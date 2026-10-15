@@ -87,7 +87,7 @@ reader can see which precondition a future run skipped.
 | 10 KiB one-shot All-Reduce | < 22 µs (doctor) or < 20 µs (spec 1336) | doctor.rs:98-101 | not measured; the probe binary is not on PATH | never run |
 | SM clock cap | [0, 2200] MHz | doctor.rs:104-107; spec 1324 | not measured | never run |
 | Available memory | `MemAvailable >= 114 GiB` per node | doctor.rs:110; spec 1324 | 5 GiB (other tenant resident) | **FAIL** |
-| Engram shards | `engram-l1-r{rank}of4.bin`, `engram-l14-r{rank}of4.bin` plus manifest, 512-byte aligned, ~48 GiB per node | doctor.rs:113-119, 2043; spec 1325 | absent; `sparkflash pack-engram` is not implemented (crates/sparkflash-cli/src/main.rs:5-6) | **FAIL** |
+| Engram shards | `engram-l1-r{rank}of4.bin`, `engram-l14-r{rank}of4.bin` plus manifest, 512-byte aligned, ~48 GiB per node | doctor.rs:113-119, 2043; spec 1325 | absent; `sparkflash pack-engram` exists and reads the checkpoint's safetensors shards (crates/sparkflash-cli/src/main.rs:40, crates/sparkflash-engram/src/packer.rs) but has not been run against the checkpoint, so no shard has been written | **FAIL** |
 
 Section 2.4's second command is the one that produces this table; the "measured" column above is the
 2026-10-15 reading, not a run of that command.
@@ -433,9 +433,13 @@ These are the most load-bearing statements in this document. Each one is a place
 contains an expectation and no instrument.
 
 1. **There is no engine.** The only implementation of `InferenceEngine` is
-   `MockEngine` (crates/sparkflash-api/src/engine.rs:372, 424, 680). Nothing in `crates/` loads
-   weights (no `safetensors` reference anywhere). `sparkflash serve` and `sparkflash pack-engram` are
-   not implemented (crates/sparkflash-cli/src/main.rs:5-6). `sparkflash_api::server::router` builds an
+   `MockEngine` (crates/sparkflash-api/src/engine.rs:372, 424, 680). The Engram packer does read
+   checkpoint shards (crates/sparkflash-engram/src/packer.rs), but nothing loads the transformer
+   weights into a runnable model, and `sparkflash serve` does not exist while `doctor`, `trace` and
+   `pack-engram` are wired (crates/sparkflash-cli/src/main.rs:3-5, 39-42). Corrected after the first
+   revision of this finding: that revision predated milestone 2's merge, which is what wired
+   `pack-engram`, and it said the packer did not exist. The finding itself is unchanged for the
+   transformation stack - there is no route from a checkpoint to a token. `sparkflash_api::server::router` builds an
    axum `Router` (crates/sparkflash-api/src/server.rs:200) but **nothing binds a socket**: there is no
    `TcpListener`, no `axum::serve` and no async entry point in the workspace. Consequence: gates 3.4
    through 3.8 cannot be run by any command in this tree, not merely "have not been run".

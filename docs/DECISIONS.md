@@ -554,9 +554,10 @@ of the nine, **no command in this repository can produce the number the gate ass
 **Findings, in the order they change what can be claimed.**
 
 1. There is no engine. The only `InferenceEngine` implementation in the tree is `MockEngine`
-   (`crates/sparkflash-api/src/engine.rs:372, 424, 680`); nothing under `crates/` loads checkpoint
-   weights (no `safetensors` reference exists); `serve` and `pack-engram` are unimplemented
-   (`crates/sparkflash-cli/src/main.rs:5-6`); and `server::router` builds an axum `Router`
+   (`crates/sparkflash-api/src/engine.rs:372, 424, 680`); the Engram packer reads checkpoint
+   safetensors shards, but no code loads the transformer weights into a runnable model, and
+   `sparkflash serve` does not exist while `doctor`, `trace` and `pack-engram` are wired
+   (`crates/sparkflash-cli/src/main.rs:3-5, 39-42`); and `server::router` builds an axum `Router`
    (`crates/sparkflash-api/src/server.rs:200`) that nothing binds to a socket - there is no
    `TcpListener`, no `axum::serve` and no async entry point in the workspace. So qeval, the DSpark KL
    divergence, the 1M needle test, the sparkDash sweeps and CUDA graph capture cannot be run by any
@@ -585,6 +586,17 @@ of the nine, **no command in this repository can produce the number the gate ass
 9. Positive: the only ignored tests in the repository whose bodies really exercise hardware are the KV
    ones on the milestone-4 branch (`crates/sparkflash-kv/tests/hardware.rs:25`, a real NVMe `O_DIRECT`
    round trip at the device's own alignment). They are the pattern the three comm stubs should follow.
+
+**Correction, recorded the same day.** The survey's snapshot predated milestone 2's merge, which is
+what wired `sparkflash pack-engram`, and the first revision of finding 1 therefore said the packer did
+not exist and that nothing under `crates/` mentioned safetensors. Both halves were wrong in the merged
+tree: the CLI dispatches the subcommand (`crates/sparkflash-cli/src/main.rs:40`) into
+`sparkflash_engram::packer`, which reads the checkpoint's safetensors shards. The finding that
+matters is unchanged - no code loads the transformer weights into a runnable model, the endpoints
+are never bound to a socket, and the five gates that need a model still have no command to run them -
+but a record that overstates a gap is as misleading as one that hides it, so the claim is corrected
+here and in `docs/QUALIFICATION.md` rather than left to be discovered. The Engram shards are absent
+for the ordinary reason: the packer has not been run against the checkpoint.
 
 **Two latency numbers, and why both are right.** The spec states 22 us for preflight check 3 (line 1323)
 and 20 us for milestone 3 (line 1336). Nothing in the tree encoded 20. They are not in conflict once
