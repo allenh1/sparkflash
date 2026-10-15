@@ -3,18 +3,36 @@
 //! Two jobs:
 //!
 //! 1. Decide whether a CUDA toolchain is available. Nothing in the workspace may require a GPU
-//!    to build or test, so every CUDA path is behind the node's `cuda` feature and the CPU
+//!    to build or test, so every CUDA path is behind the node's "cuda" feature and the CPU
 //!    reference kernels are always compiled.
-//! 2. When a toolchain IS present, compile the shared trace ABI header. That header is included
-//!    by every instrumented kernel and its Rust counterpart lives in sparkflash-trace, so an
-//!    edit that breaks either side has to fail the build instead of lurking until the first real
-//!    kernel compile. The check compiles a device-only probe that static-asserts every struct
-//!    size, alignment and field offset and instantiates all four trace macros; it needs no GPU,
-//!    only the CUDA frontend.
+//! 2. When a CUDA frontend IS present, compile the shared headers and the RoCEnante kernel.
+//!    Both the trace ABI header and the RoCEnante slot ABI are contracts between Rust and
+//!    device code, so a drift has to fail the build instead of lurking until the first real
+//!    kernel launch:
 //!
-//! `-arch` defaults to the DGX Spark target (sm_121a) and can be overridden with
-//! SPARKFLASH_CUDA_ARCH. An architecture the installed toolkit does not know is downgraded to a
-//! build-script warning, because CI may carry an older CUDA; any other failure is fatal.
+//!    * the trace probe compiles a device-only translation unit that static-asserts every
+//!      GpuTraceEvent/GpuTraceRing size, alignment and field offset and instantiates all four
+//!      trace macros;
+//!    * the RoCEnante probe compiles kernels/rocenante_oneshot_sm121.cu together with a
+//!      redeclaration of the kernel's __global__ signature and a second, literal copy of the
+//!      slot layout assertions;
+//!    * the kernel itself is compiled standalone, so it must be a self-contained translation
+//!      unit.
+//!
+//!    None of that needs a GPU, only a CUDA frontend. When nvcc is absent but clang is present,
+//!    the kernel AND the RoCEnante probe are instead handed to clang's CUDA frontend with a
+//!    stubbed cuda_bf16.h (crates/sparkflash-kernels/cuda_stub/cuda_stub.h) and compiled
+//!    device-only with -fsyntax-only. Compiling the probe rather than the kernel alone matters:
+//!    it turns SPARKFLASH_ENABLE_GPU_TRACE on, so the trace macros in the kernel body are
+//!    type-checked instead of expanding to no-ops, it re-declares the __global__ signature
+//!    against the definition, and it re-states the slot layout as literals. That is still a
+//!    syntax and type check, not a substitute for nvcc: the stub's intrinsics carry no
+//!    semantics and clang does not validate inline PTX.
+//!
+//! "-arch" defaults to the DGX Spark target (sm_121a) and can be overridden with
+//! SPARKFLASH_CUDA_ARCH. An architecture or option the installed frontend does not know is
+//! downgraded to a build-script warning, because CI may carry an older toolkit; any other
+//! failure is fatal.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,7 +42,7 @@ use std::process::Command;
 /// The assertions live inside a kernel so they are evaluated during device-only compilation,
 /// and the macro instantiations force the ENTER/READ_TIMER/EXIT/EXIT_ROCE bodies to be
 /// type-checked. HEADER_PATH is substituted with the canonical header path.
-const PROBE: &str = r#"#include <stddef.h>
+const TRACE_PROBE: &str = r#"#include <stddef.h>
 #include <stdint.h>
 
 #define SPARKFLASH_ENABLE_GPU_TRACE 1
@@ -63,43 +81,161 @@ __global__ void sparkflash_trace_abi_probe(GpuTraceRing *ring, uint64_t *sink) {
 }
 "#;
 
+/// The probe that pins the RoCEnante one-shot slot ABI.
+///
+/// It redeclares the kernel's signature and then includes the kernel source, so the
+/// declaration, the definition and the slot layout are all checked in one translation unit.
+/// The layout numbers are deliberately written out as literals instead of reusing the header's
+/// macros: if somebody weakens the header's static_asserts, this copy still fails.
+const ROCE_PROBE: &str = r#"#include <stddef.h>
+#include <stdint.h>
+
+#define SPARKFLASH_ENABLE_GPU_TRACE 1
+#include "rocenante_oneshot_sm121.cuh"
+
+extern "C" __global__ void rocenante_oneshot_allreduce_bf16_tp4(
+    const __nv_bfloat16* __restrict__ local_in,
+    __nv_bfloat16* __restrict__ local_out,
+    RoceOneShotSlot* __restrict__ slot,
+    volatile uint64_t* __restrict__ host_doorbell_seq,
+    GpuTraceRing* __restrict__ trace_ring,
+    const uint32_t layer_id,
+    const uint32_t my_rank,
+    const uint32_t num_elements,
+    const uint64_t step_seq);
+
+#include "rocenante_oneshot_sm121.cu"
+
+__global__ void sparkflash_roce_abi_probe(RoceOneShotSlot *slot, uint64_t *sink) {
+    static_assert(sizeof(__nv_bfloat16) == 2, "bf16 must be 2 bytes");
+    static_assert(alignof(__nv_bfloat16) == 2, "bf16 must be 2-byte aligned");
+    static_assert(sizeof(RoceOneShotSlot) == 8388640, "slot must be 8 MiB + 32 bytes");
+    static_assert(alignof(RoceOneShotSlot) == 8, "slot must keep its natural 8-byte alignment");
+    static_assert(offsetof(RoceOneShotSlot, arrival_seq) == 0, "arrival_seq must start the slot");
+    static_assert(offsetof(RoceOneShotSlot, payload) == 32, "payload must start at offset 32");
+    static_assert((1024 * 1024) * 2 == 2097152, "one payload row is 2 MiB");
+    static_assert(4 * (1024 * 1024) * 2 + 32 == 8388640, "8 MiB + 32 bytes");
+    static_assert(SPARK_ROCE_SLOT_RANKS == 4, "the one-shot group is TP=4");
+    static_assert(SPARK_ROCE_SLOT_ROW_ELEMS == 1024 * 1024, "one row is 1 Mi elements");
+    static_assert(SPARK_ROCENANTE_PEER_WAIT_NS > 0, "the peer wait must be bounded but non-zero");
+    static_assert(SPARK_ROCENANTE_SPIN_ITERS > 0, "the spin backoff must be non-zero");
+    static_assert(
+        SPARK_ROCE_PAYLOAD_DIAG_FLAG > SPARK_ROCE_SLOT_ROW_BYTES,
+        "the diagnostic flag must live above every possible byte count");
+    static_assert(SPARK_ROCE_DIAG_MISSING_SHIFT + 4 <= 31, "the missing mask must fit the flag");
+    static_assert(
+        sizeof(slot->payload[0]) == SPARK_ROCE_SLOT_ROW_BYTES, "one slot row is 2 MiB");
+
+    if (sink != nullptr) {
+        // Force the diagnostic NaN constructor through the real cuda_bf16.h conversion path.
+        // Do NOT read __nv_bfloat16::__x here: CUDA 12.9 declares that member protected, so a
+        // probe that touches it only compiles against a stub that makes it public. nvcc 12.9.86
+        // rejects it, which is how this line was found.
+        __nv_bfloat16 nan = spark_roce_diag_nan_bf16();
+        float nan_value = __bfloat162float(nan);
+        *sink = (uint64_t)SPARK_ROCE_SLOT_BYTES + slot->arrival_seq[0]
+                + (uint64_t)(nan_value != nan_value ? 1u : 0u);
+    }
+}
+"#;
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../kernels");
+    println!("cargo:rerun-if-changed=cuda_stub");
     println!("cargo:rustc-check-cfg=cfg(sparkflash_cuda_toolkit)");
     println!("cargo:rerun-if-env-changed=SPARKFLASH_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=SPARKFLASH_NVCC");
+    println!("cargo:rerun-if-env-changed=SPARKFLASH_CLANG");
+
+    let arch = std::env::var("SPARKFLASH_CUDA_ARCH").unwrap_or_else(|_| "sm_121a".to_owned());
 
     let Some(nvcc) = which_nvcc() else {
-        println!("cargo:warning=sparkflash-kernels: nvcc not found; CPU reference kernels only");
+        // No nvcc: the clang CUDA frontend can still parse the kernel against the stub
+        // headers. That check is weaker than nvcc (no PTX validation, no ptxas), so it is
+        // reported as a different kind of evidence, not as a substitute.
+        match which_clang() {
+            Some(clang) => report_clang(&clang, &arch),
+            None => println!(
+                "cargo:warning=sparkflash-kernels: neither nvcc nor clang++ was found; the \
+                 CUDA ABI and kernel sources are UNVERIFIED by this build (CPU reference \
+                 kernels only). The unit tests in roce_abi.rs still check the Rust/CUDA \
+                 conformance textually."
+            ),
+        }
         return;
     };
     println!("cargo:rustc-cfg=sparkflash_cuda_toolkit");
 
-    let arch = std::env::var("SPARKFLASH_CUDA_ARCH").unwrap_or_else(|_| "sm_121a".to_owned());
-    let header = Path::new("../../kernels/trace_globaltimer_sm121.cuh");
-    if !header.is_file() {
+    let kernels = Path::new("../../kernels");
+    if !kernels.is_dir() {
         println!(
-            "cargo:warning=sparkflash-kernels: {} is missing; skipping the trace ABI check",
-            header.display()
+            "cargo:warning=sparkflash-kernels: {} is missing; skipping every CUDA ABI check",
+            kernels.display()
         );
         return;
     }
 
-    match check_trace_header(&nvcc, &arch, header) {
+    let trace_header = kernels.join("trace_globaltimer_sm121.cuh");
+    if !trace_header.is_file() {
+        println!(
+            "cargo:warning=sparkflash-kernels: {} is missing; skipping the trace ABI check",
+            trace_header.display()
+        );
+    } else {
+        report(
+            &nvcc,
+            &arch,
+            "the shared CUDA trace ABI header",
+            check_trace_header(&nvcc, &arch, &trace_header),
+        );
+    }
+
+    let roce_header = kernels.join("rocenante_oneshot_sm121.cuh");
+    let roce_kernel = kernels.join("rocenante_oneshot_sm121.cu");
+    if !roce_header.is_file() || !roce_kernel.is_file() {
+        println!(
+            "cargo:warning=sparkflash-kernels: the RoCEnante one-shot sources are missing; \
+             skipping the slot ABI check"
+        );
+        return;
+    }
+
+    report(
+        &nvcc,
+        &arch,
+        "the RoCEnante slot ABI probe (which includes the kernel)",
+        check_roce_probe(&nvcc, &arch, kernels),
+    );
+    report(
+        &nvcc,
+        &arch,
+        "the RoCEnante one-shot kernel",
+        compile_file(
+            &nvcc,
+            &arch,
+            &roce_kernel,
+            &[Path::new("../../kernels")],
+            "rocenante_oneshot_sm121",
+        ),
+    );
+}
+
+/// Prints a warning for an unusable toolchain and aborts the build for a real compile error.
+fn report(nvcc: &Path, arch: &str, what: &str, result: Result<(), ProbeFailure>) {
+    match result {
         Ok(()) => {}
-        Err(failure) if failure.unusable_toolchain => {
-            println!(
-                "cargo:warning=sparkflash-kernels: {} cannot compile the trace ABI probe for \
-                 {arch} ({}); set SPARKFLASH_CUDA_ARCH to a supported architecture",
-                nvcc.display(),
-                failure.stderr.trim(),
-            );
-        }
-        // A header that does not compile must never reach a GPU host: the ABI is shared with
-        // sparkflash-trace, so a drift here would corrupt every trace record.
+        Err(failure) if failure.unusable_toolchain => println!(
+            "cargo:warning=sparkflash-kernels: {} cannot compile {what} for {arch} ({}); set \
+             SPARKFLASH_CUDA_ARCH to a supported architecture",
+            nvcc.display(),
+            failure.stderr.trim(),
+        ),
+        // A header or kernel that does not compile must never reach a GPU host: the ABI is
+        // shared with sparkflash-trace and sparkflash-comm, so a drift here would corrupt
+        // every trace record and every collective.
         Err(failure) => panic!(
-            "sparkflash-kernels: the shared CUDA trace ABI header failed to compile:\n{}",
+            "sparkflash-kernels: {what} failed to compile:\n{}",
             failure.stderr
         ),
     }
@@ -107,62 +243,236 @@ fn main() {
 
 struct ProbeFailure {
     stderr: String,
-    /// True when nvcc itself refused the request (unknown option or unsupported architecture)
-    /// rather than reporting an error inside the header.
+    /// True when the frontend itself refused the request (unknown option or unsupported
+    /// architecture) rather than reporting an error inside the source.
     unusable_toolchain: bool,
+}
+
+impl ProbeFailure {
+    fn new(stderr: String) -> Self {
+        let unusable_toolchain = stderr.contains("Unsupported gpu architecture")
+            || stderr.contains("unsupported architecture")
+            || stderr.contains("unsupported CUDA gpu architecture")
+            || stderr.contains("Unknown option")
+            || stderr.contains("Unrecognized")
+            || stderr.contains("unknown argument")
+            || stderr.contains("not supported")
+            || stderr.contains("cannot find CUDA installation");
+        Self {
+            stderr,
+            unusable_toolchain,
+        }
+    }
 }
 
 /// Compiles a device-only probe of the shared trace header with nvcc.
 fn check_trace_header(nvcc: &Path, arch: &str, header: &Path) -> Result<(), ProbeFailure> {
-    let fail = |stderr: String| ProbeFailure {
-        unusable_toolchain: stderr.contains("Unsupported gpu architecture")
-            || stderr.contains("unsupported architecture")
-            || stderr.contains("Unknown option")
-            || stderr.contains("Unrecognized"),
-        stderr,
-    };
-
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").map_err(|e| fail(e.to_string()))?);
+    let out_dir = out_dir()?;
     let canonical = header
         .canonicalize()
-        .map_err(|e| fail(format!("cannot canonicalize {}: {e}", header.display())))?;
+        .map_err(|e| ProbeFailure::new(format!("cannot canonicalize {}: {e}", header.display())))?;
     let probe = out_dir.join("trace_abi_probe.cu");
-    let source = PROBE.replace("HEADER_PATH", &canonical.display().to_string());
-    std::fs::write(&probe, source).map_err(|e| fail(e.to_string()))?;
+    let source = TRACE_PROBE.replace("HEADER_PATH", &canonical.display().to_string());
+    std::fs::write(&probe, source).map_err(|e| ProbeFailure::new(e.to_string()))?;
+    let include = canonical.parent().map(Path::to_path_buf);
+    let includes: Vec<&Path> = include.iter().map(PathBuf::as_path).collect();
+    compile_file(nvcc, arch, &probe, &includes, "trace_abi_probe")
+}
 
+/// Compiles the RoCEnante slot ABI probe (and, through it, the kernel) with nvcc.
+fn check_roce_probe(nvcc: &Path, arch: &str, kernels: &Path) -> Result<(), ProbeFailure> {
+    let out_dir = out_dir()?;
+    let probe = out_dir.join("roce_abi_probe.cu");
+    std::fs::write(&probe, ROCE_PROBE).map_err(|e| ProbeFailure::new(e.to_string()))?;
+    compile_file(nvcc, arch, &probe, &[kernels], "roce_abi_probe")
+}
+
+/// Compiles one translation unit to PTX with nvcc. No host codegen and no link, but the
+/// frontend still evaluates every static_assert and type-checks every macro.
+fn compile_file(
+    nvcc: &Path,
+    arch: &str,
+    source: &Path,
+    includes: &[&Path],
+    stem: &str,
+) -> Result<(), ProbeFailure> {
+    let out_dir = out_dir()?;
     let mut command = Command::new(nvcc);
-    command.args([
-        "-std=c++17",
-        &format!("-arch={arch}"),
-        // Device code only, to PTX: no host codegen, no link, but the frontend still evaluates
-        // every static_assert and type-checks the macros. (--device-c would work too; --ptx
-        // additionally avoids needing a host compiler.)
-        "--ptx",
-    ]);
-    command
-        .arg(&probe)
-        .arg("-o")
-        .arg(out_dir.join("trace_abi_probe.ptx"));
-    if let Some(parent) = canonical.parent() {
-        command.arg("-I").arg(parent);
+    command.args(["-std=c++17", &format!("-arch={arch}"), "--ptx"]);
+    for include in includes {
+        command.arg("-I").arg(include);
     }
+    command
+        .arg(source)
+        .arg("-o")
+        .arg(out_dir.join(format!("{stem}.ptx")));
     let output = command
         .output()
-        .map_err(|e| fail(format!("failed to run {}: {e}", nvcc.display())))?;
+        .map_err(|e| ProbeFailure::new(format!("failed to run {}: {e}", nvcc.display())))?;
     if output.status.success() {
         Ok(())
     } else {
-        Err(fail(String::from_utf8_lossy(&output.stderr).into_owned()))
+        Err(ProbeFailure::new(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
+    }
+}
+
+fn out_dir() -> Result<PathBuf, ProbeFailure> {
+    std::env::var("OUT_DIR")
+        .map(PathBuf::from)
+        .map_err(|e| ProbeFailure::new(e.to_string()))
+}
+
+/// Parses the kernel with clang's CUDA frontend, which is all a host without nvcc can do.
+fn report_clang(clang: &Path, arch: &str) {
+    match check_kernel_syntax(clang, arch) {
+        Ok(()) => report_clang_probe(clang, arch),
+        // Retry once on a baseline architecture: the syntax and the slot layout do not depend
+        // on the target, and an older clang may not know sm_121a yet.
+        Err(failure) if failure.unusable_toolchain && arch != "sm_90" => {
+            match check_kernel_syntax(clang, "sm_90") {
+                Ok(()) => {
+                    println!(
+                        "cargo:warning=sparkflash-kernels: clang cannot target {arch}; the kernel \
+                         parsed cleanly for sm_90 instead. Set SPARKFLASH_CUDA_ARCH (or \
+                         SPARKFLASH_CLANG) to check the real target."
+                    );
+                    report_clang_probe(clang, "sm_90");
+                }
+                Err(second) => clang_outcome(second, arch),
+            }
+        }
+        Err(failure) => clang_outcome(failure, arch),
+    }
+}
+
+/// Runs the RoCEnante ABI probe through clang after the kernel parsed, and reports what that
+/// buys. The probe is the same translation unit nvcc would compile, so on this host it is the
+/// only place where the trace macros, the signature redeclaration and the literal slot
+/// assertions are evaluated together.
+fn report_clang_probe(clang: &Path, arch: &str) {
+    match check_roce_probe_syntax(clang, arch) {
+        Ok(()) => println!(
+            "cargo:warning=sparkflash-kernels: nvcc not found; clang's CUDA frontend parsed \
+             kernels/rocenante_oneshot_sm121.cu and the RoCEnante ABI probe (trace macros \
+             enabled, signature redeclared, slot static_asserts) against stub headers \
+             (-fsyntax-only, {arch}). That checks syntax, types and the ABI's static_asserts, \
+             NOT PTX and NOT numerics. A CUDA host must run the nvcc probe before this kernel \
+             is trusted."
+        ),
+        Err(failure) if failure.unusable_toolchain => println!(
+            "cargo:warning=sparkflash-kernels: clang parsed the kernel but cannot run the \
+             RoCEnante ABI probe for {arch} ({}); the probe's literal slot assertions were not \
+             evaluated here",
+            failure.stderr.trim()
+        ),
+        Err(failure) => panic!(
+            "sparkflash-kernels: the clang CUDA ABI probe failed; the RoCEnante slot ABI, the \
+             kernel signature and the kernel body do not agree:\n{}",
+            failure.stderr
+        ),
+    }
+}
+
+/// Turns a clang probe result into either a portability warning or a hard build failure.
+fn clang_outcome(failure: ProbeFailure, arch: &str) {
+    if failure.unusable_toolchain {
+        println!(
+            "cargo:warning=sparkflash-kernels: clang++ cannot run the CUDA syntax probe for \
+             {arch} ({}); the kernel sources are UNVERIFIED by this build",
+            failure.stderr.trim()
+        );
+    } else {
+        panic!(
+            "sparkflash-kernels: the clang CUDA syntax probe failed; \
+             kernels/rocenante_oneshot_sm121.cu does not parse:\n{}",
+            failure.stderr
+        );
+    }
+}
+
+/// Parses the kernel alone: the weakest clang check, and the one that must pass before the
+/// probe is worth running.
+fn check_kernel_syntax(clang: &Path, arch: &str) -> Result<(), ProbeFailure> {
+    let kernel = Path::new("../../kernels/rocenante_oneshot_sm121.cu");
+    if !kernel.is_file() {
+        return Err(ProbeFailure::new(format!(
+            "{} is missing",
+            kernel.display()
+        )));
+    }
+    clang_syntax_check(clang, arch, kernel)
+}
+
+/// Parses the RoCEnante ABI probe: the same source the nvcc path compiles, with the trace
+/// macros enabled and the kernel's signature re-declared before its definition.
+fn check_roce_probe_syntax(clang: &Path, arch: &str) -> Result<(), ProbeFailure> {
+    let kernels = Path::new("../../kernels");
+    if !kernels.is_dir() {
+        return Err(ProbeFailure::new(format!(
+            "{} is missing",
+            kernels.display()
+        )));
+    }
+    let probe = out_dir()?.join("roce_abi_probe.cu");
+    std::fs::write(&probe, ROCE_PROBE).map_err(|e| ProbeFailure::new(e.to_string()))?;
+    clang_syntax_check(clang, arch, &probe)
+}
+
+/// Runs clang's CUDA device-only syntax check on one translation unit against the stub headers.
+fn clang_syntax_check(clang: &Path, arch: &str, source: &Path) -> Result<(), ProbeFailure> {
+    let stub = Path::new("cuda_stub");
+    if !stub.is_dir() {
+        return Err(ProbeFailure::new(format!(
+            "{} is missing; the clang probe needs the stub CUDA headers",
+            stub.display()
+        )));
+    }
+    let mut command = Command::new(clang);
+    command.args([
+        "-x",
+        "cuda",
+        "--cuda-device-only",
+        &format!("--cuda-gpu-arch={arch}"),
+        "-nocudainc",
+        "-nocudalib",
+        "-std=c++17",
+        "-fsyntax-only",
+        "-DSPARKFLASH_CUDA_SYNTAX_STUB=1",
+        "-I",
+        "../../kernels",
+        "-I",
+        "cuda_stub",
+    ]);
+    command.arg(source);
+    let output = command
+        .output()
+        .map_err(|e| ProbeFailure::new(format!("failed to run {}: {e}", clang.display())))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(ProbeFailure::new(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
     }
 }
 
 fn which_nvcc() -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os("SPARKFLASH_NVCC") {
+    which("SPARKFLASH_NVCC", "nvcc")
+}
+
+fn which_clang() -> Option<PathBuf> {
+    which("SPARKFLASH_CLANG", "clang++")
+}
+
+fn which(env: &str, program: &str) -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os(env) {
         let path = PathBuf::from(explicit);
         return path.is_file().then_some(path);
     }
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .map(|dir| dir.join("nvcc"))
+        .map(|dir| dir.join(program))
         .find(|candidate| candidate.is_file())
 }

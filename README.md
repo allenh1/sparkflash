@@ -19,7 +19,11 @@ A purpose-built Rust inference server for **DeepSeek-V4.1-Flash** on a 4x NVIDIA
    that the test-suite exercises on any machine, and an on-device parity test that runs where a
    GPU exists.
 3. **Determinism is a feature.** Collective reductions use a canonical rank order so all four
-   ranks produce bit-identical outputs.
+   ranks produce bit-identical outputs for every finite value and both infinities — and, because
+   the order and the single bf16 rounding are fixed rather than arrival-dependent, so do NaN
+   inputs. NaN *payload and sign* are the one thing not claimed: the device conversion is not
+   payload-preserving, so rank-to-rank agreement holds where agreement with the CPU reference does
+   not (see `docs/DECISIONS.md` and `sparkflash-comm`'s crate docs).
 
 ## Workspace layout
 

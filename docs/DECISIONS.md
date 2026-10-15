@@ -194,3 +194,81 @@ behind `ThreadTraceState`.
 **Also recorded here** (found by review, not a decision): the ring constructors bound capacity at
 `MAX_RING_CAPACITY` and use checked arithmetic, because the header stores capacity - 1 in 32 bits
 and an unchecked capacity made the *safe* `slot()` accessor index out of bounds in release builds.
+
+## D11 - The RoCEnante wait is bounded and traceable instead of spinning forever
+
+**Context.** Spec 5.4 (lines 683-687) spins on `slot->arrival_seq[peer] < step_seq` with no exit
+condition. A dropped doorbell, a late peer or a NIC that never posts therefore hangs the kernel
+indefinitely, and on a unified-memory GB10 a hung kernel is not killable from the host without a
+device reset - the failure mode would take down a node that is otherwise healthy.
+
+**Decision.** The wait is bounded by a `%globaltimer` deadline with `__nanosleep` backoff
+(`SPARK_ROCENANTE_PEER_WAIT_NS`, default 1 ms, roughly 45x the 22 us gate in spec 6.1). On timeout the
+block returns a bf16 quiet NaN for the elements it owns and emits a single diagnostic trace record whose
+`payload_meta` carries the timeout flag, a 4-bit missing-rank mask and a row-overflow bit. A straggler
+thus produces a visible, attributable wrong answer instead of a dead node.
+
+**Also recorded in the kernel, because the spec is silent.** A `__syncthreads()` sits between the
+doorbell and the peer poll, which orders the ringing within a block and keeps the per-block deadline
+stamp after the doorbell. It is a block-scoped barrier, so it does not stop another block from reaching
+the poll first: what makes that safe is the sequence guard, since the poll waits for
+`arrival_seq[peer] >= step_seq` rather than for the ring. (An earlier draft of this entry claimed the
+barrier gave grid-wide ordering; the M3 review falsified that, and the poll's guard is the real reason
+no block can proceed on a peer that has not rung.) The observing threads also fence unconditionally
+after the poll, not only on the wait path, so a peer that was already visible when the block arrived is
+still acquired rather than riding on the writer's release alone. `step_seq` is strictly
+increasing per rank, and a slot is not reused for `step_seq + 1` until every rank has finished reading
+it; double buffering is the communicator's job, not the kernel's. The spec's slot struct carries no
+alignment attribute, so the slot is 8-byte aligned (by its `u64` member), not 32: `sizeof ==
+8_388_640`, pinned by `static_assert` on the C side and by a parsed-declaration test on the Rust side.
+An oversized `num_elements` is clamped and flagged rather than allowed to run into the neighbouring
+payload row; the router's 2 MiB threshold is exactly one payload row, so a conforming caller never
+reaches the clamp.
+
+## D12 - Dual-rail device selection enumerates the fabric instead of trusting the spec's device names
+
+**Context.** Spec 6.1 (check 2) and the Milestone 3 registration list name the two rails as
+`rocep1s0f0` / `enp1s0f0np0` and `roceP2p1s0f0` / `enP2p1s0f0np0`. Measured read-only on the live
+cluster, those are the **f0** functions and they are down at 40 Gb/s, while the rails actually carrying
+traffic are the **f1** functions: `rocep1s0f1` -> `enp1s0f1np1` and `roceP2p1s0f1` ->
+`enP2p1s0f1np1`, both ACTIVE at 200 Gb/s (4X HDR). Both rails share 192.0.2.0/24, and a node holds two
+addresses, one per rail (the head node is 192.0.2.80 on rail 1 and 192.0.2.85 on rail 2), with two
+default routes at different metrics.
+
+**Decision.** The communicator enumerates the RDMA devices and their netdevs and selects the ones that are
+ACTIVE at 200 Gb/s, with the spec's names kept as a documented fallback and an explicit operator override.
+Registering a device that is down, or falling back silently to a 40 Gb/s link, is a hard startup error,
+not a warning: a silent downgrade would invalidate the whole milestone's bandwidth claims while still
+producing plausible numbers.
+
+**Also measured, and relevant to the preflight.** The live nodes run kernel `6.17.0-1029-nvidia` (meets
+the `>= 6.17.0-1018` requirement) but driver `580.173.02`, which is **below** the `580.178.04` the spec
+requires, so check 1 fails on the real cluster today; the active rails report MTU 1500 rather than the
+required 9000; `nvidia_uvm` exposes no 64K-packing parameter under any conventional name among its 56
+module parameters, so "64K page packing is active" is not verifiable as written; and `MemAvailable` is
+5 GiB because the live vLLM instance holds the memory, which is why the 114 GiB gate must only be read
+while the cluster is idle.
+
+## D13 - Dispatch telemetry keeps the spec's truncating formula, and the exact figure lives in the plan
+
+**Context.** Spec 5.4 (lines 758-760) accounts dual-rail traffic as `half_bytes = num_bytes / 2;
+rdma_bytes_railN += half_bytes * 3`. With an ODD `num_bytes` the integer division truncates, so each
+rail's counter undercounts by up to 3 bytes relative to the true `3 * num_bytes / 2`.
+
+**Decision.** Keep the spec's formula for the spec-named counters, because those counters are the
+conformance surface an operator compares against the paper, and pin the behaviour with a test that
+reproduces the undercount rather than hiding it. The exact byte figure is already conserved and exposed
+by `RailPlan`, which is what the transport actually moves, so nothing about the wire behaviour depends on
+the counter. The truncation is also unreachable for this model's payloads: every collective here carries
+bf16 elements, so `num_bytes` is always even.
+
+**Also recorded.** The spec defines neither an operator override for the rail devices nor an error for an
+unusable fabric; `SPARKFLASH_RAIL_DEVICES` and `CommError::FabricUnavailable` are additions (see D12).
+
+**Recorded limitation (M3 review, non-blocking).** `RailSelection` and `SelectedRail` carry public
+fields and derive `Deserialize`, so a caller that constructs one by hand - or deserialises one - can
+still present a colliding pair: the invariant lives in `RailSelection::resolve`, not in the type.
+Nothing in the tree consumes an untrusted selection today, so this is an API-shape hazard rather than
+a defect, and it is recorded here instead of being silently assumed. If a future caller ever accepts
+a selection from configuration or the network, either the fields must become private with
+`resolve`-only construction or the type must gain a `validate()` that its consumers call.

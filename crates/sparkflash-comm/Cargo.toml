@@ -6,9 +6,21 @@ license.workspace = true
 authors.workspace = true
 description = "RoCEnante one-shot RDMA + NCCL dual-path collective transport for 4x DGX Spark"
 
+[features]
+default = []
+# Thin ibverbs / GPUNetIO backend skeleton. It links nothing on the Milestone 3 dev box:
+# every entry point returns `CommError::RdmaNotBuilt`.
+rdma = []
+
 [dependencies]
 serde = { workspace = true }
 sparkflash-trace = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 libc = { workspace = true }
+
+[dev-dependencies]
+# Independent round-to-nearest-even oracle for the bf16 conversion tests.
+half = { workspace = true }
+# Serialization shape checks for the telemetry snapshot the API layer consumes.
+serde_json = { workspace = true }
