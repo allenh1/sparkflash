@@ -52,6 +52,22 @@ test:
     - cargo test --workspace
     - cargo test -p sparkflash-trace --no-default-features
 
+# `cargo test --workspace` builds only the default feature sets, so code behind a non-default
+# feature is compiled by no job unless a job names it. sparkflash-engram's io_uring ring sits
+# behind `io-uring`, which no crate in the workspace enables: the ring and its tests were
+# invisible to six rounds of green gates, which is how an orphaned-submission-queue defect
+# survived all of them, and sparkflash-comm/rdma was in the same position. This job discovers
+# the features rather than listing them, tests and lints each one, and fails when a feature
+# appears that is not classified as hardware-only in ci/check_features.py - so a feature cannot
+# go uncompiled again without somebody writing down why.
+test-features:
+  stage: test
+  script:
+    - rustup component add clippy
+    - apt-get update
+    - apt-get install -y --no-install-recommends python3
+    - python3 ci/check_features.py
+
 # Actually compiles CUDA. This replaces a job that ran `command -v nvcc || exit 0` in a
 # rust:1.98 image and therefore never compiled a single line of CUDA in its life.
 #
