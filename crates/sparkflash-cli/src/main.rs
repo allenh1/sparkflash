@@ -1,8 +1,22 @@
 //! `sparkflash` command-line entry point.
 //!
-//! Milestone 1 scaffolding: the serve, pack-engram, doctor and trace subcommands arrive with
-//! the crates that implement them.
+//! The binary is a thin dispatcher: each subcommand is one arm here and the logic lives in
+//! `sparkflash_cli`, so it can be exercised as a library with injected probes and without
+//! spawning a process. `doctor` is implemented today; `pack-engram`, `serve` and `trace`
+//! arrive with the crates that back them.
 
-fn main() {
-    println!("sparkflash: Milestone 1 scaffolding");
+use std::process::ExitCode;
+
+use sparkflash_cli::doctor;
+
+fn main() -> ExitCode {
+    let mut args = std::env::args();
+    let _program = args.next();
+    match args.next().as_deref() {
+        Some("doctor") => doctor::run(args),
+        _ => {
+            println!("sparkflash: Milestone 1 scaffolding");
+            ExitCode::SUCCESS
+        }
+    }
 }
