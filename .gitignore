@@ -1,0 +1,19 @@
+# Rust
+/target
+**/target
+**/*.rs.bk
+*.pdb
+
+# Local artifacts
+/.research
+/.scratch
+*.trace.json
+*.trace.json.gz
+/engram-*.bin
+/tmp
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
