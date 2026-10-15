@@ -57,15 +57,26 @@ test:
 # behind `io-uring`, which no crate in the workspace enables: the ring and its tests were
 # invisible to six rounds of green gates, which is how an orphaned-submission-queue defect
 # survived all of them, and sparkflash-comm/rdma was in the same position. This job discovers
-# the features rather than listing them, tests and lints each one, and fails when a feature
-# appears that is not classified as hardware-only in ci/check_features.py - so a feature cannot
-# go uncompiled again without somebody writing down why.
+# the features rather than listing them, tests and lints each one, fails on an empty feature that
+# nothing names, and fails when a feature appears that is not classified as hardware-only in
+# ci/check_features.py - so a feature cannot go uncompiled again without somebody writing down why.
+# The script's own tests run first, because the first version of it silently skipped the very
+# feature it was written for.
+#
+# One gap this job cannot close, written down rather than implied: the runner's seccomp policy
+# refuses io_uring_setup with EPERM, so the ring-dependent tests in sparkflash-engram report that
+# they did NOT verify the ring (one line each, on stderr, naming the test and the errno) and pass.
+# Compiling the feature, linting it and running its non-ring logic is real coverage and is what this
+# job adds; the ring's own syscall behaviour is verified on a host that permits io_uring_setup, by
+# the same tests with SPARKFLASH_REQUIRE_IO_URING=1 set, which turns a skip into a failure. Read a
+# green io-uring job as "the feature builds and its logic passes", never as "the ring ran here".
 test-features:
   stage: test
   script:
     - rustup component add clippy
     - apt-get update
     - apt-get install -y --no-install-recommends python3
+    - python3 ci/test_check_features.py
     - python3 ci/check_features.py
 
 # Actually compiles CUDA. This replaces a job that ran `command -v nvcc || exit 0` in a
@@ -109,7 +120,9 @@ cuda-abi:
     # missing or refuses the architecture.
     - test -n "$(find "$CARGO_TARGET_DIR" -name trace_abi_probe.ptx -print -quit)"
     - find "$CARGO_TARGET_DIR" -name trace_abi_probe.ptx -exec ls -l {} +
-    # The job this replaced also claimed to test --features cuda and never did. cudarc's
-    # build script refuses to pick a CUDA version on its own, so the version is resolved
-    # from the toolkit nvcc in this image rather than hard-coded.
-    - cargo test -p sparkflash-kernels --features cuda,cudarc/cuda-version-from-build-system
+    # The job this replaced also claimed to test --features cuda and never did. The feature is
+    # enabled exactly as a user would enable it - nothing appended to satisfy cudarc - because the
+    # root manifest now selects cudarc's cuda-version-from-build-system feature, and that is the
+    # shape a reader has to be able to reproduce. A version feature added only on this command line
+    # would leave a plain --features cuda broken for everyone else.
+    - cargo test -p sparkflash-kernels --features cuda

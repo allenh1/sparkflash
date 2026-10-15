@@ -48,7 +48,14 @@ deepseek-recipe-image = { version = "0.1", default-features = false }
 tokenizers = "0.23"
 
 # Hardware, CUDA, RDMA, and async NVMe I/O
-cudarc = { version = "0.19", features = ["driver", "nvrtc", "f16"] }
+#
+# cudarc will not pick a CUDA version by itself: its build script aborts with "Must specify one of
+# the following features: [cuda-version-from-build-system, cuda-13040, ...]" unless one is selected.
+# Naming it here is what makes the cuda feature a feature a person can actually enable; before this
+# line the feature existed, selected cudarc, and then failed to build, which only showed up because
+# a job finally ran it. The version is resolved from the toolkit on the machine rather than
+# hard-coded, so the feature follows the CUDA the host has.
+cudarc = { version = "0.19", features = ["driver", "nvrtc", "f16", "cuda-version-from-build-system"] }
 io-uring = "0.7"
 libc = "0.2"
 memmap2 = "0.9"
