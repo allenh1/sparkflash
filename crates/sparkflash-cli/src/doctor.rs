@@ -738,6 +738,41 @@ impl LinkProbe for SystemProbes {
     }
 }
 
+/// Reads the one-shot All-Reduce latency from the rocenante-probe JSON document, requiring the
+/// probe's own transport labels before the number is trusted.
+///
+/// The probe labels every measurement with the transport it used and whether that transport says
+/// anything about the fabric, precisely so a consumer can tell a fabric number from an in-process
+/// pipeline number. The doctor is that consumer, so the labels are a requirement rather than
+/// decoration: a preflight that scored a loopback run would report the 200 Gb/s gate from a
+/// measurement that never touched the fabric, either passing it falsely on a fast host or blaming
+/// the RoCEnante staging fence for a pipeline latency. Missing or unreadable labels fail closed.
+fn oneshot_allreduce_us_from_probe_json(raw: &str) -> Probe<f64> {
+    let value: Value = serde_json::from_str(raw).map_err(|error| {
+        ProbeError::Unavailable(format!("rocenante-probe returned unreadable JSON: {error}"))
+    })?;
+    let transport = value
+        .get("transport")
+        .and_then(Value::as_str)
+        .unwrap_or("(no transport label)");
+    let fabric = match value.get("fabric") {
+        Some(Value::Bool(true)) => "true".to_owned(),
+        Some(Value::Bool(false)) => "false".to_owned(),
+        _ => "(no fabric label)".to_owned(),
+    };
+    if fabric != "true" || transport != "rdma" {
+        return Err(ProbeError::Unavailable(format!(
+            "rocenante-probe reported transport {transport} with fabric {fabric}, which is not the RDMA fabric path, so this number is refused: the one-shot All-Reduce gate is the fabric measurement and an in-process pipeline run must never be scored as it. Run the probe on a node whose RDMA rails are ACTIVE"
+        )));
+    }
+    value
+        .get("oneshot_allreduce_us")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| {
+            ProbeError::Unavailable("rocenante-probe JSON has no oneshot_allreduce_us field".into())
+        })
+}
+
 impl RdmaProbe for SystemProbes {
     fn dual_rail_write_gbps(&self, peers: &[String], seconds: u64) -> Probe<f64> {
         let peer = peers.first().ok_or_else(|| {
@@ -773,25 +808,15 @@ impl RdmaProbe for SystemProbes {
         let peer = peers.first().ok_or_else(|| {
             ProbeError::NotApplicable("no peer was given for the All-Reduce probe".into())
         })?;
-        // The RoCEnante one-shot path is implemented in milestone 3; until its probe binary is
-        // on PATH this reports Unavailable, which fails a live preflight loudly instead of
-        // pretending the latency gate ran.
+        // The probe either measures the fabric path or exits non-zero; it never prints a number it
+        // could not measure. Its own labels then decide whether that number belongs to this gate: a
+        // loopback run is a real measurement of the wrong thing, so the reader refuses it.
         let size = bytes.to_string();
         let raw = Self::output(
             "rocenante-probe",
             &["--bytes", &size, "--peer", peer, "--json"],
         )?;
-        let value: Value = serde_json::from_str(&raw).map_err(|error| {
-            ProbeError::Unavailable(format!("rocenante-probe returned unreadable JSON: {error}"))
-        })?;
-        value
-            .get("oneshot_allreduce_us")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| {
-                ProbeError::Unavailable(
-                    "rocenante-probe JSON has no oneshot_allreduce_us field".into(),
-                )
-            })
+        oneshot_allreduce_us_from_probe_json(&raw)
     }
 }
 
@@ -2760,6 +2785,62 @@ mod tests {
         let outcome = check_rdma(&fake_probes(&Arc::new(fake)), &cluster());
         assert_eq!(outcome.status, CheckStatus::Fail);
         assert!(outcome.remediation.expect("remediation").contains("22"));
+    }
+
+    /// The bytes rocenante-probe prints for an explicitly requested in-process loopback run: a real
+    /// measurement of the pipeline, labelled as not the fabric. Round 6 of review put a shim on
+    /// PATH that ran the real probe with --transport loopback and the doctor scored it as the gate.
+    const LOOPBACK_ALLREDUCE_JSON: &str = "{\"bytes\":10240,\"fabric\":false,\"max_us\":695.605,\"min_us\":587.454,\"oneshot_allreduce_us\":678.801,\"p90_us\":683.572,\"peers\":[],\"samples\":20,\"statistic\":\"median\",\"statistic_note\":\"median (p50) of the post-warmup samples\",\"transport\":\"loopback\",\"warmup_discarded\":3}";
+
+    #[test]
+    fn a_loopback_labelled_number_is_refused_by_the_reader() {
+        match oneshot_allreduce_us_from_probe_json(LOOPBACK_ALLREDUCE_JSON) {
+            Ok(micros) => panic!("a loopback number was accepted as the fabric gate: {micros}"),
+            Err(ProbeError::Unavailable(text)) => {
+                assert!(text.contains("loopback"), "{text}");
+                assert!(text.contains("fabric false"), "{text}");
+            }
+            Err(other) => panic!("expected Unavailable, got {other}"),
+        }
+    }
+
+    #[test]
+    fn the_reader_accepts_only_a_fabric_labelled_number() {
+        let fabric = "{\"bytes\":10240,\"fabric\":true,\"oneshot_allreduce_us\":21.25,\"samples\":50,\"transport\":\"rdma\"}";
+        assert_eq!(
+            oneshot_allreduce_us_from_probe_json(fabric).ok(),
+            Some(21.25)
+        );
+        for unlabelled in [
+            "{\"oneshot_allreduce_us\":21.25}",
+            "{\"fabric\":true,\"oneshot_allreduce_us\":21.25}",
+            "{\"transport\":\"rdma\",\"oneshot_allreduce_us\":21.25}",
+            "{\"fabric\":false,\"transport\":\"rdma\",\"oneshot_allreduce_us\":21.25}",
+        ] {
+            assert!(
+                matches!(
+                    oneshot_allreduce_us_from_probe_json(unlabelled),
+                    Err(ProbeError::Unavailable(_))
+                ),
+                "a payload without the fabric labels must fail closed: {unlabelled}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_rdma_does_not_score_a_loopback_measurement() {
+        let mut fake = Fake::happy();
+        fake.allreduce = oneshot_allreduce_us_from_probe_json(LOOPBACK_ALLREDUCE_JSON);
+        let outcome = check_rdma(&fake_probes(&Arc::new(fake)), &cluster());
+        assert_eq!(outcome.status, CheckStatus::Fail);
+        assert!(
+            outcome
+                .details
+                .iter()
+                .any(|line| line.contains("loopback") && line.contains("fabric")),
+            "check 3 must refuse the loopback payload by name: {:?}",
+            outcome.details
+        );
     }
 
     #[test]

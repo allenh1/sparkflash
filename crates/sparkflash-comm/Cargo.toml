@@ -18,9 +18,16 @@ sparkflash-trace = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 libc = { workspace = true }
+# rocenante-probe: the argument parser and the JSON document the doctor reads.
+clap = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # Independent round-to-nearest-even oracle for the bf16 conversion tests.
 half = { workspace = true }
-# Serialization shape checks for the telemetry snapshot the API layer consumes.
-serde_json = { workspace = true }
+
+[[bin]]
+# The doctor's latency instrument. The target name is part of the contract with the doctor, which
+# runs rocenante-probe from PATH, so it is pinned here rather than left to file discovery.
+name = "rocenante-probe"
+path = "src/bin/rocenante-probe.rs"

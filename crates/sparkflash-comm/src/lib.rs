@@ -50,6 +50,7 @@ pub mod error;
 mod exchange;
 pub mod fabric;
 pub mod layout;
+pub mod probe;
 pub mod rail;
 #[cfg(feature = "rdma")]
 pub mod rdma;

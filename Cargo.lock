@@ -2223,6 +2223,7 @@ dependencies = [
 name = "sparkflash-comm"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "half",
  "libc",
  "parking_lot",
