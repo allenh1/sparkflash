@@ -115,28 +115,57 @@ on dim 0; wkv, gate.weight, all norms, hc_*, engram.wkv and the compressors are 
 
 ## 4. Quantisation scheme
 
-| Tensor class | Checkpoint storage | Scale layout | Source |
-| :--- | :--- | :--- | :--- |
-| Dense Linears (attn, gate, shared expert, engram.wkv, indexer, ...) | fp8 e4m3, 1 byte/param | [ceil(out/32), ceil(in/32)] ue8m0, one scale per 32x32 block | model.py:225-233, 27 |
-| Routed experts (w1/w2/w3) | fp4 e2m1 packed 2-per-byte, stored [out, in/2] int8 | [out, in/32] ue8m0 (per output row, per 32 along K) | model.py:219-224; kernel.py:582 |
-| MTP experts | same as routed experts | same | model.py:872-880 |
-| wo_a | converted to bf16 at load time | dequantised, no scale retained | convert.py:156-173 |
-| Embedding / head / norms / hc_* | bf16 (head kept fp32 at runtime) | -- | model.py:1005-1006 |
+| Tensor class | Weight (checkpoint) | Weight scale grid | Activation (compute) | Activation scale grid | Source |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| Dense Linears (attn, gate, engram.wkv, indexer, ...) | fp8 e4m3, 1 byte/param | [ceil(out/32), ceil(in/32)] ue8m0, one scale per 32x32 block | fp8 e4m3, dynamic (**W8A8**) | [tokens, in/32] ue8m0 | model.py:225-233, 27, 197; kernel.py:293-298 |
+| Shared expert (ffn.shared_experts) | fp8 e4m3 (constructed without a dtype, so it takes ModelArgs.dtype) | [ceil(out/32), ceil(in/32)] ue8m0 | fp8 e4m3, dynamic (**W8A8**) | [tokens, in/32] ue8m0 | model.py:26, 887, 196-205 |
+| Routed experts (w1/w2/w3) | fp4 e2m1 packed 2-per-byte, stored [out, in/2] int8 | **[out, in/32]** ue8m0, one scale per output row per 32 along K: no blocking along out | **fp8 e4m3, dynamic (W4A8)** | [tokens, in/32] ue8m0 | model.py:219-224, 186-195; kernel.py:486-499, 511-515, 581-582 |
+| MTP experts (mtp.N.ffn.experts) | same as routed experts | same | same (**W4A8**) | same | model.py:872-885 |
+| wo_a | converted to bf16 at load time | dequantised, no scale retained | bf16 | -- | convert.py:156-173 |
+| Embedding / head / norms / hc_* | bf16 (head kept fp32 at runtime) | -- | bf16 | -- | model.py:1005-1006 |
+
+**No activation tensor exists in the checkpoint**: the safetensors constrain the weights only. The
+activation *scheme* is nevertheless declared in it, and it is FP8: `quantization_config` states
+`quant_method: "fp8"` with `activation_scheme: "dynamic"`, `weight_block_size: [32, 32]`,
+`scale_fmt: "ue8m0"` and `expert_dtype: "fp4"` (config.json:12-21). `expert_dtype: "fp4"` names the
+routed **weight** format; the declared activation scheme is dynamic FP8, and the reference forward
+implements exactly that (below). The dense and MoE kernels are separate in this tree because the
+weight formats differ (8-bit block-scaled vs 4-bit row-scaled), **not** because the activations
+differ: both take the same FP8 activation.
 
 Kernel-level rules:
 
-- fp8 GEMM: activations are quantised per 32 with power-of-two (ue8m0) scales, amax floored at 1e-4;
-  the weight scale is a genuine 2-D block grid (kernel.py:74-80 asserts the (ceil(N/32), K/32)
-  shape).
-- fp4 GEMM: the **activation** is still fp8 with per-32 ue8m0 scales, and the weight scale is a
-  single row per output feature (kernel.py:579-582 asserts b_s.shape == (N, K // 32)). The GEMM
-  therefore multiplies an fp8 activation by an fp4 weight with two different scale granularities
-  (model.py:181-195).
+- Both GEMMs share **one** activation quantiser. model.py:187 (fp4 weights) and model.py:197 (fp8
+  weights) make the identical call `act_quant(x, fp8_block_size=32, scale_fmt="ue8m0",
+  scale_dtype=e8m0fnu)`, which returns E4M3 values with per-32 ue8m0 scales; amax is floored at 1e-4
+  and, because scale_fmt is set, the scale is rounded to a power of two (kernel.py:74-80).
+- **The routed-expert GEMM is W4A8, not W4A4**: fp4 e2m1 weights against fp8 e4m3 activations. The
+  kernel that implements it is documented as "FP8 act x FP4 weight GEMM" and typed
+  `A: T.Tensor[(M, K), FP8]`, `B: T.Tensor[(N, K), FP4]` (kernel.py:486-499, 511-515). The dispatch
+  site states the rule: "Quantized weights need a quantized activation, and both fp4 and fp8 weights
+  take an fp8 one -- for fp4 the kernel handles the mixed precision" (model.py:181-183). The FP4
+  *activation* quantiser exists but is never a GEMM input: its only call sites are the indexer K, the
+  indexer Q and the compressed-KV cache (model.py:546, 552, 760), i.e. KV storage only. The MMA itself
+  is fp8 x fp8: the kernel casts each FP4 weight sub-block to FP8 through float before the dot product
+  (kernel.py:496-498), so an E2M1 activation would change the arithmetic, not just the operand type.
+- **The two weight scale grids differ:**
+  - fp8 weight (dense + shared expert): `[ceil(out/32), ceil(in/32)]`, a true 2-D block grid.
+    `fp8_gemm` asserts `b_s.shape == ((N + block_size - 1) // block_size, K // block_size)`
+    (kernel.py:293-298) and the module allocates the same `((out+31)//32, (in+31)//32)` shape
+    (model.py:225-233).
+  - fp4 weight (routed and MTP experts): `[out, in/32]`, one ue8m0 scale per output row per 32
+    values along K, with **no** blocking along the output dimension. `fp4_gemm` asserts
+    `b_s.shape == (N, K // 32)` (kernel.py:581-582) and the module allocates exactly
+    `(out_features, in_features // fp4_block_size)` (model.py:219-224).
+  - activations, both paths: `[tokens, in/32]` (`a_s.numel() == M * (K // 32)`, kernel.py:294 and
+    kernel.py:581).
+- The spec's only statement about the MoE activation format is the trace-scope table's "576-wide
+  grouped **W4A4** GEMM" (spec line 1130); see delta D7 in section 6.
 - convert.py can optionally lift the whole expert set from fp4 to fp8 losslessly
   (`--expert-dtype fp8`, convert.py:174-181): the helper re-scales each 32x32 fp8 block by a shared
   power-of-two offset and derives `MAX_OFFSET_BITS = 6` from 6.0 * 2^6 = 384 < 448, the e4m3 maximum
-  (convert.py:36-38, 47-53). Note this changes the arithmetic the reference kernel performs, so it is
-  a storage/throughput trade, not a bit-exact option.
+  (convert.py:36-38, 47-53). That trades the W4A8 expert path for a W8A8 one; it is a
+  storage/throughput option, not a bit-exact one.
 
 ---
 
@@ -195,3 +224,16 @@ the top-k normalisation uses 1e-20 with an explicit "not norm_eps" comment (mode
 **D6 — The spec's "MXFP4 (32x32 ue8m0)" for experts is wrong on two counts.** Expert weights use a
 per-output-row scale with granularity 32 along K only (kernel.py:582), not 32x32 blocks; and the
 *activation* is fp8 e4m3 with per-32 ue8m0 scales, not fp4 (model.py:186-195).
+
+**D7 — The spec calls the MoE kernel "W4A4"; the checkpoint and the reference are W4A8.** The spec's
+only wording on the MoE activation format is the `MOE_MXFP4` telemetry row: "Route planner, 576-wide
+grouped W4A4 GEMM, deterministic sum" (spec line 1130); milestone 4 names the kernel without any
+activation claim (spec line 1338). Three sources contradict W4A4: (1) the checkpoint declares
+`quant_method: "fp8"` with `activation_scheme: "dynamic"` and `expert_dtype: "fp4"`, i.e. dynamic FP8
+activations with FP4 expert weights (config.json:12-21); (2) the reference GEMM is documented and
+typed as "FP8 act x FP4 weight", `A: T.Tensor[(M, K), FP8]` (kernel.py:486-499, 511-515), fed by
+`act_quant(x, 32, "ue8m0", ...)` in the fp4 branch of the dispatcher (model.py:187); (3) the spec's
+own section 2.4 has the fused mHC kernel emit the block input as dynamic FP8 `32x32 ue8m0` (spec
+line 86), which is the tensor the MoE consumes, and nothing in the spec re-quantises it to E2M1. W4A4
+would need an extra FP8 to E2M1 step that no source defines, and it would quantise a tensor that the
+preceding kernel already produced in FP8. Recorded as D14 in `docs/DECISIONS.md`.

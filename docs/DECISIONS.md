@@ -17,6 +17,16 @@ records the evidence and the consequence for the build. Research backing is in
 | D6 | DSpark speculative loop | Implement the paper's loop; the reference code is not wired |
 | D7 | CED prefill bypass | Implement it; it needs no extra weights |
 | D8 | Hash layers (`tid2eid`) | Out of scope: not derivable from the checkpoint |
+| D9 | Trace request targeting | Thread-local binding plus a process-wide filter; an unbound thread loses spans, it never mis-attributes them, and milestone 5 must re-bind the id on the engine request at each step |
+| D10 | CPU span ring shape | 48-byte records behind a per-thread mutex, while the GPU ABI stays byte-exact at 32 bytes; the CPU shape is internal and can change behind `ThreadTraceState` |
+| D11 | RoCEnante peer wait | Bounded 1 ms `%globaltimer` deadline with `__nanosleep` backoff; a timeout yields a quiet-NaN result plus one timeout trace record, so a straggler is a visible wrong answer and not a hung node |
+| D12 | Rail device selection | Enumerate the fabric and require an ACTIVE 200 Gb/s function; a down or 40 Gb/s link is a hard startup error, with the spec's device names kept as a fallback and an operator override |
+| D13 | Dual-rail byte accounting | Keep the spec's truncating counter formula and pin the undercount with a test; the exact byte figure is the plan's, not the counter's |
+| D14 | MoE expert GEMM activation format | W4A8: FP8 E4M3 activations with per-32 ue8m0 scales against FP4 weights on `[out, in/32]`; the spec's "W4A4" is a defect and the kernel's E2M1 activation operand is replaced |
+
+The table is an index of the entries below, not a second source of record: each row is a one-line
+summary and the matching `## D<n>` section carries the evidence and the full consequence. If a row and
+its entry ever disagree, the entry wins.
 
 ---
 
@@ -272,3 +282,73 @@ Nothing in the tree consumes an untrusted selection today, so this is an API-sha
 a defect, and it is recorded here instead of being silently assumed. If a future caller ever accepts
 a selection from configuration or the network, either the fields must become private with
 `resolve`-only construction or the type must gain a `validate()` that its consumers call.
+
+---
+
+## D14 - The MoE expert GEMM is W4A8: FP8 E4M3 activations against FP4 E2M1 weights
+
+Recorded 2026-10-15. Numbering: the main checkout ended at D13. This entry is merged first and so takes
+D14; milestone 2 keeps D15 for the deleted trace features, and the milestone 4-KV entry renumbers from
+D14 to D16 when that branch rebases.
+
+**Question.** `kernels/b12x_mxfp4_moe_sm121.cu` takes packed E2M1 activations (`act_fp4`, line 69)
+while `docs/architecture/03-moe.md` section 4 described the reference's FP8 activation. The kernel
+author documented the divergence at the call site (kernel file lines 20-27: "the activation ELEMENTS
+here are E2M1, whereas the reference implementation's fp4 GEMM quantises its activation to E4M3
+(03-moe.md:131-133)") and justified it with "Specification 6.2 mandates the MXFP4 expert kernels".
+The spec's only statement on the activation format is the `MOE_MXFP4` telemetry row, "Route planner,
+576-wide grouped W4A4 GEMM, deterministic sum" (spec line 1130).
+
+**Decision.** The MoE expert GEMM is **W4A8**: FP4 E2M1 weights with one ue8m0 scale per output row
+per 32 values along K (grid `[out, in/32]`) against **dynamic FP8 E4M3 activations** with per-32
+ue8m0 scales (grid `[tokens, in/32]`). The spec's "W4A4" is a defect, not a mandate. The doc and the
+kernel must cite the same evidence: `docs/architecture/03-moe.md` now states the format and both
+scale grids explicitly (section 4, lines 116-168) and records the spec defect as delta D7
+(03-moe.md:228-239). The kernel header still says E2M1 and needs the same citation; that file belongs
+to `sparkflash-kernels` (kernel-dev), so it was reported rather than edited here.
+
+**Evidence, three independent sources.**
+
+1. *The checkpoint declares the activation scheme.* `inference/config.json:12-21` is
+   `quant_method: "fp8"`, `activation_scheme: "dynamic"`, `weight_block_size: [32, 32]`,
+   `scale_fmt: "ue8m0"`, `expert_dtype: "fp4"`. No activation tensor is stored in the checkpoint at
+   all, so the config is the only activation-format statement it makes, and it names dynamic FP8 for
+   activations; `expert_dtype: "fp4"` names the routed **weight** format only.
+2. *The reference forward is typed W4A8.* `inference/model.py:181-195` dispatches on the weight dtype
+   and calls the same FP8 activation quantiser in both branches `act_quant(x, 32, "ue8m0",
+   e8m0fnu)` (lines 187 and 197); the fp4 GEMM is documented "FP8 act x FP4 weight GEMM" and typed
+   `A: T.Tensor[(M, K), FP8]`, `B: T.Tensor[(N, K), FP4]` (`inference/kernel.py:486-499, 511-515`),
+   asserting `a_s.numel() == M * (K // 32)` and `b_s.shape == (N, K // 32)` (kernel.py:581-582). The
+   E2M1 activation quantiser `fp4_act_quant` is never a GEMM input: its call sites are the indexer K
+   (model.py:546), the indexer Q (model.py:552) and the compressed-KV cache (model.py:760).
+3. *The spec contradicts itself first.* Section 2.4 step 4 has the fused mHC kernel write the block
+   input as dynamic FP8 `32x32 ue8m0` (spec line 86); that block input is what the MoE consumes.
+   Re-quantising it to E2M1 inside the MoE is an extra step no source defines, and the `MOE_MXFP4`
+   row's "W4A4" is the only place the spec says otherwise. Milestone 4 names the kernel with no
+   activation claim (spec line 1338), and "MXFP4" in the filename and in spec line 44 names the
+   weight format.
+
+**Scale grids.** Two grids, now stated verbatim in `03-moe.md:151-161`. The FP8 (dense and shared
+expert) weight scale is a 2-D block grid `[ceil(out/32), ceil(in/32)]` (kernel.py:293-298,
+model.py:225-233); the FP4 expert weight scale is `[out, in/32]`, one ue8m0 scale per output row per
+32 along K with no blocking along `out` (kernel.py:581-582, model.py:219-224). Activations use
+`[tokens, in/32]` on both paths (kernel.py:294, 581). The kernel and `mxfp4_ref.rs` already implement
+the `[out, in/32]` weight grid, so aligning the divergence changes the A operand's element type, not
+the scale layout.
+
+**Consequence.** A loader must hand this kernel FP8 E4M3 activations with per-32 ue8m0 scales. The
+reference MMA is fp8 x fp8 - the kernel casts each FP4 weight sub-block to FP8 through float before the
+dot product (kernel.py:496-498) - so an E2M1 A operand would be a different arithmetic, not merely a
+different operand type, and it could not be validated bit-for-bit against the reference. **Decided
+(Lead, 2026-10-15):** `kernels/b12x_mxfp4_moe_sm121.cu` gains FP8 E4M3 activations with per-32 ue8m0
+scales and keeps its FP4 weights and their `[out, in/32]` grid; the E2M1 A operand is **not** kept on
+throughput grounds, because the released artefact is an inference path typed W4A8 whose only E2M1
+activation call sites are the indexer K, the indexer Q and the KV cache. That edit is routed to
+`kernel-dev`; this entry and `03-moe.md` section 4 are the citation both sides now share.
+
+**Verification.** Doc-only change plus this entry; no GPU and no cluster were involved, and every
+claim above is a line-cited reading of `config.json`, `model.py`, `kernel.py` and the spec. The
+reference tree was read at `/home/user/dsv41-research`; the kernel file was read at
+`wt/m4k/kernels/b12x_mxfp4_moe_sm121.cu` (the workspace-root `kernels/` directory of specification
+5.1, not a `crates/sparkflash-kernels/kernels/` subdirectory). No git commands were run; the edits
+are in the `docs/architecture` worktree.
