@@ -8,7 +8,7 @@
 //! Detection is exact and structural:
 //!
 //! * An N-gram g of length n repeated R times back to back makes the last n*R tokens
-//!   periodic with period n. That is equivalent to token[i] == token[i - n] holding for
+//!   periodic with period n. That is equivalent to token\[i\] == token\[i - n\] holding for
 //!   the last n*(R-1) tokens, which is a single counter plus a ring of n+1 token hashes.
 //! * R identical consecutive newline-terminated lines, each at least min_line_bytes long,
 //!   are tracked with two reusable string buffers.

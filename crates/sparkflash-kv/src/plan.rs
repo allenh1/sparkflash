@@ -15,32 +15,54 @@ use crate::config::{KV_PAGE_TOKENS, SWA_WINDOW_SIZE};
 /// Cumulative KV cache telemetry exported through /v1/cluster/stats and Prometheus.
 #[derive(Debug, Default)]
 pub struct KvCacheTelemetry {
+    /// Prompts planned since process start.
     pub requests_total: AtomicU64,
+    /// Prompt tokens those plans covered.
     pub prompt_tokens_total: AtomicU64,
+    /// Matched tokens served from coherent UMA.
     pub global_kv_uma_hit_tokens: AtomicU64,
+    /// Matched tokens restored from the NVMe persistent tier.
     pub global_kv_nvme_hit_tokens: AtomicU64,
+    /// Prompt tokens found in no global KV tier and therefore encoded in full.
     pub global_kv_miss_tokens: AtomicU64,
+    /// Plans whose 128-token SWA tail was still resident in the ring.
     pub swa_tail_cache_hits: AtomicU64,
+    /// Plans whose cached prefix needed bounded replay to rebuild that tail.
     pub swa_tail_cache_misses: AtomicU64,
+    /// Tokens replayed through the encoder layers to rebuild sliding-window KV.
     pub encoder_swa_replay_tokens_total: AtomicU64,
+    /// Tokens replayed through the decoder layers for the prompt tail.
     pub decoder_swa_replay_tokens_total: AtomicU64,
+    /// Pages currently allocated from the pool.
     pub active_kv_pages: AtomicU64,
+    /// Size of the paged KV pool, as last reported by the allocator.
     pub total_kv_pages: AtomicU64,
 }
 
 /// Point-in-time snapshot of the KV cache telemetry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct KvCacheStatsSnapshot {
+    /// Prompts planned since process start.
     pub requests_total: u64,
+    /// Prompt tokens those plans covered.
     pub prompt_tokens_total: u64,
+    /// Matched tokens served from coherent UMA.
     pub global_kv_uma_hit_tokens: u64,
+    /// Matched tokens restored from the NVMe persistent tier.
     pub global_kv_nvme_hit_tokens: u64,
+    /// Prompt tokens found in no global KV tier and therefore encoded in full.
     pub global_kv_miss_tokens: u64,
+    /// Plans whose 128-token SWA tail was still resident in the ring.
     pub swa_tail_cache_hits: u64,
+    /// Plans whose cached prefix needed bounded replay to rebuild that tail.
     pub swa_tail_cache_misses: u64,
+    /// Tokens replayed through the encoder layers to rebuild sliding-window KV.
     pub encoder_swa_replay_tokens_total: u64,
+    /// Tokens replayed through the decoder layers for the prompt tail.
     pub decoder_swa_replay_tokens_total: u64,
+    /// Pages currently allocated from the pool.
     pub active_kv_pages: u64,
+    /// Size of the paged KV pool, as last reported by the allocator.
     pub total_kv_pages: u64,
     /// Fraction of prompt tokens served from any global KV tier.
     pub global_kv_hit_rate: f64,
@@ -49,6 +71,7 @@ pub struct KvCacheStatsSnapshot {
 /// Result of matching an incoming prompt against the radix prefix tree and the SWA tail ring.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrefixMatchPlan {
+    /// Length of the prompt this plan was computed for.
     pub total_prompt_tokens: usize,
     /// Prefix tokens matched in global KV, aligned down to a 64-token page boundary.
     pub global_kv_cached_tokens: usize,

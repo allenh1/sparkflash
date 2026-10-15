@@ -1,8 +1,10 @@
-# SparkFlash-RS CI: weight-free, GPU-free correctness gate.
+# SparkFlash-RS CI: weight-free correctness gate.
 #
-# Everything in this pipeline runs on any x86_64 or aarch64 host: no CUDA toolkit, no
-# checkpoint, no RDMA fabric. Hardware-specific crates are exercised through their CPU
-# reference implementations and mock transports.
+# Everything in this pipeline runs on any x86_64 or aarch64 host: no checkpoint, no RDMA
+# fabric, and no GPU. Hardware-specific crates are exercised through their CPU reference
+# implementations and mock transports. CUDA is the one exception, and it still needs no GPU:
+# the cuda-abi job compiles device-only code with nvcc, which is enough to type-check every
+# static assert in the shared trace ABI header.
 stages:
   - check
   - test
@@ -32,21 +34,66 @@ clippy:
     - rustup component add clippy
     - cargo clippy --workspace --all-targets -- -D warnings
 
+# Every public item in the workspace must carry a doc comment. Review round 5 found that
+# nothing had ever run this, which is how sparkflash-trace, sparkflash-kv, sparkflash-comm
+# and sparkflash-cli all drifted out of compliance.
+rustdoc:
+  stage: check
+  script:
+    - RUSTDOCFLAGS="-D missing_docs" cargo doc --workspace --no-deps
+
 test:
   stage: test
   script:
     # No --all-features here on purpose: the only optional feature in the workspace is
     # sparkflash-kernels/cuda, and enabling it pulls in cudarc, whose build script refuses to
-    # configure a CUDA version without a toolkit and a target. CUDA is exercised by the
-    # separate cuda job below, which is allowed to fail when no toolchain is present.
+    # configure a CUDA version without a toolkit and a target. CUDA is exercised by cuda-abi
+    # below, which runs in an image that really has a toolkit.
     - cargo test --workspace
     - cargo test -p sparkflash-trace --no-default-features
 
-# Compiles the shared trace ABI header and the sm_121a kernels when a toolkit exists. The job
-# is allowed to fail: CI runners without a GPU must still gate correctness.
-cuda:
+# Actually compiles CUDA. This replaces a job that ran `command -v nvcc || exit 0` in a
+# rust:1.98 image and therefore never compiled a single line of CUDA in its life.
+#
+# It is a hard gate on purpose: no allow_failure, no `|| exit 0`, and no SPARKFLASH_CUDA_ARCH
+# override. build.rs defaults to the DGX Spark target sm_121a, so a toolkit that does not know
+# that architecture fails here instead of quietly compiling something else.
+cuda-abi:
   stage: test
-  allow_failure: true
+  image: nvidia/cuda:12.9.1-devel-ubuntu22.04
+  variables:
+    RUSTUP_HOME: "$CI_PROJECT_DIR/.rustup"
+    CARGO_TARGET_DIR: "$CI_PROJECT_DIR/target-cuda"
+    # Named explicitly so a missing toolkit is a loud failure rather than the silent skip that
+    # made the previous job useless.
+    SPARKFLASH_NVCC: /usr/local/cuda/bin/nvcc
+  cache:
+    - key: "cargo-$CI_COMMIT_REF_SLUG"
+      paths:
+        - .cargo-home/
+    - key: "cuda-$CI_COMMIT_REF_SLUG"
+      paths:
+        - target-cuda/
+        - .rustup/
   script:
-    - command -v nvcc || exit 0
-    - cargo test -p sparkflash-kernels --features cuda
+    - test -x "$SPARKFLASH_NVCC"
+    - $SPARKFLASH_NVCC --version
+    - apt-get update
+    - apt-get install -y --no-install-recommends ca-certificates curl gcc g++ make
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --component rustfmt --component clippy
+    - . "$CARGO_HOME/env"
+    - rustc --version
+    # build.rs writes its PTX into OUT_DIR, which is not part of cargo's fingerprint, so a
+    # target dir restored from cache could satisfy the assertion below without compiling
+    # anything. Clearing just this crate forces the build script to run again.
+    - cargo clean -p sparkflash-kernels
+    - cargo test -p sparkflash-kernels
+    # Proof that nvcc really compiled the probe for sm_121a: build.rs only writes this file
+    # when the toolkit accepted the header, and it is silent (a cargo warning) when nvcc is
+    # missing or refuses the architecture.
+    - test -n "$(find "$CARGO_TARGET_DIR" -name trace_abi_probe.ptx -print -quit)"
+    - find "$CARGO_TARGET_DIR" -name trace_abi_probe.ptx -exec ls -l {} +
+    # The job this replaced also claimed to test --features cuda and never did. cudarc's
+    # build script refuses to pick a CUDA version on its own, so the version is resolved
+    # from the toolkit nvcc in this image rather than hard-coded.
+    - cargo test -p sparkflash-kernels --features cuda,cudarc/cuda-version-from-build-system

@@ -14,23 +14,41 @@ use std::fmt;
 pub struct TraceScope;
 
 impl TraceScope {
+    /// Empty mask: no domain is instrumented.
     pub const NONE: u64 = 0;
+    /// Prompt and image encoding: tokenization, NFKC compression, ViT unshuffle.
     pub const API_ENCODE: u64 = 1 << 0;
+    /// Request scheduling: queue wait and PREFILL_BYPASS interleaving.
     pub const SCHED_BATCH: u64 = 1 << 1;
+    /// KV manager: radix lookup, 64-token page allocation, NVMe KV load.
     pub const KV_RADIX: u64 = 1 << 2;
+    /// Sliding-window rebuild: encoder replay versus decoder replay of the tail.
     pub const SWA_REPLAY: u64 = 1 << 3;
+    /// Engram CPU tiers: 24-head XOR hash plus Tier-1 DRM and Tier-2 UMA lookups.
     pub const ENGRAM_PREFETCH: u64 = 1 << 4;
+    /// Engram NVMe tier: io_uring submission, queue depth and O_DIRECT completion.
     pub const ENGRAM_IO_URING: u64 = 1 << 5;
+    /// Engram gate kernel: wkv GEMM, RMSNorm dot-product gate and mean alpha.
     pub const ENGRAM_GPU_GATE: u64 = 1 << 6;
+    /// Mega-mHC kernel: residual mix, Sinkhorn-20 and the dynamic FP8 cast.
     pub const MEGA_MHC: u64 = 1 << 7;
+    /// FlashMLA CSA2 indexer: Top-512 scoring and the HSI pool build.
     pub const CSA2_INDEXER: u64 = 1 << 8;
+    /// FlashMLA CSA2 attention: FP4 dequant, 64-token paged MLA, FP8 SWA combine.
     pub const CSA2_ATTN: u64 = 1 << 9;
+    /// Dense MXFP8 projections: wqkv_a, wq_b, wo_a and the shared expert GEMMs.
     pub const DENSE_MXFP8: u64 = 1 << 10;
+    /// MXFP4 MoE: route planning, the grouped W4A4 GEMM and its deterministic sum.
     pub const MOE_MXFP4: u64 = 1 << 11;
+    /// DSpark drafter: the layers 37..39 draft pass, Markov head and confidence cap.
     pub const DSPARK_DRAFT: u64 = 1 << 12;
+    /// RoCEnante RDMA: staging, the peer-ready wait and the canonical-order reduce.
     pub const ROCENANTE_RDMA: u64 = 1 << 13;
+    /// NCCL fallback collectives, used during sequence-parallel prefill.
     pub const NCCL_COLLECTIVE: u64 = 1 << 14;
+    /// Side-stream L2 warner that overlaps the RoCEnante wait window.
     pub const L2_PREFETCH: u64 = 1 << 15;
+    /// Every defined domain set, i.e. all sixteen bits.
     pub const ALL: u64 = 0xFFFF;
 
     /// Number of defined scopes.
@@ -91,10 +109,13 @@ impl TraceScope {
 /// Why a scope specification could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ScopeParseError {
+    /// The specification contained no tokens at all.
     #[error("empty scope specification")]
     Empty,
+    /// A token matched no scope name; carries the rejected token.
     #[error("unknown trace scope: {0}")]
     UnknownScope(String),
+    /// More entries than the parser accepts; carries the maximum it takes.
     #[error("scope specification has too many entries (max {0})")]
     TooMany(usize),
 }
