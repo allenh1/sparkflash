@@ -1171,6 +1171,127 @@ mod uring {
     /// matched by its raw value.
     const ETIME: i32 = 62;
 
+    /// Linux EPERM: a seccomp policy (the default Docker profile, for one) refuses
+    /// io_uring_setup outright.
+    #[cfg(test)]
+    const EPERM: i32 = 1;
+
+    /// Linux EACCES: the same refusal from a capability check.
+    #[cfg(test)]
+    const EACCES: i32 = 13;
+
+    /// Linux ENOSYS: the kernel has no io_uring_setup at all.
+    #[cfg(test)]
+    const ENOSYS: i32 = 38;
+
+    /// The errno of an io_uring_setup failure that means *this environment forbids io_uring*
+    /// rather than *the ring is broken*.
+    ///
+    /// Only EPERM, EACCES and ENOSYS qualify: the first two are a seccomp profile or a capability
+    /// check refusing the syscall, the third is a kernel without it. Every other failure -
+    /// EMFILE, ENOMEM, EINVAL, a depth the kernel rejects - is a real failure and must panic,
+    /// because an environment that permits io_uring and still fails is what these tests exist to
+    /// catch. It is pure over the error so the test
+    /// only_the_errnos_that_forbid_io_uring_are_skipped can pin the narrowness of the skip
+    /// instead of a comment asserting it (CI feature sweep, round 6).
+    ///
+    /// Test-only: production never decides to skip.
+    #[cfg(test)]
+    fn skip_errno(error: &std::io::Error) -> Option<i32> {
+        let errno = error.raw_os_error()?;
+        matches!(errno, EPERM | EACCES | ENOSYS).then_some(errno)
+    }
+
+    /// The one line a ring test that could not run leaves in the job log.
+    ///
+    /// It names the test and the missing capability, and says in as many words that nothing was
+    /// verified, so a green io-uring job is not read as full coverage.
+    #[cfg(test)]
+    fn ring_skip_line(test: &str, detail: &str) -> String {
+        format!(
+            "IO_URING UNAVAILABLE: {test} did NOT verify the ring ({detail}); run the io-uring \
+             tests on a host that permits io_uring_setup\n"
+        )
+    }
+
+    /// The running test's name, for the skip line and the panic message.
+    #[cfg(test)]
+    fn test_name() -> String {
+        std::thread::current()
+            .name()
+            .map(str::to_owned)
+            .unwrap_or_else(|| String::from("a ring test on an unnamed thread"))
+    }
+
+    /// Writes a skip line straight to the process's stderr.
+    ///
+    /// Not eprintln!: the test harness captures the print macros, so a skipped test's line would
+    /// never reach the job log - which is exactly how a silent gap is mistaken for coverage.
+    #[cfg(test)]
+    fn report_skip(line: String) {
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+    }
+
+    /// Whether a skip is acceptable, decided by the environment alone.
+    ///
+    /// The CI runner's seccomp profile forbids io_uring_setup, so the ring tests skip there and the
+    /// job is green having verified nothing; the loud line is the record of that. A host that does
+    /// permit io_uring - a developer machine, or the cluster - can set
+    /// `SPARKFLASH_REQUIRE_IO_URING=1` to turn the skip into a failure, so "the ring tests ran
+    /// here" is a claim somebody can check instead of assume. Pure over the variable's value so the
+    /// rule is testable without mutating the process environment, which is global to the test
+    /// binary and would race every other test in it.
+    #[cfg(test)]
+    fn skip_is_allowed(require: Option<&std::ffi::OsStr>) -> bool {
+        require.is_none_or(|value| value.is_empty() || value == "0")
+    }
+
+    /// Creates the ring a test needs, or reports that this environment forbids io_uring and
+    /// returns None so the test returns early.
+    ///
+    /// Only the errnos skip_errno allows produce None; anything else still panics, with the same
+    /// shape these tests used before the helper existed. The skip is itself refusable: see
+    /// [skip_is_allowed].
+    #[cfg(test)]
+    pub(super) fn ring_or_skip(depth: u32) -> Option<IoUring> {
+        match IoUring::new(depth) {
+            Ok(ring) => Some(ring),
+            Err(error) => match skip_errno(&error) {
+                Some(errno) => {
+                    let line = ring_skip_line(
+                        &test_name(),
+                        &format!("io_uring_setup was refused with errno {errno}: {error}"),
+                    );
+                    if !skip_is_allowed(std::env::var_os("SPARKFLASH_REQUIRE_IO_URING").as_deref())
+                    {
+                        panic!(
+                            "{line}SPARKFLASH_REQUIRE_IO_URING is set, so an unverified ring is a failure here"
+                        );
+                    }
+                    report_skip(line);
+                    None
+                }
+                None => {
+                    let test = test_name();
+                    panic!("{test}: an io_uring ring of depth {depth}: {error}")
+                }
+            },
+        }
+    }
+
+    /// Reports that a test which asked for the ring ended up not using it, because the Auto
+    /// backend fell back to the pool.
+    ///
+    /// The fallback path is covered by its own test; the ring is not, and this line says so where
+    /// a job log can see it.
+    #[cfg(test)]
+    pub(super) fn report_ring_not_verified(reason: &str) {
+        report_skip(ring_skip_line(
+            &test_name(),
+            &format!("the ring was not used: {reason}"),
+        ));
+    }
+
     /// The engine's handle on the ring worker.
     pub(super) struct RingHandle {
         pub(super) tx: Sender<Job>,
@@ -1688,7 +1809,7 @@ mod uring {
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
         use std::time::{Duration, Instant};
 
-        use io_uring::{IoUring, types};
+        use io_uring::types;
 
         use super::super::{InFlight, record_lost_completion, retire_accepted, retire_slots};
         use super::{CQE_TIMEOUT, ETIME};
@@ -1720,12 +1841,17 @@ mod uring {
             }
         }
 
+        /// Needs a real ring: on an environment that forbids io_uring this reports the skip and
+        /// returns, verifying nothing, because the bounded wait is the syscall's own behaviour.
+        ///
         /// The bounded wait returns a timeout instead of blocking. This is the property that
         /// stops a lost completion from wedging the worker inside `io_uring_enter`, and with
         /// it `Drop`'s join.
         #[test]
         fn the_completion_wait_returns_a_timeout() {
-            let ring = IoUring::new(8).expect("an io_uring ring");
+            let Some(ring) = super::ring_or_skip(8) else {
+                return;
+            };
             let timeout = types::Timespec::from(Duration::from_millis(20));
             let args = types::SubmitArgs::new().timespec(&timeout);
             let started = Instant::now();
@@ -1747,6 +1873,77 @@ mod uring {
                 elapsed < Duration::from_secs(5),
                 "the wait was not bounded: {elapsed:?}"
             );
+        }
+
+        /// The skip is narrow: only the errnos that mean this environment forbids io_uring are
+        /// skipped, and every other failure still panics. The classification is a pure function
+        /// over the error, so it is pinned here with synthetic errors instead of trusted from a
+        /// comment on ring_or_skip. No ring is created, so this test runs even on a runner whose
+        /// seccomp policy refuses io_uring_setup (CI feature sweep, round 6).
+        #[test]
+        fn only_the_errnos_that_forbid_io_uring_are_skipped() {
+            for (errno, kind) in [
+                (super::EPERM, std::io::ErrorKind::PermissionDenied),
+                (super::EACCES, std::io::ErrorKind::PermissionDenied),
+                (super::ENOSYS, std::io::ErrorKind::Unsupported),
+            ] {
+                let error = std::io::Error::from_raw_os_error(errno);
+                assert_eq!(
+                    super::skip_errno(&error),
+                    Some(errno),
+                    "errno {errno} ({kind:?}) means this environment forbids io_uring: skip it"
+                );
+            }
+            for errno in [super::ETIME, 24, 12, 22, 16, 0] {
+                let error = std::io::Error::from_raw_os_error(errno);
+                assert_eq!(
+                    super::skip_errno(&error),
+                    None,
+                    "errno {errno} is a real ring failure and must still panic, not skip"
+                );
+            }
+            assert_eq!(
+                super::skip_errno(&std::io::Error::other("an error without an errno")),
+                None,
+                "a failure with no errno is a real failure"
+            );
+            let line = super::ring_skip_line(
+                "prefetch::uring::timeout_tests::some_test",
+                "io_uring_setup was refused with errno 1",
+            );
+            assert!(
+                line.contains("some_test")
+                    && line.contains("errno 1")
+                    && line.contains("did NOT verify"),
+                "the skip line must name the test and the missing capability: {line}"
+            );
+        }
+
+        /// A skip is the environment's decision and can be refused: an unset, empty or "0"
+        /// SPARKFLASH_REQUIRE_IO_URING allows it, and any other value makes the unverified ring a
+        /// failure. The rule is pure over the value, so this runs without mutating the process
+        /// environment, which every test in this binary shares (CI feature sweep, round 6).
+        #[test]
+        fn a_skip_is_refused_when_the_environment_demands_a_ring() {
+            use std::ffi::OsStr;
+            assert!(
+                super::skip_is_allowed(None),
+                "an unset variable allows the skip"
+            );
+            assert!(
+                super::skip_is_allowed(Some(OsStr::new(""))),
+                "an empty value allows the skip"
+            );
+            assert!(
+                super::skip_is_allowed(Some(OsStr::new("0"))),
+                "0 allows the skip"
+            );
+            for value in ["1", "true", "yes", "on"] {
+                assert!(
+                    !super::skip_is_allowed(Some(OsStr::new(value))),
+                    "{value} must make an unverified ring a failure, not a skip"
+                );
+            }
         }
 
         /// A lost completion retires every request that was in the ring, tells each waiter why,
@@ -1790,6 +1987,11 @@ mod uring {
             );
         }
 
+        /// The worker this drives holds a ring, so on an environment that forbids io_uring it
+        /// reports the skip and returns: what goes unverified there is the RingWorker glue around
+        /// the drain, while a_lost_completion_retires_every_request_in_the_ring covers the same
+        /// retirement without a ring.
+        ///
         /// A stall with a backlog retires the ring's slots, the worker's own backlog and the jobs
         /// still waiting in the channel. Accepted requests live in all three, the worker exits on
         /// a stall, and the channel is a second queue on top of the ring depth, so the last two
@@ -1799,10 +2001,13 @@ mod uring {
         #[test]
         fn a_stall_retires_the_slots_the_backlog_and_the_queue() {
             let depth = 2;
+            let Some(ring) = super::ring_or_skip(depth as u32 + 1) else {
+                return;
+            };
             let (tx, rx) = crossbeam_channel::bounded::<Job>(depth);
             let shared = std::sync::Arc::new(shared_with(0));
             let mut worker = super::RingWorker {
-                ring: IoUring::new(depth as u32 + 1).expect("an io_uring ring"),
+                ring,
                 files: Vec::new(),
                 file_bytes: Vec::new(),
                 buffers: Vec::new(),
@@ -2842,16 +3047,25 @@ mod uring_tests {
             );
             assert!(engine.snapshot().ring_submissions >= 1);
         } else {
+            uring::report_ring_not_verified(engine.fallback_reason().unwrap_or_default());
             assert!(engine.snapshot().pool_reads >= 1);
         }
     }
 
+    /// Needs the engine's own ring: on an environment that forbids io_uring this reports the skip
+    /// and returns, verifying nothing. The window arithmetic below is covered ring-free by
+    /// build_entry and reap; the syscall path is not.
+    ///
     /// The tail a 512-padded rank file leaves: the ring serves the final rows whose windows round
     /// past the padded end, every row arrives byte for byte, and nothing is published from bytes
     /// the kernel did not write. Before the fix the ring refused those windows, so a rank file on
     /// the device this project targets had a tail it never served (review A3, round 4).
     #[test]
     fn the_ring_serves_a_tail_window_that_overruns_the_padded_end() {
+        // The engine creates its own ring, so this is a capability probe of the same syscall.
+        if uring::ring_or_skip(wide_ring_config().queue_depth as u32).is_none() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let spec = packed_file(dir.path(), 37);
         let padded = std::fs::metadata(&spec.path)
@@ -2897,7 +3111,9 @@ mod uring_tests {
         }
     }
 
-    /// A memory-backed source has no file to open, so `Auto` must fall back and say so.
+    /// A memory-backed source has no file to open, so `Auto` must fall back and say so. On an
+    /// environment that forbids io_uring the reason it checks is the missing ring rather than the
+    /// memory source, which is reported as a coverage gap below.
     #[test]
     fn a_memory_source_falls_back_with_a_reason() {
         let spec = TableSpec {
@@ -2917,10 +3133,17 @@ mod uring_tests {
         let engine = PrefetchEngine::new(Arc::new(table), ring_config()).unwrap();
         assert_eq!(engine.backend(), PrefetchBackend::ThreadPool);
         let reason = engine.fallback_reason().unwrap_or_default();
+        if reason.contains("io_uring unavailable") {
+            uring::report_ring_not_verified(reason);
+        }
         assert!(reason.contains("io_uring"), "unexpected reason: {reason}");
     }
 
     /// Asking for the ring explicitly must fail loudly instead of falling back silently.
+    ///
+    /// Needs a real ring: on an environment that forbids io_uring this reports the skip and
+    /// returns, because the error below would then be the missing ring rather than the memory
+    /// source, and the assertion would pass without verifying what it names.
     #[test]
     fn requiring_the_ring_on_a_memory_source_fails() {
         let spec = TableSpec {
@@ -2937,6 +3160,9 @@ mod uring_tests {
         };
         let mut table = MemoryTable::new().with_layer(spec);
         table.fill_pattern(0).unwrap();
+        if uring::ring_or_skip(ring_config().queue_depth as u32).is_none() {
+            return;
+        }
         let engine =
             PrefetchEngine::with_backend(Arc::new(table), ring_config(), BackendRequest::IoUring);
         assert!(engine.is_err(), "the ring cannot serve a memory source");
@@ -2969,10 +3195,7 @@ mod uring_tests {
         )
         .unwrap();
         if engine.backend() != PrefetchBackend::IoUring {
-            eprintln!(
-                "skipping: the ring is unavailable here ({})",
-                engine.fallback_reason().unwrap_or_default()
-            );
+            uring::report_ring_not_verified(engine.fallback_reason().unwrap_or_default());
             return;
         }
         let rows: Vec<u32> = (0..8).collect();
@@ -3034,10 +3257,7 @@ mod uring_tests {
         )
         .unwrap();
         if engine.backend() != PrefetchBackend::IoUring {
-            eprintln!(
-                "skipping: the ring is unavailable here ({})",
-                engine.fallback_reason().unwrap_or_default()
-            );
+            uring::report_ring_not_verified(engine.fallback_reason().unwrap_or_default());
             return;
         }
         // Shrink the file under the ring. Both the store and the ring have already cached its
