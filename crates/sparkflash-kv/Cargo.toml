@@ -7,7 +7,11 @@ authors.workspace = true
 description = "3-tier radix KV cache, CSA2 page tables and SWA Bounded Replay planner"
 
 [dependencies]
+libc = { workspace = true }
+parking_lot = { workspace = true }
 serde = { workspace = true }
 sparkflash-trace = { workspace = true }
 thiserror = { workspace = true }
-parking_lot = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -352,3 +352,63 @@ reference tree was read at `/home/user/dsv41-research`; the kernel file was read
 `wt/m4k/kernels/b12x_mxfp4_moe_sm121.cu` (the workspace-root `kernels/` directory of specification
 5.1, not a `crates/sparkflash-kernels/kernels/` subdirectory). No git commands were run; the edits
 are in the `docs/architecture` worktree.
+
+---
+
+## D16 - Six spec defects in 5.5 (KV cache and SWA Bounded Replay), recorded 2026-10-15
+
+Found while implementing `sparkflash-kv` (milestone 4, task-12). Facts only, with spec line
+numbers from `deepseek_v41_flash_4x_dgx_spark_rust_spec.md`; where the code settles a question,
+that is stated.
+
+**1. The 890 B/token headline contradicts its own itemisation (spec lines 73, 76).** Line 76
+itemises one global entry as "256 bytes + 32 bytes of `E4M3` scales per 16 channels" for the main
+KV, "plus `qk_rope_head_dim = 64`", "and Indexer K (128 dim in MXFP4 = 64 bytes + 4 bytes
+`ue8m0`)". That is 420 B/entry, and 2.5 entries/token (layers 2/8/14 at m=2, layer 20 at m=1)
+gives **1050 B/token**, not the **890** the same sentence asserts. 890 closes only if the rotary
+dimensions are not counted twice, i.e. if `head_dim = 512` already contains
+`qk_rope_head_dim = 64`; the entry is then 356 B (288 + 68). The D1 entry of section 7 ("Spec
+deltas") of `docs/architecture/08-kv-footprint.md` derives the same 1050 (heading at line 171,
+derivation at lines 173-175), while section 4 starts at line 75. **Code:** `sparkflash-kv`
+uses 356 B per entry, 890 B per token and 56,960 B per 64-token page (160 entries);
+`tests/layout.rs` pins 1050 and 890 side by side so the contradiction cannot be tidied away.
+
+**2. `plan_request` clamps the hit, which makes the spec's zero-decoder-replay branch unreachable
+(spec lines 841, 846, 861-865).** Line 841 is
+`raw_cached = (uma + nvme).min(total_prompt_tokens - 1)`, so
+`global_kv_cached_tokens <= total - 1` and `uncached_suffix_tokens >= 1` for every non-empty
+prompt (line 846). Line 861 returns 0 decoder replay tokens only when
+`swa_tail_hit && uncached_suffix_tokens == 0`, a condition that clamp forbids. As specified, that
+branch is dead code.
+
+**3. Three different memory floors, and only two of them are in the spec (spec lines 180, 1324).**
+Line 180 budgets a 9.12 GiB "MemAvailable Floor Guard" inside the 121.7 GiB per-node total
+(line 181). Line 1324 requires `MemAvailable >= 114 GiB` per node before weight loading. The
+third figure, 8 GiB, is not in the spec at all: it comes from the milestone 4 task brief, which
+describes it as "mentioned in the spec". **Code:** the configurable floor is the brief's 8 GiB
+(`layout::MEMORY_FLOOR_BYTES`, enforced by `MemoryBudget` and `KvCacheConfig::validate`); the
+9.12 GiB and 114 GiB values are host preflight numbers owned by deployment, not by this crate.
+
+**4. "72h persistent" is a label with no TTL API (spec lines 818, 939).** Both occurrences are
+doc comments naming Tier-2 the "NVMe Persistent 72h Cache" (line 818) and the "NVMe 72-hour
+persistent Global KV store" (line 939). Section 5.5 defines no expiry, timestamp or
+eviction-by-age operation anywhere. **Code:** the file-backed tier persists a roster and survives
+a reopen, but nothing expires on wall-clock time. If 72-hour retention is a requirement it is
+unimplemented and needs an API.
+
+**5. The two bounded replays cannot reconstruct a SWA tail on their own (a consequence of 2).**
+Encoder replay covers the last `min(cached, 128)` tokens of the *cached prefix* (lines 850, 855);
+decoder replay covers the last `min(total, 128)` tokens of the *prompt* (line 864). Those windows
+coincide only when `cached == total`, which finding 2 forbids. On a partial hit the encoder half
+is regenerable but the decoder half is not, so the two replay calls alone can never fill all 40
+layers of a tail. **Code:** `cache_swa_tail` is the prefill path that fills all 40 layers, and
+`SwaTail` tracks a `present_layers` bitmask so a tail only counts as a hit once every layer is
+present.
+
+**6. The 13.4 GiB pool row does not line up with the other footprint rows (spec line 174).** The
+row says 13.4 GiB holds "3.67M - 6.50M" tokens at 890 B/token. 13.4 GiB = 14,388,140,442 B is
+16,166,449 tokens, about 2.5x the stated top; conversely 3.67M and 6.50M tokens are 3.04 GiB and
+5.39 GiB. Section 3.1 of `docs/architecture/08-kv-footprint.md` (lines 66-69) derives the same.
+**Code:** the default global KV pool is sized explicitly in `KvCacheConfig`, and
+`docs/architecture/08-kv-footprint.md` is the reference for the tokens-per-GiB arithmetic.
+

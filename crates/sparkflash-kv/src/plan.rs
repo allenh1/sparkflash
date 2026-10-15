@@ -264,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn full_prefix_hit_with_swa_tail_skips_all_replay() {
+    fn full_prefix_hit_with_swa_tail_skips_encoder_replay_but_not_the_decoder_window() {
         let telemetry = KvCacheTelemetry::default();
         let plan = telemetry.plan_request(4096, 4096, 0, true);
         // Never cache away the final token: the next token still has to be produced.
