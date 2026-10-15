@@ -1,0 +1,37 @@
+[package]
+name = "sparkflash-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "OpenAI/Anthropic-compatible HTTP+SSE server for SparkFlash-RS"
+
+[dependencies]
+sparkflash-trace = { workspace = true }
+sparkflash-engram = { workspace = true }
+sparkflash-kv = { workspace = true }
+deepseek-recipe = { workspace = true }
+deepseek-recipe-core = { workspace = true }
+deepseek-recipe-encoding = { workspace = true }
+tokenizers = "0.23"
+
+axum = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+http = { workspace = true }
+prometheus = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+parking_lot = { workspace = true }
+flate2 = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
+http-body-util = { workspace = true }
+tempfile = { workspace = true }

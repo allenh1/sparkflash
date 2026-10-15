@@ -1,0 +1,52 @@
+# SparkFlash-RS CI: weight-free, GPU-free correctness gate.
+#
+# Everything in this pipeline runs on any x86_64 or aarch64 host: no CUDA toolkit, no
+# checkpoint, no RDMA fabric. Hardware-specific crates are exercised through their CPU
+# reference implementations and mock transports.
+stages:
+  - check
+  - test
+
+variables:
+  CARGO_TERM_COLOR: always
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
+
+default:
+  image: rust:1.98
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - target/
+    - .cargo-home/
+
+fmt:
+  stage: check
+  script:
+    - rustup component add rustfmt clippy
+    - cargo fmt --all -- --check
+
+clippy:
+  stage: check
+  script:
+    - rustup component add clippy
+    - cargo clippy --workspace --all-targets -- -D warnings
+
+test:
+  stage: test
+  script:
+    # No --all-features here on purpose: the only optional feature in the workspace is
+    # sparkflash-kernels/cuda, and enabling it pulls in cudarc, whose build script refuses to
+    # configure a CUDA version without a toolkit and a target. CUDA is exercised by the
+    # separate cuda job below, which is allowed to fail when no toolchain is present.
+    - cargo test --workspace
+    - cargo test -p sparkflash-trace --no-default-features
+
+# Compiles the shared trace ABI header and the sm_121a kernels when a toolkit exists. The job
+# is allowed to fail: CI runners without a GPU must still gate correctness.
+cuda:
+  stage: test
+  allow_failure: true
+  script:
+    - command -v nvcc || exit 0
+    - cargo test -p sparkflash-kernels --features cuda

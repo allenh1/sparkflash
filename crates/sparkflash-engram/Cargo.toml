@@ -1,0 +1,16 @@
+[package]
+name = "sparkflash-engram"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Deterministic Engram conditional-memory engine (hash, tiered cache, io_uring store)"
+
+[dependencies]
+serde = { workspace = true }
+sparkflash-trace = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

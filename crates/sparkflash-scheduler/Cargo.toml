@@ -1,0 +1,15 @@
+[package]
+name = "sparkflash-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Continuous batcher, CED prefill bypass and DSpark confidence scheduler"
+
+[dependencies]
+serde = { workspace = true }
+sparkflash-trace = { workspace = true }
+sparkflash-kv = { workspace = true }
+sparkflash-engram = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }

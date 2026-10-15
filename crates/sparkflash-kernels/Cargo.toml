@@ -1,0 +1,18 @@
+[package]
+name = "sparkflash-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "sm_121a CUDA kernels and CPU reference implementations"
+
+[dependencies]
+sparkflash-trace = { workspace = true }
+half = { workspace = true }
+bytemuck = { workspace = true }
+thiserror = { workspace = true }
+cudarc = { workspace = true, optional = true }
+
+[features]
+default = []
+cuda = ["dep:cudarc"]

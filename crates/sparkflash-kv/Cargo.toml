@@ -1,0 +1,13 @@
+[package]
+name = "sparkflash-kv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "3-tier radix KV cache, CSA2 page tables and SWA Bounded Replay planner"
+
+[dependencies]
+serde = { workspace = true }
+sparkflash-trace = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }

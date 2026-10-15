@@ -1,0 +1,27 @@
+[package]
+name = "sparkflash-trace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Zero-overhead scoped CPU + in-graph GPU trace points for 4x DGX Spark"
+
+[features]
+default = ["trace-points"]
+# Master compile-time switch: when off, every trace point expands to nothing.
+trace-points = []
+# Enables the in-graph GPU (%globaltimer) trace ring ABI.
+trace-gpu-in-graph = []
+# Mirrors CPU spans into NVTX v3 ranges.
+trace-nvtx = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+flate2 = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,80 @@
+[workspace]
+members = [
+    "crates/sparkflash-trace",
+    "crates/sparkflash-api",
+    "crates/sparkflash-scheduler",
+    "crates/sparkflash-kv",
+    "crates/sparkflash-engram",
+    "crates/sparkflash-comm",
+    "crates/sparkflash-kernels",
+    "crates/sparkflash-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["SparkFlash Team"]
+repository = "https://example.com/sparkflash"
+rust-version = "1.88"
+
+[workspace.dependencies]
+sparkflash-trace = { path = "crates/sparkflash-trace" }
+sparkflash-api = { path = "crates/sparkflash-api" }
+sparkflash-scheduler = { path = "crates/sparkflash-scheduler" }
+sparkflash-kv = { path = "crates/sparkflash-kv" }
+sparkflash-engram = { path = "crates/sparkflash-engram" }
+sparkflash-comm = { path = "crates/sparkflash-comm" }
+sparkflash-kernels = { path = "crates/sparkflash-kernels" }
+
+tokio = { version = "1.43", features = ["full", "rt-multi-thread", "parking_lot"] }
+axum = { version = "0.8", features = ["http2", "json", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-br"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bytes = "1.9"
+futures = "0.3"
+async-stream = "0.3"
+http = "1.2"
+http-body-util = "0.1"
+
+# Official DeepSeek V4.1 Rust encoding & protocol toolkit
+deepseek-recipe = "0.1"
+deepseek-recipe-core = "0.1"
+deepseek-recipe-encoding = "0.1"
+deepseek-recipe-image = { version = "0.1", default-features = false }
+tokenizers = "0.23"
+
+# Hardware, CUDA, RDMA, and async NVMe I/O
+cudarc = { version = "0.19", features = ["driver", "nvrtc", "f16"] }
+io-uring = "0.7"
+libc = "0.2"
+memmap2 = "0.9"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+dashmap = "6.1"
+prometheus = { version = "0.13", features = ["process"] }
+tracing = { version = "0.1", features = ["release_max_level_debug"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+anyhow = "1.0"
+thiserror = "2.0"
+half = { version = "2.4", features = ["bytemuck", "serde"] }
+bytemuck = { version = "1.21", features = ["derive"] }
+flate2 = "1.0"
+sha2 = "0.10"
+rand = "0.8"
+num_cpus = "1.16"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = 1
+
+[profile.bench]
+inherits = "release"
