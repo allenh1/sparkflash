@@ -58,6 +58,13 @@ pub struct ScopedCpuSpan {
 impl ScopedCpuSpan {
     /// Starts a span when any bit of `scope` is armed, otherwise returns None and costs a
     /// single relaxed atomic load.
+    ///
+    /// The decision is taken here and not revisited at `Drop`: a span already in flight when an
+    /// admin installs or changes the request filter is still recorded, even if its request is
+    /// filtered out by the time it ends. That is accepted, not overlooked (review M5 A5): a
+    /// capture collects the spans that were already running when it was installed - bounded by
+    /// the number of threads, not by the capture's duration - and re-reading the filter at
+    /// `Drop` would make one span's cost depend on two readings of the same global state.
     #[inline(always)]
     #[must_use]
     pub fn enter(scope: u64, label: &'static str, meta: u32) -> Option<Self> {

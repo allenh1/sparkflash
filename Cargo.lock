@@ -2166,6 +2166,7 @@ version = "0.1.0"
 dependencies = [
  "parking_lot",
  "serde",
+ "sparkflash-comm",
  "sparkflash-engram",
  "sparkflash-kv",
  "sparkflash-trace",

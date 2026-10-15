@@ -40,7 +40,8 @@ impl TraceScope {
     pub const DENSE_MXFP8: u64 = 1 << 10;
     /// MXFP4 MoE: route planning, the grouped W4A4 GEMM and its deterministic sum.
     pub const MOE_MXFP4: u64 = 1 << 11;
-    /// DSpark drafter: the layers 37..39 draft pass, Markov head and confidence cap.
+    /// DSpark drafter: the layers 37..39 draft pass, the confidence cap and anchor-expert reuse.
+    /// The rank-256 Markov head is not modelled: its logits are inputs to the survival math.
     pub const DSPARK_DRAFT: u64 = 1 << 12;
     /// RoCEnante RDMA: staging, the peer-ready wait and the canonical-order reduce.
     pub const ROCENANTE_RDMA: u64 = 1 << 13;
