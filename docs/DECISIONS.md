@@ -312,7 +312,7 @@ to `sparkflash-kernels` (kernel-dev), so it was reported rather than edited here
 
 **Evidence, three independent sources.**
 
-1. *The checkpoint declares the activation scheme.* `inference/config.json:12-21` is
+1. *The checkpoint declares the activation scheme.* `config.json:12-21` is
    `quant_method: "fp8"`, `activation_scheme: "dynamic"`, `weight_block_size: [32, 32]`,
    `scale_fmt: "ue8m0"`, `expert_dtype: "fp4"`. No activation tensor is stored in the checkpoint at
    all, so the config is the only activation-format statement it makes, and it names dynamic FP8 for
@@ -570,9 +570,10 @@ of the nine, **no command in this repository can produce the number the gate ass
 3. The three cluster gates are panic stubs: `crates/sparkflash-comm/tests/hardware_gates.rs:44-47,
    55-57, 65-67` panic "not implemented on this host" after their permission and feature checks, so the
    All-Reduce latency gate has no measurement in the test tree at all.
-4. The one real All-Reduce instrument exists and is unmerged: `rocenante-probe` on
-   `feat/rocenante-probe`. Merged `main`'s doctor expects it on `PATH` and fails check 3 without it by
-   design. Its honest limitation is that it still cannot produce a number on the real fabric, because
+4. The one real All-Reduce instrument is merged: `rocenante-probe` is a binary target of
+   `sparkflash-comm` now, and the doctor invokes it and refuses a loopback-labelled number by name, so
+   check 3 went from a missing command to an instrument that measures or refuses. Its honest
+   limitation is that it still cannot produce a number on the real fabric, because
    `RdmaTransport::open` resolves the live rails and then returns `CommError::RdmaNotBuilt`; what
    changed is the failure mode, from "no such command" to a precise refusal.
 5. `sparkflash trace --scopes all --steps 45` prints a plan; it cannot capture, because the capture path
