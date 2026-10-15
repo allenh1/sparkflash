@@ -23,6 +23,8 @@ records the evidence and the consequence for the build. Research backing is in
 | D12 | Rail device selection | Enumerate the fabric and require an ACTIVE 200 Gb/s function; a down or 40 Gb/s link is a hard startup error, with the spec's device names kept as a fallback and an operator override |
 | D13 | Dual-rail byte accounting | Keep the spec's truncating counter formula and pin the undercount with a test; the exact byte figure is the plan's, not the counter's |
 | D14 | MoE expert GEMM activation format | W4A8: FP8 E4M3 activations with per-32 ue8m0 scales against FP4 weights on `[out, in/32]`; the spec's "W4A4" is a defect and the kernel's E2M1 activation operand is replaced |
+| D16 | KV specification defects | Six 5.5 defects recorded as facts: the 890 B/token headline contradicts its own itemisation (356 B/entry once the rotary dimensions are not double-counted), plus five more, each with the code's settlement named |
+| D17 | Qualification state | Nine gates recorded with instrument, command, artifact and state; five cannot be run by any command in this tree, and 20 us at 10 KiB is the requirement while the preflight's 22 us is a deliberately looser readiness threshold |
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
 summary and the matching `## D<n>` section carries the evidence and the full consequence. If a row and
@@ -411,4 +413,64 @@ row says 13.4 GiB holds "3.67M - 6.50M" tokens at 890 B/token. 13.4 GiB = 14,388
 5.39 GiB. Section 3.1 of `docs/architecture/08-kv-footprint.md` (lines 66-69) derives the same.
 **Code:** the default global KV pool is sized explicitly in `KvCacheConfig`, and
 `docs/architecture/08-kv-footprint.md` is the reference for the tokens-per-GiB arithmetic.
+## D17 - `QUALIFICATION.md` records nine gates that no command in this tree can run, and the two All-Reduce latency numbers in the spec measure different things
 
+Recorded 2026-10-15 from the qualification survey. Numbering: D15 is milestone 2's deleted trace
+features, which is on an open branch, and D16 is milestone 4-KV's spec defects, which has merged; this
+entry takes D17 so that milestone 2 does not have to rebase a heading. Entries stand in merge order: the
+file reads D14, D16, D17 today, with D15 inserting above D16 when that branch lands.
+
+**Context.** Milestone 5 ends with correctness and throughput gates. None had ever run, and the survey
+that produced `docs/QUALIFICATION.md` asked why. The answer is not that the gates were skipped: for five
+of the nine, **no command in this repository can produce the number the gate asserts on.**
+
+**Findings, in the order they change what can be claimed.**
+
+1. There is no engine. The only `InferenceEngine` implementation in the tree is `MockEngine`
+   (`crates/sparkflash-api/src/engine.rs:372, 424, 680`); nothing under `crates/` loads checkpoint
+   weights (no `safetensors` reference exists); `serve` and `pack-engram` are unimplemented
+   (`crates/sparkflash-cli/src/main.rs:5-6`); and `server::router` builds an axum `Router`
+   (`crates/sparkflash-api/src/server.rs:200`) that nothing binds to a socket - there is no
+   `TcpListener`, no `axum::serve` and no async entry point in the workspace. So qeval, the DSpark KL
+   divergence, the 1M needle test, the sparkDash sweeps and CUDA graph capture cannot be run by any
+   command here. That is a stronger statement than "unrun": the instrument does not exist.
+2. Six run summaries have no producer. `SPARKFLASH_{QEVAL,DSPARK,NEEDLE,SPARKDASH,CUDA_GRAPH,TRACE}_RESULTS`
+   appear only in `crates/sparkflash-scheduler/src/gates.rs` (declared 32-42, read 291-374). Nothing in
+   the repository writes them, so the operator must supply the summary the gate then asserts on. A gate
+   that asserts on a summary nothing produces is a check that cannot fail on the thing it names - the
+   same pattern as the ring no job compiled and the feature sweep that skipped its own feature.
+3. The three cluster gates are panic stubs: `crates/sparkflash-comm/tests/hardware_gates.rs:44-47,
+   55-57, 65-67` panic "not implemented on this host" after their permission and feature checks, so the
+   All-Reduce latency gate has no measurement in the test tree at all.
+4. The one real All-Reduce instrument exists and is unmerged: `rocenante-probe` on
+   `feat/rocenante-probe`. Merged `main`'s doctor expects it on `PATH` and fails check 3 without it by
+   design. Its honest limitation is that it still cannot produce a number on the real fabric, because
+   `RdmaTransport::open` resolves the live rails and then returns `CommError::RdmaNotBuilt`; what
+   changed is the failure mode, from "no such command" to a precise refusal.
+5. `sparkflash trace --scopes all --steps 45` prints a plan; it cannot capture, because the capture path
+   is a hardware gate whose summary nothing produces.
+6. No CUDA graph code exists: `cudaGraph` and `cuda_graph` appear in `crates/` only inside the gate's own
+   parser and gate function.
+7. Doctor's collective probes use only the first `--nodes` address, so its "aggregate >= 180 Gbps" is two
+   local rails to one peer, not the "between all 4 ranks" the spec's preflight line asks for.
+8. The gates print nothing on success, so a green run leaves no measurement in a log; an artifact has to
+   be captured deliberately, which is why every gate section of the runbook names one.
+9. Positive: the only ignored tests in the repository whose bodies really exercise hardware are the KV
+   ones on the milestone-4 branch (`crates/sparkflash-kv/tests/hardware.rs:25`, a real NVMe `O_DIRECT`
+   round trip at the device's own alignment). They are the pattern the three comm stubs should follow.
+
+**Two latency numbers, and why both are right.** The spec states 22 us for preflight check 3 (line 1323)
+and 20 us for milestone 3 (line 1336). Nothing in the tree encoded 20. They are not in conflict once
+their roles are separated, and this entry is the separation: 20 us at 10 KiB is the requirement, and the
+preflight's 22 us is a readiness threshold, deliberately looser so that a node can pass preflight while
+still failing the requirement. A run that reports 21 us has passed the preflight and failed the gate. The
+payload is 10 KiB in both places: 2 MiB appears in the spec as the router threshold, and the hardware
+test's name for it is a naming defect rather than a second budget. Doctor encodes 22.0
+(`crates/sparkflash-cli/src/doctor.rs:101`) and this entry is why it stays there.
+
+**Consequence.** `docs/QUALIFICATION.md` is the record of what each gate would prove, the exact command
+that would run it, the artifact that would evidence it, and - for every gate - that its state today is
+"never run", with the missing instrument named where the instrument is missing. No gate may be reported
+as passing on the strength of an `#[ignore]`d test, and the only claims a green CI run supports are
+narrow: the CPU references, the threshold and parser logic, and doctor's check logic against injected
+fakes. Closing the gaps in findings 1-7 is later work, not a qualification run.
