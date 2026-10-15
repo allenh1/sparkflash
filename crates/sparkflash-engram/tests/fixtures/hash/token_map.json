@@ -1,0 +1,15 @@
+{
+  "magic": "EGTM",
+  "version": 1,
+  "tokenizer": "reference/tokenizer.json",
+  "tokenizer_sha256": "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
+  "tokenizer_bytes": 6367257,
+  "tokenizers_python_version": "0.23.3",
+  "vocab_size": 129280,
+  "compressed_vocab_size": 99092,
+  "pad_id": 2,
+  "token_map_entries": 129280,
+  "generator": "crates/sparkflash-engram/tests/fixtures/hash/generate_fixtures.py",
+  "reference": "/home/user/dsv41-research/inference/engram.py",
+  "numpy_port_cross_checked": true
+}

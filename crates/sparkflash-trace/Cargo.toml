@@ -9,11 +9,12 @@ description = "Zero-overhead scoped CPU + in-graph GPU trace points for 4x DGX S
 [features]
 default = ["trace-points"]
 # Master compile-time switch: when off, every trace point expands to nothing.
+#
+# `trace-gpu-in-graph` and `trace-nvtx` used to be declared here and gated nothing: no `cfg` in
+# the workspace named either one, so enabling them changed nothing at all, which reads as a
+# capability claim. They are deleted until the in-graph ring and the NVTX mirror exist; D15 in
+# docs/DECISIONS.md records the decision (review A6, round 4).
 trace-points = []
-# Enables the in-graph GPU (%globaltimer) trace ring ABI.
-trace-gpu-in-graph = []
-# Mirrors CPU spans into NVTX v3 ranges.
-trace-nvtx = []
 
 [dependencies]
 serde = { workspace = true }

@@ -23,6 +23,7 @@ records the evidence and the consequence for the build. Research backing is in
 | D12 | Rail device selection | Enumerate the fabric and require an ACTIVE 200 Gb/s function; a down or 40 Gb/s link is a hard startup error, with the spec's device names kept as a fallback and an operator override |
 | D13 | Dual-rail byte accounting | Keep the spec's truncating counter formula and pin the undercount with a test; the exact byte figure is the plan's, not the counter's |
 | D14 | MoE expert GEMM activation format | W4A8: FP8 E4M3 activations with per-32 ue8m0 scales against FP4 weights on `[out, in/32]`; the spec's "W4A4" is a defect and the kernel's E2M1 activation operand is replaced |
+| D15 | Two dead trace features | Deleted: neither name appeared in any cfg in the workspace, so enabling either changed nothing; the CUDA dependency selector stays because it selects cudarc |
 | D16 | KV specification defects | Six 5.5 defects recorded as facts: the 890 B/token headline contradicts its own itemisation (356 B/entry once the rotary dimensions are not double-counted), plus five more, each with the code's settlement named |
 | D17 | Qualification state | Nine gates recorded with instrument, command, artifact and state; five cannot be run by any command in this tree, and 20 us at 10 KiB is the requirement while the preflight's 22 us is a deliberately looser readiness threshold |
 
@@ -354,6 +355,132 @@ reference tree was read at `/home/user/dsv41-research`; the kernel file was read
 `wt/m4k/kernels/b12x_mxfp4_moe_sm121.cu` (the workspace-root `kernels/` directory of specification
 5.1, not a `crates/sparkflash-kernels/kernels/` subdirectory). No git commands were run; the edits
 are in the `docs/architecture` worktree.
+
+---
+
+## D10 - The CPU span ring is 48 bytes behind a per-thread mutex, not the 32-byte lock-free ring the spec describes
+
+**Context.** Specification 5.8 (line 1112) asks for "32-byte `CpuTraceEvent` records into a
+per-thread lock-free ring buffer". The implementation stores 48-byte `CpuTraceEvent` values
+(label, scope, meta, thread id, start, end) in a per-thread `Mutex<Vec<CpuTraceEvent>>`, kept in a
+process-wide registry so the exporter can drain every thread at once.
+
+**Decision.** Keep the *GPU* wire ABI byte-exact - `GpuTraceEvent` stays 32 bytes and 32-byte
+aligned, and `kernels/trace_globaltimer_sm121.cuh` is checked against it field by field by the
+build-script probe and by unit tests - and accept the CPU side deviating in record size and locking
+discipline. The GPU ABI is a contract the kernels compile against; the CPU ring is internal to one
+process and never crosses the wire.
+
+**Why not the spec's shape.** A 32-byte lock-free ring would drop the label and meta fields that
+make a CPU trace readable in Chrome/Perfetto, which is the whole point of the capture. It is also
+not on any hot path: `is_scope_enabled` short-circuits on an L1-cached mask before anything is
+touched, so a disabled engine locks and allocates nothing. An armed span does take its own
+thread's mutex, but cross-thread contention only appears when the exporter drains a capture.
+
+**Revisit when.** If armed-capture profiling ever shows CPU span recording, replace the Vec with a
+fixed-size lock-free ring and move the label to a static-table index. The change is contained
+behind `ThreadTraceState`.
+
+**Also recorded here** (found by review, not a decision): the ring constructors bound capacity at
+`MAX_RING_CAPACITY` and use checked arithmetic, because the header stores capacity - 1 in 32 bits
+and an unchecked capacity made the *safe* `slot()` accessor index out of bounds in release builds.
+
+## D11 - The RoCEnante wait is bounded and traceable instead of spinning forever
+
+**Context.** Spec 5.4 (lines 683-687) spins on `slot->arrival_seq[peer] < step_seq` with no exit
+condition. A dropped doorbell, a late peer or a NIC that never posts therefore hangs the kernel
+indefinitely, and on a unified-memory GB10 a hung kernel is not killable from the host without a
+device reset - the failure mode would take down a node that is otherwise healthy.
+
+**Decision.** The wait is bounded by a `%globaltimer` deadline with `__nanosleep` backoff
+(`SPARK_ROCENANTE_PEER_WAIT_NS`, default 1 ms, roughly 45x the 22 us gate in spec 6.1). On timeout the
+block returns a bf16 quiet NaN for the elements it owns and emits a single diagnostic trace record whose
+`payload_meta` carries the timeout flag, a 4-bit missing-rank mask and a row-overflow bit. A straggler
+thus produces a visible, attributable wrong answer instead of a dead node.
+
+**Also recorded in the kernel, because the spec is silent.** A `__syncthreads()` sits between the
+doorbell and the peer poll, which orders the ringing within a block and keeps the per-block deadline
+stamp after the doorbell. It is a block-scoped barrier, so it does not stop another block from reaching
+the poll first: what makes that safe is the sequence guard, since the poll waits for
+`arrival_seq[peer] >= step_seq` rather than for the ring. (An earlier draft of this entry claimed the
+barrier gave grid-wide ordering; the M3 review falsified that, and the poll's guard is the real reason
+no block can proceed on a peer that has not rung.) The observing threads also fence unconditionally
+after the poll, not only on the wait path, so a peer that was already visible when the block arrived is
+still acquired rather than riding on the writer's release alone. `step_seq` is strictly
+increasing per rank, and a slot is not reused for `step_seq + 1` until every rank has finished reading
+it; double buffering is the communicator's job, not the kernel's. The spec's slot struct carries no
+alignment attribute, so the slot is 8-byte aligned (by its `u64` member), not 32: `sizeof ==
+8_388_640`, pinned by `static_assert` on the C side and by a parsed-declaration test on the Rust side.
+An oversized `num_elements` is clamped and flagged rather than allowed to run into the neighbouring
+payload row; the router's 2 MiB threshold is exactly one payload row, so a conforming caller never
+reaches the clamp.
+
+## D12 - Dual-rail device selection enumerates the fabric instead of trusting the spec's device names
+
+**Context.** Spec 6.1 (check 2) and the Milestone 3 registration list name the two rails as
+`rocep1s0f0` / `enp1s0f0np0` and `roceP2p1s0f0` / `enP2p1s0f0np0`. Measured read-only on the live
+cluster, those are the **f0** functions and they are down at 40 Gb/s, while the rails actually carrying
+traffic are the **f1** functions: `rocep1s0f1` -> `enp1s0f1np1` and `roceP2p1s0f1` ->
+`enP2p1s0f1np1`, both ACTIVE at 200 Gb/s (4X HDR). Both rails share 192.0.2.0/24, and a node holds two
+addresses, one per rail (the head node is 192.0.2.80 on rail 1 and 192.0.2.85 on rail 2), with two
+default routes at different metrics.
+
+**Decision.** The communicator enumerates the RDMA devices and their netdevs and selects the ones that are
+ACTIVE at 200 Gb/s, with the spec's names kept as a documented fallback and an explicit operator override.
+Registering a device that is down, or falling back silently to a 40 Gb/s link, is a hard startup error,
+not a warning: a silent downgrade would invalidate the whole milestone's bandwidth claims while still
+producing plausible numbers.
+
+**Also measured, and relevant to the preflight.** The live nodes run kernel `6.17.0-1029-nvidia` (meets
+the `>= 6.17.0-1018` requirement) but driver `580.173.02`, which is **below** the `580.178.04` the spec
+requires, so check 1 fails on the real cluster today; the active rails report MTU 1500 rather than the
+required 9000; `nvidia_uvm` exposes no 64K-packing parameter under any conventional name among its 56
+module parameters, so "64K page packing is active" is not verifiable as written; and `MemAvailable` is
+5 GiB because the live vLLM instance holds the memory, which is why the 114 GiB gate must only be read
+while the cluster is idle.
+
+## D13 - Dispatch telemetry keeps the spec's truncating formula, and the exact figure lives in the plan
+
+**Context.** Spec 5.4 (lines 758-760) accounts dual-rail traffic as `half_bytes = num_bytes / 2;
+rdma_bytes_railN += half_bytes * 3`. With an ODD `num_bytes` the integer division truncates, so each
+rail's counter undercounts by up to 3 bytes relative to the true `3 * num_bytes / 2`.
+
+**Decision.** Keep the spec's formula for the spec-named counters, because those counters are the
+conformance surface an operator compares against the paper, and pin the behaviour with a test that
+reproduces the undercount rather than hiding it. The exact byte figure is already conserved and exposed
+by `RailPlan`, which is what the transport actually moves, so nothing about the wire behaviour depends on
+the counter. The truncation is also unreachable for this model's payloads: every collective here carries
+bf16 elements, so `num_bytes` is always even.
+
+**Also recorded.** The spec defines neither an operator override for the rail devices nor an error for an
+unusable fabric; `SPARKFLASH_RAIL_DEVICES` and `CommError::FabricUnavailable` are additions (see D12).
+
+**Recorded limitation (M3 review, non-blocking).** `RailSelection` and `SelectedRail` carry public
+fields and derive `Deserialize`, so a caller that constructs one by hand - or deserialises one - can
+still present a colliding pair: the invariant lives in `RailSelection::resolve`, not in the type.
+Nothing in the tree consumes an untrusted selection today, so this is an API-shape hazard rather than
+a defect, and it is recorded here instead of being silently assumed. If a future caller ever accepts
+a selection from configuration or the network, either the fields must become private with
+`resolve`-only construction or the type must gain a `validate()` that its consumers call.
+
+## D15 - Two dead trace features are deleted; the CUDA dependency selector stays
+
+**Context.** `sparkflash-trace` declared `trace-gpu-in-graph` ("enables the in-graph GPU
+`%globaltimer` trace ring ABI") and `trace-nvtx` ("mirrors CPU spans into NVTX v3 ranges").
+Neither name appears in any `cfg` or `cfg_attr` in the workspace, so enabling either feature
+changed nothing: a feature that gates nothing reads as "there is GPU trace code behind this" when
+there is none. The blindness only became visible once CI started discovering the workspace's
+features from cargo metadata and testing each one (MR !9). `sparkflash-kernels` also declares
+`cuda = ["dep:cudarc"]`, which likewise gates no Rust code, but it does select a real optional
+dependency, and the `cuda-abi` job builds and tests with
+`--features cuda,cudarc/cuda-version-from-build-system` in an image that has a toolkit.
+
+**Decision.** Delete `trace-gpu-in-graph` and `trace-nvtx` from
+`crates/sparkflash-trace/Cargo.toml` and add them back when the in-graph ring and the NVTX mirror
+are implemented. The specification's compile-time-features section still describes them as the
+intended design, so their absence is a gap to close, not a requirement to abandon. Keep
+`sparkflash-kernels/cuda`: it is a dependency selector exercised by the CUDA ABI job rather than a
+code gate, and it stays classified hardware-only in CI.
 
 ---
 

@@ -133,12 +133,21 @@ mod tests {
 
     #[test]
     fn rows_shard_across_four_ranks_like_the_reference() {
-        // 384006168 is not divisible by 4, so the last rank's slice is padded - exactly what
-        // convert.py produces.
+        // Layer 0 is 384006168 = 4 * 96001542, so it divides evenly and no rank is padded:
+        // rank 3 ends on the last real row.
         assert_eq!(rows_per_rank(0, 4), 96_001_542);
         assert_eq!(row_range_for_rank(0, 0, 4), 0..96_001_542);
         assert_eq!(row_range_for_rank(0, 3, 4), 288_004_626..384_006_168);
+        // Layer 1 is the layer that pads: 384016682 / 4 = 96004170.5, so every rank owns
+        // 96004171 rows and rank 3's slice runs 2 rows past the table - the zero-padded final
+        // shard convert.py produces.
         assert_eq!(rows_per_rank(1, 4), 96_004_171);
+        assert_eq!(row_range_for_rank(1, 3, 4), 288_012_513..384_016_684);
+        assert_eq!(
+            rows_per_rank(1, 4) * 4 - num_embeddings(1),
+            2,
+            "layer 1's last rank is padded by 2 rows"
+        );
     }
 
     #[test]

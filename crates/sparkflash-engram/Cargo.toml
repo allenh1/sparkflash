@@ -8,9 +8,34 @@ description = "Deterministic Engram conditional-memory engine (hash, tiered cach
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 sparkflash-trace = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
+anyhow = { workspace = true }
+tokenizers = { workspace = true }
+memmap2 = { workspace = true }
+libc = { workspace = true }
+sha2 = { workspace = true }
+crossbeam-channel = { workspace = true }
+num_cpus = { workspace = true }
+clap = { workspace = true }
+io-uring = { workspace = true, optional = true }
+
+[features]
+default = []
+# io_uring needs a recent kernel and a real block device; the store must work without it.
+#
+# mod uring is behind this feature, so its tests only compile with --features io-uring: a plain
+# cargo test --workspace never builds the ring's retirement path or its tests, which is how the
+# incomplete stall retirement escaped review A1. Gate this crate with the feature enabled too.
+io-uring = ["dep:io-uring"]
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+# pack-engram is a thin wrapper so the packer is usable without the CLI crate.
+[[bin]]
+name = "pack-engram"
+path = "src/bin/pack_engram.rs"
