@@ -106,7 +106,7 @@ cuda-abi:
     - test -x "$SPARKFLASH_NVCC"
     - $SPARKFLASH_NVCC --version
     - apt-get update
-    - apt-get install -y --no-install-recommends ca-certificates curl gcc g++ make
+    - apt-get install -y --no-install-recommends ca-certificates curl diffutils gcc g++ make
     - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --component rustfmt --component clippy
     - . "$CARGO_HOME/env"
     - rustc --version
@@ -141,3 +141,9 @@ cuda-abi:
     # upgrade that looked like a regression would make the check useless. tests/kernel_baseline.rs
     # runs the same script and skips, loudly, when nvcc is absent, so this step is what enforces it.
     - /bin/sh crates/sparkflash-kernels/scripts/check-kernel-baseline.sh
+    # The codec golden table is the ground truth the MXFP8/MXFP4 tests compare against, and it is
+    # committed from outside the tree. Until this step existed, nothing could tell a table nvcc
+    # had just produced from one somebody had edited: the provenance was a claim. The script
+    # regenerates it here and fails unless the bytes match, which is also the only thing keeping
+    # the claimed toolkit version honest.
+    - sh crates/sparkflash-kernels/scripts/regen-codec-fixture.sh
