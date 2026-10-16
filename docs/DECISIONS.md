@@ -349,6 +349,21 @@ throughput grounds, because the released artefact is an inference path typed W4A
 activation call sites are the indexer K, the indexer Q and the KV cache. That edit is routed to
 `kernel-dev`; this entry and `03-moe.md` section 4 are the citation both sides now share.
 
+**Padded loader contract (A8).** The kernel reads the PADDED width, so the loader contract is part
+of this decision rather than an implementation detail. Per routed `(token, slot)` row the loader
+must emit `act_fp8` as `[tokens * top_k][640]` E4M3 bytes and `act_scales` as
+`[tokens * top_k][20]` ue8m0 bytes; per output row `(expert, hidden)` it must emit `w_fp4` as
+`[experts][d][320]` packed E2M1 bytes and `w_scales` as `[experts][d][20]` ue8m0 bytes. Index
+>= `SPARK_M4_MOE_WIDTH` (576) is masked on the activation side, so the 64 padded values cannot
+change a result, but the kernel still addresses them and its row strides are those constants. The
+reference's whole-expert grid would give `2304 / 32 = 72`-wide weight- and activation-scale rows,
+and a 576-wide per-rank slice would give 18-wide rows; either misindexes every row after the first.
+The Rust side states and tests the rejection
+(`sparkflash-kernels::mxfp4_ref::{MoeRowLayout, pre_padded_moe_layout, check_moe_layout}`), the
+kernel carries the same contract next to its constants, and producing the layout belongs to the
+checkpoint loader, which is **not** in milestone 4: it lands with Milestone 5 (spec lines 1329-1340
+name the orchestrated integration; no loader has its own milestone).
+
 **Verification.** Doc-only change plus this entry; no GPU and no cluster were involved, and every
 claim above is a line-cited reading of `config.json`, `model.py`, `kernel.py` and the spec. The
 reference tree was read at `/home/user/dsv41-research`; the kernel file was read at

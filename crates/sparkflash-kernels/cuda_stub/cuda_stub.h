@@ -69,4 +69,31 @@ __device__ __forceinline__ void __nanosleep(unsigned int ns) { (void)ns; }
 // which is the only way this host can type-check a kernel's trace call at all. The return
 // values are meaningless; the probe discards them.
 __device__ unsigned int atomicAdd(unsigned int *address, unsigned int val);
+__device__ float atomicAdd(float *address, float val);
+__device__ unsigned long long atomicAdd(unsigned long long *address, unsigned long long val);
 __device__ int __ffsll(long long value);
+
+// cuda_fp8.h / cuda_fp4.h expose their conversions as plain unsigned char values. The M4 kernels
+// store FP8 as uint8_t and call these intrinsics under nvcc; the clang probe instead compiles
+// the bit-arithmetic fallback in m4_common_sm121.cuh, so no fp8 type is needed here.
+
+// Device math and bit-cast intrinsics the M4 kernels use. The math ones carry no semantics: the
+// probe is -fsyntax-only, so nothing here is ever executed or numerically checked.
+__device__ __forceinline__ unsigned int __float_as_uint(float value) {
+    return (unsigned int)value;
+}
+
+__device__ __forceinline__ float __uint_as_float(unsigned int bits) {
+    return (float)bits;
+}
+
+__device__ __forceinline__ float expf(float value) {
+    (void)value;
+    return 1.0f;
+}
+
+__device__ __forceinline__ float sqrtf(float value) {
+    (void)value;
+    return value;
+}
+

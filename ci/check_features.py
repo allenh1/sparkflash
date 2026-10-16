@@ -26,13 +26,24 @@ RDMA fabric and no checkpoint.
 """
 
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-# Features that need hardware this pipeline does not have. The cuda-abi job compiles CUDA in
-# an image that does have a toolkit, so this one is covered elsewhere in the pipeline.
+# Features whose TESTS need hardware this pipeline does not have. The cuda-abi job compiles CUDA in
+# an image that does have a toolkit, so this one is covered elsewhere in the pipeline - but only the
+# tests are what needs the GPU, and the lint is what needs the TOOLKIT, because cudarc's build script
+# runs `nvcc --version` and refuses to configure a version without one.
+#
+# Round-19 A4: the skip below is for the tests, and the feature-scoped clippy call stands BEFORE it,
+# so on a host with a toolkit the sweep lints the feature as well. Before that the `continue` skipped
+# the lint along with the tests, and the workspace clippy resolves default features only - so
+# sparkflash-kernels/cuda was linted by no gate at all while this file's docstring claimed it was.
+# When no toolkit is on PATH the command cannot run here and the sweep SAYS SO and names the job that
+# owns the feature, rather than dropping it quietly.
 HARDWARE_ONLY = {
     ("sparkflash-kernels", "cuda"): "needs a toolkit and a target; the cuda-abi job compiles it",
 }
@@ -133,6 +144,71 @@ def run(command):
     return subprocess.run(command).returncode
 
 
+# The clippy gate, verbatim as CI runs it. It is the WORKSPACE invocation on purpose: a crate-scoped
+# `cargo clippy -p <package>` does not see the workspace-level documentation lints, so a doc-list
+# continuation in a crate this sweep does not scope over reached CI (round-18 A7). Keep it equal to the
+# clippy step in .gitlab-ci.yml, and see ci/test_check_features.py::ClippyGate, which pins it.
+CLIPPY_GATE = ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+
+
+def feature_clippy(package, feature):
+    """The feature-scoped clippy run, which the workspace invocation cannot replace.
+
+    A workspace clippy resolves DEFAULT features only, so a path behind a non-default feature
+    (sparkflash-engram/io-uring, sparkflash-comm/rdma, sparkflash-kernels/cuda) is not linted by it at
+    all. The sweep runs BOTH: this one per feature, and CLIPPY_GATE once for the workspace, which is
+    the command CI runs and the only one that sees cross-crate documentation lints (round-18 A7).
+    """
+    return [
+        "cargo",
+        "clippy",
+        "-p",
+        package,
+        "--all-targets",
+        "--features",
+        feature,
+        "--",
+        "-D",
+        "warnings",
+    ]
+
+
+def toolkit():
+    """The nvcc the feature-scoped lint of a hardware-only feature needs, or None when there is none.
+
+    `cargo clippy` needs no GPU, but it does need to BUILD the feature, and cudarc's build script runs
+    `nvcc --version`: without a toolkit the cuda feature cannot even be configured, in this job's rust
+    image or on a developer host. So the lint is not dropped, it is conditional on the toolkit - and
+    when it is missing, main says which command it is not running and why (round-19 A4).
+    """
+    return shutil.which(os.environ.get("SPARKFLASH_NVCC", "nvcc"))
+
+
+def commands_for(found, toolkit_present):
+    """The commands the sweep runs, in the order it runs them, for `classify`'s list of features.
+
+    The feature-scoped clippy stands BEFORE the hardware-only skip on purpose (round-19 A4). Clippy
+    needs no GPU: only the tests do, and the workspace gate resolves default features only, so skipping
+    the feature-scoped lint left sparkflash-kernels/cuda linted by neither gate while this file claimed
+    otherwise. The lint runs whenever one can - `toolkit_present` is what decides that for a
+    hardware-only feature - and this list is what the tests in ci/test_check_features.py pin, so a
+    command that stops being produced fails a test rather than the pipeline.
+    """
+    commands = []
+    for package, feature in found:
+        hardware_only = (package, feature) in HARDWARE_ONLY
+        if not hardware_only or toolkit_present:
+            commands.append(feature_clippy(package, feature))
+        if hardware_only:
+            continue
+        commands.append(["cargo", "test", "-p", package, "--features", feature])
+    # And one workspace-wide clippy run, exactly the command CI runs, which is the only one that sees
+    # cross-crate documentation lints - the reason a clippy::doc_lazy_continuation in one crate's test
+    # code reached CI while the feature-scoped runs stayed green (round-18 A7).
+    commands.append(CLIPPY_GATE)
+    return commands
+
+
 def main():
     packages, manifests, sources = workspace()
     found, dead = classify(packages, manifests, sources)
@@ -163,14 +239,19 @@ def main():
     if failed:
         return 1
 
+    # BOTH clippy gates, and for a hardware-only feature the lint still runs when one can: only its
+    # tests are skipped. Without a toolkit the lint cannot build the feature, and that is said loudly.
+    toolkit_present = toolkit()
+    if toolkit_present is None and any((package, feature) in HARDWARE_ONLY for package, feature in found):
+        print(
+            "no CUDA toolkit on PATH, so the feature-scoped lint of a hardware-only feature cannot run "
+            "here (cudarc's build script runs nvcc --version). The cuda-abi job owns that feature and "
+            "should lint it there; this is the one gate that cannot run in this image.",
+            file=sys.stderr,
+        )
     failures = 0
-    for package, feature in found:
-        if (package, feature) in HARDWARE_ONLY:
-            continue
-        failures += run(["cargo", "test", "-p", package, "--features", feature]) != 0
-        failures += run(
-            ["cargo", "clippy", "-p", package, "--all-targets", "--features", feature, "--", "-D", "warnings"]
-        ) != 0
+    for command in commands_for(found, toolkit_present):
+        failures += run(command) != 0
 
     if failures:
         print(f"{failures} feature-scoped command(s) failed", file=sys.stderr)

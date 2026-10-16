@@ -114,9 +114,40 @@ __device__ __forceinline__ uint64_t spark_read_globaltimer_ns() {
     } while (0)
 
 #else
-#define SPARK_GPU_TRACE_ENTER(ring, scope, t_var) do { (void)(ring); } while (0)
-#define SPARK_GPU_READ_TIMER(ring, scope, t_var) do { (void)(ring); } while (0)
-#define SPARK_GPU_TRACE_EXIT(ring, scope, layer, meta, t_enter) do { (void)(ring); } while (0)
+// Trace compiled out. Every argument is still consumed, because a kernel whose trace is disabled
+// otherwise reports its timer variables and payload computations as "set but never used"
+// (nvcc 550-D / 177-D), and a plain void cast does not satisfy that diagnostic. Passing the
+// values through this identity function is a real use; both compilers inline it away.
+__device__ __forceinline__ uint64_t spark_trace_keepalive(uint64_t value) { return value; }
+
+#define SPARK_GPU_TRACE_ENTER(ring, scope, t_var)     \
+    do {                                              \
+        (void)(ring);                                 \
+        (void)(scope);                                \
+        (t_var) = spark_trace_keepalive(t_var);       \
+    } while (0)
+#define SPARK_GPU_READ_TIMER(ring, scope, t_var)      \
+    do {                                              \
+        (void)(ring);                                 \
+        (void)(scope);                                \
+        (t_var) = spark_trace_keepalive(t_var);       \
+    } while (0)
+#define SPARK_GPU_TRACE_EXIT(ring, scope, layer, meta, t_enter)          \
+    do {                                                                 \
+        (void)(ring);                                                    \
+        (void)(scope);                                                   \
+        (void)(layer);                                                   \
+        (void)spark_trace_keepalive((uint64_t)(meta));                   \
+        (void)spark_trace_keepalive(t_enter);                            \
+    } while (0)
 #define SPARK_GPU_TRACE_EXIT_ROCE(ring, scope, layer, bytes, t_enter, t_staged, t_ready) \
-    do { (void)(ring); } while (0)
+    do {                                                                                \
+        (void)(ring);                                                                   \
+        (void)(scope);                                                                  \
+        (void)(layer);                                                                  \
+        (void)spark_trace_keepalive((uint64_t)(bytes));                                 \
+        (void)spark_trace_keepalive(t_enter);                                           \
+        (void)spark_trace_keepalive(t_staged);                                          \
+        (void)spark_trace_keepalive(t_ready);                                           \
+    } while (0)
 #endif

@@ -15,4 +15,13 @@ cudarc = { workspace = true, optional = true }
 
 [features]
 default = []
+# "cuda" selects the optional cudarc dependency and nothing else. It does NOT gate the kernel
+# builds: build.rs always probes the toolchain and emits the sparkflash_cuda_toolkit cfg that the
+# compile-time ABI checks read, so the kernels are parsed whether or not this feature is on. No
+# module in this crate calls cudarc yet, so today it adds a dependency and no code path - the
+# device/launch path lives in the launcher crate, not here. Enabling it does not currently build:
+# the workspace pins cudarc without one of its required cuda-12xxx/13xxx version features, so
+# cudarc's own build.rs stops with "Must specify one of the following features: ...". Making it
+# build means choosing a version feature (cuda-12090 matches the 12.9 toolkit this repo probes
+# with) in the root Cargo.toml, which is outside this crate.
 cuda = ["dep:cudarc"]

@@ -1,8 +1,11 @@
 //! CPU reference for the RoCEnante one-shot All-Reduce numerics.
 //!
-//! This module is the definition of "bit-identical" for milestone 3. The CUDA kernel
+//! This module is the definition of the milestone 3 result. The CUDA kernel
 //! (kernels/rocenante_oneshot_sm121.cu) and every Rust transport in sparkflash-comm must agree
-//! with it bit for bit:
+//! with it bit for bit for every finite input. The equality is NOT unconditional: CUDA's
+//! __float2bfloat16_rn host routine collapses a NaN to the payload 0x7fff, so a NaN result is
+//! equal in sign and payload only where both sides round it identically, and the tests below
+//! exclude NaN payload and sign rather than pretending otherwise. The rules that do hold:
 //!
 //! 1. one f32 accumulator per element, initialised to `+0.0f`;
 //! 2. the four rank rows are added in ascending rank order 0, 1, 2, 3, with an f32 rounding

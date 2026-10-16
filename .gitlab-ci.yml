@@ -126,3 +126,18 @@ cuda-abi:
     # shape a reader has to be able to reproduce. A version feature added only on this command line
     # would leave a plain --features cuda broken for everyone else.
     - cargo test -p sparkflash-kernels --features cuda
+    # The feature sweep in ci/check_features.py lints every non-default feature, but it cannot lint
+    # --features cuda without a toolkit: cudarc's build script probes nvcc and exits if it is absent.
+    # This job HAS the toolkit, so the cuda lint belongs here - a workspace clippy resolves default
+    # features only and would leave the CUDA paths unlinted. The sweep prints a loud line naming this
+    # job when it skips the command, so the two together close the gap rather than each assuming the
+    # other.
+    - cargo clippy -p sparkflash-kernels --all-targets --features cuda -- -D warnings
+    # The committed kernel baseline is the check that would catch a kernel silently changing. It
+    # recompiles all six Milestone 4 kernels with this job's nvcc, compares the cubin bytes, the
+    # cubin sha256 and the PTX membar line count against
+    # crates/sparkflash-kernels/baseline/kernel_baseline.txt, and reports a different toolkit as a
+    # toolkit change (with the regenerate command) rather than as a kernel change - a compiler
+    # upgrade that looked like a regression would make the check useless. tests/kernel_baseline.rs
+    # runs the same script and skips, loudly, when nvcc is absent, so this step is what enforces it.
+    - /bin/sh crates/sparkflash-kernels/scripts/check-kernel-baseline.sh
