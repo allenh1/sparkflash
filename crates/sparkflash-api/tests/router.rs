@@ -12,7 +12,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::{Value, json};
-use sparkflash_api::engine::{ClusterStatsSnapshot, MockEngine};
+use sparkflash_api::engine::{Capabilities, ClusterStatsSnapshot, InferenceEngine, MockEngine};
 use sparkflash_api::server::{disarm_traces, router};
 use sparkflash_api::state::AppState;
 use tower::ServiceExt as _;
@@ -27,8 +27,11 @@ fn trace_lock() -> &'static Mutex<()> {
 }
 
 fn engine_with(pieces: &[&str]) -> MockEngine {
+    // The released model serves every optional channel, and the mock's own default is the
+    // conservative one, so a test that describes the real surface says so explicitly.
     MockEngine::new(MODEL)
         .with_cluster_stats(ClusterStatsSnapshot::default())
+        .with_capabilities(Capabilities::ALL)
         .content(pieces)
 }
 
@@ -517,6 +520,52 @@ async fn models_round_trip() {
         body["data"][0]["capabilities"]["reasoning_effort"]["max"],
         100
     );
+}
+
+#[tokio::test]
+async fn models_reports_the_engines_own_capabilities() {
+    // The most conservative answer: an engine that has declared nothing gets nothing advertised.
+    let blind = MockEngine::new(MODEL);
+    assert_eq!(blind.capabilities(), Capabilities::default());
+    let (status, _, bytes) = send(app_with(blind), get_request("/v1/models")).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_json(&bytes);
+    let caps = body["data"][0]["capabilities"]
+        .as_object()
+        .expect("capabilities is an object")
+        .clone();
+    assert_eq!(caps["multimodal"], false, "no vision path, no multimodal");
+    assert_eq!(caps["image_url"], false);
+    assert_eq!(caps["tools"], false, "no tool calls, no tools");
+    assert_eq!(caps["tool_choice"], false);
+    assert_eq!(caps["thinking"], false, "no reasoning channel");
+    assert_eq!(caps["chat_template_kwargs"], json!([]));
+    assert!(
+        !caps.contains_key("reasoning_effort"),
+        "a driver that has not declared the reasoning-effort knob must not publish its schema"
+    );
+    assert_eq!(
+        caps["streaming"], true,
+        "streaming is the server's own capability, not the engine's"
+    );
+
+    // And an engine that declares every channel is advertised with every channel.
+    let seeing = MockEngine::new(MODEL).with_capabilities(Capabilities::ALL);
+    assert_eq!(seeing.capabilities(), Capabilities::ALL);
+    let (status, _, bytes) = send(app_with(seeing), get_request("/v1/models")).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_json(&bytes);
+    let caps = body["data"][0]["capabilities"]
+        .as_object()
+        .expect("capabilities is an object")
+        .clone();
+    assert_eq!(caps["multimodal"], true);
+    assert_eq!(caps["image_url"], true);
+    assert_eq!(caps["tools"], true);
+    assert_eq!(caps["tool_choice"], true);
+    assert_eq!(caps["thinking"], true);
+    assert_eq!(caps["chat_template_kwargs"], json!(["thinking"]));
+    assert_eq!(caps["reasoning_effort"]["max"], 100);
 }
 
 #[tokio::test]

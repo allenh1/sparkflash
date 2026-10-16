@@ -259,10 +259,14 @@ norm_eps)` (**norm_eps = 1e-20**, not hc_eps), `mixes = F.linear(x, hc_fn) * rsq
   - `pre = sigmoid(mixes[0:hc]·scale[0] + base[0:hc]) + eps` (kernel.py:427),
   - `post = 2·sigmoid(mixes[hc:2hc]·scale[1] + base[hc:2hc])` — **no `+ eps`** (kernel.py:429),
   - `comb` raw = `mixes[2hc:]·scale[2] + base[2hc:]` reshaped `[hc, hc]` (kernel.py:430-431),
-  - `comb = softmax(comb, -1) + eps` (kernel.py:436-443), then `comb /= (colsum + eps)`
-    (kernel.py:445-448), then `sinkhorn_iters - 1 = 19` further alternating row/column
-    normalisations (kernel.py:450-458). **Total: 20 row/column passes** = `hc_sinkhorn_iters` = 20,
-    with `hc_eps = 1e-6` in every denominator.
+  - `comb = softmax(comb, -1) + eps` (kernel.py:436-443) is one row pass, then
+    `comb /= (colsum + eps)` (kernel.py:445-448) is **one unconditional column pass** outside the
+    loop, then `sinkhorn_iters - 1 = 19` iterations of a row pass followed by a column pass
+    (kernel.py:450-458). **Total: 40 passes = 20 row + 20 column** at the released
+    `hc_sinkhorn_iters = 20` (config.json:129; kernel.py:466) - not 20 passes - and the last pass
+    is a column pass, so `comb` ends column-stochastic (each column sums to 1); `hc_eps = 1e-6` is
+    in every denominator after the softmax, which adds it once, before the first column pass
+    (kernel.py:443).
 - `hc_pre` = `Σ_hc pre_mix ⊙ x` → `[b, s, d]` (model.py:957-960); `hc_post` =
   `post ⊙ x + Σ_hc comb ⊙ residual` → `[b, s, hc, d]` (model.py:962-966).
 
@@ -487,7 +491,7 @@ report's own figures (tech_report.txt:541-555 for the pool, 465-524 for the mode
 | gate_temp | 1.0 (not a config key; `ModelArgs` default) | model.py:67, 811 |
 | swiglu_limit | 10.0 | config.json:36; model.py:845-847 |
 | MoE reduction epsilon | `1e-20` (the literal, **not** `norm_eps`) | model.py:825 |
-| hc_mult, sinkhorn iters, hc_eps | 4, 20, 1e-6 | config.json:128-130; kernel.py:450 |
+| hc_mult, sinkhorn iters, hc_eps | 4, 20, 1e-6 | config.json:128-130; kernel.py:466 |
 | norm_eps | 1e-20 | config.json:37; model.py:75 |
 | heads / head_dim / rope slice | 64 / 512 / last 64 | config.json:28, 30-31; model.py:772 |
 | window_size | 128 | config.json:59 |

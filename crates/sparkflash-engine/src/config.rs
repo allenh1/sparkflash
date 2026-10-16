@@ -282,7 +282,12 @@ impl ModelConfig {
             hc_eps: 1e-6,
             engram_layer_ids: vec![1],
             engram_vocab_size: 100,
-            engram_num_embeddings: vec![64],
+            // Large enough for the whole bucket range: the reference indexes the table with the
+            // hash id itself (model.py:309, 317), so the rows have to cover every offset plus every
+            // one of the (orders - 1) * n_heads bucket primes, which for this vocabulary are drawn
+            // just above engram_vocab_size. 64 rows was smaller than the sum of two such primes and
+            // made tiny an invalid configuration the layout refused.
+            engram_num_embeddings: vec![1024],
             engram_max_ngram_size: 2,
             engram_pad_id: 2,
             engram_compressed_vocab_size: 32,

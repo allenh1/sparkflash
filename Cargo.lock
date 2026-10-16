@@ -2205,10 +2205,13 @@ name = "sparkflash-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
+ "futures",
  "serde_json",
  "sparkflash-api",
  "sparkflash-comm",
+ "sparkflash-engine",
  "sparkflash-engram",
  "sparkflash-kernels",
  "sparkflash-kv",

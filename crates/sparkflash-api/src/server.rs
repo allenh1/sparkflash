@@ -1086,6 +1086,38 @@ fn anthropic_stop_reason(reason: FinishReason) -> &'static str {
 
 async fn list_models(State(state): State<AppState>) -> Response {
     let created = state.now_unix();
+    // The capability line is the engine's own answer rather than a list of constants: a server must
+    // not advertise a channel its engine cannot serve. `image_url` and `tool_choice` ride along with
+    // the channel they belong to, and the reasoning-effort schema is published only when the engine
+    // honours it, because a caller reads its presence as "this server accepts it".
+    let capabilities = state.engine.capabilities();
+    let mut advertised = json!({
+        "streaming": true,
+        "tools": capabilities.tools,
+        "tool_choice": capabilities.tools,
+        "multimodal": capabilities.vision,
+        "image_url": capabilities.vision,
+        "thinking": capabilities.thinking,
+        "chat_template_kwargs": if capabilities.thinking { json!(["thinking"]) } else { json!([]) },
+        "endpoints": [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+            "/v1/messages",
+            "/v1/cluster/stats",
+            "/v1/admin/trace",
+            "/metrics",
+        ],
+    });
+    if capabilities.reasoning_effort {
+        advertised["reasoning_effort"] = json!({
+            "type": "integer",
+            "min": 1,
+            "max": 100,
+            "default": 75,
+            "names": ["low", "minimal", "medium", "high", "xhigh", "max"],
+        });
+    }
     let body = json!({
         "object": "list",
         "data": [{
@@ -1096,31 +1128,7 @@ async fn list_models(State(state): State<AppState>) -> Response {
             "context_length": max_seq_len(),
             "max_output_tokens": MODEL_MAX_OUTPUT_TOKENS,
             "fabric_mode": state.engine.cluster_stats().fabric_mode,
-            "capabilities": {
-                "streaming": true,
-                "tools": true,
-                "tool_choice": true,
-                "multimodal": true,
-                "image_url": true,
-                "thinking": true,
-                "reasoning_effort": {
-                    "type": "integer",
-                    "min": 1,
-                    "max": 100,
-                    "default": 75,
-                    "names": ["low", "minimal", "medium", "high", "xhigh", "max"],
-                },
-                "chat_template_kwargs": ["thinking"],
-                "endpoints": [
-                    "/v1/chat/completions",
-                    "/v1/completions",
-                    "/v1/responses",
-                    "/v1/messages",
-                    "/v1/cluster/stats",
-                    "/v1/admin/trace",
-                    "/metrics",
-                ],
-            },
+            "capabilities": advertised,
         }],
     });
     Json(body).into_response()

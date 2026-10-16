@@ -30,6 +30,8 @@
 
 pub mod config;
 pub mod dtype;
+pub mod forward;
+pub mod linalg;
 pub mod loader;
 pub mod quant;
 pub mod safetensors;

@@ -1,0 +1,721 @@
+//! The reference forward pass: DeepSeek-V4.1-Flash, run on `f32` over a [crate::weights::WeightSource].
+//!
+//! This is a *reference*, and it is deliberately the smallest thing that can carry the architecture's
+//! shape flow: one sequence, one chunk at a time, no batching, no CUDA, no quantised kernels.
+//! `docs/engine/01-forward-order.md` is its specification - every step below carries the `model.py`
+//! line range that document cites, and each module it calls carries the detail.
+//!
+//! # Why it exists
+//!
+//! The engine has to be testable on a host with no weights, no GPU and no cluster (510 GB of
+//! checkpoint, 98 GB per Engram table). [crate::synthetic::SyntheticWeights] produces every tensor of
+//! a [crate::tensor::TensorPlan] from a seed, so a test can run the whole architecture at a
+//! configuration small enough to fit in a test process and assert the properties that do not depend
+//! on the numbers: the shape flow, causality, the KV cache growing by exactly one token per decode
+//! step, attention never reaching past the window in an SWA layer, and determinism for a fixed seed.
+//!
+//! What it is NOT is a performance path, and nothing here claims a speed: each weight is read through
+//! [crate::linalg::decode_by_name], which refuses a tensor above an element limit, so a released
+//! configuration stops with an explicit refusal instead of quietly trying to allocate 98 GB.
+
+pub mod attention;
+pub mod engram;
+pub mod mhc;
+pub mod moe;
+pub mod mtp;
+
+use crate::config::ModelConfig;
+use crate::forward::mhc::Mixes;
+use crate::linalg::{self, EngineError};
+use crate::tensor::TensorPlan;
+use crate::weights::WeightSource;
+
+/// Per-sequence state: the tokens consumed and every cache the attention layers own.
+///
+/// Each backbone layer and each MTP stage has its own window ring and compressed KV, so the caches
+/// are indexed by layer. Nothing here is shared between sequences.
+pub struct SequenceState {
+    tokens: Vec<u32>,
+    attention: Vec<attention::AttnState>,
+}
+
+impl SequenceState {
+    /// Fresh state for one sequence of `config`.
+    #[must_use]
+    pub fn new(config: &ModelConfig) -> Self {
+        Self {
+            tokens: Vec::new(),
+            attention: (0..config.n_layers + config.n_mtp_layers)
+                .map(|_| attention::AttnState::for_config(config))
+                .collect(),
+        }
+    }
+
+    /// The tokens this sequence has consumed, in order.
+    #[must_use]
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    /// How many tokens the sequence has consumed: the position the next step writes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Whether the sequence has consumed nothing yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// The window row a backbone layer holds for `position`, for tests that assert what the cache
+    /// kept. `None` when the layer has not written that position.
+    #[must_use]
+    pub fn window_row(&self, layer: usize, position: usize) -> Option<&[f32]> {
+        self.attention.get(layer)?.window.row(position)
+    }
+
+    /// The attention state of one layer or MTP stage, for tests.
+    #[must_use]
+    pub fn attention(&self, layer: usize) -> Option<&attention::AttnState> {
+        self.attention.get(layer)
+    }
+}
+
+/// How the step chooses its next token.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sampling {
+    /// 0 (the default) is greedy; above it the reference's Gumbel-max draw at that temperature.
+    pub temperature: f32,
+    /// The sampler's seed. The same logits and seed always give the same token.
+    pub seed: u64,
+}
+
+impl Default for Sampling {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            seed: 0,
+        }
+    }
+}
+
+/// What one step produced.
+#[derive(Debug)]
+pub struct StepOutput {
+    /// The logits of the last position, `vocab_size` long.
+    pub logits: Vec<f32>,
+    /// The chosen next token, or `None` when the step produced no logits.
+    pub next_token: Option<u32>,
+    /// The tokens the DSpark stages drafted after it (empty when the tap did not fire).
+    pub draft: Vec<u32>,
+    /// One confidence per drafted token.
+    pub confidence: Vec<f32>,
+    /// How many tokens the step consumed.
+    pub consumed: usize,
+}
+
+/// The reference engine: a configuration, a plan, a weight source and a sampler.
+///
+/// It owns no per-sequence state - that lives in [SequenceState] - so one engine can drive several
+/// sequences, exactly as the reference does.
+pub struct InferenceEngine {
+    config: ModelConfig,
+    plan: TensorPlan,
+    source: Box<dyn WeightSource>,
+    limit: usize,
+    sampling: Sampling,
+}
+
+impl InferenceEngine {
+    /// An engine over a source, with the plan that source is read against.
+    ///
+    /// `limit` caps the elements of any single tensor the pass materialises; use
+    /// [linalg::REFERENCE_TENSOR_LIMIT] unless a test wants a smaller one.
+    ///
+    /// # Errors
+    ///
+    /// [EngineError::Config] when the configuration is not usable.
+    pub fn new(
+        config: ModelConfig,
+        source: Box<dyn WeightSource>,
+        limit: usize,
+    ) -> Result<Self, EngineError> {
+        config.validate()?;
+        let plan = TensorPlan::language_model(&config);
+        Ok(Self {
+            config,
+            plan,
+            source,
+            limit,
+            sampling: Sampling::default(),
+        })
+    }
+
+    /// The same engine with a different sampler.
+    #[must_use]
+    pub fn with_sampling(mut self, sampling: Sampling) -> Self {
+        self.sampling = sampling;
+        self
+    }
+
+    /// The configuration this engine runs.
+    #[must_use]
+    pub fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+
+    /// The plan the weights are read against.
+    #[must_use]
+    pub fn plan(&self) -> &TensorPlan {
+        &self.plan
+    }
+
+    /// The element limit in force.
+    #[must_use]
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Consumes `tokens` as one chunk and returns the logits of the last position.
+    ///
+    /// # Errors
+    ///
+    /// [EngineError] from any weight read, decode or shape check.
+    pub fn prefill(
+        &self,
+        state: &mut SequenceState,
+        tokens: &[u32],
+    ) -> Result<StepOutput, EngineError> {
+        if tokens.is_empty() {
+            return Err(EngineError::Shape {
+                what: "prefill".to_owned(),
+                detail: "no tokens to prefill".to_owned(),
+            });
+        }
+        self.run(state, tokens)
+    }
+
+    /// Consumes one token and returns the logits for the position after it.
+    ///
+    /// # Errors
+    ///
+    /// [EngineError] from any weight read, decode or shape check.
+    pub fn decode(&self, state: &mut SequenceState, token: u32) -> Result<StepOutput, EngineError> {
+        self.run(state, &[token])
+    }
+}
+
+/// The buffers one step needs, sized once per chunk from the configuration and reused by every
+/// layer. Nothing here is model-sized: the weight tensors themselves are never retained.
+struct Scratch {
+    attn_mixes: Mixes,
+    ffn_mixes: Mixes,
+    attn_in: Vec<f32>,
+    attn_out: Vec<f32>,
+    ffn_in: Vec<f32>,
+    ffn_out: Vec<f32>,
+    residual: Vec<f32>,
+    moe: moe::MoeScratch,
+}
+
+impl Scratch {
+    fn for_chunk(config: &ModelConfig, positions: usize) -> Self {
+        let width = positions * config.dim;
+        Self {
+            attn_mixes: Mixes::for_tokens(config, positions),
+            ffn_mixes: Mixes::for_tokens(config, positions),
+            attn_in: vec![0.0; width],
+            attn_out: vec![0.0; width],
+            ffn_in: vec![0.0; width],
+            ffn_out: vec![0.0; width],
+            residual: vec![0.0; positions * config.hc_width()],
+            moe: moe::MoeScratch::for_config(config),
+        }
+    }
+}
+
+/// Samples one token from `logits`: greedy at temperature 0, Gumbel-max above it.
+///
+/// The reference samples `argmax(logits / temperature + gumbel_noise)` (model.py:1285-1292), which
+/// is a draw from the temperature-scaled softmax. The noise here comes from splitmix64 seeded by
+/// `seed`, so the same logits and seed always give the same token. The GPU path's sync-free philox
+/// generator is a different milestone: this is the CPU reference and it says so.
+#[must_use]
+pub fn sample_gumbel(logits: &[f32], temperature: f32, seed: u64) -> Option<u32> {
+    if logits.is_empty() {
+        return None;
+    }
+    if !temperature.is_finite() || temperature <= 0.0 {
+        return linalg::argmax(logits).map(|index| index as u32);
+    }
+    let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
+    let mut best: Option<(u32, f32)> = None;
+    for (index, &logit) in logits.iter().enumerate() {
+        state = splitmix64(state);
+        // A uniform in (0, 1): the top 53 bits, nudged off zero so the logarithm below is finite.
+        let uniform = (((state >> 11) as f64) + 0.5) / ((1u64 << 53) as f64);
+        let gumbel = -(-(uniform.ln())).ln();
+        let score = logit / temperature + gumbel as f32;
+        if best.is_none_or(|(_, held)| score > held) {
+            best = Some((index as u32, score));
+        }
+    }
+    best.map(|(index, _)| index)
+}
+
+/// One splitmix64 step: the generator this file's reference sampler uses.
+fn splitmix64(state: u64) -> u64 {
+    let mut z = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+impl InferenceEngine {
+    /// The step [InferenceEngine::prefill] and [InferenceEngine::decode] both run: the whole-model
+    /// order of `Transformer.forward` (model.py:1241-1272, section 3.1 of the forward-order doc),
+    /// with `seqlen` positions at a time and `start_pos` already in the caches.
+    fn run(&self, state: &mut SequenceState, tokens: &[u32]) -> Result<StepOutput, EngineError> {
+        let config = &self.config;
+        let seqlen = tokens.len();
+        let start_pos = state.tokens.len();
+        let dim = config.dim;
+        let hc = config.hc_mult;
+        let width = config.hc_width();
+        let source: &dyn WeightSource = self.source.as_ref();
+
+        // One hashing pass for the whole chunk, before any layer runs, shared by every Engram layer
+        // (model.py:1252). The pass needs the sequence, not just the chunk: an n-gram looks back
+        // across the chunk boundary, and [engram::ngram_hashes] walks the positions
+        // `start_pos..tokens.len()` of the tokens it is handed, so handing it the chunk alone
+        // hashes nothing on a decode step and pads every chunked-prefill row. The reference keeps
+        // the token history in one tensor, which is what this concatenation reproduces; it is a
+        // reference-only cost (one copy per step) and it is the caller's, not the hasher's, because
+        // only the engine holds the history.
+        let mut history = Vec::with_capacity(start_pos + seqlen);
+        history.extend_from_slice(&state.tokens);
+        history.extend_from_slice(tokens);
+        let mut hashes = Vec::new();
+        engram::ngram_hashes(config, &history, start_pos, &mut hashes)?;
+
+        // The embedding lookup, one row per token (model.py:1253-1255).
+        let embed = linalg::decode_by_name(source, "embed.weight", self.limit)?;
+        if embed.len() < config.vocab_size * dim {
+            return Err(EngineError::Shape {
+                what: "embed.weight".to_owned(),
+                detail: format!(
+                    "a {}x{} table has {} values, so it cannot serve vocab_size {}",
+                    config.vocab_size,
+                    dim,
+                    embed.len(),
+                    config.vocab_size
+                ),
+            });
+        }
+
+        // The stream becomes [seqlen, hc, dim]: every copy starts as the same embedding, and the
+        // first input mix selects copy 0 (model.py:1258-1260).
+        let mut hidden = vec![0.0f32; seqlen * width];
+        for (position, &token) in tokens.iter().enumerate() {
+            let row = (token as usize) * dim;
+            let Some(embedding) = embed.get(row..row + dim) else {
+                return Err(EngineError::Shape {
+                    what: "embed.weight".to_owned(),
+                    detail: format!(
+                        "token {token} is outside the {} row table",
+                        config.vocab_size
+                    ),
+                });
+            };
+            for copy in 0..hc {
+                hidden[(position * hc + copy) * dim..(position * hc + copy + 1) * dim]
+                    .copy_from_slice(embedding);
+            }
+        }
+        let mut pre_mix = vec![0.0f32; seqlen * hc];
+        for position in 0..seqlen {
+            pre_mix[position * hc] = 1.0;
+        }
+
+        // The layers, ascending, with the Engram write before the block it belongs to and the DSpark
+        // tap reading the block INPUT of the three target layers (model.py:1261-1267).
+        let mut scratch = Scratch::for_chunk(config, seqlen);
+        // The DSpark tap reads the block INPUT of the target layers, averaged over the hc copies.
+        // The reference concatenates the taps PER POSITION (model.py:1264-1266), so main_hidden holds
+        // `taps * dim` values for each token with the taps in tap order - not one tap's worth of
+        // tokens after another's.
+        let tap_layers: Vec<usize> = (0..config.n_layers)
+            .filter(|layer| config.dspark_target_layer_ids.contains(layer))
+            .collect();
+        let taps = tap_layers.len();
+        let mut main_hidden = vec![0.0f32; seqlen * taps * dim];
+        for layer in 0..config.n_layers {
+            if config.engram_rows(layer).is_some() {
+                engram::engram_forward(config, layer, &mut hidden, &hashes, source, self.limit)?;
+            }
+            if let Some(tap) = tap_layers.iter().position(|&target| target == layer) {
+                let mut averaged = vec![0.0f32; dim];
+                for position in 0..seqlen {
+                    let base = position * width;
+                    for (column, value) in averaged.iter_mut().enumerate() {
+                        let mut sum = 0.0f32;
+                        for copy in 0..hc {
+                            sum += hidden[base + copy * dim + column];
+                        }
+                        *value = sum / hc as f32;
+                    }
+                    write_tap(&mut main_hidden, position, tap, taps, dim, &averaged);
+                }
+            }
+            self.block(
+                state,
+                layer,
+                &mut hidden,
+                &mut pre_mix,
+                &mut scratch,
+                start_pos,
+            )?;
+        }
+
+        // Collapse the copies with the LAST block's FFN coefficient, then the final norm and the LM
+        // head (model.py:1268-1269).
+        let mut collapsed = vec![0.0f32; seqlen * dim];
+        mhc::hc_pre(config, &pre_mix, &hidden, &mut collapsed)?;
+        let norm = linalg::decode_by_name(source, "norm.weight", self.limit)?;
+        let mut tail = collapsed[(seqlen - 1) * dim..].to_vec();
+        linalg::rms_norm(&mut tail, &norm, dim, config.norm_eps as f32)?;
+        let head = linalg::decode_by_name(source, "head.weight", self.limit)?;
+        let mut logits = vec![0.0f32; config.vocab_size];
+        linalg::matmul(&mut logits, &tail, &head, config.vocab_size, dim, 1)?;
+
+        let next_token = sample_gumbel(&logits, self.sampling.temperature, self.sampling.seed);
+
+        // The DSpark stages draft after this token when the tap fired (model.py:1274-1282).
+        // The reference drafts nothing for the chunk at position 0: `forward_spec` returns None there
+        // (model.py:1123-1125, 1274-1282), so a prefill that starts a sequence has no draft, while every
+        // later step does. Refusing the step would be wrong in the other direction - the draft is
+        // optional, the logits are not.
+        let (draft, confidence) = if main_hidden.is_empty() || start_pos == 0 {
+            (Vec::new(), Vec::new())
+        } else {
+            // The MTP stages own their own window rings, held after the backbone layers.
+            let stages = &mut state.attention[config.n_layers..];
+            let output = mtp::dspark_forward(
+                config,
+                tokens,
+                start_pos,
+                &main_hidden,
+                next_token.unwrap_or(0),
+                stages,
+                source,
+                self.limit,
+            )?;
+            (output.draft, output.confidence)
+        };
+
+        state.tokens.extend_from_slice(tokens);
+        Ok(StepOutput {
+            logits,
+            next_token,
+            draft,
+            confidence,
+            consumed: seqlen,
+        })
+    }
+
+    /// One block, in the order `Block.forward` runs it (model.py:968-994, section 3.2).
+    ///
+    /// The shift is the point of single-pass mHC: the attention sublayer mixes the copies with the
+    /// previous sublayer's coefficient and leaves this one's behind, which the FFN sublayer then uses
+    /// (model.py:972-994).
+    fn block(
+        &self,
+        state: &mut SequenceState,
+        layer: usize,
+        hidden: &mut [f32],
+        pre_mix: &mut [f32],
+        scratch: &mut Scratch,
+        start_pos: usize,
+    ) -> Result<(), EngineError> {
+        let config = &self.config;
+        let prefix = format!("layers.{layer}");
+        let source: &dyn WeightSource = self.source.as_ref();
+
+        // The attention sublayer (model.py:972-980).
+        let fn_w = linalg::decode_by_name(source, &format!("{prefix}.hc_attn_fn"), self.limit)?;
+        let scale = linalg::decode_by_name(source, &format!("{prefix}.hc_attn_scale"), self.limit)?;
+        let base = linalg::decode_by_name(source, &format!("{prefix}.hc_attn_base"), self.limit)?;
+        mhc::hc_mixes(
+            config,
+            hidden,
+            &fn_w,
+            &scale,
+            &base,
+            &mut scratch.attn_mixes,
+        )?;
+        mhc::hc_pre(config, pre_mix, hidden, &mut scratch.attn_in)?;
+        let attn_norm =
+            linalg::decode_by_name(source, &format!("{prefix}.attn_norm.weight"), self.limit)?;
+        linalg::rms_norm(
+            &mut scratch.attn_in,
+            &attn_norm,
+            config.dim,
+            config.norm_eps as f32,
+        )?;
+        attention::attention_forward(
+            config,
+            layer,
+            &prefix,
+            &scratch.attn_in,
+            start_pos,
+            &mut state.attention[layer],
+            source,
+            &mut scratch.attn_out,
+            self.limit,
+        )?;
+        scratch.residual.copy_from_slice(hidden);
+        mhc::hc_post(
+            config,
+            &scratch.attn_out,
+            &scratch.residual,
+            &scratch.attn_mixes.post,
+            &scratch.attn_mixes.comb,
+            hidden,
+        )?;
+
+        // The FFN sublayer (model.py:982-994), whose input mix is the attention sublayer's.
+        let fn_w = linalg::decode_by_name(source, &format!("{prefix}.hc_ffn_fn"), self.limit)?;
+        let scale = linalg::decode_by_name(source, &format!("{prefix}.hc_ffn_scale"), self.limit)?;
+        let base = linalg::decode_by_name(source, &format!("{prefix}.hc_ffn_base"), self.limit)?;
+        mhc::hc_mixes(config, hidden, &fn_w, &scale, &base, &mut scratch.ffn_mixes)?;
+        mhc::hc_pre(config, &scratch.attn_mixes.pre, hidden, &mut scratch.ffn_in)?;
+        let ffn_norm =
+            linalg::decode_by_name(source, &format!("{prefix}.ffn_norm.weight"), self.limit)?;
+        linalg::rms_norm(
+            &mut scratch.ffn_in,
+            &ffn_norm,
+            config.dim,
+            config.norm_eps as f32,
+        )?;
+        moe::moe_forward(
+            config,
+            &prefix,
+            &scratch.ffn_in,
+            source,
+            self.limit,
+            &mut scratch.moe,
+            &mut scratch.ffn_out,
+        )?;
+        scratch.residual.copy_from_slice(hidden);
+        mhc::hc_post(
+            config,
+            &scratch.ffn_out,
+            &scratch.residual,
+            &scratch.ffn_mixes.post,
+            &scratch.ffn_mixes.comb,
+            hidden,
+        )?;
+
+        // The next block's input mix is THIS block's FFN coefficient (model.py:994).
+        pre_mix.copy_from_slice(&scratch.ffn_mixes.pre);
+        Ok(())
+    }
+}
+
+/// Writes one tap of one position into the DSpark tap buffer, which holds `taps * dim` values per
+/// token with the taps in tap order (model.py:1264-1266).
+fn write_tap(
+    out: &mut [f32],
+    position: usize,
+    tap: usize,
+    taps: usize,
+    dim: usize,
+    values: &[f32],
+) {
+    let start = (position * taps + tap) * dim;
+    out[start..start + dim].copy_from_slice(values);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dtype::DType;
+    use crate::tensor::TensorSpec;
+    use crate::weights::WeightError;
+
+    /// The tap buffer is position-major: all of a token's taps sit together, in tap order. The
+    /// reference concatenates the taps per position (model.py:1264-1266). A layer-major layout
+    /// passes every end-to-end test at this scale, because the draft is insensitive to the
+    /// permutation, so the axis is pinned here rather than through the forward pass.
+    #[test]
+    fn the_dspark_taps_are_written_per_position_in_tap_order() {
+        let mut out = vec![-1.0f32; 3 * 2 * 2];
+        write_tap(&mut out, 0, 0, 2, 2, &[1.0, 2.0]);
+        write_tap(&mut out, 0, 1, 2, 2, &[3.0, 4.0]);
+        write_tap(&mut out, 2, 1, 2, 2, &[1.0, 2.0]);
+        assert_eq!(
+            out[0..4],
+            [1.0, 2.0, 3.0, 4.0],
+            "position 0 holds both of its taps, in tap order"
+        );
+        assert_eq!(out[4..8], [-1.0f32; 4], "position 1 was not written");
+        assert_eq!(out[8..10], [-1.0f32; 2], "position 2 holds its first tap");
+        assert_eq!(
+            out[10..12],
+            [1.0, 2.0],
+            "position 2's second tap follows its first"
+        );
+    }
+
+    /// The default sampler is greedy, and a temperature that is not above zero is greedy too rather
+    /// than a division by zero.
+    #[test]
+    fn the_reference_sampler_is_greedy_at_zero_temperature() {
+        let logits = [0.5f32, 2.0, -1.0];
+        assert_eq!(sample_gumbel(&logits, 0.0, 0), Some(1));
+        assert_eq!(sample_gumbel(&logits, -1.0, 7), Some(1));
+        assert_eq!(sample_gumbel(&[], 1.0, 1), None);
+    }
+
+    /// A draw is a function of the logits, the temperature and the seed, and the seeds do not all
+    /// collapse onto one token.
+    #[test]
+    fn a_seeded_draw_is_a_function_of_its_inputs() {
+        let logits = [0.0f32, 0.1, 0.2, 0.3];
+        let first = sample_gumbel(&logits, 1.0, 99);
+        assert_eq!(first, sample_gumbel(&logits, 1.0, 99));
+        let draws: Vec<u32> = (0..32)
+            .filter_map(|seed| sample_gumbel(&logits, 1.0, seed))
+            .collect();
+        assert_eq!(draws.len(), 32);
+        assert!(
+            draws.iter().any(|token| Some(*token) != first),
+            "32 seeds do not all agree on one token: {draws:?}"
+        );
+        assert!(draws.iter().all(|token| (*token as usize) < logits.len()));
+    }
+
+    /// At a temperature above zero the noise can outvote a small logit gap, which is the whole point
+    /// of the temperature.
+    #[test]
+    fn a_temperature_above_zero_can_pick_what_greedy_would_not() {
+        let logits = [1.0f32, 0.999_9];
+        assert_eq!(sample_gumbel(&logits, 0.0, 0), Some(0));
+        assert!(
+            (0..64).any(|seed| sample_gumbel(&logits, 1.0, seed) == Some(1)),
+            "a 1e-4 logit gap is well inside Gumbel noise at temperature 1"
+        );
+    }
+
+    /// A plan-shaped source of finite numbers for tests that drive one block instead of the whole
+    /// pass. Every tensor keeps the plan's shape but is served as `f32` with the same small positive
+    /// pattern mtp.rs's finite hand uses, so nothing here is NaN or inf.
+    struct Hand {
+        specs: Vec<TensorSpec>,
+    }
+
+    impl Hand {
+        fn for_config(config: &ModelConfig) -> Self {
+            Self {
+                specs: TensorPlan::language_model(config).specs().to_vec(),
+            }
+        }
+    }
+
+    impl WeightSource for Hand {
+        fn names(&self) -> Vec<String> {
+            self.specs.iter().map(|spec| spec.name.clone()).collect()
+        }
+
+        fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
+            self.specs
+                .iter()
+                .find(|spec| spec.name == name)
+                .map(|spec| TensorSpec {
+                    dtype: DType::F32,
+                    ..spec.clone()
+                })
+                .ok_or_else(|| WeightError::Missing {
+                    name: name.to_owned(),
+                })
+        }
+
+        fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+            let elements = usize::try_from(self.spec(name)?.elements()).unwrap_or(usize::MAX);
+            let mut bytes = Vec::with_capacity(elements.saturating_mul(4));
+            for index in 0..elements {
+                let value = 0.02 + 0.01 * (index % 5) as f32;
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Ok(bytes)
+        }
+    }
+
+    /// The FFN block's RMSNorm reads `config.norm_eps`, not `hc_eps` (M7), the half the window-row
+    /// test in tests/forward.rs cannot reach.
+    ///
+    /// That test's observable is `attn_in`, the ATTENTION norm's output; by the time the FFN norm's
+    /// scale reaches a stored window row, the next layer's attention norm and the hc mixing have
+    /// rescaled it, so substituting hc_eps there leaves the whole suite green. The FFN norm is visible
+    /// here instead: `block` normalises `scratch.ffn_in` in place, so immediately after the call that
+    /// buffer IS the FFN norm's own output. Two configurations identical except norm_eps - 1.0 against
+    /// tiny's 1e-20, hc_eps held equal at 1e-6 - must give ffn_in RMS values a wide factor apart, and
+    /// they do because the hidden values are small enough that the epsilon dominates the denominator.
+    ///
+    /// Measured on this configuration, ffn_in RMS after one block of layer 0:
+    ///   norm_eps 1e-20 (tiny), correct engine          4.2069e-2
+    ///   norm_eps 1.0,          correct engine          8.6641e-5  -> 486x
+    ///   the FFN norm reading hc_eps instead (1e-6)     1.008x     (3.8161e-2 against 3.7844e-2)
+    /// The threshold is 100x, so the engine as written passes with about 5x of room and the substitution
+    /// fails it by two orders of magnitude. Replacing the epsilon in the ATTENTION norm instead leaves
+    /// this ratio at 486x, which is the point: this test and the window-row test in tests/forward.rs
+    /// cover the two block norms between them, and neither one alone covers both.
+    #[test]
+    fn the_ffn_block_rms_norm_reads_the_configured_epsilon() {
+        let sharp = ModelConfig {
+            norm_eps: 1.0,
+            ..ModelConfig::tiny()
+        };
+        let plain = ModelConfig::tiny();
+        assert!(
+            sharp.norm_eps > plain.norm_eps * 1e15,
+            "the two epsilons must be far apart for this to measure anything"
+        );
+        assert_eq!(
+            sharp.hc_eps, plain.hc_eps,
+            "only norm_eps differs between the two runs"
+        );
+
+        let ffn_row = |config: &ModelConfig| -> f32 {
+            let engine =
+                InferenceEngine::new(config.clone(), Box::new(Hand::for_config(config)), 1 << 22)
+                    .expect("a consistent configuration");
+            let mut state = SequenceState::new(config);
+            let mut scratch = Scratch::for_chunk(config, 1);
+            // Nonzero and small: mean(x^2) near 1e-6 leaves the epsilon in charge of the denominator.
+            let mut hidden: Vec<f32> = (0..config.hc_width())
+                .map(|index| 1e-3 * (1 + (index % 3)) as f32)
+                .collect();
+            let mut pre_mix = vec![0.0f32; scratch.attn_mixes.pre.len()];
+            engine
+                .block(&mut state, 0, &mut hidden, &mut pre_mix, &mut scratch, 0)
+                .expect("one block over a finite source");
+            let mean_square: f32 = scratch
+                .ffn_in
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                / scratch.ffn_in.len() as f32;
+            mean_square.sqrt()
+        };
+
+        let small = ffn_row(&sharp);
+        let large = ffn_row(&plain);
+        assert!(
+            large > small * 100.0,
+            "norm_eps 1.0 must shrink the FFN norm's output far below the 1e-20 run, got {small} against {large}"
+        );
+    }
+}

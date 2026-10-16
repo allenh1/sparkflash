@@ -569,15 +569,22 @@ of the nine, **no command in this repository can produce the number the gate ass
 
 **Findings, in the order they change what can be claimed.**
 
-1. There is no engine. The only `InferenceEngine` implementation in the tree is `MockEngine`
-   (`crates/sparkflash-api/src/engine.rs:372, 424, 680`); the Engram packer reads checkpoint
-   safetensors shards, but no code loads the transformer weights into a runnable model, and
-   `sparkflash serve` does not exist while `doctor`, `trace` and `pack-engram` are wired
-   (`crates/sparkflash-cli/src/main.rs:3-5, 39-42`); and `server::router` builds an axum `Router`
-   (`crates/sparkflash-api/src/server.rs:200`) that nothing binds to a socket - there is no
-   `TcpListener`, no `axum::serve` and no async entry point in the workspace. So qeval, the DSpark KL
-   divergence, the 1M needle test, the sparkDash sweeps and CUDA graph capture cannot be run by any
-   command here. That is a stronger statement than "unrun": the instrument does not exist.
+1. There is no GPU engine. `sparkflash serve` exists and is wired
+   (`crates/sparkflash-cli/src/serve.rs`, dispatched at `crates/sparkflash-cli/src/main.rs:43`): it
+   builds a `sparkflash_engine` reference engine over the synthetic plan or a sharded checkpoint,
+   binds a `TcpListener` (serve.rs:892) and serves it with `axum::serve` (serve.rs:907) on a `tokio`
+   runtime (serve.rs:874). It is one CPU process in `f32`, one sequence at a time, requests
+   serialised through a single engine thread and no batching (serve.rs:12-17, 24-31), so the api
+   crate's `InferenceEngine` seam now has two implementations - `MockEngine`
+   (`crates/sparkflash-api/src/engine.rs:460, 731`) and `ReferenceDriver` (serve.rs:363) - and
+   the reference forward pass is implemented and runs: all five modules are present and filled in
+   (`attention`, `engram`, `mhc`, `moe`, `mtp`; crates/sparkflash-engine/src/forward/mod.rs:21-25),
+   with no `unimplemented!()` or `todo!()` left in `crates/sparkflash-engine/src`, in `f32` on the CPU.
+   It has run end to end against the synthetic tiny plan only (serve.rs:950-951), and never against
+   real shards (none on this host), so its numbers are unusable for the model gates. So qeval, the
+   DSpark KL divergence, the 1M needle test, the sparkDash sweeps and CUDA graph capture still cannot
+   be run by any command here: they need the GPU and cluster instruments, not an HTTP entry point.
+   That is a stronger statement than "unrun": the instrument does not exist.
 2. Six run summaries have no producer. `SPARKFLASH_{QEVAL,DSPARK,NEEDLE,SPARKDASH,CUDA_GRAPH,TRACE}_RESULTS`
    appear only in `crates/sparkflash-scheduler/src/gates.rs` (declared 32-42, read 291-374). Nothing in
    the repository writes them, so the operator must supply the summary the gate then asserts on. A gate
@@ -607,13 +614,24 @@ of the nine, **no command in this repository can produce the number the gate ass
 **Correction, recorded the same day.** The survey's snapshot predated milestone 2's merge, which is
 what wired `sparkflash pack-engram`, and the first revision of finding 1 therefore said the packer did
 not exist and that nothing under `crates/` mentioned safetensors. Both halves were wrong in the merged
-tree: the CLI dispatches the subcommand (`crates/sparkflash-cli/src/main.rs:40`) into
+tree: the CLI dispatches the subcommand (`crates/sparkflash-cli/src/main.rs:42`) into
 `sparkflash_engram::packer`, which reads the checkpoint's safetensors shards. The finding that
-matters is unchanged - no code loads the transformer weights into a runnable model, the endpoints
-are never bound to a socket, and the five gates that need a model still have no command to run them -
-but a record that overstates a gap is as misleading as one that hides it, so the claim is corrected
-here and in `docs/QUALIFICATION.md` rather than left to be discovered. The Engram shards are absent
-for the ordinary reason: the packer has not been run against the checkpoint.
+matters is unchanged - the five gates that need a GPU model still have no command to run them - but
+two of the mechanisms it named are not: since the serve slice landed, weights are loaded into a
+runnable reference model and the endpoints are bound to a socket
+(`crates/sparkflash-cli/src/serve.rs:892, 907`). A record that overstates a gap is as misleading as
+one that hides it, so the claim is corrected here and in `docs/QUALIFICATION.md` rather than left to
+be discovered. The Engram shards are absent for the ordinary reason: the packer has not been run
+against the checkpoint.
+
+**Correction, recorded 2026-10-16.** The first revision of finding 1 also said "`sparkflash serve`
+does not exist", that `server::router` was a `Router` "that nothing binds to a socket", that there was
+"no `TcpListener`, no `axum::serve` and no async entry point in the workspace", and that "no code
+loads the transformer weights into a runnable model". All four sentences were true of the 2026-10-15
+snapshot this entry records and are false in the tree today, so item 1 above now states the corrected
+version rather than the snapshot's. What remains true is the conclusion those sentences supported:
+the five gates that need a model still have no instrument here - because the one server in the tree
+is the CPU reference path, not because a server is missing.
 
 **Two latency numbers, and why both are right.** The spec states 22 us for preflight check 3 (line 1323)
 and 20 us for milestone 3 (line 1336). Nothing in the tree encoded 20. They are not in conflict once
@@ -637,11 +655,12 @@ fakes. Closing the gaps in findings 1-7 is later work, not a qualification run.
 
 **Evidence.** The specification's tree names eight crates (`deepseek_v41_flash_4x_dgx_spark_rust_spec.md`
 lines 227-252) and none of them is an engine; `docs/QUALIFICATION.md` section 5 finding 1 records the
-consequence, that five gates have no instrument because `server::router` binds no socket and the only
-implementation is `MockEngine`. The checkpoint settles two things the earlier architecture work left
-implicit. Its index (`model.safetensors.index.json`, 96,085 names over 48 shards,
-`metadata.total_size` 510,286,023,000) contains no `ffn.gate.scale`, no `compressor.*.scale`, no
-`indexer.weights_proj.scale` and no `indexer.wk.scale`, so those tensors are not block-quantised;
+consequence, that the five gates needing a GPU model have no instrument - the tree's one socket is
+the CPU reference serve path (`crates/sparkflash-cli/src/serve.rs`), which has no GPU, no KV pool
+and no batching, so it cannot produce their numbers. The checkpoint settles two things the earlier
+architecture work left implicit. Its index (`model.safetensors.index.json`, 96,085 names over 48
+shards, `metadata.total_size` 510,286,023,000) contains no `ffn.gate.scale`, no `compressor.*.scale`,
+no `indexer.weights_proj.scale` and no `indexer.wk.scale`, so those tensors are not block-quantised;
 `inference/model.py:811` runs the gate through the plain fp32 `F.linear` path, which agrees. And
 `convert.py:156-168` dequantises `wo_a` to bf16 at conversion time, so the released index stores it
 quantised, with a scale for all 40 layers: the tensor's identity changes between the released shards
@@ -698,4 +717,37 @@ Claims in the architecture docs corrected here and in those files: the gate weig
 rather than fp32, the image path is 970,536,960 bytes rather than 553,394,784, and the section 2.4 byte
 table is exact rather than a 0.09% approximation. `docs/engine/01-forward-order.md` carries the
 evidence, with citations, for all of it.
+
+---
+
+## D19 - `panic = "abort"` in the release profile is deliberate, and the serve panic guard says so
+
+Recorded 2026-10-16.
+
+**Evidence.** The workspace manifest sets `panic = "abort"` for the release profile: the line is
+`Cargo.toml:85`, inside `[profile.release]` at 81-86. `sparkflash serve` runs each request's forward pass
+inside `std::panic::catch_unwind` on the engine thread so that a panic ends that one request as its
+`EngineEvent::Error` instead of stopping the server - but `catch_unwind` only catches a panic in a build
+that unwinds, and a release build does not. In a release `sparkflash` the process therefore aborts
+rather than answering the request with an error; that is stated in the module doc (`serve.rs:41-47`)
+and again at the guard (`serve.rs:685-690`). The guard cannot be narrowed to this binary: Cargo
+refuses `panic` in a package profile with "`panic` may not be specified in a `package` profile"
+(`serve.rs:42-44`), so the strategy is all-or-nothing across the workspace. Every dev and test build
+unwinds, which is why the panic path is testable there: the guard's test and the weight source that
+panics on demand are compiled only under `#[cfg(all(test, panic = "unwind"))]` (`serve.rs:260`, `:736`,
+`:917-923`), so `cargo test` - and therefore CI - exercises the guard while a release binary never
+reaches it.
+
+**Decision.** Keep `panic = "abort"`. A server that aborts on an internal panic rather than unwinding
+through half-initialised engine state is the deliberate choice; a per-package override is impossible
+anyway, and flipping the workspace to `unwind` would change the panic strategy of `sparkflash-comm`
+and the CUDA kernels for no gain at this milestone. The guard stays because the builds that can
+reach it are the ones that need a per-request terminal event, and the module doc states the limit
+rather than implying a protection the release binary does not have.
+
+**Consequence.** `serve.rs`'s per-request panic guard must not be read as a production protection: in
+a release `sparkflash`, an engine panic is a process abort. `docs/QUALIFICATION.md` section 5
+finding 1 points here for the serve path's failure semantics. Before this entry the setting was
+recorded nowhere in `docs/` - a reader learned it only from the manifest or from `serve.rs`'s module
+doc.
 

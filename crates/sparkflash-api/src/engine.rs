@@ -368,6 +368,33 @@ impl ClusterStatsSnapshot {
     }
 }
 
+/// What an engine can actually serve.
+///
+/// Every field defaults to `false`, which is the most conservative answer there is: an engine that
+/// has not declared a channel is treated as not having it, so `GET /v1/models` can never advertise
+/// a capability by omission. A driver opts in by saying what it really does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Capabilities {
+    /// Whether the engine accepts image parts.
+    pub vision: bool,
+    /// Whether the engine can emit tool calls.
+    pub tools: bool,
+    /// Whether the engine produces a reasoning channel.
+    pub thinking: bool,
+    /// Whether the engine honours a caller's `reasoning_effort`.
+    pub reasoning_effort: bool,
+}
+
+impl Capabilities {
+    /// Every optional channel declared: what an engine that does all of it answers.
+    pub const ALL: Self = Self {
+        vision: true,
+        tools: true,
+        thinking: true,
+        reasoning_effort: true,
+    };
+}
+
 /// The model runtime behind the HTTP layer.
 pub trait InferenceEngine: Send + Sync {
     /// Canonical model id served by this engine.
@@ -378,6 +405,15 @@ pub trait InferenceEngine: Send + Sync {
 
     /// Current cluster telemetry snapshot.
     fn cluster_stats(&self) -> ClusterStatsSnapshot;
+
+    /// What this engine can serve beyond plain text.
+    ///
+    /// This is what `GET /v1/models` advertises. It defaults to [`Capabilities::default`], the most
+    /// conservative answer: a channel is something a driver has to state, never something assumed on
+    /// its behalf.
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
 }
 
 /// One scripted tool call for MockEngine.
@@ -433,6 +469,8 @@ pub struct MockEngine {
     accepted_prediction_tokens: usize,
     rejected_prediction_tokens: usize,
     loop_guard: Option<LoopAbortConfig>,
+    /// What this mock answers for [`InferenceEngine::capabilities`].
+    capabilities: Capabilities,
 }
 
 impl MockEngine {
@@ -451,7 +489,20 @@ impl MockEngine {
             accepted_prediction_tokens: 0,
             rejected_prediction_tokens: 0,
             loop_guard: None,
+            capabilities: Capabilities::default(),
         }
+    }
+
+    /// Sets what this mock says it can serve.
+    ///
+    /// The mock never actually does any of it: these are the answers
+    /// [`InferenceEngine::capabilities`] gives, and nothing more, so that the capability line of
+    /// `/v1/models` can be pinned in every direction. The default is [`Capabilities::default`], the
+    /// most conservative set there is.
+    #[must_use]
+    pub fn with_capabilities(mut self, capabilities: Capabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     /// Replaces the whole scripted response.
@@ -707,6 +758,10 @@ impl InferenceEngine for MockEngine {
         snapshot.max_seq_len = max_seq_len();
         snapshot
     }
+
+    fn capabilities(&self) -> Capabilities {
+        self.capabilities
+    }
 }
 
 /// Convenience: the prefix-match plan a request produced, for tests and callers that only
@@ -746,6 +801,38 @@ mod tests {
 
     fn collect(engine: &MockEngine, request: EngineRequest) -> Vec<EngineEvent> {
         futures::executor::block_on(engine.generate(request).collect::<Vec<_>>())
+    }
+
+    /// An engine that declares nothing: it answers with the trait's conservative default.
+    struct SilentEngine;
+
+    impl InferenceEngine for SilentEngine {
+        fn model_id(&self) -> &str {
+            "silent"
+        }
+
+        fn generate(&self, _request: EngineRequest) -> BoxStream<'static, EngineEvent> {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn cluster_stats(&self) -> ClusterStatsSnapshot {
+            ClusterStatsSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn an_engine_that_declares_nothing_answers_with_the_conservative_default() {
+        assert_eq!(SilentEngine.capabilities(), Capabilities::default());
+        assert_eq!(
+            MockEngine::new(MODEL_ID).capabilities(),
+            Capabilities::default()
+        );
+        assert_eq!(
+            MockEngine::new(MODEL_ID)
+                .with_capabilities(Capabilities::ALL)
+                .capabilities(),
+            Capabilities::ALL
+        );
     }
 
     #[test]

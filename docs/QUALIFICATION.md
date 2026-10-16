@@ -38,7 +38,7 @@ forward from that earlier reading rather than re-measured for this document.
 | sparkDash c = 1..16 | 1340 | gates.rs:338 + `SPARKFLASH_SPARKDASH_RESULTS` | **never run** (no producer; see 3.7) |
 | CUDA graph replay, batch 1..16 | 1340, 1336 | gates.rs:350 + `SPARKFLASH_CUDA_GRAPH_RESULTS` | **never run** (no producer and no graph-capture code; see 3.8) |
 | 45-step scoped trace, every scope | 1340 | `sparkflash trace` planner (trace_cli.rs) + gates.rs:362 | **never run** (planner only, no capture runner; see 3.9) |
-| Preflight, checks 1-5 | 1321-1325 | `sparkflash doctor` (real probes) | **measured read-only 2026-10-15**, not through this runbook: 3 checks measured failing (driver, MTU, memory), a 4th cannot pass (Engram shards, no packer), and check 3 has no instrument (section 2) |
+| Preflight, checks 1-5 | 1321-1325 | `sparkflash doctor` (real probes) | **measured read-only 2026-10-15**, not through this runbook: 3 checks measured failing (driver, MTU, memory), a 4th cannot pass (the Engram shards are not packed here: the packer exists but has not been run against the checkpoint), and check 3 has no instrument (section 2) |
 
 What has actually run: CI (.gitlab-ci.yml:52) executes `cargo test --workspace`, which excludes every
 ignored test, so the gates themselves never run in CI. The tests that do run in CI are the threshold
@@ -87,7 +87,7 @@ reader can see which precondition a future run skipped.
 | 10 KiB one-shot All-Reduce | < 22 µs (doctor) or < 20 µs (spec 1336) | doctor.rs:98-101 | not measured; the probe binary is not on PATH | never run |
 | SM clock cap | [0, 2200] MHz | doctor.rs:104-107; spec 1324 | not measured | never run |
 | Available memory | `MemAvailable >= 114 GiB` per node | doctor.rs:110; spec 1324 | 5 GiB (other tenant resident) | **FAIL** |
-| Engram shards | `engram-l1-r{rank}of4.bin`, `engram-l14-r{rank}of4.bin` plus manifest, 512-byte aligned, ~48 GiB per node | doctor.rs:113-119, 2043; spec 1325 | absent; `sparkflash pack-engram` exists and reads the checkpoint's safetensors shards (crates/sparkflash-cli/src/main.rs:40, crates/sparkflash-engram/src/packer.rs) but has not been run against the checkpoint, so no shard has been written | **FAIL** |
+| Engram shards | `engram-l1-r{rank}of4.bin`, `engram-l14-r{rank}of4.bin` plus manifest, 512-byte aligned, ~48 GiB per node | doctor.rs:113-119, 2079-2135; spec 1325 | absent; `sparkflash pack-engram` exists and reads the checkpoint's safetensors shards (crates/sparkflash-cli/src/main.rs:42, crates/sparkflash-engram/src/packer.rs) but has not been run against the checkpoint, so no shard has been written | **FAIL** |
 
 Section 2.4's second command is the one that produces this table; the "measured" column above is the
 2026-10-15 reading, not a run of that command.
@@ -106,7 +106,7 @@ cargo build --release -p sparkflash-cli
 - **Pass criterion: the report's `verdict` is `"ready"`**, meaning every check ran and passed
   (doctor.rs:1221-1281). The process exit code is **not** sufficient: `Verdict::Incomplete` (nothing
   failed, at least one check did not run) also exits 0, and only `Verdict::NotReady` exits 1
-  (doctor.rs:1243-1248).
+  (doctor.rs:1244-1252, 1270-1271).
 - `--apply` and `--lock-sm-clocks` are the only mutating flags and both are refused while a node may
   be serving traffic (doctor.rs:1449-1457). Preflight is read-only: do not pass them during this
   runbook.
@@ -307,8 +307,9 @@ SPARKFLASH_NEEDLE_RESULTS="context=1048576 found=1" cargo test -p sparkflash-sch
 telemetry for the run (pages per tier), and the summary line. The gate reads only `context` and
 `found`, so what the run actually asked is not recoverable from the gate.
 
-**State: never run**; no producer (finding 2), and no serve path that could hold 1M tokens of KV
-(finding 1).
+**State: never run**; no producer (finding 2), and the reference serve path could not hold 1M
+tokens of KV even if it were driven: it has no KV pool and no persistent tier, and decodes one chunk
+at a time on the CPU (crates/sparkflash-cli/src/serve.rs:12-17, 490-492; finding 1).
 
 ### 3.7 sparkDash concurrency 1..16
 
@@ -331,8 +332,9 @@ SPARKFLASH_SPARKDASH_RESULTS="max_concurrency=16 failed_requests=0" cargo test -
 count), the server-side telemetry with the run, and the summary line. A single `max_concurrency=16`
 line without the 16 levels does not show that the sweep happened.
 
-**State: never run**; there is no sweep client in the tree (finding 2) and no server to sweep
-(finding 1).
+**State: never run**; there is no sweep client in the tree (finding 2), and the one server in the
+tree is not a concurrency-16 target: the reference serve path serialises every request through a
+single engine thread, one sequence at a time (crates/sparkflash-cli/src/serve.rs:24-31; finding 1).
 
 ### 3.8 CUDA graph replay, batch 1..16
 
@@ -362,7 +364,7 @@ summary line.
 **Spec.** Line 1340: "capture a 45-step scoped trace via `sparkflash trace --scopes all --steps 45`".
 
 **Instrument.** Two halves, only one of which exists. The command exists and parses:
-crates/sparkflash-cli/src/main.rs:17 dispatches `trace` to
+crates/sparkflash-cli/src/main.rs:41 dispatches `trace` to
 `sparkflash_scheduler::trace_cli::run` (trace_cli.rs:158), with `GATE_STEPS = 45` (trace_cli.rs:20).
 The capture does not: trace_cli.rs:6-8 says "Only the plan is produced here; running the capture is a
 hardware gate". The gate reads the result: gates.rs:360-374, test
@@ -436,17 +438,38 @@ runbook that keeps a green board from being read as "defect-free".
 These are the most load-bearing statements in this document. Each one is a place where the tree
 contains an expectation and no instrument.
 
-1. **There is no engine.** The only implementation of `InferenceEngine` is
-   `MockEngine` (crates/sparkflash-api/src/engine.rs:372, 424, 680). The Engram packer does read
-   checkpoint shards (crates/sparkflash-engram/src/packer.rs), but nothing loads the transformer
-   weights into a runnable model, and `sparkflash serve` does not exist while `doctor`, `trace` and
-   `pack-engram` are wired (crates/sparkflash-cli/src/main.rs:3-5, 39-42). Corrected after the first
-   revision of this finding: that revision predated milestone 2's merge, which is what wired
-   `pack-engram`, and it said the packer did not exist. The finding itself is unchanged for the
-   transformation stack - there is no route from a checkpoint to a token. `sparkflash_api::server::router` builds an
-   axum `Router` (crates/sparkflash-api/src/server.rs:200) but **nothing binds a socket**: there is no
-   `TcpListener`, no `axum::serve` and no async entry point in the workspace. Consequence: gates 3.4
-   through 3.8 cannot be run by any command in this tree, not merely "have not been run".
+1. **There is no GPU engine, and that is what the five model gates need.** `sparkflash serve`
+   is implemented and wired (crates/sparkflash-cli/src/serve.rs, dispatched at
+   crates/sparkflash-cli/src/main.rs:43): it builds a `sparkflash_engine` reference engine over either
+   the synthetic tiny plan (`--synthetic`, no checkpoint on disk) or a real sharded checkpoint
+   (`--checkpoint DIR`), presents it to `sparkflash_api::server::router` through a local driver, binds
+   a `TcpListener` (serve.rs:892) and serves it with `axum::serve` (serve.rs:907) on a `tokio`
+   runtime (serve.rs:874), printing the address it actually bound (serve.rs:906). It is one process,
+   `f32`, on the CPU, one sequence at a time, with requests serialised through a single engine
+   thread and no batching (serve.rs:12-17, 24-31, 552-554). So `MockEngine`
+   (crates/sparkflash-api/src/engine.rs:460, 731) is no longer the only implementation of the api
+   crate's `InferenceEngine` - `ReferenceDriver` implements it too (serve.rs:363). Its failure
+   semantics are a decision recorded in `docs/DECISIONS.md` D19: an engine panic is caught per request
+   only where the build unwinds, and the release profile's `panic = "abort"` (Cargo.toml:85) makes a
+   release `sparkflash` abort the process instead. The reference
+   forward pass is implemented and runs: all five modules are present and filled in (`attention`,
+   `engram`, `mhc`, `moe`, `mtp`; crates/sparkflash-engine/src/forward/mod.rs:21-25), no
+   `unimplemented!()` or `todo!()` remains anywhere in crates/sparkflash-engine/src, and the engine runs
+   a whole prefill and decode in `f32` on the CPU (crates/sparkflash-engine/src/forward/mod.rs:1-3;
+   crates/sparkflash-engine/tests/forward.rs:102-108, 168-177, 206-225). What has run end to end is
+   the synthetic tiny plan, the path every serve test takes (serve.rs:950-951). The code's route from
+   a checkpoint to a token is compile-verified and refusal-tested only - a directory without
+   `model.safetensors.index.json` is refused by name (serve.rs:285, 1318-1322), and shards that do not
+   match the plan are refused at load (serve.rs:728-733) - and it has never run against real shards,
+   because this host has none, so the numbers the reference path could print are still unusable for
+   the model gates, which measure the GPU path. The first revision of this finding was right that no
+   such route existed when the survey was taken. Two corrections to it: it predated milestone 2's
+   merge, which
+   wired `pack-engram` (crates/sparkflash-engram/src/packer.rs), and it predated the serve slice, so
+   it said the packer and the server did not exist. The consequence is unchanged: gates 3.4 through
+   3.8 cannot be run by any command in this tree, not merely "have not been run" - they measure the
+   GPU and cluster path (a qeval harness, a 16-way concurrent server, graph capture), and none of
+   that exists here.
 2. **Six run summaries have no producer.** `SPARKFLASH_QEVAL_RESULTS`, `SPARKFLASH_DSPARK_RESULTS`,
    `SPARKFLASH_NEEDLE_RESULTS`, `SPARKFLASH_SPARKDASH_RESULTS`, `SPARKFLASH_CUDA_GRAPH_RESULTS` and
    `SPARKFLASH_TRACE_RESULTS` appear **only** in crates/sparkflash-scheduler/src/gates.rs (declared at
@@ -547,6 +570,6 @@ SPARKFLASH_TRACE_RESULTS="steps=45 scopes=16" cargo test -p sparkflash-scheduler
 Steps 2 and 3 cannot currently succeed: step 2's gates are panic stubs (finding 3) and the probe,
 now merged, can only refuse because the RDMA backend is a skeleton (finding 4); step 3's six gates
 have no producer of their summaries (finding 2)
-and five of them additionally have no engine to run (finding 1); step 4 prints a plan rather than a
+and five of them additionally need a GPU engine this tree does not have (finding 1); step 4 prints a plan rather than a
 capture (finding 7). Until those findings are closed, this runbook's honest state is section 1: every
 gate **never run**.

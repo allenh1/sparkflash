@@ -4,3 +4,4 @@
 //! can be exercised as a library, with injected probes, without spawning a process.
 
 pub mod doctor;
+pub mod serve;

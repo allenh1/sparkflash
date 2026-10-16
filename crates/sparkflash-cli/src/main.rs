@@ -2,20 +2,22 @@
 //!
 //! The binary is a thin dispatcher: each subcommand is one arm here and the logic lives in
 //! the crate that owns it, so everything the binary can do is also reachable as a library call
-//! and testable without a process. `doctor`, `trace` and `pack-engram` are implemented today;
-//! `serve` arrives with the crate that backs it.
+//! and testable without a process. `doctor`, `trace`, `pack-engram` and `serve` are implemented
+//! today.
 //!
 //! The arms parse differently on purpose. `doctor` parses its own arguments inside
 //! `sparkflash_cli::doctor` because it takes a repeated `--nodes` list and echoes probe output
 //! verbatim, so its arm forwards the remaining arguments untouched. `pack-engram` is a clap
 //! command whose options are shared verbatim with the standalone `pack-engram` binary, so its
 //! arguments are handed to clap with the subcommand name restored as the program name, and
-//! `trace` forwards to the scheduler's own CLI for the same reason `doctor` does.
+//! `trace` forwards to the scheduler's own CLI for the same reason `doctor` does. `serve` parses
+//! its own arguments for the same reason as `doctor`, and it is the one arm that does not return
+//! until the process is stopped.
 
 use std::process::ExitCode;
 
 use clap::Parser;
-use sparkflash_cli::doctor;
+use sparkflash_cli::{doctor, serve};
 use sparkflash_engram::packer::{CliArgs, run_cli};
 
 /// `pack-engram` options, shared verbatim with the standalone binary.
@@ -38,8 +40,9 @@ fn main() -> ExitCode {
         Some("doctor") => doctor::run(args),
         Some("trace") => sparkflash_scheduler::trace_cli::run(args),
         Some("pack-engram") => pack_engram(args),
+        Some("serve") => serve::run(args),
         _ => {
-            println!("sparkflash: usage: sparkflash <doctor|trace|pack-engram>");
+            println!("sparkflash: usage: sparkflash <doctor|trace|pack-engram|serve>");
             ExitCode::SUCCESS
         }
     }
