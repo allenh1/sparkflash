@@ -13,16 +13,26 @@
 //!   the released model and a tiny one for tests.
 //! - [`dtype`]: the storage formats in the checkpoint - FP8 E4M3, FP4 E2M1 packed two-per-byte,
 //!   the UE8M0 scale bytes, and the block rules that decide how many scale bytes a tensor carries.
+//! - [`quant`]: the checkpoint's storage formats decoded to f32 - FP8 E4M3, E8M0 scales, FP4
+//!   E2M1, bf16 and f32 - and the reference's per-32 activation quantisers.
 //! - [`tensor`]: [`TensorPlan`], the name, shape and dtype of every tensor the forward reads.
 //! - [`weights`]: the [`WeightSource`] trait - the only thing the arithmetic code will see.
 //! - [`synthetic`]: a [`WeightSource`] backed by a seeded generator instead of a file.
+//! - [`safetensors`]: the checkpoint's container and index, read without reading tensor data, so a
+//!   reader that has the index can describe 96,085 tensors without opening a 510 GB checkpoint.
+//! - [`loader`]: the checkpoint opened against the plan - verified shard by shard, then read one
+//!   tensor at a time, with the two conversions convert.py performs and the Engram tables refused.
 //!
-//! Nothing here allocates a model-sized buffer, opens a checkpoint, or touches a device.
+//! Nothing here allocates a model-sized buffer or touches a device. The one module that opens a
+//! checkpoint, [`loader`], reads headers first and then a single tensor at a time, under a limit.
 
 #![forbid(unsafe_code)]
 
 pub mod config;
 pub mod dtype;
+pub mod loader;
+pub mod quant;
+pub mod safetensors;
 pub mod synthetic;
 pub mod tensor;
 pub mod weights;

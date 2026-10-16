@@ -36,6 +36,33 @@ pub enum WeightError {
         /// The source's configured limit.
         limit: u128,
     },
+    /// The plan itself cannot be checked against anything.
+    ///
+    /// The audit asks whether a checkpoint is the model a plan describes, and an empty plan
+    /// describes nothing: every planned name is trivially present, so it would report a directory
+    /// full of unrelated files as conformant. A check that passes because it checked nothing is the
+    /// failure this crate is built to avoid, so the empty plan is refused before the checkpoint is
+    /// consulted at all.
+    #[error("the tensor plan cannot be used: {detail}")]
+    Plan {
+        /// What is wrong with it.
+        detail: String,
+    },
+    /// The source refuses this name outright, whatever its size.
+    ///
+    /// Not every tensor that must not be read is too large to read. The two Engram tables are 98 GB
+    /// each and belong to another crate's packed store, so this source names them and refuses them;
+    /// that refusal is a policy about the name, not a measurement of the bytes, and it is decided
+    /// before the shard is opened so that a refused name costs no file handle. Reporting it as
+    /// [WeightError::TooLarge] would have meant inventing a size for a tensor that was never
+    /// described.
+    #[error("tensor {name} is refused by this source: {detail}")]
+    Refused {
+        /// The name that was asked for.
+        name: String,
+        /// Why this source will not read it.
+        detail: String,
+    },
     /// The underlying storage could not be read.
     #[error("could not read {name}: {detail}")]
     Io {
