@@ -8,6 +8,7 @@ members = [
     "crates/sparkflash-comm",
     "crates/sparkflash-kernels",
     "crates/sparkflash-cli",
+    "crates/sparkflash-engine",
 ]
 resolver = "2"
 
@@ -27,6 +28,7 @@ sparkflash-kv = { path = "crates/sparkflash-kv" }
 sparkflash-engram = { path = "crates/sparkflash-engram" }
 sparkflash-comm = { path = "crates/sparkflash-comm" }
 sparkflash-kernels = { path = "crates/sparkflash-kernels" }
+sparkflash-engine = { path = "crates/sparkflash-engine" }
 
 tokio = { version = "1.43", features = ["full", "rt-multi-thread", "parking_lot"] }
 axum = { version = "0.8", features = ["http2", "json", "macros"] }

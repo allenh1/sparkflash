@@ -15,7 +15,7 @@ convert.py, kernel.py, config.json, tech_report.txt.
 | expert intermediate width | 2304 | config.json moe_intermediate_size |
 | MoE layers | all 40 backbone blocks (+ 3 MTP) | model.py:929; tech_report.txt p.22 line 1002 |
 | MTP routed experts | 128, top-3 | config.json dspark_n_routed_experts / dspark_num_experts_per_tok |
-| gate weight | [384, 5120] fp8 + scale | layers.N.ffn.gate.weight, 40 tensors |
+| gate weight | [384, 5120] bf16, **not quantised** (no `ffn.gate.scale` in the index; the gate runs the plain fp32 `F.linear` path, model.py:811) | layers.N.ffn.gate.weight, 40 tensors |
 | gate.bias | [384] fp32 | from e_score_correction_bias (convert.py:115) |
 | gate.bias_vl | [384] fp32 | image-span routing bias (model.py:807) |
 | routed expert tensors | 40 x 384 x 3 weights + 40 x 384 x 3 scales = 92,160 | index.json |
@@ -117,7 +117,8 @@ on dim 0; wkv, gate.weight, all norms, hc_*, engram.wkv and the compressors are 
 
 | Tensor class | Weight (checkpoint) | Weight scale grid | Activation (compute) | Activation scale grid | Source |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| Dense Linears (attn, gate, engram.wkv, indexer, ...) | fp8 e4m3, 1 byte/param | [ceil(out/32), ceil(in/32)] ue8m0, one scale per 32x32 block | fp8 e4m3, dynamic (**W8A8**) | [tokens, in/32] ue8m0 | model.py:225-233, 27, 197; kernel.py:293-298 |
+| Dense Linears (attn, engram.wkv, indexer, ...) | fp8 e4m3, 1 byte/param | [ceil(out/32), ceil(in/32)] ue8m0, one scale per 32x32 block | fp8 e4m3, dynamic (**W8A8**) | [tokens, in/32] ue8m0 | model.py:225-233, 27, 197; kernel.py:293-298 |
+| MoE gate weight | bf16, 2 bytes/param, **not quantised** | -- | fp32 `F.linear(x.float(), weight.float())`, no activation quant | -- | model.py:811, 206-207 |
 | Shared expert (ffn.shared_experts) | fp8 e4m3 (constructed without a dtype, so it takes ModelArgs.dtype) | [ceil(out/32), ceil(in/32)] ue8m0 | fp8 e4m3, dynamic (**W8A8**) | [tokens, in/32] ue8m0 | model.py:26, 887, 196-205 |
 | Routed experts (w1/w2/w3) | fp4 e2m1 packed 2-per-byte, stored [out, in/2] int8 | **[out, in/32]** ue8m0, one scale per output row per 32 along K: no blocking along out | **fp8 e4m3, dynamic (W4A8)** | [tokens, in/32] ue8m0 | model.py:219-224, 186-195; kernel.py:486-499, 511-515, 581-582 |
 | MTP experts (mtp.N.ffn.experts) | same as routed experts | same | same (**W4A8**) | same | model.py:872-885 |

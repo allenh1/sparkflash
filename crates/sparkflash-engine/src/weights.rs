@@ -1,0 +1,144 @@
+//! The weight source: the only interface the arithmetic code will ever see.
+//!
+//! A source answers three questions about a tensor - does it exist, what is its dtype and shape,
+//! and what are its bytes - and nothing else. Two implementations are planned:
+//!
+//! - [`crate::synthetic`], which generates bytes from a seed and needs no checkpoint, and
+//! - the checkpoint source, which will memory-map the 48 safetensors shards named by the index.
+//!
+//! Keeping the trait this narrow is what makes the engine testable without the weights: every test
+//! that is about arithmetic rather than about the file format runs against the synthetic source, and
+//! the conformance check below is what proves the two sources describe the same model.
+
+use crate::dtype::DType;
+use crate::tensor::{TensorPlan, TensorSpec};
+
+/// What can go wrong while asking a source for a tensor.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WeightError {
+    /// The source does not hold a tensor with that name.
+    #[error("no tensor named {name}")]
+    Missing {
+        /// The name that was asked for.
+        name: String,
+    },
+    /// The tensor exists but is larger than this source is willing to materialise.
+    ///
+    /// The real checkpoint is 510 GB across four nodes, so a source that will happily allocate a
+    /// tensor of any size is a source that can take a machine down by accident. This error is the
+    /// guard, and the limit is a constructor argument.
+    #[error("tensor {name} needs {bytes} bytes, over this source's limit of {limit}")]
+    TooLarge {
+        /// The name that was asked for.
+        name: String,
+        /// The number of bytes the tensor would occupy.
+        bytes: u128,
+        /// The source's configured limit.
+        limit: u128,
+    },
+    /// The underlying storage could not be read.
+    #[error("could not read {name}: {detail}")]
+    Io {
+        /// The name that was asked for.
+        name: String,
+        /// The operating system's message.
+        detail: String,
+    },
+    /// The storage disagrees with the plan.
+    #[error("tensor {name} is malformed: {detail}")]
+    Malformed {
+        /// The name that was asked for.
+        name: String,
+        /// What is wrong with it.
+        detail: String,
+    },
+}
+
+/// A borrowed view of one tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TensorView<'a> {
+    /// The tensor's name.
+    pub name: &'a str,
+    /// Its element format.
+    pub dtype: DType,
+    /// Its logical shape: the shape the arithmetic sees, which for a packed FP4 weight is twice
+    /// the last dimension of the bytes on disk.
+    pub shape: &'a [usize],
+    /// Its bytes, in the layout the dtype implies.
+    pub data: &'a [u8],
+}
+
+/// A source of weights.
+pub trait WeightSource {
+    /// Every tensor name this source holds, in a stable order.
+    fn names(&self) -> Vec<String>;
+
+    /// The dtype and logical shape of one tensor.
+    fn spec(&self, name: &str) -> Result<TensorSpec, WeightError>;
+
+    /// The bytes of one tensor.
+    fn read(&self, name: &str) -> Result<Vec<u8>, WeightError>;
+
+    /// Whether the source holds a tensor with that name.
+    fn contains(&self, name: &str) -> bool {
+        self.spec(name).is_ok()
+    }
+}
+
+/// The result of checking a source against a plan.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Conformance {
+    /// How many tensors were present with the planned dtype and shape.
+    pub matched: usize,
+    /// Every disagreement, in plan order: a missing tensor, a dtype that differs, or a shape that
+    /// differs.
+    pub mismatches: Vec<String>,
+}
+
+impl Conformance {
+    /// Whether the source and the plan describe the same model.
+    pub fn is_conformant(&self) -> bool {
+        self.mismatches.is_empty()
+    }
+}
+
+/// Check every tensor in `plan` against `source`.
+///
+/// This is the check that lets a synthetic source stand in for the checkpoint in a test: it reports
+/// whether the two describe the same names with the same dtypes and shapes, without reading tensor
+/// data - only specs - so it is cheap even against a 510 GB checkpoint.
+///
+/// What it can and cannot prove depends entirely on the source. Against a real checkpoint it is a
+/// conformance gate. Against [`crate::synthetic::SyntheticWeights`] built from the same plan it can
+/// only ever agree, because that source clones the plan: a test that wants to show this check FIRING
+/// must hand it a source that deviates, which is what
+/// `the_conformance_check_rejects_a_source_that_deviates` does.
+pub fn check_source_against_plan<S: WeightSource + ?Sized>(
+    source: &S,
+    plan: &TensorPlan,
+) -> Conformance {
+    let mut report = Conformance::default();
+    for wanted in plan.specs() {
+        match source.spec(&wanted.name) {
+            Err(error) => report.mismatches.push(format!("{}: {error}", wanted.name)),
+            Ok(found) => {
+                if found.dtype != wanted.dtype {
+                    report.mismatches.push(format!(
+                        "{}: dtype {} but the plan says {}",
+                        wanted.name,
+                        found.dtype.name(),
+                        wanted.dtype.name()
+                    ));
+                } else if found.shape != wanted.shape {
+                    report.mismatches.push(format!(
+                        "{}: shape {:?} but the plan says {:?}",
+                        wanted.name, found.shape, wanted.shape
+                    ));
+                } else {
+                    report.matched += 1;
+                }
+            }
+        }
+    }
+    report
+}

@@ -94,9 +94,11 @@ compiled into ModelArgs (dim=1024, n_layers=5, n_heads=16, ...; inference/model.
 Reconstructed from the shapes implied by config.json plus the tensor names in
 model.safetensors.index.json, then cross-checked against metadata.total_size (section 2.4).
 
-### 2.1 Backbone — 552B
+### 2.1 Backbone — 551.6B (the report says 552B)
 
 Per layer (dim=5120, H=64, head_dim=512, q_lora=1280, o_groups=8, o_lora=1024, E=384, EI=2304):
+every row is a count from the module constructors in `inference/model.py` plus `config.json`, and the
+rows are meant to be added up.
 
 | Block | Params |
 | :--- | ---: |
@@ -115,16 +117,26 @@ Per layer (dim=5120, H=64, head_dim=512, q_lora=1280, o_groups=8, o_lora=1024, E
 | 1 shared expert x 3 x (2304x5120) | 35,389,440 |
 | hc_attn_fn + hc_ffn_fn (24x20480 each) | 983,040 |
 | hc_*_base (24x2) + hc_*_scale (3x2) | 54 |
-| **per layer** | **13,754,509,990** |
-| x40 | 550,180,399,600 |
-| embed.weight 129280x5120 | 662,118,400 |
-| head.weight 129280x5120 | 662,118,400 |
+| **per layer: the 15 rows above, summed** | **13,754,511,990** |
+| 40 layers = 13,754,511,990 x 40 | 550,180,479,600 |
+| embed.weight 129280x5120 | 661,913,600 |
+| head.weight 129280x5120 | 661,913,600 |
 | norm.weight | 5,120 |
-| source-layer extras: compressor.wkv x4, compressor.wgate x3, compressor.norm x4, indexer.wk x4, indexer.k_norm x4, indexer.wq_b x8, indexer.weights_proj x8 | 15,792,896 |
-| **backbone total** | **551,510,179,440 (about 551.5B)** |
+| source-layer extras: compressor.norm 4x512 + compressor.wkv 4x2,621,440 + compressor.wgate 3x2,621,440 + indexer.wk 4x65,536 + indexer.k_norm 4x128 + indexer.wq_b 8x5,242,880 + indexer.weights_proj 8x163,840 | 61,868,544 |
+| **backbone total: 550,180,479,600 + 661,913,600 + 661,913,600 + 5,120 + 61,868,544** | **551,566,180,464 (about 551.6B)** |
 
-The paper says 552B backbone parameters (tech_report.txt p.7, line 285); the released config
-reproduces that to 0.09%. The 3 MTP/DSpark stages add about 7.6B (section 2.3).
+The per-layer rows and the extras are exact counts, not estimates; the only rounding in this section
+is the "551.6B". The 15-row per-layer sum is 13,754,511,990, and
+13,754,511,990 x 40 + 661,913,600 + 661,913,600 + 5,120 + 61,868,544 = 551,566,180,464. The extras
+row is the seven source-layer families the 15 rows leave out: the compressor (4 norms of 512, 4
+`wkv` of 512x5120, 3 `wgate` of 512x5120) and the indexer (4 `wk` of 128x512, 4 `k_norm` of 128,
+8 `wq_b` of 4096x1280, 8 `weights_proj` of 32x5120). The embed and head rows are 129,280 x 5120 =
+661,913,600 each: V = 129,280 is `config.json`'s `text_config.vocab_size`, and the byte identity pins it
+independently (section 2.4: embed + head = 2,647,654,400 bytes).
+
+The paper says 552B backbone parameters (tech_report.txt p.7, line 285); the released config gives
+551,566,180,464, within 0.08% (a parameter-count comparison, not the byte identity, which is exact:
+section 2.4). The 3 MTP/DSpark stages add about 7.6B (section 2.3).
 
 ### 2.2 Engram — 196B
 
@@ -153,30 +165,45 @@ lines 981-995). The **released reference forward does not implement CED**: Trans
 iterates over all 40 layers for every token (inference/model.py:1261-1267) and generate.py prefills
 whole chunks through all 40 layers (inference/generate.py:69-74). See section 4.
 
-### 2.4 Checkpoint byte layout reconstructed from total_size
+### 2.4 Checkpoint byte layout derived from the constructors, closed against total_size
 
-Assuming fp8 (1 byte/param plus one ue8m0 byte per 32x32 block) for dense Linears, packed MXFP4
-(0.5 byte/param plus one ue8m0 byte per 32 elements along K) for routed and shared experts,
-2 bytes for embeddings/norms/HC/Engram tables plus 1/32 byte per param for Engram scales, and
-4 bytes for attn_sink:
+Every row is derived from the module constructors, and the total closes **exactly**. Sizes:
+fp8 1 byte/param plus one ue8m0 byte per 32x32 block; packed MXFP4 0.5 byte/param plus one ue8m0 byte
+per 32 elements along K; bf16 2 bytes/param for the unquantised weights (embeddings, head, norms,
+the gate weight, the Engram q/k weights, the compressor wkv/wgate, the DSpark confidence projection);
+fp32 4 bytes/param for attn_sink, the HC parameters and the gate biases; ue8m0 1 byte per scale
+element:
 
 | Group | Bytes |
 | :--- | ---: |
-| routed + shared experts (40 layers) | 290,194,790,400 |
-| Engram tables (fp8 plus ue8m0 per 32) | 202,758,032,400 |
-| dense attention (40 layers) | 5,069,721,600 |
-| MoE gates + MTP MoE | 7,406,531,712 |
+| routed experts, backbone (40 x 384 x 3 FP4 + 3 E8M0 scales) | 288,777,830,400 |
+| shared experts, backbone (40 x 3 FP8 + 3 E8M0) | 1,416,960,000 |
+| routed experts, MTP (3 x 128 x 3 + 3) | 7,219,445,760 |
+| shared experts, MTP (3 x 3 + 3) | 106,272,000 |
+| dense attention, backbone (40 layers; wo_a scale 32x32) | 5,069,578,240 |
+| attention + FFN norms (43 layers: q_norm 1280, kv_norm 512, attn_norm/ffn_norm 5120) | 1,034,752 |
+| dense attention, MTP (3 layers) | 380,218,368 |
+| MoE gates, backbone + MTP (bf16 weight, fp32 biases) | 161,344,512 |
 | embed + head | 2,647,654,400 |
+| final norm.weight | 10,240 |
 | HC parameters (40 + 3 layers, fp32) | 169,092,168 |
-| compressor + indexer | 60,947,520 |
-| Engram projections | 315,207,680 |
-| vision + aligner + image delimiters | 553,394,784 |
-| **reconstructed total** | **509,820,148,088** |
+| compressor + indexer | 81,835,008 |
+| Engram tables (FP8 plus ue8m0 per 32) | 202,758,032,400 |
+| Engram projections (2 layers; q/k bf16) | 315,043,840 |
+| MTP extras (main_proj, stage norms, markov head, confidence head) | 211,133,952 |
+| image path (vision 823,685,120 + aligner 146,821,120 + 3 delimiters 30,720, bf16) | 970,536,960 |
+| **total** | **510,286,023,000** |
 | metadata.total_size | **510,286,023,000** |
-| delta | 0.09% |
+| delta | **0 (exact)** |
 
-The residual sits in the packing details (per-tensor scale padding, and whether every fp8 tensor
-really uses 32x32 rather than 128x128 blocks; inference/convert.py:164 accepts both).
+The identity is what settles choices a safetensors header would otherwise have to settle:
+`wo_a`'s scale grid is 32x32, i.e. `[256, 128]` — the 128x128 alternative `[64, 32]` would leave the
+total 1,228,800 bytes short (40 layers x 30,720); the compressor `wkv`/`wgate`, the Engram
+`q_weight`/`k_weight` and `mtp.2.confidence_head.proj.weight` are stored bf16 even where the
+reference promotes the module to fp32 (inference/model.py:444-446, 932 with 940-946, 1092); and the
+Engram `q_weight`/`k_weight` are the four tensors whose fp32-vs-bf16 choice is worth 163,840 bytes
+(4 x 4 x 5120 x 2). The shard files are not on this machine, so a header read is still
+the direct confirmation; this table is the corroboration.
 
 ---
 
@@ -190,12 +217,13 @@ image_newline.
 | :--- | ---: | :--- |
 | layers.{0..39}.attn.{wq_a,wq_b,wkv,wo_a,wo_b}.{weight,scale} | 40 each | scale only for fp8 tensors |
 | layers.N.attn.attn_sink | 40 | no .weight suffix; fp32 |
-| layers.N.attn.{q_norm,kv_norm}.weight, attn_norm, ffn_norm | 40 each | fp32 weights |
+| layers.N.attn.{q_norm,kv_norm}.weight, attn_norm, ffn_norm | 40 each | bf16 in storage; RMSNorm casts to fp32 internally (model.py:288-293) |
 | layers.{2,8,14,20}.attn.compressor.{wkv,norm}.weight | 4 | main-KV compressor |
 | layers.{2,8,14}.attn.compressor.wgate.weight | 3 | **absent for layer 20** (ratio 1) |
 | layers.{2,8,14,20}.attn.indexer.{wk,k_norm}.weight | 4 | owns_k layers only |
-| layers.{2,8,14,20,24,28,32,36}.attn.indexer.wq_b.{weight,scale}, .weights_proj.weight | 8 each | indexers |
-| layers.N.ffn.gate.weight | 40 | 384x5120, fp8 |
+| layers.{2,8,14,20,24,28,32,36}.attn.indexer.wq_b.{weight,scale} | 8 | the only quantised indexer projection |
+| layers.{2,8,14,20,24,28,32,36}.attn.indexer.weights_proj.weight | 8 | bf16, no scale (model.py:515, 518) |
+| layers.N.ffn.gate.weight | 40 | 384x5120, **not quantised**: the index has no `ffn.gate.scale` and the gate runs the plain fp32 linear path (model.py:811) |
 | layers.N.ffn.gate.bias, layers.N.ffn.gate.bias_vl | 40 each | noaux correction bias plus the VL twin |
 | layers.N.ffn.experts.{0..383}.{w1,w2,w3}.{weight,scale} | 15,360 each | fp4 packed (int8 view) plus scale |
 | layers.N.ffn.shared_experts.{w1,w2,w3}.{weight,scale} | 40 each | 1 shared expert |
@@ -204,7 +232,7 @@ image_newline.
 | layers.{1,14}.engram.embed.weight | 2 | fp8 [rows, 256] |
 | layers.{1,14}.engram.embed.scale | 2 | ue8m0 [rows, 8] |
 | layers.{1,14}.engram.wkv.{weight,scale} | 2 each | fp8, 25600 x 6144 |
-| layers.{1,14}.engram.q_weight, k_weight | 2 each | fp32 [4, 5120] |
+| layers.{1,14}.engram.q_weight, k_weight | 2 each | bf16 [4, 5120] (storage bf16; built outside the fp32 block, model.py:932 + 940-946) |
 | mtp.{0,1,2}.attn.*, mtp.N.*_norm.weight, mtp.N.hc_* | 3 each | one DSpark block per stage |
 | mtp.N.ffn.experts.{0..127}.*, mtp.N.ffn.gate.* | 128 experts each | **128 routed, top-3** |
 | mtp.N.ffn.shared_experts.* | 3 | |

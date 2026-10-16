@@ -26,6 +26,7 @@ records the evidence and the consequence for the build. Research backing is in
 | D15 | Two dead trace features | Deleted: neither name appeared in any cfg in the workspace, so enabling either changed nothing; the CUDA dependency selector stays because it selects cudarc |
 | D16 | KV specification defects | Six 5.5 defects recorded as facts: the 890 B/token headline contradicts its own itemisation (356 B/entry once the rotary dimensions are not double-counted), plus five more, each with the code's settlement named |
 | D17 | Qualification state | Nine gates recorded with instrument, command, artifact and state; five cannot be run by any command in this tree, and 20 us at 10 KiB is the requirement while the preflight's 22 us is a deliberately looser readiness threshold |
+| D18 | The engine is a ninth crate, and the plan describes the checkpoint as stored | `crates/sparkflash-engine`; the plan is derived from the configuration and then checked against the index, and the load-time conversions (wo_a, the int8 view of FP4) belong to the loader, not the plan |
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
 summary and the matching `## D<n>` section carries the evidence and the full consequence. If a row and
@@ -629,3 +630,72 @@ that would run it, the artifact that would evidence it, and - for every gate - t
 as passing on the strength of an `#[ignore]`d test, and the only claims a green CI run supports are
 narrow: the CPU references, the threshold and parser logic, and doctor's check logic against injected
 fakes. Closing the gaps in findings 1-7 is later work, not a qualification run.
+
+---
+
+## D18 - The engine is a ninth crate, and the tensor plan describes the checkpoint as stored
+
+**Evidence.** The specification's tree names eight crates (`deepseek_v41_flash_4x_dgx_spark_rust_spec.md`
+lines 227-252) and none of them is an engine; `docs/QUALIFICATION.md` section 5 finding 1 records the
+consequence, that five gates have no instrument because `server::router` binds no socket and the only
+implementation is `MockEngine`. The checkpoint settles two things the earlier architecture work left
+implicit. Its index (`model.safetensors.index.json`, 96,085 names over 48 shards,
+`metadata.total_size` 510,286,023,000) contains no `ffn.gate.scale`, no `compressor.*.scale`, no
+`indexer.weights_proj.scale` and no `indexer.wk.scale`, so those tensors are not block-quantised;
+`inference/model.py:811` runs the gate through the plain fp32 `F.linear` path, which agrees. And
+`convert.py:156-168` dequantises `wo_a` to bf16 at conversion time, so the released index stores it
+quantised, with a scale for all 40 layers: the tensor's identity changes between the released shards
+and what `generate.py` loads.
+
+**Decision.** The engine is a new workspace member, `crates/sparkflash-engine`, not a module inside
+`sparkflash-cli`. The CLI already owns the doctor, the packer and the fabric probe; the engine owns the
+weight plan, the loader, the KV cache and the serving loop. Keeping them apart is what lets the loader
+be tested without a socket and the socket be tested without 510 GB of weights.
+
+The first slice is the tensor plan, the configuration and a checkpoint-free weight source, because
+those are the three things every later slice needs and the only three that can be finished before a
+weight file is opened. The plan describes the checkpoint **as stored**, with the conversions recorded as
+loader work, so its names and byte totals can be held against the index directly.
+
+**Consequence.** `TensorPlan::language_model` produces 95,819 tensors - the index's 93,415 under
+`layers.*`, 2,401 under `mtp.*`, plus `embed.weight`, `head.weight` and `norm.weight` - and the
+remaining 266 index names (259 `vision.*`, 4 `aligner.*` and the three image delimiters) are the image
+path, which the text engine does not plan and a test asserts rather than assumes. The 95,819 planned
+names are set-equal to the index's language-model names, and their storage totals 509,315,486,040
+bytes, 0.99810 of the released `total_size`; the remaining 0.19% is exactly the image path
+(970,536,960 = 823,685,120 vision + 146,821,120 aligner + 30,720 delimiters), so the plan plus the
+image path equals `metadata.total_size` **to the byte**. `metadata.total_size` is the sum of the
+stored tensor bytes and contains no index JSON; an earlier revision of this entry said the 0.19% was
+"the image path and the index metadata", which is false. That check does not depend on the
+checkpoint being present. Of the 21 tests in `crates/sparkflash-engine/tests/tensor_plan.rs`, exactly
+three need the index and print `SKIP: the released checkpoint index is not on this host` without it -
+`the_plan_names_are_the_released_index_names`, `the_names_the_plan_leaves_out_are_the_vision_tower` and
+`the_committed_digest_came_from_this_index` - and the rest run anywhere:
+`the_plan_matches_the_committed_index_digest` checks the derived plan
+against `tests/fixtures/v41_flash_tensor_digest.txt`, which
+`crates/sparkflash-engine/scripts/regen-tensor-fixture.py` generates from the released index and which
+records that index file's sha256 and name digest. That fixture is not taken on trust where the index
+exists: `the_committed_digest_came_from_this_index` regenerates every one of its lines - the sha256, the
+byte count, all nine name counts and the digest - and compares them line by line, so a fixture that
+no longer describes the checkpoint fails rather than silently certifying the plan against a stale digest.
+Finally,
+`the_plan_bytes_are_exact_not_approximately_right` pins 509,315,486,040 and
+509,315,486,040 + 970,536,960 = 510,286,023,000 with no index at all. On a host without the index the
+binary still reports 21 passed, with the three skip lines. An earlier revision of this entry said the
+checks run only where the index is present, which understated the coverage in the wrong direction.
+
+Deriving the plan instead of transcribing the index found three defects in its own drafts:
+`DType::storage_bytes` ignored `bytes_per_element` for the multi-byte formats; `wo_a` was planned
+with the whole head width instead of `heads / o_groups`; and `layers.{1,14}.engram.q_weight`/`.k_weight`
+were stored as fp32 where the checkpoint has bf16 (`inference/model.py:347-348` take the ambient bf16
+default, and `Engram` is built at `model.py:932`, outside the `set_dtype(torch.float32)` block that
+opens at `model.py:940`) - four tensors, 4 x 4 x 5120 x 2 = 163,840 bytes. None was visible until the
+byte total was compared against the released `total_size`, which is the argument for deriving it.
+
+Claims in the architecture docs corrected here and in those files: the gate weight is not quantised
+(`00-overview.md`, `03-moe.md:18`, `03-moe.md:121`), the norm weights are bf16 in storage,
+`indexer.wq_b` is the only quantised indexer projection, the Engram `q_weight`/`k_weight` are bf16
+rather than fp32, the image path is 970,536,960 bytes rather than 553,394,784, and the section 2.4 byte
+table is exact rather than a 0.09% approximation. `docs/engine/01-forward-order.md` carries the
+evidence, with citations, for all of it.
+

@@ -80,6 +80,13 @@ vision encoder is a SparkFlash-RS optimisation, not a reference behaviour. The v
 also **replicated** on every rank: convert.py's shard mapping (convert.py:56-64) contains no vision
 entries, so nothing is partitioned.
 
+In the released shards the whole image path is bf16 and its byte total is derived rather than read:
+vision 823,685,120 bytes (32 blocks of 25,702,400 plus patch_embed and the tower norm at 1,208,320),
+aligner 146,821,120, and the three image delimiters 30,720 - **970,536,960** in total. Those are the
+bytes that make the language-model plan plus the image path equal `metadata.total_size` exactly
+(00-overview.md section 2.4); the identity is the corroboration, and a safetensors header read remains
+the direct confirmation of the per-tensor dtypes.
+
 ---
 
 ## 4. The aligner: 3x3 pixel-unshuffle (vision.py:106-119)
