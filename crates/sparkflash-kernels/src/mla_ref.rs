@@ -15,6 +15,31 @@
 //! of those are asserted below, because "the window is applied" is exactly the kind of claim that
 //! silently degrades into "the window is approximately applied".
 //!
+//! # The attention sink
+//!
+//! `layers.N.attn.attn_sink` is a real checkpoint tensor that the released attention uses: F32, one
+//! learned logit per query head (`[64]`, so one element of it belongs to the single head this module
+//! computes; the engine's own tensor plan pins that shape). The released implementation is not
+//! vendored here - our architecture docs transcribe it: `sum_exp[i] += exp(attn_sink[i] -
+//! scores_max[i])` after the online-softmax loop, then divide (docs/architecture/01-csa2-attention.md
+//! section 7, from inference/kernel.py:382-383). Two decisions follow from that, and both are
+//! deliberate:
+//!
+//! * the sink is a DENOMINATOR term only. It adds probability mass for a place attention can go that
+//!   has no value vector, so it attenuates the candidate mixture instead of renormalising it; the
+//!   direction of that mixture (the ratio between its channels) is untouched;
+//! * it is added AFTER the candidate maximum rather than folded into it, because that is where the
+//!   released code adds it. A sink far above the maximum therefore overflows the denominator to
+//!   `+inf` and the output is exactly zero; that is the released arithmetic, and this reference does
+//!   not re-stabilise the formula it exists to reproduce.
+//!
+//! The value is used as given: the checkpoint does not state its range, so nothing here clamps or
+//! bounds it. [`attention_with_sink`] is the entry point, and [`attention`] is unchanged - it is
+//! exactly [`attention_with_sink`] with a sink of negative infinity. What is still missing is the
+//! device side: kernels/flash_mla_csa2_sm121 has no sink argument yet, so a device-vs-reference
+//! comparison is "sink excluded on both sides" until that ABI change lands, and nothing in this file
+//! claims otherwise.
+//!
 //! The SCORE SCALE is part of the contract, not a detail: a score is a dot product over the
 //! 512-wide latent, multiplied by 1 / sqrt(512) = 0.04419417382415922 (MLA_SCORE_SCALE below).
 //! Specification 2.3 states the sparse-selection rule but does not pin this constant, so it is
@@ -102,13 +127,16 @@ pub fn kv_latent(kv_fp4: &[u8], kv_scales: &[u8], row: usize, index: usize) -> f
         * fp8_e4m3_decode(kv_scales[row * ROW_SCALE_BYTES + index / KV_SCALE_CHANNELS])
 }
 
-/// The attention output for one head: three passes over the candidate list, exactly as the kernel
-/// runs them.
+/// The attention output for one head, without a sink: three passes over the candidate list, exactly
+/// as the kernel runs them.
 ///
 /// The query q is one head's latent, rope already applied by the caller; the KV buffer is
 /// \[positions\]\[packed\] with scales \[positions\][latent / 16]. Out-of-window candidates are skipped in
 /// every pass, so they contribute exactly nothing; if no candidate is inside the window the result
 /// is all zeros.
+///
+/// This is the no-sink path and it is unchanged by the sink work; [`attention_with_sink`] takes the
+/// checkpoint's sink value and is the only entry point that can differ.
 ///
 /// # Panics
 /// Panics if the candidate list is longer than MAX_SELECTED, or the slices are too short.
@@ -120,13 +148,64 @@ pub fn attention(
     selected: &[u32],
     position: u32,
 ) -> Vec<f32> {
+    attention_impl(q, kv_fp4, kv_scales, selected, position, None)
+}
+
+/// The attention output for one head, with that head's attention sink.
+///
+/// The sink is one additive logit in the same space as the scaled scores - it is added as given and
+/// is NOT multiplied by [`MLA_SCORE_SCALE`] again - and it enters the softmax denominator only:
+///
+/// ```text
+/// out = sum_j exp(s_j - m) v_j / (exp(sink - m) + sum_j exp(s_j - m))
+/// ```
+///
+/// with `m` the maximum over the in-window candidates, computed exactly as [`attention`] computes
+/// it. Mass that goes to the sink contributes no value, so the output keeps the candidate mixture's
+/// direction and shrinks by the sink's share of the denominator; if nothing is in the window the
+/// result is all zeros with or without a sink. Following the released implementation, the sink is
+/// added after `m` rather than folded into it, so a sink more than about 88 above `m` overflows the
+/// denominator and the output is exactly zero.
+///
+/// # Panics
+/// Panics if the candidate list is longer than MAX_SELECTED, or the slices are too short.
+#[must_use]
+pub fn attention_with_sink(
+    q: &[f32],
+    kv_fp4: &[u8],
+    kv_scales: &[u8],
+    selected: &[u32],
+    position: u32,
+    sink: f32,
+) -> Vec<f32> {
+    attention_impl(q, kv_fp4, kv_scales, selected, position, Some(sink))
+}
+
+/// The three passes, shared by the no-sink and sink entry points.
+///
+/// `sink = None` is the no-sink arithmetic exactly as it was before the sink existed, in the same
+/// order, so its results are unchanged bit for bit; `Some(sink)` adds one term to the denominator of
+/// pass two and touches nothing else.
+///
+/// # Panics
+/// Panics if the candidate list is longer than MAX_SELECTED, or the slices are too short.
+fn attention_impl(
+    q: &[f32],
+    kv_fp4: &[u8],
+    kv_scales: &[u8],
+    selected: &[u32],
+    position: u32,
+    sink: Option<f32>,
+) -> Vec<f32> {
     assert_eq!(q.len(), MLA_LATENT, "the query is one latent wide");
     assert!(
         selected.len() <= MAX_SELECTED,
         "the candidate list is index_topk long"
     );
 
-    // Pass one: the maximum score over the candidates that are inside the window.
+    // Pass one: the maximum score over the candidates that are inside the window. The sink is NOT
+    // folded into this maximum: the released kernel adds it after the candidate max, so the
+    // exponentials formed below are the ones it forms.
     let mut maximum = f32::NEG_INFINITY;
     for candidate in selected {
         if in_window(position, *candidate) {
@@ -137,8 +216,11 @@ pub fn attention(
         }
     }
 
-    // Pass two: the normalising sum. An all-excluded list leaves the sum at zero, and the guard
-    // below turns that into a zero output instead of a division by zero.
+    // Pass two: the normalising sum, plus the sink's term when there is one. An all-excluded list
+    // leaves the sum at zero and pass three's denominator guard turns that into a zero output; the
+    // sink's term is skipped there rather than evaluated, because our maximum is -inf where the
+    // released kernel's is the finite -1e30 floor, so exp(sink + 1e30) would be +inf for the
+    // released code, and both reach the same all-zero answer.
     let mut weight_sum = 0.0f32;
     if maximum > f32::NEG_INFINITY {
         for candidate in selected {
@@ -146,8 +228,10 @@ pub fn attention(
                 weight_sum += (score_candidate(q, kv_fp4, kv_scales, *candidate) - maximum).exp();
             }
         }
+        if let Some(sink) = sink {
+            weight_sum += (sink - maximum).exp();
+        }
     }
-    let denominator = if weight_sum > 0.0 { weight_sum } else { 1.0 };
 
     // Pass three: the weighted latent sum.
     let mut out = vec![0.0f32; MLA_LATENT];
@@ -162,6 +246,16 @@ pub fn attention(
             }
         }
     }
+    // The denominator is the (possibly sink-augmented) sum itself whenever something was attended;
+    // the 1.0 guard exists only for the empty case, whose numerator is already all zeros. Tying the
+    // guard to the empty case rather than to "weight_sum > 0" is what lets a non-finite sink behave
+    // as IEEE arithmetic - a +inf denominator gives exactly zero, a NaN sink gives NaN - instead of
+    // being silently swapped for an unnormalised sum.
+    let denominator = if maximum > f32::NEG_INFINITY {
+        weight_sum
+    } else {
+        1.0
+    };
     for value in out.iter_mut() {
         *value /= denominator;
     }
@@ -352,6 +446,209 @@ mod tests {
         // An empty list is the same case.
         let empty = attention(&q, &kv.fp4, &kv.scales, &[], 0);
         assert!(empty.iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn a_large_sink_removes_the_attention_mass_from_the_only_candidate() {
+        // One candidate whose latent is 1.0 in channel 0, against a query that reads channel 0, so
+        // the score is MLA_SCORE_SCALE. Without a sink that candidate takes the whole softmax and the
+        // output IS its latent. A sink of 10.0 - two orders of magnitude above the score - has to
+        // take almost all of the mass, and because the sink has no value the output collapses towards
+        // zero rather than being renormalised back to the candidate.
+        let mut kv = Kv::new(1);
+        kv.set(0, 0, 0x2); // 1.0
+        let mut q = vec![0.0f32; MLA_LATENT];
+        q[0] = 1.0;
+        let score = MLA_SCORE_SCALE;
+        let sink = 10.0f32;
+
+        let without = attention(&q, &kv.fp4, &kv.scales, &[0], 0);
+        assert_eq!(without[0], 1.0, "one candidate takes all of the mass");
+
+        let with = attention_with_sink(&q, &kv.fp4, &kv.scales, &[0], 0, sink);
+        // Closed form, written in the other arrangement from the implementation's: the candidate's
+        // weight is exp(score - max) = 1 and the sink's is exp(sink - max), so the candidate keeps
+        // s / (1 + s) with s = exp(score - sink).
+        let s = (score - sink).exp();
+        let expected = s / (1.0 + s);
+        assert!(
+            (with[0] - expected).abs() < 1e-9,
+            "got {} expected {expected}",
+            with[0]
+        );
+        // The sink removes exactly the mass it takes: the difference is 1 - expected.
+        let removed = without[0] - with[0];
+        assert!(
+            (removed - (1.0 - expected)).abs() < 1e-6,
+            "the sink removed {removed}, expected {}",
+            1.0 - expected
+        );
+        // And it is a visible collapse, so this test cannot pass with the sink ignored: a sink of
+        // 10.0 leaves the candidate under a thousandth of its weight.
+        assert!(
+            with[0] < without[0] * 1e-3,
+            "a sink of {sink} must collapse the candidate's weight: {} vs {}",
+            with[0],
+            without[0]
+        );
+        // The sink adds mass, not a value: no channel receives anything.
+        for (index, value) in with.iter().enumerate().skip(1) {
+            assert_eq!(*value, 0.0, "channel {index} must stay zero");
+        }
+    }
+
+    #[test]
+    fn the_sink_is_added_as_a_logit_and_not_scaled_again() {
+        // The candidate's score already carries MLA_SCORE_SCALE; the sink is a logit in that same
+        // additive space, so it is added as given. With score = MLA_SCORE_SCALE and sink = 1.0 the
+        // candidate keeps s / (1 + s) with s = exp(MLA_SCORE_SCALE - 1), about 0.2777. A sink that
+        // was multiplied by the score scale as well would give 0.5, so the two readings are more
+        // than 0.2 apart and this test can tell them apart.
+        let mut kv = Kv::new(1);
+        kv.set(0, 0, 0x2);
+        let mut q = vec![0.0f32; MLA_LATENT];
+        q[0] = 1.0;
+        let sink = 1.0f32;
+        let out = attention_with_sink(&q, &kv.fp4, &kv.scales, &[0], 0, sink);
+        let s = (MLA_SCORE_SCALE - sink).exp();
+        let expected = s / (1.0 + s);
+        assert!(
+            (out[0] - expected).abs() < 1e-6,
+            "got {} expected {expected}",
+            out[0]
+        );
+        let scaled_again_s = (MLA_SCORE_SCALE - sink * MLA_SCORE_SCALE).exp();
+        let scaled_again = scaled_again_s / (1.0 + scaled_again_s);
+        assert!(
+            (out[0] - scaled_again).abs() > 0.2,
+            "a sink scaled a second time must not fit this test: {} vs {scaled_again}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn the_sink_only_scales_the_candidate_mixture() {
+        // Two candidates whose latents point at different channels: row 0 is 1.0 in channel 0, row 1
+        // is 2.0 in channel 1. The query reads channel 0, so candidate 0 scores MLA_SCORE_SCALE and
+        // candidate 1 scores 0: their weights are 1 and exp(-MLA_SCORE_SCALE), and the no-sink answer
+        // is that weighted mixture. A sink can only scale the mixture down - it cannot change the
+        // ratio between its channels, because it contributes to the denominator and to nothing else.
+        let mut kv = Kv::new(2);
+        kv.set(0, 0, 0x2); // 1.0 in channel 0
+        kv.set(1, 1, 0x4); // 2.0 in channel 1
+        let mut q = vec![0.0f32; MLA_LATENT];
+        q[0] = 1.0;
+        let sink = 3.0f32;
+
+        let lower = (-MLA_SCORE_SCALE).exp();
+        let candidate_weight_sum = 1.0 + lower;
+        let without = attention(&q, &kv.fp4, &kv.scales, &[0, 1], 8);
+        assert!(
+            (without[0] - 1.0 / candidate_weight_sum).abs() < 1e-6,
+            "no sink, channel 0: {}",
+            without[0]
+        );
+        assert!(
+            (without[1] - 2.0 * lower / candidate_weight_sum).abs() < 1e-6,
+            "no sink, channel 1: {}",
+            without[1]
+        );
+
+        let with = attention_with_sink(&q, &kv.fp4, &kv.scales, &[0, 1], 8, sink);
+        // The same numerator, over the candidate sum plus the sink's exp(sink - MLA_SCORE_SCALE).
+        let sink_weight = (sink - MLA_SCORE_SCALE).exp();
+        let denominator = candidate_weight_sum + sink_weight;
+        assert!(
+            (with[0] - 1.0 / denominator).abs() < 1e-6,
+            "got {} expected {}",
+            with[0],
+            1.0 / denominator
+        );
+        assert!(
+            (with[1] - 2.0 * lower / denominator).abs() < 1e-6,
+            "got {} expected {}",
+            with[1],
+            2.0 * lower / denominator
+        );
+        // The ratio between the channels is untouched: the sink is not a mixture component.
+        let expected_ratio = 2.0 * lower;
+        assert!(
+            (with[1] / with[0] - without[1] / without[0]).abs() < 1e-4,
+            "the sink changed the mixture's shape: {} vs {}",
+            with[1] / with[0],
+            without[1] / without[0]
+        );
+        assert!(
+            (with[1] / with[0] - expected_ratio).abs() < 1e-4,
+            "the mixture's ratio must be the weight ratio: {} vs {expected_ratio}",
+            with[1] / with[0]
+        );
+        // Both channels are strictly smaller, so the sink really did take mass.
+        assert!(
+            with[0] < without[0] && with[1] < without[1],
+            "the sink must attenuate both channels: {with:?} vs {without:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_sink_reproduces_the_no_sink_output_bit_for_bit() {
+        // Point 4 of the sink work: callers with no sink are not silently altered. A sink that can
+        // never win - negative infinity, or so negative that its exponential underflows to zero -
+        // must give the same bits as the no-sink entry point, not merely a close answer.
+        let mut kv = Kv::new(2);
+        kv.set(0, 0, 0x2);
+        kv.set(1, 0, 0x4);
+        let mut q = vec![0.0f32; MLA_LATENT];
+        q[0] = 1.0;
+        let without = attention(&q, &kv.fp4, &kv.scales, &[0, 1], 8);
+        for sink in [f32::NEG_INFINITY, -1.0e30] {
+            let with = attention_with_sink(&q, &kv.fp4, &kv.scales, &[0, 1], 8, sink);
+            assert_eq!(
+                without
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                with.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                "a sink of {sink} must reproduce the no-sink output"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sink_with_nothing_in_the_window_is_still_zeros() {
+        // The sink is a place for mass to go, not a value: when every candidate is outside the
+        // window the output is all zeros whether or not a sink is given, and a sink must not turn
+        // that into a NaN or an unnormalised number.
+        let mut kv = Kv::new(2);
+        kv.set(0, 0, 0x2);
+        let q = vec![1.0f32; MLA_LATENT];
+        let future = attention_with_sink(&q, &kv.fp4, &kv.scales, &[5, 6], 0, 5.0);
+        assert!(
+            future.iter().all(|value| *value == 0.0),
+            "expected zeros, got {future:?}"
+        );
+        let empty = attention_with_sink(&q, &kv.fp4, &kv.scales, &[], 0, 5.0);
+        assert!(
+            empty.iter().all(|value| *value == 0.0),
+            "expected zeros, got {empty:?}"
+        );
+    }
+
+    #[test]
+    fn a_sink_far_above_the_candidate_max_gives_the_released_zero() {
+        // The released kernel adds the sink after the candidate maximum, so a sink more than about
+        // 88 above it overflows exp() to +inf and the output is exactly zero - "attend to nothing",
+        // with no value to show for it. That is the formula this reference reproduces; what must not
+        // happen is a NaN or an unnormalised sum.
+        let mut kv = Kv::new(1);
+        kv.set(0, 0, 0x2);
+        let mut q = vec![0.0f32; MLA_LATENT];
+        q[0] = 1.0;
+        let out = attention_with_sink(&q, &kv.fp4, &kv.scales, &[0], 0, 1.0e6);
+        assert!(
+            out.iter().all(|value| *value == 0.0),
+            "expected an exact zero, got {out:?}"
+        );
     }
 
     #[test]
