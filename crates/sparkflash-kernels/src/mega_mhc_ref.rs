@@ -32,6 +32,52 @@
 //! into the 4-vector A, and the last 4 are softmaxed into C. A different reading would change these
 //! numbers and nothing in this file claims otherwise; what it does claim is that the shape and the
 //! traffic are the ones the kernel implements.
+//!
+//! ## The per-coefficient bias: hc_attn_base / hc_ffn_base
+//!
+//! The released checkpoint carries a 24-value fp32 **bias** per predictor - `hc_attn_base` for the
+//! attention predictor and `hc_ffn_base` for the FFN one, one vector per layer. Neither the fused
+//! kernel nor this reference used to take it, so an M7 comparison ran with it silently absent. It is
+//! not a scale and not an output offset: `TransformerBlock.hc_mixes` computes
+//!
+//! `mixes = F.linear(x.flatten(2).float(), hc_fn) * rsqrt(mean(x^2) + norm_eps)` (model.py:952-954)
+//! and then `hc_split_sinkhorn(mixes, hc_scale, hc_base, ...)` (model.py:955), whose body adds
+//! `hc_base[row]` to the **raw logit** of row `row`, after the projection and after the rsqrt
+//! scaling, and BEFORE any non-linearity (inference/kernel.py:426-431):
+//!
+//! `pre[j]     = sigmoid(mix[j]        * scale[0] + base[j])       + eps`
+//! `post[j]    = 2 * sigmoid(mix[j + n] * scale[1] + base[j + n])`
+//! `comb[j][k] = mix[j*n + k + 2n] * scale[2] + base[j*n + k + 2n]` then softmax + Sinkhorn
+//!
+//! So: it is added before the softmax and before the Sinkhorn, it is added to the coefficient logits
+//! of all 24 rows (the 4 pre, the 4 post and the 16 comb), it is NOT multiplied by `hc_scale`, and
+//! it is a CONSTANT of the model - one vector per predictor, shared by every token, not a per-token
+//! term. `comb` is the 4x4 residual mixer (this reference's B), `pre` is the input mix (this
+//! reference's A) and `post` is the block-output weight (this reference's C).
+//!
+//! Two layouts therefore have to be reconciled, and the naive one is wrong. The checkpoint's row
+//! order is pre(0..n) / post(n..2n) / comb(2n..2n+n*n); this reference's H row order is B(0..n*n) /
+//! A(n*n..n*n+n) / C(n*n+n..n*n+2n), because the first 16 rows are the ones Sinkhorned. On top of
+//! that, `comb` is indexed `[source][destination]` (`hc_post` sums `comb[j][k] * residual[j]`
+//! over j, so j is the source copy and k the destination), while this reference's B is indexed
+//! `[destination][source]` (`b[i][j]` mixes stream j into stream i, and the kernel applies
+//! `s_b[s*n + t] * x[t]` to output s). The 16 comb values therefore arrive transposed.
+//! `bias_into_kernel_rows` performs that rearrangement, a test pins it value by value, and another
+//! test shows that adding the vector index for index lands the pre/post values on the wrong
+//! coefficients.
+//!
+//! What this reference does NOT model, and does not claim to: `hc_scale` (the other absent tensor
+//! of the same formula - the logits here are raw), and the released pre/post ACTIVATIONS: the model
+//! uses `sigmoid` and `2*sigmoid` where this reference's H softmaxes A and C, a reading difference
+//! that predates this work and is described above. The bias enters where the released model puts it;
+//! how a logit then becomes a coefficient remains this reference's own reading.
+//!
+//! [`h_of`] and [`mega_mhc_layer`] are unchanged and remain the no-bias path;
+//! [`h_of_with_bias`] and [`mega_mhc_layer_with_bias`] take a checkpoint vector, and an all-zero
+//! vector reproduces the no-bias path bit for bit (a test asserts that for both the coefficients and
+//! the residual streams). What is still missing is the device side: kernels/mega_mhc_sm121 has no bias
+//! argument yet, so a device-vs-reference comparison is "bias excluded on both sides" until that ABI
+//! change lands, and nothing in this file claims otherwise.
 
 use crate::m4_quant::{E4M3_ELEMENT_EMAX, QUANT_BLOCK, fp8_e4m3_encode, ue8m0_from_amax};
 
@@ -45,6 +91,20 @@ pub const SINKHORN_ITERS: usize = 20;
 pub const SINKHORN_EPS: f32 = 1e-6;
 /// The predictor rows H feeds on: n*n for B, 2n for A and C. Mirrors SPARK_M4_HC_PREDICTOR_ROWS.
 pub const PREDICTOR_ROWS: usize = HC_MULT * HC_MULT + 2 * HC_MULT;
+
+/// Row offset of the `pre` group (the input mix, this reference's A) in the RELEASED checkpoint's
+/// 24-row layout (inference/kernel.py:426-431).
+pub const PRE_ROWS_OFFSET: usize = 0;
+/// Row offset of the `post` group (the block-output weight, this reference's C) in the released
+/// layout.
+pub const POST_ROWS_OFFSET: usize = HC_MULT;
+/// Row offset of the `comb` group (the 4x4 residual mixer, this reference's B, transposed) in the
+/// released layout.
+pub const COMB_ROWS_OFFSET: usize = 2 * HC_MULT;
+
+/// The 24 per-coefficient biases of one predictor (`hc_attn_base` or `hc_ffn_base`), as the
+/// checkpoint ships them: pre(0..n) / post(n..2n) / comb(2n..2n+n*n), one f32 per H row.
+pub type HcBase = [f32; PREDICTOR_ROWS];
 
 /// A buffer whose writes are counted by its own accessor, so a write cannot be added without
 /// moving the ledger. Nothing in this reference pushes into a bare Vec and then reports a count it
@@ -287,22 +347,14 @@ pub struct Coefficients {
     pub c: [f32; HC_MULT],
 }
 
-/// H(X_l): the predictor rows applied to the stream mean, then exp + Sinkhorn into B, softmax into A
-/// and into C. The predictor is the folded (n*n + 2n) x d matrix of the kernel, row-major.
+/// The 24 raw predictor logits: one dot product per row against the mean of the four streams.
 ///
-/// It takes the REGISTER copy, which is how the kernel computes it: the reads are counted as
-/// register reads, which are not memory traffic. There is no signature of this function that
-/// accepts the streams themselves, so forming H a second time from memory is not something a caller
-/// can do by accident - and if someone does it deliberately through Streams::read, the pass counter
-/// sees it.
-///
-/// The result is deterministic and depends only on the input, so the kernel can compute it on the
-/// last tile while the other tiles wait - which is what the grid rendezvous in the kernel is for.
+/// Raw is the point: the released model adds hc_base to these numbers and only then applies its
+/// non-linearities, so the bias path ([`h_of_with_bias`]) needs them unactivated.
 ///
 /// # Panics
 /// Panics if the predictor is not the folded (n*n + 2n) by d matrix.
-#[must_use]
-pub fn h_of(registers: &mut Registers, predictor: &[f32]) -> Coefficients {
+fn predictor_rows(registers: &mut Registers, predictor: &[f32]) -> [f32; PREDICTOR_ROWS] {
     assert_eq!(
         predictor.len(),
         PREDICTOR_ROWS * HIDDEN,
@@ -319,7 +371,13 @@ pub fn h_of(registers: &mut Registers, predictor: &[f32]) -> Coefficients {
         }
         rows[row] = acc / HC_MULT as f32;
     }
+    rows
+}
 
+/// This reference's split of 24 logits into B, A and C. Shared by the bias and no-bias entry points,
+/// so the two cannot diverge in the part that is not the bias.
+#[must_use]
+fn coefficients_from_rows(rows: &[f32; PREDICTOR_ROWS]) -> Coefficients {
     // B: exponentiate the n*n rows and run Sinkhorn-Knopp.
     let mut b = [[0.0f32; HC_MULT]; HC_MULT];
     for i in 0..HC_MULT {
@@ -333,6 +391,77 @@ pub fn h_of(registers: &mut Registers, predictor: &[f32]) -> Coefficients {
     let a = softmax4(&rows[HC_MULT * HC_MULT..HC_MULT * HC_MULT + HC_MULT]);
     let c = softmax4(&rows[HC_MULT * HC_MULT + HC_MULT..PREDICTOR_ROWS]);
     Coefficients { b, a, c }
+}
+
+/// H(X_l): the predictor rows applied to the stream mean, then exp + Sinkhorn into B, softmax into A
+/// and into C. The predictor is the folded (n*n + 2n) x d matrix of the kernel, row-major.
+///
+/// This is the NO-BIAS path; it is what every caller had before the checkpoint's hc_base was
+/// modelled, and it is unchanged. Use [`h_of_with_bias`] when the checkpoint vector is available.
+///
+/// It takes the REGISTER copy, which is how the kernel computes it: the reads are counted as
+/// register reads, which are not memory traffic. There is no signature of this function that
+/// accepts the streams themselves, so forming H a second time from memory is not something a caller
+/// can do by accident - and if someone does it deliberately through Streams::read, the pass counter
+/// sees it.
+///
+/// The result is deterministic and depends only on the input, so the kernel can compute it on the
+/// last tile while the other tiles wait - which is what the grid rendezvous in the kernel is for.
+///
+/// # Panics
+/// Panics if the predictor is not the folded (n*n + 2n) by d matrix.
+#[must_use]
+pub fn h_of(registers: &mut Registers, predictor: &[f32]) -> Coefficients {
+    coefficients_from_rows(&predictor_rows(registers, predictor))
+}
+
+/// The released checkpoint's 24-value `hc_base` rearranged into this reference's H row order.
+///
+/// The checkpoint's layout is pre(0..n) / post(n..2n) / comb(2n..2n+n*n)
+/// (inference/kernel.py:426-431). This reference's row order is B(0..n*n) / A(n*n..) / C(n*n+n..),
+/// and its B is indexed `[destination][source]` while `comb` is indexed `[source][destination]`
+/// (see the module docs), so the 16 comb values are TRANSPOSED on the way in. The 4 pre values land
+/// on A unchanged and the 4 post values on C unchanged.
+///
+/// Adding the checkpoint vector index for index instead is NOT equivalent - a test pins both the
+/// arrangement and that difference.
+#[must_use]
+pub fn bias_into_kernel_rows(hc_base: &HcBase) -> [f32; PREDICTOR_ROWS] {
+    let mut kernel = [0.0f32; PREDICTOR_ROWS];
+    for destination in 0..HC_MULT {
+        for source in 0..HC_MULT {
+            kernel[destination * HC_MULT + source] =
+                hc_base[COMB_ROWS_OFFSET + source * HC_MULT + destination];
+        }
+    }
+    for j in 0..HC_MULT {
+        kernel[HC_MULT * HC_MULT + j] = hc_base[PRE_ROWS_OFFSET + j];
+        kernel[HC_MULT * HC_MULT + HC_MULT + j] = hc_base[POST_ROWS_OFFSET + j];
+    }
+    kernel
+}
+
+/// H(X_l) with the released model's per-coefficient bias: the 24 raw logits each get their
+/// `hc_base` entry added BEFORE the exp/Sinkhorn and the two softmaxes, which is where
+/// `hc_split_sinkhorn` adds it (inference/kernel.py:426-431).
+///
+/// `hc_base` is in the checkpoint's own row order; [`bias_into_kernel_rows`] does the
+/// rearrangement, and an all-zero vector reproduces [`h_of`] bit for bit.
+///
+/// # Panics
+/// Panics if the predictor is not the folded (n*n + 2n) by d matrix.
+#[must_use]
+pub fn h_of_with_bias(
+    registers: &mut Registers,
+    predictor: &[f32],
+    hc_base: &HcBase,
+) -> Coefficients {
+    let mut rows = predictor_rows(registers, predictor);
+    let bias = bias_into_kernel_rows(hc_base);
+    for (row, offset) in rows.iter_mut().zip(bias.iter()) {
+        *row += offset;
+    }
+    coefficients_from_rows(&rows)
 }
 
 /// Sinkhorn-Knopp: alternate row and column normalisation, with the specification's floor so a row
@@ -379,6 +508,9 @@ pub fn softmax4(values: &[f32]) -> [f32; HC_MULT] {
 /// reason this needs one read of X: the kernel still has A_{l-1} X_l in registers from the previous
 /// update, and recomputing it would mean reading X again.
 ///
+/// This is the NO-BIAS path and it is unchanged; [`mega_mhc_layer_with_bias`] is the same layer
+/// with the checkpoint's hc_base added to the coefficient logits.
+///
 /// # Panics
 /// Panics if the RMS weight is not d wide, or the predictor is not the folded matrix.
 #[must_use]
@@ -387,6 +519,47 @@ pub fn mega_mhc_layer(
     rms_weight: &[f32],
     a_prev: &[f32; HC_MULT],
     predictor: &[f32],
+    ledger: &mut TrafficLedger,
+) -> (Counted<f32>, Coefficients, Counted<u8>, Counted<u8>) {
+    mega_mhc_layer_inner(streams, rms_weight, a_prev, predictor, None, ledger)
+}
+
+/// The same layer with the released checkpoint's per-coefficient bias: the 24 values of hc_base are
+/// added to the raw coefficient logits before the exp/Sinkhorn and the softmaxes
+/// ([`h_of_with_bias`]).
+///
+/// An all-zero vector reproduces [`mega_mhc_layer`] bit for bit, which a test asserts.
+///
+/// # Panics
+/// As [`mega_mhc_layer`].
+#[must_use]
+pub fn mega_mhc_layer_with_bias(
+    streams: &mut Streams,
+    rms_weight: &[f32],
+    a_prev: &[f32; HC_MULT],
+    predictor: &[f32],
+    hc_base: &HcBase,
+    ledger: &mut TrafficLedger,
+) -> (Counted<f32>, Coefficients, Counted<u8>, Counted<u8>) {
+    mega_mhc_layer_inner(
+        streams,
+        rms_weight,
+        a_prev,
+        predictor,
+        Some(hc_base),
+        ledger,
+    )
+}
+
+/// The single pass both public layer entry points share. hc_base is None on the no-bias path, so that
+/// path calls exactly what it called before the bias existed.
+#[must_use]
+fn mega_mhc_layer_inner(
+    streams: &mut Streams,
+    rms_weight: &[f32],
+    a_prev: &[f32; HC_MULT],
+    predictor: &[f32],
+    hc_base: Option<&HcBase>,
     ledger: &mut TrafficLedger,
 ) -> (Counted<f32>, Coefficients, Counted<u8>, Counted<u8>) {
     assert_eq!(rms_weight.len(), HIDDEN, "the RMS weight is d wide");
@@ -415,7 +588,10 @@ pub fn mega_mhc_layer(
     // kernel, so they cost no further stream traffic. h_of takes the registers and nothing else;
     // h_of_counted exists only for the deliberately wasteful variant below, which is what the bound
     // test contrasts against.
-    let coefficients = h_of(&mut registers, predictor);
+    let coefficients = match hc_base {
+        None => h_of(&mut registers, predictor),
+        Some(base) => h_of_with_bias(&mut registers, predictor, base),
+    };
 
     // F: the RMS pre-norm, the per-32 ue8m0 scales and the FP8 codes. Writing those is d elements
     // plus d / 32 scale bytes, which is the second half of the bound.
@@ -888,5 +1064,241 @@ mod tests {
             // chosen too small (the E4M3 maximum is 448).
             assert!(amax <= 448.0, "the fixture must not need saturation");
         }
+    }
+
+    /// A predictor whose rows are all different, so the coefficients are not the zero-predictor
+    /// uniform case and a misplaced bias cannot hide inside a symmetry.
+    fn deterministic_predictor() -> Vec<f32> {
+        (0..PREDICTOR_ROWS * HIDDEN)
+            .map(|i| ((i % 19) as f32 - 9.0) / 32.0)
+            .collect()
+    }
+
+    /// Four different streams, for the same reason.
+    fn deterministic_streams() -> Vec<f32> {
+        (0..HC_MULT * HIDDEN)
+            .map(|i| ((i % 23) as f32 - 11.0) / 16.0)
+            .collect()
+    }
+
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|value| value.to_bits()).collect()
+    }
+
+    #[test]
+    fn bias_into_kernel_rows_pins_the_checkpoint_layout() {
+        // The checkpoint layout is pre(0..n) / post(n..2n) / comb(2n..): give every row its own value
+        // (1..=24) and pin where each one has to arrive.
+        let hc_base: HcBase = core::array::from_fn(|index| (index + 1) as f32);
+        let kernel = bias_into_kernel_rows(&hc_base);
+
+        // This reference's B is [destination][source] and the checkpoint's comb is [source][
+        // destination], so the 4x4 block arrives transposed:
+        // kernel[destination * n + source] = hc_base[2n + source * n + destination].
+        assert_eq!(kernel[0..4], [9.0, 13.0, 17.0, 21.0], "B row 0");
+        assert_eq!(kernel[4..8], [10.0, 14.0, 18.0, 22.0], "B row 1");
+        assert_eq!(kernel[8..12], [11.0, 15.0, 19.0, 23.0], "B row 2");
+        assert_eq!(kernel[12..16], [12.0, 16.0, 20.0, 24.0], "B row 3");
+        assert_eq!(kernel[16..20], [1.0, 2.0, 3.0, 4.0], "pre lands on A");
+        assert_eq!(kernel[20..24], [5.0, 6.0, 7.0, 8.0], "post lands on C");
+
+        // Index-for-index is a different vector, which is the assumption this test removes.
+        assert_ne!(kernel, hc_base, "the identity order is not the mapping");
+    }
+
+    #[test]
+    fn an_all_zero_bias_reproduces_the_unbiased_path_bit_for_bit() {
+        let predictor = deterministic_predictor();
+        let rms_weight = vec![1.0f32; HIDDEN];
+        let zero: HcBase = [0.0f32; PREDICTOR_ROWS];
+
+        let mut registers = Streams::new(deterministic_streams()).capture();
+        let unbiased = h_of(&mut registers, &predictor);
+        let mut registers = Streams::new(deterministic_streams()).capture();
+        let biased = h_of_with_bias(&mut registers, &predictor, &zero);
+        assert_eq!(unbiased, biased, "a zero bias must not touch H");
+
+        let (unbiased_next, unbiased_coefficients, ..) = mega_mhc_layer(
+            &mut Streams::new(deterministic_streams()),
+            &rms_weight,
+            &[0.25; HC_MULT],
+            &predictor,
+            &mut TrafficLedger::default(),
+        );
+        let (biased_next, biased_coefficients, ..) = mega_mhc_layer_with_bias(
+            &mut Streams::new(deterministic_streams()),
+            &rms_weight,
+            &[0.25; HC_MULT],
+            &predictor,
+            &zero,
+            &mut TrafficLedger::default(),
+        );
+        assert_eq!(unbiased_coefficients, biased_coefficients);
+        assert_eq!(
+            bits(unbiased_next.as_slice()),
+            bits(biased_next.as_slice()),
+            "the no-bias path must be bit-identical with a zero bias"
+        );
+    }
+
+    #[test]
+    fn a_pre_bias_enters_the_a_logits_before_the_softmax() {
+        // With a zero predictor every logit is zero, so the expected answer is a softmax over the
+        // bias itself: [1, 0, 0, 0] gives e/(e+3) on the first A entry and 1/(e+3) on the rest.
+        let predictor = zero_predictor();
+        let mut hc_base: HcBase = [0.0f32; PREDICTOR_ROWS];
+        hc_base[PRE_ROWS_OFFSET] = 1.0;
+        let mut registers = Streams::new(vec![1.0f32; HC_MULT * HIDDEN]).capture();
+        let coefficients = h_of_with_bias(&mut registers, &predictor, &hc_base);
+
+        let e = 1.0f32.exp();
+        let expected_first = e / (e + 3.0);
+        let expected_rest = 1.0 / (e + 3.0);
+        assert!(
+            (coefficients.a[0] - expected_first).abs() < 1e-6,
+            "A[0] is {}, expected {expected_first}",
+            coefficients.a[0]
+        );
+        for stream in 1..HC_MULT {
+            assert!(
+                (coefficients.a[stream] - expected_rest).abs() < 1e-6,
+                "A[{stream}] is {}, expected {expected_rest}",
+                coefficients.a[stream]
+            );
+        }
+        // A pre-activation logit, not an added coefficient: adding 1.0 after the softmax would put
+        // 1.25 here.
+        assert!(coefficients.a[0] < 1.0);
+
+        // The other two coefficient groups are untouched. In particular B is still the uniform
+        // mixer, so a vector added index for index (which would have landed on B[0][0]) is a
+        // different computation.
+        for row in 0..HC_MULT {
+            for column in 0..HC_MULT {
+                assert!(
+                    (coefficients.b[row][column] - 0.25).abs() < 1e-6,
+                    "B[{row}][{column}] moved, the pre bias belongs on A"
+                );
+            }
+        }
+        for stream in 0..HC_MULT {
+            assert!((coefficients.c[stream] - 0.25).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn a_post_bias_lands_on_the_c_vector() {
+        let predictor = zero_predictor();
+        let mut hc_base: HcBase = [0.0f32; PREDICTOR_ROWS];
+        hc_base[POST_ROWS_OFFSET + 3] = 1.0;
+        let mut registers = Streams::new(vec![1.0f32; HC_MULT * HIDDEN]).capture();
+        let coefficients = h_of_with_bias(&mut registers, &predictor, &hc_base);
+
+        let e = 1.0f32.exp();
+        assert!(
+            (coefficients.c[3] - e / (e + 3.0)).abs() < 1e-6,
+            "C[3] is {}",
+            coefficients.c[3]
+        );
+        for stream in 0..3 {
+            assert!((coefficients.c[stream] - 1.0 / (e + 3.0)).abs() < 1e-6);
+        }
+        for row in 0..HC_MULT {
+            for column in 0..HC_MULT {
+                assert!((coefficients.b[row][column] - 0.25).abs() < 1e-6);
+            }
+        }
+        for stream in 0..HC_MULT {
+            assert!((coefficients.a[stream] - 0.25).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn a_comb_bias_lands_on_the_sinkhorn_matrix_transposed_and_before_the_sinkhorn() {
+        let predictor = zero_predictor();
+        let source = 1usize;
+        let destination = 2usize;
+        let mut hc_base: HcBase = [0.0f32; PREDICTOR_ROWS];
+        hc_base[COMB_ROWS_OFFSET + source * HC_MULT + destination] = 2.0;
+        let mut registers = Streams::new(vec![1.0f32; HC_MULT * HIDDEN]).capture();
+        let coefficients = h_of_with_bias(&mut registers, &predictor, &hc_base);
+
+        // comb[source][destination] is B[destination][source] in this reference's convention, and
+        // with every other logit zero it has to be the largest entry. An implementation that added
+        // the vector index for index would put this 2.0 at B[destination + 1][destination] instead.
+        let largest = coefficients
+            .b
+            .iter()
+            .flatten()
+            .copied()
+            .fold(f32::MIN, f32::max);
+        assert_eq!(largest, coefficients.b[destination][source]);
+        assert!(
+            coefficients.b[destination][source] > coefficients.b[source][destination] * 1.5,
+            "the transpose matters: B[{destination}][{source}] = {}, B[{source}][{destination}] = {}",
+            coefficients.b[destination][source],
+            coefficients.b[source][destination]
+        );
+        assert!(coefficients.b[destination][source] > 1.0 / HC_MULT as f32);
+
+        // Added BEFORE the Sinkhorn, so the result is still normalised in both directions. An
+        // addition after the normalisation would leave row {destination} summing to about 3.
+        for (row, values) in coefficients.b.iter().enumerate() {
+            let sum: f32 = values.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-4, "row {row} sums to {sum}");
+        }
+        for column in 0..HC_MULT {
+            let sum: f32 = coefficients.b.iter().map(|values| values[column]).sum();
+            assert!((sum - 1.0).abs() < 1e-4, "column {column} sums to {sum}");
+        }
+
+        // A and C are untouched: the value landed on the 4x4 block only.
+        for stream in 0..HC_MULT {
+            assert!((coefficients.a[stream] - 0.25).abs() < 1e-6);
+            assert!((coefficients.c[stream] - 0.25).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn the_biased_layer_moves_the_residual_streams() {
+        // The end-to-end non-vacuity check: with a realistic (non-uniform) predictor, a bias on each
+        // of the three groups has to move B, A, C and the streams the layer writes. This is the test
+        // that fails if the bias is quietly ignored.
+        let predictor = deterministic_predictor();
+        let rms_weight = vec![1.0f32; HIDDEN];
+        let mut hc_base: HcBase = [0.0f32; PREDICTOR_ROWS];
+        hc_base[PRE_ROWS_OFFSET] = 1.5;
+        hc_base[POST_ROWS_OFFSET + 2] = -0.75;
+        hc_base[COMB_ROWS_OFFSET + 3 * HC_MULT + 1] = 2.0;
+
+        let (plain_next, plain_coefficients, ..) = mega_mhc_layer(
+            &mut Streams::new(deterministic_streams()),
+            &rms_weight,
+            &[0.25; HC_MULT],
+            &predictor,
+            &mut TrafficLedger::default(),
+        );
+        let (biased_next, biased_coefficients, ..) = mega_mhc_layer_with_bias(
+            &mut Streams::new(deterministic_streams()),
+            &rms_weight,
+            &[0.25; HC_MULT],
+            &predictor,
+            &hc_base,
+            &mut TrafficLedger::default(),
+        );
+
+        assert_ne!(plain_coefficients.a, biased_coefficients.a, "A must move");
+        assert_ne!(plain_coefficients.c, biased_coefficients.c, "C must move");
+        assert_ne!(plain_coefficients.b, biased_coefficients.b, "B must move");
+        let largest_delta = plain_next
+            .as_slice()
+            .iter()
+            .zip(biased_next.as_slice())
+            .map(|(plain, biased)| (plain - biased).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            largest_delta > 1e-3,
+            "the bias must move the residual streams, largest delta {largest_delta}"
+        );
     }
 }
