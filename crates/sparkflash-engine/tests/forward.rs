@@ -374,3 +374,41 @@ fn a_sequence_that_has_consumed_nothing_has_an_empty_cache_and_refuses_an_empty_
         .expect_err("an empty chunk is not a step");
     assert!(matches!(error, EngineError::Shape { .. }), "{error}");
 }
+
+/// The released geometry's attention writes more values per query than the residual width
+/// (64 heads of 512 = 32,768 values against dim = 5,120), so the scratch buffer has to be sized
+/// from the head geometry, not from dim. Before that fix a prefill at a wide-head configuration
+/// panicked on the first layer, and no tiny configuration reached the case because
+/// n_heads * head_dim <= dim there.
+#[test]
+fn a_geometry_with_wider_heads_than_the_residual_width_runs_and_records_the_narrow_row() {
+    use sparkflash_engine::forward::boundary::ATTENTION_OUT;
+
+    let config = ModelConfig {
+        n_heads: 8,
+        head_dim: 32,
+        o_groups: 2,
+        ..ModelConfig::tiny()
+    };
+    assert!(
+        config.n_heads * config.head_dim > config.dim,
+        "the test needs a head geometry wider than the residual stream"
+    );
+    let engine = engine(&config, 3, 1 << 22);
+    let mut state = SequenceState::new(&config);
+    let observed = engine
+        .prefill_observed(&mut state, &[1])
+        .expect("a wide-head configuration runs one token");
+
+    assert_eq!(observed.boundary.len(), config.n_layers);
+    for row in observed.boundary.rows() {
+        let attention = row
+            .tensor(ATTENTION_OUT)
+            .expect("the attention output is recorded");
+        assert_eq!(
+            attention.data().elements(),
+            config.dim,
+            "the recorded attention output is one dim-wide row per position, not the head buffer"
+        );
+    }
+}

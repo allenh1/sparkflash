@@ -603,6 +603,27 @@ impl InferenceEngine {
                 &scratch.attn_in,
             )?;
         }
+        // The attention writes one concatenated head vector per query before the output
+        // projection narrows it to dim, so its buffer is the wider of the two widths. The
+        // released geometry is wider (64 heads of 512 = 32,768 values against dim = 5,120); a
+        // buffer sized only positions * dim panics there on the first layer, which is why the
+        // width is derived from the geometry rather than from the residual stream.
+        let attention_width =
+            config
+                .n_heads
+                .checked_mul(config.head_dim)
+                .ok_or_else(|| EngineError::Shape {
+                    what: "attention scratch".to_owned(),
+                    detail: format!(
+                        "{} heads of {} do not fit a buffer width",
+                        config.n_heads, config.head_dim
+                    ),
+                })?;
+        let positions = hidden.len() / config.hc_width();
+        let wide = positions.saturating_mul(attention_width);
+        if scratch.attn_out.len() < wide {
+            scratch.attn_out.resize(wide, 0.0);
+        }
         attention::attention_forward(
             config,
             layer,
@@ -614,6 +635,9 @@ impl InferenceEngine {
             &mut scratch.attn_out,
             self.limit,
         )?;
+        // The projection left exactly one residual row per position; the head buffer beyond that is
+        // not a dense row and must not be recorded or mixed as one.
+        scratch.attn_out.truncate(positions * config.dim);
         if let Some(row) = boundary.as_deref_mut() {
             row.push_dense(config, boundary::ATTENTION_OUT, scratch.attn_out.clone())?;
         }

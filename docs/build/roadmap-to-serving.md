@@ -556,6 +556,25 @@ unbounded reference; the run prints both numbers.
    test already classifies 266 of the 96,085 names); the audit prints a count and a test pins it.
 6. **Run determinism.** Two runs of the same token are byte-identical (D-a at model scale).
 
+**Status of this list (host half).** Criteria 1, 4, 5 and 6 now have a runnable host implementation:
+`crates/sparkflash-engine/src/report.rs` (`one_token_report`) and
+`crates/sparkflash-engine/examples/one_token.rs` print a report whose contract
+`crates/sparkflash-engine/tests/one_token.rs` pins - forty rows at the released layer counts (40
+backbone + 3 stages), the five seam labels of section 4.3 plus the sink line, the tensor audit
+(plan/read/unread counts) and a two-run bit-identical boundary table and logits check. The
+criterion-2 attribution tests are already merged (!38). What remains is criterion 3 and the device
+column of criterion 1: the device half diffs this reference table against the device path and
+measures the per-tensor bars. A synthetic run prints that its source is bytes, not numbers, so its
+argmax/top-5 are a shape and determinism record rather than a prediction. The released-checkpoint
+reference table is not a mode of the harness yet: the reference pass reads one tensor at a time
+under an element limit, and the two Engram tables are 98,308,270,592 and 98,305,579,008 elements,
+which the loader refuses by design - a paging weight source for them is the follow-up that unblocks
+a real-weight host table (and the device diff of it). The harness did find one released-geometry bug
+on the way: the attention scratch buffer was sized from the residual width, so a 40-layer
+released-config run panicked on the first layer (64 heads of 512 = 32,768 values against dim
+5,120); forward/mod.rs now sizes it from the head geometry and truncates to the residual row, pinned
+by tests/forward.rs::a_geometry_with_wider_heads_than_the_residual_width_runs_and_records_the_narrow_row.
+
 ### 4.6 Cost of Phase 1
 
 One dedicated device window (vLLM stopped) and one upload. The weights a token needs are bounded: per
@@ -571,7 +590,10 @@ window cost.
 `task-36` (kernel ABI, api-dev); new tasks: `phase1: layer plan and a pinned 43-row table`
 (arch-docs/kernel-dev), `phase1: 40-layer token harness with per-layer diff` (kernel-dev),
 `phase1: stage 4, head and sampling on device` (kernel-dev), `phase1: perturbation and seam-label
-tests` (api-dev). `task-37` and `task-41` are *not* Phase 1; they are Phase 3.
+tests` (api-dev), `phase1: Engram-paged weight source for the released reference table`
+(kernel-dev) - the harness's host half and the released-geometry attention scratch fix are merged;
+the checkpoint table and the device diff wait on that source. `task-37` and `task-41` are *not*
+Phase 1; they are Phase 3.
 
 ---
 
