@@ -116,6 +116,11 @@ impl Default for Sampling {
 pub struct StepOutput {
     /// The logits of the last position, `vocab_size` long.
     pub logits: Vec<f32>,
+    /// The vector the head multiplied: the last position's collapsed residual after the final RMS
+    /// norm, `dim` long. It is the device head harness's input (criterion 3 compares the device
+    /// `cert_lm_head_sm121` logits against [Self::logits] on this same vector), and it is captured
+    /// rather than recomputed because the collapse and norm are the reference's own.
+    pub head_input: Vec<f32>,
     /// The chosen next token, or `None` when the step produced no logits.
     pub next_token: Option<u32>,
     /// The tokens the DSpark stages drafted after it (empty when the tap did not fire).
@@ -483,6 +488,7 @@ impl InferenceEngine {
         let norm = linalg::decode_by_name(source, "norm.weight", self.limit)?;
         let mut tail = collapsed[(seqlen - 1) * dim..].to_vec();
         linalg::rms_norm(&mut tail, &norm, dim, config.norm_eps as f32)?;
+        let head_input = tail.clone();
         let head = linalg::decode_by_name(source, "head.weight", self.limit)?;
         let mut logits = vec![0.0f32; config.vocab_size];
         linalg::matmul(&mut logits, &tail, &head, config.vocab_size, dim, 1)?;
@@ -522,6 +528,7 @@ impl InferenceEngine {
         state.tokens.extend_from_slice(tokens);
         Ok(StepOutput {
             logits,
+            head_input,
             next_token,
             draft,
             confidence,

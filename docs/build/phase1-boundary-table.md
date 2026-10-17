@@ -512,15 +512,20 @@ The host side of the format is committed and measured. `BoundaryTable::write_v1`
 (requiring both to declare the same backbone count) and diffs them, `examples/boundary_dump.rs`
 writes a pair from one reference step, and `examples/boundary_diff.rs` runs that pair gate, prints
 the per-layer/per-tensor differences and exits 1 when anything differs. The first released-checkpoint dump was produced on
-2026-10-17 on `node0` (aarch64) with the release build of the example from this MR's branch
-(the example is introduced by this MR; `main` at `e0c1502` does not have it), against the released
-snapshot in the node's Hugging Face cache:
+2026-10-17 on `node0` (aarch64) with the release build of the example committed in !44
+(`9d4e78d`); this MR adds the head dump flags, against the released snapshot in the node's Hugging
+Face cache:
 
     boundary_dump --checkpoint <snapshot> --out phase1-host-token0
 
 It wrote 40 rows of 18 tensors, a 34,767-byte manifest and a 13,537,920-byte blob, which is exactly
 the section 4 size table (40 x 338,448 bytes); `boundary_diff` of the pair against itself reports all
-40 rows bit-identical. The one-token report on the same snapshot printed:
+40 rows bit-identical. A later run of the same deterministic example (18:20, the table above is 17:34)
+with `--head-input-out` and `--logits-out` wrote criterion 3's two sides as raw little-endian
+f32: 5,120 head-input values (all finite, min -2.0506, max 1.41963,
+L2 norm 18.157493) and 129,280 logits with argmax 5 and top-5 [5: 13.230665207, 201: 12.492528915,
+372: 11.897726059, 30: 11.392500877, 1897: 11.015835762]. The device head harness reads those two
+files and will compare its own logits against them. The one-token report on the same snapshot printed:
 
 * 95,819 tensors verified, 4 Engram tensors paged (the two released Engram tables, weight and scale);
 * 40 rows, all host-vs-host bit-exact, two runs byte-identical over the boundary tables and the
@@ -531,9 +536,9 @@ the section 4 size table (40 x 338,448 bytes); `boundary_diff` of the pair again
   DSpark-stage 2,401, text-path 40, indexer 15];
 * wall clock 2:20.25 and peak RSS 6,689,384 KiB (6.4 GiB) for the whole run.
 
-The artifacts stay on the node: `/home/user/hostrun/phase1-host-token0.manifest` and `.blob`,
-and `/home/user/hostrun/host_report_token0.txt`; they are not committed here (the blob alone is
-13 MB). This is the host column of criterion 1 and the reference half of criterion 3. It is not the
+The artifacts stay on the node: `/home/user/hostrun/phase1-host-token0.manifest`, `.blob`,
+`.head.f32` and `.logits.f32`, and `/home/user/hostrun/host_report_token0.txt`; they are not
+committed here (the blob alone is 13 MB). This is the host column of criterion 1 and the reference half of criterion 3. It is not the
 device column: no device table has been captured, so nothing here says the device path matches this
 table, and the bars of section 5 remain to be measured against it.
 

@@ -548,7 +548,11 @@ unbounded reference; the run prints both numbers.
    within a bar set by the run itself on expert-residency-invariant layers (design decision: the bar
    is the measured single-layer delta compounded over forty layers, not a constant chosen to pass).
    The reference is our CPU forward with the sink and `hc_attn_base` present; the comparison is on the
-   final position only.
+   final position only. The reference now captures the vector the head multiplied
+   (`StepOutput::head_input`: the last position's collapsed residual after the final RMS norm), so the
+   device head's input is the reference's own normed vector rather than a recomputation, and
+   `boundary_dump --head-input-out FILE --logits-out FILE` writes the reference's head input and
+   logits as raw little-endian f32; the device side is the harness's own output, which does not exist yet.
 4. **Every seam labelled.** A test greps the run output for the five seam labels of section 4.3 and
    fails if one disappears; the sink line is part of the same test.
 5. **Tensor audit.** Every tensor the plan expects is read and every tensor not read on the text path
@@ -564,9 +568,12 @@ backbone + 3 stages), the five seam labels of section 4.3 plus the sink line, th
 (plan/read/unread counts) and a two-run bit-identical boundary table and logits check. The
 criterion-2 attribution tests are already merged (!38). Run it with
 `cargo run -p sparkflash-engine --example one_token` for the synthetic mode, or with
-`-- --checkpoint <snapshot dir>` on the node for the real table. What remains is criterion 3 and the device
-column of criterion 1: the device half diffs this reference table against the device path and
-measures the per-tensor bars. A synthetic run prints that its source is bytes, not numbers, so its
+`-- --checkpoint <snapshot dir>` on the node for the real table. Criterion 3's host half is also in
+place: the step output carries the head input (`StepOutput::head_input`) and `boundary_dump` writes
+it with the reference logits (`--head-input-out`, `--logits-out`), which is exactly the pair the
+device `cert_lm_head_sm121` harness compares. What remains is to run that kernel on the node and
+compare, plus the device column of criterion 1: the device half diffs this reference table against
+the device path and measures the per-tensor bars. A synthetic run prints that its source is bytes, not numbers, so its
 argmax/top-5 are a shape and determinism record rather than a prediction. The released-checkpoint
 reference table is now the harness's --checkpoint mode: ReferenceWeights verifies the plan the way
 LoadedWeights does and serves the stored forms the reference decodes, LoadedWeights::read_ranges

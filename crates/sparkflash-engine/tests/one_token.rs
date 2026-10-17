@@ -1,10 +1,70 @@
 //! The Phase 1 one-token report's contract: forty rows, the five seams, the sink line, the
 //! tensor audit, run determinism, and the logits class. A report that loses any of them fails here.
 use sparkflash_engine::config::ModelConfig;
+use sparkflash_engine::forward::{InferenceEngine, SequenceState};
 use sparkflash_engine::report::{SEAM_LABELS, SMALL_SHAPE_LIMIT, WeightClass, one_token_report};
 use sparkflash_engine::synthetic::SyntheticWeights;
 use sparkflash_engine::tensor::{TensorPlan, TensorSpec};
 use sparkflash_engine::weights::{WeightError, WeightSource};
+
+/// A finite, plan-shaped weight source: the plan's own names and shapes, every tensor served as
+/// little-endian f32 with small finite values. Copied from tests/forward.rs, where the reasoning
+/// lives: a raw-byte source is honest for shape tests but is not numbers, so an arithmetic check on
+/// it can pass vacuously (a vector that is NaN everywhere compares equal to a logit that is NaN
+/// everywhere). A content assertion about the head needs values it can do arithmetic on.
+struct FiniteSource {
+    specs: Vec<TensorSpec>,
+    seed: u64,
+}
+
+impl FiniteSource {
+    fn from_plan(plan: &TensorPlan, seed: u64) -> FiniteSource {
+        FiniteSource {
+            specs: plan.specs().to_vec(),
+            seed,
+        }
+    }
+}
+
+/// A stable per-name offset, so two tensors of the same shape are not identical.
+fn name_salt(name: &str) -> u64 {
+    name.bytes().fold(0u64, |acc, byte| {
+        acc.wrapping_mul(31).wrapping_add(u64::from(byte))
+    })
+}
+
+impl WeightSource for FiniteSource {
+    fn names(&self) -> Vec<String> {
+        self.specs.iter().map(|spec| spec.name.clone()).collect()
+    }
+
+    fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
+        match self.specs.iter().find(|spec| spec.name == name) {
+            Some(spec) => Ok(TensorSpec {
+                dtype: sparkflash_engine::dtype::DType::F32,
+                ..spec.clone()
+            }),
+            None => Err(WeightError::Missing {
+                name: name.to_string(),
+            }),
+        }
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+        let elements = usize::try_from(self.spec(name)?.elements()).expect("a test tensor fits");
+        let salt = name_salt(name);
+        let mut bytes = Vec::with_capacity(elements * 4);
+        for index in 0..elements {
+            let mixed = (index as u64)
+                .wrapping_add(salt)
+                .wrapping_add(self.seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            let hashed = (mixed ^ (mixed >> 13)).wrapping_mul(0x2545_f491_4f6c_dd1d);
+            let value = 0.01 + 0.000_1 * (hashed >> 56) as f32;
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        Ok(bytes)
+    }
+}
 
 /// The released layer counts at small shapes: forty backbone layers and three MTP stages, so the
 /// row rule is checked at the shape the roadmap states instead of at [ModelConfig::tiny].
@@ -320,5 +380,70 @@ fn a_paged_engram_run_reports_exactly_what_the_whole_table_run_reports() {
     assert_eq!(
         whole, paged,
         "the two table reads must produce the same rows, seams and audit"
+    );
+}
+
+/// The head's input is captured, not recomputed, so the device head harness compares against the
+/// reference's own normed vector. It is the last position's final-norm output (`dim` values), the
+/// head matmul on it reproduces the returned logits bit for bit, and two fresh engines capture the
+/// same bits.
+#[test]
+fn the_head_input_is_the_final_normed_vector_the_logits_came_from() {
+    let config = released_depth();
+    let dim = config.dim;
+    let vocab = config.vocab_size;
+    let run = || {
+        let plan = TensorPlan::language_model(&config);
+        // A finite source, so the content assertion below is not a NaN == NaN comparison.
+        let source = FiniteSource::from_plan(&plan, 7);
+        let engine = InferenceEngine::new(config.clone(), Box::new(source), SMALL_SHAPE_LIMIT)
+            .expect("the engine builds");
+        let mut state = SequenceState::new(engine.config());
+        engine
+            .prefill_observed(&mut state, &[3])
+            .expect("the step runs")
+            .output
+    };
+    let first = run();
+    assert_eq!(
+        first.head_input.len(),
+        dim,
+        "the head input is the residual width"
+    );
+    // A seeded-byte source is not numbers, so the vector may hold codes that decode to NaN; the
+    // finiteness contract belongs to the Numbers class, which the released-checkpoint run is.
+    assert_eq!(first.logits.len(), vocab);
+    // Compare bits, not values: a seeded-byte source can yield NaN, and NaN != NaN.
+    let bits = |values: &[f32]| {
+        values
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    };
+    // The content assertion: the reference's own head matmul on the captured vector reproduces the
+    // returned logits bit for bit. Width and determinism alone would pass a zeroed or pre-norm
+    // vector, which is exactly the regression that would invalidate the device comparison.
+    let plan = TensorPlan::language_model(&config);
+    let probe = FiniteSource::from_plan(&plan, 7);
+    let head = sparkflash_engine::linalg::decode_by_name(&probe, "head.weight", SMALL_SHAPE_LIMIT)
+        .expect("the head weight decodes");
+    let mut recomputed = vec![0.0f32; vocab];
+    sparkflash_engine::linalg::matmul(&mut recomputed, &first.head_input, &head, vocab, dim, 1)
+        .expect("the head matmul runs");
+    assert_eq!(
+        bits(&recomputed),
+        bits(&first.logits),
+        "the head input is the vector whose head matmul produced the logits"
+    );
+    let second = run();
+    assert_eq!(
+        bits(&first.head_input),
+        bits(&second.head_input),
+        "two runs capture the same head input bit for bit"
+    );
+    assert_eq!(
+        bits(&first.logits),
+        bits(&second.logits),
+        "and the same logits"
     );
 }

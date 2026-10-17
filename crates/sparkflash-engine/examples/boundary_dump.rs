@@ -6,6 +6,12 @@
 //! Usage:
 //!   cargo run --release -p sparkflash-engine --example boundary_dump -- --synthetic --out /tmp/host
 //!   cargo run --release -p sparkflash-engine --example boundary_dump -- --checkpoint <snapshot> --out /tmp/host
+//!   cargo run --release -p sparkflash-engine --example boundary_dump -- --checkpoint <snapshot> --out /tmp/host --head-input-out /tmp/head.f32 --logits-out /tmp/logits.f32
+//!
+//! The last two flags write the head's own inputs and outputs as raw little-endian f32, which is
+//! what the device head harness will consume (no device head example is committed yet; see
+//! docs/build/roadmap-to-serving.md criterion 3): it runs `cert_lm_head_sm121` over the same
+//! `head_input` and compares its logits with the reference ones.
 use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::forward::{InferenceEngine, SequenceState};
 use sparkflash_engine::loader::ReferenceWeights;
@@ -25,6 +31,8 @@ fn main() {
     let mut checkpoint: Option<PathBuf> = None;
     let mut synthetic = false;
     let mut out: Option<PathBuf> = None;
+    let mut head_input_out: Option<PathBuf> = None;
+    let mut logits_out: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -42,6 +50,16 @@ fn main() {
             }
             "--synthetic" => synthetic = true,
             "--out" => out = Some(PathBuf::from(args.next().expect("--out needs a prefix"))),
+            "--head-input-out" => {
+                head_input_out = Some(PathBuf::from(
+                    args.next().expect("--head-input-out needs a file"),
+                ));
+            }
+            "--logits-out" => {
+                logits_out = Some(PathBuf::from(
+                    args.next().expect("--logits-out needs a file"),
+                ));
+            }
             other => panic!("unknown argument {other}"),
         }
     }
@@ -104,6 +122,34 @@ fn main() {
         manifest_path.display(),
         blob_path.display()
     );
+    if let Some(path) = &head_input_out {
+        write_f32(path, &observed.output.head_input);
+        println!(
+            "head input: {} f32 values ({} bytes) -> {}",
+            observed.output.head_input.len(),
+            observed.output.head_input.len() * 4,
+            path.display()
+        );
+    }
+    if let Some(path) = &logits_out {
+        write_f32(path, &observed.output.logits);
+        println!(
+            "logits: {} f32 values ({} bytes) -> {}",
+            observed.output.logits.len(),
+            observed.output.logits.len() * 4,
+            path.display()
+        );
+    }
+}
+
+/// Writes one f32 vector as raw little-endian bytes, the form the device harness reads.
+fn write_f32(path: &std::path::Path, values: &[f32]) {
+    let mut file = BufWriter::new(File::create(path).expect("create the f32 file"));
+    for value in values {
+        file.write_all(&value.to_le_bytes())
+            .expect("write the f32 file");
+    }
+    file.flush().expect("flush the f32 file");
 }
 
 /// The released layer counts at small shapes, exactly as examples/one_token.rs builds them.
