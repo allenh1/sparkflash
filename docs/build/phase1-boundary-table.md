@@ -10,7 +10,10 @@ literally written.
 
 The host half is committed: `crates/sparkflash-engine/src/forward/boundary.rs` builds and compares
 the tables, `forward::InferenceEngine::prefill_observed`/`decode_observed` fill one per step, and
-`crates/sparkflash-engine/tests/boundary.rs` is the perturbation test. The device half — the engine
+`crates/sparkflash-engine/tests/boundary.rs` is the perturbation test. The host dumper and reader of
+the device emission format are committed too: `BoundaryTable::write_v1`/`read_v1`, with
+`examples/boundary_dump.rs` and `examples/boundary_diff.rs`, and section 11 records the first
+released-checkpoint dump. The device half — the engine
 emitting the same table and the bars for device-vs-reference — is the other half of Phase 1 and is
 not claimed here. Every measurement in this document is host-only; no device number appears in it.
 
@@ -194,6 +197,7 @@ model. Version 1:
     step <start_position> <n_tokens> <token-id>...
     prefix <n_consumed> <token-id>...
     mtp-anchor <token-id|none>
+    backbone <n_layers>
     row <layer-id>
     tensor <layer-id> <tensor-name> <dtype> <shape> <byte-offset> <byte-length>
     tensor ...
@@ -208,29 +212,42 @@ Rules:
   as decimal u32 in order.
 * `prefix` gives the consumed prefix of section 1: how many token ids the sequence had already
   consumed, then those ids in order. A first step emits `prefix 0`. The start position and the
-  prefix length agree for a sequence; a reader must still check both.
+  prefix length agree for a sequence, and a reader refuses a manifest where they disagree.
 * `mtp-anchor` gives the sampled anchor as a decimal u32 when the table has at least one MTP row,
-  and `none` when no MTP row ran. A reader must reject a manifest whose anchor presence disagrees
-  with its row set: a `none` anchor alongside an MTP row has lost an input, and an anchor alongside
-  no MTP row claims a stage that did not run. The anchor is the first draft token the stages consume
+  and `none` when no MTP row ran. The anchor is the first draft token the stages consume
   (model.py:1131-1132), not one of the row's eighteen tensors.
-* The three header lines (`step`, `prefix`, `mtp-anchor`) and the row/layer layout are the step's
-  identity. A reader compares all of them before any tensor and refuses a mismatch
-  (`BoundaryTable::diff`); comparing the same token at the same position over a different prefix,
-  or under a different anchor, is comparing different steps.
+* `backbone` gives the model's `n_layers` (40 for the released configuration). It makes the anchor
+  rule checkable: with `mtp-anchor none` the table has exactly `backbone` rows, layers `0` to
+  `backbone-1`; with an anchor it has those rows plus at least one stage row, layer ids `backbone`
+  upward. A reader must reject a manifest whose anchor presence disagrees with its row set: a
+  `none` anchor alongside a stage row has lost an input, and an anchor alongside no stage row claims
+  a stage that did not run. It also requires the rows to be exactly `0, 1, 2, ...` with no gap, so a
+  missing row is a refused table rather than a shorter one.
+* The four header lines (`step`, `prefix`, `mtp-anchor`, `backbone`) and the row/layer layout are
+  the step's identity. `BoundaryTable::diff` compares the step fields (start position, chunk tokens,
+  consumed prefix, MTP anchor) and the row set before any tensor; comparing the same token at the
+  same position over a different prefix, or under a different anchor, is comparing different steps.
+  The `backbone` line is a layout declaration beside that identity: the table does not carry it, so
+  the pair tool (`boundary::diff_v1`, what `examples/boundary_diff.rs` runs) reads both manifests
+  and refuses a pair whose backbone counts disagree before it diffs the rows - two anchored decode
+  tables with identical rows but different backbone declarations would otherwise compare as the
+  same step. Each header line must appear exactly once; a duplicate is refused rather than
+  last-wins.
 * `row` opens one layer's row and gives its layer id (backbone `0..n_layers-1`, MTP
-  `n_layers + stage`). Rows ascend; within a row the eighteen `tensor` lines are in the order of
-  section 2, exactly once each.
+  `n_layers + stage`). Rows are exactly `0, 1, 2, ...` and within a row the eighteen `tensor` lines
+  are in the order of section 2, exactly once each. A row line carries no other field.
 * `dtype` is one of three tokens, matching section 2: `f32` (4 bytes, little-endian), `u8-e4m3`
-  (1 byte, an E4M3 code), `u8-e8m0` (1 byte, an E8M0 scale code). A reader must reject any other
-  token rather than guessing.
+  (1 byte, an E4M3 code), `u8-e8m0` (1 byte, an E8M0 scale code). The token must be the one the
+  tensor's name requires; a reader rejects any other token rather than guessing. A line with a
+  trailing field is refused, not ignored.
 * `shape` is the comma-separated dimension list of section 2, e.g. `1,4,5120`; the element count is
   the product of the dimensions, and the byte length must equal it times the dtype's width.
 * `byte-offset` is the offset from the start of the binary blob named beside the manifest; lengths
-  and offsets are decimal bytes. Tensors may be packed in any order in the blob, so long as no two
-  ranges overlap. The natural order — rows ascending, tensor order of section 2, no padding — is
-  what this document recommends for the host side to dump when a byte-identical pair is wanted; no
-  host dumper is committed yet, the format is the contract the device half records to.
+  and offsets are decimal bytes. Tensors may be packed in any order in the blob, but a reader
+  refuses two tensor lines whose byte ranges overlap, and a range that leaves the blob. The natural
+  order — rows ascending, tensor order of section 2, no padding — is what `BoundaryTable::write_v1`
+  writes, so two dumps of the same step from this writer are byte-identical; the reader accepts
+  either the natural order or any non-overlapping packing.
 * A tensor the run **cannot** emit must be an explicit line `missing <layer-id> <tensor-name>
   <reason>`, never an omitted `tensor` line. An omitted line changes the row's tensor count and the
   diff refuses the table (`BoundaryTable::diff`); an explicit `missing` line makes the same failure
@@ -487,3 +504,36 @@ The 15 boundary tests and what each pins:
   the same inputs as the reference, so the table attributes that one layer's arithmetic; every later
   row is explained by the divergence above it and is not evidence for or against its own layer until
   the replay of section 7.3 substitutes the input.
+
+## 11. The released-checkpoint host dump (measured)
+
+The host side of the format is committed and measured. `BoundaryTable::write_v1` and `read_v1` in
+`forward/boundary.rs` write and read section 4, `boundary::diff_v1` reads two pairs as a pair
+(requiring both to declare the same backbone count) and diffs them, `examples/boundary_dump.rs`
+writes a pair from one reference step, and `examples/boundary_diff.rs` runs that pair gate, prints
+the per-layer/per-tensor differences and exits 1 when anything differs. The first released-checkpoint dump was produced on
+2026-10-17 on `node0` (aarch64) with the release build of the example from this MR's branch
+(the example is introduced by this MR; `main` at `e0c1502` does not have it), against the released
+snapshot in the node's Hugging Face cache:
+
+    boundary_dump --checkpoint <snapshot> --out phase1-host-token0
+
+It wrote 40 rows of 18 tensors, a 34,767-byte manifest and a 13,537,920-byte blob, which is exactly
+the section 4 size table (40 x 338,448 bytes); `boundary_diff` of the pair against itself reports all
+40 rows bit-identical. The one-token report on the same snapshot printed:
+
+* 95,819 tensors verified, 4 Engram tensors paged (the two released Engram tables, weight and scale);
+* 40 rows, all host-vs-host bit-exact, two runs byte-identical over the boundary tables and the
+  129,280 logits;
+* every logit finite, argmax 5, top-5 [5: 13.230665207, 201: 12.492528915, 372: 11.897726059,
+  30: 11.392500877, 1897: 11.015835762];
+* audit plan=95,819 read=2,643 unread=93,176 partitioned as [unselected-expert 90,720,
+  DSpark-stage 2,401, text-path 40, indexer 15];
+* wall clock 2:20.25 and peak RSS 6,689,384 KiB (6.4 GiB) for the whole run.
+
+The artifacts stay on the node: `/home/user/hostrun/phase1-host-token0.manifest` and `.blob`,
+and `/home/user/hostrun/host_report_token0.txt`; they are not committed here (the blob alone is
+13 MB). This is the host column of criterion 1 and the reference half of criterion 3. It is not the
+device column: no device table has been captured, so nothing here says the device path matches this
+table, and the bars of section 5 remain to be measured against it.
+
