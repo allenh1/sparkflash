@@ -39,7 +39,9 @@ pub struct Mixes {
     pub post: Vec<f32>,
     /// The residual mixes, `hc_mult * hc_mult` per token, row-major: `mixes[2hc:] * scale[2] +
     /// base[2hc:]` reshaped `[hc, hc]` (kernel.py:430-431) and then normalised by the split
-    /// sinkhorn (kernel.py:436-458). Column `k` mixes input copy `k`, row `r` is output copy `r`.
+    /// sinkhorn (kernel.py:436-458). Row `j` is source copy `j` and column `k` the destination
+    /// copy - the released `comb[j][k]` orientation that [hc_post] applies (`model.py:965`;
+    /// `docs/architecture/02-mhc.md` section 4; `crates/sparkflash-kernels/src/mega_mhc_ref.rs:58-67`).
     pub comb: Vec<f32>,
 }
 
@@ -107,14 +109,14 @@ pub fn identity_pre_mix(cfg: &ModelConfig, out: &mut [f32]) -> Result<(), Engine
 ///
 /// - `pre = sigmoid(mix[0:hc] * scale[0] + base[0:hc]) + hc_eps` (kernel.py:427),
 /// - `post = 2 * sigmoid(mix[hc:2hc] * scale[1] + base[hc:2hc])`, no epsilon (kernel.py:429),
-/// - `comb = mix[2hc:] * scale[2] + base[2hc:]`, reshaped `[hc, hc]`, then normalised
-///   (kernel.py:430-431, 436-458).
+/// - `comb = mix[2hc:] * scale[2] + base[2hc:]`, reshaped `[hc, hc]` (row: source copy, column:
+///   destination copy - the released orientation), then normalised (kernel.py:430-431, 436-458).
 ///
 /// The normalisation runs `2 * hc_sinkhorn_iters` passes per token: one row softmax (plus `hc_eps`),
 /// then a column normalisation, then `hc_sinkhorn_iters - 1` pairs of a row and a column
 /// normalisation, with `hc_eps` in every denominator. The last pass normalises columns and each
-/// column of `comb` sums to 1, which is the 40 passes the released `hc_sinkhorn_iters = 20` runs
-/// (kernel.py:436-458; specification section 3.2).
+/// destination column sums to 1 across its sources, which is the 40 passes the released
+/// `hc_sinkhorn_iters = 20` runs (kernel.py:436-458; specification section 3.2).
 ///
 /// `mixes` must hold one set per token ([Mixes::for_tokens]): the token count is
 /// `x_hc.len() / hc_width()` and every buffer must agree with it.
@@ -360,12 +362,14 @@ pub fn hc_pre(
 /// `hc_post` (model.py:962-966): mix one sublayer's output back onto the mHC stream of every chunk
 /// token.
 ///
-/// `out_hc[t * hc * dim + c * dim + j] = post_mix[t * hc + c] * x[t * dim + j] +
-/// sum_k comb[t * hc * hc + c * hc + k] * residual_hc[t * hc * dim + k * dim + j]`, the
-/// `post (.) x + comb (.) residual` of the specification. `comb` is row-major, `[hc, hc]` per
-/// token, with row `c` the output copy and column `k` the input copy, which is why column `k` sums
-/// to 1 after the sinkhorn: copy `k` of the residual is distributed over the outputs. The token
-/// count is `x.len() / dim` and every buffer must agree with it.
+/// `out_hc[t, k, d] = post_mix[t, k] * x[t, d] + sum_j comb[t, j, k] * residual_hc[t, j, d]`, the
+/// `post (.) x + comb (.) residual` of the specification. `comb` is row-major `[hc, hc]` per
+/// token with row `j` the **source** copy and column `k` the **destination** copy - the released
+/// `comb[j][k]` orientation: the product `C.unsqueeze(-1) * X.unsqueeze(-2)` is
+/// `[b, s, hc, hc, dim]` and is summed over dim 2, the source copy (model.py:965;
+/// `docs/architecture/02-mhc.md:91-99`). Each destination column sums to 1 after the sinkhorn, so
+/// every output copy is a convex combination of the old copies plus its own post-scaled sublayer
+/// output. The token count is `x.len() / dim` and every buffer must agree with it.
 ///
 /// # Errors
 ///
@@ -432,9 +436,9 @@ pub fn hc_post(
         for copy in 0..hc {
             for j in 0..dim {
                 let mut accumulated = post_mix[token * hc + copy] * x[token * dim + j];
-                for input_copy in 0..hc {
-                    accumulated += comb[token * hc * hc + copy * hc + input_copy]
-                        * residual_hc[token * hc * dim + input_copy * dim + j];
+                for source in 0..hc {
+                    accumulated += comb[token * hc * hc + source * hc + copy]
+                        * residual_hc[token * hc * dim + source * dim + j];
                 }
                 out_hc[token * hc * dim + copy * dim + j] = accumulated;
             }
@@ -803,9 +807,9 @@ mod tests {
         }
     }
 
-    /// `hc_post` is `post[c] * x + sum_k comb[c][k] * residual[k]` with the comb row-major and its
-    /// second index the input copy. The comb here is asymmetric: transposing it would give 1.5 for
-    /// the first copy instead of 1.9, so a flipped index is caught.
+    /// `hc_post` is `post[k] * x + sum_j comb[j][k] * residual[j]`, the released orientation: row
+    /// `j` is the source copy and column `k` the destination copy. The comb here is asymmetric, so
+    /// applying its transpose gives 1.9 and 2.05 instead of the released 1.5 and 2.25.
     #[test]
     fn hc_post_is_post_times_x_plus_the_comb_mix() {
         let cfg = ModelConfig::tiny();
@@ -822,13 +826,49 @@ mod tests {
         hc_post(&cfg, &x, &residual, &[0.5, 0.25], &comb, &mut out).unwrap();
         for (j, value) in out.iter().take(dim).enumerate() {
             assert!(
-                (*value - 1.9).abs() < 1e-6,
+                (*value - 1.5).abs() < 1e-6,
                 "copy 0 value at {j} is {value}"
             );
         }
         for (j, value) in out.iter().skip(dim).enumerate() {
             assert!(
-                (*value - 2.05).abs() < 1e-6,
+                (*value - 2.25).abs() < 1e-6,
+                "copy 1 value at {j} is {value}"
+            );
+        }
+    }
+
+    /// The released `hc_post` formula value by value on a comb whose transpose gives different
+    /// answers: `out[k] = post[k] * y + sum_j comb[j][k] * residual[j]` (model.py:965;
+    /// `docs/architecture/02-mhc.md:91-99`). The comb below is `C[source][destination]` and
+    /// unnormalised; the expected copies are 1.2 and 2.65, and applying `C` transposed would give
+    /// 1.8 and 2.35 instead.
+    #[test]
+    fn hc_post_mixes_each_destination_from_its_comb_column() {
+        let cfg = ModelConfig::tiny();
+        let dim = cfg.dim;
+        let hc = cfg.hc_mult;
+        assert_eq!(hc, 2, "the test's expected copies assume two mHC copies");
+        let x = vec![1.0; dim];
+        let mut residual = vec![0.0; hc * dim];
+        for j in 0..dim {
+            residual[j] = 1.0;
+            residual[dim + j] = 2.0;
+        }
+        let comb = [0.1, 0.6, 0.3, 0.9];
+        let mut out = vec![0.0; hc * dim];
+        hc_post(&cfg, &x, &residual, &[0.5, 0.25], &comb, &mut out).unwrap();
+        // Destination 0: 0.5 * 1 + 0.1 * 1 + 0.3 * 2 = 1.2; destination 1:
+        // 0.25 * 1 + 0.6 * 1 + 0.9 * 2 = 2.65.
+        for (j, value) in out.iter().take(dim).enumerate() {
+            assert!(
+                (*value - 1.2).abs() < 1e-6,
+                "copy 0 value at {j} is {value}"
+            );
+        }
+        for (j, value) in out.iter().skip(dim).enumerate() {
+            assert!(
+                (*value - 2.65).abs() < 1e-6,
                 "copy 1 value at {j} is {value}"
             );
         }
@@ -1047,12 +1087,20 @@ mod tests {
         hc_post(&cfg, &x, &x_hc, &post, &combs, &mut out_hc).unwrap();
         for token in 0..2 {
             for j in 0..dim {
+                // Destination copy 0 reads column 0 of the released comb: C[source][destination].
                 let expected = 0.5 * x[token * dim + j]
                     + 0.6 * x_hc[token * token_width + j]
-                    + 0.4 * x_hc[token * token_width + dim + j];
+                    + 0.2 * x_hc[token * token_width + dim + j];
                 assert!(
                     (out_hc[token * token_width + j] - expected).abs() < 1e-4,
-                    "token {token} dim {j}"
+                    "token {token} copy 0 dim {j}"
+                );
+                let expected = 0.25 * x[token * dim + j]
+                    + 0.4 * x_hc[token * token_width + j]
+                    + 0.8 * x_hc[token * token_width + dim + j];
+                assert!(
+                    (out_hc[token * token_width + dim + j] - expected).abs() < 1e-4,
+                    "token {token} copy 1 dim {j}"
                 );
             }
         }

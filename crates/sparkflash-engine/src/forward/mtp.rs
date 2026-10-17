@@ -45,6 +45,7 @@
 
 use crate::config::ModelConfig;
 use crate::forward::attention::{self, AttnState};
+use crate::forward::boundary::{self, BoundaryTable, LayerBoundary};
 use crate::forward::mhc::{self, Mixes};
 use crate::forward::moe::{self, MoeScratch};
 use crate::linalg::{self, EngineError, ScaleGrid};
@@ -261,6 +262,91 @@ pub fn confidence(
     confidence_score(hidden, markov_embed, &proj, dim, rank, &mut combined)
 }
 
+/// The per-stage boundary buffers a capture fills while one MTP stage runs.
+///
+/// The block of section 3.2 keeps its stream in `x_hc` and its coefficient sets in one
+/// `attn_mixes` per position and one `ffn_mixes` reused position by position, and the second half
+/// of the loop works one position at a time. A capture has to collect the per-position values into
+/// one row, which is what these buffers are for. They exist only when a table was asked for; the
+/// default pass allocates nothing here (docs/build/phase1-boundary-table.md section 1).
+struct StageBoundary {
+    residual_in: Vec<f32>,
+    input_mix: Vec<f32>,
+    attn_pre: Vec<f32>,
+    attn_post: Vec<f32>,
+    attn_comb: Vec<f32>,
+    post_attention: Vec<f32>,
+    ffn_pre: Vec<f32>,
+    ffn_post: Vec<f32>,
+    ffn_comb: Vec<f32>,
+    pre_ffn: Vec<f32>,
+    ffn_out: Vec<f32>,
+}
+
+impl StageBoundary {
+    /// Buffers for one stage of a `block`-position draft pass.
+    fn new(config: &ModelConfig, block: usize) -> Self {
+        let hc = config.hc_mult;
+        let hc_width = config.hc_width();
+        Self {
+            residual_in: vec![0.0; block * hc_width],
+            input_mix: vec![0.0; block * hc],
+            attn_pre: vec![0.0; block * hc],
+            attn_post: vec![0.0; block * hc],
+            attn_comb: vec![0.0; block * hc * hc],
+            post_attention: vec![0.0; block * hc_width],
+            ffn_pre: vec![0.0; block * hc],
+            ffn_post: vec![0.0; block * hc],
+            ffn_comb: vec![0.0; block * hc * hc],
+            pre_ffn: vec![0.0; block * config.dim],
+            ffn_out: vec![0.0; block * config.dim],
+        }
+    }
+
+    /// The stage's row, in the tensor order of [boundary::TENSOR_ORDER].
+    ///
+    /// `attn_in` and `attn_out` are already whole-block buffers of `dspark_forward`, and
+    /// `residual_out` is the stream after the stage's last position; the rest was collected per
+    /// position while the stage ran.
+    fn into_row(
+        self,
+        config: &ModelConfig,
+        layer: usize,
+        attn_in: &[f32],
+        attn_out: &[f32],
+        residual_out: &[f32],
+    ) -> Result<LayerBoundary, EngineError> {
+        let mut row = LayerBoundary::new(layer);
+        row.push_stream(config, boundary::RESIDUAL_IN, self.residual_in)?;
+        row.push_mixes(config, boundary::HC_IN_PRE, self.input_mix)?;
+        row.push_mixes(config, boundary::HC_ATTN_PRE, self.attn_pre)?;
+        row.push_mixes(config, boundary::HC_ATTN_POST, self.attn_post)?;
+        row.push_comb(config, boundary::HC_ATTN_COMB, self.attn_comb)?;
+        row.push_block_input(
+            config,
+            boundary::PRE_ATTENTION_HIDDEN,
+            boundary::PRE_ATTENTION_XHAT,
+            boundary::PRE_ATTENTION_SCALES,
+            attn_in,
+        )?;
+        row.push_dense(config, boundary::ATTENTION_OUT, attn_out.to_vec())?;
+        row.push_stream(config, boundary::POST_ATTENTION_HIDDEN, self.post_attention)?;
+        row.push_mixes(config, boundary::HC_FFN_PRE, self.ffn_pre)?;
+        row.push_mixes(config, boundary::HC_FFN_POST, self.ffn_post)?;
+        row.push_comb(config, boundary::HC_FFN_COMB, self.ffn_comb)?;
+        row.push_block_input(
+            config,
+            boundary::PRE_FFN_HIDDEN,
+            boundary::PRE_FFN_XHAT,
+            boundary::PRE_FFN_SCALES,
+            &self.pre_ffn,
+        )?;
+        row.push_dense(config, boundary::FFN_OUT, self.ffn_out)?;
+        row.push_stream(config, boundary::RESIDUAL_OUT, residual_out.to_vec())?;
+        Ok(row)
+    }
+}
+
 /// The DSpark stages over one chunk: Transformer.forward_spec for the decode case
 /// (model.py:1274-1282) with the stage loop of model.py:1277-1279.
 ///
@@ -298,6 +384,36 @@ pub fn dspark_forward(
     stages: &mut [AttnState],
     src: &dyn WeightSource,
     limit: usize,
+) -> Result<DsparkOutput, EngineError> {
+    dspark_forward_observed(
+        config,
+        tokens,
+        start_pos,
+        main_hidden,
+        next_token,
+        stages,
+        src,
+        limit,
+        None,
+    )
+}
+
+/// [dspark_forward] with the per-stage boundary rows appended to `capture`, layer id
+/// `n_layers + stage` (docs/build/phase1-boundary-table.md section 1).
+///
+/// `capture` is the table the backbone rows of the same step are in; the stages append their own
+/// rows so one observed step is one table. The arithmetic is [dspark_forward]'s.
+#[allow(clippy::too_many_arguments)] // dspark_forward's inputs plus the table it may fill.
+pub(crate) fn dspark_forward_observed(
+    config: &ModelConfig,
+    tokens: &[u32],
+    start_pos: usize,
+    main_hidden: &[f32],
+    next_token: u32,
+    stages: &mut [AttnState],
+    src: &dyn WeightSource,
+    limit: usize,
+    mut capture: Option<&mut BoundaryTable>,
 ) -> Result<DsparkOutput, EngineError> {
     let dim = config.dim;
     let hc = config.hc_mult;
@@ -419,10 +535,21 @@ pub fn dspark_forward(
     let mut ffn_out = vec![0.0f32; dim];
     let mut scratch = MoeScratch::for_config(config);
 
+    // The capture buffers exist only when a table was asked for: the default pass allocates nothing
+    // here (docs/build/phase1-boundary-table.md section 1).
+    let mut captured = capture.is_some().then(|| StageBoundary::new(config, block));
+
     // The stages in order (model.py:1277-1279), each one the block of section 3.2, whose attention
     // also receives main_x (model.py:1122-1126).
     for (stage, state) in stages.iter_mut().enumerate() {
         let prefix = format!("mtp.{stage}");
+        // The stage's input boundaries: the stream and the input mix every position starts from
+        // (model.py:982-990; the mix is the previous stage's FFN coefficient, or the identity mix
+        // before the first stage, model.py:1260).
+        if let Some(buffers) = captured.as_mut() {
+            buffers.residual_in.copy_from_slice(&x_hc);
+            buffers.input_mix.copy_from_slice(&pre_mix);
+        }
         let attn_fn = linalg::decode_by_name(src, &format!("{prefix}.hc_attn_fn"), limit)?;
         let attn_scale = linalg::decode_by_name(src, &format!("{prefix}.hc_attn_scale"), limit)?;
         let attn_base = linalg::decode_by_name(src, &format!("{prefix}.hc_attn_base"), limit)?;
@@ -438,6 +565,12 @@ pub fn dspark_forward(
                 &attn_base,
                 &mut attn_mixes[position],
             )?;
+            if let Some(buffers) = captured.as_mut() {
+                let at = position * hc;
+                buffers.attn_pre[at..at + hc].copy_from_slice(&attn_mixes[position].pre);
+                buffers.attn_post[at..at + hc].copy_from_slice(&attn_mixes[position].post);
+                buffers.attn_comb[at..at + hc * hc].copy_from_slice(&attn_mixes[position].comb);
+            }
             mhc::hc_pre(
                 config,
                 &pre_mix[position * hc..(position + 1) * hc],
@@ -477,6 +610,10 @@ pub fn dspark_forward(
                 &attn_mixes[position].comb,
                 &mut stream,
             )?;
+            if let Some(buffers) = captured.as_mut() {
+                let at = position * hc_width;
+                buffers.post_attention[at..at + hc_width].copy_from_slice(&stream);
+            }
             mhc::hc_mixes(
                 config,
                 &stream,
@@ -485,9 +622,19 @@ pub fn dspark_forward(
                 &ffn_base,
                 &mut ffn_mixes,
             )?;
+            if let Some(buffers) = captured.as_mut() {
+                let at = position * hc;
+                buffers.ffn_pre[at..at + hc].copy_from_slice(&ffn_mixes.pre);
+                buffers.ffn_post[at..at + hc].copy_from_slice(&ffn_mixes.post);
+                buffers.ffn_comb[at..at + hc * hc].copy_from_slice(&ffn_mixes.comb);
+            }
             // The ffn reads THIS block's attention coefficient, not its own (model.py:990).
             mhc::hc_pre(config, &attn_mixes[position].pre, &stream, &mut collapsed)?;
             linalg::rms_norm(&mut collapsed, &ffn_norm, dim, eps)?;
+            if let Some(buffers) = captured.as_mut() {
+                let at = position * dim;
+                buffers.pre_ffn[at..at + dim].copy_from_slice(&collapsed);
+            }
             moe::moe_forward(
                 config,
                 &prefix,
@@ -497,6 +644,10 @@ pub fn dspark_forward(
                 &mut scratch,
                 &mut ffn_out,
             )?;
+            if let Some(buffers) = captured.as_mut() {
+                let at = position * dim;
+                buffers.ffn_out[at..at + dim].copy_from_slice(&ffn_out);
+            }
             mhc::hc_post(
                 config,
                 &ffn_out,
@@ -507,6 +658,25 @@ pub fn dspark_forward(
             )?;
             // ffn_pre is what the next block consumes (model.py:994, 1267).
             pre_mix[position * hc..(position + 1) * hc].copy_from_slice(&ffn_mixes.pre);
+        }
+        // The stage's output boundaries and its row: the residual out is the stream after the last
+        // position, and the row is appended with layer id n_layers + stage
+        // (docs/build/phase1-boundary-table.md section 1).
+        if let Some(table) = capture.as_deref_mut() {
+            let buffers = captured.take().ok_or_else(|| {
+                shape_error(
+                    "boundary capture",
+                    "an MTP stage ran without its boundary buffers".to_owned(),
+                )
+            })?;
+            table.push_row(buffers.into_row(
+                config,
+                config.n_layers + stage,
+                &attn_in,
+                &attn_out,
+                &x_hc,
+            )?)?;
+            captured = Some(StageBoundary::new(config, block));
         }
     }
 

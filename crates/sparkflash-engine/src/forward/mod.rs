@@ -17,14 +17,24 @@
 //! What it is NOT is a performance path, and nothing here claims a speed: each weight is read through
 //! [crate::linalg::decode_by_name], which refuses a tensor above an element limit, so a released
 //! configuration stops with an explicit refusal instead of quietly trying to allocate 98 GB.
+//!
+//! # The per-layer boundary table
+//!
+//! [InferenceEngine::prefill_observed] and [InferenceEngine::decode_observed] run this exact pass
+//! and also return the per-layer [boundary::BoundaryTable] Phase 1 diffs the device against
+//! (`docs/build/phase1-boundary-table.md`, `docs/build/roadmap-to-serving.md` section 4.5). The two
+//! entry points delegate to the same `run` with a table instead of `None`, so the default path is
+//! the same code and keeps its determinism; [boundary] documents what is recorded and in what order.
 
 pub mod attention;
+pub mod boundary;
 pub mod engram;
 pub mod mhc;
 pub mod moe;
 pub mod mtp;
 
 use crate::config::ModelConfig;
+use crate::forward::boundary::{BoundaryTable, LayerBoundary};
 use crate::forward::mhc::Mixes;
 use crate::linalg::{self, EngineError};
 use crate::tensor::TensorPlan;
@@ -116,6 +126,15 @@ pub struct StepOutput {
     pub consumed: usize,
 }
 
+/// What one observed step produced: the step's output and the boundary table recorded for it.
+#[derive(Debug)]
+pub struct ObservedStep {
+    /// What the step returned: logits, the sampled token and the draft, exactly as [StepOutput].
+    pub output: StepOutput,
+    /// The per-layer boundary table, one row per layer that ran, in run order.
+    pub boundary: BoundaryTable,
+}
+
 /// The reference engine: a configuration, a plan, a weight source and a sampler.
 ///
 /// It owns no per-sequence state - that lives in [SequenceState] - so one engine can drive several
@@ -194,7 +213,7 @@ impl InferenceEngine {
                 detail: "no tokens to prefill".to_owned(),
             });
         }
-        self.run(state, tokens)
+        self.run(state, tokens, None)
     }
 
     /// Consumes one token and returns the logits for the position after it.
@@ -203,7 +222,75 @@ impl InferenceEngine {
     ///
     /// [EngineError] from any weight read, decode or shape check.
     pub fn decode(&self, state: &mut SequenceState, token: u32) -> Result<StepOutput, EngineError> {
-        self.run(state, &[token])
+        self.run(state, &[token], None)
+    }
+
+    /// [Self::prefill] with the per-layer boundary table recorded
+    /// (`docs/build/phase1-boundary-table.md`).
+    ///
+    /// The forward is the one [Self::prefill] runs and the returned [ObservedStep::output] is what
+    /// [Self::prefill] would have returned; the capture only reads.
+    ///
+    /// # Errors
+    ///
+    /// As [Self::prefill], plus [EngineError::Shape] when the configuration's `dim` does not divide
+    /// into the reference's 32-element activation blocks: the quantised block input the table
+    /// carries is one E4M3 code per element with one E8M0 scale per 32 (kernel.py:108), so a
+    /// boundary table cannot describe a row the reference itself refuses to quantise.
+    pub fn prefill_observed(
+        &self,
+        state: &mut SequenceState,
+        tokens: &[u32],
+    ) -> Result<ObservedStep, EngineError> {
+        if tokens.is_empty() {
+            return Err(EngineError::Shape {
+                what: "prefill".to_owned(),
+                detail: "no tokens to prefill".to_owned(),
+            });
+        }
+        self.run_observed(state, tokens)
+    }
+
+    /// [Self::decode] with the per-layer boundary table recorded, including the DSpark stages when
+    /// they run (`docs/build/phase1-boundary-table.md`).
+    ///
+    /// # Errors
+    ///
+    /// As [Self::prefill_observed].
+    pub fn decode_observed(
+        &self,
+        state: &mut SequenceState,
+        token: u32,
+    ) -> Result<ObservedStep, EngineError> {
+        self.run_observed(state, &[token])
+    }
+
+    /// The observed form of one step: build a table for this step, run the shared pass with it, and
+    /// return both. Checked up front because the capture's quantised block input is defined only for
+    /// a row of whole 32-element blocks (kernel.py:108).
+    fn run_observed(
+        &self,
+        state: &mut SequenceState,
+        tokens: &[u32],
+    ) -> Result<ObservedStep, EngineError> {
+        if !self.config.dim.is_multiple_of(crate::dtype::SCALE_BLOCK) {
+            return Err(EngineError::Shape {
+                what: "boundary capture".to_owned(),
+                detail: format!(
+                    // kernel.py:108 asserts the row divides into 32-element blocks.
+                    "dim {} is not a multiple of the {} element quantisation block",
+                    self.config.dim,
+                    crate::dtype::SCALE_BLOCK
+                ),
+            });
+        }
+        // The header records the history the step starts from, not only where it starts: a decode
+        // table depends on the consumed prefix through the window and compressed/index caches, so
+        // the prefix is captured before `run` extends the sequence (BoundaryTable::diff refuses a
+        // prefix mismatch even when the start position and chunk tokens agree).
+        let mut boundary = BoundaryTable::new(state.len(), tokens, state.tokens());
+        let output = self.run(state, tokens, Some(&mut boundary))?;
+        Ok(ObservedStep { output, boundary })
     }
 }
 
@@ -277,7 +364,12 @@ impl InferenceEngine {
     /// The step [InferenceEngine::prefill] and [InferenceEngine::decode] both run: the whole-model
     /// order of `Transformer.forward` (model.py:1241-1272, section 3.1 of the forward-order doc),
     /// with `seqlen` positions at a time and `start_pos` already in the caches.
-    fn run(&self, state: &mut SequenceState, tokens: &[u32]) -> Result<StepOutput, EngineError> {
+    fn run(
+        &self,
+        state: &mut SequenceState,
+        tokens: &[u32],
+        mut capture: Option<&mut BoundaryTable>,
+    ) -> Result<StepOutput, EngineError> {
         let config = &self.config;
         let seqlen = tokens.len();
         let start_pos = state.tokens.len();
@@ -369,6 +461,7 @@ impl InferenceEngine {
                     write_tap(&mut main_hidden, position, tap, taps, dim, &averaged);
                 }
             }
+            let mut row = capture.as_deref_mut().map(|_| LayerBoundary::new(layer));
             self.block(
                 state,
                 layer,
@@ -376,7 +469,11 @@ impl InferenceEngine {
                 &mut pre_mix,
                 &mut scratch,
                 start_pos,
+                row.as_mut(),
             )?;
+            if let (Some(table), Some(row)) = (capture.as_deref_mut(), row) {
+                table.push_row(row)?;
+            }
         }
 
         // Collapse the copies with the LAST block's FFN coefficient, then the final norm and the LM
@@ -401,16 +498,23 @@ impl InferenceEngine {
             (Vec::new(), Vec::new())
         } else {
             // The MTP stages own their own window rings, held after the backbone layers.
+            let anchor = next_token.unwrap_or(0);
+            // The anchor is the MTP block's first draft token (model.py:1131-1132), so it is part
+            // of the step's header whenever an MTP row is recorded, not only of the output.
+            if let Some(table) = capture.as_deref_mut() {
+                table.set_mtp_anchor(anchor);
+            }
             let stages = &mut state.attention[config.n_layers..];
-            let output = mtp::dspark_forward(
+            let output = mtp::dspark_forward_observed(
                 config,
                 tokens,
                 start_pos,
                 &main_hidden,
-                next_token.unwrap_or(0),
+                anchor,
                 stages,
                 source,
                 self.limit,
+                capture,
             )?;
             (output.draft, output.confidence)
         };
@@ -430,6 +534,7 @@ impl InferenceEngine {
     /// The shift is the point of single-pass mHC: the attention sublayer mixes the copies with the
     /// previous sublayer's coefficient and leaves this one's behind, which the FFN sublayer then uses
     /// (model.py:972-994).
+    #[allow(clippy::too_many_arguments)] // the reference's own block signature plus the one row a capture may fill; bundling the pass state would hide which buffer a call got wrong.
     fn block(
         &self,
         state: &mut SequenceState,
@@ -438,10 +543,18 @@ impl InferenceEngine {
         pre_mix: &mut [f32],
         scratch: &mut Scratch,
         start_pos: usize,
+        mut boundary: Option<&mut LayerBoundary>,
     ) -> Result<(), EngineError> {
         let config = &self.config;
         let prefix = format!("layers.{layer}");
         let source: &dyn WeightSource = self.source.as_ref();
+
+        // The entry boundaries: the residual stream this block received and the input mix it will
+        // consume (docs/build/phase1-boundary-table.md section 2).
+        if let Some(row) = boundary.as_deref_mut() {
+            row.push_stream(config, boundary::RESIDUAL_IN, hidden.to_vec())?;
+            row.push_mixes(config, boundary::HC_IN_PRE, pre_mix.to_vec())?;
+        }
 
         // The attention sublayer (model.py:972-980).
         let fn_w = linalg::decode_by_name(source, &format!("{prefix}.hc_attn_fn"), self.limit)?;
@@ -455,6 +568,23 @@ impl InferenceEngine {
             &base,
             &mut scratch.attn_mixes,
         )?;
+        if let Some(row) = boundary.as_deref_mut() {
+            row.push_mixes(
+                config,
+                boundary::HC_ATTN_PRE,
+                scratch.attn_mixes.pre.clone(),
+            )?;
+            row.push_mixes(
+                config,
+                boundary::HC_ATTN_POST,
+                scratch.attn_mixes.post.clone(),
+            )?;
+            row.push_comb(
+                config,
+                boundary::HC_ATTN_COMB,
+                scratch.attn_mixes.comb.clone(),
+            )?;
+        }
         mhc::hc_pre(config, pre_mix, hidden, &mut scratch.attn_in)?;
         let attn_norm =
             linalg::decode_by_name(source, &format!("{prefix}.attn_norm.weight"), self.limit)?;
@@ -464,6 +594,15 @@ impl InferenceEngine {
             config.dim,
             config.norm_eps as f32,
         )?;
+        if let Some(row) = boundary.as_deref_mut() {
+            row.push_block_input(
+                config,
+                boundary::PRE_ATTENTION_HIDDEN,
+                boundary::PRE_ATTENTION_XHAT,
+                boundary::PRE_ATTENTION_SCALES,
+                &scratch.attn_in,
+            )?;
+        }
         attention::attention_forward(
             config,
             layer,
@@ -475,6 +614,9 @@ impl InferenceEngine {
             &mut scratch.attn_out,
             self.limit,
         )?;
+        if let Some(row) = boundary.as_deref_mut() {
+            row.push_dense(config, boundary::ATTENTION_OUT, scratch.attn_out.clone())?;
+        }
         scratch.residual.copy_from_slice(hidden);
         mhc::hc_post(
             config,
@@ -484,12 +626,28 @@ impl InferenceEngine {
             &scratch.attn_mixes.comb,
             hidden,
         )?;
+        if let Some(row) = boundary.as_deref_mut() {
+            row.push_stream(config, boundary::POST_ATTENTION_HIDDEN, hidden.to_vec())?;
+        }
 
         // The FFN sublayer (model.py:982-994), whose input mix is the attention sublayer's.
         let fn_w = linalg::decode_by_name(source, &format!("{prefix}.hc_ffn_fn"), self.limit)?;
         let scale = linalg::decode_by_name(source, &format!("{prefix}.hc_ffn_scale"), self.limit)?;
         let base = linalg::decode_by_name(source, &format!("{prefix}.hc_ffn_base"), self.limit)?;
         mhc::hc_mixes(config, hidden, &fn_w, &scale, &base, &mut scratch.ffn_mixes)?;
+        if let Some(row) = boundary.as_deref_mut() {
+            row.push_mixes(config, boundary::HC_FFN_PRE, scratch.ffn_mixes.pre.clone())?;
+            row.push_mixes(
+                config,
+                boundary::HC_FFN_POST,
+                scratch.ffn_mixes.post.clone(),
+            )?;
+            row.push_comb(
+                config,
+                boundary::HC_FFN_COMB,
+                scratch.ffn_mixes.comb.clone(),
+            )?;
+        }
         mhc::hc_pre(config, &scratch.attn_mixes.pre, hidden, &mut scratch.ffn_in)?;
         let ffn_norm =
             linalg::decode_by_name(source, &format!("{prefix}.ffn_norm.weight"), self.limit)?;
@@ -499,6 +657,15 @@ impl InferenceEngine {
             config.dim,
             config.norm_eps as f32,
         )?;
+        if let Some(row) = boundary.as_deref_mut() {
+            row.push_block_input(
+                config,
+                boundary::PRE_FFN_HIDDEN,
+                boundary::PRE_FFN_XHAT,
+                boundary::PRE_FFN_SCALES,
+                &scratch.ffn_in,
+            )?;
+        }
         moe::moe_forward(
             config,
             &prefix,
@@ -508,6 +675,9 @@ impl InferenceEngine {
             &mut scratch.moe,
             &mut scratch.ffn_out,
         )?;
+        if let Some(row) = boundary.as_deref_mut() {
+            row.push_dense(config, boundary::FFN_OUT, scratch.ffn_out.clone())?;
+        }
         scratch.residual.copy_from_slice(hidden);
         mhc::hc_post(
             config,
@@ -517,6 +687,9 @@ impl InferenceEngine {
             &scratch.ffn_mixes.comb,
             hidden,
         )?;
+        if let Some(row) = boundary {
+            row.push_stream(config, boundary::RESIDUAL_OUT, hidden.to_vec())?;
+        }
 
         // The next block's input mix is THIS block's FFN coefficient (model.py:994).
         pre_mix.copy_from_slice(&scratch.ffn_mixes.pre);
@@ -700,7 +873,15 @@ mod tests {
                 .collect();
             let mut pre_mix = vec![0.0f32; scratch.attn_mixes.pre.len()];
             engine
-                .block(&mut state, 0, &mut hidden, &mut pre_mix, &mut scratch, 0)
+                .block(
+                    &mut state,
+                    0,
+                    &mut hidden,
+                    &mut pre_mix,
+                    &mut scratch,
+                    0,
+                    None,
+                )
                 .expect("one block over a finite source");
             let mean_square: f32 = scratch
                 .ffn_in

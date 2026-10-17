@@ -465,13 +465,81 @@ unbounded reference; the run prints both numbers.
 
 ### 4.5 Exit criteria for Phase 1
 
-1. **Per-layer boundary table.** Forty rows times {residual streams, quantised block input and
-   scales, attention output, FFN output} against the reference, each with its comparison class and
-   bar; the run fails if any row misses its bar. The table is the deliverable: a gross mismatch names
-   its layer.
+1. **Per-layer boundary table.** One row per layer that ran, times {residual streams, quantised
+   block input and scales, attention output, FFN output}, in the documented tensor order
+   ([phase1-boundary-table.md](phase1-boundary-table.md) section 2; `TENSOR_ORDER`,
+   `crates/sparkflash-engine/src/forward/boundary.rs:143`), each with its comparison class and bar;
+   the run fails if any row misses its bar. The table is the deliverable: a gross mismatch names its
+   layer. Three rules come with the rows, all measured on the host reference:
+   - **A first step's table has exactly `n_layers` rows** — 40 for the released configuration. The
+     host engine skips the MTP pass at `start_pos == 0`
+     (`crates/sparkflash-engine/src/forward/mod.rs:497`), so a first-step capture has backbone rows
+     only. The released reference returns no draft there either (`forward_spec` returns `None`,
+     model.py:1123-1125, 1274-1282) but still runs each stage's attention to seed its window KV cache
+     (`model.py:1044-1052`; `docs/engine/01-forward-order.md` section 3.9), so "40 rows" is the host
+     capture's contract, not a claim that the reference does no MTP work on a first step. The engine
+     does not seed those stage caches, so a device harness seeded the reference's way holds a
+     different MTP history on the next decode step (format document section 1). A decode
+     step after a prefill has `n_layers + n_mtp_layers` rows (43), at layer ids `n_layers + stage`
+     (`crates/sparkflash-engine/src/forward/mtp.rs:674`,
+     `crates/sparkflash-engine/src/forward/mod.rs:508`);
+     `the_released_row_count_rules_hold_at_forty_layers_and_three_stages`
+     (`crates/sparkflash-engine/tests/boundary.rs:924`) pins the 40/43 counts at the released layer
+     counts. A run that captures a decode step must emit 43 rows; criterion 1's "forty rows" is the
+     prefill/first-step case.
+   - **The quantised block-input pair exists only when `dim % 32 == 0`** — E4M3 codes plus one E8M0
+     scale per 32 contiguous elements (kernel.py:108). The observed entry points refuse a
+     configuration that violates this before any weight is read
+     (`crates/sparkflash-engine/src/forward/mod.rs:276`); the released `dim = 5120` divides. A
+     configuration that does not divide has no boundary table, rather than a row with a missing
+     tensor.
+   - **The host-vs-host bar is bit-exact, as measured.** The reference is deterministic, so two runs
+     with the same weights are bit-identical; `BoundaryTable::diff`
+     (`crates/sparkflash-engine/src/forward/boundary.rs:592`) compares f32 bits and code bytes, and
+     the determinism test `the_observed_step_is_the_plain_step_and_two_runs_capture_identically`
+     (`crates/sparkflash-engine/tests/boundary.rs:506`) pins it. A diff of two different steps or
+     layer sets is refused (`a_diff_between_different_steps_or_layer_sets_is_refused`,
+     `crates/sparkflash-engine/tests/boundary.rs:1040`), including two tables with the same start
+     position and chunk token but a different consumed prefix
+     (`a_diff_of_the_same_decode_header_over_a_different_prefix_is_refused`,
+     `crates/sparkflash-engine/tests/boundary.rs:662`) or a different MTP anchor
+     (`a_diff_of_the_same_header_over_a_different_mtp_anchor_is_refused`,
+     `crates/sparkflash-engine/tests/boundary.rs:704`). The device-vs-reference bars remain the
+     device half's measured obligation, per tensor and not per row
+     (`BoundaryTensorDiff::differing`, `crates/sparkflash-engine/src/forward/boundary.rs:845`;
+     `max_abs_delta`, `:855`): the device path carries bf16 hidden
+     buffers and reduction orders that are not the host's, so its tolerances are measured by its run
+     as the single-layer delta compounded over the traversed layers (criterion 3's decision) and are
+     not invented here.
 2. **Perturbation test.** A test injects a one-code change into layer 17's `wq_b` weights and asserts
-   the diff flags layer 17 and no other layer. Without this, the table is decoration: a diff that
-   cannot fail is not a test.
+   the diff flags layer 17. The general **default attribution rule** is first-differing-row
+   attribution: layer L's `residual_out` is layer L+1's `residual_in`, so a change at L moves every
+   later row of an end-to-end diff, and the first row whose boundary differs is the layer the diff
+   attributes first (`BoundaryDiff::first_differing`,
+   `crates/sparkflash-engine/src/forward/boundary.rs:763`). It is a default rule and a heuristic
+   about where to look, not a proof: rows after the first difference ran on a diverged stream, and
+   localising a particular operation needs the replay below. A literal "flags layer 17 and no other
+   layer" therefore holds only when the perturbed layer is the **last captured row**: the shipped test
+   `a_one_code_change_in_layer_17s_wq_b_flags_layer_17_and_no_other_layer`
+   (`crates/sparkflash-engine/tests/boundary.rs:325`) uses eighteen backbone layers so layer 17 is
+   last, and asserts `differing_layers() == [17]` while the other seventeen rows are bit-identical.
+   The measured row 17 has **161 differing values in six tensors** (`attention_out` 64,
+   `post_attention_hidden` 17, `hc_ffn_comb` 3, `pre_ffn_hidden` 8, `ffn_out` 12,
+   `residual_out` 57), and the row's `max_abs_delta` 5.96e-8 is an `hc_ffn_comb` coefficient
+   delta, not a residual-stream delta - a one-code change is small and the row records where it
+   survives and where it rounds away (format document section 6). These are the numbers measured
+   after the comb-orientation correction: an earlier host capture applied the comb transposed and
+   reported 155 differing values, calling 5.96e-8 "exactly one f32 ulp at the residual's magnitude";
+   both the count and that attribution are superseded (format document sections 3 and 6). The
+   propagation test `a_middle_layer_change_propagates_and_the_first_divergence_is_its_layer`
+   (`crates/sparkflash-engine/tests/boundary.rs:997`) pins the general case with a layer-5 change:
+   the rows before it are identical, the first difference is at layer 5, and every later row differs.
+   Testing a **later** layer's own arithmetic, once an earlier row has diverged, needs the
+   input-substitution replay of the format document section 7.3 — run the layer from the reference
+   row's entry stream and input mix; that tool belongs to the device half. Without a test that can
+   fail, the table is decoration: a diff that cannot fail is not a test, and the shipped test fails
+   both when the capture records nothing and when the injection does nothing (mutation evidence in
+   format document section 7.2).
 3. **One token's logits.** Argmax identical to the reference's; top-5 set identical; max abs delta
    within a bar set by the run itself on expert-residency-invariant layers (design decision: the bar
    is the measured single-layer delta compounded over forty layers, not a constant chosen to pass).
