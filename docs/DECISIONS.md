@@ -27,6 +27,8 @@ records the evidence and the consequence for the build. Research backing is in
 | D16 | KV specification defects | Six 5.5 defects recorded as facts: the 890 B/token headline contradicts its own itemisation (356 B/entry once the rotary dimensions are not double-counted), plus five more, each with the code's settlement named |
 | D17 | Qualification state | Nine gates recorded with instrument, command, artifact and state; five cannot be run by any command in this tree, and 20 us at 10 KiB is the requirement while the preflight's 22 us is a deliberately looser readiness threshold |
 | D18 | The engine is a ninth crate, and the plan describes the checkpoint as stored | `crates/sparkflash-engine`; the plan is derived from the configuration and then checked against the index, and the load-time conversions (wo_a, the int8 view of FP4) belong to the loader, not the plan |
+| D21 | The determinism contract | D-a kernel determinism, D-b reduction determinism and D-c no assumed cross-boundary equality are written down here and cited by the M7 harness; a test fails if either half disappears |
+| D22 | Released mHC arithmetic | The ref, the kernel and the harness model the released arithmetic end to end (projection rstd, `mix*scale+base`, sigmoid pre/post, released split-Sinkhorn, raw C, `X_hat` block norm); the stream-mean fold is the one structural difference, named rather than implied |
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
 summary and the matching `## D<n>` section carries the evidence and the full consequence. If a row and
@@ -819,4 +821,107 @@ limit 10.0; RMS epsilon 1e-20; RoPE theta 10,000 with YaRN factor 16; window 128
 `compress_ratios[0]` = 0, so layer 0 is uncompressed - and asserts the derived configuration equals the
 runtime one field for field. A key added by a later release fails that test until it is mapped or
 explicitly ignored; it can no longer be dropped in silence.
+
+---
+
+## D21 - The determinism contract is D-a, D-b and D-c, and a test makes it citable
+
+Recorded 2026-10-17.
+
+**Evidence.** Phase 0 started from a measured counter-example, not a principle. The mega-mHC kernel
+accumulated its sum of squares with an `fp32 atomicAdd`; four tiles arrived in an order the host
+could not fix; and on identical input the stage-4 repeat measured one differing byte between run 0
+and a later run (the separate 6-of-5,120 FP8-code difference was stage 1's device-versus-reference
+finding, a different comparison; that finding line is rewritten, not deleted). The three sentences the rest of the
+project needs to cite all existed, but none of them was written where a test could read it: the
+kernel claim lived in the M7 harness's comparison class, the collective claim lived in a module
+doc, and the "exact or named tolerance" rule lived only in the harness's printed output.
+
+**Decision.** The determinism contract is these three statements:
+
+- **D-a: kernel determinism.** For fixed input bytes, launch configuration and device, a forward
+  kernel's output bytes are identical on every run.
+- **D-b: reduction determinism.** The M3 one-shot reduction is bit-identical across ranks by
+  construction: f32 accumulation in ascending rank order, one rounding to bf16 at the end
+  (`crates/sparkflash-comm/src/lib.rs` module docs).
+- **D-c: no assumed cross-boundary equality.** Device-versus-reference equality is never assumed;
+  it is either exact by construction or a named tolerance with a reason, printed before the number.
+
+**Consequence.** `crates/sparkflash-kernels/tests/determinism_contract.rs` carries
+`the_determinism_contract_is_written_down_and_the_harness_cites_it`, which reads this file and
+`crates/sparkflash-kernels/examples/m7_layer0.rs` and fails if a statement disappears or the harness
+stops citing a letter from its printed output; `crates/sparkflash-kernels/tests/mhc_determinism.rs`
+pins the fixed-slot, binary64 tile combine (`kernels/mega_mhc_sm121.cu:197-222`) and the
+26-statistic buffer. The direct
+measurement is `m7_layer0 --stage 4 --repeat 100`, which compares raw bytes with no tolerance: that
+is D-a's test (owed a device window: on 2026-10-17 the resident model held the only usable context
+and the launcher refused a second one with `cuCtxCreate_v2 -> 2 (OUT_OF_MEMORY)`, recorded in
+roadmap section 3.2), and D-c is why stage 1 prints its bars before its numbers. D-b is not on this device
+path; it is the property Phase 4's numerical criterion rests on (roadmap section 7.3).
+
+---
+
+## D22 - The released mHC arithmetic is modelled end to end, with the stream-mean fold as the one structural difference
+
+Recorded 2026-10-17.
+
+**Evidence.** The released forward flattens the four residual streams to one `n*d = 20,480` vector
+per token, takes `rsqrt(mean(x^2) + norm_eps)` over that whole stream, projects it with
+`hc_fn [24, 20,480]` and multiplies by the reciprocal square root: `mixes = F.linear(x.flatten(2),
+hc_fn) * rsqrt`, with `norm_eps = 1e-20` (`inference/model.py:950-955`; the checkpoint's
+`text_config.rms_norm_eps`). Each coefficient group is then `mix * hc_scale[g] + hc_base[row]`,
+with `pre = sigmoid(...) + hc_eps`, `post = 2 * sigmoid(...)`, and the 16 comb logits go through
+a row softmax plus `hc_eps`, one unconditional column pass, and 19 alternating row/column passes,
+each dividing by `sum + hc_eps` (`inference/kernel.py:423-462`, the kernel behind
+`hc_split_sinkhorn` at 465-475). The block-pre norm that consumes the collapsed `X_hat` uses the
+same `rms_norm_eps = 1e-20` (`inference/model.py:984,991`).
+
+Before this entry the device path differed in four ways: the kernel's `H()` took neither the
+per-group scale nor the per-row bias (the harness pre-folded `hc_attn_scale` into a `[24, 5,120]`
+predictor and read `hc_attn_base` only to print its range); the projection rstd used the Sinkhorn
+epsilon instead of `norm_eps` (still over the flattened `n*d` stream), and the block RMS normalised
+the four streams over `n*d` instead of `X_hat` over `d`; `C` was published as raw logits while our reference softmaxed it, and the harness
+compensated with a harness-side softmax around the comparison; and the split of the 24 rows into
+A/B/C was our reading of the reference rather than a pinned, tested mapping.
+
+**Decision.** The released arithmetic is one implementation with one test oracle, and the kernel
+takes the released tensors:
+
+- `kernels/mega_mhc_sm121.cu` takes `hc_scale[3]` (released `[pre, post, comb]` order) and
+  `hc_base[24]` in the kernel's row order, accumulates two sums of squares (the streams' over
+  `n*d` for the projection rstd, `X_hat`'s over `d` for the block norm), and its last tile
+  publishes the released values: `A = sigmoid(...) + hc_eps`, `C = 2 * sigmoid(...)`,
+  `hc_coeffs[dst*n+src] = comb[src][dst]`, and `hc_rms_out = 1/sqrt(mean(X_hat^2) + 1e-20)`
+  (lines 226-265; the ABI comment at 20-32).
+- `kernels/m4_common_sm121.cuh:461-...` carries `spark_released_split_sinkhorn` (row softmax,
+  `+ hc_eps`, one unconditional column pass, then 19 row/column pairs, each dividing by
+  `sum + hc_eps`) and `spark_sigmoid`.
+- `crates/sparkflash-kernels/src/mega_mhc_ref.rs` carries the mapping and the oracle:
+  `fold_predictor_into_kernel_rows` (line 683) maps released `pre(0..4)/post(4..8)/comb(8..24)`
+  onto the kernel's `B(0..16)/A(16..20)/C(20..24)` with the comb transposed,
+  `bias_into_kernel_rows` (line 606) permutes the bias the same way, and
+  `mega_mhc_layer_with_scale` (line 984) is the reference the kernel is compared against. The four
+  older entry points' arithmetic and outputs are unchanged and their existing tests still pass; the
+  zero-bias equality test pins the bias-only path to the no-bias path (both still softmax-based), not
+  the released path, which deliberately differs even at unit scale and zero base: this is a new path,
+  not a redefinition of the old one.
+- `crates/sparkflash-kernels/examples/m7_layer0.rs` passes the raw released tensors (the bias in the
+  checkpoint's row order to the reference, which folds it itself, and the folded row order to the
+  kernel), compares the coefficients raw (the harness-side softmax is gone), and checks `1/rms`
+  against the released `X_hat` statistic.
+
+**Consequence.** The project's one structural difference from the release is named rather than
+implied: the predictor is the project's `[24, 5,120]` matrix applied to the stream mean (the fold),
+not the release's `[24, 20,480]` projection over the flattened stream. Closing it is a Phase 1
+decision about the kernel's inner loop, not a coefficient-tensor gap: `hc_attn_base`,
+`hc_attn_scale`, the released split-Sinkhorn, the sigmoid pre/post, the projection rstd and the
+`X_hat` block norm are consumed on both sides, and the row pairing is pinned by
+`the_fold_puts_each_released_row_on_its_kernel_row`. Roadmap section 10's unknowns 1, 2, 4 and 6
+are closed by the tests named here and by the stage-1 output lines they pin; unknown 7 is closed in
+code by D21 with its N = 100 device run owed; unknowns 3, 5 and 8-16 are untouched. The no-device half is covered by `cargo test -p sparkflash-kernels --lib`,
+`--test mhc_determinism` and `--test determinism_contract`; the device half is
+`m7_layer0 --stage 1` and `--stage 4 --repeat 100` on the pinned node, and those runs are owed: on
+2026-10-17 the node's resident model held the only usable CUDA context (roadmap sections 3.2 and 3.6
+record the refusal), so the only device numbers are the pre-change ones in roadmap section 12.1,
+labelled as such.
 

@@ -57,6 +57,23 @@
 //!     conservative rejection is listed with its reason, and every construct they cannot see is in the
 //!     third list with its measured consequence.
 //!
+//! # Which cubin numbers are current
+//!
+//! Every cubin number in this module was re-measured in the CUDA 12.9.1 container (nvcc V12.9.86)
+//! when the released mHC arithmetic changed the shared header (spark_released_split_sinkhorn,
+//! spark_sigmoid, SPARK_M4_NORM_EPS), and the measured_texts table is the authoritative record: each
+//! text's bytes / membar-lines / sha16 triple in that table is the number the checks use and the
+//! number the prose quotes for that text. The shared baseline is the released kernel's shipped text,
+//! 70264 / 4 / 3eb4db6dd204870d: every text whose body compiles to the shipped code carries it,
+//! including the round-32 guard texts the merged !20 (main c545ca8) added, which were re-measured
+//! under the same released kernel rather than quoted from the pre-change 38640 / 4 / e9cc6998. A few
+//! variants that were measured with an extra -DM4_FLAG=1 define, or in an earlier round before the
+//! release header existed, cannot be re-derived from the table because no text for them is stored;
+//! where those appear they are marked pre-change, their numbers are the historical values that
+//! motivated the rule, and nothing current depends on them. A pre-change number quoted beside a
+//! current one is history by construction, not a second claim: the table holds one triple per text,
+//! and where a prose number and the table disagree, the table wins.
+//!
 //! The two checks read different amounts of text, and the difference matters where their verdicts are
 //! compared (round-12 A1): `acquire_helper_fences_unconditionally` reads the WHOLE body of the one
 //! helper that carries the guarantee, before the poll and after it, while `acquire_fence_after_poll`
@@ -75,7 +92,7 @@
 //! and reported a `return` inside the poll's own definition as standing before the poll (round-14
 //! A-1; each of the three fixtures carries the `#include <stdint.h>` its own types need, because it
 //! stands in front of the header's own includes - the text pinned in the test is the text nvcc
-//! compiles, and all three compile to the baseline cubin, 38640 / 4 / e9cc6998, measured in the CUDA
+//! compiles, and all three compile to the baseline cubin, 70264 / 4 / 3eb4db6dd204870d, measured in the CUDA
 //! 12.9.1 container - so reading them as a poll was a false rejection; round-15 A-2 found the claim
 //! had been measured on a differently placed fixture and made the fixtures self-contained).
 //!
@@ -99,34 +116,34 @@
 //! (sm_121a, as the committed baseline is), with the cubin its text compiles to:
 //!
 //!   * the shipped form, `const uint32_t observed = spark_wait_for_flag(flag, deadline);` -
-//!     38640 / 4 / e9cc6998f6a5 (the baseline);
+//!     70264 / 4 / 3eb4db6dd204870d (the baseline);
 //!   * a bare call, a `(void)` cast, an attribute on the statement `[[maybe_unused]] poll(...);`, and
-//!     `0u > poll(...)` - all 38920 / 3 / fcf0da4f11e1974c;
-//!   * a unary operator `!poll(...)` and `0u == poll(...)` - both 38640 / 4 / cee5673b765ab128;
-//!   * `poll(...) < deadline` and a chained comparison `0u < poll(...) < deadline` - both 38768 / 3 /
-//!     9e15fc3e39ecfeff;
+//!     `0u > poll(...)` - all 70800 / 3 / 8b870f2dde88dbcb;
+//!   * a unary operator `!poll(...)` and `0u == poll(...)` - both 70264 / 4 / ae7519eaf647c7e4;
+//!   * `poll(...) < deadline` and a chained comparison `0u < poll(...) < deadline` - both 70272 / 3 /
+//!     1e9359d11ac588b6;
 //!   * a cast of the result `(uint32_t) poll(...)` and an attribute on the declaration
-//!     `[[maybe_unused]] const uint32_t observed = poll(...)` - both 38640 / 4 / e9cc6998f6a5;
+//!     `[[maybe_unused]] const uint32_t observed = poll(...)` - both 70264 / 4 / 3eb4db6dd204870d;
 //!   * the argument spellings above, spacing, the renamed-parameter call and the macro alias
-//!     (`#define POLL_ALIAS spark_wait_for_flag`, one level) - all 38640 / 4 / e9cc6998f6a5;
+//!     (`#define POLL_ALIAS spark_wait_for_flag`, one level) - all 70264 / 4 / 3eb4db6dd204870d;
 //!   * round 18 - how the DESIGNATOR itself is spelled is not part of the rule either, because
 //!     `(poll)(flag, deadline)`, `(*poll)(flag, deadline)` and `(&poll)(flag, deadline)` are the same
-//!     call: all three 38640 / 4 / e9cc6998f6a5;
+//!     call: all three 70264 / 4 / 3eb4db6dd204870d;
 //!   * round 18 - the poll as the CONDITION of a control statement or an operand of the conditional
 //!     operator, where the fence after that whole statement runs unconditionally: `true ? poll(...) :
-//!     0u` is 38640 / 4 / e9cc6998f6a5, `if (poll(...)) {}` is 38920 / 3 / fcf0da4f11e1974c and
-//!     `while (poll(...)) {}` is 38920 / 3 / ed59a852fc4aa2e8;
+//!     0u` is 70264 / 4 / 3eb4db6dd204870d, `if (poll(...)) {}` is 70800 / 3 / 8b870f2dde88dbcb and
+//!     `while (poll(...)) {}` is 70928 / 3 / 7706110186654f84;
 //!   * round 18 - an earlier `<` of a comparison in the poll's own statement, parenthesised
-//!     (`(0u < 1u) > poll(...)`) or bare (`0u < 1u > poll(...)`): both 38640 / 4 / cee5673b765ab128;
+//!     (`(0u < 1u) > poll(...)`) or bare (`0u < 1u > poll(...)`): both 70264 / 4 / ae7519eaf647c7e4;
 //!   * round 19 - a control OPERATOR in an EARLIER, COMPLETED statement, whose own statement ended at
 //!     its semicolon so it cannot bound the poll: `const bool ran = (deadline > 0u) && true;`,
-//!     `|| true;`, `& true;` and an earlier ternary, all four 38640 / 4 / e9cc6998f6a5 (measured);
+//!     `|| true;`, `& true;` and an earlier ternary, all four 70264 / 4 / 3eb4db6dd204870d (measured);
 //!     and a macro whose replacement list is the designator - `#define P (spark_wait_for_flag)`,
 //!     `#define P (*spark_wait_for_flag)`, `#define P (&spark_wait_for_flag)`, all three
-//!     38640 / 4 / e9cc6998f6a5. The parentheses are optional in the replacement list, exactly as they
+//!     70264 / 4 / 3eb4db6dd204870d. The parentheses are optional in the replacement list, exactly as they
 //!     are around the designator itself, and the object-like/function-like distinction is the
 //!     preprocessor's own: `#define P(x) ...` has no space, `#define P (x) ...` does.
-//!   * round 20 - three more spellings, all 38640 / 4 / e9cc6998f6a5: a DOUBLE-parenthesised
+//!   * round 20 - three more spellings, all 70264 / 4 / 3eb4db6dd204870d: a DOUBLE-parenthesised
 //!     replacement `#define P ((spark_wait_for_flag))`; a replacement that is the WHOLE call
 //!     `#define P spark_wait_for_flag(flag, deadline)` used as `const uint32_t observed = P;`, where
 //!     the observation is the macro's expansion rather than a call at the use; and `#define PRE
@@ -139,34 +156,34 @@
 //!     spark_wait_for_flag(a, b)` is the whole call with the macro's own parameters in the arguments
 //!     (the arguments are not read, at a use or in a replacement list); and `#define P
 //!     (spark_wait_for_flag(flag, deadline))` is the whole call WRAPPED in parentheses, refused until
-//!     round 21 although `const uint32_t observed = P;` compiles to 38640 / 4 / e9cc6998f6a5. All four
-//!     are 38640 / 4 / e9cc6998f6a5. The discarded-value spelling of the last one, `(P);` as a whole
-//!     statement, is 38920 / 3 / fcf0da4f11e1974c - the number every discarded-value call in this list
+//!     round 21 although `const uint32_t observed = P;` compiles to 70264 / 4 / 3eb4db6dd204870d. All four
+//!     are 70264 / 4 / 3eb4db6dd204870d. The discarded-value spelling of the last one, `(P);` as a whole
+//!     statement, is 70800 / 3 / 8b870f2dde88dbcb - the number every discarded-value call in this list
 //!     measures (`bare_call`, `void_cast`, `attribute_stmt`) - so the two spellings' numbers are
 //!     stated together rather than one standing for both.
 //!   * round 22 - two more accepted shapes, both of them false refusals the review found. A helper body
 //!     that carries a fence BEFORE the poll and the acquire after it: the structural check took the
 //!     FIRST fence anywhere as the acquire and refused the shape with "precedes the poll" while the lint
-//!     accepted it, and the shape is not the baseline - 38784 / 5 / fc675480, the extra fence being the
+//!     accepted it, and the shape is not the baseline - 70280 / 5 / edc829917a67de53, the extra fence being the
 //!     only delta - so the lint was right. Both checks now take the first fence AFTER the poll
 //!     (accepted_fence_before_the_poll). And `#define P (spark_wait_for_flag)(flag, deadline)` used as
 //!     `const uint32_t observed = P;`: the whole call with its DESIGNATOR parenthesised, which neither
 //!     the designator rule (the name is not the whole replacement list) nor the whole-call rule (the
 //!     body does not start with the bare name) read, so both checks refused it although it compiles to
-//!     38640 / 4 / e9cc6998f6a5 (macro_parenthesised_designator_whole_call) - the mention rule now skips
+//!     70264 / 4 / 3eb4db6dd204870d (macro_parenthesised_designator_whole_call) - the mention rule now skips
 //!     the designator's own parentheses and reads the argument list after them.
 //!   * round 23 - one more accepted shape, and the root fix that made it one. A fence inside the poll's
-//!     ARGUMENTS with the real acquire after the call (accepted_fence_in_the_arguments_and_after, 38784 /
-//!     5 / fc675480, the cubin of the accepted fence-before-and-after shape): the structural check took
+//!     ARGUMENTS with the real acquire after the call (accepted_fence_in_the_arguments_and_after, 70280 /
+//!     5 / edc82991, the cubin of the accepted fence-before-and-after shape): the structural check took
 //!     the in-arguments fence as the acquire and refused the body while the lint accepted it, because its
 //!     fence search started at the poll's designator instead of after the call's argument list. It starts
 //!     where the lint's walk starts now, so a fence in the arguments is never the acquire.
 //!   * round 24 - and the sentence above is what round 24 had to finish. Skipping the span for fences
 //!     also stopped the scan READING it, so control flow inside the poll's own arguments became
 //!     invisible: `spark_wait_for_flag((__trap(), flag), deadline); __threadfence(); return observed;`
-//!     was ACCEPTED by both checks although it compiles to 37872 / 4 / 54cda5bc, byte-identical to the
+//!     was ACCEPTED by both checks although it compiles to 69368 / 4 / c28d450c6b01fcdd, byte-identical to the
 //!     trap-before-the-poll statement body both refuse (refused_trap_in_the_poll_arguments), and
-//!     `({ return 0u; flag; })` as the first argument compiles to 38272 / 2 / 041d46b0
+//!     `({ return 0u; flag; })` as the first argument compiles to 70280 / 2 / bdd743727ff53afd
 //!     (refused_return_in_the_poll_arguments). The span is skipped for FENCE detection - a fence written
 //!     there runs before the call, so it is never the acquire - and read for control flow, in both
 //!     checks. A conditional fence BEHIND an unconditional acquire is accepted now, because without the
@@ -178,8 +195,8 @@
 //! and the function-pointer declarator `uint32_t (*poll)(...)`. Every one of those helper bodies omits
 //! the call. The spellings that ARE translation units - the `uint32_t` declaration, the `decltype` and
 //! source-macro spellings of its return type, the attribute spelling and the function-pointer
-//! declarator - compile to 38416 bytes / 3 PTB membar lines / sha 1bbf93f5d5ca1767 against the 38640 /
-//! 4 / e9cc6998f6a5 baseline (measured), which is why refusing them costs nothing: the code they
+//! declarator - compile to 70424 bytes / 3 PTB membar lines / sha c78fa93b686e2df7 against the 70264 /
+//! 4 / 3eb4db6dd204870d baseline (measured), which is why refusing them costs nothing: the code they
 //! produce is not the baseline. Two spellings are NOT measured because nvcc refuses them, and are
 //! pinned as shapes instead: `wrapper<uint32_t> poll(...)` (the declaration is incompatible with the
 //! poll's own declaration) and `uint32_t spark_wait_for_flag(flag, deadline);` (the shipped tokens as
@@ -188,11 +205,11 @@
 //!
 //! Round 23 added three refusals, each with both verdicts and, where the text compiles, a cubin. (a) The
 //! shape above with the acquire REMOVED, `spark_wait_for_flag(({ __threadfence(); flag; }), deadline);`,
-//! which the structural check used to ACCEPT: it compiles to 38624 / 3 / e638d56e, the cubin of the
+//! which the structural check used to ACCEPT: it compiles to 70120 / 3 / 2311607a03dcec7a, the cubin of the
 //! plain fence-before-the-poll body both checks refuse, so the old verdict was not a function of the
 //! compiled shape (refused_fence_in_the_poll_arguments). (b) A poll the preprocessor may not compile
 //! beside a second, unconditional poll and the fence (refused_conditional_poll_with_a_second_poll): the
-//! baseline 38640 / 4 / e9cc6998f6a5 without -DM4_FLAG=1, and 39072 / 95e0cf41 with it. (c)
+//! baseline 70264 / 4 / 3eb4db6dd204870d without -DM4_FLAG=1, and 39072 / 95e0cf41 (pre-change) with it. (c)
 //! `void (spark_wait_for_flag)(flag, deadline);` - a mention spelled with a `void` return type. The
 //! parentheses around the designator are also the shape of a call through a parenthesised designator, so
 //! both checks read it as a call; the tokens are a block-scope REDECLARATION of the poll, and nvcc
@@ -200,14 +217,14 @@
 //! to compare and both checks now refuse it with one sentence that names the type and the compiler's
 //! answer. Round 24 added three more: a `return`, a control keyword or a call that never returns in the
 //! poll's OWN argument list, in either argument, refused by both in the same sentence (the stored texts
-//! above, and `(__builtin_unreachable(), flag)` is 36520 / 2 / d251dcf7, the cubin this documentation
+//! above, and `(__builtin_unreachable(), flag)` is 68400 / 2 / 83ac2db363499ff3, the cubin this documentation
 //! already carried for a return before the poll); a conditional fence with nothing unconditional after
 //! the poll, refused by both in the same sentence; and `__threadfence(0);`, which ONE predicate now
 //! decides on both sides - the CUDA barrier takes no arguments, so the spelling is refused rather than
 //! read as a bare call statement.
 //!
 //! One more REFUSAL, for the other reason (round-18 A8): a poll and a fence inside a NESTED bare block,
-//! `{ poll(...); __threadfence(); }`. Its cubin IS the baseline, 38640 / 4 / e9cc6998f6a5 (measured),
+//! `{ poll(...); __threadfence(); }`. Its cubin IS the baseline, 70264 / 4 / 3eb4db6dd204870d (measured),
 //! and it is refused anyway because neither check can relate a block inside the helper's body to the
 //! helper's straight-line path: what the helper expands to is then not the fixed poll-then-fence shape
 //! the guarantee is stated about. Both checks refuse it with the same words, which is the round-18 fix -
@@ -217,35 +234,35 @@
 //! the fence is not the one the guarantee is stated about. Each shape has its own reason, and each cubin
 //! is measured:
 //!
-//!   * `if (deadline > 0u) poll(...); __threadfence();` - 38928 / 3 / 7068c3752a06ffd8: the poll is
+//!   * `if (deadline > 0u) poll(...); __threadfence();` - 70928 / 3 / 0f03266fa910ac58: the poll is
 //!     evaluated only when the branch is taken, so the fence may follow no observation at all;
-//!   * `(deadline > 0u) && poll(...)` - 38768 / 4 / b8425de869fb4a13: the same reason, through the
+//!   * `(deadline > 0u) && poll(...)` - 70264 / 4 / 69c8ea1592276ee1: the same reason, through the
 //!     short-circuit operator;
-//!   * `return poll(...); __threadfence();` - 38472 / 2 / 26b31e58fa4ccf0a: the call here is NOT
+//!   * `return poll(...); __threadfence();` - 70096 / 2 / bc0410cac99ba3e6: the call here is NOT
 //!     conditional, it is the return value; what is wrong is that the fence after it is unreachable,
 //!     because the return leaves the helper first. Two PTX membar lines against the baseline's four is
 //!     that unreachability, and it is why the reason for this shape is not the one above.
 //!
 //! A fourth REFUSED family (round 20): two texts where the macro reading and the call reading collide.
 //! `#define BAIL return` then `BAIL;` before the poll is a USE of a macro that can bound the path, and
-//! nvcc compiles it to 36520 bytes / 2 PTB membar lines / sha d251dcf7b50ec8a0 - not the baseline - so
+//! nvcc compiles it to 68400 bytes / 2 PTB membar lines / sha 83ac2db363499ff3 - not the baseline - so
 //! refusing it is required; the lint refused it and the structural check accepted it, which was the
 //! wrong verdict, and both now say so in the same words. `#define P(spark_wait_for_flag)
 //! spark_wait_for_flag` used as `P(spark_wait_for_flag)(flag, deadline)` is refused although nvcc DOES
-//! compile it to 38640 / 4 / e9cc6998f6a5: the scan reads two mentions of the designator - the macro's
+//! compile it to 70264 / 4 / 3eb4db6dd204870d: the scan reads two mentions of the designator - the macro's
 //! argument and the macro's own name, whose body is that parameter - and will not guess which one is the
 //! observation. That second text is a conservative refusal of a spelling the compiler accepts, and it is
 //! written down as one rather than claimed to be a defect. The operator-only macro of the ACCEPTED list
 //! is also refused when it stands in the poll's OWN statement, where no `;` separates the use from the
 //! observation: `#define MAYBE(x) ((deadline > 0u) && (x))` then
-//! `const uint32_t observed = MAYBE(spark_wait_for_flag(flag, deadline));` is 38768 / 4 / b8425de8, the
+//! `const uint32_t observed = MAYBE(spark_wait_for_flag(flag, deadline));` is 70264 / 4 / 69c8ea1592276ee1, the
 //! same code as the literal short circuit it expands to, and both checks refuse it.
 //!
 //! Round 21 added the text of this family that the review found on the OTHER side of the poll, where the
 //! two checks disagreed in the opposite direction. `#define BAIL return` then `BAIL;` AFTER the poll,
 //! in a later, completed statement, is refused by the lint and was ACCEPTED by the structural check,
 //! whose suspicion rule stopped at "before the poll, or in the poll's own statement" - and it is not the
-//! baseline: 36896 bytes / 2 PTB membar lines / sha 75beed7f5dc1ba9c, because the fence after the macro
+//! baseline: 68904 bytes / 2 PTB membar lines / sha 1068c6b80f2508ea, because the fence after the macro
 //! is unreachable, so the lint was right and the structural check was wrong. The structural check now
 //! reads the span the lint reads - every use before the FENCE - and answers with the lint's own sentence
 //! for the position: the pre-poll scan's "the acquire after it runs" before the poll, the forward walk's
@@ -272,7 +289,7 @@
 //! and a `<` opens a template argument list only when a template NAME stands before it, so the `<` of
 //! `0u < 1u > poll(...)`, which has a literal in front of it, is a comparison. Each of those was a
 //! false refusal of a call nvcc compiles: the bound alone left the parenthesised case refused, and the
-//! two cases measure the same 38640 / 4 / cee5673b765ab128.
+//! two cases measure the same 70264 / 4 / ae7519eaf647c7e4.
 //!
 //! OUTSIDE the helper's body a DECLARATION of the poll is still accepted and ignored - which is where a
 //! declaration is uninteresting, because it cannot change what the body does. The call-site check
@@ -299,7 +316,7 @@
 //! again. That is what keeps the guard's own `#define`d BAIL escapes rejected while a source
 //! `#define`d return type is read as one. Every header-level declaration shape is pinned in
 //! `a_declaration_is_a_declaration_whatever_its_return_type`, and the cubin of each one nvcc accepts
-//! is the baseline (38640 / 4 / e9cc6998, measured - the typedef, `decltype` and source-macro
+//! is the baseline (70264 / 4 / 3eb4db6dd204870d, measured - the typedef, `decltype` and source-macro
 //! declarations and the function-template form of the class-template one; the non-template
 //! class-template declaration redeclares the poll with a different return type, which nvcc refuses as a
 //! redefinition, so it is pinned as a shape and not measured).
@@ -385,7 +402,7 @@
 //! "with different reasons", which round 23 found to be a divergence rather than a difference of words:
 //! the structural check refused the conditional poll while the lint, counting only compiled mentions,
 //! accepted any body that held one too, so `#if M4_FLAG` around a first poll with a second unconditional
-//! poll compiled under -DM4_FLAG=1 to two real polls (39072 / 95e0cf41, measured with that define) whose
+//! poll compiled under -DM4_FLAG=1 to two real polls (39072 / 95e0cf41 (pre-change), measured with that define) whose
 //! one acquire pairs with the second only: a silent second observation. Both checks refuse a poll the
 //! scan cannot place now, and with the same sentence. What was left then was the COUNT, where the two
 //! checks shared the "2 times" clause and spoke in their own voices about it; round 29 unified that
@@ -418,23 +435,23 @@
 //! both say "this scan" now and the matrix asserts the two COUNT messages equal. One reading is
 //! conservative rather than
 //! complete and is stated as such: a macro whose REPLACEMENT LIST contains a lambda with a return is
-//! refused, although nvcc compiles that text to the baseline (38640 / 4 / e9cc6998), because the
+//! refused, although nvcc compiles that text to the baseline (70264 / 4 / 3eb4db6dd204870d), because the
 //! replacement is read textually with no lambda skip; the lambda promise below covers a lambda written
 //! in the source, not one hidden inside a macro.
 //!
 //! WHY THE MACRO PATH IS READ TEXTUALLY, and where that stops: both checks are text scanners with a
 //! small `#define` table rather than a preprocessor, so a macro USE is judged by the body the table
 //! holds for it at that point. That is what lets `#define BAIL return` then `BAIL;` be refused before
-//! the poll (it compiles to 36520 / 2 / d251dcf7) and what makes the conservative refusal above
+//! the poll (it compiles to 68400 / 2 / 83ac2db363499ff3) and what makes the conservative refusal above
 //! possible. Round 28 aligned the macro branch with the literal one in the one place the two could be
 //! compared at all: a use inside a LAMBDA BODY is now skipped by both checks, exactly as a literal
 //! exit inside a lambda body is, so `#define BAIL return` used inside `auto f = [&] { BAIL; };` before
-//! the poll is ACCEPTED by both - it compiles to the baseline 38640 / 4 / e9cc6998, measured on the
+//! the poll is ACCEPTED by both - it compiles to the baseline 70264 / 4 / 3eb4db6dd204870d, measured on the
 //! stored text `accepted_macro_return_in_a_lambda_before_the_poll`. The lambda blindness that remains
 //! is the one inside a macro's REPLACEMENT LIST, which no reading of the use site can see.
 //! The two-poll refusal is conservative and its measurement is
-//! stated with it: a helper body that calls the poll twice is valid C++ and nvcc compiles it - to 39064
-//! bytes / 3 PTX membar lines / sha e8a967d815afaf5c, against the 38640 / 4 / e9cc6998 baseline
+//! stated with it: a helper body that calls the poll twice is valid C++ and nvcc compiles it - to 70560
+//! bytes / 3 PTX membar lines / sha 06172060143332d3, against the 70264 / 4 / 3eb4db6dd204870d baseline
 //! (measured on the stored text refused_two_polls; the round-13 fixture for this shape duplicated one
 //! const and was not a translation unit at all, so the number it quoted belonged to no text) - but the
 //! shipped helper observes once and this guard will not certify a second observation on the
@@ -451,7 +468,7 @@
 //!   * a macro that is not defined in the scanned source (the included header's macros are
 //!     invisible here), or a control keyword assembled by token pasting. Both remove real barriers: an
 //!     included-header macro that expands to a `return`, and a `##`-assembled one, each compile the
-//!     helper to 36896 bytes / 2 PTB membar lines / sha 75beed7f... against the 38640 / 4 / e9cc6998
+//!     helper to 68904 bytes / 2 PTB membar lines / sha 1068c6b8... against the 70264 / 4 / 3eb4db6dd204870d
 //!     baseline (measured, not pinned: the two fixtures' VERDICT - that both checks accept them, and so
 //!     miss the removed barrier - is pinned in `the_written_claims_are_exact`, and the cubin numbers are
 //!     the measurement those two shapes produce; round-11 A4). The names of the macros a source DOES
@@ -577,7 +594,7 @@
 //!     (`obs: __threadfence();`) or the global `::` (`::__threadfence();`), an attribute-specifier may
 //!     stand in front of it on the same line or on the line above (`[[likely]] __threadfence();`), and a
 //!     comment or a blank line around it changes nothing. nvcc compiled both attribute placements to the
-//!     baseline cubin byte for byte (38640 / 4 / e9cc6998, measured) and the statement-start rule looks
+//!     baseline cubin byte for byte (70264 / 4 / 3eb4db6dd204870d, measured) and the statement-start rule looks
 //!     past the whole `[[...]]` rather than reading its closing bracket as an expression (round-12 A4),
 //!     which is pinned for both placements in `the_written_claims_are_exact`. A conditional OPERATOR in
 //!     an earlier, completed statement (`bool ready2 = ready ? true : false;` before the fence) does not
@@ -586,8 +603,8 @@
 //!     `;` that ends that statement is a `;` at the operator's own brace depth, so the `;` inside
 //!     a statement expression does not end it (round-10 A-1, a regression of the round-8 A6 scoping
 //!     that let `(observed == 0u) && ({ int z = 0; __threadfence(); z; });` through while nvcc
-//!     dropped a barrier: 38624 bytes / 3 PTB membar lines / sha d64426bf... against the 38640 / 4 /
-//!     e9cc6998 baseline). nvcc compiles the designator wrappers, the bare block, the label, the global
+//!     dropped a barrier: 38624 bytes / 3 PTB membar lines / sha d64426bf... (pre-change) against the 70264 / 4 /
+//!     3eb4db6dd204870d baseline). nvcc compiles the designator wrappers, the bare block, the label, the global
 //!     `::` and both attribute placements to the same barriers, so rejecting them was the round-7,
 //!     round-8, round-9, round-10 and round-12 false rejections, and each is
 //!     pinned green; a fence in a branch or a loop body, a fence in a conditional expression, and an
@@ -597,7 +614,7 @@
 //!     (`{ int i = 0; (void)i; __threadfence(); }`), it may be the whole body of a statement
 //!     expression (`({ __threadfence(); });`), and bare blocks may nest
 //!     (`{ { __threadfence(); } }`). nvcc compiles each of those three bodies to the baseline cubin
-//!     byte for byte (38640 / 4 / e9cc6998), so they are enumerated rather than rejected. A
+//!     byte for byte (70264 / 4 / 3eb4db6dd204870d), so they are enumerated rather than rejected. A
 //!     `co_await` or `co_yield` before the fence is accepted for the same reason the scan gives no
 //!     verdict on suspension at all: the fence still runs when the coroutine resumes, and this scanner
 //!     does not model coroutines;
@@ -620,8 +637,8 @@
 //! with them: only the unqualified or globally qualified `__threadfence` is this barrier, so
 //! `X::__threadfence();` and `x.__threadfence();` are read as a body with no barrier - which is
 //! what they are, and with a namespace member of that name nvcc compiles the no-op and the kernel loses
-//! two barriers (38472 bytes / 2 PTB membar lines / sha 26b31e58... against the 38640 / 4 /
-//! e9cc6998 baseline), so certifying them would be worse than refusing them. A fence reached through a
+//! two barriers (70096 bytes / 2 PTB membar lines / sha bc0410ca... against the 70264 / 4 /
+//! 3eb4db6dd204870d baseline), so certifying them would be worse than refusing them. A fence reached through a
 //! function pointer or a CAST expression keeps the name as part of a larger expression rather than as a
 //! bare call statement, which is the reason both checks report; nvcc does compile
 //! `((void (*)(void))__threadfence)();` to the baseline cubin byte for byte, so this one is a policy
@@ -630,9 +647,9 @@
 //! that imports a guarded name is rejected with the file and the line by all three checks, and the two
 //! cases are not the same one (round-10 A-2, corrected in round-11 A5): a using-declaration for a
 //! namespace's member (`using X::__threadfence;`) really does re-bind the name, and nvcc compiled that
-//! body to 38472 bytes / 2 PTB membar lines / sha 26b31e58... against the baseline, while a
+//! body to 70096 bytes / 2 PTB membar lines / sha bc0410ca... against the baseline, while a
 //! using-declaration for the global barrier itself (`using ::__threadfence;`) still names the barrier
-//! and nvcc compiles that body to the baseline cubin (38640 / 4 / e9cc6998, measured) - so that one is a
+//! and nvcc compiles that body to the baseline cubin (70264 / 4 / 3eb4db6dd204870d, measured) - so that one is a
 //! POLICY rejection, and the message says so instead of claiming the name changed meaning. The BARE
 //! spelling is a third case, and what this doc said about it was false: `using __threadfence;` is not
 //! namespace-qualified, and nvcc refuses the translation unit with "namespace-qualified name is
@@ -644,8 +661,8 @@
 //! matches the argument list"; `using X::__threadfence<int>;` is a template-id - "a template-id is not
 //! allowed"; and `using __threadfence = X;` is an ALIAS-declaration, which is not a using-declaration
 //! at all: nvcc refuses it when the right-hand side is not a type ("namespace X is not a type name")
-//! and COMPILES the re-binding when it is, where the barrier is gone - 38472 bytes / 2 PTB membar lines
-//! / sha 26b31e58..., the same cubin as the member re-bind, against the 38640 / 4 / e9cc6998 baseline
+//! and COMPILES the re-binding when it is, where the barrier is gone - 70096 bytes / 2 PTB membar lines
+//! / sha bc0410ca..., the same cubin as the member re-bind, against the 70264 / 4 / 3eb4db6dd204870d baseline
 //! (round-13 A-3, pinned in `the_using_spellings_are_refused_with_their_own_reason`).
 //! A using-directive whose namespace the scanned source defines is rejected too, and nvcc refuses the
 //! ambiguity it produces ("more than one instance of overloaded function __threadfence matches"); a
@@ -655,8 +672,8 @@
 //! in device code), so the rejection costs nothing
 //! and closes the textual gap. A fence inside a lambda's body or a class, struct, namespace, enum or
 //! union body is rejected as a nested body rather than a bare block: it runs only if the closure is
-//! called or the member is reached, and nvcc compiled the uncalled closure to 38472 bytes / 2 PTB
-//! membar lines / sha 26b31e58... while the called one was byte-identical to the baseline, so even the
+//! called or the member is reached, and nvcc compiled the uncalled closure to 70096 bytes / 2 PTB
+//! membar lines / sha bc0410ca... while the called one was byte-identical to the baseline, so even the
 //! called spelling is refused by policy and the message says which form to write (round-10 A-3).
 //! The `do { } while (0)` idiom is the one control-looking body that is NOT suspicious, and a
 //! qualified call to a non-returning name (`std::abort()`) is not treated as a blocker at all; both
@@ -670,12 +687,12 @@
 //! compiles it to the baseline. Round 27 established it for a lambda body written directly before the
 //! poll and round 28 extended it to a lambda body nested at any depth and to the macro branch -
 //! `auto f = [&] { return flag; };`, `[&]{ { return; } }`, `[&]{ if (flag) { return; } }` and
-//! `[&]{ __trap(); }` before AND after the poll are all stored and measured at 38640 / 4 / e9cc6998,
+//! `[&]{ __trap(); }` before AND after the poll are all stored and measured at 70264 / 4 / 3eb4db6dd204870d,
 //! while a bare block at statement level stays refused because the `return` in it IS the helper's
-//! (38272 / 2 / 041d46b0, measured), as is every attributed block below. Round 31 A2 added the second
+//! (70280 / 2 / bdd743727ff53afd, measured), as is every attributed block below. Round 31 A2 added the second
 //! member of the class: a local TYPE body. `struct S { S() { return; } };`, `struct S { ~S() {
 //! return; } };` and `struct S { void run() { return; } };` before the poll are exits of the MEMBER,
-//! not of the helper, and nvcc compiles all three to the baseline 38640 / 4 / e9cc6998 with the
+//! not of the helper, and nvcc compiles all three to the baseline 70264 / 4 / 3eb4db6dd204870d with the
 //! acquire present (accepted_return_in_a_local_constructor, ..._destructor, ..._member_function);
 //! both checks used to refuse them with the unreachability sentence, which was false of that body.
 //! Round 32 A2 extended the same reading to the class-head spellings the closing reviews found
@@ -683,22 +700,24 @@
 //! ATTRIBUTE specifier (`struct [[maybe_unused]] S`, `struct __attribute__((packed)) S`, and
 //! `struct alignas(8) S`, which round 32 added after the second review) all stand between the
 //! keyword and the brace, and the walk-back stopped at their `,`, `]` or `)`. It skips a balanced
-//! bracket group now, and all five spellings are stored and measured at 38640 / 4 / e9cc6998
+//! bracket group now, and all five spellings are stored and measured at
+//! 70264 / 4 / 3eb4db6dd204870d (38640 / 4 / e9cc6998 pre-change)
 //! (accepted_return_in_a_local_type_with_two_bases, ..._with_public_bases, ..._with_an_attribute,
 //! ..._with_a_gnu_attribute, ..._with_alignas).
 //! Round 32 A3 is the same rule read in the CALLED direction: a lambda the source CALLS where it
 //! stands runs, so a body of its own that holds a non-returning call cannot hand control back and
 //! the statement after the call never completes. `(void)([&]{ __trap(); return 0u; })();` before the
-//! poll is that shape; nvcc compiles it to 37872 / 4 / 54cda5bc, the cubin this file already
-//! refuses as `__trap();` before the poll. That is the ONE-CUBIN-ONE-VERDICT rule this module reads
+//! poll is that shape; nvcc compiles it to 69368 / 4 / c28d450c6b01fcdd (37872 / 4 / 54cda5bc pre-change),
+//! the cubin this file already refuses as `__trap();` before the poll. That is the
+//! ONE-CUBIN-ONE-VERDICT rule this module reads
 //! the call direction with: two texts that compile to the same cubin may not be certified
 //! differently when the refusal asserts something about the compiled code - here, that the acquire
 //! after the call never runs. A CONSERVATIVE refusal asserts less than that ("the scan will not
 //! certify this text") and conflicts with nothing: four texts in the store are refused with the
-//! baseline 38640 / 4 / e9cc6998 recorded beside them: two for how their macros' replacement lists
-//! read textually rather than preprocessed, one for the preprocessor conditional the scan will not
-//! resolve, and one, refused_poll_in_a_bare_block, because its poll stands in a nested block rather
-//! than a top-level statement.
+//! baseline 70264 / 4 / 3eb4db6dd204870d recorded beside them (38640 / 4 / e9cc6998 pre-change): two
+//! for how their macros' replacement lists read textually rather than preprocessed, one for the
+//! preprocessor conditional the scan will not resolve, and one, refused_poll_in_a_bare_block,
+//! because its poll stands in a nested block rather than a top-level statement.
 //! Both checks ACCEPTED it until round 32 - the false-accept direction of the same defect - and
 //! both refuse it now (refused_trap_in_a_called_lambda_before_the_poll, measured at that cubin). A
 //! `return` in the called lambda returns to the caller, so `(void)([&]{ return; })();` is still
@@ -717,12 +736,13 @@
 //! walk-back now steps over the balanced template parameter list) and `[&]() -> decltype(auto)` (it
 //! steps over the balanced `decltype(...)` in the return type). Round 32 A4 pinned the two specifier
 //! spellings that were accepted and untested: `[&]() noexcept { return; }` and
-//! `[&]() mutable { return; }` are stored and measured at 38640 / 4 / e9cc6998
-//! (accepted_noexcept_lambda_with_a_return, accepted_mutable_lambda_with_a_return). Both of round 30's
+//! `[&]() mutable { return; }` are stored and measured at 70264 / 4 / 3eb4db6dd204870d
+//! (38640 / 4 / e9cc6998 pre-change; accepted_noexcept_lambda_with_a_return,
+//! accepted_mutable_lambda_with_a_return). Both of round 30's
 //! spellings are stored ACCEPTED texts as well
 //! (accepted_template_parameter_list_lambda_with_a_return and
 //! accepted_decltype_auto_lambda_with_a_return), and nvcc compiles all four to the BASELINE
-//! 38640 / 4 / e9cc6998, as it always did - the round-29 refusals said the acquire after the exit was
+//! 70264 / 4 / 3eb4db6dd204870d, as it always did - the round-29 refusals said the acquire after the exit was
 //! unreachable, and that sentence was false of the body nvcc compiled.
 //! Round 31 A1 closed the way that claim was still false: the walk-back kept ONE depth counter for
 //! round, square and angle brackets, so a `<` or `>` written inside a parenthesised or
@@ -730,7 +750,7 @@
 //! group it sat in, the scan never reached the arrow, and both checks refused the whole spelling with
 //! the unreachability sentence. Each bracket kind has its own counter now, a bracket nested in
 //! another kind of group is ignored, and the angle matcher skips the groups nested in a template
-//! argument or parameter list. Eleven stored and measured texts pin it at 38640 / 4 / e9cc6998:
+//! argument or parameter list. Eleven stored and measured texts pin it at 70264 / 4 / 3eb4db6dd204870d:
 //! `[&]() -> std::enable_if_t<(1 < 2), int> { return 0; }` and its `(2 > 1)` twin, five
 //! `decltype(...)` forms (`1 << 2`, `(1 < 2)`, `(1 <= 2)`, `(1 > 2)`, `(1 >= 2)`), and
 //! `[&]<typename T = std::enable_if_t<(1 < 2), int>>()`, the same with `(1 << 2) != 0`, plus
@@ -742,8 +762,9 @@
 //! comparison PARENTHESISED, so the guard had never been asked about a BARE one, and
 //! `std::enable_if_t<1 < 2, int>`, `1 <= 2` and `1 >= 2` written bare in a template argument or
 //! parameter list were still refused with the unreachability sentence while nvcc compiled all five
-//! to 38640 / 4 / e9cc6998. In BOTH angle walks a `<` is a delimiter only when a template NAME
-//! stands in front of it, and the `>` of a `>=` is a comparison rather than a close: the guard is
+//! to 70264 / 4 / 3eb4db6dd204870d (38640 / 4 / e9cc6998 pre-change). In BOTH angle walks a `<` is a
+//! delimiter only when a template NAME stands in front of it, and the `>` of a `>=` is a comparison
+//! rather than a close: the guard is
 //! the one function round-18 A4 wrote for the call reading, now with three call sites. The five
 //! bare forms are stored and measured (accepted_bare_less_than_in_a_trailing_return, the
 //! ..._less_equal one beside it, and the three ..._in_a_template_parameter_list forms).
@@ -757,11 +778,11 @@
 //! skips a balanced `[[...]]` pair - adjacent brackets on both sides, which an init-capture list is
 //! not - and the walk-back keeps looking for the capture list before it. So `[[maybe_unused]] { {
 //! return 0u; } }` before the poll, the same with an `if` and with a `while`, and the after-poll
-//! `[[maybe_unused]] { { return observed; } }` are stored, measured and REFUSED (38272 / 2 /
-//! 041d46b0 and 38472 / 2 / 26b31e58), as is the plain nested block `{ { return 0u; } }` that is the
+//! `[[maybe_unused]] { { return observed; } }` are stored, measured and REFUSED (70280 / 2 /
+//! bdd74372 and 70096 / 2 / bc0410cac99ba3e6), as is the plain nested block `{ { return 0u; } }` that is the
 //! control, while accepted_init_capture_ending_in_a_subscript and
 //! accepted_capture_list_with_a_trailing_attribute are stored and measured at the baseline
-//! 38640 / 4 / e9cc6998.
+//! 70264 / 4 / 3eb4db6dd204870d.
 //! The tokens that really do bound the path stay rejected: a `return`, `goto`, `throw` or `co_return`
 //! outside a lambda body, a loop, and a non-returning call. The same tokens BEFORE the poll are rejected
 //! too, by both checks and with the same reason - the structural check reads the whole helper body and
@@ -769,7 +790,7 @@
 //! round-12 A1 found (both verdicts pinned in `the_written_claims_are_exact`).
 //! A nested fence does not stop either check while a top-level fence follows it: `auto l = [&] {
 //! __threadfence(); }; (void)l; __threadfence();` is accepted by both checks, and nvcc compiled it to the
-//! baseline cubin byte for byte (38640 / 4 / e9cc6998, measured); the lint used to reject the lambda's
+//! baseline cubin byte for byte (70264 / 4 / 3eb4db6dd204870d, measured); the lint used to reject the lambda's
 //! fence before it ever reached the real acquire, which was the first disagreement of round-12 A1.
 //! A fence inside a `requires`-expression or a `try` block is rejected as a nested body, and the two
 //! checks agree about both - the lint used to step into a `try` block and accept the fence there while
@@ -792,10 +813,10 @@
 //! test is what keeps the promise from going stale again.
 //! The PTX `membar` count is not monotone with correctness, which is why the gate compares bytes and
 //! sha256 as well - and both numbers here are MEASUREMENTS of the shape written beside them, not pins:
-//! `__threadfence();` followed by `if (observed != 0u) { } else { __threadfence(); }` compiles to 38784
-//! bytes / 5 PTB membar lines / sha 5c203118... , which is MORE membar lines than the 38640 / 4 baseline
+//! `__threadfence();` followed by `if (observed != 0u) { } else { __threadfence(); }` compiles to 70280
+//! bytes / 5 PTB membar lines / sha edc82991... which is MORE membar lines than the 70264 / 4 baseline
 //! while the acquire is present, and `if (observed != 0u) { __threadfence(); }` with the top-level fence
-//! deleted compiles to 38624 bytes / 3 PTB membar lines / sha e5b9d6cc... , which is FEWER lines with the
+//! deleted compiles to 38624 bytes / 3 PTB membar lines / sha e5b9d6cc... (pre-change), which is FEWER lines with the
 //! acquire gone (round-12 A3 re-measured both, after the round-11 sentence attributed the 5-line number
 //! to the wrong shape). A gate that watched only the count would call the first of those safer and the
 //! second unsafe.
@@ -922,6 +943,14 @@ fn mega_mhc_signature_is_pinned() {
                 name: "predictor",
             },
             ExpectedParam {
+                raw_type: "const float *__restrict__ hc_scale",
+                name: "hc_scale",
+            },
+            ExpectedParam {
+                raw_type: "const float *__restrict__ hc_base",
+                name: "hc_base",
+            },
+            ExpectedParam {
                 raw_type: "const float *__restrict__ rms_weight",
                 name: "rms_weight",
             },
@@ -975,7 +1004,7 @@ const SIGNATURES: [(&str, &str, &str); 6] = [
     (
         "mega_mhc_sm121.cu",
         "mega_mhc_fused_bf16_sm121",
-        "__nv_bfloat16 *__restrict__ x; const __nv_bfloat16 *__restrict__ y_prev; const float *__restrict__ b_prev; const float *__restrict__ c_prev; const float *__restrict__ a_prev; const float *__restrict__ predictor; const float *__restrict__ rms_weight; uint8_t *__restrict__ xhat_fp8; uint8_t *__restrict__ xhat_scales; float *__restrict__ hc_stats; uint32_t *__restrict__ hc_sync; float *__restrict__ hc_coeffs; float *__restrict__ hc_rms_out; GpuTraceRing *__restrict__ trace_ring; const uint32_t layer_id; const uint64_t step_seq",
+        "__nv_bfloat16 *__restrict__ x; const __nv_bfloat16 *__restrict__ y_prev; const float *__restrict__ b_prev; const float *__restrict__ c_prev; const float *__restrict__ a_prev; const float *__restrict__ predictor; const float *__restrict__ hc_scale; const float *__restrict__ hc_base; const float *__restrict__ rms_weight; uint8_t *__restrict__ xhat_fp8; uint8_t *__restrict__ xhat_scales; float *__restrict__ hc_stats; uint32_t *__restrict__ hc_sync; float *__restrict__ hc_coeffs; float *__restrict__ hc_rms_out; GpuTraceRing *__restrict__ trace_ring; const uint32_t layer_id; const uint64_t step_seq",
     ),
     (
         "b12x_mxfp8_dense_sm121.cu",
@@ -1100,13 +1129,15 @@ fn the_signature_parser_notices_a_dropped_qualifier() {
     );
     assert_eq!(
         decl.params.len(),
-        16,
+        18,
         "the parameter count is unchanged by the mutation"
     );
+    // xhat_scales is parameter 10: x, y_prev, b_prev, c_prev, a_prev, predictor, hc_scale,
+    // hc_base, rms_weight, xhat_fp8, xhat_scales.
     assert!(
-        !decl.params[8].raw_type.contains("__restrict__"),
+        !decl.params[10].raw_type.contains("__restrict__"),
         "the parser must expose the missing qualifier: {}",
-        decl.params[8].raw_type
+        decl.params[10].raw_type
     );
 }
 
@@ -1124,7 +1155,10 @@ fn mega_mhc_geometry_is_self_consistent() {
         "specification 2.4 leaves four streams, swept as four tiles"
     );
     assert_eq!(threads % 32, 0, "a block is a whole number of warps");
-    assert_eq!(stats, 25, "n*n + 2n dot products plus the sum of squares");
+    assert_eq!(
+        stats, 26,
+        "n*n + 2n dot products plus the block RMS and the coefficient RMS statistics"
+    );
     assert_eq!(table.value("SPARK_M4_HC_PREDICTOR_ROWS"), 24);
     assert_eq!(
         tile % table.value("SPARK_M4_QUANT_BLOCK"),
@@ -2936,7 +2970,7 @@ fn designator_is_a_call(tokens: &[CodeToken], index: usize) -> bool {
 /// token pattern as its `poll` argument, so `spark_wait_for_flag((flag), (deadline))`, a cast
 /// argument and plain spacing differences were located by the structural check and missed by the
 /// lint, which then reported "no poll of spark_wait_for_flag(flag, deadline) in this source's code"
-/// for code nvcc compiles to the baseline cubin byte for byte (38640 / 4 / e9cc6998, measured).
+/// for code nvcc compiles to the baseline cubin byte for byte (70264 / 4 / 3eb4db6dd204870d, measured).
 fn raw_poll_call_indices(tokens: &[CodeToken]) -> Vec<usize> {
     let directives = directive_token_mask(tokens);
     // The macros in effect at each position, in source order: whether a name in front of an argument
@@ -3440,8 +3474,8 @@ fn rejection(message: impl Into<String>) -> String {
 #[derive(Debug, PartialEq, Eq)]
 enum UsingTarget {
     /// `using X::__threadfence;` names a member of X, so an unqualified call can resolve to X's
-    /// declaration and the meaning really does change. Measured: nvcc compiled that helper to 38472
-    /// bytes / 2 PTB membar lines / sha 26b31e58... against the 38640 / 4 / e9cc6998 baseline
+    /// declaration and the meaning really does change. Measured: nvcc compiled that helper to 70096
+    /// bytes / 2 PTB membar lines / sha bc0410ca... against the 70264 / 4 / 3eb4db6dd204870d baseline
     /// (round-10 A-2).
     Member(String),
     /// `using namespace X;` where a scanned source defines X with a member carrying a guarded name:
@@ -3467,8 +3501,8 @@ enum UsingTarget {
     /// `using __threadfence = X;` is an alias-declaration, not a using-declaration, and it RE-BINDS
     /// the unqualified name in its scope: nvcc refuses it when the right-hand side is not a type
     /// ("namespace X is not a type name", measured) and compiles the re-binding when it is, where the
-    /// barrier is gone - 38472 bytes / 2 PTB membar lines / sha 26b31e58..., the same cubin as the
-    /// `using X::__threadfence;` member re-bind, against the 38640 / 4 / e9cc6998 baseline
+    /// barrier is gone - 70096 bytes / 2 PTB membar lines / sha bc0410ca..., the same cubin as the
+    /// `using X::__threadfence;` member re-bind, against the 70264 / 4 / 3eb4db6dd204870d baseline
     /// (measured, round-13 A-3).
     Alias,
 }
@@ -3497,7 +3531,7 @@ fn using_declaration_rejection(position: &str, name: &str, target: &UsingTarget)
             "{position}: `using X::{name}<...>;` is a template-id, which nvcc refuses with \"a template-id is not allowed\" (measured). This is a policy rejection, not a claim that {name} changed meaning"
         ),
         UsingTarget::Alias => format!(
-            "{position}: `using {name} = ...;` is an alias-declaration that re-binds the unqualified {name} in its scope: nvcc refuses it when the right-hand side is not a type (\"namespace X is not a type name\") and compiles the re-binding when it is, which loses the barrier - 38472 bytes / 2 PTB membar lines / sha 26b31e58... against the 38640 / 4 / e9cc6998 baseline (measured). This scan refuses the shape rather than certify it"
+            "{position}: `using {name} = ...;` is an alias-declaration that re-binds the unqualified {name} in its scope: nvcc refuses it when the right-hand side is not a type (\"namespace X is not a type name\") and compiles the re-binding when it is, which loses the barrier - 70096 bytes / 2 PTB membar lines / sha bc0410ca... against the 70264 / 4 / 3eb4db6dd204870d baseline (measured). This scan refuses the shape rather than certify it"
         ),
     }
 }
@@ -3577,8 +3611,8 @@ fn is_the_library_non_returning_call(
 /// A bare block runs unconditionally like the statements around it; a lambda's body does not run until
 /// the closure is called, and a class, struct, namespace, enum or union body is not on the helper's
 /// path at all. The round-10 reviewer compiled `auto l = [] { __threadfence(); }; (void)l;` into
-/// 38472 bytes with 2 PTB membar lines (sha 26b31e58...), one barrier short of the 38640 / 4 /
-/// e9cc6998 baseline, while the called version was byte-identical to it - so the fence in the closure
+/// 70096 bytes with 2 PTB membar lines (sha bc0410ca...), one barrier short of the 70264 / 4 /
+/// 3eb4db6dd204870d baseline, while the called version was byte-identical to it - so the fence in the closure
 /// is a nested, conditional fence, not the acquire.
 ///
 /// A `]` anywhere in the statement catches every lambda spelling, including `[&] { ... }` and
@@ -3621,7 +3655,7 @@ fn opens_a_lambda_or_a_type_body(tokens: &[CodeToken], history: &[usize]) -> boo
 /// A `return` inside a lambda exits the LAMBDA, and a `return` inside a member function of a local
 /// type exits that MEMBER. Neither is the helper's path - the helper reaches its acquire either way -
 /// so every reading that looks for an exit standing on the helper's path skips both. nvcc compiles
-/// `struct S { void run() { return; } };` before the poll to the baseline 38640 / 4 / e9cc6998 with
+/// `struct S { void run() { return; } };` before the poll to the baseline 70264 / 4 / 3eb4db6dd204870d with
 /// the acquire present, and round 31 A2 found that the class-body spelling was refused with the
 /// unreachability sentence, which was false of it.
 ///
@@ -3631,14 +3665,15 @@ fn opens_a_lambda_or_a_type_body(tokens: &[CodeToken], history: &[usize]) -> boo
 /// baseline (round 28 A2). The walk stops at `floor`, the opening brace of the block the caller is
 /// reading - the helper's own body in all three readings - so a lambda or a type defined outside the
 /// helper cannot make this true, which is what keeps a bare block at statement level refused (it
-/// compiles to 38272 / 2 / 041d46b0, and the reason it is refused with is then true).
+/// compiles to 70280 / 2 / bdd743727ff53afd, and the reason it is refused with is then true).
 ///
 /// Round 32 A3: the excuse is that the exit leaves the LAMBDA and the helper still reaches its
 /// acquire. For a lambda the source does not call that holds, because the body never runs; for a
 /// lambda the source CALLS right there it only holds if the body can RETURN.
 /// `(void)([&]{ __trap(); return 0u; })();` before the poll is the counter-example: the trap ends
 /// the helper, the acquire after it never runs, and nvcc compiles the text to
-/// 37872 / 4 / 54cda5bc - the cubin this file already refuses as `__trap();` before the poll, so
+/// 69368 / 4 / c28d450c6b01fcdd (37872 / 4 / 54cda5bc pre-change) - the cubin this file already
+/// refuses as `__trap();` before the poll, so
 /// the module's one-cubin-one-verdict rule applies: a CALLED lambda body that holds a
 /// non-returning call of its own is not a body the helper does not own. A `return` does not make
 /// the body non-returning - it returns to the caller - so `(void)([&]{ return; })();` stays
@@ -3693,7 +3728,8 @@ fn a_lambda_body_is_called_at(tokens: &[CodeToken], open: usize) -> bool {
 /// run only if the statement does. `(void)([&]{ { __trap(); } return 0u; })();` before the poll is
 /// the round-33 A1 counter-example to the narrower rule round 32 shipped: the brace is a bare
 /// block, the trap runs exactly as it does unbraced, and the text is the same program as the
-/// unbraced spelling this file already refuses as 37872 / 4 / 54cda5bc. A trap behind a control
+/// unbraced spelling this file already refuses as 69368 / 4 / c28d450c6b01fcdd (37872 / 4 /
+/// 54cda5bc pre-change). A trap behind a control
 /// statement - `[&]{ if (c) { __trap(); } return 0u; }()` - is still not counted, because it is
 /// conditional on `c` and the acquire after it still runs.
 fn a_called_lambda_body_cannot_return(tokens: &[CodeToken], open: usize) -> bool {
@@ -4144,8 +4180,8 @@ struct MacroDefinition {
 ///
 /// Suspicion still propagates through the names a replacement list mentions to a fixed point, exactly
 /// as before - `#define OUTER INNER` beside `#define INNER if (observed != 0u)` is the round-8 shape,
-/// which nvcc compiled to 38624 bytes with 3 PTX membar lines (sha e5b9d6...) while the baseline is
-/// 38640 / 4 / e9cc6998 - but the reverse edges are indexed by name and each one is walked once. The
+/// which nvcc compiled to 38624 bytes with 3 PTX membar lines (sha e5b9d6...) (pre-change) while the baseline is
+/// 70264 / 4 / 3eb4db6dd204870d - but the reverse edges are indexed by name and each one is walked once. The
 /// previous implementation re-scanned every body each time it learned a name, so a chain of N
 /// definitions cost O(N^2) body scans over a growing name list: the round-10 review measured a
 /// 400-link chain at 0.7-1.0 s and a 4000-link chain that did not finish inside 120 s. This one
@@ -4383,8 +4419,8 @@ fn macro_body_is_a_type(body: &[CodeToken]) -> bool {
 ///
 /// Round-20 A1 split this out of the old `macro_body_is_control`, which counted the operators too. A
 /// body that carries only an operator does not bound the path by itself - `#define PRE (deadline > 0u)
-/// && true` then `const bool ran = PRE;` before the poll compiles to the 38640 / 4 / e9cc6998 baseline,
-/// while `#define BAIL return` then `BAIL;` before the poll compiles to 36520 / 2 / d251dcf7 - not the
+/// && true` then `const bool ran = PRE;` before the poll compiles to the 70264 / 4 / 3eb4db6dd204870d baseline,
+/// while `#define BAIL return` then `BAIL;` before the poll compiles to 68400 / 2 / 83ac2db363499ff3 - not the
 /// baseline. The operators keep the rule below.
 ///
 /// The one recognised no-op spelling is the `do { } while (0)` idiom: it runs its body once and falls
@@ -4566,13 +4602,13 @@ fn suspicious_macro_in_poll_statement(
 ///     while the text defines the helper, is rejected instead of guessed at: the acquire pairs with
 ///     one observation, and the lint will not decide on the developer's behalf which call that is
 ///     (round-14 A-1; the two-poll refusal is conservative - a helper body that calls the poll twice
-///     is valid C++ and nvcc compiles it, to 39112 bytes / 3 PTX membar lines / sha 07aa2c1d...
-///     against the 38640 / 4 / e9cc6998 baseline, measured - the shipped helper observes once, and a
+///     is valid C++ and nvcc compiles it, to 39112 bytes / 3 PTX membar lines / sha 07aa2c1d... (pre-change)
+///     against the 70264 / 4 / 3eb4db6dd204870d baseline, measured - the shipped helper observes once, and a
 ///     second observation is a change this guard will not certify on the developer's behalf). The
 ///     poll it follows is the HELPER's own call, not the first call of that name
 ///     in the text - a forward declaration, a function-pointer parameter and an earlier polling
 ///     function all name the raw poll without being the observation, and each of those headers
-///     compiles to the baseline cubin (38640 / 4 / e9cc6998, measured);
+///     compiles to the baseline cubin (70264 / 4 / 3eb4db6dd204870d, measured);
 ///
 /// What this does NOT catch, stated so that the claim is no wider than the code: a non-returning
 /// callee that is not on NON_RETURNING_CALLS, or one reached through a function pointer, a macro or
@@ -4646,7 +4682,7 @@ pub fn acquire_fence_after_poll(source: &str, poll: &str) -> Result<(), String> 
             // dereferenced or addressed, and whatever expression the call stands in. What is refused
             // is a mention that is NOT a call: a declaration in any return-type spelling, a
             // function-pointer declarator, an attribute between the type and the name. Those bodies
-            // omit the call and compile to something other than the baseline (38416 / 3 / 1bbf93f5,
+            // omit the call and compile to something other than the baseline (70424 / 3 / c78fa93b686e2df7,
             // measured), while every call shape - including the ones an earlier rule refused as
             // "wrapped in a comparison" - is a translation unit whose cubin the module documentation
             // lists.
@@ -4655,7 +4691,7 @@ pub fn acquire_fence_after_poll(source: &str, poll: &str) -> Result<(), String> 
             // follows - but it IS a poll the scan cannot place, and the structural check refuses the
             // body for it. Accepting the shape whenever a compiled poll also existed made a SILENT
             // second observation possible: `#if M4_FLAG` around a first poll, then an unconditional
-            // poll and the fence, compiles under -DM4_FLAG=1 to two real polls (39072 / 95e0cf41)
+            // poll and the fence, compiles under -DM4_FLAG=1 to two real polls (39072 / 95e0cf41 (pre-change))
             // whose one acquire pairs with the second only, while without the define it is the
             // baseline. Both checks now refuse it, and with the same sentence, so the agreement is
             // whole-message equality rather than a matching verdict.
@@ -4888,7 +4924,7 @@ pub fn acquire_fence_after_poll(source: &str, poll: &str) -> Result<(), String> 
     // The first fence this walk saw inside a nested body, recorded rather than reported. The
     // structural check records the same thing and only reports it when the body has NO top-level
     // fence, and the two checks have to agree: `auto l = [] { __threadfence(); }; (void)l;
-    // __threadfence();` is the baseline cubin byte for byte (38640 / 4 / e9cc6998) and this walk used
+    // __threadfence();` is the baseline cubin byte for byte (70264 / 4 / 3eb4db6dd204870d) and this walk used
     // to reject it on the lambda's fence before ever reaching the real acquire (round-12 A1).
     let mut nested_fence: Option<usize> = None;
     // Round-25 A2: a fence the preprocessor may not compile is a FALLBACK candidate, not an immediate
@@ -4913,9 +4949,9 @@ pub fn acquire_fence_after_poll(source: &str, poll: &str) -> Result<(), String> 
     // the call and is never the acquire - but the arguments are still READ for control flow. A `return`,
     // a control keyword or a call that never returns inside them ends the path just as it would in front
     // of the poll: `spark_wait_for_flag((__trap(), flag), deadline); __threadfence(); return observed;`
-    // compiles to 37872 / 4 / 54cda5bc, byte-identical to the trap-before-the-poll statement body that
-    // both checks refuse, and `({ return 0u; flag; })` as the first argument compiles to 38272 / 2 /
-    // 041d46b0. Reading the span is what keeps the verdict a function of the compiled shape.
+    // compiles to 69368 / 4 / c28d450c6b01fcdd, byte-identical to the trap-before-the-poll statement body that
+    // both checks refuse, and `({ return 0u; flag; })` as the first argument compiles to 70280 / 2 /
+    // bdd74372. Reading the span is what keeps the verdict a function of the compiled shape.
     let argument_span = call_argument_list(&tokens, start)
         .and_then(|(_, open)| matching_close_bracket(&tokens, open).map(|close| (open, close)));
     let mut index = call_argument_list(&tokens, start)
@@ -4926,7 +4962,7 @@ pub fn acquire_fence_after_poll(source: &str, poll: &str) -> Result<(), String> 
         // A macro whose body returns or traps is a blocker here too - the structural check read it and
         // the lint did not, so the two answered the same compiled body differently
         // (`spark_wait_for_flag(({ BAIL; flag; }), deadline);` with `#define BAIL return 0u` is
-        // 38272 / 2 / 041d46b0, the cubin of the literal return-in-argument shape both refuse). A
+        // 70280 / 2 / bdd743727ff53afd, the cubin of the literal return-in-argument shape both refuse). A
         // LAMBDA body is skipped, because a `return` there exits the lambda (the docs have promised
         // that since round 10, and `spark_wait_for_flag(([&]{ return flag; })(), deadline);` compiles
         // to the baseline with the acquire present), and a bare `if`/`while`/`for`/`switch` is not a
@@ -5301,7 +5337,7 @@ fn poll_designator_end(body: &[String]) -> Option<usize> {
 ///
 /// Round-22 A2: the designator may be parenthesised on its own - `#define P
 /// (spark_wait_for_flag)(flag, deadline)` - which is the same call as the bare name and compiles to the
-/// same baseline cubin (38640 / 4 / e9cc6998, measured). Neither rule read it: the designator rule
+/// same baseline cubin (70264 / 4 / 3eb4db6dd204870d, measured). Neither rule read it: the designator rule
 /// wants the name to be the WHOLE replacement list, and this rule wanted the bare name to come first,
 /// so an ordinary spelling of the call fell between them and was refused.
 /// The slice inside one pair of parentheses that wraps the WHOLE slice, or [`None`] when the slice is
@@ -5565,8 +5601,8 @@ fn function_body_tokens(tokens: &[CodeToken], name: &str) -> Option<(usize, usiz
 /// conditional the guard cannot resolve is rejected, because the compiler may not take it. A macro
 /// whose body hides a control keyword IS analysed here too, in the lint's own words (round-20 A1): the
 /// round-19 review found that the lint refused `#define BAIL return` then `BAIL;` before the poll while
-/// this check accepted it, and nvcc compiles that text to 36520 / 2 / d251dcf7 rather than to the
-/// 38640 / 4 / e9cc6998 baseline, so accepting it was the wrong verdict rather than a stricter one.
+/// this check accepted it, and nvcc compiles that text to 68400 / 2 / 83ac2db363499ff3 rather than to the
+/// 70264 / 4 / 3eb4db6dd204870d baseline, so accepting it was the wrong verdict rather than a stricter one.
 ///
 /// # Errors
 /// Returns the line of the defect and the reason, so a test can assert on each mutation.
@@ -5575,8 +5611,8 @@ pub fn acquire_helper_fences_unconditionally(header: &str) -> Result<(), String>
     // A using-declaration that re-binds a guarded name is the same rewrite as a #define, and it has
     // to be refused here because the bare call in this body is the thing it redirects (round-10 A-2):
     // `using X::__threadfence;` beside `namespace X { void __threadfence() {} }` made the acquire
-    // call X's no-op, and nvcc compiled that kernel to 38472 bytes / 2 PTB membar lines / sha
-    // 26b31e58... against the 38640 / 4 / e9cc6998 baseline.
+    // call X's no-op, and nvcc compiled that kernel to 70096 bytes / 2 PTB membar lines / sha
+    // bc0410ca... against the 70264 / 4 / 3eb4db6dd204870d baseline.
     if let Some((_, line, name, target)) =
         guarded_names_brought_into_scope(&[(COMMON_HEADER_NAME, header)])
     {
@@ -5604,7 +5640,7 @@ pub fn acquire_helper_fences_unconditionally(header: &str) -> Result<(), String>
     // argument list, whatever the designator's parentheses and whatever expression the call stands in.
     // A mention that is not a call - a declaration, a function-pointer declarator, an attribute
     // between the type and the name - is refused rather than read as a call, because those bodies
-    // compile to something other than the baseline (38416 / 3 / 1bbf93f5, measured).
+    // compile to something other than the baseline (70424 / 3 / c78fa93b686e2df7, measured).
     let mentions = raw_poll_mentions(&tokens, open, close);
     // The fence and the index its own statement starts at (a global `::` belongs to the designator).
     let mut top_fence: Option<(usize, usize)> = None;
@@ -5632,7 +5668,7 @@ pub fn acquire_helper_fences_unconditionally(header: &str) -> Result<(), String>
     let mut blockers: Vec<(usize, bool, bool, usize)> = Vec::new();
     // Every USE of a macro that can bound the path before the poll - `#define BAIL return` then `BAIL;`.
     // Round-20 A1: the lint refused these and this check accepted them, which was the wrong verdict: nvcc
-    // compiles that text to 36520 / 2 / d251dcf7 rather than to the 38640 / 4 / e9cc6998 baseline.
+    // compiles that text to 68400 / 2 / 83ac2db363499ff3 rather than to the 70264 / 4 / 3eb4db6dd204870d baseline.
     let mut suspicious_macro_uses: Vec<usize> = Vec::new();
     // Every `;` of the body with its brace depth: the separator that ends the fence's statement is a
     // `;` at the same depth as the operator, and the `;` of `int z = 0;` inside a statement
@@ -5652,9 +5688,9 @@ pub fn acquire_helper_fences_unconditionally(header: &str) -> Result<(), String>
             // `do` and `try` name a body directly; anything else opens a bare block, which executes
             // unconditionally like the statements around it. A lambda's or a type's body is not bare
             // either (round-10 A-3): the fence in `auto l = [] { __threadfence(); };` runs only if
-            // the closure is called, and nvcc compiled that helper to 38472 bytes with 2 PTB membar
-            // lines (sha 26b31e58...) while the called version was byte-identical to the 38640 / 4 /
-            // e9cc6998 baseline.
+            // the closure is called, and nvcc compiled that helper to 70096 bytes with 2 PTB membar
+            // lines (sha bc0410ca...) while the called version was byte-identical to the 70264 / 4 /
+            // 3eb4db6dd204870d baseline.
             // `requires` is in the list because nothing inside a requires-expression is executed,
             // so a fence there is not the acquire even though it sits in braces (round-11 A1).
             // An attribute standing between a head and its brace does not change which body this
@@ -5695,7 +5731,7 @@ pub fn acquire_helper_fences_unconditionally(header: &str) -> Result<(), String>
             if let Some(designator) = global_fence_designator(&tokens, &code_history, designator) {
                 // Round-24 A2: a fence the guard cannot resolve is a FALLBACK candidate, not a refusal.
                 // `poll; __threadfence(); #if M4_FLAG __threadfence(); #endif; return observed;`
-                // preprocesses without the define to exactly the shipped body - 38640 / 4 / e9cc6998,
+                // preprocesses without the define to exactly the shipped body - 70264 / 4 / 3eb4db6dd204870d,
                 // the committed baseline - so the unconditional fence is the acquire and the later
                 // conditional one is irrelevant. Refusing on sight made this check refuse a baseline
                 // body while the lint accepted it, with a reason that was simply false. This candidate
@@ -5715,7 +5751,7 @@ pub fn acquire_helper_fences_unconditionally(header: &str) -> Result<(), String>
                 // this check refuse `__threadfence(); spark_wait_for_flag(flag, deadline);
                 // __threadfence(); return observed;` with "precedes the poll" while the lint accepted
                 // it. The reviewer measured that shape: the extra fence before the poll is the only
-                // delta and it is 38784 bytes / 5 PTB membar lines / sha fc675480, so the acquire after
+                // delta and it is 70280 bytes / 5 PTB membar lines / sha edc82991, so the acquire after
                 // the poll is present and the LINT is right. Fences before the poll are ignored here,
                 // exactly as the lint ignores them.
                 if bare_blocks.iter().all(|&bare| bare) {
@@ -5744,10 +5780,10 @@ pub fn acquire_helper_fences_unconditionally(header: &str) -> Result<(), String>
             // which executes BEFORE the call - was read as the acquire of that observation, and the
             // verdict stopped being a function of the compiled shape: the statement-expression fence
             // `spark_wait_for_flag(({ __threadfence(); flag; }), deadline); return observed;` was
-            // ACCEPTED here and refused by the lint, while it compiles to 38624 / 3 / e638d56e, the same
+            // ACCEPTED here and refused by the lint, while it compiles to 70120 / 3 / 2311607a03dcec7a, the same
             // cubin as the plain fence-before-the-poll body both checks refuse. With the real acquire
             // after it, `spark_wait_for_flag((__threadfence(), flag), deadline); __threadfence();` was
-            // REFUSED here and accepted by the lint, and it compiles to 38784 / 5 / fc675480, the cubin
+            // REFUSED here and accepted by the lint, and it compiles to 70280 / 5 / edc829917a67de53, the cubin
             // of the accepted fence-before-and-after shape. A fence in the arguments is never the
             // acquire, and nothing inside the arguments stands between the poll and its fence.
             let (after_the_call, argument_span) = call_argument_list(&tokens, cursor)
@@ -5762,9 +5798,9 @@ pub fn acquire_helper_fences_unconditionally(header: &str) -> Result<(), String>
                 // control flow. Round 23 skipped it entirely, which made the scan stop reading a
                 // `return`, a control keyword or a non-returning call inside the poll's own arguments:
                 // `spark_wait_for_flag((__trap(), flag), deadline); __threadfence(); return observed;`
-                // was ACCEPTED although it compiles to 37872 / 4 / 54cda5bc, the cubin of the
+                // was ACCEPTED although it compiles to 69368 / 4 / c28d450c6b01fcdd, the cubin of the
                 // trap-before-the-poll statement body both checks refuse, and `({ return 0u; flag; })`
-                // as the first argument compiles to 38272 / 2 / 041d46b0. The lint reads the same span
+                // as the first argument compiles to 70280 / 2 / bdd743727ff53afd. The lint reads the same span
                 // now, so the two cannot diverge on the shape the compiler sees.
                 // Round-25 A3: the reading is the lint's reading. A lambda body is skipped - a
                 // `return` there exits the lambda, not the helper, and refusing
@@ -5937,9 +5973,9 @@ pub fn acquire_helper_fences_unconditionally(header: &str) -> Result<(), String>
     };
     // Round-20 A1 and round-21 A1: a use of a suspicious macro is refused in the LINT's own words,
     // because the lint refuses these texts and this check used to accept some of them. The macro can
-    // leave the helper before the acquire runs, and every measured one differs from the 38640 / 4 /
-    // e9cc6998 baseline: `BAIL;` before the poll is 36520 / 2 / d251dcf7 (round 20), and `BAIL;`
-    // after it in a later, completed statement is 36896 / 2 / 75beed7f (round 21, where this check
+    // leave the helper before the acquire runs, and every measured one differs from the 70264 / 4 /
+    // 3eb4db6dd204870d baseline: `BAIL;` before the poll is 68400 / 2 / 83ac2db363499ff3 (round 20), and `BAIL;`
+    // after it in a later, completed statement is 68904 / 2 / 1068c6b80f2508ea (round 21, where this check
     // accepted the text and the lint refused it).
     //
     // The scope is the LINT's, exactly: every use that stands before the FENCE. The lint reads a use
@@ -6013,8 +6049,8 @@ pub fn acquire_helper_fences_unconditionally(header: &str) -> Result<(), String>
     // `;` at the operator's own brace depth: the `;` inside a statement expression or a lambda body
     // belongs to the inner statement, and reading it as the end of the operator's statement let
     // `(observed == 0u) && ({ int z = 0; __threadfence(); z; });` through (round-10 A-1, where nvcc
-    // dropped a barrier: 38624 bytes / 3 PTB membar lines / sha d64426bf... against the 38640 / 4 /
-    // e9cc6998 baseline). The keywords and the early exits keep the conservative reading, because
+    // dropped a barrier: 38624 bytes / 3 PTB membar lines / sha d64426bf... (pre-change) against the 70264 / 4 /
+    // 3eb4db6dd204870d baseline). The keywords and the early exits keep the conservative reading, because
     // nothing here bounds a branch or a loop in front of the fence.
     // The poll's own designator, from its first token to the name: `(poll)`, `(*poll)`, `(&poll)` are
     // calls, and the `&` of the last one is not the bitwise operator a blocker scan would read it as
@@ -6094,8 +6130,8 @@ const COMMON_HEADER_NAME: &str = "m4_common_sm121.cuh";
 /// A using-declaration rewrites what an unqualified name denotes exactly as a `#define` does, and
 /// the round-10 A-2 hole shows why that matters: with `namespace X { __device__ void
 /// __threadfence() {} }` and `using X::__threadfence;` beside the bare call, the helper's
-/// `__threadfence();` calls X's no-op, and nvcc compiled the kernel to 38472 bytes with 2 PTB membar
-/// lines (sha 26b31e58...) where the baseline is 38640 / 4 / e9cc6998. Both checks accepted it,
+/// `__threadfence();` calls X's no-op, and nvcc compiled the kernel to 70096 bytes with 2 PTB membar
+/// lines (sha bc0410ca...) where the baseline is 70264 / 4 / 3eb4db6dd204870d. Both checks accepted it,
 /// because the text of the call is unchanged.
 ///
 /// A using-DIRECTIVE cannot be resolved by a text scanner in general, so it is caught in the case the
@@ -7343,7 +7379,7 @@ __threadfence();
     ///
     /// Every rejection here is a shape nvcc compiles to FEWER barriers than the committed baseline,
     /// and every acceptance is one it compiles to the baseline cubin byte for byte (nvcc 12.9.1,
-    /// sm_121a, measured in the container: 38640 bytes, 4 PTX membar lines, sha256 e9cc6998...), so an
+    /// sm_121a, measured in the container: 70264 bytes, 4 PTX membar lines, sha256 3eb4db6dd204870d), so an
     /// unnecessary rejection and a real hole both surface as a failing assertion here rather than as a
     /// claim in a comment.
     #[test]
@@ -7356,9 +7392,9 @@ __threadfence();
         // (A1) a non-returning call that is NOT a statement of its own. Requiring a semicolon after
         // the argument list missed the whole class, and nvcc moved in every measurable spelling of
         // it: with (__builtin_unreachable(), 0u), with uint32_t bail = (__builtin_unreachable(), 0u)
-        // and with (observed, __builtin_unreachable()) mega_mhc compiled to 36696 bytes with 2 membar
-        // lines (sha 363f46...) instead of the baseline 38640 / 4 / e9cc6998, and (__trap(), 0u)
-        // compiled to 38232 bytes (sha 7455986b...) with the four barrier instructions present but
+        // and with (observed, __builtin_unreachable()) mega_mhc compiled to 36696 bytes with 2 membar (pre-change)
+        // lines (sha 363f46...) instead of the baseline 70264 / 4 / 3eb4db6dd204870d, and (__trap(), 0u)
+        // compiled to 38232 bytes (sha 7455986b...; pre-change) with the four barrier instructions present but
         // unreachable behind the trap. The last fixture, wrap(__builtin_unreachable()), pins the same
         // rule in a position nvcc refuses outright - the builtin returns void, so it cannot be an
         // argument at all - which is also why pinning it costs nothing: a shape that does not compile
@@ -7426,7 +7462,7 @@ __threadfence();
         }
 
         // (A3) only the unqualified or globally qualified name is this barrier. With a namespace
-        // member named __threadfence, X::__threadfence(); compiled mega_mhc to 38472 bytes with 2
+        // member named __threadfence, X::__threadfence(); compiled mega_mhc to 70096 bytes with 2
         // membar lines (sha 26b31e...) - a silently missing acquire - while ::__threadfence(); is the
         // real global function and compiles to the baseline cubin byte for byte.
         let qualified = COMMON_HEADER.replace("    __threadfence();", "    X::__threadfence();");
@@ -7499,7 +7535,7 @@ __threadfence();
 
         // (A4) a nested expansion no longer launders a conditional fence. The inner macro carries the
         // if, so the fence inside OUTER { ... } is conditional; nvcc compiled that body to 38624
-        // bytes with 3 membar lines (sha e5b9d6...), one barrier short of the baseline. The names this
+        // bytes with 3 membar lines (sha e5b9d6...) (pre-change), one barrier short of the baseline. The names this
         // source defines are followed to a fixed point, and the message says which macro is which.
         let nested = format!(
             "#define OUTER INNER\n#define INNER if (observed != 0u)\n{}",
@@ -8273,8 +8309,8 @@ __threadfence();
     #[test]
     fn the_holes_and_the_false_rejections_are_closed() {
         // A-1: a `;` nested inside a brace does not end the operator's statement. nvcc compiled this
-        // body to 38624 bytes / 3 PTB membar lines / sha d64426bf..., byte for byte the conditional
-        // fence the round-3 shape produces and one barrier short of the 38640 / 4 / e9cc6998 baseline.
+        // body to 38624 bytes / 3 PTB membar lines / sha d64426bf... (pre-change), byte for byte the conditional
+        // fence the round-3 shape produces and one barrier short of the 70264 / 4 / 3eb4db6dd204870d baseline.
         let statement_expression = COMMON_HEADER.replace(
             HELPER_ANCHOR,
             r"    (observed == 0u) && ({ int z = 0; __threadfence(); z; });
@@ -8326,7 +8362,7 @@ __threadfence();
 
         // A-2: a using-declaration re-binds the name exactly as a #define does. With
         // `namespace X { __device__ void __threadfence() {} }` and this declaration, nvcc compiled
-        // the kernel to 38472 bytes / 2 PTB membar lines / sha 26b31e58..., the same hole as the
+        // the kernel to 70096 bytes / 2 PTB membar lines / sha bc0410ca..., the same hole as the
         // qualified call the round-9 review found, and both checks accepted it.
         let using_declaration = COMMON_HEADER.replace(
             HELPER_ANCHOR,
@@ -8371,9 +8407,9 @@ __threadfence();
             "A-2 using-directive: {error}"
         );
 
-        // A-3: a lambda's body is not a bare block. nvcc compiled the uncalled closure into 38472
-        // bytes / 2 PTB membar lines / sha 26b31e58... and the called one byte for byte to the
-        // 38640 / 4 / e9cc6998 baseline; the checks reject both, which is the canonical-form policy
+        // A-3: a lambda's body is not a bare block. nvcc compiled the uncalled closure into 70096
+        // bytes / 2 PTB membar lines / sha bc0410ca... and the called one byte for byte to the
+        // 70264 / 4 / 3eb4db6dd204870d baseline; the checks reject both, which is the canonical-form policy
         // (the closure is not the acquire, and the message says what to write).
         let uncalled_closure = COMMON_HEADER.replace(
             HELPER_ANCHOR,
@@ -8417,7 +8453,7 @@ __threadfence();
         // A-4: four false rejections. A member function, another scope's function, a declaration and a
         // name this source defines as a harmless macro are not the library function that never
         // returns; nvcc compiled each of these four bodies to the baseline cubin byte for byte
-        // (38640 / 4 / e9cc6998), while the bare `abort();` and the host-qualified forms do not
+        // (70264 / 4 / 3eb4db6dd204870d), while the bare `abort();` and the host-qualified forms do not
         // compile in device code at all.
         let member_abort =
             COMMON_HEADER.replace(HELPER_ANCHOR, &format!("    s.abort(1u);\n{HELPER_ANCHOR}"));
@@ -8474,7 +8510,7 @@ __threadfence();
 
         // A-5: the preprocessor is positional, so a definition after the use cannot make the use a
         // `return`; treating it as if it stood at the top rejected real code, and nvcc compiled this
-        // body to the baseline cubin byte for byte (38640 / 4 / e9cc6998).
+        // body to the baseline cubin byte for byte (70264 / 4 / 3eb4db6dd204870d).
         const POLL: &str = "spark_wait_for_flag(&flag, deadline)";
         let definition_after_the_use = r"int FLAG;
 spark_wait_for_flag(&flag, deadline);
@@ -8501,7 +8537,7 @@ __threadfence();
         );
 
         // A-6: a fence reached through a cast expression. nvcc compiled this body to the baseline
-        // cubin byte for byte (38640 / e9cc6998 / 4), so the rejection is a policy decision and not a
+        // cubin byte for byte (70264 / 3eb4db6dd204870d / 4), so the rejection is a policy decision and not a
         // claim that the fence is conditional: the scanner does not resolve a cast, and both messages
         // name the canonical form to write instead.
         let cast_call = COMMON_HEADER.replace(
@@ -8568,8 +8604,8 @@ __threadfence();
     #[test]
     fn the_written_claims_are_exact() {
         // ---- A1, accepted list: the shapes the code accepts that the doc did not name. nvcc compiles
-        // every one of these to the baseline cubin (38640 bytes / 4 PTB membar lines / sha
-        // e9cc6998...), which is why they are enumerated rather than rejected.
+        // every one of these to the baseline cubin (70264 bytes / 4 PTB membar lines / sha
+        // 3eb4db6dd204870d), which is why they are enumerated rather than rejected.
         for (label, body) in [
             (
                 "a bare block with a statement before the fence",
@@ -8647,7 +8683,7 @@ __threadfence();
         }
 
         // ---- A2 rejected list, with a reason that is true. An empty if body cannot bound the path,
-        // and nvcc compiled it to the baseline cubin byte for byte (38640 / 4 / e9cc6998), so the
+        // and nvcc compiled it to the baseline cubin byte for byte (70264 / 4 / 3eb4db6dd204870d), so the
         // message must not claim the fence is not guaranteed: it says the scan does not read a
         // construct's body. A lambda whose return belongs to the LAMBDA is not in this list at all -
         // round 27 moved it to the ACCEPTANCE assertions below, where its baseline cubin belongs. The
@@ -8660,7 +8696,7 @@ __threadfence();
             ),
             // The row that used to stand here - `auto f = [&] { if (...) return; }; (void)f;` before the
             // poll - is no longer in this list: round 27 A2 asserts it as ACCEPTANCE below, because the
-            // return exits the LAMBDA and nvcc compiles the body to the baseline 38640 / 4 / e9cc6998.
+            // return exits the LAMBDA and nvcc compiles the body to the baseline 70264 / 4 / 3eb4db6dd204870d.
             (
                 "an if whose condition is an operator",
                 r"    if (observed != 0u && deadline == 0u) { }",
@@ -8687,8 +8723,8 @@ __threadfence();
             }
         }
         // Round-27 A2: the lambda case asserts ACCEPTANCE, on both sides, because the return exits the
-        // lambda, the statement completes, and nvcc compiles the body to the baseline 38640 / 4 /
-        // e9cc6998. A lambda body's exit before the poll is not this helper's path.
+        // lambda, the statement completes, and nvcc compiles the body to the baseline 70264 / 4 /
+        // 3eb4db6dd204870d. A lambda body's exit before the poll is not this helper's path.
         {
             let body = r"    auto f = [&] { if (observed != 0u) return; };
     (void)f;
@@ -8742,9 +8778,9 @@ __threadfence();
         // ---- A4: the two limits the doc lists and the tests did not exercise. Neither is a shape the
         // scan could have recognised: the scan reads one source at a time, so a name defined in an
         // included file is not expanded, and a keyword built by token pasting is two identifiers to
-        // the tokenizer. Measured here, against the 38640 / 4 / e9cc6998 baseline: a name defined in an
-        // included file as a return and a ##-assembled return each compile the helper to 36896 bytes /
-        // 2 PTB membar lines / sha 75beed7f... - the reviewer's numbers, reproduced - which is why the
+        // the tokenizer. Measured here, against the 70264 / 4 / 3eb4db6dd204870d baseline: a name defined in an
+        // included file as a return and a ##-assembled return each compile the helper to 68904 bytes /
+        // 2 PTB membar lines / sha 1068c6b8... - the reviewer's numbers, reproduced - which is why the
         // not-seen list is a list of consequences rather than a footnote.
         let from_an_included_header = COMMON_HEADER.replace(
             HELPER_ANCHOR,
@@ -8781,10 +8817,10 @@ __threadfence();
         );
 
         // ---- A5: the using-declaration reason. A using-declaration for the global barrier still
-        // names the barrier and nvcc compiles that body to the baseline cubin byte for byte (38640 /
-        // 4 / e9cc6998), so the message must say the rejection is a policy one rather than claim the
+        // names the barrier and nvcc compiles that body to the baseline cubin byte for byte (70264 /
+        // 4 / 3eb4db6dd204870d), so the message must say the rejection is a policy one rather than claim the
         // name changed meaning; a using-declaration for a namespace member is the case where the
-        // meaning really does change (38472 / 2 / 26b31e58).
+        // meaning really does change (70096 / 2 / bc0410cac99ba3e6).
         let global_using = COMMON_HEADER.replace(
             HELPER_ANCHOR,
             r"    using ::__threadfence;
@@ -8830,7 +8866,7 @@ __threadfence();
         );
 
         // ---- R12 A4: an attribute-specifier before the fence. Both placements compile to the
-        // baseline cubin byte for byte (38640 / 4 / e9cc6998, measured), so the fence is accepted
+        // baseline cubin byte for byte (70264 / 4 / 3eb4db6dd204870d, measured), so the fence is accepted
         // rather than refused, and the statement-start rule the two checks share now looks past the
         // whole [[...]] instead of reading its closing bracket as an expression.
         for (label, body) in [
@@ -8860,7 +8896,7 @@ __threadfence();
 
         // ---- R12 A1, first disagreement: a nested fence is not reported while a top-level fence
         // follows it. Both checks accept the shape, and nvcc compiled it to the baseline cubin byte
-        // for byte (38640 / 4 / e9cc6998); the lint used to reject the lambda's fence before it ever
+        // for byte (70264 / 4 / 3eb4db6dd204870d); the lint used to reject the lambda's fence before it ever
         // reached the real acquire.
         let lambda_then_top = COMMON_HEADER.replace(
             HELPER_ANCHOR,
@@ -9293,8 +9329,8 @@ __threadfence();
     /// VARIABLE declaration with two initializer values ("too many initializer values"), so it is not
     /// a translation unit and no cubin is claimed for it; a block-scope function declaration is
     /// accepted by nvcc, so the twin that spells the parameters as types IS a translation unit, and the
-    /// round-15 evidence compiles it to 38416 bytes / 3 PTB membar lines / sha 1bbf93f5d5ca1767 against
-    /// the 38640 / 4 / e9cc6998f6a5 baseline for THREE of the four return types: the typedef, the
+    /// round-15 evidence compiles it to 70424 bytes / 3 PTB membar lines / sha c78fa93b686e2df7 against
+    /// the 70264 / 4 / 3eb4db6dd204870d baseline for THREE of the four return types: the typedef, the
     /// `decltype` and the source-macro declarations. The class-template twin is not a translation unit -
     /// nvcc reports the non-template declaration as incompatible with the poll's own - so that one is
     /// pinned as tokens only, and the function-template form beside the helper is what is measured for
@@ -9351,7 +9387,7 @@ __threadfence();
                     )
                     .replace("    return observed;", "    return 0u;");
             // The compilable twin: a block-scope function declaration, which nvcc accepts, and the
-            // exact text the round-15 evidence measures at 38416 / 3 / 1bbf93f5d5ca1767.
+            // exact text the round-15 evidence measures at 70424 / 3 / c78fa93b686e2df7.
             let type_parameter_twin = format!("#include <stdint.h>\n{prefix}{COMMON_HEADER}")
                 .replace(
                     poll_line,
@@ -9653,7 +9689,7 @@ __threadfence();
         // sentence. Round-23 A3 corrected this. The lint used to read the text as "no compiled poll"
         // and accept any body that also held a compiled poll, while the structural check refused the
         // body, so `#if M4_FLAG` around a first poll with a second unconditional poll and the fence
-        // compiled under -DM4_FLAG=1 to two real polls (39072 / 95e0cf41) with one acquire between
+        // compiled under -DM4_FLAG=1 to two real polls (39072 / 95e0cf41 (pre-change)) with one acquire between
         // them: a silent second observation. A poll the scan cannot place is refused in both checks now.
         let poll_in_a_conditional =
             COMMON_HEADER.replace(poll_line, &format!("#if M4_FLAG\n{poll_line}\n#endif"));
@@ -9674,8 +9710,8 @@ __threadfence();
         // found has both fences. With the canonical fence still in place BOTH checks ACCEPT it, because
         // the structural check now takes the first fence AFTER the poll exactly as the lint does. The
         // reviewer measured the shape: the acquire after the poll is present and the extra fence before
-        // it is the only delta, 38784 bytes / 5 PTB membar lines / sha fc675480, against the 38640 / 4 /
-        // e9cc6998 baseline - so the lint's acceptance was right and this check's refusal was wrong.
+        // it is the only delta, 70280 bytes / 5 PTB membar lines / sha edc82991, against the 70264 / 4 /
+        // 3eb4db6dd204870d baseline - so the lint's acceptance was right and this check's refusal was wrong.
         let fence_before_and_after =
             COMMON_HEADER.replace(poll_line, &format!("    __threadfence();\n{poll_line}"));
         let structural = acquire_helper_fences_unconditionally(&fence_before_and_after);
@@ -9710,7 +9746,7 @@ __threadfence();
         );
         // Round-14 A-1: the poll this lint follows is the HELPER's own, so plumbing that names the
         // raw poll cannot hijack it. nvcc compiles each of these three headers to the baseline cubin
-        // (38640 bytes / 4 PTB membar lines / sha e9cc6998f6a5, measured in the CUDA 12.9.1
+        // (70264 bytes / 4 PTB membar lines / sha 3eb4db6dd204870d, measured in the CUDA 12.9.1
         // container), which is why reading them as a poll was a false rejection and not a
         // conservative one.
         // Each fixture carries the include its own types need, because it stands in front of the
@@ -9780,7 +9816,7 @@ __threadfence();
         // Round-20 A1: a use of a macro that can BOUND the path before the poll is refused by BOTH checks
         // now, in the same words. The round-19 review found the lint refusing it while the structural
         // check accepted it, which was not a documented asymmetry but a wrong verdict: nvcc compiles this
-        // text to 36520 / 2 / d251dcf7 rather than to the 38640 / 4 / e9cc6998 baseline (measured; the
+        // text to 68400 / 2 / 83ac2db363499ff3 rather than to the 70264 / 4 / 3eb4db6dd204870d baseline (measured; the
         // stored text refused_suspicious_macro_before_poll is this text).
         let bail_before_the_poll = format!("#define BAIL return\n{COMMON_HEADER}").replace(
             SHIPPED_HELPER_BODY,
@@ -9810,12 +9846,12 @@ __threadfence();
         assert_eq!(
             acquire_helper_fences_unconditionally(&operator_macro_in_an_earlier_statement),
             Ok(()),
-            "an operator-only macro in a completed statement is not a blocker (38640 / 4 / e9cc6998)"
+            "an operator-only macro in a completed statement is not a blocker (70264 / 4 / 3eb4db6dd204870d)"
         );
         assert_eq!(
             acquire_fence_after_poll(&operator_macro_in_an_earlier_statement, HELPER_POLL),
             Ok(()),
-            "the lint agrees (38640 / 4 / e9cc6998)"
+            "the lint agrees (70264 / 4 / 3eb4db6dd204870d)"
         );
         // And the refusal side of the macro rule in the poll's OWN statement: the poll passed as the
         // argument of a macro that can return. Both checks refuse it - the lint names the use with the
@@ -9873,7 +9909,7 @@ __threadfence();
         // Round-21 A1: the SAME macro AFTER the poll, in a later, completed statement. The round-20 rule
         // scoped suspicion to "before the poll, or in the poll's own statement", and this check accepted
         // the text while the lint refused it - the mirror image of round 20, and again the lint was
-        // right: nvcc compiles the text to 36896 / 2 / 75beed7f rather than to the 38640 / 4 / e9cc6998
+        // right: nvcc compiles the text to 68904 / 2 / 1068c6b80f2508ea rather than to the 70264 / 4 / 3eb4db6dd204870d
         // baseline, because the fence after the macro is unreachable (the stored text is
         // refused_suspicious_macro_after_the_poll). The scope is now the lint's own - every use before
         // the FENCE - and the shared reason is the lint's forward-walk sentence.
@@ -10213,9 +10249,9 @@ __threadfence();
             ("the shipped body itself", with_define("", observed), false),
             // Round-25 A1: a MACRO whose body returns, used INSIDE the poll's own argument list. The
             // structural check read it and the lint did not, so the two answered one compiled body
-            // differently: the literal `({ return 0u; flag; })` in the argument is 38272 / 2 /
-            // 041d46b0, while THIS form - `#define BAIL return` inside `({ BAIL; flag; })` - is
-            // 36520 / 2 / d251dcf7, the cubin of a `return` before the poll that both checks refuse
+            // differently: the literal `({ return 0u; flag; })` in the argument is 70280 / 2 /
+            // bdd74372, while THIS form - `#define BAIL return` inside `({ BAIL; flag; })` - is
+            // 68400 / 2 / 83ac2db363499ff3, the cubin of a `return` before the poll that both checks refuse
             // for the same reason. Round 26 corrected this comment, which had swapped the two.
             (
                 "a macro that returns inside the poll's first argument",
@@ -10278,8 +10314,8 @@ __threadfence();
             ),
             // Round-26 A1: a lambda with a TRAILING RETURN TYPE. The narrow backward scan from the
             // body's `{` stopped at `*`, `uint32_t` or an identifier, so the lambda's `return` was
-            // read as the helper's and both checks refused a body nvcc compiles to 38640 / 4 /
-            // e9cc6998, the BASELINE. The walk's own detector reads every lambda spelling.
+            // read as the helper's and both checks refused a body nvcc compiles to 70264 / 4 /
+            // 3eb4db6dd204870d, the BASELINE. The walk's own detector reads every lambda spelling.
             (
                 "a trailing-return-type lambda as the poll's first argument",
                 with_define(
@@ -10331,9 +10367,9 @@ __threadfence();
             // list is not a path-bounding operator, so this is accepted.
             // Round-28 A1/A2: an exit that belongs to a LAMBDA, before and after the poll, at every
             // nesting the review named. The exit exits the LAMBDA, the helper's path reaches the
-            // acquire, and nvcc compiles every one of these to the baseline 38640 / 4 / e9cc6998. The
+            // acquire, and nvcc compiles every one of these to the baseline 70264 / 4 / 3eb4db6dd204870d. The
             // bare block at the end is the same text with the lambda removed, and it compiles to
-            // 38272 / 2 / 041d46b0 - so the row that must stay refused is refused for a true reason.
+            // 70280 / 2 / bdd743727ff53afd - so the row that must stay refused is refused for a true reason.
             (
                 "a non-returning call inside a lambda before the poll",
                 with_define(
@@ -10521,7 +10557,7 @@ __threadfence();
             // read. Round 30's single depth counter let a `<` or `>` inside `(...)` cancel that
             // group, so the walk-back never reached the arrow and both checks refused these with
             // the unreachability sentence, which was false of the compiled body: nvcc compiles every
-            // one of them to the BASELINE 38640 / 4 / e9cc6998 with the acquire present.
+            // one of them to the BASELINE 70264 / 4 / 3eb4db6dd204870d with the acquire present.
             (
                 "an enable_if with a less-than in the trailing return type",
                 with_define(
@@ -10635,11 +10671,12 @@ __threadfence();
                 false,
             ),
             // Round-32 A1/A2/A3/A4: the shapes the closing reviews of the merged !8 reported. A1/A2/A4
-            // are ACCEPTED by both checks and compile to the BASELINE 38640 / 4 / e9cc6998 (measured
-            // in the stored table); A3 is the FALSE ACCEPT they found - the lambda is CALLED where it
-            // stands, so its trap ends the helper, and the text compiles to the cubin this file
-            // already refuses as `__trap();` before the poll (37872 / 4 / 54cda5bc). Under the
-            // module's one-cubin-one-verdict rule the row claims a REFUSAL.
+            // are ACCEPTED by both checks and compile to the BASELINE 70264 / 4 / 3eb4db6dd204870d
+            // (measured in the stored table; 38640 / 4 / e9cc6998 pre-change); A3 is the FALSE ACCEPT
+            // they found - the lambda is CALLED where it stands, so its trap ends the helper, and the
+            // text compiles to the cubin this file already refuses as `__trap();` before the poll
+            // (69368 / 4 / c28d450c6b01fcdd, 37872 / 4 / 54cda5bc pre-change). Under the module's
+            // one-cubin-one-verdict rule the row claims a REFUSAL.
             (
                 "a bare less-than comparison in a trailing return type",
                 with_define(
@@ -11097,10 +11134,10 @@ __threadfence();
         // bare call statement, and both checks say so in the same words now; and a poll the preprocessor
         // may not compile is refused in both checks, with the same sentence, whether or not a second
         // compiled poll exists. Three of these rows are also stored and measured, and their cubins are
-        // the ones the measured table carries: refused_fence_in_the_poll_arguments 38624 / 3 / e638d56e,
-        // accepted_fence_in_the_arguments_and_after 38784 / 5 / fc675480, and
-        // refused_conditional_poll_with_a_second_poll, the 38640 / 4 / e9cc6998 baseline without
-        // -DM4_FLAG=1 (and 39072 / 95e0cf41 with it, measured with that define).
+        // the ones the measured table carries: refused_fence_in_the_poll_arguments 70120 / 3 / 2311607a03dcec7a,
+        // accepted_fence_in_the_arguments_and_after 70280 / 5 / edc829917a67de53, and
+        // refused_conditional_poll_with_a_second_poll, the 70264 / 4 / 3eb4db6dd204870d baseline without
+        // -DM4_FLAG=1 (and 39072 / 95e0cf41 (pre-change) with it, measured with that define).
         let positions: Vec<(&str, String, bool)> = vec![
             (
                 "a fence in the first argument, as a statement expression",
@@ -11172,7 +11209,7 @@ __threadfence();
             // "error: incomplete type void is not allowed", so there is no cubin to measure. Both
             // checks refuse it, with the same sentence, which names the type and the compiler's answer.
             // Round-24 A2/A3: an unconditional acquire followed by a CONDITIONAL one is the shipped
-            // body once the preprocessor resolves it (38640 / 4 / e9cc6998), so it is accepted; a
+            // body once the preprocessor resolves it (70264 / 4 / 3eb4db6dd204870d), so it is accepted; a
             // conditional fence with nothing unconditional after the poll is refused by both, in the
             // same sentence; and a fence WRITTEN WITH ARGUMENTS is not the barrier the shared header
             // writes, which one predicate now decides on both sides.
@@ -11203,9 +11240,9 @@ __threadfence();
             // Round-24 A1: control flow inside the poll's OWN argument list. The span is skipped for
             // fence detection (a fence there runs before the call, so it is never the acquire) but it is
             // still read for control flow, in BOTH checks. `(__trap(), flag)` as the first argument
-            // compiles to 37872 / 4 / 54cda5bc, byte-identical to the trap-before-the-poll statement
-            // body both checks refuse; `({ return 0u; flag; })` as the first argument to 38272 / 2 /
-            // 041d46b0; `(__builtin_unreachable(), flag)` to 36520 / 2 / d251dcf7, the documented cubin
+            // compiles to 69368 / 4 / c28d450c6b01fcdd, byte-identical to the trap-before-the-poll statement
+            // body both checks refuse; `({ return 0u; flag; })` as the first argument to 70280 / 2 /
+            // bdd74372; `(__builtin_unreachable(), flag)` to 68400 / 2 / 83ac2db363499ff3, the documented cubin
             // of a return before the poll. All of them are refused by both, in the same words.
             (
                 "a trap in the first argument",
@@ -11249,8 +11286,8 @@ __threadfence();
             ),
             // Round-25 A1: the macro twin of the literal shape above, in the first argument and in the
             // second. The structural check read the macro; the lint's argument-span loop did not, so the
-            // same compiled body (38272 / 2 / 041d46b0 for the literal `return 0u` argument, 36520 / 2 /
-            // d251dcf7 for `#define BAIL return`) got two verdicts.
+            // same compiled body (70280 / 2 / bdd743727ff53afd for the literal `return 0u` argument, 68400 / 2 /
+            // 83ac2db3 for `#define BAIL return`) got two verdicts.
             (
                 "a macro that returns in the first argument",
                 grid_source(
@@ -11268,7 +11305,7 @@ __threadfence();
                 true,
             ),
             // Round-26 A1: the trailing-return-type lambdas, each of which nvcc compiles to the
-            // BASELINE 38640 / 4 / e9cc6998 with the acquire present, and each of which both checks
+            // BASELINE 70264 / 4 / 3eb4db6dd204870d with the acquire present, and each of which both checks
             // refused because the narrow scan did not walk past the return type.
             (
                 "a trailing-return-type lambda in the first argument",
@@ -11318,8 +11355,8 @@ __threadfence();
             // blocker; the body carries no return so the row reads the capture alone.
             // Round-27 A1/A3: a LIVE directive whose next line starts with an exit. Round 26's
             // `end_of_directive(...) + 1` skipped that first token, so neither check saw the exit and
-            // both ACCEPTED a body whose compiled acquire is dead (nvcc: 38272 / 2 / 041d46b0, or
-            // 37872 / 4 / 54cda5bc for the trap). Every spelling of a live condition is here, and the
+            // both ACCEPTED a body whose compiled acquire is dead (nvcc: 70280 / 2 / bdd743727ff53afd, or
+            // 69368 / 4 / c28d450c6b01fcdd for the trap). Every spelling of a live condition is here, and the
             // second-line control that already worked is here too so the direction is proved both ways.
             (
                 "an exit on the first line after #if 1",
@@ -11608,15 +11645,16 @@ __threadfence();
     /// the mega_mhc kernel, exactly as the committed baseline is), and the phrase its refusal has to
     /// carry (empty for an accepted text).
     ///
-    /// Every cubin quoted in this module's documentation is a cubin in this table, and every text in
-    /// this table is stored under /home/user/wt/targets/kd17_texts/<name>.cuh, where
+    /// The table is the authoritative record: every CURRENT cubin quoted in this module's documentation
+    /// is this table's entry for its text (prose numbers marked pre-change are historical), and every
+    /// text in this table is stored under /home/user/wt/targets/kd17_texts/<name>.cuh, where
     /// `the_stored_measured_texts_are_the_texts_the_tests_build` checks it byte for byte.
     fn measured_texts() -> Vec<(&'static str, String, Verdict, &'static str, &'static str)> {
         let mut texts: Vec<(&'static str, String, Verdict, &'static str, &'static str)> = vec![(
             "shipped",
             COMMON_HEADER.to_string(),
             Verdict::Accepted,
-            "38640 / 4 / e9cc6998",
+            "70264 / 4 / 3eb4db6dd204870d",
             "",
         )];
         // The shapes an earlier rule refused as "not the canonical observation" and that are CALLS:
@@ -11625,113 +11663,113 @@ __threadfence();
             (
                 "bare_call",
                 "    spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return 0u;\n",
-                "38920 / 3 / fcf0da4f",
+                "70800 / 3 / 8b870f2dde88dbcb",
             ),
             (
                 "unary",
                 "    const bool observed = !spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed ? 1u : 0u;\n",
-                "38640 / 4 / cee5673b",
+                "70264 / 4 / ae7519eaf647c7e4",
             ),
             (
                 "eq",
                 "    const bool observed = 0u == spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed ? 1u : 0u;\n",
-                "38640 / 4 / cee5673b",
+                "70264 / 4 / ae7519eaf647c7e4",
             ),
             (
                 "gt",
                 "    const bool observed = 0u > spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed ? 1u : 0u;\n",
-                "38920 / 3 / fcf0da4f",
+                "70800 / 3 / 8b870f2dde88dbcb",
             ),
             (
                 "lt",
                 "    const bool observed = spark_wait_for_flag(flag, deadline) < deadline;\n    __threadfence();\n    return observed ? 1u : 0u;\n",
-                "38768 / 3 / 9e15fc3e",
+                "70272 / 3 / 1e9359d11ac588b6",
             ),
             (
                 "chained",
                 "    const bool observed = 0u < spark_wait_for_flag(flag, deadline) < deadline;\n    __threadfence();\n    return observed ? 1u : 0u;\n",
-                "38768 / 3 / 9e15fc3e",
+                "70272 / 3 / 1e9359d11ac588b6",
             ),
             (
                 "cast_seed",
                 "    const uint32_t observed = (uint32_t) spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "void_cast",
                 "    (void) spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return 0u;\n",
-                "38920 / 3 / fcf0da4f",
+                "70800 / 3 / 8b870f2dde88dbcb",
             ),
             (
                 "attribute_decl",
                 "    [[maybe_unused]] const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "attribute_stmt",
                 "    [[maybe_unused]] spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return 0u;\n",
-                "38920 / 3 / fcf0da4f",
+                "70800 / 3 / 8b870f2dde88dbcb",
             ),
             (
                 "spaced",
                 "    const uint32_t observed = spark_wait_for_flag ( flag , deadline );\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "paren_args",
                 "    const uint32_t observed = spark_wait_for_flag((flag), (deadline));\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "cast_arg",
                 "    const uint32_t observed = spark_wait_for_flag((const uint32_t *)flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             // Round-18 A1: the designator itself is parenthesised, dereferenced or addressed, which
             // `call_argument_list` unwraps and the old rule - a literal `(` after the name - did not.
             (
                 "paren_designator",
                 "    const uint32_t observed = (spark_wait_for_flag)(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "deref_designator",
                 "    const uint32_t observed = (*spark_wait_for_flag)(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "addr_designator",
                 "    const uint32_t observed = (&spark_wait_for_flag)(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             // Round-18 A2/A3: the poll is the condition of a control statement, or an operand of the
             // conditional operator, and the fence after that whole statement runs unconditionally.
             (
                 "ternary",
                 "    const uint32_t observed = true ? spark_wait_for_flag(flag, deadline) : 0u;\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "if_condition",
                 "    if (spark_wait_for_flag(flag, deadline)) {}\n    __threadfence();\n    return 0u;\n",
-                "38920 / 3 / fcf0da4f",
+                "70800 / 3 / 8b870f2dde88dbcb",
             ),
             (
                 "while_condition",
                 "    while (spark_wait_for_flag(flag, deadline)) {}\n    __threadfence();\n    return 0u;\n",
-                "38920 / 3 / ed59a852",
+                "70928 / 3 / 7706110186654f84",
             ),
             // Round-18 A4: the earlier `<` of a comparison in the poll's own statement, inside balanced
             // parentheses and bare.
             (
                 "paren_less_than",
                 "    const bool observed = (0u < 1u) > spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / cee5673b",
+                "70264 / 4 / ae7519eaf647c7e4",
             ),
             (
                 "bare_less_than",
                 "    const bool observed = 0u < 1u > spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / cee5673b",
+                "70264 / 4 / ae7519eaf647c7e4",
             ),
             // The parenthesised comparison whose left operand is an IDENTIFIER: the template-name rule
             // cannot rescue this one, only skipping the balanced group can, so it is what makes the
@@ -11739,7 +11777,7 @@ __threadfence();
             (
                 "paren_identifier_less_than",
                 "    const bool observed = (deadline < 1u) > spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38808 / 3 / d663b32f",
+                "70304 / 3 / de799400e3bdbdd9",
             ),
             // Round-19 A1: a control OPERATOR in an earlier, COMPLETED statement. Its semicolon stands
             // between it and the poll, so it never bounds the poll's own statement; all four compile to
@@ -11747,22 +11785,22 @@ __threadfence();
             (
                 "earlier_and",
                 "    const bool ran = (deadline > 0u) && true;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "earlier_or",
                 "    const bool ran = (deadline > 0u) || true;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "earlier_ampersand",
                 "    const bool took = (deadline > 0u) & true;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "earlier_ternary",
                 "    const uint32_t earlier = true ? 1u : 0u;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
         ] {
             texts.push((
@@ -11780,122 +11818,122 @@ __threadfence();
             (
                 "accepted_template_parameter_list_lambda_with_a_return",
                 "    auto f = [&]<typename T>() { return; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_decltype_auto_lambda_with_a_return",
                 "    auto f = [&]() -> decltype(auto) { return; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_init_capture_ending_in_a_subscript",
                 "    auto f = [x = (&deadline)[0]] { return; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_capture_list_with_a_trailing_attribute",
                 "    auto f = [&] [[maybe_unused]] { return; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_empty_capture_list_with_a_return",
                 "    auto f = [] { return; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_enable_if_less_than_in_a_trailing_return",
                 "    auto f = [&]() -> std::enable_if_t<(1 < 2), int> { return 0; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_enable_if_greater_than_in_a_trailing_return",
                 "    auto f = [&]() -> std::enable_if_t<(2 > 1), int> { return 0; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_decltype_shift_in_a_trailing_return",
                 "    auto f = [&]() -> decltype(1 << 2, int{}) { return 0; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_decltype_less_than_in_a_trailing_return",
                 "    auto f = [&]() -> decltype((1 < 2), 0) { return 0; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_decltype_less_equal_in_a_trailing_return",
                 "    auto f = [&]() -> decltype((1 <= 2), int{}) { return 0; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_decltype_greater_than_in_a_trailing_return",
                 "    auto f = [&]() -> decltype((1 > 2), int{}) { return 0; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_decltype_greater_equal_in_a_trailing_return",
                 "    auto f = [&]() -> decltype((1 >= 2), int{}) { return 0; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_enable_if_less_than_in_a_template_parameter_list",
                 "    auto f = [&]<typename T = std::enable_if_t<(1 < 2), int>>() { return ; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_enable_if_shift_in_a_template_parameter_list",
                 "    auto f = [&]<typename T = std::enable_if_t<(1 << 2) != 0, int>>() { return ; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_non_type_parameter_less_than_in_a_template_parameter_list",
                 "    auto f = [&]<auto N = (1 < 2)>() { return ; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_non_type_parameter_shift_in_a_template_parameter_list",
                 "    auto f = [&]<auto N = (1 << 2)>() { return ; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_return_in_a_local_constructor",
                 "    struct S { S() { return; } };\n    (void)sizeof(S);\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_return_in_a_local_destructor",
                 "    struct S { ~S() { return; } };\n    (void)sizeof(S);\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_return_in_a_local_member_function",
                 "    struct S { void run() { return; } };\n    (void)sizeof(S);\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_trailing_return_lambda",
                 "    const uint32_t observed = spark_wait_for_flag(([&]() -> const volatile uint32_t * { return flag; }()), deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_generic_trailing_return_lambda",
                 "    const uint32_t observed = spark_wait_for_flag(([&](auto x) -> const volatile uint32_t * { return x; }(flag)), deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_disabled_return_in_the_arguments",
                 "    const uint32_t observed = spark_wait_for_flag(({\n#if 0\n        return 0u;\n#endif\n        flag;\n    }), deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_disabled_macro_in_the_arguments",
                 "    #define BAIL return 0u\n    const uint32_t observed = spark_wait_for_flag(({\n#if 0\n        BAIL;\n#endif\n        flag;\n    }), deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_lambda_capture_before_the_poll",
                 "    const uint32_t capture = (([&]{ flag; }()), 0u), observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed + capture;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             // Round-27 A2: the lambda whose body is only `return flag;`, in an earlier COMPLETED
             // statement before the poll. The return exits the LAMBDA, so the helper reaches the
@@ -11903,58 +11941,59 @@ __threadfence();
             // otherwise asserted a false fact about the compiled code.
             // Round-28 A1/A2: an exit that belongs to a LAMBDA, at every nesting the review named,
             // before and after the poll. The exit exits the lambda, the acquire still runs, and every
-            // one of these is the BASELINE 38640 / 4 / e9cc6998 - measured, not quoted.
+            // one of these is the BASELINE 70264 / 4 / 3eb4db6dd204870d - measured, not quoted.
             (
                 "accepted_nonreturning_call_in_a_lambda_before_the_poll",
                 "    auto f = [&] { __trap(); };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_return_in_a_nested_block_inside_a_lambda",
                 "    auto f = [&] { { return; } };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_return_in_an_if_inside_a_lambda",
                 "    auto f = [&] { if (flag != nullptr) { return; } };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_return_in_a_loop_inside_a_lambda",
                 "    auto f = [&] { for (;;) { return; } };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_trap_in_a_nested_block_inside_a_lambda",
                 "    auto f = [&] { { __trap(); } };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_macro_return_in_a_lambda_before_the_poll",
                 "    #define BAIL return\n    auto f = [&] { BAIL; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_return_in_a_nested_block_inside_a_lambda_after_the_poll",
                 "    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    auto f = [&] { { return; } };\n    (void)f;\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_return_in_an_if_inside_a_lambda_after_the_poll",
                 "    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    auto f = [&] { if (observed != 0u) { return; } };\n    (void)f;\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_trap_in_a_nested_block_inside_a_lambda_after_the_poll",
                 "    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    auto f = [&] { { __trap(); } };\n    (void)f;\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_lambda_return_before_the_poll",
                 "    auto f = [&] { return flag; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
-            // Round-32 A1/A2/A4, every one of them measured at the BASELINE 38640 / 4 / e9cc6998. A1:
+            // Round-32 A1/A2/A4, every one of them measured at the BASELINE 70264 / 4 / 3eb4db6dd204870d
+            // (38640 / 4 / e9cc6998 pre-change). A1:
             // the comparison written BARE in a template argument or parameter list - a `<` is a
             // delimiter only when a template NAME stands in front of it, and the `>` of a `>=` is not a
             // close. A2: the class-head spellings whose comma, `]` or `)` stopped the type-body walk
@@ -11963,62 +12002,62 @@ __threadfence();
             (
                 "accepted_bare_less_than_in_a_trailing_return",
                 "    auto f = [&]() -> std::enable_if_t<1 < 2, int> { return 0; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_bare_less_equal_in_a_trailing_return",
                 "    auto f = [&]() -> std::enable_if_t<1 <= 2, int> { return 0; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_bare_less_than_in_a_template_parameter_list",
                 "    auto f = [&]<int N = 1 < 2>() { return ; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_bare_less_equal_in_a_template_parameter_list",
                 "    auto f = [&]<auto N = 1 <= 2>() { return ; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_bare_greater_equal_in_a_template_parameter_list",
                 "    auto f = [&]<auto N = 1 >= 2>() { return ; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_return_in_a_local_type_with_two_bases",
                 "    struct A {}; struct B {}; struct S : A, B { void run() { return; } };\n    (void)sizeof(S);\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_return_in_a_local_type_with_public_bases",
                 "    struct A {}; struct B {}; class S : public A, public B { public: void run() { return; } };\n    (void)sizeof(S);\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_return_in_a_local_type_with_an_attribute",
                 "    struct [[maybe_unused]] S { void run() { return; } };\n    (void)sizeof(S);\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_return_in_a_local_type_with_a_gnu_attribute",
                 "    struct __attribute__((packed)) S { void run() { return; } };\n    (void)sizeof(S);\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_return_in_a_local_type_with_alignas",
                 "    struct alignas(8) S { void run() { return; } };\n    (void)sizeof(S);\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_noexcept_lambda_with_a_return",
                 "    auto f = [&]() noexcept { return ; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "accepted_mutable_lambda_with_a_return",
                 "    auto f = [&]() mutable { return ; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
         ] {
             texts.push((
@@ -12062,7 +12101,7 @@ __threadfence();
                     "    const uint32_t observed = spark_wait_for_flag(f, d);\n    __threadfence();\n    return observed;\n",
                 ),
             Verdict::Accepted,
-            "38640 / 4 / e9cc6998",
+            "70264 / 4 / 3eb4db6dd204870d",
             "",
         ));
         // Round-19 A5: a parenthesised macro replacement is the same alias, and the designator inside
@@ -12079,7 +12118,7 @@ __threadfence();
                     "    const uint32_t observed = P(flag, deadline);\n    __threadfence();\n    return observed;\n",
                 ),
                 Verdict::Accepted,
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
                 "",
             ));
         }
@@ -12108,7 +12147,7 @@ __threadfence();
                 name,
                 format!("{define}\n{COMMON_HEADER}").replace(SHIPPED_HELPER_BODY, body),
                 Verdict::Accepted,
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
                 "",
             ));
         }
@@ -12131,7 +12170,7 @@ __threadfence();
                 &format!("    __threadfence();\n{SHIPPED_HELPER_BODY}"),
             ),
             Verdict::Accepted,
-            "38784 / 5 / fc675480",
+            "70280 / 5 / edc829917a67de53",
             "",
         ));
         // Round-23 A2 (HIGH): a fence in the poll's ARGUMENTS plus a real bare acquire after it. The
@@ -12145,7 +12184,7 @@ __threadfence();
                 "    const uint32_t observed = spark_wait_for_flag((__threadfence(), flag), deadline);\n    __threadfence();\n    return observed;\n",
             ),
             Verdict::Accepted,
-            "38784 / 5 / fc675480",
+            "70280 / 5 / edc829917a67de53",
             "",
         ));
         for (name, define, body, cubin) in [
@@ -12153,31 +12192,31 @@ __threadfence();
                 "macro_triple_paren_alias",
                 "#define P (((spark_wait_for_flag)))",
                 "    const uint32_t observed = P(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "macro_whole_call_with_parameters",
                 "#define P(a, b) spark_wait_for_flag(a, b)",
                 "    const uint32_t observed = P(flag, deadline);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "macro_parenthesised_whole_call",
                 "#define P (spark_wait_for_flag(flag, deadline))",
                 "    const uint32_t observed = P;\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "macro_parenthesised_whole_call_use",
                 "#define P (spark_wait_for_flag(flag, deadline))",
                 "    const uint32_t observed = (P);\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             (
                 "macro_parenthesised_whole_call_statement",
                 "#define P (spark_wait_for_flag(flag, deadline))",
                 "    (P);\n    __threadfence();\n    return 0u;\n",
-                "38920 / 3 / fcf0da4f",
+                "70800 / 3 / 8b870f2dde88dbcb",
             ),
             // Round-22 A2: the same call with its DESIGNATOR parenthesised. Neither the designator rule
             // nor the whole-call rule read it, so both checks refused a spelling that compiles to the
@@ -12186,7 +12225,7 @@ __threadfence();
                 "macro_parenthesised_designator_whole_call",
                 "#define P (spark_wait_for_flag)(flag, deadline)",
                 "    const uint32_t observed = P;\n    __threadfence();\n    return observed;\n",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
         ] {
             texts.push((
@@ -12204,11 +12243,11 @@ __threadfence();
                 "    const uint32_t observed = POLL_ALIAS(flag, deadline);\n    __threadfence();\n    return observed;\n",
             ),
             Verdict::Accepted,
-            "38640 / 4 / e9cc6998",
+            "70264 / 4 / 3eb4db6dd204870d",
             "",
         ));
         // The REFUSED list: a mention that is not a call. Each of these bodies only DECLARES the poll,
-        // so the code it compiles to is not the baseline (38416 / 3 / 1bbf93f5, measured). The bare
+        // so the code it compiles to is not the baseline (70424 / 3 / c78fa93b686e2df7, measured). The bare
         // block is refused for the other reason (round-18 A8): the poll and the fence sit inside a
         // block neither check can relate to the helper's straight-line path, so both refuse it even
         // though its cubin IS the baseline.
@@ -12219,7 +12258,7 @@ __threadfence();
                     "    uint32_t (*spark_wait_for_flag)(const volatile uint32_t *, uint64_t);\n    __threadfence();\n    return 0u;\n",
                 ),
                 "the shared header writes the call as",
-                "38416 / 3 / 1bbf93f5",
+                "70424 / 3 / c78fa93b686e2df7",
             ),
             (
                 "refused_attribute_between_type_and_name",
@@ -12227,7 +12266,7 @@ __threadfence();
                     "    uint32_t [[maybe_unused]] spark_wait_for_flag(const volatile uint32_t *, uint64_t);\n    __threadfence();\n    return 0u;\n",
                 ),
                 "the shared header writes the call as",
-                "38416 / 3 / 1bbf93f5",
+                "70424 / 3 / c78fa93b686e2df7",
             ),
             (
                 "refused_macro_return",
@@ -12238,10 +12277,10 @@ __threadfence();
                     )
                 ),
                 "the shared header writes the call as",
-                "38416 / 3 / 1bbf93f5",
+                "70424 / 3 / c78fa93b686e2df7",
             ),
             // Round-28 A2: the same body with the lambda removed. The `return` is the HELPER's, the
-            // fence after it never runs, and it compiles to 38272 / 2 / 041d46b0 - so this refusal is
+            // fence after it never runs, and it compiles to 70280 / 2 / bdd743727ff53afd - so this refusal is
             // not collateral damage of the lambda rule.
             (
                 "refused_bare_block_before_the_poll",
@@ -12249,20 +12288,20 @@ __threadfence();
                     "    { return 0u; }\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
                 ),
                 "stands before the poll",
-                "38272 / 2 / 041d46b0",
+                "70280 / 2 / bdd743727ff53afd",
             ),
             // Round-29 A1: an ATTRIBUTE before a compound statement. Round 28's outward walk read the
             // closing `]]` of an attribute-specifier as a lambda capture list, so both checks ACCEPTED
             // these although the exit in each is the HELPER's. Every cubin here is measured, and the
-            // pre-poll ones are the 38272 / 2 / 041d46b0 cubin the module documentation assigns to a
-            // helper-level exit before the poll, while the after-poll ones are 38472 / 2 / 26b31e58.
+            // pre-poll ones are the 70280 / 2 / bdd743727ff53afd cubin the module documentation assigns to a
+            // helper-level exit before the poll, while the after-poll ones are 70096 / 2 / bc0410cac99ba3e6.
             (
                 "refused_attribute_before_a_block_before_the_poll",
                 with_the_shipped_body(
                     "    [[maybe_unused]] { { return 0u; } }\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
                 ),
                 "stands before the poll",
-                "38272 / 2 / 041d46b0",
+                "70280 / 2 / bdd743727ff53afd",
             ),
             (
                 "refused_attribute_before_an_if_before_the_poll",
@@ -12270,7 +12309,7 @@ __threadfence();
                     "    [[maybe_unused]] { if (flag != nullptr) { return 0u; } }\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
                 ),
                 "stands before the poll",
-                "38272 / 2 / 041d46b0",
+                "70280 / 2 / bdd743727ff53afd",
             ),
             (
                 "refused_attribute_before_a_while_before_the_poll",
@@ -12278,7 +12317,7 @@ __threadfence();
                     "    [[maybe_unused]] { while (flag != nullptr) { return 0u; } }\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
                 ),
                 "stands before the poll",
-                "38272 / 2 / 041d46b0",
+                "70280 / 2 / bdd743727ff53afd",
             ),
             (
                 "refused_attribute_before_a_bare_return_before_the_poll",
@@ -12286,7 +12325,7 @@ __threadfence();
                     "    [[maybe_unused]] { return 0u; }\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
                 ),
                 "stands before the poll",
-                "38272 / 2 / 041d46b0",
+                "70280 / 2 / bdd743727ff53afd",
             ),
             (
                 "refused_attribute_before_a_block_after_the_poll",
@@ -12294,7 +12333,7 @@ __threadfence();
                     "    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    [[maybe_unused]] { { return observed; } }\n    __threadfence();\n    return observed;\n",
                 ),
                 "stands between the poll and the acquire",
-                "38472 / 2 / 26b31e58",
+                "70096 / 2 / bc0410cac99ba3e6",
             ),
             (
                 "refused_attribute_before_a_bare_return_after_the_poll",
@@ -12302,7 +12341,7 @@ __threadfence();
                     "    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    [[maybe_unused]] { return observed; }\n    __threadfence();\n    return observed;\n",
                 ),
                 "stands between the poll and the acquire",
-                "38472 / 2 / 26b31e58",
+                "70096 / 2 / bc0410cac99ba3e6",
             ),
             // The CONTROL: the same nested block with no attribute. It was refused before round 28 and
             // is still refused - the fix must not turn the attribute case into a general excuse.
@@ -12312,7 +12351,7 @@ __threadfence();
                     "    { { return 0u; } }\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
                 ),
                 "stands before the poll",
-                "38272 / 2 / 041d46b0",
+                "70280 / 2 / bdd743727ff53afd",
             ),
             // Round-30 A1: the two spellings round 29 refused here conservatively are ACCEPTED rows
             // now - the walk-back reads the balanced template parameter list and the balanced
@@ -12324,7 +12363,7 @@ __threadfence();
                     "    {\n        const uint32_t observed = spark_wait_for_flag(flag, deadline);\n        __threadfence();\n        return observed;\n    }\n",
                 ),
                 "not a top-level statement",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             // Round-18 A2/A3, corrected in round 19: the shapes that STAY refused. Two of them are
             // calls whose EVALUATION is conditional; the third, `return poll(...)`, is an
@@ -12337,7 +12376,7 @@ __threadfence();
                     "    if (deadline > 0u) spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return 0u;\n",
                 ),
                 "\"if\" stands before the poll",
-                "38928 / 3 / 7068c375",
+                "70928 / 3 / 0f03266fa910ac58",
             ),
             (
                 "refused_short_circuit",
@@ -12345,7 +12384,7 @@ __threadfence();
                     "    const bool ran = (deadline > 0u) && spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return ran ? 1u : 0u;\n",
                 ),
                 "\"&&\" stands before the poll",
-                "38768 / 4 / b8425de8",
+                "70264 / 4 / 69c8ea1592276ee1",
             ),
             (
                 "refused_return_call",
@@ -12356,12 +12395,12 @@ __threadfence();
                 // is conditional, so the needle carries that word and nothing else does: a mutation that
                 // reports it as the conditional case fails this row.
                 "the acquire after it is unreachable",
-                "38472 / 2 / 26b31e58",
+                "70096 / 2 / bc0410cac99ba3e6",
             ),
             // Round-20 A1: the SAME kind of macro as the accepted macro_operator_before_the_poll, used as
             // the poll's own ARGUMENT. No `;` stands between the use and the observation, so the
             // completed-statement scoping does not excuse it and both checks refuse the text; its cubin is
-            // 38768 / 4 / b8425de8, the same code as the literal short circuit it expands to.
+            // 70264 / 4 / 69c8ea1592276ee1, the same code as the literal short circuit it expands to.
             (
                 "refused_operator_macro_wrapping_the_poll",
                 format!(
@@ -12371,11 +12410,11 @@ __threadfence();
                     )
                 ),
                 "\"MAYBE\" stands before the poll",
-                "38768 / 4 / b8425de8",
+                "70264 / 4 / 69c8ea1592276ee1",
             ),
             // Round-20 A1/A3: the two texts where the macro reading and the call reading collide, both
             // refused by BOTH checks. `BAIL;` before the poll is a use of a macro that can bound the
-            // path and its cubin is NOT the baseline (36520 / 2 / d251dcf7), so the refusal is required;
+            // path and its cubin is NOT the baseline (68400 / 2 / 83ac2db363499ff3), so the refusal is required;
             // the parameter-swapping alias IS the baseline cubin, and the scan refuses it anyway because
             // it reads two mentions and will not guess which is the observation (documented as a
             // conservative refusal, not as a defect).
@@ -12388,7 +12427,7 @@ __threadfence();
                     )
                 ),
                 "is a macro whose body contains a control keyword",
-                "36520 / 2 / d251dcf7",
+                "68400 / 2 / 83ac2db363499ff3",
             ),
             (
                 "refused_macro_parameter_alias",
@@ -12399,11 +12438,11 @@ __threadfence();
                     )
                 ),
                 "2 times",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             // Round-21 A1: the SAME macro as the text above, used AFTER the poll in a later, completed
             // statement. The lint refused it and the structural check accepted it (the mirror image of
-            // round 20) although its cubin is NOT the baseline - 36896 / 2 / 75beed7f, measured, because
+            // round 20) although its cubin is NOT the baseline - 68904 / 2 / 1068c6b80f2508ea, measured, because
             // the fence after the macro is unreachable - so the lint was right. The scope is now the
             // lint's own, every use before the fence, and the shared reason is the lint's forward-walk
             // sentence, which this row's needle names.
@@ -12416,23 +12455,23 @@ __threadfence();
                     )
                 ),
                 "the fence runs after it",
-                "36896 / 2 / 75beed7f",
+                "68904 / 2 / 1068c6b80f2508ea",
             ),
             // Round-19 A7: the two-poll body as a TRANSLATION UNIT. The round-13 fixture duplicated one
             // const and nvcc refuses that, so the number the documentation quoted sat with a text that
-            // does not compile; this one does, and 39064 / 3 / e8a967d8 is its own measurement.
+            // does not compile; this one does, and 70560 / 3 / 06172060143332d3 is its own measurement.
             (
                 "refused_two_polls",
                 with_the_shipped_body(
                     "    const uint32_t first = spark_wait_for_flag(flag, deadline);\n    const uint32_t second = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return first + second;\n",
                 ),
                 "2 times",
-                "39064 / 3 / e8a967d8",
+                "70560 / 3 / 06172060143332d3",
             ),
             // Round-23 A1 (HIGH): the fence sits in the poll's ARGUMENTS, where it runs BEFORE the call,
             // and there is no acquire after the call. The structural check read the in-arguments fence as
             // the acquire of the next mention and ACCEPTED the body while the lint refused it - and the
-            // body compiles to 38624 / 3 / e638d56e, the cubin of the plain fence-before-the-poll body
+            // body compiles to 70120 / 3 / 2311607a03dcec7a, the cubin of the plain fence-before-the-poll body
             // both checks refuse, so the verdict was not a function of the compiled shape. Both refuse it
             // now, and in the same words.
             (
@@ -12441,11 +12480,11 @@ __threadfence();
                     "    const uint32_t observed = spark_wait_for_flag(({ __threadfence(); flag; }), deadline);\n    return observed;\n",
                 ),
                 "no reachable __threadfence()",
-                "38624 / 3 / e638d56e",
+                "70120 / 3 / 2311607a03dcec7a",
             ),
             // Round-23 A3 (HIGH): a poll inside a conditional the guard cannot resolve, plus a second,
             // unconditional poll and the fence. Under -DM4_FLAG=1 the text compiles to TWO real polls
-            // (39072 / 95e0cf41, measured with that define) whose single acquire pairs with the second
+            // (39072 / 95e0cf41 (pre-change), measured with that define) whose single acquire pairs with the second
             // only, so the first observation is read with no acquire after it; without the define it is
             // the baseline below. The structural check refused the body and the lint accepted it; both
             // refuse it now, and with the same sentence.
@@ -12455,20 +12494,20 @@ __threadfence();
                     "    #if M4_FLAG\n    spark_wait_for_flag(flag, deadline);\n    #endif\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
                 ),
                 "sits inside a preprocessor conditional",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             // Round-24 A1 (HIGH): control flow inside the poll's OWN argument list, which the round-23
             // span skip stopped the scan from reading, so BOTH checks accepted it although the compiled
-            // acquire is absent. `(__trap(), flag)` as the first argument is 37872 / 4 / 54cda5bc -
+            // acquire is absent. `(__trap(), flag)` as the first argument is 69368 / 4 / c28d450c6b01fcdd -
             // byte-identical to the trap-before-the-poll statement body both checks refuse - and
-            // `({ return 0u; flag; })` there is 38272 / 2 / 041d46b0.
+            // `({ return 0u; flag; })` there is 70280 / 2 / bdd743727ff53afd.
             (
                 "refused_trap_in_the_poll_arguments",
                 with_the_shipped_body(
                     "    const uint32_t observed = spark_wait_for_flag((__trap(), flag), deadline);\n    __threadfence();\n    return observed;\n",
                 ),
                 "does not return and stands between the poll and the acquire",
-                "37872 / 4 / 54cda5bc",
+                "69368 / 4 / c28d450c6b01fcdd",
             ),
             (
                 "refused_return_in_the_poll_arguments",
@@ -12476,7 +12515,7 @@ __threadfence();
                     "    const uint32_t observed = spark_wait_for_flag(({ return 0u; flag; }), deadline);\n    __threadfence();\n    return observed;\n",
                 ),
                 "\"return\" stands between the poll and the acquire",
-                "38272 / 2 / 041d46b0",
+                "70280 / 2 / bdd743727ff53afd",
             ),
             // The cubin the documentation already carries for a return before the poll: the arguments
             // are not a different path, which is exactly why reading them matters.
@@ -12486,7 +12525,7 @@ __threadfence();
                     "    const uint32_t observed = spark_wait_for_flag((__builtin_unreachable(), flag), deadline);\n    __threadfence();\n    return observed;\n",
                 ),
                 "does not return and stands between the poll and the acquire",
-                "36520 / 2 / d251dcf7",
+                "68400 / 2 / 83ac2db363499ff3",
             ),
             // Round-26 A3: the documented CONSERVATIVE refusal. The text compiles to the BASELINE - the
             // macro's replacement is a lambda holding a `return` - and the refusal is only that the
@@ -12498,11 +12537,12 @@ __threadfence();
                     "    #define LL ([&]{ return flag; })\n    const uint32_t observed = spark_wait_for_flag((LL)(), deadline);\n    __threadfence();\n    return observed;\n",
                 ),
                 "a macro whose body contains a control keyword",
-                "38640 / 4 / e9cc6998",
+                "70264 / 4 / 3eb4db6dd204870d",
             ),
             // Round-32 A3: the FALSE ACCEPT the second closing review found. The lambda is CALLED
             // where it stands, so the trap inside it ends the helper and nvcc compiles this text to
-            // 37872 / 4 / 54cda5bc - the cubin of `__trap();` before the poll, which both checks
+            // 69368 / 4 / c28d450c6b01fcdd (37872 / 4 / 54cda5bc pre-change) - the cubin of
+            // `__trap();` before the poll, which both checks
             // already refuse, and the refusal here is about the compiled code, so the CALLED
             // lambda body is not a body the helper does not own. The never-called twin
             // (`accepted_nonreturning_call_in_a_lambda_before_the_poll`) stays accepted: that body
@@ -12513,7 +12553,7 @@ __threadfence();
                     "    (void)([&]{ __trap(); return 0u; })();\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
                 ),
                 "does not return",
-                "37872 / 4 / 54cda5bc",
+                "69368 / 4 / c28d450c6b01fcdd",
             ),
         ] {
             texts.push((name, source, Verdict::Refused, cubin, needle));
@@ -12530,19 +12570,19 @@ __threadfence();
     /// The table lives in \`measured_texts\`; the names below are its names, and the numbers are its
     /// cubins (full shas are in the module documentation):
     ///
-    ///   * \`shipped\`, the shared header unchanged - 38640 / 4 / e9cc6998, the baseline;
-    ///   * \`bare_call\` - 38920 / 3 / fcf0da4f; \`void_cast\` - 38920 / 3 / fcf0da4f; \`gt\` - 38920 / 3 /
-    ///     fcf0da4f; \`attribute_stmt\` - 38920 / 3 / fcf0da4f;
-    ///   * \`unary\`, \`eq\` - both 38640 / 4 / cee5673b;
-    ///   * \`lt\`, \`chained\` - both 38768 / 3 / 9e15fc3e;
+    ///   * \`shipped\`, the shared header unchanged - 70264 / 4 / 3eb4db6dd204870d, the baseline;
+    ///   * \`bare_call\` - 70800 / 3 / 8b870f2dde88dbcb; \`void_cast\` - 70800 / 3 / 8b870f2dde88dbcb; \`gt\` - 70800 / 3 /
+    ///     8b870f2d; \`attribute_stmt\` - 70800 / 3 / 8b870f2dde88dbcb;
+    ///   * \`unary\`, \`eq\` - both 70264 / 4 / ae7519eaf647c7e4;
+    ///   * \`lt\`, \`chained\` - both 70272 / 3 / 1e9359d11ac588b6;
     ///   * \`cast_seed\`, \`attribute_decl\`, \`spaced\`, \`paren_args\`, \`cast_arg\`, \`renamed\`, \`alias\` -
-    ///     all 38640 / 4 / e9cc6998;
+    ///     all 70264 / 4 / 3eb4db6dd204870d;
     ///   * round-18 A1: \`paren_designator\` (\`(poll)(flag, deadline)\`), \`deref_designator\`,
-    ///     \`addr_designator\` - all 38640 / 4 / e9cc6998, i.e. the designator spelling is not part of the
+    ///     \`addr_designator\` - all 70264 / 4 / 3eb4db6dd204870d, i.e. the designator spelling is not part of the
     ///     rule either, because the call is the same call;
-    ///   * round-18 A2/A3: \`ternary\` (\`true ? poll(...) : 0u\`) - 38640 / 4 / e9cc6998;
-    ///     \`if_condition\` - 38920 / 3 / fcf0da4f; \`while_condition\` - 38920 / 3 / ed59a852;
-    ///   * round-18 A4: \`paren_less_than\` and \`bare_less_than\` - both 38640 / 4 / cee5673b.
+    ///   * round-18 A2/A3: \`ternary\` (\`true ? poll(...) : 0u\`) - 70264 / 4 / 3eb4db6dd204870d;
+    ///     \`if_condition\` - 70800 / 3 / 8b870f2dde88dbcb; \`while_condition\` - 70928 / 3 / 7706110186654f84;
+    ///   * round-18 A4: \`paren_less_than\` and \`bare_less_than\` - both 70264 / 4 / ae7519eaf647c7e4.
     ///
     /// The renamed-parameter call and the macro alias of the designator also have their own focused test,
     /// \`a_call_under_renamed_parameters_or_through_an_alias_is_a_call\`.
@@ -12569,7 +12609,7 @@ __threadfence();
         assert_eq!(measured, 89, "every accepted shape is exercised");
     }
 
-    /// Round-17 A2/A4, both accepted and both measured at the baseline (38640 / 4 / e9cc6998f6a5):
+    /// Round-17 A2/A4, both accepted and both measured at the baseline (70264 / 4 / 3eb4db6dd204870d):
     /// the scan does not read the arguments, so a helper whose parameters are named `f` and `d` is not
     /// asked to write `flag` and `deadline` (the shipped spelling in the messages is an illustration,
     /// not a substitution - the hint never tells a writer to use a name that does not exist), and a
@@ -12604,8 +12644,8 @@ __threadfence();
     /// the verdict may not depend on what stands earlier in the file. Both forms below are accepted by
     /// both checks: the shipped header (whose own `#include <...>` lines put an earlier `<` and an
     /// earlier `>` in the file) with the observation written `0u > poll(...)`, and the same body with a
-    /// comparison added in front of it. The measured cubin of the header form is 38920 / 3 /
-    /// fcf0da4f11e1974c; the form without includes is pinned as SCAN TEXT only, because that text cannot
+    /// comparison added in front of it. The measured cubin of the header form is 70800 / 3 /
+    /// 8b870f2dde88dbcb; the form without includes is pinned as SCAN TEXT only, because that text cannot
     /// be a translation unit (it cannot declare the types the header needs without including them, and an
     /// include is itself an earlier `<`) - which is exactly why the bound is on the statement.
     #[test]
@@ -12623,7 +12663,7 @@ __threadfence();
         assert_eq!(
             acquire_fence_after_poll(&in_the_header, HELPER_POLL),
             Ok(()),
-            "the lint agrees (measured 38920 / 3 / fcf0da4f)"
+            "the lint agrees (measured 70800 / 3 / 8b870f2dde88dbcb)"
         );
         let with_an_earlier_comparison =
             format!("__device__ bool round17_prelude() {{ return 1 < 2; }}\n{in_the_header}");
@@ -12646,13 +12686,13 @@ __threadfence();
     /// not the baseline.
     ///
     ///   * A1, a function-pointer declarator - `uint32_t (*spark_wait_for_flag)(const volatile
-    ///     uint32_t *, uint64_t);` in the body: nvcc compiles this text to 38416 bytes / 3 PTB membar
-    ///     lines / sha 1bbf93f5d5ca1767, against the 38640 / 4 / e9cc6998f6a5 baseline (measured);
+    ///     uint32_t *, uint64_t);` in the body: nvcc compiles this text to 70424 bytes / 3 PTB membar
+    ///     lines / sha c78fa93b686e2df7, against the 70264 / 4 / 3eb4db6dd204870d baseline (measured);
     ///   * A2, an attribute between the type and the name - `uint32_t [[maybe_unused]]
-    ///     spark_wait_for_flag(const volatile uint32_t *, uint64_t);`: same 38416 / 3 /
-    ///     1bbf93f5d5ca1767 (measured);
+    ///     spark_wait_for_flag(const volatile uint32_t *, uint64_t);`: same 70424 / 3 /
+    ///     c78fa93b686e2df7 (measured);
     ///   * A3, a macro-defined return type - `#define SPARK_M4_RETURN decltype(true ? 0u : 1u)` and
-    ///     the same declaration through it: same 38416 / 3 / 1bbf93f5d5ca1767 (measured).
+    ///     the same declaration through it: same 70424 / 3 / c78fa93b686e2df7 (measured).
     ///
     /// The fourth shape round 16 refused, a real call wrapped in a chained comparison, is a CALL and is
     /// accepted now (round-17 A1): it is pinned with its measured cubin in

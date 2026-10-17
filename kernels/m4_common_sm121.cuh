@@ -58,6 +58,10 @@
 // H(X_l) is 20 Sinkhorn-Knopp iterations with eps 1e-6 (2.1: hc_sinkhorn_iters, hc_eps).
 #define SPARK_M4_HC_SINKHORN_ITERS 20u
 #define SPARK_M4_HC_EPS 1e-6f
+// The residual-stream RMS epsilon of the released config.json: norm_eps = 1e-20. It is NOT
+// hc_eps. The released model uses it both in hc_mixes' rsqrt(mean(x^2) + norm_eps) and in the
+// RMSNorm the collapsed block input goes through (inference/model.py:953-954, 984, 991).
+#define SPARK_M4_NORM_EPS 1e-20f
 // The folded predictor of H() emits n*n stream-mixing rows, n input-mixing rows and n
 // block-output rows (2.4 step 3: tile dot products and sum-of-squares for H(X_l)).
 #define SPARK_M4_HC_PREDICTOR_ROWS (SPARK_M4_HC_MULT * SPARK_M4_HC_MULT + 2u * SPARK_M4_HC_MULT)
@@ -438,6 +442,76 @@ __device__ __forceinline__ void spark_sinkhorn_knopp(float m[SPARK_M4_HC_MULT][S
     }
 }
 
+// Defined with the other accurate math helpers further down; declared here because the released
+// schedule's row softmax needs exp and the two Sinkhorn schedules are kept next to each other so a
+// reader can compare them.
+__device__ __forceinline__ float spark_exp(float x);
+
+// The RELEASED comb normalisation of hc_split_sinkhorn (inference/kernel.py:436-458), which is
+// not spark_sinkhorn_knopp above. The matrix arrives in the released [source][destination]
+// orientation; the schedule is:
+//
+//   1. a row softmax over the destinations (no eps inside the softmax denominator), then + eps;
+//   2. one unconditional column pass, /(colsum + eps);
+//   3. (iterations - 1) pairs of row pass /(rowsum + eps) and column pass /(colsum + eps).
+//
+// The last pass is a column pass, so the released comb ends up column-stochastic in this
+// orientation. The eps placement is not symmetric and a generic alternating normalisation is a
+// different computation (docs/architecture/02-mhc.md D3).
+__device__ __forceinline__ void spark_released_split_sinkhorn(
+    float m[SPARK_M4_HC_MULT][SPARK_M4_HC_MULT], uint32_t iterations, float eps) {
+    const uint32_t n = (uint32_t)SPARK_M4_HC_MULT;
+    for (uint32_t row = 0; row < n; ++row) {
+        float row_max = m[row][0];
+        for (uint32_t col = 1; col < n; ++col) {
+            row_max = m[row][col] > row_max ? m[row][col] : row_max;
+        }
+        float sum = 0.0f;
+        for (uint32_t col = 0; col < n; ++col) {
+            m[row][col] = spark_exp(m[row][col] - row_max);
+            sum += m[row][col];
+        }
+        const float inverse = 1.0f / sum;
+        for (uint32_t col = 0; col < n; ++col) {
+            m[row][col] = m[row][col] * inverse + eps;
+        }
+    }
+    // The unconditional first column pass. eps enters both the matrix (above) and this
+    // denominator; the release does exactly this once.
+    for (uint32_t col = 0; col < n; ++col) {
+        float sum = eps;
+        for (uint32_t row = 0; row < n; ++row) {
+            sum += m[row][col];
+        }
+        const float inverse = 1.0f / sum;
+        for (uint32_t row = 0; row < n; ++row) {
+            m[row][col] *= inverse;
+        }
+    }
+    for (uint32_t it = 1; it < iterations; ++it) {
+        for (uint32_t row = 0; row < n; ++row) {
+            float sum = eps;
+            for (uint32_t col = 0; col < n; ++col) {
+                sum += m[row][col];
+            }
+            const float inverse = 1.0f / sum;
+            for (uint32_t col = 0; col < n; ++col) {
+                m[row][col] *= inverse;
+            }
+        }
+        for (uint32_t col = 0; col < n; ++col) {
+            float sum = eps;
+            for (uint32_t row = 0; row < n; ++row) {
+                sum += m[row][col];
+            }
+            const float inverse = 1.0f / sum;
+            for (uint32_t row = 0; row < n; ++row) {
+                m[row][col] *= inverse;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Bounded grid-wide rendezvous
 // ---------------------------------------------------------------------------------------
@@ -520,6 +594,9 @@ __device__ __forceinline__ __nv_bfloat16 spark_diag_nan_bf16(void) {
 // approximation), because the Sinkhorn-Knopp result is part of the numerical contract the CPU
 // reference defines; the stub in the clang probe provides declarations with no semantics.
 __device__ __forceinline__ float spark_exp(float x) { return expf(x); }
+// The logistic function of the released pre/post activations (inference/kernel.py:427, 429). f32
+// throughout, like the reference's sigmoid.
+__device__ __forceinline__ float spark_sigmoid(float x) { return 1.0f / (1.0f + spark_exp(-x)); }
 
 __device__ __forceinline__ float spark_sqrt(float x) { return sqrtf(x); }
 

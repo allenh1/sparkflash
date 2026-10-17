@@ -39,7 +39,7 @@ quoted with each row because the class is part of the number.
 
 | Stage | Kernel | Comparison class (printed before the numbers) | Measured on node0, 2026-10-17 | Device bytes |
 | :--- | :--- | :--- | :--- | ---: |
-| 1. mHC | `mega_mhc_fused_bf16_sm121` | Internal consistency against the in-crate f32 reference on real layer-0 bytes; **not model fidelity** (excludes `hc_attn_base`; `C` softmaxed by the harness; tasks 40, 38). | **20,480/20,480 bit-exact**; scales **160/160**; **p50 0.0227 ms**/launch | < 1 MiB |
+| 1. mHC | `mega_mhc_fused_bf16_sm121` | Internal consistency against the in-crate f32 reference on real layer-0 bytes; **not model fidelity** (the predictor is the stream-mean fold). The released class (D22: `hc_attn_base` and `hc_attn_scale` consumed, `C` compared raw, released split-Sinkhorn) is what the current code prints and what the owed re-run will measure. | **20,480/20,480 bit-exact**; scales **160/160**; **p50 0.0227 ms**/launch — **measured on the pre-released-arithmetic kernel**; the released-arithmetic re-run is owed (section 3.6) | < 1 MiB |
 | 2. Attention | `flash_mla_csa2_sm121` | Tolerance 99.5 % exact, abs delta at most 1.6e-2; **sink excluded both sides** (task-36); candidates harness-supplied; indexer outputs not compared. | **163,833/163,840 = 99.9957 %**; **5.73 ms** = **4.27 ms indexer** + **1.46 ms attention** | **4.2 MiB** |
 | 3. MoE combine | `b12x_mxfp4_moe_sm121` | Tolerance 99.9 % exact, at most 2 bf16 codes; **router on the host seam**; gate/up, SwiGLU, quantiser host; 8/32/64 resident experts. | **20,480/20,480 exact, max ULP 0**; **0.821 / 0.847 / 0.850 ms per token** over four chained launches | 100–802 MB |
 
@@ -199,8 +199,9 @@ believing a 40-layer run.
 normalisations": it is softmax over the key axis, then `+eps` and divide by `(colsum + eps)`, then
 19 alternating passes ([../architecture/02-mhc.md](../architecture/02-mhc.md) section 8, delta D3;
 `kernel.py:437-458`). The kernel publishes the raw coefficient logits `C` instead, and the M7 harness
-compensates by applying the softmax itself before comparing (`m7_layer0.rs:681`: "C-after-softmax
-within 1e-4"). The compensation is honest in the harness and fatal in an engine: every consumer of
+compensates by applying the softmax itself before comparing (the pre-change harness printed
+"C-after-softmax within 1e-4"; this MR deletes that line and the
+compensation). The compensation is honest in the harness and fatal in an engine: every consumer of
 the coefficients would have to reproduce it, and any consumer that did not would still "pass" the
 stage that was supposed to catch it.
 
@@ -210,34 +211,51 @@ correct schedule from a plausible one). The harness loses its softmax and compar
 
 **Proven by.** `m7_layer0 --stage 1` compares the kernel's raw `C` against the reference's `C` at
 1e-4, with a deliberately non-trivial token (a real embedding row, not zeros); and a test asserts
-that the harness no longer transforms the kernel's output — so the check fails today and cannot
-silently return to the harness-side compensation.
+that the harness no longer transforms the kernel's output — so the check cannot silently return to
+the harness-side compensation.
+
+**Status (D22).** The kernel publishes the normalised released `C`, the harness compares it raw (the
+softmax is deleted), and `spark_released_split_sinkhorn` plus
+`the_released_split_sinkhorn_adds_eps_once_before_the_first_column_pass` pin the epsilon placement;
+the stage-1 device run that would re-measure it is owed a window (section 3.6).
 
 ### 3.2 task-39 — `hc_stats` is not deterministic
 
 **What is wrong.** The kernel accumulates the sum of squares with `fp32 atomicAdd`, so the addition
 order is not fixed. The harness's own finding line says what that costs: `1/rms` differs because of
-the atomic order, and the difference moves a value across an E4M3 boundary — **6 of 5,120 FP8 codes
-moved between runs** on identical input (`m7_layer0.rs:928-936`). A nondeterministic quantiser
+the atomic order, and on identical input the pre-change stage-4 repeat measured **one differing byte
+between run 0 and a later run**. (The separate 6-of-5,120 FP8-code difference is stage 1's
+device-versus-reference finding, a different comparison; it is not evidence of nondeterminism.) A nondeterministic quantiser
 upstream of every layer's activation makes "byte-identical" untestable and makes the difference
 between a real regression and a scheduling accident invisible.
 
 **What we build.** A deterministic reduction of the 5,120-wide sum: one block per row, per-lane
 partials, a shuffle tree, then a fixed-order cross-warp combine in shared memory. The cost is
-negligible at 0.0227 ms per launch, and it must apply to every kernel that accumulates a
-normalisation statistic, not only this one.
+negligible next to the 5.73 ms attention stage (0.0227 ms/launch on the pre-change kernel), and it must
+apply to every kernel that accumulates a normalisation statistic, not only this one.
 
-**Proven by.** A new test, `m7_determinism`, runs `--stage 1` N = 100 times on the same input and
-asserts that `hc_stats`, the 5,120 FP8 codes and the 160 scale bytes are byte-identical across all
-runs. It fails today (the six-code move is the evidence) and passes after the fix. One device window
+**Proven by.** The measurement is `m7_layer0 --stage 4 --repeat 100`: the same input bytes 100
+times, requiring `hc_stats`, the 5,120 FP8 codes and the 160 scale bytes to be byte-identical across
+all runs. The host halves pin the fixed-slot structure (`crates/sparkflash-kernels/tests/mhc_determinism.rs`)
+and the D21 contract (`crates/sparkflash-kernels/tests/determinism_contract.rs`) without a device. The old fp32 `atomicAdd` reduction failed the
+contract by construction (tile arrival order changed `hc_stats`), and on identical input the
+pre-change stage-4 run measured one differing byte between run 0 and a later run. One device window
 suffices; the harness already exists.
+
+**Status.** The kernel change is in (fixed slot per tile, binary64 tile-order combine,
+`kernels/mega_mhc_sm121.cu:197-222`), the harness's stage 4 is the N = 100 exact-bytes measurement,
+`crates/sparkflash-kernels/tests/mhc_determinism.rs` pins the kernel structure without a device, and
+`crates/sparkflash-kernels/tests/determinism_contract.rs` pins the D21 contract. The device run is owed: on 2026-10-17 the launcher refused with
+`cuCtxCreate_v2 -> 2 (OUT_OF_MEMORY)` because the resident model holds the only usable context —
+a capacity fact, recorded rather than worked around.
 
 ### 3.3 task-40 — `hc_attn_base` is dropped by the kernel and by our reference
 
 **What is wrong.** Every layer's checkpoint carries an `hc_attn_base` of 24 f32 values — an additive
 per-coefficient bias — and neither the kernel's `H()` nor our reference's `h_of` has a term for it.
-The harness reads the tensor only to print its range and says so: "not consumed: see the gap line"
-(`m7_layer0.rs:683-687`). The released forward models it; task-40 records the gap. A model-fidelity
+The harness reads the tensor only to print its range and says so; the pre-change harness printed
+"not consumed: see the gap line", and this MR deletes both the
+line and the gap. The released forward models it; task-40 records the gap. A model-fidelity
 claim cannot be made while a per-layer parameter that the released forward consumes is absent from
 both sides of a two-sided comparison — the comparison is self-consistent, and wrong.
 
@@ -249,6 +267,13 @@ argument. The stage-1 comparison starts consuming the tensor it already reads.
 `hc_attn_base` and asserts the coefficients move by exactly the bias's effect; and the stage-1
 comparison passes with the bias consumed. The ABI change is the same shape as every later kernel ABI
 change: versioned in the launcher, recorded in the MR.
+
+**Status.** The reference takes the bias first (`bias_into_kernel_rows`, `mega_mhc_ref.rs:606`), the
+kernel takes `hc_base` as an ABI argument (`kernels/mega_mhc_sm121.cu:93`, `m4_abi.rs` signature
+pin), the harness's "not consumed" line is gone, and
+`the_released_scale_multiplies_each_group_before_the_bias_is_added` drives a non-zero bias. This MR
+also takes `hc_attn_scale` into the kernel, which closes roadmap-section-10 unknown 1 on the same
+path.
 
 ### 3.4 task-43 — the baseline does not know the seventh kernel, and the flash_mla fix is unreviewable
 
@@ -268,11 +293,11 @@ seven-entry file with the seven-kernel check.
 **Proven by.** `check-kernel-baseline.sh` green on `!26`, CI green, and the baseline header naming
 seven kernels instead of six.
 
-### 3.5 The determinism contract we adopt here (proposed decision entry)
+### 3.5 The determinism contract we adopt here (adopted as D21)
 
-The project needs one sentence that every later test can cite, and it should become a new
-[DECISIONS.md](../DECISIONS.md) entry when Phase 0 closes (this document does not edit
-`DECISIONS.md`):
+The project needs one sentence that every later test can cite, and it is now entry
+[D21](../DECISIONS.md) in `DECISIONS.md`; `crates/sparkflash-kernels/tests/determinism_contract.rs`
+fails if a statement or the harness's citation of it disappears:
 
 - **D-a: kernel determinism.** For fixed input bytes, launch configuration and device, a forward
   kernel's output bytes are identical on every run. The M7 harness's per-stage runs did not test it;
@@ -292,13 +317,27 @@ Each of these is a test that can fail, not a checklist item:
 1. `m7_layer0 --stage 1` passes with **raw `C`** compared (no harness-side softmax) and
    `hc_attn_base` consumed; the harness prints neither the "not consumed" nor the "C-after-softmax"
    caveat.
-2. `m7_determinism` (N = 100, same input) passes: `hc_stats`, FP8 codes and scales byte-identical.
+2. `m7_layer0 --stage 4 --repeat 100` (same input) passes: `hc_stats`, FP8 codes and scales
+   byte-identical; its host-side structural half is `crates/sparkflash-kernels/tests/mhc_determinism.rs`.
 3. `check-kernel-baseline.sh` green on `!26`; the baseline names seven kernels and records the
    `flash_mla` fix.
 4. A test asserts the three D-a/D-b/D-c statements exist and are cited by the harness's output — a
-   "contract is checked, not described" test.
-5. `cargo test -p sparkflash-kernels --test kernel_baseline` and `--test m7_determinism` green in CI
-   without a device (the determinism test skips with a refusal, not a silent pass).
+   "contract is checked, not described" test. It is
+   `determinism_contract::the_determinism_contract_is_written_down_and_the_harness_cites_it`
+   (`crates/sparkflash-kernels/tests/determinism_contract.rs`).
+5. `cargo test -p sparkflash-kernels --test kernel_baseline`, `--test mhc_determinism` and
+   `--test determinism_contract` green in CI without a device. The determinism and contract tests
+   have no device skip path; `kernel_baseline` skips its nvcc comparison when nvcc is absent, and
+   the CI `cuda-abi` job runs `check-kernel-baseline.sh` in the pinned container, so the baseline
+   gate is enforced there rather than by the skip.
+
+**Status of this list.** Items 3, 4 and 5 are met on the branch that closes Phase 0: the baseline is
+regenerated under the pinned V12.9.86 (`check-kernel-baseline.sh` green, seven entries), item 4's test
+is in `tests/determinism_contract.rs`, and the harness and contract tests run without a device. Item 1 is met in
+the code (raw `C`, both released tensors consumed, no caveat lines) and item 2's structural halves are in
+(`mhc_determinism.rs`, `determinism_contract.rs`); both device halves (`--stage 1`, `--stage 4 --repeat 100`) are owed a window: the
+node's resident model holds the only usable CUDA context, and the launcher refuses a second one with
+the listed OUT_OF_MEMORY message rather than working around it.
 
 ### 3.7 Tasks
 
@@ -575,7 +614,7 @@ number that is comparable to vLLM's on the same prompt and batch.
 
 | Term | Per token | Source |
 | :--- | ---: | :--- |
-| mHC (40 layers times 0.0227 ms) | 0.9 ms | measured stage 1 |
+| mHC (40 layers times 0.0227 ms) | 0.9 ms | measured stage 1, pre-change kernel |
 | Attention proper (40 times 1.46 ms) | 58.4 ms | measured stage 2 |
 | **Indexer (40 times 4.27 ms)** | **170.8 ms** | measured stage 2 |
 | MoE combine (40 times about 0.85 ms) | 34 ms | measured stage 3 |
@@ -985,19 +1024,45 @@ Each is a real gap with a test that would close it; none is a caveat to be waved
    reading of the reference, not a confirmed device-versus-reference boundary. Test: a stage-1 run
    with a deliberately perturbed scale vector must move the coefficients by exactly the folded
    amount; if it does not, the fold is in the wrong place.
+   **Closed (D22).** The fold is gone: the kernel takes `hc_scale[3]` itself and applies it with
+   `hc_base` after the projection rstd, the reference is
+   `mega_mhc_ref::mega_mhc_layer_with_scale`, and
+   `the_released_scale_multiplies_each_group_before_the_bias_is_added` pins the scaled-then-biased
+   order against the reference's own arithmetic.
 2. **The pre/post activation pairing in mHC is our reading.** The split of the 24 predictor rows into
-   `A` (sigmoid), `B` (2 times sigmoid) and `C` (16, Sinkhorn) follows the reference's code, but the
+   `A` (pre, `sigmoid + hc_eps`), `B` (comb, the 16 Sinkhorn rows) and `C` (post, `2 * sigmoid`)
+   follows the reference's code, but the
    stage-1 comparison would pass a wrong *pairing* as long as both sides made the same mistake. Test:
    a reference-side unit test against the released kernel's row semantics, not against our port.
+   **Closed (D22).** `the_fold_puts_each_released_row_on_its_kernel_row`,
+   `the_released_pre_and_post_activations_are_sigmoids_not_softmaxes` and
+   `the_released_split_sinkhorn_adds_eps_once_before_the_first_column_pass` (plus
+   `the_released_split_sinkhorn_runs_iterations_minus_one_pairs`, which enters the pair loop) pin the
+   row mapping, the activations and the released schedule; `mega_mhc_ref.rs:606,683` are the mapping
+   functions.
 3. **The attention sink (task-36) is reference-only today.** The reference half is committed
    (`feat/attn-sink-ref`, `8c0c524`, not pushed); the kernel ABI is a separate MR. Until it lands,
    stage 2 is internal consistency with the sink excluded on both sides, and the run says so.
 4. **`hc_attn_base` (task-40)** is consumed by neither side (section 3.3).
+   **Closed (D22).** Both sides consume it: the kernel takes it as an ABI argument and
+   `bias_into_kernel_rows` puts the 24 values in the kernel's row order; the harness no longer
+   prints a "not consumed" line.
 5. **The seventh kernel has no device-versus-reference comparison** (task-43): it is the only
    arithmetic in the chain with no numeric check at all.
 6. **The mHC `C` normalisation (task-38)** is compared after a harness-side softmax; the epsilon
    placement of D3 is not proven by the stage as it stands.
-7. **`hc_stats` is nondeterministic (task-39)**: 6 of 5,120 FP8 codes moved between runs.
+   **Closed (D22).** `C` is compared raw on both sides, the harness-side softmax is deleted, and
+   `spark_released_split_sinkhorn` plus
+   `the_released_split_sinkhorn_adds_eps_once_before_the_first_column_pass` pin the released epsilon
+   placement (one `+ eps` after the row softmax, one unconditional column pass, then 19 row/column
+   pairs, each dividing by `sum + eps`).
+7. **`hc_stats` is nondeterministic (task-39)**: the statistic was accumulated with an fp32
+   atomicAdd, so tile arrival order changed it between runs (the unrelated 6-of-5,120 code difference
+   was stage 1's device-versus-reference finding, not a two-run difference).
+   **Closed in code (D21).** The fp32 atomicAdd is gone: each tile writes a slot fixed by
+   `blockIdx` and the four partials are summed in tile order in binary64
+   (`kernels/mega_mhc_sm121.cu:197-222`), with the structure pinned by
+   `mhc_determinism.rs`. The N = 100 device run is owed a window, like unknown 1's stage-1 run.
 8. **No bytes have ever moved on the four-node fabric.** The ibverbs backend is a skeleton, the two
    hardware collective tests are panic stubs, and the 10 KiB gate is unmeasured.
 9. **The NCCL ring path's reduction order (and therefore R2) is unknown** for prefill payloads above
@@ -1044,9 +1109,9 @@ merged and the slice documented), and they feed Phase 0/1 rather than being repl
 
 | Number | Value | Host | How measured |
 | :--- | :--- | :--- | :--- |
-| mHC residual streams | 20,480/20,480 bit-exact | node0, 2026-10-17 | `m7_layer0 --stage 1`, real layer-0 bytes |
-| mHC ue8m0 scales | 160/160 bit-exact | node0, 2026-10-17 | same |
-| mHC kernel time | p50 0.0227 ms/launch | node0, 2026-10-17 | same |
+| mHC residual streams | 20,480/20,480 bit-exact | node0, 2026-10-17 | `m7_layer0 --stage 1`, real layer-0 bytes; **pre-released-arithmetic kernel, re-run owed** |
+| mHC ue8m0 scales | 160/160 bit-exact | node0, 2026-10-17 | same; **pre-released-arithmetic kernel, re-run owed** |
+| mHC kernel time | p50 0.0227 ms/launch | node0, 2026-10-17 | same; **pre-released-arithmetic kernel, re-run owed** |
 | Attention outputs | 163,833/163,840 = 99.9957 % exact | node0, 2026-10-17 | `--stage 2`, `--tokens 130` (128-token window) |
 | Attention kernel time | 5.73 ms/launch = 4.27 indexer plus 1.46 attention | node0, 2026-10-17 | same, event timing over repeats |
 | Attention device bytes | 4.2 MiB (`index_key` 4 MiB) | node0, 2026-10-17 | printer from the harness's planned layout |

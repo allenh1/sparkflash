@@ -19,19 +19,35 @@
 //
 // H() interpretation, stated plainly because the specification does not fix its internals
 // (2.4 only says "RMSNorm weights folded offline into the predictor projection"): the folded
-// predictor is a (n*n + 2n) x d matrix applied to the stream mean of X_l. Its first n*n rows
-// are the raw stream-mixing logits (exponentiated and Sinkhorn-normalised into B), the next n
-// rows are the input-mixing logits (softmax into A), and the last n rows are C. The predictor
-// input is the mean across the n streams, so H() costs (n*n + 2n)*d multiply-accumulates, and
-// the 25 accumulated scalars per tile are what the grid reduces.
+// predictor is a (n*n + 2n) x d matrix applied to the stream mean of X_l, in the released row
+// order pre(0..n) / post(n..2n) / comb(2n..2n+n*n) permuted into this kernel's coefficient order
+// B(0..n*n) / A(n*n..n*n+n) / C(n*n+n..). The released arithmetic is applied to the accumulated
+// values, in the released order (inference/kernel.py:426-458):
 //
-// Verification status: this kernel has never been executed - there is no GPU on the development
-// host. It is compiled for sm_121a by nvcc 12.9.1 through the build-script probe (PTX and
-// cubin), parsed by the clang CUDA frontend against stub headers when nvcc is absent, and its
+//   mixes   = projection * rsqrt(mean(X_l^2) + norm_eps)   over the flattened n*d stream
+//   A_j     = sigmoid(mixes_j * hc_scale[0] + hc_base_j) + hc_eps
+//   C_j     = 2 * sigmoid(mixes_{j+n} * hc_scale[1] + hc_base_{j+n})
+//   comb    = released split-Sinkhorn(mixes_{comb} * hc_scale[2] + hc_base_{comb})
+//
+// with hc_base in this kernel's row order and hc_scale in the released [pre, post, comb] order.
+// The two different RMS statistics the release needs are both accumulated per tile: the sum of
+// squares of X_hat over d (the block input's RMSNorm) and the sum of squares of the four streams
+// over the flattened n*d input (the projection's rsqrt). Together with the 24 projection rows
+// that is 26 accumulated scalars per tile.
+//
+// Verification status: compiled for sm_121a by nvcc 12.9.1 through the build-script probe (PTX
+// and cubin), parsed by the clang CUDA frontend against stub headers when nvcc is absent, and its
 // ABI is pinned by static asserts here plus parsed-declaration tests in
-// crates/sparkflash-kernels/src/m4_abi.rs. The numerics are defined and tested by
-// mega_mhc_ref.rs on the CPU. Runtime behaviour - the grid rendezvous in particular - is NOT
-// verified and must not be claimed until it runs on hardware.
+// crates/sparkflash-kernels/src/m4_abi.rs. The numerics are defined by mega_mhc_ref.rs on the CPU.
+//
+// Earlier revisions of this kernel (the pre-released-arithmetic ABI) ran on hardware: then
+// examples/m7_layer0.rs stage 1 matched the CPU reference on four layer-0 tokens, and stage 4
+// launched the same input ten times with byte-identical output. The ABI below - hc_scale and
+// hc_base, 26 statistics, released pre/post/comb - has NOT run on storage: the node's resident
+// model holds the only usable CUDA context, so the stage-1 and stage-4 device runs are owed. That
+// stage is the regression test for the reduction below: the four block partials go to slots fixed
+// by blockIdx and are combined in tile order in binary64, so the order the blocks reach the
+// rendezvous cannot change hc_stats. The old fp32 atomicAdd sequence could and did.
 
 #include "m4_common_sm121.cuh"
 
@@ -40,10 +56,20 @@
 #define SPARK_M4_MHC_TILE_ELEMS 1280u
 #define SPARK_M4_MHC_TILES (SPARK_M4_HIDDEN / SPARK_M4_MHC_TILE_ELEMS)
 #define SPARK_M4_MHC_THREADS 128u
-// One dot product per predictor row plus the sum of squares of the stream mean.
-#define SPARK_M4_MHC_STATS (SPARK_M4_HC_PREDICTOR_ROWS + 1u)
+// One dot product per predictor row, then the two different sums of squares the released model
+// needs: one over X_hat for the block RMS pre-norm, one over the four streams for the
+// coefficient projection's rsqrt. Keeping them apart is not a refinement: they are different
+// functions of the input, and the old single "sum of squares of the stream mean" was neither.
+#define SPARK_M4_MHC_STATS (SPARK_M4_HC_PREDICTOR_ROWS + 2u)
 // hc_sync[0] counts finished tiles, hc_sync[1] is the coefficients-ready flag.
 #define SPARK_M4_MHC_SYNC_WORDS 2u
+// hc_stats is one final statistics vector plus one block-reduced partial vector per tile:
+//
+//   hc_stats[0 .. STATS)                         the 26 final statistics (published output)
+//   hc_stats[(tile + 1) * STATS .. + STATS)      tile's partials (grid scratch)
+//
+// The launcher must allocate SPARK_M4_MHC_GRID_STATS floats, not STATS.
+#define SPARK_M4_MHC_GRID_STATS (SPARK_M4_MHC_STATS * (SPARK_M4_MHC_TILES + 1u))
 
 static_assert(SPARK_M4_MHC_TILES == 4u, "the sweep is four tiles");
 static_assert(SPARK_M4_MHC_TILE_ELEMS * SPARK_M4_MHC_TILES == SPARK_M4_HIDDEN,
@@ -53,7 +79,8 @@ static_assert(SPARK_M4_MHC_TILE_ELEMS % SPARK_M4_QUANT_BLOCK == 0u,
 static_assert(SPARK_M4_MHC_TILES * SPARK_M4_MHC_THREADS >= SPARK_M4_MHC_STATS,
               "the block reduction needs at least one thread per statistic");
 static_assert(SPARK_M4_MHC_THREADS % 32u == 0u, "a block is a whole number of warps");
-static_assert(SPARK_M4_MHC_STATS == 25u, "24 predictor rows plus one sum of squares");
+static_assert(SPARK_M4_MHC_STATS == 26u,
+              "24 predictor rows plus the block RMS and the coefficient RMS statistics");
 
 extern "C" __global__ void mega_mhc_fused_bf16_sm121(
     __nv_bfloat16 *__restrict__ x,              // [n][d] residual streams, updated in place
@@ -61,11 +88,13 @@ extern "C" __global__ void mega_mhc_fused_bf16_sm121(
     const float *__restrict__ b_prev,           // [n][n] row-major stream mixing of layer l-1
     const float *__restrict__ c_prev,           // [n] block-output weights of layer l-1
     const float *__restrict__ a_prev,           // [n] input-mixing weights of layer l-1
-    const float *__restrict__ predictor,        // [n*n + 2n][d] folded H() predictor
+    const float *__restrict__ predictor,        // [n*n + 2n][d] folded H() predictor, kernel row order
+    const float *__restrict__ hc_scale,         // [3] released per-group scale: pre, post, comb
+    const float *__restrict__ hc_base,          // [n*n + 2n] released per-row bias, kernel row order
     const float *__restrict__ rms_weight,       // [d] folded input RMS pre-norm weight
     uint8_t *__restrict__ xhat_fp8,             // [d] E4M3 block input, one byte per element
     uint8_t *__restrict__ xhat_scales,          // [d / 32] ue8m0 scales, one per MX block
-    float *__restrict__ hc_stats,               // [25] grid scratch: dot products, sum of squares
+    float *__restrict__ hc_stats,               // [GRID_STATS] final 26 + one partial vector per tile
     uint32_t *__restrict__ hc_sync,             // [2] grid scratch: tiles done, ready flag
     float *__restrict__ hc_coeffs,              // [24] out: B (n*n), A (n), C (n) for layer l
     float *__restrict__ hc_rms_out,             // [1] out: 1/rms(X_hat_l) used by the pre-norm
@@ -141,10 +170,17 @@ extern "C" __global__ void mega_mhc_fused_bf16_sm121(
         for (uint32_t p = 0; p < (uint32_t)SPARK_M4_HC_PREDICTOR_ROWS; ++p) {
             local[p] += mean * predictor[p * d + index];
         }
-        local[SPARK_M4_HC_PREDICTOR_ROWS] += mean * mean;
+        // The block RMSNorm's statistic is over X_hat (released model.py:984/991), and the
+        // projection's rsqrt statistic is over the flattened four-stream input (model.py:953-954).
+        local[SPARK_M4_HC_PREDICTOR_ROWS] += xhat * xhat;
+        float stream_squares = 0.0f;
+        for (uint32_t s = 0; s < n; ++s) {
+            stream_squares += updated[s] * updated[s];
+        }
+        local[SPARK_M4_HC_PREDICTOR_ROWS + 1u] += stream_squares;
     }
 
-    // Block-reduce the 25 statistics, then hand them to the grid.
+    // Block-reduce the 26 statistics, then hand them to the grid.
     for (uint32_t p = 0; p < SPARK_M4_MHC_STATS; ++p) {
         s_reduce[tid] = local[p];
         __syncthreads();
@@ -161,52 +197,77 @@ extern "C" __global__ void mega_mhc_fused_bf16_sm121(
     }
 
     if (tid == 0u) {
+        // Deterministic grid reduction. The slot a tile writes is fixed by blockIdx, so the buffer
+        // does not depend on arrival order; the fence makes this tile's 26 partials visible before
+        // the counter that counts it, the same publish order the RoCEnante kernel uses.
         for (uint32_t p = 0; p < SPARK_M4_MHC_STATS; ++p) {
-            atomicAdd(&hc_stats[p], s_stats[p]);
+            hc_stats[(tile + 1u) * SPARK_M4_MHC_STATS + p] = s_stats[p];
         }
-        // The fence makes this tile's statistics visible before the counter that counts it, the
-        // same publish order the RoCEnante kernel uses for its doorbell.
         __threadfence();
         const uint32_t done = atomicAdd(&hc_sync[0], 1u) + 1u;
         if (done == (uint32_t)SPARK_M4_MHC_TILES) {
+            // All four partial vectors are visible. Combine them in TILE order in binary64: every
+            // partial is a binary32 value, and the sum of four of them is exact in binary64 (its
+            // significand needs at most 26 bits against binary64's 53) for any realistic exponent
+            // spread, so the cast below performs the one rounding the fp32 atomicAdd sequence used
+            // to perform four times in an order the host could not fix. The result is therefore
+            // independent of which tile arrives last, and repeated launches of the same input
+            // publish byte-identical hc_stats.
+            float total[SPARK_M4_MHC_STATS];
+            for (uint32_t p = 0; p < SPARK_M4_MHC_STATS; ++p) {
+                double sum = 0.0;
+                for (uint32_t b = 0u; b < (uint32_t)SPARK_M4_MHC_TILES; ++b) {
+                    sum += (double)hc_stats[(b + 1u) * SPARK_M4_MHC_STATS + p];
+                }
+                total[p] = (float)sum;
+                hc_stats[p] = total[p];
+            }
             // Last tile of the sweep: solve H(X_l) and publish the coefficients for layer l.
+            // Released order: the projection takes its rsqrt factor first (model.py:953-954),
+            // then each group is scaled and biased (inference/kernel.py:426-431).
+            const float coefficient_rstd =
+                1.0f / spark_sqrt(total[SPARK_M4_HC_PREDICTOR_ROWS + 1u] / (float)(n * d) +
+                                  (float)SPARK_M4_NORM_EPS);
+            // mixing is in the RELEASED [source][destination] orientation, the orientation the
+            // released schedule's row softmax and column passes assume (D3).
             float mixing[SPARK_M4_HC_MULT][SPARK_M4_HC_MULT];
             float input[SPARK_M4_HC_MULT];
             float output[SPARK_M4_HC_MULT];
-            for (uint32_t r = 0; r < n; ++r) {
-                for (uint32_t c = 0; c < n; ++c) {
-                    mixing[r][c] = spark_exp(hc_stats[r * n + c]);
+            for (uint32_t source = 0; source < n; ++source) {
+                for (uint32_t destination = 0; destination < n; ++destination) {
+                    // This kernel's row order is B[destination][source]; the released comb is
+                    // [source][destination].
+                    const uint32_t row = destination * n + source;
+                    mixing[source][destination] =
+                        total[row] * coefficient_rstd * hc_scale[2] + hc_base[row];
                 }
             }
-            spark_sinkhorn_knopp(mixing, (uint32_t)SPARK_M4_HC_SINKHORN_ITERS,
-                                 (float)SPARK_M4_HC_EPS);
-            // A is a softmax over the n input-mixing logits.
-            float amax = hc_stats[n * n];
-            for (uint32_t s = 1; s < n; ++s) {
-                const float candidate = hc_stats[n * n + s];
-                amax = candidate > amax ? candidate : amax;
+            spark_released_split_sinkhorn(mixing, (uint32_t)SPARK_M4_HC_SINKHORN_ITERS,
+                                          (float)SPARK_M4_HC_EPS);
+            // A_j = sigmoid(mix_j * scale[0] + base_j) + hc_eps (kernel.py:427).
+            for (uint32_t j = 0; j < n; ++j) {
+                const float mix = total[n * n + j] * coefficient_rstd;
+                input[j] = spark_sigmoid(mix * hc_scale[0] + hc_base[n * n + j]) +
+                           (float)SPARK_M4_HC_EPS;
             }
-            float asum = 0.0f;
-            for (uint32_t s = 0; s < n; ++s) {
-                input[s] = spark_exp(hc_stats[n * n + s] - amax);
-                asum += input[s];
+            // C_j = 2 * sigmoid(mix_{j+n} * scale[1] + base_{j+n}) (kernel.py:429). The post rows are
+            // the n rows after the pre rows, i.e. n*n + j, not 2*n*n + j: this kernel's row order is
+            // B(0..n*n)/A(n*n..n*n+n)/C(n*n+n..n*n+2n), and the stat that carries each group is the
+            // same row index, so C's two statistics are total[n*n+n+j] and hc_base[n*n+n+j].
+            for (uint32_t j = 0; j < n; ++j) {
+                const float mix = total[n * n + n + j] * coefficient_rstd;
+                output[j] = 2.0f * spark_sigmoid(mix * hc_scale[1] + hc_base[n * n + n + j]);
             }
-            const float ainverse = 1.0f / asum;
-            for (uint32_t s = 0; s < n; ++s) {
-                input[s] *= ainverse;
-                output[s] = hc_stats[2u * n * n + s];
-            }
-            for (uint32_t r = 0; r < n; ++r) {
-                for (uint32_t c = 0; c < n; ++c) {
-                    hc_coeffs[r * n + c] = mixing[r][c];
+            for (uint32_t destination = 0; destination < n; ++destination) {
+                for (uint32_t source = 0; source < n; ++source) {
+                    hc_coeffs[destination * n + source] = mixing[source][destination];
                 }
-                hc_coeffs[n * n + r] = input[r];
-                hc_coeffs[n * n + n + r] = output[r];
+                hc_coeffs[n * n + destination] = input[destination];
+                hc_coeffs[n * n + n + destination] = output[destination];
             }
-            // The RMS pre-norm of X_hat_l over the whole hidden dimension. eps keeps an
-            // all-zero block input finite; the CPU reference uses the same expression.
-            const float mean_square = hc_stats[SPARK_M4_HC_PREDICTOR_ROWS] / (float)d;
-            *hc_rms_out = 1.0f / spark_sqrt(mean_square + (float)SPARK_M4_HC_EPS);
+            // The RMS pre-norm of X_hat_l over the hidden dimension, with the released norm_eps.
+            const float mean_square = total[SPARK_M4_HC_PREDICTOR_ROWS] / (float)d;
+            *hc_rms_out = 1.0f / spark_sqrt(mean_square + (float)SPARK_M4_NORM_EPS);
             __threadfence();
             hc_sync[1] = 1u;
         }

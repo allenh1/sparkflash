@@ -26,19 +26,24 @@
 //!    three-pass variant is part of the test suite, not a comment.
 //!
 //! H is under-specified by the specification, which fixes its output shapes (n*n + 2n = 24 rows plus
-//! the accumulator) but not the internals. This module states the project's reading explicitly and
-//! implements it: the 24 predictor rows are applied to the mean over the four streams, the first 16
-//! are exponentiated and Sinkhorn-Knopp-normalised into the 4x4 matrix B, the next 4 are softmaxed
-//! into the 4-vector A, and the last 4 are softmaxed into C. A different reading would change these
-//! numbers and nothing in this file claims otherwise; what it does claim is that the shape and the
-//! traffic are the ones the kernel implements.
+//! the accumulators) but not the internals. This module states the project's reading explicitly and
+//! implements it: the 24 predictor rows are applied to the mean over the four streams, in the
+//! RELEASED row order pre(0..n) / post(n..2n) / comb(2n..2n+n*n) folded into this reference's
+//! kernel order by [`fold_predictor_into_kernel_rows`]; the first 16 kernel rows become the 4x4
+//! mixer B, the next 4 the input mix A and the last 4 the block-output weight C. How they are
+//! activated and normalised is not this module's choice: the released model uses
+//! `sigmoid(...) + hc_eps`, `2*sigmoid(...)` and the released split-Sinkhorn schedule, and an
+//! earlier version of this file softmaxed A and C and ran a generic Sinkhorn-Knopp on B. Those were
+//! semantic differences, not refinements; the released arithmetic is implemented by
+//! [`h_of_with_scale`] / [`mega_mhc_layer_with_scale`] and the softmax reading is still built,
+//! and labelled, by the no-bias and bias-only entry points.
 //!
 //! ## The per-coefficient bias: hc_attn_base / hc_ffn_base
 //!
 //! The released checkpoint carries a 24-value fp32 **bias** per predictor - `hc_attn_base` for the
 //! attention predictor and `hc_ffn_base` for the FFN one, one vector per layer. Neither the fused
 //! kernel nor this reference used to take it, so an M7 comparison ran with it silently absent. It is
-//! not a scale and not an output offset: `TransformerBlock.hc_mixes` computes
+//! not an output offset and not a per-token term: `TransformerBlock.hc_mixes` computes
 //!
 //! `mixes = F.linear(x.flatten(2).float(), hc_fn) * rsqrt(mean(x^2) + norm_eps)` (model.py:952-954)
 //! and then `hc_split_sinkhorn(mixes, hc_scale, hc_base, ...)` (model.py:955), whose body adds
@@ -50,10 +55,10 @@
 //! `comb[j][k] = mix[j*n + k + 2n] * scale[2] + base[j*n + k + 2n]` then softmax + Sinkhorn
 //!
 //! So: it is added before the softmax and before the Sinkhorn, it is added to the coefficient logits
-//! of all 24 rows (the 4 pre, the 4 post and the 16 comb), it is NOT multiplied by `hc_scale`, and
-//! it is a CONSTANT of the model - one vector per predictor, shared by every token, not a per-token
-//! term. `comb` is the 4x4 residual mixer (this reference's B), `pre` is the input mix (this
-//! reference's A) and `post` is the block-output weight (this reference's C).
+//! of all 24 rows (the 4 pre, the 4 post and the 16 comb), it is put on top of the scaled logit and
+//! never multiplied by the scale, and it is a CONSTANT of the model - one vector per predictor,
+//! shared by every token. `comb` is the 4x4 residual mixer (this reference's B), `pre` is the
+//! input mix (this reference's A) and `post` is the block-output weight (this reference's C).
 //!
 //! Two layouts therefore have to be reconciled, and the naive one is wrong. The checkpoint's row
 //! order is pre(0..n) / post(n..2n) / comb(2n..2n+n*n); this reference's H row order is B(0..n*n) /
@@ -66,18 +71,82 @@
 //! test shows that adding the vector index for index lands the pre/post values on the wrong
 //! coefficients.
 //!
-//! What this reference does NOT model, and does not claim to: `hc_scale` (the other absent tensor
-//! of the same formula - the logits here are raw), and the released pre/post ACTIVATIONS: the model
-//! uses `sigmoid` and `2*sigmoid` where this reference's H softmaxes A and C, a reading difference
-//! that predates this work and is described above. The bias enters where the released model puts it;
-//! how a logit then becomes a coefficient remains this reference's own reading.
+//! ## The released pre/post activation and hc_scale: a semantic change
 //!
-//! [`h_of`] and [`mega_mhc_layer`] are unchanged and remain the no-bias path;
+//! Two released behaviours were missing here, and both change the numbers rather than refine them.
+//! `hc_split_sinkhorn` is called with the checkpoint's `hc_scale` (model.py:948-955) and applies,
+//! after the projection and its rsqrt and BEFORE any non-linearity (inference/kernel.py:426-431):
+//!
+//! `pre[j]     = sigmoid(mix[j]         * hc_scale[0] + base[j])       + hc_eps`
+//! `post[j]    = 2 * sigmoid(mix[j + n] * hc_scale[1] + base[j + n])`
+//! `comb[j][k] = mix[j*n + k + 2n]      * hc_scale[2] + base[j*n + k + 2n]`
+//!
+//! with `hc_scale` the `[3]` tensor of model.py:945-946, in the order pre, post, comb, and
+//! `eps = self.hc_eps = 1e-6` (model.py:937, 955; the call site is model.py:955).
+//!
+//! * **The scale multiplies, then the bias is added.** The order is `mix * scale + base`, never
+//!   `(mix + base) * scale`, and the scale is per coefficient GROUP - one scalar for the four pre
+//!   rows, one for the four post rows, one for the sixteen comb rows - not per row.
+//!   [`scale_into_kernel_rows`] places the three scalars on the 24 rows in this reference's order,
+//!   [`h_of_with_scale`] and [`mega_mhc_layer_with_scale`] apply them, and a test pins the order
+//!   by computing both wrong orders and showing they land on different numbers.
+//! * **The pre and post activations are sigmoids, not softmaxes.** They do not normalise across the
+//!   four copies: each `pre` entry is independently `sigmoid(...) + hc_eps`, in
+//!   `(hc_eps, 1 + hc_eps)`, and each `post` entry is independently `2 * sigmoid(...)`, in
+//!   `(0, 2)`. This module's earlier reading softmaxed the four pre logits and the four post
+//!   logits, which forces each vector to sum to one and gives it a different shape entirely (at zero
+//!   logits, `0.25` each instead of `0.5 + eps` and `1.0`). That reading is retained as
+//!   [`PrePostActivation::Softmax`] because entry points were built on it, and every entry point now
+//!   says which reading it is:
+//!
+//!   - [`h_of`] and [`mega_mhc_layer`]: no bias, no scale, softmax A and C - the ORIGINAL reading.
+//!   - [`h_of_with_bias`] and [`mega_mhc_layer_with_bias`]: the checkpoint bias, no scale, softmax
+//!     A and C - the bias-only reading, unchanged.
+//!   - [`h_of_with_scale`] and [`mega_mhc_layer_with_scale`]: the checkpoint bias AND scale,
+//!     the projection rstd, the released sigmoid activation and the released comb schedule - the
+//!     reading a released-model comparison wants.
+//!
+//! The arithmetic AROUND the logits is now the released arithmetic, each piece with the source
+//! lines above and a test that separates it from the older reading:
+//!
+//! * **the projection rstd**: `rsqrt(mean(x^2) + norm_eps)` over the flattened `n*d` stream,
+//!   `norm_eps = 1e-20` (model.py:953-954; D4 in docs/architecture/02-mhc.md), applied BEFORE the
+//!   group scale and the bias. `coefficient_rstd` is the single definition; a test pins the
+//!   constant (1/sqrt(1e-20), not 1/sqrt(1e-6)) and the n*d mean.
+//! * **the comb schedule**: the released softmax-then-alternate schedule in the released
+//!   `[source][destination]` orientation (inference/kernel.py:436-458; D3), implemented by
+//!   [`released_split_sinkhorn`] and [`released_comb`] rather than by the generic
+//!   [`sinkhorn_knopp`]. A test transcribes the schedule by hand and compares every matrix entry.
+//! * **the block RMS statistic**: the RMSNorm of the COLLAPSED block input normalises X_hat with
+//!   X_hat's sum of squares over `d` and `norm_eps` (model.py:984, 991), not the streams' sum
+//!   over `n*d`, and not the Sinkhorn epsilon.
+//!
+//! The one remaining difference is structural rather than arithmetic: the predictor is the folded
+//! `[24, d]` matrix applied to the stream mean, while the release projects the flattened
+//! `[24, n*d]` stream (see [`fold_predictor_into_kernel_rows`]). Closing that needs a kernel that
+//! projects all four copies, which is a Phase-1 decision; no entry point in this file pretends the
+//! fold is the release's projection.
+//!
+//! ## Entry points
+//!
+//! [`h_of`] and [`mega_mhc_layer`] are the original no-bias, softmax-reading path;
 //! [`h_of_with_bias`] and [`mega_mhc_layer_with_bias`] take a checkpoint vector, and an all-zero
 //! vector reproduces the no-bias path bit for bit (a test asserts that for both the coefficients and
-//! the residual streams). What is still missing is the device side: kernels/mega_mhc_sm121 has no bias
-//! argument yet, so a device-vs-reference comparison is "bias excluded on both sides" until that ABI
-//! change lands, and nothing in this file claims otherwise.
+//! the residual streams). [`h_of_with_scale`] and [`mega_mhc_layer_with_scale`] additionally take
+//! `hc_scale` and use the released sigmoid activation: with `hc_scale = [1, 1, 1]` and a zero base
+//! they still differ from the no-bias path in A and C by construction, and that difference IS the
+//! semantic change.
+//!
+//! The device side now carries the same tensors and the same arithmetic: kernels/mega_mhc_sm121
+//! takes `hc_scale` [3] and `hc_base` [24] in this reference's row order, applies the projection
+//! rstd, the group scale and the bias, the sigmoid pre/post and the released split-Sinkhorn, and
+//! publishes the 26 accumulated statistics (the 24 projection rows plus the two RMS statistics) so
+//! the host can compare the whole coefficient chain raw. `examples/m7_layer0.rs` folds the
+//! released rows with [`fold_predictor_into_kernel_rows`], passes the bias through
+//! [`bias_into_kernel_rows`], passes the scale itself, and no longer pre-folds it into the
+//! predictor (doing both would apply it twice). The fold itself is the structural difference above,
+//! so a device-vs-reference comparison is an internal-consistency check of the released arithmetic,
+//! not yet a released-model bit comparison.
 
 use crate::m4_quant::{E4M3_ELEMENT_EMAX, QUANT_BLOCK, fp8_e4m3_encode, ue8m0_from_amax};
 
@@ -87,8 +156,15 @@ pub const HIDDEN: usize = 5120;
 pub const HC_MULT: usize = 4;
 /// Sinkhorn-Knopp iterations. Mirrors SPARK_M4_HC_SINKHORN_ITERS.
 pub const SINKHORN_ITERS: usize = 20;
-/// The Sinkhorn floor. Mirrors SPARK_M4_HC_EPS.
+/// The Sinkhorn floor. Mirrors SPARK_M4_HC_EPS: the epsilon added after the row softmax and to
+/// every later denominator, and the epsilon `pre` carries (inference/kernel.py:427, 443-458).
 pub const SINKHORN_EPS: f32 = 1e-6;
+/// The residual-stream RMS epsilon of the released model: `norm_eps = 1e-20` in the released
+/// `config.json`, used by `hc_mixes`'s `rsqrt(mean(x^2) + norm_eps)` and by the RMSNorm
+/// pre-norm over the collapsed block input (model.py:953-954; D4 in
+/// docs/architecture/02-mhc.md). It is NOT `hc_eps`: this reference used the Sinkhorn floor in
+/// both denominators, which is a defect the released entry points close.
+pub const NORM_EPS: f32 = 1e-20;
 /// The predictor rows H feeds on: n*n for B, 2n for A and C. Mirrors SPARK_M4_HC_PREDICTOR_ROWS.
 pub const PREDICTOR_ROWS: usize = HC_MULT * HC_MULT + 2 * HC_MULT;
 
@@ -102,9 +178,27 @@ pub const POST_ROWS_OFFSET: usize = HC_MULT;
 /// released layout.
 pub const COMB_ROWS_OFFSET: usize = 2 * HC_MULT;
 
+/// The number of per-group scales one predictor carries: pre, post, comb.
+pub const HC_SCALE_LEN: usize = 3;
+/// Position of the `pre` group's scalar in the checkpoint's `hc_scale`, the group this reference's
+/// A comes from (inference/kernel.py:427).
+pub const PRE_SCALE_INDEX: usize = 0;
+/// Position of the `post` group's scalar, the group this reference's C comes from
+/// (inference/kernel.py:429).
+pub const POST_SCALE_INDEX: usize = 1;
+/// Position of the `comb` group's scalar, the group this reference's B comes from
+/// (inference/kernel.py:431).
+pub const COMB_SCALE_INDEX: usize = 2;
+
 /// The 24 per-coefficient biases of one predictor (`hc_attn_base` or `hc_ffn_base`), as the
 /// checkpoint ships them: pre(0..n) / post(n..2n) / comb(2n..2n+n*n), one f32 per H row.
 pub type HcBase = [f32; PREDICTOR_ROWS];
+
+/// The three per-group scales of one predictor (`hc_attn_scale` or `hc_ffn_scale`), as the
+/// checkpoint ships them: `[pre, post, comb]`, one f32 per coefficient GROUP (model.py:945-946,
+/// inference/kernel.py:426-431). Not one per row; [`scale_into_kernel_rows`] expands it onto the
+/// 24 rows of this reference's H order.
+pub type HcScale = [f32; HC_SCALE_LEN];
 
 /// A buffer whose writes are counted by its own accessor, so a write cannot be added without
 /// moving the ledger. Nothing in this reference pushes into a bare Vec and then reports a count it
@@ -349,8 +443,13 @@ pub struct Coefficients {
 
 /// The 24 raw predictor logits: one dot product per row against the mean of the four streams.
 ///
-/// Raw is the point: the released model adds hc_base to these numbers and only then applies its
-/// non-linearities, so the bias path ([`h_of_with_bias`]) needs them unactivated.
+/// Raw is the point: the released model multiplies these numbers by hc_scale, adds hc_base and only
+/// then applies its non-linearities, so the bias and scale paths ([`h_of_with_bias`],
+/// [`h_of_with_scale`]) need them unactivated and unscaled.
+///
+/// Note what is NOT here: the release also multiplies the projection by
+/// `rsqrt(mean(x^2) + norm_eps)` (model.py:953-954); this reference does not, which is listed as a
+/// remaining difference in the module docs.
 ///
 /// # Panics
 /// Panics if the predictor is not the folded (n*n + 2n) by d matrix.
@@ -374,30 +473,108 @@ fn predictor_rows(registers: &mut Registers, predictor: &[f32]) -> [f32; PREDICT
     rows
 }
 
-/// This reference's split of 24 logits into B, A and C. Shared by the bias and no-bias entry points,
-/// so the two cannot diverge in the part that is not the bias.
+/// How the four `pre` logits become the A vector and the four `post` logits the C vector.
+///
+/// The B path is shared by both variants, so the two readings cannot diverge in the part that is not
+/// the A/C activation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrePostActivation {
+    /// The released `hc_split_sinkhorn` (inference/kernel.py:427,429): `pre[j] =
+    /// sigmoid(logit[j]) + hc_eps` and `post[j] = 2 * sigmoid(logit[j])`, independently for each
+    /// entry, with no normalisation across the four copies.
+    ReleasedSigmoid,
+    /// This module's EARLIER reading: an independent softmax over the four `pre` logits and another
+    /// over the four `post` logits, so each vector sums to one. This is NOT the released arithmetic;
+    /// it is kept because [`h_of`], [`h_of_with_bias`], [`mega_mhc_layer`] and
+    /// [`mega_mhc_layer_with_bias`] were built on it and their numbers are pinned by tests.
+    Softmax,
+}
+
+/// This reference's split of 24 logits into B, A and C, under either reading of the A/C activation.
+///
+/// B follows the activation too, because the two readings were built at different times: the softmax
+/// reading (the original entry points, whose numbers are pinned) uses this module's own
+/// [`sinkhorn_knopp`] on exponentiated logits, while the released reading uses
+/// [`released_comb`], which is the released softmax-then-alternate schedule in the released
+/// orientation. A and C: [`PrePostActivation`].
+#[must_use]
+pub fn coefficients_from_rows_with(
+    rows: &[f32; PREDICTOR_ROWS],
+    activation: PrePostActivation,
+) -> Coefficients {
+    let b = match activation {
+        // The original reading, unchanged: exponentiate and run the generic Sinkhorn-Knopp.
+        PrePostActivation::Softmax => {
+            let mut b = [[0.0f32; HC_MULT]; HC_MULT];
+            for i in 0..HC_MULT {
+                for j in 0..HC_MULT {
+                    b[i][j] = rows[i * HC_MULT + j].exp();
+                }
+            }
+            sinkhorn_knopp(&mut b, SINKHORN_ITERS, SINKHORN_EPS);
+            b
+        }
+        PrePostActivation::ReleasedSigmoid => released_comb(rows),
+    };
+
+    let (a, c) = match activation {
+        PrePostActivation::Softmax => (
+            softmax4(&rows[HC_MULT * HC_MULT..HC_MULT * HC_MULT + HC_MULT]),
+            softmax4(&rows[HC_MULT * HC_MULT + HC_MULT..PREDICTOR_ROWS]),
+        ),
+        PrePostActivation::ReleasedSigmoid => (
+            released_pre(&rows[HC_MULT * HC_MULT..HC_MULT * HC_MULT + HC_MULT]),
+            released_post(&rows[HC_MULT * HC_MULT + HC_MULT..PREDICTOR_ROWS]),
+        ),
+    };
+    Coefficients { b, a, c }
+}
+
+/// This reference's EARLIER split, for the no-bias and bias-only entry points: the softmax reading of
+/// A and C. Kept as one named function so it is obvious which reading a caller gets.
 #[must_use]
 fn coefficients_from_rows(rows: &[f32; PREDICTOR_ROWS]) -> Coefficients {
-    // B: exponentiate the n*n rows and run Sinkhorn-Knopp.
-    let mut b = [[0.0f32; HC_MULT]; HC_MULT];
-    for i in 0..HC_MULT {
-        for j in 0..HC_MULT {
-            b[i][j] = rows[i * HC_MULT + j].exp();
-        }
-    }
-    sinkhorn_knopp(&mut b, SINKHORN_ITERS, SINKHORN_EPS);
+    coefficients_from_rows_with(rows, PrePostActivation::Softmax)
+}
 
-    // A and C: softmax over n rows each.
-    let a = softmax4(&rows[HC_MULT * HC_MULT..HC_MULT * HC_MULT + HC_MULT]);
-    let c = softmax4(&rows[HC_MULT * HC_MULT + HC_MULT..PREDICTOR_ROWS]);
-    Coefficients { b, a, c }
+/// The logistic function, in f32.
+#[must_use]
+pub fn sigmoid(value: f32) -> f32 {
+    1.0 / (1.0 + (-value).exp())
+}
+
+/// The released `pre` activation: `sigmoid(logit) + hc_eps` per entry (inference/kernel.py:427). It
+/// is not a distribution; the four entries are independent.
+#[must_use]
+fn released_pre(logits: &[f32]) -> [f32; HC_MULT] {
+    assert_eq!(
+        logits.len(),
+        HC_MULT,
+        "the pre activation wants exactly n logits"
+    );
+    core::array::from_fn(|j| sigmoid(logits[j]) + SINKHORN_EPS)
+}
+
+/// The released `post` activation: `2 * sigmoid(logit)` per entry, no epsilon
+/// (inference/kernel.py:429).
+#[must_use]
+fn released_post(logits: &[f32]) -> [f32; HC_MULT] {
+    assert_eq!(
+        logits.len(),
+        HC_MULT,
+        "the post activation wants exactly n logits"
+    );
+    core::array::from_fn(|j| 2.0 * sigmoid(logits[j]))
 }
 
 /// H(X_l): the predictor rows applied to the stream mean, then exp + Sinkhorn into B, softmax into A
 /// and into C. The predictor is the folded (n*n + 2n) x d matrix of the kernel, row-major.
 ///
-/// This is the NO-BIAS path; it is what every caller had before the checkpoint's hc_base was
-/// modelled, and it is unchanged. Use [`h_of_with_bias`] when the checkpoint vector is available.
+/// This is the ORIGINAL reading and it is unchanged: no bias, no scale, and A and C are SOFTMAXED,
+/// which is NOT what the released `hc_split_sinkhorn` does (inference/kernel.py:427-429 uses
+/// `sigmoid` and `2*sigmoid`; see the module docs, "The released pre/post activation and
+/// hc_scale"). Use [`h_of_with_bias`] when only the checkpoint bias is to be added, and
+/// [`h_of_with_scale`] for the released activation and scale.
 ///
 /// It takes the REGISTER copy, which is how the kernel computes it: the reads are counted as
 /// register reads, which are not memory traffic. There is no signature of this function that
@@ -441,9 +618,108 @@ pub fn bias_into_kernel_rows(hc_base: &HcBase) -> [f32; PREDICTOR_ROWS] {
     kernel
 }
 
+/// The released checkpoint's three per-group `hc_scale` values expanded onto this reference's 24 H
+/// rows.
+///
+/// The checkpoint indexes the scales by COEFFICIENT GROUP, not by row: `hc_scale[0]` multiplies all
+/// four `pre` rows, `hc_scale[1]` all four `post` rows and `hc_scale[2]` all sixteen `comb`
+/// rows (inference/kernel.py:427-431). This reference's row order is B(0..n*n) / A(n*n..) /
+/// C(n*n+n..), so the comb scalar lands on the B rows, the pre scalar on the A rows and the post
+/// scalar on the C rows. The scale MULTIPLIES the logit and `hc_base` is added afterwards, so a zero
+/// scale leaves only the bias, never the other way round.
+#[must_use]
+pub fn scale_into_kernel_rows(hc_scale: &HcScale) -> [f32; PREDICTOR_ROWS] {
+    let mut kernel = [0.0f32; PREDICTOR_ROWS];
+    for destination in 0..HC_MULT {
+        for source in 0..HC_MULT {
+            kernel[destination * HC_MULT + source] = hc_scale[COMB_SCALE_INDEX];
+        }
+    }
+    for j in 0..HC_MULT {
+        kernel[HC_MULT * HC_MULT + j] = hc_scale[PRE_SCALE_INDEX];
+        kernel[HC_MULT * HC_MULT + HC_MULT + j] = hc_scale[POST_SCALE_INDEX];
+    }
+    kernel
+}
+
+/// The released checkpoint row that kernel row `kernel_row` comes from, in the fold of
+/// [`fold_predictor_into_kernel_rows`]. Kernel rows are B(0..n*n) / A(n*n..n*n+n) /
+/// C(n*n+n..); released rows are pre(0..n) / post(n..2n) / comb(2n..2n+n*n), and the comb terms
+/// transpose because this reference's B is `[destination][source]`.
+fn released_row_into_kernel_row(kernel_row: usize) -> usize {
+    let comb_rows = HC_MULT * HC_MULT;
+    if kernel_row < comb_rows {
+        let destination = kernel_row / HC_MULT;
+        let source = kernel_row % HC_MULT;
+        COMB_ROWS_OFFSET + source * HC_MULT + destination
+    } else if kernel_row < comb_rows + HC_MULT {
+        PRE_ROWS_OFFSET + (kernel_row - comb_rows)
+    } else {
+        POST_ROWS_OFFSET + (kernel_row - comb_rows - HC_MULT)
+    }
+}
+
+/// The released `[24, n*d]` predictor folded into this reference's `[24, d]` row order.
+///
+/// The release applies `hc_fn` to the flattened `n*d` stream (model.py:952-954). The kernel and
+/// this reference take the project's fold: each row is averaged over the four copies, so the
+/// projection is applied to the stream mean and costs 24*d multiply-accumulates instead of
+/// 24*n*d (specification 2.4, "RMSNorm weights folded offline into the predictor projection";
+/// docs/architecture/02-mhc.md section 6 step 4). That fold is ONE structural difference from the
+/// release this module does not close: the release's `F.linear` sees all 20480 columns, so a
+/// released-model comparison ultimately needs the full projection, which the kernel's tiled
+/// accumulation does not perform. The arithmetic AROUND the logits - the projection rstd, the
+/// per-group scale, the bias, the sigmoid pre/post and the released split-Sinkhorn - is released.
+///
+/// The row ORDER is the checkpoint's: reversed from `pre(0..n) / post(n..2n) / comb(2n..)` into
+/// kernel order, with the comb terms transposed. Folding the rows without this mapping makes the
+/// kernel apply one group's projection to another group's activation, and a device comparison
+/// cannot catch it because both sides share the fold - a test pins this mapping instead
+/// (docs/build/roadmap-to-serving.md section 10, open unknown 2).
+///
+/// # Panics
+/// Panics if `released` is not `PREDICTOR_ROWS * HC_MULT * HIDDEN` long or `kernel_rows` is not
+/// `PREDICTOR_ROWS * HIDDEN` long.
+pub fn fold_predictor_into_kernel_rows(released: &[f32], kernel_rows: &mut [f32]) {
+    assert_eq!(
+        released.len(),
+        PREDICTOR_ROWS * HC_MULT * HIDDEN,
+        "the released predictor is 24 rows by n*d"
+    );
+    assert_eq!(
+        kernel_rows.len(),
+        PREDICTOR_ROWS * HIDDEN,
+        "the folded predictor is 24 rows by d"
+    );
+    for kernel_row in 0..PREDICTOR_ROWS {
+        let released_row = released_row_into_kernel_row(kernel_row);
+        let out = kernel_row * HIDDEN;
+        for column in 0..HIDDEN {
+            let mut sum = 0.0f32;
+            for copy in 0..HC_MULT {
+                sum += released[released_row * HC_MULT * HIDDEN + copy * HIDDEN + column];
+            }
+            kernel_rows[out + column] = sum / HC_MULT as f32;
+        }
+    }
+}
+
+/// `row = row * scale + base`, in that order: the released formula is `mix * hc_scale[group] +
+/// hc_base[row]`, so the scale multiplies and the bias is added (inference/kernel.py:427-431).
+fn apply_scale_then_bias(rows: &mut [f32; PREDICTOR_ROWS], hc_base: &HcBase, hc_scale: &HcScale) {
+    let scale = scale_into_kernel_rows(hc_scale);
+    let bias = bias_into_kernel_rows(hc_base);
+    for index in 0..PREDICTOR_ROWS {
+        rows[index] = rows[index] * scale[index] + bias[index];
+    }
+}
+
 /// H(X_l) with the released model's per-coefficient bias: the 24 raw logits each get their
 /// `hc_base` entry added BEFORE the exp/Sinkhorn and the two softmaxes, which is where
 /// `hc_split_sinkhorn` adds it (inference/kernel.py:426-431).
+///
+/// This is the BIAS-ONLY reading: no `hc_scale`, and A and C are softmaxed, not sigmoided, so it is
+/// not the released activation. Use [`h_of_with_scale`] for that.
 ///
 /// `hc_base` is in the checkpoint's own row order; [`bias_into_kernel_rows`] does the
 /// rearrangement, and an all-zero vector reproduces [`h_of`] bit for bit.
@@ -462,6 +738,140 @@ pub fn h_of_with_bias(
         *row += offset;
     }
     coefficients_from_rows(&rows)
+}
+
+/// The sum of squares of the four streams over the whole flattened `n*d` stream: the statistic the
+/// released `hc_mixes` normalises its projection by (model.py:952-954). These are register reads,
+/// not stream traffic: the kernel holds the streams in registers when it needs this.
+fn stream_sum_squares(registers: &mut Registers) -> f32 {
+    let mut sum = 0.0f32;
+    for stream in 0..HC_MULT {
+        for channel in 0..HIDDEN {
+            let value = registers.read(stream, channel);
+            sum += value * value;
+        }
+    }
+    sum
+}
+
+/// The released coefficient rstd: `1/sqrt(mean(x^2) + norm_eps)` over the flattened `n*d`
+/// stream (model.py:953-954). The mean is over `n*d`, not `d`: all four copies are dimensions of
+/// the flattened projection input, so every element contributes. D4 in docs/architecture/02-mhc.md
+/// records the constant.
+#[must_use]
+fn coefficient_rstd(sum_squares: f32) -> f32 {
+    1.0 / (sum_squares / (HC_MULT * HIDDEN) as f32 + NORM_EPS).sqrt()
+}
+
+/// H(X_l) with ALL THREE released predictor tensors and the released arithmetic: the projection is
+/// first multiplied by `rsqrt(mean(x^2) + norm_eps)` over the flattened `n*d` stream
+/// (model.py:953-954), then each row is multiplied by its group's `hc_scale` entry and has
+/// `hc_base` added AFTER the product, then the four `pre` logits become
+/// `sigmoid(...) + hc_eps`, the four `post` logits `2 * sigmoid(...)`, and the sixteen `comb`
+/// logits the released softmax-then-alternate schedule (inference/kernel.py:426-458).
+///
+/// This is the reading a released-model comparison wants, and it differs from [`h_of_with_bias`]
+/// in THREE deliberate ways, each pinned by a test: the projection rstd is applied, the scale is
+/// applied, A and C are sigmoids instead of softmaxes, and B uses the released schedule instead of
+/// this module's [`sinkhorn_knopp`].
+///
+/// Consequently a zero `hc_base` with `hc_scale = [1, 1, 1]` does NOT reproduce [`h_of`]: A and
+/// C differ by the activation, and B differs by the schedule.
+///
+/// # Panics
+/// Panics if the predictor is not the folded (n*n + 2n) by d matrix.
+#[must_use]
+pub fn h_of_with_scale(
+    registers: &mut Registers,
+    predictor: &[f32],
+    hc_base: &HcBase,
+    hc_scale: &HcScale,
+) -> Coefficients {
+    let mut rows = predictor_rows(registers, predictor);
+    let rstd = coefficient_rstd(stream_sum_squares(registers));
+    for row in rows.iter_mut() {
+        *row *= rstd;
+    }
+    apply_scale_then_bias(&mut rows, hc_base, hc_scale);
+    coefficients_from_rows_with(&rows, PrePostActivation::ReleasedSigmoid)
+}
+
+/// The released `comb` normalisation, exactly as `hc_split_sinkhorn` runs it
+/// (inference/kernel.py:436-458):
+///
+/// 1. a row softmax over the LAST axis, then `+ eps` (one row pass that adds eps once);
+/// 2. one unconditional column pass, `/(colsum + eps)`;
+/// 3. `iterations - 1` pairs of `/(rowsum + eps)` and `/(colsum + eps)`.
+///
+/// The matrix is in the released `[source][destination]` orientation, so "row" is a destination
+/// sum for one source, the last pass is a COLUMN pass, and each column ends summing to 1. This is
+/// not [`sinkhorn_knopp`]: the softmax is the first row normalisation and carries no eps in its
+/// own denominator, eps is added to the matrix once before the first column pass, and every later
+/// denominator carries it. D3 in docs/architecture/02-mhc.md states the same schedule.
+pub fn released_split_sinkhorn(
+    matrix: &mut [[f32; HC_MULT]; HC_MULT],
+    iterations: usize,
+    eps: f32,
+) {
+    for row in matrix.iter_mut() {
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for value in row.iter_mut() {
+            *value = (*value - max).exp();
+            sum += *value;
+        }
+        for value in row.iter_mut() {
+            *value = *value / sum + eps;
+        }
+    }
+    normalise_columns(matrix, eps);
+    for _ in 1..iterations {
+        normalise_rows(matrix, eps);
+        normalise_columns(matrix, eps);
+    }
+}
+
+/// One `/(rowsum + eps)` pass of the released schedule.
+fn normalise_rows(matrix: &mut [[f32; HC_MULT]; HC_MULT], eps: f32) {
+    for row in matrix.iter_mut() {
+        let denominator: f32 = row.iter().sum::<f32>() + eps;
+        for value in row.iter_mut() {
+            *value /= denominator;
+        }
+    }
+}
+
+/// One `/(colsum + eps)` pass of the released schedule.
+fn normalise_columns(matrix: &mut [[f32; HC_MULT]; HC_MULT], eps: f32) {
+    for column in 0..HC_MULT {
+        let denominator: f32 = (0..HC_MULT).map(|row| matrix[row][column]).sum::<f32>() + eps;
+        for row in matrix.iter_mut() {
+            row[column] /= denominator;
+        }
+    }
+}
+
+/// The released 16 comb rows in this reference's `B[destination][source]` order.
+///
+/// The rows on the way in are the kernel's order, `B[destination][source]`; the release computes
+/// `comb` in `[source][destination]` order (D3 and the workspace notes in
+/// docs/architecture/02-mhc.md), so the matrix is transposed into that orientation, normalised by
+/// [`released_split_sinkhorn`], and transposed back.
+fn released_comb(rows: &[f32; PREDICTOR_ROWS]) -> [[f32; HC_MULT]; HC_MULT] {
+    let mut comb = [[0.0f32; HC_MULT]; HC_MULT];
+    for destination in 0..HC_MULT {
+        for source in 0..HC_MULT {
+            comb[source][destination] = rows[destination * HC_MULT + source];
+        }
+    }
+    released_split_sinkhorn(&mut comb, SINKHORN_ITERS, SINKHORN_EPS);
+    let mut b = [[0.0f32; HC_MULT]; HC_MULT];
+    for source in 0..HC_MULT {
+        for destination in 0..HC_MULT {
+            b[destination][source] = comb[source][destination];
+        }
+    }
+    b
 }
 
 /// Sinkhorn-Knopp: alternate row and column normalisation, with the specification's floor so a row
@@ -508,8 +918,10 @@ pub fn softmax4(values: &[f32]) -> [f32; HC_MULT] {
 /// reason this needs one read of X: the kernel still has A_{l-1} X_l in registers from the previous
 /// update, and recomputing it would mean reading X again.
 ///
-/// This is the NO-BIAS path and it is unchanged; [`mega_mhc_layer_with_bias`] is the same layer
-/// with the checkpoint's hc_base added to the coefficient logits.
+/// This is the ORIGINAL reading and it is unchanged: no bias, no scale, and A and C softmaxed, which
+/// is NOT the released activation (see the module docs). [`mega_mhc_layer_with_bias`] is the same
+/// layer with the checkpoint's hc_base added; [`mega_mhc_layer_with_scale`] is the same layer with
+/// hc_base AND hc_scale and the released sigmoid activation.
 ///
 /// # Panics
 /// Panics if the RMS weight is not d wide, or the predictor is not the folded matrix.
@@ -521,14 +933,22 @@ pub fn mega_mhc_layer(
     predictor: &[f32],
     ledger: &mut TrafficLedger,
 ) -> (Counted<f32>, Coefficients, Counted<u8>, Counted<u8>) {
-    mega_mhc_layer_inner(streams, rms_weight, a_prev, predictor, None, ledger)
+    mega_mhc_layer_inner(
+        streams,
+        rms_weight,
+        a_prev,
+        predictor,
+        CoefficientTensors::None,
+        ledger,
+    )
 }
 
 /// The same layer with the released checkpoint's per-coefficient bias: the 24 values of hc_base are
 /// added to the raw coefficient logits before the exp/Sinkhorn and the softmaxes
 /// ([`h_of_with_bias`]).
 ///
-/// An all-zero vector reproduces [`mega_mhc_layer`] bit for bit, which a test asserts.
+/// This is the BIAS-ONLY reading: no hc_scale, and A and C softmaxed, so it is not the released
+/// activation. An all-zero vector reproduces [`mega_mhc_layer`] bit for bit, which a test asserts.
 ///
 /// # Panics
 /// As [`mega_mhc_layer`].
@@ -546,20 +966,68 @@ pub fn mega_mhc_layer_with_bias(
         rms_weight,
         a_prev,
         predictor,
-        Some(hc_base),
+        CoefficientTensors::Bias(hc_base),
         ledger,
     )
 }
 
-/// The single pass both public layer entry points share. hc_base is None on the no-bias path, so that
-/// path calls exactly what it called before the bias existed.
+/// The same layer with BOTH released coefficient tensors and the released activation: hc_scale
+/// multiplies each logit, hc_base is added after the product, and A and C are sigmoids
+/// ([`h_of_with_scale`]).
+///
+/// This is the layer to compare against the released model. It is the same single pass and the same
+/// traffic - only the coefficients differ - so the ledger's claims are unchanged.
+///
+/// # Panics
+/// As [`mega_mhc_layer`].
+#[must_use]
+pub fn mega_mhc_layer_with_scale(
+    streams: &mut Streams,
+    rms_weight: &[f32],
+    a_prev: &[f32; HC_MULT],
+    predictor: &[f32],
+    hc_base: &HcBase,
+    hc_scale: &HcScale,
+    ledger: &mut TrafficLedger,
+) -> (Counted<f32>, Coefficients, Counted<u8>, Counted<u8>) {
+    mega_mhc_layer_inner(
+        streams,
+        rms_weight,
+        a_prev,
+        predictor,
+        CoefficientTensors::Released {
+            base: hc_base,
+            scale: hc_scale,
+        },
+        ledger,
+    )
+}
+
+/// Which coefficient tensors the shared single pass applies. This is what keeps the three public layer
+/// entry points on ONE implementation: only the formation of the coefficients differs.
+enum CoefficientTensors<'a> {
+    /// No checkpoint coefficients: this module's original H.
+    None,
+    /// The checkpoint's hc_base only, with the softmax reading of A and C.
+    Bias(&'a HcBase),
+    /// The checkpoint's hc_base and hc_scale, with the released sigmoid activation.
+    Released {
+        /// The 24 per-row biases, as the checkpoint ships them.
+        base: &'a HcBase,
+        /// The three per-group scales, as the checkpoint ships them.
+        scale: &'a HcScale,
+    },
+}
+
+/// The single pass all public layer entry points share. `tensors` says which coefficient tensors to
+/// apply, so the no-bias path calls exactly what it called before the bias and scale existed.
 #[must_use]
 fn mega_mhc_layer_inner(
     streams: &mut Streams,
     rms_weight: &[f32],
     a_prev: &[f32; HC_MULT],
     predictor: &[f32],
-    hc_base: Option<&HcBase>,
+    tensors: CoefficientTensors<'_>,
     ledger: &mut TrafficLedger,
 ) -> (Counted<f32>, Coefficients, Counted<u8>, Counted<u8>) {
     assert_eq!(rms_weight.len(), HIDDEN, "the RMS weight is d wide");
@@ -570,32 +1038,50 @@ fn mega_mhc_layer_inner(
     // stream buffer except through the counting accessor.
     let mut registers = streams.capture();
 
-    // X_hat from the previous layer's A, and the residual sum of squares for the RMS norm: both are
-    // formed on the way past the register copy, which is how the kernel forms them.
+    // X_hat from the previous layer's A, plus the TWO different sums of squares the released model
+    // needs: the streams' over the flattened n*d input (for the coefficient projection's rsqrt,
+    // model.py:953-954) and X_hat's over d (for the RMSNorm the block input goes through,
+    // model.py:984/991). The kernel accumulates both on the way past the register copy, one at the
+    // thread's element and one per stream copy, and reduces them in a fixed order.
     let mut xhat = vec![0.0f32; HIDDEN];
-    let mut sum_squares = 0.0f32;
+    let mut stream_sum_squares = 0.0f32;
+    let mut xhat_sum_squares = 0.0f32;
     for (index, slot) in xhat.iter_mut().enumerate() {
         let mut value = 0.0f32;
         for (stream, weight) in a_prev.iter().enumerate() {
             let element = registers.read(stream, index);
-            sum_squares += element * element;
+            stream_sum_squares += element * element;
             value += weight * element;
         }
+        xhat_sum_squares += value * value;
         *slot = value;
     }
+    // The older entry points' block RMS is pinned (including its epsilon) and is not the released
+    // statistic; only the released entry point gets the released one. The coefficient path's
+    // h_of_with_scale recomputes its own n*d sum from the registers, so it stays independent of this
+    // loop's traversal.
+    let block_inv_rms = match tensors {
+        CoefficientTensors::Released { .. } => {
+            1.0 / (xhat_sum_squares / HIDDEN as f32 + NORM_EPS).sqrt()
+        }
+        _ => 1.0 / (stream_sum_squares / (HC_MULT * HIDDEN) as f32 + SINKHORN_EPS).sqrt(),
+    };
 
     // H(X_l) and the B X_l term both come from that register copy, exactly as they do in the
     // kernel, so they cost no further stream traffic. h_of takes the registers and nothing else;
     // h_of_counted exists only for the deliberately wasteful variant below, which is what the bound
     // test contrasts against.
-    let coefficients = match hc_base {
-        None => h_of(&mut registers, predictor),
-        Some(base) => h_of_with_bias(&mut registers, predictor, base),
+    let coefficients = match tensors {
+        CoefficientTensors::None => h_of(&mut registers, predictor),
+        CoefficientTensors::Bias(base) => h_of_with_bias(&mut registers, predictor, base),
+        CoefficientTensors::Released { base, scale } => {
+            h_of_with_scale(&mut registers, predictor, base, scale)
+        }
     };
 
     // F: the RMS pre-norm, the per-32 ue8m0 scales and the FP8 codes. Writing those is d elements
     // plus d / 32 scale bytes, which is the second half of the bound.
-    let inv_rms = 1.0f32 / (sum_squares / (HC_MULT * HIDDEN) as f32 + SINKHORN_EPS).sqrt();
+    let inv_rms = block_inv_rms;
     let mut codes: Counted<u8> = Counted::new();
     let mut scales: Counted<u8> = Counted::new();
     for block in 0..HIDDEN / QUANT_BLOCK {
@@ -1299,6 +1785,600 @@ mod tests {
         assert!(
             largest_delta > 1e-3,
             "the bias must move the residual streams, largest delta {largest_delta}"
+        );
+    }
+
+    #[test]
+    fn scale_into_kernel_rows_pins_the_group_layout() {
+        // One scalar per GROUP, not per row: hc_scale = [pre, post, comb] (model.py:945-946,
+        // inference/kernel.py:427-431). Give each group a distinct value and pin where it lands in
+        // this reference's B(0..n*n) / A(n*n..) / C(n*n+n..) row order.
+        let hc_scale: HcScale = [1.0, 2.0, 3.0];
+        let kernel = scale_into_kernel_rows(&hc_scale);
+        // This reference's row order: B at 0, A at n*n, C at n*n + n.
+        let a_offset = HC_MULT * HC_MULT;
+        let c_offset = a_offset + HC_MULT;
+        assert_eq!((a_offset, c_offset), (16, 20), "the row layout moved");
+        for (row, value) in kernel.iter().enumerate().take(a_offset) {
+            assert_eq!(*value, 3.0, "comb scales B, row {row}");
+        }
+        for (row, value) in kernel.iter().enumerate().skip(a_offset).take(HC_MULT) {
+            assert_eq!(*value, 1.0, "pre scales A, row {row}");
+        }
+        for (row, value) in kernel.iter().enumerate().skip(c_offset) {
+            assert_eq!(*value, 2.0, "post scales C, row {row}");
+        }
+        assert_eq!(kernel.len(), PREDICTOR_ROWS);
+        // The indices are the checkpoint's group order, not this reference's row order.
+        assert_eq!(
+            (PRE_SCALE_INDEX, POST_SCALE_INDEX, COMB_SCALE_INDEX),
+            (0, 1, 2)
+        );
+    }
+
+    #[test]
+    fn the_released_scale_multiplies_each_group_before_the_bias_is_added() {
+        // inference/kernel.py:427-431 reads `mix * scale[group] + base` - multiply first, add
+        // second. Each group gets a different scale and every row a different bias, so a missing
+        // scale, a scale applied AFTER the bias, and a bias applied BEFORE the scale all land on
+        // different numbers. The expected values are written out here with a locally-defined
+        // logistic rather than taken from the module, so this test cannot agree with its builder by
+        // construction.
+        let predictor = deterministic_predictor();
+        let hc_scale: HcScale = [0.5, -2.0, 3.0];
+        let hc_base: HcBase = core::array::from_fn(|index| (index as f32 - 12.0) / 16.0);
+        let logistic = |z: f32| 1.0 / (1.0 + (-z).exp());
+
+        // The raw logits, which are the input of the released formula, and the projection rstd the
+        // release multiplies them by before scale and bias (model.py:953-954).
+        let rstd = coefficient_rstd(stream_sum_squares(
+            &mut Streams::new(deterministic_streams()).capture(),
+        ));
+        let rows = predictor_rows(
+            &mut Streams::new(deterministic_streams()).capture(),
+            &predictor,
+        );
+        let got = h_of_with_scale(
+            &mut Streams::new(deterministic_streams()).capture(),
+            &predictor,
+            &hc_base,
+            &hc_scale,
+        );
+
+        // A: sigmoid(mix * rstd * scale[0] + base) + hc_eps (kernel.py:427, model.py:953-954).
+        assert!(
+            (rstd - 1.0).abs() > 1e-3,
+            "the fixture cannot see the projection rstd: {rstd}"
+        );
+        for j in 0..HC_MULT {
+            let row = rows[HC_MULT * HC_MULT + j] * rstd;
+            let base = hc_base[PRE_ROWS_OFFSET + j];
+            let expected = logistic(row * hc_scale[PRE_SCALE_INDEX] + base) + SINKHORN_EPS;
+            assert!(
+                (got.a[j] - expected).abs() < 1e-6,
+                "A[{j}] is {}, expected {expected}",
+                got.a[j]
+            );
+            let missing_scale = logistic(row + base) + SINKHORN_EPS;
+            let scale_after_bias =
+                logistic((row + base) * hc_scale[PRE_SCALE_INDEX]) + SINKHORN_EPS;
+            assert!(
+                (expected - missing_scale).abs() > 1e-3,
+                "this fixture cannot see a missing scale at A[{j}]"
+            );
+            assert!(
+                (expected - scale_after_bias).abs() > 1e-3,
+                "this fixture cannot tell multiply-then-add from add-then-multiply at A[{j}]"
+            );
+        }
+
+        // C: 2 * sigmoid(mix * rstd * scale[1] + base), no epsilon (kernel.py:429).
+        for j in 0..HC_MULT {
+            let row = rows[HC_MULT * HC_MULT + HC_MULT + j] * rstd;
+            let base = hc_base[POST_ROWS_OFFSET + j];
+            let expected = 2.0 * logistic(row * hc_scale[POST_SCALE_INDEX] + base);
+            assert!(
+                (got.c[j] - expected).abs() < 1e-6,
+                "C[{j}] is {}, expected {expected}",
+                got.c[j]
+            );
+            let missing_scale = 2.0 * logistic(row + base);
+            let scale_after_bias = 2.0 * logistic((row + base) * hc_scale[POST_SCALE_INDEX]);
+            assert!(
+                (expected - missing_scale).abs() > 1e-3,
+                "this fixture cannot see a missing scale at C[{j}]"
+            );
+            assert!(
+                (expected - scale_after_bias).abs() > 1e-3,
+                "this fixture cannot tell multiply-then-add from add-then-multiply at C[{j}]"
+            );
+        }
+
+        // B: the sixteen comb logits are `mix * rstd * scale[2] + base`, transposed into the
+        // released [source][destination] orientation, normalised by the released split-Sinkhorn
+        // schedule, then transposed back into this reference's [destination][source]. Build every
+        // step from the released formula here and compare; then build the no-scale matrix and show
+        // the fixture can tell them apart.
+        let mut expected = [[0.0f32; HC_MULT]; HC_MULT];
+        let mut unscaled = [[0.0f32; HC_MULT]; HC_MULT];
+        for source in 0..HC_MULT {
+            for destination in 0..HC_MULT {
+                let checkpoint_row = COMB_ROWS_OFFSET + source * HC_MULT + destination;
+                let mix = rows[destination * HC_MULT + source] * rstd;
+                expected[source][destination] =
+                    mix * hc_scale[COMB_SCALE_INDEX] + hc_base[checkpoint_row];
+                unscaled[source][destination] = mix + hc_base[checkpoint_row];
+            }
+        }
+        released_split_sinkhorn(&mut expected, SINKHORN_ITERS, SINKHORN_EPS);
+        released_split_sinkhorn(&mut unscaled, SINKHORN_ITERS, SINKHORN_EPS);
+        let mut expected_b = [[0.0f32; HC_MULT]; HC_MULT];
+        let mut unscaled_b = [[0.0f32; HC_MULT]; HC_MULT];
+        for source in 0..HC_MULT {
+            for destination in 0..HC_MULT {
+                expected_b[destination][source] = expected[source][destination];
+                unscaled_b[destination][source] = unscaled[source][destination];
+            }
+        }
+        assert_eq!(
+            got.b, expected_b,
+            "the comb rows must be scaled before the released split-Sinkhorn"
+        );
+        assert_ne!(
+            expected_b, unscaled_b,
+            "this fixture cannot see a missing comb scale"
+        );
+    }
+
+    #[test]
+    fn the_released_pre_and_post_activations_are_sigmoids_not_softmaxes() {
+        // kernel.py:427 and 429: pre = sigmoid(...) + hc_eps and post = 2 * sigmoid(...),
+        // independently per entry, so neither vector is a distribution. At zero logits the release
+        // gives 0.5 + eps and 1.0, where this module's earlier softmax reading gives 0.25 and 0.25.
+        let predictor = zero_predictor();
+        let zero_base: HcBase = [0.0f32; PREDICTOR_ROWS];
+        let hc_scale: HcScale = [1.0; HC_SCALE_LEN];
+        let released = h_of_with_scale(
+            &mut Streams::new(vec![1.0f32; HC_MULT * HIDDEN]).capture(),
+            &predictor,
+            &zero_base,
+            &hc_scale,
+        );
+        for j in 0..HC_MULT {
+            assert!(
+                (released.a[j] - (0.5 + SINKHORN_EPS)).abs() < 1e-6,
+                "A[{j}] is {}, expected 0.5 + eps",
+                released.a[j]
+            );
+            assert!(
+                (released.c[j] - 1.0).abs() < 1e-6,
+                "C[{j}] is {}, expected 2 * sigmoid(0) = 1",
+                released.c[j]
+            );
+        }
+        let a_sum: f32 = released.a.iter().sum();
+        assert!(
+            (a_sum - 2.0).abs() < 1e-5,
+            "four independent sigmoids at zero logits sum to 2, got {a_sum}"
+        );
+        assert!(
+            released.a.iter().all(|value| (value - 0.25).abs() > 1e-3),
+            "the softmax reading would put 0.25 in every A entry"
+        );
+
+        // A nonzero logit moves ITS OWN entry only; the other three stay at sigmoid(0) + eps.
+        let mut hc_base: HcBase = [0.0f32; PREDICTOR_ROWS];
+        hc_base[PRE_ROWS_OFFSET] = 1.0;
+        hc_base[POST_ROWS_OFFSET + 3] = 2.0;
+        let logistic = |z: f32| 1.0 / (1.0 + (-z).exp());
+        let biased = h_of_with_scale(
+            &mut Streams::new(vec![1.0f32; HC_MULT * HIDDEN]).capture(),
+            &predictor,
+            &hc_base,
+            &hc_scale,
+        );
+        assert!((biased.a[0] - (logistic(1.0) + SINKHORN_EPS)).abs() < 1e-6);
+        for j in 1..HC_MULT {
+            assert!(
+                (biased.a[j] - (0.5 + SINKHORN_EPS)).abs() < 1e-6,
+                "A[{j}] moved even though its logit did not"
+            );
+        }
+        assert!((biased.c[3] - 2.0 * logistic(2.0)).abs() < 1e-6);
+        for j in 0..3 {
+            assert!((biased.c[j] - 1.0).abs() < 1e-6);
+        }
+        let expected_sum = logistic(1.0) + SINKHORN_EPS + 3.0 * (0.5 + SINKHORN_EPS);
+        let a_sum: f32 = biased.a.iter().sum();
+        assert!(
+            (a_sum - expected_sum).abs() < 1e-6,
+            "A is {a_sum}, and the independent sigmoids sum to {expected_sum}"
+        );
+        assert!(
+            (a_sum - 1.0).abs() > 0.5,
+            "a softmax would sum to one; the released activation must not"
+        );
+
+        // The earlier reading is still available, still labelled, and is a DIFFERENT computation -
+        // this test says so rather than pretending both can hold.
+        let old = h_of_with_bias(
+            &mut Streams::new(vec![1.0f32; HC_MULT * HIDDEN]).capture(),
+            &predictor,
+            &hc_base,
+        );
+        let e = 1.0f32.exp();
+        assert!(
+            (old.a[0] - e / (e + 3.0)).abs() < 1e-6,
+            "the old A remains a softmax"
+        );
+        assert!((old.a.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!(
+            (old.a[0] - biased.a[0]).abs() > 0.1,
+            "the two readings must differ at A[0]"
+        );
+        assert!(
+            (old.c[3] - biased.c[3]).abs() > 0.5,
+            "the two readings must differ at C[3]"
+        );
+
+        // The semantic change itself: a unit scale and a zero base do not reproduce the old path,
+        // because BOTH the activation and the comb schedule differ now. The comb difference is not a
+        // side effect to be tolerated: the released schedule ends with a column pass and adds eps to
+        // the matrix, so it cannot coincide with this module's generic Sinkhorn-Knopp.
+        let modern = h_of_with_scale(
+            &mut Streams::new(vec![1.0f32; HC_MULT * HIDDEN]).capture(),
+            &predictor,
+            &zero_base,
+            &hc_scale,
+        );
+        let original = h_of(
+            &mut Streams::new(vec![1.0f32; HC_MULT * HIDDEN]).capture(),
+            &predictor,
+        );
+        assert_ne!(modern.a, original.a, "A changed semantically");
+        assert_ne!(modern.c, original.c, "C changed semantically");
+        assert_ne!(
+            modern.b, original.b,
+            "B changed semantically: the released schedule is not the generic Sinkhorn-Knopp"
+        );
+    }
+
+    #[test]
+    fn the_scaled_layer_moves_the_residual_streams() {
+        // The scale has to reach the LAYER, not only the coefficient helper: with the same bias, a
+        // scale of [3, 0.5, -2] against [1, 1, 1] must move B, A, C and the streams the layer writes.
+        // This is the end-to-end non-vacuity check for the scale, as
+        // `the_biased_layer_moves_the_residual_streams` is for the bias.
+        let predictor = deterministic_predictor();
+        let rms_weight = vec![1.0f32; HIDDEN];
+        let hc_base: HcBase = core::array::from_fn(|index| (index as f32 - 12.0) / 32.0);
+        let unit: HcScale = [1.0; HC_SCALE_LEN];
+        let scaled: HcScale = [3.0, 0.5, -2.0];
+
+        let (unit_next, unit_coefficients, ..) = mega_mhc_layer_with_scale(
+            &mut Streams::new(deterministic_streams()),
+            &rms_weight,
+            &[0.25; HC_MULT],
+            &predictor,
+            &hc_base,
+            &unit,
+            &mut TrafficLedger::default(),
+        );
+        let (scaled_next, scaled_coefficients, ..) = mega_mhc_layer_with_scale(
+            &mut Streams::new(deterministic_streams()),
+            &rms_weight,
+            &[0.25; HC_MULT],
+            &predictor,
+            &hc_base,
+            &scaled,
+            &mut TrafficLedger::default(),
+        );
+
+        assert_ne!(
+            unit_coefficients.a, scaled_coefficients.a,
+            "A must move with the scale"
+        );
+        assert_ne!(
+            unit_coefficients.c, scaled_coefficients.c,
+            "C must move with the scale"
+        );
+        assert_ne!(
+            unit_coefficients.b, scaled_coefficients.b,
+            "B must move with the scale"
+        );
+        let largest_delta = unit_next
+            .as_slice()
+            .iter()
+            .zip(scaled_next.as_slice())
+            .map(|(unit, scaled)| (unit - scaled).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            largest_delta > 1e-3,
+            "the scale must move the residual streams, largest delta {largest_delta}"
+        );
+    }
+
+    #[test]
+    fn the_released_split_sinkhorn_adds_eps_once_before_the_first_column_pass() {
+        // kernel.py:436-458, with the schedule split in its three parts so each one is visible:
+        //   row softmax (no eps in its own denominator) + eps, one column pass /(colsum + eps),
+        //   then iterations - 1 (row, column) pairs. With iterations = 1 the closed form below is the
+        // whole schedule, so this test cannot agree with the implementation by construction: it
+        // recomputes the softmax with exp/sum here and applies eps in exactly one place.
+        let fixture = [
+            [2.0f32, -1.0, 0.5, 0.0],
+            [0.0, 1.5, -0.5, 1.0],
+            [-2.0, 0.25, 3.0, -0.75],
+            [1.0, 0.0, 0.0, -1.0],
+        ];
+        let mut got = fixture;
+        released_split_sinkhorn(&mut got, 1, SINKHORN_EPS);
+        let mut expected = [[0.0f32; HC_MULT]; HC_MULT];
+        for source in 0..HC_MULT {
+            let row_max = fixture[source]
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut exponentials = [0.0f32; HC_MULT];
+            let mut row_sum = 0.0f32;
+            for destination in 0..HC_MULT {
+                let value = (fixture[source][destination] - row_max).exp();
+                exponentials[destination] = value;
+                row_sum += value;
+            }
+            for (slot, exponential) in expected[source].iter_mut().zip(exponentials) {
+                *slot = exponential / row_sum + SINKHORN_EPS;
+            }
+        }
+        let column_sums: [f32; HC_MULT] =
+            core::array::from_fn(|destination| expected.iter().map(|row| row[destination]).sum());
+        for (destination, column_sum) in column_sums.iter().enumerate() {
+            for row in expected.iter_mut() {
+                row[destination] /= column_sum + SINKHORN_EPS;
+            }
+        }
+        for source in 0..HC_MULT {
+            for destination in 0..HC_MULT {
+                assert!(
+                    (got[source][destination] - expected[source][destination]).abs() < 1e-7,
+                    "[{source}][{destination}] is {} and the hand transcription of the schedule says {}",
+                    got[source][destination],
+                    expected[source][destination]
+                );
+            }
+        }
+        // The eps is added to the whole matrix ONCE, so removing it changes the result even after
+        // the last pass divides by a sum that also carries eps; the generic Sinkhorn-Knopp does not
+        // have this shape at all.
+        let mut generic = [[0.0f32; HC_MULT]; HC_MULT];
+        for source in 0..HC_MULT {
+            for destination in 0..HC_MULT {
+                generic[source][destination] = fixture[source][destination].exp();
+            }
+        }
+        sinkhorn_knopp(&mut generic, SINKHORN_ITERS, SINKHORN_EPS);
+        let mut full = fixture;
+        released_split_sinkhorn(&mut full, SINKHORN_ITERS, SINKHORN_EPS);
+        assert_ne!(
+            full, generic,
+            "the released schedule is not the generic Sinkhorn-Knopp"
+        );
+        // Twenty iterations terminate on a column pass, so the columns of the released-orientation
+        // matrix are the side that sums to one.
+        let full_column_sums: [f32; HC_MULT] =
+            core::array::from_fn(|destination| full.iter().map(|row| row[destination]).sum());
+        for (destination, column_sum) in full_column_sums.iter().enumerate() {
+            assert!(
+                (column_sum - 1.0).abs() < 1e-5,
+                "column {destination} sums to {column_sum}; the last released pass is a column pass"
+            );
+        }
+    }
+
+    #[test]
+    fn the_released_split_sinkhorn_runs_iterations_minus_one_pairs() {
+        // The sibling test above hand-transcribes the iterations = 1 schedule, which never enters
+        // the (row, column) pair loop, so an off-by-one in `for _ in 1..iterations` is invisible to
+        // it: 18 pairs also terminate on a column pass with unit columns. This test pins the loop
+        // count numerically. `kernel.py:436-458` runs one unconditional column pass and then
+        // `iterations - 1` (row, column) pairs, so iterations = 2 and 3 must run one and two pairs.
+        // The expected matrices are the output of an independent float64 transcription of that
+        // schedule for the fixture below, and they differ most where the extra pair lands; the
+        // implementation is f32, hence the 1e-6 bar.
+        let fixture = [
+            [2.0f32, -1.0, 0.5, 0.0],
+            [0.0, 1.5, -0.5, 1.0],
+            [-2.0, 0.25, 3.0, -0.75],
+            [1.0, 0.0, 0.0, -1.0],
+        ];
+        // row softmax + eps, one column pass, then ONE (row, column) pair.
+        let expected_two = [
+            [5.496816e-01, 5.8454554e-02, 1.1457338e-01, 2.515067e-01],
+            [5.5371697e-02, 5.3003616e-01, 3.137294e-02, 5.0886584e-01],
+            [5.1950157e-03, 1.0526046e-01, 7.201142e-01, 6.1295424e-02],
+            [3.8975075e-01, 3.0624767e-01, 1.3393867e-1, 1.783309e-01],
+        ];
+        // the same, then TWO (row, column) pairs.
+        let expected_three = [
+            [5.6097523e-01, 6.2984936e-2, 1.0831817e-01, 2.7009445e-01],
+            [4.89073e-02, 4.942847e-01, 2.5670015e-02, 4.729582e-01],
+            [5.7912927e-03, 1.23891e-01, 7.4366117e-01, 7.190355e-02],
+            [3.8432518e-01, 3.1883832e-01, 1.22349721e-01, 1.8504276e-01],
+        ];
+        for (iterations, expected) in [(2usize, expected_two), (3usize, expected_three)] {
+            let mut got = fixture;
+            released_split_sinkhorn(&mut got, iterations, SINKHORN_EPS);
+            for source in 0..HC_MULT {
+                for destination in 0..HC_MULT {
+                    assert!(
+                        (got[source][destination] - expected[source][destination]).abs() < 1e-6,
+                        "iterations = {iterations}: [{source}][{destination}] is {} and the transcribed schedule says {}",
+                        got[source][destination],
+                        expected[source][destination]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_released_projection_rstd_uses_norm_eps_over_the_flattened_stream() {
+        // model.py:953-954: mixes = F.linear(x) * rsqrt(mean(x^2) + norm_eps), the mean over the
+        // flattened n*d = 20480 stream. Two fixture values pin the two halves of that sentence:
+        // 1e-20 in the denominator (an hc_eps of 1e-6 would sit at 1e3, not 1e10) and the n*d
+        // denominator with all four copies contributing (identical copies at 2 give mean 4).
+        let zero_stream_squares = coefficient_rstd(0.0);
+        assert!(
+            (zero_stream_squares - 1e10).abs() / 1e10 < 1e-5,
+            "coefficient_rstd(0) is {zero_stream_squares}; norm_eps = 1e-20 gives 1e10 and hc_eps = 1e-6 gives 1e3"
+        );
+        let squares = 4.0f32 * (HC_MULT * HIDDEN) as f32;
+        assert!(
+            (coefficient_rstd(squares) - 0.5).abs() < 1e-6,
+            "four copies at 2 have mean square 4 over the flattened stream, so the rstd is 0.5"
+        );
+
+        // The rstd multiplies the logits BEFORE the group scale and the bias. The four copies are
+        // identical at 2, the predictor is nonzero, so omitting the multiplier moves every group.
+        let predictor = deterministic_predictor();
+        let streams = || vec![2.0f32; HC_MULT * HIDDEN];
+        let hc_base: HcBase = core::array::from_fn(|index| (index as f32 - 10.0) / 40.0);
+        let hc_scale: HcScale = [1.5, -0.5, 2.0];
+        let rows = predictor_rows(&mut Streams::new(streams()).capture(), &predictor);
+        let got = h_of_with_scale(
+            &mut Streams::new(streams()).capture(),
+            &predictor,
+            &hc_base,
+            &hc_scale,
+        );
+        let logistic = |z: f32| 1.0 / (1.0 + (-z).exp());
+        let mut without_rstd_differs = 0;
+        for j in 0..HC_MULT {
+            let row = rows[HC_MULT * HC_MULT + j];
+            let expected =
+                logistic(0.5 * row * hc_scale[PRE_SCALE_INDEX] + hc_base[PRE_ROWS_OFFSET + j])
+                    + SINKHORN_EPS;
+            assert!(
+                (got.a[j] - expected).abs() < 1e-6,
+                "A[{j}] is {}, expected {expected}",
+                got.a[j]
+            );
+            let missing = logistic(row * hc_scale[PRE_SCALE_INDEX] + hc_base[PRE_ROWS_OFFSET + j])
+                + SINKHORN_EPS;
+            if (expected - missing).abs() > 1e-3 {
+                without_rstd_differs += 1;
+            }
+        }
+        assert!(
+            without_rstd_differs > 0,
+            "this fixture cannot see the projection rstd at A"
+        );
+    }
+
+    #[test]
+    fn the_released_block_rms_normalises_x_hat_not_the_streams() {
+        // model.py:984/991 normalise the COLLAPSED block input, so the statistic is the sum of
+        // squares of X_hat over d - not the sum over the four streams. With X_hat uniform at 0.25
+        // the released rstd is exactly 4; the old streams statistic gives ~2 on this fixture, and
+        // the two produce different FP8 codes. The reference entry point must follow the release.
+        let a_prev = [0.25f32; HC_MULT];
+        let mut stream_values = vec![0.0f32; HC_MULT * HIDDEN];
+        stream_values[..HIDDEN].fill(1.0);
+        let rms_weight = vec![1.0f32; HIDDEN];
+        let (_next, _coefficients, codes, scales) = mega_mhc_layer_with_scale(
+            &mut Streams::new(stream_values.clone()),
+            &rms_weight,
+            &a_prev,
+            &zero_predictor(),
+            &[0.0f32; PREDICTOR_ROWS],
+            &[1.0f32; HC_SCALE_LEN],
+            &mut TrafficLedger::default(),
+        );
+        let expected_codes = |inv_rms: f32| {
+            let mut out = Vec::with_capacity(HIDDEN);
+            for _ in 0..HIDDEN / QUANT_BLOCK {
+                let value = 0.25f32 * inv_rms;
+                let normalised = [value; QUANT_BLOCK];
+                let scale_code = ue8m0_from_amax(value.abs(), E4M3_ELEMENT_EMAX);
+                let scale = crate::m4_quant::ue8m0_decode(scale_code);
+                for value in normalised {
+                    out.push(fp8_e4m3_encode(value / scale));
+                }
+            }
+            out
+        };
+        let released = expected_codes(4.0);
+        let old = expected_codes(1.0 / (0.25f32 + 1e-6).sqrt());
+        assert_eq!(
+            codes.as_slice(),
+            released.as_slice(),
+            "the released block RMS must normalise X_hat, not the streams"
+        );
+        assert_ne!(
+            released, old,
+            "this fixture cannot distinguish the two RMS statistics"
+        );
+        let _ = scales;
+    }
+
+    #[test]
+    fn the_fold_puts_each_released_row_on_its_kernel_row() {
+        // The released row order is pre(0..n) / post(n..2n) / comb(2n..). The fold must move pre to
+        // kernel A rows (n*n..n*n+n), post to kC rows (n*n+n..) and comb to B rows (0..n*n)
+        // transposed. Every released row carries its own index, so the folded value names both the
+        // row it came from and the row it landed on, and the table below is written out by hand
+        // instead of derived, which is what makes this test independent of the helper's match arms.
+        let mut released = vec![0.0f32; PREDICTOR_ROWS * HC_MULT * HIDDEN];
+        for released_row in 0..PREDICTOR_ROWS {
+            for copy in 0..HC_MULT {
+                for column in 0..HIDDEN {
+                    released[released_row * HC_MULT * HIDDEN + copy * HIDDEN + column] =
+                        released_row as f32 * 10.0 + copy as f32 + column as f32 * 1e-3;
+                }
+            }
+        }
+        let mut folded = vec![0.0f32; PREDICTOR_ROWS * HIDDEN];
+        fold_predictor_into_kernel_rows(&released, &mut folded);
+        for kernel_row in 0..PREDICTOR_ROWS {
+            let expected_released_row = if kernel_row < HC_MULT * HC_MULT {
+                // kernel B[destination][source] <- released comb [source][destination]
+                let destination = kernel_row / HC_MULT;
+                let source = kernel_row % HC_MULT;
+                COMB_ROWS_OFFSET + source * HC_MULT + destination
+            } else if kernel_row < HC_MULT * HC_MULT + HC_MULT {
+                PRE_ROWS_OFFSET + (kernel_row - HC_MULT * HC_MULT)
+            } else {
+                POST_ROWS_OFFSET + (kernel_row - HC_MULT * HC_MULT - HC_MULT)
+            };
+            // The fold is the mean over the four copies: released_row * 10 + 1.5 + column * 1e-3.
+            let base = expected_released_row as f32 * 10.0 + 1.5;
+            for column in 0..HIDDEN {
+                let got = folded[kernel_row * HIDDEN + column];
+                let expected = base + column as f32 * 1e-3;
+                assert!(
+                    (got - expected).abs() < 1e-3,
+                    "kernel row {kernel_row} column {column} is {got}, and released row {expected_released_row} says {expected}"
+                );
+            }
+        }
+        // Non-vacuity: the identity row mapping (no permutation, no transpose) does NOT fit.
+        let mut wrong = 0;
+        for kernel_row in 0..PREDICTOR_ROWS {
+            let mut naive = vec![0.0f32; HIDDEN];
+            for column in 0..HIDDEN {
+                for copy in 0..HC_MULT {
+                    naive[column] +=
+                        released[kernel_row * HC_MULT * HIDDEN + copy * HIDDEN + column];
+                }
+                naive[column] /= HC_MULT as f32;
+                if (naive[column] - folded[kernel_row * HIDDEN + column]).abs() > 1e-3 {
+                    wrong += 1;
+                }
+            }
+        }
+        assert!(
+            wrong > HIDDEN,
+            "a fold without the row permutation must not match, and it differs at {wrong} entries"
         );
     }
 }
