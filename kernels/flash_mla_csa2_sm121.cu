@@ -21,11 +21,20 @@
 //     caller, so this kernel consumes rotated q and k. Nothing here claims to implement rope.
 //   * the FP4 latent is dequantized in the scalar path. A tensor-core variant would accumulate
 //     in the hardware's order and is not claimed to be bit-identical to flash_mla_ref.rs.
+//   * the attention sink is one additive logit per head (`layers.N.attn.attn_sink`, F32 [64])
+//     and enters the softmax DENOMINATOR only, after the maximum, exactly as the released
+//     implementation does (kernel.py:382-383): a sink above the maximum shrinks an output, it
+//     never adds a value to it. This is the same arithmetic as mla_ref::attention_with_sink.
 //
-// Verification status: never executed. nvcc 12.9.1 compiles it for sm_121a, clang parses it
-// against the stub headers, src/m4_abi.rs pins the signature and geometry, and
-// src/mla_ref.rs defines and tests the numerics (including that the online softmax equals a
-// two-pass softmax and that the sliding window predicate is applied exactly once).
+// Verification status: executed on node0 (GB10, sm_121a) on 2026-10-17. nvcc 13.0.3
+// compiles it for sm_121a, clang parses it against the stub headers, src/m4_abi.rs pins the
+// signature and geometry, and src/mla_ref.rs defines and tests the numerics (including that the
+// online softmax equals a two-pass softmax and that the sliding window predicate is applied
+// exactly once). The device run: stage 2 of examples/m7_layer0.rs, with the checkpoint sink
+// consumed on both sides, PASSed 5/5 positions - 163,838/163,840 outputs (99.9988%) bit-exact
+// against the bf16 rounding of the f32 reference, max abs delta 9.765625e-4 (one bf16 ULP), max
+// ULP distance 1. That is internal consistency of the sink arithmetic against our reference on
+// real checkpoint bytes, not a claim of bit-identity with the released kernel.
 
 #include "m4_common_sm121.cuh"
 
@@ -106,6 +115,7 @@ extern "C" __global__ void flash_mla_csa2_sm121(
     const uint32_t *__restrict__ selected,           // [selected_count] candidate position ids
     const __nv_bfloat16 *__restrict__ index_key,     // [hsi_blocks][8][index_head_dim]
     const __nv_bfloat16 *__restrict__ index_query,   // [heads][index_head_dim]
+    const float *__restrict__ sink,                  // [heads] additive per-head attention sink logit
     float *__restrict__ block_scores,                // [hsi_blocks] out: best score in the block
     uint32_t *__restrict__ block_best,               // [hsi_blocks] out: the token that scored it
     __nv_bfloat16 *__restrict__ out,                 // [heads][latent] attention output
@@ -232,7 +242,10 @@ extern "C" __global__ void flash_mla_csa2_sm121(
         s_max = local_max;
     }
     __syncthreads();
-    float local_sum = 0.0f;
+    // The sink contributes probability mass but no value, so it is one term of the denominator
+    // and nothing else. Adding it after the maximum is the released order (kernel.py:382-383);
+    // thread 0 owns the term so the reduction order stays fixed run to run.
+    float local_sum = lane == 0u ? spark_exp(sink[head] - s_max) : 0.0f;
     for (uint32_t slot = lane; slot < selected_count; slot += SPARK_M4_MLA_THREADS) {
         const float probability = spark_exp(s_scores[slot] - s_max);
         s_scores[slot] = probability;

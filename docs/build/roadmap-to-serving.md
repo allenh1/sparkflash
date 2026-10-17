@@ -39,8 +39,8 @@ quoted with each row because the class is part of the number.
 
 | Stage | Kernel | Comparison class (printed before the numbers) | Measured on node0, 2026-10-17 | Device bytes |
 | :--- | :--- | :--- | :--- | ---: |
-| 1. mHC | `mega_mhc_fused_bf16_sm121` | Internal consistency against the in-crate f32 reference on real layer-0 bytes; **not model fidelity** (the predictor is the stream-mean fold). The released class (D22: `hc_attn_base` and `hc_attn_scale` consumed, `C` compared raw, released split-Sinkhorn) is what the current code prints and what the owed re-run will measure. | **20,480/20,480 bit-exact**; scales **160/160**; **p50 0.0227 ms**/launch — **measured on the pre-released-arithmetic kernel**; the released-arithmetic re-run is owed (section 3.6) | < 1 MiB |
-| 2. Attention | `flash_mla_csa2_sm121` | Tolerance 99.5 % exact, abs delta at most 1.6e-2; **sink excluded both sides** (task-36); candidates harness-supplied; indexer outputs not compared. | **163,833/163,840 = 99.9957 %**; **5.73 ms** = **4.27 ms indexer** + **1.46 ms attention** | **4.2 MiB** |
+| 1. mHC | `mega_mhc_fused_bf16_sm121` | Internal consistency against the in-crate f32 reference on real layer-0 bytes; **not model fidelity** (the predictor is the stream-mean fold). The released class (D22: `hc_attn_base` and `hc_attn_scale` consumed, `C` compared raw, released split-Sinkhorn) is what the current code prints and what the second-window re-run measured. | **20,480/20,480 bit-exact**; scales **160/160**; **4/4 tokens PASS** on the released-arithmetic cubin (second window); kernel time **not re-measured**, p50 0.0227 ms is the pre-released-arithmetic figure | < 1 MiB |
+| 2. Attention | `flash_mla_csa2_sm121` | Tolerance 99.5 % exact, abs delta at most 1.6e-2; **sink included on both sides** (task-36 closed: the kernel takes a `[64]` f32 argument, the reference is `mla_ref::attention_with_sink`); candidates harness-supplied; indexer outputs not compared. | **163,838/163,840 = 99.9988 % exact, max abs delta 9.765625e-4, max ULP 1** (second window); timing **5.73 ms** is the first-window number, re-measure owed | **4.2 MiB** |
 | 3. MoE combine | `b12x_mxfp4_moe_sm121` | Tolerance 99.9 % exact, at most 2 bf16 codes; **router on the host seam**; gate/up, SwiGLU, quantiser host; 8/32/64 resident experts. | **20,480/20,480 exact, max ULP 0**; **0.821 / 0.847 / 0.850 ms per token** over four chained launches | 100–802 MB |
 
 The arithmetic that follows is **extrapolation, not a measurement**: 0.0227 + 5.73 + 0.85 is about
@@ -69,7 +69,7 @@ Every exclusion below is printed by the harness next to the number it limits; th
 because every downstream phase inherits them.
 
 1. **No stage is model fidelity.** Stage 1 is internal consistency against *our* reference on real
-   bytes. Stage 2 is tolerance-based with the sink excluded on both sides, a harness-supplied
+   bytes. Stage 2 is tolerance-based with the sink included on both sides (task-36 closed), a harness-supplied
    candidate list and no comparison of the indexer's own outputs. Stage 3 is tolerance-based over a
    *quantised* activation: the same chain with an f32 activation differs in essentially every output
    (max abs delta 14.19 at 8 experts, 12.91 at 32 and 64), so the exact agreement says the kernel
@@ -331,13 +331,11 @@ Each of these is a test that can fail, not a checklist item:
    the CI `cuda-abi` job runs `check-kernel-baseline.sh` in the pinned container, so the baseline
    gate is enforced there rather than by the skip.
 
-**Status of this list.** Items 3, 4 and 5 are met on the branch that closes Phase 0: the baseline is
-regenerated under the pinned V13.0.88 (`check-kernel-baseline.sh` green, seven entries), item 4's test
-is in `tests/determinism_contract.rs`, and the harness and contract tests run without a device. Item 1 is met in
-the code (raw `C`, both released tensors consumed, no caveat lines) and item 2's structural halves are in
-(`mhc_determinism.rs`, `determinism_contract.rs`); both device halves (`--stage 1`, `--stage 4 --repeat 100`) are owed a window: the
-node's resident model holds the only usable CUDA context, and the launcher refuses a second one with
-the listed OUT_OF_MEMORY message rather than working around it.
+**Status of this list.** All five are met. Items 3, 4 and 5 in CI (`check-kernel-baseline.sh` green
+under V13.0.88, seven entries). The two device halves ran in the second window of 2026-10-17 with the
+node's model stopped and cubins rebuilt on the node from these sources: item 1 PASSed 4/4 tokens with
+raw `C` and `hc_attn_base` consumed and no caveat lines, and item 2 PASSed `--stage 4 --repeat 100`
+(4 tokens x 100 launches, every compared byte identical).
 
 ### 3.7 Tasks
 
@@ -435,12 +433,12 @@ A seam that is labelled is a seam whose cost and correctness are known. A seam t
 number that cannot be attributed — the sink was dropped from both sides of the comparison for
 exactly this reason, and task-36 is the fix, not a caveat.
 
-**The sink (task-36) enters Phase 1.** The reference half is committed on branch `feat/attn-sink-ref`
-(commit `8c0c524`, not yet pushed); the kernel half is the ABI change (a 64-float per-head argument)
-and is its own MR. Phase 1's attention path consumes it: the acceptance criterion is that the run
-output contains no "sink excluded" line. If the kernel half slips, Phase 1 can still run with the
-sink excluded on both sides — but then its logits are not model fidelity, and the phase exit says so
-explicitly.
+**The sink (task-36) is closed.** The reference half is merged (!27, `0374b69`); the kernel half is
+the `[64]` f32 per-head argument on `flash_mla_csa2_sm121`, plus the matching
+`mla_ref::attention_with_sink` call and signature pin. The second device window of 2026-10-17 ran
+stage 2 with it: 5/5 positions PASS, 163,838/163,840 exact (max abs delta 9.765625e-4, max ULP 1),
+and the harness prints that the sink is consumed on both sides — no "sink excluded" line. Phase 1's
+attention path consumes the same argument.
 
 ### 4.4 What one token proves, and what it does not
 
@@ -1114,9 +1112,10 @@ Each is a real gap with a test that would close it; none is a caveat to be waved
    `the_released_split_sinkhorn_runs_iterations_minus_one_pairs`, which enters the pair loop) pin the
    row mapping, the activations and the released schedule; `mega_mhc_ref.rs:606,683` are the mapping
    functions.
-3. **The attention sink (task-36) is reference-only today.** The reference half is committed
-   (`feat/attn-sink-ref`, `8c0c524`, not pushed); the kernel ABI is a separate MR. Until it lands,
-   stage 2 is internal consistency with the sink excluded on both sides, and the run says so.
+3. **The attention sink (task-36) is consumed on both sides.** **Closed (D22, second window).**
+   The kernel takes the `[64]` f32 argument and the reference is `mla_ref::attention_with_sink`; the
+   stage-2 run of 2026-10-17 was 5/5 positions within tolerance with the sink consumed, and prints no
+   "sink excluded" line.
 4. **`hc_attn_base` (task-40)** is consumed by neither side (section 3.3).
    **Closed (D22).** Both sides consume it: the kernel takes it as an ABI argument and
    `bias_into_kernel_rows` puts the 24 values in the kernel's row order; the harness no longer
@@ -1166,9 +1165,9 @@ Each is a real gap with a test that would close it; none is a caveat to be waved
 | Phase | Existing tasks | New tasks (proposed) | Exit criterion |
 | :--- | :--- | :--- | :--- |
 | 0 | task-38, task-39, task-40, task-43 | determinism test; raw-C stage-1 | section 3.6 |
-| 1 | task-36 (kernel ABI), task-35 and task-31 (slice close-out) | layer plan and pinned 43-row table; 40-layer token harness; stage-4 head; perturbation and seam-label tests | section 4.5 |
+| 1 | task-35 and task-31 (slice close-out) | layer plan and pinned 43-row table; 40-layer token harness; stage-4 head; perturbation and seam-label tests | section 4.5 |
 | 2 | none | device KV store; prefill/decode harness; KV audit; D16 measured bytes | section 5.5 |
-| 3 | task-41, task-37, task-36 (if open) | K=5120 gate/up GEMM; CUDA graph runner; tokens/s harness vs vLLM | section 6.4 |
+| 3 | task-41, task-37 | K=5120 gate/up GEMM; CUDA graph runner; tokens/s harness vs vLLM | section 6.4 |
 | 4 | task-30 (cluster facts; prerequisite) | one-shot gate on the real fabric; ring-path numerical check; loopback TP test; sharding map; per-rank memory census; Engram packer on the real checkpoint | section 7.7 |
 | 5 | task-18 | device engine; scheduler adapter; latency harness; gate producers | section 8.4 |
 
@@ -1183,20 +1182,21 @@ merged and the slice documented), and they feed Phase 0/1 rather than being repl
 
 | Number | Value | Host | How measured |
 | :--- | :--- | :--- | :--- |
-| mHC residual streams | 20,480/20,480 bit-exact | node0, 2026-10-17 | `m7_layer0 --stage 1`, real layer-0 bytes; **pre-released-arithmetic kernel, re-run owed** |
-| mHC ue8m0 scales | 160/160 bit-exact | node0, 2026-10-17 | same; **pre-released-arithmetic kernel, re-run owed** |
-| mHC kernel time | p50 0.0227 ms/launch | node0, 2026-10-17 | same; **pre-released-arithmetic kernel, re-run owed** |
-| Attention outputs | 163,833/163,840 = 99.9957 % exact | node0, 2026-10-17 | `--stage 2`, `--tokens 130` (128-token window) |
-| Attention kernel time | 5.73 ms/launch = 4.27 indexer plus 1.46 attention | node0, 2026-10-17 | same, event timing over repeats |
+| mHC residual streams | 20,480/20,480 bit-exact | node0, 2026-10-17 (second window) | `m7_layer0 --stage 1`, real layer-0 bytes, released-arithmetic cubin; PASS 4/4 tokens |
+| mHC ue8m0 scales | 160/160 bit-exact | node0, 2026-10-17 (second window) | same; PASS 4/4 tokens |
+| mHC kernel time | p50 0.0227 ms/launch | node0, 2026-10-17 (first window) | pre-released-arithmetic kernel; **timing re-measure owed** |
+| Attention outputs | 163,838/163,840 = 99.9988 % exact, max abs delta 9.765625e-4, max ULP 1 | node0, 2026-10-17 (second window) | `--stage 2 --tokens 130`; **sink consumed on both sides** (kernel argument + `attention_with_sink`) |
+| Attention kernel time | 5.73 ms/launch = 4.27 indexer plus 1.46 attention | node0, 2026-10-17 (first window) | event timing over repeats; the sink ABI changes no timing claim, but re-measure is owed |
 | Attention device bytes | 4.2 MiB (`index_key` 4 MiB) | node0, 2026-10-17 | printer from the harness's planned layout |
-| MoE combine | 20,480/20,480 exact, max ULP 0 | node0, 2026-10-17 | `--stage 3 --experts 8/32/64 --tokens 4` |
+| mHC determinism | 4 tokens x 100 launches, every compared byte identical | node0, 2026-10-17 (second window) | `--stage 4 --repeat 100`, released-arithmetic cubin; Phase 0 exit criterion 2 |
+| MoE combine | 20,480/20,480 exact, max ULP 0 | node0, 2026-10-17 (second window: 8 experts re-run PASS; 32/64 from the first window) | `--stage 3 --experts 8/32/64 --tokens 4` |
 | MoE combine time | 0.821 / 0.847 / 0.850 ms per token | node0, 2026-10-17 | same, four rank-chained launches |
-| Expert coverage | 10/24, 24/24, 24/24 top-6 selections | node0, 2026-10-17 | same, coverage line |
-| Quantisation gap | 1/20,480 and 2/20,480 outputs exact; max abs delta 14.19 / 12.91 | node0, 2026-10-17 | same, f32-activation control |
+| Expert coverage | 10/24, 24/24, 24/24 top-6 selections | node0, 2026-10-17 (first window) | same, coverage line |
+| Quantisation gap | 1/20,480 and 2/20,480 outputs exact; max abs delta 14.19 / 12.91; second window 8 experts: max abs delta 13.4375 | node0, 2026-10-17 | same, f32-activation control |
 | Device total memory | 124,610 MiB | node0 | `cuDeviceTotalMem_v2` ([device-path-design.md](device-path-design.md) section 9) |
 | Free memory beside vLLM | 3,115 MB | node0, 2026-10-16 | `doctor --local` |
 | Empty-node MemAvailable | 118.2 GiB at process start | node0, 2026-10-17 | harness floor check |
-| Kernel baseline | five of six entries byte-identical, `flash_mla` moves 32,608 to 32,624 B; seventh 22,088 B | amd64 dev box, `nvcc V13.0.88` | `check-kernel-baseline.sh` |
+| Kernel baseline | seven of seven entries re-pinned; `flash_mla` moves 35,848 to 36,160 B for the sink ABI | amd64 CI container, `nvcc V13.0.88` | `check-kernel-baseline.sh` (temporary job in the CUDA 13.0.3 image) |
 | Checkpoint bytes | 510,286,023,000 B, closing exactly | released index | [../architecture/00-overview.md](../architecture/00-overview.md) section 2.4 |
 | KV entry / token / page | 356 B / 890 B / 56,960 B | design plus `tests/layout.rs` | D1, D16 |
 | Per-rank weights (all resident) | about 130.1 GB on a 130.66 GB device | arithmetic, released bytes | section 7.5 |

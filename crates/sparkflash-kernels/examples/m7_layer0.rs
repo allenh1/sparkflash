@@ -31,8 +31,11 @@
 //! the release's [24, n*d] projection over the flattened stream, so stage 1 is internal
 //! consistency of the released arithmetic, not a checkpoint-exact claim.
 //!
-//! Stage 2: mla_ref::attention against flash_mla_csa2_sm121, the attention sink EXCLUDED on both
-//! sides and labelled as what it is - internal consistency, sink excluded, not model fidelity. Its
+//! Stage 2: mla_ref::attention_with_sink against flash_mla_csa2_sm121, the checkpoint's per-head
+//! attn_sink consumed on BOTH sides: the kernel takes the [64] f32 sink as an argument and adds
+//! it to the softmax denominator after the maximum, exactly as the reference does, so this is
+//! internal consistency of the sink arithmetic, not (yet) a device-vs-release claim - the device
+//! run of this ABI change is the proof. Its
 //! input arrives from stage 1, so it carries stage 1's one residual limitation: the predictor is
 //! the project's fold over the stream mean, not the release's flattened projection; the coefficient
 //! tensors themselves are consumed on both sides now. The KV rows it feeds both sides are the FP4
@@ -1104,8 +1107,8 @@ fn stage1(args: &Args) -> Result<(), String> {
 
 // ---------------------------------------------------------------------------------------------
 // Stage 2: MLA attention on layer 0. compress_ratios[0] == 0, so the sliding-window path over at
-// most index_topk candidates is the whole attention rule, and the attention sink is excluded on
-// both sides because neither the kernel nor the reference has a sink parameter.
+// most index_topk candidates is the whole attention rule. The per-head attention sink is consumed
+// on both sides: the kernel takes a [64] f32 argument and the reference is attention_with_sink.
 // ---------------------------------------------------------------------------------------------
 
 /// The MLA latent width, mirrored from mla_ref::MLA_LATENT.
@@ -1334,13 +1337,13 @@ fn stage2_selected(position: usize) -> Vec<u32> {
 fn stage2(args: &Args) -> Result<(), String> {
     let kernel = "flash_mla_csa2_sm121";
     let prefix = format!("layers.{}", args.layer);
-    println!("=== stage 2: {kernel} against mla_ref::attention ===");
+    println!("=== stage 2: {kernel} against mla_ref::attention_with_sink ===");
     println!(
         "comparison class: TOLERANCE-BASED, not exact. The kernel writes bf16 and evaluates expf on the device; the reference is f32 with the library exponential. The tolerance is named here, before any number it judges: at least {STAGE2_EXACT_BAR}% of the {} outputs bit-identical to the bf16 rounding of the f32 reference, and max abs delta <= {STAGE2_DELTA_BAR:e}. Reason: the score sum, the window predicate, the candidate order, the FP4 decode and the divide are identical by construction on both sides, so the only degrees of freedom are expf against libm exp, the tree reduction of the normalising sum against the serial one, and the bf16 output write itself.",
         MLA_HEADS * MLA_LATENT
     );
     println!(
-        "label: internal consistency, sink excluded, not model fidelity. The attention sink (attn_sink, F32 [64], a per-head additive logit inside the softmax denominator) is EXCLUDED ON BOTH SIDES: the kernel has no sink parameter and mla_ref::attention has none, so the exclusion is structural rather than an omission this harness could forget. Task-36 tracks the reference first and then the ABI change."
+        "label: internal consistency of the sink arithmetic, not model fidelity. The attention sink (attn_sink, F32 [64], a per-head additive logit inside the softmax denominator) is CONSUMED ON BOTH SIDES: the kernel takes it as an argument and adds it to the denominator after the maximum, and mla_ref::attention_with_sink does the same. The device run of this ABI change is what turns this into a measured device-vs-reference claim; until that Spark window, the comparison is internal consistency on host inputs."
     );
     println!(
         "inherited limitation from stage 1, printed rather than implied: this stage's input chain starts at stage 1's xhat fp8 codes and scales, which carry stage 1's residual gap - the predictor is the project's [24, d] fold over the stream mean, not the release's [24, 20480] projection over the flattened stream - and the bf16 write and tf32-like reductions of the device. The coefficient tensors are NOT a gap any more: hc_attn_base and hc_attn_scale are consumed on both sides and the kernel's C is compared raw."
@@ -1413,7 +1416,7 @@ fn stage2(args: &Args) -> Result<(), String> {
         wkv_scale.len()
     );
     println!(
-        "attn_sink: {} f32 in [{sink_min:.4}, {sink_max:.4}] - read for the record and NOT consumed, on either side",
+        "attn_sink: {} f32 in [{sink_min:.4}, {sink_max:.4}] - consumed on BOTH sides: passed to the kernel as a [64] argument and added to the denominator after the maximum, and passed to mla_ref::attention_with_sink",
         sink.len()
     );
 
@@ -1498,7 +1501,8 @@ fn stage2(args: &Args) -> Result<(), String> {
         + index_query_bytes
         + MLA_HSI_BLOCKS * 4
         + MLA_HSI_BLOCKS * 4
-        + out_bytes) as u64;
+        + out_bytes
+        + MLA_HEADS * 4) as u64;
     let cuda = Cuda::load()?;
     let cubin_path = args.cubin_dir.join(format!("{kernel}.cubin"));
     let cubin = std::fs::read(&cubin_path).map_err(|e| {
@@ -1511,6 +1515,7 @@ fn stage2(args: &Args) -> Result<(), String> {
     admit_memory(args, planned, "stage 2 device buffers")?;
     let mut allocated = 0usize;
     let q_d = cuda.alloc(MLA_HEADS * MLA_LATENT * 2, &mut allocated)?;
+    let sink_d = cuda.alloc(MLA_HEADS * 4, &mut allocated)?;
     let kv_fp4_d = cuda.alloc(tokens * KV_PACKED_BYTES, &mut allocated)?;
     let kv_scales_d = cuda.alloc(tokens * KV_SCALE_BYTES, &mut allocated)?;
     let selected_d = cuda.alloc(MLA_MAX_SELECTED * 4, &mut allocated)?;
@@ -1525,6 +1530,7 @@ fn stage2(args: &Args) -> Result<(), String> {
     );
     cuda.copy_htod(&kv_fp4_d, &kv_fp4)?;
     cuda.copy_htod(&kv_scales_d, &kv_scales)?;
+    cuda.copy_htod(&sink_d, &f32_to_bytes(&sink))?;
 
     // Deterministic integer-valued index data for the indexer self-check below. Every product and
     // partial sum is an exact integer in f32 (|dot| <= 1,024), so the reference and the kernel must
@@ -1584,13 +1590,14 @@ fn stage2(args: &Args) -> Result<(), String> {
     // every dot product is exact in f32, and compares the two heads of index head 0 - the pair
     // that splits the pool in the kernel - against mla_ref::index_block_best. Blocks the kernel
     // does not write keep their sentinel, so partial coverage fails rather than passing silently.
-    let index_check_params: [u64; 14] = [
+    let index_check_params: [u64; 15] = [
         q_d.0,
         kv_fp4_d.0,
         kv_scales_d.0,
         selected_d.0,
         index_key_d.0,
         index_query_d.0,
+        sink_d.0,
         block_scores_d.0,
         block_best_d.0,
         out_d.0,
@@ -1645,7 +1652,7 @@ fn stage2(args: &Args) -> Result<(), String> {
     );
 
     let mut verdicts: Vec<(String, bool)> = Vec::new();
-    let mut last_params: [u64; 14] = [0; 14];
+    let mut last_params: [u64; 15] = [0; 15];
     for (step, &position) in positions.iter().enumerate() {
         let (codes, scales) = &xhat[position];
         let q_latent_bits = mxfp8_ref::dense_gemm(
@@ -1700,13 +1707,14 @@ fn stage2(args: &Args) -> Result<(), String> {
 
         cuda.copy_htod(&q_d, &bf16_bits_to_bytes(&q_device))?;
         cuda.copy_htod(&selected_d, &u32s_to_bytes(&selected))?;
-        let params: [u64; 14] = [
+        let params: [u64; 15] = [
             q_d.0,
             kv_fp4_d.0,
             kv_scales_d.0,
             selected_d.0,
             index_key_d.0,
             index_query_d.0,
+            sink_d.0,
             block_scores_d.0,
             block_best_d.0,
             out_d.0,
@@ -1732,8 +1740,14 @@ fn stage2(args: &Args) -> Result<(), String> {
         let mut reference = Vec::with_capacity(MLA_HEADS * MLA_LATENT);
         for head in 0..MLA_HEADS {
             let q_head = &q_used[head * MLA_LATENT..(head + 1) * MLA_LATENT];
-            let head_out =
-                mla_ref::attention(q_head, &kv_fp4, &kv_scales, &selected, position as u32);
+            let head_out = mla_ref::attention_with_sink(
+                q_head,
+                &kv_fp4,
+                &kv_scales,
+                &selected,
+                position as u32,
+                sink[head],
+            );
             reference.extend_from_slice(&head_out);
         }
         println!(
@@ -1784,6 +1798,7 @@ fn stage2(args: &Args) -> Result<(), String> {
             block_scores_d,
             block_best_d,
             out_d,
+            sink_d,
         ],
     );
     check_floor(args, "stage 2 end")?;

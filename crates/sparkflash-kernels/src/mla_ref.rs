@@ -35,10 +35,10 @@
 //!
 //! The value is used as given: the checkpoint does not state its range, so nothing here clamps or
 //! bounds it. [`attention_with_sink`] is the entry point, and [`attention`] is unchanged - it is
-//! exactly [`attention_with_sink`] with a sink of negative infinity. What is still missing is the
-//! device side: kernels/flash_mla_csa2_sm121 has no sink argument yet, so a device-vs-reference
-//! comparison is "sink excluded on both sides" until that ABI change lands, and nothing in this file
-//! claims otherwise.
+//! exactly [`attention_with_sink`] with a sink of negative infinity. The device side now carries the same
+//! argument: kernels/flash_mla_csa2_sm121 takes a [heads] f32 sink and adds it to the denominator
+//! after the maximum, so a device-vs-reference comparison runs with the sink included; the device
+//! run of 2026-10-17 (stage 2, 5/5 positions) is that comparison.
 //!
 //! The SCORE SCALE is part of the contract, not a detail: a score is a dot product over the
 //! 512-wide latent, multiplied by 1 / sqrt(512) = 0.04419417382415922 (MLA_SCORE_SCALE below).

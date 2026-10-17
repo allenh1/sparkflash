@@ -48,11 +48,15 @@
 // reference masks identically, and it still COUNTS the wasted MACs so the cost of the padding is
 // visible rather than assumed away.
 //
-// Verification status: never executed (no GPU on this host). nvcc 12.9.1 compiles it for
-// sm_121a, clang parses it against the stub headers, the signature and geometry are pinned by
-// src/m4_abi.rs, and src/mxfp4_ref.rs defines and tests the numerics on the CPU. No latency, no
-// expert-parallel transport, and no tensor-core path is claimed. The dispatch handshake that
-// feeds this kernel is not in this file and does not poll any peer-written word.
+// Verification status: executed on node0 (GB10, sm_121a) on 2026-10-17. nvcc 13.0.3
+// compiles it for sm_121a, clang parses it against the stub headers, the signature and geometry
+// are pinned by src/m4_abi.rs, and src/mxfp4_ref.rs defines and tests the numerics on the CPU.
+// The device run: stage 3 of examples/m7_layer0.rs with 8 resident experts on real layer-0 bytes
+// PASSed - the combine output 20,480/20,480 bit-exact against the bf16 rounding of the
+// quantised reference, max ULP distance 0. The router is still the host seam and the shared
+// expert is still host arithmetic, as the harness prints; no latency, no expert-parallel
+// transport and no tensor-core path is claimed. The dispatch handshake that feeds this kernel is
+// not in this file and does not poll any peer-written word.
 
 #include "m4_common_sm121.cuh"
 
