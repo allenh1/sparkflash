@@ -18,6 +18,7 @@
 
 pub mod abi;
 pub mod c_decl;
+pub mod engram_head_ref;
 pub mod lm_head_ref;
 pub mod m4_abi;
 pub mod m4_quant;
