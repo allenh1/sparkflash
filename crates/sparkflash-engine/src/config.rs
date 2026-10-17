@@ -344,7 +344,7 @@ impl ModelConfig {
             dtype: "fp8".to_string(),
             expert_dtype: "fp4".to_string(),
             compress_rope_theta: 160_000.0,
-            compress_ratios: vec![2, 2, 1],
+            compress_ratios: vec![2, 2, 0],
             image_token_id: 127,
             gate_temp: 1.0,
             norm_topk_prob: true,

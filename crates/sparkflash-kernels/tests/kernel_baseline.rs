@@ -37,7 +37,7 @@ fn the_kernels_still_compile_to_the_recorded_baseline() {
         println!(
             "skipping the kernel baseline check: no nvcc on PATH and SPARKFLASH_NVCC is unset or \
              not a file, so there is nothing to compile the six kernels with. Run it on a CUDA host \
-             or inside nvidia/cuda:12.9.1-devel-ubuntu22.04: /bin/sh \
+             or inside nvidia/cuda:13.0.3-devel-ubuntu22.04: /bin/sh \
              crates/sparkflash-kernels/scripts/check-kernel-baseline.sh"
         );
         return;

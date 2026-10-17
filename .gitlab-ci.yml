@@ -87,7 +87,8 @@ test-features:
 # that architecture fails here instead of quietly compiling something else.
 cuda-abi:
   stage: test
-  image: nvidia/cuda:12.9.1-devel-ubuntu22.04
+  tags: [cuda]
+  image: nvidia/cuda:13.0.3-devel-ubuntu22.04
   variables:
     RUSTUP_HOME: "$CI_PROJECT_DIR/.rustup"
     CARGO_TARGET_DIR: "$CI_PROJECT_DIR/target-cuda"

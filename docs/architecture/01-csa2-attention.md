@@ -63,12 +63,18 @@ Complete layer assignment (compress_ratios has 43 entries: index 0..42):
 | 33..35 | 1 | Reuse | |
 | 36 | 1 | **Reindex** | |
 | 37, 38, 39 | 1 | Reuse | |
-| 40..42 (MTP) | 0 | SWA only (DSpark) | layer_id `>=` n_layers disqualifies them from both source sets (model.py:653-655) |
+| 40..42 (MTP) | 0 | **MTP stage** (DSpark; `LayerMode::Mtp`) | layer_id `>=` n_layers disqualifies them from both source sets (model.py:653-655); the DSpark block asserts ratio 0 (model.py:1034) |
 
 Counts: 38 layers have ratio `>` 0, of which 3 Full, 1 Full+HSI, 4 Reindex and **30 Reuse**
 (5+5+5 in the ratio-2 groups, then 3 + 3+3+3+3 in the ratio-1 groups). This matches tech_report.txt
 p.10 lines 442-460 (encoder: 3 groups of six, first layer Full, remaining five Reuse; decoder: layer
 20 Full, then four groups of four, first layer of each Reindex, remaining three Reuse).
+
+The engine plan names rows 40..42 `LayerMode::Mtp`, not `SwaOnly`: they are DSpark stages after the
+backbone, own no KV or index and read no backbone cache. The three backbone modes themselves are
+ownership: `Full` owns the compressor and compressed KV, `Reindex` owns only an indexer, `Reuse`
+owns neither. Index ownership is an independent predicate (model.py:654-655), so the plan can
+represent a KV source without an indexer even though the released lists do not contain one.
 
 The sharing is implemented through one process-global slot per artefact, which is safe because layers
 always run in order and each source writes before its consumers read (model.py:1166-1180):

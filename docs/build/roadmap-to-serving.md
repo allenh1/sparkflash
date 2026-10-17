@@ -58,7 +58,7 @@ Two secondary results belong here because later phases rely on them:
   "the rest is fine" figure.
 - **Kernel builds are reproducible.** Five of the six nvcc entries in
   [kernel_baseline.txt](../../crates/sparkflash-kernels/baseline/kernel_baseline.txt) reproduce
-  byte-identically under the pinned toolkit `V12.9.86`; the sixth is `flash_mla_csa2_sm121`, whose
+  byte-identically under the pinned toolkit `V13.0.88`; the sixth is `flash_mla_csa2_sm121`, whose
   `__syncthreads` fix in `!26` moves the cubin from 32,608 to 32,624 bytes (and its sha256), and the
   seventh kernel (`swiglu_mxfp8_quant_sm121`, 22,088 B) has no baseline entry yet. Recording both is
   task-43 and a Phase 0 exit.
@@ -286,7 +286,7 @@ is red and the CI for `!26` cannot be read as "the kernels are unchanged where t
 pinned-toolkit result — five of six entries byte-identical, only the fixed kernel moving — is
 exactly the evidence that makes the seventh kernel reviewable; it must be recorded, not inferred.
 
-**What we build.** Regenerate the baseline under the pinned `nvcc V12.9.86` (the image and the script
+**What we build.** Regenerate the baseline under the pinned `nvcc V13.0.88` (the image and the script
 are both pinned), record the new `flash_mla` cubin and the seventh kernel's entry, and pin the
 seven-entry file with the seven-kernel check.
 
@@ -332,7 +332,7 @@ Each of these is a test that can fail, not a checklist item:
    gate is enforced there rather than by the skip.
 
 **Status of this list.** Items 3, 4 and 5 are met on the branch that closes Phase 0: the baseline is
-regenerated under the pinned V12.9.86 (`check-kernel-baseline.sh` green, seven entries), item 4's test
+regenerated under the pinned V13.0.88 (`check-kernel-baseline.sh` green, seven entries), item 4's test
 is in `tests/determinism_contract.rs`, and the harness and contract tests run without a device. Item 1 is met in
 the code (raw `C`, both released tensors consumed, no caveat lines) and item 2's structural halves are in
 (`mhc_determinism.rs`, `determinism_contract.rs`); both device halves (`--stage 1`, `--stage 4 --repeat 100`) are owed a window: the
@@ -371,8 +371,8 @@ section 2, [../engine/01-forward-order.md](../engine/01-forward-order.md) sectio
 - `candidate_source_layer = 20` builds the **HSI pool**; every layer above 20 masks its scores with
   that pool.
 - Of forty backbone layers: **3 Full, 1 Full + HSI source, 4 Reindex, 30 Reuse**, and two ratio-0
-  layers (0 and 1) with no compressor and no indexer at all. The three MTP layers are SWA-only and
-  outside this phase.
+  layers (0 and 1) with no compressor and no indexer at all. The three MTP rows are window-only
+  DSpark stages (`LayerMode::Mtp`) and outside this phase.
 - Layer 1 and layer 14 additionally carry the **Engram** tables, and layers 37–39 are the **DSpark**
   targets — the base forward computes them as ordinary ratio-1 layers, the draft path does not exist
   yet.
@@ -384,19 +384,25 @@ state and a served model, and it is structural: no amount of kernel work finds i
 
 ### 4.2 The layer plan: derive it, assert it, dispatch from it
 
-**What we build.** One `LayerPlan` per layer, built once from the released config and validated
-before any weight is read:
+**What we build.** One `LayerPlan` for the model - one row per backbone layer and MTP stage -
+built once from the released config and validated before any weight is read:
 
-    struct LayerPlan {
-        mode: LayerMode,                 // Full { ratio }, Reindex, Reuse, SwaOnly
+    struct LayerSpec {
+        mode: LayerMode,                 // SwaOnly, Full, Reindex, Reuse, Mtp (unit variants)
+        owns_kv: bool,                   // Full: owns the compressor and compressed KV
+        owns_index: bool,                // Full index source or Reindex: publishes topk_idxs
         kv_source: Option<usize>,        // Some(2 | 8 | 14 | 20) for readers
-        index_source: Option<usize>,
-        candidate_source: Option<usize>, // Some(20)
-        window: usize,                   // 128
-        compress_ratio: u32,             // 0 for layers 0/1, else 2 or 1
+        index_source: Option<usize>,     // Some(2 | 8 | ... | 36); a Full row may reuse too
+        candidate_source: Option<usize>, // Some(20); an index source, not necessarily a KV one
+        kv_offset: Option<usize>,        // Some(128) on a compressed row; None on a stage
+        compress_ratio: usize,           // 0 for layers 0/1, else 2 or 1
         engram: bool,                    // layers 1, 14
         dspark_target: bool,             // layers 37..39 (base forward only)
     }
+
+`Full` means "owns KV", not "owns both": `owns_index` is an independent flag
+(`model.py:654-655`), so a Full row can reuse a preceding index source's Top-K while still
+publishing its own compressed KV.
 
 The plan is **derived** from the four config fields ([DECISIONS.md](../DECISIONS.md) D18's rule) and
 then *asserted* against the released config: forty backbone plus three MTP entries in
@@ -1190,7 +1196,7 @@ merged and the slice documented), and they feed Phase 0/1 rather than being repl
 | Device total memory | 124,610 MiB | node0 | `cuDeviceTotalMem_v2` ([device-path-design.md](device-path-design.md) section 9) |
 | Free memory beside vLLM | 3,115 MB | node0, 2026-10-16 | `doctor --local` |
 | Empty-node MemAvailable | 118.2 GiB at process start | node0, 2026-10-17 | harness floor check |
-| Kernel baseline | five of six entries byte-identical, `flash_mla` moves 32,608 to 32,624 B; seventh 22,088 B | amd64 dev box, `nvcc V12.9.86` | `check-kernel-baseline.sh` |
+| Kernel baseline | five of six entries byte-identical, `flash_mla` moves 32,608 to 32,624 B; seventh 22,088 B | amd64 dev box, `nvcc V13.0.88` | `check-kernel-baseline.sh` |
 | Checkpoint bytes | 510,286,023,000 B, closing exactly | released index | [../architecture/00-overview.md](../architecture/00-overview.md) section 2.4 |
 | KV entry / token / page | 356 B / 890 B / 56,960 B | design plus `tests/layout.rs` | D1, D16 |
 | Per-rank weights (all resident) | about 130.1 GB on a 130.66 GB device | arithmetic, released bytes | section 7.5 |

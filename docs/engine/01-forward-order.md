@@ -471,10 +471,14 @@ the tensor counts in section 2.2 exactly:
 | 25..27 | 1 | Reuse | — | layer 24's indices |
 | 28, 32, 36 | 1 | Reindex | indexer | as layer 24, in their groups |
 | 29..31, 33..35, 37..39 | 1 | Reuse | — | their group's Reindex layer |
-| 40..42 (MTP) | 0 | SWA only (DSpark) | — | — (`layer_id >= n_layers` disqualifies them) |
+| 40..42 (MTP) | 0 | MTP stage (DSpark; `LayerMode::Mtp`) | — | — (`layer_id >= n_layers` disqualifies them; ratio 0 is asserted at model.py:1034) |
 
 Counts: 38 layers have ratio > 0 — 3 Full, 1 Full+HSI, 4 Reindex, 30 Reuse. This reproduces the
 report's own figures (tech_report.txt:541-555 for the pool, 465-524 for the modes).
+
+The engine plan calls the stage rows `LayerMode::Mtp`, not `SwaOnly`: they run after the backbone and
+own no cache. In the plan `Full` means "owns KV" and `owns_index` is independent (model.py:654-655),
+so a Full row that is not an index source reuses the preceding Top-K exactly as a Reuse row does.
 
 ---
 
