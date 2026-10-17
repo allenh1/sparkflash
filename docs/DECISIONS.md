@@ -751,3 +751,72 @@ finding 1 points here for the serve path's failure semantics. Before this entry 
 recorded nowhere in `docs/` - a reader learned it only from the manifest or from `serve.rs`'s module
 doc.
 
+---
+
+## D20 - `sparkflash serve` reads the checkpoint's released `config.json`, and the two configuration documents are pinned
+
+Recorded 2026-10-17.
+
+**Evidence.** The checkpoint ships two configuration documents that are not interchangeable.
+`config.json` at the checkpoint root is the released HF document: a nested `text_config`/
+`vision_config` pair whose key names differ from the engine's (`hidden_size` for `dim`,
+`num_nextn_predict_layers` for `n_mtp_layers`, `routed_scaling_factor` for `route_scale`,
+`rms_norm_eps` for `norm_eps`, `sliding_window` for `window_size`, and several more).
+`inference/config.json` is the flat 64-key runtime document the reference loads with
+`ModelArgs(**json.load(...))` (inference/generate.py:121-123); it is what this crate carries at
+`crates/sparkflash-engine/config/deepseek_v41_flash.runtime.json`. Before this entry,
+`ModelConfig::from_json` parsed only the runtime document, so `sparkflash serve --checkpoint` could
+not read a checkpoint as it was released: the file serve opens is `<dir>/config.json`
+(serve.rs:83, 289-297), which is the HF document, and the parse failed on the absent `dim`. The
+released field values checked read-only from the node agree with the copy at
+`/home/user/dsv41-research/config.json` (sha256 `8be45ce0...`).
+
+The released document carries no `first_k_dense_replace`, `n_group` or `topk_group`, and neither
+does the runtime one. That is a property of the model rather than an omission: every V4.1 backbone
+layer is a MoE block (`self.ffn = MoE(layer_id, args)`, model.py:929), there is no dense MLP to put
+first, and the gate is an ungrouped top-k over all routed experts
+(`indices = (scores + bias).topk(...)`, model.py:808-823). The engine never had those fields and no
+code path wants them; what this entry adds is that a released document that does carry one is
+refused by name instead of loaded with the field dropped.
+
+The released document also carries no `gate.bias_vl`. That is a tensor, not a config field: the
+reference creates it only inside the `vision_enabled` branch (model.py:807), and it is the image-span
+selection bias (model.py:818-820). The plan describes all 43 of them - 40 backbone and 3 MTP stages
+(`docs/engine/01-forward-order.md:132`) - and the text path never reads one: `route` takes the bias
+as an argument and its text caller passes `None` (forward/moe.rs:461). The image path, when it exists,
+is the one that will.
+
+The tensor index settles the naming question. Of its 96,085 keys, 93,415 are `layers.N.*`, 2,401
+`mtp.N.*`, 263 `vision.*`/`aligner.*`, and six are globals (`embed.weight`, `head.weight`,
+`norm.weight`, `image_start`, `image_end`, `image_newline`); none starts with `model.`. The
+plan builds `layers.{N}` and `mtp.{N}` (tensor.rs:73-81) and the index reader returns
+`weight_map` keys verbatim (safetensors.rs:79-82), so no parser adds or strips a `model.` prefix.
+Extra stored names - the vision and aligner tensors - are reported by the audit rather than refused
+(loader.rs:471-472).
+
+**Decision.** `ModelConfig::from_released_json` maps the released document onto the runtime fields,
+and `ModelConfig::from_json` accepts either document (a `text_config` key selects the released
+reader), which fixes the serve path without touching it. Every key of the released `text_config` is
+accounted for: mapped to a field, checked against the value the rest of the engine assumes
+(`hidden_act` = `silu`, `topk_method` = `noaux_tc`, `attention_bias` = false,
+`num_key_value_heads` = 1, `rope_scaling.rope_type` = `yarn`), or ignored with its reason
+(`max_position_embeddings`, `initializer_range`, `attention_dropout`, `use_cache`). The
+`quantization_config` is checked rather than mapped - the dense decode assumes 32x32 UE8M0 scales and
+FP4 experts - and the released document's own `dtype` (`bfloat16`, the safetensors storage format) is
+deliberately not the runtime `dtype` (`fp8`, the linear-weight format, which comes from
+`quantization_config.quant_method`). The released document states `norm_topk_prob`, which the
+runtime document omits and the reference defaults to true; the released reader takes the stated value.
+
+**Consequence.** `crates/sparkflash-engine/config/deepseek_v41_flash.released.json` is the released
+`config.json` byte-for-byte (source sha256
+`8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879`), beside the runtime copy, and
+`crates/sparkflash-engine/tests/released_config.rs` pins its exact top-level, `text_config` and
+`vision_config` key sets, its sha256, and the verified values - vocab 129,280; dim 5,120; one routed
+expert's width 2,304; 40 layers; 3 MTP stages; 64 heads; head dim 512; RoPE head dim 64; q-LoRA 1,280;
+o-LoRA 1,024; 8 output groups; 384 routed experts; top-k 6; one shared expert; route scale 1.5; SwiGLU
+limit 10.0; RMS epsilon 1e-20; RoPE theta 10,000 with YaRN factor 16; window 128; `kv_source_layers`
+[2, 8, 14, 20]; index top-k 512; mHC 4; Engram layers [1, 14]; DSpark targets [37, 38, 39];
+`compress_ratios[0]` = 0, so layer 0 is uncompressed - and asserts the derived configuration equals the
+runtime one field for field. A key added by a later release fails that test until it is mapped or
+explicitly ignored; it can no longer be dropped in silence.
+

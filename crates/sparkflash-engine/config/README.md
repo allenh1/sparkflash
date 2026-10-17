@@ -1,16 +1,22 @@
-# The runtime configuration in this directory
+# The configuration documents in this directory
 
-`deepseek_v41_flash.runtime.json` is the released DeepSeek-V4.1-Flash *runtime* configuration: the
-flat document the reference implementation loads with `ModelArgs(**json.load(...))`
-(`inference/generate.py:121-123`), not the released HF configuration, which nests everything under
-`text_config`/`vision_config` and names several keys differently.
+The checkpoint ships two configuration documents, and they are not the same file:
+
+- `deepseek_v41_flash.runtime.json` - the released DeepSeek-V4.1-Flash *runtime* configuration: the
+  flat document the reference implementation loads with `ModelArgs(**json.load(...))`
+  (`inference/generate.py:121-123`).
+- `deepseek_v41_flash.released.json` - the released HF `config.json`, the document the checkpoint
+  carries at its root: the same model, nested under `text_config`/`vision_config` and with the HF
+  key names (`hidden_size` for `dim`, `num_nextn_predict_layers` for `n_mtp_layers`, ...).
+  `ModelConfig::from_released_json` maps it; `ModelConfig::from_json` accepts either document.
 
 Provenance:
 
-- Source: the checkpoint distribution's `inference/config.json`.
-- Source sha256: `2e84f45cf1dac8c7fcbb200e96667d4b913275690668ed496f24c7747207a809`.
-- Copy: the same 64 keys with the same values, re-serialised with sorted keys and two-space indent,
-  2,126 bytes. The value of each key is unchanged; only the JSON formatting differs.
+- `deepseek_v41_flash.runtime.json`: source the checkpoint distribution's `inference/config.json`,
+  sha256 `2e84f45cf1dac8c7fcbb200e96667d4b913275690668ed496f24c7747207a809`. The same 64 keys with the
+  same values, re-serialised with sorted keys and two-space indent, 2,126 bytes.
+- `deepseek_v41_flash.released.json`: source the checkpoint's root `config.json`, sha256
+  `8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879`. Byte-for-byte, 3,311 bytes.
 
-The copy exists so the engine can be built and tested on a machine that does not have the
-checkpoint. It is a configuration file, not weights: nothing in it is model data.
+The copies exist so the engine can be built and tested on a machine that does not have the
+checkpoint. They are configuration files, not weights: nothing in them is model data.
