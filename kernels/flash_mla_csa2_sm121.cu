@@ -182,6 +182,13 @@ extern "C" __global__ void flash_mla_csa2_sm121(
     if (lane == 0u) {
         s_sum = local_sum > 0.0f ? local_sum : 1.0f;
     }
+    // The publish of s_sum needs its own rendezvous, for the same reason s_max does: without it a
+    // warp that loses the race reads the prologue's 1.0f and divides the latent sum by one instead
+    // of by the normaliser. That is not a rounding error - it scales the head's output by s_sum and
+    // it is nondeterministic, so the CPU reference cannot agree with it. Stage 2 of the layer-0
+    // harness caught exactly that: identical input scored 96.1% exact on one run and 87.5% on the
+    // next, and every over-tolerance value was a head that had divided by the wrong denominator.
+    __syncthreads();
     // Each thread owns two latent channels and walks the candidate list in ascending slot order.
     // That order is part of the contract, so this deliberately does not use shared-memory atomics:
     // an atomic sum would make the rounding depend on warp scheduling and no CPU reference could

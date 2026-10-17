@@ -34,6 +34,7 @@
 # USAGE
 #   scripts/build-aarch64.sh                 # release binary for sparkflash-cli (the preflight CLI)
 #   scripts/build-aarch64.sh --workspace     # every workspace binary
+#   scripts/build-aarch64.sh --example=m7_layer0   # one example (the M7 layer-0 harness)
 #   scripts/build-aarch64.sh --print-env     # show the resolved toolchain and exit
 #
 # OUTPUT
@@ -68,6 +69,7 @@ PRINT_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --workspace) BUILD_ARGS=(--workspace) ;;
+    --example=*) BUILD_ARGS=(-p sparkflash-kernels --example "${arg#--example=}") ;;
     --print-env) PRINT_ONLY=1 ;;
     -h|--help) sed -n '2,45p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
@@ -188,7 +190,7 @@ cd "$REPO_ROOT"
 # ----- 5. what came out --------------------------------------------------------------------------
 OUT="$CARGO_TARGET_DIR/$TARGET/release"
 say "artifacts in $OUT"
-for binary in "$OUT"/sparkflash "$OUT"/rocenante-probe; do
+for binary in "$OUT"/sparkflash "$OUT"/rocenante-probe "$OUT"/examples/*; do
   [ -f "$binary" ] || continue
   printf '%s\n' "$(file -b "$binary")"
   printf 'sha256 %s  %s\n' "$(sha256sum "$binary" | cut -d' ' -f1)" "$binary"

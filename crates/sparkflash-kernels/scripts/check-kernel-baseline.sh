@@ -16,7 +16,7 @@ set -eu
 crate_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 baseline="$crate_dir/baseline/kernel_baseline.txt"
 nvcc=${SPARKFLASH_NVCC:-nvcc}
-kernels="mega_mhc_sm121 b12x_mxfp8_dense_sm121 b12x_mxfp4_moe_sm121 flash_mla_csa2_sm121 b12x_mxfp8_wo_a_sm121 cert_lm_head_sm121"
+kernels="mega_mhc_sm121 b12x_mxfp8_dense_sm121 b12x_mxfp4_moe_sm121 flash_mla_csa2_sm121 b12x_mxfp8_wo_a_sm121 cert_lm_head_sm121 swiglu_mxfp8_quant_sm121"
 
 if [ ! -f "$baseline" ]; then
     echo "no baseline at $baseline" >&2
@@ -85,4 +85,4 @@ if [ "$status" -ne 0 ]; then
     echo "  /bin/sh $crate_dir/scripts/regen-kernel-baseline.sh $baseline" >&2
     exit 1
 fi
-echo "all six kernels match the recorded baseline ($recorded_release, $present_build)"
+echo "all kernels match the recorded baseline ($recorded_release, $present_build)"

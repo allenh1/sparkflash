@@ -1,5 +1,5 @@
 #!/bin/sh
-# Writes the kernel baseline: for each of the six Milestone 4 kernels, the cubin bytes, the cubin
+# Writes the kernel baseline: for each baseline kernel (the six Milestone 4 kernels and the M7 SwiGLU quantiser epilogue), the cubin bytes, the cubin
 # sha256 and the number of `membar` lines nvcc emits in its PTX, under the toolkit that made them.
 #
 # The text this prints is what scripts/check-kernel-baseline.sh compares against
@@ -44,7 +44,7 @@ nvcc_release=$release
 nvcc_build=$build
 arch=$arch
 EOF
-    for kernel in mega_mhc_sm121 b12x_mxfp8_dense_sm121 b12x_mxfp4_moe_sm121 flash_mla_csa2_sm121 b12x_mxfp8_wo_a_sm121 cert_lm_head_sm121; do
+    for kernel in mega_mhc_sm121 b12x_mxfp8_dense_sm121 b12x_mxfp4_moe_sm121 flash_mla_csa2_sm121 b12x_mxfp8_wo_a_sm121 cert_lm_head_sm121 swiglu_mxfp8_quant_sm121; do
         "$nvcc" -std=c++17 "-arch=$arch" -cubin -I "$kernels" "$kernels/$kernel.cu" -o "$work/$kernel.cubin"
         "$nvcc" -std=c++17 "-arch=$arch" --ptx -I "$kernels" "$kernels/$kernel.cu" -o "$work/$kernel.ptx"
         bytes=$(wc -c < "$work/$kernel.cubin" | tr -d ' ')

@@ -1,6 +1,6 @@
 //! The committed kernel baseline: cubin bytes, cubin sha256 and PTX membar count per kernel.
 //!
-//! `scripts/check-kernel-baseline.sh` recompiles the six Milestone 4 kernels with nvcc and compares
+//! `scripts/check-kernel-baseline.sh` recompiles the baseline kernels with nvcc and compares
 //! them with `baseline/kernel_baseline.txt`. That is the check which would catch a kernel silently
 //! changing - the acquire fence disappearing, a codec constant moving - and it is the only check in
 //! this crate that reads what the compiler really produced rather than what the source says.
@@ -25,7 +25,7 @@ fn nvcc() -> Option<PathBuf> {
 }
 
 #[test]
-fn the_six_kernels_still_compile_to_the_recorded_baseline() {
+fn the_kernels_still_compile_to_the_recorded_baseline() {
     let Some(nvcc) = nvcc() else {
         println!(
             "skipping the kernel baseline check: no nvcc on PATH and SPARKFLASH_NVCC is unset or \
@@ -74,8 +74,8 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
         .collect();
     assert_eq!(
         listed.len(),
-        6,
-        "the list must name the six kernels: {listed:?}"
+        7,
+        "the list must name every baseline kernel - the six Milestone 4 kernels and the M7 SwiGLU          quantiser epilogue: {listed:?}"
     );
 
     let manifest = std::fs::read_to_string(crate_dir.join("baseline/kernel_baseline.txt"))
