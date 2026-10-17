@@ -353,11 +353,11 @@
 //! shapes the round-21 review had me pin for the stricter-direction sentence (a fence inside an
 //! unresolved conditional, a fence inside a `try` body) are pinned with a whole-message equality in
 //! `the_two_checks_agree_about_the_fence_shapes_the_structural_check_reads`. WHICH BODIES ARE
-//! TRANSLATION UNITS: every row of the 68-row matrix and every text in the measured table is a
+//! TRANSLATION UNITS: every row of the 81-row matrix and every text in the measured table is a
 //! translation unit. The matrix rows are written out with SPARKFLASH_MATRIX_DUMP and compiled in the
 //! CUDA 12.9.1 container, and the measured texts are compiled there by the measurement harness, which
-//! is the same container: the counts are the matrix dump's 68 compiled / 0 refused and the harness's
-//! 103 texts / 0 refused. What the matrix compile proves is PARSEABILITY: the rows carry no entry
+//! is the same container: the counts are the matrix dump's 81 compiled / 0 refused and the harness's
+//! 116 texts / 0 refused. What the matrix compile proves is PARSEABILITY: the rows carry no entry
 //! point, so each row is compiled to an empty cubin, and a row that nvcc rejects is a row this
 //! documentation may not quote a cubin for. The cubins quoted in this file are measured on the stored
 //! texts of the measured table, which are built from the shipped header by `with_the_shipped_body`,
@@ -678,13 +678,50 @@
 //! not of the helper, and nvcc compiles all three to the baseline 38640 / 4 / e9cc6998 with the
 //! acquire present (accepted_return_in_a_local_constructor, ..._destructor, ..._member_function);
 //! both checks used to refuse them with the unreachability sentence, which was false of that body.
+//! Round 32 A2 extended the same reading to the class-head spellings the closing reviews found
+//! refused: a BASE CLAUSE with a comma (`struct S : A, B`, `class S : public A, public B`) and an
+//! ATTRIBUTE specifier (`struct [[maybe_unused]] S`, `struct __attribute__((packed)) S`, and
+//! `struct alignas(8) S`, which round 32 added after the second review) all stand between the
+//! keyword and the brace, and the walk-back stopped at their `,`, `]` or `)`. It skips a balanced
+//! bracket group now, and all five spellings are stored and measured at 38640 / 4 / e9cc6998
+//! (accepted_return_in_a_local_type_with_two_bases, ..._with_public_bases, ..._with_an_attribute,
+//! ..._with_a_gnu_attribute, ..._with_alignas).
+//! Round 32 A3 is the same rule read in the CALLED direction: a lambda the source CALLS where it
+//! stands runs, so a body of its own that holds a non-returning call cannot hand control back and
+//! the statement after the call never completes. `(void)([&]{ __trap(); return 0u; })();` before the
+//! poll is that shape; nvcc compiles it to 37872 / 4 / 54cda5bc, the cubin this file already
+//! refuses as `__trap();` before the poll. That is the ONE-CUBIN-ONE-VERDICT rule this module reads
+//! the call direction with: two texts that compile to the same cubin may not be certified
+//! differently when the refusal asserts something about the compiled code - here, that the acquire
+//! after the call never runs. A CONSERVATIVE refusal asserts less than that ("the scan will not
+//! certify this text") and conflicts with nothing: four texts in the store are refused with the
+//! baseline 38640 / 4 / e9cc6998 recorded beside them: two for how their macros' replacement lists
+//! read textually rather than preprocessed, one for the preprocessor conditional the scan will not
+//! resolve, and one, refused_poll_in_a_bare_block, because its poll stands in a nested block rather
+//! than a top-level statement.
+//! Both checks ACCEPTED it until round 32 - the false-accept direction of the same defect - and
+//! both refuse it now (refused_trap_in_a_called_lambda_before_the_poll, measured at that cubin). A
+//! `return` in the called lambda returns to the caller, so `(void)([&]{ return; })();` is still
+//! accepted, and so is the lambda nobody calls: `auto f = [&] { __trap(); }; (void)f;` before the
+//! poll is measured at the BASELINE (accepted_nonreturning_call_in_a_lambda_before_the_poll),
+//! because a body that never runs cannot bound the path. A trap reached through a macro, a
+//! function pointer or an inline-asm block, and a body that cannot return only because of an
+//! unbounded loop, are the same stated limits the non-returning name list carries. So is a closure
+//! the source STORES in a variable and calls later - `auto f = [&] { __trap(); }; f();` before the
+//! poll - because the reading asks whether the lambda is called where it stands and does not follow
+//! the variable the closure is bound to; that body is excused today, and the excuse is a stated
+//! limit rather than a measured cubin claim.
 //! THE SPELLINGS THE DETECTOR READS. "Any depth inside a lambda" holds for every spelling with a
 //! capture list - `[&]`, `[=]`, `[x]`, `[&, x]`, `[]` and the trailing-return forms - and round 30
 //! made it hold for the two spellings round 29 had refused conservatively: `[&]<typename T>()` (the
 //! walk-back now steps over the balanced template parameter list) and `[&]() -> decltype(auto)` (it
-//! steps over the balanced `decltype(...)` in the return type). Both are stored ACCEPTED texts now
+//! steps over the balanced `decltype(...)` in the return type). Round 32 A4 pinned the two specifier
+//! spellings that were accepted and untested: `[&]() noexcept { return; }` and
+//! `[&]() mutable { return; }` are stored and measured at 38640 / 4 / e9cc6998
+//! (accepted_noexcept_lambda_with_a_return, accepted_mutable_lambda_with_a_return). Both of round 30's
+//! spellings are stored ACCEPTED texts as well
 //! (accepted_template_parameter_list_lambda_with_a_return and
-//! accepted_decltype_auto_lambda_with_a_return) and nvcc compiles both to the BASELINE
+//! accepted_decltype_auto_lambda_with_a_return), and nvcc compiles all four to the BASELINE
 //! 38640 / 4 / e9cc6998, as it always did - the round-29 refusals said the acquire after the exit was
 //! unreachable, and that sentence was false of the body nvcc compiled.
 //! Round 31 A1 closed the way that claim was still false: the walk-back kept ONE depth counter for
@@ -700,7 +737,16 @@
 //! `[&]<auto N = (1 < 2)>()` and `[&]<auto N = (1 << 2)>()` in a template parameter list. A genuine
 //! `>` at the top level of the walk-back is still read as a template close, which is what keeps the
 //! acceptance and the refusal both honest; a requires-clause is NOT read (nvcc 12.9 refuses that
-//! spelling itself, so it has no cubin to pin).
+//! spelling itself, so it has no cubin to pin). Round 32 A1 closed the last of it, and it was a
+//! test-quality defect before it was a code one: every one of round 31's angle texts wrote its
+//! comparison PARENTHESISED, so the guard had never been asked about a BARE one, and
+//! `std::enable_if_t<1 < 2, int>`, `1 <= 2` and `1 >= 2` written bare in a template argument or
+//! parameter list were still refused with the unreachability sentence while nvcc compiled all five
+//! to 38640 / 4 / e9cc6998. In BOTH angle walks a `<` is a delimiter only when a template NAME
+//! stands in front of it, and the `>` of a `>=` is a comparison rather than a close: the guard is
+//! the one function round-18 A4 wrote for the call reading, now with three call sites. The five
+//! bare forms are stored and measured (accepted_bare_less_than_in_a_trailing_return, the
+//! ..._less_equal one beside it, and the three ..._in_a_template_parameter_list forms).
 //! AN ATTRIBUTE IS NOT A CAPTURE LIST, and `]]` alone does not decide it. Round 28's outward walk read
 //! a compound statement carrying an attribute as a lambda body, because `[[maybe_unused]]` closes with
 //! two `]` tokens: the walk saw the first `]` before the brace and took it for a capture list - the
@@ -727,9 +773,15 @@
 //! fence before it ever reached the real acquire, which was the first disagreement of round-12 A1.
 //! A fence inside a `requires`-expression or a `try` block is rejected as a nested body, and the two
 //! checks agree about both - the lint used to step into a `try` block and accept the fence there while
-//! the structural check refused it (round-11 A1). Neither shape can ship: a `requires`-expression in that
-//! position is not valid C++ ("identifier requires is undefined"), and device code does not support
-//! exception handling, so refusing them costs nothing.
+//! the structural check refused it (round-11 A1). An attribute between the head and the brace changes
+//! neither verdict: `try [[likely]] { __threadfence(); }` and `catch (...) [[likely]] {
+//! __threadfence(); }` are refused by both checks as well, which they were not while both
+//! determinations read the attribute's closing bracket as the token before the brace (round-36 A1).
+//! Neither shape can ship: a `requires`-expression in that
+//! position is not valid C++ ("identifier requires is undefined"), and the attributed `try` and
+//! `catch` spellings do not parse at all - the grammar has no attribute there, and g++ 16 and clang 22
+//! reject both in c++17, c++20, c++23 and c++2c - so no compiler ever reaches the "device code does not
+//! support exception handling" refusal the plain spellings get. Refusing them costs nothing.
 //! Every rejection in this module ends with the canonical hint, and `every_rejection_carries_the_-
 //! `canonical_hint` asserts that branch by branch: the lint's missing-poll, macro, non-returning,
 //! spelling, placement, conditional and pre-poll branches, the structural check's shape rules (no poll,
@@ -2571,12 +2623,24 @@ fn a_lambda_body_opens_at(tokens: &[CodeToken], index: usize) -> bool {
             }
             // An angle bracket inside another kind of group is a comparison, not a delimiter of
             // the type: it is ignored so the group it sits in still closes on its own counter.
-            ">" if parens == 0 && squares == 0 && braces == 0 => angles += 1,
-            "<" if parens == 0 && squares == 0 && braces == 0 => {
-                if angles == 0 {
-                    break;
+            // The `>` of a `>=` is a comparison as well (round 32 A1): counting it left the
+            // group it sits in open, so the scan never reached the arrow.
+            ">" if parens == 0 && squares == 0 && braces == 0 => {
+                if tokens.get(probe + 1).map(|next| next.text.as_str()) != Some("=") {
+                    angles += 1;
                 }
-                angles -= 1;
+            }
+            // Round 32 A1: a top-level `<` is a delimiter only when a template NAME stands in
+            // front of it. `std::enable_if_t<1 < 2, int>` and `enable_if_t<N < 2, int>` write a
+            // COMPARISON there, and counting it closed the group the comparison sat in, so the
+            // scan stopped at the real opener and the trailing-return forms were refused with
+            // the unreachability sentence. A comparison neither opens nor closes anything, and
+            // it does not end the scan either - the scan ends at a `;`, a top-level brace, the
+            // beginning of the text or the step bound, so the walk still reaches the arrow.
+            "<" if parens == 0 && squares == 0 && braces == 0 => {
+                if a_template_name_stands_before(tokens, probe) && angles > 0 {
+                    angles -= 1;
+                }
             }
             ";" if parens == 0 && squares == 0 && angles == 0 && braces == 0 => break,
             _ => {}
@@ -2625,6 +2689,13 @@ fn the_matching_angle_opener(tokens: &[CodeToken], close: usize) -> Option<usize
     let mut braces = 0usize;
     let mut angles = 1usize;
     let mut cursor = close;
+    // Round 32 A1: `>` and `<` are comparisons as well, so the first `<` that would close the
+    // count is not always the opener - in `[&]<auto N = M < 2>()` it is the comparison after
+    // `M`, in front of which no `]` stands, so phase 2 cannot consume it. The walk therefore
+    // REMEMBERS the leftmost opener it has matched and keeps looking: a comparison inside the
+    // group must not stand in for its opener, which is the reading the standard gives when the
+    // name in front of the inner `<` is a value rather than a template.
+    let mut opener: Option<usize> = None;
     while cursor > 0 {
         cursor -= 1;
         let text = tokens[cursor].text.as_str();
@@ -2640,7 +2711,12 @@ fn the_matching_angle_opener(tokens: &[CodeToken], close: usize) -> Option<usize
         match text {
             ")" => parens += 1,
             "]" => squares += 1,
-            "}" => braces += 1,
+            "}" => {
+                if braces == 0 {
+                    return opener;
+                }
+                braces -= 1;
+            }
             "(" => {
                 if parens == 0 {
                     return None;
@@ -2654,22 +2730,42 @@ fn the_matching_angle_opener(tokens: &[CodeToken], close: usize) -> Option<usize
                 squares -= 1;
             }
             "{" => {
+                // The start of a block ends the statement, exactly as the `;` below does.
                 if braces == 0 {
-                    return None;
+                    return opener;
                 }
                 braces -= 1;
             }
-            ">" if parens == 0 && squares == 0 && braces == 0 => angles += 1,
+            // A `;` or a preprocessor line ends the statement, so no group can open before
+            // it: the candidate found inside the statement is the answer.
+            ";" | "#" if parens == 0 && squares == 0 && braces == 0 => return opener,
+            // The `>` of a `>=` is a comparison, not a template close (round 32 A1).
+            ">" if parens == 0 && squares == 0 && braces == 0 => {
+                if tokens.get(cursor + 1).map(|next| next.text.as_str()) != Some("=") {
+                    angles += 1;
+                }
+            }
+            // Round 32 A1: only a `<` with a template NAME in front of it, or the one that
+            // follows a generic lambda's capture list, opens a template group; `1 < 2` and
+            // `1 <= 2` write a comparison there.
             "<" if parens == 0 && squares == 0 && braces == 0 => {
-                angles -= 1;
-                if angles == 0 {
-                    return Some(cursor);
+                let named = a_template_name_stands_before(tokens, cursor)
+                    || tokens
+                        .get(cursor.wrapping_sub(1))
+                        .map(|before| before.text.as_str())
+                        == Some("]");
+                if named {
+                    angles -= 1;
+                    if angles == 0 {
+                        opener = Some(cursor);
+                        angles = 1;
+                    }
                 }
             }
             _ => {}
         }
     }
-    None
+    opener
 }
 /// The index of the opener that matches the closer at `close`, walking backwards. `None` when the
 /// tokens do not balance, which is also how a caller refuses to guess (round-30 A2).
@@ -2714,6 +2810,35 @@ fn an_attribute_closes_at(tokens: &[CodeToken], close: usize) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// The last token before the attribute groups standing at `last`, if there are any.
+///
+/// C++ lets a balanced attribute group stand between a control statement's head and the brace of its
+/// body: `if (deadline) [[likely]] { ... }`, and the same after `else`, `do`, `for`, `while` and
+/// `switch`. It does NOT for `try` or `catch`: the grammar has no attribute between `try` and its
+/// compound statement, nor between a catch clause's `)` and its compound statement, and both g++ 16 and
+/// clang 22 reject `try [[likely]] {` and `catch (...) [[likely]] {` at parse in c++17, c++20, c++23 and
+/// c++2c ("expected `{` before `[`"). Those two spellings are still inputs here because the readings
+/// below run on a token stream, and the fixtures pin this walk with them. The token at `last` is then
+/// the attribute's closing bracket, which is no control token, and a rule that tests it alone reads the
+/// body as a bare block. What that hid: the refusal the plain spellings rest on is keyed on the token
+/// that ends the head - the `)` of an if/for/while/switch/catch condition - or on `try`, `do` and
+/// `requires` naming a body directly, so for `catch (...) [[likely]] {` it is the `)` of the parameter
+/// list that the attribute bracket merely hid, and the attributed `try` and `catch` bodies were ACCEPTED
+/// while the plain ones were refused (round-36 A1). Neither `try` nor `catch` is in [is_control], so no
+/// later blocker rescues them.
+/// [a_bare_block_opens_at] has stepped over the group since round-34 A1; this is the same walk, shared
+/// so the three rules that need it cannot drift apart again.
+fn the_token_before_the_attributes(tokens: &[CodeToken], last: Option<usize>) -> Option<usize> {
+    let mut before = last;
+    while let Some(close) = before {
+        let Some(opener) = an_attribute_closes_at(tokens, close) else {
+            break;
+        };
+        before = opener.checked_sub(1);
+    }
+    before
 }
 
 /// Whether a `;` at the same brace nesting as `from` stands between `from` and `to`, which means the
@@ -3061,6 +3186,22 @@ fn matching_open_bracket(tokens: &[CodeToken], close: usize) -> Option<usize> {
     }
 }
 
+/// Whether a template NAME stands in front of the `<` at `open`: an identifier, a `>`, a `::`,
+/// the `template` keyword or a type keyword (every one of those is an identifier to
+/// `is_identifier`). A `<` with none of them in front of it is a COMPARISON, and a comparison
+/// neither opens a template group nor closes one. Round-18 A4 needed the test to tell
+/// `0u < 1u > poll(...)` from `name<0u>`; round 32 A1 needs the SAME test in the two walks that
+/// look for a lambda body, where counting `std::enable_if_t<1 < 2, int>` as an opener closed the
+/// group the comparison sat in and refused a textbook nvcc compiles to the baseline. One
+/// definition, three call sites: round 18 introduced it inside `matching_open_angle`, and round 32
+/// put the two lambda walks that had their own angle handling onto the same definition.
+fn a_template_name_stands_before(tokens: &[CodeToken], open: usize) -> bool {
+    open.checked_sub(1).is_some_and(|before| {
+        let text = tokens[before].text.as_str();
+        is_identifier(text) || text == ">" || text == ":"
+    })
+}
+
 /// The `<` that matches the `>` at `close`, or None when that `>` does not close a template
 /// argument list. The tokenizer emits one token per punctuation character, so `>>` is two nested
 /// `>` and a nested template id is counted correctly.
@@ -3078,14 +3219,10 @@ fn matching_open_angle(tokens: &[CodeToken], close: usize) -> Option<usize> {
                     // numeric literal, so that `<` is a comparison and the `>` in front of the poll is
                     // not a template close. Reading it as one refused a call nvcc compiles to the same
                     // size as the shipped comparison.
-                    return match index
-                        .checked_sub(1)
-                        .map(|before| tokens[before].text.as_str())
-                    {
-                        Some(text) if is_identifier(text) || text == ">" || text == ":" => {
-                            Some(index)
-                        }
-                        _ => None,
+                    return if a_template_name_stands_before(tokens, index) {
+                        Some(index)
+                    } else {
+                        None
                     };
                 }
             }
@@ -3454,7 +3591,23 @@ fn opens_a_lambda_or_a_type_body(tokens: &[CodeToken], history: &[usize]) -> boo
         cursor -= 1;
         match tokens[history[cursor]].text.as_str() {
             ";" | "{" | "}" => return false,
-            "]" | "class" | "struct" | "namespace" | "enum" | "union" => return true,
+            "]" => {
+                // An ATTRIBUTE in front of the brace ends in the same ] a capture list does, and it
+                // introduces no body: `[[likely]] { __threadfence(); }` runs its fence exactly where
+                // the same block without the attribute does, so refusing it because the ] looks like
+                // a capture list is the compile-to-the-baseline direction this project calls the
+                // worse error (round-35 A3). Step over the whole attribute group and keep looking;
+                // anything else that ends in ] is still a capture list or a subscript, which is the
+                // lambda body this test exists to find.
+                if let Some(opener) = an_attribute_closes_at(tokens, history[cursor]) {
+                    while cursor > 0 && history[cursor - 1] >= opener {
+                        cursor -= 1;
+                    }
+                    continue;
+                }
+                return true;
+            }
+            "class" | "struct" | "namespace" | "enum" | "union" => return true,
             _ => {}
         }
     }
@@ -3479,6 +3632,18 @@ fn opens_a_lambda_or_a_type_body(tokens: &[CodeToken], history: &[usize]) -> boo
 /// reading - the helper's own body in all three readings - so a lambda or a type defined outside the
 /// helper cannot make this true, which is what keeps a bare block at statement level refused (it
 /// compiles to 38272 / 2 / 041d46b0, and the reason it is refused with is then true).
+///
+/// Round 32 A3: the excuse is that the exit leaves the LAMBDA and the helper still reaches its
+/// acquire. For a lambda the source does not call that holds, because the body never runs; for a
+/// lambda the source CALLS right there it only holds if the body can RETURN.
+/// `(void)([&]{ __trap(); return 0u; })();` before the poll is the counter-example: the trap ends
+/// the helper, the acquire after it never runs, and nvcc compiles the text to
+/// 37872 / 4 / 54cda5bc - the cubin this file already refuses as `__trap();` before the poll, so
+/// the module's one-cubin-one-verdict rule applies: a CALLED lambda body that holds a
+/// non-returning call of its own is not a body the helper does not own. A `return` does not make
+/// the body non-returning - it returns to the caller - so `(void)([&]{ return; })();` stays
+/// accepted, and a lambda nobody calls (`auto f = [&]{ __trap(); }; (void)f;`) stays accepted
+/// too, which is what its baseline cubin measures.
 fn inside_a_body_the_helper_does_not_own(tokens: &[CodeToken], index: usize, floor: usize) -> bool {
     let mut cursor = index;
     while cursor > floor {
@@ -3487,7 +3652,11 @@ fn inside_a_body_the_helper_does_not_own(tokens: &[CodeToken], index: usize, flo
         };
         // Only the precise detectors, not the walk's looser one: an attribute's brackets would
         // make the looser test true for the whole helper.
-        if a_lambda_body_opens_at(tokens, open) || a_type_body_opens_at(tokens, open) {
+        if a_lambda_body_opens_at(tokens, open) {
+            return !(a_lambda_body_is_called_at(tokens, open)
+                && a_called_lambda_body_cannot_return(tokens, open));
+        }
+        if a_type_body_opens_at(tokens, open) {
             return true;
         }
         // Neither: keep walking outward, because this brace may be a nested block INSIDE a lambda
@@ -3495,6 +3664,117 @@ fn inside_a_body_the_helper_does_not_own(tokens: &[CodeToken], index: usize, flo
         cursor = open;
     }
     false
+}
+
+/// Whether the lambda whose body starts at `open` is CALLED where it stands: `[&]{ ... }()` or
+/// `([&]{ ... })()`. The tokenizer emits one token per punctuation character, so the wrap-around
+/// form is `}` `)` `(`. Round 32 A3.
+fn a_lambda_body_is_called_at(tokens: &[CodeToken], open: usize) -> bool {
+    let Some(close) = matching_close_bracket(tokens, open) else {
+        return false;
+    };
+    match tokens.get(close + 1).map(|token| token.text.as_str()) {
+        Some("(") => true,
+        Some(")") => tokens.get(close + 2).map(|token| token.text.as_str()) == Some("("),
+        _ => false,
+    }
+}
+
+/// Whether the body of a CALLED lambda at `open` cannot return: it calls one of the
+/// `NON_RETURNING_CALLS` names on a path that runs when the body runs, so control never comes back
+/// to the statement the call stands in and everything after that statement is unreachable (round
+/// 32 A3). The same name test the two walks use decides it, so a declaration, a member, another
+/// scope's function or a name this source `#define`s is not a non-returning call here either. A
+/// trap reached through a macro, a function pointer or an inline-asm block is the same stated limit
+/// the name list carries.
+///
+/// The scan descends through BARE BLOCKS and stops at every other brace: a lambda's or a type's
+/// body, whose calls belong to another function, and a control statement's body, whose statements
+/// run only if the statement does. `(void)([&]{ { __trap(); } return 0u; })();` before the poll is
+/// the round-33 A1 counter-example to the narrower rule round 32 shipped: the brace is a bare
+/// block, the trap runs exactly as it does unbraced, and the text is the same program as the
+/// unbraced spelling this file already refuses as 37872 / 4 / 54cda5bc. A trap behind a control
+/// statement - `[&]{ if (c) { __trap(); } return 0u; }()` - is still not counted, because it is
+/// conditional on `c` and the acquire after it still runs.
+fn a_called_lambda_body_cannot_return(tokens: &[CodeToken], open: usize) -> bool {
+    let Some(close) = matching_close_bracket(tokens, open) else {
+        return false;
+    };
+    let mut macros = MacroScope::from_tokens(tokens);
+    // One frame per open brace, innermost last: true where the brace opens a scope whose statements
+    // this scan must not read as the lambda's own. `opaque` counts the true ones still open.
+    let mut frames: Vec<bool> = Vec::new();
+    let mut opaque = 0usize;
+    let mut inner = open + 1;
+    while inner < close {
+        macros.advance_to(inner);
+        let text = tokens[inner].text.as_str();
+        match text {
+            "{" => {
+                let hides = !a_bare_block_opens_at(tokens, inner);
+                if hides {
+                    opaque += 1;
+                }
+                frames.push(hides);
+            }
+            "}" => {
+                if frames.pop() == Some(true) {
+                    opaque -= 1;
+                }
+            }
+            _ => {
+                if opaque == 0
+                    && NON_RETURNING_CALLS.contains(&text)
+                    && is_the_library_non_returning_call(tokens, inner, &macros)
+                {
+                    return true;
+                }
+            }
+        }
+        inner += 1;
+    }
+    false
+}
+
+/// Whether the `{` at `index` opens a BARE BLOCK: a scope that runs where it stands, so the
+/// statements in it are on the path the code around them is on (round 33 A1).
+///
+/// This is the difference the round-32 fix turned on and got half right. `{ __trap(); }` inside an
+/// immediately-called lambda runs in the same order as `__trap();` there - the brace adds no
+/// condition and no function - so a scan that stops at the brace certifies a text that is the same
+/// program as one it already refuses. Three kinds of brace are therefore NOT bare blocks:
+///
+///   * a lambda's or a type's body, which the precise detectors already identify, because a call in
+///     there belongs to another function that may never run;
+///   * a control statement's body, whose brace follows `)`, `else`, `do`, `try` or `requires`,
+///     because a trap in there is conditional and refusing a conditional trap would refuse a text
+///     nvcc compiles to the baseline - the direction this project treats as the worse error;
+///   * a lambda's or a type's body behind a capture list or behind attributes, which is what the `]
+///     case in those detectors covers - note that the attributes are stepped over first, so an
+///     attribute standing on a bare block does not hide that block.
+///
+/// Everything else is a bare block. The rule is deliberately the narrow one: it descends only where
+/// nothing can keep the statements from running, so it closes the false accept without opening a
+/// false refusal. The limit that buys is stated rather than hidden: the rule reads braces, not
+/// values, so `(void)([&]{ if (1) { __trap(); } return 0u; })();` before the poll stays accepted
+/// even though the condition is constantly true, because deciding it needs the condition's value.
+/// Round-32's narrower rule was the same kind of limit - it just put the boundary at the wrong
+/// brace, refusing nothing and accepting a text whose cubin the file already refuses.
+fn a_bare_block_opens_at(tokens: &[CodeToken], index: usize) -> bool {
+    if a_lambda_body_opens_at(tokens, index) || a_type_body_opens_at(tokens, index) {
+        return false;
+    }
+    // An ATTRIBUTE may stand between a control keyword and the brace of its body, which C++ allows on
+    // a selection or iteration statement, as in: if (deadline) [[likely]] { ... }. The brace then
+    // follows a ], which is not a control token, so an attribute-blind test read the body as a bare
+    // block and refused a conditional trap that nvcc compiles to the baseline - the worse direction,
+    // and the one this rule exists to avoid (round-34 A1). Step over every attribute standing there
+    // and test the token before the first of them.
+    !matches!(
+        the_token_before_the_attributes(tokens, index.checked_sub(1))
+            .map(|before| tokens[before].text.as_str()),
+        Some(")" | "else" | "do" | "try" | "requires")
+    )
 }
 
 /// The index of the `{` that opens the innermost block holding `index`, or `None` when the walk
@@ -3518,25 +3798,37 @@ fn the_enclosing_brace(tokens: &[CodeToken], index: usize, floor: usize) -> Opti
     None
 }
 
-/// Whether the `{` at `index` opens a TYPE body, `struct S { ... }`, `class X : public Y { ... }`
-/// or `union U { ... }`. The walk back stops at the first token that ends a declaration or starts
-/// another construct, so an ordinary function body, a lambda body, a namespace and a control
+/// Whether the `{` at `index` opens a TYPE body, `struct S { ... }`, `class X : public A, public B
+/// { ... }` or `union U { ... }`. The walk back stops at the first token that ends a declaration or
+/// starts another construct, so an ordinary function body, a lambda body, a namespace and a control
 /// statement all answer false (round 31 A2).
+///
+/// Round 32 A2: a balanced bracket group is SKIPPED instead of ending the walk, and a `,` no
+/// longer ends it. A base clause (`struct S : A, B`, `class S : public A, public B`) and an
+/// attribute specifier (`struct [[maybe_unused]] S`, `struct __attribute__((packed)) S`) both
+/// stand between the keyword and the brace in declarations nvcc compiles to the baseline, and
+/// stopping at their `,`, `]` or `)` refused those type bodies with the unreachability sentence.
+/// The skip is bounded: `matching_open_bracket` answers `None` for an unbalanced group, so a
+/// stray closer still ends the walk.
 fn a_type_body_opens_at(tokens: &[CodeToken], index: usize) -> bool {
     if tokens.get(index).map(|token| token.text.as_str()) != Some("{") {
         return false;
     }
     let mut cursor = index;
     let mut looked = 0usize;
-    while cursor > 0 && looked < 24 {
+    while cursor > 0 && looked < 48 {
         cursor -= 1;
         looked += 1;
         match tokens[cursor].text.as_str() {
             "struct" | "class" | "union" => return true,
-            // A declaration, a body, a parameter list, a lambda capture, a namespace or a control
-            // statement: everything before this point belongs to another construct.
-            ";" | "{" | "}" | ")" | "]" | "=" | "," | "namespace" | "enum" | "if" | "else"
-            | "for" | "while" | "switch" | "do" | "try" | "catch" | "return" => return false,
+            ")" | "]" => match matching_open_bracket(tokens, cursor) {
+                Some(opener) => cursor = opener,
+                None => return false,
+            },
+            // A declaration, a body, an assignment, a namespace or a control statement:
+            // everything before this point belongs to another construct.
+            ";" | "{" | "}" | "=" | "namespace" | "enum" | "if" | "else" | "for" | "while"
+            | "switch" | "do" | "try" | "catch" | "return" => return false,
             _ => {}
         }
     }
@@ -4712,12 +5004,18 @@ pub fn acquire_fence_after_poll(source: &str, poll: &str) -> Result<(), String> 
             // as a nested body while this walk stepped into it and accepted a fence there, which was
             // the one place the two checks disagreed (round-11 A1); `requires` was accepted by both
             // even though nothing inside a requires-expression is executed (round-11 A1).
-            let branch = visited_code.last().is_some_and(|&previous| {
-                matches!(
-                    tokens[previous].text.as_str(),
-                    ")" | "try" | "do" | "requires"
-                )
-            });
+            // The token read here can be an attribute's closing bracket, as in `try [[likely]] { ... }`
+            // or `catch (...) [[likely]] { ... }`, so the read steps over any attribute group first
+            // (round-36 A1). Reading the `]]` alone let BOTH checks accept those two spellings, which
+            // the plain ones are refused for, and no later blocker rescues them: neither `try` nor
+            // `catch` is in [is_control].
+            let branch = the_token_before_the_attributes(&tokens, visited_code.last().copied())
+                .is_some_and(|previous| {
+                    matches!(
+                        tokens[previous].text.as_str(),
+                        ")" | "try" | "do" | "requires"
+                    )
+                });
             nested_bodies.push(lambda_or_type || branch);
             visited_code.push(index);
             index += 1;
@@ -5359,12 +5657,17 @@ pub fn acquire_helper_fences_unconditionally(header: &str) -> Result<(), String>
             // e9cc6998 baseline.
             // `requires` is in the list because nothing inside a requires-expression is executed,
             // so a fence there is not the acquire even though it sits in braces (round-11 A1).
-            let bare = code_history.last().is_none_or(|&previous| {
-                !matches!(
-                    tokens[previous].text.as_str(),
-                    ")" | "else" | "do" | "try" | "requires"
-                )
-            }) && !opens_a_lambda_or_a_type_body(&tokens, &code_history);
+            // An attribute standing between a head and its brace does not change which body this
+            // is, and its closing bracket is not one of the tokens below: the read steps over the group
+            // first, so `try [[likely]] { ... }` is still not a bare block (round-36 A1).
+            let bare = the_token_before_the_attributes(&tokens, code_history.last().copied())
+                .is_none_or(|previous| {
+                    !matches!(
+                        tokens[previous].text.as_str(),
+                        ")" | "else" | "do" | "try" | "requires"
+                    )
+                })
+                && !opens_a_lambda_or_a_type_body(&tokens, &code_history);
             bare_blocks.push(bare);
             depth += 1;
             code_history.push(cursor);
@@ -9625,12 +9928,47 @@ __threadfence();
         let fence_in_a_try_body = format!(
             "{poll_line}\n    try {{\n        __threadfence();\n    }} catch (...) {{\n    }}\n    return observed;\n"
         );
+        // The same two bodies with an attribute between the head and the brace. NEITHER spelling is
+        // valid C++ - the grammar has no attribute between `try` and its compound statement, nor
+        // between a catch clause's `)` and its compound statement, and both g++ 16 and clang 22 reject
+        // `try [[likely]] {` and `catch (...) [[likely]] {` at parse in c++17, c++20, c++23 and c++2c
+        // ("expected `{` before `[`") - so no compiler reaches the "device code does not support
+        // exception handling" refusal nvcc gives the PLAIN spellings. The guard reads tokens rather
+        // than compiling, so the question here is still the one it answers for the plain spelling:
+        // these must get the same verdict (round-36 A1).
+        let attributed_try_body = format!(
+            "{poll_line}\n    try [[likely]] {{\n        __threadfence();\n    }} catch (...) {{\n    }}\n    return observed;\n"
+        );
+        let attributed_catch_body = format!(
+            "{poll_line}\n    try {{\n    }} catch (...) [[likely]] {{\n        __threadfence();\n    }}\n    return observed;\n"
+        );
+        // An UNCALLED lambda with an attribute between the capture list and the brace. The walk-back
+        // must step over the attribute group and keep looking for the capture list; the variant that
+        // stops at the attribute, which is the mutation of the step-over's `continue`, reads the
+        // closure body as the helper's own bare block and certifies a fence that never runs. Both
+        // spellings are legitimate C++: g++ accepts `[] [[maybe_unused]] { ... }` at c++17 and c++20,
+        // and clang accepts it with a C++23-extension warning.
+        let uncalled_attributed_lambda = format!(
+            "{poll_line}\n    auto l = [] [[maybe_unused]] {{ __threadfence(); }};\n    (void)l;\n    return observed;\n"
+        );
         for (label, body) in [
             (
                 "a fence inside a preprocessor conditional the guard cannot resolve",
                 conditional_fence,
             ),
             ("a fence inside a try body", fence_in_a_try_body),
+            (
+                "a fence inside a try body carrying an attribute",
+                attributed_try_body,
+            ),
+            (
+                "a fence inside a catch body carrying an attribute",
+                attributed_catch_body,
+            ),
+            (
+                "a fence inside an uncalled lambda with an attribute before its brace",
+                uncalled_attributed_lambda,
+            ),
         ] {
             let source = COMMON_HEADER.replace(SHIPPED_HELPER_BODY, &body);
             let structural = acquire_helper_fences_unconditionally(&source);
@@ -9661,7 +9999,7 @@ __threadfence();
     /// as a shape rather than stored and measured, so no cubin is claimed for it beyond the two the
     /// stored texts already carry - and every row IS a translation unit, which is evidence rather than a
     /// reading: with SPARKFLASH_MATRIX_DUMP set the loop writes the very texts it runs, and all
-    /// sixty-eight compile in the CUDA 12.9.1 container (the rows whose macro called abort() call the
+    /// eighty-one compile in the CUDA 12.9.1 container (the rows whose macro called abort() call the
     /// device-callable `__trap()`, because nvcc compiles abort() and `__builtin_trap()` as calls to a
     /// `__host__` function from a device body). What that compile proves is PARSEABILITY and nothing
     /// more: a row is a translation unit with no entry point, so its cubin is empty, and the cubins this
@@ -9721,15 +10059,15 @@ __threadfence();
         );
         assert_eq!(
             matrix.matches("with_define(").count(),
-            68,
-            "the matrix has the sixty-eight rows the documentation states"
+            81,
+            "the matrix has the eighty-one rows the documentation states"
         );
         assert!(
             source.contains(concat!("Forty rows in ", "all")),
             "the documented positions count"
         );
         assert!(
-            source.contains(concat!("the 68-row ", "matrix")),
+            source.contains(concat!("the 81-row ", "matrix")),
             "the documented matrix count"
         );
     }
@@ -10296,6 +10634,116 @@ __threadfence();
                 ),
                 false,
             ),
+            // Round-32 A1/A2/A3/A4: the shapes the closing reviews of the merged !8 reported. A1/A2/A4
+            // are ACCEPTED by both checks and compile to the BASELINE 38640 / 4 / e9cc6998 (measured
+            // in the stored table); A3 is the FALSE ACCEPT they found - the lambda is CALLED where it
+            // stands, so its trap ends the helper, and the text compiles to the cubin this file
+            // already refuses as `__trap();` before the poll (37872 / 4 / 54cda5bc). Under the
+            // module's one-cubin-one-verdict rule the row claims a REFUSAL.
+            (
+                "a bare less-than comparison in a trailing return type",
+                with_define(
+                    "",
+                    "    auto f = [&]() -> std::enable_if_t<1 < 2, int> { return 0; };\n    (void)f;\n\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                ),
+                false,
+            ),
+            (
+                "a bare less-equal comparison in a trailing return type",
+                with_define(
+                    "",
+                    "    auto f = [&]() -> std::enable_if_t<1 <= 2, int> { return 0; };\n    (void)f;\n\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                ),
+                false,
+            ),
+            (
+                "a bare less-than comparison in a template parameter list",
+                with_define(
+                    "",
+                    "    auto f = [&]<int N = 1 < 2>() { return ; };\n    (void)f;\n\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                ),
+                false,
+            ),
+            (
+                "a bare less-equal comparison in a template parameter list",
+                with_define(
+                    "",
+                    "    auto f = [&]<auto N = 1 <= 2>() { return ; };\n    (void)f;\n\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                ),
+                false,
+            ),
+            (
+                "a bare greater-equal comparison in a template parameter list",
+                with_define(
+                    "",
+                    "    auto f = [&]<auto N = 1 >= 2>() { return ; };\n    (void)f;\n\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                ),
+                false,
+            ),
+            (
+                "a return in a local type with two private bases",
+                with_define(
+                    "",
+                    "    struct A {}; struct B {}; struct S : A, B { void run() { return; } };\n    (void)sizeof(S);\n\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                ),
+                false,
+            ),
+            (
+                "a return in a local type with two public bases",
+                with_define(
+                    "",
+                    "    struct A {}; struct B {}; class S : public A, public B { public: void run() { return; } };\n    (void)sizeof(S);\n\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                ),
+                false,
+            ),
+            (
+                "a return in a local type with an attribute",
+                with_define(
+                    "",
+                    "    struct [[maybe_unused]] S { void run() { return; } };\n    (void)sizeof(S);\n\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                ),
+                false,
+            ),
+            (
+                "a return in a local type with a GNU attribute",
+                with_define(
+                    "",
+                    "    struct __attribute__((packed)) S { void run() { return; } };\n    (void)sizeof(S);\n\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                ),
+                false,
+            ),
+            (
+                "a return in a local type with an alignas specifier",
+                with_define(
+                    "",
+                    "    struct alignas(8) S { void run() { return; } };\n    (void)sizeof(S);\n\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                ),
+                false,
+            ),
+            (
+                "a noexcept lambda with a return",
+                with_define(
+                    "",
+                    "    auto f = [&]() noexcept { return ; };\n    (void)f;\n\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                ),
+                false,
+            ),
+            (
+                "a mutable lambda with a return",
+                with_define(
+                    "",
+                    "    auto f = [&]() mutable { return ; };\n    (void)f;\n\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                ),
+                false,
+            ),
+            (
+                "a trap in a lambda the source calls before the poll",
+                with_define(
+                    "",
+                    "    (void)([&]{ __trap(); return 0u; })();\n\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                ),
+                true,
+            ),
             // Round-31 A1, the other direction: a `>` still has to be read as a template close where
             // it is one, and NOT as one where it is a comparison. The first row exercises the `>`
             // piece of the walk-back with no parameter list after it; the second is the control, where
@@ -10416,6 +10864,10 @@ __threadfence();
                     "stands before the poll"
                 } else if structural.contains("stands between the poll and the acquire") {
                     "stands between the poll and the acquire"
+                } else if structural.contains("does not return, so this scan") {
+                    // Round-32 A3: the trap rule's sentence, which both checks write word for word
+                    // for the called-lambda body and for the bare statement alike.
+                    "does not return, so this scan"
                 } else {
                     "2 times"
                 };
@@ -11502,6 +11954,72 @@ __threadfence();
                 "    auto f = [&] { return flag; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
                 "38640 / 4 / e9cc6998",
             ),
+            // Round-32 A1/A2/A4, every one of them measured at the BASELINE 38640 / 4 / e9cc6998. A1:
+            // the comparison written BARE in a template argument or parameter list - a `<` is a
+            // delimiter only when a template NAME stands in front of it, and the `>` of a `>=` is not a
+            // close. A2: the class-head spellings whose comma, `]` or `)` stopped the type-body walk
+            // (two base clauses, `[[maybe_unused]]`, a GNU `__attribute__` and `alignas(8)`). A4: the two
+            // specifier spellings both checks already accepted and nothing pinned until now.
+            (
+                "accepted_bare_less_than_in_a_trailing_return",
+                "    auto f = [&]() -> std::enable_if_t<1 < 2, int> { return 0; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                "38640 / 4 / e9cc6998",
+            ),
+            (
+                "accepted_bare_less_equal_in_a_trailing_return",
+                "    auto f = [&]() -> std::enable_if_t<1 <= 2, int> { return 0; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                "38640 / 4 / e9cc6998",
+            ),
+            (
+                "accepted_bare_less_than_in_a_template_parameter_list",
+                "    auto f = [&]<int N = 1 < 2>() { return ; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                "38640 / 4 / e9cc6998",
+            ),
+            (
+                "accepted_bare_less_equal_in_a_template_parameter_list",
+                "    auto f = [&]<auto N = 1 <= 2>() { return ; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                "38640 / 4 / e9cc6998",
+            ),
+            (
+                "accepted_bare_greater_equal_in_a_template_parameter_list",
+                "    auto f = [&]<auto N = 1 >= 2>() { return ; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                "38640 / 4 / e9cc6998",
+            ),
+            (
+                "accepted_return_in_a_local_type_with_two_bases",
+                "    struct A {}; struct B {}; struct S : A, B { void run() { return; } };\n    (void)sizeof(S);\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                "38640 / 4 / e9cc6998",
+            ),
+            (
+                "accepted_return_in_a_local_type_with_public_bases",
+                "    struct A {}; struct B {}; class S : public A, public B { public: void run() { return; } };\n    (void)sizeof(S);\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                "38640 / 4 / e9cc6998",
+            ),
+            (
+                "accepted_return_in_a_local_type_with_an_attribute",
+                "    struct [[maybe_unused]] S { void run() { return; } };\n    (void)sizeof(S);\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                "38640 / 4 / e9cc6998",
+            ),
+            (
+                "accepted_return_in_a_local_type_with_a_gnu_attribute",
+                "    struct __attribute__((packed)) S { void run() { return; } };\n    (void)sizeof(S);\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                "38640 / 4 / e9cc6998",
+            ),
+            (
+                "accepted_return_in_a_local_type_with_alignas",
+                "    struct alignas(8) S { void run() { return; } };\n    (void)sizeof(S);\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                "38640 / 4 / e9cc6998",
+            ),
+            (
+                "accepted_noexcept_lambda_with_a_return",
+                "    auto f = [&]() noexcept { return ; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                "38640 / 4 / e9cc6998",
+            ),
+            (
+                "accepted_mutable_lambda_with_a_return",
+                "    auto f = [&]() mutable { return ; };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                "38640 / 4 / e9cc6998",
+            ),
         ] {
             texts.push((
                 name,
@@ -11982,6 +12500,21 @@ __threadfence();
                 "a macro whose body contains a control keyword",
                 "38640 / 4 / e9cc6998",
             ),
+            // Round-32 A3: the FALSE ACCEPT the second closing review found. The lambda is CALLED
+            // where it stands, so the trap inside it ends the helper and nvcc compiles this text to
+            // 37872 / 4 / 54cda5bc - the cubin of `__trap();` before the poll, which both checks
+            // already refuse, and the refusal here is about the compiled code, so the CALLED
+            // lambda body is not a body the helper does not own. The never-called twin
+            // (`accepted_nonreturning_call_in_a_lambda_before_the_poll`) stays accepted: that body
+            // never runs, which is what its baseline cubin measures.
+            (
+                "refused_trap_in_a_called_lambda_before_the_poll",
+                with_the_shipped_body(
+                    "    (void)([&]{ __trap(); return 0u; })();\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+                ),
+                "does not return",
+                "37872 / 4 / 54cda5bc",
+            ),
         ] {
             texts.push((name, source, Verdict::Refused, cubin, needle));
         }
@@ -12033,7 +12566,7 @@ __threadfence();
                 "the lint reads {name} as a call of the poll (measured {cubin})"
             );
         }
-        assert_eq!(measured, 77, "every accepted shape is exercised");
+        assert_eq!(measured, 89, "every accepted shape is exercised");
     }
 
     /// Round-17 A2/A4, both accepted and both measured at the baseline (38640 / 4 / e9cc6998f6a5):
@@ -12158,7 +12691,166 @@ __threadfence();
                 );
             }
         }
-        assert_eq!(measured, 26, "every refused text is exercised");
+        assert_eq!(measured, 27, "every refused text is exercised");
+    }
+
+    /// Round-33 A1: the round-32 rule counted a non-returning call only at the called lambda's own
+    /// level, so a trap one brace deeper - inside a BARE BLOCK, which runs where it stands - was still
+    /// accepted. The text below is the same program as the refused unbraced spelling, so a guard that
+    /// accepts it is certifying two verdicts for one cubin. None of these texts is measured in the
+    /// container and no cubin is claimed for any of them: what is pinned is the verdict, and the
+    /// measured text that carries the cubin is `refused_trap_in_a_called_lambda_before_the_poll`.
+    #[test]
+    fn a_trap_in_a_bare_block_inside_a_called_lambda_is_refused() {
+        let refused = [
+            (
+                "one block deep",
+                "    (void)([&]{ { __trap(); } return 0u; })();\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+            ),
+            (
+                "two blocks deep",
+                "    (void)([&]{ { { __trap(); } } return 0u; })();\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+            ),
+            (
+                "with an attribute on the bare block itself",
+                "    (void)([&]{ [[likely]] { __trap(); } return 0u; })();
+    const uint32_t observed = spark_wait_for_flag(flag, deadline);
+    __threadfence();
+    return observed;
+",
+            ),
+            (
+                "after another statement",
+                "    (void)([&]{ flag; { __trap(); } return 0u; })();\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+            ),
+        ];
+        for (shape, body) in refused {
+            let source = with_the_shipped_body(body);
+            for (check, result) in [
+                ("structural", acquire_helper_fences_unconditionally(&source)),
+                ("lint", acquire_fence_after_poll(&source, HELPER_POLL)),
+            ] {
+                let error = result.expect_err(&format!(
+                    "the {check} check must refuse a trap in a bare block inside a called lambda ({shape})"
+                ));
+                assert!(
+                    error.contains("does not return") && error.ends_with(CANONICAL_HINT),
+                    "the {check} check refuses the {shape} shape, says why and ends with the hint: {error}"
+                );
+            }
+        }
+        // The direction that must not change, which is the worse error of the two: a trap the
+        // statement makes conditional, and a trap in a lambda nobody calls, both stay accepted.
+        let accepted = [
+            (
+                "behind a condition",
+                "    (void)([&]{ if (deadline) { __trap(); } return 0u; })();\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+            ),
+            (
+                "in a lambda nobody calls",
+                "    auto f = [&]{ { __trap(); } };\n    (void)f;\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+            ),
+            // A control statement's body is not descended into even when the statement's own
+            // condition is a constant, because the rule reads braces and not values. A `switch` whose
+            // only label is a `default` that falls into the trap is the sharpest case: it always runs
+            // the trap, and this scan accepts it. That is the stated limit of a text-level rule, and
+            // it is the direction this project chooses - folding `switch` or a constant `if` needs the
+            // condition's value, and a wrong fold would refuse a text nvcc compiles to the baseline.
+            // A control statement's body stays a control statement's body when an ATTRIBUTE stands
+            // between the condition and the brace, which C++ allows on a selection or iteration
+            // statement (round-34 A1: an attribute is not a bare block, and reading it as one refused
+            // a text nvcc compiles to the baseline).
+            (
+                "behind a condition carrying an attribute",
+                "    (void)([&]{ if (deadline) [[likely]] { __trap(); } return 0u; })();
+    const uint32_t observed = spark_wait_for_flag(flag, deadline);
+    __threadfence();
+    return observed;
+",
+            ),
+            (
+                "behind an else carrying an attribute",
+                "    (void)([&]{ if (deadline) { flag; } else [[likely]] { __trap(); } return 0u; })();
+    const uint32_t observed = spark_wait_for_flag(flag, deadline);
+    __threadfence();
+    return observed;
+",
+            ),
+            (
+                "in a for body carrying an attribute",
+                "    (void)([&]{ for (;;) [[unlikely]] { __trap(); } return 0u; })();
+    const uint32_t observed = spark_wait_for_flag(flag, deadline);
+    __threadfence();
+    return observed;
+",
+            ),
+            (
+                "behind a switch carrying an attribute",
+                "    (void)([&]{ switch (flag) [[likely]] { default: __trap(); } return 0u; })();
+    const uint32_t observed = spark_wait_for_flag(flag, deadline);
+    __threadfence();
+    return observed;
+",
+            ),
+            // Two attributes in front of the same body: the loop steps over EVERY attribute, and a
+            // version that steps over only one false-refuses this text, which g++ and clang both
+            // accept at -std=c++17 and c++20 (round-35 A2).
+            (
+                "behind a condition carrying two attributes",
+                "    (void)([&]{ if (deadline) [[likely]] [[clang::likely]] { __trap(); } return 0u; })();
+    const uint32_t observed = spark_wait_for_flag(flag, deadline);
+    __threadfence();
+    return observed;
+",
+            ),
+            (
+                "behind a constant switch",
+                "    (void)([&]{ { switch (flag) { default: __trap(); } } return 0u; })();\n    const uint32_t observed = spark_wait_for_flag(flag, deadline);\n    __threadfence();\n    return observed;\n",
+            ),
+        ];
+        for (shape, body) in accepted {
+            let source = with_the_shipped_body(body);
+            assert!(
+                acquire_helper_fences_unconditionally(&source).is_ok(),
+                "the structural check still accepts a trap {shape}"
+            );
+            assert!(
+                acquire_fence_after_poll(&source, HELPER_POLL).is_ok(),
+                "the lint still accepts a trap {shape}"
+            );
+        }
+    }
+
+    /// Round-35 A3: an attribute in front of the acquire block does not stop the block being bare.
+    /// An attribute is only a hint, so the attributed block runs its fence exactly where the plain
+    /// block does; the structural scan once took the attribute's closing bracket for a lambda capture
+    /// list and refused it, which is the compile-to-the-baseline direction this project treats as the
+    /// worse error. Both checks are pinned here, for one, two and no attributes.
+    #[test]
+    fn an_attribute_before_the_fence_block_does_not_make_it_conditional() {
+        for (shape, block) in [
+            ("without an attribute", "{ __threadfence(); }"),
+            ("with an attribute", "[[likely]] { __threadfence(); }"),
+            (
+                "with two attributes",
+                "[[likely]] [[clang::likely]] { __threadfence(); }",
+            ),
+        ] {
+            let source = with_the_shipped_body(&format!(
+                "    const uint32_t observed = spark_wait_for_flag(flag, deadline);
+    {block}
+    return observed;
+"
+            ));
+            assert!(
+                acquire_helper_fences_unconditionally(&source).is_ok(),
+                "the structural check accepts the fence block {shape}"
+            );
+            assert!(
+                acquire_fence_after_poll(&source, HELPER_POLL).is_ok(),
+                "the lint accepts the fence block {shape}"
+            );
+        }
     }
 
     /// This file, as the text the documentation check below reads: the module's own documentation is

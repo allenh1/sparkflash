@@ -24,6 +24,13 @@ fn nvcc() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// The six shipped cubins, recompiled and compared byte for byte, on a host that has nvcc.
+///
+/// On a host WITHOUT nvcc the check returns early, and the line it prints is on the test's captured
+/// stdout, so a green `cargo test` run does not show it - libtest only shows it under `--nocapture`.
+/// The channel that states the same thing on every run is the build script's `cargo:warning`, which
+/// names the arch and the sources it could not compile, and CI's `cuda-abi` job has nvcc, so this
+/// check is not skipped where it matters. Nothing here claims a skip is loud.
 #[test]
 fn the_kernels_still_compile_to_the_recorded_baseline() {
     let Some(nvcc) = nvcc() else {

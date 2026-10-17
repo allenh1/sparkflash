@@ -139,7 +139,8 @@ cuda-abi:
     # crates/sparkflash-kernels/baseline/kernel_baseline.txt, and reports a different toolkit as a
     # toolkit change (with the regenerate command) rather than as a kernel change - a compiler
     # upgrade that looked like a regression would make the check useless. tests/kernel_baseline.rs
-    # runs the same script and skips, loudly, when nvcc is absent, so this step is what enforces it.
+    # runs the same script and skips when nvcc is absent - a skip libtest reports only under
+    # --nocapture and build.rs reports as its own cargo:warning - so this step is what enforces it.
     - /bin/sh crates/sparkflash-kernels/scripts/check-kernel-baseline.sh
     # The codec golden table is the ground truth the MXFP8/MXFP4 tests compare against, and it is
     # committed from outside the tree. Until this step existed, nothing could tell a table nvcc
