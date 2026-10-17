@@ -12,6 +12,10 @@ half = { workspace = true }
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
 cudarc = { workspace = true, optional = true }
+# Used only by examples/moe_slice.rs, the device-path vertical slice: the CUDA driver API is
+# resolved with dlopen at run time, so nothing links libcuda. Same crate and version family cudarc
+# itself uses for fallback-dynamic-loading, so this adds an edge and not a new package version.
+libloading = "0.8"
 
 [features]
 default = []
