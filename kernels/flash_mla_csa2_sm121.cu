@@ -57,6 +57,29 @@ static_assert(SPARK_M4_MLA_HEADS_PER_INDEX_HEAD == 2u, "two query heads per inde
 static_assert(SPARK_M4_HSI_BLOCKS * SPARK_M4_HSI_BLOCK_TOKENS == SPARK_M4_HSI_POSITIONS,
               "the HSI pool is 2048 blocks of 8 tokens");
 
+// One warp scores one HSI block. The indexer's dot is 128 values wide, four per lane, so a
+// five-step __shfl_down_sync tree reduces it with no shared memory and no block barrier. The old
+// shape reduced the same 128 lanes inside a 256-thread shared-memory tree: nine __syncthreads()
+// per slot-dot and half the threads contributing nothing, which made the indexer a barrier chain
+// rather than arithmetic. Eight warps now score eight independent HSI blocks at once, and the
+// blockIdx.y slice strides in units of eight. The shuffle is declared by the clang syntax stub as
+// well, so the host-side ABI probe still parses.
+#define SPARK_M4_MLA_WARP_LANES 32u
+#define SPARK_M4_MLA_WARPS (SPARK_M4_MLA_THREADS / SPARK_M4_MLA_WARP_LANES)
+static_assert(SPARK_M4_MLA_THREADS % SPARK_M4_MLA_WARP_LANES == 0u,
+              "the block divides into whole warps");
+static_assert(SPARK_M4_INDEX_HEAD_DIM == 4u * SPARK_M4_MLA_WARP_LANES,
+              "four indexer dimensions per lane");
+
+__device__ __forceinline__ float spark_mla_warp_sum(float value) {
+    value += __shfl_down_sync(0xffffffffu, value, 16u);
+    value += __shfl_down_sync(0xffffffffu, value, 8u);
+    value += __shfl_down_sync(0xffffffffu, value, 4u);
+    value += __shfl_down_sync(0xffffffffu, value, 2u);
+    value += __shfl_down_sync(0xffffffffu, value, 1u);
+    return value;
+}
+
 // A position is attendable when it is inside the sliding window behind the query. The predicate
 // is a function of the query position and the candidate id, so the CPU reference can test it
 // directly instead of duplicating the comparison.
@@ -103,7 +126,12 @@ extern "C" __global__ void flash_mla_csa2_sm121(
     __shared__ float s_sum;
 
     uint64_t t_enter = 0u;
-    SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_CSA2_ATTN, t_enter);
+    // The trace is recorded by one block (blockIdx.x == 0, thread 0) and the slice is the extra
+    // dimension the indexer added. Guarding the entry here keeps the enter/exit pair balanced
+    // with the early return below: only slice 0 enters and only slice 0 exits.
+    if (blockIdx.y == 0u) {
+        SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_CSA2_ATTN, t_enter);
+    }
 
     // Stage 1: score the HSI blocks for this head. Each block owns only its own block slot, so
     // there is no cross-block communication and nothing to acquire here.
@@ -112,28 +140,60 @@ extern "C" __global__ void flash_mla_csa2_sm121(
         s_sum = 1.0f;
     }
     __syncthreads();
-    for (uint32_t block = blockIdx.y; block < (uint32_t)SPARK_M4_HSI_BLOCKS; block += gridDim.y) {
+    // The two query heads of one indexer head compute the same 128-wide dots over the same keys:
+    // one indexer head serves both, and the index query is addressed by it, not by the query head.
+    // The pair therefore splits the pool instead of duplicating it. The even head takes the even
+    // HSI blocks and the odd head the odd ones, so every block is still written, by exactly one
+    // head of the pair, and the full-head launch (grid.x = SPARK_M4_HEADS) covers all 2,048. A
+    // partial launch would leave the other parity stale; that is a property of the pairing, and
+    // the fixed grid is what makes it safe.
+    const __nv_bfloat16 *query_row =
+        index_query + (uint64_t)index_head * SPARK_M4_INDEX_HEAD_DIM;
+    const uint32_t lane_in_warp = lane % SPARK_M4_MLA_WARP_LANES;
+    const uint32_t warp = lane / SPARK_M4_MLA_WARP_LANES;
+    const uint32_t pair = head % (uint32_t)SPARK_M4_MLA_HEADS_PER_INDEX_HEAD;
+    const uint32_t pair_stride = (uint32_t)SPARK_M4_MLA_HEADS_PER_INDEX_HEAD;
+    const uint32_t blocks_per_slice = SPARK_M4_MLA_WARPS * pair_stride;
+    const uint32_t block_stride = gridDim.y * blocks_per_slice;
+    const float q0 = __bfloat162float(query_row[lane_in_warp]);
+    const float q1 = __bfloat162float(query_row[lane_in_warp + SPARK_M4_MLA_WARP_LANES]);
+    const float q2 = __bfloat162float(query_row[lane_in_warp + 2u * SPARK_M4_MLA_WARP_LANES]);
+    const float q3 = __bfloat162float(query_row[lane_in_warp + 3u * SPARK_M4_MLA_WARP_LANES]);
+    for (uint32_t block = blockIdx.y * blocks_per_slice + warp * pair_stride + pair;
+         block < (uint32_t)SPARK_M4_HSI_BLOCKS;
+         block += block_stride) {
         float best = -3.402823466e38f;
         uint32_t best_token = 0u;
         for (uint32_t slot = 0; slot < (uint32_t)SPARK_M4_HSI_BLOCK_TOKENS; ++slot) {
-            float score = 0.0f;
-            for (uint32_t i = lane; i < (uint32_t)SPARK_M4_INDEX_HEAD_DIM; i += SPARK_M4_MLA_THREADS) {
-                score += __bfloat162float(index_query[(uint64_t)index_head * SPARK_M4_INDEX_HEAD_DIM + i]) *
-                         __bfloat162float(
-                             index_key[((uint64_t)block * SPARK_M4_HSI_BLOCK_TOKENS + slot) *
-                                           SPARK_M4_INDEX_HEAD_DIM + i]);
-            }
-            // Reduce the partial dot product across the block.
-            score = spark_block_sum(score, lane, SPARK_M4_MLA_THREADS);
-            if (lane == 0u && score > best) {
+            const __nv_bfloat16 *key_row =
+                index_key + ((uint64_t)block * SPARK_M4_HSI_BLOCK_TOKENS + slot) *
+                                SPARK_M4_INDEX_HEAD_DIM;
+            float score = q0 * __bfloat162float(key_row[lane_in_warp]) +
+                          q1 * __bfloat162float(key_row[lane_in_warp + SPARK_M4_MLA_WARP_LANES]) +
+                          q2 * __bfloat162float(key_row[lane_in_warp + 2u * SPARK_M4_MLA_WARP_LANES]) +
+                          q3 * __bfloat162float(key_row[lane_in_warp + 3u * SPARK_M4_MLA_WARP_LANES]);
+            // Reduce the four partial products of each lane inside the warp.
+            score = spark_mla_warp_sum(score);
+            if (lane_in_warp == 0u && score > best) {
                 best = score;
                 best_token = block * SPARK_M4_HSI_BLOCK_TOKENS + slot;
             }
         }
-        if (lane == 0u) {
+        if (lane_in_warp == 0u) {
             block_scores[block] = best;
             block_best[block] = best_token;
         }
+    }
+
+    // blockIdx.y exists only to slice the indexer's HSI pool, but stage 2 used to run unguarded
+    // in every slice: each blockIdx.y re-ran the whole attention for the same head and wrote the
+    // same out[] values. At a grid of 64 that performed 64 times the attention work for one
+    // result, and the launch paid about 1.47 ms for it at 128 candidates (measured on node0
+    // as the --tokens 130 minus --tokens 1 difference at grid.y 64, before this guard). One
+    // execution of that attention is 0.068 ms, so the redundant copies overlapped rather than
+    // serialising; the work was still real. Only slice 0 runs the attention now.
+    if (blockIdx.y != 0u) {
+        return;
     }
 
     // Stage 2: attention over the selected candidates. Pass one computes every score and the

@@ -1108,7 +1108,7 @@ const ASSERT_COUNTS: [(&str, usize); 7] = [
     ("mega_mhc_sm121.cu", 6),
     ("b12x_mxfp8_dense_sm121.cu", 6),
     ("b12x_mxfp4_moe_sm121.cu", 10),
-    ("flash_mla_csa2_sm121.cu", 11),
+    ("flash_mla_csa2_sm121.cu", 13),
     ("b12x_mxfp8_wo_a_sm121.cu", 11),
     ("cert_lm_head_sm121.cu", 8),
 ];
@@ -1463,10 +1463,11 @@ fn every_static_assert_in_the_milestone_holds_under_rust_too() {
         }
     }
     assert_eq!(
-        checked, 72,
+        checked, 74,
         "the milestone's static asserts must all be evaluated: 20 in the shared header plus 6, 6, \
-         10, 11, 11 and 8 in the six kernels. The MoE count rose from 7 to 10 with D14, which pins \
-         the FP8 E4M3 activation operand's byte width in the build itself"
+         10, 13, 11 and 8 in the six kernels. The MoE count rose from 7 to 10 with D14, which pins \
+         the FP8 E4M3 activation operand's byte width in the build itself; flash_mla's rose from 11 \
+         to 13 with the warp-level indexer's two geometry asserts"
     );
     // Every exception must still exist: a stale entry would quietly widen the rule above.
     for (name, condition) in NON_SPARK_ASSERTIONS {
@@ -1916,7 +1917,7 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
         let code = crate::c_decl::strip_comments(source);
         code.contains(
             "const uint32_t index_head = head / (uint32_t)SPARK_M4_MLA_HEADS_PER_INDEX_HEAD;",
-        ) && code.contains("index_query[(uint64_t)index_head * SPARK_M4_INDEX_HEAD_DIM + i]")
+        ) && code.contains("index_query + (uint64_t)index_head * SPARK_M4_INDEX_HEAD_DIM")
     };
     assert!(mla_uses_the_index_head(FLASH_MLA_CSA2));
     let query_head = FLASH_MLA_CSA2.replace(

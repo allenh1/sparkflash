@@ -92,6 +92,10 @@ struct Args {
     layer: usize,
     repeat: usize,
     floor_gib: u64,
+    /// The kernel's indexer grid.y. Every slice walks a disjoint stripe of the 2,048 HSI blocks,
+    /// sixteen blocks per slice; 64 stays the optimum once stage 2 stops running in every slice
+    /// (one slice is 0.161 ms at 128 candidates, and 64 is 0.1613 against 0.1813 at 8).
+    grid_y: u32,
 }
 
 fn next_value(values: &mut std::vec::IntoIter<String>, flag: &str) -> Result<String, String> {
@@ -108,6 +112,7 @@ fn parse_args() -> Result<Args, String> {
         layer: 0,
         repeat: 1,
         floor_gib: DEFAULT_FLOOR_GIB,
+        grid_y: 64,
     };
     let mut values: std::vec::IntoIter<String> =
         std::env::args().skip(1).collect::<Vec<_>>().into_iter();
@@ -145,6 +150,11 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|e| format!("--mem-floor-gib: {e}"))?;
             }
+            "--grid-y" => {
+                args.grid_y = next_value(&mut values, &flag)?
+                    .parse()
+                    .map_err(|e| format!("--grid-y: {e}"))?;
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -156,6 +166,12 @@ fn parse_args() -> Result<Args, String> {
     }
     if args.tokens == 0 {
         return Err("--tokens must be at least 1".to_string());
+    }
+    // 2,048 HSI blocks over eight warps and two heads per indexer head leaves at most 128 useful
+    // slices with work in each; beyond that the slice loop is empty and the block is pure launch
+    // overhead. The lower bound is the other side: one slice serialises the pool.
+    if args.grid_y == 0 || args.grid_y > 256 {
+        return Err("--grid-y must be in 1..=256 (2,048 HSI blocks over eight warps)".to_string());
     }
     Ok(args)
 }
@@ -1278,7 +1294,7 @@ fn stage2(args: &Args) -> Result<(), String> {
         "inherited limitation from stage 1, printed rather than implied: this stage's input chain starts at stage 1's xhat fp8 codes and scales, so stage 1's listed gaps ride into this input - hc_attn_base is not modelled by the kernel or the reference (task-40), and the kernel publishes hc_coeffs C unnormalised while the reference softmaxes it (task-38). This is not a clean chain from the checkpoint."
     );
     println!(
-        "layer {}: compress_ratios[0] = 0, so this is NOT a CED layer. The whole attention rule is the 128-token sliding window over at most index_topk 512 candidates. The candidate list is supplied by the harness: the top-512 merge over the HSI pool is a separate pipeline step the kernel does not implement. The HSI indexer inside the kernel is fed zero index_query/index_key and its block_scores/block_best outputs are NOT compared; this stage's boundary is the attention output.",
+        "layer {}: compress_ratios[0] = 0, so this is NOT a CED layer. The whole attention rule is the 128-token sliding window over at most index_topk 512 candidates. The candidate list is supplied by the harness: the top-512 merge over the HSI pool is a separate pipeline step the kernel does not implement. The HSI indexer inside the kernel is checked separately at the top of this stage on deterministic non-zero index data, against mla_ref::index_block_best, because stage 2 never consumes its block_scores/block_best; this stage's own boundary is the attention output.",
         args.layer
     );
     println!(
@@ -1467,15 +1483,124 @@ fn stage2(args: &Args) -> Result<(), String> {
     );
     cuda.copy_htod(&kv_fp4_d, &kv_fp4)?;
     cuda.copy_htod(&kv_scales_d, &kv_scales)?;
-    cuda.copy_htod(&index_key_d, &vec![0u8; index_key_bytes])?;
-    cuda.copy_htod(&index_query_d, &vec![0u8; index_query_bytes])?;
-    cuda.copy_htod(&block_scores_d, &vec![0u8; MLA_HSI_BLOCKS * 4])?;
-    cuda.copy_htod(&block_best_d, &vec![0u8; MLA_HSI_BLOCKS * 4])?;
 
-    // The indexer stage of the kernel runs one blockIdx.y slice per HSI block stride; 64 slices is
-    // enough to keep every block busy without launching 131072 blocks.
-    let grid = (MLA_HEADS as u32, 64u32, 1u32);
+    // Deterministic integer-valued index data for the indexer self-check below. Every product and
+    // partial sum is an exact integer in f32 (|dot| <= 1,024), so the reference and the kernel must
+    // agree bit for bit and a mapping error cannot hide behind rounding. Stage 2 never reads these
+    // buffers, so this does not touch the attention comparison.
+    let index_key_f32: Vec<f32> = (0..MLA_HSI_BLOCKS * MLA_HSI_BLOCK_TOKENS * MLA_INDEX_HEAD_DIM)
+        .map(|i| {
+            let block = i / (MLA_HSI_BLOCK_TOKENS * MLA_INDEX_HEAD_DIM);
+            let slot = (i / MLA_INDEX_HEAD_DIM) % MLA_HSI_BLOCK_TOKENS;
+            let dim = i % MLA_INDEX_HEAD_DIM;
+            (((block * 13 + slot * 7 + dim * 3) % 9) as i32 - 4) as f32
+        })
+        .collect();
+    let index_query_f32: Vec<f32> = (0..MLA_HEADS * MLA_INDEX_HEAD_DIM)
+        .map(|i| {
+            let index_head = i / MLA_INDEX_HEAD_DIM;
+            let dim = i % MLA_INDEX_HEAD_DIM;
+            (((index_head * 5 + dim * 11) % 7) as i32 - 3) as f32
+        })
+        .collect();
+    cuda.copy_htod(
+        &index_key_d,
+        &bf16_bits_to_bytes(&bf16_bits_of_f32(&index_key_f32)),
+    )?;
+    cuda.copy_htod(
+        &index_query_d,
+        &bf16_bits_to_bytes(&bf16_bits_of_f32(&index_query_f32)),
+    )?;
+    // Sentinels, so a block the indexer fails to write is visible even when its correct score is 0.
+    cuda.copy_htod(
+        &block_scores_d,
+        &f32_to_bytes(&vec![12345.0f32; MLA_HSI_BLOCKS]),
+    )?;
+    cuda.copy_htod(
+        &block_best_d,
+        &u32s_to_bytes(&vec![u32::MAX; MLA_HSI_BLOCKS]),
+    )?;
+
+    // The indexer stage of the kernel runs one blockIdx.y slice per stripe of HSI blocks. The
+    // slice count is a measured lever: more slices give the pool more blocks to run on but pay a
+    // fixed per-block cost, and only slice 0 runs stage 2. See --grid-y and the task-41 report.
+    let grid = (MLA_HEADS as u32, args.grid_y, 1u32);
     let block = (MLA_THREADS, 1u32, 1u32);
+    println!(
+        "launch grid: ({}, {}, {}) blocks of ({}, 1, 1) threads; each warp walks {} HSI blocks per head",
+        grid.0,
+        grid.1,
+        grid.2,
+        block.0,
+        (MLA_HSI_BLOCKS as u32).div_ceil(args.grid_y * 8 * 2)
+    );
+
+    // --- indexer self-check ---------------------------------------------------------------
+    // Stage 2 never reads block_scores or block_best, so until now the harness fed the indexer
+    // zeros and compared nothing: a mapping error in the warp-level rewrite would pass every
+    // attention comparison below. This runs the indexer on integer-valued bf16 index data, where
+    // every dot product is exact in f32, and compares the two heads of index head 0 - the pair
+    // that splits the pool in the kernel - against mla_ref::index_block_best. Blocks the kernel
+    // does not write keep their sentinel, so partial coverage fails rather than passing silently.
+    let index_check_params: [u64; 14] = [
+        q_d.0,
+        kv_fp4_d.0,
+        kv_scales_d.0,
+        selected_d.0,
+        index_key_d.0,
+        index_query_d.0,
+        block_scores_d.0,
+        block_best_d.0,
+        out_d.0,
+        0,
+        0,
+        0,
+        args.layer as u64,
+        0,
+    ];
+    check_floor(args, "indexer check pre-launch")?;
+    cuda.launch(func, (2u32, args.grid_y, 1u32), block, &index_check_params)?;
+    check_floor(args, "indexer check post-launch")?;
+    let mut index_scores_bytes = vec![0u8; MLA_HSI_BLOCKS * 4];
+    let mut index_best_bytes = vec![0u8; MLA_HSI_BLOCKS * 4];
+    cuda.copy_dtoh(&mut index_scores_bytes, &block_scores_d)?;
+    cuda.copy_dtoh(&mut index_best_bytes, &block_best_d)?;
+    let index_scores_dev = bytes_to_f32(&index_scores_bytes);
+    let index_best_dev: Vec<u32> = index_best_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_le_bytes(*chunk))
+        .collect();
+    let (index_scores_ref, index_best_ref) = mla_ref::index_block_best(
+        &index_query_f32[..MLA_INDEX_HEAD_DIM],
+        &index_key_f32,
+        MLA_HSI_BLOCKS,
+    );
+    let index_score_stats = compare_f32(
+        "indexer block_scores (head pair 0/1, the full pool)",
+        &index_scores_dev,
+        &index_scores_ref,
+    )?;
+    let index_best_exact = index_best_dev
+        .iter()
+        .zip(&index_best_ref)
+        .filter(|(device, reference)| device == reference)
+        .count();
+    println!(
+        "  indexer block_best: {index_best_exact}/{} exact (an unwritten block keeps u32::MAX)",
+        MLA_HSI_BLOCKS
+    );
+    if !index_score_stats.all_exact() || index_best_exact != MLA_HSI_BLOCKS {
+        return Err(format!(
+            "indexer self-check FAILED at grid.y {}: {} of {} block scores exact and {index_best_exact} of {} block_best exact",
+            args.grid_y, index_score_stats.exact, index_score_stats.len, MLA_HSI_BLOCKS
+        ));
+    }
+    println!(
+        "  indexer self-check: PASS at grid.y {} (both parities of the pool, one head each)",
+        args.grid_y
+    );
 
     let mut verdicts: Vec<(String, bool)> = Vec::new();
     let mut last_params: [u64; 14] = [0; 14];
