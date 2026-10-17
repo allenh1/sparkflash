@@ -22,6 +22,50 @@ fn released_depth() -> ModelConfig {
     }
 }
 
+/// The numbers on the audit line, parsed so a test can check the partition rather than a prefix:
+/// plan, read, unread, then the four class counts in line order (experts, stages, text-path,
+/// indexer). The line's shape is part of the report's contract, so a missing token is a failure.
+fn audit_numbers(report: &str) -> (usize, usize, usize, [usize; 4]) {
+    let line = report
+        .lines()
+        .find(|line| line.starts_with("audit:"))
+        .expect("the report has an audit line");
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let number = |key: &str| -> usize {
+        let token = tokens
+            .iter()
+            .find(|token| token.starts_with(key))
+            .unwrap_or_else(|| panic!("no {key} in the audit line: {line}"));
+        token
+            .strip_prefix(key)
+            .expect("the prefix was matched")
+            .trim_end_matches(',')
+            .parse()
+            .unwrap_or_else(|_| panic!("{key} is not a number in: {line}"))
+    };
+    let after = |label: &str| -> usize {
+        let at = tokens
+            .iter()
+            .position(|token| *token == label)
+            .unwrap_or_else(|| panic!("no {label} in the audit line: {line}"));
+        tokens[at + 1]
+            .trim_end_matches([',', ']'])
+            .parse()
+            .unwrap_or_else(|_| panic!("{label} is not followed by a number in: {line}"))
+    };
+    (
+        number("plan="),
+        number("read="),
+        number("unread="),
+        [
+            after("expected-unread=[unselected-expert"),
+            after("DSpark-stage"),
+            after("text-path"),
+            after("indexer"),
+        ],
+    )
+}
+
 #[test]
 fn the_one_token_report_has_forty_rows_seams_sink_audit_and_determinism() {
     let config = released_depth();
@@ -61,13 +105,21 @@ fn the_one_token_report_has_forty_rows_seams_sink_audit_and_determinism() {
         "the logits line is printed"
     );
     assert!(report.contains("argmax="), "the argmax is printed");
-    assert!(
-        report.contains("audit: plan="),
-        "the tensor audit is printed"
+    // At the released layer counts and tiny shapes the partition is exact and pinned: 40 layers x 2
+    // unselected experts x 6 tensors = 480 expert tensors, 130 DSpark-stage tensors, no text-path
+    // tensor and no indexer (the harness config clears compression), against a 2,253-tensor plan of
+    // which 1,643 are read.
+    let (plan, read, unread, classes) = audit_numbers(&report);
+    assert_eq!((plan, read, unread), (2253, 1643, 610));
+    assert_eq!(
+        classes,
+        [480, 130, 0, 0],
+        "the four classes at released depth"
     );
-    assert!(
-        report.contains("expected-unread=[unselected-expert"),
-        "the audit classifies what it did not read:\n{report}"
+    assert_eq!(
+        classes.iter().sum::<usize>(),
+        unread,
+        "the printed classes partition the unread set:\n{report}"
     );
     assert!(
         report.contains("logits class: the weight source is bytes, not numbers"),
@@ -88,6 +140,72 @@ fn the_one_token_report_has_forty_rows_seams_sink_audit_and_determinism() {
     assert!(
         sink.contains("consumed on both sides"),
         "the sink line says what the kernel and the reference do: {sink}"
+    );
+}
+
+/// A ratio-2 configuration skips its indexers at compress_len 0, so the audit has a real indexer
+/// class to name there rather than a class that only exists on paper. The tiny configuration is
+/// small enough to run the report end to end.
+#[test]
+fn the_audit_names_the_indexer_a_first_step_could_not_consult() {
+    let config = ModelConfig::tiny();
+    assert!(
+        config.compress_ratios.iter().any(|&ratio| ratio > 0),
+        "the tiny configuration has a compression layer"
+    );
+    let plan = TensorPlan::language_model(&config);
+    let source = SyntheticWeights::from_plan(&plan, 73);
+    let report = one_token_report(
+        &config,
+        Box::new(source),
+        SMALL_SHAPE_LIMIT,
+        0,
+        WeightClass::Bytes,
+    )
+    .expect("the tiny report runs and its unread indexer is classified");
+    let (_, _, unread, classes) = audit_numbers(&report);
+    assert_eq!(
+        classes[3], 8,
+        "the tiny plan's eight indexer tensors are unread"
+    );
+    assert_eq!(
+        classes.iter().sum::<usize>(),
+        unread,
+        "the tiny configuration's classes partition its unread set:\n{report}"
+    );
+}
+
+/// A vision-enabled configuration plans three more gate.bias_vl tensors, one per MTP stage, and
+/// every mtp.* tensor is unread on a first step. The text-path class must count the backbone's
+/// tensors only, or the printed classes stop partitioning the unread set in exactly the
+/// configuration criterion 5 targets (the released plan has 43 bias_vl: 40 backbone + 3 stages).
+#[test]
+fn a_vision_enabled_configuration_keeps_the_audit_classes_disjoint() {
+    let config = ModelConfig {
+        vision_n_layers: Some(32),
+        ..released_depth()
+    };
+    let plan = TensorPlan::language_model(&config);
+    let source = SyntheticWeights::from_plan(&plan, 79);
+    let report = one_token_report(
+        &config,
+        Box::new(source),
+        SMALL_SHAPE_LIMIT,
+        0,
+        WeightClass::Bytes,
+    )
+    .expect("the vision-enabled report runs");
+    let (plan, read, unread, classes) = audit_numbers(&report);
+    assert_eq!(
+        (plan, read, unread),
+        (2296, 1643, 653),
+        "the vision plan's counts"
+    );
+    assert_eq!(classes, [480, 133, 40, 0], "text-path is backbone-only");
+    assert_eq!(
+        classes.iter().sum::<usize>(),
+        unread,
+        "the stage tensors are not double-counted as text-path:\n{report}"
     );
 }
 

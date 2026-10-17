@@ -572,8 +572,13 @@ which the loader refuses by design - a paging weight source for them is the foll
 a real-weight host table (and the device diff of it). The harness did find one released-geometry bug
 on the way: the attention scratch buffer was sized from the residual width, so a 40-layer
 released-config run panicked on the first layer (64 heads of 512 = 32,768 values against dim
-5,120); forward/mod.rs now sizes it from the head geometry and truncates to the residual row, pinned
-by tests/forward.rs::a_geometry_with_wider_heads_than_the_residual_width_runs_and_records_the_narrow_row.
+5,120). The same bug sat in the MTP stage path and would have hit the 43-row decode case once the
+MTP pass ran; both buffers are now sized from the head geometry and truncated to the residual row,
+pinned by tests/forward.rs::a_geometry_with_wider_heads_than_the_residual_width_runs_and_records_the_narrow_row
+and tests/boundary.rs::a_wide_head_decode_records_all_forty_three_rows. The audit also now
+partitions the unread set into the four classes criterion 5 names (unselected experts, DSpark
+stages, the text-path gate.bias_vl, and an indexer no first step consults) and refuses anything
+outside them, so the future real-weight report is not refused for an expected tensor.
 
 ### 4.6 Cost of Phase 1
 

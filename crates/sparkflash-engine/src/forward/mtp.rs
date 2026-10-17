@@ -531,7 +531,17 @@ pub(crate) fn dspark_forward_observed(
     let mut collapsed = vec![0.0f32; dim];
     let mut stream = vec![0.0f32; hc_width];
     let mut attn_in = vec![0.0f32; block * dim];
-    let mut attn_out = vec![0.0f32; block * dim];
+    // The stage attention writes one concatenated head vector per draft position before the output
+    // projection narrows it to dim, exactly like the backbone's (forward/mod.rs); at the released
+    // geometry 64 heads of 512 is 32,768 values against dim 5,120, so a block*dim buffer panics.
+    let attention_width = config.n_heads.checked_mul(config.head_dim).ok_or_else(|| {
+        shape_error(
+            "dspark scratch",
+            "the head geometry does not fit a width".to_owned(),
+        )
+    })?;
+    let mut attn_out = vec![0.0f32; block.saturating_mul(dim)];
+    let wide_attention = block.saturating_mul(attention_width);
     let mut ffn_out = vec![0.0f32; dim];
     let mut scratch = MoeScratch::for_config(config);
 
@@ -580,6 +590,11 @@ pub(crate) fn dspark_forward_observed(
             linalg::rms_norm(&mut collapsed, &attn_norm, dim, eps)?;
             attn_in[position * dim..(position + 1) * dim].copy_from_slice(&collapsed);
         }
+        // The projection of the previous stage left one dim-wide row per position, so the head
+        // buffer has to grow back to the wide width before every stage's attention.
+        if attn_out.len() < wide_attention {
+            attn_out.resize(wide_attention, 0.0);
+        }
         // The engine's element limit travels with the call, so InferenceEngine::new's cap applies to
         // every tensor this stage reads, not just the ones the engine reads itself.
         attention::dspark_attention_forward(
@@ -594,6 +609,9 @@ pub(crate) fn dspark_forward_observed(
             &mut attn_out,
             limit,
         )?;
+        // The projection left one dim-wide row per draft position; the head buffer beyond that is
+        // not a dense row and must not reach the mHC post or the captured row.
+        attn_out.truncate(block * dim);
 
         let ffn_fn = linalg::decode_by_name(src, &format!("{prefix}.hc_ffn_fn"), limit)?;
         let ffn_scale = linalg::decode_by_name(src, &format!("{prefix}.hc_ffn_scale"), limit)?;

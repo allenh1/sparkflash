@@ -1744,8 +1744,10 @@ fn output_projection(
 ///
 /// The window path always runs; the compressed path runs only for a layer whose `compress_ratio` is
 /// positive (model.py:775), which is where the compressor, the indexer and the cross-layer channel
-/// come in. The output is the attention result projected by `wo_a` and `wo_b`, so `out` holds
-/// `seqlen * dim` values afterwards.
+/// come in. The output is the attention result projected by `wo_a` and `wo_b`, so `out`'s first
+/// `seqlen * dim` values hold the result afterwards; during the pass it is written as
+/// `seqlen * n_heads * head_dim` values first, so the buffer must be the wider of the two and must
+/// not be resized between layers (a buffer that is too short is a typed [EngineError::Shape]).
 ///
 /// `limit` caps the elements of any single tensor this pass materialises.
 ///
@@ -1774,6 +1776,28 @@ pub fn attention_forward(
             format!(
                 "{seqlen} rows need {} values, got {}",
                 seqlen * dim,
+                out.len()
+            ),
+        ));
+    }
+    // The attention write is wider than the projection: one concatenated head vector per query
+    // before `output_projection` narrows it to `dim`. The caller's buffer is therefore the max of
+    // the two widths, and a buffer sized only `seqlen * dim` would panic below at released
+    // geometry (64 heads of 512 = 32,768 against dim 5,120), so it is a typed refusal here.
+    let wide = seqlen
+        .checked_mul(heads)
+        .and_then(|values| values.checked_mul(head_dim))
+        .ok_or_else(|| {
+            shape(
+                "attention output",
+                "the head geometry does not fit a buffer".to_owned(),
+            )
+        })?;
+    if out.len() < wide {
+        return Err(shape(
+            "attention output",
+            format!(
+                "{seqlen} rows of {heads} heads of {head_dim} write {wide} values, got {}",
                 out.len()
             ),
         ));
@@ -1919,8 +1943,10 @@ pub fn attention_forward(
 /// no main input. A stage that has main rows only ever stores those, as the reference does
 /// (model.py:1065). The reference asserts `compress_ratio == 0` for this class (model.py:1034), and
 /// no compressor or indexer path is taken here. The query is rotated with the stage's own tables, an
-/// index outside the gathered rows stays a zero row with a masked score, and `out` holds
-/// `block_rows * dim` values.
+/// index outside the gathered rows stays a zero row with a masked score, and `out`'s first
+/// `block_rows * dim` values hold the projected result afterwards (like the backbone pass, it is
+/// written as `block_rows * n_heads * head_dim` values first, so the buffer must be the wider of
+/// the two; too short is a typed [EngineError::Shape]).
 ///
 /// `limit` caps the elements of any single tensor this pass materialises.
 ///
@@ -1961,6 +1987,27 @@ pub fn dspark_attention_forward(
             format!(
                 "{heads} heads of {head_dim} do not split into {} groups",
                 config.o_groups
+            ),
+        ));
+    }
+    // As in the backbone pass: the stage writes `block_rows * n_heads * head_dim` values before
+    // its projection narrows them to `block_rows * dim`, so a caller-sized `block_rows * dim`
+    // buffer is a typed refusal rather than a panic at released geometry.
+    let wide = block_rows
+        .checked_mul(heads)
+        .and_then(|values| values.checked_mul(head_dim))
+        .ok_or_else(|| {
+            shape(
+                "dspark output",
+                "the head geometry does not fit a buffer".to_owned(),
+            )
+        })?;
+    if out.len() < wide {
+        return Err(shape(
+            "dspark output",
+            format!(
+                "{block_rows} rows of {heads} heads of {head_dim} write {wide} values, got {}",
+                out.len()
             ),
         ));
     }

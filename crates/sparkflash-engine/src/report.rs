@@ -1,8 +1,11 @@
 //! The Phase 1 one-token run, as a text report with a fixed contract.
 //!
 //! One token is the cheapest forward that exists and the first place the whole backbone runs:
-//! forty layers, every layer plan mode present in a real configuration, all forty mHC passes, the
-//! host router, the combine, the head and the sampler. The report is the deliverable - it records
+//! forty layers, all forty mHC passes, the host router, the combine, the head and the sampler. The
+//! released-depth harness runs those at tiny shapes with the compression, indexer and Engram lists
+//! cleared, so a compressor/indexer/Engram path and the three DSpark stages are not exercised by
+//! it; a tiny ratio-2 configuration does exercise the indexer audit class. The released-geometry
+//! table waits on the Engram-paged source. The report is the deliverable - it records
 //! the per-layer boundary table's row count and classes, the five host seams of the roadmap
 //! (section 4.3), the attention sink line (section 4.3, task-36), the tensor audit (section 4.5
 //! criterion 5) and run determinism (criterion 6). A run that misses any of them is an error, not
@@ -252,33 +255,60 @@ pub fn one_token_report(
         .iter()
         .filter(|name| !read.contains(name.as_str()))
         .collect();
-    // At a first step the only legitimate unread names are the experts the router did not select
-    // and the DSpark stages, which the engine skips at start_pos == 0; anything else is a tensor
-    // the plan expects and this pass never read, and a report that hid it would be decoration.
-    let experts = unread
-        .iter()
-        .filter(|name| name.contains(".ffn.experts."))
-        .count();
+    // At a first step the unread names fall into four classes the format document and criterion 5
+    // name, and classifying them disjointly is what makes the line a partition rather than a hope:
+    // the experts the router did not select; the DSpark stages (every mtp.* tensor, including the
+    // stage experts, so it is tested first); the text-path tensor gate.bias_vl, which D18 excludes;
+    // and an indexer no position needs at compress_len == 0. Anything outside those classes is a
+    // tensor the plan expects and this pass never read, and the report refuses rather than hides it.
     let stages = unread
         .iter()
         .filter(|name| name.starts_with("mtp."))
         .count();
+    let experts = unread
+        .iter()
+        .filter(|name| !name.starts_with("mtp.") && name.contains(".ffn.experts."))
+        .count();
+    let text_path = unread
+        .iter()
+        .filter(|name| !name.starts_with("mtp.") && name.ends_with("ffn.gate.bias_vl"))
+        .count();
+    let indexer = unread
+        .iter()
+        .filter(|name| !name.starts_with("mtp.") && name.contains(".attn.indexer."))
+        .count();
     let other: Vec<&&String> = unread
         .iter()
-        .filter(|name| !name.contains(".ffn.experts.") && !name.starts_with("mtp."))
+        .filter(|name| {
+            !name.starts_with("mtp.")
+                && !name.contains(".ffn.experts.")
+                && !name.ends_with("ffn.gate.bias_vl")
+                && !name.contains(".attn.indexer.")
+        })
         .collect();
     if !other.is_empty() {
         return Err(EngineError::Shape {
             what: "one-token report".to_owned(),
             detail: format!(
-                "{} plan tensors were not read and are neither unselected experts nor DSpark stages: {:?}",
+                "{} plan tensors were not read and are in none of the four expected classes: {:?}",
                 other.len(),
                 other.iter().take(8).collect::<Vec<_>>()
             ),
         });
     }
+    // The four filters are constructed to be disjoint, and a report whose own classes do not add
+    // up to its unread count is a bookkeeping bug, not a report: check the partition it prints.
+    if experts + stages + text_path + indexer != unread.len() {
+        return Err(EngineError::Shape {
+            what: "one-token report".to_owned(),
+            detail: format!(
+                "the audit classes {experts}+{stages}+{text_path}+{indexer} do not partition the {} unread tensors",
+                unread.len()
+            ),
+        });
+    }
     report.push_str(&format!(
-        "audit: plan={} read={} unread={} expected-unread=[unselected-expert {experts}, DSpark-stage {stages}] first_unread={:?}\n",
+        "audit: plan={} read={} unread={} expected-unread=[unselected-expert {experts}, DSpark-stage {stages}, text-path {text_path}, indexer {indexer}] first_unread={:?}\n",
         plan_names.len(),
         read.len(),
         unread.len(),

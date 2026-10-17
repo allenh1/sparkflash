@@ -917,6 +917,60 @@ fn released_depth() -> ModelConfig {
     }
 }
 
+/// The same 43-row decode rule at a geometry whose heads are wider than the residual stream
+/// (8 heads of 32 = 256 values against dim 64, four times wider; the released geometry is 6.4
+/// times wider). The backbone scratch and the MTP stage scratch both write the head buffer before
+/// the projection narrows it; the
+/// released config cannot run yet (the Engram tables need a paging source), so this is the host
+/// shape that keeps both buffers honest.
+#[test]
+fn a_wide_head_decode_records_all_forty_three_rows() {
+    use sparkflash_engine::forward::boundary::ATTENTION_OUT;
+
+    let config = ModelConfig {
+        n_heads: 8,
+        head_dim: 32,
+        o_groups: 2,
+        ..released_depth()
+    };
+    assert!(config.n_heads * config.head_dim > config.dim);
+    let configured = engine(&config, 63, None);
+    let mut state = SequenceState::new(&config);
+    configured
+        .prefill_observed(&mut state, &[1, 2])
+        .expect("the wide-head prefill runs");
+    let decode = configured
+        .decode_observed(&mut state, 3)
+        .expect("the wide-head decode runs the MTP stages");
+    assert_eq!(
+        decode.boundary.len(),
+        config.n_layers + config.n_mtp_layers,
+        "40 backbone rows and 3 stage rows"
+    );
+    for row in decode.boundary.rows() {
+        let elements = row
+            .tensor(ATTENTION_OUT)
+            .expect("every row records its attention output")
+            .data()
+            .elements();
+        if row.layer() < config.n_layers {
+            assert_eq!(
+                elements,
+                config.dim,
+                "backbone layer {} records one dim-wide row for the decode token",
+                row.layer()
+            );
+        } else {
+            assert_eq!(
+                elements,
+                config.dim * config.dspark_block_size,
+                "stage {} records one dim-wide row per draft position",
+                row.layer()
+            );
+        }
+    }
+}
+
 /// The roadmap's row-count rule at the released layer counts: a first step has exactly
 /// `n_layers` rows (40), and a decode step after a prefill has `n_layers + n_mtp_layers` (43), with
 /// the stages at layer ids `n_layers + stage`.

@@ -14,9 +14,9 @@
 //! - [`dtype`]: the storage formats in the checkpoint - FP8 E4M3, FP4 E2M1 packed two-per-byte,
 //!   the UE8M0 scale bytes, and the block rules that decide how many scale bytes a tensor carries.
 //! - [`quant`]: the checkpoint's storage formats decoded to f32 - FP8 E4M3, E8M0 scales, FP4
+//!   E2M1, bf16 and f32 - and the reference's per-32 activation quantisers.
 //! - [`report`]: the Phase 1 one-token report - rows, seams, audit and determinism as one
 //!   runnable contract.
-//!   E2M1, bf16 and f32 - and the reference's per-32 activation quantisers.
 //! - [`tensor`]: [`TensorPlan`], the name, shape and dtype of every tensor the forward reads.
 //! - [`layer_plan`]: [`LayerPlan`], the attention variant, KV source, Engram and DSpark role of
 //!   every backbone layer and MTP stage, plus the execution order its KV DAG requires.
