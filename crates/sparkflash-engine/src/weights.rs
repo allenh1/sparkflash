@@ -106,6 +106,24 @@ pub trait WeightSource {
     /// The bytes of one tensor.
     fn read(&self, name: &str) -> Result<Vec<u8>, WeightError>;
 
+    /// Named byte ranges of one tensor, for a source that can page a table too large to hold.
+    ///
+    /// The released Engram tables are 98 GB of FP8 each, far past any element limit the reference
+    /// pass would accept, but a token looks up only a few rows of them. A source that can read a
+    /// row on demand returns them here; one that only serves whole tensors keeps the default
+    /// `None`, and the caller falls back to [`WeightSource::read`] under its limit (which refuses a
+    /// released-size table rather than allocating it).
+    ///
+    /// The returned bytes are the ranges concatenated in the order given, with no decoding.
+    fn read_ranges(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Option<Result<Vec<u8>, WeightError>> {
+        let _ = (name, ranges);
+        None
+    }
+
     /// Whether the source holds a tensor with that name.
     fn contains(&self, name: &str) -> bool {
         self.spec(name).is_ok()

@@ -562,17 +562,24 @@ unbounded reference; the run prints both numbers.
 `crates/sparkflash-engine/tests/one_token.rs` pins - forty rows at the released layer counts (40
 backbone + 3 stages), the five seam labels of section 4.3 plus the sink line, the tensor audit
 (plan/read/unread counts) and a two-run bit-identical boundary table and logits check. The
-criterion-2 attribution tests are already merged (!38). What remains is criterion 3 and the device
+criterion-2 attribution tests are already merged (!38). Run it with
+`cargo run -p sparkflash-engine --example one_token` for the synthetic mode, or with
+`-- --checkpoint <snapshot dir>` on the node for the real table. What remains is criterion 3 and the device
 column of criterion 1: the device half diffs this reference table against the device path and
 measures the per-tensor bars. A synthetic run prints that its source is bytes, not numbers, so its
 argmax/top-5 are a shape and determinism record rather than a prediction. The released-checkpoint
-reference table is not a mode of the harness yet: the reference pass reads one tensor at a time
-under an element limit, and the two Engram tables are 98,308,270,592 and 98,305,579,008 elements,
-which the loader refuses by design - a paging weight source for them is the follow-up that unblocks
-a real-weight host table (and the device diff of it). The harness did find one released-geometry bug
-on the way: the attention scratch buffer was sized from the residual width, so a 40-layer
-released-config run panicked on the first layer (64 heads of 512 = 32,768 values against dim
-5,120). The same bug sat in the MTP stage path and would have hit the 43-row decode case once the
+reference table is now the harness's --checkpoint mode: ReferenceWeights verifies the plan the way
+LoadedWeights does and serves the stored forms the reference decodes, LoadedWeights::read_ranges
+pages the two Engram tables row by row (98,308,270,592 and 98,305,579,008 elements, still refused as
+whole reads), the loader bounds every other tensor, and the rest of the released plan runs under a
+1<<30-element limit. Serving the loader's converted tensors instead would have failed at the first
+layer - `wo_a` comes back as BF16 with its scale applied under the plan's F8E4M3 spec - which the
+new tiny plan-complete-checkpoint test
+(`tests/loader.rs::a_reference_source_runs_one_token_on_a_plan_complete_checkpoint`) pins. What
+remains is to run it on the node and diff the device half against its table. The harness did find
+one released-geometry bug on the way: the attention scratch buffer was sized from the residual
+width, so a 40-layer released-config run panicked on the first layer (64 heads of 512 = 32,768 values
+against dim 5,120). The same bug sat in the MTP stage path and would have hit the 43-row decode case once the
 MTP pass ran; both buffers are now sized from the head geometry and truncated to the residual row,
 pinned by tests/forward.rs::a_geometry_with_wider_heads_than_the_residual_width_runs_and_records_the_narrow_row
 and tests/boundary.rs::a_wide_head_decode_records_all_forty_three_rows. The audit also now
@@ -595,9 +602,10 @@ window cost.
 `task-36` (kernel ABI, api-dev); new tasks: `phase1: layer plan and a pinned 43-row table`
 (arch-docs/kernel-dev), `phase1: 40-layer token harness with per-layer diff` (kernel-dev),
 `phase1: stage 4, head and sampling on device` (kernel-dev), `phase1: perturbation and seam-label
-tests` (api-dev), `phase1: Engram-paged weight source for the released reference table`
-(kernel-dev) - the harness's host half and the released-geometry attention scratch fix are merged;
-the checkpoint table and the device diff wait on that source. `task-37` and `task-41` are *not*
+tests` (api-dev), `phase1: run the released-checkpoint reference table on the node` (kernel-dev) -
+the paged Engram source, the released-geometry scratch fixes, the partitioned audit and the
+harness's --checkpoint mode landed; the real-weight run and its device diff are what remain.
+`task-37` and `task-41` are *not*
 Phase 1; they are Phase 3.
 
 ---

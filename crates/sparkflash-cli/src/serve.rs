@@ -775,6 +775,14 @@ impl WeightSource for LoadedSource {
     fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
         self.loaded.get(name).map(|tensor| tensor.data)
     }
+
+    fn read_ranges(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Option<Result<Vec<u8>, WeightError>> {
+        Some(self.loaded.read_ranges(name, ranges))
+    }
 }
 
 /// Runs one request and sends its events, ending with exactly one terminal reply.

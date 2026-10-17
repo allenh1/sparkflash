@@ -77,7 +77,11 @@
 //! [SafeTensorsSource::with_refused], so a caller gets a typed refusal naming the tensor rather
 //! than a 98 GB allocation or a confusing size error. They are still part of the audit, because a
 //! checkpoint that lacks them is not the released checkpoint, and reading their headers is a few
-//! kilobytes.
+//! kilobytes. For a caller that needs the rows themselves, [SafeTensorsSource::read_ranges] serves
+//! named byte ranges of one tensor without a whole read (and deliberately does not consult the
+//! refusal list: a range read is the alternative to the whole read the list refuses), and
+//! [LoadedWeights::read_ranges] exposes it unchanged. The reference pass's Engram path uses it to
+//! page the rows a chunk actually looks up.
 //!
 //! # The other safetensors reader, and why there are two
 //!
@@ -644,6 +648,117 @@ impl LoadedWeights {
                 dequantise_wo_a(name, &weight, &weight_shape, &scale, &scale_shape)
             }
         }
+    }
+
+    /// Reads named byte ranges of one stored tensor, for the paged Engram path.
+    ///
+    /// This bypasses [LoadedWeights::get]'s whole-tensor treatments on purpose: the only tensors a
+    /// caller pages are the two Engram tables, which are stored FP8 with an E8M0 per-row-32 scale
+    /// row and need no conversion, and this method returns their raw bytes for the caller to decode
+    /// row by row. The source's refusal list does not apply to a range read (see
+    /// [crate::safetensors::SafeTensorsSource::read_ranges]); the element limit does not either,
+    /// because holding one row at a time is what makes the released 98 GB table readable at all.
+    ///
+    /// # Errors
+    /// As [crate::safetensors::SafeTensorsSource::read_ranges].
+    pub fn read_ranges(&self, name: &str, ranges: &[(u64, usize)]) -> Result<Vec<u8>, WeightError> {
+        self.source.read_ranges(name, ranges)
+    }
+}
+
+/// A plan-consistent source for the CPU reference pass.
+///
+/// [LoadedWeights] hands back what a serving path wants: `wo_a` comes out as BF16 with its block
+/// scales already applied, because that is the converted form the device kernels take. The
+/// reference pass is the other way round - it decodes what the plan names (`F8E4M3` plus the
+/// separate `wo_a.scale`) and applies the grid itself, as model.py does - so it needs the stored
+/// bytes and the plan's [TensorSpec] for every tensor. The one reinterpretation it does share with
+/// the loader is the packed expert: the file stores two FP4 values per int8 byte, and both the
+/// device path and the reference's expert path want the logical `F4E2M1` shape, so [packed_expert]
+/// runs here too.
+///
+/// The two Engram tables are only ever read through [WeightSource::read_ranges], which this source
+/// serves straight from the shard; a whole read of them is still refused by name.
+pub struct ReferenceWeights {
+    source: SafeTensorsSource,
+    plan: TensorPlan,
+}
+
+impl ReferenceWeights {
+    /// Verifies the checkpoint against the plan, then opens the raw source the reference reads.
+    ///
+    /// The verification is [LoadedWeights::open]'s: every planned tensor's header must agree with
+    /// the plan, and the report must be exact. Only then is the source opened, with the Engram
+    /// tables on its refusal list and the default byte limit for every other tensor.
+    ///
+    /// # Errors
+    /// As [LoadedWeights::open] and [SafeTensorsSource::open].
+    pub fn open(
+        dir: impl Into<PathBuf>,
+        index_path: &Path,
+        plan: &TensorPlan,
+    ) -> Result<Self, WeightError> {
+        let dir = dir.into();
+        LoadedWeights::open(dir.clone(), index_path, plan)?;
+        let source = SafeTensorsSource::open(dir, index_path)?.with_refused(engram_tables(plan));
+        Ok(Self {
+            source,
+            plan: plan.clone(),
+        })
+    }
+
+    /// The plan this source was opened against.
+    pub fn plan(&self) -> &TensorPlan {
+        &self.plan
+    }
+}
+
+impl WeightSource for ReferenceWeights {
+    /// Every planned name, in the plan's order.
+    fn names(&self) -> Vec<String> {
+        self.plan.names().map(str::to_owned).collect()
+    }
+
+    /// The plan's spec, which is what the engine decodes against for every tensor this source serves
+    /// (the packed expert's logical shape included).
+    fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
+        self.plan
+            .get(name)
+            .cloned()
+            .ok_or_else(|| WeightError::Missing {
+                name: name.to_owned(),
+            })
+    }
+
+    /// The stored bytes of one tensor, with the packed expert reinterpreted to the logical shape.
+    ///
+    /// Everything else - `wo_a` included - is returned exactly as stored, because the engine
+    /// applies the separate scale grids itself.
+    fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+        let Some(spec) = self.plan.get(name) else {
+            return Err(WeightError::Missing {
+                name: name.to_owned(),
+            });
+        };
+        if Treatment::of(spec, name) != Treatment::PackedExpert {
+            return self.source.read(name);
+        }
+        // The source's spec() is already the logical FP4 view, so the stored word and the packed
+        // shape come from the header descriptor itself, which is what packed_expert checks.
+        let header = self.source.header(name)?;
+        let descriptor = header.tensor(name)?;
+        let (word, shape) = (descriptor.dtype.clone(), descriptor.shape.clone());
+        let bytes = self.source.read(name)?;
+        packed_expert(name, &word, &shape, &spec.shape, bytes).map(|tensor| tensor.data)
+    }
+
+    /// Named byte ranges of one stored tensor, straight from the shard (the Engram paging path).
+    fn read_ranges(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Option<Result<Vec<u8>, WeightError>> {
+        Some(self.source.read_ranges(name, ranges))
     }
 }
 

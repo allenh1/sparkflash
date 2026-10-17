@@ -1139,3 +1139,124 @@ fn an_index_metadata_block_that_repeats_a_key_is_refused() {
         other => panic!("expected Malformed naming the repeated metadata key, got {other:?}"),
     }
 }
+
+#[test]
+fn paged_ranges_return_exactly_the_requested_bytes_and_bypass_the_refusal_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let data: Vec<u8> = (0..32).collect();
+    write_container(
+        dir.path(),
+        "a.safetensors",
+        &[Entry {
+            name: "a.weight",
+            dtype: "F32",
+            shape: &[8],
+            data: &data,
+        }],
+    );
+    let source = source(dir.path(), &[("a.weight", "a.safetensors")]).with_refused(["a.weight"]);
+    // A whole read is refused by policy...
+    assert!(matches!(
+        source.read("a.weight"),
+        Err(WeightError::Refused { .. })
+    ));
+    // ...while paging the same tensor is the alternative to that policy, and the ranges come back
+    // in the order asked, byte for byte.
+    let paged = source
+        .read_ranges("a.weight", &[(8, 4), (0, 8), (28, 4)])
+        .expect("the shard can serve the ranges");
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&data[8..12]);
+    expected.extend_from_slice(&data[0..8]);
+    expected.extend_from_slice(&data[28..32]);
+    assert_eq!(paged, expected);
+
+    // A range that leaves the tensor is a typed refusal, not a short read.
+    let error = source.read_ranges("a.weight", &[(30, 4)]).unwrap_err();
+    match error {
+        WeightError::Malformed { detail, .. } => {
+            assert!(detail.contains("outside"), "{detail}");
+        }
+        other => panic!("expected Malformed for an out-of-range page, got {other:?}"),
+    }
+}
+
+#[test]
+fn paged_ranges_are_bounded_by_the_stored_bytes_not_the_logical_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    // A packed expert stores two FP4 values per byte, so its logical last dimension (4) is twice
+    // the stored one (2): eight stored bytes, not sixteen. Paging must bound itself by the eight
+    // the header names, or a range read could run into the next tensor in the shard.
+    let data: Vec<u8> = (0..8).collect();
+    write_container(
+        dir.path(),
+        "a.safetensors",
+        &[Entry {
+            name: "layers.0.ffn.experts.0.w1.weight",
+            dtype: "I8",
+            shape: &[2, 4],
+            data: &data,
+        }],
+    );
+    let source = source(
+        dir.path(),
+        &[("layers.0.ffn.experts.0.w1.weight", "a.safetensors")],
+    );
+    let name = "layers.0.ffn.experts.0.w1.weight";
+    assert_eq!(
+        source
+            .read_ranges(name, &[(0, 8)])
+            .expect("the stored bytes"),
+        data,
+        "the whole stored tensor is pageable"
+    );
+    let error = source.read_ranges(name, &[(8, 1)]).unwrap_err();
+    match error {
+        WeightError::Malformed { detail, .. } => {
+            assert!(detail.contains("outside"), "{detail}");
+        }
+        other => panic!("expected Malformed past the stored bytes, got {other:?}"),
+    }
+}
+
+#[test]
+fn paged_ranges_resolve_each_tensor_in_its_own_shard() {
+    let dir = tempfile::tempdir().unwrap();
+    let first: Vec<u8> = (0..8).collect();
+    let second: Vec<u8> = (100..116).collect();
+    write_container(
+        dir.path(),
+        "a.safetensors",
+        &[Entry {
+            name: "a.weight",
+            dtype: "F32",
+            shape: &[2],
+            data: &first,
+        }],
+    );
+    write_container(
+        dir.path(),
+        "b.safetensors",
+        &[Entry {
+            name: "b.weight",
+            dtype: "F32",
+            shape: &[4],
+            data: &second,
+        }],
+    );
+    let source = source(
+        dir.path(),
+        &[("a.weight", "a.safetensors"), ("b.weight", "b.safetensors")],
+    );
+    // Each page starts from that tensor's own data_offsets plus its own shard's data section,
+    // which is what a reader that keeps one data section offset for the whole checkpoint gets
+    // wrong on the second shard.
+    assert_eq!(
+        source.read_ranges("a.weight", &[(4, 4)]).unwrap(),
+        first[4..8].to_vec()
+    );
+    assert_eq!(
+        source.read_ranges("b.weight", &[(0, 4), (12, 4)]).unwrap(),
+        [second[0..4].to_vec(), second[12..16].to_vec()].concat()
+    );
+}

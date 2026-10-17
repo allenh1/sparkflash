@@ -704,7 +704,97 @@ impl SafeTensorsSource {
     }
 }
 
+impl SafeTensorsSource {
+    /// Reads named byte ranges of one tensor, without materialising the tensor.
+    ///
+    /// This is the call a paged reader makes for a table too large to hold. It deliberately does not
+    /// consult this source's refusal list: the list exists to stop a whole-table read under the
+    /// element limit, and a range read is the alternative to that limit, not a bypass of a check that
+    /// would otherwise apply. Each range is checked against the bytes the shard actually stores for
+    /// the tensor - the header's data_offsets, not the plan's logical size, because a packed expert
+    /// stores half as many bytes as its logical shape - and the ranges are concatenated in the order
+    /// given.
+    ///
+    /// # Errors
+    /// [WeightError::Missing] when the name is not in the index or its shard, [WeightError::Malformed]
+    /// when a range falls outside the tensor, [WeightError::Io] when the shard cannot be read.
+    pub fn read_ranges(&self, name: &str, ranges: &[(u64, usize)]) -> Result<Vec<u8>, WeightError> {
+        let (shard, header) = self.resolve(name)?;
+        let descriptor = header.tensor(name)?;
+        let (begin, finish) = (descriptor.data_offsets[0], descriptor.data_offsets[1]);
+        let total = finish.saturating_sub(begin);
+        let start = header
+            .data_start
+            .checked_add(descriptor.data_offsets[0])
+            .ok_or_else(|| WeightError::Malformed {
+                name: name.to_string(),
+                detail: format!(
+                    "the tensor starts at byte {} of a data section that begins at {}",
+                    descriptor.data_offsets[0], header.data_start
+                ),
+            })?;
+        let path = self.shard_path(shard);
+        let mut file = File::open(&path).map_err(|error| WeightError::Io {
+            name: name.to_string(),
+            detail: format!("open {}: {error}", path.display()),
+        })?;
+        let mut out = Vec::new();
+        for &(offset, len) in ranges {
+            let end = offset
+                .checked_add(len as u64)
+                .ok_or_else(|| WeightError::Malformed {
+                    name: name.to_string(),
+                    detail: format!("range {offset}+{len} overflows a byte offset"),
+                })?;
+            if end > total {
+                return Err(WeightError::Malformed {
+                    name: name.to_string(),
+                    detail: format!(
+                        "range {offset}..{end} is outside the tensor's {total} stored bytes"
+                    ),
+                });
+            }
+            let at = start
+                .checked_add(offset)
+                .ok_or_else(|| WeightError::Malformed {
+                    name: name.to_string(),
+                    detail: format!("byte {start}+{offset} overflows a file offset"),
+                })?;
+            file.seek(SeekFrom::Start(at))
+                .map_err(|error| WeightError::Io {
+                    name: name.to_string(),
+                    detail: format!("seek to byte {at} of {}: {error}", path.display()),
+                })?;
+            let mut buffer = vec![0u8; len];
+            file.read_exact(&mut buffer)
+                .map_err(|error| match error.kind() {
+                    std::io::ErrorKind::UnexpectedEof => WeightError::Malformed {
+                        name: name.to_string(),
+                        detail: format!(
+                            "{} declared {end} bytes from byte {at} but holds fewer",
+                            path.display()
+                        ),
+                    },
+                    _ => WeightError::Io {
+                        name: name.to_string(),
+                        detail: format!("read {}: {error}", path.display()),
+                    },
+                })?;
+            out.extend_from_slice(&buffer);
+        }
+        Ok(out)
+    }
+}
+
 impl WeightSource for SafeTensorsSource {
+    fn read_ranges(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Option<Result<Vec<u8>, WeightError>> {
+        Some(SafeTensorsSource::read_ranges(self, name, ranges))
+    }
+
     /// Every name in the index, in sorted order.
     fn names(&self) -> Vec<String> {
         self.index.names().map(str::to_string).collect()

@@ -17,10 +17,11 @@ use tempfile::TempDir;
 use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::dtype::DType;
 use sparkflash_engine::loader::{
-    LoadedWeights, Treatment, WO_A_GRIDS, dequantise_wo_a, engram_tables, is_engram_table,
-    packed_expert, wo_a_scale_name,
+    LoadedWeights, ReferenceWeights, Treatment, WO_A_GRIDS, dequantise_wo_a, engram_tables,
+    is_engram_table, packed_expert, wo_a_scale_name,
 };
 use sparkflash_engine::quant;
+use sparkflash_engine::report::{SMALL_SHAPE_LIMIT, WeightClass, one_token_report};
 use sparkflash_engine::safetensors::CheckpointIndex;
 use sparkflash_engine::tensor::{TensorPlan, TensorSpec};
 use sparkflash_engine::weights::WeightError;
@@ -978,4 +979,86 @@ fn an_empty_plan_is_refused_before_the_checkpoint_is_consulted() {
     let plan = test_plan();
     let checkpoint = checkpoint(&plan, |_| {});
     assert!(LoadedWeights::open(checkpoint.dir(), &checkpoint.index, &plan).is_ok());
+}
+
+#[test]
+fn a_loaded_checkpoint_pages_the_engram_tables_by_range() {
+    let plan = test_plan();
+    let weight = "layers.1.engram.embed.weight";
+    let scale = "layers.1.engram.embed.scale";
+    let width = plan.get(weight).expect("the plan holds the table").shape[1];
+    let checkpoint = checkpoint(&plan, |entries| {
+        for item in entries.iter_mut() {
+            if item.name == weight {
+                item.data = (0..item.data.len()).map(|at| (at % 251) as u8).collect();
+            } else if item.name == scale {
+                item.data = vec![0x80; item.data.len()];
+            }
+        }
+    });
+    // The whole read of the table is refused by the refusal list before the byte limit is
+    // consulted, and the limit is one byte, so any other whole read would be refused too; a
+    // successful row read therefore proves the paged path goes through neither check.
+    let loader = LoadedWeights::open_with_limit(checkpoint.dir(), &checkpoint.index, &plan, 1)
+        .expect("a complete checkpoint opens");
+    assert!(
+        loader.get(weight).is_err(),
+        "a whole read of the table must still be refused"
+    );
+
+    let rows = [0usize, 5, 1023];
+    let ranges: Vec<(u64, usize)> = rows
+        .iter()
+        .map(|&row| (row as u64 * width as u64, width))
+        .collect();
+    let bytes = loader
+        .read_ranges(weight, &ranges)
+        .expect("the loader serves row ranges of the table");
+    let mut expected = Vec::new();
+    for &row in &rows {
+        for column in 0..width {
+            expected.push(((row * width + column) % 251) as u8);
+        }
+    }
+    assert_eq!(bytes, expected);
+
+    // A range outside the table is a typed refusal, not a short read.
+    assert!(loader.read_ranges(weight, &[(u64::MAX / 2, 8)]).is_err());
+
+    // The scale table pages the same way, one E8M0 byte per 32 columns of a row.
+    let scale_width = width.div_ceil(32);
+    let scales = loader
+        .read_ranges(scale, &[(0, scale_width)])
+        .expect("the scale rows are served");
+    assert_eq!(scales, vec![0x80; scale_width]);
+}
+
+#[test]
+fn a_reference_source_runs_one_token_on_a_plan_complete_checkpoint() {
+    // This is the seam the --checkpoint mode exists on, and the one the SyntheticWeights tests
+    // cannot reach: a real safetensors container, the plan's stored forms, the paged Engram read and
+    // the engine's reference pass in one run. It caught the loader's converted `wo_a` (BF16 with the
+    // scale applied) being served under the plan's F8E4M3 spec, which failed at the first layer.
+    let config = test_config();
+    let plan = test_plan();
+    let checkpoint = checkpoint(&plan, |_| {});
+    let reference = ReferenceWeights::open(checkpoint.dir(), &checkpoint.index, &plan)
+        .expect("the checkpoint verifies and the raw reference source opens");
+    let report = one_token_report(
+        &config,
+        Box::new(reference),
+        SMALL_SHAPE_LIMIT,
+        0,
+        WeightClass::Numbers,
+    )
+    .expect("a plan-complete checkpoint must run one token on the reference path");
+    assert!(
+        report.contains("rows: 2 (a first step records n_layers=2 backbone rows)"),
+        "the row rule holds for the tiny plan:\n{report}"
+    );
+    assert!(report.contains("audit:"), "the audit ran:\n{report}");
+    assert!(
+        report.contains("seam:"),
+        "the seam labels are in the run:\n{report}"
+    );
 }

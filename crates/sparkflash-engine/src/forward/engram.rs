@@ -39,15 +39,18 @@
 //! - The bf16 round trip. The reference casts the looked-up rows to bfloat16 (model.py:320) and the
 //!   write back to the input dtype (model.py:365). This crate's reference pass is f32 throughout, as
 //!   forward/mod.rs states, so the values are the f32 ones.
-//! - The table read. [engram_forward] decodes a whole table under the element limit, because
-//!   [WeightSource] has no partial read. The limit is what turns the released 98 GB table into an
-//!   explicit refusal; paging single rows is what crates/sparkflash-engram's packed store does (see
-//!   [crate::loader]).
+//! - The table read. [engram_forward] pages the rows a chunk looks up through
+//!   [WeightSource::read_ranges] when the source supports it (the CLI's loader does), so the
+//!   released 98 GB tables are read a few rows at a time rather than refused; a source that only
+//!   serves whole tensors keeps the whole-table read under the element limit, which is what turns a
+//!   released-size table into an explicit refusal there.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::{ConfigError, ModelConfig};
+use crate::dtype::DType;
 use crate::linalg::{self, EngineError, ScaleGrid};
+use crate::quant;
 use crate::weights::WeightSource;
 
 /// The id that marks a position taking no part in an n-gram.
@@ -483,6 +486,70 @@ fn read_table(
     Ok(table)
 }
 
+/// Reads only the rows a chunk looks up, when the source can page the table.
+///
+/// The table is [rows, width] F8E4M3 with one E8M0 scale per 32 columns of each row, so row `id`
+/// occupies `width` weight bytes and `width.div_ceil(32)` scale bytes of the two stored tensors.
+/// Those are the plan's pinned storage rules for the table (loader.rs, tensor.rs), not something a
+/// caller may vary: a source that reported a different dtype would be decoded wrongly, which is why
+/// the paged path is only taken through a plan-verified source.
+/// Returns `None` when the source serves whole tensors only (the caller falls back to
+/// [read_table]); otherwise the decoded rows in sorted-id order plus the id-to-slot map the lookup
+/// needs, or the error that stopped the paging read.
+type PagedTable = Option<Result<(Vec<f32>, BTreeMap<usize, usize>), EngineError>>;
+
+fn read_paged_table(
+    prefix: &str,
+    src: &dyn WeightSource,
+    ids: &BTreeSet<usize>,
+    width: usize,
+) -> PagedTable {
+    let scale_width = width.div_ceil(32);
+    let weight_name = format!("{prefix}.engram.embed.weight");
+    let scale_name = format!("{prefix}.engram.embed.scale");
+    let weight_ranges: Vec<(u64, usize)> = ids
+        .iter()
+        .map(|&id| (id as u64 * width as u64, width))
+        .collect();
+    let scale_ranges: Vec<(u64, usize)> = ids
+        .iter()
+        .map(|&id| (id as u64 * scale_width as u64, scale_width))
+        .collect();
+    let weight_bytes = match src.read_ranges(&weight_name, &weight_ranges)? {
+        Ok(bytes) => bytes,
+        Err(error) => return Some(Err(error.into())),
+    };
+    let scale_bytes = match src.read_ranges(&scale_name, &scale_ranges)? {
+        Ok(bytes) => bytes,
+        Err(error) => return Some(Err(error.into())),
+    };
+    let mut table = vec![0.0f32; ids.len() * width];
+    let mut slot_of = BTreeMap::new();
+    for (slot, &id) in ids.iter().enumerate() {
+        slot_of.insert(id, slot);
+        let weight = match quant::decode(
+            DType::F8E4M3,
+            &weight_bytes[slot * width..(slot + 1) * width],
+            width,
+        ) {
+            Ok(values) => values,
+            Err(error) => return Some(Err(error.into())),
+        };
+        let scales = match quant::decode(
+            DType::F8E8M0,
+            &scale_bytes[slot * scale_width..(slot + 1) * scale_width],
+            scale_width,
+        ) {
+            Ok(values) => values,
+            Err(error) => return Some(Err(error.into())),
+        };
+        for column in 0..width {
+            table[slot * width + column] = weight[column] * scales[column / 32];
+        }
+    }
+    Some(Ok((table, slot_of)))
+}
+
 /// Reads a dense fp8 weight and applies its 32x32 E8M0 grid.
 ///
 /// # Errors
@@ -585,7 +652,37 @@ pub fn engram_forward(
     let block = layer_index * columns;
     let prefix = format!("layers.{layer}");
 
-    let table = read_table(&prefix, src, rows, width, limit)?;
+    // Which rows this chunk actually looks up. A sentinel position is skipped entirely (the mask),
+    // and the table is read through the paged path when the source can serve ranges: for the
+    // released tables a whole read is 98 GB and a one-token chunk needs a few dozen rows. A chunk
+    // whose every position is a sentinel therefore reads no table at all.
+    let mut wanted: BTreeSet<usize> = BTreeSet::new();
+    for token in 0..seqlen {
+        let row = &hashes[token * stride + block..token * stride + block + columns];
+        if row.contains(&HASH_SENTINEL) {
+            continue;
+        }
+        for &id in row {
+            let index = id as usize;
+            if index >= rows {
+                return Err(EngineError::Shape {
+                    what: prefix.clone(),
+                    detail: format!(
+                        "hash id {index} is outside the {rows}-row Engram table: the bucket layout and the planned rows disagree"
+                    ),
+                });
+            }
+            wanted.insert(index);
+        }
+    }
+    let (table, slot_of) = match read_paged_table(&prefix, src, &wanted, width) {
+        Some(result) => {
+            let (table, slot_of) = result?;
+            (table, Some(slot_of))
+        }
+        None if wanted.is_empty() => (Vec::new(), Some(BTreeMap::new())),
+        None => (read_table(&prefix, src, rows, width, limit)?, None),
+    };
     let out_width = dim * (hc + 1);
     let fetched_width = columns * width;
     let wkv = read_dense(
@@ -636,8 +733,20 @@ pub fn engram_forward(
                     ),
                 });
             }
-            fetched[column * width..(column + 1) * width]
-                .copy_from_slice(&table[index * width..(index + 1) * width]);
+            let at = match &slot_of {
+                Some(slots) => {
+                    slots
+                        .get(&index)
+                        .copied()
+                        .ok_or_else(|| EngineError::Shape {
+                            what: prefix.clone(),
+                            detail: format!("the paged Engram read has no row for hash id {index}"),
+                        })?
+                        * width
+                }
+                None => index * width,
+            };
+            fetched[column * width..(column + 1) * width].copy_from_slice(&table[at..at + width]);
         }
         linalg::matmul(&mut kv, &fetched, &wkv, out_width, fetched_width, 1)?;
         let (key, value) = kv.split_at(hc * dim);
@@ -1492,5 +1601,85 @@ mod tests {
         );
         assert_eq!(two_layout.multipliers[1], layout.multipliers[0]);
         assert_ne!(two_layout.multipliers[0], two_layout.multipliers[1]);
+    }
+
+    /// The paged read must produce exactly what the whole-table read produces. The wrapper refuses
+    /// every whole-tensor read of the two Engram tables (like the CLI's loader does), so a fallback
+    /// would fail the test instead of silently taking the other path.
+    struct PagedEngram<'a> {
+        inner: &'a Hand,
+    }
+
+    impl WeightSource for PagedEngram<'_> {
+        fn names(&self) -> Vec<String> {
+            self.inner.names()
+        }
+
+        fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
+            self.inner.spec(name)
+        }
+
+        fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+            if name.ends_with(".engram.embed.weight") || name.ends_with(".engram.embed.scale") {
+                return Err(WeightError::Refused {
+                    name: name.to_owned(),
+                    detail: "the paged test source serves these tables by range only".to_owned(),
+                });
+            }
+            self.inner.read(name)
+        }
+
+        fn read_ranges(
+            &self,
+            name: &str,
+            ranges: &[(u64, usize)],
+        ) -> Option<Result<Vec<u8>, WeightError>> {
+            let table = self.inner.read(name).expect("the test holds the table");
+            let mut out = Vec::new();
+            for &(offset, len) in ranges {
+                let start = offset as usize;
+                out.extend_from_slice(&table[start..start + len]);
+            }
+            Some(Ok(out))
+        }
+    }
+
+    #[test]
+    fn the_paged_table_read_is_the_whole_table_read() {
+        let cfg = test_config();
+        let layer = cfg.engram_layer_ids[0];
+        let width = cfg.engram_head_dim;
+        let columns = hash_columns(&cfg);
+        let rows = cfg.engram_num_embeddings[0];
+        let hand = engram_source(&cfg, |row, column| {
+            ((row * 31 + column * 7) % 29) as f32 / 7.0 - 2.0
+        });
+        // Two tokens, no sentinel: ids chosen inside the table.
+        let hashes: Vec<u32> = (0..2 * columns)
+            .map(|at| ((at * 97 + 13) % rows) as u32)
+            .collect();
+        let seqlen = 2;
+        let base: Vec<f32> = (0..seqlen * cfg.hc_width())
+            .map(|at| 1.0 + at as f32)
+            .collect();
+        let mut whole = base.clone();
+        let mut paged = base.clone();
+        let ran_whole = engram_forward(&cfg, layer, &mut whole, &hashes, &hand, 1 << 22)
+            .expect("the whole-table read runs");
+        let ran_paged = engram_forward(
+            &cfg,
+            layer,
+            &mut paged,
+            &hashes,
+            &PagedEngram { inner: &hand },
+            1 << 22,
+        )
+        .expect("the paged read runs");
+        assert!(ran_whole);
+        assert!(ran_paged);
+        assert_eq!(
+            whole, paged,
+            "{seqlen} tokens of width {width} must be identical whether the {rows}-row table was read whole or row by row"
+        );
     }
 }

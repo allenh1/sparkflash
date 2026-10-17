@@ -76,6 +76,21 @@ impl WeightSource for CountingSource {
             .insert(name.to_owned());
         self.inner.read(name)
     }
+
+    fn read_ranges(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Option<Result<Vec<u8>, WeightError>> {
+        // A paged Engram read is a read of the named tensor, so the audit records it exactly like a
+        // whole read; otherwise a paged run would look like it never touched the table.
+        let result = self.inner.read_ranges(name, ranges)?;
+        self.reads
+            .lock()
+            .expect("the audit set is not poisoned")
+            .insert(name.to_owned());
+        Some(result)
+    }
 }
 
 /// Runs one token through the engine and returns the Phase 1 report.

@@ -3,7 +3,8 @@
 use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::report::{SEAM_LABELS, SMALL_SHAPE_LIMIT, WeightClass, one_token_report};
 use sparkflash_engine::synthetic::SyntheticWeights;
-use sparkflash_engine::tensor::TensorPlan;
+use sparkflash_engine::tensor::{TensorPlan, TensorSpec};
+use sparkflash_engine::weights::{WeightError, WeightSource};
 
 /// The released layer counts at small shapes: forty backbone layers and three MTP stages, so the
 /// row rule is checked at the shape the roadmap states instead of at [ModelConfig::tiny].
@@ -245,5 +246,79 @@ fn a_numbers_class_run_refuses_non_finite_logits_from_a_byte_source() {
     assert!(
         error.to_string().contains("not finite"),
         "the refusal names the non-finite logits: {error}"
+    );
+}
+
+/// A source that serves the Engram tables by range, like the CLI's loader, and refuses them whole.
+/// The wrapped synthetic source is the only one a host without the checkpoint can use, so this is
+/// the end-to-end check that the paged path and the report's audit agree with the whole-table path.
+struct PagedSynthetic {
+    inner: SyntheticWeights,
+}
+
+impl WeightSource for PagedSynthetic {
+    fn names(&self) -> Vec<String> {
+        self.inner.names()
+    }
+
+    fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
+        self.inner.spec(name)
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+        if name.ends_with(".engram.embed.weight") || name.ends_with(".engram.embed.scale") {
+            return Err(WeightError::Refused {
+                name: name.to_owned(),
+                detail: "the paged test source serves these tables by range only".to_owned(),
+            });
+        }
+        self.inner.read(name)
+    }
+
+    fn read_ranges(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Option<Result<Vec<u8>, WeightError>> {
+        let table = self
+            .inner
+            .read(name)
+            .expect("the synthetic source holds the table");
+        let mut out = Vec::new();
+        for &(offset, len) in ranges {
+            let start = offset as usize;
+            out.extend_from_slice(&table[start..start + len]);
+        }
+        Some(Ok(out))
+    }
+}
+
+#[test]
+fn a_paged_engram_run_reports_exactly_what_the_whole_table_run_reports() {
+    let mut config = released_depth();
+    config.engram_layer_ids = vec![1, 14];
+    config.engram_num_embeddings = vec![1024, 1024];
+    let plan = TensorPlan::language_model(&config);
+    let whole = one_token_report(
+        &config,
+        Box::new(SyntheticWeights::from_plan(&plan, 83)),
+        SMALL_SHAPE_LIMIT,
+        0,
+        WeightClass::Bytes,
+    )
+    .expect("the whole-table engram run reports");
+    let paged = one_token_report(
+        &config,
+        Box::new(PagedSynthetic {
+            inner: SyntheticWeights::from_plan(&plan, 83),
+        }),
+        SMALL_SHAPE_LIMIT,
+        0,
+        WeightClass::Bytes,
+    )
+    .expect("the paged engram run reports; the table is refused whole, so a fallback fails here");
+    assert_eq!(
+        whole, paged,
+        "the two table reads must produce the same rows, seams and audit"
     );
 }
