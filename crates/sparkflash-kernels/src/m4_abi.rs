@@ -93,7 +93,7 @@
 //! A-1; each of the three fixtures carries the `#include <stdint.h>` its own types need, because it
 //! stands in front of the header's own includes - the text pinned in the test is the text nvcc
 //! compiles, and all three compile to the baseline cubin, 70432 / 4 / 605321041ac5ec1e, measured in the CUDA
-//! 12.9.1 container - so reading them as a poll was a false rejection; round-15 A-2 found the claim
+//! 13.0.3 container - so reading them as a poll was a false rejection; round-15 A-2 found the claim
 //! had been measured on a differently placed fixture and made the fixtures self-contained).
 //!
 //! INSIDE THE HELPER'S BODY the rule is one line (round 17: round 16 stated it wrongly and this is the
@@ -7378,7 +7378,7 @@ __threadfence();
     /// The shapes the round-8 review named, pinned one by one.
     ///
     /// Every rejection here is a shape nvcc compiles to FEWER barriers than the committed baseline,
-    /// and every acceptance is one it compiles to the baseline cubin byte for byte (nvcc 12.9.1,
+    /// and every acceptance is one it compiles to the baseline cubin byte for byte (nvcc 13.0.3,
     /// sm_121a, measured in the container: 70432 bytes, 4 PTX membar lines, sha256 605321041ac5ec1e), so an
     /// unnecessary rejection and a real hole both surface as a failing assertion here rather than as a
     /// claim in a comment.
@@ -9746,7 +9746,7 @@ __threadfence();
         );
         // Round-14 A-1: the poll this lint follows is the HELPER's own, so plumbing that names the
         // raw poll cannot hijack it. nvcc compiles each of these three headers to the baseline cubin
-        // (70432 bytes / 4 PTB membar lines / sha 605321041ac5ec1e, measured in the CUDA 12.9.1
+        // (70432 bytes / 4 PTB membar lines / sha 605321041ac5ec1e, measured in the CUDA 13.0.3
         // container), which is why reading them as a poll was a false rejection and not a
         // conservative one.
         // Each fixture carries the include its own types need, because it stands in front of the
@@ -12916,7 +12916,7 @@ __threadfence();
     /// Round-18 C, widened in round 19: every text this module quotes a cubin for is stored, and each
     /// file in EACH store is byte-identical to the text the tests build. A number can therefore always
     /// be traced to a text: the name in the documentation is the file name, the file is the builder's
-    /// own bytes, and the cubin beside it is the one measured on those bytes in the CUDA 12.9.1
+    /// own bytes, and the cubin beside it is the one measured on those bytes in the CUDA 13.0.3
     /// container. The generator's store is the one the container read; the builder's store is the one
     /// the tests build. Checking both is what keeps them from drifting apart.
     #[test]
