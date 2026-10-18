@@ -81,11 +81,11 @@ pub struct PrefixMatchPlan {
     pub nvme_restored_tokens: usize,
     /// Whether the exact 128-token SWA tail at `global_kv_cached_tokens` was in the ring.
     pub swa_tail_hit: bool,
-    /// Tokens replayed through encoder layers 0..19 to rebuild sliding-window KV.
+    /// Tokens replayed through encoder layers 0..=20 to rebuild sliding-window KV.
     pub encoder_swa_replay_tokens: usize,
     /// Uncached suffix that must run the full encoder.
     pub uncached_suffix_tokens: usize,
-    /// Tokens at the end of the prompt that must run decoder layers 20..39.
+    /// Tokens at the end of the prompt that must run decoder layers 21..=39.
     pub decoder_swa_replay_tokens: usize,
 }
 

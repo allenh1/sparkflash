@@ -22,6 +22,8 @@
 //!   device rather than hardcoded, plus the promotion/demotion policy that joins them;
 //! * crate::fp4 is the weight-free reference codec that defines the 356-byte entry layout
 //!   behind the specification's 890 bytes per token;
+//! * crate::schedule is the CED prefill/decode split as data: the encoder/decoder boundary,
+//!   the 40-row layer mode/source table and the kernel handle publication order;
 //! * crate::swa is the 128-slot prefix-tail ring and the bounded-replay accounting;
 //! * crate::cache wires them together. Its replay methods hold only the SWA lock, and the
 //!   store refuses a global-KV write from a replaying thread on both the publish path and
@@ -38,6 +40,7 @@ pub mod fp4;
 pub mod layout;
 pub mod plan;
 pub mod radix;
+pub mod schedule;
 pub mod swa;
 pub mod telemetry;
 pub mod tier;
@@ -73,6 +76,10 @@ pub use layout::{
 };
 pub use plan::{KvCacheStatsSnapshot, KvCacheTelemetry, PrefixMatchPlan};
 pub use radix::{InsertOutcome, NodeId, PrefixMatch, RadixTree, block_hash};
+pub use schedule::{
+    CedSchedule, DECODER_FIRST_LAYER, ENCODER_LAST_LAYER, LayerSchedule, Publication,
+    PublishedHandle, ScheduleError, ced_schedule,
+};
 pub use swa::{
     ALL_SWA_LAYERS, ReplayKind, ReplayOutcome, SwaProducer, SwaTail, SwaTailRing, TailId, tail_hash,
 };

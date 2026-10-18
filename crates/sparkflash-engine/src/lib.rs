@@ -26,6 +26,9 @@
 //!   reader that has the index can describe 96,085 tensors without opening a 510 GB checkpoint.
 //! - [`loader`]: the checkpoint opened against the plan - verified shard by shard, then read one
 //!   tensor at a time, with the two conversions convert.py performs and the Engram tables refused.
+//! - [`sequence_fixture`]: the Phase 2 sequence fixture - the host reference's prompt, prompt
+//!   length + decode steps, compared positions, per-step tokens and logits digests, plus the
+//!   token-first comparison the device path is held to.
 //!
 //! Nothing here allocates a model-sized buffer or touches a device. The one module that opens a
 //! checkpoint, [`loader`], reads headers first and then a single tensor at a time, under a limit.
@@ -41,6 +44,7 @@ pub mod loader;
 pub mod quant;
 pub mod report;
 pub mod safetensors;
+pub mod sequence_fixture;
 pub mod synthetic;
 pub mod tensor;
 pub mod weights;
@@ -49,6 +53,12 @@ pub use config::ModelConfig;
 pub use dtype::DType;
 pub use layer_plan::{
     AttentionGeometry, CompressionKind, LayerMode, LayerPlan, LayerSpec, PlanError,
+};
+pub use sequence_fixture::{
+    CompareError, DeviceStep, FixtureError, FixtureProvenance, FixtureSource, FixtureStep,
+    FixtureWeightKind, FixtureWeights, KvRowDigest, KvRowKind, LogitsCapture, SequenceFixture,
+    compare_logits, compare_steps, compared_positions, deterministic_prompt, exclusion_boundary,
+    generate_fixture,
 };
 pub use tensor::{TensorPlan, TensorSpec};
 pub use weights::{TensorView, WeightError, WeightSource};
