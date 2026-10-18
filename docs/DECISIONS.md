@@ -28,7 +28,8 @@ records the evidence and the consequence for the build. Research backing is in
 | D17 | Qualification state | Nine gates recorded with instrument, command, artifact and state; five cannot be run by any command in this tree, and 20 us at 10 KiB is the requirement while the preflight's 22 us is a deliberately looser readiness threshold |
 | D18 | The engine is a ninth crate, and the plan describes the checkpoint as stored | `crates/sparkflash-engine`; the plan is derived from the configuration and then checked against the index, and the load-time conversions (wo_a, the int8 view of FP4) belong to the loader, not the plan |
 | D21 | The determinism contract | D-a kernel determinism, D-b reduction determinism and D-c no assumed cross-boundary equality are written down here and cited by the M7 harness; a test fails if either half disappears |
-| D22 | Released mHC arithmetic | The ref, the kernel and the harness model the released arithmetic end to end (projection rstd, `mix*scale+base`, sigmoid pre/post, released split-Sinkhorn, raw C, `X_hat` block norm); the stream-mean fold is the one structural difference, named rather than implied |
+| D22 | Released mHC arithmetic | The ref, the kernel and the harness model the released arithmetic end to end (projection rstd, `mix*scale+base`, sigmoid pre/post, released split-Sinkhorn, raw C, `X_hat` block norm, released `[24, n*d]` predictor); B0 removed the stream-mean fold from both sides, so the old structural difference is gone |
+| D23 | The activation quantiser is the reference ceil rule | Device activation quantisers take the smallest power of two at or above `amax/448` after the 1e-4 amax floor (the engine's `quantize_activation_fp8` rule); the checkpoint weight-grid rule stays floor-log2 and the two helpers are named apart (D8) |
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
 summary and the matching `## D<n>` section carries the evidence and the full consequence. If a row and
@@ -924,4 +925,111 @@ code by D21 with its N = 100 device run owed; unknowns 3, 5 and 8-16 are untouch
 2026-10-17 the node's resident model held the only usable CUDA context (roadmap sections 3.2 and 3.6
 record the refusal), so the only device numbers are the pre-change ones in roadmap section 12.1,
 labelled as such.
+
+
+**Update (B0, 2026-10-18): the stream-mean fold is gone, so the structural difference this entry
+named no longer exists.** The kernel's B0 inner loop consumes the released `[24, n*d]` predictor
+rows and projects them over the flattened four-copy stream; the harness no longer averages the four
+copies, and `mega_mhc_ref::released_predictor_into_kernel_rows` permutes the released rows into the
+kernel's B/A/C row order on both sides. The retired `fold_predictor_into_kernel_rows` path survives
+only in stage 0's non-vacuity half, where it is computed explicitly to show the gap it used to
+leave. Measured on the engine's captured row 0 (device log
+`/home/user/phase1-evidence/phase1-d8-stage0-quantiser-20261018T012533Z.log`): the released
+projection reproduces the captured `hc_*_pre/post/comb` tensors to a worst absolute delta of
+5.96e-8 against a 1e-5 bar, while the retired fold misses them by 5.03e-1 / 1.71 / 9.07e-1 (attn
+pre/post/comb) and 6.66e-1 / 9.16e-1 / 8.76e-1 (ffn). Stage 1 on the node (same window) then passes
+at layers 0, 1 and 4 with 4 of 4 tokens each, the FP8 codes and ue8m0 scales at layers 0, 1 and 4 on 4 of 4 tokens each: layer 0 token 0
+matches 5,119/5,120 codes (one one-code difference at index 615, scales 160/160 bit-exact) and
+tokens 1-3 match 5,120/5,120 codes and 160/160 scales; layer 1 matches 5,120/5,120 codes and
+160/160 scales at every token; layer 4 token 0 matches 5,118/5,120 codes (two one-code
+differences, scales exact) and its other tokens match everything. Where a code differs the
+residual is the known fixed-order vs sequential `1/rms` reduction difference, inside the
+stage-1 bar. The
+"one structural difference" consequence above and the "device runs are owed" note at its end are
+both superseded by these runs.
+
+---
+
+## D23 - The activation quantiser is the reference ceil rule, and it is named apart from the weight-grid rule
+
+Recorded 2026-10-18 (Lead decision D8, from the B1 probe finding).
+
+**Evidence.** The released forward has exactly one *dynamic activation* scale rule
+(`inference/kernel.py:36-37, 76-80`; the engine's `quant::e8m0_encode_ceil` and
+`quant::quantize_activation_fp8`): floor the block's amax at 1e-4, multiply by 1/448 in f32, then
+round the scale exponent **up** - one higher when the product's mantissa is nonzero - giving the
+smallest power of two at or above `amax/448`. The checkpoint's stored *weights* use a different
+rule (`ue8m0_from_amax`: `floor(log2(amax)) - element_emax`), and the two are not interchangeable:
+on an activation whose amax lies above `1.75 * 2^floor(log2 amax)` the weight-grid rule picks a
+scale one binade too small. The B1 probe caught the consequence: `swiglu_mxfp8_quant_sm121` was
+10.16% exact on E4M3 codes and 0/80 on scales against the reference, with a maximum code delta of
+24, caused by `spark_mx_quantize_block -> spark_ue8m0_from_amax(amax, 8u)`; the same rule was in
+the mHC kernel's `X_hat` quantiser.
+
+**Decision.** Device activation quantisers use the ceil rule, and the two rules are separate,
+explicitly named helpers so a future caller cannot pick the wrong one:
+
+- `kernels/m4_activation_quant_sm121.cuh` carries `spark_act_quant_scale_code` (amax floor
+  inside the helper, ceil exponent, ue8m0 clamps) and the `SPARK_M4_ACT_*` constants. It is a
+  separate header rather than an addition to `m4_common_sm121.cuh` because that header's bytes are
+  the input to the pinned measured-text evidence in `m4_abi` (one substitution per stored text, each
+  with a measured cubin): changing it would invalidate that whole table. The common header was
+  therefore left byte-identical; it still describes `spark_ue8m0_from_amax` and
+  `spark_quantize_row_e4m3` under their general OCP MX wording and still calls that rule the
+  OCP MX rule. The separation is carried by the activation header name and docs, by the kernel
+  call sites, and by the tests below, NOT by a common-header comment edit. A future
+  common-header edit must regenerate the measured-text table first.
+- `kernels/mega_mhc_sm121.cu`'s `X_hat^FP8` block quantiser and
+  `kernels/swiglu_mxfp8_quant_sm121.cu`'s activation quantiser (both entry points, SwiGLU output
+  and `mxfp8_quantize_activations_sm121`) call the activation helper. The weight-grid
+  `spark_quantize_row_e4m3` in the common header is NOT edited (see the previous bullet): it
+  keeps its general OCP MX doc, and nothing on the activation path calls it.
+- `crates/sparkflash-kernels/src/mega_mhc_ref.rs` and `swiglu_ref.rs` use `m4_quant`'s
+  `act_quant_scale_code` (total: inf takes code 254, NaN falls to the 1e-4 floor) or
+  `act_quant_fp8_row`; both modules' docs and tests state the ceil rule, and the old floor-rule
+  helper is deleted from `swiglu_ref`. The D8 review (B1) found these two refs still routing an
+  infinite amax through the fast_pow2 pair, which panics; `act_quant_scale_code` is the single
+  total path now, and `crates/sparkflash-cli/tests/activation_quantiser_equivalence.rs` compares
+  it with the engine rule on inf, NaN, powers of two, subnormals and the 1e-4 floor.
+- `m7_layer0 --stage 0` gained the cross-check the measurement needs: it recomputes row 0's
+  `pre_attention_xhat/scales` and `pre_ffn_xhat/scales` from the row's own captured f32 block
+  inputs with the ceil rule and requires every code and scale to match the engine's captured
+  tensors; the retired floor rule is printed on the same bytes, unjudged.
+
+**Consequence and device evidence (node node0, 2026-10-18, window held open for B0/B1/D8).**
+Rebuilt with the pinned nvcc V13.0.88 from the CUDA 13.0.1 devel image (`7d2f6a8c2071`; the
+build log records `CUDA Version 13.0.1`; the CI `cuda-abi` image is CUDA 13.0.3). The changed
+cubins are
+`mega_mhc_fused_bf16_sm121` 70,312 B sha256 `e21293e3...` and `swiglu_mxfp8_quant_sm121` 21,776 B
+sha256 `4dbef63b...`; dense, wo_a, mxfp4_moe, flash_mla and cert_lm_head are byte-identical, so the
+baseline diff is those two lines only:
+
+- stage 0: ceil-rule recomputation reproduces 5,120/5,120 codes and 160/160 scales for both block
+  inputs; the retired floor rule would give 4,288/5,120 codes + 134/160 scales (attention) and
+  4,096/5,120 + 128/160 (ffn); projection check unchanged at 5.96e-8. PASS.
+- stage 8: all four probes bit-exact - dense 16,384/16,384 and wo_a 8,192/8,192 (ULP 0), swiglu
+  4x640 codes 2,560/2,560 + scales 80/80, swiglu 2x2304 codes 4,608/4,608 + scales 144/144. The
+  same probe bytes were 10.16% / 0% exact before the fix (max code delta 24). PASS.
+- stage 1: PASS 4/4 tokens at layers 0, 1 and 4; layer 0 token 0 is 5,119/5,120 codes (one
+  one-code difference) with 160/160 scales exact, layer 0 tokens 1-3 are 5,120/5,120 codes and
+  160/160 scales, layer 1 is 5,120/5,120 codes and 160/160 scales at every token, and layer 4
+  token 0 is 5,118/5,120 codes (two one-code differences, scales exact) with its other tokens
+  exact. `phase1-d8-stage1-layer0-20261018T012545Z.log` shows the old floor-rule behaviour
+  (4,287/5,120 codes, 134/160 scales on token 0) but its header records the NEW binary and new
+  cubin sha256s, so it is NOT evidence that the pre-D8 cubin was installed; a correctly labelled
+  OLD-VS-NEW run using the retained
+  pre-D8 floor-rule cubin `b0-out/mega_mhc_fused_bf16_sm121.cubin` (70,152 B sha256
+  `6487f6ff...`, the B0 released-projection build) and the old binary
+  `m7_layer0-b0` (09cf261f...) against it as an OLD-VS-OLD control; both are on the node or in
+  the evidence directory and both runs are device-window items.
+- stages 2 and 3 re-run unchanged (attention within tolerance, MoE combine 20,480/20,480 exact), so
+  the rebuild did not disturb the other boundaries.
+
+Logs are in `/home/user/phase1-evidence/` (`phase1-d8-*`), cubins and the baseline diff in
+`d8-out/`. The stage-1 and stage-2 logs cited in this entry were produced before the M2 fix of their
+printed comparison-class strings (they print the retired stream-mean fold as the predictor);
+regenerating them is a device-window item, and until then their numbers are cited from the
+captured bytes and not as current evidence. The Phase 1 consequence: the two activation-quantised boundary tensors are now produced
+by the reference rule, so the row-0 boundary diff in B2 can attribute a code mismatch to the
+number's own rounding rather than to a known rule defect.
 

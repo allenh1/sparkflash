@@ -39,21 +39,26 @@
 // so the two readings differ for a negative gate beyond the limit. The asymmetry is reproduced here
 // deliberately, and a host test in src/swiglu_ref.rs fails if the kernel text loses it.
 //
-// THE QUANTISE RECIPE IS THE SHIPPED ONE. mega_mhc_sm121.cu lines 243-249 quantise their activation
-// for the same consuming kernels: amax over the 32-value block, spark_ue8m0_from_amax(amax, 8) for
-// the scale (8 because E4M3's top magnitude is 1.75 * 2^8 = 448), 1 / scale, then
-// spark_fp8_e4m3_encode. Mirroring that recipe rather than inventing one is the point: the operand
-// has to be the operand the consuming kernel was proven on.
+// THE QUANTISE RECIPE IS THE REFERENCE'S ACTIVATION RULE, NOT THE WEIGHT-GRID RULE. Both output
+// operands are ACTIVATIONS (the routed experts' SwiGLU result consumed by w2, and the shared
+// expert's input consumed by w1/w3), so the scale is the reference's act_quant rule
+// (kernel.py:36-37, 76-80; engine quant::e8m0_encode_ceil): amax over the 32-value block floored at
+// 1e-4, times 1/448 in f32, exponent rounded UP to the next power of two, then
+// spark_fp8_e4m3_encode(value / scale). The checkpoint weight-grid rule
+// (spark_ue8m0_from_amax, floor(log2(amax)) - emax) is for stored weights only: on an activation it
+// under-scales every block whose amax lies above 1.75 * 2^floor(log2 amax), and the operand then
+// differs from the one the engine's act_quant produced.
 //
 // LAYOUT. One warp owns one 32-value block, so a block scale is a shuffle reduction and no shared
 // memory is needed. Every lane of a warp is active because a block is exactly 32 wide.
 
 #include "m4_common_sm121.cuh"
+#include "m4_activation_quant_sm121.cuh"
 
-// One MX block's scale and one value's code, for a warp that owns the whole 32-value block: the
-// amax is a butterfly reduction across the warp, lane 0 writes the scale, and every lane encodes its
-// own value against it.
-__device__ __forceinline__ uint8_t spark_mx_quantize_block(
+// One MX activation block's scale and one value's code, for a warp that owns the whole 32-value
+// block: the amax is a butterfly reduction across the warp, lane 0 writes the scale, and every lane
+// encodes its own value against the reference's activation scale.
+__device__ __forceinline__ uint8_t spark_activation_quantize_block(
     float value,
     uint32_t lane,
     uint8_t *__restrict__ scale_out) {
@@ -61,11 +66,12 @@ __device__ __forceinline__ uint8_t spark_mx_quantize_block(
     for (int offset = 16; offset > 0; offset >>= 1) {
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, offset));
     }
-    const uint8_t scale = spark_ue8m0_from_amax(amax, 8u);
+    // THE ACTIVATION RULE: the reference floors amax at 1e-4 and rounds the scale exponent up.
+    const uint8_t scale = spark_act_quant_scale_code(amax);
     if (lane == 0u) {
         *scale_out = scale;
     }
-    return spark_fp8_e4m3_encode(value * (1.0f / spark_ue8m0_decode(scale)));
+    return spark_fp8_e4m3_encode(value / spark_ue8m0_decode(scale));
 }
 
 extern "C" __global__ void swiglu_mxfp8_quant_sm121(
@@ -102,7 +108,7 @@ extern "C" __global__ void swiglu_mxfp8_quant_sm121(
     const float clamped_up = fminf(fmaxf(u, -limit), limit);  // both sides
     const float activated = (clamped_gate / (1.0f + __expf(-clamped_gate))) * clamped_up;
 
-    out_fp8[index] = spark_mx_quantize_block(
+    out_fp8[index] = spark_activation_quantize_block(
         activated,
         lane,
         &out_scales[(uint64_t)row * (uint64_t)blocks_per_row + (uint64_t)block]);
@@ -134,7 +140,7 @@ extern "C" __global__ void mxfp8_quantize_activations_sm121(
     const uint32_t block = (uint32_t)(warp % blocks_per_row);
     const uint64_t index = (uint64_t)row * (uint64_t)cols + (uint64_t)block * 32u + (uint64_t)lane;
 
-    out_fp8[index] = spark_mx_quantize_block(
+    out_fp8[index] = spark_activation_quantize_block(
         __bfloat162float(values[index]),
         lane,
         &out_scales[(uint64_t)row * (uint64_t)blocks_per_row + (uint64_t)block]);

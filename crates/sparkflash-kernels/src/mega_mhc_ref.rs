@@ -27,11 +27,11 @@
 //!
 //! H is under-specified by the specification, which fixes its output shapes (n*n + 2n = 24 rows plus
 //! the accumulators) but not the internals. This module states the project's reading explicitly and
-//! implements it: the 24 predictor rows are applied to the mean over the four streams, in the
-//! RELEASED row order pre(0..n) / post(n..2n) / comb(2n..2n+n*n) folded into this reference's
-//! kernel order by [`fold_predictor_into_kernel_rows`]; the first 16 kernel rows become the 4x4
-//! mixer B, the next 4 the input mix A and the last 4 the block-output weight C. How they are
-//! activated and normalised is not this module's choice: the released model uses
+//! implements it: the released (n*n + 2n) x (n*d) prediction matrix, whose rows are the released
+//! pre(0..n) / post(n..2n) / comb(2n..2n+n*n) rows permuted into this reference's kernel order by
+//! [`released_predictor_into_kernel_rows`]; the first 16 kernel rows become the 4x4 mixer B, the
+//! next 4 the input mix A and the last 4 the block-output weight C. How they are activated and
+//! normalised is not this module's choice: the released model uses
 //! `sigmoid(...) + hc_eps`, `2*sigmoid(...)` and the released split-Sinkhorn schedule, and an
 //! earlier version of this file softmaxed A and C and ran a generic Sinkhorn-Knopp on B. Those were
 //! semantic differences, not refinements; the released arithmetic is implemented by
@@ -121,11 +121,13 @@
 //!   X_hat's sum of squares over `d` and `norm_eps` (model.py:984, 991), not the streams' sum
 //!   over `n*d`, and not the Sinkhorn epsilon.
 //!
-//! The one remaining difference is structural rather than arithmetic: the predictor is the folded
-//! `[24, d]` matrix applied to the stream mean, while the release projects the flattened
-//! `[24, n*d]` stream (see [`fold_predictor_into_kernel_rows`]). Closing that needs a kernel that
-//! projects all four copies, which is a Phase-1 decision; no entry point in this file pretends the
-//! fold is the release's projection.
+//! The predictor used to be the folded `[24, d]` matrix applied to the stream mean, which is the
+//! release's flattened `[24, n*d]` projection divided by the copy count when the copies are equal.
+//! **B0 (2026-10) closed that difference**: every entry point now takes the released `[24, n*d]`
+//! predictor (rows permuted into kernel order, NOT averaged; see
+//! [`released_predictor_into_kernel_rows`]) and projects all four copies, and there is no fold
+//! helper left to silently reintroduce it. `kernels/mega_mhc_sm121.cu` took the same change in the
+//! same window. Pre-B0 stage-1 device runs measured the folded semantics; those numbers are retired.
 //!
 //! ## Entry points
 //!
@@ -141,14 +143,14 @@
 //! takes `hc_scale` [3] and `hc_base` [24] in this reference's row order, applies the projection
 //! rstd, the group scale and the bias, the sigmoid pre/post and the released split-Sinkhorn, and
 //! publishes the 26 accumulated statistics (the 24 projection rows plus the two RMS statistics) so
-//! the host can compare the whole coefficient chain raw. `examples/m7_layer0.rs` folds the
-//! released rows with [`fold_predictor_into_kernel_rows`], passes the bias through
-//! [`bias_into_kernel_rows`], passes the scale itself, and no longer pre-folds it into the
-//! predictor (doing both would apply it twice). The fold itself is the structural difference above,
-//! so a device-vs-reference comparison is an internal-consistency check of the released arithmetic,
-//! not yet a released-model bit comparison.
+//! the host can compare the whole coefficient chain raw. `examples/m7_layer0.rs` permutes the
+//! released rows into kernel order with [`released_predictor_into_kernel_rows`] (no averaging),
+//! passes the bias through [`bias_into_kernel_rows`], passes the scale itself, and no longer
+//! pre-folds it into the predictor (doing both would apply it twice). With the full released
+//! projection on both sides, a device-vs-reference comparison at stage 1 is now a comparison of the
+//! released arithmetic (modulo per-tile reduction order), not of a folded approximation.
 
-use crate::m4_quant::{E4M3_ELEMENT_EMAX, QUANT_BLOCK, fp8_e4m3_encode, ue8m0_from_amax};
+use crate::m4_quant::{QUANT_BLOCK, act_quant_scale_code, fp8_e4m3_encode};
 
 /// The hidden width. Mirrors SPARK_M4_HIDDEN.
 pub const HIDDEN: usize = 5120;
@@ -441,34 +443,39 @@ pub struct Coefficients {
     pub c: [f32; HC_MULT],
 }
 
-/// The 24 raw predictor logits: one dot product per row against the mean of the four streams.
+/// The 24 raw predictor logits: one dot product per row against the FLATTENED `n*d` stream
+/// (released `F.linear(x.flatten(2), hc_fn)`, model.py:951-954).
 ///
 /// Raw is the point: the released model multiplies these numbers by hc_scale, adds hc_base and only
 /// then applies its non-linearities, so the bias and scale paths ([`h_of_with_bias`],
-/// [`h_of_with_scale`]) need them unactivated and unscaled.
+/// [`h_of_with_scale`]) need them unactivated and unscaled. The projection's
+/// `rsqrt(mean(x^2) + norm_eps)` factor is applied by [`h_of_with_scale`], not here.
 ///
-/// Note what is NOT here: the release also multiplies the projection by
-/// `rsqrt(mean(x^2) + norm_eps)` (model.py:953-954); this reference does not, which is listed as a
-/// remaining difference in the module docs.
+/// The predictor is the released `[PREDICTOR_ROWS][HC_MULT * HIDDEN]` matrix in kernel row order,
+/// produced from the checkpoint by [`released_predictor_into_kernel_rows`]. The accumulation order
+/// is the flattened stream order (copy by copy, then channel), which is the engine reference's
+/// `F.linear` order.
 ///
 /// # Panics
-/// Panics if the predictor is not the folded (n*n + 2n) by d matrix.
+/// Panics if the predictor is not the released (n*n + 2n) by (n*d) matrix.
 fn predictor_rows(registers: &mut Registers, predictor: &[f32]) -> [f32; PREDICTOR_ROWS] {
     assert_eq!(
         predictor.len(),
-        PREDICTOR_ROWS * HIDDEN,
-        "the folded predictor must be (n*n + 2n) by d"
+        PREDICTOR_ROWS * HC_MULT * HIDDEN,
+        "the released predictor must be (n*n + 2n) by (n*d)"
     );
-    // The stream mean, then one dot product per predictor row, all out of the register copy.
+    // One dot product per predictor row over the flattened four-stream input, out of the register
+    // copy: no stream is read twice, and the projection is NOT the folded stream mean.
     let mut rows = [0.0f32; PREDICTOR_ROWS];
     for row in 0..PREDICTOR_ROWS {
         let mut acc = 0.0f32;
         for stream in 0..HC_MULT {
             for i in 0..HIDDEN {
-                acc += registers.read(stream, i) * predictor[row * HIDDEN + i];
+                acc += registers.read(stream, i)
+                    * predictor[row * HC_MULT * HIDDEN + stream * HIDDEN + i];
             }
         }
-        rows[row] = acc / HC_MULT as f32;
+        rows[row] = acc;
     }
     rows
 }
@@ -567,8 +574,10 @@ fn released_post(logits: &[f32]) -> [f32; HC_MULT] {
     core::array::from_fn(|j| 2.0 * sigmoid(logits[j]))
 }
 
-/// H(X_l): the predictor rows applied to the stream mean, then exp + Sinkhorn into B, softmax into A
-/// and into C. The predictor is the folded (n*n + 2n) x d matrix of the kernel, row-major.
+/// H(X_l): the predictor rows applied to the flattened four-copy stream (post-B0; the retired fold
+/// applied them to the stream mean), then exp + Sinkhorn into B, softmax into A and into C. The
+/// predictor is the released (n*n + 2n) x (n*d) matrix in the kernel's B/A/C row order, row-major,
+/// with all four step copies kept: it is NOT averaged over the streams.
 ///
 /// This is the ORIGINAL reading and it is unchanged: no bias, no scale, and A and C are SOFTMAXED,
 /// which is NOT what the released `hc_split_sinkhorn` does (inference/kernel.py:427-429 uses
@@ -586,7 +595,7 @@ fn released_post(logits: &[f32]) -> [f32; HC_MULT] {
 /// last tile while the other tiles wait - which is what the grid rendezvous in the kernel is for.
 ///
 /// # Panics
-/// Panics if the predictor is not the folded (n*n + 2n) by d matrix.
+/// Panics if the predictor is not the released (n*n + 2n) by (n*d) matrix.
 #[must_use]
 pub fn h_of(registers: &mut Registers, predictor: &[f32]) -> Coefficients {
     coefficients_from_rows(&predictor_rows(registers, predictor))
@@ -642,8 +651,8 @@ pub fn scale_into_kernel_rows(hc_scale: &HcScale) -> [f32; PREDICTOR_ROWS] {
     kernel
 }
 
-/// The released checkpoint row that kernel row `kernel_row` comes from, in the fold of
-/// [`fold_predictor_into_kernel_rows`]. Kernel rows are B(0..n*n) / A(n*n..n*n+n) /
+/// The released checkpoint row that kernel row `kernel_row` comes from, in the permutation of
+/// [`released_predictor_into_kernel_rows`]. Kernel rows are B(0..n*n) / A(n*n..n*n+n) /
 /// C(n*n+n..); released rows are pre(0..n) / post(n..2n) / comb(2n..2n+n*n), and the comb terms
 /// transpose because this reference's B is `[destination][source]`.
 fn released_row_into_kernel_row(kernel_row: usize) -> usize {
@@ -659,28 +668,26 @@ fn released_row_into_kernel_row(kernel_row: usize) -> usize {
     }
 }
 
-/// The released `[24, n*d]` predictor folded into this reference's `[24, d]` row order.
+/// The released `[24, n*d]` predictor permuted into this reference's `[24, n*d]` kernel row
+/// order: NO averaging, every stream copy kept.
 ///
-/// The release applies `hc_fn` to the flattened `n*d` stream (model.py:952-954). The kernel and
-/// this reference take the project's fold: each row is averaged over the four copies, so the
-/// projection is applied to the stream mean and costs 24*d multiply-accumulates instead of
-/// 24*n*d (specification 2.4, "RMSNorm weights folded offline into the predictor projection";
-/// docs/architecture/02-mhc.md section 6 step 4). That fold is ONE structural difference from the
-/// release this module does not close: the release's `F.linear` sees all 20480 columns, so a
-/// released-model comparison ultimately needs the full projection, which the kernel's tiled
-/// accumulation does not perform. The arithmetic AROUND the logits - the projection rstd, the
-/// per-group scale, the bias, the sigmoid pre/post and the released split-Sinkhorn - is released.
+/// The release applies `hc_fn` to the flattened `n*d` stream (model.py:952-954), so the reference
+/// and the kernel both project all four copies ([specification 2.4]'s "RMSNorm weights folded
+/// offline into the predictor projection" describes the checkpoint's storage of the projection, not
+/// a d-wide fold). B0 closed the old fold; this function is the ONLY row rearrangement left, and it
+/// must not average: a fold here would silently divide the released projection by the copy count
+/// again, which a test now pins.
 ///
 /// The row ORDER is the checkpoint's: reversed from `pre(0..n) / post(n..2n) / comb(2n..)` into
-/// kernel order, with the comb terms transposed. Folding the rows without this mapping makes the
+/// kernel order, with the comb terms transposed. Permuting the rows without this mapping makes the
 /// kernel apply one group's projection to another group's activation, and a device comparison
-/// cannot catch it because both sides share the fold - a test pins this mapping instead
+/// cannot catch it because both sides share the permutation - a test pins this mapping instead
 /// (docs/build/roadmap-to-serving.md section 10, open unknown 2).
 ///
 /// # Panics
-/// Panics if `released` is not `PREDICTOR_ROWS * HC_MULT * HIDDEN` long or `kernel_rows` is not
-/// `PREDICTOR_ROWS * HIDDEN` long.
-pub fn fold_predictor_into_kernel_rows(released: &[f32], kernel_rows: &mut [f32]) {
+/// Panics if `released` is not `PREDICTOR_ROWS * HC_MULT * HIDDEN` long or `kernel_rows` is not the
+/// same length.
+pub fn released_predictor_into_kernel_rows(released: &[f32], kernel_rows: &mut [f32]) {
     assert_eq!(
         released.len(),
         PREDICTOR_ROWS * HC_MULT * HIDDEN,
@@ -688,19 +695,15 @@ pub fn fold_predictor_into_kernel_rows(released: &[f32], kernel_rows: &mut [f32]
     );
     assert_eq!(
         kernel_rows.len(),
-        PREDICTOR_ROWS * HIDDEN,
-        "the folded predictor is 24 rows by d"
+        PREDICTOR_ROWS * HC_MULT * HIDDEN,
+        "the kernel-order predictor is also 24 rows by n*d: B0 removed the d-wide fold"
     );
     for kernel_row in 0..PREDICTOR_ROWS {
         let released_row = released_row_into_kernel_row(kernel_row);
-        let out = kernel_row * HIDDEN;
-        for column in 0..HIDDEN {
-            let mut sum = 0.0f32;
-            for copy in 0..HC_MULT {
-                sum += released[released_row * HC_MULT * HIDDEN + copy * HIDDEN + column];
-            }
-            kernel_rows[out + column] = sum / HC_MULT as f32;
-        }
+        let out = kernel_row * HC_MULT * HIDDEN;
+        let source = released_row * HC_MULT * HIDDEN;
+        kernel_rows[out..out + HC_MULT * HIDDEN]
+            .copy_from_slice(&released[source..source + HC_MULT * HIDDEN]);
     }
 }
 
@@ -725,7 +728,7 @@ fn apply_scale_then_bias(rows: &mut [f32; PREDICTOR_ROWS], hc_base: &HcBase, hc_
 /// rearrangement, and an all-zero vector reproduces [`h_of`] bit for bit.
 ///
 /// # Panics
-/// Panics if the predictor is not the folded (n*n + 2n) by d matrix.
+/// Panics if the predictor is not the released (n*n + 2n) by (n*d) matrix.
 #[must_use]
 pub fn h_of_with_bias(
     registers: &mut Registers,
@@ -763,6 +766,29 @@ fn coefficient_rstd(sum_squares: f32) -> f32 {
     1.0 / (sum_squares / (HC_MULT * HIDDEN) as f32 + NORM_EPS).sqrt()
 }
 
+/// The f32 block input the kernel now captures through its B0 `xhat_normed` output: the collapsed
+/// input `X_hat` times the RMS weight times `1/rms`, in the KERNEL's multiplication order
+/// (`xhat * weight * inv_rms`). This is the value BEFORE the per-32 quantization whose codes and
+/// scales are [`Counted`] outputs of the layer functions; a comparison can therefore separate the
+/// RMSNorm arithmetic from the quantizer instead of reconstructing the f32 value as
+/// `code * scale`.
+///
+/// It is a capture, not a change to the specification's write set, so it is not counted in
+/// [`TrafficLedger`]: the kernel's write set grew by `d` f32 when the capture was added, and that
+/// is reported in the kernel's payload meta rather than charged to the (2n+2)d stream bound.
+///
+/// # Panics
+/// Panics if `xhat` or `rms_weight` is not `d` wide.
+#[must_use]
+pub fn block_input_normed(xhat: &[f32], rms_weight: &[f32], inv_rms: f32) -> Vec<f32> {
+    assert_eq!(xhat.len(), HIDDEN, "X_hat is d wide");
+    assert_eq!(rms_weight.len(), HIDDEN, "the RMS weight is d wide");
+    xhat.iter()
+        .zip(rms_weight.iter())
+        .map(|(value, weight)| value * weight * inv_rms)
+        .collect()
+}
+
 /// H(X_l) with ALL THREE released predictor tensors and the released arithmetic: the projection is
 /// first multiplied by `rsqrt(mean(x^2) + norm_eps)` over the flattened `n*d` stream
 /// (model.py:953-954), then each row is multiplied by its group's `hc_scale` entry and has
@@ -779,7 +805,7 @@ fn coefficient_rstd(sum_squares: f32) -> f32 {
 /// C differ by the activation, and B differs by the schedule.
 ///
 /// # Panics
-/// Panics if the predictor is not the folded (n*n + 2n) by d matrix.
+/// Panics if the predictor is not the released (n*n + 2n) by (n*d) matrix.
 #[must_use]
 pub fn h_of_with_scale(
     registers: &mut Registers,
@@ -924,7 +950,8 @@ pub fn softmax4(values: &[f32]) -> [f32; HC_MULT] {
 /// hc_base AND hc_scale and the released sigmoid activation.
 ///
 /// # Panics
-/// Panics if the RMS weight is not d wide, or the predictor is not the folded matrix.
+/// Panics if the RMS weight is not d wide, or the predictor is not the released `[24, n*d]`
+/// matrix in kernel row order.
 #[must_use]
 pub fn mega_mhc_layer(
     streams: &mut Streams,
@@ -1080,29 +1107,34 @@ fn mega_mhc_layer_inner(
     };
 
     // F: the RMS pre-norm, the per-32 ue8m0 scales and the FP8 codes. Writing those is d elements
-    // plus d / 32 scale bytes, which is the second half of the bound.
+    // plus d / 32 scale bytes, which is the second half of the bound. The f32 pre-normed value is
+    // computed through [`block_input_normed`] in the KERNEL's multiplication order, so the codes and
+    // scales are quantized from the same f32 value the kernel's B0 capture writes.
     let inv_rms = block_inv_rms;
+    let normed = block_input_normed(&xhat, rms_weight, inv_rms);
     let mut codes: Counted<u8> = Counted::new();
     let mut scales: Counted<u8> = Counted::new();
     for block in 0..HIDDEN / QUANT_BLOCK {
         let base = block * QUANT_BLOCK;
         let mut amax = 0.0f32;
-        let mut normalised = [0.0f32; QUANT_BLOCK];
-        for i in 0..QUANT_BLOCK {
-            let value = xhat[base + i] * inv_rms * rms_weight[base + i];
-            normalised[i] = value;
+        for value in &normed[base..base + QUANT_BLOCK] {
             let magnitude = value.abs();
             amax = if magnitude > amax { magnitude } else { amax };
         }
-        let scale_code = ue8m0_from_amax(amax, E4M3_ELEMENT_EMAX);
+        // X_hat^FP8 is an ACTIVATION, so its scale is the reference's act_quant rule: amax floored at
+        // 1e-4, times 1/448 in f32, then the scale exponent rounded UP (kernel.py:36-37, 76-80;
+        // engine quant::e8m0_encode_ceil). The checkpoint weight-grid rule
+        // (ue8m0_from_amax = floor(log2(amax)) - emax) is deliberately a different rule and must not
+        // be used here: on a block whose amax lies above 1.75 * 2^floor(log2 amax) it picks a scale
+        // one power of two too small, and the E4M3 operand differs from the engine's.
+        // act_quant_scale_code is total, so a block containing inf takes code 254 instead of
+        // aborting this oracle (the D8 review's B1).
+        let scale_code = act_quant_scale_code(amax);
         scales.push(scale_code);
-        // MX encodes the value DIVIDED by the shared scale: the scale is 2^(floor(log2(amax)) - emax),
-        // so value / scale lands near the element format's own exponent range and the decoder
-        // multiplies it back. Encoding the value directly and multiplying by the scale on the way out
-        // would shrink the block by a factor of 2^emax - which is what this reference did until the
-        // round-trip test below caught it.
+        // MX encodes the value DIVIDED by the shared power-of-two scale; the decoder multiplies it
+        // back. This is the same value/scale order the reference uses (kernel.py:89-93).
         let scale = crate::m4_quant::ue8m0_decode(scale_code);
-        for value in normalised.iter() {
+        for value in &normed[base..base + QUANT_BLOCK] {
             codes.push(fp8_e4m3_encode(value / scale));
         }
     }
@@ -1133,16 +1165,17 @@ fn mega_mhc_layer_inner(
 /// are counted as stream traffic. This is a second full pass in this reference (the kernel does it
 /// from registers and charges nothing), and it is what makes the wasteful variant below wasteful.
 fn h_of_counted(streams: &mut Streams, predictor: &[f32]) -> Coefficients {
-    assert_eq!(predictor.len(), PREDICTOR_ROWS * HIDDEN);
+    assert_eq!(predictor.len(), PREDICTOR_ROWS * HC_MULT * HIDDEN);
     let mut rows = [0.0f32; PREDICTOR_ROWS];
     for row in 0..PREDICTOR_ROWS {
         let mut acc = 0.0f32;
         for stream in 0..HC_MULT {
             for i in 0..HIDDEN {
-                acc += streams.read(stream, i) * predictor[row * HIDDEN + i];
+                acc += streams.read(stream, i)
+                    * predictor[row * HC_MULT * HIDDEN + stream * HIDDEN + i];
             }
         }
-        rows[row] = acc / HC_MULT as f32;
+        rows[row] = acc;
     }
     let mut b = [[0.0f32; HC_MULT]; HC_MULT];
     for i in 0..HC_MULT {
@@ -1223,7 +1256,7 @@ mod tests {
     /// The zeros predictor: every predictor row is zero, so H is the uniform case and the golden
     /// numbers below can be worked out on paper.
     fn zero_predictor() -> Vec<f32> {
-        vec![0.0f32; PREDICTOR_ROWS * HIDDEN]
+        vec![0.0f32; PREDICTOR_ROWS * HC_MULT * HIDDEN]
     }
 
     #[test]
@@ -1234,9 +1267,10 @@ mod tests {
         // Take X_l = 1 in every stream and a_prev = 0.25, so X_hat = 0.25 * 4 * 1 = 1. The RMS
         // denominator is sqrt(1 + eps), whose deviation from 1 is a factor 1 - 5e-7, and with an RMS
         // weight of 3 the normalised value is 2.9999985 - not on a power of two and not near a
-        // rounding boundary, so the block scale is 2^(floor(log2(3)) - 8) = 2^-7 (ue8m0 code 120)
-        // and the encoded element is 3 / 2^-7 = 384, which is E4M3 0x7C. Read back, that is
-        // 384 * 2^-7 = 3, and X_{l+1} = B X + C F = 4 * 0.25 * 1 + 0.25 * 3 = 1.75.
+        // rounding boundary, so the activation scale rule picks 2^-7 (ue8m0 code 120: the smallest
+        // power of two at or above 3/448) and the encoded element is 3 / 2^-7 = 384, which is E4M3
+        // 0x7C. Read back, that is 384 * 2^-7 = 3, and X_{l+1} = B X + C F = 4 * 0.25 * 1 + 0.25 * 3
+        // = 1.75.
         let x = vec![1.0f32; HC_MULT * HIDDEN];
         let rms_weight = vec![3.0f32; HIDDEN];
         let mut ledger = TrafficLedger::default();
@@ -1555,7 +1589,7 @@ mod tests {
     /// A predictor whose rows are all different, so the coefficients are not the zero-predictor
     /// uniform case and a misplaced bias cannot hide inside a symmetry.
     fn deterministic_predictor() -> Vec<f32> {
-        (0..PREDICTOR_ROWS * HIDDEN)
+        (0..PREDICTOR_ROWS * HC_MULT * HIDDEN)
             .map(|i| ((i % 19) as f32 - 9.0) / 32.0)
             .collect()
     }
@@ -1824,7 +1858,11 @@ mod tests {
         // different numbers. The expected values are written out here with a locally-defined
         // logistic rather than taken from the module, so this test cannot agree with its builder by
         // construction.
-        let predictor = deterministic_predictor();
+        // The deterministic stream pattern (period 23) and the predictor pattern (period 19) cancel
+        // exactly on kernel A row 19, which would make the missing-scale assertion below vacuous at
+        // A[3]; one nonzero entry gives that row a real logit and leaves every other row untouched.
+        let mut predictor = deterministic_predictor();
+        predictor[(HC_MULT * HC_MULT + 3) * HC_MULT * HIDDEN + 1] = 1.0;
         let hc_scale: HcScale = [0.5, -2.0, 3.0];
         let hc_base: HcBase = core::array::from_fn(|index| (index as f32 - 12.0) / 16.0);
         let logistic = |z: f32| 1.0 / (1.0 + (-z).exp());
@@ -2278,10 +2316,12 @@ mod tests {
     #[test]
     fn the_released_block_rms_normalises_x_hat_not_the_streams() {
         // model.py:984/991 normalise the COLLAPSED block input, so the statistic is the sum of
-        // squares of X_hat over d - not the sum over the four streams. With X_hat uniform at 0.25
-        // the released rstd is exactly 4; the old streams statistic gives ~2 on this fixture, and
-        // the two produce different FP8 codes. The reference entry point must follow the release.
-        let a_prev = [0.25f32; HC_MULT];
+        // squares of X_hat over d - not the sum over the four streams. With one stream at 1.0 and
+        // a uniform a_prev, X_hat is uniform at 0.3, so the released rstd is 1/0.3; the old streams
+        // statistic is 1/sqrt(0.25). The two normalised values are 1.0 and ~0.6, which the
+        // reference's E4M3 quantiser maps to DIFFERENT codes (0x78 against 0x7A); the fixture must
+        // keep that property or it cannot tell the statistics apart.
+        let a_prev = [0.3f32; HC_MULT];
         let mut stream_values = vec![0.0f32; HC_MULT * HIDDEN];
         stream_values[..HIDDEN].fill(1.0);
         let rms_weight = vec![1.0f32; HIDDEN];
@@ -2294,12 +2334,11 @@ mod tests {
             &[1.0f32; HC_SCALE_LEN],
             &mut TrafficLedger::default(),
         );
-        let expected_codes = |inv_rms: f32| {
+        let expected_codes = |value: f32| {
             let mut out = Vec::with_capacity(HIDDEN);
             for _ in 0..HIDDEN / QUANT_BLOCK {
-                let value = 0.25f32 * inv_rms;
                 let normalised = [value; QUANT_BLOCK];
-                let scale_code = ue8m0_from_amax(value.abs(), E4M3_ELEMENT_EMAX);
+                let scale_code = act_quant_scale_code(value.abs());
                 let scale = crate::m4_quant::ue8m0_decode(scale_code);
                 for value in normalised {
                     out.push(fp8_e4m3_encode(value / scale));
@@ -2307,8 +2346,10 @@ mod tests {
             }
             out
         };
-        let released = expected_codes(4.0);
-        let old = expected_codes(1.0 / (0.25f32 + 1e-6).sqrt());
+        let released_inv = 1.0 / (0.3f32 * 0.3f32 + NORM_EPS).sqrt();
+        let old_inv = 1.0 / (0.25f32 + 1e-6).sqrt();
+        let released = expected_codes(0.3f32 * 1.0f32 * released_inv);
+        let old = expected_codes(0.3f32 * 1.0f32 * old_inv);
         assert_eq!(
             codes.as_slice(),
             released.as_slice(),
@@ -2322,12 +2363,12 @@ mod tests {
     }
 
     #[test]
-    fn the_fold_puts_each_released_row_on_its_kernel_row() {
-        // The released row order is pre(0..n) / post(n..2n) / comb(2n..). The fold must move pre to
-        // kernel A rows (n*n..n*n+n), post to kC rows (n*n+n..) and comb to B rows (0..n*n)
-        // transposed. Every released row carries its own index, so the folded value names both the
-        // row it came from and the row it landed on, and the table below is written out by hand
-        // instead of derived, which is what makes this test independent of the helper's match arms.
+    fn released_predictor_rows_are_permuted_and_never_averaged() {
+        // The released row order is pre(0..n) / post(n..2n) / comb(2n..). The permutation must move
+        // pre to kernel A rows (n*n..n*n+n), post to kernel C rows (n*n+n..) and comb to B rows
+        // (0..n*n) transposed. Every released element carries its own value, so the copy index and
+        // the column survive the mapping and the test names both. B0 removed the d-wide fold: a
+        // helper that averages the copies, or that drops three of them, must fail here.
         let mut released = vec![0.0f32; PREDICTOR_ROWS * HC_MULT * HIDDEN];
         for released_row in 0..PREDICTOR_ROWS {
             for copy in 0..HC_MULT {
@@ -2337,8 +2378,8 @@ mod tests {
                 }
             }
         }
-        let mut folded = vec![0.0f32; PREDICTOR_ROWS * HIDDEN];
-        fold_predictor_into_kernel_rows(&released, &mut folded);
+        let mut kernel_order = vec![0.0f32; PREDICTOR_ROWS * HC_MULT * HIDDEN];
+        released_predictor_into_kernel_rows(&released, &mut kernel_order);
         for kernel_row in 0..PREDICTOR_ROWS {
             let expected_released_row = if kernel_row < HC_MULT * HC_MULT {
                 // kernel B[destination][source] <- released comb [source][destination]
@@ -2350,35 +2391,58 @@ mod tests {
             } else {
                 POST_ROWS_OFFSET + (kernel_row - HC_MULT * HC_MULT - HC_MULT)
             };
-            // The fold is the mean over the four copies: released_row * 10 + 1.5 + column * 1e-3.
-            let base = expected_released_row as f32 * 10.0 + 1.5;
-            for column in 0..HIDDEN {
-                let got = folded[kernel_row * HIDDEN + column];
-                let expected = base + column as f32 * 1e-3;
-                assert!(
-                    (got - expected).abs() < 1e-3,
-                    "kernel row {kernel_row} column {column} is {got}, and released row {expected_released_row} says {expected}"
-                );
+            // No averaging: every copy is carried through, so copy c keeps value + c + column/1000.
+            let base = expected_released_row as f32 * 10.0;
+            for copy in 0..HC_MULT {
+                for column in 0..HIDDEN {
+                    let got = kernel_order[kernel_row * HC_MULT * HIDDEN + copy * HIDDEN + column];
+                    let expected = base + copy as f32 + column as f32 * 1e-3;
+                    assert!(
+                        (got - expected).abs() < 1e-3,
+                        "kernel row {kernel_row} copy {copy} column {column} is {got}, and released row {expected_released_row} says {expected}"
+                    );
+                }
             }
         }
-        // Non-vacuity: the identity row mapping (no permutation, no transpose) does NOT fit.
-        let mut wrong = 0;
+        // Non-vacuity 1: the identity row mapping (no permutation, no transpose) does NOT fit.
+        let mut wrong_mapping = 0;
+        for index in 0..PREDICTOR_ROWS * HC_MULT * HIDDEN {
+            if (released[index] - kernel_order[index]).abs() > 1e-3 {
+                wrong_mapping += 1;
+            }
+        }
+        assert!(
+            wrong_mapping > HC_MULT * HIDDEN,
+            "an identity row mapping must not match, and it differs at {wrong_mapping} entries"
+        );
+        // Non-vacuity 2: the retired fold (mean over the four copies) does NOT fit. If it did, this
+        // test would not notice B0 being undone.
+        let mut wrong_fold = 0;
         for kernel_row in 0..PREDICTOR_ROWS {
-            let mut naive = vec![0.0f32; HIDDEN];
+            let released_row = if kernel_row < HC_MULT * HC_MULT {
+                let destination = kernel_row / HC_MULT;
+                let source = kernel_row % HC_MULT;
+                COMB_ROWS_OFFSET + source * HC_MULT + destination
+            } else if kernel_row < HC_MULT * HC_MULT + HC_MULT {
+                PRE_ROWS_OFFSET + (kernel_row - HC_MULT * HC_MULT)
+            } else {
+                POST_ROWS_OFFSET + (kernel_row - HC_MULT * HC_MULT - HC_MULT)
+            };
             for column in 0..HIDDEN {
+                let mut mean = 0.0f32;
                 for copy in 0..HC_MULT {
-                    naive[column] +=
-                        released[kernel_row * HC_MULT * HIDDEN + copy * HIDDEN + column];
+                    mean += released[released_row * HC_MULT * HIDDEN + copy * HIDDEN + column];
                 }
-                naive[column] /= HC_MULT as f32;
-                if (naive[column] - folded[kernel_row * HIDDEN + column]).abs() > 1e-3 {
-                    wrong += 1;
+                mean /= HC_MULT as f32;
+                let first_copy = kernel_order[kernel_row * HC_MULT * HIDDEN + column];
+                if (mean - first_copy).abs() > 1e-3 {
+                    wrong_fold += 1;
                 }
             }
         }
         assert!(
-            wrong > HIDDEN,
-            "a fold without the row permutation must not match, and it differs at {wrong} entries"
+            wrong_fold > HIDDEN,
+            "an averaged (pre-B0 folded) row must not match the full projection row, and it differs at {wrong_fold} entries"
         );
     }
 }

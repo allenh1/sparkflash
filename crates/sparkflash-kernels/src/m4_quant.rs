@@ -291,6 +291,13 @@ pub fn fast_pow2(exponent: i32) -> f32 {
 /// The reference's scale for one block: fast_round_scale(amax, 1/448), which is
 /// fast_pow2(fast_log2_ceil(amax * fp8_max_inv)) (kernel.py:36-37 and 78).
 ///
+/// This function is the reference's own arithmetic for a FINITE product, kept as the historical
+/// reproduction of fast_round_scale. It is NOT total: an infinite amax gives an infinite scale,
+/// which [ue8m0_code_of_power_of_two] then rejects, and a subnormal product is mis-ceiled by
+/// fast_log2_ceil. Every path that can see a non-finite or sub-normal activation uses
+/// [act_quant_scale_code] instead, which is the same rule with the engine's total handling of
+/// both; the D8 review's blocker was the host oracle still routing through this pair.
+///
 /// Two consequences are worth stating, because they are exactly where this differs from the
 /// floor-of-log2 rule that ue8m0_from_amax uses for the checkpoint's weight grids:
 ///
@@ -311,7 +318,9 @@ pub fn act_quant_scale(amax: f32) -> f32 {
 ///
 /// # Panics
 /// Panics if the scale is not a positive power of two, which would mean the caller did not build it
-/// with act_quant_scale.
+/// with act_quant_scale. A caller that can see an infinite block maximum must not route it through
+/// [act_quant_scale] and then here - that is the panic the D8 review found in the host oracle - but
+/// through [act_quant_scale_code], which returns the total code 254 for infinity.
 #[must_use]
 pub fn ue8m0_code_of_power_of_two(scale: f32) -> u8 {
     let bits = scale.to_bits();
@@ -322,6 +331,50 @@ pub fn ue8m0_code_of_power_of_two(scale: f32) -> u8 {
     ((bits >> 23) & 0xFF) as u8
 }
 
+/// The ue8m0 code of the reference's activation scale for one block whose largest magnitude is
+/// `amax`: the engine's rule (quant::quantize_activation_fp8's block_scale_code, which is
+/// `e8m0_encode_ceil(amax.max(1e-4) / 448)`, i.e. the smallest power of two at or above
+/// amax/448) in one total function, matching the kernel's spark_act_quant_scale_code.
+///
+/// The 1e-4 floor is inside this helper on purpose, as it is inside the kernel's: a caller that
+/// forgot it would quantise an all-zero block into NaNs. Every input is total, including:
+///
+/// * an infinite amax, which takes code 254 (the largest scale, as the engine clamps it);
+/// * a NaN amax, which the floor replaces (a max-reduction ignores NaNs, exactly as the engine's
+///   fold and the kernel's fmaxf chain do);
+/// * a subnormal product, which cannot occur after the floor but would be mis-ceiled by the
+///   reference's fast_log2_ceil, so [ue8m0_code_ceil] computes it from the highest set bit.
+#[must_use]
+pub fn act_quant_scale_code(amax: f32) -> u8 {
+    ue8m0_code_ceil(amax.max(ACT_QUANT_AMAX_FLOOR) * (1.0 / E4M3_MAX))
+}
+
+/// The ue8m0 code of the smallest power of two at or above `value`: the engine's
+/// quant::e8m0_encode_ceil, total on every f32. NaN takes the reserved all-ones code (the engine's
+/// E8M0_NAN), a non-positive value takes code 0, a subnormal is ceiled from its highest set mantissa
+/// bit (the case fast_log2_ceil gets wrong), and the result is clamped to the ue8m0 range [0, 254].
+#[must_use]
+pub fn ue8m0_code_ceil(value: f32) -> u8 {
+    if value.is_nan() {
+        return 255; // the reserved NaN code, engine quant::E8M0_NAN
+    }
+    if value <= 0.0 {
+        return 0;
+    }
+    let bits = value.to_bits();
+    let field = ((bits >> 23) & 0xFF) as i32;
+    let mantissa = bits & 0x007F_FFFF;
+    let exponent = if field == 0 {
+        // Subnormal: value = mantissa * 2^-149, so the ceiling of its log2 is the index of its
+        // highest set bit, one higher again when a lower bit is set too.
+        let highest = 31 - mantissa.leading_zeros() as i32;
+        -149 + highest + i32::from(mantissa.count_ones() > 1)
+    } else {
+        field - 127 + i32::from(mantissa != 0)
+    };
+    (exponent + 127).clamp(0, 254) as u8
+}
+
 /// The reference's act_quant for one row of 32-value blocks (kernel.py:41-124): returns the E4M3
 /// bytes and the per-block ue8m0 bytes, in that order.
 ///
@@ -330,6 +383,12 @@ pub fn ue8m0_code_of_power_of_two(scale: f32) -> u8 {
 /// (kernel.py:78); the division by that scale, the clamp to +-448 and the cast to
 /// torch.float8_e4m3fn (kernel.py:89-93), whose round-to-nearest-even is the codec this module
 /// already pins exhaustively over all 65,536 inputs.
+///
+/// The block scale is [act_quant_scale_code]'s total code, so a row containing inf or NaN does not
+/// panic: inf raises the block maximum, which floors nothing and takes code 254, and the element
+/// clamps to +-448 exactly as the engine's quantize_activation_fp8 does; NaN is ignored by the
+/// block maximum as it is by both the engine's fold and the kernel's fmaxf chain, so a row of NaN
+/// quantises through the 1e-4 floor.
 ///
 /// # Panics
 /// Panics if the row is empty or not a whole number of blocks.
@@ -347,9 +406,13 @@ pub fn act_quant_fp8_row(row: &[f32]) -> (Vec<u8>, Vec<u8>) {
         for value in block {
             amax = amax.max(value.abs());
         }
-        let amax = amax.max(ACT_QUANT_AMAX_FLOOR);
-        let scale = act_quant_scale(amax);
-        scales.push(ue8m0_code_of_power_of_two(scale));
+        // One rule, one code path: the scale code is act_quant_scale_code's total output and the
+        // dividing scale is that code's value, exactly as the engine divides by the decoded code
+        // (quant::quantize_activation_fp8). An E8M0 code is exact, so this is the same f32
+        // fast_pow2 built before D8, and the row stays total when amax is infinite.
+        let code = act_quant_scale_code(amax);
+        scales.push(code);
+        let scale = ue8m0_decode(code);
         for value in block {
             values.push(fp8_e4m3_encode((value / scale).clamp(-E4M3_MAX, E4M3_MAX)));
         }
@@ -429,4 +492,124 @@ pub fn assert_matches_kernel_header() {
         m4_abi::header_constant(header, "SPARK_M4_UE8M0_MAX"),
         "SPARK_M4_UE8M0_MAX"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The activation rule is the engine's total ceil rule, and the three awkward classes the D8
+    /// review named are all total: an infinite block maximum takes the largest scale, NaN is
+    /// replaced by the 1e-4 floor (a max-reduction ignores it), and a non-positive amax takes the
+    /// floor too. Before this test the same values went through act_quant_scale ->
+    /// ue8m0_code_of_power_of_two and the infinite one panicked there.
+    #[test]
+    fn the_activation_scale_code_is_total_at_infinity_nan_and_zero() {
+        assert_eq!(act_quant_scale_code(f32::INFINITY), 254);
+        assert_eq!(act_quant_scale_code(f32::NEG_INFINITY), 105);
+        assert_eq!(act_quant_scale_code(f32::NAN), 105);
+        assert_eq!(act_quant_scale_code(0.0), 105);
+        assert_eq!(act_quant_scale_code(-0.0), 105);
+        assert_eq!(act_quant_scale_code(-1.0), 105);
+        assert_eq!(act_quant_scale_code(ACT_QUANT_AMAX_FLOOR), 105);
+        // The largest f32 still ceilings below the top code (its product is 2^119.2): only an
+        // infinite amax reaches 254, exactly as the engine clamps it.
+        assert_eq!(act_quant_scale_code(f32::MAX), 247);
+    }
+
+    /// Exact powers of two take their own exponent, and a value just above one takes the next
+    /// exponent because the rule is a ceiling, not a floor.
+    #[test]
+    fn exact_powers_of_two_take_their_exponent_and_the_rest_round_up() {
+        for (amax, code) in [
+            (224.0f32, 126u8),
+            (448.0, 127),
+            (896.0, 128),
+            (1792.0, 129),
+            (224.0 * 2.0f32.powi(-9), 117),
+        ] {
+            assert_eq!(act_quant_scale_code(amax), code, "amax {amax}");
+        }
+        assert_eq!(ue8m0_code_ceil(1.0), 127);
+        assert_eq!(ue8m0_code_ceil(0.5), 126);
+        assert_eq!(ue8m0_code_ceil(2.0), 128);
+        assert_eq!(
+            ue8m0_code_ceil(1.5),
+            128,
+            "a nonzero mantissa rounds the exponent up"
+        );
+        assert_eq!(ue8m0_code_ceil(0.75), 127);
+    }
+
+    /// The subnormal branch is the one the reference's fast_log2_ceil gets wrong, so it is tested
+    /// on bit patterns the 1e-4 floor cannot hide: a subnormal at or below 2^-127 ceils to code 0,
+    /// one above it ceils to code 1 (the 2^-126 scale), while fast_log2_ceil reports -126 for all
+    /// of them - the engine's subnormal branch fixes exactly this.
+    #[test]
+    fn subnormal_products_are_ceiled_from_the_highest_set_bit() {
+        assert_eq!(ue8m0_code_ceil(f32::MIN_POSITIVE), 1);
+        assert_eq!(ue8m0_code_ceil(2.0f32.powi(-125)), 2);
+        // At or below 2^-127: the ceiling of log2 is at most -127, so the code is 0.
+        for bits in [1u32, 2, 3, 1 << 22] {
+            let value = f32::from_bits(bits);
+            assert!(
+                value > 0.0 && value <= f32::from_bits(1 << 22),
+                "bits {bits:#x}"
+            );
+            assert_eq!(ue8m0_code_ceil(value), 0, "bits {bits:#x}");
+            // fast_log2_ceil reports the exponent field, which for every subnormal is -127 + 1:
+            // the engine fixed the product ceiling precisely so this branch is not reached.
+            assert_eq!(fast_log2_ceil(value), -126, "bits {bits:#x}");
+        }
+        // Just above 2^-127: the ceiling is -126, the smallest normal's exponent.
+        for bits in [(1u32 << 22) + 1, (1 << 23) - 1] {
+            let value = f32::from_bits(bits);
+            assert!(value > 0.0 && value < f32::MIN_POSITIVE, "bits {bits:#x}");
+            assert_eq!(ue8m0_code_ceil(value), 1, "bits {bits:#x}");
+            assert_eq!(fast_log2_ceil(value), -126, "bits {bits:#x}");
+        }
+    }
+
+    /// The 1e-4 floor is what keeps an all-zero block out of NaN codes, and it is shared with the
+    /// kernel helper: the floor value is code 105, and an all-zero row quantises to zeros at it.
+    #[test]
+    fn the_amax_floor_gives_an_all_zero_block_a_finite_scale() {
+        let (codes, scales) = act_quant_fp8_row(&[0.0f32; QUANT_BLOCK]);
+        assert_eq!(scales, vec![105]);
+        assert_eq!(codes, vec![0u8; QUANT_BLOCK]);
+    }
+
+    /// A row containing infinity is quantised, not rejected: the largest scale and a saturating
+    /// E4M3 code for the infinite element.
+    #[test]
+    fn an_infinite_row_quantises_to_saturation_instead_of_panicking() {
+        let mut row = [1.0f32; QUANT_BLOCK];
+        row[0] = f32::INFINITY;
+        let (codes, scales) = act_quant_fp8_row(&row);
+        assert_eq!(scales, vec![254]);
+        assert_eq!(
+            codes[0], 0x7E,
+            "inf clamps to +448, the E4M3 saturation code"
+        );
+        assert!(
+            codes[1..].iter().all(|&code| code == 0),
+            "1/2^127 rounds to zero"
+        );
+    }
+
+    /// The activation rule is NOT the checkpoint weight-grid rule; the two differ by one code at
+    /// the values the reviewer named, which is what pins swiglu_ref::quantise_row's delegation and
+    /// kills the mutation that reinstates the weight-grid rule there.
+    #[test]
+    fn the_activation_ceil_rule_differs_from_the_weight_grid_floor_rule() {
+        for (amax, ceil, floor) in [(1.9f32, 120u8, 119u8), (449.0, 128, 127)] {
+            assert_eq!(act_quant_scale_code(amax), ceil, "ceil rule at {amax}");
+            assert_eq!(
+                ue8m0_from_amax(amax, E4M3_ELEMENT_EMAX),
+                floor,
+                "weight-grid rule at {amax}"
+            );
+            assert_ne!(ceil, floor);
+        }
+    }
 }

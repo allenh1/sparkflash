@@ -8,13 +8,17 @@
 //!   `silu(gate) * up`. The asymmetry is not an accident to be tidied up: `silu` is not odd,
 //!   so the two plausible readings disagree for a gate below the limit, and [swiglu] is the one the
 //!   reference uses.
-//! * The quantise step is the shipped `mega_mhc_sm121.cu:243-249` recipe: one ue8m0 scale per
-//!   32 values, chosen so that every scaled value fits E4M3's 448, then round-to-nearest-even
-//!   E4M3.
+//! * The quantise step is the reference's ACTIVATION quantiser, not the checkpoint weight-grid
+//!   rule: one ue8m0 scale per 32 values from the ceil rule (amax floored at 1e-4, then the
+//!   smallest power of two at or above amax/448), followed by the clamp to +-448 and a
+//!   round-to-nearest-even E4M3 encode. That is [crate::m4_quant::act_quant_fp8_row], which mirrors
+//!   kernel.py:36-37/76-124 and is the rule the engine's quant::quantize_activation_fp8 uses; the
+//!   weight-grid rule (floor(log2(amax)) - emax) is for stored weights and is deliberately a
+//!   different rule.
 //!
-//! The device side calls the shared header's own `spark_ue8m0_from_amax` and
-//! `spark_fp8_e4m3_encode`, so what the harness compares is this module against those header
-//! functions. This module must never be adjusted to agree with a kernel; the kernel has to agree
+//! The device side calls `kernels/m4_activation_quant_sm121.cuh`'s
+//! `spark_act_quant_scale_code` and `spark_fp8_e4m3_encode`, so what the harness compares is this
+//! module against those header functions. This module must never be adjusted to agree with a kernel; the kernel has to agree
 //! with it, and with the engine reference behind it.
 
 /// The release configuration's `swiglu_limit`, from the layer-0 config.
@@ -49,27 +53,6 @@ pub fn swiglu(gate: f32, up: f32, limit: f32) -> f32 {
 #[cfg(test)]
 fn swiglu_symmetric(gate: f32, up: f32, limit: f32) -> f32 {
     silu(gate.clamp(-limit, limit)) * up.clamp(-limit, limit)
-}
-
-/// The ue8m0 scale code for one block: the smallest power-of-two scale for which the block's
-/// largest magnitude fits E4M3, i.e. the shared header's `spark_ue8m0_from_amax(amax, 8)`.
-///
-/// A zero or non-finite `amax` returns the zero code, which the header also does for a block of
-/// zeros; a caller that needs the reference's `ACTIVATION_AMAX_FLOOR` applies it before calling.
-#[must_use]
-pub fn ue8m0_from_amax(amax: f32) -> u8 {
-    if amax <= 0.0 || !amax.is_finite() {
-        return 0;
-    }
-    // The scale must satisfy amax / 2^(e - 127) <= 448, so 2^e >= amax / 448.
-    let wanted = amax / E4M3_MAX;
-    let mut exponent = 0i32;
-    let mut value = 1.0f32;
-    while value < wanted && exponent < 254 {
-        value *= 2.0;
-        exponent += 1;
-    }
-    (exponent + 127).clamp(0, 254) as u8
 }
 
 /// The value a ue8m0 code denotes: `2^(bits - 127)`, with code 0 the 2^-127 float subnormal
@@ -150,25 +133,18 @@ pub fn quantise_row(gate: &[f32], up: &[f32], limit: f32) -> (Vec<u8>, Vec<u8>) 
         .zip(up.iter())
         .map(|(gate, up)| swiglu(*gate, *up, limit))
         .collect();
-    let mut codes = vec![0u8; activated.len()];
-    let mut scales = vec![0u8; activated.len() / QUANT_BLOCK];
-    for (block, chunk) in activated.chunks(QUANT_BLOCK).enumerate() {
-        let amax = chunk
-            .iter()
-            .fold(0.0f32, |amax, value| amax.max(value.abs()));
-        let scale = ue8m0_from_amax(amax);
-        let inverse = 1.0 / ue8m0_decode(scale);
-        for (offset, value) in chunk.iter().enumerate() {
-            codes[block * QUANT_BLOCK + offset] = e4m3_encode(value * inverse);
-        }
-        scales[block] = scale;
-    }
-    (codes, scales)
+    // One function, one rule: the released activation quantiser. A second implementation here is
+    // how the previous floor-rule scale (and, before that, a decoder that made every code zero)
+    // drifted away from the kernel; delegating leaves the kernel nothing to disagree with.
+    crate::m4_quant::act_quant_fp8_row(&activated)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::m4_quant::{
+        ACT_QUANT_AMAX_FLOOR, E4M3_ELEMENT_EMAX, act_quant_scale_code, ue8m0_from_amax,
+    };
 
     #[test]
     fn the_gate_branch_is_clamped_on_one_side_only() {
@@ -246,7 +222,10 @@ mod tests {
         let gate = [1.0f32; QUANT_BLOCK];
         let up = [1.0f32; QUANT_BLOCK];
         let (codes, scales) = quantise_row(&gate, &up, SWIGLU_LIMIT);
-        assert_eq!(scales, vec![127], "a unit row takes the 2^0 scale");
+        // silu(1) * 1 = 0.731..., so the reference's ceil rule picks the smallest power of two at or
+        // above 0.731/448, which is 2^-9 (ue8m0 code 118) - not the weight-grid floor rule's code and
+        // not the 2^0 scale a "start doubling from one" helper would return.
+        assert_eq!(scales, vec![118], "a unit row takes the 2^-9 scale");
         assert!(
             codes.iter().any(|code| *code != 0),
             "every code was zero: the quantiser's inverse scale is wrong"
@@ -260,22 +239,60 @@ mod tests {
     }
 
     #[test]
-    fn a_block_scale_covers_every_value() {
-        for amax in [1e-6f32, 1e-3, 0.5, 1.0, 7.0, 448.0, 449.0, 1e6] {
-            let scale = ue8m0_from_amax(amax);
-            let denominator = ue8m0_decode(scale);
+    fn the_activation_scale_is_the_reference_ceil_rule() {
+        // The reference's rule is the SMALLEST power of two at or above amax/448 after the 1e-4 amax
+        // floor, so every block fits +-448 without saturation and no block loses a binade. This is
+        // the property the kernel's spark_act_quant_scale_code has to reproduce; it is not the
+        // weight-grid rule, which floors log2(amax) instead.
+        for amax in [1e-6f32, 1e-3, 0.5, 1.0, 3.0, 7.0, 448.0, 449.0, 1e6] {
+            let wanted = amax.max(ACT_QUANT_AMAX_FLOOR) / E4M3_MAX;
+            let scale = ue8m0_decode(act_quant_scale_code(amax));
             assert!(
-                amax / denominator <= E4M3_MAX,
-                "amax {amax} must fit E4M3 after scaling by {denominator}"
+                wanted <= scale,
+                "amax {amax}: scale {scale} is below the required {wanted}"
             );
-            assert!(scale >= 127 || scale == 0, "the scale is not subnormal");
-            assert_eq!(
-                denominator,
-                2.0f32.powi(i32::from(scale) - 127),
-                "the denominator must be the exact power of two the code denotes"
+            assert!(
+                (scale / 2.0) < wanted || scale == 2.0f32.powi(-22),
+                "amax {amax}: scale {scale} is not the smallest power of two that covers it"
+            );
+            assert!(
+                scale > 0.0 && (scale.to_bits() & 0x7F_FFFF) == 0,
+                "amax {amax}: {scale} is not a power of two"
             );
         }
-        assert_eq!(ue8m0_from_amax(0.0), 0, "a zero block takes the zero code");
+        // The zero block is the floor's job: amax 1e-4 -> scale 2^-22 -> the code for that scale.
+        assert_eq!(
+            act_quant_scale_code(ACT_QUANT_AMAX_FLOOR),
+            105,
+            "an all-zero block takes the 2^-22 floor scale, not the zero code"
+        );
+    }
+
+    /// Mutation guard for the D8 review's M4a: reinstating the checkpoint weight-grid floor rule in
+    /// [quantise_row] left the suite green, because the existing case quantised at an amax where the
+    /// two rules agree. With gate = 1 and up = 2.7 the activation's amax is silu(1) * 2.7 = 1.974,
+    /// inside the binade (1.75, 2) where they disagree: the activation ceil rule takes 2^-7 (code
+    /// 120) and the weight-grid floor rule would take 2^-8 (code 119).
+    #[test]
+    fn the_quantiser_uses_the_ceil_rule_where_the_weight_grid_rule_would_differ() {
+        let activated = swiglu(1.0, 2.7, SWIGLU_LIMIT).abs();
+        assert!(
+            activated > 1.75 && activated < 2.0,
+            "amax {activated} is not in the distinguishing binade"
+        );
+        let gate = [1.0f32; QUANT_BLOCK];
+        let up = [2.7f32; QUANT_BLOCK];
+        let (_, scales) = quantise_row(&gate, &up, SWIGLU_LIMIT);
+        assert_eq!(
+            scales,
+            vec![120],
+            "the ceil rule's code at amax {activated}"
+        );
+        assert_eq!(
+            ue8m0_from_amax(activated, E4M3_ELEMENT_EMAX),
+            119,
+            "the weight-grid rule's code at the same amax"
+        );
     }
 
     /// The E4M3 step at the binade a code represents, not the format's finest step.

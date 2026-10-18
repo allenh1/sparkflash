@@ -37,9 +37,15 @@ the operator (device empty; MemAvailable 118.2 GiB at process start, printed by 
 not on main yet; the numbers below are the run's, and the harness's own comparison-class line is
 quoted with each row because the class is part of the number.
 
+**Retirement note (2026-10-18):** every number in the table below is a FIRST-WINDOW measurement of
+the pre-B0, pre-D8 code, retained as history. B0 retired the stream-mean fold (D22) and D8 moved
+the activation quantisers to the reference ceil rule (D23); the current measurements are in
+section 12.1, and the class line in row 1 describes a predictor the current code no longer uses.
+
 | Stage | Kernel | Comparison class (printed before the numbers) | Measured on node0, 2026-10-17 | Device bytes |
 | :--- | :--- | :--- | :--- | ---: |
-| 1. mHC | `mega_mhc_fused_bf16_sm121` | Internal consistency against the in-crate f32 reference on real layer-0 bytes; **not model fidelity** (the predictor is the stream-mean fold). The released class (D22: `hc_attn_base` and `hc_attn_scale` consumed, `C` compared raw, released split-Sinkhorn) is what the current code prints and what the second-window re-run measured. | **20,480/20,480 bit-exact**; scales **160/160**; **4/4 tokens PASS** on the released-arithmetic cubin (second window); kernel time **not re-measured**, p50 0.0227 ms is the pre-released-arithmetic figure | < 1 MiB |
+| 1. mHC | `mega_mhc_fused_bf16_sm121` | Internal consistency against the in-crate f32 reference on real layer-0 bytes; **not model fidelity** (at the time the predictor was the project's stream-mean fold, retired by B0/D22; current code
+consumes the release's `[24, n*d]` projection on both sides). The released class (D22: `hc_attn_base` and `hc_attn_scale` consumed, `C` compared raw, released split-Sinkhorn) is what the current code prints and what the second-window re-run measured. | **20,480/20,480 bit-exact**; scales **160/160**; **4/4 tokens PASS** on the released-arithmetic cubin (second window); kernel time **not re-measured**, p50 0.0227 ms is the pre-released-arithmetic figure | < 1 MiB |
 | 2. Attention | `flash_mla_csa2_sm121` | Tolerance 99.5 % exact, abs delta at most 1.6e-2; **sink included on both sides** (task-36 closed: the kernel takes a `[64]` f32 argument, the reference is `mla_ref::attention_with_sink`); candidates harness-supplied; indexer outputs not compared. | **163,838/163,840 = 99.9988 % exact, max abs delta 9.765625e-4, max ULP 1** (second window); timing **5.73 ms** is the first-window number, re-measure owed | **4.2 MiB** |
 | 3. MoE combine | `b12x_mxfp4_moe_sm121` | Tolerance 99.9 % exact, at most 2 bf16 codes; **router on the host seam**; gate/up, SwiGLU, quantiser host; 8/32/64 resident experts. | **20,480/20,480 exact, max ULP 0**; **0.821 / 0.847 / 0.850 ms per token** over four chained launches | 100–802 MB |
 
@@ -585,7 +591,15 @@ the kernel's order), and 0 certified entries on this token, so the certificate w
 the harness says so. That closes criterion 3's device half for the argmax and the exact logits; the
 top-5 is not claimed because a certified entry stores a bound rather than its value. What remains is
 the device column of criterion 1: the device half diffs this reference table against the device path
-and measures the per-tensor bars, and the 40-layer token harness that produces those rows. A synthetic run prints that its source is bytes, not numbers, so its
+and measures the per-tensor bars, and the 40-layer token harness that produces those rows. The
+groundwork for that diff is now device-measured in the fourth window (2026-10-18): the released
+`[24, n*d]` mHC predictor (B0), the B1 probes (B1) and the reference activation ceil rule (D8) run
+on the node as one chained layer-0 path - stage 0 PASS, stage 1 PASS at layers 0/1/4, stage 8 PASS
+with all four probes bit-exact, stage 2 PASS, stage 3 PASS; the numbers and logs are in
+[phase1-boundary-table.md](phase1-boundary-table.md) section 12 and D22/D23 in
+[DECISIONS.md](../DECISIONS.md). What remains for criterion 1's device column is B2: the single-layer
+row-0 dump-and-diff of all 18 tensors against this reference table, per tensor class, followed by the
+40-layer token harness. A synthetic run prints that its source is bytes, not numbers, so its
 argmax/top-5 are a shape and determinism record rather than a prediction. The released-checkpoint
 reference table is now the harness's --checkpoint mode: ReferenceWeights verifies the plan the way
 LoadedWeights does and serves the stored forms the reference decodes, LoadedWeights::read_ranges
@@ -1241,8 +1255,11 @@ merged and the slice documented), and they feed Phase 0/1 rather than being repl
 
 | Number | Value | Host | How measured |
 | :--- | :--- | :--- | :--- |
-| mHC residual streams | 20,480/20,480 bit-exact | node0, 2026-10-17 (second window) | `m7_layer0 --stage 1`, real layer-0 bytes, released-arithmetic cubin; PASS 4/4 tokens |
-| mHC ue8m0 scales | 160/160 bit-exact | node0, 2026-10-17 (second window) | same; PASS 4/4 tokens |
+| mHC residual streams | 20,480/20,480 bit-exact | node0, 2026-10-18 (fourth window) | `m7_layer0 --stage 1`, real layer-0 bytes, released `[24, n*d]` predictor cubin (B0); PASS 4/4 tokens at layers 0/1/4 |
+| mHC E4M3 codes / ue8m0 scales | layer 0: token 0 at **5,119/5,120 codes** (one one-code difference), tokens 1-3 exact; layer 1: **5,120/5,120 codes** at every token; layer 4: token 0 at **5,118/5,120 codes** (two one-code differences), other tokens exact; **160/160 scales** at every token in every case | node0, 2026-10-18 (fourth window) | `m7_layer0 --stage 1`, real layer-0 bytes, released `[24, n*d]` predictor cubin (B0), ceil-rule reference (D8); PASS 4/4 tokens at layers 0/1/4; where a code differs it is the fixed-order `1/rms` reduction residual, inside the bar |
+| mHC activation quantiser rule (D8), host recomputation | ceil rule **5,120/5,120 codes + 160/160 scales exact** on the engine's captured row 0; the retired floor rule would give 4,288/5,120 + 134/160 (attention) and 4,096/5,120 + 128/160 (ffn) | node0, 2026-10-18 (fourth window) | `m7_layer0 --stage 0`, engine's captured row-0 `pre_attention_xhat/scales` and `pre_ffn_xhat/scales` recomputed with `act_quant_fp8_row`; log `phase1-d8-stage0-quantiser-20261018T012533Z.log` |
+| mHC activation quantiser rule (D8), device stage-1 old-vs-new | **OLD-VS-NEW run pending a device window**: the retained `phase1-d8-stage1-layer0-20261018T012545Z.log` shows the old floor-rule behaviour (4,287/5,120 codes, 134/160 scales on token 0) but its header records the NEW binary and cubin sha256s, so it is not evidence for the old cubin and is not cited as such | node0, 2026-10-18 (mislabelled; regeneration owed) | pre-D8 floor-rule cubin retained at `/home/user/phase1-evidence/b0-out/mega_mhc_fused_bf16_sm121.cubin` (70,152 B, `6487f6ff...`) and old binary `m7_layer0-b0` on the node; rerun `--stage 1 --layer 0` with a labelled `OLD-VS-NEW` wrapper |
+| SwiGLU activation quantiser | codes 2,560/2,560 + scales 80/80 (4x640) and 4,608/4,608 + 144/144 (2x2304) bit-exact; pre-D8 probe was 10.16%/0% exact, max code delta 24 | node0, 2026-10-18 (fourth window) | `m7_layer0 --stage 8`, device kernel against `swiglu_ref` on identical bytes; PASS 4/4 probes |
 | mHC kernel time | p50 0.0227 ms/launch | node0, 2026-10-17 (first window) | pre-released-arithmetic kernel; **timing re-measure owed** |
 | Attention outputs | 163,838/163,840 = 99.9988 % exact, max abs delta 9.765625e-4, max ULP 1 | node0, 2026-10-17 (second window) | `--stage 2 --tokens 130`; **sink consumed on both sides** (kernel argument + `attention_with_sink`) |
 | Attention kernel time | 5.73 ms/launch = 4.27 indexer plus 1.46 attention | node0, 2026-10-17 (first window) | event timing over repeats; the sink ABI changes no timing claim, but re-measure is owed |
@@ -1255,11 +1272,16 @@ merged and the slice documented), and they feed Phase 0/1 rather than being repl
 | Device total memory | 124,610 MiB | node0 | `cuDeviceTotalMem_v2` ([device-path-design.md](device-path-design.md) section 9) |
 | Free memory beside vLLM | 3,115 MB | node0, 2026-10-16 | `doctor --local` |
 | Empty-node MemAvailable | 118.2 GiB at process start | node0, 2026-10-17 | harness floor check |
-| Kernel baseline | seven of seven entries re-pinned; `flash_mla` moves 35,848 to 36,160 B for the sink ABI | amd64 CI container, `nvcc V13.0.88` | `check-kernel-baseline.sh` (temporary job in the CUDA 13.0.3 image) |
+| Kernel baseline | seven of seven entries re-pinned; this branch's D8 moves `mega_mhc` to 70,312 B sha256 `e21293e3...` and `swiglu` to 21,776 B sha256 `4dbef63b...`; the other five unchanged (dense, wo_a, mxfp4_moe, flash_mla, cert_lm_head byte-identical) | amd64 container, `nvcc V13.0.88` from the CUDA 13.0.1 devel image `7d2f6a8c2071` (`d8-out/build.log` records `CUDA Version 13.0.1`; the CI `cuda-abi` image is 13.0.3), 2026-10-18 | `regen-kernel-baseline.sh` + `check-kernel-baseline.sh`; regenerated text and diff in `/home/user/phase1-evidence/d8-out/` |
 | Checkpoint bytes | 510,286,023,000 B, closing exactly | released index | [../architecture/00-overview.md](../architecture/00-overview.md) section 2.4 |
 | KV entry / token / page | 356 B / 890 B / 56,960 B | design plus `tests/layout.rs` | D1, D16 |
 | Per-rank weights (all resident) | about 130.1 GB on a 130.66 GB device | arithmetic, released bytes | section 7.5 |
 | Per-token collective budget | 83 collectives, about 1.77 MB, about 1.7 ms at 20 µs | arithmetic | section 7.2 |
+
+The stage-1 and stage-2 logs cited in this section predate the M2 fix of the harness's printed
+comparison-class strings (they print the retired stream-mean fold as the current predictor). They
+are pending regeneration in the next device window and are not cited as current evidence until
+then; the numbers above come from their captured bytes, not from the stale printed class line.
 
 ### 12.2 The labels
 

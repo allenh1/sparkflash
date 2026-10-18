@@ -1,7 +1,7 @@
 //! M7: layer 0 of DeepSeek-V4.1-Flash on the GB10, one stage per run.
 //!
 //! The layer is the unit of proof: a stage that matches at a boundary localises a failure to that
-//! boundary, which one final tensor cannot. Every run is ONE stage (--stage 1 through 6). The argv,
+//! boundary, which one final tensor cannot. Every run is ONE stage (--stage 0 through 8). The argv,
 //! the device bytes and the comparison class are printed before any numbers, and MemAvailable is
 //! printed and re-checked before and after every launch, with the process refusing to continue
 //! under the memory floor (32 GiB by default) - and refusing an allocation that would take the
@@ -19,26 +19,49 @@
 //!   * embed.weight is read one row at a time, because the whole tensor is 1.3 GB and this harness
 //!     needs one token's row.
 //!
+//! Stage 0 (CPU only, no CUDA context, runnable while vLLM holds the node): the fold-closure
+//! cross-check. It opens the released `hc_attn_fn` / `hc_ffn_fn` [24, 4*d] matrices, permutes
+//! their rows into the kernel's B/A/C order with NO averaging, runs the released H() arithmetic
+//! (full flattened projection, projection rstd, `mix * scale + base`, sigmoid pre/post, released
+//! split-Sinkhorn) through mega_mhc_ref::mega_mhc_layer_with_scale, and diffs the resulting
+//! coefficient tensors against the ones the ENGINE captured in the host boundary row 0
+//! (`hc_attn_pre/post/comb`, `hc_ffn_pre/post/comb` in the v1 manifest/blob; the attn streams come
+//! from the row's `residual_in`, the ffn streams from its `post_attention_hidden`). Its
+//! non-vacuity half runs the same reference over the RETIRED fold (predictor rows averaged over the
+//! four copies, projection over the stream mean) and prints how far that lands from the same row-0
+//! tensors, which is the fold gap measured on the captured arithmetic instead of on a synthetic
+//! fixture. Since D8 it also re-derives the row's activation-quantised block inputs from their own
+//! captured f32 values with m4_quant::act_quant_fp8_row - the reference's activation ceil rule, the
+//! rule the engine wrote pre_attention_xhat/scales and pre_ffn_xhat/scales with - and reports how
+//! many E4M3 codes and ue8m0 scales it reproduces exactly; the retired floor-log2 weight-grid rule is
+//! printed on the same bytes, unjudged, as the size of the gap. Pass bar: every full-projection
+//! coefficient within 1e-5 absolute of the engine's captured value (both sides are f32 sequential
+//! reductions, so the expected delta is a few ULP) and every recomputed activation quantiser code
+//! and scale identical to the captured one; the folded comparison is printed as evidence and is not
+//! judged.
+//!
 //! Stage 1 (small, and it gates the rest): mega_mhc_fused_bf16_sm121 against
-//! mega_mhc_ref::mega_mhc_layer_with_scale. The kernel now takes the released `hc_attn_base` [24]
-//! and `hc_attn_scale` [3] itself, and both sides run the released arithmetic end to end: the
-//! projection rstd, `mix * scale + base`, the sigmoid pre/post and the released split-Sinkhorn.
-//! The reference returns the coefficients, the FP8 codes and the ue8m0 scales as well as the f32
-//! streams, so the comparison is two-sided, and the coefficients are compared RAW (the old
-//! harness-side softmax around C is gone because the kernel and the reference now agree on C's
-//! released activation). Nothing in stage 1 is larger than a megabyte. The one residual difference
-//! from the release is the predictor fold: the project's [24, d] matrix over the stream mean, not
-//! the release's [24, n*d] projection over the flattened stream, so stage 1 is internal
-//! consistency of the released arithmetic, not a checkpoint-exact claim.
+//! mega_mhc_ref::mega_mhc_layer_with_scale. The kernel takes the released `hc_attn_base` [24] and
+//! `hc_attn_scale` [3] itself, and both sides run the released arithmetic end to end: the full
+//! released [24, 4*d] projection over the flattened stream (B0 removed the old d-wide fold from BOTH
+//! sides), the projection rstd, `mix * scale + base`, the sigmoid pre/post and the released
+//! split-Sinkhorn. The reference returns the coefficients, the FP8 codes and the ue8m0 scales as well
+//! as the f32 streams, so the comparison is two-sided, and the coefficients are compared RAW (the
+//! old harness-side softmax around C is gone because the kernel and the reference now agree on C's
+//! released activation). The kernel's B0 `xhat_normed` output is compared with
+//! mega_mhc_ref::block_input_normed on the same device inputs, so the f32 block input is checked as
+//! a captured value rather than reconstructed from codes times scale. Nothing in stage 1 is larger
+//! than a megabyte. With the fold closed, stage 1 is a comparison of the released projection
+//! arithmetic (modulo the kernel's per-tile reduction order), not of a folded approximation; the
+//! pre-B0 stage-1 runs measured folded semantics and those numbers are retired.
 //!
 //! Stage 2: mla_ref::attention_with_sink against flash_mla_csa2_sm121, the checkpoint's per-head
 //! attn_sink consumed on BOTH sides: the kernel takes the [64] f32 sink as an argument and adds
 //! it to the softmax denominator after the maximum, exactly as the reference does, so this is
 //! internal consistency of the sink arithmetic, not (yet) a device-vs-release claim - the device
-//! run of this ABI change is the proof. Its
-//! input arrives from stage 1, so it carries stage 1's one residual limitation: the predictor is
-//! the project's fold over the stream mean, not the release's flattened projection; the coefficient
-//! tensors themselves are consumed on both sides now. The KV rows it feeds both sides are the FP4
+//! run of this ABI change is the proof. Its input arrives from stage 1, so it shares stage 1's
+//! chain: with B0 the mHC predictor is the released flattened projection on both sides, so no
+//! predictor-fold limitation is inherited any more. The KV rows it feeds both sides are the FP4
 //! main-KV format the kernel and
 //! mla_ref::kv_latent both consume (per-16-channel E4M3 scale of amax/6, E2M1 codes, low nibble
 //! first), quantised here by sparkflash-kv's quantize_main_kv rule from kv_norm(wkv(xhat)) with the
@@ -84,9 +107,10 @@
 //! Stages 1, 2 and 3 take --layer N and read that layer's tensor names; the released run used layer 0
 //! for development, and the same stages pass unchanged on other layers: stage 1 at layers 1, 4, 14
 //! and 39, stages 2 and 3 at layer 14 (recon logs in docs/build/phase1-boundary-table.md section 11),
-//! so the per-layer kernels are not layer-0-specific. The chained 40-layer token harness is a separate
-//! program: the stages here each build their own inputs and compare one stage's outputs, they do not
-//! chain layers.
+//! so the per-layer kernels are not layer-0-specific. Stage 0 is the CPU-only exception: it needs
+//! the host boundary row and compares that row's captured layer-0 coefficients, so it is layer 0
+//! only. The chained 40-layer token harness is a separate program: the stages here each build their
+//! own inputs and compare one stage's outputs, they do not chain layers.
 //!
 //! Build the cubins first, one per entry point and named after it, WITHOUT
 //! -DSPARKFLASH_ENABLE_GPU_TRACE (the trace macros then compile out and this launcher passes a
@@ -96,13 +120,21 @@
 //!   nvcc -cubin -arch=sm_121a -I kernels -o out/b12x_mxfp4_moe_sm121.cubin kernels/b12x_mxfp4_moe_sm121.cu
 //!   nvcc -cubin -arch=sm_121a -I kernels -o out/cert_lm_head_sm121.cubin kernels/cert_lm_head_sm121.cu
 //!
+//! Stage 8 additionally needs the three kernels it probes, each named after its entry point:
+//!
+//!   nvcc -cubin -arch=sm_121a -I kernels -o out/b12x_mxfp8_dense_sm121.cubin kernels/b12x_mxfp8_dense_sm121.cu
+//!   nvcc -cubin -arch=sm_121a -I kernels -o out/b12x_mxfp8_wo_a_sm121.cubin kernels/b12x_mxfp8_wo_a_sm121.cu
+//!   nvcc -cubin -arch=sm_121a -I kernels -o out/swiglu_mxfp8_quant_sm121.cubin kernels/swiglu_mxfp8_quant_sm121.cu
+//!
 //! Usage:
+//!   m7_layer0 --stage 0 --checkpoint <snapshot dir> --host-row <manifest prefix>   (CPU only)
 //!   m7_layer0 --stage 1 --checkpoint <snapshot dir> [--cubin-dir out] [--tokens 4] [--layer N]
 //!   m7_layer0 --stage 2 --checkpoint <snapshot dir> [--cubin-dir out] [--tokens 130] [--layer N]
 //!   m7_layer0 --stage 3 --checkpoint <snapshot dir> [--experts 8|32|64] [--tokens 4] [--layer N]
 //!   m7_layer0 --stage 4 --checkpoint <snapshot dir> [--tokens 4] [--repeat 10] [--layer N]
 //!   m7_layer0 --stage 5 --checkpoint <snapshot dir> --head-input HEAD.f32 --logits LOGITS.f32 [--cubin-dir out]
 //!   m7_layer0 --stage 6 --checkpoint <snapshot dir> --head-input HEAD.f32 --logits LOGITS.f32 [--mem-floor-gib 1]   (CPU only)
+//!   m7_layer0 --stage 8 [--cubin-dir out] [--layer N]   (probes: dense, wo_a, swiglu vs in-crate refs)
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -111,11 +143,13 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use sparkflash_kernels::m4_quant::{
-    QUANT_BLOCK, act_quant_fp8_row, fp4_e2m1_encode, fp8_e4m3_decode, fp8_e4m3_encode, ue8m0_decode,
+    E4M3_ELEMENT_EMAX, QUANT_BLOCK, act_quant_fp8_row, fp4_e2m1_encode, fp8_e4m3_decode,
+    fp8_e4m3_encode, ue8m0_decode, ue8m0_from_amax,
 };
 use sparkflash_kernels::mega_mhc_ref::{
-    HC_MULT, PREDICTOR_ROWS, Streams, TrafficLedger, bias_into_kernel_rows,
-    fold_predictor_into_kernel_rows, mega_mhc_layer_with_scale,
+    HC_MULT, PREDICTOR_ROWS, SINKHORN_EPS, SINKHORN_ITERS, Streams, TrafficLedger,
+    bias_into_kernel_rows, block_input_normed, mega_mhc_layer_with_scale,
+    released_predictor_into_kernel_rows, released_split_sinkhorn, sigmoid,
 };
 use sparkflash_kernels::{mla_ref, mxfp4_ref, mxfp8_ref, swiglu_ref};
 
@@ -155,6 +189,8 @@ struct Args {
     head_input: Option<PathBuf>,
     /// The reference logits (boundary_dump --logits-out), for --stage 5.
     logits: Option<PathBuf>,
+    /// The phase-1 host boundary v1 pair (manifest prefix) for stage 0's row-0 cross-check.
+    host_row: Option<PathBuf>,
     /// The kernel's indexer grid.y. Every slice walks a disjoint stripe of the 2,048 HSI blocks,
     /// sixteen blocks per slice; 64 stays the optimum once stage 2 stops running in every slice
     /// (one slice is 0.161 ms at 128 candidates, and 64 is 0.1613 against 0.1813 at 8).
@@ -178,6 +214,7 @@ fn parse_args() -> Result<Args, String> {
         grid_y: 64,
         head_input: None,
         logits: None,
+        host_row: None,
     };
     let mut values: std::vec::IntoIter<String> =
         std::env::args().skip(1).collect::<Vec<_>>().into_iter();
@@ -226,11 +263,27 @@ fn parse_args() -> Result<Args, String> {
             "--logits" => {
                 args.logits = Some(PathBuf::from(next_value(&mut values, &flag)?));
             }
+            "--host-row" => {
+                args.host_row = Some(PathBuf::from(next_value(&mut values, &flag)?));
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    if args.stage == 0 {
-        return Err("--stage 1, 2, 3, 4, 5 or 6 is required: one stage per run".to_string());
+    if args.stage > 8 {
+        return Err("--stage 0 through 8 is required: one stage per run".to_string());
+    }
+    if args.host_row.is_some() && args.stage != 0 && args.stage != 7 {
+        return Err(format!(
+            "--host-row is consumed by stage 0 and (later) stage 7, not by stage {}",
+            args.stage
+        ));
+    }
+    if args.stage == 0 && args.host_row.is_none() {
+        return Err(
+            "--stage 0 needs --host-row <manifest prefix>: it cross-checks the \
+                    captured row-0 coefficients"
+                .to_string(),
+        );
     }
     if args.checkpoint.as_os_str().is_empty() {
         return Err("--checkpoint is required".to_string());
@@ -758,17 +811,22 @@ fn read_header(path: &Path) -> Result<HashMap<String, Header>, String> {
 
 /// The released per-sublayer mHC tensors in the form the kernel and the reference consume.
 ///
-/// The predictor is the project's [24, d] fold, in the kernel's B/A/C row order with the released
-/// pre/post/comb rows mapped and the comb terms transposed; `hc_scale` stays in the release's
-/// [pre, post, comb] order because the kernel indexes it by group. Nothing is pre-folded: the scale
-/// must NOT multiply the predictor here, or the kernel would apply it a second time.
+/// The predictor is the RELEASED [24, n*d] matrix, in the kernel's B/A/C row order with the
+/// released pre/post/comb rows mapped and the comb terms transposed - B0 removed the d-wide fold, so
+/// the rows are permuted and never averaged, and both the reference and the kernel take this full
+/// form; `hc_scale` stays in the release's [pre, post, comb] order because the kernel indexes it by
+/// group. Nothing is pre-folded: the scale must NOT multiply the predictor here, or the kernel would
+/// apply it a second time.
 ///
 /// The bias is kept twice because the two consumers want different orders. `hc_base` is the
-/// checkpoint's 24-row order, which is what the reference takes (`mega_mhc_layer_with_scale` folds
+/// checkpoint's 24-row order, which is what the reference takes (`mega_mhc_layer_with_scale` maps
 /// it itself); `hc_base_kernel` is the same bias mapped onto the kernel's B/A/C rows and is the
-/// only form handed to the device. Passing `hc_base_kernel` to the reference would fold it twice,
+/// only form handed to the device. Passing `hc_base_kernel` to the reference would map it twice,
 /// so the field names carry the difference.
 struct ReleasedMhcTensors {
+    /// The released matrix exactly as the checkpoint stores it: [24][n*d], released row order.
+    released: Vec<f32>,
+    /// The same matrix permuted into kernel row order, copies kept.
     predictor: Vec<f32>,
     hc_base: [f32; PREDICTOR_ROWS],
     hc_base_kernel: [f32; PREDICTOR_ROWS],
@@ -778,27 +836,529 @@ struct ReleasedMhcTensors {
 fn read_released_mhc_tensors(
     snap: &mut Snapshot,
     prefix: &str,
+    sublayer: &str,
 ) -> Result<ReleasedMhcTensors, String> {
+    let fn_name = format!("{prefix}.hc_{sublayer}_fn");
     let fn_shape = [PREDICTOR_ROWS, HC_MULT * HIDDEN];
-    let raw_fn = snap.read_f32(&format!("{prefix}.hc_attn_fn"), &fn_shape)?;
-    let base = snap.read_f32(&format!("{prefix}.hc_attn_base"), &[PREDICTOR_ROWS])?;
-    let group_scale = snap.read_f32(&format!("{prefix}.hc_attn_scale"), &[3])?;
+    let raw_fn = snap.read_f32(&fn_name, &fn_shape)?;
+    let base = snap.read_f32(&format!("{prefix}.hc_{sublayer}_base"), &[PREDICTOR_ROWS])?;
+    let group_scale = snap.read_f32(&format!("{prefix}.hc_{sublayer}_scale"), &[3])?;
     let hc_base: [f32; PREDICTOR_ROWS] = base
         .as_slice()
         .try_into()
-        .map_err(|_| format!("{prefix}.hc_attn_base must be {PREDICTOR_ROWS} values"))?;
+        .map_err(|_| format!("{prefix}.hc_{sublayer}_base must be {PREDICTOR_ROWS} values"))?;
     let hc_scale: [f32; 3] = group_scale
         .as_slice()
         .try_into()
-        .map_err(|_| format!("{prefix}.hc_attn_scale must be three values"))?;
-    let mut predictor = vec![0.0f32; PREDICTOR_ROWS * HIDDEN];
-    fold_predictor_into_kernel_rows(&raw_fn, &mut predictor);
+        .map_err(|_| format!("{prefix}.hc_{sublayer}_scale must be three values"))?;
+    // B0: permute the released rows into kernel order, keep all n copies. The old
+    // fold_predictor_into_kernel_rows no longer exists; nothing here may average.
+    let mut predictor = vec![0.0f32; PREDICTOR_ROWS * HC_MULT * HIDDEN];
+    released_predictor_into_kernel_rows(&raw_fn, &mut predictor);
     Ok(ReleasedMhcTensors {
+        released: raw_fn,
         predictor,
         hc_base,
         hc_base_kernel: bias_into_kernel_rows(&hc_base),
         hc_scale,
     })
+}
+
+/// One tensor of a v1 phase-1 boundary row, as the manifest records it.
+struct V1Tensor {
+    dtype: String,
+    dims: Vec<usize>,
+    offset: usize,
+    len: usize,
+}
+
+/// A phase-1 host boundary v1 pair: the text manifest plus the blob it indexes.
+///
+/// The format is \`docs/build/phase1-boundary-table.md\` section 3: a header, then \`row N\` markers and
+/// one \`tensor <row> <name> <dtype> <dims> <offset> <bytes>\` line per tensor. Stage 0 reads two
+/// f32 tensors from row 0 and the coefficient tensors that row captured, so it needs a reader that
+/// checks the pair's own consistency rather than trusting the offsets.
+struct HostBoundaryTable {
+    prefix: PathBuf,
+    manifest: String,
+    blob: Vec<u8>,
+}
+
+impl HostBoundaryTable {
+    /// Open \`<prefix>.manifest\` and \`<prefix>.blob\`.
+    fn open(prefix: &Path) -> Result<Self, String> {
+        let manifest_path = prefix.with_extension("manifest");
+        let blob_path = prefix.with_extension("blob");
+        let manifest = std::fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+        let blob =
+            std::fs::read(&blob_path).map_err(|e| format!("{}: {e}", blob_path.display()))?;
+        if !manifest.starts_with("# phase1-boundary v1") {
+            return Err(format!(
+                "{}: not a phase1-boundary v1 manifest",
+                manifest_path.display()
+            ));
+        }
+        Ok(Self {
+            prefix: prefix.to_path_buf(),
+            manifest,
+            blob,
+        })
+    }
+
+    /// The tensor \`name\` of \`row\`, from its manifest line.
+    fn tensor(&self, row: usize, name: &str) -> Result<V1Tensor, String> {
+        let prefix = format!("tensor {row} {name} ");
+        let line = self
+            .manifest
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .ok_or_else(|| format!("{}: no tensor {name} in row {row}", self.prefix.display()))?;
+        let mut fields = line.split_whitespace().skip(3);
+        let dtype = fields
+            .next()
+            .ok_or_else(|| format!("row {row} {name}: no dtype"))?
+            .to_string();
+        let dims: Vec<usize> = fields
+            .next()
+            .ok_or_else(|| format!("row {row} {name}: no shape"))?
+            .split(',')
+            .map(|value| value.parse::<usize>().map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
+        let offset = fields
+            .next()
+            .ok_or_else(|| format!("row {row} {name}: no offset"))?
+            .parse::<usize>()
+            .map_err(|e| e.to_string())?;
+        let len = fields
+            .next()
+            .ok_or_else(|| format!("row {row} {name}: no length"))?
+            .parse::<usize>()
+            .map_err(|e| e.to_string())?;
+        if offset.saturating_add(len) > self.blob.len() {
+            let end = offset + len;
+            let blob = self.blob.len();
+            return Err(format!(
+                "row {row} {name}: [{offset}, {end}) is outside the {blob}-byte blob"
+            ));
+        }
+        Ok(V1Tensor {
+            dtype,
+            dims,
+            offset,
+            len,
+        })
+    }
+
+    /// The tensor's bytes.
+    fn bytes(&self, row: usize, name: &str) -> Result<Vec<u8>, String> {
+        let tensor = self.tensor(row, name)?;
+        Ok(self.blob[tensor.offset..tensor.offset + tensor.len].to_vec())
+    }
+
+    /// The tensor's bytes as a u8 slice, with its manifest dtype checked to be a u8 format.
+    fn u8(&self, row: usize, name: &str) -> Result<Vec<u8>, String> {
+        let tensor = self.tensor(row, name)?;
+        if !tensor.dtype.starts_with("u8") {
+            return Err(format!(
+                "row {row} {name}: expected a u8 format, the manifest says {}",
+                tensor.dtype
+            ));
+        }
+        let elements: usize = tensor.dims.iter().product();
+        let bytes = self.bytes(row, name)?;
+        if bytes.len() != elements {
+            return Err(format!(
+                "row {row} {name}: {elements} elements by shape, {} bytes",
+                bytes.len()
+            ));
+        }
+        Ok(bytes)
+    }
+
+    /// The tensor as f32 values, with its manifest dtype and shape checked.
+    fn f32(&self, row: usize, name: &str) -> Result<Vec<f32>, String> {
+        let tensor = self.tensor(row, name)?;
+        if tensor.dtype != "f32" {
+            return Err(format!(
+                "row {row} {name}: expected f32, the manifest says {}",
+                tensor.dtype
+            ));
+        }
+        let values = bytes_to_f32(&self.bytes(row, name)?);
+        let elements: usize = tensor.dims.iter().product();
+        if values.len() != elements {
+            return Err(format!(
+                "row {row} {name}: {elements} elements by shape, {} values by dtype",
+                values.len()
+            ));
+        }
+        Ok(values)
+    }
+}
+
+/// Compare one coefficient group the reference computed against the engine's captured tensor.
+///
+/// Returns (values compared, max abs delta, index of the max) and prints a line. \`tensor\` is the
+/// row-0 tensor name, \`captured\` its f32 values as the engine wrote them, and \`reference\` the
+/// reference's values in the same released orientation (the caller transposes B, because the
+/// reference's B is [destination][source] while the captured comb is [source][destination]).
+fn compare_row0_coefficient(
+    tensor: &str,
+    reference: &[f32],
+    captured: &[f32],
+) -> Result<(usize, f32, usize), String> {
+    if reference.len() != captured.len() {
+        return Err(format!(
+            "{tensor}: {} reference values against {} captured values",
+            reference.len(),
+            captured.len()
+        ));
+    }
+    let mut max_delta = 0.0f32;
+    let mut at = 0;
+    for (index, (reference, captured)) in reference.iter().zip(captured).enumerate() {
+        let delta = (reference - captured).abs();
+        if !delta.is_finite() || delta > max_delta {
+            max_delta = if delta.is_finite() {
+                delta
+            } else {
+                f32::INFINITY
+            };
+            at = index;
+        }
+    }
+    println!(
+        "  {tensor}: {} values, max abs delta {:e} at index {}",
+        captured.len(),
+        max_delta,
+        at
+    );
+    Ok((captured.len(), max_delta, at))
+}
+
+/// The released H(X) coefficient tensors for one predictor, computed through the reference's
+/// released arithmetic from raw logits in kernel row order. Used only by stage 0's non-vacuity
+/// half, so the retired fold can be compared against the engine's captured row without a second
+/// coefficient implementation.
+fn released_coefficients_from_raw(
+    raw: &[f32; PREDICTOR_ROWS],
+    hc_base: &[f32; PREDICTOR_ROWS],
+    hc_scale: &[f32; 3],
+) -> ([f32; 16], [f32; HC_MULT], [f32; HC_MULT]) {
+    let mut mixing = [[0.0f32; HC_MULT]; HC_MULT];
+    for (source, row_mixing) in mixing.iter_mut().enumerate() {
+        for (destination, slot) in row_mixing.iter_mut().enumerate() {
+            let row = destination * HC_MULT + source;
+            *slot = raw[row] * hc_scale[2] + hc_base[row];
+        }
+    }
+    released_split_sinkhorn(&mut mixing, SINKHORN_ITERS, SINKHORN_EPS);
+    let mut b = [0.0f32; 16];
+    for destination in 0..HC_MULT {
+        for source in 0..HC_MULT {
+            b[destination * HC_MULT + source] = mixing[source][destination];
+        }
+    }
+    let mut a = [0.0f32; HC_MULT];
+    let mut c = [0.0f32; HC_MULT];
+    for j in 0..HC_MULT {
+        a[j] = sigmoid(raw[HC_MULT * HC_MULT + j] * hc_scale[0] + hc_base[HC_MULT * HC_MULT + j])
+            + SINKHORN_EPS;
+        c[j] = 2.0
+            * sigmoid(
+                raw[HC_MULT * HC_MULT + HC_MULT + j] * hc_scale[1]
+                    + hc_base[HC_MULT * HC_MULT + HC_MULT + j],
+            );
+    }
+    (b, a, c)
+}
+
+/// The raw logits of the RETIRED d-wide fold: each released row averaged over the four copies, then
+/// projected against the stream mean in the same accumulation order the reference uses. This is the
+/// pre-B0 semantics, kept only as stage 0's non-vacuity evidence; nothing in the device path may use
+/// it.
+fn retired_fold_raw_logits(released: &[f32], streams: &[f32]) -> [f32; PREDICTOR_ROWS] {
+    let mut folded = vec![0.0f32; PREDICTOR_ROWS * HIDDEN];
+    for kernel_row in 0..PREDICTOR_ROWS {
+        let released_row = match kernel_row {
+            row if row < HC_MULT * HC_MULT => {
+                let destination = row / HC_MULT;
+                let source = row % HC_MULT;
+                2 * HC_MULT + source * HC_MULT + destination
+            }
+            row if row < HC_MULT * HC_MULT + HC_MULT => row - HC_MULT * HC_MULT,
+            row => HC_MULT + (row - HC_MULT * HC_MULT - HC_MULT),
+        };
+        for column in 0..HIDDEN {
+            let mut sum = 0.0f32;
+            for copy in 0..HC_MULT {
+                sum += released[released_row * HC_MULT * HIDDEN + copy * HIDDEN + column];
+            }
+            folded[kernel_row * HIDDEN + column] = sum / HC_MULT as f32;
+        }
+    }
+    let mut mean = vec![0.0f32; HIDDEN];
+    for copy in 0..HC_MULT {
+        for column in 0..HIDDEN {
+            mean[column] += streams[copy * HIDDEN + column];
+        }
+    }
+    for value in mean.iter_mut() {
+        *value /= HC_MULT as f32;
+    }
+    let mut raw = [0.0f32; PREDICTOR_ROWS];
+    for row in 0..PREDICTOR_ROWS {
+        let mut acc = 0.0f32;
+        for column in 0..HIDDEN {
+            acc += mean[column] * folded[row * HIDDEN + column];
+        }
+        raw[row] = acc;
+    }
+    raw
+}
+
+/// One captured block input's quantised tensors, recomputed from the row's own f32 values.
+///
+/// The engine wrote pre_*_hidden (the f32 normalised block input), pre_*_xhat (E4M3 codes) and
+/// pre_*_scales (ue8m0) through quant::quantize_activation_fp8, the reference ceil rule.
+/// [act_quant_fp8_row] is that same rule, so this checks the rule the device kernels now carry
+/// against the engine's OWN captured arithmetic, not against another copy of the device reference.
+/// The retired floor-rule codes are printed unjudged: they are the size of the gap D8 closed.
+///
+/// Returns (code mismatches, scale mismatches).
+fn stage0_activation_quantisers(
+    table: &HostBoundaryTable,
+    prefix: &str,
+    hidden_name: &str,
+    xhat_name: &str,
+    scales_name: &str,
+) -> Result<(usize, usize), String> {
+    let hidden = table.f32(0, hidden_name)?;
+    let captured_codes = table.u8(0, xhat_name)?;
+    let captured_scales = table.u8(0, scales_name)?;
+    if hidden.len() != HIDDEN {
+        return Err(format!(
+            "row 0 {hidden_name}: expected {HIDDEN} f32 values, got {}",
+            hidden.len()
+        ));
+    }
+    if captured_codes.len() != HIDDEN || captured_scales.len() != HIDDEN / QUANT_BLOCK {
+        return Err(format!(
+            "row 0 {xhat_name}: expected {HIDDEN} codes and {} scales, got {} and {}",
+            HIDDEN / QUANT_BLOCK,
+            captured_codes.len(),
+            captured_scales.len()
+        ));
+    }
+    let (codes, scales) = act_quant_fp8_row(&hidden);
+    let code_mismatches = codes
+        .iter()
+        .zip(&captured_codes)
+        .filter(|(recomputed, captured)| recomputed != captured)
+        .count();
+    let scale_mismatches = scales
+        .iter()
+        .zip(&captured_scales)
+        .filter(|(recomputed, captured)| recomputed != captured)
+        .count();
+    // The retired floor-log2 weight-grid rule on the same f32 values, for the gap's size only.
+    let mut floor_codes = [0u8; HIDDEN];
+    let mut floor_scales = [0u8; HIDDEN / QUANT_BLOCK];
+    let (code_blocks, _) = floor_codes.as_chunks_mut::<QUANT_BLOCK>();
+    for (block, (scale_slot, code_slot)) in floor_scales.iter_mut().zip(code_blocks).enumerate() {
+        let hidden_block = &hidden[block * QUANT_BLOCK..(block + 1) * QUANT_BLOCK];
+        let amax = hidden_block
+            .iter()
+            .fold(0.0f32, |amax, value| amax.max(value.abs()));
+        let code = ue8m0_from_amax(amax, E4M3_ELEMENT_EMAX);
+        *scale_slot = code;
+        let scale = ue8m0_decode(code);
+        for (dst, value) in code_slot.iter_mut().zip(hidden_block) {
+            *dst = fp8_e4m3_encode(value / scale);
+        }
+    }
+    let floor_code_mismatches = floor_codes
+        .iter()
+        .zip(&captured_codes)
+        .filter(|(recomputed, captured)| recomputed != captured)
+        .count();
+    let floor_scale_mismatches = floor_scales
+        .iter()
+        .zip(&captured_scales)
+        .filter(|(recomputed, captured)| recomputed != captured)
+        .count();
+    println!(
+        "  {prefix} activation quantiser: ceil-rule codes {}/{HIDDEN} exact, scales {}/{} exact; \
+         retired floor rule would give {}/{HIDDEN} codes and {}/{} scales exact (not judged)",
+        HIDDEN - code_mismatches,
+        HIDDEN / QUANT_BLOCK - scale_mismatches,
+        HIDDEN / QUANT_BLOCK,
+        HIDDEN - floor_code_mismatches,
+        HIDDEN / QUANT_BLOCK - floor_scale_mismatches,
+        HIDDEN / QUANT_BLOCK,
+    );
+    Ok((code_mismatches, scale_mismatches))
+}
+
+/// Stage 0: the fold-closure cross-check, CPU only.
+///
+/// It verifies the B0 claim against the engine's OWN captured arithmetic rather than against another
+/// copy of the reference: the released projection (all four copies, no averaging) must reproduce the
+/// coefficient tensors the host boundary row 0 recorded, and the retired fold must not. No CUDA
+/// context is created, so this runs while vLLM holds the node.
+fn stage0(args: &Args) -> Result<(), String> {
+    let host_row = args
+        .host_row
+        .as_ref()
+        .ok_or("--stage 0 needs --host-row <manifest prefix>")?;
+    println!(
+        "=== stage 0: the released projection against the engine's captured row-0 coefficients ==="
+    );
+    println!(
+        "comparison class: HOST-ONLY. The released hc_*_fn [24, n*d] matrices are projected over the \
+         flattened four-copy stream with the reference's released arithmetic, and the resulting \
+         pre/post/comb coefficients are diffed against the tensors the engine captured in boundary \
+         row 0. No CUDA context is created."
+    );
+    println!(
+        "pass bar: every full-projection coefficient within 1e-5 absolute of the engine's captured \
+         value (both sides are f32 sequential reductions over the same rows, so the expected delta \
+         is a few ULP). The retired-fold column is printed as evidence of the size of the semantic \
+         gap and is not judged."
+    );
+    if args.layer != 0 {
+        return Err(format!(
+            "stage 0 cross-checks captured row 0, so it needs --layer 0, got {}",
+            args.layer
+        ));
+    }
+    println!("host pair: {}", host_row.display());
+    let table = HostBoundaryTable::open(host_row)?;
+    let mut snap = Snapshot::open(&args.checkpoint)?;
+    println!("checkpoint: {}", args.checkpoint.display());
+
+    // The attn sublayer's streams are the row's residual_in (the updated X_l the block entered
+    // with); the ffn sublayer's streams are the row's post_attention_hidden. Both are captured
+    // [positions, hc, dim] f32 and one token is one 4*5120 stream.
+    let residual_in = table.f32(0, "residual_in")?;
+    let post_attention = table.f32(0, "post_attention_hidden")?;
+    if residual_in.len() != HC_MULT * HIDDEN || post_attention.len() != HC_MULT * HIDDEN {
+        return Err(format!(
+            "row 0: expected two {}-value streams, got {} and {}",
+            HC_MULT * HIDDEN,
+            residual_in.len(),
+            post_attention.len()
+        ));
+    }
+    let mut worst = 0.0f32;
+    let mut quant_mismatches = 0usize;
+    for (sublayer, streams, prefix) in [
+        ("attn", &residual_in, "hc_attn"),
+        ("ffn", &post_attention, "hc_ffn"),
+    ] {
+        let mhc = read_released_mhc_tensors(&mut snap, "layers.0", sublayer)?;
+        println!(
+            "{sublayer}: predictor {} f32 (released [24, 4*d], rows in kernel order, no averaging)",
+            mhc.predictor.len()
+        );
+        let (_, coefficients, _, _) = mega_mhc_layer_with_scale(
+            &mut Streams::new(streams.clone()),
+            &vec![1.0f32; HIDDEN],
+            &[1.0, 0.0, 0.0, 0.0],
+            &mhc.predictor,
+            &mhc.hc_base,
+            &mhc.hc_scale,
+            &mut TrafficLedger::default(),
+        );
+        // The captured coefficients are in the release's layouts: comb [source][destination],
+        // pre and post one value per copy. The reference's B is [destination][source].
+        let mut b_reference = vec![0.0f32; HC_MULT * HC_MULT];
+        for destination in 0..HC_MULT {
+            for source in 0..HC_MULT {
+                b_reference[source * HC_MULT + destination] = coefficients.b[destination][source];
+            }
+        }
+        let pre = table.f32(0, &format!("{prefix}_pre"))?;
+        let post = table.f32(0, &format!("{prefix}_post"))?;
+        let comb = table.f32(0, &format!("{prefix}_comb"))?;
+        let (_, d_pre, _) =
+            compare_row0_coefficient(&format!("{prefix}_pre"), &coefficients.a, &pre)?;
+        let (_, d_post, _) =
+            compare_row0_coefficient(&format!("{prefix}_post"), &coefficients.c, &post)?;
+        let (_, d_comb, _) =
+            compare_row0_coefficient(&format!("{prefix}_comb"), &b_reference, &comb)?;
+        worst = worst.max(d_pre).max(d_post).max(d_comb);
+
+        // Non-vacuity: the pre-B0 fold. Its predictor rows are averaged over the four copies and its
+        // projection is against the stream mean; it is computed explicitly so the reported delta
+        // belongs to the retired semantics, not to a scaled full projection.
+        let raw = retired_fold_raw_logits(&mhc.released, streams);
+        let (folded_b, folded_a, folded_c) =
+            released_coefficients_from_raw(&raw, &mhc.hc_base, &mhc.hc_scale);
+        let mut folded_b_released = vec![0.0f32; HC_MULT * HC_MULT];
+        for destination in 0..HC_MULT {
+            for source in 0..HC_MULT {
+                folded_b_released[source * HC_MULT + destination] =
+                    folded_b[destination * HC_MULT + source];
+            }
+        }
+        let (_, fold_pre, _) =
+            compare_row0_coefficient(&format!("{prefix}_pre (retired fold)"), &folded_a, &pre)?;
+        let (_, fold_post, _) =
+            compare_row0_coefficient(&format!("{prefix}_post (retired fold)"), &folded_c, &post)?;
+        let (_, fold_comb, _) = compare_row0_coefficient(
+            &format!("{prefix}_comb (retired fold)"),
+            &folded_b_released,
+            &comb,
+        )?;
+        println!(
+            "  {sublayer} retired fold vs captured: pre {:e}, post {:e}, comb {:e} (not judged)",
+            fold_pre, fold_post, fold_comb
+        );
+
+        // D8: the captured activation-quantised block input, recomputed from the row's own f32
+        // block input with the reference ceil rule. The engine wrote these tensors through its own
+        // quantise_activation_fp8, so this is the rule change checked against the engine's
+        // arithmetic, not against the device reference.
+        let (quant_prefix, hidden_name, xhat_name, scales_name) = match sublayer {
+            "attn" => (
+                "pre_attention",
+                "pre_attention_hidden",
+                "pre_attention_xhat",
+                "pre_attention_scales",
+            ),
+            "ffn" => (
+                "pre_ffn",
+                "pre_ffn_hidden",
+                "pre_ffn_xhat",
+                "pre_ffn_scales",
+            ),
+            other => return Err(format!("unknown sublayer {other}")),
+        };
+        let (code_mismatches, scale_mismatches) = stage0_activation_quantisers(
+            &table,
+            quant_prefix,
+            hidden_name,
+            xhat_name,
+            scales_name,
+        )?;
+        quant_mismatches += code_mismatches + scale_mismatches;
+    }
+    println!("stage 0: full-projection worst max abs delta {worst:e} against a 1e-5 bar");
+    println!(
+        "stage 0: activation-quantiser mismatches {quant_mismatches} against a 0 bar (ceil rule must reproduce the engine's captured codes and scales)"
+    );
+    if worst <= 1e-5 && quant_mismatches == 0 {
+        println!(
+            "stage 0: PASS (the released projection reproduces the engine's captured row-0 coefficients, and the ceil-rule activation quantiser reproduces its captured xhat codes and scales)"
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "stage 0: FAIL - worst projection delta {worst:e} (bar 1e-5), activation-quantiser mismatches {quant_mismatches} (bar 0)"
+        ))
+    }
 }
 
 /// Stage 1: the fused Mega-MHC kernel against the in-crate reference, on real layer-0 bytes.
@@ -813,7 +1373,8 @@ fn stage1(args: &Args) -> Result<(), String> {
     println!("=== stage 1: {kernel} against mega_mhc_ref::mega_mhc_layer_with_scale ===");
     println!(
         "comparison class: internal consistency of the fused Mega-mHC kernel against the in-crate \
-         CPU reference, on real layer-0 checkpoint bytes; NOT model fidelity"
+         CPU reference, on real layer-0 checkpoint bytes; the predictor is the released flattened \
+         [24, n*d] projection on BOTH sides (B0 closed the fold), NOT model fidelity"
     );
     println!(
         "compared at every boundary, exact matches and max abs delta: coefficients B[16] A[4] C[4] \
@@ -826,11 +1387,12 @@ fn stage1(args: &Args) -> Result<(), String> {
          C = 0, A = [1, 0, 0, 0], Y_-1 = 0, X_-1 = four copies of one embed.weight row"
     );
     println!(
-        "predictor fold: hc_attn_fn is stored as [24, 20480] over the flattened streams; the kernel \
-         and the reference both take the [24, 5120] fold over the stream MEAN. The fold maps the \
-         released rows pre(0..4)/post(4..8)/comb(8..24) onto the kernel's B(0..16)/A(16..20)/C(20..24) \
-         order, comb transposed (mega_mhc_ref::fold_predictor_into_kernel_rows); the group scale is \
-         NOT pre-folded, the kernel takes hc_attn_scale itself"
+        "predictor: hc_attn_fn is stored as [24, 20480] over the flattened streams, and BOTH sides \
+         consume the released [24, n*d] projection over all four copies (B0 removed the old d-wide \
+         fold from both). The kernel's B(0..16)/A(16..20)/C(20..24) order is the released \
+         pre/post/comb rows mapped with the comb terms transposed; the group scale is NOT \
+         pre-folded, the kernel takes hc_attn_scale itself. The RETIRED fold over the stream MEAN is \
+         measured only by stage 0's non-vacuity half and is not what this stage compares"
     );
     println!(
         "released tensors on the device path: hc_attn_scale [3] and hc_attn_base [24] both reach the \
@@ -848,7 +1410,7 @@ fn stage1(args: &Args) -> Result<(), String> {
 
     // The released mHC tensors in the form the kernel and the reference consume; nothing is
     // pre-folded into the predictor (the scale must reach the kernel as `hc_attn_scale`).
-    let mhc = read_released_mhc_tensors(&mut snap, &prefix)?;
+    let mhc = read_released_mhc_tensors(&mut snap, &prefix, "attn")?;
     let norm = snap.read_f32_or_bf16(&format!("{prefix}.attn_norm.weight"), &[HIDDEN])?;
     let predictor = mhc.predictor;
     let hc_base = mhc.hc_base;
@@ -862,14 +1424,14 @@ fn stage1(args: &Args) -> Result<(), String> {
         .fold(f32::NEG_INFINITY, f32::max);
     println!(
         "hc_attn_fn: {} f32 stored; hc_attn_base: {} f32 in [{base_min:.4}, {base_max:.4}] \
-         (consumed: checkpoint row order for the reference, folded B/A/C row order for the kernel);          hc_attn_scale: {hc_scale:?} (consumed)",
+         (consumed: checkpoint row order for the reference, kernel B/A/C row order for the device);          hc_attn_scale: {hc_scale:?} (consumed)",
         PREDICTOR_ROWS * HC_MULT * HIDDEN,
         mhc.hc_base.len(),
     );
     println!("attn_norm.weight: {} f32 after widening to f32", norm.len());
     println!(
-        "predictor: {} f32 folded into the kernel's B/A/C row order ({} KiB); hc_attn_fn released \
-         before any device allocation",
+        "predictor: {} f32 = released [24, 4*d] rows permuted into the kernel's B/A/C order, NO \
+         averaging ({} KiB); hc_attn_fn released before any device allocation",
         predictor.len(),
         predictor.len() * 4 / 1024,
     );
@@ -898,7 +1460,8 @@ fn stage1(args: &Args) -> Result<(), String> {
         + MHC_GRID_STATS * 4
         + 2 * 4
         + 24 * 4
-        + 4) as u64;
+        + 4
+        + HIDDEN * 4) as u64;
     let cuda = Cuda::load()?;
     let cubin_path = args.cubin_dir.join(format!("{kernel}.cubin"));
     let cubin = std::fs::read(&cubin_path).map_err(|e| {
@@ -925,6 +1488,7 @@ fn stage1(args: &Args) -> Result<(), String> {
     let sync_d = cuda.alloc(2 * 4, &mut allocated)?;
     let coeffs_d = cuda.alloc(24 * 4, &mut allocated)?;
     let rms_d = cuda.alloc(4, &mut allocated)?;
+    let normed_d = cuda.alloc(HIDDEN * 4, &mut allocated)?;
     println!(
         "device bytes allocated: {allocated} ({} KiB)",
         allocated / 1024
@@ -945,8 +1509,9 @@ fn stage1(args: &Args) -> Result<(), String> {
 
     let grid = (MHC_TILES, 1u32, 1u32);
     let block = (MHC_THREADS, 1u32, 1u32);
-    // The kernel takes 18 parameters: 15 pointers, the trace ring, the layer id, the step sequence.
-    let params: [u64; 18] = [
+    // The kernel takes 19 parameters: 16 pointers (including the B0 f32 block-input capture), the
+    // trace ring, the layer id and the step sequence.
+    let params: [u64; 19] = [
         x_d.0,
         y_d.0,
         b_d.0,
@@ -962,6 +1527,7 @@ fn stage1(args: &Args) -> Result<(), String> {
         sync_d.0,
         coeffs_d.0,
         rms_d.0,
+        normed_d.0,
         0, // trace_ring: null, the kernel is built without -DSPARKFLASH_ENABLE_GPU_TRACE
         args.layer as u64,
         0,
@@ -1004,12 +1570,14 @@ fn stage1(args: &Args) -> Result<(), String> {
         // 1/rms(X_hat), the released formula, from the same A the kernel was given: the RMSNorm of
         // the COLLAPSED block input uses X_hat's sum of squares over d and norm_eps = 1e-20, not
         // the four streams' sum over n*d and not the Sinkhorn epsilon.
+        let mut expected_xhat = vec![0.0f32; HIDDEN];
         let mut xhat_squares = 0.0f32;
         for column in 0..HIDDEN {
             let mut value = 0.0f32;
             for (stream, weight) in a_prev.iter().enumerate() {
                 value += weight * x[stream * HIDDEN + column];
             }
+            expected_xhat[column] = value;
             xhat_squares += value * value;
         }
         let expected_inv_rms = 1.0f32 / (xhat_squares / HIDDEN as f32 + NORM_EPS).sqrt();
@@ -1028,11 +1596,13 @@ fn stage1(args: &Args) -> Result<(), String> {
         let mut scales_out = vec![0u8; HIDDEN / QUANT_BLOCK];
         let mut coeffs_out = vec![0u8; 24 * 4];
         let mut rms_out = vec![0u8; 4];
+        let mut normed_out = vec![0u8; HIDDEN * 4];
         cuda.copy_dtoh(&mut x_out, &x_d)?;
         cuda.copy_dtoh(&mut fp8_out, &fp8_d)?;
         cuda.copy_dtoh(&mut scales_out, &scales_d)?;
         cuda.copy_dtoh(&mut coeffs_out, &coeffs_d)?;
         cuda.copy_dtoh(&mut rms_out, &rms_d)?;
+        cuda.copy_dtoh(&mut normed_out, &normed_d)?;
         let x_out_bits: Vec<u16> = x_out
             .as_chunks::<2>()
             .0
@@ -1068,6 +1638,18 @@ fn stage1(args: &Args) -> Result<(), String> {
         let s_scales = compare_u8("xhat_scales (ue8m0)", &scales_out, scales.as_slice())?;
         let s_x = compare_bf16_write("residual streams X_l", &x_out_bits, &expected_x)?;
         let s_rms = compare_f32("1/rms(X_hat)", &rms_out_f32, &[expected_inv_rms])?;
+        // The B0 capture: the kernel publishes the f32 block input it quantised, and the expected
+        // value is xhat * rms_weight * inverse_rms in the kernel's multiply order, both derived from
+        // the SAME inputs and the device's own inverse rms, so the two are expected bit-exact. This
+        // is a check of the capture itself, independent of codes-times-scale reconstruction.
+        let normed_out_f32 = bytes_to_f32(&normed_out);
+        let expected_normed = block_input_normed(&expected_xhat, &norm, rms_out_f32[0]);
+        let s_capture = compare_f32(
+            "block input f32 capture (xhat_normed)",
+            &normed_out_f32,
+            &expected_normed,
+        )?;
+        let capture_ok = s_capture.all_exact();
         let coefficients_ok =
             s_b.max_delta <= 1e-4 && s_a.max_delta <= 1e-4 && s_c.max_delta <= 1e-4;
         // Both sums of squares are block-parallel reductions whose four partials are combined in
@@ -1075,24 +1657,49 @@ fn stage1(args: &Args) -> Result<(), String> {
         let rms_ok = s_rms.max_delta <= 3e-4;
         let fp8_ok = s_fp8.exact_pct() >= 99.5 && s_fp8.max_delta <= 1.0;
         if s_fp8.exact != s_fp8.len {
-            println!(
-                "  finding: {} of {} FP8 codes differ (first at index {}), each by one code with the \
-                 scales bit-exact; the cause is upstream, not in the quantiser: the two sums of \
-                 squares differ between the device's fixed-order block reduction and the \
-                 reference's sequential accumulation, so 1/rms differs by {:e} and moves a value \
-                 across an E4M3 boundary",
-                s_fp8.len - s_fp8.exact,
-                s_fp8.len,
-                s_fp8.at,
-                s_rms.max_delta,
-            );
+            // The diagnosis is conditional on what the bytes show (D8 review M3): a quantiser-rule
+            // difference moves codes by more than one AND moves block scales, while the fixed-order
+            // vs sequential 1/rms residual is one code with bit-exact scales.
+            if s_scales.all_exact() && s_fp8.max_delta <= 1.0 {
+                println!(
+                    "  finding: {} of {} FP8 codes differ (first at index {}), each by one code with \
+                     the scales bit-exact; the cause is upstream, not in the quantiser: the two sums \
+                     of squares differ between the device's fixed-order block reduction and the \
+                     reference's sequential accumulation, so 1/rms differs by {:e} and moves a value \
+                     across an E4M3 boundary",
+                    s_fp8.len - s_fp8.exact,
+                    s_fp8.len,
+                    s_fp8.at,
+                    s_rms.max_delta,
+                );
+            } else {
+                println!(
+                    "  finding: {} of {} FP8 codes differ (first at index {}), max code delta {} and \
+                     {} of {} ue8m0 scales differing: this is a QUANTISER-RULE difference, not the \
+                     reduction-order residual (that one is a one-code difference with bit-exact \
+                     scales). Check which scale rule the installed cubin was built with before \
+                     reading the token verdict.",
+                    s_fp8.len - s_fp8.exact,
+                    s_fp8.len,
+                    s_fp8.at,
+                    s_fp8.max_delta,
+                    s_scales.len - s_scales.exact,
+                    s_scales.len,
+                );
+            }
         }
         verdicts.push((
             format!("token {token}"),
-            fp8_ok && s_scales.all_exact() && s_x.all_exact() && coefficients_ok && rms_ok,
+            fp8_ok
+                && s_scales.all_exact()
+                && s_x.all_exact()
+                && coefficients_ok
+                && rms_ok
+                && capture_ok,
         ));
         println!(
-            "  token {token} boundary verdict: fp8 {} scales {} X_l {} coefficients {} inv_rms {}",
+            "  token {token} boundary verdict: fp8 {} scales {} X_l {} coefficients {} inv_rms {} \
+             f32 block input {}",
             if fp8_ok { "within bar" } else { "DIFFER" },
             if s_scales.all_exact() {
                 "bit-exact"
@@ -1110,6 +1717,11 @@ fn stage1(args: &Args) -> Result<(), String> {
                 "OVER 1e-4"
             },
             if rms_ok { "within 3e-4" } else { "OVER 3e-4" },
+            if capture_ok {
+                "bit-exact"
+            } else {
+                "DIFFER (bar: bit-exact)"
+            },
         );
         println!(
             "  reference ledger: x_read {} x_write {} xhat_write {} scale_write {} (passes {})",
@@ -1162,6 +1774,7 @@ fn stage1(args: &Args) -> Result<(), String> {
             sync_d,
             coeffs_d,
             rms_d,
+            normed_d,
         ],
     );
     check_floor(args, "stage 1 end")?;
@@ -1423,7 +2036,7 @@ fn stage2(args: &Args) -> Result<(), String> {
         "label: internal consistency of the sink arithmetic, not model fidelity. The attention sink (attn_sink, F32 [64], a per-head additive logit inside the softmax denominator) is CONSUMED ON BOTH SIDES: the kernel takes it as an argument and adds it to the denominator after the maximum, and mla_ref::attention_with_sink does the same. The device run of this ABI change is what turns this into a measured device-vs-reference claim; until that Spark window, the comparison is internal consistency on host inputs."
     );
     println!(
-        "inherited limitation from stage 1, printed rather than implied: this stage's input chain starts at stage 1's xhat fp8 codes and scales, which carry stage 1's residual gap - the predictor is the project's [24, d] fold over the stream mean, not the release's [24, 20480] projection over the flattened stream - and the bf16 write and tf32-like reductions of the device. The coefficient tensors are NOT a gap any more: hc_attn_base and hc_attn_scale are consumed on both sides and the kernel's C is compared raw."
+        "inherited limitation from stage 1, printed rather than implied: this stage's input chain starts at stage 1's xhat fp8 codes and scales, which carry stage 1's residual gap - the bf16 write, the tf32-like reductions of the device, and the kernel's per-tile reduction order against the reference's serial arithmetic. The predictor is NOT a gap any more: B0 removed the d-wide fold, both sides consume the release's [24, 20480] projection over the flattened streams, and the coefficient tensors hc_attn_base and hc_attn_scale are consumed on both sides with the kernel's C compared raw."
     );
     println!(
         "layer {}: compress_ratios[0] = 0, so this is NOT a CED layer. The whole attention rule is the 128-token sliding window over at most index_topk 512 candidates. The candidate list is supplied by the harness: the top-512 merge over the HSI pool is a separate pipeline step the kernel does not implement. The HSI indexer inside the kernel is checked separately at the top of this stage on deterministic non-zero index data, against mla_ref::index_block_best, because stage 2 never consumes its block_scores/block_best; this stage's own boundary is the attention output.",
@@ -1439,7 +2052,7 @@ fn stage2(args: &Args) -> Result<(), String> {
 
     // The stage-1 chain, exactly as stage 1 runs it: the released tensors, the boundary seed and
     // the mHC reference, whose returned codes and scales are this stage's input.
-    let mhc = read_released_mhc_tensors(&mut snap, &prefix)?;
+    let mhc = read_released_mhc_tensors(&mut snap, &prefix, "attn")?;
     let norm = snap.read_f32_or_bf16(&format!("{prefix}.attn_norm.weight"), &[HIDDEN])?;
     let predictor = mhc.predictor;
     let hc_base = mhc.hc_base;
@@ -2335,7 +2948,7 @@ fn stage3(args: &Args) -> Result<(), String> {
 
     // The stage-1 chain, exactly as stages 1 and 2 run it: the released tensors and the boundary
     // seed, whose returned codes and scales are the hidden state this stage routes.
-    let mhc = read_released_mhc_tensors(&mut snap, &prefix)?;
+    let mhc = read_released_mhc_tensors(&mut snap, &prefix, "attn")?;
     let attn_norm = snap.read_f32_or_bf16(&format!("{prefix}.attn_norm.weight"), &[HIDDEN])?;
     let predictor = mhc.predictor;
     let hc_base = mhc.hc_base;
@@ -2679,10 +3292,9 @@ fn stage3(args: &Args) -> Result<(), String> {
             .iter()
             .map(|bits| half::bf16::from_bits(*bits).to_f32())
             .collect();
-        // swiglu_ref::quantise_row is deliberately not used here: its ue8m0_decode adds
-        // 0x0C00_0000 to the exponent, so the scale 127 decodes as 2^24 instead of 1.0 and every
-        // quantised code rounds to zero. The lines below are the same recipe with m4_quant's
-        // decoder, which the rest of this harness and the mxfp8 reference already use.
+        // The shared expert's activation is quantised by the same reference activation rule the
+        // device kernel now carries: swiglu_ref::quantise_row delegates to act_quant_fp8_row, and
+        // this call site spells the two steps out because it needs the f32 activation as well.
         let activated: Vec<f32> = gate
             .iter()
             .zip(&up)
@@ -2869,16 +3481,17 @@ fn stage4(args: &Args) -> Result<(), String> {
 
     let mut snap = Snapshot::open(&args.checkpoint)?;
     println!("checkpoint: {}", args.checkpoint.display());
-    let mhc = read_released_mhc_tensors(&mut snap, &prefix)?;
+    let mhc = read_released_mhc_tensors(&mut snap, &prefix, "attn")?;
     let norm = snap.read_f32_or_bf16(&format!("{prefix}.attn_norm.weight"), &[HIDDEN])?;
     let predictor = mhc.predictor;
     let hc_base_kernel = mhc.hc_base_kernel;
     let hc_scale = mhc.hc_scale;
     println!(
-        "predictor: {} f32 folded (released row order into kernel B/A/C, no scale pre-folded); \
-         hc_attn_base in kernel row order and hc_attn_scale {hc_scale:?} reach the kernel; \
-         attn_norm.weight: {} f32; the layer-0 seed is B = identity, C = 0, A = [1, 0, 0, 0], \
-         Y_-1 = 0, X_-1 = four copies of one embed row",
+        "predictor: {} f32 = released [24, 4*d] rows permuted into kernel B/A/C order, NO averaging \
+         (released row order into kernel B/A/C, no scale pre-folded); hc_attn_base in kernel row \
+         order and hc_attn_scale {hc_scale:?} reach the kernel; attn_norm.weight: {} f32; the \
+         layer-0 seed is B = identity, C = 0, A = [1, 0, 0, 0], Y_-1 = 0, X_-1 = four copies of one \
+         embed row",
         predictor.len(),
         norm.len()
     );
@@ -2905,7 +3518,8 @@ fn stage4(args: &Args) -> Result<(), String> {
         + MHC_GRID_STATS * 4
         + 2 * 4
         + 24 * 4
-        + 4) as u64;
+        + 4
+        + HIDDEN * 4) as u64;
     let cuda = Cuda::load()?;
     let cubin_path = args.cubin_dir.join(format!("{kernel}.cubin"));
     let cubin = std::fs::read(&cubin_path).map_err(|e| {
@@ -2932,6 +3546,7 @@ fn stage4(args: &Args) -> Result<(), String> {
     let sync_d = cuda.alloc(2 * 4, &mut allocated)?;
     let coeffs_d = cuda.alloc(24 * 4, &mut allocated)?;
     let rms_d = cuda.alloc(4, &mut allocated)?;
+    let normed_d = cuda.alloc(HIDDEN * 4, &mut allocated)?;
     println!(
         "device bytes allocated: {allocated} ({} KiB)",
         allocated / 1024
@@ -2948,7 +3563,7 @@ fn stage4(args: &Args) -> Result<(), String> {
 
     let grid = (MHC_TILES, 1u32, 1u32);
     let block = (MHC_THREADS, 1u32, 1u32);
-    let params: [u64; 18] = [
+    let params: [u64; 19] = [
         x_d.0,
         y_d.0,
         b_d.0,
@@ -2964,6 +3579,7 @@ fn stage4(args: &Args) -> Result<(), String> {
         sync_d.0,
         coeffs_d.0,
         rms_d.0,
+        normed_d.0,
         0, // trace_ring: null, the kernel is built without -DSPARKFLASH_ENABLE_GPU_TRACE
         args.layer as u64,
         0,
@@ -3450,6 +4066,330 @@ fn stage6(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------------------------
+// Stage 8: the three never-executed kernels, probed against their in-crate references on the same
+// bytes (B1). Dense and wo_a are compared bit-for-bit at the bf16 output; swiglu is compared at its
+// two outputs (E4M3 codes and ue8m0 scales). The probe is deterministic and tiny: it does not read
+// the checkpoint and its shapes are the smallest that exercise the tiling (dense: two tiles per
+// axis; wo_a: the released geometry; swiglu: one warp per block, both the 640-wide routed width and
+// the 2304-wide shared width).
+// ---------------------------------------------------------------------------------------------
+
+/// Deterministic byte patterns for the probe inputs: valid E4M3 codes only (0x7F is NaN), kept
+/// below the NaN code so a reference decode and the device decode agree.
+fn probe_codes(len: usize, stride: u32, period: u32) -> Vec<u8> {
+    (0..len)
+        .map(|index| (((index as u32).wrapping_mul(stride).wrapping_add(11)) % period) as u8)
+        .collect()
+}
+
+/// Deterministic ue8m0 scale codes: valid, in a middle exponent band, never 255.
+fn probe_scales(len: usize, stride: u32, period: u32) -> Vec<u8> {
+    (0..len)
+        .map(|index| (120 + ((index as u32).wrapping_mul(stride) % period)) as u8)
+        .collect()
+}
+
+fn bytes_to_u16(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect()
+}
+
+/// One probe's verdict line and its pass flag.
+struct ProbeVerdict {
+    name: String,
+    ok: bool,
+}
+
+/// Load one probe kernel from the cubin directory, folding the two failure modes into one message.
+fn load_probe_kernel(
+    cuda: &Cuda,
+    args: &Args,
+    kernel: &str,
+) -> Result<(CuModule, CuFunction), String> {
+    let path = args.cubin_dir.join(format!("{kernel}.cubin"));
+    let cubin = std::fs::read(&path).map_err(|e| {
+        format!(
+            "{}: {e} (build the B1 cubins first, see the module docs)",
+            path.display()
+        )
+    })?;
+    cuda.load_function(&cubin, kernel)
+}
+
+/// The dense probe: two tiles in each axis, one block per tile on the device, the in-crate GEMM on
+/// the same activation and B12x weight bytes.
+fn probe_dense(cuda: &Cuda, args: &Args, verdicts: &mut Vec<ProbeVerdict>) -> Result<(), String> {
+    let kernel = "b12x_mxfp8_dense_sm121";
+    println!("--- probe: {kernel} (dense MXFP8 GEMM) ---");
+    let (module, func) = load_probe_kernel(cuda, args, kernel)?;
+    let (rows, cols, inner) = (128usize, 128usize, 128usize);
+    let a = probe_codes(rows * inner, 37, 0x7F);
+    let a_scales = probe_scales(rows * inner / QUANT_BLOCK, 7, 16);
+    let w = probe_codes(mxfp8_ref::b12x_buffer_bytes(cols, inner), 53, 0x7F);
+    let w_scales = probe_scales(mxfp8_ref::b12x_scale_bytes(cols, inner), 11, 16);
+    let expected = mxfp8_ref::dense_gemm(&a, &a_scales, &w, &w_scales, rows, cols, inner);
+
+    let mut allocated = 0usize;
+    let a_d = cuda.alloc(a.len(), &mut allocated)?;
+    let as_d = cuda.alloc(a_scales.len(), &mut allocated)?;
+    let w_d = cuda.alloc(w.len(), &mut allocated)?;
+    let ws_d = cuda.alloc(w_scales.len(), &mut allocated)?;
+    let out_d = cuda.alloc(rows * cols * 2, &mut allocated)?;
+    println!(
+        "  shapes: rows {rows}, cols {cols}, inner {inner}; device bytes {allocated} ({} KiB)",
+        allocated / 1024
+    );
+    cuda.copy_htod(&a_d, &a)?;
+    cuda.copy_htod(&as_d, &a_scales)?;
+    cuda.copy_htod(&w_d, &w)?;
+    cuda.copy_htod(&ws_d, &w_scales)?;
+    let grid = ((rows.div_ceil(64)) as u32, (cols.div_ceil(64)) as u32, 1u32);
+    let block = (256u32, 1u32, 1u32);
+    let params: [u64; 11] = [
+        a_d.0,
+        as_d.0,
+        w_d.0,
+        ws_d.0,
+        out_d.0,
+        rows as u64,
+        cols as u64,
+        inner as u64,
+        0, // trace_ring: built without -DSPARKFLASH_ENABLE_GPU_TRACE
+        args.layer as u64,
+        0, // step_seq
+    ];
+    check_floor(args, "stage 8 dense pre-launch")?;
+    cuda.launch(func, grid, block, &params)?;
+    check_floor(args, "stage 8 dense post-launch")?;
+    let mut device = vec![0u8; rows * cols * 2];
+    cuda.copy_dtoh(&mut device, &out_d)?;
+    cuda.free(module, &[a_d, as_d, w_d, ws_d, out_d]);
+    let device_bits = bytes_to_u16(&device);
+    let (stats, max_ulp) = compare_bf16_bits("dense out", &device_bits, &expected);
+    println!("  max ULP distance {max_ulp}");
+    let ok = stats.all_exact() && max_ulp == 0;
+    verdicts.push(ProbeVerdict {
+        name: format!("{kernel}: bf16 out"),
+        ok,
+    });
+    Ok(())
+}
+
+/// The wo_a probe: the released geometry (8 groups, 4096 reduction, 1024 output channels per
+/// group), the in-crate grouped reference on the same bytes.
+fn probe_wo_a(cuda: &Cuda, args: &Args, verdicts: &mut Vec<ProbeVerdict>) -> Result<(), String> {
+    let kernel = "b12x_mxfp8_wo_a_sm121";
+    println!("--- probe: {kernel} (grouped wo_a MXFP8 GEMM) ---");
+    let (module, func) = load_probe_kernel(cuda, args, kernel)?;
+    let groups = 8usize;
+    let group_inner = 4096usize;
+    let lo_rank = 1024usize;
+    let attn = probe_codes(groups * group_inner, 29, 0x7F);
+    let attn_scales = probe_scales(groups * group_inner / QUANT_BLOCK, 5, 16);
+    let w = probe_codes(
+        groups * mxfp8_ref::b12x_buffer_bytes(lo_rank, group_inner),
+        17,
+        0x7F,
+    );
+    let w_scales = probe_scales(
+        groups * mxfp8_ref::b12x_scale_bytes(lo_rank, group_inner),
+        3,
+        16,
+    );
+    let expected = mxfp8_ref::grouped_wo_a(
+        &attn,
+        &attn_scales,
+        &w,
+        &w_scales,
+        groups,
+        group_inner,
+        lo_rank,
+    );
+
+    let mut allocated = 0usize;
+    let attn_d = cuda.alloc(attn.len(), &mut allocated)?;
+    let as_d = cuda.alloc(attn_scales.len(), &mut allocated)?;
+    let w_d = cuda.alloc(w.len(), &mut allocated)?;
+    let ws_d = cuda.alloc(w_scales.len(), &mut allocated)?;
+    let out_d = cuda.alloc(groups * lo_rank * 2, &mut allocated)?;
+    println!(
+        "  shapes: groups {groups}, group_inner {group_inner}, lo_rank {lo_rank}; device bytes {allocated} ({} MiB)",
+        allocated / (1024 * 1024)
+    );
+    cuda.copy_htod(&attn_d, &attn)?;
+    cuda.copy_htod(&as_d, &attn_scales)?;
+    cuda.copy_htod(&w_d, &w)?;
+    cuda.copy_htod(&ws_d, &w_scales)?;
+    let grid = (groups as u32, (lo_rank / 256) as u32, 1u32);
+    let block = (256u32, 1u32, 1u32);
+    let params: [u64; 9] = [
+        attn_d.0,
+        as_d.0,
+        w_d.0,
+        ws_d.0,
+        out_d.0,
+        groups as u64,
+        0, // trace_ring
+        args.layer as u64,
+        0, // step_seq
+    ];
+    check_floor(args, "stage 8 wo_a pre-launch")?;
+    cuda.launch(func, grid, block, &params)?;
+    check_floor(args, "stage 8 wo_a post-launch")?;
+    let mut device = vec![0u8; groups * lo_rank * 2];
+    cuda.copy_dtoh(&mut device, &out_d)?;
+    cuda.free(module, &[attn_d, as_d, w_d, ws_d, out_d]);
+    let device_bits = bytes_to_u16(&device);
+    let (stats, max_ulp) = compare_bf16_bits("wo_a lo_out", &device_bits, &expected);
+    println!("  max ULP distance {max_ulp}");
+    let ok = stats.all_exact() && max_ulp == 0;
+    verdicts.push(ProbeVerdict {
+        name: format!("{kernel}: bf16 lo_out"),
+        ok,
+    });
+    Ok(())
+}
+
+/// The swiglu probe at one width: the kernel's E4M3 codes and ue8m0 scales against
+/// swiglu_ref::quantise_row over the bf16-rounded inputs the device reads.
+fn probe_swiglu_shape(
+    cuda: &Cuda,
+    args: &Args,
+    func: CuFunction,
+    rows: usize,
+    cols: usize,
+    verdicts: &mut Vec<ProbeVerdict>,
+) -> Result<(), String> {
+    let limit = swiglu_ref::SWIGLU_LIMIT;
+    // Values spread over +-16 so both clamps fire on some elements, and bf16-rounded before both
+    // sides see them: the device reads bf16, so the reference must read the same bytes.
+    let gate_f32: Vec<f32> = (0..rows * cols)
+        .map(|index| (((index * 41 + 13) % 997) as f32 - 498.0) / 32.0)
+        .collect();
+    let up_f32: Vec<f32> = (0..rows * cols)
+        .map(|index| (((index * 59 + 7) % 991) as f32 - 495.0) / 32.0)
+        .collect();
+    let gate_bits = bf16_bits_of_f32(&gate_f32);
+    let up_bits = bf16_bits_of_f32(&up_f32);
+    let gate: Vec<f32> = gate_bits
+        .iter()
+        .map(|bits| half::bf16::from_bits(*bits).to_f32())
+        .collect();
+    let up: Vec<f32> = up_bits
+        .iter()
+        .map(|bits| half::bf16::from_bits(*bits).to_f32())
+        .collect();
+    let mut expected_codes = vec![0u8; rows * cols];
+    let mut expected_scales = vec![0u8; rows * cols / QUANT_BLOCK];
+    for row in 0..rows {
+        let (codes, scales) = swiglu_ref::quantise_row(
+            &gate[row * cols..(row + 1) * cols],
+            &up[row * cols..(row + 1) * cols],
+            limit,
+        );
+        expected_codes[row * cols..(row + 1) * cols].copy_from_slice(&codes);
+        expected_scales[row * cols / QUANT_BLOCK..(row + 1) * cols / QUANT_BLOCK]
+            .copy_from_slice(&scales);
+    }
+
+    let mut allocated = 0usize;
+    let gate_d = cuda.alloc(rows * cols * 2, &mut allocated)?;
+    let up_d = cuda.alloc(rows * cols * 2, &mut allocated)?;
+    let codes_d = cuda.alloc(rows * cols, &mut allocated)?;
+    let scales_d = cuda.alloc(rows * cols / QUANT_BLOCK, &mut allocated)?;
+    println!(
+        "  shape: rows {rows}, cols {cols}; device bytes {allocated} ({} KiB)",
+        allocated / 1024
+    );
+    cuda.copy_htod(&gate_d, &bf16_bits_to_bytes(&gate_bits))?;
+    cuda.copy_htod(&up_d, &bf16_bits_to_bytes(&up_bits))?;
+    let total_blocks = (rows * cols / QUANT_BLOCK) as u32;
+    let warps_per_block = 8u32;
+    let grid = (total_blocks.div_ceil(warps_per_block), 1u32, 1u32);
+    let block = (256u32, 1u32, 1u32);
+    let params: [u64; 10] = [
+        gate_d.0,
+        up_d.0,
+        codes_d.0,
+        scales_d.0,
+        rows as u64,
+        cols as u64,
+        u64::from(limit.to_bits()), // the f32 argument rides in a u64 slot, little-endian
+        0,                          // trace_ring
+        args.layer as u64,
+        0, // step_seq
+    ];
+    check_floor(args, &format!("stage 8 swiglu {rows}x{cols} pre-launch"))?;
+    cuda.launch(func, grid, block, &params)?;
+    check_floor(args, &format!("stage 8 swiglu {rows}x{cols} post-launch"))?;
+    let mut codes_out = vec![0u8; rows * cols];
+    let mut scales_out = vec![0u8; rows * cols / QUANT_BLOCK];
+    cuda.copy_dtoh(&mut codes_out, &codes_d)?;
+    cuda.copy_dtoh(&mut scales_out, &scales_d)?;
+    // Free the shape's buffers only; the module is unloaded once by stage 8 after both widths.
+    cuda.free(std::ptr::null_mut(), &[gate_d, up_d, codes_d, scales_d]);
+    let s_codes = compare_u8(
+        &format!("swiglu {rows}x{cols} out_fp8"),
+        &codes_out,
+        &expected_codes,
+    )?;
+    let s_scales = compare_u8(
+        &format!("swiglu {rows}x{cols} out_scales"),
+        &scales_out,
+        &expected_scales,
+    )?;
+    let ok = s_codes.all_exact() && s_scales.all_exact();
+    verdicts.push(ProbeVerdict {
+        name: format!("swiglu_mxfp8_quant_sm121 {rows}x{cols}: codes+scales"),
+        ok,
+    });
+    Ok(())
+}
+
+/// Stage 8: the B1 probes. Each probe compares a never-executed kernel against its in-crate
+/// reference on identical input bytes; the stage fails if any output is not bit-exact, and a
+/// failure is reported as a finding rather than absorbed by a tolerance (B1's contract, D6).
+fn stage8(args: &Args) -> Result<(), String> {
+    println!(
+        "=== stage 8: B1 probes, never-executed kernels against their in-crate references ==="
+    );
+    println!(
+        "comparison class: each kernel is compared BIT-EXACT against src/mxfp8_ref.rs or \
+         src/swiglu_ref.rs on identical input bytes; any difference is a finding, not a tolerance"
+    );
+    let cuda = Cuda::load()?;
+    let mut verdicts: Vec<ProbeVerdict> = Vec::new();
+    probe_dense(&cuda, args, &mut verdicts)?;
+    probe_wo_a(&cuda, args, &mut verdicts)?;
+
+    let kernel = "swiglu_mxfp8_quant_sm121";
+    println!("--- probe: {kernel} (SwiGLU activation + MXFP8 quantise) ---");
+    let (module, func) = load_probe_kernel(&cuda, args, kernel)?;
+    probe_swiglu_shape(&cuda, args, func, 4, 640, &mut verdicts)?;
+    probe_swiglu_shape(&cuda, args, func, 2, 2304, &mut verdicts)?;
+    cuda.free(module, &[]);
+
+    let failed: Vec<&str> = verdicts
+        .iter()
+        .filter(|verdict| !verdict.ok)
+        .map(|verdict| verdict.name.as_str())
+        .collect();
+    if failed.is_empty() {
+        println!("stage 8: PASS ({} probes bit-exact)", verdicts.len());
+        Ok(())
+    } else {
+        Err(format!(
+            "stage 8: FAIL at {:?} - a probe differs from its in-crate reference; B1 stops here and reports the delta rather than adjusting the bar",
+            failed
+        ))
+    }
+}
+
 fn main() -> Result<(), String> {
     let args = parse_args()?;
     println!("argv: {}", std::env::args().collect::<Vec<_>>().join(" "));
@@ -3457,15 +4397,27 @@ fn main() -> Result<(), String> {
         "memory discipline: floor {} GiB, working ceiling {WORKING_CEILING_GIB} GiB, MemAvailable checked before and after every launch",
         args.floor_gib
     );
-    check_floor(&args, "process start")?;
+    if args.stage == 0 {
+        println!(
+            "stage 0 is CPU-only: no CUDA context is created and the device memory floor is not \
+             checked; the only allocation is the row-0 tensors from the manifest/blob"
+        );
+    } else {
+        check_floor(&args, "process start")?;
+    }
     match args.stage {
+        0 => stage0(&args),
         1 => stage1(&args),
         2 => stage2(&args),
         3 => stage3(&args),
         4 => stage4(&args),
         5 => stage5(&args),
         6 => stage6(&args),
-        other => Err(format!("unknown stage {other}: one of 1, 2, 3, 4, 5, 6")),
+        8 => stage8(&args),
+        7 => Err("stage 7 (the B2 layer-0 replay) is not implemented yet".to_string()),
+        other => Err(format!(
+            "unknown stage {other}: one of 0, 1, 2, 3, 4, 5, 6, 8"
+        )),
     }
 }
 

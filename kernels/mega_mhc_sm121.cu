@@ -9,20 +9,27 @@
 //                                                   input-mixing coefficients by one layer is
 //                                                   the point of 2.4 - no second pass)
 //   3. tile dot products and sum-of-squares for H(X_l), then 20 Sinkhorn-Knopp iterations
-//   4. input RMS pre-norm and dynamic 32x32 ue8m0 FP8 quantization of X_hat_l
+//   4. input RMS pre-norm and the reference's dynamic activation quantisation of X_hat_l: one
+//      ue8m0 scale per 32 values from the act_quant ceil rule (spark_act_quant_scale_code), the
+//      rule the engine's quant::quantize_activation_fp8 uses for every GEMM's activation operand.
+//      The checkpoint weight-grid rule (spark_ue8m0_from_amax) is the other rule and is wrong here
 //
-// Write set: exactly X_l (n*d bf16) plus the quantized block input (d FP8 + d/32 scales). The
-// traffic bound (2n+2)d of specification 2.4 is checked by the CPU reference in
-// crates/sparkflash-kernels/src/mega_mhc_ref.rs, which counts every element the reference
-// touches per stage; see that module for the model and for the deliberately multi-pass variant
-// that proves the bound is not vacuous.
+// Write set: X_l (n*d bf16), the f32 pre-normed block input ready for quantization (d f32 - the
+// B0 boundary capture, so a comparison can separate the norm from the quantizer), and the
+// quantized block input (d FP8 + d/32 scales). The traffic bound (2n+2)d of specification 2.4 is
+// over the residual streams (read X_l once, write X_{l+1}); the CPU reference in
+// crates/sparkflash-kernels/src/mega_mhc_ref.rs counts every element the reference touches per
+// stage and keeps the stream traffic and the block-input representations separate. See that
+// module for the model and for the deliberately multi-pass variant that proves the bound is not
+// vacuous.
 //
-// H() interpretation, stated plainly because the specification does not fix its internals
-// (2.4 only says "RMSNorm weights folded offline into the predictor projection"): the folded
-// predictor is a (n*n + 2n) x d matrix applied to the stream mean of X_l, in the released row
-// order pre(0..n) / post(n..2n) / comb(2n..2n+n*n) permuted into this kernel's coefficient order
-// B(0..n*n) / A(n*n..n*n+n) / C(n*n+n..). The released arithmetic is applied to the accumulated
-// values, in the released order (inference/kernel.py:426-458):
+// H() interpretation, stated plainly because the specification does not fix its internals: the
+// predictor is the RELEASED (n*n + 2n) x (n*d) matrix, whose rows are the checkpoint's
+// pre(0..n) / post(n..2n) / comb(2n..2n+n*n) rows permuted into this kernel's coefficient order
+// B(0..n*n) / A(n*n..n*n+n) / C(n*n+n..) (the "RMSNorm weights folded offline into the predictor
+// projection" of 2.4 is how the release stores the projection; it is not a d-wide fold). Every row
+// projects all n copies of the flattened stream (model.py:951-954). The released arithmetic is
+// applied to the accumulated values, in the released order (inference/kernel.py:426-458):
 //
 //   mixes   = projection * rsqrt(mean(X_l^2) + norm_eps)   over the flattened n*d stream
 //   A_j     = sigmoid(mixes_j * hc_scale[0] + hc_base_j) + hc_eps
@@ -35,21 +42,35 @@
 // over the flattened n*d input (the projection's rsqrt). Together with the 24 projection rows
 // that is 26 accumulated scalars per tile.
 //
-// Verification status: compiled for sm_121a by nvcc 12.9.1 through the build-script probe (PTX
-// and cubin), parsed by the clang CUDA frontend against stub headers when nvcc is absent, and its
-// ABI is pinned by static asserts here plus parsed-declaration tests in
+// Predictor fold, removed by B0 (the Phase-1 device chain, 2026-10): earlier revisions of this
+// kernel and its CPU reference took the project's [24, 5120] fold - each released row averaged over
+// the four copies and applied to the stream mean - because that is what a d-wide single pass can
+// compute. That fold is NOT the released projection: with equal copies it computes the released
+// projection divided by the copy count, which is a semantic difference, not a rounding one. This
+// kernel now takes the released [24, 20480] matrix (1,966,080 bytes of f32 predictor buffer, the
+// predictor argument below) and performs the full projection over all four copies, so the device
+// column of the Phase-1 boundary table can be compared with the host reference. The pre-B0 stage-1
+// device runs measured the folded semantics; those numbers are retired, and the post-B0 run is the
+// first release-semantics stage-1 check. mega_mhc_ref.rs no longer exposes a fold helper.
+//
+// Verification status: compiled for sm_121a by nvcc through the build-script probe (PTX and
+// cubin), parsed by the clang CUDA frontend against stub headers when nvcc is absent, and its ABI
+// is pinned by static asserts here plus parsed-declaration tests in
 // crates/sparkflash-kernels/src/m4_abi.rs. The numerics are defined by mega_mhc_ref.rs on the CPU.
 //
 // Earlier revisions of this kernel (the pre-released-arithmetic ABI) ran on hardware: then
 // examples/m7_layer0.rs stage 1 matched the CPU reference on four layer-0 tokens, and stage 4
-// launched the same input ten times with byte-identical output. The ABI below - hc_scale and
-// hc_base, 26 statistics, released pre/post/comb - has NOT run on storage: the node's resident
-// model holds the only usable CUDA context, so the stage-1 and stage-4 device runs are owed. That
-// stage is the regression test for the reduction below: the four block partials go to slots fixed
-// by blockIdx and are combined in tile order in binary64, so the order the blocks reach the
-// rendezvous cannot change hc_stats. The old fp32 atomicAdd sequence could and did.
+// launched the same input ten times with byte-identical output. That old PASS compared the folded
+// semantics on both sides and is retired. The release-semantics device run IS the post-B0 run
+// (2026-10-18: stage 0 matches the engine's captured row-0 coefficients to 5.96e-8, stage 1 PASSes
+// 4 of 4 tokens at layers 0, 1 and 4 against the released-projection reference; logs
+// /home/user/phase1-evidence/phase1-b0-* and phase1-d8-*). That run is also the regression test
+// for the reduction below: the four block partials go to slots fixed by blockIdx and are combined
+// in tile order in binary64, so the order the blocks reach the rendezvous cannot change hc_stats.
+// The old fp32 atomicAdd sequence could and did.
 
 #include "m4_common_sm121.cuh"
+#include "m4_activation_quant_sm121.cuh"
 
 // The hidden dimension is swept as four 1280-element tiles, one block each: four tiles covering
 // d = 5120, which is the "4 x 5120 hidden-dim tiles" reading of 2.4.
@@ -88,7 +109,7 @@ extern "C" __global__ void mega_mhc_fused_bf16_sm121(
     const float *__restrict__ b_prev,           // [n][n] row-major stream mixing of layer l-1
     const float *__restrict__ c_prev,           // [n] block-output weights of layer l-1
     const float *__restrict__ a_prev,           // [n] input-mixing weights of layer l-1
-    const float *__restrict__ predictor,        // [n*n + 2n][d] folded H() predictor, kernel row order
+    const float *__restrict__ predictor,        // [n*n + 2n][n * d] released H() predictor, kernel row order
     const float *__restrict__ hc_scale,         // [3] released per-group scale: pre, post, comb
     const float *__restrict__ hc_base,          // [n*n + 2n] released per-row bias, kernel row order
     const float *__restrict__ rms_weight,       // [d] folded input RMS pre-norm weight
@@ -98,6 +119,7 @@ extern "C" __global__ void mega_mhc_fused_bf16_sm121(
     uint32_t *__restrict__ hc_sync,             // [2] grid scratch: tiles done, ready flag
     float *__restrict__ hc_coeffs,              // [24] out: B (n*n), A (n), C (n) for layer l
     float *__restrict__ hc_rms_out,             // [1] out: 1/rms(X_hat_l) used by the pre-norm
+    float *__restrict__ xhat_normed,            // [d] out: f32 X_hat_l * rms_weight * inv_rms
     GpuTraceRing *__restrict__ trace_ring,
     const uint32_t layer_id,
     const uint64_t step_seq) {
@@ -160,15 +182,21 @@ extern "C" __global__ void mega_mhc_fused_bf16_sm121(
         }
         // X_hat_l = A_{l-1} X_l from registers: no second traversal of the residual stream.
         float xhat = 0.0f;
-        float mean = 0.0f;
         for (uint32_t s = 0; s < n; ++s) {
             xhat += s_a[s] * updated[s];
-            mean += updated[s];
         }
-        mean *= 1.0f / (float)n;
         s_xhat[i] = xhat;
+        // The released predictor is [n*n + 2n][n*d]: every row projects the FLATTENED four-stream
+        // input, not the stream mean (model.py:951-954). The launcher has already permuted the
+        // released pre/post/comb rows into this kernel's B/A/C row order; the projection is the
+        // same "accumulate first, then rstd and scale and bias in the last-tile solve" chain.
         for (uint32_t p = 0; p < (uint32_t)SPARK_M4_HC_PREDICTOR_ROWS; ++p) {
-            local[p] += mean * predictor[p * d + index];
+            const float *row = predictor + (uint64_t)p * (uint64_t)(n * d) + (uint64_t)index;
+            float projection = 0.0f;
+            for (uint32_t s = 0; s < n; ++s) {
+                projection += updated[s] * row[(uint64_t)s * (uint64_t)d];
+            }
+            local[p] += projection;
         }
         // The block RMSNorm's statistic is over X_hat (released model.py:984/991), and the
         // projection's rsqrt statistic is over the flattened four-stream input (model.py:953-954).
@@ -298,10 +326,14 @@ extern "C" __global__ void mega_mhc_fused_bf16_sm121(
         float amax = 0.0f;
         for (uint32_t k = 0; k < SPARK_M4_QUANT_BLOCK; ++k) {
             const float value = s_xhat[element + k] * rms_weight[index + k] * inverse_rms;
+            xhat_normed[index + k] = value;
             const float magnitude = value < 0.0f ? -value : value;
             amax = magnitude > amax ? magnitude : amax;
         }
-        const uint8_t scale = spark_ue8m0_from_amax(amax, 8u);
+        // X_hat^FP8 is an ACTIVATION operand, so its scale is the reference's act_quant rule
+        // (smallest power of two at or above amax/448 after the 1e-4 floor), never the checkpoint
+        // weight-grid rule: the engine quantises this same vector with quant::quantize_activation_fp8.
+        const uint8_t scale = spark_act_quant_scale_code(amax);
         xhat_scales[index / SPARK_M4_QUANT_BLOCK] = scale;
         const float inverse_scale = 1.0f / spark_ue8m0_decode(scale);
         for (uint32_t k = 0; k < SPARK_M4_QUANT_BLOCK; ++k) {
@@ -312,9 +344,11 @@ extern "C" __global__ void mega_mhc_fused_bf16_sm121(
     }
 
     if (tid == 0u) {
-        // payload_meta: the bytes this layer writes per token - X_l (n*d*2), the block input
-        // (d) and its scales (d/32). The trace ring is the only place that number is reported.
-        const uint32_t meta = (uint32_t)(n * d * 2u + d + d / SPARK_M4_QUANT_BLOCK);
+        // payload_meta: the bytes this layer writes per token - X_l (n*d*2), the quantized block
+        // input (d) and its scales (d/32), and the f32 pre-normed block input (d*4). The trace ring
+        // is the only place that number is reported.
+        const uint32_t meta =
+            (uint32_t)(n * d * 2u + d + d / SPARK_M4_QUANT_BLOCK + d * 4u);
         const uint32_t reported = failed != 0u ? (meta | 0x80000000u) : meta;
         SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_MEGA_MHC, layer_id, reported, t_enter);
         // The trace macros expand to nothing when the scope mask is compiled out, so keep these

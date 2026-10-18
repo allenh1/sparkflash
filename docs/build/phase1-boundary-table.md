@@ -177,8 +177,11 @@ conversion"). The two byte tensors are one byte per element and have no order.
 element is clamped to +/-448 after division and rounded to the nearest E4M3 code (ties to even), and
 the scale is stored as the E8M0 byte `c` meaning `2^(c - 127)` (`quant.rs` `e8m0_encode_ceil`,
 `f8e8m0_to_f32`). E4M3 code `0x7f`/`0xff` (NaN) and E8M0 code `0xff` (NaN) never appear for a
-finite block; the tests assert that. The block is 32 **contiguous elements along `dim`**, one block
-per 32 channels of one token.
+finite block; the tests assert that. The device kernels implement this same ceil rule in
+`kernels/m4_activation_quant_sm121.cuh`'s `spark_act_quant_scale_code` (D23): the checkpoint's
+weight-grid rule `floor(log2(amax)) - element_emax` is a different rule, lives in a differently
+named helper in `m4_common_sm121.cuh`, and is never used for an activation. The block is 32
+**contiguous elements along `dim`**, one block per 32 channels of one token.
 
 **`dim` must be a multiple of 32** for the quantised pair to exist at all: the reference asserts
 `N % block_size == 0` rather than quantising a short block (kernel.py:108), and the observed entry
@@ -590,4 +593,40 @@ The artifacts stay on the node: `/home/user/hostrun/phase1-host-token0.manifest`
 committed here (the blob alone is 13 MB). This is the host column of criterion 1 and the reference half of criterion 3. It is not the
 device column: no device table has been captured, so nothing here says the device path matches this
 table, and the bars of section 5 remain to be measured against it.
+
+
+## 12. The chained device path, layer 0 (measured 2026-10-18)
+
+This is the device column for the layer-0 boundary: the M7 harness stages that feed each other's
+inputs, run on the node in one window (vLLM stopped; pinned nvcc V13.0.88 cubins, binary sha256
+`56f82fb7...`, mega_mhc cubin sha256 `e21293e3...`). Every log names its argv, binary sha256, UTC start/end and `MemAvailable` before and after; a log of a run
+that loads kernels names the cubin sha256s too, with one exception: the two B1 probe attempts
+(`phase1-b1-stage8-probes-20261018T011320Z.log`, `...011404Z.log`) record the binary only, so they are
+cited for their probe numbers and not as cubin provenance. The logs are
+`/home/user/phase1-evidence/phase1-d8-*` and the earlier B0 runs `phase1-b0-*`. **Log regeneration pending:** the stage-1 and stage-2 logs behind the table below were
+produced before the M2 fix of their printed comparison-class strings and still print the retired
+stream-mean fold as the predictor. Their numbers are cited here, but they are not current
+evidence until regenerated in a device window; the printed class lines in this file are the ones
+the fixed harness emits.
+
+| stage | what it checks | measured result | log (UTC) |
+|---|---|---|---|
+| 0 | released `[24, n*d]` projection against the engine's captured row-0 coefficients, plus the captured activation quantiser recomputed with the ceil rule | projection worst abs delta 5.96e-8 against a 1e-5 bar; ceil-rule codes 5,120/5,120 and scales 160/160 exact for both block inputs; retired floor rule would give 4,288/5,120 + 134/160 (attn) and 4,096/5,120 + 128/160 (ffn). PASS | 01:25:33Z-01:25:34Z |
+| 1, layers 0/1/4 | `mega_mhc_fused_bf16_sm121` against `mega_mhc_ref::mega_mhc_layer_with_scale` | PASS 4/4 tokens each. Layer 0: token 0 matches **5,119/5,120 codes** (one one-code difference at index 615) with 160/160 scales bit-exact; tokens 1-3 match 5,120/5,120 codes and 160/160 scales. Layer 1: 5,120/5,120 codes and 160/160 scales at every token. Layer 4: token 0 matches **5,118/5,120 codes** (two one-code differences, scales exact) and its other tokens match everything. Where a code differs the cause is the known fixed-order vs sequential `1/rms` reduction delta, inside the stage-1 bar. | 01:26:13Z-01:26:26Z |
+| 8 | dense MXFP8 GEMM, grouped wo_a, SwiGLU activation quantiser against the in-crate references on identical bytes | 4/4 probes bit-exact: dense 16,384/16,384 and wo_a 8,192/8,192 (max ULP 0); swiglu 4x640 codes 2,560/2,560 + scales 80/80; swiglu 2x2304 codes 4,608/4,608 + scales 144/144 | 01:26:36Z-01:26:37Z |
+| 2, layer 0 | `flash_mla_csa2_sm121` against `mla_ref::attention_with_sink` | PASS 3/3 positions: 32,768/32,768 bf16 exact at positions 0 and 1; position 3 32,765/32,768 (99.9908% vs 99.5% bar), max ULP 1, max abs delta 1.19e-7 (bar 1.6e-2) | 01:26:49Z-01:26:50Z |
+| 3, layer 0 | `b12x_mxfp4_moe_sm121` down/combine against `mxfp4_ref::moe_combine` | PASS: combine 20,480/20,480 bf16 exact, max ULP 0; the printed quantisation gap (quantised vs f32 activation) is 100% of outputs, unchanged, because this stage's device boundary is the combine only | 01:26:51Z-01:27:03Z |
+
+Rule change (D23): the old floor-rule behaviour is the mislabelled log above (4,287/5,120 codes
+and 134/160 scales on token 0, but with the new binary and new cubin hashes in its header). The
+pre-D8 floor-rule cubin is retained at
+`/home/user/phase1-evidence/b0-out/mega_mhc_fused_bf16_sm121.cubin` (70,152 B sha256
+`6487f6ff...`); a properly labelled
+`OLD-VS-NEW` run (old cubin + new ceil-rule reference, both binary and cubin hashes in the log)
+is a **device-window item** and is not cited as evidence until it exists.
+
+What this still does not do: the B2 row-0 dump-and-diff (all 18 tensors against the host table, per
+tensor class) is a separate stage not yet implemented, so no device `v1` table exists and the
+bars of section 5 are still unmeasured against this table. Stages 1-3 chain by passing inputs from
+one stage to the next inside the harness; the 40-layer token chain is a separate program.
 

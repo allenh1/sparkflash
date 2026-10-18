@@ -1,4 +1,5 @@
-//! The released per-sublayer row order on the consumers that are easy to get wrong.
+//! The released per-sublayer row order and the released predictor on the consumers that are easy to
+//! get wrong.
 //!
 //! A source pin is a shape check, not a numeric one, and says so: it exists because these are
 //! index-order mistakes that the device-side numbers would only reveal on a machine with a free CUDA
@@ -37,8 +38,7 @@ fn the_kernel_publishes_each_coefficient_group_from_its_own_statistics_rows() {
     );
     assert!(
         !code.contains("2u * n * n") && !code.contains("2 * n * n"),
-        "2*n*n is not a group row index for hc_mult = 4: the stats buffer holds 24 predictor \
-         statistics, so n*n + 2n = 24 is the end and 2*n*n = 32 is past it"
+        "2*n*n is not a group row index for hc_mult = 4: the stats buffer holds 24 predictor statistics, so n*n + 2n = 24 is the end and 2*n*n = 32 is past it"
     );
     assert!(
         code.contains("hc_coeffs[n * n + n + destination] = output[destination]"),
@@ -49,45 +49,63 @@ fn the_kernel_publishes_each_coefficient_group_from_its_own_statistics_rows() {
         "B must be published as [destination][source] from the released [source][destination]"
     );
 }
+
 #[test]
-fn the_harness_gives_the_reference_the_checkpoint_order_bias_and_the_kernel_the_folded_one() {
+fn the_harness_gives_the_reference_checkpoint_order_and_the_kernel_the_kernel_order() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let harness =
         std::fs::read_to_string(root.join("crates/sparkflash-kernels/examples/m7_layer0.rs"))
             .expect("the M7 harness must be readable from the crate");
-    // Exactly the three reference call sites (stages 1, 2 and 3) and each one gets the checkpoint
-    // order array, never the folded one.
+    // Every reference call site gets the checkpoint-order bias. The reference's h_of_with_scale
+    // applies the bias in the released [pre, post, comb] group order after the released [24, n*d]
+    // projection; handing it the kernel-row-order bias would apply the row permutation twice.
     let mut at = 0usize;
     let mut calls = 0usize;
     while let Some(offset) = harness[at..].find("mega_mhc_layer_with_scale(") {
         let start = at + offset;
-        let window = &harness[start..(start + 600).min(harness.len())];
+        let window = &harness[start..(start + 700).min(harness.len())];
         assert!(
-            window.contains("&hc_base,"),
-            "a mega_mhc_layer_with_scale call does not receive hc_base (checkpoint order): {window}"
+            window.contains("hc_base,"),
+            "a mega_mhc_layer_with_scale call does not receive an hc_base (checkpoint order): {window}"
         );
         assert!(
-            !window.contains("&hc_base_kernel,"),
-            "a mega_mhc_layer_with_scale call receives the folded hc_base_kernel, so the reference \
-             would fold the bias twice: {window}"
+            !window.contains("&hc_base_kernel,") && !window.contains("&mhc.hc_base_kernel"),
+            "a mega_mhc_layer_with_scale call receives the kernel-order bias as an argument, so the reference would apply the row permutation twice: {window}"
         );
         calls += 1;
         at = start + "mega_mhc_layer_with_scale(".len();
     }
+    // Stage 0's one call site loops over both sublayers (attn, ffn) and stages 1, 2 and 3 have one
+    // call site each, so the source has four.
     assert_eq!(
-        calls, 3,
-        "stages 1, 2 and 3 each run the reference once; the constant moved, re-derive the count"
+        calls, 4,
+        "the reference call-site count moved (stage 0 runs both sublayers through one site); re-derive the count"
     );
-    // The kernel still receives the folded order, produced exactly once from the checkpoint order.
+    // The kernel-order bias is still produced exactly once from the checkpoint order.
+    assert_eq!(
+        harness
+            .matches("hc_base_kernel: bias_into_kernel_rows(&hc_base)")
+            .count(),
+        1,
+        "the kernel-order bias must be derived from the checkpoint-order hc_base exactly once"
+    );
+    // The released predictor is [24, n*d] full rows in the release's row order; the kernel's row
+    // order is a permutation of those rows, never an average over the four copies (that was the
+    // retired fold, and B0 removed it from both sides).
     assert!(
-        harness.contains("hc_base_kernel: bias_into_kernel_rows(&hc_base)"),
-        "the folded kernel-order bias must be derived from the checkpoint-order hc_base exactly once"
+        harness.contains("released_predictor_into_kernel_rows(&raw_fn, &mut predictor)"),
+        "the harness must permute the released [24, n*d] rows into kernel order without averaging"
     );
+    assert!(
+        !harness.contains("fold_predictor_into_kernel_rows("),
+        "no pre-B0 predictor fold call may survive in the harness (only comments may name it)"
+    );
+    // Only stage 1 and stage 4 launch mega_mhc, and both must upload the kernel-order bias.
     assert_eq!(
         harness
             .matches("cuda.copy_htod(&base_d, &f32_to_bytes(&hc_base_kernel))")
             .count(),
         2,
-        "only stage 1 and stage 4 launch mega_mhc, and both must upload the folded order"
+        "only stage 1 and stage 4 launch mega_mhc, and both must upload the kernel-order bias"
     );
 }

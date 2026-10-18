@@ -139,7 +139,10 @@ Kernel-level rules:
 - Both GEMMs share **one** activation quantiser. model.py:187 (fp4 weights) and model.py:197 (fp8
   weights) make the identical call `act_quant(x, fp8_block_size=32, scale_fmt="ue8m0",
   scale_dtype=e8m0fnu)`, which returns E4M3 values with per-32 ue8m0 scales; amax is floored at 1e-4
-  and, because scale_fmt is set, the scale is rounded to a power of two (kernel.py:74-80).
+  and the scale is the smallest power of two at or above amax/448, i.e. the exponent is rounded UP
+  (kernel.py:74-80). That is the activation rule, not the checkpoint's weight-grid floor-log2 rule;
+  the device SwiGLU quantiser takes it from `kernels/m4_activation_quant_sm121.cuh`'s
+  `spark_act_quant_scale_code` and the mHC block input uses the same helper (D23/D8).
 - **The routed-expert GEMM is W4A8, not W4A4**: fp4 e2m1 weights against fp8 e4m3 activations. The
   kernel that implements it is documented as "FP8 act x FP4 weight GEMM" and typed
   `A: T.Tensor[(M, K), FP8]`, `B: T.Tensor[(N, K), FP4]` (kernel.py:486-499, 511-515). The dispatch

@@ -165,8 +165,12 @@ block input:
    19 alternating row and column normalisations. All of it fits in registers or shared memory.
 6. **Input pre-norm**: RMSNorm(X_hat) with the sublayer's norm weight (attn_norm or ffn_norm).
 7. **Dynamic FP8 quantisation of the normalised block input**: act_quant with block_size = 32 and
-   scale_fmt = "ue8m0", i.e. power-of-two scales via fast_round_scale with amax floored at 1e-4
-   (kernel.py:36-37, 74-80).
+   scale_fmt = "ue8m0", i.e. the SMALLEST power of two at or above amax/448 (the exponent is rounded
+   up), with amax floored at 1e-4 (kernel.py:36-37, 74-80). This is the reference's activation rule,
+   not the checkpoint's weight-grid rule `floor(log2(amax)) - 8`: the device kernel implements it
+   in `kernels/m4_activation_quant_sm121.cuh`'s `spark_act_quant_scale_code` and the two rules are
+   separate, named helpers (D23/D8). The mHC reference and the harness use
+   `m4_quant::act_quant_fp8_row` for the same reason.
 8. **Write X_out once**, plus the quantised X_hat and its per-32 scales.
 
 Data the kernel needs that the report omits: **A_prev must arrive as an input** (it is the previous

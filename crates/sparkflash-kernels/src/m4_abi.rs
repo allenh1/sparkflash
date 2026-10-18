@@ -979,6 +979,10 @@ fn mega_mhc_signature_is_pinned() {
                 name: "hc_rms_out",
             },
             ExpectedParam {
+                raw_type: "float *__restrict__ xhat_normed",
+                name: "xhat_normed",
+            },
+            ExpectedParam {
                 raw_type: "GpuTraceRing *__restrict__ trace_ring",
                 name: "trace_ring",
             },
@@ -1004,7 +1008,7 @@ const SIGNATURES: [(&str, &str, &str); 6] = [
     (
         "mega_mhc_sm121.cu",
         "mega_mhc_fused_bf16_sm121",
-        "__nv_bfloat16 *__restrict__ x; const __nv_bfloat16 *__restrict__ y_prev; const float *__restrict__ b_prev; const float *__restrict__ c_prev; const float *__restrict__ a_prev; const float *__restrict__ predictor; const float *__restrict__ hc_scale; const float *__restrict__ hc_base; const float *__restrict__ rms_weight; uint8_t *__restrict__ xhat_fp8; uint8_t *__restrict__ xhat_scales; float *__restrict__ hc_stats; uint32_t *__restrict__ hc_sync; float *__restrict__ hc_coeffs; float *__restrict__ hc_rms_out; GpuTraceRing *__restrict__ trace_ring; const uint32_t layer_id; const uint64_t step_seq",
+        "__nv_bfloat16 *__restrict__ x; const __nv_bfloat16 *__restrict__ y_prev; const float *__restrict__ b_prev; const float *__restrict__ c_prev; const float *__restrict__ a_prev; const float *__restrict__ predictor; const float *__restrict__ hc_scale; const float *__restrict__ hc_base; const float *__restrict__ rms_weight; uint8_t *__restrict__ xhat_fp8; uint8_t *__restrict__ xhat_scales; float *__restrict__ hc_stats; uint32_t *__restrict__ hc_sync; float *__restrict__ hc_coeffs; float *__restrict__ hc_rms_out; float *__restrict__ xhat_normed; GpuTraceRing *__restrict__ trace_ring; const uint32_t layer_id; const uint64_t step_seq",
     ),
     (
         "b12x_mxfp8_dense_sm121.cu",
@@ -1129,7 +1133,7 @@ fn the_signature_parser_notices_a_dropped_qualifier() {
     );
     assert_eq!(
         decl.params.len(),
-        18,
+        19,
         "the parameter count is unchanged by the mutation"
     );
     // xhat_scales is parameter 10: x, y_prev, b_prev, c_prev, a_prev, predictor, hc_scale,
@@ -2014,6 +2018,22 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
     assert!(
         !mla_uses_the_index_head(&query_head),
         "the query head must not index the indexer query buffer"
+    );
+
+    // A6: the normed X_hat row is actually written. The write is not on the quantiser's own path
+    // (that recomputes the product), so deleting it left the whole suite green even though the
+    // exported row - mega_mhc_sm121.cu:329's xhat_normed - was empty. The reference's own row
+    // comparison cannot see a missing device write that no test reads, so the source text pins it.
+    let mhc_writes_the_normed_row = |source: &str| -> bool {
+        let code = crate::c_decl::strip_comments(source);
+        code.contains("xhat_normed[index + k] = value;")
+    };
+    assert!(mhc_writes_the_normed_row(MEGA_MHC));
+    let dropped_normed_write = MEGA_MHC.replace("xhat_normed[index + k] = value;", "");
+    assert_ne!(dropped_normed_write, MEGA_MHC, "the mutation must apply");
+    assert!(
+        !mhc_writes_the_normed_row(&dropped_normed_write),
+        "the normed X_hat write is the kernel's exported row, not dead code"
     );
 
     // A7: the MoE masks the padded region instead of trusting the caller to have zeroed it.
