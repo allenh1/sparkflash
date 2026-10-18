@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! M7: layer 0 of DeepSeek-V4.1-Flash on the GB10, one stage per run.
 //!
 //! The layer is the unit of proof: a stage that matches at a boundary localises a failure to that
@@ -154,13 +156,21 @@
 //!                                             --stage9-kv-format engine selects the engine's released window-KV format for K5, fp4 is the default)
 
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
 use sparkflash_engine::safetensors::SafeTensorsSource;
 use sparkflash_engine::{ModelConfig, TensorPlan, WeightSource};
+use sparkflash_kernels::cuda_driver::{
+    Cuda, Deviceptr, Kernel as CuFunction, KernelId, Module as CuModule, mem_available_kb,
+};
+use sparkflash_kernels::cuda_harness::{
+    EngineWindowStats, FlashMlaKernel, FlashMlaParams, assert_engine_window_finite,
+    engine_window_row, flash_mla_params, launch_flash_mla as flash_mla_launch,
+    launch_flash_mla_repeated as flash_mla_launch_repeated,
+    load_flash_mla as load_flash_mla_kernel,
+};
 use sparkflash_kernels::m4_quant::{
-    E4M3_ELEMENT_EMAX, QUANT_BLOCK, act_quant_fp8_row, bf16_bits, fp4_e2m1_encode, fp8_e4m3_decode,
+    E4M3_ELEMENT_EMAX, QUANT_BLOCK, act_quant_fp8_row, fp4_e2m1_encode, fp8_e4m3_decode,
     fp8_e4m3_encode, ue8m0_decode, ue8m0_from_amax,
 };
 use sparkflash_kernels::mega_mhc_ref::{
@@ -178,6 +188,25 @@ use self::b2_harness::{
     combine_bf16_routed_with_shared, forced_control_verdict, free_forced_metrics, gate_up_rows,
     route_token_with, slice_and_pad_rows, verify_forced_ffn_out, verify_forced_operand_provenance,
 };
+
+/// Maps a cubin kernel name to the shared driver KernelId.
+///
+/// The flash_mla kernel is deliberately absent: it is loaded only through
+/// cuda_harness::load_flash_mla, which owns the symbol and returns the opaque FlashMlaKernel, so
+/// the harness never holds a raw handle for it.
+fn kernel_id(name: &str) -> Result<KernelId, String> {
+    match name {
+        "mega_mhc_fused_bf16_sm121" => Ok(KernelId::MegaMhcBf16),
+        "b12x_mxfp8_dense_sm121" => Ok(KernelId::Mxfp8Dense),
+        "b12x_mxfp8_wo_a_sm121" => Ok(KernelId::Mxfp8WoA),
+        "b12x_mxfp4_moe_sm121" => Ok(KernelId::Mxfp4Moe),
+        "swiglu_mxfp8_quant_sm121" => Ok(KernelId::SwigluMxfp8Quant),
+        "cert_lm_head_sm121" => Ok(KernelId::CertLmHead),
+        other => Err(format!(
+            "{other} is not one of the shared driver kernels; the flash_mla kernel is loaded through cuda_harness::load_flash_mla and has no KernelId"
+        )),
+    }
+}
 
 /// The hidden width the checkpoint's layer 0 is built around.
 const HIDDEN: usize = 5120;
@@ -281,80 +310,6 @@ impl WindowKvFormat {
             Self::Engine => "engine (released FP8 window format, bf16 storage)",
         }
     }
-}
-
-/// One row of the engine's released window-KV format, produced by the one construction path that
-/// stage 2 and stage 9 share.
-struct EngineWindowRow {
-    codes: Vec<u8>,
-    scales: Vec<u8>,
-}
-
-/// The one construction of an engine-format window row, shared by stage 2 and stage 9 so the
-/// storage/quantiser order cannot drift between the two harnesses. The caller has already applied
-/// the layer's rms_norm and rope tail in f32; this function applies the engine's storage-dtype
-/// round (bf16) exactly once, quantises with the engine's released
-/// sparkflash_engine::quant::quantize_activation_fp8, and asserts the result is byte-identical to
-/// m4_quant::act_quant_fp8_row on the same bf16 row. No second bf16 round happens here: the
-/// engine quantiser returns the input dtype, so the bf16 row is the stored row.
-fn engine_window_row(latent: &[f32]) -> Result<EngineWindowRow, String> {
-    let bf16_row: Vec<f32> = latent
-        .iter()
-        .map(|value| half::bf16::from_bits(bf16_bits(*value)).to_f32())
-        .collect();
-    let engine_row = sparkflash_engine::quant::quantize_activation_fp8(&bf16_row)
-        .map_err(|error| format!("engine window quantiser: {error}"))?;
-    let (oracle_codes, oracle_scales) = act_quant_fp8_row(&bf16_row);
-    if engine_row.codes() != oracle_codes.as_slice()
-        || engine_row.scales() != oracle_scales.as_slice()
-    {
-        return Err(
-            "the engine window quantiser and m4_quant::act_quant_fp8_row disagree on the same \
-             bf16 row; the format oracle is not the engine's rule"
-                .to_string(),
-        );
-    }
-    Ok(EngineWindowRow {
-        codes: engine_row.codes().to_vec(),
-        scales: engine_row.scales().to_vec(),
-    })
-}
-
-/// Refuse to hand engine window bytes to the kernel when they decode to a NaN or a non-finite
-/// value. The engine quantiser clamps to +/-448 and never emits the E4M3 NaN code 0x7F, so this
-/// guard turns a corrupt row into a loud failure instead of a poisoned attention output.
-fn assert_engine_window_finite(
-    codes: &[u8],
-    scales: &[u8],
-    rows: usize,
-    context: &str,
-) -> Result<(), String> {
-    let nan_codes = codes.iter().filter(|code| **code == 0x7F).count();
-    let mut non_finite = 0usize;
-    for row in 0..rows {
-        for index in 0..MLA_LATENT {
-            if !mla_ref::window_kv_value(codes, scales, row, index).is_finite() {
-                non_finite += 1;
-            }
-        }
-    }
-    if nan_codes != 0 || non_finite != 0 {
-        return Err(format!(
-            "{context}: engine window decode is not finite: {nan_codes} E4M3 NaN codes (0x7F) and \
-             {non_finite} non-finite decoded values in {rows} rows; the engine quantiser cannot \
-             emit these, so refuse the launch instead of letting the kernel compute on them"
-        ));
-    }
-    Ok(())
-}
-
-/// Per-run engine-window counters for stage 9: rows built by the shared helper, oracle agreements,
-/// and rows that passed the finite-decode guard.
-#[derive(Default)]
-struct EngineWindowStats {
-    rows: usize,
-    quantiser_agreements: usize,
-    guarded_rows: usize,
 }
 
 fn next_value(values: &mut std::vec::IntoIter<String>, flag: &str) -> Result<String, String> {
@@ -1245,7 +1200,7 @@ fn stage1(args: &Args) -> Result<(), String> {
             cubin_path.display()
         )
     })?;
-    let (module, func) = cuda.load_function(&cubin, kernel)?;
+    let (module, func) = cuda.load_kernel(&cubin, kernel_id(kernel)?)?;
     admit_memory(args, planned, "stage 1 device buffers")?;
     let mut allocated = 0usize;
     let x_d = cuda.alloc(HC_MULT * HIDDEN * 2, &mut allocated)?;
@@ -1629,111 +1584,6 @@ const STAGE2_MERGED_CHAIN_EXACT: usize = 163_838;
 const STAGE2_MERGED_CHAIN_TOTAL: usize = 163_840;
 const STAGE2_MERGED_CHAIN_MAX_DELTA: f32 = 2.4414063e-4;
 const STAGE2_MERGED_CHAIN_MAX_ULP: i32 = 1;
-
-/// The flash_mla_csa2_sm121 launch parameters, in the kernel's pinned ABI order. One constructor
-/// owns the order and the fixed-size array; no launch site builds its own argument list, because
-/// Cuda::launch takes a slice and cannot see a stale arity (a 15-element vector would make
-/// cuLaunchKernel read four arguments past the end).
-const FLASH_MLA_PARAM_COUNT: usize = 19;
-/// selected_count is the one field a launch may vary after construction: the out-of-window
-/// injection launches keep every other argument and change only the candidate count.
-const FLASH_MLA_SELECTED_COUNT_INDEX: usize = 15;
-
-/// The flash_mla launch arguments in the kernel's pinned order (see the kernel declaration and
-/// m4_abi::SIGNATURES). Pointers are carried as u64 because that is what cuLaunchKernel's
-/// argument array holds.
-#[derive(Clone, Copy)]
-struct FlashMlaParams([u64; FLASH_MLA_PARAM_COUNT]);
-
-impl FlashMlaParams {
-    fn as_slice(&self) -> &[u64] {
-        &self.0
-    }
-
-    fn with_selected_count(mut self, selected_count: usize) -> Self {
-        self.0[FLASH_MLA_SELECTED_COUNT_INDEX] = selected_count as u64;
-        self
-    }
-}
-
-impl Default for FlashMlaParams {
-    fn default() -> Self {
-        Self([0; FLASH_MLA_PARAM_COUNT])
-    }
-}
-
-/// Builds the flash_mla launch parameters with the kernel's own parameter names. Every launch in
-/// this file (stage-2 indexer self-check, stage-2 attention, stage-7 K5, stage-9 K5) goes through
-/// this constructor and the typed wrappers below; a future kernel signature change fails to compile
-/// at every site instead of leaving one of them on a stale array.
-#[allow(clippy::too_many_arguments)]
-fn flash_mla_params(
-    q: u64,
-    kv_fp4: u64,
-    kv_scales: u64,
-    window_codes: u64,
-    window_scales: u64,
-    window_kv_format: u64,
-    window_rows: u64,
-    selected: u64,
-    index_key: u64,
-    index_query: u64,
-    sink: u64,
-    block_scores: u64,
-    block_best: u64,
-    out: u64,
-    position: u64,
-    selected_count: usize,
-    trace_ring: u64,
-    layer: usize,
-    step_seq: u64,
-) -> FlashMlaParams {
-    FlashMlaParams([
-        q,
-        kv_fp4,
-        kv_scales,
-        window_codes,
-        window_scales,
-        window_kv_format,
-        window_rows,
-        selected,
-        index_key,
-        index_query,
-        sink,
-        block_scores,
-        block_best,
-        out,
-        position,
-        selected_count as u64,
-        trace_ring,
-        layer as u64,
-        step_seq,
-    ])
-}
-
-/// Launches the flash_mla kernel. The only type it accepts is FlashMlaParams, so the pinned
-/// 19-argument order cannot be bypassed at a call site.
-fn flash_mla_launch(
-    cuda: &Cuda,
-    func: CuFunction,
-    grid: (u32, u32, u32),
-    block: (u32, u32, u32),
-    params: &FlashMlaParams,
-) -> Result<(), String> {
-    cuda.launch(func, grid, block, params.as_slice())
-}
-
-/// The repeated-launch timing wrapper for the same typed parameters.
-fn flash_mla_launch_repeated(
-    cuda: &Cuda,
-    func: CuFunction,
-    grid: (u32, u32, u32),
-    block: (u32, u32, u32),
-    params: &FlashMlaParams,
-    repeat: usize,
-) -> Result<(Vec<f64>, f64), String> {
-    cuda.launch_repeated(func, grid, block, params.as_slice(), repeat)
-}
 
 const _: () = assert!(
     MLA_LATENT == 512
@@ -2181,7 +2031,7 @@ fn stage2(args: &Args) -> Result<(), String> {
             cubin_path.display()
         )
     })?;
-    let (module, func) = cuda.load_function(&cubin, kernel)?;
+    let (module, func) = load_flash_mla_kernel(&cuda, &cubin)?;
     admit_memory(args, planned, "stage 2 device buffers")?;
     let mut allocated = 0usize;
     let q_d = cuda.alloc(MLA_HEADS * MLA_LATENT * 2, &mut allocated)?;
@@ -3283,7 +3133,7 @@ fn stage3(args: &Args) -> Result<(), String> {
             cubin_path.display()
         )
     })?;
-    let (module, func) = cuda.load_function(&cubin, kernel)?;
+    let (module, func) = cuda.load_kernel(&cubin, kernel_id(kernel)?)?;
     let device_planned = 2 * tokens * HIDDEN * 2
         + act_fp8[0].len()
         + act_scales[0].len()
@@ -3617,7 +3467,7 @@ fn stage4(args: &Args) -> Result<(), String> {
             cubin_path.display()
         )
     })?;
-    let (module, func) = cuda.load_function(&cubin, kernel)?;
+    let (module, func) = cuda.load_kernel(&cubin, kernel_id(kernel)?)?;
     admit_memory(args, planned, "stage 4 device buffers")?;
     let mut allocated = 0usize;
     let x_d = cuda.alloc(HC_MULT * HIDDEN * 2, &mut allocated)?;
@@ -3898,7 +3748,7 @@ fn stage5(args: &Args) -> Result<(), String> {
             cubin_path.display()
         )
     })?;
-    let (_module, func) = cuda.load_function(&cubin, "cert_lm_head_sm121")?;
+    let (_module, func) = cuda.load_kernel(&cubin, KernelId::CertLmHead)?;
     let planned = (LM_HIDDEN * 2
         + LM_VOCAB * LM_HIDDEN * 2
         + LM_VOCAB_PER_RANK * 4
@@ -4207,7 +4057,7 @@ fn load_probe_kernel(
             path.display()
         )
     })?;
-    cuda.load_function(&cubin, kernel)
+    cuda.load_kernel(&cubin, kernel_id(kernel)?)
 }
 
 /// The dense probe: two tiles in each axis, one block per tile on the device, the in-crate GEMM on
@@ -4421,7 +4271,7 @@ fn probe_swiglu_shape(
     cuda.copy_dtoh(&mut codes_out, &codes_d)?;
     cuda.copy_dtoh(&mut scales_out, &scales_d)?;
     // Free the shape's buffers only; the module is unloaded once by stage 8 after both widths.
-    cuda.free(std::ptr::null_mut(), &[gate_d, up_d, codes_d, scales_d]);
+    cuda.free_buffers(&[&gate_d, &up_d, &codes_d, &scales_d]);
     let s_codes = compare_u8(
         &format!("swiglu {rows}x{cols} out_fp8"),
         &codes_out,
@@ -5600,12 +5450,19 @@ fn stage7(args: &Args) -> Result<(), String> {
                 path.display()
             )
         })?;
-        cuda.load_function(&cubin, name)
+        cuda.load_kernel(&cubin, kernel_id(name)?)
     };
     let (_mhc_module, mhc_func) = load(kernel_ok, &mut allocated)?;
     let (_dense_module, dense_func) = load("b12x_mxfp8_dense_sm121", &mut allocated)?;
     let (_wo_a_module, wo_a_func) = load("b12x_mxfp8_wo_a_sm121", &mut allocated)?;
-    let (_mla_module, mla_func) = load("flash_mla_csa2_sm121", &mut allocated)?;
+    let mla_cubin_path = args.cubin_dir.join("flash_mla_csa2_sm121.cubin");
+    let mla_cubin = std::fs::read(&mla_cubin_path).map_err(|e| {
+        format!(
+            "{}: {e} (build the stage-7 cubins first; the module docs give the nvcc lines)",
+            mla_cubin_path.display()
+        )
+    })?;
+    let (_mla_module, flash_mla_kernel) = load_flash_mla_kernel(&cuda, &mla_cubin)?;
     let (_moe_module, moe_func) = load("b12x_mxfp4_moe_sm121", &mut allocated)?;
     let mut captures: HashMap<&'static str, RowValue> = HashMap::with_capacity(18);
 
@@ -5799,7 +5656,7 @@ fn stage7(args: &Args) -> Result<(), String> {
     check_floor(args, "stage 7 K5 pre-launch")?;
     flash_mla_launch(
         &cuda,
-        mla_func,
+        flash_mla_kernel,
         (MLA_HEADS as u32, args.grid_y, 1u32),
         (MLA_THREADS, 1u32, 1u32),
         &params,
@@ -6807,7 +6664,7 @@ struct Stage9Device {
     mhc_func: CuFunction,
     dense_func: CuFunction,
     wo_a_func: CuFunction,
-    mla_func: CuFunction,
+    flash_mla_kernel: FlashMlaKernel,
     moe_func: CuFunction,
 }
 
@@ -6823,14 +6680,21 @@ fn stage9_device(args: &Args) -> Result<Stage9Device, String> {
                 path.display()
             )
         })?;
-        let (module, function) = cuda.load_function(&cubin, name)?;
+        let (module, function) = cuda.load_kernel(&cubin, kernel_id(name)?)?;
         modules.push(module);
         Ok(function)
     };
     let mhc_func = load("mega_mhc_fused_bf16_sm121")?;
     let dense_func = load("b12x_mxfp8_dense_sm121")?;
     let wo_a_func = load("b12x_mxfp8_wo_a_sm121")?;
-    let mla_func = load("flash_mla_csa2_sm121")?;
+    let mla_cubin_path = args.cubin_dir.join("flash_mla_csa2_sm121.cubin");
+    let mla_cubin = std::fs::read(&mla_cubin_path).map_err(|e| {
+        format!(
+            "{}: {e} (build the stage-7/9 cubins first; the module docs give the nvcc lines)",
+            mla_cubin_path.display()
+        )
+    })?;
+    let (_mla_module, flash_mla_kernel) = load_flash_mla_kernel(&cuda, &mla_cubin)?;
     let moe_func = load("b12x_mxfp4_moe_sm121")?;
     let mhc = LayerMhc::alloc(&cuda)?;
     Ok(Stage9Device {
@@ -6840,7 +6704,7 @@ fn stage9_device(args: &Args) -> Result<Stage9Device, String> {
         mhc_func,
         dense_func,
         wo_a_func,
-        mla_func,
+        flash_mla_kernel,
         moe_func,
     })
 }
@@ -7003,7 +6867,7 @@ fn stage9_attention_block(
     check_floor(args, &format!("stage 9 layer {layer} K5 pre-launch"))?;
     flash_mla_launch(
         &dev.cuda,
-        dev.mla_func,
+        dev.flash_mla_kernel,
         (MLA_HEADS as u32, args.grid_y, 1u32),
         (MLA_THREADS, 1u32, 1u32),
         &params,
@@ -8358,434 +8222,3 @@ fn stage9(args: &Args) -> Result<(), String> {
 // so this harness does not carry a second loader. Nothing links libcuda: the driver is dlopen'd
 // at run time on the node.
 // ---------------------------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------------------------
-// Raw CUDA driver API, resolved through dlopen. Nothing links libcuda: the driver is dlopen'd at
-// run time on the node, which is the invariant docs/build/device-path-design.md records.
-// ---------------------------------------------------------------------------------------------
-
-type CuResult = i32;
-
-/// An opaque CUDA event handle.
-type CuEvent = *mut c_void;
-
-/// MemAvailable in kB, parsed. Interpolating the whole /proc line into a message produced
-/// "...the node has ~MemAvailable: 3768676 kB GB of system memory available...", which is exactly
-/// the kind of unreadable failure text this launcher exists to avoid.
-fn mem_available_kb() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    text.lines()
-        .find_map(|line| line.strip_prefix("MemAvailable:"))
-        .and_then(|value| value.split_whitespace().next())
-        .and_then(|value| value.parse().ok())
-}
-
-/// The cuLaunchKernel signature. The parameter list is long by nature, so it is named once here
-/// rather than spelled out at the one call site.
-type LaunchFn = unsafe extern "C" fn(
-    CuFunction,
-    u32,
-    u32,
-    u32,
-    u32,
-    u32,
-    u32,
-    u32,
-    *mut c_void,
-    *mut *mut c_void,
-    *mut c_void,
-) -> CuResult;
-
-/// The driver's CUresult names, so a report says OUT_OF_MEMORY rather than 2.
-fn name(code: CuResult) -> String {
-    let s = match code {
-        0 => "SUCCESS",
-        1 => "INVALID_VALUE",
-        2 => "OUT_OF_MEMORY",
-        3 => "NOT_INITIALIZED",
-        4 => "DEINITIALIZED",
-        100 => "NO_DEVICE",
-        101 => "INVALID_DEVICE",
-        201 => "INVALID_CONTEXT",
-        400 => "INVALID_HANDLE",
-        700 => "ILLEGAL_ADDRESS",
-        801 => "NOT_SUPPORTED",
-        _ => "UNKNOWN",
-    };
-    format!("{code} ({s})")
-}
-type CuDeviceptr = u64;
-type CuModule = *mut c_void;
-type CuFunction = *mut c_void;
-
-struct Deviceptr(CuDeviceptr);
-
-struct Cuda {
-    lib: libloading::Library,
-    ctx: *mut c_void,
-}
-
-impl Cuda {
-    /// cuInit alone is not enough: cuModuleLoadData and cuMemAlloc need a CURRENT context, and
-    /// without one the driver answers CUDA_ERROR_INVALID_CONTEXT (201), which is what the first
-    /// run on the node returned. The primary context is retained (refcounted, shared with anything
-    /// else driving the device) and made current for this thread.
-    fn load() -> Result<Self, String> {
-        unsafe {
-            let lib = libloading::Library::new("libcuda.so.1")
-                .map_err(|e| format!("libcuda.so.1: {e}"))?;
-            {
-                let init: libloading::Symbol<unsafe extern "C" fn(u32) -> CuResult> =
-                    lib.get(b"cuInit").map_err(|e| e.to_string())?;
-                let r = init(0);
-                if r != 0 {
-                    return Err(format!("cuInit failed: {r}"));
-                }
-            }
-            let mut count: i32 = 0;
-            {
-                let f: libloading::Symbol<unsafe extern "C" fn(*mut i32) -> CuResult> =
-                    lib.get(b"cuDeviceGetCount").map_err(|e| e.to_string())?;
-                let r = f(&mut count);
-                if r != 0 {
-                    return Err(format!("cuDeviceGetCount failed: {}", name(r)));
-                }
-            }
-            let mut dev: i32 = 0;
-            {
-                let get: libloading::Symbol<unsafe extern "C" fn(*mut i32, i32) -> CuResult> =
-                    lib.get(b"cuDeviceGet").map_err(|e| e.to_string())?;
-                let r = get(&mut dev, 0);
-                if r != 0 {
-                    return Err(format!("cuDeviceGet(0) failed: {}", name(r)));
-                }
-            }
-            let mut device_name = String::from("unknown device");
-            {
-                let mut nm = [0i8; 128];
-                let f: libloading::Symbol<unsafe extern "C" fn(*mut i8, i32, i32) -> CuResult> =
-                    lib.get(b"cuDeviceGetName").map_err(|e| e.to_string())?;
-                let r = f(nm.as_mut_ptr(), 128, dev);
-                if r == 0 {
-                    // c_char is u8 on aarch64 and i8 on x86_64; cast rather than assume either.
-                    let s = std::ffi::CStr::from_ptr(nm.as_ptr().cast());
-                    device_name = s.to_string_lossy().into_owned();
-                    let mut total: u64 = 0;
-                    let t: libloading::Symbol<unsafe extern "C" fn(*mut u64, i32) -> CuResult> =
-                        lib.get(b"cuDeviceTotalMem_v2").map_err(|e| e.to_string())?;
-                    let _ = t(&mut total, dev);
-                    println!(
-                        "device 0: {device_name} of {count} (total {} MiB, MemAvailable {} MiB)",
-                        total / (1024 * 1024),
-                        mem_available_kb().map(|kb| kb / 1024).unwrap_or(0)
-                    );
-                }
-            }
-            let mut ctx: *mut c_void = std::ptr::null_mut();
-            {
-                // CU_CTX_LMEM_RESIZE_TO_MAX (0x10) asks the driver NOT to pre-reserve the maximum
-                // local memory for this context. On a unified-memory GB10 where the device total is
-                // 124 GB but only ~3.7 GB of system memory is free, that pre-reservation is the
-                // difference between a context and CUDA_ERROR_OUT_OF_MEMORY.
-                let set_flags: libloading::Symbol<unsafe extern "C" fn(i32, u32) -> CuResult> = lib
-                    .get(b"cuDevicePrimaryCtxSetFlags")
-                    .map_err(|e| e.to_string())?;
-                let _ = set_flags(dev, 0x10);
-                let retain: libloading::Symbol<
-                    unsafe extern "C" fn(*mut *mut c_void, i32) -> CuResult,
-                > = lib
-                    .get(b"cuDevicePrimaryCtxRetain")
-                    .map_err(|e| e.to_string())?;
-                let r = retain(&mut ctx, dev);
-                if r != 0 {
-                    // One alternative route, tried exactly once - not a retry loop. Retaining the
-                    // primary context is the normal route for a process that does not own the
-                    // device; cuCtxCreate_v2 is what a launcher would use if it did. Both results
-                    // are reported so the failure cannot be read as one API's quirk.
-                    let mut alt: *mut c_void = std::ptr::null_mut();
-                    let create: libloading::Symbol<
-                        unsafe extern "C" fn(*mut *mut c_void, u32, i32) -> CuResult,
-                    > = lib.get(b"cuCtxCreate_v2").map_err(|e| e.to_string())?;
-                    let r2 = create(&mut alt, 0x10, dev);
-                    // Nothing is left half-initialised: no context was retained, no device memory
-                    // was allocated, and this condition is not retried. If a context IS created and
-                    // a later step fails, Drop releases it.
-                    let avail = mem_available_kb()
-                        .map(|kb| format!("{} MiB", kb / 1024))
-                        .unwrap_or_else(|| "unknown".to_string());
-                    return Err(format!(
-                        "no CUDA context could be created on device 0 ({}): \
-                         cuDevicePrimaryCtxRetain -> {}, cuCtxCreate_v2 -> {} (one attempt each, not \
-                         retried). cuInit, cuDeviceGet and cuDeviceGetName all succeeded, so the \
-                         driver is reachable and the device is present: on this node a second CUDA \
-                         context does not fit beside the resident model. MemAvailable now: {avail}. \
-                         No device memory was allocated and no context is left retained. This is a \
-                         capacity fact about the node, not a defect in this launcher - do not work \
-                         around it here.",
-                        device_name,
-                        name(r),
-                        name(r2),
-                    ));
-                }
-            }
-            {
-                let set: libloading::Symbol<unsafe extern "C" fn(*mut c_void) -> CuResult> =
-                    lib.get(b"cuCtxSetCurrent").map_err(|e| e.to_string())?;
-                let r = set(ctx);
-                if r != 0 {
-                    return Err(format!("cuCtxSetCurrent failed: {r}"));
-                }
-            }
-            Ok(Cuda { lib, ctx })
-        }
-    }
-
-    fn sym<T>(&self, name: &[u8]) -> Result<libloading::Symbol<'_, T>, String> {
-        unsafe {
-            self.lib
-                .get(name)
-                .map_err(|e| format!("{}: {e}", String::from_utf8_lossy(name)))
-        }
-    }
-
-    fn alloc(&self, bytes: usize, total: &mut usize) -> Result<Deviceptr, String> {
-        unsafe {
-            let f: libloading::Symbol<unsafe extern "C" fn(*mut CuDeviceptr, usize) -> CuResult> =
-                self.sym(b"cuMemAlloc_v2")?;
-            let mut p: CuDeviceptr = 0;
-            let r = f(&mut p, bytes);
-            if r != 0 {
-                return Err(format!("cuMemAlloc({bytes}) failed: {r}"));
-            }
-            *total += bytes;
-            Ok(Deviceptr(p))
-        }
-    }
-
-    fn copy_htod(&self, dst: &Deviceptr, src: &[u8]) -> Result<(), String> {
-        unsafe {
-            let f: libloading::Symbol<
-                unsafe extern "C" fn(CuDeviceptr, *const c_void, usize) -> CuResult,
-            > = self.sym(b"cuMemcpyHtoD_v2")?;
-            let r = f(dst.0, src.as_ptr().cast(), src.len());
-            if r != 0 {
-                return Err(format!("cuMemcpyHtoD failed: {r}"));
-            }
-            Ok(())
-        }
-    }
-
-    fn copy_dtoh(&self, dst: &mut [u8], src: &Deviceptr) -> Result<(), String> {
-        unsafe {
-            let f: libloading::Symbol<
-                unsafe extern "C" fn(*mut c_void, CuDeviceptr, usize) -> CuResult,
-            > = self.sym(b"cuMemcpyDtoH_v2")?;
-            let r = f(dst.as_mut_ptr().cast(), src.0, dst.len());
-            if r != 0 {
-                return Err(format!("cuMemcpyDtoH failed: {r}"));
-            }
-            Ok(())
-        }
-    }
-
-    fn load_function(&self, cubin: &[u8], name: &str) -> Result<(CuModule, CuFunction), String> {
-        unsafe {
-            let load: libloading::Symbol<
-                unsafe extern "C" fn(*mut CuModule, *const c_void) -> CuResult,
-            > = self.sym(b"cuModuleLoadData")?;
-            let mut module: CuModule = std::ptr::null_mut();
-            let r = load(&mut module, cubin.as_ptr().cast());
-            if r != 0 {
-                return Err(format!("cuModuleLoadData failed: {r}"));
-            }
-            let get: libloading::Symbol<
-                unsafe extern "C" fn(*mut CuFunction, CuModule, *const i8) -> CuResult,
-            > = self.sym(b"cuModuleGetFunction")?;
-            let cname = std::ffi::CString::new(name).map_err(|e| e.to_string())?;
-            let mut func: CuFunction = std::ptr::null_mut();
-            let r = get(&mut func, module, cname.as_ptr().cast());
-            if r != 0 {
-                return Err(format!("cuModuleGetFunction({name}) failed: {r}"));
-            }
-            Ok((module, func))
-        }
-    }
-
-    fn launch(
-        &self,
-        func: CuFunction,
-        grid: (u32, u32, u32),
-        block: (u32, u32, u32),
-        args: &[u64],
-    ) -> Result<(), String> {
-        unsafe {
-            let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
-            let mut storage: Vec<[u64; 1]> = args.iter().map(|a| [*a]).collect();
-            let mut ptrs: Vec<*mut c_void> =
-                storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
-            let r = launch(
-                func,
-                grid.0,
-                grid.1,
-                grid.2,
-                block.0,
-                block.1,
-                block.2,
-                0,
-                std::ptr::null_mut(),
-                ptrs.as_mut_ptr(),
-                std::ptr::null_mut(),
-            );
-            if r != 0 {
-                return Err(format!("cuLaunchKernel failed: {r}"));
-            }
-            let sync: libloading::Symbol<unsafe extern "C" fn() -> CuResult> =
-                self.sym(b"cuCtxSynchronize")?;
-            let r = sync();
-            if r != 0 {
-                return Err(format!("cuCtxSynchronize failed: {r}"));
-            }
-            Ok(())
-        }
-    }
-
-    /// Times one kernel the way a throughput claim needs it: a warm-up launch outside the timed
-    /// region, one event pair per launch for the distribution, then a single batched region with no
-    /// per-launch synchronisation - the figure to quote when the per-launch event overhead would
-    /// dominate a kernel this small. No allocation, no upload and no checkpoint read is inside
-    /// either timed region, so the numbers are the kernel's own and not the host's.
-    fn launch_repeated(
-        &self,
-        func: CuFunction,
-        grid: (u32, u32, u32),
-        block: (u32, u32, u32),
-        args: &[u64],
-        repeat: usize,
-    ) -> Result<(Vec<f64>, f64), String> {
-        unsafe {
-            let create: libloading::Symbol<unsafe extern "C" fn(*mut CuEvent, u32) -> CuResult> =
-                self.sym(b"cuEventCreate")?;
-            let record: libloading::Symbol<unsafe extern "C" fn(CuEvent, *mut c_void) -> CuResult> =
-                self.sym(b"cuEventRecord")?;
-            let wait: libloading::Symbol<unsafe extern "C" fn(CuEvent) -> CuResult> =
-                self.sym(b"cuEventSynchronize")?;
-            let elapsed: libloading::Symbol<
-                unsafe extern "C" fn(*mut f32, CuEvent, CuEvent) -> CuResult,
-            > = self.sym(b"cuEventElapsedTime")?;
-            let destroy: libloading::Symbol<unsafe extern "C" fn(CuEvent) -> CuResult> =
-                self.sym(b"cuEventDestroy")?;
-            let mut start: CuEvent = std::ptr::null_mut();
-            let mut stop: CuEvent = std::ptr::null_mut();
-            let r = create(&mut start, 0);
-            if r != 0 {
-                return Err(format!("cuEventCreate failed: {r}"));
-            }
-            let r = create(&mut stop, 0);
-            if r != 0 {
-                return Err(format!("cuEventCreate failed: {r}"));
-            }
-            // Warm-up: fills the module cache and the launch path, and is deliberately not timed.
-            self.launch(func, grid, block, args)?;
-            let sync: libloading::Symbol<unsafe extern "C" fn() -> CuResult> =
-                self.sym(b"cuCtxSynchronize")?;
-            let r = sync();
-            if r != 0 {
-                return Err(format!("cuCtxSynchronize failed: {r}"));
-            }
-            let mut per_launch = Vec::with_capacity(repeat);
-            for _ in 0..repeat {
-                let r = record(start, std::ptr::null_mut());
-                if r != 0 {
-                    return Err(format!("cuEventRecord failed: {r}"));
-                }
-                self.launch(func, grid, block, args)?;
-                let r = record(stop, std::ptr::null_mut());
-                if r != 0 {
-                    return Err(format!("cuEventRecord failed: {r}"));
-                }
-                let r = wait(stop);
-                if r != 0 {
-                    return Err(format!("cuEventSynchronize failed: {r}"));
-                }
-                let mut ms: f32 = 0.0;
-                let r = elapsed(&mut ms, start, stop);
-                if r != 0 {
-                    return Err(format!("cuEventElapsedTime failed: {r}"));
-                }
-                per_launch.push(f64::from(ms));
-            }
-            let r = record(start, std::ptr::null_mut());
-            if r != 0 {
-                return Err(format!("cuEventRecord failed: {r}"));
-            }
-            for _ in 0..repeat {
-                self.launch(func, grid, block, args)?;
-            }
-            let r = record(stop, std::ptr::null_mut());
-            if r != 0 {
-                return Err(format!("cuEventRecord failed: {r}"));
-            }
-            let r = wait(stop);
-            if r != 0 {
-                return Err(format!("cuEventSynchronize failed: {r}"));
-            }
-            let mut total: f32 = 0.0;
-            let r = elapsed(&mut total, start, stop);
-            if r != 0 {
-                return Err(format!("cuEventElapsedTime failed: {r}"));
-            }
-            destroy(start);
-            destroy(stop);
-            Ok((per_launch, f64::from(total) / repeat as f64))
-        }
-    }
-
-    fn free(&self, module: CuModule, ptrs: &[Deviceptr]) {
-        unsafe {
-            if let Ok(f) =
-                self.sym::<unsafe extern "C" fn(CuDeviceptr) -> CuResult>(b"cuMemFree_v2")
-            {
-                for p in ptrs {
-                    let _ = f(p.0);
-                }
-            }
-            if let Ok(f) = self.sym::<unsafe extern "C" fn(CuModule) -> CuResult>(b"cuModuleUnload")
-            {
-                let _ = f(module);
-            }
-            // The primary context is released by Drop, on every exit path.
-        }
-    }
-
-    /// Frees device buffers without unloading the module that produced them: stage 7 runs several
-    /// different-shaped launches per loaded module, so the module has to outlive them.
-    fn free_buffers(&self, ptrs: &[&Deviceptr]) {
-        unsafe {
-            if let Ok(f) =
-                self.sym::<unsafe extern "C" fn(CuDeviceptr) -> CuResult>(b"cuMemFree_v2")
-            {
-                for p in ptrs {
-                    let _ = f(p.0);
-                }
-            }
-        }
-    }
-}
-
-impl Drop for Cuda {
-    /// Releases this process's reference to the primary context on every exit path, including a
-    /// failure after the context was created, so a run can never leave a half-initialised Cuda.
-    /// Releasing is refcounted and does not disturb anything else driving the device.
-    fn drop(&mut self) {
-        if self.ctx.is_null() {
-            return;
-        }
-        unsafe {
-            if let Ok(f) = self
-                .sym::<unsafe extern "C" fn(*mut c_void) -> CuResult>(b"cuDevicePrimaryCtxRelease")
-            {
-                let _ = f(self.ctx);
-            }
-        }
-    }
-}

@@ -215,6 +215,47 @@ comparison).
 `m4_quant::act_quant_fp8_row` - so the two harness-side users of the rule cannot drift; the
 CUDA copy remains the third owner. No rule change.
 
+**Task-8 harness-move note (2026-10-18):** the shared CUDA harness pieces now live in
+`crates/sparkflash-kernels/src/cuda_harness.rs`: the 19-word `FlashMlaParams`/`flash_mla_params`
+builder and the `engine_window_row` family, so the `m7_layer0` chain harness and the forthcoming
+`m8_sequence` harness import one builder and one row construction instead of each carrying a copy.
+The window-row helper calls the engine's released quantiser, so `sparkflash-engine` moves from a
+dev-dependency to a normal dependency of `sparkflash-kernels`; the edge is deliberate and acyclic
+(the engine crate depends on no other workspace crate). No rule change and no stage claim change:
+the m7 evidence binary `cf9b4e90` is cited for the merged Stage-C column only, not for this
+refactor, which is pinned by tests instead.
+
+
+**Task-8 extension (2026-10-18): the instruction is compile-time, not a text scanner.** Round-2 and
+round-3 reviews showed that any "the example must call the wrapper" source-text classifier can be
+evaded (string literals, a space before the parameter list, a differently named module, a .inc
+re-export, an aliased handle), so the enforcement moved into the type system. The raw CUDA driver
+region of `examples/m7_layer0.rs` moved verbatim into the library as
+`crates/sparkflash-kernels/src/cuda_driver.rs`: same dlopen symbol names, same seven kernels,
+same grid/block order, same `launch_repeated` semantics and same error strings, with `unsafe`
+confined to that module. The public surface is deliberately small and documented - opaque `Kernel`
+and `Module` handles, `KernelId` with exactly the six non-flash_mla kernels, `Cuda` load/alloc/copy/
+launch/free entry points - and `Cuda::launch`/`launch_repeated` only accept an opaque `Kernel`. The
+flash_mla kernel is reachable only through `cuda_harness::FlashMlaKernel` and
+`load_flash_mla`/`launch_flash_mla`/`launch_flash_mla_repeated`; there is no public conversion
+between `FlashMlaKernel` and `Kernel` and no symbol-name loader on the public API, so neither a raw
+handle read nor an aliased handle compiles. `examples/m7_layer0.rs` now carries
+`#![forbid(unsafe_code)]`, imports the shared driver (with `Kernel as CuFunction`/`Module as
+CuModule` aliases only) and gets the typed launches under their old names, so its call sites are
+unchanged except for imports and the three flash_mla loads (which now read the cubin through the
+typed loader); the driver move is move-only and behavior-preserving by inspection. The fragile
+source classifier and file walker are deleted from `m4_abi`; one exact-path pin remains as defense
+in depth (examples importing `sparkflash_kernels::cuda_driver` must have
+`#![forbid(unsafe_code)]`, no unsafe token outside masked comments/strings, no `mla_func`/
+`cuLaunchKernel`/`extern` token), alongside the hardened definition pin (every file under `src`,
+whitespace-insensitive `fn name (`, exact canonical `src/cuda_harness.rs` path, no `as
+engine_window_row`/`as flash_mla_params` re-export) with mutation tests for the round-3 evasions.
+`compile_fail` doctests prove the bypasses do not compile and a counterpart `no_run` doctest proves
+the typed call does; the device stages were not re-run. dlopen-only means a CPU-only build does not
+link libcuda. No rule change and no stage claim change. The launcher crate no longer contains any
+driver code, so a future harness (m8) must import cuda_driver and use the typed launch entry points
+rather than revisit FFI.
+
 ## D8 — Hash layers are out of scope
 
 `num_hash_layers` / `gate.tid2eid` cannot be derived from anything in this checkout: the

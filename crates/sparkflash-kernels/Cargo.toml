@@ -4,16 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "sm_121a CUDA kernels and CPU reference implementations"
+description = "sm_121a CUDA kernels, CPU reference implementations and the shared dlopen CUDA driver wrapper"
 
 [dependencies]
 sparkflash-trace = { workspace = true }
+# The shared CUDA harness (src/cuda_harness.rs) builds the engine-format window row with the
+# engine's released quantiser, so the engine crate is a library dependency and not only an
+# example dev-dependency: the m7 and m8 harnesses must import one row construction and the
+# helper's quantiser is the engine's own. The edge is acyclic - the engine crate depends on no
+# other workspace crate.
+sparkflash-engine = { path = "../sparkflash-engine" }
 half = { workspace = true }
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
 cudarc = { workspace = true, optional = true }
-# Used only by examples/moe_slice.rs, the device-path vertical slice: the CUDA driver API is
-# resolved with dlopen at run time, so nothing links libcuda. Same crate and version family cudarc
+# The shared CUDA driver (src/cuda_driver.rs) resolves the driver API with dlopen at run time, so
+# nothing links libcuda and a CPU-only build is unaffected. Same crate and version family cudarc
 # itself uses for fallback-dynamic-loading, so this adds an edge and not a new package version.
 libloading = "0.8"
 
@@ -22,20 +28,20 @@ default = []
 # "cuda" selects the optional cudarc dependency and nothing else. It does NOT gate the kernel
 # builds: build.rs always probes the toolchain and emits the sparkflash_cuda_toolkit cfg that the
 # compile-time ABI checks read, so the kernels are parsed whether or not this feature is on. No
-# module in this crate calls cudarc yet, so today it adds a dependency and no code path - the
-# device/launch path lives in the launcher crate, not here. Enabling it does not currently build:
-# the workspace pins cudarc without one of its required cuda-12xxx/13xxx version features, so
-# cudarc's own build.rs stops with "Must specify one of the following features: ...". Making it
-# build means choosing a version feature (cuda-12090 matches the 12.9 toolkit this repo probes
-# with) in the root Cargo.toml, which is outside this crate.
+# module in this crate calls cudarc yet, so today it adds a dependency and no code path. The
+# runtime device/launch path the harness examples use is src/cuda_driver.rs, which is
+# feature-independent and dlopen-only, so a CPU-only build still has it available. Enabling cuda
+# does not currently build: the workspace pins cudarc without one of its required cuda-12xxx/13xxx
+# version features, so cudarc's own build.rs stops with "Must specify one of the following
+# features: ...". Making it build means choosing a version feature (cuda-12090 matches the 12.9
+# toolkit this repo probes with) in the root Cargo.toml, which is outside this crate.
 cuda = ["dep:cudarc"]
 
 [dev-dependencies]
-# Only examples/m7_layer0.rs --stage 9 uses these. The 40-layer chain is the one harness that needs
-# the released Engram seam: the hash layout and the paged table read are engine code, and
-# duplicating them in the kernels crate would put a second copy of the released arithmetic next to
-# the one the host pair was produced with. sha2 hashes the two determinism blobs; the harness does
-# not otherwise hash anything. Neither edge creates a cycle: the engine crate depends on no other
-# workspace crate.
-sparkflash-engine = { path = "../sparkflash-engine" }
+# The engine crate is a normal dependency now (src/cuda_harness.rs calls its released
+# quantiser); examples/m7_layer0.rs --stage 9 also uses its released Engram seam: the hash
+# layout and the paged table read are engine code, and duplicating them in the kernels crate
+# would put a second copy of the released arithmetic next to the one the host pair was produced
+# with. sha2 hashes the two determinism blobs; the harness does not otherwise hash anything.
+# Neither edge creates a cycle: the engine crate depends on no other workspace crate.
 sha2 = { workspace = true }

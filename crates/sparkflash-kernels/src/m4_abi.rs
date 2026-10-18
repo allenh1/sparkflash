@@ -1942,31 +1942,254 @@ fn kernels_include_the_common_header_before_using_its_helpers() {
     }
 }
 
-/// Every flash_mla launch site goes through the typed parameter builder and its launch wrappers,
-/// so no site can keep a stale arity or a hand-built argument order. Mutation: the stage-2 main
-/// site is put back on a 15-element array and the pin must reject it.
+#[cfg(test)]
+mod pin_helpers {
+    use std::path::{Path, PathBuf};
+
+    /// A source file the pin scans read at test time: a display name and its text.
+    pub type ScannedSource = (String, String);
+
+    /// Counts definitions of fn <function>( in source, whatever the visibility or nesting.
+    ///
+    /// A private or nested module that redeclares a shared harness function is exactly the drift
+    /// these pins forbid, so the count includes fn, pub fn, pub(crate) fn and every other
+    /// qualifier. Comments are stripped first and the match is line-anchored, so a call site or a
+    /// string literal that merely contains the token does not count as a definition.
+    pub fn definition_count(source: &str, function: &str) -> usize {
+        let code = mask_string_literals(&crate::c_decl::strip_comments(source));
+        let compact: String = code.chars().filter(|ch| !ch.is_whitespace()).collect();
+        compact.matches(&format!("fn{function}(")).count()
+    }
+
+    /// Replaces the contents of Rust string literals with spaces (newlines kept), so a definition
+    /// token that only appears inside a message or a fixture string is not counted. Comments are
+    /// stripped before this is called.
+    pub fn mask_string_literals(source: &str) -> String {
+        let mut masked = String::with_capacity(source.len());
+        let mut in_string = false;
+        let mut escaped = false;
+        for ch in source.chars() {
+            if in_string {
+                if ch == '\n' {
+                    masked.push('\n');
+                } else {
+                    masked.push(' ');
+                }
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+            } else if ch == '"' {
+                in_string = true;
+                masked.push(' ');
+            } else {
+                masked.push(ch);
+            }
+        }
+        masked
+    }
+
+    /// All Rust sources under dir, recursively, sorted for deterministic messages.
+    pub fn rust_sources_under(dir: &Path) -> Vec<ScannedSource> {
+        fn visit(dir: &Path, found: &mut Vec<ScannedSource>) {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+                .expect("a source directory must be readable")
+                .map(|entry| entry.expect("a directory entry must be readable").path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    visit(&path, found);
+                } else {
+                    let bytes = std::fs::read(&path).expect("a scanned file must be readable");
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    found.push((path.to_string_lossy().into_owned(), text));
+                }
+            }
+        }
+        let mut found = Vec::new();
+        visit(dir, &mut found);
+        found
+    }
+
+    /// The crate source tree, src/**/*.rs.
+    pub fn crate_sources() -> Vec<ScannedSource> {
+        rust_sources_under(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+    }
+
+    /// The example source tree, examples/**/*.rs.
+    pub fn example_sources() -> Vec<ScannedSource> {
+        rust_sources_under(&Path::new(env!("CARGO_MANIFEST_DIR")).join("examples"))
+    }
+
+    /// Exactly one definition of function across the scanned sources, and it must be
+    /// expected_path. Paths are canonicalised and compared exactly: a differently named file
+    /// beside the harness (src/not_cuda_harness.rs) cannot stand in, and a duplicate anywhere
+    /// fails the count.
+    pub fn require_single_shared_definition(
+        sources: &[ScannedSource],
+        function: &str,
+        expected_path: &Path,
+    ) -> Result<(), String> {
+        let expected = std::fs::canonicalize(expected_path)
+            .map_err(|error| format!("{}: {error}", expected_path.display()))?;
+        let mut found: Vec<(&str, usize)> = Vec::new();
+        for (name, source) in sources {
+            let count = definition_count(source, function);
+            if count != 0 {
+                found.push((name, count));
+            }
+        }
+        let total: usize = found.iter().map(|(_, count)| *count).sum();
+        if total != 1 {
+            return Err(format!(
+                "expected exactly one fn {function}( definition in the crate source, found {found:?}"
+            ));
+        }
+        let actual = std::fs::canonicalize(found[0].0)
+            .map_err(|error| format!("{}: {error}", found[0].0))?;
+        if actual != expected {
+            return Err(format!(
+                "the one fn {function}( definition must live in {}, found {}",
+                expected.display(),
+                found[0].0
+            ));
+        }
+        Ok(())
+    }
+
+    /// No source re-exports function under its own name.
+    pub fn require_no_alias(sources: &[ScannedSource], function: &str) -> Result<(), String> {
+        for (name, source) in sources {
+            if has_alias(source, function) {
+                return Err(format!(
+                    "{name} re-exports {function} under the same name; there is one definition and no alias"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// True when source re-exports function under its own name (use m::x as x).
+    pub fn has_alias(source: &str, function: &str) -> bool {
+        let code = mask_string_literals(&crate::c_decl::strip_comments(source));
+        let compact: String = code.chars().filter(|ch| !ch.is_whitespace()).collect();
+        compact.contains(&format!("as{function}"))
+    }
+
+    /// The file name alone, for pin messages.
+    pub fn display_name(path: &str) -> String {
+        path.rsplit('/').next().unwrap_or(path).to_string()
+    }
+
+    /// True for the unsafe keyword outside identifiers, so #![forbid(unsafe_code)] does not count.
+    pub fn has_unsafe_keyword(code: &str) -> bool {
+        let bytes = code.as_bytes();
+        let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+        for (at, _) in code.match_indices("unsafe") {
+            let before = at.checked_sub(1).map_or(b' ', |index| bytes[index]);
+            let after = bytes.get(at + "unsafe".len()).copied().unwrap_or(b' ');
+            if !is_ident(before) && !is_ident(after) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Examples whose code imports the shared CUDA driver. String literals are masked first, so a
+    /// message that merely quotes the import path is not a user.
+    pub fn example_driver_users(sources: &[ScannedSource]) -> Vec<String> {
+        sources
+            .iter()
+            .filter(|(_, source)| {
+                mask_string_literals(&crate::c_decl::strip_comments(source))
+                    .contains("sparkflash_kernels::cuda_driver")
+            })
+            .map(|(name, _)| display_name(name))
+            .collect()
+    }
+
+    /// The defense-in-depth rule for an example that uses the shared CUDA driver: no unsafe code
+    /// at all and no raw driver token. The compiler already closes the raw launch (the driver
+    /// launcher only accepts opaque Kernel values and flash_mla is an opaque FlashMlaKernel); this
+    /// pin keeps a future example from opening a second FFI path beside the shared one.
+    pub fn check_driver_example(source: &str) -> Result<(), String> {
+        let code = mask_string_literals(&crate::c_decl::strip_comments(source));
+        if !code.contains("sparkflash_kernels::cuda_driver") {
+            return Ok(());
+        }
+        if !code.contains("#![forbid(unsafe_code)]") {
+            return Err(
+                "an example that uses the shared CUDA driver must start with #![forbid(unsafe_code)]"
+                    .to_string(),
+            );
+        }
+        if has_unsafe_keyword(&code) {
+            return Err(
+                "an example that uses the shared CUDA driver must not contain the unsafe keyword"
+                    .to_string(),
+            );
+        }
+        for token in [
+            "mla_func",
+            "cuLaunchKernel",
+            "cuModuleGetFunction",
+            "extern",
+        ] {
+            if code.contains(token) {
+                return Err(format!(
+                    "an example that uses the shared CUDA driver must not name the raw driver token {token}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Definitions of function across every example source.
+    pub fn example_definition_count(sources: &[ScannedSource], function: &str) -> usize {
+        sources
+            .iter()
+            .map(|(_, source)| definition_count(source, function))
+            .sum()
+    }
+}
+
+/// Every flash_mla launch site goes through the typed parameter builder and the library's typed
+/// launches, so no site can keep a stale arity or a hand-built argument order. The builder and the
+/// launches live in sparkflash_kernels::cuda_harness and the example only aliases them; a raw
+/// launch is not expressible in the example, because cuda_driver::Cuda::launch takes an opaque
+/// Kernel and flash_mla is only ever an opaque FlashMlaKernel. Mutation: the stage-2 main site is
+/// put back on a 15-element array and the pin must reject it.
 #[test]
-fn every_flash_mla_launch_site_uses_the_typed_parameter_builder() {
+fn every_flash_mla_launch_site_uses_the_typed_builder_and_typed_launches() {
     let pin = |source: &str| -> bool {
         let code = crate::c_decl::strip_comments(source);
-        // Four constructor calls: the stage-2 indexer self-check, the stage-2 attention loop and
-        // the stage-7 and stage-9 K5 launches.
+        // Four constructor calls: stage-2 indexer self-check, stage-2 attention loop, stage-7 K5
+        // and stage-9 K5.
         let builders = code.matches("= flash_mla_params(").count();
-        // The typed wrapper is the only launch path: one definition plus six call sites (indexer,
-        // stage-2 main, the two injected launches, stage-2 timing, stage-7 K5, stage-9 K5).
+        // Six typed launches: stage-2 indexer, stage-2 main, the two injected launches, stage-7 K5
+        // and stage-9 K5; one timed launch in the stage-2 timing loop.
         let launches = code.matches("flash_mla_launch(").count();
         let timed = code.matches("flash_mla_launch_repeated(").count();
         builders == 4
-            && launches == 7
-            && timed == 2
+            && launches == 6
+            && timed == 1
+            && code.contains("launch_flash_mla as flash_mla_launch")
             && !code.contains("[u64; 15]")
             && !code.contains("cuda.launch(mla_func")
             && !code.contains("cuda.launch(dev.mla_func")
     };
     let source = include_str!("../examples/m7_layer0.rs");
     assert!(
+        crate::c_decl::strip_comments(source).contains("use sparkflash_kernels::cuda_harness::"),
+        "the example must import the one flash_mla parameter builder from the library harness module"
+    );
+    assert!(
         pin(source),
-        "a flash_mla launch site bypasses the typed builder/launch wrapper (expected 4 builder calls and 6 wrapper call sites)"
+        "a flash_mla launch site bypasses the typed builder/launch wrapper (expected 4 builder calls, 6 typed launches and 1 timed launch)"
     );
     let stale = source.replacen(
         "let params = flash_mla_params(",
@@ -1980,30 +2203,94 @@ fn every_flash_mla_launch_site_uses_the_typed_parameter_builder() {
     );
 }
 
+/// Examples that use the shared CUDA driver are unsafe-free and never name a raw driver token.
+/// This is defense in depth next to the type-level enforcement: the driver's launch entry points
+/// only accept opaque handles (cuda_driver::Kernel and cuda_harness::FlashMlaKernel), and this pin
+/// keeps a future example from opening its own FFI path beside the shared one.
+#[test]
+fn examples_using_the_shared_cuda_driver_are_unsafe_free_and_name_no_raw_driver_token() {
+    let examples = pin_helpers::example_sources();
+    let users = pin_helpers::example_driver_users(&examples);
+    assert!(
+        users.iter().any(|name| name == "m7_layer0.rs"),
+        "m7_layer0.rs must be one of the pinned driver examples, else the pin is vacuous; found {users:?}"
+    );
+    for (name, source) in &examples {
+        pin_helpers::check_driver_example(source)
+            .unwrap_or_else(|error| panic!("{}: {error}", pin_helpers::display_name(name)));
+    }
+    let spoof = r#"const SPOOF: &str = "use sparkflash_kernels::cuda_driver::Cuda;";\nfn f() {}"#;
+    assert!(
+        !pin_helpers::example_driver_users(&[("spoof.rs".to_string(), spoof.to_string())])
+            .iter()
+            .any(|name| name == "spoof.rs"),
+        "a string literal must not make an example a driver user"
+    );
+    assert!(
+        pin_helpers::check_driver_example(
+            "use sparkflash_kernels::cuda_driver::Cuda;\nfn f() {}\n"
+        )
+        .is_err(),
+        "a real driver import without #![forbid(unsafe_code)] must fail"
+    );
+    assert!(
+        pin_helpers::check_driver_example(
+            "#![forbid(unsafe_code)]\nuse sparkflash_kernels::cuda_driver::Cuda;\nfn f() { let _ = mla_func; }\n"
+        )
+        .is_err(),
+        "a raw handle name must fail the driver example pin"
+    );
+    assert!(
+        pin_helpers::check_driver_example(
+            "#![forbid(unsafe_code)]\nuse sparkflash_kernels::cuda_driver::Cuda;\nfn f() { unsafe {} }\n"
+        )
+        .is_err(),
+        "an unsafe block must fail the driver example pin"
+    );
+}
+
 /// Stage 2 and stage 9 must build their engine-format window rows with the one shared helper, in
 /// the pinned order: rms_norm + rope tail (caller, f32) -> bf16 storage round exactly once ->
-/// engine quantiser -> assert against m4_quant::act_quant_fp8_row. Stage 9's K5 reference must be
-/// format-dispatched to mla_ref::attention_with_sink_window in engine mode (feeding window bytes to
-/// the FP4 reference is the defect this pins).
+/// engine quantiser -> assert against m4_quant::act_quant_fp8_row. The helper lives in the library
+/// harness module, sparkflash_kernels::cuda_harness, so the m7 example and the forthcoming m8
+/// sequence example compile one implementation instead of a copy each. Definitions are counted at
+/// every visibility, module and whitespace variant in every file under src, and the one definition
+/// must be the exact path src/cuda_harness.rs. Stage 9's K5 reference must be format-dispatched to
+/// mla_ref::attention_with_sink_window in engine mode (feeding window bytes to the FP4 reference is
+/// the defect this pins).
 #[test]
-fn stage2_and_stage9_share_one_engine_window_row_builder() {
-    let source = include_str!("../examples/m7_layer0.rs");
-    let code = crate::c_decl::strip_comments(source);
-    // One definition plus exactly two call sites: stage 2's row loop and stage 9's attention block.
+fn stage2_and_stage9_share_one_library_engine_window_row_builder() {
+    let crate_sources = pin_helpers::crate_sources();
+    let harness_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cuda_harness.rs");
+    pin_helpers::require_single_shared_definition(
+        &crate_sources,
+        "engine_window_row",
+        &harness_path,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    pin_helpers::require_no_alias(&crate_sources, "engine_window_row")
+        .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(
-        code.matches("fn engine_window_row(").count(),
-        1,
-        "the shared engine-row builder must be defined exactly once"
+        pin_helpers::example_definition_count(&pin_helpers::example_sources(), "engine_window_row"),
+        0,
+        "no example may define its own engine-window row helper"
+    );
+    let example = crate::c_decl::strip_comments(include_str!("../examples/m7_layer0.rs"));
+    assert!(
+        example.contains("use sparkflash_kernels::cuda_harness::"),
+        "the example must import the shared engine-row helper from the library harness"
     );
     assert_eq!(
-        code.matches("engine_window_row(&").count(),
+        example.matches("engine_window_row(&").count(),
         2,
-        "stage 2 and stage 9 must both call the shared engine-row helper; a re-implementation has drifted"
+        "stage 2 and stage 9 must both call the one shared engine-row helper; a re-implementation has drifted"
     );
-    let start = code
+    let harness =
+        std::fs::read_to_string(&harness_path).expect("the harness source must be readable");
+    let start = harness
         .find("fn engine_window_row(")
-        .expect("the shared engine-row builder must exist");
-    let body = &code[start..];
+        .expect("the shared engine-row builder must exist in the library harness");
+    let body = &harness[start..];
     let body_end = body
         .find("\n}\n")
         .expect("the shared engine-row helper has a body terminator");
@@ -2026,16 +2313,16 @@ fn stage2_and_stage9_share_one_engine_window_row_builder() {
         1,
         "the bf16 round must happen exactly once, at the engine's storage dtype boundary"
     );
-    // Stage 9's engine K5 reference dispatch: engine -> attention_with_sink_window, FP4 -> the
-    // FP4 reference. Both names must be in the attention block and the dispatch must use the
-    // format value, not a constant.
-    let block_start = code
+    // Stage 9's engine K5 reference dispatch: engine -> attention_with_sink_window, FP4 -> the FP4
+    // reference. Both names must be in the attention block and the dispatch must use the format
+    // value, not a constant.
+    let block_start = example
         .find("fn stage9_attention_block(")
         .expect("stage 9's attention block must exist");
-    let block_end = code[block_start..]
+    let block_end = example[block_start..]
         .find("fn stage9_ffn_block(")
         .expect("the attention block is followed by the FFN block");
-    let block = &code[block_start..block_start + block_end];
+    let block = &example[block_start..block_start + block_end];
     assert!(
         block.contains("attention_with_sink_window("),
         "stage 9 engine mode must check K5 against mla_ref::attention_with_sink_window"
@@ -2049,9 +2336,140 @@ fn stage2_and_stage9_share_one_engine_window_row_builder() {
         "stage 9's K5 reference must be format-dispatched, not hardcoded"
     );
     assert!(
-        code.contains("\"--stage9-kv-format\""),
+        example.contains("--stage9-kv-format"),
         "stage 9 must expose --stage9-kv-format"
     );
+}
+
+/// The flash_mla parameter builder has one definition, in the exact path src/cuda_harness.rs, no
+/// alias, and no example reimplements it: a second copy is the drift the builder exists to prevent.
+#[test]
+fn the_flash_mla_builder_has_one_unaliased_definition_in_the_library_harness() {
+    let crate_sources = pin_helpers::crate_sources();
+    let harness_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cuda_harness.rs");
+    pin_helpers::require_single_shared_definition(
+        &crate_sources,
+        "flash_mla_params",
+        &harness_path,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    pin_helpers::require_no_alias(&crate_sources, "flash_mla_params")
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        pin_helpers::example_definition_count(&pin_helpers::example_sources(), "flash_mla_params"),
+        0,
+        "no example may define its own flash_mla parameter builder"
+    );
+}
+
+/// The definition pins against the reviewed evasions: a differently named file beside the harness,
+/// an inline or space-before-paren duplicate in a .inc file, and a re-export under the same name.
+/// Every case is written to a temp tree and scanned with the same helpers the real pins use.
+#[test]
+fn the_definition_pins_reject_the_reviewed_evasions() {
+    let base =
+        std::env::temp_dir().join(format!("sparkflash-pin-definitions-{}", std::process::id()));
+    let pristine = base.join("pristine/src");
+    std::fs::create_dir_all(&pristine).expect("the temp source dir must be creatable");
+    let harness = pristine.join("cuda_harness.rs");
+    std::fs::write(
+        &harness,
+        "pub fn engine_window_row(latent: &[f32]) {}\npub fn flash_mla_params() {}\n",
+    )
+    .expect("the temp pristine harness must be writable");
+    let sources = pin_helpers::rust_sources_under(&pristine);
+    pin_helpers::require_single_shared_definition(&sources, "engine_window_row", &harness)
+        .expect("one definition in the harness file is the pristine case");
+    pin_helpers::require_single_shared_definition(&sources, "flash_mla_params", &harness)
+        .expect("one builder definition in the harness file is the pristine case");
+
+    // (c) a differently named file beside the harness cannot stand in for the harness path, and a
+    // duplicate in it fails the count.
+    let suffixed = base.join("suffixed/src");
+    std::fs::create_dir_all(&suffixed).expect("the temp source dir must be creatable");
+    std::fs::write(
+        suffixed.join("not_cuda_harness.rs"),
+        "fn engine_window_row() {}\n",
+    )
+    .expect("the temp suffixed source must be writable");
+    let suffixed_sources = pin_helpers::rust_sources_under(&suffixed);
+    assert!(
+        pin_helpers::require_single_shared_definition(
+            &suffixed_sources,
+            "engine_window_row",
+            &suffixed.join("cuda_harness.rs"),
+        )
+        .is_err(),
+        "a definition in src/not_cuda_harness.rs must not satisfy the exact harness path"
+    );
+    std::fs::write(
+        pristine.join("not_cuda_harness.rs"),
+        "fn engine_window_row() {}\n",
+    )
+    .expect("the temp duplicate source must be writable");
+    let duplicated = pin_helpers::rust_sources_under(&pristine);
+    assert!(
+        pin_helpers::require_single_shared_definition(&duplicated, "engine_window_row", &harness)
+            .is_err(),
+        "a second definition in a differently named file must fail the count"
+    );
+    std::fs::remove_file(pristine.join("not_cuda_harness.rs")).expect("cleanup");
+
+    // (b)+(d) an inline or space-before-paren duplicate in a .inc file is still counted, because
+    // every file and every whitespace variant is scanned.
+    let inc = base.join("inc/src");
+    std::fs::create_dir_all(&inc).expect("the temp source dir must be creatable");
+    let inc_harness = inc.join("cuda_harness.rs");
+    std::fs::write(
+        &inc_harness,
+        "pub fn engine_window_row(latent: &[f32]) {}\n",
+    )
+    .expect("the temp harness must be writable");
+    std::fs::write(
+        inc.join("private_copy.inc"),
+        "mod hidden {\n    fn engine_window_row (latent: &[f32]) {}\n}\n",
+    )
+    .expect("the temp inc source must be writable");
+    let inc_sources = pin_helpers::rust_sources_under(&inc);
+    assert!(
+        pin_helpers::require_single_shared_definition(
+            &inc_sources,
+            "engine_window_row",
+            &inc_harness
+        )
+        .is_err(),
+        "the .inc duplicate with a space before the parameter list must be counted"
+    );
+    assert_eq!(
+        pin_helpers::definition_count(
+            "mod hidden {\n    fn engine_window_row () {}\n}",
+            "engine_window_row"
+        ),
+        1,
+        "the whitespace-insensitive token must see a space-before-paren definition"
+    );
+
+    // (d) a re-export under the same name is rejected even where the definition count is one.
+    assert!(
+        pin_helpers::has_alias(
+            "pub use private_copy::engine_window_row as engine_window_row;\n",
+            "engine_window_row"
+        ),
+        "an as-rename re-export of the shared helper must be detected"
+    );
+    assert!(
+        pin_helpers::require_no_alias(
+            &[(
+                "src/cuda_harness.rs".to_string(),
+                "pub fn engine_window_row(latent: &[f32]) {}\npub use private_copy::engine_window_row as engine_window_row;\n".to_string(),
+            )],
+            "engine_window_row",
+        )
+        .is_err(),
+        "a re-export under the same name must fail the alias pin"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// Checks that a kernel's observing path executes an acquire fence unconditionally.

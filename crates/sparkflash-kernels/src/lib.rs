@@ -1,13 +1,17 @@
 //! sm_121a CUDA kernels and their CPU reference implementations.
 //!
-//! The crate holds three things:
+//! The crate holds four things:
 //!
 //! * the Milestone 3 collective: the RoCEnante one-shot All-Reduce slot ABI, its kernel, and the
 //!   CPU reference that defines the reduction's numerics (abi, roce_abi, roce_reduce);
 //! * the Milestone 4 kernels of specification 6.2: Mega-mHC, the MXFP8 dense twin, the MXFP4 MoE,
 //!   FlashMLA CSA2 and the certified LM head, with a weight-free CPU reference per kernel
 //!   (m4_abi, m4_quant, and the per-kernel reference modules);
-//! * the parsers that keep the Rust and CUDA halves of every ABI in lockstep (c_decl).
+//! * the parsers that keep the Rust and CUDA halves of every ABI in lockstep (c_decl);
+//! * the shared harness: the dlopen CUDA driver wrapper (cuda_driver, the one place in the
+//!   workspace that carries unsafe code for the device path) and the typed flash_mla launch
+//!   capability (cuda_harness), so m7_layer0 and the forthcoming m8_sequence launch the same
+//!   opaque handles instead of each carrying a raw driver copy.
 //!
 //! Equality claims in this crate are stated per module and are never unconditional. The MX codecs
 //! in m4_quant are equal to CUDA's converters for all 65,536 bf16 inputs, NaN patterns included,
@@ -18,6 +22,8 @@
 
 pub mod abi;
 pub mod c_decl;
+pub mod cuda_driver;
+pub mod cuda_harness;
 pub mod engram_head_ref;
 pub mod lm_head_ref;
 pub mod m4_abi;
