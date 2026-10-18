@@ -64,11 +64,12 @@ __device__ __forceinline__ void __threadfence(void) {}
 __device__ __forceinline__ void __threadfence_system(void) {}
 __device__ __forceinline__ void __nanosleep(unsigned int ns) { (void)ns; }
 
-// Warp shuffle, used by the flash_mla indexer to reduce a 128-wide dot inside one warp. clang's
-// CUDA frontend carries the shuffle as a builtin but only declares it through cuda_runtime.h,
-// which this probe deliberately does not include. A bare declaration is enough for the
-// -fsyntax-only probe; nvcc never sees this file.
+// Warp shuffle, used by the flash_mla indexer to reduce a 128-wide dot inside one warp and by the
+// SwiGLU quantiser to reduce a 32-wide MX block's amax. clang's CUDA frontend carries the shuffles
+// as builtins but only declares them through cuda_runtime.h, which this probe deliberately does
+// not include. A bare declaration is enough for the -fsyntax-only probe; nvcc never sees this file.
 __device__ float __shfl_down_sync(unsigned int mask, float value, unsigned int delta, int width = 32);
+__device__ float __shfl_xor_sync(unsigned int mask, float value, unsigned int lane_mask, int width = 32);
 
 // The shared trace header's macros call atomicAdd and __ffsll, which CUDA's own headers
 // provide. Declaring them here lets the ABI probe compile the macros with the trace enabled,
@@ -96,6 +97,27 @@ __device__ __forceinline__ float __uint_as_float(unsigned int bits) {
 __device__ __forceinline__ float expf(float value) {
     (void)value;
     return 1.0f;
+}
+
+// The __-prefixed fast intrinsics and the C99 float math functions the SwiGLU quantiser uses.
+// Like expf above they carry no semantics: -fsyntax-only never calls them. They are declared
+// because the build script's probe now covers kernels/swiglu_mxfp8_quant_sm121.cu, which CUDA's
+// own headers would normally provide.
+__device__ __forceinline__ float __expf(float value) {
+    (void)value;
+    return 1.0f;
+}
+
+__device__ __forceinline__ float fabsf(float value) {
+    return value < 0.0f ? -value : value;
+}
+
+__device__ __forceinline__ float fmaxf(float a, float b) {
+    return a > b ? a : b;
+}
+
+__device__ __forceinline__ float fminf(float a, float b) {
+    return a < b ? a : b;
 }
 
 __device__ __forceinline__ float sqrtf(float value) {

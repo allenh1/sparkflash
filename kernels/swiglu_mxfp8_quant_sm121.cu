@@ -1,10 +1,27 @@
 // The SwiGLU + MX-quantise epilogue that b12x_mxfp8_dense_sm121 does not have, and the standalone
 // activation quantiser the shared expert needs beside it.
 //
-// NOT part of the six-kernel M4 ABI. m4_abi's KERNELS array and the six-cubin baseline are pinned,
-// and adding an entry there would be an ABI revision; these are layer-level additions outside that
-// array, by the Lead's decision on task-35. The crate's clang probe therefore still reports six
-// kernels and does NOT cover this file: nvcc is this file's only compile proof.
+// SEVENTH PROBED KERNEL, STILL OUTSIDE THE FROZEN m4_abi KERNELS ARRAY. Specification 6.2 names six
+// Milestone 4 kernels, and m4_abi's KERNELS array plus its per-kernel declaration pins are those
+// six; adding an entry there would be an ABI revision, so these two entry points stay a layer-level
+// addition outside that array (the Lead's decision on task-35). The build script's kernel set and
+// the pinned baseline DO include this file: it is compiled on its own and in the combined probe by
+// both the nvcc and the clang-fallback paths, its enabled trace macros are type-checked there, and
+// baseline/kernel_baseline.txt records its cubin as the seventh entry. The host reference is
+// src/swiglu_ref.rs.
+//
+// TRACE. Both entry points record under the scope of the arithmetic they feed, not of the file they
+// live in. swiglu_mxfp8_quant_sm121 is launched for TWO shapes and the scope follows the shape: the
+// routed-expert epilogue (cols = 640, SPARK_M4_MOE_WIDTH_PADDED) records under
+// TRACE_SCOPE_MOE_MXFP4 because its operands are exactly what b12x_mxfp4_moe_sm121 consumes, and
+// the shared-expert path (cols = 2304) records under TRACE_SCOPE_DENSE_MXFP8 because its operands
+// feed the dense W8A8 GEMMs. The scope is picked from `cols` once per launch and passed to both
+// macros, so no launch can carry a scope that contradicts its output. mxfp8_quantize_activations_sm121
+// is always TRACE_SCOPE_DENSE_MXFP8. payload_meta is one E4M3 byte per value the block ACTUALLY
+// quantised (active warps times 32, not blockDim.x: a short grid's last block owns fewer than
+// warps_per_block whole blocks and idle warps quantise nothing). The instrumentation is the
+// trace_globaltimer_sm121.cuh macro pattern the M4 kernels use; the barrier its end timestamp needs
+// is compiled only when SPARKFLASH_ENABLE_GPU_TRACE is defined.
 //
 // TWO ENTRY POINTS, TWO DIFFERENT WEIGHT FORMATS, AND THE SHAPES ARE NOT INTERCHANGEABLE.
 //
@@ -82,36 +99,70 @@ extern "C" __global__ void swiglu_mxfp8_quant_sm121(
     const uint32_t rows,
     const uint32_t cols,
     const float limit,                        // swiglu_limit, 10.0 in the released config
-    GpuTraceRing *__restrict__ trace_ring,    // no scope is defined for this kernel yet: the trace
-    const uint32_t layer_id,                  // macros reduce to (void)(ring) when the build does
-    const uint64_t step_seq) {                // not define SPARKFLASH_ENABLE_GPU_TRACE
-    (void)trace_ring;
-    (void)layer_id;
-    (void)step_seq;
-
+    GpuTraceRing *__restrict__ trace_ring,    // scope follows cols, see trace_scope below
+    const uint32_t layer_id,
+    const uint64_t step_seq) {
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warps_per_block = blockDim.x >> 5u;
     const uint64_t warp = (uint64_t)blockIdx.x * warps_per_block + (uint64_t)(threadIdx.x >> 5u);
     const uint32_t blocks_per_row = cols >> 5u;  // cols is a multiple of 32 by contract
     const uint64_t total_blocks = (uint64_t)rows * (uint64_t)blocks_per_row;
-    if (warp >= total_blocks) {
-        return;
+
+    // The scope is a property of the launch shape, not of this file: cols = 640 is the routed-expert
+    // epilogue whose outputs b12x_mxfp4_moe_sm121 consumes, and cols = 2304 is the shared-expert
+    // path whose outputs feed the dense W8A8 GEMMs. Both macros below take this one expression, so a
+    // launch cannot open under one scope and close under another.
+    const uint64_t trace_scope = cols == SPARK_M4_MOE_WIDTH_PADDED
+                                     ? TRACE_SCOPE_MOE_MXFP4
+                                     : TRACE_SCOPE_DENSE_MXFP8;
+    uint64_t t_enter = 0u;
+    SPARK_GPU_TRACE_ENTER(trace_ring, trace_scope, t_enter);
+
+    // The early return becomes a guard instead: the block's thread 0 has to stay alive to close the
+    // trace event, and a barrier is only well defined if every non-exited thread reaches it. The
+    // guard is per warp, not per block, which is legal here because nothing after it is
+    // block-uniform.
+    if (warp < total_blocks) {
+        const uint32_t row = (uint32_t)(warp / blocks_per_row);
+        const uint32_t block = (uint32_t)(warp % blocks_per_row);
+        const uint64_t index =
+            (uint64_t)row * (uint64_t)cols + (uint64_t)block * 32u + (uint64_t)lane;
+
+        const float g = __bfloat162float(gate[index]);
+        const float u = __bfloat162float(up[index]);
+        const float clamped_gate = fminf(g, limit);               // upper side only
+        const float clamped_up = fminf(fmaxf(u, -limit), limit);  // both sides
+        const float activated = (clamped_gate / (1.0f + __expf(-clamped_gate))) * clamped_up;
+
+        out_fp8[index] = spark_activation_quantize_block(
+            activated,
+            lane,
+            &out_scales[(uint64_t)row * (uint64_t)blocks_per_row + (uint64_t)block]);
     }
-
-    const uint32_t row = (uint32_t)(warp / blocks_per_row);
-    const uint32_t block = (uint32_t)(warp % blocks_per_row);
-    const uint64_t index = (uint64_t)row * (uint64_t)cols + (uint64_t)block * 32u + (uint64_t)lane;
-
-    const float g = __bfloat162float(gate[index]);
-    const float u = __bfloat162float(up[index]);
-    const float clamped_gate = fminf(g, limit);               // upper side only
-    const float clamped_up = fminf(fmaxf(u, -limit), limit);  // both sides
-    const float activated = (clamped_gate / (1.0f + __expf(-clamped_gate))) * clamped_up;
-
-    out_fp8[index] = spark_activation_quantize_block(
-        activated,
-        lane,
-        &out_scales[(uint64_t)row * (uint64_t)blocks_per_row + (uint64_t)block]);
+    // The exit timestamp has to cover the whole block, so the barrier is taken after the block's
+    // work. Unlike the b12x kernels' unconditional barrier, this one is compiled ONLY when the trace
+    // is, the same condition that turns the macros below from no-ops into device code: the shipped
+    // kernel pays nothing for a ring it was not built to write to. The lane guard is the same shape
+    // b12x_mxfp8_wo_a_sm121.cu and b12x_mxfp8_dense_sm121.cu use.
+#if defined(SPARKFLASH_ENABLE_GPU_TRACE)
+    __syncthreads();
+#endif
+    // payload_meta: one E4M3 activation byte per value the reporting block quantised. Only block 0's
+    // thread 0 records an event (the trace macro's guard), and for the real launches it is fully
+    // live: 4x640 is 80 blocks over 10 grids and 2x2304 is 144 over 18, 8 warps each, so the count
+    // is 8 warps = 256 values. The clamp below only changes a grid whose total block count is not a
+    // multiple of warps_per_block (a one-block grid); there blockDim.x would over-report idle warps.
+    const uint64_t first_warp = (uint64_t)blockIdx.x * warps_per_block;
+    const uint64_t remaining = total_blocks > first_warp ? total_blocks - first_warp : 0u;
+    const uint32_t active_warps = remaining < warps_per_block ? (uint32_t)remaining : warps_per_block;
+    const uint32_t meta = active_warps * 32u;
+    if (lane == 0u) {
+        SPARK_GPU_TRACE_EXIT(trace_ring, trace_scope, layer_id, meta, t_enter);
+        (void)step_seq;
+    }
+    (void)t_enter;
+    (void)trace_scope;
+    (void)meta;
 }
 
 extern "C" __global__ void mxfp8_quantize_activations_sm121(
@@ -120,28 +171,48 @@ extern "C" __global__ void mxfp8_quantize_activations_sm121(
     uint8_t *__restrict__ out_scales,          // [rows][cols / 32] ue8m0, row stride cols / 32
     const uint32_t rows,
     const uint32_t cols,
-    GpuTraceRing *__restrict__ trace_ring,
+    GpuTraceRing *__restrict__ trace_ring,    // TRACE_SCOPE_DENSE_MXFP8, see the event below
     const uint32_t layer_id,
     const uint64_t step_seq) {
-    (void)trace_ring;
-    (void)layer_id;
-    (void)step_seq;
-
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warps_per_block = blockDim.x >> 5u;
     const uint64_t warp = (uint64_t)blockIdx.x * warps_per_block + (uint64_t)(threadIdx.x >> 5u);
     const uint32_t blocks_per_row = cols >> 5u;
     const uint64_t total_blocks = (uint64_t)rows * (uint64_t)blocks_per_row;
-    if (warp >= total_blocks) {
-        return;
+
+    uint64_t t_enter = 0u;
+    // The shared expert's input quantiser feeds the W8A8 gate-up GEMMs, which are the dense MXFP8
+    // path's arithmetic, so it records under DENSE_MXFP8 rather than the FP4 expert scope.
+    SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_DENSE_MXFP8, t_enter);
+
+    // Guard instead of early return, so every thread of the block reaches the barrier below and the
+    // exit timestamp covers the block.
+    if (warp < total_blocks) {
+        const uint32_t row = (uint32_t)(warp / blocks_per_row);
+        const uint32_t block = (uint32_t)(warp % blocks_per_row);
+        const uint64_t index =
+            (uint64_t)row * (uint64_t)cols + (uint64_t)block * 32u + (uint64_t)lane;
+
+        out_fp8[index] = spark_activation_quantize_block(
+            __bfloat162float(values[index]),
+            lane,
+            &out_scales[(uint64_t)row * (uint64_t)blocks_per_row + (uint64_t)block]);
     }
-
-    const uint32_t row = (uint32_t)(warp / blocks_per_row);
-    const uint32_t block = (uint32_t)(warp % blocks_per_row);
-    const uint64_t index = (uint64_t)row * (uint64_t)cols + (uint64_t)block * 32u + (uint64_t)lane;
-
-    out_fp8[index] = spark_activation_quantize_block(
-        __bfloat162float(values[index]),
-        lane,
-        &out_scales[(uint64_t)row * (uint64_t)blocks_per_row + (uint64_t)block]);
+    // Trace-only barrier, for the same reason as the entry above.
+#if defined(SPARKFLASH_ENABLE_GPU_TRACE)
+    __syncthreads();
+#endif
+    // payload_meta: the same active-warp rule as the entry above: block 0's 8 warps = 256 values for
+    // the real grid, and the clamp only changes a grid whose total block count is not a multiple of
+    // warps_per_block (a one-block grid).
+    const uint64_t first_warp = (uint64_t)blockIdx.x * warps_per_block;
+    const uint64_t remaining = total_blocks > first_warp ? total_blocks - first_warp : 0u;
+    const uint32_t active_warps = remaining < warps_per_block ? (uint32_t)remaining : warps_per_block;
+    const uint32_t meta = active_warps * 32u;
+    if (lane == 0u) {
+        SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_DENSE_MXFP8, layer_id, meta, t_enter);
+        (void)step_seq;
+    }
+    (void)t_enter;
+    (void)meta;
 }

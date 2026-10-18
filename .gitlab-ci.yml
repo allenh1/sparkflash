@@ -158,7 +158,8 @@ cuda-abi:
     # other.
     - cargo clippy -p sparkflash-kernels --all-targets --features cuda -- -D warnings
     # The committed kernel baseline is the check that would catch a kernel silently changing. It
-    # recompiles all six Milestone 4 kernels with this job's nvcc, compares the cubin bytes, the
+    # recompiles all seven baseline kernels (the six Milestone 4 kernels and the M7 SwiGLU
+    # quantiser epilogue) with this job's nvcc, compares the cubin bytes, the
     # cubin sha256 and the PTX membar line count against
     # crates/sparkflash-kernels/baseline/kernel_baseline.txt, and reports a different toolkit as a
     # toolkit change (with the regenerate command) rather than as a kernel change - a compiler

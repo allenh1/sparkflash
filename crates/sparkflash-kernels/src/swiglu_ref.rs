@@ -203,6 +203,98 @@ mod tests {
     }
 
     #[test]
+    fn the_kernel_text_is_traced_in_both_launch_shapes() {
+        // The kernel is launched for two shapes and the telemetry scope follows the shape: cols = 640
+        // is the routed-expert epilogue (MOE_MXFP4 consumer), cols = 2304 the shared-expert path
+        // (DENSE_MXFP8 consumer). One scope expression feeds ENTER and EXIT, so a launch cannot open
+        // under one consumer and close under another. A later edit that hard-codes a scope, or
+        // deletes the instrumentation, fails here - the enabled macro bodies are type-checked by
+        // build.rs but that would not catch the scope being wrong for a shape.
+        let source = include_str!("../../../kernels/swiglu_mxfp8_quant_sm121.cu");
+        // Both entry points are in this one file and they record different scopes: the routed-expert
+        // epilogue (cols = 640) under MOE_MXFP4 and the shared-expert activation quantiser under
+        // DENSE_MXFP8. A "both names appear" check would pass on a comment alone, so the assertions
+        // below pin the ternary arms and the exact macro calls.
+        assert!(
+            source.contains("? TRACE_SCOPE_MOE_MXFP4")
+                && source.contains(": TRACE_SCOPE_DENSE_MXFP8"),
+            "the ternary must map cols == 640 to MOE_MXFP4 and every other shape to DENSE_MXFP8"
+        );
+        assert!(
+            !source.contains("? TRACE_SCOPE_DENSE_MXFP8"),
+            "swapped ternary arms would record the shared expert under the FP4 scope"
+        );
+        assert!(
+            source.contains("const uint64_t trace_scope = cols == SPARK_M4_MOE_WIDTH_PADDED"),
+            "the scope must be computed once per launch, from the launch shape"
+        );
+        assert!(
+            source.contains("SPARK_GPU_TRACE_ENTER(trace_ring, trace_scope, t_enter)"),
+            "the entry event must use the per-launch scope"
+        );
+        assert!(
+            source
+                .contains("SPARK_GPU_TRACE_EXIT(trace_ring, trace_scope, layer_id, meta, t_enter)"),
+            "the exit event must use the same per-launch scope"
+        );
+        // The second entry point, mxfp8_quantize_activations_sm121, has no shape ternary: it is the
+        // shared-expert input quantiser and must open AND close under DENSE_MXFP8.
+        assert!(
+            source.contains("SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_DENSE_MXFP8, t_enter)"),
+            "the activation quantiser must open under DENSE_MXFP8"
+        );
+        assert!(
+            source.contains(
+                "SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_DENSE_MXFP8, layer_id, meta, t_enter)"
+            ),
+            "the activation quantiser must close under DENSE_MXFP8"
+        );
+        assert!(
+            !source.contains("(void)trace_ring"),
+            "a discarded trace ring means the instrumentation was deleted, not disabled"
+        );
+        // payload_meta is the ACTIVE warp count times 32, not blockDim.x. For the real shapes the
+        // reporting block is fully live (8 warps = 256 values), but the clamp is what keeps a
+        // one-block grid from over-reporting idle warps. BOTH entry points carry the same two lines,
+        // so a whole-file contains() accepts a mutation of only one of them; split at the second
+        // entry point and assert the clamp and its use in EACH half, with the wrong forms refused in
+        // each half too.
+        const SECOND_ENTRY: &str = "extern \"C\" __global__ void mxfp8_quantize_activations_sm121";
+        let (routed_half, dense_half) = source
+            .split_once(SECOND_ENTRY)
+            .expect("the source must still have both entry points");
+        // Orient the split before trusting it: the shape ternary exists only in the first entry
+        // point, so a split at the wrong place cannot silently make both halves the same text.
+        assert!(
+            routed_half.contains("const uint64_t trace_scope = cols == SPARK_M4_MOE_WIDTH_PADDED")
+                && !dense_half.contains("trace_scope"),
+            "the split must put the shape ternary in the first half and no scope variable in the second"
+        );
+        for (what, half) in [
+            ("swiglu_mxfp8_quant_sm121", routed_half),
+            ("mxfp8_quantize_activations_sm121", dense_half),
+        ] {
+            assert!(
+                half.contains(
+                    "remaining < warps_per_block ? (uint32_t)remaining : warps_per_block"
+                ),
+                "{what}: the active warp count must clamp a partly live block"
+            );
+            assert!(
+                half.contains("const uint32_t meta = active_warps * 32u;"),
+                "{what}: payload_meta must count the warps that actually quantised a block"
+            );
+            for wrong in [
+                "const uint32_t active_warps = warps_per_block;",
+                "const uint32_t meta = blockDim.x;",
+                "const uint32_t meta = warps_per_block * 32u;",
+            ] {
+                assert!(!half.contains(wrong), "{what}: {wrong} must not appear");
+            }
+        }
+    }
+
+    #[test]
     fn the_ue8m0_decoder_handles_the_code_127_boundary_and_the_subnormal_zero() {
         assert_eq!(ue8m0_decode(127), 1.0, "code 127 is 2^0, not 2^24");
         assert_eq!(ue8m0_decode(0), f32::from_bits(1 << 22));

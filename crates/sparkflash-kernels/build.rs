@@ -7,10 +7,10 @@
 //!    cfg, which is what the ABI checks are gated on, and the CPU reference kernels are always
 //!    compiled. The crate's optional "cuda" feature is a separate thing - it only selects the
 //!    cudarc dependency, and no code in this crate reads it (see Cargo.toml).
-//! 2. When a CUDA frontend IS present, compile the shared headers and the RoCEnante kernel.
-//!    Both the trace ABI header and the RoCEnante slot ABI are contracts between Rust and
-//!    device code, so a drift has to fail the build instead of lurking until the first real
-//!    kernel launch:
+//! 2. When a CUDA frontend IS present, compile the shared headers, the RoCEnante kernel and the
+//!    seven device kernels of the M4/M7 set. The trace ABI header, the RoCEnante slot ABI and the
+//!    pinned kernel set are contracts between Rust and device code, so a drift has to fail the
+//!    build instead of lurking until the first real kernel launch:
 //!
 //!    * the trace probe compiles a device-only translation unit that static-asserts every
 //!      GpuTraceEvent/GpuTraceRing size, alignment and field offset and instantiates all four
@@ -19,12 +19,16 @@
 //!      redeclaration of the kernel's __global__ signature and a second, literal copy of the
 //!      slot layout assertions;
 //!    * the kernel itself is compiled standalone, so it must be a self-contained translation
-//!      unit.
+//!      unit;
+//!    * every kernel of the M4/M7 set is compiled on its own, so a failure names the file, and
+//!      then all seven are compiled together with the trace macros enabled, which is the only
+//!      check that can catch a collision BETWEEN kernel files.
 //!
 //!    None of that needs a GPU, only a CUDA frontend. When nvcc is absent but clang is present,
-//!    the kernel AND the RoCEnante probe are instead handed to clang's CUDA frontend with a
-//!    stubbed cuda_bf16.h (crates/sparkflash-kernels/cuda_stub/cuda_stub.h) and compiled
-//!    device-only with -fsyntax-only. Compiling the probe rather than the kernel alone matters:
+//!    the kernel, the RoCEnante probe and the M4/M7 kernel set are instead handed to clang's CUDA
+//!    frontend with a stubbed cuda_bf16.h
+//!    (crates/sparkflash-kernels/cuda_stub/cuda_stub.h) and compiled device-only with
+//!    -fsyntax-only. Compiling the probe rather than the kernel alone matters:
 //!    it turns SPARKFLASH_ENABLE_GPU_TRACE on, so the trace macros in the kernel body are
 //!    type-checked instead of expanding to no-ops, it re-declares the __global__ signature
 //!    against the definition, and it re-states the slot layout as literals. That is still a
@@ -141,32 +145,42 @@ __global__ void sparkflash_roce_abi_probe(RoceOneShotSlot *slot, uint64_t *sink)
 }
 "#;
 
-/// The six Milestone 4 kernels of specification 6.2, with the stem used for their PTX output.
-/// Every one of them is probed on every build: a kernel that is only ever compiled by hand on a
-/// GPU host is a kernel nobody has type-checked, and the CI cuda-abi job runs exactly this probe.
-const M4_KERNELS: [(&str, &str); 6] = [
+/// The seven device kernel sources the crate probes and pins, with the stem used for their PTX
+/// output.
+///
+/// Six of them are the Milestone 4 kernels of specification 6.2, the set m4_abi's frozen KERNELS
+/// array pins. The seventh is the M7 SwiGLU + MX-quantise epilogue
+/// (kernels/swiglu_mxfp8_quant_sm121.cu): it is deliberately OUTSIDE that frozen array, because
+/// adding an entry there would be an ABI revision, but it is a device source this crate ships,
+/// the clang/nvcc probes compile it like the others, and baseline/kernel_baseline.txt records its
+/// cubin as the seventh entry. Every one of the seven is probed on every build: a kernel that is
+/// only ever compiled by hand on a GPU host is a kernel nobody has type-checked, and the CI
+/// cuda-abi job runs exactly this probe.
+const PROBED_KERNELS: [(&str, &str); 7] = [
     ("mega_mhc_sm121.cu", "mega_mhc_sm121"),
     ("b12x_mxfp8_dense_sm121.cu", "b12x_mxfp8_dense_sm121"),
     ("b12x_mxfp4_moe_sm121.cu", "b12x_mxfp4_moe_sm121"),
     ("flash_mla_csa2_sm121.cu", "flash_mla_csa2_sm121"),
     ("b12x_mxfp8_wo_a_sm121.cu", "b12x_mxfp8_wo_a_sm121"),
     ("cert_lm_head_sm121.cu", "cert_lm_head_sm121"),
+    ("swiglu_mxfp8_quant_sm121.cu", "swiglu_mxfp8_quant_sm121"),
 ];
 
-/// The Milestone 4 shared header every one of those kernels includes for its model constants, the
-/// MX codecs and the B12x layout. A probe of the four modules is not enough if this one is missing.
+/// The shared header every one of those kernels includes for its model constants, the MX codecs
+/// and the B12x layout. Probing the kernel files is not enough if this one is missing: it is the
+/// one include they all share.
 const M4_COMMON_HEADER: &str = "m4_common_sm121.cuh";
 
-/// The combined probe: all six kernels in one translation unit with the trace macros ENABLED. This
-/// is the only check in the build that can catch a collision BETWEEN kernels (two files defining
-/// the same macro to different values, or two identical non-inline symbols), and it is also the
-/// only one that compiles the enabled branch of every trace scope.
-fn m4_probe_source() -> String {
+/// The combined probe: all seven kernel sources in one translation unit with the trace macros
+/// ENABLED. This is the only check in the build that can catch a collision BETWEEN kernels (two
+/// files defining the same macro to different values, or two identical non-inline symbols), and it
+/// is also the only one that compiles the enabled branch of every trace scope.
+fn combined_probe_source() -> String {
     let mut source = String::from("#define SPARKFLASH_ENABLE_GPU_TRACE 1\n");
     source.push_str("#include \"");
     source.push_str(M4_COMMON_HEADER);
     source.push_str("\"\n");
-    for (file, _) in M4_KERNELS {
+    for (file, _) in PROBED_KERNELS {
         source.push_str("#include \"");
         source.push_str(file);
         source.push_str("\"\n");
@@ -255,44 +269,45 @@ fn main() {
         ),
     );
 
-    // The Milestone 4 kernel set. Every kernel is probed individually so that a failure names the
-    // file, and then all six are probed together with the trace macros enabled.
+    // The M4/M7 kernel set. Every kernel is probed individually so that a failure names the file,
+    // and then all seven are probed together with the trace macros enabled.
     if !kernels.join(M4_COMMON_HEADER).is_file() {
         println!(
-            "cargo:warning=sparkflash-kernels: {} is missing; skipping every Milestone 4 kernel \
-             probe",
+            "cargo:warning=sparkflash-kernels: {} is missing; skipping every M4/M7 kernel probe",
             M4_COMMON_HEADER
         );
         return;
     }
-    for (file, stem) in M4_KERNELS {
+    for (file, stem) in PROBED_KERNELS {
         let path = kernels.join(file);
         if !path.is_file() {
             println!(
-                "cargo:warning=sparkflash-kernels: {file} is missing; the Milestone 4 kernel set \
-                 is incomplete (specification 6.2 names six)"
+                "cargo:warning=sparkflash-kernels: {file} is missing; the M4/M7 kernel set is \
+                 incomplete (the six Milestone 4 kernels plus the M7 SwiGLU quantiser \
+                 epilogue); the report would cover fewer kernels than the baseline names"
             );
             continue;
         }
         report(
             &nvcc,
             &arch,
-            &format!("the Milestone 4 kernel {file}"),
+            &format!("the probed kernel {file}"),
             compile_file(&nvcc, &arch, &path, &[kernels], stem),
         );
     }
     report(
         &nvcc,
         &arch,
-        "the combined Milestone 4 probe (all six kernels, trace macros enabled)",
+        "the combined M4/M7 probe (all seven kernels, trace macros enabled)",
         check_m4_probe(&nvcc, &arch, kernels),
     );
 }
 
-/// Writes and compiles the combined Milestone 4 probe with nvcc.
+/// Writes and compiles the combined M4/M7 probe with nvcc.
 fn check_m4_probe(nvcc: &Path, arch: &str, kernels: &Path) -> Result<(), ProbeFailure> {
     let probe = out_dir()?.join("m4_kernels_probe.cu");
-    std::fs::write(&probe, m4_probe_source()).map_err(|e| ProbeFailure::new(e.to_string()))?;
+    std::fs::write(&probe, combined_probe_source())
+        .map_err(|e| ProbeFailure::new(e.to_string()))?;
     compile_file(nvcc, arch, &probe, &[kernels], "m4_kernels_probe")
 }
 
@@ -428,13 +443,14 @@ fn report_clang(clang: &Path, arch: &str) {
 /// assertions are evaluated together.
 fn report_clang_probe(clang: &Path, arch: &str) {
     match check_roce_probe_syntax(clang, arch) {
-        Ok(()) => match check_m4_kernels_syntax(clang, arch) {
+        Ok(()) => match check_probed_kernels_syntax(clang, arch) {
             Ok((checked, missing)) => println!(
                 "cargo:warning=sparkflash-kernels: nvcc not found; clang's CUDA frontend parsed \
                  kernels/rocenante_oneshot_sm121.cu, the RoCEnante ABI probe (trace macros \
-                 enabled, signature redeclared, slot static_asserts), {checked} of the six \
-                 Milestone 4 kernels ({missing} missing) and the combined Milestone 4 probe with \
-                 the trace macros enabled, against stub headers (-fsyntax-only, {arch}). That \
+                 enabled, signature redeclared, slot static_asserts), {checked} of the seven \
+                 probed kernels (the six Milestone 4 ABI kernels plus the M7 SwiGLU quantiser \
+                 epilogue; {missing} missing) and the combined M4/M7 probe with the trace macros \
+                 enabled, against stub headers (-fsyntax-only, {arch}). That \
                  checks syntax, types and every static_assert, NOT PTX and NOT numerics. A CUDA \
                  host must run the nvcc probe before any of these kernels is trusted."
             ),
@@ -458,13 +474,13 @@ fn report_clang_probe(clang: &Path, arch: &str) {
     }
 }
 
-/// Parses the six Milestone 4 kernels and the combined probe with clang. Returns how many kernels
-/// were found and how many were missing, so the warning can say which evidence was gathered.
-fn check_m4_kernels_syntax(clang: &Path, arch: &str) -> Result<(usize, usize), ProbeFailure> {
+/// Parses the seven probed kernels and the combined probe with clang. Returns how many kernels were
+/// found and how many were missing, so the warning can say which evidence was gathered.
+fn check_probed_kernels_syntax(clang: &Path, arch: &str) -> Result<(usize, usize), ProbeFailure> {
     let kernels = Path::new("../../kernels");
     let mut checked = 0usize;
     let mut missing = 0usize;
-    for (file, _) in M4_KERNELS {
+    for (file, _) in PROBED_KERNELS {
         let path = kernels.join(file);
         if path.is_file() {
             clang_syntax_check(clang, arch, &path)?;
@@ -475,7 +491,8 @@ fn check_m4_kernels_syntax(clang: &Path, arch: &str) -> Result<(usize, usize), P
     }
     if checked > 0 {
         let probe = out_dir()?.join("m4_kernels_probe.cu");
-        std::fs::write(&probe, m4_probe_source()).map_err(|e| ProbeFailure::new(e.to_string()))?;
+        std::fs::write(&probe, combined_probe_source())
+            .map_err(|e| ProbeFailure::new(e.to_string()))?;
         clang_syntax_check(clang, arch, &probe)?;
     }
     Ok((checked, missing))

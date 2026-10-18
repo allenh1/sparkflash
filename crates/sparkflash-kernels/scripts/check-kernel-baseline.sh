@@ -1,5 +1,5 @@
 #!/bin/sh
-# Verifies that nvcc still compiles the six Milestone 4 kernels to the recorded baseline.
+# Verifies that nvcc still compiles the seven baseline kernels to the recorded baseline.
 #
 # This is the check that would catch a kernel silently changing: it recompiles each kernel to a cubin
 # and to PTX, and compares the cubin bytes, the cubin sha256 and the PTX membar count with
