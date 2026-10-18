@@ -33,8 +33,9 @@ records the evidence and the consequence for the build. Research backing is in
 | D22 | Released mHC arithmetic | The ref, the kernel and the harness model the released arithmetic end to end (projection rstd, `mix*scale+base`, sigmoid pre/post, released split-Sinkhorn, raw C, `X_hat` block norm, released `[24, n*d]` predictor); B0 removed the stream-mean fold from both sides, so the old structural difference is gone |
 | D23 | The activation quantiser is the reference ceil rule | Device activation quantisers take the smallest power of two at or above `amax/448` after the 1e-4 amax floor (the engine's `quantize_activation_fp8` rule); the checkpoint weight-grid rule stays floor-log2 and the two helpers are named apart (D8) |
 | D24 | CSA attention attends the window/compressed union | Format 2 (CSA-union) attends the window rows then the selected compressed ids, causal, with the sink first in the denominator; the 19-param ABI and formats 0/1 are unchanged, and it is reference-tested/CPU-pinned only until a device window proves it |
-| D25 | The golden sequence fixture is Phase-2 reference truth | The real-checkpoint fixture (`e6df8290...`, 2,536,194 B; 130-token prefill with next token 491, 8 decodes, compared 129..137) is the truth 2B/2C are measured against; device output is compared token-first then logits at 2e-2; the 2B device comparison has not run, criterion 1 stays OPEN, and the fixture is never regenerated to accommodate a device change |
+| D25 | The golden sequence fixture is Phase-2 reference truth | The real-checkpoint fixture (`e6df8290...`, 2,536,194 B; 130-token prefill with next token 491, 8 decodes, compared 129..137) is the truth 2B/2C are measured against; device output is compared token-first then logits at 2e-2; the 2B device plumbing (rotation + format-2/1 dispatch, no forward chain) is wired on branch phase2/m8-sequence (MR !63 after the round-2 fix commit), no device run of the corrected path has happened, the token/logits comparison has not run, criterion 1 stays OPEN, and the fixture is never regenerated to accommodate a device change |
 | D26 | The Milestone-4 ABI source-text lint is frozen | No new source-text scanner, parser or lint in `m4_abi.rs`; new kernel invariants are enforced by compiled-artifact inspection (cubin/PTX baseline) or runtime device assertions, and `ci/check-m4-abi-size.sh` fails CI if the file grows past its pinned line count |
+
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
 summary and the matching `## D<n>` section carries the evidence and the full consequence. If a row and
@@ -1205,7 +1206,7 @@ typed FlashMlaParams/flash_mla_params builder.
 
 ---
 
-## D25 - The golden sequence fixture is the Phase 2 reference truth, and 2B's device comparison is still open
+## D25 - The golden sequence fixture is the Phase 2 reference truth; 2B's device plumbing is wired and its comparison is still open
 
 Recorded 2026-10-18.
 
@@ -1237,10 +1238,13 @@ corrected reference) is a separate Lead decision that records a new sha256/size 
 old fixture superseded. The CSA-union format-2 semantics remain D24's; this entry does not restate
 them.
 
-**Consequence.** At record time the 2B device comparison has NOT run: the skeleton is CPU-pinned in
-draft MR !63 (opened at bad3c84 against a26be2e), the format-2 dispatch and the measured
-`window_rows` rotation are not wired, and no device prefill/decode, token, logits or rotation-copy
-number exists for this milestone. Phase 2 exit criterion 1
+**Consequence.** The 2B device plumbing is now wired on branch `phase2/m8-sequence` (MR !63):
+the measured `window_rows` rotation and the format-2/format-1 attention dispatch run in a device
+window, but the per-layer forward chain that would produce tokens and logits is still absent, and a
+2026-10-18 window ran the plumbing only. Round-2 adversarial review then found the first commit's
+rotation clock included verification/dispatch and its decoder rows were counted from position 0, so
+those numbers are superseded and the corrected path has not been re-run on a device; no device
+prefill/decode token or logits delta exists for this milestone. Phase 2 exit criterion 1
 ([build/roadmap-to-serving.md](build/roadmap-to-serving.md) section 5.5.1) is therefore OPEN, as are
 criteria 2-5. Format 2 is reference-tested/CPU-pinned only (D24, !62 -> main d3dcc3f, pipeline
 2763); its device execution is the next Lead-sequenced step, and this fixture is what that run will

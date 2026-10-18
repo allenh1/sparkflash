@@ -65,6 +65,16 @@ test:
     - cargo test --workspace
     - cargo test -p sparkflash-trace --no-default-features
 
+# `cargo test --workspace` does not run the tests inside example harnesses: it builds the examples
+# to check they compile, but their #[cfg(test)] blocks are invisible to every gate. The m8_sequence
+# harness keeps its rotation accounting, dispatch plan, fixture pin and comparison-plumbing invariants
+# there, so those checks had never run in CI. This job runs them explicitly; it needs no GPU, no
+# checkpoint and no cubin.
+test-examples:
+  stage: test
+  script:
+    - cargo test -p sparkflash-kernels --examples
+
 # `cargo test --workspace` builds only the default feature sets, so code behind a non-default
 # feature is compiled by no job unless a job names it. sparkflash-engram's io_uring ring sits
 # behind `io-uring`, which no crate in the workspace enables: the ring and its tests were

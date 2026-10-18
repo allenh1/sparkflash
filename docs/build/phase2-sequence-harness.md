@@ -1,9 +1,13 @@
 # Phase 2 sequence harness (milestone 2)
 
 Status: **2A contract/format landed on main** as 13d880d (squash of !56) with the real-checkpoint
-element-limit follow-up 51cd0c5 (squash of !58); the node golden fixture now exists
-([phase2-golden-fixture.md](phase2-golden-fixture.md)); 2B is a CPU-pinned skeleton in draft MR !63
-and its device comparison has not run; 2C has not started. This note records the accepted design,
+element-limit follow-up 51cd0c5 (squash of !58); the node golden fixture exists
+([phase2-golden-fixture.md](phase2-golden-fixture.md)); 2B iteration 1 (branch phase2/m8-sequence)
+wires the measured window rotation and the format-2/format-1 attention dispatch into m8_sequence
+and ships a host dry-run plus a paste-ready device command; the plumbing was run in the 2026-10-18
+window, round-2 review then found a contaminated rotation clock and a decoder-row over-count, and
+this fix commit corrects both (corrected path NOT yet run on a device); the 2B device comparison has
+**not** run and the model forward is not wired; 2C has not started. This note records the accepted design,
 the 2A contract, and the exact boundaries so no later claim is read more broadly than it was
 measured; section 7 records the current Phase 2 status. **Phase 2 exit criterion 1 remains OPEN.**
 
@@ -165,28 +169,147 @@ two fixture weight kinds are pinned in the serialised schema.
   (kind, layer, position); per-token bytes measured from the live store per layer mode; the
   un-masked-score control breaks 5.5.4.
 
-## 7. Status after the golden fixture (2026-10-18)
+## 7. Status after the 2B iteration-1 wiring and the round-2 fix (2026-10-18)
 
 * **2A contract/format landed**: !56 (main 13d880d) produced the schema and the comparator; the
   real-checkpoint element-limit follow-up is !58 (main 51cd0c5). Sections 2-5 describe the contract
   as merged.
-* **The golden fixture exists**: a real-checkpoint 130-token prefill + 8 greedy decodes, 2,536,194 B,
-  sha256 `e6df8290...`; its provenance and measurement caveats are in
-  [phase2-golden-fixture.md](phase2-golden-fixture.md). It is reference truth, not device evidence.
-* **2B skeleton is CPU-pinned and in draft MR !63**: the `m8_sequence` harness compares token-first
-  then logits at 2e-2, and refuses the device path in that draft. It was opened at bad3c84 against
-  a26be2e; a rebase onto d3dcc3f is still owed.
-* **2B device comparison has NOT run.** No token, logits, rotation-copy or device timing number for
-  this milestone exists.
-* **CSA-union format 2 landed** as !62 -> main d3dcc3f (pipeline 2763 green): the previous
-  window-only device attention structurally excluded the compressed candidates the engine reference
-  attends at position 129, so `window_kv_format=2` attends the window rows then the selected
-  compressed ids, causal, with the sink first in the denominator. The 19-param ABI and formats 0/1
-  are unchanged and the CPU twin (`mla_ref::attention_with_sink_union`) is bit-for-bit against the
-  engine reference, but **format 2 has not executed on a device**; its semantics are D24.
+* **The golden fixture exists and is byte-pinned**: a real-checkpoint 130-token prefill + 8 greedy
+  decodes, 2,536,194 B, sha256
+  `e6df8290dcc9cfc96af27ad1a4da165e5f3d8d4e9aac0f98819b0030b738b308`; its provenance and
+  measurement caveats are in [phase2-golden-fixture.md](phase2-golden-fixture.md). It is reference
+  truth, not device evidence. The dev-host copy used for the local dry-run is
+  `/home/user/phase2-evidence/devhost-copy-f72738b/sequence-130-released.json` (evidence, not the
+  repo); the node path is `/home/user/phase2-evidence/sequence-130-released.json`.
+  `m8_sequence`'s loader now pins that byte size and hash, so a different fixture with the same
+  schema and token 491 is refused before a comparison.
+* **CSA-union format 2 landed** as !62 -> main d3dcc3f (pipeline 2763 green): `window_kv_format=2`
+  attends the window rows then the selected compressed ids, causal, with the sink first in the
+  denominator. The 19-param ABI and formats 0/1 are unchanged; the CPU twin
+  (`mla_ref::attention_with_sink_union`) is checked against the engine reference. Format 2 has since
+  executed on devices: the isolated task-14 check and the 2026-10-18 plumbing window below. Its
+  semantics are D24.
+* **2B iteration 1 (branch `phase2/m8-sequence`) wires the device half in
+  `crates/sparkflash-kernels/examples/m8_sequence.rs`.** It does NOT run the model forward and claims
+  no exit criterion. Round 2 of adversarial review found two blockers and two majors in the first
+  commit (8c91fe5); this fix commit corrects them:
+  * **rotation rows are anchored at each layer's first executed position.** Encoder layers start at
+    0 and decoder layers at the CED boundary 2, so a decoder view at position `p` holds
+    `min(p - 1, 128)` rows, not `min(p + 1, 128)`. The first commit used the latter and over-counted
+    253 slots per decoder layer (4,807 slots, 2,538,096 B), which would also have rotated slots the
+    layer never wrote if the forward chain reused it. `cuda_harness::ring_view_position` now takes
+    the layer's first position, with lib tests for the decoder cases, and the plan, the device copy
+    closure and the dry-run all call that one helper.
+  * **corrected rotation accounting**: one rotation per token-layer execution, copying only the rows
+    that execution's oldest-first view holds: **5,482 executions (prefill 5,162 + decode 320),
+    376,576 slots, 198,832,128 B (codes 192,806,912 B + scales 6,025,216 B)**; one full ring
+    67,584 B, all forty rings once 2,703,360 B, at most 21,928 `copy_dtod` calls and exactly 11,764
+    expected under the segment geometry (5,082 one-run views x 2 calls + 400 wrapped views x 4).
+    An independent closed-form test pins the per-layer split (encoder 200,256 slots, decoder
+    176,320 slots); the earlier min(position + 1) total (381,383 slots) and the skeleton's
+    forty-ring-volume x executions total are both named and pinned as wrong.
+  * **rotation timing is copy-only.** `measure_rotation` sums the durations the closure attributes to
+    its `rotate_window_ring` calls alone and reports the loop wall separately; the device closure
+    times only those calls, and a test sleeps 60 ms between copies and asserts the sleep appears in
+    the wall but not in the copy time. A dispatch or read-back can no longer be charged to the copy
+    rate. The 2026-10-18 window's rotation seconds and MiB/s came from the contaminated first-commit
+    clock, so **they are deliberately not quoted here and must not be**; the corrected path's
+    copy-only rate is unmeasured.
+  * the per-layer attention-kind table and the dispatch plan for the compared positions: 360 calls =
+    18 window-only (format 1, layers 0-1) + 342 union (format 2, 38 layers); at position 129 the
+    union calls carry 65 selected ids on the 18 ratio-2 layers and 130 on the 20 ratio-1 layers; the
+    per-position **selected counts (window rows are not included in these numbers)** are 3770, 3790,
+    3828, 3848, 3886, 3906, 3944, 3964, 4002.
+  * `--dry-run` (host only, no CUDA): builds the schedule/rotation/dispatch plans, bounds-checks every
+    union call through the shared `Format2AttentionCall::params()` builder (which now carries real
+    indexer buffers instead of nulls), builds the expanded compressed views, and exercises the
+    token-then-logits comparison plumbing against the fixture with three negative controls (wrong
+    token, out-of-bar logits, position outside the compared set are all refused). It writes the same
+    report shape the device run writes. The loader pins the fixture hash first.
+  * `--prefill-only` is implemented: it narrows the compared set to the prefill position 129 for both
+    the dispatch plan and the comparison, and the report labels the narrowed set (it used to be a
+    parsed-but-ignored flag).
+  * `--device`: measures the rotation sweep with real device-to-device copies on the corrected row
+    arithmetic, reads every compared position's oldest-first view back and compares it byte-for-byte
+    with the host slot order, then runs the dispatches on harness-owned deterministic inputs,
+    comparing each prefill-position dispatch against the CPU twin (bar 2e-2) and repeating each
+    decode dispatch to prove byte-identical output. It reads no weight and produces **no token and no
+    logits delta**; the report states that the 9-position comparison was NOT attempted. The dispatch
+    line counts every launch (first launches plus determinism repeats), not just records.
+* **Device window 2026-10-18: what the first-commit binary measured, and what is still needed.**
+  The window ran binary `3afcf1ac...` (commit 8c91fe5) on node0, report
+  `/home/user/phase2-evidence/window-2026-10-18/runs/m8-sequence-report.txt`, fixture
+  `e6df8290...`, flash_mla cubin `5bfee4c7...`. Numbers from it that this note still quotes, because
+  the code that produced them is unchanged by the fix:
+  * dispatch: 360 calls (342 union format 2 + 18 window-only format 1) over 9 positions x 40 layers,
+    grid (64,1,1) block (256,1,1); 0 non-finite; 40 device-vs-twin comparisons at position 129 all
+    within the 2.0e-2 bar (worst 9.718239e-4 at layer 0, head 5, channel 48); 320/320 repeated-launch
+    determinism checks identical; the run issued 680 launches (360 first launches + 320 determinism
+    repeats) and its first-launch time was 0.174152 s over the 360 records = 483.756 us per record.
+  * rotation order check: 360 oldest-first views read back and compared byte-for-byte with the host
+    slot order (24,330,240 B verified), zero mismatches.
+  * rotation: the run issued 11,764 `copy_dtod` calls, the count the corrected geometry still
+    predicts; it moved the first-commit plan's over-counted total (381,383 slots: 4,807 slots too
+    many in total, 253 per decoder-layer view, 19 x 253), so that byte total measured a bug, not the
+    corrected plan's 376,576 slots / 198,832,128 B.
+  The corrected binary has **not** run on a device: the corrected rotation bytes, its copy-only
+  rate, and the re-measured dispatch wall time are all unmeasured. No number in this note may be
+  presented as the corrected path's measurement.
+* **Performance question for Phase 3 (task-10).** The rotation is 11,764 driver copies for 376,576
+  slots (32.0 slots per copy on average, code-derived); the old timing suggests per-call overhead
+  dominates, but because that clock was contaminated the per-call cost and the MiB/s are **not
+  claimed**. The same window measured one m7 stage-2 attention launch at 130 tokens at p50
+  0.2492 ms (engine format, `runs/a-stage2-engine-130.log`; the FP4 stage-2 run in that window also
+  reproduced the merged-chain equality: 163838/163840 exact, max abs delta 2.4414063e-4, max ULP 1,
+  `runs/c-stage2-fp4-130.log`). The comparison "rotation versus one attention call" is the strongest
+  argument for the Phase 3 fix, but it stays an open measurement until the corrected copy-only run
+  produces its number; task-10 is filed for it (batch each contiguous run, one pitched
+  `cudaMemcpy2D` per view, or a device-side copy kernel driven by the `RingSegment` table, keeping
+  `host_ring_view` as the oracle).
+* **Host seams still open** (each is labelled in every report): the HSI pool population and the
+  top-512 candidate merge are harness-supplied (the harness passes the reachable compressed rows
+  directly); the expanded compressed view is built on the host; the query, window rings, compressed
+  store, sink and indexer buffers are deterministic harness-owned content, not model state; and the
+  per-layer forward chain is absent. The kernel stage-1 indexer buffers are zeroed host buffers, so
+  the dispatch checks the ABI and layout, not the HSI selection. Format-2 dispatches are built and
+  bounds-checked through the shared `Format2AttentionCall` builder, and format-1 window-only
+  dispatches go through `cuda_harness::flash_mla_params` directly because that builder is format-2
+  only; both take the 19-word order from the same constructor.
+* **The format-2 builder defect is fixed in this branch.** Commit 0d715bd added
+  `crates/sparkflash-kernels/src/sequence_chain.rs` in this branch (the earlier note's claim that the
+  module was outside this branch's write scope was wrong); `Format2AttentionCall` now carries the four
+  indexer `Deviceptr` fields, passes them to their ABI words (8, 9, 11, 12; the sink stays at 10) and
+  refuses nulls, so `params()`/`launch()` can issue a real format-2 launch. Tests in both crates pin
+  the pointer words and the null refusal.
+* **Example tests now run in CI.** `cargo test --workspace` builds examples but does not run their
+  `#[cfg(test)]` blocks, so the 29 m8 invariants had never run in a gate; `.gitlab-ci.yml` gains a
+  `test-examples` job running `cargo test -p sparkflash-kernels --examples` (no GPU, no checkpoint).
+* **Task-15 layer-0 smoke is NOT 2B evidence.** The 4-position layer-0 device smoke recorded a
+  last-position residual within the bar and six tight row-0 bars slightly exceeded, and its 130-token
+  run was cut off by the window. It is a single-layer plumbing check, not the 40-layer CED
+  prefill/decode comparison this milestone needs.
+* **2B device comparison has NOT run for the corrected path.** No device token and no device logits
+  delta exist for this milestone. The branch ships the corrected wiring and the command below; the
+  Lead runs it in a sequenced window.
+* **Exact device command** (built with `scripts/build-aarch64.sh --example=m8_sequence`); the binary
+  must be the staged node copy of the fix commit, and the output path is stamped per window:
+
+```text
+# STAGED=<node dir for the fix commit>; BIN=$STAGED/m8_sequence_<fixup-sha>_aarch64
+# first copy the local aarch64 build to $BIN, then run it on the node; stamp the output path:
+OUT=/home/user/phase2-evidence/window-$(date -u +%Y%m%dT%H%M%SZ)/m8-sequence/report.txt
+$BIN --device \
+  --checkpoint /home/user/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170 \
+  --index /home/user/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170/model.safetensors.index.json \
+  --golden /home/user/phase2-evidence/sequence-130-released.json \
+  --cubin-dir /home/user/phase2-evidence/task15/cubins \
+  --out "$OUT" --provenance node
+```
+
+  The report states the corrected rotation plan and its copy-only measurement separately, and lists
+  the per-step tokens as NOT PRODUCED until the forward chain is wired.
 * **No exit criterion is claimed.** Phase 2 criterion 1 (`roadmap-to-serving.md` section 5.5.1:
   prefill over 128 tokens and 8 decode steps, every decoded token reproduced token-for-token
-  against the reference) remains OPEN. The precise remaining gap is the Lead-sequenced 2B device
-  run: wire the format-2 dispatch and the measured `window_rows` rotation into `m8_sequence`, run
-  prefill 130 + 8 decodes on the node against the golden fixture, and compare tokens first then
-  logits at 2e-2. Criteria 2-5 are likewise unclaimed.
+  against the reference) remains OPEN. The precise remaining gap is the forward chain: embedding ->
+  40 layers -> lm head -> greedy selection at each compared position, consuming the rotated window
+  ring and the format-2 dispatch this branch wires. Criteria 2-5 are likewise unclaimed.

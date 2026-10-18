@@ -48,4 +48,12 @@ sha2 = { workspace = true }
 # The task-14 union-attention example reads the engine-produced attention-case fixture (JSON) and
 # writes its run report as JSON; the fixture is data, not a new crate edge beyond these two.
 serde = { workspace = true }
+# The 2B harness (examples/m8_sequence.rs) consumes the task-7 device KV store, so it needs the
+# kv crate with its CUDA backend. This is a dev-only edge: the regular graph is
+# kernels -> engine -> kv, and kv depends on no kernel crate, so the edge is acyclic and a
+# CPU-only build of the library is unaffected. The feature pulls libloading into the dev build,
+# the same dlopen-only driver family cuda_driver already uses.
+sparkflash-kv = { workspace = true, features = ["cuda"] }
+# The device run reads the node golden fixture (SequenceFixture derives Deserialize) and writes
+# its own JSON report; the library itself does not depend on a JSON writer.
 serde_json = { workspace = true }

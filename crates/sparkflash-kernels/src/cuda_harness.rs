@@ -22,7 +22,7 @@
 //! crate is a normal dependency of this crate rather than only a dev-dependency of the examples.
 //! The engine crate depends on no other workspace crate, so the edge creates no cycle.
 
-use crate::cuda_driver::{Cuda, Kernel, Module};
+use crate::cuda_driver::{Cuda, Deviceptr, Kernel, Module};
 use crate::m4_quant::{act_quant_fp8_row, bf16_bits};
 use crate::mla_ref;
 
@@ -268,6 +268,217 @@ pub fn assert_engine_window_finite(
     Ok(())
 }
 
+/// One device window ring's geometry: the engine window format is 128 slots of one 512-byte E4M3
+/// code row plus one 16-byte E8M0 scale row. The 528-byte slot is the rotation unit the Phase 2 2B
+/// sequence harness measures; on the device the two arrays are separate, so every copy below moves
+/// one array at a time and a "slot" is two rows of two different arrays.
+pub const WINDOW_RING_SLOTS: usize = mla_ref::SWA_WINDOW as usize;
+/// One E4M3 code row of one engine-format window slot.
+pub const WINDOW_RING_CODE_ROW_BYTES: usize = mla_ref::MLA_LATENT;
+/// One E8M0 scale row of one engine-format window slot.
+pub const WINDOW_RING_SCALE_ROW_BYTES: usize = mla_ref::WINDOW_SCALE_BYTES;
+
+/// The ring a window view is rotated out of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowRingLayout {
+    /// Slots in the ring; 128 for the released model's sliding window.
+    pub slots: usize,
+    /// Bytes in one slot's code array row.
+    pub code_row_bytes: usize,
+    /// Bytes in one slot's scale array row.
+    pub scale_row_bytes: usize,
+}
+
+impl WindowRingLayout {
+    /// The engine window format: 128 slots of 512 B codes + 16 B scales.
+    pub const ENGINE: Self = Self {
+        slots: WINDOW_RING_SLOTS,
+        code_row_bytes: WINDOW_RING_CODE_ROW_BYTES,
+        scale_row_bytes: WINDOW_RING_SCALE_ROW_BYTES,
+    };
+
+    /// Bytes of one slot across both arrays: 528 for the engine format. This is the host's raw slot
+    /// size and the number a byte report quotes; the device never holds the two arrays interleaved.
+    #[must_use]
+    pub fn slot_bytes(&self) -> usize {
+        self.code_row_bytes + self.scale_row_bytes
+    }
+
+    /// Bytes in one full ring, both arrays.
+    #[must_use]
+    pub fn ring_bytes(&self) -> usize {
+        self.slots * self.slot_bytes()
+    }
+
+    /// Refuses a layout that cannot describe a ring.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.slots == 0 || self.code_row_bytes == 0 || self.scale_row_bytes == 0 {
+            return Err(format!(
+                "window ring layout needs non-zero slots/rows, got {self:?}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One contiguous source run of a ring written to a contiguous destination run of the oldest-first
+/// view. A view wraps the ring at most once, so a rotation is at most two segments per array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingSegment {
+    /// First source slot of the run.
+    pub src_slot: usize,
+    /// First destination row of the run in the contiguous view.
+    pub dst_row: usize,
+    /// Slots in the run.
+    pub slots: usize,
+}
+
+/// The oldest-first window view at one query position: `(window_rows, oldest_slot)`.
+///
+/// Slot `position % slots` holds the row written at `position`. A layer writes slots for the
+/// positions it actually executes, which need not start at 0: the 130-token CED schedule starts
+/// encoder layers at 0 and decoder layers at 2, so at decoder position 2 the ring holds one row,
+/// not three. The view for a query at `position` is therefore the last
+/// `min(position - first_position + 1, slots)` slots, oldest first. Passing 0 for
+/// `first_position` is the full-prompt case; any other value would otherwise rotate unwritten
+/// slots into the view and corrupt the KV read.
+pub fn ring_view_position(
+    layout: &WindowRingLayout,
+    first_position: usize,
+    position: usize,
+) -> Result<(usize, usize), String> {
+    layout.validate()?;
+    if first_position > position {
+        return Err(format!(
+            "window view at position {position} precedes the layer's first position {first_position}"
+        ));
+    }
+    let window_rows = position
+        .saturating_sub(first_position)
+        .saturating_add(1)
+        .min(layout.slots);
+    let newest_slot = position % layout.slots;
+    let oldest_slot = (newest_slot + layout.slots - (window_rows - 1)) % layout.slots;
+    Ok((window_rows, oldest_slot))
+}
+
+/// Splits one oldest-first view into at most two contiguous ring runs, in view order.
+pub fn ring_view_segments(
+    layout: &WindowRingLayout,
+    window_rows: usize,
+    oldest_slot: usize,
+) -> Result<Vec<RingSegment>, String> {
+    layout.validate()?;
+    if window_rows == 0 {
+        return Err("a window view needs at least one row".to_string());
+    }
+    if window_rows > layout.slots {
+        return Err(format!(
+            "window rows {window_rows} exceed the ring's {} slots",
+            layout.slots
+        ));
+    }
+    if oldest_slot >= layout.slots {
+        return Err(format!(
+            "oldest slot {oldest_slot} is outside the ring's {} slots",
+            layout.slots
+        ));
+    }
+    let first = (layout.slots - oldest_slot).min(window_rows);
+    let mut segments = Vec::with_capacity(2);
+    segments.push(RingSegment {
+        src_slot: oldest_slot,
+        dst_row: 0,
+        slots: first,
+    });
+    let wrapped = window_rows - first;
+    if wrapped > 0 {
+        segments.push(RingSegment {
+            src_slot: 0,
+            dst_row: first,
+            slots: wrapped,
+        });
+    }
+    Ok(segments)
+}
+
+/// Copies one ring into an oldest-first contiguous view with device-to-device copies, returning the
+/// number of driver copies issued (two per segment: codes then scales).
+///
+/// The destination view is one code array and one scale array indexed by oldest-first row; the
+/// source is the ring, indexed by slot. Both views have the same per-row sizes, so a segment's
+/// byte ranges are the same arithmetic on both sides. This is the measured rotation the 2B harness
+/// reports; it moves exactly the rows the kernel reads, never a full ring when the query needs less.
+#[allow(clippy::too_many_arguments)] // four pointers, a layout and the view arithmetic are the store's geometry.
+pub fn rotate_window_ring(
+    cuda: &Cuda,
+    dst_codes: &Deviceptr,
+    dst_scales: &Deviceptr,
+    src_codes: &Deviceptr,
+    src_scales: &Deviceptr,
+    layout: &WindowRingLayout,
+    window_rows: usize,
+    oldest_slot: usize,
+) -> Result<usize, String> {
+    let segments = ring_view_segments(layout, window_rows, oldest_slot)?;
+    let mut copies = 0usize;
+    for segment in &segments {
+        let code_bytes = segment.slots * layout.code_row_bytes;
+        let scale_bytes = segment.slots * layout.scale_row_bytes;
+        cuda.copy_dtod(
+            &dst_codes.offset(segment.dst_row * layout.code_row_bytes),
+            &src_codes.offset(segment.src_slot * layout.code_row_bytes),
+            code_bytes,
+        )?;
+        cuda.copy_dtod(
+            &dst_scales.offset(segment.dst_row * layout.scale_row_bytes),
+            &src_scales.offset(segment.src_slot * layout.scale_row_bytes),
+            scale_bytes,
+        )?;
+        copies += 2;
+    }
+    Ok(copies)
+}
+
+/// Builds the expected oldest-first view on the host from a ring image (both arrays). The device run
+/// uses it to check a rotation's order independently of the attention twin: the bytes the kernel
+/// will read are compared against the slot order the ring math says they should be.
+pub fn host_ring_view(
+    codes: &[u8],
+    scales: &[u8],
+    layout: &WindowRingLayout,
+    window_rows: usize,
+    oldest_slot: usize,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    layout.validate()?;
+    if codes.len() != layout.slots * layout.code_row_bytes
+        || scales.len() != layout.slots * layout.scale_row_bytes
+    {
+        return Err(format!(
+            "ring image is {} B codes + {} B scales, expected {} slots x ({}, {})",
+            codes.len(),
+            scales.len(),
+            layout.slots,
+            layout.code_row_bytes,
+            layout.scale_row_bytes
+        ));
+    }
+    let segments = ring_view_segments(layout, window_rows, oldest_slot)?;
+    let mut view_codes = Vec::with_capacity(window_rows * layout.code_row_bytes);
+    let mut view_scales = Vec::with_capacity(window_rows * layout.scale_row_bytes);
+    for segment in &segments {
+        let code_start = segment.src_slot * layout.code_row_bytes;
+        view_codes.extend_from_slice(
+            &codes[code_start..code_start + segment.slots * layout.code_row_bytes],
+        );
+        let scale_start = segment.src_slot * layout.scale_row_bytes;
+        view_scales.extend_from_slice(
+            &scales[scale_start..scale_start + segment.slots * layout.scale_row_bytes],
+        );
+    }
+    Ok((view_codes, view_scales))
+}
+
 /// Per-run engine-window counters for stage 9: rows built by the shared helper, oracle agreements,
 /// and rows that passed the finite-decode guard.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +511,132 @@ mod tests {
             FlashMlaParams::default().as_slice(),
             &[0u64; FLASH_MLA_PARAM_COUNT]
         );
+    }
+
+    #[test]
+    fn ring_view_positions_are_oldest_first_and_wrap_at_the_ring() {
+        let layout = WindowRingLayout::ENGINE;
+        assert_eq!(layout.slot_bytes(), 528);
+        assert_eq!(layout.ring_bytes(), 128 * 528);
+        // Inside the first pass the view is slots 0..=position, no wrap.
+        for position in 0..128 {
+            let (rows, oldest) =
+                ring_view_position(&layout, 0, position).expect("view inside the ring");
+            assert_eq!(rows, position + 1);
+            assert_eq!(oldest, 0);
+            assert_eq!(
+                ring_view_segments(&layout, rows, oldest)
+                    .expect("segments")
+                    .len(),
+                1
+            );
+        }
+        // At and after the ring's first pass the view is the full ring, oldest first, wrapping.
+        let cases = [
+            (128usize, 128usize, 1usize),
+            (129, 128, 2),
+            (130, 128, 3),
+            (255, 128, 0),
+            (256, 128, 1),
+        ];
+        for (position, rows, oldest) in cases {
+            let view = ring_view_position(&layout, 0, position).expect("view past the ring");
+            assert_eq!(view, (rows, oldest), "position {position}");
+        }
+    }
+
+    #[test]
+    fn ring_view_position_respects_a_layer_that_starts_mid_ring() {
+        let layout = WindowRingLayout::ENGINE;
+        // The 130-token CED schedule starts decoder layers at position 2: at decoder position 2
+        // the ring holds one row (slot 2), not the three a first_position of 0 would claim.
+        assert_eq!(
+            ring_view_position(&layout, 2, 2).expect("first decoder row"),
+            (1, 2)
+        );
+        assert_eq!(
+            ring_view_position(&layout, 2, 3).expect("second decoder row"),
+            (2, 2)
+        );
+        // Decoder position 128 holds 127 rows, slots 2..=127 then 0; position 129 holds the full
+        // ring and starts at slot 2.
+        assert_eq!(
+            ring_view_position(&layout, 2, 128).expect("decoder at 128"),
+            (127, 2)
+        );
+        assert_eq!(
+            ring_view_position(&layout, 2, 129).expect("decoder at 129"),
+            (128, 2)
+        );
+        // Positions are absolute: the oldest slot is the newest slot minus rows-1, modulo the ring.
+        for position in 2..200usize {
+            let (rows, oldest) = ring_view_position(&layout, 2, position).expect("decoder view");
+            assert_eq!(rows, (position - 1).min(128));
+            assert_eq!(oldest, position.saturating_sub(rows - 1) % 128);
+        }
+        assert!(ring_view_position(&layout, 3, 2).is_err());
+    }
+
+    #[test]
+    fn ring_view_segments_cover_every_row_exactly_once_in_view_order() {
+        let layout = WindowRingLayout::ENGINE;
+        for position in 0..300usize {
+            let (rows, oldest) = ring_view_position(&layout, 0, position).expect("view");
+            let segments = ring_view_segments(&layout, rows, oldest).expect("segments");
+            assert!(!segments.is_empty() && segments.len() <= 2);
+            let mut seen = Vec::new();
+            let mut next_dst = 0usize;
+            for segment in &segments {
+                assert_eq!(segment.dst_row, next_dst);
+                assert!(segment.slots > 0);
+                for offset in 0..segment.slots {
+                    seen.push((segment.src_slot + offset) % layout.slots);
+                }
+                next_dst += segment.slots;
+            }
+            assert_eq!(
+                next_dst, rows,
+                "position {position}: segments do not fill the view"
+            );
+            let expected: Vec<usize> = (0..rows).map(|row| (oldest + row) % layout.slots).collect();
+            assert_eq!(seen, expected, "position {position}");
+        }
+        assert!(ring_view_segments(&layout, 0, 0).is_err());
+        assert!(ring_view_segments(&layout, 129, 0).is_err());
+        assert!(ring_view_segments(&layout, 1, 128).is_err());
+    }
+
+    #[test]
+    fn host_ring_view_is_the_slot_order_the_math_requires() {
+        let layout = WindowRingLayout::ENGINE;
+        let codes: Vec<u8> = (0..layout.slots)
+            .flat_map(|slot| vec![slot as u8; layout.code_row_bytes])
+            .collect();
+        let scales: Vec<u8> = (0..layout.slots)
+            .flat_map(|slot| vec![(slot as u8).wrapping_mul(3); layout.scale_row_bytes])
+            .collect();
+        // Position 5: rows 0..=5, oldest 0.
+        let (rows, oldest) = ring_view_position(&layout, 0, 5).expect("view");
+        let (view_codes, view_scales) =
+            host_ring_view(&codes, &scales, &layout, rows, oldest).expect("host view");
+        assert_eq!(rows, 6);
+        assert_eq!(view_codes.len(), 6 * layout.code_row_bytes);
+        for row in 0..6 {
+            assert_eq!(view_codes[row * layout.code_row_bytes], row as u8);
+            assert_eq!(
+                view_scales[row * layout.scale_row_bytes],
+                (row as u8).wrapping_mul(3)
+            );
+        }
+        // Position 129: oldest slot 2, so rows are slots 2..127 then 0..1.
+        let (rows, oldest) = ring_view_position(&layout, 0, 129).expect("view");
+        let (view_codes, _) = host_ring_view(&codes, &scales, &layout, rows, oldest).expect("view");
+        assert_eq!(rows, 128);
+        assert_eq!(view_codes[0], 2);
+        assert_eq!(view_codes[125 * layout.code_row_bytes], 127);
+        assert_eq!(view_codes[126 * layout.code_row_bytes], 0);
+        assert_eq!(view_codes[127 * layout.code_row_bytes], 1);
+        assert!(host_ring_view(&codes[..10], &scales, &layout, 1, 0).is_err());
     }
 
     #[test]

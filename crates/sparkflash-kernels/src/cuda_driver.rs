@@ -81,6 +81,20 @@ pub struct Deviceptr(
     pub CuDeviceptr,
 );
 
+impl Deviceptr {
+    /// Advances this address by a byte offset.
+    ///
+    /// The rotation copy moves one row group at a time (512-byte code rows, 16-byte scale rows),
+    /// so it needs an address inside an allocation, not only the allocation base. The arithmetic is
+    /// the driver's flat address space and is not checked against an allocation bound: a caller
+    /// that offsets past its allocation gets the driver's own ILLEGAL_ADDRESS, exactly as it would
+    /// from a hand-built address. Only the device path calls this; a host-only build never does.
+    #[must_use]
+    pub fn offset(self, bytes: usize) -> Self {
+        Self(self.0 + bytes as u64)
+    }
+}
+
 /// The opaque handle of a kernel that is not flash_mla.
 ///
 /// The raw CUfunction stays private: examples cannot construct a Kernel and cannot recover the
@@ -340,6 +354,38 @@ impl Cuda {
             let r = f(dst.as_mut_ptr().cast(), src.0, dst.len());
             if r != 0 {
                 return Err(format!("cuMemcpyDtoH failed: {r}"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Copies between two device allocations.
+    ///
+    /// The byte count is explicit because the callers copy fixed-size rows (512 bytes of window
+    /// codes, 16 bytes of window scales) into contiguous buffers, not whole slices. The real
+    /// cuMemcpyDtoD_v2 symbol and copy are exercised by the m8 device run; this doctest is no_run
+    /// so the call's arity and signature are compiled in CI without loading libcuda.
+    ///
+    /// ```no_run
+    /// use sparkflash_kernels::cuda_driver::Cuda;
+    ///
+    /// # fn main() -> Result<(), String> {
+    /// let cuda = Cuda::load()?;
+    /// let mut allocated = 0usize;
+    /// let src = cuda.alloc(512, &mut allocated)?;
+    /// let dst = cuda.alloc(512, &mut allocated)?;
+    /// cuda.copy_dtod(&dst, &src, 512)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn copy_dtod(&self, dst: &Deviceptr, src: &Deviceptr, bytes: usize) -> Result<(), String> {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(CuDeviceptr, CuDeviceptr, usize) -> CuResult,
+            > = self.sym(b"cuMemcpyDtoD_v2")?;
+            let r = f(dst.0, src.0, bytes);
+            if r != 0 {
+                return Err(format!("cuMemcpyDtoD failed: {r}"));
             }
             Ok(())
         }
