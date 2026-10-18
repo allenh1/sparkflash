@@ -37,6 +37,7 @@ use std::fmt::Write as _;
 
 use crate::config::{ConfigError, ModelConfig};
 use crate::linalg::{self, EngineError, ScaleGrid};
+use crate::parallel::{enter_worker, reference_threads};
 use crate::weights::WeightSource;
 
 /// The reduction epsilon of model.py:825: the literal `1e-20`, **not** `norm_eps` and not `hc_eps`.
@@ -191,42 +192,19 @@ impl MoeScratch {
         weight: f32,
     ) -> Result<(), EngineError> {
         let dim = cfg.dim;
-        let inter = expert.inter;
-        if inter > self.gate_branch.len() || inter > self.up_branch.len() {
-            return Err(shape_error(
-                "an expert",
-                format!("an intermediate width of {inter} does not fit the scratch"),
-            ));
-        }
         let row = &x[token * dim..(token + 1) * dim];
-        linalg::matmul(
-            &mut self.gate_branch[..inter],
-            row,
-            &expert.w1,
-            inter,
-            dim,
-            1,
-        )?;
-        linalg::matmul(&mut self.up_branch[..inter], row, &expert.w3, inter, dim, 1)?;
-        swiglu(
+        expert_body(
             cfg,
-            &mut self.gate_branch[..inter],
-            &self.up_branch[..inter],
-        )?;
-        for value in &mut self.gate_branch[..inter] {
-            *value *= weight;
-        }
-        linalg::matmul(
+            row,
+            expert,
+            weight,
+            &mut self.gate_branch,
+            &mut self.up_branch,
             &mut self.expert_out,
-            &self.gate_branch[..inter],
-            &expert.w2,
-            dim,
-            inter,
-            1,
         )?;
         for (accumulated, value) in self.routed[token * dim..(token + 1) * dim]
             .iter_mut()
-            .zip(self.expert_out.iter())
+            .zip(self.expert_out[..dim].iter())
         {
             *accumulated += *value;
         }
@@ -254,6 +232,54 @@ struct ExpertWeights {
     w2: Vec<f32>,
     /// The intermediate width `inter` these three share.
     inter: usize,
+}
+
+/// Runs one expert body on one token, writing its `dim`-wide output to `out`.
+///
+/// This is exactly the arithmetic [MoeScratch::add_expert] adds: `gate = w1 x`, `up = w3 x`, the
+/// clamps, the routing weight, then `w2`. It is a separate function so the serial and the
+/// expert-parallel paths share one definition - the parallel path computes a contribution into a
+/// per-choice row and the serial path adds it immediately, and both must be the same bits.
+fn expert_body(
+    cfg: &ModelConfig,
+    row: &[f32],
+    expert: &ExpertWeights,
+    weight: f32,
+    gate_branch: &mut [f32],
+    up_branch: &mut [f32],
+    out: &mut [f32],
+) -> Result<(), EngineError> {
+    let dim = cfg.dim;
+    let inter = expert.inter;
+    if inter > gate_branch.len() || inter > up_branch.len() {
+        return Err(shape_error(
+            "an expert",
+            format!("an intermediate width of {inter} does not fit the scratch"),
+        ));
+    }
+    if out.len() < dim {
+        return Err(shape_error(
+            "an expert",
+            format!(
+                "an expert body writes {dim} values into {} slots",
+                out.len()
+            ),
+        ));
+    }
+    linalg::matmul(&mut gate_branch[..inter], row, &expert.w1, inter, dim, 1)?;
+    linalg::matmul(&mut up_branch[..inter], row, &expert.w3, inter, dim, 1)?;
+    swiglu(cfg, &mut gate_branch[..inter], &up_branch[..inter])?;
+    for value in &mut gate_branch[..inter] {
+        *value *= weight;
+    }
+    linalg::matmul(
+        &mut out[..dim],
+        &gate_branch[..inter],
+        &expert.w2,
+        dim,
+        inter,
+        1,
+    )
 }
 
 /// The geometry one weight is expected to have, and how its scale grid maps onto it.
@@ -579,24 +605,190 @@ pub fn moe_forward(
     scratch
         .choices
         .sort_unstable_by_key(|(token, expert, _)| (*expert, *token));
-    let mut position = 0;
-    while position < scratch.choices.len() {
-        let expert = scratch.choices[position].1;
-        let weights = scratch.read_expert(cfg, src, prefix, ExpertBody::Routed(expert), limit)?;
-        while position < scratch.choices.len() && scratch.choices[position].1 == expert {
-            let (token, _, weight) = scratch.choices[position];
-            scratch.add_expert(cfg, x, token, &weights, weight)?;
-            position += 1;
+    let groups = expert_groups(&scratch.choices);
+    let mut contrib = vec![0.0f32; scratch.choices.len() * dim];
+    let pass = RoutedPass {
+        cfg,
+        prefix,
+        x,
+        src,
+        limit,
+        choices: &scratch.choices,
+    };
+    let workers = reference_threads().min(groups.len()).max(1);
+    if workers <= 1 {
+        compute_routed(&pass, &groups, &mut contrib)?;
+    } else {
+        // One worker per contiguous run of experts. Every worker computes its choices' expert
+        // outputs into its own rows of `contrib`; the values are the serial values because
+        // [expert_body] is the serial body, and the rows are disjoint so scheduling cannot reach
+        // them.
+        let chunk = groups.len().div_ceil(workers);
+        let mut rest = &mut contrib[..];
+        let mut blocks: Vec<RoutedBlock<'_>> = Vec::with_capacity(workers);
+        for group_chunk in groups.chunks(chunk) {
+            let first = group_chunk.first().map_or(0, |group| group.1);
+            let last = group_chunk.last().map_or(first, |group| group.2);
+            let (head, tail) = rest.split_at_mut((last - first) * dim);
+            blocks.push((head, group_chunk));
+            rest = tail;
+        }
+        let pass = &pass;
+        std::thread::scope(|scope| -> Result<(), EngineError> {
+            let mut handles = Vec::with_capacity(blocks.len());
+            for (block, group_chunk) in blocks {
+                handles.push(scope.spawn(move || -> Result<(), EngineError> {
+                    enter_worker();
+                    compute_routed(pass, group_chunk, block)
+                }));
+            }
+            for handle in handles {
+                handle.join().expect("a reference MoE worker panicked")?;
+            }
+            Ok(())
+        })?;
+    }
+
+    // The order the routed fp32 sums round in: one `+=` per choice, experts ascending. The
+    // contributions were computed by the same body either way, so this is the same arithmetic the
+    // serial loop does, not a reassociation of it.
+    for (&(token, _, _), contribution) in scratch.choices.iter().zip(contrib.chunks(dim)) {
+        let row = &mut scratch.routed[token * dim..(token + 1) * dim];
+        for (accumulated, value) in row.iter_mut().zip(contribution.iter()) {
+            *accumulated += *value;
         }
     }
 
     // The shared expert always runs, on the same input, after the routed sum (model.py:903).
+    // Tokens do not interact here either, so each token's row gets exactly one `+=` of the same
+    // [expert_body] output the serial loop would add.
     let shared = scratch.read_expert(cfg, src, prefix, ExpertBody::Shared, limit)?;
-    for token in 0..tokens {
-        scratch.add_expert(cfg, x, token, &shared, 1.0)?;
+    let shared_workers = reference_threads().min(tokens).max(1);
+    if shared_workers <= 1 {
+        for token in 0..tokens {
+            scratch.add_expert(cfg, x, token, &shared, 1.0)?;
+        }
+    } else {
+        let rows_per_chunk = tokens.div_ceil(shared_workers);
+        let mut rest = &mut scratch.routed[..tokens * dim];
+        let mut row_blocks: Vec<&mut [f32]> = Vec::with_capacity(shared_workers);
+        while !rest.is_empty() {
+            let take = (rows_per_chunk * dim).min(rest.len());
+            let (head, tail) = rest.split_at_mut(take);
+            row_blocks.push(head);
+            rest = tail;
+        }
+        std::thread::scope(|scope| -> Result<(), EngineError> {
+            let mut handles = Vec::with_capacity(row_blocks.len());
+            for (block_index, rows) in row_blocks.into_iter().enumerate() {
+                let first_token = block_index * rows_per_chunk;
+                let shared = &shared;
+                handles.push(scope.spawn(move || -> Result<(), EngineError> {
+                    enter_worker();
+                    let mut local = MoeScratch::for_config(cfg);
+                    let mut buffer = vec![0.0f32; cfg.dim];
+                    for (local_token, row) in rows.chunks_mut(dim).enumerate() {
+                        let token = first_token + local_token;
+                        expert_body(
+                            cfg,
+                            &x[token * dim..(token + 1) * dim],
+                            shared,
+                            1.0,
+                            &mut local.gate_branch,
+                            &mut local.up_branch,
+                            &mut buffer,
+                        )?;
+                        for (accumulated, value) in row.iter_mut().zip(buffer.iter()) {
+                            *accumulated += *value;
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+            for handle in handles {
+                handle
+                    .join()
+                    .expect("a reference shared-expert worker panicked")?;
+            }
+            Ok(())
+        })?;
     }
 
     out.copy_from_slice(&scratch.routed[..tokens * dim]);
+    Ok(())
+}
+
+/// One contiguous run of a routed expert in the expert-major choice order:
+/// `(expert, first_choice, end_choice)`.
+type ChoiceGroup = (usize, usize, usize);
+
+/// One worker's slice of the routed contribution buffer and the groups that fill it.
+type RoutedBlock<'a> = (&'a mut [f32], &'a [ChoiceGroup]);
+
+/// The per-chunk inputs [compute_routed] needs that do not change between workers.
+struct RoutedPass<'a> {
+    cfg: &'a ModelConfig,
+    prefix: &'a str,
+    x: &'a [f32],
+    src: &'a dyn WeightSource,
+    limit: usize,
+    choices: &'a [(usize, usize, f32)],
+}
+
+/// The contiguous runs of one expert in the expert-major choice order.
+///
+/// Each run is `(expert, first_choice, end_choice)`; runs are ascending by expert and together
+/// cover every choice exactly once.
+fn expert_groups(choices: &[(usize, usize, f32)]) -> Vec<ChoiceGroup> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < choices.len() {
+        let expert = choices[start].1;
+        let mut end = start + 1;
+        while end < choices.len() && choices[end].1 == expert {
+            end += 1;
+        }
+        groups.push((expert, start, end));
+        start = end;
+    }
+    groups
+}
+
+/// Computes the expert outputs for one run of [expert_groups] into `contrib`.
+///
+/// `contrib` is one `dim`-wide row per choice in `groups`, in choice order; the first group's
+/// choice index is the base. This is the body that fills the routed contribution buffer, whether
+/// the run is a whole layer (serial path) or one worker's slice of it (parallel path).
+fn compute_routed(
+    pass: &RoutedPass<'_>,
+    groups: &[ChoiceGroup],
+    contrib: &mut [f32],
+) -> Result<(), EngineError> {
+    let dim = pass.cfg.dim;
+    let base = groups.first().map_or(0, |group| group.1);
+    let mut local = MoeScratch::for_config(pass.cfg);
+    for &(expert, start, end) in groups {
+        let weights = local.read_expert(
+            pass.cfg,
+            pass.src,
+            pass.prefix,
+            ExpertBody::Routed(expert),
+            pass.limit,
+        )?;
+        for (local_choice, &(token, _, weight)) in pass.choices[start..end].iter().enumerate() {
+            expert_body(
+                pass.cfg,
+                &pass.x[token * dim..(token + 1) * dim],
+                &weights,
+                weight,
+                &mut local.gate_branch,
+                &mut local.up_branch,
+                &mut local.expert_out,
+            )?;
+            let offset = (start + local_choice - base) * dim;
+            contrib[offset..offset + dim].copy_from_slice(&local.expert_out[..dim]);
+        }
+    }
     Ok(())
 }
 

@@ -14,6 +14,7 @@
 //! [crate::dtype] already owns the block rules. This module only *applies* a decoded E8M0 grid.
 
 use crate::dtype::DType;
+use crate::parallel::{par_aligned_mut, par_chunks_mut};
 use crate::quant::{self, QuantError};
 use crate::weights::{TensorView, WeightError, WeightSource};
 
@@ -154,6 +155,10 @@ pub fn decode_view(view: &TensorView<'_>) -> Result<Vec<f32>, EngineError> {
 /// reference multiplies in f32 (documented on that function), and doing it here keeps one place
 /// responsible for the mapping from an element to its block.
 ///
+/// Rows are independent, so large weights are scaled a row block at a time on the reference
+/// thread pool. Each element still receives exactly one multiplication by its own grid entry, so
+/// the result is identical for any thread count.
+///
 /// # Errors
 ///
 /// [EngineError::Shape] when the buffer, the grid or the declared shape disagree.
@@ -187,19 +192,26 @@ pub fn apply_scales(
             ),
         });
     }
-    for row in 0..rows {
-        for col in 0..cols {
-            let scale = match grid {
-                ScaleGrid::Block32 => scales[(row / 32) * cols.div_ceil(32) + col / 32],
-                ScaleGrid::PerRow32 => scales[row * cols.div_ceil(32) + col / 32],
-            };
-            weight[row * cols + col] *= scale;
+    let min_rows = (65_536 / cols).max(1);
+    par_aligned_mut(weight, cols, min_rows, |first_row, block| {
+        for (local_row, row_values) in block.chunks_mut(cols).enumerate() {
+            let row = first_row + local_row;
+            for (col, value) in row_values.iter_mut().enumerate() {
+                let scale = match grid {
+                    ScaleGrid::Block32 => scales[(row / 32) * cols.div_ceil(32) + col / 32],
+                    ScaleGrid::PerRow32 => scales[row * cols.div_ceil(32) + col / 32],
+                };
+                *value *= scale;
+            }
         }
-    }
+    });
     Ok(())
 }
 
 /// `out[b, row] = sum_col x[b, col] * w[row, col]` for every batch row, overwriting `out`.
+///
+/// Large multiplies are split over output rows on the reference thread pool; each output element
+/// still runs the same ascending-`col` accumulation, so no output depends on the thread count.
 ///
 /// # Errors
 ///
@@ -227,18 +239,41 @@ pub fn matmul(
             ),
         });
     }
-    for b in 0..batch {
-        let xb = &x[b * cols..b * cols + cols];
-        let ob = &mut out[b * rows..b * rows + rows];
-        for row in 0..rows {
+    let total = batch * rows;
+    let multiplies = batch as u128 * rows as u128 * cols as u128;
+    // A matvec with one batch row is mostly a weight read; starting a scoped thread for it costs
+    // more than the arithmetic saves unless the row set is matrix-sized (a vocabulary head). Above
+    // that gate the split is over output rows, so every output keeps its serial reduction order.
+    if multiplies < 4_000_000 || (batch == 1 && rows < 16_384) {
+        for b in 0..batch {
+            let xb = &x[b * cols..b * cols + cols];
+            let ob = &mut out[b * rows..b * rows + rows];
+            for row in 0..rows {
+                let wr = &w[row * cols..row * cols + cols];
+                let mut acc = 0.0f32;
+                for col in 0..cols {
+                    acc += xb[col] * wr[col];
+                }
+                ob[row] = acc;
+            }
+        }
+        return Ok(());
+    }
+    let min_chunk = (65_536 / cols.max(1)).max(1);
+    par_chunks_mut(&mut out[..total], min_chunk, |offset, chunk| {
+        for (index, slot) in chunk.iter_mut().enumerate() {
+            let global = offset + index;
+            let b = global / rows;
+            let row = global % rows;
+            let xb = &x[b * cols..b * cols + cols];
             let wr = &w[row * cols..row * cols + cols];
             let mut acc = 0.0f32;
             for col in 0..cols {
                 acc += xb[col] * wr[col];
             }
-            ob[row] = acc;
+            *slot = acc;
         }
-    }
+    });
     Ok(())
 }
 
@@ -273,6 +308,9 @@ pub fn matmul_biased(
 
 /// Normalises each `cols`-long row of `x` in place: `x * rsqrt(mean(x^2) + eps) * weight`.
 ///
+/// Whole rows are split over the reference thread pool; a row's mean and scaling are computed in
+/// the same order as the serial pass, so the result is identical for any thread count.
+///
 /// # Errors
 ///
 /// [EngineError::Shape] when `x` is not a whole number of `cols`-long rows or the weight is the
@@ -293,13 +331,16 @@ pub fn rms_norm(x: &mut [f32], weight: &[f32], cols: usize, eps: f32) -> Result<
             ),
         });
     }
-    for row in x.chunks_mut(cols) {
-        let mean = row.iter().map(|v| v * v).sum::<f32>() / cols as f32;
-        let inv = 1.0 / (mean + eps).sqrt();
-        for (value, w) in row.iter_mut().zip(weight.iter()) {
-            *value = *value * inv * w;
+    let min_rows = (65_536 / cols).max(1);
+    par_aligned_mut(x, cols, min_rows, |_first_row, block| {
+        for row in block.chunks_mut(cols) {
+            let mean = row.iter().map(|v| v * v).sum::<f32>() / cols as f32;
+            let inv = 1.0 / (mean + eps).sqrt();
+            for (value, w) in row.iter_mut().zip(weight.iter()) {
+                *value = *value * inv * w;
+            }
         }
-    }
+    });
     Ok(())
 }
 
@@ -554,5 +595,84 @@ mod tests {
         assert_eq!(argmax(&[]), None);
         assert_eq!(mean(&[]), 0.0);
         assert!((mean(&[1.0, 2.0, 3.0]) - 2.0).abs() < 1e-6);
+    }
+
+    /// The exact bits of a slice, for comparing two runs that must agree bit for bit.
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|value| value.to_bits()).collect()
+    }
+
+    #[test]
+    fn the_parallel_matmul_is_bit_identical_to_the_serial_one() {
+        // Batch > 1 and ten million multiplies, so the parallel arm is taken. Thread count 1 is the
+        // serial arm; thread count 4 splits the output rows into four chunks and the assertion
+        // proves those chunks compute the same f32 bits as the serial loop. The values are not
+        // powers of two, so any reassociation would show up in the low bits. This proves the split
+        // is value-transparent, not anything about a particular scheduling.
+        let rows = 5_000;
+        let cols = 1_000;
+        let batch = 2;
+        let x: Vec<f32> = (0..batch * cols)
+            .map(|index| ((index as f32) * 0.001).sin())
+            .collect();
+        let w: Vec<f32> = (0..rows * cols)
+            .map(|index| ((index as f32) * 0.002).cos())
+            .collect();
+        let run = |threads: usize| {
+            crate::parallel::with_reference_threads(threads, || {
+                let mut out = vec![0.0f32; batch * rows];
+                matmul(&mut out, &x, &w, rows, cols, batch).expect("matmul");
+                out
+            })
+        };
+        assert_eq!(bits(&run(1)), bits(&run(4)));
+    }
+
+    #[test]
+    fn the_parallel_scale_grid_is_bit_identical_to_the_serial_one() {
+        let rows = 2_048usize;
+        let cols = 64usize;
+        let weight: Vec<f32> = (0..rows * cols)
+            .map(|index| ((index as f32) * 0.003).sin())
+            .collect();
+        // The two grids have different lengths: Block32 scales a 32x32 element block, PerRow32
+        // scales one 32-element block per row. Test both, each with the size the shape requires.
+        let block32: Vec<f32> = (0..rows.div_ceil(32) * cols.div_ceil(32))
+            .map(|index| 1.0 + index as f32 * 1e-3)
+            .collect();
+        let per_row32: Vec<f32> = (0..rows * cols.div_ceil(32))
+            .map(|index| 1.0 + index as f32 * 2e-3)
+            .collect();
+        for (grid, scales) in [
+            (ScaleGrid::Block32, block32.as_slice()),
+            (ScaleGrid::PerRow32, per_row32.as_slice()),
+        ] {
+            let run = |threads: usize| {
+                crate::parallel::with_reference_threads(threads, || {
+                    let mut copy = weight.clone();
+                    apply_scales(&mut copy, rows, cols, scales, grid).expect("scales");
+                    copy
+                })
+            };
+            assert_eq!(bits(&run(1)), bits(&run(4)), "grid {grid:?}");
+        }
+    }
+
+    #[test]
+    fn the_parallel_rms_norm_is_bit_identical_to_the_serial_one() {
+        let rows = 1_024;
+        let cols = 128;
+        let x: Vec<f32> = (0..rows * cols)
+            .map(|index| ((index as f32) * 0.004).sin())
+            .collect();
+        let weight: Vec<f32> = (0..cols).map(|index| 1.0 + index as f32 * 1e-3).collect();
+        let run = |threads: usize| {
+            crate::parallel::with_reference_threads(threads, || {
+                let mut copy = x.clone();
+                rms_norm(&mut copy, &weight, cols, 1e-5).expect("rms norm");
+                copy
+            })
+        };
+        assert_eq!(bits(&run(1)), bits(&run(4)));
     }
 }

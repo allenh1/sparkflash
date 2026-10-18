@@ -30,6 +30,7 @@
 //! Nothing here reads a checkpoint or touches a device: bytes in, floats out.
 
 use crate::dtype::{DType, SCALE_BLOCK};
+use crate::parallel::par_chunks_mut;
 
 /// The largest finite E4M3 value (kernel.py:45).
 pub const FP8_E4M3_MAX: f32 = 448.0;
@@ -263,10 +264,34 @@ fn check_whole_units(dtype: DType, actual: usize, unit: usize) -> Result<(), Qua
     })
 }
 
+/// The element count above which a decode is worth splitting across threads.
+///
+/// Below it a scoped thread costs more than it saves; the value is a few times a cache line's
+/// worth of work per thread, not a tuned constant.
+const DECODE_CHUNK: usize = 1 << 13;
+
+/// Decodes `elements` independent values, in parallel over element chunks.
+///
+/// The format differs per caller; the property every decoder has is that one element is a pure
+/// function of its index, so a chunk boundary cannot change a value. That is the whole reason the
+/// decoders are safe to parallelise.
+fn decode_scan<F>(elements: usize, decode: F) -> Vec<f32>
+where
+    F: Fn(usize) -> f32 + Sync,
+{
+    let mut out = vec![0.0f32; elements];
+    par_chunks_mut(&mut out, DECODE_CHUNK, |offset, chunk| {
+        for (index, slot) in chunk.iter_mut().enumerate() {
+            *slot = decode(offset + index);
+        }
+    });
+    out
+}
+
 /// Decodes a whole E4M3 buffer: one code per byte, and every byte is a valid code.
 #[must_use]
 pub fn decode_f8e4m3(bytes: &[u8]) -> Vec<f32> {
-    bytes.iter().map(|&code| f8e4m3_to_f32(code)).collect()
+    decode_scan(bytes.len(), |index| f8e4m3_to_f32(bytes[index]))
 }
 
 /// Decodes a whole E8M0 scale buffer.
@@ -275,7 +300,7 @@ pub fn decode_f8e4m3(bytes: &[u8]) -> Vec<f32> {
 /// where the reference does it (convert.py:171, kernel.py:85).
 #[must_use]
 pub fn decode_f8e8m0(bytes: &[u8]) -> Vec<f32> {
-    bytes.iter().map(|&code| f8e8m0_to_f32(code)).collect()
+    decode_scan(bytes.len(), |index| f8e8m0_to_f32(bytes[index]))
 }
 
 /// Decodes a little-endian bf16 buffer.
@@ -286,12 +311,10 @@ pub fn decode_f8e8m0(bytes: &[u8]) -> Vec<f32> {
 /// not a value, and padding it with a zero byte would invent one.
 pub fn decode_bf16(bytes: &[u8]) -> Result<Vec<f32>, QuantError> {
     check_whole_units(DType::BF16, bytes.len(), 2)?;
-    Ok(bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| bf16_to_f32(u16::from_le_bytes(*pair)))
-        .collect())
+    Ok(decode_scan(bytes.len() / 2, |index| {
+        let pair = [bytes[index * 2], bytes[index * 2 + 1]];
+        bf16_to_f32(u16::from_le_bytes(pair))
+    }))
 }
 
 /// Decodes a little-endian f32 buffer.
@@ -301,12 +324,15 @@ pub fn decode_bf16(bytes: &[u8]) -> Result<Vec<f32>, QuantError> {
 /// [QuantError::Length] when the buffer is not a whole number of four-byte values.
 pub fn decode_f32(bytes: &[u8]) -> Result<Vec<f32>, QuantError> {
     check_whole_units(DType::F32, bytes.len(), 4)?;
-    Ok(bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| f32_from_le_bytes(*word))
-        .collect())
+    Ok(decode_scan(bytes.len() / 4, |index| {
+        let word = [
+            bytes[index * 4],
+            bytes[index * 4 + 1],
+            bytes[index * 4 + 2],
+            bytes[index * 4 + 3],
+        ];
+        f32_from_le_bytes(word)
+    }))
 }
 
 /// Decodes a packed E2M1 buffer in element order: a byte's low nibble before its high one.
@@ -320,16 +346,14 @@ pub fn decode_f32(bytes: &[u8]) -> Result<Vec<f32>, QuantError> {
 /// elements. Accepting more bytes than that would silently drop values off the end of a tensor.
 pub fn decode_f4e2m1(bytes: &[u8], elements: usize) -> Result<Vec<f32>, QuantError> {
     check_len(DType::F4E2M1, elements, bytes.len())?;
-    Ok((0..elements)
-        .map(|index| {
-            let byte = bytes[index / 2];
-            if index % 2 == 0 {
-                f4e2m1_to_f32(byte)
-            } else {
-                f4e2m1_to_f32(byte >> 4)
-            }
-        })
-        .collect())
+    Ok(decode_scan(elements, |index| {
+        let byte = bytes[index / 2];
+        if index % 2 == 0 {
+            f4e2m1_to_f32(byte)
+        } else {
+            f4e2m1_to_f32(byte >> 4)
+        }
+    }))
 }
 
 /// Decodes elements values of any checkpoint format out of bytes.
@@ -718,5 +742,45 @@ mod tests {
                 "2^{exponent} came out as {value}"
             );
         }
+    }
+
+    #[test]
+    fn parallel_decoding_is_bit_identical_to_the_serial_decoding() {
+        // Past DECODE_CHUNK so the threaded arm is taken, and every code appears: NaN codes, both
+        // E2M1 nibbles, BF16 and F32 words.
+        let elements = 40_000;
+        let codes: Vec<u8> = (0..elements as u32)
+            .map(|index| (index.wrapping_mul(37) & 0xFF) as u8)
+            .collect();
+        let run = |threads: usize| {
+            crate::parallel::with_reference_threads(threads, || {
+                (
+                    decode_f8e4m3(&codes),
+                    decode_f8e8m0(&codes),
+                    decode_f4e2m1(&codes[..elements / 2], elements).expect("fp4"),
+                    decode_bf16(&codes).expect("bf16"),
+                    decode_f32(&codes).expect("f32"),
+                )
+            })
+        };
+        let serial = run(1);
+        let parallel = run(4);
+        let bits = |values: &[f32]| {
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(&serial.0), bits(&parallel.0));
+        assert_eq!(bits(&serial.1), bits(&parallel.1));
+        assert_eq!(bits(&serial.2), bits(&parallel.2));
+        assert_eq!(bits(&serial.3), bits(&parallel.3));
+        assert_eq!(bits(&serial.4), bits(&parallel.4));
+        // F16 is declared for completeness but the reference decoder deliberately refuses it, and
+        // the threaded path does not change that: the test covers every format the decoder accepts.
+        assert!(matches!(
+            decode(DType::F16, &codes, elements),
+            Err(QuantError::Unsupported { dtype: DType::F16 })
+        ));
     }
 }

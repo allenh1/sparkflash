@@ -65,6 +65,50 @@ fn committed_ci_fixture_regenerates_byte_identically() {
 }
 
 #[test]
+fn committed_ci_fixture_is_byte_identical_under_one_or_several_reference_threads() {
+    // The parallel helpers split independent output work only, so the fixture must not depend on
+    // how many threads the reference pass uses. One thread is the serial pass; two, four and eight
+    // additionally take the threaded arms wherever the tiny configuration's sizes cross a helper's
+    // threshold - here that is the MoE routed-expert and shared-expert arms, plus whatever
+    // decoders/matmuls/norms the fixture's call graph reaches. The per-routine threaded arms
+    // (decoders, matmul, apply_scales, rms_norm) are proven bit-identical by their own unit tests;
+    // this test is the end-to-end byte check, not a per-routine coverage claim.
+    let (text, fixture) = load_fixture();
+    let generate = |threads: usize| {
+        sparkflash_engine::parallel::with_reference_threads(threads, || {
+            let regenerated = generate_fixture(
+                &fixture.config,
+                &fixture.config_label,
+                FixtureWeights::FiniteFp32 {
+                    seed: fixture.source.seed,
+                },
+                &fixture.prompt_tokens,
+                fixture.decode_steps,
+                LogitsCapture::All,
+                fixture.provenance.clone(),
+            )
+            .expect("the CI fixture regenerates");
+            let mut encoded =
+                serde_json::to_string_pretty(&regenerated).expect("the fixture serialises");
+            encoded.push('\n');
+            encoded
+        })
+    };
+    let serial = generate(1);
+    assert_eq!(
+        serial, text,
+        "the serial regeneration must reproduce the fixture"
+    );
+    for threads in [2, 4, 8] {
+        assert_eq!(
+            generate(threads),
+            serial,
+            "the regeneration at {threads} reference threads must reproduce the serial bytes"
+        );
+    }
+}
+
+#[test]
 fn the_ci_fixture_contract_is_pinned() {
     let (_, fixture) = load_fixture();
     assert_eq!(

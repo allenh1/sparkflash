@@ -96,7 +96,14 @@ pub struct TensorView<'a> {
 }
 
 /// A source of weights.
-pub trait WeightSource {
+///
+/// `Send + Sync` is part of the contract because the reference pass reads experts concurrently:
+/// two independent expert bodies have no order between them, so the MoE block reads them from
+/// several threads at once. A source is immutable from the caller's side (every method takes
+/// `&self`), so `Sync` is the real requirement and `Send` follows from the boxed trait object
+/// the engine owns. A source that needs interior mutability to serve a read must make it
+/// thread-safe, exactly as [crate::safetensors::SafeTensorsSource] does for its header cache.
+pub trait WeightSource: Send + Sync {
     /// Every tensor name this source holds, in a stable order.
     fn names(&self) -> Vec<String>;
 

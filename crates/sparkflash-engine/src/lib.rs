@@ -41,6 +41,7 @@ pub mod forward;
 pub mod layer_plan;
 pub mod linalg;
 pub mod loader;
+pub mod parallel;
 pub mod quant;
 pub mod report;
 pub mod safetensors;
