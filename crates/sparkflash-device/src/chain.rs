@@ -110,6 +110,18 @@ pub enum ChainError {
         /// The seam the backend returned.
         found: &'static str,
     },
+    /// A device stage's launcher refused or failed.
+    #[error("device stage {stage:?} (layer {layer}, position {position}) failed: {detail}")]
+    DeviceStage {
+        /// The stage that was dispatched.
+        stage: ChainStage,
+        /// The layer.
+        layer: usize,
+        /// The token position.
+        position: usize,
+        /// The launcher's failure detail (missing cubin, unwired stage, driver error).
+        detail: String,
+    },
     /// A record does not name a phase-3 removal plan.
     #[error("seam {name}: phase3_followup is false; every seam must name its removal")]
     SeamWithoutRemoval {
@@ -859,8 +871,9 @@ pub struct StageCall {
     pub stage: ChainStage,
 }
 
-/// A chain backend. M3-a has no device implementation; the skeleton executor and its tests use this
-/// trait, and the first runnable pass will implement it over the staged weights and the kernels.
+/// A chain backend. The M3 wiring implements it in [`crate::chain_device::ChainDevice`] over an
+/// injected host-seam delegate and device launcher; the skeleton executor and its tests use the
+/// trait, and a later pass supplies the staged weights and kernels behind that same wiring.
 pub trait ChainOps {
     /// Runs one stage. A host-seam stage returns its [SeamRecord]; a device stage returns None.
     ///

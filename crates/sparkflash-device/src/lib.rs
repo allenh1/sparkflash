@@ -30,6 +30,12 @@
 //!   view; [`cubins`] parses the baseline pins and verifies size and SHA-256 fail-closed. The
 //!   skeleton runs through a [`chain::ChainOps`] backend and reports
 //!   `chain_execution = false`, `device_execution = false`, `token_produced = false`.
+//! - M3 wiring adds [`chain_device`]: the one `ChainOps` implementation a device run uses. Host
+//!   seams go to an injected host-seam delegate; device-status stages go to an injected launcher,
+//!   never to host math. The fake launcher drives the full 130 + 8 plan through
+//!   `device-chain --dry-run` (108,017 calls, plan-vs-ledger validated); the real `CudaLauncher`
+//!   is behind `cuda`, verifies the pinned cubin directory, wires the mHC typed builder, and
+//!   refuses every stage until M3-b stages buffers/weights. No device execution or token is claimed.
 //!
 //! **What the crate does not do.** No chain execution, no device weight staging, no device token or
 //! logits path, no boundary capture and no criterion-1 claim (design 3.1, 3.2, 4.3, 7 M3). The token
@@ -51,6 +57,7 @@
 #![forbid(unsafe_code)]
 
 pub mod chain;
+pub mod chain_device;
 pub mod cubins;
 pub mod engine;
 pub mod session;
@@ -62,6 +69,13 @@ pub use chain::{
     LAYER_STAGE_ORDER, MILESTONE_DECODE_STEPS, MILESTONE_PROMPT_TOKENS, PLAN_ONLY_LABEL,
     STEP_STAGE_ORDER, SeamPlanEntry, StageCall, StageStatus, TAIL_STAGE_ORDER, run_skeleton,
 };
+pub use chain_device::{
+    ChainDevice, ChainDeviceStats, DeviceLaunchError, DeviceLauncher, DeviceStageCall,
+    DryRunReport, FakeLauncher, HostSeamDelegate, NoCudaLauncher, SeatHostSeams, dry_run,
+    host_seat_counts, run_chain,
+};
+#[cfg(feature = "cuda")]
+pub use chain_device::{CudaLauncher, MhcBuffers};
 pub use cubins::{
     CHAIN_KERNELS, GATE_UP_KERNEL, REQUIRED_KERNELS, ROUTER_KERNEL, required_pins,
     verify_required_dir,

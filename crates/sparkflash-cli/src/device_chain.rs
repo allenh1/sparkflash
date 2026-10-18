@@ -1,14 +1,17 @@
-//! The device-chain subcommand: M3-a prints the chain plan and refuses to serve.
-//!
-//! The only accepted form today is:
+//! The device-chain subcommand: M3-a prints the plan, M3 wiring dry-runs the dispatch, and neither
+//! executes a device stage.
 //!
 //!   sparkflash device-chain --plan-only
+//!   sparkflash device-chain --dry-run
 //!
-//! It prints the CED schedule, the window accounting, the stage map, the planned host-seam set and
-//! the exact design 4.3 labels, then exits 2: a plan is not an execution, and this arm has no
-//! device session, no weight staging and no token path. The labels are printed verbatim so a plan
-//! cannot be read as a device result (docs/build/device-forward-chain.md 4.3 item 3). There is no
-//! line that could be read as a launch, a token or a logits comparison.
+//! --plan-only prints the CED schedule, the window accounting, the stage map, the planned host-seam
+//! set and the exact design 4.3 labels. --dry-run additionally runs the full 130 + 8 plan through
+//! the real ChainDevice wiring with the fake launcher and the host-seam seat delegate, validates the
+//! plan-vs-ledger self-check (108,017 ChainOps calls) and prints the per-stage call counts and
+//! host-seam seats. Both exit 2: a plan or a fake-launcher dry-run is not an execution, and this
+//! arm has no device session, no weight staging and no token path. The labels are printed verbatim
+//! so a plan cannot be read as a device result (docs/build/device-forward-chain.md 4.3 item 3).
+//! There is no line that could be read as a launch, a token or a logits comparison.
 
 use std::process::ExitCode;
 
@@ -16,13 +19,14 @@ use sparkflash_device::chain::{
     ChainLabels, ChainSchedule, ChainSeamPlan, LAYER_STAGE_ORDER, STEP_STAGE_ORDER,
     TAIL_STAGE_ORDER,
 };
+use sparkflash_device::chain_device::dry_run;
 use sparkflash_device::cubins::{baseline_pins, required_pins};
 use sparkflash_device::window::WindowAccounting;
 
 /// The usage line for this subcommand.
-pub const USAGE: &str = "sparkflash device-chain --plan-only";
+pub const USAGE: &str = "sparkflash device-chain --plan-only|--dry-run";
 
-/// The exit code a plan-only invocation returns: 2, refusing to serve.
+/// The exit code a plan-only or dry-run invocation returns: 2, refusing to serve.
 pub const PLAN_ONLY_EXIT: u8 = 2;
 
 /// Builds the plan-only report lines.
@@ -84,15 +88,70 @@ pub fn plan_lines() -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
+/// Builds the dry-run report lines.
+///
+/// It runs the full plan through the real [sparkflash_device::chain_device::ChainDevice] wiring
+/// with the fake launcher. No driver is opened, no cubin is loaded and no kernel is launched; the
+/// output says so and still exits 2 refusing to serve.
+///
+/// # Errors
+/// A schedule, wiring or plan-vs-ledger error, printed by [run] before it exits nonzero.
+pub fn dry_run_lines() -> Result<Vec<String>, String> {
+    let schedule = ChainSchedule::milestone().map_err(|error| error.to_string())?;
+    let dry = dry_run(&schedule).map_err(|error| error.to_string())?;
+    let report = &dry.report;
+    let seats = sparkflash_device::chain_device::host_seat_counts(report);
+    // Derive the flags and the headline counts from the report and the launcher, not from
+    // constants: a future wiring change cannot drift the printed numbers away from what ran.
+    let host_calls = report.ledger.records().len();
+    let device_calls = dry.device_calls.len();
+    let total_calls = host_calls + device_calls;
+    let mut lines = vec![
+        "sparkflash device-chain: DRY RUN - no driver opened, no cubin loaded, no kernel launched, no token produced; fake launcher only".to_string(),
+        format!(
+            "execution flags: chain_execution={}; device_execution={}; token_produced={}",
+            report.chain_execution, report.device_execution, report.token_produced
+        ),
+        schedule.describe(),
+        format!(
+            "dry-run wiring: ChainDevice<FakeLauncher, SeatHostSeams> over the full 130+8 plan; {total_calls} ChainOps calls ({host_calls} host-seam seats, {device_calls} device-launcher calls)"
+        ),
+        "per-stage ChainOps calls:".to_string(),
+    ];
+    for (stage, count) in &dry.stats.per_stage {
+        lines.push(format!("  stage call {stage}: {count}"));
+    }
+    lines.push("host-seam seats (zero host bytes; real arithmetic is M3-c):".to_string());
+    for (seam, count) in seats {
+        lines.push(format!("  host-seam seat {seam}: {count} records"));
+    }
+    lines.push("plan-vs-ledger self-check: PASS".to_string());
+    lines.push(
+        "no comparison was made: M3 wiring is a dispatch/ledger dry-run, not a device run"
+            .to_string(),
+    );
+    lines.extend(ChainLabels::plan_lines());
+    lines.push(
+        "device-chain: exiting 2, refusing to serve: M3 wiring has no device execution path"
+            .to_string(),
+    );
+    Ok(lines)
+}
+
 /// Runs the subcommand with the arguments that followed it.
 pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     let args: Vec<String> = args.collect();
-    if args.as_slice() != ["--plan-only"] {
-        eprintln!("sparkflash device-chain: usage: {USAGE}");
-        eprintln!("sparkflash device-chain: only --plan-only is accepted in M3-a");
-        return ExitCode::from(PLAN_ONLY_EXIT);
-    }
-    match plan_lines() {
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let lines = match arg_refs.as_slice() {
+        ["--plan-only"] => plan_lines(),
+        ["--dry-run"] => dry_run_lines(),
+        _ => {
+            eprintln!("sparkflash device-chain: usage: {USAGE}");
+            eprintln!("sparkflash device-chain: --plan-only or --dry-run is required");
+            return ExitCode::from(PLAN_ONLY_EXIT);
+        }
+    };
+    match lines {
         Ok(lines) => {
             for line in lines {
                 println!("{line}");
@@ -174,5 +233,42 @@ mod tests {
         assert!(!text.contains("tokens="));
         assert!(!text.contains("outputs_sha256"));
         assert!(!text.contains("chain execution: true"));
+    }
+
+    #[test]
+    fn a_dry_run_drives_the_full_plan_and_claims_no_execution() {
+        let lines = dry_run_lines().expect("dry run");
+        let text = lines.join("\n");
+        assert!(text.contains("DRY RUN - no driver opened"));
+        assert!(
+            text.contains("chain_execution=false; device_execution=false; token_produced=false")
+        );
+        assert!(text.contains(
+            "dry-run wiring: ChainDevice<FakeLauncher, SeatHostSeams> over the full 130+8 plan; 108017 ChainOps calls (58670 host-seam seats, 49347 device-launcher calls)"
+        ));
+        // Pin both totals explicitly: 108,017 ChainOps calls, of which the fake launcher records
+        // 49,347. A wiring change must update the derived output and this test together.
+        assert!(text.contains("108017 ChainOps calls"));
+        assert!(text.contains("49347 device-launcher calls"));
+        assert!(text.contains("stage call mhc_entry: 5482"));
+        assert!(text.contains("stage call embedding: 138"));
+        assert!(text.contains("stage call final_norm: 9"));
+        assert!(text.contains("host-seam seat dispatch: 5482"));
+        assert!(text.contains("plan-vs-ledger self-check: PASS"));
+        assert!(text.contains("no comparison was made"));
+        assert!(
+            text.lines()
+                .any(|line| line == format!("label: {PLAN_ONLY_LABEL}"))
+        );
+        for label in [HYBRID_TOKEN_LABEL, FIRST_CHAIN_LABEL, HEAD_LABEL] {
+            assert!(
+                text.lines()
+                    .any(|line| line == format!("label reserved for a later stage: {label}")),
+                "future label missing: {label}"
+            );
+        }
+        assert!(!text.lines().any(|line| line.starts_with("label: hybrid:")));
+        assert!(!text.contains("execution flags: chain_execution=true"));
+        assert!(!text.contains("device_execution=true"));
     }
 }

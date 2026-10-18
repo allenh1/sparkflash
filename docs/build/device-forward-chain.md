@@ -1,14 +1,21 @@
 # Device forward chain: the 40-layer hybrid chain and the 130 + 8 golden comparison
 
-Status: **M3-a chain skeleton (host-only) on `task/device-engine-m3`, rebased on `origin/main`
-`5ee8599`; no device chain execution and no token/logits claim.** The host skeleton
-(`chain.rs`, `window.rs`, `cubins.rs`, the masked comparator and `device-chain --plan-only`)
-is code, not design prose; it opens no driver and launches no kernel. The device path has not run
-(2.1, 5), so every number below is plan accounting or a labelled measurement on another harness, not
-a measurement of this chain. **Phase 2 exit criterion 1 remains OPEN**
-(`phase2-sequence-harness.md` section 7; D25). The document still consumes the main-branch
-comparison helpers (1.2) and adopts !68's typed capability vocabulary in M1 only (1.3), and it claims
-no device result.
+Status: **M3 wiring (host-only dry-run) on `task/device-engine-m3-wiring`, based on
+`origin/main` `5898e23`; no device chain execution, no token and no logits claim, and Phase 2
+exit criterion 1 remains OPEN** (`phase2-sequence-harness.md` section 7; D25). The
+chain skeleton (`chain.rs`, `window.rs`, `cubins.rs`, the masked comparator and
+`device-chain --plan-only`) is code, not design prose, and the wiring (`chain_device.rs`) now
+drives its full plan through one `ChainOps` implementation: host-seam stages go to a host-seam
+delegate, every device-status stage goes to an injected launcher, and the wiring runs all 5,482
+token-layer executions (108,017 ChainOps calls, of which the fake launcher records 49,347) through
+`device-chain --dry-run` while the plan-vs-ledger self-check validates. The real launcher is
+behind the `cuda` feature, reads each pinned cubin once and verifies that same slice with
+`cubins::verify_bytes`, and wires the first typed builder (mHC), but M3-b weight staging is not
+present, so no launch path is reachable here; the default-build `NoCudaLauncher` refuses every
+device stage with `CudaUnavailable`. No driver is opened and no kernel is launched by the plan or
+the dry-run; every number below is plan accounting or a labelled measurement on another harness,
+not a measurement of this chain. The document still consumes the main-branch comparison
+helpers (1.2) and adopts !68's typed capability vocabulary in M1 only (1.3).
 
 Terminology: **chain** = the code that runs the 40 released backbone layers on the device for one
 sequence; **capture** = the reference boundary table (v1 manifest + blob) the chain is diffed
@@ -500,6 +507,28 @@ stage:", then exits 2 refusing to serve. M3-b/c/d then add the typed builders/ca
 staging and memory admission, and the first host-seam hybrid pass. No token comparison is claimed
 in M3-a; the ledger is already required, and no device claim is made until a Lead window.
 
+**M3 wiring (this branch, on top of 5898e23).** `chain_device.rs` is the single `ChainOps`
+implementation the device run will use. Every stage is classified, never guessed: a
+`StageStatus::HostSeam` stage goes to an injected `HostSeamDelegate` (the M3-a seat recorder by
+default), and a `DeviceKernel` or `DeviceMeasuredNotWired` stage goes to an injected
+`DeviceLauncher`; there is no host fallback for a device stage and no device launch for a host
+seam. The default tests and `device-chain --dry-run` use the fake launcher, which records the
+49,347 device-launcher calls and, with `SeatHostSeams`, produces the 58,670 host-seam records;
+the full plan is 108,017 `ChainOps` calls and the plan-vs-ledger self-check passes. The dry-run
+prints the per-stage call counts and host-seam seats, still exits 2 and still prints
+`chain_execution=false`, `device_execution=false`, `token_produced=false`. Injecting a missing
+cubin or a launcher error fails at the named stage/layer/position: there is no partial success
+report.
+
+The real `CudaLauncher` is behind the `cuda` feature. It reads each pinned cubin once and verifies
+that same slice with `cubins::verify_bytes` on construction, and has the first typed builder wired
+(`mega_mhc_launch::MegaMhcParams`). mHC entry/post refuse until M3-b supplies `MhcBuffers`
+(`NotStaged`); router and routed gate/up are measured but not wired (`NotWired`); the other device
+stages are `NotStaged`. The default-build `NoCudaLauncher` refuses every device stage with
+`CudaUnavailable`. This MR makes **no device execution, no token and no comparison**; it proves
+the dispatch, launcher injection, error path and ledger plumbing only. M3-b then stages weights and
+buffers, M3-c runs the first hybrid token, and M3-d adds the boundary comparison.
+
 **M4 - full 130 + 8 run and the criterion-1 claim.** The scope formerly called M3. The full phase
 of section 5 with the boundary capture at 129, the contract of section 4, and the report artifacts.
 The first point at which this note's subject may be called passing - as a hybrid claim, with
@@ -507,8 +536,9 @@ labelled host seams, the token path labelled "hybrid: token produced by host mat
 logits", the FFN stage labelled hybrid while gate/up is merged but not wired, and the head
 labelled NOT YET DEVICE-EXECUTED AS A PRUNING PATH.
 
-File layout: `crates/sparkflash-device/src/{lib.rs, engine.rs, session.rs, chain.rs, window.rs,
-cubins.rs}`, `crates/sparkflash-device/tests/{engine_offline.rs, chain_contract.rs}`, the
+File layout: `crates/sparkflash-device/src/{lib.rs, engine.rs, session.rs, chain.rs,
+chain_device.rs, window.rs, cubins.rs}`, `crates/sparkflash-device/tests/{engine_offline.rs,
+chain_contract.rs}`, the
 `sparkflash-cli device-chain` subcommand, and the `--package=` selector in
 `scripts/build-aarch64.sh` (still to add; the selector is not needed until a node build of the
 chain exists). The crate must build without libcuda (same rule as kernels: nothing links libcuda;
