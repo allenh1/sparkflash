@@ -531,26 +531,31 @@ context) recomputed all 129,280 logits from the reference's f32 head input and f
 the kernel ABI is fed, in the kernel's ascending order. Both recomputations reproduce the reference
 argmax 5 and top-5 exactly; the f32 recomputation matches the reference logits bit for bit (max abs
 delta 0), so the host's accumulation order is the engine's, and the bf16 conversion the kernel cannot
-avoid moves a logit by at most 2.4320781e-2. That last number is the measured scale the device head's
-exact-entry bar has to sit above, and the reason the stage-5 comparison uses a bf16-matched reference
-rather than the f32-hidden logits.
+avoid moves a logit by at most 2.4320781e-2. That number is why the stage-5 comparison uses a bf16-matched
+reference rather than the f32-hidden logits: otherwise the conversion would be charged to the head.
+The exact-entry bar itself is measured by the device run and was 0 (the device reproduced the matched
+host's values); stage 5 keeps a provisional 2e-2 ceiling rather than folding a 2.4e-2 conversion into
+a bar about the head's arithmetic.
 
-The device run then happened, in a full window on `node0` with vLLM stopped (2026-10-17 19:44,
-118 GiB free). `m7_layer0 --stage 5` launched `cert_lm_head_sm121` once per rank over the four
+The device run then happened, in a full window on `node0` with vLLM stopped (2026-10-17,
+118 GiB free; the timed log is `/home/user/phase1-evidence/stage5-device-run-timed.log`, and the
+rebuilt-binary logs that match the current PASS lines are `stage5-device-final.log` and
+`stage6-cpu-final.log`). `m7_layer0 --stage 5` launched `cert_lm_head_sm121` once per rank over the four
 32,320-row shards of `head.weight` and printed:
 
 * device argmax **5**, value **13.237006187**, equal to the bf16-matched host reference (and to the
   f32-hidden reference argmax 5);
 * **all 129,280 entries exact, 0 certified**: the screen's bound (per-128-block hidden sums times the
-  row's max |w|) is far above the largest logit on this hidden state, so it pruned nothing and the
+  row's max |w|) bounds every entry well above the largest logit on this hidden state, so it pruned nothing and the
   whole vocabulary took the exact path - the run is the exact BF16 GEMM, not a pruned one;
-* **max |device - bf16-matched host| = 0** over every entry: the device logits are bit-identical to the
-  host recomputation in the kernel's order, so the head's arithmetic is reproduced exactly and the
-  only difference from the reference logits is the measured 2.4320781e-2 bf16 conversion of the
-  hidden vector;
+* **max |device - bf16-matched host| = 0** over every entry: the device values equal the host
+  recomputation in the kernel's order, so the head's arithmetic is reproduced exactly (as a value
+  comparison, not a NaN-aware bit comparison) and the only difference from the reference logits is
+  the measured 2.4320781e-2 bf16 conversion of the hidden vector;
 * the certificate check was therefore not exercised and says so rather than claiming it passed; the
   kernel's 32-value block reduction was cross-checked against the per-entry scan on every rank;
-* the run took 1.56 s including the 1.32 GB upload, and a second run printed identical output.
+* the run took 1.56 s including the 1.32 GB upload, and a second run printed the identical stage-5
+  result lines.
 
 This is criterion 3's device half for the argmax and the exact logits. The top-5 set is not claimed:
 a certified entry stores a bound, and the kernel's contract is the argmax; with 0 certified entries on

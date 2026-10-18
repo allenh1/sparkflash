@@ -1,7 +1,7 @@
 //! M7: layer 0 of DeepSeek-V4.1-Flash on the GB10, one stage per run.
 //!
 //! The layer is the unit of proof: a stage that matches at a boundary localises a failure to that
-//! boundary, which one final tensor cannot. Every run is ONE stage (--stage 1, 2 or 3). The argv,
+//! boundary, which one final tensor cannot. Every run is ONE stage (--stage 1 through 6). The argv,
 //! the device bytes and the comparison class are printed before any numbers, and MemAvailable is
 //! printed and re-checked before and after every launch, with the process refusing to continue
 //! under the memory floor (32 GiB by default) - and refusing an allocation that would take the
@@ -459,18 +459,8 @@ impl Snapshot {
         if row >= header.shape[0] {
             return Err(format!("{name}: row {row} is out of range"));
         }
-        let len = cols * 2;
-        let start = header.start + (row * len) as u64;
-        let shard = self.shard_of(name)?;
-        let file = self
-            .files
-            .get_mut(&shard)
-            .ok_or_else(|| format!("{name}: shard {shard} is not open"))?;
-        file.seek(SeekFrom::Start(start))
-            .map_err(|e| format!("{name}: {e}"))?;
-        let mut bytes = vec![0u8; len];
-        file.read_exact(&mut bytes)
-            .map_err(|e| format!("{name}: {e}"))?;
+        let mut bytes = vec![0u8; cols * 2];
+        self.read_row_bf16_into(name, row, cols, &mut bytes)?;
         Ok(bytes_to_bf16_f32(&bytes))
     }
 }
@@ -3315,7 +3305,12 @@ fn stage5(args: &Args) -> Result<(), String> {
         per_rank
     );
     println!(
-        "exact entries: max |device - host(kernel order)| {max_exact_delta:e} at entry {at_max_delta} (bar {LM_EXACT_BAR:e}, provisional until a run measures it); certificate violations {certificate_violations}"
+        "exact entries: max |device - host(kernel order)| {max_exact_delta:e} at entry {} (provisional bar {LM_EXACT_BAR:e}; the released token measured 0 against the matched reference); certificate violations {certificate_violations}",
+        if max_exact_delta == 0.0 {
+            "n/a".to_string()
+        } else {
+            at_max_delta.to_string()
+        }
     );
     if pruned == 0 {
         println!(
@@ -3335,8 +3330,13 @@ fn stage5(args: &Args) -> Result<(), String> {
             "stage 5: FAIL (argmax device {best_entry} vs matched {matched_at} vs reference {reference_at}; max exact delta {max_exact_delta:e} bar {LM_EXACT_BAR:e}; certificate violations {certificate_violations})"
         ));
     }
+    let certificate = if pruned == 0 {
+        "the certificate was not exercised (0 certified entries)".to_string()
+    } else {
+        format!("{pruned} certified bounds all upper bounds")
+    };
     println!(
-        "stage 5: PASS (argmax {best_entry} equal to both references; {exact} exact entries within the bar; {pruned} certified bounds all upper bounds)"
+        "stage 5: PASS (argmax {best_entry} equal to both references; {exact} exact entries within the bar; {certificate})"
     );
     Ok(())
 }
@@ -3346,12 +3346,7 @@ fn stage5(args: &Args) -> Result<(), String> {
 /// tie even when both sides computed the same values.
 fn top_k(logits: &[f32], k: usize) -> Vec<usize> {
     let mut indices: Vec<usize> = (0..logits.len()).collect();
-    indices.sort_by(|a, b| {
-        logits[*b]
-            .partial_cmp(&logits[*a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.cmp(b))
-    });
+    indices.sort_by(|a, b| logits[*b].total_cmp(&logits[*a]).then_with(|| a.cmp(b)));
     indices.truncate(k);
     indices
 }
@@ -3363,8 +3358,10 @@ fn top_k(logits: &[f32], k: usize) -> Vec<usize> {
 /// head input and once from the bf16 codes the kernel ABI is fed, both in the kernel's ascending order.
 /// The two deltas it prints are the ones the device run will sit on top of: the bf16 conversion of
 /// the hidden vector (what the device cannot avoid) and the host order versus the engine's matmul
-/// order (what the matched reference must reproduce). The first number is also the measured scale
-/// the device bar should be tightened to.
+/// order (what the matched reference must reproduce). The first number is why the device comparison
+/// uses the matched reference instead of the f32-hidden logits; the head's own bar is measured by the
+/// device run (which reported max abs delta 0 against the matched host on the released token), not
+/// derived from the conversion.
 fn stage6(args: &Args) -> Result<(), String> {
     let head_input_path = args
         .head_input
@@ -3378,6 +3375,13 @@ fn stage6(args: &Args) -> Result<(), String> {
     let reference = read_f32_file(logits_path, LM_VOCAB)?;
     let hidden = bf16_bits_of_f32(&hidden_f32);
     let mut snapshot = Snapshot::open(&args.checkpoint)?;
+    let header = snapshot.load("head.weight")?;
+    if header.shape.len() != 2 || header.shape[0] != LM_VOCAB || header.shape[1] != LM_HIDDEN {
+        return Err(format!(
+            "head.weight: expected two dimensions [{LM_VOCAB}][{LM_HIDDEN}], the checkpoint stores {:?}",
+            header.shape
+        ));
+    }
     let mut row = vec![0u8; LM_HIDDEN * 2];
     let mut matched_f32 = vec![0.0f32; LM_VOCAB];
     let mut matched_bf16 = vec![0.0f32; LM_VOCAB];
@@ -3414,14 +3418,17 @@ fn stage6(args: &Args) -> Result<(), String> {
     println!("top-5: reference {reference_top:?}; f32 {f32_top:?}; bf16 {bf16_top:?}");
     let argmax_ok = reference_at == f32_at && reference_at == bf16_at;
     let top_ok = reference_top == f32_top && reference_top == bf16_top;
-    if !argmax_ok || !top_ok {
+    // The f32 recomputation is the engine's order; measured max abs delta 0 on the released token,
+    // and a nonzero value would mean the matched reference is no longer the head's arithmetic.
+    let order_ok = delta_f32 == 0.0;
+    if !argmax_ok || !top_ok || !order_ok {
         return Err(format!(
-            "stage 6: FAIL (argmax reference {reference_at} f32 {f32_at} bf16 {bf16_at}; top-5 {:?} vs {:?} vs {:?})",
+            "stage 6: FAIL (argmax reference {reference_at} f32 {f32_at} bf16 {bf16_at}; top-5 {:?} vs {:?} vs {:?}; f32-order delta {delta_f32:e})",
             reference_top, f32_top, bf16_top
         ));
     }
     println!(
-        "stage 6: PASS (argmax and top-5 identical under both recomputations; the bf16 conversion moves a logit by at most {delta_bf16:e}, which is the measured bar the device run starts from)"
+        "stage 6: PASS (argmax and top-5 identical under both recomputations; the bf16 conversion moves a logit by at most {delta_bf16:e}, which is why the device comparison uses the matched reference rather than the f32-hidden logits)"
     );
     Ok(())
 }

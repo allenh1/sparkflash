@@ -575,11 +575,12 @@ device `cert_lm_head_sm121` harness compares. The harness itself is merged (`m7_
 !46) and its CPU precheck (`--stage 6`) has run on the node: recomputing all 129,280 logits in the
 kernel's order from the f32 head input reproduces the reference bit for bit, and from the bf16 codes
 the kernel ABI is fed it keeps argmax 5 and the same top-5 while moving a logit by at most 2.4320781e-2
-(measured, `phase1-boundary-table.md` section 11). That is the unavoidable conversion the device
-comparison must be measured above.
+(measured, `phase1-boundary-table.md` section 11). That is the conversion the matched reference
+avoids charging to the head; the head's own bar is measured by the device run, which had max abs
+delta 0 against the matched host.
 
 The device head has now run in a full window: `--stage 5` reports device argmax 5 equal to both
-references, all 129,280 entries exact with **max |device - bf16-matched host| = 0** (bit-identical in
+references, all 129,280 entries exact with **max |device - bf16-matched host| = 0** (value equality in
 the kernel's order), and 0 certified entries on this token, so the certificate was not exercised and
 the harness says so. That closes criterion 3's device half for the argmax and the exact logits; the
 top-5 is not claimed because a certified entry stores a bound rather than its value. What remains is
@@ -621,7 +622,7 @@ window cost.
 (arch-docs/kernel-dev), `phase1: 40-layer token harness with per-layer diff` (kernel-dev),
 `phase1: stage 4, head and sampling on device` (kernel-dev) - the certified head harness is merged
 (!46) and has run on the released token: argmax matches both references, all 129,280 logits are
-bit-identical to the bf16-matched host, 0 certified; the sampling path remains. `phase1: perturbation and seam-label
+within max abs delta 0 of the bf16-matched host, 0 certified; the sampling path remains. `phase1: perturbation and seam-label
 tests` (api-dev), `phase1: run the released-checkpoint reference table on the node` (kernel-dev) -
 the paged Engram source, the released-geometry scratch fixes, the partitioned audit and the
 harness's --checkpoint mode landed; the real-weight run and its device diff are what remain.
