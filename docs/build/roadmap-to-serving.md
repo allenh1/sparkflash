@@ -723,7 +723,8 @@ itself. The device-side cache and the host-side radix metadata have never met.
 - four compressed-KV arrays (one per `kv_source` layer), sized for `SPARK_MAX_SEQ_LEN` at that
   layer's ratio: at 1M tokens, 3 ratio-2 sources times 500 k positions times 288 B = 432 MB, plus
   layer 20's ratio-1 1M times 288 B = 288 MB, so about **720 MB**; index K at 68 B per position gives
-  about **170 MB**; four window rings at 128 times 528 B times 40 layers are about **2.7 MB**. Total
+  about **170 MB**; forty window rings (one per layer) at 128 slots times 528 B each are about
+  **2.7 MB**. Total
   about **0.9 GB** at 1M context (design arithmetic from D1's entry sizes and the section 8 layouts
   of [../architecture/01-csa2-attention.md](../architecture/01-csa2-attention.md), not a
   measurement).

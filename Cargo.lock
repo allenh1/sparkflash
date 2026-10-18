@@ -2297,8 +2297,10 @@ name = "sparkflash-kv"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "libloading 0.8.9",
  "parking_lot",
  "serde",
+ "sha2",
  "sparkflash-trace",
  "tempfile",
  "thiserror 2.0.21",

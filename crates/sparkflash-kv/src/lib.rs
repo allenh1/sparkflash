@@ -30,6 +30,9 @@
 
 pub mod cache;
 pub mod config;
+#[cfg(feature = "cuda")]
+pub mod device_cuda;
+pub mod device_store;
 pub mod error;
 pub mod fp4;
 pub mod layout;
@@ -48,6 +51,10 @@ pub use config::{
     COMPRESS_RATIOS, Csa2Mode, GLOBAL_KV_BYTES_PER_TOKEN, INDEX_SOURCE_LAYERS, INDEX_TOPK,
     KV_PAGE_TOKENS, KV_SOURCE_LAYERS, NUM_HIDDEN_LAYERS, SWA_WINDOW_SIZE, compress_ratio,
     csa2_mode, index_source_for, kv_source_for,
+};
+pub use device_store::{
+    ArrayHandle, AuditRow, BufferSpec, DeviceKvStore, SelectedHandle, SourceHandles, SourceShape,
+    StoreEntry, StoreError, StoreGeometry, StoreMemory, WindowHandles,
 };
 pub use error::KvError;
 pub use fp4::{

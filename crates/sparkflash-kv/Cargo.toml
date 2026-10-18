@@ -6,12 +6,23 @@ license.workspace = true
 authors.workspace = true
 description = "3-tier radix KV cache, CSA2 page tables and SWA Bounded Replay planner"
 
+[features]
+# The CUDA driver backend (dlopen, no libcuda link). The store's layout and audit layers are
+# always compiled; host-only users never build the backend.
+cuda = ["dep:libloading"]
+
 [dependencies]
 libc = { workspace = true }
+libloading = { version = "0.8", optional = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
+sha2 = { workspace = true }
 sparkflash-trace = { workspace = true }
 thiserror = { workspace = true }
+
+[[example]]
+name = "dev_store_probe"
+required-features = ["cuda"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
