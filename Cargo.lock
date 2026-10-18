@@ -2253,7 +2253,10 @@ name = "sparkflash-device"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "sha2",
  "sparkflash-api",
+ "sparkflash-kernels",
+ "tempfile",
 ]
 
 [[package]]

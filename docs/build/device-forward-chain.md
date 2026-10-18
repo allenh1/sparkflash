@@ -447,15 +447,29 @@ post-!68 `multimodal: false` wire constant, 1.3), refuses non-greedy configurati
 vocabulary of !68 when that merges (1.3). This is the iteration-2 scope: the serving seam's
 capability boundary becomes real without a device claim.
 
-**M2 - chain skeleton on the device.** Load the driver and cubins, stage weights
-through `WeightSource`, run the 40-layer chain with the seams of section 3.1, and execute the smoke
-phase on the node. No token comparison is claimed; the ledger is already required.
+**M2 - re-scoped (2026-10-18): real session and one pinned kernel execution proof.** The original
+iteration-2 mapping made M2 the chain skeleton; after M1 the Lead re-scoped it so the device path
+is proved incrementally. M2 opens the CUDA driver, loads the pinned `moe_router_sm121` cubin
+(37,384 B, sha256 `5992cef9...769b`, checked before the driver) and runs exactly one real router
+launch through the same `DeviceSession` seam on a worker thread, reading ids/weights/scores back.
+The report then derives `device_execution: true` from the session's evidence, naming the kernel,
+cubin sha256/size, launches, tokens and an outputs sha256; `chain_execution` stays `false`. This
+is a session/launch proof, not a forward chain: **no token, logits, correctness or criterion-1
+claim, and no chain**. It is gated by the `cuda` feature (default off) plus an explicit
+`--engine device --device-cubin PATH`, so the default binary and a GPU-less CI host build and test
+without a device path; the launch itself is a Lead-run dev-window result, not a test. The wiring
+and the fake session stay behind the M1 capability flag.
 
-**M3 - full 130 + 8 run and the criterion-1 claim.** The full phase of section 5 with the boundary
-capture at 129, the contract of section 4, and the report artifacts. The first point at which this
-note's subject may be called passing - as a hybrid claim, with labelled host seams, the token path
-labelled "hybrid: token produced by host math over device logits", the FFN stage labelled hybrid
-while gate/up is host, and the head labelled NOT YET DEVICE-EXECUTED AS A PRUNING PATH.
+**M3 - chain skeleton on the device.** The scope formerly called M2. Load the driver and cubins,
+stage weights through `WeightSource`, run the 40-layer chain with the seams of section 3.1, and
+execute the smoke phase on the node. No token comparison is claimed; the ledger is already required.
+
+**M4 - full 130 + 8 run and the criterion-1 claim.** The scope formerly called M3. The full phase
+of section 5 with the boundary capture at 129, the contract of section 4, and the report artifacts.
+The first point at which this note's subject may be called passing - as a hybrid claim, with
+labelled host seams, the token path labelled "hybrid: token produced by host math over device
+logits", the FFN stage labelled hybrid while gate/up is host, and the head labelled NOT YET
+DEVICE-EXECUTED AS A PRUNING PATH.
 
 File layout: `crates/sparkflash-device/src/{lib.rs, engine.rs, session.rs, chain.rs, window.rs}`,
 `crates/sparkflash-device/tests/{engine_offline.rs, chain_contract.rs}`, the

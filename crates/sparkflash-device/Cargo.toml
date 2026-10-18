@@ -4,11 +4,21 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "SparkFlash device forward chain (M1: fake-session InferenceEngine skeleton)"
+description = "SparkFlash device forward chain (M2: real session one-kernel launch proof behind the api engine seam)"
+
+[features]
+default = []
+# "cuda" compiles the M2 real session: the dlopen CUDA driver, the pinned router ABI/launch and
+# Cubin sha256 checks. It links no libcuda; a CPU-only host can still build and test the crate with
+# the feature on (the driver is only opened at session open, and the pin/file checks come first).
+# The default build has no device path at all.
+cuda = ["dep:sparkflash-kernels", "dep:sha2"]
 
 [dependencies]
 sparkflash-api = { workspace = true }
 futures = { workspace = true }
+sparkflash-kernels = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
-sparkflash-api = { workspace = true }
+tempfile = { workspace = true }

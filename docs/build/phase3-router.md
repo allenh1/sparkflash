@@ -149,9 +149,29 @@ held at about 118 GiB in both runs, and the harness reported 4,028,288 B of devi
 * p50 6.8541 ms per launch (0.0527 ms/token) - the launch is gate-bandwidth-bound, so the per-token
   cost drops with the batch, as the cost note above predicts.
 
-The values are within the bars declared in section 4. The Lead re-runs the window on a binary
-rebuilt from this merged tree, so that the recorded sha matches the merged tree; these lines record
-the reviewed-tree run (binary `8f32174e`, built from `15b86d0`).
+The values are within the bars declared in section 4. These two runs are the reviewed-tree binary
+`8f32174e` (built from `15b86d0`); the merged-main re-run follows.
+
+**Merged-main re-run, 2026-10-18T19:14Z-19:16Z.** After !77 merged as `d14306c`, the Lead rebuilt
+the harness from that merged main and re-ran both batches in a second window. The binary that ran
+was the aarch64 `m9_router` with sha256
+`a3ba20e4b3f9d0cc87267bfb90dbd204f9d18ab157a88114146afc228dd1cf85`, 4,970,848 B, built from
+`d14306c`; cubin `5992cef9`, 37,384 B; window log `window-b3-20261018T191453Z.log`, `runs3/`. Both
+runs PASSED 7 of 7 against the corrected comparison class of section 4:
+
+* `--tokens 8`: host path vs twin ids 48 of 48 equal and weights bit-identical; device vs twin ids
+  48 of 48, scores max abs delta 1.1920929e-7 (ULP 1), weights ULP 2; determinism 12,672 B
+  byte-identical; p50 6.8530 ms per launch.
+* `--tokens 130`: grid `(17, 1, 1)`; ids 780 of 780; device vs twin scores ULP 2, weights ULP 4;
+  determinism 205,920 B byte-identical; p50 6.8534 ms per launch.
+
+vLLM was stopped across four nodes for the window and restarted healthy afterwards. These are the
+Lead's window measurements, not CI. The !80 review delta changed no kernel code - the cubin is still
+`5992cef9` - so the device arithmetic measured above is the delivered one. The harness binary itself
+is not byte-identical to a rebuild from the present main, because main also carries the !81 device-M1
+engine changes and the delta's source shifts: a rebuild from the !81 main `8b3aef9` gives
+`c920c1fdc...`, 4,971,048 B. The Lead re-runs on that final binary if a sha-matched measurement is
+needed.
 
 ## 6. What this iteration does not claim
 

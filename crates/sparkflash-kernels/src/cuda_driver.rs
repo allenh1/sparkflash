@@ -168,6 +168,8 @@ pub enum KernelId {
     CertLmHead,
     /// moe_router_sm121: the device MoE router (task-37, roadmap 6.3 item 4).
     MoeRouter,
+    /// routed_gate_up_sm121: the routed-expert W4A8 gate/up projection (task-8 iteration B).
+    RoutedGateUp,
 }
 
 impl KernelId {
@@ -181,6 +183,7 @@ impl KernelId {
             KernelId::SwigluMxfp8Quant => "swiglu_mxfp8_quant_sm121",
             KernelId::CertLmHead => "cert_lm_head_sm121",
             KernelId::MoeRouter => "moe_router_sm121",
+            KernelId::RoutedGateUp => "routed_gate_up_sm121",
         }
     }
 }
@@ -192,6 +195,12 @@ impl KernelId {
 pub struct Cuda {
     lib: libloading::Library,
     ctx: *mut c_void,
+    /// The device ordinal the retained primary context belongs to.
+    ///
+    /// `cuDevicePrimaryCtxRelease` takes a `CUdevice` (an `int`), not the `CUcontext`: storing the
+    /// ordinal is what lets `Drop` make the matching release call with the right argument instead of
+    /// passing a pointer through a mis-typed symbol.
+    dev: i32,
 }
 
 impl Cuda {
@@ -278,9 +287,19 @@ impl Cuda {
                         unsafe extern "C" fn(*mut *mut c_void, u32, i32) -> CuResult,
                     > = lib.get(b"cuCtxCreate_v2").map_err(|e| e.to_string())?;
                     let r2 = create(&mut alt, 0x10, dev);
-                    // Nothing is left half-initialised: no context was retained, no device memory
-                    // was allocated, and this condition is not retried. If a context IS created and
-                    // a later step fails, Drop releases it.
+                    // A context created by the alternative route is not the one this type stores,
+                    // so destroy it now: it would otherwise leak on the error return below.
+                    if r2 == 0
+                        && let Ok(destroy) = lib
+                            .get::<unsafe extern "C" fn(*mut c_void) -> CuResult>(
+                                b"cuCtxDestroy_v2",
+                            )
+                    {
+                        let _ = destroy(alt);
+                    }
+                    // Nothing is left half-initialised: no context was retained, the alternative
+                    // context (if any) was destroyed, no device memory was allocated, and this
+                    // condition is not retried.
                     let avail = mem_available_kb()
                         .map(|kb| format!("{} MiB", kb / 1024))
                         .unwrap_or_else(|| "unknown".to_string());
@@ -300,14 +319,33 @@ impl Cuda {
                 }
             }
             {
+                // This failure path cannot rely on Drop, because the Cuda it would release has not
+                // been constructed yet; release the retained primary context explicitly.
                 let set: libloading::Symbol<unsafe extern "C" fn(*mut c_void) -> CuResult> =
-                    lib.get(b"cuCtxSetCurrent").map_err(|e| e.to_string())?;
+                    match lib.get(b"cuCtxSetCurrent") {
+                        Ok(set) => set,
+                        Err(error) => {
+                            if let Ok(release_v2) = lib
+                                .get::<unsafe extern "C" fn(i32) -> CuResult>(
+                                    b"cuDevicePrimaryCtxRelease_v2",
+                                )
+                            {
+                                let _ = release_v2(dev);
+                            }
+                            return Err(error.to_string());
+                        }
+                    };
                 let r = set(ctx);
                 if r != 0 {
+                    if let Ok(release_v2) = lib.get::<unsafe extern "C" fn(i32) -> CuResult>(
+                        b"cuDevicePrimaryCtxRelease_v2",
+                    ) {
+                        let _ = release_v2(dev);
+                    }
                     return Err(format!("cuCtxSetCurrent failed: {r}"));
                 }
             }
-            Ok(Cuda { lib, ctx })
+            Ok(Cuda { lib, ctx, dev })
         }
     }
 
@@ -608,10 +646,10 @@ impl Drop for Cuda {
             return;
         }
         unsafe {
-            if let Ok(f) = self
-                .sym::<unsafe extern "C" fn(*mut c_void) -> CuResult>(b"cuDevicePrimaryCtxRelease")
+            if let Ok(release_v2) =
+                self.sym::<unsafe extern "C" fn(i32) -> CuResult>(b"cuDevicePrimaryCtxRelease_v2")
             {
-                let _ = f(self.ctx);
+                let _ = release_v2(self.dev);
             }
         }
     }

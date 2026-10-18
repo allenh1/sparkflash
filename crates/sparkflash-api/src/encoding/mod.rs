@@ -619,7 +619,57 @@ pub fn load_hf_tokenizer(path: &Path) -> anyhow::Result<HfTokenizerEncoder> {
     Ok(HfTokenizerEncoder::new(tokenizer))
 }
 
-/// Vendored reference tokenizer shipped with the repository.
+/// The vendored tokenizer's location relative to a deployed directory.
+const VENDORED_TOKENIZER: &str = "reference/tokenizer.json";
+
+/// The vendored reference tokenizer's compile-time path in this checkout.
+///
+/// This is a development convenience: it embeds `CARGO_MANIFEST_DIR`, so it is only meaningful
+/// for a test or binary running from the checkout that built it. A binary built in one directory
+/// and copied elsewhere must resolve [`resolve_reference_tokenizer`] instead, or be given
+/// `--tokenizer`; the M2 dev-window run of 2026-10-18 failed because a default based on this path
+/// was carried to a node where that build directory does not exist.
 pub fn reference_tokenizer_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../reference/tokenizer.json")
+}
+
+/// Resolves the vendored reference tokenizer for a binary that may not run from this checkout.
+///
+/// `--tokenizer` is the operator's explicit override and is never routed through this function.
+/// Otherwise the file is looked for, in order, at `<exe_dir>/reference/tokenizer.json` and
+/// `<cwd>/reference/tokenizer.json`, which covers a deployed binary with the directory staged
+/// next to it and one started from the stage root. The compile-time `CARGO_MANIFEST_DIR` is
+/// deliberately not a candidate: it names a directory on the build host, not on the node.
+///
+/// # Errors
+///
+/// A message naming `--tokenizer` and every candidate that was tried, so the operator can stage
+/// the file or pass the flag instead of guessing which default failed.
+pub fn resolve_reference_tokenizer(
+    exe_dir: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for root in [exe_dir, cwd].into_iter().flatten() {
+        let candidate = root.join(VENDORED_TOKENIZER);
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    if let Some(candidate) = candidates.iter().find(|path| path.is_file()) {
+        return Ok(candidate.clone());
+    }
+    if candidates.is_empty() {
+        return Err(format!(
+            "no default tokenizer found: --tokenizer was not given and {VENDORED_TOKENIZER} cannot be looked up because neither the executable directory nor the current directory is available; pass --tokenizer FILE (the model's own tokenizer.json)"
+        ));
+    }
+    let tried = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "no default tokenizer found: --tokenizer was not given and {VENDORED_TOKENIZER} is not at {tried}; pass --tokenizer FILE (the model's own tokenizer.json)"
+    ))
 }

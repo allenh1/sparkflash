@@ -7,11 +7,12 @@
 //! [`sparkflash_engine::forward::InferenceEngine`] over either the synthetic plan or a real
 //! checkpoint, presents it to the router through a local driver, and binds the router to a socket.
 //!
-//! `--engine device` selects the M1 `sparkflash-device` skeleton instead: a `DeviceEngine` over
-//! the same reference engine, with a fake session, `vision: false`, non-greedy sampling refused
-//! and no device execution (design `docs/build/device-forward-chain.md` 1.3, 7 M1). It is not
-//! the default: `--engine reference` is, and that path is unchanged. The first real device
-//! session is M2.
+//! `--engine device` selects the `sparkflash-device` engine instead: a `DeviceEngine` over the
+//! same reference engine. Without a cubin it is the M1 fake session (no driver, no launch,
+//! `vision: false`). With `--device-cubin PATH` and a binary built with the `cuda` feature it
+//! is the M2 real session: one pinned `moe_router_sm121` launch, evidence only, no chain and no
+//! token claim (design `docs/build/device-forward-chain.md` 1.3, 7 M1, 7 M2). It is not the
+//! default: `--engine reference` is, and that path is unchanged. The first real chain is M3.
 //!
 //! # What it does not claim
 //!
@@ -71,7 +72,9 @@ use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use sparkflash_api::AppState;
-use sparkflash_api::encoding::{HfTokenizerEncoder, load_hf_tokenizer, reference_tokenizer_path};
+use sparkflash_api::encoding::{
+    HfTokenizerEncoder, load_hf_tokenizer, resolve_reference_tokenizer,
+};
 use sparkflash_api::engine::InferenceEngine as ApiInferenceEngine;
 use sparkflash_api::engine::{
     Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason, MODEL_ID,
@@ -82,7 +85,9 @@ use sparkflash_api::telemetry_types::{
     CompletionTokensDetails, DSparkStepStats, DeepSeekSparkRequestStats, OpenAiUsageWithCache,
     PromptTokensDetails, RequestTimingStats, RoceTransportStats, finite_or_zero,
 };
-use sparkflash_device::{DeviceEngine, FakeSession};
+#[cfg(feature = "cuda")]
+use sparkflash_device::CudaSession;
+use sparkflash_device::{DeviceEngine, DeviceSession, FakeSession};
 use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::forward::{InferenceEngine, Sampling, SequenceState};
 use sparkflash_engine::linalg::{CHECKPOINT_TENSOR_LIMIT, REFERENCE_TENSOR_LIMIT};
@@ -148,16 +153,18 @@ const _: () = {
 
 /// Which serving engine implementation the process runs.
 ///
-/// The reference engine is the existing CPU path and the default. `device` is the M1
-/// `sparkflash-device` skeleton: a fake session that delegates `generate` back to the reference
-/// engine, refuses images through the typed missing-capability path, refuses non-greedy sampling,
-/// and claims no device execution (design `docs/build/device-forward-chain.md` 1.3, 7 M1).
-/// The first real device session is M2.
+/// The reference engine is the existing CPU path and the default. `device` is the
+/// `sparkflash-device` engine in one of two forms: without `--device-cubin` it is the M1 fake
+/// session (delegates `generate` back to the reference engine, refuses images through the typed
+/// missing-capability path, refuses non-greedy sampling, claims no device execution); with
+/// `--device-cubin` and a binary built with the `cuda` feature it is the M2 real session (one
+/// pinned `moe_router_sm121` launch as an execution proof, evidence only, still no chain and no
+/// token claim). Design `docs/build/device-forward-chain.md` 1.3, 7 M1, 7 M2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum EngineChoice {
     /// The existing CPU reference engine: unchanged serving behaviour.
     Reference,
-    /// The M1 device skeleton: fake session, no device execution, no device claim.
+    /// The device engine: the M1 fake session without a cubin, the M2 real session with one.
     Device,
 }
 
@@ -168,6 +175,50 @@ impl EngineChoice {
         match self {
             Self::Reference => "reference",
             Self::Device => "device",
+        }
+    }
+}
+
+/// What the cli should construct for the engine, decided from the flags with no side effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceSelection {
+    /// The existing CPU reference engine: the default, and unchanged by M1/M2.
+    Reference,
+    /// The M1 fake-session skeleton: no driver, no launch, no device claim.
+    FakeSession,
+    /// The M2 real session: open the driver and run one pinned router launch from this cubin.
+    CudaSession(PathBuf),
+}
+
+/// Decides which engine to construct, purely, so the selection rules are testable on a CPU host.
+///
+/// `--device-cubin` is only meaningful with `--engine device`, and the real session only exists
+/// when the binary was built with the `cuda` feature. Without a cubin, `--engine device` is the
+/// fake session: that keeps the M1 skeleton and the CI default constructible without a device.
+///
+/// # Errors
+/// A message naming the flag combination or the missing feature; the caller prints it and refuses
+/// to start.
+pub fn select_engine(
+    engine: EngineChoice,
+    device_cubin: Option<&Path>,
+    cuda_built: bool,
+) -> Result<DeviceSelection, String> {
+    match (engine, device_cubin) {
+        (EngineChoice::Reference, None) => Ok(DeviceSelection::Reference),
+        (EngineChoice::Reference, Some(_)) => Err(
+            "--device-cubin is only used with --engine device; the reference engine has no device session"
+                .to_owned(),
+        ),
+        (EngineChoice::Device, None) => Ok(DeviceSelection::FakeSession),
+        (EngineChoice::Device, Some(cubin)) => {
+            if !cuda_built {
+                return Err(
+                    "this binary was built without the cuda feature: --device-cubin needs a build with --features cuda"
+                        .to_owned(),
+                );
+            }
+            Ok(DeviceSelection::CudaSession(cubin.to_path_buf()))
         }
     }
 }
@@ -199,8 +250,12 @@ pub struct ServeOptions {
     /// Serve a real sharded checkpoint: a directory holding `config.json` and the safetensors
     /// index, or the index file itself.
     pub checkpoint: Option<PathBuf>,
-    /// The `tokenizer.json` to detokenise with.
-    pub tokenizer: PathBuf,
+    /// The `tokenizer.json` to detokenise with, when the operator passed `--tokenizer`.
+    ///
+    /// `None` means the default is resolved at startup from the executable's directory, then the
+    /// current directory (`reference/tokenizer.json` under either), so a binary copied to a node
+    /// does not depend on the build host's checkout path. `--tokenizer` always overrides.
+    pub tokenizer: Option<PathBuf>,
     /// The ceiling on tokens generated for one request. A request asking for more is clamped to it.
     pub max_tokens: usize,
     /// The element cap the reference pass applies to one tensor. Above it, a tensor is refused
@@ -210,8 +265,11 @@ pub struct ServeOptions {
     /// `--checkpoint` and [REFERENCE_TENSOR_LIMIT] for `--synthetic`.
     pub element_limit: usize,
     /// Which engine implementation to serve. The default is the existing reference engine; the
-    /// device selection is the M1 skeleton behind a capability flag (design 7 M1).
+    /// device selection is the M1 skeleton or, with a cubin and the cuda feature, the M2 session.
     pub engine: EngineChoice,
+    /// The pinned router cubin for the M2 real session. Only with `--engine device` and a binary
+    /// built with the `cuda` feature; absent means the M1 fake session.
+    pub device_cubin: Option<PathBuf>,
 }
 
 impl ServeOptions {
@@ -225,7 +283,7 @@ impl ServeOptions {
         let cli =
             ServeArgs::try_parse_from(std::iter::once("sparkflash serve".to_owned()).chain(args))
                 .map_err(|error| error.to_string())?;
-        let tokenizer = cli.tokenizer.unwrap_or_else(reference_tokenizer_path);
+        let tokenizer = cli.tokenizer;
         let checkpoint = cli.checkpoint;
         // The cap follows the source when the operator does not name one: a real checkpoint's
         // largest tensors are the embedding and the head at 661,913,600 elements each, and
@@ -248,25 +306,30 @@ impl ServeOptions {
                 max_tokens: cli.max_tokens,
                 element_limit,
                 engine: cli.engine,
+                device_cubin: cli.device_cubin,
             }),
         }
     }
 
     /// The weights recipe this run serves, resolved before any thread starts.
     ///
+    /// The tokenizer is passed in because the default is resolved from the *process* directories
+    /// (see [`resolve_reference_tokenizer`]) rather than at parse time; `--tokenizer` is still
+    /// the override, and the caller has already chosen between it and the resolved default.
+    ///
     /// # Errors
     ///
     /// A message naming `--checkpoint` and the file that is missing or unusable.
-    fn recipe(&self) -> Result<Recipe, String> {
+    fn recipe(&self, tokenizer: &Path) -> Result<Recipe, String> {
         match (self.synthetic, self.checkpoint.as_deref()) {
             (true, _) => Ok(Recipe {
                 config: ModelConfig::tiny(),
                 weights: Weights::Synthetic {
                     seed: SYNTHETIC_WEIGHT_SEED,
                 },
-                tokenizer: self.tokenizer.clone(),
+                tokenizer: tokenizer.to_path_buf(),
             }),
-            (false, Some(path)) => checkpoint_recipe(path, &self.tokenizer),
+            (false, Some(path)) => checkpoint_recipe(path, tokenizer),
             (false, None) => Err(no_weights_message()),
         }
     }
@@ -301,7 +364,7 @@ fn default_element_limit(checkpoint: Option<&Path>) -> usize {
     name = "sparkflash serve",
     version,
     about = "Serve the OpenAI-compatible HTTP API over the reference engine",
-    long_about = "Serves the HTTP API from the reference forward pass. Exactly one weight source is required: --synthetic generates the tiny reference plan from a seed and needs no checkpoint, while --checkpoint reads a real sharded checkpoint. The default run is read-only apart from what serving implies: no hardware state is changed and nothing is written to the checkpoint. --engine device selects the M1 sparkflash-device skeleton instead: a fake session that delegates to the reference engine, refuses images and non-greedy sampling, and claims no device execution; the default is --engine reference and is unchanged."
+    long_about = "Serves the HTTP API from the reference forward pass. Exactly one weight source is required: --synthetic generates the tiny reference plan from a seed and needs no checkpoint, while --checkpoint reads a real sharded checkpoint. The default run is read-only apart from what serving implies: no hardware state is changed and nothing is written to the checkpoint. --engine device selects the sparkflash-device engine instead: the M1 fake session that delegates to the reference engine, or with --device-cubin and a cuda build the M2 one-launch session; both refuse images and non-greedy sampling, and neither claims a chain or tokens. The default is --engine reference and is unchanged."
 )]
 struct ServeArgs {
     /// The address to bind.
@@ -313,11 +376,13 @@ struct ServeArgs {
     /// Serve a real sharded checkpoint: its directory, or its safetensors index file.
     #[arg(long, value_name = "DIR")]
     checkpoint: Option<PathBuf>,
-    /// The tokenizer.json to detokenise with; defaults to the vendored reference tokenizer.
+    /// The tokenizer.json to detokenise with; without it the default is resolved at startup.
     ///
-    /// The default is the reference tokenizer that ships with this repository, which is what makes
-    /// --synthetic self-contained. A real deployment passes the model's own tokenizer file, because
-    /// detokenising with the wrong vocabulary produces text that is not the model's output.
+    /// The default is `reference/tokenizer.json` next to the executable, then under the current
+    /// directory. That makes a copied binary work when the stage carries the `reference/`
+    /// directory, and never depends on the checkout that built it. A real deployment passes the
+    /// model's own tokenizer file, because detokenising with the wrong vocabulary produces text
+    /// that is not the model's output.
     #[arg(long, value_name = "FILE")]
     tokenizer: Option<PathBuf>,
     /// The ceiling on tokens generated for one request.
@@ -335,14 +400,21 @@ struct ServeArgs {
         help = "Element cap for one tensor; defaults from the weight source (the 32 Mi reference guard for --synthetic, the checkpoint cap for --checkpoint)"
     )]
     element_limit: Option<usize>,
-    /// Which engine to serve: the default `reference` CPU path, or the M1 `device` skeleton.
+    /// Which engine to serve: the default `reference` CPU path, or the `device` engine.
     ///
-    /// `device` wraps the reference engine in `sparkflash-device`'s M1 `DeviceEngine`: a fake
-    /// session, no kernel launch, no device execution, `vision: false` and non-greedy sampling
-    /// refused. The first real device session is M2; this flag is the capability flag that keeps
-    /// the existing serve path unchanged by default.
+    /// `device` wraps the reference engine in `sparkflash-device`'s `DeviceEngine`. Without
+    /// `--device-cubin` it is the M1 fake session: no kernel launch, no device execution,
+    /// `vision: false` and non-greedy sampling refused. With `--device-cubin` and a binary built
+    /// with the `cuda` feature it is the M2 real session: one pinned router launch, evidence only,
+    /// still no chain and no token claim. The first real chain is M3.
     #[arg(long, value_enum, default_value = "reference")]
     engine: EngineChoice,
+    /// The pinned router cubin for the M2 real session (only with `--engine device`).
+    ///
+    /// Requires a binary built with the `cuda` feature. Without the flag, `--engine device` is
+    /// the M1 fake session, which is what the CI host and the default build use.
+    #[arg(long, value_name = "PATH")]
+    device_cubin: Option<PathBuf>,
 }
 
 /// What the engine thread builds: a configuration, where its weights come from, and the tokenizer.
@@ -938,6 +1010,33 @@ fn run_request(
     Ok(())
 }
 
+/// Wraps a device session in the engine and prints the report's startup line.
+///
+/// The report is derived from the session (fake/real, evidence or none), so this line cannot
+/// overstate what ran; the caller only chooses which session to build.
+fn device_engine<S: DeviceSession + 'static>(
+    session: S,
+    driver: ReferenceDriver,
+) -> Result<Arc<dyn ApiInferenceEngine>, String> {
+    let device = DeviceEngine::open(session, Arc::new(driver))
+        .map_err(|error| format!("cannot open the device session: {error}"))?;
+    println!("sparkflash serve: {}", device.report().startup_line());
+    Ok(Arc::new(device))
+}
+
+/// The default tokenizer, resolved from where this process actually is.
+///
+/// The executable's directory comes first so a deployed binary can stage `reference/` next to
+/// itself, then the current directory for a run started from the stage root. This deliberately does
+/// not consult the build host's checkout path (see `resolve_reference_tokenizer`).
+fn default_tokenizer() -> Result<PathBuf, String> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let cwd = std::env::current_dir().ok();
+    resolve_reference_tokenizer(exe_dir.as_deref(), cwd.as_deref())
+}
+
 /// Entry point main.rs calls: parses arguments, starts the engine, binds the router.
 pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
     let options = match ServeOptions::parse(args) {
@@ -947,7 +1046,28 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             return ExitCode::from(EXIT_REFUSED);
         }
     };
-    let recipe = match options.recipe() {
+    let selection = match select_engine(
+        options.engine,
+        options.device_cubin.as_deref(),
+        cfg!(feature = "cuda"),
+    ) {
+        Ok(selection) => selection,
+        Err(message) => {
+            eprintln!("sparkflash serve: {message}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    let tokenizer = match options.tokenizer.clone() {
+        Some(tokenizer) => tokenizer,
+        None => match default_tokenizer() {
+            Ok(tokenizer) => tokenizer,
+            Err(message) => {
+                eprintln!("sparkflash serve: {message}");
+                return ExitCode::from(EXIT_REFUSED);
+            }
+        },
+    };
+    let recipe = match options.recipe(&tokenizer) {
         Ok(recipe) => recipe,
         Err(message) => {
             eprintln!("sparkflash serve: {message}");
@@ -961,27 +1081,31 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             return ExitCode::from(EXIT_REFUSED);
         }
     };
-    let engine: Arc<dyn ApiInferenceEngine> = match options.engine {
-        EngineChoice::Reference => Arc::new(driver),
-        EngineChoice::Device => {
-            let device = match DeviceEngine::open(FakeSession::new(), Arc::new(driver)) {
-                Ok(device) => device,
-                Err(error) => {
-                    eprintln!("sparkflash serve: cannot open the device session: {error}");
-                    return ExitCode::from(EXIT_REFUSED);
+    let engine: Arc<dyn ApiInferenceEngine> = match selection {
+        DeviceSelection::Reference => Arc::new(driver),
+        DeviceSelection::FakeSession => match device_engine(FakeSession::new(), driver) {
+            Ok(engine) => engine,
+            Err(message) => {
+                eprintln!("sparkflash serve: {message}");
+                return ExitCode::from(EXIT_REFUSED);
+            }
+        },
+        DeviceSelection::CudaSession(cubin) => {
+            #[cfg(feature = "cuda")]
+            {
+                match device_engine(CudaSession::new(cubin), driver) {
+                    Ok(engine) => engine,
+                    Err(message) => {
+                        eprintln!("sparkflash serve: {message}");
+                        return ExitCode::from(EXIT_REFUSED);
+                    }
                 }
-            };
-            let report = device.report();
-            // The M1 skeleton says what it is before serving a request: a fake session with no
-            // device execution, so a reader cannot mistake it for M2/M3 device work (design 7 M1).
-            println!(
-                "sparkflash serve: engine {} (M1 fake-session skeleton; fake_session={}, device_execution={}, vision={}); no device claim, no kernel launch; the first real session is M2",
-                options.engine.as_str(),
-                report.fake_session,
-                report.device_execution,
-                report.vision
-            );
-            Arc::new(device)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = cubin;
+                unreachable!("select_engine refuses a cubin without the cuda feature")
+            }
         }
     };
     let state = AppState::new(engine);
@@ -1069,6 +1193,7 @@ mod tests {
     use sparkflash_engine::loader::Treatment;
 
     use super::*;
+    use sparkflash_api::encoding::reference_tokenizer_path;
 
     /// A driver over the synthetic tiny plan: the path every behavioural test takes.
     fn synthetic_driver(max_tokens: usize) -> ReferenceDriver {
@@ -1481,6 +1606,23 @@ mod tests {
         .expect("parses");
         assert_eq!(device.engine, EngineChoice::Device);
         assert_eq!(device.engine.as_str(), "device");
+        assert!(
+            device.device_cubin.is_none(),
+            "no cubin means the fake session"
+        );
+
+        let with_cubin = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--engine".to_owned(),
+            "device".to_owned(),
+            "--device-cubin".to_owned(),
+            "out/moe_router_sm121.cubin".to_owned(),
+        ])
+        .expect("parses");
+        assert_eq!(
+            with_cubin.device_cubin,
+            Some(PathBuf::from("out/moe_router_sm121.cubin"))
+        );
 
         let error = ServeOptions::parse(vec![
             "--synthetic".to_owned(),
@@ -1492,12 +1634,115 @@ mod tests {
     }
 
     #[test]
+    fn the_engine_selection_is_pure_and_refuses_mismatches() {
+        let cubin = Path::new("out/moe_router_sm121.cubin");
+        assert_eq!(
+            select_engine(EngineChoice::Reference, None, false).expect("reference"),
+            DeviceSelection::Reference
+        );
+        assert_eq!(
+            select_engine(EngineChoice::Device, None, false).expect("fake device"),
+            DeviceSelection::FakeSession
+        );
+        assert_eq!(
+            select_engine(EngineChoice::Device, Some(cubin), true).expect("cuda device"),
+            DeviceSelection::CudaSession(PathBuf::from(cubin))
+        );
+
+        // A cubin means a device session, so it is not silently ignored on the reference path.
+        let reference_error = select_engine(EngineChoice::Reference, Some(cubin), true)
+            .expect_err("the reference engine has no device session");
+        assert!(
+            reference_error.contains("--device-cubin") && reference_error.contains("--engine"),
+            "{reference_error}"
+        );
+
+        // A cubin without the feature cannot be honoured, and the message names the feature.
+        let feature_error = select_engine(EngineChoice::Device, Some(cubin), false)
+            .expect_err("the binary has no cuda feature");
+        assert!(feature_error.contains("cuda"), "{feature_error}");
+    }
+
+    /// The exit code every pre-serve refusal returns; the server has not bound a socket.
+    fn refused(code: ExitCode) -> bool {
+        code == ExitCode::from(EXIT_REFUSED)
+    }
+
+    #[test]
+    fn a_bad_engine_value_is_a_usage_refusal() {
+        let code = run(vec![
+            "--synthetic".to_owned(),
+            "--engine".to_owned(),
+            "gpu".to_owned(),
+        ]);
+        assert!(refused(code), "{code:?}");
+    }
+
+    #[test]
+    fn a_cubin_with_the_reference_engine_is_refused() {
+        let code = run(vec![
+            "--synthetic".to_owned(),
+            "--device-cubin".to_owned(),
+            "out/moe_router_sm121.cubin".to_owned(),
+        ]);
+        assert!(refused(code), "{code:?}");
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn a_cubin_without_the_cuda_feature_is_refused() {
+        let code = run(vec![
+            "--synthetic".to_owned(),
+            "--engine".to_owned(),
+            "device".to_owned(),
+            "--device-cubin".to_owned(),
+            "out/moe_router_sm121.cubin".to_owned(),
+        ]);
+        assert!(refused(code), "{code:?}");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_missing_cubin_with_the_cuda_feature_is_refused() {
+        // The reference driver starts (synthetic, explicit tokenizer), then the device session
+        // fails on the missing cubin before any driver is opened; the exit code is a refusal.
+        let code = run(vec![
+            "--synthetic".to_owned(),
+            "--engine".to_owned(),
+            "device".to_owned(),
+            "--device-cubin".to_owned(),
+            "/definitely/not/a/router.cubin".to_owned(),
+            "--tokenizer".to_owned(),
+            reference_tokenizer_path().to_string_lossy().into_owned(),
+        ]);
+        assert!(refused(code), "{code:?}");
+    }
+
+    #[test]
+    fn an_explicit_tokenizer_overrides_the_default_resolution() {
+        let options = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--tokenizer".to_owned(),
+            "/models/deepseek/tokenizer.json".to_owned(),
+        ])
+        .expect("parses");
+        assert_eq!(
+            options.tokenizer,
+            Some(PathBuf::from("/models/deepseek/tokenizer.json"))
+        );
+    }
+
+    #[test]
     fn the_defaults_are_loopback_and_the_reference_caps() {
         let options = ServeOptions::parse(vec!["--synthetic".to_owned()]).expect("parses");
         assert_eq!(options.bind, SocketAddr::from(([127, 0, 0, 1], 8000)));
         assert_eq!(options.max_tokens, MODEL_MAX_OUTPUT_TOKENS);
         assert_eq!(options.element_limit, REFERENCE_TENSOR_LIMIT);
-        assert_eq!(options.tokenizer, reference_tokenizer_path());
+        assert!(
+            options.tokenizer.is_none(),
+            "no --tokenizer means resolve next to the executable, then the cwd"
+        );
+        assert!(options.device_cubin.is_none());
         assert!(options.synthetic);
         assert!(options.checkpoint.is_none());
     }

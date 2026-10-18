@@ -1,8 +1,9 @@
-//! M1 offline contract for `crates/sparkflash-device` (design 7 M1, tests/engine_offline.rs).
+//! Offline contract for `crates/sparkflash-device` (design 7 M1 and 7 M2, tests/engine_offline.rs).
 //!
-//! No device, checkpoint, cluster or network: these run on a CPU-only build. They pin the M1
-//! boundary only - the capability report, the typed vision refusal, the non-greedy refusal and the
-//! delegation - and make no device-execution claim.
+//! No device, checkpoint, cluster or network: these run on a CPU-only build. They pin the boundary
+//! and the honesty of the report - the capability report, the typed vision refusal, the non-greedy
+//! refusal, the delegation, and the rule that `device_execution` is derived from the session's
+//! evidence, never from a flag. The M2 launch itself is a dev-window run, not a test.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,7 +14,10 @@ use sparkflash_api::engine::{
     MissingCapability, MockEngine, MockResponse,
 };
 use sparkflash_api::{ImagePart, MODEL_ID};
-use sparkflash_device::{DeviceEngine, DeviceRefusal, FakeSession, NON_GREEDY_CODE};
+use sparkflash_device::{
+    DeviceEngine, DeviceRefusal, DeviceSession, ExecutionEvidence, FakeSession, NON_GREEDY_CODE,
+    SessionError,
+};
 
 /// A reference engine that counts how often it was entered, so a refusal can prove it did not
 /// delegate and a greedy request can prove it did.
@@ -163,4 +167,174 @@ fn a_greedy_request_delegates_to_the_reference_engine() {
             .any(|event| matches!(event, EngineEvent::ContentDelta(text) if text == "hi")),
         "events: {events:?}"
     );
+}
+
+/// A non-fake session that reports one piece of execution evidence, so the report's derivation can
+/// be tested without a device. It is a test double for the `DeviceSession` seam, not a claim
+/// that anything ran.
+struct ProofSession {
+    evidence: ExecutionEvidence,
+}
+
+impl DeviceSession for ProofSession {
+    fn name(&self) -> &'static str {
+        "proof"
+    }
+
+    fn fake(&self) -> bool {
+        false
+    }
+
+    fn open(&self) -> Result<(), SessionError> {
+        Ok(())
+    }
+
+    fn record_request(&self) {}
+
+    fn requests(&self) -> usize {
+        0
+    }
+
+    fn execution(&self) -> Option<ExecutionEvidence> {
+        Some(self.evidence.clone())
+    }
+}
+
+fn proof_evidence() -> ExecutionEvidence {
+    ExecutionEvidence {
+        kernel: "moe_router_sm121",
+        cubin_sha256: "5992cef91c3e01be46c0691a5d905877b38a2c3002d90d5c31b80a003924769b".to_owned(),
+        cubin_bytes: 37_384,
+        launches: 1,
+        tokens: 8,
+        outputs_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            .to_owned(),
+    }
+}
+
+#[test]
+fn a_non_fake_session_derives_device_execution_from_its_evidence() {
+    let (reference, _) = CountingReference::new();
+    let engine = DeviceEngine::open(
+        ProofSession {
+            evidence: proof_evidence(),
+        },
+        Arc::new(reference),
+    )
+    .expect("the proof session opens");
+    let report = engine.report();
+    assert!(!report.fake_session, "the session is not fake");
+    assert!(report.device_execution, "evidence means something ran");
+    assert!(!report.chain_execution, "M2 has no chain");
+    let line = report.startup_line();
+    let evidence = report.evidence.expect("the evidence is repeated");
+    assert_eq!(evidence.kernel, "moe_router_sm121");
+    assert_eq!(evidence.launches, 1);
+    assert!(line.contains("M2 session/launch proof"), "{line}");
+    assert!(!line.contains("M1 fake-session skeleton"), "{line}");
+}
+
+#[test]
+fn the_fake_session_reports_no_execution_and_documents_the_m1_boundary() {
+    let (engine, _) = engine();
+    let report = engine.report();
+    assert!(report.fake_session);
+    assert!(!report.device_execution);
+    assert!(!report.chain_execution);
+    assert!(report.evidence.is_none());
+    let line = report.startup_line();
+    assert!(line.contains("M1 fake-session skeleton"), "{line}");
+    assert!(line.contains("first real session is M2"), "{line}");
+    assert!(line.contains("unsupported_sampling"), "{line}");
+    assert!(line.contains("503"), "{line}");
+}
+
+/// A session that contradicts itself: it says it is fake and also hands back evidence. The report
+/// must resolve that contradiction in the safe direction - fake wins.
+struct ContradictorySession;
+
+impl DeviceSession for ContradictorySession {
+    fn name(&self) -> &'static str {
+        "contradictory"
+    }
+
+    fn fake(&self) -> bool {
+        true
+    }
+
+    fn open(&self) -> Result<(), SessionError> {
+        Ok(())
+    }
+
+    fn record_request(&self) {}
+
+    fn requests(&self) -> usize {
+        0
+    }
+
+    fn execution(&self) -> Option<ExecutionEvidence> {
+        Some(proof_evidence())
+    }
+}
+
+/// A real session that has not executed anything: there is no evidence to claim.
+struct EvidenceLessRealSession;
+
+impl DeviceSession for EvidenceLessRealSession {
+    fn name(&self) -> &'static str {
+        "real-no-evidence"
+    }
+
+    fn fake(&self) -> bool {
+        false
+    }
+
+    fn open(&self) -> Result<(), SessionError> {
+        Ok(())
+    }
+
+    fn record_request(&self) {}
+
+    fn requests(&self) -> usize {
+        0
+    }
+}
+
+#[test]
+fn a_fake_session_ignores_evidence_and_never_prints_the_m2_label() {
+    let (reference, _) = CountingReference::new();
+    let engine = DeviceEngine::open(ContradictorySession, Arc::new(reference))
+        .expect("the contradictory session opens");
+    let report = engine.report();
+    assert!(report.fake_session);
+    assert!(
+        !report.device_execution,
+        "a fake session cannot have executed anything"
+    );
+    assert!(report.evidence.is_none(), "the evidence is ignored");
+    let line = report.startup_line();
+    assert!(line.contains("M1 fake-session skeleton"), "{line}");
+    assert!(line.contains("fake_session=true"), "{line}");
+    assert!(line.contains("device_execution=false"), "{line}");
+    assert!(!line.contains("M2 session/launch proof"), "{line}");
+}
+
+#[test]
+fn a_real_session_without_evidence_claims_nothing() {
+    let (reference, _) = CountingReference::new();
+    let engine = DeviceEngine::open(EvidenceLessRealSession, Arc::new(reference))
+        .expect("the no-evidence session opens");
+    let report = engine.report();
+    assert!(!report.fake_session);
+    assert!(!report.device_execution);
+    assert!(!report.chain_execution);
+    assert!(report.evidence.is_none());
+    let line = report.startup_line();
+    assert!(
+        line.contains("real device session, no execution evidence"),
+        "{line}"
+    );
+    assert!(line.contains("device_execution=false"), "{line}");
+    assert!(!line.contains("M1 fake-session skeleton"), "{line}");
+    assert!(!line.contains("M2 session/launch proof"), "{line}");
 }
