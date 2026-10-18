@@ -1,3 +1,23 @@
+//! # FREEZE (D26, 2026-10-18): no new source-text scanners in this file
+//!
+//! This module is frozen. It is the Milestone-4 ABI conformance lint, and its own contract below says
+//! the scan is "explicitly NOT the proof" - the committed cubin baseline is - while review round after
+//! review round kept finding false accepts and false rejections in it (the history below reaches round
+//! 24). Each fix bought another parser feature for a proof a text scan cannot make, so the class is
+//! closed rather than extended:
+//!
+//!   * no new scanner, parser or lint for a new kernel invariant is added to this file; a new
+//!     invariant goes to compiled-artifact inspection (scripts/check-kernel-baseline.sh recompiles
+//!     every Milestone 4 kernel and compares cubin bytes, sha256 and PTX membar lines against
+//!     baseline/kernel_baseline.txt in the cuda-abi CI job) or to a runtime device assertion in a
+//!     harness (the m7_layer0 device stages), where the shipped binary is what is measured;
+//!   * defects in the scanners already here are still fixed, with the mutation proof the file requires,
+//!     because they gate the kernels today: the freeze is on growth, not on correctness;
+//!   * the file's length is pinned by ci/check-m4-abi-size.sh, wired into .gitlab-ci.yml; a change that
+//!     makes it longer fails that check, and a legitimate shrink updates the pin in the same commit.
+//!
+//! Decision record: docs/DECISIONS.md D26.
+//!
 //! Parsed-declaration conformance for the Milestone 4 sm_121a kernels.
 //!
 //! Every kernel in this milestone is CUDA that cannot run on the development host, so its ABI is
@@ -2158,6 +2178,25 @@ mod pin_helpers {
     }
 }
 
+/// The split m7_layer0 example, concatenated for the text pins below: `main.rs` plus one module
+/// per stage. The split moved statements between files without changing them, so a pin that used to
+/// scan one path scans the concatenation; every module file ends with a newline, so no statement is
+/// joined across a file boundary.
+#[cfg(test)]
+const M7_LAYER0_SOURCE: &str = concat!(
+    include_str!("../examples/m7_layer0/main.rs"),
+    include_str!("../examples/m7_layer0/stage0.rs"),
+    include_str!("../examples/m7_layer0/stage1.rs"),
+    include_str!("../examples/m7_layer0/stage2.rs"),
+    include_str!("../examples/m7_layer0/stage3.rs"),
+    include_str!("../examples/m7_layer0/stage4.rs"),
+    include_str!("../examples/m7_layer0/stage5.rs"),
+    include_str!("../examples/m7_layer0/stage6.rs"),
+    include_str!("../examples/m7_layer0/stage7.rs"),
+    include_str!("../examples/m7_layer0/stage8.rs"),
+    include_str!("../examples/m7_layer0/stage9.rs"),
+);
+
 /// Every flash_mla launch site goes through the typed parameter builder and the library's typed
 /// launches, so no site can keep a stale arity or a hand-built argument order. The builder and the
 /// launches live in sparkflash_kernels::cuda_harness and the example only aliases them; a raw
@@ -2183,7 +2222,7 @@ fn every_flash_mla_launch_site_uses_the_typed_builder_and_typed_launches() {
             && !code.contains("cuda.launch(mla_func")
             && !code.contains("cuda.launch(dev.mla_func")
     };
-    let source = include_str!("../examples/m7_layer0.rs");
+    let source = M7_LAYER0_SOURCE;
     assert!(
         crate::c_decl::strip_comments(source).contains("use sparkflash_kernels::cuda_harness::"),
         "the example must import the one flash_mla parameter builder from the library harness module"
@@ -2213,8 +2252,8 @@ fn examples_using_the_shared_cuda_driver_are_unsafe_free_and_name_no_raw_driver_
     let examples = pin_helpers::example_sources();
     let users = pin_helpers::example_driver_users(&examples);
     assert!(
-        users.iter().any(|name| name == "m7_layer0.rs"),
-        "m7_layer0.rs must be one of the pinned driver examples, else the pin is vacuous; found {users:?}"
+        users.iter().any(|name| name == "main.rs"),
+        "the split m7_layer0 example's main.rs must be one of the pinned driver examples, else the pin is vacuous; found {users:?}"
     );
     for (name, source) in &examples {
         pin_helpers::check_driver_example(source)
@@ -2276,7 +2315,7 @@ fn stage2_and_stage9_share_one_library_engine_window_row_builder() {
         0,
         "no example may define its own engine-window row helper"
     );
-    let example = crate::c_decl::strip_comments(include_str!("../examples/m7_layer0.rs"));
+    let example = crate::c_decl::strip_comments(M7_LAYER0_SOURCE);
     assert!(
         example.contains("use sparkflash_kernels::cuda_harness::"),
         "the example must import the shared engine-row helper from the library harness"

@@ -33,7 +33,8 @@ the three stages below can be read at all.
 
 All three were measured on `node0` in the M7 device window of 2026-10-17, with vLLM stopped by
 the operator (device empty; MemAvailable 118.2 GiB at process start, printed by the harness), by
-`crates/sparkflash-kernels/examples/m7_layer0.rs` in review as merge request `!26`. The harness is
+`crates/sparkflash-kernels/examples/m7_layer0/main.rs` (one module per stage beside it) in review at
+`!26`; split from one file by 954d7af with no behaviour change. The harness is
 not on main yet; the numbers below are the run's, and the harness's own comparison-class line is
 quoted with each row because the class is part of the number.
 
@@ -1216,8 +1217,9 @@ the architecture rather than a step.
 Each is a real gap with a test that would close it; none is a caveat to be waved away.
 
 1. **`hc_scale` (the three per-group scales) is not modelled by the kernel.** The M7 harness folds
-   `hc_attn_scale` and `hc_ffn_scale` into the predictor it hands the kernel (`m7_layer0.rs:674-679`
-   and the fold loop at `710-726`); whether the model applies the same fold at the same point is our
+   `hc_attn_scale` and `hc_ffn_scale` into the predictor it hands the kernel
+   (`examples/m7_layer0/main.rs:674-679` and the fold loop at `710-726`; the split left the crate-root
+   line numbers unchanged); whether the model applies the same fold at the same point is our
    reading of the reference, not a confirmed device-versus-reference boundary. Test: a stage-1 run
    with a deliberately perturbed scale vector must move the coefficients by exactly the folded
    amount; if it does not, the fold is in the wrong place.
@@ -1358,7 +1360,7 @@ then; the numbers above come from their captured bytes, not from the stale print
 
 - Stage numbers: `m7_layer0 --stage {1,2,3} --checkpoint <released> --cubin-dir <cubins>`; the argv
   and comparison class are printed by the harness itself
-  (`crates/sparkflash-kernels/examples/m7_layer0.rs`, in `!26`).
+  (`crates/sparkflash-kernels/examples/m7_layer0/`, in `!26`; split by 954d7af).
 - Kernel reproducibility:
   [crates/sparkflash-kernels/scripts/check-kernel-baseline.sh](../../crates/sparkflash-kernels/scripts/check-kernel-baseline.sh)
   inside the pinned nvcc image.

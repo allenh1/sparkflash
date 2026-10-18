@@ -42,6 +42,19 @@ rustdoc:
   script:
     - RUSTDOCFLAGS="-D missing_docs" cargo doc --workspace --no-deps
 
+# D26 freezes the Milestone-4 ABI lint (crates/sparkflash-kernels/src/m4_abi.rs): it parses kernel
+# source text, and its own contract says that scan is explicitly not the proof - the committed cubin
+# baseline is - while the recorded review history reaches round 24 with a real false accept or false
+# rejection in every round. New kernel invariants go to compiled-artifact inspection (the cuda-abi
+# job's baseline) or runtime device assertions instead. This cheap, always-on check fails if the file
+# grows past its pinned line count, so a new scanner cannot arrive as a side effect of another edit.
+# A commit that changes the file's length changes PINNED_LINES in ci/check-m4-abi-size.sh in the same
+# diff; that diff is the deliberate act a reviewer reads.
+m4-abi-freeze:
+  stage: check
+  script:
+    - sh ci/check-m4-abi-size.sh
+
 test:
   stage: test
   script:

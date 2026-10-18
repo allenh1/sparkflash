@@ -149,8 +149,8 @@ two fixture weight kinds are pinned in the serialised schema.
 
 ## 6. 2B/2C notes fixed in advance
 
-* 2B is a **new example** `crates/sparkflash-kernels/examples/m8_sequence.rs`; `m7_layer0.rs` stays
-  untouched. `FlashMlaParams`/`engine_window_row` move to a public kernels module with the m7
+* 2B is a **new example** `crates/sparkflash-kernels/examples/m8_sequence.rs`; the `m7_layer0`
+  harness stays untouched (now `examples/m7_layer0/`, split by 954d7af). `FlashMlaParams`/`engine_window_row` move to a public kernels module with the m7
   author's acknowledgement, and a test pins that both call sites use the shared builder.
 * 2B prefill 130 tokens then 8 decodes, consuming the task-7 store; `window_rows` must be
   contiguous oldest-first. The device window slot is not one 528-B blob: it is two arrays per

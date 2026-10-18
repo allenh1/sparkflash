@@ -1,6 +1,7 @@
 //! Host-side guard for the Mega-mHC grid reduction's determinism.
 //!
-//! The direct test is the device one: `examples/m7_layer0.rs --stage 4` launches the kernel N times
+//! The direct test is the device one: `cargo run -p sparkflash-kernels --example m7_layer0 --
+//! --stage 4` launches the kernel N times
 //! on the same input bytes and requires every compared output byte to match run 0. This file is the
 //! cheap half that can run anywhere, including a host with no GPU: it reads the kernel source and
 //! fails when the shape that made the reduction nondeterministic comes back.

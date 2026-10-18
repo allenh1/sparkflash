@@ -20,9 +20,18 @@ fn the_determinism_contract_is_written_down_and_the_harness_cites_it() {
             "the determinism contract is missing this statement: {statement}"
         );
     }
-    let harness =
-        std::fs::read_to_string(root.join("crates/sparkflash-kernels/examples/m7_layer0.rs"))
-            .expect("the M7 harness must be readable from the crate");
+    let mut harness = String::new();
+    let mut modules: Vec<std::path::PathBuf> =
+        std::fs::read_dir(root.join("crates/sparkflash-kernels/examples/m7_layer0"))
+            .expect("the split M7 harness directory must be readable from the crate")
+            .map(|entry| entry.expect("a harness module must be readable").path())
+            .collect();
+    modules.sort();
+    for module in modules {
+        harness.push_str(
+            &std::fs::read_to_string(&module).expect("an M7 harness module must be readable"),
+        );
+    }
     for citation in [
         "D-a (kernel determinism)",
         "D-b (reduction determinism)",

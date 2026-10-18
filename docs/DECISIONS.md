@@ -34,6 +34,7 @@ records the evidence and the consequence for the build. Research backing is in
 | D23 | The activation quantiser is the reference ceil rule | Device activation quantisers take the smallest power of two at or above `amax/448` after the 1e-4 amax floor (the engine's `quantize_activation_fp8` rule); the checkpoint weight-grid rule stays floor-log2 and the two helpers are named apart (D8) |
 | D24 | CSA attention attends the window/compressed union | Format 2 (CSA-union) attends the window rows then the selected compressed ids, causal, with the sink first in the denominator; the 19-param ABI and formats 0/1 are unchanged, and it is reference-tested/CPU-pinned only until a device window proves it |
 | D25 | The golden sequence fixture is Phase-2 reference truth | The real-checkpoint fixture (`e6df8290...`, 2,536,194 B; 130-token prefill with next token 491, 8 decodes, compared 129..137) is the truth 2B/2C are measured against; device output is compared token-first then logits at 2e-2; the 2B device comparison has not run, criterion 1 stays OPEN, and the fixture is never regenerated to accommodate a device change |
+| D26 | The Milestone-4 ABI source-text lint is frozen | No new source-text scanner, parser or lint in `m4_abi.rs`; new kernel invariants are enforced by compiled-artifact inspection (cubin/PTX baseline) or runtime device assertions, and `ci/check-m4-abi-size.sh` fails CI if the file grows past its pinned line count |
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
 summary and the matching `## D<n>` section carries the evidence and the full consequence. If a row and
@@ -361,6 +362,15 @@ traffic are the **f1** functions: `rocep1s0f1` -> `enp1s0f1np1` and `roceP2p1s0f
 addresses, one per rail (the head node is 192.0.2.80 on rail 1 and 192.0.2.85 on rail 2), with two
 default routes at different metrics.
 
+**Rail-2 address table (read-only measurement, 2026-10-18, not a gate run).** This entry recorded
+only the head node's pair. The live listing (Lead, 2026-10-18) gives rail 1 / rail 2 pairs:
+node0 `192.0.2.80`/`.85`, node1 `192.0.2.84`/`.88`, node2 `.64`/`.68`,
+node3 `.59`/`.63`. Both rails are ACTIVE at 200000 Mb/s on the f1 functions; the deployed vLLM
+reference selects only `rocep1s0f1` (single rail), while our gates target the dual-rail aggregate.
+The full table, the device states and the NCCL environment with provenance are in
+`docs/build/rdma-backend.md`; `docs/QUALIFICATION.md` section 2.1 now points there instead of saying
+the addresses are unrecorded.
+
 **Decision.** The communicator enumerates the RDMA devices and their netdevs and selects the ones that are
 ACTIVE at 200 Gb/s, with the spec's names kept as a documented fallback and an explicit operator override.
 Registering a device that is down, or falling back silently to a 40 Gb/s link, is a hard startup error,
@@ -485,111 +495,6 @@ reference tree was read at `/home/user/dsv41-research`; the kernel file was read
 are in the `docs/architecture` worktree.
 
 ---
-
-## D10 - The CPU span ring is 48 bytes behind a per-thread mutex, not the 32-byte lock-free ring the spec describes
-
-**Context.** Specification 5.8 (line 1112) asks for "32-byte `CpuTraceEvent` records into a
-per-thread lock-free ring buffer". The implementation stores 48-byte `CpuTraceEvent` values
-(label, scope, meta, thread id, start, end) in a per-thread `Mutex<Vec<CpuTraceEvent>>`, kept in a
-process-wide registry so the exporter can drain every thread at once.
-
-**Decision.** Keep the *GPU* wire ABI byte-exact - `GpuTraceEvent` stays 32 bytes and 32-byte
-aligned, and `kernels/trace_globaltimer_sm121.cuh` is checked against it field by field by the
-build-script probe and by unit tests - and accept the CPU side deviating in record size and locking
-discipline. The GPU ABI is a contract the kernels compile against; the CPU ring is internal to one
-process and never crosses the wire.
-
-**Why not the spec's shape.** A 32-byte lock-free ring would drop the label and meta fields that
-make a CPU trace readable in Chrome/Perfetto, which is the whole point of the capture. It is also
-not on any hot path: `is_scope_enabled` short-circuits on an L1-cached mask before anything is
-touched, so a disabled engine locks and allocates nothing. An armed span does take its own
-thread's mutex, but cross-thread contention only appears when the exporter drains a capture.
-
-**Revisit when.** If armed-capture profiling ever shows CPU span recording, replace the Vec with a
-fixed-size lock-free ring and move the label to a static-table index. The change is contained
-behind `ThreadTraceState`.
-
-**Also recorded here** (found by review, not a decision): the ring constructors bound capacity at
-`MAX_RING_CAPACITY` and use checked arithmetic, because the header stores capacity - 1 in 32 bits
-and an unchecked capacity made the *safe* `slot()` accessor index out of bounds in release builds.
-
-## D11 - The RoCEnante wait is bounded and traceable instead of spinning forever
-
-**Context.** Spec 5.4 (lines 683-687) spins on `slot->arrival_seq[peer] < step_seq` with no exit
-condition. A dropped doorbell, a late peer or a NIC that never posts therefore hangs the kernel
-indefinitely, and on a unified-memory GB10 a hung kernel is not killable from the host without a
-device reset - the failure mode would take down a node that is otherwise healthy.
-
-**Decision.** The wait is bounded by a `%globaltimer` deadline with `__nanosleep` backoff
-(`SPARK_ROCENANTE_PEER_WAIT_NS`, default 1 ms, roughly 45x the 22 us gate in spec 6.1). On timeout the
-block returns a bf16 quiet NaN for the elements it owns and emits a single diagnostic trace record whose
-`payload_meta` carries the timeout flag, a 4-bit missing-rank mask and a row-overflow bit. A straggler
-thus produces a visible, attributable wrong answer instead of a dead node.
-
-**Also recorded in the kernel, because the spec is silent.** A `__syncthreads()` sits between the
-doorbell and the peer poll, which orders the ringing within a block and keeps the per-block deadline
-stamp after the doorbell. It is a block-scoped barrier, so it does not stop another block from reaching
-the poll first: what makes that safe is the sequence guard, since the poll waits for
-`arrival_seq[peer] >= step_seq` rather than for the ring. (An earlier draft of this entry claimed the
-barrier gave grid-wide ordering; the M3 review falsified that, and the poll's guard is the real reason
-no block can proceed on a peer that has not rung.) The observing threads also fence unconditionally
-after the poll, not only on the wait path, so a peer that was already visible when the block arrived is
-still acquired rather than riding on the writer's release alone. `step_seq` is strictly
-increasing per rank, and a slot is not reused for `step_seq + 1` until every rank has finished reading
-it; double buffering is the communicator's job, not the kernel's. The spec's slot struct carries no
-alignment attribute, so the slot is 8-byte aligned (by its `u64` member), not 32: `sizeof ==
-8_388_640`, pinned by `static_assert` on the C side and by a parsed-declaration test on the Rust side.
-An oversized `num_elements` is clamped and flagged rather than allowed to run into the neighbouring
-payload row; the router's 2 MiB threshold is exactly one payload row, so a conforming caller never
-reaches the clamp.
-
-## D12 - Dual-rail device selection enumerates the fabric instead of trusting the spec's device names
-
-**Context.** Spec 6.1 (check 2) and the Milestone 3 registration list name the two rails as
-`rocep1s0f0` / `enp1s0f0np0` and `roceP2p1s0f0` / `enP2p1s0f0np0`. Measured read-only on the live
-cluster, those are the **f0** functions and they are down at 40 Gb/s, while the rails actually carrying
-traffic are the **f1** functions: `rocep1s0f1` -> `enp1s0f1np1` and `roceP2p1s0f1` ->
-`enP2p1s0f1np1`, both ACTIVE at 200 Gb/s (4X HDR). Both rails share 192.0.2.0/24, and a node holds two
-addresses, one per rail (the head node is 192.0.2.80 on rail 1 and 192.0.2.85 on rail 2), with two
-default routes at different metrics.
-
-**Decision.** The communicator enumerates the RDMA devices and their netdevs and selects the ones that are
-ACTIVE at 200 Gb/s, with the spec's names kept as a documented fallback and an explicit operator override.
-Registering a device that is down, or falling back silently to a 40 Gb/s link, is a hard startup error,
-not a warning: a silent downgrade would invalidate the whole milestone's bandwidth claims while still
-producing plausible numbers.
-
-**Also measured, and relevant to the preflight.** The live nodes run kernel `6.17.0-1029-nvidia` (meets
-the `>= 6.17.0-1018` requirement) but driver `580.173.02`, which is **below** the `580.178.04` the spec
-requires, so check 1 fails on the real cluster today; the active rails report MTU 1500 rather than the
-required 9000; `nvidia_uvm` exposes no 64K-packing parameter under any conventional name among its 56
-module parameters, so "64K page packing is active" is not verifiable as written; and `MemAvailable` is
-5 GiB because the live vLLM instance holds the memory, which is why the 114 GiB gate must only be read
-while the cluster is idle.
-
-## D13 - Dispatch telemetry keeps the spec's truncating formula, and the exact figure lives in the plan
-
-**Context.** Spec 5.4 (lines 758-760) accounts dual-rail traffic as `half_bytes = num_bytes / 2;
-rdma_bytes_railN += half_bytes * 3`. With an ODD `num_bytes` the integer division truncates, so each
-rail's counter undercounts by up to 3 bytes relative to the true `3 * num_bytes / 2`.
-
-**Decision.** Keep the spec's formula for the spec-named counters, because those counters are the
-conformance surface an operator compares against the paper, and pin the behaviour with a test that
-reproduces the undercount rather than hiding it. The exact byte figure is already conserved and exposed
-by `RailPlan`, which is what the transport actually moves, so nothing about the wire behaviour depends on
-the counter. The truncation is also unreachable for this model's payloads: every collective here carries
-bf16 elements, so `num_bytes` is always even.
-
-**Also recorded.** The spec defines neither an operator override for the rail devices nor an error for an
-unusable fabric; `SPARKFLASH_RAIL_DEVICES` and `CommError::FabricUnavailable` are additions (see D12).
-
-**Recorded limitation (M3 review, non-blocking).** `RailSelection` and `SelectedRail` carry public
-fields and derive `Deserialize`, so a caller that constructs one by hand - or deserialises one - can
-still present a colliding pair: the invariant lives in `RailSelection::resolve`, not in the type.
-Nothing in the tree consumes an untrusted selection today, so this is an API-shape hazard rather than
-a defect, and it is recorded here instead of being silently assumed. If a future caller ever accepts
-a selection from configuration or the network, either the fields must become private with
-`resolve`-only construction or the type must gain a `validate()` that its consumers call.
 
 ## D15 - Two dead trace features are deleted; the CUDA dependency selector stays
 
@@ -959,8 +864,8 @@ doc, and the "exact or named tolerance" rule lived only in the harness's printed
 
 **Consequence.** `crates/sparkflash-kernels/tests/determinism_contract.rs` carries
 `the_determinism_contract_is_written_down_and_the_harness_cites_it`, which reads this file and
-`crates/sparkflash-kernels/examples/m7_layer0.rs` and fails if a statement disappears or the harness
-stops citing a letter from its printed output; `crates/sparkflash-kernels/tests/mhc_determinism.rs`
+`crates/sparkflash-kernels/examples/m7_layer0/` (the split modules, concatenated after 954d7af) and
+fails if a statement disappears or the harness stops citing a letter from its printed output; `crates/sparkflash-kernels/tests/mhc_determinism.rs`
 pins the fixed-slot, binary64 tile combine (`kernels/mega_mhc_sm121.cu:197-222`) and the
 26-statistic buffer. The direct
 measurement is `m7_layer0 --stage 4 --repeat 100`, which compares raw bytes with no tolerance: that
@@ -1015,7 +920,7 @@ takes the released tensors:
   zero-bias equality test pins the bias-only path to the no-bias path (both still softmax-based), not
   the released path, which deliberately differs even at unit scale and zero base: this is a new path,
   not a redefinition of the old one.
-- `crates/sparkflash-kernels/examples/m7_layer0.rs` passes the raw released tensors (the bias in the
+- `crates/sparkflash-kernels/examples/m7_layer0/main.rs` passes the raw released tensors (the bias in the
   checkpoint's row order to the reference, which folds it itself, and the folded row order to the
   kernel), compares the coefficients raw (the harness-side softmax is gone), and checks `1/rms`
   against the released `X_hat` statistic.
@@ -1340,3 +1245,48 @@ number exists for this milestone. Phase 2 exit criterion 1
 criteria 2-5. Format 2 is reference-tested/CPU-pinned only (D24, !62 -> main d3dcc3f, pipeline
 2763); its device execution is the next Lead-sequenced step, and this fixture is what that run will
 be measured against.
+
+---
+
+## D26 - The Milestone-4 ABI source-text lint is frozen, and kernel invariants move to compiled artifacts or runtime device assertions
+
+Recorded 2026-10-18.
+
+**Context.** `crates/sparkflash-kernels/src/m4_abi.rs` is the Milestone-4 ABI lint: it re-derives
+geometry from `#define`s, re-parses `__global__` signatures, re-evaluates the kernels' static asserts
+in Rust and checks trace-scope wrapping by reading kernel source text. Its own module doc records the
+contract that makes its size a liability rather than a virtue: the scan is "explicitly NOT the proof",
+the committed cubin baseline is, and the review history recorded there reaches round 24, where every
+round was a real false accept or a real false rejection (round 24: a `return`, a control keyword or a
+non-returning call in the poll's own argument list was invisible to both checks). Each fix added
+another parser feature for a property a text scan cannot establish: that the compiled kernel is what
+the source appears to say. Measured 2026-10-18: 13,854 lines at main `2245a4e`, 13,874 with the
+freeze notice this entry records, and 13,893 after the `m7_layer0` split replaced the two
+`include_str!`s of the single example file with one concatenation constant (the split moved the
+pinned statements into per-stage modules; the pins scan the same text, concatenated).
+
+**Decision.** Freeze the file. (1) No new source-text scanner, parser or lint for a new kernel
+invariant is added to it. A new invariant is enforced by compiling the kernel and inspecting the
+artifact - `crates/sparkflash-kernels/scripts/check-kernel-baseline.sh` recompiles the Milestone-4
+kernels and compares cubin bytes, cubin sha256 and PTX `membar` line count against
+`crates/sparkflash-kernels/baseline/kernel_baseline.txt`, and the `cuda-abi` CI job runs it - or by a
+runtime device assertion in a harness (the `m7_layer0` device stages), where the shipped binary is
+what is measured. (2) Defects in the scanners already present are still fixed, with the mutation proof
+the module requires: the freeze is on growth, not on correctness. (3) The committed line count is
+pinned by `ci/check-m4-abi-size.sh` and enforced by the `m4-abi-freeze` job in `.gitlab-ci.yml`: any
+growth fails the pipeline, so a commit that changes the length must change `PINNED_LINES` in the same
+diff. That diff is the deliberate, reviewable act; a scanner cannot arrive as a side effect of an
+unrelated edit.
+
+**Consequence.** A proposed kernel invariant that can only be enforced by reading source text must
+instead become a compile-time assertion in the kernel or its header (compiled by the build-script nvcc
+probe and pinned by the cubin baseline), a PTX/SASS baseline delta, or a device assertion in a
+harness. A new parser feature in `m4_abi.rs` is now a policy exception that needs a new Lead
+decision, not a maintenance change. Nothing in this entry alters the kernels or the scanners'
+verdicts: the existing tests keep gating every pipeline.
+
+**Verification.** Notice plus a CI script, no behaviour change: `wc -l` on the file (13,893 lines),
+`sh ci/check-m4-abi-size.sh` prints the pin line and was run against a one-line growth (exit 1) and
+against the restored file (exit 0), and `cargo test -p sparkflash-kernels` continues to run the
+module's own tests, which this change does not edit. No GPU, no checkpoint and no cluster were
+involved.

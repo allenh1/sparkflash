@@ -1,4 +1,5 @@
-//! Offline readers and pure helpers shared by examples/m7_layer0.rs and the CPU tests in
+//! Offline readers and pure helpers shared by the m7_layer0 example (examples/m7_layer0/, split from
+//! one file by 954d7af) and the CPU tests in
 //! tests/b2_harness_offline.rs.
 //!
 //! The harness's checkpoint and v1-boundary readers, its released-router implementation and its

@@ -53,9 +53,18 @@ fn the_kernel_publishes_each_coefficient_group_from_its_own_statistics_rows() {
 #[test]
 fn the_harness_gives_the_reference_checkpoint_order_and_the_kernel_the_kernel_order() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let harness =
-        std::fs::read_to_string(root.join("crates/sparkflash-kernels/examples/m7_layer0.rs"))
-            .expect("the M7 harness must be readable from the crate");
+    let mut harness = String::new();
+    let mut modules: Vec<std::path::PathBuf> =
+        std::fs::read_dir(root.join("crates/sparkflash-kernels/examples/m7_layer0"))
+            .expect("the split M7 harness directory must be readable from the crate")
+            .map(|entry| entry.expect("a harness module must be readable").path())
+            .collect();
+    modules.sort();
+    for module in modules {
+        harness.push_str(
+            &std::fs::read_to_string(&module).expect("an M7 harness module must be readable"),
+        );
+    }
     // Every reference call site gets the checkpoint-order bias. The reference's h_of_with_scale
     // applies the bias in the released [pre, post, comb] group order after the released [24, n*d]
     // projection; handing it the kernel-row-order bias would apply the row permutation twice.

@@ -58,10 +58,16 @@ reader can see which precondition a future run skipped.
 
 - The four ranks are addressed as `192.0.2.80, .84, .68, .59` (crates/sparkflash-comm/tests/hardware_gates.rs:18).
 - Both rails share `192.0.2.0/24` and each node holds **two** addresses, one per rail; the head node
-  is `192.0.2.80` on rail 1 and `192.0.2.85` on rail 2 (docs/DECISIONS.md D12, line 238 entry).
-- The rail-2 addresses of the other three nodes are **not recorded anywhere in this tree**. A dual-rail
-  run needs them; recovering them is a precondition, not a detail (see 3.1, where one address for
-  `--nodes` drives both rails' probes).
+  is `192.0.2.80` on rail 1 and `192.0.2.85` on rail 2 (docs/DECISIONS.md D12).
+- Rail 1 / rail 2 address pairs for all four nodes, measured read-only on 2026-10-18 (Lead; this is a
+  configuration listing, not a gate): node0 `.80`/`.85`, node1 `.84`/`.88`, node2
+  `.64`/`.68`, node3 `.59`/`.63`. The full table, the ACTIVE f1 device names and the NCCL
+  environment of the deployed reference are in `docs/build/rdma-backend.md`. Recovering these was a
+  precondition; recording them is not the same as a dual-rail run, and no dual-rail gate has used
+  them yet (see 3.1, where one address for `--nodes` drives both rails' probes).
+- The deployed vLLM reference is **single-rail** (`NCCL_IB_HCA=rocep1s0f1`, read from the live
+  container on 2026-10-18), while our gates target the dual-rail aggregate. Do not compare a
+  single-rail reference number with the dual-rail bar (`docs/build/rdma-backend.md`, section 3).
 
 ### 2.2 Permission and an exclusive window
 
