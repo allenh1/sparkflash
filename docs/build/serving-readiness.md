@@ -1,14 +1,14 @@
 # Serving readiness: the device path to a real token
 
 Status: **docs-only readiness map. No code changed.** Verified against code main `8b3aef9`
-("!81 batch 2: !78 device M1 + !80 router delta fixes", 2026-10-18) and the device windows of
-2026-10-18 (including the b5 M2-session and b6 gate/up Lead windows); the branch is rebased onto
-main `79f45b3` (!85 cleanup batch 1: CLI serve fixes plus D30's routed-expert sharding decision).
-!85 changes no kernel, baseline or device-crate file; its D30 consequence (routed experts
-82.2 GB/rank padded to 640) is reflected in section 4. Every number below is tagged **measured**
-(a named device log printed it), **derived** (arithmetic shown here over figures that are measured or
-pinned), or **unverified** (no evidence this
-map can cite). A wrong number in this file is a blocker: correct or remove it rather than round it.
+("!81 batch 2: !78 device M1 + !80 router delta fixes", 2026-10-18), and updated to main `5898e23`
+(!88: M3-a host-only chain skeleton plus typed chain param builders; !87: gate/up guard and doc
+truth; !86: device M2 real session, routed gate/up kernel, and this map). The branch is rebased onto
+`5898e23`; D30's routed-expert sharding consequence (routed experts 82.2 GB/rank padded to 640) is
+reflected in section 4. Every number below is tagged **measured** (a named device log or in-repo doc
+printed it), **derived** (arithmetic shown here over figures that are measured or pinned), or
+**unverified** (no evidence this map can cite). A wrong number in this file is a blocker: correct or
+remove it rather than round it.
 
 Scope: **one** question — can the device path run a real 40-layer forward pass and produce tokens
 today, and if not, what exactly is missing? This is the question that decides whether the GB10
@@ -17,11 +17,12 @@ HTTP wiring, throughput) is out of scope except where it changes the answer; sec
 memory consequence that makes the single-node chain look different from a served deployment.
 
 Short answer: **no end-to-end device token exists.** The per-stage kernels are pinned, most are
-individually measured on 2026-10-18, but nothing wires them into a chain: the chain crate is the M1
-fake-session skeleton, the m8 harness that comes closest explicitly reports
-"device token NOT PRODUCED", and Phase 2 exit criterion 1 remains **OPEN**
-([device-forward-chain.md](device-forward-chain.md) section 4.3). Section 3 lists the remaining work
-in dependency order.
+individually measured on 2026-10-18, and the gate/up kernel and the M2 session are now on main, but
+no chain executes a device stage and no token exists: `sparkflash-device` has the M3-a host-only
+plan/ledger skeleton (`sparkflash device-chain --plan-only`, `chain_execution=false`, no device
+stage wired), the m8 harness that comes closest explicitly reports "device token NOT PRODUCED", and
+Phase 2 exit criterion 1 remains **OPEN** ([device-forward-chain.md](device-forward-chain.md) section
+4.3). Section 3 lists the remaining work in dependency order.
 
 Unit note: the measured device total is **124,610 MiB** `cuDeviceTotalMem_v2`
 ([device-path-design.md](device-path-design.md) section 9; [roadmap-to-serving.md](roadmap-to-serving.md)
@@ -55,7 +56,7 @@ has actually been executed on a GB10; "gap" is what separates the stage from a w
 | 5 | window-KV write and ring rotation | `copy_dtod` + ring layout helpers | **measured**: corrected m8 run (11,764 copies, 198,832,128 B, 0 mismatches) | chain wiring; device KV store is Phase 3 |
 | 6 | attention: CSA union format 2 (38 layers), window format 1 (layers 0-1) | `FLASH_MLA_CSA2` | **measured**: task-14 format 2, m8 dispatch, stage-2 formats 0/1 | chain wiring; builder is on main |
 | 7 | MoE router | `MOE_ROUTER` | **measured**: two m9 runs, 7/7 checks each | chain wiring only |
-| 8 | routed expert gate/up (w1/w3) + SwiGLU + activation quantiser | **none on main; measured on the unmerged gate/up branch** | host seam on main; the branch's gate/up projection is Lead-window bit-exact (30,720/30,720 and 499,200/499,200), with no routing weight/SwiGLU/combine/shared expert; SwiGLU quantiser kernel probed, never trusted | **kernel missing on main**; seam `moe_gate_up` |
+| 8 | routed expert gate/up (w1/w3) + SwiGLU + activation quantiser | `ROUTED_GATE_UP` (merged, !86) | **measured** gate/up projection: window b6, 30,720/30,720 and 499,200/499,200 bf16 exact, padding 0, deterministic; typed builder merged, **not wired**; SwiGLU quantiser kernel probed, never trusted | gate/up chain wiring; routing weight, SwiGLU/combine and shared expert still host |
 | 9 | routed down/combine | `MXFP4_MOE` | **measured**: slice 40,960/40,960 and 163,840/163,840 exact; stage 3 PASS; chained 7/9 | chain wiring only |
 | 10 | shared expert | `MXFP8_DENSE` (gate/up, down) + host SwiGLU/quantiser | **measured as GEMM**: stage-8 probe bit-exact; stage-9 K13-K15 device GEMMs with host activation | chain wiring; fused kernel optional |
 | 11 | FFN epilogue: routed-weighted sum, shared add | routed sum inside `MXFP4_MOE`; shared add host | **measured** only in host references / harness combine | no device epilogue kernel; see the seam-name gap in 2.11 |
@@ -76,16 +77,16 @@ device evidence either.
 
 ## 2. Stage detail: pins, harnesses, measurements, APIs, gaps
 
-Kernel pins are in `crates/sparkflash-kernels/baseline/kernel_baseline.txt:11-18` (eight entries,
+Kernel pins are in `crates/sparkflash-kernels/baseline/kernel_baseline.txt:11-19` (nine entries,
 nvcc release V13.0.88, arch sm_121a). The six Milestone-4 kernels are the six-entry
 `m4_abi::KERNELS` array (`crates/sparkflash-kernels/src/m4_abi.rs:867`; constants at `:854, :856,
-:858, :860, :862, :864`), and `m4_abi` is frozen by D26 (`docs/DECISIONS.md`), so the router and
-SwiGLU kernels are pinned outside that array (router ABI: `crates/sparkflash-kernels/src/router_abi.rs`;
-SwiGLU: `kernels/swiglu_mxfp8_quant_sm121.cu:1-14`). The driver enum has seven variants
-(`cuda_driver.rs:156-170`), one raw loader and launch path
-(`Cuda::load_kernel` `:401`, `Cuda::launch` `:436`, `launch_repeated` `:481`); only two stages
-have a **typed** launcher today (attention and router; see 2.6/2.7). Everything else is launched
-through parameter-word arrays built by the m7 harness.
+:858, :860, :862, :864`), and `m4_abi` is frozen by D26 (`docs/DECISIONS.md`), so the router, SwiGLU
+and gate/up kernels are pinned outside that array (router ABI: `crates/sparkflash-kernels/src/router_abi.rs`;
+SwiGLU: `kernels/swiglu_mxfp8_quant_sm121.cu:1-14`; gate/up: `routed_gate_up_abi.rs`). The driver
+enum has eight variants (`cuda_driver.rs:157-173`), one raw loader and launch path
+(`Cuda::load_kernel` `:527`, `Cuda::launch` `:562`, `launch_repeated` `:607`); typed launchers
+exist for attention and router (2.6/2.7), and `!88` added typed param builders for mHC, dense, wo_a,
+MXFP4 down/combine, LM head and routed gate/up (`*_launch.rs`), none of them wired into a chain yet.
 
 `mega_mhc_sm121` is the baseline manifest key; the cubin entry the driver and the harness use is
 `mega_mhc_fused_bf16_sm121` (`cuda_driver.rs:177`). Both names denote the same 70,312 B cubin
@@ -254,34 +255,30 @@ norm+RoPE kernel missing (Phase 3); host seam otherwise.
 
 ### 2.8 routed expert gate/up, SwiGLU and the activation quantiser (row stage 8)
 
-**There is no device kernel for this stage on main, and the chain cannot call one.**
-`kernels/b12x_mxfp4_moe_sm121.cu:33-36` says it explicitly: the file is the down/combine
-projection, and "the up/gate projections that produce the activation are the same MXFP4 GEMM and are
-not duplicated here". Stage 3 says the same in its own output
-(`stage3.rs:251`): the gate/up projections, SwiGLU and the activation quantiser are host arithmetic
-"because no device kernel in the six-cubin set reduces K=5120 with packed FP4 weights". The roadmap
-names it as the Phase-3 gap ([roadmap-to-serving.md](roadmap-to-serving.md) section 4.3 seam table,
-rows "gate/up (w1/w3) GEMM" and "SwiGLU and the activation quantiser").
+**The gate/up kernel is merged on main (`routed_gate_up_sm121`, !86), but the chain does not call
+it yet.** `kernels/b12x_mxfp4_moe_sm121.cu:33-36` says the file is the down/combine projection, and
+"the up/gate projections that produce the activation are the same MXFP4 GEMM and are not duplicated
+here". Stage 3 said the same before the merge (`stage3.rs:251`): gate/up, SwiGLU and the activation
+quantiser were host arithmetic "because no device kernel in the six-cubin set reduces K=5120 with
+packed FP4 weights". The roadmap named it as the Phase-3 gap
+([roadmap-to-serving.md](roadmap-to-serving.md) section 4.3 seam table, rows "gate/up (w1/w3) GEMM"
+and "SwiGLU and the activation quantiser").
 
-Verification performed for this map: on main, `ls kernels/*.cu` shows nine files — the eight
-baseline kernels plus `rocenante_oneshot_sm121.cu` (a RoCE probe, not a model kernel). None is a
-K=5120 routed gate/up GEMM. The driver enum on main has no such variant: `KernelId` has exactly
-seven variants (`cuda_driver.rs:156-170`), and a grep finds only reference helpers
-(`gate_up_rows`, `mxfp4_ref`), not a cubin entry. [phase3-router.md](phase3-router.md) section 6
-says "Iteration B (the K = 5120 routed-expert gate/up FP4 GEMM) is a separate MR, not this one".
-
-**The draft exists, unmerged, on `origin/task/phase3-gate-up` (head `fc97f64`, rebased from the
-measured `bb09bf3`; Rust/.cu byte-identical):** that branch adds
-`kernels/routed_gate_up_sm121.cu`, the typed `routed_gate_up_launch.rs` (with
-`routed_gate_up_abi.rs` and `routed_gate_up_ref.rs`), the harness `examples/m10_gate_up.rs`, the
-doc `docs/build/phase3-gate-up.md`, and a baseline entry
+**On main since !86:** `kernels/routed_gate_up_sm121.cu`, the typed `routed_gate_up_launch.rs`
+(`GateUpLaunchParams` and its launcher; ABI in `routed_gate_up_abi.rs`, twin in
+`routed_gate_up_ref.rs`), the harness `examples/m10_gate_up.rs`, the doc
+[phase3-gate-up.md](phase3-gate-up.md), and the baseline entry
 `routed_gate_up_sm121 cubin_bytes=9752 cubin_sha256=115200d26c3404b7169c476e350f5575dadc3fec9e8b0ec97113cd297fa6c1af`.
-Its doc says the kernel computes **one** projection (w1 or w3) of one routed-expert slice per
-launch — 576 real columns per rank padded to 640, D30's layout — and ends at BF16 rows, leaving
-SwiGLU and the quantiser in the host chain / `swiglu_mxfp8_quant_sm121`.
+`KernelId` now has eight variants including `RoutedGateUp` (`cuda_driver.rs:173`), and
+`sparkflash-device/src/cubins.rs` requires the pin as one of the eight chain kernels (`:34`,
+`:39`). The chain's stage map labels it `DeviceMeasuredNotWired` (`chain.rs:366`, `:477`): the
+kernel computes **one** projection (w1 or w3) of one routed-expert slice per launch — 576 real
+columns per rank padded to 640, D30's layout — and ends at BF16 rows, leaving SwiGLU and the
+quantiser in the host chain / `swiglu_mxfp8_quant_sm121`.
 
-**Measured (Lead window, 2026-10-18T20:22:35Z; node-only logs, not in this repository):** binary
-`m10_gate_up_bb12c547_aarch64`, sha256
+**Measured (window b6, 2026-10-18T20:22:35Z; in-repo record: [phase3-gate-up.md](phase3-gate-up.md)
+section 5; node-only logs: `window-b6-20261018T202235Z.log`, `runs6/m10-tokens8.log`,
+`runs6/m10-tokens130.log`):** binary `m10_gate_up_bb12c547_aarch64`, sha256
 `bb12c547aed5f6a1a17c753db60c4330b41da4190ea62564d8e0155f1b9755b8`, 4,557,008 B, cubin 9,752 B /
 `115200d26c...af`; vLLM was stopped on all four nodes for the run and restarted afterwards.
 `--tokens 8`: device gate **30,720/30,720** bf16 exact against the CPU twin and up
@@ -294,22 +291,21 @@ p50 **30.1708 ms** (0.2321 ms/token), up p50 **30.2761 ms** (0.2329 ms/token). C
 attempt (binary `dd9921a4` from `0ff78fe`) panicked in the harness before the device path at 8
 tokens (`m10_gate_up.rs:221`: 30,720 vs 27,648), recorded in window b4; it produced no device
 numbers. This is a gate/up arithmetic measurement only: the **routing weight, SwiGLU, combine,
-shared expert, end-to-end MoE and any host-time saving are not measured or claimed**. Nothing of the
-branch is merged into main, so "no device kernel on main" stands.
+shared expert, end-to-end MoE and any host-time saving are not measured or claimed**.
 
-The seventh baseline kernel `swiglu_mxfp8_quant_sm121` (21,776 B, sha256
+The SwiGLU baseline kernel `swiglu_mxfp8_quant_sm121` (21,776 B, sha256
 `4dbef63bb07808f92fb6e61bdcb9aec53cb6afd8f28d6744aea3185759c1862e`, `kernel_baseline.txt:17`) is
 the SwiGLU + MX-quantise epilogue, and it is *probed* bit-exactly against `swiglu_ref` in stage 8
 (4x640: 2,560/2,560 codes + 80/80 scales; 2x2304: 4,608/4,608 + 144/144,
 `phase1-boundary-table.md:628`), but **the chain does not launch it**; it stays outside
-`m4_abi::KERNELS` (D26) and is not a device stage of any measured run. On main the gate/up GEMM
-that produces the activation still does not exist; the unmerged branch's measured kernel above is
-that GEMM, so the remaining device gap is the surrounding MoE math, not the projection itself.
+`m4_abi::KERNELS` (D26) and is not a device stage of any measured run. The gate/up GEMM now exists
+on main and is measured in isolation; the remaining FFN device gap is its chain wiring plus the
+surrounding MoE math, not the projection itself.
 
-**Gap:** the kernel is missing on main; the unmerged branch now measures the gate/up GEMM
-bit-exactly, but a device FFN claim still needs it merged plus the routing weight, SwiGLU/quantiser,
-combine and shared expert on device, and the chain wired. Until then the first chain's FFN stage is
-a labelled **hybrid** host seam `moe_gate_up`.
+**Gap:** the gate/up kernel is merged and measured in isolation but **not wired into the chain**; a
+device FFN claim still needs it wired plus the routing weight, SwiGLU/quantiser, combine and shared
+expert on device. Until then the first chain's FFN stage is a labelled **hybrid** host seam
+`moe_gate_up`.
 
 ### 2.9 routed down/combine (row stage 9)
 
@@ -460,18 +456,19 @@ run against the checkpoint ([roadmap-to-serving.md](roadmap-to-serving.md) secti
   `FakeSession` that records calls and produces no device result; it opens no driver, loads no
   cubin, allocates no device buffer, reads no checkpoint or cluster, and delegates `generate` to the
   reference engine (`crates/sparkflash-device/src/lib.rs:1-24`, `engine.rs:1-17`, `session.rs:1-9`;
-  cli flag `crates/sparkflash-cli/src/serve.rs:157/:345`). Its four offline tests run without CUDA
-  (`crates/sparkflash-device/tests/engine_offline.rs`), and its only dependencies are
-  `sparkflash-api` and `futures` — no kernel or driver link. The capability report says
-  `vision: false, fake_session: true`, and the cli default is `reference`.
-- **M2 exists only on an unmerged branch, and the Lead has now executed it once.**
-  `origin/task/device-engine-m2` (head `fab693c`, rebased from the measured `11ad400`) re-scopes
-  the milestones and implements a **real session**: it opens the CUDA driver, loads the pinned
-  `moe_router_sm121` cubin (37,384 B, `5992cef9...`, checked before the driver), runs **exactly
-  one** router launch through the same `DeviceSession` seam on a worker thread, reads
+  cli flag `crates/sparkflash-cli/src/serve.rs:164/:269`). Its four offline tests run without CUDA
+  (`crates/sparkflash-device/tests/engine_offline.rs`); the engine path depends only on
+  `sparkflash-api` and `futures`, while the crate as a whole now also carries the host-only chain
+  dependencies (`sparkflash-engine`, `sparkflash-kernels`, `sparkflash-kv`) with nothing linking
+  libcuda (`crates/sparkflash-device/Cargo.toml:19-25`), so a CPU-only build still opens no driver.
+  The capability report says `vision: false, fake_session: true`, and the cli default is `reference`.
+- **M2 is merged on main (`!86`), and the Lead has executed it once.** `sparkflash-device`
+  opens the CUDA driver behind the `cuda` feature and `--engine device --device-cubin PATH`, loads
+  the pinned `moe_router_sm121` cubin (37,384 B, `5992cef9...`, checked before the driver), runs
+  **exactly one** router launch through the same `DeviceSession` seam on a worker thread, reads
   ids/weights/scores back, and derives `device_execution: true` while `chain_execution` stays
-  `false`. That branch's design doc renames the old M2 chain skeleton to **M3** and the old M3 full
-  run to **M4**. Lead window b5 (2026-10-18T20:09:55Z; node-only logs) executed it: binary
+  `false` (measured build `11ad400`; the branch head before merge was `fab693c`). Lead window b5
+  (2026-10-18T20:09:55Z; node-only logs) executed it: binary
   `sparkflash_m2_11ad400_aarch64` sha256
   `bb06520a8e414e98314c570d48e2da07f75bfa571b2644f4746a297093d8dbb5`, 41,264,704 B; device 0
   NVIDIA GB10 (total 124,610 MiB); report line `fake_session=false, device_execution=true,
@@ -479,12 +476,9 @@ run against the checkpoint ([roadmap-to-serving.md](roadmap-to-serving.md) secti
   tokens=8, outputs_sha256=889671ba4b1fc5ab92fb8a1e87a0a43df40dd47e22f036914eccc93ee42191d6`,
   then listening; the M1 fake-session negative control in the same window printed
   `fake_session=true, device_execution=false, chain=false, vision=false` and launched nothing. This
-  is an execution proof only: no token, no logits, no chain. None of it is merged: on main
-  `chain.rs` and `window.rs` do not exist (the crate contains only `lib.rs`, `engine.rs`,
-  `session.rs`), it does not depend on `sparkflash-kernels`, and there is no weight staging, window
-  ring, boundary capture, seam ledger instance or token path. This map uses the branch's names for
-  the remaining work (M3 chain skeleton, M4 full run) and says where main's doc still uses the older
-  M2/M3 labels.
+  is an execution proof only: no token, no logits, no chain. The design doc's re-scope (section 7)
+  is now main's: M2 is this session proof, the chain skeleton is **M3** (split M3-a..d), the full
+  run is **M4**.
 
 ### 3.2 The honest status of the "40-layer forward pass producing tokens"
 
@@ -502,12 +496,13 @@ No such run exists. The closest measured artifacts are:
    forward chain not wired in this iteration", with the final status "the model forward is NOT
    wired, so NO token and NO logits delta was produced" and "Phase 2 exit criterion 1 remains OPEN"
    (`runs2/m8-sequence-report.txt`, quoted verbatim).
-3. **The M2 real-session execution proof** (2026-10-18T20:09:55Z, window b5, Lead-window): one
-   pinned `moe_router_sm121` launch through the device session (`launches=1`, `tokens=8`,
-   `device_execution=true`, `chain=false`), with the M1 fake-session negative control in the same
-   window registering no launch. It is an execution proof, not a forward chain and not a token.
-4. **Per-stage measurements** (router, gate/up on the unmerged branch, head, attention, down/combine,
-   mHC) — each real, none of them a chain.
+3. **The M2 real-session execution proof** (merged on main since `!86`; 2026-10-18T20:09:55Z,
+   window b5, Lead-window): one pinned `moe_router_sm121` launch through the device session
+   (`launches=1`, `tokens=8`, `device_execution=true`, `chain=false`), with the M1 fake-session
+   negative control in the same window registering no launch. It is an execution proof, not a
+   forward chain and not a token.
+4. **Per-stage measurements** (router, gate/up merged and measured in isolation, head, attention,
+   down/combine, mHC) — each real, none of them a chain.
 
 So the answer to the one question is: **the pieces are measured; the forward pass is not wired; no
 token has been produced by the device path; criterion 1 is OPEN.**
@@ -518,64 +513,78 @@ fixture that is the only truth (D25); logits are compared at position 129 only a
 boundary capture (D7) ([device-forward-chain.md](device-forward-chain.md) sections 4.1 and 4.3). None
 of those nine tokens has a device-produced counterpart yet.
 
-### 3.3 Ordered work, M1/M2 and the chain (M3/M4 in the M2 branch's re-scope)
+### 3.3 Ordered work, M1/M2 and the chain (M3/M4)
 
 The design's milestone split ([device-forward-chain.md](device-forward-chain.md) section 7) is the
-right frame. Main's doc still labels the chain skeleton M2 and the full run M3; the unmerged
-`origin/task/device-engine-m2` branch re-scopes M2 to the session/launch proof just described and
-renames the chain work **M3** and the full run **M4**. The ordering below uses the branch's names,
-respects data dependencies, and separates what is already on main.
+right frame and now matches main: M1 (`!78`) and M2 (`!86`) are merged, and M3 is split into M3-a
+(merged on main, `!88`, host-only) and M3-b/c/d, with the full 130 + 8 run as M4. The ordering
+below respects data dependencies and separates what is already on main.
 
-**M3-a — chain skeleton plumbing (no token yet).**
-1. Add the kernel/fixture dependencies to `sparkflash-device` and the chain files `chain.rs`
-   (per-layer graph and seam ledger) and `window.rs` (ring layout/rotation) per design 7 (main's doc
-   calls them the M2 files; in the branch's re-scope this is M3).
-2. Load the driver and the six chain cubins (plus the router cubin if the device router is used),
-   verifying cubin sha256 and size against
-   `kernel_baseline.txt` before any launch (the m7 harness already does this; the device crate
-   currently does none of it).
-3. Add typed param builders for the five stages that lack them (mHC, dense, wo_a, MXFP4 down/combine,
-   head); only attention (`FlashMlaParams`/`launch_flash_mla`) and router
-   (`RouterLaunchParams`/launch) are typed today. Each builder must be ABI-pinned like the router's.
+**M3-a — chain skeleton (merged on main, `!88`; host-only, no device execution, no token).**
+1. `chain.rs` derives the 130 + 8 CED schedule (5,162 prefill + 320 decode = 5,482 token-layer
+   executions, cross-checked against `SequencePlan::ced`), fixes the 40-layer stage map (gate/up and
+   the router labelled `DeviceMeasuredNotWired`), builds the planned seam set and the plan-vs-ledger
+   self-check (fails on a missing **and** an unplanned seam), and runs through a `ChainOps` backend
+   with `chain_execution = false`.
+2. `window.rs` accounts the 128-slot rings (67,584 B each, 2,703,360 B for 40 layers) and
+   round-trips the oldest-first view; `cubins.rs` parses the nine baseline pins, requires the eight
+   chain pins (the six chain kernels plus router and routed gate/up) and verifies size and SHA-256
+   fail-closed.
+3. `sparkflash device-chain --plan-only` prints the schedule, stage map, planned seam counts, the
+   plan-only label verbatim and the design 4.3 labels explicitly prefixed "label reserved for a
+   later stage:", then exits 2 refusing to serve
+   (`crates/sparkflash-cli/src/device_chain.rs:23-29`); the contract tests are
+   `crates/sparkflash-device/tests/chain_contract.rs`.
+4. The typed chain param builders are on main for mHC, dense, wo_a, MXFP4 down/combine, LM head and
+   routed gate/up (`mega_mhc_launch.rs`, `mxfp8_dense_launch.rs`, `mxfp8_wo_a_launch.rs`,
+   `mxfp4_moe_launch.rs`, `cert_lm_head_launch.rs`, `routed_gate_up_launch.rs`); they are
+   ABI-pinned but **not wired into a chain**, matching the stage map's measured-but-not-wired labels.
+5. The masked comparator is host code in `sparkflash-engine` (`sequence_fixture.rs`:
+   `DeviceStep`, `compare_steps`, `CertifiedMask`); it is the Phase-2 comparison path, not a
+   chain execution.
+
+Criterion 1 stays **OPEN**: M3-a prints a plan, opens no driver, launches nothing and produces no
+token or logits.
 
 **M3-b — weight staging and budget admission.**
-4. Stage the dense, mHC, shared-expert, head and embedding weights through `WeightSource`
+6. Stage the dense, mHC, shared-expert, head and embedding weights through `WeightSource`
    (`embed.weight` is 1.324 GB bf16, section 4); stream routed experts per layer (no data path
    exists; section 4 shows why all-resident is impossible).
-5. Admit the device budget before allocating (the m8 plumbing run's 9,926,144 B across 176 buffers
+7. Admit the device budget before allocating (the m8 plumbing run's 9,926,144 B across 176 buffers
    is a lower bound with no weights and no head; design 5: `device-forward-chain.md:369-370`;
    the slice's per-run tallies are in `device-path-design.md` section 11).
-6. Handle the paged Engram source for layers 1 and 14 (the engine's own `engram_forward` is the
+8. Handle the paged Engram source for layers 1 and 14 (the engine's own `engram_forward` is the
    measured reference, but the packer has never run against the checkpoint).
 
 **M3-c — first hybrid token (the first real end-to-end run).**
-7. Implement the per-layer order of design 2.2 with the seams of design 3.1, using the existing
-   builders (`Format2AttentionCall`, `WindowRingLayout`/`rotate_window_ring`) and the new typed
-   builders. The FFN stage is **hybrid** (host gate/up + host SwiGLU/quantiser over device
-   down/combine) unless the unmerged gate/up branch merges and is wired first; in either case the
+9. Implement the per-layer order of design 2.2 with the seams of design 3.1, using the existing
+   builders (`Format2AttentionCall`, `WindowRingLayout`/`rotate_window_ring`), the typed chain
+   builders from M3-a and the routed gate/up builder. The FFN stage is **hybrid** (host gate/up +
+   host SwiGLU/quantiser over device down/combine) unless gate/up is wired first; in either case the
    routing weight, SwiGLU/quantiser and shared expert stay host for the first token. The seam ledger
    records every seam, prints before comparisons and fails its self-check on a missing/unplanned
    seam.
-8. Run the token path as the design allows for a hybrid first run: host `final_norm`, head screening,
-   host block reduction + `best_entry` argmax. The report must say "hybrid: token produced by host
-   math over device logits"; per design 3.2 that run cannot claim Phase 3 exit criteria and cannot
-   claim the Phase 2 token row as device evidence.
-9. Settle the epilogue seam (2.11) before this run: either a named host seam with a removal plan or a
-   device epilogue. Do not let the shared add be unledgered.
+10. Run the token path as the design allows for a hybrid first run: host `final_norm`, head screening,
+    host block reduction + `best_entry` argmax. The report must say "hybrid: token produced by host
+    math over device logits"; per design 3.2 that run cannot claim Phase 3 exit criteria and cannot
+    claim the Phase 2 token row as device evidence.
+11. Settle the epilogue seam (2.11) before this run: either a named host seam with a removal plan or a
+    device epilogue. Do not let the shared add be unledgered.
 
 **M3-d — boundary capture and the Phase-2 comparison harness.**
-10. Capture the 18 boundary tensors per row at position 129 only, and compare tokens 130..=137 exactly
+12. Capture the 18 boundary tensors per row at position 129 only, and compare tokens 130..=137 exactly
     against the fixture (D7; the fixture is the only truth, D25). Reuse `BoundaryStage` and the
-    pre-registered bars; the m7 stage 7/9 harness already exercises the comparison path.
+    pre-registered bars; the masked comparator from M3-a and the m7 stage 7/9 harness exercise the
+    comparison path.
 
 **M4 — the full 130 + 8 run and criterion 1.**
-11. Run the full prefill+decode schedule and write the report artifacts; criterion 1's PASS definition
+13. Run the full prefill+decode schedule and write the report artifacts; criterion 1's PASS definition
     is design 4.3. The run may only be called passing as the hybrid claim described there (host FFN
     seams labelled, token path labelled hybrid, head labelled NOT YET DEVICE-EXECUTED AS A PRUNING
     PATH), and Phase 3 claims require removing the class-(b) host seams (final norm, argmax) — which
-    need kernels (2.12/2.14) — plus the gate/up kernel for a device FFN claim (2.8; the draft is
-    unmerged on `origin/task/phase3-gate-up`, now with Lead-window gate/up numbers, but the routing
-    weight, SwiGLU, combine and shared expert are still unmeasured on device and unwired).
+    need kernels (2.12/2.14) — plus wiring the merged gate/up kernel for a device FFN claim (2.8:
+    kernel and typed builder are on main, but it is not wired, and the routing weight, SwiGLU,
+    combine and shared expert are still unmeasured on device).
 
 **Beyond criterion 1 (serving replacement of vLLM).** Even M4 (the full 130 + 8 run) runs one sequence
 on one node. Serving
@@ -586,7 +595,7 @@ token, not part of it.
 
 ### 3.4 Missing kernels, in dependency order for a *device* (non-hybrid) claim
 
-1. Routed gate/up K = 5120 FP4 GEMM (blocks the device FFN stage; the largest gap, 2.8).
+1. Routed gate/up chain wiring (the kernel is merged and measured; blocks the device FFN stage, 2.8).
 2. Final-norm kernel (blocks a device token path, class (b)).
 3. Head block-reduction / greedy-argmax kernel (blocks a device token path, class (b)).
 4. Embedding gather kernel (input side; host seam is allowed for a hybrid run).
@@ -640,7 +649,7 @@ Engram cache (derived: 130.66 − 87.63 = 43.03; roadmap section 7.5, D30). Cave
 stand: usable device memory is below `cuDeviceTotalMem_v2` and the driver/context overhead is
 unmeasured; the Engram packer has never been run against the checkpoint.
 
-For **one-node chain work** (M3/M4 in the M2 branch's re-scope) the reference 4-rank sharding is not
+For **one-node chain work** (M3/M4 as re-scoped on main) the reference 4-rank sharding is not
 available (the chain is single-node and does not shard experts), so the working set has to be built
 from whole-model components: dense
 attention 5.07 GB + replicated 3.43 GB + head 1.324 GB + embedding 1.324 GB = **≈11.15 GB** (derived,
@@ -698,13 +707,15 @@ rows with unpadded release bytes are 18.37 / 12.35 / 11.30 GB.
 
 - main `8b3aef9` = "!81 batch 2: !78 device M1 + !80 router delta fixes" (the code tree this map
   was verified against). Main has since advanced through docs-only facts (`e19c933`, !79: D29, D25's
-  18:32Z numbers) and `79f45b3` (!85 cleanup batch 1: CLI `serve` checkpoint fixes plus D30's
-  routed-expert sharding); neither changes a kernel, baseline or device-crate file. Chain APIs on
-  main from `1ceeb54` (!63): `Format2AttentionCall`,
-  `SeamKind/Record/Ledger`, `BoundaryStage`.
-- Design and contracts: [device-forward-chain.md](device-forward-chain.md) (M1/M2/M3 at section 7 on
-  main; the unmerged M2 branch re-scopes to M1/M2/M3/M4; head contract 4.2; criterion-1 definition
-  4.3; seam set 3.1), [device-path-design.md](device-path-design.md),
+  18:32Z numbers), `79f45b3` (!85 cleanup batch 1 plus D30), and the device-path merges `5898e23`
+  (!88: M3-a host-only chain skeleton and typed chain builders; !87: gate/up guard and doc truth;
+  !86: M2 real session, routed gate/up kernel and this map). M1 is `!78`/`!81`; the M2 session is
+  `!86`. Chain APIs on main from `1ceeb54` (!63): `Format2AttentionCall`,
+  `SeamKind/Record/Ledger`, `BoundaryStage`; the M3-a plan types (`ChainSchedule`,
+  `ChainSeamPlan`, `ChainOps`, `WindowAccounting`) are in `sparkflash-device` from `!88`.
+- Design and contracts: [device-forward-chain.md](device-forward-chain.md) (M1, M2 and the M3/M4
+  re-scope at section 7 on main; head contract 4.2; criterion-1 definition 4.3; seam set 3.1),
+  [device-path-design.md](device-path-design.md), [phase3-gate-up.md](phase3-gate-up.md),
   [roadmap-to-serving.md](roadmap-to-serving.md) (sections 4.3, 4.6, 7.5), [phase1-boundary-table.md](phase1-boundary-table.md),
   [phase3-router.md](phase3-router.md), [phase3-indexer.md](phase3-indexer.md),
   [task14-union-attention-case.md](task14-union-attention-case.md), [../DECISIONS.md](../DECISIONS.md)
@@ -726,13 +737,13 @@ repository or the evidence tree on this host.
 | router b2 window | **in-repo:** [phase3-router.md](phase3-router.md) section 5; **node-only:** `window-b2-20261018T183240Z.log`; `runs2/m9-router-tokens8.log`, `runs2/m9-router-tokens130.log` | binary `8f32174e...`, cubin `5992cef9...`; 48/48 and 780/780 ids exact; ULP/bit counts; p50 6.8530/6.8541 ms; 4,028,288 B buffers |
 | router b3 window | **Lead-reported only** (node: `window-b3-...`, `runs3/m9-d14306c-tokens{8,130}.log`; not in this repo or evidence tree) | same ids/ULP counts; p50 6.8528/6.8534 ms; 5,470,816 B buffers at 130 tokens |
 | stage-1 retry | **in-repo:** [phase3-indexer.md](phase3-indexer.md) section 5; **node-only:** `window-stage1-20261018T174723Z.log`; `runs/d-stage1-layer0-retry.log` | stage 1 PASS 4/4 tokens every boundary with the renamed pinned cubin `e21293e3...` |
-| gate/up b6 window | **Lead-reported only** (node: `window-b6-20261018T202235Z.log`; `runs6/m10-tokens8.log`, `runs6/m10-tokens130.log`; not in this repo or evidence tree) | binary `bb12c547...`, 4,557,008 B; gate/up 30,720/30,720 and 499,200/499,200 exact; padding 0; determinism byte-identical; p50 1.2734/1.2741 ms (tokens 8) and 30.1708/30.2761 ms (tokens 130); control gap 3.977737e-2/3.599775e-2 |
-| M2 session b5 window | **Lead-reported only** (node: `window-b5-20261018T200757Z.log`; `runs5/m2-real.log`, `runs5/m2-fake.log`; not in this repo or evidence tree) | binary `bb06520a...`, 41,264,704 B; one router launch, `fake_session=false`, `device_execution=true`, `chain=false`, `launches=1`, `tokens=8`, outputs sha256 `889671ba...`; M1 fake-session negative control in the same window |
+| gate/up b6 window | **in-repo:** [phase3-gate-up.md](phase3-gate-up.md) section 5; **node-only:** `window-b6-20261018T202235Z.log`; `runs6/m10-tokens8.log`, `runs6/m10-tokens130.log` | binary `bb12c547...`, 4,557,008 B; gate/up 30,720/30,720 and 499,200/499,200 exact; padding 0; determinism byte-identical; p50 1.2734/1.2741 ms (tokens 8) and 30.1708/30.2761 ms (tokens 130); control gap 3.977737e-2/3.599775e-2 |
+| M2 session b5 window | **Lead-reported only** (code on main since `!86`; node: `window-b5-20261018T200757Z.log`; `runs5/m2-real.log`, `runs5/m2-fake.log`; not in this repo or evidence tree) | binary `bb06520a...`, 41,264,704 B; one router launch, `fake_session=false`, `device_execution=true`, `chain=false`, `launches=1`, `tokens=8`, outputs sha256 `889671ba...`; M1 fake-session negative control in the same window |
 | task-14 union check | this evidence tree: `/home/user/phase2-evidence/task14/run-task14.log`; `union-attention-report.json` | format 2 pass=true at layers 21/30/39; format 1 misses by ~1.8-2.2 |
 | chained 40-row column | this host: `/home/user/phase1-evidence/phase1-c-stage9-40rows-harness5b-20261018T050416Z.log` (572,420 B, sha256 `bd0f908e...`); device pair `stage9-out-r5b/device.{manifest,blob}` (shas `6093c74b...`/`fecd813b...`) | 40 rows × 2 runs, 763 launches/run, 298.6 s, bit-identical; Phase-1 aggregate 306 under / 414 over bar |
 | B2 chained replay | this host: `/home/user/phase1-evidence/phase1-b2-stage7-layer0-rereview5-20261018T044122Z.log` (23,897 B, sha256 `c2de544c...`) | 20 launches (16 chain + 4 forced-routing control), UTC 04:41:22Z |
 | head | this host: `/home/user/phase1-evidence/stage5-device-run-timed.log`, `stage5-device-final.log` | 4 launches (one per rank), 129,280 exact, 0 certified, argmax 5, 1.56 s incl. 1.32 GB upload |
-| window-cubin set | **node-only:** nine files = eight baseline cubins + the renamed mHC copy, all matching `kernel_baseline.txt:11-18` when checked; **this evidence tree has seven** (`cubins/`: no `moe_router`, no renamed `mega_mhc_fused` copy) | pin check |
+| window-cubin set | **node-only:** ten files = the nine baseline cubins plus the legacy `mega_mhc_sm121` copy, all matching `kernel_baseline.txt` when checked; **this evidence tree has seven** (`cubins/`: no `moe_router`, no `routed_gate_up`, no `mega_mhc_fused` copy) | pin check |
 
 The b4 first gate/up attempt (`dd9921a4` from `0ff78fe`) panicked at `m10_gate_up.rs:221`
 (30,720 vs 27,648) and produced no numbers; b6 is the completed gate/up window with both shapes.
@@ -744,12 +755,9 @@ and is not cited.
 ### 5.3 Corrections to earlier text (read this before citing the older docs)
 
 - `device-forward-chain.md` section 2.1 says "the corrected device path has not run". That is **still
-  true for the 40-layer chain**; only its parenthetical claim that the corrected m8 binary itself has
-  not run is stale — the m8 plumbing binary ran at 2026-10-18T18:32Z (2.5/2.6), while the chain is
-  still not wired. Section 2.2 says the baseline has seven entries and the chain launches six
-  kernels: the six-kernel statement is **still true** (the chain launches the same six; the router is
-  a seam, not one of them), and only "seven entries" is stale — the baseline has **eight** since the
-  router was added. Fix the parenthetical and the entry count, not the two true statements.
+  true for the 40-layer chain** (the m8 plumbing binary ran at 2026-10-18T18:32Z, but no chain is
+  wired); section 2.2 on main already records the baseline's nine entries and that gate/up is merged
+  but not wired, so those earlier corrections are now in the doc of record rather than this list.
 - `kernels/flash_mla_csa2_sm121.cu:53-58` says format 2 was never executed on a device; task-14 and
   the m8 dispatch supersede it (2.6).
 - `kernels/cert_lm_head_sm121.cu:31-38` says "never executed"; four launches are recorded (2.13).
@@ -758,9 +766,9 @@ and is not cited.
   `8f32174e` from `15b86d0`, p50 6.8530/6.8541 ms). A later b3 window (binary `a3ba20e4`) repeated
   the ids and ULP counts with p50 6.8528/6.8534 ms, but its logs are Lead-reported node files, not
   checked-in evidence, so no b3 number is treated as in-repo here.
-- The `origin/task/phase3-gate-up` doc on its head `fc97f64` still says the harness has "no device
-  numbers yet"; the 2026-10-18T20:22:35Z Lead window (5.2) supersedes that for the gate/up projection
-  only (and the branch's device run has now been executed).
+- Earlier text in this map called M2 and the gate/up kernel "unmerged branches" and said the chain
+  skeleton did not exist. `!86` merged M2 and the gate/up kernel, and `!88` merged the M3-a host
+  skeleton; sections 2.8, 3.1 and 3.3 are the current statements.
 - The brief's "measured stage 2/7/9" for mHC is corrected in 2.3: stage 2 calls the mHC reference
   helper and does not launch the kernel; stages 7 and 9 execute it chained.
 - The brief's "124.6 GiB" is the 124,610 MiB total with a unit slip (section 0 note).
@@ -769,7 +777,7 @@ and is not cited.
 
 No device token, no logits comparison against the fixture from a chain, no Phase 2 or Phase 3 exit
 criterion, no serving throughput, no memory measurement for a wired chain, and no claim about the
-unmerged `origin/task/phase3-gate-up` draft beyond its Lead-window gate/up arithmetic: the routing
-weight, SwiGLU, combine, shared expert, end-to-end MoE, host-time savings and chain correctness are
-all unclaimed. The one claim is the map itself: the stages,
+merged gate/up kernel beyond its measured gate/up projection (routing weight, SwiGLU, combine,
+shared expert, end-to-end MoE, host-time savings and chain wiring are all unclaimed; M3-a is a plan,
+not an execution). The one claim is the map itself: the stages,
 their pins, their measured status, the gaps, and the ordering of the remaining work.
