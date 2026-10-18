@@ -27,6 +27,7 @@
 //! the same code and keeps its determinism; [boundary] documents what is recorded and in what order.
 
 pub mod attention;
+pub mod attention_case;
 pub mod boundary;
 pub mod engram;
 pub mod mhc;

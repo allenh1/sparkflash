@@ -49,6 +49,7 @@
 //! buffer, which is what the reference would read from a registered buffer it never wrote. Run the
 //! source layers first, which spec section 4 already requires.
 
+use super::attention_case;
 use crate::config::ModelConfig;
 use crate::linalg::{self, EngineError, ScaleGrid};
 use crate::quant;
@@ -1907,6 +1908,29 @@ pub fn attention_forward(
             scale,
             &mut out[query * heads * head_dim..(query + 1) * heads * head_dim],
         )?;
+        // Off-by-default capture hook (task-14): offers the query's inputs and pre-projection
+        // output to the fixture generator. It is inactive unless explicitly armed, and it copies
+        // values the reference has already computed, so the reference arithmetic is untouched.
+        attention_case::record(attention_case::Frame {
+            layer,
+            position: start_pos + query,
+            start_pos,
+            seqlen,
+            ratio,
+            heads,
+            head_dim,
+            window_rows,
+            window_width,
+            compressed_stride,
+            q: &q[query * heads * head_dim..(query + 1) * heads * head_dim],
+            sink: &sink,
+            window_ids: &ids[query * window_width..(query + 1) * window_width],
+            window_kv: &kv[..window_rows * head_dim],
+            compressed_ids: &compressed_ids
+                [query * compressed_stride..(query + 1) * compressed_stride],
+            compressed_kv: &kv[window_rows * head_dim..],
+            out: &out[query * heads * head_dim..(query + 1) * heads * head_dim],
+        });
     }
     let tables =
         rope_tables_for_layer(config, layer, &head_row_positions(start_pos, seqlen, heads));

@@ -45,3 +45,7 @@ cuda = ["dep:cudarc"]
 # with. sha2 hashes the two determinism blobs; the harness does not otherwise hash anything.
 # Neither edge creates a cycle: the engine crate depends on no other workspace crate.
 sha2 = { workspace = true }
+# The task-14 union-attention example reads the engine-produced attention-case fixture (JSON) and
+# writes its run report as JSON; the fixture is data, not a new crate edge beyond these two.
+serde = { workspace = true }
+serde_json = { workspace = true }
