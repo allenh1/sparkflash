@@ -8,8 +8,9 @@ description = "RoCEnante one-shot RDMA + NCCL dual-path collective transport for
 
 [features]
 default = []
-# Thin ibverbs / GPUNetIO backend skeleton. It links nothing on the Milestone 3 dev box:
-# every entry point returns `CommError::RdmaNotBuilt`.
+# The real libibverbs backend. It adds no build-time dependency: libibverbs is dlopen'd at run
+# time, so a default build still links nothing and the feature only compiles the backend module
+# (and the doctor's rocenante-probe fabric path) into the crate.
 rdma = []
 
 [dependencies]

@@ -271,12 +271,26 @@ pub trait LinkProbe {
     fn df_probe(&self, netdev: &str, peer: &str, payload_bytes: usize) -> Probe<String>;
 }
 
+/// One peer's measured cross-node write bandwidth, in Gbps.
+///
+/// Check 3 gates on the worst peer rather than on an aggregate: a mean over four ranks hides the
+/// one link that is degraded, which is exactly the failure the gate exists to catch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerBandwidth {
+    /// The peer the reading belongs to, as named in --nodes.
+    pub peer: String,
+    /// Dual-rail write bandwidth measured toward that peer, in Gbps.
+    pub gbps: f64,
+}
+
 /// RDMA bandwidth and latency readings (ibverbs / the RoCEnante probe).
 pub trait RdmaProbe {
-    /// Aggregate dual-rail cross-node bandwidth in Gbps, averaged over `seconds`.
-    fn dual_rail_write_gbps(&self, peers: &[String], seconds: u64) -> Probe<f64>;
-    /// 10 KiB one-shot All-Reduce latency in microseconds.
-    fn oneshot_allreduce_us(&self, peers: &[String], bytes: usize) -> Probe<f64>;
+    /// Dual-rail cross-node write bandwidth toward every peer in `peers`, each in Gbps, averaged
+    /// over `seconds`.
+    fn dual_rail_write_gbps(&self, peers: &[String], seconds: u64) -> Probe<Vec<PeerBandwidth>>;
+    /// 10 KiB one-shot All-Reduce latency in microseconds, measured from `rank` in a world made of
+    /// `rank` plus `peers`.
+    fn oneshot_allreduce_us(&self, rank: usize, peers: &[String], bytes: usize) -> Probe<f64>;
 }
 
 /// GPU clock and host memory readings (`nvidia-smi`, `/proc/meminfo`).
@@ -466,10 +480,10 @@ impl LinkProbe for NotApplicableLink {
 struct NotApplicableRdma(String);
 
 impl RdmaProbe for NotApplicableRdma {
-    fn dual_rail_write_gbps(&self, _peers: &[String], _seconds: u64) -> Probe<f64> {
+    fn dual_rail_write_gbps(&self, _peers: &[String], _seconds: u64) -> Probe<Vec<PeerBandwidth>> {
         Err(ProbeError::NotApplicable(self.0.clone()))
     }
-    fn oneshot_allreduce_us(&self, _peers: &[String], _bytes: usize) -> Probe<f64> {
+    fn oneshot_allreduce_us(&self, _rank: usize, _peers: &[String], _bytes: usize) -> Probe<f64> {
         Err(ProbeError::NotApplicable(self.0.clone()))
     }
 }
@@ -774,48 +788,100 @@ fn oneshot_allreduce_us_from_probe_json(raw: &str) -> Probe<f64> {
 }
 
 impl RdmaProbe for SystemProbes {
-    fn dual_rail_write_gbps(&self, peers: &[String], seconds: u64) -> Probe<f64> {
-        let peer = peers.first().ok_or_else(|| {
-            ProbeError::NotApplicable("no peer was given for the RDMA probe".into())
-        })?;
-        let seconds = seconds.to_string();
-        let mut total = 0.0_f64;
-        for rail in RAILS {
-            let raw = Self::output(
-                "ibv_write_bw",
-                &["-d", rail.rdma, "--report_gbits", "-D", &seconds, peer],
-            )?;
-            let value = raw
-                .lines()
-                .find_map(|line| {
-                    let mut fields = line.split_whitespace();
-                    let first = fields.next()?;
-                    let value = first.parse::<f64>().ok()?;
-                    Some(value)
-                })
-                .ok_or_else(|| {
-                    ProbeError::Unavailable(format!(
-                        "ibv_write_bw on {} produced no bandwidth line",
-                        rail.rdma
-                    ))
-                })?;
-            total += value;
+    fn dual_rail_write_gbps(&self, peers: &[String], seconds: u64) -> Probe<Vec<PeerBandwidth>> {
+        if peers.is_empty() {
+            return Err(ProbeError::NotApplicable(
+                "no peer was given for the RDMA probe".into(),
+            ));
         }
-        Ok(total)
+        let seconds = seconds.to_string();
+        let mut readings = Vec::with_capacity(peers.len());
+        for peer in peers {
+            let mut total = 0.0_f64;
+            for rail in RAILS {
+                let raw = Self::output(
+                    "ibv_write_bw",
+                    &["-d", rail.rdma, "--report_gbits", "-D", &seconds, peer],
+                )?;
+                let value = raw
+                    .lines()
+                    .find_map(|line| {
+                        let mut fields = line.split_whitespace();
+                        let first = fields.next()?;
+                        let value = first.parse::<f64>().ok()?;
+                        Some(value)
+                    })
+                    .ok_or_else(|| {
+                        ProbeError::Unavailable(format!(
+                            "ibv_write_bw on {} toward {peer} produced no bandwidth line",
+                            rail.rdma
+                        ))
+                    })?;
+                total += value;
+            }
+            readings.push(PeerBandwidth {
+                peer: peer.clone(),
+                gbps: total,
+            });
+        }
+        Ok(readings)
     }
 
-    fn oneshot_allreduce_us(&self, peers: &[String], bytes: usize) -> Probe<f64> {
-        let peer = peers.first().ok_or_else(|| {
-            ProbeError::NotApplicable("no peer was given for the All-Reduce probe".into())
-        })?;
+    fn oneshot_allreduce_us(&self, rank: usize, peers: &[String], bytes: usize) -> Probe<f64> {
+        if peers.is_empty() {
+            return Err(ProbeError::NotApplicable(
+                "no peer was given for the All-Reduce probe".into(),
+            ));
+        }
+        // The probe needs one control-plane address per rank. A rank other than 0 only dials
+        // table[0], which is a --nodes peer, so its own slot can be a placeholder. Rank 0 BINDS
+        // table[0], so it must know its own real address: that cannot be guessed from --nodes,
+        // and binding a placeholder would make every peer dial an unreachable address.
+        let mut table = match std::env::var("SPARK_COMM_PEERS") {
+            Ok(full) if !full.trim().is_empty() => {
+                let table: Vec<String> =
+                    full.split(',').map(|peer| peer.trim().to_owned()).collect();
+                if table.len() != peers.len() + 1 {
+                    return Err(ProbeError::NotApplicable(format!(
+                        "SPARK_COMM_PEERS names {} ranks but this doctor call has {} peer(s); it must name every rank including this node (world {})",
+                        table.len(),
+                        peers.len(),
+                        peers.len() + 1
+                    )));
+                }
+                if table.get(rank).is_none_or(|peer| peer.is_empty()) {
+                    return Err(ProbeError::NotApplicable(format!(
+                        "SPARK_COMM_PEERS has no address for rank {rank}"
+                    )));
+                }
+                table
+            }
+            _ if rank == 0 => {
+                return Err(ProbeError::NotApplicable(
+                    "a rank-0 doctor cannot guess its own rail address: set SPARK_COMM_PEERS to the full rank table (rank 0 first) so the control plane can bind a reachable address".into(),
+                ));
+            }
+            _ => {
+                let mut table = peers.to_vec();
+                table.insert(rank.min(table.len()), "127.0.0.1".to_owned());
+                table
+            }
+        };
+        table.truncate(peers.len() + 1);
+        let size = bytes.to_string();
+        let world = table.len().to_string();
+        let rank_text = rank.to_string();
+        let mut arguments: Vec<&str> = vec![
+            "--bytes", &size, "--world", &world, "--rank", &rank_text, "--json",
+        ];
+        for peer in &table {
+            arguments.push("--peer");
+            arguments.push(peer.as_str());
+        }
         // The probe either measures the fabric path or exits non-zero; it never prints a number it
         // could not measure. Its own labels then decide whether that number belongs to this gate: a
         // loopback run is a real measurement of the wrong thing, so the reader refuses it.
-        let size = bytes.to_string();
-        let raw = Self::output(
-            "rocenante-probe",
-            &["--bytes", &size, "--peer", peer, "--json"],
-        )?;
+        let raw = Self::output("rocenante-probe", &arguments)?;
         oneshot_allreduce_us_from_probe_json(&raw)
     }
 }
@@ -1943,45 +2009,87 @@ pub fn check_rdma(probes: &Probes, options: &Options) -> CheckOutcome {
         .filter(|peer| !peer_is_self(peer, options))
         .cloned()
         .collect();
+    // Bandwidth: one reading per peer, scored at the worst peer. A mean across ranks would pass a
+    // cluster with one degraded cable, which is the failure this gate exists to catch.
     evidence.resolve(
         probes.rdma.dual_rail_write_gbps(&peers, options.rdma_seconds),
-        |evidence, gbps| {
-            if gbps >= MIN_AGGREGATE_RDMA_GBPS {
+        |evidence, readings| {
+            if readings.is_empty() {
+                evidence.fail(
+                    "the RDMA bandwidth probe reported no peer readings",
+                    "point --nodes at the other three nodes so every peer is measured, then re-run",
+                );
+                return;
+            }
+            let measured = readings
+                .iter()
+                .map(|reading| format!("{} {:.1} Gbps", reading.peer, reading.gbps))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let worst = readings
+                .iter()
+                .min_by(|left, right| left.gbps.total_cmp(&right.gbps))
+                .unwrap_or(&readings[0]);
+            if worst.gbps >= MIN_AGGREGATE_RDMA_GBPS {
                 evidence.pass(format!(
-                    "aggregate dual-rail bandwidth {gbps:.1} Gbps over {} s",
+                    "aggregate dual-rail bandwidth {:.1} Gbps worst-case over {} peers probed for {} s: {measured}",
+                    worst.gbps,
+                    readings.len(),
                     options.rdma_seconds
                 ));
             } else {
                 evidence.fail(
                     format!(
-                        "aggregate dual-rail bandwidth {gbps:.1} Gbps, expected >= {MIN_AGGREGATE_RDMA_GBPS} Gbps"
+                        "aggregate dual-rail bandwidth {:.1} Gbps to {} is below {MIN_AGGREGATE_RDMA_GBPS} Gbps; measured {measured}",
+                        worst.gbps, worst.peer
                     ),
                     format!(
-                        "raise aggregate bandwidth to >= {MIN_AGGREGATE_RDMA_GBPS} Gbps: check both ConnectX-7 halves are up and that the RoCEnante probe uses both rails"
+                        "raise aggregate bandwidth to >= {MIN_AGGREGATE_RDMA_GBPS} Gbps to every peer: check both ConnectX-7 halves are up and that the RoCEnante probe uses both rails"
                     ),
                 );
             }
         },
     );
-    evidence.resolve(
-        probes.rdma.oneshot_allreduce_us(&peers, ONESHOT_AR_BYTES),
-        |evidence, micros| {
+    // Latency: a doctor process can measure exactly one rank's view - its own, named by
+    // --rank. One process cannot observe another rank's latency, and pretending otherwise (by
+    // looping over rank views with a fabricated address table) produced a check that could never
+    // rendezvous on a healthy cluster. The other ranks must run their probe processes at the same
+    // time (Lead orchestration), which is what the failure advice below says.
+    let rank = options.rank;
+    match probes
+        .rdma
+        .oneshot_allreduce_us(rank, &peers, ONESHOT_AR_BYTES)
+    {
+        Ok(micros) => {
+            let peers_text = if peers.is_empty() {
+                "no peer".to_owned()
+            } else {
+                peers.join(", ")
+            };
             if micros < MAX_ONESHOT_AR_LATENCY_US {
                 evidence.pass(format!(
-                    "10 KiB one-shot All-Reduce {micros:.2} us (< {MAX_ONESHOT_AR_LATENCY_US} us)"
+                    "10 KiB one-shot All-Reduce {micros:.2} us on rank {rank} (< {MAX_ONESHOT_AR_LATENCY_US} us); peers {peers_text}"
                 ));
             } else {
                 evidence.fail(
                     format!(
-                        "10 KiB one-shot All-Reduce {micros:.2} us, expected < {MAX_ONESHOT_AR_LATENCY_US} us"
+                        "10 KiB one-shot All-Reduce {micros:.2} us on rank {rank}, expected < {MAX_ONESHOT_AR_LATENCY_US} us; peers {peers_text}"
                     ),
                     format!(
                         "get the 10 KiB one-shot All-Reduce below {MAX_ONESHOT_AR_LATENCY_US} us: check the RoCEnante staging fence, peer flag wait and canonical-order reduce"
                     ),
                 );
             }
-        },
-    );
+        }
+        Err(ProbeError::NotApplicable(message)) | Err(ProbeError::Unavailable(message)) => {
+            // Any unmeasurable probe fails the check: a rank that could not be measured is not
+            // evidence that it met the bar.
+            evidence.fail(
+                format!("rank {rank}'s 10 KiB one-shot All-Reduce could not be measured: {message}"),
+                "start the probe on every node at the same time (the control plane rendezvous is the barrier), pass --rank for this node, then re-run",
+            );
+        }
+    }
     evidence.finish(
         CheckId::RdmaBandwidth,
         format!(
@@ -2462,10 +2570,28 @@ mod tests {
     }
 
     impl RdmaProbe for FakeRdma {
-        fn dual_rail_write_gbps(&self, _peers: &[String], _seconds: u64) -> Probe<f64> {
-            self.0.gbps.clone()
+        fn dual_rail_write_gbps(
+            &self,
+            peers: &[String],
+            seconds: u64,
+        ) -> Probe<Vec<PeerBandwidth>> {
+            self.0
+                .calls
+                .record(format!("rdma-bandwidth peers={peers:?} seconds={seconds}"));
+            self.0.gbps.clone().map(|gbps| {
+                peers
+                    .iter()
+                    .map(|peer| PeerBandwidth {
+                        peer: peer.clone(),
+                        gbps,
+                    })
+                    .collect()
+            })
         }
-        fn oneshot_allreduce_us(&self, _peers: &[String], _bytes: usize) -> Probe<f64> {
+        fn oneshot_allreduce_us(&self, rank: usize, peers: &[String], bytes: usize) -> Probe<f64> {
+            self.0.calls.record(format!(
+                "rdma-allreduce rank={rank} peers={peers:?} bytes={bytes}"
+            ));
             self.0.allreduce.clone()
         }
     }
@@ -2854,6 +2980,128 @@ mod tests {
             },
         );
         assert_eq!(outcome.status, CheckStatus::NotApplicable);
+    }
+
+    /// Three peers plus this node: the shape check 3 must measure in full.
+    fn three_peer_cluster() -> Options {
+        Options {
+            nodes: vec![
+                "192.0.2.84".to_owned(),
+                "192.0.2.68".to_owned(),
+                "192.0.2.59".to_owned(),
+            ],
+            ..cluster()
+        }
+    }
+
+    #[test]
+    fn check_rdma_hands_every_peer_to_the_bandwidth_probe() {
+        let fake = Arc::new(Fake::happy());
+        let outcome = check_rdma(&fake_probes(&fake), &three_peer_cluster());
+        assert_eq!(outcome.status, CheckStatus::Pass);
+        let calls = fake.calls.entries();
+        let bandwidth = calls
+            .iter()
+            .find(|call| call.starts_with("rdma-bandwidth"))
+            .unwrap_or_else(|| panic!("no bandwidth probe was recorded: {calls:?}"));
+        for peer in ["192.0.2.84", "192.0.2.68", "192.0.2.59"] {
+            assert!(
+                bandwidth.contains(peer),
+                "the bandwidth probe did not hand {peer} to the measurement: {bandwidth}"
+            );
+        }
+        assert!(
+            outcome
+                .details
+                .iter()
+                .any(|detail| detail.contains("worst-case")
+                    && detail.contains("192.0.2.84")
+                    && detail.contains("192.0.2.59")),
+            "the evidence must name every probed peer: {:?}",
+            outcome.details
+        );
+    }
+
+    #[test]
+    fn check_rdma_probes_only_this_node_rank_and_scores_it() {
+        let fake = Arc::new(Fake::happy());
+        let outcome = check_rdma(&fake_probes(&fake), &three_peer_cluster());
+        assert_eq!(outcome.status, CheckStatus::Pass);
+        let calls = fake.calls.entries();
+        let latency_calls: Vec<&String> = calls
+            .iter()
+            .filter(|call| call.starts_with("rdma-allreduce"))
+            .collect();
+        assert_eq!(
+            latency_calls.len(),
+            1,
+            "one doctor process must issue exactly one latency probe (its own rank): {calls:?}"
+        );
+        assert!(
+            latency_calls[0].contains("rank=0 "),
+            "the probe must use the local rank: {}",
+            latency_calls[0]
+        );
+        assert!(
+            outcome
+                .details
+                .iter()
+                .any(|detail| detail.contains("10 KiB one-shot All-Reduce")
+                    && detail.contains("rank 0")),
+            "the evidence must name the probed rank: {:?}",
+            outcome.details
+        );
+    }
+
+    #[test]
+    fn check_rdma_names_the_requested_rank() {
+        let fake = Arc::new(Fake::happy());
+        let options = Options {
+            rank: 2,
+            ..three_peer_cluster()
+        };
+        let outcome = check_rdma(&fake_probes(&fake), &options);
+        assert_eq!(outcome.status, CheckStatus::Pass);
+        let calls = fake.calls.entries();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("rdma-allreduce rank=2 ")),
+            "the requested rank was not probed: {calls:?}"
+        );
+        assert!(
+            outcome
+                .details
+                .iter()
+                .any(|detail| detail.contains("rank 2")),
+            "the evidence must name rank 2: {:?}",
+            outcome.details
+        );
+    }
+
+    #[test]
+    fn check_rdma_fails_when_this_rank_cannot_be_measured() {
+        let mut fake = Fake::happy();
+        fake.allreduce = Err(ProbeError::Unavailable(
+            "no peer probe is running".to_owned(),
+        ));
+        let fake = Arc::new(fake);
+        let outcome = check_rdma(&fake_probes(&fake), &three_peer_cluster());
+        assert_eq!(
+            outcome.status,
+            CheckStatus::Fail,
+            "an unmeasurable rank must fail, not pass on other evidence: {:?}",
+            outcome.details
+        );
+        assert!(
+            outcome
+                .details
+                .iter()
+                .any(|detail| detail.contains("rank 0")
+                    && detail.contains("no peer probe is running")),
+            "the failure must name the rank and the reason: {:?}",
+            outcome.details
+        );
     }
 
     // ---- check 4 ------------------------------------------------------------------------

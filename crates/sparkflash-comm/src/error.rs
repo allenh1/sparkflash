@@ -42,9 +42,19 @@ pub enum CommError {
     /// The requested backend is not available on this host.
     #[error("collective backend unavailable: {0}")]
     Unsupported(String),
-    /// The optional rdma backend was requested but is a skeleton on this host.
-    #[error("rdma backend not built: {0}")]
-    RdmaNotBuilt(String),
+    /// The runtime libibverbs layer refused a call.
+    ///
+    /// This is the error every ibverbs entry point maps onto: the call's name, and the errno or
+    /// ABI reason the library gave. It is separate from
+    /// [`Unsupported`](Self::Unsupported), which means the library itself could not be loaded, and
+    /// from [`Protocol`](Self::Protocol), which means a peer sent something this backend did not expect.
+    #[error("ibverbs {call} failed: {detail}")]
+    Verbs {
+        /// The libibverbs entry point, for example "ibv_post_send".
+        call: &'static str,
+        /// What the library reported: errno text, or the ABI mismatch.
+        detail: String,
+    },
     /// The dual-rail RoCE fabric is not usable, or was pinned to devices that are not.
     #[error("dual-rail fabric unusable: {0}")]
     FabricUnavailable(String),
@@ -56,6 +66,17 @@ impl CommError {
         Self::Timeout {
             timeout_ms: duration_millis(timeout),
             what: what.into(),
+        }
+    }
+
+    /// Builds the error for a libibverbs call that returned a non-zero code.
+    ///
+    /// Only the rdma feature's backend reports this variant, so the constructor is compiled with it.
+    #[cfg(feature = "rdma")]
+    pub(crate) fn verbs(call: &'static str, detail: impl Into<String>) -> Self {
+        Self::Verbs {
+            call,
+            detail: detail.into(),
         }
     }
 

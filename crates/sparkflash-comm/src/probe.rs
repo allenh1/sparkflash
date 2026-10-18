@@ -23,14 +23,16 @@
 //! - Built without the rdma feature: run_fabric returns Unavailable immediately and names the exact
 //!   rebuild command, cargo build --release -p sparkflash-comm --features rdma --bin
 //!   rocenante-probe. Nothing from rdma.rs is compiled into that build.
-//! - Built with the rdma feature while the backend is still a skeleton: RdmaTransport::open fails in
-//!   one of two places on its own. A host with no RDMA subsystem fails first, at
-//!   select_rails_from_live_fabric (rdma.rs:64), with CommError::FabricUnavailable naming the missing
-//!   host prerequisite, and never reaches the backend placeholder. A host whose rails resolve reaches
-//!   rdma.rs:65 and gets CommError::RdmaNotBuilt, because is_built() is hard-coded false. The probe
-//!   wraps either error in Unavailable with the reason the transport gave and adds that the
-//!   ibverbs/GPUNetIO backend is not implemented in this tree, so the 20 microsecond gate cannot be
-//!   measured on any host yet. That refusal is honest; it is not a measurement.
+//! - Built with the rdma feature: the real libibverbs backend opens at run time. The probe builds
+//!   this process's configuration with [`crate::rdma::RdmaConfig::from_env_with_peers`], whose rank
+//!   table is the --peer list, and hands it to [`crate::rdma::RdmaTransport::open_with`]. That
+//!   loads libibverbs, resolves and validates both rails, registers the staging memory, creates the
+//!   RC QPs and then waits in the control plane until every rank in --world has joined. A host with
+//!   no RDMA subsystem fails at rail resolution, a host whose rails resolve but whose library is
+//!   missing fails in Verbs::load, and a host that is missing peers blocks until the deadline: each
+//!   of those is wrapped below with the transport's own typed reason. The probe never invents a
+//!   latency. If the backend refuses, the run exits 3 with an empty stdout, and that refusal is
+//!   honest; it is not a measurement.
 //! 3. Everything that does not need a device is a pure function with unit tests: argument parsing
 //!    and validation (Args and ProbeRequest::from_args), the statistic
 //!    (LatencyStats::from_samples) and the JSON emission (ProbeReport::to_json_string). The field
@@ -553,14 +555,18 @@ impl RdmaExchange {
                     request.elements()
                 ))
             })?;
-        let transport = crate::rdma::RdmaTransport::open(request.world, request.rank).map_err(
-            |error| {
-                ProbeError::Unavailable(format!(
-                    "the fabric path refused to open on rank {} of {} with peers {:?}: {error}. The ibverbs/GPUNetIO backend is not implemented in this tree yet, so this refusal names the prerequisite it stopped on, and a host whose rails resolve stops at the same missing backend. The probe will not report a number it could not measure",
-                    request.rank, request.world, request.peers
-                ))
-            },
-        )?;
+        let transport = crate::rdma::RdmaConfig::from_env_with_peers(
+            request.world,
+            request.rank,
+            request.peers.clone(),
+        )
+        .and_then(crate::rdma::RdmaTransport::open_with)
+        .map_err(|error| {
+            ProbeError::Unavailable(format!(
+                "the fabric path refused to open on rank {} of {} with peers {:?}: {error}. The ibverbs backend that the rdma feature loads at run time reported this reason, and a host with both rails ACTIVE and libibverbs present opens them, so this refusal names the prerequisite it stopped on. The probe will not report a number it could not measure",
+                request.rank, request.world, request.peers
+            ))
+        })?;
         Ok(Self {
             transport,
             buffer: vec![0_u16; request.elements()],
@@ -1114,37 +1120,49 @@ mod tests {
         }
     }
 
-    /// The real fabric measurement, behind the hardware gate. It is blocked twice over today: the
-    /// RDMA backend is still a skeleton, so RdmaTransport::open returns Err on every host because
-    /// is_built() is hard-coded false, and a run also needs the two ACTIVE 200 Gb/s rails, a peer
-    /// running the same collective, and the operator's permission. It is kept because the day the
-    /// backend lands this is the only test that measures the real path end to end. The assertions in
-    /// the body are its positive control, so it cannot pass on a refusal: the report must be labelled
-    /// fabric, carry the requested 50 samples, and hold a finite positive latency. Run it with the
-    /// peer as SPARKFLASH_PROBE_PEER=IP:
+    /// The real fabric measurement, behind the hardware gate. It needs the two ACTIVE 200 Gb/s
+    /// rails, a process on every rank started at the same time (the QP-endpoint control plane is
+    /// the barrier), and the Lead's per-run permission. The assertions in the body are its positive
+    /// control, so it cannot pass on a refusal: the report must be labelled fabric, carry the
+    /// requested 50 samples, and hold a finite positive latency. From each node, all four at once:
     ///
-    ///     SPARKFLASH_PROBE_PEER=IP cargo test -p sparkflash-comm --features rdma --lib \
+    ///     SPARK_COMM_RANK=<0..3> SPARK_COMM_WORLD=4 \
+    ///     SPARK_COMM_PEERS=192.0.2.80,192.0.2.84,192.0.2.68,192.0.2.59 \
+    ///     cargo test -p sparkflash-comm --features rdma --lib --release \
     ///         probe::tests::the_fabric_gate_measures_a_real_one_shot_all_reduce -- --ignored --nocapture
     #[cfg(feature = "rdma")]
-    #[ignore = "blocked on the RDMA backend: RdmaTransport::open always returns Err while is_built() is false, so no host can pass this yet; it also needs a live dual-rail fabric, a peer and hardware permission"]
+    #[ignore = "needs the live dual-rail RoCE fabric, one process per rank started together, and hardware permission"]
     #[test]
     fn the_fabric_gate_measures_a_real_one_shot_all_reduce() {
-        let peer = std::env::var("SPARKFLASH_PROBE_PEER").unwrap_or_else(|_| {
+        let peers = std::env::var("SPARK_COMM_PEERS").unwrap_or_else(|_| {
             panic!(
-                "set SPARKFLASH_PROBE_PEER to the peer node's address before running a hardware gate"
+                "set SPARK_COMM_PEERS to the rail-1 address table in rank order before running a hardware gate"
             )
         });
-        let request = request_of(&[
-            "--peer",
-            peer.as_str(),
+        let world = std::env::var("SPARK_COMM_WORLD").unwrap_or_else(|_| "4".to_owned());
+        let rank = std::env::var("SPARK_COMM_RANK").unwrap_or_else(|_| "0".to_owned());
+        let peer_list: Vec<String> = peers
+            .split(',')
+            .map(|peer| peer.trim().to_owned())
+            .filter(|peer| !peer.is_empty())
+            .collect();
+        let mut args: Vec<&str> = vec![
+            "--world",
+            world.as_str(),
+            "--rank",
+            rank.as_str(),
             "--bytes",
             "10240",
             "--samples",
             "50",
             "--warmup",
             "5",
-        ])
-        .unwrap_or_else(|error| panic!("{error}"));
+        ];
+        for peer in &peer_list {
+            args.push("--peer");
+            args.push(peer);
+        }
+        let request = request_of(&args).unwrap_or_else(|error| panic!("{error}"));
         let report = run(&request).unwrap_or_else(|error| panic!("fabric probe: {error}"));
         println!("{}", report.to_human_string());
         assert!(
