@@ -599,15 +599,26 @@ table, and the bars of section 5 remain to be measured against it.
 
 This is the device column for the layer-0 boundary: the M7 harness stages that feed each other's
 inputs, run on the node in one window (vLLM stopped; pinned nvcc V13.0.88 cubins, binary sha256
-`56f82fb7...`, mega_mhc cubin sha256 `e21293e3...`). Every log names its argv, binary sha256, UTC start/end and `MemAvailable` before and after; a log of a run
-that loads kernels names the cubin sha256s too, with one exception: the two B1 probe attempts
-(`phase1-b1-stage8-probes-20261018T011320Z.log`, `...011404Z.log`) record the binary only, so they are
-cited for their probe numbers and not as cubin provenance. The logs are
-`/home/user/phase1-evidence/phase1-d8-*` and the earlier B0 runs `phase1-b0-*`. **Log regeneration pending:** the stage-1 and stage-2 logs behind the table below were
-produced before the M2 fix of their printed comparison-class strings and still print the retired
-stream-mean fold as the predictor. Their numbers are cited here, but they are not current
-evidence until regenerated in a device window; the printed class lines in this file are the ones
-the fixed harness emits.
+`56f82fb7...`, mega_mhc cubin sha256 `e21293e3...`). Stage 7 (B2) is the chained replay and ran in
+the next windows on the same node; its final run is binary sha256 `2b518a35...`, the cross-build of
+the pass-5 code commit `1845f2d` (the evidence binary is that commit's own build; the docs head's
+rebuild reproduces it), and the log is
+`/home/user/phase1-evidence/phase1-b2-stage7-layer0-rereview5-20261018T044122Z.log` (20 device
+launches: 16 for the chain, 4 for the forced-routing control), UTC 04:41:22Z-04:41:26Z. The pass-5
+log's metric and content lines are bit-identical to the pass-4 log's (only the label/argv/binary-sha/
+UTC header lines and the per-launch MemAvailable lines differ), so the tie plumbing did not move any
+measured number. The pass-4 log (`...rereview4-20261018T041707Z.log`, binary `f99f14bf...`,
+pre-plumbing) remains on disk and is no longer cited. Every log names its argv, binary
+sha256, UTC
+start/end and `MemAvailable` before and after; a log of a run that loads kernels names the cubin
+sha256s too, with one exception: the two B1 probe attempts
+(`phase1-b1-stage8-probes-20261018T011320Z.log`, `...011404Z.log`) record the binary only, so they
+are cited for their probe numbers and not as cubin provenance. The logs are
+`/home/user/phase1-evidence/phase1-d8-*` and the earlier B0 runs `phase1-b0-*`. **Log
+regeneration pending:** the stage-1 and stage-2 logs behind the table below were produced before the
+M2 fix of their printed comparison-class strings and still print the retired stream-mean fold as the
+predictor. Their numbers are cited here, but they are not current evidence until regenerated in a
+device window; the printed class lines in this file are the ones the fixed harness emits.
 
 | stage | what it checks | measured result | log (UTC) |
 |---|---|---|---|
@@ -616,6 +627,7 @@ the fixed harness emits.
 | 8 | dense MXFP8 GEMM, grouped wo_a, SwiGLU activation quantiser against the in-crate references on identical bytes | 4/4 probes bit-exact: dense 16,384/16,384 and wo_a 8,192/8,192 (max ULP 0); swiglu 4x640 codes 2,560/2,560 + scales 80/80; swiglu 2x2304 codes 4,608/4,608 + scales 144/144 | 01:26:36Z-01:26:37Z |
 | 2, layer 0 | `flash_mla_csa2_sm121` against `mla_ref::attention_with_sink` | PASS 3/3 positions: 32,768/32,768 bf16 exact at positions 0 and 1; position 3 32,765/32,768 (99.9908% vs 99.5% bar), max ULP 1, max abs delta 1.19e-7 (bar 1.6e-2) | 01:26:49Z-01:26:50Z |
 | 3, layer 0 | `b12x_mxfp4_moe_sm121` down/combine against `mxfp4_ref::moe_combine` | PASS: combine 20,480/20,480 bf16 exact, max ULP 0; the printed quantisation gap (quantised vs f32 activation) is 100% of outputs, unchanged, because this stage's device boundary is the combine only | 01:26:51Z-01:27:03Z |
+| 7 (B2), layer 0 | the chained layer-0 replay: K1 mHC, K2/K3/K4 dense, K5 flash_mla, K6 wo_a, K7 dense, K8 mHC, K9-K12 routed combine, K13/K14/K15 shared dense, K16 final hc_post; all 18 boundary tensors of row 0 captured and diffed against the host v1 row by class; plus a forced-routing control that re-runs the routed MoE with the host row's own top-6 ids and weights | PASS 18/18 captured and diffed, no bar applied (this is the single-layer measurement, not the 40-layer chain). Every kernel is bit-exact against its in-crate reference on the same bytes: K2 1,280/1,280, K3 32,768/32,768, K4 512/512, K5 32,768/32,768 (100% vs `mla_ref` with the sink), K6 8,192/8,192, K7 5,120/5,120, K9-K12 5,120/5,120 max ULP 0 (forced control also 5,120/5,120 max ULP 0), K13/K14 2,304/2,304, K15 5,120/5,120. Row-0 deltas: upstream `pre_attention_hidden` max 2.76e-7 (mean 4.28e-8), `pre_attention_xhat` 5,119/5,120 codes (the one difference is distance 1) and `pre_attention_scales` 160/160 exact; `attention_out` max 2.57e-1 (mean 5.72e-2), `post_attention_hidden` bf16(host)-exact 48.18%, `pre_ffn_hidden` max 3.16e-2, `pre_ffn_xhat` 1,596/5,120 codes (histogram 1: 1,694, 2-3: 898, 4-15: 751, 16+: 181; mean distance 7.33, max 177), `pre_ffn_scales` 154/160 (6 differ, all distance 1), `ffn_out` max 2.15e-1, `residual_out` bf16(host)-exact 5.96% (max vs bf16 1.875e-1). The forced-routing control measures the discrete flip's own contribution pointwise: max abs |`ffn_out` free - `ffn_out` forced| = 3.750000e-1 at index 5071 (signed -3.750000e-1), 4,853/5,120 points differ, and the two host deltas are reported separately (free 2.150760e-1 at index 1233, forced 2.160320e-1 at index 5071; their difference is a change in max error, not a max-abs contribution). The flip is a large pointwise perturbation, and the measured relation at the max host error is: at index 1233 the flip contributes 2.500000e-1, 116.24% of the 2.150760e-1 host error there, so that max-error point is flip-dominated; forcing the host row's routing does not reduce the max host error | 04:41:22Z-04:41:26Z |
 
 Rule change (D23): the old floor-rule behaviour is the mislabelled log above (4,287/5,120 codes
 and 134/160 scales on token 0, but with the new binary and new cubin hashes in its header). The
@@ -625,8 +637,56 @@ pre-D8 floor-rule cubin is retained at
 `OLD-VS-NEW` run (old cubin + new ceil-rule reference, both binary and cubin hashes in the log)
 is a **device-window item** and is not cited as evidence until it exists.
 
-What this still does not do: the B2 row-0 dump-and-diff (all 18 tensors against the host table, per
-tensor class) is a separate stage not yet implemented, so no device `v1` table exists and the
-bars of section 5 are still unmeasured against this table. Stages 1-3 chain by passing inputs from
-one stage to the next inside the harness; the 40-layer token chain is a separate program.
+This B2 run is the Phase-1 HEALTH-CHECK column, not a criterion-1 closure, and the report must say
+so: the device path uses FP4 main/window KV (D4) and bf16/quantised arithmetic where the host
+reference is f32 with no GEMM activation quantiser and no bf16 writes
+(`crates/sparkflash-engine/src/forward/attention.rs` module docs, "What is deliberately not
+reproduced", items 1-2). The column therefore measures attribution and gross mismatch, layer by
+layer; the format-faithful exactness run is the later one after Phase 2 (task-3: FP8 window KV, then
+release-faithful arithmetic). Criterion 1 is not closed on this run.
+
+The row-0 deltas have two named sources, separated by the B2 attribution check in the same log:
+(1) the window-KV format of D4 - the same f32 latent re-encoded in the device's FP4 E2M1 format and
+the host's FP8 E4M3 format predicts `attention_out` with a max abs difference of 3.13e-1 on the same
+latent and the same tail, which is the format's own contribution and the valid D4 number; the
+host-format prediction is 1.05e-1 from the host row against the measured 2.57e-1, but it reuses the
+device's q and attention-tail operands, so it also carries the upstream device-side differences and
+is reported as a diagnostic, not attributed to the format; (2) the host reference's own
+non-reproduced arithmetic, which the residual belongs to. The prediction's control - the same
+arithmetic in the device's format - reproduces the run's `attention_out` exactly. The one discrete
+event measured on this row is the router's top-6: the ordered lists differ in four slots and the
+expert sets differ by one member (device only 246, host only 236). Its effect is measured, not
+assumed: the forced-routing control re-derives the host row's routing from the host row, builds the
+forced operands from it and verifies them against the checkpoint before any launch - every rank's w2
+weight and scale slices, and every slot's w1/w3-derived activation codes and scales at every rank,
+bit-for-bit for the requested ids/weights; it also recomputes the forced `ffn_out` from the forced
+routed-combine bits and the K15 shared output through the free path's combination, requires it
+bit-identical to the tensor it diffs, and reads that returned recomputation for every reported
+forced number (so a copy after the assertion cannot change a metric), and its verdict requires
+identical ids with unchanged weights
+to reproduce the routed bytes exactly (a difference there is nondeterminism and aborts) while a flip
+must produce a nonzero difference - then reports the free-vs-forced difference pointwise - max abs
+3.750000e-1 at index 5071 (signed -3.750000e-1), 4,853/5,120 points differ - separately from the two
+host deltas (free 2.150760e-1 at index 1233, forced 2.160320e-1 at index 5071), whose difference is a
+change in max error and not the flip's max-abs contribution. The flip is a large pointwise
+perturbation, and the measured relation to the max host error is the opposite of a small one: at the
+free max-error index 1233 the flip contributes 2.500000e-1, 116.24% of the 2.150760e-1 host error
+there, so that max-error point is flip-dominated; forcing the host row's routing leaves the max host
+error essentially unchanged. The residual consists of the device path's quantised routed arithmetic
+plus the propagated upstream deltas, and the combine kernel is excluded (K9-K12 exact on the same
+bytes, free and forced). No device `v1` table file is written yet
+(the stage diffs row 0 in-process and prints the deltas), and the 40-layer token chain is a separate
+program whose bars are the B2 single-layer deltas compounded over the layers a tensor traversed,
+printed before the numbers they judge. The readers, the released router and the free-vs-forced
+metric behind this section are compiled and exercised on the CPU by
+`crates/sparkflash-kernels/tests/b2_harness_offline.rs` (14 tests: the readers, the released router,
+the free-vs-forced metric, the forced-output tie against the forced routed bits - including that the
+metric consumes the tie's returned tensor, so a post-assert copy cannot change it - the
+identical-routing determinism rules, and the full pre-launch operand verifier exercised end to end on
+synthetic tensors including a top-k-6 fixture that corrupts slot 3's scale and slot 5's w1), so the
+checkpoint/manifest
+parsing, the released router, the free-vs-forced metric, the determinism verdict (positive and negative cases: ids equal with
+changed weights may round to equal bytes, ids equal with unchanged weights must reproduce the bytes,
+a flip must change them) and the operand-byte provenance verifier are not validated only by a device
+run; the manifest offset + length overflow branch is exercised too.
 

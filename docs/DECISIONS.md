@@ -1033,3 +1033,42 @@ captured bytes and not as current evidence. The Phase 1 consequence: the two act
 by the reference rule, so the row-0 boundary diff in B2 can attribute a code mismatch to the
 number's own rounding rather than to a known rule defect.
 
+**Stage B record (2026-10-18, sixth window): the chained layer-0 replay (B2) is measured, and it is
+a health check, not criterion-1 closure.** The `--stage 7` replay ran sixteen device launches in
+release order plus a four-launch forced-routing control, captured and diffed all eighteen row-0
+boundary tensors, and exited 0 (PASS 18/18; log `phase1-b2-stage7-layer0-rereview5-20261018T044122Z.log`,
+binary sha256 `2b518a35...`, the cross-build of the pass-5 code commit `1845f2d`; the evidence
+binary is that commit's own build, and the docs head's rebuild reproduces it). The pass-5 log's
+metric and content lines are bit-identical to the pass-4 log's (only label/argv/binary-sha/UTC and
+MemAvailable lines differ), so the tie plumbing did not move any measured number; the pass-4 log
+(`...rereview4-20261018T041707Z.log`, binary `f99f14bf...`) remains on disk as pre-plumbing
+evidence and is no longer cited. It applies no bar: it measures the single-layer deltas the 40-layer
+chain will compound. Every kernel is bit-exact against its in-crate reference on the same bytes, so
+the chain itself is verified; the row-0 deltas against the f32 host reference are attributed to the
+window-KV format (D4) and the host reference's documented "deliberately not reproduced" arithmetic,
+quantified in the log's attribution check. The device column therefore measures attribution and
+gross mismatch, not exactness: the device path uses FP4 main/window KV and bf16/quantised
+arithmetic where the reference is f32 with no GEMM activation quantiser, and the format-faithful
+exactness run is the one after Phase 2 (task-3). The forced-routing control was corrected across the
+re-review passes: subtracting the free and forced host max-abs deltas is a change in max error, not a
+max-abs contribution, and is no longer reported as one; its verdict enforces determinism - identical
+ids with unchanged weights must reproduce the free path's routed bytes exactly (a difference there is
+nondeterminism and aborts), a flip with identical routed bytes aborts, and a weight change with equal
+ids may round to equal or different bytes; the forced operands are built from the re-derived host
+routing and verified against the checkpoint before the launches (every rank's w2 weight and scale
+slices, and every slot's w1/w3-derived activation codes and scales at every rank, bit-for-bit); and
+the forced `ffn_out` is recomputed from the forced routed-combine bits and the shared output through
+the free path's combination and required bit-identical before the host delta is reported; the
+returned recomputation (documented as the asserted-identical recomputation of the forced output) is
+the tensor every reported forced number reads, so a copy inserted after the assertion cannot change a
+metric. The router's top-6 differs (ordered lists differ in four slots, expert sets
+differ by one member, device-only 246 and host-only 236); the control measures the flip pointwise:
+max abs |`ffn_out` free - forced| = 3.750000e-1 at index 5071 (signed -3.750000e-1), 4,853/5,120
+points differ, with the two host deltas kept separate (2.150760e-1 free, max at index 1233;
+2.160320e-1 forced, max at index 5071). The flip is a large pointwise perturbation, and the
+max-host-error point is flip-dominated: at index 1233 the flip contributes 2.500000e-1, 116.24% of
+the 2.150760e-1 host error there, and forcing the host row's routing does not reduce the max host
+error. The combine kernel is excluded (K9-K12 exact on the same bytes, free and forced). Routing
+flips are divergence events to report per layer, never to fold into a smooth bar; and no number in
+this record closes criterion 1.
+
