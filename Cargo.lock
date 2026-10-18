@@ -2221,6 +2221,7 @@ dependencies = [
  "serde_json",
  "sparkflash-api",
  "sparkflash-comm",
+ "sparkflash-device",
  "sparkflash-engine",
  "sparkflash-engram",
  "sparkflash-kernels",
@@ -2244,6 +2245,14 @@ dependencies = [
  "serde_json",
  "sparkflash-trace",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "sparkflash-device"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "sparkflash-api",
 ]
 
 [[package]]

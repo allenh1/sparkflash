@@ -19,6 +19,7 @@ sparkflash-comm = { workspace = true }
 sparkflash-kernels = { workspace = true }
 sparkflash-scheduler = { workspace = true }
 sparkflash-engine = { workspace = true }
+sparkflash-device = { workspace = true }
 axum = { workspace = true }
 futures = { workspace = true }
 clap = { workspace = true }

@@ -47,15 +47,18 @@
 // depends on the launch order: every token's score vector is produced by one deterministic
 // sequence of f32 roundings, and the selection is a deterministic scan.
 //
-// A NULL scores pointer is not accepted: scores are an output of this kernel (the harness compares
-// them against the host reference to separate a GEMM difference from a score-function difference),
-// and a caller that does not need them passes a scratch allocation. Making it optional would turn
-// an ABI mismatch into a silent no-op.
+// A NULL scores pointer is not accepted: scores are an output of this kernel (the harness reads
+// them back and compares them against the CPU twin inside the declared score bar), and a caller
+// that does not need them passes a scratch allocation. Making it optional would turn an ABI
+// mismatch into a silent no-op.
 //
-// Verification status: compiled by nvcc 13.0.3 for sm_121a (PTX and cubin recorded in
-// docs/build/phase3-router.md), parsed by the clang frontend through the stub headers on this
-// host, and its ABI and constants are pinned by src/router_abi.rs. The device-versus-host run is
-// examples/m9_router.rs on node0; no device number is claimed by this file.
+// Verification status: compiled by nvcc 13.0.3 for sm_121a (the committed baseline records the
+// cubin length, sha256 and PTX membar count; docs/build/phase3-router.md records the window recipe
+// and the Lead's measured runs, and states that the pre-softplus GEMM is not separately asserted),
+// parsed by the clang frontend through the stub headers on this host, and its ABI and constants are
+// pinned by src/router_abi.rs. The measured comparison class is device-versus-twin, with the host
+// path bit-identical to the twin (asserted in examples/m9_router.rs); there is no separate
+// device-versus-host comparison, and no device number is claimed by this file.
 
 #include "m4_common_sm121.cuh"
 

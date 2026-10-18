@@ -1,0 +1,14 @@
+[package]
+name = "sparkflash-device"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SparkFlash device forward chain (M1: fake-session InferenceEngine skeleton)"
+
+[dependencies]
+sparkflash-api = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+sparkflash-api = { workspace = true }

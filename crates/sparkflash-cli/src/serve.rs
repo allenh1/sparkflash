@@ -7,6 +7,12 @@
 //! [`sparkflash_engine::forward::InferenceEngine`] over either the synthetic plan or a real
 //! checkpoint, presents it to the router through a local driver, and binds the router to a socket.
 //!
+//! `--engine device` selects the M1 `sparkflash-device` skeleton instead: a `DeviceEngine` over
+//! the same reference engine, with a fake session, `vision: false`, non-greedy sampling refused
+//! and no device execution (design `docs/build/device-forward-chain.md` 1.3, 7 M1). It is not
+//! the default: `--engine reference` is, and that path is unchanged. The first real device
+//! session is M2.
+//!
 //! # What it does not claim
 //!
 //! This is the *reference* engine: one sequence at a time, `f32`, on the CPU, with every weight
@@ -61,7 +67,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use sparkflash_api::AppState;
@@ -76,6 +82,7 @@ use sparkflash_api::telemetry_types::{
     CompletionTokensDetails, DSparkStepStats, DeepSeekSparkRequestStats, OpenAiUsageWithCache,
     PromptTokensDetails, RequestTimingStats, RoceTransportStats, finite_or_zero,
 };
+use sparkflash_device::{DeviceEngine, FakeSession};
 use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::forward::{InferenceEngine, Sampling, SequenceState};
 use sparkflash_engine::linalg::REFERENCE_TENSOR_LIMIT;
@@ -121,6 +128,32 @@ const _: () = {
     assert_send_sync::<sparkflash_engine::forward::InferenceEngine>();
 };
 
+/// Which serving engine implementation the process runs.
+///
+/// The reference engine is the existing CPU path and the default. `device` is the M1
+/// `sparkflash-device` skeleton: a fake session that delegates `generate` back to the reference
+/// engine, refuses images through the typed missing-capability path, refuses non-greedy sampling,
+/// and claims no device execution (design `docs/build/device-forward-chain.md` 1.3, 7 M1).
+/// The first real device session is M2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum EngineChoice {
+    /// The existing CPU reference engine: unchanged serving behaviour.
+    Reference,
+    /// The M1 device skeleton: fake session, no device execution, no device claim.
+    Device,
+}
+
+impl EngineChoice {
+    /// The stable spelling used by the flag and the startup line.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::Device => "device",
+        }
+    }
+}
+
 /// What this process can honestly say about the fabric it is running on: nothing.
 const NO_FABRIC: &str = "none (reference serve: one process, no RoCE)";
 
@@ -155,6 +188,9 @@ pub struct ServeOptions {
     /// The element cap the reference pass applies to one tensor. Above it, a tensor is refused
     /// rather than materialised.
     pub element_limit: usize,
+    /// Which engine implementation to serve. The default is the existing reference engine; the
+    /// device selection is the M1 skeleton behind a capability flag (design 7 M1).
+    pub engine: EngineChoice,
 }
 
 impl ServeOptions {
@@ -182,6 +218,7 @@ impl ServeOptions {
                 tokenizer,
                 max_tokens: cli.max_tokens,
                 element_limit: cli.element_limit,
+                engine: cli.engine,
             }),
         }
     }
@@ -220,7 +257,7 @@ fn no_weights_message() -> String {
     name = "sparkflash serve",
     version,
     about = "Serve the OpenAI-compatible HTTP API over the reference engine",
-    long_about = "Serves the HTTP API from the reference forward pass. Exactly one weight source is required: --synthetic generates the tiny reference plan from a seed and needs no checkpoint, while --checkpoint reads a real sharded checkpoint. The default run is read-only apart from what serving implies: no hardware state is changed and nothing is written to the checkpoint."
+    long_about = "Serves the HTTP API from the reference forward pass. Exactly one weight source is required: --synthetic generates the tiny reference plan from a seed and needs no checkpoint, while --checkpoint reads a real sharded checkpoint. The default run is read-only apart from what serving implies: no hardware state is changed and nothing is written to the checkpoint. --engine device selects the M1 sparkflash-device skeleton instead: a fake session that delegates to the reference engine, refuses images and non-greedy sampling, and claims no device execution; the default is --engine reference and is unchanged."
 )]
 struct ServeArgs {
     /// The address to bind.
@@ -245,6 +282,14 @@ struct ServeArgs {
     /// The element cap the reference pass applies to one tensor.
     #[arg(long, value_name = "N", default_value_t = REFERENCE_TENSOR_LIMIT)]
     element_limit: usize,
+    /// Which engine to serve: the default `reference` CPU path, or the M1 `device` skeleton.
+    ///
+    /// `device` wraps the reference engine in `sparkflash-device`'s M1 `DeviceEngine`: a fake
+    /// session, no kernel launch, no device execution, `vision: false` and non-greedy sampling
+    /// refused. The first real device session is M2; this flag is the capability flag that keeps
+    /// the existing serve path unchanged by default.
+    #[arg(long, value_enum, default_value = "reference")]
+    engine: EngineChoice,
 }
 
 /// What the engine thread builds: a configuration, where its weights come from, and the tokenizer.
@@ -898,7 +943,30 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             return ExitCode::from(EXIT_REFUSED);
         }
     };
-    let state = AppState::new(Arc::new(driver));
+    let engine: Arc<dyn ApiInferenceEngine> = match options.engine {
+        EngineChoice::Reference => Arc::new(driver),
+        EngineChoice::Device => {
+            let device = match DeviceEngine::open(FakeSession::new(), Arc::new(driver)) {
+                Ok(device) => device,
+                Err(error) => {
+                    eprintln!("sparkflash serve: cannot open the device session: {error}");
+                    return ExitCode::from(EXIT_REFUSED);
+                }
+            };
+            let report = device.report();
+            // The M1 skeleton says what it is before serving a request: a fake session with no
+            // device execution, so a reader cannot mistake it for M2/M3 device work (design 7 M1).
+            println!(
+                "sparkflash serve: engine {} (M1 fake-session skeleton; fake_session={}, device_execution={}, vision={}); no device claim, no kernel launch; the first real session is M2",
+                options.engine.as_str(),
+                report.fake_session,
+                report.device_execution,
+                report.vision
+            );
+            Arc::new(device)
+        }
+    };
+    let state = AppState::new(engine);
     let router = sparkflash_api::server::router(state);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1376,6 +1444,29 @@ mod tests {
             .expect_err("there is no checkpoint there");
         assert!(error.contains("--checkpoint"), "{error}");
         assert!(error.contains(CHECKPOINT_INDEX_NAME), "{error}");
+    }
+
+    #[test]
+    fn the_engine_flag_defaults_to_reference_and_accepts_device() {
+        let reference = ServeOptions::parse(vec!["--synthetic".to_owned()]).expect("parses");
+        assert_eq!(reference.engine, EngineChoice::Reference);
+
+        let device = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--engine".to_owned(),
+            "device".to_owned(),
+        ])
+        .expect("parses");
+        assert_eq!(device.engine, EngineChoice::Device);
+        assert_eq!(device.engine.as_str(), "device");
+
+        let error = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--engine".to_owned(),
+            "gpu".to_owned(),
+        ])
+        .expect_err("an unknown engine is refused");
+        assert!(error.contains("gpu"), "{error}");
     }
 
     #[test]

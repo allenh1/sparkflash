@@ -532,17 +532,15 @@ mod tests {
             .iter()
             .map(|value| half::bf16::from_f32(*value).to_bits())
             .collect();
-        // The f32 side of the comparison widens with an INDEPENDENT implementation (the `half`
-        // crate), not with the twin's own bf16_to_f32: otherwise "the two entry points agree" would
-        // only restate that both call the same widening. The helper's agreement with `half` is
-        // asserted separately, over every one of the 65,536 BF16 bit patterns, below.
-        let x_widened: Vec<f32> = x_bits
-            .iter()
-            .map(|bits| half::bf16::from_bits(*bits).to_f32())
-            .collect();
+        // The f32 side of the comparison widens with an INDEPENDENT expression - the bit shift that
+        // defines BF16 as the top half of an f32 - not with the twin's own bf16_to_f32, because
+        // otherwise "the two entry points agree" would only restate that both call the same
+        // widening. The helper's agreement with that expression is asserted over every one of the
+        // 65,536 BF16 bit patterns, below.
+        let x_widened: Vec<f32> = x_bits.iter().map(|bits| independent_widen(*bits)).collect();
         let gate_widened: Vec<f32> = gate_bits
             .iter()
-            .map(|bits| half::bf16::from_bits(*bits).to_f32())
+            .map(|bits| independent_widen(*bits))
             .collect();
         let from_f32 = route_f32(&x_widened, &gate_widened, &bias, params).expect("fits");
         let from_bf16 = route_bf16(&x_bits, &gate_bits, &bias, params).expect("fits");
@@ -553,13 +551,21 @@ mod tests {
         assert!((score * score - z.exp().ln_1p()).abs() < 1e-6);
     }
 
+    /// The BF16 -> F32 widening written out from the bit layout: a BF16 is the top sixteen bits of
+    /// an F32. This is deliberately NOT `half::bf16` and not the twin's `bf16_to_f32`: it is the
+    /// independent expression the twin's helper is checked against.
+    fn independent_widen(bits: u16) -> f32 {
+        f32::from_bits(u32::from(bits) << 16)
+    }
+
     #[test]
-    fn the_twins_widening_agrees_with_the_half_crate_on_every_bfloat16_pattern() {
+    fn the_twins_widening_matches_the_independent_bit_shift_on_every_bfloat16_pattern() {
         // Exhaustive over the 16-bit pattern space, so this is not a sample of lucky rows. NaN
-        // payloads are compared as NaN (the widening is allowed to quiet them).
+        // patterns are compared as NaN: the bit shift leaves a signalling NaN signalling, and a
+        // NaN-aware comparison is the only correct one there.
         for bits in 0..=u16::MAX {
             let widened = bf16_to_f32(bits);
-            let reference = half::bf16::from_bits(bits).to_f32();
+            let reference = independent_widen(bits);
             if reference.is_nan() {
                 assert!(
                     widened.is_nan(),
@@ -569,9 +575,16 @@ mod tests {
                 assert_eq!(
                     widened.to_bits(),
                     reference.to_bits(),
-                    "bits {bits:#06x} widened differently from the half crate"
+                    "bits {bits:#06x} widened differently from the bit shift"
                 );
             }
         }
+        // A signalling-NaN pattern is the case a bit shift and a conversion library are most likely
+        // to disagree on; both must still widen to a NaN.
+        assert!(
+            bf16_to_f32(0x7F81).is_nan(),
+            "sNaN pattern must widen to NaN"
+        );
+        assert!(independent_widen(0x7F81).is_nan());
     }
 }
