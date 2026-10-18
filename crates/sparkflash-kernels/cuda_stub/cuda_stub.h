@@ -125,3 +125,18 @@ __device__ __forceinline__ float sqrtf(float value) {
     return value;
 }
 
+
+// The device router's score function: sqrt(softplus(z)) with PyTorch's threshold. nvcc provides
+// expf/log1pf/sqrtf and the two rounding intrinsics; the clang probe only needs the declarations.
+__device__ __forceinline__ float log1pf(float value) {
+    (void)value;
+    return 0.0f;
+}
+
+__device__ __forceinline__ float __fmul_rn(float a, float b) {
+    return a * b;
+}
+
+__device__ __forceinline__ float __fadd_rn(float a, float b) {
+    return a + b;
+}

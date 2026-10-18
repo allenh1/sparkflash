@@ -31,8 +31,8 @@ use crate::engine::{
 };
 use crate::error::ApiError;
 use crate::prompt::{
-    PromptSummary, summarize_anthropic_messages, summarize_chat_messages, summarize_prompt_text,
-    summarize_responses_input,
+    PromptSummary, find_image_carrier, summarize_anthropic_messages, summarize_chat_messages,
+    summarize_prompt_text, summarize_responses_input,
 };
 use crate::reasoning::{self, ReasoningSpec};
 use crate::schema::{
@@ -230,6 +230,30 @@ fn invalid_body(error: serde_json::Error) -> ApiError {
     )
 }
 
+/// Refuses an image carrier found in the raw request body before generation.
+///
+/// This is D27's structural backstop: [`find_image_carrier`] walks every object and array, so
+/// an image spelling no typed parser knows (the documented `computer_screenshot` output, a
+/// `file_id`-only screenshot, a `code_interpreter_call` output, a case-variant
+/// `type`) is refused with the same HTTP 400 `unsupported_capability` as the capability
+/// seam, and the message names the shape and JSON path found. It runs before
+/// `validate_request` because the typed seam only sees the parts a parser understood.
+fn refuse_image_carrier(carrier: Option<String>) -> Result<(), ApiError> {
+    let Some(shape) = carrier else {
+        return Ok(());
+    };
+    Err(ApiError::invalid_request(
+        format!(
+            "this engine does not implement the vision capability: the request body carries an \
+             image at {shape}, and the 263 vision/aligner tensors and the three image delimiters \
+             are not wired into the tensor plan (DECISIONS.md D18), so it cannot be turned into \
+             visual tokens; the request is refused rather than answered from its text tokens alone"
+        ),
+        None,
+        Some("unsupported_capability".to_owned()),
+    ))
+}
+
 fn resolve_reasoning(value: &Value) -> Result<ReasoningSpec, ApiError> {
     // The Responses API nests the effort in `reasoning.effort`; everything else uses the
     // top-level `reasoning_effort` that crate::reasoning understands.
@@ -323,12 +347,17 @@ struct RequestBuilder {
 }
 
 impl RequestBuilder {
+    /// Builds the seam request. The parsed image parts are passed through - never turned into a
+    /// fabricated visual-token count - so the engine's `validate_request` can refuse them (see
+    /// [`crate::engine::MissingCapability`]) and a future vision engine has the payload it needs:
+    /// inline parts carry the decoded bytes, not only a length. The handler calls
+    /// `validate_request` before generation.
     fn build(self) -> EngineRequest {
         EngineRequest {
             request_id: self.id,
             model: self.model,
             prompt_tokens: self.summary.token_ids,
-            image_tokens: self.summary.image_tokens,
+            images: self.summary.images,
             max_tokens: self.max_tokens,
             temperature: self.temperature.unwrap_or(1.0),
             top_p: self.top_p.unwrap_or(1.0),
@@ -488,6 +517,7 @@ async fn chat_completions(
 ) -> Result<Response, ApiError> {
     let value = parse_json(&body)?;
     let spec = resolve_reasoning(&value)?;
+    let image_carrier = find_image_carrier(&value);
     let request: ChatCompletionRequest = serde_json::from_value(value).map_err(invalid_body)?;
     if request.messages.is_empty() {
         return Err(ApiError::invalid_request(
@@ -506,6 +536,7 @@ async fn chat_completions(
     let model = resolve_model(&state, request.model.as_deref())?;
     let trace = trace_context(&headers)?;
     let summary = summarize_chat_messages(&request.messages)?;
+    refuse_image_carrier(image_carrier)?;
     let id = state.next_id("chatcmpl-dsv41-");
     let created = state.now_unix();
     let trace_id = trace_request_id(&headers, &id);
@@ -527,6 +558,12 @@ async fn chat_completions(
         trace,
     }
     .build();
+    // The capability boundary: an engine that cannot serve a channel the request needs refuses
+    // here, with a typed error naming it, before any token is generated or streamed.
+    state
+        .engine
+        .validate_request(&engine_request)
+        .map_err(ApiError::from)?;
 
     if request.stream {
         let include_usage = request
@@ -759,6 +796,7 @@ async fn completions(
 ) -> Result<Response, ApiError> {
     let value = parse_json(&body)?;
     let spec = resolve_reasoning(&value)?;
+    let image_carrier = find_image_carrier(&value);
     let request: CompletionRequest = serde_json::from_value(value).map_err(invalid_body)?;
     let model = resolve_model(&state, request.model.as_deref())?;
     let trace = trace_context(&headers)?;
@@ -774,6 +812,7 @@ async fn completions(
         }
     };
     let summary = summarize_prompt_text(&prompt_text);
+    refuse_image_carrier(image_carrier)?;
     let id = state.next_id("cmpl-dsv41-");
     let created = state.now_unix();
     let trace_id = trace_request_id(&headers, &id);
@@ -790,6 +829,10 @@ async fn completions(
         trace,
     }
     .build();
+    state
+        .engine
+        .validate_request(&engine_request)
+        .map_err(ApiError::from)?;
 
     if request.stream {
         let include_usage = request
@@ -913,6 +956,7 @@ async fn responses(
 ) -> Result<Response, ApiError> {
     let value = parse_json(&body)?;
     let spec = resolve_reasoning(&value)?;
+    let image_carrier = find_image_carrier(&value);
     let request: ResponsesRequest = serde_json::from_value(value).map_err(invalid_body)?;
     if request.stream.unwrap_or(false) {
         return Err(ApiError::invalid_request(
@@ -931,6 +975,7 @@ async fn responses(
     if let Some(input) = request.input.as_ref() {
         summary.absorb(summarize_responses_input(input)?);
     }
+    refuse_image_carrier(image_carrier)?;
 
     let response_id = state.next_id("resp_dsv41_");
     let message_id = state.next_id("msg_dsv41_");
@@ -955,6 +1000,10 @@ async fn responses(
         trace,
     }
     .build();
+    state
+        .engine
+        .validate_request(&engine_request)
+        .map_err(ApiError::from)?;
     let _binding = RequestTraceBinding::new(trace_id);
     let output = drive_engine(state.engine.as_ref(), engine_request).await?;
     state
@@ -1008,6 +1057,7 @@ async fn messages(
 ) -> Result<Response, ApiError> {
     let value = parse_json(&body)?;
     let spec = resolve_reasoning(&value)?;
+    let image_carrier = find_image_carrier(&value);
     let request: MessagesRequest = serde_json::from_value(value).map_err(invalid_body)?;
     if request.stream.unwrap_or(false) {
         return Err(ApiError::invalid_request(
@@ -1026,6 +1076,7 @@ async fn messages(
     let model = resolve_model(&state, request.model.as_deref())?;
     let trace = trace_context(&headers)?;
     let summary = summarize_anthropic_messages(request.system.as_ref(), &request.messages)?;
+    refuse_image_carrier(image_carrier)?;
     let stop = request.stop_sequences.clone().unwrap_or_default();
     let id = state.next_id("msg_dsv41_");
     let trace_id = trace_request_id(&headers, &id);
@@ -1042,6 +1093,10 @@ async fn messages(
         trace,
     }
     .build();
+    state
+        .engine
+        .validate_request(&engine_request)
+        .map_err(ApiError::from)?;
     let _binding = RequestTraceBinding::new(trace_id);
     let output = drive_engine(state.engine.as_ref(), engine_request).await?;
     state
@@ -1086,17 +1141,31 @@ fn anthropic_stop_reason(reason: FinishReason) -> &'static str {
 
 async fn list_models(State(state): State<AppState>) -> Response {
     let created = state.now_unix();
-    // The capability line is the engine's own answer rather than a list of constants: a server must
-    // not advertise a channel its engine cannot serve. `image_url` and `tool_choice` ride along with
-    // the channel they belong to, and the reasoning-effort schema is published only when the engine
-    // honours it, because a caller reads its presence as "this server accepts it".
+    // Most of the capability line is the engine's own answer, because a server must not advertise a
+    // channel its engine cannot serve: `tools`, `thinking` and the reasoning-effort schema come from
+    // `Capabilities`, `tool_choice` rides along with tools, and the schema is published only when
+    // the engine honours it.
+    //
+    // `multimodal` and `image_url` are the exception: they are fixed `false` rather than read from
+    // a capability field. The image path is 263 `vision.*`/`aligner.*` tensors plus the three image
+    // delimiters that the tensor plan does not load (DECISIONS.md D18), so no engine in this
+    // workspace can serve an image part. A request carrying one is refused with
+    // `unsupported_capability` before generation (D27); advertising `true` would be a claim no
+    // engine can honour.
+    //
+    // This block is the single wiring point for a future vision engine: re-add `vision` to
+    // `Capabilities`, derive `multimodal` and `image_url` from it here, and override
+    // `InferenceEngine::validate_request` with the image forward - which consumes the
+    // `EngineRequest::images` parts already carried through the seam (including the decoded bytes
+    // of inline images) and produces the visual-token ids - in the same reviewed change. Until then no code path can print `true`, so the constants
+    // cannot drift from the refusal.
     let capabilities = state.engine.capabilities();
     let mut advertised = json!({
         "streaming": true,
         "tools": capabilities.tools,
         "tool_choice": capabilities.tools,
-        "multimodal": capabilities.vision,
-        "image_url": capabilities.vision,
+        "multimodal": false,
+        "image_url": false,
         "thinking": capabilities.thinking,
         "chat_template_kwargs": if capabilities.thinking { json!(["thinking"]) } else { json!([]) },
         "endpoints": [

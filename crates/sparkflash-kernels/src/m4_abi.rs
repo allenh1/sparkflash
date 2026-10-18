@@ -3,16 +3,18 @@
 //! This module is frozen. It is the Milestone-4 ABI conformance lint, and its own contract below says
 //! the scan is "explicitly NOT the proof" - the committed cubin baseline is - while review round after
 //! review round kept finding false accepts and false rejections in it (the history below reaches round
-//! 24). Each fix bought another parser feature for a proof a text scan cannot make, so the class is
+//! 36). Each fix bought another parser feature for a proof a text scan cannot make, so the class is
 //! closed rather than extended:
 //!
 //!   * no new scanner, parser or lint for a new kernel invariant is added to this file; a new
-//!     invariant goes to compiled-artifact inspection (scripts/check-kernel-baseline.sh recompiles
-//!     every Milestone 4 kernel and compares cubin bytes, sha256 and PTX membar lines against
-//!     baseline/kernel_baseline.txt in the cuda-abi CI job) or to a runtime device assertion in a
-//!     harness (the m7_layer0 device stages), where the shipped binary is what is measured;
+//!     invariant goes to compiled-artifact inspection
+//!     (crates/sparkflash-kernels/scripts/check-kernel-baseline.sh recompiles every Milestone 4
+//!     kernel and compares cubin bytes, sha256 and PTX membar lines against
+//!     crates/sparkflash-kernels/baseline/kernel_baseline.txt in the cuda-abi CI job) or to a
+//!     runtime device assertion in a harness (the m7_layer0 device stages), where the shipped
+//!     binary is what is measured;
 //!   * defects in the scanners already here are still fixed, with the mutation proof the file requires,
-//!     because they gate the kernels today: the freeze is on growth, not on correctness;
+//!     because they gate the kernels today: the freeze is on length, not on correctness;
 //!   * the file's length is pinned by ci/check-m4-abi-size.sh, wired into .gitlab-ci.yml; a change that
 //!     makes it longer fails that check, and a legitimate shrink updates the pin in the same commit.
 //!
@@ -2120,8 +2122,11 @@ mod pin_helpers {
         false
     }
 
-    /// Examples whose code imports the shared CUDA driver. String literals are masked first, so a
-    /// message that merely quotes the import path is not a user.
+    /// Examples whose code imports the shared CUDA driver, as their full source paths so a pin can
+    /// name the exact file - after the m7_layer0 split the importing file is
+    /// `examples/m7_layer0/main.rs`, and a basename-only witness would accept any other `main.rs`.
+    /// String literals are masked first, so a message that merely quotes the import path is not a
+    /// user.
     pub fn example_driver_users(sources: &[ScannedSource]) -> Vec<String> {
         sources
             .iter()
@@ -2129,7 +2134,7 @@ mod pin_helpers {
                 mask_string_literals(&crate::c_decl::strip_comments(source))
                     .contains("sparkflash_kernels::cuda_driver")
             })
-            .map(|(name, _)| display_name(name))
+            .map(|(name, _)| name.clone())
             .collect()
     }
 
@@ -2252,13 +2257,21 @@ fn examples_using_the_shared_cuda_driver_are_unsafe_free_and_name_no_raw_driver_
     let examples = pin_helpers::example_sources();
     let users = pin_helpers::example_driver_users(&examples);
     assert!(
-        users.iter().any(|name| name == "main.rs"),
+        users
+            .iter()
+            .any(|name| name.ends_with("examples/m7_layer0/main.rs")),
         "the split m7_layer0 example's main.rs must be one of the pinned driver examples, else the pin is vacuous; found {users:?}"
     );
     for (name, source) in &examples {
         pin_helpers::check_driver_example(source)
             .unwrap_or_else(|error| panic!("{}: {error}", pin_helpers::display_name(name)));
     }
+    // The split moved the driver import into main.rs but left the code it guards in the per-stage
+    // modules. The four-token check above only sees the file containing the import, so run it once
+    // over the concatenation the other m7 pins already scan: a raw driver token in a stage module
+    // must not become invisible just because the import lives one file over.
+    pin_helpers::check_driver_example(M7_LAYER0_SOURCE)
+        .unwrap_or_else(|error| panic!("examples/m7_layer0/: {error}"));
     let spoof = r#"const SPOOF: &str = "use sparkflash_kernels::cuda_driver::Cuda;";\nfn f() {}"#;
     assert!(
         !pin_helpers::example_driver_users(&[("spoof.rs".to_string(), spoof.to_string())])

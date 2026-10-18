@@ -33,8 +33,10 @@ records the evidence and the consequence for the build. Research backing is in
 | D22 | Released mHC arithmetic | The ref, the kernel and the harness model the released arithmetic end to end (projection rstd, `mix*scale+base`, sigmoid pre/post, released split-Sinkhorn, raw C, `X_hat` block norm, released `[24, n*d]` predictor); B0 removed the stream-mean fold from both sides, so the old structural difference is gone |
 | D23 | The activation quantiser is the reference ceil rule | Device activation quantisers take the smallest power of two at or above `amax/448` after the 1e-4 amax floor (the engine's `quantize_activation_fp8` rule); the checkpoint weight-grid rule stays floor-log2 and the two helpers are named apart (D8) |
 | D24 | CSA attention attends the window/compressed union | Format 2 (CSA-union) attends the window rows then the selected compressed ids, causal, with the sink first in the denominator; the 19-param ABI and formats 0/1 are unchanged, and it is reference-tested/CPU-pinned only until a device window proves it |
-| D25 | The golden sequence fixture is Phase-2 reference truth | The real-checkpoint fixture (`e6df8290...`, 2,536,194 B; 130-token prefill with next token 491, 8 decodes, compared 129..137) is the truth 2B/2C are measured against; device output is compared token-first then logits at 2e-2; the 2B device plumbing (rotation + format-2/1 dispatch, no forward chain) is wired on branch phase2/m8-sequence (MR !63 after the round-2 fix commit), no device run of the corrected path has happened, the token/logits comparison has not run, criterion 1 stays OPEN, and the fixture is never regenerated to accommodate a device change |
-| D26 | The Milestone-4 ABI source-text lint is frozen | No new source-text scanner, parser or lint in `m4_abi.rs`; new kernel invariants are enforced by compiled-artifact inspection (cubin/PTX baseline) or runtime device assertions, and `ci/check-m4-abi-size.sh` fails CI if the file grows past its pinned line count |
+| D25 | The golden sequence fixture is Phase-2 reference truth | The real-checkpoint fixture (`e6df8290...`, 2,536,194 B; 130-token prefill with next token 491, 8 decodes, compared 129..137) is the truth 2B/2C are measured against; device output is compared token-first then logits at 2e-2; the 2B device plumbing (rotation + format-2/1 dispatch, no forward chain) was merged as !63 (1ceeb54) and ran the corrected path on the node in the 2026-10-18T18:32Z window (11,764 copies, 198,832,128 B in 0.025624 s copy-only, 360 dispatches), the token/logits comparison has not run, criterion 1 stays OPEN, and the fixture is never regenerated to accommodate a device change |
+| D26 | The Milestone-4 ABI source-text lint is frozen | No new source-text scanner, parser or lint in `m4_abi.rs`; new kernel invariants are enforced by compiled-artifact inspection (cubin/PTX baseline) or runtime device assertions, and `ci/check-m4-abi-size.sh` fails CI if the file's line count differs from its pinned count |
+| D27 | The capability boundary has no vision channel | `Capabilities` has no `vision` field, `/v1/models` reports `multimodal: false`, and an image request is refused before generation with typed `MissingCapability::vision()` (HTTP 400 `unsupported_capability`); the 32x32 dummy grid and its 121 fabricated visual tokens are deleted, and `EngineRequest` carries the parsed `images: Vec<ImagePart>` (inline parts hold the decoded bytes) rather than `image_tokens`; the known protocol image `type`s are explicit part variants and a raw-body scan (`prompt::find_image_carrier`) refuses any image-family carrier the typed parser did not record, wherever it appears and in any case (a schema-name map key whose value is itself a JSON Schema aside) |
+| D28 | The reference engine is `Send + Sync` | `WeightSource` gained `Send + Sync` in !60 (`f72738b`), so `forward::InferenceEngine` is `Send + Sync`; `serve.rs`'s module docs are corrected and a compile-time assertion pins it, while the single-owner engine thread stays because the pass is one-sequence-at-a-time and the sampler swap consumes the engine, not because of thread-safety |
 
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
@@ -1238,17 +1240,20 @@ corrected reference) is a separate Lead decision that records a new sha256/size 
 old fixture superseded. The CSA-union format-2 semantics remain D24's; this entry does not restate
 them.
 
-**Consequence.** The 2B device plumbing is now wired on branch `phase2/m8-sequence` (MR !63):
-the measured `window_rows` rotation and the format-2/format-1 attention dispatch run in a device
-window, but the per-layer forward chain that would produce tokens and logits is still absent, and a
-2026-10-18 window ran the plumbing only. Round-2 adversarial review then found the first commit's
-rotation clock included verification/dispatch and its decoder rows were counted from position 0, so
-those numbers are superseded and the corrected path has not been re-run on a device; no device
-prefill/decode token or logits delta exists for this milestone. Phase 2 exit criterion 1
+**Consequence.** The 2B device plumbing is merged as !63 (1ceeb54): the measured `window_rows`
+rotation and the format-2/format-1 attention dispatch run in a device window, but the per-layer
+forward chain that would produce tokens and logits is still absent. Round-2 adversarial review found
+the first commit's rotation clock included verification/dispatch and its decoder rows were counted
+from position 0; both were fixed before merge and the first-window numbers are superseded. The
+corrected path then ran on the node in the 2026-10-18T18:32Z window: 11,764 `copy_dtod` calls moving
+198,832,128 B in 0.025624 s of copy-only time (7,400.000 MiB/s), 360 dispatches with 0 non-finite and
+320/320 identical repeats, and 9,926,144 B across 176 device buffers. It produced no token and no
+logits delta because the forward chain is absent, so no device prefill/decode token comparison exists
+for this milestone. Phase 2 exit criterion 1
 ([build/roadmap-to-serving.md](build/roadmap-to-serving.md) section 5.5.1) is therefore OPEN, as are
-criteria 2-5. Format 2 is reference-tested/CPU-pinned only (D24, !62 -> main d3dcc3f, pipeline
-2763); its device execution is the next Lead-sequenced step, and this fixture is what that run will
-be measured against.
+criteria 2-5. Format 2 has executed on devices (the isolated task-14 check and this plumbing run;
+D24, !62 -> main d3dcc3f, pipeline 2763); this fixture is what the eventual token/logits comparison
+will be measured against.
 
 ---
 
@@ -1260,14 +1265,19 @@ Recorded 2026-10-18.
 geometry from `#define`s, re-parses `__global__` signatures, re-evaluates the kernels' static asserts
 in Rust and checks trace-scope wrapping by reading kernel source text. Its own module doc records the
 contract that makes its size a liability rather than a virtue: the scan is "explicitly NOT the proof",
-the committed cubin baseline is, and the review history recorded there reaches round 24, where every
-round was a real false accept or a real false rejection (round 24: a `return`, a control keyword or a
-non-returning call in the poll's own argument list was invisible to both checks). Each fix added
+the committed cubin baseline is, and the review history recorded there reaches round 36, where every
+round was a real false accept or a real false rejection (the round-24 paragraph in
+`crates/sparkflash-kernels/src/m4_abi.rs` records one: a `return`, a control keyword or a
+non-returning call in the poll's own argument list was invisible to both checks; the last recorded
+round is 36, an attributed `try`/`catch` body both checks accepted while refusing the plain
+spelling). Each fix added
 another parser feature for a property a text scan cannot establish: that the compiled kernel is what
 the source appears to say. Measured 2026-10-18: 13,854 lines at main `2245a4e`, 13,874 with the
-freeze notice this entry records, and 13,893 after the `m7_layer0` split replaced the two
+freeze notice this entry records, 13,893 after the `m7_layer0` split replaced the two
 `include_str!`s of the single example file with one concatenation constant (the split moved the
-pinned statements into per-stage modules; the pins scan the same text, concatenated).
+pinned statements into per-stage modules; the pins scan the same text, concatenated), and 13,906
+after the task-11 follow-up hardening (the corrected round-33 claim, crate-relative baseline paths,
+the exact `m7_layer0/main.rs` witness and the four-token check over the concatenation).
 
 **Decision.** Freeze the file. (1) No new source-text scanner, parser or lint for a new kernel
 invariant is added to it. A new invariant is enforced by compiling the kernel and inspecting the
@@ -1276,10 +1286,10 @@ kernels and compares cubin bytes, cubin sha256 and PTX `membar` line count again
 `crates/sparkflash-kernels/baseline/kernel_baseline.txt`, and the `cuda-abi` CI job runs it - or by a
 runtime device assertion in a harness (the `m7_layer0` device stages), where the shipped binary is
 what is measured. (2) Defects in the scanners already present are still fixed, with the mutation proof
-the module requires: the freeze is on growth, not on correctness. (3) The committed line count is
+the module requires: the freeze is on length, not on correctness. (3) The committed line count is
 pinned by `ci/check-m4-abi-size.sh` and enforced by the `m4-abi-freeze` job in `.gitlab-ci.yml`: any
-growth fails the pipeline, so a commit that changes the length must change `PINNED_LINES` in the same
-diff. That diff is the deliberate, reviewable act; a scanner cannot arrive as a side effect of an
+line-count change, growth or shrink, fails the pipeline, so a commit that changes the length must
+change `PINNED_LINES` in the same diff. That diff is the deliberate, reviewable act; a scanner cannot arrive as a side effect of an
 unrelated edit.
 
 **Consequence.** A proposed kernel invariant that can only be enforced by reading source text must
@@ -1289,8 +1299,262 @@ harness. A new parser feature in `m4_abi.rs` is now a policy exception that need
 decision, not a maintenance change. Nothing in this entry alters the kernels or the scanners'
 verdicts: the existing tests keep gating every pipeline.
 
-**Verification.** Notice plus a CI script, no behaviour change: `wc -l` on the file (13,893 lines),
+**Verification.** Notice plus a CI script, no behaviour change: `wc -l` on the file (13,906 lines),
 `sh ci/check-m4-abi-size.sh` prints the pin line and was run against a one-line growth (exit 1) and
 against the restored file (exit 0), and `cargo test -p sparkflash-kernels` continues to run the
 module's own tests, which this change does not edit. No GPU, no checkpoint and no cluster were
 involved.
+
+---
+
+## D27 - The capability boundary has no vision channel, and an image request is refused before generation
+
+Recorded 2026-10-18.
+
+**Evidence.** The image path is 263 `vision.*`/`aligner.*` tensors plus the three image delimiters
+(`image_start`, `image_end`, `image_newline`) - the 266 names D18 records as absent from
+`TensorPlan::language_model`, 970,536,960 stored bytes. None of them is loaded, and no forward
+module consumes them: there is no vision tower, no aligner and no token-grid derivation anywhere in
+`crates/sparkflash-engine`. Before this entry `crates/sparkflash-api/src/multimodal.rs` nevertheless
+carried `DEFAULT_IMAGE_GRID = 32` and `default_image_tokens()`, `prompt.rs` charged 121 visual
+tokens per image part, and the api capability set had a `vision: bool` that `Capabilities::ALL` set
+true. The consequence was that a chat request carrying an image was accepted: it was answered from
+its text tokens with a usage block counting visual tokens no engine produced, and `/v1/models`
+advertised `multimodal: true` for the `ALL` engine.
+
+**Decision.** The capability boundary is the engine's own answer, and no engine in this workspace
+can answer yes to vision:
+
+- `Capabilities` has no `vision` field. `/v1/models` reports `multimodal: false` and
+  `image_url: false` as constants, because the channel is absent rather than a driver's choice.
+- `engine::Capability::Vision` and `engine::MissingCapability` are the typed vocabulary of a
+  capability a request needs and an engine lacks. `InferenceEngine::validate_request` defaults to
+  refusing a request whose `images` list is non-empty with `MissingCapability::vision()`; all four
+  request routes call it before generation and map it to HTTP 400 `unsupported_capability`. The
+  message names the missing channel and the 263 unwired tensors.
+- `EngineRequest::image_tokens` is gone. A request carries `images: Vec<ImagePart>` - the parsed
+  parts, in request order - never a visual-token count nothing measured. `default_image_tokens()`
+  and `DEFAULT_IMAGE_GRID` are deleted; `count_image_tokens(grid_h, grid_w)` remains as the
+  published tiling arithmetic for a front end that derives a real grid, and nothing in the request
+  path calls it. The payload is carried all the way to the seam - inline parts hold the decoded
+  payload bytes, not only a length - so a future vision forward can decode pixels and derive token
+  ids without re-parsing the request.
+- The known protocol image content `type`s are explicit `ContentPart` variants: `image_url`,
+  `input_image` and Anthropic `image` (a `source` object, also accepted on the chat route). The
+  variants are the typed half, not the whole boundary. `prompt::find_image_carrier` scans the raw
+  request body and refuses any carrier the typed parsers did not record: any object key naming an
+  image (`image_url`, `input_image`, `image`, `computer_screenshot`, and the conservative
+  `file_id`), any `type` value containing `image`, `screenshot` or `vision`
+  case-insensitively anywhere in the body, and any value under a carrier key (the key alone is
+  the carrier: `{"image_url": null}` is refused, and a `data:` URL is not special). A text field
+  that merely mentions the word "image" (or contains a `data:` URL as text) is not a carrier and
+  stays accepted; a genuinely non-image part such as `input_audio` still takes the fail-open
+  `Other` path. The scan is deliberately conservative: a carrier spelling no typed parser knows is
+  refused with the same HTTP 400 `unsupported_capability`, naming the JSON path and spelling
+  found, rather than being answered from text.
+- `push_object` walks both `content` and `output` for Responses items, so an image nested under a
+  `function_call_output`/`computer_call_output` `output` array becomes the same `ImagePart` as a
+  top-level one (review round 2; see the corrections below). It remains the typed half: the raw
+  scan covers containers it does not walk (for example `code_interpreter_call.outputs` and the
+  documented `computer_screenshot` object under `output`).
+- `ReferenceDriver::generate` refuses an image part with the same code as defense in depth, for
+  callers that drive the driver directly instead of through the router.
+
+**Consequence.** A multimodal request can no longer reach a token count: `/v1/chat/completions`
+(both an `image_url` part, a bare Anthropic `image` block and the case-variant
+`{"type":"Image"}` spelling - the first two used to bypass the check, see below),
+`/v1/completions` (an `<image>` placeholder in the prompt, and any carrier key such as a stray
+`file_id`), `/v1/responses` (`input_image`; one nested under a `function_call_output`
+`output` array; the documented `computer_call_output` screenshot as an object or inside an
+`output` array; a `file_id`-only screenshot; a `code_interpreter_call.outputs` image; and
+any future image-family type or carrier key at any depth) and `/v1/messages` (an Anthropic
+`image` block and any untyped carrier) all answer 400 with code `unsupported_capability` and a
+message containing `vision` and `263`; a recording engine in
+`crates/sparkflash-api/tests/router.rs` shows `generate` is never entered, so the dummy-grid path is
+unreachable from a request. `crates/sparkflash-engine/tests/tensor_plan.rs` pins the 263 excluded
+names and the exact 970,536,960 bytes, and `the_plan_bytes_are_exact_not_approximately_right` pins
+the total without the index. Tests: `engine.rs`'s `the_capability_set_has_no_vision_channel`,
+`a_request_with_an_image_part_is_refused_with_the_missing_capability` and
+`a_scripted_request_with_an_image_part_charges_no_fabricated_visual_tokens`; `prompt.rs`'s
+`image_url_parts_are_decoded_and_recorded_without_charging_visual_tokens`,
+`chat_route_anthropic_image_block_is_recorded_not_ignored`,
+`a_responses_function_call_output_nested_image_is_recorded`,
+`a_genuinely_non_image_unknown_part_is_still_accepted_and_ignored`,
+`the_image_carrier_detector_finds_arbitrary_nested_shapes` and
+`the_image_carrier_detector_does_not_scan_arbitrary_text`; `router.rs`'s
+`an_image_request_is_refused_with_the_missing_capability_and_never_reaches_the_engine`,
+`a_nested_responses_image_cannot_bypass_the_refusal`,
+`every_route_refuses_an_image_request_with_the_same_typed_error`,
+`the_documented_screenshot_shapes_are_refused_without_entering_the_engine`,
+`every_route_refuses_an_untyped_image_carrier_with_the_same_typed_error`,
+`a_text_only_body_that_mentions_images_is_still_served`,
+`a_non_image_unknown_chat_part_is_still_accepted_and_ignored` and
+`models_reports_the_engines_own_capabilities`; `serve.rs`'s
+`an_image_request_is_refused_with_the_typed_missing_capability` and
+`the_driver_declares_no_channel_it_does_not_serve`. No device run is involved or claimed. When the
+vision path is wired, the channel returns to `Capabilities`, `validate_request` is overridden with
+the image forward (which consumes `EngineRequest::images` and produces the visual-token ids) and
+this entry is superseded rather than edited.
+
+**Corrected after review (2026-10-18).** The first revision of this entry claimed all four routes
+refused every image shape; it did not. `/v1/chat/completions` deserialised content parts into a
+typed `ContentPart` enum whose `#[serde(other)]` arm (`ContentPart::Other`, "accepted but ignored")
+swallowed an Anthropic image block sent to the chat route: `{"type":"image","source":{...}}` produced
+no `ImagePart`, so `image_parts` stayed 0, `validate_request` returned `Ok` and generation ran -
+HTTP 200, `image_tokens: 0`, and a prompt-token count for its text part alone (the critic's
+reproduction reported `prompt_tokens: 11`; the body pinned in `tests/router.rs` has the text `hi`,
+which costs 8 prompt tokens: 4 message overhead + 1 text + 3 reply primer). The fix is the explicit
+`ContentPart::Image` variant above plus the `push_image_source` helper shared with the
+`/v1/messages` and `/v1/responses` paths; `every_route_refuses_an_image_request_with_the_same_typed_error`
+now carries that exact body and the recording-engine test carries it too, and the catch-all policy is
+stated on `ContentPart::Other` and pinned by
+`a_genuinely_non_image_unknown_part_is_still_accepted_and_ignored`. The earlier claim was a defect in
+this record as well as in the code, and it is corrected here rather than quietly reworded.
+
+**Corrected after review, round 2 (2026-10-18).** The chat-route fix was not the last silent
+fallback. `push_object`'s default arm recursed only into `content` and `text`, so
+`{"input":[{"type":"function_call_output","call_id":"c1","output":[{"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="}]}]}`
+on `/v1/responses` never produced an `ImagePart`: the request was answered HTTP 200 from its text
+with `image_tokens: 0`, and `generate` was entered. The default arm now walks `content` and
+`output`; `every_route_refuses_an_image_request_with_the_same_typed_error` and
+`a_nested_responses_image_cannot_bypass_the_refusal` pin that exact body (400
+`unsupported_capability`, with the recording engine showing `generate` was never entered), and
+`a_responses_function_call_output_nested_image_is_recorded` pins the parser half. `ImagePart::Data`
+also grew the decoded payload bytes (it previously held only `byte_len`), so the "payload is carried
+through the seam" claim in this entry, `engine.rs` and `server.rs` is now true rather than a
+description of a length.
+
+**Corrected after review, round 3 (2026-10-18).** Round 2 fixed the `output` *array* but the
+documented `computer_call_output` shape nests its image as an object under `output`, and its
+type is `computer_screenshot`, not `input_image`: that body, the same shape inside an
+`output` array, and the `file_id`-only screenshot each reached generation and were answered
+HTTP 200 from the text. The reviewer's point was that another spelling would follow, because the fix
+so far was an enumeration. This entry now relies on a structural scan instead:
+`prompt::find_image_carrier` walks every object and array in the raw body and refuses (a) any
+carrier key anywhere - `image_url`, `input_image`, `image`, `computer_screenshot`, and
+`file_id` (conservative: a file reference cannot be shown to be a non-image file) - (b) any
+`type` value containing `image`, `screenshot` or `vision` case-insensitively, and (c)
+**any value** under a carrier key (the key alone is the carrier: `{"image_url": null}` is refused,
+and a `data:` URL is not special). The typed parsers and `MissingCapability::vision()` still handle
+the known shapes; the scan runs in every handler before generation and returns the same HTTP 400
+`unsupported_capability` with a message naming the JSON path and spelling. The pinned tests are
+`router.rs`'s `the_documented_screenshot_shapes_are_refused_without_entering_the_engine` (object
+and array screenshot, `file_id`-only, `code_interpreter_call.outputs` image,
+`{"type":"Image"}`, and an arbitrary-depth future type),
+`every_route_refuses_an_untyped_image_carrier_with_the_same_typed_error` (the same class on all
+four routes) and `a_text_only_body_that_mentions_images_is_still_served`, plus `prompt.rs`'s
+`the_image_carrier_detector_finds_arbitrary_nested_shapes` and
+`the_image_carrier_detector_does_not_scan_arbitrary_text` and, as my own attempt to defeat the
+detector before review, `five_independent_bypass_attacks_are_all_refused` (a carrier four
+containers deep under an unknown item type, an upper-case key, a carrier under a nested
+`function_call_output` output object, a `file_id`/screenshot pair, and a `type` spelled
+with a JSON unicode escape so only the decoded value carries the word). That last test is the
+adversarial half of the pin, not a claim that five shapes exhaust the space. The scan is structural
+over keys and `type` values, not a byte scan: image bytes under an unrelated key with no carrier
+name and no image-family `type` word are indistinguishable from text without decoding payloads the
+router has no parser for, and are not refused; every protocol image shape this router serves has one
+or the other, which is what the tests above pin. The `Image`-spelling end-to-end claim from round 1
+is now true rather than a description of the opposite behaviour: that spelling is refused.
+
+**Corrected after review, round 3 (false positives, then a false negative).** The structural scan
+was too broad in the other direction: it refused pure-text requests whose schema merely uses the
+names. A tool definition
+`{"tools":[{"function":{"parameters":{"properties":{"image":{"type":"string"}}}}}]}` and a
+`response_format` JSON Schema with an `image` property answered HTTP 400 although they
+carry no media. A first fix exempted whole schema/data subtrees by key name; the reviewer rejected
+that: a real carrier under `arguments`, `metadata` or `items` would then return
+`None` and be served from text - the same silent-fallback class, with a different key. The scan
+now exempts only the **immediate child keys of the JSON Schema name maps** in
+`prompt.rs::SCHEMA_NAME_MAPS` (`properties`, `patternProperties`, `$defs`,
+`definitions`), and only when the mapped value is itself a JSON Schema (a bool, an empty
+object, or an object whose keys are all in `prompt.rs::SCHEMA_KEYWORDS`): those keys are names,
+not payload, and each child schema value is still walked. A **non-schema value under such a name is
+payload**, so the name is carrier-matched and the value falls through to the normal scan; the
+reviewer's second finding was that the name-only exemption left
+`{"properties":{"image":"data:image/png;base64,..."}}` invisible and served with generation
+entered. Every other key is scanned, so a nonstandard `arguments` object carrying
+`image_url` (the real OpenAI shape is a JSON string, which no string scan touches) and an
+`image` under `metadata` are refused fail-closed, not served. Pinned by `router.rs`'s
+`schema_name_maps_do_not_trip_the_refusal_but_data_carriers_still_do` (tool and
+`response_format` schemas served with generation entered; an `arguments` carrier, a
+carrier under an arbitrary non-exempt `payload`, a scalar under `properties.image` and a
+nested `properties...image_url` object all 400 with `generate` not entered) and
+`prompt.rs`'s `the_image_carrier_detector_exempts_schema_names_only` (valid
+bool/empty/keyword-only schemas exempt, child schema values walked, `arguments`/`metadata`
+carriers refused) and `a_non_schema_value_under_a_schema_name_is_still_refused` (a string, a
+number or an object with an unknown key under `properties`/`patternProperties`/`definitions`
+is refused; bool, empty and keyword-only schemas stay `None`). The existing bypass matrix is
+unchanged and still passes; the five attacks were restored to their original `parameters`
+carriers, which the narrowed scan refuses again.
+
+**Corrected after review, round 3 (third false positive: the keyword list).** The schema-shape test
+is only as good as its keyword list: a legitimate schema
+`{"properties":{"image":{"type":"object","minProperties":1}}}`, a draft-07 `dependencies`
+schema, and `$defs.image_url` with `minProperties` were classified as payload because
+`minProperties`, `maxProperties` and `dependencies` were missing from
+`prompt.rs::SCHEMA_KEYWORDS`, so an image-named property under them was refused (HTTP 400,
+`generate` not entered). The list now carries those three plus the OpenAPI annotation keys
+common tool schemas use (`example`, `xml`, `externalDocs`; `deprecated`,
+`readOnly`, `writeOnly` and `discriminator` were already there), alongside the
+already-present `dependentRequired`, `dependentSchemas`, `propertyNames`,
+`contains`/`minContains`/`maxContains`, `unevaluatedProperties`/`unevaluatedItems`,
+`prefixItems`/`additionalItems`/`additionalProperties`. The unknown-key policy is
+deliberate and unchanged: a mapped object with a key outside the list cannot be proven to be a JSON
+Schema, so a carrier name under it is payload and is refused fail-closed - serving it would reopen
+the silent-fallback class. Pinned in `prompt.rs`'s
+`standard_schema_keywords_outside_the_first_list_do_not_trip_the_refusal` (minProperties,
+maxProperties, draft-07 dependencies, `$defs.image_url` + minProperties and the OpenAPI
+annotations stay `None`; an unknown-keyword object under `properties.image` is refused)
+and in `router.rs`'s `schema_name_maps_do_not_trip_the_refusal_but_data_carriers_still_do`
+(those three schema shapes served with generation entered; an unknown-keyword carrier 400 with
+`generate` not entered, beside the existing fail-closed pins). The existing bypass matrix is
+unchanged.
+
+**Why removing the field is not a breaking change, and why the advertised constants cannot lie.**
+`Capabilities` is a workspace-internal type: no crate in the workspace is published, nothing
+serialises the struct (the wire shape is written explicitly in `server.rs::list_models`), and the
+only consumers are `crates/sparkflash-cli/src/serve.rs` - which answers the conservative default -
+and the api's own tests. The HTTP contract is unchanged: `/v1/models` still carries `multimodal`
+and `image_url`; they are now constants `false`. Before this entry the served `ReferenceDriver`
+already answered `false` for both, and the only `true` came from
+`MockEngine::with_capabilities(Capabilities::ALL)` in tests, i.e. a claim no served engine made, so
+no client that worked against the shipped server changes behaviour. Hardcoding `false` cannot lie
+today because the advertisement and the refusal are both unconditional (including every shape in
+the corrections above; the raw-body scan is what makes the refusal independent of the typed
+parser's spelling list), and there is exactly one reviewed wiring point for the
+future: re-add `vision: bool` to `Capabilities`, derive `multimodal`/`image_url` from it in
+`server.rs::list_models` (the comment there marks the spot), and override `validate_request` with
+the image forward. The payload half is already in place - `EngineRequest::images` carries the parsed
+parts, including the decoded bytes of inline images - so the wiring change needs the 263 tensors, the
+visual-token derivation and the capability flag, not a new request field; until it lands, no code
+path can print `true`.
+
+---
+
+## D28 - The reference engine is `Send + Sync`, and `serve`'s docs said otherwise
+
+Recorded 2026-10-18.
+
+**Evidence.** `crates/sparkflash-cli/src/serve.rs`'s module docs said, until this entry, that
+`sparkflash_engine::forward::InferenceEngine` "is neither" `Send` nor `Sync` because it holds
+`Box<dyn WeightSource>` and `WeightSource` "declares no `Send` bound". That was true when the
+driver was written; !60 (`f72738b`, "engine: parallel reference pass (no arithmetic change)") added
+the bound - `crates/sparkflash-engine/src/weights.rs:106` is now
+`pub trait WeightSource: Send + Sync` - because the MoE block reads independent experts from several
+threads. Every remaining field of `forward::InferenceEngine` (`ModelConfig`, `TensorPlan`, `usize`,
+`Sampling`) is thread-safe, so the engine is `Send + Sync` as a type.
+
+**Decision.** Correct the docs to the truth and pin it with a compile-time assertion rather than a
+comment: `serve.rs` carries
+`const _: () = { const fn assert_send_sync<T: Send + Sync>() {} assert_send_sync::<...InferenceEngine>(); };`,
+so a future field that breaks the claim stops the crate compiling. The single-owner engine thread
+stays, but its justification is now the engine's shape, not thread-safety: the reference pass runs
+one sequence at a time, and each request applies its sampler by consuming the engine
+(`with_sampling`), so one mutable owner is the honest shape. Building an engine per request - the
+other way to get `Send + Sync` - would re-open and re-verify a checkpoint per request.
+
+**Consequence.** No behaviour change and no new dependency; the driver still talks to the engine
+thread over channels and requests still serialise. The module docs state both facts (the type is
+`Send + Sync`; the passes serialise by design), and `the_driver_declares_no_channel_it_does_not_serve`
+pins the capability half while the `const` assertion pins the thread-safety half. No device run is
+involved or claimed.

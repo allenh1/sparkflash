@@ -16,6 +16,7 @@ use sparkflash_engram::EngramTelemetrySnapshot;
 use sparkflash_kv::{KvCacheStatsSnapshot, KvCacheTelemetry, PrefixMatchPlan};
 
 use crate::loop_abort::{LoopAbort, LoopAbortConfig, LoopAbortDetector};
+use crate::multimodal::ImagePart;
 use crate::telemetry_types::{
     CompletionTokensDetails, DSparkStepStats, DeepSeekSparkRequestStats, OpenAiUsageWithCache,
     PromptTokensDetails, RequestTimingStats, RoceTransportStats, finite_or_zero,
@@ -120,8 +121,15 @@ pub struct EngineRequest {
     pub model: String,
     /// Prompt token ids (placeholder ids in Milestone 1).
     pub prompt_tokens: Vec<u32>,
-    /// Visual tokens contributed by image content parts.
-    pub image_tokens: usize,
+    /// Image content parts carried by the prompt, in request order.
+    ///
+    /// The router passes the parsed parts through and [`InferenceEngine::validate_request`] refuses
+    /// any request that has one with [`MissingCapability::vision`] before generation: no engine in
+    /// this workspace implements the image path, so there is no honest visual-token count to carry
+    /// beside them. Inline parts carry the decoded payload bytes, so a vision front end can decode
+    /// them to pixels and derive the ids, never from an assumed grid: the future wiring point has
+    /// the payload it needs.
+    pub images: Vec<ImagePart>,
     /// Hard cap on generated tokens.
     pub max_tokens: usize,
     /// Sampling temperature.
@@ -147,7 +155,8 @@ pub struct EngineRequest {
 pub enum EngineEvent {
     /// Emitted first, before any delta.
     Started {
-        /// Total prompt tokens (text plus visual).
+        /// Total prompt tokens. Text only: a request carrying an image part is refused before
+        /// generation, because no engine in this workspace implements the vision path.
         prompt_tokens: usize,
         /// Prompt tokens served from the prefix cache.
         cached_tokens: usize,
@@ -373,10 +382,21 @@ impl ClusterStatsSnapshot {
 /// Every field defaults to `false`, which is the most conservative answer there is: an engine that
 /// has not declared a channel is treated as not having it, so `GET /v1/models` can never advertise
 /// a capability by omission. A driver opts in by saying what it really does.
+///
+/// There is deliberately no `vision` (or `multimodal`) field. The image path is the 263
+/// `vision.*`/`aligner.*` tensors plus the three image delimiters, and the tensor plan does not
+/// load any of them (DECISIONS.md D18), so no engine in this workspace can serve an image. A
+/// channel no driver can implement is not a capability that defaults to `false`; it is absent, and
+/// a request that needs it is refused with [`MissingCapability`] rather than answered from its text
+/// tokens or charged a visual-token count derived from an assumed image grid. When the vision path
+/// is wired, the channel returns here as a field that is `true` only for an engine that really
+/// carries the tensors - and `server::list_models` derives `multimodal`/`image_url` from it instead
+/// of the constants there today, in the same change that overrides `validate_request`. The parsed
+/// payload - including the decoded bytes of inline images - is already carried on
+/// [`EngineRequest::images`], so only the vision forward (which decodes those bytes to pixels) and
+/// the visual-token ids are missing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Capabilities {
-    /// Whether the engine accepts image parts.
-    pub vision: bool,
     /// Whether the engine can emit tool calls.
     pub tools: bool,
     /// Whether the engine produces a reasoning channel.
@@ -386,13 +406,83 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// Every optional channel declared: what an engine that does all of it answers.
+    /// Every optional channel this workspace implements, declared: what an engine that does all of
+    /// it answers. Vision is not in the list because no engine here implements it (see the type
+    /// docs).
     pub const ALL: Self = Self {
-        vision: true,
         tools: true,
         thinking: true,
         reasoning_effort: true,
     };
+}
+
+/// A capability a request can require and an engine can lack.
+///
+/// This is the vocabulary of the *missing* capability. [`Capabilities`] says what an engine has;
+/// a request that needs a channel the engine lacks is refused with [`MissingCapability`] before any
+/// generation. Vision is the only such channel today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Capability {
+    /// An engine that can turn image parts into visual tokens: the vision tower, the aligner and the
+    /// three image delimiters.
+    Vision,
+}
+
+impl Capability {
+    /// The stable spelling the Display impl and error messages use.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vision => "vision",
+        }
+    }
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A request needs a capability the engine does not implement.
+///
+/// Returned by [`InferenceEngine::validate_request`] before any generation, so the HTTP layer can
+/// answer with a client error that names the missing channel instead of streaming an answer computed
+/// from the request's text tokens alone. The only channel today is [`Capability::Vision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("this engine does not implement the {capability} capability: {detail}")]
+pub struct MissingCapability {
+    capability: Capability,
+    detail: &'static str,
+}
+
+impl MissingCapability {
+    /// The channel the request needed.
+    #[must_use]
+    pub fn capability(self) -> Capability {
+        self.capability
+    }
+
+    /// The machine-readable code the HTTP layer answers with.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        "unsupported_capability"
+    }
+
+    /// The missing vision capability, with the reason the image path cannot be served.
+    ///
+    /// The reason is the same one [`Capabilities`] cites: the image path is 263
+    /// `vision.*`/`aligner.*` tensors plus the three image delimiters, and the tensor plan loads
+    /// none of them (DECISIONS.md D18).
+    #[must_use]
+    pub fn vision() -> Self {
+        Self {
+            capability: Capability::Vision,
+            detail: "the 263 vision/aligner tensors and the three image delimiters are not wired into \
+                     the tensor plan (DECISIONS.md D18), so an image part cannot be turned into visual \
+                     tokens; the request is refused rather than answered from its text tokens alone",
+        }
+    }
 }
 
 /// The model runtime behind the HTTP layer.
@@ -413,6 +503,23 @@ pub trait InferenceEngine: Send + Sync {
     /// its behalf.
     fn capabilities(&self) -> Capabilities {
         Capabilities::default()
+    }
+
+    /// Checks that this engine can serve `request` before any generation.
+    ///
+    /// The default implementation refuses a request that carries an image part with
+    /// [`MissingCapability::vision`]: no engine in this workspace implements the image path, and
+    /// [`Capabilities`] deliberately has no vision channel to consult. An engine that really can
+    /// serve images overrides this method together with the capability surface, so the refusal and
+    /// the advertisement stay the same fact.
+    ///
+    /// # Errors
+    /// [`MissingCapability`] naming the first channel the request needs and the engine lacks.
+    fn validate_request(&self, request: &EngineRequest) -> Result<(), MissingCapability> {
+        if !request.images.is_empty() {
+            return Err(MissingCapability::vision());
+        }
+        Ok(())
     }
 }
 
@@ -602,7 +709,7 @@ impl MockEngine {
     }
 
     fn script(&self, request: &EngineRequest) -> Vec<EngineEvent> {
-        let prompt_tokens = request.prompt_tokens.len() + request.image_tokens;
+        let prompt_tokens = request.prompt_tokens.len();
         let plan = self.kv.plan_request(
             prompt_tokens,
             self.uma_matched,
@@ -701,7 +808,10 @@ impl MockEngine {
                 cached_tokens: plan.global_kv_cached_tokens,
                 uma_cached_tokens: plan.uma_hit_tokens,
                 nvme_cached_tokens: plan.nvme_restored_tokens,
-                image_tokens: request.image_tokens,
+                // No engine here produces visual tokens. The router refuses an image request via
+                // validate_request; a direct caller that bypasses that check still gets no
+                // fabricated count from this mock.
+                image_tokens: 0,
             },
             completion_tokens_details: CompletionTokensDetails {
                 reasoning_tokens,
@@ -786,7 +896,7 @@ mod tests {
             request_id: "req-1".to_owned(),
             model: MODEL_ID.to_owned(),
             prompt_tokens: vec![1, 2, 3],
-            image_tokens: 0,
+            images: Vec::new(),
             max_tokens: 64,
             temperature: 1.0,
             top_p: 1.0,
@@ -833,6 +943,64 @@ mod tests {
                 .capabilities(),
             Capabilities::ALL
         );
+    }
+
+    #[test]
+    fn the_capability_set_has_no_vision_channel() {
+        // A struct literal, so re-adding a `vision` field fails to compile until this test and the
+        // refusal in `validate_request` are updated together: there is no channel to advertise while
+        // the 263 vision/aligner tensors are unwired (DECISIONS.md D18, D27).
+        let every_implemented_channel = Capabilities {
+            tools: true,
+            thinking: true,
+            reasoning_effort: true,
+        };
+        assert_eq!(Capabilities::ALL, every_implemented_channel);
+    }
+
+    #[test]
+    fn a_request_with_an_image_part_is_refused_with_the_missing_capability() {
+        let engine = MockEngine::new(MODEL_ID);
+        let mut request = request();
+        request.images = vec![ImagePart::Placeholder];
+        let error = engine
+            .validate_request(&request)
+            .expect_err("no engine in this workspace implements the vision path");
+        assert_eq!(error.capability(), Capability::Vision);
+        assert_eq!(error.code(), "unsupported_capability");
+        let message = error.to_string();
+        assert!(message.contains("vision"), "names the channel: {message}");
+        assert!(
+            message.contains("263"),
+            "names the unwired tensors: {message}"
+        );
+    }
+
+    #[test]
+    fn a_text_request_passes_the_capability_check() {
+        let engine = MockEngine::new(MODEL_ID);
+        assert_eq!(engine.validate_request(&request()), Ok(()));
+    }
+
+    #[test]
+    fn a_scripted_request_with_an_image_part_charges_no_fabricated_visual_tokens() {
+        // The mock is handed a request that bypassed the router's refusal. It still charges only the
+        // prompt it was given: there is no 32x32 grid to fall back on (D27).
+        let engine = MockEngine::new(MODEL_ID).content(&["ok"]);
+        let mut request = request();
+        request.images = vec![ImagePart::Placeholder];
+        let events = collect(&engine, request);
+        match events.first() {
+            Some(EngineEvent::Started { prompt_tokens, .. }) => assert_eq!(*prompt_tokens, 3),
+            other => panic!("expected Started, got {other:?}"),
+        }
+        match events.last() {
+            Some(EngineEvent::Finished { usage, .. }) => {
+                assert_eq!(usage.prompt_tokens, 3);
+                assert_eq!(usage.prompt_tokens_details.image_tokens, 0);
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
     }
 
     #[test]
@@ -958,18 +1126,6 @@ mod tests {
                 assert_eq!(usage.completion_tokens, 5);
             }
             other => panic!("expected Finished, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn image_tokens_are_counted_in_the_prompt() {
-        let engine = MockEngine::new(MODEL_ID).content(&["ok"]);
-        let mut request = request();
-        request.image_tokens = 576;
-        let events = collect(&engine, request);
-        match events.first() {
-            Some(EngineEvent::Started { prompt_tokens, .. }) => assert_eq!(*prompt_tokens, 3 + 576),
-            other => panic!("expected Started, got {other:?}"),
         }
     }
 

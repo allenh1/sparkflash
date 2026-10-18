@@ -1103,6 +1103,15 @@ to "are we ready to serve" that is not a claim.
 
 ### 8.1 What exists, and why the surface is not the work
 
+The surface is honest about what it cannot do. The engine capability set has no vision channel,
+`GET /v1/models` reports `multimodal: false` and `image_url: false`, and a request carrying an image
+part is refused before generation with HTTP 400 `unsupported_capability` and a message naming the
+missing vision capability - rather than answered from its text tokens or charged a visual-token count
+derived from an assumed 32x32 grid. The vision tower and aligner are 263 checkpoint tensors the
+tensor plan does not load (D18), so the channel is absent rather than merely unimplemented
+(DECISIONS.md D27). The Phase 5 device engine inherits that boundary: it reports the conservative
+capability set and the same typed refusal.
+
 The API crate is a full HTTP surface with an `InferenceEngine` seam and a `MockEngine` behind it
 ([crates/sparkflash-api/src/engine.rs](../../crates/sparkflash-api/src/engine.rs)); the scheduler
 crate has chunked prefill with the bounded HSI indexer, the short-request bypass, the DSpark

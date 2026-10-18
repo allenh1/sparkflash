@@ -22,8 +22,9 @@ Measured on that base commit (and still true on this branch, which does not touc
   `mega_mhc_sm121`, `b12x_mxfp8_dense_sm121`, `b12x_mxfp4_moe_sm121`, `flash_mla_csa2_sm121`,
   `b12x_mxfp8_wo_a_sm121`, `cert_lm_head_sm121`. `swiglu_mxfp8_quant_sm121` is **not** in it, and the
   build-script warning says "6 of the six Milestone 4 kernels".
-* `scripts/check-kernel-baseline.sh:19` names **seven** kernels (the six above plus
-  `swiglu_mxfp8_quant_sm121`), and `baseline/kernel_baseline.txt:10-16` pins seven cubins.
+* `crates/sparkflash-kernels/scripts/check-kernel-baseline.sh:19` names **seven** kernels (the six
+  above plus `swiglu_mxfp8_quant_sm121`), and
+  `crates/sparkflash-kernels/baseline/kernel_baseline.txt:11-17` pins seven cubins.
 * `kernels/` holds eight `.cu` files: the six above, `swiglu_mxfp8_quant_sm121.cu`, and
   `rocenante_oneshot_sm121.cu` (which has its own probe). So "six" is spec 6.2's Milestone-4 set; the
   standalone swiglu kernel is compiled and pinned by the baseline script but not by the build-script
@@ -110,15 +111,18 @@ adds scanner features for properties text cannot establish.
 
 * The file is frozen by a module-level notice: no new source-text scanner/parser/lint for a new
   kernel invariant; new invariants go to compiled artifacts (cubin/PTX baseline via
-  `scripts/check-kernel-baseline.sh`, which the `cuda-abi` job runs) or to runtime device assertions
-  in a harness. Existing scanner defects are still fixed.
-* Recorded as DECISIONS D26, including the measured size and the reasoning (round 24's false
-  accept/reject history).
-* Enforced by `ci/check-m4-abi-size.sh` (fails if the file grows past the pin) and the
-  `m4-abi-freeze` job in `.gitlab-ci.yml`. Measured 2026-10-18: 13,854 lines at main `2245a4e`,
-  13,874 once the freeze notice landed, 13,893 after the m7_layer0 split replaced the two
-  `include_str!`s of the old example file with one concatenation constant. The pin moved in the same
-  commit as each intentional change, which is D26's deliberate-act rule.
+  `crates/sparkflash-kernels/scripts/check-kernel-baseline.sh`, which the `cuda-abi` job runs) or to
+  runtime device assertions in a harness. Existing scanner defects are still fixed.
+* Recorded as DECISIONS D26, including the measured size and the reasoning (the file's review history
+  reaches round 36: at this branch's pin the round-36 A1 attributed-`try`/`catch` finding is
+  `m4_abi.rs:822` and `:3694`, the round-33 A1 `BARE BLOCK` comment is `:4607`, and the round-24
+  paragraph is `:203`).
+* Enforced by `ci/check-m4-abi-size.sh` (fails if the line count differs from the pin, in either
+  direction, since the task-11 hardening) and the `m4-abi-freeze` job in `.gitlab-ci.yml`. Measured
+  2026-10-18: 13,854 lines at main `2245a4e`, 13,874 once the freeze notice landed, 13,893 after the
+  m7_layer0 split replaced the two `include_str!`s of the old example file with one concatenation
+  constant, and 13,906 after the task-11 hardening. The pin moved in the same commit as each
+  intentional change, which is D26's deliberate-act rule.
 
 ## 7. `m7_layer0` is too large
 
@@ -133,6 +137,16 @@ adds scanner features for properties text cannot establish.
 * Proof in the repository: `python3 ci/verify-m7-layer0-split.py` (verbatim slices from `2245a4e`),
   plus 17 CLI/validation argv paths with byte-identical stdout/stderr/exit against a pre-split
   binary. Device stages were **not** run (no GB10, checkpoint or cubins on the dev host).
+
+## References re-checked, not claimed exhaustive
+
+The D10-D13 dedupe (`c739f93`) removed a duplicate block; it did **not** make every `DECISIONS.md`
+citation in the tree resolve. Checked in the task-11 follow-up: `crates/sparkflash-scheduler/src/engine.rs:18`
+cited `docs/DECISIONS.md:151-155` for the `X-Request-Id` binding, which was already wrong at base
+`2245a4e` - those lines are the Task-6 stage-9 extension inside D4 (Dense 264-byte Engram rows), not
+the request-binding decision (D9, `docs/DECISIONS.md:272`). Fixed to `docs/DECISIONS.md D9` there;
+this citation predates the dedupe and was not caused by it. No other `DECISIONS.md` line citation was
+re-checked, and this note makes no claim that the rest are correct.
 
 ## What this note does not do
 

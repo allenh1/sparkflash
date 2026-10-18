@@ -1,6 +1,6 @@
 //! The shared CUDA harness pieces the stage harnesses build their launches from.
 //!
-//! Two families live here, both moved out of examples/m7_layer0.rs so the m7 chain harness and the
+//! Two families live here, both moved out of examples/m7_layer0/main.rs so the m7 chain harness and the
 //! m8 sequence harness cannot drift from each other:
 //!
 //! * FlashMlaParams and flash_mla_params: the one constructor for flash_mla_csa2_sm121's pinned

@@ -44,10 +44,11 @@ rustdoc:
 
 # D26 freezes the Milestone-4 ABI lint (crates/sparkflash-kernels/src/m4_abi.rs): it parses kernel
 # source text, and its own contract says that scan is explicitly not the proof - the committed cubin
-# baseline is - while the recorded review history reaches round 24 with a real false accept or false
+# baseline is - while the recorded review history reaches round 36 with a real false accept or false
 # rejection in every round. New kernel invariants go to compiled-artifact inspection (the cuda-abi
-# job's baseline) or runtime device assertions instead. This cheap, always-on check fails if the file
-# grows past its pinned line count, so a new scanner cannot arrive as a side effect of another edit.
+# job's baseline) or runtime device assertions instead. This cheap, always-on check fails if the
+# file's line count differs from its pin, so a new scanner cannot arrive as a side effect of another
+# edit and an existing one cannot disappear without the pin diff.
 # A commit that changes the file's length changes PINNED_LINES in ci/check-m4-abi-size.sh in the same
 # diff; that diff is the deliberate act a reviewer reads.
 m4-abi-freeze:
@@ -158,8 +159,8 @@ cuda-abi:
     # other.
     - cargo clippy -p sparkflash-kernels --all-targets --features cuda -- -D warnings
     # The committed kernel baseline is the check that would catch a kernel silently changing. It
-    # recompiles all seven baseline kernels (the six Milestone 4 kernels and the M7 SwiGLU
-    # quantiser epilogue) with this job's nvcc, compares the cubin bytes, the
+    # recompiles all eight baseline kernels (the six Milestone 4 kernels, the M7 SwiGLU
+    # quantiser epilogue and the task-37 device router) with this job's nvcc, compares the cubin bytes, the
     # cubin sha256 and the PTX membar line count against
     # crates/sparkflash-kernels/baseline/kernel_baseline.txt, and reports a different toolkit as a
     # toolkit change (with the regenerate command) rather than as a kernel change - a compiler

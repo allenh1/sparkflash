@@ -11,6 +11,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
+use crate::engine::MissingCapability;
 use crate::multimodal::MultimodalError;
 use crate::reasoning::ReasoningError;
 
@@ -204,6 +205,17 @@ impl From<ReasoningError> for ApiError {
             Some(param.to_owned()),
             Some(code.to_owned()),
         )
+    }
+}
+
+impl From<MissingCapability> for ApiError {
+    fn from(error: MissingCapability) -> Self {
+        // A capability is the engine's own answer, so the refusal is a client error: the request
+        // asked for a channel this deployment does not serve, and no retry can change that. `param`
+        // is left unset because the image can arrive through `messages`, `prompt`, `input` or
+        // `content`, so naming one field would be wrong on the other three routes; the message names
+        // the missing capability and the code is `unsupported_capability`.
+        Self::invalid_request(error.to_string(), None, Some(error.code().to_owned()))
     }
 }
 

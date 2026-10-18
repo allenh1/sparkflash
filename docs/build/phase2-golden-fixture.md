@@ -2,8 +2,9 @@
 
 Status: **the real-checkpoint sequence fixture exists.** It was produced on the node `node0` on
 2026-10-18 from main `f72738b`, in a Lead-sequenced vLLM-down window, and it is the **reference
-truth** for milestone 2B/2C. It is **not** a device run and it closes no exit criterion: the 2B
-device comparison has not run, and Phase 2 exit criterion 1
+truth** for milestone 2B/2C. It is **not** a device run and it closes no exit criterion: 2B's device
+plumbing ran on the node on 2026-10-18 but the device comparison (tokens then logits against this
+fixture) has not run, and Phase 2 exit criterion 1
 ([roadmap-to-serving.md](roadmap-to-serving.md) section 5.5.1) remains OPEN. The CSA-union format-2
 semantics that can reproduce this fixture's attended set are [DECISIONS.md](../DECISIONS.md) D24; the
 decision that this fixture is the truth is D25.
@@ -140,8 +141,9 @@ not implement CED (D7), and positions older than the window have no comparable d
 ## 6. What it is not, and the rule that protects it
 
 * Not a device run: no kernel launch, no CUDA, no GPU output, nothing here is device evidence.
-* Not exit-criterion evidence: 2B has not run on a device (the skeleton is CPU-pinned in draft MR
-  !63), so Phase 2 exit criterion 1 stays OPEN; criteria 2-5 are not claimed either.
+* Not exit-criterion evidence: no device run has compared tokens or logits against this fixture (the
+  2B plumbing run of 2026-10-18T18:32Z measured rotation and dispatch only), so Phase 2 exit
+  criterion 1 stays OPEN; criteria 2-5 are not claimed either.
 * Not a CED-parity claim: only the compared set is comparable, and the harness supplies the
   encoder/decoder split.
 * Not a claim that the device will match: the fixture is what the device run is measured against.
@@ -160,7 +162,7 @@ by-product of a device milestone.
   [commit](https://example.com/sparkflash/-/commit/f72738b5a63996a8425d11d744c4abb5f321e007)
 - MR !62 (CSA-union kernel, merged):
   [merge request 62](https://example.com/sparkflash/-/merge_requests/62)
-- MR !63 (2B skeleton, draft, CPU-pinned):
+- MR !63 (2B harness, merged as 1ceeb54):
   [merge request 63](https://example.com/sparkflash/-/merge_requests/63)
 - pipeline 2763 (!62, green):
   [pipeline 2763](https://example.com/sparkflash/-/pipelines/2763)

@@ -16,16 +16,24 @@
 //! does not measure is left at the zero it actually is, with the reason written beside it. There is
 //! no cluster, no rank and no rail behind this process, so nothing here reports one.
 //!
-//! # The engine is not `Send`, and the seam requires `Send + Sync`
+//! # The engine is `Send + Sync` (since !60), and it still has one owner thread
 //!
-//! The api crate's engine trait is `Send + Sync`. The reference engine is neither: it holds its
-//! weights as `Box<dyn WeightSource>`, and `WeightSource` declares no `Send` bound, so the box
-//! erases the concrete source's thread-safety and the engine as a whole cannot be moved between
-//! threads or shared. Two ways out exist and this module takes the honest one: the engine is built
-//! and owned by one dedicated thread, and the driver the router holds talks to it over channels.
-//! The driver is therefore `Send + Sync` by construction, the engine never leaves the thread that
-//! built it, and no `unsafe` is involved. The alternative - building an engine per request - would
-//! re-open and re-verify a checkpoint for every request.
+//! The api crate's seam requires `Send + Sync`. Until !60 (`f72738b`, "engine: parallel reference
+//! pass") the reference engine was neither: it held its weights as `Box<dyn WeightSource>`, and
+//! `WeightSource` then declared no `Send` bound, so the box erased the concrete source's
+//! thread-safety. That is no longer true - `sparkflash_engine::weights::WeightSource` is declared
+//! `Send + Sync` so the MoE block can read independent experts concurrently, and every other field
+//! of `sparkflash_engine::forward::InferenceEngine` (`ModelConfig`, `TensorPlan`, `usize`,
+//! `Sampling`) is thread-safe - so the engine is `Send + Sync` as a type. The assertion below
+//! pins that, and the earlier revision of these docs said the opposite.
+//!
+//! The driver still holds the engine on one dedicated thread, but thread-safety is no longer the
+//! reason. The reason is the engine's shape: the reference pass runs one sequence at a time, and a
+//! request applies its own sampler by consuming the engine (`with_sampling`), so the engine wants a
+//! single mutable owner rather than a shared lock. Building one engine per request, the other way
+//! to get `Send + Sync`, would re-open and re-verify a checkpoint for every request. The channel
+//! handoff keeps the driver weight-free and the engine on the thread that built it; no `unsafe` is
+//! involved.
 //!
 //! The consequence is that requests are serialised. That is the reference engine's own shape: one
 //! sequence, one chunk at a time, no batching. A request is one job on that thread.
@@ -61,7 +69,8 @@ use sparkflash_api::encoding::{HfTokenizerEncoder, load_hf_tokenizer, reference_
 use sparkflash_api::engine::InferenceEngine as ApiInferenceEngine;
 use sparkflash_api::engine::{
     Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason, MODEL_ID,
-    MODEL_MAX_OUTPUT_TOKENS, default_engram_layers, empty_kv_snapshot, max_seq_len,
+    MODEL_MAX_OUTPUT_TOKENS, MissingCapability, default_engram_layers, empty_kv_snapshot,
+    max_seq_len,
 };
 use sparkflash_api::telemetry_types::{
     CompletionTokensDetails, DSparkStepStats, DeepSeekSparkRequestStats, OpenAiUsageWithCache,
@@ -100,6 +109,17 @@ const SYNTHETIC_WEIGHT_SEED: u64 = 0;
 
 /// The name the engine thread runs under, so a panic names it.
 const ENGINE_THREAD_NAME: &str = "sparkflash-engine";
+
+/// Pins the thread-safety fact the module docs state.
+///
+/// `WeightSource` gained `Send + Sync` in !60 (`f72738b`), so the boxed source no longer erases
+/// the concrete source's thread-safety and the reference engine is `Send + Sync` as a type. This is
+/// a compile-time assertion, not a test: if a future field or trait bound breaks the claim, the
+/// crate stops compiling and the docs above have to change with it.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<sparkflash_engine::forward::InferenceEngine>();
+};
 
 /// What this process can honestly say about the fabric it is running on: nothing.
 const NO_FABRIC: &str = "none (reference serve: one process, no RoCE)";
@@ -319,8 +339,9 @@ fn load_tokenizer(path: &Path) -> Result<HfTokenizerEncoder, String> {
 
 /// The api crate's engine, backed by the engine thread.
 ///
-/// It holds no engine state: a job in, replies out. That is what makes it `Send + Sync` while the
-/// engine on the other end is neither (see the module docs).
+/// It holds no engine state: a job in, replies out. That is what makes it `Send + Sync`; the
+/// reference engine it drives is `Send + Sync` too (see the module docs) but still lives on one
+/// dedicated thread by design, not because a boxed trait object forced it to.
 pub struct ReferenceDriver {
     model: String,
     jobs: tokio::sync::mpsc::Sender<Job>,
@@ -366,14 +387,13 @@ impl ApiInferenceEngine for ReferenceDriver {
     }
 
     fn generate(&self, request: EngineRequest) -> BoxStream<'static, EngineEvent> {
-        // The reference pass is text-only. Answering an image request from its text tokens alone
-        // would present text the caller did not ask for as if the image had been seen, so it is
-        // refused instead.
-        if request.image_tokens > 0 {
-            return refused(
-                "the reference engine has no vision path: this request carries image tokens, so it is refused rather than answered from its text tokens alone",
-                REFUSED_CODE,
-            );
+        // The reference pass is text-only, and the image path is 263 vision/aligner tensors plus the
+        // three delimiters that the tensor plan does not load (DECISIONS.md D18). Answering from the
+        // text tokens alone would present an answer as if the image had been seen, so the request is
+        // refused with the same typed missing-capability fact the seam reports (D27).
+        if !request.images.is_empty() {
+            let missing = MissingCapability::vision();
+            return refused(&missing.to_string(), missing.code());
         }
         if request.prompt_tokens.is_empty() {
             return refused(
@@ -452,9 +472,9 @@ impl ApiInferenceEngine for ReferenceDriver {
     }
 
     /// The reference driver is text-only: it takes no image part, emits no tool call and has no
-    /// reasoning channel, so it answers with the conservative set. That is also the trait's default,
-    /// which is what keeps the advertisement and `generate`'s refusal of an image request from
-    /// drifting apart.
+    /// reasoning channel, so it answers with the conservative set. That is the trait's default, and
+    /// it relies on the trait's default `validate_request`, which refuses an image part for every
+    /// engine that does not override it.
     fn capabilities(&self) -> Capabilities {
         Capabilities::default()
     }
@@ -994,7 +1014,7 @@ mod tests {
             request_id: "test-request".to_owned(),
             model: MODEL_ID.to_owned(),
             prompt_tokens: prompt.to_vec(),
-            image_tokens: 0,
+            images: Vec::new(),
             max_tokens,
             temperature,
             top_p: 1.0,
@@ -1250,13 +1270,36 @@ mod tests {
     // ---- refusals that never reach the engine --------------------------------------------
 
     #[tokio::test]
-    async fn an_image_request_is_refused_rather_than_answered_without_the_image() {
+    async fn an_image_request_is_refused_with_the_typed_missing_capability() {
         let driver = synthetic_driver(4);
         let mut with_image = request(&[1, 2, 3], 4, 0.0, 0);
-        with_image.image_tokens = 2;
+        with_image.images = vec![sparkflash_api::ImagePart::Placeholder];
         let stream = events(&driver, with_image).await;
         assert_eq!(stream.len(), 1, "a refusal is one event: {stream:?}");
-        assert!(matches!(stream.first(), Some(EngineEvent::Error { .. })));
+        match stream.first() {
+            Some(EngineEvent::Error { message, code }) => {
+                assert_eq!(code, MissingCapability::vision().code());
+                assert!(
+                    message.contains("vision"),
+                    "the refusal names the channel: {message}"
+                );
+            }
+            other => panic!("a refusal is one Error event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_driver_declares_no_channel_it_does_not_serve() {
+        // The image path and the tool/reasoning channels: the reference pass implements none of them.
+        assert_eq!(synthetic_driver(1).capabilities(), Capabilities::default());
+        // And the capability check refuses an image part rather than letting `generate` answer from
+        // the text tokens alone.
+        let mut with_image = request(&[1, 2, 3], 4, 0.0, 0);
+        with_image.images = vec![sparkflash_api::ImagePart::Placeholder];
+        assert_eq!(
+            synthetic_driver(1).validate_request(&with_image),
+            Err(MissingCapability::vision())
+        );
     }
 
     #[tokio::test]

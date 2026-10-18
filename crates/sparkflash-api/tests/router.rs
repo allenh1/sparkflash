@@ -4,6 +4,7 @@
 //! MockEngine, so response bodies (including exact SSE framing) are asserted directly.
 
 use std::io::Read as _;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{Mutex, MutexGuard};
 
@@ -12,7 +13,10 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::{Value, json};
-use sparkflash_api::engine::{Capabilities, ClusterStatsSnapshot, InferenceEngine, MockEngine};
+use sparkflash_api::engine::{
+    Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest, InferenceEngine,
+    MissingCapability, MockEngine,
+};
 use sparkflash_api::server::{disarm_traces, router};
 use sparkflash_api::state::AppState;
 use tower::ServiceExt as _;
@@ -41,6 +45,71 @@ fn app() -> Router {
 
 fn app_with(engine: MockEngine) -> Router {
     router(AppState::new(Arc::new(engine)).with_fixed_time(FIXED_TIME))
+}
+
+/// An engine that counts how many times generation was entered.
+///
+/// Used to show a refused request never reaches the model: the image path is refused at the seam,
+/// so the dummy-grid accounting some earlier revision would have run has no way in.
+#[derive(Clone, Default)]
+struct RecordingEngine {
+    calls: Arc<AtomicUsize>,
+}
+
+impl InferenceEngine for RecordingEngine {
+    fn model_id(&self) -> &str {
+        MODEL
+    }
+
+    fn generate(
+        &self,
+        _request: EngineRequest,
+    ) -> futures::stream::BoxStream<'static, EngineEvent> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(futures::stream::empty())
+    }
+
+    fn cluster_stats(&self) -> ClusterStatsSnapshot {
+        ClusterStatsSnapshot::default()
+    }
+}
+
+/// A scripted engine that also records that generation was entered.
+///
+/// `RecordingEngine` above is deliberately empty (a refusal test only needs "was the engine
+/// entered"), so a test that expects HTTP 200 needs a stream that finishes. This wraps
+/// `MockEngine`'s script and counts the calls.
+struct RecordingMockEngine {
+    calls: Arc<AtomicUsize>,
+    inner: MockEngine,
+}
+
+impl RecordingMockEngine {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            inner: MockEngine::new(MODEL),
+        }
+    }
+}
+
+impl InferenceEngine for RecordingMockEngine {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn generate(&self, request: EngineRequest) -> futures::stream::BoxStream<'static, EngineEvent> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.generate(request)
+    }
+
+    fn cluster_stats(&self) -> ClusterStatsSnapshot {
+        self.inner.cluster_stats()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
 }
 
 async fn send(app: Router, request: Request<Body>) -> (StatusCode, HeaderMap, Vec<u8>) {
@@ -271,19 +340,343 @@ async fn thinking_flags_are_accepted_and_validated() {
 }
 
 #[tokio::test]
-async fn image_url_content_parts_are_accepted_and_counted() {
+async fn an_image_request_is_refused_with_the_missing_capability_and_never_reaches_the_engine() {
+    let engine = RecordingEngine::default();
+    let calls = Arc::clone(&engine.calls);
+    let app = router(AppState::new(Arc::new(engine)).with_fixed_time(FIXED_TIME));
+    // Two shapes for the same route. The second is the regression: an Anthropic image block sent to
+    // the chat route used to deserialise to `ContentPart::Other`, be dropped, and reach generation
+    // with no image - HTTP 200 from the text tokens alone (critic finding on 8a1b99b).
+    let bodies = [
+        json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+            ]}],
+        }),
+        json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}},
+            ]}],
+        }),
+    ];
+    for body in bodies {
+        let (status, _, bytes) =
+            send(app.clone(), json_request("/v1/chat/completions", &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error = body_json(&bytes);
+        assert_eq!(error["error"]["code"], MissingCapability::vision().code());
+        assert_eq!(
+            error["error"]["type"], "invalid_request_error",
+            "a capability the engine lacks is a client error, not a server failure"
+        );
+        let message = error["error"]["message"].as_str().expect("message");
+        assert!(message.contains("vision"), "names the channel: {message}");
+        assert!(
+            message.contains("263"),
+            "names the unwired tensors: {message}"
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the engine was never entered: no visual-token count, fabricated or otherwise, was produced"
+    );
+}
+
+#[tokio::test]
+async fn a_nested_responses_image_cannot_bypass_the_refusal() {
+    let engine = RecordingEngine::default();
+    let calls = Arc::clone(&engine.calls);
+    let app = router(AppState::new(Arc::new(engine)).with_fixed_time(FIXED_TIME));
+    let body = json!({
+        "model": MODEL,
+        "input": [{
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": [{"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="}],
+        }],
+    });
+    let (status, _, bytes) = send(app, json_request("/v1/responses", &body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(&bytes)["error"]["code"],
+        MissingCapability::vision().code()
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the engine was never entered for a nested image"
+    );
+}
+
+#[tokio::test]
+async fn the_documented_screenshot_shapes_are_refused_without_entering_the_engine() {
+    // Review round 3: the canonical OpenAI computer_call_output nests its image under output as
+    // an object, not an array of content parts, and the documented screenshot type is
+    // computer_screenshot; a file-reference screenshot has no URL at all. Each shape used to reach
+    // generation with no ImagePart recorded. The structural detector in prompt.rs refuses all of
+    // them, plus a case-variant type and a carrier at an arbitrary depth.
+    let engine = RecordingEngine::default();
+    let calls = Arc::clone(&engine.calls);
+    let app = router(AppState::new(Arc::new(engine)).with_fixed_time(FIXED_TIME));
+    let bodies = [
+        // The documented object output.
+        json!({
+            "model": MODEL,
+            "input": [{
+                "type": "computer_call_output",
+                "call_id": "c1",
+                "output": {"type": "computer_screenshot", "image_url": "data:image/png;base64,aGVsbG8="},
+            }],
+        }),
+        // The same carrier inside an output array.
+        json!({
+            "model": MODEL,
+            "input": [{
+                "type": "computer_call_output",
+                "call_id": "c1",
+                "output": [{"type": "computer_screenshot", "image_url": "data:image/png;base64,aGVsbG8="}],
+            }],
+        }),
+        // A file_id-only screenshot: there is no URL to look for, only the carrier.
+        json!({
+            "model": MODEL,
+            "input": [{
+                "type": "computer_call_output",
+                "call_id": "c1",
+                "output": {"type": "computer_screenshot", "file_id": "file-123"},
+            }],
+        }),
+        // A code_interpreter_call output carrying a future image part type.
+        json!({
+            "model": MODEL,
+            "input": [{
+                "type": "code_interpreter_call",
+                "call_id": "c1",
+                "outputs": [{
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="},
+                }],
+            }],
+        }),
+        // A case variant of a known type: serde's tag match is case-sensitive, the detector is not.
+        json!({
+            "model": MODEL,
+            "input": [{"type": "Image", "image_url": "data:image/png;base64,aGVsbG8="}],
+        }),
+        // A carrier under an item type that does not exist yet, two containers deep.
+        json!({
+            "model": MODEL,
+            "input": [{
+                "type": "future_tool_call",
+                "payload": {"nested": [{"frame": {"type": "Computer_Screenshot"}}]},
+            }],
+        }),
+    ];
+    for body in bodies {
+        let (status, _, bytes) = send(app.clone(), json_request("/v1/responses", &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        let error = body_json(&bytes);
+        assert_eq!(
+            error["error"]["code"],
+            MissingCapability::vision().code(),
+            "body: {body}"
+        );
+        assert_eq!(error["error"]["param"], Value::Null, "body: {body}");
+        let message = error["error"]["message"].as_str().expect("message");
+        assert!(
+            message.contains("vision") && message.contains("263"),
+            "names the channel and the tensors: {message}"
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no screenshot shape reached generation"
+    );
+}
+
+#[tokio::test]
+async fn every_route_refuses_an_untyped_image_carrier_with_the_same_typed_error() {
+    // The detector is route-independent: it scans the raw body the handler already parsed, so a
+    // carrier the typed parsers missed is refused on all four routes with the capability error.
+    let engine = RecordingEngine::default();
+    let calls = Arc::clone(&engine.calls);
+    let app = router(AppState::new(Arc::new(engine)).with_fixed_time(FIXED_TIME));
+    let bodies = [
+        (
+            "/v1/chat/completions",
+            json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "Image", "image_url": "data:image/png;base64,aGVsbG8="},
+                ]}],
+            }),
+        ),
+        (
+            "/v1/responses",
+            json!({
+                "model": MODEL,
+                "input": [{"type": "computer_call_output", "call_id": "c1",
+                           "output": {"type": "computer_screenshot", "file_id": "file-123"}}],
+            }),
+        ),
+        (
+            "/v1/messages",
+            json!({
+                "model": MODEL,
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": [
+                    {"type": "computer_screenshot", "image_url": "data:image/png;base64,aGVsbG8="},
+                ]}],
+            }),
+        ),
+        (
+            // Any carrier key anywhere: a stray file_id on the completions route is refused too.
+            "/v1/completions",
+            json!({"model": MODEL, "prompt": "hi", "file_id": "file-123"}),
+        ),
+    ];
+    for (uri, body) in bodies {
+        let (status, _, bytes) = send(app.clone(), json_request(uri, &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+        assert_eq!(
+            body_json(&bytes)["error"]["code"],
+            MissingCapability::vision().code(),
+            "{uri}: {body}"
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no untyped carrier reached generation"
+    );
+}
+
+#[tokio::test]
+async fn a_text_only_body_that_mentions_images_is_still_served() {
+    // The detector looks for carriers, not words: prose about an image, and even a data: URL in a
+    // text field, is text (D27's fail-open rule for genuinely non-image content).
+    let body = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": [{
+            "type": "text",
+            "text": "an image of a cat; image_url and file_id are words here, and data:image/png;base64,aGVsbG8= is text",
+        }]}],
+    });
+    let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body_json(&bytes)["choices"][0]["message"]["content"],
+        "Hello world"
+    );
+}
+
+#[tokio::test]
+async fn a_non_image_unknown_chat_part_is_still_accepted_and_ignored() {
+    // The ContentPart::Other catch-all stays fail-open for genuinely non-image parts (D27): an
+    // audio part must not be mistaken for an image, so this request is served rather than refused.
     let body = json!({
         "model": MODEL,
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": "hi"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+            {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
         ]}],
     });
     let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
-    assert_eq!(status, StatusCode::OK);
-    let body = body_json(&bytes);
-    assert_eq!(body["usage"]["prompt_tokens_details"]["image_tokens"], 121);
-    assert_eq!(body["usage"]["prompt_tokens"], 8 + 121);
+    assert_eq!(status, StatusCode::OK, "a non-image part is not refused");
+    assert_eq!(
+        body_json(&bytes)["choices"][0]["message"]["content"],
+        "Hello world"
+    );
+}
+
+#[tokio::test]
+async fn every_route_refuses_an_image_request_with_the_same_typed_error() {
+    // The image can arrive as a chat content part, an Anthropic image block on the chat route, a
+    // completion prompt tag, a Responses input_image or an Anthropic image block. Each route must
+    // refuse it at the same seam, with the same typed error, before generation - otherwise one of
+    // them would silently fall back to text.
+    let bodies = [
+        (
+            "/v1/chat/completions",
+            json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "image_url", "image_url": {"url": "https://example.invalid/a.png"}},
+                ]}],
+            }),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}},
+                ]}],
+            }),
+        ),
+        (
+            "/v1/completions",
+            json!({"model": MODEL, "prompt": "look <image>AAAA</image>"}),
+        ),
+        (
+            "/v1/responses",
+            json!({
+                "model": MODEL,
+                "input": [
+                    {"type": "input_text", "text": "hi"},
+                    {"type": "input_image", "image_url": "https://example.invalid/a.png"},
+                ],
+            }),
+        ),
+        (
+            // Review round 2: an image nested under a function_call_output's output array used to
+            // be skipped by the default arm and answered from text (HTTP 200, generate entered).
+            "/v1/responses",
+            json!({
+                "model": MODEL,
+                "input": [{
+                    "type": "function_call_output",
+                    "call_id": "c1",
+                    "output": [{"type": "input_image", "image_url": "data:image/png;base64,aGVsbG8="}],
+                }],
+            }),
+        ),
+        (
+            "/v1/messages",
+            json!({
+                "model": MODEL,
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}},
+                ]}],
+            }),
+        ),
+    ];
+    for (uri, body) in bodies {
+        let (status, _, bytes) = send(app(), json_request(uri, &body)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{uri} must refuse an image"
+        );
+        let error = body_json(&bytes);
+        assert_eq!(
+            error["error"]["code"],
+            MissingCapability::vision().code(),
+            "{uri}"
+        );
+        assert_eq!(error["error"]["param"], Value::Null, "{uri}");
+    }
 }
 
 #[tokio::test]
@@ -534,7 +927,10 @@ async fn models_reports_the_engines_own_capabilities() {
         .as_object()
         .expect("capabilities is an object")
         .clone();
-    assert_eq!(caps["multimodal"], false, "no vision path, no multimodal");
+    assert_eq!(
+        caps["multimodal"], false,
+        "no engine in this workspace has a vision path, so multimodal is never advertised"
+    );
     assert_eq!(caps["image_url"], false);
     assert_eq!(caps["tools"], false, "no tool calls, no tools");
     assert_eq!(caps["tool_choice"], false);
@@ -549,7 +945,10 @@ async fn models_reports_the_engines_own_capabilities() {
         "streaming is the server's own capability, not the engine's"
     );
 
-    // And an engine that declares every channel is advertised with every channel.
+    // And an engine that declares every implemented channel is advertised with every implemented
+    // channel. `Capabilities::ALL` has no vision member, so even the widest declaration cannot
+    // advertise multimodal/image_url: the image path is not a channel to opt into while the 263
+    // vision/aligner tensors are unwired (D18, D27).
     let seeing = MockEngine::new(MODEL).with_capabilities(Capabilities::ALL);
     assert_eq!(seeing.capabilities(), Capabilities::ALL);
     let (status, _, bytes) = send(app_with(seeing), get_request("/v1/models")).await;
@@ -559,8 +958,8 @@ async fn models_reports_the_engines_own_capabilities() {
         .as_object()
         .expect("capabilities is an object")
         .clone();
-    assert_eq!(caps["multimodal"], true);
-    assert_eq!(caps["image_url"], true);
+    assert_eq!(caps["multimodal"], false);
+    assert_eq!(caps["image_url"], false);
     assert_eq!(caps["tools"], true);
     assert_eq!(caps["tool_choice"], true);
     assert_eq!(caps["thinking"], true);
@@ -855,4 +1254,226 @@ async fn trace_dump_includes_the_gpu_ring_and_reports_it_unmapped() {
         unsafe { ring.collect() }.is_empty(),
         "ring must be left empty"
     );
+}
+
+#[tokio::test]
+async fn five_independent_bypass_attacks_are_all_refused() {
+    // My own attempt to defeat the detector before review: five shapes no existing test carried.
+    // Each is an image carrier by protocol convention; each must be refused with the capability
+    // error and never enter generation. This is the adversarial half of the pin, not a claim that
+    // five shapes exhaust the space.
+    let engine = RecordingEngine::default();
+    let calls = Arc::clone(&engine.calls);
+    let app = router(AppState::new(Arc::new(engine)).with_fixed_time(FIXED_TIME));
+
+    // 1. A carrier four containers deep, under an item type that does not exist.
+    let nested = json!({
+        "model": MODEL,
+        "input": [{
+            "type": "future_call",
+            "payload": {"steps": [{"result": {"frame": {"type": "Vision_Frame"}}}]},
+        }],
+    });
+    // 2. An upper-case carrier key.
+    let upper_key = json!({
+        "model": MODEL,
+        "input": [{"type": "future_call", "parameters": {"IMAGE_URL": "https://example.invalid/x.png"}}],
+    });
+    // 3. A carrier key nested inside an output object that is itself under a function_call_output.
+    let nested_output = json!({
+        "model": MODEL,
+        "input": [{
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": {"content": {"image": {"url": "https://example.invalid/x.png"}}},
+        }],
+    });
+    // 4. A file reference on an item that also claims to be a screenshot by type.
+    let file_ref = json!({
+        "model": MODEL,
+        "input": [{"type": "computer_call_output", "call_id": "c1",
+                   "output": {"type": "computer_screenshot"}, "file_id": "file-9"}],
+    });
+    // 5. The carrier type spelled with a JSON unicode escape: a byte-level scan of the raw request
+    //    would miss the word "image"; only the decoded Value carries it.
+    let raw = format!(
+        r##"{{"model":"{MODEL}","input":[{{"type":"future_call","parameters":{{"type":"im\u0061ge"}}}}]}}"##,
+    );
+    let escaped = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(Body::from(raw))
+        .expect("request");
+
+    for body in [nested, upper_key, nested_output, file_ref] {
+        let (status, _, bytes) = send(app.clone(), json_request("/v1/responses", &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(
+            body_json(&bytes)["error"]["code"],
+            MissingCapability::vision().code(),
+            "body: {body}"
+        );
+    }
+    let (status, _, bytes) = send(app.clone(), escaped).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(&bytes)["error"]["code"],
+        MissingCapability::vision().code()
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "none of the five attacks reached generation"
+    );
+}
+
+#[tokio::test]
+async fn schema_name_maps_do_not_trip_the_refusal_but_data_carriers_still_do() {
+    // Round-3 false-positive pin, narrowed. The immediate child keys of a JSON Schema name map are
+    // names: a tool parameter or a response_format schema may legitimately be called "image", and
+    // those requests are text requests served with generation entered. The exemption is the names
+    // only; a real carrier under a non-exempt container - including a nonstandard arguments object
+    // that carries image_url - is still refused fail-closed with generate not entered.
+    let engine = RecordingMockEngine::new();
+    let calls = Arc::clone(&engine.calls);
+    let app = router(AppState::new(Arc::new(engine)).with_fixed_time(FIXED_TIME));
+
+    let tool_schema = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "draw a cat"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "draw",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"image": {"type": "string"}, "image_url": {"type": "string"}},
+                    "required": ["image"],
+                },
+            },
+        }],
+    });
+    let response_format = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "x", "schema": {"type": "object", "properties": {"image": {"type": "string"}}}},
+        },
+    });
+    // Standard validation keywords that were missing from the first keyword list, plus the
+    // draft-07 and OpenAPI spellings common tool schemas carry. Each is a valid schema value under
+    // an image-named property, so each is a text request that must be served.
+    let min_properties = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {
+            "name": "draw",
+            "parameters": {"type": "object", "properties": {
+                "image": {"type": "object", "minProperties": 1},
+            }},
+        }}],
+    });
+    let draft07_dependencies = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {
+            "name": "draw",
+            "parameters": {"type": "object", "properties": {
+                "image": {"type": "object", "dependencies": {"shot": ["caption"]}},
+            }},
+        }}],
+    });
+    let defs_min_properties = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "response_format": {"type": "json_schema", "json_schema": {"schema":
+            {"type": "object", "$defs": {"image_url": {"type": "object", "minProperties": 1}}}}},
+    });
+    for body in [
+        tool_schema,
+        response_format,
+        min_properties,
+        draft07_dependencies,
+        defs_min_properties,
+    ] {
+        let (status, _, bytes) =
+            send(app.clone(), json_request("/v1/chat/completions", &body)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a schema name must not refuse a text request: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        5,
+        "generation must be entered for every schema-named text request"
+    );
+
+    // Fail-closed, not silent: a nonstandard arguments object, an arbitrary non-exempt container,
+    // and a NON-schema value under a schema name (the name exemption requires the mapped value to be
+    // a JSON Schema) all carry a real carrier. The typed parser cannot see any of them, so the
+    // detector must, and generation must not be entered.
+    let tool_arguments = json!({
+        "model": MODEL,
+        "messages": [
+            {"role": "user", "content": "draw"},
+            {"role": "assistant", "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "draw", "arguments": {"image": "a cat", "image_url": "https://example.invalid/x"}},
+            }]},
+        ],
+    });
+    let nested_under_payload = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "payload": {"nested": {"IMAGE_URL": "https://example.invalid/x.png"}},
+    });
+    let response_format_scalar_carrier = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "response_format": {"type": "json_schema", "json_schema": {"schema": {
+            "properties": {"image": "data:image/png;base64,aGVsbG8="}}}},
+    });
+    let nested_schema_name_carrier = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"parameters": {
+            "properties": {"outer": {"properties": {"image_url": {"url": "data:image/png;base64,aGVsbG8="}}}}}}}],
+    });
+    // Deliberate fail-closed policy: an unknown keyword cannot be proven to be a schema, so a
+    // carrier name under it is payload and is refused rather than served.
+    let unknown_schema_keyword = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": {"parameters": {
+            "properties": {"image": {"type": "string", "x-not-a-schema-keyword": 1}}}}}],
+    });
+    for body in [
+        tool_arguments,
+        nested_under_payload,
+        response_format_scalar_carrier,
+        nested_schema_name_carrier,
+        unknown_schema_keyword,
+    ] {
+        let engine2 = RecordingEngine::default();
+        let calls2 = Arc::clone(&engine2.calls);
+        let app2 = router(AppState::new(Arc::new(engine2)).with_fixed_time(FIXED_TIME));
+        let (status, _, bytes) = send(app2, json_request("/v1/chat/completions", &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(
+            body_json(&bytes)["error"]["code"],
+            MissingCapability::vision().code(),
+            "body: {body}"
+        );
+        assert_eq!(
+            calls2.load(Ordering::SeqCst),
+            0,
+            "the engine was not entered for a carrier: {body}"
+        );
+    }
 }

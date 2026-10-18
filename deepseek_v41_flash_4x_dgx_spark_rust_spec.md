@@ -922,6 +922,12 @@ To maximize multi-user responsiveness and single-stream speed on 4x DGX Spark, `
   - `POST /v1/admin/trace` & `GET /v1/admin/trace/dump` (Dynamically enables/disables scoped trace bitmasks for a specific step count or request ID and exports Chrome/Perfetto `trace.json.gz` + per-layer latency percentile tables)
   - `GET /metrics` (Prometheus exposition format for Grafana / `sparkDash` / `Ramjet` tier-aware routers)
 
+> **Implementation status (2026-10-18):** the `Multimodal image_url` part of the chat endpoint above
+> is not served by this tree. The vision tower and aligner are 263 checkpoint tensors the tensor plan
+> does not load, `GET /v1/models` reports `multimodal: false`, and any request carrying an image part
+> is refused with `unsupported_capability` naming the missing vision channel before generation. This
+> specification entry advertises the target surface, not the current one (DECISIONS.md D18 and D27).
+
 ```rust
 //! crates/sparkflash-api/src/telemetry_types.rs
 //! OpenAI-Compatible Usage + Extended DeepSeek-V4.1-Flash Cache & Hardware Telemetry Schema.

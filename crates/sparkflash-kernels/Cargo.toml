@@ -39,7 +39,7 @@ cuda = ["dep:cudarc"]
 
 [dev-dependencies]
 # The engine crate is a normal dependency now (src/cuda_harness.rs calls its released
-# quantiser); examples/m7_layer0.rs --stage 9 also uses its released Engram seam: the hash
+# quantiser); examples/m7_layer0/main.rs --stage 9 also uses its released Engram seam: the hash
 # layout and the paged table read are engine code, and duplicating them in the kernels crate
 # would put a second copy of the released arithmetic next to the one the host pair was produced
 # with. sha2 hashes the two determinism blobs; the harness does not otherwise hash anything.

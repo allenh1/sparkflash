@@ -100,7 +100,39 @@ pub enum ContentPart {
         #[serde(default)]
         image_url: Option<Value>,
     },
-    /// Any other part type; accepted but ignored.
+    /// Anthropic-style image part, also accepted on the chat route.
+    ///
+    /// The Anthropic block (`{"type":"image","source":{...}}`) is a shape the router parses on
+    /// `/v1/messages` and `/v1/responses`; a client that sends it to `/v1/chat/completions` must not
+    /// fall through to [`Self::Other`], because an ignored image part would reach generation with no
+    /// image and the capability refusal would never run.
+    Image {
+        /// Anthropic source object (`{"type":"base64","media_type":...,"data":...}` or a URL).
+        #[serde(default)]
+        source: Option<Value>,
+        /// OpenAI-style URL, if the client sent one under `type: "image"`.
+        #[serde(default)]
+        image_url: Option<Value>,
+    },
+    /// Any other part type; accepted but ignored **only if it is not an image carrier**.
+    ///
+    /// This catch-all is deliberately fail-open for genuinely non-image content (OpenAI adds part
+    /// types over time, and Milestone 1 does not consume audio or files). The known protocol image
+    /// types (`image_url`, `input_image` and Anthropic `image`) are explicit variants above;
+    /// everything else deserialises here. The tag match is case-sensitive, so a spelling such as
+    /// `Image` lands here too - which is why the enum is not the guarantee. The guarantee is
+    /// `crate::prompt::find_image_carrier`, which scans the raw request body in every handler and
+    /// refuses an image-family `type` value or carrier key at any depth, in any case, before
+    /// generation (D27); a part that deserialised to `Other` produces no
+    /// [`crate::multimodal::ImagePart`], so without that scan the capability check would pass and
+    /// the request would be answered from text - exactly the silent fallback D27 forbids. The scan
+    /// does not carrier-match the immediate child keys of a JSON Schema name map
+    /// (`properties`, `patternProperties`, `$defs`, `definitions`) **when the mapped
+    /// value is itself a JSON Schema**, where a property named `image` is a name rather than media,
+    /// so a text request is not refused for its schema; it still walks each child schema value, and a
+    /// non-schema value under such a name is payload (the name is matched), so every other key -
+    /// including an `arguments` or `metadata` object - is refused fail-closed if it carries a
+    /// carrier.
     #[serde(other)]
     Other,
 }

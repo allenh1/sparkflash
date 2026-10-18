@@ -46,7 +46,7 @@ be reached through `super`:
 | `stage7` | `stage2`, `stage3`, `stage8` |
 | `stage9` | `stage2`, `stage3`, `stage7`, `stage8` |
 
-Only items used across a module boundary were given `pub(crate)` (111 items: stage entry points,
+Only items used across a module boundary were given `pub(crate)` (103 items: stage entry points,
 the shared `B2_STREAM_TENSORS`/`RoutedOperands` data, and the `LayerMhc` methods stages 7/8/9 call
 on each other's values). The added keyword is the only token that changed; the verifier below
 strips it back before comparing. The CLI is unchanged: `--stage` 0-9, the same flags, the same
@@ -77,7 +77,7 @@ OK    stage6 verbatim 92 lines
 OK    stage8 verbatim 324 lines
 OK    stage7 verbatim modulo rustfmt re-wrapping and 1 inserted trailing comma(s)
 OK    stage9 verbatim 1943 lines
-OK   main.rs verbatim 882 lines (root 850 + fn main 33 )
+OK   main.rs verbatim 882 lines (root 850 + fn main 32 lines, one trailing blank)
 OK   dropped original lines 8220 to 8224 are comments only
 PASS split is verbatim
 ```
@@ -175,10 +175,10 @@ its new layout. All three changes are mechanical; the diffs are in 954d7af.
   write scope of the task; the Lead reviewed and accepted the mechanical edit.
 
 Known stale references **not** fixed here because they are outside this task's scope (all
-comments/docs, no code): `crates/sparkflash-kernels/Cargo.toml:42`,
-`src/cuda_harness.rs:3`, `src/mega_mhc_ref.rs:146`, and historical DECISIONS entries D12's Task-8
-extension (lines 238, 247) and D25 (line 1194) that describe the file as it was at their own
-commit. `src/lib.rs` and `src/m7_layer0_shapes.rs` name `m7_layer0` (the example target) without the
+comments/docs, no code): historical DECISIONS entries D12's Task-8 extension (lines 239, 248) and the
+D24 consequence at `docs/DECISIONS.md:1204`, both describing the file as it was at their own commit. The three stale `examples/m7_layer0.rs`
+comments left here at !69 time (`crates/sparkflash-kernels/Cargo.toml:42`, `src/cuda_harness.rs:3`,
+`src/mega_mhc_ref.rs:146`) were fixed in the !72 follow-up. `src/lib.rs` and `src/m7_layer0_shapes.rs` name `m7_layer0` (the example target) without the
 file extension and stay correct.
 
 ## 6. Citing lines after the split
@@ -189,4 +189,4 @@ file extension and stay correct.
   between the two original ranges).
 * A line `L` inside a stage slice `[start, end]` is at `file line = 1 + len(imports) + 1 + (L -
   start)`: the import block, one blank line, then the original text. For example original
-  `stage9` line 6277 is `stage9.rs` line 8 (5 imports + blank).
+  `stage9` line 6277 is `stage9.rs` line 7 (5 imports + 1 blank line).

@@ -166,6 +166,8 @@ pub enum KernelId {
     SwigluMxfp8Quant,
     /// cert_lm_head_sm121: the certified LM-head kernel.
     CertLmHead,
+    /// moe_router_sm121: the device MoE router (task-37, roadmap 6.3 item 4).
+    MoeRouter,
 }
 
 impl KernelId {
@@ -178,6 +180,7 @@ impl KernelId {
             KernelId::Mxfp4Moe => "b12x_mxfp4_moe_sm121",
             KernelId::SwigluMxfp8Quant => "swiglu_mxfp8_quant_sm121",
             KernelId::CertLmHead => "cert_lm_head_sm121",
+            KernelId::MoeRouter => "moe_router_sm121",
         }
     }
 }

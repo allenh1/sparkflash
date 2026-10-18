@@ -24,7 +24,7 @@ fn nvcc() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// The seven shipped cubins, recompiled and compared byte for byte, on a host that has nvcc.
+/// The eight shipped cubins, recompiled and compared byte for byte, on a host that has nvcc.
 ///
 /// On a host WITHOUT nvcc the check returns early, and the line it prints is on the test's captured
 /// stdout, so a green `cargo test` run does not show it - libtest only shows it under `--nocapture`.
@@ -36,7 +36,7 @@ fn the_kernels_still_compile_to_the_recorded_baseline() {
     let Some(nvcc) = nvcc() else {
         println!(
             "skipping the kernel baseline check: no nvcc on PATH and SPARKFLASH_NVCC is unset or \
-             not a file, so there is nothing to compile the seven kernels with. Run it on a CUDA host \
+             not a file, so there is nothing to compile the eight kernels with. Run it on a CUDA host \
              or inside nvidia/cuda:13.0.3-devel-ubuntu22.04: /bin/sh \
              crates/sparkflash-kernels/scripts/check-kernel-baseline.sh"
         );
@@ -62,7 +62,7 @@ fn the_kernels_still_compile_to_the_recorded_baseline() {
 }
 
 /// The kernel list in `check-kernel-baseline.sh`, the manifest, the kernels on disk and the build
-/// script's `PROBED_KERNELS` table must name the same seven kernels. The script asserts the first
+/// script's `PROBED_KERNELS` table must name the same eight kernels. The script asserts the first
 /// two when it runs; this pins all four without nvcc, so a kernel file added under `kernels/` - or a
 /// probe list edited without the baseline - fails here instead of letting the success line mean less
 /// than it says.
@@ -82,9 +82,9 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
         .collect();
     assert_eq!(
         listed.len(),
-        7,
-        "the list must name every baseline kernel - the seven entries: the six Milestone 4 kernels \
-         and the M7 SwiGLU quantiser epilogue: {listed:?}"
+        8,
+        "the list must name every baseline kernel - the eight entries: the six Milestone 4 kernels, \
+         the M7 SwiGLU quantiser epilogue and the task-37 device router: {listed:?}"
     );
 
     let manifest = std::fs::read_to_string(crate_dir.join("baseline/kernel_baseline.txt"))

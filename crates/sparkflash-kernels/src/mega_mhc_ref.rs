@@ -143,7 +143,7 @@
 //! takes `hc_scale` [3] and `hc_base` [24] in this reference's row order, applies the projection
 //! rstd, the group scale and the bias, the sigmoid pre/post and the released split-Sinkhorn, and
 //! publishes the 26 accumulated statistics (the 24 projection rows plus the two RMS statistics) so
-//! the host can compare the whole coefficient chain raw. `examples/m7_layer0.rs` permutes the
+//! the host can compare the whole coefficient chain raw. `examples/m7_layer0/main.rs` permutes the
 //! released rows into kernel order with [`released_predictor_into_kernel_rows`] (no averaging),
 //! passes the bias through [`bias_into_kernel_rows`], passes the scale itself, and no longer
 //! pre-folds it into the predictor (doing both would apply it twice). With the full released

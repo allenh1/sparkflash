@@ -35,5 +35,8 @@ pub mod mxfp4_ref;
 pub mod mxfp8_ref;
 pub mod roce_abi;
 pub mod roce_reduce;
+pub mod router_abi;
+pub mod router_launch;
+pub mod router_ref;
 pub mod sequence_chain;
 pub mod swiglu_ref;

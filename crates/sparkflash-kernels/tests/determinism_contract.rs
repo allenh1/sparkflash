@@ -25,6 +25,7 @@ fn the_determinism_contract_is_written_down_and_the_harness_cites_it() {
         std::fs::read_dir(root.join("crates/sparkflash-kernels/examples/m7_layer0"))
             .expect("the split M7 harness directory must be readable from the crate")
             .map(|entry| entry.expect("a harness module must be readable").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
             .collect();
     modules.sort();
     for module in modules {

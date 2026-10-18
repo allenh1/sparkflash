@@ -20,8 +20,8 @@ pub mod telemetry_types;
 
 pub use encoding::SparkV41Encoding;
 pub use engine::{
-    Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason, InferenceEngine,
-    MODEL_ID, MockEngine, NodeStats,
+    Capabilities, Capability, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason,
+    InferenceEngine, MODEL_ID, MissingCapability, MockEngine, NodeStats,
 };
 pub use error::ApiError;
 pub use loop_abort::{LoopAbort, LoopAbortConfig, LoopAbortDetector};

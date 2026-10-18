@@ -11,7 +11,7 @@
 //! opaque-handle launcher. It never calls `cuLaunchKernel` and never builds a raw argument array.
 //! The flash_mla handle is opaque, so this module cannot bypass that path even by accident.
 //!
-//! `examples/m7_layer0.rs` is frozen device evidence (stage 2/7/9 pins) and keeps its own stage-9
+//! `examples/m7_layer0/main.rs` is frozen device evidence (stage 2/7/9 pins) and keeps its own stage-9
 //! chain. This module does not refactor it and does not import from it. Some launch argument
 //! construction therefore looks similar to m7's; the duplication is accepted until 2B is green,
 //! at which point a separate unification task can move m7 onto this module. The invariant that

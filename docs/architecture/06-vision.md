@@ -3,6 +3,18 @@
 References: /home/user/dsv41-research/inference/vision.py (119 lines),
 image_processor.py (173 lines), model.py:1224-1239 and 1253-1256.
 
+**Status (2026-10-18).** This document specifies the reference vision path. The vision forward (the
+ViT tower, the 3x3 aligner and the image-token derivation) is not implemented in this tree, and
+`TensorPlan::language_model` excludes the 263 `vision.*`/`aligner.*` tensors and the three image
+delimiters, so no forward module consumes them. Only the placeholder normalisation and the
+image-source/span parsing exist (`crates/sparkflash-api/src/multimodal.rs` and the encoding
+`case.rs` image-span handling); they name and count image parts but produce no visual-token ids.
+`GET /v1/models` advertises `multimodal: false`, and a request carrying an image part is refused at
+the engine seam with `unsupported_capability` / `vision` instead of being charged a fabricated token
+count (DECISIONS.md D18 and D27). A raw-body scan (`prompt::find_image_carrier`) backstops the typed
+parsers: an image carrier whose spelling the parser does not know (for example the documented
+`computer_screenshot` output) is refused with the same 400 rather than ignored.
+
 Config (config.json text_config.vision_config / runtime config.json):
 vision_n_layers 32, vision_dim 1024, vision_n_heads 16, vision_inter_dim 2816, vision_patch_size 14,
 vision_downsample_ratio 3, vision_max_n_token 1024, vision_min_pixels 295936,

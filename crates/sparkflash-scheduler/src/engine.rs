@@ -15,7 +15,7 @@
 //! request records that request's spans and nobody else's.
 //!
 //! `EngineRequest::trace_request_id` is the id an admin capture filters on - the HTTP layer's
-//! `X-Request-Id` (docs/DECISIONS.md:151-155) - not a scheduler-private tag.
+//! `X-Request-Id` (docs/DECISIONS.md D9) - not a scheduler-private tag.
 
 use crate::RequestId;
 use crate::bypass::{AdmissionKind, PrefillTimeline, admit};

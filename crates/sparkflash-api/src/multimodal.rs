@@ -11,6 +11,20 @@
 //!
 //! `<｜rl_image_start｜>` (129263) and `<｜rl_image_pad｜>` (129262) are distinct real
 //! tokens used by the vision path; only their ASCII spellings are normalised.
+//!
+//! # No visual-token count is fabricated here
+//!
+//! The vision path is 263 `vision.*`/`aligner.*` tensors plus the three image delimiters, none of
+//! which the tensor plan loads (DECISIONS.md D18), so no engine in this workspace can turn an image
+//! part into visual tokens. This module therefore parses, normalises and labels image parts and
+//! stops there: it does not assume a 32x32 patch grid or charge the 121 tokens such a grid would
+//! imply. The router parses the parts, carries them (with the decoded payload bytes for inline
+//! images) to the engine seam, and the engine refuses the request with a typed
+//! [`crate::engine::MissingCapability`] naming the missing vision channel; a future vision front
+//! end decodes those bytes into pixels and derives the real grid.
+
+use std::fmt;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -29,8 +43,6 @@ pub const IMAGE_TAG_CLOSE: &str = "</image>";
 pub const VISION_PATCH_SIZE: u32 = 14;
 /// 3x3 pixel-unshuffle downsample ratio.
 pub const VISION_DOWNSAMPLE_RATIO: u32 = 3;
-/// Assumed ViT patch grid per image until the vision path decodes real geometry.
-pub const DEFAULT_IMAGE_GRID: u32 = 32;
 /// Upper bound on visual tokens per image, from reference/inference_config.json.
 pub const VISION_MAX_IMAGE_TOKENS: usize = 1024;
 
@@ -57,14 +69,18 @@ pub enum MultimodalError {
 }
 
 /// One image reference extracted from a request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The inline variant carries the decoded payload bytes, not just their length: a future vision
+/// front end must decode the file bytes to pixels to derive the real token grid, and the engine
+/// seam does not retain the request JSON, so a length alone would force it to re-read the request.
+#[derive(Clone, PartialEq, Eq)]
 pub enum ImagePart {
     /// Inline base64 payload decoded from a `data:` URL.
     Data {
         /// Declared media type, lower-cased, e.g. `image/png`.
         media_type: String,
-        /// Decoded payload length in bytes.
-        byte_len: usize,
+        /// Decoded payload bytes: the image file (PNG/JPEG/...), not raw pixels.
+        bytes: Arc<[u8]>,
     },
     /// Remote image; Milestone 1 does not fetch it (deferred to the vision path).
     Url {
@@ -76,6 +92,15 @@ pub enum ImagePart {
 }
 
 impl ImagePart {
+    /// Builds an inline part from a declared media type and the decoded payload bytes.
+    #[must_use]
+    pub fn data(media_type: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self::Data {
+            media_type: media_type.into(),
+            bytes: bytes.into(),
+        }
+    }
+
     /// Short stable kind name used in logs and tests.
     #[must_use]
     pub fn kind(&self) -> &'static str {
@@ -83,6 +108,21 @@ impl ImagePart {
             Self::Data { .. } => "data",
             Self::Url { .. } => "url",
             Self::Placeholder => "placeholder",
+        }
+    }
+}
+
+/// Prints the payload length rather than every byte, so a real image does not flood a log line.
+impl fmt::Debug for ImagePart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Data { media_type, bytes } => f
+                .debug_struct("Data")
+                .field("media_type", media_type)
+                .field("byte_len", &bytes.len())
+                .finish(),
+            Self::Url { url } => f.debug_struct("Url").field("url", url).finish(),
+            Self::Placeholder => f.write_str("Placeholder"),
         }
     }
 }
@@ -140,24 +180,17 @@ pub fn count_image_placeholders(text: &str) -> usize {
     text.matches(IMAGE_PLACEHOLDER).count()
 }
 
-/// Visual tokens produced by a `grid_h x grid_w` ViT patch grid after 3x3 pixel-unshuffle.
+/// Visual tokens a `grid_h x grid_w` ViT patch grid produces after 3x3 pixel-unshuffle.
 ///
-/// The M1 implementation is the published tiling arithmetic: ceil(grid / 3) tiles per
-/// axis, multiplied together.
-///
-/// TODO(M2): derive the real grid from the decoded image rather than the 32x32 default;
-/// see reference/inference/image_processor.py for the authoritative preprocessing.
+/// This is the published tiling arithmetic - ceil(grid / 3) tiles per axis, multiplied together -
+/// for a front end that has **derived** its grid from the decoded image
+/// (reference/inference/image_processor.py is the authoritative preprocessing). It is exposed as
+/// arithmetic only: this crate never assumes a grid, so no request is charged a count from it.
 #[must_use]
 pub fn count_image_tokens(grid_h: u32, grid_w: u32) -> usize {
     let rows = grid_h.div_ceil(VISION_DOWNSAMPLE_RATIO) as usize;
     let cols = grid_w.div_ceil(VISION_DOWNSAMPLE_RATIO) as usize;
     rows * cols
-}
-
-/// Visual tokens charged for one image with the default 32x32 patch grid.
-#[must_use]
-pub fn default_image_tokens() -> usize {
-    count_image_tokens(DEFAULT_IMAGE_GRID, DEFAULT_IMAGE_GRID)
 }
 
 /// Parses an OpenAI `image_url` value.
@@ -190,10 +223,7 @@ pub fn parse_image_url(raw: &str) -> Result<ImagePart, MultimodalError> {
             media_type.to_ascii_lowercase()
         };
         let decoded = decode_base64(payload)?;
-        return Ok(ImagePart::Data {
-            media_type,
-            byte_len: decoded.len(),
-        });
+        return Ok(ImagePart::data(media_type, decoded));
     }
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         return Ok(ImagePart::Url {
@@ -338,36 +368,20 @@ mod tests {
             "33 is exactly divisible by 3"
         );
         assert_eq!(count_image_tokens(34, 34), 144);
-        assert_eq!(default_image_tokens(), 121);
     }
 
     #[test]
-    fn data_urls_are_decoded_to_a_byte_length() {
+    fn data_urls_are_decoded_to_their_payload_bytes() {
         let part = parse_image_url("data:image/png;base64,aGVsbG8=").expect("hello");
-        assert_eq!(
-            part,
-            ImagePart::Data {
-                media_type: "image/png".to_owned(),
-                byte_len: 5
-            }
-        );
+        assert_eq!(part, ImagePart::data("image/png", b"hello".to_vec()));
         assert_eq!(part.kind(), "data");
         let empty_media = parse_image_url("data:;base64,////").expect("no media type");
         assert_eq!(
             empty_media,
-            ImagePart::Data {
-                media_type: "application/octet-stream".to_owned(),
-                byte_len: 3
-            }
+            ImagePart::data("application/octet-stream", vec![0xFF, 0xFF, 0xFF])
         );
         let wrapped = parse_image_url("data:image/jpeg;base64, aGVs\nbG8 ").expect("wrapped");
-        assert_eq!(
-            wrapped,
-            ImagePart::Data {
-                media_type: "image/jpeg".to_owned(),
-                byte_len: 5
-            }
-        );
+        assert_eq!(wrapped, ImagePart::data("image/jpeg", b"hello".to_vec()));
     }
 
     #[test]
@@ -412,12 +426,6 @@ mod tests {
     fn anthropic_sources_round_trip_through_the_shared_parser() {
         let url = anthropic_source_to_data_url("image/png", "aGVsbG8=");
         let part = parse_image_url(&url).expect("decodes");
-        assert_eq!(
-            part,
-            ImagePart::Data {
-                media_type: "image/png".to_owned(),
-                byte_len: 5
-            }
-        );
+        assert_eq!(part, ImagePart::data("image/png", b"hello".to_vec()));
     }
 }
