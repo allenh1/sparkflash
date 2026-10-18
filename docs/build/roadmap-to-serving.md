@@ -573,11 +573,11 @@ place: the step output carries the head input (`StepOutput::head_input`) and `bo
 it with the reference logits (`--head-input-out`, `--logits-out`), which is exactly the pair the
 device `cert_lm_head_sm121` harness compares. The harness itself is merged (`m7_layer0 --stage 5`,
 !46) and its CPU precheck (`--stage 6`) has run on the node: recomputing all 129,280 logits in the
-kernel's order from the f32 head input reproduces the reference bit for bit, and from the bf16 codes
+kernel's order from the f32 head input reproduces the reference exactly (max abs delta 0), and from the bf16 codes
 the kernel ABI is fed it keeps argmax 5 and the same top-5 while moving a logit by at most 2.4320781e-2
 (measured, `phase1-boundary-table.md` section 11). That is the conversion the matched reference
-avoids charging to the head; the head's own bar is measured by the device run, which had max abs
-delta 0 against the matched host.
+avoids charging to the head; the measured device-vs-matched delta was 0, and the bar remains the
+provisional 2e-2 ceiling.
 
 The device head has now run in a full window: `--stage 5` reports device argmax 5 equal to both
 references, all 129,280 entries exact with **max |device - bf16-matched host| = 0** (value equality in
@@ -619,7 +619,10 @@ window cost.
 ### 4.7 Tasks
 
 `task-36` (kernel ABI, api-dev); new tasks: `phase1: layer plan and a pinned 43-row table`
-(arch-docs/kernel-dev), `phase1: 40-layer token harness with per-layer diff` (kernel-dev),
+(arch-docs/kernel-dev), the 40-layer token harness task (kernel-dev) - kernel dispatch is not
+layer-0-specific: stage 1 passes at layers 1, 4, 14 and 39, stages 2 and 3 at layer 14 (recon logs in
+phase1-boundary-table.md section 11); the chained harness remains, and the stages deliberately do not
+chain layers.
 `phase1: stage 4, head and sampling on device` (kernel-dev) - the certified head harness is merged
 (!46) and has run on the released token: argmax matches both references, all 129,280 logits are
 within max abs delta 0 of the bf16-matched host, 0 certified; the sampling path remains. `phase1: perturbation and seam-label

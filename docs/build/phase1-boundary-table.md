@@ -529,13 +529,13 @@ files and will compare its own logits against them. A CPU precheck of that compa
 (`m7_layer0 --stage 6`, run on `node0` on 2026-10-17 while vLLM held the node: 50 s, no CUDA
 context) recomputed all 129,280 logits from the reference's f32 head input and from the bf16 codes
 the kernel ABI is fed, in the kernel's ascending order. Both recomputations reproduce the reference
-argmax 5 and top-5 exactly; the f32 recomputation matches the reference logits bit for bit (max abs
+argmax 5 and top-5 exactly; the f32 recomputation matches the reference logits exactly (max abs
 delta 0), so the host's accumulation order is the engine's, and the bf16 conversion the kernel cannot
 avoid moves a logit by at most 2.4320781e-2. That number is why the stage-5 comparison uses a bf16-matched
 reference rather than the f32-hidden logits: otherwise the conversion would be charged to the head.
-The exact-entry bar itself is measured by the device run and was 0 (the device reproduced the matched
-host's values); stage 5 keeps a provisional 2e-2 ceiling rather than folding a 2.4e-2 conversion into
-a bar about the head's arithmetic.
+The measured device-vs-matched delta was 0 (the device reproduced the matched host's values); the bar
+remains the provisional 2e-2 ceiling rather than folding a 2.4e-2 conversion into a bar about the
+head's arithmetic.
 
 The device run then happened, in a full window on `node0` with vLLM stopped (2026-10-17,
 118 GiB free; the timed log is `/home/user/phase1-evidence/stage5-device-run-timed.log`, and the
@@ -546,8 +546,10 @@ rebuilt-binary logs that match the current PASS lines are `stage5-device-final.l
 * device argmax **5**, value **13.237006187**, equal to the bf16-matched host reference (and to the
   f32-hidden reference argmax 5);
 * **all 129,280 entries exact, 0 certified**: the screen's bound (per-128-block hidden sums times the
-  row's max |w|) bounds every entry well above the largest logit on this hidden state, so it pruned nothing and the
-  whole vocabulary took the exact path - the run is the exact BF16 GEMM, not a pruned one;
+  row's max |w|) never fell below the running maximum on this hidden state, so it pruned nothing and
+  the whole vocabulary took the exact path - the run is the exact BF16 GEMM, not a pruned one. The
+  harness prints no bound margin, so this records what happened, not how far above the maximum the
+  bound sat;
 * **max |device - bf16-matched host| = 0** over every entry: the device values equal the host
   recomputation in the kernel's order, so the head's arithmetic is reproduced exactly (as a value
   comparison, not a NaN-aware bit comparison) and the only difference from the reference logits is
@@ -560,7 +562,19 @@ rebuilt-binary logs that match the current PASS lines are `stage5-device-final.l
 This is criterion 3's device half for the argmax and the exact logits. The top-5 set is not claimed:
 a certified entry stores a bound, and the kernel's contract is the argmax; with 0 certified entries on
 this token the top-5 happens to be recoverable, but the harness does not claim a contract it cannot
-honour in general. The one-token report on the same snapshot printed:
+honour in general.
+
+As a precondition for the chained 40-layer token harness, the per-stage harness was run with --layer
+on other layers: stage 1 (mHC) PASS at layers 1 and 4 (2 tokens, every boundary), stage 2 (attention)
+PASS at layer 1 (2 positions, exact 99.9878%, max abs delta 7.6293945e-6 against its 1.6e-2 bar) and
+stage 3 (MoE, 8 experts) PASS at layer 1 (combine exact 100%, max ULP 0 against its 2-code bar). A
+later run (log /home/user/phase1-evidence/layer-dispatch-recon-engram-last.log) adds stage 1 PASS at
+layers 14 and 39 (2 tokens, every boundary), stage 2 PASS at layer 14 (2 positions) and stage 3 PASS at
+layer 14 (8 experts, 2 tokens). The stages read the layers.N. tensor names and take --layer, so the
+kernels are not layer-0-specific; what remains is chaining them, which the stages deliberately do not do
+(each builds its own inputs and compares one stage's outputs). Log of the first run:
+/home/user/phase1-evidence/layer-dispatch-recon.log. The one-token report on the same snapshot
+printed:
 
 * 95,819 tensors verified, 4 Engram tensors paged (the two released Engram tables, weight and scale);
 * 40 rows, all host-vs-host bit-exact, two runs byte-identical over the boundary tables and the

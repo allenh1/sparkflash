@@ -73,17 +73,34 @@
 //! still an upper bound. The kernel's contract is the argmax, not the top-5 (a certified entry
 //! stores a bound), so no top-5 claim is made here.
 //!
+//! Stage 6: the CPU half of the criterion-3 head comparison, runnable while vLLM holds the node. It
+//! never opens a CUDA context: it streams head.weight one 10 KB row at a time and recomputes every
+//! logit twice, once from the reference's f32 head input and once from the bf16 codes the
+//! kernel ABI is fed, both in the kernel's ascending order, and compares both to the reference logits
+//! (argmax and top-5, plus a gated f32-order delta). It prints the measured bf16-conversion delta,
+//! which is why the device comparison uses a matched reference; the measured device-vs-matched delta
+//! was 0 and the bar remains the provisional 2e-2 ceiling.
+//!
+//! Stages 1, 2 and 3 take --layer N and read that layer's tensor names; the released run used layer 0
+//! for development, and the same stages pass unchanged on other layers: stage 1 at layers 1, 4, 14
+//! and 39, stages 2 and 3 at layer 14 (recon logs in docs/build/phase1-boundary-table.md section 11),
+//! so the per-layer kernels are not layer-0-specific. The chained 40-layer token harness is a separate
+//! program: the stages here each build their own inputs and compare one stage's outputs, they do not
+//! chain layers.
+//!
 //! Build the cubins first, one per entry point and named after it, WITHOUT
 //! -DSPARKFLASH_ENABLE_GPU_TRACE (the trace macros then compile out and this launcher passes a
 //! null ring pointer):
 //!   nvcc -cubin -arch=sm_121a -I kernels -o out/mega_mhc_fused_bf16_sm121.cubin kernels/mega_mhc_sm121.cu
+//!   nvcc -cubin -arch=sm_121a -I kernels -o out/flash_mla_csa2_sm121.cubin kernels/flash_mla_csa2_sm121.cu
+//!   nvcc -cubin -arch=sm_121a -I kernels -o out/b12x_mxfp4_moe_sm121.cubin kernels/b12x_mxfp4_moe_sm121.cu
 //!   nvcc -cubin -arch=sm_121a -I kernels -o out/cert_lm_head_sm121.cubin kernels/cert_lm_head_sm121.cu
 //!
 //! Usage:
-//!   m7_layer0 --stage 1 --checkpoint <snapshot dir> [--cubin-dir out] [--tokens 4] [--layer 0]
-//!   m7_layer0 --stage 2 --checkpoint <snapshot dir> [--cubin-dir out] [--tokens 130]
-//!   m7_layer0 --stage 3 --checkpoint <snapshot dir> [--experts 8|32|64] [--tokens 4]
-//!   m7_layer0 --stage 4 --checkpoint <snapshot dir> [--tokens 4] [--repeat 10]
+//!   m7_layer0 --stage 1 --checkpoint <snapshot dir> [--cubin-dir out] [--tokens 4] [--layer N]
+//!   m7_layer0 --stage 2 --checkpoint <snapshot dir> [--cubin-dir out] [--tokens 130] [--layer N]
+//!   m7_layer0 --stage 3 --checkpoint <snapshot dir> [--experts 8|32|64] [--tokens 4] [--layer N]
+//!   m7_layer0 --stage 4 --checkpoint <snapshot dir> [--tokens 4] [--repeat 10] [--layer N]
 //!   m7_layer0 --stage 5 --checkpoint <snapshot dir> --head-input HEAD.f32 --logits LOGITS.f32 [--cubin-dir out]
 //!   m7_layer0 --stage 6 --checkpoint <snapshot dir> --head-input HEAD.f32 --logits LOGITS.f32 [--mem-floor-gib 1]   (CPU only)
 
