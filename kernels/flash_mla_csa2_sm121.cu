@@ -29,7 +29,8 @@
 //   * the kernel reads a second Main-KV format when asked: the engine's released window format
 //     (E4M3 code per channel, E8M0 scale per 32 channels, bf16-storage round trip). The format is
 //     an explicit runtime argument (0 = historical FP4 path, unchanged; 1 = engine window format);
-//     it is validated by the launcher and guarded at kernel entry. The released engine's own bf16
+//     there is no host-side validation: the kernel entry guard below refuses any other value. The
+//     released engine's own bf16
 //     arithmetic is not claimed - the engine reference forward keeps f32 dequant, and that seam is
 //     documented - only the format and its bf16 storage are reproduced.
 //   * format 2 (CSA union) is the released attention's actual candidate set: the supplied engine
@@ -119,10 +120,10 @@ __device__ __forceinline__ float spark_mla_warp_sum(float value) {
 // The engine's released window-KV format (model.py:700-707, kernel.py:98-124): one E4M3 code per
 // latent channel with one E8M0 power-of-two scale per 32 channels, stored after the engine's
 // in-place quantise/dequantise round trip, which returns the input dtype and therefore stores bf16.
-// The format is an explicit launcher argument, never inferred from another argument's value:
+// The format is an explicit runtime argument, never inferred from another argument's value:
 // 0 keeps the historical FP4 latent path byte-identical, 1 reads the engine window arrays, and
 // 2 (CSA union) attends the engine window rows plus the causal FP4 compressed candidates in one
-// softmax. Any other value is rejected by the launcher and poisoned at kernel entry. The format
+// softmax. Callers pass only 0, 1 or 2; any other value is poisoned at kernel entry. The format
 // VALUE cannot be a static_assert because it is a runtime parameter; only the layout constants
 // below are compile-time facts.
 #define SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4 0u
@@ -224,10 +225,10 @@ extern "C" __global__ void flash_mla_csa2_sm121(
     __shared__ float s_sum;
 
     // The format is a runtime value, so it is guarded at run time rather than in a static_assert.
-    // The launcher validates it and refuses any value other than 0, 1 or 2 before launching; if one
-    // ever reaches the kernel, poison out with NaN so the contract violation is visible instead of
-    // a half-formatted read, and return before the trace pair is entered. This path is not a run:
-    // it is here so that no unknown format can be silently treated as one of the real ones.
+    // There is no host-side validation (cuda_harness::flash_mla_params does not check it), so this
+    // guard is the contract: a caller that passes anything other than 0, 1 or 2 gets NaN out rather
+    // than a half-formatted read, and the trace pair is not entered. This path is not a run: it is
+    // here so that no unknown format can be silently treated as one of the real ones.
     if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION) {
         for (uint32_t i = lane; i < SPARK_M4_MLA_LATENT; i += SPARK_M4_MLA_THREADS) {
             out[(uint64_t)head * SPARK_M4_MLA_LATENT + i] =
@@ -236,8 +237,8 @@ extern "C" __global__ void flash_mla_csa2_sm121(
         return;
     }
     // Union format needs room for the implicit window rows as well as the candidate list. The
-    // launcher caps both, but a direct launch must not be able to index past s_scores, so the
-    // kernel refuses it the same way it refuses an unknown format.
+    // caller supplies both; this guard is what keeps a direct launch from indexing past s_scores,
+    // so the kernel refuses it the same way it refuses an unknown format.
     if (window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION &&
         (window_rows > (uint32_t)SPARK_M4_SWA_WINDOW ||
          selected_count > (uint32_t)SPARK_M4_MLA_MAX_SELECTED ||

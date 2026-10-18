@@ -2149,6 +2149,124 @@ mod tests {
         );
     }
 
+    /// Compute the union output with the sink term in the requested denominator position, from the
+    /// same gathered scores and values the implementation uses. This exists only to make the
+    /// addition order observable in an assertion; the engine-reference test separately pins the
+    /// actual value.
+    #[allow(clippy::too_many_arguments)]
+    fn ordered_union_output(
+        q: &[f32],
+        window_codes: &[u8],
+        window_scales: &[u8],
+        window_rows: usize,
+        kv: &Kv,
+        selected: &[u32],
+        position: u32,
+        sink: f32,
+        sink_first: bool,
+    ) -> Vec<f32> {
+        let mut scores = Vec::new();
+        let mut values: Vec<f32> = Vec::new();
+        for row in 0..window_rows {
+            scores.push(score_window_candidate(
+                q,
+                window_codes,
+                window_scales,
+                row as u32,
+            ));
+            for index in 0..MLA_LATENT {
+                values.push(window_kv_value(window_codes, window_scales, row, index));
+            }
+        }
+        for candidate in selected {
+            if union_attendable(position, *candidate) {
+                scores.push(score_candidate(q, &kv.fp4, &kv.scales, *candidate));
+                for index in 0..MLA_LATENT {
+                    values.push(kv_latent(&kv.fp4, &kv.scales, *candidate as usize, index));
+                }
+            }
+        }
+        let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut denominator = if sink_first {
+            (sink - maximum).exp()
+        } else {
+            0.0
+        };
+        for score in &scores {
+            denominator += (score - maximum).exp();
+        }
+        if !sink_first {
+            denominator += (sink - maximum).exp();
+        }
+        let mut out = vec![0.0f32; MLA_LATENT];
+        for (slot, score) in scores.iter().enumerate() {
+            let weight = (score - maximum).exp();
+            for (index, value) in out.iter_mut().enumerate() {
+                *value += weight * values[slot * MLA_LATENT + index];
+            }
+        }
+        for value in out.iter_mut() {
+            *value /= denominator;
+        }
+        out
+    }
+
+    #[test]
+    fn the_union_adds_the_sink_term_first_in_the_denominator() {
+        // critic46's review finding: moving the sink term from first to last denominator position
+        // still left the engine-reference test passing, because that case never made the addition
+        // order bit-visible. This case does. Seventeen near-2^-24 candidate weights plus a dominant
+        // sink/maximum term make the two denominator accumulations differ by several f32 ULPs, and
+        // the weighted output differs too, so a future reorder fails the assertion.
+        let mut q = vec![0.0f32; MLA_LATENT];
+        q[0] = 375.0;
+        let (codes, scales) = engine_rows(&[window_row(1.0), window_row(1.0)]);
+        let mut kv = Kv::new(16);
+        for row in 0..15 {
+            kv.set(row, 0, 0x2); // 1.0
+        }
+        kv.set(15, 0, 0x4); // 2.0, the maximum (set after the loop: set() ORs nibbles)
+        let selected: Vec<u32> = (0..16).collect();
+        let position = 20u32;
+        // The maximum is the 2.0 row; the seventeen 1.0 rows contribute weights of
+        // exp(-375*scale) ~ 2^-24 each, so their sum is large enough to move the denominator by
+        // more than one ULP of the output when it is accumulated after the sink instead of before.
+        let maximum = 2.0 * 375.0 * MLA_SCORE_SCALE;
+        let mut observable = None;
+        for step in -1000i32..=1000 {
+            let sink = maximum + step as f32 * 1e-3;
+            let first =
+                ordered_union_output(&q, &codes, &scales, 2, &kv, &selected, position, sink, true);
+            let last = ordered_union_output(
+                &q, &codes, &scales, 2, &kv, &selected, position, sink, false,
+            );
+            if bits(&first) != bits(&last) {
+                observable = Some((sink, first, last));
+                break;
+            }
+        }
+        let (sink, sink_first_expected, sink_last_expected) =
+            observable.expect("the case must make the denominator addition order observable");
+        assert_ne!(
+            bits(&sink_first_expected),
+            bits(&sink_last_expected),
+            "the searched sink must make the two denominator orders differ"
+        );
+        let got = attention_with_sink_union(
+            &q, &codes, &scales, 2, &kv.fp4, &kv.scales, &selected, position, sink,
+        );
+        assert_eq!(
+            bits(&got),
+            bits(&sink_first_expected),
+            "the sink term must be added before the candidate weights"
+        );
+        assert_ne!(
+            bits(&got),
+            bits(&sink_last_expected),
+            "this case must fail if the sink is moved to the last denominator term"
+        );
+    }
+
     #[test]
     fn the_union_capacity_accepts_exactly_640_slots() {
         // 128 window rows + 512 candidates = 640, the full bound. The kernel refuses 641 with a

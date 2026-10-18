@@ -2699,6 +2699,14 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
             && code.contains("window_rows > (uint32_t)SPARK_M4_SWA_WINDOW")
             && code.contains("selected_count > (uint32_t)SPARK_M4_MLA_MAX_SELECTED")
             && code.contains("window_rows + selected_count > (uint32_t)SPARK_M4_MLA_MAX_ATTENDED")
+            // The union branch must END the kernel: deleting its terminal return would fall
+            // through into historical Stage 2 with a format-2 result already written. Pin the
+            // 12-space union trace exit and the exact tail sequence, not just the branch header;
+            // the historical Stage-2 exit has different indentation and must not satisfy these.
+            && code.contains("            SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_CSA2_ATTN, layer_id, meta, t_enter);")
+            && code.contains(
+                "            (void)heads;\n            (void)step_seq;\n        }\n        (void)t_enter;\n        return;\n    }",
+            )
     };
     assert!(mla_guards_the_window_format(FLASH_MLA_CSA2));
 
@@ -2843,6 +2851,35 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
     assert!(
         !mla_guards_the_window_format(&no_window_cap),
         "the union window is at most the sliding window"
+    );
+
+    // The union branch's terminal return: dropping it falls through into historical Stage 2 with a
+    // format-2 result already written. The mutation removes the exact tail the pin names, and a
+    // second mutation removes only the union trace exit so the historical Stage-2 exit cannot
+    // satisfy the pin by itself.
+    let union_falls_through = FLASH_MLA_CSA2.replace(
+        "        (void)t_enter;\n        return;\n    }\n\n    // Stage 2: attention over the selected candidates.",
+        "        (void)t_enter;\n    }\n\n    // Stage 2: attention over the selected candidates.",
+    );
+    assert_ne!(
+        union_falls_through, FLASH_MLA_CSA2,
+        "the mutation must apply"
+    );
+    assert!(
+        !mla_guards_the_window_format(&union_falls_through),
+        "the union branch must return before historical Stage 2"
+    );
+    let union_no_trace_exit = FLASH_MLA_CSA2.replace(
+        "            SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_CSA2_ATTN, layer_id, meta, t_enter);\n",
+        "",
+    );
+    assert_ne!(
+        union_no_trace_exit, FLASH_MLA_CSA2,
+        "the mutation must apply"
+    );
+    assert!(
+        !mla_guards_the_window_format(&union_no_trace_exit),
+        "the union branch's trace exit is part of its terminal sequence"
     );
 
     // A6 and A9: the header carries the two scale grids and the row-scale helpers the kernels use,
