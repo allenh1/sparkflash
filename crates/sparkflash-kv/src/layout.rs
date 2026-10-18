@@ -16,7 +16,9 @@
 //! the 512-wide latent), so the 890 B figure only closes when the rotary dims are not counted
 //! twice. See docs/architecture/08-kv-footprint.md section 2.
 
-use crate::config::{KV_PAGE_TOKENS, KV_SOURCE_LAYERS, NUM_HIDDEN_LAYERS, compress_ratio};
+use crate::config::{
+    ENCODER_LAST_LAYER, KV_PAGE_TOKENS, KV_SOURCE_LAYERS, NUM_HIDDEN_LAYERS, compress_ratio,
+};
 
 /// Identifier of a page in the shared global-KV pool.
 ///
@@ -115,19 +117,19 @@ pub const SWA_SLOTS_PER_TAIL: usize = crate::config::SWA_WINDOW_SIZE;
 /// Backbone layers that keep a sliding-window cache.
 pub const SWA_LAYERS: usize = NUM_HIDDEN_LAYERS;
 
-/// Encoder layers 0..=19, i.e. half the backbone.
-pub const SWA_ENCODER_LAYERS: usize = NUM_HIDDEN_LAYERS / 2;
+/// Encoder layers 0..=20, i.e. the 21 layers of the D7 encoder half.
+pub const SWA_ENCODER_LAYERS: usize = ENCODER_LAST_LAYER + 1;
 
-/// Decoder layers 20..=39, i.e. the other half.
-pub const SWA_DECODER_LAYERS: usize = NUM_HIDDEN_LAYERS - SWA_ENCODER_LAYERS;
+/// Decoder layers 21..=39, i.e. the 19 layers of the D7 decoder half.
+pub const SWA_DECODER_LAYERS: usize = SWA_LAYERS - SWA_ENCODER_LAYERS;
 
 /// Bytes of one sequence's complete 128-token SWA tail across all 40 layers.
 pub const SWA_TAIL_BYTES: usize = SWA_LAYERS * SWA_SLOTS_PER_TAIL * SWA_SLOT_BYTES;
 
-/// Bytes of one sequence's SWA tail for the encoder half of the backbone.
+/// Bytes of one sequence's SWA tail for the encoder half (layers 0..=20) of the backbone.
 pub const SWA_TAIL_ENCODER_BYTES: usize = SWA_ENCODER_LAYERS * SWA_SLOTS_PER_TAIL * SWA_SLOT_BYTES;
 
-/// Bytes of one sequence's SWA tail for the decoder half of the backbone.
+/// Bytes of one sequence's SWA tail for the decoder half (layers 21..=39) of the backbone.
 pub const SWA_TAIL_DECODER_BYTES: usize = SWA_DECODER_LAYERS * SWA_SLOTS_PER_TAIL * SWA_SLOT_BYTES;
 
 /// One gibibyte, as u64.

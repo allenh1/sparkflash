@@ -23,18 +23,16 @@
 //! `decoder_swa_replay_tokens` is not a cache replay at all - it is the CED decoder extent,
 //! min(prompt, 128). The pin test asserts that equality, so a future change to `plan_request`
 //! cannot silently move the CED boundary.
+//!
+//! The boundary constants live in crate::config (ENCODER_LAST_LAYER, DECODER_FIRST_LAYER) and
+//! are re-exported here, so the schedule and the SWA replay kinds derive from one number.
 
 use crate::config::{
     CANDIDATE_SOURCE_LAYER, Csa2Mode, NUM_HIDDEN_LAYERS, SWA_WINDOW_SIZE, compress_ratio,
     csa2_mode, index_source_for, kv_source_for,
 };
+pub use crate::config::{DECODER_FIRST_LAYER, ENCODER_LAST_LAYER};
 use crate::plan::{KvCacheTelemetry, PrefixMatchPlan};
-
-/// Last encoder layer (inclusive): layers 0..=20 run over the whole prompt.
-pub const ENCODER_LAST_LAYER: usize = 20;
-
-/// First decoder layer: layers 21..=39 run only over the last window of the prompt.
-pub const DECODER_FIRST_LAYER: usize = 21;
 
 /// One kernel-visible handle a layer publishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

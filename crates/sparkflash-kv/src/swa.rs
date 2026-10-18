@@ -7,9 +7,9 @@
 //!
 //! A tail is keyed by the FNV-1a hash of its exact 128 token ids and every probe is confirmed
 //! against the stored ids, so a hash collision is a miss rather than a wrong window. A tail
-//! only counts as a hit once all 40 layers are present, because an encoder replay and a
-//! decoder replay each produce half of it; the present-layer mask makes that state explicit
-//! instead of pretending a half-built tail is servable.
+//! only counts as a hit once all 40 layers are present, because an encoder replay covers the
+//! 21 layers 0..=20 and a decoder replay the 19 layers 21..=39; the present-layer mask makes
+//! that split explicit instead of pretending a partially replayed tail is servable.
 //!
 //! The ring is a separate lock from the page store in crate::cache, which is what makes the
 //! "a replay never overwrites cached global KV" rule structural rather than a comment: the
@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use crate::error::KvError;
 use crate::layout::{
-    SWA_LAYERS, SWA_SLOT_BYTES, SWA_SLOTS_PER_TAIL, SWA_TAIL_BYTES, swa_layer_range,
-    swa_slot_offset,
+    SWA_ENCODER_LAYERS, SWA_LAYERS, SWA_SLOT_BYTES, SWA_SLOTS_PER_TAIL, SWA_TAIL_BYTES,
+    swa_layer_range, swa_slot_offset,
 };
 use crate::telemetry::KvStoreTelemetry;
 
@@ -46,11 +46,15 @@ pub fn tail_hash(tokens: &[u32]) -> u64 {
 }
 
 /// Which half of the backbone a bounded replay runs through.
+///
+/// The split is D7's, not the arithmetic half: the encoder covers layers 0..=20 (21 layers,
+/// including layer 20, the last Full layer and the HSI candidate source) and the decoder covers
+/// layers 21..=39 (19 layers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplayKind {
-    /// Layers 0..19: regenerate SWA KV only, reusing cached global KV.
+    /// Layers 0..=20: regenerate SWA KV only, reusing cached global KV.
     Encoder,
-    /// Layers 20..39: the decoder's bounded replay of the prompt tail.
+    /// Layers 21..=39: the decoder's bounded replay of the prompt tail.
     Decoder,
 }
 
@@ -59,8 +63,8 @@ impl ReplayKind {
     #[must_use]
     pub fn layers(self) -> std::ops::Range<usize> {
         match self {
-            Self::Encoder => 0..SWA_LAYERS / 2,
-            Self::Decoder => SWA_LAYERS / 2..SWA_LAYERS,
+            Self::Encoder => 0..SWA_ENCODER_LAYERS,
+            Self::Decoder => SWA_ENCODER_LAYERS..SWA_LAYERS,
         }
     }
 

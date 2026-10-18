@@ -37,6 +37,20 @@ pub const INDEX_TOPK: usize = 512;
 /// Number of transformer layers in the backbone.
 pub const NUM_HIDDEN_LAYERS: usize = 40;
 
+/// Last encoder layer under D7 (inclusive): layers 0..=20 run over the whole prompt.
+///
+/// D7 fixes the boundary at the model's middle layer, 20, which is also the last Full layer
+/// (KV_SOURCE_LAYERS), the Full KV source the decoder layers 21..=39 read, and the HSI
+/// candidate source (CANDIDATE_SOURCE_LAYER). This is the single source of the split for the
+/// CED schedule and the SWA bounded-replay kinds; the cross-check test pins it against both.
+///
+/// The value is written out rather than derived as NUM_HIDDEN_LAYERS / 2: the split is 21/19,
+/// so the arithmetic half is precisely the coincidence D7 does not follow.
+pub const ENCODER_LAST_LAYER: usize = 20;
+
+/// First decoder layer under D7: layers 21..=39 run only over the last window of the prompt.
+pub const DECODER_FIRST_LAYER: usize = ENCODER_LAST_LAYER + 1;
+
 /// compress_ratios from config.json, one entry per backbone layer plus the three DSpark
 /// prediction layers (indexes 40..=42, which are not backbone attention layers).
 pub const COMPRESS_RATIOS: [usize; 43] = [

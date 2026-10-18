@@ -4,7 +4,8 @@ use std::collections::HashSet;
 
 use sparkflash_kv::config::{KV_PAGE_TOKENS, SWA_WINDOW_SIZE};
 use sparkflash_kv::layout::{
-    GLOBAL_PAGE_BYTES, MemoryBudget, PageId, SWA_LAYERS, SWA_SLOT_BYTES, SWA_SLOTS_PER_TAIL,
+    GLOBAL_PAGE_BYTES, MemoryBudget, PageId, SWA_DECODER_LAYERS, SWA_ENCODER_LAYERS, SWA_LAYERS,
+    SWA_SLOT_BYTES, SWA_SLOTS_PER_TAIL,
 };
 use sparkflash_kv::swa::{ReplayKind, SwaProducer};
 use sparkflash_kv::tier::{InMemoryTier, Tier, TieredPageStore};
@@ -179,9 +180,28 @@ fn a_bounded_replay_never_rewrites_a_cached_global_kv_page() {
         .expect("decoder replay");
 
     assert_eq!(encoder.replayed_tokens, SWA_WINDOW_SIZE);
-    assert_eq!(encoder.swa_slots_written, 20 * SWA_SLOTS_PER_TAIL as u64);
+    assert_eq!(
+        encoder.swa_slots_written,
+        SWA_ENCODER_LAYERS as u64 * SWA_SLOTS_PER_TAIL as u64
+    );
+    // Absolute belt-and-braces value: the D7 encoder half writes 21 * 128 = 2,688 slots.
+    assert_eq!(encoder.swa_slots_written, 2_688);
     assert_eq!(decoder.replayed_tokens, SWA_WINDOW_SIZE);
-    assert_eq!(decoder.swa_slots_written, 20 * SWA_SLOTS_PER_TAIL as u64);
+    assert_eq!(
+        decoder.swa_slots_written,
+        SWA_DECODER_LAYERS as u64 * SWA_SLOTS_PER_TAIL as u64
+    );
+    // The D7 decoder half writes 19 * 128 = 2,432 slots, not the old 20 * 128 = 2,560.
+    assert_eq!(decoder.swa_slots_written, 2_432);
+    assert_ne!(decoder.swa_slots_written, 2_560);
+    assert_eq!(
+        sparkflash_kv::replay_layer_count(ReplayKind::Encoder),
+        SWA_ENCODER_LAYERS
+    );
+    assert_eq!(
+        sparkflash_kv::replay_layer_count(ReplayKind::Decoder),
+        SWA_DECODER_LAYERS
+    );
     assert!(encoder.global_kv_untouched());
     assert!(decoder.global_kv_untouched());
     assert_eq!(encoder.global_kv_pages_written, 0);
@@ -200,8 +220,10 @@ fn a_bounded_replay_never_rewrites_a_cached_global_kv_page() {
     );
     assert_eq!(
         snapshot.replay_swa_slots_written,
-        2 * 20 * SWA_SLOTS_PER_TAIL as u64
+        SWA_LAYERS as u64 * SWA_SLOTS_PER_TAIL as u64
     );
+    // 21 * 128 + 19 * 128 = 5,120 slots for a whole tail, unchanged by the split.
+    assert_eq!(snapshot.replay_swa_slots_written, 5_120);
 
     // And every cached page still decodes to exactly the filler's bytes.
     for block in 0..5usize {
@@ -294,7 +316,8 @@ fn a_short_window_is_replayed_but_is_not_cacheable_as_a_tail() {
         .bounded_replay(ReplayKind::Decoder, &tokens[..64], 64, &mut producer)
         .expect("short replay");
     assert_eq!(outcome.replayed_tokens, 64);
-    assert_eq!(outcome.swa_slots_written, 20 * 64);
+    assert_eq!(outcome.swa_slots_written, SWA_DECODER_LAYERS as u64 * 64);
+    assert_eq!(outcome.swa_slots_written, 1_216);
     assert!(!outcome.tail_completed);
     assert_eq!(cache.snapshot().swa_tails, 0);
 }

@@ -30,7 +30,7 @@ use crate::config::{KV_PAGE_TOKENS, SWA_WINDOW_SIZE};
 use crate::error::KvError;
 use crate::layout::{
     DEFAULT_GLOBAL_KV_POOL_BYTES, DEFAULT_SWA_TAIL_SLOTS, GLOBAL_PAGE_BYTES, MemoryBudget, PageId,
-    SWA_LAYERS, SWA_SLOT_BYTES, SWA_SLOTS_PER_TAIL, SWA_TAIL_BYTES,
+    SWA_DECODER_LAYERS, SWA_ENCODER_LAYERS, SWA_SLOT_BYTES, SWA_SLOTS_PER_TAIL, SWA_TAIL_BYTES,
 };
 use crate::plan::{KvCacheStatsSnapshot, KvCacheTelemetry, PrefixMatchPlan};
 use crate::radix::{NodeId, RadixTree};
@@ -479,13 +479,13 @@ impl KvCache {
         self.swa.lock()
     }
 
-    /// Runs one half of a Bounded Replay over the tail of a token window.
+    /// Runs one CED half of a Bounded Replay over the tail of a token window.
     ///
-    /// The producer fills only the layers of this half; the other half keeps whatever was
-    /// already in the ring. Only the SWA lock is held across the producer's work, and the
-    /// store's replay scope is armed around it, so a producer that nonetheless reached the
-    /// global-KV publish path would be refused and counted instead of silently overwriting
-    /// cached KV (see [TieredPageStore::begin_replay]).
+    /// The producer fills only the layers of this half (D7: encoder 0..=20, 21 layers; decoder
+    /// 21..=39, 19 layers); the other half keeps whatever was already in the ring. Only the SWA
+    /// lock is held across the producer's work, and the store's replay scope is armed around it,
+    /// so a producer that nonetheless reached the global-KV publish path would be refused and
+    /// counted instead of silently overwriting cached KV (see [TieredPageStore::begin_replay]).
     ///
     /// # Panics
     /// Panics if the producer re-enters this cache: see [SwaProducer::fill_layer].
@@ -765,17 +765,18 @@ fn merge_replay_outcomes(encoder: &ReplayOutcome, decoder: &ReplayOutcome) -> Re
     }
 }
 
-/// Number of layers a bounded replay covers.
+/// Number of layers a bounded replay covers, per the D7 split: 21 encoder, 19 decoder.
 #[must_use]
 pub const fn replay_layer_count(kind: ReplayKind) -> usize {
     match kind {
-        ReplayKind::Encoder => SWA_LAYERS / 2,
-        ReplayKind::Decoder => SWA_LAYERS - SWA_LAYERS / 2,
+        ReplayKind::Encoder => SWA_ENCODER_LAYERS,
+        ReplayKind::Decoder => SWA_DECODER_LAYERS,
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::SWA_LAYERS;
     use crate::tier::ReplayGuard;
 
     fn test_cache(uma: u64, dram: u64, nvme: u64) -> KvCache {
@@ -795,20 +796,23 @@ mod tests {
         // The merge is the only place that could still hardcode a zero, so it is tested with
         // counts that a hardcoded zero would not reproduce.
         let encoder = ReplayOutcome {
-            replayed_tokens: 128,
-            swa_slots_written: 20 * 128,
+            replayed_tokens: SWA_SLOTS_PER_TAIL,
+            swa_slots_written: SWA_ENCODER_LAYERS as u64 * SWA_SLOTS_PER_TAIL as u64,
             global_kv_pages_written: 1,
             tail_completed: false,
         };
         let decoder = ReplayOutcome {
-            replayed_tokens: 128,
-            swa_slots_written: 20 * 128,
+            replayed_tokens: SWA_SLOTS_PER_TAIL,
+            swa_slots_written: SWA_DECODER_LAYERS as u64 * SWA_SLOTS_PER_TAIL as u64,
             global_kv_pages_written: 2,
             tail_completed: true,
         };
         let merged = merge_replay_outcomes(&encoder, &decoder);
-        assert_eq!(merged.replayed_tokens, 128);
-        assert_eq!(merged.swa_slots_written, 40 * 128);
+        assert_eq!(merged.replayed_tokens, SWA_SLOTS_PER_TAIL);
+        assert_eq!(
+            merged.swa_slots_written,
+            SWA_LAYERS as u64 * SWA_SLOTS_PER_TAIL as u64
+        );
         assert_eq!(
             merged.global_kv_pages_written, 3,
             "a hardcoded zero would hide a refused publish from both halves"
@@ -905,7 +909,7 @@ mod tests {
     fn a_full_tail_outcome_sums_a_non_zero_counter_from_both_halves() {
         // The end-to-end falsifier for the merge: a full tail fills both halves, one layer at a
         // time, so the counter ends at the ring's layer count. A hardcoded zero (0), a single
-        // half (20) or a doubled merge (80) all fail here, which the all-zero public-path
+        // half (21 or 19) or a doubled merge (80) all fail here, which the all-zero public-path
         // comparison cannot show.
         let cache = test_cache(2, 2, 2);
         let tokens: Vec<u32> = (0..320u32).collect();

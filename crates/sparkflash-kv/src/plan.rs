@@ -4,6 +4,13 @@
 //! in each cache tier, it decides exactly how many tokens must be replayed through the
 //! encoder (to rebuild sliding-window KV) and through the decoder (Decoder SWA Bounded
 //! Replay, see arXiv:2609.19969 section 3.2.2), and records the decision in telemetry.
+//!
+//! D7 (docs/DECISIONS.md) splits the 40-layer backbone after layer 20: the encoder layers
+//! 0..=20 run over the whole prompt and the decoder layers 21..=39 only over the last
+//! min(prompt, SWA_WINDOW_SIZE) tokens. A plan counts tokens, not layers, so the layer
+//! boundary itself is owned by crate::config (ENCODER_LAST_LAYER, DECODER_FIRST_LAYER) and
+//! shared with the CED schedule and swa::ReplayKind; the cross-check test pins all three
+//! against each other.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -81,11 +88,14 @@ pub struct PrefixMatchPlan {
     pub nvme_restored_tokens: usize,
     /// Whether the exact 128-token SWA tail at `global_kv_cached_tokens` was in the ring.
     pub swa_tail_hit: bool,
-    /// Tokens replayed through encoder layers 0..=20 to rebuild sliding-window KV.
+    /// Tokens replayed through encoder layers 0..=20 (21 layers) to rebuild sliding-window KV.
     pub encoder_swa_replay_tokens: usize,
     /// Uncached suffix that must run the full encoder.
     pub uncached_suffix_tokens: usize,
-    /// Tokens at the end of the prompt that must run decoder layers 21..=39.
+    /// Tokens at the end of the prompt that must run decoder layers 21..=39 (19 layers).
+    ///
+    /// On a cold prompt this is the CED decoder extent, min(prompt, SWA_WINDOW_SIZE), so it is
+    /// a token count and does not change with the layer split; a 130-token prompt pins 128.
     pub decoder_swa_replay_tokens: usize,
 }
 
