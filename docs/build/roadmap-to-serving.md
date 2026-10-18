@@ -571,9 +571,20 @@ criterion-2 attribution tests are already merged (!38). Run it with
 `-- --checkpoint <snapshot dir>` on the node for the real table. Criterion 3's host half is also in
 place: the step output carries the head input (`StepOutput::head_input`) and `boundary_dump` writes
 it with the reference logits (`--head-input-out`, `--logits-out`), which is exactly the pair the
-device `cert_lm_head_sm121` harness compares. What remains is to run that kernel on the node and
-compare, plus the device column of criterion 1: the device half diffs this reference table against
-the device path and measures the per-tensor bars. A synthetic run prints that its source is bytes, not numbers, so its
+device `cert_lm_head_sm121` harness compares. The harness itself is merged (`m7_layer0 --stage 5`,
+!46) and its CPU precheck (`--stage 6`) has run on the node: recomputing all 129,280 logits in the
+kernel's order from the f32 head input reproduces the reference bit for bit, and from the bf16 codes
+the kernel ABI is fed it keeps argmax 5 and the same top-5 while moving a logit by at most 2.4320781e-2
+(measured, `phase1-boundary-table.md` section 11). That is the unavoidable conversion the device
+comparison must be measured above.
+
+The device head has now run in a full window: `--stage 5` reports device argmax 5 equal to both
+references, all 129,280 entries exact with **max |device - bf16-matched host| = 0** (bit-identical in
+the kernel's order), and 0 certified entries on this token, so the certificate was not exercised and
+the harness says so. That closes criterion 3's device half for the argmax and the exact logits; the
+top-5 is not claimed because a certified entry stores a bound rather than its value. What remains is
+the device column of criterion 1: the device half diffs this reference table against the device path
+and measures the per-tensor bars, and the 40-layer token harness that produces those rows. A synthetic run prints that its source is bytes, not numbers, so its
 argmax/top-5 are a shape and determinism record rather than a prediction. The released-checkpoint
 reference table is now the harness's --checkpoint mode: ReferenceWeights verifies the plan the way
 LoadedWeights does and serves the stored forms the reference decodes, LoadedWeights::read_ranges
@@ -608,7 +619,9 @@ window cost.
 
 `task-36` (kernel ABI, api-dev); new tasks: `phase1: layer plan and a pinned 43-row table`
 (arch-docs/kernel-dev), `phase1: 40-layer token harness with per-layer diff` (kernel-dev),
-`phase1: stage 4, head and sampling on device` (kernel-dev), `phase1: perturbation and seam-label
+`phase1: stage 4, head and sampling on device` (kernel-dev) - the certified head harness is merged
+(!46) and has run on the released token: argmax matches both references, all 129,280 logits are
+bit-identical to the bf16-matched host, 0 certified; the sampling path remains. `phase1: perturbation and seam-label
 tests` (api-dev), `phase1: run the released-checkpoint reference table on the node` (kernel-dev) -
 the paged Engram source, the released-geometry scratch fixes, the partitioned audit and the
 harness's --checkpoint mode landed; the real-weight run and its device diff are what remain.

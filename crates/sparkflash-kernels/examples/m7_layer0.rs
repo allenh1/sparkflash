@@ -85,6 +85,7 @@
 //!   m7_layer0 --stage 3 --checkpoint <snapshot dir> [--experts 8|32|64] [--tokens 4]
 //!   m7_layer0 --stage 4 --checkpoint <snapshot dir> [--tokens 4] [--repeat 10]
 //!   m7_layer0 --stage 5 --checkpoint <snapshot dir> --head-input HEAD.f32 --logits LOGITS.f32 [--cubin-dir out]
+//!   m7_layer0 --stage 6 --checkpoint <snapshot dir> --head-input HEAD.f32 --logits LOGITS.f32 [--mem-floor-gib 1]   (CPU only)
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -212,7 +213,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     if args.stage == 0 {
-        return Err("--stage 1, 2, 3, 4 or 5 is required: one stage per run".to_string());
+        return Err("--stage 1, 2, 3, 4, 5 or 6 is required: one stage per run".to_string());
     }
     if args.checkpoint.as_os_str().is_empty() {
         return Err("--checkpoint is required".to_string());
@@ -393,6 +394,51 @@ impl Snapshot {
                 "{name}: expected F32 or BF16, the checkpoint stores {other}"
             )),
         }
+    }
+
+    /// One row of a two-dimensional BF16 tensor as raw little-endian bytes, into a reused buffer.
+    /// The CPU head check walks 129,280 rows this way: reading the whole tensor would need 1.32 GB
+    /// beside a running vLLM, while one row is 10 KB.
+    fn read_row_bf16_into(
+        &mut self,
+        name: &str,
+        row: usize,
+        cols: usize,
+        out: &mut [u8],
+    ) -> Result<(), String> {
+        let header = self.load(name)?;
+        if header.dtype != "BF16" {
+            return Err(format!(
+                "{name}: expected BF16, the checkpoint stores {}",
+                header.dtype
+            ));
+        }
+        if header.shape.len() != 2 || header.shape[1] != cols {
+            return Err(format!(
+                "{name}: expected two dimensions with {cols} columns, the checkpoint stores {:?}",
+                header.shape
+            ));
+        }
+        if row >= header.shape[0] {
+            return Err(format!("{name}: row {row} is out of range"));
+        }
+        let len = cols * 2;
+        if out.len() != len {
+            return Err(format!(
+                "{name}: row buffer is {} bytes, expected {len}",
+                out.len()
+            ));
+        }
+        let start = header.start + (row * len) as u64;
+        let shard = self.shard_of(name)?;
+        let file = self
+            .files
+            .get_mut(&shard)
+            .ok_or_else(|| format!("{name}: shard {shard} is not open"))?;
+        file.seek(SeekFrom::Start(start))
+            .map_err(|e| format!("{name}: {e}"))?;
+        file.read_exact(out).map_err(|e| format!("{name}: {e}"))?;
+        Ok(())
     }
 
     /// One row of a two-dimensional BF16 tensor, without reading or holding the rest of it.
@@ -3295,6 +3341,91 @@ fn stage5(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// The reference head's top-k entry indices, ordered by value then by lowest index. The kernel's
+/// tie-break is the lowest entry index, so a comparison that ignored the index would disagree on a
+/// tie even when both sides computed the same values.
+fn top_k(logits: &[f32], k: usize) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..logits.len()).collect();
+    indices.sort_by(|a, b| {
+        logits[*b]
+            .partial_cmp(&logits[*a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(b))
+    });
+    indices.truncate(k);
+    indices
+}
+
+/// Stage 6: the CPU half of the criterion-3 head comparison, runnable while vLLM holds the node.
+///
+/// This stage never opens a CUDA context: it streams head.weight one 10 KB row at a time through the
+/// checkpoint's own shard reader and recomputes every exact logit twice, once from the reference's f32
+/// head input and once from the bf16 codes the kernel ABI is fed, both in the kernel's ascending order.
+/// The two deltas it prints are the ones the device run will sit on top of: the bf16 conversion of
+/// the hidden vector (what the device cannot avoid) and the host order versus the engine's matmul
+/// order (what the matched reference must reproduce). The first number is also the measured scale
+/// the device bar should be tightened to.
+fn stage6(args: &Args) -> Result<(), String> {
+    let head_input_path = args
+        .head_input
+        .as_ref()
+        .ok_or("--stage 6 needs --head-input FILE (boundary_dump --head-input-out)")?;
+    let logits_path = args
+        .logits
+        .as_ref()
+        .ok_or("--stage 6 needs --logits FILE (boundary_dump --logits-out)")?;
+    let hidden_f32 = read_f32_file(head_input_path, LM_HIDDEN)?;
+    let reference = read_f32_file(logits_path, LM_VOCAB)?;
+    let hidden = bf16_bits_of_f32(&hidden_f32);
+    let mut snapshot = Snapshot::open(&args.checkpoint)?;
+    let mut row = vec![0u8; LM_HIDDEN * 2];
+    let mut matched_f32 = vec![0.0f32; LM_VOCAB];
+    let mut matched_bf16 = vec![0.0f32; LM_VOCAB];
+    for entry in 0..LM_VOCAB {
+        snapshot.read_row_bf16_into("head.weight", entry, LM_HIDDEN, &mut row)?;
+        let mut from_f32 = 0.0f32;
+        let mut from_bf16 = 0.0f32;
+        for i in 0..LM_HIDDEN {
+            let w = bf16_code_to_f32(u16::from_le_bytes([row[2 * i], row[2 * i + 1]]));
+            from_f32 += hidden_f32[i] * w;
+            from_bf16 += bf16_code_to_f32(hidden[i]) * w;
+        }
+        matched_f32[entry] = from_f32;
+        matched_bf16[entry] = from_bf16;
+    }
+    let (reference_max, reference_at) = lm_argmax(&reference);
+    let (f32_max, f32_at) = lm_argmax(&matched_f32);
+    let (bf16_max, bf16_at) = lm_argmax(&matched_bf16);
+    let mut delta_f32 = 0.0f32;
+    let mut delta_bf16 = 0.0f32;
+    for entry in 0..LM_VOCAB {
+        delta_f32 = delta_f32.max((matched_f32[entry] - reference[entry]).abs());
+        delta_bf16 = delta_bf16.max((matched_bf16[entry] - matched_f32[entry]).abs());
+    }
+    let reference_top = top_k(&reference, 5);
+    let f32_top = top_k(&matched_f32, 5);
+    let bf16_top = top_k(&matched_bf16, 5);
+    println!(
+        "stage 6 (CPU): reference argmax {reference_at} value {reference_max:.9}; recomputed f32 argmax {f32_at} value {f32_max:.9}; bf16-hidden argmax {bf16_at} value {bf16_max:.9}"
+    );
+    println!(
+        "deltas: max |recomputed_f32 - reference| {delta_f32:e} (host order vs engine matmul); max |bf16_hidden - f32_hidden| {delta_bf16:e} (the unavoidable conversion the device ABI adds)"
+    );
+    println!("top-5: reference {reference_top:?}; f32 {f32_top:?}; bf16 {bf16_top:?}");
+    let argmax_ok = reference_at == f32_at && reference_at == bf16_at;
+    let top_ok = reference_top == f32_top && reference_top == bf16_top;
+    if !argmax_ok || !top_ok {
+        return Err(format!(
+            "stage 6: FAIL (argmax reference {reference_at} f32 {f32_at} bf16 {bf16_at}; top-5 {:?} vs {:?} vs {:?})",
+            reference_top, f32_top, bf16_top
+        ));
+    }
+    println!(
+        "stage 6: PASS (argmax and top-5 identical under both recomputations; the bf16 conversion moves a logit by at most {delta_bf16:e}, which is the measured bar the device run starts from)"
+    );
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
     let args = parse_args()?;
     println!("argv: {}", std::env::args().collect::<Vec<_>>().join(" "));
@@ -3309,7 +3440,8 @@ fn main() -> Result<(), String> {
         3 => stage3(&args),
         4 => stage4(&args),
         5 => stage5(&args),
-        other => Err(format!("unknown stage {other}: one of 1, 2, 3, 4, 5")),
+        6 => stage6(&args),
+        other => Err(format!("unknown stage {other}: one of 1, 2, 3, 4, 5, 6")),
     }
 }
 

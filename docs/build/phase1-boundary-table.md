@@ -525,7 +525,37 @@ with `--head-input-out` and `--logits-out` wrote criterion 3's two sides as raw 
 f32: 5,120 head-input values (all finite, min -2.0506, max 1.41963,
 L2 norm 18.157493) and 129,280 logits with argmax 5 and top-5 [5: 13.230665207, 201: 12.492528915,
 372: 11.897726059, 30: 11.392500877, 1897: 11.015835762]. The device head harness reads those two
-files and will compare its own logits against them. The one-token report on the same snapshot printed:
+files and will compare its own logits against them. A CPU precheck of that comparison
+(`m7_layer0 --stage 6`, run on `node0` on 2026-10-17 while vLLM held the node: 50 s, no CUDA
+context) recomputed all 129,280 logits from the reference's f32 head input and from the bf16 codes
+the kernel ABI is fed, in the kernel's ascending order. Both recomputations reproduce the reference
+argmax 5 and top-5 exactly; the f32 recomputation matches the reference logits bit for bit (max abs
+delta 0), so the host's accumulation order is the engine's, and the bf16 conversion the kernel cannot
+avoid moves a logit by at most 2.4320781e-2. That last number is the measured scale the device head's
+exact-entry bar has to sit above, and the reason the stage-5 comparison uses a bf16-matched reference
+rather than the f32-hidden logits.
+
+The device run then happened, in a full window on `node0` with vLLM stopped (2026-10-17 19:44,
+118 GiB free). `m7_layer0 --stage 5` launched `cert_lm_head_sm121` once per rank over the four
+32,320-row shards of `head.weight` and printed:
+
+* device argmax **5**, value **13.237006187**, equal to the bf16-matched host reference (and to the
+  f32-hidden reference argmax 5);
+* **all 129,280 entries exact, 0 certified**: the screen's bound (per-128-block hidden sums times the
+  row's max |w|) is far above the largest logit on this hidden state, so it pruned nothing and the
+  whole vocabulary took the exact path - the run is the exact BF16 GEMM, not a pruned one;
+* **max |device - bf16-matched host| = 0** over every entry: the device logits are bit-identical to the
+  host recomputation in the kernel's order, so the head's arithmetic is reproduced exactly and the
+  only difference from the reference logits is the measured 2.4320781e-2 bf16 conversion of the
+  hidden vector;
+* the certificate check was therefore not exercised and says so rather than claiming it passed; the
+  kernel's 32-value block reduction was cross-checked against the per-entry scan on every rank;
+* the run took 1.56 s including the 1.32 GB upload, and a second run printed identical output.
+
+This is criterion 3's device half for the argmax and the exact logits. The top-5 set is not claimed:
+a certified entry stores a bound, and the kernel's contract is the argmax; with 0 certified entries on
+this token the top-5 happens to be recoverable, but the harness does not claim a contract it cannot
+honour in general. The one-token report on the same snapshot printed:
 
 * 95,819 tensors verified, 4 Engram tensors paged (the two released Engram tables, weight and scale);
 * 40 rows, all host-vs-host bit-exact, two runs byte-identical over the boundary tables and the
