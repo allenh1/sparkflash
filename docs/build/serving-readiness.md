@@ -1,10 +1,11 @@
 # Serving readiness: the device path to a real token
 
 Status: **docs-only readiness map. No code changed.** Verified against code main `8b3aef9`
-("!81 batch 2: !78 device M1 + !80 router delta fixes", 2026-10-18), and updated to main `5898e23`
-(!88: M3-a host-only chain skeleton plus typed chain param builders; !87: gate/up guard and doc
-truth; !86: device M2 real session, routed gate/up kernel, and this map). The branch is rebased onto
-`5898e23`; D30's routed-expert sharding consequence (routed experts 82.2 GB/rank padded to 640) is
+("!81 batch 2: !78 device M1 + !80 router delta fixes", 2026-10-18), and updated to main `2a1f80b`
+(!90: M3 device-stage wiring with dry-run dispatch, plus the layer-0 mHC entry window record; !88:
+M3-a host-only chain skeleton plus typed chain param builders; !87: gate/up guard and doc truth;
+!86: device M2 real session, routed gate/up kernel, and this map). The branch is rebased onto
+`2a1f80b`; D30's routed-expert sharding consequence (routed experts 82.2 GB/rank padded to 640) is
 reflected in section 4. Every number below is tagged **measured** (a named device log or in-repo doc
 printed it), **derived** (arithmetic shown here over figures that are measured or pinned), or
 **unverified** (no evidence this map can cite). A wrong number in this file is a blocker: correct or
@@ -51,7 +52,7 @@ has actually been executed on a GB10; "gap" is what separates the stage from a w
 | - | :--- | :--- | :--- | :--- |
 | 1 | embedding gather | none | host seam only; device execution never attempted | kernel missing; seam `embedding_gather` |
 | 2 | attention prologue: q/kv RMSNorm, RoPE | none | host seams only | fused norm+RoPE kernel missing; seams `attn_norm`, `attn_rope` |
-| 3 | mHC entry (hc_pre) and post-mix (hc_post) | `MEGA_MHC` | **measured**: stage 1 4/4 tokens, stage 4 determinism, chained stages 7/9 | chain wiring only |
+| 3 | mHC entry (hc_pre) and post-mix (hc_post) | `MEGA_MHC` | **measured**: stage 1 4/4 tokens, stage 4 determinism, chained stages 7/9; m11 layer-0 entry PASS (b7: 130/130 positions, X_l 20,480/20,480 exact, p50 0.0340 ms/position) | chain wiring only; typed `MegaMhcParams` builder on main, not launched in the chain |
 | 4 | attention projections (wq_a/wq_b/wkv/wo_b) and wo_a | `MXFP8_DENSE`, `MXFP8_WO_A` | **measured**: stage-8 probes bit-exact; chained stages 7/9 | chain wiring only |
 | 5 | window-KV write and ring rotation | `copy_dtod` + ring layout helpers | **measured**: corrected m8 run (11,764 copies, 198,832,128 B, 0 mismatches) | chain wiring; device KV store is Phase 3 |
 | 6 | attention: CSA union format 2 (38 layers), window format 1 (layers 0-1) | `FLASH_MLA_CSA2` | **measured**: task-14 format 2, m8 dispatch, stage-2 formats 0/1 | chain wiring; builder is on main |
@@ -116,8 +117,9 @@ norm+RoPE kernel missing (Phase 3); host seam otherwise.
   pre-B0 fold: `kernels/mega_mhc_sm121.cu:40-69`.
 - **Harness/API:** `examples/m7_layer0` stage 1 (`stage1.rs`), stage 4 (`stage4.rs:81`), and the
   chained stages 7/9 load it by name and launch through `Cuda::launch` with a param-word array
-  (e.g. `stage1.rs:231`). The chain has **no typed mHC launcher**: M3 must add a pinned param
-  builder or reuse the stage builders.
+  (e.g. `stage1.rs:231`). A typed pinned builder `mega_mhc_launch::MegaMhcParams` is on main
+  (`!88`), and the M3 wiring's `CudaLauncher` constructs it for the first stage
+  (`chain_device.rs:481`), but no buffers are staged, so the chain still does not launch it.
 - **Measured (measured):** stage 1 passes 4 of 4 tokens at every boundary at layers 0, 1 and 4, and
   a later recon adds layers 14 and 39 (recon paragraph `phase1-boundary-table.md:571-578`). The
   full stage-1 row (`:627`) records two exceptions: layer-0 token 0 at 5,119/5,120 codes and
@@ -128,6 +130,14 @@ norm+RoPE kernel missing (Phase 3); host seam otherwise.
   `runs/d-stage1-layer0-retry.log` and `window-stage1-20261018T174723Z.log`, are Lead-window files
   on the node, not in this repository).
   Stage 4 launched the same inputs repeatedly with byte-identical output (mHC determinism).
+  The m11 window (b7, start 2026-10-18T22:01:38Z) ran layer 0's entry in isolation through
+  `MegaMhcParams` on released bytes: **PASS**, 130 of 130 positions with 0 failed of 130 x 2 verdicts,
+  residual streams `X_l` **20,480 of 20,480 bf16 exact** (max abs delta 0), `xhat_fp8`/scales and
+  the block-input f32 capture all exact, `1/rms` within its 3e-4 bar, two device runs
+  byte-identical, p50 **0.0340 ms/position** at 130 positions (binary
+  `m11_mhc_entry_8da8b0b2_aarch64`, sha256 `8da8b0b2...`); recorded in
+  [phase3-mhc-entry.md](phase3-mhc-entry.md) section "Window record: b7". It is one isolated stage,
+  not a chain, token or layer output.
   The B2 chained replay (stage 7) runs the sixteen-launch chain plus four forced-routing controls
   (20 launches; `/home/user/phase1-evidence/phase1-b2-stage7-layer0-rereview5-20261018T044122Z.log`,
   23,897 B, sha256 `c2de544c1789743e73ccc5d5277dc3165d98296d0f5cc867cc819d9160754ac9`,
@@ -477,8 +487,8 @@ run against the checkpoint ([roadmap-to-serving.md](roadmap-to-serving.md) secti
   then listening; the M1 fake-session negative control in the same window printed
   `fake_session=true, device_execution=false, chain=false, vision=false` and launched nothing. This
   is an execution proof only: no token, no logits, no chain. The design doc's re-scope (section 7)
-  is now main's: M2 is this session proof, the chain skeleton is **M3** (split M3-a..d), the full
-  run is **M4**.
+  is now main's: M2 is this session proof, the chain work is **M3** (M3-a, then the wiring, then
+  M3-b/c/d), the full run is **M4**.
 
 ### 3.2 The honest status of the "40-layer forward pass producing tokens"
 
@@ -516,9 +526,10 @@ of those nine tokens has a device-produced counterpart yet.
 ### 3.3 Ordered work, M1/M2 and the chain (M3/M4)
 
 The design's milestone split ([device-forward-chain.md](device-forward-chain.md) section 7) is the
-right frame and now matches main: M1 (`!78`) and M2 (`!86`) are merged, and M3 is split into M3-a
-(merged on main, `!88`, host-only) and M3-b/c/d, with the full 130 + 8 run as M4. The ordering
-below respects data dependencies and separates what is already on main.
+right frame and now matches main: M1 (`!78`) and M2 (`!86`) are merged; M3-a (`!88`, host-only
+skeleton) and the M3 wiring (`!90`: one `ChainOps` implementation, dry-run dispatch) are on main,
+and M3-b/c/d remain, with the full 130 + 8 run as M4. The ordering below respects data dependencies
+and separates what is already on main.
 
 **M3-a — chain skeleton (merged on main, `!88`; host-only, no device execution, no token).**
 1. `chain.rs` derives the 130 + 8 CED schedule (5,162 prefill + 320 decode = 5,482 token-layer
@@ -543,10 +554,27 @@ below respects data dependencies and separates what is already on main.
    `DeviceStep`, `compare_steps`, `CertifiedMask`); it is the Phase-2 comparison path, not a
    chain execution.
 
-Criterion 1 stays **OPEN**: M3-a prints a plan, opens no driver, launches nothing and produces no
-token or logits.
+**M3 wiring — the dispatch, merged on main (`!90`); dry-run only, no device execution.**
+`chain_device.rs` is the one `ChainOps` implementation a device run will use: each stage is
+classified, host-seam stages go to an injected `HostSeamDelegate`, and device-status stages go to
+an injected `DeviceLauncher` (`crates/sparkflash-device/src/chain_device.rs:105`) — there is no
+host fallback for a device stage. The default launcher is `NoCudaLauncher` (`:201`), which refuses
+every device stage with `CudaUnavailable`; the fake launcher (`:147`) drives
+`sparkflash device-chain --dry-run` over the full 130 + 8 plan: **108,017 `ChainOps` calls = 58,670
+host-seam records + 49,347 device-launcher calls**, the plan-vs-ledger self-check prints PASS, the
+per-stage counts and host-seam seats are printed, and it exits 2 with
+`chain_execution=false; device_execution=false; token_produced=false` — no driver, no cubin, no
+launch, no token (`crates/sparkflash-cli/src/device_chain.rs:27-135`). The real `CudaLauncher` is
+behind the `cuda` feature: `open` loads the required pins and verifies each pinned cubin's bytes
+with `cubins::verify_bytes` before any driver is opened (`:429`, `:440-453`), and it wires the
+first typed builder (`mega_mhc_launch::MegaMhcParams`, `:481`), but every stage refuses with
+`NotStaged` until M3-b supplies the buffers and weights (`:521`); this MR has no CLI path to it
+and claims no device execution, token or comparison.
 
-**M3-b — weight staging and budget admission.**
+Criterion 1 stays **OPEN**: the plan and the dry-run open no driver, load no cubin, launch nothing
+and produce no token or logits; the first device execution needs M3-b.
+
+**M3-b — weight staging and budget admission (next).**
 6. Stage the dense, mHC, shared-expert, head and embedding weights through `WeightSource`
    (`embed.weight` is 1.324 GB bf16, section 4); stream routed experts per layer (no data path
    exists; section 4 shows why all-resident is impossible).
@@ -709,13 +737,17 @@ rows with unpadded release bytes are 18.37 / 12.35 / 11.30 GB.
   was verified against). Main has since advanced through docs-only facts (`e19c933`, !79: D29, D25's
   18:32Z numbers), `79f45b3` (!85 cleanup batch 1 plus D30), and the device-path merges `5898e23`
   (!88: M3-a host-only chain skeleton and typed chain builders; !87: gate/up guard and doc truth;
-  !86: M2 real session, routed gate/up kernel and this map). M1 is `!78`/`!81`; the M2 session is
-  `!86`. Chain APIs on main from `1ceeb54` (!63): `Format2AttentionCall`,
+  !86: M2 real session, routed gate/up kernel and this map), and `2a1f80b` (!90: M3 device-stage
+  wiring with dry-run dispatch, plus the m11 layer-0 mHC entry window record). M1 is `!78`/`!81`;
+  the M2 session is `!86`. Chain APIs on main from `1ceeb54` (!63): `Format2AttentionCall`,
   `SeamKind/Record/Ledger`, `BoundaryStage`; the M3-a plan types (`ChainSchedule`,
-  `ChainSeamPlan`, `ChainOps`, `WindowAccounting`) are in `sparkflash-device` from `!88`.
+  `ChainSeamPlan`, `ChainOps`, `WindowAccounting`) are in `sparkflash-device` from `!88`, and
+  the M3 wiring types (`ChainDevice`, `DeviceLauncher`, `NoCudaLauncher`, `CudaLauncher`) from
+  `!90`.
 - Design and contracts: [device-forward-chain.md](device-forward-chain.md) (M1, M2 and the M3/M4
   re-scope at section 7 on main; head contract 4.2; criterion-1 definition 4.3; seam set 3.1),
   [device-path-design.md](device-path-design.md), [phase3-gate-up.md](phase3-gate-up.md),
+  [phase3-mhc-entry.md](phase3-mhc-entry.md),
   [roadmap-to-serving.md](roadmap-to-serving.md) (sections 4.3, 4.6, 7.5), [phase1-boundary-table.md](phase1-boundary-table.md),
   [phase3-router.md](phase3-router.md), [phase3-indexer.md](phase3-indexer.md),
   [task14-union-attention-case.md](task14-union-attention-case.md), [../DECISIONS.md](../DECISIONS.md)
@@ -737,6 +769,7 @@ repository or the evidence tree on this host.
 | router b2 window | **in-repo:** [phase3-router.md](phase3-router.md) section 5; **node-only:** `window-b2-20261018T183240Z.log`; `runs2/m9-router-tokens8.log`, `runs2/m9-router-tokens130.log` | binary `8f32174e...`, cubin `5992cef9...`; 48/48 and 780/780 ids exact; ULP/bit counts; p50 6.8530/6.8541 ms; 4,028,288 B buffers |
 | router b3 window | **Lead-reported only** (node: `window-b3-...`, `runs3/m9-d14306c-tokens{8,130}.log`; not in this repo or evidence tree) | same ids/ULP counts; p50 6.8528/6.8534 ms; 5,470,816 B buffers at 130 tokens |
 | stage-1 retry | **in-repo:** [phase3-indexer.md](phase3-indexer.md) section 5; **node-only:** `window-stage1-20261018T174723Z.log`; `runs/d-stage1-layer0-retry.log` | stage 1 PASS 4/4 tokens every boundary with the renamed pinned cubin `e21293e3...` |
+| m11 mHC entry b7 window | **in-repo:** [phase3-mhc-entry.md](phase3-mhc-entry.md) section "Window record: b7"; **node-only:** `window-b7-20261018T220138Z.log`; `runs7/m11-tokens8.log`, `runs7/m11-tokens130.log` | binary `8da8b0b2...`, 4,008,760 B; layer-0 mHC entry PASS, 130/130 positions, X_l 20,480/20,480 exact, xhat exact, determinism byte-identical, p50 0.0340 ms/position at 130 positions |
 | gate/up b6 window | **in-repo:** [phase3-gate-up.md](phase3-gate-up.md) section 5; **node-only:** `window-b6-20261018T202235Z.log`; `runs6/m10-tokens8.log`, `runs6/m10-tokens130.log` | binary `bb12c547...`, 4,557,008 B; gate/up 30,720/30,720 and 499,200/499,200 exact; padding 0; determinism byte-identical; p50 1.2734/1.2741 ms (tokens 8) and 30.1708/30.2761 ms (tokens 130); control gap 3.977737e-2/3.599775e-2 |
 | M2 session b5 window | **Lead-reported only** (code on main since `!86`; node: `window-b5-20261018T200757Z.log`; `runs5/m2-real.log`, `runs5/m2-fake.log`; not in this repo or evidence tree) | binary `bb06520a...`, 41,264,704 B; one router launch, `fake_session=false`, `device_execution=true`, `chain=false`, `launches=1`, `tokens=8`, outputs sha256 `889671ba...`; M1 fake-session negative control in the same window |
 | task-14 union check | this evidence tree: `/home/user/phase2-evidence/task14/run-task14.log`; `union-attention-report.json` | format 2 pass=true at layers 21/30/39; format 1 misses by ~1.8-2.2 |
@@ -778,6 +811,7 @@ and is not cited.
 No device token, no logits comparison against the fixture from a chain, no Phase 2 or Phase 3 exit
 criterion, no serving throughput, no memory measurement for a wired chain, and no claim about the
 merged gate/up kernel beyond its measured gate/up projection (routing weight, SwiGLU, combine,
-shared expert, end-to-end MoE, host-time savings and chain wiring are all unclaimed; M3-a is a plan,
-not an execution). The one claim is the map itself: the stages,
+shared expert, end-to-end MoE, host-time savings and chain wiring are all unclaimed; M3-a is a plan
+and the M3 wiring is a fake-launcher dry-run, not device executions). The one claim is the map
+itself: the stages,
 their pins, their measured status, the gaps, and the ordering of the remaining work.
