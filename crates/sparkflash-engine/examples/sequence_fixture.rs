@@ -22,10 +22,15 @@
 //! ```
 //!
 //! The node golden fixture records the shell-runnable command, the host, the generator binary's
-//! SHA-256 and free-form notes; the CI fixture records only the canonical command, because it must
-//! regenerate byte-identically on any host and binds no evidence to one machine or one binary (the
-//! schema says the same). Both print the fixture file's own SHA-256 and size. The example never
-//! claims the fixture is a device run: milestone 2B produces that separately.
+//! SHA-256 and free-form notes (each `--note TEXT` is appended verbatim, so a run can record the
+//! fix commit, the toolchain and the squash expectation without changing the generated numbers or
+//! the compared set - the note changes the fixture's provenance bytes, which is deliberate); the
+//! CI fixture records only the canonical command, because it must regenerate byte-identically on
+//! any host and binds no evidence to one machine or one binary (the schema says the same). A
+//! `--note` on the CI provenance is refused: the CI fixture's recorded command has no note flag,
+//! so a noted CI fixture would not regenerate from the command it records. Both print the fixture
+//! file's own SHA-256 and size. The example never claims the fixture is a device run: milestone 2B
+//! produces that separately.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -34,12 +39,13 @@ use sha2::{Digest, Sha256};
 use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::sequence_fixture::{
     FixtureProvenance, FixtureWeights, LogitsCapture, MILESTONE_DECODE_STEPS,
-    MILESTONE_PROMPT_TOKENS, SequenceFixture, deterministic_prompt, generate_fixture,
+    MILESTONE_PROMPT_TOKENS, SequenceFixture, ci_provenance_admits_notes, deterministic_prompt,
+    generate_fixture,
 };
 
 const USAGE: &str = "usage: sequence_fixture --out PATH [--config tiny|released] \
 [--checkpoint DIR] [--index PATH] [--prompt-tokens N] [--decode-steps N] \
-[--seed N] [--logits all|prefill|none] [--provenance auto|ci|node]";
+[--seed N] [--logits all|prefill|none] [--provenance auto|ci|node] [--note TEXT]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigChoice {
@@ -75,6 +81,7 @@ fn run() -> Result<(), String> {
     let mut logits: Option<LogitsCapture> = None;
     let mut provenance_choice = ProvenanceChoice::Auto;
     let mut out: Option<PathBuf> = None;
+    let mut custom_notes: Vec<String> = Vec::new();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -125,6 +132,7 @@ fn run() -> Result<(), String> {
                 };
             }
             "--out" => out = Some(PathBuf::from(value()?)),
+            "--note" => custom_notes.push(value()?),
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -151,6 +159,11 @@ fn run() -> Result<(), String> {
     }
     if provenance_choice == ProvenanceChoice::Node && config_choice == ConfigChoice::Tiny {
         return Err("--provenance node requires --config released".to_string());
+    }
+    // The CI fixture's canonical command has no note flag, so a note would make the fixture
+    // unreproducible from the command it records. Refuse rather than write that.
+    if provenance_choice == ProvenanceChoice::Ci {
+        ci_provenance_admits_notes(&custom_notes).map_err(|error| error.to_string())?;
     }
     let prompt = deterministic_prompt(config.vocab_size, prompt_tokens, seed);
     let index_path = index.clone().or_else(|| {
@@ -179,13 +192,17 @@ fn run() -> Result<(), String> {
             ),
             host: None,
             binary_sha256: None,
-            notes: vec![
-                "weight-free finite-FP32 source: CI fixture, not evidence about the released model"
-                    .to_string(),
-                "host and binary sha256 are deliberately absent: the CI fixture must regenerate byte-identically on any host and binds no evidence to one machine or one binary; the node golden fixture records both".to_string(),
-            ],
+            notes: {
+                let mut notes = vec![
+                    "weight-free finite-FP32 source: CI fixture, not evidence about the released model"
+                        .to_string(),
+                    "host and binary sha256 are deliberately absent: the CI fixture must regenerate byte-identically on any host and binds no evidence to one machine or one binary; the node golden fixture records both".to_string(),
+                ];
+                notes.extend(custom_notes.iter().cloned());
+                notes
+            },
         },
-        ProvenanceChoice::Node => node_provenance()?,
+        ProvenanceChoice::Node => node_provenance(&custom_notes)?,
         ProvenanceChoice::Auto => unreachable!("auto is resolved above"),
     };
     let fixture = generate_fixture(
@@ -218,7 +235,7 @@ fn logits_flag(capture: LogitsCapture) -> &'static str {
     }
 }
 
-fn node_provenance() -> Result<FixtureProvenance, String> {
+fn node_provenance(custom_notes: &[String]) -> Result<FixtureProvenance, String> {
     let argv = std::env::args().collect::<Vec<_>>();
     let command = shell_join(&argv);
     let host = std::env::var("HOSTNAME")
@@ -239,6 +256,7 @@ fn node_provenance() -> Result<FixtureProvenance, String> {
     if let Ok(cwd) = std::env::current_dir() {
         notes.push(format!("run from {}", cwd.display()));
     }
+    notes.extend(custom_notes.iter().cloned());
     Ok(FixtureProvenance {
         command,
         host,

@@ -14,6 +14,7 @@
 //! `head_input` and compares its logits with the reference ones.
 use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::forward::{InferenceEngine, SequenceState};
+use sparkflash_engine::linalg::CHECKPOINT_TENSOR_LIMIT;
 use sparkflash_engine::loader::ReferenceWeights;
 use sparkflash_engine::report::SMALL_SHAPE_LIMIT;
 use sparkflash_engine::synthetic::SyntheticWeights;
@@ -22,9 +23,6 @@ use sparkflash_engine::weights::WeightSource;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-
-/// The element limit for the released configuration, as in examples/one_token.rs.
-const CHECKPOINT_ELEMENT_LIMIT: usize = 1 << 30;
 
 fn main() {
     let mut token = 0u32;
@@ -85,7 +83,7 @@ fn main() {
                         dir.display()
                     )
                 });
-            (Box::new(reference), CHECKPOINT_ELEMENT_LIMIT)
+            (Box::new(reference), CHECKPOINT_TENSOR_LIMIT)
         }
         None => (
             Box::new(SyntheticWeights::from_plan(&plan, 1)),

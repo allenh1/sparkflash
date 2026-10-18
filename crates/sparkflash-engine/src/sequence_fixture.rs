@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 use crate::config::ModelConfig;
 use crate::dtype::DType;
 use crate::forward::{InferenceEngine, SequenceState, StepOutput};
-use crate::linalg::{EngineError, REFERENCE_TENSOR_LIMIT};
+use crate::linalg::{CHECKPOINT_TENSOR_LIMIT, EngineError};
 use crate::loader::ReferenceWeights;
 use crate::tensor::{TensorPlan, TensorSpec};
 use crate::weights::{WeightError, WeightSource};
@@ -93,6 +93,25 @@ pub struct FixtureProvenance {
     /// Free-form notes that must travel with the numbers.
     #[serde(default)]
     pub notes: Vec<String>,
+}
+
+/// Refuses notes on a CI fixture, whose recorded command cannot carry them.
+///
+/// A note is appended to [FixtureProvenance::notes], which is part of the serialised fixture, so a
+/// note changes the fixture's bytes even though it cannot change a number. The CI provenance also
+/// records the canonical command that regenerates the fixture, and that command has no `--note`
+/// flag. A noted CI fixture would therefore not regenerate from its own recorded command, which is
+/// the one property a CI fixture exists for; the generator refuses the combination instead.
+///
+/// # Errors
+///
+/// [FixtureError::NotesOnCiProvenance] when `notes` is not empty.
+pub fn ci_provenance_admits_notes(notes: &[String]) -> Result<(), FixtureError> {
+    if notes.is_empty() {
+        Ok(())
+    } else {
+        Err(FixtureError::NotesOnCiProvenance)
+    }
 }
 
 /// One fixture step: the prefill, or one decode.
@@ -323,6 +342,11 @@ pub enum FixtureError {
     /// A weight read failed.
     #[error(transparent)]
     Weights(#[from] WeightError),
+    /// A free-form note on the CI provenance.
+    #[error(
+        "a CI fixture cannot carry --note: its recorded canonical command has no note flag, so a noted fixture would not regenerate from the command it records"
+    )]
+    NotesOnCiProvenance,
 }
 
 /// A deterministic finite-FP32 weight source: the weight-free CI fixture's weights.
@@ -423,6 +447,20 @@ pub fn deterministic_prompt(vocab: usize, tokens: usize, seed: u64) -> Vec<u32> 
     prompt
 }
 
+/// The per-tensor element limit the generator hands the engine, by weight source.
+///
+/// The finite source is synthetic and small by construction, so it keeps the tight 4 Mi-element
+/// guard. A real checkpoint needs [CHECKPOINT_TENSOR_LIMIT]: the released `embed.weight` and
+/// `head.weight` are 661,913,600 elements each and many attention tensors are 41,943,040, all
+/// above [crate::linalg::REFERENCE_TENSOR_LIMIT], which is why the first real-checkpoint run was
+/// refused before this function existed.
+const fn element_limit(kind: FixtureWeightKind) -> usize {
+    match kind {
+        FixtureWeightKind::FiniteFp32 => 1 << 22,
+        FixtureWeightKind::ReferenceCheckpoint => CHECKPOINT_TENSOR_LIMIT,
+    }
+}
+
 /// Generates a fixture from a weight source and a prompt.
 ///
 /// # Errors
@@ -478,11 +516,7 @@ pub fn generate_fixture(
             },
         ),
     };
-    let limit = match source_info.kind {
-        FixtureWeightKind::FiniteFp32 => 1 << 22,
-        FixtureWeightKind::ReferenceCheckpoint => REFERENCE_TENSOR_LIMIT,
-    };
-    let engine = InferenceEngine::new(config.clone(), source, limit)?;
+    let engine = InferenceEngine::new(config.clone(), source, element_limit(source_info.kind))?;
     let mut state = SequenceState::new(config);
     let prefill = engine.prefill(&mut state, prompt_tokens)?;
     let mut steps = Vec::with_capacity(1 + decode_steps);
@@ -760,6 +794,7 @@ pub fn compare_logits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linalg::REFERENCE_TENSOR_LIMIT;
 
     fn tiny_fixture(decode_steps: usize) -> SequenceFixture {
         let config = ModelConfig::tiny();
@@ -969,6 +1004,40 @@ mod tests {
     }
 
     #[test]
+    fn the_checkpoint_limit_admits_the_released_embedding_but_the_small_shape_limit_does_not() {
+        let config = ModelConfig::v41_flash().expect("the released configuration is consistent");
+        let plan = TensorPlan::language_model(&config);
+        let spec = plan
+            .get("embed.weight")
+            .expect("the plan names embed.weight");
+        let elements = spec.elements();
+        assert_eq!(elements, 661_913_600);
+        assert!(
+            elements > REFERENCE_TENSOR_LIMIT as u128,
+            "the released embedding must be above the small-shape guard"
+        );
+        assert!(
+            elements <= CHECKPOINT_TENSOR_LIMIT as u128,
+            "the released embedding must fit the checkpoint limit"
+        );
+        // head.weight ties the embedding exactly, so it is the second tensor this guard admits.
+        let head = plan.get("head.weight").expect("the plan names head.weight");
+        assert_eq!(head.elements(), elements);
+    }
+
+    #[test]
+    fn the_generator_selects_the_checkpoint_limit_only_for_a_real_checkpoint() {
+        assert_eq!(element_limit(FixtureWeightKind::FiniteFp32), 1 << 22);
+        assert_eq!(
+            element_limit(FixtureWeightKind::ReferenceCheckpoint),
+            CHECKPOINT_TENSOR_LIMIT
+        );
+        const {
+            assert!(CHECKPOINT_TENSOR_LIMIT > REFERENCE_TENSOR_LIMIT);
+        };
+    }
+
+    #[test]
     fn empty_prompt_and_zero_decode_steps_are_refused() {
         let config = ModelConfig::tiny();
         assert!(matches!(
@@ -997,6 +1066,16 @@ mod tests {
             )
             .expect_err("no decode"),
             FixtureError::NoDecodeSteps
+        ));
+    }
+
+    #[test]
+    fn a_ci_fixture_refuses_notes_its_recorded_command_cannot_carry() {
+        ci_provenance_admits_notes(&[]).expect("an un-noted CI fixture is canonical");
+        assert!(matches!(
+            ci_provenance_admits_notes(&["fix commit abc123".to_string()])
+                .expect_err("a note cannot be part of the CI command"),
+            FixtureError::NotesOnCiProvenance
         ));
     }
 }

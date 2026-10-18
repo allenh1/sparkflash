@@ -19,17 +19,13 @@
 //! the device half diffs against (docs/build/phase1-boundary-table.md), and it needs the node: the
 //! checkpoint is not on this host.
 use sparkflash_engine::config::ModelConfig;
+use sparkflash_engine::linalg::CHECKPOINT_TENSOR_LIMIT;
 use sparkflash_engine::loader::ReferenceWeights;
 use sparkflash_engine::report::{SMALL_SHAPE_LIMIT, WeightClass, one_token_report};
 use sparkflash_engine::synthetic::SyntheticWeights;
 use sparkflash_engine::tensor::TensorPlan;
 use sparkflash_engine::weights::WeightSource;
 use std::path::PathBuf;
-
-/// The element limit for the released configuration. The largest non-paged planned tensor is
-/// embed.weight with 661,913,600 elements (head.weight ties it exactly); the Engram tables are
-/// paged and never see this limit.
-const CHECKPOINT_ELEMENT_LIMIT: usize = 1 << 30;
 
 /// The released layer counts at small shapes: 40 backbone layers and three MTP stages, with the
 /// released DSpark targets, so the row rule can be checked without a checkpoint.
@@ -116,7 +112,7 @@ fn main() {
                     })
                     .count()
             );
-            (Box::new(reference), CHECKPOINT_ELEMENT_LIMIT)
+            (Box::new(reference), CHECKPOINT_TENSOR_LIMIT)
         }
         None => (
             Box::new(SyntheticWeights::from_plan(&plan, 1)),

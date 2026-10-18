@@ -1,8 +1,10 @@
 # Phase 2 sequence harness (milestone 2)
 
-Status: **2A implemented on branch `phase2/sequence-harness`** (off main 57a4397); 2B/2C are the
-next milestones. This note records the accepted design, the 2A contract, and the exact boundaries
-so no later claim is read more broadly than it was measured.
+Status: **2A merged on main as 13d880d** (squash of !56, off main b8fcc52); 2B/2C are the next
+milestones. This note records the accepted design, the 2A contract, and the exact boundaries so no
+later claim is read more broadly than it was measured. One follow-up commit on
+`phase2/fixture-checkpoint-limit` names and shares the real-checkpoint element limit (see section
+3): the first node attempt against 13d880d was refused by the small-shape guard, not by the model.
 
 Sources: `docs/build/roadmap-to-serving.md` section 5 (5.3 prefill/decode, 5.4 audit, 5.5 exit
 criteria), `docs/DECISIONS.md` D7 (CED prefill bypass), `docs/engine/01-forward-order.md`
@@ -60,9 +62,24 @@ prompt token ids, decode step count, window, compared positions, per-step kind/p
 token/logits SHA-256 (full logits optional; CI records all, the node fixture records the last
 prefill position), reserved `kv_rows` (empty in 2A, populated for the 2C audit), and provenance.
 Provenance is deliberately asymmetric: the node golden fixture records the shell-runnable command,
-host, generator binary SHA-256 and notes, while the CI fixture records only the canonical command
-and notes, because it must regenerate byte-identically on any host and binds no evidence to one
-machine or one binary.
+host, generator binary SHA-256 and notes, while the CI fixture records only the canonical command,
+because it must regenerate byte-identically on any host and binds no evidence to one machine or one
+binary. Each `--note TEXT` on the generator command is appended verbatim to the fixture's notes, so
+the node run records the fix commit, the rustc/zig versions and the squash expectation there without
+changing the generated numbers or the compared set (the note does change the provenance bytes, which
+is why a CI fixture refuses it: the CI provenance records the canonical command, and that command has no
+`--note` flag).
+
+Two element limits, deliberately named apart. For a real checkpoint the generator gives the engine
+`linalg::CHECKPOINT_TENSOR_LIMIT` (`1 << 30` elements), the one constant every real-checkpoint
+entry point takes from `linalg` - `sequence_fixture`, `one_token` and `boundary_dump` - so those
+three entry points cannot drift. The released `embed.weight` and
+`head.weight` are 661,913,600 elements each (and many attention tensors are 41,943,040), all
+above `linalg::REFERENCE_TENSOR_LIMIT` (32 Mi elements). That constant remains the small-shape
+guard the weight-free finite source keeps, and by design it refuses real checkpoint tensors: the
+first node attempt against merged main 13d880d failed with "embed.weight holds 661913600 elements,
+above the 33554432-element limit of the reference pass" before this fix. The fixture command is
+otherwise unchanged, and the CI fixture bytes are unchanged by the fix.
 
 Commands:
 
@@ -76,6 +93,7 @@ cargo run -p sparkflash-engine --example sequence_fixture -- \
 cargo run --release -p sparkflash-engine --example sequence_fixture -- \
     --config released --checkpoint /path/to/snapshot --prompt-tokens 130 \
     --decode-steps 8 --seed 7 --logits prefill \
+    --note "fix commit <sha>: real-checkpoint element limit; lands on main as a squash" \
     --out /home/user/phase2-evidence/sequence-130-released.json
 ```
 
@@ -110,13 +128,16 @@ planner agreement; decoder extent clamp for 1/64/128/130/4096; window-crossing b
 mode/source table plus the store's `source_layer_for` agreement; exact publication order
 (17 events, HSI pool before layer 24); empty-prompt refusal.
 
-`sparkflash-engine` fixture module (13 tests): compared set exactly 9 positions; exclusion
+`sparkflash-engine` fixture module (15 tests): compared set exactly 9 positions; exclusion
 boundary for 130/128 and 130/8; a matching tiny fixture passes tokens and logits; widening with
 an older position fails naming D7 (positions 0 and 128); missing position fails; wrong
 token fails while unchanged logits still pass; logits bar absolute and second (using
 `LOGITS_ABS_BAR`, not a literal); missing device
 logits fail only the second bar; schema-version and widened-set validation; deterministic prompt;
-finite source refused for the released configuration; empty prompt / zero decode steps refused.
+finite source refused for the released configuration; the released plan's `embed.weight` is
+661,913,600 elements, above `REFERENCE_TENSOR_LIMIT` and inside `CHECKPOINT_TENSOR_LIMIT`
+(`head.weight` ties it); the generator selects the checkpoint limit only for a real checkpoint and
+keeps `1 << 22` for the finite source; empty prompt / zero decode steps refused.
 
 `tests/sequence_fixture.rs` (7 tests): committed CI fixture regenerates byte-identically;
 fixture contract (schema 1, 130 prompt, 9 steps, 8 decode, positions 129-137, kinds, digests,
