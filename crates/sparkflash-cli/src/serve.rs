@@ -85,11 +85,15 @@ use sparkflash_api::telemetry_types::{
 use sparkflash_device::{DeviceEngine, FakeSession};
 use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::forward::{InferenceEngine, Sampling, SequenceState};
-use sparkflash_engine::linalg::REFERENCE_TENSOR_LIMIT;
-use sparkflash_engine::loader::LoadedWeights;
+use sparkflash_engine::linalg::{CHECKPOINT_TENSOR_LIMIT, REFERENCE_TENSOR_LIMIT};
+use sparkflash_engine::loader::ReferenceWeights;
 use sparkflash_engine::synthetic::SyntheticWeights;
-use sparkflash_engine::tensor::{TensorPlan, TensorSpec};
-use sparkflash_engine::weights::{WeightError, WeightSource};
+use sparkflash_engine::tensor::TensorPlan;
+#[cfg(all(test, panic = "unwind"))]
+use sparkflash_engine::tensor::TensorSpec;
+#[cfg(all(test, panic = "unwind"))]
+use sparkflash_engine::weights::WeightError;
+use sparkflash_engine::weights::WeightSource;
 use sparkflash_kv::PrefixMatchPlan;
 
 /// The index file a sharded safetensors checkpoint is described by.
@@ -97,6 +101,20 @@ const CHECKPOINT_INDEX_NAME: &str = "model.safetensors.index.json";
 
 /// The model configuration a checkpoint directory has to carry.
 const CHECKPOINT_CONFIG_NAME: &str = "config.json";
+
+/// The elements in the released `embed.weight` and `head.weight`: 129,280 x 5,120.
+///
+/// The two element caps' relation to the released checkpoint is a compile-time fact, not a note in
+/// a comment: [CHECKPOINT_TENSOR_LIMIT] has to admit this tensor and [REFERENCE_TENSOR_LIMIT] has
+/// to refuse it, or `default_element_limit` is choosing between two wrong answers. The literal is
+/// the released figure; `the_released_embedding_size_matches_the_released_configuration` derives
+/// it from [ModelConfig::v41_flash] so the two cannot drift.
+const RELEASED_EMBEDDING_ELEMENTS: usize = 661_913_600;
+
+const _: () = {
+    assert!(CHECKPOINT_TENSOR_LIMIT > RELEASED_EMBEDDING_ELEMENTS);
+    assert!(REFERENCE_TENSOR_LIMIT < RELEASED_EMBEDDING_ELEMENTS);
+};
 
 /// How many replies one request may have in flight before the engine thread blocks.
 ///
@@ -187,6 +205,9 @@ pub struct ServeOptions {
     pub max_tokens: usize,
     /// The element cap the reference pass applies to one tensor. Above it, a tensor is refused
     /// rather than materialised.
+    ///
+    /// Resolved at parse time: an explicit `--element-limit`, else [CHECKPOINT_TENSOR_LIMIT] for
+    /// `--checkpoint` and [REFERENCE_TENSOR_LIMIT] for `--synthetic`.
     pub element_limit: usize,
     /// Which engine implementation to serve. The default is the existing reference engine; the
     /// device selection is the M1 skeleton behind a capability flag (design 7 M1).
@@ -205,7 +226,15 @@ impl ServeOptions {
             ServeArgs::try_parse_from(std::iter::once("sparkflash serve".to_owned()).chain(args))
                 .map_err(|error| error.to_string())?;
         let tokenizer = cli.tokenizer.unwrap_or_else(reference_tokenizer_path);
-        match (cli.synthetic, cli.checkpoint) {
+        let checkpoint = cli.checkpoint;
+        // The cap follows the source when the operator does not name one: a real checkpoint's
+        // largest tensors are the embedding and the head at 661,913,600 elements each, and
+        // [REFERENCE_TENSOR_LIMIT] would refuse them mid-request. This is the one place the choice
+        // is made, and `default_element_limit` is where a test pins it.
+        let element_limit = cli
+            .element_limit
+            .unwrap_or_else(|| default_element_limit(checkpoint.as_deref()));
+        match (cli.synthetic, checkpoint) {
             (true, Some(_)) => Err(
                 "--synthetic and --checkpoint cannot both be given: --synthetic serves the tiny synthetic plan and --checkpoint serves a real sharded checkpoint, so choose one"
                     .to_owned(),
@@ -217,7 +246,7 @@ impl ServeOptions {
                 checkpoint,
                 tokenizer,
                 max_tokens: cli.max_tokens,
-                element_limit: cli.element_limit,
+                element_limit,
                 engine: cli.engine,
             }),
         }
@@ -251,6 +280,21 @@ fn no_weights_message() -> String {
     "no weights to serve: pass --synthetic for the tiny synthetic plan, or --checkpoint DIR for a real checkpoint".to_owned()
 }
 
+/// The element cap a run gets when the operator does not name one.
+///
+/// A real checkpoint gets [CHECKPOINT_TENSOR_LIMIT]: its largest materialised tensors are
+/// `embed.weight` and `head.weight` at 661,913,600 elements, so [REFERENCE_TENSOR_LIMIT] would
+/// refuse one of them in the middle of the first request. The tiny synthetic plan keeps the
+/// reference guard, which is what makes that guard worth having. `linalg.rs` says no
+/// real-checkpoint entry point may drift back to the reference guard; this is the serving entry
+/// point that had, and this function is where the choice is made.
+fn default_element_limit(checkpoint: Option<&Path>) -> usize {
+    match checkpoint {
+        Some(_) => CHECKPOINT_TENSOR_LIMIT,
+        None => REFERENCE_TENSOR_LIMIT,
+    }
+}
+
 /// The `serve` command line as clap sees it.
 #[derive(Debug, Parser)]
 #[command(
@@ -279,9 +323,18 @@ struct ServeArgs {
     /// The ceiling on tokens generated for one request.
     #[arg(long, value_name = "N", default_value_t = MODEL_MAX_OUTPUT_TOKENS)]
     max_tokens: usize,
-    /// The element cap the reference pass applies to one tensor.
-    #[arg(long, value_name = "N", default_value_t = REFERENCE_TENSOR_LIMIT)]
-    element_limit: usize,
+    /// The element cap the reference pass applies to one tensor; the default follows the source.
+    ///
+    /// `--synthetic` keeps the reference guard, [REFERENCE_TENSOR_LIMIT], which the tiny plan fits
+    /// inside; `--checkpoint` gets [CHECKPOINT_TENSOR_LIMIT], because the released `embed.weight`
+    /// and `head.weight` hold 661,913,600 elements each and the reference guard would refuse one
+    /// of them at the first request. An explicit flag overrides both.
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Element cap for one tensor; defaults from the weight source (the 32 Mi reference guard for --synthetic, the checkpoint cap for --checkpoint)"
+    )]
+    element_limit: Option<usize>,
     /// Which engine to serve: the default `reference` CPU path, or the M1 `device` skeleton.
     ///
     /// `device` wraps the reference engine in `sparkflash-device`'s M1 `DeviceEngine`: a fake
@@ -790,13 +843,19 @@ fn build_engine(recipe: &Recipe, element_limit: usize) -> Result<InferenceEngine
     let source: Box<dyn WeightSource> = match &recipe.weights {
         Weights::Synthetic { seed } => Box::new(SyntheticWeights::from_plan(&plan, *seed)),
         Weights::Checkpoint { dir, index } => {
-            let loaded = LoadedWeights::open(dir, index, &plan).map_err(|error| {
+            // The reference pass decodes the *stored* forms: `wo_a` is F8E4M3 plus its own scale
+            // grid, exactly as the plan names it. [ReferenceWeights] is the source that serves
+            // those bytes and verifies the checkpoint first; the loader's `get` instead converts
+            // `wo_a` to BF16 with the scale applied, which a F8E4M3 spec then reads as twice the
+            // bytes it expects (linalg::decode_by_name -> quant::check_len). Serving through the
+            // converted form failed on layer 0, and this is the seam that used to do it.
+            let reference = ReferenceWeights::open(dir, index, &plan).map_err(|error| {
                 format!(
                     "--checkpoint {}: the shards do not match the planned model: {error}",
                     dir.display()
                 )
             })?;
-            Box::new(LoadedSource { loaded })
+            Box::new(reference)
         }
         #[cfg(all(test, panic = "unwind"))]
         Weights::Panicking { seed, name } => Box::new(PanickingSource {
@@ -807,47 +866,6 @@ fn build_engine(recipe: &Recipe, element_limit: usize) -> Result<InferenceEngine
     };
     InferenceEngine::new(recipe.config.clone(), source, element_limit)
         .map_err(|error| format!("cannot build the reference engine: {error}"))
-}
-
-/// The plan-verified loader as a [`WeightSource`], so the engine reads through the loader's policy.
-///
-/// The spec comes from the plan, not from a shard header: [`LoadedWeights::open`] has already
-/// refused the checkpoint unless every planned tensor is stored exactly as the plan says, so the two
-/// agree, and the plan lookup is a map read - while the loader's only byte accessor materialises a
-/// whole tensor, which is not something a `spec` call may do. Every byte still comes from the
-/// loader, so its refusals (the two Engram tables belong to another crate) and its per-tensor limit
-/// still apply.
-struct LoadedSource {
-    /// The handle the startup verification produced.
-    loaded: LoadedWeights,
-}
-
-impl WeightSource for LoadedSource {
-    fn names(&self) -> Vec<String> {
-        self.loaded.names().map(str::to_owned).collect()
-    }
-
-    fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
-        self.loaded
-            .plan()
-            .get(name)
-            .cloned()
-            .ok_or_else(|| WeightError::Missing {
-                name: name.to_owned(),
-            })
-    }
-
-    fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
-        self.loaded.get(name).map(|tensor| tensor.data)
-    }
-
-    fn read_ranges(
-        &self,
-        name: &str,
-        ranges: &[(u64, usize)],
-    ) -> Option<Result<Vec<u8>, WeightError>> {
-        Some(self.loaded.read_ranges(name, ranges))
-    }
 }
 
 /// Runs one request and sends its events, ending with exactly one terminal reply.
@@ -1046,6 +1064,10 @@ impl WeightSource for PanickingSource {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use sparkflash_engine::loader::Treatment;
+
     use super::*;
 
     /// A driver over the synthetic tiny plan: the path every behavioural test takes.
@@ -1478,6 +1500,265 @@ mod tests {
         assert_eq!(options.tokenizer, reference_tokenizer_path());
         assert!(options.synthetic);
         assert!(options.checkpoint.is_none());
+    }
+
+    #[test]
+    fn a_checkpoint_defaults_to_the_checkpoint_cap_and_an_explicit_flag_wins() {
+        // The bug this pins: a --checkpoint run defaulted to the 32 Mi reference guard, so the
+        // released embed.weight/head.weight (661,913,600 elements each) would be refused in the
+        // middle of the first request. The cap follows the source, and an operator's explicit
+        // value still wins for both sources.
+        let checkpoint = ServeOptions::parse(vec![
+            "--checkpoint".to_owned(),
+            "/tmp/not-read-at-parse-time".to_owned(),
+        ])
+        .expect("parses");
+        assert_eq!(checkpoint.element_limit, CHECKPOINT_TENSOR_LIMIT);
+        // The caps' relation to the released embedding is a compile-time assertion beside
+        // RELEASED_EMBEDDING_ELEMENTS, which `default_element_limit` returns at the one place the
+        // choice is made; this test pins which cap the parse selects, for both sources.
+        let synthetic = ServeOptions::parse(vec!["--synthetic".to_owned()]).expect("parses");
+        assert_eq!(synthetic.element_limit, REFERENCE_TENSOR_LIMIT);
+
+        let explicit = ServeOptions::parse(vec![
+            "--checkpoint".to_owned(),
+            "/tmp/not-read-at-parse-time".to_owned(),
+            "--element-limit".to_owned(),
+            "1234".to_owned(),
+        ])
+        .expect("parses");
+        assert_eq!(explicit.element_limit, 1234);
+
+        let explicit_synthetic = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--element-limit".to_owned(),
+            "1234".to_owned(),
+        ])
+        .expect("parses");
+        assert_eq!(explicit_synthetic.element_limit, 1234);
+
+        // The constant the compile-time assertions compare against is the released
+        // vocab x dim, derived here from the released configuration rather than trusted.
+        let released = ModelConfig::v41_flash().expect("the vendored released config parses");
+        assert_eq!(
+            released.vocab_size * released.dim,
+            RELEASED_EMBEDDING_ELEMENTS,
+            "the released embed/head element count must match the vendored configuration"
+        );
+    }
+
+    // ---- the checkpoint path, on a checkpoint this test writes ------------------------
+
+    /// The one shard the fixture writes.
+    const FIXTURE_SHARD: &str = "model-00001-of-00001.safetensors";
+
+    /// The fixture configuration: `tiny`, but with a `wo_a` the released 32x32 scale grid
+    /// divides. `tiny` alone has a [16, 16] `wo_a`, which the loader refuses by name because its
+    /// grid would be (16, 16); heads is n_heads * head_dim = 8 * 16 = 128, so the in dimension is
+    /// heads / o_groups = 64 and the out dimension is o_groups * o_lora_rank = 64.
+    fn checkpoint_config() -> ModelConfig {
+        ModelConfig {
+            o_lora_rank: 32,
+            n_heads: 8,
+            ..ModelConfig::tiny()
+        }
+    }
+
+    /// One tensor as the fixture stores it.
+    struct FixtureEntry {
+        name: String,
+        dtype: String,
+        shape: Vec<usize>,
+        data: Vec<u8>,
+    }
+
+    /// How many bytes a stored word of that shape occupies.
+    fn stored_bytes(word: &str, shape: &[usize]) -> usize {
+        let elements: usize = shape.iter().product();
+        let per = match word {
+            "F32" => 4,
+            "BF16" | "F16" => 2,
+            _ => 1,
+        };
+        elements * per
+    }
+
+    /// The stored dtype word and shape the plan's rules require of one planned tensor, exactly as
+    /// `crates/sparkflash-engine/tests/loader.rs` does it: the packed expert is I8 with the last
+    /// dimension halved, everything else is the plan's own dtype and shape. `wo_a` is the plan's
+    /// F8E4M3 plus its separate E8M0 grid, because that is the stored form the reference decodes.
+    fn stored_form(spec: &TensorSpec) -> (String, Vec<usize>) {
+        if Treatment::of(spec, &spec.name) == Treatment::PackedExpert {
+            let mut shape = spec.shape.clone();
+            let last = shape.len() - 1;
+            assert_eq!(shape[last] % 2, 0, "{} is packed two per byte", spec.name);
+            shape[last] /= 2;
+            ("I8".to_string(), shape)
+        } else {
+            (spec.dtype.name().to_string(), spec.shape.clone())
+        }
+    }
+
+    /// A safetensors container: an 8-byte little-endian header length, the JSON header, then data.
+    fn fixture_container(entries: &[FixtureEntry]) -> Vec<u8> {
+        let mut offset = 0u64;
+        let mut tensors = serde_json::Map::new();
+        let mut data = Vec::new();
+        for item in entries {
+            let begin = offset;
+            offset += item.data.len() as u64;
+            tensors.insert(
+                item.name.clone(),
+                serde_json::json!({
+                    "dtype": item.dtype,
+                    "shape": item.shape,
+                    "data_offsets": [begin, offset],
+                }),
+            );
+            data.extend_from_slice(&item.data);
+        }
+        let header = serde_json::Value::Object(tensors).to_string();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(&data);
+        out
+    }
+
+    /// A plan-complete checkpoint directory: one shard, the index that names it, and the
+    /// configuration the checkpoint carries. Every tensor is stored the way the plan's rules say;
+    /// the layer-0 `wo_a` weight and its scale carry real codes (E4M3 0x38 is 1.0, E8M0 0x80 is
+    /// 2.0 under the 32x32 grid), so a read of it has a value to check rather than only a length.
+    struct CheckpointFixture {
+        dir: tempfile::TempDir,
+        index: PathBuf,
+    }
+
+    impl CheckpointFixture {
+        fn dir(&self) -> &Path {
+            self.dir.path()
+        }
+
+        fn index(&self) -> &Path {
+            &self.index
+        }
+    }
+
+    fn written_checkpoint(config: &ModelConfig) -> CheckpointFixture {
+        let plan = TensorPlan::language_model(config);
+        let mut entries: Vec<FixtureEntry> = plan
+            .specs()
+            .iter()
+            .map(|spec| {
+                let (dtype, shape) = stored_form(spec);
+                let data = vec![0u8; stored_bytes(&dtype, &shape)];
+                FixtureEntry {
+                    name: spec.name.clone(),
+                    dtype,
+                    shape,
+                    data,
+                }
+            })
+            .collect();
+        for entry in &mut entries {
+            if entry.name == "layers.0.attn.wo_a.weight" {
+                entry.data = vec![0x38; entry.data.len()];
+            } else if entry.name == "layers.0.attn.wo_a.scale" {
+                entry.data = vec![0x80; entry.data.len()];
+            }
+        }
+
+        let dir = tempfile::TempDir::new().expect("a temporary directory");
+        std::fs::write(dir.path().join(FIXTURE_SHARD), fixture_container(&entries))
+            .expect("the fixture shard");
+        let weight_map: BTreeMap<&str, &str> = entries
+            .iter()
+            .map(|item| (item.name.as_str(), FIXTURE_SHARD))
+            .collect();
+        let total: u64 = entries.iter().map(|item| item.data.len() as u64).sum();
+        let index = serde_json::json!({
+            "metadata": { "total_size": total },
+            "weight_map": weight_map,
+        })
+        .to_string();
+        let index_path = dir.path().join(CHECKPOINT_INDEX_NAME);
+        std::fs::write(&index_path, index).expect("the fixture index");
+        std::fs::write(
+            dir.path().join(CHECKPOINT_CONFIG_NAME),
+            serde_json::to_string(config).expect("the configuration serialises"),
+        )
+        .expect("the fixture configuration");
+        CheckpointFixture {
+            dir,
+            index: index_path,
+        }
+    }
+
+    #[test]
+    fn a_stored_fp8_wo_a_reads_through_reference_weights_with_its_own_grid() {
+        // The decode that the serving path used to get wrong: the loader's converted form is BF16
+        // (2 bytes/element) under the plan's F8E4M3 spec (1 byte/element), so decoding it fails on
+        // length. The reference source serves the stored F8E4M3 codes and the separate grid.
+        let config = checkpoint_config();
+        let plan = TensorPlan::language_model(&config);
+        let checkpoint = written_checkpoint(&config);
+        let source =
+            ReferenceWeights::open(checkpoint.dir(), checkpoint.index(), &plan).expect("opens");
+        let weight = sparkflash_engine::linalg::decode_by_name(
+            &source,
+            "layers.0.attn.wo_a.weight",
+            CHECKPOINT_TENSOR_LIMIT,
+        )
+        .expect("the stored wo_a decodes under the plan's F8E4M3 spec");
+        assert_eq!(weight.len(), 64 * 64, "the plan's wo_a is [64, 64]");
+        assert!(
+            weight.iter().all(|&value| value == 1.0),
+            "E4M3 0x38 decodes to 1.0"
+        );
+        let scales = sparkflash_engine::linalg::decode_by_name(
+            &source,
+            "layers.0.attn.wo_a.scale",
+            CHECKPOINT_TENSOR_LIMIT,
+        )
+        .expect("the grid decodes");
+        let mut scaled = weight;
+        sparkflash_engine::linalg::apply_scales(
+            &mut scaled,
+            64,
+            64,
+            &scales,
+            sparkflash_engine::linalg::ScaleGrid::Block32,
+        )
+        .expect("the stored grid divides the weight");
+        assert!(
+            scaled.iter().all(|&value| value == 2.0),
+            "E4M3 1.0 under an E8M0 2.0 grid is 2.0"
+        );
+    }
+
+    #[test]
+    fn a_plan_complete_checkpoint_builds_the_serve_engine_and_prefills() {
+        // The whole `serve --checkpoint` path on a shard this test writes: the recipe reads
+        // config.json, build_engine verifies the checkpoint and hands the reference pass a
+        // ReferenceWeights, and prefill reads every tensor of layer 0 - wo_a included. With the
+        // loader's converted source this failed on layer 0's wo_a with "F8_E4M3 needs 4096 bytes
+        // for 4096 elements, but 8192 were given"; this test is the regression for that.
+        let config = checkpoint_config();
+        let checkpoint = written_checkpoint(&config);
+        let recipe =
+            checkpoint_recipe(checkpoint.dir(), &reference_tokenizer_path()).expect("the recipe");
+        assert!(
+            matches!(&recipe.weights, Weights::Checkpoint { .. }),
+            "the recipe reads the checkpoint, not the synthetic plan"
+        );
+        let engine = build_engine(&recipe, CHECKPOINT_TENSOR_LIMIT)
+            .expect("a plan-complete checkpoint builds the reference engine");
+        assert_eq!(engine.config(), &config);
+        let mut state = SequenceState::new(engine.config());
+        let step = engine
+            .prefill(&mut state, &[1, 2, 3])
+            .expect("the reference pass reads the stored wo_a as F8E4M3");
+        assert_eq!(step.logits.len(), config.vocab_size);
     }
 
     // ---- the timing block ----------------------------------------------------------------

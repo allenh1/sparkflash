@@ -99,13 +99,22 @@ Notes for an engine:
 - The per-expert loop is the reference's model-parallel dispatch: each rank owns a contiguous block
   of whole experts and the partial sums are all-reduced.
 
-### 3.1 Expert parallelism, not tensor parallelism
+### 3.1 Expert parallelism, not tensor parallelism (the reference's rule)
 
 convert.py shards **whole experts** across ranks: rank i keeps experts
 [i*384/mp, (i+1)*384/mp) and drops the rest (convert.py:129-134); model.py mirrors this with
 n_local_experts = n_routed_experts // world_size and experts_start_idx = rank * n_local_experts
 (model.py:867-870). At world_size 4 that is **96 whole experts per rank, each 2304 wide**, not 384
 experts of width 576. The expert width is never split.
+
+**Implementation note (DECISIONS.md D30, 2026-10-18).** Everything in this section is the
+*reference's* rule and the evidence for it stands, but it is not the layout this tree's device path
+runs. The only routed-expert device GEMM in the tree, and the only routed-expert layout the device
+has verified, slices the intermediate width instead: every rank holds every routed expert's
+576-value slice padded to 640, fed as four rank-chained launches (M7 K9-K12). D30 records that
+divergence, prices it (74.0 -> 82.2 GB/rank) and states what is still the reference's: the engine
+reads whole 2304-wide experts and is untouched, and if reference-exact sharding is required it is a
+new kernel ABI and a new decision.
 
 The dense matrices use column/row parallelism per convert.py's mapping table (convert.py:56-64):
 wq_b and wo_a are sharded on dim 0 (output), wo_b on dim 1 (input), embed/head/attn_sink/weights_proj

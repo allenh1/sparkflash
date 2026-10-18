@@ -10,7 +10,7 @@ records the evidence and the consequence for the build. Research backing is in
 | # | Question | Decision |
 | --- | --- | --- |
 | D1 | KV storage layout | Store the compressed form, dequantise on read |
-| D2 | Expert sharding | Whole experts per rank, full width, replicated shared expert |
+| D2 | Expert sharding | **Corrected by D30**: the reference shards whole experts (96/rank at world 4) and that evidence stands, but the only device-verified routed-expert layout slices the intermediate width instead (576 per rank padded to 640); the shared expert stays whole and replicated |
 | D3 | `reasoning_effort` scale | Two tables, one per surface, both tested |
 | D4 | Engram row layout | Dense 264-byte rows, no padded stride |
 | D5 | `max_seq_len` | Explicit `SPARK_MAX_SEQ_LEN`, default 1,048,576 |
@@ -38,6 +38,7 @@ records the evidence and the consequence for the build. Research backing is in
 | D27 | The capability boundary has no vision channel | `Capabilities` has no `vision` field, `/v1/models` reports `multimodal: false`, and an image request is refused before generation with typed `MissingCapability::vision()` (HTTP 400 `unsupported_capability`); the 32x32 dummy grid and its 121 fabricated visual tokens are deleted, and `EngineRequest` carries the parsed `images: Vec<ImagePart>` (inline parts hold the decoded bytes) rather than `image_tokens`; the known protocol image `type`s are explicit part variants and a raw-body scan (`prompt::find_image_carrier`) refuses any image-family carrier the typed parser did not record, wherever it appears and in any case (a schema-name map key whose value is itself a JSON Schema aside) |
 | D28 | The reference engine is `Send + Sync` | `WeightSource` gained `Send + Sync` in !60 (`f72738b`), so `forward::InferenceEngine` is `Send + Sync`; `serve.rs`'s module docs are corrected and a compile-time assertion pins it, while the single-owner engine thread stays because the pass is one-sequence-at-a-time and the sampler swap consumes the engine, not because of thread-safety |
 | D29 | The ibverbs backend is real and dual-rail capable | The `rdma` feature's libibverbs backend, its repr(C) ABI mirror and the three cluster gate bodies are real, and the deployed vLLM reference is measured single rail (NCCL_IB_HCA=rocep1s0f1); no hardware gate has run and no frame has crossed a wire, host-memory staging, active MTU 1024 and driver 580.173.02 remain gaps, and single-rail mode refuses to claim dual-rail evidence |
+| D30 | Routed-expert sharding follows the verified kernel | TP=4 over the intermediate width (576 per rank padded to 640) for the routed experts, because that is the only routed-expert layout the device has run; the reference's whole-expert rule is recorded as not implemented, the shared expert stays whole and replicated, and the padding costs +8.22 GB/rank of routed-expert storage (74.0 -> 82.2 GB/rank) |
 
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
@@ -69,6 +70,15 @@ measured per-token number derived from the real tensor shapes and reports any re
 disagreement.
 
 ## D2 — Shard whole experts across ranks
+
+**Corrected by D30 (2026-10-18).** The *evidence* below is the reference's own sharding rule and
+stands. The *decision* is not the layout this tree implements: the only routed-expert GEMM that
+exists and has run on the device reduces 576 intermediate values per rank padded to 640
+(`kernels/b12x_mxfp4_moe_sm121.cu` with `kernels/m4_common_sm121.cuh:96-97`), and the M7 harness
+feeds it as four rank-chained column slices of the 2304-wide intermediate
+(`crates/sparkflash-kernels/examples/m7_layer0/stage3.rs:21` and `stage7.rs:749-781`). D30 adopts
+that layout and records its storage and summation consequences. This entry's shared-expert half —
+whole at 2304 and replicated on every rank — is unchanged and is what the device chain runs.
 
 **Evidence.** `inference/convert.py:129-134` splits `experts.*` by expert index —
 `n_local_experts = n_experts // mp`, dropping every expert outside the rank's contiguous
@@ -192,6 +202,15 @@ top-3 global) are implemented end to end for `k=5` with the confidence cap at 0.
 `dspark_noise_token_id = 128799`. The confidence head's logit is passed through a sigmoid
 before forming the cumulative survival product, because the paper's `p_1..p_5` are
 probabilities; this is a documented numeric choice, not a port of reference code.
+
+**Corrected by D30 (2026-10-18).** The layout half of this decision is superseded. D30 records the
+serving layout for routed experts as TP=4 over the intermediate width, 576 per rank padded to 640,
+because that is the kernel ABI the device has run; the MTP blocks use the same routed-expert code
+path, and when their device path lands it uses the same ABI, so they are sliced and padded the same
+way, not held as 32 whole experts per rank. The
+functional decision in this entry (blocks 37-39, `k=5`, cap 0.10, the sigmoid on the confidence
+logit, the noise token) is unchanged. "Whole experts sharded 32/rank" remains the reference's rule
+(D2, [architecture/05-dspark.md](architecture/05-dspark.md) D3), not this tree's serving plan.
 
 ## D7 — The CED prefill bypass needs no extra weights
 
@@ -1603,3 +1622,111 @@ run is the next Lead-sequenced step. The host-memory staging buffer (not GPUNetI
 not verified qualifications. The three inline wrappers require rdma-core headers at build time; the
 hardware-free CI host exercises the stub compile path, while the stub-specific `load()` refusal
 needs a host that has libibverbs but no headers, and the real inline path needs the headers.
+
+---
+
+## D30 - Routed experts are sliced along the intermediate width, because that is the layout the device has verified
+
+Recorded 2026-10-18.
+
+**Question.** D2 decided the routed experts are sharded as *whole experts* on the reference's rule:
+96 per rank at world 4, each at the full 2304 intermediate width, in MXFP4. The only routed-expert
+device GEMM in the tree, `kernels/b12x_mxfp4_moe_sm121.cu`, is written to the opposite layout (the
+CPU engine's routed experts are host arithmetic and are not that kernel): it reduces
+`SPARK_M4_MOE_WIDTH = 576` values per rank padded to `SPARK_M4_MOE_WIDTH_PADDED = 640`
+(`kernels/m4_common_sm121.cuh:96-97`), its weight and scale row strides are static-asserted against
+640, and D14's "padded loader contract (A8)" requires a pre-padded 640-wide operand. The M7 harness
+exercises that layout: `MOE_RANKS = MOE_INTERMEDIATE / MOE_WIDTH = 2304 / 576 = 4`
+(`crates/sparkflash-kernels/examples/m7_layer0/stage3.rs:21`), and it feeds the kernel four
+rank-chained column slices of the intermediate (`stage3.rs:480-570`, `stage7.rs:749-781`; the w2
+source slice is bytes 0..288 of each 1152-byte global row and scales 0..18 of each 72, per
+[device-path-design.md](build/device-path-design.md) section 6). Both decisions cannot be true.
+
+**Decision.** The routed-expert serving layout is **TP=4 over the intermediate (K) dimension**: every
+rank holds every routed expert's 576-value intermediate slice, padded to 640 in the kernel layout
+(per expert: `w1`/`w3`/`w2` packed FP4 rows on the kernel's 320-byte stride and ue8m0 scale rows
+on 20 bytes; per activated (token, slot): a 640-value E4M3 activation row and its 20-byte scale row).
+The reference's whole-expert partitioning stays the *reference's* rule (convert.py:129-134, D2's
+evidence) and is **not** what this tree implements. The shared expert is not part of the slice: it
+stays whole at 2304 and replicated on every rank, which is D2's second half and is what the device
+chain runs (`stage7.rs` K13-K15 on `MOE_INTERMEDIATE`).
+
+**Why this direction.** Three reasons, in order of weight:
+
+1. *What has run wins over what a reference file says should run.* The 576 -> 640 layout is the one
+   this tree and the device have run: stage 3 ran the combine as four rank launches on 2026-10-17
+   with 8, 32 and 64 resident experts (20,480/20,480 bf16-exact, max ULP 0; 0.821 / 0.847 / 0.850 ms
+   per token over the four chained launches;
+   [roadmap-to-serving.md](build/roadmap-to-serving.md) sections 1.1 and 12.1,
+   [phase1-boundary-table.md](build/phase1-boundary-table.md) section 12), and the 2026-10-18 chained
+   layer-0 replay ran K9-K12 as four rank launches at 5,120/5,120 exact each
+   ([phase1-boundary-table.md](build/phase1-boundary-table.md) section 12, row 7).
+2. *Rewriting the kernel is not a docs change.* Making the kernel reduce K = 2304 is a new kernel
+   ABI (strides, padding, activation operand shape, the loader contract D14 pins), not an edit to a
+   comment; it needs its own decision and its own device verification. This entry does not authorise
+   it.
+3. *The choice costs no capacity.* Both layouts keep one quarter of the expert bytes per rank; the
+   difference is which quarter - whole experts at full width, or all experts at quarter width - so
+   picking the verified kernel does not change the memory plan, only its padding.
+
+**Storage consequence, with arithmetic.** The routed-expert bytes (backbone + MTP) total 295.997 GB
+([architecture/00-overview.md](architecture/00-overview.md) section 2.4:
+288,777,830,400 + 7,219,445,760 = 295,997,276,160 B, packed FP4 plus scale grids).
+
+- Reference EP, whole experts: 295,997,276,160 / 4 = 73,999,319,040 B = **74.0 GB/rank** (GB decimal,
+  as everywhere in this entry and in the corpus byte tables). This is the figure roadmap section 7.5
+  used.
+- TP=4 with the 576 -> 640 padding: 73,999,319,040 x 640 / 576 = **82,221,465,600 B = 82.2 GB/rank**,
+  i.e. **+8,222,146,560 B = +8.22 GB/rank (+11.1%)**. The padding is 64 of every 640 values in the
+  weight rows, the weight scale rows and the activation rows; it is masked to zero numerically, but it
+  is still allocated, read and (for the weights) stored.
+- Device total, with its units stated once: `cuDeviceTotalMem_v2` reports **124,610 MiB**, which is
+  **130.66 GB decimal** and **121.7 GiB** (124,610 x 1,048,576 = 130,663,055,360 B). This entry and
+  roadmap section 7.5 use GB decimal; the corpus fact tables report MiB. Do not mix the two without
+  saying which one is meant.
+- With the Engram tables on local NVMe as roadmap section 7.5 plans: resident weights become 82.2
+  (routed + MTP experts) + 2.0 (dense shards) + 3.43 (replicated) = 87.63 GB, **about 87.6 GB/rank**
+  (was 79.4), leaving 130.66 - 87.63 = 43.03 GB, **about 43 GB**, for KV, activations and the Engram
+  cache. It still fits.
+- With the Engram tables resident it does **not** fit: 82.2 + 50.7 (Engram) + 2.0 + 3.43 = 138.33 GB,
+  **about 138.3 GB/rank**, against 130.66 GB - over by 138.33 - 130.66 = 7.67 GB, about **7.7 GB**.
+  The EP figure was 130.1 GB with about 0.5 GB to spare, so the padding turns "Engram on NVMe is
+  advisable" into "Engram on NVMe is required for this layout".
+
+**The MTP experts follow the same decision, and that reverses D6's layout half.** The three MTP
+blocks use the same routed-expert code path (the reference engine's expert scratch is sized for both
+expert counts), and their device path, when it lands, uses the same kernel ABI, so their experts are
+TP=4 slices padded to 640, not 32 whole experts per rank; D6 carries a "Corrected by D30" note and
+its functional decision stands. The arithmetic: the MTP routed experts are 7,219,445,760 B of
+the 295,997,276,160 B total (architecture/00-overview.md section 2.4), so 1,804,861,440 B =
+1.80 GB/rank unpadded and 1,804,861,440 x 640 / 576 = 2,005,401,600 B = 2.01 GB/rank padded - the
++0.20 GB/rank inside the 82.2. MTP is Phase 5 and off the base forward, so this is design
+arithmetic, not a measured MTP footprint.
+
+**Numerics.** Both layouts issue the same single `[tokens, 5120]` bf16 partial-sum all-reduce per
+layer (roadmap section 7.2), but the summation order differs: EP sums each rank's whole-expert
+contributions over disjoint expert sets, TP sums each rank's K-slice partials of the same experts.
+The device runs above are bit-exact against the CPU reference *on the same 576-wide sliced bytes*;
+they confirm the sliced layout's arithmetic, not EP/TP equivalence. Cross-rank accumulation order is
+exactly the kind of cross-boundary equality D21 says must not be assumed, and R3 in roadmap section
+7.3 is the criterion that covers it.
+
+**What this entry does not claim.** No device run was made for this entry (docs-only). It does not
+add the Milestone-5 loader that must emit the 640-wide layout (D14's A8 contract), and it does not
+change any kernel, the shared expert, the dense shards or the Engram row sharding. The routed
+gate/up FP4 GEMM is still host arithmetic in the M7 stages (`stage3.rs` prints that boundary and
+says no device kernel in the six-cubin set reduces K = 5120 against packed FP4 weights); the
+device-verified part of the routed path is the down/combine projection, and the 576-wide slice is
+what those verified launches consume.
+
+**Corpus check, stated for the Lead.** The corpus supports EP=4 as the *reference's* rule
+(convert.py:129-134; [architecture/03-moe.md](architecture/03-moe.md) section 3.1; D2's evidence). It
+does not support EP=4 as *this tree's implemented layout*: every routed-expert **device-path**
+artifact here (the kernel constants, D14's A8 contract, the M7 rank chaining,
+`mxfp4_ref::MOE_WIDTH`) is 576 -> 640. It is not the serving layout: the CPU reference engine reads
+whole 2304-wide experts
+([crates/sparkflash-engine/src/forward/moe.rs](../crates/sparkflash-engine/src/forward/moe.rs);
+[engine/01-forward-order.md](engine/01-forward-order.md) section 4 states the reference's rule),
+and is untouched by this entry. This records the divergence instead of claiming the reference and the
+implementation agree; if reference-exact sharding is required, that is a new kernel ABI and a new
+entry.

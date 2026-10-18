@@ -907,7 +907,7 @@ follows them unless a column says otherwise:
 
 | Component | Reference rule | Our plan | Why | Collective |
 | :--- | :--- | :--- | :--- | :--- |
-| Routed experts (384/layer) | **Whole experts per rank**, 96 at world 4 | Same | EP, not TP: per-rank 576-wide tiles would change the kernel and the memory plan (03-moe.md section 3.1) | partial-sum all-reduce, [tokens, 5120] |
+| Routed experts (384/layer) | **Whole experts per rank**, 96 at world 4 | **TP=4 over the intermediate width**: every rank holds every expert's 576-value slice, padded to 640 (D30) | The only routed-expert layout the device has run is the kernel's 576 -> 640 slice (M7 K9-K12, four rank launches); whole-expert EP would need a different kernel ABI and is recorded as not implemented (D30) | partial-sum all-reduce, [tokens, 5120] |
 | Shared expert | Whole 2,304 per rank, every rank | Same | 1.4 GB total; splitting it would add a collective for 0.4 % of the weights | none |
 | `wq_b`, `wo_a` | dim 0 (output) | Same | — | none |
 | `wo_b` | dim 1 (input), **fp32 all-reduce** | Same, fp32 payload | The reference reduces fp32 (01-csa2-attention.md section 10); bf16 would be a deliberate divergence | fp32 all-reduce, [tokens, 5120] |
@@ -921,7 +921,17 @@ follows them unless a column says otherwise:
 | `attn_sink` | dim 0 | dim 0 | Per-head; 16 per rank | none |
 | `weights_proj` | dim 0 | dim 0 | — | none |
 | **KV latent** | **Not split** (`n_kv_heads = 1`) | **Replicated, whole** | Head-splitting would turn `wkv` into an all-gather of 1,536-dim slices and is not what the reference does; about 0.9 GB/rank at 1M context | none |
-| MTP / DSpark | Experts sharded 32/rank, top-3 global | Same, Phase 5 | Out of the base forward | MoE all-reduce per draft step |
+| MTP / DSpark | Experts: **whole experts 32/rank**, top-3 global | **D30's TP=4 intermediate slice + 640 padding, the same kernel ABI, Phase 5** (D6's layout half is corrected by D30; the functional DSpark decision stands) | Out of the base forward | MoE all-reduce per draft step |
+
+**The routed-expert row contradicts the reference on purpose.** `convert.py` shards whole experts (96
+per rank at world 4) and D2 recorded that rule; the only routed-expert **device** GEMM in the tree
+and its device verification are written to a 576-value intermediate slice per rank padded to 640,
+and the M7 chain runs it as four rank launches. D30 adopts the verified layout and prices it:
+74.0 -> 82.2 GB/rank of routed experts, backbone and MTP (+11.1 %; the MTP experts are 1.80 GB/rank unpadded and
+2.01 GB/rank padded, and the MTP row above now follows D30 rather than the reference's whole-expert
+rule), and the 124,610 MiB device (130.66 GB decimal = 121.7 GiB) no longer fits the Engram tables
+resident at all (138.3 GB of weights), so section 7.5's NVMe plan becomes required rather than
+advisable. The shared expert is not sliced: it stays whole at 2,304 and replicated.
 
 Two rules deserve their own sentence because they decide the fabric's role:
 
@@ -1003,7 +1013,8 @@ the same collective in both directions (D12's dual-path enumerates the ACTIVE fu
 but the RDMA transport that would use them is real and has not run on the fabric); the real one-shot
 latency; the ring
 path's numerics; and whether a four-node window can even hold four copies of the model beside the
-operating cost (section 7.5 says the answer is "barely, and not with the Engram tables resident").
+operating cost (section 7.5: the plan fits with the Engram tables on NVMe and about 43 GB to spare,
+and does not fit with them resident).
 
 **How the nodes are addressed in the design.** Discovery is not hardcoded: the rail selection
 enumerates ACTIVE functions at 200 Gb/s or more (D12), the rank topology is `[.80, .84, .68, .59]`
@@ -1017,28 +1028,35 @@ qualification runbook specifies.
 ### 7.5 Memory per rank: the number that decides the architecture
 
 The checkpoint is 510,286,023,000 B ([../architecture/00-overview.md](../architecture/00-overview.md)
-section 2.4, closing exactly). Under the reference's sharding with world 4 (design arithmetic):
+section 2.4, closing exactly). Under the plan's sharding with world 4 (design arithmetic; the routed
+row is TP=4 with the 576 -> 640 padding, D30):
+
+All figures below are **GB decimal**; the corpus fact tables report the same device as 124,610 MiB
+(124,610 x 1,048,576 = 130,663,055,360 B = 130.66 GB = 121.7 GiB).
 
 | Group | Total | Per rank | Rule |
 | :--- | ---: | ---: | :--- |
-| Routed experts, backbone + MTP | 295.997 GB | 74.0 GB | EP, whole experts |
+| Routed experts, backbone + MTP | 295.997 GB | 82.2 GB | TP=4 intermediate slice, 576 -> 640 padded (D30; 74.0 GB unpadded) |
 | Engram tables | 202.758 GB | 50.7 GB | row shard |
 | Dense attention, embed/head, sink, weights_proj | 8.1 GB | about 2.0 GB | dim-0/dim-1 shards |
 | Replicated (shared experts, gates, norms, mHC, Engram projections, compressors, MTP extras, image) | 3.43 GB | 3.43 GB | replicated |
-| **Resident per rank** | | **about 130.1 GB** | 126.7 sharded plus 3.4 replicated |
-| Device total | | **130.66 GB** (124,610 MiB) | `cuDeviceTotalMem_v2` |
+| **Resident per rank** | | **about 138.3 GB** | 134.9 sharded plus 3.4 replicated |
+| Device total | | **130.66 GB** (124,610 MiB = 121.7 GiB) | `cuDeviceTotalMem_v2` |
 
-**With every Engram table resident, a rank holds 130.1 GB of weights on a 130.66 GB device and has
-about 0.5 GB left for KV, activations, the Engram cache and the CUDA context.** That is not a
-serviceable configuration, and it is the single most important consequence of the released byte table
-for Phase 4.
+**With every Engram table resident, a rank holds 82.2 + 50.7 + 2.0 + 3.43 = 138.33 GB (about
+138.3 GB) of weights on a 130.66 GB device: it does not fit, by 138.33 - 130.66 = 7.67 GB (about
+7.7 GB).** The EP layout this section carried before D30 left about 0.5 GB to spare; the 8.22 GB of
+padding D30 introduces removes even that margin, so the NVMe plan below is required rather than
+merely advisable. It is the single most important consequence of the released byte table for
+Phase 4.
 
 The plan that makes it serviceable (design):
 
 1. **Engram tables live on the local NVMe through the M2 store, not in device memory.** The store
    already exists for exactly this reason (packer, O_DIRECT, 16-way cache, io_uring prefetch); the
    per-rank row shard is 50.7 GB on disk and the cache budget is 1 GiB. Resident weights drop to
-   **about 79.4 GB**, leaving **about 51 GB** for KV (about 0.9 GB at 1M context, section 5.2),
+   82.2 + 2.0 + 3.43 = 87.63 GB, **about 87.6 GB**, leaving 130.66 - 87.63 = 43.03 GB, **about
+   43 GB**, for KV (about 0.9 GB at 1M context, section 5.2),
    activations (prefill chunks, tens of MB) and the Engram cache. Cost: the I/O budget — 24 lookups
    times 2 layers = 48 rows per token, 5.6–6.5 µs per row on a hit and about 18 µs on a miss, so
    **about 0.3–0.9 ms/token** of Engram I/O, with queue depth at least 48 required
@@ -1046,8 +1064,9 @@ The plan that makes it serviceable (design):
    token; it must be prefetched, not hidden.
 2. **The image path (0.97 GB) is not loaded for text serving** — a further 0.97 GB, and one fewer
    family to audit.
-3. **The MTP/DSpark layers (7.4 GB of experts plus 0.21 GB extras) load only when speculation is on**;
-   the base forward is forty layers.
+3. **The MTP/DSpark layers (7.22 GB of routed experts globally, 1.80 GB/rank; 2.01 GB/rank after
+   D30's padding, plus 0.21 GB extras) load only when speculation is on**; the base forward is forty
+   layers.
 4. **The Engram packer has never been run against the checkpoint** ([../QUALIFICATION.md](../QUALIFICATION.md)
    section 1, check 4: the shards are not packed here). This is a prerequisite, not a Phase 5 detail.
 
@@ -1129,7 +1148,7 @@ does **not** exist is the device engine those crates would drive. The serving su
   page tables name device offsets (Phase 2's store, Phase 4's per-rank replication); the
   bounded-indexer plan must match the device candidate path.
 - **Admission control by memory**: the KV pool, activation workspace and Engram cache must fit the
-  about 51 GB left after weights (section 7.5), so batch and concurrency limits are computed from the
+  about 43 GB left after weights (section 7.5), so batch and concurrency limits are computed from the
   measured per-rank census, not configured by hand.
 - **CUDA graph capture/replay per batch shape** (gate 3.8) and the **45-step scoped trace** (gate
   3.9) — both have instruments and no producers today.
@@ -1348,7 +1367,7 @@ merged and the slice documented), and they feed Phase 0/1 rather than being repl
 | Kernel baseline | seven of seven entries re-pinned. The D8 update moved `mega_mhc` to 70,312 B sha256 `e21293e3...` and `swiglu` to 21,776 B sha256 `4dbef63b...`. On this task-3 branch, `flash_mla_csa2_sm121` moves from 36,160 B sha256 `822df7f8...` to 44,080 B sha256 `bbb216b7...` (same pinned toolkit); the other five entries are byte-identical to the D8 baseline. | node0, 2026-10-18 (task-3 branch, `nvcc V13.0.88` sm_121a); D8 numbers from amd64 container `7d2f6a8c2071` | `regen-kernel-baseline.sh` commands re-run on the node for the task-3 branch; the diff is the single flash_mla line; `check-kernel-baseline.sh` is green in the `cuda-abi` CI job |
 | Checkpoint bytes | 510,286,023,000 B, closing exactly | released index | [../architecture/00-overview.md](../architecture/00-overview.md) section 2.4 |
 | KV entry / token / page | 356 B / 890 B / 56,960 B | design plus `tests/layout.rs` | D1, D16 |
-| Per-rank weights (all resident) | about 130.1 GB on a 130.66 GB device | arithmetic, released bytes | section 7.5 |
+| Per-rank weights (all resident) | 82.2 + 50.7 + 2.0 + 3.43 = 138.3 GB on a 130.66 GB device (does not fit; with the Engram tables on NVMe, 87.6 GB) | arithmetic, released bytes | section 7.5, D30 |
 | Per-token collective budget | 83 collectives, about 1.77 MB, about 1.7 ms at 20 µs | arithmetic | section 7.2 |
 | HSI indexer (task-7; landed as !35 `826f4f0`) | **measured, window 2026-10-18**: stage 2, 200 launches, p50: indexer proxy at one candidate (`--tokens 1`, engine format) **0.0930 ms**; attention-proper proxy at 128 candidates (A - B) **0.1562 ms**, with the 130-token engine total **0.2492 ms**; FP4 total 0.2471 ms and the merged-chain equality line reproduced exactly (163,838/163,840 exact, 2.4414063e-4, ULP 1); A correctness 163,834/163,840 exact (99.9963%), max abs delta 9.765625e-4, ULP 1, deterministic. Under the A-minus-B proxy the indexer is now about 0.6x the attention proper, so roadmap 6.3 item 1's "at or below" would hold - but that split is a proxy, not a phase-isolated measurement, so the target is **measurable and proxy-met, not established** | node0, 2026-10-18T17:16Z window; binary sha256 `43603e44...`, cubin `5bfee4c7...`, checkpoint `1bae0e10...`; run logs in `/home/user/phase2-evidence/window-2026-10-18/runs/`; method, exact lines and the proxy caveat in [phase3-indexer.md](phase3-indexer.md) | stage-1 printed-class log regenerated 2026-10-18T17:47:23Z: `stage 1: PASS (4 of 4 tokens at every boundary)` with the renamed Mega-mHC cubin; log `/home/user/phase2-evidence/window-2026-10-18/window-stage1-20261018T174723Z.log`; boundary deltas in [phase3-indexer.md](phase3-indexer.md) section 5 |
 

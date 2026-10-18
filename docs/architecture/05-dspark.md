@@ -223,6 +223,13 @@ shifts every draft.
 whole-expert sharding (convert.py:129-134) each rank holds 32 of the 128 MTP experts at full width
 2304, and top-3 selection is global across all 128 -- it is not a per-rank top-3.
 
+**Implementation note (DECISIONS.md D30, 2026-10-18).** The paragraph above is the *reference's*
+rule, and it is the evidence for the spec confusion. It is not the serving layout this tree records
+for routed experts: D30 adopts TP=4 over the intermediate width (every rank holds every expert's
+576-value slice, padded to 640 - the only routed-expert layout the device has run), and the MTP
+blocks use the same code path and kernel ABI, so their experts are sliced and padded the same way
+when they land. D6's layout half is corrected by D30; D3's functional facts stand.
+
 **D4 — The spec treats the confidence output as a probability.** It is an unbounded fp32 logit with
 no sigmoid (model.py:1097). A threshold comparison written against "probability in [0,1]" will
 misbehave.
