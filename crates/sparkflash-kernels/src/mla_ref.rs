@@ -40,6 +40,23 @@
 //! after the maximum, so a device-vs-reference comparison runs with the sink included; the device
 //! run of 2026-10-17 (stage 2, 5/5 positions) is that comparison.
 //!
+//! # CSA union mode
+//!
+//! attention_with_sink_union is the attention the released prefill/decode actually computes:
+//! the engine-format window rows supplied by the caller (oldest first, all attended) concatenated
+//! with the selected compressed candidates that are not in the query's future, one f32 softmax
+//! over that union, and the sink added to the denominator after the maximum. The selected ids are
+//! absolute token positions decoded from the FP4 latent; for a ratio-2 compressed source the
+//! caller supplies a per-position expanded view (row p = store row p / ratio) so an id is a row
+//! index again. Unlike the format-0/1 window paths above, an id outside the sliding window but at
+//! or before the query is attended here - that is the Criterion-1 gap this mode closes. The
+//! kernel counterpart is formats 1 and 2 of kernels/flash_mla_csa2_sm121.cu; format 2 is
+//! CPU-pinned only, not yet device-verified (see docs/DECISIONS.md D24). The test
+//! format_two_union_equals_the_engine_reference_on_the_attended_multiset compares this twin bit for
+//! bit with sparkflash_engine::forward::attention::sparse_attention over the concatenated reference
+//! KV (window rows then compressed store rows), so the union is pinned to the engine's attended
+//! multiset and denominator order rather than to a second definition of our own.
+//!
 //! The SCORE SCALE is part of the contract, not a detail: a score is a dot product over the
 //! 512-wide latent, multiplied by 1 / sqrt(512) = 0.04419417382415922 (MLA_SCORE_SCALE below).
 //! Specification 2.3 states the sparse-selection rule but does not pin this constant, so it is
@@ -69,6 +86,9 @@ pub const HSI_BLOCKS: usize = 2048;
 pub const HSI_BLOCK_TOKENS: usize = 8;
 /// The largest candidate list the caller may pass. Mirrors SPARK_M4_MLA_MAX_SELECTED.
 pub const MAX_SELECTED: usize = 512;
+/// The largest number of slots a CSA union attention call can attend: one compressed candidate list
+/// plus one full sliding window. Mirrors SPARK_M4_MLA_MAX_ATTENDED.
+pub const MAX_ATTENDED: usize = MAX_SELECTED + SWA_WINDOW as usize;
 /// E2M1 values per byte.
 pub const FP4_PER_BYTE: usize = 2;
 /// E4M3 scales per latent row.
@@ -438,6 +458,220 @@ fn window_attention_impl(
             for (index, value) in out.iter_mut().enumerate() {
                 *value += weight
                     * window_kv_value(window_codes, window_scales, *candidate as usize, index);
+            }
+        }
+    }
+    let denominator = if maximum > f32::NEG_INFINITY {
+        weight_sum
+    } else {
+        1.0
+    };
+    for value in out.iter_mut() {
+        *value /= denominator;
+    }
+    out
+}
+
+/// Whether one selected compressed candidate is attendable in CSA union mode.
+///
+/// The reference's reachability mask keeps the compressed positions strictly behind the query's own
+/// position, which for a ratio-1 store is exactly `candidate <= position` (the engine computes
+/// `reach = (start_pos + query + 1) / ratio` and masks `position >= reach`). A ratio-2 store is
+/// presented to this function as a per-position expanded view (`row p = store row p / ratio`), so
+/// an absolute candidate id maps to a row again and the same comparison stays the causal test.
+#[must_use]
+pub fn union_attendable(position: u32, candidate: u32) -> bool {
+    candidate <= position
+}
+
+/// The CSA union attention output for one head, without a sink.
+///
+/// This is the attention the released prefill/decode path actually computes: the last
+/// `window_rows` engine-format window rows (oldest first) and the selected compressed candidates,
+/// concatenated in that order and softmaxed together. In the engine's forward that is
+/// `sparse_attention(q, [window_kv; compressed_kv], sink, [window_indices..., compressed_ids...])`;
+/// here `window_rows` is the number of window rows supplied and `selected` holds the compressed
+/// candidates as absolute token positions.
+///
+/// A selected id is attended when [`union_attendable`] holds; an id at or past the query is
+/// excluded exactly, and an id older than the sliding window is NOT excluded - attending it is the
+/// point of this mode. Duplicate entries are attended once per entry, in list order. `kv_fp4` and
+/// `kv_scales` are read by `id`; for a ratio-2 compressed source the caller supplies a
+/// per-position view (`row p = store row p / ratio`) so the id is a row index again.
+///
+/// `window_rows` must be at most [`SWA_WINDOW`] and `window_rows + selected.len()` at most
+/// [`MAX_ATTENDED`]. The window rows are the engine's format: `window_codes` is [rows][512] E4M3
+/// codes and `window_scales` is [rows][16] E8M0 bytes, decoded to the bf16 value the engine stores.
+///
+/// # Panics
+///
+/// Panics if the query is not one latent wide, the candidate list is longer than [`MAX_SELECTED`],
+/// the window is longer than [`SWA_WINDOW`], the union is longer than [`MAX_ATTENDED`] (exactly 640
+/// slots run; 641 is refused rather than writing past the score array), the window slices are too
+/// short, or an attended candidate has no row in the expanded KV view.
+#[allow(clippy::too_many_arguments)]
+// the engine's concatenated attention signature: the query, the window format, the compressed format, the candidate list and the causal position are distinct inputs.
+#[must_use]
+pub fn attention_union(
+    q: &[f32],
+    window_codes: &[u8],
+    window_scales: &[u8],
+    window_rows: usize,
+    kv_fp4: &[u8],
+    kv_scales: &[u8],
+    selected: &[u32],
+    position: u32,
+) -> Vec<f32> {
+    union_attention_impl(
+        q,
+        window_codes,
+        window_scales,
+        window_rows,
+        kv_fp4,
+        kv_scales,
+        selected,
+        position,
+        None,
+    )
+}
+
+/// The CSA union attention output for one head, with that head's attention sink.
+///
+/// The sink is the same additive denominator logit as in [`attention_with_sink`]: one value
+/// added after the union's maximum, in the denominator only. It contributes no value, so a union
+/// with nothing attendable still yields an all-zero output.
+///
+/// # Panics
+///
+/// As [`attention_union`].
+#[allow(clippy::too_many_arguments)] // as attention_union, plus the per-head sink: the reference's own signature.
+#[must_use]
+pub fn attention_with_sink_union(
+    q: &[f32],
+    window_codes: &[u8],
+    window_scales: &[u8],
+    window_rows: usize,
+    kv_fp4: &[u8],
+    kv_scales: &[u8],
+    selected: &[u32],
+    position: u32,
+    sink: f32,
+) -> Vec<f32> {
+    union_attention_impl(
+        q,
+        window_codes,
+        window_scales,
+        window_rows,
+        kv_fp4,
+        kv_scales,
+        selected,
+        position,
+        Some(sink),
+    )
+}
+
+/// The three-pass union attention: maximum over the union, normalising sum plus the sink, then the
+/// weighted value sum. The slot order is the reference's concatenation - window rows
+/// 0..window_rows first, then the selected list in the order given - so a duplicate changes the
+/// arithmetic exactly as the engine's concatenated index list does.
+#[allow(clippy::too_many_arguments)] // the twin's private form: the same inputs plus the optional sink.
+fn union_attention_impl(
+    q: &[f32],
+    window_codes: &[u8],
+    window_scales: &[u8],
+    window_rows: usize,
+    kv_fp4: &[u8],
+    kv_scales: &[u8],
+    selected: &[u32],
+    position: u32,
+    sink: Option<f32>,
+) -> Vec<f32> {
+    assert_eq!(q.len(), MLA_LATENT, "the query is one latent wide");
+    assert!(
+        selected.len() <= MAX_SELECTED,
+        "the candidate list is index_topk long"
+    );
+    assert!(
+        window_rows <= SWA_WINDOW as usize,
+        "the union window is at most the sliding window"
+    );
+    assert!(
+        window_rows + selected.len() <= MAX_ATTENDED,
+        "the union attends at most window plus selected slots"
+    );
+    assert!(
+        window_codes.len() >= window_rows * MLA_LATENT
+            && window_scales.len() >= window_rows * WINDOW_SCALE_BYTES,
+        "the window rows are shorter than the declared row count"
+    );
+    for candidate in selected {
+        if union_attendable(position, *candidate) {
+            let row = *candidate as usize;
+            assert!(
+                kv_fp4.len() >= (row + 1) * ROW_PACKED_BYTES
+                    && kv_scales.len() >= (row + 1) * ROW_SCALE_BYTES,
+                "an attended compressed id has no row in the expanded KV view"
+            );
+        }
+    }
+
+    // Pass one: the maximum over the union, window rows first and then the selected list.
+    let mut maximum = f32::NEG_INFINITY;
+    for row in 0..window_rows {
+        let score = score_window_candidate(q, window_codes, window_scales, row as u32);
+        if score > maximum {
+            maximum = score;
+        }
+    }
+    for candidate in selected {
+        if union_attendable(position, *candidate) {
+            let score = score_candidate(q, kv_fp4, kv_scales, *candidate);
+            if score > maximum {
+                maximum = score;
+            }
+        }
+    }
+
+    // Pass two: the sink's term and the normalising sum, in the released order - the sink is the
+    // first denominator term, then the attended slots in slot order. The kernel's union branch and
+    // sparkflash_engine::forward::attention::sparse_attention use this same order, which is what
+    // makes the f32 sum bit-comparable rather than only close.
+    let mut weight_sum = 0.0f32;
+    if maximum > f32::NEG_INFINITY {
+        if let Some(sink) = sink {
+            weight_sum += (sink - maximum).exp();
+        }
+        for row in 0..window_rows {
+            weight_sum += (score_window_candidate(q, window_codes, window_scales, row as u32)
+                - maximum)
+                .exp();
+        }
+        for candidate in selected {
+            if union_attendable(position, *candidate) {
+                weight_sum += (score_candidate(q, kv_fp4, kv_scales, *candidate) - maximum).exp();
+            }
+        }
+    }
+
+    // Pass three: the weighted value sum in the same order. An id past the query is skipped
+    // outright, so its contribution is exactly zero rather than a small weight.
+    let mut out = vec![0.0f32; MLA_LATENT];
+    if maximum > f32::NEG_INFINITY {
+        for row in 0..window_rows {
+            let weight = (score_window_candidate(q, window_codes, window_scales, row as u32)
+                - maximum)
+                .exp();
+            for (index, value) in out.iter_mut().enumerate() {
+                *value += weight * window_kv_value(window_codes, window_scales, row, index);
+            }
+        }
+        for candidate in selected {
+            if !union_attendable(position, *candidate) {
+                continue;
+            }
+            let weight = (score_candidate(q, kv_fp4, kv_scales, *candidate) - maximum).exp();
+            for (index, value) in out.iter_mut().enumerate() {
+                *value += weight * kv_latent(kv_fp4, kv_scales, *candidate as usize, index);
             }
         }
     }
@@ -1214,5 +1448,783 @@ mod tests {
                 .all(|value| *value == 0.0)
         );
         assert!(window_attendable(rows, 0) && !window_attendable(rows, 3));
+    }
+
+    // ---- CSA union attention (window rows + compressed candidates) -------------
+
+    /// A query that reads one latent channel only, so a score is that channel's value times the
+    /// MLA score scale.
+    fn channel_query(channel: usize) -> Vec<f32> {
+        let mut q = vec![0.0f32; MLA_LATENT];
+        q[channel] = 1.0;
+        q
+    }
+
+    /// Engine-format bytes for a list of f32 rows, exactly as the harness builds them: the engine
+    /// quantiser's E4M3 codes plus one E8M0 scale per 32 channels.
+    fn engine_rows(rows: &[Vec<f32>]) -> (Vec<u8>, Vec<u8>) {
+        let mut codes = Vec::with_capacity(rows.len() * MLA_LATENT);
+        let mut scales = Vec::with_capacity(rows.len() * WINDOW_SCALE_BYTES);
+        for row in rows {
+            let (row_codes, row_scales) = crate::m4_quant::act_quant_fp8_row(row);
+            codes.extend_from_slice(&row_codes);
+            scales.extend_from_slice(&row_scales);
+        }
+        (codes, scales)
+    }
+
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|value| value.to_bits()).collect()
+    }
+
+    #[test]
+    fn union_attendable_is_the_causal_comparison_not_the_window() {
+        // The distinction the mode exists for: at position 129 the token at 0 is outside the
+        // 128-token window but is still a legal compressed candidate, so the union attends it.
+        assert!(union_attendable(129, 0));
+        assert!(union_attendable(129, 129));
+        assert!(!union_attendable(129, 130));
+        assert!(union_attendable(0, 0));
+        assert!(!union_attendable(0, 1));
+        assert!(!in_window(129, 0), "the historical window excludes it");
+        assert!(in_window(129, 129));
+    }
+
+    #[test]
+    fn a_selected_id_outside_the_window_contributes_in_union_mode() {
+        // Position 129, candidate 0: 129 tokens behind, so the window predicate excludes it, but
+        // the union must attend it. The window row is all zeros and the candidate's channel 0 is
+        // 1.0, so window-only gives 0 and the union gives 1 / (1 + exp(-scale)).
+        let q = channel_query(0);
+        let (codes, scales) = engine_rows(&[vec![0.0f32; MLA_LATENT]]);
+        let mut kv = Kv::new(130);
+        kv.set(0, 0, 0x2); // 1.0
+        let window_only = attention_window(&q, &codes, &scales, 1, &[]);
+        assert_eq!(window_only[0], 0.0, "a zero window row has zero value");
+        let union = attention_union(&q, &codes, &scales, 1, &kv.fp4, &kv.scales, &[0], 129);
+        let expected = 1.0 / (1.0 + (-MLA_SCORE_SCALE).exp());
+        assert!(
+            (union[0] - expected).abs() < 1e-6,
+            "the out-of-window candidate must contribute: got {} expected {expected}",
+            union[0]
+        );
+        assert!(
+            union[0] > 0.5,
+            "a window-only answer would be 0; got {}",
+            union[0]
+        );
+    }
+
+    #[test]
+    fn a_selected_id_past_the_position_is_excluded_exactly() {
+        let q = channel_query(0);
+        let (codes, scales) = engine_rows(&[vec![0.0f32; MLA_LATENT]]);
+        let mut kv = Kv::new(7);
+        kv.set(6, 0, 0x7); // 6.0, and it must not be seen at position 5
+        let future = attention_union(&q, &codes, &scales, 1, &kv.fp4, &kv.scales, &[6], 5);
+        let without = attention_union(&q, &codes, &scales, 1, &kv.fp4, &kv.scales, &[], 5);
+        assert_eq!(
+            bits(&future),
+            bits(&without),
+            "a future id must not change the output by even one bit"
+        );
+        assert!(future.iter().all(|value| *value == 0.0));
+        // The same id at the query's own position is attended, so the exclusion is the causal
+        // comparison and not an off-by-one that drops everything.
+        let mut kv5 = Kv::new(6);
+        kv5.set(5, 0, 0x7);
+        let attended = attention_union(&q, &codes, &scales, 1, &kv5.fp4, &kv5.scales, &[5], 5);
+        assert!(attended[0] > 0.0);
+    }
+
+    #[test]
+    fn duplicate_selected_ids_are_attended_once_per_entry() {
+        // Window empty, two compressed rows: row 0 is 1.0 and row 1 is 2.0 in channel 0. With
+        // [0, 1] the weights are (exp(-s), 1); with [0, 0, 1] row 0 has twice the weight, so the
+        // output moves towards 1.0. A dedup would leave both calls identical.
+        let q = channel_query(0);
+        let mut kv = Kv::new(2);
+        kv.set(0, 0, 0x2); // 1.0
+        kv.set(1, 0, 0x4); // 2.0
+        let single = attention_union(&q, &[], &[], 0, &kv.fp4, &kv.scales, &[0, 1], 10);
+        let duplicated = attention_union(&q, &[], &[], 0, &kv.fp4, &kv.scales, &[0, 0, 1], 10);
+        let lower = (-MLA_SCORE_SCALE).exp();
+        let expected_single = (lower + 2.0) / (lower + 1.0);
+        let expected_duplicated = (2.0 * lower + 2.0) / (2.0 * lower + 1.0);
+        assert!((single[0] - expected_single).abs() < 1e-6);
+        assert!((duplicated[0] - expected_duplicated).abs() < 1e-6);
+        assert!(
+            (single[0] - duplicated[0]).abs() > 1e-3,
+            "a duplicate must change the mixture: {} vs {}",
+            single[0],
+            duplicated[0]
+        );
+    }
+
+    #[test]
+    fn a_token_in_the_window_and_also_selected_contributes_both_values() {
+        // The window row stores 1.0 and the compressed row for the same token stores 2.0: they are
+        // two different KV values in the reference's concatenated index space, and both are
+        // attended. A dedup by token id would drop one of them.
+        let q = channel_query(0);
+        let (codes, scales) = engine_rows(&[vec![1.0f32; MLA_LATENT]]);
+        let mut kv = Kv::new(1);
+        kv.set(0, 0, 0x4); // 2.0 in the compressed row
+        let union = attention_union(&q, &codes, &scales, 1, &kv.fp4, &kv.scales, &[0], 0);
+        // Window score 1*s, compressed score 2*s; the weights are exp(-s) and 1.
+        let lower = (-MLA_SCORE_SCALE).exp();
+        let expected = (lower + 2.0) / (lower + 1.0);
+        assert!(
+            (union[0] - expected).abs() < 1e-6,
+            "got {} expected {expected}",
+            union[0]
+        );
+        assert!(union[0] > 1.0 && union[0] < 2.0);
+    }
+
+    #[test]
+    fn an_empty_union_is_zero_even_with_a_sink() {
+        let q = channel_query(0);
+        assert!(
+            attention_union(&q, &[], &[], 0, &[], &[], &[], 5)
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        assert!(
+            attention_with_sink_union(&q, &[], &[], 0, &[], &[], &[], 5, 5.0)
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        // A future-only list is the same case; its rows need not exist because they are never read.
+        let future = attention_union(&q, &[], &[], 0, &[], &[], &[6, 7], 5);
+        assert!(future.iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn union_with_no_selected_is_the_window_attention_bit_for_bit() {
+        let q: Vec<f32> = (0..MLA_LATENT)
+            .map(|index| ((index as f32 * 0.013).cos() * 0.5) + ((index % 11) as f32 * 0.02))
+            .collect();
+        let rows = 3usize;
+        let mut values = Vec::with_capacity(rows);
+        for row in 0..rows {
+            values.push(
+                (0..MLA_LATENT)
+                    .map(|index| ((row as f32 + 1.0) * 0.7 + index as f32 * 0.019).sin())
+                    .collect::<Vec<f32>>(),
+            );
+        }
+        let (codes, scales) = engine_rows(&values);
+        // In the engine-format window call the window rows contribute only when their row ids are
+        // listed; the union mode attends every supplied window row, so the equivalent window call
+        // lists rows 0..window_rows. No selected compressed candidates are involved.
+        let listed: Vec<u32> = (0..rows as u32).collect();
+        let window = attention_window(&q, &codes, &scales, rows, &listed);
+        let union = attention_union(&q, &codes, &scales, rows, &[], &[], &[], 0);
+        assert_eq!(bits(&window), bits(&union));
+        let window_sink = attention_with_sink_window(&q, &codes, &scales, rows, &listed, 0.75);
+        let union_sink =
+            attention_with_sink_union(&q, &codes, &scales, rows, &[], &[], &[], 0, 0.75);
+        assert_eq!(bits(&window_sink), bits(&union_sink));
+    }
+
+    #[test]
+    fn an_unreachable_union_sink_reproduces_the_no_sink_bits() {
+        let q = channel_query(0);
+        let (codes, scales) = engine_rows(&[vec![0.5f32; MLA_LATENT]]);
+        let mut kv = Kv::new(1);
+        kv.set(0, 0, 0x4);
+        let without = attention_union(&q, &codes, &scales, 1, &kv.fp4, &kv.scales, &[0], 0);
+        for sink in [f32::NEG_INFINITY, -1.0e30] {
+            let with = attention_with_sink_union(
+                &q,
+                &codes,
+                &scales,
+                1,
+                &kv.fp4,
+                &kv.scales,
+                &[0],
+                0,
+                sink,
+            );
+            assert_eq!(
+                bits(&without),
+                bits(&with),
+                "a sink of {sink} must not change the bits"
+            );
+        }
+    }
+
+    /// The union against a slow f64 reference built from the same decode rules: window rows first,
+    /// then the causal selected ids, one sink term after the maximum. The selected list includes
+    /// ids both inside and outside the window, a duplicate row (the same compressed id listed
+    /// twice), an id past the position (excluded), and the id equal to the position (attended).
+    #[test]
+    fn union_attention_matches_a_slow_f64_reference() {
+        let q: Vec<f32> = (0..MLA_LATENT)
+            .map(|index| ((index as f32 * 0.017).sin() * 0.75) + ((index % 7) as f32 * 0.01))
+            .collect();
+        let window_rows = 2usize;
+        let mut window_values = Vec::with_capacity(window_rows);
+        for row in 0..window_rows {
+            window_values.push(
+                (0..MLA_LATENT)
+                    .map(|index| {
+                        let angle = (row as f32 + 1.0) * 0.31 + index as f32 * 0.023;
+                        (angle.sin() * 2.0) + (index % 5) as f32 * 0.05
+                    })
+                    .collect::<Vec<f32>>(),
+            );
+        }
+        let (codes, scales) = engine_rows(&window_values);
+        let mut kv = Kv::new(201);
+        for row in [0usize, 1, 127, 129, 199] {
+            kv.set(row, 0, 0x2); // 1.0
+            kv.set(row, 1, if row % 2 == 0 { 0x4 } else { 0x5 }); // 2.0 / 3.0
+        }
+        let position = 199u32;
+        let selected = [0u32, 1, 1, 127, 129, 199, 200];
+        let sink = 0.25f32;
+
+        let mut scores = Vec::new();
+        let mut values = Vec::new();
+        for row in 0..window_rows {
+            let mut score = 0.0f64;
+            for (index, q_value) in q.iter().enumerate() {
+                let value = f64::from(window_kv_value(&codes, &scales, row, index));
+                values.push(value);
+                score += f64::from(*q_value) * value;
+            }
+            scores.push(score * f64::from(MLA_SCORE_SCALE));
+        }
+        for candidate in selected {
+            if !union_attendable(position, candidate) {
+                continue;
+            }
+            let mut score = 0.0f64;
+            for (index, q_value) in q.iter().enumerate() {
+                let value = f64::from(kv_latent(&kv.fp4, &kv.scales, candidate as usize, index));
+                values.push(value);
+                score += f64::from(*q_value) * value;
+            }
+            scores.push(score * f64::from(MLA_SCORE_SCALE));
+        }
+        let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let mut denominator = (f64::from(sink) - maximum).exp();
+        for score in &scores {
+            denominator += (score - maximum).exp();
+        }
+        let mut expected = vec![0.0f64; MLA_LATENT];
+        for (slot, score) in scores.iter().enumerate() {
+            let weight = (score - maximum).exp() / denominator;
+            for index in 0..MLA_LATENT {
+                expected[index] += weight * values[slot * MLA_LATENT + index];
+            }
+        }
+        let union = attention_with_sink_union(
+            &q,
+            &codes,
+            &scales,
+            window_rows,
+            &kv.fp4,
+            &kv.scales,
+            &selected,
+            position,
+            sink,
+        );
+        for index in 0..MLA_LATENT {
+            let delta = (f64::from(union[index]) - expected[index]).abs();
+            assert!(
+                delta <= 1e-5,
+                "channel {index}: union differs from the slow f64 result by {delta:e}"
+            );
+        }
+
+        // The same union without a sink must agree with the same f64 reference with the sink term
+        // removed, and the sink must attenuate every channel (it adds mass, not a value).
+        let no_sink = attention_union(
+            &q,
+            &codes,
+            &scales,
+            window_rows,
+            &kv.fp4,
+            &kv.scales,
+            &selected,
+            position,
+        );
+        let candidate_sum: f64 = scores.iter().map(|score| (score - maximum).exp()).sum();
+        let mut expected_no_sink = vec![0.0f64; MLA_LATENT];
+        for (slot, score) in scores.iter().enumerate() {
+            let weight = (score - maximum).exp() / candidate_sum;
+            for index in 0..MLA_LATENT {
+                expected_no_sink[index] += weight * values[slot * MLA_LATENT + index];
+            }
+        }
+        for index in 0..MLA_LATENT {
+            let delta = (f64::from(no_sink[index]) - expected_no_sink[index]).abs();
+            assert!(
+                delta <= 1e-5,
+                "no-sink channel {index} differs by {delta:e}"
+            );
+            assert!(
+                union[index].abs() <= no_sink[index].abs() + 1e-6,
+                "the sink must only remove mass, channel {index}"
+            );
+        }
+    }
+
+    // ---- CSA union mode against the engine's own sparse_attention reference ----
+
+    fn window_row(value: f32) -> Vec<f32> {
+        let mut row = vec![0.0f32; MLA_LATENT];
+        row[0] = value;
+        row
+    }
+
+    fn store_kv(row_codes: &[u8]) -> Kv {
+        let mut kv = Kv::new(row_codes.len());
+        for (row, code) in row_codes.iter().enumerate() {
+            kv.set(row, 0, *code);
+        }
+        kv
+    }
+
+    /// The per-position view a ratio-N source hands union mode: row p decodes exactly like store row
+    /// p / ratio. This is option A of the task-11 contract, and the equality test below is what
+    /// proves it is not double-counting.
+    fn expand_store(store: &Kv, ratio: usize) -> Kv {
+        assert!(ratio >= 1, "a ratio is at least one token per store row");
+        let mut expanded = Kv::new(store.rows * ratio);
+        for row in 0..expanded.rows {
+            let source = row / ratio;
+            expanded.fp4[row * ROW_PACKED_BYTES..(row + 1) * ROW_PACKED_BYTES].copy_from_slice(
+                &store.fp4[source * ROW_PACKED_BYTES..(source + 1) * ROW_PACKED_BYTES],
+            );
+            expanded.scales[row * ROW_SCALE_BYTES..(row + 1) * ROW_SCALE_BYTES].copy_from_slice(
+                &store.scales[source * ROW_SCALE_BYTES..(source + 1) * ROW_SCALE_BYTES],
+            );
+        }
+        expanded
+    }
+
+    /// The engine's own sparse_attention over the concatenated reference KV: window rows first, then
+    /// the compressed store rows, with indices = window rows ++ compressed ids shifted by the window
+    /// and usize::MAX for a future (masked) id. This mirrors attention_forward exactly, including
+    /// the sink being the first denominator term. The caller passes the *store* (unexpanded) so a
+    /// ratio-N case is compared against the engine's own compressed rows, not our expansion.
+    #[allow(clippy::too_many_arguments)]
+    fn reference_union_output(
+        q: &[f32],
+        window_codes: &[u8],
+        window_scales: &[u8],
+        window_rows: usize,
+        store: &Kv,
+        ratio: usize,
+        selected: &[u32],
+        position: u32,
+        sink: f32,
+    ) -> Vec<f32> {
+        let mut kv = Vec::with_capacity((window_rows + store.rows) * MLA_LATENT);
+        for row in 0..window_rows {
+            for index in 0..MLA_LATENT {
+                kv.push(window_kv_value(window_codes, window_scales, row, index));
+            }
+        }
+        let compressed_base = window_rows;
+        for row in 0..store.rows {
+            for index in 0..MLA_LATENT {
+                kv.push(kv_latent(&store.fp4, &store.scales, row, index));
+            }
+        }
+        let mut indices: Vec<usize> = (0..window_rows).collect();
+        for id in selected {
+            if *id <= position {
+                let id = *id as usize;
+                assert!(
+                    id.is_multiple_of(ratio),
+                    "an absolute id must lie on the compressed source's token grid"
+                );
+                indices.push(compressed_base + id / ratio);
+            } else {
+                // The reference's NO_INDEX is usize::MAX, and sparse_attention masks it.
+                indices.push(usize::MAX);
+            }
+        }
+        let mut out = vec![0.0f32; MLA_LATENT];
+        sparkflash_engine::forward::attention::sparse_attention(
+            q,
+            &kv,
+            &[sink],
+            &indices,
+            1,
+            MLA_LATENT,
+            MLA_SCORE_SCALE,
+            &mut out,
+        )
+        .expect("the reference sparse attention accepts whole 512-wide rows");
+        out
+    }
+
+    struct UnionCase {
+        label: &'static str,
+        position: u32,
+        window: Vec<Vec<f32>>,
+        store: Vec<u8>,
+        ratio: usize,
+        selected: Vec<u32>,
+    }
+
+    /// The hard condition of the task-11 contract: format 2 must equal the ENGINE reference, not a
+    /// hand-written union softmax of our own definition. Each case is compared bit for bit with
+    /// sparkflash_engine::forward::attention::sparse_attention over the concatenated reference KV,
+    /// and the case list covers the required multiset shapes: distinct compressed ids, a compressed
+    /// id inside the window, a duplicate entry, an id at the query position, an id past it, and two
+    /// ratio-2 expanded-view cases (one with a compressed id inside the window).
+    #[test]
+    fn format_two_union_equals_the_engine_reference_on_the_attended_multiset() {
+        let q = channel_query(0);
+        let sink = 0.75f32;
+        let cases = vec![
+            UnionCase {
+                label: "distinct compressed ids outside the window, ratio 1",
+                position: 129,
+                window: vec![window_row(0.5), window_row(1.5)],
+                store: (0..130)
+                    .map(|row| [0x2u8, 0x4, 0x7, 0x1][row % 4])
+                    .collect(),
+                ratio: 1,
+                selected: vec![0, 3, 100],
+            },
+            UnionCase {
+                label: "a compressed id inside the sliding window, ratio 1",
+                position: 10,
+                window: vec![
+                    window_row(2.0),
+                    window_row(0.5),
+                    window_row(1.0),
+                    window_row(3.0),
+                    window_row(0.5),
+                    window_row(2.0),
+                    window_row(1.5),
+                    window_row(0.5),
+                    window_row(2.5),
+                ],
+                store: (0..12).map(|row| [0x4u8, 0x7, 0x1, 0x2][row % 4]).collect(),
+                ratio: 1,
+                selected: vec![4, 7],
+            },
+            UnionCase {
+                label: "duplicate selected entries, ratio 1",
+                position: 9,
+                window: vec![window_row(1.0), window_row(2.0)],
+                store: (0..8).map(|row| [0x6u8, 0x1, 0x4, 0x2][row % 4]).collect(),
+                ratio: 1,
+                selected: vec![3, 3, 5],
+            },
+            UnionCase {
+                label: "a compressed id at the query position, ratio 1",
+                position: 7,
+                window: vec![window_row(3.0), window_row(0.5)],
+                store: (0..8).map(|row| [0x1u8, 0x7, 0x2, 0x4][row % 4]).collect(),
+                ratio: 1,
+                selected: vec![7, 2],
+            },
+            UnionCase {
+                label: "a compressed id past the query position, ratio 1",
+                position: 7,
+                window: vec![window_row(0.5), window_row(3.0)],
+                store: (0..9).map(|row| [0x2u8, 0x4, 0x1, 0x7][row % 4]).collect(),
+                ratio: 1,
+                selected: vec![8, 2],
+            },
+            UnionCase {
+                label: "expanded per-position view, ratio 2",
+                position: 5,
+                window: vec![window_row(1.5), window_row(0.5), window_row(2.5)],
+                store: vec![0x2, 0x4, 0x7, 0x1],
+                ratio: 2,
+                selected: vec![0, 2, 4],
+            },
+            UnionCase {
+                label: "expanded per-position view with a compressed id inside the window, ratio 2",
+                position: 5,
+                window: vec![window_row(0.5), window_row(2.0), window_row(1.5)],
+                store: vec![0x7, 0x1, 0x4, 0x2],
+                ratio: 2,
+                selected: vec![4],
+            },
+        ];
+        for case in &cases {
+            let (window_codes, window_scales) = engine_rows(&case.window);
+            let store = store_kv(&case.store);
+            let expanded = expand_store(&store, case.ratio);
+            let window_rows = case.window.len();
+            let got = attention_with_sink_union(
+                &q,
+                &window_codes,
+                &window_scales,
+                window_rows,
+                &expanded.fp4,
+                &expanded.scales,
+                &case.selected,
+                case.position,
+                sink,
+            );
+            let want = reference_union_output(
+                &q,
+                &window_codes,
+                &window_scales,
+                window_rows,
+                &store,
+                case.ratio,
+                &case.selected,
+                case.position,
+                sink,
+            );
+            assert_eq!(
+                bits(&got),
+                bits(&want),
+                "{}: format 2 must reproduce sparse_attention on the concatenated reference KV",
+                case.label
+            );
+
+            // The union must not be the window-only answer: at least one selected entry changes it.
+            let window_only = attention_with_sink_union(
+                &q,
+                &window_codes,
+                &window_scales,
+                window_rows,
+                &expanded.fp4,
+                &expanded.scales,
+                &[],
+                case.position,
+                sink,
+            );
+            assert_ne!(
+                bits(&got),
+                bits(&window_only),
+                "{}: the selected ids must contribute to the union",
+                case.label
+            );
+
+            // Future ids are masked exactly: dropping them must not change a bit. This is the
+            // reference's NO_INDEX column and our union_attendable() exclusion.
+            let attended: Vec<u32> = case
+                .selected
+                .iter()
+                .copied()
+                .filter(|id| *id <= case.position)
+                .collect();
+            if attended.len() != case.selected.len() {
+                let without_future = attention_with_sink_union(
+                    &q,
+                    &window_codes,
+                    &window_scales,
+                    window_rows,
+                    &expanded.fp4,
+                    &expanded.scales,
+                    &attended,
+                    case.position,
+                    sink,
+                );
+                assert_eq!(
+                    bits(&got),
+                    bits(&without_future),
+                    "{}: a future id must be excluded exactly",
+                    case.label
+                );
+            }
+
+            // A duplicate is attended once per entry, in list order: de-duplicating changes the
+            // result, and the engine reference above was given the duplicate index too.
+            let mut unique = case.selected.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            if unique.len() != case.selected.len() {
+                let deduped = attention_with_sink_union(
+                    &q,
+                    &window_codes,
+                    &window_scales,
+                    window_rows,
+                    &expanded.fp4,
+                    &expanded.scales,
+                    &unique,
+                    case.position,
+                    sink,
+                );
+                assert_ne!(
+                    bits(&got),
+                    bits(&deduped),
+                    "{}: a duplicate selected entry is attended once per entry",
+                    case.label
+                );
+            }
+
+            // Option A's injective id mapping: compressed store row c is absolute position c*ratio,
+            // and that expanded row decodes to exactly the store row.
+            if case.ratio > 1 {
+                assert!(
+                    case.selected
+                        .iter()
+                        .all(|id| (*id as usize).is_multiple_of(case.ratio)),
+                    "{}: ids are absolute positions on the compressed grid",
+                    case.label
+                );
+                for row in 0..store.rows {
+                    let id = row * case.ratio;
+                    for index in 0..MLA_LATENT {
+                        assert_eq!(
+                            kv_latent(&store.fp4, &store.scales, row, index).to_bits(),
+                            kv_latent(&expanded.fp4, &expanded.scales, id, index).to_bits(),
+                            "{}: store row {row} must be expanded row {id}",
+                            case.label
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ratio_two_expansion_cannot_double_count_a_store_row() {
+        let q = channel_query(0);
+        let (window_codes, window_scales) = engine_rows(&[window_row(0.5)]);
+        let store = store_kv(&[0x2, 0x4, 0x7]);
+        let expanded = expand_store(&store, 2);
+        let position = 5u32;
+        let sink = 0.25f32;
+        // The correct absolute ids: compressed rows 0, 1, 2 are token positions 0, 2, 4.
+        let correct = [0u32, 2, 4];
+        let got = attention_with_sink_union(
+            &q,
+            &window_codes,
+            &window_scales,
+            1,
+            &expanded.fp4,
+            &expanded.scales,
+            &correct,
+            position,
+            sink,
+        );
+        let want = reference_union_output(
+            &q,
+            &window_codes,
+            &window_scales,
+            1,
+            &store,
+            2,
+            &correct,
+            position,
+            sink,
+        );
+        assert_eq!(
+            bits(&got),
+            bits(&want),
+            "ids c*ratio must map exactly to compressed row c"
+        );
+        // The double-count hazard: using the compressed row index as the absolute id reads the
+        // expanded view row 1, which is store row 0 again, so row 0 is counted twice and row 2 is
+        // never attended. That answer must not equal the reference.
+        let naive = [0u32, 1, 2];
+        let wrong = attention_with_sink_union(
+            &q,
+            &window_codes,
+            &window_scales,
+            1,
+            &expanded.fp4,
+            &expanded.scales,
+            &naive,
+            position,
+            sink,
+        );
+        assert_ne!(
+            bits(&wrong),
+            bits(&want),
+            "compressed indices used as token ids double-count an expanded store row"
+        );
+        assert_eq!(
+            kv_latent(&expanded.fp4, &expanded.scales, 0, 0).to_bits(),
+            kv_latent(&expanded.fp4, &expanded.scales, 1, 0).to_bits(),
+            "the expansion intentionally duplicates each store row"
+        );
+    }
+
+    #[test]
+    fn the_union_capacity_accepts_exactly_640_slots() {
+        // 128 window rows + 512 candidates = 640, the full bound. The kernel refuses 641 with a
+        // NaN poison at its entry guard; this twin refuses it with a panic (the #[should_panic]
+        // test below). Exactly 640 must run, not be refused.
+        let q = channel_query(0);
+        let window = vec![vec![0.0f32; MLA_LATENT]; 128];
+        let (codes, scales) = engine_rows(&window);
+        let mut store = Kv::new(512);
+        for row in 0..512 {
+            store.set(row, 0, 0x2);
+        }
+        let selected: Vec<u32> = (0..512).collect();
+        let out = attention_with_sink_union(
+            &q,
+            &codes,
+            &scales,
+            128,
+            &store.fp4,
+            &store.scales,
+            &selected,
+            511,
+            0.0,
+        );
+        assert_eq!(out.len(), MLA_LATENT);
+        assert!(
+            out.iter().all(|value| value.is_finite()),
+            "exactly 640 slots must produce a finite output"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "the union window is at most the sliding window")]
+    fn the_union_capacity_refuses_641_slots() {
+        let q = channel_query(0);
+        let window = vec![vec![0.0f32; MLA_LATENT]; 129];
+        let (codes, scales) = engine_rows(&window);
+        let mut store = Kv::new(512);
+        for row in 0..512 {
+            store.set(row, 0, 0x2);
+        }
+        let selected: Vec<u32> = (0..512).collect();
+        let _ = attention_with_sink_union(
+            &q,
+            &codes,
+            &scales,
+            129,
+            &store.fp4,
+            &store.scales,
+            &selected,
+            511,
+            0.0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "the candidate list is index_topk long")]
+    fn the_union_refuses_more_than_512_candidates() {
+        let q = channel_query(0);
+        let window = vec![vec![0.0f32; MLA_LATENT]; 1];
+        let (codes, scales) = engine_rows(&window);
+        let mut store = Kv::new(513);
+        for row in 0..513 {
+            store.set(row, 0, 0x2);
+        }
+        let selected: Vec<u32> = (0..513).collect();
+        let _ = attention_with_sink_union(
+            &q,
+            &codes,
+            &scales,
+            1,
+            &store.fp4,
+            &store.scales,
+            &selected,
+            512,
+            0.0,
+        );
     }
 }

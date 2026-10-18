@@ -32,6 +32,13 @@
 //     it is validated by the launcher and guarded at kernel entry. The released engine's own bf16
 //     arithmetic is not claimed - the engine reference forward keeps f32 dequant, and that seam is
 //     documented - only the format and its bf16 storage are reproduced.
+//   * format 2 (CSA union) is the released attention's actual candidate set: the supplied engine
+//     window rows are all attended, oldest first, then the selected compressed candidates are
+//     attended when candidate <= position (the reference's causal reachability mask; a candidate
+//     inside the window is NOT excluded). One f32 softmax runs over that union with the sink in
+//     the denominator after the maximum. Out-of-window selected ids therefore contribute, which is
+//     the Criterion-1 gap the window-only formats cannot express. Formats 0 and 1 keep their own
+//     exclusion rules unchanged.
 //
 // Verification status: executed on node0 (GB10, sm_121a) on 2026-10-17. nvcc 13.0.3
 // compiles it for sm_121a, clang parses it against the stub headers, src/m4_abi.rs pins the
@@ -41,7 +48,13 @@
 // consumed on both sides, PASSed 5/5 positions - 163,838/163,840 outputs (99.9988%) bit-exact
 // against the bf16 rounding of the f32 reference, max abs delta 9.765625e-4 (one bf16 ULP), max
 // ULP distance 1. That is internal consistency of the sink arithmetic against our reference on
-// real checkpoint bytes, not a claim of bit-identity with the released kernel.
+// real checkpoint bytes, not a claim of bit-identity with the released kernel. Formats 0 and 1 are
+// those measured columns. Format 2 is reference-tested by CPU tests only: src/mla_ref.rs's union
+// twin is compared bit for bit with sparkflash_engine::forward::attention::sparse_attention over the
+// concatenated window ++ compressed reference KV, its 640-slot bound is exercised at exactly 640 and
+// at 641 (this kernel's entry guard poisons 641 with NaN), and src/m4_abi.rs pins the dispatch text.
+// Format 2 has NOT been executed on a device, and nothing here claims it reproduces the golden
+// fixture until a Lead-sequenced window runs it.
 
 #include "m4_common_sm121.cuh"
 
@@ -49,14 +62,21 @@
 #define SPARK_M4_MLA_LATENT SPARK_M4_KV_LORA_RANK
 #define SPARK_M4_MLA_FP4_PER_BYTE 2u
 // One score per selected position lives in shared memory, which is what bounds the candidate
-// count: 512 positions of f32 plus the running statistics.
+// count: 512 positions of f32 plus the running statistics. In union format the window rows are
+// attended in the same array, so its capacity is one candidate list plus one full window. The
+// capacity is written as that expression (no C cast) so the Rust reader evaluates the same sum.
 #define SPARK_M4_MLA_MAX_SELECTED 512u
+#define SPARK_M4_MLA_MAX_ATTENDED (SPARK_M4_MLA_MAX_SELECTED + SPARK_M4_SWA_WINDOW)
 
 static_assert(SPARK_M4_MLA_LATENT % SPARK_M4_KV_SCALE_CHANNELS == 0u,
               "the latent divides into 16-channel scale groups");
 static_assert(SPARK_M4_MLA_LATENT % SPARK_M4_MLA_THREADS == 0u, "the latent tiles across the block");
 static_assert(SPARK_M4_MLA_LATENT / SPARK_M4_MLA_THREADS == 2u, "two latent values per thread");
 static_assert(SPARK_M4_MLA_MAX_SELECTED == SPARK_M4_INDEX_TOPK, "the candidate list is index_topk");
+static_assert(SPARK_M4_MLA_MAX_ATTENDED == 640u,
+              "the union capacity is 512 candidates plus the 128-token window");
+static_assert(SPARK_M4_MLA_MAX_ATTENDED >= SPARK_M4_MLA_MAX_SELECTED,
+              "the union array must hold every historical candidate list");
 static_assert(SPARK_M4_KV_SCALE_CHANNELS == 16u, "an E4M3 scale per 16 channels");
 static_assert(SPARK_M4_SWA_WINDOW == 128u, "the sliding window is 128 tokens");
 static_assert(SPARK_M4_MLA_THREADS == SPARK_M4_REDUCE_SLOTS, "the block reduction needs 256 threads");
@@ -100,11 +120,14 @@ __device__ __forceinline__ float spark_mla_warp_sum(float value) {
 // latent channel with one E8M0 power-of-two scale per 32 channels, stored after the engine's
 // in-place quantise/dequantise round trip, which returns the input dtype and therefore stores bf16.
 // The format is an explicit launcher argument, never inferred from another argument's value:
-// 0 keeps the historical FP4 latent path byte-identical, 1 reads the engine window arrays, and any
-// other value is rejected by the launcher. The format VALUE cannot be a static_assert because it is
-// a runtime parameter; only the layout constants below are compile-time facts.
+// 0 keeps the historical FP4 latent path byte-identical, 1 reads the engine window arrays, and
+// 2 (CSA union) attends the engine window rows plus the causal FP4 compressed candidates in one
+// softmax. Any other value is rejected by the launcher and poisoned at kernel entry. The format
+// VALUE cannot be a static_assert because it is a runtime parameter; only the layout constants
+// below are compile-time facts.
 #define SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4 0u
 #define SPARK_M4_MLA_WINDOW_KV_FORMAT_ENGINE_FP8 1u
+#define SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION 2u
 #define SPARK_M4_MLA_WINDOW_QUANT_BLOCK 32u
 #define SPARK_M4_MLA_WINDOW_SCALES (SPARK_M4_MLA_LATENT / SPARK_M4_MLA_WINDOW_QUANT_BLOCK)
 static_assert(SPARK_M4_MLA_LATENT % SPARK_M4_MLA_WINDOW_QUANT_BLOCK == 0u,
@@ -159,15 +182,25 @@ __device__ __forceinline__ uint32_t spark_mla_attends(uint32_t window_kv_format,
                : (candidate < window_rows ? 1u : 0u);
 }
 
+// Union format: the window rows are attended unconditionally (the caller supplies only rows at or
+// behind the query, oldest first), and a selected compressed id is attended when it is not in the
+// future. The reference's reachability mask is the same comparison for a ratio-1 compressed store;
+// a ratio-2 store reaches this kernel as a per-position expanded view (row p = store row p/ratio),
+// so an absolute candidate id is still a row index here. A candidate inside the sliding window is
+// deliberately NOT filtered out: the union is the released attention's whole candidate set.
+__device__ __forceinline__ uint32_t spark_mla_union_attends(uint32_t position, uint32_t candidate) {
+    return candidate <= position ? 1u : 0u;
+}
+
 extern "C" __global__ void flash_mla_csa2_sm121(
     const __nv_bfloat16 *__restrict__ q,             // [heads][latent] query, rope already applied
     const uint8_t *__restrict__ kv_fp4,              // [positions][latent/2] packed E2M1 latent
     const uint8_t *__restrict__ kv_scales,           // [positions][latent/16] E4M3 scales
     const uint8_t *__restrict__ window_codes,        // engine format: [window_rows][latent] E4M3 codes
     const uint8_t *__restrict__ window_scales,       // engine format: [window_rows][latent/32] E8M0 scales
-    const uint32_t window_kv_format,                 // 0 = historical FP4 latent, 1 = engine FP8 window
+    const uint32_t window_kv_format,                 // 0 = FP4 window, 1 = engine FP8 window, 2 = CSA union
     const uint32_t window_rows,                      // engine format: window rows supplied, oldest first
-    const uint32_t *__restrict__ selected,           // [selected_count] candidate position ids
+    const uint32_t *__restrict__ selected,           // [selected_count] candidate position ids (2: absolute token positions)
     const __nv_bfloat16 *__restrict__ index_key,     // [hsi_blocks][8][index_head_dim]
     const __nv_bfloat16 *__restrict__ index_query,   // [heads][index_head_dim]
     const float *__restrict__ sink,                  // [heads] additive per-head attention sink logit
@@ -186,16 +219,29 @@ extern "C" __global__ void flash_mla_csa2_sm121(
     // heads, 32 indexer heads), so this division is required, not cosmetic.
     const uint32_t index_head = head / (uint32_t)SPARK_M4_MLA_HEADS_PER_INDEX_HEAD;
 
-    __shared__ float s_scores[SPARK_M4_MLA_MAX_SELECTED];
+    __shared__ float s_scores[SPARK_M4_MLA_MAX_ATTENDED];
     __shared__ float s_max;
     __shared__ float s_sum;
 
     // The format is a runtime value, so it is guarded at run time rather than in a static_assert.
-    // The launcher validates it and refuses any value other than 0 or 1 before launching; if one
+    // The launcher validates it and refuses any value other than 0, 1 or 2 before launching; if one
     // ever reaches the kernel, poison out with NaN so the contract violation is visible instead of
     // a half-formatted read, and return before the trace pair is entered. This path is not a run:
-    // it is here so that no third format can be silently treated as one of the two real ones.
-    if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_ENGINE_FP8) {
+    // it is here so that no unknown format can be silently treated as one of the real ones.
+    if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION) {
+        for (uint32_t i = lane; i < SPARK_M4_MLA_LATENT; i += SPARK_M4_MLA_THREADS) {
+            out[(uint64_t)head * SPARK_M4_MLA_LATENT + i] =
+                __float2bfloat16_rn(__uint_as_float(0x7FC00000u));
+        }
+        return;
+    }
+    // Union format needs room for the implicit window rows as well as the candidate list. The
+    // launcher caps both, but a direct launch must not be able to index past s_scores, so the
+    // kernel refuses it the same way it refuses an unknown format.
+    if (window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION &&
+        (window_rows > (uint32_t)SPARK_M4_SWA_WINDOW ||
+         selected_count > (uint32_t)SPARK_M4_MLA_MAX_SELECTED ||
+         window_rows + selected_count > (uint32_t)SPARK_M4_MLA_MAX_ATTENDED)) {
         for (uint32_t i = lane; i < SPARK_M4_MLA_LATENT; i += SPARK_M4_MLA_THREADS) {
             out[(uint64_t)head * SPARK_M4_MLA_LATENT + i] =
                 __float2bfloat16_rn(__uint_as_float(0x7FC00000u));
@@ -271,6 +317,99 @@ extern "C" __global__ void flash_mla_csa2_sm121(
     // execution of that attention is 0.068 ms, so the redundant copies overlapped rather than
     // serialising; the work was still real. Only slice 0 runs the attention now.
     if (blockIdx.y != 0u) {
+        return;
+    }
+
+    // Format 2: the CSA union. The score array holds the supplied window rows first (all attended,
+    // oldest first, engine format) and then the selected compressed candidates (absolute token
+    // positions, attended when candidate <= position, FP4 latent). One f32 three-pass softmax runs
+    // over that union: maximum, normalising sum plus the sink after the maximum, weighted values.
+    // This is the released attention's concatenation (window_indices then compressed_ids) and the
+    // reason a selected id older than the window must contribute. Formats 0 and 1 do not enter this
+    // branch and their arithmetic below is unchanged.
+    if (window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION) {
+        const uint32_t union_total = window_rows + selected_count;
+        // Pass one: every union slot's score. A selected id past the query is excluded by score,
+        // exactly as the reference's reachability mask excludes it.
+        for (uint32_t slot = lane; slot < union_total; slot += SPARK_M4_MLA_THREADS) {
+            float score = 0.0f;
+            if (slot < window_rows) {
+                for (uint32_t i = 0; i < SPARK_M4_MLA_LATENT; ++i) {
+                    score += __bfloat162float(q[(uint64_t)head * SPARK_M4_MLA_LATENT + i]) *
+                             spark_mla_load_window_stored(window_codes, window_scales, slot, i);
+                }
+                score *= SPARK_M4_MLA_SCORE_SCALE;
+            } else {
+                const uint32_t candidate = selected[slot - window_rows];
+                if (spark_mla_union_attends(position, candidate) != 0u) {
+                    for (uint32_t i = 0; i < SPARK_M4_MLA_LATENT; ++i) {
+                        const float key = spark_mla_load_latent(
+                                              kv_fp4 + (uint64_t)candidate * (SPARK_M4_MLA_LATENT / 2u), i) *
+                                          spark_mla_scale(
+                                              kv_scales + (uint64_t)candidate *
+                                                              (SPARK_M4_MLA_LATENT / SPARK_M4_KV_SCALE_CHANNELS),
+                                              i);
+                        score += __bfloat162float(q[(uint64_t)head * SPARK_M4_MLA_LATENT + i]) * key;
+                    }
+                    score *= SPARK_M4_MLA_SCORE_SCALE;
+                } else {
+                    score = -3.402823466e38f;
+                }
+            }
+            s_scores[slot] = score;
+        }
+        __syncthreads();
+        float local_max = -3.402823466e38f;
+        for (uint32_t slot = lane; slot < union_total; slot += SPARK_M4_MLA_THREADS) {
+            local_max = s_scores[slot] > local_max ? s_scores[slot] : local_max;
+        }
+        local_max = spark_block_max(local_max, lane, SPARK_M4_MLA_THREADS);
+        if (lane == 0u) {
+            s_max = local_max;
+        }
+        __syncthreads();
+        // The sink is a denominator term only, added after the maximum as in the released order.
+        float local_sum = lane == 0u ? spark_exp(sink[head] - s_max) : 0.0f;
+        for (uint32_t slot = lane; slot < union_total; slot += SPARK_M4_MLA_THREADS) {
+            const float probability = spark_exp(s_scores[slot] - s_max);
+            s_scores[slot] = probability;
+            local_sum += probability;
+        }
+        local_sum = spark_block_sum(local_sum, lane, SPARK_M4_MLA_THREADS);
+        if (lane == 0u) {
+            s_sum = local_sum > 0.0f ? local_sum : 1.0f;
+        }
+        __syncthreads();
+        // Each thread owns two latent channels and walks the union in ascending slot order: window
+        // rows first, then the selected list as supplied. That order is part of the contract.
+        for (uint32_t i = lane; i < SPARK_M4_MLA_LATENT; i += SPARK_M4_MLA_THREADS) {
+            float acc = 0.0f;
+            for (uint32_t slot = 0; slot < union_total; ++slot) {
+                if (slot < window_rows) {
+                    acc += s_scores[slot] *
+                           spark_mla_load_window_stored(window_codes, window_scales, slot, i);
+                } else {
+                    const uint32_t candidate = selected[slot - window_rows];
+                    if (spark_mla_union_attends(position, candidate) != 0u) {
+                        const float value = spark_mla_load_latent(
+                                                kv_fp4 + (uint64_t)candidate * (SPARK_M4_MLA_LATENT / 2u), i) *
+                                            spark_mla_scale(
+                                                kv_scales + (uint64_t)candidate *
+                                                                (SPARK_M4_MLA_LATENT / SPARK_M4_KV_SCALE_CHANNELS),
+                                                i);
+                        acc += s_scores[slot] * value;
+                    }
+                }
+            }
+            out[(uint64_t)head * SPARK_M4_MLA_LATENT + i] = __float2bfloat16_rn(acc / s_sum);
+        }
+        if (lane == 0u) {
+            const uint32_t meta = (uint32_t)(SPARK_M4_MLA_LATENT * 2u);
+            SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_CSA2_ATTN, layer_id, meta, t_enter);
+            (void)heads;
+            (void)step_seq;
+        }
+        (void)t_enter;
         return;
     }
 

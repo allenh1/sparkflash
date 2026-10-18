@@ -1246,3 +1246,50 @@ no pair written) is kept as the historical record of the L36 case. The earlier S
 diff log) stays on disk as historical evidence and is no longer cited. Criterion 1 is NOT closed by
 this column: it is the Phase-1 health-check measurement, and the format-faithful exactness run is the
 one after Phase 2 (task-3).
+
+## D24 - CSA attention attends the window/compressed union, and format 2 is reference-tested until a device window
+
+**Evidence.** Task-9's 2B harness found the concrete Criterion-1 gap. The released model (and the
+golden fixture computed by sparkflash_engine::forward::attention::attention_forward) builds the
+attention candidate list as window_indices followed by the selected compressed_ids and softmaxes
+the union with the sink in the denominator (sparse_attention, kernel.py:311-389). The
+flash_mla_csa2_sm121 formats 0 and 1 are window-only: format 0 keeps a candidate only when
+position - candidate < 128 (FP4), format 1 keeps a selected id only when it is a row index inside
+the supplied engine window. At prefill position 129 the decoder layers 21-39 read the layer-20
+ratio-1 compressed store and must attend compressed ids 0..1, which are outside the 128-token
+window, so a window-only device attention cannot reproduce the golden logits at that position. The
+reference's own reachability mask is reach = (start_pos + query + 1) / ratio; for a ratio-1 store
+that is exactly candidate <= position, and the compressed ids are emitted in position order and
+shifted into the shared window-first index space (attention_forward, compressed_indices).
+
+**Decision.** window_kv_format = 2 (macro SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION in
+kernels/flash_mla_csa2_sm121.cu) is the CSA union mode. Formats 0 and 1 keep their own exclusion
+rules and code paths; the mode is a third explicit runtime value, the 19-parameter ABI is unchanged,
+and the kernel entry poisons the output for any unknown value. Format 2 semantics: (1) the
+window_rows engine-format rows are all attended, oldest first; (2) the selected entries are
+absolute token positions decoded from kv_fp4/kv_scales, attended when candidate <= position and
+excluded exactly otherwise; (3) score/weight order is window rows then the selected list as
+supplied, duplicates attended once per entry, one f32 three-pass softmax with the sink added to the
+denominator after the maximum, out rounded to bf16. A ratio-2 compressed source is passed as a
+per-position expanded view (row p = store row p / ratio; selected compressed index c becomes token
+id c * ratio), so the kernel needs no ratio argument. The internal union scores are bounded by
+SPARK_M4_MLA_MAX_ATTENDED = 640 (512 candidates + 128 window), a compile-time constant with a
+static_assert and a kernel guard; mla_ref::attention_with_sink_union is the CPU twin with the same
+arithmetic order.
+
+**Consequence.** The CPU reference tests prove the arithmetic and dispatch only. In particular,
+mla_ref's format_two_union_equals_the_engine_reference_on_the_attended_multiset compares format 2
+bit for bit with sparkflash_engine::forward::attention::sparse_attention over the concatenated
+window ++ compressed reference KV, not with a second union definition: window rows are the
+engine-format decoded rows, compressed rows are the store rows addressed by absolute token ids,
+and the sink is the first denominator term in both. Its cases cover distinct out-of-window ids, an
+id inside the window, duplicate entries, an id at the query position, a future id (reference
+NO_INDEX), ratio-2 expanded views and a negative control showing that using compressed indices as
+token ids double-counts an expanded store row. The 640-slot bound is exercised at exactly 640
+(accepted) and at 641 (refused by the Rust twin; the kernel entry guard poisons it with NaN), and
+the dispatch/capacity text is pinned in m4_abi. Format 2 has NOT been executed on a device and no
+result here claims it reproduces the golden fixture; that claim waits for a Lead-sequenced device
+window (the 2B harness then compares format 2 on the existing stage-2 positions plus a 130-token
+position-129 case). Formats 0 and 1 device evidence from task-3/task-6 is untouched, and
+m7_layer0.rs is not modified by this change. The 2B harness consumes format 2 through the existing
+typed FlashMlaParams/flash_mla_params builder.

@@ -1198,7 +1198,7 @@ const ASSERT_COUNTS: [(&str, usize); 7] = [
     ("mega_mhc_sm121.cu", 6),
     ("b12x_mxfp8_dense_sm121.cu", 6),
     ("b12x_mxfp4_moe_sm121.cu", 10),
-    ("flash_mla_csa2_sm121.cu", 15),
+    ("flash_mla_csa2_sm121.cu", 17),
     ("b12x_mxfp8_wo_a_sm121.cu", 11),
     ("cert_lm_head_sm121.cu", 8),
 ];
@@ -1553,12 +1553,13 @@ fn every_static_assert_in_the_milestone_holds_under_rust_too() {
         }
     }
     assert_eq!(
-        checked, 76,
+        checked, 78,
         "the milestone's static asserts must all be evaluated: 20 in the shared header plus 6, 6, \
-         10, 15, 11 and 8 in the six kernels. The MoE count rose from 7 to 10 with D14, which pins \
+         10, 17, 11 and 8 in the six kernels. The MoE count rose from 7 to 10 with D14, which pins \
          the FP8 E4M3 activation operand's byte width in the build itself; flash_mla's rose from 13 \
-         to 15 with the engine window format's two layout asserts. The format VALUE is not among \
-         them: it is a runtime launch parameter and is guarded at kernel entry instead"
+         to 15 with the engine window format's two layout asserts, then to 17 with the union \
+         capacity's two. The format VALUE is not among them: it is a runtime launch parameter and \
+         is guarded at kernel entry instead"
     );
     // Every exception must still exist: a stale entry would quietly widen the rule above.
     for (name, condition) in NON_SPARK_ASSERTIONS {
@@ -2501,11 +2502,14 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
         "the weight stride must not be reused for the scales"
     );
 
-    // A2: the MLA score scale is applied, exactly once.
+    // A2: the MLA score scale is applied exactly once in each attention path: the historical
+    // shared loop and the union mode's window and compressed score sites. The union branch adds two
+    // sites, so the count is pinned rather than left as a lower bound.
     let mla_scales_the_score = |source: &str| -> bool {
         let code = crate::c_decl::strip_comments(source);
         code.contains("score *= SPARK_M4_MLA_SCORE_SCALE;")
-            && code.matches("SPARK_M4_MLA_SCORE_SCALE").count() == 1
+            && code.matches("score *= SPARK_M4_MLA_SCORE_SCALE;").count() == 3
+            && code.matches("SPARK_M4_MLA_SCORE_SCALE").count() == 3
     };
     assert!(mla_scales_the_score(FLASH_MLA_CSA2));
     let unscaled = FLASH_MLA_CSA2.replace("score *= SPARK_M4_MLA_SCORE_SCALE;", "score *= 1.0f;");
@@ -2657,26 +2661,188 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
     // A10: the engine window-KV format is selected by an explicit runtime argument, guarded at
     // kernel entry, and never inferred from another argument's value. A format VALUE cannot be a
     // static_assert - static_asserts see compile-time constants, not launch parameters - so the
-    // guard is runtime code and this pin is the source text that proves it exists. The mutation is
-    // the sentinel selector the design rejects: window_rows == 0 cannot express an empty engine
-    // window, and it reads badly in the ABI pin because the row count is not a format.
+    // guard is runtime code and this pin is the source text that proves it exists. Format 2 (CSA
+    // union) is a third runtime mode, not a widening of the window: this same helper also pins the
+    // union dispatch, its capacity expression and the formats 0/1 predicate text the union branch
+    // must not disturb. Each mutation below asserts it applied and that this helper then fails.
     let mla_guards_the_window_format = |source: &str| -> bool {
         let code = crate::c_decl::strip_comments(source);
         code.contains("#define SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4 0u")
             && code.contains("#define SPARK_M4_MLA_WINDOW_KV_FORMAT_ENGINE_FP8 1u")
-            && code.contains("if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_ENGINE_FP8) {")
+            && code.contains("#define SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION 2u")
+            && code.contains("if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION) {")
             && code.contains("__float2bfloat16_rn(__uint_as_float(0x7FC00000u))")
             && !code.contains("static_assert(window_kv_format")
+            // The formats 0/1 dispatch text the union branch does not enter: the attended
+            // predicate and the two ternary load sites.
+            && code.contains("? spark_mla_in_window(position, candidate)")
+            && code.contains(": (candidate < window_rows ? 1u : 0u);")
+            && code.contains(
+                "const float key = window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4",
+            )
+            && code.contains(
+                "const float value = window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4",
+            )
+            // The union mode's own dispatch: the absolute-position causal predicate, every supplied
+            // window row attended, and the compile-time capacity shared with the Rust twin. The
+            // three capacity arms together refuse 641 while accepting exactly 640 (128 + 512).
+            && code.contains(
+                "#define SPARK_M4_MLA_MAX_ATTENDED (SPARK_M4_MLA_MAX_SELECTED + SPARK_M4_SWA_WINDOW)",
+            )
+            && code.contains("static_assert(SPARK_M4_MLA_MAX_ATTENDED == 640u,")
+            && code.contains("__shared__ float s_scores[SPARK_M4_MLA_MAX_ATTENDED];")
+            && code.contains("__device__ __forceinline__ uint32_t spark_mla_union_attends(")
+            && code.contains("return candidate <= position ? 1u : 0u;")
+            && code.contains("if (window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION) {")
+            && code.contains("spark_mla_union_attends(position, candidate) != 0u")
+            && code.contains("spark_mla_load_window_stored(window_codes, window_scales, slot, i)")
+            && code.contains("window_rows > (uint32_t)SPARK_M4_SWA_WINDOW")
+            && code.contains("selected_count > (uint32_t)SPARK_M4_MLA_MAX_SELECTED")
+            && code.contains("window_rows + selected_count > (uint32_t)SPARK_M4_MLA_MAX_ATTENDED")
     };
     assert!(mla_guards_the_window_format(FLASH_MLA_CSA2));
+
+    // The sentinel selector the design rejects: window_rows == 0 cannot express an empty engine
+    // window, and it reads badly in the ABI pin because the row count is not a format.
     let sentinel_format = FLASH_MLA_CSA2.replace(
-        "if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_ENGINE_FP8) {",
+        "if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION) {",
         "if (window_rows == 0u) {",
     );
     assert_ne!(sentinel_format, FLASH_MLA_CSA2, "the mutation must apply");
     assert!(
         !mla_guards_the_window_format(&sentinel_format),
         "a row-count sentinel is exactly the format selector this design rejects"
+    );
+
+    // The format value itself: renumbering the union mode onto the engine value must fail the pin.
+    let wrong_union_value = FLASH_MLA_CSA2.replace(
+        "#define SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION 2u",
+        "#define SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION 1u",
+    );
+    assert_ne!(wrong_union_value, FLASH_MLA_CSA2, "the mutation must apply");
+    assert!(
+        !mla_guards_the_window_format(&wrong_union_value),
+        "the union format must keep its own value, not alias engine format 1"
+    );
+
+    // Accepting 3 through a too-wide guard, or falling back to the old two-value guard, is the
+    // silent-wrong-arithmetic defect: both must fail.
+    let wide_guard = FLASH_MLA_CSA2.replace(
+        "if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION) {",
+        "if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION + 1u) {",
+    );
+    assert_ne!(wide_guard, FLASH_MLA_CSA2, "the mutation must apply");
+    assert!(
+        !mla_guards_the_window_format(&wide_guard),
+        "a fourth format must not pass the entry guard"
+    );
+    let two_value_guard = FLASH_MLA_CSA2.replace(
+        "if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION) {",
+        "if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_ENGINE_FP8) {",
+    );
+    assert_ne!(two_value_guard, FLASH_MLA_CSA2, "the mutation must apply");
+    assert!(
+        !mla_guards_the_window_format(&two_value_guard),
+        "the old two-value guard would hand format 2 to the format-1 branch"
+    );
+
+    // A refusal that is not visible is worse than no refusal: the poison must stay the NaN output.
+    let no_poison = FLASH_MLA_CSA2.replace("0x7FC00000u", "0x0u");
+    assert_ne!(no_poison, FLASH_MLA_CSA2, "the mutation must apply");
+    assert!(
+        !mla_guards_the_window_format(&no_poison),
+        "the refused formats must still poison with NaN"
+    );
+
+    // The negative pin: a runtime format cannot be a static_assert even when the guard remains.
+    let asserted_format =
+        format!("{FLASH_MLA_CSA2}\nstatic_assert(window_kv_format > 2u, \"format\");\n");
+    assert_ne!(asserted_format, FLASH_MLA_CSA2, "the mutation must apply");
+    assert!(
+        !mla_guards_the_window_format(&asserted_format),
+        "a runtime format value cannot be a static_assert"
+    );
+
+    // The formats 0/1 dispatch text: both ternary load sites are pinned, so deleting either one
+    // fails even while the other (and the union branch) remains.
+    let no_key_site = FLASH_MLA_CSA2.replace(
+        "const float key = window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4",
+        "const float key = 1u",
+    );
+    assert_ne!(no_key_site, FLASH_MLA_CSA2, "the mutation must apply");
+    assert!(
+        !mla_guards_the_window_format(&no_key_site),
+        "the format-0/1 key load dispatch must stay"
+    );
+    let no_value_site = FLASH_MLA_CSA2.replace(
+        "const float value = window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4",
+        "const float value = 1u",
+    );
+    assert_ne!(no_value_site, FLASH_MLA_CSA2, "the mutation must apply");
+    assert!(
+        !mla_guards_the_window_format(&no_value_site),
+        "the format-0/1 value load dispatch must stay"
+    );
+
+    // The union rule is a causal predicate, not a window: changing it to the window predicate or
+    // to an exclusive comparison would silently drop out-of-window candidates (the Criterion-1
+    // gap) or the query's own position.
+    let union_windowed = FLASH_MLA_CSA2.replace(
+        "return candidate <= position ? 1u : 0u;",
+        "return candidate <= position && spark_mla_in_window(position, candidate) ? 1u : 0u;",
+    );
+    assert_ne!(union_windowed, FLASH_MLA_CSA2, "the mutation must apply");
+    assert!(
+        !mla_guards_the_window_format(&union_windowed),
+        "an out-of-window selected id must stay attendable in union mode"
+    );
+    let union_exclusive = FLASH_MLA_CSA2.replace(
+        "return candidate <= position ? 1u : 0u;",
+        "return candidate < position ? 1u : 0u;",
+    );
+    assert_ne!(union_exclusive, FLASH_MLA_CSA2, "the mutation must apply");
+    assert!(
+        !mla_guards_the_window_format(&union_exclusive),
+        "an id at the query's own position is attendable"
+    );
+
+    // Capacity: exactly 640 is the union of a full candidate list and a full window; a narrower
+    // expression (or no sum guard) would write past s_scores.
+    let shrunk_capacity = FLASH_MLA_CSA2.replace(
+        "#define SPARK_M4_MLA_MAX_ATTENDED (SPARK_M4_MLA_MAX_SELECTED + SPARK_M4_SWA_WINDOW)",
+        "#define SPARK_M4_MLA_MAX_ATTENDED (SPARK_M4_MLA_MAX_SELECTED + 64u)",
+    );
+    assert_ne!(shrunk_capacity, FLASH_MLA_CSA2, "the mutation must apply");
+    assert!(
+        !mla_guards_the_window_format(&shrunk_capacity),
+        "the union capacity expression is one candidate list plus one window"
+    );
+    let no_capacity_guard = FLASH_MLA_CSA2.replace(
+        "window_rows + selected_count > (uint32_t)SPARK_M4_MLA_MAX_ATTENDED",
+        "window_rows + selected_count > (uint32_t)SPARK_M4_MLA_LATENT",
+    );
+    assert_ne!(no_capacity_guard, FLASH_MLA_CSA2, "the mutation must apply");
+    assert!(
+        !mla_guards_the_window_format(&no_capacity_guard),
+        "a union longer than the score array would be an out-of-bounds write"
+    );
+    let no_selected_cap = FLASH_MLA_CSA2.replace(
+        "selected_count > (uint32_t)SPARK_M4_MLA_MAX_SELECTED",
+        "selected_count > 1024u",
+    );
+    assert_ne!(no_selected_cap, FLASH_MLA_CSA2, "the mutation must apply");
+    assert!(
+        !mla_guards_the_window_format(&no_selected_cap),
+        "the selected list is index_topk long"
+    );
+    let no_window_cap = FLASH_MLA_CSA2.replace(
+        "window_rows > (uint32_t)SPARK_M4_SWA_WINDOW",
+        "window_rows > 256u",
+    );
+    assert_ne!(no_window_cap, FLASH_MLA_CSA2, "the mutation must apply");
+    assert!(
+        !mla_guards_the_window_format(&no_window_cap),
+        "the union window is at most the sliding window"
     );
 
     // A6 and A9: the header carries the two scale grids and the row-scale helpers the kernels use,
