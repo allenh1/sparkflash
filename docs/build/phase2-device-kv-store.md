@@ -52,15 +52,20 @@ The KV arrays are 720 + 170 + 2.578 MiB = 892.578 MiB, which is the section 5.2 
 (720 MB / 170 MB / 2.7 MB / ~0.9 GB there; those figures are MiB, spelled out here).
 
 Each layer's kernel pointer is `base + layer_entry_base × entry_size`, so a position p is at
-`p × 256` (`kv_fp4`) / `p × 32` (`kv_scales`), matching device-path-design section 3. Window ring
-slot offset is `(layer × 128 + slot) × 528`, matching `swa_slot_offset`.
+`p × 256` (`kv_fp4`) / `p × 32` (`kv_scales`), matching device-path-design section 3. The window
+ring is two separate device arrays: slot `(layer × 128 + slot)` is at `× 512` in `window_codes` and
+`× 16` in `window_scales` (`DeviceKvStore::window_offsets`). The 528-B `swa_slot_offset` is the
+host/audit raw-slot size, not a device stride.
 
 ### The 890-vs-1050 question
 The store measures its own live allocation, not the report's headline: 933,232,640 B / 1,048,576
-tokens = **890.0 B/token** for main + index. There is no 64-byte-per-entry region anywhere in the
-layout; the spec's 1050 B/token itemisation double-counts `qk_rope_head_dim = 64`, which is already
-inside `head_dim = 512` (D16 finding 1, 08-kv-footprint section 2). This settles *which layout the
-implementation realises*; it is not a claim that the reference allocates 890 B/token — the reference
+tokens = **890.0 B/token** for main + index. There is no separate 64-byte `qk_rope` region beyond
+`head_dim = 512`: the rotary dimensions are inside the 512-wide main latent. The 64-byte-per-entry
+region that does exist is the indexer-K **payload** (`[entries][64]`, with 4 scale bytes on top),
+and it is included in the 356 B/entry and 890 B/token figures. The spec's 1050 B/token itemisation
+double-counts `qk_rope_head_dim = 64` as a separate region (D16 finding 1, 08-kv-footprint
+section 2). This settles *which layout the implementation realises*; it is not a claim that the
+reference allocates 890 B/token — the reference
 allocates bf16 (D1) and the 890 figure is the implemented store's measured live allocation.
 
 ## 4. Layer modes and handle resolution
@@ -75,14 +80,17 @@ allocates bf16 (D1) and the 890 figure is the implemented store's measured live 
 | 40–42 | MTP, not in store | — | — | — |
 
 The store allocates **40** window rings, one per backbone layer: every layer attends over its own
-window (model.py:707 allocates one window cache per layer), and 128 × 528 × 40 = 2,703,360 B is the
-same section's own sum. The task brief's "four window rings (one per source layer)" is an arithmetic
+window (model.py:707 allocates one window cache per layer), and 128 × (512 + 16) × 40 = 2,703,360 B
+is the same section's own sum (the two device arrays hold the same bytes as 128 raw 528-B slots). The
+task brief's "four window rings (one per source layer)" is an arithmetic
 slip; roadmap section 5.2's matching "four window rings at 128 × 528 B × 40 layers" sentence is
 corrected in this change to say forty. The ring count is not a design choice.
 
-Handles are resolved, never searched: `main_kv_handle(layer)` and `index_k_handle(layer)` return the
-nearest preceding Full layer's array; `window_handle(layer)` returns the layer's own ring; the Top-K
-list and HSI pool are published buffers with an explicit publication state.
+Handles are resolved, never searched: `source_handles(layer)` returns the nearest preceding Full
+layer's four arrays (main-KV payload and scales, indexer-K payload and scales); `window_handles(layer)`
+returns the layer's own ring as the two arrays; the Top-K list and HSI pool are published buffers
+with an explicit publication state. Layers 40-42 (MTP) are outside the store and are refused with
+`OutOfBounds`, as `window_handles` already did.
 
 ## 5. Ownership and API
 
@@ -100,25 +108,27 @@ example declares `required-features = ["cuda"]`. Host-only users never see a CUD
 ## 6. Plan → store write protocol, and what the store refuses
 
 The host plan decides *where*: page `p` covers tokens `[64p, 64p+64)`; its page payload is unpacked
-to entry `p × 16` (ratio 2) or `p × 64` (ratio 1) per source layer. The store validates and refuses
+to entry `p × 32` (ratio 2) or `p × 64` (ratio 1) per source layer. The store validates and refuses
 — it never allocates, never evicts, never infers a page position:
 
 * page index ≥ 16,384 → `OutOfBounds` (**the required ratio-derived negative test**); the last
   legal page, 16,383, must succeed and 16,384 must fail;
-* main/index position ≥ the source's bound → `OutOfBounds`; the bounds are **524,288 entries for each
-  of layers 2, 8, 14** (ratio 2) and **1,048,576 entries for layer 20** (ratio 1). The last legal
+* main/index position ≥ the source's bound → `LayerOutOfBounds`; the bounds are **524,288 entries
+  for each of layers 2, 8, 14** (ratio 2) and **1,048,576 entries for layer 20** (ratio 1). The last legal
   entries (524,287 and 1,048,575) must succeed and 524,288 / 1,048,576 must fail, with the layer and
   position named in the error;
-* payload length ≠ 56,960, or window slot bytes ≠ 528 → `InvalidLength`;
+* main-KV entry bytes ≠ 288, indexer-K entry bytes ≠ 68, payload length ≠ 56,960, or window slot
+  bytes ≠ 528 → `InvalidLength`;
 * main-KV/index-K write on a non-Full layer → `WrongLayerMode`;
 * Top-K length > 512, HSI pool ≠ 4,194,304 bytes → `InvalidLength`;
 * a consumer asking for the Top-K list or HSI pool before publication → `NotPublished`.
 
 ## 7. Audit manifest and corruption test
 
-Manifest record per **written** entry: `kind: u8` (main/index/window), `layer: u8`, `position: u32`,
-`stored_sha256: [u8;32]` over the **raw stored entry bytes** (288 for main KV, 68 for indexer K, 528
-for a window slot), and `canonical_sha256: [u8;32]` over the **dequantise round-trip bytes**:
+Manifest record per **written** entry: the entry (kind main-KV / indexer-K / window, plus its layer
+and position), `stored_sha256: [u8;32]` over the **raw stored entry bytes** (288 for main KV, 68 for
+indexer K, 528 for a window slot), and `canonical_sha256: [u8;32]` over the **dequantise round-trip
+bytes**:
 
 * main KV: the 512 decoded dequantised values, as f32 LE bits;
 * indexer K: the 128 decoded dequantised values, as f32 LE bits;
@@ -127,9 +137,10 @@ for a window slot), and `canonical_sha256: [u8;32]` over the **dequantise round-
 
 NaN is not expected from a valid upload; to keep the x86 dev host and the aarch64 node computing the
 same digest for the same stored bytes, any NaN is normalised to the quiet NaN `0x7fc00000`
-(`0x7fc0` for bf16) before hashing. Records sort by `(kind, layer, position)`. The audit reads the
-device back through the store, recomputes both hashes and fails on the first mismatch, naming
-`(kind, layer, position)`.
+(`0x7fc0` for bf16) before hashing. Records are produced in payload order: for each source layer in
+`kv_source` order, each entry's main-KV row then its indexer-K row; window rows are appended by the
+caller. The audit reads the device back through the store, recomputes both hashes and fails on the
+first mismatch in that order, naming the entry.
 
 Corruption: flip one byte of a stored entry (same write path as any upload), re-audit; the audit
 **must** fail and name that entry. Unit test on the CPU backend, and the node run performs the same
@@ -142,9 +153,12 @@ store on the node through the CUDA driver (allocation and memcpys only — **no 
 compute**), measures `cuMemGetInfo` free-memory delta across alloc/free plus the store's own
 accounting, writes one 64-token page for all four source layers plus one window slot per layer and
 the two published buffers, reads back, audits (must pass), corrupts one byte, audits (must fail),
-frees. The log is copied to this dev host with sha256 and size; the log records the exact cross-build
-command, working directory and binary sha256, and the binary hash's path dependence is stated. Number
-to be reported: store total and per-token bytes, and the section-5.2 arithmetic they match.
+frees. The log is copied to this dev host with sha256 and size; the log records the measured lines
+and `RESULT: PASS` only — it does not contain the build command, the working directory, the binary
+sha256 or an exit-code field. Those provenance items are recorded in this note and the MR
+description, which also records the exit code. The aarch64 binary hash is path-dependent, as stated
+below. Number to be reported: store total and per-token bytes, and the section-5.2 arithmetic they
+match.
 
 ## 9. Measured run (node node0, NVIDIA GB10, 2026-10-18T08:05:33Z)
 
@@ -152,11 +166,17 @@ Binary: cross-built from commit 6548930, cwd `/home/user/wt/phase2-kv`, rust 1.9
 `aarch64-unknown-linux-gnu`, cuda feature on. Staged as
 `/tmp/phase2-kv-dev_store_probe-18d7a58e`: 3,201,896 B, sha256
 `18d7a58ed3f6564fddf6d9c4129cfed0cd5c5f39cddd2bc5e3ad02e19d466524`. The aarch64 hash is
-path-dependent; the recorded build cwd and command are the provenance.
+path-dependent, so that copy is not reproducible from another path; it is no longer on the node
+host. A rebuild at afd904b (the label-only fix) gives
+`838e22586576be247995dac690f011463dd21228889254951803a7f10a8ed500` — the hash recorded for that
+rebuild in the MR description, and a different binary from the logged one (the fix changes only the
+printed label). The build command, cwd and binary sha256 above are recorded in this note and the MR
+description, not in the log; the log's numbers are those of 18d7a58e.
 
 Log: `/home/user/phase2-evidence/phase2-task7-dev_store_probe-20261018T080533Z.log`,
 1,629 B, sha256 `2bfd70b54409827ddac3696d7e8912e468d1d03e5ed35507e48a079e72e956a5`. The process
-exited 0 and printed `RESULT: PASS`; it allocated and copied only — no kernel launch, no compute.
+printed `RESULT: PASS`, and its exit code was 0 (recorded with the run; the log has no exit-code
+field). It allocated and copied only — no kernel launch, no compute.
 
 Geometry at 1,048,576 tokens (16,384 pages, 2,621,440 entries) reproduced section 5 exactly:
 kv_fp4 671,088,640; kv_scales 83,886,080; index_k_fp4 167,772,160; index_k_scales 10,485,760;
@@ -181,16 +201,16 @@ audit pass again. Layer 21 resolved to layer 20's arrays, and the window/handle 
 in the log.
 
 Probe-text caveat: the log's layer-21 line prints `entries=268435456`, which is the kv_fp4 array's
-**byte** count (1,048,576 entries × 256 B), a print label mistake in the example (fixed in a
-follow-up commit; no measurement is affected — the byte count itself is correct and is what the
-ledger above uses).
+**byte** count (1,048,576 entries × 256 B), a print label mistake in the example (fixed in afd904b;
+no measurement is affected — the byte count itself is correct and is what the ledger above uses).
 
-## 9. Open items (documented, next milestone)
+## 10. Open items (documented, next milestone)
 
 1. The kernel's `window_rows` input is contiguous **oldest-first**; the store keeps the
    reference's slot-indexed ring (`slot = position % 128`). Producing the kernel's row order needs a
-   128 × 528 B rotation copy per layer per step; the sequence milestone must implement it and
-   measure it — it is not hidden in this store.
+   per-slot rotation copy (512 code + 16 scale bytes, 528 B per slot across the two arrays) per
+   layer per step; the sequence milestone must implement it and measure it — it is not hidden in
+   this store.
 2. HSI pool population (candidate selection and bf16 dequantisation from layer 20's index-K) is
    next milestone; this store allocates and validates the buffer only.
 3. Paged/evicting device allocation stays Phase 4/5.

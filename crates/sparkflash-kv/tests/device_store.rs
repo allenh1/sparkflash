@@ -10,8 +10,8 @@ use sparkflash_kv::device_store::{
 };
 use sparkflash_kv::fp4::{quantize_indexer_k, quantize_main_kv, quantize_swa_slot};
 use sparkflash_kv::layout::{
-    GLOBAL_PAGE_BYTES, INDEXER_K_DIM, INDEXER_K_ENTRY_BYTES, MAIN_KV_DIM, MAIN_KV_ENTRY_BYTES,
-    SWA_SLOT_BYTES, SWA_SLOT_DIM, page_entry_offset,
+    GLOBAL_PAGE_BYTES, INDEXER_K_DIM, INDEXER_K_ENTRY_BYTES, MAIN_KV_DATA_BYTES, MAIN_KV_DIM,
+    MAIN_KV_ENTRY_BYTES, SWA_SLOT_BYTES, SWA_SLOT_DIM, page_entry_offset,
 };
 
 /// A [StoreMemory] over owned byte vectors: the CPU stand-in for the CUDA driver.
@@ -87,6 +87,72 @@ impl StoreMemory for HostMemory {
 
     fn allocated_bytes(&self) -> u64 {
         self.live_bytes()
+    }
+}
+
+/// A [StoreMemory] that keeps each buffer's planned size and validates offsets, but not the
+/// bytes: the live-geometry page-bound test needs the 940 MB store's geometry and refusal path,
+/// not 940 MB of host RAM.
+#[derive(Default)]
+struct SparseMemory {
+    sizes: Vec<usize>,
+    bases: Vec<u64>,
+    total: u64,
+}
+
+impl SparseMemory {
+    fn check(&self, buffer: &usize, offset: u64, len: usize) -> Result<(), StoreError> {
+        let start = usize::try_from(offset).map_err(|_| StoreError::TooLarge)?;
+        let end = start.checked_add(len).ok_or(StoreError::TooLarge)?;
+        let size = self.sizes[*buffer];
+        if end > size {
+            return Err(StoreError::OutOfBounds {
+                what: "sparse backend range",
+                value: end as u64,
+                bound: size as u64,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl StoreMemory for SparseMemory {
+    type Buffer = usize;
+
+    fn allocate(&mut self, bytes: usize) -> Result<Self::Buffer, StoreError> {
+        let id = self.sizes.len();
+        self.sizes.push(bytes);
+        self.bases.push(self.total);
+        self.total += bytes as u64;
+        Ok(id)
+    }
+
+    fn release(&mut self, buffer: Self::Buffer) {
+        let size = std::mem::take(&mut self.sizes[buffer]);
+        self.total -= size as u64;
+    }
+
+    fn write(
+        &mut self,
+        buffer: &Self::Buffer,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        self.check(buffer, offset, bytes.len())
+    }
+
+    fn read(&self, buffer: &Self::Buffer, offset: u64, out: &mut [u8]) -> Result<(), StoreError> {
+        self.check(buffer, offset, out.len())?;
+        out.fill(0);
+        Ok(())
+    }
+
+    fn address(&self, buffer: &Self::Buffer) -> u64 {
+        self.bases[*buffer]
+    }
+
+    fn allocated_bytes(&self) -> u64 {
+        self.total
     }
 }
 
@@ -205,6 +271,28 @@ fn page_bound_is_exact() {
 }
 
 #[test]
+fn live_page_bound_is_exact() {
+    let geometry = StoreGeometry::for_max_seq_len(1_048_576).expect("live geometry");
+    assert_eq!(geometry.pages(), 16_384);
+    let mut store = DeviceKvStore::new(SparseMemory::default(), geometry.clone()).expect("store");
+    let payload = vec![0u8; GLOBAL_PAGE_BYTES];
+    store
+        .write_page(16_383, &payload)
+        .expect("last legal live page");
+    let error = store
+        .write_page(16_384, &payload)
+        .expect_err("live bound+1");
+    assert!(matches!(
+        error,
+        StoreError::OutOfBounds {
+            what: "page",
+            value: 16_384,
+            bound: 16_384,
+        }
+    ));
+}
+
+#[test]
 fn source_bounds_are_exact() {
     let geometry = StoreGeometry::for_max_seq_len(128).expect("geometry");
     let mut store = DeviceKvStore::new(HostMemory::default(), geometry.clone()).expect("store");
@@ -310,6 +398,32 @@ fn wrong_lengths_and_wrong_layer_mode_are_refused() {
             ..
         })
     ));
+    for length in [MAIN_KV_ENTRY_BYTES - 1, MAIN_KV_ENTRY_BYTES + 1] {
+        let error = store
+            .write_main_entry(2, 0, &vec![0u8; length])
+            .expect_err("wrong main-KV entry length");
+        assert!(matches!(
+            error,
+            StoreError::InvalidLength {
+                context: "main KV entry",
+                expected: MAIN_KV_ENTRY_BYTES,
+                actual,
+            } if actual == length
+        ));
+    }
+    for length in [INDEXER_K_ENTRY_BYTES - 1, INDEXER_K_ENTRY_BYTES + 1] {
+        let error = store
+            .write_indexer_entry(2, 0, &vec![0u8; length])
+            .expect_err("wrong indexer-K entry length");
+        assert!(matches!(
+            error,
+            StoreError::InvalidLength {
+                context: "indexer-K entry",
+                expected: INDEXER_K_ENTRY_BYTES,
+                actual,
+            } if actual == length
+        ));
+    }
     assert!(matches!(
         store.write_main_entry(3, 0, &[0u8; MAIN_KV_ENTRY_BYTES]),
         Err(StoreError::WrongLayerMode {
@@ -429,6 +543,35 @@ fn handles_resolve_and_publication_is_explicit() {
 }
 
 #[test]
+fn mtp_layers_are_outside_the_store() {
+    let geometry = StoreGeometry::for_max_seq_len(128).expect("geometry");
+    let store = DeviceKvStore::new(HostMemory::default(), geometry).expect("store");
+    for layer in [40usize, 41, 42] {
+        assert_eq!(store.geometry().source_layer_for(layer), None);
+        let error = store.source_handles(layer).expect_err("MTP layer");
+        assert!(
+            matches!(
+                error,
+                StoreError::OutOfBounds {
+                    what: "source layer",
+                    value,
+                    bound: 40,
+                } if value == layer as u64
+            ),
+            "layer {layer}: {error}"
+        );
+        assert!(matches!(
+            store.window_handles(layer),
+            Err(StoreError::OutOfBounds {
+                what: "window layer",
+                value,
+                bound: 40,
+            }) if value == layer as u64
+        ));
+    }
+}
+
+#[test]
 fn corruption_is_detected_and_named() {
     let geometry = StoreGeometry::for_max_seq_len(128).expect("geometry");
     let mut store = DeviceKvStore::new(HostMemory::default(), geometry.clone()).expect("store");
@@ -479,6 +622,62 @@ fn corruption_is_detected_and_named() {
             &payload[page_entry_offset(1, 3)..][..MAIN_KV_ENTRY_BYTES],
         )
         .expect("restore main");
+    // A scale byte of the main-KV entry is a different array; the audit must still name it.
+    store
+        .inject_corruption(
+            StoreEntry::MainKv {
+                layer: 8,
+                position: 3,
+            },
+            MAIN_KV_DATA_BYTES + 1,
+        )
+        .expect("corrupt main scale");
+    let error = store.audit(&expected).expect_err("corrupted scale audit");
+    assert!(matches!(
+        error,
+        StoreError::AuditMismatch {
+            entry: StoreEntry::MainKv {
+                layer: 8,
+                position: 3
+            },
+            ..
+        }
+    ));
+    store
+        .write_main_entry(
+            8,
+            3,
+            &payload[page_entry_offset(1, 3)..][..MAIN_KV_ENTRY_BYTES],
+        )
+        .expect("restore main");
+    // Indexer-K is a separate array family and was not covered by the main/window corruption.
+    store
+        .inject_corruption(
+            StoreEntry::IndexerK {
+                layer: 8,
+                position: 3,
+            },
+            0,
+        )
+        .expect("corrupt indexer");
+    let error = store.audit(&expected).expect_err("corrupted indexer audit");
+    assert!(matches!(
+        error,
+        StoreError::AuditMismatch {
+            entry: StoreEntry::IndexerK {
+                layer: 8,
+                position: 3
+            },
+            ..
+        }
+    ));
+    store
+        .write_indexer_entry(
+            8,
+            3,
+            &payload[page_entry_offset(1, 3) + MAIN_KV_ENTRY_BYTES..][..INDEXER_K_ENTRY_BYTES],
+        )
+        .expect("restore indexer");
     store
         .inject_corruption(
             StoreEntry::Window {
@@ -489,6 +688,32 @@ fn corruption_is_detected_and_named() {
         )
         .expect("corrupt window");
     let error = store.audit(&expected).expect_err("corrupted window audit");
+    assert!(matches!(
+        error,
+        StoreError::AuditMismatch {
+            entry: StoreEntry::Window {
+                layer: 5,
+                slot: 127
+            },
+            ..
+        }
+    ));
+    store
+        .write_window_slot(5, 127, &slot)
+        .expect("restore window");
+    // The window's scale array is the 16-byte tail of the raw slot.
+    store
+        .inject_corruption(
+            StoreEntry::Window {
+                layer: 5,
+                slot: 127,
+            },
+            SWA_SLOT_DIM,
+        )
+        .expect("corrupt window scale");
+    let error = store
+        .audit(&expected)
+        .expect_err("corrupted window scale audit");
     assert!(matches!(
         error,
         StoreError::AuditMismatch {

@@ -167,13 +167,16 @@ impl StoreGeometry {
         self.sources.iter().find(|source| source.layer == layer)
     }
 
-    /// The Full layer whose arrays a given layer consumes, or None for SWA-only layers.
+    /// The Full layer whose arrays a given layer consumes, or None when it consumes none.
     ///
     /// Reuse and Reindex layers read the nearest preceding Full layer's compressed KV and
-    /// indexer K (model.py:500, 517-525; owns_k is only the kv_source list).
+    /// indexer K (model.py:500, 517-525; owns_k is only the kv_source list). SWA-only layers,
+    /// and layers outside the 40-layer backbone (the MTP stages 40-42, which the store does not
+    /// hold), have no source and return None. The [crate::config::compress_ratio] lookup is only
+    /// defined inside that backbone, so the bound is checked first.
     #[must_use]
     pub fn source_layer_for(&self, layer: usize) -> Option<usize> {
-        if config::compress_ratio(layer) == 0 {
+        if layer >= SWA_LAYERS || config::compress_ratio(layer) == 0 {
             None
         } else {
             Some(config::kv_source_for(layer))
@@ -216,7 +219,7 @@ impl StoreGeometry {
         self.total_entries() * (MAIN_KV_ENTRY_BYTES + INDEXER_K_ENTRY_BYTES) as u64
     }
 
-    /// Window rings: 40 layers x 128 slots x 528 bytes, constant in context length.
+    /// Window rings: 40 layers x 128 slots x (512 code + 16 scale) bytes, constant in context.
     #[must_use]
     pub fn window_bytes(&self) -> u64 {
         (WINDOW_RINGS * WINDOW_SLOTS * SWA_SLOT_BYTES) as u64
@@ -1019,8 +1022,17 @@ impl<M: StoreMemory> DeviceKvStore<M> {
     /// Full layer (kv_source_for); SWA-only layers are refused.
     ///
     /// # Errors
-    /// [StoreError::WrongLayerMode] for a SWA-only layer.
+    /// [StoreError::OutOfBounds] for a layer outside the 40-layer backbone (the MTP stages
+    /// 40-42, which are outside the store), and [StoreError::WrongLayerMode] for an in-store
+    /// SWA-only layer.
     pub fn source_handles(&self, layer: usize) -> Result<SourceHandles, StoreError> {
+        if layer >= SWA_LAYERS {
+            return Err(StoreError::OutOfBounds {
+                what: "source layer",
+                value: layer as u64,
+                bound: SWA_LAYERS as u64,
+            });
+        }
         let owner = self
             .geometry
             .source_layer_for(layer)
