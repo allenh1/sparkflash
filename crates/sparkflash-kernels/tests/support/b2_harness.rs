@@ -216,6 +216,10 @@ pub struct Snapshot {
     index_text: String,
     headers: HashMap<String, HashMap<String, Header>>,
     files: HashMap<String, File>,
+    /// Every tensor name this reader was asked for, and the bytes it actually read: the Stage-C
+    /// audit is measured at the reader, not estimated from a plan.
+    read_names: std::collections::BTreeSet<String>,
+    read_bytes: u64,
 }
 
 impl Snapshot {
@@ -228,6 +232,8 @@ impl Snapshot {
             index_text,
             headers: HashMap::new(),
             files: HashMap::new(),
+            read_names: std::collections::BTreeSet::new(),
+            read_bytes: 0,
         })
     }
 
@@ -301,6 +307,8 @@ impl Snapshot {
         let mut bytes = vec![0u8; len];
         file.read_exact(&mut bytes)
             .map_err(|e| format!("{name}: {e}"))?;
+        self.read_names.insert(name.to_string());
+        self.read_bytes = self.read_bytes.saturating_add(len as u64);
         Ok(bytes)
     }
 
@@ -366,6 +374,8 @@ impl Snapshot {
         file.seek(SeekFrom::Start(start))
             .map_err(|e| format!("{name}: {e}"))?;
         file.read_exact(out).map_err(|e| format!("{name}: {e}"))?;
+        self.read_names.insert(name.to_string());
+        self.read_bytes = self.read_bytes.saturating_add(len as u64);
         Ok(())
     }
 
@@ -395,6 +405,17 @@ impl Snapshot {
         let mut bytes = vec![0u8; cols * 2];
         self.read_row_bf16_into(name, row, cols, &mut bytes)?;
         Ok(bytes_to_bf16_f32(&bytes))
+    }
+
+    /// How many distinct tensors this reader was asked for, and how many bytes it read: the Stage-C
+    /// audit's measured half (the plan half comes from the engine's TensorPlan).
+    pub fn audit(&self) -> (usize, u64) {
+        (self.read_names.len(), self.read_bytes)
+    }
+
+    /// The distinct tensor names this reader was asked for.
+    pub fn read_names(&self) -> Vec<String> {
+        self.read_names.iter().cloned().collect()
     }
 }
 
@@ -531,6 +552,11 @@ impl HostBoundaryTable {
             ));
         }
         Ok(values)
+    }
+
+    /// The host pair's manifest text, for the stage-9 report's host-pair line.
+    pub fn manifest_text(&self) -> &str {
+        &self.manifest
     }
 }
 
@@ -723,20 +749,36 @@ pub struct ForcedControlVerdict {
     pub routing_identical: bool,
     pub weights_changed: bool,
     pub routed_identical: bool,
+    /// The two independently computed routed-combine references (free operands vs forced operands)
+    /// are bit-identical, so a flip cannot move the bf16 output by construction.
+    pub references_identical: bool,
 }
 
-/// Classify one forced-routing control run and enforce determinism. Errors if the ids differ but
-/// the routed bytes are identical (a copy of the free path or a broken launch), and errors if the
-/// ids and weights are both identical but the routed bytes differ (identical routing must reproduce
-/// the free path's bytes exactly, so a different result is nondeterminism). When the ids are
-/// identical and the weights changed, the routed bytes may be equal (the change rounded away) or
-/// differ; only the ordered ids define the routing choice.
+/// Classify one forced-routing control run and enforce determinism from the evidence. The caller
+/// passes the routed-combine bytes and the two independently computed references (free operands vs
+/// forced operands, both already checked against their launches); their bit-equality is the evidence
+/// that decides whether an ids-differ/bytes-identical outcome is a legitimate zero-effect flip or a
+/// copy of the free path.
+///
+/// Errors if the ids differ and the bytes are identical while the two references differ: a flip whose
+/// references differ must move the output, so the forced launch cannot have used the host routing (a
+/// copy of the free path, or a broken launch). Errors if the ids differ, the references are
+/// bit-identical, and the bytes differ: with identical expected bytes a launch must reproduce its own
+/// reference, so differing bytes mean a broken/nondeterministic launch, not an allowance. When the
+/// ids differ, the references are identical, and the bytes are identical, the flip cannot move the
+/// output by construction: allowed and reported in the verdict. Errors if the ids and weights are
+/// both identical but the routed bytes differ (identical routing must reproduce the free path's bytes
+/// exactly, so a different result is nondeterminism). When the ids are identical and the weights
+/// changed, the routed bytes may be equal (the change rounded away) or differ; only the ordered ids
+/// define the routing choice.
 pub fn forced_control_verdict(
     device_ids: &[u32],
     host_ids: &[u32],
     device_weights: &[f32],
     host_weights: &[f32],
     routed_identical: bool,
+    free_reference: &[u16],
+    forced_reference: &[u16],
 ) -> Result<ForcedControlVerdict, String> {
     if device_ids.len() != host_ids.len() || device_weights.len() != host_weights.len() {
         return Err(format!(
@@ -750,11 +792,24 @@ pub fn forced_control_verdict(
     if device_ids.is_empty() {
         return Err("forced-routing control: empty routing".to_string());
     }
+    if free_reference.len() != forced_reference.len() {
+        return Err(format!(
+            "forced-routing control: the two references have different lengths ({} free values vs {} forced values)",
+            free_reference.len(),
+            forced_reference.len()
+        ));
+    }
     let routing_identical = device_ids == host_ids;
     let weights_changed = routing_identical && device_weights != host_weights;
-    if !routing_identical && routed_identical {
+    let references_identical = free_reference == forced_reference;
+    if !routing_identical && routed_identical && !references_identical {
         return Err(format!(
-            "forced-routing control: the routing choices differ (device ids {device_ids:?} vs host ids {host_ids:?}) but the routed-combine bytes are identical; a flip must produce a nonzero difference, so the forced launch cannot have used the host routing"
+            "forced-routing control: the routing choices differ (device ids {device_ids:?} vs host ids {host_ids:?}) and the two references differ, but the routed-combine bytes are identical; a flip whose references differ must produce a nonzero difference, so the forced launch cannot have used the host routing (this is the copy case)"
+        ));
+    }
+    if !routing_identical && !routed_identical && references_identical {
+        return Err(format!(
+            "forced-routing control: the routing choices differ (device ids {device_ids:?} vs host ids {host_ids:?}) but the two references are bit-identical, so both launches must produce identical bytes; the routed-combine bytes differ, so a launch does not reproduce its own reference (broken or nondeterministic launch)"
         ));
     }
     if routing_identical && !weights_changed && !routed_identical {
@@ -766,6 +821,7 @@ pub fn forced_control_verdict(
         routing_identical,
         weights_changed,
         routed_identical,
+        references_identical,
     })
 }
 
@@ -1307,48 +1363,165 @@ mod tests {
     fn forced_control_verdict_covers_the_allowed_and_rejected_cases() {
         let ids = [250u32, 209];
         let weights = [0.75f32, 0.25];
-        let same = forced_control_verdict(&ids, &ids, &weights, &weights, true).expect("identical");
+        // The two independently computed routed-combine references: differing (a real flip moves the
+        // output) and identical (a flip that cannot move the bf16 output by construction).
+        let free_ref = [1u16, 2];
+        let forced_ref = [3u16, 4];
+        let same =
+            forced_control_verdict(&ids, &ids, &weights, &weights, true, &free_ref, &forced_ref)
+                .expect("identical");
         assert!(same.routing_identical);
         assert!(!same.weights_changed);
         assert!(same.routed_identical);
         // Equal ids, different weights, rounded-same routed bytes: allowed, and weights_changed says so.
-        let weight_changed =
-            forced_control_verdict(&ids, &ids, &weights, &[0.7500001, 0.2499999], true)
-                .expect("equal ids with changed weights");
+        let weight_changed = forced_control_verdict(
+            &ids,
+            &ids,
+            &weights,
+            &[0.7500001, 0.2499999],
+            true,
+            &free_ref,
+            &forced_ref,
+        )
+        .expect("equal ids with changed weights");
         assert!(weight_changed.routing_identical);
         assert!(weight_changed.weights_changed);
         // Different ids (a flip) with different routed bytes: allowed.
-        let flip = forced_control_verdict(&ids, &[250, 210], &weights, &weights, false)
-            .expect("ids differ and bytes differ");
+        let flip = forced_control_verdict(
+            &ids,
+            &[250, 210],
+            &weights,
+            &weights,
+            false,
+            &free_ref,
+            &forced_ref,
+        )
+        .expect("ids differ, references differ and bytes differ");
         assert!(!flip.routing_identical);
         assert!(!flip.weights_changed);
         // Different ids but identical routed bytes: a copy of the free path, rejected.
-        let copied = forced_control_verdict(&ids, &[250, 210], &weights, &weights, true);
+        let copied = forced_control_verdict(
+            &ids,
+            &[250, 210],
+            &weights,
+            &weights,
+            true,
+            &free_ref,
+            &forced_ref,
+        );
         assert!(
             copied.is_err(),
             "a flip with identical routed bytes must fail"
         );
-        assert!(forced_control_verdict(&ids, &ids[..1], &weights, &weights, true).is_err());
+        assert!(
+            forced_control_verdict(
+                &ids,
+                &ids[..1],
+                &weights,
+                &weights,
+                true,
+                &free_ref,
+                &forced_ref
+            )
+            .is_err()
+        );
+        // The two references must agree in length as well: a mismatched pair is an abort.
+        assert!(
+            forced_control_verdict(
+                &ids,
+                &ids,
+                &weights,
+                &weights,
+                true,
+                &free_ref,
+                &forced_ref[..1]
+            )
+            .is_err()
+        );
         // Identical ids AND identical weights must reproduce the bytes: different bytes are
         // nondeterminism, not a legitimate case.
         assert!(
-            forced_control_verdict(&[1u32, 2], &[1, 2], &[0.5f32, 0.5], &[0.5, 0.5], false)
-                .is_err(),
+            forced_control_verdict(
+                &[1u32, 2],
+                &[1, 2],
+                &[0.5f32, 0.5],
+                &[0.5, 0.5],
+                false,
+                &free_ref,
+                &forced_ref,
+            )
+            .is_err(),
             "identical ids and weights with different routed bytes must fail"
         );
-        let deterministic =
-            forced_control_verdict(&[1u32, 2], &[1, 2], &[0.5f32, 0.5], &[0.5, 0.5], true)
-                .expect("identical ids and weights with equal bytes");
+        let deterministic = forced_control_verdict(
+            &[1u32, 2],
+            &[1, 2],
+            &[0.5f32, 0.5],
+            &[0.5, 0.5],
+            true,
+            &free_ref,
+            &forced_ref,
+        )
+        .expect("identical ids and weights with equal bytes");
         assert!(deterministic.routing_identical);
         assert!(!deterministic.weights_changed);
         // Ids equal, weights changed, routed bytes DIFFER: allowed (the changed weight need not
         // round away), and weights_changed records why the bytes may differ.
-        let weight_changed_differing_bytes =
-            forced_control_verdict(&[1u32, 2], &[1, 2], &[0.5f32, 0.5], &[0.25, 0.75], false)
-                .expect("identical ids with changed weights and different bytes");
+        let weight_changed_differing_bytes = forced_control_verdict(
+            &[1u32, 2],
+            &[1, 2],
+            &[0.5f32, 0.5],
+            &[0.25, 0.75],
+            false,
+            &free_ref,
+            &forced_ref,
+        )
+        .expect("identical ids with changed weights and different bytes");
         assert!(weight_changed_differing_bytes.routing_identical);
         assert!(weight_changed_differing_bytes.weights_changed);
         assert!(!weight_changed_differing_bytes.routed_identical);
+        // (a) ids differ + references bit-identical + bytes identical: the flip cannot move the
+        // output by construction, so this is a legitimate zero-effect flip, not a copy.
+        let zero_effect = forced_control_verdict(
+            &ids,
+            &[250, 210],
+            &weights,
+            &weights,
+            true,
+            &free_ref,
+            &free_ref,
+        )
+        .expect("ids differ but the references are bit-identical: zero-effect flip");
+        assert!(!zero_effect.routing_identical);
+        assert!(zero_effect.routed_identical);
+        assert!(zero_effect.references_identical);
+        // (b) ids differ + references differ + bytes identical: the copy case, a hard abort. This is
+        // also the forced=free copy: a launch that secretly ran the free operands would show the free
+        // bytes while the two references (built from the two routings) differ.
+        let copy_error =
+            copied.expect_err("ids differ with differing references cannot give equal bytes");
+        assert!(
+            copy_error.contains("references differ") && copy_error.contains("copy case"),
+            "unexpected error: {copy_error}"
+        );
+        // (d) ids differ + references bit-identical + bytes differ: with identical expected bytes a
+        // launch must reproduce its reference, so differing bytes mean a broken/nondeterministic
+        // launch - an error, not an allowance.
+        let broken = forced_control_verdict(
+            &ids,
+            &[250, 210],
+            &weights,
+            &weights,
+            false,
+            &free_ref,
+            &free_ref,
+        );
+        let broken_error =
+            broken.expect_err("a launch that does not reproduce its reference must fail");
+        assert!(
+            broken_error.contains("reproduce its own reference"),
+            "unexpected error: {broken_error}"
+        );
     }
 
     #[test]

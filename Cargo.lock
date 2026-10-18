@@ -2286,6 +2286,8 @@ dependencies = [
  "cudarc",
  "half",
  "libloading 0.8.9",
+ "sha2",
+ "sparkflash-engine",
  "sparkflash-trace",
  "thiserror 2.0.21",
 ]

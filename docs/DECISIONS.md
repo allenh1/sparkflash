@@ -1036,11 +1036,13 @@ number's own rounding rather than to a known rule defect.
 **Stage B record (2026-10-18, sixth window): the chained layer-0 replay (B2) is measured, and it is
 a health check, not criterion-1 closure.** The `--stage 7` replay ran sixteen device launches in
 release order plus a four-launch forced-routing control, captured and diffed all eighteen row-0
-boundary tensors, and exited 0 (PASS 18/18; log `phase1-b2-stage7-layer0-rereview5-20261018T044122Z.log`,
-binary sha256 `2b518a35...`, the cross-build of the pass-5 code commit `1845f2d`; the evidence
-binary is that commit's own build, and the docs head's rebuild reproduces it). The pass-5 log's
-metric and content lines are bit-identical to the pass-4 log's (only label/argv/binary-sha/UTC and
-MemAvailable lines differ), so the tie plumbing did not move any measured number; the pass-4 log
+boundary tensors, and exited 0 (PASS 18/18; log `phase1-b2-stage7-layer0-rereview5-20261018T044122Z.log`, 23,897 B,
+local copy sha256 `c2de544c1789743e73ccc5d5277dc3165d98296d0f5cc867cc819d9160754ac9`, binary
+sha256 `2b518a35...`, the cross-build of the pass-5 code commit `1845f2d`; the evidence binary is
+that commit's own build, and the docs head's rebuild reproduces it). The pass-5 log's metric and
+content lines are bit-identical to the pass-4 log's (only the label/argv/binary-sha/UTC header lines
+and the device/node MemAvailable lines - header before and after, process start, per-launch and
+staged-weight - differ), so the tie plumbing did not move any measured number; the pass-4 log
 (`...rereview4-20261018T041707Z.log`, binary `f99f14bf...`) remains on disk as pre-plumbing
 evidence and is no longer cited. It applies no bar: it measures the single-layer deltas the 40-layer
 chain will compound. Every kernel is bit-exact against its in-crate reference on the same bytes, so
@@ -1053,8 +1055,10 @@ exactness run is the one after Phase 2 (task-3). The forced-routing control was 
 re-review passes: subtracting the free and forced host max-abs deltas is a change in max error, not a
 max-abs contribution, and is no longer reported as one; its verdict enforces determinism - identical
 ids with unchanged weights must reproduce the free path's routed bytes exactly (a difference there is
-nondeterminism and aborts), a flip with identical routed bytes aborts, and a weight change with equal
-ids may round to equal or different bytes; the forced operands are built from the re-derived host
+nondeterminism and aborts), a flip with identical routed bytes aborts (refined in the Stage C record
+below: the abort applies when the two independently computed references differ; a flip whose
+references are bit-identical cannot move the bytes and is reported, not aborted), and a weight change
+with equal ids may round to equal or different bytes; the forced operands are built from the re-derived host
 routing and verified against the checkpoint before the launches (every rank's w2 weight and scale
 slices, and every slot's w1/w3-derived activation codes and scales at every rank, bit-for-bit); and
 the forced `ffn_out` is recomputed from the forced routed-combine bits and the shared output through
@@ -1072,3 +1076,68 @@ error. The combine kernel is excluded (K9-K12 exact on the same bytes, free and 
 flips are divergence events to report per layer, never to fold into a smooth bar; and no number in
 this record closes criterion 1.
 
+**Stage C record (2026-10-18, sixth window, after the B2 merge): the 40-layer chained device
+column is measured on the rebased code, its verdict is evidence-based, and the old attribution is
+withdrawn.** Stage C (`m7_layer0 --stage 9`) chains the released checkpoint's first step (token id 0,
+position 0, backbone rows only) as 40 rows, writes a device `v1` pair and diffs it with
+`boundary_diff`. The branch is rebased onto main `2214fe6` (the squashed B2 !51) and adapted to
+the B2 helpers rather than carrying a second copy: the duplicate C safetensors reader is deleted and
+the shared `crates/sparkflash-kernels/tests/support/b2_harness.rs` module supplies the snapshot
+reader and host boundary table (the module gains the read audit - `read_names`/`read_bytes`/
+`audit` - and a `manifest_text` accessor); both the stage-7 replay and `stage9_ffn_block` use
+`combine_bf16_routed_with_shared` for `ffn_out`, `verify_forced_ffn_out` (whose returned
+recomputation feeds both host deltas and the pointwise flip metric), `forced_control_verdict` for
+the ids/weights/routed-bits verdict, and `verify_forced_operand_provenance` with
+`FORCED_OPERAND_GEOMETRY` before every forced launch. The frozen bars continue to be the B2
+single-layer deltas of record (log `...rereview5-20261018T044122Z.log`, 23,897 B, local sha256
+`c2de544c...`, lines 149-166, binary `2b518a35...`); this run does not re-measure them.
+
+Evidence of record: log `/home/user/phase1-evidence/phase1-c-stage9-40rows-harness5b-20261018T050416Z.log`
+(572,420 B, sha256 `bd0f908ef2e3519512a20bd53eb86303fcfad65550f7b145a6c81c7a2c973a65`, UTC
+05:04:16Z-05:09:14Z, wall 298.6 s, exit 0), binary sha256
+`c1708abcfa19bf37fe4fa74c7f0057d1689df46ffada196b3cdd84ccb355f211` (the C head's cross-build),
+node MemAvailable 123,438,768 kB before / 123,194,824 kB after / 122,285,404 kB minimum; device pair
+`stage9-out-r5b/device.manifest` (34,767 B, sha256 `6093c74b...`) and `device.blob`
+(13,537,920 B, sha256 `fecd813b...`); diff log
+`phase1-c-stage9-diff-20261018T050941Z.log` (sha256 `b86be96879239a82a46559d0df2bd2e050ccc2c0f66986fe76a044ed676b5eb4`,
+`boundary_diff` binary `5ffb11f9...`). Determinism: PASS - the two chain runs are bit-identical
+on all 18 tensors of all 40 rows, both v1 blobs `fecd813b...`. The control run exits 0 with all 40
+rows bit-identical and the device column exits 1 with all 40 rows differing (the engine tool's
+documented verdict for a health-check column). The device pair and all 1,520 printed row lines are
+bit-identical to the earlier Stage-C run's, so the helper adaptation changed verification/reporting,
+not measurements; the wall rises from 230.9 s to 298.6 s because every layer's forced operands are
+now verified against the checkpoint before the forced launches, and the harness-reader byte total
+rises from 15,826,461,120 B to 20,338,614,720 B for the same 2,661 distinct tensors because the
+shared reader counts the provenance re-reads. Totals unchanged: 306 of 720 tensor-row comparisons at
+or under the frozen bars, 414 over; first over-bar row 1; free-running `ffn_out` max abs up to
+7.957832e2, forced up to 5.397832e2; 17 of 40 layers flip [0, 1, 2, 4, 5, 8, 10, 11, 15, 16, 17, 19,
+20, 23, 24, 35, 36]; audit 95,819 planned / 2,673 read / 93,146 unread, all classified; 80/80 K5,
+640/640 kernel-vs-reference and 160/160 routed-combine checks exact, zero warnings.
+
+**Attribution correction and the verdict refinement.** The old reading "free max-abs minus forced
+max-abs = -9.560585e-4 = -0.44%, so the flip is not dominant" subtracted two maxima taken at
+different indices and is withdrawn. The measurements are pointwise and separate: on row 0 the flip's
+pointwise max abs is 3.750000e-1 at index 5071 (signed -3.750000e-1), 4,853/5,120 points differ; the
+two host deltas are free 2.150760e-1 (max at index 1233) and forced 2.160320e-1 (max at index 5071).
+The difference of the two host-error maxima is a change in max error, not the flip's max-abs
+contribution; at the free max-error index 1233 the flip contributes 2.500000e-1, 116.24% of the
+2.150760e-1 host error there, so that max-error point is flip-dominated and forcing the host routing
+does not reduce the max host error. The 40-layer run also measured a legitimate zero-effect flip:
+at layer 36 the ordered ids differ in slot 5 (device 186, host 150) but the two independently
+computed routed-combine references are bit-identical, so the bf16 output cannot move - the routed
+bytes are identical, the pointwise flip is 0.000000e0 (0/5,120 points differ), and both host deltas
+are 1.932627e2 at index 2455. The original B2 verdict rule (a flip must give a nonzero routed
+difference) aborted here, so it is refined to take the two references as evidence:
+`forced_control_verdict` now allows ids-differ + bytes-identical only when the two references are
+bit-identical, keeps the hard copy abort when the references differ, adds a separate abort when the
+references are bit-identical but the bytes differ (a launch that does not reproduce its own
+reference), and leaves the identical-ids rules unchanged. Operand provenance is untouched. B2's own
+row-0 case is unchanged (its references differ, so the copy mutation still aborts), and the CPU suite
+(`b2_harness_offline`, 14 tests) covers the allowed zero-effect flip, the copy abort, the
+broken-launch abort and the identical-ids cases. The pre-refinement attempt
+(`phase1-c-stage9-40rows-harness5-20261018T045752Z.log`, 259,368 B, sha256 `5b8da864...`, exit 1,
+no pair written) is kept as the historical record of the L36 case. The earlier Stage-C evidence
+(`phase1-c-stage9-40rows-final-20261018T023529Z.log`, binary `f5430527...`, its smoke log and its
+diff log) stays on disk as historical evidence and is no longer cited. Criterion 1 is NOT closed by
+this column: it is the Phase-1 health-check measurement, and the format-faithful exactness run is the
+one after Phase 2 (task-3).

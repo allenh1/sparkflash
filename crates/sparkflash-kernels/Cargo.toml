@@ -29,3 +29,13 @@ default = []
 # build means choosing a version feature (cuda-12090 matches the 12.9 toolkit this repo probes
 # with) in the root Cargo.toml, which is outside this crate.
 cuda = ["dep:cudarc"]
+
+[dev-dependencies]
+# Only examples/m7_layer0.rs --stage 9 uses these. The 40-layer chain is the one harness that needs
+# the released Engram seam: the hash layout and the paged table read are engine code, and
+# duplicating them in the kernels crate would put a second copy of the released arithmetic next to
+# the one the host pair was produced with. sha2 hashes the two determinism blobs; the harness does
+# not otherwise hash anything. Neither edge creates a cycle: the engine crate depends on no other
+# workspace crate.
+sparkflash-engine = { path = "../sparkflash-engine" }
+sha2 = { workspace = true }
