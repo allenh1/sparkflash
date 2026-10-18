@@ -46,7 +46,7 @@ section 12.1, and the class line in row 1 describes a predictor the current code
 | :--- | :--- | :--- | :--- | ---: |
 | 1. mHC | `mega_mhc_fused_bf16_sm121` | Internal consistency against the in-crate f32 reference on real layer-0 bytes; **not model fidelity** (at the time the predictor was the project's stream-mean fold, retired by B0/D22; current code
 consumes the release's `[24, n*d]` projection on both sides). The released class (D22: `hc_attn_base` and `hc_attn_scale` consumed, `C` compared raw, released split-Sinkhorn) is what the current code prints and what the second-window re-run measured. | **20,480/20,480 bit-exact**; scales **160/160**; **4/4 tokens PASS** on the released-arithmetic cubin (second window); kernel time **not re-measured**, p50 0.0227 ms is the pre-released-arithmetic figure | < 1 MiB |
-| 2. Attention | `flash_mla_csa2_sm121` | Tolerance 99.5 % exact, abs delta at most 1.6e-2; **sink included on both sides** (task-36 closed: the kernel takes a `[64]` f32 argument, the reference is `mla_ref::attention_with_sink`); candidates harness-supplied; indexer outputs not compared. | **163,838/163,840 = 99.9988 % exact, max abs delta 9.765625e-4, max ULP 1** (second window); timing **5.73 ms** is the first-window number, re-measure owed | **4.2 MiB** |
+| 2. Attention | `flash_mla_csa2_sm121` | Tolerance 99.5 % exact, abs delta at most 1.6e-2; **sink included on both sides** (task-36 closed: the kernel takes a `[64]` f32 argument, the reference is `mla_ref::attention_with_sink`); candidates harness-supplied; indexer outputs not compared. | **163,838/163,840 = 99.9988 % exact, max abs delta 9.765625e-4, max ULP 1** (second window, measured on the pre-D8 stage-1 chain; the merged-chain number is max abs 2.4414063e-4, recorded in section 12.1); timing **5.73 ms** is the first-window number, re-measure owed | **4.2 MiB** |
 | 3. MoE combine | `b12x_mxfp4_moe_sm121` | Tolerance 99.9 % exact, at most 2 bf16 codes; **router on the host seam**; gate/up, SwiGLU, quantiser host; 8/32/64 resident experts. | **20,480/20,480 exact, max ULP 0**; **0.821 / 0.847 / 0.850 ms per token** over four chained launches | 100–802 MB |
 
 The arithmetic that follows is **extrapolation, not a measurement**: 0.0227 + 5.73 + 0.85 is about
@@ -62,12 +62,13 @@ Two secondary results belong here because later phases rely on them:
   geometry (2,048 blocks), not by the 128-candidate window, so it does not shrink on shorter
   prompts: it is the first target of section 6 and the reason a 264 ms/token figure is not a
   "the rest is fine" figure.
-- **Kernel builds are reproducible.** Five of the six nvcc entries in
-  [kernel_baseline.txt](../../crates/sparkflash-kernels/baseline/kernel_baseline.txt) reproduce
-  byte-identically under the pinned toolkit `V13.0.88`; the sixth is `flash_mla_csa2_sm121`, whose
-  `__syncthreads` fix in `!26` moves the cubin from 32,608 to 32,624 bytes (and its sha256), and the
-  seventh kernel (`swiglu_mxfp8_quant_sm121`, 22,088 B) has no baseline entry yet. Recording both is
-  task-43 and a Phase 0 exit.
+- **Kernel builds are reproducible.** The committed baseline has seven entries, all re-pinned under
+  the pinned toolkit `V13.0.88`: the D8 update moved `mega_mhc_sm121` to 70,312 B and
+  `swiglu_mxfp8_quant_sm121` to 21,776 B (sha256 `4dbef63b...`), and this task-3 branch moves
+  `flash_mla_csa2_sm121` to 44,080 B (sha256 `bbb216b7...`) while the other five entries stay
+  byte-identical. (History: the `!26` `__syncthreads` fix had moved flash_mla from 32,608 to
+  32,624 B before the engine window format changed its source again.) The D8 and task-3 rows below
+  record the measured diffs; future kernel changes are task-43 and a Phase 0 exit item.
 
 ### 1.2 What the stages do not establish
 
@@ -281,23 +282,25 @@ pin), the harness's "not consumed" line is gone, and
 also takes `hc_attn_scale` into the kernel, which closes roadmap-section-10 unknown 1 on the same
 path.
 
-### 3.4 task-43 — the baseline does not know the seventh kernel, and the flash_mla fix is unreviewable
+### 3.4 task-43 — the baseline did not know the seventh kernel, and the flash_mla fix was unreviewable
 
-**What is wrong.** `!26` changes `flash_mla_csa2_sm121.cu` (one `__syncthreads` fix) and adds
-`swiglu_mxfp8_quant_sm121.cu`. The baseline in
-[kernel_baseline.txt](../../crates/sparkflash-kernels/baseline/kernel_baseline.txt) still records the
-pre-fix `flash_mla` cubin and has no entry for the seventh kernel, so
+**What was wrong (historical).** `!26` changed `flash_mla_csa2_sm121.cu` (one `__syncthreads` fix)
+and added `swiglu_mxfp8_quant_sm121.cu`. At that time the baseline in
+[kernel_baseline.txt](../../crates/sparkflash-kernels/baseline/kernel_baseline.txt) still recorded the
+pre-fix `flash_mla` cubin and had no entry for the seventh kernel, so
 [crates/sparkflash-kernels/scripts/check-kernel-baseline.sh](../../crates/sparkflash-kernels/scripts/check-kernel-baseline.sh)
-is red and the CI for `!26` cannot be read as "the kernels are unchanged where they should be". The
-pinned-toolkit result — five of six entries byte-identical, only the fixed kernel moving — is
-exactly the evidence that makes the seventh kernel reviewable; it must be recorded, not inferred.
+was red and the CI for `!26` could not be read as "the kernels are unchanged where they should be".
+The pinned-toolkit result — five of six entries byte-identical, only the fixed kernel moving — was
+exactly the evidence that made the seventh kernel reviewable; it had to be recorded, not inferred.
 
-**What we build.** Regenerate the baseline under the pinned `nvcc V13.0.88` (the image and the script
-are both pinned), record the new `flash_mla` cubin and the seventh kernel's entry, and pin the
-seven-entry file with the seven-kernel check.
+**What was built (task-43 closed by D8).** The baseline was regenerated under the pinned
+`nvcc V13.0.88` (the image and the script are both pinned) and now has seven entries: D8 moved
+`mega_mhc` to 70,312 B and `swiglu` to 21,776 B (sha256 `4dbef63b...`) while five entries stayed
+byte-identical, and this task-3 branch moves `flash_mla` to 44,080 B (sha256 `bbb216b7...`) as the
+single further diff. The baseline header names seven kernels.
 
-**Proven by.** `check-kernel-baseline.sh` green on `!26`, CI green, and the baseline header naming
-seven kernels instead of six.
+**Proven by.** `check-kernel-baseline.sh` green in the `cuda-abi` CI job with seven entries, and the
+kernel-baseline row in section 12.1 records the measured diff.
 
 ### 3.5 The determinism contract we adopt here (adopted as D21)
 
@@ -442,9 +445,16 @@ exactly this reason, and task-36 is the fix, not a caveat.
 **The sink (task-36) is closed.** The reference half is merged (!27, `0374b69`); the kernel half is
 the `[64]` f32 per-head argument on `flash_mla_csa2_sm121`, plus the matching
 `mla_ref::attention_with_sink` call and signature pin. The second device window of 2026-10-17 ran
-stage 2 with it: 5/5 positions PASS, 163,838/163,840 exact (max abs delta 9.765625e-4, max ULP 1),
-and the harness prints that the sink is consumed on both sides — no "sink excluded" line. Phase 1's
-attention path consumes the same argument.
+stage 2 with it: 5/5 positions PASS, 163,838/163,840 exact, max ULP 1 (that window recorded max abs
+delta 9.765625e-4 on the pre-D8 stage-1 chain). After D8 changed the stage-1 activation-quantiser
+chain, the merged-chain numbers were re-measured on 2026-10-18 with a paired diagnostic: the
+merged-head binary with the old 15-parameter kernel (cubin `822df7f8...`) and the task-3 binary
+(cubin `bbb216b7...`) write identical per-position lines, totals 163,838/163,840 exact, max abs
+delta 2.4414063e-4, max ULP 1 (logs `phase1-task3-diag-oldkernel-20261018T060534Z.log` and
+`phase1-task3-diag-newkernel-20261018T060534Z.log`); the 9.765625e-4 number is kept as a historical
+pre-D8 label, not as a current expectation, and the harness prints the position set and that note
+beside the equality line. The harness prints that the sink is consumed on both sides — no "sink
+excluded" line. Phase 1's attention path consumes the same argument.
 
 ### 4.4 What one token proves, and what it does not
 
@@ -655,9 +665,11 @@ too). The retired earlier log (`phase1-c-stage9-40rows-final-...T023529Z.log`, b
 `f5430527...`), its smoke and diff logs stay on disk as historical evidence and are no longer
 cited. **This does not close criterion 1**:
 the health-check class measures attribution and gross mismatch (D4 FP4 window KV; f32 host
-reference with no GEMM quantiser or bf16 writes), and the format-faithful exactness run is task-3
-after Phase 2. Criterion 1's device half now has a running, deterministic, self-auditing column; its
-exactness half is still owed by the later run.
+reference with no GEMM quantiser or bf16 writes). Task-3 has since landed the engine FP8 window
+format on the device path and measured its own column (roadmap section 4.4 and the table row above):
+that column is a format-fidelity tolerance class, not a closure, and the release-faithful exactness
+run still waits for Phase 2. Criterion 1's device half now has a running, deterministic,
+self-auditing column; its exactness half is still owed by the later run.
 
 ### 4.6 Cost of Phase 1
 
@@ -1303,11 +1315,13 @@ merged and the slice documented), and they feed Phase 0/1 rather than being repl
 | Window-KV format attribution (B2) | The same f32 window-KV latent encoded in the device's FP4 E2M1 format and the host's FP8 E4M3 format predicts `attention_out` with max abs 3.13e-1 between the formats on the same latent and the same tail: that is the format's own contribution. The host-format prediction is 1.05e-1 from the host row against the measured 2.57e-1, but it reuses the device's q and attention-tail operands, so it carries upstream device-side differences and is a diagnostic, not a pure format measurement | node0, 2026-10-18 (fifth window) | same log, "D4 attribution check" lines; the device-format prediction's control reproduces the run's `attention_out` exactly; the same-latent `formats_delta` is the attribution and `predicted_host_delta` is only a diagnostic |
 | Router top-6 and its measured effect (B2) | ordered top-6 differs in four slots; expert sets differ by one member (device only 246, host only 236). The corrected forced-routing control re-derives the host row's routing from the host row, builds the forced operands from it and verifies them against the checkpoint before any launch (every rank's w2 slices and every slot's w1/w3-derived activation codes and scales at every rank), requires identical ids with unchanged weights to reproduce identical routed bytes and ties the forced `ffn_out` to the forced routed output, then measures the flip pointwise: max abs |`ffn_out` free - `ffn_out` forced| = 3.750000e-1 at index 5071 (signed -3.750000e-1), 4,853/5,120 points differ; the two host deltas are 2.150760e-1 (free, max at index 1233) and 2.160320e-1 (forced, max at index 5071), and their difference is a change in max error, not a max-abs contribution. The flip is large and the max host-error point is flip-dominated: at index 1233 the flip is 2.500000e-1, 116.24% of the 2.150760e-1 host error there; forcing the host routing does not reduce the max host error | node0, 2026-10-18 (sixth window, pass-5 rerun) | same log, "forced-routing control" lines; the forced path requires identical ids+weights to give bit-identical routed output (else nondeterminism aborts), a flip to give a nonzero difference, and `ffn_out_forced` to be exactly the forced routed bits plus shared output through the free path's combination; both the free-running and forced routed combines are 5,120/5,120 exact against `mxfp4_ref` on the same bytes |
 | Chained 40-layer device column (Stage C) - determinism, format and diff | two chain runs bit-identical on all 18 tensors x 40 rows, both v1 blobs sha256 `fecd813b...`; device manifest byte-identical to the host pair's (`6093c74b...`, 34,767 B; device blob 13,537,920 B); the pair and all 1,520 printed row lines are bit-identical to the earlier Stage-C run's, so the B2-helper adaptation moved verification only; `boundary_diff` control (host vs itself) exits 0 with all 40 rows bit-identical, host-vs-device exits 1 with all 40 rows differing | node0, 2026-10-18 (sixth window) | `m7_layer0 --stage 9 --stage9-layers 40 --stage9-runs 2`, released checkpoint token 0 position 0, 763 launches per chain run; binary sha256 `c1708abc...` (C head rebased onto main `2214fe6`); log `phase1-c-stage9-40rows-harness5b-20261018T050416Z.log` (572,420 B, sha256 `bd0f908e...`), diff log `phase1-c-stage9-diff-20261018T050941Z.log` (sha256 `b86be968...`, diff binary `5ffb11f9...`); pair `stage9-out-r5b/`; the retired `...final-...T023529Z.log` / binary `f5430527...` stay on disk as historical and are no longer cited |
-| Chained 40-layer device column (Stage C) - bar results | Row 0 (Stage-B replay, bars ARE its own deltas: reproduction only) 18/18 at or under; rows 1-39 the independent ones. Totals 306 of 720 tensor-row comparisons at or under the pre-registered bars, 414 over; first over-bar row 1; residual_out max-abs grows 1.41 (row 1) -> 3.03e3 (row 39), post_attention_hidden -> 2.81e3, ffn_out peak 1.44e2; discrete expert flips on 17/40 layers [0, 1, 2, 4, 5, 8, 10, 11, 15, 16, 17, 19, 20, 23, 24, 35, 36], the pointwise free-vs-forced flip and the two separate host deltas printed per layer; L36 is the zero-effect flip (references bit-identical, pointwise flip 0.0, host deltas 1.932627e2 both) | node0, 2026-10-18 (sixth window) | log `phase1-c-stage9-40rows-harness5b-20261018T050416Z.log`, row lines and "run 0 summary"/"run 0 routing" lines (all 1,520 row lines bit-identical to the earlier run's); bars are frozen B2 deltas of record (`phase1-b2-stage7-layer0-rereview5-20261018T044122Z.log` lines 149-166, binary `2b518a35...`, 23,897 B, local sha256 `c2de544c...`), stream tensors times row+1; `AT-BAR-PRECISION` class for the frozen log's 7-digit constants; the earlier "free minus forced = flip contribution" reading is withdrawn |
+| Chained 40-layer device column (Stage C) - bar results | Row 0 (Stage-B replay, bars ARE its own deltas: reproduction only) 18/18 at or under; rows 1-39 the independent ones. Totals 306 of 720 tensor-row comparisons at or under the pre-registered bars, 414 over; first over-bar row 1; residual_out max-abs grows 1.41 (row 1) -> 3.03e3 (row 39), post_attention_hidden -> 2.81e3, ffn_out 1.44e2 at row 20 (column max 7.957832e2 at row 24); discrete expert flips on 17/40 layers [0, 1, 2, 4, 5, 8, 10, 11, 15, 16, 17, 19, 20, 23, 24, 35, 36], the pointwise free-vs-forced flip and the two separate host deltas printed per layer; L36 is the zero-effect flip (references bit-identical, pointwise flip 0.0, host deltas 1.932627e2 both) | node0, 2026-10-18 (sixth window) | log `phase1-c-stage9-40rows-harness5b-20261018T050416Z.log`, row lines and "run 0 summary"/"run 0 routing" lines (all 1,520 row lines bit-identical to the earlier run's); bars are frozen B2 deltas of record (`phase1-b2-stage7-layer0-rereview5-20261018T044122Z.log` lines 149-166, binary `2b518a35...`, 23,897 B, local sha256 `c2de544c...`), stream tensors times row+1; `AT-BAR-PRECISION` class for the frozen log's 7-digit constants; the earlier "free minus forced = flip contribution" reading is withdrawn |
 | Chained 40-layer device column (Stage C) - forced-control verdict refinement | ids-differ + routed-bytes-identical is allowed only when the two independently computed routed-combine references are bit-identical; L36 is the measured case (refs identical, pointwise flip 0.0, both host deltas 1.932627e2 at index 2455). A flip whose references differ and whose bytes are identical remains the hard copy abort; references bit-identical with bytes differing aborts as a broken/nondeterministic launch; identical-ids rules unchanged; the operand-provenance verifier is unchanged. B2's row-0 case is unchanged (its references differ, so the copy mutation still aborts) | node0, 2026-10-18 (sixth window) | per-layer forced-control lines of both runs in `phase1-c-stage9-40rows-harness5b-20261018T050416Z.log`; CPU suite `crates/sparkflash-kernels/tests/b2_harness_offline.rs` (14 tests, new allowed/abort cases); the pre-refinement abort log `phase1-c-stage9-40rows-harness5-20261018T045752Z.log` (259,368 B, sha256 `5b8da864...`, exit 1, no pair written) stays on disk as historical evidence |
 | Chained 40-layer device column (Stage C) - audit and internal exactness | plan 95,819 / read 2,673 / unread 93,146, all unread classified (unselected-expert 90,660; DSpark-stage 2,401; text-path 40; indexer 32; compressor 11; head-not-claimed 2), 0 unclassified; 80/80 K5 checks 100% exact, 640/640 kernel-vs-reference checks exact, 160/160 routed-combine checks exact, zero warnings; 20,338,614,720 B through the harness's own reader (2,661 distinct tensors; the shared reader counts every read, including the forced-operand provenance re-reads) plus the paged Engram reads; wall 298.6 s, MemAvailable min 122,285,404 kB | node0, 2026-10-18 (sixth window) | log `phase1-c-stage9-40rows-harness5b-20261018T050416Z.log`, audit and per-kernel reference lines; the S7 seam is degenerate at position 0, so compressor/indexer are read differently from the host path (stated in the audit note); the earlier run's 15,826,461,120 B is superseded |
 | mHC kernel time | p50 0.0227 ms/launch | node0, 2026-10-17 (first window) | pre-released-arithmetic kernel; **timing re-measure owed** |
-| Attention outputs | 163,838/163,840 = 99.9988 % exact, max abs delta 9.765625e-4, max ULP 1 | node0, 2026-10-17 (second window) | `--stage 2 --tokens 130`; **sink consumed on both sides** (kernel argument + `attention_with_sink`) |
+| Attention outputs (FP4 latent window format) | 163,838/163,840 = 99.9988 % exact, max abs delta 2.4414063e-4, max ULP 1 - the merged-chain measurement; the earlier 9.765625e-4 was the pre-D8 stage-1 chain and is a historical label only | node0, 2026-10-18 (paired diagnostic after D8) | `--stage 2 --tokens 130 --stage2-kv-format fp4`; merged-head binary `c1708abc...` with the old 15-parameter kernel and cubin `822df7f8...` versus task-3 binary `487ac623...`/cubin `bbb216b7...`: every query-position/attention-out/verdict line identical (pairing logs `phase1-task3-diag-oldkernel-20261018T060534Z.log` 9,122 B sha256 `ef554d46...` and `phase1-task3-diag-newkernel-20261018T060534Z.log` 10,242 B sha256 `061eb529...`; that pairing predates the launch-ABI fix); equality re-run on the final ABI-fixed binary `14e0266f...` in `phase1-task3-abi-stage2-fp4-a/-b` (11,647 B each, sha256 `4613aac5...`/`b455cc57...`, PASS); **sink consumed on both sides** (kernel argument + `attention_with_sink`) |
+| Attention outputs (engine FP8 window format, task-3) | 163,834/163,840 = 99.9963 % exact, max abs delta 9.765625e-4, max ULP 1; P0/P1/P127/P128 are 32,768/32,768 exact and P129 is 32,762/32,768; declared class 99.5% / 1.6e-2. Internal consistency in the engine's released window format: both sides consume bf16(E4M3 code x E8M0 scale); the engine's quantiser and `m4_quant::act_quant_fp8_row` agree byte-for-byte on 130/130 rows | node0, 2026-10-18 (task-3 window) | `--stage 2 --tokens 130 --stage2-kv-format engine`; out-of-window ids at or past `window_rows` contribute exactly zero on both sides at every position; ring order pinned oldest -> newest; two device runs per position byte-identical; the ABI-fixed binary `14e0266f...` also prints a host finite-window guard (130 x 512 decoded finite; no 0x7F NaN code or 0x7E x scale-254 overflow pair reaches the kernel) and a non-vacuous out-of-window assertion (3 injected ids verified outside and present); logs `phase1-task3-abi-stage2-engine-a/-b` (14,127 B each, sha256 `3abfdd7d...`/`1577daa2...`); decoded edge cases pinned in `mla_ref::window_decode_covers_every_e4m3_code_and_the_scale_edges`; not a bit-identity claim against the released kernel and the engine reference's f32-dequant seam is named |
+| Launch-ABI fix re-check (stage 7 + stage 9) | stage 7 layer-0 replay: the 18-row measurement table and all 18 `single_layer_delta` lines are bit-identical to the merged B2 log (23,897 B, sha256 `c2de544c...`), headers aside and one updated B2-helper sentence in the forced-control separation line; stage 7 PASS 18/18. Stage 9 smoke (2 layers, 1 run) PASS framing to the last row, 0 FAIL; row 1 `residual_out` max-abs 1.411274 equals the merged Stage-C row-1 number (9 over/below-bar rows are attribution, not a gate) | node0, 2026-10-18 (task-3 ABI-fix window) | both runs from the ABI-fixed binary `14e0266f1f554f1372bf6a1f79f8dde9d0aefe2888a345b5ba30217c294757cc` (the build of head `c520c93`, command `./scripts/build-aarch64.sh --example=m7_layer0` run in `/home/user/wt/task3-window-kv`; the aarch64 hash is path-dependent, and the node copy of the evidence binary hashes to the same `14e0266f...`) and flash cubin `bbb216b7...`; logs `phase1-task3-abi-stage7-b2compare` (24,005 B, sha256 `fb87a5e4...`) and `phase1-task3-abi-stage9-smoke` (26,155 B, sha256 `b14a6036...`); all four flash_mla builder calls and six wrapper call sites are covered by the typed builder and the `m4_abi` source-text pin with its 15-parameter mutation; kernel baseline diff remains the single flash_mla line (44,080 B) |
 | Attention kernel time | 5.73 ms/launch = 4.27 indexer plus 1.46 attention | node0, 2026-10-17 (first window) | event timing over repeats; the sink ABI changes no timing claim, but re-measure is owed |
 | Attention device bytes | 4.2 MiB (`index_key` 4 MiB) | node0, 2026-10-17 | printer from the harness's planned layout |
 | mHC determinism | 4 tokens x 100 launches, every compared byte identical | node0, 2026-10-17 (second window) | `--stage 4 --repeat 100`, released-arithmetic cubin; Phase 0 exit criterion 2 |
@@ -1318,7 +1332,7 @@ merged and the slice documented), and they feed Phase 0/1 rather than being repl
 | Device total memory | 124,610 MiB | node0 | `cuDeviceTotalMem_v2` ([device-path-design.md](device-path-design.md) section 9) |
 | Free memory beside vLLM | 3,115 MB | node0, 2026-10-16 | `doctor --local` |
 | Empty-node MemAvailable | 118.2 GiB at process start | node0, 2026-10-17 | harness floor check |
-| Kernel baseline | seven of seven entries re-pinned; this branch's D8 moves `mega_mhc` to 70,312 B sha256 `e21293e3...` and `swiglu` to 21,776 B sha256 `4dbef63b...`; the other five unchanged (dense, wo_a, mxfp4_moe, flash_mla, cert_lm_head byte-identical) | amd64 container, `nvcc V13.0.88` from the CUDA 13.0.1 devel image `7d2f6a8c2071` (`d8-out/build.log` records `CUDA Version 13.0.1`; the CI `cuda-abi` image is 13.0.3), 2026-10-18 | `regen-kernel-baseline.sh` + `check-kernel-baseline.sh`; regenerated text and diff in `/home/user/phase1-evidence/d8-out/` |
+| Kernel baseline | seven of seven entries re-pinned. The D8 update moved `mega_mhc` to 70,312 B sha256 `e21293e3...` and `swiglu` to 21,776 B sha256 `4dbef63b...`. On this task-3 branch, `flash_mla_csa2_sm121` moves from 36,160 B sha256 `822df7f8...` to 44,080 B sha256 `bbb216b7...` (same pinned toolkit); the other five entries are byte-identical to the D8 baseline. | node0, 2026-10-18 (task-3 branch, `nvcc V13.0.88` sm_121a); D8 numbers from amd64 container `7d2f6a8c2071` | `regen-kernel-baseline.sh` commands re-run on the node for the task-3 branch; the diff is the single flash_mla line; `check-kernel-baseline.sh` is green in the `cuda-abi` CI job |
 | Checkpoint bytes | 510,286,023,000 B, closing exactly | released index | [../architecture/00-overview.md](../architecture/00-overview.md) section 2.4 |
 | KV entry / token / page | 356 B / 890 B / 56,960 B | design plus `tests/layout.rs` | D1, D16 |
 | Per-rank weights (all resident) | about 130.1 GB on a 130.66 GB device | arithmetic, released bytes | section 7.5 |

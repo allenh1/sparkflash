@@ -53,7 +53,7 @@
 //! the candidate list itself, and the merge of the per-block indexer results into one top-512 list.
 //! Those are separate steps, and nothing in this file claims anything about them.
 
-use crate::m4_quant::{fp4_e2m1_decode, fp8_e4m3_decode};
+use crate::m4_quant::{bf16_bits, bf16_value, fp4_e2m1_decode, fp8_e4m3_decode, ue8m0_decode};
 
 /// The MLA latent width. Mirrors SPARK_M4_MLA_LATENT.
 pub const MLA_LATENT: usize = 512;
@@ -272,6 +272,184 @@ fn score_candidate(q: &[f32], kv_fp4: &[u8], kv_scales: &[u8], candidate: u32) -
         score += value * kv_latent(kv_fp4, kv_scales, candidate as usize, index);
     }
     score * MLA_SCORE_SCALE
+}
+
+/// One E8M0 scale per this many window-KV channels (model.py:27, kernel.py:98-124).
+pub const WINDOW_QUANT_BLOCK: usize = 32;
+/// One E8M0 scale byte per `WINDOW_QUANT_BLOCK` channels: sixteen for a 512-wide row.
+pub const WINDOW_SCALE_BYTES: usize = MLA_LATENT / WINDOW_QUANT_BLOCK;
+
+/// One channel of one engine-format window-KV row, dequantised as the engine stores it: the E4M3
+/// code times its 32-channel E8M0 power-of-two scale, in f32, then rounded to bf16.
+///
+/// The bf16 round is the engine's storage: model.py:707 quantises in place with an `inplace=True`
+/// round trip whose output dtype is the input dtype (BF16), so the released window cache holds
+/// `bf16(dequant(code, scale))` and the attention reads those bf16 values. The device kernel applies
+/// the same `__float2bfloat16_rn` round to the decoded value, so both sides consume the same
+/// values; this module does not instead claim the engine's bf16 *arithmetic*, which the engine
+/// reference forward deliberately does not reproduce.
+///
+/// # Panics
+/// Panics if the row or the scale bytes are too short.
+#[must_use]
+pub fn window_kv_value(codes: &[u8], scales: &[u8], row: usize, index: usize) -> f32 {
+    let code = fp8_e4m3_decode(codes[row * MLA_LATENT + index]);
+    let scale = ue8m0_decode(scales[row * WINDOW_SCALE_BYTES + index / WINDOW_QUANT_BLOCK]);
+    bf16_value(bf16_bits(code * scale))
+}
+
+/// Whether one candidate is inside the engine-format window: the ids are row indices into the
+/// window rows the caller supplied, oldest first, so an id at or past `window_rows` is outside and
+/// contributes exactly nothing.
+#[must_use]
+pub fn window_attendable(window_rows: usize, candidate: u32) -> bool {
+    (candidate as usize) < window_rows
+}
+
+/// The window attention output for one head, without a sink.
+///
+/// The query is one head's latent with rope already applied. The window rows are the engine's
+/// window format, oldest first: `window_codes` is [rows][512] E4M3 codes and `window_scales` is
+/// [rows][16] E8M0 bytes. `selected` holds row indices; an id at or past `window_rows` is outside
+/// the window and is skipped in every pass, so its contribution is exactly zero and an all-outside
+/// list gives an all-zero output.
+///
+/// This is the engine-format counterpart of [`attention`]; it shares no decode or attention code with
+/// the FP4 path, which is the point: the device kernel and this reference are two independent
+/// implementations of the same format.
+///
+/// # Panics
+/// Panics if the candidate list is longer than MAX_SELECTED, or the slices are too short for
+/// `window_rows` rows.
+#[must_use]
+pub fn attention_window(
+    q: &[f32],
+    window_codes: &[u8],
+    window_scales: &[u8],
+    window_rows: usize,
+    selected: &[u32],
+) -> Vec<f32> {
+    window_attention_impl(q, window_codes, window_scales, window_rows, selected, None)
+}
+
+/// The engine-format window attention output for one head, with that head's attention sink.
+///
+/// The sink is the same additive denominator logit as in [`attention_with_sink`]: one value added
+/// after the maximum, in the denominator only. An all-outside candidate list therefore yields an
+/// all-zero output even with a sink, because the numerator is empty.
+///
+/// # Panics
+/// Panics if the candidate list is longer than MAX_SELECTED, or the slices are too short for
+/// `window_rows` rows.
+#[must_use]
+pub fn attention_with_sink_window(
+    q: &[f32],
+    window_codes: &[u8],
+    window_scales: &[u8],
+    window_rows: usize,
+    selected: &[u32],
+    sink: f32,
+) -> Vec<f32> {
+    window_attention_impl(
+        q,
+        window_codes,
+        window_scales,
+        window_rows,
+        selected,
+        Some(sink),
+    )
+}
+
+/// The score of one engine-format window candidate: the query against the row's stored bf16 values,
+/// in f32, times the MLA score scale.
+fn score_window_candidate(
+    q: &[f32],
+    window_codes: &[u8],
+    window_scales: &[u8],
+    candidate: u32,
+) -> f32 {
+    let mut score = 0.0f32;
+    for (index, value) in q.iter().enumerate() {
+        score += value * window_kv_value(window_codes, window_scales, candidate as usize, index);
+    }
+    score * MLA_SCORE_SCALE
+}
+
+/// The three-pass window attention, in the same order as the FP4 three passes: candidate maximum,
+/// normalising sum plus the sink term, weighted window-row sum.
+fn window_attention_impl(
+    q: &[f32],
+    window_codes: &[u8],
+    window_scales: &[u8],
+    window_rows: usize,
+    selected: &[u32],
+    sink: Option<f32>,
+) -> Vec<f32> {
+    assert_eq!(q.len(), MLA_LATENT, "the query is one latent wide");
+    assert!(
+        selected.len() <= MAX_SELECTED,
+        "the candidate list is index_topk long"
+    );
+    assert!(
+        window_codes.len() >= window_rows * MLA_LATENT
+            && window_scales.len() >= window_rows * WINDOW_SCALE_BYTES,
+        "the window rows are shorter than the declared row count"
+    );
+
+    // Pass one: the maximum score over the in-window candidates. An out-of-window id is assigned
+    // -FLT_MAX exactly as the kernel assigns it, so it cannot affect the maximum.
+    let mut maximum = f32::NEG_INFINITY;
+    for candidate in selected {
+        if window_attendable(window_rows, *candidate) {
+            let score = score_window_candidate(q, window_codes, window_scales, *candidate);
+            if score > maximum {
+                maximum = score;
+            }
+        }
+    }
+
+    // Pass two: the normalising sum and, when present, the sink's term - added after the maximum,
+    // exactly where the released implementation adds it.
+    let mut weight_sum = 0.0f32;
+    if maximum > f32::NEG_INFINITY {
+        for candidate in selected {
+            if window_attendable(window_rows, *candidate) {
+                weight_sum += (score_window_candidate(q, window_codes, window_scales, *candidate)
+                    - maximum)
+                    .exp();
+            }
+        }
+        if let Some(sink) = sink {
+            weight_sum += (sink - maximum).exp();
+        }
+    }
+
+    // Pass three: the weighted sum of the stored window values. Out-of-window ids are skipped
+    // outright, so their contribution is exactly zero rather than a small weight.
+    let mut out = vec![0.0f32; MLA_LATENT];
+    if maximum > f32::NEG_INFINITY {
+        for candidate in selected {
+            if !window_attendable(window_rows, *candidate) {
+                continue;
+            }
+            let weight = (score_window_candidate(q, window_codes, window_scales, *candidate)
+                - maximum)
+                .exp();
+            for (index, value) in out.iter_mut().enumerate() {
+                *value += weight
+                    * window_kv_value(window_codes, window_scales, *candidate as usize, index);
+            }
+        }
+    }
+    let denominator = if maximum > f32::NEG_INFINITY {
+        weight_sum
+    } else {
+        1.0
+    };
+    for value in out.iter_mut() {
+        *value /= denominator;
+    }
+    out
 }
 
 /// The indexer: for each of the first blocks HSI blocks, the best query/key dot product and the token
@@ -812,5 +990,229 @@ mod tests {
         assert_eq!(index_head_of(1), 0);
         assert_eq!(index_head_of(2), 1);
         assert_eq!(index_head_of(MLA_HEADS - 1), INDEX_HEADS - 1);
+    }
+
+    // ---- engine-format window KV (D4) -------------------------------------------
+
+    /// The engine quantiser and the device-side oracle must produce the same bytes for the same
+    /// row, and the reference must decode those bytes to exactly the bf16 values the engine stores.
+    #[test]
+    fn window_format_bytes_agree_with_the_engine_quantiser() {
+        for seed in 0..8u64 {
+            let row: Vec<f32> = (0..MLA_LATENT)
+                .map(|index| {
+                    let bits = seed
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add((index as u64).wrapping_mul(1_442_695_040_888_963_407))
+                        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+                    (((bits >> 40) & 0xFFFF) as f32 / 65_536.0 - 0.5) * 8.0
+                })
+                .collect();
+            let engine = sparkflash_engine::quant::quantize_activation_fp8(&row)
+                .expect("the row is a whole number of 32-blocks");
+            let (codes, scales) = crate::m4_quant::act_quant_fp8_row(&row);
+            assert_eq!(
+                engine.codes(),
+                codes.as_slice(),
+                "the engine and the device oracle must emit the same E4M3 codes (seed {seed})"
+            );
+            assert_eq!(
+                engine.scales(),
+                scales.as_slice(),
+                "the engine and the device oracle must emit the same E8M0 codes (seed {seed})"
+            );
+            let dequantised = engine.dequantize();
+            for (index, &dequantised_value) in dequantised.iter().enumerate() {
+                let stored = window_kv_value(&codes, &scales, 0, index);
+                let expected = bf16_value(bf16_bits(dequantised_value));
+                assert_eq!(
+                    stored.to_bits(),
+                    expected.to_bits(),
+                    "the reference must consume the engine's bf16 storage (seed {seed}, channel {index})"
+                );
+            }
+        }
+    }
+
+    /// Every one of the 256 E4M3 codes, and the two E8M0 scale extremes, decode exactly as the
+    /// format says.
+    #[test]
+    fn window_decode_covers_every_e4m3_code_and_the_scale_edges() {
+        // One row of all 256 codes, twice, at scale code 127 (2^0).
+        let mut codes = Vec::with_capacity(MLA_LATENT);
+        for _ in 0..2 {
+            codes.extend(0u8..=255u8);
+        }
+        let scales = vec![127u8; WINDOW_SCALE_BYTES];
+        for code in 0u8..=255u8 {
+            let decoded = fp8_e4m3_decode(code);
+            let expected = bf16_value(bf16_bits(decoded));
+            let stored = window_kv_value(&codes, &scales, 0, usize::from(code));
+            if decoded.is_nan() {
+                assert!(stored.is_nan(), "code {code:#04x} must stay NaN");
+            } else {
+                assert_eq!(
+                    stored.to_bits(),
+                    expected.to_bits(),
+                    "code {code:#04x} must decode to the bf16 rounding of its value"
+                );
+            }
+        }
+        // Scale code 0 is 2^-127, scale code 254 is 2^127; both with the E4M3 code for 1.0.
+        let one = crate::m4_quant::fp8_e4m3_encode(1.0);
+        let codes = vec![one; MLA_LATENT];
+        for (scale_code, scale) in [(0u8, 2.0f32.powi(-127)), (254u8, 2.0f32.powi(127))] {
+            let scales = vec![scale_code; WINDOW_SCALE_BYTES];
+            let expected = bf16_value(bf16_bits(scale));
+            let stored = window_kv_value(&codes, &scales, 0, 0);
+            assert_eq!(
+                stored.to_bits(),
+                expected.to_bits(),
+                "scale code {scale_code} must decode to its power of two"
+            );
+            assert_eq!(ue8m0_decode(scale_code), scale);
+        }
+        // Codes the engine quantiser cannot emit, pinned so the decoder's edge behaviour is a
+        // tested contract: 0x7E is +448 and 0x7F is the E4M3 NaN. With scale code 254 (2^127) the
+        // 448 value overflows f32 to +inf, and the NaN code stays a NaN. Real engine rows cannot
+        // contain either (the quantiser clamps to +/-448 and never writes 0x7F), and the stage-2
+        // harness scans the delivered rows for a NaN code or a non-finite decode before launch, so
+        // this test describes the decoder and not reachable device input.
+        let max_code = crate::m4_quant::fp8_e4m3_encode(448.0);
+        assert_eq!(max_code, 0x7E);
+        let mut codes = vec![max_code; MLA_LATENT];
+        let scales = vec![254u8; WINDOW_SCALE_BYTES];
+        let stored = window_kv_value(&codes, &scales, 0, 0);
+        assert!(
+            stored.is_infinite() && stored > 0.0,
+            "448 x 2^127 must overflow to +inf"
+        );
+        codes.fill(0x7F);
+        let stored = window_kv_value(&codes, &scales, 0, 0);
+        assert!(stored.is_nan(), "the E4M3 NaN code must stay NaN");
+    }
+
+    /// An all-zero window row hits the reference's 1e-4 amax floor, so its scale stays finite and
+    /// nonzero and every channel dequantises back to exactly zero (kernel.py:76, 108).
+    #[test]
+    fn a_zero_window_row_hits_the_scale_floor() {
+        let row = vec![0.0f32; MLA_LATENT];
+        let engine = sparkflash_engine::quant::quantize_activation_fp8(&row).expect("whole blocks");
+        let (codes, scales) = crate::m4_quant::act_quant_fp8_row(&row);
+        assert_eq!(engine.codes(), codes.as_slice());
+        assert_eq!(engine.scales(), scales.as_slice());
+        assert!(
+            codes.iter().all(|&code| code == 0),
+            "a zero row is all zero codes"
+        );
+        assert!(
+            scales.iter().all(|&scale| scale == scales[0]) && scales[0] != 0,
+            "every block gets the floor scale, not zero"
+        );
+        assert_eq!(
+            ue8m0_decode(scales[0]),
+            2.0f32.powi(-22),
+            "the 1e-4 floor divided by 448 is 2^-22"
+        );
+        for index in 0..MLA_LATENT {
+            assert_eq!(window_kv_value(&codes, &scales, 0, index), 0.0);
+        }
+    }
+
+    /// The bf16 storage round is idempotent on every bf16 pattern: rounding a value that is already
+    /// bf16 changes nothing, which is what lets the kernel and this reference agree bit for bit on
+    /// the stored values.
+    #[test]
+    fn bf16_storage_round_is_idempotent_for_every_bf16_pattern() {
+        for bits in 0u16..=u16::MAX {
+            let value = bf16_value(bits);
+            assert_eq!(
+                bf16_value(bf16_bits(value)).to_bits(),
+                value.to_bits(),
+                "a bf16 pattern must round to itself"
+            );
+        }
+    }
+
+    /// The engine-format attention against a slow f64 reference, plus the out-of-window rules: an
+    /// id at or past the row count changes nothing, its contribution is exactly zero, and an
+    /// all-outside list gives an all-zero output even with a sink.
+    #[test]
+    fn window_attention_matches_a_slow_f64_reference_and_out_of_window_contributes_nothing() {
+        let q: Vec<f32> = (0..MLA_LATENT)
+            .map(|index| ((index as f32 * 0.017).sin() * 0.75) + ((index % 7) as f32 * 0.01))
+            .collect();
+        let rows = 3usize;
+        let mut codes = Vec::with_capacity(rows * MLA_LATENT);
+        let mut scales = Vec::with_capacity(rows * WINDOW_SCALE_BYTES);
+        for row in 0..rows {
+            let values: Vec<f32> = (0..MLA_LATENT)
+                .map(|index| {
+                    let angle = (row as f32 + 1.0) * 0.31 + index as f32 * 0.023;
+                    (angle.sin() * 2.0) + (index % 5) as f32 * 0.05
+                })
+                .collect();
+            let (row_codes, row_scales) = crate::m4_quant::act_quant_fp8_row(&values);
+            codes.extend_from_slice(&row_codes);
+            scales.extend_from_slice(&row_scales);
+        }
+        let sink = 0.25f32;
+        let in_window = [0u32, 1, 2];
+        let with_out_of_window = [0u32, 1, 2, 3, 7, u32::MAX];
+        let without = attention_with_sink_window(&q, &codes, &scales, rows, &in_window, sink);
+        let with = attention_with_sink_window(&q, &codes, &scales, rows, &with_out_of_window, sink);
+        assert_eq!(
+            without, with,
+            "out-of-window ids must not change the output by even one bit"
+        );
+
+        // The slow f64 reference: the same stored values, the same score scale, the same sink.
+        let mut values = Vec::with_capacity(rows * MLA_LATENT);
+        for row in 0..rows {
+            for index in 0..MLA_LATENT {
+                values.push(f64::from(window_kv_value(&codes, &scales, row, index)));
+            }
+        }
+        let mut scores = Vec::new();
+        for row in 0..rows {
+            let mut score = 0.0f64;
+            for (index, value) in q.iter().enumerate() {
+                score += f64::from(*value) * values[row * MLA_LATENT + index];
+            }
+            scores.push(score * f64::from(MLA_SCORE_SCALE));
+        }
+        let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let mut denominator = (f64::from(sink) - maximum).exp();
+        for score in &scores {
+            denominator += (score - maximum).exp();
+        }
+        let mut expected = vec![0.0f64; MLA_LATENT];
+        for (row, score) in scores.iter().enumerate() {
+            let weight = (score - maximum).exp() / denominator;
+            for index in 0..MLA_LATENT {
+                expected[index] += weight * values[row * MLA_LATENT + index];
+            }
+        }
+        for index in 0..MLA_LATENT {
+            let delta = (f64::from(without[index]) - expected[index]).abs();
+            assert!(
+                delta <= 1e-5,
+                "channel {index}: reference differs from the slow f64 result by {delta:e}"
+            );
+        }
+
+        // An all-outside list is exactly zero, with and without the sink.
+        let all_outside = [3u32, 7, u32::MAX];
+        assert!(
+            attention_with_sink_window(&q, &codes, &scales, rows, &all_outside, sink)
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        assert!(
+            attention_window(&q, &codes, &scales, rows, &all_outside)
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        assert!(window_attendable(rows, 0) && !window_attendable(rows, 3));
     }
 }

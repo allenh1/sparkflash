@@ -643,8 +643,11 @@ so: the device path uses FP4 main/window KV (D4) and bf16/quantised arithmetic w
 reference is f32 with no GEMM activation quantiser and no bf16 writes
 (`crates/sparkflash-engine/src/forward/attention.rs` module docs, "What is deliberately not
 reproduced", items 1-2). The column therefore measures attribution and gross mismatch, layer by
-layer; the format-faithful exactness run is the later one after Phase 2 (task-3: FP8 window KV, then
-release-faithful arithmetic). Criterion 1 is not closed on this run.
+layer; task-3 has since landed the FP8 window-KV device path and measured its engine-format column
+(163,834/163,840 exact, max abs 9.765625e-4, max ULP 1 against the declared 99.5% / 1.6e-2 class;
+section 13.7), which is a format-fidelity class separate from this FP4 health-check column, and the
+release-faithful arithmetic that would close exactness is still Phase 2. Criterion 1 is not closed
+on this run.
 
 The row-0 deltas have two named sources, separated by the B2 attribution check in the same log:
 (1) the window-KV format of D4 - the same f32 latent re-encoded in the device's FP4 E2M1 format and
@@ -836,7 +839,8 @@ ones):
 The reading: the per-layer attention output stays inside its flat 2.565311e-1 bar through row 13
 (first over-bar row 14; 24 of 40 rows over), while the stream tensors compound: residual_out goes
 from 1.41e0 at row 1 to 3.03e3 at row 39, residual_in from 1.82e-1 to 2.61e3 and
-post_attention_hidden from 1.79e-1 to 2.81e3; ffn_out peaks at 1.44e2 at row 20. That is the
+post_attention_hidden from 1.79e-1 to 2.81e3; ffn_out is 1.44e2 at row 20 (the column maximum is
+7.957832e2 at row 24). That is the
 gross-mismatch growth the health-check class predicts; it is reported, not smoothed, and the
 discrete routing events are kept out of the bars.
 
@@ -865,8 +869,8 @@ the B2 numbers: the flip's pointwise max abs is 3.750000e-1 at index 5071 (signe
 flip's max-abs contribution; the pointwise measurement is. At the free max-error index 1233 the flip
 contributes 2.500000e-1, 116.24% of the 2.150760e-1 host error there, so that row-0 max-error point
 is flip-dominated, and forcing the host routing does not reduce the max host error. The earlier
-"free minus forced = -9.560585e-4, so the flip is not dominant" reading was wrong - it subtracted two
-maxima taken at different indices - and is withdrawn.
+reading of the flip as the difference of the two host-error maxima (free minus forced) was wrong -
+it subtracted two maxima taken at different indices - and is withdrawn.
 
 Across the column the free-running `ffn_out` max-abs reaches 7.957832e2 and the forced reaches
 5.397832e2; neither maximum is decomposed into a flip contribution, and the flips are never folded
@@ -909,8 +913,33 @@ its own reference; it is broken or nondeterministic).
 This is the Phase-1 health-check column: the device path uses FP4 main/window KV (D4) and
 bf16/quantised arithmetic where the host reference is f32 with no GEMM activation quantiser and no
 bf16 writes, so the column measures attribution and gross mismatch. **Criterion 1 is NOT closed on
-this run.** The format-faithful exactness run is the later one after Phase 2 (task-3: FP8 window KV,
-then release-faithful arithmetic), and its bars may not be invented to make a row pass. The
+this run.** The format-faithful exactness run is the later one after Phase 2 (release-faithful
+arithmetic), and its bars may not be invented to make a row pass. Task-3 has since landed the first
+half: the window-KV device path now accepts the engine's released FP8 E4M3 + E8M0 window format
+(`--stage2-kv-format engine`), reproduces the engine's bf16 storage round on both sides, and measured
+163,834/163,840 exact (99.9963%), max abs 9.765625e-4, max ULP 1 at positions 0/1/127/128/129 (P0,
+P1, P127 and P128 all 32,768/32,768 exact; P129 32,762/32,768), against the pre-declared 99.5% /
+1.6e-2 class (final logs `phase1-task3-abi-stage2-engine-a/-b`, 14,127 B
+each, sha256 `3abfdd7d...`/`1577daa2...`). That engine-format column is a format-fidelity tolerance class, not the criterion-1
+closure: the engine reference forward still keeps f32 dequant, so its bf16 arithmetic is not
+reproduced. The FP4 default path was re-measured on the merged chain at 163,838/163,840 exact, max
+abs 2.4414063e-4, max ULP 1, with every per-position line identical between the merged-head
+old-kernel binary and the task-3 binary; the equality line is re-run on the final binary in
+`phase1-task3-abi-stage2-fp4-a/-b` (11,647 B each, sha256
+`4613aac5...`/`b455cc57...`, PASS), and the earlier 9.765625e-4 is the pre-D8 chain and is
+labelled historical. The round-2 review fixed the stage-7 and stage-9 K5 sites that still used the
+retired 15-parameter launch array: every flash_mla launch now goes through one typed 19-parameter
+builder (`FlashMlaParams`) and two launch wrappers, pinned by the
+`m4_abi::every_flash_mla_launch_site_uses_the_typed_parameter_builder` source-text test with its
+mutation. The ABI-fixed binary `14e0266f...` (the build of head `c520c93`, command
+`./scripts/build-aarch64.sh --example=m7_layer0` run in `/home/user/wt/task3-window-kv`; the
+aarch64 hash is path-dependent, and the node copy of the evidence binary hashes to the same
+`14e0266f...`) re-ran the stage-7 layer-0 replay (the 18-row measurement table and all 18
+`single_layer_delta` lines are bit-identical to the merged B2 log, headers aside) and the
+stage-9 smoke (2 rows, 1 run: PASS framing, 0 FAIL; row 1 `residual_out` max-abs 1.411274 equals
+the merged Stage-C row-1 number) in logs
+`phase1-task3-abi-stage7-b2compare` (24,005 B, sha256 `fb87a5e4...`) and
+`phase1-task3-abi-stage9-smoke` (26,155 B, sha256 `b14a6036...`). The
 discrete expert flips above are divergence events, not bugs, and they are reported per layer rather
 than folded into a smooth bar. What this run does close is the device half's 40-layer column as a
 deterministic, self-auditing, format-compatible measurement: the same token the host reference

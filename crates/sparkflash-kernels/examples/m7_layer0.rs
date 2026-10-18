@@ -61,17 +61,27 @@
 //! internal consistency of the sink arithmetic, not (yet) a device-vs-release claim - the device
 //! run of this ABI change is the proof. Its input arrives from stage 1, so it shares stage 1's
 //! chain: with B0 the mHC predictor is the released flattened projection on both sides, so no
-//! predictor-fold limitation is inherited any more. The KV rows it feeds both sides are the FP4
-//! main-KV format the kernel and
-//! mla_ref::kv_latent both consume (per-16-channel E4M3 scale of amax/6, E2M1 codes, low nibble
-//! first), quantised here by sparkflash-kv's quantize_main_kv rule from kv_norm(wkv(xhat)) with the
-//! rope tail rotated; the engine's own window path rounds its KV to FP8 instead, so this stage
-//! measures the kernel against the reference over the kernel's KV format, not the engine's path.
+//! predictor-fold limitation is inherited any more. Stage 2 feeds the KV rows in one of two
+//! formats, selected explicitly by --stage2-kv-format (default fp4, the byte-identical historical
+//! path):
+//!
+//!   * fp4: the FP4 main-KV format the kernel and mla_ref::kv_latent both consume
+//!     (per-16-channel E4M3 scale of amax/6, E2M1 codes, low nibble first), quantised by
+//!     sparkflash-kv's quantize_main_kv rule from kv_norm(wkv(xhat)) with the rope tail rotated.
+//!     This is the merged Stage-2 column, and a --tokens 130 run re-asserts its historical totals.
+//!   * engine: the engine's released window format (model.py:700-707, kernel.py:98-124) - bf16
+//!     rows quantised to E4M3 codes with one E8M0 power-of-two scale per 32 channels, with the
+//!     engine's in-place bf16 storage round trip reproduced on both sides. This is a separate
+//!     format-fidelity class, not a bit-identity claim against the released kernel, and it does
+//!     not reproduce the engine's bf16 arithmetic: sparkflash-engine's reference forward keeps
+//!     f32 dequant and that seam is named in the docs.
+//!
 //! The candidate list is supplied by the harness (the top-512 merge over the HSI pool is a separate
 //! pipeline step), and the kernel's indexer outputs are not compared. Run it with --tokens 130: a
 //! prompt at or under the 128-token window never produces an out-of-window candidate, and the
-//! exclusion branch is part of what the stage must exercise. The stage-2 output prints every one of
-//! these labels before its numbers.
+//! exclusion branch is part of what the stage must exercise; in engine mode the harness also
+//! injects ids at and past the supplied row count and asserts their contribution is exactly zero.
+//! The stage-2 output prints every one of these labels before its numbers.
 //!
 //! Stage 3: the MoE, bounded, with the router on the host and labelled as a host seam. The router
 //! semantics reproduced are the engine reference's: scores from gate.weight divided by gate_temp,
@@ -149,7 +159,7 @@ use std::path::{Path, PathBuf};
 use sparkflash_engine::safetensors::SafeTensorsSource;
 use sparkflash_engine::{ModelConfig, TensorPlan, WeightSource};
 use sparkflash_kernels::m4_quant::{
-    E4M3_ELEMENT_EMAX, QUANT_BLOCK, act_quant_fp8_row, fp4_e2m1_encode, fp8_e4m3_decode,
+    E4M3_ELEMENT_EMAX, QUANT_BLOCK, act_quant_fp8_row, bf16_bits, fp4_e2m1_encode, fp8_e4m3_decode,
     fp8_e4m3_encode, ue8m0_decode, ue8m0_from_amax,
 };
 use sparkflash_kernels::mega_mhc_ref::{
@@ -206,6 +216,9 @@ struct Args {
     logits: Option<PathBuf>,
     /// The phase-1 host boundary v1 pair (manifest prefix) for stage 0's row-0 cross-check.
     host_row: Option<PathBuf>,
+    /// Stage 2's KV format: fp4 is the historical kernel FP4 latent path (the default, unchanged),
+    /// engine is the engine's released FP8 E4M3 + E8M0-per-32 window format with bf16 storage.
+    stage2_kv_format: WindowKvFormat,
     /// The kernel's indexer grid.y. Every slice walks a disjoint stripe of the 2,048 HSI blocks,
     /// sixteen blocks per slice; 64 stays the optimum once stage 2 stops running in every slice
     /// (one slice is 0.161 ms at 128 candidates, and 64 is 0.1613 against 0.1813 at 8).
@@ -219,6 +232,50 @@ struct Args {
     /// Stage 9's v1 pair destination: `<dir>/device.manifest` and `<dir>/device.blob` are written
     /// there for examples/boundary_diff.rs to run unchanged.
     stage9_out: Option<PathBuf>,
+}
+
+/// The stage-2 KV format, an explicit selector rather than a sentinel over another argument.
+///
+/// fp4 keeps the historical FP4 E2M1 latent path byte-identical; engine selects the engine's
+/// released window format: one E4M3 code per latent channel, one E8M0 power-of-two scale per 32
+/// channels, and the engine's in-place quantise/dequantise round trip, whose output dtype is BF16
+/// and which therefore stores bf16 values. The launcher validates this value here, before a cubin
+/// is loaded or a launch is built; the kernel's own runtime value guard is a contract-violation
+/// backstop and is not the validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowKvFormat {
+    /// The historical kernel format: E2M1 codes with an E4M3 scale per 16 channels.
+    Fp4,
+    /// The engine's released window format: E4M3 codes with an E8M0 scale per 32 channels.
+    Engine,
+}
+
+impl WindowKvFormat {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "fp4" => Ok(Self::Fp4),
+            "engine" => Ok(Self::Engine),
+            other => Err(format!(
+                "--stage2-kv-format {other}: unsupported. Only fp4 (the historical kernel format) \
+                 and engine (the engine's released FP8 window format) are supported; every other \
+                 value is rejected here, before the kernel can see it."
+            )),
+        }
+    }
+
+    fn kernel_value(self) -> u32 {
+        match self {
+            Self::Fp4 => 0,
+            Self::Engine => 1,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fp4 => "fp4 (historical kernel format)",
+            Self::Engine => "engine (released FP8 window format, bf16 storage)",
+        }
+    }
 }
 
 fn next_value(values: &mut std::vec::IntoIter<String>, flag: &str) -> Result<String, String> {
@@ -242,6 +299,7 @@ fn parse_args() -> Result<Args, String> {
         head_input: None,
         logits: None,
         host_row: None,
+        stage2_kv_format: WindowKvFormat::Fp4,
     };
     let mut values: std::vec::IntoIter<String> =
         std::env::args().skip(1).collect::<Vec<_>>().into_iter();
@@ -292,6 +350,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--host-row" => {
                 args.host_row = Some(PathBuf::from(next_value(&mut values, &flag)?));
+            }
+            "--stage2-kv-format" => {
+                args.stage2_kv_format = WindowKvFormat::parse(&next_value(&mut values, &flag)?)?;
             }
             "--stage9-layers" => {
                 args.stage9_layers = next_value(&mut values, &flag)?
@@ -1464,6 +1525,130 @@ const E2M1_MAX: f32 = 6.0;
 /// The stage-2 pass bar, printed before the numbers that are judged against it.
 const STAGE2_EXACT_BAR: f64 = 99.5;
 const STAGE2_DELTA_BAR: f32 = 1.6e-2;
+/// The engine window format's scale geometry: one E8M0 byte per 32 latent channels (model.py:27).
+const WINDOW_QUANT_BLOCK: usize = 32;
+const WINDOW_SCALE_BYTES: usize = MLA_LATENT / WINDOW_QUANT_BLOCK;
+/// The engine's sliding window is 128 rows, supplied oldest first.
+const WINDOW_ROWS: usize = MLA_SWA_WINDOW as usize;
+/// The merged-chain FP4 numbers on the --tokens 130 plan, re-reported next to the engine column so
+/// that a change to the default path cannot pass unnoticed. These are the numbers the merged
+/// Stage-2 claim records on the chain that contains D8: 163,838/163,840 exact (99.9988%), 2.4414063e-4
+/// max abs delta, one bf16 ULP max. They were defined by the paired diagnostic of 2026-10-18
+/// (phase1-task3-diag-oldkernel-20261018T060534Z.log and ...newkernel...): the merged-head binary
+/// with the old 15-parameter kernel (cubin 822df7f8) and the task-3 binary (cubin bbb216b7) write
+/// identical per-position lines on the same chain, so this constant is the old kernel's own number,
+/// not a value the new path is allowed to drift from. The earlier record's 9.765625e-4 max abs delta
+/// was measured on the pre-D8 stage-1 chain (phase1-b0-stage2-layer0-20261018T010919Z.log); it is
+/// kept only as a historical label and is not expected here.
+const STAGE2_MERGED_CHAIN_EXACT: usize = 163_838;
+const STAGE2_MERGED_CHAIN_TOTAL: usize = 163_840;
+const STAGE2_MERGED_CHAIN_MAX_DELTA: f32 = 2.4414063e-4;
+const STAGE2_MERGED_CHAIN_MAX_ULP: i32 = 1;
+
+/// The flash_mla_csa2_sm121 launch parameters, in the kernel's pinned ABI order. One constructor
+/// owns the order and the fixed-size array; no launch site builds its own argument list, because
+/// Cuda::launch takes a slice and cannot see a stale arity (a 15-element vector would make
+/// cuLaunchKernel read four arguments past the end).
+const FLASH_MLA_PARAM_COUNT: usize = 19;
+/// selected_count is the one field a launch may vary after construction: the out-of-window
+/// injection launches keep every other argument and change only the candidate count.
+const FLASH_MLA_SELECTED_COUNT_INDEX: usize = 15;
+
+/// The flash_mla launch arguments in the kernel's pinned order (see the kernel declaration and
+/// m4_abi::SIGNATURES). Pointers are carried as u64 because that is what cuLaunchKernel's
+/// argument array holds.
+#[derive(Clone, Copy)]
+struct FlashMlaParams([u64; FLASH_MLA_PARAM_COUNT]);
+
+impl FlashMlaParams {
+    fn as_slice(&self) -> &[u64] {
+        &self.0
+    }
+
+    fn with_selected_count(mut self, selected_count: usize) -> Self {
+        self.0[FLASH_MLA_SELECTED_COUNT_INDEX] = selected_count as u64;
+        self
+    }
+}
+
+impl Default for FlashMlaParams {
+    fn default() -> Self {
+        Self([0; FLASH_MLA_PARAM_COUNT])
+    }
+}
+
+/// Builds the flash_mla launch parameters with the kernel's own parameter names. Every launch in
+/// this file (stage-2 indexer self-check, stage-2 attention, stage-7 K5, stage-9 K5) goes through
+/// this constructor and the typed wrappers below; a future kernel signature change fails to compile
+/// at every site instead of leaving one of them on a stale array.
+#[allow(clippy::too_many_arguments)]
+fn flash_mla_params(
+    q: u64,
+    kv_fp4: u64,
+    kv_scales: u64,
+    window_codes: u64,
+    window_scales: u64,
+    window_kv_format: u64,
+    window_rows: u64,
+    selected: u64,
+    index_key: u64,
+    index_query: u64,
+    sink: u64,
+    block_scores: u64,
+    block_best: u64,
+    out: u64,
+    position: u64,
+    selected_count: usize,
+    trace_ring: u64,
+    layer: usize,
+    step_seq: u64,
+) -> FlashMlaParams {
+    FlashMlaParams([
+        q,
+        kv_fp4,
+        kv_scales,
+        window_codes,
+        window_scales,
+        window_kv_format,
+        window_rows,
+        selected,
+        index_key,
+        index_query,
+        sink,
+        block_scores,
+        block_best,
+        out,
+        position,
+        selected_count as u64,
+        trace_ring,
+        layer as u64,
+        step_seq,
+    ])
+}
+
+/// Launches the flash_mla kernel. The only type it accepts is FlashMlaParams, so the pinned
+/// 19-argument order cannot be bypassed at a call site.
+fn flash_mla_launch(
+    cuda: &Cuda,
+    func: CuFunction,
+    grid: (u32, u32, u32),
+    block: (u32, u32, u32),
+    params: &FlashMlaParams,
+) -> Result<(), String> {
+    cuda.launch(func, grid, block, params.as_slice())
+}
+
+/// The repeated-launch timing wrapper for the same typed parameters.
+fn flash_mla_launch_repeated(
+    cuda: &Cuda,
+    func: CuFunction,
+    grid: (u32, u32, u32),
+    block: (u32, u32, u32),
+    params: &FlashMlaParams,
+    repeat: usize,
+) -> Result<(Vec<f64>, f64), String> {
+    cuda.launch_repeated(func, grid, block, params.as_slice(), repeat)
+}
 
 const _: () = assert!(
     MLA_LATENT == 512
@@ -1678,13 +1863,26 @@ fn stage2_selected(position: usize) -> Vec<u32> {
 fn stage2(args: &Args) -> Result<(), String> {
     let kernel = "flash_mla_csa2_sm121";
     let prefix = format!("layers.{}", args.layer);
+    let format = args.stage2_kv_format;
     println!("=== stage 2: {kernel} against mla_ref::attention_with_sink ===");
     println!(
-        "comparison class: TOLERANCE-BASED, not exact. The kernel writes bf16 and evaluates expf on the device; the reference is f32 with the library exponential. The tolerance is named here, before any number it judges: at least {STAGE2_EXACT_BAR}% of the {} outputs bit-identical to the bf16 rounding of the f32 reference, and max abs delta <= {STAGE2_DELTA_BAR:e}. Reason: the score sum, the window predicate, the candidate order, the FP4 decode and the divide are identical by construction on both sides, so the only degrees of freedom are expf against libm exp, the tree reduction of the normalising sum against the serial one, and the bf16 output write itself.",
-        MLA_HEADS * MLA_LATENT
+        "stage-2 KV format: {} (kernel selector {}). fp4 is the merged Stage-2 default and this run must reproduce its historical numbers; engine is the engine's released window-KV format and is reported as a separate class of evidence, never folded into the FP4 claim.",
+        format.label(),
+        format.kernel_value()
     );
     println!(
-        "label: internal consistency of the sink arithmetic, not model fidelity. The attention sink (attn_sink, F32 [64], a per-head additive logit inside the softmax denominator) is CONSUMED ON BOTH SIDES: the kernel takes it as an argument and adds it to the denominator after the maximum, and mla_ref::attention_with_sink does the same. The device run of this ABI change is what turns this into a measured device-vs-reference claim; until that Spark window, the comparison is internal consistency on host inputs."
+        "comparison class: TOLERANCE-BASED, not exact. The kernel writes bf16 and evaluates expf on the device; the reference is f32 with the library exponential. The tolerance is named here, before any number it judges: at least {STAGE2_EXACT_BAR}% of the {} outputs bit-identical to the bf16 rounding of the f32 reference, and max abs delta <= {STAGE2_DELTA_BAR:e}, with the max ULP distance reported. Reason: the score sum, the window predicate, the candidate or row order, the KV decode and the divide are identical by construction on both sides, so the only degrees of freedom are expf against libm exp, the tree reduction of the normalising sum against the serial one, and the bf16 output write itself. {}",
+        MLA_HEADS * MLA_LATENT,
+        match format {
+            WindowKvFormat::Fp4 =>
+                "This run uses the historical FP4 latent format, the same class the merged Stage-2 claim records; its totals must equal that claim exactly.",
+            WindowKvFormat::Engine =>
+                "This run uses the engine window format: the stored values are bf16(dequant(E4M3 code, E8M0 scale)), reproduced on both sides, so this class measures format fidelity. It is not a bit-identity claim against the released kernel, and the engine's bf16 arithmetic is not reproduced: sparkflash-engine's reference forward keeps f32 dequant, and that pre-existing seam is named rather than hidden.",
+        }
+    );
+    println!(
+        "label: internal consistency of the sink arithmetic, not model fidelity. The attention sink (attn_sink, F32 [64], a per-head additive logit inside the softmax denominator) is CONSUMED ON BOTH SIDES: the kernel takes it as an argument and adds it to the denominator after the maximum, and the reference does the same. The class printed above judges the numbers below. This run's format is {}.",
+        format.label()
     );
     println!(
         "inherited limitation from stage 1, printed rather than implied: this stage's input chain starts at stage 1's xhat fp8 codes and scales, which carry stage 1's residual gap - the bf16 write, the tf32-like reductions of the device, and the kernel's per-tile reduction order against the reference's serial arithmetic. The predictor is NOT a gap any more: B0 removed the d-wide fold, both sides consume the release's [24, 20480] projection over the flattened streams, and the coefficient tensors hc_attn_base and hc_attn_scale are consumed on both sides with the kernel's C compared raw."
@@ -1693,9 +1891,15 @@ fn stage2(args: &Args) -> Result<(), String> {
         "layer {}: compress_ratios[0] = 0, so this is NOT a CED layer. The whole attention rule is the 128-token sliding window over at most index_topk 512 candidates. The candidate list is supplied by the harness: the top-512 merge over the HSI pool is a separate pipeline step the kernel does not implement. The HSI indexer inside the kernel is checked separately at the top of this stage on deterministic non-zero index data, against mla_ref::index_block_best, because stage 2 never consumes its block_scores/block_best; this stage's own boundary is the attention output.",
         args.layer
     );
-    println!(
-        "KV row format: the rows fed to BOTH sides are the FP4 main-KV format the kernel and mla_ref::kv_latent both consume, quantised here by sparkflash-kv's quantize_main_kv rule (per-16 E4M3 scale of amax/6, E2M1 codes, low nibble first) from kv_norm(wkv(xhat)) with the rope tail rotated. The engine's own window path rounds its KV to FP8 instead, so this stage measures the kernel against the reference over the kernel's KV format, not the engine's window path."
-    );
+    if format == WindowKvFormat::Fp4 {
+        println!(
+            "KV row format: the rows fed to BOTH sides are the FP4 main-KV format the kernel and mla_ref::kv_latent both consume, quantised here by sparkflash-kv's quantize_main_kv rule (per-16 E4M3 scale of amax/6, E2M1 codes, low nibble first) from kv_norm(wkv(xhat)) with the rope tail rotated. The engine's released window path rounds its KV to FP8 instead, so this run measures the kernel against the reference over the kernel's KV format, not the engine's window path; the engine format is a separate run (--stage2-kv-format engine)."
+        );
+    } else {
+        println!(
+            "KV row format: the engine's released window format (model.py:700-707, kernel.py:98-124). Each kv_norm(wkv(xhat)) row is rounded to bf16 - the engine's storage dtype, because its in-place act_quant returns the input dtype - then quantised into E4M3 codes with one E8M0 power-of-two scale per 32 channels. Both the kernel and mla_ref::attention_with_sink_window decode code times scale and round the decoded value to bf16, so the bf16 storage round is consumed on both sides. The device bytes are the engine crate's own quantiser and are asserted byte-identical to m4_quant::act_quant_fp8_row on the same bf16 rows. sparkflash-engine's own reference forward keeps f32 dequant, so the engine's bf16 arithmetic is not reproduced here; that seam is named, not hidden."
+        );
+    }
     check_floor(args, "stage 2 start")?;
 
     let mut snap = Snapshot::open(&args.checkpoint)?;
@@ -1778,6 +1982,11 @@ fn stage2(args: &Args) -> Result<(), String> {
     let mut xhat: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(tokens);
     let mut kv_fp4: Vec<u8> = Vec::with_capacity(tokens * KV_PACKED_BYTES);
     let mut kv_scales: Vec<u8> = Vec::with_capacity(tokens * KV_SCALE_BYTES);
+    // Engine window format rows, one per token: [tokens][512] E4M3 codes and [tokens][16] E8M0
+    // scales. The kernel is handed the contiguous slice for one query position, oldest first.
+    let mut window_codes: Vec<u8> = Vec::new();
+    let mut window_scales: Vec<u8> = Vec::new();
+    let mut window_quantiser_agreements = 0usize;
     for token in 0..tokens {
         let row = snap.read_row_bf16("embed.weight", token, HIDDEN)?;
         let mut x = Vec::with_capacity(HC_MULT * HIDDEN);
@@ -1820,23 +2029,84 @@ fn stage2(args: &Args) -> Result<(), String> {
         let (packed, row_scales) = quantize_kv_row(&latent);
         kv_fp4.extend_from_slice(&packed);
         kv_scales.extend_from_slice(&row_scales);
+        if format == WindowKvFormat::Engine {
+            let bf16_row: Vec<f32> = latent
+                .iter()
+                .map(|value| half::bf16::from_bits(bf16_bits(*value)).to_f32())
+                .collect();
+            let engine_row = sparkflash_engine::quant::quantize_activation_fp8(&bf16_row)
+                .map_err(|error| format!("token {token}: engine window quantiser: {error}"))?;
+            let (oracle_codes, oracle_scales) = act_quant_fp8_row(&bf16_row);
+            if engine_row.codes() != oracle_codes.as_slice()
+                || engine_row.scales() != oracle_scales.as_slice()
+            {
+                return Err(format!(
+                    "token {token}: the engine window quantiser and m4_quant::act_quant_fp8_row disagree on the same bf16 row; the format oracle is not the engine's rule"
+                ));
+            }
+            window_quantiser_agreements += 1;
+            window_codes.extend_from_slice(engine_row.codes());
+            window_scales.extend_from_slice(engine_row.scales());
+        }
         xhat.push((codes.as_slice().to_vec(), scales.as_slice().to_vec()));
         let _ = ledger;
     }
-    println!(
-        "input chain: {tokens} xhat fp8 rows from the mHC reference -> wkv {} B weight -> kv_norm -> rope tail -> FP4; kv_fp4 {} B, kv_scales {} B",
-        wkv_weight.len(),
-        kv_fp4.len(),
-        kv_scales.len()
-    );
+    if format == WindowKvFormat::Fp4 {
+        println!(
+            "input chain (FP4): {tokens} xhat fp8 rows from the mHC reference -> wkv {} B weight -> kv_norm -> rope tail -> FP4; kv_fp4 {} B, kv_scales {} B",
+            wkv_weight.len(),
+            kv_fp4.len(),
+            kv_scales.len()
+        );
+    } else {
+        println!(
+            "input chain (engine): {tokens} xhat fp8 rows from the mHC reference -> wkv {} B weight -> kv_norm -> rope tail -> bf16 storage -> E4M3 + E8M0; window_codes {} B, window_scales {} B",
+            wkv_weight.len(),
+            window_codes.len(),
+            window_scales.len()
+        );
+        println!(
+            "engine window format: {tokens} rows rounded to bf16 then quantised by sparkflash_engine::quant::quantize_activation_fp8; {window_quantiser_agreements}/{tokens} rows byte-identical to m4_quant::act_quant_fp8_row (E4M3 codes and E8M0 scales, asserted not averaged)"
+        );
+        if window_quantiser_agreements != tokens {
+            return Err("the engine window quantiser and the m4_quant oracle disagree".to_string());
+        }
+        // The engine quantiser clamps to +/-448 and never emits the E4M3 NaN code 0x7F, so a NaN
+        // code or an overflowing decode (for example 0x7E with scale code 254) is unreachable from
+        // real engine rows. The decoder still has a documented edge behaviour (mla_ref and the CUDA
+        // helper both produce NaN/inf for those codes); this guard keeps such bytes from reaching
+        // the kernel silently, where they would poison the attention output.
+        let nan_codes = window_codes.iter().filter(|code| **code == 0x7F).count();
+        let mut non_finite = 0usize;
+        for row in 0..tokens {
+            for index in 0..MLA_LATENT {
+                if !mla_ref::window_kv_value(&window_codes, &window_scales, row, index).is_finite()
+                {
+                    non_finite += 1;
+                }
+            }
+        }
+        if nan_codes != 0 || non_finite != 0 {
+            return Err(format!(
+                "engine window decode is not finite: {nan_codes} E4M3 NaN codes (0x7F) and {non_finite} non-finite decoded values in {tokens} rows; the engine quantiser cannot emit these, so refuse the launch instead of letting the kernel compute on them"
+            ));
+        }
+        println!(
+            "engine window guard: {tokens} rows x {MLA_LATENT} channels decoded finite; no E4M3 NaN code (0x7F) and no overflowing (0x7E x scale 254) pair reached the kernel"
+        );
+    }
 
     // The device buffers are sized once and admitted against the memory floor before allocation.
     let index_key_bytes = MLA_HSI_BLOCKS * MLA_HSI_BLOCK_TOKENS * MLA_INDEX_HEAD_DIM * 2;
     let index_query_bytes = MLA_HEADS * MLA_INDEX_HEAD_DIM * 2;
     let out_bytes = MLA_HEADS * MLA_LATENT * 2;
+    let window_codes_bytes = WINDOW_ROWS * MLA_LATENT;
+    let window_scales_bytes = WINDOW_ROWS * WINDOW_SCALE_BYTES;
     let planned = (MLA_HEADS * MLA_LATENT * 2
         + tokens * KV_PACKED_BYTES
         + tokens * KV_SCALE_BYTES
+        + window_codes_bytes
+        + window_scales_bytes
         + MLA_MAX_SELECTED * 4
         + index_key_bytes
         + index_query_bytes
@@ -1859,6 +2129,8 @@ fn stage2(args: &Args) -> Result<(), String> {
     let sink_d = cuda.alloc(MLA_HEADS * 4, &mut allocated)?;
     let kv_fp4_d = cuda.alloc(tokens * KV_PACKED_BYTES, &mut allocated)?;
     let kv_scales_d = cuda.alloc(tokens * KV_SCALE_BYTES, &mut allocated)?;
+    let window_codes_d = cuda.alloc(window_codes_bytes, &mut allocated)?;
+    let window_scales_d = cuda.alloc(window_scales_bytes, &mut allocated)?;
     let selected_d = cuda.alloc(MLA_MAX_SELECTED * 4, &mut allocated)?;
     let index_key_d = cuda.alloc(index_key_bytes, &mut allocated)?;
     let index_query_d = cuda.alloc(index_query_bytes, &mut allocated)?;
@@ -1931,10 +2203,14 @@ fn stage2(args: &Args) -> Result<(), String> {
     // every dot product is exact in f32, and compares the two heads of index head 0 - the pair
     // that splits the pool in the kernel - against mla_ref::index_block_best. Blocks the kernel
     // does not write keep their sentinel, so partial coverage fails rather than passing silently.
-    let index_check_params: [u64; 15] = [
+    let index_check_params = flash_mla_params(
         q_d.0,
         kv_fp4_d.0,
         kv_scales_d.0,
+        window_codes_d.0,
+        window_scales_d.0,
+        WindowKvFormat::Fp4.kernel_value() as u64,
+        0, // window_rows is a plain count: the indexer's launch carries none
         selected_d.0,
         index_key_d.0,
         index_query_d.0,
@@ -1942,14 +2218,20 @@ fn stage2(args: &Args) -> Result<(), String> {
         block_scores_d.0,
         block_best_d.0,
         out_d.0,
-        0,
-        0,
-        0,
-        args.layer as u64,
-        0,
-    ];
+        0, // position
+        0, // selected_count
+        0, // trace_ring: the kernel is built without -DSPARKFLASH_ENABLE_GPU_TRACE
+        args.layer,
+        0, // step_seq
+    );
     check_floor(args, "indexer check pre-launch")?;
-    cuda.launch(func, (2u32, args.grid_y, 1u32), block, &index_check_params)?;
+    flash_mla_launch(
+        &cuda,
+        func,
+        (2u32, args.grid_y, 1u32),
+        block,
+        &index_check_params,
+    )?;
     check_floor(args, "indexer check post-launch")?;
     let mut index_scores_bytes = vec![0u8; MLA_HSI_BLOCKS * 4];
     let mut index_best_bytes = vec![0u8; MLA_HSI_BLOCKS * 4];
@@ -1993,7 +2275,11 @@ fn stage2(args: &Args) -> Result<(), String> {
     );
 
     let mut verdicts: Vec<(String, bool)> = Vec::new();
-    let mut last_params: [u64; 15] = [0; 15];
+    let mut last_params = FlashMlaParams::default();
+    let mut total_exact = 0usize;
+    let mut total_len = 0usize;
+    let mut aggregate_max_delta = 0.0f32;
+    let mut aggregate_max_ulp = 0i32;
     for (step, &position) in positions.iter().enumerate() {
         let (codes, scales) = &xhat[position];
         let q_latent_bits = mxfp8_ref::dense_gemm(
@@ -2040,18 +2326,76 @@ fn stage2(args: &Args) -> Result<(), String> {
             .iter()
             .map(|bits| half::bf16::from_bits(*bits).to_f32())
             .collect();
-        let selected = stage2_selected(position);
-        let in_window = selected
-            .iter()
-            .filter(|candidate| mla_ref::in_window(position as u32, **candidate))
-            .count();
+
+        // The engine window rows for this query position: the last min(position + 1, 128)
+        // positions, oldest first. Row r is position first + r, so the newest row is always the
+        // query position and the oldest rows drop off once the window is full: p=127 has 128 rows
+        // (positions 0..=127, row 0 = position 0); p=128 drops position 0 (rows 1..=128, row 0 =
+        // position 1, row 127 = position 128); p=129 also drops position 1 (rows 2..=129). This is
+        // the engine's order: get_window_topk_idxs returns ascending chunk ids for prefill and
+        // oldest-to-newest ring slot order for decode, which is the same supplied order.
+        let (first, window_row_count) = if format == WindowKvFormat::Engine {
+            let first = position.saturating_sub(WINDOW_ROWS - 1);
+            (first, position - first + 1)
+        } else {
+            (0usize, 0usize)
+        };
+        if format == WindowKvFormat::Engine {
+            // The order is asserted, not assumed: the rows are exactly the last window_row_count
+            // positions, oldest first, and the last row is the query position.
+            if window_row_count != (position + 1).min(WINDOW_ROWS)
+                || first + window_row_count - 1 != position
+            {
+                return Err(format!(
+                    "ring order assertion failed at position {position}: first {first}, rows {window_row_count}"
+                ));
+            }
+            let dropped = if first == 0 {
+                "none".to_string()
+            } else {
+                format!("positions 0..{first}")
+            };
+            println!(
+                "  ring order: {window_row_count} rows supplied oldest -> newest; row r -> position {first} + r (row 0 = position {first}, last row = position {position}); dropped oldest {dropped}; the 128-row window has wrapped: {}",
+                position >= WINDOW_ROWS
+            );
+        }
+        let selected: Vec<u32> = if format == WindowKvFormat::Engine {
+            (0..window_row_count as u32).collect()
+        } else {
+            stage2_selected(position)
+        };
+        let in_window = if format == WindowKvFormat::Engine {
+            selected.len()
+        } else {
+            selected
+                .iter()
+                .filter(|candidate| mla_ref::in_window(position as u32, **candidate))
+                .count()
+        };
 
         cuda.copy_htod(&q_d, &bf16_bits_to_bytes(&q_device))?;
         cuda.copy_htod(&selected_d, &u32s_to_bytes(&selected))?;
-        let params: [u64; 15] = [
+        if format == WindowKvFormat::Engine {
+            let code_start = first * MLA_LATENT;
+            let scale_start = first * WINDOW_SCALE_BYTES;
+            cuda.copy_htod(
+                &window_codes_d,
+                &window_codes[code_start..code_start + window_row_count * MLA_LATENT],
+            )?;
+            cuda.copy_htod(
+                &window_scales_d,
+                &window_scales[scale_start..scale_start + window_row_count * WINDOW_SCALE_BYTES],
+            )?;
+        }
+        let params = flash_mla_params(
             q_d.0,
             kv_fp4_d.0,
             kv_scales_d.0,
+            window_codes_d.0,
+            window_scales_d.0,
+            format.kernel_value() as u64,
+            window_row_count as u64,
             selected_d.0,
             index_key_d.0,
             index_query_d.0,
@@ -2060,43 +2404,82 @@ fn stage2(args: &Args) -> Result<(), String> {
             block_best_d.0,
             out_d.0,
             position as u64,
-            selected.len() as u64,
+            selected.len(),
             0, // trace_ring: null, the kernel is built without -DSPARKFLASH_ENABLE_GPU_TRACE
-            args.layer as u64,
+            args.layer,
             step as u64,
-        ];
+        );
         last_params = params;
-        check_floor(args, &format!("stage 2 position {position} pre-launch"))?;
-        cuda.launch(func, grid, block, &params)?;
-        check_floor(args, &format!("stage 2 position {position} post-launch"))?;
-
+        // Determinism: the same launch on the same inputs runs twice and the two device writes are
+        // compared byte for byte. A mismatch is a hard failure, not a statistic.
         let mut device_out = vec![0u8; out_bytes];
-        cuda.copy_dtoh(&mut device_out, &out_d)?;
+        for run in 0..2usize {
+            check_floor(
+                args,
+                &format!("stage 2 position {position} run {run} pre-launch"),
+            )?;
+            flash_mla_launch(&cuda, func, grid, block, &params)?;
+            check_floor(
+                args,
+                &format!("stage 2 position {position} run {run} post-launch"),
+            )?;
+            let mut run_out = vec![0u8; out_bytes];
+            cuda.copy_dtoh(&mut run_out, &out_d)?;
+            if run == 0 {
+                device_out = run_out;
+            } else if run_out != device_out {
+                return Err(format!(
+                    "stage 2 determinism failed at position {position}: two runs on the same inputs wrote different bytes"
+                ));
+            }
+        }
         let device_bits: Vec<u16> = device_out
             .as_chunks::<2>()
             .0
             .iter()
             .map(|chunk| u16::from_le_bytes(*chunk))
             .collect();
-        let mut reference = Vec::with_capacity(MLA_HEADS * MLA_LATENT);
-        for head in 0..MLA_HEADS {
-            let q_head = &q_used[head * MLA_LATENT..(head + 1) * MLA_LATENT];
-            let head_out = mla_ref::attention_with_sink(
-                q_head,
-                &kv_fp4,
-                &kv_scales,
-                &selected,
-                position as u32,
-                sink[head],
-            );
-            reference.extend_from_slice(&head_out);
-        }
+        let reference_for = |list: &[u32]| -> Vec<f32> {
+            let mut reference = Vec::with_capacity(MLA_HEADS * MLA_LATENT);
+            for head in 0..MLA_HEADS {
+                let q_head = &q_used[head * MLA_LATENT..(head + 1) * MLA_LATENT];
+                let head_out = if format == WindowKvFormat::Engine {
+                    let code_start = first * MLA_LATENT;
+                    let scale_start = first * WINDOW_SCALE_BYTES;
+                    mla_ref::attention_with_sink_window(
+                        q_head,
+                        &window_codes[code_start..code_start + window_row_count * MLA_LATENT],
+                        &window_scales
+                            [scale_start..scale_start + window_row_count * WINDOW_SCALE_BYTES],
+                        window_row_count,
+                        list,
+                        sink[head],
+                    )
+                } else {
+                    mla_ref::attention_with_sink(
+                        q_head,
+                        &kv_fp4,
+                        &kv_scales,
+                        list,
+                        position as u32,
+                        sink[head],
+                    )
+                };
+                reference.extend_from_slice(&head_out);
+            }
+            reference
+        };
+        let reference = reference_for(&selected);
         println!(
             "--- query position {position}: {} candidates, {in_window} in window, {} excluded ---",
             selected.len(),
             selected.len() - in_window
         );
         let (stats, max_ulp) = compare_bf16_ulp("attention out", &device_bits, &reference)?;
+        total_exact += stats.exact;
+        total_len += stats.len;
+        aggregate_max_delta = aggregate_max_delta.max(stats.max_delta);
+        aggregate_max_ulp = aggregate_max_ulp.max(max_ulp);
         let ok = stats.exact_pct() >= STAGE2_EXACT_BAR && stats.max_delta <= STAGE2_DELTA_BAR;
         println!(
             "  position {position} verdict: {} (exact {:.4}% against a {STAGE2_EXACT_BAR}% bar, max abs delta {:e} against a {STAGE2_DELTA_BAR:e} bar, max ULP distance {max_ulp})",
@@ -2109,12 +2492,122 @@ fn stage2(args: &Args) -> Result<(), String> {
             stats.max_delta,
         );
         verdicts.push((format!("position {position}"), ok));
+
+        if format == WindowKvFormat::Engine {
+            // Out-of-window ids in engine mode must contribute exactly zero, not merely be left out
+            // of a list: ids at and past the row count, and u32::MAX, are added to the candidate
+            // list. The device bytes must not change at all, and the reference with the injected
+            // ids must equal the reference without them, bit for bit.
+            let mut injected = selected.clone();
+            let injected_outsiders = [
+                window_row_count as u32,
+                window_row_count as u32 + 17,
+                u32::MAX,
+            ];
+            injected.extend(injected_outsiders);
+            // Non-vacuousness: the ids really are outside the window and really are in the list
+            // handed to the kernel. Without this check an injection that silently dropped the ids
+            // (or admitted them) would compare byte-identical for the wrong reason.
+            if !injected_outsiders
+                .iter()
+                .all(|id| !mla_ref::window_attendable(window_row_count, *id))
+            {
+                return Err(format!(
+                    "out-of-window injection is vacuous at position {position}: an injected id is inside the window"
+                ));
+            }
+            if !injected_outsiders.iter().all(|id| injected.contains(id)) {
+                return Err(format!(
+                    "out-of-window injection is vacuous at position {position}: an injected id is missing from the candidate list"
+                ));
+            }
+            if injected.len() != selected.len() + injected_outsiders.len() {
+                return Err(format!(
+                    "out-of-window injection count changed at position {position}"
+                ));
+            }
+            cuda.copy_htod(&selected_d, &u32s_to_bytes(&injected))?;
+            let injected_params = params.with_selected_count(injected.len());
+            flash_mla_launch(&cuda, func, grid, block, &injected_params)?;
+            let mut injected_out = vec![0u8; out_bytes];
+            cuda.copy_dtoh(&mut injected_out, &out_d)?;
+            let injected_reference = reference_for(&injected);
+            if injected_out != device_out || injected_reference != reference {
+                return Err(format!(
+                    "out-of-window zeroing failed at position {position}: injected ids changed the output or the reference"
+                ));
+            }
+            // An all-outside list is exactly zero on both sides even with the sink in the
+            // denominator: the numerator is empty and the divide is by one. The list is the same
+            // three verified outsiders, and no in-window id may be present.
+            let all_outside = injected_outsiders;
+            if all_outside
+                .iter()
+                .any(|id| mla_ref::window_attendable(window_row_count, *id))
+            {
+                return Err(format!(
+                    "all-outside injection is vacuous at position {position}: the all-outside list contains an in-window id"
+                ));
+            }
+            cuda.copy_htod(&selected_d, &u32s_to_bytes(&all_outside))?;
+            let outside_params = params.with_selected_count(all_outside.len());
+            flash_mla_launch(&cuda, func, grid, block, &outside_params)?;
+            let mut outside_out = vec![0u8; out_bytes];
+            cuda.copy_dtoh(&mut outside_out, &out_d)?;
+            let outside_reference = reference_for(&all_outside);
+            if !outside_out.iter().all(|byte| *byte == 0)
+                || !outside_reference.iter().all(|value| *value == 0.0)
+            {
+                return Err(format!(
+                    "all-out-of-window output is not exactly zero at position {position}"
+                ));
+            }
+            println!(
+                "  out-of-window ids at and past the {window_row_count} rows (plus u32::MAX): {} injected ids verified outside the window and present in the candidate list; device output byte-identical with and without them, reference equal, all-outside output exactly zero on both sides: PASS",
+                injected_outsiders.len()
+            );
+            verdicts.push((format!("position {position} out-of-window zeroing"), true));
+        }
+    }
+    println!(
+        "format {}: totals across {} positions: {total_exact}/{total_len} exact ({:.4}%), max abs delta {:e}, max ULP {aggregate_max_ulp}; determinism: two device runs per position, byte-identical",
+        format.label(),
+        positions.len(),
+        100.0 * total_exact as f64 / total_len as f64,
+        aggregate_max_delta
+    );
+    if format == WindowKvFormat::Fp4 && tokens == 130 {
+        let positions_text = positions
+            .iter()
+            .map(|position| position.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let merged_chain = total_exact == STAGE2_MERGED_CHAIN_EXACT
+            && total_len == STAGE2_MERGED_CHAIN_TOTAL
+            && aggregate_max_delta == STAGE2_MERGED_CHAIN_MAX_DELTA
+            && aggregate_max_ulp == STAGE2_MERGED_CHAIN_MAX_ULP;
+        println!(
+            "merged-chain FP4 equality: {} (positions [{positions_text}]; expected {STAGE2_MERGED_CHAIN_EXACT}/{STAGE2_MERGED_CHAIN_TOTAL} exact, max abs delta {:e}, max ULP {} - the paired merged-head old-kernel diagnostic numbers on this chain; got {total_exact}/{total_len}, {:e}, {aggregate_max_ulp})",
+            if merged_chain { "PASS" } else { "FAIL" },
+            STAGE2_MERGED_CHAIN_MAX_DELTA,
+            STAGE2_MERGED_CHAIN_MAX_ULP,
+            aggregate_max_delta
+        );
+        println!(
+            "historical FP4 note: 9.765625e-4 was the pre-D8 stage-1 chain, measured with the retired B0 binary (phase1-b0-stage2-layer0-20261018T010919Z.log); on the merged chain the merged-head old-kernel binary and this binary write identical per-position lines (phase1-task3-diag-oldkernel-20261018T060534Z.log vs phase1-task3-diag-newkernel-20261018T060534Z.log), so the merged-chain expectation above is that old kernel's own measured number"
+        );
+        if !merged_chain {
+            return Err(
+                "the FP4 default path no longer reproduces the merged-chain Stage-2 numbers (the paired old-kernel diagnostic on the same chain is the reference)"
+                    .to_string(),
+            );
+        }
     }
 
     if args.repeat > 1 {
         check_floor(args, "stage 2 timing pre-launch")?;
         let (mut per_launch, batched_ms) =
-            cuda.launch_repeated(func, grid, block, &last_params, args.repeat)?;
+            flash_mla_launch_repeated(&cuda, func, grid, block, &last_params, args.repeat)?;
         check_floor(args, "stage 2 timing post-launch")?;
         per_launch.sort_by(|a, b| a.partial_cmp(b).expect("event times are finite"));
         let count = per_launch.len();
@@ -2133,6 +2626,8 @@ fn stage2(args: &Args) -> Result<(), String> {
             q_d,
             kv_fp4_d,
             kv_scales_d,
+            window_codes_d,
+            window_scales_d,
             selected_d,
             index_key_d,
             index_query_d,
@@ -2150,7 +2645,7 @@ fn stage2(args: &Args) -> Result<(), String> {
         .collect();
     if failed.is_empty() {
         println!(
-            "stage 2: PASS ({} of {} query positions within the printed tolerance)",
+            "stage 2: PASS ({} of {} printed checks within the declared class: per-position bars plus, for the engine format, the out-of-window zeroing assertions)",
             verdicts.len(),
             verdicts.len()
         );
@@ -5221,10 +5716,14 @@ fn stage7(args: &Args) -> Result<(), String> {
     println!(
         "indexer side channel: zero index data + sentinel outputs; kernel indexer writes ignored, not compared"
     );
-    let params: [u64; 15] = [
+    let params = flash_mla_params(
         q_d.0,
         kv_fp4_d.0,
         kv_scales_d.0,
+        0, // window_codes: the FP4 path carries none
+        0, // window_scales
+        WindowKvFormat::Fp4.kernel_value() as u64,
+        0, // window_rows: FP4 ids are token positions, the window comes from position
         selected_d.0,
         index_key_d.0,
         index_query_d.0,
@@ -5233,13 +5732,14 @@ fn stage7(args: &Args) -> Result<(), String> {
         block_best_d.0,
         attn_out_d.0,
         0, // position
-        selected.len() as u64,
+        selected.len(),
         0, // trace_ring
-        args.layer as u64,
+        args.layer,
         0, // step_seq
-    ];
+    );
     check_floor(args, "stage 7 K5 pre-launch")?;
-    cuda.launch(
+    flash_mla_launch(
+        &cuda,
         mla_func,
         (MLA_HEADS as u32, args.grid_y, 1u32),
         (MLA_THREADS, 1u32, 1u32),
@@ -6379,10 +6879,14 @@ fn stage9_attention_block(
         &block_best_d,
         &u32s_to_bytes(&vec![u32::MAX; MLA_HSI_BLOCKS]),
     )?;
-    let params: [u64; 15] = [
+    let params = flash_mla_params(
         q_d.0,
         kv_fp4_d.0,
         kv_scales_d.0,
+        0, // window_codes: the FP4 path carries none
+        0, // window_scales
+        WindowKvFormat::Fp4.kernel_value() as u64,
+        0, // window_rows: FP4 ids are token positions, the window comes from position
         selected_d.0,
         index_key_d.0,
         index_query_d.0,
@@ -6391,13 +6895,14 @@ fn stage9_attention_block(
         block_best_d.0,
         attn_out_d.0,
         0, // position
-        selected.len() as u64,
+        selected.len(),
         0, // trace_ring
-        layer as u64,
+        layer,
         0, // step_seq
-    ];
+    );
     check_floor(args, &format!("stage 9 layer {layer} K5 pre-launch"))?;
-    cuda.launch(
+    flash_mla_launch(
+        &dev.cuda,
         dev.mla_func,
         (MLA_HEADS as u32, args.grid_y, 1u32),
         (MLA_THREADS, 1u32, 1u32),

@@ -1023,7 +1023,7 @@ const SIGNATURES: [(&str, &str, &str); 6] = [
     (
         "flash_mla_csa2_sm121.cu",
         "flash_mla_csa2_sm121",
-        "const __nv_bfloat16 *__restrict__ q; const uint8_t *__restrict__ kv_fp4; const uint8_t *__restrict__ kv_scales; const uint32_t *__restrict__ selected; const __nv_bfloat16 *__restrict__ index_key; const __nv_bfloat16 *__restrict__ index_query; const float *__restrict__ sink; float *__restrict__ block_scores; uint32_t *__restrict__ block_best; __nv_bfloat16 *__restrict__ out; const uint32_t position; const uint32_t selected_count; GpuTraceRing *__restrict__ trace_ring; const uint32_t layer_id; const uint64_t step_seq",
+        "const __nv_bfloat16 *__restrict__ q; const uint8_t *__restrict__ kv_fp4; const uint8_t *__restrict__ kv_scales; const uint8_t *__restrict__ window_codes; const uint8_t *__restrict__ window_scales; const uint32_t window_kv_format; const uint32_t window_rows; const uint32_t *__restrict__ selected; const __nv_bfloat16 *__restrict__ index_key; const __nv_bfloat16 *__restrict__ index_query; const float *__restrict__ sink; float *__restrict__ block_scores; uint32_t *__restrict__ block_best; __nv_bfloat16 *__restrict__ out; const uint32_t position; const uint32_t selected_count; GpuTraceRing *__restrict__ trace_ring; const uint32_t layer_id; const uint64_t step_seq",
     ),
     (
         "b12x_mxfp8_wo_a_sm121.cu",
@@ -1198,7 +1198,7 @@ const ASSERT_COUNTS: [(&str, usize); 7] = [
     ("mega_mhc_sm121.cu", 6),
     ("b12x_mxfp8_dense_sm121.cu", 6),
     ("b12x_mxfp4_moe_sm121.cu", 10),
-    ("flash_mla_csa2_sm121.cu", 13),
+    ("flash_mla_csa2_sm121.cu", 15),
     ("b12x_mxfp8_wo_a_sm121.cu", 11),
     ("cert_lm_head_sm121.cu", 8),
 ];
@@ -1553,11 +1553,12 @@ fn every_static_assert_in_the_milestone_holds_under_rust_too() {
         }
     }
     assert_eq!(
-        checked, 74,
+        checked, 76,
         "the milestone's static asserts must all be evaluated: 20 in the shared header plus 6, 6, \
-         10, 13, 11 and 8 in the six kernels. The MoE count rose from 7 to 10 with D14, which pins \
-         the FP8 E4M3 activation operand's byte width in the build itself; flash_mla's rose from 11 \
-         to 13 with the warp-level indexer's two geometry asserts"
+         10, 15, 11 and 8 in the six kernels. The MoE count rose from 7 to 10 with D14, which pins \
+         the FP8 E4M3 activation operand's byte width in the build itself; flash_mla's rose from 13 \
+         to 15 with the engine window format's two layout asserts. The format VALUE is not among \
+         them: it is a runtime launch parameter and is guarded at kernel entry instead"
     );
     // Every exception must still exist: a stale entry would quietly widen the rule above.
     for (name, condition) in NON_SPARK_ASSERTIONS {
@@ -1941,6 +1942,44 @@ fn kernels_include_the_common_header_before_using_its_helpers() {
     }
 }
 
+/// Every flash_mla launch site goes through the typed parameter builder and its launch wrappers,
+/// so no site can keep a stale arity or a hand-built argument order. Mutation: the stage-2 main
+/// site is put back on a 15-element array and the pin must reject it.
+#[test]
+fn every_flash_mla_launch_site_uses_the_typed_parameter_builder() {
+    let pin = |source: &str| -> bool {
+        let code = crate::c_decl::strip_comments(source);
+        // Four constructor calls: the stage-2 indexer self-check, the stage-2 attention loop and
+        // the stage-7 and stage-9 K5 launches.
+        let builders = code.matches("= flash_mla_params(").count();
+        // The typed wrapper is the only launch path: one definition plus six call sites (indexer,
+        // stage-2 main, the two injected launches, stage-2 timing, stage-7 K5, stage-9 K5).
+        let launches = code.matches("flash_mla_launch(").count();
+        let timed = code.matches("flash_mla_launch_repeated(").count();
+        builders == 4
+            && launches == 7
+            && timed == 2
+            && !code.contains("[u64; 15]")
+            && !code.contains("cuda.launch(mla_func")
+            && !code.contains("cuda.launch(dev.mla_func")
+    };
+    let source = include_str!("../examples/m7_layer0.rs");
+    assert!(
+        pin(source),
+        "a flash_mla launch site bypasses the typed builder/launch wrapper (expected 4 builder calls and 6 wrapper call sites)"
+    );
+    let stale = source.replacen(
+        "let params = flash_mla_params(",
+        "let params: [u64; 15] = [0; 15];",
+        1,
+    );
+    assert_ne!(stale, source, "the mutation must apply");
+    assert!(
+        !pin(&stale),
+        "a hand-built 15-parameter array is the stale-ABI defect this pin exists for"
+    );
+}
+
 /// Checks that a kernel's observing path executes an acquire fence unconditionally.
 ///
 #[test]
@@ -2121,6 +2160,31 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
     assert!(
         !lm_breaks_ties_by_index(&first_wins),
         "a later entry winning a tie is the defect"
+    );
+
+    // A10: the engine window-KV format is selected by an explicit runtime argument, guarded at
+    // kernel entry, and never inferred from another argument's value. A format VALUE cannot be a
+    // static_assert - static_asserts see compile-time constants, not launch parameters - so the
+    // guard is runtime code and this pin is the source text that proves it exists. The mutation is
+    // the sentinel selector the design rejects: window_rows == 0 cannot express an empty engine
+    // window, and it reads badly in the ABI pin because the row count is not a format.
+    let mla_guards_the_window_format = |source: &str| -> bool {
+        let code = crate::c_decl::strip_comments(source);
+        code.contains("#define SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4 0u")
+            && code.contains("#define SPARK_M4_MLA_WINDOW_KV_FORMAT_ENGINE_FP8 1u")
+            && code.contains("if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_ENGINE_FP8) {")
+            && code.contains("__float2bfloat16_rn(__uint_as_float(0x7FC00000u))")
+            && !code.contains("static_assert(window_kv_format")
+    };
+    assert!(mla_guards_the_window_format(FLASH_MLA_CSA2));
+    let sentinel_format = FLASH_MLA_CSA2.replace(
+        "if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_ENGINE_FP8) {",
+        "if (window_rows == 0u) {",
+    );
+    assert_ne!(sentinel_format, FLASH_MLA_CSA2, "the mutation must apply");
+    assert!(
+        !mla_guards_the_window_format(&sentinel_format),
+        "a row-count sentinel is exactly the format selector this design rejects"
     );
 
     // A6 and A9: the header carries the two scale grids and the row-scale helpers the kernels use,

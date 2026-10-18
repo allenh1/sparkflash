@@ -115,6 +115,33 @@ shard is a contiguous 1/4 slice of rows (the reference slices rows, not heads:
 `convert.py` `".engram.embed." in name` -> `shard_size = (param.size(0) + mp - 1) // mp`).
 The spec's "6 heads per rank" is wrong and is dropped.
 
+**Task-3 extension (2026-10-18): the window-KV format becomes an explicit selector.** The window-KV
+format is a runtime parameter, never a static_assert value: `flash_mla_csa2_sm121` takes
+`window_kv_format` (0 = the FP4 latent format above and the merged Stage-2 default, 1 = the
+engine's released window format), the launcher rejects any other value with a loud documented error
+and the kernel entry poisons the output and returns, and that entry guard is pinned by a source-text
+test. The engine format stores E4M3 codes with one E8M0 power-of-two scale per 32 channels (16 blocks
+per 512-wide row); both the kernel and `mla_ref` decode `code * scale` and round the decoded value
+to bf16, so the engine's in-place bf16 storage round is consumed on both sides.
+`sparkflash-engine`'s reference forward keeps f32 dequant, and that seam is named rather than
+hidden: the column measures format fidelity, not the engine's bf16 arithmetic. Measured
+engine-format column: 163,834/163,840 exact (99.9963%), max abs 9.765625e-4, max ULP 1,
+out-of-window ids exactly zero on both sides, same bytes from the engine quantiser and
+`m4_quant::act_quant_fp8_row` on 130/130 rows. The FP4 default path was re-measured on the merged
+chain at 163,838/163,840 exact, max abs 2.4414063e-4, max ULP 1, identical per-position lines to the
+merged-head old-kernel binary; the 9.765625e-4 in the 2026-10-17 record is the pre-D8 stage-1 chain
+and is kept only as a historical label. Criterion 1's exactness half remains owed: this is internal
+consistency in the engine's format, not model fidelity, and release-faithful arithmetic remains
+Phase 2. The 19-parameter kernel ABI is carried by one typed parameter builder in the harness
+(`FlashMlaParams` / `flash_mla_params`; every launch goes through `flash_mla_launch` or
+`flash_mla_launch_repeated`), pinned by the `m4_abi` source-text test with its 15-parameter
+mutation. Round-2 review found the stage-7 and stage-9 K5 sites still on the retired 15-parameter
+array; after the fix the ABI-fixed binary `14e0266f...` (build of head `c520c93`, command
+`./scripts/build-aarch64.sh --example=m7_layer0` run in `/home/user/wt/task3-window-kv`; the
+aarch64 hash is path-dependent) re-ran both sites on the node (stage-7 measured rows and
+all 18 `single_layer_delta` lines bit-identical to the merged B2 log, stage-9 smoke PASS framing;
+logs `phase1-task3-abi-stage7-b2compare`, `phase1-task3-abi-stage9-smoke`).
+
 ## D5 — `max_seq_len` is an explicit configuration value
 
 **Evidence.** The reference sizes its cache as `4 x 4096` by default and `1 x 64K`
@@ -150,6 +177,18 @@ for it is missing from the checkpoint.
 `SWA_WINDOW_SIZE` tokens — the O(N·L/2) saving is a scheduling property, and
 `sparkflash-kv`'s `plan_request` already models the token counts. Nothing about the weights
 or the numerics changes.
+
+**Phase-2 seam-cleanup note (task-3).** The FP8 activation-quantiser rule exists in three places:
+`crates/sparkflash-engine/src/quant.rs` (the host reference and behavioural owner of the rule),
+`crates/sparkflash-kernels/src/m4_quant.rs` (the device host oracle) and
+`kernels/m4_activation_quant_sm121.cuh` (the CUDA transcription). Current pins are
+`activation_quantiser_equivalence` (engine against the oracle, including inf/NaN/subnormal scale
+codes) and `assert_matches_kernel_header` (the constants). Phase-2 cleanup, recorded here without a
+rule change: name the three owners explicitly in the docs; add one shared deterministic vector
+fixture and extend the equivalence test to full codes and scales (not only scale codes); extend the
+header check so a second CUDA copy cannot drift; and add a node stage-8 act-quant probe against the
+same fixture, because CI has no GPU execution (the CI-only fallback is a pinned source-text
+comparison).
 
 ## D8 — Hash layers are out of scope
 
@@ -1114,9 +1153,9 @@ or under the frozen bars, 414 over; first over-bar row 1; free-running `ffn_out`
 20, 23, 24, 35, 36]; audit 95,819 planned / 2,673 read / 93,146 unread, all classified; 80/80 K5,
 640/640 kernel-vs-reference and 160/160 routed-combine checks exact, zero warnings.
 
-**Attribution correction and the verdict refinement.** The old reading "free max-abs minus forced
-max-abs = -9.560585e-4 = -0.44%, so the flip is not dominant" subtracted two maxima taken at
-different indices and is withdrawn. The measurements are pointwise and separate: on row 0 the flip's
+**Attribution correction and the verdict refinement.** The old reading of the flip as the difference
+of the two host max-abs maxima (free minus forced) subtracted two maxima taken at different indices
+and is withdrawn. The measurements are pointwise and separate: on row 0 the flip's
 pointwise max abs is 3.750000e-1 at index 5071 (signed -3.750000e-1), 4,853/5,120 points differ; the
 two host deltas are free 2.150760e-1 (max at index 1233) and forced 2.160320e-1 (max at index 5071).
 The difference of the two host-error maxima is a change in max error, not the flip's max-abs

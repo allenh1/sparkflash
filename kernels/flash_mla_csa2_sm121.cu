@@ -26,6 +26,13 @@
 //     implementation does (kernel.py:382-383): a sink above the maximum shrinks an output, it
 //     never adds a value to it. This is the same arithmetic as mla_ref::attention_with_sink.
 //
+//   * the kernel reads a second Main-KV format when asked: the engine's released window format
+//     (E4M3 code per channel, E8M0 scale per 32 channels, bf16-storage round trip). The format is
+//     an explicit runtime argument (0 = historical FP4 path, unchanged; 1 = engine window format);
+//     it is validated by the launcher and guarded at kernel entry. The released engine's own bf16
+//     arithmetic is not claimed - the engine reference forward keeps f32 dequant, and that seam is
+//     documented - only the format and its bf16 storage are reproduced.
+//
 // Verification status: executed on node0 (GB10, sm_121a) on 2026-10-17. nvcc 13.0.3
 // compiles it for sm_121a, clang parses it against the stub headers, src/m4_abi.rs pins the
 // signature and geometry, and src/mla_ref.rs defines and tests the numerics (including that the
@@ -89,6 +96,22 @@ __device__ __forceinline__ float spark_mla_warp_sum(float value) {
     return value;
 }
 
+// The engine's released window-KV format (model.py:700-707, kernel.py:98-124): one E4M3 code per
+// latent channel with one E8M0 power-of-two scale per 32 channels, stored after the engine's
+// in-place quantise/dequantise round trip, which returns the input dtype and therefore stores bf16.
+// The format is an explicit launcher argument, never inferred from another argument's value:
+// 0 keeps the historical FP4 latent path byte-identical, 1 reads the engine window arrays, and any
+// other value is rejected by the launcher. The format VALUE cannot be a static_assert because it is
+// a runtime parameter; only the layout constants below are compile-time facts.
+#define SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4 0u
+#define SPARK_M4_MLA_WINDOW_KV_FORMAT_ENGINE_FP8 1u
+#define SPARK_M4_MLA_WINDOW_QUANT_BLOCK 32u
+#define SPARK_M4_MLA_WINDOW_SCALES (SPARK_M4_MLA_LATENT / SPARK_M4_MLA_WINDOW_QUANT_BLOCK)
+static_assert(SPARK_M4_MLA_LATENT % SPARK_M4_MLA_WINDOW_QUANT_BLOCK == 0u,
+              "the engine window row is a whole number of 32-channel scale blocks");
+static_assert(SPARK_M4_MLA_WINDOW_SCALES == 16u,
+              "one E8M0 scale per 32 channels is sixteen bytes for a 512-wide row");
+
 // A position is attendable when it is inside the sliding window behind the query. The predicate
 // is a function of the query position and the candidate id, so the CPU reference can test it
 // directly instead of duplicating the comparison.
@@ -108,10 +131,42 @@ __device__ __forceinline__ float spark_mla_scale(const uint8_t *scales, uint32_t
     return spark_fp8_e4m3_decode(scales[index / SPARK_M4_KV_SCALE_CHANNELS]);
 }
 
+// One latent channel of one engine-format window row: the E4M3 code times its 32-channel E8M0
+// power-of-two scale, in f32, rounded to bf16. The round is load-bearing: the engine's window cache
+// holds bf16(dequant(code, scale)) because model.py:707 quantises in place and returns the input
+// dtype, and this kernel and src/mla_ref.rs both apply the same round so they consume the same
+// stored values.
+__device__ __forceinline__ float spark_mla_load_window_stored(const uint8_t *window_codes,
+                                                              const uint8_t *window_scales,
+                                                              uint32_t row,
+                                                              uint32_t index) {
+    const float code = spark_fp8_e4m3_decode(window_codes[(uint64_t)row * SPARK_M4_MLA_LATENT + index]);
+    const float scale = spark_ue8m0_decode(
+        window_scales[(uint64_t)row * SPARK_M4_MLA_WINDOW_SCALES + index / SPARK_M4_MLA_WINDOW_QUANT_BLOCK]);
+    return __bfloat162float(__float2bfloat16_rn(code * scale));
+}
+
+// Whether one selected id is attendable in the selected format. FP4 candidates are token positions
+// filtered by the sliding-window predicate; engine-format candidates are row indices into the
+// supplied window rows (oldest first), so any id at or past window_rows is out of window and gets
+// the same excluded score, which makes its contribution exactly zero in every pass.
+__device__ __forceinline__ uint32_t spark_mla_attends(uint32_t window_kv_format,
+                                                      uint32_t position,
+                                                      uint32_t candidate,
+                                                      uint32_t window_rows) {
+    return window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4
+               ? spark_mla_in_window(position, candidate)
+               : (candidate < window_rows ? 1u : 0u);
+}
+
 extern "C" __global__ void flash_mla_csa2_sm121(
     const __nv_bfloat16 *__restrict__ q,             // [heads][latent] query, rope already applied
     const uint8_t *__restrict__ kv_fp4,              // [positions][latent/2] packed E2M1 latent
     const uint8_t *__restrict__ kv_scales,           // [positions][latent/16] E4M3 scales
+    const uint8_t *__restrict__ window_codes,        // engine format: [window_rows][latent] E4M3 codes
+    const uint8_t *__restrict__ window_scales,       // engine format: [window_rows][latent/32] E8M0 scales
+    const uint32_t window_kv_format,                 // 0 = historical FP4 latent, 1 = engine FP8 window
+    const uint32_t window_rows,                      // engine format: window rows supplied, oldest first
     const uint32_t *__restrict__ selected,           // [selected_count] candidate position ids
     const __nv_bfloat16 *__restrict__ index_key,     // [hsi_blocks][8][index_head_dim]
     const __nv_bfloat16 *__restrict__ index_query,   // [heads][index_head_dim]
@@ -134,6 +189,19 @@ extern "C" __global__ void flash_mla_csa2_sm121(
     __shared__ float s_scores[SPARK_M4_MLA_MAX_SELECTED];
     __shared__ float s_max;
     __shared__ float s_sum;
+
+    // The format is a runtime value, so it is guarded at run time rather than in a static_assert.
+    // The launcher validates it and refuses any value other than 0 or 1 before launching; if one
+    // ever reaches the kernel, poison out with NaN so the contract violation is visible instead of
+    // a half-formatted read, and return before the trace pair is entered. This path is not a run:
+    // it is here so that no third format can be silently treated as one of the two real ones.
+    if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_ENGINE_FP8) {
+        for (uint32_t i = lane; i < SPARK_M4_MLA_LATENT; i += SPARK_M4_MLA_THREADS) {
+            out[(uint64_t)head * SPARK_M4_MLA_LATENT + i] =
+                __float2bfloat16_rn(__uint_as_float(0x7FC00000u));
+        }
+        return;
+    }
 
     uint64_t t_enter = 0u;
     // The trace is recorded by one block (blockIdx.x == 0, thread 0) and the slice is the extra
@@ -212,10 +280,16 @@ extern "C" __global__ void flash_mla_csa2_sm121(
     for (uint32_t slot = lane; slot < selected_count; slot += SPARK_M4_MLA_THREADS) {
         const uint32_t candidate = selected[slot];
         float score = 0.0f;
-        if (spark_mla_in_window(position, candidate) != 0u) {
+        if (spark_mla_attends(window_kv_format, position, candidate, window_rows) != 0u) {
             for (uint32_t i = 0; i < SPARK_M4_MLA_LATENT; ++i) {
-                const float key = spark_mla_load_latent(kv_fp4 + (uint64_t)candidate * (SPARK_M4_MLA_LATENT / 2u), i) *
-                                  spark_mla_scale(kv_scales + (uint64_t)candidate * (SPARK_M4_MLA_LATENT / SPARK_M4_KV_SCALE_CHANNELS), i);
+                const float key = window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4
+                                      ? spark_mla_load_latent(
+                                            kv_fp4 + (uint64_t)candidate * (SPARK_M4_MLA_LATENT / 2u), i) *
+                                            spark_mla_scale(
+                                                kv_scales + (uint64_t)candidate *
+                                                                (SPARK_M4_MLA_LATENT / SPARK_M4_KV_SCALE_CHANNELS),
+                                                i)
+                                      : spark_mla_load_window_stored(window_codes, window_scales, candidate, i);
                 score += __bfloat162float(q[(uint64_t)head * SPARK_M4_MLA_LATENT + i]) * key;
             }
             // The MLA score scale, 1/sqrt(512) over the latent width. Specification 2.3 fixes the
@@ -223,7 +297,10 @@ extern "C" __global__ void flash_mla_csa2_sm121(
             // src/mla_ref.rs carries the same literal, compared bit for bit by a test there.
             score *= SPARK_M4_MLA_SCORE_SCALE;
         } else {
-            score = -3.402823466e38f; // outside the window: excluded, not merely down-weighted
+            // Outside the format's window: excluded by score, not merely down-weighted. In engine
+            // format an id at or past window_rows gets this exact value too, so its contribution is
+            // exactly zero in pass three; that zeroing is a requirement and is tested by injection.
+            score = -3.402823466e38f;
         }
         s_scores[slot] = score;
     }
@@ -271,9 +348,15 @@ extern "C" __global__ void flash_mla_csa2_sm121(
         float acc = 0.0f;
         for (uint32_t slot = 0; slot < selected_count; ++slot) {
             const uint32_t candidate = selected[slot];
-            if (spark_mla_in_window(position, candidate) != 0u) {
-                const float value = spark_mla_load_latent(kv_fp4 + (uint64_t)candidate * (SPARK_M4_MLA_LATENT / 2u), i) *
-                                    spark_mla_scale(kv_scales + (uint64_t)candidate * (SPARK_M4_MLA_LATENT / SPARK_M4_KV_SCALE_CHANNELS), i);
+            if (spark_mla_attends(window_kv_format, position, candidate, window_rows) != 0u) {
+                const float value = window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4
+                                        ? spark_mla_load_latent(
+                                              kv_fp4 + (uint64_t)candidate * (SPARK_M4_MLA_LATENT / 2u), i) *
+                                              spark_mla_scale(
+                                                  kv_scales + (uint64_t)candidate *
+                                                                  (SPARK_M4_MLA_LATENT / SPARK_M4_KV_SCALE_CHANNELS),
+                                                  i)
+                                        : spark_mla_load_window_stored(window_codes, window_scales, candidate, i);
                 acc += s_scores[slot] * value;
             }
         }
