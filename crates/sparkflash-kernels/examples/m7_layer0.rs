@@ -149,8 +149,9 @@
 //!   m7_layer0 --stage 8 [--cubin-dir out] [--layer N]   (probes: dense, wo_a, swiglu vs in-crate refs)
 //!   m7_layer0 --stage 7 --checkpoint <snapshot dir> --host-row <manifest prefix> [--cubin-dir out]
 //!                                            (B2: the chained layer-0 replay, one token, 18-tensor row diff)
-//!   m7_layer0 --stage 9 --checkpoint <snapshot dir> --host-row <manifest prefix> --stage9-out DIR [--cubin-dir out] [--stage9-layers 40] [--stage9-runs 2]
-//!                                            (Stage C: the 40-row chained device forward, bars from the B2 deltas, v1 pair + determinism)
+//!   m7_layer0 --stage 9 --checkpoint <snapshot dir> --host-row <manifest prefix> --stage9-out DIR [--cubin-dir out] [--stage9-layers 40] [--stage9-runs 2] [--stage9-kv-format fp4|engine]
+//!                                            (Stage C: the 40-row chained device forward, bars from the B2 deltas, v1 pair + determinism;
+//!                                             --stage9-kv-format engine selects the engine's released window-KV format for K5, fp4 is the default)
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -232,6 +233,10 @@ struct Args {
     /// Stage 9's v1 pair destination: `<dir>/device.manifest` and `<dir>/device.blob` are written
     /// there for examples/boundary_diff.rs to run unchanged.
     stage9_out: Option<PathBuf>,
+    /// Stage 9's K5 window-KV format: fp4 keeps the merged health-check column byte-identical;
+    /// engine selects the engine's released window format for each layer's window row (bf16
+    /// storage round, E4M3 codes, one E8M0 scale per 32 channels). Default fp4.
+    stage9_kv_format: WindowKvFormat,
 }
 
 /// The stage-2 KV format, an explicit selector rather than a sentinel over another argument.
@@ -251,14 +256,14 @@ enum WindowKvFormat {
 }
 
 impl WindowKvFormat {
-    fn parse(value: &str) -> Result<Self, String> {
+    fn parse(flag: &str, value: &str) -> Result<Self, String> {
         match value {
             "fp4" => Ok(Self::Fp4),
             "engine" => Ok(Self::Engine),
             other => Err(format!(
-                "--stage2-kv-format {other}: unsupported. Only fp4 (the historical kernel format) \
-                 and engine (the engine's released FP8 window format) are supported; every other \
-                 value is rejected here, before the kernel can see it."
+                "{flag} {other}: unsupported. Only fp4 (the historical kernel format) and engine \
+                 (the engine's released FP8 window format) are supported; every other value is \
+                 rejected here, before the kernel can see it."
             )),
         }
     }
@@ -276,6 +281,80 @@ impl WindowKvFormat {
             Self::Engine => "engine (released FP8 window format, bf16 storage)",
         }
     }
+}
+
+/// One row of the engine's released window-KV format, produced by the one construction path that
+/// stage 2 and stage 9 share.
+struct EngineWindowRow {
+    codes: Vec<u8>,
+    scales: Vec<u8>,
+}
+
+/// The one construction of an engine-format window row, shared by stage 2 and stage 9 so the
+/// storage/quantiser order cannot drift between the two harnesses. The caller has already applied
+/// the layer's rms_norm and rope tail in f32; this function applies the engine's storage-dtype
+/// round (bf16) exactly once, quantises with the engine's released
+/// sparkflash_engine::quant::quantize_activation_fp8, and asserts the result is byte-identical to
+/// m4_quant::act_quant_fp8_row on the same bf16 row. No second bf16 round happens here: the
+/// engine quantiser returns the input dtype, so the bf16 row is the stored row.
+fn engine_window_row(latent: &[f32]) -> Result<EngineWindowRow, String> {
+    let bf16_row: Vec<f32> = latent
+        .iter()
+        .map(|value| half::bf16::from_bits(bf16_bits(*value)).to_f32())
+        .collect();
+    let engine_row = sparkflash_engine::quant::quantize_activation_fp8(&bf16_row)
+        .map_err(|error| format!("engine window quantiser: {error}"))?;
+    let (oracle_codes, oracle_scales) = act_quant_fp8_row(&bf16_row);
+    if engine_row.codes() != oracle_codes.as_slice()
+        || engine_row.scales() != oracle_scales.as_slice()
+    {
+        return Err(
+            "the engine window quantiser and m4_quant::act_quant_fp8_row disagree on the same \
+             bf16 row; the format oracle is not the engine's rule"
+                .to_string(),
+        );
+    }
+    Ok(EngineWindowRow {
+        codes: engine_row.codes().to_vec(),
+        scales: engine_row.scales().to_vec(),
+    })
+}
+
+/// Refuse to hand engine window bytes to the kernel when they decode to a NaN or a non-finite
+/// value. The engine quantiser clamps to +/-448 and never emits the E4M3 NaN code 0x7F, so this
+/// guard turns a corrupt row into a loud failure instead of a poisoned attention output.
+fn assert_engine_window_finite(
+    codes: &[u8],
+    scales: &[u8],
+    rows: usize,
+    context: &str,
+) -> Result<(), String> {
+    let nan_codes = codes.iter().filter(|code| **code == 0x7F).count();
+    let mut non_finite = 0usize;
+    for row in 0..rows {
+        for index in 0..MLA_LATENT {
+            if !mla_ref::window_kv_value(codes, scales, row, index).is_finite() {
+                non_finite += 1;
+            }
+        }
+    }
+    if nan_codes != 0 || non_finite != 0 {
+        return Err(format!(
+            "{context}: engine window decode is not finite: {nan_codes} E4M3 NaN codes (0x7F) and \
+             {non_finite} non-finite decoded values in {rows} rows; the engine quantiser cannot \
+             emit these, so refuse the launch instead of letting the kernel compute on them"
+        ));
+    }
+    Ok(())
+}
+
+/// Per-run engine-window counters for stage 9: rows built by the shared helper, oracle agreements,
+/// and rows that passed the finite-decode guard.
+#[derive(Default)]
+struct EngineWindowStats {
+    rows: usize,
+    quantiser_agreements: usize,
+    guarded_rows: usize,
 }
 
 fn next_value(values: &mut std::vec::IntoIter<String>, flag: &str) -> Result<String, String> {
@@ -296,6 +375,7 @@ fn parse_args() -> Result<Args, String> {
         stage9_layers: 40,
         stage9_runs: 2,
         stage9_out: None,
+        stage9_kv_format: WindowKvFormat::Fp4,
         head_input: None,
         logits: None,
         host_row: None,
@@ -352,7 +432,8 @@ fn parse_args() -> Result<Args, String> {
                 args.host_row = Some(PathBuf::from(next_value(&mut values, &flag)?));
             }
             "--stage2-kv-format" => {
-                args.stage2_kv_format = WindowKvFormat::parse(&next_value(&mut values, &flag)?)?;
+                args.stage2_kv_format =
+                    WindowKvFormat::parse("--stage2-kv-format", &next_value(&mut values, &flag)?)?;
             }
             "--stage9-layers" => {
                 args.stage9_layers = next_value(&mut values, &flag)?
@@ -366,6 +447,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--stage9-out" => {
                 args.stage9_out = Some(PathBuf::from(next_value(&mut values, &flag)?));
+            }
+            "--stage9-kv-format" => {
+                args.stage9_kv_format =
+                    WindowKvFormat::parse("--stage9-kv-format", &next_value(&mut values, &flag)?)?;
             }
             other => return Err(format!("unknown argument {other}")),
         }
@@ -2030,23 +2115,11 @@ fn stage2(args: &Args) -> Result<(), String> {
         kv_fp4.extend_from_slice(&packed);
         kv_scales.extend_from_slice(&row_scales);
         if format == WindowKvFormat::Engine {
-            let bf16_row: Vec<f32> = latent
-                .iter()
-                .map(|value| half::bf16::from_bits(bf16_bits(*value)).to_f32())
-                .collect();
-            let engine_row = sparkflash_engine::quant::quantize_activation_fp8(&bf16_row)
-                .map_err(|error| format!("token {token}: engine window quantiser: {error}"))?;
-            let (oracle_codes, oracle_scales) = act_quant_fp8_row(&bf16_row);
-            if engine_row.codes() != oracle_codes.as_slice()
-                || engine_row.scales() != oracle_scales.as_slice()
-            {
-                return Err(format!(
-                    "token {token}: the engine window quantiser and m4_quant::act_quant_fp8_row disagree on the same bf16 row; the format oracle is not the engine's rule"
-                ));
-            }
+            let engine_row =
+                engine_window_row(&latent).map_err(|error| format!("token {token}: {error}"))?;
             window_quantiser_agreements += 1;
-            window_codes.extend_from_slice(engine_row.codes());
-            window_scales.extend_from_slice(engine_row.scales());
+            window_codes.extend_from_slice(&engine_row.codes);
+            window_scales.extend_from_slice(&engine_row.scales);
         }
         xhat.push((codes.as_slice().to_vec(), scales.as_slice().to_vec()));
         let _ = ledger;
@@ -2071,26 +2144,12 @@ fn stage2(args: &Args) -> Result<(), String> {
         if window_quantiser_agreements != tokens {
             return Err("the engine window quantiser and the m4_quant oracle disagree".to_string());
         }
-        // The engine quantiser clamps to +/-448 and never emits the E4M3 NaN code 0x7F, so a NaN
-        // code or an overflowing decode (for example 0x7E with scale code 254) is unreachable from
-        // real engine rows. The decoder still has a documented edge behaviour (mla_ref and the CUDA
-        // helper both produce NaN/inf for those codes); this guard keeps such bytes from reaching
-        // the kernel silently, where they would poison the attention output.
-        let nan_codes = window_codes.iter().filter(|code| **code == 0x7F).count();
-        let mut non_finite = 0usize;
-        for row in 0..tokens {
-            for index in 0..MLA_LATENT {
-                if !mla_ref::window_kv_value(&window_codes, &window_scales, row, index).is_finite()
-                {
-                    non_finite += 1;
-                }
-            }
-        }
-        if nan_codes != 0 || non_finite != 0 {
-            return Err(format!(
-                "engine window decode is not finite: {nan_codes} E4M3 NaN codes (0x7F) and {non_finite} non-finite decoded values in {tokens} rows; the engine quantiser cannot emit these, so refuse the launch instead of letting the kernel compute on them"
-            ));
-        }
+        assert_engine_window_finite(
+            &window_codes,
+            &window_scales,
+            tokens,
+            "engine window format",
+        )?;
         println!(
             "engine window guard: {tokens} rows x {MLA_LATENT} channels decoded finite; no E4M3 NaN code (0x7F) and no overflowing (0x7E x scale 254) pair reached the kernel"
         );
@@ -6796,6 +6855,7 @@ fn stage9_attention_block(
     w: &Stage9Weights,
     attn_codes: &[u8],
     attn_scales: &[u8],
+    format_stats: &mut EngineWindowStats,
 ) -> Result<Vec<f32>, String> {
     let cuda = &dev.cuda;
     let tag = format!("L{layer:02}");
@@ -6844,6 +6904,27 @@ fn stage9_attention_block(
     rms_norm_row(&mut kv, &w.kv_norm, NORM_EPS);
     rotate_rope_tail(&mut kv, 1, MLA_LATENT, ROPE_HEAD_DIM, ROPE_THETA, 0);
     let (kv_packed, kv_scales_row) = quantize_kv_row(&kv);
+    // The engine-format window row, built by the same helper stage 2 uses: rms_norm and the rope
+    // tail are already applied above, then exactly one bf16 storage round, then the engine's
+    // released quantiser, asserted against m4_quant::act_quant_fp8_row on the same bf16 values.
+    let format = args.stage9_kv_format;
+    let mut window_codes = Vec::new();
+    let mut window_scales = Vec::new();
+    if format == WindowKvFormat::Engine {
+        let engine_row =
+            engine_window_row(&kv).map_err(|error| format!("stage 9 layer {layer}: {error}"))?;
+        assert_engine_window_finite(
+            &engine_row.codes,
+            &engine_row.scales,
+            1,
+            &format!("stage 9 layer {layer}"),
+        )?;
+        format_stats.rows += 1;
+        format_stats.quantiser_agreements += 1;
+        format_stats.guarded_rows += 1;
+        window_codes = engine_row.codes;
+        window_scales = engine_row.scales;
+    }
 
     // K5: the attention kernel, one launch. The candidate list is the single position 0: this is a
     // first prefill step, so the window holds only position 0 and there is no compressed row yet
@@ -6858,6 +6939,16 @@ fn stage9_attention_block(
     let sink_d = cuda.alloc(MLA_HEADS * 4, &mut allocated)?;
     let kv_fp4_d = cuda.alloc(KV_PACKED_BYTES, &mut allocated)?;
     let kv_scales_d = cuda.alloc(KV_SCALE_BYTES, &mut allocated)?;
+    let window_codes_d = if format == WindowKvFormat::Engine {
+        Some(cuda.alloc(MLA_LATENT, &mut allocated)?)
+    } else {
+        None
+    };
+    let window_scales_d = if format == WindowKvFormat::Engine {
+        Some(cuda.alloc(WINDOW_SCALE_BYTES, &mut allocated)?)
+    } else {
+        None
+    };
     let selected_d = cuda.alloc(MLA_MAX_SELECTED * 4, &mut allocated)?;
     let index_key_d = cuda.alloc(index_key_bytes, &mut allocated)?;
     let index_query_d = cuda.alloc(index_query_bytes, &mut allocated)?;
@@ -6868,6 +6959,10 @@ fn stage9_attention_block(
     cuda.copy_htod(&sink_d, &f32_to_bytes(&w.attn_sink))?;
     cuda.copy_htod(&kv_fp4_d, &kv_packed)?;
     cuda.copy_htod(&kv_scales_d, &kv_scales_row)?;
+    if let (Some(codes_d), Some(scales_d)) = (window_codes_d.as_ref(), window_scales_d.as_ref()) {
+        cuda.copy_htod(codes_d, &window_codes)?;
+        cuda.copy_htod(scales_d, &window_scales)?;
+    }
     cuda.copy_htod(&selected_d, &u32s_to_bytes(&selected))?;
     cuda.copy_htod(&index_key_d, &vec![0u8; index_key_bytes])?;
     cuda.copy_htod(&index_query_d, &vec![0u8; index_query_bytes])?;
@@ -6883,10 +6978,15 @@ fn stage9_attention_block(
         q_d.0,
         kv_fp4_d.0,
         kv_scales_d.0,
-        0, // window_codes: the FP4 path carries none
-        0, // window_scales
-        WindowKvFormat::Fp4.kernel_value() as u64,
-        0, // window_rows: FP4 ids are token positions, the window comes from position
+        window_codes_d.as_ref().map_or(0, |buffer| buffer.0),
+        window_scales_d.as_ref().map_or(0, |buffer| buffer.0),
+        format.kernel_value() as u64,
+        // one stored window row per layer in engine mode; FP4 ids are token positions
+        if format == WindowKvFormat::Engine {
+            1
+        } else {
+            0
+        },
         selected_d.0,
         index_key_d.0,
         index_query_d.0,
@@ -6911,7 +7011,7 @@ fn stage9_attention_block(
     check_floor(args, &format!("stage 9 layer {layer} K5 post-launch"))?;
     let mut attn_out_bytes = vec![0u8; out_bytes];
     cuda.copy_dtoh(&mut attn_out_bytes, &attn_out_d)?;
-    cuda.free_buffers(&[
+    let mut free_list: Vec<&Deviceptr> = vec![
         &q_d,
         &sink_d,
         &kv_fp4_d,
@@ -6922,31 +7022,65 @@ fn stage9_attention_block(
         &block_scores_d,
         &block_best_d,
         &attn_out_d,
-    ]);
+    ];
+    if let (Some(codes_d), Some(scales_d)) = (window_codes_d.as_ref(), window_scales_d.as_ref()) {
+        free_list.push(codes_d);
+        free_list.push(scales_d);
+    }
+    cuda.free_buffers(&free_list);
     let _ = allocated;
     let attn_out_bits = bytes_to_u16(&attn_out_bytes);
     let mut reference = Vec::with_capacity(MLA_HEADS * MLA_LATENT);
     for head in 0..MLA_HEADS {
-        let head_out = mla_ref::attention_with_sink(
-            &q_used[head * MLA_LATENT..(head + 1) * MLA_LATENT],
-            &kv_packed,
-            &kv_scales_row,
-            &selected,
-            0,
-            w.attn_sink[head],
-        );
+        let q_head = &q_used[head * MLA_LATENT..(head + 1) * MLA_LATENT];
+        // The reference is format-dispatched exactly like stage 2: engine mode must read the same
+        // window codes/scales with mla_ref::attention_with_sink_window (the engine decode plus
+        // bf16 round), never the FP4 reference with window bytes.
+        let head_out = if format == WindowKvFormat::Engine {
+            mla_ref::attention_with_sink_window(
+                q_head,
+                &window_codes,
+                &window_scales,
+                1,
+                &selected,
+                w.attn_sink[head],
+            )
+        } else {
+            mla_ref::attention_with_sink(
+                q_head,
+                &kv_packed,
+                &kv_scales_row,
+                &selected,
+                0,
+                w.attn_sink[head],
+            )
+        };
         reference.extend_from_slice(&head_out);
     }
     let (attn_stats, attn_ulp) = compare_bf16_ulp(
-        &format!("L{layer:02} K5 attention out (same q/kv/selected/sink)"),
+        &if format == WindowKvFormat::Engine {
+            format!(
+                "L{layer:02} K5 attention out (engine window format, window_rows=1, same bytes)"
+            )
+        } else {
+            format!("L{layer:02} K5 attention out (same q/kv/selected/sink)")
+        },
         &attn_out_bits,
         &reference,
     )?;
-    println!(
-        "  {tag} K5 internal check: {:.4}% exact against mla_ref on the same bytes, max abs delta {:e}, max ULP {attn_ulp}",
-        attn_stats.exact_pct(),
-        attn_stats.max_delta
-    );
+    if format == WindowKvFormat::Engine {
+        println!(
+            "  {tag} K5 internal check (engine window format, window_rows=1, selected=[0]): {:.4}% exact against mla_ref::attention_with_sink_window on the same bytes, max abs delta {:e}, max ULP {attn_ulp}",
+            attn_stats.exact_pct(),
+            attn_stats.max_delta
+        );
+    } else {
+        println!(
+            "  {tag} K5 internal check: {:.4}% exact against mla_ref on the same bytes, max abs delta {:e}, max ULP {attn_ulp}",
+            attn_stats.exact_pct(),
+            attn_stats.max_delta
+        );
+    }
 
     let mut attn_operand = widen_bits(&attn_out_bits);
     rotate_rope_tail_inverse(
@@ -7418,6 +7552,7 @@ fn stage9_chain(
     hashes: &[u32],
     n_rows: usize,
     run_index: usize,
+    format_stats: &mut EngineWindowStats,
 ) -> Result<Stage9Run, String> {
     let mut snap = Snapshot::open(&args.checkpoint)?;
     let mut rows: Vec<Stage9Row> = Vec::with_capacity(n_rows);
@@ -7587,8 +7722,15 @@ fn stage9_chain(
         }
 
         // --- K2-K7: the attention block on the device.
-        let attention_out =
-            stage9_attention_block(args, dev, layer, &weights, &attn_codes, &attn_scales)?;
+        let attention_out = stage9_attention_block(
+            args,
+            dev,
+            layer,
+            &weights,
+            &attn_codes,
+            &attn_scales,
+            format_stats,
+        )?;
         captures.insert("attention_out", RowValue::F32(attention_out.clone()));
 
         // --- K8: the FFN sublayer's mHC pass (applies the attention hc_post).
@@ -7851,18 +7993,30 @@ fn stage9(args: &Args) -> Result<(), String> {
     let engram_layers: Vec<usize> = (0..n_rows)
         .filter(|&layer| cfg.engram_rows(layer).is_some())
         .collect();
-    println!(
-        "scope label: this is the Phase-1 HEALTH-CHECK column, not a criterion-1 closure. The device path uses FP4 main/window KV and bf16/quantised arithmetic where the host reference is f32 with no GEMM activation quantiser, so this column measures attribution and gross mismatch; the format-faithful exactness run is the later one after Phase 2 (task-3), and criterion 1 is NOT closed by this run."
-    );
+    if args.stage9_kv_format == WindowKvFormat::Engine {
+        println!(
+            "scope label: this is the Phase-1 HEALTH-CHECK column with the engine's released window-KV format, not a criterion-1 closure. K5's window row now uses the engine's E4M3 + per-32 E8M0 format with its bf16 storage round, the same format class as the host row's window KV; the main/compressed KV, the rest of the arithmetic and the host reference remain f32/bf16 as before, and sparkflash-engine's reference forward keeps f32 dequant, so criterion 1 is NOT closed by this run."
+        );
+    } else {
+        println!(
+            "scope label: this is the Phase-1 HEALTH-CHECK column, not a criterion-1 closure. The device path uses FP4 main/window KV and bf16/quantised arithmetic where the host reference is f32 with no GEMM activation quantiser, so this column measures attribution and gross mismatch; the format-faithful exactness run is the later one after Phase 2 (task-3), and criterion 1 is NOT closed by this run."
+        );
+    }
     println!(
         "rows: {n_rows} backbone rows requested out of 40, one token (id 0), position 0, no MTP rows (a first step records the backbone only); the emitted v1 pair has one row per layer like the host pair"
     );
     println!(
         "comparison classes: exact-codes for pre_attention_xhat/scales and pre_ffn_xhat/scales (no numeric tolerance), exact-bits (device tolerance) for the other fourteen; the measured class is named before any number it judges"
     );
-    println!(
-        "known differences, stated before the numbers: (1) the attention chain feeds the kernel its Main-KV format, FP4 E2M1 codes with one E4M3 scale per 16 channels, while the host row's window KV is the release's FP8 E4M3 path with a per-32 ue8m0 scale (decision D4); (2) the host reference is f32 throughout and deliberately does not reproduce the device's GEMM activation quantisers or bf16 module outputs; (3) the Engram write at layers 1 and 14 runs on the host seam with the engine's released code, but on the bf16 device stream instead of the host's f32 stream; the device chain's rows after an Engram layer carry that seam's rounding. Every kernel is also checked bit for bit against its in-crate reference on the same bytes, and the two chain runs must be byte-identical, so a kernel or harness non-determinism shows up as a failure, not a delta."
-    );
+    if args.stage9_kv_format == WindowKvFormat::Engine {
+        println!(
+            "known differences, stated before the numbers: (1) the K5 window row uses the engine's released FP8 window format (E4M3 codes, one E8M0 scale per 32 channels, bf16 storage round), the same format class as the host row's window KV; the main/compressed KV remains FP4 E2M1 and is not exercised at position 0, where the only candidate is the stored window row; (2) the host reference is f32 throughout and deliberately does not reproduce the device's GEMM activation quantisers or bf16 module outputs; (3) the Engram write at layers 1 and 14 runs on the host seam with the engine's released code, but on the bf16 device stream instead of the host's f32 stream; the device chain's rows after an Engram layer carry that seam's rounding. Every kernel is also checked bit for bit against its in-crate reference on the same bytes, and the two chain runs must be byte-identical, so a kernel or harness non-determinism shows up as a failure, not a delta."
+        );
+    } else {
+        println!(
+            "known differences, stated before the numbers: (1) the attention chain feeds the kernel its Main-KV format, FP4 E2M1 codes with one E4M3 scale per 16 channels, while the host row's window KV is the release's FP8 E4M3 path with a per-32 ue8m0 scale (decision D4); (2) the host reference is f32 throughout and deliberately does not reproduce the device's GEMM activation quantisers or bf16 module outputs; (3) the Engram write at layers 1 and 14 runs on the host seam with the engine's released code, but on the bf16 device stream instead of the host's f32 stream; the device chain's rows after an Engram layer carry that seam's rounding. Every kernel is also checked bit for bit against its in-crate reference on the same bytes, and the two chain runs must be byte-identical, so a kernel or harness non-determinism shows up as a failure, not a delta."
+        );
+    }
     println!(
         "bars: pre-registration, printed before the numbers they judge (design section 8): bar(row L, T) = single_layer_delta_B2(T) * (L + 1) for the stream-carrying tensors (residual_in, post_attention_hidden, residual_out), and single_layer_delta_B2(T) for the per-layer tensors. single_layer_delta_B2 is the frozen Stage-B measurement of record in /home/user/phase1-evidence/phase1-b2-stage7-layer0-rereview5-20261018T044122Z.log lines 149-166 (binary 2b518a35...); this run does not re-measure it."
     );
@@ -8002,9 +8156,18 @@ fn stage9(args: &Args) -> Result<(), String> {
         "launch count per run: {} device launches = {n_rows} layers x (15 chain launches K1..K15 + 4 forced-routing K9-K12 launches) + 1 final K16 + {extra_k16} K16 before an Engram layer",
         launches
     );
+    if args.stage9_kv_format == WindowKvFormat::Engine {
+        println!(
+            "KV row format (engine): each layer's kv_norm(wkv(layer input)) row -> rope tail -> bf16 storage -> E4M3 codes + one E8M0 scale per 32 channels; the row is built by the same engine_window_row helper stage 2 uses (bf16 storage round exactly once), then dispatched to K5 as window_codes/window_scales with window_kv_format=1 and window_rows=1"
+        );
+        println!(
+            "engine window format: this column IS the format-faithful window-KV column; the bars are the frozen Stage-B compounded bars and this is still the health-check class, not a criterion-1 closure"
+        );
+    }
     check_floor(args, "stage 9 start")?;
     let dev = stage9_device(args)?;
     let mut runs: Vec<Vec<Stage9Row>> = Vec::new();
+    let mut engine_stats = EngineWindowStats::default();
     let mut audit: Option<(Vec<String>, usize, u64)> = None;
     for run_index in 0..args.stage9_runs {
         check_floor(args, &format!("stage 9 run {run_index} start"))?;
@@ -8017,6 +8180,7 @@ fn stage9(args: &Args) -> Result<(), String> {
             &hashes,
             n_rows,
             run_index,
+            &mut engine_stats,
         )?;
         println!(
             "run {run_index} checkpoint reads: {} tensors, {} bytes (measured by the harness's own reader, not a plan estimate)",
@@ -8037,6 +8201,28 @@ fn stage9(args: &Args) -> Result<(), String> {
     } else {
         println!(
             "determinism: NOT CLAIMED - one chain run was requested (--stage9-runs 1), so this run makes no determinism claim"
+        );
+    }
+    if args.stage9_kv_format == WindowKvFormat::Engine {
+        let rows_expected = n_rows * runs.len();
+        if engine_stats.rows != rows_expected
+            || engine_stats.quantiser_agreements != rows_expected
+            || engine_stats.guarded_rows != rows_expected
+        {
+            return Err(format!(
+                "stage 9 engine window format: built {} rows, {} oracle agreements, {} guarded rows; expected {rows_expected} of each",
+                engine_stats.rows, engine_stats.quantiser_agreements, engine_stats.guarded_rows
+            ));
+        }
+        println!(
+            "engine window format summary: {} runs x {} layers = {} rows; {}/{} rows byte-identical to m4_quant::act_quant_fp8_row; finite-decode guard PASS on {}/{} rows",
+            runs.len(),
+            n_rows,
+            rows_expected,
+            engine_stats.quantiser_agreements,
+            rows_expected,
+            engine_stats.guarded_rows,
+            rows_expected
         );
     }
     let (manifest, blob) = stage9_build_v1(first_run)?;

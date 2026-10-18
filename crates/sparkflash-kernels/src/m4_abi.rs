@@ -1980,6 +1980,80 @@ fn every_flash_mla_launch_site_uses_the_typed_parameter_builder() {
     );
 }
 
+/// Stage 2 and stage 9 must build their engine-format window rows with the one shared helper, in
+/// the pinned order: rms_norm + rope tail (caller, f32) -> bf16 storage round exactly once ->
+/// engine quantiser -> assert against m4_quant::act_quant_fp8_row. Stage 9's K5 reference must be
+/// format-dispatched to mla_ref::attention_with_sink_window in engine mode (feeding window bytes to
+/// the FP4 reference is the defect this pins).
+#[test]
+fn stage2_and_stage9_share_one_engine_window_row_builder() {
+    let source = include_str!("../examples/m7_layer0.rs");
+    let code = crate::c_decl::strip_comments(source);
+    // One definition plus exactly two call sites: stage 2's row loop and stage 9's attention block.
+    assert_eq!(
+        code.matches("fn engine_window_row(").count(),
+        1,
+        "the shared engine-row builder must be defined exactly once"
+    );
+    assert_eq!(
+        code.matches("engine_window_row(&").count(),
+        2,
+        "stage 2 and stage 9 must both call the shared engine-row helper; a re-implementation has drifted"
+    );
+    let start = code
+        .find("fn engine_window_row(")
+        .expect("the shared engine-row builder must exist");
+    let body = &code[start..];
+    let body_end = body
+        .find("\n}\n")
+        .expect("the shared engine-row helper has a body terminator");
+    let body = &body[..body_end];
+    let round_at = body
+        .find("half::bf16::from_bits(bf16_bits(")
+        .expect("the helper must apply the bf16 storage round");
+    let quantise_at = body
+        .find("sparkflash_engine::quant::quantize_activation_fp8")
+        .expect("the helper must use the engine's released quantiser");
+    let oracle_at = body
+        .find("act_quant_fp8_row(")
+        .expect("the helper must assert the m4_quant oracle");
+    assert!(
+        round_at < quantise_at && quantise_at < oracle_at,
+        "the shared helper order is pinned: bf16 storage round, then engine quantiser, then the m4_quant oracle"
+    );
+    assert_eq!(
+        body.matches("half::bf16::from_bits(bf16_bits(").count(),
+        1,
+        "the bf16 round must happen exactly once, at the engine's storage dtype boundary"
+    );
+    // Stage 9's engine K5 reference dispatch: engine -> attention_with_sink_window, FP4 -> the
+    // FP4 reference. Both names must be in the attention block and the dispatch must use the
+    // format value, not a constant.
+    let block_start = code
+        .find("fn stage9_attention_block(")
+        .expect("stage 9's attention block must exist");
+    let block_end = code[block_start..]
+        .find("fn stage9_ffn_block(")
+        .expect("the attention block is followed by the FFN block");
+    let block = &code[block_start..block_start + block_end];
+    assert!(
+        block.contains("attention_with_sink_window("),
+        "stage 9 engine mode must check K5 against mla_ref::attention_with_sink_window"
+    );
+    assert!(
+        block.contains("attention_with_sink("),
+        "stage 9 fp4 mode must keep the FP4 reference"
+    );
+    assert!(
+        block.contains("if format == WindowKvFormat::Engine"),
+        "stage 9's K5 reference must be format-dispatched, not hardcoded"
+    );
+    assert!(
+        code.contains("\"--stage9-kv-format\""),
+        "stage 9 must expose --stage9-kv-format"
+    );
+}
+
 /// Checks that a kernel's observing path executes an acquire fence unconditionally.
 ///
 #[test]

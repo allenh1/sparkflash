@@ -953,3 +953,194 @@ unchanged - its references differ, so the copy mutation still aborts - and the C
 flip, the copy abort, the broken-launch abort (references identical but bytes differ) and the
 identical-ids rules, so the refinement is exercised without a device window. The operand-provenance
 verifier is unchanged and still runs before every forced launch.
+
+## 14. The format-faithful Stage-C column (engine window-KV format, measured 2026-10-18)
+
+This is a second 40-layer column of the same token, run with the window KV in the engine's released
+format instead of FP4: `m7_layer0 --stage 9 --stage9-kv-format engine` (the flag defaults to
+`fp4`). It measures how the Stage-C column behaves when K5's window row has the same format class
+as the host row's window KV; it is not a criterion-1 closure (the seam is named in 14.6). The FP4
+column in section 13 is unchanged and was re-measured bit-identical below.
+
+### 14.1 What the engine format changes, and what cannot drift
+
+One window row per layer, built from the layer's KV after the device `wkv` GEMM:
+`kv_norm(wkv(layer input)) -> rope tail -> bf16 storage round -> E4M3 codes + one E8M0 scale per
+32 channels`. The row is built by the same `engine_window_row` helper stage 2 uses: exactly one
+bf16 round at the engine's storage-dtype boundary, then
+`sparkflash_engine::quant::quantize_activation_fp8`, asserted byte-for-byte against
+`m4_quant::act_quant_fp8_row` on the same bf16 values; the finite-decode guard (no `0x7F`, every
+`code*scale` bf16 decode finite) refuses the launch if a row cannot be decoded. The row reaches K5
+through the typed 19-parameter `FlashMlaParams` as `window_codes`/`window_scales` with
+`window_kv_format=1` and `window_rows=1` (`selected=[0]`). Stage 9's K5 internal check is
+format-dispatched exactly like stage 2: engine mode compares against
+`mla_ref::attention_with_sink_window` (the engine decode plus bf16 round), FP4 mode against
+`mla_ref::attention_with_sink` with the FP4 bytes - window bytes are never fed to the FP4
+reference.
+
+The only structural difference between stage 2 and stage 9 is where the pre-norm latent comes from:
+stage 2 computes it with the host `mxfp8_ref` bf16 GEMM, stage 9 with the device K4 bf16 output
+widened to f32. The norm/rope -> bf16-round -> quantise order is one shared function, pinned by
+`m4_abi::stage2_and_stage9_share_one_engine_window_row_builder` (single definition, exactly two
+call sites, the pinned order, exactly one bf16 round, and the stage-9 format dispatch), so the two
+columns cannot silently diverge.
+
+### 14.2 The evidence: argv, binary, logs, and the measured FP4 invariance
+
+Both runs use the same binary, sha256 `cf9b4e90...` (8,639,024 B), built by
+`./scripts/build-aarch64.sh --example=m7_layer0` in `/home/user/wt/task6-stage-c-engine` with
+`CARGO_TARGET_DIR=/home/user/deepseek-v4.1-flash-spark/target`; the node copy
+`/home/user/hostrun/m7_layer0-task6-stage-c` hashes to the same value (the aarch64 hash is
+path-dependent, so the build command and cwd are part of the provenance). Cubins are the merged
+`/home/user/hostrun/task3-cubins-all` set recorded in both log headers as eight
+`cubin_sha256` lines; `flash_mla_csa2_sm121` is `bbb216b7...` (44,080 B), the others are the
+merged shas. No cubin was rebuilt for this column.
+
+| run | log (size / sha256) | UTC | wall | exit | MemAvailable before -> after |
+|---|---|---|---|---|---|
+| FP4 default, 1 chain run | `phase1-task6-stage9-fp4-default` 291,481 B `20673dbe...` | 07:52:51-07:55:31Z | 159.8 s | 0 | 123,441,524 -> 123,042,400 kB |
+| engine, 2 chain runs | `phase1-task6-stage9-engine` 582,759 B `1eb2f577...` | 07:55:37-08:00:37Z | 300.1 s | 0 | 123,160,992 -> 123,238,624 kB |
+
+Both logs were copied back and sha256-verified equal on node and dev host; the wrapper recorded
+argv, binary sha, every cubin sha, UTC and MemAvailable, and the 32 GiB memory floor was met. The
+FP4 default run proves the new flag is additive rather than assumed:
+
+- pair sha256s equal the merged Stage-C pair `stage9-out-r5b`: `device.manifest` 34,767 B
+  `6093c74b...` and `device.blob` 13,537,920 B `fecd813b...`, on both hosts, even though the
+  output directory is the new `task6-stage9-fp4-out` (the merged pair was not overwritten);
+- all 760 row lines of the new log (720 tensor lines + 40 row summaries) are byte-identical to the
+  merged log's run 0, and the tensor-line lists are equal;
+- the host-vs-FP4-new `boundary_diff` output body is byte-identical to the merged Stage-C diff
+  body (728 lines, wrapper section header aside), with the same 40-row verdict and exit 1.
+
+So the new binary and cubin set reproduce the merged column exactly; section 13's numbers are not
+re-judged or replaced, and any difference in 14.4 is the engine format alone.
+
+### 14.3 Determinism, the separate v1 pair, and the three diff verdicts
+
+The engine column writes its own pair in `task6-stage9-engine-out` (never `stage9-out-r5b`):
+`device.manifest` 34,767 B sha256 `6093c74b...` (byte-identical to the host pair's manifest, so
+the writer and the format agree) and `device.blob` 13,537,920 B sha256 `40cadade...`. The two
+runs are bit-identical on all 18 tensors of all 40 rows (`determinism: PASS`), and both runs print
+the same blob sha `40cadade...`. These are health-check columns, so an all-identical pair is not
+expected: all three `boundary_diff` verdicts exit 1, and that is the expected verdict, not a
+regression.
+
+| comparison | verdict body | total differing values | per-row min / max |
+|---|---|---|---|
+| host vs FP4-new | `diff: differs in 40 rows` | 3,360,709 | 65,016 / 86,590 |
+| host vs engine | `diff: differs in 40 rows` | 3,362,675 | 63,631 / 86,530 |
+| FP4-new vs engine | `diff: differs in 40 rows` | 2,688,652 | 47,676 / 84,190 |
+
+The tool's row line is `row N: X of 18 tensors differ`, where `X` is the row's differing-value
+count summed over tensors and 18 is the tensor count. Examples: host-vs-engine row 0 is
+`row 0: 63631 of 18 tensors differ` (`attention_out` 5,120 differ, max abs 9.642373e-2;
+`post_attention_hidden` 20,478 differ, max abs 2.803117e-2; `residual_out` 20,480 differ, max
+abs 1.5459442e-1); FP4-vs-engine row 0 is `row 0: 49070 of 18 tensors differ` (`attention_out`
+5,054 differ, max abs 3.1640625e-1; `pre_ffn_xhat` 3,564 differ, max code distance 197;
+`residual_out` 19,480 differ, max abs 2.5e-1). The engine pair therefore differs from the FP4
+pair through the whole chain, not only at K5.
+
+The diff logs are `phase1-task6-stage9-diff-host-vs-fp4.log` (37,948 B `bdd8748d...`),
+`phase1-task6-stage9-diff-host-vs-engine.log` (38,212 B `31ffc645...`) and
+`phase1-task6-stage9-diff-fp4-vs-engine.log` (36,704 B `fc0b16e7...`). The `boundary_diff`
+binary used is the release build of this branch head, sha256 `8cc71fd1...`; the merged diff of
+record used debug `5ffb11f9...` and the FP4 verdict body matches it line for line.
+
+### 14.4 The frozen bars, the totals, and per-tensor movement
+
+Bars are exactly the frozen Stage-B compounded bars of section 13.3, printed before the numbers by
+the unchanged printer (`single_layer_delta_B2(T) * (L + 1)` for the three stream-carrying
+tensors, `single_layer_delta_B2(T)` otherwise); the engine column adds no bar and no tolerance and
+does not re-derive one. It is also free in launches and memory: 763 device launches per run, the
+same as the FP4 column, and the only additions are two per-layer device buffers (512 B codes + 16 B
+scales) allocated and freed inside the K5 block. Wall for the two engine runs is 300.1 s vs 298.6 s
+for the merged two-run Stage-C log (+1.5 s, within run-to-run noise).
+
+Totals over the 40 x 18 = 720 tensor-row comparisons:
+
+| column | at or under the bar | over it | rows with any over-bar comparison |
+|---|---|---|---|
+| merged FP4 (section 13) | 306 | 414 | 1-39 (39 rows) |
+| engine (this section) | 299 | 421 | 0-39 (40 rows) |
+
+The net is seven more misses (306 -> 299); 28 tensor-class changes across 17 rows include movement
+in both directions, and no row becomes clean. Row 0 is 17/18 in the engine column (worst
+measured/bar 1.451; merged row 0 was 18/18), so all 40 rows now carry at least one over-bar
+comparison. Per tensor, at/under counts of the 40 rows (only the six tensors that change are shown;
+the other twelve are identical to section 13.3):
+
+| tensor | merged FP4 | engine | delta |
+|---|---|---|---|
+| `pre_attention_scales` | 17 | 13 | -4 |
+| `attention_out` | 16 | 20 | +4 |
+| `hc_ffn_post` | 36 | 34 | -2 |
+| `hc_ffn_comb` | 38 | 36 | -2 |
+| `pre_ffn_hidden` | 24 | 20 | -4 |
+| `ffn_out` | 6 | 7 | +1 |
+
+The movement is reported, not smoothed: 17 rows change at least one comparison class
+(`[0, 3, 4, 6, 9, 10, 12, 13, 14, 15, 18, 19, 20, 25, 26, 31, 35]`, 28 tensor-class changes), the
+four `attention_out` gains and one `ffn_out` gain are outweighed by four
+`pre_attention_scales`, four `pre_ffn_hidden`, two `hc_ffn_post` and two `hc_ffn_comb`
+losses, and the frozen bars judge both columns the same way. A column whose
+window row is closer in format to the host row does not automatically shrink the health-check
+mismatch: the main/compressed KV, the GEMM activations and the bf16 module outputs are unchanged
+seams, so the mismatch is attributable elsewhere.
+
+### 14.5 Discrete routing events move with the format
+
+The K5 window bytes feed the layer output, so the engine column's bf16 stream differs upstream of
+the router and the discrete flip pattern moves: engine **22 of 40 layers flip**
+`[0, 1, 2, 3, 4, 5, 7, 9, 10, 12, 13, 14, 15, 16, 17, 18, 20, 23, 24, 30, 35, 36]` vs the FP4
+column's 17 `[0, 1, 2, 4, 5, 8, 10, 11, 15, 16, 17, 19, 20, 23, 24, 35, 36]`; 14 layers flip in
+both, engine-only flips are `[3, 7, 9, 12, 13, 14, 18, 30]` and FP4-only `[8, 11, 19]`, identical
+across the engine column's two runs. The zero-effect flip class is empty in the engine column: the
+FP4 column prints L36's zero-effect flip once per run (plus L39's ids-equal forced control), while
+the engine column prints no `references bit-identical true` line at all, so every engine-column
+flip moves the routed bytes. Nothing aborts: 0 WARNING lines,
+exit 0. This is a divergence event to report, not a bug: the same token with a different upstream
+window format produces different hidden states and therefore different top-6 decisions. Example,
+from the log: engine L00's ordered lists differ in slots 1-5 with an equal expert set, and its
+forced control measures `pointwise |ffn_out free - ffn_out forced| max 3.125000e-2 at i=176
+(signed -3.125000e-2), 764/5120 points differ; host deltas: free-running 1.906414e-1 at i=5071,
+forced 1.906414e-1 at i=5071` - a different attribution from the FP4 column's L00 (slot-5 set
+difference, 4,853/5,120 points differing), and both are printed rather than reconciled.
+
+A consequence visible in the audit: the engine run reads 18 more checkpoint tensors per run than
+the FP4 run (2,679 vs 2,661; audit `read` 2,691 vs 2,673, unread 93,128 vs 93,146,
+unselected-expert 90,642 vs 90,660) because its routing selects different experts; bytes through
+the harness's reader are identical (20,338,614,720 B) and the unread partition still sums with 0
+unclassified. The compressor/indexer seam note is unchanged: the S7 seam is degenerate at
+position 0 and this chain does not read those tensors.
+
+### 14.6 Exactness inside the harness, and the seams that keep criterion 1 open
+
+- Every kernel against its in-crate reference on the same bytes: 640/640 device-vs-in-crate
+  reference checks exact (2 runs x 40 layers x 8), 80/80 K5 checks 100.0000% exact, max abs 0e0,
+  max ULP 0, zero WARNING lines, exit 0.
+- The engine window row: `80/80 rows byte-identical to m4_quant::act_quant_fp8_row` (2 runs x 40
+  layers) and `finite-decode guard PASS on 80/80 rows`; a per-layer assertion, not a summary
+  after the fact, so a mismatch would have failed the layer by name. The shared construction is
+  pinned by `m4_abi::stage2_and_stage9_share_one_engine_window_row_builder`; the kernel-side
+  format guard and the FP4 default are unchanged from task-3.
+- The engine K5 check is `mla_ref::attention_with_sink_window` on the same bytes (engine decode
+  plus bf16 round), not the FP4 reference fed window bytes.
+- Criterion 1 is NOT closed by this column. The seam is explicit: `sparkflash-engine`'s reference
+  forward keeps f32 dequant, so the engine's bf16 storage round is consumed on both sides but the
+  engine's bf16 arithmetic is not reproduced; the main/compressed KV is still FP4 and at position 0
+  no compressed row exists, so only the window row is exercised; the GEMM activation quantisers and
+  bf16 module outputs still differ from the f32 host reference; the Engram write and the degenerate
+  S7 seam are the same host seams as section 13. The bars are inherited frozen Stage-B compounded
+  bars, so this is a format-fidelity, health-check-class measurement, not the release-faithful
+  exactness run that criterion 1 owes.
+
+### 14.7 What this adds
+
+The device half now has a measured 40-layer column whose K5 window KV is the engine's released
+format, built and asserted layer by layer through the same helper stage 2 uses, dispatched through
+the typed ABI, deterministic over two runs, and written as its own v1 pair with its own diff
+verdicts. That closes the format-faithful window-KV seam question for the device half - it is not a
+criterion-1 closure and it does not replace section 13. The next exactness step remains Phase 2
+(reproduce the engine reference forward's arithmetic); the task-5 hardening items stay
+non-blocking.

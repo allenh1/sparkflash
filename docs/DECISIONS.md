@@ -142,6 +142,25 @@ aarch64 hash is path-dependent) re-ran both sites on the node (stage-7 measured 
 all 18 `single_layer_delta` lines bit-identical to the merged B2 log, stage-9 smoke PASS framing;
 logs `phase1-task3-abi-stage7-b2compare`, `phase1-task3-abi-stage9-smoke`).
 
+**Task-6 extension (2026-10-18): the engine window format reaches the 40-layer Stage-C column.**
+`m7_layer0 --stage9-kv-format engine` builds each layer's window row with the released format
+(`kv_norm(wkv(layer input)) -> rope tail -> bf16 storage round -> E4M3 + per-32 E8M0`), passes it
+to K5 as window bytes with `window_kv_format=1`/`window_rows=1` through the typed 19-parameter
+ABI, and checks K5 against `mla_ref::attention_with_sink_window` (engine decode + bf16 round).
+The row construction is the same shared `engine_window_row` helper stage 2 uses (single bf16
+round, engine quantiser, asserted byte-identical to `m4_quant::act_quant_fp8_row`), pinned by the
+new `m4_abi::stage2_and_stage9_share_one_engine_window_row_builder` source-text test, so stage 2
+and stage 9 cannot drift. Measured: the FP4 default column is bit-identical to the merged Stage-C
+pair, row lines and diff body (the flag is additive); the engine column is deterministic over two
+runs (pair blob `40cadade...`), 80/80 rows byte-identical to the engine quantiser, finite-decode
+guard 80/80, K5 internal checks 80/80 100% exact (max abs 0), totals 299/720 at or under the frozen
+bars vs 306/720 for the FP4 column (seven net misses, six tensors change), and 22/40 layers report
+a discrete router flip vs 17/40 in the FP4 column (the changed stream moves routing; reported, not
+smoothed). Criterion 1 remains open: the engine reference forward keeps f32 dequant, and the
+main/compressed KV is still FP4 and degenerate at position 0. Logs
+`phase1-task6-stage9-fp4-default`/`phase1-task6-stage9-engine`, binary `cf9b4e90...`; details
+in `docs/build/phase1-boundary-table.md` section 14.
+
 ## D5 — `max_seq_len` is an explicit configuration value
 
 **Evidence.** The reference sizes its cache as `4 x 4096` by default and `1 x 64K`
@@ -189,6 +208,12 @@ fixture and extend the equivalence test to full codes and scales (not only scale
 header check so a second CUDA copy cannot drift; and add a node stage-8 act-quant probe against the
 same fixture, because CI has no GPU execution (the CI-only fallback is a pinned source-text
 comparison).
+
+**Task-6 update (2026-10-18):** the harness's stage-9 window row now goes through the same single
+`engine_window_row` helper as stage 2 - one bf16 storage round, then
+`sparkflash_engine::quant::quantize_activation_fp8`, asserted against
+`m4_quant::act_quant_fp8_row` - so the two harness-side users of the rule cannot drift; the
+CUDA copy remains the third owner. No rule change.
 
 ## D8 — Hash layers are out of scope
 
