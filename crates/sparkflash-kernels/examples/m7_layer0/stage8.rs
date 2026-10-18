@@ -46,7 +46,7 @@ fn load_probe_kernel(
     args: &Args,
     kernel: &str,
 ) -> Result<(CuModule, CuFunction), String> {
-    let path = args.cubin_dir.join(format!("{kernel}.cubin"));
+    let path = crate::cubin_path(&args.cubin_dir, kernel)?;
     let cubin = std::fs::read(&path).map_err(|e| {
         format!(
             "{}: {e} (build the B1 cubins first, see the module docs)",

@@ -182,3 +182,161 @@ needed.
   released operands.
 * No end-to-end layer text: the embed rows are stand-ins (section 4).
 * Iteration B (the K = 5120 routed-expert gate/up FP4 GEMM) is a separate MR, not this one.
+
+## 7. The launch geometry is the router's cost: a partitioning plan (not implemented)
+
+Status: **docs-only plan, no kernel change in this MR.** The 6.853 ms in section 5 is a real measured
+launch, and at one launch per layer it is 274 ms of routing per decoded token - but the router is not
+on the served path yet (the seam MR is separate), so this plan is about the Phase 3/4 kernel, not about
+a number a user sees today. This section proposes an order of work and states what must be measured;
+it does not promise a speedup.
+
+### 7.1 What the measured launch says about where the time goes
+
+The geometry is fixed by `router_launch.rs`: one block of 256 threads routes
+`TOKENS_PER_BLOCK = 8` tokens, so `grid = (ceil(tokens / 8), 1, 1)`; a one-token decode is a
+**single block**. Section 5 measured two launches on the Lead's 2026-10-18T18:32Z window:
+
+| tokens | grid | gate bytes read by the launch | p50 per launch |
+| ---: | :--- | ---: | ---: |
+| 8 | `(1, 1, 1)` | 3.93 MB (one block) | 6.8530 ms |
+| 130 | `(17, 1, 1)` | 66.8 MB (17 blocks) | 6.8541 ms |
+
+The 17-block launch reads **17 times** the gate bytes and runs **17 times** the blocks (17 x 8 token
+slots) of the 8-token launch, in the same p50. That rules out the reading that the launch is limited by
+device-wide gate bandwidth: 66.8 MB in 6.854 ms is **9.8 GB/s**, far from any HBM figure (the same
+observation is made about the indexer in
+[roadmap-to-serving.md](roadmap-to-serving.md) section 6.2: 4.2 MiB in 4.27 ms is about 1 GB/s and
+"equally far from any HBM figure"). The clock of a launch is the **per-block work**, and blocks run in
+parallel.
+
+The derivation from here is arithmetic, not a measurement: **6.8530 ms x 40 layers = 274.1 ms per
+token** if a decode issues one router launch per layer. No end-to-end decode was timed for this
+number.
+
+### 7.2 Why one block is slow: per-thread serial MACs and a 32-way bank conflict
+
+Per block, 256 threads = 8 warps, one token per warp, 32 lanes per token; each lane owns
+`EXPERTS_PER_THREAD = 12` experts and walks K = 5,120 in 32-value tiles (`moe_router_sm121.cu:76-92`,
+`118-135`). That is **61,440 serial MAC pairs per thread**, 15.73M per block, 31.46M f32 multiplies
+and adds. If the SM issued one f32 op per lane-cycle (4 schedulers x 32 lanes = 128 lane-ops per
+cycle, a Blackwell-class SM), the block's issue lower bound would be about **246k cycles, about
+0.14 ms at a 1.7-1.8 GHz SM clock** (the clock is not recorded in this doc; only the ratio is used).
+The measured 6.853 ms is **about 49x** that lower bound, so the gap is a serialisation, not a lack of
+issue capacity.
+
+The source points at one cause (a hypothesis until measured): `gate_tile` is
+`__nv_bfloat16 [384][32]`, so an expert row is 64 B = 16 words. In one warp every lane has the
+same `token_in_block` (`lane / 32`) and reads expert `12 * expert_lane + j` (`expert_lane = lane % 32`,
+which inside a warp is `lane`) at K offset `k`; the word
+offset is `192 * lane + 16 * j + k / 2`, and **192 mod 32 = 0**, so all 32 lanes of the warp hit
+**one shared-memory bank** - a 32-way conflict on every gate load in the inner loop. That predicts
+up to a 32x serialisation, the same order as the measured gap.
+
+**This is a source-level hypothesis, not a measurement,** and it fixes the order of the plan: first
+the change that tests it with the least code (7.4), then the partition (7.3), then both.
+
+### 7.3 Plan A: `grid.y` expert partitioning plus a second-stage top-6 merge
+
+**Stage 1.** `grid = (ceil(tokens / 8), 12, 1)`: twelve blocks, each owning **32 consecutive
+experts** (12 x 32 = 384). With 256 threads and 8 tokens there are 32 lanes per token, so **one lane
+owns one expert** instead of twelve. The block computes 32 unbiased scores per token in the same
+ascending-K order with the same `__fmul_rn`/`__fadd_rn` pair (no FMA), writes its own 32 columns of
+`scores[tokens][384]` (disjoint columns, no atomics) and its own top-6 **candidates** by selection
+signal, each `(expert id, score + bias, raw score)` = 12 B, so 12 x 6 = 72 candidates and 864 B per
+token. The local candidates use the **same order as the global rule** - highest selection signal,
+ties keep the lower expert id, i.e. `(signal desc, id asc)` - so a tie that straddles a partition
+boundary still resolves to the lower id after the merge.
+
+**Stage 2.** A second kernel, one thread per token (`grid = ceil(tokens / 256)`), reads the 72
+candidates, selects the global top-6 with the same rule as the incumbent scan - highest selection
+signal, ties keep the **lower expert id**, which is a `(signal desc, id asc)` sort - then reads the
+six raw scores from `scores[]` (written by stage 1; a separate launch is the visibility barrier),
+sums them in selection order, adds 1e-20, divides, multiplies by `route_scale`, and writes `ids` and
+`weights`. Stage 2 is microseconds: 8 tokens x 78 values, and 130 tokens fit in one block.
+
+**Determinism.** No atomics, no cross-block ordering dependence: every score is one deterministic
+f32 sequence (unchanged), and stage 2 is a pure function of the 72 candidates and six scores.
+
+**Arithmetic invariance.** Stage 1 keeps the per-expert accumulation order, the two roundings per
+MAC, the softplus branch and the score function; stage 2 keeps the normalisation order (selection
+order) and the release constants. The split must therefore be **bit-identical** to the incumbent on
+`scores`, `ids` and `weights` for the same inputs - any difference is a defect, not a tolerance.
+
+**Estimate, with its assumption stated and untested.** If per-block time is proportional to
+per-thread MAC work, stage 1 is about **6.853 / 12 = 0.571 ms per layer**, i.e. **22.8 ms per token
+across 40 layers** (from 274). The 1-block vs 17-block result does **not** support that assumption: it
+shows the launch clock is set by the per-block work (17 blocks in the same p50), not that per-block
+time scales with per-thread MAC count. The 12x figure is therefore a hypothesis for 7.5 item 7 to
+test, not a projection. The bank
+conflict also improves, from 32-way to 16-way (one expert per lane gives word offset
+`16 * expert + 16 * j + k / 2`, i.e. banks 0 and 16 only), which the estimate does **not** count. Stage 2 and the
+extra launch are not in the estimate either: +40 launches per token at a 5-10 us launch (unmeasured
+here) is 0.2-0.4 ms per token, which CUDA graphs
+([roadmap-to-serving.md](roadmap-to-serving.md) section 6.3 item 3) would absorb; the stage-2 kernel
+itself is not a term.
+
+**Cooperative variant (not first).** One kernel with `grid.sync()` between the two stages avoids the
+second launch, but the driver wrapper (`crates/sparkflash-kernels/src/cuda_driver.rs`) has no
+cooperative-launch entry point today (no cooperative symbol in the module), so it is more code and a
+new launch ABI. The second-kernel variant is the smaller change and is graph-capturable; do it first.
+
+### 7.4 Plan B: the layout-only fix that tests the hypothesis
+
+Pad the gate tile's K stride so that expert rows do not alias one bank. `[384][34]` bf16 makes an
+expert row 68 B = **17 words**: at one expert per lane the offset is `17 * lane`, and
+`gcd(17, 32) = 1`, so the 32 lanes hit **32 distinct banks (conflict-free)**; at the incumbent
+twelve experts per lane the offset is `204 * lane = 12 * lane` (mod 32), eight banks, a 4-way
+conflict (8x better than today's 32-way). No argument changes, no arithmetic changes, shared memory
+goes from 37,888 B to 39,424 B, and the only pins that move are the cubin baseline
+(`baseline/kernel_baseline.txt`, `build.rs` probe table, the two scripts and
+`tests/kernel_baseline.rs`'s count, as in section 3) and the compiled shared-memory total - the
+`gate_tile` size is in `moe_router_sm121.cu`, and the total is the cubin's `.nv.shared` value,
+which no pin in the tree records (the section 3 pins are the signature and the constants). This is the cheapest way to test 7.2's hypothesis, and it is worth doing even if Plan A
+follows, because the split alone leaves a 16-way conflict on the same load.
+
+Not recommended first: transposing the tile to `[K_TILE][N_ROUTED]`, which moves the conflict to the
+staging write and still needs a padded stride.
+
+### 7.5 The test plan (all of it; the speedup is the last item)
+
+Every step runs in the existing `m9_router` harness (section 4) on the same released operands.
+
+1. **Semantics pinned before speed.** The CPU twin (`router_ref.rs`) is unchanged; it is the
+   semantic reference for both plans.
+2. **Device vs twin, same bars as section 4:** ids exact, host-path weights vs twin exact, device
+   scores <= 1e-6 and <= 8 ULP, device weights <= 1e-6 and <= 16 ULP, two device runs byte-identical.
+3. **Equivalence to the incumbent kernel:** for tokens 1, 8 and 130, run the incumbent single-block
+   kernel and the new path on the same released gate/activation bytes and compare `scores`, `ids`
+   and `weights` **byte for byte**. The split is arithmetic-preserving, so this is an equality test,
+   not a bar.
+4. **Tie rule, in a partition and across partitions:** a synthetic gate/bias with two experts
+   tying on `score + bias`, once inside one partition and once in different partitions; both assert
+   the **lower** id is selected - stage 1's local candidate order and the merge's secondary key must
+   be the same `(signal desc, id asc)` rule.
+5. **Top-6 distribution edge cases:** all six selected experts inside one partition; selected six
+   spread 6 x 2 across partitions; the last **token block** short at `tokens` not a multiple of 8
+   (the `grid.x` block, not a partition - every partition owns a full 32 experts).
+6. **Geometry pins:** `router_abi.rs` pins the new grid.y and partition count (12 x 32 = 384) and both
+   kernels' declarations (stage 1 keeps the existing ten parameters; stage 2 adds its own); the
+   mutation test on the signature argument types stays.
+7. **Performance, recorded not promised:** p50 for tokens 1, 8 and 130 with the printed invocation and
+   the gate bytes read, for (a) Plan B alone, (b) Plan A alone, (c) both; sweep partitions 2/3/4/6/12
+   to test the scaling assumption rather than assuming the 12-way point is best. The pass bar for
+   each MR is "arithmetic bit-identical and the p50 recorded"; a speedup is a measurement, not a
+   claim in the MR text.
+8. **Baseline:** each new or changed cubin gets its own baseline entry and hash before the harness
+   will launch it (the harness refuses any cubin whose hash is not pinned).
+
+### 7.6 The honest baseline
+
+* The 6.853 ms is a **correctness harness** over released gate bytes and embed-row stand-ins
+  (section 4), not the decode path: `sparkflash serve` still routes on the host. The seam MR must
+  measure both sides on the same window before any seam win is claimed, as section 6 already says.
+* The 274 ms/token is **derived** (6.853 x 40), not measured end to end.
+* The 0.571 ms/layer and 22.8 ms/token figures in 7.3 are **estimates under a named assumption**
+  (per-thread MAC work dominates the per-block clock); the measurements in 7.5 item 7 decide whether
+  they hold.
+* The floor after the split is the **3.93 MB gate read per launch**; the incumbent's aggregate
+  9.8 GB/s at 130 tokens is why the launch is nowhere near that floor today. The plan does not put a
+  number on how close the split gets, because the conflict hypothesis in 7.2 is not yet measured.

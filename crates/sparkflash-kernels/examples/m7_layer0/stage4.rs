@@ -151,7 +151,7 @@ pub(crate) fn stage4(args: &Args) -> Result<(), String> {
         + 4
         + HIDDEN * 4) as u64;
     let cuda = Cuda::load()?;
-    let cubin_path = args.cubin_dir.join(format!("{kernel}.cubin"));
+    let cubin_path = crate::cubin_path(&args.cubin_dir, kernel)?;
     let cubin = std::fs::read(&cubin_path).map_err(|e| {
         format!(
             "{}: {e} (build the cubin first; the module docs give the nvcc line)",

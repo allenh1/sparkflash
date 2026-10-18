@@ -12,6 +12,7 @@
 //! the dlopen boundary: everything above it is safe code.
 
 use std::ffi::c_void;
+use std::path::{Path, PathBuf};
 
 type CuResult = i32;
 
@@ -173,6 +174,18 @@ pub enum KernelId {
 }
 
 impl KernelId {
+    /// Every kernel the shared driver owns, in the order of this enum.
+    pub const ALL: [KernelId; 8] = [
+        KernelId::MegaMhcBf16,
+        KernelId::Mxfp8Dense,
+        KernelId::Mxfp8WoA,
+        KernelId::Mxfp4Moe,
+        KernelId::SwigluMxfp8Quant,
+        KernelId::CertLmHead,
+        KernelId::MoeRouter,
+        KernelId::RoutedGateUp,
+    ];
+
     /// The cubin symbol of this kernel. Private: callers name the enum, never the symbol.
     fn symbol(self) -> &'static str {
         match self {
@@ -186,6 +199,81 @@ impl KernelId {
             KernelId::RoutedGateUp => "routed_gate_up_sm121",
         }
     }
+
+    /// The cubin file names this kernel may be stored under, symbol first.
+    ///
+    /// The symbol is the name the harness documents and must open. Mega-MHC carries a second,
+    /// documented alias because the pinned baseline manifest keys that kernel by its source-file
+    /// stem, `mega_mhc_sm121` (`baseline/kernel_baseline.txt`). A cubin's file name is not part of
+    /// its ABI - the symbol inside it is - so both names are the same artifact, and accepting the
+    /// alias removes the run-D failure of 2026-10-18 (the pinned artifact was copied under the
+    /// manifest's name and the harness opened the symbol's name instead).
+    pub fn cubin_names(self) -> &'static [&'static str] {
+        match self {
+            KernelId::MegaMhcBf16 => &["mega_mhc_fused_bf16_sm121", "mega_mhc_sm121"],
+            KernelId::Mxfp8Dense => &["b12x_mxfp8_dense_sm121"],
+            KernelId::Mxfp8WoA => &["b12x_mxfp8_wo_a_sm121"],
+            KernelId::Mxfp4Moe => &["b12x_mxfp4_moe_sm121"],
+            KernelId::SwigluMxfp8Quant => &["swiglu_mxfp8_quant_sm121"],
+            KernelId::CertLmHead => &["cert_lm_head_sm121"],
+            KernelId::MoeRouter => &["moe_router_sm121"],
+            KernelId::RoutedGateUp => &["routed_gate_up_sm121"],
+        }
+    }
+
+    /// Maps a cubin file name (the symbol or a documented alias) to the kernel.
+    ///
+    /// `flash_mla_csa2_sm121` is deliberately absent: that kernel is loaded through
+    /// `cuda_harness::load_flash_mla`, which owns its symbol, so it has no `KernelId`.
+    #[must_use]
+    pub fn from_cubin_name(name: &str) -> Option<KernelId> {
+        KernelId::ALL
+            .into_iter()
+            .find(|id| id.cubin_names().contains(&name))
+    }
+}
+
+/// The cubin name of the flash_mla kernel, which has no [`KernelId`]: `crate::cuda_harness`
+/// owns its symbol and its typed launches, so it sits outside the driver's kernel-id vocabulary.
+pub const FLASH_MLA_CUBIN: &str = "flash_mla_csa2_sm121";
+
+/// The built cubin for a kernel name, under `dir`, for a harness that launches it.
+///
+/// The kernel's [`KernelId::cubin_names`] are tried in order - the symbol first, then any documented
+/// alias such as the pinned baseline manifest's Mega-MHC source stem - so a cubin copied out of the
+/// pinned artifact directory under either name is found. [`FLASH_MLA_CUBIN`] is resolved by its own
+/// name because it has no `KernelId`. Any other name is refused with the driver-kernel message
+/// rather than a file error, and a known kernel with no built file names every candidate tried.
+///
+/// # Errors
+///
+/// The name is not a shared-driver kernel or the flash_mla kernel, or no candidate file exists under
+/// `dir`.
+pub fn cubin_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let candidates: &[&str] = if name == FLASH_MLA_CUBIN {
+        &[FLASH_MLA_CUBIN]
+    } else {
+        KernelId::from_cubin_name(name)
+            .ok_or_else(|| {
+                format!(
+                    "{name} is not one of the shared driver kernels; the flash_mla kernel is loaded through cuda_harness::load_flash_mla and has no KernelId"
+                )
+            })?
+            .cubin_names()
+    };
+    let mut tried = Vec::new();
+    for candidate in candidates {
+        let path = dir.join(format!("{candidate}.cubin"));
+        if path.is_file() {
+            return Ok(path);
+        }
+        tried.push(path.display().to_string());
+    }
+    Err(format!(
+        "no cubin for {name} in {}; tried {}",
+        dir.display(),
+        tried.join(", ")
+    ))
 }
 
 /// The CUDA context and the dlopen'd driver functions this process uses.

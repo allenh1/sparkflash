@@ -120,7 +120,7 @@ pub(crate) fn stage5(args: &Args) -> Result<(), String> {
     );
 
     let cuda = Cuda::load()?;
-    let cubin_path = args.cubin_dir.join("cert_lm_head_sm121.cubin");
+    let cubin_path = crate::cubin_path(&args.cubin_dir, "cert_lm_head_sm121")?;
     let cubin = std::fs::read(&cubin_path).map_err(|e| {
         format!(
             "{}: {e} (nvcc -cubin -arch=sm_121a -I kernels -o {} kernels/cert_lm_head_sm121.cu)",

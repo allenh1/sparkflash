@@ -35,6 +35,16 @@ state why the probe intentionally excludes it) and correct the "6 of the six" wo
 can close it; the baseline already compiles seven, so the drift is in the probe's coverage, not in
 the pinned bytes.
 
+**Follow-up (later, not in this branch): FIXED.** The probe table is now
+`PROBED_KERNELS: [(&str, &str); 9]` with `swiglu_mxfp8_quant_sm121`, `moe_router_sm121` and
+`routed_gate_up_sm121` as its seventh, eighth and ninth entries, and the build warning says
+"9 of the nine probed kernels". The probe table,
+the check script's list and the baseline manifest (nine `kernel` lines) are pinned equal by
+`the_baseline_list_matches_the_manifest_and_the_kernels_on_disk`
+(`crates/sparkflash-kernels/tests/kernel_baseline.rs`), which also requires every listed kernel to
+exist under `kernels/` and only the RoCEnante kernel to sit outside the list, so this drift cannot
+come back silently. The verdict above is the state at `2245a4e`.
+
 ## 2. The swiglu kernel takes trace parameters but emits no trace scope
 
 **Claim as registered:** `swiglu_mxfp8_quant_sm121.cu` takes the trace arguments and only casts them
@@ -83,6 +93,15 @@ still has one row per decision (26 `| D` rows). No decision text was rewritten i
 So the review's observation is accurate and the TODO is the honest marker of an unimplemented M2
 capability. Removing it would make the docs less true. No code change.
 
+**Follow-up (D27, later): the mock path this section defends was deleted, not kept.** D27 removed
+`DEFAULT_IMAGE_GRID` and `default_image_tokens()`, deleted `EngineRequest::image_tokens`, dropped
+the `vision` capability field, and made every request route refuse a non-empty `images` list with
+HTTP 400 `unsupported_capability` before generation; `count_image_tokens(grid_h, grid_w)` remains
+as the published tiling arithmetic for a front end that derives a real grid. The capabilities now
+report `multimodal: false` and `image_url: false` as constants because the channel is absent, not
+because a driver chose to disable it. The historical point stands - the TODO was honestly labelled
+and not a hidden shortcut - but section 4 is not the current state of the vision channel.
+
 ## 5. `serve.rs` and the `Send + Sync` engine seam
 
 **Claim as registered:** `serve.rs` has a `Send + Sync` problem at the engine seam.
@@ -101,6 +120,13 @@ capability. Removing it would make the docs less true. No code change.
   `AppState::new(Arc::new(driver))` and passes it to `sparkflash_api::server::router`. Both the trait
   object and the router require `Send + Sync`, so a driver that was not `Send + Sync` would not
   compile. There is no runtime-only claim to pin.
+
+**Follow-up (D28, !60 `f72738b`): the engine is `Send + Sync` now, and the docs were corrected.**
+`WeightSource` gained `Send + Sync`, so `forward::InferenceEngine` is `Send + Sync`; `serve.rs`'s
+module header and a compile-time assertion pin it (DECISIONS.md D28). The dedicated engine thread
+stays for the reason D28 records - the pass is one-sequence-at-a-time and the sampler swap consumes
+the engine - not because the engine is not thread-safe. The bullet above that says "the reference
+engine is not `Send`/`Sync`" describes the state before !60 and must not be quoted as current.
 
 ## 6. `m4_abi.rs` is brittle and too large
 

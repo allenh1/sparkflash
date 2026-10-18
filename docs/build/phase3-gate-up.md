@@ -175,10 +175,14 @@ batches, not claims against the host seam.
 from commit `0ff78fe`) and it panicked in the **host** comparison before the device path: the
 engine-style control has `tokens x 6 x 576` values while the twin returns the ABI's padded
 `tokens x 6 x 640`, and the gap comparison asserted equal lengths (`left 30720 right 27648` at 8
-tokens, and the same at 130). No device numbers were recorded; window log
-`window-b4-20261018T195135Z.log`, `runs4/`. The gap comparison now selects the 576 real columns of
-each twin row, and three unit tests pin the compared lengths (including the exact 30,720 / 27,648
-numbers above) so the mistake cannot regress.
+tokens, and **the same failure** at 130: `left 499200 right 449280`). No device numbers were
+recorded. The window log `window-b4-20261018T195135Z.log` is on the node only; the two failing runs
+are copied to the dev host as `phase2-evidence/window-2026-10-18/runs4/m10-tokens8.log` and
+`.../runs4/m10-tokens130.log`. The gap now goes through `control_gap`, which selects the 576 real
+columns of each twin row before comparing, and four example tests pin it at 1/8/130 tokens (the
+compared lengths, the exact 30,720 / 27,648 / 499,200 / 449,280 numbers, and the helper's real-column
+values against a padded twin) so a call-site revert no longer compiles - the guard fails in
+`cargo test --workspace --examples` instead of waiting for the next window.
 
 **Device window (b6), 2026-10-18T20:22Z - PASS.** Measured in a Lead window on node0. Log
 `window-b6-20261018T202235Z.log`, runs `runs6/m10-tokens8.log` and `runs6/m10-tokens130.log`.

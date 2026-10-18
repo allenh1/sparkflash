@@ -191,21 +191,28 @@ use self::b2_harness::{
 
 /// Maps a cubin kernel name to the shared driver KernelId.
 ///
-/// The flash_mla kernel is deliberately absent: it is loaded only through
-/// cuda_harness::load_flash_mla, which owns the symbol and returns the opaque FlashMlaKernel, so
-/// the harness never holds a raw handle for it.
+/// The mapping lives in the crate (`KernelId::from_cubin_name`) so the loader and the pinned
+/// baseline name are one list, and a kernel's documented alias resolves here too. The flash_mla
+/// kernel is deliberately absent: it is loaded only through `cuda_harness::load_flash_mla`, which
+/// owns the symbol and returns the opaque FlashMlaKernel, so the harness never holds a raw handle
+/// for it.
 fn kernel_id(name: &str) -> Result<KernelId, String> {
-    match name {
-        "mega_mhc_fused_bf16_sm121" => Ok(KernelId::MegaMhcBf16),
-        "b12x_mxfp8_dense_sm121" => Ok(KernelId::Mxfp8Dense),
-        "b12x_mxfp8_wo_a_sm121" => Ok(KernelId::Mxfp8WoA),
-        "b12x_mxfp4_moe_sm121" => Ok(KernelId::Mxfp4Moe),
-        "swiglu_mxfp8_quant_sm121" => Ok(KernelId::SwigluMxfp8Quant),
-        "cert_lm_head_sm121" => Ok(KernelId::CertLmHead),
-        other => Err(format!(
-            "{other} is not one of the shared driver kernels; the flash_mla kernel is loaded through cuda_harness::load_flash_mla and has no KernelId"
-        )),
-    }
+    KernelId::from_cubin_name(name).ok_or_else(|| {
+        format!(
+            "{name} is not one of the shared driver kernels; the flash_mla kernel is loaded through cuda_harness::load_flash_mla and has no KernelId"
+        )
+    })
+}
+
+/// The built cubin for any kernel this harness launches.
+///
+/// The names live in the crate (`cuda_driver::cubin_path`): the [`KernelId`]'s symbol and any
+/// documented alias such as the pinned baseline manifest's Mega-MHC source stem, plus the flash_mla
+/// kernel, which has its own resolver because `load_flash_mla` owns its symbol. Keeping the
+/// resolution in the crate is what lets a test cover it - an example's own `#[test]` is not run by
+/// `cargo test`.
+fn cubin_path(cubin_dir: &Path, name: &str) -> Result<PathBuf, String> {
+    sparkflash_kernels::cuda_driver::cubin_path(cubin_dir, name)
 }
 
 /// The hidden width the checkpoint's layer 0 is built around.

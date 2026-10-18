@@ -290,3 +290,135 @@ fn the_probe_table_parser_handles_wrapping_one_liners_and_count_drift() {
         "the 8-entry table against a 7-kernel manifest must not compare equal"
     );
 }
+
+/// The loader resolves every name the pinned baseline uses, including the Mega-MHC alias.
+///
+/// The manifest keys the fused Mega-MHC kernel by its source-file stem, \`mega_mhc_sm121\`, while
+/// the harness and the device open the cubin by its symbol, \`mega_mhc_fused_bf16_sm121\`. Run D
+/// failed on 2026-10-18 because the pinned artifact had been copied under the manifest's name and
+/// the harness opened the symbol's name (docs/build/phase3-indexer.md sections 2 and 3). A cubin's
+/// file name is not part of its ABI, so both names resolve to the same kernel; this test fails if
+/// either the manifest key or the alias list drifts away from the other.
+#[test]
+fn the_loader_resolves_every_name_the_pinned_baseline_uses() {
+    use sparkflash_kernels::cuda_driver::KernelId;
+
+    // Every kernel the shared driver owns is reachable from its symbol, and its primary cubin
+    // name is that symbol: the file the harness documents and opens.
+    for id in KernelId::ALL {
+        let names = id.cubin_names();
+        assert!(!names.is_empty(), "{id:?} must have a cubin name");
+        assert_eq!(
+            KernelId::from_cubin_name(names[0]),
+            Some(id),
+            "{id:?}'s primary name {} must resolve back to it",
+            names[0]
+        );
+        assert!(
+            !names.contains(&"flash_mla_csa2_sm121"),
+            "{id:?} must not claim the flash_mla kernel, which has no KernelId"
+        );
+    }
+    assert_eq!(
+        KernelId::from_cubin_name("flash_mla_csa2_sm121"),
+        None,
+        "flash_mla is loaded through load_flash_mla and must not resolve to a KernelId"
+    );
+    // The alias is one kernel, not a second one.
+    assert_eq!(
+        KernelId::from_cubin_name("mega_mhc_sm121"),
+        Some(KernelId::MegaMhcBf16)
+    );
+    assert_eq!(
+        KernelId::from_cubin_name("mega_mhc_fused_bf16_sm121"),
+        Some(KernelId::MegaMhcBf16)
+    );
+
+    // And the manifest's own key must be a name the loader answers to.
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = std::fs::read_to_string(crate_dir.join("baseline/kernel_baseline.txt"))
+        .expect("the manifest must be readable");
+    let mut checked = 0;
+    for line in manifest.lines() {
+        let Some(rest) = line.strip_prefix("kernel ") else {
+            continue;
+        };
+        let name = rest
+            .split_whitespace()
+            .next()
+            .expect("a manifest kernel line names the kernel");
+        if name == "flash_mla_csa2_sm121" {
+            continue;
+        }
+        assert!(
+            KernelId::from_cubin_name(name).is_some(),
+            "the baseline manifest names {name}, which the loader does not resolve"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 8, "the manifest pins eight driver kernels");
+}
+
+/// The name resolver stages 2-9 use: alias, symbol preference, flash_mla and the two error paths.
+///
+/// This exercises `cuda_driver::cubin_path` itself, not the helper's pieces: the HIGH this test
+/// covers was stage 2 passing `flash_mla_csa2_sm121` to a resolver that only knew `KernelId`s and
+/// therefore errored before reading a cubin. A temp directory holds the files so the test needs no
+/// CUDA and no built cubin.
+#[test]
+fn the_cubin_resolver_handles_aliases_flash_mla_and_unknown_names() {
+    use sparkflash_kernels::cuda_driver::{KernelId, cubin_path};
+
+    let dir = std::env::temp_dir().join(format!(
+        "sparkflash-cubin-path-{}-{}",
+        std::process::id(),
+        "resolver"
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a temp directory");
+
+    // The pinned manifest's Mega-MHC stem is enough: the alias resolves to that file.
+    std::fs::write(dir.join("mega_mhc_sm121.cubin"), b"alias").expect("write the alias cubin");
+    assert_eq!(
+        cubin_path(&dir, "mega_mhc_fused_bf16_sm121").expect("the alias resolves"),
+        dir.join("mega_mhc_sm121.cubin")
+    );
+
+    // When both files exist the symbol's own name wins: it is the primary name, not a fallback.
+    std::fs::write(dir.join("mega_mhc_fused_bf16_sm121.cubin"), b"symbol")
+        .expect("write the symbol");
+    assert_eq!(
+        cubin_path(&dir, "mega_mhc_fused_bf16_sm121").expect("the symbol resolves"),
+        dir.join("mega_mhc_fused_bf16_sm121.cubin")
+    );
+
+    // flash_mla has no KernelId (load_flash_mla owns the symbol) and is what stage 2 opens.
+    std::fs::write(dir.join("flash_mla_csa2_sm121.cubin"), b"mla")
+        .expect("write the flash_mla cubin");
+    assert_eq!(
+        cubin_path(&dir, "flash_mla_csa2_sm121").expect("flash_mla resolves"),
+        dir.join("flash_mla_csa2_sm121.cubin")
+    );
+    assert_eq!(
+        KernelId::from_cubin_name("flash_mla_csa2_sm121"),
+        None,
+        "the crate's kernel-id vocabulary must keep flash_mla outside it"
+    );
+
+    // A name that is neither is refused as an unknown kernel, before any file is looked at.
+    let unknown = cubin_path(&dir, "not_a_kernel_sm121").expect_err("an unknown kernel is refused");
+    assert!(
+        unknown.contains("not one of the shared driver kernels"),
+        "the unknown-name error must name the driver-kernel contract: {unknown}"
+    );
+
+    // A known kernel with no built file names every candidate it tried.
+    let missing =
+        cubin_path(&dir, "b12x_mxfp8_dense_sm121").expect_err("a missing cubin is an error");
+    assert!(
+        missing.contains("b12x_mxfp8_dense_sm121.cubin"),
+        "the missing-file error must list the candidate it tried: {missing}"
+    );
+
+    std::fs::remove_dir_all(&dir).expect("clean up the temp directory");
+}

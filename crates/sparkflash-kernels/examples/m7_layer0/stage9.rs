@@ -403,7 +403,7 @@ fn stage9_device(args: &Args) -> Result<Stage9Device, String> {
     let cuda = Cuda::load()?;
     let mut modules = Vec::with_capacity(5);
     let mut load = |name: &str| -> Result<CuFunction, String> {
-        let path = args.cubin_dir.join(format!("{name}.cubin"));
+        let path = crate::cubin_path(&args.cubin_dir, name)?;
         let cubin = std::fs::read(&path).map_err(|e| {
             format!(
                 "{}: {e} (build the stage-7/9 cubins first; the module docs give the nvcc lines)",

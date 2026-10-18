@@ -124,8 +124,10 @@ Engine reference: `forward/mod.rs:373` run, `:546` block. Per layer, in order:
    is on main (`:86`, `params()` at `:139`); its null-indexer validation (`:169-180`) is the
    task-9 fix (section 6).
 6. Post-mix mHC: `hc_post` (`mhc.rs:378`), kernel `MEGA_MHC`.
-7. MoE: route (`moe.rs:462`; seam `moe_router`); routed expert **gate/up** (`w1`/`w3`) has no
-   kernel and is the host seam `moe_gate_up`, together with SwiGLU and the activation quantiser
+7. MoE: route (`moe.rs:462`; seam `moe_router`); routed expert **gate/up** (`w1`/`w3`) is not
+   dispatched by the chain and is the host seam `moe_gate_up` (its kernel,
+   `routed_gate_up_sm121`, is measured in its own harness `m10_gate_up`), together with SwiGLU and
+   the activation quantiser
    (the seventh kernel `swiglu_mxfp8_quant_sm121` is not launched by the chain and has never
    been compared: `roadmap-to-serving.md:438`); the routed **down/combine** projection is device
    `MXFP4_MOE` (its kernel computes down/combine only and does not duplicate gate/up:
@@ -138,16 +140,18 @@ Engine reference: `forward/mod.rs:373` run, `:546` block. Per layer, in order:
    seam `lm_head_argmax`). The kernel deliberately does **not** do the grid-wide reduction
    (`kernels/cert_lm_head_sm121.cu:27-30`), so the reduction is part of the token path.
 
-Kernel ABI anchors (main): `KernelId` `cuda_driver.rs:156`; `m4_abi` `MEGA_MHC:852`,
-`MXFP8_DENSE:854`, `MXFP4_MOE:856`, `FLASH_MLA_CSA2:858`, `MXFP8_WO_A:860`,
-`CERT_LM_HEAD:862`, `KERNELS` at `:865` (a six-entry array). The ratchet baseline
-`crates/sparkflash-kernels/baseline/kernel_baseline.txt` has **seven** entries: it also pins
-`swiglu_mxfp8_quant_sm121` (line 17), which the chain does not launch because SwiGLU and the
-activation quantiser run on the host (3.1). The chain launches six: `mega_mhc_sm121`,
+Kernel ABI anchors (main): `KernelId` `cuda_driver.rs:157`; `m4_abi` `MEGA_MHC:854`,
+`MXFP8_DENSE:856`, `MXFP4_MOE:858`, `FLASH_MLA_CSA2:860`, `MXFP8_WO_A:862`,
+`CERT_LM_HEAD:864`, `KERNELS` at `:867` (a six-entry array). The ratchet baseline
+`crates/sparkflash-kernels/baseline/kernel_baseline.txt` has **nine** entries: besides the six the
+chain launches it also pins `swiglu_mxfp8_quant_sm121` (line 17), `moe_router_sm121` (line 18) and
+`routed_gate_up_sm121` (line 19), none of which the chain launches - SwiGLU and the activation
+quantiser run on the host (3.1), and the router and the routed gate/up projection are device work
+the chain does not dispatch. The chain launches six: `mega_mhc_sm121`,
 `b12x_mxfp8_dense_sm121`, `b12x_mxfp4_moe_sm121`, `flash_mla_csa2_sm121`,
 `b12x_mxfp8_wo_a_sm121`, `cert_lm_head_sm121`. Nothing in this chain adds a kernel, but two
-of those six do not supply their whole stage: routed gate/up and SwiGLU/quantiser are host seams,
-and the head's block reduction is a host seam.
+further kernels do not supply a whole stage the chain runs: routed gate/up and SwiGLU/quantiser are
+host seams, and the head's block reduction is a host seam.
 
 ### 2.3 Explicitly outside the chain
 
@@ -318,8 +322,8 @@ reproduced against the reference" (`roadmap-to-serving.md` section 5.5 item 1). 
 only when **all** hold in one run:
 
 1. exit status 0, and the run actually executed on a device: driver loaded, every cubin sha256
-   printed and equal to the seven entries of `baseline/kernel_baseline.txt` (the chain launches
-   six of them, 2.2), device kernel launches > 0 (a host-only run cannot pass);
+   printed and equal to the entries of `baseline/kernel_baseline.txt` (the chain launches six of
+   them, 2.2), device kernel launches > 0 (a host-only run cannot pass);
 2. tokens exactly 491, 367, 201, 80, 3302, 201, 54, 201, 4341 (`compare_steps`, `:699`);
 3. head reduction: the reduced argmax over the screen's per-block maxima (host `lm_head_argmax` in
    the first run; lowest-index tie-break `lm_head_ref::best_entry:161`) equals the expected token,
@@ -375,8 +379,8 @@ Phases, each writing `runs/<utc>-<phase>-<sha>.txt`:
 | phase | command | claim |
 |:--|:--|:--|
 | smoke | `sparkflash-cli device-chain --phase smoke --positions 4 --layers 1` | ABI/loader only; it records its own wall and no numerics; there is no measured smoke anchor in the repo, so none is quoted. |
-| rotation | `... --phase rotation` | ring rotation alone; the plan is 5,482 executions / 11,764 `copy_dtod` / 376,576 slots / 198,832,128 B (codes 192,806,912 B + scales 6,025,216 B; one full ring 67,584 B, forty rings 2,703,360 B) from the corrected !63 geometry (`phase2-sequence-harness.md:203-217`, on main). The copy-only rate is **unmeasured**: the 2026-10-18 window's rotation seconds and MiB/s came from the contaminated first commit (`8c91fe5`), so they are deliberately not quoted here and must not be quoted anywhere (the m8 note says so). The corrected binary has not run on a device. |
-| dispatch | `... --phase dispatch --positions 130 --layers 40` | launch+readback with rotation excluded. The command's grid is 5,200 launch slots (130 positions x 40 layers), but the chain executes **5,162** prefill token-layer executions because the decoder layers start at position 2 (2.1); 5,200 is the grid, not the execution count. This phase has **no measured anchor**. The only dispatch anchor is the 2026-10-18 window: 360 dispatches (9 positions x 40 layers: 18 window-only format 1 + 342 union format 2), first-launch time 0.174152 s / 483.756 us per record, 680 launches including 320 determinism repeats. The stage-9 40-row forced-operand wall (298.6 s, two chain runs, `phase1-boundary-table.md:736-746`) is a different harness and is not a dispatch-only clock. |
+| rotation | `... --phase rotation` | ring rotation alone; the plan is 5,482 executions / 11,764 `copy_dtod` / 376,576 slots / 198,832,128 B (codes 192,806,912 B + scales 6,025,216 B; one full ring 67,584 B, forty rings 2,703,360 B) from the corrected !63 geometry (`phase2-sequence-harness.md:203-217`, on main). The copy-only rate is **measured**: the corrected run of the 2026-10-18T18:32Z window issued 11,764 `copy_dtod` calls and moved 198,832,128 B in 0.025624 s of copy time, i.e. **7,400.000 MiB/s copy-only**; the loop wall 2.588988 s also covers view verification and the attention dispatch (DECISIONS.md D25, [phase2-sequence-harness.md](phase2-sequence-harness.md) section 7). The contaminated first commit's (`8c91fe5`) rotation seconds and MiB/s remain superseded and must not be quoted. |
+| dispatch | `... --phase dispatch --positions 130 --layers 40` | launch+readback with rotation excluded. The command's grid is 5,200 launch slots (130 positions x 40 layers), but the chain executes **5,162** prefill token-layer executions because the decoder layers start at position 2 (2.1); 5,200 is the grid, not the execution count. This phase has **no measured anchor** of its own. The only dispatch anchor is the corrected 2026-10-18T18:32Z window: 360 first-launch records (9 positions x 40 layers: 18 window-only format 1 + 342 union format 2), dispatch wall 0.175593 s over those 360 first-launch records = 487.758 us per record, 680 launches in all including 320 determinism repeats, 0 non-finite outputs and 40 device-vs-twin comparisons within the 2.0e-2 bar (DECISIONS.md D25, `phase2-sequence-harness.md` section 7). The earlier 17:16Z window measured 0.174152 s / 483.756 us over its 360 launches; the corrected run above is the run of record for this row. The stage-9 40-row forced-operand wall (298.6 s, two chain runs, `phase1-boundary-table.md:736-746`) is a different harness and is not a dispatch-only clock. |
 | full | `... --phase full --prompt 130 --decode 8` | the criterion-1 run: exit 0, tokens, position-129 logits (restricted set, 4.2), seam ledger, metadata; boundary differences printed (4.3). |
 
 Abort rules: baseline mismatch, fixture mismatch, a planned seam missing, MemAvailable below floor on

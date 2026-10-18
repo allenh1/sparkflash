@@ -1092,7 +1092,7 @@ pub(crate) fn stage7(args: &Args) -> Result<(), String> {
     let cuda = Cuda::load()?;
     let mut allocated = 0usize;
     let load = |name: &str, _allocated: &mut usize| -> Result<(CuModule, CuFunction), String> {
-        let path = args.cubin_dir.join(format!("{name}.cubin"));
+        let path = crate::cubin_path(&args.cubin_dir, name)?;
         let cubin = std::fs::read(&path).map_err(|e| {
             format!(
                 "{}: {e} (build the stage-7 cubins first; the module docs give the nvcc lines)",

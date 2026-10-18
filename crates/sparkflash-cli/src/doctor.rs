@@ -352,7 +352,9 @@ pub struct UvmPacking {
 /// A lockable SM clock window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClockRange {
-    /// Lowest lockable SM clock, in MHz.
+    /// Lowest SM clock the probe read, in MHz. `nvidia-smi`'s full query reports no device
+    /// minimum, so a probe that could only read the cap reports 0 here, which is also the
+    /// permitted window's floor.
     pub min_mhz: u64,
     /// Highest lockable SM clock, in MHz.
     pub max_mhz: u64,
@@ -886,31 +888,120 @@ impl RdmaProbe for SystemProbes {
     }
 }
 
+/// Parses a single-number clock query row (one clock field).
+fn parse_clock_cap(raw: &str) -> Option<u64> {
+    raw.lines().next()?.trim().parse().ok()
+}
+
+/// Parses the `Max Clocks` table of `nvidia-smi -q -d CLOCK`: the `SM` row of that table.
+fn parse_max_clock_from_query(raw: &str) -> Option<u64> {
+    let mut in_max_clocks = false;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Max Clocks") {
+            in_max_clocks = true;
+            continue;
+        }
+        if !in_max_clocks {
+            continue;
+        }
+        // The table ends at a blank line; every row is `Name : value unit`.
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(row) = trimmed.strip_prefix("SM")
+            && let Some(value) = row.trim_start().strip_prefix(':')
+        {
+            return value.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
+
+/// Reads an SM clock range from the query forms `nvidia-smi` exposes, in order.
+///
+/// The two-field query is the direct form, but it is not portable: on GB10 it exits 2 with empty
+/// stderr (the window recorded in `docs/build/aarch64-pipeline.md` appendix C), and the old
+/// single-form probe turned that into a failed check for a clock window it had never read. The cap
+/// alone and then the full `-q -d CLOCK` table are the fallbacks; when every form fails the gate
+/// reports "not applicable", because a cap that was never read is not a cap that was exceeded.
+fn clock_range_from(
+    pair: Probe<ClockRange>,
+    max_only: impl FnOnce() -> Probe<u64>,
+    full_query: impl FnOnce() -> Probe<String>,
+) -> Probe<ClockRange> {
+    let mut failures: Vec<String> = Vec::new();
+    match pair {
+        Ok(range) => return Ok(range),
+        Err(error) => failures.push(format!("clocks.min.sm and clocks.max.sm: {error}")),
+    }
+    match max_only() {
+        Ok(max_mhz) => {
+            return Ok(ClockRange {
+                min_mhz: 0,
+                max_mhz,
+            });
+        }
+        Err(error) => failures.push(format!("clocks.max.sm: {error}")),
+    }
+    match full_query() {
+        Ok(raw) => match parse_max_clock_from_query(&raw) {
+            Some(max_mhz) => {
+                return Ok(ClockRange {
+                    min_mhz: 0,
+                    max_mhz,
+                });
+            }
+            None => failures.push("nvidia-smi -q -d CLOCK: no Max Clocks/SM row".to_owned()),
+        },
+        Err(error) => failures.push(format!("nvidia-smi -q -d CLOCK: {error}")),
+    }
+    Err(ProbeError::NotApplicable(format!(
+        "the SM clock cap was not read, so the clock window was not checked; every nvidia-smi form failed: {}",
+        failures.join("; ")
+    )))
+}
+
+/// The two clock fields the probe reads, in the order it reads them: the minimum first, then the
+/// cap, so the range is assembled as `(min, max)` without depending on how `nvidia-smi` prints a
+/// multi-field row.
+const SM_CLOCK_FIELDS: [&str; 2] = ["clocks.min.sm", "clocks.max.sm"];
+
+/// Reads both SM clock fields through one query function, in [`SM_CLOCK_FIELDS`] order.
+///
+/// The order is the whole point: the old probe asked for `clocks.max.sm,clocks.min.sm` in one pair
+/// query and then read the row as `min,max`, so a device that answered it reported the cap as the
+/// minimum. One query per field, issued in a pinned order, is the fix, and this function is what a
+/// test can call to pin it.
+fn clock_pair(mut query: impl FnMut(&str) -> Probe<u64>) -> Probe<ClockRange> {
+    let min_mhz = query(SM_CLOCK_FIELDS[0])?;
+    let max_mhz = query(SM_CLOCK_FIELDS[1])?;
+    Ok(ClockRange { min_mhz, max_mhz })
+}
+
+/// One single-field clock query, parsed as MHz.
+fn clock_field(field: &str) -> Probe<u64> {
+    let raw = SystemProbes::output(
+        "nvidia-smi",
+        &[
+            &format!("--query-gpu={field}"),
+            "--format=csv,noheader,nounits",
+        ],
+    )?;
+    parse_clock_cap(&raw)
+        .ok_or_else(|| ProbeError::Unavailable(format!("nvidia-smi reported no usable {field}")))
+}
+
 impl GpuProbe for SystemProbes {
     fn sm_clock_range_mhz(&self) -> Probe<ClockRange> {
-        let raw = Self::output(
-            "nvidia-smi",
-            &[
-                "--query-gpu=clocks.max.sm,clocks.min.sm",
-                "--format=csv,noheader,nounits",
-            ],
-        )?;
-        let line = raw
-            .lines()
-            .next()
-            .ok_or_else(|| ProbeError::Unavailable("nvidia-smi reported no clock row".into()))?;
-        let mut fields = line.split(',').map(|field| field.trim());
-        let parse = |value: Option<&str>, what: &str| -> Probe<u64> {
-            value
-                .and_then(|value| value.parse::<u64>().ok())
-                .ok_or_else(|| {
-                    ProbeError::Unavailable(format!("nvidia-smi reported no usable {what} clock"))
-                })
-        };
-        Ok(ClockRange {
-            min_mhz: parse(fields.next(), "minimum SM")?,
-            max_mhz: parse(fields.next(), "maximum SM")?,
-        })
+        // One query per field, issued in SM_CLOCK_FIELDS order: a single pair query depends on the
+        // order nvidia-smi prints the row in, and the old one asked for the cap first and read it
+        // as the minimum.
+        clock_range_from(
+            clock_pair(clock_field),
+            || clock_field("clocks.max.sm"),
+            || Self::output("nvidia-smi", &["-q", "-d", "CLOCK"]),
+        )
     }
 
     fn lock_sm_clocks(&self, min_mhz: u64, max_mhz: u64) -> Probe<String> {
@@ -2107,8 +2198,8 @@ pub fn check_clocks_memory(probes: &Probes, options: &Options) -> CheckOutcome {
         // cap, plus a sanity check that the probe did not read the window backwards.
         if range.max_mhz <= MAX_SM_CLOCK_MHZ && range.min_mhz <= range.max_mhz {
             evidence.pass(format!(
-                "SM clocks lockable within [{}, {}] MHz (device reports {}..{} MHz)",
-                MIN_SM_CLOCK_MHZ, MAX_SM_CLOCK_MHZ, range.min_mhz, range.max_mhz
+                "SM clock cap {} MHz is within the permitted lock window [{}, {}] MHz",
+                range.max_mhz, MIN_SM_CLOCK_MHZ, MAX_SM_CLOCK_MHZ
             ));
         } else {
             evidence.fail(
@@ -3105,6 +3196,136 @@ mod tests {
     }
 
     // ---- check 4 ------------------------------------------------------------------------
+
+    #[test]
+    fn the_clock_pair_reads_the_minimum_before_the_maximum() {
+        // The HIGH this pins: the probe asks nvidia-smi for each field separately, in the order
+        // recorded in SM_CLOCK_FIELDS, so the range is (min, max) without trusting nvidia-smi's
+        // print order for a multi-field row.
+        let mut asked: Vec<String> = Vec::new();
+        let pair = clock_pair(|field| {
+            asked.push(field.to_owned());
+            Ok(if field == SM_CLOCK_FIELDS[0] { 0 } else { 2200 })
+        })
+        .expect("both fields answer");
+        assert_eq!(
+            asked,
+            SM_CLOCK_FIELDS
+                .iter()
+                .map(|field| (*field).to_owned())
+                .collect::<Vec<_>>(),
+            "the probe must ask for each field exactly once, in SM_CLOCK_FIELDS order"
+        );
+        assert_eq!(
+            pair,
+            ClockRange {
+                min_mhz: 0,
+                max_mhz: 2200
+            }
+        );
+    }
+
+    #[test]
+    fn the_clock_probe_prefers_the_pair_when_the_device_answers_it() {
+        let range = clock_range_from(
+            Ok(ClockRange {
+                min_mhz: 0,
+                max_mhz: 2200,
+            }),
+            || unreachable!("the pair answered"),
+            || unreachable!("the pair answered"),
+        )
+        .expect("the pair answers");
+        assert_eq!(
+            range,
+            ClockRange {
+                min_mhz: 0,
+                max_mhz: 2200
+            }
+        );
+    }
+
+    #[test]
+    fn the_clock_probe_falls_back_to_the_cap_alone_when_the_pair_query_is_refused() {
+        // GB10 evidence (docs/build/aarch64-pipeline.md appendix C): the two-field query exits 2
+        // with empty stderr, so the single-form probe failed a node whose clocks it never read.
+        let range = clock_range_from(
+            Err(ProbeError::Unavailable(
+                "nvidia-smi exited with exit status: 2: ".to_owned(),
+            )),
+            || Ok(1700),
+            || unreachable!("the cap-only form answered"),
+        )
+        .expect("the cap-only fallback answers");
+        assert_eq!(
+            range,
+            ClockRange {
+                min_mhz: 0,
+                max_mhz: 1700
+            }
+        );
+    }
+
+    #[test]
+    fn the_clock_probe_falls_back_to_the_full_query_table() {
+        let full = "==============NVSMI LOG==============\n\n\
+Attached GPUs                             : 1\n\
+GPU 00000000:01:00.0\n\
+    Clocks\n\
+        SM                                : 210 MHz\n\
+    Max Clocks\n\
+        Graphics                          : 2450 MHz\n\
+        SM                                : 1700 MHz\n\
+        Memory                            : 3200 MHz\n\
+    Clocks Event Reasons\n\
+        Idle                              : Active\n";
+        assert_eq!(parse_max_clock_from_query(full), Some(1700));
+        assert_eq!(
+            parse_max_clock_from_query("    Clocks\n        SM : 210 MHz\n"),
+            None,
+            "a table with no Max Clocks heading must not be read as a cap"
+        );
+        let range = clock_range_from(
+            Err(ProbeError::Unavailable("exit 2".to_owned())),
+            || Err(ProbeError::Unavailable("exit 2".to_owned())),
+            || Ok(full.to_owned()),
+        )
+        .expect("the full query answers");
+        assert_eq!(
+            range,
+            ClockRange {
+                min_mhz: 0,
+                max_mhz: 1700
+            }
+        );
+    }
+
+    #[test]
+    fn an_unreadable_clock_probe_reports_not_applicable_rather_than_a_failure() {
+        let mut fake = Fake::happy();
+        fake.clocks = clock_range_from(
+            Err(ProbeError::Unavailable(
+                "nvidia-smi exited with exit status: 2: ".to_owned(),
+            )),
+            || Err(ProbeError::Unavailable("exit 2".to_owned())),
+            || Err(ProbeError::Unavailable("exit 2".to_owned())),
+        );
+        assert!(matches!(fake.clocks, Err(ProbeError::NotApplicable(_))));
+        let outcome = check_clocks_memory(
+            &fake_probes(&Arc::new(fake)),
+            &Options {
+                local: true,
+                ..Options::default()
+            },
+        );
+        assert_eq!(
+            outcome.status,
+            CheckStatus::NotApplicable,
+            "a cap that was never read is not a cap that was exceeded: {:?}",
+            outcome.details
+        );
+        assert!(outcome.summary.starts_with("DID NOT RUN"));
+    }
 
     #[test]
     fn clock_window_accepts_the_documented_cap_and_refuses_one_mhz_more() {

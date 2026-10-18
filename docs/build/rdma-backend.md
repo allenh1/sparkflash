@@ -421,6 +421,10 @@ technical record - the ABI subset (2), bring-up (3), the QP machine (4), control
 the rail layout and its evidence (7), modes (8), errors (9), verified scope (10), exact commands (11)
 and honest limits (12).
 
+Section 15 is **not** a decision and records none: it is the design of the seam between the GPU
+one-shot kernel and this data-plane backend, written so the wiring MR has a protocol to implement and
+a list of measurements that would make it a decision. No code in the tree implements it.
+
 ## 14. Documentation follow-ups
 
 The stale claims this section listed were fixed when D29 landed: `docs/QUALIFICATION.md` now describes
@@ -430,3 +434,191 @@ carry the corrected mechanism and the single-rank probe limit. The host-memory s
 and single-rail gaps are recorded in this document's section 12, not in `docs/QUALIFICATION.md` or
 `docs/build/roadmap-to-serving.md` (the roadmap never mentions single-rail). Keep this section as the record of that change, not a list of outstanding work.
 
+
+## 15. The GPU one-shot kernel and this data plane: the seam that does not exist yet
+
+Two artefacts in this tree describe the same collective and do not meet:
+
+* the **kernel** `kernels/rocenante_oneshot_sm121.cu` with its fixed slot ABI
+  `kernels/rocenante_oneshot_sm121.cuh` (an 8 MiB + 32 B slot: `arrival_seq[4]` then
+  `payload[4][1024*1024]` bf16, header :58-72), which stages the local rank's row into coherent UMA,
+  writes a **host doorbell word** after a `__threadfence_system()` (kernel :100-101), waits for
+  `arrival_seq[peer] >= seq`, and reduces in canonical rank order;
+* the **backend** in this document, which is what actually moves bytes today: host-memory staging,
+  per-(peer, phase) slots of `24 + max_frame_bytes` bytes with a frame header and a rail-split
+  payload, `WRITE_WITH_IMM` per rail, and a caller that polls the CQs synchronously in
+  `collect` (`crates/sparkflash-comm/src/rdma/dataplane.rs:1041`).
+
+They are not two implementations of one protocol. They are two protocols.
+
+**What actually happens on a dispatch today** (the host-staging path, section 6): the payload is
+copied into a registered host staging slot on send (`fill_send_slot`,
+`dataplane.rs:662-723`), moved by the NIC, and copied out of the peer's staging slot into a
+`Vec<u16>` on receive (`assemble_frame`, `dataplane.rs:825-860`). The kernel that would remove
+both copies is not on that path: `KernelId` has seven variants and none is this kernel
+(`crates/sparkflash-kernels/src/cuda_driver.rs:156-171`), the symbol appears only in the build
+script's probe and in the ABI text pin (`build.rs:102`, `roce_abi.rs:417`), and the kernel's own
+header says so: "Neither can run the kernel" (`rocenante_oneshot_sm121.cu` verification status).
+
+### 15.1 Why they cannot be glued as they are
+
+1. **Slot geometry.** The kernel's slot is one fixed 8 MiB + 32 B object per rank (8,388,640 B:
+   `arrival_seq[4]` = 32 B, then four `payload` rows of 2,097,152 B each); the data plane's units are
+   per-peer/phase slots of `24 + max_frame_bytes`. A data-plane frame header cannot live inside
+   `payload[peer]` (it would be reduced as bf16 data), and the 8 MiB slot - one object holding all
+   four ranks' rows - does not fit the per-frame slot plan, whose unit is a single frame.
+2. **Arrival signalling.** The kernel waits on a **memory word**, `arrival_seq[peer]`. The data
+   plane's completion signal is a **CQE immediate**; `WRITE_WITH_IMM` delivers the immediate to the
+   receive queue, not to memory. The kernel header's sentence that a peer's NIC publishes
+   `arrival_seq` "as an RDMA_WRITE_WITH_IMM" (`rocenante_oneshot_sm121.cuh:63-67`) is therefore
+   not achievable with that verb alone: publishing the word needs either an extra 8-byte RDMA WRITE
+   of its own, or a receive-side agent that writes it after the completions. This is a documentation
+   defect, not a layout defect - the ABI already has the 8-byte word a WRITE can target.
+3. **Rail split.** In dual-rail mode every data-plane frame is split across both rails (section 6);
+   single-rail mode has one rail. The kernel expects each peer's **whole** row. Under a rail split no
+   single rail's NIC sees the whole frame, so the arrival word can only be published after **both**
+   rails' completions are observed - a job for a receive-side agent, not for one NIC.
+4. **Who drives.** The data plane is caller-synchronous: `prepare`, `send`, `collect`, `finish`
+   (`exchange.rs:49-59`) run on the thread that owns the buffer, and `collect` polls the CQ in that
+   thread. The kernel's handshake is asynchronous and the caller is the GPU: the doorbell is written
+   by the device and the kernel spins inside the launch until the peers' rows arrive. A host proxy
+   that polls the doorbell and the CQs is not an optimisation here; it is what the protocol requires.
+5. **The collective API is host-slice shaped.** `Transport::all_reduce_bf16(&self, buf: &mut [u16],
+   seq: u64, layout: &CollectiveLayout)` (`transport.rs:41`) and its real implementation over
+   `DataPlane` (`rdma.rs:652-668`) take a **host** slice. A device-resident buffer cannot be expressed through
+   that signature without staging it back to the host - which is exactly the copy the kernel exists
+   to remove. The zero-copy path needs a device-buffer collective seam, not just another transport.
+
+### 15.2 The proposed seam (design, not implemented)
+
+Costed in one sentence: the kernel's slot and doorbell live in UMA memory that both the GPU and the
+NIC's MR can reach, a host proxy posts one `WRITE_WITH_IMM` per rail from the slot, and every payload
+byte moves GPU -> NIC -> peer GPU with **no CPU memcpy**. The CPU moves control words only (doorbell
+read, completion reaping, one 8-byte arrival store per peer).
+
+**(a) Memory.** One `RoceOneShotSlot` (8 MiB + 32 B) plus the 8-byte doorbell, in an allocation that
+is (i) device-addressable, and (ii) registerable with `ibv_reg_mr`. Today's backend registers host
+`Box<[u8]>` only (`dataplane.rs:529-533`, section 12 limit 1), and the driver wrapper has
+`cuMemAlloc_v2` only (`cuda_driver.rs:323`) - no host-allocation or UVA-mapping entry point. Two
+ways to allocate the slot, in order of preference:
+
+1. **Pinned host memory with a device alias** (`cudaHostAllocMapped` / `cuMemHostAlloc` +
+   `cuMemHostGetDevicePointer`). On GB10's coherent UMA the GPU writes the slot through its alias and
+   the NIC DMAs into the same physical memory; `ibv_reg_mr` is expected to work as it does for
+   today's staging buffer, but that is unverified on these nodes (15.5). This needs a new
+   driver-wrapper call, not a new kernel ABI.
+2. **Device memory registered with `ibv_reg_dmabuf_mr`.** Zero host memory, but the backend has no
+   dmabuf registration code (no `dmabuf` symbol in `verbs.rs`/`abi.rs`), so this is new ABI, a new
+   ioctl export path and a hardware unknown. Do not start here.
+
+Size and lifetime: one slot per collective step in flight, double-buffered by the communicator (the
+kernel's caller contract already says the slot must not be reused for `seq + 1` until every rank has
+finished `seq`); 2 x 8 MiB + 64 B of control words is 16 MiB, negligible against the 130.66 GB
+device.
+
+**(b) The proxy thread.** One per rank, started when the first one-shot collective is dispatched,
+owning the two rails' QPs and CQs for this path. Loop:
+
+- poll the **doorbell word** (UMA, `AtomicU64` acquire load). When it reaches `seq`, the GPU has
+  staged and fenced this rank's row;
+- for each of the three peers and each rail, post a `WRITE_WITH_IMM` of that rail's whole-element
+  half of `payload[my_rank]`; the immediate is a **cross-check, not the arrival word's source**:
+  `imm_encode` packs the sender in bits 31:24, the phase in bit 16, the kind in bit 8 and only the
+  **low byte** of the sequence in bits 7:0 (`dataplane.rs:223-232`), so it cannot carry the full
+  sequence an arrival publish needs. The proxy is told the full `(seq, elements)` by the dispatch -
+  the collector already knows which exchange it is serving - and checks the immediate's sender, phase
+  and low sequence byte against that expectation; the phase/kind bits are part of the exchange
+  protocol, not spare;
+- drain this proxy's own send CQEs (the existing `pending_sends` accounting is the model);
+- on the **receive** side, poll both CQs; when both rail immediates for `(peer, seq)` have arrived,
+  store `arrival_seq[peer] = seq` **release** (8 bytes, no payload touched). The kernel's spin then
+  sees the row and reduces.
+- no frame header is needed on this path: the geometry is fixed (TP=4, row <= 2 MiB) and the immediate
+  attributes the frame; the header's validation role is replaced by the slot geometry and the arrival
+  word. This keeps the kernel ABI byte-identical.
+
+**(c) The arrival word, corrected.** The kernel header's contract changes from "the peer's NIC
+publishes `arrival_seq`" to "the peer's receive-side proxy publishes `arrival_seq[sender] = seq`
+after both rails' frames for the `(sender, seq)` the dispatch named have been observed"; the
+immediate corroborates the sender and the low sequence byte, it does not supply the word. The **layout** does not
+change (an 8-byte word written by a host store), so `rocenante_oneshot_sm121.cuh`'s struct and
+`roce_abi.rs`'s offsets stay pinned; the header comment and the `roce_abi` doc comment are edited
+deliberately in the wiring MR, because they are part of the pinned ABI *text*.
+
+**(d) The device-buffer seam.** Add a device-pointer form of the one-shot collective next to the
+host-slice `Transport` method (for example `all_reduce_bf16_device(device_ptr, elements, seq)`,
+implemented by the kernel launch + proxy handshake). The host-slice `Transport` stays exactly as it
+is for loopback, TCP and every CI test; the device form is only reachable when the buffer really is
+device memory. This is a new trait method, not a signature change to the existing one, so the current
+call sites and tests are untouched.
+
+**Latency shape, stated without a number.** The proxy adds two host hops to the device path: doorbell
+poll (GPU store -> host read) before the posts, and CQ poll (NIC completion -> host store) before the
+arrival publish. The kernel's peer wait is bounded at 1 ms by default
+(`SPARK_ROCENANTE_PEER_WAIT_NS`, header :127-128; D11's bounded wait), which is generous against a
+spinning proxy but must be checked against a proxy that ever blocks. Nothing here is measured: the
+20 us gate (QUALIFICATION 3.1) is the bar the window run must clear, not a prediction of this design.
+
+### 15.3 What the wiring MR would contain
+
+1. Driver-wrapper host allocation + device alias (`cuMemHostAlloc`, `cuMemHostGetDevicePointer`,
+   `cuMemFreeHost`), with the existing allocation accounting respected.
+2. `OneShotSlot` allocation and MR registration in the comm crate, separate from the per-frame
+   staging plan (the one-shot path never uses the generic inbox/send slots).
+3. The proxy thread and its state machine (pure, injectable completions -> unit-testable on x86).
+4. The device-buffer collective seam (d) and the kernel launch plumbing (a `KernelId` variant, a
+   typed launcher, the cubin baseline entry - the kernel is probed today but not in the pinned
+   baseline set).
+5. The deliberate ABI-text correction (c), plus tests that assert the edited text is what the parser
+   reads (the existing `roce_abi` parse tests are the model).
+6. **No change** to the host-staging backend, the schedule driver, the TcpTransport or any CI test.
+
+### 15.4 The test plan (correctness first, one measurement last)
+
+Hardware-free (this host, no libibverbs, no device):
+
+1. **Slot arithmetic and plan.** `payload[r]` offset `32 + r * 2 MiB`, `arrival_seq[r]` offset
+   `8 * r`, rail halves as whole bf16 elements, immediate round trip, refusal when `num_elements`
+   exceeds the row or `seq` is not strictly increasing. Unit tests in `roce_abi.rs` /
+   `dataplane.rs` style.
+2. **Proxy state machine.** Feed it a scripted sequence of completions (both rails out of order, one
+   rail late, duplicate, missing) and assert: arrival is published exactly once, only after both
+   rails, with the seq the dispatch named; a missing rail never publishes; a stale seq or a
+   mismatched immediate is refused.
+3. **Numerics contract.** The device path is only correct if its result equals `roce_reduce`'s
+   canonical order bit for bit; the existing CPU reference and its golden vectors are the test, and
+   the proxy must never reorder or re-round anything (it moves bytes and writes arrival words; the
+   kernel's reduction order is already pinned).
+4. **CI / no-hardware refusal.** Feature-off build unchanged; feature-on build returns typed errors on
+   a host without libibverbs, as section 10 already asserts.
+
+Window (needs Lead orchestration and all four nodes; no number may be quoted before it runs):
+
+5. **One 10 KiB all-reduce through the kernel path on four ranks.** Assert every rank's output equals
+   the CPU reference on the same bytes (bit-identical, finite values; NaN payloads are outside the
+   contract per `roce_reduce`'s docs); the kernel's own trace record carries the staging and
+   peer-ready timestamps, so the window prints the doorbell->arrival interval directly.
+6. **Determinism.** 10,000 replays byte-identical (QUALIFICATION 3.2), two runs per configuration.
+7. **The gate.** QUALIFICATION 3.1's 10 KiB All-Reduce under 20 us p50 is the acceptance bar; this
+   design is not allowed to claim it before the run prints it. If the proxy cannot meet it, the
+   honest fallbacks are the existing host-staging path or a single-rail mode - not a redefined gate.
+
+### 15.5 Honest limits of this design
+
+- **It is not written yet.** Nothing in this section exists in code; the two artefacts it joins are
+  real, the seam is a proposal.
+- **Pinned-host MR is unverified.** Preference (a) uses pinned host memory; whether `ibv_reg_mr`
+  over such a mapping works on these nodes is as unverified as the rest of the hardware path
+  (section 10: no hardware run, ever). Preference (b)'s device-memory MR via `ibv_reg_dmabuf_mr` is
+  unverified for a second reason: no registration code for it exists in the backend.
+- **One extra wake-up hop.** A spinning proxy is assumed; a blocking or yielding proxy can exceed
+  the kernel's 1 ms peer-wait budget under contention. A pinned spinning proxy thread costs a core
+  during the collective - an acceptable but real cost.
+- **Single rail is simpler and may be faster for 10 KiB.** With one rail the arrival publish needs only
+  one completion and the frame fits one rail trivially; the design keeps the two-rail path because
+  D29's gate requirement is dual-rail capable, and the window run should measure both.
+- **No latency or bandwidth number is claimed.** The design removes two CPU payload copies and adds
+  control-plane polling; whether that is faster than the host-staging path on this hardware is the
+  window's question, not this document's answer.
+- **The kernel's 2 MiB row cap is unchanged**, so prefill payloads above it still route to the NCCL
+  ring; this seam touches only the one-shot class (roadmap section 7.2).

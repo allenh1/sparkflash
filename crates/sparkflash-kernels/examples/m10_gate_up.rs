@@ -257,6 +257,37 @@ fn real_columns(padded: &[f32], routed_rows: usize) -> Vec<f32> {
     real
 }
 
+/// A control buffer already in the engine's real-column width (no ABI padding).
+///
+/// The distinct type is the regression guard for the first-window panic: `max_abs_delta` takes
+/// `&[f32]`, so restoring the old call site `max_abs_delta(&twin_gate_f32, &control_gate)` is a
+/// type error instead of a silent 640-wide-vs-576-wide comparison.
+#[derive(Debug, Clone, Default)]
+struct RealColumns(Vec<f32>);
+
+impl RealColumns {
+    fn with_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+
+    fn extend(&mut self, values: impl IntoIterator<Item = f32>) {
+        self.0.extend(values);
+    }
+
+    fn as_slice(&self) -> &[f32] {
+        &self.0
+    }
+}
+
+/// The engine-style f32 control is `[rows][WIDTH]` (no padding columns) while the twin returns the
+/// ABI's padded `[rows][WIDTH_PADDED]` rows. The gap comparison therefore goes through this helper:
+/// it selects the real columns first and only then takes the max abs delta, so a call site cannot
+/// accidentally compare a padded row with the control again.
+fn control_gap(twin_padded: &[f32], control: &RealColumns, routed_rows: usize) -> (f32, usize) {
+    let real = real_columns(twin_padded, routed_rows);
+    max_abs_delta(&real, control.as_slice())
+}
+
 fn max_abs(values: &[f32]) -> f32 {
     values
         .iter()
@@ -333,7 +364,7 @@ fn run() -> Result<(), String> {
          and the shared expert - those stay outside this kernel by contract.",
         args.tokens * twin::TOP_K,
         args.tokens * twin::TOP_K,
-        args.tokens * twin::TOP_K
+        args.tokens * twin::TOP_K * twin::WIDTH
     );
     check_floor(args.floor_gib, "m10_gate_up start")?;
 
@@ -466,8 +497,8 @@ fn run() -> Result<(), String> {
         .collect();
     let mut shared_gate = Vec::with_capacity(args.tokens * twin::TOP_K * twin::WIDTH);
     let mut shared_up = Vec::with_capacity(args.tokens * twin::TOP_K * twin::WIDTH);
-    let mut control_gate = Vec::with_capacity(args.tokens * twin::TOP_K * twin::WIDTH);
-    let mut control_up = Vec::with_capacity(args.tokens * twin::TOP_K * twin::WIDTH);
+    let mut control_gate = RealColumns::with_capacity(args.tokens * twin::TOP_K * twin::WIDTH);
+    let mut control_up = RealColumns::with_capacity(args.tokens * twin::TOP_K * twin::WIDTH);
     for (routed_row, expert) in ids.iter().enumerate() {
         let token = routed_row / twin::TOP_K;
         let expert = *expert as usize;
@@ -528,11 +559,9 @@ fn run() -> Result<(), String> {
     // The control is engine-style f32 (no padding columns), the twin is the ABI's padded rows:
     // compare the 576 real columns only, never the padding tail.
     let compared_rows = args.tokens * twin::TOP_K;
-    let twin_gate_real = real_columns(&twin_gate_f32, compared_rows);
-    let twin_up_real = real_columns(&twin_up_f32, compared_rows);
-    let (gate_gap, _) = max_abs_delta(&twin_gate_real, &control_gate);
-    let (up_gap, _) = max_abs_delta(&twin_up_real, &control_up);
-    let control_max = max_abs(&control_gate).max(max_abs(&control_up));
+    let (gate_gap, _) = control_gap(&twin_gate_f32, &control_gate, compared_rows);
+    let (up_gap, _) = control_gap(&twin_up_f32, &control_up, compared_rows);
+    let control_max = max_abs(control_gate.as_slice()).max(max_abs(control_up.as_slice()));
     println!(
         "host: twin vs shared-harness arithmetic {shared_mismatches} mismatched bf16 values of {} \
          real outputs per projection; engine-style f32 control gap over the {} real columns only: \
@@ -805,6 +834,32 @@ mod tests {
             let real = real_columns(&vec![0.0f32; rows * twin::WIDTH_PADDED], rows);
             assert_eq!(real.len(), rows * twin::WIDTH);
             assert_ne!(real.len(), rows * twin::WIDTH_PADDED);
+        }
+    }
+
+    /// The function the run actually calls. A 640-wide padded twin against a 576-wide control must
+    /// not panic, must ignore the padding tail even when the tail is enormous, and must report a real
+    /// column that differs. The call site cannot regress to `max_abs_delta(&twin_padded, &control)`:
+    /// `RealColumns` is not `&[f32]`, so that line no longer compiles.
+    #[test]
+    fn the_control_gap_slices_the_padded_twin_at_every_window_batch() {
+        for tokens in [1usize, 8, 130] {
+            let rows = tokens * twin::TOP_K;
+            let mut twin_padded = vec![0.5f32; rows * twin::WIDTH_PADDED];
+            let mut control = RealColumns(vec![0.5f32; rows * twin::WIDTH]);
+            // A padding tail that would dominate the gap if it were compared.
+            for row in 0..rows {
+                for column in twin::WIDTH..twin::WIDTH_PADDED {
+                    twin_padded[row * twin::WIDTH_PADDED + column] = 1.0e6;
+                }
+            }
+            assert_eq!(control_gap(&twin_padded, &control, rows), (0.0, 0));
+            // One real column (row 0, column 7) differs by 1.5: the gap reports it at index 7.
+            twin_padded[7] = 2.5;
+            control.0[7] = 1.0;
+            let (gap, at) = control_gap(&twin_padded, &control, rows);
+            assert!((gap - 1.5).abs() < f32::EPSILON, "gap was {gap}");
+            assert_eq!(at, 7);
         }
     }
 }

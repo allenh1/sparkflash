@@ -426,14 +426,16 @@ Engram, DSpark) so a change to the derivation shows up as a diff, not as a token
 
 ### 4.3 What stays on the host in Phase 1, and why that is labelled
 
-The device path today has six kernels with baseline entries and a seventh,
-`swiglu_mxfp8_quant_sm121`, that has never been compared against a reference (task-43). Phase 1 keeps these on the host and **names each
-one** in the run output:
+The device path today has nine kernels with baseline entries: the six Milestone-4 ABI kernels, the
+SwiGLU quantiser epilogue `swiglu_mxfp8_quant_sm121` (never compared against a reference, task-43),
+the task-37 router `moe_router_sm121` (measured in its own correctness harness) and the task-8
+routed gate/up kernel `routed_gate_up_sm121` (measured in its own harness). None of the last three is
+on the served decode path yet. Phase 1 keeps them on the host and **names each one** in the run output:
 
 | Seam | Why it is still host | Task that moves it |
 | :--- | :--- | :--- |
 | Router (gate GEMM, sqrt-softplus, noaux_tc bias, top-6, `norm_topk_prob`) | No device kernel reduces K = 5120 against packed FP4 weights; the gate itself is bf16 times quantised A | task-37 |
-| gate/up (w1/w3) GEMM | Same missing K = 5120 kernel | Phase 3 |
+| gate/up (w1/w3) GEMM | The K = 5120 kernel exists (`routed_gate_up_sm121`) but it is not on the served decode path | task-8, then Phase 3 |
 | SwiGLU and the activation quantiser | The seventh kernel exists but is unproven; it must be compared before it is trusted | task-43, then Phase 3 |
 | HSI candidate merge (top-512 over the pool) | A pipeline step the attention kernel does not implement (stage-2 label) | Phase 2/3 |
 | Head and sampling | `cert_lm_head_sm121` exists but has never run against a reference on the device path | Phase 1 stage 4 / Phase 3 |
