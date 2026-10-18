@@ -31,7 +31,7 @@ no doc comment is orphaned from its item.
 | `stage8.rs` | 326 | 4008-4331 | 324 | stage 8, B1 probes of never-executed kernels |
 | `stage7.rs` | 1924 | 4364-6276 | 1913 | stage 7, K5 flash_mla window attention |
 | `stage9.rs` | 1948 | 6277-8219 | 1943 | stage 9, the 40-layer released-checkpoint column |
-| (dropped) | - | 8220-8224 | 5 | a dangling section banner (`// Raw CUDA driver API ...`) whose code had already moved to `src/cuda_driver.rs` in D12's Task-8 extension. Comments only; nothing below it. |
+| (dropped) | - | 8220-8224 | 5 | a dangling section banner (`// Raw CUDA driver API ...`) whose code had already moved to `src/cuda_driver.rs` in D7's Task-8 extension. Comments only; nothing below it. |
 
 Every module starts with `use super::*;` (the crate root's items, including its `use` bindings)
 plus the sibling stages whose items it calls, at a `crate::` path because a sibling module cannot
@@ -175,11 +175,13 @@ its new layout. All three changes are mechanical; the diffs are in 954d7af.
   write scope of the task; the Lead reviewed and accepted the mechanical edit.
 
 Known stale references **not** fixed here because they are outside this task's scope (all
-comments/docs, no code): historical DECISIONS entries D12's Task-8 extension (lines 239, 248) and the
-D24 consequence at `docs/DECISIONS.md:1204`, both describing the file as it was at their own commit. The three stale `examples/m7_layer0.rs`
-comments left here at !69 time (`crates/sparkflash-kernels/Cargo.toml:42`, `src/cuda_harness.rs:3`,
-`src/mega_mhc_ref.rs:146`) were fixed in the !72 follow-up. `src/lib.rs` and `src/m7_layer0_shapes.rs` name `m7_layer0` (the example target) without the
-file extension and stay correct.
+comments/docs, no code): historical DECISIONS entries D7's Task-8 extension and the D24
+consequence, both describing the file as it was at their own commit; they are cited by decision
+number, not by line, so a later table insertion cannot stale them.
+The three stale `examples/m7_layer0.rs` comments left here at !69 time
+(`crates/sparkflash-kernels/Cargo.toml:42`, `src/cuda_harness.rs:3`, `src/mega_mhc_ref.rs:146`) were
+fixed in the !72 follow-up. `src/lib.rs` and `src/m7_layer0_shapes.rs` name `m7_layer0` (the example
+target) without the file extension and stay correct.
 
 ## 6. Citing lines after the split
 

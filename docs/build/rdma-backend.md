@@ -6,7 +6,10 @@ feature and implement the dual-rail RoCEnante transport against libibverbs. Ever
 hardware line has been built and unit-tested on the x86 development box; **no cluster hardware was
 opened by the author of this document**. The three cluster gates and the `rocenante-probe` fabric
 path are written to measure, but the numbers they produce must come from a Lead-approved run on
-192.0.2.80/.84/.68/.59.
+192.0.2.80/.84/.68/.59. The rail, address and device facts in sections 7 and 11 were captured
+read-only from the window nodes by the Lead on 2026-10-18 and staged on this dev host; they are not
+measurements taken on this dev host, which has no RDMA devices under `/sys/class/infiniband` (the
+class directory is present but empty) and no `/dev/nvidia*`.
 
 ## 1. What the feature does, and what it does not change
 
@@ -409,66 +412,21 @@ table was wrong: fix the window, not the code.
     dlopen `Unsupported` first. That refusal and the real inline path were both verified on a host
     that has libibverbs and rdma-core 39 headers (the critic's container).
 
-## 13. Proposed DECISIONS entry (D29, for the Lead to splice)
+## 13. The decision record
 
-Numbering note: hygiene-dev's !69 claims D26 and engine-dev's !68 claims D27 and D28, so this entry
-is D29 and `docs/DECISIONS.md` is untouched here; the Lead splices it in numeric order at merge
-time.
+The decision this document records is `docs/DECISIONS.md` **D29**: the backend is real and dual-rail
+capable, the deployed vLLM reference is single rail, and no document may cite that single-rail
+reference as dual-rail evidence. `docs/DECISIONS.md` is the normative record; this document stays the
+technical record - the ABI subset (2), bring-up (3), the QP machine (4), control and data plane (5-6),
+the rail layout and its evidence (7), modes (8), errors (9), verified scope (10), exact commands (11)
+and honest limits (12).
 
-```text
-## D29 - The ibverbs backend is real and dual-rail capable; the deployed vLLM reference is single rail
+## 14. Documentation follow-ups
 
-Recorded 2026-10-18.
-
-**Evidence.** crates/sparkflash-comm/src/rdma.rs and its abi/verbs/qpinfo/dataplane submodules
-implement the RoCEnante transport against a run-time dlopen of libibverbs: 16 entry points are
-resolved with dlsym and the three inline ones (ibv_post_send, ibv_post_recv, ibv_poll_cq) come from
-a bundled C shim compiled by build.rs against the real rdma-core header, because libibverbs does
-not export them; a build without the header refuses at load naming the header rather than opening a
-device it cannot post to. The hand-written repr(C) mirror is asserted field by field against
-rdma-core 39's verbs.h (send WR is the full 128-byte object including the trailing bind_mw/tso
-union, port attr 52 bytes, QP attr 144 bytes; ibv_qp and ibv_mr are labelled read-only prefixes)
-and the feature compiles only with the rdma flag; the default build gains no dependency and every
-non-rdma path is unchanged. The control-plane star exchanges per-(rail, peer) QP numbers, GIDs,
-staging MR addresses, remote keys and the staging geometry (frame cap, slot size, rail count,
-refusing any disagreement); the data plane posts RDMA WRITE_WITH_IMM over one RC QP per (rail,
-peer), validates completion opcodes and immediate byte order, and accounts posted bytes per rail. The deployed vLLM reference was measured to be single rail (docker exec vllm_node
-env): NCCL_IB_HCA=rocep1s0f1, NCCL_IB_GID_INDEX=3, NCCL_SOCKET_IFNAME=enp1s0f1np1, with line 10 of
-/home/user/phase2-evidence/window-2026-10-18/vllm-launch-recipe.sh overriding the launch
-script's twin-pair environment. The second twin (roceP2p1s0f1) is ACTIVE at 200000 Mb/s but unused
-by the deployed recipe. On the live nodes the specification's f0 rails are PORT_DOWN; the resolver
-validates ACTIVE and >= 200 Gb/s and selects the f1 twins on distinct cards.
-
-**Decision.** The ibverbs backend is real (not a skeleton) and must be dual-rail capable, but no
-document may cite the deployed vLLM configuration as dual-rail evidence: it is single rail as
-measured above. Dual rail (aggregate >= 180 Gbps, QUALIFICATION 3.3) is our requirement. The
-hardware gates run and report both modes, and the counter gate refuses to claim dual-rail evidence
-from a single-rail run. docs/build/rdma-backend.md is the authoritative description of the backend,
-its ABI subset, rail layout, verified scope and honest limits; QUALIFICATION.md and the roadmap
-must stop calling the backend a skeleton or the gates panic stubs, and the stale D17 finding 3/4
-text is superseded.
-
-**Consequence.** At record time no hardware gate has been run on the cluster: the backend, the
-three gate bodies and doctor check 3 compile and are hardware-free-tested, and the first four-node
-run is the next Lead-sequenced step. The host-memory staging buffer (not GPUNetIO device slots), the
-1024-byte active MTU, driver 580.173.02 and the single-rail deployed reference are recorded gaps,
-not verified qualifications. The three inline wrappers require rdma-core headers at build time; the
-hardware-free CI host exercises the stub compile path, while the stub-specific `load()` refusal
-needs a host that has libibverbs but no headers, and the real inline path needs the headers.
-```
-
-## 14. Stale text for the documentation owner
-
-The backend landing makes these existing claims false; the owner of docs/ should fix them
-(comm-dev's write scope stops at this file):
-
-- `docs/QUALIFICATION.md` lines 32-34 (the three gates described as a panic stub / no instrument),
-  line 86 (bandwidth never run), the section around lines 146-190 ("the backend is a skeleton",
-  "RdmaNotBuilt"), the findings around lines 479-486 and 523, and lines 570-571.
-- `docs/build/roadmap-to-serving.md` lines 130-131, 896-897, 1003, 1151-1152, 1195, 1264-1265.
-- `docs/DECISIONS.md` D17 (entry at line 671), findings 3-4 and 7 around lines 705-724: the gates
-  are no longer stubs, the backend no longer returns `RdmaNotBuilt`, and doctor check 3 no longer
-  uses only the first `--nodes` address (it hands every peer to the bandwidth probe and measures
-  this node's rank view once, failing when it cannot be measured; other ranks need concurrent probe
-  processes, not a fabricated loop).
+The stale claims this section listed were fixed when D29 landed: `docs/QUALIFICATION.md` now describes
+the backend as real and the three gates as real but never run, the runbook's per-rank doctor probe is
+stated with the four-concurrent-processes requirement, and `docs/DECISIONS.md` D17 findings 3-4 and 7
+carry the corrected mechanism and the single-rank probe limit. The host-memory staging, active-MTU
+and single-rail gaps are recorded in this document's section 12, not in `docs/QUALIFICATION.md` or
+`docs/build/roadmap-to-serving.md` (the roadmap never mentions single-rail). Keep this section as the record of that change, not a list of outstanding work.
 

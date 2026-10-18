@@ -29,16 +29,16 @@ forward from that earlier reading rather than re-measured for this document.
 
 | Gate | Spec | Instrument in the merged tree | State today |
 | :--- | :--- | :--- | :--- |
-| 10 KiB one-shot All-Reduce latency | 1336 (20 µs requirement), 1323 (22 µs preflight threshold) | `sparkflash doctor` check 3, which shells out to `rocenante-probe` (merged, labels checked, refuses rather than inventing a number); the crate's own test is a panic stub | **never run** (the instrument exists but the RDMA backend is a skeleton, so it can only refuse; see 3.1) |
-| Bit-identical collectives over 10,000 replays | 1336 | crates/sparkflash-comm/tests/hardware_gates.rs:52 is a panic stub; only the CPU reference side runs in CI | **never run** (no instrument; see 3.2) |
-| Dual-rail counters carry half the bytes each | 190, 1336 | crates/sparkflash-comm/tests/hardware_gates.rs:62 is a panic stub; doctor measures per-rail Gb/s instead | **never run** (no instrument; see 3.3) |
+| 10 KiB one-shot All-Reduce latency | 1336 (20 µs requirement), 1323 (22 µs preflight threshold) | `sparkflash doctor` check 3, which shells out to `rocenante-probe` (merged, labels checked, refuses rather than inventing a number); the crate's own gate has a real body | **never run** (the instrument is real - the RDMA backend is built and returns typed errors, not `RdmaNotBuilt` - but no run has been made and no frame has crossed a wire; see 3.1) |
+| Bit-identical collectives over 10,000 replays | 1336 | `roce_bits_match_the_cpu_reference_over_ten_thousand_replays` has a real gate body; only the CPU reference side runs in CI | **never run** (the gate is real, no four-node window has been taken, and no frame has crossed a wire; see 3.2) |
+| Dual-rail counters carry half the bytes each | 190, 1336 | `dual_rail_counters_show_both_interfaces_carrying_half_the_bytes` has a real gate body (single-rail mode refuses to claim dual-rail evidence); doctor measures per-rail Gb/s instead | **never run** (the gate is real, no four-node window has been taken, and no frame has crossed a wire; see 3.3) |
 | qeval 72/75 | 1340 | gates.rs:293 + `SPARKFLASH_QEVAL_RESULTS` | **never run** (no producer; see 3.4) |
 | DSpark KL < 0.007 | 1340 | gates.rs:308 + `SPARKFLASH_DSPARK_RESULTS` | **never run** (no producer; see 3.5) |
 | 1M-token needle | 1340 | gates.rs:325 + `SPARKFLASH_NEEDLE_RESULTS` | **never run** (no producer; see 3.6) |
 | sparkDash c = 1..16 | 1340 | gates.rs:338 + `SPARKFLASH_SPARKDASH_RESULTS` | **never run** (no producer; see 3.7) |
 | CUDA graph replay, batch 1..16 | 1340, 1336 | gates.rs:350 + `SPARKFLASH_CUDA_GRAPH_RESULTS` | **never run** (no producer and no graph-capture code; see 3.8) |
 | 45-step scoped trace, every scope | 1340 | `sparkflash trace` planner (trace_cli.rs) + gates.rs:362 | **never run** (planner only, no capture runner; see 3.9) |
-| Preflight, checks 1-5 | 1321-1325 | `sparkflash doctor` (real probes) | **measured read-only 2026-10-15**, not through this runbook: 3 checks measured failing (driver, MTU, memory), a 4th cannot pass (the Engram shards are not packed here: the packer exists but has not been run against the checkpoint), and check 3 has no instrument (section 2) |
+| Preflight, checks 1-5 | 1321-1325 | `sparkflash doctor` (real probes) | **measured read-only 2026-10-15**, not through this runbook: 3 checks measured failing (driver, MTU, memory), a 4th cannot pass (the Engram shards are not packed here: the packer exists but has not been run against the checkpoint), and check 3 has never run (section 2) |
 
 What has actually run: CI (.gitlab-ci.yml:52) executes `cargo test --workspace`, which excludes every
 ignored test, so the gates themselves never run in CI. The tests that do run in CI are the threshold
@@ -56,7 +56,7 @@ reader can see which precondition a future run skipped.
 
 ### 2.1 The four nodes and their addresses
 
-- The four ranks are addressed as `192.0.2.80, .84, .68, .59` (crates/sparkflash-comm/tests/hardware_gates.rs:18).
+- The four ranks are addressed as `192.0.2.80, .84, .68, .59` (`hardware_gates.rs:10-16`).
 - Both rails share `192.0.2.0/24` and each node holds **two** addresses, one per rail; the head node
   is `192.0.2.80` on rail 1 and `192.0.2.85` on rail 2 (docs/DECISIONS.md D12).
 - Rail 1 / rail 2 address pairs for all four nodes, measured read-only on 2026-10-18 (Lead; this is a
@@ -64,16 +64,17 @@ reader can see which precondition a future run skipped.
   `.64`/`.68`, node3 `.59`/`.63`. The full table, the ACTIVE f1 device names and the NCCL
   environment of the deployed reference are in `docs/build/rdma-backend.md`. Recovering these was a
   precondition; recording them is not the same as a dual-rail run, and no dual-rail gate has used
-  them yet (see 3.1, where one address for `--nodes` drives both rails' probes).
+  them yet (see 3.1: one doctor process probes every peer's two-rail bandwidth, but only its own
+  rank's latency view, so a four-rank number needs four concurrent doctor processes).
 - The deployed vLLM reference is **single-rail** (`NCCL_IB_HCA=rocep1s0f1`, read from the live
   container on 2026-10-18), while our gates target the dual-rail aggregate. Do not compare a
-  single-rail reference number with the dual-rail bar (`docs/build/rdma-backend.md`, section 3).
+  single-rail reference number with the dual-rail bar (`docs/build/rdma-backend.md`, section 7).
 
 ### 2.2 Permission and an exclusive window
 
 - The cluster gates refuse to run without an explicit per-run variable:
-  `SPARK_COMM_HW_PERMISSION=1` (hardware_gates.rs:10-21). Without it they panic before touching the
-  fabric, so a mis-typed `--ignored` cannot reach the cluster quietly.
+  `SPARK_COMM_HW_PERMISSION=1` (`hardware_gates.rs:20-21, 43-58`). Without it they panic before
+touching the fabric, so a mis-typed `--ignored` cannot reach the cluster quietly.
 - The cluster is **currently occupied by another instance**, which is why this runbook has not been
   executed: the last read-only measurement found `MemAvailable 5 GiB` on a node whose floor is 114 GiB
   (docs/DECISIONS.md D12; measured 2026-10-15). Any throughput or latency number taken while another
@@ -87,13 +88,13 @@ reader can see which precondition a future run skipped.
 | NVIDIA driver | >= 580.178.04; 580.142 is rejected | crates/sparkflash-cli/src/doctor.rs:64, 71; spec 1321 | 580.173.02 | **FAIL** |
 | Kernel | >= 6.17.0-1018, or 7.0.0-1019-nvidia-64k | doctor.rs:74-83; spec 1321 | 6.17.0-1029-nvidia | pass |
 | `nvidia-uvm` 64K page packing | active | spec 1321 | not verifiable: no parameter of that meaning among the module's 56 parameters | unknown |
-| Rail link speed | both rails ACTIVE at 200000 Mb/s | doctor.rs:86; spec 1322 | the f1 siblings are ACTIVE at 200 Gb/s; the f0 functions the spec names are DOWN at 40 Gb/s | **FAIL as written**, pass with siblings (doctor.rs:1694-1745) |
+| Rail link speed | both rails ACTIVE at 200000 Mb/s | doctor.rs:86; spec 1322 | the f1 siblings are ACTIVE at 200 Gb/s; the f0 functions the spec names are DOWN at 40 Gb/s | **FAIL as written**, pass with siblings (doctor.rs:1793-1986) |
 | Rail MTU | 9000, proven by a 8972-byte do-not-fragment ping | doctor.rs:89, 92; spec 1322 | 1500 | **FAIL** |
 | Aggregate RDMA bandwidth | >= 180 Gbps over both rails | doctor.rs:95; spec 1323 | not measured | never run |
 | 10 KiB one-shot All-Reduce | < 22 µs (doctor) or < 20 µs (spec 1336) | doctor.rs:98-101 | not measured; the probe binary is not on PATH | never run |
 | SM clock cap | [0, 2200] MHz | doctor.rs:104-107; spec 1324 | not measured | never run |
 | Available memory | `MemAvailable >= 114 GiB` per node | doctor.rs:110; spec 1324 | 5 GiB (other tenant resident) | **FAIL** |
-| Engram shards | `engram-l1-r{rank}of4.bin`, `engram-l14-r{rank}of4.bin` plus manifest, 512-byte aligned, ~48 GiB per node | doctor.rs:113-119, 2079-2135; spec 1325 | absent; `sparkflash pack-engram` exists and reads the checkpoint's safetensors shards (crates/sparkflash-cli/src/main.rs:42, crates/sparkflash-engram/src/packer.rs) but has not been run against the checkpoint, so no shard has been written | **FAIL** |
+| Engram shards | `engram-l1-r{rank}of4.bin`, `engram-l14-r{rank}of4.bin` plus manifest, 512-byte aligned, ~48 GiB per node | doctor.rs:113-119, 2181-2325; spec 1325 | absent; `sparkflash pack-engram` exists and reads the checkpoint's safetensors shards (crates/sparkflash-cli/src/main.rs:42, crates/sparkflash-engram/src/packer.rs) but has not been run against the checkpoint, so no shard has been written | **FAIL** |
 
 Section 2.4's second command is the one that produces this table; the "measured" column above is the
 2026-10-15 reading, not a run of that command.
@@ -108,20 +109,24 @@ cargo build --release -p sparkflash-cli
 
 - Flags are the ones the binary parses: `--nodes`, `--json`, `--apply`, `--lock-sm-clocks`,
   `--local`, `--engram-dir`, `--rank`, `--world-size`, `--rdma-seconds`, `--skip-hash`
-  (doctor.rs:1442-1476). `--local` probes one node; `--nodes` turns on the cluster checks.
+  (doctor.rs:1461-1600). `--local` probes one node; `--nodes` turns on the cluster checks.
 - **Pass criterion: the report's `verdict` is `"ready"`**, meaning every check ran and passed
-  (doctor.rs:1221-1281). The process exit code is **not** sufficient: `Verdict::Incomplete` (nothing
+  (doctor.rs:1312-1367). The process exit code is **not** sufficient: `Verdict::Incomplete` (nothing
   failed, at least one check did not run) also exits 0, and only `Verdict::NotReady` exits 1
-  (doctor.rs:1244-1252, 1270-1271).
-- `--apply` and `--lock-sm-clocks` are the only mutating flags and both are refused while a node may
-  be serving traffic (doctor.rs:1449-1457). Preflight is read-only: do not pass them during this
-  runbook.
+  (doctor.rs:1336-1337).
+- `--apply` is the master switch and `--lock-sm-clocks` is the only action behind it; the lock runs
+  only when both are given, and otherwise the doctor records a read-only note and does not change a
+  node that may be serving traffic (doctor.rs:2119-2140). This runbook passes neither.
 - Check 3 needs `ibv_write_bw` (perftest, still an external package) and `rocenante-probe` on PATH.
   The probe is a binary target of this workspace now - build it with `--features rdma` - and doctor
   fails the check loudly rather than pretending it ran when either command is missing.
-- The RDMA probe uses only the **first** node in `--nodes` (doctor.rs:743-745) and runs one
-  `ibv_write_bw` per local rail against it, so the "aggregate" it reports is two rails to one peer, not
-  a four-rank ring (doctor.rs:742-769). The same is true of the All-Reduce probe (doctor.rs:773-775).
+- The RDMA bandwidth probe hands **every** peer in `--nodes` to two `ibv_write_bw` runs (one per
+  local rail) and scores the worst peer, so its "aggregate" is every peer's two-rail bandwidth, not
+  one link (doctor.rs:2006-2052). The All-Reduce probe is different: one doctor process can measure
+  only its own rank's view (named by `--rank`), needs `SPARK_COMM_PEERS` as the full rank table with
+  rank 0 first because rank 0 binds its own address, and fails rather than skipping an unmeasurable
+  rank (doctor.rs:2053-2062); a four-rank latency needs four concurrent doctor processes
+  (docs/build/rdma-backend.md section 11.3).
 
 ### 2.5 What the preflight cannot tell you
 
@@ -153,50 +158,58 @@ Two mechanical facts apply to all six Milestone 5 gates:
 "10 KiB One-Shot All-Reduce latency < 22 µs".
 
 **Instrument.** `sparkflash doctor` check 3 (crates/sparkflash-cli/src/doctor.rs) invokes
-`rocenante-probe --bytes 10240 --peer <peer> --json` and reads the `oneshot_allreduce_us` field, with
-the byte size fixed by `ONESHOT_AR_BYTES = 10 * 1024`. The probe is a binary target of this workspace
-now (`crates/sparkflash-comm/Cargo.toml`, pipeline in `crates/sparkflash-comm/src/probe.rs`), and the
+`rocenante-probe --bytes 10240 --world <n> --rank <r> --peer ... --json` and reads the
+`oneshot_allreduce_us` field, with the byte size fixed by `ONESHOT_AR_BYTES = 10 * 1024`. The probe
+is a binary target of this workspace now (`crates/sparkflash-comm/Cargo.toml`, pipeline in
+`crates/sparkflash-comm/src/probe.rs`), and the
 JSON read is a pure function that requires `transport == "rdma"` and `fabric == true`: a loopback
 pipeline run is labelled and refused by name rather than scored against the fabric budget, which was
-a real exploit until the label check was added and is pinned by three tests. **The instrument exists
-and cannot measure on this hardware yet**: with the `rdma` feature the backend is a skeleton, so the
-probe refuses - on a host with no RDMA subsystem at `FabricUnavailable`, and only when the rails
-resolve at `RdmaNotBuilt` - and without the feature it names the exact rebuild command. The refusal
-is the honest output; a number from it would not be one.
+a real exploit until the label check was added and is pinned by three tests. **The instrument is real
+and has not run on this hardware yet**: the `rdma` feature's backend is implemented and returns typed
+errors (never `CommError::RdmaNotBuilt`), so a probe on a host without RDMA still refuses precisely
+(`FabricUnavailable`) instead of pretending, and without the feature it names the exact rebuild
+command. No frame has crossed a wire in any run recorded here, so there is no number to quote; a
+number from a loopback path would not be one.
 
 **Command.**
 
 ```bash
-# both rails to one peer, aggregate >= 180 Gbps and the 10 KiB one-shot latency
-./target/release/sparkflash doctor --nodes <peer> --rdma-seconds 1 --json
+# one doctor process per rank, all four at the same time: check 3 measures every peer's
+# two-rail bandwidth and this rank's 10 KiB All-Reduce view
+SPARK_COMM_PEERS=192.0.2.80,192.0.2.84,192.0.2.68,192.0.2.59 \
+  ./target/release/sparkflash doctor --rank 0 --nodes 192.0.2.84 --nodes 192.0.2.68 \
+  --nodes 192.0.2.59 --rdma-seconds 1 --json
 
-# the latency number on its own, once the probe binary is on PATH
-rocenante-probe --bytes 10240 --peer <peer> --json
-
-# the crate's own gate, which today cannot measure (see Status)
-SPARK_COMM_HW_PERMISSION=1 cargo test -p sparkflash-comm --features rdma \
-  --test hardware_gates -- --ignored --exact roce_oneshot_two_mib_all_reduce_meets_the_latency_budget
+# the three hardware gates, one staged binary per node: exact commands are in
+# docs/build/rdma-backend.md sections 11.2-11.3
+SPARK_COMM_HW_PERMISSION=1 SPARK_COMM_RANK=<0..3> SPARK_COMM_WORLD=4 \
+  SPARK_COMM_PEERS=192.0.2.80,192.0.2.84,192.0.2.68,192.0.2.59 \
+  ./hardware_gates-<hash> --ignored --test-threads=1 --nocapture
 ```
 
 **Pass criterion.** `oneshot_allreduce_us < 22.0` µs (doctor.rs:101) and aggregate
-`ibv_write_bw` >= 180.0 Gbps across the two rails (doctor.rs:95). The stricter `< 20 µs` of spec
-line 1336 is **not encoded anywhere** in the tree: no constant, no test, no probe field. A run must
-state which of the two it is claiming.
+`ibv_write_bw` >= 180.0 Gbps across the two rails to the worst peer (doctor.rs:95). The stricter
+`< 20 µs` of spec line 1336 is encoded once, as the gate's own constants
+(`hardware_gates.rs:112`, `:114`), and gate 1 asserts the 10 KiB median against it
+(`hardware_gates.rs:234`); doctor's 22.0 µs is doctor's own readiness threshold and the probe has
+no budget field. A run must state which of the two it is claiming. A green check 3 is every peer's
+worst-case two-rail bandwidth plus the running rank's latency view; the ring's four-rank latency
+needs four concurrent doctor processes (section 2.4).
 
 **Artifact.** The doctor JSON report (`tool`, `verdict` and the per-check evidence strings) plus the
-raw `rocenante-probe` JSON documents and the two `ibv_write_bw` outputs. Keep the peer address and the
+raw `rocenante-probe` JSON documents and the `ibv_write_bw` outputs. Keep the peer addresses and the
 rail device names with them: the aggregate is meaningless without them (section 2.4).
 
-**State: never run**, and the test that exists cannot run: its body is
-`panic!("not implemented on this host: ...")` (hardware_gates.rs:44-47). Note the payload mismatch:
+**State: never run.** The gate body is real; it needs `SPARK_COMM_HW_PERMISSION=1`, four nodes and a
+Lead-approved window, and none has been run, so no number exists. Note the payload mismatch:
 the test is named for **2 MiB** while the spec's budget and doctor's probe are for 10 KiB.
 
 ### 3.2 Bit-identical collectives over 10,000 replays
 
 **Spec.** Line 1336, second half: "bit-identical outputs across 10,000 CUDA graph replays".
 
-**Instrument.** crates/sparkflash-comm/tests/hardware_gates.rs:52
-`roce_bits_match_the_cpu_reference_over_ten_thousand_replays`, whose body is a `panic!` (lines 55-57).
+**Instrument.** The gate `roce_bits_match_the_cpu_reference_over_ten_thousand_replays` has a real
+body that replays the collective over the data plane and compares against the CPU reference.
 The CPU side of the comparison does exist and does run in CI:
 `sparkflash_comm::reduce::canonical_all_reduce_into`, exercised by
 crates/sparkflash-comm/tests/reduction_bits.rs. What is missing is the hardware side.
@@ -215,17 +228,19 @@ count as text.
 **Artifact.** The test log carrying the replay count and the first mismatching replay, plus the CPU
 reference digest it compared against.
 
-**State: never run**; the instrument does not exist (section 5, finding 3).
+**State: never run**; the gate is real but no four-node window has been taken, and no frame has
+crossed a wire (section 5, finding 3).
 
 ### 3.3 Dual-rail counters carry half the bytes each
 
 **Spec.** Line 190 (dual-rail topology: both halves active in parallel) and line 1336 (the transport
 being validated). The check exists as a test name, not as a spec sentence.
 
-**Instrument.** hardware_gates.rs:62
-`dual_rail_counters_show_both_interfaces_carrying_half_the_bytes`, body a `panic!` (lines 65-67).
-Doctor measures something adjacent but different: per-rail `ibv_write_bw` Gb/s, summed
-(doctor.rs:742-770). It does not read the counters.
+**Instrument.** The gate `dual_rail_counters_show_both_interfaces_carrying_half_the_bytes` has a real
+body that reads both rails' counters; in `SPARK_COMM_RAIL_COUNT=1` mode it asserts rail 1 carried zero
+bytes and refuses to claim dual-rail evidence.
+Doctor measures something adjacent but different: per-rail `ibv_write_bw` Gb/s toward every peer,
+summed and scored at the worst peer (doctor.rs:2006-2052). It does not read the counters.
 
 **Command.**
 
@@ -241,7 +256,8 @@ test). No hardware-side constant exists.
 
 **Artifact.** The two rails' counter readings before and after one dispatch, with the dispatch size.
 
-**State: never run**; the instrument does not exist.
+**State: never run**; the gate is real but no four-node window has been taken, and no frame has
+crossed a wire.
 
 ### 3.4 qeval 72/75
 
@@ -417,7 +433,8 @@ runbook that keeps a green board from being read as "defect-free".
    is compatible with an implementation that is numerically different everywhere the metric averages
    out.
 3. **Hardware state is one sample.** The latency and bandwidth gates measure one payload size
-   (10 KiB), one peer, one fabric state, and no contention. They do not sample the 2 MiB router
+   (10 KiB), one rank's latency view and every peer's two-rail bandwidth as a worst-peer snapshot in
+   one fabric state, with no contention. They do not sample the 2 MiB router
    threshold, the straggler path (docs/DECISIONS.md D11's bounded wait, NaN result and timeout trace
    record have never fired on hardware), or a rail failing mid-run.
 4. **Determinism over replays is not determinism over inputs.** 10,000 identical replays would show
@@ -482,42 +499,46 @@ contains an expectation and no instrument.
    lines 32-42, used in the six gate bodies at 291-374). Nothing in the repository writes them, so the
    operator has to obtain each summary from a harness that does not exist here. A gate that reads its
    result from an environment variable is only as good as the producer of that variable.
-3. **The three cluster gates are panic stubs.** crates/sparkflash-comm/tests/hardware_gates.rs:44-47,
-   55-57 and 65-67 all `panic!` with "not implemented on this host", after the permission and RDMA
-   backend checks. Even with `SPARK_COMM_HW_PERMISSION=1` and `--features rdma` they cannot measure
-   anything, so the All-Reduce latency gate has no measurement in the test tree.
-4. **The one real All-Reduce instrument is merged and still cannot measure.** `rocenante-probe` is
-   a binary target of `sparkflash-comm` now, and the doctor invokes it, so check 3 has an instrument
-   where it previously had a missing command. What the instrument can do is refuse precisely: the
-   RDMA backend resolves the live rails and then returns `CommError::RdmaNotBuilt`, and on a host
-   without `/sys/class/infiniband` it fails earlier at `FabricUnavailable`. Its hardware gate test
-   is `#[ignore]`d with a reason saying it is blocked on the backend. So the preflight still cannot
-   pass, but for the right reason, and the failure mode changed from "no such command" to a
-   prerequisite named in the message - which is the difference between an unrunnable gate and an
-   honest one.
+3. **The three cluster gates have real bodies and none has run.** `crates/sparkflash-comm/tests/
+   hardware_gates.rs` implements the three gates rather than panicking; they need
+   `SPARK_COMM_HW_PERMISSION=1`, the `rdma` feature, four cooperating processes and a Lead-approved
+   window. No run has been recorded here and no frame has crossed a wire, so the All-Reduce latency
+   gate still has no measurement.
+4. **The one real All-Reduce instrument is merged and its backend is real.** `rocenante-probe` is a
+   binary target of `sparkflash-comm` and the doctor invokes it, and the `rdma` backend now returns
+   typed errors instead of `CommError::RdmaNotBuilt`; on a host without `/sys/class/infiniband` the
+   probe still refuses earlier at `FabricUnavailable`. Its honest limitation is unchanged in kind:
+   no frame has crossed a wire, so the probe can only produce a number in a permissioned four-node
+   window, and the preflight still cannot pass on this host - but for a named prerequisite rather
+   than a missing command.
 5. **The spec carries two latency budgets, and they are different things.** 22 µs at line 1323
-   (preflight check 3) and 20 µs at line 1336 (milestone 3). Doctor encodes 22.0 (doctor.rs:101) and
-   nothing encoded 20. D17 records the separation: 20 µs at 10 KiB is the requirement, the preflight's
-   22 µs is a deliberately looser readiness threshold, and a run reporting 21 µs has passed the
-   preflight and failed the gate. The 2 MiB in one test's name is the router threshold, not a third
-   budget. Nothing in the tree has to change for this; what has to change is a report that cites one
-   number as the other.
+   (preflight check 3) and 20 µs at line 1336 (milestone 3). Doctor encodes 22.0 (doctor.rs:101); the
+   gate encodes 20.0 at 10 KiB (`hardware_gates.rs:112-114`, asserted at `:234`). D17 records the
+   separation: 20 µs at 10 KiB is the requirement, the preflight's 22 µs is a deliberately looser
+   readiness threshold, and a run reporting 21 µs has passed the preflight and failed the gate. The
+   2 MiB payload is the router threshold, timed against a separate acceptance bar (1.5x the wire
+   floor, never below 20 µs), not a third budget. Nothing in the tree has to change for this; what
+   has to change is a report that cites one number as the other.
 6. **The preflight's own title is unsatisfiable.** Spec 6.1 is titled "Seven-Point" (line 1317) and
    enumerates five checks (lines 1321-1325); doctor implements five and records the discrepancy
    (doctor.rs:51-57). The missing two are not described anywhere in the tree.
 7. **The trace command is a planner.** trace_cli.rs:6-8 and `render()` (trace_cli.rs:65-74) produce a
    plan that ends with "capture: hardware gate (needs the target runtime and the trace device)". The
    spec names this command as the gate (line 1340); the command cannot perform it.
-8. **The latency gate's payload is inconsistent.** The test is named for **2 MiB**
-   (hardware_gates.rs:41) while the spec's latency budget and doctor's probe are for 10 KiB
-   (spec 1323, 1336; doctor.rs:98). 2 MiB is the router threshold, not the latency payload.
+8. **The latency gate times both payloads.** Gate 1 (`hardware_gates.rs:105`) times the 10 KiB
+   specification payload against the 20 µs `ONESHOT_LATENCY_BAR` (`:112`, `:114`, asserted at `:234`)
+   and the 2 MiB router payload against max(1.5x the wire floor, 20 µs) (`:225-246`); 2 MiB is not the
+   latency payload. Doctor's 22 µs is a separate readiness threshold (item 5).
 9. **No CUDA graph capture exists.** `cudaGraph` and `cuda_graph` appear in `crates/` only inside
    gates.rs (the parser at 162-169, the gate at 348-358). There is no capture, no replay and no
    eager-versus-graph comparison to run.
-10. **Doctor's collective probes do not see the ring.** Both the bandwidth probe and the All-Reduce
-    probe use only the first `--nodes` address (doctor.rs:743-745, 773-775), so the reported aggregate
-    is two local rails to one peer. Spec line 1323 asks for the probe "between all 4 ranks"; a green
-    check 3 would not establish that.
+10. **Doctor's collective probes see one rank view, not the ring.** Check 3 hands every peer in
+    `--nodes` to the bandwidth probe and scores the worst peer (doctor.rs:2006-2052), but the
+    All-Reduce probe measures exactly one rank's view - the running process's own, named by `--rank`
+    and requiring the full rank table in `SPARK_COMM_PEERS` because rank 0 binds its own address
+    (doctor.rs:2053-2062; docs/build/rdma-backend.md section 11.3). One green doctor run is therefore
+    this rank's latency plus every peer's bandwidth, not the four-rank ring's latency that spec line
+    1323 asks for; the ring needs four concurrent doctor processes, and nothing has run either way.
 11. **A green run leaves no measurement in the log.** The six gates assert on the summary and print
     nothing on success (gates.rs:95-99). Artifact capture is therefore a deliberate step, not a
     side effect of running the tests - which is why every gate above has an artifact column.
@@ -526,7 +547,7 @@ contains an expectation and no instrument.
     trip at the device's own alignment, needs `SPARKFLASH_KV_NVME_PATH`) and line 58 (instantiate the
     default pool for real) have real bodies rather than panics. They are not in the merged tree
     (`crates/sparkflash-kv` has no `tests/` directory here), and they are not qualification gates, but
-    they are the pattern the three comm stubs should follow.
+    they were the pattern the three comm gates followed: those now have real bodies too (finding 3).
 
 ---
 
@@ -534,7 +555,10 @@ contains an expectation and no instrument.
 
 Run in this order. Stop at the first failure: a gate whose precondition fails produces a number that
 cannot be attributed. Every line assumes an exclusive window, `SPARK_COMM_HW_PERMISSION=1` exported
-only with the Lead's approval, and the repository root as the working directory.
+only with the Lead's approval, and the repository root as the working directory. The cluster lines
+run on all four nodes at the same time, each with its own `--rank` and the same full
+`SPARK_COMM_PEERS` table: one doctor process measures its own rank's latency view and every peer's
+two-rail bandwidth (section 2.4), and one gate process is one four-node rendezvous.
 
 ```bash
 # 0. build
@@ -545,7 +569,8 @@ cargo build --release -p sparkflash-cli
 ./target/release/sparkflash doctor --nodes 192.0.2.80,192.0.2.84,192.0.2.68,192.0.2.59 \
   --rank 0 --world-size 4 --rdma-seconds 1 --json
 
-# 2. collectives (needs the probe binary on PATH and the fabric permission)
+# 2. collectives (one process on each of the four nodes; staged-binary commands in
+#    docs/build/rdma-backend.md sections 11.2-11.3)
 SPARK_COMM_HW_PERMISSION=1 cargo test -p sparkflash-comm --features rdma \
   --test hardware_gates -- --ignored --exact roce_oneshot_two_mib_all_reduce_meets_the_latency_budget
 SPARK_COMM_HW_PERMISSION=1 cargo test -p sparkflash-comm --features rdma \
@@ -573,9 +598,9 @@ SPARKFLASH_TRACE_RESULTS="steps=45 scopes=16" cargo test -p sparkflash-scheduler
 # 5. keep, per gate: the raw run output, the summary used, and the cargo log
 ```
 
-Steps 2 and 3 cannot currently succeed: step 2's gates are panic stubs (finding 3) and the probe,
-now merged, can only refuse because the RDMA backend is a skeleton (finding 4); step 3's six gates
-have no producer of their summaries (finding 2)
-and five of them additionally need a GPU engine this tree does not have (finding 1); step 4 prints a plan rather than a
+Steps 2 and 3 cannot currently succeed: step 2's gates are real but need a permissioned four-node
+window and none has run (finding 3), and the probe has a real backend but no frame has crossed a wire
+(finding 4); step 3's six gates have no producer of their summaries (finding 2) and five of them
+additionally need a GPU engine this tree does not have (finding 1); step 4 prints a plan rather than a
 capture (finding 7). Until those findings are closed, this runbook's honest state is section 1: every
 gate **never run**.

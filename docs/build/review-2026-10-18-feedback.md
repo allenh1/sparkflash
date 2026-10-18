@@ -144,7 +144,7 @@ The D10-D13 dedupe (`c739f93`) removed a duplicate block; it did **not** make ev
 citation in the tree resolve. Checked in the task-11 follow-up: `crates/sparkflash-scheduler/src/engine.rs:18`
 cited `docs/DECISIONS.md:151-155` for the `X-Request-Id` binding, which was already wrong at base
 `2245a4e` - those lines are the Task-6 stage-9 extension inside D4 (Dense 264-byte Engram rows), not
-the request-binding decision (D9, `docs/DECISIONS.md:272`). Fixed to `docs/DECISIONS.md D9` there;
+the request-binding decision (D9). Fixed to `docs/DECISIONS.md D9` there;
 this citation predates the dedupe and was not caused by it. No other `DECISIONS.md` line citation was
 re-checked, and this note makes no claim that the rest are correct.
 

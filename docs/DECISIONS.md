@@ -37,6 +37,7 @@ records the evidence and the consequence for the build. Research backing is in
 | D26 | The Milestone-4 ABI source-text lint is frozen | No new source-text scanner, parser or lint in `m4_abi.rs`; new kernel invariants are enforced by compiled-artifact inspection (cubin/PTX baseline) or runtime device assertions, and `ci/check-m4-abi-size.sh` fails CI if the file's line count differs from its pinned count |
 | D27 | The capability boundary has no vision channel | `Capabilities` has no `vision` field, `/v1/models` reports `multimodal: false`, and an image request is refused before generation with typed `MissingCapability::vision()` (HTTP 400 `unsupported_capability`); the 32x32 dummy grid and its 121 fabricated visual tokens are deleted, and `EngineRequest` carries the parsed `images: Vec<ImagePart>` (inline parts hold the decoded bytes) rather than `image_tokens`; the known protocol image `type`s are explicit part variants and a raw-body scan (`prompt::find_image_carrier`) refuses any image-family carrier the typed parser did not record, wherever it appears and in any case (a schema-name map key whose value is itself a JSON Schema aside) |
 | D28 | The reference engine is `Send + Sync` | `WeightSource` gained `Send + Sync` in !60 (`f72738b`), so `forward::InferenceEngine` is `Send + Sync`; `serve.rs`'s module docs are corrected and a compile-time assertion pins it, while the single-owner engine thread stays because the pass is one-sequence-at-a-time and the sampler swap consumes the engine, not because of thread-safety |
+| D29 | The ibverbs backend is real and dual-rail capable | The `rdma` feature's libibverbs backend, its repr(C) ABI mirror and the three cluster gate bodies are real, and the deployed vLLM reference is measured single rail (NCCL_IB_HCA=rocep1s0f1); no hardware gate has run and no frame has crossed a wire, host-memory staging, active MTU 1024 and driver 580.173.02 remain gaps, and single-rail mode refuses to claim dual-rail evidence |
 
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
@@ -610,21 +611,23 @@ of the nine, **no command in this repository can produce the number the gate ass
    the repository writes them, so the operator must supply the summary the gate then asserts on. A gate
    that asserts on a summary nothing produces is a check that cannot fail on the thing it names - the
    same pattern as the ring no job compiled and the feature sweep that skipped its own feature.
-3. The three cluster gates are panic stubs: `crates/sparkflash-comm/tests/hardware_gates.rs:44-47,
-   55-57, 65-67` panic "not implemented on this host" after their permission and feature checks, so the
-   All-Reduce latency gate has no measurement in the test tree at all.
-4. The one real All-Reduce instrument is merged: `rocenante-probe` is a binary target of
-   `sparkflash-comm` now, and the doctor invokes it and refuses a loopback-labelled number by name, so
-   check 3 went from a missing command to an instrument that measures or refuses. Its honest
-   limitation is that it still cannot produce a number on the real fabric, because
-   `RdmaTransport::open` resolves the live rails and then returns `CommError::RdmaNotBuilt`; what
-   changed is the failure mode, from "no such command" to a precise refusal.
+3. The three cluster gates now have real bodies: `crates/sparkflash-comm/tests/hardware_gates.rs`
+   implements the three gates rather than panicking. They still have no measurement: none has run,
+   because a run needs `SPARK_COMM_HW_PERMISSION=1`, the `rdma` feature, four cooperating processes and
+   a Lead-approved window, and no frame has crossed a wire.
+4. The one real All-Reduce instrument is merged and its backend is real: `rocenante-probe` is a
+   binary target of `sparkflash-comm`, the doctor invokes it and refuses a loopback-labelled number by
+   name, and the `rdma` backend now returns typed errors instead of `CommError::RdmaNotBuilt`. Its
+   honest limitation is unchanged in kind: no frame has crossed a wire yet, so the probe can only
+   produce a number in a permissioned four-node window, not on this host.
 5. `sparkflash trace --scopes all --steps 45` prints a plan; it cannot capture, because the capture path
    is a hardware gate whose summary nothing produces.
 6. No CUDA graph code exists: `cudaGraph` and `cuda_graph` appear in `crates/` only inside the gate's own
    parser and gate function.
-7. Doctor's collective probes use only the first `--nodes` address, so its "aggregate >= 180 Gbps" is two
-   local rails to one peer, not the "between all 4 ranks" the spec's preflight line asks for.
+7. Doctor's collective probes see one rank view, not the ring: check 3 hands every peer in `--nodes`
+   to the bandwidth probe and scores the worst peer, but the All-Reduce probe measures only the running
+   rank's own view and needs the full rank table in `SPARK_COMM_PEERS` because rank 0 binds its own
+   address, so the four-rank ring's latency needs four concurrent doctor processes. Nothing has run.
 8. The gates print nothing on success, so a green run leaves no measurement in a log; an artifact has to
    be captured deliberately, which is why every gate section of the runbook names one.
 9. Positive: the only ignored tests in the repository whose bodies really exercise hardware are the KV
@@ -654,13 +657,15 @@ the five gates that need a model still have no instrument here - because the one
 is the CPU reference path, not because a server is missing.
 
 **Two latency numbers, and why both are right.** The spec states 22 us for preflight check 3 (line 1323)
-and 20 us for milestone 3 (line 1336). Nothing in the tree encoded 20. They are not in conflict once
+and 20 us for milestone 3 (line 1336). The gate's own constant is the only encoding of 20 us
+(`crates/sparkflash-comm/tests/hardware_gates.rs:112`). They are not in conflict once
 their roles are separated, and this entry is the separation: 20 us at 10 KiB is the requirement, and the
 preflight's 22 us is a readiness threshold, deliberately looser so that a node can pass preflight while
 still failing the requirement. A run that reports 21 us has passed the preflight and failed the gate. The
-payload is 10 KiB in both places: 2 MiB appears in the spec as the router threshold, and the hardware
-test's name for it is a naming defect rather than a second budget. Doctor encodes 22.0
-(`crates/sparkflash-cli/src/doctor.rs:101`) and this entry is why it stays there.
+10 KiB payload is the specification's requirement; the same gate also times 2 MiB, the spec's router
+threshold, against a first-working-backend acceptance bar of max(1.5x the wire floor, 20 us), not a
+third latency budget. Doctor encodes its own 22.0 (`crates/sparkflash-cli/src/doctor.rs:101`) and
+this entry is why it stays there.
 
 **Consequence.** `docs/QUALIFICATION.md` is the record of what each gate would prove, the exact command
 that would run it, the artifact that would evidence it, and - for every gate - that its state today is
@@ -1558,3 +1563,43 @@ thread over channels and requests still serialise. The module docs state both fa
 `Send + Sync`; the passes serialise by design), and `the_driver_declares_no_channel_it_does_not_serve`
 pins the capability half while the `const` assertion pins the thread-safety half. No device run is
 involved or claimed.
+
+## D29 - The ibverbs backend is real and dual-rail capable; the deployed vLLM reference is single rail
+
+Recorded 2026-10-18.
+
+**Evidence.** crates/sparkflash-comm/src/rdma.rs and its abi/verbs/qpinfo/dataplane submodules
+implement the RoCEnante transport against a run-time dlopen of libibverbs: 16 entry points are
+resolved with dlsym and the three inline ones (ibv_post_send, ibv_post_recv, ibv_poll_cq) come from
+a bundled C shim compiled by build.rs against the real rdma-core header, because libibverbs does
+not export them; a build without the header refuses at load naming the header rather than opening a
+device it cannot post to. The hand-written repr(C) mirror is asserted field by field against
+rdma-core 39's verbs.h (send WR is the full 128-byte object including the trailing bind_mw/tso
+union, port attr 52 bytes, QP attr 144 bytes; ibv_qp and ibv_mr are labelled read-only prefixes)
+and the feature compiles only with the rdma flag; the default build gains no dependency and every
+non-rdma path is unchanged. The control-plane star exchanges per-(rail, peer) QP numbers, GIDs,
+staging MR addresses, remote keys and the staging geometry (frame cap, slot size, rail count,
+refusing any disagreement); the data plane posts RDMA WRITE_WITH_IMM over one RC QP per (rail,
+peer), validates completion opcodes and immediate byte order, and accounts posted bytes per rail. The deployed vLLM reference was measured to be single rail (docker exec vllm_node
+env): NCCL_IB_HCA=rocep1s0f1, NCCL_IB_GID_INDEX=3, NCCL_SOCKET_IFNAME=enp1s0f1np1, with line 10 of
+/home/user/phase2-evidence/window-2026-10-18/vllm-launch-recipe.sh overriding the launch
+script's twin-pair environment. The second twin (roceP2p1s0f1) is ACTIVE at 200000 Mb/s but unused
+by the deployed recipe. On the live nodes the specification's f0 rails are PORT_DOWN; the resolver
+validates ACTIVE and >= 200 Gb/s and selects the f1 twins on distinct cards.
+
+**Decision.** The ibverbs backend is real (not a skeleton) and must be dual-rail capable, but no
+document may cite the deployed vLLM configuration as dual-rail evidence: it is single rail as
+measured above. Dual rail (aggregate >= 180 Gbps, QUALIFICATION 3.3) is our requirement. The
+hardware gates run and report both modes, and the counter gate refuses to claim dual-rail evidence
+from a single-rail run. docs/build/rdma-backend.md is the authoritative description of the backend,
+its ABI subset, rail layout, verified scope and honest limits; QUALIFICATION.md and the roadmap
+must stop calling the backend a skeleton or the gates panic stubs, and the stale D17 finding 3/4
+text is superseded.
+
+**Consequence.** At record time no hardware gate has been run on the cluster: the backend, the
+three gate bodies and doctor check 3 compile and are hardware-free-tested, and the first four-node
+run is the next Lead-sequenced step. The host-memory staging buffer (not GPUNetIO device slots), the
+1024-byte active MTU, driver 580.173.02 and the single-rail deployed reference are recorded gaps,
+not verified qualifications. The three inline wrappers require rdma-core headers at build time; the
+hardware-free CI host exercises the stub compile path, while the stub-specific `load()` refusal
+needs a host that has libibverbs but no headers, and the real inline path needs the headers.

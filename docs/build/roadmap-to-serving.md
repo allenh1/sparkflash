@@ -128,11 +128,10 @@ task-30):
 | Memory | 3 GiB MemAvailable against the 114 GiB gate, because vLLM holds the rest | head node only |
 
 **Unverified, and known to be unverified:** the state of the other three nodes (rail names, MTU,
-driver); the RoCE fabric has never carried a byte of this project — the ibverbs backend is a skeleton
-and every hardware collective test is a panic stub
-(`crates/sparkflash-comm/tests/hardware_gates.rs:44-47`, :52); the 10 KiB All-Reduce gate has never
-been measured and its preflight threshold in [DECISIONS.md](../DECISIONS.md) D17 (22 µs) already fails
-the 20 µs requirement. Section 7 builds on that fabric anyway, because the plan needs it; it labels
+driver); the RoCE fabric has never carried a byte of this project — the ibverbs backend and the three
+cluster gate bodies are real now (typed errors, never `RdmaNotBuilt`), but none has run and no frame
+has crossed a wire; the 10 KiB All-Reduce gate has never been measured and its preflight threshold in
+[DECISIONS.md](../DECISIONS.md) D17 (22 µs) already fails the 20 µs requirement. Section 7 builds on that fabric anyway, because the plan needs it; it labels
 every such statement.
 
 ### 1.5 What does not exist at all
@@ -894,9 +893,9 @@ GEMM`, `CUDA graph runner`, `tokens/s harness vs vLLM`.
 
 **The honest label.** Every number in this section is arithmetic from our own byte tables and from
 the reference's sharding rules; **nothing here has been run on the fabric**. The four-node system has
-never carried a byte of this project: the RDMA backend is a skeleton, the two hardware collective
-tests are panic stubs (`hardware_gates.rs:44-47`, :52), and the 10 KiB All-Reduce gate has never
-been measured ([../QUALIFICATION.md](../QUALIFICATION.md) section 3.1). This phase is design plus
+never carried a byte of this project: the RDMA backend is real and the three cluster gate bodies are
+implemented, but no gate has run and no frame has crossed a wire, and the 10 KiB All-Reduce gate has
+never been measured ([../QUALIFICATION.md](../QUALIFICATION.md) section 3.1). This phase is design plus
 hypothesis, and the design is written so that the first hardware run falsifies it cheaply.
 
 ### 7.1 What is sharded, what is replicated, and why
@@ -1001,7 +1000,8 @@ beside vLLM.
 
 Not known: the other three nodes' rail state, MTU, driver and CUDA; whether the two rails can carry
 the same collective in both directions (D12's dual-path enumerates the ACTIVE functions at runtime,
-but the RDMA transport that would use them is a skeleton); the real one-shot latency; the ring
+but the RDMA transport that would use them is real and has not run on the fabric); the real one-shot
+latency; the ring
 path's numerics; and whether a four-node window can even hold four copies of the model beside the
 operating cost (section 7.5 says the answer is "barely, and not with the Engram tables resident").
 
@@ -1158,8 +1158,8 @@ plus the four gates this roadmap adds:
 | Gate | Instrument today | State |
 | :--- | :--- | :--- |
 | 10 KiB one-shot All-Reduce under 20 µs | `doctor` check 3, `rocenante-probe` | never run |
-| Bit-identical collectives, 10,000 replays | `hardware_gates.rs:52` | panic stub |
-| Dual-rail counters half each | `hardware_gates.rs:62` | panic stub |
+| Bit-identical collectives, 10,000 replays | `roce_bits_match_the_cpu_reference_over_ten_thousand_replays` | real gate body, never run |
+| Dual-rail counters half each | `dual_rail_counters_show_both_interfaces_carrying_half_the_bytes` | real gate body, never run |
 | qeval 72/75 | `gates.rs:293` | no producer |
 | DSpark KL under 0.007 | `gates.rs:308` | no producer |
 | 1M-token needle | `gates.rs:325` | no producer |
@@ -1201,9 +1201,9 @@ Ordered by information per unit of cost. Each entry names the decision it settle
 4. **E4 — four-node read-only preflight.** Cost: an operator window, no model run. Settles the
    unverified cluster table (rails, MTU, driver, CUDA on all four), and it is the cheapest possible
    way to find out that Phase 4's prerequisites are not met.
-5. **E5 — the 10 KiB All-Reduce attempt.** Cost: one window with the operator; the instrument exists
-   but the backend is a skeleton, so this is also a build task. Settles whether TP on these rails is
-   viable at all — the biggest single risk in this document.
+5. **E5 — the 10 KiB All-Reduce attempt.** Cost: one window with the operator; the instrument and
+   backend are real, so this is a run rather than a build task - but no frame has crossed a wire yet.
+   Settles whether TP on these rails is viable at all — the biggest single risk in this document.
 6. **E6 — the Engram packer against the real checkpoint.** Cost: hours of local I/O, no device.
    Settles the 50.7 GB/rank NVMe plan and the per-rank memory arithmetic of section 7.5. Without it,
    the TP memory plan is a spreadsheet.
@@ -1272,8 +1272,9 @@ Each is a real gap with a test that would close it; none is a caveat to be waved
    `blockIdx` and the four partials are summed in tile order in binary64
    (`kernels/mega_mhc_sm121.cu:197-222`), with the structure pinned by
    `mhc_determinism.rs`. The N = 100 device run is owed a window, like unknown 1's stage-1 run.
-8. **No bytes have ever moved on the four-node fabric.** The ibverbs backend is a skeleton, the two
-   hardware collective tests are panic stubs, and the 10 KiB gate is unmeasured.
+8. **No bytes have ever moved on the four-node fabric.** The ibverbs backend and the three cluster
+   gate bodies are real, but none has run and no frame has crossed a wire, and the 10 KiB gate is
+   unmeasured.
 9. **The NCCL ring path's reduction order (and therefore R2) is unknown** for prefill payloads above
    2 MiB.
 10. **MTU 1500 versus 9000, and the rail-name defect, are unresolved** (task-30); the other three
