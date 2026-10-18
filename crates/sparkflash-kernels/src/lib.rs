@@ -21,7 +21,9 @@
 //! payload; see roce_reduce's module documentation.
 
 pub mod abi;
+pub mod baseline;
 pub mod c_decl;
+pub mod cert_lm_head_launch;
 pub mod cuda_driver;
 pub mod cuda_harness;
 pub mod engram_head_ref;
@@ -29,10 +31,14 @@ pub mod lm_head_ref;
 pub mod m4_abi;
 pub mod m4_quant;
 pub mod m7_layer0_shapes;
+pub mod mega_mhc_launch;
 pub mod mega_mhc_ref;
 pub mod mla_ref;
+pub mod mxfp4_moe_launch;
 pub mod mxfp4_ref;
+pub mod mxfp8_dense_launch;
 pub mod mxfp8_ref;
+pub mod mxfp8_wo_a_launch;
 pub mod roce_abi;
 pub mod roce_reduce;
 pub mod routed_gate_up_abi;

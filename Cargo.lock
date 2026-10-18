@@ -2255,8 +2255,11 @@ dependencies = [
  "futures",
  "sha2",
  "sparkflash-api",
+ "sparkflash-engine",
  "sparkflash-kernels",
+ "sparkflash-kv",
  "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

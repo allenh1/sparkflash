@@ -4,21 +4,30 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "SparkFlash device forward chain (M2: real session one-kernel launch proof behind the api engine seam)"
+description = "SparkFlash device forward chain (M3 chain skeleton; M2 real session behind the api engine seam)"
 
 [features]
 default = []
-# "cuda" compiles the M2 real session: the dlopen CUDA driver, the pinned router ABI/launch and
-# Cubin sha256 checks. It links no libcuda; a CPU-only host can still build and test the crate with
-# the feature on (the driver is only opened at session open, and the pin/file checks come first).
-# The default build has no device path at all.
-cuda = ["dep:sparkflash-kernels", "dep:sha2"]
+# "cuda" compiles the M2 real session path (session::cuda: the dlopen driver call, the pinned
+# router ABI/launch and the cubin checks). The feature is a cfg gate only: kernels and sha2 are
+# ordinary dependencies because the M3-a chain catalog and window accounting are host code that
+# must be buildable and testable without a device feature. Nothing links libcuda (the driver is
+# loaded through Cuda::load), and the default build opens no driver and constructs no device
+# session. A CPU-only host can build and test with the feature on; the driver is only opened at
+# session open, after the pin/file checks.
+cuda = []
 
 [dependencies]
 sparkflash-api = { workspace = true }
+# The chain skeleton's plan, window geometry, seam ledger and masked comparison are host code; these
+# crates are CPU-only-buildable (kernels resolves the driver with dlopen, nothing links libcuda), so
+# the default build stays GPU-free while the M3 contract is testable without the cuda feature.
+sparkflash-engine = { workspace = true }
+sparkflash-kernels = { workspace = true }
+sparkflash-kv = { workspace = true }
 futures = { workspace = true }
-sparkflash-kernels = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

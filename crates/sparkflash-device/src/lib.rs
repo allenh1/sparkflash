@@ -1,7 +1,8 @@
-//! `sparkflash-device`: the device forward chain crate. **M2 is one real kernel, still not a chain.**
+//! `sparkflash-device`: the device forward chain crate. **M2 is one real kernel; M3-a is the chain
+//! skeleton, still not an execution.**
 //!
-//! Milestones M1 and M2 of `docs/build/device-forward-chain.md` section 7. The crate exists so the
-//! serving seam's capability boundary becomes real and a device session is proved through it:
+//! Milestones M1, M2 and M3-a of `docs/build/device-forward-chain.md` section 7. The crate exists so
+//! the serving seam's capability boundary becomes real and a device session is proved through it:
 //!
 //! - It implements the api engine seam, [`sparkflash_api::engine::InferenceEngine`] (design 1.2:
 //!   `sparkflash-api` supplies "the `InferenceEngine` trait and `EngineRequest`/`Capabilities`
@@ -23,27 +24,50 @@
 //!   real session executed (kernel id, cubin sha256 and size, launches). The cli flag
 //!   `--engine reference|device` defaults to `reference`, so nothing on the existing serve path
 //!   changes unless an operator selects it (design 1.3, 7 M1, 7 M2).
+//! - M3-a adds the chain skeleton: [`chain`] derives the 130 + 8 CED schedule (5,482 token-layer
+//!   executions), the 40-layer stage map, the planned host-seam set and the plan-vs-ledger
+//!   self-check; [`window`] accounts the 128-slot window rings and round-trips the oldest-first
+//!   view; [`cubins`] parses the baseline pins and verifies size and SHA-256 fail-closed. The
+//!   skeleton runs through a [`chain::ChainOps`] backend and reports
+//!   `chain_execution = false`, `device_execution = false`, `token_produced = false`.
 //!
-//! **What the crate does not do.** No chain, no boundary capture, no window ring, no window-ring
-//! rotation, no weight staging for the chain, no token/logit comparison and no criterion-1 claim
-//! (design 3.1, 3.2, 4.3, 7 M3). The token path in a first real chain is hybrid (design 3.2b); this
-//! crate has no device token path. M3 is the first point at which a chain claim may be made.
+//! **What the crate does not do.** No chain execution, no device weight staging, no device token or
+//! logits path, no boundary capture and no criterion-1 claim (design 3.1, 3.2, 4.3, 7 M3). The token
+//! path in a first real chain is hybrid (design 3.2b); this crate has no device token path. M3's
+//! first hybrid pass, with a Lead window, is the first point at which a chain claim may be made.
 //!
 //! # Dependency direction and the cuda feature
 //!
-//! Default dependencies are the api crate (the engine seam) and futures only, so a CPU-only build
-//! and CI see no driver path. The `cuda` feature adds `sparkflash-kernels` (the dlopen driver, the
-//! pinned router ABI/launch and the cubin pin) and `sha2`; nothing links libcuda, because the
-//! driver is loaded through `Cuda::load`. The cli forwards its own `cuda` feature here, and a
-//! real session is only constructed with that feature, an explicit `--engine device` and an
-//! explicit cubin path.
+//! The chain plan, window arithmetic, seam ledger and masked comparison are host code, so default
+//! dependencies include `sparkflash-engine`, `sparkflash-kernels` and `sparkflash-kv`; those crates
+//! are CPU-only-buildable (kernels resolves the driver with dlopen and nothing links libcuda), and
+//! the default build still opens no driver: the device path is behind `cuda`. `sparkflash-engine`
+//! must never depend on this crate (the dependency direction is device -> engine); the MR's
+//! verification runs `cargo tree -p sparkflash-device` and
+//! `cargo tree -p sparkflash-engine` to show the tree stays acyclic. The cli forwards its own
+//! `cuda` feature here, and a real session is
+//! only constructed with that feature, an explicit `--engine device` and an explicit cubin path.
 
 #![forbid(unsafe_code)]
 
+pub mod chain;
+pub mod cubins;
 pub mod engine;
 pub mod session;
+pub mod window;
 
+pub use chain::{
+    ChainError, ChainLabels, ChainLayer, ChainOps, ChainRunReport, ChainSchedule, ChainSeamPlan,
+    ChainStage, FIRST_CHAIN_LABEL, FUTURE_LABEL_PREFIX, HEAD_LABEL, HYBRID_TOKEN_LABEL,
+    LAYER_STAGE_ORDER, MILESTONE_DECODE_STEPS, MILESTONE_PROMPT_TOKENS, PLAN_ONLY_LABEL,
+    STEP_STAGE_ORDER, SeamPlanEntry, StageCall, StageStatus, TAIL_STAGE_ORDER, run_skeleton,
+};
+pub use cubins::{
+    CHAIN_KERNELS, GATE_UP_KERNEL, REQUIRED_KERNELS, ROUTER_KERNEL, required_pins,
+    verify_required_dir,
+};
 pub use engine::{CapabilityReport, DeviceEngine, DeviceRefusal, NON_GREEDY_CODE, is_greedy};
 #[cfg(feature = "cuda")]
 pub use session::cuda::CudaSession;
 pub use session::{DeviceSession, ExecutionEvidence, FakeSession, SessionError};
+pub use window::{WindowAccounting, layer_view, layer_view_bytes};

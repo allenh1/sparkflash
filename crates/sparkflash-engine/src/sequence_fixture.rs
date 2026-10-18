@@ -741,6 +741,411 @@ pub fn compare_steps(fixture: &SequenceFixture, device: &[DeviceStep]) -> Result
     Ok(())
 }
 
+/// A compact certified-bit mask: one bit per vocabulary entry, 1 for an upper bound, 0 for an
+/// exact logit.
+///
+/// The released vocabulary is 129,280 entries, but the mask type is sized by the values it is
+/// built for; a 1,048,576-entry screen is 128 KiB of words, not a byte (or a bool) per entry.
+/// Bits beyond `entries` in the last word are masked off, so a caller's padding cannot inflate the
+/// certified count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertifiedMask {
+    words: Vec<u64>,
+    entries: usize,
+}
+
+impl CertifiedMask {
+    const BITS: usize = u64::BITS as usize;
+
+    /// A mask of `entries` exact logits (every bit 0).
+    #[must_use]
+    pub fn exact(entries: usize) -> Self {
+        Self {
+            words: vec![0; entries.div_ceil(Self::BITS)],
+            entries,
+        }
+    }
+
+    /// Builds a mask from packed little-endian words.
+    ///
+    /// Bits beyond `entries` in the last word are cleared, so a caller's padding cannot inflate
+    /// [CertifiedMask::certified_entries].
+    ///
+    /// # Errors
+    /// [MaskedCompareError::MaskWords] when the word count is not `entries.div_ceil(64)`.
+    pub fn from_words(mut words: Vec<u64>, entries: usize) -> Result<Self, MaskedCompareError> {
+        let expected_words = entries.div_ceil(Self::BITS);
+        if words.len() != expected_words {
+            return Err(MaskedCompareError::MaskWords {
+                entries,
+                expected_words,
+                found_words: words.len(),
+            });
+        }
+        let remainder = entries % Self::BITS;
+        if remainder != 0
+            && let Some(last) = words.last_mut()
+        {
+            *last &= (1u64 << remainder) - 1;
+        }
+        Ok(Self { words, entries })
+    }
+
+    /// Number of entries the mask describes.
+    #[must_use]
+    pub fn entries(&self) -> usize {
+        self.entries
+    }
+
+    /// The packed words.
+    #[must_use]
+    pub fn words(&self) -> &[u64] {
+        &self.words
+    }
+
+    /// Whether entry `index` is certified (an upper bound, not an exact logit). Out-of-range bits
+    /// read as exact; the comparator validates the mask shape before indexing.
+    #[must_use]
+    pub fn is_certified(&self, index: usize) -> bool {
+        if index >= self.entries {
+            return false;
+        }
+        let word = self.words[index / Self::BITS];
+        (word >> (index % Self::BITS)) & 1 == 1
+    }
+
+    /// Sets one entry's certified bit.
+    ///
+    /// # Errors
+    /// [MaskedCompareError::MaskIndex] when `index` is outside the mask.
+    pub fn set_certified(
+        &mut self,
+        index: usize,
+        certified: bool,
+    ) -> Result<(), MaskedCompareError> {
+        if index >= self.entries {
+            return Err(MaskedCompareError::MaskIndex {
+                index,
+                entries: self.entries,
+            });
+        }
+        let word = &mut self.words[index / Self::BITS];
+        let bit = 1u64 << (index % Self::BITS);
+        if certified {
+            *word |= bit;
+        } else {
+            *word &= !bit;
+        }
+        Ok(())
+    }
+
+    /// Entries with the certified bit set.
+    #[must_use]
+    pub fn certified_entries(&self) -> usize {
+        self.words
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum()
+    }
+
+    /// Entries whose value is exact (bit 0).
+    #[must_use]
+    pub fn exact_entries(&self) -> usize {
+        self.entries - self.certified_entries()
+    }
+}
+
+/// One device step's screened logits: the values the head reported and the compact certified mask
+/// that travels with them.
+///
+/// The certified LM head returns an exact logit where the bit is 0 and an upper bound (strictly
+/// below the running maximum that pruned the entry) where it is 1. The comparison contract
+/// (design `docs/build/device-forward-chain.md` 4.2) compares only the exact entries plus the
+/// argmax entry, because a certified bound cannot be compared per entry; the mask travels with the
+/// values so the compared set is auditable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScreenedLogits {
+    /// One logit value per vocabulary entry.
+    pub logits: Vec<f32>,
+    /// One certified bit per entry.
+    pub certified: CertifiedMask,
+}
+
+impl ScreenedLogits {
+    /// Builds screened logits, refusing a mask whose entry count does not match the values.
+    ///
+    /// # Errors
+    /// [MaskedCompareError::MaskShape] when the mask and the values describe different entry counts.
+    pub fn new(logits: Vec<f32>, certified: CertifiedMask) -> Result<Self, MaskedCompareError> {
+        if logits.len() != certified.entries() {
+            return Err(MaskedCompareError::MaskShape {
+                logits: logits.len(),
+                certified: certified.entries(),
+            });
+        }
+        Ok(Self { logits, certified })
+    }
+
+    /// Entries whose value is exact (certified bit 0).
+    #[must_use]
+    pub fn exact_entries(&self) -> usize {
+        self.certified.exact_entries()
+    }
+
+    /// Entries the screen certified as upper bounds.
+    #[must_use]
+    pub fn certified_entries(&self) -> usize {
+        self.certified.certified_entries()
+    }
+
+    /// The lowest-index argmax over the values, the same tie-break as the head reference
+    /// (`lm_head_ref::best_entry`: strict greater-than keeps the first entry on a tie). An empty
+    /// screen returns None.
+    #[must_use]
+    pub fn argmax(&self) -> Option<(usize, f32)> {
+        let mut best: Option<(usize, f32)> = None;
+        for (index, &value) in self.logits.iter().enumerate() {
+            match best {
+                Some((_, current)) if value <= current => {}
+                _ => best = Some((index, value)),
+            }
+        }
+        best
+    }
+}
+
+/// The masked logits comparison result the chain report quotes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaskedLogitsComparison {
+    /// The fixture position that was compared.
+    pub position: usize,
+    /// Entries actually compared: every exact entry plus the argmax entry.
+    pub compared_entries: usize,
+    /// Entries the screen left exact.
+    pub mask_exact_entries: usize,
+    /// Entries the screen certified as upper bounds (skipped except for the argmax).
+    pub mask_certified_entries: usize,
+    /// Compared entries whose f32 bits are identical to the fixture's.
+    pub bit_identical_entries: usize,
+    /// Compared entries outside the bar (zero when the comparison succeeds).
+    pub mismatches: usize,
+    /// Index of the argmax entry; the mask can never exclude it from the comparison.
+    pub argmax_index: usize,
+    /// Largest absolute difference over the compared set.
+    pub max_abs_diff: f32,
+    /// Index of that largest difference.
+    pub max_abs_index: usize,
+}
+
+/// Everything the masked logits comparison can reject.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum MaskedCompareError {
+    /// The requested position is not one the fixture compares.
+    #[error("position {position} is not in the fixture's compared set")]
+    PositionNotCompared {
+        /// The offending position.
+        position: usize,
+    },
+    /// The fixture has no recorded logits at a compared position (decode steps are digest-only).
+    #[error("position {position}: the fixture records no logits for a masked comparison")]
+    LogitsMissing {
+        /// The position.
+        position: usize,
+    },
+    /// The device logits length differs from the fixture's.
+    #[error("position {position}: logits length {found} does not match fixture {expected}")]
+    LogitsShape {
+        /// The fixture length.
+        expected: usize,
+        /// The device length.
+        found: usize,
+        /// The position.
+        position: usize,
+    },
+    /// The certified mask and the logits have different lengths.
+    #[error("mask has {certified} entries but the logits have {logits}")]
+    MaskShape {
+        /// Logits length as the caller passed it.
+        logits: usize,
+        /// Mask length in entries.
+        certified: usize,
+    },
+    /// A certified bit was set outside the mask.
+    #[error("certified bit index {index} is outside the mask's {entries} entries")]
+    MaskIndex {
+        /// The index.
+        index: usize,
+        /// Mask entries.
+        entries: usize,
+    },
+    /// Packed mask words do not match the entry count.
+    #[error("a {entries}-entry mask needs {expected_words} words, got {found_words}")]
+    MaskWords {
+        /// Mask entries.
+        entries: usize,
+        /// Expected word count.
+        expected_words: usize,
+        /// Found word count.
+        found_words: usize,
+    },
+    /// The comparison bar is negative or not finite.
+    #[error("invalid absolute bar {bar}")]
+    InvalidBar {
+        /// The bar as passed.
+        bar: f32,
+    },
+    /// A compared value is not finite.
+    #[error(
+        "position {position}: non-finite compared value at {index} (device {device}, fixture {fixture})"
+    )]
+    NonFinite {
+        /// The position.
+        position: usize,
+        /// The index.
+        index: usize,
+        /// The device value as formatted.
+        device: String,
+        /// The fixture value as formatted.
+        fixture: String,
+    },
+    /// A compared value is outside the bar.
+    #[error(
+        "position {position}: {mismatches} of {compared_entries} compared logits outside the {bar} bar (max |difference| {max_abs_diff} at {max_abs_index}, argmax {argmax_index})"
+    )]
+    LogitsMismatch {
+        /// The position.
+        position: usize,
+        /// Number of compared entries outside the bar.
+        mismatches: usize,
+        /// Compared entries.
+        compared_entries: usize,
+        /// Largest absolute difference.
+        max_abs_diff: f32,
+        /// Index of that difference.
+        max_abs_index: usize,
+        /// The bar.
+        bar: f32,
+        /// The argmax entry (always compared).
+        argmax_index: usize,
+    },
+}
+
+/// Compares the screened logits against the fixture with the design 4.2 mask: every entry whose
+/// certified bit is 0, plus the argmax entry, with the absolute bar applied only to that set.
+///
+/// The compared set is fixed by the fixture and the screened values: no caller can widen it, and a
+/// certified entry is never compared except when it is the argmax (whose value is exact by the
+/// certificate contract and decides the token). "Bit-identical" in the result counts compared
+/// entries whose f32 bit patterns equal the fixture's. A positive bar is numeric and is applied to
+/// the compared set; bar zero is the strict case, where PASS is bit-identity, so `+0.0` and
+/// `-0.0` differ. The all-entry comparison is a different, host-only diagnostic and must not use
+/// this function.
+///
+/// # Errors
+/// [MaskedCompareError] naming the first position, shape, non-finite value or out-of-bar entry.
+pub fn compare_logits_exact(
+    fixture: &SequenceFixture,
+    position: usize,
+    screened: &ScreenedLogits,
+    bar: f32,
+) -> Result<MaskedLogitsComparison, MaskedCompareError> {
+    if bar < 0.0 || !bar.is_finite() {
+        return Err(MaskedCompareError::InvalidBar { bar });
+    }
+    if !fixture.compared_positions.contains(&position) {
+        return Err(MaskedCompareError::PositionNotCompared { position });
+    }
+    let expected = fixture
+        .steps
+        .iter()
+        .find(|step| step.position == position)
+        .and_then(|step| step.logits.as_ref())
+        .ok_or(MaskedCompareError::LogitsMissing { position })?;
+    if screened.logits.len() != expected.len() {
+        return Err(MaskedCompareError::LogitsShape {
+            position,
+            expected: expected.len(),
+            found: screened.logits.len(),
+        });
+    }
+    if screened.certified.entries() != screened.logits.len() {
+        return Err(MaskedCompareError::MaskShape {
+            logits: screened.logits.len(),
+            certified: screened.certified.entries(),
+        });
+    }
+    let Some((argmax_index, _)) = screened.argmax() else {
+        return Err(MaskedCompareError::LogitsShape {
+            position,
+            expected: expected.len(),
+            found: 0,
+        });
+    };
+    let mut compared_entries = 0usize;
+    let mut bit_identical_entries = 0usize;
+    let mut mismatches = 0usize;
+    let mut max_abs_diff = 0.0f32;
+    let mut max_abs_index = argmax_index;
+    for (index, &reference) in expected.iter().enumerate() {
+        if index != argmax_index && screened.certified.is_certified(index) {
+            continue;
+        }
+        compared_entries += 1;
+        let device = screened.logits[index];
+        if !device.is_finite() || !reference.is_finite() {
+            return Err(MaskedCompareError::NonFinite {
+                position,
+                index,
+                device: device.to_string(),
+                fixture: reference.to_string(),
+            });
+        }
+        let bit_identical = device.to_bits() == reference.to_bits();
+        if bit_identical {
+            bit_identical_entries += 1;
+        }
+        let difference = (device - reference).abs();
+        // Bar zero is bit-identity, not numeric equality: +0.0 and -0.0 are numerically equal but
+        // are different f32 values, and "exact" must not count them as the same result. A positive
+        // bar is numeric and admits both zeros.
+        let outside_bar = if bar == 0.0 {
+            !bit_identical
+        } else {
+            difference > bar
+        };
+        if outside_bar {
+            mismatches += 1;
+        }
+        if difference > max_abs_diff {
+            max_abs_diff = difference;
+            max_abs_index = index;
+        }
+    }
+    let result = MaskedLogitsComparison {
+        position,
+        compared_entries,
+        mask_exact_entries: screened.exact_entries(),
+        mask_certified_entries: screened.certified_entries(),
+        bit_identical_entries,
+        mismatches,
+        argmax_index,
+        max_abs_diff,
+        max_abs_index,
+    };
+    if mismatches > 0 {
+        return Err(MaskedCompareError::LogitsMismatch {
+            position,
+            mismatches,
+            compared_entries,
+            max_abs_diff,
+            max_abs_index,
+            bar,
+            argmax_index,
+        });
+    }
+    Ok(result)
+}
+
 /// Compares the full logits where the fixture recorded them, against an absolute bar.
 ///
 /// This is the second bar: tokens decide pass/fail first, and the logits check the values behind
@@ -947,6 +1352,272 @@ mod tests {
             compare_logits(&fixture, &device, LOGITS_ABS_BAR)
                 .expect_err("recorded logits are required"),
             CompareError::LogitsMissing { position: 130 }
+        ));
+    }
+
+    fn fixture_logits_at(fixture: &SequenceFixture, position: usize) -> Vec<f32> {
+        fixture
+            .steps
+            .iter()
+            .find(|step| step.position == position)
+            .and_then(|step| step.logits.clone())
+            .expect("the tiny fixture records all logits")
+    }
+
+    fn lowest_argmax(logits: &[f32]) -> usize {
+        let mut best = 0;
+        for (index, &value) in logits.iter().enumerate() {
+            if value > logits[best] {
+                best = index;
+            }
+        }
+        best
+    }
+
+    fn exact_mask(entries: usize) -> CertifiedMask {
+        CertifiedMask::exact(entries)
+    }
+
+    #[test]
+    fn a_screened_exact_screen_is_compared_entry_for_entry() {
+        let fixture = tiny_fixture(8);
+        let logits = fixture_logits_at(&fixture, 129);
+        let entries = logits.len();
+        let screened = ScreenedLogits::new(logits.clone(), exact_mask(entries)).expect("mask");
+        let comparison = compare_logits_exact(&fixture, 129, &screened, 0.0).expect("exact");
+        assert_eq!(comparison.position, 129);
+        assert_eq!(comparison.compared_entries, entries);
+        assert_eq!(comparison.mask_exact_entries, entries);
+        assert_eq!(comparison.mask_certified_entries, 0);
+        assert_eq!(comparison.bit_identical_entries, entries);
+        assert_eq!(comparison.mismatches, 0);
+        assert_eq!(comparison.argmax_index, lowest_argmax(&logits));
+        assert_eq!(comparison.max_abs_diff, 0.0);
+    }
+
+    #[test]
+    fn certified_entries_are_skipped_but_the_argmax_is_not() {
+        let fixture = tiny_fixture(8);
+        let logits = fixture_logits_at(&fixture, 129);
+        let argmax = lowest_argmax(&logits);
+        let mut mask = exact_mask(logits.len());
+        for index in 0..logits.len() {
+            mask.set_certified(index, index != argmax).expect("bit");
+        }
+        let mut screened = ScreenedLogits::new(logits.clone(), mask.clone()).expect("screened");
+        // A differing certified bound is skipped: only the argmax is compared. The value stays
+        // below the argmax so the device argmax itself is unchanged (a certified bound above the
+        // winner would be an invalid screen, and the comparator would compare it as the argmax).
+        let certified_outlier = (0..logits.len()).find(|index| *index != argmax).unwrap();
+        screened.logits[certified_outlier] = logits[argmax] - 10.0 * LOGITS_ABS_BAR;
+        let comparison =
+            compare_logits_exact(&fixture, 129, &screened, LOGITS_ABS_BAR).expect("only argmax");
+        assert_eq!(comparison.compared_entries, 1);
+        assert_eq!(comparison.argmax_index, argmax);
+        assert_eq!(comparison.mask_certified_entries, logits.len() - 1);
+
+        // The argmax entry is compared even when it carries a certified bit: set that bit now, so
+        // deleting the "index != argmax_index" condition would skip every entry and this test
+        // would fail instead of passing vacuously.
+        let mut certified_argmax_mask = mask.clone();
+        certified_argmax_mask
+            .set_certified(argmax, true)
+            .expect("argmax bit");
+        assert!(certified_argmax_mask.is_certified(argmax));
+        let mut certified_argmax =
+            ScreenedLogits::new(logits, certified_argmax_mask).expect("mask");
+        let argmax_value = certified_argmax.logits[argmax];
+        certified_argmax.logits[argmax] = argmax_value + argmax_value.abs() * 2.0 + 1.0;
+        let error = compare_logits_exact(&fixture, 129, &certified_argmax, LOGITS_ABS_BAR)
+            .expect_err("the argmax is always compared");
+        assert!(matches!(
+            error,
+            MaskedCompareError::LogitsMismatch {
+                position: 129,
+                argmax_index,
+                ..
+            } if argmax_index == argmax
+        ));
+    }
+
+    #[test]
+    fn the_mask_excludes_a_differing_entry_and_the_bar_is_inclusive() {
+        let fixture = tiny_fixture(8);
+        let logits = fixture_logits_at(&fixture, 129);
+        let argmax = lowest_argmax(&logits);
+        let exact_entry = (0..logits.len()).find(|index| *index != argmax).unwrap();
+
+        // An exact entry that differs by more than the bar fails.
+        let mut screened =
+            ScreenedLogits::new(logits.clone(), exact_mask(logits.len())).expect("mask");
+        let value = screened.logits[exact_entry];
+        screened.logits[exact_entry] = value - value.abs() * 2.0 - 1.0;
+        assert!(matches!(
+            compare_logits_exact(&fixture, 129, &screened, LOGITS_ABS_BAR)
+                .expect_err("an exact entry outside the bar fails"),
+            MaskedCompareError::LogitsMismatch {
+                position: 129,
+                max_abs_index,
+                mismatches: 1,
+                ..
+            } if max_abs_index == exact_entry
+        ));
+
+        // The same differing entry is certified away: the argmax is the only compared entry.
+        let mut mask = exact_mask(logits.len());
+        mask.set_certified(exact_entry, true).expect("bit");
+        let mut certified = ScreenedLogits::new(logits.clone(), mask).expect("mask");
+        let value = certified.logits[exact_entry];
+        certified.logits[exact_entry] = value - value.abs() * 2.0 - 1.0;
+        compare_logits_exact(&fixture, 129, &certified, LOGITS_ABS_BAR)
+            .expect("a certified entry is excluded");
+
+        // A non-zero boundary: a difference exactly equal to the bar passes, one f32 step below
+        // the difference fails. The entry is decreased so the argmax (and the compared set) does
+        // not change.
+        let expected_value = fixture_logits_at(&fixture, 129)[exact_entry];
+        let mut boundary = ScreenedLogits::new(
+            logits.clone(),
+            exact_mask(fixture_logits_at(&fixture, 129).len()),
+        )
+        .expect("mask");
+        boundary.logits[exact_entry] = expected_value - expected_value.abs().max(1.0) * 0.5;
+        let difference = (boundary.logits[exact_entry] - expected_value).abs();
+        assert!(difference > 0.0);
+        compare_logits_exact(&fixture, 129, &boundary, difference)
+            .expect("a difference exactly at the bar passes");
+        let below = f32::from_bits(difference.to_bits() - 1);
+        assert!(matches!(
+            compare_logits_exact(&fixture, 129, &boundary, below)
+                .expect_err("a difference just above the bar fails"),
+            MaskedCompareError::LogitsMismatch { position: 129, .. }
+        ));
+
+        // The bar is inclusive at zero: identical bits pass, one ulp fails, and the released
+        // 2e-2 bar admits the same one-ulp difference.
+        let mut one_ulp =
+            ScreenedLogits::new(logits, exact_mask(fixture_logits_at(&fixture, 129).len()))
+                .expect("mask");
+        one_ulp.logits[exact_entry] = f32::from_bits(one_ulp.logits[exact_entry].to_bits() + 1);
+        let exact = ScreenedLogits::new(
+            fixture_logits_at(&fixture, 129),
+            exact_mask(fixture_logits_at(&fixture, 129).len()),
+        )
+        .expect("mask");
+        let comparison = compare_logits_exact(&fixture, 129, &exact, 0.0).expect("identical bits");
+        assert_eq!(comparison.max_abs_diff, 0.0);
+        assert!(matches!(
+            compare_logits_exact(&fixture, 129, &one_ulp, 0.0).expect_err("bar zero exact only"),
+            MaskedCompareError::LogitsMismatch {
+                position: 129,
+                mismatches: 1,
+                ..
+            }
+        ));
+        compare_logits_exact(&fixture, 129, &one_ulp, LOGITS_ABS_BAR)
+            .expect("one ulp is inside the released bar");
+    }
+
+    #[test]
+    fn bar_zero_compares_f32_bits_and_rejects_signed_zero() {
+        let mut fixture = tiny_fixture(8);
+        let mut logits = fixture_logits_at(&fixture, 129);
+        let argmax = lowest_argmax(&logits);
+        assert!(logits[argmax] > 0.0, "the fixture argmax is positive");
+        let entry = (0..logits.len()).find(|index| *index != argmax).unwrap();
+        logits[entry] = -0.0;
+        for step in &mut fixture.steps {
+            if step.position == 129 {
+                step.logits.as_mut().expect("logits")[entry] = 0.0;
+            }
+        }
+        let screened = ScreenedLogits::new(logits.clone(), exact_mask(logits.len())).expect("mask");
+        // The values are numerically equal, but +0.0 and -0.0 are not the same f32. Bar zero is
+        // bit-identity, so this must fail; a positive bar is numeric and admits both zeros.
+        let error = compare_logits_exact(&fixture, 129, &screened, 0.0)
+            .expect_err("signed zero is not bit-identical");
+        assert!(matches!(
+            error,
+            MaskedCompareError::LogitsMismatch {
+                position: 129,
+                mismatches: 1,
+                ..
+            }
+        ));
+        let positive = compare_logits_exact(&fixture, 129, &screened, f32::MIN_POSITIVE)
+            .expect("a positive bar admits signed zero");
+        assert_eq!(positive.mismatches, 0);
+        assert_eq!(positive.bit_identical_entries, logits.len() - 1);
+    }
+
+    #[test]
+    fn a_one_million_entry_mask_is_128_kib_of_words() {
+        let mask = CertifiedMask::exact(1_048_576);
+        assert_eq!(mask.entries(), 1_048_576);
+        assert_eq!(mask.words().len(), 16_384);
+        assert_eq!(std::mem::size_of_val(mask.words()), 131_072);
+        assert_eq!(mask.certified_entries(), 0);
+        assert_eq!(mask.exact_entries(), 1_048_576);
+        assert!(matches!(
+            CertifiedMask::from_words(vec![0; 1], 1_048_576).expect_err("word count"),
+            MaskedCompareError::MaskWords { .. }
+        ));
+        // Padding bits beyond the entry count are cleared instead of inflating the certified count.
+        let padded = CertifiedMask::from_words(vec![u64::MAX, u64::MAX], 65).expect("padded mask");
+        assert_eq!(padded.certified_entries(), 65);
+        assert_eq!(padded.exact_entries(), 0);
+        let mut mask = CertifiedMask::exact(65);
+        mask.set_certified(64, true).expect("bit 64");
+        assert!(mask.is_certified(64));
+        assert!(matches!(
+            mask.set_certified(65, true).expect_err("out of range"),
+            MaskedCompareError::MaskIndex {
+                index: 65,
+                entries: 65
+            }
+        ));
+    }
+
+    #[test]
+    fn the_certified_mask_and_logits_must_have_the_logits_shape() {
+        let fixture = tiny_fixture(8);
+        let logits = fixture_logits_at(&fixture, 129);
+        assert!(matches!(
+            ScreenedLogits::new(logits.clone(), exact_mask(logits.len() - 1))
+                .expect_err("mask shape"),
+            MaskedCompareError::MaskShape { .. }
+        ));
+        let screened =
+            ScreenedLogits::new(logits, exact_mask(fixture_logits_at(&fixture, 129).len()))
+                .expect("mask");
+        let mut short = screened.clone();
+        short.logits.pop();
+        assert!(matches!(
+            compare_logits_exact(&fixture, 129, &short, LOGITS_ABS_BAR).expect_err("logits shape"),
+            MaskedCompareError::LogitsShape { position: 129, .. }
+        ));
+    }
+
+    #[test]
+    fn the_masked_comparator_refuses_an_uncompared_position_and_non_finite_values() {
+        let fixture = tiny_fixture(8);
+        let logits = fixture_logits_at(&fixture, 129);
+        let screened = ScreenedLogits::new(logits.clone(), exact_mask(logits.len())).expect("mask");
+        assert!(matches!(
+            compare_logits_exact(&fixture, 128, &screened, LOGITS_ABS_BAR)
+                .expect_err("position 128 is not compared"),
+            MaskedCompareError::PositionNotCompared { position: 128 }
+        ));
+        let mut nan = screened;
+        nan.logits[0] = f32::NAN;
+        assert!(matches!(
+            compare_logits_exact(&fixture, 129, &nan, LOGITS_ABS_BAR)
+                .expect_err("a non-finite exact value fails"),
+            MaskedCompareError::NonFinite {
+                position: 129,
+                index: 0,
+                ..
+            }
         ));
     }
 
