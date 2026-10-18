@@ -1340,16 +1340,20 @@ merged and the slice documented), and they feed Phase 0/1 rather than being repl
 | KV entry / token / page | 356 B / 890 B / 56,960 B | design plus `tests/layout.rs` | D1, D16 |
 | Per-rank weights (all resident) | about 130.1 GB on a 130.66 GB device | arithmetic, released bytes | section 7.5 |
 | Per-token collective budget | 83 collectives, about 1.77 MB, about 1.7 ms at 20 µs | arithmetic | section 7.2 |
-| HSI indexer (task-7; landed as !35 `826f4f0`) | **measured, window 2026-10-18**: stage 2, 200 launches, p50: indexer proxy at one candidate (`--tokens 1`, engine format) **0.0930 ms**; attention-proper proxy at 128 candidates (A - B) **0.1562 ms**, with the 130-token engine total **0.2492 ms**; FP4 total 0.2471 ms and the merged-chain equality line reproduced exactly (163,838/163,840 exact, 2.4414063e-4, ULP 1); A correctness 163,834/163,840 exact (99.9963%), max abs delta 9.765625e-4, ULP 1, deterministic. Under the A-minus-B proxy the indexer is now about 0.6x the attention proper, so roadmap 6.3 item 1's "at or below" would hold - but that split is a proxy, not a phase-isolated measurement, so the target is **measurable and proxy-met, not established** | node0, 2026-10-18T17:16Z window; binary sha256 `43603e44...`, cubin `5bfee4c7...`, checkpoint `1bae0e10...`; run logs in `/home/user/phase2-evidence/window-2026-10-18/runs/`; method, exact lines and the proxy caveat in [phase3-indexer.md](phase3-indexer.md) | stage-1 printed-class log still owed: run D failed on the Mega-mHC cubin name (`mega_mhc_fused_bf16_sm121.cubin` vs the baseline's `mega_mhc_sm121`); corrected command in [phase3-indexer.md](phase3-indexer.md) section 4.1 |
+| HSI indexer (task-7; landed as !35 `826f4f0`) | **measured, window 2026-10-18**: stage 2, 200 launches, p50: indexer proxy at one candidate (`--tokens 1`, engine format) **0.0930 ms**; attention-proper proxy at 128 candidates (A - B) **0.1562 ms**, with the 130-token engine total **0.2492 ms**; FP4 total 0.2471 ms and the merged-chain equality line reproduced exactly (163,838/163,840 exact, 2.4414063e-4, ULP 1); A correctness 163,834/163,840 exact (99.9963%), max abs delta 9.765625e-4, ULP 1, deterministic. Under the A-minus-B proxy the indexer is now about 0.6x the attention proper, so roadmap 6.3 item 1's "at or below" would hold - but that split is a proxy, not a phase-isolated measurement, so the target is **measurable and proxy-met, not established** | node0, 2026-10-18T17:16Z window; binary sha256 `43603e44...`, cubin `5bfee4c7...`, checkpoint `1bae0e10...`; run logs in `/home/user/phase2-evidence/window-2026-10-18/runs/`; method, exact lines and the proxy caveat in [phase3-indexer.md](phase3-indexer.md) | stage-1 printed-class log regenerated 2026-10-18T17:47:23Z: `stage 1: PASS (4 of 4 tokens at every boundary)` with the renamed Mega-mHC cubin; log `/home/user/phase2-evidence/window-2026-10-18/window-stage1-20261018T174723Z.log`; boundary deltas in [phase3-indexer.md](phase3-indexer.md) section 5 |
 
-The stage-1 printed-class log cited in this section predates the M2 fix of the harness's printed
-comparison-class strings (it prints the retired stream-mean fold as the current predictor). It is
-still pending regeneration: run D in the 2026-10-18 window failed before any GPU work on the
-Mega-mHC cubin file name, and the corrected command is in [phase3-indexer.md](phase3-indexer.md)
-section 4.1. The **stage-2** half was regenerated in that window: runs A and B (engine format) and
-C (FP4) print the current comparison-class strings, recorded with the window's numbers in
-[phase3-indexer.md](phase3-indexer.md) sections 2 and 5. The stage-2 numbers in 12.1's HSI indexer
-row come from the harness's printed lines in those logs, not from a stale printed class line.
+The stage-1 and stage-2 printed-class logs cited in this section predate the M2 fix of the
+harness's printed comparison-class strings (the stage-1 log printed the retired stream-mean fold as
+the current predictor). **Both halves have been regenerated in the 2026-10-18 windows.** The
+**stage-2** half: runs A and B (engine format) and C (FP4) print the current comparison-class
+strings, recorded with the window's numbers in [phase3-indexer.md](phase3-indexer.md) sections 2 and
+5; the stage-2 numbers in 12.1's HSI indexer row come from those printed lines, not from a stale
+printed class line. The **stage-1** half: run D failed before any GPU work on the Mega-mHC cubin
+file name, and the corrected 17:47:23Z retry window printed
+`stage 1: PASS (4 of 4 tokens at every boundary)` with the renamed cubin (log
+`/home/user/phase2-evidence/window-2026-10-18/window-stage1-20261018T174723Z.log`); its boundary
+deltas are quoted in [phase3-indexer.md](phase3-indexer.md) section 5. The stage-1 rows in 12.1 are
+the fourth-window values, which that run re-confirms against a current printed-class log.
 
 ### 12.2 The labels
 

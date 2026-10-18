@@ -10,9 +10,10 @@ measured, of what class, and what is still owed.
 section 2 below, quoted from the logs. Run D (the stale stage-1 printed-class log) failed
 immediately on a cubin file name - the example loads
 `mega_mhc_fused_bf16_sm121.cubin` while the baseline manifest keys the kernel as
-`mega_mhc_sm121`; section 3 explains the two names and section 4.1 now builds the file under the
-name the example uses. Stage 1 therefore still has no fresh log; stage 2's printed-class logs were
-regenerated (section 5).
+`mega_mhc_sm121`; section 3 explains the two names and section 4.1 builds the file under the name
+the example uses. **A short follow-up window at 17:47:23Z staged that renamed copy and re-ran stage
+1; it passed 4 of 4 tokens at every boundary** (numbers and log paths in section 5). Both halves of
+the stale printed-class logs are therefore regenerated: stage 2 by A/B/C, stage 1 by the retry.
 
 ## 1. What landed, and where it can be cited from
 
@@ -67,9 +68,10 @@ is extrapolated from !35.
 | B | `--stage 2 --tokens 1 --stage2-kv-format engine --grid-y 64 --repeat 200` | **PASS, 2/2** | engine format, 1 position: 32,768/32,768 exact, max abs delta 0, max ULP 0; determinism byte-identical | min 0.0913, **p50 0.0930**, mean 0.0930, max 0.1003; batched 0.0943 |
 | C | `--stage 2 --tokens 130 --stage2-kv-format fp4 --grid-y 64 --repeat 200` | **PASS, 5/5** | FP4 historical format, 5 positions: 163,838/163,840 exact (99.9988%), max abs delta 2.4414063e-4, max ULP 1; `merged-chain FP4 equality: PASS` (got exactly the expected 163838/163840, 2.4414063e-4, 1); determinism byte-identical | min 0.2443, **p50 0.2471**, mean 0.2503, max 0.3411; batched 0.2523 |
 | D | `--stage 1 --tokens 4 --layer 0` | **FAILED before any GPU work** | none - see section 5 | none |
+| D (retry, 17:47:23Z) | `--stage 1 --tokens 4 --layer 0` | **PASS, 4 of 4 tokens at every boundary** | per token: `hc_coeffs` B 0/16 exact (max abs 3.95e-7), A 1/4 (2.74e-6), C 0/4 (7.15e-7); `xhat_fp8` 5,120/5,120 exact and 160/160 ue8m0 scales; residual `X_l` 20,480/20,480 bf16 exact; `1/rms(X_hat)` max abs 3.43e-5 (bar 3e-4); block-input f32 capture 5,120/5,120 exact | none (correctness run) |
 
-All three runs print `launch grid: (64, 64, 1) blocks of (256, 1, 1) threads; each warp walks 2 HSI
-blocks per head`, so the geometry is the one this note documents.
+The three stage-2 runs print `launch grid: (64, 64, 1) blocks of (256, 1, 1) threads; each warp
+walks 2 HSI blocks per head`, so the geometry is the one this note documents.
 
 **The indexer/attention split is a proxy, and it flipped against the carried row.** Both A and B
 score the full 2,048-block HSI pool at every candidate count (that is the indexer's work), while the
@@ -175,11 +177,12 @@ mkdir -p "$OUT"
 "$BIN" --stage 2 --tokens 130 --stage2-kv-format fp4 --grid-y 64 --repeat 200 \
   --checkpoint "$CKPT" --cubin-dir "$CUBINS" 2>&1 | tee "$OUT/phase3-indexer-stage2-fp4-130-$(date -u +%Y%m%dT%H%M%SZ).log"
 
-# D - same window: regenerate the stale stage-1 printed-class log (roadmap 12.1 footer).
-#     Needs <CUBINS>/mega_mhc_fused_bf16_sm121.cubin (section 3); this run failed 2026-10-18
-#     with Error: "<CUBINS>/mega_mhc_fused_bf16_sm121.cubin: No such file or directory
+# D - regenerate the stale stage-1 printed-class log (roadmap 12.1 footer).
+#     Needs <CUBINS>/mega_mhc_fused_bf16_sm121.cubin (section 3); the first window's attempt failed
+#     2026-10-18 with Error: "<CUBINS>/mega_mhc_fused_bf16_sm121.cubin: No such file or directory
 #     (os error 2) (build the cubin first; the module docs give the nvcc line)"
-#     (the quoted line is verbatim except for the elided <CUBINS> prefix).
+#     (verbatim except the elided <CUBINS> prefix). The 17:47:23Z retry staged the renamed cubin and
+#     printed stage 1: PASS (4 of 4 tokens; section 5).
 "$BIN" --stage 1 --tokens 4 --layer 0 \
   --checkpoint "$CKPT" --cubin-dir "$CUBINS" 2>&1 | tee "$OUT/phase3-indexer-stage1-$(date -u +%Y%m%dT%H%M%SZ).log"
 ```
@@ -215,15 +218,20 @@ values the 2026-10-18 window actually printed are shown after each line:
 7. `format fp4 (historical kernel format): totals across 5 positions: 163838/163840 exact (99.9988%), max abs delta 2.4414063e-4, max ULP 1; determinism: two device runs per position, byte-identical`
    plus `merged-chain FP4 equality: PASS (... got 163838/163840, 2.4414063e-4, 1)` (C).
 8. `stage 2: PASS (10 of 10 printed checks ...)` (A); `stage 2: PASS (2 of 2 ...)` (B);
-   `stage 2: PASS (5 of 5 ...)` (C); run D must print
-   `stage 1: PASS (4 of 4 tokens at every boundary)`.
+   `stage 2: PASS (5 of 5 ...)` (C). The stage-1 retry printed
+   `stage 1: PASS (4 of 4 tokens at every boundary)`; its per-token lines are quoted in section 5.
 9. The harness's own header lines from each per-run log: checkpoint path, memory-floor lines and
    the run's geometry. The binary and cubin sha256s are NOT repeated in the per-run logs; they are
    the window log's provenance lines, quoted verbatim as
    `43603e4442829b73590bbc35a5ab433ae67cc50e94b8741822a9d0d959513cdc  .../m7_layer0_task7_aarch64` and
    `5bfee4c7a0ece7c921e591fc6b8bd9d98c39b95d735d7c1d699ec58edaa51ea3  .../cubins/flash_mla_csa2_sm121.cubin`
    (`/home/user/phase2-evidence/window-2026-10-18/logs/window-20261018T171617Z.log`). The
-   window's UTC start/end is recorded in that same log, not in the per-run logs.
+   window's UTC start/end is recorded in that same log, not in the per-run logs. The stage-1 retry's
+   provenance lines are in its own window log
+   `/home/user/phase2-evidence/window-2026-10-18/window-stage1-20261018T174723Z.log`: the same
+   binary sha256 `43603e44...` and
+   `.../cubins/mega_mhc_fused_bf16_sm121.cubin` sha256 `e21293e3...` (the renamed copy of the
+   baseline's `mega_mhc_sm121`, 70,312 B).
 
 ### 4.4 Pass bar (declared before the numbers)
 
@@ -233,27 +241,44 @@ The harness prints its bar before it judges anything: for the engine format at l
 must reproduce the merged-chain equality line exactly (163,838/163,840 exact, max abs delta
 2.4414063e-4, max ULP 1). The indexer self-check is exact by construction: 2,048/2,048 block scores
 and 2,048/2,048 block_best. A run that misses any of these exits non-zero and the log is a finding,
-not a pass. The 2026-10-18 window met the bar on A, B and C; D never reached its bar.
+not a pass. The 2026-10-18 window met the bar on A, B and C; D failed before reaching its bar and
+the 17:47:23Z retry (section 5) met it on 4 of 4 tokens.
 
 ## 5. The stale stage-1/stage-2 printed-class logs
 
 Roadmap 12.1 records that the stage-1 and stage-2 logs cited there predate the M2 fix of the
 harness's printed comparison-class strings and are "pending regeneration in the next device
-window". **The 2026-10-18 window regenerated the stage-2 half**: runs A and B (engine format) and C
-(FP4) print the current comparison-class strings and are the replacement logs for that class. **The
-stage-1 half is still owed**: run D failed before any GPU work on
-`Error: "<CUBINS>/mega_mhc_fused_bf16_sm121.cubin: No such file or directory (os error 2) (build
-the cubin first; the module docs give the nvcc line)"` (verbatim except the elided `<CUBINS>`
-prefix) - the command built `mega_mhc_sm121.cubin` (section 3 has the two names and the corrected
-command). The next window needs only that renamed cubin to close the stage-1 regeneration; the
-sha256 is unchanged by the rename. After that window, the Lead or the docs owner quotes the new log
-lines into roadmap 12.1 and retires the stale logs.
+window". **Both halves are now regenerated in the 2026-10-18 windows.**
+
+- **Stage 2**: runs A and B (engine format) and C (FP4) print the current comparison-class strings
+  and are the replacement logs for that class (section 2).
+- **Stage 1**: run D failed before any GPU work because the example loads
+  `mega_mhc_fused_bf16_sm121.cubin` while the baseline manifest keys the kernel `mega_mhc_sm121`
+  (section 3). A short follow-up window at **2026-10-18T17:47:23Z** staged the renamed copy - cubin
+  `mega_mhc_fused_bf16_sm121.cubin`, 70,312 B, sha256
+  `e21293e3f6288dbe413a2b998efce6c43c8a56dd993eca5cd1bfc6138cdca618`, the same bytes the baseline
+  records for `mega_mhc_sm121`; the rename does not change the sha - and re-ran argv
+  `m7_layer0 --stage 1 --tokens 4 --layer 0 --checkpoint <snapshot> --cubin-dir <cubins>`.
+  Result: **`stage 1: PASS (4 of 4 tokens at every boundary)`**, exit 0. Logs:
+  `/home/user/phase2-evidence/window-2026-10-18/window-stage1-20261018T174723Z.log` and
+  `.../runs/d-stage1-layer0-retry.log`; binary `m7_layer0_task7_aarch64` sha256
+  `43603e4442829b73590bbc35a5ab433ae67cc50e94b8741822a9d0d959513cdc`. Per token the harness printed:
+  `hc_coeffs` B 0/16 exact (max abs 3.95e-7), A 1/4 (2.74e-6), C 0/4 (7.15e-7); `xhat_fp8`
+  5,120/5,120 exact with 160/160 ue8m0 scales; the residual `X_l` 20,480/20,480 bf16 exact;
+  `1/rms(X_hat)` max abs 3.43e-5 against its 3e-4 bar; and the block-input f32 capture 5,120/5,120
+  exact. No pass-bar miss, no non-zero exit.
+
+Roadmap 12.1's HSI indexer row and its stale-log note now cite the regenerated logs; the numbers
+there come from the harness's printed lines in those logs, not from a stale printed class line. The
+class is unchanged: stage 1 is internal consistency against the in-crate f32 reference on released
+layer-0 bytes, not model fidelity.
 
 ## 6. What this note does not establish
 
-- It is not a new device run for stage 1, and it does not claim one. Stage 2's numbers are measured
-  (section 2); stage 1's printed-class log is still stale until run D is re-run with the renamed
-  cubin.
+- Stage 1 was re-run on the device in the 17:47:23Z retry window and passed 4 of 4 tokens at every
+  boundary (section 5); that run is internal consistency against the in-crate reference on released
+  layer-0 bytes, not model fidelity, and it makes no timing claim. Stage 2's numbers are measured
+  (section 2). The stale printed-class note is retired: both halves are regenerated.
 - It does not claim roadmap 6.3 item 1's "at or below the attention proper" target is *established*.
   Under the A-minus-B proxy the indexer (0.0930 ms) is below the implied attention proper
   (0.1562 ms), which is the first measured window where the comparison favours the indexer, but the
