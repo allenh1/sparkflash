@@ -27,9 +27,13 @@ records the evidence and the consequence for the build. Research backing is in
 | D16 | KV specification defects | Six 5.5 defects recorded as facts: the 890 B/token headline contradicts its own itemisation (356 B/entry once the rotary dimensions are not double-counted), plus five more, each with the code's settlement named |
 | D17 | Qualification state | Nine gates recorded with instrument, command, artifact and state; five cannot be run by any command in this tree, and 20 us at 10 KiB is the requirement while the preflight's 22 us is a deliberately looser readiness threshold |
 | D18 | The engine is a ninth crate, and the plan describes the checkpoint as stored | `crates/sparkflash-engine`; the plan is derived from the configuration and then checked against the index, and the load-time conversions (wo_a, the int8 view of FP4) belong to the loader, not the plan |
+| D19 | `panic = "abort"` in the release profile | Kept deliberately: a release build aborts on an engine panic, so `sparkflash serve`'s per-request `catch_unwind` guard protects the unwinding dev/test builds, not production; the guard and its module doc stay, and the limit is stated rather than implied |
+| D20 | The two configuration documents | `ModelConfig::from_released_json` maps the released HF `config.json` onto the runtime fields (every key mapped, checked or ignored with a reason) and `from_json` accepts either document, so `sparkflash serve` reads a checkpoint as released; both documents are pinned, and the derived configuration equals the runtime one field for field |
 | D21 | The determinism contract | D-a kernel determinism, D-b reduction determinism and D-c no assumed cross-boundary equality are written down here and cited by the M7 harness; a test fails if either half disappears |
 | D22 | Released mHC arithmetic | The ref, the kernel and the harness model the released arithmetic end to end (projection rstd, `mix*scale+base`, sigmoid pre/post, released split-Sinkhorn, raw C, `X_hat` block norm, released `[24, n*d]` predictor); B0 removed the stream-mean fold from both sides, so the old structural difference is gone |
 | D23 | The activation quantiser is the reference ceil rule | Device activation quantisers take the smallest power of two at or above `amax/448` after the 1e-4 amax floor (the engine's `quantize_activation_fp8` rule); the checkpoint weight-grid rule stays floor-log2 and the two helpers are named apart (D8) |
+| D24 | CSA attention attends the window/compressed union | Format 2 (CSA-union) attends the window rows then the selected compressed ids, causal, with the sink first in the denominator; the 19-param ABI and formats 0/1 are unchanged, and it is reference-tested/CPU-pinned only until a device window proves it |
+| D25 | The golden sequence fixture is Phase-2 reference truth | The real-checkpoint fixture (`e6df8290...`, 2,536,194 B; 130-token prefill with next token 491, 8 decodes, compared 129..137) is the truth 2B/2C are measured against; device output is compared token-first then logits at 2e-2; the 2B device comparison has not run, criterion 1 stays OPEN, and the fixture is never regenerated to accommodate a device change |
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
 summary and the matching `## D<n>` section carries the evidence and the full consequence. If a row and
@@ -1293,3 +1297,46 @@ window (the 2B harness then compares format 2 on the existing stage-2 positions 
 position-129 case). Formats 0 and 1 device evidence from task-3/task-6 is untouched, and
 m7_layer0.rs is not modified by this change. The 2B harness consumes format 2 through the existing
 typed FlashMlaParams/flash_mla_params builder.
+
+---
+
+## D25 - The golden sequence fixture is the Phase 2 reference truth, and 2B's device comparison is still open
+
+Recorded 2026-10-18.
+
+**Evidence.** The Phase 2A node run produced a real-checkpoint sequence fixture: the engine's CPU
+reference forward over the released 40-layer checkpoint, one 130-token prompt (the deterministic
+prompt for seed 7, its ids recorded) then 8 greedy decode steps. It is
+`/home/user/phase2-evidence/sequence-130-released.json` on node `node0` and
+`/home/user/phase2-evidence/devhost-copy-f72738b/sequence-130-released.json` on the dev host,
+2,536,194 B, sha256
+`e6df8290dcc9cfc96af27ad1a4da165e5f3d8d4e9aac0f98819b0030b738b308`, schema 1, `config_label`
+`released`, compared positions `[129..137]`, prefill next token 491, decode next tokens
+`[367, 201, 80, 3302, 201, 54, 201, 4341]`. Provenance: main `f72738b`, aarch64 binary sha256
+`ed3838df5ca28722a19d6dda689d7b90c4dd67c8faf205cafcc3469dcb459ffa` (7,265,936 B), rustc 1.98.1 /
+zig 0.17.0, `/usr/bin/time` wall 613.54 s, exit 0; [build/phase2-golden-fixture.md](build/phase2-golden-fixture.md)
+records the full provenance, the evidence files and the caveats (the prefill/decode split is
+inferred from the IO bursts, not measured; the `read_bytes` figure is warm-cache). This is the first
+real-checkpoint sequence reference in the tree: 2A's committed CI fixture is a deterministic
+tiny-config fixture that pins the schema and the comparator, not model evidence
+([build/phase2-sequence-harness.md](build/phase2-sequence-harness.md) section 3).
+
+**Decision.** That fixture is the Phase 2 reference truth for 2B/2C. A device output is compared
+token-first (the prefill next token and all 8 decoded tokens, on the fixture's compared set only) and
+then, where the fixture recorded logits, at the fixed 2e-2 absolute bar (`LOGITS_ABS_BAR`); the
+comparison is never widened to older positions because the engine reference does not implement CED
+(D7). The fixture is reference truth, not a test output: it must not be regenerated as a side effect
+of a device change. If a device run disagrees, the device work is wrong or the gap is real, and the
+fixture is not edited to make the run pass. A legitimate regeneration (a schema change or a
+corrected reference) is a separate Lead decision that records a new sha256/size here and marks the
+old fixture superseded. The CSA-union format-2 semantics remain D24's; this entry does not restate
+them.
+
+**Consequence.** At record time the 2B device comparison has NOT run: the skeleton is CPU-pinned in
+draft MR !63 (opened at bad3c84 against a26be2e), the format-2 dispatch and the measured
+`window_rows` rotation are not wired, and no device prefill/decode, token, logits or rotation-copy
+number exists for this milestone. Phase 2 exit criterion 1
+([build/roadmap-to-serving.md](build/roadmap-to-serving.md) section 5.5.1) is therefore OPEN, as are
+criteria 2-5. Format 2 is reference-tested/CPU-pinned only (D24, !62 -> main d3dcc3f, pipeline
+2763); its device execution is the next Lead-sequenced step, and this fixture is what that run will
+be measured against.

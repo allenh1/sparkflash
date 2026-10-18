@@ -1,10 +1,11 @@
 # Phase 2 sequence harness (milestone 2)
 
-Status: **2A merged on main as 13d880d** (squash of !56, off main b8fcc52); 2B/2C are the next
-milestones. This note records the accepted design, the 2A contract, and the exact boundaries so no
-later claim is read more broadly than it was measured. One follow-up commit on
-`phase2/fixture-checkpoint-limit` names and shares the real-checkpoint element limit (see section
-3): the first node attempt against 13d880d was refused by the small-shape guard, not by the model.
+Status: **2A contract/format landed on main** as 13d880d (squash of !56) with the real-checkpoint
+element-limit follow-up 51cd0c5 (squash of !58); the node golden fixture now exists
+([phase2-golden-fixture.md](phase2-golden-fixture.md)); 2B is a CPU-pinned skeleton in draft MR !63
+and its device comparison has not run; 2C has not started. This note records the accepted design,
+the 2A contract, and the exact boundaries so no later claim is read more broadly than it was
+measured; section 7 records the current Phase 2 status. **Phase 2 exit criterion 1 remains OPEN.**
 
 Sources: `docs/build/roadmap-to-serving.md` section 5 (5.3 prefill/decode, 5.4 audit, 5.5 exit
 criteria), `docs/DECISIONS.md` D7 (CED prefill bypass), `docs/engine/01-forward-order.md`
@@ -163,3 +164,29 @@ two fixture weight kinds are pinned in the serialised schema.
   Reindex layer, source main KV through a Reuse layer, SWA-only window slot) each fail naming
   (kind, layer, position); per-token bytes measured from the live store per layer mode; the
   un-masked-score control breaks 5.5.4.
+
+## 7. Status after the golden fixture (2026-10-18)
+
+* **2A contract/format landed**: !56 (main 13d880d) produced the schema and the comparator; the
+  real-checkpoint element-limit follow-up is !58 (main 51cd0c5). Sections 2-5 describe the contract
+  as merged.
+* **The golden fixture exists**: a real-checkpoint 130-token prefill + 8 greedy decodes, 2,536,194 B,
+  sha256 `e6df8290...`; its provenance and measurement caveats are in
+  [phase2-golden-fixture.md](phase2-golden-fixture.md). It is reference truth, not device evidence.
+* **2B skeleton is CPU-pinned and in draft MR !63**: the `m8_sequence` harness compares token-first
+  then logits at 2e-2, and refuses the device path in that draft. It was opened at bad3c84 against
+  a26be2e; a rebase onto d3dcc3f is still owed.
+* **2B device comparison has NOT run.** No token, logits, rotation-copy or device timing number for
+  this milestone exists.
+* **CSA-union format 2 landed** as !62 -> main d3dcc3f (pipeline 2763 green): the previous
+  window-only device attention structurally excluded the compressed candidates the engine reference
+  attends at position 129, so `window_kv_format=2` attends the window rows then the selected
+  compressed ids, causal, with the sink first in the denominator. The 19-param ABI and formats 0/1
+  are unchanged and the CPU twin (`mla_ref::attention_with_sink_union`) is bit-for-bit against the
+  engine reference, but **format 2 has not executed on a device**; its semantics are D24.
+* **No exit criterion is claimed.** Phase 2 criterion 1 (`roadmap-to-serving.md` section 5.5.1:
+  prefill over 128 tokens and 8 decode steps, every decoded token reproduced token-for-token
+  against the reference) remains OPEN. The precise remaining gap is the Lead-sequenced 2B device
+  run: wire the format-2 dispatch and the measured `window_rows` rotation into `m8_sequence`, run
+  prefill 130 + 8 decodes on the node against the golden fixture, and compare tokens first then
+  logits at 2e-2. Criteria 2-5 are likewise unclaimed.
