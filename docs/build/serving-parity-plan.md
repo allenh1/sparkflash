@@ -130,3 +130,34 @@ for the server rather than being polled.
 - **Engram NVMe (task-24)** read amplification under batching is unmeasured; the user's directive
   is that the drive is fast enough, but the number still has to be recorded.
 - **Model load time** makes each vLLM window expensive; batch oracle work per window.
+
+## Addendum 2026-10-19T17:30Z - user directives: TP=4 first, and vLLM is itself Engram-disk-served
+
+User, verbatim: *You cannot run this model on a single node. I think I would rather you just go for
+TP=4 first, then experiment with EP on top of that once you have TP=4 working.* and *we do patch
+vLLM to use the disk served engram as well*.
+
+Consequences for this plan:
+
+- **task-23 (S5, TP=4) is the first parallelism work, not a later stage.** Single-node runs remain a
+  numeric/correctness reference only (the device chain computes the same arithmetic while streaming
+  weights), while serving and every performance measurement happen at TP=4 across the four nodes,
+  because the released checkpoint is 475 GiB and a node has 121 GB.
+- **task-31 (S5a, EP=4) is created and blocked by task-23**: expert parallelism is an experiment on
+  top of a working TP=4, not a replacement for the parity baseline.
+- **Engram-on-disk is not a deviation from the oracle**: the deployed vLLM is patched to serve the
+  Engram tables from disk too, so the disk-offloaded table is part of the like-for-like comparison
+  (D39 rule 4 stands, and task-9 now includes mirroring the patch's disk read path after inspecting
+  it in the container).
+- **The per-position weight staging is not a serving configuration**: b68 measured 89.45 ms/position
+  of attention staging and 5.066 GB/position H2D for the five projection weights. TP=4 requires
+  resident sharded weights per rank - measured from the checkpoint headers as **72.31 GiB**, not the
+  ~113-119 GiB that the checkpoint-total-divided-by-four figure implies (that number includes the
+  188.83 GiB of Engram tables resident, which is the configuration that wedges a 121.69 GiB node) -
+  plus KV per rank (~15 GiB at 3.68M tokens in the reference), RDMA all-reduce, and a four-process
+  driver; with Engram on disk the all-in budget is ~90.4 GiB per rank (tp4-design.md section 3). `crates/sparkflash-comm` already carries a dlopen-libibverbs
+  RDMA module, an exchange module and a probe binary - tp-dev surveys it before proposing new
+  transport work.
+- **tp-dev owns the design** (docs/build/tp4-design.md, reviewed by the Lead before implementation)
+  and the staged implementation tasks; wo_a (task-6), MoE combine (task-4) and the other native
+  fixes stay single-rank work and are revisited for resident weights when TP=4 lands.

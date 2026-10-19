@@ -108,6 +108,13 @@ pub trait MoeDeviceBackend {
         let _ = (config, hidden, source, limit, logits);
         Ok(None)
     }
+
+    /// The certified mask the most recent [Self::lm_head] call left for the assembled logits:
+    /// one byte per vocabulary entry, non-zero when the screen left that entry exact. `None` means
+    /// the backend has no certified mask to offer, so a masked logits check cannot run.
+    fn head_certified_mask(&self) -> Option<&[u8]> {
+        None
+    }
 }
 
 /// The reduction epsilon of model.py:825: the literal `1e-20`, **not** `norm_eps` and not `hc_eps`.

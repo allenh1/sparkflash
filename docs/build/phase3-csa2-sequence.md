@@ -8,9 +8,11 @@ m20 per-position twin harness are on branch `task/c4c-csa2-seq` (kernel-only, si
 sequence entry's out[] is **byte-identical** to the base entry's on the same operands, so no
 fallback to the old entry is needed. Window b48 is a **contaminated, superseded run** (an
 overlapping window started two GPU clients and raced the vLLM stop/restart loop); it is retained as
-history in section 8.1 and is **not** the record and not a rescue for anything. The entry is **not wired into the engine** - the c4a-2 call
-site is engine-dev's change, and the host loop stays the fallback at positions > 0 until that
-wiring is measured.
+history in section 8.1 and is **not** the record and not a rescue for anything. The entry is
+**wired into the engine** at `start_pos > 0` by the hybrid-sequence branch (merged by
+`task/hybrid-merge`; the base entry remains the position-0 path and `REQUIRED_KERNELS` grows to
+eleven including this entry and the head reduce); the host loop stays the fallback for any step the
+backend declines, and the wiring itself is not yet measured in a Lead window.
 
 The base attention kernel `kernels/flash_mla_csa2_sm121.cu` and its pin/artifacts are **untouched**
 by this work, so the published b31/b33/b39/b40 evidence continues to refer to the same
@@ -41,6 +43,73 @@ until the call site is extended.
 The second line (position 0: reference 201, hybrid 320, positions 1 and 2 exact) is a first-step
 state difference above/below the attention body (the position-0 device body at b45 was the OLD base
 entry), owned by engine-dev, not by this kernel. Nothing in this page claims to explain it.
+
+### 1.1 The position-0 divergence on a non-zero prompt row (window b49, engine-dev)
+
+The b41 token-0 evidence never exercised the device attention projections or the format-2 body on
+a non-zero input row: token 0's embedding is the zero row, so the D8/FP8 activation quantiser and
+the body's bf16 seams were multiplied by zero. b49 used the actual first prompt token, 52479, and
+split the same one-token chain four ways (all runs: binary
+`bin/sparkflash_m3c_tokenprobe_aarch64` sha256
+`3335540c18757c8f4bfba4fb49fdf810b84d1a45a3ab8835d33ed3b7b05a268f`, checkpoint
+`1bae0e10...`, `--token 52479`, pre-cutover; the window log is
+`window-b49-20261019T093344Z.log` sha256
+`9e49a73b67b3d488e3e5d4c641e498f654d3b296b6f36b3a0c1b6ee3e906f41d`):
+
+| attention projections | attention body | hybrid token | log (sha256) |
+| --- | --- | --- | --- |
+| device | device | 320 | `runs49/token52479-devicebody.log` `3fcdd32f...` |
+| device | host | 24311 | `runs49/token52479-hostbody.log` `ea24431f...` |
+| host | device | 303 | `runs49/hostprojdevbody52479.log` `229f9253...` |
+| host | host | **201** | `runs49/hostall52479.log` `a9f7b719...` |
+
+Every run's in-process reference is `token_id=201` with top5 `201: 19.850099564, 7835:
+17.377937317, 1137: 16.937931061, 603: 16.491512299, 28: 16.139692307`. The measure-zero row
+below the attention body is the layer-0 mHC entry, and it passes on this row: `pre_attention_hidden
+exact=true`, `hc_attn_pre max_abs=4.321337e-6`, `inv_rms max_abs=1.430511e-5` in
+`runs49/lzprobe52479.log` sha256 `f5c11787...`. The layer-0 MoE diagnostics in the same runs are
+also exact (router ids equal; routed gate/up bits 0 mismatched; weighted codes/scales 0; shared
+bf16 0). So the delta is introduced by the **device attention projections (MXFP8 with the D8/FP8
+activation quantiser) and the format-2 body**, which are approximation seams for a non-zero row;
+the entry, embedding, sequence state and MoE are excluded. The four-way split above is the
+record, not a defect to hide.
+
+### 1.2 Window b51: sequence FAILED before comparison (hardcoded c3 guard)
+
+Window b51 ran the 130 + 8 sequence on binary `sparkflash_m3c_c4c_seqwired_4d80f9c_aarch64`
+(sha256 `fcb6ede1e959b678424088196b1db6ac27bc0b95634c78947ff70747fa38d511`), log
+`window-b51-20261019T100657Z.log` (sha256
+`85cf0ee16554e0473a36b92bcb863c79db56310cdbe74c85d744293562c862a0`; run log
+`runs51/seq130x8.log`, sha256
+`f241ae44bd121ef3b5e448710495da1b2c451f18e3ebde29abefa76cae6d14b3`). The RUN started
+`2026-10-19T10:08:11Z` and exited 1 at `2026-10-19T10:18:27Z`. It is a **FAILURE, not a
+measurement**: the reference prefill completed (`wall_ms=614394`) and the chain aborted after
+one of forty layers, before any position comparison. The terminal line is preserved verbatim:
+
+```text
+c4a-2 chain abort: hybrid sequence: c3 runtime guard: projected total 681.2 s exceeds the 600 s self-limit after 1 of 40 layers; aborting cleanly before layer 1
+```
+
+The partial one-layer line was `attention partial totals: projection_launches=5 body_launches=1
+staging_ms=176 projection_us=13360 body_us=318 staged_matrix_bytes=126739200 host_bytes=281720`.
+The guard was a hardcoded 600 s self-limit and ignored `--time-budget-s 5400`; its projection
+also mixed the 614 s reference prefill with a one-layer chain rate and therefore could not report
+elapsed, staging and device work separately. The fix is the staging-reuse change and the
+per-position timing line that prints wall, staging, device, projected total and the budget; it does
+**not** change the p0 four-way divergence record above or criterion 1. b51 is retained as a failure
+record and is superseded by the next sequence timing window (b52).
+
+Policy for criterion 1 (Lead decision): the compared token set is positions 129 and 130..=137 of
+the 130+8 run; prompt index 0 maps to position 129 and is **not** compared. Position 0 remains a
+measured divergence. A host-attention position-0 fallback is a sanity-only option and must not be
+used in the claim path; it is not part of the sequence wiring.
+
+The a29aecd embedding-row fix is wired into `hybrid_sequence`: the sequence path stages each
+prompt token through `embed_row(token)`. No window has yet run that path on a non-zero prompt id,
+so the fix is **unexercised** until the 3-position timing run consumes positions 1 and 2 (its log is
+the citation). The one-token `hybrid_token` stage still deliberately guards `--token = 0` (its
+reference slot is token 0, not a free token choice), so a29aecd is inert there; that guard is not a
+claim that row 0 is the only embedding row.
 
 What the sequence path DOES need beyond the base entry is the **position-causal indexer**:
 stage 1 of the base kernel scores every HSI block over all eight of its tokens with no mask, so a
@@ -413,8 +482,9 @@ main with !108 (batch 24) as the thirteenth baseline entry / twelfth `KernelId` 
 **unwired**, so `REQUIRED_KERNELS` stays 9 and no chain claim rests on it. The b50 window record in
 section 8 is the measured evidence (PASS 50/50; report `d95b6292...`).
 
-The chain path that consumes it is **not merged and not claimed**. Windows b55-b62 measured it on the
-hybrid-sequence branch (every binary there also contains the unreviewed head-reduce cut-over
+The chain path that consumes it is **merged with this MR** (`task/hybrid-merge`; the call site
+wires the entry at `start_pos > 0` and `REQUIRED_KERNELS` includes it) but **not claimed**. Windows
+b55-b62 measured it on the hybrid-sequence branch (every binary there also contains the unreviewed head-reduce cut-over
 `c9fa90f`, so all of it is "sequence diagnostics on an unreviewed build"):
 
 - the per-position call site works as designed: `sequence attention position support:

@@ -22,6 +22,7 @@ pub struct AppState {
     pub started: Instant,
     id_seq: Arc<AtomicU64>,
     fixed_time_unix: Option<u64>,
+    max_logprobs: usize,
 }
 
 impl AppState {
@@ -34,6 +35,7 @@ impl AppState {
             started: Instant::now(),
             id_seq: Arc::new(AtomicU64::new(0)),
             fixed_time_unix: None,
+            max_logprobs: crate::server::DEFAULT_MAX_LOGPROBS,
         }
     }
 
@@ -42,6 +44,22 @@ impl AppState {
     pub fn with_fixed_time(mut self, unix_seconds: u64) -> Self {
         self.fixed_time_unix = Some(unix_seconds);
         self
+    }
+
+    /// Sets the cap on requested logprobs, vLLM's `--max-logprobs`.
+    ///
+    /// [`usize::MAX`] means "no cap", which is what `sparkflash serve --max-logprobs -1` passes:
+    /// vLLM spells unlimited that way too.
+    #[must_use]
+    pub fn with_max_logprobs(mut self, max_logprobs: usize) -> Self {
+        self.max_logprobs = max_logprobs;
+        self
+    }
+
+    /// The cap on requested logprobs.
+    #[must_use]
+    pub fn max_logprobs(&self) -> usize {
+        self.max_logprobs
     }
 
     /// The engine's model id.

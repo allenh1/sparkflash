@@ -61,6 +61,7 @@
 //! in. Nothing here has been run against a real sharded checkpoint, so nothing here claims that it
 //! has.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -77,9 +78,9 @@ use sparkflash_api::encoding::{
 };
 use sparkflash_api::engine::InferenceEngine as ApiInferenceEngine;
 use sparkflash_api::engine::{
-    Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason, MODEL_ID,
-    MODEL_MAX_OUTPUT_TOKENS, MissingCapability, default_engram_layers, empty_kv_snapshot,
-    max_seq_len,
+    Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason, LogprobSelection,
+    LogprobsRequest, MODEL_ID, MODEL_MAX_OUTPUT_TOKENS, MissingCapability, PromptLogprobs,
+    TokenLogprob, TokenString, default_engram_layers, empty_kv_snapshot, max_seq_len,
 };
 use sparkflash_api::telemetry_types::{
     CompletionTokensDetails, DSparkStepStats, DeepSeekSparkRequestStats, OpenAiUsageWithCache,
@@ -89,7 +90,7 @@ use sparkflash_api::telemetry_types::{
 use sparkflash_device::CudaSession;
 use sparkflash_device::{DeviceEngine, DeviceSession, FakeSession};
 use sparkflash_engine::config::ModelConfig;
-use sparkflash_engine::forward::{InferenceEngine, Sampling, SequenceState};
+use sparkflash_engine::forward::{InferenceEngine, Sampling, SequenceState, StepOutput};
 use sparkflash_engine::linalg::{CHECKPOINT_TENSOR_LIMIT, REFERENCE_TENSOR_LIMIT};
 use sparkflash_engine::loader::ReferenceWeights;
 use sparkflash_engine::synthetic::SyntheticWeights;
@@ -258,6 +259,10 @@ pub struct ServeOptions {
     pub tokenizer: Option<PathBuf>,
     /// The ceiling on tokens generated for one request. A request asking for more is clamped to it.
     pub max_tokens: usize,
+    /// The cap on requested logprobs, vLLM's `--max-logprobs`: 20 by default, `-1` for no cap.
+    ///
+    /// `usize::MAX` is how "no cap" is carried: the router compares each request against it.
+    pub max_logprobs: usize,
     /// The element cap the reference pass applies to one tensor. Above it, a tensor is refused
     /// rather than materialised.
     ///
@@ -292,6 +297,18 @@ impl ServeOptions {
         let element_limit = cli
             .element_limit
             .unwrap_or_else(|| default_element_limit(checkpoint.as_deref()));
+        // vLLM's `--max-logprobs` semantics: a positive cap, or -1 for no cap. 0 is not a cap and
+        // is refused rather than treated as "no logprobs", which would silently answer every
+        // request with an empty `top_logprobs`.
+        let max_logprobs = match cli.max_logprobs {
+            value if value < -1 || value == 0 => {
+                return Err(
+                    "--max-logprobs must be a positive value or -1 (-1 means no cap)".to_owned(),
+                );
+            }
+            -1 => usize::MAX,
+            value => usize::try_from(value).unwrap_or(usize::MAX),
+        };
         match (cli.synthetic, checkpoint) {
             (true, Some(_)) => Err(
                 "--synthetic and --checkpoint cannot both be given: --synthetic serves the tiny synthetic plan and --checkpoint serves a real sharded checkpoint, so choose one"
@@ -304,6 +321,7 @@ impl ServeOptions {
                 checkpoint,
                 tokenizer,
                 max_tokens: cli.max_tokens,
+                max_logprobs,
                 element_limit,
                 engine: cli.engine,
                 device_cubin: cli.device_cubin,
@@ -388,6 +406,18 @@ struct ServeArgs {
     /// The ceiling on tokens generated for one request.
     #[arg(long, value_name = "N", default_value_t = MODEL_MAX_OUTPUT_TOKENS)]
     max_tokens: usize,
+    /// The cap on requested logprobs, vLLM's `--max-logprobs`.
+    ///
+    /// A request asking for more, or for the whole vocabulary with `logprobs=-1`, is refused with
+    /// vLLM's error text. The default is 20, vLLM's own default; the cluster's oracle window runs
+    /// with 1000 because it compares full distributions.
+    #[arg(
+        long,
+        value_name = "N",
+        allow_hyphen_values = true,
+        default_value_t = 20
+    )]
+    max_logprobs: i64,
     /// The element cap the reference pass applies to one tensor; the default follows the source.
     ///
     /// `--synthetic` keeps the reference guard, [REFERENCE_TENSOR_LIMIT], which the tiny plan fits
@@ -516,6 +546,9 @@ pub struct ReferenceDriver {
     model: String,
     jobs: tokio::sync::mpsc::Sender<Job>,
     max_tokens: usize,
+    /// The configuration's vocabulary size, reported to the router so `logprobs=-1` and
+    /// `logprob_token_ids` are validated against the model rather than guessed.
+    vocab_size: usize,
     cluster: ClusterStatsSnapshot,
 }
 
@@ -543,6 +576,7 @@ impl ReferenceDriver {
                 model: MODEL_ID.to_owned(),
                 jobs,
                 max_tokens,
+                vocab_size: recipe.config.vocab_size,
                 cluster: cluster_snapshot(),
             }),
             Ok(Err(message)) => Err(message),
@@ -579,6 +613,7 @@ impl ApiInferenceEngine for ReferenceDriver {
             max_tokens,
             temperature: request.temperature,
             seed: request.seed.unwrap_or(0),
+            logprobs: request.logprobs,
             replies,
         };
         if self.jobs.try_send(job).is_err() {
@@ -606,6 +641,12 @@ impl ApiInferenceEngine for ReferenceDriver {
                 }
                 match state.answers.recv().await {
                     Some(Reply::Delta(text)) => Some((EngineEvent::ContentDelta(text), state)),
+                    Some(Reply::PromptLogprobs(prompt)) => {
+                        Some((EngineEvent::PromptLogprobs(prompt), state))
+                    }
+                    Some(Reply::TokenLogprobs(logprob)) => {
+                        Some((EngineEvent::TokenLogprobs(logprob), state))
+                    }
                     Some(Reply::Done(summary)) => {
                         state.done = true;
                         Some((finished_event(prompt_tokens, *summary), state))
@@ -647,6 +688,11 @@ impl ApiInferenceEngine for ReferenceDriver {
     /// engine that does not override it.
     fn capabilities(&self) -> Capabilities {
         Capabilities::default()
+    }
+
+    /// The configuration's vocabulary size: every logprob row this driver scores is that long.
+    fn vocab_size(&self) -> Option<usize> {
+        Some(self.vocab_size)
     }
 }
 
@@ -769,6 +815,8 @@ struct Job {
     temperature: f32,
     /// The sampler seed, defaulting to zero when the request named none.
     seed: u64,
+    /// The logprobs the request asked for; the default asks for none and costs nothing.
+    logprobs: LogprobsRequest,
     /// Where the events go.
     replies: tokio::sync::mpsc::Sender<Reply>,
 }
@@ -777,6 +825,10 @@ struct Job {
 enum Reply {
     /// A non-empty detokenised piece. The thread never sends an empty string.
     Delta(String),
+    /// Prompt logprobs, sent once after `Started` and before any token.
+    PromptLogprobs(Box<PromptLogprobs>),
+    /// Logprobs for one generated token, sent after that token's delta.
+    TokenLogprobs(Box<TokenLogprob>),
     /// The request ended; the counts and the timings in here were measured.
     Done(Box<RunSummary>),
     /// The request failed. The string is written for an operator to read.
@@ -940,6 +992,333 @@ fn build_engine(recipe: &Recipe, element_limit: usize) -> Result<InferenceEngine
         .map_err(|error| format!("cannot build the reference engine: {error}"))
 }
 
+// ---------------------------------------------------------------------------------------
+// Logprob arithmetic
+// ---------------------------------------------------------------------------------------
+//
+// vLLM's default `logprobs_mode` is "raw_logprobs": a reported logprob is the log-softmax of the
+// *raw* logits, before temperature and before any penalty. That is what this section computes from
+// the `StepOutput.logits` the reference pass already returns (the raw logits of the position it
+// just fed). The logits are f32; the softmax accumulates in f64 so a 129,280-entry row does not
+// lose the sum to f32 rounding, and every entry is `logit - max - ln(sum)`, which makes the row a
+// distribution even when the logits are large.
+//
+// Everything here is gated on the request: a request that asked for no logprobs runs the loop
+// below with `want_sample` and `want_prompt` false, so no row is normalised and no string is
+// decoded. A request for the whole vocabulary is O(vocabulary) per position by definition; a
+// prompt-logprobs request costs one forward pass per prompt token (see
+// [`prompt_logprobs_pass`]).
+
+/// The log-softmax of one raw-logit row, in output-token-id order.
+fn log_softmax(logits: &[f32]) -> Vec<f32> {
+    let max = logits
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    // An all-masked row has no distribution; reporting the floor for every token is the only
+    // honest answer, and the API layer clamps `-inf` to -9999 on the wire.
+    if !max.is_finite() {
+        return vec![f32::NEG_INFINITY; logits.len()];
+    }
+    let sum: f64 = logits
+        .iter()
+        .map(|&value| ((value - max) as f64).exp())
+        .sum();
+    if !(sum.is_finite() && sum > 0.0) {
+        return vec![f32::NEG_INFINITY; logits.len()];
+    }
+    let log_sum = sum.ln();
+    logits
+        .iter()
+        .map(|&value| ((value - max) as f64 - log_sum) as f32)
+        .collect()
+}
+
+/// The 1-based competition rank of `token_logprob` in the row: one plus the number of tokens with a
+/// strictly greater logprob, so tied tokens share a rank. That is vLLM's rank.
+fn competition_rank(logprobs: &[f32], token_logprob: f32) -> u32 {
+    let greater = logprobs
+        .iter()
+        .filter(|&&value| value > token_logprob)
+        .count();
+    u32::try_from(greater).unwrap_or(u32::MAX).saturating_add(1)
+}
+
+/// Descending logprob, ties broken by ascending token id.
+///
+/// The tie-break is what makes a tie deterministic: two tokens with the same logprob are reported
+/// in token-id order, so the same request produces the same `top_logprobs` every time.
+fn compare_logprobs(logprobs: &[f32], left: usize, right: usize) -> std::cmp::Ordering {
+    logprobs[right]
+        .partial_cmp(&logprobs[left])
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| left.cmp(&right))
+}
+
+/// The indices of the `k` largest logprobs, in descending order.
+fn top_k_indices(logprobs: &[f32], k: usize) -> Vec<usize> {
+    let k = k.min(logprobs.len());
+    if k == 0 {
+        return Vec::new();
+    }
+    let mut order: Vec<usize> = (0..logprobs.len()).collect();
+    if k < order.len() {
+        order.select_nth_unstable_by(k, |left, right| compare_logprobs(logprobs, *left, *right));
+        order.truncate(k);
+    }
+    order.sort_unstable_by(|left, right| compare_logprobs(logprobs, *left, *right));
+    order
+}
+
+/// Collapses duplicate token ids the way vLLM's logprob dict does: the first insertion position is
+/// kept and the later value overwrites it. Only the rank can differ for one id, so this is what
+/// gives the sampled token the top-k positional rank when it also appears in the top-k.
+fn collapse_entries(
+    entries: Vec<sparkflash_api::LogprobAlternative>,
+) -> Vec<sparkflash_api::LogprobAlternative> {
+    let mut collapsed: Vec<sparkflash_api::LogprobAlternative> = Vec::with_capacity(entries.len());
+    let mut positions: HashMap<u32, usize> = HashMap::with_capacity(entries.len());
+    for entry in entries {
+        match positions.get(&entry.token_id) {
+            Some(&index) => collapsed[index] = entry,
+            None => {
+                positions.insert(entry.token_id, collapsed.len());
+                collapsed.push(entry);
+            }
+        }
+    }
+    collapsed
+}
+
+/// Decodes token ids the way vLLM decodes a logprob token: one id at a time, with the preceding
+/// sequence ids as context, because a byte-fallback token that completes a multi-byte UTF-8
+/// character decodes to a replacement glyph on its own.
+///
+/// Single-token decodes that are already complete text are cached: they do not depend on the
+/// context, and a top-k's alternatives recur at every position.
+struct LogprobDecoder<'a> {
+    /// Decodes a token-id slice to text. A closure rather than the tokenizer itself so the
+    /// arithmetic and the correction are host-testable without a tokenizer file.
+    decode_ids: &'a dyn Fn(&[u32]) -> Result<String, String>,
+    /// The last (up to four) sequence ids before the position being decoded; vLLM's context depth.
+    context: Vec<u32>,
+    /// Complete single-token decodes, by token id.
+    clean: HashMap<u32, String>,
+}
+
+impl<'a> LogprobDecoder<'a> {
+    fn new(decode_ids: &'a dyn Fn(&[u32]) -> Result<String, String>) -> Self {
+        Self {
+            decode_ids,
+            context: Vec::new(),
+            clean: HashMap::new(),
+        }
+    }
+
+    /// Decodes one id against the current context, without advancing the context.
+    fn decode(&mut self, token_id: u32) -> Result<String, String> {
+        if let Some(text) = self.clean.get(&token_id) {
+            return Ok(text.clone());
+        }
+        let raw = (self.decode_ids)(&[token_id])?;
+        if raw.ends_with('\u{FFFD}') {
+            return self.corrected(token_id);
+        }
+        self.clean.insert(token_id, raw.clone());
+        Ok(raw)
+    }
+
+    /// Makes `token_id` the newest context id: the next position's tokens are decoded after it.
+    fn push(&mut self, token_id: u32) {
+        self.context.push(token_id);
+        if self.context.len() > 4 {
+            self.context.remove(0);
+        }
+    }
+
+    /// vLLM's byte-fallback correction: retry the decode with up to four preceding ids until the
+    /// text no longer ends in a replacement glyph, then report the part of that decode the clean
+    /// prefix did not already carry.
+    fn corrected(&self, token_id: u32) -> Result<String, String> {
+        let available = self.context.len().min(4);
+        for count in 1..=available {
+            let start = self.context.len() - count;
+            let mut ids: Vec<u32> = self.context[start..].to_vec();
+            ids.push(token_id);
+            let Ok(full) = (self.decode_ids)(&ids) else {
+                continue;
+            };
+            if full.ends_with('\u{FFFD}') {
+                continue;
+            }
+            // Byte-fallback context tokens decode to a replacement glyph; the clean prefix is the
+            // start of the trailing run that is not one of those.
+            let mut clean_end = count;
+            for index in (0..count).rev() {
+                match (self.decode_ids)(&[self.context[start + index]]) {
+                    Ok(text) if text.ends_with('\u{FFFD}') => clean_end = index,
+                    _ => break,
+                }
+            }
+            let clean_prefix = if clean_end == 0 {
+                String::new()
+            } else {
+                (self.decode_ids)(&self.context[start..start + clean_end]).unwrap_or_default()
+            };
+            return Ok(match full.strip_prefix(clean_prefix.as_str()) {
+                Some(rest) => rest.to_owned(),
+                None => {
+                    let common = common_prefix_bytes(&clean_prefix, &full);
+                    full[common..].to_owned()
+                }
+            });
+        }
+        Ok(String::new())
+    }
+}
+
+/// The length in bytes of the longest common prefix of two strings.
+fn common_prefix_bytes(left: &str, right: &str) -> usize {
+    left.chars()
+        .zip(right.chars())
+        .take_while(|(left, right)| left == right)
+        .map(|(character, _)| character.len_utf8())
+        .sum()
+}
+
+/// Builds one position's [`TokenLogprob`] from its log-softmax row.
+fn token_logprob(
+    logprobs: &[f32],
+    token_id: u32,
+    token: String,
+    selection: Option<LogprobSelection>,
+    token_ids: &[u32],
+    decoder: &mut LogprobDecoder<'_>,
+) -> Result<TokenLogprob, String> {
+    let token_logprob = logprobs
+        .get(token_id as usize)
+        .copied()
+        .unwrap_or(f32::NEG_INFINITY);
+    let unranked = token_ids.is_empty() && matches!(selection, Some(LogprobSelection::All));
+    let rank = if unranked {
+        None
+    } else {
+        Some(competition_rank(logprobs, token_logprob))
+    };
+    let mut entries = vec![sparkflash_api::LogprobAlternative {
+        token_id,
+        token: token.clone(),
+        logprob: token_logprob,
+        rank,
+    }];
+    if !token_ids.is_empty() {
+        // vLLM's `logprob_token_ids`: the sampled token first, then the requested ids in request
+        // order, each with its positional rank.
+        for (index, &requested) in token_ids.iter().enumerate() {
+            let Some(&value) = logprobs.get(requested as usize) else {
+                continue;
+            };
+            entries.push(sparkflash_api::LogprobAlternative {
+                token_id: requested,
+                token: decoder.decode(requested)?,
+                logprob: value,
+                rank: Some(u32::try_from(index + 1).unwrap_or(u32::MAX)),
+            });
+        }
+    } else {
+        match selection {
+            // No alternatives: the position's own token is all that was asked for.
+            None => {}
+            Some(LogprobSelection::All) => {
+                // The whole vocabulary, id-ordered and unranked: -1's "unsorted and unranked".
+                entries.clear();
+                for (index, &value) in logprobs.iter().enumerate() {
+                    entries.push(sparkflash_api::LogprobAlternative {
+                        token_id: u32::try_from(index).unwrap_or(u32::MAX),
+                        token: decoder.decode(u32::try_from(index).unwrap_or(u32::MAX))?,
+                        logprob: value,
+                        rank: None,
+                    });
+                }
+            }
+            Some(LogprobSelection::Top(count)) => {
+                for (position, index) in top_k_indices(logprobs, count as usize)
+                    .into_iter()
+                    .enumerate()
+                {
+                    entries.push(sparkflash_api::LogprobAlternative {
+                        token_id: u32::try_from(index).unwrap_or(u32::MAX),
+                        token: decoder.decode(u32::try_from(index).unwrap_or(u32::MAX))?,
+                        logprob: logprobs[index],
+                        rank: Some(u32::try_from(position + 1).unwrap_or(u32::MAX)),
+                    });
+                }
+                entries = collapse_entries(entries);
+            }
+        }
+    }
+    Ok(TokenLogprob {
+        token_id,
+        token,
+        logprob: token_logprob,
+        rank,
+        top: entries,
+    })
+}
+
+/// Feeds the prompt one token at a time to score every position, returning the step output a batch
+/// prefill would have returned.
+///
+/// This is the gated cost of prompt logprobs: the reference engine reports logits only for the
+/// position it just fed, so scoring prompt position `i` needs the forward pass after
+/// `tokens[..i]`. The prompt is therefore fed token by token - one forward pass per prompt token -
+/// only when the request asked for prompt logprobs (or for `echo` with logprobs, which asks for
+/// them implicitly). A device chain that keeps the KV cache and reports every position's logits in
+/// one pass makes this one pass; until then this is the honest O(n) implementation, and the branch
+/// document records the measured cost.
+fn prompt_logprobs_pass(
+    engine: &InferenceEngine,
+    prompt: &[u32],
+    state: &mut SequenceState,
+    logprobs: &LogprobsRequest,
+    decoder: &mut LogprobDecoder<'_>,
+) -> Result<(StepOutput, PromptLogprobs), String> {
+    let mut feed = engine
+        .prefill(state, &prompt[..1])
+        .map_err(|error| format!("prefill failed: {error}"))?;
+    let mut tokens = Vec::with_capacity(prompt.len());
+    let mut positions: Vec<Option<TokenLogprob>> = Vec::with_capacity(prompt.len());
+    tokens.push(TokenString {
+        token_id: prompt[0],
+        token: decoder.decode(prompt[0])?,
+    });
+    decoder.push(prompt[0]);
+    // Position 0 has no conditioning token, so it reports `None` exactly as vLLM does.
+    positions.push(None);
+    for (index, &token_id) in prompt.iter().enumerate().skip(1) {
+        let row = log_softmax(&feed.logits);
+        let token = decoder.decode(token_id)?;
+        tokens.push(TokenString {
+            token_id,
+            token: token.clone(),
+        });
+        positions.push(Some(token_logprob(
+            &row,
+            token_id,
+            token,
+            logprobs.prompt,
+            &[],
+            decoder,
+        )?));
+        decoder.push(token_id);
+        feed = engine
+            .decode(state, token_id)
+            .map_err(|error| format!("decode failed at prompt position {index}: {error}"))?;
+    }
+    Ok((feed, PromptLogprobs { tokens, positions }))
+}
+
 /// Runs one request and sends its events, ending with exactly one terminal reply.
 ///
 /// `Ok(())` means the terminal reply was sent. `Err(message)` means the request failed and the
@@ -953,14 +1332,47 @@ fn run_request(
     // A sequence per request: the engine owns no per-sequence state, which is exactly the seam this
     // driver relies on.
     let mut state = SequenceState::new(engine.config());
-    let prefill = engine
-        .prefill(&mut state, &job.prompt_tokens)
-        .map_err(|error| format!("prefill failed: {error}"))?;
+    let want_sample = job.logprobs.wants_sample();
+    let want_prompt = job.logprobs.wants_prompt() && !job.prompt_tokens.is_empty();
+    let decode_ids = |ids: &[u32]| -> Result<String, String> {
+        tokenizer.tokenizer().decode(ids, false).map_err(|error| {
+            format!(
+                "the tokenizer could not decode {} token id(s): {error}",
+                ids.len()
+            )
+        })
+    };
+    let mut logprob_decoder = LogprobDecoder::new(&decode_ids);
+    let (prefill, prompt_logprobs) = if want_prompt {
+        let (step, payload) = prompt_logprobs_pass(
+            engine,
+            &job.prompt_tokens,
+            &mut state,
+            &job.logprobs,
+            &mut logprob_decoder,
+        )?;
+        (step, Some(payload))
+    } else {
+        (
+            engine
+                .prefill(&mut state, &job.prompt_tokens)
+                .map_err(|error| format!("prefill failed: {error}"))?,
+            None,
+        )
+    };
     let prefill_elapsed = request_started.elapsed();
+    // Prompt logprobs are one payload for the prompt, delivered once at the end of prefill, which
+    // is where vLLM delivers them.
+    if let Some(payload) = prompt_logprobs {
+        job.replies
+            .blocking_send(Reply::PromptLogprobs(Box::new(payload)))
+            .map_err(|_| "the client stopped reading this response".to_owned())?;
+    }
     // The stream decoder keeps the state an incomplete UTF-8 sequence needs, so a token that only
     // completes half a character is held back instead of being emitted as a replacement character
     // that the next token would then contradict.
     let mut decoder = tokenizer.tokenizer().decode_stream(false);
+    let mut logits = prefill.logits;
     let mut next = prefill.next_token;
     let mut completion_tokens = 0usize;
     let mut ttft: Option<Duration> = None;
@@ -969,20 +1381,43 @@ fn run_request(
         if ttft.is_none() {
             ttft = Some(request_started.elapsed());
         }
-        if let Some(piece) = decoder
+        let piece = decoder
             .step(token)
             .map_err(|error| format!("the tokenizer could not decode token {token}: {error}"))?
-            .filter(|piece| !piece.is_empty())
-        {
+            .filter(|piece| !piece.is_empty());
+        if want_sample {
+            // The logprob belongs to the token the logits just produced, so it is built before that
+            // token is fed back in.
+            let row = log_softmax(&logits);
+            let token_string = logprob_decoder.decode(token)?;
+            let entry = token_logprob(
+                &row,
+                token,
+                token_string,
+                job.logprobs.sample,
+                &job.logprobs.token_ids,
+                &mut logprob_decoder,
+            )?;
+            if let Some(piece) = piece {
+                job.replies
+                    .blocking_send(Reply::Delta(piece))
+                    .map_err(|_| "the client stopped reading this response".to_owned())?;
+            }
+            job.replies
+                .blocking_send(Reply::TokenLogprobs(Box::new(entry)))
+                .map_err(|_| "the client stopped reading this response".to_owned())?;
+            logprob_decoder.push(token);
+        } else if let Some(piece) = piece {
             job.replies
                 .blocking_send(Reply::Delta(piece))
                 .map_err(|_| "the client stopped reading this response".to_owned())?;
         }
         completion_tokens += 1;
-        next = engine
-            .decode(&mut state, token)
-            .map_err(|error| format!("decode failed after {completion_tokens} token(s): {error}"))?
-            .next_token;
+        let step = engine.decode(&mut state, token).map_err(|error| {
+            format!("decode failed after {completion_tokens} token(s): {error}")
+        })?;
+        logits = step.logits;
+        next = step.next_token;
     }
     let elapsed = request_started.elapsed();
     let timing = RequestTiming::measure(
@@ -1108,7 +1543,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             }
         }
     };
-    let state = AppState::new(engine);
+    let state = AppState::new(engine).with_max_logprobs(options.max_logprobs);
     let router = sparkflash_api::server::router(state);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1229,6 +1664,7 @@ mod tests {
             request_id: "test-request".to_owned(),
             model: MODEL_ID.to_owned(),
             prompt_tokens: prompt.to_vec(),
+            logprobs: LogprobsRequest::default(),
             images: Vec::new(),
             max_tokens,
             temperature,
@@ -2040,5 +2476,368 @@ mod tests {
             timing.prefill_tok_per_s
         );
         assert_eq!(timing.decode_tok_per_s, 0.0, "no decode step ran");
+    }
+
+    // ---- logprob arithmetic (host only, no tokenizer file) -------------------------------
+
+    /// A decoder that spells one id per token: the arithmetic tests need no tokenizer file.
+    fn spelling_decoder(ids: &[u32]) -> Result<String, String> {
+        Ok(ids
+            .iter()
+            .map(|id| format!("t{id}"))
+            .collect::<Vec<_>>()
+            .join("|"))
+    }
+
+    #[test]
+    fn log_softmax_is_a_distribution_over_the_raw_logits() {
+        let row = log_softmax(&[0.0, 0.0, 0.0]);
+        let expected = -f64::from(3.0f32).ln() as f32;
+        for value in &row {
+            assert!((value - expected).abs() < 1e-6, "{value} != {expected}");
+        }
+        // A full-vocabulary row must still sum to one: the accumulation is f64, so the sum is not
+        // lost to the row's width.
+        let mut wide = vec![0.0f32; 129_280];
+        wide[7] = 40.0;
+        let total: f64 = log_softmax(&wide)
+            .iter()
+            .map(|value| f64::from(*value).exp())
+            .sum();
+        assert!(
+            (total - 1.0).abs() < 1e-6,
+            "a 129,280-entry row sums to {total}"
+        );
+        // An all-masked row has no distribution: every entry is the floor, never a NaN.
+        let masked = log_softmax(&[f32::NEG_INFINITY, f32::NEG_INFINITY]);
+        assert!(masked.iter().all(|value| *value == f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn ranks_are_vllms_competition_ranks() {
+        let row = [0.0f32, -0.1, -0.1, -2.0];
+        assert_eq!(competition_rank(&row, 0.0), 1);
+        assert_eq!(
+            competition_rank(&row, -0.1),
+            2,
+            "only the strictly greater token outranks it; the tie shares the rank"
+        );
+        assert_eq!(competition_rank(&row, -2.0), 4);
+    }
+
+    #[test]
+    fn top_k_ties_break_by_token_id_so_the_answer_is_deterministic() {
+        let row = [-1.0f32, -2.0, -2.0, -3.0];
+        assert_eq!(top_k_indices(&row, 2), vec![0, 1]);
+        for _ in 0..8 {
+            assert_eq!(
+                top_k_indices(&row, 2),
+                vec![0, 1],
+                "the tie-break is stable"
+            );
+        }
+        assert_eq!(top_k_indices(&row, 0), Vec::<usize>::new());
+        assert_eq!(
+            top_k_indices(&row, 99),
+            vec![0, 1, 2, 3],
+            "asking for more than the vocabulary reports the whole vocabulary in order"
+        );
+    }
+
+    #[test]
+    fn a_natural_top_k_reports_the_sampled_token_first_then_the_alternatives() {
+        let decode = spelling_decoder;
+        let mut decoder = LogprobDecoder::new(&decode);
+        let row = log_softmax(&[-1.0, -2.0, -3.0, -0.5]);
+        let entry = token_logprob(
+            &row,
+            3,
+            "t3".to_owned(),
+            Some(LogprobSelection::Top(2)),
+            &[],
+            &mut decoder,
+        )
+        .expect("the entry builds");
+        assert_eq!(entry.token_id, 3);
+        assert_eq!(entry.rank, Some(1), "the sampled token is the argmax here");
+        assert_eq!(entry.top[0].token_id, 3);
+        assert_eq!(
+            entry.top.len(),
+            2,
+            "the sampled token is also in the top-2, so it collapses to one entry and the map is \
+             sampled + one alternative"
+        );
+        assert_eq!(entry.top[0].rank, Some(1));
+        assert_eq!(entry.top[1].token_id, 0);
+        assert_eq!(entry.top[1].rank, Some(2));
+
+        let only_sampled = token_logprob(
+            &row,
+            1,
+            "t1".to_owned(),
+            Some(LogprobSelection::Top(0)),
+            &[],
+            &mut decoder,
+        )
+        .expect("the entry builds");
+        assert_eq!(
+            only_sampled.top.len(),
+            1,
+            "top_logprobs=0 is the token alone"
+        );
+        assert_eq!(only_sampled.top[0].token_id, 1);
+        assert_eq!(only_sampled.rank, Some(3), "one token outranks it");
+    }
+
+    #[test]
+    fn the_requested_token_ids_replace_the_natural_top_k() {
+        let decode = spelling_decoder;
+        let mut decoder = LogprobDecoder::new(&decode);
+        let row = log_softmax(&[-1.0, -2.0, -3.0, -0.5]);
+        let entry = token_logprob(
+            &row,
+            1,
+            "t1".to_owned(),
+            Some(LogprobSelection::Top(2)),
+            &[2, 3],
+            &mut decoder,
+        )
+        .expect("the entry builds");
+        let ids: Vec<u32> = entry
+            .top
+            .iter()
+            .map(|alternative| alternative.token_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "sampled first, then the requested ids in order"
+        );
+        assert_eq!(entry.top[1].rank, Some(1));
+        assert_eq!(entry.top[2].rank, Some(2));
+    }
+
+    #[test]
+    fn whole_vocabulary_logprobs_are_id_ordered_and_unranked() {
+        let decode = spelling_decoder;
+        let mut decoder = LogprobDecoder::new(&decode);
+        let row = log_softmax(&[-1.0, -2.0, -3.0]);
+        let entry = token_logprob(
+            &row,
+            2,
+            "t2".to_owned(),
+            Some(LogprobSelection::All),
+            &[],
+            &mut decoder,
+        )
+        .expect("the entry builds");
+        assert_eq!(entry.top.len(), 3);
+        assert_eq!(entry.rank, None, "vLLM's -1 is unranked");
+        assert!(
+            entry
+                .top
+                .iter()
+                .all(|alternative| alternative.rank.is_none())
+        );
+        let ids: Vec<u32> = entry
+            .top
+            .iter()
+            .map(|alternative| alternative.token_id)
+            .collect();
+        assert_eq!(ids, vec![0, 1, 2], "id order, not logprob order");
+    }
+
+    #[test]
+    fn a_byte_fallback_token_gets_the_character_it_completes() {
+        let decode = |ids: &[u32]| -> Result<String, String> {
+            match ids {
+                [7] => Ok("\u{FFFD}".to_owned()),
+                [6] => Ok("\u{FFFD}".to_owned()),
+                [6, 7] => Ok("\u{e9}".to_owned()),
+                [8] => Ok("a".to_owned()),
+                other => spelling_decoder(other),
+            }
+        };
+        let mut decoder = LogprobDecoder::new(&decode);
+        assert_eq!(
+            decoder.decode(7).expect("decodes"),
+            "",
+            "a genuinely incomplete sequence has no text yet"
+        );
+        decoder.push(6);
+        assert_eq!(
+            decoder.decode(7).expect("decodes"),
+            "\u{e9}",
+            "with the preceding half in context the character is the correction, not a replacement"
+        );
+        assert_eq!(decoder.decode(8).expect("decodes"), "a");
+        assert_eq!(
+            decoder.decode(8).expect("decodes"),
+            "a",
+            "a clean decode is cached"
+        );
+    }
+
+    // ---- logprobs through the reference driver -------------------------------------------
+
+    fn logprobs_request(
+        prompt: &[u32],
+        max_tokens: usize,
+        sample: LogprobSelection,
+        prompt_logprobs: Option<LogprobSelection>,
+    ) -> EngineRequest {
+        let mut request = request(prompt, max_tokens, 0.0, 0);
+        request.logprobs = LogprobsRequest {
+            sample: Some(sample),
+            prompt: prompt_logprobs,
+            token_ids: Vec::new(),
+        };
+        request
+    }
+
+    fn token_logprobs(stream: &[EngineEvent]) -> Vec<TokenLogprob> {
+        stream
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::TokenLogprobs(logprob) => Some((**logprob).clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_request_that_asked_for_no_logprobs_gets_no_logprob_events() {
+        let driver = synthetic_driver(4);
+        let stream = events(&driver, request(&[1, 2, 3], 4, 0.0, 0)).await;
+        assert!(
+            !stream.iter().any(|event| matches!(
+                event,
+                EngineEvent::TokenLogprobs(_) | EngineEvent::PromptLogprobs(_)
+            )),
+            "the logprob path must cost nothing when it was not asked for: {stream:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_logprobs_are_none_at_position_zero_and_delivered_after_started() {
+        let driver = synthetic_driver(2);
+        let stream = events(
+            &driver,
+            logprobs_request(
+                &[1, 2, 3],
+                2,
+                LogprobSelection::Top(2),
+                Some(LogprobSelection::Top(1)),
+            ),
+        )
+        .await;
+        let started = stream
+            .iter()
+            .position(|event| matches!(event, EngineEvent::Started { .. }))
+            .expect("Started");
+        let prompt = stream
+            .iter()
+            .position(|event| matches!(event, EngineEvent::PromptLogprobs(_)))
+            .expect("prompt logprobs");
+        assert_eq!(
+            prompt,
+            started + 1,
+            "prompt logprobs arrive at the end of prefill"
+        );
+        let EngineEvent::PromptLogprobs(payload) = &stream[prompt] else {
+            unreachable!()
+        };
+        assert_eq!(payload.positions.len(), 3);
+        assert_eq!(payload.tokens.len(), 3);
+        assert!(
+            payload.positions[0].is_none(),
+            "prompt position 0 has no conditioning token"
+        );
+        for position in &payload.positions[1..] {
+            let entry = position.as_ref().expect("a scored position");
+            assert_eq!(
+                entry.top[0].token_id, entry.token_id,
+                "the prompt token itself is the first dict entry"
+            );
+            assert!(entry.rank.unwrap_or(0) >= 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn temperature_zero_logprobs_are_reproducible_and_cover_every_token() {
+        let driver = synthetic_driver(3);
+        let request = logprobs_request(&[1, 2, 3], 3, LogprobSelection::Top(2), None);
+        let first = events(&driver, request.clone()).await;
+        let second = events(&driver, request).await;
+        let first_logprobs = token_logprobs(&first);
+        assert_eq!(
+            first_logprobs,
+            token_logprobs(&second),
+            "the same request must produce the same logprobs"
+        );
+        let completion_tokens = first
+            .iter()
+            .find_map(|event| match event {
+                EngineEvent::Finished { usage, .. } => Some(usage.completion_tokens),
+                _ => None,
+            })
+            .expect("Finished");
+        assert_eq!(
+            first_logprobs.len(),
+            completion_tokens,
+            "one logprob entry per generated token"
+        );
+        for entry in &first_logprobs {
+            assert_eq!(entry.top[0].token_id, entry.token_id);
+            assert_eq!(
+                entry.rank,
+                Some(1),
+                "at temperature 0 the generated token is the raw-logit argmax"
+            );
+            assert!(!entry.top.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn whole_vocabulary_logprobs_cover_the_configured_vocabulary() {
+        let driver = synthetic_driver(1);
+        let stream = events(
+            &driver,
+            logprobs_request(&[1, 2, 3], 1, LogprobSelection::All, None),
+        )
+        .await;
+        let entries = token_logprobs(&stream);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].top.len(),
+            ModelConfig::tiny().vocab_size,
+            "logprobs=-1 reports the whole vocabulary"
+        );
+        let ids: Vec<u32> = entries[0]
+            .top
+            .iter()
+            .map(|alternative| alternative.token_id)
+            .collect();
+        let mut ordered = ids.clone();
+        ordered.sort_unstable();
+        assert_eq!(ids, ordered, "the whole vocabulary is reported in id order");
+        assert!(
+            entries[0]
+                .top
+                .iter()
+                .all(|alternative| alternative.rank.is_none()),
+            "logprobs=-1 is unranked"
+        );
+        // The synthetic tiny plan's logits are not a distribution (they are NaN at this prompt), so
+        // the honest row is the floor for every token. This pins that the whole-vocabulary path
+        // reports the row it was given instead of inventing finite values; the distribution
+        // property itself is pinned on a real logit row by `log_softmax_is_a_distribution_...`.
+        assert!(
+            entries[0]
+                .top
+                .iter()
+                .all(|alternative| alternative.logprob == f32::NEG_INFINITY),
+            "an all-NaN logit row reports the floor for every token"
+        );
     }
 }

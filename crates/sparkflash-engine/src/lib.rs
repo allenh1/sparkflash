@@ -56,10 +56,11 @@ pub use layer_plan::{
     AttentionGeometry, CompressionKind, LayerMode, LayerPlan, LayerSpec, PlanError,
 };
 pub use sequence_fixture::{
-    CompareError, DeviceStep, FixtureError, FixtureProvenance, FixtureSource, FixtureStep,
-    FixtureWeightKind, FixtureWeights, KvRowDigest, KvRowKind, LogitsCapture, MaskedCompareError,
-    MaskedLogitsComparison, ScreenedLogits, SequenceFixture, compare_logits, compare_logits_exact,
-    compare_steps, compared_positions, deterministic_prompt, exclusion_boundary, generate_fixture,
+    CertifiedMask, CompareError, DeviceStep, FixtureError, FixtureProvenance, FixtureSource,
+    FixtureStep, FixtureWeightKind, FixtureWeights, KvRowDigest, KvRowKind, LogitsCapture,
+    MaskedCompareError, MaskedLogitsComparison, ScreenedLogits, SequenceFixture, compare_logits,
+    compare_logits_exact, compare_steps, compared_positions, deterministic_prompt,
+    exclusion_boundary, generate_fixture,
 };
 pub use tensor::{TensorPlan, TensorSpec};
 pub use weights::{TensorView, WeightError, WeightSource};

@@ -2201,9 +2201,9 @@ pub fn attention_forward_with_backend(
         config.window_size
     };
     let mut combined: Vec<usize> = Vec::with_capacity(window_width + compressed_stride);
-    // The device body only sees the prefill chunk's ids, where the window is this chunk and no
-    // per-query ring write changes the KV view. For a decode step it answers `false` and the host
-    // loop below runs unchanged.
+    // The device body sees the prefill chunk at position 0, and one-ring-row decode steps through
+    // the position-causal sequence entry. A backend that does not stage a decode step answers
+    // false and the host loop below runs unchanged (the ring write is idempotent).
     let device_attention = if start_pos == 0 {
         let mut chunk_ids = Vec::with_capacity(seqlen * (window_width + compressed_stride));
         for query in 0..seqlen {
@@ -2218,6 +2218,30 @@ pub fn attention_forward_with_backend(
             &kv,
             &sink,
             &chunk_ids,
+            heads,
+            head_dim,
+            seqlen,
+            window_width,
+            compressed_stride,
+            scale,
+            start_pos,
+            &mut out[..seqlen * heads * head_dim],
+        )?
+    } else if seqlen == 1 {
+        let position = start_pos;
+        state.window.write(position, &kv_rows[..head_dim])?;
+        for slot in 0..config.window_size {
+            kv[slot * head_dim..(slot + 1) * head_dim].copy_from_slice(state.window.slot_row(slot));
+        }
+        combined.clear();
+        combined.extend_from_slice(&ids[..window_width]);
+        combined.extend_from_slice(&compressed_ids[..compressed_stride]);
+        backend.attention(
+            layer,
+            &q,
+            &kv,
+            &sink,
+            &combined,
             heads,
             head_dim,
             seqlen,
@@ -2296,6 +2320,97 @@ pub fn attention_forward_with_backend(
     )?;
     output_projection_with(config, prefix, out, seqlen, src.source, src.limit, backend)?;
     Ok(())
+}
+
+/// The host projection stages for the diagnostic twin: raw wq_a latent, raw wq_b q (before
+/// q_norm/RoPE), q after q_norm/RoPE, raw wkv, the kv after kv_norm/RoPE, and the window row after
+/// the fp8 round trip. All stages are produced by the host reference path on the same x.
+#[derive(Debug, Clone)]
+pub struct AttentionProjectionProbe {
+    /// Raw wq_a output, before q_norm.
+    pub latent_raw: Vec<f32>,
+    /// The q_norm'd latent, the wq_b input.
+    pub latent_normed: Vec<f32>,
+    /// Raw wq_b output, after q_norm and before RoPE.
+    pub q_raw: Vec<f32>,
+    /// q after q_norm and RoPE.
+    pub q_rot: Vec<f32>,
+    /// Raw wkv output, before kv_norm.
+    pub wkv_raw: Vec<f32>,
+    /// The window KV after kv_norm, RoPE, and the fp8 round trip.
+    pub window_kv: Vec<f32>,
+}
+
+/// Runs the host projection stages on one x row for the b57 projection twin.
+///
+/// # Errors
+///
+/// Any weight read or shape error from the host projection path.
+pub fn attention_projection_probe(
+    config: &ModelConfig,
+    layer: usize,
+    prefix: &str,
+    x: &[f32],
+    start_pos: usize,
+    source: &dyn WeightSource,
+    limit: usize,
+) -> Result<AttentionProjectionProbe, EngineError> {
+    let head_dim = config.head_dim;
+    let rank = config.q_lora_rank;
+    let mut backend = HostAttentionProjectionBackend;
+    let latent_raw = backend.wq_a(config, layer, prefix, x, source, limit)?;
+    let q_norm = weight(
+        Reads { source, limit },
+        &format!("{prefix}.attn.q_norm.weight"),
+    )?;
+    let mut latent = latent_raw.clone();
+    linalg::rms_norm(&mut latent, &q_norm, rank, config.norm_eps as f32)?;
+    let q_raw = backend.wq_b(config, layer, prefix, &latent, source, limit)?;
+    let latent_normed = latent.clone();
+    let tables = rope_tables_for_layer(
+        config,
+        layer,
+        &head_row_positions(start_pos, 1, config.n_heads),
+    );
+    let mut q_rot = q_raw.clone();
+    rotate_rows(
+        &mut q_rot,
+        config.n_heads,
+        head_dim,
+        config.rope_head_dim,
+        &tables,
+        false,
+    )?;
+    let wkv_raw = backend.wkv(config, layer, prefix, x, source, limit)?;
+    let norm = weight(
+        Reads { source, limit },
+        &format!("{prefix}.attn.kv_norm.weight"),
+    )?;
+    let mut window_kv = wkv_raw.clone();
+    linalg::rms_norm(&mut window_kv, &norm, head_dim, config.norm_eps as f32)?;
+    rotate_rows(
+        &mut window_kv,
+        1,
+        head_dim,
+        config.rope_head_dim,
+        &tables,
+        false,
+    )?;
+    round_trip_rows(
+        &mut window_kv,
+        head_dim,
+        WINDOW_QUANT_BLOCK,
+        Element::Fp8,
+        ScaleRule::PowerOfTwo,
+    );
+    Ok(AttentionProjectionProbe {
+        latent_raw,
+        latent_normed,
+        q_raw,
+        q_rot,
+        wkv_raw,
+        window_kv,
+    })
 }
 
 /// The DSpark stage pass, which attends the main rows through its own ring (model.py:1032-1074).

@@ -393,6 +393,17 @@ pub struct HybridLayerTrace {
     /// deferred FFN epilogue this is the post-attention X for the 39 deferred layers; only layer 39
     /// keeps the host epilogue add.
     pub residual_out: Vec<f32>,
+    /// The normalised attention block input the layer consumed, dim values. Diagnostic only: it is
+    /// the device-vs-host comparison point before the five projection GEMMs.
+    pub pre_attention_hidden: Vec<f32>,
+    /// The residual stream the provider handed this layer, hc_mult * dim values. For layer l > 0 in
+    /// the deferred chain this is the previous layer's epilogue-applied residual.
+    pub entry_input_x: Vec<f32>,
+    /// The post-attention residual X the device left, hc_mult * dim values; empty when the layer is
+    /// the last one and the host epilogue ran in place.
+    pub post_attention_x: Vec<f32>,
+    /// The host FFN output Y for this layer, dim values; empty when the layer is the last one.
+    pub ffn_out: Vec<f32>,
     /// Host continuation wall time in milliseconds, from the end of the MhcEntry handoff to the end
     /// of the FFN epilogue.
     pub host_ms: u64,
@@ -411,6 +422,8 @@ pub struct HybridTokenOutput {
     pub logits: Vec<f32>,
     /// The greedy token the host argmax selected.
     pub token: Option<u32>,
+    /// One certified byte per vocabulary entry, when the backend ran a certified screen.
+    pub certified_mask: Option<Vec<u8>>,
 }
 
 fn u64_bytes(values: usize) -> u64 {
@@ -1268,6 +1281,10 @@ impl InferenceEngine {
                 layer,
                 stages: layer_stages,
                 residual_out: hidden.clone(),
+                pre_attention_hidden: handoff.entry.pre_attention_hidden.clone(),
+                entry_input_x: handoff.x.clone(),
+                post_attention_x: Vec::new(),
+                ffn_out: Vec::new(),
                 host_ms,
             });
             progress(layer, host_ms);
@@ -1308,6 +1325,7 @@ impl InferenceEngine {
             head_input,
             logits,
             token,
+            certified_mask: None,
         })
     }
 
@@ -1328,10 +1346,44 @@ impl InferenceEngine {
         embedding: &[f32],
         provider: &mut HybridDeferredProvider<'_>,
         post: &mut HybridPostProvider<'_>,
+        attention: Option<&mut dyn attention::AttentionProjectionBackend>,
+        moe_backend: Option<&mut dyn moe::MoeDeviceBackend>,
+        progress: &mut dyn FnMut(usize, u64),
+    ) -> Result<HybridTokenOutput, EngineError> {
+        let mut state = SequenceState::new(&self.config);
+        self.run_hybrid_sequence_step(
+            &mut state,
+            token,
+            embedding,
+            0,
+            provider,
+            post,
+            attention,
+            moe_backend,
+            progress,
+        )
+    }
+
+    /// One deferred hybrid step at an explicit position in a persistent [SequenceState].
+    ///
+    /// This is the sequence-aware form of [Self::run_hybrid_chain_deferred]: the provider and the
+    /// device attention/MoE backends see the caller's accumulated KV/attention state, and `start_pos`
+    /// is the position this one-token step writes. The one-token method above is a fresh-state
+    /// wrapper, so the b40/b41 single-token evidence keeps the same code path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_hybrid_sequence_step(
+        &self,
+        state: &mut SequenceState,
+        token: u32,
+        embedding: &[f32],
+        start_pos: usize,
+        provider: &mut HybridDeferredProvider<'_>,
+        post: &mut HybridPostProvider<'_>,
         mut attention: Option<&mut dyn attention::AttentionProjectionBackend>,
         mut moe_backend: Option<&mut dyn moe::MoeDeviceBackend>,
         progress: &mut dyn FnMut(usize, u64),
     ) -> Result<HybridTokenOutput, EngineError> {
+        let input_token = token;
         let config = &self.config;
         let dim = config.dim;
         let hc = config.hc_mult;
@@ -1363,7 +1415,15 @@ impl InferenceEngine {
         }
         let mut pre_mix = vec![0.0f32; hc];
         pre_mix[0] = 1.0;
-        let mut state = SequenceState::new(config);
+        if state.tokens.len() != start_pos {
+            return Err(EngineError::Shape {
+                what: "deferred hybrid sequence step".to_owned(),
+                detail: format!(
+                    "start position {start_pos} does not match the state's {} consumed tokens",
+                    state.tokens.len()
+                ),
+            });
+        }
         let mut scratch = Scratch::for_chunk(config, 1);
         let mut layers = Vec::with_capacity(config.n_layers);
         let mut deferred: Option<DeferredHandoff> = None;
@@ -1384,12 +1444,12 @@ impl InferenceEngine {
             let mut next_deferred = None;
             let defer_epilogue = layer + 1 < config.n_layers;
             self.block(
-                &mut state,
+                state,
                 layer,
                 &mut hidden,
                 &mut pre_mix,
                 &mut scratch,
-                0,
+                start_pos,
                 Some(&handoff.entry),
                 Some(&mut layer_stages),
                 None,
@@ -1406,6 +1466,14 @@ impl InferenceEngine {
                     None
                 },
             )?;
+            let deferred_post_x = next_deferred
+                .as_ref()
+                .map(|handoff| handoff.x.clone())
+                .unwrap_or_default();
+            let deferred_ffn = next_deferred
+                .as_ref()
+                .map(|handoff| handoff.y.clone())
+                .unwrap_or_default();
             if defer_epilogue {
                 deferred = Some(next_deferred.ok_or_else(|| EngineError::Shape {
                     what: format!("layer {layer} deferred FFN epilogue"),
@@ -1419,6 +1487,10 @@ impl InferenceEngine {
                 layer,
                 stages: layer_stages,
                 residual_out: hidden.clone(),
+                pre_attention_hidden: handoff.entry.pre_attention_hidden.clone(),
+                entry_input_x: handoff.x.clone(),
+                post_attention_x: deferred_post_x,
+                ffn_out: deferred_ffn,
                 host_ms,
             });
             progress(layer, host_ms);
@@ -1467,6 +1539,9 @@ impl InferenceEngine {
             linalg::matmul(&mut logits, &tail, &head, config.vocab_size, dim, 1)?;
             linalg::argmax(&logits).map(|index| index as u32)
         };
+        let certified_mask = moe_backend
+            .as_ref()
+            .and_then(|backend| backend.head_certified_mask().map(<[u8]>::to_vec));
         let head_note = if device_token.is_some() {
             "device cert_lm_head_sm121 screen and in-kernel argmax over four rank shards; host block reduction"
         } else {
@@ -1501,12 +1576,14 @@ impl InferenceEngine {
                 note: argmax_note,
             },
         ];
+        state.tokens.push(input_token);
         Ok(HybridTokenOutput {
             layers,
             tail_stages,
             head_input,
             logits,
             token,
+            certified_mask,
         })
     }
 }

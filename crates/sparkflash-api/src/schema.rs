@@ -29,6 +29,24 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     /// Nucleus sampling threshold.
     pub top_p: Option<f32>,
+    /// Whether to report logprobs for the generated tokens.
+    ///
+    /// OpenAI's boolean form. When true, `top_logprobs` selects how many alternatives ride along
+    /// (default `0`: only each token's own logprob, which is OpenAI's behaviour).
+    pub logprobs: Option<bool>,
+    /// Per generated token: number of alternative logprobs, or `-1` for the whole vocabulary.
+    pub top_logprobs: Option<i32>,
+    /// Per prompt token: number of alternative logprobs, or `-1` for the whole vocabulary.
+    pub prompt_logprobs: Option<i32>,
+    /// Specific vocabulary ids whose logprobs are wanted at every generated position.
+    pub logprob_token_ids: Option<Vec<u32>>,
+    /// vLLM's chat `echo`: prepend the final message to the continuation.
+    ///
+    /// The reference chat path cannot render a chat template yet (the router's prompt ids are
+    /// placeholders, see `prompt.rs`), so this flag is parsed for protocol compatibility and used
+    /// only for its vLLM side effect: when `prompt_logprobs` is absent it selects
+    /// `top_logprobs`'s value, as vLLM does. It does not change the prompt.
+    pub echo: Option<bool>,
     /// Tool definitions (accepted verbatim in Milestone 1).
     pub tools: Option<Value>,
     /// Stop sequence(s).
@@ -179,6 +197,21 @@ pub struct CompletionRequest {
     pub stream_options: Option<StreamOptions>,
     /// Echo the prompt in the response.
     pub echo: Option<bool>,
+    /// Per generated token: number of alternative logprobs, or `-1` for the whole vocabulary.
+    ///
+    /// The vLLM wire integer for /v1/completions. `0` reports only each generated token's own
+    /// logprob; a positive `n` reports up to `n` alternatives besides it; `-1` reports the
+    /// whole vocabulary (bounded by the server's `--max-logprobs`).
+    pub logprobs: Option<i32>,
+    /// Per prompt token: number of alternative logprobs, or `-1` for the whole vocabulary.
+    ///
+    /// Position 0 has no conditioning token, so it always reports `null`. `echo` computes this
+    /// implicitly with `logprobs`'s value when the field is absent, which is vLLM's rule.
+    pub prompt_logprobs: Option<i32>,
+    /// Specific vocabulary ids whose logprobs are wanted at every generated position.
+    ///
+    /// Takes precedence over `logprobs`'s natural top-k, as vLLM's extension does.
+    pub logprob_token_ids: Option<Vec<u32>>,
     /// Raw reasoning effort, validated by crate::reasoning.
     pub reasoning_effort: Option<Value>,
     /// Whether thinking is enabled.

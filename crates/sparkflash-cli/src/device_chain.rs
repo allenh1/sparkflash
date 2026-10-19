@@ -18,7 +18,9 @@
 //! is a failure, not a success. The labels are printed verbatim so a plan cannot be read as a device
 //! result (docs/build/device-forward-chain.md 4.3 item 3).
 
+use std::collections::HashMap;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 use sparkflash_device::chain::{
     ChainLabels, ChainSchedule, ChainSeamPlan, LAYER_STAGE_ORDER, STEP_STAGE_ORDER,
@@ -27,6 +29,76 @@ use sparkflash_device::chain::{
 use sparkflash_device::chain_device::dry_run;
 use sparkflash_device::cubins::{baseline_pins, required_pins};
 use sparkflash_device::window::WindowAccounting;
+use sparkflash_engine::tensor::TensorSpec;
+use sparkflash_engine::weights::{WeightError, WeightSource};
+
+/// A read-through cache over the checkpoint source used by the device path.
+///
+/// The sequence run touches the same per-layer matrices at every position. The released checkpoint
+/// is memory-mapped but each weight read still copies the tensor, and the per-position cost of that
+/// copy dominates the chain. The cache keeps the exact bytes once and returns a copy of them, so the
+/// run does not page the checkpoint 138 times; it is the host half of the M3-d staging-reuse shape
+/// (the device side keeps its own persistent buffers). The key is the tensor name, so a read is
+/// either the cached bytes or the source's exact bytes.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+struct CachedWeightSource {
+    inner: sparkflash_engine::safetensors::SafeTensorsSource,
+    cache: Mutex<HashMap<String, Arc<Vec<u8>>>>,
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+impl CachedWeightSource {
+    fn new(inner: sparkflash_engine::safetensors::SafeTensorsSource) -> Self {
+        Self {
+            inner,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl WeightSource for CachedWeightSource {
+    fn names(&self) -> Vec<String> {
+        self.inner.names()
+    }
+
+    fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
+        self.inner.spec(name)
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+        // The routed-expert weights are the one tensor family a sequence does not revisit often
+        // enough to justify an unbounded cache: every position selects different experts, and
+        // caching all of them retains the whole expert set in RSS. Read them through the mmap
+        // source (the page cache keeps the file-backed pages reclaimable) and cache only the
+        // per-layer matrices the positions reuse.
+        if name.contains(".ffn.experts.") {
+            return self.inner.read(name);
+        }
+        if let Some(bytes) = self
+            .cache
+            .lock()
+            .map_err(|_| WeightError::Missing {
+                name: name.to_owned(),
+            })?
+            .get(name)
+        {
+            return Ok((**bytes).clone());
+        }
+        let bytes = Arc::new(self.inner.read(name)?);
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(name.to_owned(), Arc::clone(&bytes));
+        }
+        Ok((*bytes).clone())
+    }
+
+    fn read_ranges(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Option<Result<Vec<u8>, WeightError>> {
+        WeightSource::read_ranges(&self.inner, name, ranges)
+    }
+}
 
 /// The usage line for this subcommand.
 pub const USAGE: &str = "sparkflash device-chain --plan-only|--dry-run|--run-stage mhc_entry|layer_zero|hybrid_token --checkpoint DIR --cubin-dir DIR [--positions 0] [--layer 0] [--token 0] [--element-limit N] [--moe-preflight] [--moe-layer0-diagnose]";
@@ -81,11 +153,15 @@ fn deferred_twin_update(
 
 /// The layers whose attention body did not launch exactly once, in device order.
 #[cfg(any(feature = "cuda", test))]
-fn missing_body_layers(layers: &[usize], body_launches: &[usize]) -> Vec<usize> {
+fn missing_body_layers(
+    layers: &[usize],
+    body_launches: &[usize],
+    body_per_layer: usize,
+) -> Vec<usize> {
     layers
         .iter()
         .zip(body_launches)
-        .filter_map(|(layer, launches)| (*launches != 1).then_some(*layer))
+        .filter_map(|(layer, launches)| (*launches != body_per_layer).then_some(*layer))
         .collect()
 }
 
@@ -121,20 +197,27 @@ fn c4a2_seam_line(
     layers: &[usize],
     body_launches: &[usize],
     entry_launches: usize,
+    body_per_layer: usize,
 ) -> Result<String, String> {
-    let missing = missing_body_layers(layers, body_launches);
+    let missing = missing_body_layers(layers, body_launches, body_per_layer);
     if !missing.is_empty() {
         return Err(format!(
-            "c4a-2 seam line withheld: the format-2 body must launch exactly once on every layer, but layers {missing:?} do not (body_launches != 1); the per-layer ledger and totals would otherwise disagree"
+            "c4a-2 seam line withheld: the format-2 body must launch exactly {body_per_layer} time(s) on every layer, but layers {missing:?} do not (body_launches != {body_per_layer}); the per-layer ledger and totals would otherwise disagree"
         ));
     }
     let post_launches = layers.len();
     let mhc_launches = entry_launches + post_launches;
+    let total_body: usize = body_launches.iter().sum();
+    let launch_word = if body_per_layer == 1 {
+        "once".to_string()
+    } else {
+        format!("{body_per_layer} times")
+    };
     Ok(format!(
-        "c4a-2 seam: format-2 body launched exactly once on all {} layers; {} projection + {} body launches plus the {} mHC launches ({} entry + {} post)",
+        "c4a-2 seam: format-2 body launched exactly {launch_word} on all {} layers; {} projection + {} body launches plus the {} mHC launches ({} entry + {} post)",
         layers.len(),
         layers.len() * 5,
-        layers.len(),
+        total_body,
         mhc_launches,
         entry_launches,
         post_launches
@@ -292,6 +375,13 @@ struct StageArgs {
     element_limit: Option<usize>,
     moe_preflight: bool,
     moe_layer0_diagnose: bool,
+    fixture: Option<std::path::PathBuf>,
+    prompt_tokens: usize,
+    decode_steps: usize,
+    time_budget_s: u64,
+    sequence: bool,
+    reference_check: bool,
+    dump_logits: Option<std::path::PathBuf>,
 }
 
 #[cfg(feature = "cuda")]
@@ -319,17 +409,21 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
         .first()
         .ok_or_else(|| format!("usage: {USAGE}"))?
         .to_string();
-    if stage != "mhc_entry" && stage != "layer_zero" && stage != "hybrid_token" {
+    if stage != "mhc_entry"
+        && stage != "layer_zero"
+        && stage != "hybrid_token"
+        && stage != "hybrid_sequence"
+    {
         let reason = match stage.as_str() {
             "moe_router" | "moe_gate_up" => {
                 "NotWired (measured in isolation, not wired into the chain)"
             }
             _ => {
-                "NotStaged (M3-c stages only the layer-0 mHC entry, the layer-0 hybrid pass and the 40-layer hybrid token)"
+                "NotStaged (M3-c stages only the layer-0 mHC entry, the layer-0 hybrid pass, the 40-layer hybrid token and the hybrid sequence)"
             }
         };
         return Err(format!(
-            "stage {stage} is {reason}; --run-stage currently exposes only mhc_entry, layer_zero and hybrid_token"
+            "stage {stage} is {reason}; --run-stage currently exposes only mhc_entry, layer_zero, hybrid_token and hybrid_sequence"
         ));
     }
     let mut checkpoint = None;
@@ -340,6 +434,12 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
     let mut element_limit = None;
     let mut moe_preflight = false;
     let mut moe_layer0_diagnose = false;
+    let mut fixture = None;
+    let mut prompt_tokens = 1usize;
+    let mut decode_steps = 0usize;
+    let mut time_budget_s = 3600u64;
+    let mut reference_check = false;
+    let mut dump_logits = None;
     let mut index = 1usize;
     while index < args.len() {
         let flag = args[index];
@@ -353,6 +453,11 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
             index += 1;
             continue;
         }
+        if flag == "--reference-check" {
+            reference_check = true;
+            index += 1;
+            continue;
+        }
         let value = args
             .get(index + 1)
             .ok_or_else(|| format!("{flag} needs a value"))?;
@@ -360,6 +465,34 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
             "--checkpoint" => checkpoint = Some(std::path::PathBuf::from(value)),
             "--cubin-dir" => cubin_dir = Some(std::path::PathBuf::from(value)),
             "--positions" => positions = parse_positions(value)?,
+            "--fixture" => fixture = Some(std::path::PathBuf::from(value)),
+            "--dump-logits" => {
+                if value.is_empty() {
+                    return Err("--dump-logits needs a non-empty path".to_string());
+                }
+                dump_logits = Some(std::path::PathBuf::from(value));
+            }
+            "--prompt-tokens" => {
+                prompt_tokens = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("--prompt-tokens: {value} is not a count"))?;
+                if prompt_tokens == 0 {
+                    return Err("--prompt-tokens must be at least 1".to_string());
+                }
+            }
+            "--decode-steps" => {
+                decode_steps = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("--decode-steps: {value} is not a count"))?;
+            }
+            "--time-budget-s" => {
+                time_budget_s = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("--time-budget-s: {value} is not seconds"))?;
+                if time_budget_s == 0 {
+                    return Err("--time-budget-s must be positive".to_string());
+                }
+            }
             "--layer" => {
                 layer = value
                     .parse::<usize>()
@@ -403,6 +536,13 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
             "hybrid_token compares against the reference token 0 pass; --token must be 0, got {token}"
         ));
     }
+    let sequence = stage == "hybrid_sequence";
+    if dump_logits.is_some() && !sequence {
+        return Err(
+            "--dump-logits is only wired into hybrid_sequence, whose per-position logits the vLLM numeric comparison consumes"
+                .to_string(),
+        );
+    }
     Ok((
         stage,
         StageArgs {
@@ -414,6 +554,13 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
             element_limit,
             moe_preflight,
             moe_layer0_diagnose,
+            fixture,
+            prompt_tokens,
+            decode_steps,
+            time_budget_s,
+            reference_check,
+            sequence,
+            dump_logits,
         },
     ))
 }
@@ -484,6 +631,8 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
     use sparkflash_device::staging::{
         LayerPostStaging, LayerStaging, LayerZeroStaging, StagingError,
     };
+    use sparkflash_engine::forward::attention_case;
+    use sparkflash_engine::forward::boundary::BoundaryTable;
     use sparkflash_engine::forward::engram;
     use sparkflash_engine::forward::layer_zero::{
         LayerZeroEntrySource, M11_HC_COEFF_BAR, M11_INV_RMS_BAR, bf16_bytes, kernel_mhc_capture,
@@ -504,6 +653,40 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         .map_err(|error| format!("checkpoint config.json: {error}"))?;
     let limit = layer_zero_element_limit(args);
     let dim = config.dim;
+    let sequence = args.sequence;
+    let sequence_fixture = if sequence {
+        let path = args
+            .fixture
+            .as_ref()
+            .ok_or_else(|| "hybrid_sequence needs --fixture FILE".to_string())?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("sequence fixture {}: {error}", path.display()))?;
+        let fixture: sparkflash_engine::SequenceFixture = serde_json::from_str(&text)
+            .map_err(|error| format!("sequence fixture {}: {error}", path.display()))?;
+        fixture
+            .validate()
+            .map_err(|error| format!("sequence fixture {}: {error}", path.display()))?;
+        if args.prompt_tokens > fixture.prompt_tokens.len() {
+            return Err(format!(
+                "--prompt-tokens {} exceeds the fixture's {} prompt tokens",
+                args.prompt_tokens,
+                fixture.prompt_tokens.len()
+            ));
+        }
+        if args.decode_steps > fixture.decode_steps {
+            return Err(format!(
+                "--decode-steps {} exceeds the fixture's {} decode steps",
+                args.decode_steps, fixture.decode_steps
+            ));
+        }
+        Some(fixture)
+    } else {
+        None
+    };
+    let prompt_ids: Vec<u32> = match &sequence_fixture {
+        Some(fixture) => fixture.prompt_tokens[..args.prompt_tokens].to_vec(),
+        None => vec![args.token],
+    };
     let started = Instant::now();
     let mut lines = vec![
         "sparkflash device-chain: M3-c c4c HYBRID TOKEN - 40 layers, one prompt token, one position".to_string(),
@@ -516,10 +699,10 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         "attention body seam (c4a-2): m14 is the real device format-2 flash_mla_csa2_sm121 launch, 64 head blocks of 256 threads, one launch per layer at position 0. Window codes/scales are built by the engine window row helper from the host kv row; the selected compressed list is empty at position 0, and the kernel's indexer stage-1 buffers are uploaded as zeros plus sentinels and their writes are ignored. The 512-candidate / 640-slot regime is NOT exercised at position 0.".to_string(),
         "attention seam ledger: 3 launches/layer for wq_a+wq_b+wkv (120), 1 format-2 attention launch/layer (40) and 2 launches/layer for wo_a+wo_b (80) = 240 attention launches; 42 MhcEntry + 40 MhcPost + 240 attention = 322 chain launches.".to_string(),
         "routed MoE seam (c4c): 17 device launches/layer - 1 moe_router, 8 routed_gate_up (4 ranks x w1/w3), 4 weighted swiglu_mxfp8_quant_weighted, 4 serial b12x_mxfp4_moe combine - 680 launches over 40 layers. The shared expert runs four real device launches/layer (160), and the final RMSNorm is one device launch. The router selected-expert ids are read back once per layer; only the distinct selected experts are staged; the weighted epilogue reads the router's weights buffer in place, so no host weight multiply exists.".to_string(),
-        "chain launch ledger: 322 attention/mHC + 680 routed MoE + 160 shared expert + 4 head rank launches + 1 final norm = 1167 device launches; the chain token comparison remains the CHAIN-WIRING gate.".to_string(),
-        "claim: CHAIN-WIRING parity over c4c device MoE/norm/head, not a device-token result; criterion 1 remains OPEN because the four-shard block-max/argmax assembly and the token readback are host".to_string(),
-        "caching seam: no 40-layer staging metadata cache; attention and FFN staging objects are rebuilt and dropped per layer, and the five attention weight sets are restaged from the checkpoint per layer. Reused device allocations: the 16-buffer mHC set (2,064,352 B) plus the attention projection buffers.".to_string(),
-        "per-layer host stand-ins after c4c: none in the routed or shared expert, and the final RMSNorm is device. The five attention projections and the format-2 attention body are device at position 0. Attention host seams: q_norm, kv_norm, RoPE, window row construction, compressor/cache, selected-list assembly, indexer scoring, inverse RoPE, D8 quantisers. MoE host seams: router selected-id readback/local mapping and selected-expert staging. Tail host seams: lm_head weight read/upload, the four-shard block-max/argmax assembly and the token readback.".to_string(),
+        "chain launch ledger: 322 attention/mHC + 680 routed MoE + 160 shared expert + 4 head screen launches + 1 head reduce + 1 final norm = 1168 device launches; the chain token comparison remains the CHAIN-WIRING gate.".to_string(),
+        "claim: CHAIN-WIRING parity over c4c device MoE/norm/head, with the token produced by the device lm_head_reduce_sm121 launch; the only declared token-path seam is the 4-byte token plus status readback. Criterion 1 remains OPEN until a full 130 + 8 run meets design 4.3 items 1-6.".to_string(),
+        "caching seam: the checkpoint source is a lazy read-through host cache (no 40-layer preload), the five attention weight sets are read and packed once per layer and kept in the attention backend, and the per-layer mHC staging objects are built once and reused across positions. Reused device allocations: the 16-buffer mHC set (2,064,352 B) plus the attention projection buffers.".to_string(),
+        "per-layer host stand-ins after c4c: none in the routed or shared expert, and the final RMSNorm is device. The five attention projections and the format-2 attention body are device at position 0. Attention host seams: q_norm, kv_norm, RoPE, window row construction, compressor/cache, selected-list assembly, indexer scoring, inverse RoPE, D8 quantisers. MoE host seams: router selected-id readback/local mapping and selected-expert staging. Tail host seams: the head-weight read/upload and the 4-byte token plus status readback; the four-shard block-max/argmax assembly remains only as the WINNER_CERTIFIED fallback.".to_string(),
         format!(
             "checkpoint {}; cubin dir {}; token {}; position 0; element limit {}",
             args.checkpoint.display(),
@@ -528,6 +711,87 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             limit
         ),
     ];
+    if sequence {
+        lines[0] = format!(
+            "sparkflash device-chain: M3-c c4c HYBRID SEQUENCE - {} prompt positions + {} decode steps through the deferred chain",
+            args.prompt_tokens, args.decode_steps
+        );
+        let fixture_path = args
+            .fixture
+            .as_ref()
+            .map_or_else(|| "none".to_string(), |path| path.display().to_string());
+        let fixture_sha = args.fixture.as_ref().map_or_else(
+            || "none".to_string(),
+            |path| {
+                sparkflash_engram::packer::sha256_file(path)
+                    .unwrap_or_else(|_| "unreadable".to_string())
+            },
+        );
+        let fixture_bytes = args
+            .fixture
+            .as_ref()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map_or(0, |meta| meta.len());
+        lines.push(format!(
+            "sequence metadata: binary={} fixture={} fixture_sha256={} fixture_bytes={} checkpoint={} cubin_dir={} prompt_tokens={} decode_steps={} time_budget_s={} argv={:?}",
+            std::env::current_exe().map_or_else(|_| "unknown".to_string(), |path| path.display().to_string()),
+            fixture_path,
+            fixture_sha,
+            fixture_bytes,
+            args.checkpoint.display(),
+            args.cubin_dir.display(),
+            args.prompt_tokens,
+            args.decode_steps,
+            args.time_budget_s,
+            std::env::args().collect::<Vec<_>>()
+        ));
+        let binary_path = std::env::current_exe()
+            .map_or_else(|_| "unknown".to_string(), |path| path.display().to_string());
+        let binary_sha = std::env::current_exe().ok().map_or_else(
+            || "unknown".to_string(),
+            |path| {
+                sparkflash_engram::packer::sha256_file(&path)
+                    .unwrap_or_else(|_| "unreadable".to_string())
+            },
+        );
+        lines.push(format!(
+            "sequence metadata binary: path={} sha256={}",
+            binary_path, binary_sha
+        ));
+        if let Ok(entries) = std::fs::read_dir(&args.cubin_dir) {
+            let mut cubins: Vec<(String, String)> = entries
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "cubin")
+                })
+                .map(|entry| {
+                    let path = entry.path();
+                    let name = path.file_name().map_or_else(
+                        || "?".to_string(),
+                        |name| name.to_string_lossy().to_string(),
+                    );
+                    let sha = sparkflash_engram::packer::sha256_file(&path)
+                        .unwrap_or_else(|_| "unreadable".to_string());
+                    (name, sha)
+                })
+                .collect();
+            cubins.sort();
+            for (name, sha) in cubins {
+                lines.push(format!("sequence cubin: {name} sha256={sha}"));
+            }
+        }
+        let sequence_utc_start = utc_now();
+        let sequence_mem_before = read_mem_available_bytes().unwrap_or(0);
+        lines.push(format!(
+            "sequence metadata start: utc_start={} mem_available_before={} host={}",
+            sequence_utc_start,
+            sequence_mem_before,
+            host_name()
+        ));
+    }
 
     if args.moe_preflight {
         let source = SafeTensorsSource::open(
@@ -598,22 +862,128 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
     let reference_engine = InferenceEngine::new(config.clone(), Box::new(reference_source), limit)
         .map_err(|error| format!("reference engine: {error}"))?;
     let mut reference_state = SequenceState::new(&config);
-    let observed = reference_engine
-        .prefill_observed(&mut reference_state, &[args.token])
-        .map_err(|error| format!("reference prefill: {error}"))?;
-    let reference_elapsed = started.elapsed();
-    let reference_output = observed.output;
-    let reference_boundary = observed.boundary;
-    let reference_token = reference_output.next_token;
-    let reference_top5 = top5(&reference_output.logits);
-    lines.push(format!(
-        "reference engine: token_id={}; wall_ms={}; top5={}",
-        token_text(reference_token),
-        reference_elapsed.as_millis(),
-        format_top5(&reference_top5)
-    ));
+    let mut reference_tokens = Vec::new();
+    let mut reference_logits = Vec::new();
+    let mut reference_top5s: Vec<Vec<(u32, f32)>> = Vec::new();
+    let mut reference_boundary = None;
+    let mut reference_boundaries: Vec<BoundaryTable> = Vec::new();
+    let mut reference_attention_records: Vec<Vec<attention_case::AttentionCaseRecord>> = Vec::new();
+    let mut reference_head_inputs: Vec<Vec<f32>> = Vec::new();
+    let reference_elapsed;
+    if sequence {
+        let full_claim = sequence_fixture.as_ref().is_some_and(|fixture| {
+            args.prompt_tokens == fixture.prompt_tokens.len()
+                && args.decode_steps == fixture.decode_steps
+        });
+        if args.reference_check && !full_claim {
+            return Err(
+                "--reference-check needs the fixture prompt/decode counts so the live reference and the fixture name the same positions"
+                    .to_string(),
+            );
+        }
+        if full_claim {
+            let observed = reference_engine
+                .prefill_observed(&mut reference_state, &prompt_ids)
+                .map_err(|error| format!("reference prefill: {error}"))?;
+            let mut next = observed.output.next_token;
+            reference_tokens.push(next);
+            reference_top5s.push(top5(&observed.output.logits));
+            reference_logits = observed.output.logits.clone();
+            reference_boundaries.push(observed.boundary.clone());
+            reference_boundary = Some(observed.boundary);
+            for _ in 0..args.decode_steps {
+                let token =
+                    next.ok_or_else(|| "reference sequence has no token to decode".to_string())?;
+                let step = reference_engine
+                    .decode(&mut reference_state, token)
+                    .map_err(|error| format!("reference decode: {error}"))?;
+                next = step.next_token;
+                reference_tokens.push(next);
+                reference_logits = step.logits;
+            }
+            let fixture = sequence_fixture
+                .as_ref()
+                .ok_or_else(|| "sequence fixture disappeared".to_string())?;
+            let expected: Vec<Option<u32>> =
+                fixture.steps.iter().map(|step| step.next_token).collect();
+            let mut all_equal = reference_tokens.len() == expected.len();
+            for (index, (reference, fixture_token)) in
+                reference_tokens.iter().zip(expected.iter()).enumerate()
+            {
+                let position = prompt_ids.len().saturating_sub(1) + index;
+                let equal = reference == fixture_token;
+                all_equal &= equal;
+                let line = format!(
+                    "reference vs fixture: position={position} reference_token={} fixture_token={} equal={equal}",
+                    token_text(*reference),
+                    token_text(*fixture_token)
+                );
+                println!("{line}");
+                lines.push(line);
+            }
+            let summary = format!(
+                "reference vs fixture: positions={} all_equal={all_equal}",
+                reference_tokens.len()
+            );
+            println!("{summary}");
+            lines.push(summary);
+            if !all_equal {
+                return Err(format!(
+                    "reference engine does not reproduce the fixture tokens: got {:?}, fixture {:?}; the fixture is stale or from another checkpoint",
+                    reference_tokens, expected
+                ));
+            }
+        } else {
+            // Sanity prefix: compare every prompt position against a reference run of that prefix.
+            let capture_layers: Vec<usize> = (0..config.n_layers).collect();
+            for position in 0..prompt_ids.len() {
+                let mut prefix_state = SequenceState::new(&config);
+                attention_case::begin(&capture_layers, position)
+                    .map_err(|error| format!("reference attention capture {position}: {error}"))?;
+                let observed = reference_engine
+                    .prefill_observed(&mut prefix_state, &prompt_ids[..=position])
+                    .map_err(|error| format!("reference sanity prefix {position}: {error}"))?;
+                let captured = attention_case::finish();
+                reference_attention_records.push(captured);
+                reference_tokens.push(observed.output.next_token);
+                reference_top5s.push(top5(&observed.output.logits));
+                reference_head_inputs.push(observed.output.head_input.clone());
+                reference_logits = observed.output.logits;
+                reference_boundaries.push(observed.boundary.clone());
+                reference_boundary = Some(observed.boundary);
+            }
+        }
+        reference_elapsed = started.elapsed();
+        lines.push(format!(
+            "reference engine: sequence positions={} decoded={} tokens={:?}; wall_ms={}",
+            args.prompt_tokens,
+            args.decode_steps,
+            reference_tokens,
+            reference_elapsed.as_millis()
+        ));
+    } else {
+        let observed = reference_engine
+            .prefill_observed(&mut reference_state, &[args.token])
+            .map_err(|error| format!("reference prefill: {error}"))?;
+        reference_elapsed = started.elapsed();
+        reference_tokens.push(observed.output.next_token);
+        reference_top5s.push(top5(&observed.output.logits));
+        reference_logits = observed.output.logits;
+        reference_boundary = Some(observed.boundary);
+        let reference_token = reference_tokens[0];
+        let reference_top5 = top5(&reference_logits);
+        lines.push(format!(
+            "reference engine: token_id={}; wall_ms={}; top5={}",
+            token_text(reference_token),
+            reference_elapsed.as_millis(),
+            format_top5(&reference_top5)
+        ));
+    }
     drop(reference_engine);
     drop(reference_state);
+    if sequence && args.reference_check {
+        return Ok(lines);
+    }
 
     // The embedding row is paged, not the whole 661M-element table.
     let embed_source = SafeTensorsSource::open(
@@ -621,16 +991,32 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         &args.checkpoint.join("model.safetensors.index.json"),
     )
     .map_err(|error| format!("embed checkpoint {}: {error}", args.checkpoint.display()))?;
-    let embed_staging = LayerZeroStaging::from_source(&embed_source, &[args.token as usize])
+    let mut embed_ids: Vec<usize> = prompt_ids.iter().map(|token| *token as usize).collect();
+    if sequence {
+        embed_ids.extend(
+            reference_tokens
+                .iter()
+                .flatten()
+                .map(|token| *token as usize),
+        );
+        embed_ids.sort_unstable();
+        embed_ids.dedup();
+    }
+    let embed_staging = LayerZeroStaging::from_source(&embed_source, &embed_ids)
         .map_err(|error| format!("embed row stage: {error}"))?;
-    let embedding = embed_staging
-        .embed_row(args.token as usize)
-        .ok_or_else(|| format!("no staged embed row for input token {}", args.token))?
-        .values_f32();
-    drop(embed_source);
-    let mut engram_hashes = Vec::new();
-    engram::ngram_hashes(&config, &[args.token], 0, &mut engram_hashes)
-        .map_err(|error| format!("engram token hashes: {error}"))?;
+    let embedding = if sequence {
+        Vec::new()
+    } else {
+        embed_staging
+            .embed_row(args.token as usize)
+            .ok_or_else(|| format!("no staged embed row for input token {}", args.token))?
+            .values_f32()
+    };
+    let engram_hashes = Rc::new(RefCell::new(Vec::new()));
+    if !sequence {
+        engram::ngram_hashes(&config, &[args.token], 0, &mut engram_hashes.borrow_mut())
+            .map_err(|error| format!("engram token hashes: {error}"))?;
+    }
 
     let mem_available_bytes = read_mem_available_bytes()?;
     let mut attention_backend =
@@ -644,11 +1030,13 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         "mega_mhc_sm121",
     )?));
     let cubin_bytes = launcher.borrow().cubin_bytes();
-    let provider_source = SafeTensorsSource::open(
-        &args.checkpoint,
-        &args.checkpoint.join("model.safetensors.index.json"),
-    )
-    .map_err(|error| format!("staging checkpoint {}: {error}", args.checkpoint.display()))?;
+    let provider_source = CachedWeightSource::new(
+        SafeTensorsSource::open(
+            &args.checkpoint,
+            &args.checkpoint.join("model.safetensors.index.json"),
+        )
+        .map_err(|error| format!("checkpoint source {}: {error}", args.checkpoint.display()))?,
+    );
 
     #[derive(Clone)]
     struct DeviceTiming {
@@ -695,41 +1083,42 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
     let post_staging_slot: Rc<RefCell<Option<LayerPostStaging>>> = Rc::new(RefCell::new(None));
     let mut staged_first = false;
     let device_total_us = Rc::new(Cell::new(0u128));
-    let completed = Rc::new(Cell::new(0usize));
+    // The per-layer staging objects are built once and reused across sequence positions. They are
+    // small (the matrices that dominate staging live in the attention/MoE backends), but rebuilding
+    // them per token was still a per-position checkpoint read.
+    let mut layer_staging_cache: Vec<Option<LayerStaging>> = vec![None; config.n_layers];
+    let mut post_staging_cache: Vec<Option<LayerPostStaging>> = vec![None; config.n_layers];
     let progress_lines: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let mut provider = |layer: usize,
                         hidden: &[f32],
                         pre_mix: &[f32],
                         deferred: Option<&DeferredHandoff>|
      -> Result<HybridEntry, sparkflash_engine::linalg::EngineError> {
-        let done = completed.get();
-        if done > 0 {
-            let chain_elapsed = started.elapsed().as_secs_f64() - reference_elapsed.as_secs_f64();
-            let projected = reference_elapsed.as_secs_f64()
-                + chain_elapsed * (config.n_layers as f64 / done as f64);
-            if projected > 600.0 {
-                return Err(sparkflash_engine::linalg::EngineError::Shape {
-                    what: "c3 runtime guard".to_string(),
-                    detail: format!(
-                        "projected total {:.1} s exceeds the 600 s self-limit after {} of {} layers; aborting cleanly before layer {}",
-                        projected, done, config.n_layers, layer
-                    ),
-                });
-            }
-        }
         let staging_started = Instant::now();
-        let staging = LayerStaging::from_source(&provider_source, layer, &[]).map_err(
-            |error: StagingError| sparkflash_engine::linalg::EngineError::Shape {
-                what: format!("layer {layer} staging"),
-                detail: error.to_string(),
-            },
-        )?;
-        let post_staging = LayerPostStaging::from_source(&provider_source, layer).map_err(
-            |error: StagingError| sparkflash_engine::linalg::EngineError::Shape {
-                what: format!("layer {layer} post staging"),
-                detail: error.to_string(),
-            },
-        )?;
+        let staging = if let Some(staging) = &layer_staging_cache[layer] {
+            staging.clone()
+        } else {
+            let staging = LayerStaging::from_source(&provider_source, layer, &[]).map_err(
+                |error: StagingError| sparkflash_engine::linalg::EngineError::Shape {
+                    what: format!("layer {layer} staging"),
+                    detail: error.to_string(),
+                },
+            )?;
+            layer_staging_cache[layer] = Some(staging.clone());
+            staging
+        };
+        let post_staging = if let Some(staging) = &post_staging_cache[layer] {
+            staging.clone()
+        } else {
+            let staging = LayerPostStaging::from_source(&provider_source, layer).map_err(
+                |error: StagingError| sparkflash_engine::linalg::EngineError::Shape {
+                    what: format!("layer {layer} post staging"),
+                    detail: error.to_string(),
+                },
+            )?;
+            post_staging_cache[layer] = Some(staging.clone());
+            staging
+        };
         let matrix_bytes = staging.host_bytes() + post_staging.host_bytes();
         if !staged_first {
             let request = sparkflash_device::BudgetRequest {
@@ -773,7 +1162,7 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
                     &config,
                     layer,
                     &mut x,
-                    &engram_hashes,
+                    &engram_hashes.borrow(),
                     &provider_source,
                     limit,
                 )
@@ -870,7 +1259,7 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
                     &config,
                     layer,
                     &mut engrammed,
-                    &engram_hashes,
+                    &engram_hashes.borrow(),
                     &provider_source,
                     limit,
                 )
@@ -1100,7 +1489,6 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             timing.x_bytes = x_after.len();
             timing.matrix_bytes = matrix_bytes;
         }
-        completed.set(done + 1);
         Ok(HybridEntry {
             entry,
             x: x_readback,
@@ -1337,22 +1725,271 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             progress_lines.borrow_mut().push(line);
         }
     };
-    let chain_source = SafeTensorsSource::open(
-        &args.checkpoint,
-        &args.checkpoint.join("model.safetensors.index.json"),
-    )
-    .map_err(|error| format!("chain checkpoint {}: {error}", args.checkpoint.display()))?;
+    let chain_source = CachedWeightSource::new(
+        SafeTensorsSource::open(
+            &args.checkpoint,
+            &args.checkpoint.join("model.safetensors.index.json"),
+        )
+        .map_err(|error| format!("chain checkpoint {}: {error}", args.checkpoint.display()))?,
+    );
     let chain_engine = InferenceEngine::new(config.clone(), Box::new(chain_source), limit)
         .map_err(|error| format!("chain engine: {error}"))?;
-    let chain_result = chain_engine.run_hybrid_chain_deferred(
-        args.token,
-        &embedding,
-        &mut provider,
-        &mut post,
-        Some(&mut attention_backend),
-        Some(&mut moe_backend),
-        &mut progress,
-    );
+    let mut sequence_outputs = Vec::new();
+    let chain_result = if sequence {
+        let mut state = SequenceState::new(&config);
+        let mut chain_tokens: Vec<Option<u32>> = Vec::new();
+        let mut sequence_abort: Option<String> = None;
+        let mut run_token = |token: u32,
+                             position: usize,
+                             history: &[u32],
+                             state: &mut SequenceState,
+                             outputs: &mut Vec<sparkflash_engine::forward::HybridTokenOutput>,
+                             tokens: &mut Vec<Option<u32>>,
+                             lines: &mut Vec<String>|
+         -> Result<(), sparkflash_engine::linalg::EngineError> {
+            if started.elapsed().as_secs() > args.time_budget_s {
+                let line = format!(
+                    "sequence time budget EXCEEDED after {} of {} positions: elapsed_s={} budget_s={}",
+                    position,
+                    args.prompt_tokens + args.decode_steps,
+                    started.elapsed().as_secs(),
+                    args.time_budget_s
+                );
+                println!("{line}");
+                lines.push(line);
+                return Err(sparkflash_engine::linalg::EngineError::Shape {
+                    what: "sequence time budget".to_string(),
+                    detail: format!(
+                        "elapsed {} s exceeds --time-budget-s {}",
+                        started.elapsed().as_secs(),
+                        args.time_budget_s
+                    ),
+                });
+            }
+            let available = read_mem_available_bytes().map_err(|error| {
+                sparkflash_engine::linalg::EngineError::Shape {
+                    what: "sequence memory read".to_string(),
+                    detail: error,
+                }
+            })?;
+            if available < sparkflash_device::budget::ADMISSION_FLOOR_BYTES + 512 * 1024 * 1024 {
+                let line = format!(
+                    "sequence memory guard ABORT before position {position}: mem_available={available} B is within 512 MiB of the {} B admission floor",
+                    sparkflash_device::budget::ADMISSION_FLOOR_BYTES
+                );
+                println!("{line}");
+                lines.push(line.clone());
+                return Err(sparkflash_engine::linalg::EngineError::Shape {
+                    what: "sequence memory guard".to_string(),
+                    detail: line,
+                });
+            }
+            let mut hashes = Vec::new();
+            engram::ngram_hashes(&config, history, position, &mut hashes).map_err(|error| {
+                sparkflash_engine::linalg::EngineError::Shape {
+                    what: "sequence Engram hashes".to_string(),
+                    detail: error.to_string(),
+                }
+            })?;
+            *engram_hashes.borrow_mut() = hashes;
+            let embedding = match embed_staging.embed_row(token as usize) {
+                Some(row) => row.values_f32(),
+                None => {
+                    sparkflash_device::staging::embed_row_from_source(&embed_source, token as usize)
+                        .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
+                            what: "sequence embedding".to_string(),
+                            detail: format!(
+                                "no staged or readable embed row for token {token}: {error}"
+                            ),
+                        })?
+                        .values_f32()
+                }
+            };
+            let rss_before_kib = read_rss_kib();
+            let position_started = Instant::now();
+            let attention_before = attention_backend.stats();
+            let moe_before = moe_backend.stats();
+            let output = chain_engine.run_hybrid_sequence_step(
+                state,
+                token,
+                &embedding,
+                position,
+                &mut provider,
+                &mut post,
+                Some(&mut attention_backend),
+                Some(&mut moe_backend),
+                &mut progress,
+            )?;
+            tokens.push(output.token);
+            // Only the diagnostic prefix and the two positions the criterion compares need the
+            // per-layer/head buffers. Keeping the other 130+ outputs whole is the runner half of
+            // the per-position RSS growth; the logits stay because the token table prints top5.
+            let keep_full = position < 3
+                || position + 1 == args.prompt_tokens
+                || position + 1 == args.prompt_tokens + args.decode_steps;
+            let mut output = output;
+            if !keep_full {
+                output.layers.clear();
+                output.tail_stages.clear();
+                output.head_input.clear();
+                output.certified_mask = None;
+            }
+            outputs.push(output);
+            let attention_after = attention_backend.stats();
+            let moe_after = moe_backend.stats();
+            let mem_after = read_mem_available_bytes().unwrap_or(0);
+            let rss_after_kib = read_rss_kib();
+            let mem_line = format!(
+                "sequence memory: position={position} mem_available_before={available} mem_available_after={mem_after} mem_delta_bytes={} rss_kib_before={rss_before_kib} rss_kib_after={rss_after_kib} rss_delta_kib={}",
+                mem_after as i128 - available as i128,
+                rss_after_kib as i128 - rss_before_kib as i128
+            );
+            println!("{mem_line}");
+            lines.push(mem_line);
+            let done = position + 1;
+            let total_positions = args.prompt_tokens + args.decode_steps;
+            let chain_cumulative =
+                (started.elapsed().as_secs_f64() - reference_elapsed.as_secs_f64()).max(0.0);
+            let full_positions = sequence_fixture
+                .as_ref()
+                .map(|fixture| fixture.prompt_tokens.len() + fixture.decode_steps)
+                .unwrap_or(total_positions);
+            let chain_full = chain_cumulative * full_positions as f64 / done as f64;
+            let reference_basis = if full_positions == total_positions {
+                "measured_full"
+            } else {
+                "requested_only"
+            };
+            let projected_total = reference_elapsed.as_secs_f64() + chain_full;
+            let timing_line = format!(
+                "sequence position: position={} done={}/{} wall_ms={} chain_ms={} projected_total_s={:.1} projected_chain_full_s={:.1} full_positions={} reference_basis={} budget_s={} attention_staging_us={} attention_device_us={} moe_staging_us={} moe_device_us={} routed_staging_us={} routed_device_us={} shared_staging_us={} shared_device_us={} total_staging_us={} total_device_us={} mem_available={}",
+                position,
+                done,
+                total_positions,
+                position_started.elapsed().as_millis(),
+                started
+                    .elapsed()
+                    .as_millis()
+                    .saturating_sub(reference_elapsed.as_millis()),
+                projected_total,
+                chain_full,
+                full_positions,
+                reference_basis,
+                args.time_budget_s,
+                attention_after
+                    .staging_us
+                    .saturating_sub(attention_before.staging_us),
+                attention_after
+                    .device_us
+                    .saturating_sub(attention_before.device_us),
+                moe_after.staging_us.saturating_sub(moe_before.staging_us),
+                moe_after.device_us.saturating_sub(moe_before.device_us),
+                moe_after
+                    .routed_staging_us
+                    .saturating_sub(moe_before.routed_staging_us),
+                moe_after
+                    .routed_device_us
+                    .saturating_sub(moe_before.routed_device_us),
+                moe_after
+                    .shared_staging_us
+                    .saturating_sub(moe_before.shared_staging_us),
+                moe_after
+                    .shared_device_us
+                    .saturating_sub(moe_before.shared_device_us),
+                (attention_after.staging_us - attention_before.staging_us)
+                    + (moe_after.staging_us - moe_before.staging_us),
+                (attention_after.device_us - attention_before.device_us)
+                    + (moe_after.device_us - moe_before.device_us),
+                read_mem_available_bytes().unwrap_or(0)
+            );
+            println!("{timing_line}");
+            lines.push(timing_line);
+            if position == 0
+                || (position + 1).is_multiple_of(8)
+                || position + 1 == args.prompt_tokens + args.decode_steps
+            {
+                let line = format!(
+                    "sequence progress: position={}/{} token={:?} elapsed_s={} mem_available={} moe_device_us={} routed_device_us={} shared_device_us={} attention_body_launches={} attention_body_us={}",
+                    position + 1,
+                    args.prompt_tokens + args.decode_steps,
+                    tokens.last().copied().flatten(),
+                    started.elapsed().as_secs(),
+                    read_mem_available_bytes().unwrap_or(0),
+                    moe_backend.stats().device_us,
+                    moe_backend.stats().routed_device_us,
+                    moe_backend.stats().shared_device_us,
+                    attention_backend.stats().attention_launches,
+                    attention_backend.stats().attention_us
+                );
+                println!("{line}");
+                lines.push(line);
+            }
+            Ok(())
+        };
+        for (position, token) in prompt_ids.iter().copied().enumerate() {
+            let history = &prompt_ids[..=position];
+            if let Err(error) = run_token(
+                token,
+                position,
+                history,
+                &mut state,
+                &mut sequence_outputs,
+                &mut chain_tokens,
+                &mut lines,
+            ) {
+                sequence_abort = Some(error.to_string());
+                break;
+            }
+        }
+        if sequence_abort.is_none() {
+            let mut decode_token = reference_tokens[0].unwrap_or(0);
+            for step in 0..args.decode_steps {
+                let position = prompt_ids.len() + step;
+                let mut history = prompt_ids.clone();
+                history.extend(reference_tokens[..=step].iter().flatten().copied());
+                if let Err(error) = run_token(
+                    decode_token,
+                    position,
+                    &history,
+                    &mut state,
+                    &mut sequence_outputs,
+                    &mut chain_tokens,
+                    &mut lines,
+                ) {
+                    sequence_abort = Some(error.to_string());
+                    break;
+                }
+                decode_token = chain_tokens.last().copied().flatten().unwrap_or(0);
+            }
+        }
+        if let Some(error) = sequence_abort {
+            Err(sparkflash_engine::linalg::EngineError::Shape {
+                what: "hybrid sequence".to_string(),
+                detail: error,
+            })
+        } else {
+            for (layer, timing) in device_timings.borrow_mut().iter_mut().enumerate() {
+                timing.body_launches = attention_backend.body_launches(layer);
+                timing.moe_launches = moe_backend.launches_for(layer);
+            }
+            sequence_outputs.last().cloned().ok_or_else(|| {
+                sparkflash_engine::linalg::EngineError::Shape {
+                    what: "hybrid sequence".to_string(),
+                    detail: "no sequence output".to_string(),
+                }
+            })
+        }
+    } else {
+        chain_engine.run_hybrid_chain_deferred(
+            args.token,
+            &embedding,
+            &mut provider,
+            &mut post,
+            Some(&mut attention_backend),
+            Some(&mut moe_backend),
+            &mut progress,
+        )
+    };
     let output = match chain_result {
         Ok(output) => output,
         Err(error) => {
@@ -1455,10 +2092,16 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         })
         .collect();
     let engram_entries = timings.iter().filter(|timing| timing.engram_split).count();
+    let sequence_positions = if sequence {
+        args.prompt_tokens + args.decode_steps
+    } else {
+        1
+    };
     let c4a2_line = c4a2_seam_line(
         &body_layers,
         &body_counts,
         body_layers.len() + engram_entries,
+        sequence_positions,
     )?;
     let moe_missing: Vec<usize> = output
         .layers
@@ -1472,7 +2115,7 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         .collect();
     if !moe_missing.is_empty() {
         return Err(format!(
-            "c4c seam line withheld: the routed MoE plus shared expert must launch exactly 21 times on every layer (17 routed + 4 shared), but layers {moe_missing:?} do not (moe_launches != 21); the per-layer ledger and totals would otherwise disagree"
+            "c4c seam line withheld: the routed MoE plus shared expert must launch exactly 21 times on every layer, but layers {moe_missing:?} do not (moe_launches != 21); the per-layer ledger and totals would otherwise disagree"
         ));
     }
     for (device_index, trace) in output.layers.iter().enumerate() {
@@ -1484,6 +2127,8 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             .iter()
             .map(|event| event.host_bytes_in.saturating_add(event.host_bytes_out))
             .sum();
+        let body_ok = timing.body_launches == sequence_positions;
+        let moe_ok = timing.moe_launches == 21;
         let ledger = trace
             .stages
             .iter()
@@ -1505,10 +2150,10 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
                         "[device: wq_a+wq_b+wkv, 3 launches; host q_norm + D8 quant seams]"
                             .to_string()
                     }
-                    "attention" if timing.body_launches == 1 => {
-                        "[device: format-2 flash-MLA, 1 launch; host q/window/selected seams]"
-                            .to_string()
-                    }
+                    "attention" if body_ok => format!(
+                        "[device: format-2 flash-MLA, {} launch(es), one per sequence position; host q/window/selected seams]",
+                        timing.body_launches
+                    ),
                     "attention" => format!(
                         "[HOST STAND-IN: m14 flash-MLA; body_launches={}]",
                         timing.body_launches
@@ -1517,15 +2162,16 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
                         "[device: wo_a+wo_b, 2 launches; host inverse-RoPE + D8 quant seams]"
                             .to_string()
                     }
-                    "moe_router" if timing.moe_launches == 21 => {
-                        "[device: moe_router, 1 launch; host dispatch/readback seam]".to_string()
-                    }
+                    "moe_router" if moe_ok => {
+                        "[device: moe_router, 1 launch per position; host dispatch/readback seam]"
+                            .to_string()
+                    },
                     "moe_router" => format!(
                         "[HOST STAND-IN: routed MoE; moe_launches={}]",
                         timing.moe_launches
                     ),
-                    "moe_gate_up" if timing.moe_launches == 21 => {
-                        "[device: routed_gate_up, 8 launches (4 ranks x w1/w3); host selected-expert staging]"
+                    "moe_gate_up" if moe_ok => {
+                        "[device: routed_gate_up, 8 launches per position (4 ranks x w1/w3); host selected-expert staging]"
                             .to_string()
                     }
                     "moe_swiglu_quant" if timing.moe_launches == 21 => {
@@ -1612,14 +2258,19 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         moe_stats.final_norm_bf16_mismatches
     ));
     lines.push(format!(
-        "lm head totals: head_launches={} head_certified={} certified_by_rank={:?} winner_certified={} head_staging_us={} head_device_us={} head_staged_bytes={} screen=cert_lm_head_sm121 argmax=in-kernel per four rank shards; host block assembly",
+        "lm head totals: head_launches={} head_certified={} certified_by_rank={:?} winner_certified={} head_staging_us={} head_device_us={} head_staged_bytes={} reduce_used={} reduce_token={} reduce_status={:#x} reduce_value={:e} reduce_certified_count={} screen=cert_lm_head_sm121 argmax=in-kernel per four rank shards + lm_head_reduce_sm121; host block assembly is the fallback",
         moe_stats.head_launches,
         moe_stats.head_certified,
         moe_stats.head_certified_by_rank,
         moe_stats.head_winner_certified,
         moe_stats.head_staging_us,
         moe_stats.head_device_us,
-        moe_stats.head_staged_bytes
+        moe_stats.head_staged_bytes,
+        moe_stats.head_reduce_used,
+        moe_stats.head_reduce_token,
+        moe_stats.head_reduce_status,
+        moe_stats.head_reduce_value,
+        moe_stats.head_reduce_certified_count
     ));
     lines.push(format!(
         "moe counts: routed_launches={} shared_launches={} total_launches={} routed_staging_us={} shared_staging_us={} total_staging_us={}",
@@ -1630,11 +2281,26 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         moe_stats.shared_staging_us,
         moe_stats.staging_us
     ));
+    let sequence_positions = if sequence {
+        prompt_ids.len() + args.decode_steps
+    } else {
+        1
+    };
+    let entry_launches = (output.layers.len() + engram_entries) * sequence_positions;
+    let post_launches = output.layers.len() * sequence_positions;
+    let device_launches = entry_launches
+        + post_launches
+        + attention_stats.launches
+        + attention_stats.attention_launches
+        + moe_stats.launches
+        + moe_stats.head_launches
+        + moe_stats.final_norm_launches;
     lines.push(format!(
-        "chain totals: layers={} entry_launches={} post_launches={} attention_projection_launches={} attention_body_launches={} routed_moe_launches={} shared_moe_launches={} head_launches={} tail_norm_launches={} moe_launches={} device_launches={} engram_split_layers={} device_us={} device_ms={:.3} staging_ms={} host_ms={} total_chain_ms={} host_bytes={} staged_matrix_bytes={} cubin_bytes={} device_buffer_bytes={}",
+        "chain totals: layers={} sequence_positions={} entry_launches={} post_launches={} attention_projection_launches={} attention_body_launches={} routed_moe_launches={} shared_moe_launches={} head_launches={} tail_norm_launches={} moe_launches={} device_launches={} engram_split_layers={} device_us={} device_ms={:.3} staging_ms={} host_ms={} total_chain_ms={} host_bytes={} staged_matrix_bytes={} cubin_bytes={} device_buffer_bytes={} (entry/post/moe/head/norm totals are cumulative over {} positions; host/bytes/timing are the last position only)",
         output.layers.len(),
-        output.layers.len() + engram_entries,
-        output.layers.len(),
+        sequence_positions,
+        entry_launches,
+        post_launches,
         attention_stats.launches,
         attention_stats.attention_launches,
         moe_stats.routed_launches,
@@ -1642,13 +2308,7 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         moe_stats.head_launches,
         moe_stats.final_norm_launches,
         moe_stats.launches,
-        output.layers.len() * 2
-            + engram_entries
-            + attention_stats.launches
-            + attention_stats.attention_launches
-            + moe_stats.launches
-            + moe_stats.head_launches
-            + moe_stats.final_norm_launches,
+        device_launches,
         engram_entries,
         total_device_us,
         total_device_us as f64 / 1000.0,
@@ -1658,12 +2318,53 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         total_host_bytes,
         total_matrix_bytes,
         total_cubin_bytes,
-        total_device_buffer_bytes
+        total_device_buffer_bytes,
+        sequence_positions
     ));
     for stage in &output.tail_stages {
         lines.push(format!(
             "tail stage {}: host_bytes_in={} host_bytes_out={} note={}",
             stage.stage, stage.host_bytes_in, stage.host_bytes_out, stage.note
+        ));
+    }
+    if sequence {
+        let expected_body = output.layers.len() * sequence_positions;
+        let actual_body = attention_stats.attention_launches;
+        lines.push(format!(
+            "sequence attention position support: body_launches={} expected={} positions={} device_position_0_body={} other_position_bodies={}",
+            actual_body,
+            expected_body,
+            sequence_positions,
+            output.layers.len(),
+            actual_body.saturating_sub(output.layers.len())
+        ));
+        if actual_body != expected_body {
+            lines.push(
+                "sequence attention position support: FAIL - the C4A-2 format-2 body or the csa2 sequence entry did not run on every layer and position; at least one step fell back to the host attention loop"
+                    .to_string(),
+            );
+        }
+    }
+    if sequence && reference_attention_records.len() == prompt_ids.len() {
+        lines.extend(sequence_alignment_and_residual_lines(
+            &reference_tokens,
+            &reference_top5s,
+            &reference_boundaries,
+            &reference_attention_records,
+            &reference_head_inputs,
+            moe_backend.router_records(),
+            attention_backend.diag_latent_raw(),
+            attention_backend.diag_q_raw(),
+            attention_backend.diag_wq_b_input(),
+            attention_backend.diag_wkv_raw(),
+            attention_backend.diag_window_codes(),
+            attention_backend.diag_wq_b_kernel(),
+            &args.checkpoint,
+            limit,
+            &prompt_ids,
+            &sequence_outputs,
+            &config,
+            attention_backend.operand_traces(),
         ));
     }
     let hybrid_top5 = top5(&output.logits);
@@ -1673,6 +2374,170 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         chain_elapsed.as_millis(),
         format_top5(&hybrid_top5)
     ));
+    if sequence {
+        let all_tokens: Vec<Option<u32>> = sequence_outputs.iter().map(|out| out.token).collect();
+        let full_claim = sequence_fixture.as_ref().is_some_and(|fixture| {
+            args.prompt_tokens == fixture.prompt_tokens.len()
+                && args.decode_steps == fixture.decode_steps
+        });
+        let chain_tokens: Vec<Option<u32>> = if full_claim {
+            all_tokens[prompt_ids.len() - 1..].to_vec()
+        } else {
+            all_tokens.clone()
+        };
+        let rows = sequence_comparison_rows(
+            &reference_tokens,
+            &chain_tokens,
+            prompt_ids.len(),
+            full_claim,
+        );
+        let mut all_match = chain_tokens.len() == reference_tokens.len();
+        let first_output = if full_claim { prompt_ids.len() - 1 } else { 0 };
+        let fixture_steps: Vec<Option<u32>> = sequence_fixture
+            .as_ref()
+            .map(|fixture| fixture.steps.iter().map(|step| step.next_token).collect())
+            .unwrap_or_default();
+        for (row, (position, reference, hybrid, exact)) in rows.iter().enumerate() {
+            all_match &= *exact;
+            let fixture_index = position.saturating_sub(prompt_ids.len().saturating_sub(1));
+            let (fixture_token, fixture_equal) = if full_claim {
+                (
+                    fixture_steps.get(fixture_index).copied().flatten(),
+                    fixture_steps.get(fixture_index).copied().flatten() == *reference,
+                )
+            } else {
+                (None, false)
+            };
+            lines.push(format!(
+                "token comparison: position={} reference_id={} hybrid_id={} fixture_id={} exact_equal={} reference_equals_fixture={}",
+                position,
+                token_text(*reference),
+                token_text(*hybrid),
+                token_text(fixture_token),
+                exact,
+                if full_claim { fixture_equal.to_string() } else { "n/a".to_string() }
+            ));
+            let output_index = first_output + row;
+            if let Some(output) = sequence_outputs.get(output_index) {
+                lines.push(format!(
+                    "position {} hybrid top5: {}",
+                    position,
+                    format_top5(&top5(&output.logits))
+                ));
+            }
+            if let Some(reference_top5) = reference_top5s.get(output_index) {
+                lines.push(format!(
+                    "position {} reference top5: {}",
+                    position,
+                    format_top5(reference_top5)
+                ));
+            }
+        }
+        if let Some(path) = args.dump_logits.as_deref() {
+            // The machine-readable companion for the vLLM numeric comparison. It is written as
+            // soon as the compared rows exist and before the token-parity gate can return, so a
+            // failing parity run still leaves its logits; it changes no arithmetic and prints no
+            // line, so the stage's existing output stays byte-identical.
+            let _ = write_logits_dump(
+                path,
+                &rows,
+                &sequence_outputs,
+                first_output,
+                full_claim,
+                &fixture_steps,
+                prompt_ids.len(),
+            )?;
+        }
+        if chain_tokens.len() != reference_tokens.len() {
+            lines.push(format!(
+                "sequence comparison count: hybrid={} reference={} (all prefill {} + decode {})",
+                chain_tokens.len(),
+                reference_tokens.len(),
+                args.prompt_tokens,
+                args.decode_steps
+            ));
+        }
+        if full_claim {
+            let fixture = sequence_fixture
+                .as_ref()
+                .ok_or_else(|| "sequence fixture disappeared".to_string())?;
+            let position129 = sequence_outputs
+                .get(prompt_ids.len() - 1)
+                .ok_or_else(|| "sequence has no position-129 output".to_string())?;
+            let certified = position129.certified_mask.as_ref().ok_or_else(|| {
+                "the device head did not provide a certified mask; criterion-1 item 4 cannot be compared"
+                    .to_string()
+            })?;
+            let mut words = vec![0u64; certified.len().div_ceil(64)];
+            for (index, bit) in certified.iter().enumerate() {
+                if *bit != 0 {
+                    words[index / 64] |= 1u64 << (index % 64);
+                }
+            }
+            let mask = sparkflash_engine::sequence_fixture::CertifiedMask::from_words(
+                words,
+                certified.len(),
+            )
+            .map_err(|error| format!("certified mask: {error}"))?;
+            let screened = sparkflash_engine::ScreenedLogits::new(position129.logits.clone(), mask)
+                .map_err(|error| format!("screened logits: {error}"))?;
+            let comparison = sparkflash_engine::compare_logits_exact(fixture, 129, &screened, 2e-2)
+                .map_err(|error| format!("logits 129: {error}"))?;
+            lines.push(format!(
+                "logits 129: compared_entries={} mask_exact_entries={} mask_certified_entries={} bit_identical_entries={} mismatches={} max_abs_diff={:.9e} max_abs_index={} argmax_index={} bar=0.02 PASS",
+                comparison.compared_entries,
+                comparison.mask_exact_entries,
+                comparison.mask_certified_entries,
+                comparison.bit_identical_entries,
+                comparison.mismatches,
+                comparison.max_abs_diff,
+                comparison.max_abs_index,
+                comparison.argmax_index
+            ));
+            let head_exact = position129.token == reference_tokens[0];
+            lines.push(format!(
+                "head reduction: reduced_argmax={} expected={} certified={} exact={}",
+                token_text(position129.token),
+                token_text(reference_tokens[0]),
+                certified.iter().filter(|bit| **bit != 0).count(),
+                head_exact
+            ));
+            lines.push(format!(
+                "head certified: device_mask_entries={} certified={} token={}",
+                certified.len(),
+                certified.iter().filter(|bit| **bit != 0).count(),
+                token_text(position129.token)
+            ));
+        }
+        if !all_match {
+            if let Some(boundary) = reference_boundary.as_ref() {
+                lines.extend(first_layer_difference(
+                    boundary,
+                    &output,
+                    prompt_ids.len().saturating_sub(1),
+                ));
+            }
+            lines.push("HYBRID SEQUENCE token parity: FAIL - a position's hybrid token is not the in-process reference token".to_string());
+            return Err(lines.join(
+                "
+",
+            ));
+        }
+        lines.push(format!(
+            "HYBRID SEQUENCE token parity: PASS - {} compared positions exact; criterion 1 item 2 {}",
+            reference_tokens.len(),
+            if full_claim { "satisfied" } else { "sanity prefix, not a claim" }
+        ));
+        lines.push(format!(
+            "sequence metadata tail: utc_end={} mem_available_after={} total_wall_ms={} exit=0",
+            utc_now(),
+            read_mem_available_bytes().unwrap_or(0),
+            started.elapsed().as_millis()
+        ));
+        return Ok(lines);
+    }
+    let reference_token = reference_tokens[0];
+    let reference_top5 = top5(&reference_logits);
     let token_match = reference_token == output.token;
     lines.push(format!(
         "token comparison: reference_id={} hybrid_id={} exact_equal={} top5_overlap={}",
@@ -1682,9 +2547,14 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         top5_overlap(&reference_top5, &hybrid_top5)
     ));
     if !token_match {
-        lines.extend(first_layer_difference(&reference_boundary, &output));
+        if let Some(boundary) = reference_boundary.as_ref() {
+            lines.extend(first_layer_difference(boundary, &output, 0));
+        }
         lines.push("CHAIN-WIRING token parity: FAIL - the hybrid token id is not the in-process reference token id".to_string());
-        return Err(lines.join("\n"));
+        return Err(lines.join(
+            "
+",
+        ));
     }
     lines.push("CHAIN-WIRING token parity: PASS - the hybrid chain produced the same token id as the in-process reference engine; this is chain-wiring parity, not a device-token claim, and criterion 1 remains OPEN".to_string());
     Ok(lines)
@@ -1715,6 +2585,851 @@ fn bf16_write_difference(actual: &[u8], twin: &[f32]) -> Option<(usize, f32, f32
         }
     }
     None
+}
+
+/// A UTC wall-clock stamp for the sequence metadata, independent of a date library.
+#[cfg(feature = "cuda")]
+fn utc_now() -> String {
+    std::process::Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map_or_else(
+            || {
+                format!(
+                    "unix:{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |elapsed| elapsed.as_secs())
+                )
+            },
+            |output| String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        )
+}
+
+/// The node hostname for the sequence metadata.
+#[cfg(feature = "cuda")]
+fn host_name() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map_or_else(|_| "unknown".to_string(), |name| name.trim().to_string())
+}
+
+/// The positions a sequence comparison reports: the last prefill token plus every decode
+/// position for a claim, or every prompt position for a prefix sanity run. A missing hybrid token
+/// still gets a row, so a short capture is visible instead of being silently compared.
+#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda")]
+fn diag_checksum_f32(values: &[f32]) -> u64 {
+    values.iter().fold(0u64, |acc, value| {
+        acc.rotate_left(5) ^ value.to_bits() as u64
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn diag_checksum_bytes(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .fold(0u64, |acc, value| acc.rotate_left(5) ^ *value as u64)
+}
+
+#[cfg(feature = "cuda")]
+fn diag_ids_text(ids: &[usize], cap: usize) -> String {
+    let shown: Vec<String> = ids
+        .iter()
+        .take(cap)
+        .map(|id| {
+            if *id == usize::MAX {
+                "NO".to_string()
+            } else {
+                id.to_string()
+            }
+        })
+        .collect();
+    if ids.len() > cap {
+        format!("[{},...{}]", shown.join(","), ids.len())
+    } else {
+        format!("[{}]", shown.join(","))
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn diag_stage_compare(device: &[f32], host: &[f32]) -> (usize, f32) {
+    let mut mismatches = 0usize;
+    let mut max_abs = 0f32;
+    for (device, host) in device.iter().zip(host.iter()) {
+        let diff = (device - host).abs();
+        if diff > max_abs {
+            max_abs = diff;
+        }
+        if sparkflash_kernels::m4_quant::bf16_bits(*device)
+            != sparkflash_kernels::m4_quant::bf16_bits(*host)
+        {
+            mismatches += 1;
+        }
+    }
+    (mismatches, max_abs)
+}
+
+#[cfg(feature = "cuda")]
+fn diag_boundary_row<'a>(
+    boundaries: &'a [sparkflash_engine::forward::boundary::BoundaryTable],
+    position: usize,
+    layer: usize,
+    name: &str,
+    width: usize,
+) -> Option<&'a [f32]> {
+    let values = boundaries
+        .get(position)?
+        .row(layer)?
+        .tensor(name)?
+        .data()
+        .as_f32()?;
+    if values.len() == width {
+        Some(values)
+    } else if width != 0
+        && values.len().is_multiple_of(width)
+        && (position + 1) * width <= values.len()
+    {
+        Some(&values[position * width..(position + 1) * width])
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn diag_bf16(value: f32) -> f32 {
+    f32::from_bits((sparkflash_kernels::m4_quant::bf16_bits(value) as u32) << 16)
+}
+
+#[cfg(feature = "cuda")]
+fn read_rss_kib() -> u64 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// The b56 follow-up: the fed-token/prediction alignment table and the per-position, per-layer
+/// residual twin. The reference boundary is token-major, so for prefix position + 1 the hybrid
+/// position's residual row is position; this slices it before comparing instead of treating the
+/// whole multi-position tensor as the hybrid's single row.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn sequence_alignment_and_residual_lines(
+    reference_tokens: &[Option<u32>],
+    reference_top5s: &[Vec<(u32, f32)>],
+    reference_boundaries: &[sparkflash_engine::forward::boundary::BoundaryTable],
+    reference_attention_records: &[Vec<
+        sparkflash_engine::forward::attention_case::AttentionCaseRecord,
+    >],
+    reference_head_inputs: &[Vec<f32>],
+    router_records: &[crate::moe_device::RouterTwinRecord],
+    diag_latent_raw: Option<&[f32]>,
+    diag_q_raw: Option<&[f32]>,
+    diag_wq_b_input: Option<&[f32]>,
+    diag_wkv_raw: Option<&[f32]>,
+    diag_window_codes: Option<&[u8]>,
+    wq_b_kernel: Option<(usize, usize, f32)>,
+    checkpoint: &std::path::Path,
+    limit: usize,
+    prompt_ids: &[u32],
+    sequence_outputs: &[sparkflash_engine::forward::HybridTokenOutput],
+    config: &sparkflash_engine::config::ModelConfig,
+    operand_traces: &[crate::attention_device::AttentionOperandTrace],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let n = prompt_ids.len().min(3);
+    for (position, prompt_id) in prompt_ids.iter().take(n).enumerate() {
+        if let Some(output) = sequence_outputs.get(position) {
+            let top = top5(&output.logits);
+            lines.push(format!(
+                "alignment: position={} hybrid fed_token={} predicted_top1={} logit_max={:.9} top5=[{}]",
+                position,
+                prompt_id,
+                token_text(output.token),
+                top.first().map_or(f32::NAN, |(_, value)| *value),
+                format_top5(&top)
+            ));
+        }
+        if let (Some(predicted), Some(top)) = (
+            reference_tokens.get(position).copied().flatten(),
+            reference_top5s.get(position),
+        ) {
+            lines.push(format!(
+                "alignment: position={} reference fed_token={} predicted_top1={} logit_max={:.9} top5=[{}]",
+                position,
+                prompt_id,
+                predicted,
+                top.first().map_or(f32::NAN, |(_, value)| *value),
+                format_top5(top)
+            ));
+        }
+    }
+    for position in 0..n {
+        let Some(output) = sequence_outputs.get(position) else {
+            continue;
+        };
+        let Some(host) = reference_head_inputs.get(position) else {
+            lines.push(format!(
+                "head-input twin: position={position} no reference head input captured"
+            ));
+            continue;
+        };
+        if output.head_input.len() != host.len() {
+            lines.push(format!(
+                "head-input twin: position={position} device width {} reference width {}",
+                output.head_input.len(),
+                host.len()
+            ));
+            continue;
+        }
+        let (mismatches, max_abs) = diag_stage_compare(&output.head_input, host);
+        let blocks = 8usize;
+        let mut block_max = vec![0f32; blocks];
+        for (index, (device_value, host_value)) in
+            output.head_input.iter().zip(host.iter()).enumerate()
+        {
+            let block = index * blocks / host.len().max(1);
+            block_max[block] = block_max[block].max((device_value - host_value).abs());
+        }
+        let block_text: Vec<String> = block_max
+            .iter()
+            .map(|value| format!("{value:.6e}"))
+            .collect();
+        lines.push(format!(
+            "head-input twin: position={position} bf16_mismatches={mismatches}/{} max_abs_diff={max_abs:.6e} per_block_max_abs=[{}]",
+            host.len(),
+            block_text.join(",")
+        ));
+    }
+    let width = config.hc_width();
+    if let Ok(source) = sparkflash_engine::safetensors::SafeTensorsSource::open(
+        checkpoint,
+        &checkpoint.join("model.safetensors.index.json"),
+    ) {
+        use sparkflash_engine::weights::WeightSource as _;
+        let mut first_set_flip: Option<usize> = None;
+        for record in router_records {
+            let Some(input) = diag_boundary_row(
+                reference_boundaries,
+                0,
+                record.layer,
+                sparkflash_engine::forward::boundary::PRE_FFN_HIDDEN,
+                config.dim,
+            ) else {
+                continue;
+            };
+            let gate_name = format!("layers.{}.ffn.gate.weight", record.layer);
+            let bias_name = format!("layers.{}.ffn.gate.bias", record.layer);
+            let Ok(gate_raw) = source.read(&gate_name) else {
+                continue;
+            };
+            let Ok(bias_raw) = source.read(&bias_name) else {
+                continue;
+            };
+            let gate = decode_bf16(&gate_raw);
+            let bias: Vec<f32> = bias_raw
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_bits(u32::from_le_bytes(*chunk)))
+                .collect();
+            let params = sparkflash_kernels::router_ref::RouterParams {
+                hidden: config.dim,
+                n_routed: config.n_routed_experts,
+                top_k: config.n_activated_experts,
+                gate_temp: config.gate_temp as f32,
+                norm_eps: config.norm_eps as f32,
+                scale: config.route_scale as f32,
+                norm_topk_prob: config.norm_topk_prob,
+            };
+            let bf16_input: Vec<f32> = input.iter().map(|value| diag_bf16(*value)).collect();
+            let Ok(reference) =
+                sparkflash_kernels::router_ref::route_f32(input, &gate, &bias, params)
+            else {
+                continue;
+            };
+            let Ok(bf16_control) =
+                sparkflash_kernels::router_ref::route_f32(&bf16_input, &gate, &bias, params)
+            else {
+                continue;
+            };
+            let mut device_set = record.ids.clone();
+            device_set.sort_unstable();
+            let mut reference_set = reference.ids.clone();
+            reference_set.sort_unstable();
+            let mut bf16_set = bf16_control.ids.clone();
+            bf16_set.sort_unstable();
+            let ordered_equal = record.ids == reference.ids;
+            let same_set = device_set == reference_set;
+            let bf16_same_set = reference_set == bf16_set;
+            let bf16_matches_device_set = device_set == bf16_set;
+            let score_delta = record
+                .scores
+                .iter()
+                .zip(reference.scores.iter())
+                .map(|(device, host)| (device - host).abs())
+                .fold(0.0f32, finite_max);
+            if first_set_flip.is_none() && !same_set {
+                first_set_flip = Some(record.layer);
+            }
+            if matches!(record.layer, 0 | 1 | 14) || !same_set {
+                lines.push(format!(
+                    "router twin: position=0 layer={} device_ids={:?} reference_ids={:?} ordered_equal={} same_set={} scores_max_abs={:.6e} bf16_control_ids={:?} bf16_control_same_set={} bf16_control_matches_device_set={}",
+                    record.layer,
+                    record.ids,
+                    reference.ids,
+                    ordered_equal,
+                    same_set,
+                    score_delta,
+                    bf16_control.ids,
+                    bf16_same_set,
+                    bf16_matches_device_set
+                ));
+            }
+        }
+        lines.push(match first_set_flip {
+            Some(layer) => format!(
+                "router twin: first_set_flip_layer={layer} (ordered-only differences before it are not semantic)"
+            ),
+            None => "router twin: first_set_flip_layer=none".to_string(),
+        });
+    }
+    // The deferred chain's hybrid layer output is the post-attention X, not the reference's
+    // after-FFN residual. Compare the declared stage on each side explicitly.
+    for position in 0..n {
+        let Some(output) = sequence_outputs.get(position) else {
+            continue;
+        };
+        let Some(first) = output.layers.first() else {
+            continue;
+        };
+        let Some(post) = diag_boundary_row(
+            reference_boundaries,
+            position,
+            0,
+            sparkflash_engine::forward::boundary::POST_ATTENTION_HIDDEN,
+            width,
+        ) else {
+            continue;
+        };
+        if first.post_attention_x.len() == post.len() {
+            let (mismatches, max_abs) = diag_stage_compare(&first.post_attention_x, post);
+            lines.push(format!(
+                "stage twin: position={position} (a) post-attention hidden layer=0 bf16_mismatches={mismatches}/{} max_abs_diff={max_abs:.6e}",
+                post.len()
+            ));
+        }
+        if let Some(ffn) = diag_boundary_row(
+            reference_boundaries,
+            position,
+            0,
+            sparkflash_engine::forward::boundary::FFN_OUT,
+            config.dim,
+        ) && first.ffn_out.len() == ffn.len()
+        {
+            let (mismatches, max_abs) = diag_stage_compare(&first.ffn_out, ffn);
+            lines.push(format!(
+                "stage twin: position={position} (c) host FFN output Y layer=0 bf16_mismatches={mismatches}/{} max_abs_diff={max_abs:.6e}",
+                ffn.len()
+            ));
+        }
+        if let Some(after_ffn) = diag_boundary_row(
+            reference_boundaries,
+            position,
+            0,
+            sparkflash_engine::forward::boundary::RESIDUAL_OUT,
+            width,
+        ) && let Some(second) = output.layers.get(1)
+            && second.entry_input_x.len() == after_ffn.len()
+        {
+            let (mismatches, max_abs) = diag_stage_compare(&second.entry_input_x, after_ffn);
+            lines.push(format!(
+                "stage twin: position={position} (d) deferred residual_out(0) vs layer-1 entry bf16_mismatches={mismatches}/{} max_abs_diff={max_abs:.6e}",
+                after_ffn.len()
+            ));
+        }
+        if output.layers.get(1).is_some()
+            && let Some(after_ffn_1) = diag_boundary_row(
+                reference_boundaries,
+                position,
+                1,
+                sparkflash_engine::forward::boundary::RESIDUAL_OUT,
+                width,
+            )
+            && let Some(third) = output.layers.get(2)
+            && third.entry_input_x.len() == after_ffn_1.len()
+        {
+            let (mismatches, max_abs) = diag_stage_compare(&third.entry_input_x, after_ffn_1);
+            lines.push(format!(
+                "stage twin: position={position} (d2) deferred residual_out(1) vs layer-2 entry bf16_mismatches={mismatches}/{} max_abs_diff={max_abs:.6e}",
+                after_ffn_1.len()
+            ));
+        }
+        if let Some(last) = output.layers.last()
+            && let Some(after_ffn) = diag_boundary_row(
+                reference_boundaries,
+                position,
+                last.layer,
+                sparkflash_engine::forward::boundary::RESIDUAL_OUT,
+                width,
+            )
+            && last.residual_out.len() == after_ffn.len()
+        {
+            let (mismatches, max_abs) = diag_stage_compare(&last.residual_out, after_ffn);
+            lines.push(format!(
+                "stage twin: position={position} (e) layer-39 host epilogue residual bf16_mismatches={mismatches}/{} max_abs_diff={max_abs:.6e}",
+                after_ffn.len()
+            ));
+        }
+    }
+    let mut first: Option<(usize, usize)> = None;
+    for position in 0..n {
+        let Some(boundary) = reference_boundaries.get(position) else {
+            lines.push(format!(
+                "residual twin: position={position} no reference boundary captured"
+            ));
+            continue;
+        };
+        let Some(output) = sequence_outputs.get(position) else {
+            continue;
+        };
+        for layer in 0..config.n_layers {
+            let Some(row) = boundary.row(layer) else {
+                continue;
+            };
+            let reference_name = if layer + 1 < config.n_layers {
+                sparkflash_engine::forward::boundary::POST_ATTENTION_HIDDEN
+            } else {
+                sparkflash_engine::forward::boundary::RESIDUAL_OUT
+            };
+            let Some(tensor) = row.tensor(reference_name) else {
+                continue;
+            };
+            let Some(values) = tensor.data().as_f32() else {
+                continue;
+            };
+            let expected = if values.len() == width {
+                Some(values)
+            } else if width != 0
+                && values.len().is_multiple_of(width)
+                && (position + 1) * width <= values.len()
+            {
+                Some(&values[position * width..(position + 1) * width])
+            } else {
+                None
+            };
+            let Some(expected) = expected else {
+                lines.push(format!(
+                    "residual twin: position={position} layer={layer} reference tensor has {} values, not rows of {width}",
+                    values.len()
+                ));
+                continue;
+            };
+            let Some(trace) = output.layers.iter().find(|trace| trace.layer == layer) else {
+                continue;
+            };
+            if trace.residual_out.len() != expected.len() {
+                lines.push(format!(
+                    "residual twin: position={position} layer={layer} hybrid row has {} values, reference row {}",
+                    trace.residual_out.len(),
+                    expected.len()
+                ));
+                continue;
+            }
+            let mut mismatches = 0usize;
+            let mut max_abs = 0f32;
+            for (device, host) in trace.residual_out.iter().zip(expected.iter()) {
+                let diff = (device - host).abs();
+                if diff > max_abs {
+                    max_abs = diff;
+                }
+                if sparkflash_kernels::m4_quant::bf16_bits(*device)
+                    != sparkflash_kernels::m4_quant::bf16_bits(*host)
+                {
+                    mismatches += 1;
+                }
+            }
+            lines.push(format!(
+                "residual twin (stage-aligned): position={position} layer={layer} bf16_mismatches={mismatches}/{} max_abs_diff={max_abs:.6e}",
+                expected.len()
+            ));
+            if first.is_none() && mismatches > 0 {
+                first = Some((position, layer));
+            }
+        }
+    }
+    if let Some((position, layer)) = first {
+        lines.push(format!(
+            "residual first divergence: position={position} layer={layer}; operand comparison follows"
+        ));
+        let device = operand_traces
+            .iter()
+            .find(|trace| trace.position == position && trace.layer == layer);
+        let host = reference_attention_records
+            .get(position)
+            .and_then(|records| records.iter().find(|record| record.layer == layer));
+        match (device, host) {
+            (Some(device), Some(host)) => {
+                lines.push(format!(
+                    "operand q: device first={:.9} last={:.9} checksum={:016x} | host first={:.9} last={:.9} checksum={:016x}",
+                    device.q_first,
+                    device.q_last,
+                    device.q_checksum,
+                    host.q.first().copied().unwrap_or(0.0),
+                    host.q.last().copied().unwrap_or(0.0),
+                    diag_checksum_f32(&host.q)
+                ));
+                lines.push(format!(
+                    "operand sink: device first={:.9} last={:.9} checksum={:016x} | host first={:.9} last={:.9} checksum={:016x}",
+                    device.sink_first,
+                    device.sink_last,
+                    device.sink_checksum,
+                    host.sink.first().copied().unwrap_or(0.0),
+                    host.sink.last().copied().unwrap_or(0.0),
+                    diag_checksum_f32(&host.sink)
+                ));
+                lines.push(format!(
+                    "operand ids: device window_count={} selected_count={} compressed_count={} ratio={} window={} selected={} | host window_ids={} compressed_ids={} compressed_rows={} ratio={} window_ids={} compressed_ids={}",
+                    device.window_ids.len(),
+                    device.selected.len(),
+                    device.compressed_count,
+                    device.ratio,
+                    diag_ids_text(&device.window_ids, 6),
+                    diag_ids_text(&device.selected, 6),
+                    host.window_ids.len(),
+                    host.compressed_ids.len(),
+                    host.compressed_rows,
+                    host.ratio,
+                    diag_ids_text(&host.window_ids, 6),
+                    diag_ids_text(&host.compressed_ids, 6)
+                ));
+                let host_first = if host.window_rows == 0 {
+                    0
+                } else {
+                    sparkflash_kernels::cuda_harness::engine_window_row(
+                        &host.window_kv[..host.head_dim.min(host.window_kv.len())],
+                    )
+                    .map_or(0, |window| {
+                        diag_checksum_bytes(&window.codes[..window.codes.len().min(512)])
+                    })
+                };
+                let host_last = if host.window_rows == 0 {
+                    0
+                } else {
+                    let row = host.window_rows - 1;
+                    let start = row * host.head_dim;
+                    let end = (start + host.head_dim).min(host.window_kv.len());
+                    sparkflash_kernels::cuda_harness::engine_window_row(&host.window_kv[start..end])
+                        .map_or(0, |window| {
+                            diag_checksum_bytes(&window.codes[..window.codes.len().min(512)])
+                        })
+                };
+                lines.push(format!(
+                    "operand window-codes: device len={} first_checksum={:016x} last_checksum={:016x} compressed_code_bytes={} | host quantised first_checksum={:016x} last_checksum={:016x}",
+                    device.window_codes_len,
+                    device.window_first_checksum,
+                    device.window_last_checksum,
+                    device.compressed_codes_len,
+                    host_first,
+                    host_last
+                ));
+                // Stage-aligned projection twin: the host pre-attention row is the reference
+                // boundary's row for this position, and the probe reproduces the host projection
+                // stages on that exact row. Raw wq_a/wq_b/wkv are compared before q_norm/RoPE, the
+                // q the body consumed is compared as BF16, and the window-row quantiser is compared
+                // on the host row it quantised.
+                let host_pre = reference_boundaries
+                    .get(position)
+                    .and_then(|boundary| boundary.row(layer))
+                    .and_then(|row| {
+                        row.tensor(
+                            sparkflash_engine::forward::boundary::PRE_ATTENTION_HIDDEN,
+                        )
+                    })
+                    .and_then(|tensor| tensor.data().as_f32())
+                    .and_then(|values| {
+                        let width = config.dim;
+                        if width != 0
+                            && values.len().is_multiple_of(width)
+                            && (position + 1) * width <= values.len()
+                        {
+                            Some(&values[position * width..(position + 1) * width])
+                        } else {
+                            None
+                        }
+                    });
+                if let (Some(host_pre), Some(trace)) = (
+                    host_pre,
+                    sequence_outputs
+                        .get(position)
+                        .and_then(|output| output.layers.iter().find(|trace| trace.layer == layer)),
+                ) {
+                    let (mismatches, max_abs) =
+                        diag_stage_compare(&trace.pre_attention_hidden, host_pre);
+                    lines.push(format!(
+                        "operand pre-attention: device vs host bf16_mismatches={mismatches}/{} max_abs_diff={max_abs:.6e}",
+                        host_pre.len()
+                    ));
+                    let source = sparkflash_engine::safetensors::SafeTensorsSource::open(
+                        checkpoint,
+                        &checkpoint.join("model.safetensors.index.json"),
+                    );
+                    if let Ok(source) = source {
+                        let prefix = format!("layers.{layer}");
+                        match sparkflash_engine::forward::attention::attention_projection_probe(
+                            config,
+                            layer,
+                            &prefix,
+                            host_pre,
+                            position,
+                            &source,
+                            limit,
+                        ) {
+                            Ok(probe) => {
+                                let mut stage = |name: &str, device: Option<&[f32]>, host: &[f32]| {
+                                    if let Some(device) = device
+                                        && device.len() == host.len()
+                                    {
+                                        let (mismatches, max_abs) = diag_stage_compare(device, host);
+                                        lines.push(format!(
+                                            "projection {name}: device vs host bf16_mismatches={mismatches}/{} max_abs_diff={max_abs:.6e}",
+                                            host.len()
+                                        ));
+                                    }
+                                };
+                                stage("raw wq_a latent", diag_latent_raw, &probe.latent_raw);
+                                stage("wq_b input latent normed", diag_wq_b_input, &probe.latent_normed);
+                                stage("raw wq_b q pre-RoPE", diag_q_raw, &probe.q_raw);
+                                stage("raw wkv", diag_wkv_raw, &probe.wkv_raw);
+                                if let Some((mismatches, len, max_abs)) = wq_b_kernel {
+                                    lines.push(format!(
+                                        "projection wq_b kernel vs mxfp8_ref: bf16_mismatches={mismatches}/{len} max_abs_diff={max_abs:.6e}"
+                                    ));
+                                }
+                                if let Some(device_input) = diag_wq_b_input {
+                                    use sparkflash_engine::forward::attention::AttentionProjectionBackend as _;
+                                    let mut host_backend =
+                                        sparkflash_engine::forward::attention::HostAttentionProjectionBackend;
+                                    match host_backend.wq_b(
+                                        config,
+                                        layer,
+                                        &format!("layers.{layer}"),
+                                        device_input,
+                                        &source,
+                                        limit,
+                                    ) {
+                                        Ok(host_on_device) => {
+                                            if let Some(device_q) = diag_q_raw
+                                                && device_q.len() == host_on_device.len()
+                                            {
+                                                let (mismatches, max_abs) =
+                                                    diag_stage_compare(device_q, &host_on_device);
+                                                lines.push(format!(
+                                                    "projection wq_b host-on-device-latent: device vs host bf16_mismatches={mismatches}/{} max_abs_diff={max_abs:.6e}",
+                                                    host_on_device.len()
+                                                ));
+                                            }
+                                        }
+                                        Err(error) => lines.push(format!(
+                                            "projection wq_b host-on-device-latent failed: {error}"
+                                        )),
+                                    }
+                                }
+                                let (q_mismatches, q_max_abs) =
+                                    diag_stage_compare(&device.q_values, &probe.q_rot);
+                                let expected_quant = probe
+                                    .q_rot
+                                    .iter()
+                                    .map(|value| (diag_bf16(*value) - *value).abs())
+                                    .fold(0f32, f32::max);
+                                lines.push(format!(
+                                    "projection q staged BF16: device vs host bf16_mismatches={q_mismatches}/{} max_abs_diff={q_max_abs:.6e} expected_bf16_quant_delta={expected_quant:.6e}",
+                                    probe.q_rot.len()
+                                ));
+                                if let Some(codes) = diag_window_codes {
+                                    match sparkflash_kernels::cuda_harness::engine_window_row(
+                                        &probe.window_kv[..config.head_dim.min(probe.window_kv.len())],
+                                    ) {
+                                        Ok(window) => {
+                                            let equal = codes == window.codes.as_slice();
+                                            lines.push(format!(
+                                                "projection window-row quantiser: device_codes_len={} host_codes_len={} byte_equal={} device_checksum={:016x} host_checksum={:016x}",
+                                                codes.len(),
+                                                window.codes.len(),
+                                                equal,
+                                                diag_checksum_bytes(codes),
+                                                diag_checksum_bytes(&window.codes)
+                                            ));
+                                        }
+                                        Err(detail) => lines.push(format!(
+                                            "projection window-row quantiser: host engine_window_row failed: {detail}"
+                                        )),
+                                    }
+                                }
+                            }
+                            Err(error) => lines.push(format!(
+                                "projection host probe failed: {error}"
+                            )),
+                        }
+                    } else if let Err(error) = source {
+                        lines.push(format!("projection host source failed: {error}"));
+                    }
+                }
+            }
+            (Some(_), None) => lines.push(format!(
+                "operand comparison position={position} layer={layer}: no host attention_case record"
+            )),
+            (None, Some(_)) => lines.push(format!(
+                "operand comparison position={position} layer={layer}: no device operand trace"
+            )),
+            (None, None) => lines.push(format!(
+                "operand comparison position={position} layer={layer}: neither trace present"
+            )),
+        }
+    }
+    lines
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn sequence_comparison_rows(
+    reference: &[Option<u32>],
+    hybrid: &[Option<u32>],
+    prompt_len: usize,
+    full_claim: bool,
+) -> Vec<(usize, Option<u32>, Option<u32>, bool)> {
+    let count = reference.len().max(hybrid.len());
+    let mut rows = Vec::with_capacity(count);
+    for index in 0..count {
+        let position = if full_claim {
+            if index == 0 {
+                prompt_len.saturating_sub(1)
+            } else {
+                prompt_len + index - 1
+            }
+        } else {
+            index
+        };
+        let expected = reference.get(index).copied().flatten();
+        let found = hybrid.get(index).copied().flatten();
+        rows.push((position, expected, found, expected == found));
+    }
+    rows
+}
+
+/// The largest `count` logits, descending by value and then ascending by id. It is [top5]'s
+/// ordering with a parameter, used only by the logits dump.
+#[cfg(feature = "cuda")]
+fn top_logits(logits: &[f32], count: usize) -> Vec<(u32, f32)> {
+    let mut indices: Vec<usize> = (0..logits.len()).collect();
+    indices.sort_by(|left, right| {
+        logits[*right]
+            .total_cmp(&logits[*left])
+            .then_with(|| left.cmp(right))
+    });
+    indices
+        .into_iter()
+        .take(count)
+        .map(|index| (index as u32, logits[index]))
+        .collect()
+}
+
+/// Writes the vLLM numeric-comparison dump for the compared sequence positions.
+///
+/// `<path>` receives one JSON object per line: position, the device head's argmax token id, the
+/// argmax of the dumped logits, the reference/fixture token ids where they exist, the vocabulary
+/// size, the byte offset of this position's block in the sidecar, and the top-20 (token_id, logit)
+/// pairs. `<path>.bin` receives the full vocabulary logits as little-endian f32 blocks in the same
+/// position order, so the comparison can rebuild any screened/masked set.
+///
+/// The rows are the rows the token table already compared: position 129 then the decode
+/// positions for a full claim, else positions 0.. for a short run. The dump changes no arithmetic
+/// and writes no stdout line; the returned count is the number of positions written.
+///
+/// # Errors
+/// A path that cannot be created/written, or a JSON serialisation failure.
+#[cfg(feature = "cuda")]
+fn write_logits_dump(
+    path: &std::path::Path,
+    rows: &[(usize, Option<u32>, Option<u32>, bool)],
+    outputs: &[sparkflash_engine::forward::HybridTokenOutput],
+    first_output: usize,
+    full_claim: bool,
+    fixture_steps: &[Option<u32>],
+    prompt_len: usize,
+) -> Result<usize, String> {
+    use std::io::Write;
+
+    let mut bin_path = path.as_os_str().to_owned();
+    bin_path.push(".bin");
+    let bin_path = std::path::PathBuf::from(bin_path);
+    let text_file = std::fs::File::create(path)
+        .map_err(|error| format!("logits dump {}: {error}", path.display()))?;
+    let bin_file = std::fs::File::create(&bin_path)
+        .map_err(|error| format!("logits dump {}: {error}", bin_path.display()))?;
+    let mut text = std::io::BufWriter::new(text_file);
+    let mut bin = std::io::BufWriter::new(bin_file);
+    let mut written = 0usize;
+    let mut offset = 0usize;
+    for (row, (position, reference, hybrid, exact)) in rows.iter().enumerate() {
+        let Some(output) = outputs.get(first_output + row) else {
+            continue;
+        };
+        let logits = &output.logits;
+        if logits.is_empty() {
+            continue;
+        }
+        let mut argmax = 0usize;
+        for (index, value) in logits.iter().enumerate() {
+            if value.total_cmp(&logits[argmax]).is_gt() {
+                argmax = index;
+            }
+        }
+        let mut block = Vec::with_capacity(logits.len() * 4);
+        for value in logits {
+            block.extend_from_slice(&value.to_le_bytes());
+        }
+        bin.write_all(&block)
+            .map_err(|error| format!("logits dump {}: {error}", bin_path.display()))?;
+        let fixture_index = position.saturating_sub(prompt_len.saturating_sub(1));
+        let fixture_id = if full_claim {
+            fixture_steps.get(fixture_index).copied().flatten()
+        } else {
+            None
+        };
+        let top: Vec<serde_json::Value> = top_logits(logits, 20)
+            .into_iter()
+            .map(|(id, value)| serde_json::json!([id, f64::from(value)]))
+            .collect();
+        let object = serde_json::json!({
+            "position": position,
+            "device_argmax": output.token,
+            "logits_argmax": u32::try_from(argmax).unwrap_or(u32::MAX),
+            "reference_id": reference,
+            "hybrid_id": hybrid,
+            "fixture_id": fixture_id,
+            "exact_token_equal": exact,
+            "vocab": logits.len(),
+            "logits_offset": offset,
+            "logits_bin": bin_path.display().to_string(),
+            "top20": top,
+        });
+        writeln!(text, "{object}")
+            .map_err(|error| format!("logits dump {}: {error}", path.display()))?;
+        offset += logits.len() * 4;
+        written += 1;
+    }
+    text.flush()
+        .map_err(|error| format!("logits dump {}: {error}", path.display()))?;
+    bin.flush()
+        .map_err(|error| format!("logits dump {}: {error}", bin_path.display()))?;
+    Ok(written)
 }
 
 /// The five largest logits, descending by value and then ascending by index.
@@ -1758,6 +3473,7 @@ fn top5_overlap(reference: &[(u32, f32)], hybrid: &[(u32, f32)]) -> usize {
 fn first_layer_difference(
     reference: &sparkflash_engine::forward::boundary::BoundaryTable,
     hybrid: &sparkflash_engine::forward::HybridTokenOutput,
+    position: usize,
 ) -> Vec<String> {
     for trace in &hybrid.layers {
         let Some(row) = reference.row(trace.layer) else {
@@ -1766,28 +3482,40 @@ fn first_layer_difference(
                 trace.layer
             )];
         };
-        let Some(tensor) = row.tensor(sparkflash_engine::forward::boundary::RESIDUAL_OUT) else {
+        let reference_name = if trace.layer + 1 < hybrid.layers.len() {
+            sparkflash_engine::forward::boundary::POST_ATTENTION_HIDDEN
+        } else {
+            sparkflash_engine::forward::boundary::RESIDUAL_OUT
+        };
+        let Some(tensor) = row.tensor(reference_name) else {
             return vec![format!(
-                "first differing layer: layer {} has no reference residual_out",
+                "first differing layer: layer {} has no reference {reference_name}",
                 trace.layer
             )];
         };
         let Some(values) = tensor.data().as_f32() else {
             continue;
         };
-        if values.len() != trace.residual_out.len() {
+        let width = trace.residual_out.len();
+        let values = if values.len() == width {
+            values
+        } else if width != 0
+            && values.len().is_multiple_of(width)
+            && (position + 1) * width <= values.len()
+        {
+            &values[position * width..(position + 1) * width]
+        } else {
             return vec![format!(
-                "first differing layer: layer {} residual_out lengths differ ({} vs {})",
+                "first differing layer: layer {} reference residual tensor has {} values, not rows of {width}",
                 trace.layer,
-                values.len(),
-                trace.residual_out.len()
+                values.len()
             )];
-        }
+        };
         let max_abs = max_abs_delta(values, &trace.residual_out);
         if max_abs > 0.0 {
             return vec![format!(
-                "first differing layer (best effort): layer {} residual_out max_abs_delta={:.6e}; this includes the BF16 staging seam and any device-entry delta",
-                trace.layer, max_abs
+                "first differing layer (best effort, stage-aligned): layer {} {} max_abs_delta={:.6e}; this includes the BF16 staging seam and any device-entry delta",
+                trace.layer, reference_name, max_abs
             )];
         }
     }
@@ -1803,7 +3531,7 @@ fn run_stage_lines(args: &[&str]) -> Result<Vec<String>, String> {
     use sparkflash_engine::safetensors::SafeTensorsSource;
 
     let (stage, args) = stage_args(args)?;
-    if stage == "hybrid_token" {
+    if stage == "hybrid_token" || stage == "hybrid_sequence" {
         return run_hybrid_lines(&args);
     }
     let source = SafeTensorsSource::open(
@@ -2125,7 +3853,7 @@ mod tests {
             text.contains("crates/sparkflash-kernels/baseline/kernel_baseline.txt"),
             "the catalog names the repository path, not a crate-relative one"
         );
-        assert!(text.contains("9 required for the device path"));
+        assert!(text.contains("11 required for the device path"));
         // STEP -> LAYER -> TAIL, and the tail's own order, by position in the printed stage map.
         // Presence alone cannot catch a map that prints the groups out of order.
         let map_line = |prefix: &str| {
@@ -2295,6 +4023,13 @@ mod tests {
             element_limit: None,
             moe_preflight: false,
             moe_layer0_diagnose: false,
+            fixture: None,
+            prompt_tokens: 1,
+            decode_steps: 0,
+            time_budget_s: 3600,
+            sequence: false,
+            reference_check: false,
+            dump_logits: None,
         };
         assert_eq!(
             layer_zero_element_limit(&default_args),
@@ -2345,6 +4080,123 @@ mod tests {
         ])
         .expect_err("hybrid_token is position 0 only");
         assert!(error.contains("position 0 only"), "{error}");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_hybrid_sequence_arm_parses_its_own_shape() {
+        let (stage, args) = stage_args(&[
+            "hybrid_sequence",
+            "--checkpoint",
+            "/checkpoint",
+            "--cubin-dir",
+            "/cubins",
+            "--fixture",
+            "/fixture.json",
+            "--prompt-tokens",
+            "3",
+            "--decode-steps",
+            "0",
+            "--time-budget-s",
+            "120",
+            "--dump-logits",
+            "/tmp/hybrid-logits.jsonl",
+        ])
+        .expect("hybrid_sequence arguments");
+        assert_eq!(stage, "hybrid_sequence");
+        assert!(args.sequence);
+        assert_eq!(args.prompt_tokens, 3);
+        assert_eq!(args.decode_steps, 0);
+        assert_eq!(args.time_budget_s, 120);
+        assert_eq!(
+            args.dump_logits,
+            Some(std::path::PathBuf::from("/tmp/hybrid-logits.jsonl"))
+        );
+        let error = stage_args(&[
+            "hybrid_token",
+            "--checkpoint",
+            "/checkpoint",
+            "--cubin-dir",
+            "/cubins",
+            "--dump-logits",
+            "/tmp/hybrid-logits.jsonl",
+        ])
+        .expect_err("the dump is wired into hybrid_sequence only");
+        assert!(error.contains("only wired into hybrid_sequence"), "{error}");
+        let error = stage_args(&[
+            "hybrid_sequence",
+            "--checkpoint",
+            "/checkpoint",
+            "--cubin-dir",
+            "/cubins",
+            "--prompt-tokens",
+            "0",
+        ])
+        .expect_err("zero prompt tokens");
+        assert!(error.contains("at least 1"), "{error}");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_logits_dump_is_one_jsonl_object_and_one_le_f32_block_per_position() {
+        use sparkflash_engine::forward::HybridTokenOutput;
+
+        let output = |logits: Vec<f32>, token: u32| HybridTokenOutput {
+            layers: Vec::new(),
+            tail_stages: Vec::new(),
+            head_input: Vec::new(),
+            logits,
+            token: Some(token),
+            certified_mask: None,
+        };
+        let outputs = vec![
+            output(vec![0.5, -1.0, 3.25, 2.0], 2),
+            output(vec![9.0, 0.0], 0),
+        ];
+        let rows = vec![
+            (129usize, Some(3), Some(2), false),
+            (130, Some(0), Some(0), true),
+        ];
+        let fixture_steps = vec![Some(7), Some(0)];
+        let path = std::env::temp_dir().join(format!(
+            "sparkflash-logits-dump-test-{}.jsonl",
+            std::process::id()
+        ));
+        // The full 130-prompt claim starts the token table at position 129 = prompt_len - 1.
+        let written = write_logits_dump(&path, &rows, &outputs, 0, true, &fixture_steps, 130)
+            .expect("the dump writes");
+        assert_eq!(written, 2);
+        let text = std::fs::read_to_string(&path).expect("the jsonl reads back");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON line 1");
+        assert_eq!(first["position"], 129);
+        assert_eq!(first["device_argmax"], 2);
+        assert_eq!(first["logits_argmax"], 2);
+        assert_eq!(first["reference_id"], 3);
+        assert_eq!(first["fixture_id"], 7);
+        assert_eq!(first["vocab"], 4);
+        assert_eq!(first["logits_offset"], 0);
+        let top = first["top20"].as_array().expect("top20 is an array");
+        assert_eq!(top.len(), 4);
+        assert_eq!(top[0], serde_json::json!([2, 3.25]));
+        assert_eq!(top[1], serde_json::json!([3, 2.0]));
+        let second: serde_json::Value = serde_json::from_str(lines[1]).expect("valid JSON line 2");
+        assert_eq!(second["position"], 130);
+        assert_eq!(second["logits_offset"], 16);
+        assert_eq!(second["fixture_id"], 0);
+        let bin = std::fs::read(format!("{}.bin", path.display())).expect("the f32 sidecar reads");
+        assert_eq!(bin.len(), (4 + 2) * 4);
+        assert_eq!(
+            f32::from_le_bytes(bin[0..4].try_into().expect("four bytes")),
+            0.5
+        );
+        assert_eq!(
+            f32::from_le_bytes(bin[16..20].try_into().expect("four bytes")),
+            9.0
+        );
+        std::fs::remove_file(&path).expect("the jsonl is removable");
+        std::fs::remove_file(format!("{}.bin", path.display())).expect("the sidecar is removable");
     }
 
     #[cfg(feature = "cuda")]
@@ -2567,8 +4419,8 @@ mod tests {
 
     #[test]
     fn missing_body_layers_reports_every_layer_whose_body_did_not_launch_once() {
-        assert_eq!(missing_body_layers(&[0, 1, 2], &[1, 0, 2]), vec![1, 2]);
-        assert!(missing_body_layers(&[5, 6], &[1, 1]).is_empty());
+        assert_eq!(missing_body_layers(&[0, 1, 2], &[1, 0, 2], 1), vec![1, 2]);
+        assert!(missing_body_layers(&[5, 6], &[1, 1], 1).is_empty());
     }
 
     /// The chain's two deferred-twin call sites, pinned as source text. A helper-only test did not
@@ -2670,14 +4522,25 @@ mod tests {
 
     #[test]
     fn the_c4a2_seam_line_is_emitted_only_when_every_body_launched_once() {
-        let line = c4a2_seam_line(&[0, 1, 2], &[1, 1, 1], 3).expect("all layers launch once");
+        let line = c4a2_seam_line(&[0, 1, 2], &[1, 1, 1], 3, 1).expect("all layers launch once");
         assert!(
             line.contains("3 layers") && line.contains("6 mHC launches (3 entry + 3 post)"),
             "{line}"
         );
-        let error = c4a2_seam_line(&[0, 1, 2], &[1, 0, 1], 3).expect_err("layer 1 did not launch");
+        let error =
+            c4a2_seam_line(&[0, 1, 2], &[1, 0, 1], 3, 1).expect_err("layer 1 did not launch");
         assert!(error.contains("[1]"), "{error}");
         assert!(error.contains("withheld"), "{error}");
+    }
+
+    #[test]
+    fn the_sequence_seam_accepts_one_body_per_position_and_rejects_a_short_layer() {
+        let line = c4a2_seam_line(&[0, 1], &[3, 3], 2, 3).expect("three positions on both layers");
+        assert!(line.contains("3 times on all 2 layers"), "{line}");
+        assert!(line.contains("10 projection + 6 body launches"), "{line}");
+        let error =
+            c4a2_seam_line(&[0, 1], &[3, 2], 2, 3).expect_err("layer 1 lost a position body");
+        assert!(error.contains("[1]"), "{error}");
     }
 
     #[test]
@@ -2685,7 +4548,7 @@ mod tests {
         let layers: Vec<usize> = (0..40).collect();
         let launches = vec![1; 40];
         let engram_entries = 2;
-        let line = c4a2_seam_line(&layers, &launches, layers.len() + engram_entries)
+        let line = c4a2_seam_line(&layers, &launches, layers.len() + engram_entries, 1)
             .expect("all 40 bodies launch once");
         assert_eq!(
             line,
@@ -2694,5 +4557,31 @@ mod tests {
         );
         let total = 200 + 40 + 82;
         assert_eq!(total, 322);
+    }
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn sequence_comparison_rows_cover_three_prefix_positions() {
+        let reference = vec![Some(10), Some(11), Some(12)];
+        let hybrid = vec![Some(10), Some(11), Some(12)];
+        let rows = sequence_comparison_rows(&reference, &hybrid, 3, false);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].0, 0);
+        assert_eq!(rows[2].0, 2);
+        assert!(rows.iter().all(|row| row.3), "{rows:?}");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn sequence_comparison_rows_cover_the_claim_positions_and_a_short_capture() {
+        let reference = vec![Some(491), Some(367), Some(201)];
+        let hybrid = vec![Some(491), Some(367)];
+        let rows = sequence_comparison_rows(&reference, &hybrid, 130, true);
+        assert_eq!(
+            rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            vec![129, 130, 131]
+        );
+        assert!(rows[0].3);
+        assert!(!rows[2].3);
+        assert_eq!(rows[2].2, None);
     }
 }

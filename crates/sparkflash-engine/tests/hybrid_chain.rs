@@ -323,6 +323,77 @@ fn a_host_controlled_deferred_chain_is_bit_identical_to_reference_prefill() {
     );
 }
 
+#[test]
+fn a_three_position_sequence_step_matches_the_same_reference_prefixes() {
+    // The sanity window runs three deferred steps and compares each position to a fresh reference
+    // prefill of the same prefix. This is the host-controlled shape of that run: the persistent
+    // SequenceState must not leak position 0 into positions 1 and 2, and the same reference must be
+    // the comparison for every position.
+    let mut config = ModelConfig::tiny();
+    config.engram_layer_ids.clear();
+    config.engram_num_embeddings.clear();
+    config.compress_ratios = vec![0; config.n_layers + config.n_mtp_layers];
+    let plan = TensorPlan::language_model(&config);
+    let engine = InferenceEngine::new(
+        config.clone(),
+        Box::new(FiniteSource::from_plan(&plan, 0x5eed)),
+        usize::MAX,
+    )
+    .expect("engine");
+    let provider_source = FiniteSource::from_plan(&plan, 0x5eed);
+    let table =
+        linalg::decode_by_name(&provider_source, "embed.weight", usize::MAX).expect("embed");
+    let tokens = [3u32, 7, 11];
+    let mut reference = Vec::new();
+    for prefix in 1..=tokens.len() {
+        let mut state = SequenceState::new(&config);
+        let observed = engine
+            .prefill(&mut state, &tokens[..prefix])
+            .expect("reference prefix");
+        reference.push(observed.next_token);
+    }
+    let mut hybrid_reference = Vec::new();
+    let mut state = SequenceState::new(&config);
+    let mut provider =
+        |layer: usize, hidden: &[f32], pre_mix: &[f32], deferred: Option<&DeferredHandoff>| {
+            host_deferred_entry(&config, &provider_source, layer, hidden, pre_mix, deferred)
+        };
+    let mut post = |layer: usize, residual: &[f32], attention_out: &[f32], attn_mixes: &Mixes| {
+        host_post(
+            &config,
+            &provider_source,
+            layer,
+            residual,
+            attention_out,
+            attn_mixes,
+        )
+    };
+    let mut progress = |_layer: usize, _host_ms: u64| {};
+    for (position, token) in tokens.iter().copied().enumerate() {
+        let start = token as usize * config.dim;
+        let embedding = table[start..start + config.dim].to_vec();
+        let output = engine
+            .run_hybrid_sequence_step(
+                &mut state,
+                token,
+                &embedding,
+                position,
+                &mut provider,
+                &mut post,
+                None,
+                None,
+                &mut progress,
+            )
+            .expect("hybrid sequence step");
+        hybrid_reference.push(output.token);
+        assert_eq!(state.tokens().len(), position + 1);
+    }
+    assert_eq!(
+        hybrid_reference, reference,
+        "every position must match a fresh reference prefill of the same prefix"
+    );
+}
+
 struct RecordingAttentionBackend {
     inner: HostAttentionProjectionBackend,
     calls: usize,

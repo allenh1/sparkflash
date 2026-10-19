@@ -112,6 +112,134 @@ impl FinishReason {
     }
 }
 
+/// How many alternative logprobs one position reports.
+///
+/// The wire values are the ones vLLM accepts: a non-negative top-k count, or `-1` for the whole
+/// vocabulary. The router resolves the wire integer to this type (and validates it against the
+/// engine's vocabulary size and the server's logprob cap) before an [`EngineRequest`] exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogprobSelection {
+    /// The `n` most likely alternatives. The position's own token is always reported in addition,
+    /// which is why the OpenAI completion object can carry `n + 1` entries.
+    Top(u32),
+    /// The whole vocabulary, in token-id order and unranked: vLLM's `-1`.
+    All,
+}
+
+impl LogprobSelection {
+    /// The number of alternatives a `Top` selection asks the engine to select.
+    #[must_use]
+    pub fn top(self) -> Option<usize> {
+        match self {
+            Self::Top(count) => Some(count as usize),
+            Self::All => None,
+        }
+    }
+}
+
+/// The logprobs one request asks for.
+///
+/// This is the engine side of the OpenAI `logprobs` / `top_logprobs` / `prompt_logprobs` /
+/// `logprob_token_ids` fields; the router resolves and validates the wire values before it builds
+/// this. The default asks for nothing, and an engine that is not asked does no logprob work and
+/// emits no logprob event, so the cost only exists on requests that requested it. Prompt logprobs
+/// are the expensive half for the reference driver (see `sparkflash-cli`'s `serve`: it has no
+/// all-position logit API, so it feeds the prompt token by token to score each position).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogprobsRequest {
+    /// Per generated token: how many alternatives the engine reports, if any.
+    pub sample: Option<LogprobSelection>,
+    /// Per prompt token: how many alternatives the engine reports, if any. Position 0 always
+    /// reports `None` because it has no conditioning token to be scored against.
+    pub prompt: Option<LogprobSelection>,
+    /// Specific vocabulary ids whose logprobs are wanted at every generated position, in request
+    /// order. When non-empty this takes precedence over `sample`'s natural top-k, as vLLM's
+    /// `logprob_token_ids` does.
+    pub token_ids: Vec<u32>,
+}
+
+impl LogprobsRequest {
+    /// Whether this request asks for per-token sample logprobs (natural top-k or explicit ids).
+    #[must_use]
+    pub fn wants_sample(&self) -> bool {
+        self.sample.is_some() || !self.token_ids.is_empty()
+    }
+
+    /// Whether this request asks for prompt logprobs.
+    #[must_use]
+    pub fn wants_prompt(&self) -> bool {
+        self.prompt.is_some()
+    }
+
+    /// Whether any logprob work is requested at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.wants_sample() && !self.wants_prompt()
+    }
+}
+
+/// One token and its logprob, as reported for one position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenLogprob {
+    /// The vocabulary id of the token this position is about (the sampled token for a generated
+    /// position, the prompt token for a prompt position).
+    pub token_id: u32,
+    /// Its decoded string. The engine owns the tokenizer, so the router never decodes a token id
+    /// itself: this is the string that goes into `tokens[]`, `top_logprobs` keys and
+    /// `decoded_token`.
+    pub token: String,
+    /// Its log probability (natural log).
+    pub logprob: f32,
+    /// Its 1-based vocabulary rank: the number of tokens with a strictly greater logprob, plus one.
+    /// `None` when the request asked for the whole vocabulary, which vLLM leaves unranked.
+    pub rank: Option<u32>,
+    /// The alternatives, in vLLM's order: the position's own token first, then the selected
+    /// alternatives. For a natural top-k that is the top-k in descending logprob with duplicates
+    /// collapsed (the position's own token keeps first place); for `All` it is the whole
+    /// vocabulary in token-id order; for explicit `token_ids` it is the requested ids in request
+    /// order.
+    pub top: Vec<LogprobAlternative>,
+}
+
+/// One alternative in a [`TokenLogprob`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogprobAlternative {
+    /// Vocabulary id.
+    pub token_id: u32,
+    /// Decoded string.
+    pub token: String,
+    /// Log probability.
+    pub logprob: f32,
+    /// vLLM's rank for the entry: the true competition rank for the leading (own-token) entry and
+    /// the top-k positional rank for the selected alternatives; `None` for an unranked `All`
+    /// payload.
+    pub rank: Option<u32>,
+}
+
+/// The decoded string of one prompt token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenString {
+    /// Vocabulary id.
+    pub token_id: u32,
+    /// Decoded string, decoded the way vLLM decodes a logprob token: one id at a time, with the
+    /// preceding sequence ids as context so a byte-fallback token gets the character it completes
+    /// instead of a replacement glyph.
+    pub token: String,
+}
+
+/// Prompt logprobs, one entry per prompt token.
+///
+/// `positions[0]` is always `None`: the first prompt token has no conditioning token, so there is
+/// no distribution to score it under. vLLM reports the same `None` in the completion response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptLogprobs {
+    /// The decoded string of every prompt token, including position 0, because the `echo`
+    /// response lists all of them in `tokens[]`.
+    pub tokens: Vec<TokenString>,
+    /// One logprob per prompt token; position 0 is `None`.
+    pub positions: Vec<Option<TokenLogprob>>,
+}
+
 /// A fully normalized inference request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineRequest {
@@ -121,6 +249,9 @@ pub struct EngineRequest {
     pub model: String,
     /// Prompt token ids (placeholder ids in Milestone 1).
     pub prompt_tokens: Vec<u32>,
+    /// The logprobs this request asks for. The default asks for none: no log-softmax, no top-k and
+    /// no extra event, so a request that did not ask for logprobs pays nothing for the feature.
+    pub logprobs: LogprobsRequest,
     /// Image content parts carried by the prompt, in request order.
     ///
     /// The router passes the parsed parts through and [`InferenceEngine::validate_request`] refuses
@@ -176,6 +307,12 @@ pub enum EngineEvent {
         /// Fragment of the JSON arguments string.
         arguments_delta: String,
     },
+    /// Logprobs for one generated token, emitted after that token's own content delta and only
+    /// when the request asked for sample logprobs. One of these is emitted per generated token.
+    TokenLogprobs(Box<TokenLogprob>),
+    /// Prompt logprobs, emitted once after `Started` and before any delta or token logprob, only
+    /// when the request asked for them. The payload's `positions[0]` is `None`.
+    PromptLogprobs(Box<PromptLogprobs>),
     /// Terminal event carrying usage and telemetry.
     Finished {
         /// Why generation stopped.
@@ -493,6 +630,16 @@ pub trait InferenceEngine: Send + Sync {
     /// Runs one request, yielding normalized decode events.
     fn generate(&self, request: EngineRequest) -> BoxStream<'static, EngineEvent>;
 
+    /// The vocabulary size this engine scores against, when it knows it.
+    ///
+    /// The router uses it to validate the wire logprob bounds the way vLLM validates against the
+    /// model configuration: `-1` means the whole vocabulary, and explicit `logprob_token_ids`
+    /// must name ids inside it. The default `None` means "not stated", and the router refuses the
+    /// requests it cannot check rather than guessing a bound.
+    fn vocab_size(&self) -> Option<usize> {
+        None
+    }
+
     /// Current cluster telemetry snapshot.
     fn cluster_stats(&self) -> ClusterStatsSnapshot;
 
@@ -578,6 +725,13 @@ pub struct MockEngine {
     loop_guard: Option<LoopAbortConfig>,
     /// What this mock answers for [`InferenceEngine::capabilities`].
     capabilities: Capabilities,
+    /// Scripted sample logprobs, one per content piece, emitted only when the request asks for
+    /// sample logprobs. This is how the router tests drive the response assembly without a model.
+    token_logprobs: Vec<TokenLogprob>,
+    /// Scripted prompt logprobs, emitted only when the request asks for prompt logprobs.
+    prompt_logprobs: Option<PromptLogprobs>,
+    /// The vocabulary size this mock reports to `logprobs=-1` validation; `None` means unstated.
+    vocab_size: Option<usize>,
 }
 
 impl MockEngine {
@@ -597,6 +751,9 @@ impl MockEngine {
             rejected_prediction_tokens: 0,
             loop_guard: None,
             capabilities: Capabilities::default(),
+            token_logprobs: Vec::new(),
+            prompt_logprobs: None,
+            vocab_size: None,
         }
     }
 
@@ -609,6 +766,33 @@ impl MockEngine {
     #[must_use]
     pub fn with_capabilities(mut self, capabilities: Capabilities) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    /// Scripts one sample logprob per content piece, in order.
+    ///
+    /// The mock emits these (one [`EngineEvent::TokenLogprobs`] after each content delta) only when
+    /// the request actually asks for sample logprobs, so a test can pin both the gated delivery and
+    /// the assembled response shape.
+    #[must_use]
+    pub fn with_token_logprobs(mut self, logprobs: Vec<TokenLogprob>) -> Self {
+        self.token_logprobs = logprobs;
+        self
+    }
+
+    /// Scripts the prompt logprobs payload, emitted (once, after `Started`) only when the request
+    /// asks for prompt logprobs.
+    #[must_use]
+    pub fn with_prompt_logprobs(mut self, logprobs: PromptLogprobs) -> Self {
+        self.prompt_logprobs = Some(logprobs);
+        self
+    }
+
+    /// Reports a vocabulary size, which is what lets `logprobs=-1` and `logprob_token_ids` be
+    /// validated by the router.
+    #[must_use]
+    pub fn with_vocab_size(mut self, vocab_size: usize) -> Self {
+        self.vocab_size = Some(vocab_size);
         self
     }
 
@@ -722,6 +906,13 @@ impl MockEngine {
             prompt_tokens,
             cached_tokens: plan.global_kv_cached_tokens,
         });
+        // Prompt logprobs are one payload for the whole prompt, delivered once at the end of
+        // prefill, exactly where vLLM delivers them.
+        if request.logprobs.wants_prompt()
+            && let Some(prompt_logprobs) = self.prompt_logprobs.clone()
+        {
+            events.push(EngineEvent::PromptLogprobs(Box::new(prompt_logprobs)));
+        }
 
         let mut budget = request.max_tokens;
         let mut completion_tokens = 0usize;
@@ -745,7 +936,7 @@ impl MockEngine {
                 reasoning_tokens += 1;
                 events.push(EngineEvent::ReasoningDelta(piece.clone()));
             }
-            for piece in &self.response.content {
+            for (content_index, piece) in self.response.content.iter().enumerate() {
                 if budget == 0 {
                     truncated = true;
                     break 'script;
@@ -757,6 +948,11 @@ impl MockEngine {
                 budget -= 1;
                 completion_tokens += 1;
                 events.push(EngineEvent::ContentDelta(piece.clone()));
+                if request.logprobs.wants_sample()
+                    && let Some(logprob) = self.token_logprobs.get(content_index)
+                {
+                    events.push(EngineEvent::TokenLogprobs(Box::new(logprob.clone())));
+                }
             }
             for (index, call) in self.response.tool_calls.iter().enumerate() {
                 if budget == 0 {
@@ -872,6 +1068,10 @@ impl InferenceEngine for MockEngine {
     fn capabilities(&self) -> Capabilities {
         self.capabilities
     }
+
+    fn vocab_size(&self) -> Option<usize> {
+        self.vocab_size
+    }
 }
 
 /// Convenience: the prefix-match plan a request produced, for tests and callers that only
@@ -896,6 +1096,7 @@ mod tests {
             request_id: "req-1".to_owned(),
             model: MODEL_ID.to_owned(),
             prompt_tokens: vec![1, 2, 3],
+            logprobs: LogprobsRequest::default(),
             images: Vec::new(),
             max_tokens: 64,
             temperature: 1.0,

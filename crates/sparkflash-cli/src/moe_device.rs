@@ -8,6 +8,7 @@
 #![allow(clippy::items_after_test_module)]
 
 use std::path::Path;
+use std::sync::Arc;
 
 use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::dtype::DType;
@@ -19,6 +20,9 @@ use sparkflash_engine::quant::quantize_activation_fp8;
 use sparkflash_engine::weights::WeightSource;
 use sparkflash_kernels::cert_lm_head_launch::{self, CertLmHeadParams};
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel, KernelId, Module};
+use sparkflash_kernels::lm_head_reduce_launch::{
+    self as head_reduce, LmHeadReduceParams, STATUS_WINNER_CERTIFIED,
+};
 use sparkflash_kernels::m4_quant::bf16_bits;
 use sparkflash_kernels::mxfp4_moe_launch::{self, Mxfp4MoeParams};
 use sparkflash_kernels::mxfp4_ref;
@@ -38,6 +42,7 @@ const COMBINE: &str = "b12x_mxfp4_moe_sm121";
 const DENSE: &str = "b12x_mxfp8_dense_sm121";
 const SWIGLU: &str = "swiglu_mxfp8_quant_sm121";
 const HEAD: &str = "cert_lm_head_sm121";
+const HEAD_REDUCE: &str = "lm_head_reduce_sm121";
 const RMSNORM: &str = "rmsnorm_sm121";
 const RANKS: usize = 4;
 const HEAD_VOCAB_PER_RANK: usize = 32_320;
@@ -51,11 +56,6 @@ fn shared_scale_shapes(inter: usize, dim: usize) -> ([usize; 2], [usize; 2]) {
         [inter / QUANT_BLOCK, dim / QUANT_BLOCK],
         [dim / QUANT_BLOCK, inter / QUANT_BLOCK],
     )
-}
-
-/// Whether the winning head entry is certified (not claimable). Missing flags are not certified.
-fn winner_is_certified(flags: &[u8], winner: usize) -> bool {
-    flags.get(winner).is_some_and(|flag| *flag != 0)
 }
 
 type SharedScaleGrids = (Vec<u8>, Vec<u8>, Vec<u8>);
@@ -129,8 +129,6 @@ pub struct MoeDeviceStats {
     pub shared_device_us: u64,
     /// Cumulative uploaded shared-expert bytes.
     pub shared_bytes: u64,
-    /// Shared-expert host bytes (activation/readback), excluding the routed block.
-    pub shared_host_bytes: u64,
     /// Layer-0 shared-expert bf16 mismatches against the same-device-byte host twin.
     pub layer0_shared_bf16_mismatches: usize,
     /// Layer-0 shared-expert f32 max abs difference from the host reference (calibration).
@@ -145,10 +143,12 @@ pub struct MoeDeviceStats {
     pub routed_staging_us: u64,
     /// Routed-only device microseconds, excluding the shared expert.
     pub routed_device_us: u64,
-    /// Routed-only host bytes (activation, readback), excluding the shared expert.
+    /// Routed-only host bytes, excluding the shared expert.
     pub routed_host_bytes: u64,
     /// LM-head launches (four rank shards in c4c).
     pub head_launches: usize,
+    /// Shared-expert-only host bytes, excluding the routed experts.
+    pub shared_host_bytes: u64,
     /// Total certified (pruned) head entries over the four rank shards.
     pub head_certified: usize,
     /// Certified count per rank shard, in rank order.
@@ -161,6 +161,18 @@ pub struct MoeDeviceStats {
     pub head_staged_bytes: u64,
     /// True when the winning entry is certified, so the token is not claimable.
     pub head_winner_certified: bool,
+    /// Whether the device reduce produced the claimed token instead of the host assembly fallback.
+    pub head_reduce_used: bool,
+    /// The reduce's token readback (diagnostic on the fallback path).
+    pub head_reduce_token: u32,
+    /// The reduce's argmax value readback.
+    pub head_reduce_value: f32,
+    /// The reduce's status word.
+    pub head_reduce_status: u32,
+    /// The reduce's total certified count readback.
+    pub head_reduce_certified_count: u32,
+    /// Head calls seen so far, used as the position label for the head A/B diagnostic.
+    pub head_calls: usize,
     /// Final-RMSNorm launches (one in the tail).
     pub final_norm_launches: usize,
     /// Host microseconds in the final-RMSNorm launch and readback.
@@ -196,6 +208,18 @@ struct SharedDiagnose<'a> {
     shared_bytes: &'a [u8],
 }
 
+/// One device router decision kept for the stage-aligned router twin: layer, selected ids, and the
+/// unbiased scores the kernel published.
+#[derive(Debug, Clone)]
+pub struct RouterTwinRecord {
+    /// Backbone layer.
+    pub layer: usize,
+    /// The selected expert ids read back after the device router launch.
+    pub ids: Vec<u32>,
+    /// The device router scores for the token.
+    pub scores: Vec<f32>,
+}
+
 struct Kernels {
     router: Kernel,
     gate_up: Kernel,
@@ -204,6 +228,7 @@ struct Kernels {
     dense: Kernel,
     swiglu: Kernel,
     head: Kernel,
+    head_reduce: Kernel,
     rmsnorm: Kernel,
     _router_module: Module,
     _gate_up_module: Module,
@@ -212,6 +237,7 @@ struct Kernels {
     _dense_module: Module,
     _swiglu_module: Module,
     _head_module: Module,
+    _head_reduce_module: Module,
     _rmsnorm_module: Module,
 }
 
@@ -222,6 +248,11 @@ pub struct MoeDeviceBackendImpl {
     stats: MoeDeviceStats,
     launches_by_layer: Vec<usize>,
     diagnose_layer0: bool,
+    router_twin_enabled: bool,
+    router_records: Vec<RouterTwinRecord>,
+    head_certified: Vec<u8>,
+    // The 1.32 GB host head weight, read once and reused across sequence steps.
+    head_weight: Option<Arc<Vec<u8>>>,
 }
 
 impl MoeDeviceBackendImpl {
@@ -238,6 +269,7 @@ impl MoeDeviceBackendImpl {
         let dense_bytes = verified(dir, DENSE)?;
         let swiglu_bytes = verified(dir, SWIGLU)?;
         let head_bytes = verified(dir, HEAD)?;
+        let head_reduce_bytes = verified(dir, HEAD_REDUCE)?;
         let rmsnorm_bytes = verified(dir, RMSNORM)?;
         let cuda = Cuda::load()?;
         let (router_module, router) = router_launch::load(&cuda, &router_bytes)?;
@@ -249,6 +281,7 @@ impl MoeDeviceBackendImpl {
         let (swiglu_module, swiglu) =
             cuda.load_kernel(&swiglu_bytes, KernelId::SwigluMxfp8Quant)?;
         let (head_module, head) = cert_lm_head_launch::load(&cuda, &head_bytes)?;
+        let (head_reduce_module, head_reduce) = head_reduce::load(&cuda, &head_reduce_bytes)?;
         let (rmsnorm_module, rmsnorm) = rmsnorm_launch::load(&cuda, &rmsnorm_bytes)?;
         Ok(Self {
             cuda,
@@ -260,6 +293,7 @@ impl MoeDeviceBackendImpl {
                 dense,
                 swiglu,
                 head,
+                head_reduce,
                 rmsnorm,
                 _router_module: router_module,
                 _gate_up_module: gate_up_module,
@@ -268,6 +302,7 @@ impl MoeDeviceBackendImpl {
                 _dense_module: dense_module,
                 _swiglu_module: swiglu_module,
                 _head_module: head_module,
+                _head_reduce_module: head_reduce_module,
                 _rmsnorm_module: rmsnorm_module,
             },
             stats: MoeDeviceStats {
@@ -284,7 +319,11 @@ impl MoeDeviceBackendImpl {
                 ..MoeDeviceStats::default()
             },
             diagnose_layer0: false,
+            router_twin_enabled: std::env::var("SPARKFLASH_ROUTER_TWIN").is_ok(),
+            router_records: Vec::new(),
             launches_by_layer: vec![0; 64],
+            head_certified: Vec::new(),
+            head_weight: None,
         })
     }
 
@@ -294,6 +333,12 @@ impl MoeDeviceBackendImpl {
     pub fn with_layer0_diagnose(mut self) -> Self {
         self.diagnose_layer0 = true;
         self
+    }
+
+    /// The layer 0/1/14 router decisions captured for the stage-aligned router twin.
+    #[must_use]
+    pub fn router_records(&self) -> &[RouterTwinRecord] {
+        &self.router_records
     }
 
     /// The counters since construction.
@@ -557,7 +602,9 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             .collect();
         let (table, local_ids) = local_table(&ids, n_routed)?;
         let local_count = table.len();
-        let device_weights: Vec<f32> = if layer == 0 {
+        let router_twin =
+            (self.diagnose_layer0 || self.router_twin_enabled) && layer < config.n_layers;
+        let device_weights: Vec<f32> = if router_twin {
             let mut weight_bytes = vec![0u8; rows * 4];
             self.cuda
                 .copy_dtoh(&mut weight_bytes, &weights_d)
@@ -572,12 +619,39 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         } else {
             Vec::new()
         };
+        let device_scores: Vec<f32> = if router_twin {
+            let mut score_bytes = vec![0u8; tokens * n_routed * 4];
+            self.cuda
+                .copy_dtoh(&mut score_bytes, &scores_d)
+                .map_err(drv)?;
+            host_bytes += score_bytes.len() as u64;
+            score_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_bits(u32::from_le_bytes(*chunk)))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let experts = read_experts(source, prefix, &table, dim, inter)?;
         let expert_bytes: usize = experts.iter().map(Expert::bytes).sum();
         staged_bytes += expert_bytes as u64;
         host_bytes += expert_bytes as u64;
-        if self.diagnose_layer0 && layer == 0 {
+        if router_twin
+            && !self
+                .router_records
+                .iter()
+                .any(|record| record.layer == layer)
+        {
+            self.router_records.push(RouterTwinRecord {
+                layer,
+                ids: ids.clone(),
+                scores: device_scores.clone(),
+            });
+        }
+        if router_twin {
             let x_bits: Vec<u16> = x_bf16
                 .as_chunks::<2>()
                 .0
@@ -614,18 +688,21 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
                         .zip(device_weights.iter())
                         .map(|(host, device)| (host - device).abs())
                         .fold(0.0f32, f32::max);
+                    let score_delta = host
+                        .scores
+                        .iter()
+                        .zip(device_scores.iter())
+                        .map(|(host, device)| (host - device).abs())
+                        .fold(0.0f32, f32::max);
                     println!(
-                        "moe layer0 diag: router ids device={ids:?} host={:?} equal={ids_equal} weights_max_abs={weight_delta:e}",
+                        "moe router twin: layer={layer} ids device={ids:?} host={:?} equal={ids_equal} scores_max_abs={score_delta:e} weights_max_abs={weight_delta:e}",
                         host.ids
                     );
-                    if !ids_equal || weight_delta > 1.0e-6 {
-                        return Err(err(
-                            "device routed MoE layer-0 diagnose",
-                            format!(
-                                "router mismatch: ids device={ids:?} host={:?}, weights max abs {weight_delta:e}",
-                                host.ids
-                            ),
-                        ));
+                    if !ids_equal {
+                        println!(
+                            "moe router twin: layer={layer} DISCRETE SELECTION FLIP - device ids {ids:?} vs host ids {:?}",
+                            host.ids
+                        );
                     }
                 }
                 Err(message) => {
@@ -882,7 +959,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         self.stats.launches += 17;
         self.stats.staged_bytes += staged_bytes;
         self.stats.host_bytes += host_bytes;
-        self.stats.routed_host_bytes += host_bytes;
+        self.stats.routed_host_bytes = self.stats.routed_host_bytes.saturating_add(host_bytes);
         self.stats.layers += 1;
         if self.launches_by_layer.len() <= layer {
             self.launches_by_layer.resize(layer + 1, 0);
@@ -1274,13 +1351,13 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         }
         self.launches_by_layer[layer] += 4;
         self.stats.shared_us += staging_us + device_us;
-        self.stats.shared_host_bytes += host_bytes;
         self.stats.shared_staging_us += staging_us;
         self.stats.shared_device_us += device_us;
         self.stats.staging_us += staging_us;
         self.stats.device_us += device_us;
         self.stats.shared_bytes += staged_bytes;
         self.stats.host_bytes += host_bytes;
+        self.stats.shared_host_bytes = self.stats.shared_host_bytes.saturating_add(host_bytes);
         self.cuda.free_buffers(&ptrs.iter().collect::<Vec<_>>());
         Ok(true)
     }
@@ -1384,7 +1461,18 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         }
         let started = std::time::Instant::now();
         let staging_started = std::time::Instant::now();
-        let head = read_spec(source, "head.weight", DType::BF16, &[vocab, dim])?;
+        let head = if let Some(head) = &self.head_weight {
+            Arc::clone(head)
+        } else {
+            let head = Arc::new(read_spec(
+                source,
+                "head.weight",
+                DType::BF16,
+                &[vocab, dim],
+            )?);
+            self.head_weight = Some(Arc::clone(&head));
+            head
+        };
         if head.len() != vocab * dim * 2 {
             return Err(err(
                 "device head",
@@ -1410,8 +1498,12 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         self.cuda.copy_htod(&weight_d, &head).map_err(drv)?;
         let per_rank_out = per_rank * 4;
         let block_count = per_rank.div_ceil(cert_lm_head_launch::CHUNK as usize);
-        let logits_d = self.cuda.alloc(per_rank_out, &mut allocated).map_err(drv)?;
-        let certified_d = self.cuda.alloc(per_rank, &mut allocated).map_err(drv)?;
+        let mut logits_d = Vec::with_capacity(RANKS);
+        let mut certified_d = Vec::with_capacity(RANKS);
+        for _ in 0..RANKS {
+            logits_d.push(self.cuda.alloc(per_rank_out, &mut allocated).map_err(drv)?);
+            certified_d.push(self.cuda.alloc(per_rank, &mut allocated).map_err(drv)?);
+        }
         let count_d = self.cuda.alloc(4, &mut allocated).map_err(drv)?;
         let block_max_d = self
             .cuda
@@ -1421,14 +1513,38 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             .cuda
             .alloc(block_count * 4, &mut allocated)
             .map_err(drv)?;
+        let reduce_token_d = self.cuda.alloc(4, &mut allocated).map_err(drv)?;
+        let reduce_value_d = self.cuda.alloc(4, &mut allocated).map_err(drv)?;
+        let reduce_block_max_d = self
+            .cuda
+            .alloc(head_reduce::BLOCKS * 4, &mut allocated)
+            .map_err(drv)?;
+        let reduce_block_argmax_d = self
+            .cuda
+            .alloc(head_reduce::BLOCKS * 4, &mut allocated)
+            .map_err(drv)?;
+        let reduce_top5_value_d = self
+            .cuda
+            .alloc(head_reduce::TOP * 4, &mut allocated)
+            .map_err(drv)?;
+        let reduce_top5_index_d = self
+            .cuda
+            .alloc(head_reduce::TOP * 4, &mut allocated)
+            .map_err(drv)?;
+        let reduce_status_d = self.cuda.alloc(4, &mut allocated).map_err(drv)?;
+        let reduce_count_d = self.cuda.alloc(4, &mut allocated).map_err(drv)?;
+        ptrs.extend([hidden_d, weight_d, count_d, block_max_d, block_argmax_d]);
+        ptrs.extend(logits_d.iter().copied());
+        ptrs.extend(certified_d.iter().copied());
         ptrs.extend([
-            hidden_d,
-            weight_d,
-            logits_d,
-            certified_d,
-            count_d,
-            block_max_d,
-            block_argmax_d,
+            reduce_token_d,
+            reduce_value_d,
+            reduce_block_max_d,
+            reduce_block_argmax_d,
+            reduce_top5_value_d,
+            reduce_top5_index_d,
+            reduce_status_d,
+            reduce_count_d,
         ]);
         let rank_stride = per_rank * dim * 2;
         let mut best_value = f32::NEG_INFINITY;
@@ -1436,6 +1552,9 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         let mut certified_total = 0usize;
         let mut certified_by_rank = [0usize; RANKS];
         let mut certified_flags = vec![0u8; vocab];
+        let mut host_top: Vec<(f32, u32)> = Vec::new();
+        let head_position = self.stats.head_calls;
+        self.stats.head_calls = self.stats.head_calls.saturating_add(1);
         let head_staging_us = staging_started.elapsed().as_micros() as u64;
         self.stats.head_staging_us += head_staging_us;
         self.stats.head_staged_bytes += head.len() as u64;
@@ -1444,8 +1563,8 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             let params = CertLmHeadParams::new(
                 hidden_d,
                 Deviceptr(weight_d.0 + (rank * rank_stride) as u64),
-                logits_d,
-                certified_d,
+                logits_d[rank],
+                certified_d[rank],
                 count_d,
                 block_max_d,
                 block_argmax_d,
@@ -1461,10 +1580,10 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             let mut block_max = vec![0u8; block_count * 4];
             let mut block_argmax = vec![0u8; block_count * 4];
             self.cuda
-                .copy_dtoh(&mut logits_bytes, &logits_d)
+                .copy_dtoh(&mut logits_bytes, &logits_d[rank])
                 .map_err(drv)?;
             self.cuda
-                .copy_dtoh(&mut certified, &certified_d)
+                .copy_dtoh(&mut certified, &certified_d[rank])
                 .map_err(drv)?;
             self.cuda
                 .copy_dtoh(&mut count_bytes, &count_d)
@@ -1503,28 +1622,146 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
                 ]) as usize;
                 let global = head_global_index(rank, relative, per_rank);
                 consider_head_block(&mut best_value, &mut best_index, value, global);
+                consider_head_top(&mut host_top, value, global as u32);
             }
         }
-        let head_device_end_us = started.elapsed().as_micros() as u64;
-        let winner_certified = winner_is_certified(&certified_flags, best_index as usize);
-        self.stats.head_launches += RANKS;
-        self.stats.head_certified += certified_total;
-        self.stats.head_certified_by_rank = certified_by_rank;
-        self.stats.head_winner_certified = winner_certified;
-        let head_device_us = head_device_end_us - head_staging_us;
-        self.stats.head_device_us += head_device_us;
-        self.stats.device_us += started.elapsed().as_micros() as u64;
-        // The refusal is checked before the diagnostic twin: a certified winner is not claimable,
-        // so the twin arithmetic must not run (or become part of the record) for it.
-        if head_action(winner_certified, self.diagnose_layer0) == HeadAction::Refuse {
+        let reduce_params = LmHeadReduceParams::new(
+            [logits_d[0], logits_d[1], logits_d[2], logits_d[3]],
+            [
+                certified_d[0],
+                certified_d[1],
+                certified_d[2],
+                certified_d[3],
+            ],
+            reduce_token_d,
+            reduce_value_d,
+            reduce_block_max_d,
+            reduce_block_argmax_d,
+            reduce_top5_value_d,
+            reduce_top5_index_d,
+            reduce_status_d,
+            reduce_count_d,
+            0,
+            0,
+            0,
+        );
+        head_reduce::launch(&self.cuda, self.kernels.head_reduce, &reduce_params).map_err(drv)?;
+        let mut reduce_token_bytes = [0u8; 4];
+        let mut reduce_status_bytes = [0u8; 4];
+        let mut reduce_value_bytes = [0u8; 4];
+        let mut reduce_count_bytes = [0u8; 4];
+        self.cuda
+            .copy_dtoh(&mut reduce_token_bytes, &reduce_token_d)
+            .map_err(drv)?;
+        self.cuda
+            .copy_dtoh(&mut reduce_status_bytes, &reduce_status_d)
+            .map_err(drv)?;
+        self.cuda
+            .copy_dtoh(&mut reduce_value_bytes, &reduce_value_d)
+            .map_err(drv)?;
+        self.cuda
+            .copy_dtoh(&mut reduce_count_bytes, &reduce_count_d)
+            .map_err(drv)?;
+        let reduce_token = u32::from_le_bytes(reduce_token_bytes);
+        let reduce_status = u32::from_le_bytes(reduce_status_bytes);
+        let reduce_value = f32::from_bits(u32::from_le_bytes(reduce_value_bytes));
+        let reduce_certified_count = u32::from_le_bytes(reduce_count_bytes);
+        let mut reduce_top5_values = [0f32; head_reduce::TOP];
+        let mut reduce_top5_indices = [0u32; head_reduce::TOP];
+        let mut reduce_top5_value_bytes = vec![0u8; head_reduce::TOP * 4];
+        let mut reduce_top5_index_bytes = vec![0u8; head_reduce::TOP * 4];
+        self.cuda
+            .copy_dtoh(&mut reduce_top5_value_bytes, &reduce_top5_value_d)
+            .map_err(drv)?;
+        self.cuda
+            .copy_dtoh(&mut reduce_top5_index_bytes, &reduce_top5_index_d)
+            .map_err(drv)?;
+        for slot in 0..head_reduce::TOP {
+            reduce_top5_values[slot] = f32::from_bits(u32::from_le_bytes([
+                reduce_top5_value_bytes[slot * 4],
+                reduce_top5_value_bytes[slot * 4 + 1],
+                reduce_top5_value_bytes[slot * 4 + 2],
+                reduce_top5_value_bytes[slot * 4 + 3],
+            ]));
+            reduce_top5_indices[slot] = u32::from_le_bytes([
+                reduce_top5_index_bytes[slot * 4],
+                reduce_top5_index_bytes[slot * 4 + 1],
+                reduce_top5_index_bytes[slot * 4 + 2],
+                reduce_top5_index_bytes[slot * 4 + 3],
+            ]);
+        }
+        let host_text: Vec<String> = host_top
+            .iter()
+            .map(|(value, index)| format!("{index}:{value:.9}"))
+            .collect();
+        let device_text: Vec<String> = reduce_top5_indices
+            .iter()
+            .zip(reduce_top5_values.iter())
+            .map(|(index, value)| format!("{index}:{value:.9}"))
+            .collect();
+        println!(
+            "head A/B: position={head_position} host_top1={best_index} host_top5=[{}] device_top1={reduce_token} device_top5=[{}] block_max_equal={} host_value={best_value:.9} device_value={reduce_value:.9}",
+            host_text.join(", "),
+            device_text.join(", "),
+            best_value.to_bits() == reduce_value.to_bits()
+        );
+        let force_host = std::env::var("SPARKFLASH_HEAD_HOST_ASSEMBLY")
+            .is_ok_and(|value| value == "1" || value == "true");
+        if reduce_status & !0x7 != 0 {
+            return Err(err(
+                "device head reduce",
+                format!("unknown status bits in {reduce_status:#x}"),
+            ));
+        }
+        let reduce_winner_certified = reduce_winner_certified(reduce_status);
+        if !reduce_winner_certified && reduce_token != best_index {
+            return Err(err(
+                "device head reduce",
+                format!(
+                    "the reduce token {reduce_token} differs from the host block assembly token {best_index}, status={reduce_status:#x}"
+                ),
+            ));
+        }
+        if force_host && !reduce_winner_certified {
+            let head_device_us = started.elapsed().as_micros() as u64 - head_staging_us;
+            self.stats.head_launches += RANKS + 1;
+            self.stats.head_certified += certified_total;
+            self.stats.head_certified_by_rank = certified_by_rank;
+            self.head_certified = certified_flags;
+            self.stats.head_winner_certified = false;
+            self.stats.head_reduce_used = false;
+            self.stats.head_reduce_token = reduce_token;
+            self.stats.head_reduce_value = reduce_value;
+            self.stats.head_device_us += head_device_us;
+            self.stats.device_us += started.elapsed().as_micros() as u64;
             self.cuda.free_buffers(&ptrs.iter().collect::<Vec<_>>());
             println!(
-                "lm head refusal: winner={} is certified; certified_by_rank={:?} certified_total={} head_staging_us={} head_device_us={}",
-                best_index, certified_by_rank, certified_total, head_staging_us, head_device_us
+                "head A/B: position={head_position} returned host assembly token={best_index} (SPARKFLASH_HEAD_HOST_ASSEMBLY)"
+            );
+            return Ok(Some(best_index));
+        }
+        self.stats.head_reduce_token = reduce_token;
+        self.stats.head_reduce_value = reduce_value;
+        self.stats.head_reduce_status = reduce_status;
+        self.stats.head_reduce_certified_count = reduce_certified_count;
+        let head_device_end_us = started.elapsed().as_micros() as u64;
+        if head_action(reduce_winner_certified, self.diagnose_layer0) == HeadAction::Refuse {
+            let head_device_us = head_device_end_us - head_staging_us;
+            self.stats.head_launches += RANKS + 1;
+            self.stats.head_certified += certified_total;
+            self.stats.head_certified_by_rank = certified_by_rank;
+            self.head_certified = certified_flags;
+            self.stats.head_winner_certified = true;
+            self.stats.head_reduce_used = false;
+            self.stats.head_device_us += head_device_us;
+            self.stats.device_us += started.elapsed().as_micros() as u64;
+            self.cuda.free_buffers(&ptrs.iter().collect::<Vec<_>>());
+            println!(
+                "lm head refusal: reduce status={reduce_status:#x} token={reduce_token} is certified; falling back to host block assembly token={best_index} certified_by_rank={certified_by_rank:?} certified_total={certified_total} head_staging_us={head_staging_us} head_device_us={head_device_us}"
             );
             return Ok(None);
         }
-        if head_action(winner_certified, self.diagnose_layer0) == HeadAction::Diagnose {
+        if head_action(reduce_winner_certified, self.diagnose_layer0) == HeadAction::Diagnose {
             let hidden_values = decode_bf16(&hidden_bf16);
             let mut twin_logits = vec![0.0f32; vocab];
             let mut twin_best = f32::NEG_INFINITY;
@@ -1577,7 +1814,20 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             }
         }
         self.cuda.free_buffers(&ptrs.iter().collect::<Vec<_>>());
-        Ok(Some(best_index))
+        self.stats.head_launches += RANKS + 1;
+        self.stats.head_certified += certified_total;
+        self.stats.head_certified_by_rank = certified_by_rank;
+        self.head_certified = certified_flags;
+        self.stats.head_winner_certified = false;
+        self.stats.head_reduce_used = true;
+        let head_device_us = head_device_end_us - head_staging_us;
+        self.stats.head_device_us += head_device_us;
+        self.stats.device_us += started.elapsed().as_micros() as u64;
+        Ok(Some(reduce_token))
+    }
+
+    fn head_certified_mask(&self) -> Option<&[u8]> {
+        Some(&self.head_certified)
     }
 }
 
@@ -1794,11 +2044,25 @@ fn head_global_index(rank: usize, relative: usize, per_rank: usize) -> usize {
     rank * per_rank + relative
 }
 
+fn consider_head_top(top: &mut Vec<(f32, u32)>, value: f32, index: u32) {
+    if top.len() < 5 || value > top.last().copied().unwrap_or((f32::NEG_INFINITY, 0)).0 {
+        top.push((value, index));
+        top.sort_by(|left, right| right.0.total_cmp(&left.0));
+        top.truncate(5);
+    }
+}
+
 fn consider_head_block(best_value: &mut f32, best_index: &mut u32, value: f32, global: usize) {
     if value > *best_value || (value == *best_value && global < *best_index as usize) {
         *best_value = value;
         *best_index = global as u32;
     }
+}
+
+/// Whether the device reduce's winning token is certified by the tournament, in which case the
+/// host block assembly is not trusted and the device answer must be refused (host fallback).
+fn reduce_winner_certified(status: u32) -> bool {
+    status & STATUS_WINNER_CERTIFIED != 0
 }
 
 /// What the head does after the reduce readback. The certified refusal is unconditional and comes
@@ -1954,22 +2218,6 @@ mod tests {
     }
 
     #[test]
-    fn the_certified_winner_refusal_is_decided_before_the_twin_check() {
-        assert!(
-            winner_is_certified(&[0, 1, 0], 1),
-            "a blocked flag refuses the token"
-        );
-        assert!(
-            !winner_is_certified(&[0, 0, 0], 0),
-            "an open flag is claimable"
-        );
-        assert!(
-            !winner_is_certified(&[], 0),
-            "a missing flag is not certified"
-        );
-    }
-
-    #[test]
     fn the_shared_scale_reads_pin_the_32x32_grid_shapes() {
         let (inter, dim) = (2304usize, 5120usize);
         assert_eq!(shared_scale_shapes(inter, dim), ([72, 160], [160, 72]));
@@ -2012,6 +2260,7 @@ mod tests {
             .expect_err("a swapped w1/w2 grid must be refused");
         assert!(error.to_string().contains("declared"), "{error}");
     }
+
     #[test]
     fn routed_and_shared_totals_print_their_own_counters() {
         let mut stats = MoeDeviceStats {
@@ -2040,6 +2289,7 @@ mod tests {
         assert!(shared.contains("host_bytes=666000"), "{shared}");
         assert!(!shared.contains("999"), "{shared}");
     }
+
     #[test]
     fn a_certified_winner_is_refused_before_the_diagnose_branch() {
         assert_eq!(head_action(true, true), HeadAction::Refuse);
@@ -2063,6 +2313,14 @@ mod tests {
             160 * 72,
             "w2 scales are the [5120/32][2304/32] grid"
         );
+    }
+
+    #[test]
+    fn the_certified_winner_is_refused_and_the_twin_check_does_not_run_for_it() {
+        assert!(reduce_winner_certified(STATUS_WINNER_CERTIFIED));
+        assert!(!reduce_winner_certified(head_reduce::STATUS_TOP5_CLAIMED));
+        assert!(!reduce_winner_certified(head_reduce::STATUS_ANY_CERTIFIED));
+        assert!(!reduce_winner_certified(0));
     }
 
     #[test]

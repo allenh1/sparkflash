@@ -15,7 +15,7 @@ use http_body_util::BodyExt as _;
 use serde_json::{Value, json};
 use sparkflash_api::engine::{
     Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest, InferenceEngine,
-    MissingCapability, MockEngine,
+    LogprobAlternative, MissingCapability, MockEngine, PromptLogprobs, TokenLogprob, TokenString,
 };
 use sparkflash_api::server::{disarm_traces, router};
 use sparkflash_api::state::AppState;
@@ -1476,4 +1476,554 @@ async fn schema_name_maps_do_not_trip_the_refusal_but_data_carriers_still_do() {
             "the engine was not entered for a carrier: {body}"
         );
     }
+}
+// ---------------------------------------------------------------------------------------
+// Logprobs
+// ---------------------------------------------------------------------------------------
+//
+// The expected shapes are the ones vLLM emits (verified against the image's v1 logprobs code):
+// the completion `top_logprobs` dict carries the sampled token in addition to the alternatives,
+// the chat list is the first `top_logprobs` entries of that dict, `prompt_logprobs` is id-keyed
+// with rank and decoded_token, and an `-inf` logprob is clamped to -9999.
+
+fn alternative(token_id: u32, token: &str, logprob: f32, rank: u32) -> LogprobAlternative {
+    LogprobAlternative {
+        token_id,
+        token: token.to_owned(),
+        logprob,
+        rank: Some(rank),
+    }
+}
+
+fn scripted(
+    token_id: u32,
+    token: &str,
+    logprob: f32,
+    top: Vec<LogprobAlternative>,
+) -> TokenLogprob {
+    TokenLogprob {
+        token_id,
+        token: token.to_owned(),
+        logprob,
+        rank: Some(1),
+        top,
+    }
+}
+
+/// A mock with two generated tokens' logprobs and a three-token prompt's.
+fn logprob_engine() -> MockEngine {
+    let hello = scripted(
+        11,
+        "Hello",
+        -0.5,
+        vec![
+            alternative(11, "Hello", -0.5, 1),
+            alternative(7, "Hi", -1.5, 2),
+        ],
+    );
+    let world = scripted(
+        12,
+        " world",
+        -0.25,
+        vec![
+            alternative(12, " world", -0.25, 1),
+            alternative(9, " there", -2.0, 2),
+            alternative(10, " rare", f32::NEG_INFINITY, 3),
+        ],
+    );
+    let prompt = PromptLogprobs {
+        tokens: vec![
+            TokenString {
+                token_id: 21,
+                token: "a".to_owned(),
+            },
+            TokenString {
+                token_id: 22,
+                token: "b".to_owned(),
+            },
+            TokenString {
+                token_id: 23,
+                token: "c".to_owned(),
+            },
+        ],
+        positions: vec![
+            None,
+            Some(scripted(
+                22,
+                "b",
+                -0.125,
+                vec![alternative(22, "b", -0.125, 1)],
+            )),
+            Some(scripted(
+                23,
+                "c",
+                -0.25,
+                vec![
+                    alternative(23, "c", -0.25, 2),
+                    alternative(24, "d", -0.0625, 1),
+                ],
+            )),
+        ],
+    };
+    MockEngine::new(MODEL)
+        .with_cluster_stats(ClusterStatsSnapshot::default())
+        .with_capabilities(Capabilities::ALL)
+        .content(&["Hello", " world"])
+        .with_vocab_size(128)
+        .with_token_logprobs(vec![hello, world])
+        .with_prompt_logprobs(prompt)
+}
+
+#[tokio::test]
+async fn completion_logprobs_have_the_vllm_shape() {
+    let (status, _, bytes) = send(
+        app_with(logprob_engine()),
+        json_request(
+            "/v1/completions",
+            &json!({"model": MODEL, "prompt": "hello", "logprobs": 1}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_json(&bytes);
+    let logprobs = &body["choices"][0]["logprobs"];
+    assert_eq!(logprobs["tokens"], json!(["Hello", " world"]));
+    assert_eq!(logprobs["text_offset"], json!([0, 5]));
+    assert_eq!(logprobs["token_logprobs"], json!([-0.5, -0.25]));
+    assert_eq!(
+        logprobs["top_logprobs"][0],
+        json!({"Hello": -0.5, "Hi": -1.5}),
+        "the completion dict carries the sampled token as an entry"
+    );
+    assert_eq!(
+        logprobs["top_logprobs"][1],
+        json!({" world": -0.25, " there": -2.0, " rare": -9999.0}),
+        "a -inf logprob is clamped to -9999"
+    );
+    assert_eq!(
+        body["choices"][0]["prompt_logprobs"],
+        Value::Null,
+        "no prompt logprobs were requested"
+    );
+}
+
+#[tokio::test]
+async fn completion_prompt_logprobs_are_id_keyed_with_rank_and_decoded_token() {
+    let (status, _, bytes) = send(
+        app_with(logprob_engine()),
+        json_request(
+            "/v1/completions",
+            &json!({"model": MODEL, "prompt": "hello", "prompt_logprobs": 1}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_json(&bytes);
+    let prompt = &body["choices"][0]["prompt_logprobs"];
+    assert_eq!(prompt.as_array().expect("array").len(), 3);
+    assert_eq!(
+        prompt[0],
+        Value::Null,
+        "position 0 has no conditioning token"
+    );
+    assert_eq!(
+        prompt[1],
+        json!({"22": {"logprob": -0.125, "rank": 1, "decoded_token": "b"}})
+    );
+    assert_eq!(
+        prompt[2],
+        json!({
+            "23": {"logprob": -0.25, "rank": 2, "decoded_token": "c"},
+            "24": {"logprob": -0.0625, "rank": 1, "decoded_token": "d"},
+        })
+    );
+    assert_eq!(
+        body["choices"][0]["logprobs"],
+        Value::Null,
+        "prompt logprobs do not imply generated-token logprobs"
+    );
+}
+
+#[tokio::test]
+async fn echo_prepends_the_prompt_and_its_logprobs() {
+    let (status, _, bytes) = send(
+        app_with(logprob_engine()),
+        json_request(
+            "/v1/completions",
+            &json!({"model": MODEL, "prompt": "hello", "echo": true, "logprobs": 1}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_json(&bytes);
+    let choice = &body["choices"][0];
+    assert_eq!(choice["text"], "helloHello world");
+    let logprobs = &choice["logprobs"];
+    assert_eq!(
+        logprobs["tokens"],
+        json!(["a", "b", "c", "Hello", " world"]),
+        "echo lists the prompt tokens before the generated ones"
+    );
+    assert_eq!(logprobs["text_offset"], json!([0, 1, 2, 3, 8]));
+    assert_eq!(
+        logprobs["token_logprobs"],
+        json!([Value::Null, -0.125, -0.25, -0.5, -0.25])
+    );
+    assert_eq!(
+        logprobs["top_logprobs"][0],
+        Value::Null,
+        "the echoed position 0 has no score"
+    );
+    assert!(
+        choice["prompt_logprobs"].is_array(),
+        "echo computed the prompt logprobs from logprobs (vLLM's rule): {}",
+        choice["prompt_logprobs"]
+    );
+}
+
+#[tokio::test]
+async fn echo_without_generation_returns_the_prompt_only() {
+    let (status, _, bytes) = send(
+        app_with(logprob_engine()),
+        json_request(
+            "/v1/completions",
+            &json!({"model": MODEL, "prompt": "hello", "echo": true, "logprobs": 1, "max_tokens": 0}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "echo makes max_tokens 0 legal");
+    let body = body_json(&bytes);
+    let choice = &body["choices"][0];
+    assert_eq!(choice["text"], "hello");
+    assert_eq!(choice["finish_reason"], "length");
+    assert_eq!(choice["logprobs"]["tokens"], json!(["a", "b", "c"]));
+    assert_eq!(
+        choice["logprobs"]["text_offset"],
+        json!([0, 1, 2]),
+        "offset stays inside the prompt text"
+    );
+    assert_eq!(body["usage"]["completion_tokens"], 0);
+}
+
+#[tokio::test]
+async fn chat_logprobs_entries_carry_bytes_and_the_top_list() {
+    let mut body = chat_body("hi");
+    body["logprobs"] = json!(true);
+    body["top_logprobs"] = json!(2);
+    let (status, _, bytes) = send(
+        app_with(logprob_engine()),
+        json_request("/v1/chat/completions", &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_json(&bytes);
+    let content = &body["choices"][0]["logprobs"]["content"];
+    assert_eq!(content.as_array().expect("array").len(), 2);
+    assert_eq!(content[0]["token"], "Hello");
+    assert_eq!(content[0]["logprob"], -0.5);
+    assert_eq!(content[0]["bytes"], json!([72, 101, 108, 108, 111]));
+    let top = content[0]["top_logprobs"].as_array().expect("array");
+    assert_eq!(top.len(), 2, "the list is the first n entries of the dict");
+    assert_eq!(top[0]["token"], "Hello");
+    assert_eq!(top[0]["logprob"], -0.5);
+    assert_eq!(top[0]["bytes"], json!([72, 101, 108, 108, 111]));
+    assert_eq!(top[1]["token"], "Hi");
+
+    let mut second = chat_body("hi");
+    second["logprobs"] = json!(true);
+    second["top_logprobs"] = json!(0);
+    let (status, _, bytes) = send(
+        app_with(logprob_engine()),
+        json_request("/v1/chat/completions", &second),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_json(&bytes);
+    assert_eq!(
+        body["choices"][0]["logprobs"]["content"][0]["top_logprobs"],
+        json!([]),
+        "logprobs without top_logprobs reports the token alone"
+    );
+}
+
+#[tokio::test]
+async fn chat_prompt_logprobs_are_reported_at_the_top_level() {
+    let mut body = chat_body("hi");
+    body["prompt_logprobs"] = json!(1);
+    let (status, _, bytes) = send(
+        app_with(logprob_engine()),
+        json_request("/v1/chat/completions", &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_json(&bytes);
+    assert_eq!(body["choices"][0]["logprobs"], Value::Null);
+    let prompt = &body["prompt_logprobs"];
+    assert_eq!(prompt.as_array().expect("array").len(), 3);
+    assert_eq!(prompt[0], Value::Null);
+    assert_eq!(
+        prompt[1],
+        json!({"22": {"logprob": -0.125, "rank": 1, "decoded_token": "b"}})
+    );
+}
+
+#[tokio::test]
+async fn logprobs_are_validated_the_way_vllm_validates_them() {
+    let cases: Vec<(Value, &str)> = vec![
+        (
+            json!({"model": MODEL, "prompt": "hello", "logprobs": 21}),
+            "Requested sample logprobs of 21, which is greater than max allowed: 20",
+        ),
+        (
+            json!({"model": MODEL, "prompt": "hello", "logprobs": -1}),
+            "Requested sample logprobs of 128, which is greater than max allowed: 20",
+        ),
+        (
+            json!({"model": MODEL, "prompt": "hello", "logprobs": -2}),
+            "`logprobs` must be a positive value or -1.",
+        ),
+        (
+            json!({"model": MODEL, "prompt": "hello", "prompt_logprobs": 21}),
+            "Requested prompt logprobs of 21, which is greater than max allowed: 20",
+        ),
+        (
+            json!({"model": MODEL, "prompt": "hi", "logprob_token_ids": [1]}),
+            "when using `logprob_token_ids`, `logprobs` must be set.",
+        ),
+        (
+            json!({"model": MODEL, "prompt": "hi", "logprobs": 1, "logprob_token_ids": [129]}),
+            "token_id(s) [129] in logprob_token_ids contain out-of-vocab token ids. Vocabulary size: 128",
+        ),
+    ];
+    for (case, message) in cases {
+        let (status, _, bytes) = send(
+            app_with(logprob_engine()),
+            json_request("/v1/completions", &case),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {case}");
+        let body = body_json(&bytes);
+        assert_eq!(body["error"]["code"], "invalid_logprobs", "body: {case}");
+        assert_eq!(body["error"]["message"], message, "body: {case}");
+    }
+
+    let (status, _, bytes) = send(
+        app_with(logprob_engine()),
+        json_request(
+            "/v1/completions",
+            &json!({"model": MODEL, "prompt": "hi", "logprobs": 1, "stream": true, "prompt_logprobs": 1}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body = body_json(&bytes);
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(
+        body["error"]["message"],
+        "`prompt_logprobs` are not available when `stream=True`."
+    );
+
+    let mut chat = chat_body("hi");
+    chat["top_logprobs"] = json!(2);
+    let (status, _, bytes) = send(
+        app_with(logprob_engine()),
+        json_request("/v1/chat/completions", &chat),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(&bytes)["error"]["message"],
+        "when using `top_logprobs`, `logprobs` must be set to true."
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_id_list_takes_precedence_over_the_natural_selection() {
+    // vLLM drops `logprobs`/\`top_logprobs\` from the sampling parameters when `logprob_token_ids` is
+    // set, so neither the cap nor the list length is checked: only presence and the -1 floor are.
+    let (status, _, bytes) = send(
+        app_with(logprob_engine()),
+        json_request(
+            "/v1/completions",
+            &json!({"model": MODEL, "prompt": "hello", "logprobs": 21, "logprob_token_ids": [7]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body_json(&bytes));
+    let body = body_json(&bytes);
+    let top = body["choices"][0]["logprobs"]["top_logprobs"][0]
+        .as_object()
+        .expect("a dict");
+    assert!(
+        top.keys().any(|key| key == "Hi"),
+        "the explicit id is reported: {top:?}"
+    );
+
+    let (status, _, bytes) = send(
+        app_with(logprob_engine()),
+        json_request(
+            "/v1/completions",
+            &json!({"model": MODEL, "prompt": "hello", "logprobs": -2, "logprob_token_ids": [7]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(&bytes)["error"]["message"],
+        "`logprobs` must be a positive value or -1."
+    );
+
+    let mut chat = chat_body("hi");
+    chat["logprobs"] = json!(true);
+    chat["top_logprobs"] = json!(21);
+    chat["logprob_token_ids"] = json!([7]);
+    let (status, _, bytes) = send(
+        app_with(logprob_engine()),
+        json_request("/v1/chat/completions", &chat),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body_json(&bytes));
+
+    let mut chat = chat_body("hi");
+    chat["logprob_token_ids"] = json!([7]);
+    let (status, _, bytes) = send(
+        app_with(logprob_engine()),
+        json_request("/v1/chat/completions", &chat),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(&bytes)["error"]["message"],
+        "when using `logprob_token_ids`, `logprobs` must be set to true."
+    );
+}
+
+#[tokio::test]
+async fn chat_logprobs_true_alone_asks_for_the_sampled_token() {
+    let mut body = chat_body("hi");
+    body["logprobs"] = json!(true);
+    let (status, _, bytes) = send(
+        app_with(logprob_engine()),
+        json_request("/v1/chat/completions", &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body_json(&bytes));
+    let body = body_json(&bytes);
+    let content = &body["choices"][0]["logprobs"]["content"];
+    assert_eq!(content.as_array().expect("array").len(), 2);
+    assert_eq!(content[0]["token"], "Hello");
+    assert_eq!(
+        content[0]["top_logprobs"],
+        json!([]),
+        "vLLM's logprobs=0 reports the token with no alternatives"
+    );
+}
+
+#[tokio::test]
+async fn an_unstated_vocabulary_cannot_serve_the_whole_vocabulary() {
+    let engine = MockEngine::new(MODEL)
+        .with_cluster_stats(ClusterStatsSnapshot::default())
+        .with_capabilities(Capabilities::ALL)
+        .content(&["Hello"])
+        .with_token_logprobs(vec![scripted(
+            11,
+            "Hello",
+            -0.5,
+            vec![alternative(11, "Hello", -0.5, 1)],
+        )]);
+    let (status, _, bytes) = send(
+        app_with(engine),
+        json_request(
+            "/v1/completions",
+            &json!({"model": MODEL, "prompt": "hello", "logprobs": -1}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body_json(&bytes)["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("does not report its vocabulary size"),
+        "{}",
+        body_json(&bytes)["error"]["message"]
+    );
+}
+
+#[tokio::test]
+async fn the_logprob_cap_can_be_lifted_like_max_logprobs() {
+    let app = router(
+        AppState::new(Arc::new(logprob_engine()))
+            .with_fixed_time(FIXED_TIME)
+            .with_max_logprobs(usize::MAX),
+    );
+    let (status, _, bytes) = send(
+        app,
+        json_request(
+            "/v1/completions",
+            &json!({"model": MODEL, "prompt": "hello", "logprobs": -1}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {}", body_json(&bytes));
+}
+
+#[tokio::test]
+async fn streaming_chat_carries_each_token_with_its_logprobs() {
+    let mut body = chat_body("hi");
+    body["stream"] = json!(true);
+    body["logprobs"] = json!(true);
+    body["top_logprobs"] = json!(2);
+    let (status, _, bytes) = send(
+        app_with(logprob_engine()),
+        json_request("/v1/chat/completions", &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let frames = sse_frames(&bytes);
+    let scored: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame["choices"][0]["logprobs"].is_object())
+        .collect();
+    assert_eq!(scored.len(), 2, "one chunk per generated token: {scored:?}");
+    assert_eq!(scored[0]["choices"][0]["delta"]["content"], "Hello");
+    assert_eq!(
+        scored[0]["choices"][0]["logprobs"]["content"][0]["token"],
+        "Hello"
+    );
+    assert_eq!(scored[1]["choices"][0]["delta"]["content"], " world");
+}
+
+#[tokio::test]
+async fn streaming_completions_echo_the_prompt_in_the_first_chunk() {
+    let (status, _, bytes) = send(
+        app_with(logprob_engine()),
+        json_request(
+            "/v1/completions",
+            &json!({"model": MODEL, "prompt": "hello", "stream": true, "echo": true, "logprobs": 1}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let frames = sse_frames(&bytes);
+    let scored: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame["choices"][0]["logprobs"].is_object())
+        .collect();
+    assert_eq!(scored.len(), 2, "one chunk per generated token: {scored:?}");
+    assert_eq!(scored[0]["choices"][0]["text"], "helloHello");
+    assert_eq!(
+        scored[0]["choices"][0]["logprobs"]["tokens"],
+        json!(["a", "b", "c", "Hello"])
+    );
+    assert_eq!(
+        scored[0]["choices"][0]["logprobs"]["text_offset"],
+        json!([0, 1, 2, 3])
+    );
+    assert_eq!(scored[1]["choices"][0]["text"], " world");
+    assert_eq!(
+        scored[1]["choices"][0]["logprobs"]["text_offset"],
+        json!([10]),
+        "the streamed offset continues from the text already sent"
+    );
 }

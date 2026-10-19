@@ -122,7 +122,7 @@ and the kernel's rounding/vector-load tokens.
 4. **odd width**: a synthetic \`[3, 513]\` BF16 case (not a multiple of eight, so the scalar path
    runs) is bit-exact to the reference; the operand is declared synthetic.
 
-Window command used for the b41 c4c-norm record (the cubin was staged next to the binary):
+Window command used for the b41/b45 record (the cubin is staged next to the binary):
 
 \`\`\`bash
 sparkflash_m18_final_norm_<rev>_aarch64 --checkpoint <snapshot dir> --cubin-dir <cubin dir> --tokens 8 --floor-gib 32
@@ -158,7 +158,9 @@ odd-width operands are declared synthetic.
 - The host fallback stays \`sparkflash_engine::linalg::rms_norm\` on the f32 tail; the device path
   replaces the \`final_norm\` host seam (\`forward/mod.rs:602\`, \`StageEvent: "host final RMS norm;
   class-(b) seam, not device-executed"\`) with the launch and a declared fallback behind a flag.
-- The REQUIRED_KERNELS catalog includes this kernel: it is one of the nine required
-  chain pins, and the c4c final-norm launch is gated by it.
+- `sparkflash-device/src/cubins.rs::REQUIRED_KERNELS` now includes this kernel: the c4c-norm
+  cut-over wired the launch (b41), so the hybrid-sequence tree requires eleven kernels (the six
+  chain kernels, router, routed gate/up, this RMSNorm, the head reduce and the CSA2 sequence entry)
+  against thirteen baseline pins.
 - The kernel emits no trace event (no norm scope among the sixteen assigned bits); do not record
   it under a dense/mHC scope.

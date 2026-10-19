@@ -48,6 +48,7 @@ records the evidence and the consequence for the build. Research backing is in
 | D37 | Criterion 1 stays OPEN: the FP8-native device path is stage-faithful but not token-parity with the f32 reference (superseded by D39: native arithmetic, numeric criterion) | b55-b62 measured the whole sequence path: alignment, pre-attention hidden, format-2 body, `wq_b`-vs-`mxfp8_ref` and the head reduce all pass at their own bars, yet position 0 predicts 320 where the reference predicts 201 (head input differs by 0.608) because the device attention path quantises activations (MXFP8, 32-element blocks, power-of-two ceil scales) while the fixture reference is f32 over dequantised weights. The first criterion-shaped 130+8 attempt (b62) aborted at 131/138 positions on a ~0.8 GB/position memory defect. No maths was changed; exact token parity needs either a precision-first activation path or a redefined criterion, and the hybrid-sequence branch stays unmerged until then |
 | D38 | vLLM token parity is only meaningful on the same weights, and the deployed vLLM serves a different checkpoint | `/v1/models` on the cluster reports the `pqhaz/...-heretic` snapshot `12d58ad0...`, while the fixture and the device engine use the released `deepseek-ai/...` snapshot `1bae0e10...`; its greedy completions are degenerate and must not be treated as a parity target. Any future vLLM comparison must first record the served `root` and prove it equals the snapshot under test |
 | D39 | The chain runs the checkpoint's native arithmetic; acceptance is numeric with tolerance, and vLLM is the behavioural oracle | Native arithmetic means the released forward's rule (model.py:27-30, 182-205: 32-element ue8m0-ceil activations, 32x32 ue8m0 / FP4-32 weights, f32 accumulate), not f32/BF16-class activations; token equality is retired as a criterion because generation is not deterministic, so acceptance is numeric/distributional at declared tolerances; vLLM is the behavioural oracle; Engram weights stay disk-offloaded |
+| D40 | Serving-parity measurement protocol, metric set and provisional numeric bars, declared before the first diagnostic run (D41 freezes them) | The oracle is vLLM serving the released snapshot at TP=4, temperature 0, prompt_logprobs with max-logprobs 1000 and the served root recorded (D38); the device side is the full-vocabulary --dump-logits artefact on the same token ids; the comparison reports top-1/top-5/top-20 agreement, max/mean |delta logprob| over the oracle top-100 and KL over a fixed renormalised top-100 support, per position plus aggregates; provisional bars are top-1 >= 95% of positions, median top-20 recall >= 90%, median KL <= 0.02 nat and p95 <= 0.10 nat, max |delta| <= 1.0 nat per position (no position above 2.0); D41 must freeze the thresholds from the measured oracle self-consistency floor (at least 3x the floor) before any serving claim, and a bar changed after a gate run is a new decision |
 
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
@@ -2318,3 +2319,131 @@ simulation - not a device defect.
   (docs/build/native-arithmetic-audit.md) plus the per-kernel audit against kernel.py
   (docs/build/native-kernel-arithmetic-audit.md); the numeric comparison against the vLLM-released
   oracle is measured in window b69.
+
+
+## D40 - Serving-parity measurement: the protocol, the metrics and the provisional bars, declared before the first measurement
+
+Recorded 2026-10-19 (Lead), ahead of the first diagnostic run of the native device chain against
+the vLLM-released oracle (b70). D39 fixed *what* is compared (native arithmetic, vLLM as the
+behavioural oracle, numeric/distributional tolerance, never token equality); this decision fixes
+*how* it is measured and what the numbers must be before a serving-parity claim is allowed.
+
+**Decision.** The measurement protocol and the metric set below are frozen now. The numeric
+thresholds are **provisional** and are frozen for acceptance in a follow-up decision (D41) that must
+be recorded before the serving-parity gate run; D41 also fixes the API/performance bars. No claim of
+serving parity may be made on a diagnostic run, and no bar may be changed after a gate run has been
+measured - a changed bar is a new decision and the next run is a new gate.
+
+### Protocol (frozen)
+
+1. **Oracle side.** vLLM serving the released snapshot
+   1bae0e1088993b9b82de08f59de5be5a34e42170, TP=4, temperature 0, --max-logprobs 1000. The served
+   root is read from /v1/models and recorded in the same evidence file as the numbers; a request
+   with a different root invalidates the comparison (D38). One request per pinned prompt (the
+   prompt suite of task-18), prompt_logprobs over the full prompt; the distribution at compared
+   position p is prompt_logprobs[p + 1] - the next-token distribution the oracle assigns after
+   consuming position p.
+2. **Device side.** sparkflash device-chain --run-stage hybrid_sequence --dump-logits FILE on the
+   same token ids (prefill only; no sampling, no generation). The dump is one JSONL object per
+   compared position plus FILE.bin, consecutive little-endian f32 blocks holding the full
+   129,280-vocabulary logits in the same position order.
+3. **Comparison.** Offline, from the two artefacts; every evidence file records the served root, the
+   device binary sha256, the cubin set identity, the fixture and prompt-suite sha256, and the two
+   source filenames. No live server is needed for the comparison, so a window is used once per side.
+4. **Same tokens both sides.** The comparison uses the fixture's prompt ids, not generated tokens:
+   at temperature 0 with the same prefix both implementations are asked the same question; token
+   streams after the first divergence are not comparable and are not compared (D39).
+
+### Metrics (frozen)
+
+With O_p the oracle's top-1000 distribution at position p and D_p the device's full distribution:
+
+- top1_agree(p) - the oracle's argmax equals the device's argmax;
+- top5_recall(p), top20_recall(p) - fraction of the oracle's top-5 / top-20 ids that are in the
+  device's top-5 / top-20;
+- max_abs_dlogp(p) and mean_abs_dlogp(p) - the maximum and mean of |O_p(t) - D_p(t)| over the
+  oracle's top-100 ids (raw logprobs, no renormalisation);
+- kl(p) - KL(O_p || D_p) in nats over the union support of the oracle and device top-100, renormalised
+  on both sides to that common support (a fixed support makes the number comparable across
+  positions).
+
+Aggregates over a run: top1_agree fraction over compared positions, median/mean/p95 of kl and
+max_abs_dlogp, and the same broken down per prompt. The evidence file stores every per-position
+value, not only the aggregates.
+
+### Provisional bars (frozen for D41)
+
+A quality pass requires **all** of the following on the pinned suite:
+
+- top1_agree >= 95% of compared positions;
+- median top20_recall >= 90%;
+- median kl <= 0.02 nat and p95 kl <= 0.10 nat;
+- per position max_abs_dlogp <= 1.0 nat, and no position above 2.0 nat.
+
+Rationale: a different-but-valid native kernel arithmetic (different accumulation association, the
+same quantisation rule) is expected to move logprobs by small fractions of a nat, which leaves top-k
+sets stable except where the distribution is nearly flat; the bar is set to catch a *model*
+difference (the class of the b68 simulation-vs-native distance) while allowing kernel-order
+differences. The thresholds are provisional because no measurement exists yet of the oracle's own
+run-to-run variation.
+
+### Floor rule (frozen)
+
+Before D41 freezes the thresholds, the campaign measures the oracle's self-consistency floor on the
+same prompts: the same request issued at batch size 1 and inside a batch of 4 (and issued twice),
+which yields the implementation's own kl / max_abs_dlogp variation. The frozen bars must be at least
+3x that measured floor; if the floor is larger than the provisional bars above, the discrepancy is
+investigated and reported, not absorbed by loosening the bar.
+
+### Bar file format (for D41)
+
+D41 is recorded as a JSON file, not prose, so the gate run consumes it directly.
+`scripts/compare_native_vs_vllm.py` accepts exactly these names (`--bars FILE`); any other name is
+ignored and the run is unbared:
+
+| name | D40 metric | provisional value |
+| :--- | :--- | :--- |
+| positions_min | compared positions present in the dump | 9 |
+| top1_agreement_min | top1_agree fraction over positions | 0.95 |
+| top5_overlap_mean_min | mean top5_recall | 0.90 |
+| top20_overlap_mean_min | mean top20_recall | 0.90 |
+| top100_overlap_mean_min | mean fraction of the oracle's top-100 in the device's top-100 | 0.80 |
+| top1000_overlap_mean_min | mean fraction of the oracle's top-1000 in the device's top-1000 | 0.60 |
+| max_abs_delta_max | maximum over positions of max_abs_dlogp | 1.0 |
+| mean_abs_delta_max | mean over positions of mean_abs_dlogp | 0.10 |
+| kl_mean_max | mean of kl | 0.02 |
+| kl_p95_max | p95 of kl | 0.10 |
+| js_mean_max | mean Jensen-Shannon divergence (diagnostic, not a bar) | 0.05 |
+
+The "no position above 2.0 nat" tail rule stays in the report even though the schema has no separate
+name for it: such positions are listed individually in the evidence, and a run with any of them fails
+at review even if the file gate passes. The D41 values are the floor rule's output, not these
+provisional numbers copied forward.
+
+### First measured oracle facts (2026-10-19, before b70)
+
+Captured against the released root at 17:28Z: the fixture's positions 129..137
+(`native-oracle-released.json`) and the 8-prompt suite at every position
+(`native-oracle-suite.json`), both with `prompt_logprobs=1000` and the served root verified. Two
+facts to keep when reading b70:
+
+- At device position 129 the oracle's argmax is token 367 with logprob -0.199, while the fixture's
+  reference token 491 has logprob -5.449 (rank 7), and the heretic vLLM of D38 also produced 367
+  first. The fixture's `next_token` columns are therefore a simulation artefact (as D39 already
+  held), not oracle truth: a low top-1 agreement at these positions is a statement about the
+  simulation until task-32 root-causes the difference, not a device regression.
+- vLLM scores prompt token `i` in `prompt_logprobs[i]` given `0..i-1` with entry 0 null, which is
+  device position `p = i - 1`; that is the convention the harness implements and the one the
+  comparison joins on.
+
+### Consequences
+
+- b70 is a **diagnostic** run: its numbers are recorded, labelled pre-fix, and no pass/fail is
+  claimed. Its value is the F1-F8 magnitude measured against the released oracle instead of against
+  the f32 simulation.
+- Every native-arithmetic fix (task-4 .. task-11) that gets a window reports its movement in these
+  metrics; the twin/stage bars remain the per-fix gate (task-12), these metrics are the native gate.
+- The serving-parity gate (task-26) evaluates this protocol on the pinned suite with the D41-frozen
+  bars, together with the performance bars D41 also fixes.
+- docs/build/serving-parity-plan.md section 4 points here; the plan's phrase "bars are declared
+  before the run" now has a named record.

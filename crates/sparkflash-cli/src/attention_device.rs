@@ -3,10 +3,13 @@
 //! selected-list seams left exactly where they are. This module is only compiled with
 //! `--features cuda`.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::forward::attention::AttentionProjectionBackend;
+use sparkflash_engine::forward::attention::sparse_attention;
 use sparkflash_engine::linalg::EngineError;
 use sparkflash_engine::quant::quantize_activation_fp8;
 use sparkflash_engine::weights::WeightSource;
@@ -14,15 +17,19 @@ use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel, KernelId, Module}
 use sparkflash_kernels::cuda_harness::{
     FlashMlaKernel, engine_window_row, flash_mla_params, launch_flash_mla, load_flash_mla,
 };
+use sparkflash_kernels::flash_mla_csa2_seq_launch::{self, FlashMlaSeqParams};
 use sparkflash_kernels::m4_quant::bf16_bits;
 use sparkflash_kernels::mxfp8_dense_launch::{self, Mxfp8DenseParams};
 use sparkflash_kernels::mxfp8_ref::b12x_weight_index;
 use sparkflash_kernels::mxfp8_wo_a_launch::{self, Mxfp8WoAParams};
-use sparkflash_kv::fp4::quantize_main_kv;
+use sparkflash_kv::fp4::{dequantize_main_kv, quantize_main_kv};
+/// One packed projection weight: the value bytes and their block scales, read once per name.
+type PackedWeight = Arc<(Vec<u8>, Vec<u8>)>;
 
 const DENSE_KERNEL: &str = "b12x_mxfp8_dense_sm121";
 const WO_A_KERNEL: &str = "b12x_mxfp8_wo_a_sm121";
 const FLASH_MLA_KERNEL: &str = "flash_mla_csa2_sm121";
+const FLASH_MLA_SEQ_KERNEL: &str = "flash_mla_csa2_seq_sm121";
 /// The CSA-union format value the m14 kernel expects.
 const FORMAT_CSA_UNION: u64 = 2;
 /// 64 heads x 512 latent x bf16.
@@ -72,13 +79,68 @@ pub struct AttentionDeviceStats {
     pub layers: usize,
 }
 
+/// One staged attention operand summary for the b56 follow-up: q and sink checksums, the exact
+/// window and selected ids the device staged, and the first/last window-code checksums. It is a
+/// diagnostic copy only and does not feed the launch.
+#[derive(Debug, Clone)]
+pub struct AttentionOperandTrace {
+    /// Absolute query position.
+    pub position: usize,
+    /// Backbone layer.
+    pub layer: usize,
+    /// The q row the body consumed.
+    pub q_values: Vec<f32>,
+    /// First q value.
+    pub q_first: f32,
+    /// Last q value.
+    pub q_last: f32,
+    /// XOR-fold of the q BF16 words (enough to compare device and host staging).
+    pub q_checksum: u64,
+    /// First sink value.
+    pub sink_first: f32,
+    /// Last sink value.
+    pub sink_last: f32,
+    /// XOR-fold of the sink words.
+    pub sink_checksum: u64,
+    /// The window ids the device staged, oldest first.
+    pub window_ids: Vec<usize>,
+    /// The selected compressed ids the device staged.
+    pub selected: Vec<usize>,
+    /// Number of compressed rows staged.
+    pub compressed_count: usize,
+    /// Inferred compression ratio.
+    pub ratio: usize,
+    /// Number of staged window codes.
+    pub window_codes_len: usize,
+    /// XOR-fold of the first window row's codes.
+    pub window_first_checksum: u64,
+    /// XOR-fold of the last window row's codes.
+    pub window_last_checksum: u64,
+    /// Number of staged compressed code bytes.
+    pub compressed_codes_len: usize,
+}
+
+fn checksum_f32(values: &[f32]) -> u64 {
+    values.iter().fold(0u64, |acc, value| {
+        acc.rotate_left(5) ^ value.to_bits() as u64
+    })
+}
+
+fn checksum_bytes(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .fold(0u64, |acc, value| acc.rotate_left(5) ^ *value as u64)
+}
+
 struct Kernels {
     dense: Kernel,
     wo_a: Kernel,
     flash: FlashMlaKernel,
+    flash_seq: Kernel,
     _dense_module: Module,
     _wo_a_module: Module,
     _flash_module: Module,
+    _flash_seq_module: Module,
 }
 
 struct Buffers {
@@ -121,6 +183,18 @@ pub struct AttentionDeviceBackend {
     // call, so the quantised operand is stashed here between the call that builds it and the one
     // that consumes it; this is a single-threaded chain, and each layer consumes it immediately.
     last_activation: Option<(Vec<u8>, Vec<u8>)>,
+    // Packed attention weights, read once per (layer, projection) name and reused across sequence
+    // positions. This is the M3-d staging-reuse shape for the projection set; host bytes only.
+    weight_cache: HashMap<String, PackedWeight>,
+    // Positions 0-2's staged operands for the residual/alignment diagnostic; empty otherwise.
+    operand_traces: Vec<AttentionOperandTrace>,
+    // Layer 0's first-position raw projection outputs, for the stage-aligned projection twin.
+    diag_latent_raw: Option<Vec<f32>>,
+    diag_q_raw: Option<Vec<f32>>,
+    diag_wq_b_input: Option<Vec<f32>>,
+    diag_wkv_raw: Option<Vec<f32>>,
+    diag_window_codes: Option<Vec<u8>>,
+    diag_wq_b_kernel: Option<(usize, usize, f32)>,
 }
 
 impl AttentionDeviceBackend {
@@ -134,10 +208,13 @@ impl AttentionDeviceBackend {
         let dense_bytes = verified_cubin(dir, DENSE_KERNEL)?;
         let wo_a_bytes = verified_cubin(dir, WO_A_KERNEL)?;
         let flash_bytes = verified_cubin(dir, FLASH_MLA_KERNEL)?;
+        let flash_seq_bytes = verified_cubin(dir, FLASH_MLA_SEQ_KERNEL)?;
         let cuda = Cuda::load()?;
         let (dense_module, dense) = cuda.load_kernel(&dense_bytes, KernelId::Mxfp8Dense)?;
         let (wo_a_module, wo_a) = cuda.load_kernel(&wo_a_bytes, KernelId::Mxfp8WoA)?;
         let (flash_module, flash) = load_flash_mla(&cuda, &flash_bytes)?;
+        let (flash_seq_module, flash_seq) =
+            flash_mla_csa2_seq_launch::load(&cuda, &flash_seq_bytes)?;
         let mut total = 0usize;
         let alloc = |bytes: usize, total: &mut usize| cuda.alloc(bytes, total);
         let a_codes = alloc(MAX_ACT_BYTES, &mut total)?;
@@ -184,9 +261,11 @@ impl AttentionDeviceBackend {
                 dense,
                 wo_a,
                 flash,
+                flash_seq,
                 _dense_module: dense_module,
                 _wo_a_module: wo_a_module,
                 _flash_module: flash_module,
+                _flash_seq_module: flash_seq_module,
             },
             buffers: Buffers {
                 a_codes,
@@ -214,6 +293,14 @@ impl AttentionDeviceBackend {
             stats: AttentionDeviceStats::default(),
             body_by_layer: vec![0; 64],
             last_activation: None,
+            weight_cache: HashMap::new(),
+            operand_traces: Vec::new(),
+            diag_latent_raw: None,
+            diag_q_raw: None,
+            diag_wq_b_input: None,
+            diag_wkv_raw: None,
+            diag_window_codes: None,
+            diag_wq_b_kernel: None,
         })
     }
 
@@ -227,6 +314,48 @@ impl AttentionDeviceBackend {
     #[must_use]
     pub fn body_launches(&self, layer: usize) -> usize {
         self.body_by_layer.get(layer).copied().unwrap_or(0)
+    }
+
+    /// The staged operand summaries for positions 0-2, in launch order.
+    #[must_use]
+    pub fn operand_traces(&self) -> &[AttentionOperandTrace] {
+        &self.operand_traces
+    }
+
+    /// Layer 0's first-position raw wq_a latent, for the projection twin.
+    #[must_use]
+    pub fn diag_latent_raw(&self) -> Option<&[f32]> {
+        self.diag_latent_raw.as_deref()
+    }
+
+    /// Layer 0's first-position raw wq_b q, before RoPE.
+    #[must_use]
+    pub fn diag_q_raw(&self) -> Option<&[f32]> {
+        self.diag_q_raw.as_deref()
+    }
+
+    /// Layer 0's first-position wq_b input latent, after q_norm.
+    #[must_use]
+    pub fn diag_wq_b_input(&self) -> Option<&[f32]> {
+        self.diag_wq_b_input.as_deref()
+    }
+
+    /// Layer 0's first-position raw wkv output, before kv_norm.
+    #[must_use]
+    pub fn diag_wkv_raw(&self) -> Option<&[f32]> {
+        self.diag_wkv_raw.as_deref()
+    }
+
+    /// Layer 0's first-position staged window codes.
+    #[must_use]
+    pub fn diag_window_codes(&self) -> Option<&[u8]> {
+        self.diag_window_codes.as_deref()
+    }
+
+    /// The wq_b kernel-vs-reference comparison: (BF16 mismatches, length, max abs diff).
+    #[must_use]
+    pub fn diag_wq_b_kernel(&self) -> Option<(usize, usize, f32)> {
+        self.diag_wq_b_kernel
     }
 
     /// The persistent device bytes this backend allocated.
@@ -280,6 +409,22 @@ impl AttentionDeviceBackend {
         Ok(())
     }
 
+    fn packed_weight(
+        &mut self,
+        src: &dyn WeightSource,
+        name: &str,
+        cols: usize,
+        inner: usize,
+    ) -> Result<PackedWeight, EngineError> {
+        if let Some(entry) = self.weight_cache.get(name) {
+            return Ok(Arc::clone(entry));
+        }
+        let entry = Arc::new(read_packed(src, name, cols, inner)?);
+        self.weight_cache
+            .insert(name.to_owned(), Arc::clone(&entry));
+        Ok(entry)
+    }
+
     fn read_out(&mut self, bytes: usize) -> Result<Vec<f32>, String> {
         let mut raw = vec![0u8; bytes];
         self.cuda.copy_dtoh(&mut raw, &self.buffers.out)?;
@@ -307,8 +452,8 @@ impl AttentionDeviceBackend {
             });
         }
         let started = std::time::Instant::now();
-        let (packed, scales) =
-            read_packed(src, &format!("{prefix}.attn.{weight_name}"), cols, inner)?;
+        let weight =
+            self.packed_weight(src, &format!("{prefix}.attn.{weight_name}"), cols, inner)?;
         let codes = self
             .last_activation
             .take()
@@ -316,7 +461,7 @@ impl AttentionDeviceBackend {
                 what: "attention activation".to_owned(),
                 detail: "the projection backend has no quantised activation".to_owned(),
             })?;
-        self.upload_weight(&packed, &scales)
+        self.upload_weight(&weight.0, &weight.1)
             .map_err(|detail| EngineError::Shape {
                 what: "attention weight upload".to_owned(),
                 detail,
@@ -373,6 +518,29 @@ impl AttentionDeviceBackend {
         self.stats.device_us += launched.elapsed().as_micros() as u64;
         self.stats.launches += 1;
         self.stats.layers = layer + 1;
+        if layer == 0 && weight_name == "wq_b.weight" && self.diag_wq_b_kernel.is_none() {
+            let reference = sparkflash_kernels::mxfp8_ref::dense_gemm(
+                &codes.0, &codes.1, &weight.0, &weight.1, rows, cols, inner,
+            );
+            let reference: Vec<f32> = reference
+                .iter()
+                .map(|bits| f32::from_bits((*bits as u32) << 16))
+                .collect();
+            let mut mismatches = 0usize;
+            let mut max_abs = 0f32;
+            for (device, host) in read.iter().zip(reference.iter()) {
+                let diff = (device - host).abs();
+                if diff > max_abs {
+                    max_abs = diff;
+                }
+                if sparkflash_kernels::m4_quant::bf16_bits(*device)
+                    != sparkflash_kernels::m4_quant::bf16_bits(*host)
+                {
+                    mismatches += 1;
+                }
+            }
+            self.diag_wq_b_kernel = Some((mismatches, reference.len(), max_abs));
+        }
         let _ = config;
         Ok(read)
     }
@@ -479,6 +647,398 @@ impl Drop for AttentionDeviceBackend {
     }
 }
 
+impl AttentionDeviceBackend {
+    /// One position-causal format-2 attention through the sequence entry. The engine passes the
+    /// decode step's ring KV: window rows in combined[..window_width] (ring slots, oldest first,
+    /// with NO_INDEX padding when the ring is not full) followed by compressed rows in the shared
+    /// index space (window_width + j). The kernel wants the window rows oldest-first and the
+    /// compressed candidates as even absolute positions, so the local compressed index j becomes
+    /// 2*j here; a stray future id is masked by the kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_sequence(
+        &mut self,
+        layer: usize,
+        q: &[f32],
+        kv: &[f32],
+        sink: &[f32],
+        combined: &[usize],
+        heads: usize,
+        head_dim: usize,
+        seqlen: usize,
+        window_width: usize,
+        scale: f32,
+        start_pos: usize,
+        out: &mut [f32],
+    ) -> Result<bool, EngineError> {
+        let _ = scale;
+        if seqlen != 1
+            || window_width == 0
+            || combined.len() < window_width
+            || q.len() != heads * head_dim
+            || out.len() < heads * head_dim
+            || sink.len() != heads
+            || !kv.len().is_multiple_of(head_dim)
+            || kv.len() / head_dim < window_width
+        {
+            return Ok(false);
+        }
+        let kv_rows = kv.len() / head_dim;
+        let window_ids: Vec<usize> = combined[..window_width]
+            .iter()
+            .copied()
+            .filter(|id| *id < window_width && *id < kv_rows)
+            .collect();
+        let window_count = window_ids.len();
+        if window_count == 0 || window_count > window_width {
+            return Ok(false);
+        }
+        let compressed_count = kv_rows - window_width;
+        // The compressed store groups ratio consecutive token positions per row. The engine mixes
+        // ratio-1 and ratio-2 layers, so recover it from the candidate count: at seqlen 1 the
+        // ratio-2 count is (start_pos + 1) / 2, and a larger count can only be ratio 1.
+        let ratio = if compressed_count == 0 || compressed_count > start_pos.div_ceil(2) {
+            1
+        } else {
+            2
+        };
+        let pool_rows = if compressed_count == 0 {
+            0
+        } else {
+            (compressed_count - 1) * ratio + 1
+        };
+        let mut selected: Vec<u32> = Vec::new();
+        for id in &combined[window_width..] {
+            if *id < window_width || *id >= kv_rows {
+                continue;
+            }
+            let local = id - window_width;
+            let absolute = u32::try_from(local * ratio).map_err(|_| EngineError::Shape {
+                what: "csa2 sequence selected id".to_owned(),
+                detail: format!("compressed index {local} does not fit a u32"),
+            })?;
+            selected.push(absolute);
+        }
+        if selected.len() > MAX_SELECTED / 4
+            || window_count * 512 > MAX_WINDOW_CODES
+            || window_count * 16 > MAX_WINDOW_SCALES
+            || pool_rows * 256 > MAX_KV_FP4
+            || pool_rows * 32 > MAX_KV_SCALES
+        {
+            return Ok(false);
+        }
+        if compressed_count == 0 && !selected.is_empty() {
+            return Ok(false);
+        }
+        let mut window_codes = Vec::with_capacity(window_count * 512);
+        let mut window_scales = Vec::with_capacity(window_count * 16);
+        for id in &window_ids {
+            let row = &kv[*id * head_dim..(*id + 1) * head_dim];
+            let window = engine_window_row(row).map_err(|detail| EngineError::Shape {
+                what: "csa2 sequence window row".to_owned(),
+                detail,
+            })?;
+            if window.codes.len() != 512 || window.scales.len() != 16 {
+                return Ok(false);
+            }
+            window_codes.extend_from_slice(&window.codes);
+            window_scales.extend_from_slice(&window.scales);
+        }
+        if layer == 0 && start_pos == 0 && self.diag_window_codes.is_none() {
+            self.diag_window_codes = Some(window_codes.clone());
+        }
+        // The kernel indexes the compressed pool by the selected absolute position itself
+        // (kv_fp4 + candidate * LATENT/2), so a position j is stored at row 2*j; odd rows stay zero.
+        let mut compressed_codes = vec![0u8; pool_rows * 256];
+        let mut compressed_scales = vec![0u8; pool_rows * 32];
+        for row in 0..compressed_count {
+            let values = &kv[(window_width + row) * head_dim..(window_width + row + 1) * head_dim];
+            let entry = quantize_main_kv(values).map_err(|error| EngineError::Shape {
+                what: "csa2 sequence compressed row".to_owned(),
+                detail: error.to_string(),
+            })?;
+            if entry.data.len() != 256 || entry.scales.len() != 32 {
+                return Ok(false);
+            }
+            let pool_row = row * ratio;
+            compressed_codes[pool_row * 256..(pool_row + 1) * 256].copy_from_slice(&entry.data);
+            compressed_scales[pool_row * 32..(pool_row + 1) * 32].copy_from_slice(&entry.scales);
+        }
+        let q_bytes: Vec<u8> = q
+            .iter()
+            .flat_map(|value| bf16_bits(*value).to_le_bytes())
+            .collect();
+        let sink_bytes = f32_bytes(sink);
+        let selected_bytes: Vec<u8> = selected
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        if start_pos <= 2 {
+            self.operand_traces.push(AttentionOperandTrace {
+                position: start_pos,
+                layer,
+                q_values: q.to_vec(),
+                q_first: q.first().copied().unwrap_or(0.0),
+                q_last: q.last().copied().unwrap_or(0.0),
+                q_checksum: checksum_f32(q),
+                sink_first: sink.first().copied().unwrap_or(0.0),
+                sink_last: sink.last().copied().unwrap_or(0.0),
+                sink_checksum: checksum_f32(sink),
+                window_ids: window_ids.clone(),
+                selected: selected.iter().map(|value| *value as usize).collect(),
+                compressed_count,
+                ratio,
+                window_codes_len: window_codes.len(),
+                window_first_checksum: checksum_bytes(&window_codes[..window_codes.len().min(512)]),
+                window_last_checksum: if window_codes.len() >= 512 {
+                    checksum_bytes(&window_codes[window_codes.len() - 512..])
+                } else {
+                    0
+                },
+                compressed_codes_len: compressed_codes.len(),
+            });
+        }
+        let started = std::time::Instant::now();
+        self.cuda
+            .copy_htod(&self.mla.q, &q_bytes)
+            .map_err(|detail| EngineError::Shape {
+                what: "csa2 sequence q upload".to_owned(),
+                detail,
+            })?;
+        self.cuda
+            .copy_htod(&self.mla.window_codes, &window_codes)
+            .map_err(|detail| EngineError::Shape {
+                what: "csa2 sequence window codes upload".to_owned(),
+                detail,
+            })?;
+        self.cuda
+            .copy_htod(&self.mla.window_scales, &window_scales)
+            .map_err(|detail| EngineError::Shape {
+                what: "csa2 sequence window scales upload".to_owned(),
+                detail,
+            })?;
+        if !compressed_codes.is_empty() {
+            self.cuda
+                .copy_htod(&self.mla.kv_fp4, &compressed_codes)
+                .map_err(|detail| EngineError::Shape {
+                    what: "csa2 sequence compressed codes upload".to_owned(),
+                    detail,
+                })?;
+            self.cuda
+                .copy_htod(&self.mla.kv_scales, &compressed_scales)
+                .map_err(|detail| EngineError::Shape {
+                    what: "csa2 sequence compressed scales upload".to_owned(),
+                    detail,
+                })?;
+        }
+        self.cuda
+            .copy_htod(&self.mla.selected, &selected_bytes)
+            .map_err(|detail| EngineError::Shape {
+                what: "csa2 sequence selected upload".to_owned(),
+                detail,
+            })?;
+        self.cuda
+            .copy_htod(&self.mla.sink, &sink_bytes)
+            .map_err(|detail| EngineError::Shape {
+                what: "csa2 sequence sink upload".to_owned(),
+                detail,
+            })?;
+        let params = FlashMlaSeqParams::new(
+            self.mla.q,
+            self.mla.kv_fp4,
+            self.mla.kv_scales,
+            self.mla.window_codes,
+            self.mla.window_scales,
+            FORMAT_CSA_UNION,
+            window_count as u64,
+            self.mla.selected,
+            self.mla.index_key,
+            self.mla.index_query,
+            self.mla.sink,
+            self.mla.block_scores,
+            self.mla.block_best,
+            self.mla.out,
+            start_pos as u64,
+            u32::try_from(selected.len()).map_err(|_| EngineError::Shape {
+                what: "csa2 sequence selected count".to_owned(),
+                detail: "selected list does not fit a u32".to_owned(),
+            })?,
+            0,
+            u32::try_from(layer).map_err(|_| EngineError::Shape {
+                what: "csa2 sequence layer".to_owned(),
+                detail: "layer does not fit a u32".to_owned(),
+            })?,
+            0,
+        );
+        flash_mla_csa2_seq_launch::launch(&self.cuda, self.kernels.flash_seq, &params).map_err(
+            |detail| EngineError::Shape {
+                what: "csa2 sequence attention launch".to_owned(),
+                detail,
+            },
+        )?;
+        let mut raw = vec![0u8; heads * head_dim * 2];
+        self.cuda
+            .copy_dtoh(&mut raw, &self.mla.out)
+            .map_err(|detail| EngineError::Shape {
+                what: "csa2 sequence readback".to_owned(),
+                detail,
+            })?;
+        for (slot, value) in decode_bf16(&raw).iter().enumerate() {
+            out[slot] = *value;
+        }
+        self.attention_twin(
+            layer,
+            q,
+            kv,
+            sink,
+            combined,
+            heads,
+            head_dim,
+            window_width,
+            scale,
+            start_pos,
+            out,
+        )?;
+        self.stats.host_bytes = self.stats.host_bytes.saturating_add(
+            (q_bytes.len()
+                + window_codes.len()
+                + window_scales.len()
+                + sink_bytes.len()
+                + selected_bytes.len()
+                + compressed_codes.len()
+                + compressed_scales.len()
+                + raw.len()) as u64,
+        );
+        self.stats.attention_us += started.elapsed().as_micros() as u64;
+        self.stats.attention_launches += 1;
+        if let Some(count) = self.body_by_layer.get_mut(layer) {
+            *count += 1;
+        }
+        Ok(true)
+    }
+}
+
+impl AttentionDeviceBackend {
+    /// In-chain body twin: run the host sparse-attention reference on the same q, kv, sink and
+    /// combined ids the device body was staged with, and compare the BF16 rounding of both
+    /// outputs. It reports a per-head-block mismatch count so a p>0 divergence can be localised
+    /// to the indexer/window/compressed-row contract instead of only the final token.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_twin(
+        &self,
+        layer: usize,
+        q: &[f32],
+        kv: &[f32],
+        sink: &[f32],
+        combined: &[usize],
+        heads: usize,
+        head_dim: usize,
+        window_width: usize,
+        scale: f32,
+        start_pos: usize,
+        device_out: &[f32],
+    ) -> Result<(), EngineError> {
+        if start_pos > 2 {
+            return Ok(());
+        }
+        let width = heads * head_dim;
+        // The host body must see the bytes the device body saw, not the unquantised checkpoint
+        // activations: BF16 q, one E4M3+E8M0 window row per ring slot, and the FP4 round-trip of
+        // each compressed row. Otherwise a quantisation difference masquerades as a mask/indexer
+        // bug.
+        let q_host: Vec<f32> = q
+            .iter()
+            .map(|value| f32::from_bits((bf16_bits(*value) as u32) << 16))
+            .collect();
+        let kv_rows = kv.len() / head_dim;
+        let mut host_kv = vec![0f32; kv.len()];
+        for slot in 0..window_width.min(kv_rows) {
+            let row = &kv[slot * head_dim..(slot + 1) * head_dim];
+            let window = engine_window_row(row).map_err(|detail| EngineError::Shape {
+                what: "attention twin window row".to_owned(),
+                detail,
+            })?;
+            for index in 0..head_dim {
+                host_kv[slot * head_dim + index] = sparkflash_kernels::mla_ref::window_kv_value(
+                    &window.codes,
+                    &window.scales,
+                    0,
+                    index,
+                );
+            }
+        }
+        for row in window_width..kv_rows {
+            let values = &kv[row * head_dim..(row + 1) * head_dim];
+            let entry = quantize_main_kv(values).map_err(|error| EngineError::Shape {
+                what: "attention twin compressed row".to_owned(),
+                detail: error.to_string(),
+            })?;
+            let mut staged = vec![0f32; head_dim];
+            dequantize_main_kv(&entry, &mut staged).map_err(|error| EngineError::Shape {
+                what: "attention twin compressed dequant".to_owned(),
+                detail: error.to_string(),
+            })?;
+            host_kv[row * head_dim..(row + 1) * head_dim].copy_from_slice(&staged);
+        }
+        let mut host_out = vec![0f32; width];
+        sparse_attention(
+            &q_host,
+            &host_kv,
+            sink,
+            combined,
+            heads,
+            head_dim,
+            scale,
+            &mut host_out,
+        )?;
+        let blocks = 8.min(heads);
+        let mut block_mismatches = vec![0usize; blocks];
+        let mut mismatches = 0usize;
+        let mut exact_heads = 0usize;
+        let mut max_abs_diff = 0f32;
+        for head in 0..heads {
+            let mut head_mismatches = 0usize;
+            for slot in head * head_dim..(head + 1) * head_dim {
+                let diff = (device_out[slot] - host_out[slot]).abs();
+                if diff > max_abs_diff {
+                    max_abs_diff = diff;
+                }
+                if bf16_bits(device_out[slot]) != bf16_bits(host_out[slot]) {
+                    head_mismatches += 1;
+                }
+            }
+            mismatches += head_mismatches;
+            if head_mismatches == 0 {
+                exact_heads += 1;
+            }
+            let block = head * blocks / heads;
+            block_mismatches[block] += head_mismatches;
+        }
+        let fractions: Vec<String> = block_mismatches
+            .iter()
+            .map(|count| {
+                let slots = (heads / blocks).max(1) * head_dim;
+                format!("{:.6}", 1.0 - *count as f64 / slots as f64)
+            })
+            .collect();
+        println!(
+            "sequence attention twin: position={} layer={} heads={} head_dim={} bf16_mismatches={}/{} exact_fraction={:.6} exact_heads={}/{} max_abs_diff={:.6e} per_head_block_mismatches={:?} per_head_block_exact_fraction=[{}]",
+            start_pos,
+            layer,
+            heads,
+            head_dim,
+            mismatches,
+            width,
+            1.0 - mismatches as f64 / width as f64,
+            exact_heads,
+            heads,
+            max_abs_diff,
+            block_mismatches,
+            fractions.join(",")
+        );
+        Ok(())
+    }
+}
+
 impl AttentionProjectionBackend for AttentionDeviceBackend {
     fn wq_a(
         &mut self,
@@ -491,7 +1051,7 @@ impl AttentionProjectionBackend for AttentionDeviceBackend {
     ) -> Result<Vec<f32>, EngineError> {
         let _ = limit;
         self.last_activation = Some(quantise(x, "wq_a activation")?);
-        self.dense(
+        let out = self.dense(
             config,
             layer,
             prefix,
@@ -500,7 +1060,11 @@ impl AttentionProjectionBackend for AttentionDeviceBackend {
             config.q_lora_rank,
             config.dim,
             rows_of(x, config.dim, "wq_a input")?,
-        )
+        )?;
+        if layer == 0 && self.diag_latent_raw.is_none() {
+            self.diag_latent_raw = Some(out.clone());
+        }
+        Ok(out)
     }
 
     fn wq_b(
@@ -514,8 +1078,11 @@ impl AttentionProjectionBackend for AttentionDeviceBackend {
     ) -> Result<Vec<f32>, EngineError> {
         let _ = limit;
         let rank = config.q_lora_rank;
+        if layer == 0 && self.diag_wq_b_input.is_none() {
+            self.diag_wq_b_input = Some(latent.to_vec());
+        }
         self.last_activation = Some(quantise(latent, "wq_b activation")?);
-        self.dense(
+        let out = self.dense(
             config,
             layer,
             prefix,
@@ -524,7 +1091,11 @@ impl AttentionProjectionBackend for AttentionDeviceBackend {
             config.n_heads * config.head_dim,
             rank,
             rows_of(latent, rank, "wq_b input")?,
-        )
+        )?;
+        if layer == 0 && self.diag_q_raw.is_none() {
+            self.diag_q_raw = Some(out.clone());
+        }
+        Ok(out)
     }
 
     fn wkv(
@@ -538,7 +1109,7 @@ impl AttentionProjectionBackend for AttentionDeviceBackend {
     ) -> Result<Vec<f32>, EngineError> {
         let _ = limit;
         self.last_activation = Some(quantise(x, "wkv activation")?);
-        self.dense(
+        let out = self.dense(
             config,
             layer,
             prefix,
@@ -547,7 +1118,11 @@ impl AttentionProjectionBackend for AttentionDeviceBackend {
             config.head_dim,
             config.dim,
             rows_of(x, config.dim, "wkv input")?,
-        )
+        )?;
+        if layer == 0 && self.diag_wkv_raw.is_none() {
+            self.diag_wkv_raw = Some(out.clone());
+        }
+        Ok(out)
     }
 
     fn wo_a(
@@ -577,13 +1152,13 @@ impl AttentionProjectionBackend for AttentionDeviceBackend {
                 detail: "missing quantised activation".to_owned(),
             })?;
         let started = std::time::Instant::now();
-        let (packed, scales) = read_packed(
+        let weight = self.packed_weight(
             src,
             &format!("{prefix}.attn.wo_a.weight"),
             config.o_groups * config.o_lora_rank,
             wide_row / config.o_groups,
         )?;
-        self.upload_weight(&packed, &scales)
+        self.upload_weight(&weight.0, &weight.1)
             .map_err(|detail| EngineError::Shape {
                 what: "wo_a weight upload".to_owned(),
                 detail,
@@ -672,6 +1247,22 @@ impl AttentionProjectionBackend for AttentionDeviceBackend {
         start_pos: usize,
         out: &mut [f32],
     ) -> Result<bool, EngineError> {
+        if start_pos > 0 {
+            return self.attention_sequence(
+                layer,
+                q,
+                kv,
+                sink,
+                combined,
+                heads,
+                head_dim,
+                seqlen,
+                window_width,
+                scale,
+                start_pos,
+                out,
+            );
+        }
         // c4a-2 wires the real format-2 launch at position 0 only: one query row, one window row,
         // and either no compressed candidate (ratio > 1) or the single reachable position 0
         // (ratio == 1). Anything else answers false and the host reference loop runs.
@@ -704,6 +1295,31 @@ impl AttentionProjectionBackend for AttentionDeviceBackend {
             what: "m14 window row".to_owned(),
             detail,
         })?;
+        if start_pos <= 2 {
+            let window_checksum = checksum_bytes(&window.codes);
+            self.operand_traces.push(AttentionOperandTrace {
+                position: 0,
+                layer,
+                q_values: q.to_vec(),
+                q_first: q.first().copied().unwrap_or(0.0),
+                q_last: q.last().copied().unwrap_or(0.0),
+                q_checksum: checksum_f32(q),
+                sink_first: sink.first().copied().unwrap_or(0.0),
+                sink_last: sink.last().copied().unwrap_or(0.0),
+                sink_checksum: checksum_f32(sink),
+                window_ids: combined[..window_width.min(combined.len())].to_vec(),
+                selected: combined[window_width.min(combined.len())..].to_vec(),
+                compressed_count: compressed,
+                ratio: 1,
+                window_codes_len: window.codes.len(),
+                window_first_checksum: window_checksum,
+                window_last_checksum: window_checksum,
+                compressed_codes_len: if compressed == 1 { 256 } else { 0 },
+            });
+        }
+        if layer == 0 && self.diag_window_codes.is_none() {
+            self.diag_window_codes = Some(window.codes.clone());
+        }
         let sink_bytes = f32_bytes(sink);
         self.cuda
             .copy_htod(&self.mla.q, &q_bytes)
@@ -804,6 +1420,9 @@ impl AttentionProjectionBackend for AttentionDeviceBackend {
         for (slot, value) in decode_bf16(&raw).iter().enumerate() {
             out[slot] = *value;
         }
+        self.attention_twin(
+            layer, q, kv, sink, combined, heads, head_dim, 1, scale, start_pos, out,
+        )?;
         let compressed_bytes = if compressed == 1 { 256 + 32 + 4 } else { 0 };
         self.stats.host_bytes = self.stats.host_bytes.saturating_add(
             (q_bytes.len()

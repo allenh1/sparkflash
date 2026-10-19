@@ -68,6 +68,7 @@ fn request(temperature: f32) -> EngineRequest {
         request_id: "m1".to_owned(),
         model: MODEL_ID.to_owned(),
         prompt_tokens: vec![1, 2, 3],
+        logprobs: sparkflash_api::LogprobsRequest::default(),
         images: Vec::new(),
         max_tokens: 4,
         temperature,

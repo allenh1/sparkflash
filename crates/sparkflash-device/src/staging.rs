@@ -324,6 +324,63 @@ pub struct LayerZeroStaging {
     pub buffer_digests: Vec<StagedTensor>,
 }
 
+/// Reads one embedding row on demand from the checkpoint, for a token that was not in the
+/// pre-staged set. The embedding gather is a declared host seam, so a decode token produced by the
+/// device head can be embedded without staging the whole vocabulary table.
+///
+/// # Errors
+/// [StagingError] on a missing tensor, a dtype/shape mismatch, an out-of-range position, a short
+/// read, or a source that cannot page a row.
+pub fn embed_row_from_source(
+    source: &dyn WeightSource,
+    position: usize,
+) -> Result<EmbedRow, StagingError> {
+    let embed_spec = source
+        .spec(EMBED_WEIGHT)
+        .map_err(|error| source_error(EMBED_WEIGHT, error))?;
+    if embed_spec.dtype != DType::BF16
+        || embed_spec.shape.len() != 2
+        || embed_spec.shape[1] != HIDDEN
+    {
+        return Err(StagingError::Spec {
+            name: EMBED_WEIGHT.to_string(),
+            expected: format!("BF16 [vocab, {HIDDEN}]"),
+            found: format!("{} {:?}", embed_spec.dtype.name(), embed_spec.shape),
+        });
+    }
+    let rows = embed_spec.shape[0];
+    if position >= rows {
+        return Err(StagingError::Position {
+            name: EMBED_WEIGHT.to_string(),
+            position,
+            rows,
+        });
+    }
+    let row_bytes = HIDDEN * 2;
+    let offset = position
+        .checked_mul(row_bytes)
+        .ok_or_else(|| StagingError::Position {
+            name: EMBED_WEIGHT.to_string(),
+            position,
+            rows,
+        })? as u64;
+    let ranges = source
+        .read_ranges(EMBED_WEIGHT, &[(offset, row_bytes)])
+        .ok_or_else(|| StagingError::EmbedUnpaged {
+            name: EMBED_WEIGHT.to_string(),
+            bytes: embed_spec.storage_bytes(),
+        })?;
+    let row = ranges.map_err(|error| source_error(EMBED_WEIGHT, error))?;
+    if row.len() != row_bytes {
+        return Err(StagingError::Bytes {
+            name: format!("{EMBED_WEIGHT}[{position}]"),
+            expected: row_bytes,
+            found: row.len(),
+        });
+    }
+    EmbedRow::new(position, row, rows)
+}
+
 impl LayerZeroStaging {
     /// Reads the layer-0 mHC tensors and the declared embed rows through a WeightSource.
     ///

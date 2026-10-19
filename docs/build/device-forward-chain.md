@@ -1412,6 +1412,267 @@ reference is the token-0 slot, so a non-zero prompt id is not accepted there. Th
 prompt id, and the 3-position sanity run is the first log expected to cite it. The guard is a
 deliberate reference-shape limit, not a claim that row 0 is the only embedding row.
 
+### Per-window records retained from the hybrid-sequence branch (b53-b62; superseded by the consolidated record later in this section)
+
+The dated subsections below are the hybrid branch's own window records, kept verbatim so the
+merge does not delete a measured window. The consolidated "Hybrid sequence path b55-b62" record
+later in this section is the later canon for b55-b62; where the two disagree (for example b53
+versus b54 as the split-counter record), the consolidated record and its accounting note govern.
+
+### c4c-norm window b53: split-counter accounting record
+
+Window b53 ran tip 6170230 (binary sparkflash_m3c_c4c_seqreuse_6170230_aarch64, sha256
+9853c02b2b7052673473cc851bbded51ecb065d659b867e0e5c55e34d30f3d13), window log
+window-b53-20261019T104523Z.log (sha256
+8a4e3a571ba1a45987edb9befcef590982dee578762ec87c80019d16be473c63), window start
+2026-10-19T10:45:23Z, host node0, MemAvailable 123,991,476 kB. The c4c-norm RUN
+started 10:46:38Z and exited 0 at 10:47:30Z; log runs53/c4c-norm-token0.log (sha256
+719cc03b517d9ca5c3ea4ab87cca7c37d25fdd6fe13c183c109006c5c73e1f43). This is the first window
+whose routed and shared totals lines carry distinct host bytes, so it is the split-counter
+accounting record. Verbatim:
+
+```text
+routed MoE totals: layers=40 router_launches=40 gate_up_launches=320 weighted_launches=160 combine_launches=160 moe_launches=680 staging_ms=3445 device_us=388431 staged_expert_bytes=9349393600 host_bytes=4515856824 layer0_host_max_abs=1.909e-1 layer0_host_rel=2.014e-2 layer0_host_max=9.479e0 layer0_bf16_twin_mismatches=0 layer0_bf16_twin_max_abs=0.000e0
+shared expert totals: layers=40 shared_launches=160 staging_ms=1758 device_us=306274 total_us=2064542 staged_shared_bytes=1417171200 host_bytes=620800 layer0_shared_bf16_mismatches=0 layer0_shared_host_max_abs=1.303e-2 layer0_shared_host_rel=8.163e-3 layer0_shared_host_max=1.597e0
+moe counts: routed_launches=680 shared_launches=160 total_launches=840 routed_staging_us=3445105 shared_staging_us=1758268 total_staging_us=5203373
+chain totals: layers=40 sequence_positions=1 entry_launches=42 post_launches=40 attention_projection_launches=200 attention_body_launches=40 routed_moe_launches=680 shared_moe_launches=160 head_launches=5 tail_norm_launches=1 moe_launches=840 device_launches=1168 engram_split_layers=2 device_us=5506333 device_ms=5506.333 staging_ms=12793 host_ms=14368 total_chain_ms=17452 host_bytes=4591049624 staged_matrix_bytes=16073744000 cubin_bytes=302136 device_buffer_bytes=48723168 (entry/post/moe/head/norm totals are cumulative over 1 positions; host/bytes/timing are the last position only)
+token comparison: reference_id=5 hybrid_id=5 exact_equal=true top5_overlap=4
+CHAIN-WIRING token parity: PASS - the hybrid chain produced the same token id as the in-process reference engine; this is chain-wiring parity, not a device-token claim, and criterion 1 remains OPEN
+```
+
+The split is observable: routed host bytes 4,515,856,824 and shared host bytes 620,800 are
+different counters on the two lines. The chain total staging is 12,793 ms and device_launches=1168
+(the lm_head_reduce_sm121 cut-over adds one launch vs b45 1167); the head line reports
+head_launches=5 with reduce_used=true, so the token is device-produced. b53 is still CHAIN-WIRING
+parity, not criterion 1.
+
+The same window ran the 3-position timing: it printed positions 0/1/2 at wall 18107/8772/8536 ms
+and exited 1 at the pre-fix c4a-2 seam because 6170230 predates the sequence seam fix (three
+format-2 bodies per layer vs the one-position guard); those timing lines are a measurement, not a
+criterion result, and the projection field is superseded by e7c0456. The criterion-shaped 130+8
+RUN on 6170230 started 10:49:35Z but was stopped when b54 superseded the binary; it produced no
+result and is not a criterion record.
+
+b52 history (superseded). b52 ran the same c4c command on 37b3d45 (sha256
+1dc1e2cf18209225b2def2ff06bb6b66db2c87ea8aa36be8a6af170d64b65204). It passed CHAIN-WIRING with
+token 5=5 and device_launches=1168, but its routed and shared totals both printed the cumulative
+host_bytes=4515856824 because of the shared-host-bytes mischarge, and its 3-position run died at
+the same pre-fix c4a-2 seam. b52 is recorded only as history; its host-byte split and its timing
+projection must not be cited.
+
+### c4c-norm window b54 and sequence timing b55
+
+Window b54 ran the post-projection binary e7c0456 for c4c-norm and repeated the split accounting:
+binary sha256 6b1c15f5e48953918a1fe941ef2dda0a1492f22b7bab33649215d1d7fa19ea39; window
+window-b54-20261019T105232Z.log, c4c-norm exit 0 at 10:53:18Z, routed host_bytes=4515856824 and
+shared host_bytes=620800 distinct, moe counts routed 3184489 shared 1775648 total 4960137, chain
+staging_ms=12620 device_launches=1168, token 5=5 CHAIN-WIRING PASS. The b54 3-position run still
+died at the per-layer MoE seam and the b54 130+8 was stopped before a result; b54 is not the
+sequence record.
+
+Window b55 ran 641462a (binary sparkflash_m3c_c4c_seqreuse_641462a_aarch64, sha256
+a2227d97f7d6adf35823fb751ee863b7752c0f8457edd3f9d05246fd67a5823e), window start
+2026-10-19T11:00:46Z, MemAvailable 123,254,016 kB. The 3-position RUN started 11:00:46Z, printed
+the three timing lines, passed every seam, and exited 1 only on the known p0 token divergence.
+Log runs55/seq-timing-3.log (sha256
+223f73bdca0c5561c93850c8c6ac493a132b30a7e1092943aa6829e8621fbe62). Verbatim:
+
+```text
+sequence position: position=0 done=1/3 wall_ms=16034 chain_ms=16490 projected_total_s=2348.8 projected_chain_full_s=2275.6 full_positions=138 reference_basis=requested_only budget_s=3600 attention_staging_us=6150565 attention_device_us=541370 moe_staging_us=5922940 moe_device_us=5378222 routed_staging_us=4321254 routed_device_us=436414 shared_staging_us=1601686 shared_device_us=306329 total_staging_us=12073505 total_device_us=5919592 mem_available=105823436800
+sequence position: position=1 done=2/3 wall_ms=8257 chain_ms=24748 projected_total_s=1780.8 projected_chain_full_s=1707.6 full_positions=138 reference_basis=requested_only budget_s=3600 attention_staging_us=89497 attention_device_us=536754 moe_staging_us=5557272 moe_device_us=4713179 routed_staging_us=4288779 routed_device_us=384262 shared_staging_us=1268493 shared_device_us=306178 total_staging_us=5646769 total_device_us=5249933 mem_available=102680076288
+sequence position: position=2 done=3/3 wall_ms=7735 chain_ms=32484 projected_total_s=1567.5 projected_chain_full_s=1494.2 full_positions=138 reference_basis=requested_only budget_s=3600 attention_staging_us=92278 attention_device_us=546175 moe_staging_us=4964229 moe_device_us=4106543 routed_staging_us=3682850 routed_device_us=387140 shared_staging_us=1281379 shared_device_us=312517 total_staging_us=5056507 total_device_us=4652718 mem_available=99178446848
+c4a-2 seam: format-2 body launched exactly 3 times on all 40 layers; 200 projection + 120 body launches plus the 82 mHC launches (42 entry + 40 post)
+token comparison: position=0 reference_id=201 hybrid_id=320 exact_equal=false
+token comparison: position=1 reference_id=201 hybrid_id=16 exact_equal=false
+token comparison: position=2 reference_id=16 hybrid_id=16 exact_equal=true
+HYBRID SEQUENCE token parity: FAIL - a position's hybrid token is not the in-process reference token
+```
+
+The gate is met: projected_chain_full_s=1494.2 over 138 positions plus b51 measured 614 s full
+reference gives about 2108 s, under 3600. The exit 1 is not a seam failure, but it is **not only
+the known p0 divergence**: position 0 is device 320 vs reference 201, position 1 is device 16 vs
+reference 201, and position 2 is device 16 vs reference 16. The host-fallback b48 run matched
+position 1 exactly, so this is a device-body-vs-host-body divergence at p>0 in the sequence entry,
+not a state/wrapper issue. The 130+8 full RUN started 11:02:36Z but was killed after this finding;
+it produced no result and is not a criterion record. The follow-up is the in-chain host body twin
+on c057be2 (below).
+
+### Sequence attention in-chain body twin (fde6b11, b56)
+
+Window b56 ran the short 3-position diagnostic on binary fde6b11 (sha256
+eadb442260ee0fbf54c00483d80fed5cedb5d11bd322ca8cffc036888be37101) and produced 120 twin
+lines, positions 0-2 x 40 layers, with a per-layer host-body comparison on the same quantised
+staged operands. The window log is window-b56-20261019T111735Z.log; the run log is
+runs56/twin-3.log, sha256 e679025936189ddd0771756e9fbdfbffbbd862d4341fa2138e0e8113ee2a5d7b.
+
+Result: the device body is faithful on identical operands. Position 0 has 5 mismatched BF16 slots
+over 40 x 32768 (single-layer worst 1/32768, exact_heads 63-64/64); position 1 has 38 slots
+(single-layer worst 4/32768, exact_heads at least 60/64); position 2 has 47 slots (same bound).
+Every per-head-block exact fraction is at least 0.9990 and every max_abs_diff is at most 7.8e-3,
+which is the BF16 spacing of these values. The seq entry's indexer, mask, window-row and
+selected-list contract is therefore not the token-divergence cause: the device body equals the host
+body to BF16 LSB on the operands the device staged. The b55 p1 token mismatch (reference 201,
+hybrid 16) is a staged-operand or residual/state divergence, not the csa2 seq kernel.
+
+The earlier first-differing-layer line in b55 was a false comparison: reference residual_out is
+token-major and held 3 prompt positions (61440 values) while the hybrid output held one position
+(20480), and the old comparison treated the multi-position tensor as the hybrid row. The follow-up
+binary slices the reference row before comparing. b56 is a short diagnostic record, not a claim;
+the b55 full run remains killed and is not a criterion record.
+
+### Sequence alignment and residual twin (bec6498, diagnostic)
+
+Binary bec6498 (sha256 af6ba20e0bb5eceff420904fa748856c603bff204c3da79f5c1a02073b62c402) adds
+the short follow-up: per position 0-2 it prints a fed_token/predicted_top1/logit_max/top5 alignment
+line for both hybrid and reference; it records the per-prefix reference boundary and slices the
+token-major residual row for the hybrid position; it prints the per-layer residual BF16 mismatch
+and max_abs; at the first divergence it prints device-vs-host q, sink, window/selected ids,
+compressed count/ratio and first/last window-code checksums. This is the next record; no claim
+window is booked until the alignment and operand/residual twin are clean.
+
+### Sequence alignment/residual diagnostic (bec6498, b57)
+
+Window b57 ran bec6498 on the short 3-position command. The alignment table excludes a one-token
+offset: hybrid and reference feed the same token at the same position (52479, 56659, 101226) and
+compare the same positions; predictions still differ at p0 (320 vs 201) and p1 (16 vs 201) while p2
+matches (16 vs 16). The residual twin slices the reference token-major row properly and reports
+position 0 layer 0 bf16_mismatches=20335/20480 max_abs_diff=8.587394e-1, i.e. a real value
+divergence from the first layer, not a shape artefact.
+
+At that first divergence the operand pair has an identical sink (checksum 031684704ed44895 on both
+sides) and identical ids (window [0], selected empty), while q differs (device first 0.164062500 /
+checksum c55cad79e647c613 vs host first 0.194739088 / checksum 62266f458e1bc01b) and the staged
+window-row code checksums differ (device 6446b4769b567b20 vs host-quantised 9d68aefc560275cc). The
+b56 body twin already showed the device body is faithful on identical operands, so b57 localises the
+divergence upstream of the body: projection/RoPE/window-latent staging, not the csa2 seq kernel,
+not the indexer ids and not teacher-forcing alignment. b57 is a localisation diagnostic, not a
+criterion attempt or a pass/fail of the claim.
+
+The follow-up 841566b adds the stage-aligned projection twin: raw wq_a/wq_b/wkv device vs the host
+attention_projection_probe on the reference pre-attention row; q compared at the BF16 stage the body
+consumed with the expected BF16 delta; device window codes against engine_window_row(host window
+row); pre-attention hidden; and a final-norm head-input twin with per-block max abs. The next record
+is that run; no claim window is booked until it says whether the device path is faithful to the
+FP8-native math or a projection stage is wrong.
+
+### Unreviewed cut-over label (all sequence diagnostics)
+
+Every sequence binary from fde6b11 through 420407e contains c9fa90f as an ancestor, and c9fa90f is
+the c4c reduce cut-over (fifth head launch through lm_head_reduce_sm121, device token plus 4-byte
+token/status readback, WINNER_CERTIFIED host-assembly fallback, REQUIRED_KERNELS 9->10). It has not
+been reviewed or measured in a window; it is planned as batch 25. Therefore b55 and b56-b60 are
+sequence diagnostics on an unreviewed cut-over build. b56's body twin still compares only the
+attention body on staged operands, but the build it ran on is that cut-over, and the b57-b60
+projection/head diagnostics inherit the same label. No claim may be inferred from any of them.
+
+### Projection twin and wq_b kernel check (841566b / f32a9e5 / f228178, b58-b60)
+
+b58 on 841566b: pre-attention hidden device vs host is 4/5120 BF16 mismatches with max_abs
+2.831221e-7, so the layer input/MhcEntry agrees. Raw wq_a differs by 2.787181e-3 and raw wkv by
+3.555462e-3, both consistent with the MXFP8 activation-scale delta. Raw wq_b q pre-RoPE differs by
+2.942886e-1 and q staged BF16 differs by the same amount against an expected BF16 rounding delta of
+6.176376e-2. Head-input twin mismatches 5113/5111/5104 of 5120 at p0/p1/p2 with max_abs 6.088e-1 /
+6.534e-1 / 5.361e-1 and no single block; the final-norm/head input is not a clean uniform scale.
+
+b59 on f32a9e5: wq_b input latent normed differs by 5.186009e-2; host wq_b on the device latent still
+differs from the device wq_b by 2.080269e-1.
+
+b60 on f228178: verbatim projection wq_b kernel vs mxfp8_ref: bf16_mismatches=0/32768
+max_abs_diff=0.000000e0. The device wq_b kernel is exactly mxfp8_ref on the exact packed weight and
+activation bytes it consumed. The projection path is faithful to the FP8-native math; the gap
+against the host f32 reference is the MXFP8/BF16 quantisation gap. The projection investigation is
+stopped here under the head-reduce lead; these are localisation records, not a claim.
+
+### Head A/B against the unreviewed reduce (420407e)
+
+The next diagnostic adds one head A/B line per head call: position N, host_top1, host_top5,
+device_top1, device_top5, block_max_equal, host_value and device_value. The host side is the
+four-shard block assembly from the copied block maxima/argmax (the same path as the WINNER_CERTIFIED
+fallback); the device side reads the lm_head_reduce TOP buffers. Setting
+SPARKFLASH_HEAD_HOST_ASSEMBLY=1 returns the host-assembly token. If the host assembly reproduces the
+reference 201/201/16 while the device reduce gives 320/16/16, the unreviewed c9fa90f cut-over is the
+bug; if not, the head-input/upstream path remains the lead. b60 is not a criterion attempt.
+
+### Head A/B result: the reduce is not the bug (420407e, b61)
+
+Window b61 ran 420407e plain and with SPARKFLASH_HEAD_HOST_ASSEMBLY=1. The host four-shard block
+assembly and the device reduce agree at every position: p0 host_top1=320 device_top1=320,
+p1 host_top1=16 device_top1=16, p2 host_top1=16 device_top1=16, with block_max_equal=true and
+identical host_value/device_value at each position. Forcing the host assembly still returns
+320/16/16, not the reference 201/201/16. The host and device top5 lists differ only because the host
+side ranks one winner per 1024-entry block while the reduce ranks full logits; the winner and block
+maximum are identical. The unreviewed c9fa90f reduce is therefore excluded as the cause.
+
+b61's 120 attention body twin lines are zero-mismatch on 35/40 layers at position 0, 18/40 at
+position 1 and 13/40 at position 2; the nonzero layers are the same BF16-stage-scale mismatches b56
+reported (the body still matches the host body on identical staged operands). Together with b60's
+wq_b kernel-vs-mxfp8_ref 0/32768, b58's exact pre-attention row and b56's body twin, the device path
+is faithful to its FP8-native definition at every stage measured. The head input and logits
+still differ from the in-process f32 reference because q and the window rows are FP8-quantised on the
+device; the remaining gap is the criterion-definition question (f32 reference with a 2e-2 logits bar
+against an FP8-native device path), not a projection, body, alignment or reduce bug. No claim.
+
+### Criterion-definition evidence (b58-b61, not a claim)
+
+The measured chain is faithful to the device's own FP8-native definition at every stage the
+diagnostics can separate, while the criterion compares against an in-process f32 reference:
+
+- pre-attention hidden: 4/5120 BF16 mismatches, max_abs 2.8e-7 (exact for practical purposes);
+- raw wq_a: max_abs 2.8e-3; raw wkv: max_abs 3.6e-3 - the MXFP8 activation-scale delta;
+- raw wq_b: max_abs 2.9e-1, and the wq_b kernel against mxfp8_ref on the exact launch bytes is
+  0/32768 BF16 mismatches with max_abs 0.0 - the kernel is exactly the block-scaled FP8 GEMM;
+- attention body on the staged operands: BF16-exact or within the stage LSB (b56/b61);
+- head reduce and host four-shard block assembly: identical top1 and block maximum at p0/p1/p2,
+  including when the host assembly is forced (320/16/16 on both, against reference 201/201/16);
+- final-norm/head input: 5113/5112/5104 of 5120 BF16 mismatch, max_abs ~0.6, no single block.
+
+The logit gap follows from the FP8-quantised q/window rows: the reference computes those layers in
+f32, so the device logits are systematically flatter (p0 15.73 vs 19.85, p1 15.43 vs 21.25, p2 14.56
+vs 16.97) and the argmax moves at p0/p1. A 2e-2 logits bar against the f32 reference is not reachable
+by an FP8-native path; the decision is (a) define the reference with the same FP8 staging/quantisation
+so the criterion measures wiring, or (b) add a higher-precision parity path for this comparison. No
+mathematics should be 'fixed' before that decision; these are localisation records only.
+
+### b62 criterion attempt: ABORTED by host memory, not a criterion result
+
+b62 (420407e, 130 prompt + 8 decode, live reference vs device chain) was stopped by the operator at
+131/138 positions: process RSS reached 121 GB and MemAvailable fell to 1.3 GB, so it was killed
+before the host OOM killer could act. It is recorded as an aborted criterion attempt with a named
+memory defect, not as a criterion result. The 131 head A/B lines that did complete agreed at every
+position (device_top1 == host_top1, block_max_equal=true, identical values), so the head and reduce
+remain cleared. The hybrid greedy picks on the synthetic prompt (for example position 120 -> 8060,
+128 -> 13763, 130 -> 8060, 131 -> 16) do not look like the fixture
+[491, 367, 201, 80, 3302, ...], but the run never reached the live-reference-vs-fixture table, so
+the question does the LIVE reference reproduce the FIXTURE tokens is still open.
+
+The growth was ~0.95 GB per position (126 GB available at start, 1.3 GB at position 131). The
+attributed cause is the CachedWeightSource unbounded read-through cache of routed-expert tensors:
+every position selects different experts, and caching every selected expert w1/w3/w2 raw bytes
+retains the whole routed-expert set in RSS instead of letting the mmap page cache stay reclaimable.
+The fix reads .ffn.experts.* through the mmap source without inserting it into the cache, strips the
+per-layer/head buffers from outputs outside the diagnostic prefix and the two criterion positions,
+and prints a per-position sequence memory line with MemAvailable and VmRSS before/after so the
+next run attributes any remaining growth. A --reference-check mode prints the nine
+reference vs fixture lines and the summary immediately after the reference prefill and returns
+before opening any device backend, so the fixture-staleness question needs no 138-position loop.
+
+### Reference identity and vLLM (criterion context)
+
+The deployed vLLM is not serving our checkpoint. Its /v1/models root is
+/root/.cache/huggingface/hub/models--pqhaz--DeepSeek-V4.1-Flash-1017-heretic/snapshots/12d58ad0878b5008e80d720251adb969a0069412,
+while the fixture and engine use
+models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170. Its
+completions are also degenerate (the capital-of-France prompt returns filler), so no 'vLLM parity'
+statement may be made unless it says 'same weights'; as deployed it is not the same weights and the
+f32 fixture reference remains the only truth for our checkpoint.
+
+Separately, a live vLLM query with the fixture's 130 prompt ids (greedy, 9 tokens) returned
+[367, 223, 10727, 201, 15, 223, 19, 16, 223] against the fixture's
+[491, 367, 201, 80, 3302, 201, 54, 201, 4341]. The fixture prompt is synthetic (seed 0), so this
+does not decide the criterion, but 'vLLM parity' and 'f32-reference parity' are two different bars
+and must not be conflated. The 130+8 run b62 checks whether the live in-process reference reproduces
+the fixture's own reference tokens before the criterion discussion continues.
+
 ### c3 window b22: PASS - CHAIN-WIRING token parity (NOT a device token)
 
 Window b22 ran the c3 arm on binary `sparkflash_m3c_f4446e7_aarch64` (sha256

@@ -26,8 +26,8 @@ use sparkflash_trace::{
 };
 
 use crate::engine::{
-    EngineEvent, EngineRequest, FinishReason, InferenceEngine, MODEL_MAX_OUTPUT_TOKENS,
-    MODEL_OWNED_BY, max_seq_len,
+    EngineEvent, EngineRequest, FinishReason, InferenceEngine, LogprobSelection, LogprobsRequest,
+    MODEL_MAX_OUTPUT_TOKENS, MODEL_OWNED_BY, PromptLogprobs, TokenLogprob, max_seq_len,
 };
 use crate::error::ApiError;
 use crate::prompt::{
@@ -53,6 +53,16 @@ pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// Default token budget when a request does not set `max_tokens`.
 pub const DEFAULT_MAX_TOKENS: usize = 4096;
+
+/// The default cap on requested logprobs, matching vLLM's `--max-logprobs` default.
+///
+/// The cap exists because a request for the whole vocabulary multiplies the response size by the
+/// 129,280-token vocabulary per position. `sparkflash serve --max-logprobs N` changes it, and
+/// `-1` lifts it, exactly as vLLM's flag does.
+pub const DEFAULT_MAX_LOGPROBS: usize = 20;
+
+/// vLLM's cap on the length of `logprob_token_ids`.
+pub const MAX_LOGPROB_TOKEN_IDS: usize = 128;
 
 /// Capacity of the host-side GPU trace ring, in events.
 ///
@@ -343,6 +353,7 @@ struct RequestBuilder {
     spec: ReasoningSpec,
     stop: Vec<String>,
     seed: Option<u64>,
+    logprobs: LogprobsRequest,
     trace: Option<TraceDirective>,
 }
 
@@ -365,6 +376,7 @@ impl RequestBuilder {
             reasoning_effort: self.spec.effort,
             stop: self.stop,
             seed: self.seed,
+            logprobs: self.logprobs,
             trace_scopes: self.trace.map_or(0, |directive| directive.scopes),
             trace_steps: self.trace.map_or(0, |directive| directive.steps),
         }
@@ -445,6 +457,12 @@ struct EngineOutput {
     reasoning: String,
     content: String,
     tool_calls: Vec<BufferedToolCall>,
+    /// One logprob per generated token, in generation order. Empty when the engine was not asked
+    /// for sample logprobs; an engine that is asked for them emits one
+    /// [`EngineEvent::TokenLogprobs`] per generated token.
+    token_logprobs: Vec<TokenLogprob>,
+    /// Prompt logprobs, present when the engine was asked for them.
+    prompt_logprobs: Option<PromptLogprobs>,
     finish_reason: FinishReason,
     usage: OpenAiUsageWithCache,
     stats: Box<DeepSeekSparkRequestStats>,
@@ -458,12 +476,16 @@ async fn drive_engine(
     let mut reasoning = String::new();
     let mut content = String::new();
     let mut tool_calls: BTreeMap<usize, BufferedToolCall> = BTreeMap::new();
+    let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
+    let mut prompt_logprobs: Option<PromptLogprobs> = None;
     let mut finished = None;
     while let Some(event) = stream.next().await {
         match event {
             EngineEvent::Started { .. } => {}
             EngineEvent::ReasoningDelta(text) => reasoning.push_str(&text),
             EngineEvent::ContentDelta(text) => content.push_str(&text),
+            EngineEvent::PromptLogprobs(payload) => prompt_logprobs = Some(*payload),
+            EngineEvent::TokenLogprobs(logprob) => token_logprobs.push(*logprob),
             EngineEvent::ToolCallDelta {
                 index,
                 id,
@@ -500,10 +522,347 @@ async fn drive_engine(
         reasoning,
         content,
         tool_calls: tool_calls.into_values().collect(),
+        token_logprobs,
+        prompt_logprobs,
         finish_reason,
         usage,
         stats,
     })
+}
+
+// ---------------------------------------------------------------------------------------
+// Logprobs
+// ---------------------------------------------------------------------------------------
+//
+// The wire layer mirrors vLLM's `logprobs_mode="raw_logprobs"` protocol: the engine reports the
+// log-softmax of the raw logits (before temperature and penalties), the router only shapes it.
+// The JSON shapes below are the ones vLLM emits, including its two oddities that clients depend
+// on: the completion `top_logprobs` dict carries the sampled token in addition to the requested
+// top-k entries, and the chat `top_logprobs` list is the first `n` entries of that dict (so it
+// starts with the sampled token). `echo` with no explicit `prompt_logprobs` computes prompt
+// logprobs with `logprobs`'s value, which is vLLM's rule.
+
+/// What the response layer needs to know about the logprobs a request asked for.
+#[derive(Debug, Clone, Copy, Default)]
+struct LogprobInfo {
+    /// Per generated token selection; `None` when the request asked for none.
+    sample: Option<LogprobSelection>,
+    /// Whether explicit `logprob_token_ids` selected the alternatives: vLLM then returns every
+    /// entry of the position, truncation only applies to a natural top-k.
+    explicit_token_ids: bool,
+}
+
+impl LogprobInfo {
+    /// Whether generated-token logprobs were requested at all.
+    fn wants_sample(self) -> bool {
+        self.sample.is_some() || self.explicit_token_ids
+    }
+}
+
+/// vLLM's clamp for a reported logprob: nothing below `-9999`, and a non-finite value (an
+/// all-masked row, in principle) becomes the floor rather than an unrepresentable JSON number.
+fn clamped_logprob(value: f32) -> f64 {
+    if value.is_finite() {
+        f64::from(value.max(-9999.0))
+    } else {
+        -9999.0
+    }
+}
+
+/// The UTF-8 bytes of a decoded token, as a JSON array of byte values: OpenAI's and vLLM's
+/// `bytes` field for chat logprobs.
+fn utf8_bytes(text: &str) -> Value {
+    Value::Array(text.as_bytes().iter().map(|byte| json!(byte)).collect())
+}
+
+/// Resolves one wire logprob count against the server cap and the engine's vocabulary size.
+///
+/// vLLM's rules: a negative value other than `-1` is refused; `-1` asks for the whole
+/// vocabulary and must fit under `--max-logprobs`; a positive value must fit too. The error
+/// strings are vLLM's spellings so a client that matches on them keeps working.
+fn resolve_logprob_selection(
+    raw: Option<i32>,
+    field: &'static str,
+    requested_for: &'static str,
+    max_logprobs: usize,
+    vocab_size: Option<usize>,
+) -> Result<Option<LogprobSelection>, ApiError> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    if value < -1 {
+        return Err(ApiError::invalid_request(
+            format!("`{field}` must be a positive value or -1."),
+            Some(field.to_owned()),
+            Some("invalid_logprobs".to_owned()),
+        ));
+    }
+    if value == -1 {
+        let Some(vocab) = vocab_size else {
+            return Err(ApiError::invalid_request(
+                format!(
+                    "`{field}` = -1 requests the whole vocabulary, but this engine does not report its vocabulary size, so the request cannot be bounded"
+                ),
+                Some(field.to_owned()),
+                Some("invalid_logprobs".to_owned()),
+            ));
+        };
+        if max_logprobs != usize::MAX && vocab > max_logprobs {
+            return Err(ApiError::invalid_request(
+                format!(
+                    "Requested {requested_for} logprobs of {vocab}, which is greater than max allowed: {max_logprobs}"
+                ),
+                Some(field.to_owned()),
+                Some("invalid_logprobs".to_owned()),
+            ));
+        }
+        return Ok(Some(LogprobSelection::All));
+    }
+    let want = value as usize;
+    if max_logprobs != usize::MAX && want > max_logprobs {
+        return Err(ApiError::invalid_request(
+            format!(
+                "Requested {requested_for} logprobs of {want}, which is greater than max allowed: {max_logprobs}"
+            ),
+            Some(field.to_owned()),
+            Some("invalid_logprobs".to_owned()),
+        ));
+    }
+    Ok(Some(LogprobSelection::Top(value as u32)))
+}
+
+/// Resolves and validates `logprob_token_ids`.
+///
+/// vLLM's rules: the ids need `logprobs` to be set, the list is capped at
+/// [`MAX_LOGPROB_TOKEN_IDS`], and every id must be inside the vocabulary. The sampling-parameter
+/// rule that `logprobs` must equal the list length is *not* enforced: both OpenAI protocol layers
+/// drop `logprobs` as soon as `logprob_token_ids` is set, so it is unreachable over HTTP.
+fn resolve_logprob_token_ids(
+    raw: Option<Vec<u32>>,
+    logprobs: Option<LogprobSelection>,
+    vocab_size: Option<usize>,
+) -> Result<Vec<u32>, ApiError> {
+    let Some(ids) = raw else {
+        return Ok(Vec::new());
+    };
+    if ids.is_empty() {
+        return Ok(ids);
+    }
+    if logprobs.is_none() {
+        return Err(ApiError::invalid_request(
+            "when using `logprob_token_ids`, `logprobs` must be set.",
+            Some("logprob_token_ids".to_owned()),
+            Some("invalid_logprobs".to_owned()),
+        ));
+    }
+    if ids.len() > MAX_LOGPROB_TOKEN_IDS {
+        return Err(ApiError::invalid_request(
+            format!(
+                "Requested logprob_token_ids of length {}, which is greater than max allowed: {MAX_LOGPROB_TOKEN_IDS}",
+                ids.len()
+            ),
+            Some("logprob_token_ids".to_owned()),
+            Some("invalid_logprobs".to_owned()),
+        ));
+    }
+    if let Some(vocab) = vocab_size {
+        let invalid: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|id| *id as usize >= vocab)
+            .collect();
+        if !invalid.is_empty() {
+            let listed = invalid
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ApiError::invalid_request(
+                format!(
+                    "token_id(s) [{listed}] in logprob_token_ids contain out-of-vocab token ids. Vocabulary size: {vocab}"
+                ),
+                Some("logprob_token_ids".to_owned()),
+                Some("invalid_logprobs".to_owned()),
+            ));
+        }
+    }
+    Ok(ids)
+}
+
+/// Refuses an explicit `prompt_logprobs` on a streaming request, which vLLM does.
+///
+/// The check is on the request field only, and only for a value that asks for logprobs at all: vLLM
+/// rejects `> 0` and `-1`, while `0` is accepted and dropped (a stream chunk has no
+/// `prompt_logprobs` field). An `echo`-implied request is allowed to stream, and the first
+/// completion chunk carries the prompt logprobs.
+fn reject_streaming_prompt_logprobs(stream: bool, explicit: Option<i32>) -> Result<(), ApiError> {
+    if stream
+        && let Some(value) = explicit
+        && (value > 0 || value == -1)
+    {
+        return Err(ApiError::invalid_request(
+            "`prompt_logprobs` are not available when `stream=True`.",
+            Some("prompt_logprobs".to_owned()),
+            Some("unsupported_parameter".to_owned()),
+        ));
+    }
+    Ok(())
+}
+
+/// One position of an OpenAI completion's parallel logprob arrays.
+struct CompletionPosition<'a> {
+    /// The decoded token string.
+    token: &'a str,
+    /// The logprob entry, or `None` for prompt position 0, which has no conditioning token.
+    logprob: Option<&'a TokenLogprob>,
+}
+
+/// The prompt positions of an `echo` completion: every prompt token, with `None` at position 0.
+fn prompt_positions(prompt: &PromptLogprobs) -> Vec<CompletionPosition<'_>> {
+    prompt
+        .tokens
+        .iter()
+        .enumerate()
+        .map(|(index, token)| CompletionPosition {
+            token: &token.token,
+            logprob: prompt.positions.get(index).and_then(Option::as_ref),
+        })
+        .collect()
+}
+
+/// The generated positions of a completion.
+fn generated_positions(output: &EngineOutput) -> Vec<CompletionPosition<'_>> {
+    output
+        .token_logprobs
+        .iter()
+        .map(|logprob| CompletionPosition {
+            token: &logprob.token,
+            logprob: Some(logprob),
+        })
+        .collect()
+}
+
+/// Builds the OpenAI completion `logprobs` object for a position list.
+///
+/// vLLM's `top_logprobs` entry is the position's whole map, in vLLM's insertion order: the
+/// sampled/actual token first, then the selected alternatives. Each value is the clamped logprob.
+fn completion_logprobs_value(positions: &[CompletionPosition<'_>], text_base: usize) -> Value {
+    let mut text_offset = Vec::with_capacity(positions.len());
+    let mut token_logprobs = Vec::with_capacity(positions.len());
+    let mut tokens = Vec::with_capacity(positions.len());
+    let mut top_logprobs = Vec::with_capacity(positions.len());
+    let mut offset = text_base;
+    for position in positions {
+        text_offset.push(json!(offset));
+        offset += position.token.chars().count();
+        tokens.push(Value::String(position.token.to_owned()));
+        match position.logprob {
+            None => {
+                token_logprobs.push(Value::Null);
+                top_logprobs.push(Value::Null);
+            }
+            Some(logprob) => {
+                token_logprobs.push(json!(clamped_logprob(logprob.logprob)));
+                let mut map = Map::new();
+                for alternative in &logprob.top {
+                    map.insert(
+                        alternative.token.clone(),
+                        json!(clamped_logprob(alternative.logprob)),
+                    );
+                }
+                top_logprobs.push(Value::Object(map));
+            }
+        }
+    }
+    json!({
+        "text_offset": text_offset,
+        "token_logprobs": token_logprobs,
+        "tokens": tokens,
+        "top_logprobs": top_logprobs,
+    })
+}
+
+/// Builds the id-keyed `prompt_logprobs` array: one entry per prompt token, `null` at position 0.
+///
+/// vLLM's `Logprob` for prompt positions is `{logprob, rank, decoded_token}`, keyed by token id.
+fn prompt_logprobs_value(prompt: &PromptLogprobs) -> Value {
+    let mut entries = Vec::with_capacity(prompt.positions.len());
+    for position in &prompt.positions {
+        let Some(logprob) = position else {
+            entries.push(Value::Null);
+            continue;
+        };
+        let mut map = Map::new();
+        for alternative in &logprob.top {
+            let mut entry = Map::new();
+            entry.insert(
+                "logprob".to_owned(),
+                json!(clamped_logprob(alternative.logprob)),
+            );
+            entry.insert(
+                "rank".to_owned(),
+                alternative.rank.map_or(Value::Null, |rank| json!(rank)),
+            );
+            entry.insert(
+                "decoded_token".to_owned(),
+                Value::String(alternative.token.clone()),
+            );
+            map.insert(alternative.token_id.to_string(), Value::Object(entry));
+        }
+        entries.push(Value::Object(map));
+    }
+    Value::Array(entries)
+}
+
+/// The alternatives a chat logprobs entry lists.
+///
+/// vLLM's chat `top_logprobs` is the first `n` entries of the position's map (whose first entry is
+/// always the sampled token), the whole map for `-1` or `logprob_token_ids`, and empty for `0`.
+fn chat_top_entries(
+    logprob: &TokenLogprob,
+    info: LogprobInfo,
+) -> &[crate::engine::LogprobAlternative] {
+    if info.explicit_token_ids {
+        return &logprob.top;
+    }
+    match info.sample {
+        None => &[],
+        Some(LogprobSelection::All) => &logprob.top,
+        Some(LogprobSelection::Top(count)) => {
+            let count = (count as usize).min(logprob.top.len());
+            &logprob.top[..count]
+        }
+    }
+}
+
+/// One entry of the chat `logprobs.content` array.
+fn chat_logprobs_entry(logprob: &TokenLogprob, info: LogprobInfo) -> Value {
+    let alternatives: Vec<Value> = chat_top_entries(logprob, info)
+        .iter()
+        .map(|alternative| {
+            json!({
+                "token": alternative.token,
+                "logprob": clamped_logprob(alternative.logprob),
+                "bytes": utf8_bytes(&alternative.token),
+            })
+        })
+        .collect();
+    json!({
+        "token": logprob.token,
+        "logprob": clamped_logprob(logprob.logprob),
+        "bytes": utf8_bytes(&logprob.token),
+        "top_logprobs": alternatives,
+    })
+}
+
+/// Builds the OpenAI chat `logprobs` object: `{content: [{token, logprob, bytes, top_logprobs}]}`.
+fn chat_logprobs_value(output: &EngineOutput, info: LogprobInfo) -> Value {
+    let content: Vec<Value> = output
+        .token_logprobs
+        .iter()
+        .map(|logprob| chat_logprobs_entry(logprob, info))
+        .collect();
+    json!({ "content": content })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -533,6 +892,81 @@ async fn chat_completions(
             Some("unsupported_parameter".to_owned()),
         ));
     }
+    // Logprobs are resolved and validated before generation, exactly where vLLM validates them:
+    // an impossible request (too many alternatives, out-of-vocabulary ids, streaming prompt
+    // logprobs) is a 400, never a truncated answer.
+    let vocab_size = state.engine.vocab_size();
+    let logprobs_requested = request.logprobs.unwrap_or(false);
+    let explicit_token_ids = request
+        .logprob_token_ids
+        .as_ref()
+        .is_some_and(|ids| !ids.is_empty());
+    // vLLM's chat protocol drops `top_logprobs` from the sampling parameters as soon as
+    // `logprob_token_ids` is set, so the explicit list takes precedence and `logprobs` only has to
+    // be true. Without ids, `logprobs: true` alone asks for the sampled token (vLLM's
+    // `logprobs: 0`), which is why the resolved selection defaults to `Top(0)`.
+    let sample = if explicit_token_ids {
+        if !logprobs_requested {
+            return Err(ApiError::invalid_request(
+                "when using `logprob_token_ids`, `logprobs` must be set to true.",
+                Some("logprob_token_ids".to_owned()),
+                Some("invalid_logprobs".to_owned()),
+            ));
+        }
+        if let Some(top_logprobs) = request.top_logprobs
+            && top_logprobs < -1
+        {
+            return Err(ApiError::invalid_request(
+                "`top_logprobs` must be a positive value or -1.",
+                Some("top_logprobs".to_owned()),
+                Some("invalid_logprobs".to_owned()),
+            ));
+        }
+        Some(LogprobSelection::Top(0))
+    } else if logprobs_requested {
+        Some(
+            resolve_logprob_selection(
+                request.top_logprobs,
+                "top_logprobs",
+                "sample",
+                state.max_logprobs(),
+                vocab_size,
+            )?
+            .unwrap_or(LogprobSelection::Top(0)),
+        )
+    } else {
+        if let Some(top_logprobs) = request.top_logprobs
+            && top_logprobs != 0
+        {
+            return Err(ApiError::invalid_request(
+                "when using `top_logprobs`, `logprobs` must be set to true.",
+                Some("top_logprobs".to_owned()),
+                Some("invalid_logprobs".to_owned()),
+            ));
+        }
+        None
+    };
+    // vLLM's chat `echo` implication is deliberately not implemented: this router does not render
+    // a chat template into the prompt yet (see prompt.rs), so "the final message" is not a thing
+    // it could echo. Explicit prompt_logprobs are supported, and are refused for streams below.
+    let prompt_logprobs = resolve_logprob_selection(
+        request.prompt_logprobs,
+        "prompt_logprobs",
+        "prompt",
+        state.max_logprobs(),
+        vocab_size,
+    )?;
+    reject_streaming_prompt_logprobs(request.stream, request.prompt_logprobs)?;
+    let token_ids = resolve_logprob_token_ids(request.logprob_token_ids, sample, vocab_size)?;
+    let logprobs = LogprobsRequest {
+        sample,
+        prompt: prompt_logprobs,
+        token_ids,
+    };
+    let logprob_info = LogprobInfo {
+        sample,
+        explicit_token_ids,
+    };
     let model = resolve_model(&state, request.model.as_deref())?;
     let trace = trace_context(&headers)?;
     let summary = summarize_chat_messages(&request.messages)?;
@@ -555,6 +989,7 @@ async fn chat_completions(
         spec,
         stop: normalize_stop(request.stop.as_ref()),
         seed: request.seed,
+        logprobs,
         trace,
     }
     .build();
@@ -580,6 +1015,7 @@ async fn chat_completions(
                 include_usage,
                 trace_id,
             },
+            logprob_info,
             trace,
         ))
     } else {
@@ -589,13 +1025,19 @@ async fn chat_completions(
             .metrics
             .record_request(&output.usage, &output.stats.kv_cache);
         Ok(json_response(
-            chat_completion_body(&output, &id, created, &model),
+            chat_completion_body(&output, &id, created, &model, logprob_info),
             trace,
         ))
     }
 }
 
-fn chat_completion_body(output: &EngineOutput, id: &str, created: u64, model: &str) -> Value {
+fn chat_completion_body(
+    output: &EngineOutput,
+    id: &str,
+    created: u64,
+    model: &str,
+    logprob_info: LogprobInfo,
+) -> Value {
     let mut message = Map::new();
     message.insert("role".to_owned(), Value::String("assistant".to_owned()));
     if output.content.is_empty() && !output.tool_calls.is_empty() {
@@ -625,19 +1067,48 @@ fn chat_completion_body(output: &EngineOutput, id: &str, created: u64, model: &s
             .collect();
         message.insert("tool_calls".to_owned(), Value::Array(calls));
     }
-    json!({
-        "id": id,
-        "object": "chat.completion",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "message": Value::Object(message),
-            "finish_reason": output.finish_reason,
-        }],
-        "usage": output.usage,
-        "x_deepseek_spark_stats": output.stats,
-    })
+    // `logprobs` is always present (null when not requested, like the OpenAI schema and vLLM);
+    // `prompt_logprobs` is vLLM's extension and is only emitted when the request asked for it.
+    let logprobs = if logprob_info.wants_sample() {
+        chat_logprobs_value(output, logprob_info)
+    } else {
+        Value::Null
+    };
+    let mut choice = Map::new();
+    choice.insert("index".to_owned(), json!(0));
+    choice.insert("message".to_owned(), Value::Object(message));
+    choice.insert("logprobs".to_owned(), logprobs);
+    choice.insert(
+        "finish_reason".to_owned(),
+        serde_json::to_value(output.finish_reason).unwrap_or(Value::Null),
+    );
+    let mut body = Map::new();
+    body.insert("id".to_owned(), Value::String(id.to_owned()));
+    body.insert(
+        "object".to_owned(),
+        Value::String("chat.completion".to_owned()),
+    );
+    body.insert("created".to_owned(), json!(created));
+    body.insert("model".to_owned(), Value::String(model.to_owned()));
+    body.insert(
+        "choices".to_owned(),
+        Value::Array(vec![Value::Object(choice)]),
+    );
+    if let Some(prompt_logprobs) = output.prompt_logprobs.as_ref() {
+        body.insert(
+            "prompt_logprobs".to_owned(),
+            prompt_logprobs_value(prompt_logprobs),
+        );
+    }
+    body.insert(
+        "usage".to_owned(),
+        serde_json::to_value(output.usage).unwrap_or(Value::Null),
+    );
+    body.insert(
+        "x_deepseek_spark_stats".to_owned(),
+        serde_json::to_value(output.stats.as_ref()).unwrap_or(Value::Null),
+    );
+    Value::Object(body)
 }
 
 fn chat_chunk(
@@ -646,14 +1117,19 @@ fn chat_chunk(
     created: u64,
     delta: Value,
     finish_reason: Option<FinishReason>,
+    logprobs: Option<Value>,
     stats: Option<&DeepSeekSparkRequestStats>,
 ) -> Value {
+    let mut choice = json!({"index": 0, "delta": delta, "finish_reason": finish_reason});
+    if let (Some(logprobs), Some(map)) = (logprobs, choice.as_object_mut()) {
+        map.insert("logprobs".to_owned(), logprobs);
+    }
     let mut chunk = json!({
         "id": id,
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        "choices": [choice],
     });
     if let Some(stats) = stats
         && let Some(map) = chunk.as_object_mut()
@@ -702,6 +1178,7 @@ fn chat_stream_response(
     state: &AppState,
     request: EngineRequest,
     context: StreamContext,
+    logprob_info: LogprobInfo,
     trace: Option<TraceDirective>,
 ) -> Response {
     let engine = Arc::clone(&state.engine);
@@ -724,11 +1201,17 @@ fn chat_stream_response(
             json!({"role": "assistant"}),
             None,
             None,
+            None,
         )));
+        // When logprobs are requested the text has to travel with the logprob entry of the token
+        // it belongs to, so content deltas are held here until their `TokenLogprobs` arrives.
+        let mut buffered = String::new();
         let mut events = engine.generate(request);
         while let Some(event) = events.next().await {
             match event {
                 EngineEvent::Started { .. } => {}
+                // Explicit prompt_logprobs are refused for streams, so this cannot arrive here.
+                EngineEvent::PromptLogprobs(_) => {}
                 EngineEvent::ReasoningDelta(text) => {
                     yield Ok(sse_frame(&chat_chunk(
                         &id,
@@ -737,17 +1220,39 @@ fn chat_stream_response(
                         json!({"reasoning_content": text}),
                         None,
                         None,
+                        None,
                     )));
                 }
                 EngineEvent::ContentDelta(text) => {
-                    yield Ok(sse_frame(&chat_chunk(
-                        &id,
-                        &model,
-                        created,
-                        json!({"content": text}),
-                        None,
-                        None,
-                    )));
+                    if logprob_info.wants_sample() {
+                        buffered.push_str(&text);
+                    } else {
+                        yield Ok(sse_frame(&chat_chunk(
+                            &id,
+                            &model,
+                            created,
+                            json!({"content": text}),
+                            None,
+                            None,
+                            None,
+                        )));
+                    }
+                }
+                EngineEvent::TokenLogprobs(logprob) => {
+                    if logprob_info.wants_sample() {
+                        let text = std::mem::take(&mut buffered);
+                        let logprobs =
+                            json!({"content": [chat_logprobs_entry(&logprob, logprob_info)]});
+                        yield Ok(sse_frame(&chat_chunk(
+                            &id,
+                            &model,
+                            created,
+                            json!({"content": text}),
+                            None,
+                            Some(logprobs),
+                            None,
+                        )));
+                    }
                 }
                 EngineEvent::ToolCallDelta { index, id: call_id, name, arguments_delta } => {
                     yield Ok(sse_frame(&chat_chunk(
@@ -757,16 +1262,33 @@ fn chat_stream_response(
                         tool_call_delta(index, call_id, name, arguments_delta),
                         None,
                         None,
+                        None,
                     )));
                 }
                 EngineEvent::Finished { finish_reason, usage, stats } => {
                     metrics.record_request(&usage, &stats.kv_cache);
+                    // An engine that was asked for logprobs but emitted none for its last token
+                    // has its text flushed here, without a logprob entry rather than with a
+                    // fabricated one.
+                    if logprob_info.wants_sample() && !buffered.is_empty() {
+                        let text = std::mem::take(&mut buffered);
+                        yield Ok(sse_frame(&chat_chunk(
+                            &id,
+                            &model,
+                            created,
+                            json!({"content": text}),
+                            None,
+                            None,
+                            None,
+                        )));
+                    }
                     yield Ok(sse_frame(&chat_chunk(
                         &id,
                         &model,
                         created,
                         json!({}),
                         Some(finish_reason),
+                        None,
                         Some(stats.as_ref()),
                     )));
                     if include_usage {
@@ -816,16 +1338,81 @@ async fn completions(
     let id = state.next_id("cmpl-dsv41-");
     let created = state.now_unix();
     let trace_id = trace_request_id(&headers, &id);
+    // vLLM's echo rules: `echo` with no explicit `prompt_logprobs` computes prompt logprobs with
+    // `logprobs`'s value, and `echo` with `max_tokens == 0` is the echo-without-generation
+    // request (text is the prompt, no tokens are generated, finish_reason is "length").
+    let echo = request.echo.unwrap_or(false);
+    let max_tokens = if echo && request.max_tokens == Some(0) {
+        0
+    } else {
+        resolve_max_tokens(None, "max_tokens", request.max_tokens, "max_tokens")?
+    };
+    let vocab_size = state.engine.vocab_size();
+    let explicit_token_ids = request
+        .logprob_token_ids
+        .as_ref()
+        .is_some_and(|ids| !ids.is_empty());
+    // vLLM's completion protocol drops `logprobs` from the sampling parameters as soon as
+    // `logprob_token_ids` is set, so the explicit list takes precedence: the number only has to be
+    // present, and is neither capped nor compared against the list length.
+    let sample = if explicit_token_ids {
+        let Some(value) = request.logprobs else {
+            return Err(ApiError::invalid_request(
+                "when using `logprob_token_ids`, `logprobs` must be set.",
+                Some("logprob_token_ids".to_owned()),
+                Some("invalid_logprobs".to_owned()),
+            ));
+        };
+        if value < -1 {
+            return Err(ApiError::invalid_request(
+                "`logprobs` must be a positive value or -1.",
+                Some("logprobs".to_owned()),
+                Some("invalid_logprobs".to_owned()),
+            ));
+        }
+        Some(LogprobSelection::Top(0))
+    } else {
+        resolve_logprob_selection(
+            request.logprobs,
+            "logprobs",
+            "sample",
+            state.max_logprobs(),
+            vocab_size,
+        )?
+    };
+    let mut prompt_logprobs_raw = request.prompt_logprobs;
+    if prompt_logprobs_raw.is_none() && echo {
+        prompt_logprobs_raw = request.logprobs;
+    }
+    let prompt_logprobs = resolve_logprob_selection(
+        prompt_logprobs_raw,
+        "prompt_logprobs",
+        "prompt",
+        state.max_logprobs(),
+        vocab_size,
+    )?;
+    reject_streaming_prompt_logprobs(request.stream, request.prompt_logprobs)?;
+    let token_ids = resolve_logprob_token_ids(request.logprob_token_ids, sample, vocab_size)?;
+    let logprobs = LogprobsRequest {
+        sample,
+        prompt: prompt_logprobs,
+        token_ids,
+    };
+    let logprob_info = LogprobInfo {
+        sample,
+        explicit_token_ids,
+    };
     let engine_request = RequestBuilder {
         id: id.clone(),
         model: model.clone(),
         summary,
-        max_tokens: resolve_max_tokens(None, "max_tokens", request.max_tokens, "max_tokens")?,
+        max_tokens,
         temperature: request.temperature,
         top_p: request.top_p,
         spec,
         stop: normalize_stop(request.stop.as_ref()),
         seed: request.seed,
+        logprobs,
         trace,
     }
     .build();
@@ -849,6 +1436,9 @@ async fn completions(
                 include_usage,
                 trace_id,
             },
+            logprob_info,
+            echo,
+            prompt_text,
             trace,
         ))
     } else {
@@ -857,22 +1447,67 @@ async fn completions(
         state
             .metrics
             .record_request(&output.usage, &output.stats.kv_cache);
-        let body = json!({
-            "id": id,
-            "object": "text_completion",
-            "created": created,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "text": output.content,
-                "logprobs": null,
-                "finish_reason": output.finish_reason,
-            }],
-            "usage": output.usage,
-            "x_deepseek_spark_stats": output.stats,
-        });
+        let body = completion_body(
+            &output,
+            &id,
+            created,
+            &model,
+            logprob_info,
+            echo,
+            &prompt_text,
+        );
         Ok(json_response(body, trace))
     }
+}
+
+/// Builds the OpenAI /v1/completions body, applying vLLM's echo and logprob rules.
+///
+/// With `echo`, `text` is the prompt text plus the generated text and the logprob arrays cover the
+/// prompt tokens first; `prompt_logprobs` is always present (null unless computed), because that is
+/// the field a vLLM client checks.
+fn completion_body(
+    output: &EngineOutput,
+    id: &str,
+    created: u64,
+    model: &str,
+    logprob_info: LogprobInfo,
+    echo: bool,
+    prompt_text: &str,
+) -> Value {
+    let text = if echo {
+        format!("{prompt_text}{}", output.content)
+    } else {
+        output.content.clone()
+    };
+    let logprobs = if logprob_info.wants_sample() {
+        let mut positions = Vec::new();
+        if echo && let Some(prompt) = output.prompt_logprobs.as_ref() {
+            positions.extend(prompt_positions(prompt));
+        }
+        positions.extend(generated_positions(output));
+        completion_logprobs_value(&positions, 0)
+    } else {
+        Value::Null
+    };
+    let prompt_logprobs = output
+        .prompt_logprobs
+        .as_ref()
+        .map_or(Value::Null, prompt_logprobs_value);
+    json!({
+        "id": id,
+        "object": "text_completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "text": text,
+            "logprobs": logprobs,
+            "finish_reason": output.finish_reason,
+            "prompt_logprobs": prompt_logprobs,
+        }],
+        "usage": output.usage,
+        "x_deepseek_spark_stats": output.stats,
+    })
 }
 
 fn completion_chunk(
@@ -881,13 +1516,20 @@ fn completion_chunk(
     created: u64,
     text: &str,
     finish_reason: Option<FinishReason>,
+    logprobs: Option<Value>,
 ) -> Value {
+    let mut choice = json!({"index": 0, "text": text, "finish_reason": finish_reason});
+    if let (Some(logprobs), Some(map)) = (logprobs, choice.as_object_mut()) {
+        map.insert("logprobs".to_owned(), logprobs);
+    } else if let Some(map) = choice.as_object_mut() {
+        map.insert("logprobs".to_owned(), Value::Null);
+    }
     json!({
         "id": id,
         "object": "text_completion",
         "created": created,
         "model": model,
-        "choices": [{"index": 0, "text": text, "logprobs": null, "finish_reason": finish_reason}],
+        "choices": [choice],
     })
 }
 
@@ -895,6 +1537,9 @@ fn completions_stream_response(
     state: &AppState,
     request: EngineRequest,
     context: StreamContext,
+    logprob_info: LogprobInfo,
+    echo: bool,
+    prompt_text: String,
     trace: Option<TraceDirective>,
 ) -> Response {
     let engine = Arc::clone(&state.engine);
@@ -910,18 +1555,95 @@ fn completions_stream_response(
         // The spans are emitted while this generator is polled, so the binding has to be
         // taken here rather than on the handler's stack.
         let _binding = RequestTraceBinding::new(trace_id);
+        // With logprobs requested the chunk has to carry the text the logprob belongs to, so
+        // content deltas are held until their `TokenLogprobs` event arrives.
+        let mut buffered = String::new();
+        let mut prompt: Option<PromptLogprobs> = None;
+        // vLLM starts a streamed chunk's `text_offset` at the length of the text it has already
+        // sent, not at zero for every chunk.
+        let mut emitted_chars = 0usize;
+        let mut echo_sent = false;
         let mut events = engine.generate(request);
         while let Some(event) = events.next().await {
             match event {
                 EngineEvent::Started { .. } => {}
+                EngineEvent::PromptLogprobs(payload) => prompt = Some(*payload),
                 EngineEvent::ReasoningDelta(_) => {}
                 EngineEvent::ContentDelta(text) => {
-                    yield Ok(sse_frame(&completion_chunk(&id, &model, created, &text, None)));
+                    if logprob_info.wants_sample() {
+                        buffered.push_str(&text);
+                    } else {
+                        emitted_chars += text.chars().count();
+                        yield Ok(sse_frame(&completion_chunk(&id, &model, created, &text, None, None)));
+                    }
+                }
+                EngineEvent::TokenLogprobs(logprob) => {
+                    if logprob_info.wants_sample() {
+                        let mut positions = Vec::new();
+                        let text = if echo && !echo_sent {
+                            echo_sent = true;
+                            if let Some(prompt) = prompt.as_ref() {
+                                positions.extend(prompt_positions(prompt));
+                            }
+                            format!("{prompt_text}{}", std::mem::take(&mut buffered))
+                        } else {
+                            std::mem::take(&mut buffered)
+                        };
+                        positions.push(CompletionPosition {
+                            token: &logprob.token,
+                            logprob: Some(&logprob),
+                        });
+                        let logprobs = completion_logprobs_value(&positions, emitted_chars);
+                        emitted_chars += text.chars().count();
+                        yield Ok(sse_frame(&completion_chunk(
+                            &id,
+                            &model,
+                            created,
+                            &text,
+                            None,
+                            Some(logprobs),
+                        )));
+                    }
                 }
                 EngineEvent::ToolCallDelta { .. } => {}
                 EngineEvent::Finished { finish_reason, usage, stats } => {
                     metrics.record_request(&usage, &stats.kv_cache);
-                    yield Ok(sse_frame(&completion_chunk(&id, &model, created, "", Some(finish_reason))));
+                    // The last text a logprobs request has (a token the engine did not logprob,
+                    // or the echo prompt of an echo-without-generation stream) goes out once here.
+                    if logprob_info.wants_sample() {
+                        let mut positions = Vec::new();
+                        let mut text = std::mem::take(&mut buffered);
+                        if echo && !echo_sent {
+                            echo_sent = true;
+                            if let Some(prompt) = prompt.as_ref() {
+                                positions.extend(prompt_positions(prompt));
+                            }
+                            text = format!("{prompt_text}{text}");
+                        }
+                        if !text.is_empty() || !positions.is_empty() {
+                            let logprobs = if positions.is_empty() {
+                                None
+                            } else {
+                                Some(completion_logprobs_value(&positions, emitted_chars))
+                            };
+                            yield Ok(sse_frame(&completion_chunk(
+                                &id,
+                                &model,
+                                created,
+                                &text,
+                                None,
+                                logprobs,
+                            )));
+                        }
+                    }
+                    yield Ok(sse_frame(&completion_chunk(
+                        &id,
+                        &model,
+                        created,
+                        "",
+                        Some(finish_reason),
+                        None,
+                    )));
                     if include_usage {
                         yield Ok(sse_frame(&json!({
                             "id": id,
@@ -997,6 +1719,7 @@ async fn responses(
         spec,
         stop: Vec::new(),
         seed: None,
+        logprobs: LogprobsRequest::default(),
         trace,
     }
     .build();
@@ -1090,6 +1813,7 @@ async fn messages(
         spec,
         stop,
         seed: None,
+        logprobs: LogprobsRequest::default(),
         trace,
     }
     .build();
