@@ -114,7 +114,8 @@ the branch is routing-driven, not an id cycle.
    per-row routing weight, per rank slice - the stage-8 B1 class with the model's multiply-before-
    quantise order, including the single bf16 rounding of the product. Additionally the real 576-wide
    columns are BIT-EXACT against `mxfp4_ref::routed_activation_operand` over the same real values and
-   weight (the operand the old host seam built, now only a comparison). A difference is a finding,
+   weight (the operand the old host seam built, now only a comparison - built by calling that function
+   itself over the real SwiGLU row, not an arithmetically equal re-implementation). A difference is a finding,
    never a tolerance. Two launches byte-identical. The weight operand is the router's device
    `weights_d` buffer, read in place.
 4. **Down/combine.** Device bf16 BIT-EXACT against the chained `mxfp4_ref::moe_combine` over the
@@ -133,16 +134,20 @@ The weighted epilogue removes that seam from the device path. `swiglu_mxfp8_quan
 takes the router's per-row `float *weights` operand and does the model's order on the device:
 asymmetric-clamped SwiGLU, one bf16 rounding of the product, then the activation ceil-rule quantise.
 Stage 3 reads `weights_d` in place (the router output is not copied or re-uploaded for the operand)
-and stage 4 consumes stage 3's device codes/scales directly, so the values that cross are now
-device-to-device:
+and stage 4 consumes stage 3's device codes/scales directly, so the operands are device-produced:
+the epilogue writes them and the combine reads them, with no host multiply or host quantise in the
+measured path (the harness copies the stage-3 bytes back and into the chain's own buffers only to
+compare them against the twins and for the second determinism pass):
 
 - device router weights `[tokens*6]` f32 (the router's own buffer) -> weighted epilogue;
 - device gate/up bf16 `[tokens*6][640]` per rank -> weighted epilogue;
 - device operand `[tokens*6][640]` E4M3 + `[tokens*6][20]` ue8m0 per rank -> device combine;
 - device combine -> device combine, four serial rank launches.
 
-The host still reads the router weights back, but only for the comparison twin - the operand path does
-not round-trip through the host, and the harness prints the crossing shapes as above. The unweighted
+The host still reads the router weights back, and it copies stage-3 codes/scales back and stage 4's
+operand in, but only for the comparison twins - "no round trip" here means no host multiply and no
+host quantise in the operand path, not that the harness never copies bytes; it prints the crossing
+shapes as above. The unweighted
 epilogue remains pinned and is m17b's shared-expert quantiser; the six-kernel frozen m4 ABI array is
 untouched (D33). Window b33 is the device measurement of this build: 35 checks passed at tokens 8
 and 130 (record below), including the bit-exact operand and chain comparisons and the real-width
@@ -179,10 +184,11 @@ records the wall times without attributing them to a component. The lowest MemAv
 
 ## Host dry run and tests
 
-`cargo test -p sparkflash-kernels --example m17_moe_a`: 21 tests pass (the shared b2_harness
-suite plus seven m17 tests: argument parsing of the documented command, the local expert table,
+`cargo test -p sparkflash-kernels --example m17_moe_a`: 22 tests pass (the shared b2_harness
+suite plus eight m17 tests: argument parsing of the documented command, the local expert table,
 disjoint rank slices covering the stored rows, the padding check counting only columns after 576, the
-staged-tensor-name format, the weighted epilogue pin against the embedded baseline, and the
+staged-tensor-name format, the weighted epilogue pin against the embedded baseline, the source pin
+that the real-width comparison calls `mxfp4_ref::routed_activation_operand` itself, and the
 regression test for the stage-4 activation assembly that window b26 caught). The weighted run prints
 35 checks (stage 1: 4, staged names: 1, stage 2: 12, stage 3: 16, stage 4: 2); window b33 measured
 both runs at 35 checks, `exit=0`. `cargo clippy -p sparkflash-kernels --example m17_moe_a -- -D warnings` is clean. The
@@ -517,6 +523,15 @@ Both runs: 35 checks, 4 stages, four pinned cubins (router 37,384 B / `5992cef9.
 9,752 B / `115200d2...`, weighted epilogue 13,000 B / `0e602daf...`, combine 10,048 B /
 `36a15a4f...`), `exit=0`. The records below are the complete per-run logs
 `runs33/m17a-weighted-tokens8.log` and `runs33/m17a-weighted-tokens130.log`, verbatim.
+
+The b33 binary (6443d5d0) was built before one verification path was rewired by review: in that
+binary the real-width `routed_activation_operand` comparison was built with
+`swiglu_ref::quantise_row_weighted`, which the crate's tests pin equal to
+`routed_activation_operand` composed with SwiGLU. The follow-up commit makes the harness call
+`mxfp4_ref::routed_activation_operand` itself (identical arithmetic, no device or launch change), so
+the b33 PASS stands; the binary and the b33 record stay tied to the pre-fix source commit (main
+`da8d491`, whose example source produced 6443d5d0) and were not rebuilt or re-run. No window is
+needed for a comparison-code change that never touches the device path.
 
 #### tokens 8 (weighted build, 35 checks; 48 routed rows, 37 distinct experts, 695,623,680 released expert bytes read)
 

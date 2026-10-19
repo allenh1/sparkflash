@@ -287,7 +287,7 @@ and "SwiGLU and the activation quantiser").
 `routed_gate_up_ref.rs`), the harness `examples/m10_gate_up.rs`, the doc
 [phase3-gate-up.md](phase3-gate-up.md), and the baseline entry
 `routed_gate_up_sm121 cubin_bytes=9752 cubin_sha256=115200d26c3404b7169c476e350f5575dadc3fec9e8b0ec97113cd297fa6c1af`.
-`KernelId` now has eight variants including `RoutedGateUp` (`cuda_driver.rs:173`), and
+`KernelId` now has nine variants including `RoutedGateUp` (`cuda_driver.rs:176`), and
 `sparkflash-device/src/cubins.rs` requires the pin as one of the eight chain kernels (`:34`,
 `:39`). The chain's stage map labels it `DeviceMeasuredNotWired` (`chain.rs:366`, `:477`): the
 kernel computes **one** projection (w1 or w3) of one routed-expert slice per launch — 576 real
@@ -881,7 +881,7 @@ repository or the evidence tree on this host.
 | chained 40-row column | this host: `/home/user/phase1-evidence/phase1-c-stage9-40rows-harness5b-20261018T050416Z.log` (572,420 B, sha256 `bd0f908e...`); device pair `stage9-out-r5b/device.{manifest,blob}` (shas `6093c74b...`/`fecd813b...`) | 40 rows × 2 runs, 763 launches/run, 298.6 s, bit-identical; Phase-1 aggregate 306 under / 414 over bar |
 | B2 chained replay | this host: `/home/user/phase1-evidence/phase1-b2-stage7-layer0-rereview5-20261018T044122Z.log` (23,897 B, sha256 `c2de544c...`) | 20 launches (16 chain + 4 forced-routing control), UTC 04:41:22Z |
 | head | this host: `/home/user/phase1-evidence/stage5-device-run-timed.log`, `stage5-device-final.log` | 4 launches (one per rank), 129,280 exact, 0 certified, argmax 5, 1.56 s incl. 1.32 GB upload |
-| window-cubin set | **node-only:** ten files = the nine baseline cubins plus the legacy `mega_mhc_sm121` copy, all matching `kernel_baseline.txt` when checked; **this evidence tree has seven** (`cubins/`: no `moe_router`, no `routed_gate_up`, no `mega_mhc_fused` copy) | pin check |
+| window-cubin set | **node-only:** eleven files = the ten baseline cubins plus the legacy `mega_mhc_sm121` copy, all matching `kernel_baseline.txt` when checked; **this evidence tree has seven** (`cubins/`: no `moe_router`, no `routed_gate_up`, no `mega_mhc_fused` copy) | pin check |
 
 The b4 first gate/up attempt (`dd9921a4` from `0ff78fe`) panicked at `m10_gate_up.rs:221`
 (30,720 vs 27,648) and produced no numbers; b6 is the completed gate/up window with both shapes.

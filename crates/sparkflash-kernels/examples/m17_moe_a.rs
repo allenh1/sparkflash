@@ -32,32 +32,36 @@
 //!    different weight slices; disjoint outputs), so a later chain may stream them; only the
 //!    combine ranks below are serial by construction.
 //!
-//! 3. SWIGLU+QUANT (swiglu_mxfp8_quant_sm121, 21,776 B / 4dbef63b...): the device gate/up bf16
-//!    outputs read back, cols 640 per rank slice, unweighted (the kernel has no routing-weight
-//!    operand - that is F6, recorded in docs/DECISIONS.md). Class, the stage-8 B1 class: E4M3
-//!    codes and ue8m0 scales BIT-EXACT against swiglu_ref::quantise_row over the same bf16 values;
-//!    any difference is a finding, never a tolerance. Two launches byte-identical.
+//! 3. WEIGHTED SWIGLU+QUANT (swiglu_mxfp8_quant_weighted_sm121, 13,000 B / 0e602daf...): the device
+//!    gate/up bf16 outputs read back, cols 640 per rank slice, with the router's per-row weights_d
+//!    as the weight operand read IN PLACE (no host copy of the operand). The kernel does the model's
+//!    order: asymmetric-clamped SwiGLU, one bf16 rounding of activation*weight, then the activation
+//!    ceil-rule quantise. Class, the stage-8 B1 class with the weight inside it: E4M3 codes and
+//!    ue8m0 scales BIT-EXACT against swiglu_ref::quantise_row_weighted over the same 640-wide rows
+//!    and weights, AND the real 576-wide operand BIT-EXACT against
+//!    mxfp4_ref::routed_activation_operand over the same real values and weight (built by calling
+//!    that function, not an equal twin); any difference is a finding, never a tolerance. Two
+//!    launches byte-identical. This is the F6 seam's device closure (D33).
 //!
 //! 4. DOWN/COMBINE (b12x_mxfp4_moe_sm121, 10,048 B / 36a15a4f...): four serial rank launches over
 //!    the 576-wide w2 slices of the same selected experts, chained because each rank's bf16 output
 //!    is the next rank's residual operand (the kernel writes hidden + this rank's partial sum, so
-//!    the chained rounding is part of the arithmetic). Class: device bf16 BIT-EXACT against the
-//!    chained mxfp4_ref::moe_combine over the same bytes; two full chains byte-identical.
+//!    the chained rounding is part of the arithmetic). The activation operand is stage 3's device
+//!    codes/scales, not a host-built tensor. Class: device bf16 BIT-EXACT against the chained
+//!    mxfp4_ref::moe_combine over the SAME device-built operand bytes; two full chains
+//!    byte-identical.
 //!
-//! THE F6 SEAM, STATED BEFORE ANY NUMBER. The released arithmetic multiplies the SwiGLU output by
-//! the routing weight BEFORE the w2 activation quantiser reads it (model.py:841-851), and no
-//! pinned routed kernel takes a weight operand. So stage 3 measures the device quantiser on the
-//! UNWEIGHTED gate/up product, and the operand stage 4 consumes is built on the host from the SAME
-//! device gate/up bf16 values: host SwiGLU over those bytes, then
-//! mxfp4_ref::routed_activation_operand(activation, routing_weight) - the exact reference rule,
-//! bf16 cast included. The values that cross the seam are (a) the device gate/up bf16 outputs,
-//! [tokens*6][640] per rank and projection, 2 bytes each; (b) the routing weight, one f32 per
-//! selected expert per token; (c) the quantised activation operand the combine reads,
-//! [tokens*6][640] E4M3 + [tokens*6][20] ue8m0 per rank. Stage 3's device codes are NOT the
-//! combine's operand: weight-multiplying already-quantised codes would quantise twice and is not
-//! the model's order. The combine is therefore WEIGHTED, but its activation operand is
-//! host-quantised by the same rule the reference uses. The NOT-claimed list at the end excludes a
-//! fully-device weighted routed block and any per-token/per-layer claim.
+//! THE F6 SEAM, CLOSED ON THE DEVICE (D33). The released arithmetic multiplies the SwiGLU output
+//! by the routing weight BEFORE the w2 activation quantiser reads it (model.py:841-851). The
+//! weighted stage-3 entry point takes the routing weight as an operand, so the multiply and the
+//! quantise both happen on the device: gate/up bf16 -> weighted epilogue -> the combine's E4M3 +
+//! ue8m0 operand, with the router's weights_d read in place. Stage 3's device codes/scales ARE the
+//! operand stage 4 consumes, so no host multiply and no host quantise remain in the routed path
+//! (D32's host seam is gone; b27/b30 measured the unweighted predecessor). The host still reads the
+//! gate/up and operand bytes back, but only to compare them against the reference twins - the
+//! operand the combine consumes is device-produced; the harness prints the crossing shapes. The
+//! NOT-claimed list at the end keeps this to one layer's routed branch: not a chain, token,
+//! per-layer or performance claim.
 //!
 //! Usage (aarch64 node, checkpoint present):
 //!
@@ -67,8 +71,9 @@
 //! ```
 //!
 //! The cubin dir must hold the four pinned cubins, each refused by size+sha256 before allocation:
-//! moe_router_sm121.cubin, routed_gate_up_sm121.cubin, swiglu_mxfp8_quant_sm121.cubin,
-//! b12x_mxfp4_moe_sm121.cubin (build lines: nvcc -std=c++17 -arch=sm_121a -cubin -I kernels
+//! moe_router_sm121.cubin, routed_gate_up_sm121.cubin, swiglu_mxfp8_quant_weighted_sm121.cubin (the
+//! weighted epilogue; the unweighted swiglu_mxfp8_quant_sm121 is m17b's shared-expert quantiser and
+//! is not required here), b12x_mxfp4_moe_sm121.cubin (build lines: nvcc -std=c++17 -arch=sm_121a -cubin -I kernels
 //! kernels/<name>.cu -o <dir>/<name>.cubin, CUDA 13.0.3 / V13.0.88).
 
 #![forbid(unsafe_code)]
@@ -659,14 +664,17 @@ fn run() -> Result<(), String> {
             expected_codes[row * WIDTH_PADDED..(row + 1) * WIDTH_PADDED].copy_from_slice(&codes);
             expected_scales[row * MOE_SCALE_ROW..(row + 1) * MOE_SCALE_ROW]
                 .copy_from_slice(&scales);
-            // The model's real-width operand, computed with the same weighted rule on the real
-            // {WIDTH} columns: this is exactly the old host path's operand, now only a comparison.
-            let (real_codes, real_scales) = swiglu_ref::quantise_row_weighted(
-                &gate_f32[..WIDTH],
-                &up_f32[..WIDTH],
-                SWIGLU_LIMIT,
-                weight,
-            );
+            // The model's real-width operand: the old host path's operand, now only a comparison -
+            // swiglu_ref::swiglu over the real {WIDTH} columns, then the reference's own
+            // mxfp4_ref::routed_activation_operand. Calling the model rule itself (rather than an
+            // arithmetically equal re-implementation) is what the check's name claims.
+            let swiglu_row: Vec<f32> = gate_f32[..WIDTH]
+                .iter()
+                .zip(&up_f32[..WIDTH])
+                .map(|(gate, up)| swiglu_ref::swiglu(*gate, *up, SWIGLU_LIMIT))
+                .collect();
+            let (real_codes, real_scales) =
+                mxfp4_ref::routed_activation_operand(&swiglu_row, weight);
             model_codes[row * WIDTH..(row + 1) * WIDTH].copy_from_slice(&real_codes);
             model_scales[row * (WIDTH / QUANT_BLOCK)..(row + 1) * (WIDTH / QUANT_BLOCK)]
                 .copy_from_slice(&real_scales);
@@ -1450,6 +1458,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_real_width_comparison_calls_the_reference_rule() {
+        // Review finding: stage 3's class named mxfp4_ref::routed_activation_operand while the model
+        // operand was built with an arithmetically equal helper, so the printed record claimed a
+        // comparison that never ran. The real-width operand is now built by calling the reference
+        // function itself; this pins that against the example source, the way the other examples pin
+        // their kernels' text. The source is split before this test so the assertion's own literal
+        // cannot satisfy it.
+        let source = include_str!("m17_moe_a.rs");
+        let (production, _) = source
+            .split_once("fn the_real_width_comparison_calls_the_reference_rule")
+            .expect("the source contains this test");
+        assert!(
+            production.contains("mxfp4_ref::routed_activation_operand(&swiglu_row, weight)"),
+            "the real-width model operand must call mxfp4_ref::routed_activation_operand directly"
+        );
+        assert!(
+            !production
+                .contains("let (real_codes, real_scales) = swiglu_ref::quantise_row_weighted("),
+            "the model operand must not be an equal re-implementation of the reference rule"
+        );
     }
 
     #[test]

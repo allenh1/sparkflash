@@ -1887,7 +1887,12 @@ four pinned cubins verified by size and sha256 before allocation (window
 `window-b33-20261019T055723Z.log`; run logs `runs33/m17a-weighted-tokens8.log` and
 `runs33/m17a-weighted-tokens130.log`, reproduced verbatim in `docs/build/phase3-moe-routed.md`). The
 window number is b33 in the Lead's global numbering (b30 hardened m17a, b31 c4a-1, b32 c4a-2 first
-attempt, b33 c4a-2 corrected PASS plus this run); an earlier draft of this entry called it b31. The
+attempt, b33 c4a-2 corrected PASS plus this run); an earlier draft of this entry called it b31. One
+verification detail moved after b33 without changing it: the b33 binary built the real-width
+comparison operand with `swiglu_ref::quantise_row_weighted` (the crate's tests pin it equal to
+`routed_activation_operand` composed with SwiGLU), and the review follow-up makes the harness call
+`mxfp4_ref::routed_activation_operand` itself. Arithmetic and every device launch are unchanged, so
+the PASS and the tie between the binary and the pre-fix source commit both stand. The
 class is the same bit-exact class as D32's host path, now on the device; it is still not a chain,
 token, per-layer or end-to-end claim, the activation and residual are the declared
 released-`embed.weight` stand-ins, and the shared expert is not covered.
