@@ -388,9 +388,13 @@ a device-chain claim, so a token produced with a host final norm is a hybrid tok
 
 ### 2.13 certified LM head (row stage 13)
 
-- **Pin:** `cert_lm_head_sm121`, 14,712 B, sha256
-  `a833a336f0d9fe0a1dc5febffede52de099b545cad013bf4a3c542d6e167f7ec`
-  (`kernel_baseline.txt:16`). The certificate is stated at
+- **Pin:** `cert_lm_head_sm121`, 14,888 B, sha256
+  `7394b1290a3210a78ba12e6fc5414b0f4c84d1cdaf8edbcfa63b25dfcdf00493`
+  (`kernel_baseline.txt:16`; D31 fixed the certified_count reduction, which was lane-0-only on the
+  pruning path - window b21/b23 measured 4,899 flags against 34 published on the pre-fix
+  `a833a336...` artifact - and re-pinned the cubin; the ABI is unchanged). m16 window b25 runs both
+  the real-token control and the pruning case to PASS on this pin, including `certified_count ==
+  flags` per rank. The certificate is stated at
   `kernels/cert_lm_head_sm121.cu:9-24`: per-entry upper bound over 40 hidden blocks, strict-skip
   pruning, ties preserved; grid-wide finalisation is deliberately **not** in the kernel (`:27-30`),
   so the block reduction is part of the token path.

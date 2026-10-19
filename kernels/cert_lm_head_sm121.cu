@@ -157,10 +157,17 @@ extern "C" __global__ void cert_lm_head_sm121(
         }
         block_max[blockIdx.x] = best;
         block_argmax[blockIdx.x] = best_index;
-        atomicAdd(certified_count, pruned);
         const uint32_t meta = SPARK_M4_LM_CHUNK * 4u;
         SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_DENSE_MXFP8, layer_id, meta, t_enter);
         (void)step_seq;
+    }
+    // The count is the number of ALL certified entries, so every thread contributes its own prunes.
+    // Until D31 the atomic lived inside the lane-0 block above and added lane 0's count alone, which
+    // undercounted the pruning path (4,899 flags against 34 published in windows b21/b23). The count
+    // is a sum of integers, so the accumulation order does not matter and the value is deterministic
+    // across runs; a thread with no prunes skips the atomic, so the all-exact path is unchanged.
+    if (pruned > 0u) {
+        atomicAdd(certified_count, pruned);
     }
     (void)t_enter;
 }

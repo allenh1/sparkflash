@@ -39,6 +39,7 @@ records the evidence and the consequence for the build. Research backing is in
 | D28 | The reference engine is `Send + Sync` | `WeightSource` gained `Send + Sync` in !60 (`f72738b`), so `forward::InferenceEngine` is `Send + Sync`; `serve.rs`'s module docs are corrected and a compile-time assertion pins it, while the single-owner engine thread stays because the pass is one-sequence-at-a-time and the sampler swap consumes the engine, not because of thread-safety |
 | D29 | The ibverbs backend is real and dual-rail capable | The `rdma` feature's libibverbs backend, its repr(C) ABI mirror and the three cluster gate bodies are real, and the deployed vLLM reference is measured single rail (NCCL_IB_HCA=rocep1s0f1); no hardware gate has run and no frame has crossed a wire, host-memory staging, active MTU 1024 and driver 580.173.02 remain gaps, and single-rail mode refuses to claim dual-rail evidence |
 | D30 | Routed-expert sharding follows the verified kernel | TP=4 over the intermediate width (576 per rank padded to 640) for the routed experts, because that is the only routed-expert layout the device has run; the reference's whole-expert rule is recorded as not implemented, the shared expert stays whole and replicated, and the padding costs +8.22 GB/rank of routed-expert storage (74.0 -> 82.2 GB/rank) |
+| D31 | The certified LM head counts every thread's prunes, and the pin is re-baselined | `cert_lm_head_sm121`'s published `certified_count` was lane 0's per-thread count only, so the concentrated pruning case reported 34 against 4,899 flags in windows b21/b23; the atomic now adds every thread's prunes, the count is deterministic, and the cubin is re-pinned at 14,888 B / `7394b129...` with the ABI unchanged (same entry, geometry and `certified_count` semantic) |
 
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
@@ -1730,3 +1731,59 @@ whole 2304-wide experts
 and is untouched by this entry. This records the divergence instead of claiming the reference and the
 implementation agree; if reference-exact sharding is required, that is a new kernel ABI and a new
 entry.
+
+---
+
+## D31 - The certified LM head counts every thread's prunes, and the pin is re-baselined
+
+Recorded 2026-10-18.
+
+**Question.** `kernels/cert_lm_head_sm121.cu` publishes `certified_count` so a caller can tell how
+many entries the certificate pruned. The kernel's own contract (`:65`) calls it the "total pruned
+entries, atomically accumulated". In windows b21 and b23 the concentrated certificate case
+certified 4,899 of 129,280 entries but published a count of 34, and the host twin predicted the
+exact undercount per rank: 12, 6, 3, 13. The real-token control certified 0 and published 0, so
+phase 1 (which only ever ran the non-pruning case) never saw it.
+
+**Finding, as measured.** The count was accumulated from lane 0 alone. `pruned` is a per-thread
+counter (`:100` declared, `:122` incremented); the old `atomicAdd(certified_count, pruned)` sat
+inside `if (lane == 0u)` (`:148`, `:160`), and the block reduction at `:149-157` reduces only
+`running_max`/`running_argmax`. The PTX confirms it: the thread-local pruned register was the
+value the single `atom.global.add.u32` added, so the published number was the sum over the 32
+blocks of lane 0's prunes - 34 at the concentrated seam, exactly as the twin's per-entry loop over
+`lane == 0` entries predicts. It is a kernel-side contract violation, not host count assembly: the
+host compares each rank's published count to that rank's own flags independently. Certificate
+soundness (bounds, exact entries, pruning decisions, block reductions, argmax, determinism) was
+intact in b21/b23; the control PASS stands.
+
+**Decision.** Fix the kernel and treat it as a deliberate re-baseline, because the certified
+pruning path is what makes the head viable in serving and a wrong count would corrupt whatever
+accounting uses it. The minimal fix keeps the existing structure: the atomic moved out of the
+lane-0 block to `if (pruned > 0u) atomicAdd(certified_count, pruned);`, so every thread adds its
+own prunes and threads with nothing pruned skip the atomic (the all-exact path is unchanged). The
+count is a sum of integers, so accumulation order does not matter and the value is deterministic
+across runs; the m16 harness already checks two-launch byte identity.
+
+**Re-pin.** The fixed cubin is 14,888 B, sha256
+`7394b1290a3210a78ba12e6fc5414b0f4c84d1cdaf8edbcfa63b25dfcdf00493`, 0 PTX membar lines, built
+reproducibly with the pinned CUDA 13.0.3 toolkit (nvcc V13.0.88, `-std=c++17 -arch=sm_121a
+-cubin -I kernels`); the PTX still has exactly one count atomic, now guarded only by `pruned > 0`
+(the `tid.x != 0` skip branches to that guard), so every lane reaches it. `kernel_baseline.txt:16`,
+the m16 PIN constants, the m16 page and serving-readiness 2.13 carry the new size and sha. The
+phase-1 window record's cubin list keeps `a833a336...` because it is a historical window record and
+is not rewritten, as do the b21/b23 undercount records in the m16 page.
+
+**The ABI does not change.** The entry signature, the geometry macros and the semantic of
+`certified_count` (total pruned entries) are the same. Only the reduction of an internal counter
+changed: the artifact now delivers the documented semantic instead of a lane-0-only subset of it,
+so the Milestone-4 ABI freeze (D14, D26) is not touched and no caller needs to change.
+
+**Re-window, and the PASS that follows.** Window b24 measured the count fix working (published
+4,899 = 4,899 flags, per rank 1062/1205/1215/1417) but exposed a harness gate that compared the
+synthetic case against the real token's reference argmax; that gate was fixed and tested, and window
+b25 passed both cases on the fixed artifact with `certified_count == flags` per rank and the same
+bound/certificate/argmax/determinism checks - the first recorded device PASS of the certified pruning
+path (m16 stage, documented in `build/phase3-lm-head.md`). b21/b23 remain the pre-fix
+`a833a336...` evidence. No other pinned kernel has this pattern: a tree-wide grep of
+`kernels/*.cu` finds per-thread counters with an atomic only here; the other `atomicAdd` uses are
+barrier/reduction counters (`mega_mhc_sm121.cu:235`), not published counts.
