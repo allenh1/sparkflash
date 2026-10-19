@@ -793,7 +793,7 @@ pub(crate) fn routed_operands(
     })
 }
 
-/// Runs the four chained rank launches of `b12x_mxfp4_moe_sm121` for one routing choice and
+/// Runs the four serial rank launches of `b12x_mxfp4_moe_sm121` for one routing choice: each adds
 /// returns the combine's bf16 output bits. The memory floor is checked before and after each launch.
 #[allow(clippy::too_many_arguments)] // stage 7 and stage 9 both drive it; the scope names which log line it is.
 pub(crate) fn run_routed_combine(
@@ -810,30 +810,29 @@ pub(crate) fn run_routed_combine(
         "--- K9-K12 b12x_mxfp4_moe_sm121: routed combine, {label}, {MOE_RANKS} rank slices ---"
     );
     let mut allocated = 0usize;
-    let hidden_d = cuda.alloc(HIDDEN * 2, &mut allocated)?;
-    let moe_out_d = cuda.alloc(HIDDEN * 2, &mut allocated)?;
     let act_d = cuda.alloc(operands.act_fp8[0].len(), &mut allocated)?;
     let acts_d = cuda.alloc(operands.act_scales[0].len(), &mut allocated)?;
     let w_d = cuda.alloc(operands.w_rank[0].len(), &mut allocated)?;
     let ws_d = cuda.alloc(operands.ws_rank[0].len(), &mut allocated)?;
     let ids_d = cuda.alloc(MOE_TOP_K * 4, &mut allocated)?;
+    let acc_d = cuda.alloc(HIDDEN * MOE_TOP_K * 4, &mut allocated)?;
     let _ = allocated;
-    cuda.copy_htod(&hidden_d, &vec![0u8; HIDDEN * 2])?;
+    // The four rank launches ADD their f32 partials into this [top_k][hidden] accumulator
+    // (audit M2/F7); it therefore starts zeroed and no rank partial is rounded.
+    cuda.copy_htod(&acc_d, &vec![0u8; HIDDEN * MOE_TOP_K * 4])?;
     cuda.copy_htod(&ids_d, &u32s_to_bytes(table_ids))?;
-    let mut routed_bits: Vec<u16> = vec![0u16; HIDDEN];
     for rank in 0..MOE_RANKS {
         cuda.copy_htod(&act_d, &operands.act_fp8[rank])?;
         cuda.copy_htod(&acts_d, &operands.act_scales[rank])?;
         cuda.copy_htod(&w_d, &operands.w_rank[rank])?;
         cuda.copy_htod(&ws_d, &operands.ws_rank[rank])?;
-        let params: [u64; 11] = [
-            hidden_d.0,
+        let params: [u64; 10] = [
             act_d.0,
             acts_d.0,
             w_d.0,
             ws_d.0,
             ids_d.0,
-            moe_out_d.0,
+            acc_d.0,
             1, // tokens
             0, // trace_ring
             layer as u64,
@@ -850,13 +849,26 @@ pub(crate) fn run_routed_combine(
             args,
             &format!("{scope} K{} ({label}) post-launch", 9 + rank),
         )?;
-        let mut bytes = vec![0u8; HIDDEN * 2];
-        cuda.copy_dtoh(&mut bytes, &moe_out_d)?;
-        routed_bits = bytes_to_u16(&bytes);
-        cuda.copy_htod(&hidden_d, &bytes)?;
     }
-    cuda.free_buffers(&[&hidden_d, &moe_out_d, &act_d, &acts_d, &w_d, &ws_d, &ids_d]);
-    Ok(routed_bits)
+    let mut acc_bytes = vec![0u8; HIDDEN * MOE_TOP_K * 4];
+    cuda.copy_dtoh(&mut acc_bytes, &acc_d)?;
+    cuda.free_buffers(&[&acc_d, &act_d, &acts_d, &w_d, &ws_d, &ids_d]);
+    let acc: Vec<f32> = acc_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect();
+    // The native routed epilogue over the device accumulator; this stage has no shared expert, so
+    // its shared input is zero (the shared add and the one MoE bf16 round belong to task-10's host
+    // seams, and stage 7 measures the routed tensor only).
+    Ok(mxfp4_ref::moe_combine_finalize(
+        &acc,
+        &vec![0u16; HIDDEN],
+        table_ids,
+        1,
+        HIDDEN,
+    ))
 }
 
 /// Stage 7: the chained layer-0 replay (B2).
@@ -1565,7 +1577,7 @@ pub(crate) fn stage7(args: &Args) -> Result<(), String> {
     let (combine_stats, combine_ulp) =
         compare_bf16_bits("K9-K12 routed combine", &routed_bits, &reference_combine);
     println!(
-        "  routed combine internal check: {:.4}% exact against mxfp4_ref::moe_combine chained over the same {MOE_RANKS} ranks, max ULP {combine_ulp}",
+        "  routed combine internal check: {:.4}% exact against mxfp4_ref::moe_combine_rank x{MOE_RANKS} + moe_combine_finalize, max ULP {combine_ulp}",
         combine_stats.exact_pct()
     );
 
@@ -1732,7 +1744,7 @@ pub(crate) fn stage7(args: &Args) -> Result<(), String> {
         )
     };
     println!(
-        "  forced routed combine internal check: {:.4}% exact against mxfp4_ref::moe_combine chained over the same ranks, max ULP {forced_ulp}",
+        "  forced routed combine internal check: {:.4}% exact against mxfp4_ref::moe_combine_rank x{MOE_RANKS} + moe_combine_finalize, max ULP {forced_ulp}",
         forced_stats.exact_pct()
     );
     println!(

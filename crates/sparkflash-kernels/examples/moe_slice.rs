@@ -2,7 +2,10 @@
 //!
 //! One MoE layer's real expert combine weights, uploaded exactly as the checkpoint stores them
 //! (rank-0 column slice, then padded to the kernel's stride), with b12x_mxfp4_moe_sm121 launched
-//! on them and the result diffed against the CPU reference mxfp4_ref::moe_combine on the same bytes.
+//! on them and the result diffed against the CPU reference mxfp4_ref::moe_combine_rank on the same
+//! bytes: the device accumulates ONE tensor-parallel rank's f32 partials into
+//! [tokens][top_k][hidden], and the native epilogue (per-slot bf16 round, ascending expert-id add,
+//! shared bf16 add, one bf16) is applied to the device accumulator by mxfp4_ref::moe_combine_finalize.
 //!
 //! Real: the expert weights, read from the released checkpoint. Synthetic: the activations and the
 //! expert ids, because this slice tests the GEMM, not the router. The activation operand is still
@@ -29,8 +32,8 @@ use std::path::{Path, PathBuf};
 use sparkflash_kernels::m4_quant::QUANT_BLOCK;
 use sparkflash_kernels::mxfp4_ref::{
     FP4_PER_BYTE, MOE_SCALE_BYTES_PER_ROW, MOE_TOP_K, MOE_WEIGHT_BYTES_PER_ROW, MOE_WIDTH,
-    MOE_WIDTH_PADDED, check_moe_layout, moe_combine, pre_padded_moe_layout,
-    routed_activation_operand,
+    MOE_WIDTH_PADDED, check_moe_layout, moe_combine_finalize, moe_combine_rank,
+    pre_padded_moe_layout, routed_activation_operand,
 };
 
 const HIDDEN: usize = 5120;
@@ -375,9 +378,11 @@ fn main() -> Result<(), String> {
         .map(|_| (next() * args.experts as f32) as u32 % args.experts as u32)
         .collect();
 
-    // CPU reference on the same bytes.
-    let (reference, cost) = moe_combine(
-        &hidden,
+    // CPU reference on the same bytes: this rank's f32 partials, then the native epilogue with the
+    // bf16 hidden row playing the shared expert's role (it is the only non-routed row here).
+    let mut reference_acc = vec![0.0f32; args.tokens * TOP_K * HIDDEN];
+    let cost = moe_combine_rank(
+        &mut reference_acc,
         &act_fp8,
         &act_scales,
         &w_all,
@@ -387,20 +392,24 @@ fn main() -> Result<(), String> {
         HIDDEN,
         args.experts,
     );
+    let reference = moe_combine_finalize(&reference_acc, &hidden, &expert_ids, args.tokens, HIDDEN);
 
     // The raw driver API through dlopen: no CUDA library is linked, exactly as the design records.
     let cuda = Cuda::load()?;
     let cubin = std::fs::read(&args.cubin).map_err(|e| format!("{}: {e}", args.cubin.display()))?;
     let (module, func) = cuda.load_function(&cubin, "b12x_mxfp4_moe_sm121")?;
     let mut allocated = 0usize;
-    let hidden_d = cuda.alloc(hidden.len() * 2, &mut allocated)?;
     let act_d = cuda.alloc(act_fp8.len(), &mut allocated)?;
     let acts_d = cuda.alloc(act_scales.len(), &mut allocated)?;
     let w_d = cuda.alloc(w_all.len(), &mut allocated)?;
     let ws_d = cuda.alloc(ws_all.len(), &mut allocated)?;
     let ids_d = cuda.alloc(expert_ids.len() * 4, &mut allocated)?;
-    let out_d = cuda.alloc(args.tokens * HIDDEN * 2, &mut allocated)?;
-    cuda.copy_htod(&hidden_d, bytemuck::cast_slice(&hidden))?;
+    let acc_d = cuda.alloc(reference_acc.len() * 4, &mut allocated)?;
+    // The rank accumulator is caller-zeroed: the kernel ADDS each rank's partials into it.
+    cuda.copy_htod(
+        &acc_d,
+        bytemuck::cast_slice(&vec![0.0f32; reference_acc.len()]),
+    )?;
     cuda.copy_htod(&act_d, &act_fp8)?;
     cuda.copy_htod(&acts_d, &act_scales)?;
     cuda.copy_htod(&w_d, &w_all)?;
@@ -411,14 +420,13 @@ fn main() -> Result<(), String> {
     let block = (THREADS, 1, 1);
     // Every argument is staged as 8 bytes; on a little-endian host the driver reads the low 4 bytes
     // of the u32 parameters, which is the value written here.
-    let params: [u64; 11] = [
-        hidden_d.0,
+    let params: [u64; 10] = [
         act_d.0,
         acts_d.0,
         w_d.0,
         ws_d.0,
         ids_d.0,
-        out_d.0,
+        acc_d.0,
         args.tokens as u64,
         0u64,
         args.layer as u64,
@@ -433,11 +441,18 @@ fn main() -> Result<(), String> {
     } else {
         cuda.launch(func, grid, block, &params)?;
     }
-    let mut gpu = vec![0u8; args.tokens * HIDDEN * 2];
-    cuda.copy_dtoh(&mut gpu, &out_d)?;
-    cuda.free(module, &[hidden_d, act_d, acts_d, w_d, ws_d, ids_d, out_d]);
+    let mut gpu_acc = vec![0u8; args.tokens * TOP_K * HIDDEN * 4];
+    cuda.copy_dtoh(&mut gpu_acc, &acc_d)?;
+    cuda.free(module, &[act_d, acts_d, w_d, ws_d, ids_d, acc_d]);
 
-    let gpu_bits: Vec<u16> = bytemuck::cast_slice(&gpu).to_vec();
+    let gpu_acc: Vec<f32> = bytemuck::cast_slice(&gpu_acc).to_vec();
+    let acc_exact = gpu_acc
+        .iter()
+        .zip(&reference_acc)
+        .filter(|(device, host)| device.to_bits() == host.to_bits())
+        .count();
+    let gpu_bits: Vec<u16> =
+        moe_combine_finalize(&gpu_acc, &hidden, &expert_ids, args.tokens, HIDDEN);
     assert_eq!(
         gpu_bits.len(),
         reference.len(),
@@ -476,6 +491,10 @@ fn main() -> Result<(), String> {
         W2_OUT
     );
     println!("cpu reference cost: {cost:?}");
+    println!(
+        "rank accumulator: {acc_exact}/{} f32 partials bit-exact against mxfp4_ref::moe_combine_rank",
+        reference_acc.len()
+    );
     println!("elements compared: {}", reference.len());
     println!(
         "exact bf16 matches: {exact} ({:.4}%)",

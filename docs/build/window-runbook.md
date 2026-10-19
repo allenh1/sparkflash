@@ -184,3 +184,39 @@ python3 -m unittest discover -s scripts/tests -v
 47 host-only tests (no server, no GPU): log-softmax stability, top-k/overlap, KL/JS, dump and oracle
 JSON parsing, position/prefix mapping, bar evaluation, and an end-to-end synthetic comparison.
 
+## Build-cache hygiene across worktrees
+
+Worktrees that share one `CARGO_TARGET_DIR` can serve kernels and test binaries built from a
+DIFFERENT tree. The kernels build script's clang probe and the crate fingerprints key on the package
+and feature set, not on the worktree path, so a tree whose `kernels/` set differs can fail to build,
+or - worse - a test run can be a cached binary from the other tree and its counts are not this tree's.
+
+The concrete symptom seen 2026-10-19: `sparkflash-kernels`' build script stops with
+
+```
+fatal error: 'b12x_bf16a_mxfp8w_dense_sm121.cu' file not found
+```
+
+while that `.cu` is absent from this tree's `kernels/` (it is in the other branch): the probe output
+came from the shared target dir, not from this tree. Same class as engine-dev's `CARGO_MANIFEST_DIR`
+catch. Rules before any window run:
+
+- build each worktree with its own target dir (`CARGO_TARGET_DIR=<worktree>/target`) or clear the
+  shared dir before a gate run;
+- after switching worktrees, verify the binary's `sha256` against the expected cubin pin instead of
+  trusting the path;
+- in a window log, a launch/support count that matches the OTHER branch's kernel set is this bug.
+## rerere: a silent replay hazard
+
+`.git/rr-cache` (this repo sets `rerere.enabled=true`) is shared through `.git` by every worktree, and
+a resolution recorded from a conflict-marked file is reused SILENTLY by later replays of the same
+conflict. The dangerous case is the one nothing catches: a docs-only or comment-only commit that
+"replays clean" while the resolution it reused was the raw conflict markers, because no compiler runs
+on it. Seen 2026-10-19: a rehearsal staged a conflicted file without resolving it, rerere recorded
+that post-image, and the next replay committed `<<<<<<< HEAD` markers and reported success. Rules:
+
+- after every replay, `grep -c '^<<<<<<<'` on the touched files - code gates catch code, nothing
+  catches docs;
+- if rerere auto-resolves a conflict, read the result instead of trusting it;
+- if a poisoned entry is suspected, clear `.git/rr-cache` (it is only a convenience cache).
+

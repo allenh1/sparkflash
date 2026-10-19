@@ -16,6 +16,13 @@
 //!   weight-grid rule (floor(log2(amax)) - emax) is for stored weights and is deliberately a
 //!   different rule.
 //!
+//! * The operand is `quantise(bf16(swiglu))`, NOT `quantise(swiglu)`: native casts the shared
+//!   expert's f32 SwiGLU activation to BF16 before w2's act_quant reads it (model.py:848-851),
+//!   and the routed experts' weighted epilogue rounds its product for the same reason. Both
+//!   [quantise_row] and [quantise_row_weighted] therefore carry exactly one BF16 rounding before
+//!   the quantiser; a version that quantises the unrounded f32 keeps up to eight mantissa bits
+//!   the released model never sees.
+//!
 //! The device side calls `kernels/m4_activation_quant_sm121.cuh`'s
 //! `spark_act_quant_scale_code` and `spark_fp8_e4m3_encode`, so what the harness compares is this
 //! module against those header functions. This module must never be adjusted to agree with a kernel; the kernel has to agree
@@ -118,8 +125,14 @@ pub fn e4m3_decode(code: u8) -> f32 {
     if code & 0x80 != 0 { -value } else { value }
 }
 
-/// The fused reference for one row: activations in f32, then the `[cols]` E4M3 bytes and the
-/// `[cols / QUANT_BLOCK]` ue8m0 scales the MoE kernel consumes.
+/// The fused reference for one row: activations in f32, each rounded once to bf16 (round-nearest-
+/// even) and widened back to f32, then the `[cols]` E4M3 bytes and the `[cols / QUANT_BLOCK]`
+/// ue8m0 scales the MoE kernel consumes.
+///
+/// The bf16 rounding is NOT an implementation detail: native casts the shared expert's SwiGLU
+/// activation to BF16 before w2's act_quant reads it (model.py:848-851), so the operand is
+/// `quantise(bf16(swiglu))`. Quantising the unrounded f32 is the F6/M3 finding this function now
+/// fixes, and [quantise_row_weighted] rounds its product for the same reason.
 #[must_use]
 pub fn quantise_row(gate: &[f32], up: &[f32], limit: f32) -> (Vec<u8>, Vec<u8>) {
     assert_eq!(gate.len(), up.len(), "the two branches are one row each");
@@ -131,7 +144,9 @@ pub fn quantise_row(gate: &[f32], up: &[f32], limit: f32) -> (Vec<u8>, Vec<u8>) 
     let activated: Vec<f32> = gate
         .iter()
         .zip(up.iter())
-        .map(|(gate, up)| swiglu(*gate, *up, limit))
+        .map(|(gate, up)| {
+            crate::m4_quant::bf16_value(crate::m4_quant::bf16_bits(swiglu(*gate, *up, limit)))
+        })
         .collect();
     // One function, one rule: the released activation quantiser. A second implementation here is
     // how the previous floor-rule scale (and, before that, a decoder that made every code zero)
@@ -425,6 +440,51 @@ mod tests {
             ue8m0_from_amax(activated, E4M3_ELEMENT_EMAX),
             119,
             "the weight-grid rule's code at the same amax"
+        );
+    }
+
+    /// Mutation guard for the M3/F6 finding: the unweighted operand must be quantise(bf16(swiglu)),
+    /// not quantise(swiglu). The scan below re-derives both readings from the f32 activation and
+    /// proves (a) [quantise_row] equals the bf16-rounded reading for every sampled block and (b) at
+    /// least one sampled block's codes/scales actually move, so removing the pre-round fails here
+    /// instead of passing on values the rounding happens not to change.
+    #[test]
+    fn the_unweighted_activation_is_rounded_to_bf16_before_the_quantiser() {
+        let mut differing = 0usize;
+        let mut scanned = 0usize;
+        for step in 0..4096u32 {
+            let up_value = 0.5f32 + step as f32 * 0.0001;
+            let gate = vec![1.0f32; QUANT_BLOCK];
+            let up = vec![up_value; QUANT_BLOCK];
+            let activated: Vec<f32> = gate
+                .iter()
+                .zip(&up)
+                .map(|(gate, up)| swiglu(*gate, *up, SWIGLU_LIMIT))
+                .collect();
+            let rounded: Vec<f32> = activated
+                .iter()
+                .map(|value| crate::m4_quant::bf16_value(crate::m4_quant::bf16_bits(*value)))
+                .collect();
+            let (codes, scales) = quantise_row(&gate, &up, SWIGLU_LIMIT);
+            let (rounded_codes, rounded_scales) = crate::m4_quant::act_quant_fp8_row(&rounded);
+            assert_eq!(
+                codes, rounded_codes,
+                "step {step}: codes must be the bf16-rounded reading"
+            );
+            assert_eq!(
+                scales, rounded_scales,
+                "step {step}: scales must be the bf16-rounded reading"
+            );
+            let (plain_codes, plain_scales) = crate::m4_quant::act_quant_fp8_row(&activated);
+            if codes != plain_codes || scales != plain_scales {
+                differing += 1;
+            }
+            scanned += 1;
+        }
+        assert!(scanned == 4096);
+        assert!(
+            differing > 0,
+            "no sampled block distinguished quantise(bf16(x)) from quantise(x): the scan proves nothing"
         );
     }
 

@@ -2,8 +2,8 @@
 //! (`kernels/b12x_mxfp4_moe_sm121.cu`).
 //!
 //! The argument array is the `b12x_mxfp4_moe_sm121` declaration's parameter list in order - six
-//! device pointers and the token count - so a launch cannot swap the expert ids for the combined
-//! output or the token count for a pointer. The declaration is pinned here against the frozen ABI's
+//! device pointers and the token count - so a launch cannot swap the expert ids for the slot
+//! accumulator or the token count for a pointer. The declaration is pinned here against the frozen ABI's
 //! embedded copy ([m4_abi::MXFP4_MOE]); [PARAMS] is the pinned name and type of every parameter
 //! and [declaration_matches] is the check, with a mutation test proving it is not vacuous.
 //!
@@ -23,17 +23,16 @@ pub const KERNEL: &str = "b12x_mxfp4_moe_sm121";
 /// The kernel source the declaration pin is read from (the frozen ABI's embedded copy).
 pub const SOURCE: &str = m4_abi::MXFP4_MOE;
 /// The number of argument words a launch fills.
-pub const ARG_WORDS: usize = 11;
+pub const ARG_WORDS: usize = 10;
 
 /// The declaration's parameters in order: `(name, base type, pointer, pointee const)`.
 pub const PARAMS: [(&str, &str, bool, bool); ARG_WORDS] = [
-    ("hidden", "__nv_bfloat16", true, true),
     ("act_fp8", "uint8_t", true, true),
     ("act_scales", "uint8_t", true, true),
     ("w_fp4", "uint8_t", true, true),
     ("w_scales", "uint8_t", true, true),
     ("expert_ids", "uint32_t", true, true),
-    ("combined", "__nv_bfloat16", true, false),
+    ("slot_acc", "float", true, false),
     ("tokens", "uint32_t", false, false),
     ("trace_ring", "GpuTraceRing", true, false),
     ("layer_id", "uint32_t", false, false),
@@ -71,7 +70,7 @@ pub const TILE_D: u32 = 256;
 /// The number of hidden tiles: `HIDDEN / TILE_D`.
 pub const GRID_Y: u32 = 20;
 /// The index of `tokens` in [Mxfp4MoeParams::as_slice].
-pub const TOKENS_INDEX: usize = 7;
+pub const TOKENS_INDEX: usize = 6;
 
 /// The grid for `tokens` routed rows: `(tokens, GRID_Y, 1)`.
 ///
@@ -95,26 +94,24 @@ impl Mxfp4MoeParams {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
-        hidden: Deviceptr,
         act_fp8: Deviceptr,
         act_scales: Deviceptr,
         w_fp4: Deviceptr,
         w_scales: Deviceptr,
         expert_ids: Deviceptr,
-        combined: Deviceptr,
+        slot_acc: Deviceptr,
         tokens: u32,
         trace_ring: u64,
         layer_id: u32,
         step_seq: u64,
     ) -> Self {
         Self([
-            hidden.0,
             act_fp8.0,
             act_scales.0,
             w_fp4.0,
             w_scales.0,
             expert_ids.0,
-            combined.0,
+            slot_acc.0,
             u64::from(tokens),
             trace_ring,
             u64::from(layer_id),
@@ -165,9 +162,8 @@ mod tests {
             Deviceptr(0x4000),
             Deviceptr(0x5000),
             Deviceptr(0x6000),
-            Deviceptr(0x7000),
             tokens,
-            0x8000,
+            0x7000,
             7,
             11,
         )
@@ -206,7 +202,7 @@ mod tests {
         assert_eq!(
             p.as_slice(),
             [
-                0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000, 130, 0x8000, 7, 11
+                0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000, 130, 0x7000, 7, 11
             ]
         );
         assert_eq!(p.tokens(), 130);

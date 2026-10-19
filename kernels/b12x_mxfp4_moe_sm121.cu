@@ -1,10 +1,10 @@
 // kernels/b12x_mxfp4_moe_sm121.cu
 //
-// The W4A8 mixture-of-experts combine of specification 2.1/6.2: 384 routed experts with top-6
-// routing and one shared expert, whose width is 576 per rank padded to 640, FP4 E2M1 weights with
-// one ue8m0 scale per 32 values along the reduction dimension, against FP8 E4M3 activations with
-// per-32 ue8m0 scales. The activation format is decision D14 (docs/DECISIONS.md), and the three
-// artefacts that settle it are:
+// The W4A8 mixture-of-experts down-projection partial of specification 2.1/6.2: 384 routed experts
+// with top-6 routing and one shared expert, whose width is 576 per rank padded to 640, FP4 E2M1
+// weights with one ue8m0 scale per 32 values along the reduction dimension, against FP8 E4M3
+// activations with per-32 ue8m0 scales. The activation format is decision D14
+// (docs/DECISIONS.md), and the three artefacts that settle it are:
 //
 //   * the checkpoint declares it - config.json:12-21 is quant_method "fp8", activation_scheme
 //     "dynamic", weight_block_size [32, 32], scale_fmt "ue8m0", expert_dtype "fp4" - and
@@ -22,16 +22,30 @@
 // milestone list names the weight format. An earlier version of this file took packed E2M1
 // activations and justified it with specification 6.2, which makes no activation claim at all.
 //
-// What it computes, exactly: out[t][j] = residual + the sum over the six slots of that slot's
-// FP8xFP8 block sums, accumulated in f32 in ascending slot order and, inside a slot, in ascending
-// 32-value K block order, with both ue8m0 scales applied to each block's PARTIAL PRODUCT exactly as
-// kernel.py:552-553 applies them to the accumulator, and one rounding to bf16 at the very end. The
-// routing weight is deliberately NOT folded in here: the reference multiplies it into the SwiGLU
-// activation before the bf16 cast that the activation quantiser reads (model.py:849-851), so it is
-// part of the A operand, and folding it into this GEMM would quantise an unrouted tensor instead -
-// a different arithmetic, which src/mxfp4_ref.rs pins with a mutation. This kernel is the
-// down/combine projection: the up/gate projections that produce the activation are the same MXFP4
-// GEMM and are not duplicated here.
+// What it computes, exactly (decision D39, docs/DECISIONS.md; audit F7): ONE TENSOR-PARALLEL
+// RANK'S PARTIALS, in f32, into a per-(token, slot) accumulator. The released model splits one
+// expert's 2304-value intermediate width across four ranks (576 values each, padded to 640 here),
+// so an expert's w2 output is the f32 sum of four rank partials, and the released model rounds it
+// to bf16 exactly once, after that sum (model.py:899-903: y[idx] += expert(...), with the bf16
+// expert output added in ascending expert-id order into a f32 row; the rank sum is f32 at
+// model.py:902). Rounding a rank partial would be a different arithmetic: it is neither more nor
+// less precise than the reference, it is simply not the reference's. This kernel therefore rounds
+// NOTHING. Each (token, slot, column) thread computes that rank's FP8xFP8 block sums, in f32, in
+// ascending 32-value K block order, with both ue8m0 scales applied to each block's PARTIAL PRODUCT
+// exactly as kernel.py:552-553 applies them to the accumulator, and ADDS the slot's rank partial
+// into slot_acc[token * top_k + slot]. The native epilogue - round each expert's f32 sum to bf16,
+// add the top-k bf16 values in ascending expert-id order, add the shared expert's bf16 output, round
+// the MoE output to bf16 once - runs after every rank has contributed and is NOT part of this
+// kernel; src/mxfp4_ref.rs::moe_combine_finalize is its definition and src/mxfp4_ref.rs is the
+// host twin for both halves. The residual is not added here either: the released model adds it
+// later, in f32, inside hc_post (model.py:962-966).
+//
+// The routing weight is deliberately NOT folded in here: the reference multiplies it into the
+// SwiGLU activation before the bf16 cast that the activation quantiser reads (model.py:849-851), so
+// it is part of the A operand, and folding it into this GEMM would quantise an unrouted tensor
+// instead - a different arithmetic, which src/mxfp4_ref.rs pins with a mutation. This kernel is the
+// down projection: the up/gate projections that produce the activation are the same MXFP4 GEMM and
+// are not duplicated here.
 //
 // The A operand is one E4M3 byte per value, [tokens * top_k][width_padded], with per-32 ue8m0
 // scales [tokens * top_k][width_padded / 32]. The per-slot rows are the consequence of the routing
@@ -48,15 +62,17 @@
 // reference masks identically, and it still COUNTS the wasted MACs so the cost of the padding is
 // visible rather than assumed away.
 //
-// Verification status: executed on node0 (GB10, sm_121a) on 2026-10-17. nvcc 13.0.3
-// compiles it for sm_121a, clang parses it against the stub headers, the signature and geometry
-// are pinned by src/m4_abi.rs, and src/mxfp4_ref.rs defines and tests the numerics on the CPU.
-// The device run: stage 3 of examples/m7_layer0.rs with 8 resident experts on real layer-0 bytes
-// PASSed - the combine output 20,480/20,480 bit-exact against the bf16 rounding of the
-// quantised reference, max ULP distance 0. The router is still the host seam and the shared
-// expert is still host arithmetic, as the harness prints; no latency, no expert-parallel
-// transport and no tensor-core path is claimed. The dispatch handshake that feeds this kernel is
-// not in this file and does not poll any peer-written word.
+// Verification status: the native-arithmetic change (task-4, audit M2/F7) replaced the old bf16
+// rank chain (a bf16 seed in, one bf16 rounding per rank launch, one bf16 output) with this f32
+// per-slot accumulator, so the PREVIOUS device evidence - stage 3 of examples/m7_layer0.rs on
+// 2026-10-17 was 20,480/20,480 bit-exact against the bf16 rounding of the old chain - does NOT
+// carry over to this ABI and is not claimed here. This default header compiles for sm_121a under
+// nvcc 13.0.3, src/m4_abi.rs pins the signature and the geometry, and src/mxfp4_ref.rs defines and
+// tests the numerics on the CPU (device-vs-twin bit-exactness of the f32 partials is measured when
+// the chain is re-run, N9). The router is still the host seam and the shared expert is still host
+// arithmetic; no latency, no expert-parallel transport and no tensor-core path is claimed. The
+// dispatch handshake that feeds this kernel is not in this file and does not poll any peer-written
+// word.
 
 #include "m4_common_sm121.cuh"
 
@@ -129,13 +145,12 @@ __device__ __forceinline__ float spark_fp4_load(const uint8_t *row, uint32_t ind
 }
 
 extern "C" __global__ void b12x_mxfp4_moe_sm121(
-    const __nv_bfloat16 *__restrict__ hidden,   // [tokens][d] pre-combine input, kept for the residual
     const uint8_t *__restrict__ act_fp8,        // [tokens * top_k][width_padded] E4M3, one byte per value
     const uint8_t *__restrict__ act_scales,     // [tokens * top_k][width_padded / 32] ue8m0
     const uint8_t *__restrict__ w_fp4,          // [experts][d][width_padded / 2] packed E2M1
     const uint8_t *__restrict__ w_scales,       // [experts][d][width_padded / 32] ue8m0
     const uint32_t *__restrict__ expert_ids,    // [tokens][top_k] expert index per slot
-    __nv_bfloat16 *__restrict__ combined,       // [tokens][d] the routed sum over slots
+    float *__restrict__ slot_acc,               // [tokens][top_k][d] f32 IN/OUT: this rank's partials, added
     const uint32_t tokens,
     GpuTraceRing *__restrict__ trace_ring,
     const uint32_t layer_id,
@@ -151,7 +166,6 @@ extern "C" __global__ void b12x_mxfp4_moe_sm121(
     SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_MOE_MXFP4, t_enter);
 
     if (token < tokens && column < SPARK_M4_HIDDEN) {
-        float acc = 0.0f;
         const uint64_t routed_row = ((uint64_t)token * SPARK_M4_MOE_TOP_K);
         for (uint32_t slot = 0; slot < (uint32_t)SPARK_M4_MOE_TOP_K; ++slot) {
             const uint32_t expert = expert_ids[routed_row + slot];
@@ -165,6 +179,7 @@ extern "C" __global__ void b12x_mxfp4_moe_sm121(
             const uint8_t *w_scale_row = w_scales + spark_b12x_row_scale_index(
                                                        expert * SPARK_M4_HIDDEN + column, 0u,
                                                        SPARK_M4_MOE_WIDTH_PADDED);
+            float acc = 0.0f;
             for (uint32_t block = 0; block < SPARK_M4_MOE_K_BLOCKS; ++block) {
                 const uint32_t base = block * SPARK_M4_QUANT_BLOCK;
                 const float act_scale = spark_ue8m0_decode(act_scale_row[block]);
@@ -191,16 +206,21 @@ extern "C" __global__ void b12x_mxfp4_moe_sm121(
                 }
                 acc += (partial * act_scale) * w_scale;
             }
+            // The rank partial is accumulated in f32 and NOT rounded: the f32 sum over the four
+            // ranks is the expert's output, and the one bf16 rounding of that output belongs to the
+            // native epilogue (model.py:899-903), after every rank has contributed. The accumulator
+            // is laid out [tokens][top_k][d], one f32 per expert output element; one block covers
+            // one 256-value tile of one token's hidden row, so every element it writes is written
+            // by exactly one thread of exactly one block (no intra-launch race), and the four rank
+            // launches are serialized by the caller.
+            slot_acc[((uint64_t)token * SPARK_M4_MOE_TOP_K + slot) * SPARK_M4_HIDDEN + column] += acc;
         }
-        // The residual is added in f32 and rounded once, which is the order mxfp4_ref.rs pins.
-        const float residual = __bfloat162float(hidden[(uint64_t)token * SPARK_M4_HIDDEN + column]);
-        combined[(uint64_t)token * SPARK_M4_HIDDEN + column] = __float2bfloat16_rn(residual + acc);
     }
     __syncthreads();
 
     if (lane == 0u) {
-        // payload_meta: one bf16 per output element of this block's tile.
-        const uint32_t meta = SPARK_M4_MOE_TILE_D * 2u;
+        // payload_meta: one f32 per (slot, output element) of this block's tile.
+        const uint32_t meta = SPARK_M4_MOE_TILE_D * SPARK_M4_MOE_TOP_K * 4u;
         SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_MOE_MXFP4, layer_id, meta, t_enter);
         (void)step_seq;
     }

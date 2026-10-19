@@ -101,7 +101,7 @@ impl WeightSource for CachedWeightSource {
 }
 
 /// The usage line for this subcommand.
-pub const USAGE: &str = "sparkflash device-chain --plan-only|--dry-run|--run-stage mhc_entry|layer_zero|hybrid_token|tp4-smoke --checkpoint DIR --cubin-dir DIR [--positions 0] [--layer 0] [--token 0] [--element-limit N] [--moe-preflight] [--moe-layer0-diagnose]; tp4-smoke also takes --tp-rank N --tp-world-size N --comm-backend tcp|lo --comm-peers IP,IP,... --comm-port 29601 --evidence-dir DIR";
+pub const USAGE: &str = "sparkflash device-chain --plan-only|--dry-run|--run-stage mhc_entry|layer_zero|hybrid_token|hybrid_sequence|tp4-smoke --checkpoint DIR --cubin-dir DIR [--positions 0] [--layer 0] [--token 0] [--element-limit N] [--moe-preflight] [--moe-layer0-diagnose] [--fixture FILE --prompt-tokens N --decode-steps N] [--dump-logits FILE] [--reference-check] [--attention-twin-positions LIST] [--host-attention-from POSITION] [--operand-audit]; tp4-smoke also takes --tp-rank N --tp-world-size N --comm-backend tcp|lo --comm-peers IP,IP,... --comm-port 29601 --evidence-dir DIR";
 
 /// The exit code a plan-only or dry-run invocation returns: 2, refusing to serve.
 pub const PLAN_ONLY_EXIT: u8 = 2;
@@ -392,6 +392,18 @@ struct StageArgs {
     dump_logits: Option<std::path::PathBuf>,
     wo_a_mode: crate::attention_device::WoAMode,
     wo_a_operand_dump: Option<std::path::PathBuf>,
+    // When set, replaces the in-chain attention twin's armed positions; None keeps the default
+    // (prefill 0..2 plus the ring's first two wrap steps).
+    attention_twin_positions: Option<Vec<usize>>,
+    // When set, positions at or after it skip the device attention body and run the engine's host
+    // attention loop instead. The rest of the device chain (MoE, projections) keeps running, so a
+    // clean run past the window separates an attention-path defect from an upstream one.
+    host_attention_from: Option<usize>,
+    // When set, the reference half of the run captures the reference's own attention inputs at the
+    // armed twin positions, and the report compares the device's staged operands against them. This
+    // is the audit the in-chain twin cannot do: the twin compares device body against host body on
+    // the same staged operands, so a staging defect is invisible to it.
+    operand_audit: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -452,6 +464,9 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
     let mut dump_logits = None;
     let mut wo_a_mode = crate::attention_device::WoAMode::default();
     let mut wo_a_operand_dump = None;
+    let mut operand_audit = false;
+    let mut attention_twin_positions = None;
+    let mut host_attention_from = None;
     let mut index = 1usize;
     while index < args.len() {
         let flag = args[index];
@@ -470,6 +485,11 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
             index += 1;
             continue;
         }
+        if flag == "--operand-audit" {
+            operand_audit = true;
+            index += 1;
+            continue;
+        }
         let value = args
             .get(index + 1)
             .ok_or_else(|| format!("{flag} needs a value"))?;
@@ -477,6 +497,16 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
             "--checkpoint" => checkpoint = Some(std::path::PathBuf::from(value)),
             "--cubin-dir" => cubin_dir = Some(std::path::PathBuf::from(value)),
             "--positions" => positions = parse_positions(value)?,
+            "--attention-twin-positions" => {
+                attention_twin_positions = Some(parse_positions(value)?);
+            }
+            "--host-attention-from" => {
+                let mut parsed = parse_positions(value)?;
+                if parsed.len() != 1 {
+                    return Err("--host-attention-from takes one position, not a list".to_string());
+                }
+                host_attention_from = parsed.pop();
+            }
             "--fixture" => fixture = Some(std::path::PathBuf::from(value)),
             "--wo-a-mode" => {
                 wo_a_mode = crate::attention_device::WoAMode::parse(value)?;
@@ -584,6 +614,9 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
             dump_logits,
             wo_a_mode,
             wo_a_operand_dump,
+            attention_twin_positions,
+            host_attention_from,
+            operand_audit,
         },
     ))
 }
@@ -892,6 +925,13 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
     let mut reference_boundaries: Vec<BoundaryTable> = Vec::new();
     let mut reference_attention_records: Vec<Vec<attention_case::AttentionCaseRecord>> = Vec::new();
     let mut reference_head_inputs: Vec<Vec<f32>> = Vec::new();
+    // --operand-audit: the reference's own attention inputs at the armed twin positions, keyed by
+    // position and captured from the same reference pass that produces the logits comparison, so the
+    // audit costs one capture per position and no extra run.
+    let mut reference_attention_cases: std::collections::BTreeMap<
+        usize,
+        Vec<attention_case::AttentionCaseRecord>,
+    > = std::collections::BTreeMap::new();
     let reference_elapsed;
     if sequence {
         let full_claim = sequence_fixture.as_ref().is_some_and(|fixture| {
@@ -905,24 +945,67 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             );
         }
         if full_claim {
+            let audit_positions: Vec<usize> = if args.operand_audit {
+                match &args.attention_twin_positions {
+                    Some(positions) => positions.clone(),
+                    None => crate::attention_device::default_twin_positions(config.window_size),
+                }
+            } else {
+                Vec::new()
+            };
+            let audit_layers: Vec<usize> = (0..config.n_layers).collect();
+            let prefill_position = prompt_ids.len().saturating_sub(1);
+            let capture_prefill = audit_positions.contains(&prefill_position);
+            if capture_prefill {
+                attention_case::begin(&audit_layers, prefill_position).map_err(|error| {
+                    format!("reference attention capture {prefill_position}: {error}")
+                })?;
+            }
             let observed = reference_engine
                 .prefill_observed(&mut reference_state, &prompt_ids)
                 .map_err(|error| format!("reference prefill: {error}"))?;
+            if capture_prefill {
+                let captured = attention_case::finish();
+                let line = format!(
+                    "sequence operand audit: reference capture position={prefill_position} layers={} armed={audit_positions:?}",
+                    captured.len()
+                );
+                println!("{line}");
+                lines.push(line);
+                reference_attention_cases.insert(prefill_position, captured);
+            }
             let mut next = observed.output.next_token;
             reference_tokens.push(next);
             reference_top5s.push(top5(&observed.output.logits));
             reference_logits = observed.output.logits.clone();
             reference_boundaries.push(observed.boundary.clone());
             reference_boundary = Some(observed.boundary);
-            for _ in 0..args.decode_steps {
+            for step_index in 0..args.decode_steps {
                 let token =
                     next.ok_or_else(|| "reference sequence has no token to decode".to_string())?;
-                let step = reference_engine
+                let position = prompt_ids.len() + step_index;
+                let capture = audit_positions.contains(&position);
+                if capture {
+                    attention_case::begin(&audit_layers, position).map_err(|error| {
+                        format!("reference attention capture {position}: {error}")
+                    })?;
+                }
+                let decoded = reference_engine
                     .decode(&mut reference_state, token)
                     .map_err(|error| format!("reference decode: {error}"))?;
-                next = step.next_token;
+                if capture {
+                    let captured = attention_case::finish();
+                    let line = format!(
+                        "sequence operand audit: reference capture position={position} layers={}",
+                        captured.len()
+                    );
+                    println!("{line}");
+                    lines.push(line);
+                    reference_attention_cases.insert(position, captured);
+                }
+                next = decoded.next_token;
                 reference_tokens.push(next);
-                reference_logits = step.logits;
+                reference_logits = decoded.logits;
             }
             let fixture = sequence_fixture
                 .as_ref()
@@ -1062,6 +1145,33 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         "indexer arithmetic: native dtype (bf16 q_norm output quantised to E4M3 over 32-value blocks, fp8 W8A8 wq_b with a bf16 output, bf16 weights and scores, discrete two-level top-k; the indexer stays a host seam)"
             .to_string(),
     );
+    crate::attention_device::AttentionDeviceBackend::open(&args.cubin_dir)?;
+    // The in-chain attention twin's armed positions. The default keeps the prefill diagnostics at
+    // 0..2 and adds the ring's first two wrap steps, so the boundary is compared without an extra
+    // flag; --attention-twin-positions replaces the set for a targeted window ladder.
+    let twin_positions = match &args.attention_twin_positions {
+        Some(positions) => positions.clone(),
+        None => crate::attention_device::default_twin_positions(config.window_size),
+    };
+    attention_backend.set_twin_positions(twin_positions.clone());
+    if let Some(from) = args.host_attention_from {
+        // An A/B switch, not a production path: every position at or after `from` skips the device
+        // attention body and runs the engine's host attention loop on the same q/kv/ids. The rest
+        // of the device chain still runs, so a clean result past the window says the defect is in
+        // the device attention path (staging or body), and a dirty one says it is upstream.
+        attention_backend.set_host_attention_from(from);
+    }
+    if args.sequence {
+        if let Some(from) = args.host_attention_from {
+            lines.push(format!(
+                "sequence host-attention A/B: positions {from}.. run the host attention loop; the device attention body is skipped from there on (expect the position-support line below to report the shortfall)"
+            ));
+        }
+        lines.push(format!(
+            "sequence attention twin armed: positions={:?}; default is prefill 0..2 plus window and window+1 (the ring's first two wrap steps); per-layer comparisons print as 'sequence attention twin: position=...', the eviction contract as 'sequence attention boundary: position=...'",
+            twin_positions
+        ));
+    }
     let mut moe_backend = crate::moe_device::MoeDeviceBackendImpl::open(&args.cubin_dir)?;
     if args.moe_layer0_diagnose {
         moe_backend = moe_backend.with_layer0_diagnose();
@@ -2385,6 +2495,17 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
                     .to_string(),
             );
         }
+    }
+    if sequence && !reference_attention_cases.is_empty() {
+        let audit = crate::attention_device::operand_audit_lines(
+            &reference_attention_cases,
+            attention_backend.operand_traces(),
+            config.window_size,
+        );
+        for line in &audit {
+            println!("{line}");
+        }
+        lines.extend(audit);
     }
     if sequence && reference_attention_records.len() == prompt_ids.len() {
         lines.extend(sequence_alignment_and_residual_lines(
@@ -4090,6 +4211,9 @@ mod tests {
             dump_logits: None,
             wo_a_mode: crate::attention_device::WoAMode::default(),
             wo_a_operand_dump: None,
+            attention_twin_positions: None,
+            host_attention_from: None,
+            operand_audit: false,
         };
         assert_eq!(
             layer_zero_element_limit(&default_args),
@@ -4237,6 +4361,88 @@ mod tests {
         ])
         .expect_err("zero prompt tokens");
         assert!(error.contains("at least 1"), "{error}");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_attention_twin_ladder_flag_selects_positions() {
+        let (_, args) = stage_args(&[
+            "hybrid_sequence",
+            "--checkpoint",
+            "/checkpoint",
+            "--cubin-dir",
+            "/cubins",
+            "--attention-twin-positions",
+            "126,127,128,129,130",
+        ])
+        .expect("an explicit twin ladder");
+        assert_eq!(
+            args.attention_twin_positions,
+            Some(vec![126, 127, 128, 129, 130])
+        );
+        let (_, defaulted) = stage_args(&[
+            "hybrid_sequence",
+            "--checkpoint",
+            "/checkpoint",
+            "--cubin-dir",
+            "/cubins",
+        ])
+        .expect("the default twin ladder");
+        assert_eq!(defaulted.attention_twin_positions, None);
+        let error = stage_args(&[
+            "hybrid_sequence",
+            "--checkpoint",
+            "/checkpoint",
+            "--cubin-dir",
+            "/cubins",
+            "--attention-twin-positions",
+            "126,,129",
+        ])
+        .expect_err("an empty twin-position entry");
+        assert!(error.contains("empty entry"), "{error}");
+        // The A/B switch takes one position: a list would silently mis-arm the fallback.
+        let (_, ab) = stage_args(&[
+            "hybrid_sequence",
+            "--checkpoint",
+            "/checkpoint",
+            "--cubin-dir",
+            "/cubins",
+            "--host-attention-from",
+            "127",
+        ])
+        .expect("a host-attention A/B position");
+        assert_eq!(ab.host_attention_from, Some(127));
+        let error = stage_args(&[
+            "hybrid_sequence",
+            "--checkpoint",
+            "/checkpoint",
+            "--cubin-dir",
+            "/cubins",
+            "--host-attention-from",
+            "127,128",
+        ])
+        .expect_err("a host-attention list");
+        assert!(error.contains("not a list"), "{error}");
+        // The operand audit is off unless asked for: it captures the reference's attention inputs,
+        // which is memory the default run does not spend.
+        assert!(!defaulted.operand_audit);
+        let (_, audited) = stage_args(&[
+            "hybrid_sequence",
+            "--checkpoint",
+            "/checkpoint",
+            "--cubin-dir",
+            "/cubins",
+            "--attention-twin-positions",
+            "126,127,128,129,130",
+            "--operand-audit",
+        ])
+        .expect("the operand audit flag");
+        assert!(audited.operand_audit);
+        assert_eq!(
+            audited.attention_twin_positions,
+            Some(vec![126, 127, 128, 129, 130]),
+            "the audit captures at the twin ladder, it does not replace it"
+        );
     }
 
     #[cfg(feature = "cuda")]

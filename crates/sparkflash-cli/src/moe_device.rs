@@ -45,6 +45,20 @@ const HEAD: &str = "cert_lm_head_sm121";
 const HEAD_REDUCE: &str = "lm_head_reduce_sm121";
 const RMSNORM: &str = "rmsnorm_sm121";
 const RANKS: usize = 4;
+
+/// The routed kernels a layer launches, by kind. The plan is one device router, then for each of
+/// the four serial ranks a gate GEMM, an up GEMM, the weighted SwiGLU quantiser and the combine
+/// add. The plan is a constant here so the counter in the routed path can be checked against what
+/// actually launched: a launch left out of the plan, or a readback turned into a launch, mismatches.
+const ROUTED_ROUTER_LAUNCHES: usize = 1;
+const ROUTED_GATE_UP_LAUNCHES: usize = RANKS * 2;
+const ROUTED_WEIGHTED_LAUNCHES: usize = RANKS;
+const ROUTED_COMBINE_LAUNCHES: usize = RANKS;
+/// Routed launches one layer performs: the router plus four rank kernels per rank.
+const ROUTED_LAUNCHES_PER_LAYER: usize = ROUTED_ROUTER_LAUNCHES
+    + ROUTED_GATE_UP_LAUNCHES
+    + ROUTED_WEIGHTED_LAUNCHES
+    + ROUTED_COMBINE_LAUNCHES;
 const HEAD_VOCAB_PER_RANK: usize = 32_320;
 const SWIGLU_LIMIT_BITS: u64 = 10.0f32.to_bits() as u64;
 const PADDED: usize = 640;
@@ -574,6 +588,9 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         staged_bytes += (x_bf16.len() + gate.len() + bias.len()) as u64;
 
         let started = std::time::Instant::now();
+        // Count what this layer actually launches, so the accounting is measured and not
+        // asserted out of thin air; the plan constant is checked against it before it is stored.
+        let mut launched = 0usize;
         router_launch::launch(
             &self.cuda,
             self.kernels.router,
@@ -591,6 +608,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             },
         )
         .map_err(drv)?;
+        launched += ROUTED_ROUTER_LAUNCHES;
         let mut id_bytes = vec![0u8; rows * 4];
         self.cuda.copy_dtoh(&mut id_bytes, &ids_d).map_err(drv)?;
         host_bytes += id_bytes.len() as u64;
@@ -790,6 +808,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
                 step_seq: rank as u64,
             };
             routed_gate_up_launch::launch(&self.cuda, self.kernels.gate_up, &base).map_err(drv)?;
+            launched += 1;
             routed_gate_up_launch::launch(
                 &self.cuda,
                 self.kernels.gate_up,
@@ -801,6 +820,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
                 },
             )
             .map_err(drv)?;
+            launched += 1;
 
             let codes_d = self
                 .cuda
@@ -822,6 +842,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
                     &params,
                 )
                 .map_err(drv)?;
+            launched += ROUTED_WEIGHTED_LAUNCHES / RANKS;
             if layer == 0 {
                 rank_gate.push((w_gate, s_gate, w_up, s_up));
             }
@@ -870,20 +891,22 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         self.stats.device_us += started.elapsed().as_micros() as u64;
 
         let combine_started = std::time::Instant::now();
-        let hidden_d = self
+        // The four serial rank launches ADD their f32 partials into ONE slot accumulator, the
+        // [tokens][top_k][dim] sum over the tensor-parallel ranks, and nothing rounds between
+        // ranks (audit M2/F7: native sums the rank partials in f32 and rounds each expert's w2
+        // output once, in the epilogue, model.py:899-903). The old chain seeded a bf16 hidden row
+        // and read a bf16 output back after every rank, rounding each partial.
+        let slot_acc_d = self
             .cuda
-            .alloc(tokens * dim * 2, &mut allocated)
+            .alloc(tokens * top_k * dim * 4, &mut allocated)
             .map_err(drv)?;
-        let combined_d = self
-            .cuda
-            .alloc(tokens * dim * 2, &mut allocated)
+        ptrs.push(slot_acc_d);
+        // Every rank ADDS into the accumulator, so it starts zeroed.
+        self.cuda
+            .copy_htod(&slot_acc_d, &vec![0u8; tokens * top_k * dim * 4])
             .map_err(drv)?;
-        ptrs.extend([hidden_d, combined_d]);
-        let zeros = vec![0u8; tokens * dim * 2];
-        self.cuda.copy_htod(&hidden_d, &zeros).map_err(drv)?;
         let mut rank_w2 = Vec::with_capacity(RANKS);
         let mut rank_s2 = Vec::with_capacity(RANKS);
-        let mut rank_device_bits = Vec::with_capacity(RANKS);
         for rank in 0..RANKS {
             let w2 = rank_slice_padded(
                 &experts,
@@ -913,13 +936,12 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
                 &self.cuda,
                 self.kernels.combine,
                 &Mxfp4MoeParams::new(
-                    hidden_d,
                     codes[rank],
                     scales[rank],
                     w2_d,
                     s2_d,
                     ids_local_d,
-                    combined_d,
+                    slot_acc_d,
                     tokens as u32,
                     0,
                     layer as u32,
@@ -927,36 +949,48 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
                 ),
             )
             .map_err(drv)?;
+            launched += ROUTED_COMBINE_LAUNCHES / RANKS;
             if layer == 0 {
                 rank_w2.push(w2);
                 rank_s2.push(s2);
             }
-            let mut bytes = vec![0u8; tokens * dim * 2];
-            self.cuda.copy_dtoh(&mut bytes, &combined_d).map_err(drv)?;
-            if layer == 0 {
-                let mut bits = vec![0u16; tokens * dim];
-                for (slot, chunk) in bytes.as_chunks::<2>().0.iter().enumerate() {
-                    bits[slot] = u16::from_le_bytes(*chunk);
-                }
-                rank_device_bits.push(bits);
-            }
-            self.cuda.copy_htod(&hidden_d, &bytes).map_err(drv)?;
-            host_bytes += (bytes.len() * 2) as u64;
         }
-        let mut final_bytes = vec![0u8; tokens * dim * 2];
+        // ONE readback after the four ranks, of the f32 accumulator.
+        let mut slot_acc_bytes = vec![0u8; tokens * top_k * dim * 4];
         self.cuda
-            .copy_dtoh(&mut final_bytes, &combined_d)
+            .copy_dtoh(&mut slot_acc_bytes, &slot_acc_d)
             .map_err(drv)?;
-        host_bytes += final_bytes.len() as u64;
-        out.copy_from_slice(&decode_bf16(&final_bytes));
+        host_bytes += slot_acc_bytes.len() as u64;
+        let slot_acc: Vec<f32> = slot_acc_bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect();
+        // The native routed epilogue up to the task-10 boundary: one bf16 round per expert, the
+        // expert outputs added in ascending expert-id order in f32. The shared-expert bf16 add and
+        // the single MoE bf16 round are task-10's host seams, so the chain keeps handing the
+        // engine an f32 routed tensor exactly as before task-4 (no half-implemented boundary).
+        let routed = mxfp4_ref::moe_combine_routed_f32(&slot_acc, &local_ids, tokens, dim);
+        out.copy_from_slice(&routed);
         let routed_device_us = combine_started.elapsed().as_micros() as u64;
         let routed_staging_us = staging.elapsed().as_micros() as u64;
         self.stats.device_us += routed_device_us;
-        self.stats.staging_us += routed_staging_us;
         self.stats.routed_device_us += routed_device_us;
+        self.stats.staging_us += routed_staging_us;
         self.stats.routed_staging_us += routed_staging_us;
-        self.stats.routed_launches += 17;
-        self.stats.launches += 17;
+        // The plan is a constant but the count is measured: a launch that moved, appeared or did
+        // not run fails here rather than being recorded as if the plan had run.
+        if launched != ROUTED_LAUNCHES_PER_LAYER {
+            return Err(err(
+                "device routed MoE launches",
+                format!(
+                    "the layer launched {launched} kernels but the plan is {ROUTED_LAUNCHES_PER_LAYER}: one router, then per rank a gate GEMM, an up GEMM, the weighted SwiGLU quantiser and the combine add"
+                ),
+            ));
+        }
+        self.stats.routed_launches += launched;
+        self.stats.launches += launched;
         self.stats.staged_bytes += staged_bytes;
         self.stats.host_bytes += host_bytes;
         self.stats.routed_host_bytes = self.stats.routed_host_bytes.saturating_add(host_bytes);
@@ -964,22 +998,19 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         if self.launches_by_layer.len() <= layer {
             self.launches_by_layer.resize(layer + 1, 0);
         }
-        self.launches_by_layer[layer] = 17;
+        self.launches_by_layer[layer] = launched;
         let _ = (limit, local_count);
         self.cuda.free_buffers(&ptrs.iter().collect::<Vec<_>>());
         if layer == 0 {
-            // The bar the chain gate alone could not provide. The device combine is a bf16
-            // rank chain with a zero seed (the engine adds residual and shared later), so the
-            // reference is the SAME chained bf16 combine over the SAME device-built operand
-            // bytes, not the f32 host routed sum. m17a measured that class bit-exact; any
-            // mismatch here is a wiring defect, not FP4 spread.
-            let mut twin_hidden = vec![0u16; tokens * dim];
-            let mut twin_mismatches = 0usize;
-            let mut twin_max_abs = 0.0f32;
-            let mut per_rank_mismatches = Vec::with_capacity(RANKS);
+            // The bar the chain gate alone could not provide. The device combine is the native
+            // structure now: one f32 slot accumulator over the four ranks, no per-rank bf16
+            // rounding. The twin is mxfp4_ref::moe_combine_rank over the SAME device-built operand
+            // bytes and the SAME rank weight slices, then the same routed epilogue over that twin
+            // accumulator; any mismatch is a wiring defect, not FP4 spread.
+            let mut twin_acc = vec![0.0f32; tokens * top_k * dim];
             for rank in 0..RANKS {
-                let (next, _) = mxfp4_ref::moe_combine(
-                    &twin_hidden,
+                let _cost = mxfp4_ref::moe_combine_rank(
+                    &mut twin_acc,
                     &device_operand[rank].0,
                     &device_operand[rank].1,
                     &rank_w2[rank],
@@ -989,26 +1020,30 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
                     dim,
                     local_count,
                 );
-                let mut rank_mismatches = 0usize;
-                for (&device, &twin) in rank_device_bits[rank].iter().zip(next.iter()) {
-                    if device != twin {
-                        rank_mismatches += 1;
-                        let device_value = f32::from_bits(u32::from(device) << 16);
-                        let twin_value = f32::from_bits(u32::from(twin) << 16);
-                        twin_max_abs = twin_max_abs.max((device_value - twin_value).abs());
-                    }
-                }
-                twin_mismatches += rank_mismatches;
-                per_rank_mismatches.push(rank_mismatches);
-                twin_hidden = next;
             }
+            let acc_mismatches = slot_acc
+                .iter()
+                .zip(twin_acc.iter())
+                .filter(|(device, twin)| device.to_bits() != twin.to_bits())
+                .count();
+            let mut twin_max_abs = 0.0f32;
+            for (device, twin) in slot_acc.iter().zip(twin_acc.iter()) {
+                twin_max_abs = twin_max_abs.max((device - twin).abs());
+            }
+            let twin_routed = mxfp4_ref::moe_combine_routed_f32(&twin_acc, &local_ids, tokens, dim);
+            let routed_mismatches = routed
+                .iter()
+                .zip(twin_routed.iter())
+                .filter(|(device, twin)| device.to_bits() != twin.to_bits())
+                .count();
+            let twin_mismatches = acc_mismatches + routed_mismatches;
             self.stats.layer0_bf16_twin_mismatches = twin_mismatches;
             self.stats.layer0_bf16_twin_max_abs = twin_max_abs;
             if twin_mismatches != 0 {
                 return Err(err(
                     "device routed MoE layer-0 bar",
                     format!(
-                        "the device bf16 combine differs from the host bf16 twin on the same device operand: {twin_mismatches} bf16 codes mismatch (per rank {per_rank_mismatches:?}), max abs {twin_max_abs:e}"
+                        "the device f32 combine accumulator differs from the host moe_combine_rank twin on the same device operand: {twin_mismatches} f32 bits mismatch ({acc_mismatches} accumulator, {routed_mismatches} routed epilogue), max abs {twin_max_abs:e}"
                     ),
                 ));
             }
@@ -1118,7 +1153,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
                     || weighted_code_mismatches != 0
                     || weighted_scale_mismatches != 0;
                 println!(
-                    "moe layer0 diag: bf16 combine twin exact={} mismatches={twin_mismatches} per_rank={per_rank_mismatches:?} host_f32_max_abs={delta:e} host_max={host_magnitude:e} relative={relative:e}",
+                    "moe layer0 diag: native combine twin exact={} mismatches={twin_mismatches} acc={acc_mismatches} routed_epilogue={routed_mismatches} host_f32_max_abs={delta:e} host_max={host_magnitude:e} relative={relative:e}",
                     twin_mismatches == 0
                 );
                 if stage_error {
@@ -2115,12 +2150,12 @@ fn decode_bf16(bytes: &[u8]) -> Vec<f32> {
 /// counters are printed rather than the cumulative ones.
 pub fn routed_totals_line(stats: &MoeDeviceStats) -> String {
     format!(
-        "routed MoE totals: layers={} router_launches={} gate_up_launches={} weighted_launches={} combine_launches={} moe_launches={} staging_ms={} device_us={} staged_expert_bytes={} host_bytes={} layer0_host_max_abs={:.3e} layer0_host_rel={:.3e} layer0_host_max={:.3e} layer0_bf16_twin_mismatches={} layer0_bf16_twin_max_abs={:.3e}",
+        "routed MoE totals: layers={} combine_arith=native_f32_slot_acc router_launches={} gate_up_launches={} weighted_launches={} combine_launches={} moe_launches={} staging_ms={} device_us={} staged_expert_bytes={} host_bytes={} layer0_host_max_abs={:.3e} layer0_host_rel={:.3e} layer0_host_max={:.3e} layer0_bf16_twin_mismatches={} layer0_bf16_twin_max_abs={:.3e}",
         stats.layers,
-        stats.layers,
-        stats.layers * 8,
-        stats.layers * 4,
-        stats.layers * 4,
+        stats.layers * ROUTED_ROUTER_LAUNCHES,
+        stats.layers * ROUTED_GATE_UP_LAUNCHES,
+        stats.layers * ROUTED_WEIGHTED_LAUNCHES,
+        stats.layers * ROUTED_COMBINE_LAUNCHES,
         stats.routed_launches,
         stats.routed_staging_us / 1000,
         stats.routed_device_us,
@@ -2288,6 +2323,42 @@ mod tests {
         assert!(shared.contains("device_us=555000"), "{shared}");
         assert!(shared.contains("host_bytes=666000"), "{shared}");
         assert!(!shared.contains("999"), "{shared}");
+    }
+
+    /// The routed path measures its launches and checks the measurement against this plan before it
+    /// records the accounting, so the plan has to be pinned: one router, and per rank a gate GEMM, an
+    /// up GEMM, the weighted SwiGLU quantiser and the combine add. 17 is the count the accounting and
+    /// the log carry; the native f32 slot accumulator adds no launch, and a per-rank readback turned
+    /// into a launch would be 21 and fail the check inside the layer.
+    #[test]
+    fn the_routed_launch_plan_counts_seventeen_kernels_per_layer() {
+        assert_eq!(
+            RANKS, 4,
+            "the c4c routed path is four tensor-parallel ranks"
+        );
+        assert_eq!(ROUTED_ROUTER_LAUNCHES, 1);
+        assert_eq!(
+            ROUTED_GATE_UP_LAUNCHES,
+            RANKS * 2,
+            "a gate and an up GEMM per rank"
+        );
+        assert_eq!(ROUTED_WEIGHTED_LAUNCHES, RANKS);
+        assert_eq!(ROUTED_COMBINE_LAUNCHES, RANKS);
+        assert_eq!(ROUTED_LAUNCHES_PER_LAYER, 17);
+        assert_eq!(RANKS * 4 + 1, ROUTED_LAUNCHES_PER_LAYER);
+        let stats = MoeDeviceStats {
+            layers: 1,
+            routed_launches: ROUTED_LAUNCHES_PER_LAYER,
+            ..Default::default()
+        };
+        let line = routed_totals_line(&stats);
+        // The arithmetic is named in the log, so a window log says which combine rule ran rather
+        // than leaving it implicit. The chain has no legacy arm: native is the only and default path.
+        assert!(line.contains("combine_arith=native_f32_slot_acc"), "{line}");
+        assert!(
+            line.contains(&format!("moe_launches={ROUTED_LAUNCHES_PER_LAYER}")),
+            "{line}"
+        );
     }
 
     #[test]

@@ -43,13 +43,15 @@
 //!    that function, not an equal twin); any difference is a finding, never a tolerance. Two
 //!    launches byte-identical. This is the F6 seam's device closure (D33).
 //!
-//! 4. DOWN/COMBINE (b12x_mxfp4_moe_sm121, 10,048 B / 36a15a4f...): four serial rank launches over
-//!    the 576-wide w2 slices of the same selected experts, chained because each rank's bf16 output
-//!    is the next rank's residual operand (the kernel writes hidden + this rank's partial sum, so
-//!    the chained rounding is part of the arithmetic). The activation operand is stage 3's device
-//!    codes/scales re-uploaded from the stage-3 readback byte for byte, not a host-built tensor. Class: device bf16 BIT-EXACT against the chained
-//!    mxfp4_ref::moe_combine over the SAME device-built operand bytes; two full chains
-//!    byte-identical.
+//! 4. DOWN/COMBINE (b12x_mxfp4_moe_sm121, 9,976 B / 2d1fdb45...): four serial rank launches over
+//!    the 576-wide w2 slices of the same selected experts, each ADDING its f32 partials into one
+//!    [tokens][top_k][hidden] accumulator (audit M2/F7: the native arithmetic sums the tensor-parallel
+//!    rank partials in f32 and rounds each expert's w2 output ONCE, in the epilogue, model.py:899-903).
+//!    The native epilogue (per-slot bf16 round, ascending expert-id add, bf16 shared stand-in, one
+//!    bf16) is applied to the device accumulator by mxfp4_ref::moe_combine_finalize. The activation
+//!    operand is stage 3's device codes/scales re-uploaded from the stage-3 readback byte for byte,
+//!    not a host-built tensor. Class: device f32 BIT-EXACT against the mxfp4_ref::moe_combine_rank
+//!    chain over the SAME device-built operand bytes; two full chains byte-identical.
 //!
 //! THE F6 SEAM, CLOSED ON THE DEVICE (D33). The released arithmetic multiplies the SwiGLU output
 //! by the routing weight BEFORE the w2 activation quantiser reads it (model.py:841-851). The
@@ -138,9 +140,9 @@ const SWIGLU_WEIGHTED_CUBIN_SHA256: &str =
     "0e602daf6f2a51f027f3a924aaa503fada7db14610b94114439c659be4150cfe";
 /// The MXFP4 down/combine cubin pin (same source; mxfp4_moe_launch states the device chain's
 /// catalog owns the bytes, so this harness pins them here).
-const MXFP4_MOE_CUBIN_BYTES: usize = 10_048;
+const MXFP4_MOE_CUBIN_BYTES: usize = 9_976;
 const MXFP4_MOE_CUBIN_SHA256: &str =
-    "36a15a4f3ae12b4e7d452c1201b267d3102afa43f168bd322d6930ff3f543057";
+    "2d1fdb45fb070a40dc272d5ea9231e53bd849759d922b046299c186a05d68dc3";
 
 /// The pass/fail verdict of one named check, printed with its detail.
 struct Verdict {
@@ -796,16 +798,17 @@ fn run() -> Result<(), String> {
     );
 
     // ---------------------------------------------------------------------------------------
-    // Stage 4: down projection + weighted combine, four serial rank launches.
+    // Stage 4: down projection + weighted combine, four serial rank launches into one f32
+    // per-(token, slot, hidden) accumulator.
     // ---------------------------------------------------------------------------------------
     println!(
-        "--- stage 4: b12x_mxfp4_moe_sm121 down/combine, 4 serial rank launches (residual chain) ---"
+        "--- stage 4: b12x_mxfp4_moe_sm121 down/combine, 4 serial rank launches into a f32 [tokens][top_k][hidden] accumulator ---"
     );
     println!(
-        "comparison class (declared before any number): device bf16 BIT-EXACT against the chained mxfp4_ref::moe_combine over the SAME device-built weighted operand bytes (stage 3's codes/scales), with the same w2 slices and ids (four ranks, each rank's bf16 output is the next rank's residual hidden, so the chained rounding is part of both sides); two full chains byte-identical. Unlike b27, the activation operand is NOT host-quantised: stage 3's weighted epilogue produced it on the device from the router's weight buffer, so the F6 host seam is out of this path."
+        "comparison class (declared before any number): device f32 BIT-EXACT against mxfp4_ref::moe_combine_rank over the SAME device-built weighted operand bytes (stage 3's codes/scales), the same w2 rank slices and the same ids. The device writes one f32 per (token, slot, hidden index): the f32 sum of the four ranks' partials, with NO bf16 rounding (audit M2/F7: native rounds each expert's w2 output once, after the rank all-reduce, model.py:899-903; rounding a rank partial is not the reference's arithmetic). The native epilogue (per-slot bf16 round, add the bf16 expert outputs in ascending expert-id order into f32, add the shared expert's bf16 output, round the MoE output once to bf16) is then applied to the DEVICE accumulator by mxfp4_ref::moe_combine_finalize; the declared bf16 embed stand-in plays the shared-expert role in this harness (m17b owns the real shared expert), and the residual is NOT part of this stage (native adds it later in hc_post, model.py:962-966). Two full chains byte-identical. Unlike b27, the activation operand is NOT host-quantised: stage 3's weighted epilogue produced it on the device from the router's weight buffer, so the F6 host seam is out of this path."
     );
     println!(
-        "F6 seam crossing: device gate/up bf16 [rows {rows}][{WIDTH_PADDED}] per rank -> device weighted epilogue (routing weight operand, no host round trip) -> device operand [rows {rows}][{WIDTH_PADDED}] E4M3 + [rows {rows}][{MOE_SCALE_ROW}] ue8m0 per rank -> device combine"
+        "F6 seam crossing: device gate/up bf16 [rows {rows}][{WIDTH_PADDED}] per rank -> device weighted epilogue -> device operand [rows {rows}][{WIDTH_PADDED}] E4M3 + [rows {rows}][{MOE_SCALE_ROW}] ue8m0 per rank -> device f32 combine accumulator (no host round trip until the readback)"
     );
     let w2_rank: Vec<Vec<u8>> = (0..RANKS)
         .map(|rank| {
@@ -845,7 +848,8 @@ fn run() -> Result<(), String> {
         ws2_rank[0].len()
     );
 
-    // The residual stand-in and the reference chain.
+    // The declared bf16 embed stand-in (the harness's shared-expert stand-in) and the reference
+    // f32 accumulator over the four rank slices.
     let mut hidden_bits: Vec<u16> = Vec::with_capacity(args.tokens * HIDDEN);
     for token in 0..args.tokens {
         for column in 0..HIDDEN {
@@ -855,10 +859,10 @@ fn run() -> Result<(), String> {
             ]));
         }
     }
-    let mut reference = hidden_bits.clone();
+    let mut reference_acc = vec![0.0f32; args.tokens * TOP_K * HIDDEN];
     for rank in 0..RANKS {
-        let (next, _) = mxfp4_ref::moe_combine(
-            &reference,
+        let _ = mxfp4_ref::moe_combine_rank(
+            &mut reference_acc,
             &device_codes[rank],
             &device_scales[rank],
             &w2_rank[rank],
@@ -868,10 +872,16 @@ fn run() -> Result<(), String> {
             HIDDEN,
             local_experts,
         );
-        reference = next;
     }
+    let reference = mxfp4_ref::moe_combine_finalize(
+        &reference_acc,
+        &hidden_bits,
+        &local_ids,
+        args.tokens,
+        HIDDEN,
+    );
     println!(
-        "reference: mxfp4_ref::moe_combine chained over the 4 rank slices fed by the SAME device-built weighted operand bytes, residual seed = the declared bf16 embed stand-in"
+        "reference: mxfp4_ref::moe_combine_rank x{RANKS} into one f32 accumulator, then moe_combine_finalize (per-slot bf16, ascending expert-id add, bf16 shared stand-in, one MoE bf16); the embed stand-in is not a residual"
     );
 
     let combine_cubin = pinned_cubin(
@@ -881,18 +891,17 @@ fn run() -> Result<(), String> {
         MXFP4_MOE_CUBIN_SHA256,
     )?;
     let (combine_module, combine_kernel) = mxfp4_moe_launch::load(&cuda, &combine_cubin)?;
-    let device_chain = |cuda: &Cuda, label: &str| -> Result<Vec<u16>, String> {
+    let device_chain = |cuda: &Cuda, label: &str| -> Result<(Vec<f32>, Vec<u16>), String> {
         let mut allocated = 0usize;
-        let hidden_d = cuda.alloc(args.tokens * HIDDEN * 2, &mut allocated)?;
-        let out_d = cuda.alloc(args.tokens * HIDDEN * 2, &mut allocated)?;
         let act_d = cuda.alloc(device_codes[0].len(), &mut allocated)?;
         let acts_d = cuda.alloc(device_scales[0].len(), &mut allocated)?;
         let w_d = cuda.alloc(w2_rank[0].len(), &mut allocated)?;
         let ws_d = cuda.alloc(ws2_rank[0].len(), &mut allocated)?;
         let ids_d = cuda.alloc(local_ids.len() * 4, &mut allocated)?;
+        let acc_d = cuda.alloc(reference_acc.len() * 4, &mut allocated)?;
         println!("  {label}: device bytes admitted {allocated}");
-        cuda.copy_htod(&hidden_d, &bf16_bits_to_bytes(&hidden_bits))?;
-        let mut last: Vec<u16> = hidden_bits.clone();
+        // Every rank ADDS into the accumulator, so the caller zeroes it before the first launch.
+        cuda.copy_htod(&acc_d, &f32s_to_bytes(&vec![0.0f32; reference_acc.len()]))?;
         for rank in 0..RANKS {
             cuda.copy_htod(&act_d, &device_codes[rank])?;
             cuda.copy_htod(&acts_d, &device_scales[rank])?;
@@ -900,13 +909,12 @@ fn run() -> Result<(), String> {
             cuda.copy_htod(&ws_d, &ws2_rank[rank])?;
             cuda.copy_htod(&ids_d, &u32s_to_bytes(&local_ids))?;
             let params = Mxfp4MoeParams::new(
-                hidden_d,
                 act_d,
                 acts_d,
                 w_d,
                 ws_d,
                 ids_d,
-                out_d,
+                acc_d,
                 args.tokens as u32,
                 0,
                 args.layer as u32,
@@ -917,20 +925,27 @@ fn run() -> Result<(), String> {
                 &format!("m17a stage 4 {label} rank {rank} pre-launch"),
             )?;
             mxfp4_moe_launch::launch(cuda, combine_kernel, &params)?;
-            let bytes = read_bf16_bytes(cuda, &out_d, args.tokens * HIDDEN)?;
-            cuda.copy_htod(&hidden_d, &bytes)?;
-            last = bytes_bf16_bits(&bytes);
             check_floor(
                 args.floor_gib,
                 &format!("m17a stage 4 {label} rank {rank} post-launch"),
             )?;
         }
-        cuda.free_buffers(&[&hidden_d, &out_d, &act_d, &acts_d, &w_d, &ws_d, &ids_d]);
-        Ok(last)
+        let mut acc_bytes = vec![0u8; reference_acc.len() * 4];
+        cuda.copy_dtoh(&mut acc_bytes, &acc_d)?;
+        let acc = f32_bytes_vec(&acc_bytes);
+        cuda.free_buffers(&[&acc_d, &act_d, &acts_d, &w_d, &ws_d, &ids_d]);
+        let out =
+            mxfp4_ref::moe_combine_finalize(&acc, &hidden_bits, &local_ids, args.tokens, HIDDEN);
+        Ok((acc, out))
     };
-    let first_chain = device_chain(&cuda, "chain 1")?;
-    let second_chain = device_chain(&cuda, "chain 2")?;
+    let (first_acc, first_chain) = device_chain(&cuda, "chain 1")?;
+    let (second_acc, second_chain) = device_chain(&cuda, "chain 2")?;
     cuda.free(combine_module, &[]);
+    let acc_mismatches = first_acc
+        .iter()
+        .zip(&reference_acc)
+        .filter(|(device, host)| device.to_bits() != host.to_bits())
+        .count();
     let mismatches = first_chain
         .iter()
         .zip(&reference)
@@ -938,21 +953,39 @@ fn run() -> Result<(), String> {
         .count();
     Verdict::push(
         &mut verdicts,
-        "stage 4: device chain bit-exact vs moe_combine chain",
+        "stage 4: device f32 accumulator bit-exact vs the moe_combine_rank chain",
+        acc_mismatches == 0,
+        format!(
+            "{acc_mismatches} mismatched f32 partials of {}",
+            first_acc.len()
+        ),
+    );
+    Verdict::push(
+        &mut verdicts,
+        "stage 4: native epilogue on the device accumulator bit-exact vs the reference",
         mismatches == 0,
         format!(
             "{mismatches} mismatched bf16 codes of {}",
             first_chain.len()
         ),
     );
+    let chain_identical = first_chain == second_chain
+        && first_acc
+            .iter()
+            .zip(&second_acc)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
     Verdict::push(
         &mut verdicts,
         "stage 4: two full chains byte-identical",
-        first_chain == second_chain,
-        format!("{} bf16 codes compared", first_chain.len()),
+        chain_identical,
+        format!(
+            "{} f32 partials + {} bf16 codes compared",
+            first_acc.len(),
+            first_chain.len()
+        ),
     );
     println!(
-        "stage 4 output: {} token rows x {HIDDEN} bf16 codes (residual + weighted routed sum over {TOP_K} slots and 4 ranks)",
+        "stage 4 output: {} token rows x {HIDDEN} bf16 codes (native combine: 4-rank f32 sum, per-expert bf16 round, ascending expert-id add, bf16 shared stand-in, one MoE bf16; residual belongs to hc_post and is not in this stage)",
         args.tokens
     );
 

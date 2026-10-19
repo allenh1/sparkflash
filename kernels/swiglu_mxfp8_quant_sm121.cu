@@ -36,6 +36,14 @@
 //    [tokens][2304] E4M3 with [tokens][72] ue8m0 - the 32-wide-block operand b12x_mxfp8_dense_sm121
 //    wants for its w2. The width is the caller's argument, never baked in.
 //
+//    THE ACTIVATION IS ROUNDED TO BF16 BEFORE THE QUANTISER. Native computes the shared expert's
+//    SwiGLU, casts that f32 activation to BF16, and only then lets w2's act_quant read it
+//    (model.py:848-851). The operand is therefore quantise(bf16(swiglu)) and not
+//    quantise(swiglu): quantising the unrounded f32 would keep up to eight mantissa bits the
+//    released model never sees. This file rounds in the epilogue (one __float2bfloat16_rn per
+//    value) and the host reference swiglu_ref::quantise_row rounds with m4_quant::bf16_bits, so
+//    the two stay bit-exact.
+//
 // 3. mxfp8_quantize_activations_sm121 - the shared expert's INPUT quantiser, a different shape and a
 //    different job: bf16 [rows][cols] to E4M3 [rows][cols] with [rows][cols / 32] ue8m0 scales over
 //    the 5120-wide hidden, i.e. [tokens][160], because the shared expert's gate-up GEMMs are FP8
@@ -133,9 +141,14 @@ extern "C" __global__ void swiglu_mxfp8_quant_sm121(
         const float clamped_gate = fminf(g, limit);               // upper side only
         const float clamped_up = fminf(fmaxf(u, -limit), limit);  // both sides
         const float activated = (clamped_gate / (1.0f + __expf(-clamped_gate))) * clamped_up;
+        // Native rounds the unweighted activation to BF16 before w2's act_quant (model.py:848-851):
+        // the shared expert's operand is quantise(bf16(swiglu)), not quantise(swiglu). The weighted
+        // routed epilogue rounds the product for the same reason; here there is no product, so the
+        // activation itself is the value that is cast.
+        const float rounded = __bfloat162float(__float2bfloat16_rn(activated));
 
         out_fp8[index] = spark_activation_quantize_block(
-            activated,
+            rounded,
             lane,
             &out_scales[(uint64_t)row * (uint64_t)blocks_per_row + (uint64_t)block]);
     }

@@ -11,14 +11,20 @@
 //!    +-448 clamp are mirrored in crate::m4_quant::act_quant_fp8_row, and
 //!    the_reference_quantiser_mirrors_act_quant checks each of them separately. The FP4 weights keep
 //!    the checkpoint's \[out, in/32\] grid and the E2M1 packing.
-//! 2. the arithmetic: out\[t\]\[j\] = residual + the sum over the top-k slots of that slot's FP8xFP8
-//!    block sums, accumulated in f32 in ascending slot order and, inside a slot, over the padded
-//!    width ascending in 32-value blocks, with both ue8m0 scales applied to each block's partial
-//!    product the way kernel.py:552-553 applies them to the accumulator, and one rounding to bf16
-//!    at the very end. The FP4 weight is read through the reference's cast to FP8
-//!    (kernel.py:538-540), which is exact on all sixteen E2M1 codes (enumerated by a test here
-//!    rather than assumed), and no routing weight is applied: it belongs to the activation operand,
-//!    see routed_activation_operand.
+//! 2. the arithmetic, which is the released model's, not a per-rank chain: one expert's output is
+//!    the f32 sum of the four tensor-parallel ranks' FP8xFP8 block sums (each rank owns a 576-value
+//!    slice of the 2304-value intermediate width, padded to 640), computed with both ue8m0 scales
+//!    applied to each 32-value block's partial product the way kernel.py:552-553 applies them to the
+//!    accumulator. [moe_combine_rank] adds a rank's partials into a f32 per-(token, slot)
+//!    accumulator and rounds nothing, because rounding a rank partial is a different arithmetic:
+//!    the released model rounds each expert's w2 output to bf16 once, then adds the experts in
+//!    ascending expert-id order into a f32 row, adds the shared expert's bf16 output, and rounds the
+//!    MoE output to bf16 once (model.py:893-904). [moe_combine_finalize] implements that epilogue and
+//!    [moe_combine] is the one-rank wrapper. The residual is NOT part of this arithmetic: the
+//!    released model adds it later, in f32, inside hc_post (model.py:962-966). The FP4 weight is read
+//!    through the reference's cast to FP8 (kernel.py:538-540), which is exact on all sixteen E2M1
+//!    codes (enumerated by a test here rather than assumed), and no routing weight is applied: it
+//!    belongs to the activation operand, see routed_activation_operand.
 //! 3. the 576 -> 640 padding: the kernel MASKS the padded region of the activation row to zero
 //!    (index < MOE_WIDTH in its inner loop), and this reference masks identically. The invariant is
 //!    therefore a property of the two implementations rather than a precondition on the caller who
@@ -204,25 +210,28 @@ pub fn routed_activation_operand(activation: &[f32], routing: f32) -> (Vec<u8>, 
     crate::m4_quant::act_quant_fp8_row(&routed)
 }
 
-/// One W4A8 MoE combine, exactly as b12x_mxfp4_moe_sm121.cu computes it, plus the cost count.
+/// One TP rank's W4A8 down-projection partial, added into the native per-slot accumulator.
 ///
-/// The hidden state is \[tokens\]\[hidden\] bf16 bits (the residual), the activations are
-/// \[tokens * top_k\]\[padded\] E4M3 bytes with scales \[tokens * top_k\]\[padded / 32\] ue8m0, the
-/// weights are \[experts\]\[hidden\]\[padded / 2\] packed E2M1 with scales
-/// \[experts\]\[hidden\]\[padded / 32\] ue8m0, and the expert ids are \[tokens\]\[top_k\]. The
-/// result is \[tokens\]\[hidden\] bf16 bits.
+/// This is the kernel half of the native MoE arithmetic: the W4A8 GEMM is split across the four
+/// tensor-parallel ranks over the intermediate width (each rank owns a 576-value slice, padded to
+/// 640), so one expert's output is the f32 sum of all ranks' partials. The reference sums those
+/// partials in f32 (model.py:900 has y[idx] += expert(...), where the rank all-reduce is f32 at
+/// model.py:902) and rounds each expert's output to bf16 exactly once; there is no bf16 rounding
+/// inside a GEMM. This function therefore performs NO rounding: it adds this rank's block-scaled
+/// partials into slot_acc[token * MOE_TOP_K + slot] in f32, and [moe_combine_finalize] /
+/// [moe_combine_routed_f32] round each slot once, after every rank has contributed.
 ///
-/// The strides are the pre-padded ones D14 fixes and `pre_padded_moe_layout` states. A loader that
-/// produced the reference's whole-expert 72-wide or 576-wide per-rank 18-wide scale rows would
-/// misindex every row after the first; `check_moe_layout` is the explicit rejection of that.
+/// slot_acc must be zero-initialised by the caller and has tokens * MOE_TOP_K entries. The
+/// activation, weight, id and geometry inputs are the ones [moe_combine] documents.
 ///
 /// # Panics
-/// Panics if the activation operand is sized like a packed E2M1 one rather than FP8 E4M3, if any
-/// other buffer is too short for the declared shape, or if an expert index is out of range.
+/// Panics if slot_acc is the wrong length, if the activation operand is sized like a packed E2M1
+/// one rather than FP8 E4M3, if any other buffer is too short for the declared shape, or if an
+/// expert index is out of range.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
-pub fn moe_combine(
-    hidden: &[u16],
+pub fn moe_combine_rank(
+    slot_acc: &mut [f32],
     act_fp8: &[u8],
     act_scales: &[u8],
     w: &[u8],
@@ -231,8 +240,13 @@ pub fn moe_combine(
     tokens: usize,
     hidden_dim: usize,
     experts: usize,
-) -> (Vec<u16>, MoeCost) {
+) -> MoeCost {
     let routed_rows = tokens * MOE_TOP_K;
+    assert_eq!(
+        slot_acc.len(),
+        routed_rows * hidden_dim,
+        "the slot accumulator holds one f32 per (routed row, hidden index)"
+    );
     assert!(
         act_fp8.len() >= routed_rows * MOE_ACT_BYTES_PER_ROW,
         "the activation operand is FP8 E4M3, one byte per value ({} bytes per routed row, D14), but \
@@ -258,12 +272,11 @@ pub fn moe_combine(
         MOE_SCALE_BYTES_PER_ROW
     );
     let mut cost = MoeCost::default();
-    let mut out = vec![0u16; tokens * hidden_dim];
     for token in 0..tokens {
         for column in 0..hidden_dim {
-            let mut acc = 0.0f32;
+            let slot_base = token * MOE_TOP_K;
             for slot in 0..MOE_TOP_K {
-                let routed_row = token * MOE_TOP_K + slot;
+                let routed_row = slot_base + slot;
                 let expert = expert_ids[routed_row] as usize;
                 assert!(expert < experts, "expert index {expert} is out of range");
                 let act_row =
@@ -275,6 +288,7 @@ pub fn moe_combine(
                 let w_scale_row = &w_scales
                     [(expert * hidden_dim + column) * MOE_SCALE_BYTES_PER_ROW..]
                     [..MOE_SCALE_BYTES_PER_ROW];
+                let mut acc = 0.0f32;
                 for block in 0..MOE_SCALE_BYTES_PER_ROW {
                     let base = block * QUANT_BLOCK;
                     let act_scale = ue8m0_decode(act_scale_row[block]);
@@ -309,19 +323,159 @@ pub fn moe_combine(
                     acc += (partial * act_scale) * w_scale;
                     // Counted per 32-value block, inside the loop that reads them, so the totals are
                     // the whole row the kernel walks: 320 weight bytes, 640 activation bytes and 40
-                    // scale bytes per routed slot. (Before D14 these two counters were incremented
-                    // once per slot with a single block's worth, so the earlier numbers were per-block
-                    // units rather than the row's traffic.)
+                    // scale bytes per routed slot.
                     cost.weight_bytes += (QUANT_BLOCK / FP4_PER_BYTE) as u64;
                     cost.activation_bytes += QUANT_BLOCK as u64;
                     cost.scale_bytes += 2; // one activation ue8m0 byte and one weight ue8m0 byte
                 }
+                slot_acc[routed_row * hidden_dim + column] += acc;
             }
-            let residual = crate::m4_quant::bf16_value(hidden[token * hidden_dim + column]);
-            out[token * hidden_dim + column] = bf16_bits(residual + acc);
         }
     }
-    (out, cost)
+    cost
+}
+
+/// The slots of one token in ascending expert-id order, as native adds them.
+///
+/// model.py:899-903 iterates the routed experts in ascending expert-id order (for i in range(...):
+/// torch.where(indices == i)), and y[idx] += expert(...) therefore adds the bf16 expert outputs in
+/// that order. FP32 addition is not associative, so the order is part of the arithmetic; the top-k
+/// slot order the kernel produced them in is not the native order.
+#[must_use]
+pub fn moe_combine_slot_order(expert_ids: &[u32], token: usize) -> [usize; MOE_TOP_K] {
+    let mut order = [0usize; MOE_TOP_K];
+    let mut used = [false; MOE_TOP_K];
+    // Selection sort by expert id: six entries, so the O(k^2) shape costs nothing, and taking the
+    // first minimum in ascending slot order is stable on equal ids (the top-k cannot repeat an
+    // expert, but the reference's stability is part of the order rule regardless).
+    for (position, entry) in order.iter_mut().enumerate() {
+        let mut best = usize::MAX;
+        for slot in 0..MOE_TOP_K {
+            if used[slot] {
+                continue;
+            }
+            if best == usize::MAX
+                || expert_ids[token * MOE_TOP_K + slot] < expert_ids[token * MOE_TOP_K + best]
+            {
+                best = slot;
+            }
+        }
+        *entry = best;
+        used[best] = true;
+        let _ = position;
+    }
+    order
+}
+
+/// The routed part of the native combine epilogue, as f32:
+/// sum over ascending expert id of bf16(w2 expert output).
+///
+/// Each slot's f32 rank sum is rounded to bf16 once (the expert's w2 output dtype,
+/// model.py:851-852 returns self.w2(x.to(dtype))), and the bf16 values are added in ascending
+/// expert-id order in f32. Native keeps the result in f32 and adds the shared expert before the
+/// single MoE bf16 round (model.py:903-904), so this function deliberately does not round the total:
+/// the chain adds its shared expert and rounds at that boundary. [moe_combine_finalize] is the
+/// whole-token version with the shared add and the round included.
+///
+/// # Panics
+/// Panics if the accumulator or the id list is the wrong length.
+#[must_use]
+pub fn moe_combine_routed_f32(
+    slot_acc: &[f32],
+    expert_ids: &[u32],
+    tokens: usize,
+    hidden_dim: usize,
+) -> Vec<f32> {
+    assert_eq!(
+        slot_acc.len(),
+        tokens * MOE_TOP_K * hidden_dim,
+        "the slot accumulator holds one f32 per (routed row, hidden index)"
+    );
+    let mut routed = vec![0.0f32; tokens * hidden_dim];
+    for token in 0..tokens {
+        let order = moe_combine_slot_order(expert_ids, token);
+        for column in 0..hidden_dim {
+            let mut total = 0.0f32;
+            for slot in order {
+                let expert_output = slot_acc[(token * MOE_TOP_K + slot) * hidden_dim + column];
+                let rounded = crate::m4_quant::bf16_value(bf16_bits(expert_output));
+                total += rounded;
+            }
+            routed[token * hidden_dim + column] = total;
+        }
+    }
+    routed
+}
+
+/// The full native MoE output for one token block: the routed f32 sum, the shared expert's bf16
+/// output added, and one rounding to bf16.
+///
+/// This is model.py:893-904 with the residual left out: y is f32, each routed expert's w2 output is
+/// bf16 before the add, the shared expert's bf16 output is added after the routed sum, and the MoE
+/// output is rounded to bf16 once. The residual is added later by hc_post in f32
+/// (model.py:962-966), which is why it does not appear here. shared is the shared expert's output
+/// already rounded to bf16 bits (its own w2 GEMM output dtype); it is widened back for the add.
+///
+/// # Panics
+/// Panics if the accumulator, the shared row or the id list is the wrong length.
+#[must_use]
+pub fn moe_combine_finalize(
+    slot_acc: &[f32],
+    shared: &[u16],
+    expert_ids: &[u32],
+    tokens: usize,
+    hidden_dim: usize,
+) -> Vec<u16> {
+    assert_eq!(
+        shared.len(),
+        tokens * hidden_dim,
+        "the shared expert output is one bf16 value per token and hidden index"
+    );
+    let routed = moe_combine_routed_f32(slot_acc, expert_ids, tokens, hidden_dim);
+    let mut out = vec![0u16; tokens * hidden_dim];
+    for (index, &value) in routed.iter().enumerate() {
+        let shared_value = crate::m4_quant::bf16_value(shared[index]);
+        out[index] = bf16_bits(value + shared_value);
+    }
+    out
+}
+
+/// One complete W4A8 MoE combine for a single TP rank's operand data: accumulate the rank's
+/// partials, finalize the routed sum and the shared add. The multi-rank chain calls
+/// [moe_combine_rank] once per rank and [moe_combine_finalize] (or [moe_combine_routed_f32]) once,
+/// because the rank partials must stay f32 until every rank has contributed.
+///
+/// The operands are the ones [moe_combine_rank] documents; shared replaces the old pre-combine
+/// hidden row and is the shared expert's bf16 output (model.py:903).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn moe_combine(
+    shared: &[u16],
+    act_fp8: &[u8],
+    act_scales: &[u8],
+    w: &[u8],
+    w_scales: &[u8],
+    expert_ids: &[u32],
+    tokens: usize,
+    hidden_dim: usize,
+    experts: usize,
+) -> (Vec<u16>, MoeCost) {
+    let mut slot_acc = vec![0.0f32; tokens * MOE_TOP_K * hidden_dim];
+    let cost = moe_combine_rank(
+        &mut slot_acc,
+        act_fp8,
+        act_scales,
+        w,
+        w_scales,
+        expert_ids,
+        tokens,
+        hidden_dim,
+        experts,
+    );
+    (
+        moe_combine_finalize(&slot_acc, shared, expert_ids, tokens, hidden_dim),
+        cost,
+    )
 }
 
 #[cfg(test)]
@@ -629,7 +783,10 @@ mod tests {
         let weight_scales: Vec<u8> = (0..experts * hidden_dim * MOE_SCALE_BYTES_PER_ROW)
             .map(|i| 122 + (i % 6) as u8)
             .collect();
-        let ids: Vec<u32> = (0..rows).map(|i| (i % experts) as u32).collect();
+        // Deliberately NOT ascending in slot order: with this fixture the slot order alternates, so
+        // a naive loop that adds in slot order is not the same order as native's ascending
+        // expert-id order, and the reference has to sort.
+        let ids: Vec<u32> = (0..rows).map(|i| ((i + 1) % experts) as u32).collect();
 
         let (reference, _) = moe_combine(
             &vec![0u16; tokens * hidden_dim],
@@ -644,9 +801,11 @@ mod tests {
         );
 
         for token in 0..tokens {
+            let mut order: Vec<usize> = (0..MOE_TOP_K).collect();
+            order.sort_by_key(|slot| ids[token * MOE_TOP_K + slot]);
             for column in 0..hidden_dim {
-                let mut acc = 0.0f32;
-                for slot in 0..MOE_TOP_K {
+                let mut total = 0.0f32;
+                for slot in order.iter().copied() {
                     let routed_row = token * MOE_TOP_K + slot;
                     let expert = ids[routed_row] as usize;
                     let act_row =
@@ -658,6 +817,7 @@ mod tests {
                     let w_scale_row = &weight_scales
                         [(expert * hidden_dim + column) * MOE_SCALE_BYTES_PER_ROW..]
                         [..MOE_SCALE_BYTES_PER_ROW];
+                    let mut acc = 0.0f32;
                     for block in 0..MOE_SCALE_BYTES_PER_ROW {
                         let base = block * QUANT_BLOCK;
                         let mut partial = 0.0f32;
@@ -676,10 +836,15 @@ mod tests {
                         acc += (partial * ue8m0_decode(act_scale_row[block]))
                             * ue8m0_decode(w_scale_row[block]);
                     }
+                    // Native rounds the expert's w2 output to bf16 once and adds the bf16 values in
+                    // ascending expert-id order into f32 (model.py:899-903). The naive loop plays
+                    // all four tensor-parallel ranks at once, so acc is already the full expert
+                    // output.
+                    total += bf16_value(bf16_bits(acc));
                 }
                 assert_eq!(
                     reference[token * hidden_dim + column],
-                    bf16_bits(acc),
+                    bf16_bits(total),
                     "element ({token}, {column}) disagrees with the naive loop"
                 );
             }
@@ -687,36 +852,122 @@ mod tests {
     }
 
     #[test]
-    fn the_residual_is_added_before_the_single_rounding() {
-        // The kernel adds the residual in f32 and rounds once, so a zero expert has to leave the
-        // residual's own bf16 value untouched rather than re-rounding it after a sum.
+    fn the_shared_expert_is_added_after_the_per_expert_rounding() {
+        // Native rounds each expert's f32 w2 output to bf16 before adding it to y, then adds the
+        // shared expert's bf16 output and rounds the MoE output once (model.py:899-904). This
+        // fixture separates that from the old rule (add the shared value to the unrounded routed
+        // sum and round once): the bf16 codes differ.
+        let slot_acc = [1.0f32 + 2.0f32.powi(-8), 0.0, 0.0, 0.0, 0.0, 0.0];
+        let shared = [bf16_bits(2.0f32.powi(-8))];
+        let out = moe_combine_finalize(&slot_acc, &shared, &[0u32; MOE_TOP_K], 1, 1);
+        // bf16(1 + 2^-8) is a tie that rounds to 1.0; adding 2^-8 in f32 and rounding gives 1.0.
+        assert_eq!(out[0], bf16_bits(1.0));
+        // The old rule (shared added to the unrounded routed sum, one rounding) produces 1 + 2^-7.
+        assert_ne!(
+            out[0],
+            bf16_bits(1.0 + 2.0f32.powi(-7)),
+            "adding the shared expert before the per-expert rounding is a different arithmetic"
+        );
+        // A shared expert alone is not re-rounded: it is already bf16 and the single output
+        // rounding cannot move it.
+        let shared_only = [bf16_bits(1000.0f32)];
+        let out =
+            moe_combine_finalize(&[0.0f32; MOE_TOP_K], &shared_only, &[0u32; MOE_TOP_K], 1, 1);
+        assert_eq!(out[0], bf16_bits(1000.0));
+    }
+
+    #[test]
+    fn the_experts_are_added_in_ascending_expert_id_order() {
+        // FP32 addition is not associative, and native adds the bf16 expert outputs in ascending
+        // expert-id order (model.py:899-903). The large contribution sits in the slot whose expert
+        // id is not the smallest, so slot order and ascending expert-id order differ: adding the
+        // two unit experts first is exact in f32, adding the unit expert to 2^24 first is not.
+        let ids = [3u32, 0, 1, 4, 5, 2];
+        let slot_acc = [16777216.0f32, 1.0, 1.0, 0.0, 0.0, 0.0];
+        let routed = moe_combine_routed_f32(&slot_acc, &ids, 1, 1);
+        assert_eq!(
+            routed[0], 16777218.0f32,
+            "the small experts are added first, in ascending expert-id order"
+        );
+        assert_eq!(
+            (slot_acc[0] + slot_acc[1]) + slot_acc[2],
+            16777216.0f32,
+            "adding in slot order really is a different f32 result on this fixture"
+        );
+        assert_eq!(
+            moe_combine_slot_order(&ids, 0),
+            [1usize, 2, 5, 0, 3, 4],
+            "the order is by expert id, not by slot"
+        );
+        // Equal ids keep their slot order, so the sort is stable rather than arbitrary on a tie.
+        let repeated = [2u32, 2, 0, 3, 1, 0];
+        assert_eq!(
+            moe_combine_slot_order(&repeated, 0),
+            [2usize, 5, 4, 0, 1, 3]
+        );
+    }
+
+    #[test]
+    fn rank_partials_stay_f32_until_the_finalize() {
+        // The four tensor-parallel rank launches add into the same f32 accumulator and NOTHING
+        // rounds between them: an expert's output is the f32 sum of the four rank partials, and the
+        // one bf16 rounding is in the finalize. One rank's partial here is 16 + 2^-16, which is not
+        // a bf16 value (bf16(16 + 2^-16) is 16), so a per-rank rounding would change the
+        // accumulator and this test would see it.
         let tokens = 1usize;
         let hidden_dim = 1usize;
         let experts = 1usize;
-        let act = vec![0u8; tokens * MOE_TOP_K * MOE_ACT_BYTES_PER_ROW];
-        let act_scales = vec![127u8; tokens * MOE_TOP_K * MOE_SCALE_BYTES_PER_ROW];
-        // A whole padded weight row: the kernel always walks all 640 values.
-        let mut codes = vec![0u8; MOE_WIDTH_PADDED];
-        codes[0] = ONE;
-        let w = packed_row(&codes);
+        let mut act_row = vec![0u8; MOE_ACT_BYTES_PER_ROW];
+        for byte in act_row.iter_mut().take(16) {
+            *byte = fp8_e4m3_encode(1.0);
+        }
+        // The one 2^-16 product: E4M3 2^-8 times the block's ue8m0 2^-8 scale, against a 1.0
+        // weight with a unit weight scale.
+        act_row[32] = fp8_e4m3_encode(2.0f32.powi(-8));
+        let mut act_scale_row = vec![127u8; MOE_SCALE_BYTES_PER_ROW];
+        act_scale_row[1] = 119; // 2^-8
+        let act: Vec<u8> = std::iter::repeat_n(act_row, MOE_TOP_K).flatten().collect();
+        let act_scales: Vec<u8> = std::iter::repeat_n(act_scale_row, MOE_TOP_K)
+            .flatten()
+            .collect();
+        let mut w_codes = vec![0u8; MOE_WIDTH_PADDED];
+        for code in w_codes.iter_mut().take(16) {
+            *code = ONE;
+        }
+        w_codes[32] = ONE;
+        let w = packed_row(&w_codes);
         let w_scales = vec![127u8; MOE_SCALE_BYTES_PER_ROW];
-        let residual = bf16_bits(1000.0);
-        let (out, _) = moe_combine(
-            &[residual],
-            &act,
-            &act_scales,
-            &w,
-            &w_scales,
-            &[0u32; MOE_TOP_K],
-            tokens,
-            hidden_dim,
-            experts,
-        );
-        assert_eq!(
-            out[0],
-            bf16_bits(bf16_value(residual)),
-            "a zero expert must not move the residual"
-        );
+        let ids = [0u32; MOE_TOP_K];
+        let mut slot_acc = vec![0.0f32; tokens * MOE_TOP_K * hidden_dim];
+        for _ in 0..4 {
+            let cost = moe_combine_rank(
+                &mut slot_acc,
+                &act,
+                &act_scales,
+                &w,
+                &w_scales,
+                &ids,
+                tokens,
+                hidden_dim,
+                experts,
+            );
+            assert_eq!(
+                cost.macs,
+                (tokens * hidden_dim * MOE_TOP_K * MOE_WIDTH_PADDED) as u64
+            );
+        }
+        let one_rank = 16.0f32 + 2.0f32.powi(-16);
+        for value in &slot_acc {
+            assert_eq!(
+                *value,
+                4.0 * one_rank,
+                "four f32 rank partials add exactly; a per-rank bf16 rounding would give 64"
+            );
+        }
+        // The one bf16 rounding happens in the finalize, where 64 + 2^-14 rounds back to 64:
+        // six identical slots then add to 384.0.
+        let routed = moe_combine_routed_f32(&slot_acc, &ids, tokens, hidden_dim);
+        assert_eq!(routed[0], 384.0);
     }
 
     #[test]

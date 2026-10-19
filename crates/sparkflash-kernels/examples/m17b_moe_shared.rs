@@ -25,8 +25,8 @@
 //!
 //! - `b12x_mxfp8_dense_sm121`: 11,824 B,
 //!   `03e4c422f1c55141a2abde6a53038e223d0a59ffe29d2ad913b979720f150a4a`
-//! - `swiglu_mxfp8_quant_sm121`: 21,776 B,
-//!   `4dbef63bb07808f92fb6e61bdcb9aec53cb6afd8f28d6744aea3185759c1862e`
+//! - `swiglu_mxfp8_quant_sm121`: 21,912 B,
+//!   `65818de78e210b076b9efef59339b6d36bb2b69d08a590c794c292b5073ef5e0`
 //!
 //! Build lines (nvcc 13.0.88 / CUDA 13.0.3):
 //! `nvcc -std=c++17 -arch=sm_121a -cubin -I kernels kernels/<kernel>.cu -o <dir>/<kernel>.cubin`.
@@ -91,8 +91,8 @@ const DENSE_PIN_BYTES: usize = 11_824;
 const DENSE_PIN_SHA256: &str = "03e4c422f1c55141a2abde6a53038e223d0a59ffe29d2ad913b979720f150a4a";
 /// The SwiGLU + quantiser kernel shipped name / pin.
 const SWIGLU_KERNEL: &str = "swiglu_mxfp8_quant_sm121";
-const SWIGLU_PIN_BYTES: usize = 21_776;
-const SWIGLU_PIN_SHA256: &str = "4dbef63bb07808f92fb6e61bdcb9aec53cb6afd8f28d6744aea3185759c1862e";
+const SWIGLU_PIN_BYTES: usize = 21_912;
+const SWIGLU_PIN_SHA256: &str = "65818de78e210b076b9efef59339b6d36bb2b69d08a590c794c292b5073ef5e0";
 
 /// One named pass/fail verdict, printed with its detail.
 struct Verdict {

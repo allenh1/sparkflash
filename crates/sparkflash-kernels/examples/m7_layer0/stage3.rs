@@ -3,8 +3,9 @@ use crate::stage2::*;
 
 // ---------------------------------------------------------------------------------------------
 // Stage 3: the MoE block on a bounded expert subset. The router is a HOST SEAM and is labelled as
-// one; the device side is the W4A8 down/combine projection, four rank-chained launches over the
-// 2304-wide intermediate; gate/up, SwiGLU and the activation quantiser are host arithmetic here
+// one; the device side is the W4A8 down/combine projection, four serial launches accumulating one
+// f32 partial buffer over the 2304-wide intermediate; gate/up, SwiGLU and the activation quantiser
+// are host arithmetic here
 // because no device kernel in the six-cubin set reduces K=5120 with packed FP4 weights.
 // ---------------------------------------------------------------------------------------------
 
@@ -17,7 +18,7 @@ pub(crate) const MOE_INTERMEDIATE: usize = 2304;
 /// The per-rank expert width and the padded width the kernel actually walks.
 pub(crate) const MOE_WIDTH: usize = mxfp4_ref::MOE_WIDTH;
 pub(crate) const MOE_WIDTH_PADDED: usize = mxfp4_ref::MOE_WIDTH_PADDED;
-/// 2304 / 576: the number of rank-chained combine launches one routed sum needs.
+/// 2304 / 576: the number of serial combine launches one routed sum needs.
 pub(crate) const MOE_RANKS: usize = MOE_INTERMEDIATE / MOE_WIDTH;
 /// The pre-padded weight strides: 640 values are 320 packed bytes and 20 ue8m0 bytes.
 pub(crate) const MOE_PACKED_ROW: usize = mxfp4_ref::MOE_WEIGHT_BYTES_PER_ROW;
@@ -109,9 +110,13 @@ fn routed_activation_f32(activation: &[f32], routing: f32) -> Vec<f32> {
         .collect()
 }
 
-/// The reference chain the device is compared against: moe_combine over the same pre-padded rank
-/// slices, chained rank by rank exactly as the launches are, because every rank rounds to bf16 and
-/// the chained rounding is part of what the device does.
+/// The reference the device is compared against: the same pre-padded rank slices accumulated in f32
+/// into one [tokens][top_k][hidden] per-(token, slot, hidden) accumulator, exactly as the four serial
+/// rank launches accumulate, and then the native routed epilogue over that accumulator: one bf16
+/// round per expert, the bf16 values added in ascending expert-id order in f32 (model.py:899-903).
+/// There is no per-rank bf16 rounding: that was the old chain and is not the reference's arithmetic
+/// (audit M2/F7). The shared expert is not part of this stage, so the epilogue's shared input is zero
+/// and its single output bf16 round is applied to the routed sum.
 pub(crate) fn reference_combine_chain(
     act_fp8: &[Vec<u8>],
     act_scales: &[Vec<u8>],
@@ -121,10 +126,10 @@ pub(crate) fn reference_combine_chain(
     tokens: usize,
     experts: usize,
 ) -> Vec<u16> {
-    let mut previous = vec![0u16; tokens * HIDDEN];
+    let mut slot_acc = vec![0.0f32; tokens * MOE_TOP_K * HIDDEN];
     for rank in 0..MOE_RANKS {
-        let (next, _cost) = mxfp4_ref::moe_combine(
-            &previous,
+        let _cost = mxfp4_ref::moe_combine_rank(
+            &mut slot_acc,
             &act_fp8[rank],
             &act_scales[rank],
             &w_rank[rank],
@@ -134,9 +139,14 @@ pub(crate) fn reference_combine_chain(
             HIDDEN,
             experts,
         );
-        previous = next;
     }
-    previous
+    mxfp4_ref::moe_combine_finalize(
+        &slot_acc,
+        &vec![0u16; tokens * HIDDEN],
+        expert_ids,
+        tokens,
+        HIDDEN,
+    )
 }
 
 /// The same chain with the activation kept in f32 instead of E4M3: not a reference the stage
@@ -150,12 +160,10 @@ fn unquantised_combine_chain(
     tokens: usize,
 ) -> Vec<u16> {
     let blocks = MOE_INTERMEDIATE / 32;
-    let mut previous = vec![0u16; tokens * HIDDEN];
+    let mut slot_acc = vec![0.0f32; tokens * MOE_TOP_K * HIDDEN];
     for _rank in 0..MOE_RANKS {
-        let mut next = vec![0u16; tokens * HIDDEN];
         for token in 0..tokens {
             for column in 0..HIDDEN {
-                let mut acc = 0.0f32;
                 for slot in 0..MOE_TOP_K {
                     let expert = expert_ids[token * MOE_TOP_K + slot] as usize;
                     let activation = &routed_activations[token * MOE_TOP_K + slot];
@@ -163,6 +171,7 @@ fn unquantised_combine_chain(
                     let scales = &w2_scales[expert];
                     let weight_row = &weight[column * MOE_IN_PACKED..(column + 1) * MOE_IN_PACKED];
                     let scale_row = &scales[column * blocks..(column + 1) * blocks];
+                    let mut acc = 0.0f32;
                     for (block, scale) in scale_row.iter().enumerate().take(blocks) {
                         let mut partial = 0.0f32;
                         for i in 0..32 {
@@ -174,14 +183,18 @@ fn unquantised_combine_chain(
                         }
                         acc += partial * ue8m0_decode(*scale);
                     }
+                    slot_acc[(token * MOE_TOP_K + slot) * HIDDEN + column] += acc;
                 }
-                let residual = half::bf16::from_bits(previous[token * HIDDEN + column]).to_f32();
-                next[token * HIDDEN + column] = half::bf16::from_f32(residual + acc).to_bits();
             }
         }
-        previous = next;
     }
-    previous
+    mxfp4_ref::moe_combine_finalize(
+        &slot_acc,
+        &vec![0u16; tokens * HIDDEN],
+        expert_ids,
+        tokens,
+        HIDDEN,
+    )
 }
 
 /// Compares two bf16 writes code for code: exact count, absolute delta and the code distance.
@@ -238,7 +251,7 @@ pub(crate) fn stage3(args: &Args) -> Result<(), String> {
         "router: host seam, not device; selection bias gate.bias only - gate.bias_vl is the image-span bias, not read on the text path"
     );
     println!(
-        "comparison class: TOLERANCE-BASED, not exact, and the tolerance is named here before any number it judges: at least {STAGE3_EXACT_BAR}% of the {} combine outputs bit-identical to the reference's bf16 write, and no output further than 2 bf16 codes. Reason: both sides consume the same packed bytes and accumulate in the same order (slot ascending, 32-value block ascending, scales applied to each block's partial product), so the only degrees of freedom are the device's fused multiply-add against the reference's separate multiply and add, and bf16 rounding at the end of each rank chain step.",
+        "comparison class: TOLERANCE-BASED, not exact, and the tolerance is named here before any number it judges: at least {STAGE3_EXACT_BAR}% of the {} combine outputs bit-identical to the reference's bf16 write, and no output further than 2 bf16 codes. Reason: both sides consume the same packed bytes and accumulate in the same order (slot ascending, 32-value block ascending, scales applied to each block's partial product), so the only degree of freedom in the f32 rank accumulation is the device's fused multiply-add against the reference's separate multiply and add; the native epilogue (per-expert bf16 round, ascending expert-id add) is applied identically to the device accumulator, and no rank partial is rounded.",
         tokens * HIDDEN
     );
     println!(
@@ -248,7 +261,7 @@ pub(crate) fn stage3(args: &Args) -> Result<(), String> {
         "bounded subset: {experts} of the {MOE_EXPERTS} routed experts are resident - this prompt's most-routed experts first, then the lowest ids to fill - and the router selects over the RESIDENT set, which is what an expert-parallel shard with hot-expert residency sees. The coverage line below reports how much of the full-{MOE_EXPERTS} top-{MOE_TOP_K} the rung captures. This is a bounded test, not the full routing: all {MOE_EXPERTS} experts as f32 would be about 54 GB, which the memory rule puts out of scope tonight."
     );
     println!(
-        "device boundary: only the down/combine projection runs on the device, as {MOE_RANKS} rank-chained launches of {kernel} over the {MOE_INTERMEDIATE}-wide intermediate. The gate/up projections, the SwiGLU and the activation quantiser are HOST arithmetic in this stage: no device kernel in the six-cubin set reduces K={HIDDEN} against packed FP4 weights, and this stage says so instead of implying the whole block is device-proven. The shared expert is host arithmetic through mxfp8_ref::dense_gemm and is not device-compared either."
+        "device boundary: only the down/combine projection runs on the device, as {MOE_RANKS} serial launches of {kernel} accumulating one f32 [tokens][top_k][hidden] partial buffer over the {MOE_INTERMEDIATE}-wide intermediate. The gate/up projections, the SwiGLU and the activation quantiser are HOST arithmetic in this stage: no device kernel in the six-cubin set reduces K={HIDDEN} against packed FP4 weights, and this stage says so instead of implying the whole block is device-proven. The shared expert is host arithmetic through mxfp8_ref::dense_gemm and is not device-compared either."
     );
     println!(
         "input: ffn_norm applied to the harness's attention-side xhat. The true ffn-side residual stream is the mHC FFN output, which stage 1's boundary does not hand over, so the input row is a stand-in and every claim below is about the MoE arithmetic over that row, not about end-to-end layer text."
@@ -559,7 +572,9 @@ pub(crate) fn stage3(args: &Args) -> Result<(), String> {
         tokens,
         experts,
     );
-    println!("reference: mxfp4_ref::moe_combine chained over the same {MOE_RANKS} ranks");
+    println!(
+        "reference: mxfp4_ref::moe_combine_rank x{MOE_RANKS} into one f32 accumulator, then moe_combine_finalize (per-expert bf16, ascending expert-id add; this stage has no shared expert)"
+    );
 
     check_floor(args, "stage 3 device setup")?;
     let cuda = Cuda::load()?;
@@ -571,7 +586,7 @@ pub(crate) fn stage3(args: &Args) -> Result<(), String> {
         )
     })?;
     let (module, func) = cuda.load_kernel(&cubin, kernel_id(kernel)?)?;
-    let device_planned = 2 * tokens * HIDDEN * 2
+    let device_planned = tokens * MOE_TOP_K * HIDDEN * 4
         + act_fp8[0].len()
         + act_scales[0].len()
         + w_rank[0].len()
@@ -579,36 +594,34 @@ pub(crate) fn stage3(args: &Args) -> Result<(), String> {
         + tokens * MOE_TOP_K * 4;
     admit_memory(args, device_planned as u64, "stage 3 device buffers")?;
     let mut allocated = 0usize;
-    let hidden_d = cuda.alloc(tokens * HIDDEN * 2, &mut allocated)?;
-    let out_d = cuda.alloc(tokens * HIDDEN * 2, &mut allocated)?;
     let act_d = cuda.alloc(act_fp8[0].len(), &mut allocated)?;
     let acts_d = cuda.alloc(act_scales[0].len(), &mut allocated)?;
     let w_d = cuda.alloc(w_rank[0].len(), &mut allocated)?;
     let ws_d = cuda.alloc(ws_rank[0].len(), &mut allocated)?;
     let ids_d = cuda.alloc(tokens * MOE_TOP_K * 4, &mut allocated)?;
+    let acc_d = cuda.alloc(tokens * MOE_TOP_K * HIDDEN * 4, &mut allocated)?;
     println!(
         "device bytes allocated: {allocated} ({} MiB)",
         allocated / (1024 * 1024)
     );
-    cuda.copy_htod(&hidden_d, &vec![0u8; tokens * HIDDEN * 2])?;
+    // The four rank launches ADD into the f32 accumulator, so it starts zeroed.
+    cuda.copy_htod(&acc_d, &vec![0u8; tokens * MOE_TOP_K * HIDDEN * 4])?;
     let grid = (tokens as u32, (HIDDEN / MOE_TILE_D as usize) as u32, 1u32);
     let block = (MOE_THREADS, 1u32, 1u32);
-    let mut previous: Vec<u16> = vec![0u16; tokens * HIDDEN];
-    let mut last_params: [u64; 11] = [0; 11];
+    let mut last_params: [u64; 10] = [0; 10];
     for rank in 0..MOE_RANKS {
         cuda.copy_htod(&act_d, &act_fp8[rank])?;
         cuda.copy_htod(&acts_d, &act_scales[rank])?;
         cuda.copy_htod(&w_d, &w_rank[rank])?;
         cuda.copy_htod(&ws_d, &ws_rank[rank])?;
         cuda.copy_htod(&ids_d, &u32s_to_bytes(&expert_ids))?;
-        let params: [u64; 11] = [
-            hidden_d.0,
+        let params: [u64; 10] = [
             act_d.0,
             acts_d.0,
             w_d.0,
             ws_d.0,
             ids_d.0,
-            out_d.0,
+            acc_d.0,
             tokens as u64,
             0, // trace_ring: null, built without -DSPARKFLASH_ENABLE_GPU_TRACE
             args.layer as u64,
@@ -618,18 +631,23 @@ pub(crate) fn stage3(args: &Args) -> Result<(), String> {
         check_floor(args, &format!("stage 3 rank {rank} pre-launch"))?;
         cuda.launch(func, grid, block, &params)?;
         check_floor(args, &format!("stage 3 rank {rank} post-launch"))?;
-        // The next rank's residual seed is this rank's bf16 output, so the chained rounding is the
-        // same one the reference chain makes.
-        let mut bytes = vec![0u8; tokens * HIDDEN * 2];
-        cuda.copy_dtoh(&mut bytes, &out_d)?;
-        previous = bytes
-            .as_chunks::<2>()
+    }
+    // One readback after all four ranks: the f32 accumulator is the expert outputs summed over the
+    // tensor-parallel ranks, and the native epilogue rounds each expert once.
+    let mut acc_bytes = vec![0u8; tokens * MOE_TOP_K * HIDDEN * 4];
+    cuda.copy_dtoh(&mut acc_bytes, &acc_d)?;
+    let previous: Vec<u16> = mxfp4_ref::moe_combine_finalize(
+        &acc_bytes
+            .as_chunks::<4>()
             .0
             .iter()
-            .map(|chunk| u16::from_le_bytes(*chunk))
-            .collect();
-        cuda.copy_htod(&hidden_d, &bytes)?;
-    }
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect::<Vec<f32>>(),
+        &vec![0u16; tokens * HIDDEN],
+        &expert_ids,
+        tokens,
+        HIDDEN,
+    );
 
     let (stats, max_ulp) = compare_bf16_bits("combine output", &previous, &reference);
     let unquantised = unquantised_combine_chain(&routed_activations, &w2, &s2, &expert_ids, tokens);
@@ -718,7 +736,7 @@ pub(crate) fn stage3(args: &Args) -> Result<(), String> {
         );
     }
 
-    cuda.free(module, &[hidden_d, out_d, act_d, acts_d, w_d, ws_d, ids_d]);
+    cuda.free(module, &[act_d, acts_d, w_d, ws_d, ids_d, acc_d]);
     check_floor(args, "stage 3 end")?;
     let exact_ok = stats.exact_pct() >= STAGE3_EXACT_BAR;
     let ulp_ok = max_ulp <= 2;
@@ -735,7 +753,7 @@ pub(crate) fn stage3(args: &Args) -> Result<(), String> {
     );
     if exact_ok && ulp_ok {
         println!(
-            "stage 3: PASS ({experts} experts, {tokens} tokens, {MOE_RANKS} rank-chained launches)"
+            "stage 3: PASS ({experts} experts, {tokens} tokens, {MOE_RANKS} rank-accumulating launches)"
         );
         Ok(())
     } else {

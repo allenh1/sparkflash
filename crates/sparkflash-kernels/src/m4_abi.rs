@@ -1040,7 +1040,7 @@ const SIGNATURES: [(&str, &str, &str); 6] = [
     (
         "b12x_mxfp4_moe_sm121.cu",
         "b12x_mxfp4_moe_sm121",
-        "const __nv_bfloat16 *__restrict__ hidden; const uint8_t *__restrict__ act_fp8; const uint8_t *__restrict__ act_scales; const uint8_t *__restrict__ w_fp4; const uint8_t *__restrict__ w_scales; const uint32_t *__restrict__ expert_ids; __nv_bfloat16 *__restrict__ combined; const uint32_t tokens; GpuTraceRing *__restrict__ trace_ring; const uint32_t layer_id; const uint64_t step_seq",
+        "const uint8_t *__restrict__ act_fp8; const uint8_t *__restrict__ act_scales; const uint8_t *__restrict__ w_fp4; const uint8_t *__restrict__ w_scales; const uint32_t *__restrict__ expert_ids; float *__restrict__ slot_acc; const uint32_t tokens; GpuTraceRing *__restrict__ trace_ring; const uint32_t layer_id; const uint64_t step_seq",
     ),
     (
         "flash_mla_csa2_sm121.cu",
