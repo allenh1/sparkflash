@@ -34,6 +34,113 @@ pub const USAGE: &str = "sparkflash device-chain --plan-only|--dry-run|--run-sta
 /// The exit code a plan-only or dry-run invocation returns: 2, refusing to serve.
 pub const PLAN_ONLY_EXIT: u8 = 2;
 
+/// The stream the deferred step-1 entry consumes: the previous layer's readback X, never this
+/// layer's own X readback or the FFN output Y. The b28 bug used the wrong stream here.
+#[cfg(any(feature = "cuda", test))]
+fn deferred_entry_input(deferred: &sparkflash_engine::forward::DeferredHandoff) -> &[f32] {
+    deferred.x.as_slice()
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn over_bar(delta: f32, bar: f32) -> bool {
+    // `f32::max` ignores NaN and `NaN > bar` is false, so a NaN delta would otherwise pass every
+    // bar in this file. A non-finite delta is always over the bar.
+    !delta.is_finite() || delta > bar
+}
+
+/// The released-row FFN predictor the host `hc_mixes` twin compares against.
+///
+/// `LayerPostStaging::predictor` is permuted into the kernel's B/A/C row order for upload;
+/// `hc_mixes` takes the released pre/post/comb row order. Passing the kernel-order vector here
+/// compares a device coefficient with a twin projected from the wrong row map.
+#[cfg(any(feature = "cuda", test))]
+fn post_host_predictor(staging: &sparkflash_device::LayerPostStaging) -> &[f32] {
+    &staging.released_fn
+}
+
+/// The deferred step-1 twin's input stream, with the device readback deliberately ignored.
+///
+/// `readback` is the device's X_l; passing it back into the update reproduces the b28 bug. The
+/// twin must consume `input` (the previous layer's X / Engram mixer input) and only `input`.
+#[cfg(any(feature = "cuda", test))]
+fn deferred_twin_update(
+    input: &[u8],
+    readback: &[u8],
+    b: &[f32],
+    c: &[f32],
+    y: &[f32],
+) -> Vec<f32> {
+    let _ = readback;
+    sparkflash_engine::forward::layer_zero::kernel_mhc_update_fused(
+        &decode_bf16(input),
+        b,
+        c,
+        &decode_bf16(&sparkflash_engine::forward::layer_zero::bf16_bytes(y)),
+    )
+}
+
+/// The layers whose attention body did not launch exactly once, in device order.
+#[cfg(any(feature = "cuda", test))]
+fn missing_body_layers(layers: &[usize], body_launches: &[usize]) -> Vec<usize> {
+    layers
+        .iter()
+        .zip(body_launches)
+        .filter_map(|(layer, launches)| (*launches != 1).then_some(*layer))
+        .collect()
+}
+
+/// The finite maximum of two deltas, with any non-finite delta mapped to `+inf`.
+///
+/// A plain `f32::max` silently drops a NaN delta, which would let a non-finite coefficient
+/// through the m11 bars; routing every fold through this function keeps that rule at the call
+/// site instead of relying on a later comparison.
+#[cfg(any(feature = "cuda", test))]
+fn finite_max(acc: f32, delta: f32) -> f32 {
+    if delta.is_finite() {
+        acc.max(delta)
+    } else {
+        f32::INFINITY
+    }
+}
+
+/// The finite max-abs delta of two aligned rows, with non-finite values mapped to `+inf`.
+#[cfg(any(feature = "cuda", test))]
+fn max_abs_delta(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0f32, finite_max)
+}
+
+/// The c4a-2 seam decision: the format-2 body must launch exactly once on every layer.
+///
+/// Returns the seam line only when that holds; otherwise it names the layers that did not and
+/// withholds the line, so the printer cannot emit a seam line that contradicts the ledger.
+#[cfg(any(feature = "cuda", test))]
+fn c4a2_seam_line(
+    layers: &[usize],
+    body_launches: &[usize],
+    entry_launches: usize,
+) -> Result<String, String> {
+    let missing = missing_body_layers(layers, body_launches);
+    if !missing.is_empty() {
+        return Err(format!(
+            "c4a-2 seam line withheld: the format-2 body must launch exactly once on every layer, but layers {missing:?} do not (body_launches != 1); the per-layer ledger and totals would otherwise disagree"
+        ));
+    }
+    let post_launches = layers.len();
+    let mhc_launches = entry_launches + post_launches;
+    Ok(format!(
+        "c4a-2 seam: format-2 body launched exactly once on all {} layers; {} projection + {} body launches plus the {} mHC launches ({} entry + {} post)",
+        layers.len(),
+        layers.len() * 5,
+        layers.len(),
+        mhc_launches,
+        entry_launches,
+        post_launches
+    ))
+}
+
 /// Builds the plan-only report lines.
 ///
 /// # Errors
@@ -358,13 +465,18 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
     use sparkflash_device::budget::read_mem_available_bytes;
     use sparkflash_device::chain::ChainStage;
     use sparkflash_device::chain_device::{CudaLauncher, DeviceLauncher, DeviceStageCall};
-    use sparkflash_device::staging::{LayerStaging, LayerZeroStaging, StagingError};
+    use sparkflash_device::staging::{
+        LayerPostStaging, LayerStaging, LayerZeroStaging, StagingError,
+    };
+    use sparkflash_engine::forward::engram;
     use sparkflash_engine::forward::layer_zero::{
-        M11_HC_COEFF_BAR, M11_INV_RMS_BAR, bf16_bytes, kernel_mhc_capture, kernel_mhc_update,
-        kernel_mhc_xhat,
+        LayerZeroEntrySource, M11_HC_COEFF_BAR, M11_INV_RMS_BAR, bf16_bytes, kernel_mhc_capture,
+        kernel_mhc_update_fused, kernel_mhc_xhat,
     };
     use sparkflash_engine::forward::mhc::{self, Mixes};
-    use sparkflash_engine::forward::{HybridEntry, InferenceEngine, SequenceState};
+    use sparkflash_engine::forward::{
+        DeferredHandoff, HybridEntry, HybridPost, InferenceEngine, SequenceState,
+    };
     use sparkflash_engine::linalg;
     use sparkflash_engine::quant::quantize_activation_fp8;
     use sparkflash_engine::safetensors::SafeTensorsSource;
@@ -377,13 +489,18 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
     let dim = config.dim;
     let started = Instant::now();
     let mut lines = vec![
-        "sparkflash device-chain: M3-c HYBRID TOKEN - 40 layers, one prompt token, one position".to_string(),
-        "device entry path: step-1 identity (B=I, C=0, Y=0, A=previous FFN pre_mix); the kernel's previous-layer B/C/Y mixer is NOT exercised because mhc_post and ffn_epilogue are host in this stage map".to_string(),
+        "sparkflash device-chain: M3-c c4a-2 HYBRID TOKEN - 40 layers, one prompt token, one position".to_string(),
+        "device entry path: layer 0 keeps the step-1 identity (B=I, C=0, Y=0, A=initial pre_mix); layers 1..39 consume the previous-layer deferred FFN epilogue: B/C/A read back then re-uploaded (declared coefficient round-trip); Y is the host FFN output, BF16-staged; the add runs in device step 1.".to_string(),
+        "device post path: each layer runs a device MhcPost after attention. It writes the post-attention residual X and the 24 FFN coefficients, and captures the normalized FFN input; the host FFN consumes those device values.".to_string(),
+        "ffn_epilogue split: layers 0..38 move the FFN epilogue add into the next device MhcEntry step-1; layer 39 keeps the host FFN epilogue add because there is no next entry. Count: 39 deferred, 1 host.".to_string(),
+        "Engram seam: the released config puts Engram at layers 1 and 14. Engram adds to H_l after the deferred step-1 and before the attention entry, which one fused entry call cannot host-insert; those two layers run the real B/C/Y mixer device, apply Engram on the host readback, then run a second identity device entry. That is 2 extra MhcEntry launches and a declared host Engram seam, not a device Engram.".to_string(),
         "residual staging seam: each layer stages the f32 residual to BF16 and the host continues from the device-readback X; the chain is therefore not bit-identical to the reference even with exact host arithmetic".to_string(),
+        "attention projection seam: wq_a, wq_b, wkv, wo_a and wo_b are device B12x MXFP8 GEMMs replacing the host f32 projections; q_norm, kv_norm, RoPE, the window/compressor/indexer host seams, the inverse RoPE and the D8 quantisers remain declared HOST stand-ins.".to_string(),
+        "attention body seam (c4a-2): m14 is the real device format-2 flash_mla_csa2_sm121 launch, 64 head blocks of 256 threads, one launch per layer at position 0. Window codes/scales are built by the engine window row helper from the host kv row; the selected compressed list is empty at position 0, and the kernel's indexer stage-1 buffers are uploaded as zeros plus sentinels and their writes are ignored. The 512-candidate / 640-slot regime is NOT exercised at position 0.".to_string(),
+        "attention seam ledger: 3 launches/layer for wq_a+wq_b+wkv (120), 1 format-2 attention launch/layer (40) and 2 launches/layer for wo_a+wo_b (80) = 240 attention launches; 42 MhcEntry + 40 MhcPost + 240 attention = 322 chain launches. The chain token comparison remains the CHAIN-WIRING gate.".to_string(),
         "claim: CHAIN-WIRING parity, not a device-token result; criterion 1 remains OPEN".to_string(),
-        "caching seam: no 40-layer staging metadata cache; LayerStaging is rebuilt and dropped per layer. The one reused device allocation is the 16-buffer mHC set (2,064,352 B), restaged per layer.".to_string(),
-        "c3b follow-up: defer each layer's ffn_epilogue into the next device entry so the real previous-layer B/C/Y mixer is exercised and host stand-ins drop 8 -> 7; c3 is not a full device mHC path.".to_string(),
-        "per-layer device stages: 1 MhcEntry. Per-layer host stand-ins (device-status but host-executed here): attention_projections, attention, attention_output_projection, mhc_post, moe_router, moe_gate_up, moe_down_combine, shared_expert_gate. Tail stand-in: lm_head_screen. Tail host seams: final_norm, lm_head_argmax.".to_string(),
+        "caching seam: no 40-layer staging metadata cache; attention and FFN staging objects are rebuilt and dropped per layer, and the five attention weight sets are restaged from the checkpoint per layer. Reused device allocations: the 16-buffer mHC set (2,064,352 B) plus the attention projection buffers.".to_string(),
+        "per-layer host stand-ins after c4a-2 (device-status but host-executed here): moe_router, moe_gate_up, moe_down_combine, shared_expert_gate. The five attention projections and the format-2 attention body are device at position 0. Attention host seams: q_norm, kv_norm, RoPE, window row construction, compressor/cache, selected-list assembly, indexer scoring, inverse RoPE, D8 quantisers. Tail stand-in: lm_head_screen. Tail host seams: final_norm, lm_head_argmax.".to_string(),
         format!(
             "checkpoint {}; cubin dir {}; token {}; position 0; element limit {}",
             args.checkpoint.display(),
@@ -437,35 +554,73 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         .ok_or_else(|| "no staged embed row for position 0".to_string())?
         .values_f32();
     drop(embed_source);
+    let mut engram_hashes = Vec::new();
+    engram::ngram_hashes(&config, &[args.token], 0, &mut engram_hashes)
+        .map_err(|error| format!("engram token hashes: {error}"))?;
 
     let mem_available_bytes = read_mem_available_bytes()?;
-    let mut launcher = CudaLauncher::open_for_stage(&args.cubin_dir, "mega_mhc_sm121")?;
-    let cubin_bytes = launcher.cubin_bytes();
+    let mut attention_backend =
+        crate::attention_device::AttentionDeviceBackend::open(&args.cubin_dir)?;
+    let launcher = Rc::new(RefCell::new(CudaLauncher::open_for_stage(
+        &args.cubin_dir,
+        "mega_mhc_sm121",
+    )?));
+    let cubin_bytes = launcher.borrow().cubin_bytes();
     let provider_source = SafeTensorsSource::open(
         &args.checkpoint,
         &args.checkpoint.join("model.safetensors.index.json"),
     )
     .map_err(|error| format!("staging checkpoint {}: {error}", args.checkpoint.display()))?;
 
+    #[derive(Clone)]
     struct DeviceTiming {
         staging_ms: u128,
-        device_ms: u128,
+        entry_us: u128,
+        post_us: u128,
         capture_exact: bool,
         codes_exact: bool,
         scales_exact: bool,
         coeff_max_abs: f32,
         inv_rms_delta: f32,
+        post_capture_exact: bool,
+        post_codes_exact: bool,
+        post_scales_exact: bool,
+        post_coeff_max_abs: f32,
+        post_inv_rms_delta: f32,
+        engram_split: bool,
         x_bytes: usize,
         matrix_bytes: u64,
+        body_launches: usize,
     }
-    let mut device_timings: Vec<DeviceTiming> = Vec::with_capacity(config.n_layers);
+    let blank_timing = DeviceTiming {
+        staging_ms: 0,
+        entry_us: 0,
+        post_us: 0,
+        capture_exact: false,
+        codes_exact: false,
+        scales_exact: false,
+        coeff_max_abs: 0.0,
+        inv_rms_delta: 0.0,
+        post_capture_exact: false,
+        post_codes_exact: false,
+        post_scales_exact: false,
+        post_coeff_max_abs: 0.0,
+        post_inv_rms_delta: 0.0,
+        engram_split: false,
+        x_bytes: 0,
+        matrix_bytes: 0,
+        body_launches: 0,
+    };
+    let device_timings = Rc::new(RefCell::new(vec![blank_timing; config.n_layers]));
+    let post_staging_slot: Rc<RefCell<Option<LayerPostStaging>>> = Rc::new(RefCell::new(None));
     let mut staged_first = false;
-    let device_total_ms = Rc::new(Cell::new(0u64));
+    let device_total_us = Rc::new(Cell::new(0u128));
     let completed = Rc::new(Cell::new(0usize));
     let progress_lines: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let mut provider = |layer: usize,
                         hidden: &[f32],
-                        pre_mix: &[f32]|
+                        pre_mix: &[f32],
+                        deferred: Option<&DeferredHandoff>|
      -> Result<HybridEntry, sparkflash_engine::linalg::EngineError> {
         let done = completed.get();
         if done > 0 {
@@ -489,44 +644,192 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
                 detail: error.to_string(),
             },
         )?;
-        let matrix_bytes = staging.host_bytes();
+        let post_staging = LayerPostStaging::from_source(&provider_source, layer).map_err(
+            |error: StagingError| sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} post staging"),
+                detail: error.to_string(),
+            },
+        )?;
+        let matrix_bytes = staging.host_bytes() + post_staging.host_bytes();
         if !staged_first {
             let request = sparkflash_device::BudgetRequest {
                 mem_available_bytes,
-                projected_host_bytes: staging.host_bytes() + cubin_bytes,
+                projected_host_bytes: matrix_bytes + cubin_bytes,
                 projected_device_bytes: staging.device_buffer_bytes(),
             };
-            launcher.stage_layer(&staging, request).map_err(|error| {
-                sparkflash_engine::linalg::EngineError::Shape {
+            launcher
+                .borrow_mut()
+                .stage_layer(&staging, request)
+                .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
                     what: format!("layer {layer} staging admission"),
                     detail: error.to_string(),
-                }
-            })?;
+                })?;
             staged_first = true;
         } else {
-            launcher.restage_layer(&staging).map_err(|error| {
-                sparkflash_engine::linalg::EngineError::Shape {
+            launcher
+                .borrow_mut()
+                .restage_layer(&staging)
+                .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
                     what: format!("layer {layer} restage"),
                     detail: error,
-                }
-            })?;
+                })?;
         }
+        *post_staging_slot.borrow_mut() = Some(post_staging);
         let staging_ms = staging_started.elapsed().as_millis();
-        launcher.write_layer_a(pre_mix).map_err(|error| {
-            sparkflash_engine::linalg::EngineError::Shape {
-                what: format!("layer {layer} A write"),
-                detail: error,
+        let engram_layer = config.engram_rows(layer).is_some();
+        let mut device_started: Option<Instant> = None;
+        let mut engram_mixer_us: u128 = 0;
+        let x_bytes = if layer == 0 {
+            launcher
+                .borrow_mut()
+                .write_layer_a(pre_mix)
+                .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
+                    what: format!("layer {layer} A write"),
+                    detail: error,
+                })?;
+            let mut x = hidden.to_vec();
+            if engram_layer {
+                engram::engram_forward(
+                    &config,
+                    layer,
+                    &mut x,
+                    &engram_hashes,
+                    &provider_source,
+                    limit,
+                )
+                .map_err(|error| {
+                    sparkflash_engine::linalg::EngineError::Shape {
+                        what: format!("layer {layer} Engram"),
+                        detail: error.to_string(),
+                    }
+                })?;
             }
-        })?;
-        let x_bytes = bf16_bytes(hidden);
-        let device_started = Instant::now();
-        launcher.write_layer_x_bf16(&x_bytes).map_err(|error| {
-            sparkflash_engine::linalg::EngineError::Shape {
+            bf16_bytes(&x)
+        } else {
+            let deferred =
+                deferred.ok_or_else(|| sparkflash_engine::linalg::EngineError::Shape {
+                    what: format!("layer {layer} deferred handoff"),
+                    detail: "layers 1..39 require the previous layer's deferred FFN epilogue"
+                        .to_string(),
+                })?;
+            launcher
+                .borrow_mut()
+                .write_layer_bc(&deferred.mixes.post, &deferred.mixes.comb)
+                .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
+                    what: format!("layer {layer} B/C write"),
+                    detail: error,
+                })?;
+            launcher
+                .borrow_mut()
+                .write_layer_a(&deferred.mixes.pre)
+                .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
+                    what: format!("layer {layer} A write"),
+                    detail: error,
+                })?;
+            launcher
+                .borrow_mut()
+                .write_layer_y_bf16(&bf16_bytes(&deferred.y))
+                .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
+                    what: format!("layer {layer} Y write"),
+                    detail: error,
+                })?;
+            if engram_layer {
+                // Engram [1,14] adds to H_l after the deferred FFN epilogue and before the
+                // attention entry. One fused kernel call cannot host-insert that addition
+                // between step 1 and step 2, so run the real B/C/Y mixer first, apply Engram on
+                // the readback, then run an identity step-1 entry for the Engram-adjusted H_l.
+                // Two declared host seams, not a device-to-device Engram.
+                let first_started = Instant::now();
+                let first_x = bf16_bytes(deferred_entry_input(deferred));
+                launcher
+                    .borrow_mut()
+                    .write_layer_x_bf16(&first_x)
+                    .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
+                        what: format!("layer {layer} Engram mixer X write"),
+                        detail: error,
+                    })?;
+                launcher
+                    .borrow_mut()
+                    .launch(DeviceStageCall {
+                        stage: ChainStage::MhcEntry,
+                        layer,
+                        position: 0,
+                        kernel: "mega_mhc_sm121",
+                    })
+                    .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
+                        what: format!("layer {layer} Engram mixer launch"),
+                        detail: error.to_string(),
+                    })?;
+                let mixer_x = launcher.borrow_mut().read_layer_x().map_err(|error| {
+                    sparkflash_engine::linalg::EngineError::Shape {
+                        what: format!("layer {layer} Engram mixer X readback"),
+                        detail: error,
+                    }
+                })?;
+                let mut b = vec![0.0f32; config.hc_mult * config.hc_mult];
+                for destination in 0..config.hc_mult {
+                    for source in 0..config.hc_mult {
+                        b[destination * config.hc_mult + source] =
+                            deferred.mixes.comb[source * config.hc_mult + destination];
+                    }
+                }
+                let mixer_update =
+                    deferred_twin_update(&first_x, &mixer_x, &b, &deferred.mixes.post, &deferred.y);
+                if mixer_x != bf16_bytes(&mixer_update) {
+                    let difference = bf16_write_difference(&mixer_x, &mixer_update);
+                    return Err(sparkflash_engine::linalg::EngineError::Shape {
+                        what: format!("layer {layer} Engram mixer write"),
+                        detail: format!(
+                            "the deferred step-1 X_l is not the BF16 write of the fused host twin; first differing X element: {difference:?}; input X=BF16(deferred A_{{l-1}}), B=kernel-order transpose(deferred FFN comb), C=deferred FFN post, Y=BF16(deferred FFN output)"
+                        ),
+                    });
+                }
+                engram_mixer_us = first_started.elapsed().as_micros();
+                let mut engrammed = decode_bf16(&mixer_x);
+                engram::engram_forward(
+                    &config,
+                    layer,
+                    &mut engrammed,
+                    &engram_hashes,
+                    &provider_source,
+                    limit,
+                )
+                .map_err(|error| {
+                    sparkflash_engine::linalg::EngineError::Shape {
+                        what: format!("layer {layer} Engram"),
+                        detail: error.to_string(),
+                    }
+                })?;
+                launcher
+                    .borrow_mut()
+                    .restage_layer(&staging)
+                    .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
+                        what: format!("layer {layer} Engram restage"),
+                        detail: error,
+                    })?;
+                launcher
+                    .borrow_mut()
+                    .write_layer_a(&deferred.mixes.pre)
+                    .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
+                        what: format!("layer {layer} Engram A write"),
+                        detail: error,
+                    })?;
+                device_started = Some(Instant::now());
+                bf16_bytes(&engrammed)
+            } else {
+                bf16_bytes(deferred_entry_input(deferred))
+            }
+        };
+        let device_started = device_started.unwrap_or_else(Instant::now);
+        launcher
+            .borrow_mut()
+            .write_layer_x_bf16(&x_bytes)
+            .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
                 what: format!("layer {layer} X write"),
                 detail: error,
-            }
-        })?;
+            })?;
         launcher
+            .borrow_mut()
             .launch(DeviceStageCall {
                 stage: ChainStage::MhcEntry,
                 layer,
@@ -537,50 +840,105 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
                 what: format!("layer {layer} MhcEntry launch"),
                 detail: error.to_string(),
             })?;
-        let entry = launcher.read_layer_entry().map_err(|error| {
+        let entry = launcher.borrow_mut().read_layer_entry().map_err(|error| {
             sparkflash_engine::linalg::EngineError::Shape {
                 what: format!("layer {layer} entry readback"),
                 detail: error,
             }
         })?;
-        let x_after = launcher.read_layer_x().map_err(|error| {
+        let x_after = launcher.borrow_mut().read_layer_x().map_err(|error| {
             sparkflash_engine::linalg::EngineError::Shape {
                 what: format!("layer {layer} X readback"),
                 detail: error,
             }
         })?;
-        let inv_rms = launcher.read_layer_inv_rms().map_err(|error| {
-            sparkflash_engine::linalg::EngineError::Shape {
+        let inv_rms = launcher
+            .borrow_mut()
+            .read_layer_inv_rms()
+            .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
                 what: format!("layer {layer} 1/rms readback"),
                 detail: error,
-            }
-        })?;
-        let codes = launcher.read_layer_codes().map_err(|error| {
+            })?;
+        let codes = launcher.borrow_mut().read_layer_codes().map_err(|error| {
             sparkflash_engine::linalg::EngineError::Shape {
                 what: format!("layer {layer} FP8 codes readback"),
                 detail: error,
             }
         })?;
-        let scales = launcher.read_layer_scales().map_err(|error| {
+        let scales = launcher.borrow_mut().read_layer_scales().map_err(|error| {
             sparkflash_engine::linalg::EngineError::Shape {
                 what: format!("layer {layer} FP8 scales readback"),
                 detail: error,
             }
         })?;
-        let device_ms = device_started.elapsed().as_millis();
-        device_total_ms.set(device_total_ms.get() + device_ms as u64);
-        if x_after != x_bytes {
+        let entry_us = device_started.elapsed().as_micros() + engram_mixer_us;
+        device_total_us.set(device_total_us.get() + entry_us);
+        let x_readback = decode_bf16(&x_after);
+        let (b_prev, c_prev, a_prev, y_prev) = match deferred {
+            Some(deferred) if engram_layer => {
+                // The final launch after Engram is the identity step-1 entry; only A is the
+                // previous FFN pre row.
+                let (b, c, _, y) = LayerZeroStaging::layer_zero_seed();
+                (b.to_vec(), c.to_vec(), deferred.mixes.pre.clone(), y)
+            }
+            Some(deferred) => {
+                let mut b = vec![0.0f32; config.hc_mult * config.hc_mult];
+                for destination in 0..config.hc_mult {
+                    for source in 0..config.hc_mult {
+                        b[destination * config.hc_mult + source] =
+                            deferred.mixes.comb[source * config.hc_mult + destination];
+                    }
+                }
+                (
+                    b,
+                    deferred.mixes.post.clone(),
+                    deferred.mixes.pre.clone(),
+                    decode_bf16(&bf16_bytes(&deferred.y)),
+                )
+            }
+            None => {
+                let (b, c, a, y) = LayerZeroStaging::layer_zero_seed();
+                (b.to_vec(), c.to_vec(), a.to_vec(), y)
+            }
+        };
+        let host_update = deferred_twin_update(&x_bytes, &x_after, &b_prev, &c_prev, &y_prev);
+        let expected_x = bf16_bytes(&host_update);
+        if x_after != expected_x {
+            let difference = bf16_write_difference(&x_after, &host_update);
             return Err(sparkflash_engine::linalg::EngineError::Shape {
-                what: format!("layer {layer} identity X write"),
-                detail:
-                    "the X_l readback is not the BF16 stream that was written before the launch"
-                        .to_string(),
+                what: format!("layer {layer} deferred step-1 write"),
+                detail: format!(
+                    "the X_l readback is not the BF16 write of the host twin's B X + C Y update; first differing X element: {difference:?}; input X=BF16({}), B={}, C={}, Y={}",
+                    if layer == 0 {
+                        "hidden"
+                    } else {
+                        "deferred A_{l-1}"
+                    },
+                    if engram_layer && deferred.is_some() {
+                        "identity"
+                    } else if deferred.is_some() {
+                        "transpose(deferred FFN comb)"
+                    } else {
+                        "identity"
+                    },
+                    if engram_layer && deferred.is_some() {
+                        "identity"
+                    } else if deferred.is_some() {
+                        "deferred FFN post"
+                    } else {
+                        "identity"
+                    },
+                    if engram_layer && deferred.is_some() {
+                        "identity"
+                    } else if deferred.is_some() {
+                        "BF16(deferred FFN output)"
+                    } else {
+                        "identity"
+                    }
+                ),
             });
         }
-        let x_readback = decode_bf16(&x_after);
-        let (b_prev, c_prev, _a_seed, y_prev) = LayerZeroStaging::layer_zero_seed();
-        let host_update = kernel_mhc_update(&x_readback, &b_prev, &c_prev, &y_prev);
-        let host_xhat = kernel_mhc_xhat(&host_update, pre_mix);
+        let host_xhat = kernel_mhc_xhat(&host_update, &a_prev);
         let expected_capture = kernel_mhc_capture(&host_xhat, &staging.attn_norm, inv_rms);
         let units = quantize_activation_fp8(&expected_capture).map_err(|error| {
             sparkflash_engine::linalg::EngineError::Shape {
@@ -601,7 +959,7 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         let mut host_mixes = Mixes::for_config(&config);
         mhc::hc_mixes(
             &config,
-            &x_readback,
+            &host_update,
             &fn_w,
             &staging.hc_scale,
             &staging.hc_base,
@@ -612,7 +970,7 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             detail: error.to_string(),
         })?;
         let mut host_attn_in = vec![0.0f32; dim];
-        mhc::hc_pre(&config, pre_mix, &x_readback, &mut host_attn_in).map_err(|error| {
+        mhc::hc_pre(&config, &a_prev, &host_update, &mut host_attn_in).map_err(|error| {
             sparkflash_engine::linalg::EngineError::Shape {
                 what: format!("layer {layer} host hc_pre"),
                 detail: error.to_string(),
@@ -626,7 +984,7 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             .chain(entry.post.iter().zip(&host_mixes.post))
             .chain(entry.comb.iter().zip(&host_mixes.comb))
             .map(|(device, host)| (device - host).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, finite_max);
         let inv_rms_delta = (inv_rms - host_inv).abs();
         if !capture_exact || !codes_exact || !scales_exact {
             return Err(sparkflash_engine::linalg::EngineError::Shape {
@@ -636,33 +994,251 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
                 ),
             });
         }
-        if coeff_max_abs > M11_HC_COEFF_BAR {
+        if over_bar(coeff_max_abs, M11_HC_COEFF_BAR) {
             return Err(sparkflash_engine::linalg::EngineError::Shape {
                 what: format!("layer {layer} hc_coeffs bar"),
                 detail: format!("max abs {coeff_max_abs:.6e} exceeds the 1e-4 bar"),
             });
         }
-        if inv_rms_delta > M11_INV_RMS_BAR {
+        if over_bar(inv_rms_delta, M11_INV_RMS_BAR) {
             return Err(sparkflash_engine::linalg::EngineError::Shape {
                 what: format!("layer {layer} 1/rms bar"),
                 detail: format!("max abs delta {inv_rms_delta:.6e} exceeds the 3e-4 bar"),
             });
         }
-        device_timings.push(DeviceTiming {
-            staging_ms,
-            device_ms,
-            capture_exact,
-            codes_exact,
-            scales_exact,
-            coeff_max_abs,
-            inv_rms_delta,
-            x_bytes: x_after.len(),
-            matrix_bytes,
-        });
+        {
+            let mut timings = device_timings.borrow_mut();
+            let timing = &mut timings[layer];
+            timing.staging_ms = staging_ms;
+            timing.entry_us = entry_us;
+            timing.capture_exact = capture_exact;
+            timing.codes_exact = codes_exact;
+            timing.scales_exact = scales_exact;
+            timing.coeff_max_abs = coeff_max_abs;
+            timing.inv_rms_delta = inv_rms_delta;
+            timing.engram_split = engram_layer && deferred.is_some();
+            timing.x_bytes = x_after.len();
+            timing.matrix_bytes = matrix_bytes;
+        }
         completed.set(done + 1);
         Ok(HybridEntry {
             entry,
             x: x_readback,
+        })
+    };
+    let mut post = |layer: usize,
+                    residual: &[f32],
+                    attention_out: &[f32],
+                    attn_mixes: &Mixes|
+     -> Result<HybridPost, sparkflash_engine::linalg::EngineError> {
+        let post_staging = post_staging_slot.borrow_mut().take().ok_or_else(|| {
+            sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} post staging"),
+                detail: "the entry provider did not leave one FFN staging object for the post"
+                    .to_string(),
+            }
+        })?;
+        launcher
+            .borrow_mut()
+            .restage_layer_post(&post_staging)
+            .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} post restage"),
+                detail: error,
+            })?;
+        launcher
+            .borrow_mut()
+            .write_layer_bc(&attn_mixes.post, &attn_mixes.comb)
+            .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} post B/C write"),
+                detail: error,
+            })?;
+        launcher
+            .borrow_mut()
+            .write_layer_a(&attn_mixes.pre)
+            .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} post A write"),
+                detail: error,
+            })?;
+        launcher
+            .borrow_mut()
+            .write_layer_y_bf16(&bf16_bytes(attention_out))
+            .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} post Y write"),
+                detail: error,
+            })?;
+        let post_started = Instant::now();
+        launcher
+            .borrow_mut()
+            .launch(DeviceStageCall {
+                stage: ChainStage::MhcPost,
+                layer,
+                position: 0,
+                kernel: "mega_mhc_sm121",
+            })
+            .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} MhcPost launch"),
+                detail: error.to_string(),
+            })?;
+        let entry = launcher.borrow_mut().read_layer_entry().map_err(|error| {
+            sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} post entry readback"),
+                detail: error.to_string(),
+            }
+        })?;
+        let a_after = launcher.borrow_mut().read_layer_x().map_err(|error| {
+            sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} post X readback"),
+                detail: error.to_string(),
+            }
+        })?;
+        let inv_rms = launcher
+            .borrow_mut()
+            .read_layer_inv_rms()
+            .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} post 1/rms readback"),
+                detail: error.to_string(),
+            })?;
+        let codes = launcher.borrow_mut().read_layer_codes().map_err(|error| {
+            sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} post FP8 codes readback"),
+                detail: error.to_string(),
+            }
+        })?;
+        let scales = launcher.borrow_mut().read_layer_scales().map_err(|error| {
+            sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} post FP8 scales readback"),
+                detail: error.to_string(),
+            }
+        })?;
+        let post_us = post_started.elapsed().as_micros();
+        device_total_us.set(device_total_us.get() + post_us);
+        let mut b_prev = vec![0.0f32; config.hc_mult * config.hc_mult];
+        for destination in 0..config.hc_mult {
+            for source in 0..config.hc_mult {
+                b_prev[destination * config.hc_mult + source] =
+                    attn_mixes.comb[source * config.hc_mult + destination];
+            }
+        }
+        let y_prev = decode_bf16(&bf16_bytes(attention_out));
+        let host_update = kernel_mhc_update_fused(residual, &b_prev, &attn_mixes.post, &y_prev);
+        let expected_x = bf16_bytes(&host_update);
+        if a_after != expected_x {
+            return Err(sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} post step-2 write"),
+                detail: "the post X_l readback is not the BF16 write of the host twin's B X + C Y update".to_string(),
+            });
+        }
+        let host_xhat = kernel_mhc_xhat(&host_update, &attn_mixes.pre);
+        let expected_capture = kernel_mhc_capture(&host_xhat, &post_staging.ffn_norm, inv_rms);
+        let units = quantize_activation_fp8(&expected_capture).map_err(|error| {
+            sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} post host block-input quantisation"),
+                detail: error.to_string(),
+            }
+        })?;
+        let capture_exact = entry.pre_attention_hidden == expected_capture;
+        let codes_exact = codes == units.codes();
+        let scales_exact = scales == units.scales();
+        let x_readback = decode_bf16(&a_after);
+        let mut host_mixes = Mixes::for_config(&config);
+        mhc::hc_mixes(
+            &config,
+            &host_update,
+            post_host_predictor(&post_staging),
+            &post_staging.hc_scale,
+            &post_staging.hc_base,
+            &mut host_mixes,
+        )
+        .map_err(|error| sparkflash_engine::linalg::EngineError::Shape {
+            what: format!("layer {layer} post host hc_mixes"),
+            detail: error.to_string(),
+        })?;
+        let mut host_ffn_in = vec![0.0f32; dim];
+        mhc::hc_pre(&config, &attn_mixes.pre, &host_update, &mut host_ffn_in).map_err(|error| {
+            sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} post host hc_pre"),
+                detail: error.to_string(),
+            }
+        })?;
+        let host_inv = host_inv_rms(&host_ffn_in, config.norm_eps);
+        let mut coeff_max_abs = 0.0f32;
+        let mut first_bad = String::new();
+        let mut worst = String::new();
+        let hc = config.hc_mult;
+        for (set, device, host) in [
+            ("pre", entry.pre.as_slice(), host_mixes.pre.as_slice()),
+            ("post", entry.post.as_slice(), host_mixes.post.as_slice()),
+            ("comb", entry.comb.as_slice(), host_mixes.comb.as_slice()),
+        ] {
+            for (index, (device, host)) in device.iter().zip(host).enumerate() {
+                let delta = (device - host).abs();
+                let label = if set == "comb" {
+                    format!("comb[row={}][col={}]", index / hc, index % hc)
+                } else {
+                    format!("{set}[{index}]")
+                };
+                if !delta.is_finite() {
+                    if first_bad.is_empty() {
+                        first_bad =
+                            format!("{label} device={device:.9e} twin={host:.9e} delta=non-finite");
+                    }
+                    coeff_max_abs = f32::INFINITY;
+                    worst = format!("{label} delta=non-finite");
+                    continue;
+                }
+                if delta > M11_HC_COEFF_BAR && first_bad.is_empty() {
+                    first_bad =
+                        format!("{label} device={device:.9e} twin={host:.9e} delta={delta:.3e}");
+                }
+                if delta > coeff_max_abs {
+                    coeff_max_abs = delta;
+                    worst =
+                        format!("{label} device={device:.9e} twin={host:.9e} delta={delta:.3e}");
+                }
+            }
+        }
+        let inv_rms_delta = (inv_rms - host_inv).abs();
+        if !capture_exact || !codes_exact || !scales_exact {
+            return Err(sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} post block-input comparison"),
+                detail: format!(
+                    "capture exact={capture_exact}, codes exact={codes_exact}, scales exact={scales_exact}"
+                ),
+            });
+        }
+        if over_bar(coeff_max_abs, M11_HC_COEFF_BAR) {
+            return Err(sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} post hc_coeffs bar"),
+                detail: format!(
+                    "max abs {coeff_max_abs:.6e} exceeds the 1e-4 bar; first over bar: {first_bad}; worst: {worst}"
+                ),
+            });
+        }
+        if over_bar(inv_rms_delta, M11_INV_RMS_BAR) {
+            return Err(sparkflash_engine::linalg::EngineError::Shape {
+                what: format!("layer {layer} post 1/rms bar"),
+                detail: format!("max abs delta {inv_rms_delta:.6e} exceeds the 3e-4 bar"),
+            });
+        }
+        {
+            let mut timings = device_timings.borrow_mut();
+            let timing = &mut timings[layer];
+            timing.post_us = post_us;
+            timing.post_capture_exact = capture_exact;
+            timing.post_codes_exact = codes_exact;
+            timing.post_scales_exact = scales_exact;
+            timing.post_coeff_max_abs = coeff_max_abs;
+            timing.post_inv_rms_delta = inv_rms_delta;
+        }
+        let mut ffn_mixes = Mixes::for_config(&config);
+        ffn_mixes.pre.copy_from_slice(&entry.pre);
+        ffn_mixes.post.copy_from_slice(&entry.post);
+        ffn_mixes.comb.copy_from_slice(&entry.comb);
+        Ok(HybridPost {
+            x: x_readback,
+            ffn_in: entry.pre_attention_hidden,
+            ffn_mixes,
+            source: LayerZeroEntrySource::Device,
         })
     };
     let mut progress = |layer: usize, host_ms: u64| {
@@ -670,11 +1246,11 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             let chain_ms =
                 started.elapsed().as_millis() as u64 - reference_elapsed.as_millis() as u64;
             let line = format!(
-                "progress: layer {}/{} complete; chain_elapsed_ms={}; device_ms={}; host_ms_last={}",
+                "progress: layer {}/{} complete; chain_elapsed_ms={}; device_us={}; host_ms_last={}",
                 layer + 1,
                 config.n_layers,
                 chain_ms,
-                device_total_ms.get(),
+                device_total_us.get(),
                 host_ms
             );
             println!("{line}");
@@ -688,42 +1264,114 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
     .map_err(|error| format!("chain checkpoint {}: {error}", args.checkpoint.display()))?;
     let chain_engine = InferenceEngine::new(config.clone(), Box::new(chain_source), limit)
         .map_err(|error| format!("chain engine: {error}"))?;
-    let chain_result =
-        chain_engine.run_hybrid_chain(args.token, &embedding, &mut provider, &mut progress);
+    let chain_result = chain_engine.run_hybrid_chain_deferred(
+        args.token,
+        &embedding,
+        &mut provider,
+        &mut post,
+        Some(&mut attention_backend),
+        &mut progress,
+    );
     let output = match chain_result {
         Ok(output) => output,
         Err(error) => {
             lines.extend(progress_lines.borrow().iter().cloned());
-            for (layer, timing) in device_timings.iter().enumerate() {
+            for (layer, timing) in device_timings.borrow().iter().enumerate() {
                 lines.push(format!(
-                    "partial layer {layer} timing: staging_ms={} device_ms={} capture_exact={} codes_exact={} scales_exact={} coeff_max_abs={:.6e} inv_rms_delta={:.6e}",
+                    "partial layer {layer} timing: staging_ms={} entry_us={} post_us={} capture_exact={} codes_exact={} scales_exact={} coeff_max_abs={:.6e} inv_rms_delta={:.6e} post_capture_exact={} post_codes_exact={} post_scales_exact={} post_coeff_max_abs={:.6e} post_inv_rms_delta={:.6e}",
                     timing.staging_ms,
-                    timing.device_ms,
+                    timing.entry_us,
+                    timing.post_us,
                     timing.capture_exact,
                     timing.codes_exact,
                     timing.scales_exact,
                     timing.coeff_max_abs,
-                    timing.inv_rms_delta
+                    timing.inv_rms_delta,
+                    timing.post_capture_exact,
+                    timing.post_codes_exact,
+                    timing.post_scales_exact,
+                    timing.post_coeff_max_abs,
+                    timing.post_inv_rms_delta
                 ));
             }
-            lines.push(format!("c3 chain abort: {error}"));
+            let attention_stats = attention_backend.stats();
+            lines.push(format!(
+                "attention partial totals: projection_launches={} body_launches={} staging_ms={} projection_us={} body_us={} staged_matrix_bytes={} host_bytes={}",
+                attention_stats.launches,
+                attention_stats.attention_launches,
+                attention_stats.staging_us / 1000,
+                attention_stats.device_us,
+                attention_stats.attention_us,
+                attention_stats.staged_bytes,
+                attention_stats.host_bytes
+            ));
+            lines.push(format!("c4a-2 chain abort: {error}"));
             return Err(lines.join("\n"));
         }
     };
+    for (layer, timing) in device_timings.borrow_mut().iter_mut().enumerate() {
+        timing.body_launches = attention_backend.body_launches(layer);
+    }
     let total_elapsed = started.elapsed();
     let chain_elapsed = total_elapsed.saturating_sub(reference_elapsed);
     lines.extend(progress_lines.borrow().iter().cloned());
-    let total_device_ms: u128 = device_timings.iter().map(|timing| timing.device_ms).sum();
-    let total_staging_ms: u128 = device_timings.iter().map(|timing| timing.staging_ms).sum();
+    let attention_stats = attention_backend.stats();
+    let timings = device_timings.borrow();
+    let attention_device_us = attention_stats.device_us as u128;
+    let attention_body_us = attention_stats.attention_us as u128;
+    let attention_staging_ms = (attention_stats.staging_us / 1000) as u128;
+    let total_device_us: u128 = timings
+        .iter()
+        .map(|timing| timing.entry_us + timing.post_us)
+        .sum::<u128>()
+        + attention_device_us
+        + attention_body_us;
+    let total_staging_ms: u128 =
+        timings.iter().map(|timing| timing.staging_ms).sum::<u128>() + attention_staging_ms;
     let total_host_ms: u64 = output.layers.iter().map(|trace| trace.host_ms).sum();
     let total_host_bytes: u64 = output
         .layers
         .iter()
         .flat_map(|trace| trace.stages.iter())
         .map(|event| event.host_bytes_in.saturating_add(event.host_bytes_out))
-        .sum();
+        .sum::<u64>()
+        + attention_stats.host_bytes;
+    let total_matrix_bytes: u64 = timings
+        .iter()
+        .map(|timing| timing.matrix_bytes)
+        .sum::<u64>()
+        + attention_stats.staged_bytes;
+    let attention_cubin_bytes: u64 = [
+        "b12x_mxfp8_dense_sm121",
+        "b12x_mxfp8_wo_a_sm121",
+        "flash_mla_csa2_sm121",
+    ]
+    .iter()
+    .filter_map(|name| sparkflash_kernels::baseline::pin(name).ok().flatten())
+    .map(|pin| pin.cubin_bytes as u64)
+    .sum();
+    let total_cubin_bytes = cubin_bytes + attention_cubin_bytes;
+    let total_device_buffer_bytes = sparkflash_device::MhcBufferPlan::LAYER_ZERO.device_bytes()
+        as u64
+        + attention_backend.device_bytes();
+    let body_layers: Vec<usize> = output.layers.iter().map(|trace| trace.layer).collect();
+    let body_counts: Vec<usize> = output
+        .layers
+        .iter()
+        .map(|trace| {
+            timings
+                .get(trace.layer)
+                .map_or(0, |timing| timing.body_launches)
+        })
+        .collect();
+    let engram_entries = timings.iter().filter(|timing| timing.engram_split).count();
+    let c4a2_line = c4a2_seam_line(
+        &body_layers,
+        &body_counts,
+        body_layers.len() + engram_entries,
+    )?;
     for (device_index, trace) in output.layers.iter().enumerate() {
-        let timing = device_timings
+        let timing = timings
             .get(device_index)
             .ok_or_else(|| format!("layer {} has no device timing record", trace.layer))?;
         let host_bytes: u64 = trace
@@ -735,10 +1383,36 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             .stages
             .iter()
             .map(|event| {
-                let seam = match event.stage {
-                    "mhc_entry" => "[device identity seam]",
-                    "attn_norm" => "[device capture]",
-                    _ => "",
+                let seam: String = match event.stage {
+                    "mhc_entry" if trace.layer == 0 => "[device identity seam]".to_string(),
+                    "mhc_entry" if timing.engram_split => {
+                        "[device deferred FFN epilogue + Engram mixer + identity re-entry]"
+                            .to_string()
+                    }
+                    "mhc_entry" => "[device deferred FFN epilogue + attention entry]".to_string(),
+                    "mhc_post" => "[device post; 24 FFN coeffs + FFN input capture]".to_string(),
+                    "ffn_epilogue" if event.host_bytes_in == 0 => {
+                        "[deferred into next MhcEntry]".to_string()
+                    }
+                    "ffn_epilogue" => "[host FFN add; layer 39 only]".to_string(),
+                    "attn_norm" => "[device capture]".to_string(),
+                    "attention_projections" => {
+                        "[device: wq_a+wq_b+wkv, 3 launches; host q_norm + D8 quant seams]"
+                            .to_string()
+                    }
+                    "attention" if timing.body_launches == 1 => {
+                        "[device: format-2 flash-MLA, 1 launch; host q/window/selected seams]"
+                            .to_string()
+                    }
+                    "attention" => format!(
+                        "[HOST STAND-IN: m14 flash-MLA; body_launches={}]",
+                        timing.body_launches
+                    ),
+                    "attention_output_projection" => {
+                        "[device: wo_a+wo_b, 2 launches; host inverse-RoPE + D8 quant seams]"
+                            .to_string()
+                    }
+                    _ => String::new(),
                 };
                 format!(
                     "{}:{}/{} {}",
@@ -749,10 +1423,13 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             .join(",");
         lines.push(format!("ledger layer {:02}: {ledger}", trace.layer));
         lines.push(format!(
-            "layer {:02}: staging_ms={} device_ms={} host_ms={} host_bytes={} staged_matrix_bytes={} x_bytes={} capture_exact={} codes_exact={} scales_exact={} coeff_max_abs={:.6e} inv_rms_delta={:.6e}",
+            "layer {:02}: staging_ms={} engram_split={} entry_us={} post_us={} device_us={} host_ms={} host_bytes={} staged_matrix_bytes={} x_bytes={} capture_exact={} codes_exact={} scales_exact={} coeff_max_abs={:.6e} inv_rms_delta={:.6e} post_capture_exact={} post_codes_exact={} post_scales_exact={} post_coeff_max_abs={:.6e} post_inv_rms_delta={:.6e}",
             trace.layer,
             timing.staging_ms,
-            timing.device_ms,
+            timing.engram_split,
+            timing.entry_us,
+            timing.post_us,
+            timing.entry_us + timing.post_us,
             trace.host_ms,
             host_bytes,
             timing.matrix_bytes,
@@ -761,20 +1438,52 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             timing.codes_exact,
             timing.scales_exact,
             timing.coeff_max_abs,
-            timing.inv_rms_delta
+            timing.inv_rms_delta,
+            timing.post_capture_exact,
+            timing.post_codes_exact,
+            timing.post_scales_exact,
+            timing.post_coeff_max_abs,
+            timing.post_inv_rms_delta
         ));
     }
+    lines.push(c4a2_line);
     lines.push(format!(
-        "chain totals: layers={} device_launches={} device_ms={} staging_ms={} host_ms={} total_chain_ms={} host_bytes={} cubin_bytes={} device_buffer_bytes={}",
+        "attention device path: attention_projections=wq_a+wq_b+wkv 3 launches/layer; attention=format-2 flash-MLA 1 launch/layer at position 0; attention_output_projection=wo_a+wo_b 2 launches/layer; 200 projection + 40 attention launches plus 82 mHC = {}",
+        output.layers.len() * 5 + output.layers.len() + output.layers.len() * 2 + engram_entries
+    ));
+    lines.push(format!(
+        "attention totals: projection_launches={} body_launches={} staging_ms={} projection_us={} body_us={} staged_matrix_bytes={} host_bytes={} cubin_bytes={} device_buffer_bytes={}",
+        attention_stats.launches,
+        attention_stats.attention_launches,
+        attention_staging_ms,
+        attention_stats.device_us,
+        attention_stats.attention_us,
+        attention_stats.staged_bytes,
+        attention_stats.host_bytes,
+        attention_cubin_bytes,
+        attention_backend.device_bytes()
+    ));
+    lines.push(format!(
+        "chain totals: layers={} entry_launches={} post_launches={} attention_projection_launches={} attention_body_launches={} device_launches={} engram_split_layers={} device_us={} device_ms={:.3} staging_ms={} host_ms={} total_chain_ms={} host_bytes={} staged_matrix_bytes={} cubin_bytes={} device_buffer_bytes={}",
         output.layers.len(),
-        device_timings.len(),
-        total_device_ms,
+        output.layers.len() + engram_entries,
+        output.layers.len(),
+        attention_stats.launches,
+        attention_stats.attention_launches,
+        output.layers.len() * 2
+            + engram_entries
+            + attention_stats.launches
+            + attention_stats.attention_launches,
+        engram_entries,
+        total_device_us,
+        total_device_us as f64 / 1000.0,
         total_staging_ms,
         total_host_ms,
         chain_elapsed.as_millis(),
         total_host_bytes,
-        cubin_bytes,
-        sparkflash_device::MhcBufferPlan::LAYER_ZERO.device_bytes() as u64
+        total_matrix_bytes,
+        total_cubin_bytes,
+        total_device_buffer_bytes
     ));
     for stage in &output.tail_stages {
         lines.push(format!(
@@ -807,7 +1516,7 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
 }
 
 /// Decodes little-endian BF16 bytes to f32, the format the kernel's X buffer holds.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 fn decode_bf16(bytes: &[u8]) -> Vec<f32> {
     bytes
         .as_chunks::<2>()
@@ -815,6 +1524,22 @@ fn decode_bf16(bytes: &[u8]) -> Vec<f32> {
         .iter()
         .map(|chunk| f32::from_bits(u32::from(u16::from_le_bytes(*chunk)) << 16))
         .collect()
+}
+
+/// The first element where a BF16 readback is not the BF16 write of the twin.
+#[cfg(feature = "cuda")]
+fn bf16_write_difference(actual: &[u8], twin: &[f32]) -> Option<(usize, f32, f32)> {
+    let expected = sparkflash_engine::forward::layer_zero::bf16_bytes(twin);
+    for index in 0..actual.len() / 2 {
+        let actual_chunk = &actual[index * 2..index * 2 + 2];
+        if actual_chunk != &expected[index * 2..index * 2 + 2] {
+            let device = f32::from_bits(
+                u32::from(u16::from_le_bytes([actual_chunk[0], actual_chunk[1]])) << 16,
+            );
+            return Some((index, device, twin[index]));
+        }
+    }
+    None
 }
 
 /// The five largest logits, descending by value and then ascending by index.
@@ -883,11 +1608,7 @@ fn first_layer_difference(
                 trace.residual_out.len()
             )];
         }
-        let max_abs = values
-            .iter()
-            .zip(&trace.residual_out)
-            .map(|(left, right)| (left - right).abs())
-            .fold(0.0f32, f32::max);
+        let max_abs = max_abs_delta(values, &trace.residual_out);
         if max_abs > 0.0 {
             return vec![format!(
                 "first differing layer (best effort): layer {} residual_out max_abs_delta={:.6e}; this includes the BF16 staging seam and any device-entry delta",
@@ -1112,7 +1833,7 @@ fn run_stage_lines(args: &[&str]) -> Result<Vec<String>, String> {
                 "every readback coefficient is zero; the launch did not produce coefficients"
                     .to_string(),
             )
-        } else if inv_rms_delta > M11_INV_RMS_BAR {
+        } else if over_bar(inv_rms_delta, M11_INV_RMS_BAR) {
             Some(format!(
                 "device 1/rms is outside the m11 b7 3e-4 bar (delta {inv_rms_delta:.6e})"
             ))
@@ -1188,6 +1909,17 @@ mod tests {
     use sparkflash_device::chain::{
         FIRST_CHAIN_LABEL, HEAD_LABEL, HYBRID_TOKEN_LABEL, PLAN_ONLY_LABEL,
     };
+
+    #[test]
+    fn the_deferred_entry_input_is_the_previous_x_not_the_ffn_output() {
+        let config = sparkflash_engine::config::ModelConfig::tiny();
+        let handoff = sparkflash_engine::forward::DeferredHandoff {
+            x: vec![1.0, 2.0],
+            y: vec![9.0, 10.0],
+            mixes: sparkflash_engine::forward::mhc::Mixes::for_config(&config),
+        };
+        assert_eq!(deferred_entry_input(&handoff), [1.0, 2.0]);
+    }
 
     #[test]
     fn a_plan_prints_the_counts_and_labels_and_claims_no_execution() {
@@ -1470,5 +2202,309 @@ mod tests {
         let values = [3.0f32, 4.0];
         let expected = 1.0 / (12.5f32 + 0.0).sqrt();
         assert_eq!(host_inv_rms(&values, 0.0), expected);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_released_post_predictor_reproduces_the_kernel_coefficients_and_the_kernel_rows_do_not() {
+        use sparkflash_engine::config::ModelConfig;
+        use sparkflash_engine::forward::mhc::{self, Mixes};
+        use sparkflash_kernels::mega_mhc_ref::{
+            HC_MULT, HIDDEN, Streams, h_of_with_scale, released_predictor_into_kernel_rows,
+        };
+
+        let mut config = ModelConfig::tiny();
+        config.dim = HIDDEN;
+        config.hc_mult = HC_MULT;
+        config.hc_sinkhorn_iters = 3;
+        config.hc_eps = 1e-6;
+        config.norm_eps = 1e-6;
+        let width = config.hc_width();
+        let released_fn: Vec<f32> = (0..24 * width)
+            .map(|i| (((i * 13) % 97) as f32 - 48.0) / 1000.0)
+            .collect();
+        let mut kernel_fn = vec![0.0f32; released_fn.len()];
+        released_predictor_into_kernel_rows(&released_fn, &mut kernel_fn);
+        let hc_base: [f32; 24] = core::array::from_fn(|i| (i as f32 - 12.0) / 100.0);
+        let hc_scale = [0.5f32, 1.0, 0.25];
+        let x: Vec<f32> = (0..width)
+            .map(|i| (((i * 7) % 101) as f32 - 50.0) / 20.0)
+            .collect();
+
+        let mut host = Mixes::for_config(&config);
+        mhc::hc_mixes(&config, &x, &released_fn, &hc_scale, &hc_base, &mut host)
+            .expect("released-row host twin");
+        let mut streams = Streams::new(x.clone());
+        let mut registers = streams.capture();
+        let kernel_coefficients = h_of_with_scale(&mut registers, &kernel_fn, &hc_base, &hc_scale);
+        let mut released_max = 0.0f32;
+        for index in 0..HC_MULT {
+            released_max = released_max.max((host.pre[index] - kernel_coefficients.a[index]).abs());
+            released_max =
+                released_max.max((host.post[index] - kernel_coefficients.c[index]).abs());
+            for source in 0..HC_MULT {
+                released_max = released_max.max(
+                    (host.comb[source * HC_MULT + index] - kernel_coefficients.b[index][source])
+                        .abs(),
+                );
+            }
+        }
+        assert!(
+            released_max < 1e-4,
+            "the released-row host twin differs from the kernel reference by {released_max:.3e}"
+        );
+
+        let mut wrong = Mixes::for_config(&config);
+        mhc::hc_mixes(&config, &x, &kernel_fn, &hc_scale, &hc_base, &mut wrong)
+            .expect("kernel-row host twin");
+        let mut wrong_max = 0.0f32;
+        for index in 0..HC_MULT {
+            wrong_max = wrong_max.max((wrong.pre[index] - host.pre[index]).abs());
+            wrong_max = wrong_max.max((wrong.post[index] - host.post[index]).abs());
+        }
+        for (wrong, released) in wrong.comb.iter().zip(host.comb.iter()) {
+            wrong_max = wrong_max.max((wrong - released).abs());
+        }
+        assert!(
+            wrong_max > 1e-3,
+            "feeding kernel-order rows to hc_mixes must differ, got {wrong_max:.3e}"
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_deferred_step_one_twin_uses_the_input_stream_not_its_own_readback() {
+        // b28 reproduced: the Engram-split check fed the device's X_l readback back into the
+        // step-1 twin as if it were X_{l-1}. For a non-identity B/C row the update is not a fixed
+        // point, so this test pins the input-stream contract and the first-difference diagnostic.
+        use sparkflash_engine::forward::layer_zero::{bf16_bytes, kernel_mhc_update_fused};
+
+        let x = vec![0.5f32, 1.5, 2.5, 3.5];
+        let mut b = vec![0.0f32; 16];
+        for i in 0..4 {
+            b[i * 4 + i] = 1.0 + 0.125 * i as f32;
+        }
+        let c = vec![0.25f32, -0.5, 0.75, -1.0];
+        let y = 2.0f32;
+        let updated = kernel_mhc_update_fused(&x, &b, &c, &[y]);
+        let updated_bytes = bf16_bytes(&updated);
+        assert_eq!(
+            updated_bytes,
+            bf16_bytes(&kernel_mhc_update_fused(&x, &b, &c, &[y]))
+        );
+        let wrong = kernel_mhc_update_fused(&updated, &b, &c, &[y]);
+        assert_ne!(
+            updated_bytes,
+            bf16_bytes(&wrong),
+            "a non-identity B/C row must not treat its output as a fixed point"
+        );
+        let difference = bf16_write_difference(&bf16_bytes(&wrong), &updated)
+            .expect("the wrong input must be visible");
+        assert!(difference.0 < x.len());
+    }
+
+    #[test]
+    fn the_post_host_twin_projects_the_released_rows_not_the_kernel_rows() {
+        // Regression for window b27: LayerPostStaging::predictor is permuted into kernel B/A/C
+        // row order for upload, while hc_mixes consumes the released pre/post/comb order. Feeding
+        // the kernel-order vector to hc_mixes compared the device FFN coefficients against a twin
+        // built from the wrong rows (max abs 0.9965 at layer 0).
+        let staging = sparkflash_device::LayerPostStaging {
+            layer: 0,
+            predictor: vec![9.0; 24],
+            released_fn: vec![1.0; 24],
+            hc_base: [0.0; 24],
+            hc_scale: [0.0; 3],
+            ffn_norm: Vec::new(),
+            hc_base_kernel: [0.0; 24],
+            digests: Vec::new(),
+            buffer_digests: Vec::new(),
+        };
+        assert_eq!(post_host_predictor(&staging)[0], 1.0);
+        assert_ne!(post_host_predictor(&staging)[0], staging.predictor[0]);
+    }
+
+    #[test]
+    fn the_deferred_twin_ignores_its_own_readback_and_returns_the_bf16_write() {
+        use sparkflash_engine::forward::layer_zero::{bf16_bytes, kernel_mhc_update_fused};
+        let input = bf16_bytes(&[0.5, 1.5, 2.5, 3.5]);
+        let readback = bf16_bytes(&[9.0, 9.0, 9.0, 9.0]);
+        let other_readback = bf16_bytes(&[-4.0, 7.0, 1.0, 0.0]);
+        let mut b = vec![0.0f32; 16];
+        for i in 0..4 {
+            b[i * 4 + i] = 1.0 + 0.125 * i as f32;
+        }
+        let c = vec![0.25f32, -0.5, 0.75, -1.0];
+        let y = [2.0f32];
+        let twin = deferred_twin_update(&input, &readback, &b, &c, &y);
+        let twin_other = deferred_twin_update(&input, &other_readback, &b, &c, &y);
+        assert_eq!(
+            sparkflash_engine::forward::layer_zero::bf16_bytes(&twin),
+            sparkflash_engine::forward::layer_zero::bf16_bytes(&twin_other),
+            "the readback must not be an input to the twin"
+        );
+        let expected =
+            kernel_mhc_update_fused(&decode_bf16(&input), &b, &c, &decode_bf16(&bf16_bytes(&y)));
+        assert_eq!(
+            sparkflash_engine::forward::layer_zero::bf16_bytes(&twin),
+            sparkflash_engine::forward::layer_zero::bf16_bytes(&expected),
+            "the twin is the BF16 write of the input stream"
+        );
+        let from_readback = kernel_mhc_update_fused(
+            &decode_bf16(&readback),
+            &b,
+            &c,
+            &decode_bf16(&bf16_bytes(&y)),
+        );
+        assert_ne!(
+            sparkflash_engine::forward::layer_zero::bf16_bytes(&twin),
+            sparkflash_engine::forward::layer_zero::bf16_bytes(&from_readback),
+            "a non-identity row must distinguish the input from its own readback"
+        );
+    }
+
+    #[test]
+    fn both_m11_bars_reject_non_finite_deltas_and_over_bar_values() {
+        use sparkflash_engine::forward::layer_zero::{M11_HC_COEFF_BAR, M11_INV_RMS_BAR};
+        assert!(!over_bar(0.0, M11_HC_COEFF_BAR));
+        assert!(!over_bar(M11_HC_COEFF_BAR, M11_HC_COEFF_BAR));
+        assert!(over_bar(M11_HC_COEFF_BAR * 1.5, M11_HC_COEFF_BAR));
+        assert!(over_bar(f32::NAN, M11_HC_COEFF_BAR));
+        assert!(over_bar(f32::INFINITY, M11_HC_COEFF_BAR));
+        assert!(!over_bar(0.0, M11_INV_RMS_BAR));
+        assert!(over_bar(M11_INV_RMS_BAR * 1.5, M11_INV_RMS_BAR));
+        assert!(over_bar(f32::NAN, M11_INV_RMS_BAR));
+        assert!(over_bar(f32::NEG_INFINITY, M11_INV_RMS_BAR));
+    }
+
+    #[test]
+    fn missing_body_layers_reports_every_layer_whose_body_did_not_launch_once() {
+        assert_eq!(missing_body_layers(&[0, 1, 2], &[1, 0, 2]), vec![1, 2]);
+        assert!(missing_body_layers(&[5, 6], &[1, 1]).is_empty());
+    }
+
+    /// The chain's two deferred-twin call sites, pinned as source text. A helper-only test did not
+    /// catch the b28-class mutation that swaps the device readback into the twin; this test reads
+    /// the chain source and requires the exact argument expressions at both call sites.
+    #[test]
+    fn the_chain_twin_call_sites_feed_the_deferred_input_not_the_device_readback() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/device_chain.rs");
+        let source = std::fs::read_to_string(path).expect("the chain source is readable");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the test module follows the production source");
+        let normalized = production.split_whitespace().collect::<Vec<_>>().join(" ");
+        for call in [
+            "deferred_twin_update(&first_x, &mixer_x, &b, &deferred.mixes.post, &deferred.y)",
+            "deferred_twin_update(&x_bytes, &x_after, &b_prev, &c_prev, &y_prev)",
+        ] {
+            assert!(
+                normalized.contains(call),
+                "the chain must call {call}; it is not in the source"
+            );
+        }
+        for mutated in [
+            "deferred_twin_update(&mixer_x",
+            "deferred_twin_update(&x_after",
+            "deferred_twin_update(&first_x, &first_x",
+        ] {
+            assert!(
+                !normalized.contains(mutated),
+                "the chain must not feed the readback into the twin: found {mutated}"
+            );
+        }
+        assert_eq!(
+            normalized.matches("deferred_twin_update(").count(),
+            3,
+            "one definition plus exactly two chain call sites"
+        );
+    }
+
+    /// The coefficient fold must go through the finite helper; restoring a plain `f32::max` fold
+    /// would silently drop a NaN coefficient delta and is the mutation this pins.
+    #[test]
+    fn the_chain_coefficient_fold_uses_the_finite_helper() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/device_chain.rs");
+        let source = std::fs::read_to_string(path).expect("the chain source is readable");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the test module follows the production source");
+        let normalized = production.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains(".fold(0.0f32, finite_max);"),
+            "the coefficient fold must call finite_max"
+        );
+        assert!(
+            !normalized.contains(".fold(0.0f32, f32::max)"),
+            "a plain f32::max fold is NaN-blind"
+        );
+    }
+
+    /// The c4a-2 seam line is obtained from the checked function and printed; deleting the guard
+    /// or bypassing the function shows up here as missing source text.
+    ///
+    /// The literals below duplicate the production call text on purpose. A mutation applied to BOTH
+    /// production and this string would false-green, but that is not the realistic edit; a
+    /// production-only mutation is red, and the 40-layer exact-line test is the behavioural pin.
+    #[test]
+    fn the_chain_prints_the_checked_c4a2_seam_line() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/device_chain.rs");
+        let source = std::fs::read_to_string(path).expect("the chain source is readable");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the test module follows the production source");
+        let normalized = production.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains("let c4a2_line = c4a2_seam_line(")
+                && normalized
+                    .contains("&body_layers, &body_counts, body_layers.len() + engram_entries"),
+            "the chain must obtain the c4a-2 seam line from the checked function"
+        );
+        assert!(
+            normalized.contains("lines.push(c4a2_line);"),
+            "the checked c4a-2 seam line must be printed"
+        );
+    }
+
+    #[test]
+    fn finite_max_maps_non_finite_deltas_to_infinity() {
+        assert_eq!(finite_max(0.0, 0.25), 0.25);
+        assert_eq!(finite_max(0.5, 0.25), 0.5);
+        assert_eq!(finite_max(0.5, f32::NAN), f32::INFINITY);
+        assert_eq!(finite_max(0.5, f32::INFINITY), f32::INFINITY);
+        assert_eq!(finite_max(0.5, f32::NEG_INFINITY), f32::INFINITY);
+        assert_eq!(max_abs_delta(&[1.0, 2.0], &[1.0, 2.5]), 0.5);
+        assert_eq!(max_abs_delta(&[1.0, f32::NAN], &[1.0, 2.0]), f32::INFINITY);
+    }
+
+    #[test]
+    fn the_c4a2_seam_line_is_emitted_only_when_every_body_launched_once() {
+        let line = c4a2_seam_line(&[0, 1, 2], &[1, 1, 1], 3).expect("all layers launch once");
+        assert!(
+            line.contains("3 layers") && line.contains("6 mHC launches (3 entry + 3 post)"),
+            "{line}"
+        );
+        let error = c4a2_seam_line(&[0, 1, 2], &[1, 0, 1], 3).expect_err("layer 1 did not launch");
+        assert!(error.contains("[1]"), "{error}");
+        assert!(error.contains("withheld"), "{error}");
+    }
+
+    #[test]
+    fn the_c4a2_line_counts_the_two_engram_re_entries_in_the_mhc_total() {
+        let layers: Vec<usize> = (0..40).collect();
+        let launches = vec![1; 40];
+        let engram_entries = 2;
+        let line = c4a2_seam_line(&layers, &launches, layers.len() + engram_entries)
+            .expect("all 40 bodies launch once");
+        assert_eq!(
+            line,
+            "c4a-2 seam: format-2 body launched exactly once on all 40 layers; 200 projection + 40 body launches plus the 82 mHC launches (42 entry + 40 post)",
+            "the seam line must agree with the adjacent attention total: 200 + 40 + 82 = 322"
+        );
+        let total = 200 + 40 + 82;
+        assert_eq!(total, 322);
     }
 }

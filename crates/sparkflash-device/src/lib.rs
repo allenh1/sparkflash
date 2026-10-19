@@ -102,7 +102,7 @@ pub use session::cuda::CudaSession;
 pub use session::{DeviceSession, ExecutionEvidence, FakeSession, SessionError};
 pub use staging::{
     EMBED_WEIGHT, EmbedRow, LAYER0_ATTN_NORM, LAYER0_MHC_BASE, LAYER0_MHC_FN, LAYER0_MHC_SCALE,
-    LAYER0_PREFIX, LayerStaging, LayerZeroStaging, MHC_BUFFER_COUNT, MhcBufferPlan, StagedTensor,
-    StagingError,
+    LAYER0_PREFIX, LayerPostStaging, LayerStaging, LayerZeroStaging, MHC_BUFFER_COUNT,
+    MhcBufferPlan, StagedTensor, StagingError,
 };
 pub use window::{WindowAccounting, layer_view, layer_view_bytes};

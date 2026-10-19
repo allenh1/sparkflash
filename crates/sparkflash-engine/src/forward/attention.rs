@@ -1415,6 +1415,219 @@ pub fn compressed_indices(
     Ok(())
 }
 
+/// The five GEMM primitives of the attention sublayer, split out so a device arm can replace the
+/// matrix multiplies without replacing the host normalisation, RoPE, KV, cache, indexer or softmax
+/// seams. The host implementation is the reference arithmetic; [attention_forward_with_backend]
+/// uses it for every non-device caller.
+pub trait AttentionProjectionBackend {
+    /// wq_a over the normalised attention input; returns the pre-norm latent.
+    fn wq_a(
+        &mut self,
+        config: &ModelConfig,
+        layer: usize,
+        prefix: &str,
+        x: &[f32],
+        src: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Vec<f32>, EngineError>;
+    /// wq_b over the q_norm'd latent; returns the pre-RoPE q rows.
+    fn wq_b(
+        &mut self,
+        config: &ModelConfig,
+        layer: usize,
+        prefix: &str,
+        latent: &[f32],
+        src: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Vec<f32>, EngineError>;
+    /// wkv over the normalised attention input; returns the pre-norm KV rows.
+    fn wkv(
+        &mut self,
+        config: &ModelConfig,
+        layer: usize,
+        prefix: &str,
+        x: &[f32],
+        src: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Vec<f32>, EngineError>;
+    /// The grouped wo_a; returns the concatenated per-group lo vectors.
+    fn wo_a(
+        &mut self,
+        config: &ModelConfig,
+        prefix: &str,
+        wide: &[f32],
+        src: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Vec<f32>, EngineError>;
+    /// The wo_b projection of the grouped lo vectors.
+    fn wo_b(
+        &mut self,
+        config: &ModelConfig,
+        prefix: &str,
+        grouped: &[f32],
+        src: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Vec<f32>, EngineError>;
+
+    /// The CSA-union attention body over the already-built q, window KV, compressed rows and
+    /// per-query candidate ids. Returns `true` when the backend wrote `out`; the default `false`
+    /// keeps the engine's reference sparse-attention loop. A backend may support only a subset of
+    /// shapes and return `false` for the rest, which is why this is a capability answer and not a
+    /// `Result<()>`.
+    #[allow(clippy::too_many_arguments)]
+    fn attention(
+        &mut self,
+        layer: usize,
+        q: &[f32],
+        kv: &[f32],
+        sink: &[f32],
+        combined: &[usize],
+        heads: usize,
+        head_dim: usize,
+        seqlen: usize,
+        window_width: usize,
+        compressed_stride: usize,
+        scale: f32,
+        start_pos: usize,
+        out: &mut [f32],
+    ) -> Result<bool, EngineError> {
+        let _ = (
+            layer,
+            q,
+            kv,
+            sink,
+            combined,
+            heads,
+            head_dim,
+            seqlen,
+            window_width,
+            compressed_stride,
+            scale,
+            start_pos,
+            out,
+        );
+        Ok(false)
+    }
+}
+
+/// The host reference backend. It is the old arithmetic unchanged; the device arm is a different
+/// implementation of the same five primitive contracts.
+pub struct HostAttentionProjectionBackend;
+
+impl AttentionProjectionBackend for HostAttentionProjectionBackend {
+    fn wq_a(
+        &mut self,
+        config: &ModelConfig,
+        _layer: usize,
+        prefix: &str,
+        x: &[f32],
+        source: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Vec<f32>, EngineError> {
+        let src = Reads { source, limit };
+        let dim = config.dim;
+        let rank = config.q_lora_rank;
+        let seqlen = rows_of(x, dim, "attention input")?;
+        let wq_a = dense_weight(src, &format!("{prefix}.attn.wq_a"), rank, dim)?;
+        let mut latent = vec![0.0; seqlen * rank];
+        linalg::matmul(&mut latent, x, &wq_a, rank, dim, seqlen)?;
+        Ok(latent)
+    }
+
+    fn wq_b(
+        &mut self,
+        config: &ModelConfig,
+        _layer: usize,
+        prefix: &str,
+        latent: &[f32],
+        source: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Vec<f32>, EngineError> {
+        let src = Reads { source, limit };
+        let rank = config.q_lora_rank;
+        let cols = config.n_heads * config.head_dim;
+        let seqlen = rows_of(latent, rank, "q latent")?;
+        let wq_b = dense_weight(src, &format!("{prefix}.attn.wq_b"), cols, rank)?;
+        let mut q = vec![0.0; seqlen * cols];
+        linalg::matmul(&mut q, latent, &wq_b, cols, rank, seqlen)?;
+        Ok(q)
+    }
+
+    fn wkv(
+        &mut self,
+        config: &ModelConfig,
+        _layer: usize,
+        prefix: &str,
+        x: &[f32],
+        source: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Vec<f32>, EngineError> {
+        let src = Reads { source, limit };
+        let dim = config.dim;
+        let head_dim = config.head_dim;
+        let seqlen = rows_of(x, dim, "attention input")?;
+        let wkv = dense_weight(src, &format!("{prefix}.attn.wkv"), head_dim, dim)?;
+        let mut kv = vec![0.0; seqlen * head_dim];
+        linalg::matmul(&mut kv, x, &wkv, head_dim, dim, seqlen)?;
+        Ok(kv)
+    }
+
+    fn wo_a(
+        &mut self,
+        config: &ModelConfig,
+        prefix: &str,
+        wide: &[f32],
+        source: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Vec<f32>, EngineError> {
+        let src = Reads { source, limit };
+        let head_dim = config.head_dim;
+        let heads = config.n_heads;
+        let groups = config.o_groups;
+        let per_group = heads / groups;
+        let group_in = per_group * head_dim;
+        let wide_row = heads * head_dim;
+        let seqlen = rows_of(wide, wide_row, "attention wide")?;
+        let grouped_width = groups * config.o_lora_rank;
+        let wo_a =
+            scaled_or_plain_weight(src, &format!("{prefix}.attn.wo_a"), grouped_width, group_in)?;
+        let mut grouped = vec![0.0; seqlen * grouped_width];
+        for query in 0..seqlen {
+            for group in 0..groups {
+                let source = &wide[query * wide_row + group * group_in..][..group_in];
+                let block =
+                    &wo_a[group * config.o_lora_rank * group_in..][..config.o_lora_rank * group_in];
+                let dest = &mut grouped[query * grouped_width + group * config.o_lora_rank..]
+                    [..config.o_lora_rank];
+                linalg::matmul(dest, source, block, config.o_lora_rank, group_in, 1)?;
+            }
+        }
+        Ok(grouped)
+    }
+
+    fn wo_b(
+        &mut self,
+        config: &ModelConfig,
+        prefix: &str,
+        grouped: &[f32],
+        source: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Vec<f32>, EngineError> {
+        let src = Reads { source, limit };
+        let grouped_width = config.o_groups * config.o_lora_rank;
+        let seqlen = rows_of(grouped, grouped_width, "grouped lo")?;
+        let wo_b = dense_weight(
+            src,
+            &format!("{prefix}.attn.wo_b"),
+            config.dim,
+            grouped_width,
+        )?;
+        let mut out = vec![0.0; seqlen * config.dim];
+        linalg::matmul(&mut out, grouped, &wo_b, config.dim, grouped_width, seqlen)?;
+        Ok(out)
+    }
+}
+
 /// The chunk's queries: `wq_b(q_norm(wq_a(x)))` with the RoPE tail rotated, and the latent the
 /// indexer projects with its own `wq_b` (model.py:770-772, 550).
 ///
@@ -1429,19 +1642,41 @@ fn query_path(
     start_pos: usize,
     src: Reads<'_>,
 ) -> Result<(Vec<f32>, Vec<f32>), EngineError> {
+    query_path_with(
+        config,
+        layer,
+        prefix,
+        x,
+        start_pos,
+        src.source,
+        src.limit,
+        &mut HostAttentionProjectionBackend,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn query_path_with(
+    config: &ModelConfig,
+    layer: usize,
+    prefix: &str,
+    x: &[f32],
+    start_pos: usize,
+    source: &dyn WeightSource,
+    limit: usize,
+    backend: &mut dyn AttentionProjectionBackend,
+) -> Result<(Vec<f32>, Vec<f32>), EngineError> {
     let dim = config.dim;
     let rank = config.q_lora_rank;
     let head_dim = config.head_dim;
     let heads = config.n_heads;
     let seqlen = rows_of(x, dim, "attention input")?;
-    let wq_a = dense_weight(src, &format!("{prefix}.attn.wq_a"), rank, dim)?;
-    let q_norm = weight(src, &format!("{prefix}.attn.q_norm.weight"))?;
-    let wq_b = dense_weight(src, &format!("{prefix}.attn.wq_b"), heads * head_dim, rank)?;
-    let mut latent = vec![0.0; seqlen * rank];
-    linalg::matmul(&mut latent, x, &wq_a, rank, dim, seqlen)?;
+    let q_norm = weight(
+        Reads { source, limit },
+        &format!("{prefix}.attn.q_norm.weight"),
+    )?;
+    let mut latent = backend.wq_a(config, layer, prefix, x, source, limit)?;
     linalg::rms_norm(&mut latent, &q_norm, rank, config.norm_eps as f32)?;
-    let mut q = vec![0.0; seqlen * heads * head_dim];
-    linalg::matmul(&mut q, &latent, &wq_b, heads * head_dim, rank, seqlen)?;
+    let mut q = backend.wq_b(config, layer, prefix, &latent, source, limit)?;
     let tables =
         rope_tables_for_layer(config, layer, &head_row_positions(start_pos, seqlen, heads));
     rotate_rows(
@@ -1472,13 +1707,37 @@ fn window_kv(
     start_pos: usize,
     src: Reads<'_>,
 ) -> Result<Vec<f32>, EngineError> {
+    window_kv_with(
+        config,
+        layer,
+        prefix,
+        x,
+        start_pos,
+        src.source,
+        src.limit,
+        &mut HostAttentionProjectionBackend,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn window_kv_with(
+    config: &ModelConfig,
+    layer: usize,
+    prefix: &str,
+    x: &[f32],
+    start_pos: usize,
+    source: &dyn WeightSource,
+    limit: usize,
+    backend: &mut dyn AttentionProjectionBackend,
+) -> Result<Vec<f32>, EngineError> {
     let dim = config.dim;
     let head_dim = config.head_dim;
     let seqlen = rows_of(x, dim, "attention input")?;
-    let wkv = dense_weight(src, &format!("{prefix}.attn.wkv"), head_dim, dim)?;
-    let norm = weight(src, &format!("{prefix}.attn.kv_norm.weight"))?;
-    let mut kv = vec![0.0; seqlen * head_dim];
-    linalg::matmul(&mut kv, x, &wkv, head_dim, dim, seqlen)?;
+    let norm = weight(
+        Reads { source, limit },
+        &format!("{prefix}.attn.kv_norm.weight"),
+    )?;
+    let mut kv = backend.wkv(config, layer, prefix, x, source, limit)?;
     linalg::rms_norm(&mut kv, &norm, head_dim, config.norm_eps as f32)?;
     let positions: Vec<usize> = (start_pos..start_pos + seqlen).collect();
     let tables = rope_tables_for_layer(config, layer, &positions);
@@ -1717,27 +1976,54 @@ fn output_projection(
     out: &mut [f32],
     seqlen: usize,
 ) -> Result<(), EngineError> {
-    let dim = config.dim;
+    output_projection_with(
+        config,
+        prefix,
+        out,
+        seqlen,
+        src.source,
+        src.limit,
+        &mut HostAttentionProjectionBackend,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn output_projection_with(
+    config: &ModelConfig,
+    prefix: &str,
+    out: &mut [f32],
+    seqlen: usize,
+    source: &dyn WeightSource,
+    limit: usize,
+    backend: &mut dyn AttentionProjectionBackend,
+) -> Result<(), EngineError> {
     let head_dim = config.head_dim;
     let heads = config.n_heads;
-    let groups = config.o_groups;
-    let per_group = heads / groups;
-    let group_in = per_group * head_dim;
-    let wide = groups * config.o_lora_rank;
-    let wo_a = scaled_or_plain_weight(src, &format!("{prefix}.attn.wo_a"), wide, group_in)?;
-    let wo_b = dense_weight(src, &format!("{prefix}.attn.wo_b"), dim, wide)?;
-    let mut grouped = vec![0.0; seqlen * wide];
-    for query in 0..seqlen {
-        for group in 0..groups {
-            let source = &out[query * heads * head_dim + group * group_in..][..group_in];
-            let block =
-                &wo_a[group * config.o_lora_rank * group_in..][..config.o_lora_rank * group_in];
-            let dest =
-                &mut grouped[query * wide + group * config.o_lora_rank..][..config.o_lora_rank];
-            linalg::matmul(dest, source, block, config.o_lora_rank, group_in, 1)?;
-        }
+    let wide_row = heads * head_dim;
+    if out.len() < seqlen * wide_row {
+        return Err(shape(
+            "attention output projection",
+            format!(
+                "{seqlen} rows of {wide_row} values need {} slots, got {}",
+                seqlen * wide_row,
+                out.len()
+            ),
+        ));
     }
-    linalg::matmul(out, &grouped, &wo_b, dim, wide, seqlen)?;
+    let grouped = backend.wo_a(config, prefix, &out[..seqlen * wide_row], source, limit)?;
+    let projected = backend.wo_b(config, prefix, &grouped, source, limit)?;
+    let dim = config.dim;
+    if projected.len() != seqlen * dim {
+        return Err(shape(
+            "attention output projection",
+            format!(
+                "expected {} projected values, got {}",
+                seqlen * dim,
+                projected.len()
+            ),
+        ));
+    }
+    out[..seqlen * dim].copy_from_slice(&projected);
     Ok(())
 }
 
@@ -1765,6 +2051,33 @@ pub fn attention_forward(
     src: &dyn WeightSource,
     out: &mut [f32],
     limit: usize,
+) -> Result<(), EngineError> {
+    attention_forward_with_backend(
+        config,
+        layer,
+        prefix,
+        x,
+        start_pos,
+        state,
+        src,
+        out,
+        limit,
+        &mut HostAttentionProjectionBackend,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn attention_forward_with_backend(
+    config: &ModelConfig,
+    layer: usize,
+    prefix: &str,
+    x: &[f32],
+    start_pos: usize,
+    state: &mut AttnState,
+    src: &dyn WeightSource,
+    out: &mut [f32],
+    limit: usize,
+    backend: &mut dyn AttentionProjectionBackend,
 ) -> Result<(), EngineError> {
     let src = Reads { source: src, limit };
     let dim = config.dim;
@@ -1818,8 +2131,12 @@ pub fn attention_forward(
     // compression, and zero division is what a ratio of zero would otherwise be.
     let compress_len = end_pos.checked_div(ratio).unwrap_or(0);
     let scale = (head_dim as f64).powf(-0.5) as f32;
-    let (q, latent) = query_path(config, layer, prefix, x, start_pos, src)?;
-    let kv_rows = window_kv(config, layer, prefix, x, start_pos, src)?;
+    let (q, latent) = query_path_with(
+        config, layer, prefix, x, start_pos, src.source, src.limit, backend,
+    )?;
+    let kv_rows = window_kv_with(
+        config, layer, prefix, x, start_pos, src.source, src.limit, backend,
+    )?;
     state.step = Some((start_pos, seqlen));
     let window_rows = if start_pos == 0 {
         seqlen
@@ -1880,57 +2197,88 @@ pub fn attention_forward(
         config.window_size
     };
     let mut combined: Vec<usize> = Vec::with_capacity(window_width + compressed_stride);
-    for query in 0..seqlen {
-        if start_pos > 0 {
-            // A step after prefill writes its own row into the ring before attending, so the ring
-            // holds the positions this query may see and nothing later (model.py:717-719).
-            let position = start_pos + query;
-            state
-                .window
-                .write(position, &kv_rows[query * head_dim..(query + 1) * head_dim])?;
-            for slot in 0..config.window_size {
-                kv[slot * head_dim..(slot + 1) * head_dim]
-                    .copy_from_slice(state.window.slot_row(slot));
-            }
+    // The device body only sees the prefill chunk's ids, where the window is this chunk and no
+    // per-query ring write changes the KV view. For a decode step it answers `false` and the host
+    // loop below runs unchanged.
+    let device_attention = if start_pos == 0 {
+        let mut chunk_ids = Vec::with_capacity(seqlen * (window_width + compressed_stride));
+        for query in 0..seqlen {
+            chunk_ids.extend_from_slice(&ids[query * window_width..(query + 1) * window_width]);
+            chunk_ids.extend_from_slice(
+                &compressed_ids[query * compressed_stride..(query + 1) * compressed_stride],
+            );
         }
-        combined.clear();
-        combined.extend_from_slice(&ids[query * window_width..(query + 1) * window_width]);
-        combined.extend_from_slice(
-            &compressed_ids[query * compressed_stride..(query + 1) * compressed_stride],
-        );
-        sparse_attention(
-            &q[query * heads * head_dim..(query + 1) * heads * head_dim],
+        backend.attention(
+            layer,
+            &q,
             &kv,
             &sink,
-            &combined,
+            &chunk_ids,
             heads,
             head_dim,
-            scale,
-            &mut out[query * heads * head_dim..(query + 1) * heads * head_dim],
-        )?;
-        // Off-by-default capture hook (task-14): offers the query's inputs and pre-projection
-        // output to the fixture generator. It is inactive unless explicitly armed, and it copies
-        // values the reference has already computed, so the reference arithmetic is untouched.
-        attention_case::record(attention_case::Frame {
-            layer,
-            position: start_pos + query,
-            start_pos,
             seqlen,
-            ratio,
-            heads,
-            head_dim,
-            window_rows,
             window_width,
             compressed_stride,
-            q: &q[query * heads * head_dim..(query + 1) * heads * head_dim],
-            sink: &sink,
-            window_ids: &ids[query * window_width..(query + 1) * window_width],
-            window_kv: &kv[..window_rows * head_dim],
-            compressed_ids: &compressed_ids
-                [query * compressed_stride..(query + 1) * compressed_stride],
-            compressed_kv: &kv[window_rows * head_dim..],
-            out: &out[query * heads * head_dim..(query + 1) * heads * head_dim],
-        });
+            scale,
+            start_pos,
+            &mut out[..seqlen * heads * head_dim],
+        )?
+    } else {
+        false
+    };
+    if !device_attention {
+        for query in 0..seqlen {
+            if start_pos > 0 {
+                // A step after prefill writes its own row into the ring before attending, so the ring
+                // holds the positions this query may see and nothing later (model.py:717-719).
+                let position = start_pos + query;
+                state
+                    .window
+                    .write(position, &kv_rows[query * head_dim..(query + 1) * head_dim])?;
+                for slot in 0..config.window_size {
+                    kv[slot * head_dim..(slot + 1) * head_dim]
+                        .copy_from_slice(state.window.slot_row(slot));
+                }
+            }
+            combined.clear();
+            combined.extend_from_slice(&ids[query * window_width..(query + 1) * window_width]);
+            combined.extend_from_slice(
+                &compressed_ids[query * compressed_stride..(query + 1) * compressed_stride],
+            );
+            sparse_attention(
+                &q[query * heads * head_dim..(query + 1) * heads * head_dim],
+                &kv,
+                &sink,
+                &combined,
+                heads,
+                head_dim,
+                scale,
+                &mut out[query * heads * head_dim..(query + 1) * heads * head_dim],
+            )?;
+            // Off-by-default capture hook (task-14): offers the query's inputs and pre-projection
+            // output to the fixture generator. It is inactive unless explicitly armed, and it copies
+            // values the reference has already computed, so the reference arithmetic is untouched.
+            attention_case::record(attention_case::Frame {
+                layer,
+                position: start_pos + query,
+                start_pos,
+                seqlen,
+                ratio,
+                heads,
+                head_dim,
+                window_rows,
+                window_width,
+                compressed_stride,
+                q: &q[query * heads * head_dim..(query + 1) * heads * head_dim],
+                sink: &sink,
+                window_ids: &ids[query * window_width..(query + 1) * window_width],
+                window_kv: &kv[..window_rows * head_dim],
+                compressed_ids: &compressed_ids
+                    [query * compressed_stride..(query + 1) * compressed_stride],
+                compressed_kv: &kv[window_rows * head_dim..],
+                out: &out[query * heads * head_dim..(query + 1) * heads * head_dim],
+            });
+        }
     }
     let tables =
         rope_tables_for_layer(config, layer, &head_row_positions(start_pos, seqlen, heads));
@@ -1942,7 +2290,7 @@ pub fn attention_forward(
         &tables,
         true,
     )?;
-    output_projection(config, prefix, src, out, seqlen)?;
+    output_projection_with(config, prefix, out, seqlen, src.source, src.limit, backend)?;
     Ok(())
 }
 

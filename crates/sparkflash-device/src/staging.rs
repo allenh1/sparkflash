@@ -597,6 +597,148 @@ pub struct LayerStaging {
     pub buffer_digests: Vec<StagedTensor>,
 }
 
+/// One layer's released FFN mHC tensors, staged for the device post call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayerPostStaging {
+    /// The backbone layer.
+    pub layer: usize,
+    /// The released 24 x 4d FFN predictor, permuted into kernel B/A/C row order.
+    pub predictor: Vec<f32>,
+    /// The released FFN predictor in the released pre/post/comb row order, which is the order the
+    /// host `hc_mixes` twin expects. Not uploaded; kept so the host comparison does not decode the
+    /// kernel-permuted rows with the wrong row map.
+    pub released_fn: Vec<f32>,
+    /// hc_ffn_base as released, kernel row order.
+    pub hc_base: [f32; PREDICTOR_ROWS],
+    /// hc_ffn_scale (pre, post, comb).
+    pub hc_scale: [f32; 3],
+    /// ffn_norm.weight widened to f32.
+    pub ffn_norm: Vec<f32>,
+    /// hc_ffn_base rearranged into the kernel's row order.
+    pub hc_base_kernel: [f32; PREDICTOR_ROWS],
+    /// One source-provenance digest per raw tensor.
+    pub digests: Vec<StagedTensor>,
+    /// One digest per exact host vector the staging path passes to copy_htod.
+    pub buffer_digests: Vec<StagedTensor>,
+}
+
+impl LayerPostStaging {
+    /// Reads one layer's released FFN mHC tensors through a WeightSource.
+    ///
+    /// # Errors
+    /// [StagingError] on a missing tensor, a dtype/shape mismatch or a short read.
+    pub fn from_source(source: &dyn WeightSource, layer: usize) -> Result<Self, StagingError> {
+        let prefix = format!("layers.{layer}");
+        let fn_name = format!("{prefix}.hc_ffn_fn");
+        let base_name = format!("{prefix}.hc_ffn_base");
+        let scale_name = format!("{prefix}.hc_ffn_scale");
+        let norm_name = format!("{prefix}.ffn_norm.weight");
+        let fn_bytes = read_checked(
+            source,
+            &fn_name,
+            DType::F32,
+            &[PREDICTOR_ROWS, HC_MULT * HIDDEN],
+        )?;
+        let released_fn = bytes_to_f32(&fn_name, &fn_bytes)?;
+        let mut predictor = vec![0.0f32; released_fn.len()];
+        released_predictor_into_kernel_rows(&released_fn, &mut predictor);
+        let base_bytes = read_checked(source, &base_name, DType::F32, &[PREDICTOR_ROWS])?;
+        let base_values = bytes_to_f32(&base_name, &base_bytes)?;
+        let hc_base: [f32; PREDICTOR_ROWS] =
+            base_values
+                .as_slice()
+                .try_into()
+                .map_err(|_| StagingError::Spec {
+                    name: base_name.clone(),
+                    expected: format!("{PREDICTOR_ROWS} f32 values"),
+                    found: format!("{} f32 values", base_values.len()),
+                })?;
+        let scale_bytes = read_checked(source, &scale_name, DType::F32, &[3])?;
+        let scale_values = bytes_to_f32(&scale_name, &scale_bytes)?;
+        let hc_scale: [f32; 3] =
+            scale_values
+                .as_slice()
+                .try_into()
+                .map_err(|_| StagingError::Spec {
+                    name: scale_name.clone(),
+                    expected: "3 f32 values".to_string(),
+                    found: format!("{} f32 values", scale_values.len()),
+                })?;
+        let norm_spec = source
+            .spec(&norm_name)
+            .map_err(|error| source_error(&norm_name, error))?;
+        if norm_spec.shape != [HIDDEN] || !matches!(norm_spec.dtype, DType::F32 | DType::BF16) {
+            return Err(StagingError::Spec {
+                name: norm_name.clone(),
+                expected: format!("F32 or BF16 [{HIDDEN}]"),
+                found: format!("{} {:?}", norm_spec.dtype.name(), norm_spec.shape),
+            });
+        }
+        let norm_bytes = source
+            .read(&norm_name)
+            .map_err(|error| source_error(&norm_name, error))?;
+        let norm_expected = norm_spec.dtype.storage_bytes(HIDDEN);
+        if norm_bytes.len() != norm_expected {
+            return Err(StagingError::Bytes {
+                name: norm_name.clone(),
+                expected: norm_expected,
+                found: norm_bytes.len(),
+            });
+        }
+        let ffn_norm = if norm_spec.dtype == DType::F32 {
+            bytes_to_f32(&norm_name, &norm_bytes)?
+        } else {
+            bytes_to_bf16_f32(&norm_name, &norm_bytes)?
+        };
+        let hc_base_kernel = bias_into_kernel_rows(&hc_base);
+        let digests = vec![
+            digest(&fn_name, &fn_bytes),
+            digest(&base_name, &base_bytes),
+            digest(&scale_name, &scale_bytes),
+            digest(&norm_name, &norm_bytes),
+        ];
+        let buffer_digests = vec![
+            digest(
+                &format!("buffer predictor <- {fn_name}"),
+                &f32_bytes(&predictor),
+            ),
+            digest(
+                &format!("buffer hc_scale <- {scale_name}"),
+                &f32_bytes(&hc_scale),
+            ),
+            digest(
+                &format!("buffer hc_base <- {base_name}"),
+                &f32_bytes(&hc_base_kernel),
+            ),
+            digest(
+                &format!("buffer rms_weight <- {norm_name}"),
+                &f32_bytes(&ffn_norm),
+            ),
+        ];
+        Ok(Self {
+            layer,
+            predictor,
+            released_fn,
+            hc_base,
+            hc_scale,
+            ffn_norm,
+            hc_base_kernel,
+            digests,
+            buffer_digests,
+        })
+    }
+
+    /// The retained host bytes of the staged tensors.
+    #[must_use]
+    pub fn host_bytes(&self) -> u64 {
+        self.predictor.len() as u64 * 4
+            + self.released_fn.len() as u64 * 4
+            + self.hc_base.len() as u64 * 4
+            + self.hc_scale.len() as u64 * 4
+            + self.ffn_norm.len() as u64 * 4
+    }
+}
+
 impl LayerStaging {
     /// Reads one layer's released mHC tensors through a WeightSource.
     ///

@@ -684,9 +684,108 @@ prints no separate launch-status line. `staging_ms=751` and `host_ms=21219` are 
 host-continuation totals. Only `MhcEntry` is device-executed
 per layer; the 8 device-status stages and the head remain host stand-ins/host seams, and the BF16
 residual staging seam makes the chain non-bit-identical to the reference by construction. The
-result is **chain-wiring parity**, not a device token; criterion 1 remains **OPEN**. c3b is
-task-13: defer each layer's `ffn_epilogue` into the next device entry so the real B/C/Y path is
-exercised and the host stand-ins drop 8 -> 7.
+result is **chain-wiring parity**, not a device token; criterion 1 remains **OPEN**.
+
+**M3-c c3b — device post and the deferred FFN epilogue (window b29 PASS).** c3b keeps
+the c3 command shape and the in-process reference comparison. It adds a second device launch per
+layer, `MhcPost`, after host attention: the kernel writes the post-attention residual `A_l` and
+publishes the 24 FFN coefficients plus the normalized FFN input capture that the host FFN consumes.
+It also defers each layer's FFN epilogue into the next layer's device `MhcEntry` step 1, so layers
+1..39 consume the real previous-layer FFN `B/C/A/Y` rows instead of the identity seed; layer 0's
+identity entry is the only primary identity entry (the two Engram re-entries are counted in the 42).
+The count is 42 `MhcEntry` + 40 `MhcPost` launches
+per token (82): the released config's Engram layers 1 and 14 each run the real B/C/Y mixer device,
+apply Engram on the host readback, then run a second identity device entry, because Engram adds
+between the fused kernel's step 1 and step 2 and cannot be host-inserted mid-call. Engram is a
+declared host seam, not device. 39 FFN epilogue additions are deferred and layer 39's remains host
+because there is no next entry. Device-status host stand-ins drop from 8 to 7 (`mhc_post` is now
+device). The report
+prints per-layer `entry_us`/`post_us`/`device_us` and a fractional `device_ms` total, not an
+integer-truncated millisecond column. The host-control engine test proves the deferred order
+bit-for-bit against `prefill` and a perturbed-post-coefficient test requires the chain output to
+change; the device arm compares both step outputs, both captures, both coefficient sets, both
+`1/rms` values and the FP8 codes/scales against the host twins before continuing. The claim is
+still **CHAIN-WIRING parity**, not a device-token result; criterion 1 remains **OPEN**.
+
+Window b29 passed the c3b arm on `sparkflash_m3c_c3b_dc1b451_aarch64` (sha256
+`e7959c4595b6d7fba063faa0a1bf7bb0fb9894401fb2df2b678e241a11e13680`) at
+2026-10-19T05:13:49Z: `reference_id=5 hybrid_id=5 exact_equal=true top5_overlap=5`, verdict
+`CHAIN-WIRING token parity: PASS ... criterion 1 remains OPEN`; logs
+`window-b29-20261019T051140Z.log` and `runs29/c3b-hybrid-token0.log`, vLLM restored. Chain totals:
+`layers=40 entry_launches=42 post_launches=40 device_launches=82 engram_split_layers=2
+device_us=19656 device_ms=19.656 staging_ms=1050 host_ms=21194 total_chain_ms=23973
+host_bytes=61658960 staged_matrix_bytes=237580480 cubin_bytes=70312 device_buffer_bytes=2064352`.
+The 42 entries are 40 layer entries plus 2 Engram identity entries; the 40 posts are one per layer.
+`device_us` is host wall-clock around the 82 launches and readbacks, reported in microseconds and
+as fractional `device_ms`, so the c3 integer truncation cannot recur; `entry_us` at the Engram
+layers sums the two device intervals and excludes the host Engram work. The layer-0 identity entry
+is the only primary identity entry (the two Engram re-entries are counted in the 42); `mhc_post` is device on all 40 layers; `ffn_epilogue` is 39 deferred
+additions plus 1 host addition at layer 39; the 7 remaining device-status host stand-ins are named
+above. The device path and claim are unchanged by the two pre-window host-twin fixes recorded in
+`docs/build/device-forward-chain.md` (b27 post-predictor row order, b28 Engram input-readback);
+neither window is a device result. Task-13 closes with b29.
+
+
+**M3-c c4a-1 — device attention projections (window b31 PASS).** c4a-1 replaces the five host f32
+attention projections with the device B12x MXFP8 GEMMs: 3 launches/layer for `wq_a`+`wq_b`+`wkv`
+and 2 launches/layer for `wo_a`+`wo_b`, 200 attention launches, 282 chain launches with the 42
+MhcEntry and 40 MhcPost. The m14 flash-MLA body is still a declared HOST stand-in; `wo_a` consumes
+exactly the host m14 output. The declared host seams that remain inside attention are q_norm,
+kv_norm, RoPE, the D8 quantisers, the KV cache/window round-trip, the compressor/cache, the
+indexer/selected-list assembly, the m14 body and the inverse RoPE. The 5 remaining device-status host
+stand-ins are `attention/m14`, `moe_router`, `moe_gate_up`, `moe_down_combine` and
+`shared_expert_gate`. The engine D8 quantiser is pinned byte-identical to
+`m4_quant::act_quant_fp8_row` by `crates/sparkflash-cli/tests/attention_quant.rs`.
+
+Window b31 passed on `sparkflash_m3c_c4a1_c40ed50_aarch64` (sha256
+`7c4078595638a5d0f0a8734447f68f2fd970ebbd34fc76bc5402525ebdf5ec7e`) at
+2026-10-19T05:33:45Z: `reference_id=5 hybrid_id=5 exact_equal=true top5_overlap=5`, verdict
+`CHAIN-WIRING token parity: PASS ... criterion 1 remains OPEN`; logs
+`window-b31-20261019T053137Z.log` and `runs31/c4a1-hybrid-token0.log`, vLLM restored. Attention
+totals: `launches=200 staging_ms=6326 device_us=536822 staged_matrix_bytes=5069568000
+host_bytes=5994560 cubin_bytes=20880 device_buffer_bytes=42083328`. Chain totals: `layers=40
+entry_launches=42 post_launches=40 attention_launches=200 device_launches=282 engram_split_layers=2
+device_us=556036 device_ms=556.036 staging_ms=7033 host_ms=20658 total_chain_ms=23585
+host_bytes=67653520 staged_matrix_bytes=5307148480 cubin_bytes=91192 device_buffer_bytes=44147680`.
+The measured projection cost is 13.4 ms/layer for the five launches (2.68 ms/launch average) at
+row 1, and the measured staging was 7.0 s for the 5.07 GB cumulative matrix bytes; both are row-1
+measurements, not residency or throughput claims. The claim label is unchanged: **CHAIN-WIRING
+parity**, not a device-token result; criterion 1 remains **OPEN**.
+
+**M3-c c4a-2 — device format-2 attention body (window b33 PASS; b32 failure record).** c4a-2 puts
+the real `flash_mla_csa2_sm121` format-2 body on the device at position 0: one launch per layer,
+64 head blocks of 256 threads, 40 body launches on top of the 200 projections, 42 MhcEntry and 40
+MhcPost (322 total). The 20 ratio-1 layers have `compress_len=1` at position 0, so the backend also
+uploads the single reachable compressed candidate (the host FP4 row re-encoded with
+`quantize_main_kv`, pool position 0, selected `[0]`) and launches the same format-2 kernel. The
+512-candidate / 640-slot regime is **not exercised**; the other 20 layers (ratio 0 or 2) have no
+compressed candidate. Attention host seams remain q_norm, kv_norm, RoPE, window row construction,
+compressor/cache, selected-list assembly, indexer scoring (zeros/sentinels; writes ignored), inverse
+RoPE and the D8 quantisers. The remaining per-layer device-status host stand-ins are
+`moe_router`, `moe_gate_up`, `moe_down_combine` and `shared_expert_gate` (4).
+
+Window b32 (first c4a-2 binary `sparkflash_m3c_c4a2_ede89a9_aarch64`, sha256 `e9dfe712...`)
+passed the token comparison but reported `body_launches=20`/`device_launches=302`: the 20 ratio-1
+layers were rejected by the old `compressed_stride == 0` guard and silently fell back to the host
+sparse loop, and the per-layer ledger still carried the stale c4a-1 host label. It is kept as a
+**failure record**, not a PASS. The fix adds the one-candidate compressed path, per-layer launch
+counts, a per-layer ledger label derived from those counts, and a report guard that refuses the
+c4a-2 seam line/totals if any layer's body count is not 1; a 40-layer host-control test asserts 40
+body calls.
+
+Window b33 on `sparkflash_m3c_c4a2_b2_aarch64` (sha256
+`73c13ca597eb8d0039091142225ef7b93dc8a23c71aecb5d85d21386d41226de`, source `ee3bdd8`) at
+2026-10-19T05:59:29Z: `reference_id=5 hybrid_id=5 exact_equal=true top5_overlap=5`, verdict
+`CHAIN-WIRING token parity: PASS ... criterion 1 remains OPEN`; logs `window-b33-20261019T055723Z.log`,
+`runs33/c4a2-hybrid-token0.log`, vLLM restored. Attention totals: `projection_launches=200
+body_launches=40 staging_ms=5876 projection_us=535311 body_us=13980 staged_matrix_bytes=5069568000
+host_bytes=11274640 cubin_bytes=81672 device_buffer_bytes=46658816`. Chain totals: `layers=40
+entry_launches=42 post_launches=40 attention_projection_launches=200 attention_body_launches=40
+device_launches=322 engram_split_layers=2 device_us=568495 device_ms=568.495 staging_ms=6575
+host_ms=19816 total_chain_ms=22450 host_bytes=72933600 staged_matrix_bytes=5307148480
+cubin_bytes=151984 device_buffer_bytes=48723168`. Body cost is 349.5 microseconds/layer at row 1
+(measured, not a throughput claim). Claim unchanged: **CHAIN-WIRING parity, not a device-token
+result; criterion 1 remains OPEN**.
 
 **M3-c — first hybrid token (the first real end-to-end run).**
 9. Implement the per-layer order of design 2.2 with the seams of design 3.1, using the existing

@@ -388,7 +388,9 @@ mod cuda_launcher {
     use sparkflash_kernels::mega_mhc_ref::{HC_MULT, HIDDEN};
 
     use crate::budget::{BudgetAdmission, BudgetError, BudgetRequest};
-    use crate::staging::{EmbedRow, LayerStaging, LayerZeroStaging, MhcBufferPlan};
+    use crate::staging::{
+        EmbedRow, LayerPostStaging, LayerStaging, LayerZeroStaging, MhcBufferPlan,
+    };
     use sparkflash_engine::forward::layer_zero::LayerZeroEntry;
 
     /// Builds the layer-zero host handoff from the mHC kernel's f32 readback buffers.
@@ -849,6 +851,83 @@ mod cuda_launcher {
             copy_layer_tensors(cuda, &buffers, staging)
         }
 
+        /// Copies one layer's released FFN mHC tensors into the already-allocated buffer set,
+        /// leaving X, Y, B, C and A in place. The c3b post call follows an entry call that already
+        /// wrote X and the attention output, so resetting the boundary seed here would destroy the
+        /// post operand; only the predictor/scale/base/norm are replaced.
+        ///
+        /// # Errors
+        /// No staged buffers, driver unavailable, or a copy failure.
+        pub fn restage_layer_post(&mut self, staging: &LayerPostStaging) -> Result<(), String> {
+            let buffers = self.mhc_buffers.ok_or_else(|| {
+                "the mHC buffers are not staged; call stage_layer first".to_string()
+            })?;
+            let cuda = self.cuda.as_ref().ok_or_else(|| {
+                "the CUDA driver is unavailable while restaging a post layer".to_string()
+            })?;
+            cuda.copy_htod(&buffers.predictor, &f32_to_bytes(&staging.predictor))?;
+            cuda.copy_htod(&buffers.hc_scale, &f32_to_bytes(&staging.hc_scale))?;
+            cuda.copy_htod(&buffers.hc_base, &f32_to_bytes(&staging.hc_base_kernel))?;
+            cuda.copy_htod(&buffers.rms_weight, &f32_to_bytes(&staging.ffn_norm))?;
+            Ok(())
+        }
+
+        /// Writes the previous sublayer's B (comb, destination-major in the kernel) and C (post)
+        /// coefficients for the post call. `comb` is the host source-major orientation; it is
+        /// transposed here to the kernel's destination-major layout.
+        ///
+        /// # Errors
+        /// No staged buffers, driver unavailable, or the wrong coefficient lengths.
+        pub fn write_layer_bc(&mut self, post: &[f32], comb: &[f32]) -> Result<(), String> {
+            if post.len() != HC_MULT || comb.len() != HC_MULT * HC_MULT {
+                return Err(format!(
+                    "the B/C rows have {} C and {} B values, expected {HC_MULT} and {}",
+                    post.len(),
+                    comb.len(),
+                    HC_MULT * HC_MULT
+                ));
+            }
+            let buffers = self.mhc_buffers.ok_or_else(|| {
+                "the mHC buffers are not staged, so B/C cannot be written".to_string()
+            })?;
+            let cuda = self
+                .cuda
+                .as_ref()
+                .ok_or_else(|| "the CUDA driver is unavailable while copying B/C".to_string())?;
+            let mut b = vec![0.0f32; HC_MULT * HC_MULT];
+            for destination in 0..HC_MULT {
+                for source in 0..HC_MULT {
+                    b[destination * HC_MULT + source] = comb[source * HC_MULT + destination];
+                }
+            }
+            cuda.copy_htod(&buffers.b_prev, &f32_to_bytes(&b))?;
+            cuda.copy_htod(&buffers.c_prev, &f32_to_bytes(post))
+        }
+
+        /// Writes the previous sublayer's block output Y as BF16, the format the kernel's y_prev
+        /// buffer holds.
+        ///
+        /// # Errors
+        /// No staged buffers, driver unavailable, or a length other than `HIDDEN * 2`.
+        pub fn write_layer_y_bf16(&mut self, y: &[u8]) -> Result<(), String> {
+            if y.len() != HIDDEN * 2 {
+                return Err(format!(
+                    "the Y row is {} bytes, the staged buffer expects {}",
+                    y.len(),
+                    HIDDEN * 2
+                ));
+            }
+            let buffers = self.mhc_buffers.ok_or_else(|| {
+                "the mHC buffers are not staged, so Y cannot be written".to_string()
+            })?;
+            let cuda = self
+                .cuda
+                .as_ref()
+                .ok_or_else(|| "the CUDA driver is unavailable while copying Y".to_string())?;
+            cuda.copy_htod(&buffers.y_prev, y)
+                .map_err(|error| format!("copy the Y row: {error}"))
+        }
+
         /// Writes the BF16 X stream for one layer into the staged X buffer.
         ///
         /// c3 builds the bytes from the previous layer's host residual, so the caller owns the
@@ -1113,9 +1192,9 @@ mod cuda_launcher {
 
     impl DeviceLauncher for CudaLauncher {
         fn launch(&mut self, call: DeviceStageCall) -> Result<(), DeviceLaunchError> {
-            // Only the layer-0 entry weights are staged. The post-mix needs a coefficient handoff
-            // that does not exist yet, so it must refuse rather than reuse the entry buffers.
-            if call.stage == ChainStage::MhcPost {
+            // The post call reuses the mHC buffer set, but only after an entry call has allocated
+            // and staged it. Without that allocation it is refused before any driver work.
+            if call.stage == ChainStage::MhcPost && self.mhc_buffers.is_none() {
                 return Err(DeviceLaunchError::NotStaged {
                     kernel: call.kernel,
                 });
@@ -1128,7 +1207,7 @@ mod cuda_launcher {
                         kernel: call.kernel,
                     })?;
             match call.stage {
-                ChainStage::MhcEntry => {
+                ChainStage::MhcEntry | ChainStage::MhcPost => {
                     let buffers = self.mhc_buffers.ok_or(DeviceLaunchError::NotStaged {
                         kernel: call.kernel,
                     })?;
@@ -1153,9 +1232,6 @@ mod cuda_launcher {
                     cuda.free(module, &[]);
                     result
                 }
-                ChainStage::MhcPost => Err(DeviceLaunchError::NotStaged {
-                    kernel: call.kernel,
-                }),
                 ChainStage::MoeRouter | ChainStage::MoeGateUp => Err(DeviceLaunchError::NotWired {
                     kernel: call.kernel,
                 }),

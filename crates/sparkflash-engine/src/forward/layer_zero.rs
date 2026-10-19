@@ -643,6 +643,42 @@ pub fn kernel_mhc_update(
     updated
 }
 
+/// The kernel's actual step-1 instruction order, for a non-identity B/C row: the first B product is
+/// the one plain multiplication, the C Y term is fused into it, and the remaining B terms are fused
+/// in stream order. [kernel_mhc_update] is the source-level order (C Y first, then every B term
+/// fused) and matches the kernel only on the identity seed; the c3b deferred entry and post calls
+/// consume real previous-layer B/C rows, so their host twin must use this order.
+#[must_use]
+pub fn kernel_mhc_update_fused(
+    x_prev: &[f32],
+    b_prev: &[f32],
+    c_prev: &[f32],
+    y_prev: &[f32],
+) -> Vec<f32> {
+    let hc = KERNEL_HC_MULT;
+    let width = y_prev.len();
+    assert_eq!(
+        x_prev.len(),
+        hc * width,
+        "X must hold {hc} streams of {width} values"
+    );
+    assert_eq!(b_prev.len(), hc * hc, "B must be {hc} x {hc}");
+    assert_eq!(c_prev.len(), hc, "C must hold {hc} values");
+    let mut updated = vec![0.0f32; hc * width];
+    for stream in 0..hc {
+        for column in 0..width {
+            let mut value = b_prev[stream * hc] * x_prev[column];
+            value = c_prev[stream].mul_add(y_prev[column], value);
+            for source in 1..hc {
+                value =
+                    b_prev[stream * hc + source].mul_add(x_prev[source * width + column], value);
+            }
+            updated[stream * width + column] = value;
+        }
+    }
+    updated
+}
+
 /// The kernel's step-2 `X_hat = A .* X_l`, in the kernel's FMA order.
 ///
 /// `x_l` is the unrounded f32 update that the kernel keeps in registers (the BF16 write of X_l
@@ -1515,6 +1551,24 @@ mod tests {
         assert_eq!(capture, vec![0.25, -0.75]);
         assert_eq!(bf16_round(1.0), 1.0);
         assert_eq!(bf16_round(f32::from_bits(0x3f80_8000)), 1.0);
+    }
+
+    #[test]
+    fn the_fused_kernel_update_rounds_the_first_b_product() {
+        // The pinned kernel's step 1 per stream is q = b[s][0]*x[0] (rounded), then
+        // fma(c[s], y, q), then the remaining B terms fused. This case separates that order from
+        // the source-level C-Y-first order that [kernel_mhc_update] implements.
+        let x = [1.0f32, 0.0, 0.0, 0.0];
+        let mut b = [0.0f32; 16];
+        b[0] = -(1.0f32 + 2f32.powi(-22));
+        let mut c = [0.0f32; 4];
+        c[0] = 1.0f32 + 2f32.powi(-23);
+        let y = [1.0f32 + 2f32.powi(-23)];
+        let fused = kernel_mhc_update_fused(&x, &b, &c, &y);
+        let source_order = kernel_mhc_update(&x, &b, &c, &y);
+        assert_eq!(fused[0], 2f32.powi(-46));
+        assert_eq!(source_order[0], 0.0);
+        assert_ne!(fused[0].to_bits(), source_order[0].to_bits());
     }
 
     /// The layer-0 boundary seed, exposed to this module's tests without a device type.
