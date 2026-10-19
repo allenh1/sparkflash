@@ -73,6 +73,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
@@ -434,6 +435,25 @@ fn run() -> Result<(), String> {
 
     // Read the selected experts' released tensors once; the rank slices are cut from these bytes.
     let expert_table = read_expert_tensors(&mut snap, &prefix, &table_rows)?;
+    let names_read: BTreeSet<String> = snap.read_names().into_iter().collect();
+    let mut missing_names = 0usize;
+    for (_, expert) in &table_rows {
+        for name in expert_tensor_names(&prefix, *expert as u32) {
+            if !names_read.contains(&name) {
+                missing_names += 1;
+            }
+        }
+    }
+    Verdict::push(
+        &mut verdicts,
+        "stage 2: staged expert tensor names are the released global ids",
+        missing_names == 0,
+        format!(
+            "{missing_names} of {} expected released expert tensor names missing from the {} names actually read",
+            table_rows.len() * 6,
+            names_read.len()
+        ),
+    );
     println!(
         "expert bytes: {} experts x (w1/w3/w2 weights + scales), {} B read verbatim from released tensors",
         expert_table.len(),
@@ -500,6 +520,12 @@ fn run() -> Result<(), String> {
         cuda.copy_htod(&w_up_d, &w_up)?;
         cuda.copy_htod(&s_up_d, &s_up)?;
         cuda.copy_htod(&ids_d, &u32s_to_bytes(&local_ids))?;
+        // cuMemAlloc does not promise zeroed pages. Prefill both output buffers with 0xFFFF before
+        // the first launch, so the "columns 576..640 exactly zero" check cannot pass on recycled or
+        // zeroed pages if a launch stopped writing the padding.
+        let nonzero_fill = vec![0xFFu8; out_values * 2];
+        cuda.copy_htod(&gate_out_d, &nonzero_fill)?;
+        cuda.copy_htod(&up_out_d, &nonzero_fill)?;
         let base = GateUpLaunchParams {
             act_fp8: act_d,
             act_scales: act_s_d,
@@ -891,7 +917,7 @@ fn run() -> Result<(), String> {
 
     if args.repeat > 0 {
         println!(
-            "repeat requested ({}) but m17a makes no timing claim; use the per-stage launch counts printed above for cost arithmetic",
+            "repeat requested ({}) but m17a makes no timing claim; the per-stage launch counts are structure (the stages run each launch twice for determinism), not a measured cost",
             args.repeat
         );
     }
@@ -1019,6 +1045,24 @@ impl ExpertTensors {
     }
 }
 
+/// The six released tensor names of one routed expert, keyed by its GLOBAL released expert id.
+///
+/// The staging table maps a local id to the released id; only this function builds tensor names, and
+/// a window finding showed why that matters: swapping the global id for the local id in a copy left
+/// every test green because the twin consumes whatever bytes were staged. The run asserts the names
+/// actually read against [expert_tensor_names], and the unit test pins the format.
+fn expert_tensor_names(prefix: &str, expert: u32) -> [String; 6] {
+    let base = format!("{prefix}.ffn.experts.{expert}");
+    [
+        format!("{base}.w1.weight"),
+        format!("{base}.w1.scale"),
+        format!("{base}.w3.weight"),
+        format!("{base}.w3.scale"),
+        format!("{base}.w2.weight"),
+        format!("{base}.w2.scale"),
+    ]
+}
+
 fn read_expert_tensors(
     snap: &mut Snapshot,
     prefix: &str,
@@ -1026,14 +1070,14 @@ fn read_expert_tensors(
 ) -> Result<Vec<ExpertTensors>, String> {
     let mut experts = Vec::with_capacity(table.len());
     for (local, expert) in table {
-        let base = format!("{prefix}.ffn.experts.{expert}");
+        let names = expert_tensor_names(prefix, *expert as u32);
         experts.push(ExpertTensors {
-            w1: snap.read_raw(&format!("{base}.w1.weight"), "I8", &[INTER, PACKED_ROW])?,
-            s1: snap.read_raw(&format!("{base}.w1.scale"), "F8_E8M0", &[INTER, SCALE_ROW])?,
-            w3: snap.read_raw(&format!("{base}.w3.weight"), "I8", &[INTER, PACKED_ROW])?,
-            s3: snap.read_raw(&format!("{base}.w3.scale"), "F8_E8M0", &[INTER, SCALE_ROW])?,
-            w2: snap.read_raw(&format!("{base}.w2.weight"), "I8", &[HIDDEN, IN_PACKED])?,
-            s2: snap.read_raw(&format!("{base}.w2.scale"), "F8_E8M0", &[HIDDEN, IN_SCALES])?,
+            w1: snap.read_raw(&names[0], "I8", &[INTER, PACKED_ROW])?,
+            s1: snap.read_raw(&names[1], "F8_E8M0", &[INTER, SCALE_ROW])?,
+            w3: snap.read_raw(&names[2], "I8", &[INTER, PACKED_ROW])?,
+            s3: snap.read_raw(&names[3], "F8_E8M0", &[INTER, SCALE_ROW])?,
+            w2: snap.read_raw(&names[4], "I8", &[HIDDEN, IN_PACKED])?,
+            s2: snap.read_raw(&names[5], "F8_E8M0", &[HIDDEN, IN_SCALES])?,
         });
         if *local % 64 == 0 || *local + 1 == table.len() {
             println!(
@@ -1373,5 +1417,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_staged_expert_names_use_the_global_released_id() {
+        let names = expert_tensor_names("layers.0", 250);
+        for name in &names {
+            assert!(
+                name.starts_with("layers.0.ffn.experts.250."),
+                "{name}: the staged name must be the global released id"
+            );
+        }
+        let suffixes: Vec<&str> = names
+            .iter()
+            .map(|name| name.rsplit_once(".ffn.experts.250.").unwrap().1)
+            .collect();
+        assert_eq!(
+            suffixes,
+            [
+                "w1.weight",
+                "w1.scale",
+                "w3.weight",
+                "w3.scale",
+                "w2.weight",
+                "w2.scale"
+            ]
+        );
+        // A local id must never appear in a staged name.
+        assert!(!names.iter().any(|name| name.contains(".ffn.experts.3.")));
     }
 }

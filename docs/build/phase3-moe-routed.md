@@ -2,9 +2,13 @@
 
 ## Status
 
-**PASS at both token counts (window b27).** The harness ran the routed branch's four released kernel
-stages on released layer-0 bytes and all declared checks passed at tokens 8 and 130: 30 checks per
-run, four pinned cubins. The F6 routing-weight host seam is declared and measured as such, and
+**PASS at both token counts (window b27, then hardened for batch 16).** The harness ran the routed
+branch's four released kernel stages on released layer-0 bytes and all declared checks passed at
+tokens 8 and 130: 30 checks per run, four pinned cubins. Batch 16 folds in two non-blocking review
+findings (an output-buffer prefill and a staged-tensor-name assertion, below); that source adds a 31st
+check and window b30 measured it at both token counts. b27 therefore stays the pre-hardening record
+tied to binary `cc1a1d01...`, and the hardened binary's PASS is b30. The F6 routing-weight host seam is
+declared and measured as such, and
 DECISIONS D32 records it; nothing here claims a fully-device weighted routed block.
 
 History: window b26 (the first binary) PASSed stages 1-3 at both token counts and then panicked inside
@@ -16,7 +20,11 @@ Source: `crates/sparkflash-kernels/examples/m17_moe_a.rs`, aarch64 binary
 `m17_moe_a_cc1a1d01_aarch64` (4,040,960 B, sha256
 `cc1a1d01f46d633a76bef14072a1a3645acd38b37a65c1f25f7ee0e4913f82e2`),
 built by `scripts/build-aarch64.sh --example=m17_moe_a` from branch
-`task/m17-moe-a` commit a9221b8 (based on `origin/main` 5416ccf). The four pinned cubins were already
+`task/m17-moe-a` commit a9221b8 (based on `origin/main` 5416ccf) for b27, and rebuilt as
+`m17_moe_a_f3476b5a_aarch64` (4,153,704 B, sha256
+`f3476b5a22b39c9df39b6cedbeb36e74f3025f3729dcc9fb7140754f47cc8f84`) from `task/m17b-shared` rebased
+onto the current main for the batch-16 hardening; window b30 measures the hardened binary. The four
+pinned cubins were already
 exercised by earlier windows (router m9, gate/up window b6, the combine in the M7 stages, the SwiGLU
 quantiser in the stage-8 B1 probe); what is new here is the four-stage composition at the released
 geometry on released checkpoint bytes.
@@ -26,15 +34,16 @@ geometry on released checkpoint bytes.
 One harness runs the routed branch's four released kernel stages on one node, in the released order,
 with the released checkpoint bytes:
 
-| # | stage | kernel | cubin pin | launches |
+| # | stage | kernel | cubin pin | launches (one pass) |
 | :-- | :--- | :--- | :--- | :--- |
 | 1 | router | `moe_router_sm121` | 37,384 B / `5992cef9...` | 1 |
 | 2 | gate/up | `routed_gate_up_sm121` | 9,752 B / `115200d2...` | 8 (4 ranks x 2 projections) |
 | 3 | SwiGLU + MXFP8 quantise | `swiglu_mxfp8_quant_sm121` | 21,776 B / `4dbef63b...` | 4 (one per rank slice) |
 | 4 | down/combine | `b12x_mxfp4_moe_sm121` | 10,048 B / `36a15a4f...` | 4 (serial rank chain) |
 
-Every cubin is refused by size and sha256 before any device allocation; a mismatch is an error
-before the path is measured, never a tolerance. The router and gate/up pins come from their typed
+Each stage runs its launches twice (determinism), so a full run makes 2/16/8/8 launches; the table
+counts one pass. Every cubin is refused by size and sha256 before any device allocation; a mismatch is
+an error before the path is measured, never a tolerance. The router and gate/up pins come from their typed
 ABI modules; the quantiser and combine pins are stated in the harness against
 `baseline/kernel_baseline.txt` because those kernels are reached through their launch
 modules, not a typed ABI.
@@ -108,8 +117,8 @@ The seam is therefore explicit and its crossing values are printed by the harnes
 The combine is therefore **weighted but its activation operand is host-quantised by the same rule
 the reference uses**; the stage-3 device codes are not the combine's input, because
 weight-multiplying already-quantised codes would quantise twice and is not the model's order. This is
-recorded as the F6 decision entry D32 (it assumes m16's D31 lands first as batch 14, so the numbering does not collide)
-and the NOT-claimed list excludes a fully-device weighted routed block.
+recorded as the F6 decision entry D32 (m16's D31 landed as batch 14; D32 is the next number), and the
+NOT-claimed list excludes a fully-device weighted routed block.
 
 Planned follow-up, per the Lead's decision: after m17a passes, the natural next step is a weighted
 SwiGLU+quantise variant (same source with an optional per-expert weight operand, new cubin and a
@@ -118,11 +127,16 @@ head). It is not part of m17a and no kernel was changed here.
 
 ## Window command
 
+Window b27 ran binary `m17_moe_a_cc1a1d01_aarch64`; the batch-16 binary is
+`m17_moe_a_f3476b5a_aarch64` (4,153,704 B, sha256
+`f3476b5a22b39c9df39b6cedbeb36e74f3025f3729dcc9fb7140754f47cc8f84`) and ran the same two commands
+in window b30.
+
 ```sh
 cd ~/phase2-evidence/window-2026-10-18/bin
-./m17_moe_a_cc1a1d01_aarch64 --checkpoint ~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170 \
+./m17_moe_a_f3476b5a_aarch64 --checkpoint ~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170 \
     --cubin-dir ~/phase2-evidence/window-2026-10-18/cubins --tokens 8 --layer 0 --floor-gib 32
-./m17_moe_a_cc1a1d01_aarch64 --checkpoint ~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170 \
+./m17_moe_a_f3476b5a_aarch64 --checkpoint ~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170 \
     --cubin-dir ~/phase2-evidence/window-2026-10-18/cubins --tokens 130 --layer 0 --floor-gib 32
 ```
 
@@ -133,11 +147,16 @@ MemAvailable floor is checked at start, before/after each launch, before/after e
 the lowest reading in the window was 113.8 GiB at the tokens-130 end, and the node needs vLLM stopped
 as usual for a window.
 
+Measured wall time in b30 (hardened binary): tokens 8 ran 05:14:35 -> 05:14:47Z (12 s, 37 distinct
+experts) and tokens 130 ran 05:14:47 -> 05:17:30Z (163 s, 148 distinct experts); the same host twins and checkpoint reads run as in b27; the harness makes no timing claim, so the page
+records the wall times without attributing them to a component. The lowest MemAvailable reading was
+113.6 GiB during the tokens-130 stage-4 chain.
+
 ## Host dry run and tests
 
-`cargo test -p sparkflash-kernels --example m17_moe_a`: 19 tests pass (the shared b2_harness
-suite plus five m17 tests: argument parsing of the documented command, the local expert table,
-disjoint rank slices covering the stored rows, the padding check counting only columns after 576, and
+`cargo test -p sparkflash-kernels --example m17_moe_a`: 20 tests pass (the shared b2_harness
+suite plus six m17 tests: argument parsing of the documented command, the local expert table,
+disjoint rank slices covering the stored rows, the padding check counting only columns after 576, the staged-tensor-name format, and
 the regression test for the stage-4 activation assembly that window b26 caught). `cargo clippy -p sparkflash-kernels --example m17_moe_a -- -D warnings` is clean. The
 workspace gates are run before review. No device code path is executed by these tests.
 
@@ -185,7 +204,7 @@ comparison class, pin, claim or kernel changed. The rebuilt binary is the one us
 a9221b8. The window script printed that sha256 before the b27 runs, so the binary and the record are
 tied.
 
-### Window b27 (2026-10-19): PASS at both token counts
+### Window b27 (2026-10-19): PASS at both token counts (pre-hardening binary `cc1a1d01`)
 
 Window `window-b27-20261019T044614Z.log`, after the window script verified the binary sha
 `cc1a1d01...`:
@@ -199,8 +218,10 @@ Window `window-b27-20261019T044614Z.log`, after the window script verified the b
 
 Both runs: 30 checks, 4 stages, four pinned cubins (each cubin's size and sha256 printed by the
 harness before allocation: router 37,384 B / `5992cef9...`, gate/up 9,752 B / `115200d2...`, SwiGLU
-quantiser 21,776 B / `4dbef63b...`, combine 10,048 B / `36a15a4f...`). The exact per-run records
-from `runs27/m17a-tokens8.log` and `runs27/m17a-tokens130.log`:
+quantiser 21,776 B / `4dbef63b...`, combine 10,048 B / `36a15a4f...`). The blocks below are curated
+excerpts of the per-run records from `runs27/m17a-tokens8.log` and `runs27/m17a-tokens130.log` (the
+full logs hold every class text and MemAvailable line); the batch-16 hardening adds a 31st check and
+is measured separately in window b30 below.
 
 #### tokens 8 (48 routed rows, 37 distinct experts, 695,623,680 released expert bytes read)
 
@@ -303,6 +324,138 @@ gate/up bf16 [rows][640] per rank -> host SwiGLU -> routing weight -> `routed_ac
 [rows][640] E4M3 + [rows][20] ue8m0 per rank). Peak use stayed far under the 32-GiB floor
 (MemAvailable 116.6 -> 115.5 GiB across tokens 8, 116.4 -> 113.8 GiB across tokens 130). The
 decision record for the seam is DECISIONS D32.
+
+### Window b30 (2026-10-19): PASS at both token counts (hardened harness)
+
+Window `window-b30-20261019T051153Z.log` (chained after b29; it stopped vLLM during b29's restart and
+restarted it at the end). The window script verified the binary sha256 before the runs
+(`f3476b5a22b39c9df39b6cedbeb36e74f3025f3729dcc9fb7140754f47cc8f84`), and each of the four cubins'
+size and sha256 is printed before allocation.
+
+```text
+=== window b30 (m17a hardened rerun, chained after b29) start 2026-10-19T05:11:53Z host=node0 ===
+=== RUN m17a-hardened-tokens8 start 2026-10-19T05:14:35Z
+=== RUN m17a-hardened-tokens8 exit=0 end 2026-10-19T05:14:47Z
+=== RUN m17a-hardened-tokens130 start 2026-10-19T05:14:47Z
+=== RUN m17a-hardened-tokens130 exit=0 end 2026-10-19T05:17:30Z
+=== all runs complete 2026-10-19T05:17:30Z ===
+=== restarting vLLM 2026-10-19T05:17:30Z ===
+started tmux session vllm-window; waiting for health
+```
+
+The restart was initiated at 05:17:30Z and the log tail ends at "waiting for health"; the window log
+does not record a health exit, so this page does not claim one.
+
+#### tokens 8 (hardened: 31 checks, 37 distinct experts, 695,623,680 released expert bytes read)
+
+```text
+MemAvailable at m17a start: 123187088 kB (117.5 GiB), floor 32 GiB - ok
+  check stage 1: device ids exact vs twin: ok (0 mismatched selections of 48)
+  check stage 1: scores within 1e-6 / 8 ULP: ok (max abs delta 1.1920928955078125e-7 at 1207, max ULP 1)
+  check stage 1: weights within 1e-6 / 16 ULP: ok (max abs delta 5.960464477539063e-8 at 42, max ULP 2)
+  check stage 1: two launches byte-identical: ok (12672 raw output bytes compared)
+stage 1 selection: 48 routed rows; 37 distinct experts over the batch; ids/weights/scores read back
+routed expert table: 37 distinct experts selected by the device router, staged as local ids 0..37; every later stage indexes this table, and the mapping is printed below
+activation stand-in: 8 embed rows x 5120 bf16 values, D8-quantised to 40960 E4M3 bytes + 1280 ue8m0 bytes
+  check stage 2: staged expert tensor names are the released global ids: ok (0 of 222 expected released expert tensor names missing from the 225 names actually read)
+expert bytes: 37 experts x (w1/w3/w2 weights + scales), 695623680 B read verbatim from released tensors
+  check stage 2 rank 0: both projections bit-identical: ok (0 mismatched bf16 values of 61440, first at None)
+  check stage 2 rank 0: columns 576..640 exactly zero: ok (0 nonzero padding values)
+  check stage 2 rank 0: two launches byte-identical: ok (61440 gate + 61440 up bytes compared per projection)
+  check stage 2 rank 1: both projections bit-identical: ok (0 mismatched bf16 values of 61440, first at None)
+  check stage 2 rank 1: columns 576..640 exactly zero: ok (0 nonzero padding values)
+  check stage 2 rank 1: two launches byte-identical: ok (61440 gate + 61440 up bytes compared per projection)
+  check stage 2 rank 2: both projections bit-identical: ok (0 mismatched bf16 values of 61440, first at None)
+  check stage 2 rank 2: columns 576..640 exactly zero: ok (0 nonzero padding values)
+  check stage 2 rank 2: two launches byte-identical: ok (61440 gate + 61440 up bytes compared per projection)
+  check stage 2 rank 3: both projections bit-identical: ok (0 mismatched bf16 values of 61440, first at None)
+  check stage 2 rank 3: columns 576..640 exactly zero: ok (0 nonzero padding values)
+  check stage 2 rank 3: two launches byte-identical: ok (61440 gate + 61440 up bytes compared per projection)
+  check stage 3 rank 0: E4M3 codes bit-exact: ok (0 mismatched of 30720)
+  check stage 3 rank 0: ue8m0 scales bit-exact: ok (0 mismatched of 960)
+  check stage 3 rank 0: two launches byte-identical: ok (30720 code + 960 scale bytes compared)
+  check stage 3 rank 1: E4M3 codes bit-exact: ok (0 mismatched of 30720)
+  check stage 3 rank 1: ue8m0 scales bit-exact: ok (0 mismatched of 960)
+  check stage 3 rank 1: two launches byte-identical: ok (30720 code + 960 scale bytes compared)
+  check stage 3 rank 2: E4M3 codes bit-exact: ok (0 mismatched of 30720)
+  check stage 3 rank 2: ue8m0 scales bit-exact: ok (0 mismatched of 960)
+  check stage 3 rank 2: two launches byte-identical: ok (30720 code + 960 scale bytes compared)
+  check stage 3 rank 3: E4M3 codes bit-exact: ok (0 mismatched of 30720)
+  check stage 3 rank 3: ue8m0 scales bit-exact: ok (0 mismatched of 960)
+  check stage 3 rank 3: two launches byte-identical: ok (30720 code + 960 scale bytes compared)
+  check stage 4: device chain bit-exact vs moe_combine chain: ok (0 mismatched bf16 codes of 40960)
+  check stage 4: two full chains byte-identical: ok (40960 bf16 codes compared)
+MemAvailable at m17a end: 122005776 kB (116.4 GiB), floor 32 GiB - ok
+m17a: PASS (31 checks; 4 stages; tokens 8; four pinned cubins)
+```
+
+#### tokens 130 (hardened: 31 checks, 780 routed rows, 148 distinct experts, 2,782,494,720 released expert bytes read)
+
+```text
+MemAvailable at m17a start: 122955328 kB (117.3 GiB), floor 32 GiB - ok
+  check stage 1: device ids exact vs twin: ok (0 mismatched selections of 780)
+  check stage 1: scores within 1e-6 / 8 ULP: ok (max abs delta 1.1920928955078125e-7 at 1207, max ULP 2)
+  check stage 1: weights within 1e-6 / 16 ULP: ok (max abs delta 5.960464477539063e-8 at 42, max ULP 4)
+  check stage 1: two launches byte-identical: ok (205920 raw output bytes compared)
+stage 1 selection: 780 routed rows; 148 distinct experts over the batch; ids/weights/scores read back
+routed expert table: 148 distinct experts selected by the device router, staged as local ids 0..148; every later stage indexes this table, and the mapping is printed below
+activation stand-in: 130 embed rows x 5120 bf16 values, D8-quantised to 665600 E4M3 bytes + 20800 ue8m0 bytes
+  check stage 2: staged expert tensor names are the released global ids: ok (0 of 888 expected released expert tensor names missing from the 891 names actually read)
+expert bytes: 148 experts x (w1/w3/w2 weights + scales), 2782494720 B read verbatim from released tensors
+  check stage 2 rank 0: both projections bit-identical: ok (0 mismatched bf16 values of 998400, first at None)
+  check stage 2 rank 0: columns 576..640 exactly zero: ok (0 nonzero padding values)
+  check stage 2 rank 0: two launches byte-identical: ok (998400 gate + 998400 up bytes compared per projection)
+  check stage 2 rank 1: both projections bit-identical: ok (0 mismatched bf16 values of 998400, first at None)
+  check stage 2 rank 1: columns 576..640 exactly zero: ok (0 nonzero padding values)
+  check stage 2 rank 1: two launches byte-identical: ok (998400 gate + 998400 up bytes compared per projection)
+  check stage 2 rank 2: both projections bit-identical: ok (0 mismatched bf16 values of 998400, first at None)
+  check stage 2 rank 2: columns 576..640 exactly zero: ok (0 nonzero padding values)
+  check stage 2 rank 2: two launches byte-identical: ok (998400 gate + 998400 up bytes compared per projection)
+  check stage 2 rank 3: both projections bit-identical: ok (0 mismatched bf16 values of 998400, first at None)
+  check stage 2 rank 3: columns 576..640 exactly zero: ok (0 nonzero padding values)
+  check stage 2 rank 3: two launches byte-identical: ok (998400 gate + 998400 up bytes compared per projection)
+  check stage 3 rank 0: E4M3 codes bit-exact: ok (0 mismatched of 499200)
+  check stage 3 rank 0: ue8m0 scales bit-exact: ok (0 mismatched of 15600)
+  check stage 3 rank 0: two launches byte-identical: ok (499200 code + 15600 scale bytes compared)
+  check stage 3 rank 1: E4M3 codes bit-exact: ok (0 mismatched of 499200)
+  check stage 3 rank 1: ue8m0 scales bit-exact: ok (0 mismatched of 15600)
+  check stage 3 rank 1: two launches byte-identical: ok (499200 code + 15600 scale bytes compared)
+  check stage 3 rank 2: E4M3 codes bit-exact: ok (0 mismatched of 499200)
+  check stage 3 rank 2: ue8m0 scales bit-exact: ok (0 mismatched of 15600)
+  check stage 3 rank 2: two launches byte-identical: ok (499200 code + 15600 scale bytes compared)
+  check stage 3 rank 3: E4M3 codes bit-exact: ok (0 mismatched of 499200)
+  check stage 3 rank 3: ue8m0 scales bit-exact: ok (0 mismatched of 15600)
+  check stage 3 rank 3: two launches byte-identical: ok (499200 code + 15600 scale bytes compared)
+  check stage 4: device chain bit-exact vs moe_combine chain: ok (0 mismatched bf16 codes of 665600)
+  check stage 4: two full chains byte-identical: ok (665600 bf16 codes compared)
+MemAvailable at m17a end: 119333484 kB (113.8 GiB), floor 32 GiB - ok
+m17a: PASS (31 checks; 4 stages; tokens 130; four pinned cubins)
+```
+
+The new 31st check reads here as: `0 of 222 expected released expert tensor names missing from the 225
+names actually read` at tokens 8 (37 staged experts x 6 names = 222) and the same at tokens 130; the
+padding checks still read `0 nonzero padding values` on all four ranks now that the buffers started at
+`0xFFFF`. Both runs: 31 checks, 4 stages, four pinned cubins, exit 0.
+
+### Batch-16 hardening (post-b27, non-blocking review findings)
+
+Two LOW findings from the adversarial review of the b27 harness are fixed in batch 16. Neither
+changes a kernel, a class or a claim, but both tighten what a pass proves:
+
+- **Padding prefill.** The gate/up output buffers are prefilled with `0xFFFF` before the first launch,
+  because `cuMemAlloc` does not promise zeroed pages; the "columns 576..640 exactly zero" check can no
+  longer pass on recycled or zeroed pages if a launch stopped writing the padding.
+- **Staged tensor names.** `read_expert_tensors` builds its six names through
+  `expert_tensor_names(prefix, global_id)`, and the run asserts `Snapshot::read_names()` contains every
+  `layers.<l>.ffn.experts.<id>.{w1,w3,w2}.{weight,scale}` for every staged device id; a unit test pins
+  the format. Swapping the global id for the local id in a copy previously left all tests green because
+  the twin consumes whatever bytes were staged.
+
+The hardened harness prints 31 checks (30 from b27 plus the staged-name check). It was rebuilt as
+`m17_moe_a_f3476b5a_aarch64` (4,153,704 B, sha256
+`f3476b5a22b39c9df39b6cedbeb36e74f3025f3729dcc9fb7140754f47cc8f84`) and window b30 measured it at
+tokens 8 and 130: 31 checks each, both exit 0 (record below). The b27 record above belongs to binary
+`cc1a1d01...` and is not extended to the batch-16 binary. DECISIONS D32 points at this record.
 
 ## NOT claimed
 

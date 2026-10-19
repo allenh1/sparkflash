@@ -1472,9 +1472,16 @@ mod tests {
 
     #[test]
     fn the_global_argmax_uses_the_rank_shards_and_global_indices() {
-        // The maximum is only in rank 1, so a per-rank-take(1) argmax (or a first-rank-only scan)
-        // returns the wrong entry: this fixture is what makes the four-shard assembly tested.
-        let per_rank = vec![vec![0.0, 1.0], vec![2.0, 3.0]];
+        // Four rank shards, because the released LM head has four: the maximum is only in rank 1, so
+        // a per-rank-take(1) argmax (or a first-rank-only scan) returns the wrong entry. The second
+        // entry is deliberately in rank 3, so a scan that takes only two of the four shards returns
+        // rank 1's 2.0 instead of rank 3's 2.5 and fails the top-2 assertion.
+        let per_rank = vec![
+            vec![0.0, 1.0],
+            vec![2.0, 3.0],
+            vec![0.5, 0.25],
+            vec![1.5, 2.5],
+        ];
         let (value, at) = global_argmax(&per_rank);
         assert_eq!(value, 3.0);
         assert_eq!(
@@ -1485,11 +1492,16 @@ mod tests {
         let top = top_indices(&per_rank, 2);
         assert_eq!(
             top,
-            vec![VOCAB_PER_RANK + 1, VOCAB_PER_RANK],
-            "the top-2 is in descending value order across the shards"
+            vec![VOCAB_PER_RANK + 1, 3 * VOCAB_PER_RANK + 1],
+            "the top-2 is in descending value order across all four shards"
         );
         // The tie rule still goes to the lower global index across ranks.
-        let tied = vec![vec![1.0, 3.0], vec![3.0, 0.0]];
+        let tied = vec![
+            vec![1.0, 3.0],
+            vec![3.0, 0.0],
+            vec![0.0, 0.0],
+            vec![0.0, 0.0],
+        ];
         let (value, at) = global_argmax(&tied);
         assert_eq!(value, 3.0);
         assert_eq!(

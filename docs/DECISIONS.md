@@ -1817,12 +1817,14 @@ number; `crates/sparkflash-kernels/examples/m17_moe_a.rs` prints the crossed sha
 are m17b and are not covered. No kernel is changed by this entry and no cubin moves; the four cubins
 are the pins already in `baseline/kernel_baseline.txt` (router 37,384 B / `5992cef9...`, gate/up
 9,752 B / `115200d2...`, SwiGLU quantiser 21,776 B / `4dbef63b...`, combine 10,048 B /
-`36a15a4f...`). No device run is claimed by this entry; the m17a window record is appended to the
-doc when the Lead-run window returns.
+`36a15a4f...`). The m17a window b27 PASS is recorded in `docs/build/phase3-moe-routed.md`
+(binary `cc1a1d01...`, tokens 8 and 130, 30 checks each); the batch-16 hardening adds a
+padding-prefill check and a staged-tensor-name check to that harness, measured in window b30
+(31 checks each at tokens 8 and 130).
 
 **Consequence.** A later chain may accept the host seam if it stays honest, or adopt a weighted
 SwiGLU+quantise variant. That variant is the planned follow-up: the same kernel source with an
 optional per-expert weight operand, a new cubin and a deliberate re-pin with its own entry - exactly
-the re-pin pattern used for the certified LM head (m16's D31, which lands first as batch 14; this entry takes D32 and assumes that landing) - and it is the only way to remove this
+the re-pin pattern used for the certified LM head (m16's D31 landed as batch 14; this entry is D32) - and it is the only way to remove this
 seam from the device path. This entry deliberately does not claim a fully-device weighted routed
 block, per-token or per-layer text, or a host-time saving.
