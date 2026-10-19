@@ -176,11 +176,14 @@ pub enum KernelId {
     RoutedGateUp,
     /// rmsnorm_sm121: the standalone final RMSNorm of the serving tail (BF16 in, BF16 out).
     RmsNorm,
+    /// lm_head_reduce_sm121: the device block reduction and argmax over the four certified-head
+    /// shard outputs.
+    LmHeadReduce,
 }
 
 impl KernelId {
     /// Every kernel the shared driver owns, in the order of this enum.
-    pub const ALL: [KernelId; 10] = [
+    pub const ALL: [KernelId; 11] = [
         KernelId::MegaMhcBf16,
         KernelId::Mxfp8Dense,
         KernelId::Mxfp8WoA,
@@ -191,6 +194,7 @@ impl KernelId {
         KernelId::MoeRouter,
         KernelId::RoutedGateUp,
         KernelId::RmsNorm,
+        KernelId::LmHeadReduce,
     ];
 
     /// The cubin symbol of this kernel. Private: callers name the enum, never the symbol.
@@ -206,6 +210,7 @@ impl KernelId {
             KernelId::MoeRouter => "moe_router_sm121",
             KernelId::RoutedGateUp => "routed_gate_up_sm121",
             KernelId::RmsNorm => "rmsnorm_sm121",
+            KernelId::LmHeadReduce => "lm_head_reduce_sm121",
         }
     }
 
@@ -229,6 +234,7 @@ impl KernelId {
             KernelId::MoeRouter => &["moe_router_sm121"],
             KernelId::RoutedGateUp => &["routed_gate_up_sm121"],
             KernelId::RmsNorm => &["rmsnorm_sm121"],
+            KernelId::LmHeadReduce => &["lm_head_reduce_sm121"],
         }
     }
 

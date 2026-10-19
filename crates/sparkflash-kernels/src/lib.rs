@@ -27,6 +27,8 @@ pub mod cert_lm_head_launch;
 pub mod cuda_driver;
 pub mod cuda_harness;
 pub mod engram_head_ref;
+pub mod lm_head_reduce_launch;
+pub mod lm_head_reduce_ref;
 pub mod lm_head_ref;
 pub mod m4_abi;
 pub mod m4_quant;

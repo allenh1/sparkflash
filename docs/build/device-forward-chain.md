@@ -176,12 +176,14 @@ Engine reference: `forward/mod.rs:373` run, `:546` block. Per layer, in order:
 Kernel ABI anchors (main): `KernelId` `cuda_driver.rs:157`; `m4_abi` `MEGA_MHC:854`,
 `MXFP8_DENSE:856`, `MXFP4_MOE:858`, `FLASH_MLA_CSA2:860`, `MXFP8_WO_A:862`,
 `CERT_LM_HEAD:864`, `KERNELS` at `:867` (a six-entry array, frozen by D26). The ratchet baseline
-`crates/sparkflash-kernels/baseline/kernel_baseline.txt` has **eleven** entries: the six m4 kernels,
+`crates/sparkflash-kernels/baseline/kernel_baseline.txt` has **twelve** entries: the six m4 kernels,
 `swiglu_mxfp8_quant_sm121` (host seam, not launched by the chain), its weighted routed variant
 `swiglu_mxfp8_quant_weighted_sm121` (D33; m17a stage 3 loads it, window b33 measured 35 checks
 at both token counts, not wired),
 `moe_router_sm121` (M2 one-launch proof), `routed_gate_up_sm121` (task-8, measured in
-isolation, not wired) and `rmsnorm_sm121` (D34, wired as the c4c final tail norm in b41). The
+isolation, not wired), `rmsnorm_sm121` (D34, wired as the c4c final tail norm in b41) and
+`lm_head_reduce_sm121` (D35; window b44 measured m19 PASS, 17/17; not wired until the cut-over
+lands). The
 chain's six-kernel launch set is unchanged: `mega_mhc_sm121`, `b12x_mxfp8_dense_sm121`,
 `b12x_mxfp4_moe_sm121`, `flash_mla_csa2_sm121`, `b12x_mxfp8_wo_a_sm121`,
 `cert_lm_head_sm121`. Routed gate/up and the shared expert's dense GEMM are device kernels that
@@ -366,11 +368,12 @@ reproduced against the reference" (`roadmap-to-serving.md` section 5.5 item 1). 
 only when **all** hold in one run:
 
 1. exit status 0, and the run actually executed on a device: driver loaded, every cubin sha256
-   printed and equal to the eleven parsed entries of `baseline/kernel_baseline.txt`; the catalog
+   printed and equal to the twelve parsed entries of `baseline/kernel_baseline.txt`; the catalog
    requires nine of them (the six chain kernels plus the router, routed gate/up and `rmsnorm_sm121`,
-   2.2), and the other two - `swiglu_mxfp8_quant_sm121` (the host seam's unweighted epilogue) and its
-   weighted routed variant `swiglu_mxfp8_quant_weighted_sm121` (D33, measured in m17a) - are not chain
-   kernels. Device kernel launches > 0 (a host-only run cannot pass);
+   2.2), and the other three - `swiglu_mxfp8_quant_sm121` (the host seam's unweighted epilogue), its
+   weighted routed variant `swiglu_mxfp8_quant_weighted_sm121` (D33, measured in m17a) and the certified
+   head's device reduce `lm_head_reduce_sm121` (D35, m19 measured b44; required only when the cut-over
+   lands) - are not chain kernels. Device kernel launches > 0 (a host-only run cannot pass);
 2. tokens exactly 491, 367, 201, 80, 3302, 201, 54, 201, 4341 (`compare_steps`, `:699`);
 3. head reduction: the reduced argmax over the screen's per-block maxima (host `lm_head_argmax` in
    the first run; lowest-index tie-break `lm_head_ref::best_entry:161`) equals the expected token,
@@ -521,12 +524,14 @@ labelled merged/measured but not wired, the remaining host seams labelled), buil
 set and the plan-vs-ledger self-check
 (fails on missing **and** unplanned seams), and runs through a `ChainOps` backend with
 `chain_execution = false`. `window.rs` accounts the 128-slot rings (67,584 B each, 2,703,360 B
-for 40) and round-trips the oldest-first view; `cubins.rs` parses the eleven baseline pins from
+for 40) and round-trips the oldest-first view; `cubins.rs` parses the twelve baseline pins from
 `kernel_baseline.txt`, requires nine of them (the six chain kernels plus router, routed gate/up and
-the c4c tail `rmsnorm_sm121`) and verifies size and SHA-256 fail-closed; the other two,
-`swiglu_mxfp8_quant_sm121` (the host seam's unweighted epilogue) and its weighted routed variant
-`swiglu_mxfp8_quant_weighted_sm121` (D33), are not required chain kernels. `rmsnorm_sm121` is no
-longer pending: m18 measured it at 8 and 130 tokens and b41 wired it. The CLI arm
+the c4c tail `rmsnorm_sm121`) and verifies size and SHA-256 fail-closed; the other three,
+`swiglu_mxfp8_quant_sm121` (the host seam's unweighted epilogue), its weighted routed variant
+`swiglu_mxfp8_quant_weighted_sm121` (D33) and the certified head's device reduce
+`lm_head_reduce_sm121` (D35, m19 measured b44; required only when the cut-over lands), are not
+required chain kernels. `rmsnorm_sm121` is no longer pending: m18 measured it at 8 and 130 tokens
+and b41 wired it. The CLI arm
 `sparkflash device-chain --plan-only` prints the plan, stage map, seam counts, the plan-only label
 verbatim and the three design 4.3 run labels explicitly prefixed "label reserved for a later
 stage:", then exits 2 refusing to serve. M3-b adds layer-0 weight staging and budget admission;

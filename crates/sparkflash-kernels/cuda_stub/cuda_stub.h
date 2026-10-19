@@ -76,6 +76,7 @@ __device__ __forceinline__ void __nanosleep(unsigned int ns) { (void)ns; }
 // as builtins but only declares them through cuda_runtime.h, which this probe deliberately does
 // not include. A bare declaration is enough for the -fsyntax-only probe; nvcc never sees this file.
 __device__ float __shfl_down_sync(unsigned int mask, float value, unsigned int delta, int width = 32);
+__device__ unsigned int __shfl_down_sync(unsigned int mask, unsigned int value, unsigned int delta, int width = 32);
 __device__ float __shfl_xor_sync(unsigned int mask, float value, unsigned int lane_mask, int width = 32);
 
 // The shared trace header's macros call atomicAdd and __ffsll, which CUDA's own headers

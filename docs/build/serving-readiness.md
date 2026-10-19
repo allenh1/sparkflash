@@ -85,15 +85,18 @@ device evidence either.
 
 ## 2. Stage detail: pins, harnesses, measurements, APIs, gaps
 
-Kernel pins are in `crates/sparkflash-kernels/baseline/kernel_baseline.txt:12-22` (eleven entries,
+Kernel pins are in `crates/sparkflash-kernels/baseline/kernel_baseline.txt:13-24` (twelve entries,
 nvcc release V13.0.88, arch sm_121a). The six Milestone-4 kernels are the six-entry
 `m4_abi::KERNELS` array (`crates/sparkflash-kernels/src/m4_abi.rs:867`; constants at `:854, :856,
 :858, :860, :862, :864`), and `m4_abi` is frozen by D26 (`docs/DECISIONS.md`), so the router, SwiGLU
 (and its weighted routed variant, D33) and gate/up kernels are pinned outside that array (router ABI:
 `crates/sparkflash-kernels/src/router_abi.rs`; SwiGLU: `kernels/swiglu_mxfp8_quant_sm121.cu:1-14` and
 `kernels/swiglu_mxfp8_quant_weighted_sm121.cu`; gate/up: `routed_gate_up_abi.rs`; the serving tail's standalone RMSNorm: `kernels/rmsnorm_sm121.cu`
-and `docs/build/phase3-rmsnorm-tail.md`, D34). The driver
-enum has ten variants (`cuda_driver.rs:157-179`), one raw loader and launch path
+and `docs/build/phase3-rmsnorm-tail.md`, D34); the certified head's device reduce:
+`kernels/lm_head_reduce_sm121.cu` and `docs/build/phase3-lm-head-reduce.md` (D35): pinned at
+36,120 B / `3fcd7ba5...` (`ptx_membar_lines=0`), **window b44 measured m19 PASS (17/17)**, not yet
+wired into the engine. The driver
+enum has eleven variants (the ten above plus `LmHeadReduce`), one raw loader and launch path
 (`Cuda::load_kernel` `:527`, `Cuda::launch` `:562`, `launch_repeated` `:607`); typed launchers
 exist for attention and router (2.6/2.7), and `!88` added typed param builders for mHC, dense, wo_a,
 MXFP4 down/combine, LM head and routed gate/up (`*_launch.rs`), none of them wired into a chain yet.
@@ -569,9 +572,9 @@ and separates what is already on main.
    self-check (fails on a missing **and** an unplanned seam), and runs through a `ChainOps` backend
    with `chain_execution = false`.
 2. `window.rs` accounts the 128-slot rings (67,584 B each, 2,703,360 B for 40 layers) and
-   round-trips the oldest-first view; `cubins.rs` parses the eleven baseline pins, requires the nine
-   chain pins (the six chain kernels plus router and routed gate/up) and verifies size and SHA-256
-   fail-closed.
+   round-trips the oldest-first view; `cubins.rs` parses the twelve baseline pins, requires the nine
+   chain pins (the six chain kernels plus router, routed gate/up and the c4c tail `rmsnorm_sm121`)
+   and verifies size and SHA-256 fail-closed.
 3. `sparkflash device-chain --plan-only` prints the schedule, stage map, planned seam counts, the
    plan-only label verbatim and the design 4.3 labels explicitly prefixed "label reserved for a
    later stage:", then exits 2 refusing to serve
@@ -1012,7 +1015,7 @@ repository or the evidence tree on this host.
 | chained 40-row column | this host: `/home/user/phase1-evidence/phase1-c-stage9-40rows-harness5b-20261018T050416Z.log` (572,420 B, sha256 `bd0f908e...`); device pair `stage9-out-r5b/device.{manifest,blob}` (shas `6093c74b...`/`fecd813b...`) | 40 rows × 2 runs, 763 launches/run, 298.6 s, bit-identical; Phase-1 aggregate 306 under / 414 over bar |
 | B2 chained replay | this host: `/home/user/phase1-evidence/phase1-b2-stage7-layer0-rereview5-20261018T044122Z.log` (23,897 B, sha256 `c2de544c...`) | 20 launches (16 chain + 4 forced-routing control), UTC 04:41:22Z |
 | head | this host: `/home/user/phase1-evidence/stage5-device-run-timed.log`, `stage5-device-final.log` | 4 launches (one per rank), 129,280 exact, 0 certified, argmax 5, 1.56 s incl. 1.32 GB upload |
-| window-cubin set | **node-only:** twelve files = the eleven baseline cubins plus the legacy `mega_mhc_sm121` copy, all matching `kernel_baseline.txt` when checked; **this evidence tree has seven** (`cubins/`: no `moe_router`, no `routed_gate_up`, no `mega_mhc_fused` copy) | pin check |
+| window-cubin set | **node-only:** fourteen files = the thirteen baseline cubins plus the legacy `mega_mhc_sm121` copy, all matching `kernel_baseline.txt` when checked; **this tree is not the source of the pin set**: counts and hashes are checked against the node window `cubins/` (fourteen files) and the manifest. A local `cubins/` copy predating a re-pin must not be used for a check - its `cert_lm_head` copy predates the 14,888 B / `7394b129...` re-pin, so a local m19 would refuse | pin check |
 
 The b4 first gate/up attempt (`dd9921a4` from `0ff78fe`) panicked at `m10_gate_up.rs:221`
 (30,720 vs 27,648) and produced no numbers; b6 is the completed gate/up window with both shapes.
@@ -1025,7 +1028,7 @@ and is not cited.
 
 - `device-forward-chain.md` section 2.1 says "the corrected device path has not run". That is **still
   true for the 40-layer chain** (the m8 plumbing binary ran at 2026-10-18T18:32Z, but no chain is
-  wired); section 2.2 on main already records the baseline's eleven entries and that gate/up is merged
+  wired); section 2.2 on main already records the baseline's twelve entries and that gate/up is merged
   but not wired, so those earlier corrections are now in the doc of record rather than this list.
 - `kernels/flash_mla_csa2_sm121.cu:53-58` says format 2 was never executed on a device; task-14 and
   the m8 dispatch supersede it (2.6).

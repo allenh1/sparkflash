@@ -43,6 +43,7 @@ records the evidence and the consequence for the build. Research backing is in
 | D32 | The routing-weight multiply is a named host seam in the routed device chain (F6) | The released arithmetic multiplies the SwiGLU output by the routing weight BEFORE the w2 activation quantiser reads it, and no pinned routed kernel takes a weight operand. m17a therefore measures the device SwiGLU+quantise stage unweighted, and builds the combine operand on the host from the same device gate/up bf16 values with `mxfp4_ref::routed_activation_operand`; the combine is weighted but its activation operand is host-quantised by the reference's own rule. A weighted quantiser variant is the planned follow-up (new cubin, deliberate re-pin), not part of m17a |
 | D33 | The routed combine operand is built on the device: the weighted SwiGLU+quantise variant closes the F6 host seam | `swiglu_mxfp8_quant_weighted_sm121` (own cubin, 13,000 B / `0e602daf...`, `ptx_membar_lines=0`) takes a per-row routing-weight operand and does the model's order on the device: asymmetric-clamped SwiGLU, one bf16 rounding of the product, then the activation ceil-rule quantise. m17a's stage 3 reads the router's `weights_d` in place, and stage 4's combine receives those device codes/scales through a host re-upload of the stage-3 readback (a byte copy, no host arithmetic on them), so no host multiply and no host quantise remain in the routed path; the class is `swiglu_ref::quantise_row_weighted` (which equals `mxfp4_ref::routed_activation_operand` composed with SwiGLU) and the real 576-wide operand is compared against `routed_activation_operand` directly. The unweighted epilogue stays pinned for m17b's shared expert; the six-kernel frozen m4 ABI array is untouched; window b33 measured it PASS at tokens 8 and 130 (35 checks each) |
 | D34 | The serving tail's final norm is a standalone BF16 kernel, planned and pinned before any window | `kernels/rmsnorm_sm121.cu` reproduces the engine's final-norm arithmetic exactly (`sum(x^2)` ascending f32, `/cols`, `1/sqrt(mean+eps)`, `(x*inv)*w`, one BF16 RN-even rounding) with one thread per row and 128-bit BF16 loads; the host reference is the engine's own `linalg::rms_norm`, not a copy. Pinned at 31,480 B / `5f953bc0...` / `ptx_membar_lines=0` (baseline eleventh entry, driver `KernelId::RmsNorm`); m18 is measured (0 mismatched BF16 bytes at 8 and 130 tokens, odd 513 exact, two launches byte-identical) and c4c-norm wired it (b41 0/10,240 mismatches). Details: `docs/build/phase3-rmsnorm-tail.md` |
+| D35 | The certified head's device reduction replaces the host block assembly, planned and pinned before any window | `lm_head_reduce_sm121` (36,120 B / `3fcd7ba5...`, `ptx_membar_lines=0`) is pinned as the twelfth baseline entry and the driver's `KernelId::LmHeadReduce`; m19 is measured (17/17 checks: block arrays, lowest-index tie-break over the four ranks, certified-winner refusal, `0u` screen sentinel) and the b44 window produced token 5 / 13.237006187 against the host assembly's 5 / 13.230665207. The host four-shard block assembly and the 4-byte token/status readback remain the fallback; the device cut-over is not wired, so `REQUIRED_KERNELS` stays nine and the chain stays at 1167 launches |
 
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
@@ -1933,7 +1934,7 @@ carried for ABI uniformity only and the pin's \`ptx_membar_lines=0\` is expected
 \`5f953bc0fb781afe3f9b42703b19b37f89ef45b74a4ad607938df2e2c3448579\`, \`ptx_membar_lines=0\`;
 PTX inspection shows 0 \`fma.rn\`, 2 \`div.rn.f32\`, 1 \`sqrt.rn.f32\`, 0 \`rsqrt\`, and the
 \`ld.global.nc.v4.u32\` vector loads. It is the **eleventh** entry in
-\`crates/sparkflash-kernels/baseline/kernel_baseline.txt:12-22\`; \`build.rs\`'s \`PROBED_KERNELS\` probes
+\`crates/sparkflash-kernels/baseline/kernel_baseline.txt:13-23\`; \`build.rs\`'s \`PROBED_KERNELS\` probes
 eleven sources and the combined probe still compiles every kernel in one translation unit;
 \`cuda_driver::KernelId\` gained \`RmsNorm\` (ten variants); the frozen six-kernel \`m4_abi\` array is
 untouched. The host reference (\`crates/sparkflash-kernels/src/rmsnorm_ref.rs\`) calls the engine's
@@ -1959,3 +1960,107 @@ requires this kernel as one of the nine chain kernels, so the launch and fallbac
 **Consequence.** c4c can replace the \`final_norm\` host seam with one launch plus a declared host
 fallback, and the comparison class is bit-exact, not a tolerance: if the window finds a mismatch it
 is a finding against this kernel, not a widened bar.
+
+---
+
+## D35 — The certified head's device reduction replaces the host block assembly, planned and pinned before any window
+
+**Decision.** Add `kernels/lm_head_reduce_sm121.cu`, the last host assembly step between the four
+`cert_lm_head_sm121` shard launches and the token, as a device kernel. Today the chain copies each
+rank's 32,320 stored logits, 32,320 certified flags, 32 block maxima and 32 block argmax entries to
+the host and folds 128 blocks with `consider_head_block`. The entry is
+`lm_head_reduce_sm121(logits_r0..r3, certified_r0..r3, token, value, block_max, block_argmax,
+top5_value, top5_index, status, certified_count, trace_ring, layer_id, step_seq)`: four separate
+per-rank logit pointers and four certified pointers (no segmented buffer, no offset/stride pair to
+confuse), and the 4-byte token is the declared host seam, with status/count beside it for the
+claim/refusal contract.
+
+**The m16 rules, exactly.** Blocks are the screen's layout, rank-major: global block
+`r * 32 + b` covers rank `r`'s entries `[b * 1024, min((b + 1) * 1024, 32,320))`, so each rank's
+last block has 576 entries and there are 128 blocks. The four shard ranges are **uniform**
+(4 x 32,320); the non-uniform numbers sometimes quoted for the concentrated case
+(1,062 / 1,205 / 1,215 / 1,417) are its **certified-flag counts per rank**, not shard sizes - the
+kernel header and the page say so explicitly so nobody re-imports them as ranges. Block answers use
+strict greater-than with ties to the lowest global entry; the 129,280-way answer is the
+lowest-index tie-break over the 128 block answers in ascending global order; the top-5 is value
+descending then index ascending. **No arithmetic is performed on a logit** - the kernel only
+compares and moves f32 bit patterns, so it cannot introduce a value delta: the rounding class is
+inherited from `cert_lm_head_sm121`, the only arithmetic upstream. Determinism follows from fixed
+scan order, one launch and one block (8 warps x 16 chunks, thread 0 folds the answers in ascending
+order); the pin's `ptx_membar_lines=0` is expected. The kernel emits no trace event: all sixteen
+scope bits are assigned and none describes the head reduction, so the trace words are carried for
+ABI uniformity only.
+
+**The refusal contract (approved status bits).** `0x1 WINNER_CERTIFIED`: the argmax entry is
+certified, so its stored value is a bound and the token must not be claimed (refused, not asserted;
+the token is written for diagnostics only). `0x2 TOP5_CLAIMED`: set only when
+`certified_count == 0` - the device-side half of m16's `claims_top5`; the host still requires a
+reference before it may claim the set. `0x4 ANY_CERTIFIED`: informational. A certified entry is
+never silently valued as exact; on a sound certificate `WINNER_CERTIFIED` cannot happen, because a
+certified entry satisfies `bound < running maximum`, so seeing it is a finding.
+
+**Pin and CPU-side evidence (all before any window).** nvcc V13.0.88 / CUDA 13.0.3 / sm_121a:
+`lm_head_reduce_sm121` cubin **36,120 B**, sha256
+`3fcd7ba5e9871d01804e84825c107bf7741efac7b16982c77aced29b726b2849`, `ptx_membar_lines=0`,
+**measured by window b44: PASS, 17 of 17 checks**;
+PTX inspection shows 0 `membar`, 0 `fma.rn`, 5 `ld.global`, 10 `shfl.sync`, 0 `atom`. The first
+build (37,152 B / `6cff3661...`) **FAILED window b42 at 7 of 14 checks**: it scanned each block's
+local prefix instead of its `base + local` range (every block of a rank re-read the rank's first
+1,024 entries; count 3,501 vs 4,899, winner 65,025 vs 33,865, synthetic winner 777 vs 4,242) and its
+top-5 insertion could store the same entry twice (`[7, 7]`). The fixed source indexed `base + local`
+for the logits and flags and refused a duplicate top-5 index. The second build (36,120 B /
+`509b933e...`) then **FAILED window b43 at 5 of 14 checks**: it wrote the winning global entry as
+`rank * 32,320 + local` without the block base, so block 1 reported block 0's entry (873 vs 1,897),
+the concentrated winner was 32,841 instead of 33,865 (equal stored value, wrong entry), and a
+certified winner's flag was looked up at rank 0's local index (146) instead of the global entry
+(4,242), leaving status 0x4 instead of 0x5. The third build (this pin) uses `rank * 32,320 + base +
+local` for the written entry; both b42 and b43 are FAILURE records (verbatim in the page's section
+8), not passes, and this pin is the artifact for b44. It is the
+**twelfth** entry in `crates/sparkflash-kernels/baseline/kernel_baseline.txt:13-24`;
+`build.rs`'s `PROBED_KERNELS` probes twelve sources and the combined probe still compiles every
+kernel in one translation unit; `cuda_driver::KernelId` gained `LmHeadReduce` (eleven variants);
+the frozen six-kernel `m4_abi` array is untouched. The typed launch declaration
+(`crates/sparkflash-kernels/src/lm_head_reduce_launch.rs`, `ARG_WORDS = 19`, one block of 256,
+grid `(1,1,1)`) pins the kernel's parameter names/types/qualifiers against the source with a
+mutation test. The host reference (`crates/sparkflash-kernels/src/lm_head_reduce_ref.rs`) is the
+chain's assembly as a pure function (`assemble` plus `host_assembly_token`), with tests for the m16
+layout, the 576-entry partial block, brute-force argmax parity, cross-rank ties, top-5 order, a
+certified winner's refusal, the concentrated case's 4,899 flags with an exact winner, the all-exact
+control and validation refusals. The harness
+`crates/sparkflash-kernels/examples/m19_lm_head_reduce.rs` pins both cubins before allocating,
+runs the four screen launches and two reduce launches per case, and compares the reduce with the
+host assembly bit for bit: token and stored value, all 128 block maxima/argmax entries against both
+the reference and the screen's published arrays remapped rank-major, status/count, the top-5
+(claimed on the all-exact control and set-compared with the phase-1 reference logits; NOT claimed on
+the concentrated certificate), the concentrated token 33,865, launch determinism, a synthetic
+full-width tie resolving to the lowest index, and a synthetic certified winner asserting the
+refusal.
+
+**Status: measured by window b44 - PASS (17 of 17 checks), not yet wired.** b42 failed at 7 of 14
+checks (missing read base, duplicate top-5 entry) and b43 at 5 of 14 (missing write base; wrong flag
+lookup for a non-block-0 winner); both failure records are verbatim in
+`docs/build/phase3-lm-head-reduce.md` section 8, with the fixes. The b44 PASS is verbatim in the same
+section: on the real-token control the reduce token is 5 with value 13.237006187, byte-equal to the
+host assembly (reference argmax 5); all 128 block maxima/argmax entries match both the screen's
+published arrays and the host reference; the all-exact top-5 set equals the reference engine's; the
+concentrated certificate keeps 4,899 flags and the exact winner 33,865 while NOT claiming the top-5;
+two launches are byte-identical in both real cases; and the synthetic tie, nonzero-block offset,
+certified-bound-tie refusal (status 0x5) and rank-2 certified-winner (status 0x5) cases pass. The
+kernel is not wired into the engine on this branch: engine-dev's cut-over is the next change, with
+the host assembly kept as the fallback. The branch is based on
+`origin/main` @ `d95fa65` (batch 22, merged); the b40 RMSNorm record (`13a4147`) is a separate
+docs batch and is not stacked under this branch, and the merge order is c4c-norm first, then this
+reduce.
+
+**Not claimed.** Not the served forward pass, not the c4c engine wiring (engine-dev wires the launch
+and the host fallback at the cut-over, and bumps `sparkflash-device::cubins::REQUIRED_KERNELS` from
+nine to ten only then), not the head screen, not a token/chain/per-layer claim, not host-time saved,
+not a performance or bandwidth claim. The real-token control's hidden is the declared phase-1
+artifact read by path; the concentrated and synthetic cases are declared synthetic operands and no
+token is claimed from the concentrated certificate (the preserved argmax 33,865 is not a
+released-model token claim).
+
+**Consequence.** c4c can replace the host block assembly with one launch and read back a 4-byte
+token plus the claim/refusal status, with the host assembly of D32/D34 kept as the declared
+fallback; the comparison class is bit-exact, not a tolerance, so a window mismatch is a finding
+against this kernel rather than a widened bar.
