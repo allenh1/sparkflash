@@ -15,6 +15,16 @@ variables:
 
 default:
   image: rust:1.98
+  # The shared docker runner intermittently refuses jobs at pickup with
+  # runner_system_failure and an empty trace (the job never runs a command).
+  # Retrying those on the same commit is the honest fix; it does not mask a
+  # real failure, because script failures are never retried.
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - scheduler_failure
 
 cache:
   key: "$CI_COMMIT_REF_SLUG"
