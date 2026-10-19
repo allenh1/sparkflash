@@ -316,14 +316,19 @@ and `docs/build/phase3-indexer.md:71`.
 
 | id | kernel/ref | native | ours | why it matters |
 | :-- | :--- | :--- | :--- | :--- |
-| M1 | `b12x_mxfp8_wo_a` / `mxfp8_ref::grouped_wo_a` | BF16 grouped einsum over BF16-dequantised wo_a weights, BF16 attention operand, no activation quant (model.py:783-788, convert.py:154-173) | FP8 weights + E8M0 32x32 scales, FP8 E4M3 block-32 quantised activation, FP32 accumulate (kernel :53-108) | adds an activation quantisation native does not have, and uses the unrounded weight; affects every attention output before wo_b |
+| M1 | `b12x_mxfp8_wo_a` / `mxfp8_ref::grouped_wo_a` | BF16 grouped einsum over BF16-dequantised wo_a weights, BF16 attention operand, no activation quant (model.py:783-788, convert.py:154-173) | FP8 weights + E8M0 32x32 scales, FP8 E4M3 block-32 quantised activation, FP32 accumulate (kernel :53-108) | adds an activation quantisation native does not have, and uses the unrounded weight; affects every attention output before wo_b; the `b12x_bf16a_mxfp8w_wo_a` variant removes exactly this deviation (Appendix A) |
 | M2 | `b12x_mxfp4_moe` / `mxfp4_ref::moe_combine` | per-expert w2 output rounded to BF16, added in FP32 in ascending expert-id order; shared added BF16; final BF16; residual added later by hc_post (model.py:893-904,962-966) | six slots' block-scaled partials + residual accumulated in one FP32 chain, one BF16 round, slot order (kernel :180-197) | missing per-expert BF16 rounding, wrong accumulation order, residual inside the same rounding |
 | M3 | `swiglu_mxfp8_quant_sm121` (unweighted) / `swiglu_ref::quantise_row` | activation rounded to BF16 by `x.to(dtype)` before w2's act_quant (model.py:848-851) | FP32 activation quantised directly (kernel :131-140, ref :124-140) | different amax/values into the FP8 quantiser on every shared-expert row |
 | M4 | `mega_mhc_sm121` / `mega_mhc_ref` | the residual stream is BF16, hc_pre reads its BF16 values, sums in FP32 and rounds the result to BF16; the norm consumes that BF16 tensor and returns BF16; hc_post is separate rounded mul/add; torch mean/rsqrt (model.py:948-966) | X_hat is computed from the unrounded FP32 update and kept FP32 through the norm and its quantiser; FMA-contracted update; declared binary64 statistics (kernel :181-188,296-341; layer_zero.rs:607-615) | missing the BF16 residual/stream roundings and the BF16 norm output before quantisation, plus last-bit FMA differences vs native |
 
 The BF16-activation pair on this branch (`b12x_bf16a_mxfp8w_*`) is deliberately **not** on this
-list-of-defects because it is not trying to be native; it is a precision experiment (Appendix A).
-`swiglu_mxfp8_quant_weighted` is not on the list: it already has the BF16 round native requires.
+list-of-defects, but for two different reasons. For the **dense** variant it is a precision
+experiment, because native quantises those activations to FP8 (N1) and Appendix A keeps it
+unwired. For the **wo_a** variant it is not a deviation at all: native's `wo_a` operand is the
+bf16 inverse-RoPE'd attention output (`model.py:766-788`), so a BF16 activation against the
+E4M3/32x32 `wo_a` weights with an f32 accumulate is the checkpoint's rule for exactly that
+projection (M1's native column). `swiglu_mxfp8_quant_weighted` is not on the list either: it
+already has the BF16 round native requires.
 
 ## 4. Unverified (rule matches, not measured against native)
 
@@ -348,14 +353,32 @@ list-of-defects because it is not trying to be native; it is a precision experim
 | FP4 q/k block 16 | actual release: **compressed KV** FP4 block 16 with E4M3 scales (`model.py:759-760`); indexer q/k are FP4 block 32 E8M0 (`model.py:546,552`) | compressed KV block-16 E4M3 in engine `attention.rs:64-66,207-229` and kernel scale channels 16 (`m4_common:83`); indexer operands dequantised BF16 at block 32 by the caller | **match**; note the common shorthand "fp4 q/k block 16" is not the release's split |
 | f32 accumulation | `kernel.py:208-274,545-591` (FP32 accum and scaled adds) | all kernels accumulate FP32, one BF16 at the boundary | **match to the rule**; order unverified (U1) |
 
-## 6. Appendix A - the batch-25 BF16-activation pair is not native
+## 6. Appendix A - the BF16-activation pair: native for `wo_a`, a precision experiment for the dense projections
 
 `kernels/b12x_bf16a_mxfp8w_dense_sm121.cu` and `..._wo_a_sm121.cu` (`bf16a_mxfp8w_ref.rs`,
-launch modules, KernelIds `Bf16aMxfp8wDense`/`Bf16aMxfp8wWoA`) were added as a precision-first
-experiment: BF16 activations, FP8 weights still, FP32 accumulate. Native activations are FP8 E4M3
-block 32 E8M0 (N1), so this is explicitly *not* the checkpoint's arithmetic. It stays unwired on
-this branch and is not an acceptance candidate for native parity. (Lead direction: not merged, no
-GPU run needed.)
+launch modules, KernelIds `Bf16aMxfp8wDense`/`Bf16aMxfp8wWoA`) keep BF16 activations, the FP8
+E4M3 / 32x32 ue8m0 weights and an f32 accumulate. The blanket label "not native" is right for
+four of the five projections and wrong for one:
+
+- **dense (`wq_a`, `wq_b`, `wkv`, `wo_b`): not native.** Native quantises those activations to FP8
+  E4M3 block-32 E8M0 (N1, `model.py:182-205`), so a BF16 activation computes a different model.
+  The dense variant is a precision-first experiment, stays unwired on this branch and is not an
+  acceptance candidate.
+- **`wo_a`: the native rule.** Native's `wo_a` is a bf16 `ColumnParallelLinear` whose operand is
+  the bf16 inverse-RoPE'd attention output (`model.py:645-649,766-788`; `convert.py:154-173`
+  dequantises that weight to bf16), applied as a grouped einsum with an f32 accumulator and a
+  bf16 result, and with no activation quantisation anywhere on that path. The `..._wo_a_sm121`
+  variant reproduces exactly that rule for exactly that projection: it is the F1 fix candidate,
+  not a precision departure. It still needs wiring, a pin and the F1 isolation measurement before
+  it is acceptance evidence.
+
+Measured sizes recorded with this correction (2026-10-19): `wo_a` weight [8192,4096] F8_E4M3 =
+33,554,432 B per layer, scale [256,128] ue8m0 = 32,768 B, bf16 copy 67,108,864 B per layer; over
+40 backbone layers (43 weight instances including the 3 MTP layers) the fp8 form is 1.343 GB
+against 2.684 GB for the bf16 copy, delta +1.341 GB; `wo_a` is 26.5% of the 5.066 GB/position
+projection staging (89.45 ms/position of attention staging in b68). No new GPU run: these are
+stored sizes plus the already-recorded b68 totals; the variant's numerics against native remain
+the F1 isolation (named, not measured).
 
 ## 7. Appendix B - evidence summary
 

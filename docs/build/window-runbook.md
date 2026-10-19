@@ -104,10 +104,10 @@ still Lead-owned, and the stop/start protocol above is unchanged.
 
 ### 1. Device dump (device window, before the released server starts)
 
-The device side already writes the comparison input with `--dump-logits` (O6, branch
-`task/logits-dump`): one JSON object per compared position (position, device argmax, vocab,
-logits_offset, top20, ...) plus `<dump>.bin` with the full-vocabulary little-endian f32 logits in the
-same position order. The dump is written before the token-parity gate can fail, so a failing run still
+The device side already writes the comparison input with `--dump-logits` (O6, in tree:
+`crates/sparkflash-cli/src/logits_dump.rs`; schema [logits-dump.md](logits-dump.md)): one JSON object per
+compared position (position, device argmax, vocab, logits_offset, top20, ...) plus `<dump>.bin`
+with the full-vocabulary little-endian f32 logits in the same position order. The dump is written before the token-parity gate can fail, so a failing run still
 leaves its logits. Stage the run and the dump before the stop; the comparison is offline afterwards.
 
 ### 2. Oracle (after the released recipe answers /v1/models)
@@ -183,6 +183,64 @@ python3 -m unittest discover -s scripts/tests -v
 
 47 host-only tests (no server, no GPU): log-softmax stability, top-k/overlap, KL/JS, dump and oracle
 JSON parsing, position/prefix mapping, bar evaluation, and an end-to-end synthetic comparison.
+
+## Host-side staging: the window is now copy + run (2026-10-19)
+
+Since the dev host has the pinned CUDA image and `nvcc` compiles `sm_121a` with **no GPU present**,
+every compiled artifact a window needs is produced here and checked here. The window itself should
+contain no compilation: copy, stop, run, restart.
+
+The pinned-image check - the same compiled-form check the `cuda-abi` CI job runs - is now the standing
+check for every batch that touches `kernels/` or the baseline:
+
+```sh
+docker run --rm -v <worktree-under-/home>:/w -w /w nvidia/cuda:13.0.3-devel-ubuntu22.04 \
+  sh -c 'SPARKFLASH_NVCC=/usr/local/cuda/bin/nvcc sh crates/sparkflash-kernels/scripts/check-kernel-baseline.sh'
+```
+
+* mount the worktree under `/home`: the docker daemon here cannot see an agent's private `/tmp`, and a
+  `-v /tmp/...` mount silently produces an empty root-owned directory (seen 2026-10-19);
+* image `nvidia/cuda:13.0.3-devel-ubuntu22.04` (id `3869b846a8cc`), no `--gpus` needed;
+* success line: `all kernels match the recorded baseline (V13.0.88, cuda_13.0.r13.0/compiler.36424714_0)`;
+* the Rust test that wraps this script skips without `nvcc`, so on a plain host it is not evidence.
+
+What that buys, measured: F2's pin row was produced this way (the sequence kernel moved 38080 -> 38232 B
+with a new digest and `ptx_membar_lines` still 0), and the three Engram kernels were pinned the same way;
+`check-kernel-baseline.sh` then verified all 18 rows on the batch tree and again on the landed `main`.
+
+### Artifact set for a window on main 0639413
+
+`/home/user/wt/win-main/window-artifacts-0639413.txt` records, for `main` 0639413 (tree
+`d0ee03e7d65ab5e8cebd7b06bcd381a45e6f15d4`), built with `scripts/build-aarch64.sh --features=cuda`:
+
+| artifact | value |
+| :-- | :-- |
+| binary | `target/aarch64-unknown-linux-gnu/release/sparkflash`, 61,758,952 B, sha256 `1e0f0a1d45b5f754fedd87697a43b743eb7747173771478acbfe53b1dfd138af` |
+| cubins | `cubins-main-0639413/`, 19 files (16 kernels + 3 Engram), per-file sha256 in the manifest |
+| fixture | `sequence-130-released.json`, sha256 `c9aa2cd5bb093c579cdfcb4fcc9f8f100ea22789d9841600830b0f020ae7927d` |
+| baseline | 18 rows, toolkit `V13.0.88` |
+
+The binary was checked to carry the audit flags (`--operand-audit`, `--host-attention-from`,
+`--attention-twin-positions`, `--dump-logits`, `tp4-resident`) before being recorded, so a flag dropped
+by a refactor becomes a staging failure here instead of a window surprise.
+
+### The two commands the window runs
+
+```sh
+# 1. the audit: twin + operand audit over the 130-token fixture, 8 decode steps
+<binary> device-chain --run-stage hybrid_sequence --checkpoint <ckpt> --cubin-dir cubins-main-0639413 \
+  --fixture /home/user/phase2-evidence/sequence-130-released.json \
+  --prompt-tokens 130 --decode-steps 8 --time-budget-s 4800 \
+  --dump-logits <run>/logits-130x8.jsonl \
+  --attention-twin-positions 126,127,128,129,130 --operand-audit
+
+# 2. the Engram harness (task-9 / F4): device-vs-twin bit-exactness, exits 1 on a real difference
+cargo run -q -p sparkflash-kernels --release --example engram_native_slice -- --cubins cubins-main-0639413
+```
+
+The device-chain run needs only the binary and the cubins; the harness needs a CUDA-capable build of the
+kernels crate, so it runs from a node checkout. Rule: no `nvcc` on the nodes inside a window - if a window
+needs a compiler, staging was wrong.
 
 ## Build-cache hygiene across worktrees
 

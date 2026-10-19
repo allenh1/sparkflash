@@ -211,7 +211,19 @@ no measurement is affected — the byte count itself is correct and is what the 
    per-slot rotation copy (512 code + 16 scale bytes, 528 B per slot across the two arrays) per
    layer per step; the sequence milestone must implement it and measure it — it is not hidden in
    this store.
-2. HSI pool population (candidate selection and bf16 dequantisation from layer 20's index-K) is
-   next milestone; this store allocates and validates the buffer only.
-3. Paged/evicting device allocation stays Phase 4/5.
-4. One store is one sequence; batching needs a store pool.
+2. HSI pool population (candidate selection and top-512 merge) is next milestone; this store
+   allocates and validates the buffer only. Task-43 added the operand half on the host:
+   `PagedKvView::absolute_indexer_keys` gathers a sequence's layer-20 indexer K entries through
+   the block table, dequantises FP4 E2M1 with E8M0 scales, narrows to bf16 and stages the pool in
+   absolute block order (see `docs/build/serving-paged-kv.md` Section 5). It does not select.
+3. Paged/evicting device allocation: the host-side pager now exists (task-21,
+   `crates/sparkflash-kv/src/paged.rs`: block tables, FIFO free queue, prefix sharing, eviction,
+   preemption, SWA tail slots, invariants) and the device attention seam stages its operands
+   (`crates/sparkflash-device/src/paged_kv.rs`); see `docs/build/serving-paged-kv.md`. The device
+   window run of that path is unclaimed, and a block-table read path inside the kernel would be a
+   new pinned entry, not this seam. Task-43 chose absolute-position staging instead: absolute ids,
+   absolute-position main-KV rows and absolute-block HSI keys through the unchanged pinned entry,
+   with the positions-array kernel recorded as its named follow-on (same doc, Section 5).
+4. One store is one sequence; batching needs a store pool. The pager allocates one pool across
+   sequences, so the allocation half is in place; wiring it into the chain's per-step launch and
+   the continuous-batcher (task-22) is downstream.

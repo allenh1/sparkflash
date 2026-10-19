@@ -72,6 +72,7 @@ pub mod chain_device;
 pub mod cubins;
 pub mod engine;
 pub mod layer_zero;
+pub mod paged_kv;
 pub mod resident;
 pub mod session;
 pub mod shard;

@@ -38,6 +38,7 @@ pub mod device_store;
 pub mod error;
 pub mod fp4;
 pub mod layout;
+pub mod paged;
 pub mod plan;
 pub mod radix;
 pub mod schedule;
@@ -73,6 +74,10 @@ pub use layout::{
     align_down, align_up, derived_global_kv_bytes_per_token, entries_per_page,
     global_kv_bytes_for_tokens, page_entry_offset, page_slot_offset, pages_for_tokens, source_slot,
     swa_layer_range, swa_slot_offset,
+};
+pub use paged::{
+    AppendReport, BlockTable, FreeReport, PagedGeometry, PagedKvCache, PagedSequence, PagedStats,
+    PagingError, SeqId, SequenceState,
 };
 pub use plan::{KvCacheStatsSnapshot, KvCacheTelemetry, PrefixMatchPlan};
 pub use radix::{InsertOutcome, NodeId, PrefixMatch, RadixTree, block_hash};

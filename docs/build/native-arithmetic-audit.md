@@ -291,7 +291,17 @@ Isolation (proposal, not actioned): run the engine's *host* `wo_a` projection **
 projection only** while every other stage stays device. That is not the D37 mode (which made all
 five host-f32) and it is native arithmetic (bf16 einsum), so it would measure F1 directly: compare
 the device `wo_a` output against an f32 einsum over bf16 operands on the same captured attention
-output. One harness flag, one device window run.
+output. One harness flag, one device window run. The kernel variant that arithmetic needs already
+exists in tree: `b12x_bf16a_mxfp8w_wo_a_sm121` keeps the E4M3 32x32 `wo_a` weights and the f32
+accumulate and removes only the activation quantisation native does not perform, which is why the
+kernel audit's Appendix A classes the *wo_a* variant as the native rule (the dense bf16a variants
+stay unwired precision experiments). Measured sizes (2026-10-19, checkpoint headers plus the b68
+staging totals): `wo_a` weight [8192,4096] F8_E4M3 = 33,554,432 B per layer, scale [256,128]
+ue8m0 = 32,768 B, bf16 copy 67,108,864 B per layer; 40 backbone layers (43 weight instances
+including the 3 MTP layers) -> fp8 1.343 GB vs bf16 2.684 GB, delta +1.341 GB. `wo_a` is 26.5% of
+the 5.066 GB/position projection staging (89.45 ms/position of attention staging in b68). No new
+GPU run: the sizing is stored-weight arithmetic and the already-recorded b68 totals; the
+variant's numerics against native stay named and unmeasured.
 
 ### F2 - the attention body does not round each softmax probability to bf16 before P.V. **MEDIUM.**
 
@@ -680,5 +690,7 @@ re-opens the precision decision):
 5. **F6** - one bf16 round in the unweighted SwiGLU epilogue before its quantiser; a kernel test
    against a reference that pins the round, then a window re-run of stage 8's shared probe.
 
-The `--dump-logits` binary already staged on the node (`4f599b7`, sha256 `7e0ce4bf...`) is what turns
-any of these into the *vLLM* comparison that is the class this audit cannot provide on its own.
+The `--dump-logits` writer is now in tree (O6: `crates/sparkflash-cli/src/logits_dump.rs`, one
+schema in [logits-dump.md](logits-dump.md); the node binary staged for this audit was the
+`4f599b7` one, sha256 `7e0ce4bf...`) and is what turns any of these into the *vLLM*
+comparison that is the class this audit cannot provide on its own.

@@ -67,6 +67,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
@@ -94,12 +95,12 @@ use sparkflash_engine::forward::{InferenceEngine, Sampling, SequenceState, StepO
 use sparkflash_engine::linalg::{CHECKPOINT_TENSOR_LIMIT, REFERENCE_TENSOR_LIMIT};
 use sparkflash_engine::loader::ReferenceWeights;
 use sparkflash_engine::synthetic::SyntheticWeights;
-use sparkflash_engine::tensor::TensorPlan;
-#[cfg(all(test, panic = "unwind"))]
-use sparkflash_engine::tensor::TensorSpec;
-#[cfg(all(test, panic = "unwind"))]
-use sparkflash_engine::weights::WeightError;
-use sparkflash_engine::weights::WeightSource;
+use sparkflash_engine::tensor::{TensorPlan, TensorSpec};
+use sparkflash_engine::weights::{WeightError, WeightSource};
+use sparkflash_engram::layout::SCALE_BLOCK;
+use sparkflash_engram::packer::{MANIFEST_NAME, PackManifest};
+use sparkflash_engram::paged::{EngramTensor, PagedTable};
+use sparkflash_engram::store::{BackendPreference, DirectTable, RowTable, specs_from_manifest};
 use sparkflash_kv::PrefixMatchPlan;
 use sparkflash_scheduler::config::SchedulerConfig;
 use sparkflash_scheduler::prefill::ChunkedPrefillPlan;
@@ -277,6 +278,12 @@ pub struct ServeOptions {
     /// The pinned router cubin for the M2 real session. Only with `--engine device` and a binary
     /// built with the `cuda` feature; absent means the M1 fake session.
     pub device_cubin: Option<PathBuf>,
+    /// The packed Engram store directory, when `--engram-dir` was given.
+    ///
+    /// Only meaningful with `--checkpoint`; the parse refuses it with `--synthetic`. When set,
+    /// [build_engine] wraps the checkpoint source so the two Engram tables are paged from the
+    /// packed rows instead of being read as tensors from the shards.
+    pub engram_dir: Option<PathBuf>,
 }
 
 impl ServeOptions {
@@ -311,6 +318,15 @@ impl ServeOptions {
             -1 => usize::MAX,
             value => usize::try_from(value).unwrap_or(usize::MAX),
         };
+        // The packed Engram store is rows of a checkpoint's tensors; the synthetic plan carries
+        // its own tiny table in memory, so there is no checkpoint to page and the combination is
+        // refused rather than silently ignored.
+        if cli.synthetic && cli.engram_dir.is_some() {
+            return Err(
+                "--engram-dir needs --checkpoint: the packed store holds rows of a checkpoint's Engram tensors, and --synthetic already carries its tiny table in memory"
+                    .to_owned(),
+            );
+        }
         match (cli.synthetic, checkpoint) {
             (true, Some(_)) => Err(
                 "--synthetic and --checkpoint cannot both be given: --synthetic serves the tiny synthetic plan and --checkpoint serves a real sharded checkpoint, so choose one"
@@ -327,6 +343,7 @@ impl ServeOptions {
                 element_limit,
                 engine: cli.engine,
                 device_cubin: cli.device_cubin,
+                engram_dir: cli.engram_dir,
             }),
         }
     }
@@ -341,17 +358,22 @@ impl ServeOptions {
     ///
     /// A message naming `--checkpoint` and the file that is missing or unusable.
     fn recipe(&self, tokenizer: &Path) -> Result<Recipe, String> {
-        match (self.synthetic, self.checkpoint.as_deref()) {
-            (true, _) => Ok(Recipe {
+        let mut recipe = match (self.synthetic, self.checkpoint.as_deref()) {
+            (true, _) => Recipe {
                 config: ModelConfig::tiny(),
                 weights: Weights::Synthetic {
                     seed: SYNTHETIC_WEIGHT_SEED,
                 },
                 tokenizer: tokenizer.to_path_buf(),
-            }),
-            (false, Some(path)) => checkpoint_recipe(path, tokenizer),
-            (false, None) => Err(no_weights_message()),
-        }
+                engram_dir: None,
+            },
+            (false, Some(path)) => checkpoint_recipe(path, tokenizer)?,
+            (false, None) => return Err(no_weights_message()),
+        };
+        // The parse already refused --engram-dir with --synthetic; this is where the checkpoint
+        // recipe learns where its Engram rows come from.
+        recipe.engram_dir = self.engram_dir.clone();
+        Ok(recipe)
     }
 }
 
@@ -447,6 +469,22 @@ struct ServeArgs {
     /// the M1 fake session, which is what the CI host and the default build use.
     #[arg(long, value_name = "PATH")]
     device_cubin: Option<PathBuf>,
+    /// Page the two Engram tables from the packed dense store instead of the checkpoint shards.
+    ///
+    /// The directory is what `sparkflash pack-engram` wrote: `manifest.json` plus the packed
+    /// rank files. The serving path already asks for Engram rows a chunk at a time through the
+    /// weight source's range interface; this flag makes those requests read the 264-byte packed
+    /// rows with the engram crate's windowed reader instead of materialising tensors from the
+    /// checkpoint shards. Nothing about it is held in memory: a request reads only the rows its
+    /// hash ids name.
+    ///
+    /// Requires `--checkpoint`: the packed tables are rows of that checkpoint's Engram tensors,
+    /// and `--synthetic` already carries its tiny table in memory. The reference server has no
+    /// rank, so every rank file named by the manifest is opened and a row is read from whichever
+    /// file owns it; a rank-local or device-side placement is a window/serving-wiring question
+    /// this host path does not answer.
+    #[arg(long, value_name = "DIR")]
+    engram_dir: Option<PathBuf>,
 }
 
 /// What the engine thread builds: a configuration, where its weights come from, and the tokenizer.
@@ -455,6 +493,10 @@ struct Recipe {
     config: ModelConfig,
     weights: Weights,
     tokenizer: PathBuf,
+    /// Where the two Engram tables are paged from: the packed dense store, or `None` when the
+    /// run reads them the old way (which `--synthetic` can, since its tiny table fits in memory,
+    /// and which a real checkpoint does not, since the shards refuse them).
+    engram_dir: Option<PathBuf>,
 }
 
 /// Where the weights come from.
@@ -527,7 +569,320 @@ fn checkpoint_recipe(path: &Path, tokenizer: &Path) -> Result<Recipe, String> {
         config,
         weights: Weights::Checkpoint { dir, index },
         tokenizer: tokenizer.to_path_buf(),
+        // The caller attaches --engram-dir after resolving the source; a checkpoint recipe
+        // itself does not know where a packed store lives.
+        engram_dir: None,
     })
+}
+
+// ---------------------------------------------------------------------------------------
+// Engram on the packed store
+// ---------------------------------------------------------------------------------------
+//
+// The reference pass already pages the two Engram tables: `engram_forward` asks the weight source
+// for the byte ranges of the rows a chunk looks up, and falls back to a whole-tensor read only
+// when the source cannot answer ranges. What was missing in `sparkflash serve` was a source that
+// answers them from the packed dense store. This section is that source.
+//
+// It deliberately does no decoding and no hashing: the engine owns which rows a chunk wants, this
+// only translates "weight bytes [id*width, id*width+width)" into "packed row id" and back. The
+// rows are read through `sparkflash_engram::store::DirectTable`, which is the existing O_DIRECT
+// windowed reader over the packer's 264-byte rows, with its mmap fallback for a filesystem that
+// refuses direct I/O.
+//
+// Everything here is single-process and host-side. Multi-rank placement, a device-side reader and
+// the measured cost of this path are not claimed here: the read count and granularity are host
+// properties the tests state, and the latency/bandwidth are what the window has to measure.
+
+/// One Engram layer's tensor geometry, resolved from the served configuration.
+#[derive(Debug, Clone, Copy)]
+struct EngramRoute {
+    /// The backbone layer whose table this is.
+    layer_id: usize,
+    /// Bytes of one weight row (the released 256).
+    width: usize,
+    /// Bytes of one scale row (the released 8).
+    scale_width: usize,
+}
+
+/// The read counters of one serving process's Engram paging.
+///
+/// These count what the *engine asked for*: two range requests per layer per chunk (weight and
+/// scale), the rows those requests named, the batched row reads that served them and the bytes
+/// returned. They are not a performance measurement: the windowed reader fetches aligned windows,
+/// so its real I/O is a multiple of `bytes_requested` and that amplification is a window result.
+#[derive(Debug, Default)]
+struct EngramPagingStats {
+    weight_requests: AtomicU64,
+    scale_requests: AtomicU64,
+    rows_requested: AtomicU64,
+    read_batches: AtomicU64,
+    bytes_requested: AtomicU64,
+}
+
+/// A point-in-time copy of [`EngramPagingStats`], for a test.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct EngramPagingSnapshot {
+    weight_requests: u64,
+    scale_requests: u64,
+    rows_requested: u64,
+    read_batches: u64,
+    bytes_requested: u64,
+}
+
+impl EngramPagingStats {
+    #[cfg(test)]
+    fn snapshot(&self) -> EngramPagingSnapshot {
+        EngramPagingSnapshot {
+            weight_requests: self.weight_requests.load(Ordering::Relaxed),
+            scale_requests: self.scale_requests.load(Ordering::Relaxed),
+            rows_requested: self.rows_requested.load(Ordering::Relaxed),
+            read_batches: self.read_batches.load(Ordering::Relaxed),
+            bytes_requested: self.bytes_requested.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A [`WeightSource`] that pages the two Engram tables from the packed dense store.
+///
+/// Every other tensor is delegated unchanged to `inner`; only `layers.N.engram.embed.weight` and
+/// `layers.N.engram.embed.scale` are answered from the packed rows. A whole-tensor read of those
+/// two names is *not* intercepted: it goes to `inner` and is refused there, which is the honest
+/// answer for a 98 GB table and keeps a caller from silently allocating one.
+struct DiskEngramWeights {
+    /// The rest of the model: the checkpoint source (or, in a host test, a synthetic one).
+    inner: Box<dyn WeightSource>,
+    /// The windowed reader over the packed rank files.
+    table: DirectTable,
+    /// The layers this run's configuration declares, with their tensor widths.
+    routes: Vec<EngramRoute>,
+    /// What has been asked for and served so far.
+    stats: Arc<EngramPagingStats>,
+}
+
+impl DiskEngramWeights {
+    /// Opens the packed store in `dir` and wraps `inner`, which keeps serving every other tensor.
+    ///
+    /// The manifest names the rank files and the world size; every rank file is opened because a
+    /// single reference process has no rank of its own and a chunk's hash ids may fall in any
+    /// rank's row range. A rank-local serving process is a later wiring question.
+    ///
+    /// # Errors
+    /// When the manifest is missing or unreadable, when it disagrees with the compiled geometry
+    /// or the served configuration, or when a rank file cannot be opened as the packer wrote it.
+    fn open(
+        inner: Box<dyn WeightSource>,
+        dir: &Path,
+        config: &ModelConfig,
+    ) -> Result<Self, String> {
+        let manifest = load_engram_manifest(dir)?;
+        let world_size = manifest.world_size;
+        if world_size == 0 {
+            return Err(format!(
+                "--engram-dir {}: the manifest says world size 0",
+                dir.display()
+            ));
+        }
+        let mut specs = Vec::new();
+        for rank in 0..world_size {
+            let rank_specs = specs_from_manifest(&manifest, dir, rank, world_size)
+                .map_err(|error| format!("--engram-dir {}: {error}", dir.display()))?;
+            specs.extend(rank_specs);
+        }
+        let mut log = |reason: &str| {
+            eprintln!("sparkflash serve: engram: {reason}");
+        };
+        let table = DirectTable::open_with(specs, BackendPreference::Auto, &mut log)
+            .map_err(|error| format!("--engram-dir {}: {error}", dir.display()))?;
+        for index in 0..table.table_count() {
+            let (Some(spec), Some(backend)) = (table.spec(index), table.backend_of(index)) else {
+                continue;
+            };
+            eprintln!(
+                "sparkflash serve: engram layer {} rank {}/{}: {} on the {backend:?} backend, {} row window",
+                spec.layer_id,
+                spec.rank,
+                spec.world_size,
+                spec.path.display(),
+                spec.window_bytes
+            );
+        }
+        if let Some(reason) = table.fallback_reason() {
+            eprintln!("sparkflash serve: engram: O_DIRECT unavailable: {reason}");
+        }
+        Self::from_table(inner, table, config)
+    }
+
+    /// Wraps an already-opened reader. Split out so a host test can use a temporary fixture
+    /// instead of a 188 GiB packed store, without a second code path.
+    fn from_table(
+        inner: Box<dyn WeightSource>,
+        table: DirectTable,
+        config: &ModelConfig,
+    ) -> Result<Self, String> {
+        if config.engram_layer_ids.is_empty() {
+            return Err(
+                "--engram-dir: the served configuration declares no Engram layers".to_owned(),
+            );
+        }
+        let width = config.engram_head_dim;
+        let scale_width = width.div_ceil(SCALE_BLOCK);
+        let mut routes = Vec::with_capacity(config.engram_layer_ids.len());
+        for &layer_id in &config.engram_layer_ids {
+            let Some(rows) = config.engram_rows(layer_id) else {
+                continue;
+            };
+            let spec = (0..table.table_count())
+                .filter_map(|index| table.spec(index))
+                .find(|spec| spec.layer_id == layer_id)
+                .ok_or_else(|| {
+                    format!(
+                        "--engram-dir: the packed store has no table for Engram layer {layer_id}"
+                    )
+                })?;
+            if spec.logical_rows != rows as u64 {
+                return Err(format!(
+                    "--engram-dir: Engram layer {layer_id} has {} packed rows but the configuration says {rows}",
+                    spec.logical_rows
+                ));
+            }
+            // Reuse the serving translation's own validation for the width, so a configuration
+            // whose head width does not fit the packed row is refused at start-up rather than
+            // decoded wrongly at the first request.
+            PagedTable::new(&table, layer_id, width, scale_width)
+                .map_err(|error| format!("--engram-dir: {error}"))?;
+            routes.push(EngramRoute {
+                layer_id,
+                width,
+                scale_width,
+            });
+        }
+        // A packed layer the configuration does not use would be dead storage and a sign the two
+        // were produced from different checkpoints, so it is refused rather than ignored.
+        for index in 0..table.table_count() {
+            let Some(spec) = table.spec(index) else {
+                continue;
+            };
+            if !config.engram_layer_ids.contains(&spec.layer_id) {
+                return Err(format!(
+                    "--engram-dir: the packed store holds layer {} but the configuration's Engram layers are {:?}",
+                    spec.layer_id, config.engram_layer_ids
+                ));
+            }
+        }
+        Ok(Self {
+            inner,
+            table,
+            routes,
+            stats: Arc::new(EngramPagingStats::default()),
+        })
+    }
+
+    /// The route for one layer, if the configuration declared it.
+    fn route(&self, layer_id: usize) -> Option<EngramRoute> {
+        self.routes
+            .iter()
+            .copied()
+            .find(|route| route.layer_id == layer_id)
+    }
+}
+
+/// The Engram tensor a stored name addresses, with its layer id.
+///
+/// Only the two tensors the paged path exists for are recognised; every other name is `None` and
+/// is delegated to the wrapped source.
+fn engram_tensor_name(name: &str) -> Option<(usize, EngramTensor)> {
+    let rest = name.strip_prefix("layers.")?;
+    let (layer, tail) = rest.split_once('.')?;
+    let layer_id: usize = layer.parse().ok()?;
+    match tail {
+        "engram.embed.weight" => Some((layer_id, EngramTensor::Weight)),
+        "engram.embed.scale" => Some((layer_id, EngramTensor::Scale)),
+        _ => None,
+    }
+}
+
+/// Reads the packer's manifest from a directory before the engine thread starts using it.
+fn load_engram_manifest(dir: &Path) -> Result<PackManifest, String> {
+    let path = dir.join(MANIFEST_NAME);
+    let bytes = std::fs::read(&path).map_err(|error| {
+        format!(
+            "--engram-dir {}: cannot read {}: {error}",
+            dir.display(),
+            path.display()
+        )
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "--engram-dir {}: {} is not a usable packed-store manifest: {error}",
+            dir.display(),
+            path.display()
+        )
+    })
+}
+
+impl WeightSource for DiskEngramWeights {
+    fn names(&self) -> Vec<String> {
+        self.inner.names()
+    }
+
+    fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
+        self.inner.spec(name)
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+        // A whole-tensor read of an Engram table is exactly what this source exists to avoid, and
+        // the checkpoint source refuses it; delegating keeps that refusal in one place.
+        self.inner.read(name)
+    }
+
+    fn read_ranges(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Option<Result<Vec<u8>, WeightError>> {
+        let Some((layer_id, tensor)) = engram_tensor_name(name) else {
+            return self.inner.read_ranges(name, ranges);
+        };
+        let Some(route) = self.route(layer_id) else {
+            return Some(Err(WeightError::Missing {
+                name: name.to_owned(),
+            }));
+        };
+        let paged = match PagedTable::new(&self.table, layer_id, route.width, route.scale_width) {
+            Ok(paged) => paged,
+            Err(error) => {
+                return Some(Err(WeightError::Malformed {
+                    name: name.to_owned(),
+                    detail: error.to_string(),
+                }));
+            }
+        };
+        match paged.read(tensor, ranges) {
+            Ok(read) => {
+                let requests = match tensor {
+                    EngramTensor::Weight => &self.stats.weight_requests,
+                    EngramTensor::Scale => &self.stats.scale_requests,
+                };
+                requests.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .rows_requested
+                    .fetch_add(read.rows as u64, Ordering::Relaxed);
+                self.stats
+                    .read_batches
+                    .fetch_add(read.read_batches as u64, Ordering::Relaxed);
+                self.stats
+                    .bytes_requested
+                    .fetch_add(read.data.len() as u64, Ordering::Relaxed);
+                Some(Ok(read.data))
+            }
+            Err(error) => Some(Err(WeightError::Malformed {
+                name: name.to_owned(),
+                detail: error.to_string(),
+            })),
+        }
+    }
 }
 
 /// Loads the detokeniser, naming the flag when it cannot.
@@ -961,9 +1316,15 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 /// Builds the engine on the engine thread.
 ///
+/// When the recipe carries an `--engram-dir`, the checkpoint source is wrapped so the two Engram
+/// tables are paged from the packed dense store instead of being read as checkpoint tensors. The
+/// wrapper serves every other tensor unchanged, so this is the only difference in the engine the
+/// reference pass sees.
+///
 /// # Errors
 ///
-/// A message naming the checkpoint or the configuration when the engine cannot be built.
+/// A message naming the checkpoint, the packed Engram store or the configuration when the engine
+/// cannot be built.
 fn build_engine(recipe: &Recipe, element_limit: usize) -> Result<InferenceEngine, String> {
     let plan = TensorPlan::language_model(&recipe.config);
     let source: Box<dyn WeightSource> = match &recipe.weights {
@@ -989,6 +1350,10 @@ fn build_engine(recipe: &Recipe, element_limit: usize) -> Result<InferenceEngine
             armed: std::sync::atomic::AtomicBool::new(true),
             inner: SyntheticWeights::from_plan(&plan, *seed),
         }),
+    };
+    let source: Box<dyn WeightSource> = match &recipe.engram_dir {
+        Some(dir) => Box::new(DiskEngramWeights::open(source, dir, &recipe.config)?),
+        None => source,
     };
     InferenceEngine::new(recipe.config.clone(), source, element_limit)
         .map_err(|error| format!("cannot build the reference engine: {error}"))
@@ -1689,6 +2054,7 @@ mod tests {
                 seed: SYNTHETIC_WEIGHT_SEED,
             },
             tokenizer: reference_tokenizer_path(),
+            engram_dir: None,
         };
         ReferenceDriver::start(&recipe, REFERENCE_TENSOR_LIMIT, max_tokens)
             .expect("the synthetic driver starts")
@@ -1704,6 +2070,7 @@ mod tests {
                 name: "embed.weight",
             },
             tokenizer: reference_tokenizer_path(),
+            engram_dir: None,
         };
         ReferenceDriver::start(&recipe, REFERENCE_TENSOR_LIMIT, max_tokens)
             .expect("the panicking driver starts")
@@ -2120,6 +2487,35 @@ mod tests {
         let error = ServeOptions::parse(Vec::new()).expect_err("a server needs weights");
         assert!(error.contains("--synthetic"), "{error}");
         assert!(error.contains("--checkpoint"), "{error}");
+    }
+
+    #[test]
+    fn engram_dir_is_refused_with_the_synthetic_plan_and_carried_with_a_checkpoint() {
+        let error = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--engram-dir".to_owned(),
+            "/tmp/engram-tables".to_owned(),
+        ])
+        .expect_err("--synthetic has no checkpoint to page");
+        assert!(error.contains("--engram-dir"), "{error}");
+        assert!(error.contains("--checkpoint"), "{error}");
+
+        let options = ServeOptions::parse(vec![
+            "--checkpoint".to_owned(),
+            "/tmp/checkpoint".to_owned(),
+            "--engram-dir".to_owned(),
+            "/tmp/engram-tables".to_owned(),
+        ])
+        .expect("a checkpoint run may page its Engram tables");
+        assert_eq!(
+            options.engram_dir,
+            Some(PathBuf::from("/tmp/engram-tables")),
+            "the flag reaches the recipe that build_engine reads"
+        );
+        assert!(
+            options.checkpoint.is_some(),
+            "the checkpoint is still the weight source; --engram-dir only changes where its Engram rows come from"
+        );
     }
 
     #[test]
@@ -2950,5 +3346,292 @@ mod tests {
                 .all(|alternative| alternative.logprob == f32::NEG_INFINITY),
             "an all-NaN logit row reports the floor for every token"
         );
+    }
+}
+
+#[cfg(test)]
+mod engram_packed_store {
+    //! The packed-store serving path, on a temporary fixture: what it reads, how much, and that
+    //! it is the same arithmetic as the in-memory table.
+    //!
+    //! The fixture is the tiny configuration's real Engram table, obtained from
+    //! [SyntheticWeights] and re-packed into the packer's 264-byte dense rows in a temporary
+    //! file. The released 98 GB store is not needed to state the host properties: the packed
+    //! layout, the reader and the translation are the same code at any row count, and a test
+    //! that wrote the released geometry could not run here. The bytes the disk path returns are
+    //! the synthetic table's own bytes, so a logits comparison against the in-memory path is a
+    //! comparison of the two table *read* paths, not of two different models.
+
+    use std::sync::atomic::AtomicU64;
+
+    use sparkflash_api::encoding::reference_tokenizer_path;
+    use sparkflash_engine::forward::SequenceState;
+    use sparkflash_engram::layout::{ENGRAM_HEAD_DIM, ENGRAM_ROW_BYTES};
+    use sparkflash_engram::packer::align_up;
+    use sparkflash_engram::store::{TableSpec, TailFill};
+
+    use super::*;
+
+    /// An in-memory source that counts (and refuses) any whole-table Engram read, so the test can
+    /// show the paged path never fell back to materialising a table.
+    struct NoWholeTableEngramReads {
+        inner: SyntheticWeights,
+        engram_reads: Arc<AtomicU64>,
+    }
+
+    impl WeightSource for NoWholeTableEngramReads {
+        fn names(&self) -> Vec<String> {
+            self.inner.names()
+        }
+
+        fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
+            self.inner.spec(name)
+        }
+
+        fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+            if engram_tensor_name(name).is_some() {
+                self.engram_reads.fetch_add(1, Ordering::Relaxed);
+                return Err(WeightError::Refused {
+                    name: name.to_owned(),
+                    detail: "the paged Engram path must not read the whole table".to_owned(),
+                });
+            }
+            self.inner.read(name)
+        }
+
+        fn read_ranges(
+            &self,
+            name: &str,
+            ranges: &[(u64, usize)],
+        ) -> Option<Result<Vec<u8>, WeightError>> {
+            if engram_tensor_name(name).is_some() {
+                self.engram_reads.fetch_add(1, Ordering::Relaxed);
+                return Some(Err(WeightError::Refused {
+                    name: name.to_owned(),
+                    detail: "the paged Engram path must not read the table as a tensor".to_owned(),
+                }));
+            }
+            self.inner.read_ranges(name, ranges)
+        }
+    }
+
+    /// A packed dense store holding the tiny configuration's layer-1 Engram table.
+    struct PackedFixture {
+        _dir: tempfile::TempDir,
+        spec: TableSpec,
+    }
+
+    fn packed_fixture(config: &ModelConfig) -> PackedFixture {
+        let plan = TensorPlan::language_model(config);
+        let synthetic = SyntheticWeights::from_plan(&plan, SYNTHETIC_WEIGHT_SEED);
+        let rows = config
+            .engram_rows(1)
+            .expect("the tiny configuration has layer 1");
+        let width = config.engram_head_dim;
+        let scale_width = width.div_ceil(SCALE_BLOCK);
+        assert!(
+            width <= ENGRAM_HEAD_DIM
+                && scale_width <= sparkflash_engram::layout::ENGRAM_SCALE_BYTES
+        );
+        let weight = synthetic
+            .read("layers.1.engram.embed.weight")
+            .expect("the synthetic table's weights");
+        let scale = synthetic
+            .read("layers.1.engram.embed.scale")
+            .expect("the synthetic table's scales");
+        assert_eq!(weight.len(), rows * width);
+        assert_eq!(scale.len(), rows * scale_width);
+        let mut bytes = Vec::with_capacity(rows * ENGRAM_ROW_BYTES);
+        for row in 0..rows {
+            let mut dense = [0u8; ENGRAM_ROW_BYTES];
+            dense[..width].copy_from_slice(&weight[row * width..(row + 1) * width]);
+            dense[ENGRAM_HEAD_DIM..ENGRAM_HEAD_DIM + scale_width]
+                .copy_from_slice(&scale[row * scale_width..(row + 1) * scale_width]);
+            bytes.extend_from_slice(&dense);
+        }
+        bytes.resize(align_up(bytes.len() as u64) as usize, 0);
+        let dir = tempfile::TempDir::new().expect("a temporary directory");
+        let path = dir.path().join("engram-l1-r0of1.bin");
+        std::fs::write(&path, &bytes).expect("write the packed fixture table");
+        let spec = TableSpec {
+            layer_id: 1,
+            layer_index: 0,
+            rank: 0,
+            world_size: 1,
+            path,
+            row_start: 0,
+            physical_rows: rows as u64,
+            logical_rows: rows as u64,
+            window_bytes: 512,
+            tail_fill: TailFill::Reference,
+        };
+        PackedFixture { _dir: dir, spec }
+    }
+
+    #[test]
+    fn the_disk_paged_path_returns_the_same_logits_as_the_in_memory_table() {
+        let config = ModelConfig::tiny();
+        let plan = TensorPlan::language_model(&config);
+        let fixture = packed_fixture(&config);
+        let tokens = [3u32, 4, 5, 6];
+
+        let in_memory = InferenceEngine::new(
+            config.clone(),
+            Box::new(SyntheticWeights::from_plan(&plan, SYNTHETIC_WEIGHT_SEED)),
+            REFERENCE_TENSOR_LIMIT,
+        )
+        .expect("the in-memory engine builds");
+        let reference = in_memory
+            .prefill(&mut SequenceState::new(&config), &tokens)
+            .expect("the in-memory prefill runs");
+
+        let table = DirectTable::open(vec![fixture.spec.clone()]).expect("open the packed fixture");
+        let engram_reads = Arc::new(AtomicU64::new(0));
+        let source = DiskEngramWeights::from_table(
+            Box::new(NoWholeTableEngramReads {
+                inner: SyntheticWeights::from_plan(&plan, SYNTHETIC_WEIGHT_SEED),
+                engram_reads: engram_reads.clone(),
+            }),
+            table,
+            &config,
+        )
+        .expect("the packed source wraps the engine's source");
+        let stats = source.stats.clone();
+        let disk = InferenceEngine::new(config.clone(), Box::new(source), REFERENCE_TENSOR_LIMIT)
+            .expect("the disk-paged engine builds");
+        let got = disk
+            .prefill(&mut SequenceState::new(&config), &tokens)
+            .expect("the disk-paged prefill runs");
+
+        assert_eq!(
+            got.logits
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            reference
+                .logits
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "the two read paths must be bitwise identical, not merely close"
+        );
+        assert_eq!(
+            got.head_input
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            reference
+                .head_input
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(got.next_token, reference.next_token);
+        assert_eq!(
+            engram_reads.load(Ordering::Relaxed),
+            0,
+            "the engine asked the checkpoint source for no whole Engram table"
+        );
+
+        // What was asked for: one range request per stored tensor per layer per chunk, and one
+        // batched row read per request.
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.weight_requests, 1, "one weight range request");
+        assert_eq!(snapshot.scale_requests, 1, "one scale range request");
+        assert_eq!(
+            snapshot.read_batches, 2,
+            "each range request became one batched row read"
+        );
+        assert_eq!(
+            snapshot.rows_requested % 2,
+            0,
+            "the weight and scale requests name the same rows"
+        );
+        let distinct = snapshot.rows_requested / 2;
+        let columns = (config.engram_max_ngram_size - 1) * config.engram_n_heads;
+        assert!(
+            (1..=tokens.len() * columns).contains(&(distinct as usize)),
+            "{distinct} distinct rows for {} tokens x {columns} hash columns",
+            tokens.len()
+        );
+        let width = config.engram_head_dim;
+        let scale_width = width.div_ceil(SCALE_BLOCK);
+        assert_eq!(
+            snapshot.bytes_requested,
+            distinct * (width + scale_width) as u64,
+            "the bytes requested are exactly the rows' bytes, not a table"
+        );
+    }
+
+    #[test]
+    fn a_whole_table_engram_read_still_goes_to_the_inner_source_and_is_refused() {
+        let config = ModelConfig::tiny();
+        let fixture = packed_fixture(&config);
+        let table = DirectTable::open(vec![fixture.spec.clone()]).expect("open the packed fixture");
+        let engram_reads = Arc::new(AtomicU64::new(0));
+        let plan = TensorPlan::language_model(&config);
+        let source = DiskEngramWeights::from_table(
+            Box::new(NoWholeTableEngramReads {
+                inner: SyntheticWeights::from_plan(&plan, SYNTHETIC_WEIGHT_SEED),
+                engram_reads: engram_reads.clone(),
+            }),
+            table,
+            &config,
+        )
+        .expect("the packed source wraps the engine's source");
+        let error = source
+            .read("layers.1.engram.embed.weight")
+            .expect_err("a whole-table read is refused");
+        assert!(matches!(error, WeightError::Refused { .. }), "{error}");
+        assert_eq!(
+            engram_reads.load(Ordering::Relaxed),
+            1,
+            "the whole-table read reached the inner source's refusal"
+        );
+    }
+
+    #[test]
+    fn only_the_two_paged_engram_tensors_are_recognised() {
+        assert_eq!(
+            engram_tensor_name("layers.1.engram.embed.weight"),
+            Some((1, EngramTensor::Weight))
+        );
+        assert_eq!(
+            engram_tensor_name("layers.14.engram.embed.scale"),
+            Some((14, EngramTensor::Scale))
+        );
+        for name in [
+            "layers.1.engram.wkv.weight",
+            "layers.1.attn.wq.weight",
+            "layers.1.engram.embed.weight.extra",
+            "embed.weight",
+            "layers.x.engram.embed.weight",
+        ] {
+            assert_eq!(
+                engram_tensor_name(name),
+                None,
+                "{name} is not a paged tensor"
+            );
+        }
+    }
+
+    #[test]
+    fn an_engram_dir_reaches_the_weight_source_and_a_missing_manifest_is_named() {
+        let config = ModelConfig::tiny();
+        let missing = tempfile::TempDir::new().expect("a temporary directory");
+        let recipe = Recipe {
+            config,
+            weights: Weights::Synthetic {
+                seed: SYNTHETIC_WEIGHT_SEED,
+            },
+            tokenizer: reference_tokenizer_path(),
+            engram_dir: Some(missing.path().to_path_buf()),
+        };
+        let error = match build_engine(&recipe, REFERENCE_TENSOR_LIMIT) {
+            Ok(_) => panic!("a directory without a manifest cannot serve Engram rows"),
+            Err(error) => error,
+        };
+        assert!(error.contains("--engram-dir"), "{error}");
+        assert!(error.contains(MANIFEST_NAME), "{error}");
     }
 }

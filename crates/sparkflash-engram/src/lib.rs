@@ -26,6 +26,7 @@ pub mod compress;
 pub mod hash;
 pub mod layout;
 pub mod packer;
+pub mod paged;
 pub mod prefetch;
 pub mod primes;
 pub mod store;

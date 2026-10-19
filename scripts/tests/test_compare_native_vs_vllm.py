@@ -136,6 +136,17 @@ class DumpTest(unittest.TestCase):
             compare.read_dump(self.dump)
 
 
+    def test_the_existing_d40_demo_dump_is_readable(self):
+        """The compatibility fixture is a dump this test did not write."""
+        path = os.path.normpath(os.path.join(SCRIPTS, "..", "crates", "sparkflash-cli", "tests",
+                                             "fixtures", "logits-dump-demo-scale.jsonl"))
+        rows = compare.read_dump(path)
+        self.assertEqual([row["position"] for row in rows], list(range(129, 138)))
+        self.assertEqual([row["vocab"] for row in rows], [129280] * 9)
+        self.assertEqual([row["logits_offset"] for row in rows],
+                         [index * 129280 * 4 for index in range(9)])
+
+
 class PositionMetricsTest(unittest.TestCase):
     def _oracle(self, logprobs):
         ranked = sorted(logprobs.items(), key=lambda item: (-item[1], item[0]))

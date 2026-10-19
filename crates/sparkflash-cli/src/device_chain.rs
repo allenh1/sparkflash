@@ -2632,7 +2632,7 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             // soon as the compared rows exist and before the token-parity gate can return, so a
             // failing parity run still leaves its logits; it changes no arithmetic and prints no
             // line, so the stage's existing output stays byte-identical.
-            let _ = write_logits_dump(
+            let _ = crate::logits_dump::write_logits_dump(
                 path,
                 &rows,
                 &sequence_outputs,
@@ -3517,115 +3517,6 @@ fn sequence_comparison_rows(
     rows
 }
 
-/// The largest `count` logits, descending by value and then ascending by id. It is [top5]'s
-/// ordering with a parameter, used only by the logits dump.
-#[cfg(feature = "cuda")]
-fn top_logits(logits: &[f32], count: usize) -> Vec<(u32, f32)> {
-    let mut indices: Vec<usize> = (0..logits.len()).collect();
-    indices.sort_by(|left, right| {
-        logits[*right]
-            .total_cmp(&logits[*left])
-            .then_with(|| left.cmp(right))
-    });
-    indices
-        .into_iter()
-        .take(count)
-        .map(|index| (index as u32, logits[index]))
-        .collect()
-}
-
-/// Writes the vLLM numeric-comparison dump for the compared sequence positions.
-///
-/// `<path>` receives one JSON object per line: position, the device head's argmax token id, the
-/// argmax of the dumped logits, the reference/fixture token ids where they exist, the vocabulary
-/// size, the byte offset of this position's block in the sidecar, and the top-20 (token_id, logit)
-/// pairs. `<path>.bin` receives the full vocabulary logits as little-endian f32 blocks in the same
-/// position order, so the comparison can rebuild any screened/masked set.
-///
-/// The rows are the rows the token table already compared: position 129 then the decode
-/// positions for a full claim, else positions 0.. for a short run. The dump changes no arithmetic
-/// and writes no stdout line; the returned count is the number of positions written.
-///
-/// # Errors
-/// A path that cannot be created/written, or a JSON serialisation failure.
-#[cfg(feature = "cuda")]
-fn write_logits_dump(
-    path: &std::path::Path,
-    rows: &[(usize, Option<u32>, Option<u32>, bool)],
-    outputs: &[sparkflash_engine::forward::HybridTokenOutput],
-    first_output: usize,
-    full_claim: bool,
-    fixture_steps: &[Option<u32>],
-    prompt_len: usize,
-) -> Result<usize, String> {
-    use std::io::Write;
-
-    let mut bin_path = path.as_os_str().to_owned();
-    bin_path.push(".bin");
-    let bin_path = std::path::PathBuf::from(bin_path);
-    let text_file = std::fs::File::create(path)
-        .map_err(|error| format!("logits dump {}: {error}", path.display()))?;
-    let bin_file = std::fs::File::create(&bin_path)
-        .map_err(|error| format!("logits dump {}: {error}", bin_path.display()))?;
-    let mut text = std::io::BufWriter::new(text_file);
-    let mut bin = std::io::BufWriter::new(bin_file);
-    let mut written = 0usize;
-    let mut offset = 0usize;
-    for (row, (position, reference, hybrid, exact)) in rows.iter().enumerate() {
-        let Some(output) = outputs.get(first_output + row) else {
-            continue;
-        };
-        let logits = &output.logits;
-        if logits.is_empty() {
-            continue;
-        }
-        let mut argmax = 0usize;
-        for (index, value) in logits.iter().enumerate() {
-            if value.total_cmp(&logits[argmax]).is_gt() {
-                argmax = index;
-            }
-        }
-        let mut block = Vec::with_capacity(logits.len() * 4);
-        for value in logits {
-            block.extend_from_slice(&value.to_le_bytes());
-        }
-        bin.write_all(&block)
-            .map_err(|error| format!("logits dump {}: {error}", bin_path.display()))?;
-        let fixture_index = position.saturating_sub(prompt_len.saturating_sub(1));
-        let fixture_id = if full_claim {
-            fixture_steps.get(fixture_index).copied().flatten()
-        } else {
-            None
-        };
-        let top: Vec<serde_json::Value> = top_logits(logits, 20)
-            .into_iter()
-            .map(|(id, value)| serde_json::json!([id, f64::from(value)]))
-            .collect();
-        let object = serde_json::json!({
-            "position": position,
-            "device_argmax": output.token,
-            "logits_argmax": u32::try_from(argmax).unwrap_or(u32::MAX),
-            "reference_id": reference,
-            "hybrid_id": hybrid,
-            "fixture_id": fixture_id,
-            "exact_token_equal": exact,
-            "vocab": logits.len(),
-            "logits_offset": offset,
-            "logits_bin": bin_path.display().to_string(),
-            "top20": top,
-        });
-        writeln!(text, "{object}")
-            .map_err(|error| format!("logits dump {}: {error}", path.display()))?;
-        offset += logits.len() * 4;
-        written += 1;
-    }
-    text.flush()
-        .map_err(|error| format!("logits dump {}: {error}", path.display()))?;
-    bin.flush()
-        .map_err(|error| format!("logits dump {}: {error}", bin_path.display()))?;
-    Ok(written)
-}
-
 /// The five largest logits, descending by value and then ascending by index.
 #[cfg(feature = "cuda")]
 fn token_text(token: Option<u32>) -> String {
@@ -4458,69 +4349,6 @@ mod tests {
             Some(vec![126, 127, 128, 129, 130]),
             "the audit captures at the twin ladder, it does not replace it"
         );
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn the_logits_dump_is_one_jsonl_object_and_one_le_f32_block_per_position() {
-        use sparkflash_engine::forward::HybridTokenOutput;
-
-        let output = |logits: Vec<f32>, token: u32| HybridTokenOutput {
-            layers: Vec::new(),
-            tail_stages: Vec::new(),
-            head_input: Vec::new(),
-            logits,
-            token: Some(token),
-            certified_mask: None,
-        };
-        let outputs = vec![
-            output(vec![0.5, -1.0, 3.25, 2.0], 2),
-            output(vec![9.0, 0.0], 0),
-        ];
-        let rows = vec![
-            (129usize, Some(3), Some(2), false),
-            (130, Some(0), Some(0), true),
-        ];
-        let fixture_steps = vec![Some(7), Some(0)];
-        let path = std::env::temp_dir().join(format!(
-            "sparkflash-logits-dump-test-{}.jsonl",
-            std::process::id()
-        ));
-        // The full 130-prompt claim starts the token table at position 129 = prompt_len - 1.
-        let written = write_logits_dump(&path, &rows, &outputs, 0, true, &fixture_steps, 130)
-            .expect("the dump writes");
-        assert_eq!(written, 2);
-        let text = std::fs::read_to_string(&path).expect("the jsonl reads back");
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2);
-        let first: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON line 1");
-        assert_eq!(first["position"], 129);
-        assert_eq!(first["device_argmax"], 2);
-        assert_eq!(first["logits_argmax"], 2);
-        assert_eq!(first["reference_id"], 3);
-        assert_eq!(first["fixture_id"], 7);
-        assert_eq!(first["vocab"], 4);
-        assert_eq!(first["logits_offset"], 0);
-        let top = first["top20"].as_array().expect("top20 is an array");
-        assert_eq!(top.len(), 4);
-        assert_eq!(top[0], serde_json::json!([2, 3.25]));
-        assert_eq!(top[1], serde_json::json!([3, 2.0]));
-        let second: serde_json::Value = serde_json::from_str(lines[1]).expect("valid JSON line 2");
-        assert_eq!(second["position"], 130);
-        assert_eq!(second["logits_offset"], 16);
-        assert_eq!(second["fixture_id"], 0);
-        let bin = std::fs::read(format!("{}.bin", path.display())).expect("the f32 sidecar reads");
-        assert_eq!(bin.len(), (4 + 2) * 4);
-        assert_eq!(
-            f32::from_le_bytes(bin[0..4].try_into().expect("four bytes")),
-            0.5
-        );
-        assert_eq!(
-            f32::from_le_bytes(bin[16..20].try_into().expect("four bytes")),
-            9.0
-        );
-        std::fs::remove_file(&path).expect("the jsonl is removable");
-        std::fs::remove_file(format!("{}.bin", path.display())).expect("the sidecar is removable");
     }
 
     #[cfg(feature = "cuda")]

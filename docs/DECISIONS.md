@@ -34,7 +34,7 @@ records the evidence and the consequence for the build. Research backing is in
 | D23 | The activation quantiser is the reference ceil rule | Device activation quantisers take the smallest power of two at or above `amax/448` after the 1e-4 amax floor (the engine's `quantize_activation_fp8` rule); the checkpoint weight-grid rule stays floor-log2 and the two helpers are named apart (D8) |
 | D24 | CSA attention attends the window/compressed union | Format 2 (CSA-union) attends the window rows then the selected compressed ids, causal, with the sink first in the denominator; the 19-param ABI and formats 0/1 are unchanged, and it is reference-tested/CPU-pinned only until a device window proves it |
 | D25 | The golden sequence fixture is Phase-2 reference truth | The real-checkpoint fixture (`e6df8290...`, 2,536,194 B; 130-token prefill with next token 491, 8 decodes, compared 129..137) is the truth 2B/2C are measured against; device output is compared token-first then logits at 2e-2; the 2B device plumbing (rotation + format-2/1 dispatch, no forward chain) was merged as !63 (1ceeb54) and ran the corrected path on the node in the 2026-10-18T18:32Z window (11,764 copies, 198,832,128 B in 0.025624 s copy-only, 360 dispatches), the token/logits comparison has not run, criterion 1 stays OPEN, and the fixture is never regenerated to accommodate a device change |
-| D26 | The Milestone-4 ABI source-text lint is frozen | No new source-text scanner, parser or lint in `m4_abi.rs`; new kernel invariants are enforced by compiled-artifact inspection (cubin/PTX baseline) or runtime device assertions, and `ci/check-m4-abi-size.sh` fails CI if the file's line count differs from its pinned count |
+| D26 | The Milestone-4 ABI source-text lint is frozen | No new source-text scanner, parser or lint in the `m4_abi` family (`m4_abi.rs` plus its pinned submodules); new kernel invariants are enforced by compiled-artifact inspection (cubin/PTX baseline) or runtime device assertions, and `ci/check-m4-abi-size.sh` fails CI if the family's aggregate line count differs from its pinned count |
 | D27 | The capability boundary has no vision channel | `Capabilities` has no `vision` field, `/v1/models` reports `multimodal: false`, and an image request is refused before generation with typed `MissingCapability::vision()` (HTTP 400 `unsupported_capability`); the 32x32 dummy grid and its 121 fabricated visual tokens are deleted, and `EngineRequest` carries the parsed `images: Vec<ImagePart>` (inline parts hold the decoded bytes) rather than `image_tokens`; the known protocol image `type`s are explicit part variants and a raw-body scan (`prompt::find_image_carrier`) refuses any image-family carrier the typed parser did not record, wherever it appears and in any case (a schema-name map key whose value is itself a JSON Schema aside) |
 | D28 | The reference engine is `Send + Sync` | `WeightSource` gained `Send + Sync` in !60 (`f72738b`), so `forward::InferenceEngine` is `Send + Sync`; `serve.rs`'s module docs are corrected and a compile-time assertion pins it, while the single-owner engine thread stays because the pass is one-sequence-at-a-time and the sampler swap consumes the engine, not because of thread-safety |
 | D29 | The ibverbs backend is real and dual-rail capable | The `rdma` feature's libibverbs backend, its repr(C) ABI mirror and the three cluster gate bodies are real, and the deployed vLLM reference is measured single rail (NCCL_IB_HCA=rocep1s0f1); no hardware gate has run and no frame has crossed a wire, host-memory staging, active MTU 1024 and driver 580.173.02 remain gaps, and single-rail mode refuses to claim dual-rail evidence |
@@ -1313,7 +1313,11 @@ freeze notice this entry records, 13,893 after the `m7_layer0` split replaced th
 `include_str!`s of the single example file with one concatenation constant (the split moved the
 pinned statements into per-stage modules; the pins scan the same text, concatenated), and 13,906
 after the task-11 follow-up hardening (the corrected round-33 claim, crate-relative baseline paths,
-the exact `m7_layer0/main.rs` witness and the four-token check over the concatenation).
+the exact `m7_layer0/main.rs` witness and the four-token check over the concatenation). The
+quarantine split of 2026-10-19 (task-27, `docs/build/m4-abi-split.md`) then moved the scanners into
+pinned submodules without editing them: 13,906 lines before the split, 13,924 after it as the
+aggregate over the root file and the two submodules, with the 64 test ids and their
+`cargo test -- --list` output byte-identical.
 
 **Decision.** Freeze the file. (1) No new source-text scanner, parser or lint for a new kernel
 invariant is added to it. A new invariant is enforced by compiling the kernel and inspecting the
@@ -1323,9 +1327,11 @@ kernels and compares cubin bytes, cubin sha256 and PTX `membar` line count again
 runtime device assertion in a harness (the `m7_layer0` device stages), where the shipped binary is
 what is measured. (2) Defects in the scanners already present are still fixed, with the mutation proof
 the module requires: the freeze is on length, not on correctness. (3) The committed line count is
-pinned by `ci/check-m4-abi-size.sh` and enforced by the `m4-abi-freeze` job in `.gitlab-ci.yml`: any
-line-count change, growth or shrink, fails the pipeline, so a commit that changes the length must
-change `PINNED_LINES` in the same diff. That diff is the deliberate, reviewable act; a scanner cannot arrive as a side effect of an
+pinned by `ci/check-m4-abi-size.sh` and enforced by the `m4-abi-freeze` job in `.gitlab-ci.yml`: the
+pin is the aggregate over the `m4_abi` family (`m4_abi.rs`, `m4_abi/scanner.rs`,
+`m4_abi/acquire_guard.rs`), so any net line-count change, growth or shrink, and any change to the
+pinned file set, fails the pipeline; a commit that changes the length must change `PINNED_LINES` in
+the same diff. That diff is the deliberate, reviewable act; a scanner cannot arrive as a side effect of an
 unrelated edit.
 
 **Consequence.** A proposed kernel invariant that can only be enforced by reading source text must
@@ -1335,11 +1341,13 @@ harness. A new parser feature in `m4_abi.rs` is now a policy exception that need
 decision, not a maintenance change. Nothing in this entry alters the kernels or the scanners'
 verdicts: the existing tests keep gating every pipeline.
 
-**Verification.** Notice plus a CI script, no behaviour change: `wc -l` on the file (13,906 lines),
-`sh ci/check-m4-abi-size.sh` prints the pin line and was run against a one-line growth (exit 1) and
-against the restored file (exit 0), and `cargo test -p sparkflash-kernels` continues to run the
-module's own tests, which this change does not edit. No GPU, no checkpoint and no cluster were
-involved.
+**Verification.** Notice plus a CI script, no behaviour change: the pre-split `wc -l` was 13,906 lines
+(one file) and the post-split aggregate is 13,924 (`m4_abi.rs` 2,979 + `m4_abi/scanner.rs` 4,313 +
+`m4_abi/acquire_guard.rs` 6,632); `sh ci/check-m4-abi-size.sh` prints the aggregate pin and fails on
+any change; `python3 ci/verify-m4-abi-split.py` regenerates the three files from `0639413` and fails
+on any edit outside the glue and the two allow-listed self-scan adapters it names; and
+`cargo test -p sparkflash-kernels --lib -- --list | sort` is byte-identical before and after the
+split (338 lines, 64 `m4_abi` tests). No GPU, no checkpoint and no cluster were involved.
 
 ---
 
@@ -2245,6 +2253,13 @@ D37, the token-first bar in D25, and the reference-truth wording for the f32 fix
    BF16-class activations) is not a more faithful run of this checkpoint: it computes a different
    model from the one that was trained and is served. The precision-first family is rejected, and
    its artifacts stay unmerged experiments.
+   **Note (task-29, 2026-10-19):** rule 1 rejects computing the trained quantised weights at
+   *higher* precision; it does not apply to `wo_a`, whose native activation is bf16
+   (`model.py:766-788`; `convert.py:154-173` dequantises that weight to bf16 in the released
+   checkpoint). The `b12x_bf16a_mxfp8w_wo_a` kernel variant is therefore the native rule for that
+   one projection, not a precision-first experiment: it keeps the E4M3 32x32 weights and the f32
+   accumulation and removes only the activation quantisation native does not perform. The dense
+   bf16a variants remain unwired experiments and the precision-first family stays rejected.
 2. **No token-equality criterion.** Generation is not deterministic across implementations (kernel
    choice, reduction order, scheduling, batching), so a token-for-token bar can fail a correct
    native chain and pass an incorrect one. Acceptance is numeric and distributional, at declared
@@ -2294,8 +2309,10 @@ simulation - not a device defect.
   a3ba6763cc8f5087ab65dc7771e28e37e9b3a18842d2e72542c3f22f7344ef70) starts the released recipe.
 - Unmerged experiments are recorded, not delivered: task/d37-precision dd4184e (env-gated host-f32
   projection seam, never run) and batch/2026-10-19-25 6c1d582 (BF16-activation projection kernels,
-  host-tested and pinned, GPU comparison not run). The machine-readable logits dump for the numeric
-  comparison is task/logits-dump 4f599b7 (binary sha256
+  host-tested and pinned, GPU comparison not run; the dense variants are rejected precision
+  experiments, while the `_wo_a` variant is the native rule for that projection - see the
+  task-29 note under D39 - and F1's isolation is still unmeasured). The machine-readable logits
+  dump for the numeric comparison is task/logits-dump 4f599b7 (binary sha256
   7e0ce4bf2390ec078f70098eb5e77881b518e5d0ed58f9155b669a355a8d48cc).
 - **Kernel-level audit follow-up (same day, kernel-dev, branch batch/2026-10-19-25 b773e87,
   docs/build/native-kernel-arithmetic-audit.md).** Auditing the shipped kernels against the released

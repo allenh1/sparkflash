@@ -7,6 +7,7 @@
 pub mod attention_device;
 pub mod device_chain;
 pub mod doctor;
+pub mod logits_dump;
 #[cfg(feature = "cuda")]
 pub mod moe_device;
 pub mod serve;

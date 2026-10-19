@@ -24,9 +24,12 @@ Parity is three gates, not a token comparison:
   measured against the recorded vLLM TP=4 baseline on the same hardware, prompt suite and batch
   sizes, with perf bars declared before the run.
 
-Non-goals: the precision-first family (host-f32 `dd4184e`, BF16-activation kernels `6c1d582`) is
-rejected by D39 and stays unmerged; token-for-token equality is retired; Engram tables stay
-disk-offloaded (user directive), not staged into HBM.
+Non-goals: the precision-first family (host-f32 `dd4184e`, and the **dense** BF16-activation
+kernels of `6c1d582`) is rejected by D39 and stays unmerged - with one documented exception: the
+`b12x_bf16a_mxfp8w_wo_a` variant is not a precision experiment, because native's `wo_a`
+activation is bf16 (`model.py:766-788`); it is the native rule for that projection, while the
+dense bf16a variants remain rejected and F1's isolation is still unmeasured. Token-for-token
+equality is retired; Engram tables stay disk-offloaded (user directive), not staged into HBM.
 
 ## 1. Where the work starts (2026-10-19)
 
@@ -37,7 +40,7 @@ disk-offloaded (user directive), not staged into HBM.
 | Kernel-level audit M1-M4 (wo_a BF16, MoE combine, unweighted SwiGLU, mega_mhc) | merged as docs (b773e87) |
 | Stage-level audit F1-F8 (wo_a HIGH, body probs, indexer, Engram, pre-rounds, combine, f32 libm) | merged as docs (15cf26e) |
 | Hybrid device chain merge (native path, 19 files, +3571/-266) | resolved on `task/hybrid-merge` (gates green: 1476 tests); S1 lands it |
-| Machine-readable logits dump (`--dump-logits`) | branch `task/logits-dump` `4f599b7`; O6 lands it |
+| Machine-readable logits dump (`--dump-logits`) | in tree: `crates/sparkflash-cli/src/logits_dump.rs` (body from `task/logits-dump` `4f599b7`, unchanged); the one schema is [logits-dump.md](logits-dump.md); O6 done, host-tested, no device run |
 | CI check stage | green again (missing doc on `attention_forward_with_backend`, fixed in !113) |
 | Exploratory position-129 native-vs-vLLM comparison | b69 window (dump `runs69/logits-130x0.jsonl`, oracle staged) - recorded by O4 |
 
@@ -103,7 +106,7 @@ the merge (S1) unblocks all serving work.
   distribution (the b69 procedure: fixture prompt + one extra token, read the last prompt position).
 - **Device side:** `--dump-logits` writes per-position JSONL (device argmax, logits argmax, vocab,
   byte offset, top-20) plus the full-vocabulary f32 logits sidecar, which is the offline comparison
-  input.
+  input. The schema and its host tests are frozen in [logits-dump.md](logits-dump.md).
 - **Comparison:** per position and aggregate over the prompt suite - top-1 agreement, top-k overlap,
   max/mean |logprob delta| over the oracle top-k, and KL of the renormalised top-k distributions.
   Bars are declared in D40 before a run is a gate; the b69 comparison is exploratory and labelled as
