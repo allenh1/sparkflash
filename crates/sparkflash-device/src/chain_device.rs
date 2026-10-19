@@ -389,6 +389,53 @@ mod cuda_launcher {
 
     use crate::budget::{BudgetAdmission, BudgetError, BudgetRequest};
     use crate::staging::{EmbedRow, LayerZeroStaging, MhcBufferPlan};
+    use sparkflash_engine::forward::layer_zero::LayerZeroEntry;
+
+    /// Builds the layer-zero host handoff from the mHC kernel's f32 readback buffers.
+    ///
+    /// The kernel writes `hc_coeffs` as B (n*n, destination-major), A (n, the input/pre mixes) and
+    /// C (n, the output/post mixes). `Mixes` (and therefore [LayerZeroEntry]) stores comb as
+    /// source-major, so the 4x4 block is transposed here; the A and C slices copy in order.
+    fn entry_from_readback(xhat_normed: &[u8], hc_coeffs: &[u8]) -> Result<LayerZeroEntry, String> {
+        let expected_capture = HIDDEN * 4;
+        let expected_coeffs = 24 * 4;
+        if xhat_normed.len() != expected_capture {
+            return Err(format!(
+                "the mHC xhat_normed readback is {} bytes, expected {expected_capture}",
+                xhat_normed.len()
+            ));
+        }
+        if hc_coeffs.len() != expected_coeffs {
+            return Err(format!(
+                "the mHC hc_coeffs readback is {} bytes, expected {expected_coeffs}",
+                hc_coeffs.len()
+            ));
+        }
+        let f32s = |bytes: &[u8]| -> Vec<f32> {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
+                .collect()
+        };
+        let capture = f32s(xhat_normed);
+        let coeffs = f32s(hc_coeffs);
+        let hc = HC_MULT;
+        let mut comb = vec![0.0f32; hc * hc];
+        for destination in 0..hc {
+            for source in 0..hc {
+                comb[source * hc + destination] = coeffs[destination * hc + source];
+            }
+        }
+        Ok(LayerZeroEntry {
+            pre_attention_hidden: capture,
+            pre: coeffs[hc * hc..hc * hc + hc].to_vec(),
+            post: coeffs[hc * hc + hc..hc * hc + 2 * hc].to_vec(),
+            comb,
+            source: sparkflash_engine::forward::layer_zero::LayerZeroEntrySource::Device,
+        })
+    }
 
     fn f32_to_bytes(values: &[f32]) -> Vec<u8> {
         values
@@ -716,6 +763,108 @@ mod cuda_launcher {
                 .map_err(|error| format!("copy the X row: {error}"))
         }
 
+        /// Reads the layer-0 mHC entry handoff back to the host after a completed launch.
+        ///
+        /// The host trace continues from this capture and its coefficients; the values are the
+        /// kernel's f32 `xhat_normed` and `hc_coeffs` buffers. The readback does not by itself make
+        /// a chain or token claim.
+        ///
+        /// # Errors
+        /// No staged buffers, no driver, or a readback length that does not match the plan.
+        pub fn read_layer_zero_entry(&self) -> Result<LayerZeroEntry, String> {
+            let buffers = self.mhc_buffers.ok_or_else(|| {
+                "the layer-0 mHC buffers are not staged, so there is no entry handoff".to_string()
+            })?;
+            let cuda = self.cuda.as_ref().ok_or_else(|| {
+                "the CUDA driver is unavailable, so the mHC entry cannot be read back".to_string()
+            })?;
+            let plan = MhcBufferPlan::LAYER_ZERO;
+            let mut capture = vec![0u8; plan.xhat_normed];
+            let mut coefficients = vec![0u8; plan.hc_coeffs];
+            cuda.copy_dtoh(&mut capture, &buffers.xhat_normed)?;
+            cuda.copy_dtoh(&mut coefficients, &buffers.hc_coeffs)?;
+            entry_from_readback(&capture, &coefficients)
+        }
+
+        /// Reads back the staged X buffer's bytes after [Self::write_layer_zero_x].
+        ///
+        /// A window diagnostic: the caller can compare these bytes with the admitted row's
+        /// `x_bf16` seed and prove the device row is the row the host trace used. It does not make
+        /// a chain or token claim.
+        ///
+        /// # Errors
+        /// No staged buffers, no driver, or a copy error.
+        pub fn read_layer_zero_x(&self) -> Result<Vec<u8>, String> {
+            let buffers = self.mhc_buffers.ok_or_else(|| {
+                "the layer-0 mHC buffers are not staged, so X cannot be read back".to_string()
+            })?;
+            let cuda = self.cuda.as_ref().ok_or_else(|| {
+                "the CUDA driver is unavailable, so X cannot be read back".to_string()
+            })?;
+            let mut x = vec![0u8; MhcBufferPlan::LAYER_ZERO.x];
+            cuda.copy_dtoh(&mut x, &buffers.x)?;
+            Ok(x)
+        }
+
+        /// Reads the kernel's `1/rms(X_hat)` f32 output after a completed launch.
+        ///
+        /// m11 b7 measured this scalar against the CPU twin with a `3e-4` bar; the window uses it
+        /// as a diagnostic next to the normalised capture. It does not make a chain or token claim.
+        ///
+        /// # Errors
+        /// No staged buffers, no driver, a short read, or a non-finite value.
+        pub fn read_layer_zero_inv_rms(&self) -> Result<f32, String> {
+            let buffers = self.mhc_buffers.ok_or_else(|| {
+                "the layer-0 mHC buffers are not staged, so 1/rms cannot be read back".to_string()
+            })?;
+            let cuda = self.cuda.as_ref().ok_or_else(|| {
+                "the CUDA driver is unavailable, so 1/rms cannot be read back".to_string()
+            })?;
+            let mut bytes = [0u8; 4];
+            cuda.copy_dtoh(&mut bytes, &buffers.hc_rms_out)?;
+            let value = f32::from_le_bytes(bytes);
+            if !value.is_finite() {
+                return Err(format!(
+                    "the mHC 1/rms readback is {value}; the kernel writes a finite scalar"
+                ));
+            }
+            Ok(value)
+        }
+
+        /// Reads the kernel's E4M3 codes for the block input, after a completed launch.
+        ///
+        /// # Errors
+        /// No staged buffers, no driver, or a copy error.
+        pub fn read_layer_zero_codes(&self) -> Result<Vec<u8>, String> {
+            let buffers = self.mhc_buffers.ok_or_else(|| {
+                "the layer-0 mHC buffers are not staged, so the FP8 codes cannot be read back"
+                    .to_string()
+            })?;
+            let cuda = self.cuda.as_ref().ok_or_else(|| {
+                "the CUDA driver is unavailable, so the FP8 codes cannot be read back".to_string()
+            })?;
+            let mut codes = vec![0u8; MhcBufferPlan::LAYER_ZERO.xhat_fp8];
+            cuda.copy_dtoh(&mut codes, &buffers.xhat_fp8)?;
+            Ok(codes)
+        }
+
+        /// Reads the kernel's E8M0 block scales for the block input, after a completed launch.
+        ///
+        /// # Errors
+        /// No staged buffers, no driver, or a copy error.
+        pub fn read_layer_zero_scales(&self) -> Result<Vec<u8>, String> {
+            let buffers = self.mhc_buffers.ok_or_else(|| {
+                "the layer-0 mHC buffers are not staged, so the FP8 scales cannot be read back"
+                    .to_string()
+            })?;
+            let cuda = self.cuda.as_ref().ok_or_else(|| {
+                "the CUDA driver is unavailable, so the FP8 scales cannot be read back".to_string()
+            })?;
+            let mut scales = vec![0u8; MhcBufferPlan::LAYER_ZERO.xhat_scales];
+            cuda.copy_dtoh(&mut scales, &buffers.xhat_scales)?;
+            Ok(scales)
+        }
+
         /// The raw bytes of every verified cubin this launcher loaded.
         #[must_use]
         pub fn cubin_bytes(&self) -> u64 {
@@ -1011,6 +1160,37 @@ mod cuda_launcher {
                 !error.contains("CUDA driver is unavailable"),
                 "the length check must run before the driver/copy path: {error}"
             );
+        }
+
+        #[test]
+        fn the_mhc_entry_readback_is_transposed_into_the_host_coefficient_orientation() {
+            let capture: Vec<f32> = (0..HIDDEN).map(|index| index as f32 * 0.25).collect();
+            let coefficients: Vec<f32> = (0..24).map(|index| index as f32 + 1.0).collect();
+            let entry = entry_from_readback(&f32_to_bytes(&capture), &f32_to_bytes(&coefficients))
+                .expect("a full readback is accepted");
+            assert_eq!(entry.pre_attention_hidden, capture);
+            assert_eq!(
+                entry.source,
+                sparkflash_engine::forward::layer_zero::LayerZeroEntrySource::Device,
+                "the readback must carry device provenance explicitly"
+            );
+            assert_eq!(entry.pre, coefficients[16..20].to_vec());
+            assert_eq!(entry.post, coefficients[20..24].to_vec());
+            for source in 0..HC_MULT {
+                for destination in 0..HC_MULT {
+                    assert_eq!(
+                        entry.comb[source * HC_MULT + destination],
+                        coefficients[destination * HC_MULT + source],
+                        "comb[{source}][{destination}] is the kernel's destination-major value"
+                    );
+                }
+            }
+            let error = entry_from_readback(&[0u8; 4], &f32_to_bytes(&coefficients))
+                .expect_err("a short capture is refused");
+            assert!(error.contains("xhat_normed"));
+            let error = entry_from_readback(&f32_to_bytes(&capture), &[0u8; 4])
+                .expect_err("short coefficients are refused");
+            assert!(error.contains("hc_coeffs"));
         }
 
         #[test]

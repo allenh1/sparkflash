@@ -109,13 +109,32 @@ impl EmbedRow {
     }
 
     /// The layer-0 X_-1 seed: the row repeated HC_MULT times.
+    ///
+    /// Public so a window caller can compare the device X readback against the exact bytes the
+    /// launcher copied; the row's fields remain private and its only constructor is the admitted
+    /// staging path.
     #[must_use]
-    pub(crate) fn x_bf16(&self) -> Vec<u8> {
+    pub fn x_bf16(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(self.bf16.len() * HC_MULT);
         for _ in 0..HC_MULT {
             bytes.extend_from_slice(&self.bf16);
         }
         bytes
+    }
+
+    /// Widens the row to f32 for the host layer-0 trace.
+    ///
+    /// The host pass is the reference arithmetic; it consumes the same released BF16 row the
+    /// device X seed gets, widened exactly as the kernel's f32 capture would be. This is a host
+    /// seam on the c1 path, not a device readback.
+    #[must_use]
+    pub fn values_f32(&self) -> Vec<f32> {
+        self.bf16
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| bf16_value(u16::from_le_bytes(*chunk)))
+            .collect()
     }
 
     /// Builds a row without validation, only so tests can exercise the launch-time length check.

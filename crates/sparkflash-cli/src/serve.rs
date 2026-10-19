@@ -351,7 +351,7 @@ fn no_weights_message() -> String {
 /// reference guard, which is what makes that guard worth having. `linalg.rs` says no
 /// real-checkpoint entry point may drift back to the reference guard; this is the serving entry
 /// point that had, and this function is where the choice is made.
-fn default_element_limit(checkpoint: Option<&Path>) -> usize {
+pub(crate) fn default_element_limit(checkpoint: Option<&Path>) -> usize {
     match checkpoint {
         Some(_) => CHECKPOINT_TENSOR_LIMIT,
         None => REFERENCE_TENSOR_LIMIT,
@@ -1790,6 +1790,17 @@ mod tests {
             RELEASED_EMBEDDING_ELEMENTS,
             "the released embed/head element count must match the vendored configuration"
         );
+    }
+
+    #[test]
+    fn the_checkpoint_cap_admits_the_released_wq_b_and_the_reference_cap_refuses_it() {
+        // wq_b is [32768, 1280] in the released layer-0 attention projection: 41,943,040
+        // elements. The checkpoint arm must admit it by default; the finite/synthetic guard must
+        // still refuse it, which is the whole reason two caps exist.
+        const RELEASED_WQ_B_ELEMENTS: usize = 32_768 * 1_280;
+        assert_eq!(RELEASED_WQ_B_ELEMENTS, 41_943_040);
+        assert!(RELEASED_WQ_B_ELEMENTS <= default_element_limit(Some(Path::new("/checkpoint"))));
+        assert!(RELEASED_WQ_B_ELEMENTS > default_element_limit(None));
     }
 
     // ---- the checkpoint path, on a checkpoint this test writes ------------------------

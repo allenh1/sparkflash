@@ -1,9 +1,12 @@
 # Device forward chain: the 40-layer hybrid chain and the 130 + 8 golden comparison
 
-Status: **M3-b layer-0 weight staging and budget admission on `task/device-engine-m3-b`, based
-on `origin/main` `972c19a`; window b9 executed the cuda-only stage arm three times (exit 0), but
-there was no chain, token, logits or per-position comparison, and Phase 2 exit criterion 1 remains
-OPEN** (`phase2-sequence-harness.md` section 7; D25). The chain skeleton
+Status: **M3-c one-layer host pass and M3-b layer-0 staging on `task/device-engine-m3-c`, rebased
+onto `origin/main` `159ae8c`; the c1/c2 host pass is tested without a GPU, and the c2 comparison is
+bit-exact against the reference boundary on a finite plan. Window b19 (combined) passed the
+released-checkpoint one-layer, one-position device-entry arm on device (exit 0, `M3-c LAYER-0 PASS`,
+hybrid verdict PASS within the m11 b7 classes); that is the c2 window record. The 8 device-status
+stages remain host stand-ins, and no device chain, token, logits or per-position chain comparison
+exists; Phase 2 exit criterion 1 remains OPEN** (`phase2-sequence-harness.md` section 7; D25). The chain skeleton
 (`chain.rs`, `window.rs`, `cubins.rs`, the masked comparator and `device-chain --plan-only`) is
 code, not design prose, and the wiring (`chain_device.rs`) drives its full plan through one
 `ChainOps` implementation: host-seam stages go to a host-seam delegate, every device-status stage
@@ -600,8 +603,117 @@ completing is evidence that the per-launch `hc_sync`/`hc_stats` reset lets each 
 rendezvous again (m11's finding was that stale counters never publish), but there is no readback,
 so the coefficients are not compared and no per-position output is claimed.
 
-Criterion 1 remains **OPEN**; M3-c runs the first hybrid token and M3-d adds the boundary
-comparison.
+**M3-c c1/c2 one-layer host pass (this branch, rebased onto `159ae8c`; originally cut from
+`dfa790b`).** The first MR of M3-c lands the layer-0 arithmetic and its comparison without a GPU:
+
+- **c1, the host pass.** `sparkflash-engine/src/forward/layer_zero.rs` composes the existing
+  reference functions (`hc_mixes`/`hc_pre`/`hc_post`, `attention_forward` and `moe_forward`) in
+  the reference block's layer-0 order, records one `StageEvent` per active
+  `LAYER_ZERO_HOST_STAGES` entry (17 stages), and returns the boundary values.
+  `sparkflash-device/src/layer_zero.rs` maps those events onto the chain's stable seam names, builds
+  the one-layer `ChainSeamPlan`, records the host ledger, validates it (a missing or unplanned seam
+  fails) and prints the execution classification. The device-stage entries are **not** padded with
+  fake bytes: they are labelled `host stand-in (device builder not wired)`, and the report says they
+  did not execute on a device. This is the declared design decision for this MR: the only device
+  stage in the one-layer path is the `mhc_entry` readback below; every other active stage runs the
+  reference host arithmetic and says so. In the window hybrid, `attn_norm` is
+  `device-fused` rather than host: its result arrives inside the device mHC `xhat_normed` capture,
+  so the pass drops that planned seam instead of emitting a zero-byte host seam. `mhc_entry` can be
+  marked device only through a private one-shot launch receipt held by
+  `run_layer_zero_device_entry`; no host-only run can relabel a stand-in. A `Bar` comparison is a
+  failure when it is outside its declared class (see the hybrid bullet below), not a success.
+- **c2, the host reference comparison.** The same `LayerZeroTrace` is compared against the
+  reference engine's own layer-0 `BoundaryTable` row (`prefill_observed`), quantity by quantity,
+  with bit identity as the class. The quantity set is pinned to twelve ordered names (six tensors
+  and six mHC mix vectors), and both comparators refuse a dropped quantity. Each quantity now
+  carries its first differing index and expected/actual f32 bits, the maximum absolute delta and
+  the maximum ULP distance; the report prints those per quantity before the verdict. The unit test
+  uses a finite plan-shaped source, reaches `ComparisonClass::Exact` for all twelve, mutates one
+  residual value to prove `Bar`, and mutates one ULP to prove the diagnostic fields. This unit-test
+  c2 is a finite-plan comparison, not a token; the released-checkpoint window c2 record is b19 in
+  the window records below, still one layer/one position and not a token.
+- **hybrid class.** The device-entry arm is not a host-vs-reference comparison. The one device
+  kernel's outputs are compared with the classes m11 measured in window b7
+  (`phase3-mhc-entry.md`), and the host twin uses the kernel's FMA program (kernel-dev's m15
+  cross-check: the pinned kernel has 241 `fma.rn.f32`, no `mul.rn.f32`/`add.rn.f32`, and the
+  `C Y` term is the single plain `mul.f32`). The step-1 update is
+  `kernel_mhc_update` (`acc = C*Y`, then one `mul_add` per B term in stream order), step 2 is
+  `kernel_mhc_xhat` (one `mul_add` per A term), and the capture is
+  `kernel_mhc_capture` (`xhat * rms_weight * inverse_rms`, left-associative). Unit tests pin
+  that these differ from a mul-then-add construction. With the released layer-0 seed
+  (X_-1 = four copies of the embed row, Y_-1 = 0, B = I, C = 0, A = [1,0,0,0]) the kernel writes
+  X_0 = X_-1 and publishes H(X_0). X_l, the f32 capture, the E4M3 codes and the E8M0 scales are
+  **exact** (m11 b7: X_l 20,480/20,480, capture 5,120/5,120, codes/scales exact); the `1/rms`
+  scalar carries the `3e-4` bar (b7 maximum `2.746582e-4`), and the 24 B/A/C coefficients carry
+  the `1e-4` bar (b7 measured B `1.1920929e-7`, A `2.682209e-6`, C `6.7055225e-7` at position
+  129). `compare_entry` gates those five readback quantities (capture, three coefficient groups,
+  `1/rms`) and the arm separately requires exact X_l/codes/scales; it does not invent a bar for
+  downstream host arithmetic. The twelve
+  trace quantities are still printed with their full diagnostics, labelled as host-continuation
+  diagnostics: the host trace starts from the host-computed entry, the device trace starts from
+  the readback, so every downstream value inherits the entry deltas and is not a device-kernel
+  result. The `mega_mhc_layer_with_scale` traffic-accounting return value is **not** used as the
+  entry expectation: it applies the coefficients it just formed, while the kernel writes with the
+  previous call's B/C.
+- **window-only continuation.** `CudaLauncher::read_layer_zero_entry` reads the mHC kernel's f32
+  `xhat_normed` and `hc_coeffs` (24 values), transposes B into the host source-major comb order and
+  builds `LayerZeroEntry`. `run_layer_zero_device_entry` writes the staged row and reads X back
+  **before** the launch (the kernel updates X in place to X_l), launches the pinned
+  `mega_mhc_sm121` kernel, reads X_l, the E4M3 codes and the E8M0 scales back, reads the entry and
+  the kernel's `hc_rms_out` (1/rms), and continues the host pass from the readback. The arm prints
+  the staged boundary seed, the X/X_l/capture/codes/scales comparisons, the device/host `1/rms`
+  delta against the `3e-4` bar, the non-zero coefficient count, and the fact that
+  `xhat_normed`/`hc_coeffs`/`hc_rms_out` are unconditional writes at
+  `kernels/mega_mhc_sm121.cu:291-294,329` while `trace_ring=0` only disables the ring.
+  `sparkflash device-chain --run-stage layer_zero --checkpoint DIR --cubin-dir DIR --token 0` is
+  the cuda-only arm. It resolves the same checkpoint-aware element cap as `serve`:
+  `CHECKPOINT_TENSOR_LIMIT` by default, with `--element-limit N` as the escape hatch, because the
+  released `wq_b` alone is 41,943,040 elements and the reference guard would refuse it before any
+  device work.
+- **window records.** b13 (binary `sparkflash_m3c_8819_aarch64`, sha256 `881918dc...`) failed
+  before any allocation in the host reference trace because the arm hard-coded the 32 Mi
+  `REFERENCE_TENSOR_LIMIT`; released `attn.wq_b` is 41,943,040 elements. The element-cap delta
+  (pre-rebase commit `56a4441`) resolves the same checkpoint-aware default as `serve` and adds
+  `--element-limit`; no device work happened in b13, so no window record is claimed.
+  b14 (binary sha256
+  `497058ed3ff93e107b3709ad6861e3dd24a4b9810f33dc9c9ff4b6bca3d11925`, built from `4722153`)
+  ran the same arm in a Lead window: it reached staging and the launch, exited 1 with
+  `sparkflash device-chain: layer-0 comparison reported BAR (12 differing); a readback that is not
+  bit-identical to the host trace is a failed run`, and printed no per-quantity lines. There was
+  no device crash; vLLM was stopped and restored. The log is node-only
+  (`window-b14-20261019T012513Z.log`, `runs14/m3c-layer0-token0.log`). b14 is a failed run with
+  no c1/c2 record; this delta is its response, and b19 (combined) is the recorded rerun (b16 was
+  m15's re-window).
+  The old exact comparator started the host trace from the host RMSNorm/capture
+  (`value * inv * weight`) while the kernel emits `value * weight * inv`, and the host and
+  kernel reduce the `1/rms` sum in different orders; if the entry readback is within the m11
+  classes, twelve downstream host values differing is the expected consequence, not evidence of a
+  row or coefficient-mapping bug. The new arm gates the entry boundaries and prints the
+  per-quantity detail instead of reporting only the count.
+  b19 (combined) is the c2 window record. The device ran binary
+  `sparkflash_m3c_d9ac_aarch64` (sha256
+  `d9ac5a616c289b7089c73b18c84779e69eef1f6f135a80a0d177112228de0d78`, built from commit `b49992f`)
+  with cubin `e21293e3...`, exited 0, and printed `M3-c LAYER-0 PASS - one layer, one position, no
+  token` and `layer-0 hybrid verdict: PASS - the device MhcEntry readback is within the m11 b7
+  classes (hc_coeffs 1.0e-4, 1/rms 3.0e-4); downstream differences are host arithmetic from a
+  different entry, not a device claim`. The record is `window-b19-20261019T021326Z.log` and
+  `runs19/m3c-layer0-token0.log` on the node; vLLM was stopped and restored. The recorded evidence:
+  X readback equals the admitted four-copy BF16 row (true); X_l readback equals the FMA host update
+  (true); the FMA host update equals the host trace's four-copy X_0 (true); f32 capture exact
+  5,120/5,120; E4M3 codes exact 5,120/5,120 bytes; E8M0 scales exact 160/160 bytes; 24/24 non-zero
+  coefficients, source `Device`; staged seed B identity, C zero, A `[1,0,0,0]`, Y_-1 zero; device
+  `1/rms` 6.406901360e0 against host 6.406919003e0, max abs delta 1.764297e-5 (bar 3.0e-4). The
+  per-quantity classes were `pre_attention_hidden` exact (max abs 0), `hc_attn_pre` bar max abs
+  8.493662e-7 / 127 ULP, `hc_attn_post` bar 3.278255e-7 / 55 ULP, `hc_attn_comb` bar 3.129244e-7 /
+  238 ULP, and `inv_rms` bar 1.764297e-5 / 37 ULP. BAR is used only where a declared m11 bar
+  exists; X/X_l/capture/codes/scales are exact. The eight device-status stages are still host
+  stand-ins: the arm accounted 8 host seams and 887,344 B of host work, explicitly not device
+  work. This is one layer, one position and no token; c3 is not started.
+
+
+Criterion 1 remains **OPEN**. The b19 record is the one-layer window c2 PASS; the 40-layer c3
+path and the token/chain comparison are not started pending review and merge of the M3-c batch,
+and M3-d adds the boundary capture.
 
 **M4 - full 130 + 8 run and the criterion-1 claim.** The scope formerly called M3. The full phase
 of section 5 with the boundary capture at 129, the contract of section 4, and the report artifacts.

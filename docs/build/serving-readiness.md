@@ -19,11 +19,13 @@ memory consequence that makes the single-node chain look different from a served
 
 Short answer: **no end-to-end device token exists.** The per-stage kernels are pinned, most are
 individually measured on 2026-10-18, and the gate/up kernel and the M2 session are now on main, but
-no chain executes a device stage and no token exists: `sparkflash-device` has the M3-a host-only
-plan/ledger skeleton (`sparkflash device-chain --plan-only`, `chain_execution=false`, no device
-stage wired), the m8 harness that comes closest explicitly reports "device token NOT PRODUCED", and
-Phase 2 exit criterion 1 remains **OPEN** ([device-forward-chain.md](device-forward-chain.md) section
-4.3). Section 3 lists the remaining work in dependency order.
+no chain executes a device stage sequence and no token exists: `sparkflash-device` has the M3-a
+host-only plan/ledger skeleton (`sparkflash device-chain --plan-only`, `chain_execution=false`;
+the window arm wires one MhcEntry stage), and the m8 harness that comes closest explicitly reports
+"device token NOT PRODUCED". The one released device execution is the one-layer, one-position
+MhcEntry window arm (b19, section 3.4/M3-c), which is a c2 record, not a chain or token. Phase 2
+exit criterion 1 remains **OPEN** ([device-forward-chain.md](device-forward-chain.md) section 4.3).
+Section 3 lists the remaining work in dependency order.
 
 Unit note: the measured device total is **124,610 MiB** `cuDeviceTotalMem_v2`
 ([device-path-design.md](device-path-design.md) section 9; [roadmap-to-serving.md](roadmap-to-serving.md)
@@ -595,6 +597,47 @@ still ahead. Window b9 executed that cuda-only arm three times on binary
 `sparkflash_m3b_1846e72_aarch64` (42,221,656 B, sha256 `1846e729...`), at 1, 3 and 130 positions,
 all exit 0; 130 sequential launches are the per-launch-reset evidence, not a numeric result. There
 was no readback, so no coefficient or per-position output is compared. Criterion 1 stays **OPEN**.
+
+**M3-c — one-layer host pass plus device-entry c2 (this branch, rebased onto `159ae8c`).** The
+first M3-c MR adds `sparkflash-engine/src/forward/layer_zero.rs` and
+`sparkflash-device/src/layer_zero.rs`: the 17 active layer-0 stages run the reference host
+arithmetic in the chain's order, the host seams are ledgered and the trace is compared bit-for-bit
+against the reference engine's layer-0 boundary row. The host comparison is exact for all twelve
+ordered quantities (six tensors and six mHC mixes) on a finite plan; both comparators pin that set
+and refuse a dropped quantity, and every quantity now reports its first differing index and bits,
+max absolute delta and ULP. Device-status stages without a typed builder are labelled host
+stand-ins; the only device substitution is the window-only mHC entry readback
+(`--run-stage layer_zero --token 0`), which feeds the host continuation. The device readback is now
+gated by the m11 b7 classes from [phase3-mhc-entry.md](phase3-mhc-entry.md): the 24 coefficients
+within `1e-4`, the `xhat_normed` capture exactly (against the expected capture built with the
+kernel's `mul_add` order and the device's own `1/rms`), the FP8 codes and E8M0 scales exactly,
+X_l exactly, and the `1/rms` scalar within its `3e-4` bar; downstream host values are printed as
+host-continuation diagnostics, not as a device class. The host twin uses `f32::mul_add` in the
+kernel's operand order (kernel-dev's m15 finding: 241 fused multiply-adds, one plain `C*Y` mul),
+with a unit test that distinguishes it from a mul-then-add construction. The arm also reads X
+before launch and X_l after it and prints the kernel/host 1/rms delta. `attn_norm` is
+`device-fused` in that arm (it is inside the mHC capture), and only the launch path's private
+receipt can mark `mhc_entry` device. Window b14 (binary `497058ed...`, from
+`4722153`) reached the launch and failed honestly with `BAR (12 differing)` and no per-quantity
+lines; the FMA-correct twin and the m11 classes are its response, and no b14 result is claimed.
+Window b13 failed before allocation because the arm used the 32 Mi reference cap and released
+`wq_b` is 41,943,040 elements; the element-cap delta (pre-rebase `56a4441`) fixes that and adds
+`--element-limit`. Window b19 (combined) then passed the released-checkpoint one-layer,
+one-position arm on the node: binary `sparkflash_m3c_d9ac_aarch64` (sha256
+`d9ac5a616c289b7089c73b18c84779e69eef1f6f135a80a0d177112228de0d78`, from `b49992f`), cubin
+`e21293e3...`, exit 0, `M3-c LAYER-0 PASS - one layer, one position, no token` and `layer-0
+hybrid verdict: PASS - the device MhcEntry readback is within the m11 b7 classes (hc_coeffs
+1.0e-4, 1/rms 3.0e-4)`; logs `window-b19-20261019T021326Z.log` and
+`runs19/m3c-layer0-token0.log`, vLLM stopped and restored. The run recorded X and X_l true,
+capture exact 5,120/5,120, FP8 codes exact 5,120/5,120 bytes, E8M0 scales exact 160/160 bytes,
+24/24 non-zero coefficients read from `Device`, and device `1/rms` 6.406901360e0 against host
+6.406919003e0 (max abs 1.764297e-5, bar 3.0e-4); the coefficient classes were `hc_attn_pre`
+8.493662e-7 / 127 ULP, `hc_attn_post` 3.278255e-7 / 55 ULP, `hc_attn_comb` 3.129244e-7 / 238 ULP,
+and `inv_rms` 1.764297e-5 / 37 ULP, all within their declared bars. BAR is used only where a
+declared m11 bar exists; X/X_l/capture/codes/scales are exact. The eight device-status stages remain
+host stand-ins: the arm accounted 8 host seams and 887,344 B of host work, explicitly not device
+work. This is still one layer, one position and no token; c3 is not started and criterion 1 stays
+**OPEN**.
 
 **M3-c — first hybrid token (the first real end-to-end run).**
 9. Implement the per-layer order of design 2.2 with the seams of design 3.1, using the existing

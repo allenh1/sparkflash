@@ -30,6 +30,7 @@ pub mod attention;
 pub mod attention_case;
 pub mod boundary;
 pub mod engram;
+pub mod layer_zero;
 pub mod mhc;
 pub mod moe;
 pub mod mtp;
