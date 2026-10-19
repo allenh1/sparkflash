@@ -605,8 +605,19 @@ Window (needs Lead orchestration and all four nodes; no number may be quoted bef
 
 ### 15.5 Honest limits of this design
 
-- **It is not written yet.** Nothing in this section exists in code; the two artefacts it joins are
-  real, the seam is a proposal.
+- **Status: the contract is written, the wiring is not** (updated 2026-10-19).
+  `crates/sparkflash-comm/src/oneshot.rs` now exists and is host-tested: the pinned slot geometry
+  and the `Exchange`/`DeviceBuffer`/`SlotRegistration`/`Dispatch` descriptors (null or misaligned
+  pointer, wrong slot size, payload over a row, bad rail count, non-increasing sequence all
+  refused), the receive-side proxy state machine of 15.2(b), and `Transport::all_reduce_bf16_device`
+  as a default-refusing trait method (a host backend answers `CommError::Unsupported`; it cannot
+  fall back to the host slice). `crates/sparkflash-comm/tests/device_seam.rs` runs that contract with
+  four rank threads over shared memory for 100 sequences - arrival order shuffled, rails reversed per
+  peer - and requires bit-identical agreement with `canonical_all_reduce_into`. Of the 15.4 test
+  plan, items 1-3 are host-covered and item 4 is the feature-off refusal section 10 already asserts;
+  items 5-7 need the window. Of 15.3, item 6 is unchanged and item 2 is still the next piece; items 1
+  (host allocation plus device alias), 3 (the proxy threaded to real QPs), 4 (kernel launch plumbing)
+  and 5 (the deliberate ABI-text correction) remain. No hardware result exists, so none may be cited.
 - **Pinned-host MR is unverified.** Preference (a) uses pinned host memory; whether `ibv_reg_mr`
   over such a mapping works on these nodes is as unverified as the rest of the hardware path
   (section 10: no hardware run, ever). Preference (b)'s device-memory MR via `ibv_reg_dmabuf_mr` is

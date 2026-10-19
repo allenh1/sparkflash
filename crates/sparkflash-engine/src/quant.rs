@@ -153,6 +153,23 @@ pub const fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
+/// The BF16 bit pattern an f32 rounds to, ties to even, the cast torch's bfloat16 assignment does.
+pub fn f32_to_bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    // A NaN keeps its high bits and is made quiet; the rounding below would carry the trivially
+    // set mantissa bit into the exponent field.
+    if value.is_nan() {
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    let round = 0x7FFF + ((bits >> 16) & 1);
+    (bits.wrapping_add(round) >> 16) as u16
+}
+
+/// Rounds an f32 to the nearest BF16 value, ties to even, as a bf16 tensor assignment does.
+pub fn bf16_round(value: f32) -> f32 {
+    f32::from_bits(u32::from(f32_to_bf16_bits(value)) << 16)
+}
+
 /// Decodes four little-endian bytes as an f32.
 ///
 /// The checkpoint's F32 tensors are raw binary32 in little-endian order, the layout safetensors

@@ -5,7 +5,7 @@
 mod support;
 
 use std::io::Write;
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
@@ -267,4 +267,116 @@ fn connect_rejects_a_rank_outside_the_collective() {
         TcpTransport::connect(config),
         Err(CommError::RankOutOfRange { .. })
     ));
+}
+
+// ---------------------------------------------------------------------------------
+// Cluster mode: an explicit per-rank address table (the four-node transport path)
+// ---------------------------------------------------------------------------------
+
+#[test]
+fn cluster_address_table_two_ranks_all_reduce_and_gather() {
+    let world = 2;
+    let base = port_block();
+    let addresses: Vec<SocketAddr> = (0..world)
+        .map(|rank| SocketAddr::from(([127, 0, 0, 1], base + rank as u16)))
+        .collect();
+    let elements = 257;
+    let payloads: Vec<Vec<u16>> = (0..world)
+        .map(|rank| finite_pattern(rank, elements, 0x5a17))
+        .collect();
+    let expected = reference_all_reduce(&payloads);
+    let gather_elements = 1003;
+    let locals: Vec<Vec<u16>> = (0..world)
+        .map(|rank| finite_pattern(rank, gather_elements, 0x77c1))
+        .collect();
+    let layout = CollectiveLayout::new(world, elements, FabricSchedule::OneShotAllToAll)
+        .unwrap_or_else(|error| panic!("layout: {error}"));
+    let results = run_ranks(world, |rank| {
+        let config = TcpConfig::with_addresses(rank, addresses.clone()).expect("cluster config");
+        let transport =
+            TcpTransport::connect(config).unwrap_or_else(|error| panic!("rank {rank}: {error}"));
+        let mut buf = payloads[rank].clone();
+        transport
+            .all_reduce_bf16(&mut buf, 3, &layout)
+            .unwrap_or_else(|error| panic!("rank {rank} reduce: {error}"));
+        let mut gathered = vec![0u16; world * gather_elements];
+        transport
+            .all_gather_bf16(&locals[rank], &mut gathered, 4)
+            .unwrap_or_else(|error| panic!("rank {rank} gather: {error}"));
+        (buf, gathered)
+    });
+    let mut assembled = Vec::with_capacity(world * gather_elements);
+    for segment in &locals {
+        assembled.extend_from_slice(segment);
+    }
+    for (rank, (reduced, gathered)) in results.iter().enumerate() {
+        assert_bits_eq(
+            reduced,
+            &expected,
+            &format!("cluster rank {rank} all_reduce"),
+        );
+        assert_bits_eq(
+            gathered,
+            &assembled,
+            &format!("cluster rank {rank} all_gather"),
+        );
+    }
+}
+
+#[test]
+fn cluster_mode_binds_a_wildcard_address_and_peers_dial_loopback() {
+    let world = 2;
+    let base = port_block();
+    let addresses: Vec<SocketAddr> = (0..world)
+        .map(|rank| SocketAddr::from(([127, 0, 0, 1], base + rank as u16)))
+        .collect();
+    let elements = 129;
+    let payloads: Vec<Vec<u16>> = (0..world)
+        .map(|rank| finite_pattern(rank, elements, 0x1234))
+        .collect();
+    let expected = reference_all_reduce(&payloads);
+    let layout = CollectiveLayout::new(world, elements, FabricSchedule::OneShotAllToAll)
+        .unwrap_or_else(|error| panic!("layout: {error}"));
+    let results = run_ranks(world, |rank| {
+        let mut config =
+            TcpConfig::with_addresses(rank, addresses.clone()).expect("cluster config");
+        config.bind_addr = Some(SocketAddr::from(([0, 0, 0, 0], base + rank as u16)));
+        let transport =
+            TcpTransport::connect(config).unwrap_or_else(|error| panic!("rank {rank}: {error}"));
+        let mut buf = payloads[rank].clone();
+        transport
+            .all_reduce_bf16(&mut buf, 1, &layout)
+            .unwrap_or_else(|error| panic!("rank {rank}: {error}"));
+        buf
+    });
+    for (rank, buf) in results.iter().enumerate() {
+        assert_bits_eq(buf, &expected, &format!("wildcard-bind rank {rank}"));
+    }
+}
+
+#[test]
+fn cluster_address_table_must_be_complete() {
+    let one = vec![SocketAddr::from(([127, 0, 0, 1], 42001))];
+    assert!(TcpConfig::with_addresses(0, one.clone()).is_ok());
+    assert!(matches!(
+        TcpConfig::with_addresses(1, one.clone()),
+        Err(CommError::RankOutOfRange { .. })
+    ));
+    assert!(matches!(
+        TcpConfig::with_addresses(0, Vec::new()),
+        Err(CommError::InvalidLayout(_))
+    ));
+    let base = port_block();
+    let config = TcpConfig {
+        world_size: 3,
+        peer_addrs: Some(vec![SocketAddr::from(([127, 0, 0, 1], base))]),
+        ..TcpConfig::loopback4(0, base)
+    };
+    match TcpTransport::connect(config) {
+        Ok(_) => panic!("a partial address table was accepted"),
+        Err(error) => assert!(
+            matches!(error, CommError::InvalidLayout(_)),
+            "a partial address table must be refused as a layout error, got {error:?}"
+        ),
+    }
 }

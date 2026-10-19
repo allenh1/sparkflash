@@ -1023,6 +1023,58 @@ struct IndexRequest<'a> {
     n_pos: usize,
 }
 
+/// The activation the reference's indexer wq_b receives (model.py:519, 187-199).
+///
+/// The q_norm output is a bf16 tensor, and the ColumnParallelLinear at the model dtype
+/// quantises it to E4M3 over 32-value blocks with power-of-two scales before the fp8 GEMM.
+fn indexer_query_activation(config: &ModelConfig, q: &[f32]) -> Vec<f32> {
+    let mut latent: Vec<f32> = q.iter().map(|value| quant::bf16_round(*value)).collect();
+    round_trip_rows(
+        &mut latent,
+        config.q_lora_rank,
+        INDEX_QUANT_BLOCK,
+        Element::Fp8,
+        ScaleRule::PowerOfTwo,
+    );
+    latent
+}
+
+/// The indexer's scores for one index source, bf16 all the way (model.py:553-557).
+///
+/// The einsum hands back bf16, the rectified product narrows to bf16, and the per-head sum
+/// accumulates in f32 and narrows once.
+fn index_scores(
+    q_index: &[f32],
+    keys: &[f32],
+    weights: &[f32],
+    seqlen: usize,
+    n_pos: usize,
+    heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let mut score = vec![0.0f32; seqlen * n_pos];
+    for query in 0..seqlen {
+        let query_weights = &weights[query * heads..(query + 1) * heads];
+        let q_row = &q_index[query * heads * head_dim..(query + 1) * heads * head_dim];
+        let sums = &mut score[query * n_pos..(query + 1) * n_pos];
+        for head in 0..heads {
+            let q_head = &q_row[head * head_dim..(head + 1) * head_dim];
+            let weight = query_weights[head];
+            for (position, sum) in sums.iter_mut().enumerate() {
+                let key = &keys[position * head_dim..(position + 1) * head_dim];
+                let raw = quant::bf16_round(dot(q_head, key));
+                if raw > 0.0 {
+                    *sum += quant::bf16_round(raw * weight);
+                }
+            }
+        }
+        for value in sums.iter_mut() {
+            *value = quant::bf16_round(*value);
+        }
+    }
+    score
+}
+
 /// One index source's selection (model.py:550-580).
 ///
 /// Writes the per-query positions into `out`, in the shared index space, with [`NO_INDEX`] where a
@@ -1043,6 +1095,7 @@ fn index_source_indices(
     let seqlen = request.seqlen;
     let n_pos = request.n_pos;
     // The query projection, rotated and fp4 round-tripped exactly like the keys (model.py:550-552).
+    let q_latent = indexer_query_activation(config, request.q);
     let mut q_index = vec![0.0; seqlen * heads * head_dim];
     let wq_b = dense_weight(
         request.src,
@@ -1052,12 +1105,15 @@ fn index_source_indices(
     )?;
     linalg::matmul(
         &mut q_index,
-        request.q,
+        &q_latent,
         &wq_b,
         heads * head_dim,
         config.q_lora_rank,
         seqlen,
     )?;
+    for value in q_index.iter_mut() {
+        *value = quant::bf16_round(*value);
+    }
     let tables = rope_tables_for_layer(
         config,
         request.layer,
@@ -1101,22 +1157,15 @@ fn index_source_indices(
     }
     // The score: rectified query-key dot products combined by the query's own weights, summed over
     // the index heads in order (model.py:556-557).
-    let mut score = vec![0.0f32; seqlen * n_pos];
-    for query in 0..seqlen {
-        let weights = &request.state.index_weights[query * heads..(query + 1) * heads];
-        let q_row = &q_index[query * heads * head_dim..(query + 1) * heads * head_dim];
-        for head in 0..heads {
-            let q_head = &q_row[head * head_dim..(head + 1) * head_dim];
-            let weight = weights[head];
-            for position in 0..n_pos {
-                let key = &request.keys[position * head_dim..(position + 1) * head_dim];
-                let raw = dot(q_head, key);
-                if raw > 0.0 {
-                    score[query * n_pos + position] += raw * weight;
-                }
-            }
-        }
-    }
+    let mut score = index_scores(
+        &q_index,
+        request.keys,
+        &request.state.index_weights,
+        seqlen,
+        n_pos,
+        heads,
+        head_dim,
+    );
     // Reachability: a position becomes visible once the query has passed its last token, which the
     // reference masks rather than skipping, so that an unreachable position can never outrank a
     // reachable one (model.py:561-567).
@@ -1778,11 +1827,17 @@ fn index_weights(
     let dim = config.dim;
     let heads = config.index_n_heads;
     let projection = weight(src, &format!("{prefix}.attn.indexer.weights_proj.weight"))?;
+    // The projection is a bf16 Linear over the bf16 layer input and hands back bf16; the factor
+    // then multiplies that bf16 tensor and narrows the product (model.py:513, 555).
+    let rounded: Vec<f32> = x.iter().map(|value| quant::bf16_round(*value)).collect();
     let mut values = vec![0.0; seqlen * heads];
-    linalg::matmul(&mut values, x, &projection, heads, dim, seqlen)?;
+    linalg::matmul(&mut values, &rounded, &projection, heads, dim, seqlen)?;
+    for value in values.iter_mut() {
+        *value = quant::bf16_round(*value);
+    }
     let factor = ((config.index_head_dim as f64).powf(-0.5) * (heads as f64).powf(-0.5)) as f32;
     for value in values.iter_mut() {
-        *value *= factor;
+        *value = quant::bf16_round(*value * factor);
     }
     Ok(values)
 }
@@ -3070,6 +3125,115 @@ mod tests {
         assert_eq!(state.latent_rows, 1);
         assert_eq!(state.compressed_len, 4);
         assert!(state.latent.iter().all(|value| value.is_finite()));
+    }
+
+    /// The indexer's wq_b is an fp8 W8A8 ColumnParallelLinear: the bf16 q_norm output is
+    /// quantised to E4M3 over 32-value blocks with power-of-two scales before the GEMM
+    /// (model.py:519, 187-199).
+    #[test]
+    fn the_indexer_query_activation_is_bf16_narrowed_then_fp8_quantised() {
+        let config = ModelConfig::tiny();
+        let width = config.q_lora_rank;
+        let q: Vec<f32> = (0..width).map(|index| 0.1 + index as f32 * 0.03).collect();
+        let activation = indexer_query_activation(&config, &q);
+        assert_eq!(activation.len(), q.len());
+        let narrowed: Vec<f32> = q.iter().map(|value| quant::bf16_round(*value)).collect();
+        assert_ne!(
+            activation, narrowed,
+            "the E4M3 quantisation must move a value"
+        );
+        let mut twice = activation.clone();
+        round_trip_rows(
+            &mut twice,
+            width,
+            INDEX_QUANT_BLOCK,
+            Element::Fp8,
+            ScaleRule::PowerOfTwo,
+        );
+        assert_eq!(
+            twice, activation,
+            "a dequantised value must be a fixed point"
+        );
+    }
+
+    /// The indexer's score path is bf16 in the reference: the einsum output, the rectified
+    /// product and the per-head sum each narrow to bf16 (model.py:553-557). A margin smaller than
+    /// half a bf16 step disappears, which is why the indexer's dtype is a discrete risk.
+    #[test]
+    fn the_indexer_scores_narrow_each_step_to_bf16() {
+        let q = [0.1f32, 0.2];
+        let keys = [0.3f32, 0.4, 1.0, 1.0];
+        let weights = [0.5f32];
+        let scores = index_scores(&q, &keys, &weights, 1, 2, 1, 2);
+        let first_f32 = 0.1f32 * 0.3 + 0.2 * 0.4;
+        let first_expected = quant::bf16_round(quant::bf16_round(first_f32) * 0.5);
+        assert_eq!(
+            scores[0], first_expected,
+            "the dot and the product narrow to bf16"
+        );
+        assert_ne!(
+            scores[0],
+            first_f32 * 0.5,
+            "the f32 score is not what the indexer uses"
+        );
+        let second_f32 = 0.1f32 * 1.0 + 0.2 * 1.0;
+        let second_expected = quant::bf16_round(quant::bf16_round(second_f32) * 0.5);
+        assert_eq!(scores[1], second_expected);
+    }
+
+    /// A property demo, not a measurement: a score margin below half a bf16 step disappears, so
+    /// the top-k cannot separate the two positions and the tie rule (lower position) decides. The
+    /// f32 score ordering would pick the other one. At the planned window lengths the released
+    /// configuration never reaches this regime: index_topk (512) exceeds n_pos, so every reachable
+    /// position is selected whatever the scores say (docs/build/indexer-native-dtype.md).
+    #[test]
+    fn the_bf16_score_path_can_erase_a_margin_the_f32_path_keeps() {
+        let q = [1.0f32, 0.0];
+        let near = 1.0f32 + 2.0f32.powi(-10);
+        let keys = [1.0f32, 0.0, near, 0.0];
+        let weights = [1.0f32];
+        let scores = index_scores(&q, &keys, &weights, 1, 2, 1, 2);
+        assert_eq!(
+            scores[0], scores[1],
+            "the sub-step margin is gone, so the two positions tie"
+        );
+        let f32_scores = [1.0f32 * 1.0, 1.0f32 * near];
+        assert!(
+            f32_scores[1] > f32_scores[0],
+            "the f32 path keeps the margin and ranks the later position first"
+        );
+    }
+
+    /// weights_proj is a bf16 Linear and the factor multiplies its bf16 output, so every
+    /// per-query weight is a bf16 value (model.py:513, 555).
+    #[test]
+    fn the_indexer_weights_are_bf16_narrowed() {
+        reset_shared_attention();
+        let config = ModelConfig::tiny();
+        let hand = Hand::for_config(&config);
+        let mut state = AttnState::for_config(&config);
+        let rows = 4usize;
+        let mut out = vec![0.0; rows * config.dim];
+        attention_forward(
+            &config,
+            0,
+            "layers.0",
+            &chunk(&config, rows, 0),
+            0,
+            &mut state,
+            &hand,
+            &mut out,
+            LIMIT,
+        )
+        .expect("a prefill");
+        assert!(!state.index_weights.is_empty());
+        for value in &state.index_weights {
+            assert_eq!(
+                quant::bf16_round(*value),
+                *value,
+                "the per-query weights must be a bf16 tensor"
+            );
+        }
     }
 
     /// The positions an index source returns are reachable, sorted, inside the caches, and no more

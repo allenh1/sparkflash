@@ -44,7 +44,7 @@ use sparkflash_engine::sequence_fixture::{
 };
 
 const USAGE: &str = "usage: sequence_fixture --out PATH [--config tiny|released] \
-[--checkpoint DIR] [--index PATH] [--prompt-tokens N] [--decode-steps N] \
+[--checkpoint DIR] [--index PATH] [--prompt-tokens N] [--prompt-ids PATH] [--decode-steps N] \
 [--seed N] [--logits all|prefill|none] [--provenance auto|ci|node] [--note TEXT]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +82,7 @@ fn run() -> Result<(), String> {
     let mut provenance_choice = ProvenanceChoice::Auto;
     let mut out: Option<PathBuf> = None;
     let mut custom_notes: Vec<String> = Vec::new();
+    let mut prompt_ids: Option<Vec<u32>> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -114,6 +115,21 @@ fn run() -> Result<(), String> {
                 seed = value()?
                     .parse()
                     .map_err(|_| "--seed needs a number".to_string())?;
+            }
+            // A prompt of real tokenizer ids: the oracle comparison needs the exact prompt the
+            // served model saw, which a deterministic pseudo-random prompt cannot supply. The
+            // file is a JSON array of integer token ids; the vocabulary bound and the emptiness
+            // check stay where they are, in `generate_fixture`.
+            "--prompt-ids" => {
+                let path = PathBuf::from(value()?);
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|error| format!("--prompt-ids {}: {error}", path.display()))?;
+                let ids: Vec<u32> = serde_json::from_str(text.trim())
+                    .map_err(|error| format!("--prompt-ids {}: {error}", path.display()))?;
+                if ids.is_empty() {
+                    return Err(format!("--prompt-ids {} is an empty array", path.display()));
+                }
+                prompt_ids = Some(ids);
             }
             "--logits" => {
                 logits = Some(match value()?.as_str() {
@@ -164,8 +180,18 @@ fn run() -> Result<(), String> {
     // unreproducible from the command it records. Refuse rather than write that.
     if provenance_choice == ProvenanceChoice::Ci {
         ci_provenance_admits_notes(&custom_notes).map_err(|error| error.to_string())?;
+        // The CI fixture's recorded command is the deterministic-prompt invocation and must
+        // regenerate byte-identically; a token-id file would not.
+        if prompt_ids.is_some() {
+            return Err("--provenance ci cannot describe a --prompt-ids fixture".to_string());
+        }
     }
-    let prompt = deterministic_prompt(config.vocab_size, prompt_tokens, seed);
+    // `--prompt-tokens` and `--seed` only describe the deterministic prompt; when real ids are
+    // supplied the recorded `prompt_tokens` length comes from them, not from the flag.
+    let prompt = match &prompt_ids {
+        Some(ids) => ids.clone(),
+        None => deterministic_prompt(config.vocab_size, prompt_tokens, seed),
+    };
     let index_path = index.clone().or_else(|| {
         checkpoint
             .as_ref()

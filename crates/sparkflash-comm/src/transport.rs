@@ -51,6 +51,31 @@ pub trait Transport: Send + Sync {
     /// # Errors
     /// Returns CommError when the lengths are wrong or a peer fails.
     fn all_gather_bf16(&self, local: &[u16], out: &mut [u16], seq: u64) -> Result<(), CommError>;
+    /// All-reduces a **device** buffer in place through the one-shot kernel seam.
+    ///
+    /// This is the device-buffer form of the collective described in
+    /// `docs/build/rdma-backend.md` section 15: the payload never crosses the host. The host-slice
+    /// `all_reduce_bf16` above stays the only form loopback, TCP and every CI test implement, and
+    /// it is deliberately not a default fallback for this one. A backend that has not wired the
+    /// kernel and the proxy refuses with [`CommError::Unsupported`] naming the prerequisite, so a
+    /// call site cannot believe it ran a copy-elided collective when it did not.
+    ///
+    /// # Errors
+    /// The default implementation always returns [`CommError::Unsupported`]; a real implementation
+    /// returns its transport errors as usual.
+    fn all_reduce_bf16_device(
+        &self,
+        buffer: &crate::oneshot::DeviceBuffer,
+        elements: usize,
+        seq: u64,
+    ) -> Result<(), CommError> {
+        let _ = (buffer, elements, seq);
+        Err(CommError::Unsupported(
+            "the device-buffer one-shot seam needs the RoCEnante kernel launcher and a registered \
+             slot (S5.3); this backend moves host slices only"
+                .to_owned(),
+        ))
+    }
 }
 
 /// Configuration of an in-process loopback cluster.

@@ -1,0 +1,215 @@
+{
+  "schema": "sparkflash-control-fixture-vs-oracle/1",
+  "control": "prefill",
+  "prompt_id": "b69-fixture-130",
+  "position": 129,
+  "fixture": {
+    "path": "/tmp/sequence-130-released.json",
+    "sha256": "e6df8290dcc9cfc96af27ad1a4da165e5f3d8d4e9aac0f98819b0030b738b308",
+    "generator": "sparkflash-engine sequence_fixture v1",
+    "config_label": "released",
+    "command": "'/home/user/phase2-evidence/sequence_fixture_f72738b_aarch64' '--config' 'released' '--checkpoint' '/home/user/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170' '--prompt-tokens' '130' '--decode-steps' '8' '--seed' '7' '--logits' 'prefill' '--provenance' 'node' '--out' '/home/user/phase2-evidence/sequence-130-released.json' '--note' 'main=f72738b5a63996a8425d11d744c4abb5f321e007' '--note' 'binary sha256=ed3838df5ca28722a19d6dda689d7b90c4dd67c8faf205cafcc3469dcb459ffa size=7265936' '--note' 'toolchain rustc 1.98.1 (48a229cea 2026-09-01), cargo 1.98.1 (797e8a9bc 2026-08-05), zig 0.17.0, aarch64-unknown-linux-gnu release' '--note' 'squash: !60 squash-merged as main f72738b; !58 and !57 already on main; does not depend on !61' '--note' 'fix commit f72738b; argv/host/cwd/binary sha recorded by the generator'",
+    "binary_sha256": "ed3838df5ca28722a19d6dda689d7b90c4dd67c8faf205cafcc3469dcb459ffa"
+  },
+  "oracle": {
+    "path": "/tmp/native-oracle-suite.json",
+    "sha256": "efce16c2637aeab70475a43b8dc0c5cbe1f066b6bb9cd671480c7d7e03c4572a",
+    "served_root": "/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170",
+    "generated_at": "2026-10-19T17:30:37Z",
+    "root_verified": true
+  },
+  "prefix": {
+    "fixture_prompt_len": 130,
+    "oracle_prompt_len": 140,
+    "prefix_verified": true,
+    "continuation_verified": true,
+    "suite_sha256": "42f66ad2d8d81ff555eeee2ef837e0cd6ca3cb59bde57320223d9c9b9ef19cd7",
+    "next_prompt_token": 491
+  },
+  "engine_argmax": 491,
+  "oracle_argmax": 367,
+  "metrics": {
+    "position": 129,
+    "target_token": 491,
+    "target_in_distribution": true,
+    "device_argmax": 491,
+    "oracle_argmax": 367,
+    "device_top": [
+      [
+        491,
+        -2.2538182269843414
+      ],
+      [
+        2463,
+        -2.323902226984341
+      ],
+      [
+        223,
+        -3.0981902269843413
+      ],
+      [
+        63438,
+        -3.177501226984342
+      ],
+      [
+        67,
+        -3.520539226984342
+      ],
+      [
+        4862,
+        -3.7746542269843406
+      ],
+      [
+        68637,
+        -3.8559882269843406
+      ],
+      [
+        367,
+        -3.9291442269843415
+      ],
+      [
+        3400,
+        -4.205417226984341
+      ],
+      [
+        14,
+        -4.215186226984342
+      ],
+      [
+        3188,
+        -4.266935226984341
+      ],
+      [
+        12140,
+        -4.336649226984342
+      ],
+      [
+        18003,
+        -4.405426226984341
+      ],
+      [
+        37852,
+        -4.565097226984342
+      ],
+      [
+        1560,
+        -4.982848226984341
+      ],
+      [
+        813,
+        -5.010062226984342
+      ],
+      [
+        35,
+        -5.133223226984342
+      ],
+      [
+        22392,
+        -5.198966226984341
+      ],
+      [
+        66543,
+        -5.335047226984342
+      ],
+      [
+        271,
+        -5.380040226984342
+      ]
+    ],
+    "oracle_top": [
+      [
+        367,
+        -0.08188365399837494
+      ],
+      [
+        491,
+        -3.831883668899536
+      ],
+      [
+        813,
+        -4.769383430480957
+      ],
+      [
+        37852,
+        -5.769383430480957
+      ],
+      [
+        67,
+        -5.831883430480957
+      ],
+      [
+        2463,
+        -6.394383430480957
+      ],
+      [
+        3188,
+        -6.394383430480957
+      ],
+      [
+        3614,
+        -6.456883430480957
+      ],
+      [
+        22876,
+        -6.456883430480957
+      ],
+      [
+        63438,
+        -6.581883430480957
+      ],
+      [
+        435,
+        -6.644383430480957
+      ],
+      [
+        22392,
+        -6.644383430480957
+      ],
+      [
+        7117,
+        -6.769383430480957
+      ],
+      [
+        12171,
+        -6.831883430480957
+      ],
+      [
+        276,
+        -6.894383430480957
+      ],
+      [
+        68637,
+        -7.144383430480957
+      ],
+      [
+        91,
+        -7.206883430480957
+      ],
+      [
+        14,
+        -7.394383430480957
+      ],
+      [
+        65,
+        -7.394383430480957
+      ],
+      [
+        4490,
+        -7.394383430480957
+      ]
+    ],
+    "top1_agreement": false,
+    "target_logprob_device": -2.2538182269843414,
+    "target_logprob_oracle": -3.831883668899536,
+    "top5_overlap": 0.4,
+    "top20_overlap": 0.55,
+    "top100_overlap": 0.48,
+    "top1000_overlap": 0.529,
+    "max_abs_delta": 6.724035203496616,
+    "mean_abs_delta": 2.338960292582835,
+    "compared_tokens": 1000,
+    "kl_oracle_to_device": 3.182710501802874,
+    "js_divergence": 0.5292271297086572,
+    "oracle_mass_on_returned": 0.9931539407402322
+  }
+}

@@ -204,6 +204,13 @@ pub fn decode_bf16(bytes: &[u8]) -> Result<Vec<u16>, CommError> {
 }
 
 /// Configuration of one rank of a TCP RoCEnante cluster.
+///
+/// Two addressing modes share one protocol. The loopback mode (implemented by
+/// [TcpConfig::loopback4] and the integration tests) derives every address from
+/// `127.0.0.1:(base_port + rank)`. The cluster mode (implemented by
+/// [TcpConfig::with_addresses]) takes an explicit per-rank address table, so the same
+/// [TcpTransport] runs on the four nodes: rank `r` binds `peer_addrs[r]` and dials
+/// `peer_addrs[peer]`.
 #[derive(Debug, Clone)]
 pub struct TcpConfig {
     /// Rank this transport serves.
@@ -211,6 +218,9 @@ pub struct TcpConfig {
     /// Number of ranks in the cluster.
     pub world_size: usize,
     /// Port of rank 0; rank r binds base_port + r on 127.0.0.1.
+    ///
+    /// Ignored when [TcpConfig::peer_addrs] is set: the address table then supplies every
+    /// address, including this rank's listen address.
     pub base_port: u16,
     /// Read/write deadline for every frame.
     pub timeout: Duration,
@@ -218,6 +228,20 @@ pub struct TcpConfig {
     pub connect_timeout: Duration,
     /// Largest single frame payload accepted.
     pub max_frame_bytes: usize,
+    /// Explicit listen address for this rank.
+    ///
+    /// This is separate from [TcpConfig::peer_addrs] so a rank may bind a wildcard or a
+    /// specific interface (`0.0.0.0:29601`, `192.0.2.80:29601`) while its peers dial a
+    /// routable address for the same port. When `None`, this rank binds
+    /// `127.0.0.1:(base_port + rank)`.
+    pub bind_addr: Option<SocketAddr>,
+    /// Explicit per-rank dial address table, indexed by rank.
+    ///
+    /// When `Some`, it must hold exactly [TcpConfig::world_size] addresses: a cluster that
+    /// describes three of its four ranks is refused at connect instead of silently dialing
+    /// loopback for the missing one. When `None`, peer `p` is dialed at
+    /// `127.0.0.1:(base_port + p)`.
+    pub peer_addrs: Option<Vec<SocketAddr>>,
 }
 
 impl TcpConfig {
@@ -231,7 +255,42 @@ impl TcpConfig {
             timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(5),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            bind_addr: None,
+            peer_addrs: None,
         }
+    }
+
+    /// The cluster configuration: one explicit listen address per rank.
+    ///
+    /// `addresses[r]` is what rank `r` binds and what every peer dials. The address table is
+    /// the whole cluster description, so an address that is unreachable is a connection
+    /// timeout naming the peer, not a silent fallback to loopback.
+    ///
+    /// # Errors
+    /// [CommError::RankOutOfRange] when `rank` is not an index into `addresses`,
+    /// [CommError::InvalidLayout] when the table is empty.
+    pub fn with_addresses(rank: usize, addresses: Vec<SocketAddr>) -> Result<Self, CommError> {
+        if addresses.is_empty() {
+            return Err(CommError::InvalidLayout(
+                "a TCP cluster address table needs at least one address".to_owned(),
+            ));
+        }
+        if rank >= addresses.len() {
+            return Err(CommError::RankOutOfRange {
+                rank,
+                world_size: addresses.len(),
+            });
+        }
+        Ok(Self {
+            rank,
+            world_size: addresses.len(),
+            base_port: 0,
+            timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(5),
+            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            bind_addr: Some(addresses[rank]),
+            peer_addrs: Some(addresses),
+        })
     }
 
     /// Replaces the frame deadline.
@@ -239,6 +298,51 @@ impl TcpConfig {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// Replaces the connection-setup deadline.
+    #[must_use]
+    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self
+    }
+
+    /// This rank's listen address: the explicit bind address, else `127.0.0.1:(base + rank)`.
+    fn local_address(&self) -> SocketAddr {
+        self.bind_addr.unwrap_or_else(|| {
+            SocketAddr::from((
+                [127, 0, 0, 1],
+                (u32::from(self.base_port) + self.rank as u32) as u16,
+            ))
+        })
+    }
+
+    /// Peer `peer`'s dial address, from the table when present and from the loopback scheme
+    /// otherwise.
+    ///
+    /// # Errors
+    /// [CommError::InvalidLayout] when the table is present but does not cover the cluster:
+    /// a partial address table is a configuration error, never a loopback fallback.
+    fn peer_address(&self, peer: usize) -> Result<SocketAddr, CommError> {
+        match &self.peer_addrs {
+            Some(table) => {
+                if table.len() != self.world_size {
+                    return Err(CommError::InvalidLayout(format!(
+                        "the address table holds {} addresses but world_size is {}",
+                        table.len(),
+                        self.world_size
+                    )));
+                }
+                table.get(peer).copied().ok_or(CommError::RankOutOfRange {
+                    rank: peer,
+                    world_size: self.world_size,
+                })
+            }
+            None => Ok(SocketAddr::from((
+                [127, 0, 0, 1],
+                (u32::from(self.base_port) + peer as u32) as u16,
+            ))),
+        }
     }
 }
 
@@ -284,8 +388,18 @@ impl TcpTransport {
                 config.base_port
             )));
         }
-        let local_port = (u32::from(config.base_port) + config.rank as u32) as u16;
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], local_port)))?;
+        // A partial address table is a configuration error, never a loopback fallback for the
+        // ranks it leaves out: checked once here so it fails before any socket is opened.
+        if let Some(table) = &config.peer_addrs
+            && table.len() != world_size
+        {
+            return Err(CommError::InvalidLayout(format!(
+                "the address table holds {} addresses but world_size is {world_size}",
+                table.len()
+            )));
+        }
+        let local_address = config.local_address();
+        let listener = TcpListener::bind(local_address)?;
         listener.set_nonblocking(true)?;
         let deadline = Instant::now() + config.connect_timeout;
         let mut readers: Vec<Option<TcpStream>> = (0..world_size).map(|_| None).collect();
@@ -327,8 +441,7 @@ impl TcpTransport {
             writers[peer] = Some(writer);
         }
         for peer in config.rank + 1..world_size {
-            let port = (u32::from(config.base_port) + peer as u32) as u16;
-            let address = SocketAddr::from(([127, 0, 0, 1], port));
+            let address = config.peer_address(peer)?;
             let mut writer = connect_retry(address, deadline, config.connect_timeout)?;
             tune(&writer, config.timeout)?;
             write_hello(&mut writer, config.rank)?;

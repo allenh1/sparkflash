@@ -182,11 +182,16 @@ pub enum KernelId {
     /// flash_mla_csa2_seq_sm121: the deferred sequence's position-causal CSA2 attention entry, the
     /// start_pos > 0 path the c4a-2 call-site guard currently denies.
     FlashMlaCsa2Seq,
+    /// b12x_bf16a_mxfp8w_dense_sm121: the BF16-activation variant of the dense MXFP8 projection
+    /// (D37's precision-first path); weights stay B12x FP8 codes and ue8m0 scales.
+    Bf16aMxfp8wDense,
+    /// b12x_bf16a_mxfp8w_wo_a_sm121: the BF16-activation variant of the grouped wo_a projection.
+    Bf16aMxfp8wWoA,
 }
 
 impl KernelId {
     /// Every kernel the shared driver owns, in the order of this enum.
-    pub const ALL: [KernelId; 12] = [
+    pub const ALL: [KernelId; 14] = [
         KernelId::MegaMhcBf16,
         KernelId::Mxfp8Dense,
         KernelId::Mxfp8WoA,
@@ -199,6 +204,8 @@ impl KernelId {
         KernelId::RmsNorm,
         KernelId::LmHeadReduce,
         KernelId::FlashMlaCsa2Seq,
+        KernelId::Bf16aMxfp8wDense,
+        KernelId::Bf16aMxfp8wWoA,
     ];
 
     /// The cubin symbol of this kernel. Private: callers name the enum, never the symbol.
@@ -216,6 +223,8 @@ impl KernelId {
             KernelId::RmsNorm => "rmsnorm_sm121",
             KernelId::LmHeadReduce => "lm_head_reduce_sm121",
             KernelId::FlashMlaCsa2Seq => "flash_mla_csa2_seq_sm121",
+            KernelId::Bf16aMxfp8wDense => "b12x_bf16a_mxfp8w_dense_sm121",
+            KernelId::Bf16aMxfp8wWoA => "b12x_bf16a_mxfp8w_wo_a_sm121",
         }
     }
 
@@ -241,6 +250,8 @@ impl KernelId {
             KernelId::RmsNorm => &["rmsnorm_sm121"],
             KernelId::LmHeadReduce => &["lm_head_reduce_sm121"],
             KernelId::FlashMlaCsa2Seq => &["flash_mla_csa2_seq_sm121"],
+            KernelId::Bf16aMxfp8wDense => &["b12x_bf16a_mxfp8w_dense_sm121"],
+            KernelId::Bf16aMxfp8wWoA => &["b12x_bf16a_mxfp8w_wo_a_sm121"],
         }
     }
 

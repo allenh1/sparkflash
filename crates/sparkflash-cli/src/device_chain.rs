@@ -101,7 +101,7 @@ impl WeightSource for CachedWeightSource {
 }
 
 /// The usage line for this subcommand.
-pub const USAGE: &str = "sparkflash device-chain --plan-only|--dry-run|--run-stage mhc_entry|layer_zero|hybrid_token --checkpoint DIR --cubin-dir DIR [--positions 0] [--layer 0] [--token 0] [--element-limit N] [--moe-preflight] [--moe-layer0-diagnose]";
+pub const USAGE: &str = "sparkflash device-chain --plan-only|--dry-run|--run-stage mhc_entry|layer_zero|hybrid_token|tp4-smoke --checkpoint DIR --cubin-dir DIR [--positions 0] [--layer 0] [--token 0] [--element-limit N] [--moe-preflight] [--moe-layer0-diagnose]; tp4-smoke also takes --tp-rank N --tp-world-size N --comm-backend tcp|lo --comm-peers IP,IP,... --comm-port 29601 --evidence-dir DIR";
 
 /// The exit code a plan-only or dry-run invocation returns: 2, refusing to serve.
 pub const PLAN_ONLY_EXIT: u8 = 2;
@@ -337,6 +337,14 @@ pub fn dry_run_lines() -> Result<Vec<String>, String> {
 pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     let args: Vec<String> = args.collect();
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    // The tp4-smoke stage is host-only: it opens no driver, so it must be reachable from a build
+    // without the cuda feature. A rank of the four-node window runs the same code a CPU-only host
+    // builds, and the host tests exercise it without a device.
+    if arg_refs.first().copied() == Some("--run-stage")
+        && arg_refs.get(1).copied() == Some("tp4-smoke")
+    {
+        return crate::tp4_smoke::run(&arg_refs[2..]);
+    }
     #[cfg(feature = "cuda")]
     if arg_refs.first().copied() == Some("--run-stage") {
         return run_stage(&arg_refs[1..]);
@@ -382,6 +390,8 @@ struct StageArgs {
     sequence: bool,
     reference_check: bool,
     dump_logits: Option<std::path::PathBuf>,
+    wo_a_mode: crate::attention_device::WoAMode,
+    wo_a_operand_dump: Option<std::path::PathBuf>,
 }
 
 #[cfg(feature = "cuda")]
@@ -440,6 +450,8 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
     let mut time_budget_s = 3600u64;
     let mut reference_check = false;
     let mut dump_logits = None;
+    let mut wo_a_mode = crate::attention_device::WoAMode::default();
+    let mut wo_a_operand_dump = None;
     let mut index = 1usize;
     while index < args.len() {
         let flag = args[index];
@@ -466,6 +478,15 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
             "--cubin-dir" => cubin_dir = Some(std::path::PathBuf::from(value)),
             "--positions" => positions = parse_positions(value)?,
             "--fixture" => fixture = Some(std::path::PathBuf::from(value)),
+            "--wo-a-mode" => {
+                wo_a_mode = crate::attention_device::WoAMode::parse(value)?;
+            }
+            "--dump-wo-a-operand" => {
+                if value.is_empty() {
+                    return Err("--dump-wo-a-operand needs a non-empty path".to_string());
+                }
+                wo_a_operand_dump = Some(std::path::PathBuf::from(value));
+            }
             "--dump-logits" => {
                 if value.is_empty() {
                     return Err("--dump-logits needs a non-empty path".to_string());
@@ -561,6 +582,8 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
             reference_check,
             sequence,
             dump_logits,
+            wo_a_mode,
+            wo_a_operand_dump,
         },
     ))
 }
@@ -1020,7 +1043,25 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
 
     let mem_available_bytes = read_mem_available_bytes()?;
     let mut attention_backend =
-        crate::attention_device::AttentionDeviceBackend::open(&args.cubin_dir)?;
+        crate::attention_device::AttentionDeviceBackend::open(&args.cubin_dir)?
+            .with_wo_a_mode(args.wo_a_mode);
+    if args.moe_layer0_diagnose || args.wo_a_operand_dump.is_some() {
+        attention_backend = attention_backend.with_wo_a_native_diagnose();
+    }
+    if let Some(dir) = args.wo_a_operand_dump.clone() {
+        attention_backend = attention_backend.with_wo_a_operand_dump(dir);
+    }
+    lines.push(format!(
+        "wo_a path: mode={} (native = BF16 activation, no activation quantisation; mxfp8 = E4M3 activation with per-32 ue8m0 scales); operand_dump={}",
+        args.wo_a_mode.name(),
+        args.wo_a_operand_dump
+            .as_ref()
+            .map_or_else(|| "none".to_string(), |path| path.display().to_string())
+    ));
+    lines.push(
+        "indexer arithmetic: native dtype (bf16 q_norm output quantised to E4M3 over 32-value blocks, fp8 W8A8 wq_b with a bf16 output, bf16 weights and scores, discrete two-level top-k; the indexer stays a host seam)"
+            .to_string(),
+    );
     let mut moe_backend = crate::moe_device::MoeDeviceBackendImpl::open(&args.cubin_dir)?;
     if args.moe_layer0_diagnose {
         moe_backend = moe_backend.with_layer0_diagnose();
@@ -2366,6 +2407,23 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             &config,
             attention_backend.operand_traces(),
         ));
+    }
+    if !attention_backend.wo_a_comparisons().is_empty() {
+        for comparison in attention_backend.wo_a_comparisons() {
+            lines.push(format!(
+                "wo_a native comparison: mode={} layer={} device_vs_native_mismatches={}/{} device_max_abs={:.9e} mxfp8_codes_equal={}/{} mxfp8_max_abs={:.9e} output_max_abs={:.9e} operand_checksum={:#018x}",
+                comparison.mode.name(),
+                comparison.layer,
+                comparison.device_vs_native.mismatches,
+                comparison.device_vs_native.total,
+                comparison.device_vs_native.max_abs,
+                comparison.mxfp8_vs_native.codes_equal,
+                comparison.mxfp8_vs_native.total,
+                comparison.mxfp8_vs_native.max_abs,
+                comparison.mxfp8_vs_native.output_max_abs,
+                comparison.operand_checksum
+            ));
+        }
     }
     let hybrid_top5 = top5(&output.logits);
     lines.push(format!(
@@ -3848,7 +3906,7 @@ mod tests {
         assert!(
             text.contains("chain_execution=false; device_execution=false; token_produced=false")
         );
-        assert!(text.contains("13 baseline pins parsed"));
+        assert!(text.contains("15 baseline pins parsed"));
         assert!(
             text.contains("crates/sparkflash-kernels/baseline/kernel_baseline.txt"),
             "the catalog names the repository path, not a crate-relative one"
@@ -4030,6 +4088,8 @@ mod tests {
             sequence: false,
             reference_check: false,
             dump_logits: None,
+            wo_a_mode: crate::attention_device::WoAMode::default(),
+            wo_a_operand_dump: None,
         };
         assert_eq!(
             layer_zero_element_limit(&default_args),
@@ -4080,6 +4140,49 @@ mod tests {
         ])
         .expect_err("hybrid_token is position 0 only");
         assert!(error.contains("position 0 only"), "{error}");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_sequence_arm_parses_the_wo_a_mode_and_operand_dump() {
+        let (_, args) = stage_args(&[
+            "hybrid_sequence",
+            "--checkpoint",
+            "/checkpoint",
+            "--cubin-dir",
+            "/cubins",
+            "--wo-a-mode",
+            "mxfp8",
+            "--dump-wo-a-operand",
+            "/tmp/wo-a-dump",
+        ])
+        .expect("wo_a arguments");
+        assert_eq!(args.wo_a_mode, crate::attention_device::WoAMode::Mxfp8);
+        assert_eq!(
+            args.wo_a_operand_dump,
+            Some(std::path::PathBuf::from("/tmp/wo-a-dump"))
+        );
+        let (_, defaults) = stage_args(&[
+            "hybrid_sequence",
+            "--checkpoint",
+            "/checkpoint",
+            "--cubin-dir",
+            "/cubins",
+        ])
+        .expect("defaults");
+        assert_eq!(defaults.wo_a_mode, crate::attention_device::WoAMode::Native);
+        assert_eq!(defaults.wo_a_operand_dump, None);
+        let error = stage_args(&[
+            "hybrid_sequence",
+            "--checkpoint",
+            "/checkpoint",
+            "--cubin-dir",
+            "/cubins",
+            "--wo-a-mode",
+            "fp8",
+        ])
+        .expect_err("an unknown mode is refused");
+        assert!(error.contains("not a wo_a mode"), "{error}");
     }
 
     #[cfg(feature = "cuda")]

@@ -221,6 +221,126 @@ logits from one prefill this becomes one pass; that is the S3 follow-up recorded
   cost table above). The one-prefill fix is task-21/S3, so the O(n) path must not be enabled by
   default anywhere in the serving stack.
 
+## Oracle patch state and the p129 near-one-hot question
+
+Added 2026-10-19 from an audit of the window that produced the D40 oracle. No server was started:
+the image was inspected from `vllm/vllm-openai:deepseekv41-flash-0909` (digest `714a937591e1...`,
+the same on all four nodes) and the launch scripts/logs on `node0`, and patch scripts were
+exercised only in throwaway `docker run --rm` containers.
+
+**How the cluster's vLLM repairs are applied.** The three `fix-*` repairs are `mods/` in
+`~/spark-vllm-docker`, applied at cluster start by `launch-cluster.sh --apply-mod <dir>`. The
+containers start idle (`sleep infinity`); for each mod the launcher `docker cp`s the directory to
+`/workspace/mods/<name>` in all four containers and runs `./run.sh` through `docker exec`, which
+source-patches the installed `vllm` package. A non-zero `run.sh` aborts the launch. The patches are
+not baked into the image (the image digest is unchanged) and are not env-gated; they live in the
+container writable layer and are re-applied on every launch, so a window is reproducible only
+through the recipe / `window-vllm.sh`, not through the bare image.
+
+**What the D40 window had live.** `window-vllm.sh start` (sha256 `a3ba6763...`, as recorded in
+`window-runbook.md`) applies exactly the canonical recipe's mod list
+(`recipes/deepseek-v4.1-flash-1017.yaml`: engram-disk-reference, sm120-dsv4-topk,
+fix-dsv41-sparse-topk-oob, diag-dsv41-decode-topk, install-ray) and then
+`vllm-launch-recipe-released.sh` (sha256 `a3ac461f...`, released snapshot root `1bae0e10...`,
+`--max-logprobs 1000`). `start-vllm.log` at 2026-10-19T17:18-17:20Z shows the mod scripts running on
+all four nodes; in particular `[fix-dsv41-sparse-topk-oob] patching
+.../vllm/models/deepseek_v4_1/common/ops/cache_utils.py` on each node, and the decode-top-k probe
+verdict "deterministic and correct". `native-oracle-released.json` (17:28:33Z) and
+`native-oracle-suite.json` (17:30:37Z) were written by that server.
+
+**Per-patch status against the served tree.**
+
+* `fix-dsv41-sparse-topk-oob` -- needed and live. The pristine image's
+  `models/deepseek_v4_1/common/ops/cache_utils.py`
+  `_compute_global_topk_indices_and_lens_kernel` loads
+  `block_table_ptr + req_idx * block_table_stride + block_indices` with no row bound (no
+  `block_table_rows` in the kernel signature); the mod masks the load, writes the `-1` sentinel and
+  excludes unresolvable entries from the valid count. This is the only one of the three on the V4.1
+  path.
+* `fix-dsv4-sparse-swa-spec-config` -- already in the image.
+  `v1/attention/backends/mla/sparse_swa.py` defines
+  `spec_config = self.vllm_config.speculative_config` (line 422) and computes the DSpark width via
+  `get_dspark_swa_index_width` (line 527); running the mod's `patch.py` against the pristine image
+  fails pattern #0 (exit 1) and would abort a launch. Must not be added to a recipe.
+* `fix-dsv4-c128a-prefill-short-extend` -- V4.0 only. It edits
+  `models/deepseek_v4/sparse_mla.py::_build_c128a_metadata` (it applies cleanly there, so it is
+  required when serving `DeepseekV4ForCausalLM`); the served architecture
+  `DeepseekV41ForCausalLM` maps to `vllm.models.deepseek_v4_1`, which contains no c128a metadata
+  builder and never calls `_build_c128a_metadata`.
+
+So the D40 oracle run was not missing any of the three *as shipped in the recipe*: the only fix the
+V4.1 path needs was live, and the other two are image-native and V4.0-only respectively.
+
+**Protocol rule for D40 oracle captures.** In this build a `prompt_logprobs` row is a function of the
+request's total prompt length and batch composition as well as the causal prefix: identical-shape
+repeats are bit-identical, but a 1-token prompt-length change moves the p129 tails by up to ~3.7 nats
+(KL up to 0.235) and a 4x-batch request moves the same row's top-1 probability from 0.820 to
+0.690-0.908 (worst KL 0.932, max 4.06 nats). Rule, not a hedge: match the token ids exactly (same
+causal prefix) and keep the request body identical; deviate in total prompt length only by the
+minimum the protocol forces -- for a `prompt_logprobs` row p the oracle request must contain token
+p+1, so the minimal oracle prompt is p+2 tokens against the device request's p+1, an irreducible
++1-token difference -- and record the prompt length (and batch composition) in every capture file.
+Gate only at that minimal forced +1 shape (or another fixed, recorded shape); a residual 1-token
+difference is a floor to quote, not a gate violation, while an arbitrary longer prompt (the 139-vs-
+140 case here) is not a valid comparison.
+
+Two floors, and the doc should say which one a gate uses. The *same-shape repeat* floor is zero:
+three identical sequential requests are bit-identical (rank-1 9/9, |difference| 0.000 at
+p50/p90/p99/max, KL 0.000, top-k overlap 1.000; p129 -0.19884082674980164 in all three). The *gate*
+floor is the measured 1-token length envelope at the minimal forced +1 shape (task-32 section 4.2;
+rows `docs/build/task32-evidence/length-probe-rows.json`, sha256
+`5fae4ee9933a551e9a1da486971ceb6e1c37fd9b8c78402e7fc90d67607f6400`, identical to the node capture
+`phase2-evidence/window-2026-10-18/task32-repeats/native-oracle-length-probe.json`: KL 0.025-0.235,
+p90 0.34-1.89 nats, max 0.81-3.74 nats, top-100 overlap 0.68-0.83, rank-1 flips only at near-ties
+such as row 128 201/223). A device-oracle gate uses the +1 envelope, never the zero repeat floor.
+
+**Batch/load state is a capture variable too.** With the same request body, `prompt_logprobs` differ
+deterministically between an idle server and one with a concurrent generation in flight (controlled
+result: p129/139 top-1 probability 0.820 -> 0.928 -> 0.820; p129/131 0.448 -> 0.882 -> 0.448; rows
+move up to 0.3-0.4 in top-1 probability), and the switch is reversible, so a busy capture cannot be
+corrected post hoc. Cause: prefix caching + chunked prefill on a shared server (an external client
+was seen on 192.0.2.71 during part of the capture window). Recorded rule: the D40 oracle must be
+captured on a verified-idle server -- idle check before and after the capture, external-client check
+recorded -- and every capture file records its load state; busy captures are labelled and are not
+valid gate inputs, and mixing idle and busy captures is invalid. The same-shape repeat floor of zero
+applies under a constant state; the concurrent-state component is part of the D41 floor (up to
+0.12-0.7 nats, up to 0.43 in top-1 probability).
+
+**The p129 near-one-hot question is open, not diagnosed.** In the same suite there are 14
+prompt-logprobs rows (of 1664) with `p(top1) > 0.9997`, all with the top-1 equal to the observed
+prompt token and top-2 gaps of 9.5-13.4 nats. Applying the discrimination test designed for this:
+
+* (a) top-1 is the observed token: 14/14.
+* (b) the position is trivially predictable: all 14 are mid-word / word-completion or fixed
+  collocations (`nineteen eight` -> `ies`, `inher` -> `its`, `Reg` -> `isters`, `rather` -> ` than`,
+  `parag` -> `rap`, `esp` -> `aces`, `mant` -> `issa`, `reprodu` -> `ces`, `disagree` -> `ing`,
+  `del` -> `tas`; the weakest is `...distribution dep` -> `arts`).
+* (c) same value across warm repeats: settled by task-32. Three identical sequential sends of the
+  b69 body on the restarted warm server are bit-identical (rank-1 9/9, `|difference|` 0.000 at
+  p50/p90/p99/max, KL 0.000, top-k overlap 1.000 at k=5/20/100/1000; p129 -0.19884082674980164 in
+  all three, matching the frozen 17:28 file). The 0.82-nat released-vs-suite drift (rows 129-137,
+  same causal prefixes) is therefore request shape, not run-to-run noise: rows in this build depend
+  deterministically on total prompt length and batch composition. A length probe gives row 129
+  top-1 probability 0.882/0.822/0.598 at lengths 131/132/133 (KL 0.053-0.235, p90 1.10-1.89, max
+  2.31-3.74), and a batch-of-4 request gives 0.690/0.806/0.839/0.908 against 0.820 single (worst KL
+  0.932, max 4.06, one rank-1 flip at the flat p135 where the single-run top-1 probability is
+  0.019). Numbers: `docs/build/task32-root-cause.md` sections 2.3/4.1/4.2 (branch
+  `task32-f32-vs-vllm`, commit `31c0212`); artefacts under
+  `phase2-evidence/window-2026-10-18/task32-repeats/`.
+* (d) top-2 gap: 9.5-13.4 nats (>= 8, "collapsed" by the rule), but a genuine >=10-nat gap
+  necessarily gives a top-1 logprob of about -1e-5, which is exactly the observed magnitude, so (d)
+  does not discriminate on its own.
+
+Recorded disposition: (a)+(b)+(c) classify these 14 rows as legitimately deterministic word-completion
+rows; the one-hot magnitude is by itself not evidence of an engine bug, and the item stays OPEN as a
+watch item rather than being closed as an artefact. The operational consequence is the shape
+protocol rule above: with shape locked a repeat is bit-identical, and the 0.82-nat released-vs-suite
+drift is the shape floor, ~40x a 0.02-nat bar, so any row-value bar must be shape-locked. The p129
+random-token row (0.92 on a prompt of random ids, with no collocation to predict) is a different
+quantity and is not explained by this classification: under a matched 131-token prompt it is still
+367 first at p=0.448, entropy 2.73 against 5.15 at p128, i.e. a stable anomaly of that query; it
+remains open and is owned by audit-dev (task-32, section 2.3).
+
 ## Tests and gates
 
 Host only, no GPU, no checkpoint:

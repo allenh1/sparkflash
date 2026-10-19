@@ -966,15 +966,7 @@ pub fn packed_expert(
 /// against the reference, and it makes a round trip through bf16 unstable for exactly the values
 /// that sit on a midpoint.
 fn f32_to_bf16(value: f32) -> u16 {
-    let bits = value.to_bits();
-    // A NaN keeps its high bits and is made quiet. The infinities have no set mantissa bit for the
-    // rounding below to carry into, and an f32 above the largest finite bf16 lands on infinity, as
-    // the cast does.
-    if value.is_nan() {
-        return ((bits >> 16) as u16) | 0x0040;
-    }
-    let round = 0x7FFF + ((bits >> 16) & 1);
-    (bits.wrapping_add(round) >> 16) as u16
+    crate::quant::f32_to_bf16_bits(value)
 }
 
 #[cfg(test)]

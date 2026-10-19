@@ -46,6 +46,8 @@ use crate::rail::RailLedger;
 use crate::telemetry::{CommTelemetry, CommTelemetrySnapshot};
 use crate::transport::Transport;
 use dataplane::{DataPlane, ReadyRail, RemoteRail, SlotLayout};
+pub use verbs::{ShimMode, shim_mode};
+
 use qpinfo::{ControlConfig, RailEndpoint, RankEndpoints, exchange_endpoints};
 use verbs::Verbs;
 

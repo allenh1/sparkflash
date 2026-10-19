@@ -1,0 +1,215 @@
+{
+  "schema": "sparkflash-control-fixture-vs-oracle/1",
+  "control": "prefill",
+  "prompt_id": "b69-fixture-130",
+  "position": 128,
+  "fixture": {
+    "path": "/tmp/f32-prompt128.json",
+    "sha256": "466d36b5a3627c8850adbb0f51ca1d799f9ceb5912321a9972504c39fa5a859f",
+    "generator": "sparkflash-engine sequence_fixture v1",
+    "config_label": "released",
+    "command": "'./sequence_fixture_f72738b_aarch64' '--config' 'released' '--checkpoint' '/home/user/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170' '--prompt-tokens' '129' '--decode-steps' '1' '--seed' '7' '--logits' 'prefill' '--provenance' 'node' '--out' '/tmp/task32/f32-prompt129.json'",
+    "binary_sha256": "ed3838df5ca28722a19d6dda689d7b90c4dd67c8faf205cafcc3469dcb459ffa"
+  },
+  "oracle": {
+    "path": "/tmp/native-oracle-suite.json",
+    "sha256": "efce16c2637aeab70475a43b8dc0c5cbe1f066b6bb9cd671480c7d7e03c4572a",
+    "served_root": "/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170",
+    "generated_at": "2026-10-19T17:30:37Z",
+    "root_verified": true
+  },
+  "prefix": {
+    "fixture_prompt_len": 129,
+    "oracle_prompt_len": 140,
+    "prefix_verified": true,
+    "continuation_verified": true,
+    "suite_sha256": "42f66ad2d8d81ff555eeee2ef837e0cd6ca3cb59bde57320223d9c9b9ef19cd7",
+    "next_prompt_token": 20462
+  },
+  "engine_argmax": 201,
+  "oracle_argmax": 223,
+  "metrics": {
+    "position": 128,
+    "target_token": 20462,
+    "target_in_distribution": true,
+    "device_argmax": 201,
+    "oracle_argmax": 223,
+    "device_top": [
+      [
+        201,
+        -2.912971811653332
+      ],
+      [
+        223,
+        -3.0374928116533315
+      ],
+      [
+        271,
+        -3.5132378116533314
+      ],
+      [
+        65,
+        -5.438772311653332
+      ],
+      [
+        10,
+        -5.932156811653331
+      ],
+      [
+        16,
+        -6.083323811653331
+      ],
+      [
+        2808,
+        -6.272945511653331
+      ],
+      [
+        84,
+        -6.289689811653331
+      ],
+      [
+        21828,
+        -6.376003411653332
+      ],
+      [
+        74,
+        -6.457368011653331
+      ],
+      [
+        78,
+        -6.622040411653331
+      ],
+      [
+        14,
+        -6.764578811653331
+      ],
+      [
+        339,
+        -6.771711811653331
+      ],
+      [
+        17,
+        -6.852289311653331
+      ],
+      [
+        65990,
+        -6.905370411653331
+      ],
+      [
+        379,
+        -6.912420411653331
+      ],
+      [
+        4341,
+        -6.918400411653331
+      ],
+      [
+        8060,
+        -6.930702811653331
+      ],
+      [
+        86,
+        -6.947570811653331
+      ],
+      [
+        33,
+        -6.948573311653331
+      ]
+    ],
+    "oracle_top": [
+      [
+        223,
+        -3.6512675285339355
+      ],
+      [
+        201,
+        -3.9012675285339355
+      ],
+      [
+        271,
+        -4.4012675285339355
+      ],
+      [
+        65,
+        -5.7137675285339355
+      ],
+      [
+        2808,
+        -6.3075175285339355
+      ],
+      [
+        21828,
+        -6.4637675285339355
+      ],
+      [
+        10,
+        -6.5262675285339355
+      ],
+      [
+        339,
+        -6.5262675285339355
+      ],
+      [
+        74,
+        -6.5575175285339355
+      ],
+      [
+        4341,
+        -6.6512675285339355
+      ],
+      [
+        16,
+        -6.6825175285339355
+      ],
+      [
+        65990,
+        -6.7450175285339355
+      ],
+      [
+        603,
+        -6.8075175285339355
+      ],
+      [
+        69,
+        -6.8387675285339355
+      ],
+      [
+        86,
+        -7.0262675285339355
+      ],
+      [
+        14,
+        -7.0575175285339355
+      ],
+      [
+        78,
+        -7.1200175285339355
+      ],
+      [
+        85135,
+        -7.1200175285339355
+      ],
+      [
+        72,
+        -7.1825175285339355
+      ],
+      [
+        33,
+        -7.2137675285339355
+      ]
+    ],
+    "top1_agreement": false,
+    "target_logprob_device": -13.211200811653331,
+    "target_logprob_oracle": -12.853416442871094,
+    "top5_overlap": 0.8,
+    "top20_overlap": 0.8,
+    "top100_overlap": 0.8,
+    "top1000_overlap": 0.673,
+    "max_abs_delta": 2.622615806282237,
+    "mean_abs_delta": 0.3695537475913776,
+    "compared_tokens": 1001,
+    "kl_oracle_to_device": 0.1259262704645796,
+    "js_divergence": 0.029156665974795246,
+    "oracle_mass_on_returned": 0.1893254423070067
+  }
+}

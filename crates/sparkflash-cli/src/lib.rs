@@ -10,3 +10,4 @@ pub mod doctor;
 #[cfg(feature = "cuda")]
 pub mod moe_device;
 pub mod serve;
+pub mod tp4_smoke;

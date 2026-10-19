@@ -50,6 +50,7 @@ pub mod error;
 mod exchange;
 pub mod fabric;
 pub mod layout;
+pub mod oneshot;
 pub mod probe;
 pub mod rail;
 #[cfg(feature = "rdma")]
@@ -70,6 +71,12 @@ pub use fabric::{
 pub use layout::{
     CollectiveLayout, FabricLink, FabricSchedule, MAX_FRAME_ELEMENTS, REFERENCE_WORLD_SIZE,
     ScheduleTransfer, TransferPhase,
+};
+pub use oneshot::{
+    ArrivalProxy, DeviceBuffer, Dispatch, DispatchLog, DispatchRecord, Exchange, LaunchPath,
+    ONESHOT_ARRIVAL_BYTES, ONESHOT_KERNEL_NAME, ONESHOT_KIND, ONESHOT_PHASE, ONESHOT_RAILS,
+    ONESHOT_RANKS, ONESHOT_ROW_BYTES, ONESHOT_ROW_ELEMENTS, ONESHOT_SLOT_ALIGN, ONESHOT_SLOT_BYTES,
+    RailFrame, SeamError, SequenceCounter, SlotKind, SlotRegistration, arrival_offset, row_offset,
 };
 pub use rail::{RailAudit, RailLedger, RailPlan, RailSplit};
 pub use reduce::{canonical_all_reduce_into, canonical_reduce_element};

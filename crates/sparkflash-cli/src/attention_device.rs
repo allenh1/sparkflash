@@ -13,6 +13,8 @@ use sparkflash_engine::forward::attention::sparse_attention;
 use sparkflash_engine::linalg::EngineError;
 use sparkflash_engine::quant::quantize_activation_fp8;
 use sparkflash_engine::weights::WeightSource;
+use sparkflash_kernels::bf16a_mxfp8w_ref::{self, CodeComparison, PathComparison};
+use sparkflash_kernels::bf16a_mxfp8w_wo_a_launch::{self, Bf16aMxfp8wWoAParams};
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel, KernelId, Module};
 use sparkflash_kernels::cuda_harness::{
     FlashMlaKernel, engine_window_row, flash_mla_params, launch_flash_mla, load_flash_mla,
@@ -28,6 +30,8 @@ type PackedWeight = Arc<(Vec<u8>, Vec<u8>)>;
 
 const DENSE_KERNEL: &str = "b12x_mxfp8_dense_sm121";
 const WO_A_KERNEL: &str = "b12x_mxfp8_wo_a_sm121";
+/// The BF16-activation grouped wo_a cubin: the native path.
+const WO_A_NATIVE_KERNEL: &str = "b12x_bf16a_mxfp8w_wo_a_sm121";
 const FLASH_MLA_KERNEL: &str = "flash_mla_csa2_sm121";
 const FLASH_MLA_SEQ_KERNEL: &str = "flash_mla_csa2_seq_sm121";
 /// The CSA-union format value the m14 kernel expects.
@@ -55,8 +59,69 @@ const MAX_WEIGHT_SCALES: usize = 160 * 256;
 const MAX_ACT_BYTES: usize = 64 * 512;
 /// The maximum activation scale count: one per 32 codes.
 const MAX_ACT_SCALES: usize = MAX_ACT_BYTES / 32;
+/// The maximum BF16 activation bytes: the same 64 x 512-wide output at two bytes each.
+const MAX_ACT_BF16_BYTES: usize = MAX_ACT_BYTES * 2;
 /// The maximum activation output: wq_b's 32,768 bf16 values.
 const MAX_OUT_BYTES: usize = 32_768 * 2;
+
+/// Which wo_a arithmetic the chain runs.
+///
+/// [WoAMode::Native] is the released rule (native-arithmetic-audit F1/M1): the inverse-RoPE angle
+/// is applied to the BF16 body output and no activation quantiser runs, so the grouped GEMM is a
+/// BF16 activation times the dequantised FP8 weight. [WoAMode::Mxfp8] is the chain's previous path
+/// and stays selectable, so a window log shows which arithmetic it measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WoAMode {
+    /// BF16 activation, no activation quantisation.
+    #[default]
+    Native,
+    /// E4M3 activation with per-32 ue8m0 scales.
+    Mxfp8,
+}
+
+impl WoAMode {
+    /// Parses the --wo-a-mode spelling.
+    ///
+    /// # Errors
+    /// Any spelling other than native or mxfp8.
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "native" => Ok(Self::Native),
+            "mxfp8" => Ok(Self::Mxfp8),
+            other => Err(format!(
+                "--wo-a-mode: {other} is not a wo_a mode (native or mxfp8)"
+            )),
+        }
+    }
+
+    /// The spelling a run log records.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Mxfp8 => "mxfp8",
+        }
+    }
+}
+
+/// One layer's wo_a comparison at that layer's first position.
+///
+/// It records two things on the SAME captured operand: the native launch against the native
+/// reference (the kernel-versus-twin check), and the current MXFP8 path against that same
+/// reference (the F1 deviation measured on one operand).
+#[derive(Debug, Clone)]
+pub struct WoAComparison {
+    /// Backbone layer index.
+    pub layer: usize,
+    /// Which wo_a arithmetic the device launch used.
+    pub mode: WoAMode,
+    /// The native device output against the BF16 reference on the same activation codes.
+    pub device_vs_native: CodeComparison,
+    /// The current MXFP8 path against the same reference.
+    pub mxfp8_vs_native: PathComparison,
+    /// XOR-fold of the operand's f32 bits, so an offline dump can be matched to a record.
+    pub operand_checksum: u64,
+}
 
 /// One launch's bookkeeping.
 #[derive(Debug, Default, Clone, Copy)]
@@ -135,10 +200,12 @@ fn checksum_bytes(bytes: &[u8]) -> u64 {
 struct Kernels {
     dense: Kernel,
     wo_a: Kernel,
+    wo_a_native: Kernel,
     flash: FlashMlaKernel,
     flash_seq: Kernel,
     _dense_module: Module,
     _wo_a_module: Module,
+    _wo_a_native_module: Module,
     _flash_module: Module,
     _flash_seq_module: Module,
 }
@@ -146,6 +213,7 @@ struct Kernels {
 struct Buffers {
     a_codes: Deviceptr,
     a_scales: Deviceptr,
+    a_bf16: Deviceptr,
     w: Deviceptr,
     w_scales: Deviceptr,
     out: Deviceptr,
@@ -186,6 +254,15 @@ pub struct AttentionDeviceBackend {
     // Packed attention weights, read once per (layer, projection) name and reused across sequence
     // positions. This is the M3-d staging-reuse shape for the projection set; host bytes only.
     weight_cache: HashMap<String, PackedWeight>,
+    // Which wo_a arithmetic this chain runs, set once at construction.
+    wo_a_mode: WoAMode,
+    // Whether the per-layer wo_a comparison (and operand dump) is armed.
+    wo_a_diagnose: bool,
+    // One slot per layer: whether that layer's comparison already ran.
+    wo_a_compared: Vec<bool>,
+    wo_a_comparisons: Vec<WoAComparison>,
+    // Where to write each layer's first-position operand and device output, when set.
+    wo_a_operand_dump: Option<std::path::PathBuf>,
     // Positions 0-2's staged operands for the residual/alignment diagnostic; empty otherwise.
     operand_traces: Vec<AttentionOperandTrace>,
     // Layer 0's first-position raw projection outputs, for the stage-aligned projection twin.
@@ -207,11 +284,14 @@ impl AttentionDeviceBackend {
         let dir = cubin_dir.as_ref();
         let dense_bytes = verified_cubin(dir, DENSE_KERNEL)?;
         let wo_a_bytes = verified_cubin(dir, WO_A_KERNEL)?;
+        let wo_a_native_bytes = verified_cubin(dir, WO_A_NATIVE_KERNEL)?;
         let flash_bytes = verified_cubin(dir, FLASH_MLA_KERNEL)?;
         let flash_seq_bytes = verified_cubin(dir, FLASH_MLA_SEQ_KERNEL)?;
         let cuda = Cuda::load()?;
         let (dense_module, dense) = cuda.load_kernel(&dense_bytes, KernelId::Mxfp8Dense)?;
         let (wo_a_module, wo_a) = cuda.load_kernel(&wo_a_bytes, KernelId::Mxfp8WoA)?;
+        let (wo_a_native_module, wo_a_native) =
+            bf16a_mxfp8w_wo_a_launch::load(&cuda, &wo_a_native_bytes)?;
         let (flash_module, flash) = load_flash_mla(&cuda, &flash_bytes)?;
         let (flash_seq_module, flash_seq) =
             flash_mla_csa2_seq_launch::load(&cuda, &flash_seq_bytes)?;
@@ -219,10 +299,11 @@ impl AttentionDeviceBackend {
         let alloc = |bytes: usize, total: &mut usize| cuda.alloc(bytes, total);
         let a_codes = alloc(MAX_ACT_BYTES, &mut total)?;
         let a_scales = alloc(MAX_ACT_SCALES, &mut total)?;
+        let a_bf16 = alloc(MAX_ACT_BF16_BYTES, &mut total)?;
         let w = alloc(MAX_WEIGHT_BYTES, &mut total)?;
         let w_scales = alloc(MAX_WEIGHT_SCALES, &mut total)?;
         let out = alloc(MAX_OUT_BYTES, &mut total)?;
-        let ptrs = vec![a_codes, a_scales, w, w_scales, out];
+        let ptrs = vec![a_codes, a_scales, a_bf16, w, w_scales, out];
         let q = alloc(MLA_Q_BYTES, &mut total)?;
         let kv_fp4 = alloc(MAX_KV_FP4, &mut total)?;
         let kv_scales = alloc(MAX_KV_SCALES, &mut total)?;
@@ -260,16 +341,19 @@ impl AttentionDeviceBackend {
             kernels: Kernels {
                 dense,
                 wo_a,
+                wo_a_native,
                 flash,
                 flash_seq,
                 _dense_module: dense_module,
                 _wo_a_module: wo_a_module,
+                _wo_a_native_module: wo_a_native_module,
                 _flash_module: flash_module,
                 _flash_seq_module: flash_seq_module,
             },
             buffers: Buffers {
                 a_codes,
                 a_scales,
+                a_bf16,
                 w,
                 w_scales,
                 out,
@@ -294,6 +378,11 @@ impl AttentionDeviceBackend {
             body_by_layer: vec![0; 64],
             last_activation: None,
             weight_cache: HashMap::new(),
+            wo_a_mode: WoAMode::default(),
+            wo_a_diagnose: false,
+            wo_a_compared: vec![false; 64],
+            wo_a_comparisons: Vec::new(),
+            wo_a_operand_dump: None,
             operand_traces: Vec::new(),
             diag_latent_raw: None,
             diag_q_raw: None,
@@ -308,6 +397,39 @@ impl AttentionDeviceBackend {
     #[must_use]
     pub fn stats(&self) -> AttentionDeviceStats {
         self.stats
+    }
+
+    /// Selects the wo_a arithmetic; the chain records its name in the run output.
+    #[must_use]
+    pub fn with_wo_a_mode(mut self, mode: WoAMode) -> Self {
+        self.wo_a_mode = mode;
+        self
+    }
+
+    /// The wo_a arithmetic this backend runs.
+    #[must_use]
+    pub fn wo_a_mode(&self) -> WoAMode {
+        self.wo_a_mode
+    }
+
+    /// Arms the per-layer wo_a comparison at each layer's first position.
+    #[must_use]
+    pub fn with_wo_a_native_diagnose(mut self) -> Self {
+        self.wo_a_diagnose = true;
+        self
+    }
+
+    /// Writes each layer's first-position wo_a operand and device output under a directory.
+    #[must_use]
+    pub fn with_wo_a_operand_dump(mut self, dir: std::path::PathBuf) -> Self {
+        self.wo_a_operand_dump = Some(dir);
+        self
+    }
+
+    /// The per-layer comparisons recorded so far, in layer order.
+    #[must_use]
+    pub fn wo_a_comparisons(&self) -> &[WoAComparison] {
+        &self.wo_a_comparisons
     }
 
     /// The format-2 body launches this backend performed for `layer`.
@@ -363,6 +485,7 @@ impl AttentionDeviceBackend {
     pub fn device_bytes(&self) -> u64 {
         (MAX_ACT_BYTES
             + MAX_ACT_SCALES
+            + MAX_ACT_BF16_BYTES
             + MAX_WEIGHT_BYTES
             + MAX_WEIGHT_SCALES
             + MAX_OUT_BYTES
@@ -389,6 +512,21 @@ impl AttentionDeviceBackend {
         }
         self.cuda.copy_htod(&self.buffers.a_codes, codes)?;
         self.cuda.copy_htod(&self.buffers.a_scales, scales)?;
+        Ok(())
+    }
+
+    fn upload_activation_bf16(&mut self, values: &[u16]) -> Result<(), String> {
+        let mut bytes = Vec::with_capacity(values.len() * 2);
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        if bytes.len() > MAX_ACT_BF16_BYTES {
+            return Err(format!(
+                "BF16 activation ({} B) does not fit the {MAX_ACT_BF16_BYTES} B staging buffer",
+                bytes.len()
+            ));
+        }
+        self.cuda.copy_htod(&self.buffers.a_bf16, &bytes)?;
         Ok(())
     }
 
@@ -1133,77 +1271,10 @@ impl AttentionProjectionBackend for AttentionDeviceBackend {
         src: &dyn WeightSource,
         limit: usize,
     ) -> Result<Vec<f32>, EngineError> {
-        let _ = limit;
-        let layer = self.stats.layers.saturating_sub(1);
-        let wide_row = config.n_heads * config.head_dim;
-        let rows = rows_of(wide, wide_row, "wo_a wide")?;
-        if rows != 1 {
-            return Err(EngineError::Shape {
-                what: "wo_a".to_owned(),
-                detail: format!("the grouped kernel is one position per launch, got {rows}"),
-            });
+        match self.wo_a_mode {
+            WoAMode::Native => self.wo_a_native(config, prefix, wide, src, limit),
+            WoAMode::Mxfp8 => self.wo_a_mxfp8(config, prefix, wide, src, limit),
         }
-        self.last_activation = Some(quantise(wide, "wo_a activation")?);
-        let packed_input = self
-            .last_activation
-            .take()
-            .ok_or_else(|| EngineError::Shape {
-                what: "wo_a activation".to_owned(),
-                detail: "missing quantised activation".to_owned(),
-            })?;
-        let started = std::time::Instant::now();
-        let weight = self.packed_weight(
-            src,
-            &format!("{prefix}.attn.wo_a.weight"),
-            config.o_groups * config.o_lora_rank,
-            wide_row / config.o_groups,
-        )?;
-        self.upload_weight(&weight.0, &weight.1)
-            .map_err(|detail| EngineError::Shape {
-                what: "wo_a weight upload".to_owned(),
-                detail,
-            })?;
-        self.stats.host_bytes = self
-            .stats
-            .host_bytes
-            .saturating_add(packed_input.0.len() as u64 + packed_input.1.len() as u64);
-        self.upload_activation(&packed_input.0, &packed_input.1)
-            .map_err(|detail| EngineError::Shape {
-                what: "wo_a activation upload".to_owned(),
-                detail,
-            })?;
-        self.stats.staging_us += started.elapsed().as_micros() as u64;
-        let params = Mxfp8WoAParams::new(
-            self.buffers.a_codes,
-            self.buffers.a_scales,
-            self.buffers.w,
-            self.buffers.w_scales,
-            self.buffers.out,
-            u32::try_from(config.o_groups).unwrap_or(0),
-            0,
-            u32::try_from(layer).unwrap_or(0),
-            0,
-        );
-        let launched = std::time::Instant::now();
-        mxfp8_wo_a_launch::launch(&self.cuda, self.kernels.wo_a, &params).map_err(|detail| {
-            EngineError::Shape {
-                what: "wo_a launch".to_owned(),
-                detail,
-            }
-        })?;
-        let grouped = self
-            .read_out(config.o_groups * config.o_lora_rank * 2)
-            .map_err(|detail| EngineError::Shape {
-                what: "wo_a readback".to_owned(),
-                detail,
-            })?;
-        self.stats.host_bytes = self
-            .stats
-            .host_bytes
-            .saturating_add((config.o_groups * config.o_lora_rank * 2) as u64);
-        self.stats.device_us += launched.elapsed().as_micros() as u64;
-        self.stats.launches += 1;
-        Ok(grouped)
     }
 
     fn wo_b(
@@ -1438,5 +1509,248 @@ impl AttentionProjectionBackend for AttentionDeviceBackend {
             *count += 1;
         }
         Ok(true)
+    }
+}
+
+/// The wo_a implementations, kept out of the trait impl so each trait method stays one call.
+impl AttentionDeviceBackend {
+    /// The native wo_a path: the BF16 activation the reference's in-place unit round leaves, the
+    /// checkpoint's FP8 weight codes dequantised inside the GEMM, and one BF16 output round.
+    fn wo_a_native(
+        &mut self,
+        config: &ModelConfig,
+        prefix: &str,
+        wide: &[f32],
+        src: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Vec<f32>, EngineError> {
+        let _ = limit;
+        let layer = self.stats.layers.saturating_sub(1);
+        let wide_row = config.n_heads * config.head_dim;
+        let rows = rows_of(wide, wide_row, "wo_a wide")?;
+        if rows != 1 {
+            return Err(EngineError::Shape {
+                what: "wo_a".to_owned(),
+                detail: format!("the grouped kernel is one position per launch, got {rows}"),
+            });
+        }
+        let started = std::time::Instant::now();
+        let weight = self.packed_weight(
+            src,
+            &format!("{prefix}.attn.wo_a.weight"),
+            config.o_groups * config.o_lora_rank,
+            wide_row / config.o_groups,
+        )?;
+        self.upload_weight(&weight.0, &weight.1)
+            .map_err(|detail| EngineError::Shape {
+                what: "wo_a weight upload".to_owned(),
+                detail,
+            })?;
+        // The reference applies the inverse rotation into the BF16 body output and reads the 512-wide
+        // head slice back from there, so the GEMM operand is that rounded value, not the f32
+        // rotation result.
+        let activation: Vec<u16> = wide.iter().map(|value| bf16_bits(*value)).collect();
+        self.upload_activation_bf16(&activation)
+            .map_err(|detail| EngineError::Shape {
+                what: "wo_a activation upload".to_owned(),
+                detail,
+            })?;
+        self.stats.host_bytes = self
+            .stats
+            .host_bytes
+            .saturating_add((activation.len() * 2) as u64);
+        self.stats.staging_us += started.elapsed().as_micros() as u64;
+        let params = Bf16aMxfp8wWoAParams::new(
+            self.buffers.a_bf16,
+            self.buffers.w,
+            self.buffers.w_scales,
+            self.buffers.out,
+            u32::try_from(config.o_groups).unwrap_or(0),
+            0,
+            u32::try_from(layer).unwrap_or(0),
+            0,
+        );
+        let launched = std::time::Instant::now();
+        bf16a_mxfp8w_wo_a_launch::launch(&self.cuda, self.kernels.wo_a_native, &params).map_err(
+            |detail| EngineError::Shape {
+                what: "wo_a native launch".to_owned(),
+                detail,
+            },
+        )?;
+        let grouped = self
+            .read_out(config.o_groups * config.o_lora_rank * 2)
+            .map_err(|detail| EngineError::Shape {
+                what: "wo_a readback".to_owned(),
+                detail,
+            })?;
+        self.stats.host_bytes = self
+            .stats
+            .host_bytes
+            .saturating_add((config.o_groups * config.o_lora_rank * 2) as u64);
+        self.stats.device_us += launched.elapsed().as_micros() as u64;
+        self.stats.launches += 1;
+        self.record_wo_a_comparison(
+            config,
+            layer,
+            wide,
+            &activation,
+            &weight.0,
+            &weight.1,
+            &grouped,
+        )?;
+        Ok(grouped)
+    }
+
+    /// The chain's previous wo_a path: E4M3 activation, per-32 ue8m0 scales, MXFP8 codes.
+    fn wo_a_mxfp8(
+        &mut self,
+        config: &ModelConfig,
+        prefix: &str,
+        wide: &[f32],
+        src: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Vec<f32>, EngineError> {
+        let _ = limit;
+        let layer = self.stats.layers.saturating_sub(1);
+        let wide_row = config.n_heads * config.head_dim;
+        let rows = rows_of(wide, wide_row, "wo_a wide")?;
+        if rows != 1 {
+            return Err(EngineError::Shape {
+                what: "wo_a".to_owned(),
+                detail: format!("the grouped kernel is one position per launch, got {rows}"),
+            });
+        }
+        self.last_activation = Some(quantise(wide, "wo_a activation")?);
+        let packed_input = self
+            .last_activation
+            .take()
+            .ok_or_else(|| EngineError::Shape {
+                what: "wo_a activation".to_owned(),
+                detail: "missing quantised activation".to_owned(),
+            })?;
+        let started = std::time::Instant::now();
+        let weight = self.packed_weight(
+            src,
+            &format!("{prefix}.attn.wo_a.weight"),
+            config.o_groups * config.o_lora_rank,
+            wide_row / config.o_groups,
+        )?;
+        self.upload_weight(&weight.0, &weight.1)
+            .map_err(|detail| EngineError::Shape {
+                what: "wo_a weight upload".to_owned(),
+                detail,
+            })?;
+        self.stats.host_bytes = self
+            .stats
+            .host_bytes
+            .saturating_add(packed_input.0.len() as u64 + packed_input.1.len() as u64);
+        self.upload_activation(&packed_input.0, &packed_input.1)
+            .map_err(|detail| EngineError::Shape {
+                what: "wo_a activation upload".to_owned(),
+                detail,
+            })?;
+        self.stats.staging_us += started.elapsed().as_micros() as u64;
+        let params = Mxfp8WoAParams::new(
+            self.buffers.a_codes,
+            self.buffers.a_scales,
+            self.buffers.w,
+            self.buffers.w_scales,
+            self.buffers.out,
+            u32::try_from(config.o_groups).unwrap_or(0),
+            0,
+            u32::try_from(layer).unwrap_or(0),
+            0,
+        );
+        let launched = std::time::Instant::now();
+        mxfp8_wo_a_launch::launch(&self.cuda, self.kernels.wo_a, &params).map_err(|detail| {
+            EngineError::Shape {
+                what: "wo_a launch".to_owned(),
+                detail,
+            }
+        })?;
+        let grouped = self
+            .read_out(config.o_groups * config.o_lora_rank * 2)
+            .map_err(|detail| EngineError::Shape {
+                what: "wo_a readback".to_owned(),
+                detail,
+            })?;
+        self.stats.host_bytes = self
+            .stats
+            .host_bytes
+            .saturating_add((config.o_groups * config.o_lora_rank * 2) as u64);
+        self.stats.device_us += launched.elapsed().as_micros() as u64;
+        self.stats.launches += 1;
+        self.record_wo_a_comparison(config, layer, wide, &[], &weight.0, &weight.1, &grouped)?;
+        Ok(grouped)
+    }
+
+    /// Records one layer's wo_a comparison the first time that layer runs, and optionally dumps the
+    /// captured operand and the device output so the comparison can be re-run offline.
+    #[allow(clippy::too_many_arguments)]
+    fn record_wo_a_comparison(
+        &mut self,
+        config: &ModelConfig,
+        layer: usize,
+        wide: &[f32],
+        activation: &[u16],
+        w: &[u8],
+        w_scales: &[u8],
+        grouped: &[f32],
+    ) -> Result<(), EngineError> {
+        let armed = self.wo_a_diagnose || self.wo_a_operand_dump.is_some();
+        if !armed || self.wo_a_compared.get(layer).copied().unwrap_or(false) {
+            return Ok(());
+        }
+        let groups = config.o_groups;
+        let inner = config.n_heads * config.head_dim / groups;
+        let lo_rank = config.o_lora_rank;
+        // The MXFP8 path has no BF16 activation buffer, so it builds the codes here.
+        let rounded: Vec<u16> = if activation.is_empty() {
+            wide.iter().map(|value| bf16_bits(*value)).collect()
+        } else {
+            activation.to_vec()
+        };
+        let native =
+            bf16a_mxfp8w_ref::grouped_wo_a_bf16a(&rounded, w, w_scales, groups, inner, lo_rank);
+        let device_vs_native = bf16a_mxfp8w_ref::compare_codes(grouped, &native);
+        let mxfp8_vs_native = bf16a_mxfp8w_ref::compare_paths(
+            wide, w, w_scales, groups, inner, lo_rank,
+        )
+        .map_err(|detail| EngineError::Shape {
+            what: "wo_a comparison".to_owned(),
+            detail,
+        })?;
+        let operand_checksum = checksum_f32(wide);
+        if let Some(dir) = self.wo_a_operand_dump.clone() {
+            std::fs::create_dir_all(&dir).map_err(|error| EngineError::Shape {
+                what: "wo_a operand dump".to_owned(),
+                detail: format!("{}: {error}", dir.display()),
+            })?;
+            let operand_path = dir.join(format!("wo_a_layer_{layer:02}_operand.f32"));
+            std::fs::write(&operand_path, f32_bytes(wide)).map_err(|error| EngineError::Shape {
+                what: "wo_a operand dump".to_owned(),
+                detail: format!("{}: {error}", operand_path.display()),
+            })?;
+            let mut device_bytes = Vec::with_capacity(grouped.len() * 2);
+            for value in grouped {
+                device_bytes.extend_from_slice(&bf16_bits(*value).to_le_bytes());
+            }
+            let device_path = dir.join(format!("wo_a_layer_{layer:02}_device.bf16"));
+            std::fs::write(&device_path, device_bytes).map_err(|error| EngineError::Shape {
+                what: "wo_a operand dump".to_owned(),
+                detail: format!("{}: {error}", device_path.display()),
+            })?;
+        }
+        if layer < self.wo_a_compared.len() {
+            self.wo_a_compared[layer] = true;
+        }
+        self.wo_a_comparisons.push(WoAComparison {
+            layer,
+            mode: self.wo_a_mode,
+            device_vs_native,
+            mxfp8_vs_native,
+            operand_checksum,
+        });
+        Ok(())
     }
 }

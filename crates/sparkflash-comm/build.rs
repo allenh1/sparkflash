@@ -18,6 +18,11 @@
 //! functions returning ENOSYS and `Verbs::load` reports a typed refusal naming the missing
 //! build prerequisite. That keeps `ci/check_features.py` honest on the hardware-free CI host
 //! while a node built with libibverbs-dev gets the real path.
+//!
+//! Cross-compiles have no libibverbs in the sysroot, so the header can be staged from a node and
+//! named with SPARKFLASH_RDMA_INCLUDE (a path list, ':'-separated): it is passed to the shim
+//! compile as -I. Without it the cross build takes the ENOSYS stub path silently for the node's
+//! runtime, so the window's rdma binary must report SPARKFLASH_IBVERBS_SHIM=system at build time.
 
 use std::env;
 use std::fs;
@@ -27,6 +32,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=src/rdma/ibverbs_shim.c");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=SPARKFLASH_RDMA_INCLUDE");
     if env::var_os("CARGO_FEATURE_RDMA").is_none() {
         return;
     }
@@ -72,6 +78,7 @@ fn compile_shim(compiler: &str, archiver: &str, source: &Path, out: &Path) -> Re
     let compile = Command::new(compiler)
         .arg("-O2")
         .arg("-fPIC")
+        .args(shim_includes())
         .arg("-c")
         .arg(source)
         .arg("-o")
@@ -99,6 +106,22 @@ fn compile_shim(compiler: &str, archiver: &str, source: &Path, out: &Path) -> Re
         return Err(format!("{archiver} failed: {}", stderr.trim()));
     }
     Ok(())
+}
+
+/// Extra include directories for the shim, from SPARKFLASH_RDMA_INCLUDE (a path list).
+///
+/// This is how a cross-compile gets the aarch64 `infiniband/verbs.h` that its sysroot does not
+/// carry: stage the header once and name its include root, so the shim compiles the real inline
+/// wrappers instead of the ENOSYS stub the node binary would then report at run time.
+fn shim_includes() -> Vec<String> {
+    env::var_os("SPARKFLASH_RDMA_INCLUDE")
+        .map(|value| {
+            env::split_paths(&value)
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| format!("-I{}", path.display()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The first tool in `candidates` that is set in the environment, or the last fallback.

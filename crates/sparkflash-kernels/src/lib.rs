@@ -22,6 +22,9 @@
 
 pub mod abi;
 pub mod baseline;
+pub mod bf16a_mxfp8w_launch;
+pub mod bf16a_mxfp8w_ref;
+pub mod bf16a_mxfp8w_wo_a_launch;
 pub mod c_decl;
 pub mod cert_lm_head_launch;
 pub mod cuda_driver;

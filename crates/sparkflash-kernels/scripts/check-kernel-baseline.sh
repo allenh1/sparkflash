@@ -1,5 +1,5 @@
 #!/bin/sh
-# Verifies that nvcc still compiles the thirteen baseline kernels to the recorded baseline.
+# Verifies that nvcc still compiles the fifteen baseline kernels to the recorded baseline.
 #
 # This is the check that would catch a kernel silently changing: it recompiles each kernel to a cubin
 # and to PTX, and compares the cubin bytes, the cubin sha256 and the PTX membar count with
@@ -16,7 +16,7 @@ set -eu
 crate_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 baseline="$crate_dir/baseline/kernel_baseline.txt"
 nvcc=${SPARKFLASH_NVCC:-nvcc}
-kernels="mega_mhc_sm121 b12x_mxfp8_dense_sm121 b12x_mxfp4_moe_sm121 flash_mla_csa2_sm121 b12x_mxfp8_wo_a_sm121 cert_lm_head_sm121 swiglu_mxfp8_quant_sm121 moe_router_sm121 routed_gate_up_sm121 swiglu_mxfp8_quant_weighted_sm121 rmsnorm_sm121 lm_head_reduce_sm121 flash_mla_csa2_seq_sm121"
+kernels="mega_mhc_sm121 b12x_mxfp8_dense_sm121 b12x_mxfp4_moe_sm121 flash_mla_csa2_sm121 b12x_mxfp8_wo_a_sm121 cert_lm_head_sm121 swiglu_mxfp8_quant_sm121 moe_router_sm121 routed_gate_up_sm121 swiglu_mxfp8_quant_weighted_sm121 rmsnorm_sm121 lm_head_reduce_sm121 flash_mla_csa2_seq_sm121 b12x_bf16a_mxfp8w_dense_sm121 b12x_bf16a_mxfp8w_wo_a_sm121"
 
 if [ ! -f "$baseline" ]; then
     echo "no baseline at $baseline" >&2

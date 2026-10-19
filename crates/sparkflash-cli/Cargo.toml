@@ -13,6 +13,10 @@ default = []
 # no libcuda, and the session is only constructed with --engine device --device-cubin PATH. The M3-a
 # device-chain plan arm needs no feature: it opens no driver.
 cuda = ["sparkflash-device/cuda"]
+# The real libibverbs RDMA backend, forwarded from sparkflash-comm. No build dependency is added
+# (libibverbs is dlopen'd at run time); this only compiles the backend in and makes
+# --comm-backend rdma reachable. The four-node window is still what the run needs.
+rdma = ["sparkflash-comm/rdma"]
 
 [[bin]]
 name = "sparkflash"

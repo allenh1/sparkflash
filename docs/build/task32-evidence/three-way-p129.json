@@ -1,0 +1,139 @@
+{
+ "schema": "sparkflash-three-way/1",
+ "task": "task-32",
+ "position": 129,
+ "note": "three implementations, same 130-token random prompt prefix; teacher-forced next-token distribution",
+ "f32": {
+  "top1": 491,
+  "top1_logit": 13.387696,
+  "top5": [
+   491,
+   2463,
+   223,
+   63438,
+   67
+  ],
+  "top20": [
+   491,
+   2463,
+   223,
+   63438,
+   67,
+   4862,
+   68637,
+   367,
+   3400,
+   14,
+   3188,
+   12140,
+   18003,
+   37852,
+   1560,
+   813,
+   35,
+   22392,
+   66543,
+   271
+  ]
+ },
+ "device": {
+  "top1": 8060,
+  "top1_logit": 19.41547966003418,
+  "top5": [
+   8060,
+   67,
+   16187,
+   3108,
+   71484
+  ],
+  "top20": [
+   8060,
+   67,
+   16187,
+   3108,
+   71484,
+   16,
+   15090,
+   271,
+   201,
+   88245,
+   13763,
+   339,
+   7513,
+   320,
+   78,
+   63351,
+   264,
+   367,
+   223,
+   110333
+  ]
+ },
+ "oracle": {
+  "top1": 367,
+  "top1_logprob": -0.08188365399837494,
+  "top1_prob": 0.9213791512407433,
+  "top5": [
+   367,
+   491,
+   813,
+   37852,
+   67
+  ]
+ },
+ "device_vs_f32_full_vocab": {
+  "mean_abs_delta": 2.486111164672207,
+  "max_abs_delta": 15.009580461273194,
+  "max_abs_delta_index": 5986,
+  "corr": 0.5333539658547681,
+  "outside_0p02": 128528,
+  "vocab": 129280
+ },
+ "device_vs_oracle": {
+  "top5_overlap": 0.2,
+  "top20_overlap": 0.1,
+  "top100_overlap": 0.22,
+  "top1000_overlap": 0.197,
+  "corr_over_oracle_band": 0.33485117106867024
+ },
+ "f32_vs_oracle": {
+  "top5_overlap": 0.4,
+  "top20_overlap": 0.55,
+  "top100_overlap": 0.48,
+  "top1000_overlap": 0.529,
+  "corr_over_oracle_band": 0.5998046862374418
+ },
+ "device_vs_f32_tops": {
+  "top5_overlap": 0.2,
+  "top20_overlap": 0.2,
+  "top100_overlap": 0.23
+ },
+ "ranks": {
+  "367": {
+   "f32": 7,
+   "device": 17,
+   "oracle": 0
+  },
+  "491": {
+   "f32_logit": 13.387696,
+   "device_logit": 10.367895126342773,
+   "device_rank": 506,
+   "oracle_rank": 1,
+   "oracle_logprob": -3.831883668899536
+  },
+  "8060": {
+   "f32_logit": 6.4190993,
+   "device_logit": 19.41547966003418,
+   "f32_rank": 767,
+   "oracle_rank": 387,
+   "oracle_logprob": -11.675633430480957
+  }
+ },
+ "p128": {
+  "device_head_ab_top1": 201,
+  "f32_top1": 201,
+  "device_block_max_host": 14.054767609,
+  "device_block_max_device": 14.054767609,
+  "note": "device agrees with f32 at p128; device logits at p128 were not dumped (dump starts at 129), head A/B line gives top1 and block max"
+ }
+}

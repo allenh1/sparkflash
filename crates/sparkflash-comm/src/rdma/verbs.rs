@@ -84,6 +84,28 @@ unsafe extern "C" {
 /// How `build.rs` built the inline shim: `system` (header present, real wrappers) or `stub`.
 const IBVERBS_SHIM: Option<&str> = option_env!("SPARKFLASH_IBVERBS_SHIM");
 
+/// The build mode of the inline shim, so a caller can refuse a stub build before touching a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShimMode {
+    /// The build had `<infiniband/verbs.h>` and compiled the real inline wrappers.
+    System,
+    /// The build had no header: the inline entry points return ENOSYS, and `Verbs::load` refuses.
+    Stub,
+}
+
+/// Which shim this binary embeds.
+///
+/// Anything other than `SPARKFLASH_IBVERBS_SHIM=system` - the stub, and an unset value that would
+/// mean the build script did not run - reports [`ShimMode::Stub`]. The refusing mode is the safe
+/// default: a binary that cannot post must not be mistaken for one that can.
+#[must_use]
+pub fn shim_mode() -> ShimMode {
+    match IBVERBS_SHIM {
+        Some("system") => ShimMode::System,
+        _ => ShimMode::Stub,
+    }
+}
+
 /// The subset of libibverbs this backend resolves. Every pointer comes from one `dlopen` handle
 /// stored in `Verbs`, and `Fns` is `Copy` so each RAII wrapper can carry the entry points it
 /// needs without borrowing the loader.

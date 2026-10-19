@@ -52,6 +52,30 @@ practical points:
 * the device evidence run must be staged before the stop, because staging over the network while the
   server is down is window time wasted.
 
+## Launching evidence processes on the nodes: the ssh trap
+
+Every rank is one process on its own node, started over ssh. Two S5.1 attempts failed on the
+launch, not in the code: `ssh host 'nohup binary ... &'` **without `-n`** keeps the session open
+until the backgrounded child exits, because the child inherits the channel. The second rank then
+starts after the first rank's connect deadline, and the run fails with `Connection refused` while
+the first rank reports a truncated hello handshake - even though the transport is correct. Use the
+launch the S5.1 gate ran with (both ranks as local ssh children of one shell, so both sessions are
+backgrounded before either wait):
+
+```sh
+ssh -n node0 "binary --tp-rank 0 ... > /home/user/phase2-evidence/.../r0.log 2>&1" &
+ssh -n node1 "binary --tp-rank 1 ... > /home/user/phase2-evidence/.../r1.log 2>&1" &
+wait
+```
+
+`ssh -n` with a detached child (`nohup setsid binary ... < /dev/null &`) is the other correct
+form. Two further points, both measured:
+
+* a rank that loads a checkpoint before its first collective needs more than the 5 s transport
+  defaults; pass `--comm-timeout 120 --comm-connect-timeout 120` (the defaults stay 5 s);
+* never probe a listening rank with `/dev/tcp` just to check: a connection that is not the
+  handshake is a protocol violation, the peer logs it and the run is lost.
+
 ## Restart and health check
 
 Restart with exactly the recorded start command above (not a hand-typed variant: `vllm serve`

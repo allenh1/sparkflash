@@ -246,17 +246,31 @@ over ssh. Rank r binds `comm_addr[r]:base_port`; lower ranks connect upward, the
 carries the rank (the existing `TcpTransport` handshake); the first collective after connection is
 the implicit barrier. No MPI, no torchrun, no Ray.
 
-### 5.2 CLI surface (added to `sparkflash device-chain`)
+### 5.2 CLI surface (added to `sparkflash device-chain --run-stage`)
 
 ```sh
+# tp4-smoke: the S5.1 host stage (no driver opened, no device memory, no token)
+--checkpoint DIR          # snapshot dir holding model.safetensors.index.json; --synthetic instead
 --tp-rank 0..3            # this process's TP rank
---tp-world-size 4         # 1 keeps the current single-process serial emulation (the oracle)
---comm-backend tcp|lo|rdma
---comm-peers IP,IP,IP,IP  # address table, index = rank
---comm-port BASE          # rank r uses BASE + r
---resident                # load sharded weights into device buffers once (default for world > 1)
---evidence-dir DIR        # per-rank JSON: load bytes/time, per-seam deltas, memory
+--tp-world-size 4         # 1 keeps the single-rank path (the oracle's configuration)
+--comm-backend tcp|lo     # tcp: one process per rank; lo: all ranks in this process; rdma: S5.3
+--comm-peers IP,IP,...    # address table, index = rank; rank i listens on (peer i, comm-port + i)
+--comm-port 29601         # base port
+--layer 0 --position 0    # the layer the attention projections are staged from
+--repeats 100             # canonical-reduce repeat count
+--comm-timeout SECS       # frame deadline; global default 5 s, a cross-node run raises it
+--comm-connect-timeout SECS  # connection-setup deadline; same default and reason
+--evidence-dir DIR        # one tp4-smoke-rN.json per rank; lo also writes the summary
+--resident                # recorded by the host stage; the device resident loader is S5.2
+--cubin-dir DIR           # recorded provenance only; the host stage opens no cubin
+--oneshot-preflight       # validate + record the S5.3 device-seam contract (host side only)
 ```
+
+The tp4-smoke arm is reachable from a build without the `cuda` feature, which is deliberate, and
+S5.1 is the proof: it was gated on CPU-only nodes. The arm is a host numerics/transport run, so the
+same code must stay testable on a host with no driver; the `cuda` feature adds device arms, it does
+not gate the host ones. Keep that property. S5.2 adds the resident device loader flags, the logits
+assembly and the chain arms.
 
 Rank 0 additionally owns the prompt fixture, the token-id/position broadcast, the logits assembly
 (`[T,129280]` f32 from four `[T,32320]` slices via all-gather at dump positions) and writing the
@@ -294,19 +308,31 @@ scp target/aarch64-unknown-linux-gnu/release/sparkflash \
 scp target/aarch64-unknown-linux-gnu/release/sparkflash \
     allenh1@192.0.2.88:/home/user/phase2-evidence/window-<W>/bin/sparkflash_tp4s1_<sha>_aarch64
 # in the window (rank 0 on .80 and rank 1 on .88, background, then wait):
+SNAP=/home/user/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170
 ssh allenh1@192.0.2.80 '/home/user/phase2-evidence/window-<W>/bin/sparkflash_tp4s1_<sha>_aarch64 \
   device-chain --run-stage tp4-smoke \
-  --checkpoint /home/user/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170 \
-  --cubin-dir /home/user/phase2-evidence/window-<W>/cubins \
+  --checkpoint '"$SNAP"' \
   --tp-rank 0 --tp-world-size 2 --comm-backend tcp \
   --comm-peers 192.0.2.80,192.0.2.88 --comm-port 29601 \
-  --layer 0 --position 0 --evidence-dir /home/user/phase2-evidence/window-<W>/tp4-s1/r0'
-ssh allenh1@192.0.2.88 '...same binary... --tp-rank 1 --comm-peers ... --evidence-dir .../r1'
+  --layer 0 --position 0 --repeats 100 \
+  --comm-timeout 120 --comm-connect-timeout 120 \
+  --evidence-dir /home/user/phase2-evidence/window-<W>/tp4-s1/r0'
+ssh allenh1@192.0.2.88 '...same binary and $SNAP... --tp-rank 1 --comm-peers ... --evidence-dir .../r1'
 ```
 
+The layer's five attention projections plus their scale grids are ~130 MB, so the load is seconds
+and the whole run fits comfortably in the 15 minutes. The two processes are in the same collective
+from their first frame: rank 1 dials rank 0 (lower rank connects upward), the hello frame carries
+the rank, and the first all-reduce is the implicit barrier - a rank that cannot load or connect
+exits non-zero instead of waiting.
+
+`--comm-backend lo` on one host runs the same arm with all ranks in one process
+and is the pre-window rehearsal (it writes the per-rank evidence files plus the summary); it needs
+no window and no GPU, so it is part of the host gate too.
+
 Why two ranks and one layer: it exercises every new piece (cross-node transport, bootstrap,
-sharded resident load, column-parallel kernels on a real shard, one row-parallel all-reduce)
-without paying for the 68.9 GiB expert load. Pass criteria are in section 9 (S5.1).
+sharded load of real tensors, the column-parallel byte-identity check, one row-parallel
+all-reduce) without paying for the 68.9 GiB expert load. Pass criteria are in section 9 (S5.1).
 
 ## 6. Resident weight loading per rank
 
@@ -346,13 +372,14 @@ attention staging leaves the hot loop. `AttentionDeviceStats.staged_bytes` and
   of the host tests; `--evidence-dir` records the verified plan hash.
 * Slice reads use `pread` at computed byte offsets, never a whole-file mmap (the checkpoint is
   475 GiB; only this rank's 72.31 GiB may be read). Column-parallel weights are row-contiguous
-  slices (one read). Row-parallel weights (`wo_b`, `w2`) need a strided slice whose per-row bytes
-  are contiguous but whose rows are 4x apart: reading whole rows and keeping the slice costs ~4x
-  disk amplification for those tensors (~63 GiB extra for w2, ~134 GiB read per rank vs 72.31 GiB
-  kept). That is what the reference's safetensors loader does and it still loads in 37 s; we do
-  the same in S5.1/S5.2 and measure it. If load time becomes a window problem, S5.2 adds an
-  optional one-time `pack-tp4` repack onto each node's NVMe (each node needs only its ~72 GiB
-  shard) -- open decision 11.3.
+  slices (one range). Row-parallel weights (`wo_b`, `w2`) need a strided slice whose per-row bytes
+  are contiguous but whose rows are 4x apart. `shard.rs` reads exactly the per-rank segments (one
+  range per row), so a rank reads only its 72.31 GiB and not the ~134 GiB a whole-row read would
+  cost; the price is one seek per row, which the S5.1 window measures on `wo_b` (5,120 ranges) and
+  S5.2 measures on the expert tables (1.9M ranges per layer over 384 experts) where it may become
+  the load-time problem. Decision (Lead, 2026-10-19): read in place first and measure; a one-time
+  `pack-tp4` repack onto each node's NVMe is built only if the measurement shows the seek path
+  dominating load time -- open decision 11.3. It is not built now.
 * Page cache: reads go through the page cache today and the checkpoint does not fit, so the
   loader issues `posix_fadvise(DONTNEED)` per finished shard region (or O_DIRECT) so host page
   cache cannot compete with the 121.69 GiB UMA the device allocations share.
@@ -420,7 +447,23 @@ no head axis to shard). Consequences:
 ## 8. Numerical acceptance: the single-node chain remains the oracle
 
 Requirement: **TP=4 output must match the single-node device chain within the D40 metrics**, with
-the single-node stage bars still enforced. Three levels:
+the single-node stage bars still enforced.
+
+**The oracle's validity is conditional on the reduce rule, and that condition is part of the
+acceptance, not a footnote.** The single-rank chain is the numerics oracle *only while the TP
+seam's arithmetic is the canonical one-rounding rule*: f32 accumulation in ascending rank order
+from `0.0`, exactly one bf16 round-to-nearest-even, then the routed epilogue. If a TP seam applies
+a different rule (for example the serial emulation's repeated bf16 decode/add/round), the two paths
+stop being the same function and a match is no longer evidence of anything. Task-4's f32
+`slot_acc` accumulation plus routed epilogue is the single-rank form of the rule and must stay
+consistent with the TP=4 collective; a conflict is a design defect to raise with the Lead, not a
+bar to loosen. Consequence for **task-34's acceptance**: it must include the L1 and L2 twins
+(collective vs `canonical_all_reduce_into`, and the TP stage outputs vs the single-rank twin from
+the **same binary**) run as part of the TP=4 evidence, not a comparison of TP=4 output tokens
+against a released-vLLM artifact - D39 forbids token equality as an acceptance criterion, and a
+vLLM-token comparison would not test the reduce rule at all.
+
+Three levels:
 
 **L1 -- collective twin (bit-exact, 0 mismatches).** At every seam, the transport's all-reduce
 over the four bf16 rank payloads must equal `canonical_all_reduce_into` on the same bytes, bit for
@@ -445,6 +488,11 @@ Under TP=4:
   The serial emulation's 4-rounding chain is the upper bound of the deviation, and the TP=4
   one-rounding path must be *closer* to the host f32 twin than the emulation is. If it is not,
   that is a wiring defect, not FP spread.
+  The evidence also carries a **diagnostic, never a gate**: the same deltas normalised by each
+  element's *own* bf16 ulp (max, median and the fraction of elements within 1 ulp of their own
+  value). A cancellation-heavy seam shows a low fraction there while every absolute error is a
+  fraction of the seam's step; it makes the seam visible without gating on its own rounding noise
+  (Lead decision, 2026-10-19).
 
 **L3 -- end-to-end, D40 metrics.** Same prompt suite and positions: top-1 agreement, median
 top-20 recall, per-position KL, median/p95 KL, max abs delta logp. Provisional bars: top1 >= 95 %,
@@ -466,18 +514,120 @@ real headers without GPU; two-process TCP test; twin bit-exactness), then the se
 all-reduce vs canonical twin, repeated 100x bit-identical, (c) wo_b delta within the L2 bar, (d)
 evidence JSON from both ranks. Expected load: one layer ~130 MB, seconds.
 
+*Status (host implementation landed with this design, MR !120).* `sparkflash-comm` grew the
+cluster address table (`TcpConfig::with_addresses`; a partial table is refused before any socket
+opens, a wildcard bind is allowed, and the hello handshake is unchanged). `sparkflash-device`
+grew `shard.rs`: the plan (`Replicated` / `Column` / `Row`) is verified against the shard
+headers before any tensor bytes are read, and the slice reader issues one contiguous range for a
+row block and one range per row for a column block through `SafeTensorsSource::read_ranges` - so
+a rank reads exactly its own bytes, never the 4x whole-row amplification (that remains the
+reference's behaviour, and the measurement that would justify `pack-tp4` is now a bytes-read
+counter rather than a 4x floor). `sparkflash-cli` grew the `--run-stage tp4-smoke` arm (host only,
+reachable without the `cuda` feature): it reads the layer's five attention projections plus scale
+grids, byte-checks every slice against the same rows/segments of the full tensor, runs the wo_b
+row-parallel seam through the transport, compares the result to `canonical_all_reduce_into` for
+100 repeats, reports the seam's ulp deltas against the single-rank f32 twin, and writes one
+evidence JSON per rank. The in-process `lo` backend runs all ranks in one process (useful on a
+host); `tcp` runs one process per rank; `rdma` is refused until S5.3.
+
+*Status: the S5.1 gate is met.* The gate run was made on the released snapshot's layer 0 with rank
+0 on node0 (.80) and rank 1 on node1 (.88), binary from commit c3d9e4e, evidence in
+`/home/user/phase2-evidence/window-2026-10-18/tp4-s1/{r0,r1}` plus a summary compiled from the
+two files (tcp mode has no shared filesystem, so the binary cannot write a summary itself). Both
+ranks, one process per node, `--comm-timeout 120 --comm-connect-timeout 120`:
+
+| check | result |
+|---|---|
+| plan verified against the real headers, same plan hash on both ranks | 10 tensors, fnv `0xdf31e75f2d12fa1b` |
+| byte-identity of every slice against the full tensor | 0 mismatched segments on all 10 tensors, both ranks |
+| bytes a rank read for its slices | 67,961,600 B (64.8 MiB) = exactly its own shard, no amplification, in 5,288 `pread` ranges (wo_b: 5,120 ranges x 4 KiB; column blocks: 1 range) |
+| slice read time / full-tensor twin read time | 37.9-105.1 ms / 236-297 ms (the 4x read is the check, run once) |
+| L1: all-reduce vs `canonical_all_reduce_into` | 0 mismatches; 100/100 repeats bit-identical; payload 5,120 bf16 = 10,240 B |
+| collective latency (median / max, 100 repeats) | 126-129 us / 1.24-165 ms (max is first-exchange + ssh/OS jitter on an otherwise idle host pair) |
+| connection setup | 3.6 ms (rank 0) / 37.0 ms (rank 1) |
+| L2: wo_b seam vs the single-rank f32 twin | max 1 ulp, median 0 ulp (bar 2 / 1); max abs delta 0.015625 = 1 ulp of the seam's 2.0 peak |
+| L2 diagnostic (per element's own ulp) | max 1,889 ulp, median 0, 91.72 % of elements within 1 own-ulp - a cancellation-heavy seam made visible, not gated |
+| whole run after both processes were up | 1 s |
+
+What the two failed attempts before it taught (kept because it is a transport-level trap): launching
+a rank with `ssh host 'nohup ... &'` without `-n` leaves the session open until the *child* exits
+(the child inherits the ssh channel), so the second rank started after the first one's connect
+deadline and the run failed with `Connection refused` even though the transport was correct. The
+working pattern is either `ssh -n` with a detached child or, simpler, both ranks as local ssh
+children in the same shell (`ssh host "binary ..." & ssh host2 "binary ..." & wait`). The 5 s
+default deadlines are too tight for a cross-node pair whose ranks also load ~130 MB before the first
+collective, so the arm now takes `--comm-timeout` / `--comm-connect-timeout` (defaults unchanged;
+the window command in section 5.5 sets 120 s).
+
 **S5.2 -- task-34: full resident chain on 4 ranks, D40 comparison.** Depends on S5.1 and task-6
 (N3 native `wo_a`; the shard layout depends on its final form). All 40 layers + 3 MTP layers,
 experts resident, embed/head sharded, Engram seam (disk + all-gather), logits assembly. Gate:
 L1/L2/L3 in one window (90 minutes asked; load is the long pole), memory admission, and per
-position H2D measured down from 5.066 GB to activation-only. This is the "TP=4 works" gate the
-user asked for; EP (task-31) unblocks after it.
+position H2D measured down from 5.066 GB to activation-only. **The L1 and L2 twins are part of the
+acceptance in this gate, not a side artifact**: they must be produced from the same TP=4 binary in
+the same run (collective vs `canonical_all_reduce_into`, and the TP stage outputs vs the
+single-rank twin), because the single-rank chain is the oracle only while the canonical
+one-rounding reduce rule matches (section 8). No comparison of TP=4 output tokens against
+released-vLLM output is part of this gate (D39). This is the "TP=4 works" gate the user asked
+for; EP (task-31) unblocks after it.
 
 **S5.3 -- task-35: device-buffer collectives and the RDMA first hardware run.** Depends on S5.1;
 transport decision from 11.1. The three existing hardware gates, `rocenante-probe` on the active
 rail, the 20 us / 10 KiB one-shot bar, repeat determinism, then the GPU-buffer seam (no
 per-collective DtoH/HtoD). If it fails, the measured gap and the NCCL fallback plan are recorded;
 no silent transport switch.
+
+*Status (host side landed 2026-10-19; the window is not booked).* The seam's **contract** now
+exists and is host-tested in `crates/sparkflash-comm/src/oneshot.rs`: the pinned slot geometry
+(32 B arrival words + four 2 MiB rows = 8,388,640 B, 8-byte aligned), the
+`Exchange`/`DeviceBuffer`/`SlotRegistration`/`Dispatch` descriptors (a payload over a row, a null
+or misaligned pointer, a slot of the wrong size and a sequence that does not strictly increase are
+all refused before any device work), the receive-side proxy state machine of `rdma-backend.md`
+15.2(b) (`on_doorbell`, then `on_frame` publishes a peer's arrival exactly once and only after
+every rail; a frame before the doorbell or outside the dispatch is a protocol error), and
+`Transport::all_reduce_bf16_device`, whose default refuses - a host backend answers
+`CommError::Unsupported` rather than quietly running the host-slice collective.
+`crates/sparkflash-comm/tests/device_seam.rs` runs the contract with four rank threads over shared
+memory for 100 sequences (arrival order shuffled, rails reversed per peer) and requires the result
+to equal `canonical_all_reduce_into` bit for bit. The tp4-smoke arm's `--oneshot-preflight` validates
+the same descriptors plus the cross-crate ABI pin (comm's constants against
+`sparkflash-kernels::roce_abi`) and records an `oneshot` evidence section stating what the host
+proved and what it did not.
+
+The host side **cannot** prove: that the CUDA kernel launches or that the slot is reachable from
+it, that the pinned-host alias or the device-memory MR registers (`ibv_reg_mr`,
+`ibv_reg_dmabuf_mr`), that the QP posting and the proxy's completions agree with the NIC, or any
+latency. Those are exactly `rdma-backend.md` 15.3 items 1, 3 (threaded to real QPs), 4 and 5: the
+launcher, the proxy thread, the MR wiring and the corrected header text.
+
+The window measurement that closes S5.3 (the line b71's gate needs) is: on the four nodes, one
+`--comm-backend rdma` dispatch of the **device-buffer** form at decode size - hidden 5,120 bf16
+(10,240 B) per seam - recorded per rank and per seam (wo_b, routed MoE, shared expert, embedding),
+with (a) one-shot all-reduce p50 <= 20 us (QUALIFICATION 3.1), measured before any TP step; (b) the
+output bit-identical to the canonical CPU twin on **every** repeat and
+`repeats_bit_identical == repeats`; (c) two runs per configuration byte-identical (the existing
+10,000-replay determinism check); (d) zero DtoH/HtoD between dispatches, asserted by the launcher's
+dispatch record (device pointers only), not inferred; (e) the one-shot call count and the per-seam
+byte counts recorded per position (123 all-reduces + 2 all-gathers), so a path that quietly fell
+back to host staging fails the gate. Prerequisites in order: the three existing hardware gates
+green, `rocenante-probe` on the active rail (`rocep1s0f1`) printing its 20 us / 10 KiB result and
+repeat determinism, then the device seam. If (a) misses, the measured gap and the NCCL fallback
+(section 11) are recorded; the gate is not redefined.
+
+Item (d) has a host-side carrier: `DispatchRecord`/`DispatchLog` in `oneshot.rs` are the record
+type the launcher fills for **every** collective call (unconditionally, no verbosity flag, no
+log-only path), carrying the slot and row device addresses and a `host_copy_bytes` that must be 0;
+`device_path_ok` refuses a record whose path was host staging and names the first offending
+sequence. `--oneshot-preflight` exercises the record shape and that refusal on the host, and the
+evidence section states `emitted: false` until the window's launcher fills it.
+
+*Window-prep note (2026-10-19): the aarch64 release binary for the S5.3 window must be built with
+`--features=rdma,cuda` **and** `SPARKFLASH_RDMA_INCLUDE=<staged aarch64 rdma-core include root>`,
+because the zig cross sysroot has no `infiniband/verbs.h`; without it the build silently takes the
+ENOSYS stub path (`SPARKFLASH_IBVERBS_SHIM=stub`) and the node binary then refuses at
+`Verbs::load` instead of posting. The aarch64 headers are staged on this dev host under
+`/home/user/opt/aarch64-rdma/include` (copied read-only from node0). The build log must not
+contain the "rdma feature built without <infiniband/verbs.h>" warning.*
 
 **S5.4 -- task-36: prefill-sized collectives + KV.** Depends on S5.2 (coordinates with task-21):
 >2 MiB ring/chunked path, embedding all-reduce and Engram all-gather at 4096 tokens, KV per rank.
@@ -491,8 +641,10 @@ task-20/21/22. Feeds S7 (task-25) and S8 (task-26).
    registration, GID/MTU and QP handshake can each fail on a first run. Mitigation: the TCP path
    is the correctness carrier (S5.1/S5.2 do not depend on RDMA), S5.3 is a separate window with a
    fallback decision, and the hardware gates separate environment from code.
-2. **The GPU-kernel to dataplane seam is not written.** `rdma-backend.md` section 15 only proposes
-   it. That is the largest genuinely new piece of S5.3, not a wiring exercise.
+2. **The GPU-kernel to dataplane seam is half written.** The contract (slot geometry, descriptors,
+   proxy state machine, device-buffer trait method, cross-crate ABI pin) is host-tested; the kernel
+   launcher, the alias/MR registration and the threaded proxy over real QPs are not, and are the
+   window's first job (`rdma-backend.md` 15.3). The measured gate is section 9/S5.3.
 3. **Memory.** 72.31 GiB device weights + KV + workspace against 121.69 GiB UMA shared with the
    host. A loader that reads through page cache can evict device memory under pressure; admission
    is checked before load, page cache is dropped per shard, and the load is streamed. A failure
