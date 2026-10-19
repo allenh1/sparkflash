@@ -19,6 +19,10 @@
 //!   a dead token, uses the pad id for that shift and every later one (engram.py:171-174).
 //! - The write: h + gate (x) value, one gate per (token, hc copy) from a normalised dot product, with
 //!   a signed square root before the sigmoid (model.py:356-365).
+//! - The native dtype rule (audit F4), op for op with the device kernels and their twin in
+//!   src/engram_native_ref.rs: the table row dequantises and casts to bf16 (exact for e4m3 x 2^k),
+//!   wkv is the released fp8 W8A8 Linear over the act-quantised fetched row with the block dot in
+//!   the kernel's reduction order and a bf16 output, and the write is one bf16 cast.
 //!
 //! # What it does NOT reproduce, stated rather than hidden
 //!
@@ -36,9 +40,6 @@
 //!   normalizer chain (spec section 8 item 7). The ids handed to [ngram_hashes] are taken to be already
 //!   compressed, and engram_pad_id is used as the pad where the reference pads with
 //!   token_map[engram_pad_id] (engram.py:147).
-//! - The bf16 round trip. The reference casts the looked-up rows to bfloat16 (model.py:320) and the
-//!   write back to the input dtype (model.py:365). This crate's reference pass is f32 throughout, as
-//!   forward/mod.rs states, so the values are the f32 ones.
 //! - The table read. [engram_forward] pages the rows a chunk looks up through
 //!   [WeightSource::read_ranges] when the source supports it (the CLI's loader does), so the
 //!   released 98 GB tables are read a few rows at a time rather than refused; a source that only
@@ -48,7 +49,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::{ConfigError, ModelConfig};
-use crate::dtype::DType;
+use crate::dtype::{DType, SCALE_BLOCK};
 use crate::linalg::{self, EngineError, ScaleGrid};
 use crate::quant;
 use crate::weights::WeightSource;
@@ -483,6 +484,11 @@ fn read_table(
     let mut table = linalg::decode_by_name(src, &format!("{prefix}.engram.embed.weight"), limit)?;
     let scales = linalg::decode_by_name(src, &format!("{prefix}.engram.embed.scale"), limit)?;
     linalg::apply_scales(&mut table, rows, width, &scales, ScaleGrid::PerRow32)?;
+    // model.py:318-319 casts the dequantised row to bf16. The cast is exact for E4M3 x 2^k, but it
+    // is the released rule and the device kernel applies it (kernels/engram_embed_sm121.cu).
+    for value in &mut table {
+        *value = quant::bf16_round(*value);
+    }
     Ok(table)
 }
 
@@ -544,7 +550,8 @@ fn read_paged_table(
             Err(error) => return Some(Err(error.into())),
         };
         for column in 0..width {
-            table[slot * width + column] = weight[column] * scales[column / 32];
+            let value = weight[column] * scales[column / 32];
+            table[slot * width + column] = quant::bf16_round(value);
         }
     }
     Some(Ok((table, slot_of)))
@@ -553,20 +560,152 @@ fn read_paged_table(
 /// Reads a dense fp8 weight and applies its 32x32 E8M0 grid.
 ///
 /// # Errors
+/// Reads the Engram wkv projection as the checkpoint stores it: F8E4M3 codes and the 32x32 E8M0
+/// grid, both as raw bytes.
 ///
-/// As [read_table], for the dense grid.
-fn read_dense(
+/// The released wkv is an fp8 W8A8 Linear (model.py:345, 186-205): the activation is quantised per
+/// 32 columns and the block's scale multiplies the block dot, so the seam needs the codes and the
+/// grid, not a dequantised matrix. A source that stores anything else is refused by name: there is
+/// no f32 arm, because an f32 projection would compute a different rule silently.
+///
+/// # Errors
+///
+/// [EngineError::TooLarge] when the logical element count is above limit, [EngineError::Missing]
+/// when the source does not hold the tensors, and [EngineError::Shape] when either tensor is not the
+/// checkpoint's dtype or length.
+fn read_fp8_blocks(
     name: &str,
     src: &dyn WeightSource,
     rows: usize,
     cols: usize,
     limit: usize,
-) -> Result<Vec<f32>, EngineError> {
+) -> Result<(Vec<u8>, Vec<u8>), EngineError> {
+    if rows * cols > limit {
+        return Err(EngineError::TooLarge {
+            name: name.to_owned(),
+            elements: rows * cols,
+            limit,
+        });
+    }
     let scale_name = name.replace("weight", "scale");
-    let mut weight = linalg::decode_by_name(src, name, limit)?;
-    let scales = linalg::decode_by_name(src, &scale_name, limit)?;
-    linalg::apply_scales(&mut weight, rows, cols, &scales, ScaleGrid::Block32)?;
-    Ok(weight)
+    let scale_rows = rows.div_ceil(SCALE_BLOCK);
+    let scale_cols = cols.div_ceil(SCALE_BLOCK);
+    let weight_spec = src.spec(name)?;
+    if weight_spec.dtype != DType::F8E4M3 {
+        return Err(EngineError::Shape {
+            what: name.to_owned(),
+            detail: format!(
+                "the released Engram wkv is fp8 E4M3, the source says {:?}: an f32 projection is not the native W8A8 rule",
+                weight_spec.dtype
+            ),
+        });
+    }
+    let scale_spec = src.spec(&scale_name)?;
+    if scale_spec.dtype != DType::F8E8M0 {
+        return Err(EngineError::Shape {
+            what: scale_name.clone(),
+            detail: format!(
+                "the released Engram wkv grid is E8M0, the source says {:?}",
+                scale_spec.dtype
+            ),
+        });
+    }
+    let codes = src.read(name)?;
+    if codes.len() != rows * cols {
+        return Err(EngineError::Shape {
+            what: name.to_owned(),
+            detail: format!(
+                "{} bytes is not the {rows} x {cols} code matrix",
+                codes.len()
+            ),
+        });
+    }
+    let scales = src.read(&scale_name)?;
+    if scales.len() != scale_rows * scale_cols {
+        return Err(EngineError::Shape {
+            what: scale_name,
+            detail: format!(
+                "{} bytes is not the {scale_rows} x {scale_cols} scale grid",
+                scales.len()
+            ),
+        });
+    }
+    Ok((codes, scales))
+}
+
+/// The activation quantiser over one fetched row: the released act_quant rule with
+/// `scale_fmt="ue8m0"` (kernel.py:41-112) on the row's bf16 values, block 32.
+///
+/// A released fetched row is `(max_ngram_size - 1) * n_heads * head_dim` long and a whole
+/// number of blocks; a test-sized configuration can end in a partial one. That tail is quantised as
+/// one block over its own values - the zeros an implicit pad would contribute - and the rule itself
+/// is untouched. The extension is stated because the released code asserts the multiple instead.
+///
+/// # Errors
+///
+/// Whatever [quant::quantize_activation_fp8] reports, which for a whole block is nothing.
+fn quantise_fetched(fetched: &[f32]) -> Result<(Vec<u8>, Vec<u8>), EngineError> {
+    let whole = fetched.len() / SCALE_BLOCK * SCALE_BLOCK;
+    let mut codes = Vec::with_capacity(fetched.len());
+    let mut scales = Vec::with_capacity(fetched.len().div_ceil(SCALE_BLOCK));
+    if whole > 0 {
+        let quantised = quant::quantize_activation_fp8(&fetched[..whole])?;
+        codes.extend_from_slice(quantised.codes());
+        scales.extend_from_slice(quantised.scales());
+    }
+    let tail = fetched.len() - whole;
+    if tail > 0 {
+        let mut padded = [0.0f32; SCALE_BLOCK];
+        padded[..tail].copy_from_slice(&fetched[whole..]);
+        let quantised = quant::quantize_activation_fp8(&padded)?;
+        codes.extend_from_slice(&quantised.codes()[..tail]);
+        scales.push(quantised.scales()[0]);
+    }
+    Ok((codes, scales))
+}
+
+/// The released wkv projection: fp8 W8A8, one 32-column block at a time.
+///
+/// For every output row the block's code dot is computed in the device kernel's reduction order
+/// (the five-step `__shfl_down_sync` tree over offsets 16, 8, 4, 2, 1 of
+/// kernels/engram_wkv_sm121.cu), multiplied by that block's activation and weight scales, and
+/// accumulated over ascending blocks; the row is then rounded to bf16, the released Linear's output
+/// dtype (model.py:187-205). The tree order matters: an ascending sum over the same products rounds
+/// differently, which the twin test pins against a recorded pair.
+fn wkv_native(
+    act_codes: &[u8],
+    act_scales: &[u8],
+    weight: &[u8],
+    weight_scales: &[u8],
+    out_width: usize,
+    inner: usize,
+) -> Vec<f32> {
+    let blocks = inner.div_ceil(SCALE_BLOCK);
+    let mut out = Vec::with_capacity(out_width);
+    for row in 0..out_width {
+        let weight_row = &weight[row * inner..(row + 1) * inner];
+        let scale_row =
+            &weight_scales[(row / SCALE_BLOCK) * blocks..(row / SCALE_BLOCK + 1) * blocks];
+        let mut accumulator = 0.0f32;
+        for kb in 0..blocks {
+            let base = kb * SCALE_BLOCK;
+            let width = (inner - base).min(SCALE_BLOCK);
+            let mut lane = [0.0f32; SCALE_BLOCK];
+            for column in 0..width {
+                lane[column] = quant::f8e4m3_to_f32(act_codes[base + column])
+                    * quant::f8e4m3_to_f32(weight_row[base + column]);
+            }
+            for offset in [16usize, 8, 4, 2, 1] {
+                for partial in 0..offset {
+                    lane[partial] += lane[partial + offset];
+                }
+            }
+            accumulator += (lane[0] * quant::f8e8m0_to_f32(act_scales[kb]))
+                * quant::f8e8m0_to_f32(scale_row[kb]);
+        }
+        out.push(quant::bf16_round(accumulator));
+    }
+    out
 }
 
 /// Writes the n-gram lookup of one layer into the residual stream.
@@ -685,7 +824,7 @@ pub fn engram_forward(
     };
     let out_width = dim * (hc + 1);
     let fetched_width = columns * width;
-    let wkv = read_dense(
+    let (wkv_codes, wkv_scales) = read_fp8_blocks(
         &format!("{prefix}.engram.wkv.weight"),
         src,
         out_width,
@@ -716,7 +855,6 @@ pub fn engram_forward(
     let clamp = 1e-6f32;
     // Scratch, allocated once for the chunk rather than once per token.
     let mut fetched = vec![0.0f32; fetched_width];
-    let mut kv = vec![0.0f32; out_width];
     let mut gate = vec![0.0f32; hc];
     for token in 0..seqlen {
         let row = &hashes[token * stride + block..token * stride + block + columns];
@@ -748,7 +886,15 @@ pub fn engram_forward(
             };
             fetched[column * width..(column + 1) * width].copy_from_slice(&table[at..at + width]);
         }
-        linalg::matmul(&mut kv, &fetched, &wkv, out_width, fetched_width, 1)?;
+        let (act_codes, act_scales) = quantise_fetched(&fetched)?;
+        let kv = wkv_native(
+            &act_codes,
+            &act_scales,
+            &wkv_codes,
+            &wkv_scales,
+            out_width,
+            fetched_width,
+        );
         let (key, value) = kv.split_at(hc * dim);
         for copy in 0..hc {
             let stream_at = token * hc_width + copy * dim;
@@ -760,7 +906,7 @@ pub fn engram_forward(
             let mut key_square = 0.0f32;
             let mut dot = 0.0f32;
             for column in 0..dim {
-                let h = stream[column];
+                let h = quant::bf16_round(stream[column]);
                 let k = key_copy[column];
                 stream_square += h * h;
                 key_square += k * k;
@@ -829,7 +975,9 @@ pub fn engram_write(
     }
     for (copy, &weight) in rows.iter().enumerate() {
         for (column, &value) in cols.iter().enumerate() {
-            out_hc[copy * dim + column] += weight * value;
+            let at = copy * dim + column;
+            // model.py:365 casts the whole write back to the input dtype, one bf16 round.
+            out_hc[at] = quant::bf16_round(out_hc[at] + weight * value);
         }
     }
     Ok(())
@@ -839,7 +987,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    use crate::dtype::{DType, SCALE_BLOCK};
+    use crate::dtype::DType;
     use crate::linalg::REFERENCE_TENSOR_LIMIT;
     use crate::quant;
     use crate::synthetic::SyntheticWeights;
@@ -953,7 +1101,10 @@ mod tests {
                     wkv.push(weight_at(row, column));
                 }
             }
-            hand.put_f32(
+            // The released wkv is fp8 codes plus a 32x32 E8M0 grid (model.py:345); the fixture's
+            // values are chosen e4m3-exact where a test asserts a number, and the grid is ones so a
+            // weight is its code.
+            hand.put_e4m3(
                 &format!("{prefix}.engram.wkv.weight"),
                 &[out_width, fetched],
                 &wkv,
@@ -1199,11 +1350,10 @@ mod tests {
             "layer 1 has an Engram"
         );
         let gate = 1.0 / (1.0 + (-(dim as f32).sqrt().sqrt()).exp());
+        // The write is one bf16 cast of 1 + gate (model.py:365), so the expectation is that cast.
+        let expected = quant::bf16_round(1.0 + gate);
         for (index, value) in x.iter().enumerate() {
-            assert!(
-                (value - (1.0 + gate)).abs() < 1e-6,
-                "element {index} is {value}"
-            );
+            assert_eq!(*value, expected, "element {index} is {value}");
         }
 
         // Case 2: only the first key element is non-zero, so mean(key^2) is 1/dim and rstd is 8. dot is
@@ -1221,15 +1371,12 @@ mod tests {
         let positive = 1.0 / (1.0 + (-1.0f32).exp());
         let clamped = 1.0 / (1.0 + (-1e-6f32.sqrt()).exp());
         for (index, value) in x.iter().enumerate() {
-            let expected = if index < dim {
+            let expected = quant::bf16_round(if index < dim {
                 1.0 + positive
             } else {
                 1.0 + clamped
-            };
-            assert!(
-                (value - expected).abs() < 1e-6,
-                "element {index} is {value}"
-            );
+            });
+            assert_eq!(*value, expected, "element {index} is {value}");
         }
 
         // Case 3: the same key negated makes the dot product negative. The signed square root keeps the
@@ -1246,11 +1393,9 @@ mod tests {
         let mut x = vec![1.0f32; cfg.hc_width()];
         engram_forward(&cfg, 1, &mut x, &[0, 0], &negative, BIG).expect("a negative dot product");
         let signed = 1.0 / (1.0 + 1.0f32.exp());
+        let expected = quant::bf16_round(1.0 + signed);
         for (index, value) in x.iter().enumerate().take(dim) {
-            assert!(
-                (*value - (1.0 + signed)).abs() < 1e-6,
-                "element {index} is {value}"
-            );
+            assert_eq!(*value, expected, "element {index} is {value}");
         }
     }
 
@@ -1681,5 +1826,99 @@ mod tests {
             whole, paged,
             "{seqlen} tokens of width {width} must be identical whether the {rows}-row table was read whole or row by row"
         );
+    }
+
+    #[test]
+    fn the_wkv_projection_is_the_released_w8a8_block_rule() {
+        // The projection is the released fp8 W8A8 Linear (model.py:345, 186-205): one 32-column
+        // block at a time, the block dot formed from the two code vectors, then scaled by that
+        // block's activation and weight scales in the device kernel's reduction order, and the row
+        // rounded to bf16. This test spells that out on hand-picked codes, so it fails if the order
+        // or the scale application moves.
+        // Mixed-magnitude codes, so the sum's order is observable: the product magnitudes span the
+        // format's range and the tree and an ascending sum round differently on some row (asserted
+        // below). The stream is a fixed LCG, not randomness, so the test reproduces anywhere.
+        let mut state = 7u32;
+        let act_codes: Vec<u8> = (0..SCALE_BLOCK)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 16) & 0x7E) as u8
+            })
+            .collect();
+        let act_max = act_codes
+            .iter()
+            .map(|&code| quant::f8e4m3_to_f32(code))
+            .fold(0.0f32, f32::max);
+        let act_scales = vec![quant::e8m0_encode_ceil(act_max / 448.0)];
+        let weight_codes: Vec<u8> = (0..64 * SCALE_BLOCK)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 16) & 0x7E) as u8
+            })
+            .collect();
+        let weight_scales = vec![121u8; 2];
+        let projected = wkv_native(
+            &act_codes,
+            &act_scales,
+            &weight_codes,
+            &weight_scales,
+            64,
+            SCALE_BLOCK,
+        );
+        let mut tree_differs = false;
+        for row in 0..64 {
+            let mut products = [0.0f32; SCALE_BLOCK];
+            for lane in 0..SCALE_BLOCK {
+                products[lane] = quant::f8e4m3_to_f32(act_codes[lane])
+                    * quant::f8e4m3_to_f32(weight_codes[row * SCALE_BLOCK + lane]);
+            }
+            let mut tree = products;
+            for offset in [16usize, 8, 4, 2, 1] {
+                for lane in 0..offset {
+                    tree[lane] += tree[lane + offset];
+                }
+            }
+            let act_scale = quant::f8e8m0_to_f32(act_scales[0]);
+            let weight_scale = quant::f8e8m0_to_f32(weight_scales[row / SCALE_BLOCK]);
+            let tree_sum = (tree[0] * act_scale) * weight_scale;
+            let expected = quant::bf16_round(tree_sum);
+            assert_eq!(projected[row], expected, "row {row}");
+            assert_eq!(
+                quant::bf16_round(projected[row]),
+                projected[row],
+                "the projection output is bf16 (row {row})"
+            );
+            // The order is observable on the f32 accumulators before the bf16 cast: on at least one
+            // row an ascending sum over the same products rounds to different bits.
+            let ascending = (products.into_iter().sum::<f32>() * act_scale) * weight_scale;
+            tree_differs |= ascending.to_bits() != tree_sum.to_bits();
+        }
+        assert!(
+            tree_differs,
+            "the tree order must be observable against an ascending sum on some row"
+        );
+    }
+
+    #[test]
+    fn a_f32_wkv_projection_is_refused_by_name() {
+        // There is no legacy arm: the released wkv is fp8 codes plus a 32x32 E8M0 grid, and a source
+        // that stores it as f32 is not the native rule. The refusal names the dtype it found.
+        let cfg = test_config();
+        let layer = cfg.engram_layer_ids[0];
+        let fetched = hash_columns(&cfg) * cfg.engram_head_dim;
+        let out_width = cfg.dim * (cfg.hc_mult + 1);
+        let mut hand = engram_source(&cfg, |_row, _column| 0.25);
+        hand.put_f32(
+            &format!("layers.{layer}.engram.wkv.weight"),
+            &[out_width, fetched],
+            &vec![0.25f32; out_width * fetched],
+        );
+        let mut x = vec![0.0f32; cfg.hc_width()];
+        let error = engram_forward(&cfg, layer, &mut x, &[0, 0], &hand, BIG)
+            .expect_err("an f32 projection is not the native rule");
+        assert!(matches!(error, EngineError::Shape { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("fp8 E4M3"), "{message}");
+        assert!(message.contains("engram.wkv.weight"), "{message}");
     }
 }

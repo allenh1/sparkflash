@@ -227,7 +227,10 @@ pub struct CompletionRequest {
 pub enum PromptSpec {
     /// A single prompt.
     Text(String),
-    /// Several prompts (joined with newlines in Milestone 1).
+    /// Several independent prompts: one response choice per prompt, vLLM's list form.
+    ///
+    /// The choice index is the prompt's position in this list. The nested token-id form
+    /// (`int[][]`) is not accepted; a token-id batch is expressed as one `int[]` prompt.
     Many(Vec<String>),
     /// A pre-tokenized prompt, passed to the engine unchanged (vLLM's `int[]` form).
     Tokens(Vec<u32>),

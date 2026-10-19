@@ -6,6 +6,9 @@
 //! side-stream warner can touch inside a measured RoCEnante wait window. The GPU execution is
 //! Milestone 4/6 work, so what is testable here is exactly the decision.
 
+use std::ops::Range;
+
+use crate::bypass::PrefillTimeline;
 use crate::config::{CED_ENCODER_LAYERS, CED_SPLIT_LAYER, L2_CACHE_LINE_BYTES, SchedulerConfig};
 use crate::error::SchedulerError;
 use crate::transport::GatherShape;
@@ -278,6 +281,189 @@ const fn coverable_window(configured: usize) -> usize {
     }
 }
 
+/// The chunked prefill policy a host executor follows: a prompt split into contiguous token
+/// chunks plus the engine steps those chunks run at.
+///
+/// The scheduler's policy is [`SchedulerConfig::chunk_tokens`] from
+/// [`crate::config::PREFILL_CHUNK_CHOICES`]
+/// with a [`SchedulerConfig::prefill_decode_interval`] decode step between chunks, which is
+/// exactly [`PrefillTimeline`]'s stride; this plan adds the token ranges so a host executor can
+/// feed the engine one chunk at a time and a test can assert the chunking does not change the
+/// result.
+///
+/// The invariant the plan exists for: for one prompt id sequence, prefilling the chunks in order
+/// on one `SequenceState` is bitwise identical to prefilling the whole prompt
+/// in one call. `crates/sparkflash-engine/tests/chunked_prefill.rs` asserts that on the reference
+/// engine and `crates/sparkflash-cli/src/serve.rs` runs this plan on the host path; the device
+/// launch sequence is window work and is not claimed here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkedPrefillPlan {
+    prompt_tokens: usize,
+    chunk_tokens: usize,
+    decode_interval: usize,
+    admitted_step: u64,
+    chunks: Vec<Range<usize>>,
+}
+
+impl ChunkedPrefillPlan {
+    /// Plans the chunks of `prompt_tokens` under the configured prefill policy.
+    ///
+    /// `admitted_step` is the step the request's own prefill starts at; [`crate::bypass::admit`]
+    /// supplies it for a request admitted against a running background prefill. The chunk steps
+    /// then follow the same stride the background prefill uses, so the timeline stays the one
+    /// source of truth for when a chunk runs.
+    ///
+    /// # Errors
+    /// Returns `SchedulerError::InvalidConfig` for an invalid configuration and
+    /// `SchedulerError::InvalidArgument` for an empty prompt.
+    pub fn plan(
+        prompt_tokens: usize,
+        admitted_step: u64,
+        config: &SchedulerConfig,
+    ) -> Result<Self, SchedulerError> {
+        config.validate()?;
+        let timeline = PrefillTimeline::new(prompt_tokens, config)?;
+        Ok(Self::from_policy(
+            timeline.prompt_tokens(),
+            timeline.chunk_tokens(),
+            timeline.decode_interval(),
+            admitted_step,
+        ))
+    }
+
+    /// The explicit-chunk form: the host executor's plan when the caller chooses the chunk size.
+    ///
+    /// This is what makes the chunked/unchunked invariant testable with prompts shorter than the
+    /// smallest configured chunk (4096 tokens): `chunk_tokens = 2` splits a five-token prompt into
+    /// three chunks without pretending the device policy allows it. [ChunkedPrefillPlan::plan]
+    /// remains the policy entry point; this constructor is for the host path.
+    ///
+    /// # Errors
+    /// Returns `SchedulerError::InvalidArgument` for an empty prompt or a zero chunk size.
+    pub fn with_chunk_tokens(
+        prompt_tokens: usize,
+        admitted_step: u64,
+        chunk_tokens: usize,
+        decode_interval: usize,
+    ) -> Result<Self, SchedulerError> {
+        if prompt_tokens == 0 {
+            return Err(SchedulerError::InvalidArgument(
+                "a chunked prefill needs at least one prompt token".to_owned(),
+            ));
+        }
+        if chunk_tokens == 0 {
+            return Err(SchedulerError::InvalidArgument(
+                "a chunked prefill needs a positive chunk size".to_owned(),
+            ));
+        }
+        Ok(Self::from_policy(
+            prompt_tokens,
+            chunk_tokens,
+            decode_interval,
+            admitted_step,
+        ))
+    }
+
+    fn from_policy(
+        prompt_tokens: usize,
+        chunk_tokens: usize,
+        decode_interval: usize,
+        admitted_step: u64,
+    ) -> Self {
+        let chunks = (0..prompt_tokens.div_ceil(chunk_tokens))
+            .map(|index| {
+                let start = index * chunk_tokens;
+                start..(start + chunk_tokens).min(prompt_tokens)
+            })
+            .collect();
+        Self {
+            prompt_tokens,
+            chunk_tokens,
+            decode_interval,
+            admitted_step,
+            chunks,
+        }
+    }
+
+    /// The token ranges to feed the engine, in order.
+    ///
+    /// They cover `0..prompt_tokens` contiguously and only the last one may be shorter than
+    /// [`ChunkedPrefillPlan::chunk_tokens`].
+    #[must_use]
+    pub fn ranges(&self) -> &[Range<usize>] {
+        &self.chunks
+    }
+
+    /// Prompt tokens the plan covers.
+    #[must_use]
+    pub const fn prompt_tokens(&self) -> usize {
+        self.prompt_tokens
+    }
+
+    /// Chunk size the plan splits at.
+    #[must_use]
+    pub const fn chunk_tokens(&self) -> usize {
+        self.chunk_tokens
+    }
+
+    /// Decode steps between two chunks under the scheduler's policy.
+    #[must_use]
+    pub const fn decode_interval(&self) -> usize {
+        self.decode_interval
+    }
+
+    /// Chunks the prompt is prefilled in.
+    #[must_use]
+    pub const fn chunks(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// The token count of the last chunk (the only one that may be short).
+    #[must_use]
+    pub fn last_chunk_tokens(&self) -> usize {
+        self.chunks.last().map_or(0, Range::len)
+    }
+
+    /// Step the request's own prefill was admitted at.
+    #[must_use]
+    pub const fn admitted_step(&self) -> u64 {
+        self.admitted_step
+    }
+
+    /// Step prefill chunk `index` runs at.
+    ///
+    /// The stride is `decode_interval + 1`, [`PrefillTimeline::stride`]'s value. With
+    /// `decode_interval == 0` the chunks run on consecutive steps, which is the shape of the
+    /// host executor (it runs the chunks back to back with no decode between them).
+    ///
+    /// # Panics
+    /// Panics when `index >= chunks()`; callers iterate over `0..chunks()`.
+    #[must_use]
+    pub fn chunk_step(&self, index: usize) -> u64 {
+        assert!(
+            index < self.chunks.len(),
+            "chunk {index} is outside the plan"
+        );
+        self.admitted_step + index as u64 * (self.decode_interval as u64 + 1)
+    }
+
+    /// Step the request's last prefill chunk runs at.
+    #[must_use]
+    pub fn last_chunk_step(&self) -> u64 {
+        self.chunk_step(self.chunks.len() - 1)
+    }
+
+    /// Step whose decode produces the request's first token.
+    ///
+    /// The first decode step after the last chunk: the inter-chunk window's decode, or (with a
+    /// zero interval) the step right after the chunk.
+    #[must_use]
+    pub const fn first_token_step(&self) -> u64 {
+        // Recomputed rather than calling the non-const accessor: step of the last chunk, plus one.
+        self.admitted_step + (self.chunks.len() as u64 - 1) * (self.decode_interval as u64 + 1) + 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,5 +647,74 @@ mod tests {
             .is_err(),
             "a configuration under one cache line cannot prefetch"
         );
+    }
+
+    #[test]
+    fn the_chunk_plan_covers_the_prompt_contiguously() {
+        let plan = ChunkedPrefillPlan::plan(400_000, 0, &SchedulerConfig::default())
+            .expect("the default policy plans a reference prompt");
+        assert_eq!(plan.chunks(), 98, "400000 tokens at 4096 per chunk");
+        assert_eq!(plan.chunk_tokens(), 4096);
+        assert_eq!(plan.prompt_tokens(), 400_000);
+        assert_eq!(plan.last_chunk_tokens(), 400_000 - 97 * 4096);
+        let mut next = 0usize;
+        for range in plan.ranges() {
+            assert_eq!(range.start, next, "chunks are contiguous and ordered");
+            assert!(!range.is_empty());
+            assert!(range.len() <= plan.chunk_tokens());
+            next = range.end;
+        }
+        assert_eq!(next, plan.prompt_tokens(), "the chunks cover the prompt");
+    }
+
+    #[test]
+    fn a_short_prompt_is_one_chunk() {
+        let plan = ChunkedPrefillPlan::plan(5, 0, &SchedulerConfig::default()).expect("plan");
+        assert_eq!(plan.chunks(), 1);
+        assert_eq!(plan.ranges().to_vec(), vec![0..5]);
+        assert_eq!(plan.last_chunk_tokens(), 5);
+        assert_eq!(plan.first_token_step(), 1);
+    }
+
+    #[test]
+    fn the_explicit_chunk_size_is_the_host_form() {
+        // A five-token prompt at two tokens per chunk: the tiny form the host invariant test uses.
+        let plan = ChunkedPrefillPlan::with_chunk_tokens(5, 0, 2, 2).expect("plan");
+        assert_eq!(plan.chunks(), 3);
+        assert_eq!(plan.ranges(), [0..2, 2..4, 4..5]);
+        assert_eq!(plan.last_chunk_tokens(), 1);
+        assert_eq!(plan.chunk_step(0), 0);
+        assert_eq!(plan.chunk_step(1), 3, "stride is decode_interval + 1");
+        assert_eq!(plan.last_chunk_step(), 6);
+        assert_eq!(plan.first_token_step(), 7);
+    }
+
+    #[test]
+    fn the_admitted_step_shifts_every_chunk_step() {
+        let plan = ChunkedPrefillPlan::plan(10_000, 17, &SchedulerConfig::default()).expect("plan");
+        assert_eq!(plan.admitted_step(), 17);
+        assert_eq!(plan.chunk_step(0), 17);
+        assert_eq!(
+            plan.chunk_step(1),
+            17 + (SchedulerConfig::default().prefill_decode_interval as u64 + 1)
+        );
+        assert_eq!(plan.first_token_step(), plan.last_chunk_step() + 1);
+    }
+
+    #[test]
+    fn a_host_plan_can_run_chunks_back_to_back() {
+        let plan = ChunkedPrefillPlan::with_chunk_tokens(7, 4, 3, 0).expect("plan");
+        assert_eq!(plan.ranges(), [0..3, 3..6, 6..7]);
+        assert_eq!(plan.chunk_step(0), 4);
+        assert_eq!(plan.chunk_step(1), 5);
+        assert_eq!(plan.chunk_step(2), 6);
+        assert_eq!(plan.first_token_step(), 7);
+    }
+
+    #[test]
+    fn the_chunk_plan_refuses_empty_prompts_and_empty_chunks() {
+        assert!(ChunkedPrefillPlan::with_chunk_tokens(0, 0, 2, 0).is_err());
+        assert!(ChunkedPrefillPlan::with_chunk_tokens(4, 0, 0, 0).is_err());
+        assert!(ChunkedPrefillPlan::plan(0, 0, &SchedulerConfig::default()).is_err());
     }
 }

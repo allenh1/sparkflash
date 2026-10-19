@@ -187,11 +187,17 @@ pub enum KernelId {
     Bf16aMxfp8wDense,
     /// b12x_bf16a_mxfp8w_wo_a_sm121: the BF16-activation variant of the grouped wo_a projection.
     Bf16aMxfp8wWoA,
+    /// engram_embed_sm121: the Engram table row reader and activation quantiser (task-9, audit F4).
+    EngramEmbed,
+    /// engram_wkv_sm121: the Engram wkv projection, fp8 W8A8 (task-9, audit F4).
+    EngramWkv,
+    /// engram_gate_write_sm121: the Engram gate and residual write (task-9, audit F4).
+    EngramGateWrite,
 }
 
 impl KernelId {
     /// Every kernel the shared driver owns, in the order of this enum.
-    pub const ALL: [KernelId; 14] = [
+    pub const ALL: [KernelId; 17] = [
         KernelId::MegaMhcBf16,
         KernelId::Mxfp8Dense,
         KernelId::Mxfp8WoA,
@@ -206,6 +212,9 @@ impl KernelId {
         KernelId::FlashMlaCsa2Seq,
         KernelId::Bf16aMxfp8wDense,
         KernelId::Bf16aMxfp8wWoA,
+        KernelId::EngramEmbed,
+        KernelId::EngramWkv,
+        KernelId::EngramGateWrite,
     ];
 
     /// The cubin symbol of this kernel. Private: callers name the enum, never the symbol.
@@ -225,6 +234,9 @@ impl KernelId {
             KernelId::FlashMlaCsa2Seq => "flash_mla_csa2_seq_sm121",
             KernelId::Bf16aMxfp8wDense => "b12x_bf16a_mxfp8w_dense_sm121",
             KernelId::Bf16aMxfp8wWoA => "b12x_bf16a_mxfp8w_wo_a_sm121",
+            KernelId::EngramEmbed => "engram_embed_sm121",
+            KernelId::EngramWkv => "engram_wkv_sm121",
+            KernelId::EngramGateWrite => "engram_gate_write_sm121",
         }
     }
 
@@ -252,6 +264,9 @@ impl KernelId {
             KernelId::FlashMlaCsa2Seq => &["flash_mla_csa2_seq_sm121"],
             KernelId::Bf16aMxfp8wDense => &["b12x_bf16a_mxfp8w_dense_sm121"],
             KernelId::Bf16aMxfp8wWoA => &["b12x_bf16a_mxfp8w_wo_a_sm121"],
+            KernelId::EngramEmbed => &["engram_embed_sm121"],
+            KernelId::EngramWkv => &["engram_wkv_sm121"],
+            KernelId::EngramGateWrite => &["engram_gate_write_sm121"],
         }
     }
 

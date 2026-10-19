@@ -6,7 +6,7 @@
 //! decode to NaN or inf, and a comparison over NaNs is vacuous.
 
 use sparkflash_engine::dtype::DType;
-use sparkflash_engine::tensor::{TensorPlan, TensorSpec};
+use sparkflash_engine::tensor::{TensorPlan, TensorSpec, checkpoint_storage_dtype};
 use sparkflash_engine::weights::{WeightError, WeightSource};
 
 /// A finite, plan-shaped weight source: the plan's names and shapes, every tensor as finite f32.
@@ -32,6 +32,21 @@ fn name_salt(name: &str) -> u64 {
     })
 }
 
+/// The deterministic value of one element, shared by the f32 and the fp8 arms so the source stays
+/// one pattern as its dtype changes.
+fn value_at(index: usize, salt: u64, seed: u64) -> f32 {
+    // A per-element mix, deliberately not a per-row one: with the high bits of the index the
+    // pattern would barely change across a row, two rows could produce exactly equal dot
+    // products, and the argmax would then be a tie that hides a mis-indexed read.
+    let mixed = (index as u64)
+        .wrapping_add(salt)
+        .wrapping_add(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    let hashed = (mixed ^ (mixed >> 13)).wrapping_mul(0x2545_f491_4f6c_dd1d);
+    // Strictly positive and at least 0.01, so nothing divides by a zero scale, and 256 values deep
+    // so neighbours differ.
+    0.01 + 0.000_1 * (hashed >> 56) as f32
+}
+
 impl WeightSource for FiniteSource {
     fn names(&self) -> Vec<String> {
         self.specs.iter().map(|spec| spec.name.clone()).collect()
@@ -40,7 +55,9 @@ impl WeightSource for FiniteSource {
     fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
         match self.specs.iter().find(|spec| spec.name == name) {
             Some(spec) => Ok(TensorSpec {
-                dtype: DType::F32,
+                // f32 for every tensor except the Engram wkv projection, whose checkpoint storage
+                // format is the only way to recover the codes (audit F4).
+                dtype: checkpoint_storage_dtype(name).unwrap_or(DType::F32),
                 ..spec.clone()
             }),
             None => Err(WeightError::Missing {
@@ -50,21 +67,30 @@ impl WeightSource for FiniteSource {
     }
 
     fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
-        let elements = usize::try_from(self.spec(name)?.elements()).expect("a test tensor fits");
+        let spec = self.spec(name)?;
+        let elements = usize::try_from(spec.elements()).expect("a test tensor fits");
         let salt = name_salt(name);
+        if spec.dtype != DType::F32 {
+            // The Engram wkv projection: fp8 codes and an all-ones E8M0 grid (audit F4).
+            let mut bytes = Vec::with_capacity(elements);
+            match spec.dtype {
+                DType::F8E4M3 => {
+                    for index in 0..elements {
+                        bytes.push(sparkflash_engine::quant::e4m3_encode(value_at(
+                            index, salt, self.seed,
+                        )));
+                    }
+                }
+                DType::F8E8M0 => bytes.resize(elements, 127u8),
+                other => {
+                    unreachable!("the fixture serves only f32 and the Engram wkv pair: {other:?}")
+                }
+            }
+            return Ok(bytes);
+        }
         let mut bytes = Vec::with_capacity(elements * 4);
         for index in 0..elements {
-            // A per-element mix, deliberately not a per-row one: with the high bits of the index the
-            // pattern would barely change across a row, two rows could produce exactly equal dot
-            // products, and the argmax would then be a tie that hides a mis-indexed read.
-            let mixed = (index as u64)
-                .wrapping_add(salt)
-                .wrapping_add(self.seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-            let hashed = (mixed ^ (mixed >> 13)).wrapping_mul(0x2545_f491_4f6c_dd1d);
-            // Strictly positive and at least 0.01, so nothing divides by a zero scale, and 256 values
-            // deep so neighbours differ.
-            let value = 0.01 + 0.000_1 * (hashed >> 56) as f32;
-            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes.extend_from_slice(&value_at(index, salt, self.seed).to_le_bytes());
         }
         Ok(bytes)
     }

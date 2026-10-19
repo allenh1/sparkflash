@@ -19,6 +19,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures::StreamExt;
 use serde_json::{Map, Value, json};
+use sparkflash_kv::PrefixMatchPlan;
 use sparkflash_trace::{
     GpuTraceRing, TraceAdminRequest, TraceAdminResponse, TraceExportOptions, TraceScope,
     active_mask, arm_with_gpu, bind_current_request, disarm_with_gpu, drain_cpu_events,
@@ -41,7 +42,9 @@ use crate::schema::{
     StopSpec,
 };
 use crate::state::AppState;
-use crate::telemetry_types::{DeepSeekSparkRequestStats, OpenAiUsageWithCache};
+use crate::telemetry_types::{
+    DSparkStepStats, DeepSeekSparkRequestStats, OpenAiUsageWithCache, safe_ratio,
+};
 
 /// Decode-side trace request header.
 pub const TRACE_HEADER: &str = "x-sparkflash-trace";
@@ -1410,18 +1413,39 @@ async fn completions(
     let request: CompletionRequest = serde_json::from_value(value).map_err(invalid_body)?;
     let model = resolve_model(&state, request.model.as_deref())?;
     let trace = trace_context(&headers)?;
-    // `tokens` carries the pre-tokenized vLLM form straight through; `text` and the joined
-    // `many` form are tokenized with the checkpoint tokenizer when the seam is attached. Without
-    // a seam (weight-free router tests) the Milestone 1 heuristic keeps the placeholder path.
-    let (prompt_text, prompt_token_ids) = match request.prompt.as_ref() {
-        Some(PromptSpec::Text(text)) => (text.clone(), None),
-        Some(PromptSpec::Many(items)) => (items.join("\n"), None),
+    // vLLM's completion batch contract: a list prompt is a list of independent prompts, each
+    // producing its own choice in one response (vllm/entrypoints/openai/completion/serving.py
+    // builds one choice per prompt and sums usage over the batch). `tokens` carries the pre-tokenized form straight through;
+    // text is tokenized with the checkpoint seam when attached, and the Milestone 1 heuristic keeps
+    // the weight-free placeholder path.
+    let prompts = match request.prompt.as_ref() {
+        Some(PromptSpec::Text(text)) => vec![CompletionPrompt {
+            text: text.clone(),
+            tokens: None,
+        }],
+        Some(PromptSpec::Many(items)) if items.is_empty() => {
+            return Err(ApiError::invalid_request(
+                "\"prompt\" must contain at least one prompt",
+                Some("prompt".to_owned()),
+                Some("invalid_prompt".to_owned()),
+            ));
+        }
+        Some(PromptSpec::Many(items)) => items
+            .iter()
+            .map(|text| CompletionPrompt {
+                text: text.clone(),
+                tokens: None,
+            })
+            .collect(),
         Some(PromptSpec::Tokens(ids)) => {
             let text = state
                 .tokenizer()
                 .and_then(|seam| seam.decode(ids))
                 .unwrap_or_default();
-            (text, Some(ids.clone()))
+            vec![CompletionPrompt {
+                text,
+                tokens: Some(ids.clone()),
+            }]
         }
         None => {
             return Err(ApiError::invalid_request(
@@ -1430,18 +1454,6 @@ async fn completions(
                 Some("invalid_prompt".to_owned()),
             ));
         }
-    };
-    let summary = match prompt_token_ids {
-        Some(ids) => tokenizer_prompt_summary(ids, prompt_text.len()),
-        None => match state.tokenizer() {
-            Some(seam) => {
-                let ids = seam
-                    .encode_text(&prompt_text)
-                    .map_err(tokenizer_seam_error)?;
-                tokenizer_prompt_summary(ids, prompt_text.len())
-            }
-            None => summarize_prompt_text(&prompt_text),
-        },
     };
     refuse_image_carrier(image_carrier)?;
     let id = state.next_id("cmpl-dsv41-");
@@ -1511,24 +1523,51 @@ async fn completions(
         sample,
         explicit_token_ids,
     };
-    let engine_request = RequestBuilder {
-        id: id.clone(),
-        model: model.clone(),
-        summary,
-        max_tokens,
-        temperature: request.temperature,
-        top_p: request.top_p,
-        spec,
-        stop: normalize_stop(request.stop.as_ref()),
-        seed: request.seed,
-        logprobs,
-        trace,
+    let stop = normalize_stop(request.stop.as_ref());
+    let mut engine_requests = Vec::with_capacity(prompts.len());
+    for (index, prompt) in prompts.iter().enumerate() {
+        let summary = match &prompt.tokens {
+            Some(ids) => tokenizer_prompt_summary(ids.clone(), prompt.text.len()),
+            None => match state.tokenizer() {
+                Some(seam) => {
+                    let ids = seam
+                        .encode_text(&prompt.text)
+                        .map_err(tokenizer_seam_error)?;
+                    tokenizer_prompt_summary(ids, prompt.text.len())
+                }
+                None => summarize_prompt_text(&prompt.text),
+            },
+        };
+        // vLLM gives every prompt its own engine request id ('{request_id}-{i}'); a single-prompt
+        // request keeps the response id so the engine seam sees exactly what it saw before.
+        let request_id = if prompts.len() == 1 {
+            id.clone()
+        } else {
+            format!("{id}-{index}")
+        };
+        engine_requests.push(
+            RequestBuilder {
+                id: request_id,
+                model: model.clone(),
+                summary,
+                max_tokens,
+                temperature: request.temperature,
+                top_p: request.top_p,
+                spec,
+                stop: stop.clone(),
+                seed: request.seed,
+                logprobs: logprobs.clone(),
+                trace,
+            }
+            .build(),
+        );
     }
-    .build();
-    state
-        .engine
-        .validate_request(&engine_request)
-        .map_err(ApiError::from)?;
+    for engine_request in &engine_requests {
+        state
+            .engine
+            .validate_request(engine_request)
+            .map_err(ApiError::from)?;
+    }
 
     if request.stream {
         let include_usage = request
@@ -1537,7 +1576,8 @@ async fn completions(
             .unwrap_or(false);
         Ok(completions_stream_response(
             &state,
-            engine_request,
+            engine_requests,
+            &prompts,
             StreamContext {
                 id,
                 created,
@@ -1547,75 +1587,283 @@ async fn completions(
             },
             logprob_info,
             echo,
-            prompt_text,
             trace,
         ))
     } else {
         let _binding = RequestTraceBinding::new(trace_id);
-        let output = drive_engine(state.engine.as_ref(), engine_request).await?;
-        state
-            .metrics
-            .record_request(&output.usage, &output.stats.kv_cache);
-        let body = completion_body(
-            &output,
-            &id,
-            created,
-            &model,
-            logprob_info,
-            echo,
-            &prompt_text,
-        );
+        let mut outputs = Vec::with_capacity(engine_requests.len());
+        for engine_request in engine_requests {
+            outputs.push(drive_engine(state.engine.as_ref(), engine_request).await?);
+        }
+        let usage = aggregate_usage(&outputs);
+        let stats = aggregate_stats(&outputs);
+        state.metrics.record_request(&usage, &stats.kv_cache);
+        let body = completion_body(&outputs, &prompts, &id, created, &model, logprob_info, echo);
         Ok(json_response(body, trace))
     }
 }
 
-/// Builds the OpenAI /v1/completions body, applying vLLM's echo and logprob rules.
+/// One prompt of a `/v1/completions` batch: the text used for echo and summary, and, for the
+/// vLLM `int[]` form, the caller's token ids.
+struct CompletionPrompt {
+    text: String,
+    tokens: Option<Vec<u32>>,
+}
+
+/// Builds the OpenAI /v1/completions body for a batch of prompts, applying vLLM's echo and
+/// logprob rules.
 ///
-/// With `echo`, `text` is the prompt text plus the generated text and the logprob arrays cover the
-/// prompt tokens first; `prompt_logprobs` is always present (null unless computed), because that is
-/// the field a vLLM client checks.
+/// vLLM's contract for a list prompt is one response whose `choices` carries one entry per prompt
+/// (`index` = choice position, echo text and prompt logprobs per prompt) and one `usage` object
+/// summed over the batch (`serving_completion.py::request_output_to_completion_response`). The
+/// `x_deepseek_spark_stats` extension is aggregated the same way, with its rates recomputed.
 fn completion_body(
-    output: &EngineOutput,
+    outputs: &[EngineOutput],
+    prompts: &[CompletionPrompt],
     id: &str,
     created: u64,
     model: &str,
     logprob_info: LogprobInfo,
     echo: bool,
-    prompt_text: &str,
 ) -> Value {
-    let text = if echo {
-        format!("{prompt_text}{}", output.content)
-    } else {
-        output.content.clone()
-    };
-    let logprobs = if logprob_info.wants_sample() {
-        let mut positions = Vec::new();
-        if echo && let Some(prompt) = output.prompt_logprobs.as_ref() {
-            positions.extend(prompt_positions(prompt));
-        }
-        positions.extend(generated_positions(output));
-        completion_logprobs_value(&positions, 0)
-    } else {
-        Value::Null
-    };
-    let prompt_logprobs = output
-        .prompt_logprobs
-        .as_ref()
-        .map_or(Value::Null, prompt_logprobs_value);
+    debug_assert_eq!(outputs.len(), prompts.len());
+    let choices: Vec<Value> = outputs
+        .iter()
+        .zip(prompts)
+        .enumerate()
+        .map(|(index, (output, prompt))| {
+            let text = if echo {
+                format!("{}{}", prompt.text, output.content)
+            } else {
+                output.content.clone()
+            };
+            let logprobs = if logprob_info.wants_sample() {
+                let mut positions = Vec::new();
+                if echo && let Some(prompt_logprobs) = output.prompt_logprobs.as_ref() {
+                    positions.extend(prompt_positions(prompt_logprobs));
+                }
+                positions.extend(generated_positions(output));
+                completion_logprobs_value(&positions, 0)
+            } else {
+                Value::Null
+            };
+            let prompt_logprobs = output
+                .prompt_logprobs
+                .as_ref()
+                .map_or(Value::Null, prompt_logprobs_value);
+            json!({
+                "index": index,
+                "text": text,
+                "logprobs": logprobs,
+                "finish_reason": output.finish_reason,
+                // The reference engine has no stop-sequence matching (its finish reason is the
+                // token cap or a step with no token), so vLLM's stop_reason is null for every
+                // choice until the device engine can report one.
+                "stop_reason": Value::Null,
+                "prompt_logprobs": prompt_logprobs,
+            })
+        })
+        .collect();
+    let usage = aggregate_usage(outputs);
+    let stats = aggregate_stats(outputs);
     json!({
         "id": id,
         "object": "text_completion",
         "created": created,
         "model": model,
-        "choices": [{
-            "index": 0,
-            "text": text,
-            "logprobs": logprobs,
-            "finish_reason": output.finish_reason,
-            "prompt_logprobs": prompt_logprobs,
-        }],
-        "usage": output.usage,
-        "x_deepseek_spark_stats": output.stats,
+        "choices": choices,
+        "usage": usage,
+        "x_deepseek_spark_stats": stats,
+    })
+}
+
+/// Sums the per-prompt usage into the one `usage` block vLLM returns for a batched completion.
+fn aggregate_usage(outputs: &[EngineOutput]) -> OpenAiUsageWithCache {
+    let usages: Vec<OpenAiUsageWithCache> = outputs.iter().map(|output| output.usage).collect();
+    sum_usage(&usages)
+}
+
+/// Sums usage parts; used by both the buffered body and the streamed final usage chunk.
+fn sum_usage(usages: &[OpenAiUsageWithCache]) -> OpenAiUsageWithCache {
+    let mut usage = OpenAiUsageWithCache::default();
+    for part in usages {
+        add_usage(&mut usage, part);
+    }
+    usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+    usage
+}
+
+/// Adds one usage into `total`; the one place the usage fields are enumerated for aggregation.
+fn add_usage(total: &mut OpenAiUsageWithCache, usage: &OpenAiUsageWithCache) {
+    total.prompt_tokens += usage.prompt_tokens;
+    total.completion_tokens += usage.completion_tokens;
+    total.prompt_tokens_details.cached_tokens += usage.prompt_tokens_details.cached_tokens;
+    total.prompt_tokens_details.uma_cached_tokens += usage.prompt_tokens_details.uma_cached_tokens;
+    total.prompt_tokens_details.nvme_cached_tokens +=
+        usage.prompt_tokens_details.nvme_cached_tokens;
+    total.prompt_tokens_details.image_tokens += usage.prompt_tokens_details.image_tokens;
+    total.completion_tokens_details.reasoning_tokens +=
+        usage.completion_tokens_details.reasoning_tokens;
+    total.completion_tokens_details.accepted_prediction_tokens +=
+        usage.completion_tokens_details.accepted_prediction_tokens;
+    total.completion_tokens_details.rejected_prediction_tokens +=
+        usage.completion_tokens_details.rejected_prediction_tokens;
+}
+
+/// Aggregates the per-request `x_deepseek_spark_stats` extension over a batch.
+///
+/// A single-prompt request returns the engine's own stats unchanged, so the single-prompt wire
+/// bytes stay exactly what the engine measured. For several prompts the counters sum, the rates
+/// are recomputed from the sums (never averaged), and the wall-clock figures take the batch's
+/// worst case: TTFT is the slowest prompt's, throughput is total tokens over summed seconds.
+fn aggregate_stats(outputs: &[EngineOutput]) -> Box<DeepSeekSparkRequestStats> {
+    let parts: Vec<(&DeepSeekSparkRequestStats, &OpenAiUsageWithCache)> = outputs
+        .iter()
+        .map(|output| (&*output.stats, &output.usage))
+        .collect();
+    aggregate_stats_parts(&parts)
+}
+
+/// The parts form of [aggregate_stats], shared with the merged streaming response.
+fn aggregate_stats_parts(
+    parts: &[(&DeepSeekSparkRequestStats, &OpenAiUsageWithCache)],
+) -> Box<DeepSeekSparkRequestStats> {
+    if let [only] = parts {
+        return Box::new((*only.0).clone());
+    }
+    let mut kv_cache = PrefixMatchPlan {
+        total_prompt_tokens: 0,
+        global_kv_cached_tokens: 0,
+        uma_hit_tokens: 0,
+        nvme_restored_tokens: 0,
+        swa_tail_hit: false,
+        encoder_swa_replay_tokens: 0,
+        uncached_suffix_tokens: 0,
+        decoder_swa_replay_tokens: 0,
+    };
+    let mut engram_layers = [
+        parts[0].0.engram_layers[0].clone(),
+        parts[0].0.engram_layers[1].clone(),
+    ];
+    for layer in &mut engram_layers {
+        layer.lookups_total = 0;
+        layer.tier1_drm_hits = 0;
+        layer.tier2_uma_hits = 0;
+        layer.tier3_nvme_misses = 0;
+        layer.hit_rate = 0.0;
+        layer.mean_prefetch_stall_us = 0.0;
+        layer.mean_gate_alpha = 0.0;
+    }
+    let mut stall_weighted = [0.0f64; 2];
+    let mut gate_weighted = [0.0f64; 2];
+    let mut transport = parts[0].0.transport.clone();
+    transport.rocenante_oneshot_calls = 0;
+    transport.nccl_ring_calls = 0;
+    transport.rail0_rocep1s0f0_mb = 0.0;
+    transport.rail1_rocep2p1s0f0_mb = 0.0;
+    transport.l2_weight_prefetch_overlaps = 0;
+    let (mut ttft_ms, mut min_uma_free_gib) = (0.0f64, f64::INFINITY);
+    let (mut prefill_seconds, mut decode_seconds) = (0.0f64, 0.0f64);
+    for (stats, usage) in parts {
+        kv_cache.total_prompt_tokens += stats.kv_cache.total_prompt_tokens;
+        kv_cache.global_kv_cached_tokens += stats.kv_cache.global_kv_cached_tokens;
+        kv_cache.uma_hit_tokens += stats.kv_cache.uma_hit_tokens;
+        kv_cache.nvme_restored_tokens += stats.kv_cache.nvme_restored_tokens;
+        kv_cache.swa_tail_hit |= stats.kv_cache.swa_tail_hit;
+        kv_cache.encoder_swa_replay_tokens += stats.kv_cache.encoder_swa_replay_tokens;
+        kv_cache.uncached_suffix_tokens += stats.kv_cache.uncached_suffix_tokens;
+        kv_cache.decoder_swa_replay_tokens += stats.kv_cache.decoder_swa_replay_tokens;
+        for (index, layer) in stats.engram_layers.iter().enumerate() {
+            let target = &mut engram_layers[index];
+            target.lookups_total += layer.lookups_total;
+            target.tier1_drm_hits += layer.tier1_drm_hits;
+            target.tier2_uma_hits += layer.tier2_uma_hits;
+            target.tier3_nvme_misses += layer.tier3_nvme_misses;
+            let lookups = layer.lookups_total as f64;
+            stall_weighted[index] += layer.mean_prefetch_stall_us * lookups;
+            gate_weighted[index] += layer.mean_gate_alpha * lookups;
+        }
+        transport.rocenante_oneshot_calls += stats.transport.rocenante_oneshot_calls;
+        transport.nccl_ring_calls += stats.transport.nccl_ring_calls;
+        transport.rail0_rocep1s0f0_mb += stats.transport.rail0_rocep1s0f0_mb;
+        transport.rail1_rocep2p1s0f0_mb += stats.transport.rail1_rocep2p1s0f0_mb;
+        transport.l2_weight_prefetch_overlaps += stats.transport.l2_weight_prefetch_overlaps;
+        ttft_ms = ttft_ms.max(stats.timing.ttft_ms);
+        min_uma_free_gib = min_uma_free_gib.min(stats.timing.min_rank_uma_free_gib);
+        let prompt_tokens = usage.prompt_tokens as f64;
+        let completion_tokens = usage.completion_tokens as f64;
+        if stats.timing.prefill_tok_per_s > 0.0 {
+            prefill_seconds += prompt_tokens / stats.timing.prefill_tok_per_s;
+        }
+        if stats.timing.decode_tok_per_s > 0.0 {
+            decode_seconds += completion_tokens / stats.timing.decode_tok_per_s;
+        }
+    }
+    for (index, layer) in engram_layers.iter_mut().enumerate() {
+        layer.hit_rate = safe_ratio(
+            (layer.tier1_drm_hits + layer.tier2_uma_hits) as usize,
+            layer.lookups_total as usize,
+        );
+        if layer.lookups_total > 0 {
+            let lookups = layer.lookups_total as f64;
+            layer.mean_prefetch_stall_us = stall_weighted[index] / lookups;
+            layer.mean_gate_alpha = gate_weighted[index] / lookups;
+        }
+    }
+    let dspark_speculative = DSparkStepStats::from_counts(
+        parts
+            .iter()
+            .map(|(stats, _)| stats.dspark_speculative.target_verify_steps)
+            .sum(),
+        parts
+            .iter()
+            .map(|(stats, _)| stats.dspark_speculative.draft_tokens_proposed)
+            .sum(),
+        parts
+            .iter()
+            .map(|(stats, _)| stats.dspark_speculative.draft_tokens_confidence_gated)
+            .sum(),
+        parts
+            .iter()
+            .map(|(stats, _)| stats.dspark_speculative.draft_tokens_accepted)
+            .sum(),
+    );
+    let kv_cache_hit_rate = safe_ratio(
+        kv_cache.global_kv_cached_tokens,
+        kv_cache.total_prompt_tokens,
+    );
+    Box::new(DeepSeekSparkRequestStats {
+        kv_cache,
+        kv_cache_hit_rate,
+        engram_layers,
+        dspark_speculative,
+        transport,
+        timing: crate::telemetry_types::RequestTimingStats {
+            ttft_ms,
+            prefill_tok_per_s: if prefill_seconds > 0.0 {
+                (parts
+                    .iter()
+                    .map(|(_, usage)| usage.prompt_tokens)
+                    .sum::<usize>() as f64)
+                    / prefill_seconds
+            } else {
+                0.0
+            },
+            decode_tok_per_s: if decode_seconds > 0.0 {
+                (parts
+                    .iter()
+                    .map(|(_, usage)| usage.completion_tokens)
+                    .sum::<usize>() as f64)
+                    / decode_seconds
+            } else {
+                0.0
+            },
+            min_rank_uma_free_gib: if min_uma_free_gib.is_finite() {
+                min_uma_free_gib
+            } else {
+                0.0
+            },
+        },
     })
 }
 
@@ -1623,11 +1871,12 @@ fn completion_chunk(
     id: &str,
     model: &str,
     created: u64,
+    index: usize,
     text: &str,
     finish_reason: Option<FinishReason>,
     logprobs: Option<Value>,
 ) -> Value {
-    let mut choice = json!({"index": 0, "text": text, "finish_reason": finish_reason});
+    let mut choice = json!({"index": index, "text": text, "finish_reason": finish_reason});
     if let (Some(logprobs), Some(map)) = (logprobs, choice.as_object_mut()) {
         map.insert("logprobs".to_owned(), logprobs);
     } else if let Some(map) = choice.as_object_mut() {
@@ -1644,15 +1893,16 @@ fn completion_chunk(
 
 fn completions_stream_response(
     state: &AppState,
-    request: EngineRequest,
+    requests: Vec<EngineRequest>,
+    prompts: &[CompletionPrompt],
     context: StreamContext,
     logprob_info: LogprobInfo,
     echo: bool,
-    prompt_text: String,
     trace: Option<TraceDirective>,
 ) -> Response {
     let engine = Arc::clone(&state.engine);
     let metrics = Arc::clone(&state.metrics);
+    let prompt_texts: Vec<String> = prompts.iter().map(|prompt| prompt.text.clone()).collect();
     let StreamContext {
         id,
         created,
@@ -1660,54 +1910,90 @@ fn completions_stream_response(
         include_usage,
         trace_id,
     } = context;
+    // One generator per prompt, tagged with its prompt index, merged into one event stream.
+    // That is vLLM's shape for a batched completion: `merge_async_iterators` feeds one result
+    // generator per prompt and every streamed choice carries the prompt's choice index.
+    let streams: Vec<futures::stream::BoxStream<'static, (usize, EngineEvent)>> = requests
+        .into_iter()
+        .enumerate()
+        .map(|(index, request)| {
+            let engine = Arc::clone(&engine);
+            let stream = async_stream::stream! {
+                let mut events = engine.generate(request);
+                while let Some(event) = events.next().await {
+                    yield (index, event);
+                }
+            };
+            Box::pin(stream) as futures::stream::BoxStream<'static, (usize, EngineEvent)>
+        })
+        .collect();
+    let mut events = futures::stream::select_all(streams);
     let stream = async_stream::stream! {
         // The spans are emitted while this generator is polled, so the binding has to be
         // taken here rather than on the handler's stack.
         let _binding = RequestTraceBinding::new(trace_id);
+        let prompt_count = prompt_texts.len();
         // With logprobs requested the chunk has to carry the text the logprob belongs to, so
-        // content deltas are held until their `TokenLogprobs` event arrives.
-        let mut buffered = String::new();
-        let mut prompt: Option<PromptLogprobs> = None;
+        // content deltas are held until their `TokenLogprobs` event arrives. All per-prompt
+        // stream state is indexed by the prompt's choice index.
+        let mut buffered: Vec<String> = (0..prompt_count).map(|_| String::new()).collect();
+        let mut prompt_logprobs: Vec<Option<PromptLogprobs>> =
+            (0..prompt_count).map(|_| None).collect();
         // vLLM starts a streamed chunk's `text_offset` at the length of the text it has already
         // sent, not at zero for every chunk.
-        let mut emitted_chars = 0usize;
-        let mut echo_sent = false;
-        let mut events = engine.generate(request);
-        while let Some(event) = events.next().await {
+        let mut emitted_chars = vec![0usize; prompt_count];
+        let mut echo_sent = vec![false; prompt_count];
+        let mut usage = OpenAiUsageWithCache::default();
+        let mut stats_parts: Vec<(DeepSeekSparkRequestStats, OpenAiUsageWithCache)> =
+            Vec::with_capacity(prompt_count);
+        while let Some((index, event)) = events.next().await {
             match event {
                 EngineEvent::Started { .. } => {}
-                EngineEvent::PromptLogprobs(payload) => prompt = Some(*payload),
+                EngineEvent::PromptLogprobs(payload) => prompt_logprobs[index] = Some(*payload),
                 EngineEvent::ReasoningDelta(_) => {}
                 EngineEvent::ContentDelta(text) => {
                     if logprob_info.wants_sample() {
-                        buffered.push_str(&text);
+                        buffered[index].push_str(&text);
                     } else {
-                        emitted_chars += text.chars().count();
-                        yield Ok(sse_frame(&completion_chunk(&id, &model, created, &text, None, None)));
+                        emitted_chars[index] += text.chars().count();
+                        yield Ok(sse_frame(&completion_chunk(
+                            &id,
+                            &model,
+                            created,
+                            index,
+                            &text,
+                            None,
+                            None,
+                        )));
                     }
                 }
                 EngineEvent::TokenLogprobs(logprob) => {
                     if logprob_info.wants_sample() {
                         let mut positions = Vec::new();
-                        let text = if echo && !echo_sent {
-                            echo_sent = true;
-                            if let Some(prompt) = prompt.as_ref() {
+                        let text = if echo && !echo_sent[index] {
+                            echo_sent[index] = true;
+                            if let Some(prompt) = prompt_logprobs[index].as_ref() {
                                 positions.extend(prompt_positions(prompt));
                             }
-                            format!("{prompt_text}{}", std::mem::take(&mut buffered))
+                            format!(
+                                "{}{}",
+                                prompt_texts[index],
+                                std::mem::take(&mut buffered[index])
+                            )
                         } else {
-                            std::mem::take(&mut buffered)
+                            std::mem::take(&mut buffered[index])
                         };
                         positions.push(CompletionPosition {
                             token: &logprob.token,
                             logprob: Some(&logprob),
                         });
-                        let logprobs = completion_logprobs_value(&positions, emitted_chars);
-                        emitted_chars += text.chars().count();
+                        let logprobs = completion_logprobs_value(&positions, emitted_chars[index]);
+                        emitted_chars[index] += text.chars().count();
                         yield Ok(sse_frame(&completion_chunk(
                             &id,
                             &model,
                             created,
+                            index,
                             &text,
                             None,
                             Some(logprobs),
@@ -1715,30 +2001,37 @@ fn completions_stream_response(
                     }
                 }
                 EngineEvent::ToolCallDelta { .. } => {}
-                EngineEvent::Finished { finish_reason, usage, stats } => {
-                    metrics.record_request(&usage, &stats.kv_cache);
+                EngineEvent::Finished {
+                    finish_reason,
+                    usage: part_usage,
+                    stats,
+                } => {
                     // The last text a logprobs request has (a token the engine did not logprob,
                     // or the echo prompt of an echo-without-generation stream) goes out once here.
                     if logprob_info.wants_sample() {
                         let mut positions = Vec::new();
-                        let mut text = std::mem::take(&mut buffered);
-                        if echo && !echo_sent {
-                            echo_sent = true;
-                            if let Some(prompt) = prompt.as_ref() {
+                        let mut text = std::mem::take(&mut buffered[index]);
+                        if echo && !echo_sent[index] {
+                            echo_sent[index] = true;
+                            if let Some(prompt) = prompt_logprobs[index].as_ref() {
                                 positions.extend(prompt_positions(prompt));
                             }
-                            text = format!("{prompt_text}{text}");
+                            text = format!("{}{text}", prompt_texts[index]);
                         }
                         if !text.is_empty() || !positions.is_empty() {
                             let logprobs = if positions.is_empty() {
                                 None
                             } else {
-                                Some(completion_logprobs_value(&positions, emitted_chars))
+                                Some(completion_logprobs_value(
+                                    &positions,
+                                    emitted_chars[index],
+                                ))
                             };
                             yield Ok(sse_frame(&completion_chunk(
                                 &id,
                                 &model,
                                 created,
+                                index,
                                 &text,
                                 None,
                                 logprobs,
@@ -1749,20 +2042,13 @@ fn completions_stream_response(
                         &id,
                         &model,
                         created,
+                        index,
                         "",
                         Some(finish_reason),
                         None,
                     )));
-                    if include_usage {
-                        yield Ok(sse_frame(&json!({
-                            "id": id,
-                            "object": "text_completion",
-                            "created": created,
-                            "model": model,
-                            "choices": [],
-                            "usage": usage,
-                        })));
-                    }
+                    add_usage(&mut usage, &part_usage);
+                    stats_parts.push(((*stats).clone(), part_usage));
                 }
                 EngineEvent::Error { message, code } => {
                     yield Ok(sse_frame(&json!({
@@ -1770,6 +2056,41 @@ fn completions_stream_response(
                     })));
                 }
             }
+        }
+        usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+        if !stats_parts.is_empty() {
+            let parts: Vec<(&DeepSeekSparkRequestStats, &OpenAiUsageWithCache)> = stats_parts
+                .iter()
+                .map(|(stats, part_usage)| (stats, part_usage))
+                .collect();
+            let stats = aggregate_stats_parts(&parts);
+            metrics.record_request(&usage, &stats.kv_cache);
+        }
+        if include_usage {
+            // vLLM emits one final usage chunk after every choice has finished, with the usage
+            // summed over the batch. A batched stream also carries the aggregate extension stats
+            // here; a single-prompt stream keeps the pre-task-40 usage-only chunk byte for byte.
+            let mut chunk = json!({
+                "id": id,
+                "object": "text_completion",
+                "created": created,
+                "model": model,
+                "choices": [],
+                "usage": usage,
+            });
+            if prompt_count > 1 && !stats_parts.is_empty() {
+                let parts: Vec<(&DeepSeekSparkRequestStats, &OpenAiUsageWithCache)> = stats_parts
+                    .iter()
+                    .map(|(stats, part_usage)| (stats, part_usage))
+                    .collect();
+                if let Some(map) = chunk.as_object_mut() {
+                    map.insert(
+                        "x_deepseek_spark_stats".to_owned(),
+                        json!(aggregate_stats_parts(&parts)),
+                    );
+                }
+            }
+            yield Ok(sse_frame(&chunk));
         }
         yield Ok(sse_done());
     };

@@ -1698,7 +1698,9 @@ mod tests {
                 .iter()
                 .find(|spec| spec.name == name)
                 .map(|spec| TensorSpec {
-                    dtype: DType::F32,
+                    // f32 for every tensor except the Engram wkv projection, whose checkpoint
+                    // storage format is the only way to recover the codes (audit F4).
+                    dtype: crate::tensor::checkpoint_storage_dtype(name).unwrap_or(DType::F32),
                     ..spec.clone()
                 })
                 .ok_or_else(|| WeightError::Missing {
@@ -1707,11 +1709,22 @@ mod tests {
         }
 
         fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
-            let elements = usize::try_from(self.spec(name)?.elements()).unwrap_or(usize::MAX);
+            let spec = self.spec(name)?;
+            let elements = usize::try_from(spec.elements()).unwrap_or(usize::MAX);
+            let value_at = |index: usize| 0.02 + 0.01 * (index % 5) as f32;
             let mut bytes = Vec::with_capacity(elements.saturating_mul(4));
-            for index in 0..elements {
-                let value = 0.02 + 0.01 * (index % 5) as f32;
-                bytes.extend_from_slice(&value.to_le_bytes());
+            match spec.dtype {
+                DType::F8E4M3 => {
+                    for index in 0..elements {
+                        bytes.push(crate::quant::e4m3_encode(value_at(index)));
+                    }
+                }
+                DType::F8E8M0 => bytes.resize(elements, 127u8),
+                _ => {
+                    for index in 0..elements {
+                        bytes.extend_from_slice(&value_at(index).to_le_bytes());
+                    }
+                }
             }
             Ok(bytes)
         }

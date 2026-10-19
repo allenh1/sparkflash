@@ -101,6 +101,8 @@ use sparkflash_engine::tensor::TensorSpec;
 use sparkflash_engine::weights::WeightError;
 use sparkflash_engine::weights::WeightSource;
 use sparkflash_kv::PrefixMatchPlan;
+use sparkflash_scheduler::config::SchedulerConfig;
+use sparkflash_scheduler::prefill::ChunkedPrefillPlan;
 
 /// The index file a sharded safetensors checkpoint is described by.
 const CHECKPOINT_INDEX_NAME: &str = "model.safetensors.index.json";
@@ -1319,6 +1321,38 @@ fn prompt_logprobs_pass(
     Ok((feed, PromptLogprobs { tokens, positions }))
 }
 
+/// Feeds one prompt to the engine in the plan's chunks, returning the last chunk's step output.
+///
+/// The invariant this path relies on is asserted in
+/// `crates/sparkflash-engine/tests/chunked_prefill.rs`: prefilling contiguous chunks on one
+/// [`SequenceState`] is bitwise identical to prefilling the whole prompt in one call. The host
+/// driver runs the chunks back to back - no decode between them, no second sequence - because the
+/// reference engine's shape is one sequence at a time; the scheduler's inter-chunk decode window is
+/// a device policy this pass does not claim.
+fn prefill_chunked(
+    engine: &InferenceEngine,
+    state: &mut SequenceState,
+    prompt: &[u32],
+    plan: &ChunkedPrefillPlan,
+) -> Result<StepOutput, String> {
+    debug_assert_eq!(plan.prompt_tokens(), prompt.len());
+    let mut last = None;
+    for range in plan.ranges() {
+        let chunk = prompt.get(range.clone()).ok_or_else(|| {
+            format!(
+                "chunk {range:?} lies outside the {} token prompt",
+                prompt.len()
+            )
+        })?;
+        last = Some(
+            engine
+                .prefill(state, chunk)
+                .map_err(|error| format!("prefill failed: {error}"))?,
+        );
+    }
+    last.ok_or_else(|| "the prompt is empty and has no prefill chunk".to_owned())
+}
+
 /// Runs one request and sends its events, ending with exactly one terminal reply.
 ///
 /// `Ok(())` means the terminal reply was sent. `Err(message)` means the request failed and the
@@ -1353,10 +1387,14 @@ fn run_request(
         )?;
         (step, Some(payload))
     } else {
+        // The chunked prefill policy: short prompts (any prompt under the smallest configured
+        // chunk, 4096 tokens) are one chunk and the call is the pre-task-40 whole-prompt prefill; a
+        // longer prompt is fed in policy chunks, which the host bits prove is the same function.
+        let plan =
+            ChunkedPrefillPlan::plan(job.prompt_tokens.len(), 0, &SchedulerConfig::default())
+                .map_err(|error| format!("the chunked prefill plan could not be built: {error}"))?;
         (
-            engine
-                .prefill(&mut state, &job.prompt_tokens)
-                .map_err(|error| format!("prefill failed: {error}"))?,
+            prefill_chunked(engine, &mut state, &job.prompt_tokens, &plan)?,
             None,
         )
     };
@@ -1836,6 +1874,66 @@ mod tests {
             without_measurements(&second),
             "the synthetic path is deterministic"
         );
+    }
+
+    /// The host driver's chunked prefill is the same function as one whole-prompt prefill: same
+    /// state, same logits bit for bit, same next token. task-40's invariant, on the engine the
+    /// serve path actually runs.
+    #[tokio::test]
+    async fn chunked_prefill_matches_unchunked_on_the_driver_engine() {
+        let config = ModelConfig::tiny();
+        let plan = TensorPlan::language_model(&config);
+        let engine = InferenceEngine::new(
+            config.clone(),
+            Box::new(SyntheticWeights::from_plan(&plan, SYNTHETIC_WEIGHT_SEED)),
+            REFERENCE_TENSOR_LIMIT,
+        )
+        .expect("the tiny engine builds");
+        // Long enough to cross the tiny window and to split unevenly at most chunk sizes.
+        let prompt: Vec<u32> = (1..=11).collect();
+        let whole = engine
+            .prefill(&mut SequenceState::new(&config), &prompt)
+            .expect("the whole-prompt prefill runs");
+        for chunk in [1usize, 2, 3, 4, 5, 8, 11] {
+            let plan =
+                ChunkedPrefillPlan::with_chunk_tokens(prompt.len(), 0, chunk, 0).expect("plan");
+            let mut state = SequenceState::new(&config);
+            let got =
+                prefill_chunked(&engine, &mut state, &prompt, &plan).expect("chunked prefill");
+            assert_eq!(
+                got.logits
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                whole
+                    .logits
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "logits differ at chunk size {chunk}"
+            );
+            assert_eq!(
+                got.head_input
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                whole
+                    .head_input
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "head input differs at chunk size {chunk}"
+            );
+            assert_eq!(
+                got.next_token, whole.next_token,
+                "next token at chunk size {chunk}"
+            );
+            assert_eq!(
+                state.tokens(),
+                prompt,
+                "the state must hold the whole prompt"
+            );
+        }
     }
 
     #[tokio::test]

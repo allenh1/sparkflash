@@ -34,6 +34,25 @@ use std::collections::BTreeMap;
 use crate::config::ModelConfig;
 use crate::dtype::{DType, dense_scale_shape, expert_scale_shape};
 
+/// The checkpoint's storage dtype for a tensor whose format cannot be recovered from f32.
+///
+/// The Engram `wkv` projection is fp8 codes plus a 32x32 E8M0 grid (`model.py:345`), and the
+/// native seam reads that format as bytes (audit F4): a source that served it as f32 would not be
+/// decodable back to the codes it came from. Sources that otherwise serve every tensor as f32 use
+/// this to mirror the checkpoint for the one tensor pair that requires it. Every other name is
+/// `None`: the plan's own dtype is then the source's choice, which is what a finite-FP32 test
+/// source relies on.
+#[must_use]
+pub fn checkpoint_storage_dtype(name: &str) -> Option<DType> {
+    if name.ends_with(".engram.wkv.weight") {
+        Some(DType::F8E4M3)
+    } else if name.ends_with(".engram.wkv.scale") {
+        Some(DType::F8E8M0)
+    } else {
+        None
+    }
+}
+
 /// One tensor's entry in the plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorSpec {

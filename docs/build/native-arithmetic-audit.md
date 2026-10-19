@@ -237,9 +237,9 @@ device path.
 
 | # | stage | native | chain | verdict | severity | evidence |
 |:--|:--|:--|:--|:--|:--|:--|
-| 35 | table lookup and dequantisation | fp8 row x ue8m0 block-32 scale, then **`.to(torch.bfloat16)`** (`model.py:312-322`) | host `read_table` dequantises into f32 with no bf16 cast (`engine/forward/engram.rs:476-487`) | `native, minus a round` | MEDIUM (F4) | SOURCE; unmeasured |
-| 36 | `wkv` | **fp8 W8A8** on the bf16 embed row (`model.py:345,184-195`) | host f32 matmul over fp8 weights dequantised to f32, **no activation quantisation** (`engram.rs:558-570,602-785`) | `native, minus a quant` | MEDIUM (F4) | SOURCE; unmeasured |
-| 37 | key/value/gate and the write | key/value/gate f32 from the bf16 `wkv` output; `(h + gate*value).to(x.dtype)` bf16 (`model.py:355-365`) | f32 gate and write, then bf16 when staged into the device mixer | `native` upstream + F4 | NONE + MEDIUM(F4) | SOURCE; ledger line "Engram seam: ... layers 1 and 14 ... declared host Engram seam" |
+| 35 | table lookup and dequantisation | fp8 row x ue8m0 block-32 scale, then **`.to(torch.bfloat16)`** (`model.py:312-322`) | host `read_table` / `read_paged_table` dequantise and cast to bf16 (`engram.rs:476-487,520-522`) | `native` (the cast is written and is exact for the format) | NONE (was MEDIUM F4) | PINNED (task-9): twin `the_row_dequant_is_the_f32_reference_rounded_to_bf16` moves 0 of 256 values on all eight captured rows; E4M3 x 2^k is bf16-exact |
+| 36 | `wkv` | **fp8 W8A8** on the bf16 embed row (`model.py:345,184-195`) | host `wkv_native` reads the raw fp8 codes and 32x32 E8M0 grid and applies the block scale to the block dot in the device kernel's reduction order (`engram.rs:591-660`) | `native` | NONE (was MEDIUM F4) | PINNED (task-9): kernels `engram_embed_sm121` / `engram_wkv_sm121` in `baseline/kernel_baseline.txt`; twins `the_wkv_block_dot_is_the_kernels_shuffle_tree`, `the_wkv_projection_is_the_released_w8a8_block_rule`; CI fixture moved 2.21e-5 |
+| 37 | key/value/gate and the write | key/value/gate f32 from the bf16 `wkv` output; `(h + gate*value).to(x.dtype)` bf16 (`model.py:355-365`) | gate over the bf16-rounded stream with bf16-exact key/value, one bf16 cast in `engram_write` (`engram.rs:749-780,806-830`) | `native` | NONE (was NONE + MEDIUM F4) | PINNED (task-9): `engram_gate_write_sm121` in the baseline; twin measures 5.883e-5 gate / 3.3e-3 relative write against the old f32 seam |
 
 ### 3.7 Tail
 
@@ -368,6 +368,43 @@ Engram term is an additive write to the residual stream on two of forty layers, 
 `value` also differs from native's bf16-rounded one. It is the largest *fully* f32 block left in the
 chain and it is a declared host seam, not a device stage. Unmeasured.
 
+**Status (task-9).** The host seam now implements the released rule op for op, and the three device
+kernels that will be the window's comparison are written and pinned host-side:
+
+* `kernels/engram_embed_sm121.cu` reads a 264-byte row (256 E4M3 codes, 8 E8M0 scales), dequantises
+  and casts to bf16, then applies the reference act_quant rule (block 32, ue8m0 scale, 1e-4 amax
+  floor, ceil-power-of-two scale, +-448 clamp, RNE).
+* `kernels/engram_wkv_sm121.cu` is the fp8 W8A8 projection over the checkpoint's raw `[out][in]`
+  codes and `[out/32][in/32]` grid: the 32-value code dot in the five-step `__shfl_down_sync` tree,
+  scaled per block and accumulated in ascending blocks, output bf16.
+* `kernels/engram_gate_write_sm121.cu` is the f32 gate over bf16 key/value/stream and one bf16 cast
+  of `h + gate * value`.
+
+All three are in `baseline/kernel_baseline.txt` (25376 / 8088 / 18744 bytes, 0 PTX membar lines,
+`V13.0.88`, `cuda_13.0.r13.0/compiler.36424714_0`), and
+`crates/sparkflash-kernels/src/engram_native_ref.rs` reproduces each op for op
+(`tests/engram_native_twin.rs`).
+
+The two "absent rounds" this section used to name are not equally weighted, and the twin measures
+which one carries F4:
+
+* the row's bf16 cast is **exact**: an E4M3 value has three mantissa bits and an E8M0 scale is a
+  power of two, so all 256 values of all eight captured rows are unchanged by it (0 moved);
+* the activation quantisation of a fetched row built from table values is also exact for the same
+  reason (a power-of-two scale keeps the four significant bits), so it is not the deviation either;
+* the discriminating rounds are the **bf16 wkv output** and the **bf16 write**. On a synthetic head
+  over the released rows the native rule moves the gate by 5.883e-5 and the write by 0.9295 on a
+  285.3 magnitude (3.3e-3 relative) - the bf16 output round is what the gate sees.
+
+The CI fixture regenerates on this tree (task-9 alone, from 304ff7c): sha256
+`17030896f4cb5b35266bf97003918489e0551010835b817438a143360d678780`, 0/9 tokens changed, max
+|logit delta| 2.2097999999998175e-05. The boundary measurement does not move: layer 0 has no Engram
+write, so `docs/build/phase1-boundary-table.md` section 6 keeps task-10's numbers.
+
+Open, and stated rather than claimed: the numeric device-vs-twin comparison is a window measurement
+(no GPU run was made; the nodes are frozen by the operator), and the on-disk read path has not yet
+been compared with the released vLLM Engram patch (that comparison needs `docker exec` on a node).
+
 Isolation: the Engram fixture stage (`engram_golden.json`) already exists; extend it to compare the
 chain's `value` and `gate` against the released forward's tensors for the two layers.
 
@@ -411,10 +448,14 @@ test that fails without it:
   live in `moe_device.rs` and the entry kernel, which task-4/5 own this cycle. Reported, not
   edited here.
 
-The host reference fixture is regenerated once, on the branch that carries both host-side changes
+The host reference fixture was regenerated on the branch that carries both host-side changes
 (task-10 F5 and task-7 F2): sha256 `c9aa2cd5bb093c579cdfcb4fcc9f8f100ea22789d9841600830b0f020ae7927d`, 0/9 tokens
 changed, max |logit delta| 1.4999999999043556e-8 against the base 4bf96e9 fixture and
-5.000000000837668e-9 against the task-10-only fixture that this branch supersedes. The pinned
+5.000000000837668e-9 against the task-10-only fixture that this branch supersedes. Task-9's native
+Engram seam regenerates it once more, from that file: sha256
+`17030896f4cb5b35266bf97003918489e0551010835b817438a143360d678780`, 0/9 tokens changed, max
+|logit delta| 2.2097999999998175e-05 - the bf16 output round of the Engram projection on layers 1
+and 14, which is the measured size of F4. The pinned
 boundary measurement in docs/build/phase1-boundary-table.md section 6 moves with it (87
 differing values in five tensors, was 161 in six) and was re-checked on the stacked tree.
 Regenerating a fixture by copying either base's file is not valid: only a run on the tree that

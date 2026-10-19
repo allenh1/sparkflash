@@ -378,7 +378,10 @@ impl WeightSource for FiniteFp32Weights {
     fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
         match self.specs.iter().find(|spec| spec.name == name) {
             Some(spec) => Ok(TensorSpec {
-                dtype: DType::F32,
+                // The finite source serves f32 - that is its whole point - except where the
+                // checkpoint's storage format is the only way to recover the value (the Engram
+                // wkv projection, audit F4).
+                dtype: crate::tensor::checkpoint_storage_dtype(name).unwrap_or(DType::F32),
                 ..spec.clone()
             }),
             None => Err(WeightError::Missing {
@@ -388,18 +391,35 @@ impl WeightSource for FiniteFp32Weights {
     }
 
     fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
-        let elements = usize::try_from(self.spec(name)?.elements()).expect("a test tensor fits");
+        let spec = self.spec(name)?;
+        let elements = usize::try_from(spec.elements()).expect("a test tensor fits");
         let salt = name.bytes().fold(0u64, |acc, byte| {
             acc.wrapping_mul(31).wrapping_add(u64::from(byte))
         });
-        let mut bytes = Vec::with_capacity(elements * 4);
-        for index in 0..elements {
+        let value_at = |index: usize| {
             let mixed = (index as u64)
                 .wrapping_add(salt)
                 .wrapping_add(self.seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
             let hashed = (mixed ^ (mixed >> 13)).wrapping_mul(0x2545_f491_4f6c_dd1d);
-            let value = 0.01 + 0.000_1 * (hashed >> 56) as f32;
-            bytes.extend_from_slice(&value.to_le_bytes());
+            0.01 + 0.000_1 * (hashed >> 56) as f32
+        };
+        let mut bytes = Vec::with_capacity(elements * 4);
+        match spec.dtype {
+            DType::F8E4M3 => {
+                bytes.reserve(elements);
+                for index in 0..elements {
+                    bytes.push(crate::quant::e4m3_encode(value_at(index)));
+                }
+            }
+            DType::F8E8M0 => {
+                // The same scale everywhere: 2^0, so the fixture's weight is its code.
+                bytes.resize(elements, 127u8);
+            }
+            _ => {
+                for index in 0..elements {
+                    bytes.extend_from_slice(&value_at(index).to_le_bytes());
+                }
+            }
         }
         Ok(bytes)
     }
