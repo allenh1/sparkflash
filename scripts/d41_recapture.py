@@ -17,8 +17,12 @@ untrustworthy capture is worse than no capture, so this script proves idleness f
   is not, the run refuses BEFORE the block's first completion; it never mixes classes silently.
 * The pre-block snapshot is taken twice (settle poll, then a confirmation snapshot right before the
   first request). If the two disagree the run refuses before any completion.
-* A metrics snapshot is taken after every completion. Requests other than ours tag the block
-  "busy": it is recorded as class "busy_distractor", never silently mixed with the idle classes.
+* A metrics snapshot is taken after every idle-class completion. A busy block is sampled by a
+  concurrent /metrics thread while its probe requests are in flight (a snapshot after the response
+  can only see the background generation). A block is tagged "busy" only when that evidence exists
+  (running > 1 or waiting > 0 in a during snapshot); otherwise the run refuses rather than writing
+  a busy class the floor script would reject. A busy block is recorded as class "busy_distractor",
+  never silently mixed with the idle classes.
 * A request failure aborts the run: no partial block is written as complete, and --out is written
   only after the whole capture succeeds (written to a temporary file, then renamed).
 
@@ -30,7 +34,9 @@ The plan file (schema "sparkflash-d41-capture-plan/1") lists blocks and their re
 * "idle_distractor": pairs of bodies that differ by prompt_len at a close-margin position; the pair
   envelope is the floor.
 * "busy_distractor": an optional "background" request (one long generation in a thread) makes the
-  probe requests run under a controlled co-tenant load; metrics_during must show running >= 2.
+  probe requests run under a controlled co-tenant load. A concurrent /metrics sampler records
+  running >= 2 while a probe is in flight (an after-response snapshot cannot see it); without
+  that evidence the capture refuses instead of writing a busy class the floor script would reject.
 
 The output is schema "sparkflash-d41-capture/1", exactly the input of scripts/d41_floors.py
 (task-41, serve-dev). Token ids are never compared as evidence (D39) and determinism across runs is
@@ -63,6 +69,9 @@ DEFAULT_REQUEST_TIMEOUT = 900.0
 DEFAULT_SETTLE_SECONDS = 8.0
 DEFAULT_SETTLE_POLL = 0.25
 BACKGROUND_START_WAIT = 30.0
+#: How often the busy-block sampler reads /metrics while the probe requests are in flight. It sends
+#: no inference requests; a few-ms interval is small enough to catch a short probe window.
+DEFAULT_SAMPLE_INTERVAL = 0.005
 
 CAPTURE_SCHEMA = "sparkflash-d41-capture/1"
 PLAN_SCHEMA = "sparkflash-d41-capture-plan/1"
@@ -103,13 +112,16 @@ def load_json(path: str) -> dict:
         raise RecaptureError(f"{path} is not JSON: {error}") from error
 
 
-def write_atomic(path: str, payload: dict) -> None:
+def write_atomic(path: str, payload: dict, compact: bool = False) -> None:
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
     handle, temporary = tempfile.mkstemp(prefix=".d41-capture-", suffix=".json", dir=directory)
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, indent=1)
+            if compact:
+                json.dump(payload, stream, separators=(",", ":"))
+            else:
+                json.dump(payload, stream, indent=1)
             stream.write("\n")
         os.replace(temporary, path)
     except BaseException:
@@ -436,6 +448,52 @@ class Snapshotter:
         return confirmation
 
 
+class MetricsSampler:
+    """Read /metrics concurrently while the busy block's probes are in flight.
+
+    A busy block needs a co-tenancy snapshot (running > 1 or waiting > 0) taken while a probe is
+    actually running. Snapshotting after the response cannot show that, because the probe has
+    already finished. One daemon thread reads /metrics at a few-ms interval during the probe
+    sequence; it never sends a completion request, so it adds no inference load.
+    """
+
+    def __init__(self, snapshotter, interval: float):
+        self.snapshotter = snapshotter
+        self.interval = max(0.0, float(interval))
+        self.samples: list[dict] = []
+        self.error: str | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="d41-metrics-sampler", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                sample = self.snapshotter.snapshot()
+            except RecaptureError as error:
+                with self._lock:
+                    self.error = str(error)
+                return
+            with self._lock:
+                self.samples.append(sample)
+            self._stop.wait(self.interval)
+
+    def stop(self) -> list[dict]:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        with self._lock:
+            samples = list(self.samples)
+            error = self.error
+        if error is not None:
+            raise RecaptureError(f"metrics sampler failed during the busy block: {error}")
+        return samples
+
+
 def block_prompt_len(records: list[dict]) -> int | None:
     """int when every record shares one prompt_len, null when they differ (frozen schema)."""
     lengths = [record["prompt_len"] for record in records]
@@ -532,47 +590,58 @@ def capture_block(transport, snapshotter, block, recipe, model, opts, log) -> di
     records: list[dict] = []
     metrics_during: list[dict] = []
     busy_reason: str | None = None
-    for request_id in block["_ids"]:
-        prompt = block["_prompts"][request_id]
-        payload = build_request(recipe, prompt, model)
-        raw_request = json.dumps(payload).encode("utf-8")
-        started_request = opts.clock()
-        raw, response = transport.post_json("/v1/completions", payload)
-        wall = round(opts.clock() - started_request, 3)
-        choices = response.get("choices") if isinstance(response, dict) else None
-        if not choices:
-            raise RecaptureError(f"block {block_id} request {request_id}: response has no choices")
-        choice = choices[0]
-        if "prompt_logprobs" not in choice:
-            raise RecaptureError(
-                f"block {block_id} request {request_id}: response has no prompt_logprobs "
-                "(is --max-logprobs 1000 set on the server?)"
-            )
-        record = {
-            "id": request_id,
-            "prompt_len": len(prompt),
-            "batch_size": 1,
-            "prompt_sha256": sha256_bytes(json.dumps(prompt).encode("utf-8")),
-            "request_sha256": sha256_bytes(raw_request),
-            "response_sha256": sha256_bytes(raw),
-            "wall_s": wall,
-            "repeat_of": None,
-            "positions": parse_positions(choice["prompt_logprobs"], prompt),
-        }
-        records.append(record)
-        if block_class == "busy_distractor":
-            during = snapshotter.snapshot()
-            metrics_during.append(during)
-        else:
-            during, idle = snapshotter.poll_idle(
-                opts.settle_seconds, opts.settle_poll, opts.clock, opts.pause
-            )
-            metrics_during.append(during)
-            if not idle:
-                busy_reason = busy_reason or (
-                    f"traffic during block: running={during['num_requests_running']} "
-                    f"waiting={during['num_requests_waiting']}"
+    sampler = None
+    if block_class == "busy_distractor":
+        sampler = MetricsSampler(
+            snapshotter, float(getattr(opts, "sample_interval", DEFAULT_SAMPLE_INTERVAL))
+        )
+        sampler.start()
+    try:
+        for request_id in block["_ids"]:
+            prompt = block["_prompts"][request_id]
+            payload = build_request(recipe, prompt, model)
+            raw_request = json.dumps(payload).encode("utf-8")
+            started_request = opts.clock()
+            raw, response = transport.post_json("/v1/completions", payload)
+            wall = round(opts.clock() - started_request, 3)
+            choices = response.get("choices") if isinstance(response, dict) else None
+            if not choices:
+                raise RecaptureError(f"block {block_id} request {request_id}: response has no choices")
+            choice = choices[0]
+            if "prompt_logprobs" not in choice:
+                raise RecaptureError(
+                    f"block {block_id} request {request_id}: response has no prompt_logprobs "
+                    "(is --max-logprobs 1000 set on the server?)"
                 )
+            record = {
+                "id": request_id,
+                "prompt_len": len(prompt),
+                "batch_size": 1,
+                "prompt_sha256": sha256_bytes(json.dumps(prompt).encode("utf-8")),
+                "request_sha256": sha256_bytes(raw_request),
+                "response_sha256": sha256_bytes(raw),
+                "wall_s": wall,
+                "repeat_of": None,
+                "positions": parse_positions(choice["prompt_logprobs"], prompt),
+            }
+            records.append(record)
+            if block_class == "busy_distractor":
+                # Kept as provenance only; the sampler thread is what can see a probe in flight.
+                during = snapshotter.snapshot()
+                metrics_during.append(during)
+            else:
+                during, idle = snapshotter.poll_idle(
+                    opts.settle_seconds, opts.settle_poll, opts.clock, opts.pause
+                )
+                metrics_during.append(during)
+                if not idle:
+                    busy_reason = busy_reason or (
+                        f"traffic during block: running={during['num_requests_running']} "
+                        f"waiting={during['num_requests_waiting']}"
+                    )
+    finally:
+        if sampler is not None:
+            metrics_during = sampler.stop() + metrics_during
     load_generator = None
     if background_state is not None:
         load_generator = finish_background(background_state, opts, log)
@@ -580,17 +649,7 @@ def capture_block(transport, snapshotter, block, recipe, model, opts, log) -> di
         metrics_after, _ = snapshotter.poll_idle(
             opts.settle_seconds, opts.settle_poll, opts.clock, opts.pause
         )
-        if not any(
-            snapshot["num_requests_running"] > 1 or snapshot["num_requests_waiting"] > 0
-            for snapshot in metrics_during
-        ):
-            raise RecaptureError(
-                f"block {block_id}: no co-tenancy evidence (no metrics_during snapshot with "
-                "running>1 or waiting>0); refusing to write a busy class without load evidence"
-            )
         verdict = "busy"
-        observed_other_traffic = True
-        class_effective = "busy_distractor"
     else:
         metrics_after, idle_after = snapshotter.poll_idle(
             opts.settle_seconds, opts.settle_poll, opts.clock, opts.pause
@@ -601,8 +660,25 @@ def capture_block(transport, snapshotter, block, recipe, model, opts, log) -> di
                 f"waiting={metrics_after['num_requests_waiting']}"
             )
         verdict = "busy" if busy_reason else "idle"
-        observed_other_traffic = bool(busy_reason)
-        class_effective = block_class if verdict == "idle" else "busy_distractor"
+    class_effective = block_class if verdict == "idle" else "busy_distractor"
+    observed_other_traffic = verdict == "busy"
+    if class_effective == "busy_distractor":
+        evidence = [
+            snapshot
+            for snapshot in metrics_during
+            if snapshot["num_requests_running"] > 1 or snapshot["num_requests_waiting"] > 0
+        ]
+        if not evidence:
+            best = max((snapshot["num_requests_running"] for snapshot in metrics_during), default=0)
+            raise RecaptureError(
+                f"block {block_id}: no co-tenancy evidence while a probe was in flight (no "
+                f"/metrics snapshot with running>1 or waiting>0; best during running={best}); "
+                "refusing to write a busy class the floor script would reject"
+            )
+        log(
+            f"block {block_id}: co-tenancy evidence running="
+            f"{max(snapshot['num_requests_running'] for snapshot in evidence)}"
+        )
     idleness = {
         "metrics_source": "/metrics",
         "metrics_before": {
@@ -776,10 +852,15 @@ def run_cli(argv: list[str] | None, transport_factory) -> int:
     parser.add_argument("--settle-poll", type=float, default=DEFAULT_SETTLE_POLL)
     parser.add_argument("--background-start-wait", type=float, default=BACKGROUND_START_WAIT,
                         help="how long a busy block waits for its background generation to show in /metrics")
+    parser.add_argument("--sample-interval", type=float, default=DEFAULT_SAMPLE_INTERVAL,
+                        help="busy-block /metrics sampling interval while probes are in flight "
+                             "(sends no inference requests; default 5 ms)")
     parser.add_argument("--running-metric", default=DEFAULT_RUNNING_METRIC)
     parser.add_argument("--waiting-metric", default=DEFAULT_WAITING_METRIC)
     parser.add_argument("--capture-id", default="")
     parser.add_argument("--tag", default="")
+    parser.add_argument("--compact", action="store_true",
+                        help="write the capture as compact JSON (a full-cap capture is tens of MB)")
     parser.add_argument("--dry-run", action="store_true", help="validate the plan; no network")
     args = parser.parse_args(argv)
     if args.expect_root == "":
@@ -811,7 +892,7 @@ def run_cli(argv: list[str] | None, transport_factory) -> int:
             stream.write("\n".join(lines) + "\n")
         print(json.dumps(result["blocks"], indent=1))
         return 0
-    write_atomic(args.out, result)
+    write_atomic(args.out, result, compact=args.compact)
     with open(log_path, "w", encoding="utf-8") as stream:
         stream.write("\n".join(lines) + "\n")
     print(f"wrote {args.out} (status={result['status']}, blocks={len(result['blocks'])})")

@@ -25,6 +25,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+use sparkflash_comm::oneshot::loopback::{HostTwinReport, run_host_twin, run_host_twin_prefill};
 use sparkflash_comm::oneshot::{
     ChunkPlan, Dispatch, DispatchAddresses, DispatchLog, DispatchRecord, Exchange, LaunchPath,
     ONESHOT_ARRIVAL_BYTES, ONESHOT_KERNEL_NAME, ONESHOT_RAILS, ONESHOT_RANKS, ONESHOT_ROW_BYTES,
@@ -47,6 +48,17 @@ pub const DEFAULT_COMM_PORT: u16 = 29601;
 
 /// The default repeat count for the canonical-reduce check.
 pub const DEFAULT_REPEATS: usize = 100;
+
+/// Sequences the loopback host twin runs for the preflight evidence: enough to cycle the ring
+/// several times and still finish quickly on one host.
+pub const HOST_TWIN_SEQUENCES: usize = 8;
+
+/// Upper bound on the payload a chunked host-twin run will allocate. The chunked contract is about
+/// the plan's shape - more than one row, split on row boundaries, one dispatch per chunk - so the
+/// evidence run clamps a large requested plan to two chunks instead of materialising a 4096-token
+/// payload four times on one host. The CPU twin reduces every element in software, so the clamp
+/// also keeps the preflight cheap; the ring shape itself is proven by the comm tests.
+pub const HOST_TWIN_CHUNKED_MAX_ELEMENTS: usize = ONESHOT_ROW_ELEMENTS + 1024;
 
 /// The default frame deadline: 5 s, the TCP transport's own default.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1265,12 +1277,147 @@ fn validate_oneshot_preflight(args: &SmokeArgs) -> Result<(), String> {
             .accept(seq)
             .map_err(|error| format!("the one-shot sequence is illegal: {error}"))?;
     }
+    validate_host_twin(args)?;
+    Ok(())
+}
+
+/// Runs the loopback host twin and requires the proofs the device path must keep.
+///
+/// This is the preflight's executable part: the seam descriptors above are checked by arithmetic,
+/// and the twin below runs the same protocol end to end in process memory. A divergence here is a
+/// contract failure, not a hardware result.
+fn validate_host_twin(args: &SmokeArgs) -> Result<(), String> {
+    let elements = args.synthetic_elements();
+    let report = run_host_twin(elements, HOST_TWIN_SEQUENCES, ONESHOT_RAILS)
+        .map_err(|error| format!("the loopback host twin failed: {error}"))?;
+    check_host_twin(&report, "one-shot")?;
+    if let Some(planned) = args.prefill_plan_elements {
+        let total = planned.min(HOST_TWIN_CHUNKED_MAX_ELEMENTS);
+        if total > ONESHOT_ROW_ELEMENTS {
+            let report = run_host_twin_prefill(total, ONESHOT_RAILS)
+                .map_err(|error| format!("the chunked loopback host twin failed: {error}"))?;
+            check_host_twin(&report, "chunked")?;
+        }
+    }
+    Ok(())
+}
+
+/// The invariants a host-twin run must satisfy: canonical arithmetic, zero host staging, the
+/// device path on every record, and one dispatch per rank per step.
+fn check_host_twin(report: &HostTwinReport, form: &str) -> Result<(), String> {
+    if !report.bit_identical {
+        return Err(format!(
+            "the {form} host twin diverged from the canonical one-rounding CPU twin"
+        ));
+    }
+    if report.host_copy_bytes != 0 {
+        return Err(format!(
+            "the {form} host twin recorded {} host-staging bytes; the device path must stage nothing",
+            report.host_copy_bytes
+        ));
+    }
+    if !report.device_path_only {
+        return Err(format!(
+            "the {form} host twin recorded a non-device dispatch"
+        ));
+    }
+    let expected = ONESHOT_RANKS * report.steps;
+    if report.dispatched != expected {
+        return Err(format!(
+            "the {form} host twin recorded {} dispatches, expected {expected}",
+            report.dispatched
+        ));
+    }
     Ok(())
 }
 
 /// The one-shot ABI is pinned in two crates: sparkflash-comm's seam contract and sparkflash-kernels'
 /// roce_abi constants, each mirrored from the CUDA header. The CLI depends on both, so this is the
 /// one place the two pins are compared; a drift in either fails here and in that crate's own tests.
+/// The loopback host twin's evidence: what the device-buffer path proved on this host, and the
+/// node measurements it explicitly did not make.
+///
+/// The twin runs the real protocol in process memory: four rank threads, the pinned slot ring, the
+/// doorbell/arrival handshake, the one-rounding reduction and a dispatch record per call. It uses
+/// no device memory, no memory region, no queue pair and no kernel, so nothing here is a hardware
+/// number; the unclaimed list is part of the section so a reader cannot mistake it for one.
+fn host_twin_section(args: &SmokeArgs) -> Value {
+    let elements = args.synthetic_elements();
+    let oneshot = match run_host_twin(elements, HOST_TWIN_SEQUENCES, ONESHOT_RAILS) {
+        Ok(report) => json!({
+            "ran": true,
+            "transport": "loopback device transport, in process",
+            "mode": report.mode,
+            "sequences": report.steps,
+            "elements": report.elements,
+            "bytes": report.bytes,
+            "rails": report.rails,
+            "slot_ring": report.slot_ring,
+            "slot_indices": report.slot_indices,
+            "dispatches": report.dispatched,
+            "host_copy_bytes": report.host_copy_bytes,
+            "bit_identical_to_canonical_twin": report.bit_identical,
+            "device_path_only": report.device_path_only,
+            "posted_rail0_bytes": report.posted.rail0_bytes,
+            "posted_rail1_bytes": report.posted.rail1_bytes,
+            "host_elapsed_ms": u64::try_from(report.elapsed.as_millis()).unwrap_or(u64::MAX),
+            "unclaimed_node_measurements": report.unclaimed,
+        }),
+        Err(error) => json!({ "ran": false, "error": error.to_string() }),
+    };
+    let chunked = match args.prefill_plan_elements {
+        Some(planned) => {
+            let total = planned.min(HOST_TWIN_CHUNKED_MAX_ELEMENTS);
+            if total <= ONESHOT_ROW_ELEMENTS {
+                json!({
+                    "ran": false,
+                    "planned_elements": planned,
+                    "note": "the planned payload fits one row, so it is not a chunked plan",
+                })
+            } else {
+                match run_host_twin_prefill(total, ONESHOT_RAILS) {
+                    Ok(report) => json!({
+                        "ran": true,
+                        "planned_elements": planned,
+                        "elements": report.elements,
+                        "clamped_for_host_run": planned > HOST_TWIN_CHUNKED_MAX_ELEMENTS,
+                        "chunks": report.steps,
+                        "slot_ring": report.slot_ring,
+                        "slot_indices": report.slot_indices,
+                        "dispatches": report.dispatched,
+                        "host_copy_bytes": report.host_copy_bytes,
+                        "bit_identical_to_canonical_twin": report.bit_identical,
+                        "device_path_only": report.device_path_only,
+                        "host_elapsed_ms": u64::try_from(report.elapsed.as_millis()).unwrap_or(u64::MAX),
+                    }),
+                    Err(error) => json!({ "ran": false, "error": error.to_string() }),
+                }
+            }
+        }
+        None => json!({
+            "ran": false,
+            "note": "pass --prefill-plan-elements with --oneshot-preflight to run the chunked twin",
+        }),
+    };
+    json!({
+        "ran": oneshot["ran"].as_bool().unwrap_or(false),
+        "oneshot": oneshot,
+        "chunked": chunked,
+        "does_not_prove": [
+            "that the CUDA kernel, the device-memory MR, the queue pairs or the launcher exist",
+            "any latency, bandwidth, correctness-across-the-mesh or determinism number",
+        ],
+        "unclaimed_node_measurements": [
+            "one-shot all-reduce p50 latency at 10 KiB against the 20 us gate",
+            "per-rail bandwidth on the live 200 Gb/s rails",
+            "correctness across the four-node mesh through the real kernel, MR and QP path",
+            "10,000-replay determinism and two-run byte identity on the nodes",
+            "device-side DtoH/HtoD absence, which a host allocation cannot demonstrate",
+        ],
+        "note": "in-process loopback behind the existing device-buffer seam; cite no hardware number from this section",
+    })
+}
+
 fn oneshot_abi_parity() -> Result<(), String> {
     use sparkflash_kernels::roce_abi;
     let pairs: [(&str, usize, usize); 6] = [
@@ -1359,6 +1506,7 @@ fn oneshot_section(args: &SmokeArgs) -> Value {
         },
         "sequence": { "first": 0, "last": args.repeats.saturating_sub(1) as u64, "repeats": args.repeats },
         "chunked": chunked_section(args),
+        "host_twin": host_twin_section(args),
         "device_buffer_form": "refused by every host transport (CommError::Unsupported); only a device path with the kernel launcher implements it",
         "proves_host_only": [
             "the comm and kernels ABI pins agree on the slot",
@@ -1366,13 +1514,17 @@ fn oneshot_section(args: &SmokeArgs) -> Value {
             "the slot descriptor and dispatch are legal",
             "the sequence counter is strictly increasing over the requested repeats",
             "the receive-side proxy publishes an arrival exactly once, only after every rail",
-            "the reduction the device path must produce equals the canonical one-rounding twin bit for bit (tests/device_seam.rs)"
+            "the reduction the device path must produce equals the canonical one-rounding twin bit for bit (tests/device_seam.rs)",
+            "the loopback device transport runs four-rank one-shot exchanges behind the same seam and matches the canonical twin bit for bit, in either arrival order (tests/oneshot_host.rs)",
+            "every dispatch record takes the device path and records zero host-staging bytes",
+            "the two-deep slot ring and the chunked reuse order are pinned by the host twin, not assumed"
         ],
         "does_not_prove": [
             "that the CUDA kernel runs or that the slot is reachable from it",
             "that the pinned-host alias or the device-memory MR registers",
             "that the QP posting and the proxy's completions agree with the NIC",
-            "any latency, bandwidth or determinism number"
+            "any latency, bandwidth or determinism number",
+            "that any number in the host_twin section is a node measurement"
         ],
         "window_measurement": {
             "gate": "S5.3 one-shot device-buffer all-reduce at decode size (QUALIFICATION 3.1)",
@@ -2201,6 +2353,32 @@ mod tests {
         assert_eq!(section["chunked"]["chunk_bytes"], ONESHOT_ROW_BYTES);
         assert_eq!(section["chunked"]["posted_bytes"], 3 * 41_943_040);
         assert_eq!(section["chunked"]["window_measurement"]["chunks"], 20);
+        assert_eq!(section["host_twin"]["ran"], true);
+        assert_eq!(
+            section["host_twin"]["oneshot"]["bit_identical_to_canonical_twin"],
+            true
+        );
+        assert_eq!(section["host_twin"]["oneshot"]["host_copy_bytes"], 0);
+        assert_eq!(section["host_twin"]["oneshot"]["slot_ring"], 2);
+        assert_eq!(
+            section["host_twin"]["oneshot"]["dispatches"],
+            4 * HOST_TWIN_SEQUENCES
+        );
+        assert_eq!(section["host_twin"]["chunked"]["ran"], true);
+        assert_eq!(section["host_twin"]["chunked"]["host_copy_bytes"], 0);
+        assert_eq!(
+            section["host_twin"]["chunked"]["bit_identical_to_canonical_twin"],
+            true
+        );
+        assert!(
+            section["host_twin"]["unclaimed_node_measurements"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+        assert_eq!(
+            section["host_twin"]["does_not_prove"][0],
+            "that the CUDA kernel, the device-memory MR, the queue pairs or the launcher exist"
+        );
     }
 
     #[test]

@@ -294,8 +294,12 @@ class MissingClassTest(FloorTestCase):
         capture = self.write_capture(
             make_capture([repeat_block(), distractor_block("idle", "idle_distractor")])
         )
-        code, stderr, _, _, _ = self.run_main(capture, require_classes="repeat,idle_distractor")
+        code, stderr, out_json, _, _ = self.run_main(capture, require_classes="repeat,idle_distractor")
         self.assertEqual(code, 0, stderr)
+        with open(out_json, encoding="utf-8") as handle:
+            report = json.load(handle)
+        self.assertEqual(report["parameters"]["required_classes"], ["repeat", "idle_distractor"])
+        self.assertEqual(report["classes"]["busy_distractor"], {"present": False})
 
     def test_unknown_required_class_is_refused(self):
         capture = self.write_capture(standard_capture())

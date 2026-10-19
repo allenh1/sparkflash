@@ -22,6 +22,8 @@
 //! (arrival words first, then four 2 MiB rows, 8-byte aligned). A drift in either place fails a
 //! test in that place; neither can move alone.
 
+pub mod loopback;
+
 use std::fmt;
 
 /// Rank count of the one-shot kernel's slot: the CUDA header fixes it at four.

@@ -659,6 +659,18 @@ log-only path), carrying the slot and row device addresses and a `host_copy_byte
 sequence. `--oneshot-preflight` exercises the record shape and that refusal on the host, and the
 evidence section states `emitted: false` until the window's launcher fills it.
 
+*Loopback host twin (2026-10-19, task-35 host portion; the node run stays frozen).* The
+device-buffer path now runs end to end on a host with no GPU and no NIC:
+`sparkflash_comm::oneshot::loopback::LoopbackDeviceTransport` implements the device form behind the
+same seam, with a two-deep slot ring per rank, the doorbell/arrival handshake, a CPU twin of the
+kernel's one-rounding reduction (`kernel_reduce_into`), a dispatch record with zero host-staging
+bytes on every call, and a chunked pipeline whose ring reuse waits for every rank's read-done epoch.
+`crates/sparkflash-comm/tests/oneshot_host.rs` proves bit-identity against the canonical twin,
+arrival-order independence, the one-rounding-versus-four-rounding distinction, the ring shape, and
+the refusal of the host-slice forms; `--oneshot-preflight` records a `host_twin` evidence section
+whose unclaimed list names latency, bandwidth and four-node mesh correctness. None of it is a node
+measurement, and 11.1's transport decision is untouched.
+
 *Window-prep note (2026-10-19): the aarch64 release binary for the S5.3 window must be built with
 `--features=rdma,cuda` **and** `SPARKFLASH_RDMA_INCLUDE=<staged aarch64 rdma-core include root>`,
 because the zig cross sysroot has no `infiniband/verbs.h`; without it the build silently takes the
@@ -686,7 +698,7 @@ The host test `four_ranks_chain_three_chunks_through_one_slot_and_match_the_cano
 (`crates/sparkflash-comm/tests/device_seam.rs`) runs four rank threads over a three-row payload
 through one slot and checks every chunk bit for bit against `canonical_all_reduce_into`; the unit
 tests refuse a future chunk's frame and refuse sizes that are not whole bf16 elements or row splits.
-**What is still a window measurement and is not claimed here**: per-chunk and total chunked latency
+The loopback host twin (15.6 of rdma-backend.md) also runs this chunked plan through the two-slot ring and matches the canonical twin chunk for chunk with zero recorded host-staging bytes, so the reuse order is exercised on the host, not only designed. **What is still a window measurement and is not claimed here**: per-chunk and total chunked latency
 against the single-seam path, bit-identity to the canonical twin for every chunk and every repeat
 twice per configuration, zero DtoH/HtoD between chunks, and the kernel trace showing no lost or
 stale doorbell when the arrival words are reused across chunks. It needs S5.3's device-path gate

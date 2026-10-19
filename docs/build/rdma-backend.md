@@ -615,9 +615,11 @@ Window (needs Lead orchestration and all four nodes; no number may be quoted bef
   four rank threads over shared memory for 100 sequences - arrival order shuffled, rails reversed per
   peer - and requires bit-identical agreement with `canonical_all_reduce_into`. Of the 15.4 test
   plan, items 1-3 are host-covered and item 4 is the feature-off refusal section 10 already asserts;
-  items 5-7 need the window. Of 15.3, item 6 is unchanged and item 2 is still the next piece; items 1
-  (host allocation plus device alias), 3 (the proxy threaded to real QPs), 4 (kernel launch plumbing)
-  and 5 (the deliberate ABI-text correction) remain. No hardware result exists, so none may be cited.
+  items 5-7 need the window. A loopback host twin now runs the same device path in process memory
+  (15.6); that is still not the wiring, so of 15.3 item 6 is unchanged and item 2 is still the next
+  piece; items 1 (host allocation plus device alias), 3 (the proxy threaded to real QPs), 4 (kernel
+  launch plumbing) and 5 (the deliberate ABI-text correction) remain. No hardware result exists, so
+  none may be cited.
 - **Pinned-host MR is unverified.** Preference (a) uses pinned host memory; whether `ibv_reg_mr`
   over such a mapping works on these nodes is as unverified as the rest of the hardware path
   (section 10: no hardware run, ever). Preference (b)'s device-memory MR via `ibv_reg_dmabuf_mr` is
@@ -633,3 +635,43 @@ Window (needs Lead orchestration and all four nodes; no number may be quoted bef
   window's question, not this document's answer.
 - **The kernel's 2 MiB row cap is unchanged**, so prefill payloads above it still route to the NCCL
   ring; this seam touches only the one-shot class (roadmap section 7.2).
+
+### 15.6 The loopback host twin behind the device seam (task-35 host portion, 2026-10-19)
+
+The device-buffer path can now be exercised end to end on a host with no GPU and no NIC, behind the
+same seam. `crates/sparkflash-comm/src/oneshot/loopback.rs` implements
+`Transport::all_reduce_bf16_device` for real: a four-rank `LoopbackDeviceCluster` owns one pinned
+slot ring per rank (the pinned 8,388,640 B geometry, two slots by default), each rank stages its row,
+rings the doorbell, the receive-side proxy publishes a peer's arrival only after every rail of every
+peer has landed, and the rank then reduces the four slot rows into the output allocation. The
+host-slice forms are refused (`CommError::Unsupported`), exactly as a device transport must refuse
+them, so no caller can silently believe it ran a copy-elided collective.
+
+The twin pins the two properties a window run must not renegotiate:
+
+- **Arithmetic.** `kernel_reduce_into` is the CUDA kernel's arithmetic written as a CPU twin: the
+  accumulator starts at 0.0f and adds ranks 0, 1, 2, 3 in ascending order in f32, rounded to bf16
+  exactly once with round-to-nearest-even. A crafted payload (rank 0 at 1.0, the others at
+  2^-9) separates one rounding from a four-rounding serial chain, and an all-negative-zero payload
+  keeps the positive-zero result the 0.0f seed decides.
+- **Shape.** Single calls cycle the two-deep ring; a chunked `ChunkPlan` reuses a ring slot only
+  after every rank has finished reading its previous use, tracked by a per-slot read-done epoch that
+  is stronger than the arrival word. `PipelineReport` carries the ring indices and every dispatch
+  record, so the shape is asserted by a test rather than assumed.
+
+`crates/sparkflash-comm/tests/oneshot_host.rs` runs four rank threads for bit-identity against
+`canonical_all_reduce_into`, in both arrival orders, at the gate's 10,240 B payload; it also checks
+one dispatch per rank per call, zero `host_copy_bytes` on every record, the refusal of an
+unregistered device address, and the ring indices of single and chunked runs.
+`sparkflash device-chain --run-stage tp4-smoke --oneshot-preflight` records a `host_twin` evidence
+section (one-shot plus, with `--prefill-plan-elements`, a clamped chunked run) and says
+`emitted: false` for the real dispatch record as before.
+
+**What this does not do, and what no host number may claim.** It allocates no device memory, no
+pinned-host alias, no MR and no queue pair; it launches no kernel (15.3 items 1, 3, 4 and 5 remain).
+It does not measure: the one-shot p50 latency at 10 KiB against the 20 us gate, per-rail bandwidth
+on the live 200 Gb/s rails, correctness across the four-node mesh through the real kernel/MR/QP
+path, 10,000-replay determinism or two-run byte identity on the nodes, or the absence of device-side
+DtoH/HtoD, which a host allocation cannot demonstrate. Those are 15.4 items 5-7 and are named
+unclaimed in every `HostTwinReport` and in the evidence section. No hardware result exists, so none
+may be cited.

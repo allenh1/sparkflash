@@ -2037,6 +2037,1466 @@ impl WeightSource for PanickingSource {
     }
 }
 
+// The host harness has no production caller yet; task-22 will consume it from the
+// continuous-batch tests. Keeping the items crate-internal is what the missing-docs gate
+// needs; the dead-code allowance is limited to non-test builds, where nothing calls it yet.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod paged_serve {
+    //! Host serving-sequence harness for paged format-2 KV.
+    //!
+    //! The reference is the same format-2 bytes held contiguously, not the engine's `f32` dense
+    //! state: paging is storage, not arithmetic. Device attention, full `lm_head` logits and load
+    //! behaviour are named window measurements, not claims made by this module.
+    use std::collections::HashMap;
+
+    use sparkflash_device::paged_kv::{AbsoluteRows, IndexerKeys, PagedKvView, WindowRows};
+    use sparkflash_kernels::m4_quant::bf16_bits;
+    use sparkflash_kernels::mla_ref::{
+        HSI_BLOCK_TOKENS, HSI_BLOCKS, INDEX_HEAD_DIM, attention_with_sink_union,
+    };
+    use sparkflash_kv::config::compress_ratio;
+    use sparkflash_kv::fp4::{IndexerKEntry, dequantize_indexer_k, quantize_indexer_k};
+    use sparkflash_kv::layout::{
+        GLOBAL_ENTRY_BYTES, INDEXER_K_DATA_OFFSET, INDEXER_K_DIM, INDEXER_K_ENTRY_BYTES,
+        MAIN_KV_DATA_BYTES, MAIN_KV_DATA_OFFSET, MAIN_KV_SCALE_BYTES, MAIN_KV_SCALE_OFFSET,
+        SWA_SLOT_DATA_BYTES, SWA_SLOT_SCALE_BYTES, SWA_SLOTS_PER_TAIL, SWA_TAIL_BYTES,
+        entries_per_page, source_slot, swa_slot_offset,
+    };
+    use sparkflash_kv::paged::{
+        AppendReport, FreeReport, PagedGeometry, PagedKvCache, PagingError, SeqId,
+        SequenceState as KvSequenceState,
+    };
+
+    const QUERY_VALUES: usize = 512;
+    const REFERENCE_SINK: f32 = 0.25;
+    const REFERENCE_VOCAB: usize = 64;
+
+    /// One position's observable output, compared bit for bit across the two paths.
+    #[derive(Debug, Clone, PartialEq)]
+    pub(crate) struct ServedStep {
+        pub(crate) attention: Vec<f32>,
+        pub(crate) logits: Vec<f32>,
+        pub(crate) next_token: u32,
+    }
+
+    fn reference_head(attention: &[f32]) -> Vec<f32> {
+        let mut logits = vec![0.0f32; REFERENCE_VOCAB];
+        for (token, logit) in logits.iter_mut().enumerate() {
+            let mut sum = 0.0f32;
+            for (index, value) in attention.iter().enumerate() {
+                let weight = (((index * 31 + token * 17) % 101) as f32 - 50.0) / 64.0;
+                sum += *value * weight;
+            }
+            *logit = sum;
+        }
+        logits
+    }
+
+    fn next_token(logits: &[f32]) -> u32 {
+        let mut best = 0usize;
+        for (index, value) in logits.iter().enumerate().skip(1) {
+            if *value > logits[best] {
+                best = index;
+            }
+        }
+        best as u32
+    }
+
+    fn reference_query() -> Vec<f32> {
+        (0..QUERY_VALUES)
+            .map(|index| ((index as f32) * 0.001).sin() * 0.1)
+            .collect()
+    }
+
+    fn synthetic_entry(layer: usize, group: usize) -> Vec<u8> {
+        let mut entry = vec![0u8; GLOBAL_ENTRY_BYTES];
+        let main_end = MAIN_KV_DATA_OFFSET + MAIN_KV_DATA_BYTES;
+        for (offset, slot) in entry[MAIN_KV_DATA_OFFSET..main_end].iter_mut().enumerate() {
+            *slot = ((group * 7 + (MAIN_KV_DATA_OFFSET + offset) * 13) % 251) as u8;
+        }
+        let scale_end = MAIN_KV_SCALE_OFFSET + MAIN_KV_SCALE_BYTES;
+        for slot in &mut entry[MAIN_KV_SCALE_OFFSET..scale_end] {
+            *slot = 0x38;
+        }
+        let values: [f32; INDEXER_K_DIM] =
+            std::array::from_fn(|channel| (((group * 13 + channel) % 9) as f32) - 4.0);
+        let quantised = quantize_indexer_k(&values).expect("synthetic indexer k");
+        let mut encoded = [0u8; INDEXER_K_ENTRY_BYTES];
+        quantised.to_bytes(&mut encoded).expect("encode indexer k");
+        entry[INDEXER_K_DATA_OFFSET..INDEXER_K_DATA_OFFSET + INDEXER_K_ENTRY_BYTES]
+            .copy_from_slice(&encoded);
+        let _ = layer;
+        entry
+    }
+
+    fn write_window_slot(tail: &mut [u8], layer: usize, logical: usize) {
+        let slot = logical % SWA_SLOTS_PER_TAIL;
+        let offset = swa_slot_offset(layer, slot);
+        for (byte, slot) in tail[offset..offset + SWA_SLOT_DATA_BYTES]
+            .iter_mut()
+            .enumerate()
+        {
+            *slot = ((logical * 7 + byte) % 200 + 1) as u8;
+        }
+        for slot in &mut tail
+            [offset + SWA_SLOT_DATA_BYTES..offset + SWA_SLOT_DATA_BYTES + SWA_SLOT_SCALE_BYTES]
+        {
+            *slot = 0x38;
+        }
+    }
+
+    fn read_window_slot(tail: &[u8], layer: usize, logical: usize) -> (Vec<u8>, Vec<u8>) {
+        let slot = logical % SWA_SLOTS_PER_TAIL;
+        let offset = swa_slot_offset(layer, slot);
+        (
+            tail[offset..offset + SWA_SLOT_DATA_BYTES].to_vec(),
+            tail[offset + SWA_SLOT_DATA_BYTES..offset + SWA_SLOT_DATA_BYTES + SWA_SLOT_SCALE_BYTES]
+                .to_vec(),
+        )
+    }
+
+    /// A serving state whose KV lives in the paged format-2 pool.
+    #[derive(Debug)]
+    pub(crate) struct PagedSequenceState {
+        cache: PagedKvCache,
+        pool: Vec<u8>,
+        layer: usize,
+        ratio: usize,
+        tails: HashMap<SeqId, Vec<u8>>,
+        known_tokens: HashMap<SeqId, Vec<u32>>,
+    }
+
+    impl PagedSequenceState {
+        pub(crate) fn new(pages: u32, tails: u32, layer: usize) -> Result<Self, PagingError> {
+            let slot = source_slot(layer).ok_or_else(|| {
+                PagingError::Invariant(format!("layer {layer} owns no compressed global KV"))
+            })?;
+            let ratio = compress_ratio(layer);
+            let geometry = PagedGeometry::new(pages, tails)?;
+            let entries = pages as usize * entries_per_page(slot);
+            let pool_len = entries.checked_mul(GLOBAL_ENTRY_BYTES).ok_or_else(|| {
+                PagingError::Invariant("paged pool size overflows usize".to_owned())
+            })?;
+            Ok(Self {
+                cache: PagedKvCache::new(geometry),
+                pool: vec![0u8; pool_len],
+                layer,
+                ratio,
+                tails: HashMap::new(),
+                known_tokens: HashMap::new(),
+            })
+        }
+
+        pub(crate) fn add_sequence(&mut self, id: SeqId) -> Result<(), PagingError> {
+            self.cache.add_sequence(id)?;
+            self.tails.insert(id, vec![0u8; SWA_TAIL_BYTES]);
+            self.known_tokens.insert(id, Vec::new());
+            self.check_invariants()
+        }
+
+        pub(crate) fn append(
+            &mut self,
+            id: SeqId,
+            tokens: &[u32],
+        ) -> Result<AppendReport, PagingError> {
+            let result = self.cache.append(id, tokens);
+            // A refused append may still have applied a prefix of `tokens`; rewrite whatever the
+            // cache now holds so the source pool and the block table cannot disagree on error.
+            self.tails
+                .entry(id)
+                .or_insert_with(|| vec![0u8; SWA_TAIL_BYTES]);
+            self.rewrite(id)?;
+            self.check_invariants()?;
+            result
+        }
+
+        pub(crate) fn preempt(&mut self, id: SeqId) -> Result<FreeReport, PagingError> {
+            let report = self.cache.preempt(id)?;
+            self.tails.remove(&id);
+            self.check_invariants()?;
+            Ok(report)
+        }
+
+        pub(crate) fn recompute(&mut self, id: SeqId) -> Result<AppendReport, PagingError> {
+            if self.cache.sequence(id).map(|sequence| sequence.state())
+                != Some(KvSequenceState::Preempted)
+            {
+                return Err(PagingError::Invariant(
+                    "recompute requires a preempted sequence".to_owned(),
+                ));
+            }
+            let tokens = self
+                .known_tokens
+                .get(&id)
+                .cloned()
+                .ok_or(PagingError::UnknownSequence(id))?;
+            if tokens.is_empty() {
+                return Err(PagingError::Invariant(
+                    "cannot recompute a request with no known tokens".to_owned(),
+                ));
+            }
+            self.append(id, &tokens)
+        }
+
+        pub(crate) fn free(&mut self, id: SeqId) -> Result<FreeReport, PagingError> {
+            let report = self.cache.free_sequence(id)?;
+            self.tails.remove(&id);
+            self.known_tokens.remove(&id);
+            self.check_invariants()?;
+            Ok(report)
+        }
+
+        pub(crate) fn check_invariants(&self) -> Result<(), PagingError> {
+            self.cache.check_invariants()
+        }
+
+        pub(crate) fn len(&self, id: SeqId) -> Result<usize, PagingError> {
+            self.cache
+                .sequence(id)
+                .map(|sequence| sequence.tokens().len())
+                .ok_or(PagingError::UnknownSequence(id))
+        }
+
+        fn rewrite(&mut self, id: SeqId) -> Result<(), PagingError> {
+            let tokens = self
+                .cache
+                .sequence(id)
+                .ok_or(PagingError::UnknownSequence(id))?
+                .tokens()
+                .to_vec();
+            self.known_tokens.insert(id, tokens.clone());
+            let layer = self.layer;
+            let tail = self
+                .tails
+                .get_mut(&id)
+                .ok_or(PagingError::UnknownSequence(id))?;
+            tail.fill(0);
+            for logical in 0..tokens.len() {
+                write_window_slot(tail, layer, logical);
+            }
+            for logical in 0..tokens.len() {
+                self.write_source(id, logical)?;
+            }
+            Ok(())
+        }
+
+        fn write_source(&mut self, id: SeqId, logical: usize) -> Result<(), PagingError> {
+            let entry = PagedKvView::new(&self.cache).source_entry(id, self.layer, logical)?;
+            let group = logical / self.ratio;
+            let bytes = synthetic_entry(self.layer, group);
+            let start = entry.byte_offset;
+            let end = start + GLOBAL_ENTRY_BYTES;
+            let pool_len = self.pool.len();
+            let destination = self.pool.get_mut(start..end).ok_or_else(|| {
+                PagingError::Invariant(format!(
+                    "pool is {pool_len} bytes, the mapping reaches byte {end}"
+                ))
+            })?;
+            destination.copy_from_slice(&bytes);
+            Ok(())
+        }
+
+        pub(crate) fn stage(
+            &self,
+            id: SeqId,
+            position: usize,
+        ) -> Result<(WindowRows, AbsoluteRows, IndexerKeys), PagingError> {
+            let held = self.len(id)?;
+            if position >= held {
+                return Err(PagingError::OutOfRange {
+                    sequence: id,
+                    logical: position,
+                    held,
+                });
+            }
+            let tail = self
+                .tails
+                .get(&id)
+                .ok_or(PagingError::UnknownSequence(id))?;
+            let view = PagedKvView::new(&self.cache);
+            let window = view.window_rows(id, self.layer, position + 1, tail)?;
+            let rows = view.absolute_source_rows(id, self.layer, position, &self.pool)?;
+            let indexer = view.absolute_indexer_keys(id, self.layer, position, &self.pool)?;
+            Ok((window, rows, indexer))
+        }
+
+        pub(crate) fn step(&self, id: SeqId, position: usize) -> Result<ServedStep, PagingError> {
+            let (window, rows, _) = self.stage(id, position)?;
+            let selected: Vec<u32> = (0..=position as u32).collect();
+            let attention = attention_with_sink_union(
+                &reference_query(),
+                &window.codes,
+                &window.scales,
+                window.rows,
+                &rows.codes,
+                &rows.scales,
+                &selected,
+                position as u32,
+                REFERENCE_SINK,
+            );
+            let logits = reference_head(&attention);
+            Ok(ServedStep {
+                next_token: next_token(&logits),
+                attention,
+                logits,
+            })
+        }
+
+        pub(crate) fn indexer_keys(
+            &self,
+            id: SeqId,
+            position: usize,
+        ) -> Result<IndexerKeys, PagingError> {
+            self.stage(id, position).map(|(_, _, keys)| keys)
+        }
+    }
+
+    /// The dense reference with the same format-2 bytes held contiguously.
+    #[derive(Debug)]
+    pub(crate) struct DenseSequenceState {
+        layer: usize,
+        ratio: usize,
+        tokens: Vec<u32>,
+        pool: Vec<u8>,
+        tail: Vec<u8>,
+    }
+
+    impl DenseSequenceState {
+        pub(crate) fn new(layer: usize, max_tokens: usize) -> Result<Self, PagingError> {
+            if source_slot(layer).is_none() {
+                return Err(PagingError::Invariant(format!(
+                    "layer {layer} owns no compressed global KV"
+                )));
+            }
+            let ratio = compress_ratio(layer);
+            let groups = max_tokens / ratio + 2;
+            Ok(Self {
+                layer,
+                ratio,
+                tokens: Vec::new(),
+                pool: vec![0u8; groups * GLOBAL_ENTRY_BYTES],
+                tail: vec![0u8; SWA_TAIL_BYTES],
+            })
+        }
+
+        pub(crate) fn append(&mut self, tokens: &[u32]) {
+            for token in tokens {
+                let logical = self.tokens.len();
+                let group = logical / self.ratio;
+                let bytes = synthetic_entry(self.layer, group);
+                self.pool[group * GLOBAL_ENTRY_BYTES..(group + 1) * GLOBAL_ENTRY_BYTES]
+                    .copy_from_slice(&bytes);
+                write_window_slot(&mut self.tail, self.layer, logical);
+                self.tokens.push(*token);
+            }
+        }
+
+        fn entry(&self, logical: usize) -> &[u8] {
+            let group = logical / self.ratio;
+            &self.pool[group * GLOBAL_ENTRY_BYTES..(group + 1) * GLOBAL_ENTRY_BYTES]
+        }
+
+        pub(crate) fn stage(
+            &self,
+            position: usize,
+        ) -> Result<(WindowRows, AbsoluteRows, IndexerKeys), PagingError> {
+            if position >= self.tokens.len() {
+                return Err(PagingError::OutOfRange {
+                    sequence: 0,
+                    logical: position,
+                    held: self.tokens.len(),
+                });
+            }
+            let attended = position + 1;
+            let rows = attended.min(SWA_SLOTS_PER_TAIL);
+            let first = attended - rows;
+            let mut window = WindowRows {
+                codes: Vec::with_capacity(rows * SWA_SLOT_DATA_BYTES),
+                scales: Vec::with_capacity(rows * SWA_SLOT_SCALE_BYTES),
+                rows,
+            };
+            for logical in first..attended {
+                let (codes, scales) = read_window_slot(&self.tail, self.layer, logical);
+                window.codes.extend_from_slice(&codes);
+                window.scales.extend_from_slice(&scales);
+            }
+            let mut absolute = AbsoluteRows {
+                codes: Vec::with_capacity(attended * MAIN_KV_DATA_BYTES),
+                scales: Vec::with_capacity(attended * MAIN_KV_SCALE_BYTES),
+                rows: attended,
+            };
+            for logical in 0..attended {
+                let entry = self.entry(logical);
+                absolute.codes.extend_from_slice(
+                    &entry[MAIN_KV_DATA_OFFSET..MAIN_KV_DATA_OFFSET + MAIN_KV_DATA_BYTES],
+                );
+                absolute.scales.extend_from_slice(
+                    &entry[MAIN_KV_SCALE_OFFSET..MAIN_KV_SCALE_OFFSET + MAIN_KV_SCALE_BYTES],
+                );
+            }
+            let slots = HSI_BLOCKS * HSI_BLOCK_TOKENS;
+            let mut indexer = IndexerKeys {
+                keys: vec![0u16; slots * INDEX_HEAD_DIM],
+                reachable_blocks: attended.div_ceil(HSI_BLOCK_TOKENS),
+                position: position as u32,
+            };
+            for logical in 0..attended {
+                let entry = self.entry(logical);
+                let bytes =
+                    &entry[INDEXER_K_DATA_OFFSET..INDEXER_K_DATA_OFFSET + INDEXER_K_ENTRY_BYTES];
+                let parsed = IndexerKEntry::from_bytes(bytes).map_err(|error| {
+                    PagingError::Invariant(format!("dense indexer k for token {logical}: {error}"))
+                })?;
+                let mut values = [0.0f32; INDEXER_K_DIM];
+                dequantize_indexer_k(&parsed, &mut values).map_err(|error| {
+                    PagingError::Invariant(format!("dense indexer k values: {error}"))
+                })?;
+                for (slot, value) in indexer.keys
+                    [logical * INDEX_HEAD_DIM..(logical + 1) * INDEX_HEAD_DIM]
+                    .iter_mut()
+                    .zip(values.iter())
+                {
+                    *slot = bf16_bits(*value);
+                }
+            }
+            Ok((window, absolute, indexer))
+        }
+
+        pub(crate) fn step(&self, position: usize) -> Result<ServedStep, PagingError> {
+            let (window, rows, _) = self.stage(position)?;
+            let selected: Vec<u32> = (0..=position as u32).collect();
+            let attention = attention_with_sink_union(
+                &reference_query(),
+                &window.codes,
+                &window.scales,
+                window.rows,
+                &rows.codes,
+                &rows.scales,
+                &selected,
+                position as u32,
+                REFERENCE_SINK,
+            );
+            let logits = reference_head(&attention);
+            Ok(ServedStep {
+                next_token: next_token(&logits),
+                attention,
+                logits,
+            })
+        }
+
+        pub(crate) fn indexer_keys(&self, position: usize) -> Result<IndexerKeys, PagingError> {
+            self.stage(position).map(|(_, _, keys)| keys)
+        }
+    }
+
+    #[cfg(test)]
+    fn assert_same_step(left: &ServedStep, right: &ServedStep, context: &str) {
+        assert_eq!(
+            left.attention
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            right
+                .attention
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            "attention bits differ: {context}"
+        );
+        assert_eq!(
+            left.logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            right.logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "reference-head logits bits differ: {context}"
+        );
+        assert_eq!(
+            left.next_token, right.next_token,
+            "argmax next token differs: {context}"
+        );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{DenseSequenceState, PagedSequenceState, assert_same_step};
+
+        const PROMPT_LEN: usize = 130;
+
+        fn prompt() -> Vec<u32> {
+            (0..PROMPT_LEN as u32).map(|index| index + 1).collect()
+        }
+
+        fn paged(layer: usize) -> PagedSequenceState {
+            let mut state = PagedSequenceState::new(8, 2, layer).expect("paged geometry");
+            state.add_sequence(1).expect("add sequence");
+            state
+        }
+
+        fn dense(layer: usize, max_tokens: usize) -> DenseSequenceState {
+            DenseSequenceState::new(layer, max_tokens).expect("dense state")
+        }
+
+        #[test]
+        fn paging_is_storage_not_arithmetic_for_prefill_and_decode() {
+            let mut paged = paged(20);
+            paged.append(1, &prompt()).expect("prefill");
+            let mut dense = dense(20, PROMPT_LEN + 4);
+            dense.append(&prompt());
+            for position in [0usize, 1, 17, 64, 127, 129] {
+                let left = paged.step(1, position).expect("paged step");
+                let right = dense.step(position).expect("dense step");
+                assert_same_step(&left, &right, &format!("prefill position {position}"));
+            }
+            let mut next = 999u32;
+            for decode in 0..3 {
+                paged.append(1, &[next]).expect("paged decode");
+                dense.append(&[next]);
+                let position = PROMPT_LEN + decode;
+                let left = paged.step(1, position).expect("paged decode step");
+                let right = dense.step(position).expect("dense decode step");
+                assert_same_step(&left, &right, &format!("decode step {position}"));
+                next = left.next_token;
+            }
+        }
+
+        #[test]
+        fn ratio_two_absolute_rows_are_storage_not_arithmetic() {
+            let mut paged = paged(2);
+            paged.append(1, &prompt()).expect("prefill");
+            let mut dense = dense(2, PROMPT_LEN + 1);
+            dense.append(&prompt());
+            for position in [0usize, 1, 2, 63, 64, 129] {
+                let left = paged.step(1, position).expect("paged step");
+                let right = dense.step(position).expect("dense step");
+                assert_same_step(&left, &right, &format!("ratio-2 position {position}"));
+            }
+        }
+
+        #[test]
+        fn absolute_rows_and_window_are_storage_not_arithmetic() {
+            let mut paged = paged(20);
+            paged.append(1, &prompt()).expect("prefill");
+            let mut dense = dense(20, PROMPT_LEN + 1);
+            dense.append(&prompt());
+            for position in [0usize, 1, 63, 64, 127, 129] {
+                let (paged_window, paged_rows, _) = paged.stage(1, position).expect("paged stage");
+                let (dense_window, dense_rows, _) = dense.stage(position).expect("dense stage");
+                assert_eq!(paged_rows, dense_rows, "absolute rows at {position}");
+                assert_eq!(
+                    paged_window.rows, dense_window.rows,
+                    "window rows at {position}"
+                );
+                assert_eq!(
+                    paged_window.codes, dense_window.codes,
+                    "window codes at {position}"
+                );
+                assert_eq!(
+                    paged_window.scales, dense_window.scales,
+                    "window scales at {position}"
+                );
+            }
+        }
+
+        #[test]
+        fn prefix_sharing_changes_storage_not_output() {
+            let mut paged = paged(20);
+            paged.add_sequence(2).expect("second sequence");
+            paged.append(1, &prompt()).expect("first prefill");
+            let report = paged.append(2, &prompt()).expect("shared prefill");
+            assert!(
+                report.shared > 0,
+                "a repeated prompt must share complete blocks"
+            );
+            let mut dense = dense(20, PROMPT_LEN + 1);
+            dense.append(&prompt());
+            let reference = dense.step(PROMPT_LEN - 1).expect("dense step");
+            for id in [1u64, 2] {
+                let left = paged.step(id, PROMPT_LEN - 1).expect("shared step");
+                assert_same_step(&left, &reference, &format!("prefix-shared sequence {id}"));
+            }
+        }
+
+        #[test]
+        fn preemption_and_recompute_match_the_dense_reference() {
+            use sparkflash_kv::paged::PagingError;
+
+            let mut paged = PagedSequenceState::new(3, 2, 20).expect("paged geometry");
+            paged.add_sequence(1).expect("add 1");
+            paged.add_sequence(2).expect("add 2");
+            let short1: Vec<u32> = (0..65u32).collect();
+            let short2: Vec<u32> = (1000..1065u32).collect();
+            paged.append(1, &short1).expect("seq 1");
+            let before = paged.step(1, 64).expect("seq 1 step");
+            let error = paged
+                .append(2, &short2)
+                .expect_err("the third page is full");
+            assert!(
+                matches!(error, PagingError::Capacity { .. }),
+                "expected Capacity, got {error}"
+            );
+            assert_eq!(paged.len(2).expect("seq 2 length"), 64);
+            paged.preempt(1).expect("preempt seq 1 frees two pages");
+            paged
+                .append(2, &short2[64..])
+                .expect("seq 2 finishes from the freed pages");
+            let mut dense2 = dense(20, short2.len());
+            dense2.append(&short2);
+            let reference2 = dense2.step(64).expect("dense seq 2 step");
+            let seq2 = paged.step(2, 64).expect("seq 2 step");
+            assert_same_step(&seq2, &reference2, "seq 2 vs dense");
+            paged.free(2).expect("free seq 2");
+            let recomputed = paged.recompute(1).expect("recompute seq 1");
+            assert!(
+                recomputed.tokens >= short1.len(),
+                "recompute must restore the tokens"
+            );
+            let after = paged.step(1, 64).expect("seq 1 after recompute");
+            assert_same_step(&before, &after, "preemption/recompute");
+            let mut dense1 = dense(20, short1.len());
+            dense1.append(&short1);
+            let reference1 = dense1.step(64).expect("dense seq 1 step");
+            assert_same_step(&after, &reference1, "recomputed vs dense");
+        }
+
+        #[test]
+        fn absolute_indexer_keys_match_the_dense_reference() {
+            let mut paged = paged(20);
+            paged.append(1, &prompt()).expect("prefill");
+            let mut dense = dense(20, PROMPT_LEN + 1);
+            dense.append(&prompt());
+            for position in [0usize, 7, 63, 64, 129] {
+                assert_eq!(
+                    paged.indexer_keys(1, position).expect("paged keys"),
+                    dense.indexer_keys(position).expect("dense keys"),
+                    "indexer keys differ at position {position}"
+                );
+            }
+        }
+
+        #[test]
+        fn randomized_multi_request_trace_keeps_invariants_after_every_step() {
+            let mut paged = PagedSequenceState::new(16, 4, 20).expect("paged geometry");
+            let mut state = 0x1234_5678_9abc_def0u64;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let mut ids: Vec<u64> = Vec::new();
+            let mut next_id = 1u64;
+            for step in 0..200 {
+                let choice = next() % 6;
+                match choice {
+                    0 if ids.len() < 4 => {
+                        paged.add_sequence(next_id).expect("add");
+                        ids.push(next_id);
+                        next_id += 1;
+                    }
+                    1 | 2 if !ids.is_empty() => {
+                        let id = ids[(next() as usize) % ids.len()];
+                        let count = (next() % 8) as usize + 1;
+                        let base = (next() % 1000) as u32;
+                        let tokens: Vec<u32> =
+                            (0..count as u32).map(|index| base + index).collect();
+                        let _ = paged.append(id, &tokens);
+                    }
+                    3 if !ids.is_empty() => {
+                        let id = ids[(next() as usize) % ids.len()];
+                        let _ = paged.preempt(id);
+                    }
+                    4 if !ids.is_empty() => {
+                        let id = ids[(next() as usize) % ids.len()];
+                        let _ = paged.recompute(id);
+                    }
+                    5 if !ids.is_empty() => {
+                        let index = (next() as usize) % ids.len();
+                        let id = ids.remove(index);
+                        let _ = paged.free(id);
+                    }
+                    _ => {}
+                }
+                paged
+                    .check_invariants()
+                    .unwrap_or_else(|error| panic!("step {step}: {error}"));
+            }
+        }
+    }
+}
+
+// A host-only continuous-batch executor. It is crate-internal because the serve driver still
+// runs one job at a time; task-22 will consume it from the tests and the device path can adopt
+// the same admission shape later. The dead-code allowance is for the non-test build only.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod continuous {
+    //! Host continuous batching over one reference engine.
+    //!
+    //! One reference engine can drive several SequenceStates. This module is the host
+    //! scheduler/executor that uses that fact: FIFO admission, one prompt chunk per prefilling
+    //! request per step, round-robin decode for admitted requests, and a deterministic record of
+    //! which request advanced at which step. The chunk plan is the scheduler crate's
+    //! ChunkedPrefillPlan; the fairness policy is the FIFO admission plus round-robin execution
+    //! stated here.
+    //!
+    //! It is a host executor, not an HTTP-path switch. The serve driver still runs one job at a
+    //! time; this module proves the scheduling semantics and gives the device path the admission
+    //! shape it will use. Device batch attention, TTFT and throughput are named window
+    //! measurements, not claims made here.
+
+    use sparkflash_engine::forward::{InferenceEngine, SequenceState};
+    use sparkflash_scheduler::prefill::ChunkedPrefillPlan;
+
+    /// Admission and execution limits for one continuous batch.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct BatchPolicy {
+        /// Maximum requests admitted at once.
+        pub(crate) max_batch: usize,
+        /// Prompt tokens fed per prefill step. The host may choose a size below the device
+        /// policy's 4096-token chunk so a test can cross a boundary with a short prompt.
+        pub(crate) chunk_tokens: usize,
+    }
+
+    impl BatchPolicy {
+        /// A policy with a positive batch width and chunk size.
+        ///
+        /// # Errors
+        /// A zero width or chunk size.
+        pub(crate) fn new(max_batch: usize, chunk_tokens: usize) -> Result<Self, String> {
+            if max_batch == 0 {
+                return Err("a continuous batch needs max_batch >= 1".to_owned());
+            }
+            if chunk_tokens == 0 {
+                return Err("a continuous batch needs chunk_tokens >= 1".to_owned());
+            }
+            Ok(Self {
+                max_batch,
+                chunk_tokens,
+            })
+        }
+    }
+
+    /// One request offered to the batch.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct RequestSpec {
+        /// Stable request id; the same id keys the output.
+        pub(crate) id: u64,
+        /// Prompt token ids; must not be empty.
+        pub(crate) prompt: Vec<u32>,
+        /// Generated-token cap. Zero prefills and finishes without a token.
+        pub(crate) max_tokens: usize,
+        /// Scheduler step at which the request may first be admitted.
+        pub(crate) arrival_step: u64,
+    }
+
+    impl RequestSpec {
+        /// A request that arrived before the batch starts.
+        #[must_use]
+        pub(crate) fn new(id: u64, prompt: Vec<u32>, max_tokens: usize) -> Self {
+            Self {
+                id,
+                prompt,
+                max_tokens,
+                arrival_step: 0,
+            }
+        }
+
+        /// The same request arriving at arrival_step.
+        #[must_use]
+        pub(crate) fn arriving_at(mut self, arrival_step: u64) -> Self {
+            self.arrival_step = arrival_step;
+            self
+        }
+    }
+
+    /// Which engine operation advanced one request in a step.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum BatchOperation {
+        /// One contiguous prompt chunk was fed through InferenceEngine::prefill.
+        Prefill,
+        /// One generated token was fed back through InferenceEngine::decode.
+        Decode,
+    }
+
+    /// One request's operation in one step.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct StepOperation {
+        /// Request id.
+        pub(crate) request: u64,
+        /// What ran.
+        pub(crate) operation: BatchOperation,
+        /// Tokens added to the request's sequence by this operation: a prompt chunk for
+        /// Prefill, the emitted token for Decode.
+        pub(crate) appended: Vec<u32>,
+    }
+
+    /// What ran in one scheduler step.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct BatchStep {
+        /// Zero-based scheduler step.
+        pub(crate) step: u64,
+        /// Operations in execution order. A request appears at most once per step.
+        pub(crate) operations: Vec<StepOperation>,
+    }
+
+    /// One request's generated output.
+    #[derive(Debug, Clone, PartialEq)]
+    pub(crate) struct RequestOutput {
+        /// Request id.
+        pub(crate) id: u64,
+        /// Generated tokens, in order.
+        pub(crate) tokens: Vec<u32>,
+        /// Raw logits that produced each token: the prefill step for the first token, then one
+        /// decode step per later token. tokens.len() == logits.len().
+        pub(crate) logits: Vec<Vec<f32>>,
+        /// Step the request was admitted at.
+        pub(crate) admitted_step: u64,
+        /// Step its first token was emitted at; None for a zero-token request.
+        pub(crate) first_token_step: Option<u64>,
+        /// Step it finished at.
+        pub(crate) finished_step: u64,
+        /// Engine operations this request consumed (prefill chunks plus decodes).
+        pub(crate) steps_advanced: usize,
+    }
+
+    /// The whole batch's outputs and the exact schedule that produced them.
+    #[derive(Debug, Clone, PartialEq)]
+    pub(crate) struct BatchReport {
+        /// One entry per request, ordered by id.
+        pub(crate) outputs: Vec<RequestOutput>,
+        /// Every step, in order, with the operations that ran in it.
+        pub(crate) steps: Vec<BatchStep>,
+        /// Batch width used.
+        pub(crate) max_batch: usize,
+        /// Prefill chunk size used.
+        pub(crate) chunk_tokens: usize,
+    }
+
+    /// One active request: its own dense engine state, its chunk plan and its generated tokens.
+    struct ActiveRequest {
+        spec: RequestSpec,
+        state: SequenceState,
+        plan: ChunkedPrefillPlan,
+        cursor: usize,
+        generated: Vec<u32>,
+        logits: Vec<Vec<f32>>,
+        last_token: Option<u32>,
+        admitted_step: u64,
+        first_token_step: Option<u64>,
+        finished_step: Option<u64>,
+        steps_advanced: usize,
+        finished: bool,
+    }
+
+    impl ActiveRequest {
+        fn new(
+            spec: RequestSpec,
+            state: SequenceState,
+            plan: ChunkedPrefillPlan,
+            admitted_step: u64,
+        ) -> Self {
+            Self {
+                spec,
+                state,
+                plan,
+                cursor: 0,
+                generated: Vec::new(),
+                logits: Vec::new(),
+                last_token: None,
+                admitted_step,
+                first_token_step: None,
+                finished_step: None,
+                steps_advanced: 0,
+                finished: false,
+            }
+        }
+
+        /// One engine operation. The prefill path emits the first token when it feeds the last
+        /// prompt chunk; the decode path feeds the previous token and emits the next one.
+        fn advance(
+            &mut self,
+            engine: &InferenceEngine,
+            step: u64,
+        ) -> Result<StepOperation, String> {
+            self.steps_advanced += 1;
+            if self.cursor < self.plan.ranges().len() {
+                let range = self.plan.ranges()[self.cursor].clone();
+                let chunk = self
+                    .spec
+                    .prompt
+                    .get(range.clone())
+                    .ok_or_else(|| "a prefill chunk lies outside the prompt".to_owned())?
+                    .to_vec();
+                let output = engine
+                    .prefill(&mut self.state, &chunk)
+                    .map_err(|error| format!("prefill for request {}: {error}", self.spec.id))?;
+                self.cursor += 1;
+                let mut operation = StepOperation {
+                    request: self.spec.id,
+                    operation: BatchOperation::Prefill,
+                    appended: chunk,
+                };
+                if self.cursor == self.plan.ranges().len() {
+                    if self.spec.max_tokens == 0 {
+                        self.finish(step);
+                    } else if let Some(token) = output.next_token {
+                        self.emit(step, output, token, &mut operation);
+                    } else {
+                        self.finish(step);
+                    }
+                }
+                return Ok(operation);
+            }
+            let token = self
+                .last_token
+                .ok_or_else(|| format!("request {} decodes before a first token", self.spec.id))?;
+            let output = engine
+                .decode(&mut self.state, token)
+                .map_err(|error| format!("decode for request {}: {error}", self.spec.id))?;
+            let mut operation = StepOperation {
+                request: self.spec.id,
+                operation: BatchOperation::Decode,
+                appended: Vec::new(),
+            };
+            if self.generated.len() >= self.spec.max_tokens {
+                self.finish(step);
+            } else if let Some(next) = output.next_token {
+                self.emit(step, output, next, &mut operation);
+            } else {
+                self.finish(step);
+            }
+            Ok(operation)
+        }
+
+        fn emit(
+            &mut self,
+            step: u64,
+            output: sparkflash_engine::forward::StepOutput,
+            token: u32,
+            operation: &mut StepOperation,
+        ) {
+            if self.first_token_step.is_none() {
+                self.first_token_step = Some(step);
+            }
+            self.generated.push(token);
+            self.logits.push(output.logits);
+            self.last_token = Some(token);
+            operation.appended.push(token);
+            if self.generated.len() >= self.spec.max_tokens {
+                self.finish(step);
+            }
+        }
+
+        fn finish(&mut self, step: u64) {
+            self.finished = true;
+            self.finished_step = Some(step);
+        }
+
+        fn into_output(self) -> RequestOutput {
+            RequestOutput {
+                id: self.spec.id,
+                tokens: self.generated,
+                logits: self.logits,
+                admitted_step: self.admitted_step,
+                first_token_step: self.first_token_step,
+                finished_step: self.finished_step.unwrap_or(self.admitted_step),
+                steps_advanced: self.steps_advanced,
+            }
+        }
+    }
+
+    /// The continuous-batch executor: pending requests, active requests and the step clock.
+    pub(crate) struct ContinuousBatch {
+        policy: BatchPolicy,
+        pending: Vec<RequestSpec>,
+        active: Vec<ActiveRequest>,
+        outputs: Vec<RequestOutput>,
+        step: u64,
+        cursor: usize,
+    }
+
+    impl ContinuousBatch {
+        /// An empty batch under policy.
+        ///
+        /// # Errors
+        /// An invalid policy.
+        pub(crate) fn new(policy: BatchPolicy) -> Result<Self, String> {
+            Ok(Self {
+                policy,
+                pending: Vec::new(),
+                active: Vec::new(),
+                outputs: Vec::new(),
+                step: 0,
+                cursor: 0,
+            })
+        }
+
+        /// True when no pending request remains and no active request is unfinished.
+        #[must_use]
+        pub(crate) fn is_done(&self) -> bool {
+            self.pending.is_empty() && self.active.is_empty()
+        }
+
+        /// Offers one request. Pending requests are kept in arrival order, and equal arrivals in
+        /// offer order, so a later offer cannot overtake an earlier one.
+        ///
+        /// # Errors
+        /// An empty prompt, a duplicate id, or an arrival in the past.
+        pub(crate) fn submit(&mut self, spec: RequestSpec) -> Result<(), String> {
+            if spec.prompt.is_empty() {
+                return Err(format!("request {} has an empty prompt", spec.id));
+            }
+            let duplicate = self.pending.iter().any(|pending| pending.id == spec.id)
+                || self.active.iter().any(|active| active.spec.id == spec.id)
+                || self.outputs.iter().any(|output| output.id == spec.id);
+            if duplicate {
+                return Err(format!("request id {} is already known", spec.id));
+            }
+            if spec.arrival_step < self.step {
+                return Err(format!(
+                    "request {} arrived at step {}, before the current step {}",
+                    spec.id, spec.arrival_step, self.step
+                ));
+            }
+            self.pending.push(spec);
+            self.pending.sort_by_key(|pending| pending.arrival_step);
+            Ok(())
+        }
+
+        /// Admits every eligible request that fits under the batch width.
+        fn admit(&mut self, engine: &InferenceEngine) -> Result<(), String> {
+            while self.active.len() < self.policy.max_batch {
+                let Some(front) = self.pending.first() else {
+                    break;
+                };
+                if front.arrival_step > self.step {
+                    break;
+                }
+                let spec = self.pending.remove(0);
+                let plan = ChunkedPrefillPlan::with_chunk_tokens(
+                    spec.prompt.len(),
+                    self.step,
+                    self.policy.chunk_tokens,
+                    0,
+                )
+                .map_err(|error| format!("prefill plan for request {}: {error}", spec.id))?;
+                let state = SequenceState::new(engine.config());
+                self.active
+                    .push(ActiveRequest::new(spec, state, plan, self.step));
+            }
+            Ok(())
+        }
+
+        /// Runs one scheduler step.
+        ///
+        /// Admission is FIFO. Every active request advances exactly once, in round-robin order,
+        /// so a decoding request is never starved by another request's prefill chunks. The
+        /// returned record is the schedule the caller can replay against a paged mirror.
+        ///
+        /// # Errors
+        /// An engine failure or a malformed request.
+        pub(crate) fn step_once(&mut self, engine: &InferenceEngine) -> Result<BatchStep, String> {
+            if self.active.is_empty()
+                && let Some(next) = self.pending.first()
+            {
+                // Do not spin over steps in which no request can be admitted.
+                self.step = self.step.max(next.arrival_step);
+            }
+            self.admit(engine)?;
+            if self.active.is_empty() {
+                let step = self.step;
+                self.step += 1;
+                return Ok(BatchStep {
+                    step,
+                    operations: Vec::new(),
+                });
+            }
+            let active_len = self.active.len();
+            let start = self.cursor % active_len;
+            let mut operations = Vec::with_capacity(active_len);
+            for offset in 0..active_len {
+                let index = (start + offset) % active_len;
+                let operation = self.active[index].advance(engine, self.step)?;
+                operations.push(operation);
+            }
+            let next_cursor = (start + 1) % active_len;
+            let mut still_active = Vec::with_capacity(active_len);
+            for request in std::mem::take(&mut self.active) {
+                if request.finished {
+                    self.outputs.push(request.into_output());
+                } else {
+                    still_active.push(request);
+                }
+            }
+            self.active = still_active;
+            self.cursor = if self.active.is_empty() {
+                0
+            } else {
+                next_cursor % self.active.len()
+            };
+            let step = self.step;
+            self.step += 1;
+            Ok(BatchStep { step, operations })
+        }
+
+        /// Runs until every submitted request finishes.
+        ///
+        /// # Errors
+        /// An engine failure, or a schedule that does not terminate.
+        pub(crate) fn run(&mut self, engine: &InferenceEngine) -> Result<BatchReport, String> {
+            let mut steps = Vec::new();
+            while !self.is_done() {
+                let step = self.step_once(engine)?;
+                steps.push(step);
+                if steps.len() > 1_000_000 {
+                    return Err("the continuous batch did not terminate".to_owned());
+                }
+            }
+            let mut outputs = std::mem::take(&mut self.outputs);
+            outputs.sort_by_key(|output| output.id);
+            Ok(BatchReport {
+                outputs,
+                steps,
+                max_batch: self.policy.max_batch,
+                chunk_tokens: self.policy.chunk_tokens,
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::collections::HashMap;
+
+        use super::super::paged_serve::{DenseSequenceState, PagedSequenceState, ServedStep};
+        use super::super::{
+            ModelConfig, REFERENCE_TENSOR_LIMIT, SYNTHETIC_WEIGHT_SEED, SyntheticWeights,
+            TensorPlan,
+        };
+        use super::*;
+
+        fn engine() -> InferenceEngine {
+            let config = ModelConfig::tiny();
+            let plan = TensorPlan::language_model(&config);
+            InferenceEngine::new(
+                config,
+                Box::new(SyntheticWeights::from_plan(&plan, SYNTHETIC_WEIGHT_SEED)),
+                REFERENCE_TENSOR_LIMIT,
+            )
+            .expect("the tiny engine builds")
+        }
+
+        fn run(
+            engine: &InferenceEngine,
+            policy: BatchPolicy,
+            specs: Vec<RequestSpec>,
+        ) -> BatchReport {
+            let mut batch = ContinuousBatch::new(policy).expect("policy");
+            for spec in specs {
+                batch.submit(spec).expect("submit");
+            }
+            batch.run(engine).expect("batch run")
+        }
+
+        fn output(report: &BatchReport, id: u64) -> &RequestOutput {
+            report
+                .outputs
+                .iter()
+                .find(|output| output.id == id)
+                .expect("request output")
+        }
+
+        fn assert_output_equal(left: &RequestOutput, right: &RequestOutput, context: &str) {
+            assert_eq!(left.tokens, right.tokens, "tokens differ: {context}");
+            assert_eq!(
+                left.logits.len(),
+                right.logits.len(),
+                "logit count differs: {context}"
+            );
+            for (index, (left_row, right_row)) in
+                left.logits.iter().zip(right.logits.iter()).enumerate()
+            {
+                assert_eq!(
+                    left_row
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    right_row
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    "logits bits differ at token {index}: {context}"
+                );
+            }
+        }
+
+        fn assert_same_served(left: &ServedStep, right: &ServedStep, context: &str) {
+            assert_eq!(
+                left.attention
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                right
+                    .attention
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "attention bits differ: {context}"
+            );
+            assert_eq!(
+                left.logits
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                right
+                    .logits
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "reference-head logits bits differ: {context}"
+            );
+            assert_eq!(
+                left.next_token, right.next_token,
+                "next token differs: {context}"
+            );
+        }
+
+        fn concurrent_specs() -> Vec<RequestSpec> {
+            vec![
+                RequestSpec::new(1, vec![1, 2, 3, 4, 5], 4),
+                RequestSpec::new(2, (6..=12).collect(), 4),
+                RequestSpec::new(3, vec![13, 14, 15], 4),
+            ]
+        }
+
+        #[test]
+        fn interleaved_requests_match_their_solo_outputs_bit_for_bit() {
+            let engine = engine();
+            let specs = concurrent_specs();
+            let batch = run(
+                &engine,
+                BatchPolicy::new(3, 2).expect("policy"),
+                specs.clone(),
+            );
+            for spec in specs {
+                let solo = run(
+                    &engine,
+                    BatchPolicy::new(1, 2).expect("policy"),
+                    vec![spec.clone()],
+                );
+                assert_output_equal(
+                    &solo.outputs[0],
+                    output(&batch, spec.id),
+                    &format!("request {} alone versus interleaved", spec.id),
+                );
+            }
+            let mixed_step = batch.steps.iter().any(|step| {
+                let prefill = step
+                    .operations
+                    .iter()
+                    .any(|operation| operation.operation == BatchOperation::Prefill);
+                let decode = step
+                    .operations
+                    .iter()
+                    .any(|operation| operation.operation == BatchOperation::Decode);
+                prefill && decode
+            });
+            assert!(
+                mixed_step,
+                "the batch must actually interleave a decode with a prefill"
+            );
+            assert!(
+                batch.steps.iter().any(|step| step.operations.len() > 1),
+                "the batch must run more than one request in a step"
+            );
+        }
+
+        #[test]
+        fn chunk_boundaries_and_decode_windows_do_not_change_the_result() {
+            let engine = engine();
+            let specs = concurrent_specs();
+            let baseline = run(
+                &engine,
+                BatchPolicy::new(3, 2).expect("policy"),
+                specs.clone(),
+            );
+            for chunk in [1usize, 3, 4, 8] {
+                let got = run(
+                    &engine,
+                    BatchPolicy::new(3, chunk).expect("policy"),
+                    specs.clone(),
+                );
+                for spec in &specs {
+                    assert_output_equal(
+                        output(&baseline, spec.id),
+                        output(&got, spec.id),
+                        &format!("chunk {chunk}, request {}", spec.id),
+                    );
+                }
+            }
+            for width in [1usize, 2, 3] {
+                let got = run(
+                    &engine,
+                    BatchPolicy::new(width, 2).expect("policy"),
+                    specs.clone(),
+                );
+                for spec in &specs {
+                    assert_output_equal(
+                        output(&baseline, spec.id),
+                        output(&got, spec.id),
+                        &format!("batch width {width}, request {}", spec.id),
+                    );
+                }
+            }
+            let chunked = run(
+                &engine,
+                BatchPolicy::new(3, 1).expect("policy"),
+                specs.clone(),
+            );
+            assert_ne!(
+                baseline.steps.len(),
+                chunked.steps.len(),
+                "the chunk size must actually change the schedule"
+            );
+        }
+
+        #[test]
+        fn admission_is_fifo_and_a_later_arrival_cannot_overtake() {
+            let engine = engine();
+            let specs = vec![
+                RequestSpec::new(1, vec![1, 2, 3, 4], 1),
+                RequestSpec::new(2, vec![5, 6, 7, 8], 1),
+                RequestSpec::new(3, vec![9, 10, 11, 12], 1).arriving_at(1),
+                RequestSpec::new(4, vec![13, 14, 15, 16], 1).arriving_at(1),
+            ];
+            let report = run(&engine, BatchPolicy::new(2, 2).expect("policy"), specs);
+            let first = output(&report, 1);
+            let second = output(&report, 2);
+            let third = output(&report, 3);
+            let fourth = output(&report, 4);
+            assert_eq!(first.admitted_step, 0);
+            assert_eq!(second.admitted_step, 0);
+            assert_eq!(third.admitted_step, 2, "the third request waits for a slot");
+            assert_eq!(fourth.admitted_step, 2);
+            assert!(
+                third.admitted_step <= fourth.admitted_step,
+                "no later arrival overtakes"
+            );
+            assert_eq!(first.finished_step, 1);
+            assert_eq!(second.finished_step, 1);
+        }
+
+        #[test]
+        fn round_robin_advances_every_active_request_once_per_step() {
+            let engine = engine();
+            let specs = vec![
+                RequestSpec::new(1, (1..=21).collect(), 2),
+                RequestSpec::new(2, (21..=41).collect(), 2),
+                RequestSpec::new(3, vec![41, 42, 43, 44], 3),
+            ];
+            let report = run(&engine, BatchPolicy::new(3, 1).expect("policy"), specs);
+            for step in &report.steps {
+                let mut requests: Vec<u64> = step
+                    .operations
+                    .iter()
+                    .map(|operation| operation.request)
+                    .collect();
+                let count = requests.len();
+                requests.sort_unstable();
+                requests.dedup();
+                assert_eq!(
+                    requests.len(),
+                    count,
+                    "a request advanced twice in one step"
+                );
+            }
+            let short = output(&report, 3);
+            let long = output(&report, 1);
+            assert!(
+                short.finished_step < long.finished_step,
+                "the short request must not starve behind a long prefill"
+            );
+            for output in &report.outputs {
+                let operations = report
+                    .steps
+                    .iter()
+                    .flat_map(|step| step.operations.iter())
+                    .filter(|operation| operation.request == output.id)
+                    .count();
+                assert_eq!(output.steps_advanced, operations);
+            }
+        }
+
+        #[test]
+        fn paged_mirrors_stay_invariant_and_match_dense_after_every_step() {
+            let engine = engine();
+            let specs = vec![
+                RequestSpec::new(1, (1..=6).collect(), 2),
+                RequestSpec::new(2, (6..=11).collect(), 2),
+            ];
+            let mut batch =
+                ContinuousBatch::new(BatchPolicy::new(2, 2).expect("policy")).expect("batch");
+            for spec in &specs {
+                batch.submit(spec.clone()).expect("submit");
+            }
+            let mut paged = PagedSequenceState::new(8, 2, 20).expect("paged geometry");
+            let mut dense: HashMap<u64, DenseSequenceState> = HashMap::new();
+            for spec in &specs {
+                paged.add_sequence(spec.id).expect("paged sequence");
+                dense.insert(
+                    spec.id,
+                    DenseSequenceState::new(20, spec.prompt.len() + spec.max_tokens + 1)
+                        .expect("dense state"),
+                );
+            }
+            let mut positions: HashMap<u64, usize> = HashMap::new();
+            while !batch.is_done() {
+                let step = batch.step_once(&engine).expect("batch step");
+                for operation in &step.operations {
+                    paged
+                        .append(operation.request, &operation.appended)
+                        .expect("paged append");
+                    dense
+                        .get_mut(&operation.request)
+                        .expect("dense state")
+                        .append(&operation.appended);
+                    *positions.entry(operation.request).or_insert(0) += operation.appended.len();
+                }
+                paged
+                    .check_invariants()
+                    .expect("paged invariant after the step");
+                for (id, mirror) in &dense {
+                    let position = positions.get(id).copied().unwrap_or(0);
+                    if position > 0 {
+                        let paged_step = paged.step(*id, position - 1).expect("paged step");
+                        let dense_step = mirror.step(position - 1).expect("dense step");
+                        assert_same_served(
+                            &paged_step,
+                            &dense_step,
+                            &format!("request {id} at position {}", position - 1),
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn a_zero_token_request_finishes_without_losing_a_slot() {
+            let engine = engine();
+            let specs = vec![
+                RequestSpec::new(1, vec![1, 2, 3], 0),
+                RequestSpec::new(2, vec![4, 5, 6], 2),
+            ];
+            let report = run(&engine, BatchPolicy::new(2, 2).expect("policy"), specs);
+            let zero = output(&report, 1);
+            assert!(zero.tokens.is_empty());
+            assert!(zero.logits.is_empty());
+            assert_eq!(zero.first_token_step, None);
+            assert_eq!(
+                zero.steps_advanced, 2,
+                "the zero cap still prefills in two chunks"
+            );
+            assert_eq!(output(&report, 2).tokens.len(), 2);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

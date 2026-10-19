@@ -1081,16 +1081,132 @@ struct IndexRequest<'a> {
 ///
 /// The q_norm output is a bf16 tensor, and the ColumnParallelLinear at the model dtype
 /// quantises it to E4M3 over 32-value blocks with power-of-two scales before the fp8 GEMM.
-fn indexer_query_activation(config: &ModelConfig, q: &[f32]) -> Vec<f32> {
-    let mut latent: Vec<f32> = q.iter().map(|value| quant::bf16_round(*value)).collect();
+/// This is the one implementation of that step: the host path and the device arm's twin both
+/// reach it through [indexer_wq_b_native].
+fn indexer_activation_native(latent: &[f32], width: usize) -> Vec<f32> {
+    let mut values: Vec<f32> = latent
+        .iter()
+        .map(|value| quant::bf16_round(*value))
+        .collect();
     round_trip_rows(
-        &mut latent,
-        config.q_lora_rank,
+        &mut values,
+        width,
         INDEX_QUANT_BLOCK,
         Element::Fp8,
         ScaleRule::PowerOfTwo,
     );
-    latent
+    values
+}
+
+/// The indexer query projection's native rule, as a host function (model.py:519, 550).
+///
+/// The reference's `wq_b` is a `ColumnParallelLinear` at the default dtype: the bf16 `q_norm`
+/// output is narrowed, quantised to E4M3 over 32-value blocks with power-of-two (ue8m0) scales,
+/// multiplied against the same-quantised weight, accumulated in f32, and narrowed to bf16.
+/// `weight` is the dequantised fp8 weight, row-major `[cols][inner]`. The host path calls this
+/// and the device arm's twin test compares against it, so the two arms cannot drift into
+/// different arithmetic.
+///
+/// # Errors
+///
+/// [EngineError::Shape] when `latent` is shorter than `rows x inner` or `weight` is shorter
+/// than `cols x inner`.
+pub fn indexer_wq_b_native(
+    latent: &[f32],
+    weight: &[f32],
+    rows: usize,
+    cols: usize,
+    inner: usize,
+) -> Result<Vec<f32>, EngineError> {
+    let latent_values = rows.saturating_mul(inner);
+    let weight_values = cols.saturating_mul(inner);
+    if latent.len() < latent_values || weight.len() < weight_values {
+        return Err(shape(
+            "indexer wq_b",
+            format!(
+                "{rows} rows of {inner} values need {latent_values} latent and {cols} output columns need {weight_values} weight values, got {} and {}",
+                latent.len(),
+                weight.len()
+            ),
+        ));
+    }
+    let activation = indexer_activation_native(&latent[..latent_values], inner);
+    let mut out = vec![0.0; rows * cols];
+    linalg::matmul(&mut out, &activation, weight, cols, inner, rows)?;
+    for value in out.iter_mut() {
+        *value = quant::bf16_round(*value);
+    }
+    Ok(out)
+}
+
+/// How many rows of the indexer query projection fit one bf16 output staging buffer.
+///
+/// The device arm stages `rows x cols` bf16 values through the shared attention output buffer,
+/// so a prefill chunk is projected in row chunks. GEMM rows are independent, which makes the
+/// chunk size an allocation detail rather than an arithmetic one; at least one row is returned,
+/// and a width that cannot fit any row returns 1 so the caller gets a typed refusal rather than
+/// a division by zero.
+#[must_use]
+pub fn indexer_chunk_rows(cols: usize, max_out_bytes: usize) -> usize {
+    let bytes_per_row = cols.saturating_mul(2).max(2);
+    (max_out_bytes / bytes_per_row).max(1)
+}
+
+/// Projects an indexer query chunk in row chunks that fit `max_out_bytes`.
+///
+/// `project(start, count)` returns a chunk's `count x cols` bf16-representable values. This is
+/// the one chunking implementation: the device arm passes a closure over its kernel launch and
+/// the host test passes one over [indexer_wq_b_native], so the test proves the arithmetic is
+/// transparent to the chunking instead of asserting it.
+///
+/// # Errors
+///
+/// [EngineError::Shape] when a chunk returns the wrong number of values, plus whatever
+/// `project` returns.
+pub fn indexer_wq_b_chunked<F>(
+    rows: usize,
+    cols: usize,
+    max_out_bytes: usize,
+    mut project: F,
+) -> Result<Vec<f32>, EngineError>
+where
+    F: FnMut(usize, usize) -> Result<Vec<f32>, EngineError>,
+{
+    let chunk = indexer_chunk_rows(cols, max_out_bytes);
+    let mut out = Vec::with_capacity(rows.saturating_mul(cols));
+    let mut start = 0;
+    while start < rows {
+        let count = chunk.min(rows - start);
+        let values = project(start, count)?;
+        if values.len() != count * cols {
+            return Err(shape(
+                "indexer wq_b chunk",
+                format!(
+                    "rows {start}..{} of {cols} columns need {} values, got {}",
+                    start + count,
+                    count * cols,
+                    values.len()
+                ),
+            ));
+        }
+        out.extend_from_slice(&values);
+        start += count;
+    }
+    Ok(out)
+}
+
+/// The host path of the indexer query projection: read the fp8 weight in its grid and run the
+/// native rule.
+fn index_source_wq_b(request: &IndexRequest<'_>) -> Result<Vec<f32>, EngineError> {
+    let config = request.config;
+    let cols = config.index_n_heads.saturating_mul(config.index_head_dim);
+    let wq_b = dense_weight(
+        request.src,
+        &format!("{}.attn.indexer.wq_b", request.prefix),
+        cols,
+        config.q_lora_rank,
+    )?;
+    indexer_wq_b_native(request.q, &wq_b, request.seqlen, cols, config.q_lora_rank)
 }
 
 /// The indexer's scores for one index source, bf16 all the way (model.py:553-557).
@@ -1142,6 +1258,7 @@ fn index_scores(
 fn index_source_indices(
     request: &IndexRequest<'_>,
     out: &mut Vec<usize>,
+    backend: Option<&mut dyn AttentionProjectionBackend>,
 ) -> Result<Option<Vec<bool>>, EngineError> {
     let config = request.config;
     let head_dim = config.index_head_dim;
@@ -1149,24 +1266,33 @@ fn index_source_indices(
     let seqlen = request.seqlen;
     let n_pos = request.n_pos;
     // The query projection, rotated and fp4 round-tripped exactly like the keys (model.py:550-552).
-    let q_latent = indexer_query_activation(config, request.q);
-    let mut q_index = vec![0.0; seqlen * heads * head_dim];
-    let wq_b = dense_weight(
-        request.src,
-        &format!("{}.attn.indexer.wq_b", request.prefix),
-        heads * head_dim,
-        config.q_lora_rank,
-    )?;
-    linalg::matmul(
-        &mut q_index,
-        &q_latent,
-        &wq_b,
-        heads * head_dim,
-        config.q_lora_rank,
-        seqlen,
-    )?;
-    for value in q_index.iter_mut() {
-        *value = quant::bf16_round(*value);
+    // The projection is the one primitive a device arm may replace: both arms run the same native
+    // rule (fp8 W8A8 with a bf16 output), one through [indexer_wq_b_native], the other through the
+    // pinned dense kernel, so a launch or chunking choice cannot change the arithmetic.
+    let mut q_index = if let Some(backend) = backend {
+        match backend.indexer_wq_b(
+            config,
+            request.layer,
+            request.prefix,
+            request.q,
+            request.src.source,
+            request.src.limit,
+        )? {
+            Some(values) => values,
+            None => index_source_wq_b(request)?,
+        }
+    } else {
+        index_source_wq_b(request)?
+    };
+    if q_index.len() != seqlen * heads * head_dim {
+        return Err(shape(
+            "indexer query projection",
+            format!(
+                "{seqlen} rows of {heads} index heads x {head_dim} need {} values, got {}",
+                seqlen * heads * head_dim,
+                q_index.len()
+            ),
+        ));
     }
     let tables = rope_tables_for_layer(
         config,
@@ -1424,8 +1550,9 @@ fn publish_rows(
 /// [EngineError::Shape] when the state has no step recorded, a layer that reads the channel finds
 /// nothing published for this chunk, the published rows are too short, or a tensor has the wrong
 /// geometry.
-#[allow(clippy::too_many_arguments)] // the prescribed signature is fixed by the task and clippy's limit is 7; all eight inputs are distinct.
-pub fn compressed_indices(
+/// The implementation of [compressed_indices] and [compressed_indices_with_backend].
+#[allow(clippy::too_many_arguments)] // the prescribed signature is fixed by the task and clippy's limit is 7; all nine inputs are distinct.
+fn compressed_indices_inner(
     state: &AttnState,
     config: &ModelConfig,
     layer: usize,
@@ -1434,6 +1561,7 @@ pub fn compressed_indices(
     prefix: &str,
     out: &mut Vec<usize>,
     limit: usize,
+    backend: Option<&mut dyn AttentionProjectionBackend>,
 ) -> Result<(), EngineError> {
     let src = Reads { source: src, limit };
     out.clear();
@@ -1500,7 +1628,7 @@ pub fn compressed_indices(
             ratio,
             n_pos,
         };
-        index_source_indices(&request, out)
+        index_source_indices(&request, out, backend)
     })?;
     with_shared(|shared| {
         shared.topk.clear();
@@ -1519,10 +1647,78 @@ pub fn compressed_indices(
     Ok(())
 }
 
-/// The five GEMM primitives of the attention sublayer, split out so a device arm can replace the
-/// matrix multiplies without replacing the host normalisation, RoPE, KV, cache, indexer or softmax
-/// seams. The host implementation is the reference arithmetic; [attention_forward_with_backend]
-/// uses it for every non-device caller.
+/// Chooses the compressed positions each query of this chunk attends to, in the shared index
+/// space, with [`NO_INDEX`] where a query has nothing (model.py:527-580).
+///
+/// `q` is this layer's query latent, the output of `wq_a` and `q_norm`: the indexer projects it
+/// with its own `wq_b` (model.py:550). Run [attention_forward] on the same state for this chunk
+/// first: the published per-query weights and the window length the ids are shifted by are
+/// per-step inputs that the fixed signature carries neither of, so the state holds them. A layer
+/// that is not an index source reads what its source published instead of computing anything
+/// (model.py:725-726). `limit` caps the elements of any single tensor this pass materialises.
+///
+/// This is the host arm: the indexer's query projection runs the engine's native host rule
+/// ([indexer_wq_b_native]). [`compressed_indices_with_backend`] is the same function with a
+/// projection backend that may run `wq_b` on a device.
+///
+/// # Errors
+///
+/// [EngineError::Shape] when the state has no step recorded, a layer that reads the channel finds
+/// nothing published for this chunk, the published rows are too short, or a tensor has the wrong
+/// geometry.
+#[allow(clippy::too_many_arguments)]
+pub fn compressed_indices(
+    state: &AttnState,
+    config: &ModelConfig,
+    layer: usize,
+    q: &[f32],
+    src: &dyn WeightSource,
+    prefix: &str,
+    out: &mut Vec<usize>,
+    limit: usize,
+) -> Result<(), EngineError> {
+    compressed_indices_inner(state, config, layer, q, src, prefix, out, limit, None)
+}
+
+/// [`compressed_indices`] with a projection backend.
+///
+/// The backend's [`AttentionProjectionBackend::indexer_wq_b`] is consulted for the index source
+/// layers; `None` from the backend keeps the engine's host native rule, so a backend that does
+/// not implement the indexer projection is still the host arm.
+///
+/// # Errors
+///
+/// As [`compressed_indices`], plus whatever the backend returns.
+#[allow(clippy::too_many_arguments)]
+pub fn compressed_indices_with_backend(
+    state: &AttnState,
+    config: &ModelConfig,
+    layer: usize,
+    q: &[f32],
+    src: &dyn WeightSource,
+    prefix: &str,
+    out: &mut Vec<usize>,
+    limit: usize,
+    backend: &mut dyn AttentionProjectionBackend,
+) -> Result<(), EngineError> {
+    compressed_indices_inner(
+        state,
+        config,
+        layer,
+        q,
+        src,
+        prefix,
+        out,
+        limit,
+        Some(backend),
+    )
+}
+
+/// The projection primitives of the attention sublayer - the five attention GEMMs plus the
+/// indexer's own wq_b - split out so a device arm can replace the matrix multiplies without
+/// replacing the host normalisation, RoPE, KV, cache, indexer scoring or softmax seams. The host
+/// implementation is the reference arithmetic; [attention_forward_with_backend] uses it for every
+/// non-device caller.
 pub trait AttentionProjectionBackend {
     /// wq_a over the normalised attention input; returns the pre-norm latent.
     fn wq_a(
@@ -1573,6 +1769,25 @@ pub trait AttentionProjectionBackend {
         limit: usize,
     ) -> Result<Vec<f32>, EngineError>;
 
+    /// The indexer's own query projection: `wq_b`, an fp8 W8A8 GEMM whose output is bf16
+    /// (model.py:519, 550).
+    ///
+    /// The rows are `[seqlen][index_n_heads * index_head_dim]`, bf16-representable, and exactly
+    /// the native rule's output ([indexer_wq_b_native]). `None` leaves the projection to the
+    /// engine's host rule; a device arm returns `Some` and the host path is skipped.
+    fn indexer_wq_b(
+        &mut self,
+        config: &ModelConfig,
+        layer: usize,
+        prefix: &str,
+        latent: &[f32],
+        src: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Option<Vec<f32>>, EngineError> {
+        let _ = (config, layer, prefix, latent, src, limit);
+        Ok(None)
+    }
+
     /// The CSA-union attention body over the already-built q, window KV, compressed rows and
     /// per-query candidate ids. Returns `true` when the backend wrote `out`; the default `false`
     /// keeps the engine's reference sparse-attention loop. A backend may support only a subset of
@@ -1615,7 +1830,7 @@ pub trait AttentionProjectionBackend {
 }
 
 /// The host reference backend. It is the old arithmetic unchanged; the device arm is a different
-/// implementation of the same five primitive contracts.
+/// implementation of the same primitive contracts.
 pub struct HostAttentionProjectionBackend;
 
 impl AttentionProjectionBackend for HostAttentionProjectionBackend {
@@ -2285,7 +2500,7 @@ pub fn attention_forward_with_backend(
         } else {
             state.index_weights.clear();
         }
-        compressed_indices(
+        compressed_indices_with_backend(
             state,
             config,
             layer,
@@ -2294,6 +2509,7 @@ pub fn attention_forward_with_backend(
             prefix,
             &mut compressed_ids,
             limit,
+            &mut *backend,
         )?;
         write_compressed_cache(config, layer, start_pos, state)?;
         state.compressed_len = compress_len;
@@ -3278,11 +3494,11 @@ mod tests {
     /// quantised to E4M3 over 32-value blocks with power-of-two scales before the GEMM
     /// (model.py:519, 187-199).
     #[test]
-    fn the_indexer_query_activation_is_bf16_narrowed_then_fp8_quantised() {
+    fn the_indexer_activation_is_bf16_narrowed_then_fp8_quantised() {
         let config = ModelConfig::tiny();
         let width = config.q_lora_rank;
         let q: Vec<f32> = (0..width).map(|index| 0.1 + index as f32 * 0.03).collect();
-        let activation = indexer_query_activation(&config, &q);
+        let activation = indexer_activation_native(&q, width);
         assert_eq!(activation.len(), q.len());
         let narrowed: Vec<f32> = q.iter().map(|value| quant::bf16_round(*value)).collect();
         assert_ne!(
@@ -4076,5 +4292,56 @@ mod tests {
             rounded, second_probability,
             "the test's probability must sit below bf16 resolution for the pin to bite"
         );
+    }
+
+    /// The chunk size is derived from the output buffer, not hardcoded: the shared 32,768-value
+    /// staging buffer fits eight rows of 4,096 columns, and a buffer smaller than one row still
+    /// yields one row.
+    #[test]
+    fn chunk_rows_are_derived_from_the_output_buffer() {
+        assert_eq!(indexer_chunk_rows(4096, 32_768 * 2), 8);
+        assert_eq!(indexer_chunk_rows(4096, 3 * 4096 * 2), 3);
+        assert_eq!(indexer_chunk_rows(4096, 1), 1);
+        assert_eq!(
+            indexer_chunk_rows(0, 1),
+            1,
+            "an empty width still yields a chunk"
+        );
+        let rows = 19;
+        let cols = 16;
+        let chunk = indexer_chunk_rows(cols, 3 * cols * 2);
+        assert_eq!(chunk, 3, "the buffer holds exactly three rows");
+        let chunks: Vec<usize> = (0..rows)
+            .step_by(chunk)
+            .map(|start| (rows - start).min(chunk))
+            .collect();
+        assert_eq!(chunks, vec![3, 3, 3, 3, 3, 3, 1]);
+    }
+
+    /// Chunking is an allocation detail: each chunk projects its own rows through the same
+    /// native rule, and the concatenation is bit-identical to one projection of all rows.
+    #[test]
+    fn chunked_projection_is_bit_identical_to_one_projection() {
+        let rows = 19;
+        let cols = 16;
+        let inner = 32;
+        let latent: Vec<f32> = (0..rows * inner).map(pattern).collect();
+        let weight: Vec<f32> = (0..cols * inner).map(pattern).collect();
+        let single = indexer_wq_b_native(&latent, &weight, rows, cols, inner)
+            .expect("one projection of the whole chunk");
+        let chunked = indexer_wq_b_chunked(rows, cols, 3 * cols * 2, |start, count| {
+            let window = &latent[start * inner..(start + count) * inner];
+            indexer_wq_b_native(window, &weight, count, cols, inner)
+        })
+        .expect("the same rows in chunks");
+        assert_eq!(single.len(), rows * cols);
+        assert_eq!(chunked.len(), single.len());
+        for (index, (one, many)) in single.iter().zip(chunked.iter()).enumerate() {
+            assert_eq!(
+                one.to_bits(),
+                many.to_bits(),
+                "value {index} differs between one projection and the chunked one"
+            );
+        }
     }
 }

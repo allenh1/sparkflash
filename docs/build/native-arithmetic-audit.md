@@ -201,9 +201,9 @@ device path.
 | 16 | compressor (ratio == 1) | **bf16** `wkv` Linear then norm (`model.py:446-449,461-463`) | host f32 matmul then f32 norm (`attention.rs:913-921`) | `native` (task-10: the wkv output and the norm are narrowed) | NONE | SOURCE; same test as #15 |
 | 17 | compressed KV: RoPE then fp4 (block 16, E4M3 scale) in place | bf16 latent -> rope bf16 -> `fp4_act_quant(..., 16, True, e4m3)` -> bf16 cache (`model.py:757-761`) | host `write_compressed_cache`: f32 rotate then `round_trip_rows(Element::Fp4, ScaleRule::E4M3Six)` with the `6*2^-9` floor and block 16 (`attention.rs:1869-1930,207-211`) | `native` (task-10 narrows the rope writeback; the latent was already bf16 from #15) | NONE | SOURCE: block size, scale dtype and floor all match `kernel.py:128-181` |
 | 18 | indexer k: `wk` (bf16 GEMM), `k_norm`, rope, fp4 block 32 ue8m0 in place | bf16 Linear -> bf16 norm -> bf16 rope -> fp4 (`model.py:540-546`) | host `write_index_keys`: f32 matmul over the bf16 weights widened to f32, f32 norm, f32 rope, fp4 round trip (`attention.rs:1799-1861`) | `native` (task-10 narrows the k_norm output and the rope writeback before the fp4 round trip) | NONE | SOURCE; test `the_quantiser_seams_narrow_the_host_value_to_bf16_first` |
-| 19 | indexer q: `wq_b` **fp8 W8A8**, rope, fp4 block 32 | `ColumnParallelLinear` fp8: `act_quant` on the bf16 q_norm output, fp8 GEMM, bf16 out, then rope, then fp4 (`model.py:519,550-552`) | host `index_source_indices`: **f32 matmul over dequantised fp8 weights with no activation quantisation**, f32 rope, fp4 round trip (`attention.rs:1045-1080`) | `native, minus a quant` (task-10 narrows the rope writeback; the absent W8A8 activation quant is the remaining gap) | MEDIUM (F3) | SOURCE; unmeasured |
-| 20 | indexer weights and scores | `weights_proj` bf16 GEMM x float -> bf16; `einsum` bf16 x bf16 -> bf16; `relu`, `* weights` -> bf16, `sum(head)` -> bf16 (`model.py:553-557`) | host f32 throughout: f32 `index_weights` (`attention.rs:1771-1788`), f32 dot and f32 head sum (`attention.rs:1102-1119`) | `native, minus rounds` | LOW (F3) | SOURCE; unmeasured |
-| 21 | two-level top-k and reachability | on the **bf16** scores (`model.py:560-580,583-611`) | host on f32 scores; the two levels, the shift into the shared index space and the tie rule are reproduced (`attention.rs:1120-1205,1214+`) | `native` structure + F3 score dtype | LOW-MEDIUM (F3) | SOURCE; a flip needs a near-tie |
+| 19 | indexer q: `wq_b` **fp8 W8A8**, rope, fp4 block 32 | `ColumnParallelLinear` fp8: `act_quant` on the bf16 q_norm output, fp8 GEMM, bf16 out, then rope, then fp4 (`model.py:519,550-552`) | host `indexer_wq_b_native` (attention.rs:1086-1160): bf16-narrowed q latent, E4M3 32-block ue8m0 activation quant, f32 accumulation over the dequantised fp8 weights, one bf16 round at the output; the same rule also runs on the pinned `b12x_mxfp8_dense_sm121` kernel through `AttentionProjectionBackend::indexer_wq_b`, bit-identical per `crates/sparkflash-cli/tests/indexer_seam.rs`; f32 rope, fp4 round trip (F5) | `native` (F3 arithmetic; batch-8 seam is wiring) - remaining gap is F5 rope/fp4 round trip, not F3 | MEDIUM (F3), low at the planned lengths because selection is reachability | SOURCE + host tests + kernel-twin test; N9 long-context selection measurement owed |
+| 20 | indexer weights and scores | `weights_proj` bf16 GEMM x float -> bf16; `einsum` bf16 x bf16 -> bf16; `relu`, `* weights` -> bf16, `sum(head)` -> bf16 (`model.py:553-557`) | host `index_weights`: bf16 values (`attention.rs:2090-2120`); `index_scores`: the dot and each rectified product narrow to bf16, the head sum accumulates in f32 and narrows once (`attention.rs:1215-1255`) | `native` | LOW (F3) | SOURCE; tests `the_indexer_scores_narrow_each_step_to_bf16`, `the_indexer_weights_are_bf16_narrowed` |
+| 21 | two-level top-k and reachability | on the **bf16** scores (`model.py:560-580,583-611`) | host on the bf16 scores; the two levels, the shift into the shared index space and the tie rule are reproduced (`attention.rs:1257-1500`) | `native` | LOW at the planned lengths: topk = n_pos, so selection is the reachability mask (argument in docs/build/indexer-native-dtype.md) | SOURCE; a flip needs a near-tie, and no released `topk_idxs` exists to compare; task-12 long-context item |
 
 ### 3.3 Attention body (format 2)
 
@@ -343,21 +343,27 @@ Native indexer: `wq_b` is a `ColumnParallelLinear` at the default dtype, i.e. **
 output. `weights_proj` and `wk` are bf16 Linears, and the score path (`model.py:553-557`) is bf16
 tensors: bf16 einsum, bf16 `relu * weights`, f32-accumulated sum to bf16.
 
-Chain: the host indexer (`attention.rs:1045-1080`) computes `wq_b` as an **f32 matmul over the
-dequantised fp8 weights with no activation quantisation**, then rope, then the fp4 q round trip; the
-scores, the per-head weights and the head sum are all f32 (`attention.rs:1102-1119`). The k path
-(`write_index_keys`) and the fp4 round trips themselves match native's format and rules (block 32,
-ue8m0, power-of-two ceil with the fp4 amax floor, `attention.rs:1799-1861,207-211`).
+Chain: batch 2 replaced the f32 projection with the native rule: `indexer_wq_b_native` narrows the
+q latent to bf16, quantises it E4M3 over 32-value ue8m0 blocks, accumulates in f32 over the
+dequantised fp8 weights and narrows the output to bf16; `index_scores` narrows the dot and each
+rectified product to bf16 and the head sum once (`attention.rs:1086-1255`). Batch 8 (task-8) added
+the device seam: a backend may run that projection on the already-pinned `b12x_mxfp8_dense_sm121`
+kernel in row chunks, and `crates/sparkflash-cli/tests/indexer_seam.rs` shows the host rule and the
+kernel's twin, fed the same operand bytes, agree bit for bit. The k path (`write_index_keys`) and the
+fp4 round trips themselves match native's format and rules (block 32, ue8m0, power-of-two ceil with
+the fp4 amax floor, `attention.rs:2124+,207-211`).
 
 Why MEDIUM rather than LOW: the indexer output is consumed **discretely** (the two top-k levels), so
-a small score deviation does not stay small - it either keeps the selected set or changes it. The q
-deviation is first-order (an absent fp8 quantisation propagating through the fp4 q codes), and the
-score's f32-vs-bf16 dtype is second-order. No measurement isolates either: the body twin is fed the
-chain's own `combined` index list, so it cannot see a selection difference against native.
+the rating is about the evidence, not the arithmetic: a class-B comparison cannot see a selection
+difference because the body twin is fed the chain's own `combined` list, and vLLM records no
+`topk_idxs`, so there is nothing released to compare a selection against. At the planned window
+lengths the risk is nil for a structural reason: index_topk = 512 > all reachable compressed
+positions, so the selection is the reachability mask and is score-independent (the argument and its
+bounds are in docs/build/indexer-native-dtype.md).
 
-Isolation: compare the chain's index scores and selected sets against the released forward's recorded
-`topk_idxs` (the fixture class already records per-stage codes, so this is a fixture extension, not a
-new model).
+Isolation: the arithmetic leg is now a no-GPU test (the host rule against the pinned kernel's twin on
+the same bytes); the selection leg needs a run with more than 512 compressed positions and is a named
+item on task-12 (N9), since vLLM records no `topk_idxs` for a released comparison.
 
 ### F4 - Engram runs entirely in f32 on the host. **MEDIUM.**
 
@@ -645,8 +651,8 @@ rounding order against `model.py`. "Declared at" is the code the device run exec
 | `RoPE` (q, kv, compressed latent, inverse) | `attention.rs:338-420,1066,1744,1833,1888,2309` | f32 rotation of a bf16 value, written back to bf16 once (`model.py:392-409`) | f32 rotation; bf16 only where the result is staged for the body | q/body **match** (one round at the same point); kv/compressed/inverse **mismatch** (the round is missing; inverse feeds F1) |
 | window row construction | `cuda_harness.rs:220-241` | quantiser input is bf16 (`model.py:706-707`) | bf16 by construction, and the two quantisers must agree | **match** |
 | compressor / cache | `attention.rs:893-994,1869-1930` | f32 pooling and f32 GEMMs when ratio > 1, then `norm(...).to(bf16)`; **bf16** GEMM when ratio == 1; fp4-16-E4M3 in place | f32 throughout; fp4 round trip with the same block/dtype/floor | **rule match, dtype mismatch**: the bf16 rounds are missing (F5); the ratio-1/ratio>1 dtype split is a native subtlety the chain collapses to f32, which is *more* precise for ratio 1 and equal for ratio > 1 apart from the latent's round |
-| selected-list assembly | `attention.rs:1084-1205` | top-k on bf16 scores, shift by the window length, unreachable -> -1, lower-position tie | same structure on f32 scores | **structure match, score dtype mismatch** (F3) |
-| indexer scoring | `attention.rs:1045-1119` | fp8 q projection, bf16 k projection, bf16 scores/weights | f32 projections, f32 scores/weights | **mismatch** (F3) |
+| selected-list assembly | `attention.rs:1257-1500` | top-k on bf16 scores, shift by the window length, unreachable -> -1, lower-position tie | same structure on the bf16 scores | **match** (F3; selection difference unmeasurable at the planned lengths, task-12) |
+| indexer scoring | `attention.rs:1086-1255`, `attention_device.rs` (seam) | fp8 q projection, bf16 k projection, bf16 scores/weights | same rule in `indexer_wq_b_native`/`index_scores`; the q projection may run on the pinned B12x kernel with a bit-identical twin test | **match** (F3) |
 | `D8 quantisers` | `attention_device.rs:618-624`, `moe_device.rs:2030-2033` | ceil rule on a bf16 tensor | ceil rule on an f32 vector | **rule match** (measured 5,120/5,120 codes at stage 0), **input dtype mismatch** (F5) |
 | router selected-id readback / local mapping | `moe_device.rs:576-600,646-701` | ids are int32, mapped to per-rank experts | ids read back as u32, mapped by expert index; no arithmetic | **match** |
 | selected-expert staging | `moe_device.rs:482-1134,1852-1896` | the weight bytes and the router's ids | same bytes, staged per distinct expert; the GEMMs are device-native | **match** |

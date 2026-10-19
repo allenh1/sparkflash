@@ -56,7 +56,7 @@ class FakeTransport:
 
     def __init__(self, served_root=SERVED_ROOT, metrics_script=None, completions_script=None,
                  metrics_raises=None, background_sets_load=True, background_sleep=0.05,
-                 model=MODEL):
+                 probe_sleep=0.0, realistic_gauge=False, model=MODEL):
         self.served_root = served_root
         self.model = model
         self.metrics_script = list(metrics_script or [])
@@ -64,7 +64,14 @@ class FakeTransport:
         self.metrics_raises = metrics_raises
         self.background_sets_load = background_sets_load
         self.background_sleep = background_sleep
+        self.probe_sleep = probe_sleep
+        #: lag-faithful gauge: running = background request (1) + probe request (1 while in flight);
+        #: the probe's contribution is decremented BEFORE the response is returned, so a snapshot
+        #: taken after the response can only see the background generation (the C1 race).
+        self.realistic_gauge = realistic_gauge
         self.load_active = threading.Event()
+        self.background_active = threading.Event()
+        self.probe_active = threading.Event()
         self.calls = []
         self.lock = threading.Lock()
 
@@ -80,6 +87,11 @@ class FakeTransport:
             with self.lock:
                 if self.metrics_script:
                     text = self.metrics_script.pop(0) if len(self.metrics_script) > 1 else self.metrics_script[0]
+                elif self.realistic_gauge:
+                    running = (1 if self.background_active.is_set() else 0) + (
+                        1 if self.probe_active.is_set() else 0
+                    )
+                    text = metrics_text(running, 0)
                 else:
                     text = metrics_text(2 if self.load_active.is_set() else 0)
             return text.encode(), text
@@ -91,9 +103,11 @@ class FakeTransport:
         if payload.get("max_tokens", 1) > 1:
             if self.background_sets_load:
                 self.load_active.set()
+                self.background_active.set()
             try:
                 time.sleep(self.background_sleep)
             finally:
+                self.background_active.clear()
                 self.load_active.clear()
             body = {"choices": [{"text": "background", "finish_reason": "length"}]}
             return json.dumps(body).encode(), body
@@ -104,6 +118,12 @@ class FakeTransport:
         scale = 1.0
         if isinstance(item, dict) and "scale" in item:
             scale = float(item["scale"])
+        if self.probe_sleep > 0:
+            self.probe_active.set()
+            try:
+                time.sleep(self.probe_sleep)
+            finally:
+                self.probe_active.clear()
         body = completion_body(payload["prompt"], scale)
         return json.dumps(body).encode(), body
 
@@ -272,6 +292,21 @@ class HappyPathTests(unittest.TestCase):
             self.assertEqual(len(fake.posts()), 5)
             self.assertEqual(data["warnings"], [])
 
+    def test_compact_output_is_valid_and_smaller(self):
+        fake = FakeTransport()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plan = self.make_plan(tmpdir)
+            pretty = os.path.join(tmpdir, "pretty.json")
+            compact = os.path.join(tmpdir, "compact.json")
+            self.assertEqual(run(fake, plan, pretty), 0)
+            self.assertEqual(run(FakeTransport(), plan, compact, ["--compact"]), 0)
+            with open(pretty, "rb") as handle:
+                pretty_bytes = handle.read()
+            with open(compact, "rb") as handle:
+                compact_bytes = handle.read()
+            self.assertLess(len(compact_bytes), len(pretty_bytes))
+            self.assertEqual(read_capture(compact)["schema"], capture.CAPTURE_SCHEMA)
+
     def test_dry_run_makes_no_requests(self):
         def factory(base_url, timeout):
             raise AssertionError("dry-run must not construct a transport")
@@ -332,6 +367,35 @@ class BusyBlockTests(unittest.TestCase):
             self.assertEqual(run(fake, self.busy_plan(tmpdir), out, ["--background-start-wait", "0.2"]), 2)
             self.assertFalse(os.path.exists(out))
 
+    def test_busy_evidence_is_sampled_while_a_probe_is_in_flight(self):
+        # Lag-faithful gauge: the probe contribution disappears BEFORE its response is returned, so
+        # a snapshot taken after the response can only see the background generation (the C1 race).
+        # Only the concurrent sampler can catch running == 2.
+        fake = FakeTransport(realistic_gauge=True, background_sleep=0.5, probe_sleep=0.05)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = os.path.join(tmpdir, "capture.json")
+            extra = ["--sample-interval", "0.002", "--background-start-wait", "2"]
+            self.assertEqual(run(fake, self.busy_plan(tmpdir), out, extra), 0)
+            data = read_capture(out)
+            block = data["blocks"][0]
+            self.assertEqual(block["class"], "busy_distractor")
+            running = [snapshot["num_requests_running"] for snapshot in block["idleness"]["metrics_during"]]
+            self.assertIn(2, running)  # probe in flight next to the background generation
+            self.assertIn(1, running)  # and the after-response snapshots already show only the background
+            self.assertTrue(block["idleness"]["observed_other_traffic"])
+            self.assertEqual(data["status"], "mixed")
+
+    def test_busy_block_refuses_when_the_sampler_never_sees_the_probe_window(self):
+        # A sampler interval longer than the whole probe sequence misses the in-flight window; the
+        # capture must refuse (exit 2, nothing written) instead of writing a busy class the floor
+        # script would reject.
+        fake = FakeTransport(realistic_gauge=True, background_sleep=0.4, probe_sleep=0.02)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = os.path.join(tmpdir, "capture.json")
+            extra = ["--sample-interval", "10", "--background-start-wait", "2"]
+            self.assertEqual(run(fake, self.busy_plan(tmpdir), out, extra), 2)
+            self.assertFalse(os.path.exists(out))
+
 
 class ReclassificationTests(unittest.TestCase):
     def test_idle_block_that_sees_traffic_is_tagged_busy(self):
@@ -353,6 +417,26 @@ class ReclassificationTests(unittest.TestCase):
             self.assertTrue(block["idleness"]["observed_other_traffic"])
             self.assertEqual(data["status"], "mixed")
 
+    def test_idle_block_that_sees_only_one_running_request_is_refused(self):
+        # running == 1 may be the capture's own in-flight request, so it is not co-tenancy
+        # evidence. The floor script would reject a busy class without running>1 or waiting>0;
+        # the capture refuses at capture time (C2) instead of writing a block that cannot be used.
+        fake = FakeTransport(metrics_script=[
+            metrics_text(0, 0), metrics_text(0, 0), metrics_text(0, 0),
+            metrics_text(1, 0), metrics_text(1, 0), metrics_text(1, 0),
+        ])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plan = plan_path(tmpdir, [{"id": "idle-B", "class": "idle_distractor",
+                                       "requests": [{"id": "a", "prompt": list(range(8))},
+                                                    {"id": "b", "prompt": list(range(9))}],
+                                       "pairs": [["a", "b"]]}])
+            out = os.path.join(tmpdir, "capture.json")
+            self.assertEqual(run(fake, plan, out), 2)
+            self.assertFalse(os.path.exists(out))
+            with open(out + ".log", "r", encoding="utf-8") as handle:
+                log = handle.read()
+            self.assertIn("no co-tenancy evidence", log)
+
 
 class FailureTests(unittest.TestCase):
     def test_request_failure_aborts_and_writes_nothing(self):
@@ -367,6 +451,55 @@ class FailureTests(unittest.TestCase):
             self.assertTrue(os.path.exists(out + ".log"))
             with open(out + ".log", "r", encoding="utf-8") as handle:
                 self.assertIn("REFUSED", handle.read())
+
+    def test_sampler_thread_stops_when_a_busy_request_fails(self):
+        fake = FakeTransport(completions_script=[capture.RecaptureError("HTTP 500 from /v1/completions")])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plan = plan_path(tmpdir, [{"id": "busy", "class": "busy_distractor",
+                                       "requests": [{"id": "p8", "prompt": list(range(8))},
+                                                    {"id": "p9", "prompt": list(range(9))}],
+                                       "pairs": [["p8", "p9"]],
+                                       "background": {"prompt": list(range(8)), "max_tokens": 8}}])
+            out = os.path.join(tmpdir, "capture.json")
+            self.assertEqual(run(fake, plan, out, ["--background-start-wait", "2"]), 2)
+            self.assertFalse(os.path.exists(out))
+            calls_after_failure = len(fake.calls)
+            time.sleep(0.05)
+            self.assertEqual(len(fake.calls), calls_after_failure)
+
+
+class IdleFallbackPlanTests(unittest.TestCase):
+    """The idle-only fallback plan must be the primary plan minus the busy block, verbatim."""
+
+    def plans(self):
+        primary_path = os.path.join(SCRIPTS, "d41_capture_plan.json")
+        idle_path = os.path.join(SCRIPTS, "d41_capture_plan_idle.json")
+        with open(primary_path, "r", encoding="utf-8") as handle:
+            primary = json.load(handle)
+        with open(idle_path, "r", encoding="utf-8") as handle:
+            idle = json.load(handle)
+        return primary, idle, idle_path
+
+    def test_idle_plan_is_the_primary_plan_minus_the_busy_block(self):
+        primary, idle, _ = self.plans()
+        self.assertEqual([block["class"] for block in primary["blocks"]],
+                         ["repeat", "idle_distractor", "busy_distractor"])
+        # Verbatim copy: ids, classes, requests, prompt arrays, order and pairs are identical.
+        self.assertEqual(idle["blocks"], primary["blocks"][:2])
+        self.assertEqual(idle["schema"], primary["schema"])
+        self.assertEqual(idle["recipe"], primary["recipe"])
+        self.assertEqual(idle["provenance"], primary["provenance"])
+        self.assertEqual(sum(len(block["requests"]) for block in idle["blocks"]), 9)
+        self.assertEqual([len(block["requests"]) for block in idle["blocks"]], [4, 5])
+        self.assertNotIn("busy_distractor", {block["class"] for block in idle["blocks"]})
+
+    def test_idle_plan_dry_runs_without_a_transport(self):
+        _, _, idle_path = self.plans()
+
+        def factory(base_url, timeout):
+            raise AssertionError("--dry-run must not construct a transport")
+
+        self.assertEqual(capture.run_cli(["--plan", idle_path, "--dry-run"], factory), 0)
 
 
 class PlanValidationTests(unittest.TestCase):

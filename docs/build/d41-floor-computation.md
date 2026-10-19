@@ -129,6 +129,19 @@ The markdown is generated from the same report, with the same hashes. Both are w
 after validation; on refusal no output path is touched. Files are written only on success, so a
 consumer cannot mistake a stale file for this run's output.
 
+## Running it on the real capture
+
+    python3 scripts/d41_floors.py \
+        --capture CAPTURE.json \
+        --out-json FLOORS.json --out-md FLOORS.md --out-bars BARS.json \
+        --source-revision <git sha of this tree>
+
+Add --require-classes repeat,idle_distractor only for the idle-only fallback plan; the omission is
+then recorded in parameters.required_classes and the D41 record must say the busy envelope was not
+captured. The capture may be compact JSON (scripts/d41_recapture.py --compact); the schema is the
+same and the floor script reads both. Exit 0 is ok, 2 is a refusal with no outputs, 3 is
+requires_review: the written bars file is then Lead's decision, not a retry.
+
 ## Tests
 
 scripts/tests/test_d41_floors.py, 36 unittest cases, synthetic captures only (no server, GPU, node
@@ -159,7 +172,12 @@ top-5, and requires_review exit 3.
   the new idle repeat/distractor capture in the schema above.
 - The capture's top band is capped at prompt_logprobs (1000); bars on the full 129,280-token
   vocabulary are not measurable from this input and are not emitted.
-- If window policy forbids the controlled background load, the run can use
-  --require-classes repeat,idle_distractor. The omission is recorded in the output parameters and
-  the D41 record must state that the busy load-state envelope was not captured.
+- If window policy forbids the controlled background load, the run can use the idle-only plan
+  (scripts/d41_capture_plan_idle.json) and --require-classes repeat,idle_distractor. That plan must
+  copy the primary plan's repeat and idle_distractor blocks verbatim - same block ids, request ids,
+  prompt arrays, order and pairs - and omit only the busy block, so the fallback idle floor is the
+  same apples-to-apples floor as the primary plan's. Its suite.sha256 is the idle plan's sha256, so
+  the provenance says which plan produced the capture. The omission is recorded in the output
+  parameters (required_classes) and the D41 record must state that the busy load-state envelope was
+  not captured and why.
 - D41 also fixes API/performance bars; those are not computed here.

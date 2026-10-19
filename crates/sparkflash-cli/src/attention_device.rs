@@ -1,15 +1,15 @@
-//! The c4a device attention backend: the five projection GEMMs plus the format-2 CSA-union
-//! attention body on the device, with the host normalisation, RoPE, KV, cache, compressor and
-//! selected-list seams left exactly where they are. This module is only compiled with
-//! `--features cuda`.
+//! The c4a device attention backend: the five attention projection GEMMs, the indexer's wq_b
+//! when a layer has compressed positions, and the format-2 CSA-union attention body on the
+//! device, with the host normalisation, RoPE, KV, cache, compressor and selected-list seams left
+//! exactly where they are. This module is only compiled with `--features cuda`.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use sparkflash_engine::config::ModelConfig;
-use sparkflash_engine::forward::attention::AttentionProjectionBackend;
 use sparkflash_engine::forward::attention::sparse_attention;
+use sparkflash_engine::forward::attention::{AttentionProjectionBackend, indexer_wq_b_chunked};
 use sparkflash_engine::forward::attention_case::{AttentionCaseRecord, NO_INDEX as CASE_NO_INDEX};
 use sparkflash_engine::linalg::EngineError;
 use sparkflash_engine::quant::quantize_activation_fp8;
@@ -145,7 +145,8 @@ pub fn default_twin_positions(window: usize) -> Vec<usize> {
 /// One launch's bookkeeping.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AttentionDeviceStats {
-    /// GEMM launches, five per layer when every method runs.
+    /// GEMM launches: five per layer when every attention projection runs, plus the indexer wq_b's
+    /// row chunks where a layer has compressed positions.
     pub launches: usize,
     /// Host microseconds spent reading, packing, quantising and uploading.
     pub staging_us: u64,
@@ -266,8 +267,9 @@ struct MlaBuffers {
     ptrs: Vec<Deviceptr>,
 }
 
-/// The device implementation of [AttentionProjectionBackend]. It stages one layer's five weights at
-/// a time into reused buffers; it never allocates the 5.07 GB cumulative matrix set on the device.
+/// The device implementation of [AttentionProjectionBackend]. It stages one layer's weights at a
+/// time into reused buffers (the indexer's wq_b included, when that projection runs); it never
+/// allocates the 5.07 GB cumulative matrix set on the device.
 pub struct AttentionDeviceBackend {
     cuda: Cuda,
     kernels: Kernels,
@@ -1364,6 +1366,52 @@ impl AttentionProjectionBackend for AttentionDeviceBackend {
             self.diag_q_raw = Some(out.clone());
         }
         Ok(out)
+    }
+
+    /// The indexer's own `wq_b`: the same pinned B12x MXFP8 GEMM as the attention projections,
+    /// run in row chunks that fit the shared output buffer (the buffer is sized for one projection,
+    /// not for prefill rows x 4096). The activation is quantised the native way per row chunk, and
+    /// GEMM rows are independent, so the chunking cannot change a value.
+    fn indexer_wq_b(
+        &mut self,
+        config: &ModelConfig,
+        layer: usize,
+        prefix: &str,
+        latent: &[f32],
+        src: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Option<Vec<f32>>, EngineError> {
+        let _ = limit;
+        let inner = config.q_lora_rank;
+        let cols = config
+            .index_n_heads
+            .checked_mul(config.index_head_dim)
+            .ok_or_else(|| EngineError::Shape {
+                what: "indexer wq_b geometry".to_owned(),
+                detail: format!(
+                    "{} index heads x {} head dim does not fit usize",
+                    config.index_n_heads, config.index_head_dim
+                ),
+            })?;
+        let rows = rows_of(latent, inner, "indexer wq_b input")?;
+        let out = indexer_wq_b_chunked(rows, cols, MAX_OUT_BYTES, |start, count| {
+            let window = &latent[start * inner..(start + count) * inner];
+            self.last_activation = Some(quantise_native_activation(
+                window,
+                "indexer wq_b activation",
+            )?);
+            self.dense(
+                config,
+                layer,
+                prefix,
+                src,
+                "indexer.wq_b.weight",
+                cols,
+                inner,
+                count,
+            )
+        })?;
+        Ok(Some(out))
     }
 
     fn wkv(
