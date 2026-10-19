@@ -374,8 +374,9 @@ criterion-shaped 130+8 run (b68) finished all 138 positions with flat memory, an
 (`491, 367, 201, 80, 3302, 201, 54, 201, 4341`). Memory is fixed (RSS flat at ~18.9 GB over 138
 positions) and the decode path works. The remaining blocker is arithmetic: MXFP8 activations against
 a f32 reference, with the attention-path drift flipping the router's expert set from layer 3 on. The
-records are the b55-b68 subsections in section 7; the precision-versus-criterion decision is
-[DECISIONS.md](../DECISIONS.md) D37.
+records are the b55-b68 subsections in section 7; the precision-versus-criterion decision is [DECISIONS.md](../DECISIONS.md) D37.
+
+**Update 2026-10-19 (D39): the token clause below is retired.** The chain runs the checkpoint's native arithmetic (32-element ue8m0-ceil activation quantiser, 32x32 ue8m0 / FP4-32 weights, f32 accumulate) and that is not what the f32 fixture computes; exact token reproduction is therefore not a criterion, and it is not attainable. Acceptance is numeric and distributional at declared tolerances against a native reference (the vLLM-released oracle, D38 actioned) and against the arithmetic twins. The token list and item 2 below are kept as the historical bar only.
 
 The PASS definition is:
 
@@ -386,7 +387,7 @@ The PASS definition is:
    weighted routed variant `swiglu_mxfp8_quant_weighted_sm121` (D33, measured in m17a) and the certified
    head's device reduce `lm_head_reduce_sm121` (D35, m19 measured b44; required only when the cut-over
    lands) - are not chain kernels. Device kernel launches > 0 (a host-only run cannot pass);
-2. tokens exactly 491, 367, 201, 80, 3302, 201, 54, 201, 4341 (`compare_steps`, `:699`);
+2. **[retired by D39]** tokens exactly 491, 367, 201, 80, 3302, 201, 54, 201, 4341 (`compare_steps`, `:699`);
 3. head reduction: the reduced argmax over the screen's per-block maxima (host `lm_head_argmax` in
    the first run; lowest-index tie-break `lm_head_ref::best_entry:161`) equals the expected token,
    and the report carries the certified/exact mask (the exactness of max/argmax is the

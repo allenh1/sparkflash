@@ -8,8 +8,9 @@ fixture) has not run, and Phase 2 exit criterion 1
 ([roadmap-to-serving.md](roadmap-to-serving.md) section 5.5.1) remains OPEN. As of 2026-10-19 the
 device side of that comparison is measured but not claimed (the sequence path is stage-faithful yet
 FP8-native against this f32 fixture, and its first criterion-shaped run aborted on a memory defect);
-the record is [device-forward-chain.md](device-forward-chain.md) section 7 and
-[DECISIONS.md](../DECISIONS.md) D37. The deployed vLLM serves a **different** checkpoint (D38), so its
+the record is [device-forward-chain.md](device-forward-chain.md) section 7 and [DECISIONS.md](../DECISIONS.md) D37.
+
+**Update 2026-10-19 (D39):** this fixture is a *simulation* reference - the CPU f32 forward over dequantised weights, not the checkpoint's native quantised arithmetic. Token comparison against it is retired as a criterion, and the cluster now serves the released snapshot (D38 actioned), which is the behavioural oracle for numeric comparisons. The fixture remains valid as a regression input. The deployed vLLM serves a **different** checkpoint (D38), so its
 tokens are not evidence about this fixture. The CSA-union format-2
 semantics that can reproduce this fixture's attended set are [DECISIONS.md](../DECISIONS.md) D24; the
 decision that this fixture is the truth is D25.

@@ -17,6 +17,8 @@ stopped, that client has no model. So:
 
 ## The canonical launch recipe
 
+**Update 2026-10-19 (D38 actioned, D39):** the canonical recipe now serves the **released** checkpoint. /home/user/phase2-evidence/window-2026-10-18/vllm-launch-recipe-released.sh (sha256 a3ac461fa02a945181a17b509f7695ca39b38930eee529a0f9fd9151061072c4) is the previous served recipe (vllm-launch-recipe-heretic-12d58ad0.sh, sha256 2a3e2c7719532149d3291d11964ace46bf27d9a0b656c39258d5a6295c552574, retained) with the model path switched to deepseek-ai/...-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170 and --max-logprobs 1000 added for the numeric comparison; window-vllm.sh (sha256 a3ba6763cc8f5087ab65dc7771e28e37e9b3a18842d2e72542c3f22f7344ef70) starts it. The served root is recorded from /v1/models in every evidence log. The old paragraph below is kept as history.
+
 Preserved at
 `/home/user/phase2-evidence/window-2026-10-18/vllm-launch-recipe.sh` (1,809 B, sha256
 `2a3e2c7719532149d3291d11964ace46bf27d9a0b656c39258d5a6295c552574`), generated from the recipe

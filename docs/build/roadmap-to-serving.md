@@ -788,8 +788,7 @@ the reference within the Phase 1 bar.
 ### 5.5 Exit criteria for Phase 2
 
 1. Prefill of a prompt **over 128 tokens** and **at least 8 decode steps**, every decoded token
-   reproduced against the reference (token-for-token, not just the last). The reference is the CPU
-   forward run with the same prompt and its own cache.
+   reproduced against the reference (token-for-token, not just the last). The reference is the CPU forward run with the same prompt and its own cache. **[Retired 2026-10-19 by D39: token equality is not a criterion (generation is not deterministic); acceptance is numeric/distributional within declared tolerances against the native reference and the arithmetic twins. Kept as history.]**
 2. The audit passes on every layer mode (Full, Full + HSI, Reindex, Reuse, SWA-only), with the
    corruption test failing as required.
 3. The measured per-token KV bytes equal 356 B times entries for the live geometry and the store's

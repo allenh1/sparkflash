@@ -111,9 +111,7 @@ the vocabulary (recorded in the fixture); no tokenizer is involved.
 
 ## 4. Comparison contract
 
-`compare_steps` is the primary bar: it checks set equality in both directions (a missing
-compared position fails; an extra older position fails), then next-token equality, then the logits
-SHA-256. `compare_logits` is the second bar: absolute max difference against the Phase-1 bar,
+`compare_steps` is the primary bar: it checks set equality in both directions (a missing compared position fails; an extra older position fails), then next-token equality, then the logits SHA-256. **[Update 2026-10-19 (D39): next-token equality is retired as an acceptance criterion - generation is not deterministic; this comparator remains the fixture-internal regression check.]** `compare_logits` is the second bar: absolute max difference against the Phase-1 bar,
 only where the fixture recorded logits. A widening of the compared set fails
 `UnexpectedPosition` and its message names D7 and the offending position.
 
