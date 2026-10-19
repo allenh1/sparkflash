@@ -139,6 +139,47 @@ pub fn quantise_row(gate: &[f32], up: &[f32], limit: f32) -> (Vec<u8>, Vec<u8>) 
     crate::m4_quant::act_quant_fp8_row(&activated)
 }
 
+/// The reference's per-value weighted activation before the quantiser: [swiglu] times the routing
+/// weight, each product rounded once to bf16 (round-nearest-even) and widened back to f32.
+///
+/// This is the order the model uses, and it is the arithmetic the weighted epilogue kernel
+/// (`kernels/swiglu_mxfp8_quant_weighted_sm121.cu`) performs: multiply, round to bf16, then
+/// quantise. It is exactly the map `mxfp4_ref::routed_activation_operand` applies to an activation,
+/// split out so the rounding step has a name and a test.
+#[must_use]
+pub fn weighted_activation(gate: &[f32], up: &[f32], limit: f32, weight: f32) -> Vec<f32> {
+    gate.iter()
+        .zip(up.iter())
+        .map(|(gate, up)| {
+            crate::m4_quant::bf16_value(crate::m4_quant::bf16_bits(
+                swiglu(*gate, *up, limit) * weight,
+            ))
+        })
+        .collect()
+}
+
+/// The routed combine operand for one row: [weighted_activation] followed by the same activation
+/// quantiser [quantise_row] uses.
+///
+/// `quantise_row_weighted(&g, &u, limit, w)` is therefore the composition
+/// `mxfp4_ref::routed_activation_operand(&swiglu_row(&g, &u, limit), w)`, which a test pins. The
+/// weighted kernel implements this function, not the unweighted epilogue plus a host multiply.
+#[must_use]
+pub fn quantise_row_weighted(
+    gate: &[f32],
+    up: &[f32],
+    limit: f32,
+    weight: f32,
+) -> (Vec<u8>, Vec<u8>) {
+    assert_eq!(gate.len(), up.len(), "the two branches are one row each");
+    assert_eq!(
+        gate.len() % QUANT_BLOCK,
+        0,
+        "a row is a whole number of MX blocks"
+    );
+    crate::m4_quant::act_quant_fp8_row(&weighted_activation(gate, up, limit, weight))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +470,115 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_weighted_reference_rounds_the_product_to_bf16_before_quantising() {
+        // The product is rounded to bf16 before the quantiser, exactly as
+        // mxfp4_ref::routed_activation_operand does. The unrounded product of a non-trivial swiglu
+        // value and a routing weight needs more than eight significand bits, so the two differ, and
+        // a reference that dropped the rounding would fail the first assertion.
+        let mut gate = [0.0f32; QUANT_BLOCK];
+        let mut up = [0.0f32; QUANT_BLOCK];
+        for index in 0..QUANT_BLOCK {
+            gate[index] = 1.0 + index as f32 * 0.25;
+            up[index] = 2.7 - index as f32 * 0.1;
+        }
+        let weight = 0.375f32;
+        let weighted = weighted_activation(&gate, &up, SWIGLU_LIMIT, weight);
+        assert_eq!(weighted.len(), gate.len());
+        let mut rounded_by_hand = Vec::new();
+        for (gate, up) in gate.iter().zip(&up) {
+            let product = swiglu(*gate, *up, SWIGLU_LIMIT) * weight;
+            let handled = crate::m4_quant::bf16_value(crate::m4_quant::bf16_bits(product));
+            rounded_by_hand.push(handled);
+        }
+        assert_eq!(weighted, rounded_by_hand);
+        // At least one product is not bf16-representable, so the rounding is observable here.
+        let raw: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(gate, up)| swiglu(*gate, *up, SWIGLU_LIMIT) * weight)
+            .collect();
+        assert_ne!(
+            weighted, raw,
+            "the fixture must contain a product the bf16 rounding changes"
+        );
+        // And the quantised operand is that rounded row through the activation rule.
+        let (codes, scales) = quantise_row_weighted(&gate, &up, SWIGLU_LIMIT, weight);
+        let (wanted_codes, wanted_scales) = crate::m4_quant::act_quant_fp8_row(&weighted);
+        assert_eq!(codes, wanted_codes);
+        assert_eq!(scales, wanted_scales);
+    }
+
+    #[test]
+    fn the_weighted_reference_is_routed_activation_operand_over_the_swiglu_row() {
+        // The F6 seam's definition: the host reference the m17a chain used. Composing it out of the
+        // weighted functions must give the same operand, so the kernel's class and the old host
+        // path's class are the same arithmetic.
+        let mut gate = [0.0f32; QUANT_BLOCK];
+        let mut up = [0.0f32; QUANT_BLOCK];
+        for index in 0..QUANT_BLOCK {
+            gate[index] = (index as f32 - 16.0) * 0.5;
+            up[index] = 1.5 - index as f32 * 0.05;
+        }
+        let weight = 1.5f32;
+        let (codes, scales) = quantise_row_weighted(&gate, &up, SWIGLU_LIMIT, weight);
+        let swiglu_row: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(gate, up)| swiglu(*gate, *up, SWIGLU_LIMIT))
+            .collect();
+        let (wanted_codes, wanted_scales) =
+            crate::mxfp4_ref::routed_activation_operand(&swiglu_row, weight);
+        assert_eq!(codes, wanted_codes);
+        assert_eq!(scales, wanted_scales);
+    }
+
+    #[test]
+    fn the_weighted_kernel_text_multiplies_before_it_rounds_and_quantises() {
+        // Source check for the kernel's ORDER: the product must be rounded to bf16 before the
+        // quantiser, and the quantiser must be the shared activation rule, not a second recipe. The
+        // window compares bits; this test keeps the source from quietly changing the order between
+        // windows.
+        let source = include_str!("../../../kernels/swiglu_mxfp8_quant_weighted_sm121.cu");
+        assert!(
+            source.contains("fminf(g, limit)"),
+            "the weighted gate branch is clamped on the upper side only"
+        );
+        assert!(
+            source.contains("fminf(fmaxf(u, -limit), limit)"),
+            "the weighted up branch is clamped on both sides"
+        );
+        let body = source
+            .split_once("extern \"C\" __global__ void swiglu_mxfp8_quant_weighted_sm121")
+            .expect("the weighted entry point must exist")
+            .1;
+        let weighted = body
+            .find("__float2bfloat16_rn(activated * weights[row])")
+            .expect("the product must be rounded to bf16");
+        let quantise = body
+            .find("spark_weighted_activation_quantize_block(")
+            .expect("the quantiser must be the shared activation rule");
+        assert!(
+            weighted < quantise,
+            "the bf16 rounding must happen before the quantiser, as the reference does"
+        );
+        assert!(
+            body.contains("const float weighted = __bfloat162float(__float2bfloat16_rn("),
+            "the rounded value must be widened back to f32 for the block-scale/encode helpers"
+        );
+        assert!(
+            source.contains("const float *__restrict__ weights"),
+            "the kernel must take the per-row routing weights as an operand"
+        );
+        assert!(
+            body.contains("weights[row]"),
+            "each row must be multiplied by its own routing weight"
+        );
+        assert!(
+            !source.contains("out_fp8[index] = spark_fp8_e4m3_encode("),
+            "the weighted path must quantise through its block helper, not a second inline recipe"
+        );
     }
 }

@@ -41,6 +41,7 @@ records the evidence and the consequence for the build. Research backing is in
 | D30 | Routed-expert sharding follows the verified kernel | TP=4 over the intermediate width (576 per rank padded to 640) for the routed experts, because that is the only routed-expert layout the device has run; the reference's whole-expert rule is recorded as not implemented, the shared expert stays whole and replicated, and the padding costs +8.22 GB/rank of routed-expert storage (74.0 -> 82.2 GB/rank) |
 | D31 | The certified LM head counts every thread's prunes, and the pin is re-baselined | `cert_lm_head_sm121`'s published `certified_count` was lane 0's per-thread count only, so the concentrated pruning case reported 34 against 4,899 flags (b21 printed only the aggregate count mismatch across the four ranks; b23 measured the per-rank 34); the atomic now adds every thread's prunes, the count is deterministic, and the cubin is re-pinned at 14,888 B / `7394b129...` with the ABI unchanged (same entry, geometry and `certified_count` semantic) |
 | D32 | The routing-weight multiply is a named host seam in the routed device chain (F6) | The released arithmetic multiplies the SwiGLU output by the routing weight BEFORE the w2 activation quantiser reads it, and no pinned routed kernel takes a weight operand. m17a therefore measures the device SwiGLU+quantise stage unweighted, and builds the combine operand on the host from the same device gate/up bf16 values with `mxfp4_ref::routed_activation_operand`; the combine is weighted but its activation operand is host-quantised by the reference's own rule. A weighted quantiser variant is the planned follow-up (new cubin, deliberate re-pin), not part of m17a |
+| D33 | The routed combine operand is built on the device: the weighted SwiGLU+quantise variant closes the F6 host seam | `swiglu_mxfp8_quant_weighted_sm121` (own cubin, 13,000 B / `0e602daf...`, `ptx_membar_lines=0`) takes a per-row routing-weight operand and does the model's order on the device: asymmetric-clamped SwiGLU, one bf16 rounding of the product, then the activation ceil-rule quantise. m17a's stage 3 reads the router's `weights_d` in place and stage 4's combine consumes those device codes/scales, so no host multiply and no host quantise remain in the routed path; the class is `swiglu_ref::quantise_row_weighted` (which equals `mxfp4_ref::routed_activation_operand` composed with SwiGLU) and the real 576-wide operand is compared against `routed_activation_operand` directly. The unweighted epilogue stays pinned for m17b's shared expert; the six-kernel frozen m4 ABI array is untouched; window b33 measured it PASS at tokens 8 and 130 (35 checks each) |
 
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
@@ -1828,3 +1829,71 @@ optional per-expert weight operand, a new cubin and a deliberate re-pin with its
 the re-pin pattern used for the certified LM head (m16's D31 landed as batch 14; this entry is D32) - and it is the only way to remove this
 seam from the device path. This entry deliberately does not claim a fully-device weighted routed
 block, per-token or per-layer text, or a host-time saving.
+
+## D33 - The routed combine operand is built on the device: the weighted SwiGLU+quantise variant closes the F6 host seam
+
+**Question.** D32 recorded the routing-weight multiply as a host seam: the model multiplies the
+SwiGLU activation by the slot's routing weight **before** the w2 activation quantiser reads it, and
+none of the four pinned routed kernels took a weight operand. The seam was honest but it kept one
+host multiply and one host quantise inside the device chain, and c4b would have to wire it.
+
+**Decision.** Close the seam with a second SwiGLU+quantise entry point, shipped as its own device
+source, own cubin and deliberate baseline re-pin:
+`kernels/swiglu_mxfp8_quant_weighted_sm121.cu`, entry
+`swiglu_mxfp8_quant_weighted_sm121(gate, up, weights, out_fp8, out_scales, rows, cols, limit,
+trace_ring, layer_id, step_seq)` - eleven argument words, the unweighted epilogue's ten plus the
+per-row `float *weights` operand. Its arithmetic is the model's order, element by element:
+
+1. `activation = swiglu(gate, up, limit)` with the reference's asymmetric clamp (gate upper side
+   only, up both sides), the same expression the unweighted epilogue uses;
+2. `weighted = bf16(activation * weights[row])` - one round-to-nearest-even bf16 rounding of the
+   product, exactly what `mxfp4_ref::routed_activation_operand` does before it quantises;
+3. the activation ceil-rule quantiser (`act_quant_fp8_row`'s rule: 1e-4 amax floor, smallest power of
+   two at or above amax/448, E4M3 encode) over the same 32-value blocks, so the output is the
+   `[rows][cols]` E4M3 + `[rows][cols/32]` ue8m0 operand `b12x_mxfp4_moe_sm121` consumes, padding
+   included (the padded gate/up bytes are zero, so they quantise to zero codes).
+
+The host reference is `swiglu_ref::quantise_row_weighted`, which a test pins as the composition
+`routed_activation_operand(&swiglu_row, weight)`; a second test proves the bf16 rounding step is
+observable in the intermediate (the unrounded product is not bf16-representable), and a source-text
+test pins the multiply-before-round-before-quantise order and the asymmetric clamp. The trace scope
+follows the shape as in the unweighted entry (cols = 640 -> `TRACE_SCOPE_MOE_MXFP4`), and the helper
+that computes a block's scale and code is a separately named function so the combined probe can
+compile both translation units.
+
+**Evidence and scope.** The new cubin is compiled by the pinned toolkit (nvcc V13.0.88,
+cuda_13.0.r13.0/compiler.36424714_0, `-arch=sm_121a`), 13,000 B, sha256
+`0e602daf6f2a51f027f3a924aaa503fada7db14610b94114439c659be4150cfe`,
+`ptx_membar_lines=0`. It is a deliberate re-pin: `baseline/kernel_baseline.txt` now has **ten**
+entries (its header and the pin tests are updated with it), `build.rs`'s `PROBED_KERNELS` table
+probes ten sources and the combined probe compiles all ten, and `cuda_driver::KernelId` gained
+`SwigluMxfp8QuantWeighted` (the driver's vocabulary, not the frozen `m4_abi` array - that stays the
+six Milestone 4 kernels). The existing unweighted epilogue, its cubin and its pin are unchanged:
+the shared expert (m17b) still uses it.
+
+m17a's stage 3 is rebuilt on the weighted entry: the kernel's weight operand is the router's
+`weights_d` buffer, read in place (the router output is not copied or re-uploaded for the operand),
+and stage 4's combine consumes the stage-3 device codes/scales directly. The harness prints the
+class before the numbers, compares the device operand bit-exact against
+`quantise_row_weighted` (codes and scales, all rows), additionally compares the real 576-wide
+columns bit-exact against `mxfp4_ref::routed_activation_operand` (the model operand the old host
+seam built), checks two-launch determinism, and then compares the device combine chain bit-exact
+against `mxfp4_ref::moe_combine` over the **same device operand bytes**. The new binary is
+`m17a_weighted_6443d5d0_aarch64` (4,142,000 B, sha256
+`6443d5d0729650bdf571a3907c95ef5c169296b25a55050b42bd7174b16828cd`, built from
+`/home/user/wt/p3-m17`). **Window b33 measured it: PASS at both token counts** - tokens 8
+`exit=0` (05:59:29Z -> 05:59:41Z) and tokens 130 `exit=0` (05:59:41Z -> 06:02:24Z), **35 checks each**,
+four pinned cubins verified by size and sha256 before allocation (window
+`window-b33-20261019T055723Z.log`; run logs `runs33/m17a-weighted-tokens8.log` and
+`runs33/m17a-weighted-tokens130.log`, reproduced verbatim in `docs/build/phase3-moe-routed.md`). The
+window number is b33 in the Lead's global numbering (b30 hardened m17a, b31 c4a-1, b32 c4a-2 first
+attempt, b33 c4a-2 corrected PASS plus this run); an earlier draft of this entry called it b31. The
+class is the same bit-exact class as D32's host path, now on the device; it is still not a chain,
+token, per-layer or end-to-end claim, the activation and residual are the declared
+released-`embed.weight` stand-ins, and the shared expert is not covered.
+
+**Consequence.** c4b can wire the routed epilogue with no routing-weight host seam: the chain hands
+the router's weight buffer to the weighted epilogue and its output to the combine. The unweighted
+epilogue remains the shared expert's quantiser. If a later window finds a mismatch, the class is a
+finding against this kernel, not a tolerance to widen, and the host path of D32 stays the fallback
+until it is fixed.

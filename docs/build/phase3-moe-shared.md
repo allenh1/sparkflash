@@ -13,7 +13,9 @@ Source: `crates/sparkflash-kernels/examples/m17b_moe_shared.rs`, aarch64 binary
 `m17b_moe_shared_7f9719c9_aarch64` (4,466,096 B, sha256
 `7f9719c91febe0fc4763c9affc4ed9683e59995382d1bae806f3fd4cbeb74ace`),
 built by `scripts/build-aarch64.sh --example=m17b_moe_shared` from branch
-`task/m17b-shared`, rebased onto `origin/main` 51e7954 (batch 15, the m17a merge). The window b28
+`task/m17b-shared`, rebased onto `origin/main` 51e7954 (batch 15, the m17a merge), with build cwd
+`/home/user/wt/p3-m17` (the build script is cwd-sensitive: the same source from another directory
+gives different bytes and size, so the sha above is reproducible only from that cwd). The window b28
 binary was built from the same m17b source before that rebase, and the rebase changed only the base.
 The branch also carries the batch-16 m17a harness hardening and the m16 four-shard argmax fixture
 extension:

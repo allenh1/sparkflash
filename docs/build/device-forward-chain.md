@@ -168,9 +168,12 @@ Engine reference: `forward/mod.rs:373` run, `:546` block. Per layer, in order:
 Kernel ABI anchors (main): `KernelId` `cuda_driver.rs:157`; `m4_abi` `MEGA_MHC:854`,
 `MXFP8_DENSE:856`, `MXFP4_MOE:858`, `FLASH_MLA_CSA2:860`, `MXFP8_WO_A:862`,
 `CERT_LM_HEAD:864`, `KERNELS` at `:867` (a six-entry array, frozen by D26). The ratchet baseline
-`crates/sparkflash-kernels/baseline/kernel_baseline.txt` has **nine** entries: the six m4 kernels,
-`swiglu_mxfp8_quant_sm121` (host seam, not launched by the chain), `moe_router_sm121` (M2
-one-launch proof) and `routed_gate_up_sm121` (task-8, measured in isolation, not wired). The
+`crates/sparkflash-kernels/baseline/kernel_baseline.txt` has **ten** entries: the six m4 kernels,
+`swiglu_mxfp8_quant_sm121` (host seam, not launched by the chain), its weighted routed variant
+`swiglu_mxfp8_quant_weighted_sm121` (D33; m17a stage 3 loads it, window b33 measured 35 checks
+at both token counts, not wired),
+`moe_router_sm121` (M2 one-launch proof) and `routed_gate_up_sm121` (task-8, measured in
+isolation, not wired). The
 chain's six-kernel launch set is unchanged: `mega_mhc_sm121`, `b12x_mxfp8_dense_sm121`,
 `b12x_mxfp4_moe_sm121`, `flash_mla_csa2_sm121`, `b12x_mxfp8_wo_a_sm121`,
 `cert_lm_head_sm121`. Routed gate/up and the shared expert's dense GEMM are device kernels that
@@ -355,10 +358,11 @@ reproduced against the reference" (`roadmap-to-serving.md` section 5.5 item 1). 
 only when **all** hold in one run:
 
 1. exit status 0, and the run actually executed on a device: driver loaded, every cubin sha256
-   printed and equal to the nine parsed entries of `baseline/kernel_baseline.txt`; the catalog
+   printed and equal to the ten parsed entries of `baseline/kernel_baseline.txt`; the catalog
    requires eight of them (the six chain kernels plus the router and routed gate/up, 2.2), and the
-   ninth, `swiglu_mxfp8_quant_sm121`, is a host seam, not a chain kernel. Device kernel launches
-   > 0 (a host-only run cannot pass);
+   other two - `swiglu_mxfp8_quant_sm121` (the host seam's unweighted epilogue) and its weighted
+   routed variant `swiglu_mxfp8_quant_weighted_sm121` (D33, measured in m17a) - are not chain
+   kernels. Device kernel launches > 0 (a host-only run cannot pass);
 2. tokens exactly 491, 367, 201, 80, 3302, 201, 54, 201, 4341 (`compare_steps`, `:699`);
 3. head reduction: the reduced argmax over the screen's per-block maxima (host `lm_head_argmax` in
    the first run; lowest-index tie-break `lm_head_ref::best_entry:161`) equals the expected token,
@@ -509,10 +513,11 @@ labelled merged/measured but not wired, the remaining host seams labelled), buil
 set and the plan-vs-ledger self-check
 (fails on missing **and** unplanned seams), and runs through a `ChainOps` backend with
 `chain_execution = false`. `window.rs` accounts the 128-slot rings (67,584 B each, 2,703,360 B
-for 40) and round-trips the oldest-first view; `cubins.rs` parses the nine baseline pins from
+for 40) and round-trips the oldest-first view; `cubins.rs` parses the ten baseline pins from
 `kernel_baseline.txt`, requires eight of them (the six chain kernels plus router and routed
-gate/up) and verifies size and SHA-256 fail-closed; the ninth, `swiglu_mxfp8_quant_sm121`, is a
-host seam and not a required chain kernel. The CLI arm
+gate/up) and verifies size and SHA-256 fail-closed; the other two, `swiglu_mxfp8_quant_sm121` (the
+host seam's unweighted epilogue) and its weighted routed variant `swiglu_mxfp8_quant_weighted_sm121`
+(D33), are not required chain kernels. The CLI arm
 `sparkflash device-chain --plan-only` prints the plan, stage map, seam counts, the plan-only label
 verbatim and the three design 4.3 run labels explicitly prefixed "label reserved for a later
 stage:", then exits 2 refusing to serve. M3-b adds layer-0 weight staging and budget admission;

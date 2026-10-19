@@ -123,11 +123,13 @@ const MOE_SCALE_ROW: usize = WIDTH_PADDED / 32;
 /// The activation quantiser's 32-value block.
 const QUANT_BLOCK: usize = 32;
 
-/// The swiglu quantiser cubin pin (baseline/kernel_baseline.txt; the crate has no pin module for
-/// it because the kernel is reached through its launch module, not through a typed ABI).
-const SWIGLU_CUBIN_BYTES: usize = 21_776;
-const SWIGLU_CUBIN_SHA256: &str =
-    "4dbef63bb07808f92fb6e61bdcb9aec53cb6afd8f28d6744aea3185759c1862e";
+/// The WEIGHTED SwiGLU + quantise cubin pin (baseline/kernel_baseline.txt). m17a's stage 3 uses the
+/// weighted variant, which multiplies each routed row by its router weight before the quantiser and
+/// so makes the combine operand device-built (the F6 seam's closure); the unweighted epilogue is
+/// still pinned in the baseline for the shared expert (m17b).
+const SWIGLU_WEIGHTED_CUBIN_BYTES: usize = 13_000;
+const SWIGLU_WEIGHTED_CUBIN_SHA256: &str =
+    "0e602daf6f2a51f027f3a924aaa503fada7db14610b94114439c659be4150cfe";
 /// The MXFP4 down/combine cubin pin (same source; mxfp4_moe_launch states the device chain's
 /// catalog owns the bytes, so this harness pins them here).
 const MXFP4_MOE_CUBIN_BYTES: usize = 10_048;
@@ -333,10 +335,10 @@ fn run() -> Result<(), String> {
         read_router_outputs(&cuda, &ids_d, &weights_d, &scores_d, args.tokens)?;
     let second_router_bytes = router_raw_bytes(&ids_2, &weights_2, &scores_2);
     check_floor(args.floor_gib, "m17a stage 1 post-launch")?;
-    cuda.free(
-        router_module,
-        &[x_d, gate_d, bias_d, ids_d, weights_d, scores_d],
-    );
+    // weights_d stays allocated: stage 3's weighted epilogue reads the router's per-row routing
+    // weights IN PLACE as its weight operand, so the multiply happens on the device rather than on a
+    // host copy. (The host readback above is only the comparison twin.)
+    cuda.free(router_module, &[x_d, gate_d, bias_d, ids_d, scores_d]);
 
     let ids_exact = device_ids == twin_ids;
     let id_mismatches = device_ids
@@ -620,36 +622,54 @@ fn run() -> Result<(), String> {
     }
 
     // ---------------------------------------------------------------------------------------
-    // Stage 3: SwiGLU + MXFP8 activation quantise on the device gate/up output.
+    // Stage 3: WEIGHTED SwiGLU + MXFP8 activation quantise on the device gate/up output: the
+    // routing weight is multiplied in BEFORE the quantiser, on the device, from the router's own
+    // weight buffer. This is the F6 host seam's closure.
     // ---------------------------------------------------------------------------------------
-    println!("--- stage 3: swiglu_mxfp8_quant_sm121 on the device gate/up bf16 values ---");
     println!(
-        "comparison class (declared before any number): E4M3 codes and ue8m0 scales BIT-EXACT against swiglu_ref::quantise_row over the same {WIDTH_PADDED} bf16 values per routed row (the stage-8 B1 class); a difference is a finding, not a tolerance; two launches byte-identical. The launch is unweighted: the kernel has no routing-weight operand, which is the F6 seam."
+        "--- stage 3: swiglu_mxfp8_quant_weighted_sm121 on the device gate/up bf16 values, with the device router's per-row weights as the weight operand ---"
     );
-    let swiglu_cubin = pinned_cubin(
+    println!(
+        "comparison class (declared before any number): E4M3 codes and ue8m0 scales BIT-EXACT against swiglu_ref::quantise_row_weighted over the same {WIDTH_PADDED} bf16 values and the same per-row routing weight, for every routed row of every rank; the REAL {WIDTH}-wide operand is additionally bit-exact against mxfp4_ref::routed_activation_operand over the same real values and weight (the model operand the combine consumes); two launches byte-identical. The weight operand is the router's device output buffer weights_d, read in place, so the operand is device-built and no host multiply or host quantise remains in the path (the F6 seam is closed)."
+    );
+    let weighted_cubin = pinned_cubin(
         &args.cubin_dir,
-        "swiglu_mxfp8_quant_sm121",
-        SWIGLU_CUBIN_BYTES,
-        SWIGLU_CUBIN_SHA256,
+        "swiglu_mxfp8_quant_weighted_sm121",
+        SWIGLU_WEIGHTED_CUBIN_BYTES,
+        SWIGLU_WEIGHTED_CUBIN_SHA256,
     )?;
-    let (swiglu_module, swiglu_kernel) =
-        cuda.load_kernel(&swiglu_cubin, KernelId::SwigluMxfp8Quant)?;
+    let (weighted_module, weighted_kernel) =
+        cuda.load_kernel(&weighted_cubin, KernelId::SwigluMxfp8QuantWeighted)?;
     let mut device_codes: Vec<Vec<u8>> = Vec::with_capacity(RANKS);
     let mut device_scales: Vec<Vec<u8>> = Vec::with_capacity(RANKS);
     for rank in 0..RANKS {
         let gate_bytes = bf16_bits_to_bytes(&gate_bits[rank]);
         let up_bytes = bf16_bits_to_bytes(&up_bits[rank]);
         let mut expected_codes = vec![0u8; rows * WIDTH_PADDED];
-        let mut expected_scales = vec![0u8; rows * (WIDTH_PADDED / QUANT_BLOCK)];
+        let mut expected_scales = vec![0u8; rows * MOE_SCALE_ROW];
+        let mut model_codes = vec![0u8; rows * WIDTH];
+        let mut model_scales = vec![0u8; rows * (WIDTH / QUANT_BLOCK)];
         for row in 0..rows {
+            let weight = device_weights[row];
             let gate_f32 =
                 bf16_bits_slice_to_f32(&gate_bits[rank], row * WIDTH_PADDED, WIDTH_PADDED);
             let up_f32 = bf16_bits_slice_to_f32(&up_bits[rank], row * WIDTH_PADDED, WIDTH_PADDED);
-            let (codes, scales) = swiglu_ref::quantise_row(&gate_f32, &up_f32, SWIGLU_LIMIT);
+            let (codes, scales) =
+                swiglu_ref::quantise_row_weighted(&gate_f32, &up_f32, SWIGLU_LIMIT, weight);
             expected_codes[row * WIDTH_PADDED..(row + 1) * WIDTH_PADDED].copy_from_slice(&codes);
-            expected_scales
-                [row * (WIDTH_PADDED / QUANT_BLOCK)..(row + 1) * (WIDTH_PADDED / QUANT_BLOCK)]
+            expected_scales[row * MOE_SCALE_ROW..(row + 1) * MOE_SCALE_ROW]
                 .copy_from_slice(&scales);
+            // The model's real-width operand, computed with the same weighted rule on the real
+            // {WIDTH} columns: this is exactly the old host path's operand, now only a comparison.
+            let (real_codes, real_scales) = swiglu_ref::quantise_row_weighted(
+                &gate_f32[..WIDTH],
+                &up_f32[..WIDTH],
+                SWIGLU_LIMIT,
+                weight,
+            );
+            model_codes[row * WIDTH..(row + 1) * WIDTH].copy_from_slice(&real_codes);
+            model_scales[row * (WIDTH / QUANT_BLOCK)..(row + 1) * (WIDTH / QUANT_BLOCK)]
+                .copy_from_slice(&real_scales);
         }
         let mut rank_allocated = 0usize;
         let gate_d = cuda.alloc(gate_bytes.len(), &mut rank_allocated)?;
@@ -657,13 +677,14 @@ fn run() -> Result<(), String> {
         let codes_d = cuda.alloc(expected_codes.len(), &mut rank_allocated)?;
         let scales_d = cuda.alloc(expected_scales.len(), &mut rank_allocated)?;
         println!(
-            "  rank {rank}: rows {rows}, cols {WIDTH_PADDED}, device bytes admitted {rank_allocated}"
+            "  rank {rank}: rows {rows}, cols {WIDTH_PADDED}, device bytes admitted {rank_allocated}, weights_d reused in place"
         );
         cuda.copy_htod(&gate_d, &gate_bytes)?;
         cuda.copy_htod(&up_d, &up_bytes)?;
-        let params: [u64; 10] = [
+        let params: [u64; 11] = [
             gate_d.0,
             up_d.0,
+            weights_d.0,
             codes_d.0,
             scales_d.0,
             rows as u64,
@@ -679,12 +700,12 @@ fn run() -> Result<(), String> {
             args.floor_gib,
             &format!("m17a stage 3 rank {rank} pre-launch"),
         )?;
-        cuda.launch(swiglu_kernel, grid, (256, 1, 1), &params)?;
+        cuda.launch(weighted_kernel, grid, (256, 1, 1), &params)?;
         let mut codes_first = vec![0u8; expected_codes.len()];
         let mut scales_first = vec![0u8; expected_scales.len()];
         cuda.copy_dtoh(&mut codes_first, &codes_d)?;
         cuda.copy_dtoh(&mut scales_first, &scales_d)?;
-        cuda.launch(swiglu_kernel, grid, (256, 1, 1), &params)?;
+        cuda.launch(weighted_kernel, grid, (256, 1, 1), &params)?;
         let mut codes_second = vec![0u8; expected_codes.len()];
         let mut scales_second = vec![0u8; expected_scales.len()];
         cuda.copy_dtoh(&mut codes_second, &codes_d)?;
@@ -704,17 +725,43 @@ fn run() -> Result<(), String> {
             .zip(&expected_scales)
             .filter(|(a, b)| a != b)
             .count();
+        let mut model_mismatches = 0usize;
+        for row in 0..rows {
+            for column in 0..WIDTH {
+                if codes_first[row * WIDTH_PADDED + column] != model_codes[row * WIDTH + column] {
+                    model_mismatches += 1;
+                }
+            }
+            for block in 0..(WIDTH / QUANT_BLOCK) {
+                if scales_first[row * MOE_SCALE_ROW + block]
+                    != model_scales[row * (WIDTH / QUANT_BLOCK) + block]
+                {
+                    model_mismatches += 1;
+                }
+            }
+        }
         Verdict::push(
             &mut verdicts,
-            &format!("stage 3 rank {rank}: E4M3 codes bit-exact"),
+            &format!("stage 3 rank {rank}: weighted E4M3 codes bit-exact"),
             code_mismatches == 0,
             format!("{code_mismatches} mismatched of {}", codes_first.len()),
         );
         Verdict::push(
             &mut verdicts,
-            &format!("stage 3 rank {rank}: ue8m0 scales bit-exact"),
+            &format!("stage 3 rank {rank}: weighted ue8m0 scales bit-exact"),
             scale_mismatches == 0,
             format!("{scale_mismatches} mismatched of {}", scales_first.len()),
+        );
+        Verdict::push(
+            &mut verdicts,
+            &format!(
+                "stage 3 rank {rank}: real {WIDTH}-wide operand bit-exact vs routed_activation_operand"
+            ),
+            model_mismatches == 0,
+            format!(
+                "{model_mismatches} mismatched of {} code+scale bytes in the real width",
+                rows * (WIDTH + WIDTH / QUANT_BLOCK)
+            ),
         );
         Verdict::push(
             &mut verdicts,
@@ -729,11 +776,15 @@ fn run() -> Result<(), String> {
         device_codes.push(codes_first);
         device_scales.push(scales_first);
     }
-    cuda.free(swiglu_module, &[]);
+    cuda.free(weighted_module, &[]);
+    cuda.free_buffers(&[&weights_d]);
     println!(
-        "stage 3 device codes/scales are measured but not the combine operand (F6 seam: the model multiplies the routing weight BEFORE the quantiser, and weight-multiplying quantised codes would quantise twice)"
+        "stage 3 output: device-built weighted operand per rank, {} rows x {WIDTH_PADDED} E4M3 codes + {} ue8m0 scales (the real {WIDTH} columns equal the model's routed_activation_operand)",
+        rows, MOE_SCALE_ROW
     );
-    let _ = (&device_codes, &device_scales);
+    println!(
+        "F6 seam closed: device router weights_d -> weighted epilogue -> device codes/scales -> combine; the host no longer multiplies the routing weight or quantises the operand"
+    );
 
     // ---------------------------------------------------------------------------------------
     // Stage 4: down projection + weighted combine, four serial rank launches.
@@ -742,29 +793,10 @@ fn run() -> Result<(), String> {
         "--- stage 4: b12x_mxfp4_moe_sm121 down/combine, 4 serial rank launches (residual chain) ---"
     );
     println!(
-        "comparison class (declared before any number): device bf16 BIT-EXACT against the chained mxfp4_ref::moe_combine over the same bytes (four ranks, each rank's bf16 output is the next rank's residual hidden, so the chained rounding is part of both sides); two full chains byte-identical. The activation operand is host-quantised by mxfp4_ref::routed_activation_operand over the device gate/up bf16 values (the F6 seam) - the combine is WEIGHTED, its operand is not device-produced."
+        "comparison class (declared before any number): device bf16 BIT-EXACT against the chained mxfp4_ref::moe_combine over the SAME device-built weighted operand bytes (stage 3's codes/scales), with the same w2 slices and ids (four ranks, each rank's bf16 output is the next rank's residual hidden, so the chained rounding is part of both sides); two full chains byte-identical. Unlike b27, the activation operand is NOT host-quantised: stage 3's weighted epilogue produced it on the device from the router's weight buffer, so the F6 host seam is out of this path."
     );
-    let routing_weights = device_weights.clone();
-    let activation_full = assemble_activation(&gate_bits, &up_bits, rows);
-    let mut act_fp8_rank: Vec<Vec<u8>> = Vec::with_capacity(RANKS);
-    let mut act_scales_rank: Vec<Vec<u8>> = Vec::with_capacity(RANKS);
-    for rank in 0..RANKS {
-        let mut codes = vec![0u8; rows * WIDTH_PADDED];
-        let mut scales = vec![0u8; rows * MOE_SCALE_ROW];
-        for row in 0..rows {
-            let slice =
-                &activation_full[row * INTER + rank * WIDTH..row * INTER + (rank + 1) * WIDTH];
-            let (rank_codes, rank_scales) =
-                mxfp4_ref::routed_activation_operand(slice, routing_weights[row]);
-            codes[row * WIDTH_PADDED..row * WIDTH_PADDED + WIDTH].copy_from_slice(&rank_codes);
-            scales[row * MOE_SCALE_ROW..row * MOE_SCALE_ROW + WIDTH / QUANT_BLOCK]
-                .copy_from_slice(&rank_scales);
-        }
-        act_fp8_rank.push(codes);
-        act_scales_rank.push(scales);
-    }
     println!(
-        "F6 seam crossing: device gate/up bf16 [rows {rows}][{WIDTH_PADDED}] per rank -> host SwiGLU ({SWIGLU_LIMIT}) -> routing weight per routed row -> routed_activation_operand -> [rows {rows}][{WIDTH_PADDED}] E4M3 + [rows {rows}][{MOE_SCALE_ROW}] ue8m0 per rank"
+        "F6 seam crossing: device gate/up bf16 [rows {rows}][{WIDTH_PADDED}] per rank -> device weighted epilogue (routing weight operand, no host round trip) -> device operand [rows {rows}][{WIDTH_PADDED}] E4M3 + [rows {rows}][{MOE_SCALE_ROW}] ue8m0 per rank -> device combine"
     );
     let w2_rank: Vec<Vec<u8>> = (0..RANKS)
         .map(|rank| {
@@ -818,8 +850,8 @@ fn run() -> Result<(), String> {
     for rank in 0..RANKS {
         let (next, _) = mxfp4_ref::moe_combine(
             &reference,
-            &act_fp8_rank[rank],
-            &act_scales_rank[rank],
+            &device_codes[rank],
+            &device_scales[rank],
             &w2_rank[rank],
             &ws2_rank[rank],
             &local_ids,
@@ -830,7 +862,7 @@ fn run() -> Result<(), String> {
         reference = next;
     }
     println!(
-        "reference: mxfp4_ref::moe_combine chained over the 4 rank slices, residual seed = the declared bf16 embed stand-in"
+        "reference: mxfp4_ref::moe_combine chained over the 4 rank slices fed by the SAME device-built weighted operand bytes, residual seed = the declared bf16 embed stand-in"
     );
 
     let combine_cubin = pinned_cubin(
@@ -844,8 +876,8 @@ fn run() -> Result<(), String> {
         let mut allocated = 0usize;
         let hidden_d = cuda.alloc(args.tokens * HIDDEN * 2, &mut allocated)?;
         let out_d = cuda.alloc(args.tokens * HIDDEN * 2, &mut allocated)?;
-        let act_d = cuda.alloc(act_fp8_rank[0].len(), &mut allocated)?;
-        let acts_d = cuda.alloc(act_scales_rank[0].len(), &mut allocated)?;
+        let act_d = cuda.alloc(device_codes[0].len(), &mut allocated)?;
+        let acts_d = cuda.alloc(device_scales[0].len(), &mut allocated)?;
         let w_d = cuda.alloc(w2_rank[0].len(), &mut allocated)?;
         let ws_d = cuda.alloc(ws2_rank[0].len(), &mut allocated)?;
         let ids_d = cuda.alloc(local_ids.len() * 4, &mut allocated)?;
@@ -853,8 +885,8 @@ fn run() -> Result<(), String> {
         cuda.copy_htod(&hidden_d, &bf16_bits_to_bytes(&hidden_bits))?;
         let mut last: Vec<u16> = hidden_bits.clone();
         for rank in 0..RANKS {
-            cuda.copy_htod(&act_d, &act_fp8_rank[rank])?;
-            cuda.copy_htod(&acts_d, &act_scales_rank[rank])?;
+            cuda.copy_htod(&act_d, &device_codes[rank])?;
+            cuda.copy_htod(&acts_d, &device_scales[rank])?;
             cuda.copy_htod(&w_d, &w2_rank[rank])?;
             cuda.copy_htod(&ws_d, &ws2_rank[rank])?;
             cuda.copy_htod(&ids_d, &u32s_to_bytes(&local_ids))?;
@@ -925,7 +957,7 @@ fn run() -> Result<(), String> {
     check_floor(args.floor_gib, "m17a end")?;
     println!("--- NOT claimed by m17a ---");
     println!(
-        "not a fully-device weighted routed block (F6 host seam above), not a chain/token/per-layer claim, not layer text (activation and residual are released embed rows), not the shared expert or the shared-add epilogue (m17b), not engine integration, not host-time saved, not a performance claim. Stage 2's 8 launches are independent; stage 4's 4 launches are serial by construction (each rank's bf16 output is the next rank's residual)."
+        "not a chain/token/per-layer claim, not layer text (activation and residual are released embed rows), not the shared expert or the shared-add epilogue (m17b), not engine integration, not host-time saved, not a performance claim. The routed combine operand is now device-built (the weighted epilogue closes the F6 host seam); what remains declared is the activation and residual stand-in. Stage 2's 8 launches are independent; stage 4's 4 launches are serial by construction (each rank's bf16 output is the next rank's residual)."
     );
     let failed: Vec<&str> = verdicts
         .iter()
@@ -1175,6 +1207,7 @@ fn read_bf16_bytes(
 /// kernel's zero padding); the four slices are concatenated in rank order. This function exists as a
 /// named unit because a window caught an indexing error here: reading rank r at `row * 640 + r * 576`
 /// instead of at `row * 640` runs off the end of the 640-wide row.
+#[cfg(test)]
 fn assemble_activation(gate_bits: &[Vec<u16>], up_bits: &[Vec<u16>], rows: usize) -> Vec<f32> {
     assert_eq!(gate_bits.len(), RANKS, "one gate output per rank");
     assert_eq!(up_bits.len(), RANKS, "one up output per rank");
@@ -1417,6 +1450,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_weighted_epilogue_pin_is_the_baseline_line() {
+        // The harness names the weighted epilogue's bytes itself; the embedded baseline is the single
+        // source of record. Comparing them here means a baseline re-pin cannot leave this harness
+        // loading the previous cubin (and the window refusing it by size/sha at run time) unnoticed.
+        let pin = sparkflash_kernels::baseline::pin("swiglu_mxfp8_quant_weighted_sm121")
+            .expect("the embedded baseline must parse")
+            .expect("the weighted epilogue must be pinned");
+        assert_eq!(pin.cubin_bytes, SWIGLU_WEIGHTED_CUBIN_BYTES);
+        assert_eq!(pin.cubin_sha256, SWIGLU_WEIGHTED_CUBIN_SHA256);
+        assert_eq!(pin.ptx_membar_lines, 0);
     }
 
     #[test]

@@ -1213,7 +1213,7 @@ mod tests {
         assert!(
             text.contains("chain_execution=false; device_execution=false; token_produced=false")
         );
-        assert!(text.contains("9 baseline pins parsed"));
+        assert!(text.contains("10 baseline pins parsed"));
         assert!(
             text.contains("crates/sparkflash-kernels/baseline/kernel_baseline.txt"),
             "the catalog names the repository path, not a crate-relative one"

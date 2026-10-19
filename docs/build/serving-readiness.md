@@ -85,20 +85,21 @@ device evidence either.
 
 ## 2. Stage detail: pins, harnesses, measurements, APIs, gaps
 
-Kernel pins are in `crates/sparkflash-kernels/baseline/kernel_baseline.txt:11-19` (nine entries,
+Kernel pins are in `crates/sparkflash-kernels/baseline/kernel_baseline.txt:12-21` (ten entries,
 nvcc release V13.0.88, arch sm_121a). The six Milestone-4 kernels are the six-entry
 `m4_abi::KERNELS` array (`crates/sparkflash-kernels/src/m4_abi.rs:867`; constants at `:854, :856,
 :858, :860, :862, :864`), and `m4_abi` is frozen by D26 (`docs/DECISIONS.md`), so the router, SwiGLU
-and gate/up kernels are pinned outside that array (router ABI: `crates/sparkflash-kernels/src/router_abi.rs`;
-SwiGLU: `kernels/swiglu_mxfp8_quant_sm121.cu:1-14`; gate/up: `routed_gate_up_abi.rs`). The driver
-enum has eight variants (`cuda_driver.rs:157-173`), one raw loader and launch path
+(and its weighted routed variant, D33) and gate/up kernels are pinned outside that array (router ABI:
+`crates/sparkflash-kernels/src/router_abi.rs`; SwiGLU: `kernels/swiglu_mxfp8_quant_sm121.cu:1-14` and
+`kernels/swiglu_mxfp8_quant_weighted_sm121.cu`; gate/up: `routed_gate_up_abi.rs`). The driver
+enum has nine variants (`cuda_driver.rs:157-177`), one raw loader and launch path
 (`Cuda::load_kernel` `:527`, `Cuda::launch` `:562`, `launch_repeated` `:607`); typed launchers
 exist for attention and router (2.6/2.7), and `!88` added typed param builders for mHC, dense, wo_a,
 MXFP4 down/combine, LM head and routed gate/up (`*_launch.rs`), none of them wired into a chain yet.
 
 `mega_mhc_sm121` is the baseline manifest key; the cubin entry the driver and the harness use is
-`mega_mhc_fused_bf16_sm121` (`cuda_driver.rs:177`). Both names denote the same 70,312 B cubin
-(`kernel_baseline.txt:11`), and a window that stages cubins needs the second name too
+`mega_mhc_fused_bf16_sm121` (`cuda_driver.rs:174`). Both names denote the same 70,312 B cubin
+(`kernel_baseline.txt:12`), and a window that stages cubins needs the second name too
 ([phase3-indexer.md](phase3-indexer.md) section 3, "Cubins to stage"). This is a naming trap, not a
 second kernel.
 
@@ -556,7 +557,7 @@ and separates what is already on main.
    self-check (fails on a missing **and** an unplanned seam), and runs through a `ChainOps` backend
    with `chain_execution = false`.
 2. `window.rs` accounts the 128-slot rings (67,584 B each, 2,703,360 B for 40 layers) and
-   round-trips the oldest-first view; `cubins.rs` parses the nine baseline pins, requires the eight
+   round-trips the oldest-first view; `cubins.rs` parses the ten baseline pins, requires the eight
    chain pins (the six chain kernels plus router and routed gate/up) and verifies size and SHA-256
    fail-closed.
 3. `sparkflash device-chain --plan-only` prints the schedule, stage map, planned seam counts, the
@@ -893,7 +894,7 @@ and is not cited.
 
 - `device-forward-chain.md` section 2.1 says "the corrected device path has not run". That is **still
   true for the 40-layer chain** (the m8 plumbing binary ran at 2026-10-18T18:32Z, but no chain is
-  wired); section 2.2 on main already records the baseline's nine entries and that gate/up is merged
+  wired); section 2.2 on main already records the baseline's ten entries and that gate/up is merged
   but not wired, so those earlier corrections are now in the doc of record rather than this list.
 - `kernels/flash_mla_csa2_sm121.cu:53-58` says format 2 was never executed on a device; task-14 and
   the m8 dispatch supersede it (2.6).

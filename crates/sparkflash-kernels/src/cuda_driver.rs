@@ -165,6 +165,9 @@ pub enum KernelId {
     Mxfp4Moe,
     /// swiglu_mxfp8_quant_sm121: the SwiGLU plus MXFP8 quantiser kernel.
     SwigluMxfp8Quant,
+    /// swiglu_mxfp8_quant_weighted_sm121: the same epilogue with the routing weight multiplied in
+    /// before the quantiser (the F6 seam's device closure).
+    SwigluMxfp8QuantWeighted,
     /// cert_lm_head_sm121: the certified LM-head kernel.
     CertLmHead,
     /// moe_router_sm121: the device MoE router (task-37, roadmap 6.3 item 4).
@@ -175,12 +178,13 @@ pub enum KernelId {
 
 impl KernelId {
     /// Every kernel the shared driver owns, in the order of this enum.
-    pub const ALL: [KernelId; 8] = [
+    pub const ALL: [KernelId; 9] = [
         KernelId::MegaMhcBf16,
         KernelId::Mxfp8Dense,
         KernelId::Mxfp8WoA,
         KernelId::Mxfp4Moe,
         KernelId::SwigluMxfp8Quant,
+        KernelId::SwigluMxfp8QuantWeighted,
         KernelId::CertLmHead,
         KernelId::MoeRouter,
         KernelId::RoutedGateUp,
@@ -194,6 +198,7 @@ impl KernelId {
             KernelId::Mxfp8WoA => "b12x_mxfp8_wo_a_sm121",
             KernelId::Mxfp4Moe => "b12x_mxfp4_moe_sm121",
             KernelId::SwigluMxfp8Quant => "swiglu_mxfp8_quant_sm121",
+            KernelId::SwigluMxfp8QuantWeighted => "swiglu_mxfp8_quant_weighted_sm121",
             KernelId::CertLmHead => "cert_lm_head_sm121",
             KernelId::MoeRouter => "moe_router_sm121",
             KernelId::RoutedGateUp => "routed_gate_up_sm121",
@@ -215,6 +220,7 @@ impl KernelId {
             KernelId::Mxfp8WoA => &["b12x_mxfp8_wo_a_sm121"],
             KernelId::Mxfp4Moe => &["b12x_mxfp4_moe_sm121"],
             KernelId::SwigluMxfp8Quant => &["swiglu_mxfp8_quant_sm121"],
+            KernelId::SwigluMxfp8QuantWeighted => &["swiglu_mxfp8_quant_weighted_sm121"],
             KernelId::CertLmHead => &["cert_lm_head_sm121"],
             KernelId::MoeRouter => &["moe_router_sm121"],
             KernelId::RoutedGateUp => &["routed_gate_up_sm121"],

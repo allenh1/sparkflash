@@ -426,11 +426,12 @@ Engram, DSpark) so a change to the derivation shows up as a diff, not as a token
 
 ### 4.3 What stays on the host in Phase 1, and why that is labelled
 
-The device path today has nine kernels with baseline entries: the six Milestone-4 ABI kernels, the
-SwiGLU quantiser epilogue `swiglu_mxfp8_quant_sm121` (never compared against a reference, task-43),
-the task-37 router `moe_router_sm121` (measured in its own correctness harness) and the task-8
-routed gate/up kernel `routed_gate_up_sm121` (measured in its own harness). None of the last three is
-on the served decode path yet. Phase 1 keeps them on the host and **names each one** in the run output:
+The device path today has ten kernels with baseline entries: the six Milestone-4 ABI kernels, the
+SwiGLU quantiser epilogue `swiglu_mxfp8_quant_sm121` (never compared against a reference, task-43)
+and its weighted routed variant `swiglu_mxfp8_quant_weighted_sm121` (the routed combine operand built
+on the device, D33, measured in m17a), the task-37 router `moe_router_sm121` (measured in its own
+correctness harness) and the task-8 routed gate/up kernel `routed_gate_up_sm121` (measured in its own
+harness). None of the last four is on the served decode path yet. Phase 1 keeps them on the host and **names each one** in the run output:
 
 | Seam | Why it is still host | Task that moves it |
 | :--- | :--- | :--- |

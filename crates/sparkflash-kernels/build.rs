@@ -8,7 +8,7 @@
 //!    compiled. The crate's optional "cuda" feature is a separate thing - it only selects the
 //!    cudarc dependency, and no code in this crate reads it (see Cargo.toml).
 //! 2. When a CUDA frontend IS present, compile the shared headers, the RoCEnante kernel and the
-//!    eight device kernels of the M4/M7/task-37 set. The trace ABI header, the RoCEnante slot ABI and the
+//!    ten device kernels of the M4/M7/task-37 set. The trace ABI header, the RoCEnante slot ABI and the
 //!    pinned kernel set are contracts between Rust and device code, so a drift has to fail the
 //!    build instead of lurking until the first real kernel launch:
 //!
@@ -21,7 +21,7 @@
 //!    * the kernel itself is compiled standalone, so it must be a self-contained translation
 //!      unit;
 //!    * every probed kernel is compiled on its own, so a failure names the file, and then
-//!      all eight are compiled together with the trace macros enabled, which is the only
+//!      all ten are compiled together with the trace macros enabled, which is the only
 //!      check that can catch a collision BETWEEN kernel files.
 //!
 //!    None of that needs a GPU, only a CUDA frontend. When nvcc is absent but clang is present,
@@ -145,20 +145,21 @@ __global__ void sparkflash_roce_abi_probe(RoceOneShotSlot *slot, uint64_t *sink)
 }
 "#;
 
-/// The nine device kernel sources the crate probes and pins, with the stem used for their PTX
+/// The ten device kernel sources the crate probes and pins, with the stem used for their PTX
 /// output.
 ///
 /// Six of them are the Milestone 4 kernels of specification 6.2, the set m4_abi's frozen KERNELS
 /// array pins. The seventh is the M7 SwiGLU + MX-quantise epilogue
-/// (kernels/swiglu_mxfp8_quant_sm121.cu), the eighth the task-37 device MoE router
+/// (kernels/swiglu_mxfp8_quant_sm121.cu), the tenth its weighted routed variant
+/// (kernels/swiglu_mxfp8_quant_weighted_sm121.cu), the eighth the task-37 device MoE router
 /// (kernels/moe_router_sm121.cu) and the ninth the task-8 routed-expert W4A8 gate/up projection
-/// (kernels/routed_gate_up_sm121.cu); all three are deliberately OUTSIDE that frozen array, because
+/// (kernels/routed_gate_up_sm121.cu); all four are deliberately OUTSIDE that frozen array, because
 /// adding an entry there would be an ABI revision, but they are device sources this crate ships, the
 /// clang/nvcc probes compile them like the others, and baseline/kernel_baseline.txt records their
-/// cubins as the seventh, eighth and ninth entries. Every one of the nine is probed on every build:
-/// a kernel that is only ever compiled by hand on a GPU host is a kernel nobody has type-checked,
-/// and the CI cuda-abi job runs exactly this probe.
-const PROBED_KERNELS: [(&str, &str); 9] = [
+/// cubins. Every one of the ten is probed on every build: a kernel that is only ever compiled by
+/// hand on a GPU host is a kernel nobody has type-checked, and the CI cuda-abi job runs exactly this
+/// probe.
+const PROBED_KERNELS: [(&str, &str); 10] = [
     ("mega_mhc_sm121.cu", "mega_mhc_sm121"),
     ("b12x_mxfp8_dense_sm121.cu", "b12x_mxfp8_dense_sm121"),
     ("b12x_mxfp4_moe_sm121.cu", "b12x_mxfp4_moe_sm121"),
@@ -168,6 +169,10 @@ const PROBED_KERNELS: [(&str, &str); 9] = [
     ("swiglu_mxfp8_quant_sm121.cu", "swiglu_mxfp8_quant_sm121"),
     ("moe_router_sm121.cu", "moe_router_sm121"),
     ("routed_gate_up_sm121.cu", "routed_gate_up_sm121"),
+    (
+        "swiglu_mxfp8_quant_weighted_sm121.cu",
+        "swiglu_mxfp8_quant_weighted_sm121",
+    ),
 ];
 
 /// The shared header every one of those kernels includes for its model constants, the MX codecs
@@ -175,7 +180,7 @@ const PROBED_KERNELS: [(&str, &str); 9] = [
 /// one include they all share.
 const M4_COMMON_HEADER: &str = "m4_common_sm121.cuh";
 
-/// The combined probe: all nine kernel sources in one translation unit with the trace macros
+/// The combined probe: all ten kernel sources in one translation unit with the trace macros
 /// ENABLED. This is the only check in the build that can catch a collision BETWEEN kernels (two
 /// files defining the same macro to different values, or two identical non-inline symbols), and it
 /// is also the only one that compiles the enabled branch of every trace scope.
@@ -274,7 +279,7 @@ fn main() {
     );
 
     // The probed kernel set. Every kernel is probed individually so that a failure names the file,
-    // and then all eight are probed together with the trace macros enabled.
+    // and then all ten are probed together with the trace macros enabled.
     if !kernels.join(M4_COMMON_HEADER).is_file() {
         println!(
             "cargo:warning=sparkflash-kernels: {} is missing; skipping every probed-kernel probe",
@@ -287,9 +292,9 @@ fn main() {
         if !path.is_file() {
             println!(
                 "cargo:warning=sparkflash-kernels: {file} is missing; the probed kernel set is \
-                 incomplete (the six Milestone 4 kernels, the M7 SwiGLU quantiser epilogue \
-                 and the task-37 device router); the report would cover fewer kernels than the \
-                 baseline names"
+                 incomplete (the six Milestone 4 kernels, the M7 SwiGLU quantiser epilogue and its \
+                 weighted routed variant, the task-37 device router and the task-8 routed gate/up \
+                 GEMM); the report would cover fewer kernels than the baseline names"
             );
             continue;
         }
@@ -303,7 +308,7 @@ fn main() {
     report(
         &nvcc,
         &arch,
-        "the combined probe (all eight kernels, trace macros enabled)",
+        "the combined probe (all ten kernels, trace macros enabled)",
         check_m4_probe(&nvcc, &arch, kernels),
     );
 }
@@ -452,9 +457,10 @@ fn report_clang_probe(clang: &Path, arch: &str) {
             Ok((checked, missing)) => println!(
                 "cargo:warning=sparkflash-kernels: nvcc not found; clang's CUDA frontend parsed \
                  kernels/rocenante_oneshot_sm121.cu, the RoCEnante ABI probe (trace macros \
-                 enabled, signature redeclared, slot static_asserts), {checked} of the nine \
+                 enabled, signature redeclared, slot static_asserts), {checked} of the ten \
                  probed kernels (the six Milestone 4 ABI kernels, the M7 SwiGLU quantiser \
-                 epilogue, the task-37 device router and the task-8 routed gate/up GEMM; \
+                 epilogue and its weighted routed variant, the task-37 device router and the \
+                 task-8 routed gate/up GEMM; \
                  {missing} missing) and the combined probe with the trace macros \
                  enabled, against stub headers (-fsyntax-only, {arch}). That \
                  checks syntax, types and every static_assert, NOT PTX and NOT numerics. A CUDA \
@@ -480,7 +486,7 @@ fn report_clang_probe(clang: &Path, arch: &str) {
     }
 }
 
-/// Parses the nine probed kernels and the combined probe with clang. Returns how many kernels were
+/// Parses the ten probed kernels and the combined probe with clang. Returns how many kernels were
 /// found and how many were missing, so the warning can say which evidence was gathered.
 fn check_probed_kernels_syntax(clang: &Path, arch: &str) -> Result<(usize, usize), ProbeFailure> {
     let kernels = Path::new("../../kernels");
