@@ -365,7 +365,16 @@ missing device tensor are errors, not passes.
 
 Criterion 1 is "prefill of a prompt over 128 tokens and at least 8 decode steps, every decoded token
 reproduced against the reference" (`roadmap-to-serving.md` section 5.5 item 1). The chain claims it
-only when **all** hold in one run:
+only when **all** hold in one run.
+
+**Status (2026-10-19): NOT claimed, still OPEN.** The hybrid-sequence path is stage-faithful but
+numerically FP8-native against a f32 reference (position 0 predicts 320 where the reference predicts
+201; head input differs by 0.608), and the first criterion-shaped attempt (b62) was aborted at
+131/138 positions on a per-position memory defect (~0.8 GB/position, RSS 121 GB). The 138-position
+run is blocked until that fix is measured flat and the precision/criterion question is decided; the
+full measured record is the b55-b62 subsection in section 7 and [DECISIONS.md](../DECISIONS.md) D37.
+
+The PASS definition is:
 
 1. exit status 0, and the run actually executed on a device: driver loaded, every cubin sha256
    printed and equal to the thirteen parsed entries of `baseline/kernel_baseline.txt`; the catalog
@@ -1469,6 +1478,91 @@ chain_contract.rs}`, the
 `scripts/build-aarch64.sh` (still to add; the selector is not needed until a node build of the
 chain exists). The crate must build without libcuda (same rule as kernels: nothing links libcuda;
 the driver is loaded through `Cuda::load`).
+
+### Hybrid sequence path b55-b62: measured, no claim (criterion 1 still OPEN)
+
+Status (2026-10-19): the device hybrid chain is **stage-faithful** but **not token-parity** with the
+in-process f32 reference, and the first criterion-shaped run was **aborted on a memory defect**. No
+claim is made here; criterion 1 remains OPEN and the hybrid-sequence branch stays unmerged.
+
+**The builds.** Every sequence binary below (b55 `641462a`, b56 `fde6b11`, b57 `bec6498`, b58
+`841566b`, b59 `f32a9e5`, b60 `f228178`, b61 `420407e`, b62 `420407e`) contains the unreviewed,
+unmeasured head-reduce cut-over `c9fa90f` (`head_launches=5`, `reduce_used=true`,
+`device_launches=1168` only when the reduce is used). Everything in this section is **sequence
+diagnostics on an unreviewed cut-over build**, not a reviewed device result.
+
+**b55 (641462a) - position plumbing and timing, 3 positions.** `sequence attention position support:
+body_launches=120 expected=120 positions=3 device_position_0_body=40 other_position_bodies=80`. Per
+position wall/chain: 16034/16490 ms, 8257/24748 ms, 7735/32484 ms; `projected_chain_full_s=1494.2`,
+`full_positions=138`, `budget_s=3600`. Tokens diverge immediately: `token comparison: position=0
+reference_id=201 hybrid_id=320 exact_equal=false`, position 1 is 201 vs 16, position 2 is 16 vs 16
+(equal). The plumbing is right and the arithmetic is not.
+
+**b56 (fde6b11) - body twin on identical staged operands.** 120 lines (40 layers x 3 positions);
+zero-mismatch layers are **35/40 at position 0, 18/40 at position 1, 13/40 at position 2**, every
+non-zero line at most 5 slots of 32,768 and max_abs <= 7.8e-3 (bf16 LSB class). The format-2 body is
+cleared on equal operands.
+
+**b57 (bec6498) - alignment, residual and operand.** Alignment is excluded: the fed token is
+identical at all three positions (52479 / 56659 / 101226), and the pre-attention hidden is exact
+(b58 line below). The residual twin still reports `residual first divergence: position=0 layer=0`,
+and the operand lines show the divergence is already present: `operand q: device
+first=0.164062500 last=0.773437500 checksum=c55cad79e647c613 | host first=0.194739088
+last=0.759224892 checksum=62266f458e1bc01b`; the sink is identical, the ids agree on the window row
+and differ in the compressed/ratio columns, and `operand window-codes: device ... first_checksum=
+6446b4769b567b20 ... | host quantised first_checksum=9d68aefc560275cc`. Note the residual twin
+compares the hybrid's deferred-epilogue boundary against the reference's post-FFN residual, i.e.
+stages one apart; it is diagnostic only and b63 adds the stage-aligned twin.
+
+**b58 (841566b) - projection and head-input twins.** `operand pre-attention: device vs host
+bf16_mismatches=4/5120 max_abs_diff=2.831221e-7` (exact); `projection raw wq_a latent ...
+max_abs_diff=2.787181e-3`; `projection raw wkv ... 3.555462e-3`; and `projection raw wq_b q
+pre-RoPE: device vs host bf16_mismatches=29209/32768 max_abs_diff=2.942886e-1` against
+`expected_bf16_quant_delta=6.176376e-2` (4.8x). The window-row quantiser is not byte-equal
+(`byte_equal=false`, checksums above). Head input: `head-input twin: position=0 bf16_mismatches=
+5113/5120 max_abs_diff=6.087970e-1` (positions 1 and 2: 6.53e-1, 5.36e-1).
+
+**b59 (f32a9e5) - where the wq_b gap enters.** `projection wq_b input latent normed: device vs host
+bf16_mismatches=1147/1280 max_abs_diff=5.186009e-2`, and feeding the device's latent through the
+host wq_b still leaves `2.080269e-1` on q, so the input latent already carries most of the gap.
+
+**b60 (f228178) - wq_b kernel vs its reference.** `projection wq_b kernel vs mxfp8_ref:
+bf16_mismatches=0/32768 max_abs_diff=0.000000e0`. On the exact launch bytes the block-scaled FP8
+GEMM reproduces `mxfp8_ref`, so the projection kernel is faithful to the FP8-native definition; the
+gap to the f32 host path is the quantisation definition itself (MXFP8, 32-element blocks,
+power-of-two ceil scales), not a kernel defect.
+
+**b61 (420407e) - head A/B, plain and with `SPARKFLASH_HEAD_HOST_ASSEMBLY=1`.** At every position
+the device reduce and the host four-shard assembly agree: `head A/B: position=0 host_top1=320 ...
+device_top1=320 ... block_max_equal=true host_value=15.734617233 device_value=15.734617233`;
+positions 1 and 2 are identical pairs (16/16, values 15.431822777 and 14.563224792). Forcing the
+host assembly still returns `returned host assembly token=320` / `16` / `16`. The unreviewed
+`c9fa90f` reduce is therefore exonerated; the host/device top-5 tails differ only because the host
+path ranks one winner per 1,024-entry block while the reduce ranks full logits. b61 logs:
+`runs61/headAB-device.log` sha256 `8f543d1c7f1135d0db9af820fa18139c421aedc01222365f4365898fc67d28cd`
+and `runs61/headAB-host.log`.
+
+**b62 (420407e) - criterion-shaped attempt: ABORTED, no criterion result.** One
+`--run-stage hybrid_sequence --fixture <fixture> --prompt-tokens 130 --decode-steps 8
+--time-budget-s 5400` run. It completed 131 of 138 positions, then the Lead killed it because host
+memory was collapsing: `MemAvailable` fell from 102.9 GB at position 1 to 2.29 GB at position 128
+and the process RSS reached **121 GB** (about 0.8 GB per position). Window log
+`window-b62-20261019T120851Z.log`, run log `runs62/seq130x8.log`, `RUN seq130x8 exit=137`. The run
+prints the reference-vs-fixture token table only at the end, so that table was lost; **the memory
+defect blocks any 138-position run** and must be fixed before another attempt. The 131 head A/B
+lines were identical device/host at every position.
+
+**Where that leaves the criterion.** The separable stages pass: alignment, the pre-attention
+hidden, the body, wq_b against `mxfp8_ref`, the head reduce and the host assembly are each at or
+inside their measured bars. The token moves at position 0 (320 vs 201), the head input differs by
+0.608, and b58-b60 attribute the difference to the FP8-native activation quantisation of the
+attention path against a dequantised-weight f32 reference. On that arithmetic, exact 130+8 token
+parity is not attainable without a precision-first activation path or a redefined criterion; that is
+a user decision, not an implementer one, and no maths was changed. Criterion 1 stays OPEN and the
+hybrid-sequence MR stays unmerged until that decision and the memory fix.
+
+**Reference note.** The deployed vLLM on the cluster serves a different checkpoint from ours
+([DECISIONS.md](../DECISIONS.md) D38), so its tokens are not a parity target for this fixture.
 
 ## 8. Open questions to the Lead
 

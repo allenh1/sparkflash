@@ -404,3 +404,32 @@ m20: PASS (50 checks; sequence CSA2 entry at positions [0, 1, 2, 129, 130, 131, 
   block arrays are a side channel with a documented head-pair split, not a selection step.
 - Not a position-0 behaviour change: the byte-identity check in m20 measures preservation, it does
   not authorize a new p0 path.
+
+## 10. Chain-wiring status (measured, no claim; 2026-10-19)
+
+The kernel itself is done and merged: `flash_mla_csa2_seq_sm121` (38,080 B, sha256
+`f6dfc738a7ad867adf040384f194812337301aa888cc486d4a60923772ba28c3`, `ptx_membar_lines=0`) landed on
+main with !108 (batch 24) as the thirteenth baseline entry / twelfth `KernelId` variant, still
+**unwired**, so `REQUIRED_KERNELS` stays 9 and no chain claim rests on it. The b50 window record in
+section 8 is the measured evidence (PASS 50/50; report `d95b6292...`).
+
+The chain path that consumes it is **not merged and not claimed**. Windows b55-b62 measured it on the
+hybrid-sequence branch (every binary there also contains the unreviewed head-reduce cut-over
+`c9fa90f`, so all of it is "sequence diagnostics on an unreviewed build"):
+
+- the per-position call site works as designed: `sequence attention position support:
+  body_launches=120 expected=120 positions=3 device_position_0_body=40 other_position_bodies=80`
+  (b55), so the position-causal entry is reached once per layer per position;
+- the format-2 body is faithful on identical staged operands (b56: 35/18/13 of 40 layers
+  zero-mismatch at positions 0/1/2, max_abs <= 7.8e-3);
+- the chain still diverges from the f32 reference at position 0 (320 vs 201), and the separable
+  stages localise the gap to the FP8-native activation quantisation of the attention projections
+  (b58-b60: `wq_b` reproduces `mxfp8_ref` exactly, but its input latent already differs by 5.19e-2
+  against the f32 host path);
+- the first criterion-shaped 130+8 attempt (b62) was **aborted at 131/138 positions** on a per-position
+  memory defect (~0.8 GB/position; RSS 121 GB), not on arithmetic.
+
+The full sequence-path record, including the head A/B result that exonerates the unreviewed reduce,
+is in [device-forward-chain.md](device-forward-chain.md) section 7. This page claims the kernel and
+the measured harness only; criterion 1 stays OPEN ([DECISIONS.md](../DECISIONS.md) D37).
+

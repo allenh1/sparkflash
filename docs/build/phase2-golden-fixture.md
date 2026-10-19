@@ -5,7 +5,12 @@ Status: **the real-checkpoint sequence fixture exists.** It was produced on the 
 truth** for milestone 2B/2C. It is **not** a device run and it closes no exit criterion: 2B's device
 plumbing ran on the node on 2026-10-18 but the device comparison (tokens then logits against this
 fixture) has not run, and Phase 2 exit criterion 1
-([roadmap-to-serving.md](roadmap-to-serving.md) section 5.5.1) remains OPEN. The CSA-union format-2
+([roadmap-to-serving.md](roadmap-to-serving.md) section 5.5.1) remains OPEN. As of 2026-10-19 the
+device side of that comparison is measured but not claimed (the sequence path is stage-faithful yet
+FP8-native against this f32 fixture, and its first criterion-shaped run aborted on a memory defect);
+the record is [device-forward-chain.md](device-forward-chain.md) section 7 and
+[DECISIONS.md](../DECISIONS.md) D37. The deployed vLLM serves a **different** checkpoint (D38), so its
+tokens are not evidence about this fixture. The CSA-union format-2
 semantics that can reproduce this fixture's attended set are [DECISIONS.md](../DECISIONS.md) D24; the
 decision that this fixture is the truth is D25.
 

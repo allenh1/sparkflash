@@ -44,6 +44,9 @@ records the evidence and the consequence for the build. Research backing is in
 | D33 | The routed combine operand is built on the device: the weighted SwiGLU+quantise variant closes the F6 host seam | `swiglu_mxfp8_quant_weighted_sm121` (own cubin, 13,000 B / `0e602daf...`, `ptx_membar_lines=0`) takes a per-row routing-weight operand and does the model's order on the device: asymmetric-clamped SwiGLU, one bf16 rounding of the product, then the activation ceil-rule quantise. m17a's stage 3 reads the router's `weights_d` in place, and stage 4's combine receives those device codes/scales through a host re-upload of the stage-3 readback (a byte copy, no host arithmetic on them), so no host multiply and no host quantise remain in the routed path; the class is `swiglu_ref::quantise_row_weighted` (which equals `mxfp4_ref::routed_activation_operand` composed with SwiGLU) and the real 576-wide operand is compared against `routed_activation_operand` directly. The unweighted epilogue stays pinned for m17b's shared expert; the six-kernel frozen m4 ABI array is untouched; window b33 measured it PASS at tokens 8 and 130 (35 checks each) |
 | D34 | The serving tail's final norm is a standalone BF16 kernel, planned and pinned before any window | `kernels/rmsnorm_sm121.cu` reproduces the engine's final-norm arithmetic exactly (`sum(x^2)` ascending f32, `/cols`, `1/sqrt(mean+eps)`, `(x*inv)*w`, one BF16 RN-even rounding) with one thread per row and 128-bit BF16 loads; the host reference is the engine's own `linalg::rms_norm`, not a copy. Pinned at 31,480 B / `5f953bc0...` / `ptx_membar_lines=0` (baseline eleventh entry, driver `KernelId::RmsNorm`); m18 is measured (0 mismatched BF16 bytes at 8 and 130 tokens, odd 513 exact, two launches byte-identical) and c4c-norm wired it (b41 0/10,240 mismatches). Details: `docs/build/phase3-rmsnorm-tail.md` |
 | D35 | The certified head's device reduction replaces the host block assembly, planned and pinned before any window | `lm_head_reduce_sm121` (36,120 B / `3fcd7ba5...`, `ptx_membar_lines=0`) is pinned as the twelfth baseline entry and the driver's `KernelId::LmHeadReduce`; m19 is measured (17/17 checks: block arrays, lowest-index tie-break over the four ranks, certified-winner refusal, `0u` screen sentinel) and the b44 window produced token 5 / 13.237006187 against the host assembly's 5 / 13.230665207. The host four-shard block assembly and the 4-byte token/status readback remain the fallback; the device cut-over is not wired, so `REQUIRED_KERNELS` stays nine and the chain stays at 1167 launches |
+| D36 | The deferred sequence's position-causal CSA2 attention entry is pinned before any window | `flash_mla_csa2_seq_sm121` (38,080 B / `f6dfc738...`, `ptx_membar_lines=0`) is the thirteenth baseline entry / twelfth `KernelId` variant with its own launch ABI; the m20 harness measured it PASS 50/50 on window b50 (positions 0, 1, 2, 129..=137; position-0 out[] byte identity 65,536 bytes) and it stays unwired, so `REQUIRED_KERNELS` stays 9; window b48 is contaminated history, not a record |
+| D37 | Criterion 1 stays OPEN: the FP8-native device path is stage-faithful but not token-parity with the f32 reference | b55-b62 measured the whole sequence path: alignment, pre-attention hidden, format-2 body, `wq_b`-vs-`mxfp8_ref` and the head reduce all pass at their own bars, yet position 0 predicts 320 where the reference predicts 201 (head input differs by 0.608) because the device attention path quantises activations (MXFP8, 32-element blocks, power-of-two ceil scales) while the fixture reference is f32 over dequantised weights. The first criterion-shaped 130+8 attempt (b62) aborted at 131/138 positions on a ~0.8 GB/position memory defect. No maths was changed; exact token parity needs either a precision-first activation path or a redefined criterion, and the hybrid-sequence branch stays unmerged until then |
+| D38 | vLLM token parity is only meaningful on the same weights, and the deployed vLLM serves a different checkpoint | `/v1/models` on the cluster reports the `pqhaz/...-heretic` snapshot `12d58ad0...`, while the fixture and the device engine use the released `deepseek-ai/...` snapshot `1bae0e10...`; its greedy completions are degenerate and must not be treated as a parity target. Any future vLLM comparison must first record the served `root` and prove it equals the snapshot under test |
 
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
@@ -2135,3 +2138,60 @@ call in the released window-only format still needs the base entry. The measured
 available if a later codegen change breaks the identity (measured, never silent mixing). `REQUIRED_KERNELS` is bumped only when the wiring is measured. Nothing here
 claims the served forward pass, the chain, a token, timing, the top-512 selection, rope, or the b45
 position-0 token mismatch, which is engine-dev's first-step state issue.
+
+
+## D37 — Criterion 1 stays OPEN: the FP8-native device path is stage-faithful but not token-parity with the f32 reference
+
+**Decision.** Criterion 1 ([device-forward-chain.md](build/device-forward-chain.md) section 4.3) is
+**not** claimed and stays OPEN. The hybrid-sequence branch is **not merged**. No maths was changed to
+chase the gap; the choice between a precision-first path and a redefined criterion belongs to the
+user.
+
+**What was measured (windows b55-b62, 2026-10-19; all binaries contain the unreviewed cut-over
+c9fa90f and everything is labelled sequence diagnostics on an unreviewed build).** The device chain
+is faithful at every separable stage: the fed token and the pre-attention hidden are exact (4/5,120
+bf16 mismatches, max_abs 2.83e-7), the format-2 attention body matches on identical staged operands
+(35/18/13 of 40 layers zero-mismatch at positions 0/1/2, max_abs <= 7.8e-3), `wq_a`/`wkv` differ by
+about 3e-3, `wq_b` is **exactly** `mxfp8_ref` on the launch bytes (0/32,768, max_abs 0.0), and the
+head reduce equals the host four-shard assembly at every position with `block_max_equal=true`
+(forcing the host assembly still returns 320/16/16). Nevertheless position 0 predicts **320** where
+the reference predicts **201** (logit max 15.73 vs 19.85), and the head input differs by **0.608**.
+
+**Attribution.** The remaining gap enters at the attention projections' activation quantisation: the
+`wq_b` input latent already differs by 5.19e-2 and the raw q by 2.94e-1 against an expected bf16
+quantisation delta of 6.18e-2 (b58/b59), while the kernel reproduces `mxfp8_ref` exactly (b60). The
+device path therefore computes MXFP8 (32-element blocks, power-of-two ceil scales) while the fixture
+reference computes f32 over dequantised weights. Exact 130+8 token parity is not attainable on the
+current arithmetic without (a) a precision-first activation path (higher-precision activations for
+the attention projections and the router, at a throughput and memory cost) or (b) a redefined
+criterion (a same-arithmetic reference or a tolerance-based acceptance). Both are user decisions.
+
+**Also blocking.** The criterion-shaped b62 run (130 prompt, 8 decode) was **aborted at 131/138
+positions** because host memory grew about 0.8 GB per position (MemAvailable 102.9 GB at position 1
+to 2.29 GB at position 128; RSS 121 GB). It must be recorded as ABORTED with that named defect, never
+as a criterion result. A 138-position run is impossible until the per-position retention is fixed and
+the fix is measured with the per-position `sequence memory:` deltas.
+
+**Consequence.** `REQUIRED_KERNELS` stays 9, the kernel work already merged (D34-D36) is unaffected,
+and the next criterion attempt waits on (1) the memory fix measured flat and (2) the user's decision
+on the precision/criterion question.
+
+## D38 — vLLM token parity is only meaningful on the same weights; the deployed vLLM serves a different checkpoint
+
+**Decision.** No statement of the form "our engine matches vLLM" may be made without first recording
+the served model's `root` and proving it equals the checkpoint under test. The deployed vLLM on the
+cluster currently serves `models--pqhaz--DeepSeek-V4.1-Flash-1017-heretic` snapshot
+`12d58ad0878b5008e80d720251adb969a0069412`, while the golden fixture and the device engine use
+`models--deepseek-ai--DeepSeek-V4.1-Flash-1017` snapshot
+`1bae0e1088993b9b82de08f59de5be5a34e42170`.
+
+**Evidence.** On 2026-10-19 the live server's `/v1/models` reported that heretic root; greedy
+completions from it are degenerate (`The capital of France is` returns ` ____. ...`), and the
+fixture's own 130 prompt ids return `[367, 223, 10727, 201, 15, 223, 19, 16, 223]` against the
+fixture reference `[491, 367, 201, 80, 3302, 201, 54, 201, 4341]`. That is a different model, not a
+numerical tolerance question.
+
+**Consequence.** The f32 reference on the released snapshot remains the only truth for our
+checkpoint. If a vLLM comparison is wanted later, it must be run against a server holding the released
+snapshot (and the served root recorded in the same log).
+

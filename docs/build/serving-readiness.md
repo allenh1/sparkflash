@@ -999,6 +999,23 @@ rows with unpadded release bytes are 18.37 / 12.35 / 11.30 GB.
   now records the 2026-10-18T18:32Z numbers. This map cites that in-repo record; the node-only run
   artifacts are named in 5.2 where they are the only source.
 
+- **Current main (2026-10-19) is `1f681a2`** = !108 batch 24 (`flash_mla_csa2_seq_sm121`
+  measured-unwired plus the m20 harness; 13 baseline entries / 12 `KernelId` variants,
+  `REQUIRED_KERNELS` 9). Batch 22 (!106 `d95fa65`) and batch 23 (!107 `4537f33`) landed the c4c
+  split records, the m18 final-norm and lm_head reduce records and the b50/b54 numbers; batch 24's
+  review was APPROVE with docs-only findings fixed in `b2012ec` before the merge. The in-repo record
+  is [device-forward-chain.md](device-forward-chain.md) section 7 (c4c, c4c-norm, b55-b62 sequence
+  status), [phase3-lm-head-reduce.md](phase3-lm-head-reduce.md) and
+  [phase3-csa2-sequence.md](phase3-csa2-sequence.md) section 10.
+- **The hybrid-sequence path is not ready and criterion 1 stays OPEN** (D37): the chain is
+  stage-faithful but not token-parity with the f32 reference (position 0 predicts 320 against the
+  reference's 201, head input differs by 0.608, attributed to the FP8-native activation
+  quantisation), and the first criterion-shaped 130+8 attempt (b62) was aborted at 131/138 positions
+  on a per-position memory defect (~0.8 GB/position, RSS 121 GB). The branch stays unmerged.
+- **The deployed vLLM is not a parity target** (D38): it serves the `...-heretic` snapshot
+  `12d58ad0...`, not the released snapshot `1bae0e10...` the fixture and the device engine use, and
+  its greedy completions are degenerate.
+
 ### 5.2 Windows and logs
 
 Node-only paths in this section are relative to
