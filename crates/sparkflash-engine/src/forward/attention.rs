@@ -284,9 +284,9 @@ pub fn rope_tables_for_layer(
 /// The body of the two builders: the reference's `precompute_freqs_cis` (model.py:368-389) reduced
 /// to the rows `positions` asks for.
 ///
-/// The frequencies stay f32 because the reference's are an f32 tensor, while the YaRN band edges are
-/// computed in f64 and then narrowed, because the reference computes them with Python floats and
-/// only narrows them where they meet that tensor.
+/// The frequencies stay f32 because the reference's are an f32 tensor. The YaRN band edges are
+/// computed in f64, because the reference computes them with Python floats; everything they
+/// feed afterwards is f32 tensor arithmetic, so the ramp and the blend below are f32 as well.
 fn tables_for(
     config: &ModelConfig,
     base: f64,
@@ -309,12 +309,23 @@ fn tables_for(
         };
         let low = corrected(config.beta_fast).floor().max(0.0);
         let high = corrected(config.beta_slow).ceil().min(dim as f64 - 1.0);
-        let span = (high - low).max(1e-3);
+        // The ramp is f32 tensor arithmetic in the reference (model.py:384): a f32 arange minus
+        // the integer band edge, divided by the integer span (or by 1e-3 in the degenerate band),
+        // then clamped. Computing it in f64 and narrowing changes one of the 32 released
+        // frequencies by an ulp, which moves about 3% of the released table's entries.
+        let span: f32 = if high > low {
+            (high - low) as f32
+        } else {
+            1e-3
+        };
         let factor = config.rope_factor as f32;
         for (k, freq) in freqs.iter_mut().enumerate() {
-            let ramp = (((k as f64 - low) / span).clamp(0.0, 1.0)) as f32;
+            let ramp = ((k as f32 - low as f32) / span).clamp(0.0, 1.0);
             let smooth = 1.0 - ramp;
-            *freq = *freq / factor * ramp + *freq * smooth;
+            // freqs / factor * (1 - smooth) + freqs * smooth (model.py:386). The reference
+            // re-derives (1 - smooth) from the rounded smooth instead of reusing ramp, so this
+            // does too: the two are not always the same f32 value.
+            *freq = *freq / factor * (1.0 - smooth) + *freq * smooth;
         }
     }
     let mut cos = Vec::with_capacity(positions.len() * pairs);
@@ -2869,6 +2880,81 @@ mod tests {
             "pair 1 is past the ramp, so twice the factor halves its frequency: {} and {}",
             angle(&two, 1),
             angle(&one, 1)
+        );
+    }
+
+    /// The reference's `precompute_freqs_cis` at the released rope geometry (rope_head_dim 64,
+    /// base 160000 = `compress_rope_theta`, original_seq_len 16384, factor 16, beta 32/1), spelled
+    /// out twice: with the reference's f32 ramp, and with the f64 ramp this host used before F8.
+    fn released_yarn_tables(positions: &[usize], f64_ramp: bool) -> RopeTables {
+        let (dim, base, original, factor) = (64usize, 160_000.0f64, 16_384usize, 16.0f32);
+        let corrected = |rotations: f64| {
+            dim as f64 * (original as f64 / (rotations * 2.0 * std::f64::consts::PI)).ln()
+                / (2.0 * base.ln())
+        };
+        let low = corrected(32.0).floor().max(0.0);
+        let high = corrected(1.0).ceil().min(dim as f64 - 1.0);
+        let span32: f32 = if high > low {
+            (high - low) as f32
+        } else {
+            1e-3
+        };
+        let span64 = (high - low).max(1e-3);
+        let mut cos = Vec::new();
+        let mut sin = Vec::new();
+        for &position in positions {
+            for k in 0..dim / 2 {
+                let freq = 1.0f32 / (base as f32).powf(2.0 * k as f32 / dim as f32);
+                let ramp = if f64_ramp {
+                    (((k as f64 - low) / span64).clamp(0.0, 1.0)) as f32
+                } else {
+                    ((k as f32 - low as f32) / span32).clamp(0.0, 1.0)
+                };
+                let smooth = 1.0 - ramp;
+                let blended = if f64_ramp {
+                    freq / factor * ramp + freq * smooth
+                } else {
+                    freq / factor * (1.0 - smooth) + freq * smooth
+                };
+                let angle = position as f32 * blended;
+                cos.push(angle.cos());
+                sin.push(angle.sin());
+            }
+        }
+        RopeTables { cos, sin }
+    }
+
+    /// F8: the reference's YaRN band is f32 tensor arithmetic (model.py:377-386): the ramp is a f32
+    /// arange minus the integer band edge over the integer span, clamped; the blend then re-derives
+    /// (1 - smooth) from the rounded smooth instead of reusing the ramp. At the released geometry the
+    /// f64-then-narrow ramp differs from that for one pair, and reusing the ramp differs for one more,
+    /// which moves 3,862 of the 131,104 table cos entries over positions 0..=4096 (3,926 sin). This
+    /// test spells the reference's arithmetic out independently, pins the tables to it, and pins that
+    /// the old f64 variant is a different table so the fix cannot be undone silently.
+    #[test]
+    fn the_yarn_ramp_is_the_reference_f32_arithmetic() {
+        let config = ModelConfig {
+            original_seq_len: 16_384,
+            rope_factor: 16.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            ..ModelConfig::tiny()
+        };
+        let positions = [47usize, 4000];
+        let tables = tables_for(&config, 160_000.0, 16_384, 64, &positions);
+        let reference = released_yarn_tables(&positions, false);
+        let f64_variant = released_yarn_tables(&positions, true);
+        assert_eq!(
+            tables.cos, reference.cos,
+            "the tables must use the reference's f32 ramp"
+        );
+        assert_eq!(
+            tables.sin, reference.sin,
+            "the tables must use the reference's f32 ramp"
+        );
+        assert_ne!(
+            reference.cos, f64_variant.cos,
+            "the f64 ramp is a different table at this geometry, so the comparison above is live"
         );
     }
 

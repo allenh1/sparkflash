@@ -1796,4 +1796,26 @@ mod tests {
             "norm_eps 1.0 must shrink the FFN norm's output far below the 1e-20 run, got {small} against {large}"
         );
     }
+    /// F8: the reference's norms call `torch.rsqrt` (model.py:292 for RMSNorm, 953 for hc_mixes),
+    /// which is the reciprocal of the f32 square root. This host computes `1.0 / sqrt` and nothing
+    /// else, so the test pins the bits: a later change cannot quietly substitute an rsqrt
+    /// approximation. The device ambiguity is declared, not aligned: CUDA's `torch.rsqrt` lowers to
+    /// a ~2 ulp intrinsic and no host arithmetic reproduces it bit for bit (native-arithmetic-audit
+    /// F8).
+    #[test]
+    fn the_norm_rsqrt_is_the_correctly_rounded_reciprocal_sqrt() {
+        let source = [3.0f32, 4.0, 0.5, 1.25];
+        let weight = [1.5f32, 1.0, 0.5, 2.0];
+        let mut values = source;
+        linalg::rms_norm(&mut values, &weight, 4, 1e-20).expect("one row of four");
+        let mean = source.iter().map(|v| v * v).sum::<f32>() / 4.0;
+        let inverse = 1.0 / (mean + 1e-20f32).sqrt();
+        for ((value, source), weight) in values.iter().zip(source).zip(weight) {
+            assert_eq!(
+                *value,
+                source * inverse * weight,
+                "the norm must scale by the correctly rounded reciprocal square root"
+            );
+        }
+    }
 }

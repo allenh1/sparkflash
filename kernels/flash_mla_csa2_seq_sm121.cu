@@ -361,7 +361,11 @@ extern "C" __global__ void flash_mla_csa2_seq_sm121(
         float local_sum = lane == 0u ? spark_exp(sink[head] - s_max) : 0.0f;
         for (uint32_t slot = lane; slot < union_total; slot += SPARK_M4_MLA_THREADS) {
             const float probability = spark_exp(s_scores[slot] - s_max);
-            s_scores[slot] = probability;
+            // kernel.py:339-341: the released body copies the f32 probabilities into a bf16 tile
+            // before the P*V GEMM, so the value sum consumes the rounded probability. The
+            // normalising sum keeps the f32 probability (kernel.py:342-353), so local_sum
+            // below adds the unrounded value on purpose.
+            s_scores[slot] = __bfloat162float(__float2bfloat16_rn(probability));
             local_sum += probability;
         }
         local_sum = spark_block_sum(local_sum, lane, SPARK_M4_MLA_THREADS);
@@ -453,7 +457,11 @@ extern "C" __global__ void flash_mla_csa2_seq_sm121(
     float local_sum = lane == 0u ? spark_exp(sink[head] - s_max) : 0.0f;
     for (uint32_t slot = lane; slot < selected_count; slot += SPARK_M4_MLA_THREADS) {
         const float probability = spark_exp(s_scores[slot] - s_max);
-        s_scores[slot] = probability;
+        // kernel.py:339-341: the released body copies the f32 probabilities into a bf16 tile
+        // before the P*V GEMM, so the value sum consumes the rounded probability. The
+        // normalising sum keeps the f32 probability (kernel.py:342-353), so local_sum
+        // below adds the unrounded value on purpose.
+        s_scores[slot] = __bfloat162float(__float2bfloat16_rn(probability));
         local_sum += probability;
     }
     local_sum = spark_block_sum(local_sum, lane, SPARK_M4_MLA_THREADS);

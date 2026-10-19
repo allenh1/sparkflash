@@ -193,7 +193,7 @@ device path.
 | 8 | `wq_a` | fp8 W8A8 on the **bf16** attn_norm output, bf16 out (`model.py:636,187-205`) | device dense B12x MXFP8: engine ceil-rule quantiser over the **f32** capture (`attention_device.rs:1052`), 32x32 ue8m0 weight grid, f32 block accumulation, bf16 out (`kernels/b12x_mxfp8_dense_sm121.cu:93-113`) | `native` rule; the quantiser's input has one bf16 round missing (F5) | NONE + LOW(F5) | MEASURED: stage 8 dense 16,384/16,384 bit-exact against the in-crate `mxfp8_ref` on the same bytes; 5,120/5,120 codes and 160/160 scales at stage 0 (D23) |
 | 9 | `q_norm` | RMSNorm, bf16 out (`model.py:970`) | host f32 `query_path_with` (`engine/forward/attention.rs:1658-1720`), no bf16 round | `native` (task-10 narrows the norm output before the device wq_b staging) | NONE | SOURCE; test `the_host_q_norm_output_is_a_bf16_tensor_before_the_wq_b_quantiser` |
 | 10 | `wq_b` | fp8 W8A8 on the **bf16** q_norm output (`model.py:971`) | device dense MXFP8; activation quantised from the f32 q_norm vector (`attention_device.rs:1083`) | `native` rule + F5 | NONE + LOW(F5) | MEASURED: `wq_b` reproduces `mxfp8_ref` 0/32,768, max_abs 0.0 (STATUS-2026-10-19 section 3) |
-| 11 | q RoPE | f32 rotation from the bf16 value, written back into the bf16 tensor (`392-409`) | host f32 `rotate_rows` on bf16-exact values; bf16 when uploaded to the body (`attention_device.rs:1289-1292`) | `native` (one rounding, at the same point) | NONE | SOURCE; tables are a different f32 libm (F8, unverified) |
+| 11 | q RoPE | f32 rotation from the bf16 value, written back into the bf16 tensor (`392-409`) | host f32 `rotate_rows` on bf16-exact values; bf16 when uploaded to the body (`attention_device.rs:1289-1292`) | `native` (one rounding, at the same point) | NONE | SOURCE; task-11 aligned the table arithmetic to the reference f32 YaRN (F8); the cos/sin last bit is the platform libm, declared |
 | 12 | `wkv` | fp8 W8A8 on the bf16 attn_norm output | device dense MXFP8 from the f32 capture (`attention_device.rs:1110`) | `native` + F5 | NONE + LOW(F5) | MEASURED as #8 |
 | 13 | `kv_norm` then window RoPE | RMSNorm bf16 out; rope in place bf16; then `act_quant(kv, 32, ue8m0, inplace=True)` (`model.py:700-707`) | host f32 `window_kv_with` (`attention.rs:1723-1760`): f32 norm, f32 rope, fp8 round trip with the ceil rule (`round_trip_rows`, `attention.rs:181-233`) | `native` (task-10 added the two rounds) | LOW | MEASURED before the rounds: stage 1 reproduced 5,119/5,120 codes and 160/160 scales (layer 0 token 0), 5,118/5,120 at layer 4 token 0 (D23) - the 1-2 code gap the rounds close; device re-measure is a window leg |
 | 14 | window row construction (host) | the quantiser sees a **bf16** row (the in-place result) | `engine_window_row` bf16-rounds the row before quantising and requires the two quantisers to agree (`cuda_harness.rs:220-241`) | `native` (the quantiser input is bf16, exactly as native) | NONE | SOURCE; the row it rounds is the chain's f32 rope output, see #13 |
@@ -467,7 +467,9 @@ Direction: neither more nor less precise; a different rounding *structure* at bf
 difference from native: of order a bf16 ulp on the FFN output with a random sign - it can flip the
 occasional bf16 code but does not bias the result.
 
-### F8 - accumulation association and f32 last-bit differences (no rule difference). **NONE, with two unverified f32 items.**
+### F8 - accumulation association and f32 last-bit differences (no rule difference)
+
+**NONE: the YaRN table arithmetic is aligned to the reference; the libm/rsqrt last bits are declared, not guessed.**
 
 All GEMMs: native accumulates code products per 32-block in an MMA and applies both scales to the
 block partial (`kernel.py:269,553`); the chain's dense/wo_a/mxfp4 kernels dequantise each product and
@@ -477,18 +479,46 @@ operands are the same f32 values in both; only the association of the f32 additi
 **not** a discrepancy class, and it is why zero-mismatch twins are attainable at all (the mHC
 projection 5.96e-8, `wq_b` 0/32,768 max 0.0, the body 66/120 exact).
 
-Two f32 items inside this class are *unverified* rather than verified-equivalent:
+Two f32 items inside this class are not rule differences. Task-11 aligned the one that is a host
+arithmetic question and declared the one that is the reference's own platform behaviour:
 
-- `torch.rsqrt` (native's norms and `hc_mixes`) against the chain's `1/sqrt`. On CUDA `torch.rsqrt`
-  lowers to a device intrinsic accurate to about 2 ulp; the chain computes `1.0f / sqrtf`. The
-  difference is below a bf16 ulp but it perturbs block-scale boundaries. Both sides are f32-class and
-  the measured mHC delta is 5.96e-8, so the practical bound is the same order; it is listed so a
-  future bit-level comparison does not mistake it for a bug.
-- the RoPE tables: native builds them with `torch.polar` over f32 `arange`/`log`/`floor`/`clamp`
-  (`model.py:369-390`), the chain with Rust f32 `sin`/`cos` over its own YaRN implementation
-  (`attention.rs:250-336`). The two f32 libms can differ in the last bit. Not measured directly;
-  bounded indirectly by the stage-1 code agreement (1-2 codes in 5,120), which is what the tables
-  feed.
+- **`torch.rsqrt` against the host's `1/sqrt` - declared, not aligned.** Native calls
+  `torch.rsqrt` in RMSNorm (`model.py:292`), the Engram gate's `rstd` (`model.py:359`) and
+  `hc_mixes` (`model.py:953`). Every host site computes the correctly rounded reciprocal of the f32
+  square root: `linalg.rs:338` (`1.0 / (mean + eps).sqrt()`), `mhc.rs:207`,
+  `engram.rs:769-770` (and `engram.rs:715` for the `dim**-0.5` constant, measured equal to the
+  reference's narrowed Python value at dims 8, 16, 32, 64, 128, 512 and 5,120). The test
+  `the_norm_rsqrt_is_the_correctly_rounded_reciprocal_sqrt` pins the bits
+  (`crates/sparkflash-engine/src/forward/mod.rs:1806`). CPU torch's `rsqrt` is that same `1/sqrt`, so
+  a CPU-generated reference would match this host only if that backend also computes the plain
+  reciprocal; PyTorch does not document that as bit-identical, and its CUDA lowering is a device
+  intrinsic accurate to about 2 ulp, so on the released platform a device normaliser and this host
+  can differ in the last bits. This is the ambiguous seam inside F8: no host arithmetic can be shown
+  bit-equal to native's `torch.rsqrt` on every backend, so it is declared rather than guessed at,
+  with the bound 2 ulp relative (about 2.4e-7 on the normaliser; a bf16 ulp at 1.0 is 3.9e-3) and the
+  mHC twin's 5.96e-8 as the measured downstream bound. A bit-level device-vs-host normaliser
+  comparison must expect the last bits to differ; it is not a defect.
+- **The RoPE tables - aligned to the reference's f32 arithmetic.** Native builds them with
+  `torch.polar` over f32 tensors (`model.py:369-390`): a f32 `arange` for the frequencies, then
+  YaRN's ramp `((arange(f32) - low) / max(high - low, 1e-3)).clamp(0, 1)` and the blend
+  `freqs / factor * (1 - smooth) + freqs * smooth` with `smooth = 1 - ramp` (`model.py:384-386`).
+  The host computed the ramp in f64 and reused `ramp` in place of the reference's `(1 - smooth)`,
+  which re-derives the value from the rounded `smooth` and is not always the same f32 value. At the
+  released geometry (`rope_head_dim` 64, base 160000, `original_seq_len` 16,384, factor 16, beta
+  32/1) that changed pair 14 by one ulp; task-11 reproduces the reference's f32 ramp and blend
+  (`attention.rs:290-351`). Measured: over positions 0..=4096 the released table's 32 pairs move
+  3,862 of 131,104 `cos` entries and 3,926 of 131,104 `sin` entries (first at position 47). The
+  pinned test `the_yarn_ramp_is_the_reference_f32_arithmetic` (`attention.rs:2935`) spells the
+  reference out independently and fails on the f64 variant. The tiny CI fixture is unaffected
+  because its ramp values are exactly 0 and 1; it was regenerated byte-identical (sha256
+  `c9aa2cd5bb093c579cdfcb4fcc9f8f100ea22789d9841600830b0f020ae7927d`). The remaining ambiguity is
+  the libm, and it is declared: `cos`/`sin` and the base `pow` are the platform's f32 functions.
+  Measured on this host, glibc's f32 `cos`/`sin` are within 1 ulp of the correctly rounded
+  double-precision value across the released table's 131,104 angles; the native platform is CUDA,
+  whose `sinf`/`cosf` are libdevice approximations (up to 2 ulp). The table's last bit is
+  platform-defined on both sides and cannot be aligned host-side; the stage-1 class-C agreement
+  (5,119/5,120 codes, D23) bounds what it does downstream.
+
 
 ---
 

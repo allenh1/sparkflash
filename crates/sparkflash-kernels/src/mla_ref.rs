@@ -165,6 +165,16 @@ pub fn kv_latent(kv_fp4: &[u8], kv_scales: &[u8], row: usize, index: usize) -> f
 /// This is the no-sink path and it is unchanged by the sink work; [`attention_with_sink`] takes the
 /// checkpoint's sink value and is the only entry point that can differ.
 ///
+/// # Historical arithmetic (pre-F2)
+///
+/// This path keeps the P*V probability in f32 on purpose. It pins the format-0/1 device
+/// kernels' arithmetic, which predates the native rounding rule; the released body rounds
+/// every softmax probability to bf16 before the value product (kernel.py:339-341), which is
+/// what [`attention_with_sink_union`] and the engine's reference body do. A comparison between this
+/// path and a native path is therefore expected to show a difference by design, not to match
+/// bit for bit, and the test `the_pre_f2_window_path_keeps_the_f32_probability_by_design
+/// pins that difference.
+///
 /// # Panics
 /// Panics if the candidate list is longer than MAX_SELECTED, or the slices are too short.
 #[must_use]
@@ -193,6 +203,9 @@ pub fn attention(
 /// result is all zeros with or without a sink. Following the released implementation, the sink is
 /// added after `m` rather than folded into it, so a sink more than about 88 above `m` overflows the
 /// denominator and the output is exactly zero.
+///
+/// Like [`attention`], this is the pre-F2 historical arithmetic: the P*V probability stays f32,
+/// and a native path rounds it to bf16 first (kernel.py:339-341).
 ///
 /// # Panics
 /// Panics if the candidate list is longer than MAX_SELECTED, or the slices are too short.
@@ -260,7 +273,9 @@ fn attention_impl(
         }
     }
 
-    // Pass three: the weighted latent sum.
+    // Pass three: the weighted latent sum. Pre-F2 historical arithmetic: the probability stays
+    // f32 here by design (see the entry points' docs); the union path carries the native bf16
+    // round instead.
     let mut out = vec![0.0f32; MLA_LATENT];
     if maximum > f32::NEG_INFINITY {
         for candidate in selected {
@@ -345,6 +360,12 @@ pub fn window_attendable(window_rows: usize, candidate: u32) -> bool {
 /// the FP4 path, which is the point: the device kernel and this reference are two independent
 /// implementations of the same format.
 ///
+/// # Historical arithmetic (pre-F2)
+///
+/// Like [`attention`], this path keeps the P*V probability in f32 on purpose: it pins the
+/// format-0/1 device arithmetic. Native rounds each probability to bf16 before the value
+/// product (kernel.py:339-341), so a native path differs from this one by design.
+///
 /// # Panics
 /// Panics if the candidate list is longer than MAX_SELECTED, or the slices are too short for
 /// `window_rows` rows.
@@ -364,6 +385,8 @@ pub fn attention_window(
 /// The sink is the same additive denominator logit as in [`attention_with_sink`]: one value added
 /// after the maximum, in the denominator only. An all-outside candidate list therefore yields an
 /// all-zero output even with a sink, because the numerator is empty.
+///
+/// Pre-F2 historical arithmetic, as [`attention_window`]: the P*V probability stays f32.
 ///
 /// # Panics
 /// Panics if the candidate list is longer than MAX_SELECTED, or the slices are too short for
@@ -452,7 +475,9 @@ fn window_attention_impl(
     }
 
     // Pass three: the weighted sum of the stored window values. Out-of-window ids are skipped
-    // outright, so their contribution is exactly zero rather than a small weight.
+    // outright, so their contribution is exactly zero rather than a small weight. Pre-F2
+    // historical arithmetic: the probability stays f32 here by design (see the entry points'
+    // docs); native rounds it to bf16 first (kernel.py:339-341).
     let mut out = vec![0.0f32; MLA_LATENT];
     if maximum > f32::NEG_INFINITY {
         for candidate in selected {
@@ -2508,5 +2533,32 @@ mod tests {
         assert_eq!(blocks[0].1, 0);
         let blocks = indexer_block_scores(&key, &query, 1);
         assert_eq!(blocks[0].1, 0);
+    }
+    /// Pre-F2 by design: the format-0/1 window path keeps the P*V probability in f32 (see
+    /// [`attention_window`]). Native rounds every probability to bf16 first (kernel.py:339-341),
+    /// so a native path and this twin differ BY DESIGN. This test pins both halves: the window
+    /// path really is the f32 arithmetic, and the native answer is a different number, so a
+    /// device-vs-twin difference cannot be read as a defect of this path.
+    #[test]
+    fn the_pre_f2_window_path_keeps_the_f32_probability_by_design() {
+        let q = channel_query(0);
+        let (codes, scales) = engine_rows(&[window_row(1.0), window_row(0.5)]);
+        let listed = [0u32, 1];
+        let window = attention_window(&q, &codes, &scales, 2, &listed);
+        // Scores are the stored values times the score scale, so the second probability is
+        // exp(-0.5 * scale) and the first is exactly 1.
+        let lower = (-0.5f32 * MLA_SCORE_SCALE).exp();
+        let denominator = 1.0 + lower;
+        let f32_answer = (1.0 + lower * 0.5) / denominator;
+        let native_lower = bf16_value(bf16_bits(lower));
+        let native_answer = (1.0 + native_lower * 0.5) / denominator;
+        assert_eq!(
+            window[0], f32_answer,
+            "the format-0/1 path is the f32 arithmetic by design"
+        );
+        assert_ne!(
+            window[0], native_answer,
+            "the native bf16 round must show as a difference, by design"
+        );
     }
 }
