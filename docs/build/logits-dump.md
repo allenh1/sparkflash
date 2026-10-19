@@ -38,17 +38,29 @@ is the full-vocabulary sidecar.
 | `logits_bin` | string | the sidecar path, `FILE` + `.bin` |
 | `top20` | array | up to 20 `[token_id, logit]` pairs, descending by logit and then ascending by id |
 
-Fields are additive. The frozen consumer requires only `position`, `vocab` and `logits_offset`
-(`CONSUMED_FIELDS` in the module), so an older dump that predates a parity-only field still joins.
+Fields are additive for parsing and joining. The frozen consumer requires only `position`, `vocab` and
+`logits_offset` (`CONSUMED_FIELDS` in the module), so an older dump that predates a parity-only field
+still parses. Absence is not treated as a match, though: a row without a usable `reference_id` (or an
+oracle position without `target_token`) is reported as `prefix_match = UNKNOWN` and counted in
+`prefix_mismatches`; a missing field never silently becomes a match. The consumer also checks the
+sidecar pair: when rows carry `logits_bin` it must name the dump's own `FILE + ".bin"`, the sidecar must
+be exactly as long as the recorded blocks, and the offsets must tile - a dump moved next to another
+run's sidecar is refused (exit 2) instead of compared silently.
 
 **Sidecar.** `FILE.bin` holds consecutive little-endian f32 blocks, `vocab` values per dumped
 position, in the same position order, with no padding. Each object's `logits_offset` is the sum of
 the previous blocks' `vocab * 4`, and the file's length is that sum for every dumped position.
 
 **Positions.** D40 joins the two sides on this integer: oracle `prompt_logprobs[p + 1]` is the
-distribution after device position `p`. A prefill-only run (`--decode-steps 0`) therefore dumps the
-prompt positions, which is what a D41 flooring run consumes; the trailing position with no oracle
-counterpart is harmless because the comparison joins on `position`.
+distribution after device position `p`. A prefill-only run (`--decode-steps 0`) does **not** produce
+the window shape for a fixture that records decode steps: `full_claim` requires both
+`prompt_tokens == fixture.prompt_tokens.len()` and `decode_steps == fixture.decode_steps`
+(`device_chain.rs`), so a zero-decode run falls into the O(N^2) sanity-prefix path - one reference
+prefill per prompt prefix - and dumps positions `0..prompt_len-1`, not the 130 + 8 window. That path
+is why b69 was terminated at 62 minutes with no dump (serving-logprobs-parity.md); it is not the
+acceptance shape and it is not what a D41 flooring run consumes (that uses the capture path in
+`d41-floor-computation.md`). The trailing position with no oracle counterpart is harmless because the
+comparison joins on `position`.
 
 ## Compatibility with the existing dumps
 

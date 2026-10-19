@@ -136,6 +136,36 @@ class DumpTest(unittest.TestCase):
             compare.read_dump(self.dump)
 
 
+    def test_rows_naming_another_sidecar_are_refused(self):
+        rows = compare.read_dump(self.dump)
+        rows[0]["logits_bin"] = os.path.join(self.tmp.name, "other.jsonl.bin")
+        with self.assertRaises(compare.CompareError):
+            compare.check_dump_sidecar(rows, self.dump, self.bin)
+
+    def test_a_sidecar_with_another_dumps_name_is_refused(self):
+        rows = compare.read_dump(self.dump)
+        with self.assertRaises(compare.CompareError):
+            compare.check_dump_sidecar(rows, self.dump, os.path.join(self.tmp.name, "other.jsonl.bin"))
+
+    def test_a_wrong_length_sidecar_is_refused(self):
+        rows = compare.read_dump(self.dump)
+        with open(self.bin, "ab") as handle:
+            handle.write(b"\0\0\0\0")
+        with self.assertRaises(compare.CompareError):
+            compare.check_dump_sidecar(rows, self.dump, self.bin)
+
+    def test_non_tiling_offsets_are_refused(self):
+        rows = compare.read_dump(self.dump)
+        rows[1]["logits_offset"] = 0
+        with self.assertRaises(compare.CompareError):
+            compare.check_dump_sidecar(rows, self.dump, self.bin)
+
+    def test_writer_shaped_dump_and_sidecar_are_accepted(self):
+        rows = compare.read_dump(self.dump)
+        for row in rows:
+            row["logits_bin"] = self.bin
+        compare.check_dump_sidecar(rows, self.dump, self.bin)
+
     def test_the_existing_d40_demo_dump_is_readable(self):
         """The compatibility fixture is a dump this test did not write."""
         path = os.path.normpath(os.path.join(SCRIPTS, "..", "crates", "sparkflash-cli", "tests",
@@ -205,6 +235,19 @@ class PositionMetricsTest(unittest.TestCase):
         metrics = compare.position_metrics(row, logits, oracle_position)
         self.assertFalse(metrics["prefix_match"])
 
+    def test_absent_reference_id_is_unknown_not_a_match(self):
+        logits = [1.0, 0.0]
+        oracle_lp = {token: value for token, value in enumerate(compare.log_softmax(logits))}
+        metrics = compare.position_metrics({"position": 0, "vocab": 2}, logits, self._oracle(oracle_lp))
+        self.assertIsNone(metrics["prefix_match"])
+
+    def test_unreadable_reference_id_is_unknown_not_a_match(self):
+        logits = [1.0, 0.0]
+        oracle_lp = {token: value for token, value in enumerate(compare.log_softmax(logits))}
+        row = {"position": 0, "vocab": 2, "reference_id": "0"}
+        metrics = compare.position_metrics(row, logits, self._oracle(oracle_lp))
+        self.assertIsNone(metrics["prefix_match"])
+
 
 class AggregateAndBarsTest(unittest.TestCase):
     def _position(self, top1, kl, delta):
@@ -229,6 +272,14 @@ class AggregateAndBarsTest(unittest.TestCase):
         failing = compare.evaluate_bars({"bars": {"max_abs_delta_max": 1.0}}, aggregate)
         self.assertFalse(failing["pass"])
         self.assertEqual(len(failing["bars"]), 1)
+
+    def test_unknown_prefix_counts_as_a_mismatch(self):
+        first = self._position(True, 0.1, 1.0)
+        second = self._position(True, 0.1, 1.0)
+        second["prefix_match"] = None
+        aggregate = compare.aggregate_metrics([first, second])
+        self.assertEqual(aggregate["prefix_mismatches"], 1)
+        self.assertEqual(aggregate["prefix_unknown"], 1)
 
     def test_unknown_bar_is_an_error(self):
         aggregate = compare.aggregate_metrics([self._position(True, 0.1, 2.0)])
@@ -304,6 +355,42 @@ class EndToEndTest(unittest.TestCase):
         out_json = os.path.join(self.tmp.name, "out.json")
         code = compare.main(["--dump", self.dump, "--oracle", self.oracle, "--out-json", out_json])
         self.assertEqual(code, 2)
+
+    def _rewrite_dump(self, mutate):
+        with open(self.dump, encoding="utf-8") as handle:
+            rows = [json.loads(line) for line in handle if line.strip()]
+        for row in rows:
+            mutate(row)
+        with open(self.dump, "w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+
+    def test_dump_without_reference_id_is_flagged_not_matched(self):
+        self._rewrite_dump(lambda row: row.pop("reference_id", None))
+        out_json = os.path.join(self.tmp.name, "out.json")
+        code = compare.main(["--dump", self.dump, "--oracle", self.oracle, "--out-json", out_json])
+        self.assertEqual(code, 0)
+        with open(out_json, encoding="utf-8") as handle:
+            result = json.load(handle)
+        self.assertEqual(result["aggregate"]["prefix_mismatches"], 2)
+        self.assertEqual(result["aggregate"]["prefix_unknown"], 2)
+        with open(os.path.join(self.tmp.name, "out.md"), encoding="utf-8") as handle:
+            self.assertIn("UNKNOWN", handle.read())
+
+    def test_dump_naming_another_sidecar_is_rejected(self):
+        self._rewrite_dump(lambda row: row.update(logits_bin=os.path.join(self.tmp.name, "other.jsonl.bin")))
+        out_json = os.path.join(self.tmp.name, "out.json")
+        code = compare.main(["--dump", self.dump, "--oracle", self.oracle, "--out-json", out_json])
+        self.assertEqual(code, 2)
+        self.assertFalse(os.path.exists(out_json))
+
+    def test_wrong_length_sidecar_is_rejected(self):
+        with open(self.bin, "ab") as handle:
+            handle.write(b"\0\0\0\0")
+        out_json = os.path.join(self.tmp.name, "out.json")
+        code = compare.main(["--dump", self.dump, "--oracle", self.oracle, "--out-json", out_json])
+        self.assertEqual(code, 2)
+        self.assertFalse(os.path.exists(out_json))
 
 
 if __name__ == "__main__":

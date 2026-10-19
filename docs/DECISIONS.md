@@ -49,6 +49,7 @@ records the evidence and the consequence for the build. Research backing is in
 | D38 | vLLM token parity is only meaningful on the same weights, and the deployed vLLM serves a different checkpoint | `/v1/models` on the cluster reports the `pqhaz/...-heretic` snapshot `12d58ad0...`, while the fixture and the device engine use the released `deepseek-ai/...` snapshot `1bae0e10...`; its greedy completions are degenerate and must not be treated as a parity target. Any future vLLM comparison must first record the served `root` and prove it equals the snapshot under test |
 | D39 | The chain runs the checkpoint's native arithmetic; acceptance is numeric with tolerance, and vLLM is the behavioural oracle | Native arithmetic means the released forward's rule (model.py:27-30, 182-205: 32-element ue8m0-ceil activations, 32x32 ue8m0 / FP4-32 weights, f32 accumulate), not f32/BF16-class activations; token equality is retired as a criterion because generation is not deterministic, so acceptance is numeric/distributional at declared tolerances; vLLM is the behavioural oracle; Engram weights stay disk-offloaded |
 | D40 | Serving-parity measurement protocol, metric set and provisional numeric bars, declared before the first diagnostic run (D41 freezes them) | The oracle is vLLM serving the released snapshot at TP=4, temperature 0, prompt_logprobs with max-logprobs 1000 and the served root recorded (D38); the device side is the full-vocabulary --dump-logits artefact on the same token ids; the comparison reports top-1/top-5/top-20 agreement, max/mean |delta logprob| over the oracle top-100 and KL over a fixed renormalised top-100 support, per position plus aggregates; provisional bars are top-1 >= 95% of positions, median top-20 recall >= 90%, median KL <= 0.02 nat and p95 <= 0.10 nat, max |delta| <= 1.0 nat per position (no position above 2.0); D41 must freeze the thresholds from the measured oracle self-consistency floor (at least 3x the floor) before any serving claim, and a bar changed after a gate run is a new decision |
+| D42 | The engine KV/attention seam is a KV store trait (Option B), recorded but NOT implemented; an in-path diagnostic mirror is rejected | The serving KV can be claimed paged only when the engine's attention path reads and writes the paged pool as its backing store. Of the three boundaries (attention backend trait, KV store trait, engine-owned allocator handle), Option B is recorded: the engine defines a minimal store contract and keeps a host dense bit-exact default; the paged store owns allocator/sharing/eviction behind it; the scheduler owns the shared pool and page-reservation-aware admission; the HTTP driver owns request-to-sequence handles and fills only cache fields it can measure from store counters (tier and replay fields stay zero). Option A cannot produce the cache claims, Option C puts page admission in the engine before the scheduler has a capacity model. No code is approved by this decision and no branch exists: it is an engine-wide refactor to be argued against measured staging and parity numbers. The frozen 19-word attention entry stays frozen (Path A's 20th argument is a separate pin decision), a default-off diagnostic request-path mirror is explicitly rejected (it leaves the serving KV dense, hides its cost behind a flag, and makes the bookkeeping claim without the user-visible cost), and the load-bearing boundary is quoted verbatim in the entry: Option B does not fix the f32-engine vs fp4-device numeric gap, O(context) staging, HSI full-pool selection, the serial HTTP engine, or the host-resident paged pool. Evidence: docs/build/engine-kv-seam-decision.md |
 
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
@@ -2371,6 +2372,17 @@ measured - a changed bar is a new decision and the next run is a new gate.
    at temperature 0 with the same prefix both implementations are asked the same question; token
    streams after the first divergence are not comparable and are not compared (D39).
 
+**Update 2026-10-19 (Lead-authorised, B70 host prep; an addendum, not a rewrite of the frozen text).**
+"Prefill only" in item 2 means the device side does not sample or generate from its own stream; it was
+read as "run with `--decode-steps 0`" and that reading is wrong for this fixture. The measured 130 + 8
+claim is a **full claim**: the golden fixture records its 8 decode steps, `full_claim` requires
+`prompt_tokens == fixture.prompt_tokens.len()` **and** `decode_steps == fixture.decode_steps`, and the
+dump then covers device positions 129..137 - 9 compared positions. A zero-decode run against this
+fixture is not a full claim and takes the O(N^2) sanity-prefix branch (one reference prefill per prompt
+prefix), dumping 130 prompt positions; b69 was that branch, terminated after 62 minutes with no dump.
+The B70 diagnostic run therefore uses 130 + 8, labels itself PRE-FIX DIAGNOSTIC in its evidence, and is
+not acceptance evidence: the native-arithmetic fixes are not in it and the D41 bars do not exist yet.
+
 ### Metrics (frozen)
 
 With O_p the oracle's top-1000 distribution at position p and D_p the device's full distribution:
@@ -2415,8 +2427,9 @@ investigated and reported, not absorbed by loosening the bar.
 ### Bar file format (for D41)
 
 D41 is recorded as a JSON file, not prose, so the gate run consumes it directly.
-`scripts/compare_native_vs_vllm.py` accepts exactly these names (`--bars FILE`); any other name is
-ignored and the run is unbared:
+`scripts/compare_native_vs_vllm.py` accepts exactly these names (`--bars FILE`); an unknown name is a
+refusal - exit 2, no evidence file written - not a silent UNBARED. A typo cannot pass and cannot quietly
+remove the gate; only omitting `--bars` produces the UNBARED verdict:
 
 | name | D40 metric | provisional value |
 | :--- | :--- | :--- |
@@ -2464,3 +2477,99 @@ facts to keep when reading b70:
   bars, together with the performance bars D41 also fixes.
 - docs/build/serving-parity-plan.md section 4 points here; the plan's phrase "bars are declared
   before the run" now has a named record.
+
+## D42 - The engine KV/attention seam is a KV store trait (Option B), recorded and not implemented; an in-path diagnostic mirror is rejected
+
+**Date:** 2026-10-19. **Status:** recorded boundary, **no implementation approved**. Proposal:
+`docs/build/engine-kv-seam-decision.md` (docs only, task-47). Reviewing this decision does not
+authorise an engine refactor, a branch, or an ABI change.
+
+### The claim this decision exists to stop
+
+"The paged store mirrors the request token sequence" is **not** the same claim as "the serving KV is
+paged". The first is a diagnostic that spends CPU to make bookkeeping look consumed; the second
+requires the engine's attention path to read and write the paged pool as its backing store. Today
+`crates/sparkflash-cli/src/serve.rs`'s `paged_serve` module is crate-internal, has no production
+caller, and is a storage/plumbing harness. `cached_tokens`, `stats.kv_cache`, `kv_cache_hit_rate`
+and prefix sharing are **not** serving claims until the seam below exists and a window measures it.
+
+### Decision
+
+The recorded boundary is **Option B, the KV store trait**, with the allocator handle hidden inside the
+paged store implementation:
+
+1. The engine defines a minimal store contract (sequence lifetime, append/write, read/stage, capacity
+   error) and keeps a host dense implementation as the default. The engine's arithmetic stays
+   layout-agnostic; the host path keeps its current bit-exact tests.
+2. The paged implementation wraps `PagedKvCache` and `PagedKvView` behind that contract and owns
+   page hashes, sharing, eviction and preemption. The engine never sees a block table.
+3. The scheduler owns the shared pool/quotas and the admission decision, gaining a capacity and
+   lifetime view; first-token promises become conditional on a page reservation. This is the task-22
+   admission shape applied to KV, not a second chunk planner.
+4. The HTTP driver owns request-to-sequence handles and the prefix key derived from prompt tokens, and
+   fills `cached_tokens` / `global_kv_cached_tokens` from measured complete-block reuse while leaving
+   the UMA/NVMe tier fields and the CED/SWA replay fields at their documented zero/not-measured state.
+   A global paged hit must not be copied into `uma_hit_tokens` or `nvme_restored_tokens`.
+
+Rejected: **Option A** (attention backend trait) because it cannot produce the cache claims this task
+exists for - the engine never sees the paged store; **Option C** (engine owns the allocator handle)
+because it puts page admission into the engine before the scheduler has a capacity model, couples the
+engine to paging policy, and is the largest blast radius; and the **default-off diagnostic mirror**
+because it leaves the serving KV dense, hides the observer's cost behind a flag, and makes the
+bookkeeping claim while avoiding the user-visible cost. A diagnostic mirror in the request path would
+spend CPU per token to satisfy a lint, not to serve.
+
+### What it would let us claim, after implementation and a window
+
+Measured `cached_tokens` and the global prompt-cache breakdown as complete-block reuse rather than
+zero; `kv_cache` stats and hit rate as store accounting (pages, shared blocks, evictions,
+preemptions, recomputes); prefix sharing under load, with the host radix key's collision assumption
+kept as part of the claim; and device attention over paged rows at the existing 19-word entry, within
+the published 2e-2 attention bar plus D40/D41 logits bars - not token equality.
+
+### The load-bearing boundary (quoted verbatim, and the reason this is a record and not an approval)
+
+> Option B does not fix the f32-engine vs fp4-device numeric gap, the O(context) staging cost, HSI
+> full-pool selection, the serial HTTP engine, or the host-resident paged pool. Those are the
+> boundary between "the serving KV is paged" and "serving parity."
+
+In particular: no bit identity or token parity across representations; staging per source layer per
+step is still required by the frozen ABI; HSI full-pool population and the top-512 candidate merge are
+untouched; the pool is host-resident and `PagedKvView` stages bytes, which a device-resident store
+would not; the HTTP driver still serialises jobs; and prefix sharing alone does not make a prefix
+cache correct under collisions, cancellation, partial prefill or eviction.
+
+### Numeric bars, per path (no path may claim bit identity to the engine once it uses the device fp4 kernel)
+
+- Host dense store: **exact** - 0 differing f32 bits at every position. This is the refactor's
+  regression gate, not a serving result.
+- Paged store with host attention: stored bytes must match the same quantiser's bytes exactly
+  (entry-level comparison against a dense byte sidecar), and attention over those bytes must match a
+  host recomputation from the same dequantised values bit for bit. This is the task-44
+  storage-is-not-arithmetic property; against the current f32 engine it is the D40/D41 numeric bar.
+- Device paged attention: the 2e-2 attention-body bar plus the D40/D41 logits bar; attention-output
+  agreement does not imply token agreement and must not be reported as parity.
+- Paged path exactness: sharing vs no sharing, and preemption/recompute vs no eviction, must give
+  identical tokens and logits bits **within** the paged path (recompute from the identical retained
+  tokens).
+- Cache statistics are accounting bars, not tolerances: refcounts, free queue, block hashes, cached
+  token counts and hit rate must equal the model the test constructs, with invariants after every
+  step. A cache number must not be given a KL-style tolerance.
+
+### ABI
+
+Keep the released `flash_mla_csa2_seq_sm121` entry at its frozen 19-word argument list for the first
+implementation, staging through `PagedKvView`. Appending a 20th positions argument (Path A) changes
+`FlashMlaParams` 19 -> 20, the m4_abi signature/declaration pin, every launch site and harness
+mapping, and the kernel baseline; that is a decision-record-level pin change with its own reviewed
+entry and must not be combined with this seam.
+
+### Prerequisite before any throughput argument
+
+The window lines in `docs/build/engine-kv-seam-decision.md` section 6 must exist at one device,
+driver/cubin set and prompt suite: paged request/pool accounting with invariants after every step;
+per-source-layer staging bytes/copies/time separated from kernel time; TTFT/prefill/decode and batch
+timing at widths 1, 4 and 16 with warmup and repeats; cached tokens and hit rate beside the timing;
+D40/D41 numeric lines; and a same-window vLLM baseline with the served root recorded. Without
+staging-versus-kernel separation and a same-window baseline, a result argues for Path A or a
+paged-read kernel, not for the seam.

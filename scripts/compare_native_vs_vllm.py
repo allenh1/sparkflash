@@ -21,6 +21,12 @@ script never invents a bar and never turns a token match into a pass. Without
 Position convention (see oracle_native.py): oracle positions are stored keyed
 by device position p, so both sides join on the same integer. The dump's own
 "position" is the device position from the hybrid_sequence token table.
+
+The dump is checked for self-consistency before any metric: when a row carries
+logits_bin it must name the dump's own FILE + ".bin" sidecar, the sidecar must be
+exactly as long as the recorded blocks and the offsets must tile. prefix_match is
+tri-state, and a row that cannot prove it is like-for-like (no usable
+reference_id) is counted as a mismatch rather than silently matched.
 """
 
 from __future__ import annotations
@@ -123,6 +129,46 @@ def read_logits(bin_path: str, offset: int, vocab: int) -> list[float]:
             f"{bin_path}: short read at offset {offset}: need {4 * vocab} bytes, got {len(raw)}"
         )
     return list(struct.unpack("<%df" % vocab, raw))
+
+
+def check_dump_sidecar(rows: list[dict], dump_path: str, bin_path: str) -> None:
+    """Refuse a dump whose rows and sidecar do not belong to each other.
+
+    The portable derivation stays FILE + ".bin", so a copied dump is read next to itself.
+    When the dump carries logits_bin (the writer always does) it must name that same
+    sidecar, the file actually read must have that name, its length must be exactly the sum
+    of the recorded blocks, and the offsets must tile in dump order - the frozen schema in
+    docs/build/logits-dump.md. A dump moved next to another run's sidecar is refused instead
+    of being compared silently.
+    """
+    expected_name = os.path.basename(dump_path) + ".bin"
+    if os.path.basename(bin_path) != expected_name:
+        raise CompareError(
+            f"sidecar {bin_path!r} is not this dump's sidecar (expected basename {expected_name!r})"
+        )
+    total = 0
+    for row in rows:
+        recorded = row.get("logits_bin")
+        if recorded is not None:
+            if not isinstance(recorded, str) or not recorded:
+                raise CompareError(f"position {row['position']}: logits_bin {recorded!r} is not a path")
+            if os.path.basename(recorded) != expected_name:
+                raise CompareError(
+                    f"position {row['position']}: logits_bin {recorded!r} does not name this dump's "
+                    f"sidecar {expected_name!r}"
+                )
+        if int(row["logits_offset"]) != total:
+            raise CompareError(
+                f"position {row['position']}: logits_offset {row['logits_offset']} does not tile "
+                f"(expected {total})"
+            )
+        total += int(row["vocab"]) * 4
+    try:
+        size = os.path.getsize(bin_path)
+    except OSError as error:
+        raise CompareError(f"cannot stat {bin_path}: {error}") from error
+    if size != total:
+        raise CompareError(f"{bin_path}: {size} bytes for {total} bytes of recorded blocks")
 
 
 def log_softmax(logits: list[float]) -> list[float]:
@@ -236,6 +282,21 @@ def _percentile(values: list[float], fraction: float) -> float:
     return ordered[index]
 
 
+def _prefix_match(row: dict, oracle_position: dict) -> bool | None:
+    """Whether the dump proves this row is like-for-like with the oracle.
+
+    True when the dumped reference token equals the oracle's teacher-forced target token,
+    False when both are readable and disagree, and None when the row cannot prove it (no or
+    unreadable reference_id, or no or unreadable oracle target_token). The aggregate counts
+    None as a mismatch: a dump that cannot prove its prefix must never be scored as if it had.
+    """
+    reference = row.get("reference_id")
+    target = oracle_position.get("target_token")
+    if type(reference) is not int or type(target) is not int:
+        return None
+    return reference == target
+
+
 def position_metrics(row: dict, logits: list[float], oracle_position: dict) -> dict:
     """One position: device logits (full vocab) against one oracle distribution."""
     vocab = int(row["vocab"])
@@ -261,13 +322,14 @@ def position_metrics(row: dict, logits: list[float], oracle_position: dict) -> d
     oracle_mass = sum(math.exp(oracle_lp[token]) for token in oracle_ids)
     target = oracle_position.get("target_token")
     reference = row.get("reference_id")
+    prefix_match = _prefix_match(row, oracle_position)
     return {
         "position": int(row["position"]),
         "oracle_argmax": oracle_argmax,
         "device_argmax": device_argmax,
         "target_token": target,
         "reference_id": reference,
-        "prefix_match": (reference is None or target is None or int(reference) == int(target)),
+        "prefix_match": prefix_match,
         "top1_agreement": oracle_argmax == device_argmax,
         "top5_overlap": topk_overlap(oracle_ids, device_ids, 5),
         "top20_overlap": topk_overlap(oracle_ids, device_ids, 20),
@@ -294,7 +356,8 @@ def aggregate_metrics(positions: list[dict]) -> dict:
         "position_first": positions[0]["position"],
         "position_last": positions[-1]["position"],
         "top1_agreement_rate": sum(1 for row in positions if row["top1_agreement"]) / len(positions),
-        "prefix_mismatches": sum(1 for row in positions if not row["prefix_match"]),
+        "prefix_mismatches": sum(1 for row in positions if row["prefix_match"] is not True),
+        "prefix_unknown": sum(1 for row in positions if row["prefix_match"] is None),
         "max_abs_delta_max": max(row["max_abs_delta"] for row in positions),
         "max_abs_delta_mean": sum(row["max_abs_delta"] for row in positions) / len(positions),
         "max_abs_delta_median": _percentile([row["max_abs_delta"] for row in positions], 0.5),
@@ -368,6 +431,7 @@ def render_markdown(result: dict) -> str:
         "js_mean",
         "oracle_topk_mass_mean",
         "prefix_mismatches",
+        "prefix_unknown",
     ):
         value = result["aggregate"][key]
         lines.append(f"| {key} | {value:.6g} |" if isinstance(value, float) else f"| {key} | {value} |")
@@ -393,7 +457,11 @@ def render_markdown(result: dict) -> str:
                 a=row["mean_abs_delta"],
                 kl=row["kl_oracle_to_device"],
                 js=row["js_divergence"],
-                pm="ok" if row["prefix_match"] else "MISMATCH",
+                pm=(
+                    "ok" if row["prefix_match"] is True
+                    else "UNKNOWN" if row["prefix_match"] is None
+                    else "MISMATCH"
+                ),
             )
         )
     lines += [
@@ -403,9 +471,11 @@ def render_markdown(result: dict) -> str:
         "* KL is the truncation-renormalised KL over the oracle's id set; 'oracle_topk_mass_mean' reports",
         "  how much probability the oracle top-k list retains, so a KL over a heavily truncated list is",
         "  read in context. The direction is oracle || device; JS is symmetric and bounded.",
-        "* 'prefix_match' false means the device row's reference token and the oracle continuation token",
-        "  disagree, so the two distributions are conditioned on different prefixes and the row must not",
-        "  be read as a like-for-like comparison.",
+        "* 'prefix_match' is tri-state: 'ok' when the dumped reference token equals the oracle's",
+        "  teacher-forced target token, 'MISMATCH' when both are readable and disagree, and 'UNKNOWN'",
+        "  when the dump carries no usable reference_id (an older dump) or the oracle has no target",
+        "  token. UNKNOWN counts in 'prefix_mismatches': the row is not proven like-for-like, so it is",
+        "  never silently scored as a match.",
         "",
     ]
     return "\n".join(lines)
@@ -437,6 +507,7 @@ def main(argv: list[str] | None = None) -> int:
         prompt = select_oracle_prompt(oracle, args.oracle_prompt)
         oracle_positions = {int(row["position"]): row for row in prompt["positions"]}
         rows = read_dump(args.dump)
+        check_dump_sidecar(rows, args.dump, bin_path)
         wanted = None
         if args.positions:
             wanted = {int(value) for value in args.positions.split(",") if value.strip()}

@@ -20,6 +20,20 @@ many sequences over one device pool. Two new modules split that seam and neither
 | `crates/sparkflash-kv/tests/paged.rs` | 16 paging/eviction rule tests |
 | `crates/sparkflash-device/tests/paged_kv.rs` | 11 addressing, absolute staging and twin tests |
 
+### 1.1 The module name is not a serving claim
+
+**"The paged store mirrors the request token sequence" is NOT the same claim as "the serving KV
+is paged."** The first is a diagnostic: the store can reproduce the token sequence it was given,
+check its own invariants and stage operands for a comparison. The
+second says the engine's KV/attention path actually reads and writes the paged pool as its backing
+store, with the serving cache fields and lifetime following from that. Until the engine KV/attention
+seam exists, the paged modules are storage tests and a staged device seam, not the KV backing of a
+served request. Do not read paged_serve or paged_kv as evidence that serving uses paged KV.
+
+The decision proposal for that seam, including the three possible boundaries and the numeric and ABI
+cost of each, is docs/build/engine-kv-seam-decision.md (task-47). This document's device window
+remains unclaimed either way.
+
 The unit is the store's own page: [crate::config::KV_PAGE_TOKENS] = 64 logical token positions. A
 Full layer at compression ratio r stores 64 / r entries per page, and a block-table page id is the
 page index the store's arrays already take. Logical block b covers tokens [64b, 64b + 64); a partial
@@ -157,5 +171,8 @@ report, not this doc.
 * **HSI candidate selection** (full pool population and the top-512 merge): phase2 open item 2.
 * **Path A** (positions-array kernel / paged-read kernel): named follow-on in Section 5; its ABI cost
   is stated there and no kernel, ABI or pin was touched.
+* A paged store that mirrors a request's token sequence is not a claim that the serving KV is
+  paged. The distinction is Section 1.1; the consumer that would make it a serving claim is the
+  engine KV seam, not this module.
 * Any numeric comparison against the device chain reference run: this milestone's evidence is the
   host test suite and the CPU twin only.
