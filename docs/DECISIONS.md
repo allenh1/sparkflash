@@ -40,6 +40,7 @@ records the evidence and the consequence for the build. Research backing is in
 | D29 | The ibverbs backend is real and dual-rail capable | The `rdma` feature's libibverbs backend, its repr(C) ABI mirror and the three cluster gate bodies are real, and the deployed vLLM reference is measured single rail (NCCL_IB_HCA=rocep1s0f1); no hardware gate has run and no frame has crossed a wire, host-memory staging, active MTU 1024 and driver 580.173.02 remain gaps, and single-rail mode refuses to claim dual-rail evidence |
 | D30 | Routed-expert sharding follows the verified kernel | TP=4 over the intermediate width (576 per rank padded to 640) for the routed experts, because that is the only routed-expert layout the device has run; the reference's whole-expert rule is recorded as not implemented, the shared expert stays whole and replicated, and the padding costs +8.22 GB/rank of routed-expert storage (74.0 -> 82.2 GB/rank) |
 | D31 | The certified LM head counts every thread's prunes, and the pin is re-baselined | `cert_lm_head_sm121`'s published `certified_count` was lane 0's per-thread count only, so the concentrated pruning case reported 34 against 4,899 flags in windows b21/b23; the atomic now adds every thread's prunes, the count is deterministic, and the cubin is re-pinned at 14,888 B / `7394b129...` with the ABI unchanged (same entry, geometry and `certified_count` semantic) |
+| D32 | The routing-weight multiply is a named host seam in the routed device chain (F6) | The released arithmetic multiplies the SwiGLU output by the routing weight BEFORE the w2 activation quantiser reads it, and no pinned routed kernel takes a weight operand. m17a therefore measures the device SwiGLU+quantise stage unweighted, and builds the combine operand on the host from the same device gate/up bf16 values with `mxfp4_ref::routed_activation_operand`; the combine is weighted but its activation operand is host-quantised by the reference's own rule. A weighted quantiser variant is the planned follow-up (new cubin, deliberate re-pin), not part of m17a |
 
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
@@ -1787,3 +1788,41 @@ path (m16 stage, documented in `build/phase3-lm-head.md`). b21/b23 remain the pr
 `a833a336...` evidence. No other pinned kernel has this pattern: a tree-wide grep of
 `kernels/*.cu` finds per-thread counters with an atomic only here; the other `atomicAdd` uses are
 barrier/reduction counters (`mega_mhc_sm121.cu:235`), not published counts.
+
+## D32 - The routing-weight multiply is a named host seam in the routed device chain (F6)
+
+**Question.** The released MoE block applies the routing weight to the SwiGLU output before the w2
+activation quantiser reads it (model.py:841-851: the activation is cast to the activation dtype, then
+the quantiser reads the tensor; the weight is inside the quantiser's input). None of the four released
+routed kernels takes a routing-weight operand: `moe_router_sm121` returns the weights,
+`routed_gate_up_sm121` takes activations/weights/expert ids only, `swiglu_mxfp8_quant_sm121` takes
+gate/up/limit only, and `b12x_mxfp4_moe_sm121` takes a pre-quantised activation operand and
+expert ids only. The engine's host path therefore multiplies the weight between SwiGLU and the w2
+quantiser, and that is the seam m17a exercises.
+
+**Decision.** Record F6 as an explicit seam instead of hiding or approximating it. The harness runs
+the device SwiGLU+quantise stage **unweighted** and measures it bit-exact against the reference; the
+combine's activation operand is built on the host from the **same device gate/up bf16 values**:
+host SwiGLU over those bytes, then `mxfp4_ref::routed_activation_operand(activation, routing_weight)`,
+which is the reference rule including its bf16 cast. The values that cross the seam are printed by
+the harness: the device gate/up bf16 `[tokens*6][640]` per rank and projection, the f32 routing
+weight per selected expert per token, and the quantised operand `[tokens*6][640]` E4M3 plus
+`[tokens*6][20]` ue8m0 per rank. The combine is weighted, but its activation operand is
+host-quantised by the reference's own rule. The alternative - weight-multiplying the already-quantised
+stage-3 codes - would quantise twice and is not the model's order, so it is not done.
+
+**Evidence and scope.** `docs/build/phase3-moe-routed.md` states the class and the seam before any
+number; `crates/sparkflash-kernels/examples/m17_moe_a.rs` prints the crossed shapes and keeps
+"fully-device weighted routed block" out of its claims. The shared expert and shared-add epilogue
+are m17b and are not covered. No kernel is changed by this entry and no cubin moves; the four cubins
+are the pins already in `baseline/kernel_baseline.txt` (router 37,384 B / `5992cef9...`, gate/up
+9,752 B / `115200d2...`, SwiGLU quantiser 21,776 B / `4dbef63b...`, combine 10,048 B /
+`36a15a4f...`). No device run is claimed by this entry; the m17a window record is appended to the
+doc when the Lead-run window returns.
+
+**Consequence.** A later chain may accept the host seam if it stays honest, or adopt a weighted
+SwiGLU+quantise variant. That variant is the planned follow-up: the same kernel source with an
+optional per-expert weight operand, a new cubin and a deliberate re-pin with its own entry - exactly
+the re-pin pattern used for the certified LM head (m16's D31, which lands first as batch 14; this entry takes D32 and assumes that landing) - and it is the only way to remove this
+seam from the device path. This entry deliberately does not claim a fully-device weighted routed
+block, per-token or per-layer text, or a host-time saving.
