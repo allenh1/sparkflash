@@ -2184,10 +2184,24 @@ defect (RSS flat at ~18.87 GB over 131 positions) and produced the measured verd
   (post-attention 3.12e-2, host FFN Y 1.99e-2) and the drift accumulates across the 40 layers; b57's
   `residual first divergence: position=0 layer=0` was a stage-offset artifact and is superseded.
 
+**Measured end to end (b68, 2026-10-19).** The on-demand embed-row fallback closed the decode seam,
+so the first complete criterion-shaped 130+8 run finished **all 138 positions** with flat memory
+(RSS 18,928,152 KiB; 9.1-9.6 s per position; `chain_ms=1238987`). Its criterion result:
+`logits 129: position 129: 128528 of 129280 compared logits outside the 0.02 bar (max |difference|
+15.009581 at 5986, argmax 8060)`, and the nine device tokens are **8060, 8060, 1168, 50673, 303,
+531, 6525, 5719, 14171** against the fixture's **491, 367, 201, 80, 3302, 201, 54, 201, 4341** -
+**0 of 9**. The same window's router-all refinement found the discrete mechanism: the first real
+expert-set flip is **layer 3** (`scores_max_abs=1.472694e-2`), 36 of 40 layers differ at position 0,
+and the BF16 control proves it is **the attention-path drift in the router input**, not BF16 staging
+and not the router kernel (`bf16_control_same_set=true`, `bf16_control_matches_device_set=false` on
+every flip line; the kernel matches its own BF16 host to 5.96e-8).
+
 **Consequence.** `REQUIRED_KERNELS` stays 9, the kernel work already merged (D34-D36) is unaffected,
-and the remaining work is ordered: (1) close the decode embedding seam and measure positions 130..137;
-(2) the user's precision-versus-criterion decision above. The hybrid branch stays unmerged and
-criterion 1 stays OPEN.
+and the remaining work is ordered: (1) the user's precision-versus-criterion decision above - the
+measured evidence now names the attention-projection/router activation quantisation as the source;
+(2) if the precision-first path is chosen, that is new API-compatible kernel variants plus re-pins,
+followed by the criterion run again; (3) serving-side work (performance, HTTP surface, 4-node path)
+is a separate program. The hybrid branch stays unmerged and criterion 1 stays OPEN.
 
 ## D38 — vLLM token parity is only meaningful on the same weights; the deployed vLLM serves a different checkpoint
 

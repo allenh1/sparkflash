@@ -367,13 +367,15 @@ Criterion 1 is "prefill of a prompt over 128 tokens and at least 8 decode steps,
 reproduced against the reference" (`roadmap-to-serving.md` section 5.5 item 1). The chain claims it
 only when **all** hold in one run.
 
-**Status (2026-10-19): NOT claimed, still OPEN, and now measured FAILING.** The hybrid-sequence path
-is stage-faithful but numerically FP8-native against a f32 reference: the first complete
-criterion-shaped prefill (b67) reaches position 129 and predicts **8060** where the exactly-reproduced
-fixture requires **491**, and its first decode step then stops on a missing embed-row seam for the
-generated token (the decode steps cannot run until that seam is closed). Memory is fixed (b66/b67:
-RSS flat at ~18.87 GB) and the b55-b62/b66/b67 records are in section 7; the precision-versus-criterion
-decision is [DECISIONS.md](../DECISIONS.md) D37.
+**Status (2026-10-19): NOT claimed, still OPEN, and measured FAILING end to end.** The first complete
+criterion-shaped 130+8 run (b68) finished all 138 positions with flat memory, and at position 129
+`128528 of 129280 compared logits` are outside the 0.02 bar (`max |difference| 15.009581`, argmax
+8060) with **0 of 9** decoded tokens matching the exactly-reproduced fixture
+(`491, 367, 201, 80, 3302, 201, 54, 201, 4341`). Memory is fixed (RSS flat at ~18.9 GB over 138
+positions) and the decode path works. The remaining blocker is arithmetic: MXFP8 activations against
+a f32 reference, with the attention-path drift flipping the router's expert set from layer 3 on. The
+records are the b55-b68 subsections in section 7; the precision-versus-criterion decision is
+[DECISIONS.md](../DECISIONS.md) D37.
 
 The PASS definition is:
 
@@ -1605,6 +1607,38 @@ Consequently the b55-b62 evidence is **not** "unmeasured": the prefill path is n
 end, it is stage-faithful, and it diverges from an exactly-reproduced fixture. Remaining work is
 ordered: (1) close the decode embedding seam so the 129..137 table exists; (2) the user's precision
 versus criterion decision (D37); (3) the router refinement (first set-flip layer, BF16 control).
+
+**b68 (e9e743e) - router-all refinement and the first complete 130+8 criterion run.** This binary adds
+the on-demand embed-row fallback (`embed_row_from_source`) that b67 was missing, so the decode steps
+can run. Its 3-position refinement first:
+- `router twin: first_set_flip_layer=3`: layers 3, 7, 8, 9, 10, 11, 12, 13, 14, ... 39 (**36 of 40**
+  at position 0) select a different expert set. `scores_max_abs` grows from 1.472694e-2 at layer 3 to
+  1.311069e0 at layer 39, while the same-input host twin is equal at all 40 layers (<=5.96e-8). Layer 0
+  keeps the reference set but already drifts by `scores_max_abs=1.649636e-2` - the seed the layer-3
+  amplification acts on.
+- **The BF16 control is decisive.** On every set-flip line `bf16_control_same_set=true` and
+  `bf16_control_matches_device_set=false`: quantising the f32 reference's router input to BF16 alone
+  never changes its expert set and never reproduces the device set. The trigger is therefore the
+  accumulated attention-path drift in the router input - phrase this as **attention-path drift flips
+  router selection at layer 3**, not as an FP8-router or BF16-staging effect. The router kernel itself
+  matches its own BF16 host to 5.96e-8.
+- The corrected non-Engram `(d2)` line is `3.213581e-2 / 3.433615e-2 / 5.166603e-2` at p0/p1/p2,
+  which confirms the old (d) `1.289867e0` was the Engram contamination and that the deferred epilogue
+  plus layer-1 Engram is not a 1e0-class error.
+- Memory is flat again (position 0 RSS 600,276 -> 15,618,236 KiB, then -34,432 KiB, then 0).
+
+The second run is the first **complete** criterion-shaped 130+8 attempt on the device chain: **all 138
+positions finished** (`sequence position: position=137 done=138/138`, `chain_ms=1238987`,
+`projected_chain_full_s=1239.0`, 9.1-9.6 s per position) with flat memory (RSS 18,928,152 KiB;
+per-position deltas 0 or a few hundred KiB, plus one one-off +577 MB page-cache line at position 136)
+and exit 1 only because parity fails. Criterion-1 evidence from that run:
+`logits 129: position 129: 128528 of 129280 compared logits outside the 0.02 bar (max |difference|
+15.009581 at 5986, argmax 8060)`; the device's nine tokens are **8060, 8060, 1168, 50673, 303, 531,
+6525, 5719, 14171** against the fixture's **491, 367, 201, 80, 3302, 201, 54, 201, 4341** - **0 of 9**.
+(That table is derived from the head A/B top-1 lines and the logits line because this build prints the
+per-position token table only on the shorter run paths; the reporting gap is noted for the next build.)
+Window `window-b68-20261019T133112Z.log`, `runs68/router-all-3.log`, `runs68/seq130x8.log`, binary
+sha256 `ee916e3d65f154d512e93e3a734aaa878cd1d0e4e9dbe408f3f73ab35adaf59a`.
 
 **Reference note.** The deployed vLLM on the cluster serves a different checkpoint from ours
 ([DECISIONS.md](../DECISIONS.md) D38), so its tokens are not a parity target for this fixture.
