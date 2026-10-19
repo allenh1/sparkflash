@@ -6,12 +6,12 @@
 //! and every device-status stage goes to an injected DeviceLauncher. There is no fallback between
 //! the two: a device stage can never quietly run host arithmetic.
 //!
-//! What this module is not. It does not stage weights, allocate device buffers, launch a kernel on
-//! the dev host, compare a token or logit, or make a device claim. The fake launcher is the default
-//! test/dry-run launcher; the real one is behind the cuda feature and still refuses a launch until
-//! M3-b stages weights and buffers. The wiring is nevertheless the single source of truth: the
-//! dry-run drives the full 130 + 8 plan through this code and validates the same ledger a device run
-//! would validate.
+//! What this module is not. It does not run a chain, compare a token or logit, or make a device
+//! claim. M3-b adds the layer-0 staging path in [crate::staging]; only that path allocates
+//! buffers. The fake
+//! launcher is the default test/dry-run launcher. The wiring is nevertheless the single source of
+//! truth: the dry-run drives the full 130 + 8 plan through this code and validates the same ledger a
+//! device run would validate.
 //!
 //! Call accounting. The full plan makes 108,017 ChainOps::stage calls: 58,670 host-seam records and
 //! 49,347 device-launcher calls. Tests and device-chain --dry-run pin those totals.
@@ -20,7 +20,8 @@
 //! with crate::cubins::verify_bytes before it can load anything (no verify-then-re-read window),
 //! then resolves the typed builder for the stage. The first wired builder is
 //! sparkflash_kernels::mega_mhc_launch; its params are built only when a buffer set is supplied,
-//! which M3-b owns. A missing or mis-pinned cubin is an error, never a host fallback.
+//! which M3-b's stage_layer_zero provides. A missing or mis-pinned cubin is an error, never a host
+//! fallback.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -260,6 +261,11 @@ impl<L: DeviceLauncher, H: HostSeamDelegate> ChainDevice<L, H> {
         &self.launcher
     }
 
+    /// The launcher, for the M3-b stage path that writes one position before each launch.
+    pub fn launcher_mut(&mut self) -> &mut L {
+        &mut self.launcher
+    }
+
     fn count(&mut self, stage: ChainStage) {
         let name = stage.name();
         if let Some((_, count)) = self
@@ -363,9 +369,9 @@ pub fn host_seat_counts(report: &ChainRunReport) -> BTreeMap<&'static str, usize
     counts
 }
 
-// The real launcher is compiled only with the feature. It still has no CLI path in this MR: M3-b
-// stages the buffers, and only then can a launch be attempted. Keeping it behind the feature means
-// the default binary has no device path at all.
+// The real launcher is compiled only with the feature. M3-b stages the layer-0 buffers and exposes
+// one cuda-only CLI stage arm; keeping it behind the feature means the default binary has no device
+// path at all.
 #[cfg(feature = "cuda")]
 mod cuda_launcher {
     use std::collections::BTreeMap;
@@ -378,44 +384,123 @@ mod cuda_launcher {
     use crate::cubins::{cubin_path, required_pins, verify_bytes};
     use sparkflash_kernels::baseline::KernelPin;
 
+    use sparkflash_kernels::m4_quant::bf16_bits;
+    use sparkflash_kernels::mega_mhc_ref::{HC_MULT, HIDDEN};
+
+    use crate::budget::{BudgetAdmission, BudgetError, BudgetRequest};
+    use crate::staging::{EmbedRow, LayerZeroStaging, MhcBufferPlan};
+
+    fn f32_to_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    fn f32_to_bf16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| bf16_bits(*value).to_le_bytes())
+            .collect()
+    }
+
+    /// The per-launch zeroes the mHC grid rendezvous needs.
+    ///
+    /// The kernel's tiles meet through atomicAdd(hc_sync[0]) and wait on hc_sync[1]; the statistics
+    /// scratch is also per-launch. Stale counters from a previous launch never publish the next
+    /// coefficients, so both buffers are re-zeroed before every launch, exactly as m11's run_once
+    /// does.
+    fn mhc_rendezvous_zeroes(buffers: &MhcBuffers) -> [(Deviceptr, Vec<u8>); 2] {
+        let plan = MhcBufferPlan::LAYER_ZERO;
+        [
+            (buffers.hc_stats, vec![0u8; plan.hc_stats]),
+            (buffers.hc_sync, vec![0u8; plan.hc_sync]),
+        ]
+    }
+
+    fn reset_mhc_rendezvous_with(
+        buffers: &MhcBuffers,
+        mut copy: impl FnMut(&Deviceptr, &[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for (destination, zeroes) in mhc_rendezvous_zeroes(buffers) {
+            copy(&destination, &zeroes)?;
+        }
+        Ok(())
+    }
+
+    /// The single entry launch sequence: reset the grid rendezvous, then launch the kernel.
+    ///
+    /// This is the function [DeviceLauncher::launch] calls, so the reset and its byte sizes are
+    /// tested through the same seam the real launch uses.
+    fn launch_mhc_entry_with(
+        buffers: &MhcBuffers,
+        mut copy: impl FnMut(&Deviceptr, &[u8]) -> Result<(), String>,
+        mut launch: impl FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        reset_mhc_rendezvous_with(buffers, |destination, zeroes| copy(destination, zeroes))?;
+        launch()
+    }
+
+    /// A typed failure from staging the layer-0 mHC buffers or from its admission.
+    #[derive(Debug, thiserror::Error)]
+    pub enum MhcStageError {
+        /// The budget admission refused before any device allocation.
+        #[error(transparent)]
+        Budget(#[from] BudgetError),
+        /// The driver or a staging copy failed.
+        #[error("device staging failed: {detail}")]
+        Launcher {
+            /// The driver or copy detail.
+            detail: String,
+        },
+    }
+
     /// The sixteen device pointers one mHC launch needs, in the kernel declaration order.
     ///
-    /// M3-b constructs this from its staged buffers; this MR only defines and passes it through.
-    /// A null/placeholder Deviceptr must never reach a launch, so construction is explicit.
+    /// Only [CudaLauncher::stage_layer_zero]'s own allocation set constructs this type: the fields
+    /// are private and there is no public setter, so a caller cannot inject a null, partial or
+    /// wrong-order pointer set into a launch.
     #[derive(Debug, Clone, Copy)]
     pub struct MhcBuffers {
-        /// The x buffer.
-        pub x: Deviceptr,
-        /// The y_prev buffer.
-        pub y_prev: Deviceptr,
-        /// The b_prev buffer.
-        pub b_prev: Deviceptr,
-        /// The c_prev buffer.
-        pub c_prev: Deviceptr,
-        /// The a_prev buffer.
-        pub a_prev: Deviceptr,
-        /// The predictor buffer.
-        pub predictor: Deviceptr,
-        /// The hc_scale buffer.
-        pub hc_scale: Deviceptr,
-        /// The hc_base buffer.
-        pub hc_base: Deviceptr,
-        /// The rms_weight buffer.
-        pub rms_weight: Deviceptr,
-        /// The xhat_fp8 buffer.
-        pub xhat_fp8: Deviceptr,
-        /// The xhat_scales buffer.
-        pub xhat_scales: Deviceptr,
-        /// The hc_stats buffer.
-        pub hc_stats: Deviceptr,
-        /// The hc_sync buffer.
-        pub hc_sync: Deviceptr,
-        /// The hc_coeffs buffer.
-        pub hc_coeffs: Deviceptr,
-        /// The hc_rms_out buffer.
-        pub hc_rms_out: Deviceptr,
-        /// The xhat_normed buffer.
-        pub xhat_normed: Deviceptr,
+        x: Deviceptr,
+        y_prev: Deviceptr,
+        b_prev: Deviceptr,
+        c_prev: Deviceptr,
+        a_prev: Deviceptr,
+        predictor: Deviceptr,
+        hc_scale: Deviceptr,
+        hc_base: Deviceptr,
+        rms_weight: Deviceptr,
+        xhat_fp8: Deviceptr,
+        xhat_scales: Deviceptr,
+        hc_stats: Deviceptr,
+        hc_sync: Deviceptr,
+        hc_coeffs: Deviceptr,
+        hc_rms_out: Deviceptr,
+        xhat_normed: Deviceptr,
+    }
+
+    impl MhcBuffers {
+        fn from_allocations(allocated: &[Deviceptr]) -> Self {
+            Self {
+                x: allocated[0],
+                y_prev: allocated[1],
+                b_prev: allocated[2],
+                c_prev: allocated[3],
+                a_prev: allocated[4],
+                predictor: allocated[5],
+                hc_scale: allocated[6],
+                hc_base: allocated[7],
+                rms_weight: allocated[8],
+                xhat_fp8: allocated[9],
+                xhat_scales: allocated[10],
+                hc_stats: allocated[11],
+                hc_sync: allocated[12],
+                hc_coeffs: allocated[13],
+                hc_rms_out: allocated[14],
+                xhat_normed: allocated[15],
+            }
+        }
     }
 
     /// The real launcher: verifies the required cubins, then dispatches the first typed builder
@@ -424,12 +509,13 @@ mod cuda_launcher {
     /// Construction reads each pinned cubin exactly once and verifies that same slice with
     /// [crate::cubins::verify_bytes], so the loaded bytes are the verified bytes (there is no
     /// verify-then-re-read window). A missing or mis-pinned cubin is refused before any driver is
-    /// opened. It opens no driver until a launch is actually attempted, and no caller in this MR
-    /// supplies MhcBuffers: that is M3-b.
+    /// opened. It opens no driver until a launch is actually attempted; M3-b's
+    /// [CudaLauncher::stage_layer_zero] is the path that allocates.
     pub struct CudaLauncher {
         cuda: Option<Cuda>,
         cubins: BTreeMap<String, Vec<u8>>,
         mhc_buffers: Option<MhcBuffers>,
+        mhc_allocations: Vec<Deviceptr>,
     }
 
     /// Reads each pinned cubin once, verifies that exact slice, and returns it as the loaded catalog.
@@ -452,19 +538,188 @@ mod cuda_launcher {
     }
 
     impl CudaLauncher {
-        /// Verifies the cubin directory and loads its bytes into the catalog.
+        /// Verifies a cubin directory against every required pin and loads its bytes.
         ///
         /// # Errors
         /// A required-pin catalog error, a cubin read error, or a size/digest mismatch.
         pub fn open(dir: impl AsRef<Path>) -> Result<Self, String> {
-            let dir = dir.as_ref();
             let pins = required_pins()?;
-            let cubins = load_verified_cubins(dir, &pins)?;
+            Self::from_pins(dir.as_ref(), &pins)
+        }
+
+        /// Verifies and loads only one stage's pinned cubin.
+        ///
+        /// This is the M3-b layer-0 path: the mHC entry does not need the attention, MoE or head
+        /// cubins to be present, and a missing or mis-pinned mHC cubin is still refused before any
+        /// driver or allocation.
+        ///
+        /// # Errors
+        /// The kernel is not in the baseline catalog, or its read/size/digest check fails.
+        pub fn open_for_stage(dir: impl AsRef<Path>, kernel: &str) -> Result<Self, String> {
+            let pin = sparkflash_kernels::baseline::pin(kernel)?.ok_or_else(|| {
+                format!("kernel {kernel} is required by the stage but the baseline does not pin it")
+            })?;
+            Self::from_pins(dir.as_ref(), &[pin])
+        }
+
+        fn from_pins(dir: &Path, pins: &[KernelPin]) -> Result<Self, String> {
+            let cubins = load_verified_cubins(dir, pins)?;
             Ok(Self {
                 cuda: None,
                 cubins,
                 mhc_buffers: None,
+                mhc_allocations: Vec::new(),
             })
+        }
+
+        /// A launcher with no cubins or driver, used only to prove the admission refusal path.
+        #[cfg(test)]
+        fn for_test() -> Self {
+            Self {
+                cuda: None,
+                cubins: BTreeMap::new(),
+                mhc_buffers: None,
+                mhc_allocations: Vec::new(),
+            }
+        }
+
+        /// Admits the budget first, then validates the staging and its projection and allocates the
+        /// layer-0 mHC buffers.
+        ///
+        /// The admission is the first statement: a refused budget returns before every validation
+        /// that can cost device work, before Cuda::load, before the first alloc and before any copy.
+        /// The projected device bytes must equal [MhcBufferPlan::LAYER_ZERO]'s exact byte total, and
+        /// the projected host bytes must cover the retained staging plus the verified cubins; a caller
+        /// cannot understate the stage and still allocate. A driver or copy failure frees every
+        /// allocation made by this call and leaves mhc_buffers unset.
+        ///
+        /// # Errors
+        /// [MhcStageError::Budget] on refusal, [MhcStageError::Launcher] on a projection, driver or
+        /// copy failure.
+        pub fn stage_layer_zero(
+            &mut self,
+            staging: &LayerZeroStaging,
+            request: BudgetRequest,
+        ) -> Result<BudgetAdmission, MhcStageError> {
+            let admission = BudgetAdmission::admit(request)?;
+            let plan = MhcBufferPlan::LAYER_ZERO;
+            let expected_device = plan.device_bytes() as u64;
+            if request.projected_device_bytes != expected_device {
+                return Err(MhcStageError::Launcher {
+                    detail: format!(
+                        "projected device bytes {} do not match the mHC buffer plan's {} bytes",
+                        request.projected_device_bytes, expected_device
+                    ),
+                });
+            }
+            let expected_host = staging.host_bytes().saturating_add(self.cubin_bytes());
+            if request.projected_host_bytes < expected_host {
+                return Err(MhcStageError::Launcher {
+                    detail: format!(
+                        "projected host bytes {} do not cover the staged {} staging bytes plus the {} verified cubin bytes",
+                        request.projected_host_bytes,
+                        staging.host_bytes(),
+                        self.cubin_bytes()
+                    ),
+                });
+            }
+            if staging.predictor.len() * 4 != plan.predictor
+                || staging.hc_scale.len() * 4 != plan.hc_scale
+                || staging.hc_base_kernel.len() * 4 != plan.hc_base
+                || staging.attn_norm.len() * 4 != plan.rms_weight
+            {
+                return Err(MhcStageError::Launcher {
+                    detail: format!(
+                        "staged tensor sizes do not match the mHC buffer plan: predictor {}B/{}B, scale {}B/{}B, base {}B/{}B, norm {}B/{}B",
+                        staging.predictor.len() * 4,
+                        plan.predictor,
+                        staging.hc_scale.len() * 4,
+                        plan.hc_scale,
+                        staging.hc_base_kernel.len() * 4,
+                        plan.hc_base,
+                        staging.attn_norm.len() * 4,
+                        plan.rms_weight
+                    ),
+                });
+            }
+            if self.mhc_buffers.is_some() {
+                return Err(MhcStageError::Launcher {
+                    detail: "the layer-0 mHC buffers are already staged".to_string(),
+                });
+            }
+            if self.cuda.is_none() {
+                self.cuda =
+                    Some(Cuda::load().map_err(|error| MhcStageError::Launcher { detail: error })?);
+            }
+            let cuda = self.cuda.as_ref().ok_or(MhcStageError::Launcher {
+                detail: "the CUDA driver is unavailable".to_string(),
+            })?;
+            let mut allocated: Vec<Deviceptr> = Vec::with_capacity(plan.sizes().len());
+            let mut total = 0usize;
+            let result = (|| -> Result<(), String> {
+                for (_name, bytes) in plan.sizes() {
+                    let pointer = cuda.alloc(bytes, &mut total)?;
+                    allocated.push(pointer);
+                }
+                let buffers = MhcBuffers::from_allocations(&allocated);
+                let (b, c, a, y) = LayerZeroStaging::layer_zero_seed();
+                let y_bytes = f32_to_bf16_bytes(&y);
+                cuda.copy_htod(&buffers.x, &vec![0u8; plan.x])?;
+                cuda.copy_htod(&buffers.y_prev, &y_bytes)?;
+                cuda.copy_htod(&buffers.b_prev, &f32_to_bytes(&b))?;
+                cuda.copy_htod(&buffers.c_prev, &f32_to_bytes(&c))?;
+                cuda.copy_htod(&buffers.a_prev, &f32_to_bytes(&a))?;
+                cuda.copy_htod(&buffers.predictor, &f32_to_bytes(&staging.predictor))?;
+                cuda.copy_htod(&buffers.hc_scale, &f32_to_bytes(&staging.hc_scale))?;
+                cuda.copy_htod(&buffers.hc_base, &f32_to_bytes(&staging.hc_base_kernel))?;
+                cuda.copy_htod(&buffers.rms_weight, &f32_to_bytes(&staging.attn_norm))?;
+                reset_mhc_rendezvous_with(&buffers, |destination, zeroes| {
+                    cuda.copy_htod(destination, zeroes)
+                })?;
+                Ok(())
+            })();
+            if let Err(detail) = result {
+                let refs: Vec<&Deviceptr> = allocated.iter().collect();
+                cuda.free_buffers(&refs);
+                return Err(MhcStageError::Launcher { detail });
+            }
+            self.mhc_buffers = Some(MhcBuffers::from_allocations(&allocated));
+            self.mhc_allocations = allocated;
+            Ok(admission)
+        }
+
+        /// Copies the staged embedding row's four BF16 copies into the staged X buffer.
+        ///
+        /// The bytes are built here from an admitted [EmbedRow]. Its fields are private and its
+        /// only constructor is crate-private, so an external caller cannot supply arbitrary X
+        /// bytes whose digest the stage report did not record.
+        ///
+        /// # Errors
+        /// No staged buffers, a driver that is unavailable, or a row that is not HIDDEN BF16
+        /// values (the four-copy X build is always HC_MULT * HIDDEN BF16 values).
+        pub fn write_layer_zero_x(&mut self, row: &EmbedRow) -> Result<(), String> {
+            let buffers = self.mhc_buffers.ok_or_else(|| {
+                "the layer-0 mHC buffers are not staged; call stage_layer_zero first".to_string()
+            })?;
+            let x = row.x_bf16();
+            if x.len() != HC_MULT * HIDDEN * 2 {
+                return Err(format!(
+                    "the X row is {} bytes, the staged buffer expects {}",
+                    x.len(),
+                    HC_MULT * HIDDEN * 2
+                ));
+            }
+            let cuda = self.cuda.as_ref().ok_or_else(|| {
+                "the CUDA driver is unavailable while copying the X row".to_string()
+            })?;
+            cuda.copy_htod(&buffers.x, &x)
+                .map_err(|error| format!("copy the X row: {error}"))
+        }
+
+        /// The raw bytes of every verified cubin this launcher loaded.
+        #[must_use]
+        pub fn cubin_bytes(&self) -> u64 {
+            self.cubins.values().map(|bytes| bytes.len() as u64).sum()
         }
 
         /// Whether this launcher verified a cubin with kernel's name.
@@ -473,15 +728,10 @@ mod cuda_launcher {
             self.cubins.contains_key(kernel)
         }
 
-        /// Supplies the mHC buffer set. M3-b owns the staging that creates it.
-        pub fn set_mhc_buffers(&mut self, buffers: MhcBuffers) {
-            self.mhc_buffers = Some(buffers);
-        }
-
         fn mhc_params(&self, buffers: &MhcBuffers, call: DeviceStageCall) -> MegaMhcParams {
             // step_seq is the absolute token position (0..prompt+decode-1) from ChainDevice, not a
             // decoder-step index and not a per-layer counter. The kernel ignores it while
-            // trace_ring=0; when M3-b enables tracing it must be read as this absolute position.
+            // trace_ring=0; if a later arm enables tracing it must be read as this absolute position.
             let step_seq = call.position as u64;
             MegaMhcParams::new(
                 buffers.x,
@@ -507,8 +757,29 @@ mod cuda_launcher {
         }
     }
 
+    impl Drop for CudaLauncher {
+        fn drop(&mut self) {
+            if let Some(cuda) = self.cuda.as_ref() {
+                let refs: Vec<&Deviceptr> = self.mhc_allocations.iter().collect();
+                cuda.free_buffers(&refs);
+            }
+        }
+    }
+
     impl DeviceLauncher for CudaLauncher {
         fn launch(&mut self, call: DeviceStageCall) -> Result<(), DeviceLaunchError> {
+            // Only the layer-0 entry weights are staged. The post-mix needs a coefficient handoff
+            // that does not exist yet, so it must refuse rather than reuse the entry buffers.
+            if call.stage == ChainStage::MhcPost {
+                return Err(DeviceLaunchError::NotStaged {
+                    kernel: call.kernel,
+                });
+            }
+            if call.stage == ChainStage::MhcEntry && call.layer != 0 {
+                return Err(DeviceLaunchError::NotStaged {
+                    kernel: call.kernel,
+                });
+            }
             let bytes =
                 self.cubins
                     .get(call.kernel)
@@ -517,7 +788,7 @@ mod cuda_launcher {
                         kernel: call.kernel,
                     })?;
             match call.stage {
-                ChainStage::MhcEntry | ChainStage::MhcPost => {
+                ChainStage::MhcEntry => {
                     let buffers = self.mhc_buffers.ok_or(DeviceLaunchError::NotStaged {
                         kernel: call.kernel,
                     })?;
@@ -533,11 +804,18 @@ mod cuda_launcher {
                     let (module, kernel) = mega_mhc_launch::load(cuda, &bytes)
                         .map_err(|error| DeviceLaunchError::Launcher { detail: error })?;
                     let params = self.mhc_params(&buffers, call);
-                    let result = mega_mhc_launch::launch(cuda, kernel, &params)
-                        .map_err(|error| DeviceLaunchError::Launcher { detail: error });
+                    let result = launch_mhc_entry_with(
+                        &buffers,
+                        |destination, zeroes| cuda.copy_htod(destination, zeroes),
+                        || mega_mhc_launch::launch(cuda, kernel, &params),
+                    )
+                    .map_err(|error| DeviceLaunchError::Launcher { detail: error });
                     cuda.free(module, &[]);
                     result
                 }
+                ChainStage::MhcPost => Err(DeviceLaunchError::NotStaged {
+                    kernel: call.kernel,
+                }),
                 ChainStage::MoeRouter | ChainStage::MoeGateUp => Err(DeviceLaunchError::NotWired {
                     kernel: call.kernel,
                 }),
@@ -552,8 +830,260 @@ mod cuda_launcher {
     mod tests {
         use super::*;
         use sha2::{Digest, Sha256};
+        use sparkflash_kernels::mega_mhc_ref::PREDICTOR_ROWS;
 
         use crate::cubins::{cubin_path, hex};
+
+        fn empty_staging() -> LayerZeroStaging {
+            LayerZeroStaging {
+                predictor: Vec::new(),
+                hc_base: [0.0; PREDICTOR_ROWS],
+                hc_scale: [0.0; 3],
+                attn_norm: Vec::new(),
+                hc_base_kernel: [0.0; PREDICTOR_ROWS],
+                embed_rows: Vec::new(),
+                digests: Vec::new(),
+                buffer_digests: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn a_refused_budget_never_loads_the_driver_or_allocates() {
+            let mut launcher = CudaLauncher::for_test();
+            let error = launcher
+                .stage_layer_zero(
+                    &empty_staging(),
+                    BudgetRequest {
+                        mem_available_bytes: 0,
+                        projected_host_bytes: 0,
+                        projected_device_bytes: MhcBufferPlan::LAYER_ZERO.device_bytes() as u64,
+                    },
+                )
+                .expect_err("the budget refuses");
+            assert!(matches!(
+                error,
+                MhcStageError::Budget(BudgetError::BelowFloor { .. })
+            ));
+            assert!(launcher.cuda.is_none(), "no driver was opened");
+            assert!(launcher.mhc_buffers.is_none(), "no buffers were staged");
+            assert!(
+                launcher.mhc_allocations.is_empty(),
+                "no allocation was made"
+            );
+        }
+
+        #[test]
+        fn a_stage_projection_must_match_the_exact_buffer_plan() {
+            let mut launcher = CudaLauncher::for_test();
+            let error = launcher
+                .stage_layer_zero(
+                    &empty_staging(),
+                    BudgetRequest {
+                        mem_available_bytes: 1 << 40,
+                        projected_host_bytes: 0,
+                        projected_device_bytes: 0,
+                    },
+                )
+                .expect_err("a zero device projection must not allocate the plan");
+            match error {
+                MhcStageError::Launcher { detail } => {
+                    assert!(
+                        detail.contains("projected device bytes"),
+                        "the error names the projection: {detail}"
+                    );
+                }
+                other => panic!("expected Launcher, got {other:?}"),
+            }
+            assert!(launcher.cuda.is_none(), "no driver was opened");
+            assert!(
+                launcher.mhc_allocations.is_empty(),
+                "no allocation was made"
+            );
+        }
+
+        #[test]
+        fn a_post_or_nonzero_layer_mhc_launch_is_refused_before_the_driver() {
+            let mut launcher = CudaLauncher::for_test();
+            for call in [
+                DeviceStageCall {
+                    stage: ChainStage::MhcPost,
+                    layer: 0,
+                    position: 0,
+                    kernel: "mega_mhc_sm121",
+                },
+                DeviceStageCall {
+                    stage: ChainStage::MhcEntry,
+                    layer: 1,
+                    position: 0,
+                    kernel: "mega_mhc_sm121",
+                },
+            ] {
+                let error = launcher
+                    .launch(call)
+                    .expect_err("the launch must be refused");
+                assert!(
+                    matches!(error, DeviceLaunchError::NotStaged { .. }),
+                    "unexpected refusal: {error:?}"
+                );
+            }
+            assert!(launcher.cuda.is_none(), "no driver was opened");
+        }
+
+        #[test]
+        fn a_second_launch_starts_with_zeroed_rendezvous_counters() {
+            use std::collections::BTreeMap;
+
+            let pointers: [Deviceptr; 16] =
+                core::array::from_fn(|index| Deviceptr(0x2000 * (index as u64 + 1)));
+            let buffers = MhcBuffers::from_allocations(&pointers);
+            let plan = MhcBufferPlan::LAYER_ZERO;
+            let zeroes = mhc_rendezvous_zeroes(&buffers);
+            assert_eq!(zeroes[0].0, buffers.hc_stats);
+            assert_eq!(zeroes[0].1.len(), 520, "hc_stats is 130 words");
+            assert_eq!(zeroes[1].0, buffers.hc_sync);
+            assert_eq!(zeroes[1].1.len(), 8, "hc_sync is two words");
+            let mut device = BTreeMap::new();
+            device.insert(buffers.hc_stats.0, vec![0xAAu8; plan.hc_stats]);
+            device.insert(buffers.hc_sync.0, vec![0xBBu8; plan.hc_sync]);
+            let mut kernels = 0;
+            for launch in 0..2 {
+                if launch > 0 {
+                    // This is the stale state a previous launch leaves behind.
+                    device.insert(buffers.hc_stats.0, vec![0xAAu8; plan.hc_stats]);
+                    device.insert(buffers.hc_sync.0, vec![0xBBu8; plan.hc_sync]);
+                }
+                launch_mhc_entry_with(
+                    &buffers,
+                    |destination, zeroes| {
+                        device.insert(destination.0, zeroes.to_vec());
+                        Ok(())
+                    },
+                    || {
+                        kernels += 1;
+                        Ok(())
+                    },
+                )
+                .expect("the fake launch accepts the reset and kernel");
+                assert!(
+                    device[&buffers.hc_stats.0].iter().all(|byte| *byte == 0),
+                    "launch {launch} starts with stale stats"
+                );
+                assert!(
+                    device[&buffers.hc_sync.0].iter().all(|byte| *byte == 0),
+                    "launch {launch} starts with stale sync counters"
+                );
+                // Simulate the grid's tile rendezvous before the next iteration.
+                device.insert(buffers.hc_stats.0, vec![4u8; plan.hc_stats]);
+                device.insert(buffers.hc_sync.0, vec![1u8; plan.hc_sync]);
+            }
+            assert_eq!(kernels, 2, "every launch reached the kernel seam");
+        }
+
+        #[test]
+        fn write_layer_zero_x_checks_the_four_copy_length_before_the_driver() {
+            use crate::staging::EmbedRow;
+
+            let pointers: [Deviceptr; 16] =
+                core::array::from_fn(|index| Deviceptr(0x4000 * (index as u64 + 1)));
+            let mut launcher = CudaLauncher::for_test();
+            launcher.mhc_buffers = Some(MhcBuffers::from_allocations(&pointers));
+
+            let valid = EmbedRow::new(1, vec![0x3cu8; HIDDEN * 2], 8)
+                .expect("a valid admitted row is accepted");
+            let error = launcher
+                .write_layer_zero_x(&valid)
+                .expect_err("no driver is available in this test");
+            assert!(
+                error.contains("CUDA driver is unavailable"),
+                "a valid four-copy row must pass the length check and reach the driver check: {error}"
+            );
+
+            let short = EmbedRow::new_unchecked(1, vec![0x3cu8; HIDDEN * 2 - 2]);
+            let error = launcher
+                .write_layer_zero_x(&short)
+                .expect_err("a short row must be refused");
+            let expected = HC_MULT * (HIDDEN * 2 - 2);
+            assert!(
+                error.contains(&format!("the X row is {expected} bytes")),
+                "the length check names the short X size: {error}"
+            );
+            assert!(
+                !error.contains("CUDA driver is unavailable"),
+                "the length check must run before the driver/copy path: {error}"
+            );
+        }
+
+        #[test]
+        fn a_launch_resets_the_sized_counters_before_the_kernel() {
+            use std::cell::RefCell;
+
+            let pointers: [Deviceptr; 16] =
+                core::array::from_fn(|index| Deviceptr(0x3000 * (index as u64 + 1)));
+            let buffers = MhcBuffers::from_allocations(&pointers);
+            let events = RefCell::new(Vec::new());
+            launch_mhc_entry_with(
+                &buffers,
+                |destination, zeroes| {
+                    if *destination == buffers.hc_stats {
+                        assert_eq!(zeroes.len(), 520);
+                        events.borrow_mut().push("stats");
+                    } else if *destination == buffers.hc_sync {
+                        assert_eq!(zeroes.len(), 8);
+                        events.borrow_mut().push("sync");
+                    } else {
+                        panic!("the reset covers a buffer outside the rendezvous");
+                    }
+                    assert!(zeroes.iter().all(|byte| *byte == 0));
+                    Ok(())
+                },
+                || {
+                    events.borrow_mut().push("kernel");
+                    Ok(())
+                },
+            )
+            .expect("the fake launch accepts the reset sequence");
+            assert_eq!(&*events.borrow(), &["stats", "sync", "kernel"]);
+        }
+
+        #[test]
+        fn mhc_params_are_all_sixteen_buffers_in_kernel_order() {
+            let launcher = CudaLauncher::for_test();
+            let pointers: [Deviceptr; 16] =
+                core::array::from_fn(|index| Deviceptr(0x1000 * (index as u64 + 1)));
+            let buffers = MhcBuffers {
+                x: pointers[0],
+                y_prev: pointers[1],
+                b_prev: pointers[2],
+                c_prev: pointers[3],
+                a_prev: pointers[4],
+                predictor: pointers[5],
+                hc_scale: pointers[6],
+                hc_base: pointers[7],
+                rms_weight: pointers[8],
+                xhat_fp8: pointers[9],
+                xhat_scales: pointers[10],
+                hc_stats: pointers[11],
+                hc_sync: pointers[12],
+                hc_coeffs: pointers[13],
+                hc_rms_out: pointers[14],
+                xhat_normed: pointers[15],
+            };
+            let params = launcher.mhc_params(
+                &buffers,
+                DeviceStageCall {
+                    stage: ChainStage::MhcEntry,
+                    layer: 7,
+                    position: 129,
+                    kernel: "mega_mhc_sm121",
+                },
+            );
+            let words = params.as_slice();
+            assert_eq!(words.len(), 19);
+            assert_eq!(&words[..16], &pointers.map(|pointer| pointer.0));
+            assert_eq!(words[16], 0, "trace ring is the trace-disabled zero");
+            assert_eq!(words[17], 7);
+            assert_eq!(words[18], 129);
+        }
 
         #[test]
         fn a_loaded_cubin_is_the_exact_slice_that_was_verified() {
@@ -586,7 +1116,7 @@ mod cuda_launcher {
 }
 
 #[cfg(feature = "cuda")]
-pub use cuda_launcher::{CudaLauncher, MhcBuffers};
+pub use cuda_launcher::{CudaLauncher, MhcBuffers, MhcStageError};
 
 #[cfg(test)]
 mod tests {
@@ -702,6 +1232,12 @@ mod tests {
             Ok(_) => panic!("there is no cubin directory there"),
             Err(error) => error,
         };
+        assert!(!error.is_empty());
+        let error =
+            match CudaLauncher::open_for_stage("/definitely/not/a/cubin/dir", "mega_mhc_sm121") {
+                Ok(_) => panic!("there is no cubin directory there"),
+                Err(error) => error,
+            };
         assert!(!error.is_empty());
     }
 }

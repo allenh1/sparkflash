@@ -1,21 +1,25 @@
 # Device forward chain: the 40-layer hybrid chain and the 130 + 8 golden comparison
 
-Status: **M3 wiring (host-only dry-run) on `task/device-engine-m3-wiring`, based on
-`origin/main` `5898e23`; no device chain execution, no token and no logits claim, and Phase 2
-exit criterion 1 remains OPEN** (`phase2-sequence-harness.md` section 7; D25). The
-chain skeleton (`chain.rs`, `window.rs`, `cubins.rs`, the masked comparator and
-`device-chain --plan-only`) is code, not design prose, and the wiring (`chain_device.rs`) now
-drives its full plan through one `ChainOps` implementation: host-seam stages go to a host-seam
-delegate, every device-status stage goes to an injected launcher, and the wiring runs all 5,482
-token-layer executions (108,017 ChainOps calls, of which the fake launcher records 49,347) through
-`device-chain --dry-run` while the plan-vs-ledger self-check validates. The real launcher is
-behind the `cuda` feature, reads each pinned cubin once and verifies that same slice with
-`cubins::verify_bytes`, and wires the first typed builder (mHC), but M3-b weight staging is not
-present, so no launch path is reachable here; the default-build `NoCudaLauncher` refuses every
-device stage with `CudaUnavailable`. No driver is opened and no kernel is launched by the plan or
-the dry-run; every number below is plan accounting or a labelled measurement on another harness,
-not a measurement of this chain. The document still consumes the main-branch comparison
-helpers (1.2) and adopts !68's typed capability vocabulary in M1 only (1.3).
+Status: **M3-b layer-0 weight staging and budget admission on `task/device-engine-m3-b`, based
+on `origin/main` `972c19a`; window b9 executed the cuda-only stage arm three times (exit 0), but
+there was no chain, token, logits or per-position comparison, and Phase 2 exit criterion 1 remains
+OPEN** (`phase2-sequence-harness.md` section 7; D25). The chain skeleton
+(`chain.rs`, `window.rs`, `cubins.rs`, the masked comparator and `device-chain --plan-only`) is
+code, not design prose, and the wiring (`chain_device.rs`) drives its full plan through one
+`ChainOps` implementation: host-seam stages go to a host-seam delegate, every device-status stage
+goes to an injected launcher, and the wiring runs all 5,482 token-layer executions (108,017
+ChainOps calls, of which the fake launcher records 49,347) through `device-chain --dry-run` while
+the plan-vs-ledger self-check validates. M3-b now has a real first-stage data path: layer-0 mHC
+tensors and declared embed rows are read through `WeightSource`, admitted against the 1 GiB
+MemAvailable floor before any device allocation, copied into the sixteen mHC buffers, and passed
+to the pinned mHC launch through `ChainDevice` by a cuda-only `--run-stage mhc_entry` arm. That
+arm ran on a device in Lead window b9 (three runs, 1/3/130 positions, exit 0); it is a stage path,
+not a chain, and it read nothing back. The mHC stage numbers recorded on main by the m11 harness
+are **m11's isolated layer-0 measurements, not a chain run**. The default-build `NoCudaLauncher`
+still refuses every device stage with `CudaUnavailable`; the plan and dry-run open no driver and
+launch nothing. Every number below is plan accounting, a labelled measurement on another harness,
+or the b9 stage-run receipt; none is a chain measurement. The document still consumes the
+main-branch comparison helpers (1.2) and adopts !68's typed capability vocabulary in M1 only (1.3).
 
 Terminology: **chain** = the code that runs the 40 released backbone layers on the device for one
 sequence; **capture** = the reference boundary table (v1 manifest + blob) the chain is diffed
@@ -503,11 +507,12 @@ gate/up) and verifies size and SHA-256 fail-closed; the ninth, `swiglu_mxfp8_qua
 host seam and not a required chain kernel. The CLI arm
 `sparkflash device-chain --plan-only` prints the plan, stage map, seam counts, the plan-only label
 verbatim and the three design 4.3 run labels explicitly prefixed "label reserved for a later
-stage:", then exits 2 refusing to serve. M3-b/c/d then add the typed builders/catalog, weight
-staging and memory admission, and the first host-seam hybrid pass. No token comparison is claimed
-in M3-a; the ledger is already required, and no device claim is made until a Lead window.
+stage:", then exits 2 refusing to serve. M3-b adds layer-0 weight staging and budget admission;
+M3-c/d add the remaining typed builders/catalog, the first host-seam hybrid pass and the boundary
+comparison. No token comparison is claimed in M3-a; the ledger is already required, and no device
+claim is made until a Lead window.
 
-**M3 wiring (this branch, on top of 5898e23).** `chain_device.rs` is the single `ChainOps`
+**M3 stage wiring (merged on main as `2a1f80b`, on top of `5898e23`).** `chain_device.rs` is the single `ChainOps`
 implementation the device run will use. Every stage is classified, never guessed: a
 `StageStatus::HostSeam` stage goes to an injected `HostSeamDelegate` (the M3-a seat recorder by
 default), and a `DeviceKernel` or `DeviceMeasuredNotWired` stage goes to an injected
@@ -522,12 +527,81 @@ report.
 
 The real `CudaLauncher` is behind the `cuda` feature. It reads each pinned cubin once and verifies
 that same slice with `cubins::verify_bytes` on construction, and has the first typed builder wired
-(`mega_mhc_launch::MegaMhcParams`). mHC entry/post refuse until M3-b supplies `MhcBuffers`
-(`NotStaged`); router and routed gate/up are measured but not wired (`NotWired`); the other device
-stages are `NotStaged`. The default-build `NoCudaLauncher` refuses every device stage with
-`CudaUnavailable`. This MR makes **no device execution, no token and no comparison**; it proves
-the dispatch, launcher injection, error path and ledger plumbing only. M3-b then stages weights and
-buffers, M3-c runs the first hybrid token, and M3-d adds the boundary comparison.
+(`mega_mhc_launch::MegaMhcParams`). M3-b now supplies `MhcBuffers` for layer 0 through
+`stage_layer_zero`; without that staging, mHC entry/post still refuse `NotStaged`. Router and
+routed gate/up are measured but not wired (`NotWired`); the other device stages are `NotStaged`.
+The default-build `NoCudaLauncher` refuses every device stage with `CudaUnavailable`. The wiring
+MR made **no device execution, no token and no comparison**; it proves the dispatch, launcher
+injection, error path and ledger plumbing only.
+
+**M3-b - layer-0 weight staging and budget admission (this branch, on `972c19a`).** `staging.rs`
+reads `layers.0.hc_attn_fn` (F32 [24, 4*d], permuted into kernel B/A/C row order without
+averaging), `layers.0.hc_attn_base` (F32 [24], rearranged with `bias_into_kernel_rows`),
+`layers.0.hc_attn_scale` (F32 [3]), `layers.0.attn_norm.weight` (F32 or BF16 [5120]) and the
+declared `embed.weight` rows through `WeightSource`. Every spec is checked before its read; the
+read must match the spec's storage length. The stage report labels two SHA-256 sets: a **source**
+digest over the checkpoint bytes read, and a **buffer** digest over the exact host vector later
+passed to `copy_htod` (the permuted predictor, kernel-order base, f32-widened norm and four-copy
+X row), so a buffer digest is never mistaken for source provenance. Embed rows are fetched only
+with `read_ranges`: a source that cannot page a row is refused rather than triggering a
+whole-table read; `embed.weight` is 1.324 GB BF16. This is **not** an all-resident model and has
+no streaming scheduler; it stages layer 0 only. The
+layer-0 boundary seed is host-built and declared exactly as m11 declares it (B = identity, C = 0,
+A = [1, 0, 0, 0], Y_-1 = 0), not checkpoint data.
+
+`budget.rs` admits a stage only when `MemAvailable - (projected host + projected device)` remains
+at least 1 GiB; it reports every number in a refusal and in an admission receipt. This is a
+headroom rule, not the harnesses' older absolute 32 GiB gate. `CudaLauncher::stage_layer_zero`
+admits first, then requires the caller's projected device bytes to equal
+`MhcBufferPlan::LAYER_ZERO` exactly and its projected host bytes to cover the staging plus the
+verified cubins; only then does it load the driver, allocate the exact sixteen buffers
+(`MhcBufferPlan::LAYER_ZERO`, 2,064,352 B) and copy the staged tensors. A driver or copy failure
+frees the allocations and leaves `mhc_buffers` unset. The staging path zeroes `hc_stats` and
+`hc_sync` at stage time, and every mHC entry launch re-zeroes both before the launch, matching
+m11's per-launch rendezvous reset; without it position 2+ would start with stale tile counters.
+`--run-stage mhc_entry` is compiled only with `cuda`; it stages the weights, uses the admitted
+numbers, writes each declared position's row into X, and drives one layer-0 mHC entry through
+`ChainDevice`. `MhcBuffers` fields are private and the public buffer setter is gone, so only
+`stage_layer_zero`'s own allocation set can reach a launch; `MhcPost` and any non-zero layer are
+refused `NotStaged` until the coefficient handoff exists. The CLI refuses every other stage by
+name (router/gate-up `NotWired`, the rest `NotStaged`). Tests cover staging arithmetic/checks,
+buffer digests pinned to the exact host bytes, admission and projection boundaries, buffer layout,
+a launch-level test of the sized rendezvous reset through the copy seam before the kernel, and the
+refusal-before-driver path without a GPU.
+
+**Window record: b9 (2026-10-18T23:21:21Z).** Lead window b9 (node-only logs:
+`window-b9-20261018T232121Z.log`; `runs9/m3b-pos0.log`, `runs9/m3b-pos012.log` and
+`runs9/m3b-pos0-129.log`, all at 23:22:35Z-23:22:36Z) ran the cuda-only arm three times on binary
+`sparkflash_m3b_1846e72_aarch64` (42,221,656 B, sha256 `1846e729...`; built from `6f79bcc`). The
+mHC cubin was `mega_mhc_sm121`, 70,312 B, sha256 `e21293e3...`, verified before any driver or
+allocation. All three runs exited 0: positions `0` (1 device stage call), `0,1,2` (3) and
+`0..129` (130), each `ADMITTED` before allocation and each
+`ChainDevice<CudaLauncher, SeatHostSeams>` with `stage_execution=true`,
+`chain_execution=false` and `token_produced=false`. The admission receipts were:
+
+- positions 0: MemAvailable 126,367,248,384 B; projected host 2,067,316 B + device 2,064,352 B =
+  4,131,668 B; floor 1,073,741,824 B; remaining 126,363,116,716 B.
+- positions 0,1,2: host 2,087,796 B + device 2,064,352 B = 4,152,148 B; remaining
+  126,363,002,028 B.
+- positions 0..129: host 3,388,276 B + device 2,064,352 B = 5,452,628 B; remaining
+  126,341,438,636 B.
+
+The binary was built from `6f79bcc`; the later EmbedRow privacy hardening is not CLI-visible,
+so no new binary was built for this record. Staging printed source -> buffer SHA-256 pairs:
+predictor 491,520 f32 (`3d384347...` ->
+`cbbb089e...`), hc_attn_base 24 f32 (`616e03e5...` -> `deda659f...`), hc_attn_scale 12 B
+(`278ed053...`, unchanged) and attn_norm 5,120 f32 from a 10,240 BF16 source (`8da5f030...` ->
+`7de8fafc...`, 20,480 buffer bytes); the declared embed rows (3 in the 0,1,2 run and 130 in the
+0..129 run) each printed source -> buffer X digests. There was no readback, so **no coefficient
+was compared and no per-position output is claimed**.
+
+The honest reading of b9 is the reset evidence, not a numeric result: 130 sequential launches
+completing is evidence that the per-launch `hc_sync`/`hc_stats` reset lets each position
+rendezvous again (m11's finding was that stale counters never publish), but there is no readback,
+so the coefficients are not compared and no per-position output is claimed.
+
+Criterion 1 remains **OPEN**; M3-c runs the first hybrid token and M3-d adds the boundary
+comparison.
 
 **M4 - full 130 + 8 run and the criterion-1 claim.** The scope formerly called M3. The full phase
 of section 5 with the boundary capture at 129, the contract of section 4, and the report artifacts.
@@ -537,7 +611,7 @@ logits", the FFN stage labelled hybrid while gate/up is merged but not wired, an
 labelled NOT YET DEVICE-EXECUTED AS A PRUNING PATH.
 
 File layout: `crates/sparkflash-device/src/{lib.rs, engine.rs, session.rs, chain.rs,
-chain_device.rs, window.rs, cubins.rs}`, `crates/sparkflash-device/tests/{engine_offline.rs,
+chain_device.rs, budget.rs, staging.rs, window.rs, cubins.rs}`, `crates/sparkflash-device/tests/{engine_offline.rs,
 chain_contract.rs}`, the
 `sparkflash-cli device-chain` subcommand, and the `--package=` selector in
 `scripts/build-aarch64.sh` (still to add; the selector is not needed until a node build of the

@@ -1,17 +1,20 @@
-//! The device-chain subcommand: M3-a prints the plan, M3 wiring dry-runs the dispatch, and neither
-//! executes a device stage.
+//! The device-chain subcommand: M3-a prints the plan, M3 wiring dry-runs the dispatch, and the
+//! cuda-only M3-b arm runs the layer-0 mHC entry as a single staged stage.
 //!
 //!   sparkflash device-chain --plan-only
 //!   sparkflash device-chain --dry-run
+//!   sparkflash device-chain --run-stage mhc_entry --checkpoint DIR --cubin-dir DIR [--positions 0]
 //!
 //! --plan-only prints the CED schedule, the window accounting, the stage map, the planned host-seam
 //! set and the exact design 4.3 labels. --dry-run additionally runs the full 130 + 8 plan through
 //! the real ChainDevice wiring with the fake launcher and the host-seam seat delegate, validates the
 //! plan-vs-ledger self-check (108,017 ChainOps calls) and prints the per-stage call counts and
-//! host-seam seats. Both exit 2: a plan or a fake-launcher dry-run is not an execution, and this
-//! arm has no device session, no weight staging and no token path. The labels are printed verbatim
-//! so a plan cannot be read as a device result (docs/build/device-forward-chain.md 4.3 item 3).
-//! There is no line that could be read as a launch, a token or a logits comparison.
+//! host-seam seats. Both exit 2: a plan or a fake-launcher dry-run is not an execution. The
+//! --run-stage arm exists only in a cuda build: it stages the layer-0 mHC tensors through
+//! WeightSource, admits the memory budget before the first device allocation, stages the sixteen
+//! mHC buffers and launches the mHC entry through ChainDevice. It refuses every other stage, makes
+//! no chain/token/comparison claim, and is not a full chain run. The labels are printed verbatim so
+//! a plan cannot be read as a device result (docs/build/device-forward-chain.md 4.3 item 3).
 
 use std::process::ExitCode;
 
@@ -24,7 +27,7 @@ use sparkflash_device::cubins::{baseline_pins, required_pins};
 use sparkflash_device::window::WindowAccounting;
 
 /// The usage line for this subcommand.
-pub const USAGE: &str = "sparkflash device-chain --plan-only|--dry-run";
+pub const USAGE: &str = "sparkflash device-chain --plan-only|--dry-run|--run-stage mhc_entry --checkpoint DIR --cubin-dir DIR [--positions 0] [--layer 0]";
 
 /// The exit code a plan-only or dry-run invocation returns: 2, refusing to serve.
 pub const PLAN_ONLY_EXIT: u8 = 2;
@@ -132,7 +135,7 @@ pub fn dry_run_lines() -> Result<Vec<String>, String> {
     );
     lines.extend(ChainLabels::plan_lines());
     lines.push(
-        "device-chain: exiting 2, refusing to serve: M3 wiring has no device execution path"
+        "device-chain: exiting 2, refusing to serve: this dry-run has no device execution path"
             .to_string(),
     );
     Ok(lines)
@@ -142,6 +145,10 @@ pub fn dry_run_lines() -> Result<Vec<String>, String> {
 pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     let args: Vec<String> = args.collect();
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    #[cfg(feature = "cuda")]
+    if arg_refs.first().copied() == Some("--run-stage") {
+        return run_stage(&arg_refs[1..]);
+    }
     let lines = match arg_refs.as_slice() {
         ["--plan-only"] => plan_lines(),
         ["--dry-run"] => dry_run_lines(),
@@ -157,6 +164,181 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
                 println!("{line}");
             }
             ExitCode::from(PLAN_ONLY_EXIT)
+        }
+        Err(error) => {
+            eprintln!("sparkflash device-chain: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The parsed --run-stage arguments. This arm is compiled only with the cuda feature.
+#[cfg(feature = "cuda")]
+struct StageArgs {
+    checkpoint: std::path::PathBuf,
+    cubin_dir: std::path::PathBuf,
+    positions: Vec<usize>,
+}
+
+#[cfg(feature = "cuda")]
+fn parse_positions(raw: &str) -> Result<Vec<usize>, String> {
+    let mut positions = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err("--positions has an empty entry".to_string());
+        }
+        let position = part
+            .parse::<usize>()
+            .map_err(|_| format!("--positions: {part} is not a position"))?;
+        positions.push(position);
+    }
+    if positions.is_empty() {
+        return Err("--positions must name at least one position".to_string());
+    }
+    Ok(positions)
+}
+
+#[cfg(feature = "cuda")]
+fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
+    let stage = args
+        .first()
+        .ok_or_else(|| "usage: sparkflash device-chain --run-stage mhc_entry --checkpoint DIR --cubin-dir DIR [--positions 0] [--layer 0]".to_string())?
+        .to_string();
+    if stage != "mhc_entry" {
+        let reason = match stage.as_str() {
+            "moe_router" | "moe_gate_up" => {
+                "NotWired (measured in isolation, not wired into the chain)"
+            }
+            _ => "NotStaged (M3-b stages only the layer-0 mHC entry)",
+        };
+        return Err(format!(
+            "stage {stage} is {reason}; --run-stage currently exposes only mhc_entry"
+        ));
+    }
+    let mut checkpoint = None;
+    let mut cubin_dir = None;
+    let mut positions = vec![0usize];
+    let mut layer = 0usize;
+    let mut index = 1usize;
+    while index < args.len() {
+        let flag = args[index];
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("{flag} needs a value"))?;
+        match flag {
+            "--checkpoint" => checkpoint = Some(std::path::PathBuf::from(value)),
+            "--cubin-dir" => cubin_dir = Some(std::path::PathBuf::from(value)),
+            "--positions" => positions = parse_positions(value)?,
+            "--layer" => {
+                layer = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("--layer: {value} is not a layer"))?;
+            }
+            other => return Err(format!("unknown --run-stage option {other}")),
+        }
+        index += 2;
+    }
+    if layer != 0 {
+        return Err(format!("--layer {layer}: M3-b stages only layer 0"));
+    }
+    Ok((
+        stage,
+        StageArgs {
+            checkpoint: checkpoint
+                .ok_or_else(|| "--run-stage needs --checkpoint DIR".to_string())?,
+            cubin_dir: cubin_dir.ok_or_else(|| "--run-stage needs --cubin-dir DIR".to_string())?,
+            positions,
+        },
+    ))
+}
+
+/// Runs the cuda-only single-stage arm and returns the lines to print.
+#[cfg(feature = "cuda")]
+fn run_stage_lines(args: &[&str]) -> Result<Vec<String>, String> {
+    use sparkflash_device::budget::read_mem_available_bytes;
+    use sparkflash_device::chain::{ChainOps, ChainStage, StageCall};
+    use sparkflash_device::chain_device::{ChainDevice, SeatHostSeams};
+    use sparkflash_device::staging::LayerZeroStaging;
+    use sparkflash_engine::safetensors::SafeTensorsSource;
+
+    let (stage, args) = stage_args(args)?;
+    let source = SafeTensorsSource::open(
+        &args.checkpoint,
+        &args.checkpoint.join("model.safetensors.index.json"),
+    )
+    .map_err(|error| format!("checkpoint {}: {error}", args.checkpoint.display()))?;
+    let staging = LayerZeroStaging::from_source(&source, &args.positions)
+        .map_err(|error| format!("stage {stage}: {error}"))?;
+    let mem_available_bytes = read_mem_available_bytes()?;
+    let mut launcher =
+        sparkflash_device::CudaLauncher::open_for_stage(&args.cubin_dir, "mega_mhc_sm121")?;
+    let cubin_bytes = launcher.cubin_bytes();
+    let request = sparkflash_device::BudgetRequest {
+        mem_available_bytes,
+        projected_host_bytes: staging.host_bytes() + cubin_bytes,
+        projected_device_bytes: staging.device_buffer_bytes(),
+    };
+    let mut lines = vec![
+        "sparkflash device-chain: M3-b STAGE RUN - one isolated layer-0 mHC entry launch; no chain, no token, no comparison".to_string(),
+        "execution flags: stage_execution=true; chain_execution=false; token_produced=false".to_string(),
+        format!(
+            "stage: {stage} layer 0 positions {:?}; checkpoint {}; cubin dir {}",
+            args.positions,
+            args.checkpoint.display(),
+            args.cubin_dir.display()
+        ),
+    ];
+    lines.push(format!(
+        "cubin: mega_mhc_sm121 {cubin_bytes} B, verified against the baseline pin before any driver or allocation"
+    ));
+    lines.extend(staging.provenance_lines());
+    let admission = launcher
+        .stage_layer_zero(&staging, request)
+        .map_err(|error| format!("{stage}: {error}"))?;
+    lines.extend(admission.report_lines());
+    let schedule = ChainSchedule::milestone().map_err(|error| error.to_string())?;
+    let mut device = ChainDevice::new(&schedule, launcher, SeatHostSeams);
+    for position in &args.positions {
+        let row = staging
+            .embed_row(*position)
+            .ok_or_else(|| format!("no staged embed row for position {position}"))?;
+        device
+            .launcher_mut()
+            .write_layer_zero_x(row)
+            .map_err(|error| format!("position {position}: {error}"))?;
+        device
+            .stage(StageCall {
+                layer: 0,
+                position: *position,
+                stage: ChainStage::MhcEntry,
+            })
+            .map_err(|error| format!("position {position}: {error}"))?;
+    }
+    lines.push(format!(
+        "device chain wiring: ChainDevice<CudaLauncher, SeatHostSeams>; {stage} launched for {} position(s); {} device stage calls",
+        args.positions.len(),
+        device.stats().device_calls
+    ));
+    lines.push(
+        "no readback, no comparison and no token: this is one isolated stage launch, not a chain run"
+            .to_string(),
+    );
+    lines.push(
+        "the mHC stage numbers on main are m11's isolated measurements, not a chain result"
+            .to_string(),
+    );
+    Ok(lines)
+}
+
+#[cfg(feature = "cuda")]
+fn run_stage(args: &[&str]) -> ExitCode {
+    match run_stage_lines(args) {
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+            ExitCode::SUCCESS
         }
         Err(error) => {
             eprintln!("sparkflash device-chain: {error}");
@@ -270,5 +452,33 @@ mod tests {
         assert!(!text.lines().any(|line| line.starts_with("label: hybrid:")));
         assert!(!text.contains("execution flags: chain_execution=true"));
         assert!(!text.contains("device_execution=true"));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn run_stage_refuses_every_other_stage_by_name() {
+        let error = run_stage_lines(&["moe_gate_up"]).expect_err("not wired");
+        assert!(error.contains("NotWired"), "{error}");
+        assert!(error.contains("moe_gate_up"), "{error}");
+        let error = run_stage_lines(&["attention"]).expect_err("not staged");
+        assert!(error.contains("NotStaged"), "{error}");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn run_stage_needs_checkpoint_and_cubin_dir_before_touching_a_driver() {
+        let error = run_stage_lines(&["mhc_entry"]).expect_err("checkpoint");
+        assert!(error.contains("--checkpoint"), "{error}");
+        let error = run_stage_lines(&["mhc_entry", "--checkpoint", "/tmp"]).expect_err("cubin");
+        assert!(error.contains("--cubin-dir"), "{error}");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn run_stage_positions_are_parsed_and_validated() {
+        assert_eq!(parse_positions("0,2,129").unwrap(), vec![0, 2, 129]);
+        assert!(parse_positions("").is_err());
+        assert!(parse_positions("0,,1").is_err());
+        assert!(parse_positions("zero").is_err());
     }
 }

@@ -554,7 +554,7 @@ and separates what is already on main.
    `DeviceStep`, `compare_steps`, `CertifiedMask`); it is the Phase-2 comparison path, not a
    chain execution.
 
-**M3 wiring — the dispatch, merged on main (`!90`); dry-run only, no device execution.**
+**M3-a wiring — the dispatch, merged on main (`!90`); dry-run only, no device execution.**
 `chain_device.rs` is the one `ChainOps` implementation a device run will use: each stage is
 classified, host-seam stages go to an injected `HostSeamDelegate`, and device-status stages go to
 an injected `DeviceLauncher` (`crates/sparkflash-device/src/chain_device.rs:105`) — there is no
@@ -568,13 +568,14 @@ launch, no token (`crates/sparkflash-cli/src/device_chain.rs:27-135`). The real 
 behind the `cuda` feature: `open` loads the required pins and verifies each pinned cubin's bytes
 with `cubins::verify_bytes` before any driver is opened (`:429`, `:440-453`), and it wires the
 first typed builder (`mega_mhc_launch::MegaMhcParams`, `:481`), but every stage refuses with
-`NotStaged` until M3-b supplies the buffers and weights (`:521`); this MR has no CLI path to it
-and claims no device execution, token or comparison.
+`NotStaged` until M3-b supplies the buffers and weights (`:521`); M3-a itself has no CLI path
+to it, and M3-b's cuda-only path is the first, executed in window b9 with no token or comparison.
 
-Criterion 1 stays **OPEN**: the plan and the dry-run open no driver, load no cubin, launch nothing
-and produce no token or logits; the first device execution needs M3-b.
+Criterion 1 stays **OPEN**: the plan and the dry-run open no driver, load no cubin, launch nothing,
+and produce no token or logits; window b9 executed the stage arm but still produced no token or
+logits, so the first end-to-end device token remains M3-c.
 
-**M3-b — weight staging and budget admission (next).**
+**M3-b — weight staging and budget admission (this branch).**
 6. Stage the dense, mHC, shared-expert, head and embedding weights through `WeightSource`
    (`embed.weight` is 1.324 GB bf16, section 4); stream routed experts per layer (no data path
    exists; section 4 shows why all-resident is impossible).
@@ -583,6 +584,17 @@ and produce no token or logits; the first device execution needs M3-b.
    the slice's per-run tallies are in `device-path-design.md` section 11).
 8. Handle the paged Engram source for layers 1 and 14 (the engine's own `engram_forward` is the
    measured reference, but the packer has never run against the checkpoint).
+
+`task/device-engine-m3-b` lands the layer-0 subset of 6 and 7 only: the layer-0 mHC tensors,
+`attn_norm.weight` and declared `embed.weight` rows are staged through `WeightSource` with
+paged row reads and separate source and copied-buffer SHA-256 provenance, and a 1 GiB-MemAvailable
+admission runs before the first device allocation, feeding one cuda-only `--run-stage mhc_entry`
+launch through `ChainDevice` (with both mHC rendezvous counters re-zeroed before every launch).
+The rest of the model, routed-expert streaming, the Engram source and the first hybrid token are
+still ahead. Window b9 executed that cuda-only arm three times on binary
+`sparkflash_m3b_1846e72_aarch64` (42,221,656 B, sha256 `1846e729...`), at 1, 3 and 130 positions,
+all exit 0; 130 sequential launches are the per-launch-reset evidence, not a numeric result. There
+was no readback, so no coefficient or per-position output is compared. Criterion 1 stays **OPEN**.
 
 **M3-c — first hybrid token (the first real end-to-end run).**
 9. Implement the per-layer order of design 2.2 with the seams of design 3.1, using the existing

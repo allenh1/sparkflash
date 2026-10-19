@@ -1,5 +1,6 @@
 //! `sparkflash-device`: the device forward chain crate. **M2 is one real kernel; M3-a is the chain
-//! skeleton, still not an execution.**
+//! skeleton, M3-b is layer-0 weight staging and a budget-gated first-stage path; none is a chain
+//! execution.**
 //!
 //! Milestones M1, M2 and M3-a of `docs/build/device-forward-chain.md` section 7. The crate exists so
 //! the serving seam's capability boundary becomes real and a device session is proved through it:
@@ -34,13 +35,22 @@
 //!   seams go to an injected host-seam delegate; device-status stages go to an injected launcher,
 //!   never to host math. The fake launcher drives the full 130 + 8 plan through
 //!   `device-chain --dry-run` (108,017 calls, plan-vs-ledger validated); the real `CudaLauncher`
-//!   is behind `cuda`, verifies the pinned cubin directory, wires the mHC typed builder, and
-//!   refuses every stage until M3-b stages buffers/weights. No device execution or token is claimed.
+//!   is behind `cuda`, verifies the pinned cubin directory and wires the mHC typed builder.
+//! - M3-b adds layer-0 staging and admission: [`staging`] reads only `layers.0.hc_attn_fn`,
+//!   `layers.0.hc_attn_base`, `layers.0.hc_attn_scale`, `layers.0.attn_norm.weight` and paged embed
+//!   rows through [`sparkflash_engine::weights::WeightSource`], checks each dtype/shape before the
+//!   read, writes no whole embedding table, records a SHA-256 per accepted tensor/row and exposes the
+//!   exact sixteen-buffer [`staging::MhcBufferPlan`]; [`budget`] admits a stage only when the
+//!   projected host and device bytes leave at least 1 GiB of MemAvailable, before any allocation.
+//!   `CudaLauncher::stage_layer_zero` allocates the sixteen buffers and copies the staged tensors
+//!   only after that admission; the cuda-only `device-chain --run-stage mhc_entry` arm drives one
+//!   layer-0 mHC entry stage through `ChainDevice`. It is a stage path, not a chain.
 //!
-//! **What the crate does not do.** No chain execution, no device weight staging, no device token or
-//! logits path, no boundary capture and no criterion-1 claim (design 3.1, 3.2, 4.3, 7 M3). The token
-//! path in a first real chain is hybrid (design 3.2b); this crate has no device token path. M3's
-//! first hybrid pass, with a Lead window, is the first point at which a chain claim may be made.
+//! **What the crate does not do.** No chain execution, no token or logits path, no boundary capture
+//! and no criterion-1 claim (design 3.1, 3.2, 4.3, 7 M3). Weight staging is layer-0-only; no layer 1
+//! to 39, shared-expert, head or routed-expert path is staged, and no device execution was performed
+//! by this crate's tests. The token path in a first real chain is hybrid (design 3.2b); M3's first
+//! hybrid pass, in a Lead window, is the first point at which a chain claim may be made.
 //!
 //! # Dependency direction and the cuda feature
 //!
@@ -56,13 +66,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod budget;
 pub mod chain;
 pub mod chain_device;
 pub mod cubins;
 pub mod engine;
 pub mod session;
+pub mod staging;
 pub mod window;
 
+pub use budget::{
+    ADMISSION_FLOOR_BYTES, BudgetAdmission, BudgetError, BudgetRequest, read_mem_available_bytes,
+};
 pub use chain::{
     ChainError, ChainLabels, ChainLayer, ChainOps, ChainRunReport, ChainSchedule, ChainSeamPlan,
     ChainStage, FIRST_CHAIN_LABEL, FUTURE_LABEL_PREFIX, HEAD_LABEL, HYBRID_TOKEN_LABEL,
@@ -75,7 +90,7 @@ pub use chain_device::{
     host_seat_counts, run_chain,
 };
 #[cfg(feature = "cuda")]
-pub use chain_device::{CudaLauncher, MhcBuffers};
+pub use chain_device::{CudaLauncher, MhcBuffers, MhcStageError};
 pub use cubins::{
     CHAIN_KERNELS, GATE_UP_KERNEL, REQUIRED_KERNELS, ROUTER_KERNEL, required_pins,
     verify_required_dir,
@@ -84,4 +99,8 @@ pub use engine::{CapabilityReport, DeviceEngine, DeviceRefusal, NON_GREEDY_CODE,
 #[cfg(feature = "cuda")]
 pub use session::cuda::CudaSession;
 pub use session::{DeviceSession, ExecutionEvidence, FakeSession, SessionError};
+pub use staging::{
+    EMBED_WEIGHT, EmbedRow, LAYER0_ATTN_NORM, LAYER0_MHC_BASE, LAYER0_MHC_FN, LAYER0_MHC_SCALE,
+    LAYER0_PREFIX, LayerZeroStaging, MHC_BUFFER_COUNT, MhcBufferPlan, StagedTensor, StagingError,
+};
 pub use window::{WindowAccounting, layer_view, layer_view_bytes};
