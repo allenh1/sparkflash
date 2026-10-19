@@ -85,7 +85,7 @@ device evidence either.
 
 ## 2. Stage detail: pins, harnesses, measurements, APIs, gaps
 
-Kernel pins are in `crates/sparkflash-kernels/baseline/kernel_baseline.txt:13-24` (twelve entries,
+Kernel pins are in `crates/sparkflash-kernels/baseline/kernel_baseline.txt:13-25` (thirteen entries,
 nvcc release V13.0.88, arch sm_121a). The six Milestone-4 kernels are the six-entry
 `m4_abi::KERNELS` array (`crates/sparkflash-kernels/src/m4_abi.rs:867`; constants at `:854, :856,
 :858, :860, :862, :864`), and `m4_abi` is frozen by D26 (`docs/DECISIONS.md`), so the router, SwiGLU
@@ -95,8 +95,11 @@ nvcc release V13.0.88, arch sm_121a). The six Milestone-4 kernels are the six-en
 and `docs/build/phase3-rmsnorm-tail.md`, D34); the certified head's device reduce:
 `kernels/lm_head_reduce_sm121.cu` and `docs/build/phase3-lm-head-reduce.md` (D35): pinned at
 36,120 B / `3fcd7ba5...` (`ptx_membar_lines=0`), **window b44 measured m19 PASS (17/17)**, not yet
-wired into the engine. The driver
-enum has eleven variants (the ten above plus `LmHeadReduce`), one raw loader and launch path
+wired into the engine. The deferred sequence's position-causal CSA2 attention entry:
+`kernels/flash_mla_csa2_seq_sm121.cu` and `docs/build/phase3-csa2-sequence.md` (D36), pinned at
+38,080 B / `f6dfc738...` (`ptx_membar_lines=0`); **window b50 measured m20 PASS (50/50)** cleanly (b48 was contaminated by an overlapping window and is superseded), including
+position 0 new-vs-old out[] byte identity; not yet wired into the engine. The driver
+enum has twelve variants (the eleven above plus `FlashMlaCsa2Seq`), one raw loader and launch path
 (`Cuda::load_kernel` `:527`, `Cuda::launch` `:562`, `launch_repeated` `:607`); typed launchers
 exist for attention and router (2.6/2.7), and `!88` added typed param builders for mHC, dense, wo_a,
 MXFP4 down/combine, LM head and routed gate/up (`*_launch.rs`), none of them wired into a chain yet.
@@ -572,7 +575,7 @@ and separates what is already on main.
    self-check (fails on a missing **and** an unplanned seam), and runs through a `ChainOps` backend
    with `chain_execution = false`.
 2. `window.rs` accounts the 128-slot rings (67,584 B each, 2,703,360 B for 40 layers) and
-   round-trips the oldest-first view; `cubins.rs` parses the twelve baseline pins, requires the nine
+   round-trips the oldest-first view; `cubins.rs` parses the thirteen baseline pins, requires the nine
    chain pins (the six chain kernels plus router, routed gate/up and the c4c tail `rmsnorm_sm121`)
    and verifies size and SHA-256 fail-closed.
 3. `sparkflash device-chain --plan-only` prints the schedule, stage map, planned seam counts, the
@@ -1028,7 +1031,7 @@ and is not cited.
 
 - `device-forward-chain.md` section 2.1 says "the corrected device path has not run". That is **still
   true for the 40-layer chain** (the m8 plumbing binary ran at 2026-10-18T18:32Z, but no chain is
-  wired); section 2.2 on main already records the baseline's twelve entries and that gate/up is merged
+  wired); section 2.2 on main already records the baseline's thirteen entries and that gate/up is merged
   but not wired, so those earlier corrections are now in the doc of record rather than this list.
 - `kernels/flash_mla_csa2_sm121.cu:53-58` says format 2 was never executed on a device; task-14 and
   the m8 dispatch supersede it (2.6).

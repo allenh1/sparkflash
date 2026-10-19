@@ -728,6 +728,85 @@ pub fn index_block_best(
     (scores, best_tokens)
 }
 
+/// One lane's four products of the indexer dot, reduced inside the warp exactly as the kernel
+/// reduces them: five shfl_down steps, 16, 8, 4, 2, 1, each lane adding the value of the lane that
+/// many positions above it. Only lane 0's value is the block score, which is the value kept here.
+fn indexer_warp_sum(per_lane: &[f32; 32]) -> f32 {
+    let mut values = *per_lane;
+    let mut offset = 16usize;
+    while offset >= 1 {
+        for lane in 0..offset {
+            values[lane] += values[lane + offset];
+        }
+        offset /= 2;
+    }
+    values[0]
+}
+
+/// The position-causal indexer block scoring of the sequence entry
+/// (kernels/flash_mla_csa2_seq_sm121.cu), for ONE indexer head.
+///
+/// Returns (best score, best token) per HSI block. A block whose first token is past the query, or
+/// whose reachable tokens are all past it, publishes (-f32::MAX, 0) - the kernel's empty result. The
+/// dot is 128 values wide, four per lane, and is reduced with the kernel's own warp tree, so the
+/// arithmetic order matches; FMA contraction in the compiled kernel can still move the score by an
+/// ULP, which is why the harness compares with the attention bar rather than bit-for-bit.
+///
+/// # Panics
+/// Panics if the key or query slices do not have the pinned shape.
+#[must_use]
+pub fn indexer_block_scores(
+    index_key: &[u16],
+    index_query: &[u16],
+    position: u32,
+) -> Vec<(f32, u32)> {
+    assert_eq!(
+        index_key.len(),
+        HSI_BLOCKS * HSI_BLOCK_TOKENS * INDEX_HEAD_DIM,
+        "the index key pool must be 2,048 x 8 x 128 bf16 values"
+    );
+    assert_eq!(
+        index_query.len(),
+        INDEX_HEAD_DIM,
+        "one indexer query row is 128 bf16 values"
+    );
+    let query: [f32; INDEX_HEAD_DIM] = std::array::from_fn(|index| bf16_value(index_query[index]));
+    let mut blocks = Vec::with_capacity(HSI_BLOCKS);
+    for block in 0..HSI_BLOCKS {
+        let first_token = block * HSI_BLOCK_TOKENS;
+        let mut best = -f32::MAX;
+        let mut best_token = 0u32;
+        if (first_token as u64) <= u64::from(position) {
+            for slot in 0..HSI_BLOCK_TOKENS {
+                let token = first_token + slot;
+                if (token as u64) > u64::from(position) {
+                    break;
+                }
+                let key_row = &index_key[(block * HSI_BLOCK_TOKENS + slot) * INDEX_HEAD_DIM
+                    ..(block * HSI_BLOCK_TOKENS + slot + 1) * INDEX_HEAD_DIM];
+                let mut per_lane = [0.0f32; 32];
+                for (lane, value) in per_lane.iter_mut().enumerate() {
+                    let q0 = query[lane];
+                    let q1 = query[lane + 32];
+                    let q2 = query[lane + 64];
+                    let q3 = query[lane + 96];
+                    *value = q0 * bf16_value(key_row[lane])
+                        + q1 * bf16_value(key_row[lane + 32])
+                        + q2 * bf16_value(key_row[lane + 64])
+                        + q3 * bf16_value(key_row[lane + 96]);
+                }
+                let score = indexer_warp_sum(&per_lane);
+                if score > best {
+                    best = score;
+                    best_token = u32::try_from(token).expect("a token fits a u32");
+                }
+            }
+        }
+        blocks.push((best, best_token));
+    }
+    blocks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2344,5 +2423,40 @@ mod tests {
             512,
             0.0,
         );
+    }
+    #[test]
+    fn the_indexer_is_position_causal_and_publishes_the_empty_block_value() {
+        let key = vec![0x3f80u16; HSI_BLOCKS * HSI_BLOCK_TOKENS * INDEX_HEAD_DIM];
+        let query = vec![0x3f80u16; INDEX_HEAD_DIM];
+        let blocks = indexer_block_scores(&key, &query, 0);
+        assert_eq!(blocks.len(), HSI_BLOCKS);
+        assert_eq!(blocks[0].1, 0);
+        assert!(blocks[0].0.is_finite());
+        for (block, (score, token)) in blocks.iter().enumerate().skip(1) {
+            assert_eq!(*score, -f32::MAX, "block {block} starts past the query");
+            assert_eq!(*token, 0);
+        }
+
+        let blocks = indexer_block_scores(&key, &query, 9);
+        assert!(blocks[0].0.is_finite());
+        assert_eq!(blocks[0].1, 0);
+        assert!(blocks[1].0.is_finite());
+        assert_eq!(blocks[1].1, 8);
+        for (block, (score, token)) in blocks.iter().enumerate().skip(2) {
+            assert_eq!(*score, -f32::MAX, "block {block} starts past position 9");
+            assert_eq!(*token, 0);
+        }
+    }
+
+    #[test]
+    fn the_indexer_keeps_the_lowest_token_on_an_equal_block_score() {
+        // All keys and the query are 1.0, so every slot in a block scores 128.0 and the tie has to
+        // resolve to the block's first token, not the last one written.
+        let key = vec![0x3f80u16; HSI_BLOCKS * HSI_BLOCK_TOKENS * INDEX_HEAD_DIM];
+        let query = vec![0x3f80u16; INDEX_HEAD_DIM];
+        let blocks = indexer_block_scores(&key, &query, 7);
+        assert_eq!(blocks[0].1, 0);
+        let blocks = indexer_block_scores(&key, &query, 1);
+        assert_eq!(blocks[0].1, 0);
     }
 }

@@ -2019,7 +2019,9 @@ local` for the written entry; both b42 and b43 are FAILURE records (verbatim in 
 **twelfth** entry in `crates/sparkflash-kernels/baseline/kernel_baseline.txt:13-24`;
 `build.rs`'s `PROBED_KERNELS` probes twelve sources and the combined probe still compiles every
 kernel in one translation unit; `cuda_driver::KernelId` gained `LmHeadReduce` (eleven variants);
-the frozen six-kernel `m4_abi` array is untouched. The typed launch declaration
+the frozen six-kernel `m4_abi` array is untouched. **(D36 adds a thirteenth entry and a twelfth
+variant; the manifest is now `kernel_baseline.txt:13-25`, `PROBED_KERNELS` probes thirteen, and the
+reduce remains the twelfth entry.)** The typed launch declaration
 (`crates/sparkflash-kernels/src/lm_head_reduce_launch.rs`, `ARG_WORDS = 19`, one block of 256,
 grid `(1,1,1)`) pins the kernel's parameter names/types/qualifiers against the source with a
 mutation test. The host reference (`crates/sparkflash-kernels/src/lm_head_reduce_ref.rs`) is the
@@ -2064,3 +2066,72 @@ released-model token claim).
 token plus the claim/refusal status, with the host assembly of D32/D34 kept as the declared
 fallback; the comparison class is bit-exact, not a tolerance, so a window mismatch is a finding
 against this kernel rather than a widened bar.
+
+## D36 — The deferred sequence's position-causal CSA2 attention entry (flash_mla_csa2_seq_sm121), pinned before any window
+
+**Decision.** Add `kernels/flash_mla_csa2_seq_sm121.cu` as a separate entry for the extended
+`start_pos > 0` sequence path, leaving `kernels/flash_mla_csa2_sm121.cu`, its 60,792 B /
+`5bfee4c7...` pin and the b31/b33/b39/b40 evidence untouched. The sequence entry is the base
+format-2 union body with one semantic change: indexer stage 1 is **position-causal**. Blocks whose
+first token is past the query publish `block_scores = -FLT_MAX`, `block_best = 0`; a reachable
+block scans only slots with `token <= position`; the strict-greater tie rule and the five-step
+warp reduction order are unchanged. The attention arithmetic (window rows oldest-first, compressed
+selected ids attended only when `candidate <= position`, sink in the denominator after the max,
+one f32 three-pass softmax, bf16 out) is the base kernel's, copied not re-derived.
+
+**Why it is needed, stated honestly.** The b45 sequence fail (`body_launches=40 expected=120
+positions=3 device_position_0_body=40 other_position_bodies=0`; log
+`window-b45-20261019T090623Z.log`, binary `sparkflash_m3c_c4c_review_seq2` /
+`5af95810...`, exit 1 at 2026-10-19T09:10:45Z) is the c4a-2 **call-site guard** in
+`crates/sparkflash-cli/src/attention_device.rs::attention()`, not a math gap: m8's released
+position-129 fixture (128 window rows, 65 compressed ids) already passed its device-vs-host twin.
+The genuine new requirement is the causal indexer, because a candidate selection built from
+`block_best` must not see future tokens. The separate entry also gives the p0 path a byte-identity
+ratchet instead of reusing an artifact whose provenance is pinned to other windows.
+
+**ABI and bookkeeping.** Same 19-word argument list as the base entry, pinned by
+`crates/sparkflash-kernels/src/flash_mla_csa2_seq_launch.rs` against the source (`PARAMS`,
+`declaration_matches`, mutation test) with grid `(64, 1, 1)` x `256` threads and the stage-2
+`blockIdx.y == 0` guard. The entry has its own `cuda_driver::KernelId` variant
+(`FlashMlaCsa2Seq`), loaded through `Cuda::load_kernel`; `REQUIRED_KERNELS` stays 9 and the
+frozen six-kernel `m4_abi::KERNELS` array (D26) is untouched. The baseline manifest is now
+**13 entries / 12 `KernelId` variants** (this is the 13th; the reduce of D35 is the 12th), and
+`PROBED_KERNELS`, both baseline scripts, `baseline.rs` and `tests/kernel_baseline.rs` agree on
+13. `flash_mla_csa2_sm121` still deliberately has no `KernelId`.
+
+**Indexer split contract.** Inside one launch, the two query heads of an index head split the HSI
+pool (even head -> even blocks, odd head -> odd blocks), and with 64 heads the 32 index-head pairs
+write the same `block_scores`/`block_best` arrays - a documented race that stage 2 does not read.
+Any consumer, including the candidate-selection step and m20, must use a deterministic launch; m20
+checks the pool at grid `(2, 1, 1)` (head pair 0), the configuration m7's stage-2 self-check uses.
+
+**Pin and CPU-side evidence (all before any window).** nvcc V13.0.88 / CUDA 13.0.3 / sm_121a:
+`flash_mla_csa2_seq_sm121` cubin **38,080 B**, sha256
+`f6dfc738a7ad867adf040384f194812337301aa888cc486d4a60923772ba28c3`,
+`ptx_membar_lines=0`; PTX 1,673 lines, 0 `membar`, 61 `fma.rn`, 56 `ld.global`, 40
+`shfl.sync`, 0 `atom`. CPU-side: new `mla_ref::indexer_block_scores` (position-causal stage-1
+reference for one index head, kernel reduction order, empty blocks `(-f32::MAX, 0)`) with tests
+for the mask at positions 0 and 9 and the lowest-token tie rule. The m20 harness
+(`examples/m20_csa2_sequence.rs`) is the per-position twin: 50 checks over synthetic declared
+operands at positions `0, 1, 2, 129..=137`, comparing attention to
+`mla_ref::attention_with_sink_union` at the 2B bar, the indexer to the causal reference (tokens
+exact, scores at the bar), determinism, the `p+2` selected-id exclusion, and the position-0
+new-vs-old byte identity. It was built and staged (aarch64 binary sha256 `c2b67d85...`, cubins as above) and **window b50
+measured it cleanly: PASS, 50 of 50 checks** at pin 38,080 B / `f6dfc738...` - union attention at positions
+0, 1, 2 and 129..=137 within the 2B bar (max abs delta 1.95e-3 / 4.88e-4), causal indexer worst
+score delta 0.0 with every best token exact, determinism, the p+2 selected-id exclusion, and the
+**position 0 new-vs-old out[] byte identity (65,536 bytes identical)**. The window record is quoted
+verbatim in `docs/build/phase3-csa2-sequence.md` section 8; b50 log
+`window-b50-20261019T094959Z.log` sha256 `531c6ec7...`, report 17,879 B sha256 `d95b6292...`
+(`runs50/m20-csa2-sequence.log` sha256 `ced4a399...`). Window b48 printed the same checks but is
+**contaminated and superseded** - engine-dev started an overlapping window (b49) and two GPU clients
+raced the vLLM stop/restart loop - so b48 is not the record and is not a rescue; it is retained as
+history in the page's section 8.1.
+
+**Consequence.** Engine-dev can extend the c4a-2 call site per position using this pinned entry.
+The position-0 ratchet measured clean **at format 2**, so the old entry does **not** need to be kept
+at position 0 for format-2 calls; the sequence entry NaN-refuses formats 0 and 1, so a position-0
+call in the released window-only format still needs the base entry. The measured fallback remains
+available if a later codegen change breaks the identity (measured, never silent mixing). `REQUIRED_KERNELS` is bumped only when the wiring is measured. Nothing here
+claims the served forward pass, the chain, a token, timing, the top-512 selection, rope, or the b45
+position-0 token mismatch, which is engine-dev's first-step state issue.

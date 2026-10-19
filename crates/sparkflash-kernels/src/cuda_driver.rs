@@ -179,11 +179,14 @@ pub enum KernelId {
     /// lm_head_reduce_sm121: the device block reduction and argmax over the four certified-head
     /// shard outputs.
     LmHeadReduce,
+    /// flash_mla_csa2_seq_sm121: the deferred sequence's position-causal CSA2 attention entry, the
+    /// start_pos > 0 path the c4a-2 call-site guard currently denies.
+    FlashMlaCsa2Seq,
 }
 
 impl KernelId {
     /// Every kernel the shared driver owns, in the order of this enum.
-    pub const ALL: [KernelId; 11] = [
+    pub const ALL: [KernelId; 12] = [
         KernelId::MegaMhcBf16,
         KernelId::Mxfp8Dense,
         KernelId::Mxfp8WoA,
@@ -195,6 +198,7 @@ impl KernelId {
         KernelId::RoutedGateUp,
         KernelId::RmsNorm,
         KernelId::LmHeadReduce,
+        KernelId::FlashMlaCsa2Seq,
     ];
 
     /// The cubin symbol of this kernel. Private: callers name the enum, never the symbol.
@@ -211,6 +215,7 @@ impl KernelId {
             KernelId::RoutedGateUp => "routed_gate_up_sm121",
             KernelId::RmsNorm => "rmsnorm_sm121",
             KernelId::LmHeadReduce => "lm_head_reduce_sm121",
+            KernelId::FlashMlaCsa2Seq => "flash_mla_csa2_seq_sm121",
         }
     }
 
@@ -235,13 +240,16 @@ impl KernelId {
             KernelId::RoutedGateUp => &["routed_gate_up_sm121"],
             KernelId::RmsNorm => &["rmsnorm_sm121"],
             KernelId::LmHeadReduce => &["lm_head_reduce_sm121"],
+            KernelId::FlashMlaCsa2Seq => &["flash_mla_csa2_seq_sm121"],
         }
     }
 
     /// Maps a cubin file name (the symbol or a documented alias) to the kernel.
     ///
     /// `flash_mla_csa2_sm121` is deliberately absent: that kernel is loaded through
-    /// `cuda_harness::load_flash_mla`, which owns its symbol, so it has no `KernelId`.
+    /// `cuda_harness::load_flash_mla`, which owns its symbol, so it has no `KernelId`. The
+    /// deferred sequence entry IS here: it is a separate cubin with its own symbol, and the call
+    /// site resolves it like any other shared-driver kernel.
     #[must_use]
     pub fn from_cubin_name(name: &str) -> Option<KernelId> {
         KernelId::ALL

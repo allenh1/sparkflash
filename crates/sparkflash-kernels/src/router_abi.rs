@@ -226,9 +226,9 @@ mod tests {
             expected,
             "the manifest entry must be the pinned cubin"
         );
-        // The header count and toolkit are part of the same claim: twelve entries, this toolkit.
+        // The header count and toolkit are part of the same claim: thirteen entries, this toolkit.
         assert!(
-            BASELINE.contains("twelve baseline kernels"),
+            BASELINE.contains("thirteen baseline kernels"),
             "the manifest header must say twelve"
         );
         assert!(BASELINE.contains(&format!("nvcc_release={TOOLKIT_RELEASE}")));
