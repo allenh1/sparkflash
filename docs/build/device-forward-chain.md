@@ -367,12 +367,13 @@ Criterion 1 is "prefill of a prompt over 128 tokens and at least 8 decode steps,
 reproduced against the reference" (`roadmap-to-serving.md` section 5.5 item 1). The chain claims it
 only when **all** hold in one run.
 
-**Status (2026-10-19): NOT claimed, still OPEN.** The hybrid-sequence path is stage-faithful but
-numerically FP8-native against a f32 reference (position 0 predicts 320 where the reference predicts
-201; head input differs by 0.608), and the first criterion-shaped attempt (b62) was aborted at
-131/138 positions on a per-position memory defect (~0.8 GB/position, RSS 121 GB). The 138-position
-run is blocked until that fix is measured flat and the precision/criterion question is decided; the
-full measured record is the b55-b62 subsection in section 7 and [DECISIONS.md](../DECISIONS.md) D37.
+**Status (2026-10-19): NOT claimed, still OPEN, and now measured FAILING.** The hybrid-sequence path
+is stage-faithful but numerically FP8-native against a f32 reference: the first complete
+criterion-shaped prefill (b67) reaches position 129 and predicts **8060** where the exactly-reproduced
+fixture requires **491**, and its first decode step then stops on a missing embed-row seam for the
+generated token (the decode steps cannot run until that seam is closed). Memory is fixed (b66/b67:
+RSS flat at ~18.87 GB) and the b55-b62/b66/b67 records are in section 7; the precision-versus-criterion
+decision is [DECISIONS.md](../DECISIONS.md) D37.
 
 The PASS definition is:
 
@@ -1560,6 +1561,50 @@ attention path against a dequantised-weight f32 reference. On that arithmetic, e
 parity is not attainable without a precision-first activation path or a redefined criterion; that is
 a user decision, not an implementer one, and no maths was changed. Criterion 1 stays OPEN and the
 hybrid-sequence MR stays unmerged until that decision and the memory fix.
+
+
+**b66 (4d12492) - fixture validity, memory fix and stage-aligned twins.** Three results.
+(i) The fixture is **valid**: after the reference prefill the live in-process f32 reference
+reproduces it exactly (`reference vs fixture: position=129 reference_token=491 fixture_token=491
+equal=true` ... `position=137 ... 4341 ... equal=true`, `reference vs fixture: positions=9
+all_equal=true`, reference wall_ms=614382), so the divergence is the device chain, not a stale
+fixture.
+(ii) The memory defect is **closed**: the routed-expert cache bypass keeps RSS at ~18.87 GB after
+position 0 and the per-position deltas are zero or page-cache noise (`rss_delta_kib=0`).
+(iii) The **stage-aligned twin** supersedes b57's boundary verdict: layer-0 post-attention is
+`9627/20480 max_abs_diff=3.120759e-2` and layer-0 host FFN Y is `4936/5120
+max_abs_diff=1.989301e-2`, so **layer 0 is not 0.5 off** and `residual first divergence: position=0
+layer=0` in b57 was the deferred-epilogue stage-offset artifact, not a numerical finding. The (d)
+layer-1-entry-vs-`residual_out(0)` line is Engram-contaminated (1.289867e0) because the provider
+applies Engram before it returns the entry. The router kernel matches its own BF16 host exactly
+(`scores_max_abs 5.96e-8`), layer 1 is only a tie-**order** swap (same six experts), and layer 14 is
+a real expert-**set** flip (device `[166,98,35,26,304,227]` vs reference `[166,98,35,74,26,205]`,
+`scores_max_abs=1.944607e-1`). So a discrete routing mechanism is real, but it starts at or before
+layer 14; the first set-flip layer is still owed by the d923906 refinement.
+
+**b67 (4d12492) - the first complete criterion-shaped prefill: measured FAIL, then the decode seam
+stops it.** One 130+8 run over 131 of 138 positions: memory stayed flat (`sequence memory:` deltas
+within page-cache noise, RSS 18.87 GB, `position=130 ... rss_delta_kib=11684`) and the fixture was
+reconfirmed in the same run (`reference vs fixture: positions=9 all_equal=true`). The chain reached
+position 130 in 1,177,425 ms (~9 s per position, `projected_chain_full_s=1240.3`); the attention
+partial totals are `projection_launches=26200 body_launches=5240 staging_ms=18790
+projection_us=69779207 body_us=1523009 staged_matrix_bytes=664113408000 host_bytes=1750529200`.
+Two hard results:
+- **Criterion 1 fails on this arithmetic at the first compared position.** Position 129 is
+  `head A/B: position=129 host_top1=8060 host_top5=[8060:19.415479660, 67:17.912334442,
+  16187:17.509645462, 3108:17.090551376, 71484:16.961109...]`, i.e. the device token is **8060**, not
+  the fixture's **491**; position 130 agrees with itself (8060 again).
+- **The decode seam cannot embed a generated token.** The run then aborts with `c4a-2 chain abort:
+  hybrid sequence: sequence embedding: no staged embed row for token 8060`: the embedding staging
+  only holds `prompt_ids` plus the reference decode tokens, so a device-generated decode token has no
+  staged row and the 8 decode steps cannot run at all. This is a wiring defect, not memory and not
+  numerics, and it must be fixed (an on-demand host row read for the fed token, which keeps the
+  declared host embedding seam) before positions 130..137 can be measured.
+
+Consequently the b55-b62 evidence is **not** "unmeasured": the prefill path is now measured end to
+end, it is stage-faithful, and it diverges from an exactly-reproduced fixture. Remaining work is
+ordered: (1) close the decode embedding seam so the 129..137 table exists; (2) the user's precision
+versus criterion decision (D37); (3) the router refinement (first set-flip layer, BF16 control).
 
 **Reference note.** The deployed vLLM on the cluster serves a different checkpoint from ours
 ([DECISIONS.md](../DECISIONS.md) D38), so its tokens are not a parity target for this fixture.

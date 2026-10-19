@@ -2166,15 +2166,28 @@ current arithmetic without (a) a precision-first activation path (higher-precisi
 the attention projections and the router, at a throughput and memory cost) or (b) a redefined
 criterion (a same-arithmetic reference or a tolerance-based acceptance). Both are user decisions.
 
-**Also blocking.** The criterion-shaped b62 run (130 prompt, 8 decode) was **aborted at 131/138
-positions** because host memory grew about 0.8 GB per position (MemAvailable 102.9 GB at position 1
-to 2.29 GB at position 128; RSS 121 GB). It must be recorded as ABORTED with that named defect, never
-as a criterion result. A 138-position run is impossible until the per-position retention is fixed and
-the fix is measured with the per-position `sequence memory:` deltas.
+**Now measured, not just suspected.** The first criterion-shaped run b62 was **aborted at 131/138
+positions** because host memory grew about 0.8 GB per position (RSS 121 GB); b66/b67 then closed that
+defect (RSS flat at ~18.87 GB over 131 positions) and produced the measured verdict:
+
+- the fixture is valid: the live f32 reference reproduces all nine fixture tokens exactly
+  (`reference vs fixture: positions=9 all_equal=true`, wall_ms 614382 / 592786), so this is a device
+  divergence;
+- **criterion 1 fails at the first compared position**: position 129's device top-1 is 8060
+  (value 19.415479660) where the fixture requires 491; b67 reaches position 130 in 1,177,425 ms
+  (~9 s per position, projected full 1833 s);
+- the **decode steps cannot run at all** yet: the run aborts with `c4a-2 chain abort: hybrid
+  sequence: sequence embedding: no staged embed row for token 8060`, because the embedding staging
+  holds only the prompt ids plus the reference decode tokens. Closing that seam (an on-demand host
+  row read for the fed token, which keeps the declared host embedding seam) is the next wiring task;
+- the stage-aligned twin places the numeric origin where b58-b60 said: layer 0 is small
+  (post-attention 3.12e-2, host FFN Y 1.99e-2) and the drift accumulates across the 40 layers; b57's
+  `residual first divergence: position=0 layer=0` was a stage-offset artifact and is superseded.
 
 **Consequence.** `REQUIRED_KERNELS` stays 9, the kernel work already merged (D34-D36) is unaffected,
-and the next criterion attempt waits on (1) the memory fix measured flat and (2) the user's decision
-on the precision/criterion question.
+and the remaining work is ordered: (1) close the decode embedding seam and measure positions 130..137;
+(2) the user's precision-versus-criterion decision above. The hybrid branch stays unmerged and
+criterion 1 stays OPEN.
 
 ## D38 — vLLM token parity is only meaningful on the same weights; the deployed vLLM serves a different checkpoint
 

@@ -1007,11 +1007,13 @@ rows with unpadded release bytes are 18.37 / 12.35 / 11.30 GB.
   is [device-forward-chain.md](device-forward-chain.md) section 7 (c4c, c4c-norm, b55-b62 sequence
   status), [phase3-lm-head-reduce.md](phase3-lm-head-reduce.md) and
   [phase3-csa2-sequence.md](phase3-csa2-sequence.md) section 10.
-- **The hybrid-sequence path is not ready and criterion 1 stays OPEN** (D37): the chain is
-  stage-faithful but not token-parity with the f32 reference (position 0 predicts 320 against the
-  reference's 201, head input differs by 0.608, attributed to the FP8-native activation
-  quantisation), and the first criterion-shaped 130+8 attempt (b62) was aborted at 131/138 positions
-  on a per-position memory defect (~0.8 GB/position, RSS 121 GB). The branch stays unmerged.
+- **The hybrid-sequence path is not ready and criterion 1 stays OPEN, now measured failing** (D37):
+  the memory defect is closed (b66/b67: RSS flat at ~18.87 GB over 131 positions) and the fixture is
+  confirmed valid (live f32 reference reproduces all nine tokens exactly), but the first complete
+  criterion-shaped prefill (b67) predicts **8060** at position 129 where the fixture requires **491**,
+  and its first decode step aborts on a missing embed-row seam for the generated token
+  (`no staged embed row for token 8060`), so positions 130..137 cannot be measured until that seam is
+  closed. The branch stays unmerged.
 - **The deployed vLLM is not a parity target** (D38): it serves the `...-heretic` snapshot
   `12d58ad0...`, not the released snapshot `1bae0e10...` the fixture and the device engine use, and
   its greedy completions are degenerate.

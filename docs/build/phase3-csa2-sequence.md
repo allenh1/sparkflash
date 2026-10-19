@@ -433,3 +433,11 @@ The full sequence-path record, including the head A/B result that exonerates the
 is in [device-forward-chain.md](device-forward-chain.md) section 7. This page claims the kernel and
 the measured harness only; criterion 1 stays OPEN ([DECISIONS.md](../DECISIONS.md) D37).
 
+
+Measured follow-ups (b66/b67, same day): the fixture was reconfirmed (`reference vs fixture:
+positions=9 all_equal=true`) and the memory defect was closed, but the first complete prefill reaches
+position 129 with device token **8060** against the fixture's **491** and then aborts on
+`sequence embedding: no staged embed row for token 8060` - the decode steps cannot run until the
+embedding seam can stage an arbitrary generated token. Criterion 1 therefore fails on the current
+arithmetic and is blocked on that seam; see [DECISIONS.md](../DECISIONS.md) D37 for the measured
+verdict and the precision-versus-criterion decision.
