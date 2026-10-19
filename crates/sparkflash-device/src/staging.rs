@@ -573,6 +573,191 @@ impl LayerZeroStaging {
     }
 }
 
+/// The staged mHC tensors for one backbone layer, without the layer-0 embedding rows.
+///
+/// c3 re-stages one layer at a time through the same sixteen-buffer plan the layer-0 arm uses. The
+/// layer is explicit so a report cannot confuse a layer-N predictor with the layer-0 one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayerStaging {
+    /// The backbone layer whose predictor, base, scale and norm are staged.
+    pub layer: usize,
+    /// The released 24 x 4d predictor in kernel B/A/C row order.
+    pub predictor: Vec<f32>,
+    /// The released hc_attn_base in checkpoint row order.
+    pub hc_base: [f32; PREDICTOR_ROWS],
+    /// The released hc_attn_scale in checkpoint order (pre, post, comb).
+    pub hc_scale: [f32; 3],
+    /// attn_norm.weight widened to f32.
+    pub attn_norm: Vec<f32>,
+    /// hc_attn_base rearranged into the kernel's row order.
+    pub hc_base_kernel: [f32; PREDICTOR_ROWS],
+    /// One source-provenance digest per raw tensor, as read.
+    pub digests: Vec<StagedTensor>,
+    /// One digest per exact host vector the staging path passes to copy_htod.
+    pub buffer_digests: Vec<StagedTensor>,
+}
+
+impl LayerStaging {
+    /// Reads one layer's released mHC tensors through a WeightSource.
+    ///
+    /// # Errors
+    /// [StagingError] on a missing tensor, a dtype/shape mismatch, a short read, or a layer other
+    /// than 0 with embed positions requested.
+    pub fn from_source(
+        source: &dyn WeightSource,
+        layer: usize,
+        positions: &[usize],
+    ) -> Result<Self, StagingError> {
+        if !positions.is_empty() && layer != 0 {
+            return Err(StagingError::Spec {
+                name: format!("layers.{layer} embedding rows"),
+                expected: "no embed rows outside layer 0".to_string(),
+                found: format!("{} positions", positions.len()),
+            });
+        }
+        let prefix = format!("layers.{layer}");
+        let fn_name = format!("{prefix}.hc_attn_fn");
+        let base_name = format!("{prefix}.hc_attn_base");
+        let scale_name = format!("{prefix}.hc_attn_scale");
+        let norm_name = format!("{prefix}.attn_norm.weight");
+        let fn_bytes = read_checked(
+            source,
+            &fn_name,
+            DType::F32,
+            &[PREDICTOR_ROWS, HC_MULT * HIDDEN],
+        )?;
+        let released_fn = bytes_to_f32(&fn_name, &fn_bytes)?;
+        let mut predictor = vec![0.0f32; released_fn.len()];
+        released_predictor_into_kernel_rows(&released_fn, &mut predictor);
+        let base_bytes = read_checked(source, &base_name, DType::F32, &[PREDICTOR_ROWS])?;
+        let base_values = bytes_to_f32(&base_name, &base_bytes)?;
+        let hc_base: [f32; PREDICTOR_ROWS] =
+            base_values
+                .as_slice()
+                .try_into()
+                .map_err(|_| StagingError::Spec {
+                    name: base_name.clone(),
+                    expected: format!("{PREDICTOR_ROWS} f32 values"),
+                    found: format!("{} f32 values", base_values.len()),
+                })?;
+        let scale_bytes = read_checked(source, &scale_name, DType::F32, &[3])?;
+        let scale_values = bytes_to_f32(&scale_name, &scale_bytes)?;
+        let hc_scale: [f32; 3] =
+            scale_values
+                .as_slice()
+                .try_into()
+                .map_err(|_| StagingError::Spec {
+                    name: scale_name.clone(),
+                    expected: "3 f32 values".to_string(),
+                    found: format!("{} f32 values", scale_values.len()),
+                })?;
+        let norm_spec = source
+            .spec(&norm_name)
+            .map_err(|error| source_error(&norm_name, error))?;
+        if norm_spec.shape != [HIDDEN] || !matches!(norm_spec.dtype, DType::F32 | DType::BF16) {
+            return Err(StagingError::Spec {
+                name: norm_name.clone(),
+                expected: format!("F32 or BF16 [{HIDDEN}]"),
+                found: format!("{} {:?}", norm_spec.dtype.name(), norm_spec.shape),
+            });
+        }
+        let norm_bytes = source
+            .read(&norm_name)
+            .map_err(|error| source_error(&norm_name, error))?;
+        let norm_expected = norm_spec.dtype.storage_bytes(HIDDEN);
+        if norm_bytes.len() != norm_expected {
+            return Err(StagingError::Bytes {
+                name: norm_name.clone(),
+                expected: norm_expected,
+                found: norm_bytes.len(),
+            });
+        }
+        let attn_norm = if norm_spec.dtype == DType::F32 {
+            bytes_to_f32(&norm_name, &norm_bytes)?
+        } else {
+            bytes_to_bf16_f32(&norm_name, &norm_bytes)?
+        };
+        let hc_base_kernel = bias_into_kernel_rows(&hc_base);
+        let digests = vec![
+            digest(&fn_name, &fn_bytes),
+            digest(&base_name, &base_bytes),
+            digest(&scale_name, &scale_bytes),
+            digest(&norm_name, &norm_bytes),
+        ];
+        let buffer_digests = vec![
+            digest(
+                &format!("buffer predictor <- {fn_name}"),
+                &f32_bytes(&predictor),
+            ),
+            digest(
+                &format!("buffer hc_scale <- {scale_name}"),
+                &f32_bytes(&hc_scale),
+            ),
+            digest(
+                &format!("buffer hc_base <- {base_name}"),
+                &f32_bytes(&hc_base_kernel),
+            ),
+            digest(
+                &format!("buffer rms_weight <- {norm_name}"),
+                &f32_bytes(&attn_norm),
+            ),
+        ];
+        Ok(Self {
+            layer,
+            predictor,
+            hc_base,
+            hc_scale,
+            attn_norm,
+            hc_base_kernel,
+            digests,
+            buffer_digests,
+        })
+    }
+
+    /// The retained host bytes of the staged tensors.
+    #[must_use]
+    pub fn host_bytes(&self) -> u64 {
+        let mut bytes = 0u64;
+        bytes += (self.predictor.len() * 4) as u64;
+        bytes += (self.hc_base.len() * 4) as u64;
+        bytes += (self.hc_scale.len() * 4) as u64;
+        bytes += (self.attn_norm.len() * 4) as u64;
+        bytes += (self.hc_base_kernel.len() * 4) as u64;
+        bytes
+    }
+
+    /// The exact device buffer bytes this stage requests.
+    #[must_use]
+    pub fn device_buffer_bytes(&self) -> u64 {
+        MhcBufferPlan::LAYER_ZERO.device_bytes() as u64
+    }
+
+    /// The provenance lines a stage report prints before any device call.
+    #[must_use]
+    pub fn provenance_lines(&self) -> Vec<String> {
+        let mut lines = vec![format!(
+            "staged layer-{} mHC: predictor {} f32 (released [24, 4*d] -> kernel B/A/C order, no averaging), hc_attn_base {} f32, hc_attn_scale {:?}, attn_norm {} f32 (no embed rows)",
+            self.layer,
+            self.predictor.len(),
+            self.hc_base.len(),
+            self.hc_scale,
+            self.attn_norm.len()
+        )];
+        for tensor in &self.digests {
+            lines.push(format!(
+                "source tensor {}: {} bytes, sha256 {}",
+                tensor.name, tensor.bytes, tensor.sha256
+            ));
+        }
+        for tensor in &self.buffer_digests {
+            lines.push(format!(
+                "buffer tensor {}: {} bytes, sha256 {}",
+                tensor.name, tensor.bytes, tensor.sha256
+            ));
+        }
+        lines
+    }
+}
 fn source_error(name: &str, error: WeightError) -> StagingError {
     StagingError::Source {
         name: name.to_string(),

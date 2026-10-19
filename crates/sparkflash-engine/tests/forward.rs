@@ -18,77 +18,13 @@
 //! values, so a fixed seed is a fixed model and a different seed is a different one).
 
 use sparkflash_engine::config::ModelConfig;
-use sparkflash_engine::dtype::DType;
 use sparkflash_engine::forward::{InferenceEngine, Sampling, SequenceState};
 use sparkflash_engine::linalg::EngineError;
-use sparkflash_engine::tensor::{TensorPlan, TensorSpec};
-use sparkflash_engine::weights::{WeightError, WeightSource};
+use sparkflash_engine::tensor::TensorPlan;
 
-/// A finite, plan-shaped weight source: the plan's names and shapes, every tensor as finite f32.
-///
-/// The plan's dtype is reported as f32 for every tensor, which is exactly what [WeightSource::read]
-/// writes, so a caller that decodes by the source's spec sees the values it was sent. Values are
-/// small (0.01 ..= 0.09), deterministic, and vary with the seed and the tensor's name, so two seeds
-/// are two different models and a mis-indexed read is visible rather than masked by uniform weights.
-struct FiniteSource {
-    specs: Vec<TensorSpec>,
-    seed: u64,
-}
+mod common;
 
-impl FiniteSource {
-    /// The source for `plan`, at `seed`.
-    fn from_plan(plan: &TensorPlan, seed: u64) -> FiniteSource {
-        FiniteSource {
-            specs: plan.specs().to_vec(),
-            seed,
-        }
-    }
-}
-
-/// A stable per-name offset, so two tensors of the same shape are not identical.
-fn name_salt(name: &str) -> u64 {
-    name.bytes().fold(0u64, |acc, byte| {
-        acc.wrapping_mul(31).wrapping_add(u64::from(byte))
-    })
-}
-
-impl WeightSource for FiniteSource {
-    fn names(&self) -> Vec<String> {
-        self.specs.iter().map(|spec| spec.name.clone()).collect()
-    }
-
-    fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
-        match self.specs.iter().find(|spec| spec.name == name) {
-            Some(spec) => Ok(TensorSpec {
-                dtype: DType::F32,
-                ..spec.clone()
-            }),
-            None => Err(WeightError::Missing {
-                name: name.to_string(),
-            }),
-        }
-    }
-
-    fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
-        let elements = usize::try_from(self.spec(name)?.elements()).expect("a test tensor fits");
-        let salt = name_salt(name);
-        let mut bytes = Vec::with_capacity(elements * 4);
-        for index in 0..elements {
-            // A per-element mix, deliberately not a per-row one: with the high bits of the index the
-            // pattern would barely change across a row, two rows could produce exactly equal dot
-            // products, and the argmax would then be a tie that hides a mis-indexed read.
-            let mixed = (index as u64)
-                .wrapping_add(salt)
-                .wrapping_add(self.seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-            let hashed = (mixed ^ (mixed >> 13)).wrapping_mul(0x2545_f491_4f6c_dd1d);
-            // Strictly positive and at least 0.01, so nothing divides by a zero scale, and 256 values
-            // deep so neighbours differ.
-            let value = 0.01 + 0.000_1 * (hashed >> 56) as f32;
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        Ok(bytes)
-    }
-}
+use common::FiniteSource;
 
 /// An engine over the plan of `config`, driven by the finite source at `seed`.
 fn engine(config: &ModelConfig, seed: u64, limit: usize) -> InferenceEngine {

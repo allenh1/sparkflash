@@ -18,13 +18,18 @@ HTTP wiring, throughput) is out of scope except where it changes the answer; sec
 memory consequence that makes the single-node chain look different from a served deployment.
 
 Short answer: **no end-to-end device token exists.** The per-stage kernels are pinned, most are
-individually measured on 2026-10-18, and the gate/up kernel and the M2 session are now on main, but
-no chain executes a device stage sequence and no token exists: `sparkflash-device` has the M3-a
-host-only plan/ledger skeleton (`sparkflash device-chain --plan-only`, `chain_execution=false`;
-the window arm wires one MhcEntry stage), and the m8 harness that comes closest explicitly reports
-"device token NOT PRODUCED". The one released device execution is the one-layer, one-position
-MhcEntry window arm (b19, section 3.4/M3-c), which is a c2 record, not a chain or token. Phase 2
-exit criterion 1 remains **OPEN** ([device-forward-chain.md](device-forward-chain.md) section 4.3).
+individually measured on 2026-10-18, and the gate/up kernel and the M2 session are now on main. The
+c3 chain (window b22) executes one device MhcEntry per layer and produces a hybrid token, but it
+still has 8 host stand-ins per layer, so that token is not a device-token result. `sparkflash-device`
+still has the M3-a host-only plan/ledger skeleton (`sparkflash device-chain --plan-only`,
+`chain_execution=false`), and the m8 harness explicitly reports "device token NOT PRODUCED".
+The one released one-layer device execution is the one-position
+MhcEntry window arm (b19, section 3.4/M3-c), which is a c2 record, not a chain or token. Window b22
+ran the c3 hybrid-token arm (40 layers, one MhcEntry per layer, in-process reference-forward token
+comparison) and passed with reference_id=5 hybrid_id=5, exit 0; that is **chain-wiring parity**, not
+a device-token result, because 8 stages per layer are still host stand-ins and the residual is
+BF16-staged per layer. Phase 2 exit criterion 1 remains **OPEN**
+([device-forward-chain.md](device-forward-chain.md) section 4.3).
 Section 3 lists the remaining work in dependency order.
 
 Unit note: the measured device total is **124,610 MiB** `cuDeviceTotalMem_v2`
@@ -517,7 +522,10 @@ No such run exists. The closest measured artifacts are:
    down/combine, mHC) — each real, none of them a chain.
 
 So the answer to the one question is: **the pieces are measured; the forward pass is not wired; no
-token has been produced by the device path; criterion 1 is OPEN.**
+token has been produced by the device path; criterion 1 is OPEN.** Window b22 ran the c3
+hybrid-token arm over the 40-layer chain and compared against the in-process reference token (both
+id 5, exit 0), but every layer still has one device stage and eight host stand-ins, so that token is
+a chain-wiring parity result, not a device-token result.
 
 Criterion 1's token row is exact: prefill 130 positions (>128) with next token **491**, then at least
 8 decode steps producing **367, 201, 80, 3302, 201, 54, 201, 4341** exactly, compared against the
@@ -636,8 +644,40 @@ capture exact 5,120/5,120, FP8 codes exact 5,120/5,120 bytes, E8M0 scales exact 
 and `inv_rms` 1.764297e-5 / 37 ULP, all within their declared bars. BAR is used only where a
 declared m11 bar exists; X/X_l/capture/codes/scales are exact. The eight device-status stages remain
 host stand-ins: the arm accounted 8 host seams and 887,344 B of host work, explicitly not device
-work. This is still one layer, one position and no token; c3 is not started and criterion 1 stays
-**OPEN**.
+work. This is still one layer, one position and no token; c3 is the b22 record below and criterion
+1 stays **OPEN**.
+
+**M3-c c3 — first 40-layer hybrid token, window b22 (PASS, chain-wiring only).** Window b22 ran
+`sparkflash_m3c_f4446e7_aarch64` (sha256
+`ced4a090d41c32bf55f10c99269faca3260181263b9a979446a83fe2167f5d5a`, from `f4446e7`), cubin
+`e21293e3...`, exit 0; logs `window-b22-20261019T033707Z.log` and
+`runs22/m3c-hybrid-token0.log`; vLLM stopped and restored. The in-process reference printed
+`reference engine: token_id=5; wall_ms=31458; top5=5: 13.230665207, 201: 12.492528915, 372:
+11.897726059, 30: 11.392500877, 1897: 11.015835762`; the hybrid chain printed `hybrid chain:
+token_id=5; wall_ms=23817; top5=5: 13.206743240, 201: 12.493413925, 372: 11.897836685, 30:
+11.358639717, 1897: 11.019292831`; the comparison was `token comparison: reference_id=5
+hybrid_id=5 exact_equal=true top5_overlap=5`; the verdict was `CHAIN-WIRING token parity: PASS -
+the hybrid chain produced the same token id as the in-process reference engine; this is
+chain-wiring parity, not a device-token claim, and criterion 1 remains OPEN`. Chain totals:
+`layers=40 device_launches=40 device_ms=0 staging_ms=751 host_ms=21219 total_chain_ms=23817
+host_bytes=68358400 cubin_bytes=70312 device_buffer_bytes=2064352`; progress at layers 8/16/24/32/40
+had chain_elapsed 5017/9566/13944/18339/22692 ms.
+
+`device_ms=0` is the sum of the per-layer host wall-clock intervals that start after the A
+copy: BF16 X write, MhcEntry launch and five read calls issuing six device-to-host copies (entry
+capture plus 24 coefficients in one call, X, `1/rms`, FP8 codes, E8M0 scales), integer-truncated.
+Every interval was below 1 ms, so the sum is 0. The A row copy happens before `device_started` and
+is in neither `device_ms` nor `staging_ms`. It is not a CUDA-event duration and does not mean no
+device work occurred: the 40 launches are accounted by `device_launches=40`, by the per-layer
+`ledger layer NN:` line (`mhc_entry` [device identity seam]) and the per-layer `layer NN:` line
+(capture/codes/scales and coefficient evidence); c3 builds no `ChainLedger`/`ExecutionEvidence` and
+prints no separate launch-status line. `staging_ms=751` and `host_ms=21219` are the staging and
+host-continuation totals. Only `MhcEntry` is device-executed
+per layer; the 8 device-status stages and the head remain host stand-ins/host seams, and the BF16
+residual staging seam makes the chain non-bit-identical to the reference by construction. The
+result is **chain-wiring parity**, not a device token; criterion 1 remains **OPEN**. c3b is
+task-13: defer each layer's `ffn_epilogue` into the next device entry so the real B/C/Y path is
+exercised and the host stand-ins drop 8 -> 7.
 
 **M3-c — first hybrid token (the first real end-to-end run).**
 9. Implement the per-layer order of design 2.2 with the seams of design 3.1, using the existing

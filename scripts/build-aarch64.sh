@@ -34,6 +34,7 @@
 # USAGE
 #   scripts/build-aarch64.sh                 # release binary for sparkflash-cli (the preflight CLI)
 #   scripts/build-aarch64.sh --workspace     # every workspace binary
+#   scripts/build-aarch64.sh --features=cuda # the CLI with its cuda-gated device arms
 #   scripts/build-aarch64.sh --example=m7_layer0   # one example (the M7 layer-0 harness)
 #   scripts/build-aarch64.sh --print-env     # show the resolved toolchain and exit
 #
@@ -69,6 +70,7 @@ PRINT_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --workspace) BUILD_ARGS=(--workspace) ;;
+    --features=*) BUILD_ARGS+=(--features "${arg#--features=}") ;;
     --example=*) BUILD_ARGS=(-p sparkflash-kernels --example "${arg#--example=}") ;;
     --print-env) PRINT_ONLY=1 ;;
     -h|--help) sed -n '2,45p' "${BASH_SOURCE[0]}"; exit 0 ;;

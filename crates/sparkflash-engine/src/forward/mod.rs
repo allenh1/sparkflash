@@ -37,6 +37,7 @@ pub mod mtp;
 
 use crate::config::ModelConfig;
 use crate::forward::boundary::{BoundaryTable, LayerBoundary};
+use crate::forward::layer_zero::{LayerZeroEntry, LayerZeroEntrySource, StageEvent};
 use crate::forward::mhc::Mixes;
 use crate::linalg::{self, EngineError};
 use crate::tensor::TensorPlan;
@@ -330,6 +331,73 @@ impl Scratch {
     }
 }
 
+/// The per-layer provider the hybrid chain calls: the layer, the previous FFN residual and the
+/// previous FFN pre-mix, returning this layer's entry and the residual the host continues from.
+pub type HybridProvider<'a> =
+    dyn FnMut(usize, &[f32], &[f32]) -> Result<HybridEntry, EngineError> + 'a;
+
+/// One hybrid MhcEntry handoff: the engine's entry values plus the residual stream the device left
+/// in X. The X is the BF16-rounded stream the host must continue from; it is not the f32 stream it
+/// handed in.
+#[derive(Debug, Clone)]
+pub struct HybridEntry {
+    /// The device (or host-control) MhcEntry coefficients and normalised attention input.
+    pub entry: LayerZeroEntry,
+    /// The residual stream read back from the kernel's X buffer, `hc_mult * dim` f32 values.
+    pub x: Vec<f32>,
+}
+
+/// One layer of a hybrid chain: the host stages that ran and the residual stream they produced.
+#[derive(Debug, Clone)]
+pub struct HybridLayerTrace {
+    /// The backbone layer.
+    pub layer: usize,
+    /// The trace stages in [crate::forward::layer_zero::LAYER_ZERO_HOST_STAGES] order, plus Engram
+    /// first on the layers that own it.
+    pub stages: Vec<StageEvent>,
+    /// The residual stream after the host mhc_post/ffn_epilogue, `hc_mult * dim` values.
+    pub residual_out: Vec<f32>,
+    /// Host continuation wall time in milliseconds, from the end of the MhcEntry handoff to the end
+    /// of the FFN epilogue.
+    pub host_ms: u64,
+}
+
+/// The result of a one-token hybrid chain: the per-layer traces, the tail stages and the token.
+#[derive(Debug, Clone)]
+pub struct HybridTokenOutput {
+    /// One trace per backbone layer, in order.
+    pub layers: Vec<HybridLayerTrace>,
+    /// The tail stages: final norm, head screen and argmax.
+    pub tail_stages: Vec<StageEvent>,
+    /// The collapsed and final-normed vector the head multiplied.
+    pub head_input: Vec<f32>,
+    /// The raw logits, `vocab_size` values.
+    pub logits: Vec<f32>,
+    /// The greedy token the host argmax selected.
+    pub token: Option<u32>,
+}
+
+fn u64_bytes(values: usize) -> u64 {
+    u64::try_from(values).unwrap_or(u64::MAX).saturating_mul(4)
+}
+
+fn record_stage(
+    stages: &mut Option<&mut Vec<StageEvent>>,
+    stage: &'static str,
+    host_bytes_in: u64,
+    host_bytes_out: u64,
+    note: &'static str,
+) {
+    if let Some(stages) = stages.as_deref_mut() {
+        stages.push(StageEvent {
+            stage,
+            host_bytes_in,
+            host_bytes_out,
+            note,
+        });
+    }
+}
+
 /// Samples one token from `logits`: greedy at temperature 0, Gumbel-max above it.
 ///
 /// The reference samples `argmax(logits / temperature + gumbel_noise)` (model.py:1285-1292), which
@@ -476,6 +544,8 @@ impl InferenceEngine {
                 &mut pre_mix,
                 &mut scratch,
                 start_pos,
+                None,
+                None,
                 row.as_mut(),
             )?;
             if let (Some(table), Some(row)) = (capture.as_deref_mut(), row) {
@@ -543,7 +613,7 @@ impl InferenceEngine {
     /// The shift is the point of single-pass mHC: the attention sublayer mixes the copies with the
     /// previous sublayer's coefficient and leaves this one's behind, which the FFN sublayer then uses
     /// (model.py:972-994).
-    #[allow(clippy::too_many_arguments)] // the reference's own block signature plus the one row a capture may fill; bundling the pass state would hide which buffer a call got wrong.
+    #[allow(clippy::too_many_arguments)] // the reference's own block signature plus the optional hybrid entry and stage recorder; bundling the pass state would hide which buffer a call got wrong.
     fn block(
         &self,
         state: &mut SequenceState,
@@ -552,6 +622,8 @@ impl InferenceEngine {
         pre_mix: &mut [f32],
         scratch: &mut Scratch,
         start_pos: usize,
+        entry: Option<&LayerZeroEntry>,
+        mut stages: Option<&mut Vec<StageEvent>>,
         mut boundary: Option<&mut LayerBoundary>,
     ) -> Result<(), EngineError> {
         let config = &self.config;
@@ -564,45 +636,112 @@ impl InferenceEngine {
             row.push_stream(config, boundary::RESIDUAL_IN, hidden.to_vec())?;
             row.push_mixes(config, boundary::HC_IN_PRE, pre_mix.to_vec())?;
         }
+        record_stage(
+            &mut stages,
+            "dispatch",
+            0,
+            0,
+            "host dispatch of the block; no arithmetic",
+        );
 
-        // The attention sublayer (model.py:972-980).
-        let fn_w = linalg::decode_by_name(source, &format!("{prefix}.hc_attn_fn"), self.limit)?;
-        let scale = linalg::decode_by_name(source, &format!("{prefix}.hc_attn_scale"), self.limit)?;
-        let base = linalg::decode_by_name(source, &format!("{prefix}.hc_attn_base"), self.limit)?;
-        mhc::hc_mixes(
-            config,
-            hidden,
-            &fn_w,
-            &scale,
-            &base,
-            &mut scratch.attn_mixes,
-        )?;
-        if let Some(row) = boundary.as_deref_mut() {
-            row.push_mixes(
+        // The attention sublayer (model.py:972-980). In a hybrid chain the device MhcEntry has
+        // already supplied the normalised attention block input and the 24 attention coefficients;
+        // the host must not recompute either. Otherwise this is the reference entry exactly.
+        let attn_mixes = if let Some(entry) = entry {
+            let mixes = Mixes {
+                pre: entry.pre.clone(),
+                post: entry.post.clone(),
+                comb: entry.comb.clone(),
+            };
+            if let Some(row) = boundary.as_deref_mut() {
+                row.push_mixes(config, boundary::HC_ATTN_PRE, mixes.pre.clone())?;
+                row.push_mixes(config, boundary::HC_ATTN_POST, mixes.post.clone())?;
+                row.push_comb(config, boundary::HC_ATTN_COMB, mixes.comb.clone())?;
+            }
+            record_stage(
+                &mut stages,
+                "mhc_entry",
+                u64_bytes(hidden.len() + mixes.pre.len() + mixes.post.len() + mixes.comb.len()),
+                u64_bytes(entry.pre_attention_hidden.len()),
+                match entry.source {
+                    LayerZeroEntrySource::Device => {
+                        "device MhcEntry handoff: identity step-1 X write (B=I, C=0, Y=0), device H(X_l), capture, codes/scales and 1/rms; host does not recompute the entry"
+                    }
+                    LayerZeroEntrySource::Host => {
+                        "caller-supplied host MhcEntry handoff; host does not recompute the entry"
+                    }
+                },
+            );
+            record_stage(
+                &mut stages,
+                "attn_norm",
+                u64_bytes(entry.pre_attention_hidden.len()),
+                0,
+                "attn_norm is part of the device MhcEntry capture; no separate host normalisation",
+            );
+            scratch.attn_in.copy_from_slice(&entry.pre_attention_hidden);
+            mixes
+        } else {
+            let fn_w = linalg::decode_by_name(source, &format!("{prefix}.hc_attn_fn"), self.limit)?;
+            let scale =
+                linalg::decode_by_name(source, &format!("{prefix}.hc_attn_scale"), self.limit)?;
+            let base =
+                linalg::decode_by_name(source, &format!("{prefix}.hc_attn_base"), self.limit)?;
+            mhc::hc_mixes(
                 config,
-                boundary::HC_ATTN_PRE,
-                scratch.attn_mixes.pre.clone(),
+                hidden,
+                &fn_w,
+                &scale,
+                &base,
+                &mut scratch.attn_mixes,
             )?;
-            row.push_mixes(
-                config,
-                boundary::HC_ATTN_POST,
-                scratch.attn_mixes.post.clone(),
+            if let Some(row) = boundary.as_deref_mut() {
+                row.push_mixes(
+                    config,
+                    boundary::HC_ATTN_PRE,
+                    scratch.attn_mixes.pre.clone(),
+                )?;
+                row.push_mixes(
+                    config,
+                    boundary::HC_ATTN_POST,
+                    scratch.attn_mixes.post.clone(),
+                )?;
+                row.push_comb(
+                    config,
+                    boundary::HC_ATTN_COMB,
+                    scratch.attn_mixes.comb.clone(),
+                )?;
+            }
+            mhc::hc_pre(config, pre_mix, hidden, &mut scratch.attn_in)?;
+            let attn_norm =
+                linalg::decode_by_name(source, &format!("{prefix}.attn_norm.weight"), self.limit)?;
+            linalg::rms_norm(
+                &mut scratch.attn_in,
+                &attn_norm,
+                config.dim,
+                config.norm_eps as f32,
             )?;
-            row.push_comb(
-                config,
-                boundary::HC_ATTN_COMB,
-                scratch.attn_mixes.comb.clone(),
-            )?;
-        }
-        mhc::hc_pre(config, pre_mix, hidden, &mut scratch.attn_in)?;
-        let attn_norm =
-            linalg::decode_by_name(source, &format!("{prefix}.attn_norm.weight"), self.limit)?;
-        linalg::rms_norm(
-            &mut scratch.attn_in,
-            &attn_norm,
-            config.dim,
-            config.norm_eps as f32,
-        )?;
+            record_stage(
+                &mut stages,
+                "mhc_entry",
+                u64_bytes(hidden.len()),
+                u64_bytes(
+                    scratch.attn_in.len()
+                        + scratch.attn_mixes.pre.len()
+                        + scratch.attn_mixes.post.len()
+                        + scratch.attn_mixes.comb.len(),
+                ),
+                "hc_mixes + hc_pre over the hc residual copies",
+            );
+            record_stage(
+                &mut stages,
+                "attn_norm",
+                u64_bytes(scratch.attn_in.len() * 2),
+                u64_bytes(scratch.attn_in.len()),
+                "RMSNorm of the attention block input with the staged attn_norm weight",
+            );
+            scratch.attn_mixes.clone()
+        };
         if let Some(row) = boundary.as_deref_mut() {
             row.push_block_input(
                 config,
@@ -633,6 +772,35 @@ impl InferenceEngine {
         if scratch.attn_out.len() < wide {
             scratch.attn_out.resize(wide, 0.0);
         }
+        scratch.attn_mixes = attn_mixes;
+        record_stage(
+            &mut stages,
+            "attention_projections",
+            u64_bytes(scratch.attn_in.len()),
+            u64_bytes(wide),
+            "q/kv projections over the normalised attention input",
+        );
+        record_stage(
+            &mut stages,
+            "attn_rope",
+            u64_bytes(wide),
+            u64_bytes(wide),
+            "RoPE on the projected q/kv rows",
+        );
+        record_stage(
+            &mut stages,
+            "window_kv",
+            u64_bytes(wide),
+            u64_bytes(wide),
+            "write and read the block's sliding-window KV ring",
+        );
+        record_stage(
+            &mut stages,
+            "attention",
+            u64_bytes(scratch.attn_in.len()),
+            u64_bytes(wide),
+            "reference attention arithmetic over the window KV",
+        );
         attention::attention_forward(
             config,
             layer,
@@ -650,6 +818,13 @@ impl InferenceEngine {
         if let Some(row) = boundary.as_deref_mut() {
             row.push_dense(config, boundary::ATTENTION_OUT, scratch.attn_out.clone())?;
         }
+        record_stage(
+            &mut stages,
+            "attention_output_projection",
+            u64_bytes(wide),
+            u64_bytes(scratch.attn_out.len()),
+            "wo_a + wo_b projection of the concatenated head rows",
+        );
         scratch.residual.copy_from_slice(hidden);
         mhc::hc_post(
             config,
@@ -662,6 +837,18 @@ impl InferenceEngine {
         if let Some(row) = boundary.as_deref_mut() {
             row.push_stream(config, boundary::POST_ATTENTION_HIDDEN, hidden.to_vec())?;
         }
+        record_stage(
+            &mut stages,
+            "mhc_post",
+            u64_bytes(
+                scratch.attn_out.len()
+                    + scratch.residual.len()
+                    + scratch.attn_mixes.post.len()
+                    + scratch.attn_mixes.comb.len(),
+            ),
+            u64_bytes(hidden.len()),
+            "hc_post: attention output mixed back onto the hc residual",
+        );
 
         // The FFN sublayer (model.py:982-994), whose input mix is the attention sublayer's.
         let fn_w = linalg::decode_by_name(source, &format!("{prefix}.hc_ffn_fn"), self.limit)?;
@@ -699,6 +886,59 @@ impl InferenceEngine {
                 &scratch.ffn_in,
             )?;
         }
+        let topk = config.n_activated_experts;
+        let shared_inter = config
+            .moe_inter_dim
+            .saturating_mul(config.n_shared_experts.max(1));
+        record_stage(
+            &mut stages,
+            "moe_router",
+            u64_bytes(scratch.ffn_in.len()),
+            u64_bytes(topk.saturating_mul(8)),
+            "route the normalised FFN input through the reference router",
+        );
+        record_stage(
+            &mut stages,
+            "moe_routing_weight",
+            u64_bytes(topk.saturating_mul(8)),
+            u64_bytes(topk.saturating_mul(12)),
+            "apply the selected experts' routing weights",
+        );
+        record_stage(
+            &mut stages,
+            "moe_gate_up",
+            u64_bytes(scratch.ffn_in.len()),
+            u64_bytes(config.moe_inter_dim.saturating_mul(2)),
+            "routed gate/up branch for the selected experts",
+        );
+        record_stage(
+            &mut stages,
+            "moe_swiglu_quant",
+            u64_bytes(config.moe_inter_dim.saturating_mul(2)),
+            u64_bytes(config.moe_inter_dim),
+            "SwiGLU and activation quantisation of the routed branch",
+        );
+        record_stage(
+            &mut stages,
+            "moe_down_combine",
+            u64_bytes(config.moe_inter_dim.saturating_mul(topk)),
+            u64_bytes(config.dim),
+            "routed down projection and combine",
+        );
+        record_stage(
+            &mut stages,
+            "shared_expert_gate",
+            u64_bytes(scratch.ffn_in.len()),
+            u64_bytes(shared_inter.saturating_mul(2)),
+            "dense shared-expert gate/up GEMM",
+        );
+        record_stage(
+            &mut stages,
+            "shared_expert_swiglu_quant",
+            u64_bytes(shared_inter.saturating_mul(2)),
+            u64_bytes(shared_inter),
+            "shared-expert SwiGLU and activation quantisation",
+        );
         moe::moe_forward(
             config,
             &prefix,
@@ -723,10 +963,165 @@ impl InferenceEngine {
         if let Some(row) = boundary {
             row.push_stream(config, boundary::RESIDUAL_OUT, hidden.to_vec())?;
         }
+        record_stage(
+            &mut stages,
+            "ffn_epilogue",
+            u64_bytes(
+                scratch.ffn_out.len()
+                    + scratch.residual.len()
+                    + scratch.ffn_mixes.post.len()
+                    + scratch.ffn_mixes.comb.len(),
+            ),
+            u64_bytes(hidden.len()),
+            "hc_post of the FFN output and the FFN epilogue add",
+        );
 
         // The next block's input mix is THIS block's FFN coefficient (model.py:994).
         pre_mix.copy_from_slice(&scratch.ffn_mixes.pre);
         Ok(())
+    }
+
+    /// Runs one prompt token through the 40-layer reference block order, replacing each layer's
+    /// MhcEntry with the caller's handoff. The caller is responsible for the device launch and for
+    /// returning the exact residual stream its X buffer holds; the engine does not touch a driver.
+    ///
+    /// This is the chain-wiring path: every other stage is the reference host arithmetic. It is not
+    /// a device-chain claim and it does not make the host stand-ins device-executed.
+    ///
+    /// # Errors
+    ///
+    /// [EngineError] from a weight read, a shape check, or a handoff whose X length is not the
+    /// configured `hc_mult * dim`.
+    #[allow(clippy::too_many_arguments)] // the chain's own inputs plus the two callbacks; bundling them would hide which one is the device seam.
+    pub fn run_hybrid_chain(
+        &self,
+        token: u32,
+        embedding: &[f32],
+        provider: &mut HybridProvider<'_>,
+        progress: &mut dyn FnMut(usize, u64),
+    ) -> Result<HybridTokenOutput, EngineError> {
+        let config = &self.config;
+        let dim = config.dim;
+        let hc = config.hc_mult;
+        let width = config.hc_width();
+        if dim == 0 || hc == 0 || width == 0 {
+            return Err(EngineError::Shape {
+                what: "hybrid chain".to_owned(),
+                detail: "dim and hc_mult must both be positive".to_owned(),
+            });
+        }
+        if token as usize >= config.vocab_size {
+            return Err(EngineError::Shape {
+                what: "hybrid chain embedding".to_owned(),
+                detail: format!(
+                    "token {token} is outside the {} row table",
+                    config.vocab_size
+                ),
+            });
+        }
+        if embedding.len() != dim {
+            return Err(EngineError::Shape {
+                what: "hybrid chain embedding".to_owned(),
+                detail: format!("expected {dim} values, got {}", embedding.len()),
+            });
+        }
+        let mut hashes = Vec::new();
+        engram::ngram_hashes(config, &[token], 0, &mut hashes)?;
+        let mut hidden = vec![0.0f32; width];
+        for copy in 0..hc {
+            hidden[copy * dim..(copy + 1) * dim].copy_from_slice(embedding);
+        }
+        let mut pre_mix = vec![0.0f32; hc];
+        pre_mix[0] = 1.0;
+        let mut state = SequenceState::new(config);
+        let mut scratch = Scratch::for_chunk(config, 1);
+        let mut layers = Vec::with_capacity(config.n_layers);
+        for layer in 0..config.n_layers {
+            let mut layer_stages = Vec::new();
+            if config.engram_rows(layer).is_some() {
+                let wrote = engram::engram_forward(
+                    config,
+                    layer,
+                    &mut hidden,
+                    &hashes,
+                    self.source.as_ref(),
+                    self.limit,
+                )?;
+                if wrote {
+                    layer_stages.push(StageEvent {
+                        stage: "engram",
+                        host_bytes_in: u64_bytes(width),
+                        host_bytes_out: u64_bytes(width),
+                        note: "Engram read/write at its layers (host seam)",
+                    });
+                }
+            }
+            let handoff = provider(layer, &hidden, &pre_mix)?;
+            if handoff.x.len() != width {
+                return Err(EngineError::Shape {
+                    what: format!("layer {layer} MhcEntry X"),
+                    detail: format!("expected {width} values, got {}", handoff.x.len()),
+                });
+            }
+            hidden.copy_from_slice(&handoff.x);
+            let started = std::time::Instant::now();
+            self.block(
+                &mut state,
+                layer,
+                &mut hidden,
+                &mut pre_mix,
+                &mut scratch,
+                0,
+                Some(&handoff.entry),
+                Some(&mut layer_stages),
+                None,
+            )?;
+            let host_ms = started.elapsed().as_millis() as u64;
+            layers.push(HybridLayerTrace {
+                layer,
+                stages: layer_stages,
+                residual_out: hidden.clone(),
+                host_ms,
+            });
+            progress(layer, host_ms);
+        }
+        let mut collapsed = vec![0.0f32; dim];
+        mhc::hc_pre(config, &pre_mix, &hidden, &mut collapsed)?;
+        let norm = linalg::decode_by_name(self.source.as_ref(), "norm.weight", self.limit)?;
+        let mut tail = collapsed;
+        linalg::rms_norm(&mut tail, &norm, dim, config.norm_eps as f32)?;
+        let head_input = tail.clone();
+        let head = linalg::decode_by_name(self.source.as_ref(), "head.weight", self.limit)?;
+        let mut logits = vec![0.0f32; config.vocab_size];
+        linalg::matmul(&mut logits, &tail, &head, config.vocab_size, dim, 1)?;
+        let token = linalg::argmax(&logits).map(|index| index as u32);
+        let tail_stages = vec![
+            StageEvent {
+                stage: "final_norm",
+                host_bytes_in: u64_bytes(dim),
+                host_bytes_out: u64_bytes(dim),
+                note: "host final RMS norm; class-(b) seam, not device-executed",
+            },
+            StageEvent {
+                stage: "lm_head_screen",
+                host_bytes_in: u64_bytes(dim),
+                host_bytes_out: u64_bytes(config.vocab_size),
+                note: "host head matmul; the device cert_lm_head_sm121 screen is a host stand-in in this run",
+            },
+            StageEvent {
+                stage: "lm_head_argmax",
+                host_bytes_in: u64_bytes(config.vocab_size),
+                host_bytes_out: 4,
+                note: "host greedy argmax; class-(b) seam, not device-executed",
+            },
+        ];
+        Ok(HybridTokenOutput {
+            layers,
+            tail_stages,
+            head_input,
+            logits,
+            token,
+        })
     }
 }
 
@@ -913,6 +1308,8 @@ mod tests {
                     &mut pre_mix,
                     &mut scratch,
                     0,
+                    None,
+                    None,
                     None,
                 )
                 .expect("one block over a finite source");

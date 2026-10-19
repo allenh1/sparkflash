@@ -388,7 +388,7 @@ mod cuda_launcher {
     use sparkflash_kernels::mega_mhc_ref::{HC_MULT, HIDDEN};
 
     use crate::budget::{BudgetAdmission, BudgetError, BudgetRequest};
-    use crate::staging::{EmbedRow, LayerZeroStaging, MhcBufferPlan};
+    use crate::staging::{EmbedRow, LayerStaging, LayerZeroStaging, MhcBufferPlan};
     use sparkflash_engine::forward::layer_zero::LayerZeroEntry;
 
     /// Builds the layer-zero host handoff from the mHC kernel's f32 readback buffers.
@@ -550,6 +550,31 @@ mod cuda_launcher {
         }
     }
 
+    /// Copies one layer's predictor/base/scale/norm and resets the boundary seed and the grid
+    /// rendezvous. The allocation itself is the caller's; this is the one copy sequence both
+    /// [CudaLauncher::stage_layer] and [CudaLauncher::restage_layer] use.
+    fn copy_layer_tensors(
+        cuda: &Cuda,
+        buffers: &MhcBuffers,
+        staging: &LayerStaging,
+    ) -> Result<(), String> {
+        let plan = MhcBufferPlan::LAYER_ZERO;
+        let (b, c, a, y) = LayerZeroStaging::layer_zero_seed();
+        let y_bytes = f32_to_bf16_bytes(&y);
+        cuda.copy_htod(&buffers.x, &vec![0u8; plan.x])?;
+        cuda.copy_htod(&buffers.y_prev, &y_bytes)?;
+        cuda.copy_htod(&buffers.b_prev, &f32_to_bytes(&b))?;
+        cuda.copy_htod(&buffers.c_prev, &f32_to_bytes(&c))?;
+        cuda.copy_htod(&buffers.a_prev, &f32_to_bytes(&a))?;
+        cuda.copy_htod(&buffers.predictor, &f32_to_bytes(&staging.predictor))?;
+        cuda.copy_htod(&buffers.hc_scale, &f32_to_bytes(&staging.hc_scale))?;
+        cuda.copy_htod(&buffers.hc_base, &f32_to_bytes(&staging.hc_base_kernel))?;
+        cuda.copy_htod(&buffers.rms_weight, &f32_to_bytes(&staging.attn_norm))?;
+        reset_mhc_rendezvous_with(buffers, |destination, zeroes| {
+            cuda.copy_htod(destination, zeroes)
+        })?;
+        Ok(())
+    }
     /// The real launcher: verifies the required cubins, then dispatches the first typed builder
     /// (mHC) when its buffers are staged.
     ///
@@ -733,6 +758,177 @@ mod cuda_launcher {
             self.mhc_buffers = Some(MhcBuffers::from_allocations(&allocated));
             self.mhc_allocations = allocated;
             Ok(admission)
+        }
+
+        /// Allocates the sixteen mHC buffers for one backbone layer, then copies that layer's
+        /// released predictor/base/scale/norm into them. The first layer of a chain calls this;
+        /// later layers call [Self::restage_layer] so the allocation is reused.
+        ///
+        /// # Errors
+        /// [MhcStageError::Budget] on refusal, [MhcStageError::Launcher] on a projection, driver or
+        /// copy failure.
+        pub fn stage_layer(
+            &mut self,
+            staging: &LayerStaging,
+            request: BudgetRequest,
+        ) -> Result<BudgetAdmission, MhcStageError> {
+            let admission = BudgetAdmission::admit(request)?;
+            let plan = MhcBufferPlan::LAYER_ZERO;
+            let expected_device = plan.device_bytes() as u64;
+            if request.projected_device_bytes != expected_device {
+                return Err(MhcStageError::Launcher {
+                    detail: format!(
+                        "projected device bytes {} do not match the mHC buffer plan's {} bytes",
+                        request.projected_device_bytes, expected_device
+                    ),
+                });
+            }
+            let expected_host = staging.host_bytes().saturating_add(self.cubin_bytes());
+            if request.projected_host_bytes < expected_host {
+                return Err(MhcStageError::Launcher {
+                    detail: format!(
+                        "projected host bytes {} do not cover the staged {} staging bytes plus the {} verified cubin bytes",
+                        request.projected_host_bytes,
+                        staging.host_bytes(),
+                        self.cubin_bytes()
+                    ),
+                });
+            }
+            if staging.predictor.len() * 4 != plan.predictor
+                || staging.hc_scale.len() * 4 != plan.hc_scale
+                || staging.hc_base_kernel.len() * 4 != plan.hc_base
+                || staging.attn_norm.len() * 4 != plan.rms_weight
+            {
+                return Err(MhcStageError::Launcher {
+                    detail: "staged tensor sizes do not match the mHC buffer plan".to_string(),
+                });
+            }
+            if self.mhc_buffers.is_some() {
+                return Err(MhcStageError::Launcher {
+                    detail: "the mHC buffers are already staged; use restage_layer".to_string(),
+                });
+            }
+            if self.cuda.is_none() {
+                self.cuda =
+                    Some(Cuda::load().map_err(|error| MhcStageError::Launcher { detail: error })?);
+            }
+            let cuda = self.cuda.as_ref().ok_or(MhcStageError::Launcher {
+                detail: "the CUDA driver is unavailable".to_string(),
+            })?;
+            let mut allocated: Vec<Deviceptr> = Vec::with_capacity(plan.sizes().len());
+            let mut total = 0usize;
+            let result = (|| -> Result<(), String> {
+                for (_name, bytes) in plan.sizes() {
+                    let pointer = cuda.alloc(bytes, &mut total)?;
+                    allocated.push(pointer);
+                }
+                let buffers = MhcBuffers::from_allocations(&allocated);
+                copy_layer_tensors(cuda, &buffers, staging)
+            })();
+            if let Err(detail) = result {
+                let refs: Vec<&Deviceptr> = allocated.iter().collect();
+                cuda.free_buffers(&refs);
+                return Err(MhcStageError::Launcher { detail });
+            }
+            self.mhc_buffers = Some(MhcBuffers::from_allocations(&allocated));
+            self.mhc_allocations = allocated;
+            Ok(admission)
+        }
+
+        /// Copies a new layer's released mHC tensors into the already-allocated buffer set.
+        ///
+        /// # Errors
+        /// No staged buffers, a driver that is unavailable, or a copy failure.
+        pub fn restage_layer(&mut self, staging: &LayerStaging) -> Result<(), String> {
+            let buffers = self.mhc_buffers.ok_or_else(|| {
+                "the mHC buffers are not staged; call stage_layer first".to_string()
+            })?;
+            let cuda = self.cuda.as_ref().ok_or_else(|| {
+                "the CUDA driver is unavailable while restaging a layer".to_string()
+            })?;
+            copy_layer_tensors(cuda, &buffers, staging)
+        }
+
+        /// Writes the BF16 X stream for one layer into the staged X buffer.
+        ///
+        /// c3 builds the bytes from the previous layer's host residual, so the caller owns the
+        /// BF16 staging seam and its digest; this method only enforces the exact buffer length.
+        ///
+        /// # Errors
+        /// No staged buffers, driver unavailable, or a length other than `HC_MULT * HIDDEN * 2`.
+        pub fn write_layer_x_bf16(&mut self, x: &[u8]) -> Result<(), String> {
+            if x.len() != HC_MULT * HIDDEN * 2 {
+                return Err(format!(
+                    "the X stream is {} bytes, the staged buffer expects {}",
+                    x.len(),
+                    HC_MULT * HIDDEN * 2
+                ));
+            }
+            let buffers = self.mhc_buffers.ok_or_else(|| {
+                "the mHC buffers are not staged, so X cannot be written".to_string()
+            })?;
+            let cuda = self
+                .cuda
+                .as_ref()
+                .ok_or_else(|| "the CUDA driver is unavailable while copying X".to_string())?;
+            cuda.copy_htod(&buffers.x, x)
+                .map_err(|error| format!("copy the X stream: {error}"))
+        }
+
+        /// Writes the previous sublayer's pre-mix coefficients as the kernel's A row for this
+        /// layer. c3's step 1 is identity, but step 2 is still H(A X_l) with the previous FFN
+        /// pre-mix, so A must be restaged per layer rather than left at the layer-0 seed.
+        ///
+        /// # Errors
+        /// No staged buffers, driver unavailable, or a length other than `HC_MULT`.
+        pub fn write_layer_a(&mut self, a: &[f32]) -> Result<(), String> {
+            if a.len() != HC_MULT {
+                return Err(format!(
+                    "the A row has {} values, the staged buffer expects {HC_MULT}",
+                    a.len()
+                ));
+            }
+            let buffers = self.mhc_buffers.ok_or_else(|| {
+                "the mHC buffers are not staged, so A cannot be written".to_string()
+            })?;
+            let cuda = self
+                .cuda
+                .as_ref()
+                .ok_or_else(|| "the CUDA driver is unavailable while copying A".to_string())?;
+            cuda.copy_htod(&buffers.a_prev, &f32_to_bytes(a))
+                .map_err(|error| format!("copy the A row: {error}"))
+        }
+
+        /// The layer-generic aliases for the c3 readbacks.
+        ///
+        /// # Errors
+        /// As the layer-0 readback each one delegates to.
+        pub fn read_layer_entry(&self) -> Result<LayerZeroEntry, String> {
+            self.read_layer_zero_entry()
+        }
+
+        /// # Errors
+        /// As [Self::read_layer_zero_x].
+        pub fn read_layer_x(&self) -> Result<Vec<u8>, String> {
+            self.read_layer_zero_x()
+        }
+
+        /// # Errors
+        /// As [Self::read_layer_zero_inv_rms].
+        pub fn read_layer_inv_rms(&self) -> Result<f32, String> {
+            self.read_layer_zero_inv_rms()
+        }
+
+        /// # Errors
+        /// As [Self::read_layer_zero_codes].
+        pub fn read_layer_codes(&self) -> Result<Vec<u8>, String> {
+            self.read_layer_zero_codes()
+        }
+
+        /// # Errors
+        /// As [Self::read_layer_zero_scales].
+        pub fn read_layer_scales(&self) -> Result<Vec<u8>, String> {
+            self.read_layer_zero_scales()
         }
 
         /// Copies the staged embedding row's four BF16 copies into the staged X buffer.
@@ -924,11 +1120,6 @@ mod cuda_launcher {
                     kernel: call.kernel,
                 });
             }
-            if call.stage == ChainStage::MhcEntry && call.layer != 0 {
-                return Err(DeviceLaunchError::NotStaged {
-                    kernel: call.kernel,
-                });
-            }
             let bytes =
                 self.cubins
                     .get(call.kernel)
@@ -1051,31 +1242,40 @@ mod cuda_launcher {
         }
 
         #[test]
-        fn a_post_or_nonzero_layer_mhc_launch_is_refused_before_the_driver() {
+        fn an_unstaged_post_is_refused_before_the_driver() {
             let mut launcher = CudaLauncher::for_test();
-            for call in [
-                DeviceStageCall {
+            let error = launcher
+                .launch(DeviceStageCall {
                     stage: ChainStage::MhcPost,
                     layer: 0,
                     position: 0,
                     kernel: "mega_mhc_sm121",
-                },
-                DeviceStageCall {
+                })
+                .expect_err("the launch must be refused");
+            assert!(
+                matches!(error, DeviceLaunchError::NotStaged { .. }),
+                "unexpected refusal: {error:?}"
+            );
+            assert!(launcher.cuda.is_none(), "no driver was opened");
+        }
+
+        #[test]
+        fn a_nonzero_layer_entry_without_cubins_is_refused_before_the_driver() {
+            let mut launcher = CudaLauncher::for_test();
+            let error = launcher
+                .launch(DeviceStageCall {
                     stage: ChainStage::MhcEntry,
                     layer: 1,
                     position: 0,
                     kernel: "mega_mhc_sm121",
-                },
-            ] {
-                let error = launcher
-                    .launch(call)
-                    .expect_err("the launch must be refused");
-                assert!(
-                    matches!(error, DeviceLaunchError::NotStaged { .. }),
-                    "unexpected refusal: {error:?}"
-                );
-            }
+                })
+                .expect_err("the launch must be refused");
+            assert!(
+                matches!(error, DeviceLaunchError::MissingCubin { .. }),
+                "unexpected refusal: {error:?}"
+            );
             assert!(launcher.cuda.is_none(), "no driver was opened");
+            assert!(launcher.mhc_buffers.is_none(), "no buffers were staged");
         }
 
         #[test]
