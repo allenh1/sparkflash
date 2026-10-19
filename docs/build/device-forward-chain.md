@@ -176,12 +176,12 @@ Engine reference: `forward/mod.rs:373` run, `:546` block. Per layer, in order:
 Kernel ABI anchors (main): `KernelId` `cuda_driver.rs:157`; `m4_abi` `MEGA_MHC:854`,
 `MXFP8_DENSE:856`, `MXFP4_MOE:858`, `FLASH_MLA_CSA2:860`, `MXFP8_WO_A:862`,
 `CERT_LM_HEAD:864`, `KERNELS` at `:867` (a six-entry array, frozen by D26). The ratchet baseline
-`crates/sparkflash-kernels/baseline/kernel_baseline.txt` has **ten** entries: the six m4 kernels,
+`crates/sparkflash-kernels/baseline/kernel_baseline.txt` has **eleven** entries: the six m4 kernels,
 `swiglu_mxfp8_quant_sm121` (host seam, not launched by the chain), its weighted routed variant
 `swiglu_mxfp8_quant_weighted_sm121` (D33; m17a stage 3 loads it, window b33 measured 35 checks
 at both token counts, not wired),
-`moe_router_sm121` (M2 one-launch proof) and `routed_gate_up_sm121` (task-8, measured in
-isolation, not wired). The
+`moe_router_sm121` (M2 one-launch proof), `routed_gate_up_sm121` (task-8, measured in
+isolation, not wired) and `rmsnorm_sm121` (D34, wired as the c4c final tail norm in b41). The
 chain's six-kernel launch set is unchanged: `mega_mhc_sm121`, `b12x_mxfp8_dense_sm121`,
 `b12x_mxfp4_moe_sm121`, `flash_mla_csa2_sm121`, `b12x_mxfp8_wo_a_sm121`,
 `cert_lm_head_sm121`. Routed gate/up and the shared expert's dense GEMM are device kernels that
@@ -366,10 +366,10 @@ reproduced against the reference" (`roadmap-to-serving.md` section 5.5 item 1). 
 only when **all** hold in one run:
 
 1. exit status 0, and the run actually executed on a device: driver loaded, every cubin sha256
-   printed and equal to the ten parsed entries of `baseline/kernel_baseline.txt`; the catalog
-   requires eight of them (the six chain kernels plus the router and routed gate/up, 2.2), and the
-   other two - `swiglu_mxfp8_quant_sm121` (the host seam's unweighted epilogue) and its weighted
-   routed variant `swiglu_mxfp8_quant_weighted_sm121` (D33, measured in m17a) - are not chain
+   printed and equal to the eleven parsed entries of `baseline/kernel_baseline.txt`; the catalog
+   requires nine of them (the six chain kernels plus the router, routed gate/up and `rmsnorm_sm121`,
+   2.2), and the other two - `swiglu_mxfp8_quant_sm121` (the host seam's unweighted epilogue) and its
+   weighted routed variant `swiglu_mxfp8_quant_weighted_sm121` (D33, measured in m17a) - are not chain
    kernels. Device kernel launches > 0 (a host-only run cannot pass);
 2. tokens exactly 491, 367, 201, 80, 3302, 201, 54, 201, 4341 (`compare_steps`, `:699`);
 3. head reduction: the reduced argmax over the screen's per-block maxima (host `lm_head_argmax` in
@@ -521,11 +521,12 @@ labelled merged/measured but not wired, the remaining host seams labelled), buil
 set and the plan-vs-ledger self-check
 (fails on missing **and** unplanned seams), and runs through a `ChainOps` backend with
 `chain_execution = false`. `window.rs` accounts the 128-slot rings (67,584 B each, 2,703,360 B
-for 40) and round-trips the oldest-first view; `cubins.rs` parses the ten baseline pins from
-`kernel_baseline.txt`, requires eight of them (the six chain kernels plus router and routed
-gate/up) and verifies size and SHA-256 fail-closed; the other two, `swiglu_mxfp8_quant_sm121` (the
-host seam's unweighted epilogue) and its weighted routed variant `swiglu_mxfp8_quant_weighted_sm121`
-(D33), are not required chain kernels. The CLI arm
+for 40) and round-trips the oldest-first view; `cubins.rs` parses the eleven baseline pins from
+`kernel_baseline.txt`, requires nine of them (the six chain kernels plus router, routed gate/up and
+the c4c tail `rmsnorm_sm121`) and verifies size and SHA-256 fail-closed; the other two,
+`swiglu_mxfp8_quant_sm121` (the host seam's unweighted epilogue) and its weighted routed variant
+`swiglu_mxfp8_quant_weighted_sm121` (D33), are not required chain kernels. `rmsnorm_sm121` is no
+longer pending: m18 measured it at 8 and 130 tokens and b41 wired it. The CLI arm
 `sparkflash device-chain --plan-only` prints the plan, stage map, seam counts, the plan-only label
 verbatim and the three design 4.3 run labels explicitly prefixed "label reserved for a later
 stage:", then exits 2 refusing to serve. M3-b adds layer-0 weight staging and budget admission;
@@ -1011,6 +1012,385 @@ compressor/cache and selected-list assembly, indexer scoring (zeros plus sentine
 inverse RoPE and the D8 quantisers. The remaining per-layer device-status host stand-ins are
 `moe_router`, `moe_gate_up`, `moe_down_combine` and `shared_expert_gate` (4). The claim stays
 **CHAIN-WIRING parity, not a device-token result; criterion 1 remains OPEN**.
+
+### c4b window b34: PREFLIGHT PASS, FULL CHAIN FAILURE - the shared-expert seam overwrote the routed row
+
+Window b34 ran the c4b arm on binary `sparkflash_m3c_c4b_12cbb46_aarch64` (sha256
+`ac1f766d39addb931651bc5e75c5def92564538b549cc1012ec1b02569f5250e`, built from `12cbb46`,
+which is based on `da8d491`). **This is a failure record, not a c4b PASS.** The one-layer
+staging/launch preflight passed and its measured number is useful; the full 40-layer chain then
+failed token parity.
+
+The preflight line was verbatim: `moe preflight: layer=0 tokens=1 launches=17 one_layer_ms=203.517
+staging_ms=188 device_us=183663 staged_expert_bytes=233734840 host_bytes=112896024
+staging_gbs=1.148 projected_full_chain_s=8.1`, then `MOE PREFLIGHT PASS: projection under the 500 s
+bar`, exit 0 at 06:39:09Z. The staged-expert bytes are the full selected-expert tensors (about 113
+MB) plus the per-rank gate/up and w2/scales slices (about 121 MB); they are not an 8.2 GB/layer
+staging.
+
+The full chain printed verbatim `reference engine: token_id=5 wall_ms=31202 top5=5,201,372,30,1897;
+hybrid chain: token_id=271 wall_ms=19793 top5=271,16,53,50,6328`, then `token comparison:
+reference_id=5 hybrid_id=271 exact_equal=false top5_overlap=0`, then `first differing layer (best
+effort): layer 0 residual_out max_abs_delta=9.425920e0; this includes the BF16 staging seam and any
+device-entry delta`, and `CHAIN-WIRING FAIL` exit=1 at 06:40:00Z. Chain totals verbatim: `layers=40
+entry_launches=42 post_launches=40 attention_projection_launches=200 attention_body_launches=40
+routed_moe_launches=680 device_launches=1002 engram_split_layers=2 device_us=6758993
+device_ms=6758.993 staging_ms=13258 host_ms=17045 total_chain_ms=19793`. Every per-layer line showed
+`moe_launches=17` and the attention `capture_exact=true codes_exact=true scales_exact=true`; those
+bars cover the attention readbacks, not the routed MoE output, so they could not see this failure.
+
+**Root cause.** `moe::add_shared_expert` (new in c4b) had a single-token path that called
+`expert_body(..., row)` with `row = out[token*dim..]`, writing the shared expert directly over the
+routed contribution instead of adding to it. The multi-token worker path used `+=` and was correct,
+which is why a one-token chain diverged from layer 0 while the 680-call host-control test (it fills
+zeros and counts launches) and the attention bars stayed green. The fix splits the host reference
+into `routed_forward` + `add_shared_expert`, makes the single-token path accumulate into
+`scratch.expert_out` and then add, and adds `add_shared_expert_adds_to_the_routed_row_and_never_
+overwrites_it` as the failure-class pin in `12cbb46`'s tree.
+
+**Diagnostic bar added, not another token-only gate.** `c2a205d` first compared the device routed
+contribution with the host f32 `routed_forward` reference and failed above a guessed `1e-2`; b35
+showed that guess was wrong (see below). `e06e9ff` replaced it with the measured class bar: the host
+bf16 chained combine (`mxfp4_ref::moe_combine`) on the SAME device codes/scales and w2/s2 slices,
+zero seed, must match every per-rank and final bf16 code exactly. The f32 delta, host magnitude and
+relative delta are still printed on the `routed MoE totals` line (`layer0_host_max_abs`,
+`layer0_host_max`, `layer0_host_rel`) as calibration, not as an abort; the bar-run cost is inside
+`total_chain_ms` but outside the staging/device counters. The fix binary
+`sparkflash_m3c_c4b_c2a205d_aarch64` (sha256
+`1ba3680172f381c4148428e5431c1e7a66f9bf748a5a83ca8436a85e52990128`) is superseded by
+`e06e9ff`; b34 remains a failure record.
+
+### c4b window b35: FAILURE RECORD - the layer-0 bar was a guessed f32 tolerance, not a class bar
+
+Window b35 ran `sparkflash_m3c_c4b_c2a205d_aarch64` (sha256
+`1ba3680172f381c4148428e5431c1e7a66f9bf748a5a83ca8436a85e52990128`) with the shared-expert
+overwrite fixed and the first layer-0 bar in place. The chain aborted at layer 0 before any token
+comparison: `device routed MoE layer-0 bar: the device routed contribution differs from the host
+routed reference by max abs 1.9090915e-1 (bar 1e-2); the chain token gate is not the only
+detector`, exit 1 at 06:53:37Z; log `window-b35-20261019T065305Z.log`, run
+`runs35/c4b-hybrid-token0.log`. **This is a failure record for that bar**, not a token result and
+not a c4b PASS. The rest of layer 0 was exact: `partial layer 0 timing: staging_ms=17 entry_us=235
+post_us=234 capture_exact=true codes_exact=true scales_exact=true coeff_max_abs=8.493662e-7
+inv_rms_delta=1.764297e-5 post_capture_exact=true post_codes_exact=true post_scales_exact=true
+post_coeff_max_abs=4.053116e-6 post_inv_rms_delta=1.144409e-5`, and all 17 routed launches ran.
+
+The number was a calibration finding, not a wiring finding. The c4b device path returns the routed
+contribution through a four-rank bf16 serial combine with a zero seed (the engine adds residual and
+shared afterwards in f32); the host `routed_forward` reference sums the six choices in f32 with no
+intermediate bf16 rounding. m17a's stage-4 class is bit-exact only against the **bf16 chain on the
+same device operand bytes**, so `1e-2` was never the measured class bar. The bar was replaced by
+that bf16-twin identity, with the f32 difference retained as printed calibration rather than an
+abort (`c2a205d`'s issue, fixed in `e06e9ff`).
+
+### c4b window b36 attempt 1: INFRASTRUCTURE FAILURE - binary not staged on the window host
+
+The first b36 invocation, log `window-b36-20261019T070444Z.log`, exited 127 because
+`sparkflash_m3c_c4b_e06e9ff_aarch64` was present on the build host but had not been copied to
+node0. **No kernel ran and no measurement was produced**; this is an infrastructure failure
+record, not a c4b result. The binary was copied and the same command was rerun.
+
+### c4b window b36: PASS - CHAIN-WIRING token parity with the routed MoE family on device
+
+Window b36 ran `sparkflash_m3c_c4b_e06e9ff_aarch64` (sha256
+`7e1f073e6c2923a5d72a04474d4944953fc7eeafa35b24a5520ab50f85a0bb5a`, built from `e06e9ff`) with
+`--moe-layer0-diagnose`; log `window-b36-20261019T070801Z.log`, run
+`runs36/c4b-diagnose.log`, exit 0 at `2026-10-19T07:09:58Z`; the log carries
+`=== RUN c4b-diagnose exit=0 end 2026-10-19T07:09:58Z` and
+`=== all runs complete 2026-10-19T07:09:58Z ===`. It reused the `window-b36.sh` script name; the
+first attempt at `07:04:44Z` exited 127 and is the infrastructure failure above. The
+verdict line was `CHAIN-WIRING token parity: PASS`; the comparison was `token comparison:
+reference_id=5 hybrid_id=5 exact_equal=true top5_overlap=5`. This is **chain-wiring parity, not a
+device-token result**, and criterion 1 remains **OPEN**.
+
+**The layer-0 routed block is calibrated, not merely tolerated.** The diagnostic lines were verbatim:
+`moe layer0 diag: weighted rank0 codes_mismatched=0 scales_mismatched=0 (width=576, rows=6)` and
+`moe layer0 diag: bf16 combine twin exact=true mismatches=0 per_rank=[0, 0, 0, 0]
+host_f32_max_abs=1.9090915e-1 host_max=9.479069e0 relative=2.0140074e-2`. The bar is therefore the
+measured bf16-twin identity (zero mismatches on every per-rank and final bf16 code, same device
+codes/scales, same w2/s2 slices, same local ids); the f32 delta of `1.909e-1` against a host max of
+`9.479` (2.014% relative) is the declared f32-vs-bf16 serial-combine class spread and is printed as
+calibration (`layer0_host_max_abs`, `layer0_host_rel`, `layer0_host_max`), not used as an abort.
+This is a different magnitude from b34's `9.425920e0` residual delta, which was the shared-expert
+overwrite bug fixed in `c2a205d`.
+
+The routed MoE totals line reported `layers=40 router_launches=40 gate_up_launches=320
+weighted_launches=160 combine_launches=160 moe_launches=680 staging_ms=2982 device_us=2945226
+staged_expert_bytes=9349393600 host_bytes=4515856824 layer0_host_max_abs=1.909e-1
+layer0_host_rel=2.014e-2 layer0_host_max=9.479e0 layer0_bf16_twin_mismatches=0 ...` (the full line
+is in the run log). Chain totals reported `layers=40 entry_launches=42 post_launches=40
+attention_projection_launches=200 attention_body_launches=40 routed_moe_launches=680
+device_launches=1002 engram_split_layers=2 device_us=3514609 device_ms=3514.609 staging_ms=10028
+host_ms=14793 total_chain_ms=17631 host_bytes=4588790424 staged_matrix_bytes=14656542080 ...`.
+
+### c4c implementation: shared expert and certified head on device (b40 PASS - wiring, norm pending)
+
+Branch `task/device-engine-m3-c4c` at post-rebase `c573f34`, based on main `acc0189` (batch 19
+merged). The c4c implementation commits are `ae27499`/`3d60f60`/`1031891`/`d44202c`/`c573f34`; the c4b
+commits below them are the same routed-MoE family rebased onto the merged batch-19 tree. The b40
+window candidate was `sparkflash_m3c_c4c_d44202c_aarch64` (sha256
+`5e674a2024f89a33f22f0d0bfc31f2bdc07c94d4c09f40d920cae5543cc1fe0b`); `c573f34`
+(`sparkflash_m3c_c4c_c573f34_aarch64`, sha256
+`7037cebeb33ea07afb335a4cc92e639762b4aa9e6bae8060740537f4f76d40c1`) changes only the shared timing
+labels and is the base for the norm-tail change.
+
+**Shared expert, four launches per layer.** The engine's device arm now calls
+`MoeDeviceBackend::shared_expert` after the routed FFN. The released shared expert is one expert
+(`moe_inter_dim=2304`, `dim=5120`): w1/w3 are FP8 E4M3 `[2304, 5120]` with the 32x32 E8M0 grid
+`[72, 160]`, w2 is FP8 E4M3 `[5120, 2304]` with grid `[160, 72]`. The backend repacks each weight
+to the m12 B12x micro-tile order (a value-preserving index permutation, no arithmetic), quantises the
+layer's activation rows with the D8 rule, then launches, in order, dense w1, dense w3, the 2304-wide
+`swiglu_mxfp8_quant_sm121` (unweighted; the shared expert has no routing weight), and dense w2. The
+kernels and pins are m17b's: `b12x_mxfp8_dense_sm121` 11,824 B `03e4c422...`,
+`swiglu_mxfp8_quant_sm121` 21,776 B `4dbef63b...`. The device shared output is BF16; the engine adds
+it to the routed f32 row on the host. The host add has no pinned elementwise kernel and is a declared
+seam. The host-twin diagnostic reads the layer prefix `layers.N` (not the shared-expert base) so
+`add_shared_expert` composes the released names exactly once; `read_spec` asserts dtype **and**
+logical shape before any byte is trusted.
+
+**Certified head, four rank launches.** The deferred tail calls `MoeDeviceBackend::lm_head` with the
+host-normalised tail. The backend converts that f32 row to BF16 (the m16 ABI), reads
+`head.weight` as BF16 `[129280, 5120]`, and launches `cert_lm_head_sm121` once per 32,320-row rank
+shard (pin 14,888 B `7394b129...`). Each launch publishes 32 chunk maxima/argmaxes and a certified
+mask/count; the host assembles the four shards' block maxima with the lowest-global-index tie-break.
+The head's per-entry exactness is the kernel certificate's; entries the screen pruned carry bounds,
+not exact logits, so the chain's `top5` after a device head is ordered by published block values and
+is not an exact-logit measurement. The host block assembly is the declared reduction seam.
+
+**What is device and what is not.** c4c removes the last per-layer device-status stand-ins: routed
+MoE (17 launches/layer, c4b), shared expert (4 launches/layer), and the head (4 launches once). The
+per-layer MoE ledger now requires exactly **21** launches (17 routed + 4 shared) and the chain totals
+count 40 x 21 = 840 MoE launches (680 routed + 160 shared) plus 4 head launches; with the merged
+batch-19 attention trio (42 entry + 40 post + 200 projection + 40 body) that is **1166 device
+launches** in the b40 window. The chain totals print the split explicitly:
+`routed_moe_launches=680 shared_moe_launches=160 head_launches=4 moe_launches=840`.
+
+The c4c-norm commit adds the standalone `rmsnorm_sm121` tail norm, so a b41 run also prints
+`tail_norm_launches=1` and `device_launches=1167`; that changes the last device-status stand-in
+before the head, and it is a separately measured change (the b40 record below is the host-norm
+chain). The remaining host seams after c4c-norm are: the shared-add elementwise, the B12x weight
+repack, the activation D8 quantiser, the selected-expert staging/dispatch, the head's BF16 conversion
+and four-shard block assembly, and the attention/tail seams named in the c4a/c4b records. **The
+four-shard block-max/argmax assembly is still host, so c4c/c4c-norm cannot claim a device token.
+Criterion 1 remains OPEN until a full 130+8 run meets section 4.3 items 1-6.**
+
+### c4c window b38: MID-RUN STAGING FAILURE - duplicated `shared_experts` in the host-twin name
+
+Window b38 ran `sparkflash_m3c_c4c_6927573_aarch64` and aborted after the layer-0 attention and
+routed-MoE launches (5 projection + 1 format-2 body + 17 routed) but before any token measurement:
+`c4a-2 chain abort: the source has no tensor named
+layers.0.ffn.shared_experts.ffn.shared_experts.w1.weight`, exit 1 at
+`2026-10-19T07:46:35Z`; log `window-b38-20261019T074449Z.log`, run
+`runs38/c4c-hybrid-token0.log`. **This is a mid-run staging failure after real device launches,
+not a c4c result**; no token measurement is recorded. The released names are `layers.N.ffn.shared_experts.w{1,2,3}.weight` and
+`.scale`. The duplicate came from the layer-0 host twin: `diagnose_shared` passed the shared base
+`layers.N.ffn.shared_experts` to `add_shared_expert`, whose prefix contract appends
+`.ffn.shared_experts` itself. Fixed in `1031891` by passing the layer prefix `layers.N` to the
+host twin, plus the dtype/shape check above. b38 is retained as the failure record; the next window
+is b39 on the rebased binary.
+
+### c4c window b39: FIRST c4c PASS - canonical numbers, combined routed/shared label
+
+Window b39 ran `sparkflash_m3c_c4c_1031891_aarch64` (sha256
+`935cf17a9796789738e365e0faf63678003e7f6f21f4e0380eb28f745231749b`) and **PASSED** the token
+comparison (`token comparison: ... exact_equal=true`, `CHAIN-WIRING token parity: PASS`). Log
+`window-b39-20261019T075605Z.log`; the run is in the same window's `runs39/c4c-hybrid-token0.log`.
+Its chain totals printed `routed_moe_launches=840 device_launches=1166`: 840 was the combined
+routed+shared MoE count under a label that said "routed". The total 1166 and the token were correct;
+only the reporting label was wrong. b39 is retained as the **first c4c PASS**, and it is honest
+evidence that the split fix changed reporting only. It is superseded as canonical by b40.
+
+### c4c window b40: PASS - c4c CHAIN-WIRING parity (NOT criterion 1, final norm still host)
+
+Window b40 ran `sparkflash_m3c_c4c_d44202c_aarch64` (sha256
+`5e674a2024f89a33f22f0d0bfc31f2bdc07c94d4c09f40d920cae5543cc1fe0b`) and exited 0 at
+`2026-10-19T08:02:19Z`; log `window-b40-20261019T080027Z.log`, run
+`runs40/c4c-hybrid-token0.log`. **This is the canonical c4c wiring PASS.** It is not a criterion-1
+PASS: the final RMS norm was still host in this window, and the head's four-shard block reduction is
+host. The measured lines were:
+
+```text
+moe layer0 diag: router ids device=[250, 209, 215, 104, 236, 275] host=[250, 209, 215, 104, 236, 275] equal=true weights_max_abs=1.1920929e-7
+moe layer0 diag: staged 6 experts local->global [(0, 250), (1, 209), (2, 215), (3, 104), (4, 236), (5, 275)], expert_bytes=112803840, rows=6
+moe layer0 diag: gate_up rank0 device-vs-host bits mismatched=0 up=0 of 3840 padded values
+moe layer0 diag: weighted rank0 codes_mismatched=0 scales_mismatched=0 (width=576, rows=6)
+moe layer0 diag: bf16 combine twin exact=true mismatches=0 per_rank=[0, 0, 0, 0] host_f32_max_abs=1.9090915e-1 host_max=9.479069e0 relative=2.0140074e-2
+moe layer0 diag: shared gate/up bf16 mismatched=0/0 codes=0 scales=0 shared_bf16_mismatches=0
+moe layer0 diag: shared host_f32_max_abs=1.3034999e-2 host_max=1.5967474e0 relative=8.16347e-3
+lm head diag: certified=0 bf16_twin_logit_mismatches=0 bf16_twin_max_abs=0e0 device_token=5 twin_token=5 token_match=true
+shared expert totals: layers=40 shared_launches=160 staging_ms=397 device_us=397895 staged_shared_bytes=1417171200 host_bytes=4516477624 layer0_shared_bf16_mismatches=0 layer0_shared_host_max_abs=1.303e-2 layer0_shared_host_rel=8.163e-3 layer0_shared_host_max=1.597e0
+chain totals: layers=40 entry_launches=42 post_launches=40 attention_projection_launches=200 attention_body_launches=40 routed_moe_launches=680 shared_moe_launches=160 head_launches=4 moe_launches=840 device_launches=1166 engram_split_layers=2 device_us=5052022 device_ms=5052.022 staging_ms=9662 host_ms=14770 total_chain_ms=17555 host_bytes=4591049624 staged_matrix_bytes=14... (this section abbreviates a long line; the run output itself carried the full number and no truncation marker)
+reference engine: token_id=5; wall_ms=23670; top5=5: 13.230665207, 201: 12.492528915, 372: 11.897726059, 30: 11.392500877, 1897: 11.015835762
+hybrid chain: token_id=5; wall_ms=17555; top5=5: 13.150072098, 201: 12.476766586, 372: 11.830552101, 30: 11.281064987, 271: 10.979187965
+token comparison: reference_id=5 hybrid_id=5 exact_equal=true top5_overlap=4
+CHAIN-WIRING token parity: PASS
+```
+
+The **class bars** are the bf16-twin identities, not an f32 tolerance: shared
+`shared_bf16_mismatches=0` (the f32 delta `1.3034999e-2` against `host_max=1.5967474e0`,
+relative `8.16347e-3`, is calibration); routed combine `exact=true mismatches=0` with its own f32
+calibration `1.9090915e-1`; head `certified=0`, `bf16_twin_logit_mismatches=0`,
+`bf16_twin_max_abs=0`, and both twin and device token 5. The hybrid top5 overlaps the reference in
+4 of 5 entries but is **not** an exact-reference-logit claim: the device head consumes a BF16 tail
+while the reference head consumes its f32 tail, and the certified screen's entries are only exact
+when `certified=0` (as here). Token parity is the gate.
+
+**Timing-label caveat, fixed after b40.** In d44202c the shared line's `staging_ms=397` and
+`device_us=397895` are the same total (397,895 us) under two labels: `shared_us` was charged whole
+to both. c573f34 splits shared staging from launch+readback and adds the shared staging to
+`staging_ms`, so a later run's two numbers are independent; b40's raw line is kept above as the
+measured record.
+
+**Cumulative host_bytes caveat.** In the b40-era totals lines the host_bytes field is a cumulative
+chain counter on both the routed and shared lines (the b45 section below quotes the same defect); it
+is not a routed-only or shared-only byte count and must not be differenced as if it were. The split
+accounting starts with the post-fix c4c-norm run.
+
+**The b40 device chain, verbatim counts:** 42 entry + 40 post mHC, 200 attention projection + 40
+format-2 body, 680 routed MoE + 160 shared MoE + 4 certified head = **1166 device launches**. The
+final RMS norm before the head was host, and the head's block-max/argmax assembly across the four
+rank shards was host. c4c is therefore **CHAIN-WIRING parity with a hybrid token path**, not
+criterion 1.
+
+### c4c-norm: standalone final RMSNorm wired (b41 PASS)
+
+
+Branch `task/device-engine-m3-c4c` at `611d21a` (kernel-dev's `e09e08c` + `42beb9e` cherry-picked
+onto the b40 tree). The tail now calls `MoeDeviceBackend::final_norm`, which the CLI backend
+implements by asserting `norm.weight` is BF16 `[5120]`, converting the collapsed f32 row to BF16,
+launching `rmsnorm_sm121` (31,480 B pin `5f953bc0...`) with `eps = config.norm_eps as f32`, and
+comparing the BF16 output **byte for byte** against `rmsnorm_ref::final_norm_bf16` (the host
+`linalg::rms_norm` over the BF16-decoded input, then `bf16_bits`). A mismatch aborts; the host
+`linalg::rms_norm` remains the fallback when the backend returns `false`. The device head consumes
+the resulting BF16 tail through its existing BF16 hidden ABI.
+
+`sparkflash-device::cubins::REQUIRED_KERNELS` now has nine entries (rmsnorm added), the chain totals
+add `tail_norm_launches` and the 31,480 cubin bytes, and the device-launch total becomes 1167. The
+m18 measurement already passed the kernel at 8 and 130 tokens (0 mismatched BF16 bytes of 81,920 and
+1,331,200); the b41 window below measures the chain wiring itself.
+
+### c4c-norm window b41: PASS - device tail norm, 1167 launches
+
+Window b41 ran `sparkflash_m3c_c4c_611d21a_aarch64` (sha256
+`2f13cbe8875e24e08da7b6bac150dfec6796e885caaefcd73ed5af177eaab0a9`), cubin `rmsnorm_sm121`
+`5f953bc0...`, exit 0 at `2026-10-19T08:16:34Z`; log `window-b41-20261019T081430Z.log`, run
+`runs41/c4c-norm-hybrid-token0.log`. **This is the c4c-norm PASS**: the final norm is no longer a
+host seam, and the chain moves 1167 device launches. Verbatim:
+
+```text
+final norm diag: rows=1 cols=5120 bf16_mismatches=0 bytes=10240
+final norm totals: final_norm_launches=1 device_us=265 staged_norm_bytes=30720 bf16_mismatches=0 screen=rmsnorm_sm121; host readback into the certified head
+lm head diag: certified=0 bf16_twin_logit_mismatches=0 bf16_twin_max_abs=0e0 device_token=5 twin_token=5 token_match=true
+reference engine: token_id=5; wall_ms=31859; top5=5: 13.230665207, 201: 12.492528915, 372: 11.897726059, 30: 11.392500877, 1897: 11.015835762
+chain totals: layers=40 entry_launches=42 post_launches=40 attention_projection_launches=200 attention_body_launches=40 routed_moe_launches=680 shared_moe_launches=160 head_launches=4 tail_norm_launches=1 moe_launches=840 device_launches=1167 engram_split_layers=2 device_us=4895227 device_ms=4895.227 staging_ms=12777 host_ms=15964 total_chain_ms=18799 host_bytes=4591049624 staged_matrix_bytes=16073744000 ...
+hybrid chain: token_id=5; wall_ms=18799; top5=5: 13.139515877, 201: 12.485794067, 372: 11.826237679, 30: 11.279764175, 271: 10.986923218
+
+token comparison: reference_id=5 hybrid_id=5 exact_equal=true top5_overlap=4
+CHAIN-WIRING token parity: PASS
+```
+
+The norm's class bar is the bf16-bit twin, not a tolerance: **0 mismatches of 10,240 bytes** (5,120
+values); the 265 us is the launch plus one readback. The b40 host-norm result remains a separate,
+unchanged record.
+
+**Accounting note (batch 22, HIGH).** The b41 `staging_ms=12777` above is the c4c **chain
+total**, not a routed-only number: it already includes the shared-expert staging that
+`moe_device.rs` charged on the same counter. An earlier review text proposed a larger total by
+adding the shared staging a second time; that figure is deleted and must not be cited. The b41 line
+is retained exactly as measured. b45 and b52 are PRE-FIX runs whose routed/shared totals lines are
+the old cumulative ones; the post-fix split record is window b54's token-0 `c4c-norm-token0`
+run on binary `e7c0456` (`window-b54-20261019T105232Z.log`; b54's `seq-timing-3` exited 1 on the
+known p0/seq divergence and its `seq130x8` was interrupted, so neither is a sequence record, and
+b52 `window-b52-20261019T103800Z.log` is superseded PRE-FIX history), which printed
+`moe counts: routed_launches=680 shared_launches=160 ... routed_staging_us=3184489 shared_staging_us=1775648
+total_staging_us=4960137`, distinct routed/shared host bytes, `head_launches=5` and
+`device_launches=1168` (the reduce cut-over), with token 5 == reference 5. Do not cite b41's
+12,777 as routed-only.
+
+**The host pieces left before the token are the four-shard block-max/argmax assembly and the
+one-time head-weight read/upload** (the head screen and in-kernel block argmax are device); the
+shared add, the B12x repack, the D8 quantiser, selected-expert staging and the c4a/c4b attention seams
+remain host. The
+token is therefore still **hybrid: host math over device logits**. Criterion 1 remains OPEN until a
+full 130 + 8 run meets section 4.3 items 1-6. The batch-22 review additionally found that this
+sentence omitted the head-weight read/upload, which is host work before the token as well; the
+claim text below names it.
+
+**Proposed criterion-1 claim text (not yet claimed by c4c).** c4c is a wiring result only. A
+criterion-1 sentence may be issued only after a full 130 + 8 run passes all six items of section 4.3;
+if it does, the honest sentence is:
+
+> 130-token prompt prefill plus 8 decode steps reproduced every decoded token (491, 367, 201, 80, 3302,
+> 201, 54, 201, 4341). In that run the device executed the mHC entry/post chain, the attention
+> projection trio and format-2 body, the routed MoE, the shared expert (dense w1/w3 + 2304-wide
+> SwiGLU quantiser + dense w2, four launches per layer), the standalone final RMSNorm
+> (`rmsnorm_sm121`, bit-identical to the host norm rounded to BF16), and the certified head screen
+> with in-kernel block argmax. **The ONLY host pieces left before the token are the one-time
+> head-weight read/upload and the four-shard block-max/argmax assembly**; the shared add, B12x
+> repack, D8 activation quantiser, selected-expert staging and the other c4a/c4b attention seams
+> remain host inside the layers. The token is therefore
+> **hybrid: host math over device logits**, not a device
+> token. This is a hybrid criterion-1 PASS with the named host seams, not a full-device-chain claim;
+> criteria 2-5 and serving readiness remain unclaimed.
+
+**Lines that falsify the claim.** Any one of these in the same run is a FAIL, not a recorded
+divergence:
+
+- `token comparison: reference_id=<a> hybrid_id=<b> exact_equal=false ...` and
+  `CHAIN-WIRING token parity: FAIL - the hybrid token id is not the in-process reference token id`;
+- `lm head diag: ... token_match=false` or `device head diagnose: the device token ... differs from
+  the same-bf16-byte host twin token ...`;
+- `final norm diag: ... bf16_mismatches=<nonzero> ...` or `device final norm diagnose: the device BF16
+  norm differs from the host bf16 twin ...`;
+- `moe layer0 diag: shared ...` with any nonzero gate/up/codes/scales/shared mismatch, or
+  `shared expert totals: ... layer0_shared_bf16_mismatches=<nonzero> ...`;
+- `c4c seam line withheld: the routed MoE plus shared expert must launch exactly 21 times ...`;
+- `c4a-2 chain abort: the source has no tensor named ...`, `declared <dtype> <shape>, expected
+  <dtype> <shape>`, or `expected <n> bytes, got <m>` (a staging failure, not a measurement);
+- on the full run, `position <p>: fixture token <expected>, device token <found>` or
+  `position <p>: max |logit difference| <diff> exceeds the bar 0.02`, or a missing seam-ledger /
+  metadata item from section 4.3.
+
+A nonzero boundary delta is a **recorded divergence** and does not rescue a token or logits failure;
+the claim sentence must name it if it is present.
+
+### c4c-norm window b45: PRE-FIX accounting run (not the split-counter record)
+
+Window b45 re-ran the review-fix binary before the split-counter fix. Window log
+`/home/user/phase2-evidence/window-2026-10-18/window-b45-20261019T090623Z.log`
+(sha256 `e3cfa0f079624c83f7365a0ea61754ac10f1d6262501050f025dc89ff378036d`), window start
+`2026-10-19T09:06:23Z`, host `node0`. The c4c-norm RUN started `09:07:35Z`, exited 0 at
+`09:08:24Z`, binary `sparkflash_m3c_c4c_review_5ea5e2d_aarch64`, sha256
+`4c64e1300f66fd3cae59df2441bdf603d653afef2f34290cc30fc9df8befbf63`. The binary predates
+`69564a5`, so its routed/shared totals lines are **stale cumulative lines**, not the routed-only
+and shared-only split. Quote them only as the stale pre-fix output:
+
+```text
+routed MoE totals: layers=40 router_launches=40 gate_up_launches=320 weighted_launches=160 combine_launches=160 moe_launches=680 staging_ms=4937 device_us=4399358 staged_expert_bytes=9349393600 host_bytes=4516477624 layer0_host_max_abs=1.909e-1 layer0_host_rel=2.014e-2 layer0_host_max=9.479e0 layer0_bf16_twin_mismatches=0 layer0_bf16_twin_max_abs=0.000e0
+shared expert totals: layers=40 shared_launches=160 staging_ms=1679 device_us=304127 total_us=1983896 staged_shared_bytes=1417171200 host_bytes=4516477624 layer0_shared_bf16_mismatches=0 layer0_shared_host_max_abs=1.303e-2 layer0_shared_host_rel=8.163e-3 layer0_shared_host_max=1.597e0
+```
+
+Both lines print the same cumulative `host_bytes` and the routed line's `staging_ms=4937` is the
+routed-plus-shared cumulative staging, so neither line is the split counter. The only reproducible
+b45 accounting lines are the independently emitted `moe counts` line and the chain totals:
+
+```text
+moe counts: routed_launches=680 shared_launches=160 total_launches=840 routed_staging_us=3257768 shared_staging_us=1679769 total_staging_us=4937537
+chain totals: layers=40 entry_launches=42 post_launches=40 attention_projection_launches=200 attention_body_launches=40 routed_moe_launches=680 shared_moe_launches=160 head_launches=4 tail_norm_launches=1 moe_launches=840 device_launches=1167 engram_split_layers=2 device_us=4968390 device_ms=4968.390 staging_ms=12148 host_ms=15352 total_chain_ms=18182 host_bytes=4591049624 staged_matrix_bytes=16073744000 cubin_bytes=302136 device_buffer_bytes=48723168
+```
+
+The c4c token comparison in the same window was
+`reference_id=5 hybrid_id=5 exact_equal=true top5_overlap=4`, CHAIN-WIRING parity PASS; it is
+not criterion 1. The window's second run, `seq-sanity2`, started `09:08:24Z` and exited 1:
+position 0 failed the fixture-token comparison and the CSA2 sequence body launches were absent
+(that build had no p>0 sequence entry), so it is a failure record, not a sequence measurement. Logs:
+`runs45/c4c-review-hybrid-token0.log` and `runs45/seq-sanity2.log`. The post-fix c4c-norm re-shoot is window b54 (see the accounting note above); b45 is not the split-counter record to cite.
+
+**Embedding-row staging (a29aecd).** hybrid_token still guards --token 0: its in-process
+reference is the token-0 slot, so a non-zero prompt id is not accepted there. The a29aecd fix
+(stage the requested token's embed.weight row instead of hardcoding row 0) is therefore
+**unexercised by this token-0 record**: it is exercised only when a sequence path runs a non-zero
+prompt id, and the 3-position sanity run is the first log expected to cite it. The guard is a
+deliberate reference-shape limit, not a claim that row 0 is the only embedding row.
 
 ### c3 window b22: PASS - CHAIN-WIRING token parity (NOT a device token)
 

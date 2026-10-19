@@ -41,7 +41,8 @@ records the evidence and the consequence for the build. Research backing is in
 | D30 | Routed-expert sharding follows the verified kernel | TP=4 over the intermediate width (576 per rank padded to 640) for the routed experts, because that is the only routed-expert layout the device has run; the reference's whole-expert rule is recorded as not implemented, the shared expert stays whole and replicated, and the padding costs +8.22 GB/rank of routed-expert storage (74.0 -> 82.2 GB/rank) |
 | D31 | The certified LM head counts every thread's prunes, and the pin is re-baselined | `cert_lm_head_sm121`'s published `certified_count` was lane 0's per-thread count only, so the concentrated pruning case reported 34 against 4,899 flags (b21 printed only the aggregate count mismatch across the four ranks; b23 measured the per-rank 34); the atomic now adds every thread's prunes, the count is deterministic, and the cubin is re-pinned at 14,888 B / `7394b129...` with the ABI unchanged (same entry, geometry and `certified_count` semantic) |
 | D32 | The routing-weight multiply is a named host seam in the routed device chain (F6) | The released arithmetic multiplies the SwiGLU output by the routing weight BEFORE the w2 activation quantiser reads it, and no pinned routed kernel takes a weight operand. m17a therefore measures the device SwiGLU+quantise stage unweighted, and builds the combine operand on the host from the same device gate/up bf16 values with `mxfp4_ref::routed_activation_operand`; the combine is weighted but its activation operand is host-quantised by the reference's own rule. A weighted quantiser variant is the planned follow-up (new cubin, deliberate re-pin), not part of m17a |
-| D33 | The routed combine operand is built on the device: the weighted SwiGLU+quantise variant closes the F6 host seam | `swiglu_mxfp8_quant_weighted_sm121` (own cubin, 13,000 B / `0e602daf...`, `ptx_membar_lines=0`) takes a per-row routing-weight operand and does the model's order on the device: asymmetric-clamped SwiGLU, one bf16 rounding of the product, then the activation ceil-rule quantise. m17a's stage 3 reads the router's `weights_d` in place and stage 4's combine consumes those device codes/scales, so no host multiply and no host quantise remain in the routed path; the class is `swiglu_ref::quantise_row_weighted` (which equals `mxfp4_ref::routed_activation_operand` composed with SwiGLU) and the real 576-wide operand is compared against `routed_activation_operand` directly. The unweighted epilogue stays pinned for m17b's shared expert; the six-kernel frozen m4 ABI array is untouched; window b33 measured it PASS at tokens 8 and 130 (35 checks each) |
+| D33 | The routed combine operand is built on the device: the weighted SwiGLU+quantise variant closes the F6 host seam | `swiglu_mxfp8_quant_weighted_sm121` (own cubin, 13,000 B / `0e602daf...`, `ptx_membar_lines=0`) takes a per-row routing-weight operand and does the model's order on the device: asymmetric-clamped SwiGLU, one bf16 rounding of the product, then the activation ceil-rule quantise. m17a's stage 3 reads the router's `weights_d` in place, and stage 4's combine receives those device codes/scales through a host re-upload of the stage-3 readback (a byte copy, no host arithmetic on them), so no host multiply and no host quantise remain in the routed path; the class is `swiglu_ref::quantise_row_weighted` (which equals `mxfp4_ref::routed_activation_operand` composed with SwiGLU) and the real 576-wide operand is compared against `routed_activation_operand` directly. The unweighted epilogue stays pinned for m17b's shared expert; the six-kernel frozen m4 ABI array is untouched; window b33 measured it PASS at tokens 8 and 130 (35 checks each) |
+| D34 | The serving tail's final norm is a standalone BF16 kernel, planned and pinned before any window | `kernels/rmsnorm_sm121.cu` reproduces the engine's final-norm arithmetic exactly (`sum(x^2)` ascending f32, `/cols`, `1/sqrt(mean+eps)`, `(x*inv)*w`, one BF16 RN-even rounding) with one thread per row and 128-bit BF16 loads; the host reference is the engine's own `linalg::rms_norm`, not a copy. Pinned at 31,480 B / `5f953bc0...` / `ptx_membar_lines=0` (baseline eleventh entry, driver `KernelId::RmsNorm`); m18 is measured (0 mismatched BF16 bytes at 8 and 130 tokens, odd 513 exact, two launches byte-identical) and c4c-norm wired it (b41 0/10,240 mismatches). Details: `docs/build/phase3-rmsnorm-tail.md` |
 
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
@@ -1873,7 +1874,8 @@ the shared expert (m17b) still uses it.
 
 m17a's stage 3 is rebuilt on the weighted entry: the kernel's weight operand is the router's
 `weights_d` buffer, read in place (the router output is not copied or re-uploaded for the operand),
-and stage 4's combine consumes the stage-3 device codes/scales directly. The harness prints the
+and stage 4's combine takes the stage-3 device codes/scales through a host re-upload of the stage-3
+readback: a byte copy of the device write, with no host arithmetic applied to it. The harness prints the
 class before the numbers, compares the device operand bit-exact against
 `quantise_row_weighted` (codes and scales, all rows), additionally compares the real 576-wide
 columns bit-exact against `mxfp4_ref::routed_activation_operand` (the model operand the old host
@@ -1902,3 +1904,58 @@ the router's weight buffer to the weighted epilogue and its output to the combin
 epilogue remains the shared expert's quantiser. If a later window finds a mismatch, the class is a
 finding against this kernel, not a tolerance to widen, and the host path of D32 stays the fallback
 until it is fixed.
+
+---
+
+## D34 — The serving tail's final norm gets a standalone BF16 kernel, planned and pinned before any window
+
+**Decision.** Add \`kernels/rmsnorm_sm121.cu\`, the model's final RMSNorm as its own stage, so c4c can
+put the last host op (the engine's \`final_norm\` seam at \`crates/sparkflash-engine/src/forward/mod.rs:602\`,
+\`linalg::rms_norm\` at \`crates/sparkflash-engine/src/linalg.rs:318\`) on the device. The entry is
+\`rmsnorm_sm121(x_bf16, weight_bf16, out_bf16, rows, cols, eps, trace_ring, layer_id, step_seq)\`:
+BF16 \`[rows][cols]\` in, BF16 \`[rows][cols]\` out (the head's ABI), the released BF16 \`[5120]\`
+weight, and the config's \`rms_norm_eps\` cast to f32 exactly as the engine casts it.
+
+**The arithmetic is the engine's, op for op.** Per row, ascending columns: \`sum(x*x)\` as f32 with
+one rounding per multiply and add; \`mean = sum / cols\`; \`inv = 1/sqrt(mean + eps)\`; \`(x * inv) * w\`;
+one BF16 round-to-nearest-even on the output. The kernel uses \`__fmul_rn\`, \`__fadd_rn\`,
+\`__fsqrt_rn\` and \`__fdiv_rn\` so nvcc cannot contract the square-and-add into an FMA (one rounding
+where the engine rounds twice) or replace sqrt-then-reciprocal with an approximate rsqrt. One
+thread owns one whole row because a block/warp reduction sums in a different order; the row-serial
+order is the engine's, and the tail's row count is the token count (1 in serving, 8 and 130 in the
+window). 128-bit BF16 loads (\`ld.global.nc.v4.u32\`) cover \`cols % 8 == 0\` (5120 released); any other
+width takes the scalar path and is tested at 513 columns. The kernel emits **no trace event**: all
+sixteen protocol scope bits are assigned and none describes a tail norm, so the trace words are
+carried for ABI uniformity only and the pin's \`ptx_membar_lines=0\` is expected.
+
+**Pin and CPU-side evidence (all before any window).** nvcc V13.0.88 / CUDA 13.0.3 / sm_121a:
+\`rmsnorm_sm121\` cubin **31,480 B**, sha256
+\`5f953bc0fb781afe3f9b42703b19b37f89ef45b74a4ad607938df2e2c3448579\`, \`ptx_membar_lines=0\`;
+PTX inspection shows 0 \`fma.rn\`, 2 \`div.rn.f32\`, 1 \`sqrt.rn.f32\`, 0 \`rsqrt\`, and the
+\`ld.global.nc.v4.u32\` vector loads. It is the **eleventh** entry in
+\`crates/sparkflash-kernels/baseline/kernel_baseline.txt:12-22\`; \`build.rs\`'s \`PROBED_KERNELS\` probes
+eleven sources and the combined probe still compiles every kernel in one translation unit;
+\`cuda_driver::KernelId\` gained \`RmsNorm\` (ten variants); the frozen six-kernel \`m4_abi\` array is
+untouched. The host reference (\`crates/sparkflash-kernels/src/rmsnorm_ref.rs\`) calls the engine's
+own \`sparkflash_engine::linalg::rms_norm\` over the bf16-decoded bytes and rounds with
+\`m4_quant::bf16_bits\` - it is not a second copy of the formula, so an engine change surfaces as a
+mismatch; a source pin (a review ratchet) fails if the twin is ever re-implemented. The harness
+\`crates/sparkflash-kernels/examples/m18_final_norm.rs\` reads the released \`norm.weight\` and
+\`config.json\` and checks: released geometry; real width bit-exact (zero mismatched BF16 codes) and
+two-launch determinism; an epsilon-control launch at eps = 1.0 (bit-exact to the reference at 1.0,
+different from the released-epsilon output); and a synthetic \`[3, 513]\` odd-width case bit-exact.
+
+**Status: measured and wired.** m18 measured 0 mismatched BF16 bytes at 8 and 130 tokens, the odd 513 case exact, two launches byte-identical; c4c-norm wired it (b41 0/10,240 BF16 mismatches). The window record is in the phase3-rmsnorm-tail section 7. The branch also
+carries the m17c review's doc-only wording correction: the stage-4 routed-combine operand handoff
+is a host re-upload of the stage-3 readback (a byte copy of the device write, no host arithmetic on
+it), not a device-to-device handoff and not "only for the comparison twins".
+
+**Not claimed.** Not the served forward pass, not c4c engine integration (engine-dev wires the
+launch and the fallback), not the LM head, not a token/chain/per-layer claim, not host-time saved,
+not a performance or bandwidth claim. The activation rows are released \`embed.weight\` rows, a
+declared stand-in for the collapsed tail hidden. \`sparkflash-device::cubins::REQUIRED_KERNELS\`
+requires this kernel as one of the nine chain kernels, so the launch and fallback are covered by the catalog.
+
+**Consequence.** c4c can replace the \`final_norm\` host seam with one launch plus a declared host
+fallback, and the comparison class is bit-exact, not a tolerance: if the window finds a mismatch it
+is a finding against this kernel, not a widened bar.

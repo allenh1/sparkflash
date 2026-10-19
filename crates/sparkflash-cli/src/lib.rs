@@ -7,4 +7,6 @@
 pub mod attention_device;
 pub mod device_chain;
 pub mod doctor;
+#[cfg(feature = "cuda")]
+pub mod moe_device;
 pub mod serve;

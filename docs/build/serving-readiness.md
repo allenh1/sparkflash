@@ -66,11 +66,11 @@ has actually been executed on a GB10; "gap" is what separates the stage from a w
 | 7 | MoE router | `MOE_ROUTER` | **measured**: two m9 runs, 7/7 checks each | chain wiring only |
 | 8 | routed expert gate/up (w1/w3) + SwiGLU + activation quantiser | `ROUTED_GATE_UP` (merged, !86) | **measured** gate/up projection: window b6, 30,720/30,720 and 499,200/499,200 bf16 exact, padding 0, deterministic; typed builder merged, **not wired**; SwiGLU quantiser kernel probed, never trusted | gate/up chain wiring; routing weight, SwiGLU/combine and shared expert still host |
 | 9 | routed down/combine | `MXFP4_MOE` | **measured**: slice 40,960/40,960 and 163,840/163,840 exact; stage 3 PASS; chained 7/9 | chain wiring only |
-| 10 | shared expert | `MXFP8_DENSE` (gate/up, down) + host SwiGLU/quantiser | **measured as GEMM**: stage-8 probe bit-exact; stage-9 K13-K15 device GEMMs with host activation | chain wiring; fused kernel optional |
+| 10 | shared expert | `MXFP8_DENSE` (gate/up, down) + `SWIGLU` quantiser | **wired in c4c**: four device launches/layer; b40/b41 `shared_launches=160`, `shared_bf16_mismatches=0` | device complete; host shared-add elementwise remains a declared seam |
 | 11 | FFN epilogue: routed-weighted sum, shared add | routed sum inside `MXFP4_MOE`; shared add host | **measured** only in host references / harness combine | no device epilogue kernel; see the seam-name gap in 2.11 |
-| 12 | final RMS norm | none | host seam only | **kernel missing**; class (b) seam |
-| 13 | certified LM-head screening | `CERT_LM_HEAD` | **measured once per rank** (stage 5): 129,280 entries exact, 0 certified | chain wiring; exactness in the chain; block reduction is host |
-| 14 | greedy argmax over the reduced maxima | none | host seam only | **kernel missing**; class (b) seam |
+| 12 | final RMS norm | `RMSNORM` (D34) | **wired in c4c-norm**: b41 `final_norm_launches=1`, 0/10,240 BF16 mismatches | device complete; host `linalg::rms_norm` remains the fallback |
+| 13 | certified LM-head screening | `CERT_LM_HEAD` | **wired in c4c**: four rank launches, 129,280 entries exact, 0 certified; b41 `head_launches=4` | device screen+argmax; four-shard block-max assembly and token readback are host |
+| 14 | greedy argmax over the reduced maxima | in-kernel block argmax over four rank shards | **wired in c4c**: in-kernel argmax, host four-shard reduction | device argmax; host block assembly remains |
 | 15 | dispatch / launch scheduling | none (control) | design seam `dispatch` | Phase 3 graph runner |
 | 16 | Engram read/write (layers 1, 14) | none (reference code) | used as reference code in the stage-9 chain | device head is Phase 3; tables are 202.758 GB |
 
@@ -85,17 +85,26 @@ device evidence either.
 
 ## 2. Stage detail: pins, harnesses, measurements, APIs, gaps
 
-Kernel pins are in `crates/sparkflash-kernels/baseline/kernel_baseline.txt:12-21` (ten entries,
+Kernel pins are in `crates/sparkflash-kernels/baseline/kernel_baseline.txt:12-22` (eleven entries,
 nvcc release V13.0.88, arch sm_121a). The six Milestone-4 kernels are the six-entry
 `m4_abi::KERNELS` array (`crates/sparkflash-kernels/src/m4_abi.rs:867`; constants at `:854, :856,
 :858, :860, :862, :864`), and `m4_abi` is frozen by D26 (`docs/DECISIONS.md`), so the router, SwiGLU
 (and its weighted routed variant, D33) and gate/up kernels are pinned outside that array (router ABI:
 `crates/sparkflash-kernels/src/router_abi.rs`; SwiGLU: `kernels/swiglu_mxfp8_quant_sm121.cu:1-14` and
-`kernels/swiglu_mxfp8_quant_weighted_sm121.cu`; gate/up: `routed_gate_up_abi.rs`). The driver
-enum has nine variants (`cuda_driver.rs:157-177`), one raw loader and launch path
+`kernels/swiglu_mxfp8_quant_weighted_sm121.cu`; gate/up: `routed_gate_up_abi.rs`; the serving tail's standalone RMSNorm: `kernels/rmsnorm_sm121.cu`
+and `docs/build/phase3-rmsnorm-tail.md`, D34). The driver
+enum has ten variants (`cuda_driver.rs:157-179`), one raw loader and launch path
 (`Cuda::load_kernel` `:527`, `Cuda::launch` `:562`, `launch_repeated` `:607`); typed launchers
 exist for attention and router (2.6/2.7), and `!88` added typed param builders for mHC, dense, wo_a,
 MXFP4 down/combine, LM head and routed gate/up (`*_launch.rs`), none of them wired into a chain yet.
+
+`rmsnorm_sm121` is the serving tail's standalone final RMSNorm (D34,
+[phase3-rmsnorm-tail.md](phase3-rmsnorm-tail.md)): the kernel, its pin (31,480 B, `5f953bc0...`,
+`ptx_membar_lines=0`), the host reference and the m18 harness are written, **measured** (0 mismatched
+BF16 bytes at 8 and 130 tokens, odd 513 exact, two launches byte-identical) and **wired** by c4c
+(b41: 0/10,240 mismatches, 1,167 device launches). The tail's `final_norm` stage map line is now a
+device stage, and `sparkflash-device::cubins::REQUIRED_KERNELS` requires **nine** chain kernels, the
+tail norm included.
 
 `mega_mhc_sm121` is the baseline manifest key; the cubin entry the driver and the harness use is
 `mega_mhc_fused_bf16_sm121` (`cuda_driver.rs:174`). Both names denote the same 70,312 B cubin
@@ -287,8 +296,9 @@ and "SwiGLU and the activation quantiser").
 `routed_gate_up_ref.rs`), the harness `examples/m10_gate_up.rs`, the doc
 [phase3-gate-up.md](phase3-gate-up.md), and the baseline entry
 `routed_gate_up_sm121 cubin_bytes=9752 cubin_sha256=115200d26c3404b7169c476e350f5575dadc3fec9e8b0ec97113cd297fa6c1af`.
-`KernelId` now has nine variants including `RoutedGateUp` (`cuda_driver.rs:176`), and
-`sparkflash-device/src/cubins.rs` requires the pin as one of the eight chain kernels (`:34`,
+`KernelId` now has ten variants including `RoutedGateUp` (`cuda_driver.rs:176`) and the tail's
+`RmsNorm` (`:178`), and
+`sparkflash-device/src/cubins.rs` requires the pin as one of the nine chain kernels (`:34`,
 `:39`). The chain's stage map labels it `DeviceMeasuredNotWired` (`chain.rs:366`, `:477`): the
 kernel computes **one** projection (w1 or w3) of one routed-expert slice per launch — 576 real
 columns per rank padded to 640, D30's layout — and ends at BF16 rows, leaving SwiGLU and the
@@ -383,9 +393,9 @@ prevent.
 ### 2.12 final RMS norm (row stage 12)
 
 Class (b) seam `final_norm`: host `linalg::rms_norm` after the tail's collapse
-(`forward/mod.rs:487-490`, collapse `mhc::hc_pre`). No kernel. The design forbids host execution for
+(`forward/mod.rs:487-490`, collapse `mhc::hc_pre`). The design forbids host execution for
 a device-chain claim, so a token produced with a host final norm is a hybrid token by definition.
-**Gap:** final-norm kernel missing (Phase 3); first hybrid run may use the seam, labelled.
+**Resolved:** `rmsnorm_sm121` is pinned (`5f953bc0...`, 31,480 B) and measured bit-exact in window b40 (7 checks at tokens 8 and 130); it is wired as the c4c-norm device tail in window b41 (`final_norm_launches=1`, `bf16_mismatches=0` of 10,240 bytes) and is a required catalog kernel. The host seam remains available as a fallback, labelled.
 
 ### 2.13 certified LM head (row stage 13)
 
@@ -428,9 +438,11 @@ a device-chain claim, so a token produced with a host final norm is a hybrid tok
 ### 2.14 greedy argmax (row stage 14)
 
 Class (b) seam `lm_head_argmax`: the block reduction over the four ranks' 32 per-block maxima plus
-the lowest-index tie-break, `lm_head_ref::best_entry:161`, `cert_lm_head_sm121.cu:27-30`. No kernel;
-head reduction/sampling kernel is Phase 3. **Gap:** kernel missing (Phase 3); a first hybrid run may
-use the seam, labelled "hybrid: token produced by host math over device logits".
+the lowest-index tie-break, `lm_head_ref::best_entry:161`, `cert_lm_head_sm121.cu:27-30`.
+**Resolved as a kernel:** `lm_head_reduce_sm121` is pinned (36,120 B / `3fcd7ba5...`) and measured in
+window b44 (m19 PASS 17/17: block arrays, tie-break, certified-winner refusal); the device token
+cut-over wiring is pending, so a pre-cut-over run still uses the seam, labelled "hybrid: token
+produced by host math over device logits".
 
 ### 2.15 dispatch and boundary capture (row stage 15)
 
@@ -557,7 +569,7 @@ and separates what is already on main.
    self-check (fails on a missing **and** an unplanned seam), and runs through a `ChainOps` backend
    with `chain_execution = false`.
 2. `window.rs` accounts the 128-slot rings (67,584 B each, 2,703,360 B for 40 layers) and
-   round-trips the oldest-first view; `cubins.rs` parses the ten baseline pins, requires the eight
+   round-trips the oldest-first view; `cubins.rs` parses the eleven baseline pins, requires the nine
    chain pins (the six chain kernels plus router and routed gate/up) and verifies size and SHA-256
    fail-closed.
 3. `sparkflash device-chain --plan-only` prints the schedule, stage map, planned seam counts, the
@@ -787,6 +799,26 @@ cubin_bytes=151984 device_buffer_bytes=48723168`. Body cost is 349.5 microsecond
 (measured, not a throughput claim). Claim unchanged: **CHAIN-WIRING parity, not a device-token
 result; criterion 1 remains OPEN**.
 
+**M3-c c4b — device routed MoE family (window b36 PASS; b34 and b35 failure records).** c4b moves the
+routed MoE family onto the device (router, 8 gate/up rank launches, 4 weighted SwiGLU launches, 4
+serial combine launches = 17 per layer, 680 over 40 layers, 1002 total with the 322 attention/mHC
+launches). Window b34 on `sparkflash_m3c_c4b_12cbb46_aarch64` (sha256 `ac1f766d...`) passed the
+one-layer preflight (`one_layer_ms=203.517 staging_ms=188 device_us=183663 projected_full_chain_s=8.1`)
+but failed token parity (reference 5, hybrid 271, layer-0 `residual_out max_abs_delta=9.425920e0`);
+the single-token shared-expert seam was overwriting the routed row, fixed in `c2a205d`. Window b35
+on `sparkflash_m3c_c4b_c2a205d_aarch64` then aborted at layer 0 on a first-cut `1e-2` f32 bar at
+`1.9090915e-1`; that bar was a guess, not a measured class bar, and is kept as a failure record.
+Window b36 on `sparkflash_m3c_c4b_e06e9ff_aarch64` (sha256 `7e1f073e...`, source `e06e9ff`) passed:
+`token comparison: reference_id=5 hybrid_id=5 exact_equal=true top5_overlap=5`, `CHAIN-WIRING token
+parity: PASS`. The layer-0 bar is now the measured bf16-twin identity: `weighted rank0
+codes_mismatched=0 scales_mismatched=0`, `bf16 combine twin exact=true mismatches=0
+per_rank=[0,0,0,0]`, while the f32 difference is `1.9090915e-1` against `host_max=9.479069e0`
+(`relative=2.0140074e-2`), a declared f32-vs-bf16 serial-combine class spread printed as calibration
+rather than an abort. Routed totals: `moe_launches=680 staging_ms=2982 device_us=2945226
+staged_expert_bytes=9349393600`; chain totals: `device_launches=1002 device_ms=3514.609
+total_chain_ms=17631`. This is **chain-wiring parity, not a device-token result**; criterion 1
+remains **OPEN**.
+
 **M3-c — first hybrid token (the first real end-to-end run).**
 9. Implement the per-layer order of design 2.2 with the seams of design 3.1, using the existing
    builders (`Format2AttentionCall`, `WindowRingLayout`/`rotate_window_ring`), the typed chain
@@ -828,8 +860,8 @@ token, not part of it.
 ### 3.4 Missing kernels, in dependency order for a *device* (non-hybrid) claim
 
 1. Routed gate/up chain wiring (the kernel is merged and measured; blocks the device FFN stage, 2.8).
-2. Final-norm kernel (blocks a device token path, class (b)).
-3. Head block-reduction / greedy-argmax kernel (blocks a device token path, class (b)).
+2. Final-norm kernel: resolved - `rmsnorm_sm121` pinned, measured (b40) and wired as the c4c-norm tail (b41); the host `linalg::rms_norm` remains the labelled fallback.
+3. Head block-reduction / greedy-argmax kernel: resolved as a kernel - `lm_head_reduce_sm121` pinned (36,120 B / `3fcd7ba5...`) and measured in window b44 (m19 PASS 17/17); the device token cut-over wiring is pending.
 4. Embedding gather kernel (input side; host seam is allowed for a hybrid run).
 5. Fused norm+RoPE kernel (attention prologue; host seam allowed).
 6. Optional later: fused shared-expert kernel, HSI/indexer kernels, device KV store (S1), compressor
@@ -980,7 +1012,7 @@ repository or the evidence tree on this host.
 | chained 40-row column | this host: `/home/user/phase1-evidence/phase1-c-stage9-40rows-harness5b-20261018T050416Z.log` (572,420 B, sha256 `bd0f908e...`); device pair `stage9-out-r5b/device.{manifest,blob}` (shas `6093c74b...`/`fecd813b...`) | 40 rows × 2 runs, 763 launches/run, 298.6 s, bit-identical; Phase-1 aggregate 306 under / 414 over bar |
 | B2 chained replay | this host: `/home/user/phase1-evidence/phase1-b2-stage7-layer0-rereview5-20261018T044122Z.log` (23,897 B, sha256 `c2de544c...`) | 20 launches (16 chain + 4 forced-routing control), UTC 04:41:22Z |
 | head | this host: `/home/user/phase1-evidence/stage5-device-run-timed.log`, `stage5-device-final.log` | 4 launches (one per rank), 129,280 exact, 0 certified, argmax 5, 1.56 s incl. 1.32 GB upload |
-| window-cubin set | **node-only:** eleven files = the ten baseline cubins plus the legacy `mega_mhc_sm121` copy, all matching `kernel_baseline.txt` when checked; **this evidence tree has seven** (`cubins/`: no `moe_router`, no `routed_gate_up`, no `mega_mhc_fused` copy) | pin check |
+| window-cubin set | **node-only:** twelve files = the eleven baseline cubins plus the legacy `mega_mhc_sm121` copy, all matching `kernel_baseline.txt` when checked; **this evidence tree has seven** (`cubins/`: no `moe_router`, no `routed_gate_up`, no `mega_mhc_fused` copy) | pin check |
 
 The b4 first gate/up attempt (`dd9921a4` from `0ff78fe`) panicked at `m10_gate_up.rs:221`
 (30,720 vs 27,648) and produced no numbers; b6 is the completed gate/up window with both shapes.
@@ -993,7 +1025,7 @@ and is not cited.
 
 - `device-forward-chain.md` section 2.1 says "the corrected device path has not run". That is **still
   true for the 40-layer chain** (the m8 plumbing binary ran at 2026-10-18T18:32Z, but no chain is
-  wired); section 2.2 on main already records the baseline's ten entries and that gate/up is merged
+  wired); section 2.2 on main already records the baseline's eleven entries and that gate/up is merged
   but not wired, so those earlier corrections are now in the doc of record rather than this list.
 - `kernels/flash_mla_csa2_sm121.cu:53-58` says format 2 was never executed on a device; task-14 and
   the m8 dispatch supersede it (2.6).

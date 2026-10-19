@@ -49,6 +49,13 @@ __device__ __forceinline__ __nv_bfloat16 __ushort_as_bfloat16(unsigned short bit
 
 // Built-in variables and device runtime functions that CUDA declares in its headers. clang
 // already knows __syncthreads() as a builtin, so it is deliberately absent here.
+struct uint4 {
+    unsigned int x;
+    unsigned int y;
+    unsigned int z;
+    unsigned int w;
+};
+
 struct uint3 {
     unsigned int x;
     unsigned int y;
@@ -139,4 +146,16 @@ __device__ __forceinline__ float __fmul_rn(float a, float b) {
 
 __device__ __forceinline__ float __fadd_rn(float a, float b) {
     return a + b;
+}
+
+// The final RMSNorm kernel's correctly-rounded sqrt and divide (CUDA device_functions.h). The
+// declarations exist only so the -fsyntax-only probe can type-check the kernel; they carry no
+// semantics here and nvcc uses its own definitions.
+__device__ __forceinline__ float __fsqrt_rn(float value) {
+    (void)value;
+    return value;
+}
+
+__device__ __forceinline__ float __fdiv_rn(float a, float b) {
+    return a / b;
 }

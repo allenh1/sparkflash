@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn the_embedded_baseline_parses_and_pins_every_m4_kernel() {
         let pins = pins().expect("the embedded baseline parses");
-        assert_eq!(pins.len(), 10, "the baseline pins ten kernels: {pins:?}");
+        assert_eq!(pins.len(), 11, "the baseline pins eleven kernels: {pins:?}");
         // m4_abi stays frozen (D26); this test only reads its name list and proves the baseline the
         // chain verifies against covers every kernel the ABI module exposes.
         for (source_name, _source) in crate::m4_abi::KERNELS {
@@ -160,7 +160,8 @@ mod tests {
                 "m4_abi kernel {source_name} has no baseline pin"
             );
         }
-        // The device chain's six chain kernels are all pinned; so are the router and gate/up.
+        // The device chain's six chain kernels are all pinned; so are the router, gate/up and the
+        // serving tail's RMSNorm (D34).
         for name in [
             "mega_mhc_sm121",
             "b12x_mxfp8_dense_sm121",
@@ -170,6 +171,7 @@ mod tests {
             "cert_lm_head_sm121",
             "moe_router_sm121",
             "routed_gate_up_sm121",
+            "rmsnorm_sm121",
         ] {
             let pin = pin(name)
                 .expect("parse")

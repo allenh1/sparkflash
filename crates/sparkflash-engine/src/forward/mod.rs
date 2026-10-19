@@ -586,6 +586,7 @@ impl InferenceEngine {
                 None,
                 None,
                 None,
+                None,
             )?;
             if let (Some(table), Some(row)) = (capture.as_deref_mut(), row) {
                 table.push_row(row)?;
@@ -666,6 +667,7 @@ impl InferenceEngine {
         mut boundary: Option<&mut LayerBoundary>,
         mut post: Option<&mut HybridPostProvider<'_>>,
         attention: Option<&mut dyn attention::AttentionProjectionBackend>,
+        mut moe: Option<&mut dyn moe::MoeDeviceBackend>,
         deferred: Option<&mut Option<DeferredHandoff>>,
     ) -> Result<(), EngineError> {
         let config = &self.config;
@@ -1060,15 +1062,60 @@ impl InferenceEngine {
             u64_bytes(shared_inter),
             "shared-expert SwiGLU and activation quantisation",
         );
-        moe::moe_forward(
-            config,
-            &prefix,
-            &scratch.ffn_in,
-            source,
-            self.limit,
-            &mut scratch.moe,
-            &mut scratch.ffn_out,
-        )?;
+        let device_moe = match moe.as_deref_mut() {
+            Some(backend) => backend.ffn(
+                config,
+                layer,
+                &prefix,
+                &scratch.ffn_in,
+                source,
+                self.limit,
+                &mut scratch.ffn_out,
+            )?,
+            None => false,
+        };
+        if !device_moe {
+            moe::moe_forward(
+                config,
+                &prefix,
+                &scratch.ffn_in,
+                source,
+                self.limit,
+                &mut scratch.moe,
+                &mut scratch.ffn_out,
+            )?;
+        } else {
+            let device_shared = match moe.as_mut() {
+                Some(backend) => backend.shared_expert(
+                    config,
+                    layer,
+                    &prefix,
+                    &scratch.ffn_in,
+                    source,
+                    self.limit,
+                    &mut scratch.ffn_out,
+                )?,
+                None => false,
+            };
+            if !device_shared {
+                moe::add_shared_expert(
+                    config,
+                    &prefix,
+                    &scratch.ffn_in,
+                    source,
+                    self.limit,
+                    &mut scratch.moe,
+                    &mut scratch.ffn_out,
+                )?;
+            }
+        }
+        record_stage(
+            &mut stages,
+            "shared_expert_down",
+            u64_bytes(scratch.ffn_in.len()),
+            u64_bytes(config.dim),
+            "shared-expert w2 projection and the shared add into the routed row",
+        );
         if let Some(row) = boundary.as_deref_mut() {
             row.push_dense(config, boundary::FFN_OUT, scratch.ffn_out.clone())?;
         }
@@ -1214,6 +1261,7 @@ impl InferenceEngine {
                 None,
                 None,
                 None,
+                None,
             )?;
             let host_ms = started.elapsed().as_millis() as u64;
             layers.push(HybridLayerTrace {
@@ -1281,6 +1329,7 @@ impl InferenceEngine {
         provider: &mut HybridDeferredProvider<'_>,
         post: &mut HybridPostProvider<'_>,
         mut attention: Option<&mut dyn attention::AttentionProjectionBackend>,
+        mut moe_backend: Option<&mut dyn moe::MoeDeviceBackend>,
         progress: &mut dyn FnMut(usize, u64),
     ) -> Result<HybridTokenOutput, EngineError> {
         let config = &self.config;
@@ -1348,6 +1397,9 @@ impl InferenceEngine {
                 attention.as_mut().map(|backend| {
                     &mut **backend as &mut dyn attention::AttentionProjectionBackend
                 }),
+                moe_backend
+                    .as_deref_mut()
+                    .map(|backend| &mut *backend as &mut dyn moe::MoeDeviceBackend),
                 if defer_epilogue {
                     Some(&mut next_deferred)
                 } else {
@@ -1373,32 +1425,80 @@ impl InferenceEngine {
         }
         let mut collapsed = vec![0.0f32; dim];
         mhc::hc_pre(config, &pre_mix, &hidden, &mut collapsed)?;
-        let norm = linalg::decode_by_name(self.source.as_ref(), "norm.weight", self.limit)?;
         let mut tail = collapsed;
-        linalg::rms_norm(&mut tail, &norm, dim, config.norm_eps as f32)?;
+        let mut device_norm = false;
+        if let Some(backend) = moe_backend.as_mut() {
+            let mut norm_bf16 = Vec::new();
+            if backend.final_norm(
+                config,
+                &tail,
+                self.source.as_ref(),
+                self.limit,
+                &mut norm_bf16,
+            )? {
+                tail = norm_bf16
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| {
+                        let bits = u16::from_le_bytes(*pair);
+                        f32::from_bits(u32::from(bits) << 16)
+                    })
+                    .collect();
+                device_norm = true;
+            }
+        }
+        if !device_norm {
+            let norm = linalg::decode_by_name(self.source.as_ref(), "norm.weight", self.limit)?;
+            linalg::rms_norm(&mut tail, &norm, dim, config.norm_eps as f32)?;
+        }
         let head_input = tail.clone();
-        let head = linalg::decode_by_name(self.source.as_ref(), "head.weight", self.limit)?;
         let mut logits = vec![0.0f32; config.vocab_size];
-        linalg::matmul(&mut logits, &tail, &head, config.vocab_size, dim, 1)?;
-        let token = linalg::argmax(&logits).map(|index| index as u32);
+        let device_token = match moe_backend.as_mut() {
+            Some(backend) => {
+                backend.lm_head(config, &tail, self.source.as_ref(), self.limit, &mut logits)?
+            }
+            None => None,
+        };
+        let token = if let Some(token) = device_token {
+            Some(token)
+        } else {
+            let head = linalg::decode_by_name(self.source.as_ref(), "head.weight", self.limit)?;
+            linalg::matmul(&mut logits, &tail, &head, config.vocab_size, dim, 1)?;
+            linalg::argmax(&logits).map(|index| index as u32)
+        };
+        let head_note = if device_token.is_some() {
+            "device cert_lm_head_sm121 screen and in-kernel argmax over four rank shards; host block reduction"
+        } else {
+            "host head matmul; the device cert_lm_head_sm121 screen is a host stand-in in this run"
+        };
+        let argmax_note = if device_token.is_some() {
+            "device block argmax; host four-shard assembly"
+        } else {
+            "host greedy argmax; class-(b) seam, not device-executed"
+        };
         let tail_stages = vec![
             StageEvent {
                 stage: "final_norm",
                 host_bytes_in: u64_bytes(dim),
                 host_bytes_out: u64_bytes(dim),
-                note: "host final RMS norm; class-(b) seam, not device-executed",
+                note: if device_norm {
+                    "device rmsnorm_sm121 on the collapsed tail; BF16 out, host readback into the certified head"
+                } else {
+                    "host final RMS norm; device rmsnorm_sm121 was not run in this invocation"
+                },
             },
             StageEvent {
                 stage: "lm_head_screen",
                 host_bytes_in: u64_bytes(dim),
                 host_bytes_out: u64_bytes(config.vocab_size),
-                note: "host head matmul; the device cert_lm_head_sm121 screen is a host stand-in in this run",
+                note: head_note,
             },
             StageEvent {
                 stage: "lm_head_argmax",
                 host_bytes_in: u64_bytes(config.vocab_size),
                 host_bytes_out: 4,
-                note: "host greedy argmax; class-(b) seam, not device-executed",
+                note: argmax_note,
             },
         ];
         Ok(HybridTokenOutput {
@@ -1594,6 +1694,7 @@ mod tests {
                     &mut pre_mix,
                     &mut scratch,
                     0,
+                    None,
                     None,
                     None,
                     None,

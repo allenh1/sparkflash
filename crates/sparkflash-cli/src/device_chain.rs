@@ -29,7 +29,7 @@ use sparkflash_device::cubins::{baseline_pins, required_pins};
 use sparkflash_device::window::WindowAccounting;
 
 /// The usage line for this subcommand.
-pub const USAGE: &str = "sparkflash device-chain --plan-only|--dry-run|--run-stage mhc_entry|layer_zero|hybrid_token --checkpoint DIR --cubin-dir DIR [--positions 0] [--layer 0] [--token 0] [--element-limit N]";
+pub const USAGE: &str = "sparkflash device-chain --plan-only|--dry-run|--run-stage mhc_entry|layer_zero|hybrid_token --checkpoint DIR --cubin-dir DIR [--positions 0] [--layer 0] [--token 0] [--element-limit N] [--moe-preflight] [--moe-layer0-diagnose]";
 
 /// The exit code a plan-only or dry-run invocation returns: 2, refusing to serve.
 pub const PLAN_ONLY_EXIT: u8 = 2;
@@ -180,7 +180,7 @@ pub fn plan_lines() -> Result<Vec<String>, String> {
     lines.extend(seam_plan.report_lines());
     lines.extend(accounting.report_lines());
     lines.push(format!(
-        "cubin catalog: {} baseline pins parsed from crates/sparkflash-kernels/baseline/kernel_baseline.txt; {} required for the device path (swiglu_mxfp8_quant_sm121 is a host seam)",
+        "cubin catalog: {} baseline pins parsed from crates/sparkflash-kernels/baseline/kernel_baseline.txt; {} required for the device path (rmsnorm_sm121 is the c4c tail norm; swiglu_mxfp8_quant_sm121 is a device stage in the shared expert and is verified by the CLI backend)",
         baseline.len(),
         pins.len()
     ));
@@ -290,6 +290,8 @@ struct StageArgs {
     positions: Vec<usize>,
     token: u32,
     element_limit: Option<usize>,
+    moe_preflight: bool,
+    moe_layer0_diagnose: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -336,9 +338,21 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
     let mut layer = 0usize;
     let mut token = 0u32;
     let mut element_limit = None;
+    let mut moe_preflight = false;
+    let mut moe_layer0_diagnose = false;
     let mut index = 1usize;
     while index < args.len() {
         let flag = args[index];
+        if flag == "--moe-preflight" {
+            moe_preflight = true;
+            index += 1;
+            continue;
+        }
+        if flag == "--moe-layer0-diagnose" {
+            moe_layer0_diagnose = true;
+            index += 1;
+            continue;
+        }
         let value = args
             .get(index + 1)
             .ok_or_else(|| format!("{flag} needs a value"))?;
@@ -398,6 +412,8 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
             positions,
             token,
             element_limit,
+            moe_preflight,
+            moe_layer0_diagnose,
         },
     ))
 }
@@ -474,6 +490,7 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         kernel_mhc_update_fused, kernel_mhc_xhat,
     };
     use sparkflash_engine::forward::mhc::{self, Mixes};
+    use sparkflash_engine::forward::moe::MoeDeviceBackend;
     use sparkflash_engine::forward::{
         DeferredHandoff, HybridEntry, HybridPost, InferenceEngine, SequenceState,
     };
@@ -489,7 +506,7 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
     let dim = config.dim;
     let started = Instant::now();
     let mut lines = vec![
-        "sparkflash device-chain: M3-c c4a-2 HYBRID TOKEN - 40 layers, one prompt token, one position".to_string(),
+        "sparkflash device-chain: M3-c c4c HYBRID TOKEN - 40 layers, one prompt token, one position".to_string(),
         "device entry path: layer 0 keeps the step-1 identity (B=I, C=0, Y=0, A=initial pre_mix); layers 1..39 consume the previous-layer deferred FFN epilogue: B/C/A read back then re-uploaded (declared coefficient round-trip); Y is the host FFN output, BF16-staged; the add runs in device step 1.".to_string(),
         "device post path: each layer runs a device MhcPost after attention. It writes the post-attention residual X and the 24 FFN coefficients, and captures the normalized FFN input; the host FFN consumes those device values.".to_string(),
         "ffn_epilogue split: layers 0..38 move the FFN epilogue add into the next device MhcEntry step-1; layer 39 keeps the host FFN epilogue add because there is no next entry. Count: 39 deferred, 1 host.".to_string(),
@@ -497,10 +514,12 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         "residual staging seam: each layer stages the f32 residual to BF16 and the host continues from the device-readback X; the chain is therefore not bit-identical to the reference even with exact host arithmetic".to_string(),
         "attention projection seam: wq_a, wq_b, wkv, wo_a and wo_b are device B12x MXFP8 GEMMs replacing the host f32 projections; q_norm, kv_norm, RoPE, the window/compressor/indexer host seams, the inverse RoPE and the D8 quantisers remain declared HOST stand-ins.".to_string(),
         "attention body seam (c4a-2): m14 is the real device format-2 flash_mla_csa2_sm121 launch, 64 head blocks of 256 threads, one launch per layer at position 0. Window codes/scales are built by the engine window row helper from the host kv row; the selected compressed list is empty at position 0, and the kernel's indexer stage-1 buffers are uploaded as zeros plus sentinels and their writes are ignored. The 512-candidate / 640-slot regime is NOT exercised at position 0.".to_string(),
-        "attention seam ledger: 3 launches/layer for wq_a+wq_b+wkv (120), 1 format-2 attention launch/layer (40) and 2 launches/layer for wo_a+wo_b (80) = 240 attention launches; 42 MhcEntry + 40 MhcPost + 240 attention = 322 chain launches. The chain token comparison remains the CHAIN-WIRING gate.".to_string(),
-        "claim: CHAIN-WIRING parity, not a device-token result; criterion 1 remains OPEN".to_string(),
+        "attention seam ledger: 3 launches/layer for wq_a+wq_b+wkv (120), 1 format-2 attention launch/layer (40) and 2 launches/layer for wo_a+wo_b (80) = 240 attention launches; 42 MhcEntry + 40 MhcPost + 240 attention = 322 chain launches.".to_string(),
+        "routed MoE seam (c4c): 17 device launches/layer - 1 moe_router, 8 routed_gate_up (4 ranks x w1/w3), 4 weighted swiglu_mxfp8_quant_weighted, 4 serial b12x_mxfp4_moe combine - 680 launches over 40 layers. The shared expert runs four real device launches/layer (160), and the final RMSNorm is one device launch. The router selected-expert ids are read back once per layer; only the distinct selected experts are staged; the weighted epilogue reads the router's weights buffer in place, so no host weight multiply exists.".to_string(),
+        "chain launch ledger: 322 attention/mHC + 680 routed MoE + 160 shared expert + 4 head rank launches + 1 final norm = 1167 device launches; the chain token comparison remains the CHAIN-WIRING gate.".to_string(),
+        "claim: CHAIN-WIRING parity over c4c device MoE/norm/head, not a device-token result; criterion 1 remains OPEN because the four-shard block-max/argmax assembly and the token readback are host".to_string(),
         "caching seam: no 40-layer staging metadata cache; attention and FFN staging objects are rebuilt and dropped per layer, and the five attention weight sets are restaged from the checkpoint per layer. Reused device allocations: the 16-buffer mHC set (2,064,352 B) plus the attention projection buffers.".to_string(),
-        "per-layer host stand-ins after c4a-2 (device-status but host-executed here): moe_router, moe_gate_up, moe_down_combine, shared_expert_gate. The five attention projections and the format-2 attention body are device at position 0. Attention host seams: q_norm, kv_norm, RoPE, window row construction, compressor/cache, selected-list assembly, indexer scoring, inverse RoPE, D8 quantisers. Tail stand-in: lm_head_screen. Tail host seams: final_norm, lm_head_argmax.".to_string(),
+        "per-layer host stand-ins after c4c: none in the routed or shared expert, and the final RMSNorm is device. The five attention projections and the format-2 attention body are device at position 0. Attention host seams: q_norm, kv_norm, RoPE, window row construction, compressor/cache, selected-list assembly, indexer scoring, inverse RoPE, D8 quantisers. MoE host seams: router selected-id readback/local mapping and selected-expert staging. Tail host seams: lm_head weight read/upload, the four-shard block-max/argmax assembly and the token readback.".to_string(),
         format!(
             "checkpoint {}; cubin dir {}; token {}; position 0; element limit {}",
             args.checkpoint.display(),
@@ -509,6 +528,61 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             limit
         ),
     ];
+
+    if args.moe_preflight {
+        let source = SafeTensorsSource::open(
+            &args.checkpoint,
+            &args.checkpoint.join("model.safetensors.index.json"),
+        )
+        .map_err(|error| {
+            format!(
+                "preflight checkpoint {}: {error}",
+                args.checkpoint.display()
+            )
+        })?;
+        let embed_staging = LayerZeroStaging::from_source(&source, &[0])
+            .map_err(|error| format!("preflight embed row: {error}"))?;
+        let x = embed_staging
+            .embed_row(0)
+            .ok_or_else(|| "preflight has no embed row 0".to_string())?
+            .values_f32();
+        let mut backend = crate::moe_device::MoeDeviceBackendImpl::open(&args.cubin_dir)?;
+        if args.moe_layer0_diagnose {
+            backend = backend.with_layer0_diagnose();
+        }
+        let mut routed = vec![0.0f32; dim];
+        let start = Instant::now();
+        let ran = backend
+            .ffn(&config, 0, "layers.0", &x, &source, limit, &mut routed)
+            .map_err(|error| format!("moe preflight: {error}"))?;
+        if !ran {
+            return Err("moe preflight: the device backend declined layer 0".to_string());
+        }
+        let one_layer = start.elapsed();
+        let stats = backend.stats();
+        let seconds = one_layer.as_secs_f64().max(1e-9);
+        let gbs = stats.staged_bytes as f64 / seconds / 1e9;
+        let projected_s = one_layer.as_secs_f64() * config.n_layers as f64;
+        lines.push(format!(
+            "moe preflight: layer=0 tokens=1 launches={} one_layer_ms={:.3} staging_ms={} device_us={} staged_expert_bytes={} host_bytes={} staging_gbs={:.3} projected_full_chain_s={:.1}",
+            stats.launches,
+            one_layer.as_secs_f64() * 1000.0,
+            stats.staging_us / 1000,
+            stats.device_us,
+            stats.staged_bytes,
+            stats.host_bytes,
+            gbs,
+            projected_s
+        ));
+        if projected_s > 500.0 {
+            lines.push(format!(
+                "MOE PREFLIGHT REFUSED: the measured projection {projected_s:.1} s exceeds the 500 s bar; do not run the full window, bring a shard/streaming plan"
+            ));
+            return Err(lines.join("\n"));
+        }
+        lines.push("MOE PREFLIGHT PASS: projection under the 500 s bar".to_string());
+        return Ok(lines);
+    }
 
     // The reference half is measured first, in this same process, on the same checkpoint.
     let reference_source = SafeTensorsSource::open(
@@ -547,11 +621,11 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         &args.checkpoint.join("model.safetensors.index.json"),
     )
     .map_err(|error| format!("embed checkpoint {}: {error}", args.checkpoint.display()))?;
-    let embed_staging = LayerZeroStaging::from_source(&embed_source, &[0])
+    let embed_staging = LayerZeroStaging::from_source(&embed_source, &[args.token as usize])
         .map_err(|error| format!("embed row stage: {error}"))?;
     let embedding = embed_staging
-        .embed_row(0)
-        .ok_or_else(|| "no staged embed row for position 0".to_string())?
+        .embed_row(args.token as usize)
+        .ok_or_else(|| format!("no staged embed row for input token {}", args.token))?
         .values_f32();
     drop(embed_source);
     let mut engram_hashes = Vec::new();
@@ -561,6 +635,10 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
     let mem_available_bytes = read_mem_available_bytes()?;
     let mut attention_backend =
         crate::attention_device::AttentionDeviceBackend::open(&args.cubin_dir)?;
+    let mut moe_backend = crate::moe_device::MoeDeviceBackendImpl::open(&args.cubin_dir)?;
+    if args.moe_layer0_diagnose {
+        moe_backend = moe_backend.with_layer0_diagnose();
+    }
     let launcher = Rc::new(RefCell::new(CudaLauncher::open_for_stage(
         &args.cubin_dir,
         "mega_mhc_sm121",
@@ -591,6 +669,7 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         x_bytes: usize,
         matrix_bytes: u64,
         body_launches: usize,
+        moe_launches: usize,
     }
     let blank_timing = DeviceTiming {
         staging_ms: 0,
@@ -610,6 +689,7 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         x_bytes: 0,
         matrix_bytes: 0,
         body_launches: 0,
+        moe_launches: 0,
     };
     let device_timings = Rc::new(RefCell::new(vec![blank_timing; config.n_layers]));
     let post_staging_slot: Rc<RefCell<Option<LayerPostStaging>>> = Rc::new(RefCell::new(None));
@@ -1270,6 +1350,7 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         &mut provider,
         &mut post,
         Some(&mut attention_backend),
+        Some(&mut moe_backend),
         &mut progress,
     );
     let output = match chain_result {
@@ -1311,11 +1392,13 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
     };
     for (layer, timing) in device_timings.borrow_mut().iter_mut().enumerate() {
         timing.body_launches = attention_backend.body_launches(layer);
+        timing.moe_launches = moe_backend.launches_for(layer);
     }
     let total_elapsed = started.elapsed();
     let chain_elapsed = total_elapsed.saturating_sub(reference_elapsed);
     lines.extend(progress_lines.borrow().iter().cloned());
     let attention_stats = attention_backend.stats();
+    let moe_stats = moe_backend.stats();
     let timings = device_timings.borrow();
     let attention_device_us = attention_stats.device_us as u128;
     let attention_body_us = attention_stats.attention_us as u128;
@@ -1325,9 +1408,11 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         .map(|timing| timing.entry_us + timing.post_us)
         .sum::<u128>()
         + attention_device_us
-        + attention_body_us;
-    let total_staging_ms: u128 =
-        timings.iter().map(|timing| timing.staging_ms).sum::<u128>() + attention_staging_ms;
+        + attention_body_us
+        + moe_stats.device_us as u128;
+    let total_staging_ms: u128 = timings.iter().map(|timing| timing.staging_ms).sum::<u128>()
+        + attention_staging_ms
+        + (moe_stats.staging_us / 1000) as u128;
     let total_host_ms: u64 = output.layers.iter().map(|trace| trace.host_ms).sum();
     let total_host_bytes: u64 = output
         .layers
@@ -1335,12 +1420,16 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         .flat_map(|trace| trace.stages.iter())
         .map(|event| event.host_bytes_in.saturating_add(event.host_bytes_out))
         .sum::<u64>()
-        + attention_stats.host_bytes;
+        + attention_stats.host_bytes
+        + moe_stats.host_bytes;
     let total_matrix_bytes: u64 = timings
         .iter()
         .map(|timing| timing.matrix_bytes)
         .sum::<u64>()
-        + attention_stats.staged_bytes;
+        + attention_stats.staged_bytes
+        + moe_stats.staged_bytes
+        + moe_stats.shared_bytes
+        + moe_stats.final_norm_bytes;
     let attention_cubin_bytes: u64 = [
         "b12x_mxfp8_dense_sm121",
         "b12x_mxfp8_wo_a_sm121",
@@ -1350,7 +1439,8 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
     .filter_map(|name| sparkflash_kernels::baseline::pin(name).ok().flatten())
     .map(|pin| pin.cubin_bytes as u64)
     .sum();
-    let total_cubin_bytes = cubin_bytes + attention_cubin_bytes;
+    let moe_cubin_bytes: u64 = 37_384 + 9_752 + 13_000 + 10_048 + 11_824 + 21_776 + 14_888 + 31_480;
+    let total_cubin_bytes = cubin_bytes + attention_cubin_bytes + moe_cubin_bytes;
     let total_device_buffer_bytes = sparkflash_device::MhcBufferPlan::LAYER_ZERO.device_bytes()
         as u64
         + attention_backend.device_bytes();
@@ -1370,6 +1460,21 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         &body_counts,
         body_layers.len() + engram_entries,
     )?;
+    let moe_missing: Vec<usize> = output
+        .layers
+        .iter()
+        .filter_map(|trace| {
+            let count = timings
+                .get(trace.layer)
+                .map_or(0, |timing| timing.moe_launches);
+            (count != 21).then_some(trace.layer)
+        })
+        .collect();
+    if !moe_missing.is_empty() {
+        return Err(format!(
+            "c4c seam line withheld: the routed MoE plus shared expert must launch exactly 21 times on every layer (17 routed + 4 shared), but layers {moe_missing:?} do not (moe_launches != 21); the per-layer ledger and totals would otherwise disagree"
+        ));
+    }
     for (device_index, trace) in output.layers.iter().enumerate() {
         let timing = timings
             .get(device_index)
@@ -1412,6 +1517,38 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
                         "[device: wo_a+wo_b, 2 launches; host inverse-RoPE + D8 quant seams]"
                             .to_string()
                     }
+                    "moe_router" if timing.moe_launches == 21 => {
+                        "[device: moe_router, 1 launch; host dispatch/readback seam]".to_string()
+                    }
+                    "moe_router" => format!(
+                        "[HOST STAND-IN: routed MoE; moe_launches={}]",
+                        timing.moe_launches
+                    ),
+                    "moe_gate_up" if timing.moe_launches == 21 => {
+                        "[device: routed_gate_up, 8 launches (4 ranks x w1/w3); host selected-expert staging]"
+                            .to_string()
+                    }
+                    "moe_swiglu_quant" if timing.moe_launches == 21 => {
+                        "[device: weighted swiglu+quant, 4 launches; routing weights stay on device]"
+                            .to_string()
+                    }
+                    "moe_down_combine" if timing.moe_launches == 21 => {
+                        "[device: mxfp4_moe combine, 4 serial rank launches]".to_string()
+                    }
+                    "shared_expert_gate" if timing.moe_launches == 21 => {
+                        "[device: b12x_mxfp8_dense, w1+w3, 2 launches; host B12x repack seam]"
+                            .to_string()
+                    }
+                    "shared_expert_swiglu_quant" if timing.moe_launches == 21 => {
+                        "[device: swiglu_mxfp8_quant at 2304, 1 launch]".to_string()
+                    }
+                    "shared_expert_down" if timing.moe_launches == 21 => {
+                        "[device: b12x_mxfp8_dense w2, 1 launch; host shared-add seam]"
+                            .to_string()
+                    }
+                    "shared_expert_gate" | "shared_expert_swiglu_quant" | "shared_expert_down" => {
+                        "[HOST STAND-IN: shared expert (c4c)]".to_string()
+                    }
                     _ => String::new(),
                 };
                 format!(
@@ -1423,7 +1560,7 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             .join(",");
         lines.push(format!("ledger layer {:02}: {ledger}", trace.layer));
         lines.push(format!(
-            "layer {:02}: staging_ms={} engram_split={} entry_us={} post_us={} device_us={} host_ms={} host_bytes={} staged_matrix_bytes={} x_bytes={} capture_exact={} codes_exact={} scales_exact={} coeff_max_abs={:.6e} inv_rms_delta={:.6e} post_capture_exact={} post_codes_exact={} post_scales_exact={} post_coeff_max_abs={:.6e} post_inv_rms_delta={:.6e}",
+            "layer {:02}: staging_ms={} engram_split={} entry_us={} post_us={} device_us={} host_ms={} host_bytes={} staged_matrix_bytes={} x_bytes={} body_launches={} moe_launches={} capture_exact={} codes_exact={} scales_exact={} coeff_max_abs={:.6e} inv_rms_delta={:.6e} post_capture_exact={} post_codes_exact={} post_scales_exact={} post_coeff_max_abs={:.6e} post_inv_rms_delta={:.6e}",
             trace.layer,
             timing.staging_ms,
             timing.engram_split,
@@ -1434,6 +1571,8 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             host_bytes,
             timing.matrix_bytes,
             timing.x_bytes,
+            timing.body_launches,
+            timing.moe_launches,
             timing.capture_exact,
             timing.codes_exact,
             timing.scales_exact,
@@ -1463,17 +1602,53 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         attention_cubin_bytes,
         attention_backend.device_bytes()
     ));
+    lines.push(crate::moe_device::routed_totals_line(&moe_stats));
+    lines.push(crate::moe_device::shared_totals_line(&moe_stats));
     lines.push(format!(
-        "chain totals: layers={} entry_launches={} post_launches={} attention_projection_launches={} attention_body_launches={} device_launches={} engram_split_layers={} device_us={} device_ms={:.3} staging_ms={} host_ms={} total_chain_ms={} host_bytes={} staged_matrix_bytes={} cubin_bytes={} device_buffer_bytes={}",
+        "final norm totals: final_norm_launches={} device_us={} staged_norm_bytes={} bf16_mismatches={} screen=rmsnorm_sm121; host readback into the certified head",
+        moe_stats.final_norm_launches,
+        moe_stats.final_norm_us,
+        moe_stats.final_norm_bytes,
+        moe_stats.final_norm_bf16_mismatches
+    ));
+    lines.push(format!(
+        "lm head totals: head_launches={} head_certified={} certified_by_rank={:?} winner_certified={} head_staging_us={} head_device_us={} head_staged_bytes={} screen=cert_lm_head_sm121 argmax=in-kernel per four rank shards; host block assembly",
+        moe_stats.head_launches,
+        moe_stats.head_certified,
+        moe_stats.head_certified_by_rank,
+        moe_stats.head_winner_certified,
+        moe_stats.head_staging_us,
+        moe_stats.head_device_us,
+        moe_stats.head_staged_bytes
+    ));
+    lines.push(format!(
+        "moe counts: routed_launches={} shared_launches={} total_launches={} routed_staging_us={} shared_staging_us={} total_staging_us={}",
+        moe_stats.routed_launches,
+        moe_stats.shared_launches,
+        moe_stats.launches,
+        moe_stats.routed_staging_us,
+        moe_stats.shared_staging_us,
+        moe_stats.staging_us
+    ));
+    lines.push(format!(
+        "chain totals: layers={} entry_launches={} post_launches={} attention_projection_launches={} attention_body_launches={} routed_moe_launches={} shared_moe_launches={} head_launches={} tail_norm_launches={} moe_launches={} device_launches={} engram_split_layers={} device_us={} device_ms={:.3} staging_ms={} host_ms={} total_chain_ms={} host_bytes={} staged_matrix_bytes={} cubin_bytes={} device_buffer_bytes={}",
         output.layers.len(),
         output.layers.len() + engram_entries,
         output.layers.len(),
         attention_stats.launches,
         attention_stats.attention_launches,
+        moe_stats.routed_launches,
+        moe_stats.shared_launches,
+        moe_stats.head_launches,
+        moe_stats.final_norm_launches,
+        moe_stats.launches,
         output.layers.len() * 2
             + engram_entries
             + attention_stats.launches
-            + attention_stats.attention_launches,
+            + attention_stats.attention_launches
+            + moe_stats.launches
+            + moe_stats.head_launches
+            + moe_stats.final_norm_launches,
         engram_entries,
         total_device_us,
         total_device_us as f64 / 1000.0,
@@ -1945,12 +2120,12 @@ mod tests {
         assert!(
             text.contains("chain_execution=false; device_execution=false; token_produced=false")
         );
-        assert!(text.contains("10 baseline pins parsed"));
+        assert!(text.contains("11 baseline pins parsed"));
         assert!(
             text.contains("crates/sparkflash-kernels/baseline/kernel_baseline.txt"),
             "the catalog names the repository path, not a crate-relative one"
         );
-        assert!(text.contains("8 required for the device path"));
+        assert!(text.contains("9 required for the device path"));
         // STEP -> LAYER -> TAIL, and the tail's own order, by position in the printed stage map.
         // Presence alone cannot catch a map that prints the groups out of order.
         let map_line = |prefix: &str| {
@@ -2100,6 +2275,17 @@ mod tests {
         .expect("an explicit element limit");
         assert_eq!(explicit.element_limit, Some(1234));
 
+        let (_, diagnosed) = stage_args(&[
+            "hybrid_token",
+            "--checkpoint",
+            "/checkpoint",
+            "--cubin-dir",
+            "/cubins",
+            "--moe-layer0-diagnose",
+        ])
+        .expect("the layer-0 diagnose flag");
+        assert!(diagnosed.moe_layer0_diagnose);
+
         use sparkflash_engine::linalg::CHECKPOINT_TENSOR_LIMIT;
         let default_args = StageArgs {
             checkpoint: std::path::PathBuf::from("/checkpoint"),
@@ -2107,6 +2293,8 @@ mod tests {
             positions: vec![0],
             token: 0,
             element_limit: None,
+            moe_preflight: false,
+            moe_layer0_diagnose: false,
         };
         assert_eq!(
             layer_zero_element_limit(&default_args),

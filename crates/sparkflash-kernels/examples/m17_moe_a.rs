@@ -47,7 +47,7 @@
 //!    the 576-wide w2 slices of the same selected experts, chained because each rank's bf16 output
 //!    is the next rank's residual operand (the kernel writes hidden + this rank's partial sum, so
 //!    the chained rounding is part of the arithmetic). The activation operand is stage 3's device
-//!    codes/scales, not a host-built tensor. Class: device bf16 BIT-EXACT against the chained
+//!    codes/scales re-uploaded from the stage-3 readback byte for byte, not a host-built tensor. Class: device bf16 BIT-EXACT against the chained
 //!    mxfp4_ref::moe_combine over the SAME device-built operand bytes; two full chains
 //!    byte-identical.
 //!
@@ -55,8 +55,9 @@
 //! by the routing weight BEFORE the w2 activation quantiser reads it (model.py:841-851). The
 //! weighted stage-3 entry point takes the routing weight as an operand, so the multiply and the
 //! quantise both happen on the device: gate/up bf16 -> weighted epilogue -> the combine's E4M3 +
-//! ue8m0 operand, with the router's weights_d read in place. Stage 3's device codes/scales ARE the
-//! operand stage 4 consumes, so no host multiply and no host quantise remain in the routed path
+//! ue8m0 operand, with the router's weights_d read in place. Stage 3's device codes/scales are the
+//! operand stage 4 consumes, re-uploaded from the stage-3 readback byte for byte, so no host
+//! multiply and no host quantise remain in the routed path
 //! (D32's host seam is gone; b27/b30 measured the unweighted predecessor). The host still reads the
 //! gate/up and operand bytes back, but only to compare them against the reference twins - the
 //! operand the combine consumes is device-produced; the harness prints the crossing shapes. The

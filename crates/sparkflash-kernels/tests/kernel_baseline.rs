@@ -62,7 +62,7 @@ fn the_kernels_still_compile_to_the_recorded_baseline() {
 }
 
 /// The kernel list in `check-kernel-baseline.sh`, the manifest, the kernels on disk and the build
-/// script's `PROBED_KERNELS` table must name the same ten kernels. The script asserts the first
+/// script's `PROBED_KERNELS` table must name the same eleven kernels. The script asserts the first
 /// two when it runs; this pins all four without nvcc, so a kernel file added under `kernels/` - or a
 /// probe list edited without the baseline - fails here instead of letting the success line mean less
 /// than it says.
@@ -82,8 +82,8 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
         .collect();
     assert_eq!(
         listed.len(),
-        10,
-        "the list must name every baseline kernel - the ten entries: the six Milestone 4 kernels, \
+        11,
+        "the list must name every baseline kernel - the eleven entries: the six Milestone 4 kernels, \
          the M7 SwiGLU quantiser epilogue and its weighted routed variant, the task-37 device \
          router and the task-8 routed gate/up GEMM: {listed:?}"
     );
@@ -357,8 +357,8 @@ fn the_loader_resolves_every_name_the_pinned_baseline_uses() {
         checked += 1;
     }
     assert_eq!(
-        checked, 9,
-        "the manifest pins nine driver kernels (ten entries; flash_mla has no KernelId)"
+        checked, 10,
+        "the manifest pins ten driver kernels (eleven entries; flash_mla has no KernelId)"
     );
 }
 

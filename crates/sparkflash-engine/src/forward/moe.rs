@@ -40,6 +40,76 @@ use crate::linalg::{self, EngineError, ScaleGrid};
 use crate::parallel::{enter_worker, reference_threads};
 use crate::weights::WeightSource;
 
+/// The c4b device capability: replaces the routed MoE block with device launches while the host
+/// keeps the declared routing seams; c4c also replaces the shared expert and the certified LM head.
+/// The default answers `false`/`None`, which runs the host reference unchanged.
+pub trait MoeDeviceBackend {
+    /// Computes the routed MoE contribution into `out` (and the host shared addition for c4b).
+    /// Returning `false` leaves `out` untouched and the host block runs instead.
+    #[allow(clippy::too_many_arguments)]
+    fn ffn(
+        &mut self,
+        config: &ModelConfig,
+        layer: usize,
+        prefix: &str,
+        x: &[f32],
+        source: &dyn WeightSource,
+        limit: usize,
+        out: &mut [f32],
+    ) -> Result<bool, EngineError> {
+        let _ = (config, layer, prefix, x, source, limit, out);
+        Ok(false)
+    }
+
+    /// Adds the dense shared expert to `out` (already holding the routed contribution). Returning
+    /// `false` leaves `out` untouched and the host shared-expert seam runs instead.
+    #[allow(clippy::too_many_arguments)]
+    fn shared_expert(
+        &mut self,
+        config: &ModelConfig,
+        layer: usize,
+        prefix: &str,
+        x: &[f32],
+        source: &dyn WeightSource,
+        limit: usize,
+        out: &mut [f32],
+    ) -> Result<bool, EngineError> {
+        let _ = (config, layer, prefix, x, source, limit, out);
+        Ok(false)
+    }
+
+    /// Runs the final RMSNorm on device over the collapsed tail, writing BF16 `[rows][cols]` bytes.
+    /// Returning `false` leaves `out` untouched and the host norm runs instead. A device norm must
+    /// be bit-identical to the host norm rounded to BF16; the backend's own twin bar is the check.
+    #[allow(clippy::too_many_arguments)]
+    fn final_norm(
+        &mut self,
+        config: &ModelConfig,
+        x: &[f32],
+        source: &dyn WeightSource,
+        limit: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, EngineError> {
+        let _ = (config, x, source, limit, out);
+        Ok(false)
+    }
+
+    /// Runs the certified LM head and its in-kernel argmax over the normalized final hidden
+    /// `hidden`, writing the four rank logits into `logits` and returning the assembled token.
+    /// `None` leaves `logits` untouched and the host head runs instead.
+    fn lm_head(
+        &mut self,
+        config: &ModelConfig,
+        hidden: &[f32],
+        source: &dyn WeightSource,
+        limit: usize,
+        logits: &mut [f32],
+    ) -> Result<Option<u32>, EngineError> {
+        let _ = (config, hidden, source, limit, logits);
+        Ok(None)
+    }
+}
+
 /// The reduction epsilon of model.py:825: the literal `1e-20`, **not** `norm_eps` and not `hc_eps`.
 const ROUTE_NORM_EPSILON: f32 = 1e-20;
 
@@ -176,39 +246,6 @@ impl MoeScratch {
             limit,
         )?;
         Ok(ExpertWeights { w1, w3, w2, inter })
-    }
-
-    /// Runs one expert body on one token and adds `weight` times its output to that token's row of
-    /// [Self::routed]: `gate = w1 x`, `up = w3 x`, the clamps, then `w2` (model.py:841-851).
-    ///
-    /// The routing weight multiplies the activation before `w2`, which is where the reference
-    /// applies it, and the accumulation is a plain `+=` into the token's row.
-    fn add_expert(
-        &mut self,
-        cfg: &ModelConfig,
-        x: &[f32],
-        token: usize,
-        expert: &ExpertWeights,
-        weight: f32,
-    ) -> Result<(), EngineError> {
-        let dim = cfg.dim;
-        let row = &x[token * dim..(token + 1) * dim];
-        expert_body(
-            cfg,
-            row,
-            expert,
-            weight,
-            &mut self.gate_branch,
-            &mut self.up_branch,
-            &mut self.expert_out,
-        )?;
-        for (accumulated, value) in self.routed[token * dim..(token + 1) * dim]
-            .iter_mut()
-            .zip(self.expert_out[..dim].iter())
-        {
-            *accumulated += *value;
-        }
-        Ok(())
     }
 }
 
@@ -497,7 +534,7 @@ pub fn route(
 /// [EngineError::Shape] when the configuration, the slices and the scratch disagree,
 /// [EngineError::TooLarge] when a tensor is above `limit`, and any other error from a weight read or
 /// decode.
-pub fn moe_forward(
+pub fn routed_forward(
     cfg: &ModelConfig,
     prefix: &str,
     x: &[f32],
@@ -659,62 +696,116 @@ pub fn moe_forward(
         }
     }
 
-    // The shared expert always runs, on the same input, after the routed sum (model.py:903).
-    // Tokens do not interact here either, so each token's row gets exactly one `+=` of the same
-    // [expert_body] output the serial loop would add.
+    out.copy_from_slice(&scratch.routed[..tokens * dim]);
+    Ok(())
+}
+
+/// The reference MoE block: the routed sum followed by the dense shared expert (model.py:903).
+///
+/// # Errors
+/// The shape and weight-read errors of [routed_forward] and [add_shared_expert].
+pub fn moe_forward(
+    cfg: &ModelConfig,
+    prefix: &str,
+    x: &[f32],
+    src: &dyn WeightSource,
+    limit: usize,
+    scratch: &mut MoeScratch,
+    out: &mut [f32],
+) -> Result<(), EngineError> {
+    routed_forward(cfg, prefix, x, src, limit, scratch, out)?;
+    add_shared_expert(cfg, prefix, x, src, limit, scratch, out)
+}
+
+/// Adds the dense shared expert to an already-computed routed contribution (the c4b device path).
+///
+/// The runtime order is the reference's: the shared expert runs on the same input after the routed
+/// sum, and each token's row gets exactly one `+=` of [expert_body]'s output. The device backend
+/// computes the routed contribution on device and calls this host seam for the shared expert.
+pub fn add_shared_expert(
+    cfg: &ModelConfig,
+    prefix: &str,
+    x: &[f32],
+    src: &dyn WeightSource,
+    limit: usize,
+    scratch: &mut MoeScratch,
+    out: &mut [f32],
+) -> Result<(), EngineError> {
+    let dim = cfg.dim;
+    if dim == 0 || !x.len().is_multiple_of(dim) || out.len() != x.len() {
+        return Err(shape_error(
+            "the shared-expert seam",
+            format!(
+                "dim {dim}, {} input values and {} output values do not describe whole tokens",
+                x.len(),
+                out.len()
+            ),
+        ));
+    }
+    let tokens = x.len() / dim;
     let shared = scratch.read_expert(cfg, src, prefix, ExpertBody::Shared, limit)?;
     let shared_workers = reference_threads().min(tokens).max(1);
     if shared_workers <= 1 {
         for token in 0..tokens {
-            scratch.add_expert(cfg, x, token, &shared, 1.0)?;
-        }
-    } else {
-        let rows_per_chunk = tokens.div_ceil(shared_workers);
-        let mut rest = &mut scratch.routed[..tokens * dim];
-        let mut row_blocks: Vec<&mut [f32]> = Vec::with_capacity(shared_workers);
-        while !rest.is_empty() {
-            let take = (rows_per_chunk * dim).min(rest.len());
-            let (head, tail) = rest.split_at_mut(take);
-            row_blocks.push(head);
-            rest = tail;
-        }
-        std::thread::scope(|scope| -> Result<(), EngineError> {
-            let mut handles = Vec::with_capacity(row_blocks.len());
-            for (block_index, rows) in row_blocks.into_iter().enumerate() {
-                let first_token = block_index * rows_per_chunk;
-                let shared = &shared;
-                handles.push(scope.spawn(move || -> Result<(), EngineError> {
-                    enter_worker();
-                    let mut local = MoeScratch::for_config(cfg);
-                    let mut buffer = vec![0.0f32; cfg.dim];
-                    for (local_token, row) in rows.chunks_mut(dim).enumerate() {
-                        let token = first_token + local_token;
-                        expert_body(
-                            cfg,
-                            &x[token * dim..(token + 1) * dim],
-                            shared,
-                            1.0,
-                            &mut local.gate_branch,
-                            &mut local.up_branch,
-                            &mut buffer,
-                        )?;
-                        for (accumulated, value) in row.iter_mut().zip(buffer.iter()) {
-                            *accumulated += *value;
-                        }
-                    }
-                    Ok(())
-                }));
+            expert_body(
+                cfg,
+                &x[token * dim..(token + 1) * dim],
+                &shared,
+                1.0,
+                &mut scratch.gate_branch,
+                &mut scratch.up_branch,
+                &mut scratch.expert_out,
+            )?;
+            let row = &mut out[token * dim..(token + 1) * dim];
+            for (accumulated, value) in row.iter_mut().zip(scratch.expert_out.iter()) {
+                *accumulated += *value;
             }
-            for handle in handles {
-                handle
-                    .join()
-                    .expect("a reference shared-expert worker panicked")?;
-            }
-            Ok(())
-        })?;
+        }
+        return Ok(());
     }
-
-    out.copy_from_slice(&scratch.routed[..tokens * dim]);
+    let rows_per_chunk = tokens.div_ceil(shared_workers);
+    let mut rest = out;
+    let mut row_blocks: Vec<&mut [f32]> = Vec::with_capacity(shared_workers);
+    while !rest.is_empty() {
+        let take = (rows_per_chunk * dim).min(rest.len());
+        let (head, tail) = rest.split_at_mut(take);
+        row_blocks.push(head);
+        rest = tail;
+    }
+    std::thread::scope(|scope| -> Result<(), EngineError> {
+        let mut handles = Vec::with_capacity(row_blocks.len());
+        for (block_index, rows) in row_blocks.into_iter().enumerate() {
+            let first_token = block_index * rows_per_chunk;
+            let shared = &shared;
+            handles.push(scope.spawn(move || -> Result<(), EngineError> {
+                enter_worker();
+                let mut local = MoeScratch::for_config(cfg);
+                let mut buffer = vec![0.0f32; cfg.dim];
+                for (local_token, row) in rows.chunks_mut(dim).enumerate() {
+                    let token = first_token + local_token;
+                    expert_body(
+                        cfg,
+                        &x[token * dim..(token + 1) * dim],
+                        shared,
+                        1.0,
+                        &mut local.gate_branch,
+                        &mut local.up_branch,
+                        &mut buffer,
+                    )?;
+                    for (accumulated, value) in row.iter_mut().zip(buffer.iter()) {
+                        *accumulated += *value;
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .expect("a reference shared-expert worker panicked")?;
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -1587,6 +1678,28 @@ mod tests {
             "out[0] is {} but the routed sum plus the shared expert is {both}",
             out[0]
         );
+    }
+
+    /// The c4b device path calls `add_shared_expert` on an already-populated routed row; the
+    /// single-token path must add the shared expert to it, never overwrite it (the b34 bug).
+    #[test]
+    fn add_shared_expert_adds_to_the_routed_row_and_never_overwrites_it() {
+        let cfg = ModelConfig::tiny();
+        let dim = cfg.dim;
+        let source = with_shared(Hand::default(), "layers.0", &cfg, 0, 1.0, 1.0);
+        let mut x = vec![0.0f32; dim];
+        x[0] = 1.0;
+        let mut scratch = MoeScratch::for_config(&cfg);
+        let mut out = vec![2.0f32; dim];
+        add_shared_expert(&cfg, "layers.0", &x, &source, BIG, &mut scratch, &mut out).unwrap();
+        assert!(
+            (out[0] - (2.0 + linalg::silu(1.0))).abs() < 1e-5,
+            "add_shared_expert must add the shared row to the routed row; out[0] is {}",
+            out[0]
+        );
+        for (column, value) in out.iter().enumerate().skip(1) {
+            assert_eq!(*value, 2.0, "column {column} must keep its routed value");
+        }
     }
 
     /// The SwiGLU clamps follow model.py:845-847: the gate is clamped from above only and the up

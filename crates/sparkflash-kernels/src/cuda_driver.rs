@@ -174,11 +174,13 @@ pub enum KernelId {
     MoeRouter,
     /// routed_gate_up_sm121: the routed-expert W4A8 gate/up projection (task-8 iteration B).
     RoutedGateUp,
+    /// rmsnorm_sm121: the standalone final RMSNorm of the serving tail (BF16 in, BF16 out).
+    RmsNorm,
 }
 
 impl KernelId {
     /// Every kernel the shared driver owns, in the order of this enum.
-    pub const ALL: [KernelId; 9] = [
+    pub const ALL: [KernelId; 10] = [
         KernelId::MegaMhcBf16,
         KernelId::Mxfp8Dense,
         KernelId::Mxfp8WoA,
@@ -188,6 +190,7 @@ impl KernelId {
         KernelId::CertLmHead,
         KernelId::MoeRouter,
         KernelId::RoutedGateUp,
+        KernelId::RmsNorm,
     ];
 
     /// The cubin symbol of this kernel. Private: callers name the enum, never the symbol.
@@ -202,6 +205,7 @@ impl KernelId {
             KernelId::CertLmHead => "cert_lm_head_sm121",
             KernelId::MoeRouter => "moe_router_sm121",
             KernelId::RoutedGateUp => "routed_gate_up_sm121",
+            KernelId::RmsNorm => "rmsnorm_sm121",
         }
     }
 
@@ -224,6 +228,7 @@ impl KernelId {
             KernelId::CertLmHead => &["cert_lm_head_sm121"],
             KernelId::MoeRouter => &["moe_router_sm121"],
             KernelId::RoutedGateUp => &["routed_gate_up_sm121"],
+            KernelId::RmsNorm => &["rmsnorm_sm121"],
         }
     }
 

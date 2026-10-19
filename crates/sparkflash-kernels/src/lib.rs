@@ -39,6 +39,8 @@ pub mod mxfp4_ref;
 pub mod mxfp8_dense_launch;
 pub mod mxfp8_ref;
 pub mod mxfp8_wo_a_launch;
+pub mod rmsnorm_launch;
+pub mod rmsnorm_ref;
 pub mod roce_abi;
 pub mod roce_reduce;
 pub mod routed_gate_up_abi;

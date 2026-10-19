@@ -133,21 +133,22 @@ host from the same device gate/up bf16 values with `mxfp4_ref::routed_activation
 The weighted epilogue removes that seam from the device path. `swiglu_mxfp8_quant_weighted_sm121`
 takes the router's per-row `float *weights` operand and does the model's order on the device:
 asymmetric-clamped SwiGLU, one bf16 rounding of the product, then the activation ceil-rule quantise.
-Stage 3 reads `weights_d` in place (the router output is not copied or re-uploaded for the operand)
-and stage 4 consumes stage 3's device codes/scales directly, so the operands are device-produced:
-the epilogue writes them and the combine reads them, with no host multiply or host quantise in the
-measured path (the harness copies the stage-3 bytes back and into the chain's own buffers only to
-compare them against the twins and for the second determinism pass):
+Stage 3 reads `weights_d` in place (the router output is not copied or re-uploaded for the operand).
+The operand stage 4's combine receives is device-produced, but the handoff is a host round trip: the
+harness reads the stage-3 codes/scales back (to compare them against the twins) and then re-uploads
+those same readback bytes into the chain's own buffers with `copy_htod`. No host arithmetic - no
+multiply, no quantise - is applied between the device write and the chain launch, so the values the
+combine consumes are exactly the device-built ones. The crossing shapes are:
 
 - device router weights `[tokens*6]` f32 (the router's own buffer) -> weighted epilogue;
 - device gate/up bf16 `[tokens*6][640]` per rank -> weighted epilogue;
 - device operand `[tokens*6][640]` E4M3 + `[tokens*6][20]` ue8m0 per rank -> device combine;
 - device combine -> device combine, four serial rank launches.
 
-The host still reads the router weights back, and it copies stage-3 codes/scales back and stage 4's
-operand in, but only for the comparison twins - "no round trip" here means no host multiply and no
-host quantise in the operand path, not that the harness never copies bytes; it prints the crossing
-shapes as above. The unweighted
+The bytes do round-trip through the host: the stage-3 readback is the source the chain re-uploads.
+What is absent is host arithmetic on them - no host multiply and no host quantise in the operand
+path - and the re-upload is a byte copy of the device write, not a recomputation. The crossing shapes
+are printed above. The unweighted
 epilogue remains pinned and is m17b's shared-expert quantiser; the six-kernel frozen m4 ABI array is
 untouched (D33). Window b33 is the device measurement of this build: 35 checks passed at tokens 8
 and 130 (record below), including the bit-exact operand and chain comparisons and the real-width

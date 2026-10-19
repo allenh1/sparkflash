@@ -16,6 +16,7 @@ use sparkflash_engine::forward::attention::{
 use sparkflash_engine::forward::engram;
 use sparkflash_engine::forward::layer_zero::{LayerZeroEntry, LayerZeroEntrySource};
 use sparkflash_engine::forward::mhc::{self, Mixes};
+use sparkflash_engine::forward::moe::MoeDeviceBackend;
 use sparkflash_engine::forward::{
     DeferredHandoff, HybridEntry, HybridPost, HybridTokenOutput, InferenceEngine, SequenceState,
 };
@@ -254,7 +255,15 @@ fn a_host_controlled_deferred_chain_is_bit_identical_to_reference_prefill() {
     };
     let mut progress = |_layer: usize, _host_ms: u64| {};
     let hybrid = engine
-        .run_hybrid_chain_deferred(0, &embedding, &mut provider, &mut post, None, &mut progress)
+        .run_hybrid_chain_deferred(
+            0,
+            &embedding,
+            &mut provider,
+            &mut post,
+            None,
+            None,
+            &mut progress,
+        )
         .expect("deferred hybrid chain");
     assert_eq!(hybrid.layers.len(), config.n_layers);
     assert_eq!(reference.next_token, hybrid.token);
@@ -333,6 +342,107 @@ impl Default for RecordingAttentionBackend {
             body_calls: 0,
             body_strides: Vec::new(),
         }
+    }
+}
+
+/// A host-control routed-MoE backend: answers `true` once per layer and counts the 17 launches the
+/// real c4b backend would issue (1 router + 8 gate/up + 4 weighted + 4 combine). Returning `true`
+/// must make the engine skip the host routed block and run only the host shared-expert seam.
+#[derive(Default)]
+struct RecordingMoeBackend {
+    calls: usize,
+    launches: usize,
+}
+
+impl MoeDeviceBackend for RecordingMoeBackend {
+    fn ffn(
+        &mut self,
+        _config: &ModelConfig,
+        _layer: usize,
+        _prefix: &str,
+        x: &[f32],
+        _source: &dyn WeightSource,
+        _limit: usize,
+        out: &mut [f32],
+    ) -> Result<bool, EngineError> {
+        self.calls += 1;
+        self.launches += 17;
+        out.fill(0.0);
+        let _ = x;
+        Ok(true)
+    }
+}
+
+#[derive(Default)]
+struct RecordingC4cBackend {
+    routed_calls: usize,
+    shared_calls: usize,
+    norm_calls: usize,
+    head_calls: usize,
+    launches: usize,
+}
+
+impl MoeDeviceBackend for RecordingC4cBackend {
+    fn ffn(
+        &mut self,
+        _config: &ModelConfig,
+        _layer: usize,
+        _prefix: &str,
+        _x: &[f32],
+        _source: &dyn WeightSource,
+        _limit: usize,
+        out: &mut [f32],
+    ) -> Result<bool, EngineError> {
+        self.routed_calls += 1;
+        self.launches += 17;
+        out.fill(0.0);
+        Ok(true)
+    }
+
+    fn shared_expert(
+        &mut self,
+        _config: &ModelConfig,
+        _layer: usize,
+        _prefix: &str,
+        _x: &[f32],
+        _source: &dyn WeightSource,
+        _limit: usize,
+        out: &mut [f32],
+    ) -> Result<bool, EngineError> {
+        self.shared_calls += 1;
+        self.launches += 4;
+        out.fill(0.0);
+        Ok(true)
+    }
+
+    fn final_norm(
+        &mut self,
+        config: &ModelConfig,
+        x: &[f32],
+        _source: &dyn WeightSource,
+        _limit: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, EngineError> {
+        let rows = x.len() / config.dim;
+        self.norm_calls += 1;
+        self.launches += 1;
+        out.clear();
+        out.resize(rows * config.dim * 2, 0);
+        Ok(true)
+    }
+
+    fn lm_head(
+        &mut self,
+        _config: &ModelConfig,
+        _hidden: &[f32],
+        _source: &dyn WeightSource,
+        _limit: usize,
+        logits: &mut [f32],
+    ) -> Result<Option<u32>, EngineError> {
+        self.head_calls += 1;
+        self.launches += 4;
+        logits.fill(0.0);
+        Ok(Some(0))
     }
 }
 
@@ -433,7 +543,14 @@ impl AttentionProjectionBackend for RecordingAttentionBackend {
 
 #[test]
 fn a_host_controlled_attention_backend_seam_is_bit_identical_to_reference_prefill() {
-    let config = ModelConfig::tiny();
+    // The seam must be exact at the model's full depth, not only at tiny()'s two layers.
+    let mut config = ModelConfig::tiny();
+    config.n_layers = 40;
+    config.compress_ratios = {
+        let mut ratios = vec![1; config.n_layers];
+        ratios.push(0);
+        ratios
+    };
     let plan = TensorPlan::language_model(&config);
     let engine = InferenceEngine::new(
         config.clone(),
@@ -470,6 +587,7 @@ fn a_host_controlled_attention_backend_seam_is_bit_identical_to_reference_prefil
             &mut provider,
             &mut post,
             Some(&mut backend),
+            None,
             &mut progress,
         )
         .expect("deferred hybrid chain with the attention backend seam");
@@ -527,6 +645,7 @@ fn a_host_controlled_attention_backend_seam_is_bit_identical_to_reference_prefil
             &mut provider,
             &mut post,
             Some(&mut perturbed),
+            None,
             &mut progress,
         )
         .expect("perturbed attention backend chain");
@@ -591,6 +710,7 @@ fn the_attention_body_seam_is_invoked_once_per_layer_and_changes_the_chain() {
             &mut provider,
             &mut post,
             Some(&mut backend),
+            None,
             &mut progress,
         )
         .expect("deferred hybrid chain with a device attention body");
@@ -615,6 +735,58 @@ fn the_attention_body_seam_is_invoked_once_per_layer_and_changes_the_chain() {
             .zip(hybrid.head_input.iter())
             .any(|(left, right)| left.to_bits() != right.to_bits()),
         "a backend that replaces the attention body must change the chain output"
+    );
+}
+
+#[test]
+fn the_routed_moe_seam_is_invoked_once_per_layer_and_issues_680_launches() {
+    let mut config = ModelConfig::tiny();
+    config.n_layers = 40;
+    config.compress_ratios = vec![0; config.n_layers + config.n_mtp_layers];
+    let plan = TensorPlan::language_model(&config);
+    let engine = InferenceEngine::new(
+        config.clone(),
+        Box::new(FiniteSource::from_plan(&plan, 0x5eed)),
+        usize::MAX,
+    )
+    .expect("engine");
+    let provider_source = FiniteSource::from_plan(&plan, 0x5eed);
+    let embedding = embedding_for(&provider_source, &config);
+    let mut provider =
+        |layer: usize, hidden: &[f32], pre_mix: &[f32], deferred: Option<&DeferredHandoff>| {
+            host_deferred_entry(&config, &provider_source, layer, hidden, pre_mix, deferred)
+        };
+    let mut post = |layer: usize, residual: &[f32], attention_out: &[f32], attn_mixes: &Mixes| {
+        host_post(
+            &config,
+            &provider_source,
+            layer,
+            residual,
+            attention_out,
+            attn_mixes,
+        )
+    };
+    let mut progress = |_layer: usize, _host_ms: u64| {};
+    let mut moe = RecordingMoeBackend::default();
+    engine
+        .run_hybrid_chain_deferred(
+            0,
+            &embedding,
+            &mut provider,
+            &mut post,
+            None,
+            Some(&mut moe),
+            &mut progress,
+        )
+        .expect("deferred hybrid chain with a routed-MoE backend");
+    assert_eq!(
+        moe.calls, config.n_layers,
+        "the routed MoE seam must be called once per layer"
+    );
+    assert_eq!(
+        moe.launches,
+        17 * config.n_layers,
+        "forty layers of routing must still account for 17 launches per layer"
     );
 }
 
@@ -653,6 +825,7 @@ fn a_perturbed_post_coefficient_changes_the_deferred_hybrid_output() {
             &mut provider,
             &mut plain_post,
             None,
+            None,
             &mut progress,
         )
         .expect("baseline deferred chain");
@@ -677,6 +850,7 @@ fn a_perturbed_post_coefficient_changes_the_deferred_hybrid_output() {
             &embedding,
             &mut provider,
             &mut changed_post,
+            None,
             None,
             &mut progress,
         )
@@ -731,5 +905,64 @@ fn a_perturbed_entry_capture_changes_the_hybrid_output() {
             .zip(&changed.head_input)
             .any(|(left, right)| left.to_bits() != right.to_bits()),
         "a block that recomputes the capture instead of consuming the handoff would ignore this perturbation"
+    );
+}
+
+#[test]
+fn the_engine_seam_calls_forty_shared_one_norm_and_one_head() {
+    // The test's name is the requirement: forty layers, not tiny()'s two.
+    let mut config = ModelConfig::tiny();
+    config.n_layers = 40;
+    config.compress_ratios = vec![0; config.n_layers + config.n_mtp_layers];
+    let plan = TensorPlan::language_model(&config);
+    let engine = InferenceEngine::new(
+        config.clone(),
+        Box::new(FiniteSource::from_plan(&plan, 0x5eed)),
+        usize::MAX,
+    )
+    .expect("engine");
+    let provider_source = FiniteSource::from_plan(&plan, 0x5eed);
+    let embedding = embedding_for(&provider_source, &config);
+    let mut provider =
+        |layer: usize, hidden: &[f32], pre_mix: &[f32], deferred: Option<&DeferredHandoff>| {
+            host_deferred_entry(&config, &provider_source, layer, hidden, pre_mix, deferred)
+        };
+    let mut post = |layer: usize, residual: &[f32], attention_out: &[f32], attn_mixes: &Mixes| {
+        host_post(
+            &config,
+            &provider_source,
+            layer,
+            residual,
+            attention_out,
+            attn_mixes,
+        )
+    };
+    let mut progress = |_layer: usize, _host_ms: u64| {};
+    let mut backend = RecordingC4cBackend::default();
+    let _ = engine
+        .run_hybrid_chain_deferred(
+            0,
+            &embedding,
+            &mut provider,
+            &mut post,
+            None,
+            Some(&mut backend),
+            &mut progress,
+        )
+        .expect("deferred chain with the c4c MoE/norm/head seam");
+    assert_eq!(
+        backend.routed_calls, config.n_layers,
+        "one routed MoE call/layer"
+    );
+    assert_eq!(
+        backend.shared_calls, config.n_layers,
+        "one shared-expert call/layer"
+    );
+    assert_eq!(backend.norm_calls, 1, "one final norm");
+    assert_eq!(backend.head_calls, 1, "one head call");
+    assert_eq!(
+        backend.launches,
+        21 * config.n_layers + 1 + 4,
+        "17 routed + 4 shared per layer, plus norm and head"
     );
 }

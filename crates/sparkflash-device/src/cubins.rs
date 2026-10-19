@@ -34,9 +34,10 @@ pub const ROUTER_KERNEL: &str = "moe_router_sm121";
 pub const GATE_UP_KERNEL: &str = "routed_gate_up_sm121";
 
 /// Every kernel the device path may launch today or after the first wiring: the six chain kernels,
-/// the router and the routed gate/up. The SwiGLU/quantiser is still a host seam, so its cubin is not
-/// required here; when it becomes a device stage its name joins this list and the baseline pins it.
-pub const REQUIRED_KERNELS: [&str; 8] = [
+/// the router, the routed gate/up and the c4c tail RMSNorm. The SwiGLU/quantiser is a device stage in
+/// the c4c shared expert, but the driver's chain catalog does not require it here; the CLI backend
+/// verifies it directly against the baseline.
+pub const REQUIRED_KERNELS: [&str; 9] = [
     "mega_mhc_sm121",
     "b12x_mxfp8_dense_sm121",
     "b12x_mxfp4_moe_sm121",
@@ -45,6 +46,7 @@ pub const REQUIRED_KERNELS: [&str; 8] = [
     "cert_lm_head_sm121",
     "moe_router_sm121",
     "routed_gate_up_sm121",
+    "rmsnorm_sm121",
 ];
 
 /// The catalog of required kernel pins, read from the embedded baseline.
@@ -171,8 +173,9 @@ mod tests {
         }
         assert!(required.iter().any(|pin| pin.name == ROUTER_KERNEL));
         assert!(required.iter().any(|pin| pin.name == GATE_UP_KERNEL));
-        // Six chain kernels plus router plus gate/up; SwiGLU stays a host seam.
-        assert_eq!(required.len(), 8);
+        // Six chain kernels plus router, gate/up and the c4c tail norm; SwiGLU stays a host seam in
+        // the routed path and runs on device only in the shared expert.
+        assert_eq!(required.len(), 9);
         // Every m4_abi kernel is one of the chain kernels (m4_abi stays frozen, D26).
         for (source_name, _) in sparkflash_kernels::m4_abi::KERNELS {
             let name = source_name.strip_suffix(".cu").unwrap_or(source_name);
