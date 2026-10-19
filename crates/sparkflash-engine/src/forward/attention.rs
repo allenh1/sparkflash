@@ -2066,6 +2066,10 @@ pub fn attention_forward(
     )
 }
 
+/// The attention stage of one layer with its projection and attention maths delegated to
+/// the backend: the model-level f32 path for the CPU reference
+/// (HostAttentionProjectionBackend) or a device seam. Writes the attention output for the
+/// positions starting at start_pos into out.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_forward_with_backend(
     config: &ModelConfig,
