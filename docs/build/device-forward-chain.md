@@ -260,18 +260,20 @@ attention through the fixed builder (`SequencePlan` / `Format2AttentionCall`, on
 **down/combine** projection (`MXFP4_MOE`), and mHC (`MEGA_MHC`); the shared expert's dense GEMM is
 covered by `b12x_mxfp8_dense` per the matrix. The certified head is **not** in this class:
 `CERT_LM_HEAD` is a screening kernel whose header still records "never executed"
-(`kernels/cert_lm_head_sm121.cu:31`, stale: one stage-5 launch per rank is recorded below;
-`roadmap-to-serving.md:440`); it writes an upper bound for entries it certifies and exact values
-only for uncertified entries (`src/lm_head_ref.rs:109-151`),
-and its per-block maxima are finalised outside the kernel. The only recorded device execution of
-this kernel is the layer-0 stage-5 harness (`phase1-boundary-table.md:546-559`): one launch per
-rank (four launches), over the four 32,320-row shards of `head.weight`, all 129,280 entries exact
-and **0 certified**, its argmax equal to that harness's
-bf16-matched host reference - a single hidden state from the layer-0 harness, not a chain run, and
-the certificate path (pruning) was never exercised. The head is therefore labelled **NOT YET
-DEVICE-EXECUTED AS A PRUNING PATH: one stage-5 launch per rank, 0 certified, never compared against
-the chain reference**; the first chain report says "first chain execution, unverified", and
-its contract is 4.2/4.3, not "already device".
+(`kernels/cert_lm_head_sm121.cu:31`, stale: one stage-5 launch per rank and the m16 window b25
+stage PASS are recorded below; `roadmap-to-serving.md:440`); it writes an upper bound for entries
+it certifies and exact values only for uncertified entries (`src/lm_head_ref.rs:109-151`),
+and its per-block maxima are finalised outside the kernel. The recorded device executions of this
+kernel are the layer-0 stage-5 harness (`phase1-boundary-table.md:546-559`) - one launch per rank
+over the four 32,320-row shards of `head.weight`, all 129,280 entries exact and **0 certified**,
+its argmax equal to that harness's bf16-matched host reference, a single hidden state and not a
+chain run - and the m16 window b25 stage measurement (`phase3-lm-head.md`), which recorded the
+stage PASS on the re-pinned artifact: real-token control and pruning case both PASS, 4,899
+certified, `certified_count == flags` per rank. The certificate path (pruning) is therefore
+measured at stage level, not in the chain. The head is labelled **STAGE PASS AT m16 b25 (4,899
+certified, counts agree), CHAIN HEAD STILL HOST STAND-IN; criterion 1 OPEN**; the first chain
+report says "first chain execution, unverified", and its contract is 4.2/4.3, not "already
+device".
 
 ## 4. Comparison contract
 
@@ -363,9 +365,8 @@ only when **all** hold in one run:
    and the report carries the certified/exact mask (the exactness of max/argmax is the
    certificate's, not a per-entry comparison). This is the **hybrid token comparison**: the report
    says "hybrid: token produced by host math over device logits", and `CERT_LM_HEAD` is labelled
-   **NOT YET DEVICE-EXECUTED AS A PRUNING PATH: one stage-5 launch per rank, 0 certified, never
-   compared against the chain reference**; the first chain report says "first chain execution,
-   unverified";
+   **STAGE PASS AT m16 b25 (4,899 certified, counts agree), CHAIN HEAD STILL HOST STAND-IN;
+   criterion 1 OPEN**; the first chain report says "first chain execution, unverified";
 4. logits at 129: absolute max diff <= 2e-2 over the entries the screen left exact plus the argmax
    entry, computed by the masked comparator (4.2) - not `sequence_fixture::compare_logits`, which
    takes no mask; the all-entry host recomputation is printed only as "host measurement, not a
@@ -446,11 +447,13 @@ one process so the ledger belongs to one run - the same run the PASS definition 
   of that host arithmetic, that is a coverage failure: wire the kernel, do not widen the bar.
 * **Certified head verification and the block reduction (token-path blocker).** `CERT_LM_HEAD`'s
   header still records "never executed" (`kernels/cert_lm_head_sm121.cu:31`), stale: one stage-5
-  launch per rank is recorded (3.2c). It is a screening kernel (4.2), so the head is labelled **NOT
-  YET DEVICE-EXECUTED AS A PRUNING PATH: one stage-5 launch per rank, 0 certified, never compared
-  against the chain reference** (3.2c); the first chain report says "first chain execution,
-  unverified", and the all-entry logits comparison is impossible by design. The block reduction over
-  the kernel's per-block maxima is not in the kernel (`:27-30`) and is a host seam (`lm_head_argmax`)
+  launch per rank is recorded (3.2c), and the m16 window b25 stage measurement recorded the pruning
+  path PASS (4,899 certified, `certified_count == flags` per rank; `phase3-lm-head.md`). It is a
+  screening kernel (4.2), so the head is labelled **STAGE PASS AT m16 b25 (4,899 certified, counts
+  agree), CHAIN HEAD STILL HOST STAND-IN; criterion 1 OPEN**; the first chain report says "first
+  chain execution, unverified", and the all-entry logits comparison is impossible by design. The
+  block reduction over the kernel's per-block maxima is not in the kernel (`:27-30`) and is a host
+  seam (`lm_head_argmax`)
   in the first run: the token is exact by the certificate but produced by host math over device
   candidates, so it is the hybrid token comparison (3.2b, 4.3) and cannot be a device-chain claim.
 * **Coverage blockers for a device-chain claim (Phase 3, not Phase 2 criterion 1).** kernel-dev's
@@ -798,8 +801,9 @@ arm is recorded in b22 above, and M3-d adds the boundary capture.
 of section 5 with the boundary capture at 129, the contract of section 4, and the report artifacts.
 The first point at which this note's subject may be called passing - as a hybrid claim, with
 labelled host seams, the token path labelled "hybrid: token produced by host math over device
-logits", the FFN stage labelled hybrid while gate/up is merged but not wired, and the head
-labelled NOT YET DEVICE-EXECUTED AS A PRUNING PATH.
+logits", the FFN stage labelled hybrid while gate/up is merged but not wired, and the head's
+pruning path labelled as the m16 stage PASS at b25 (4,899 certified, counts agree) with the
+chain's head still a host stand-in and criterion 1 OPEN.
 
 File layout: `crates/sparkflash-device/src/{lib.rs, engine.rs, session.rs, chain.rs,
 chain_device.rs, budget.rs, staging.rs, window.rs, cubins.rs}`, `crates/sparkflash-device/tests/{engine_offline.rs,

@@ -407,18 +407,22 @@ a device-chain claim, so a token produced with a host final norm is a hybrid tok
 - **Measured (measured):** stage 5 on the released token (2026-10-17): `cert_lm_head_sm121` launched
   **once per rank** over the four 32,320-row shards of `head.weight`; device argmax **5**, value
   **13.237006187**, equal to the bf16-matched host reference; **all 129,280 entries exact, 0
-  certified**; max |device − bf16 host| = **0**; certificate check not exercised (no certified
-  entries); run 1.56 s including the 1.32 GB upload; a second run printed identical lines
+  certified**; max |device − bf16 host| = **0**; certificate check not exercisable in that run (0
+  certified entries), while the pruning case itself passes at stage level at m16 window b25 (4,899
+  certified, counts equal to the flags; Phase 3 `phase3-lm-head.md`); run 1.56 s including the
+  1.32 GB upload; a second run printed identical lines
   (`phase1-boundary-table.md:546-563`; logs `stage5-device-run-timed.log`,
   `stage5-device-final.log`). This is one hidden state from the layer-0 harness, not a chain run.
 - **Stale-header flag:** `kernels/cert_lm_head_sm121.cu:31-38` still records "Verification status:
   never executed" and cites nvcc 12.9.1. That sentence is stale: four launches happened
-  (one per rank); the certificate/pruning path is still unexercised, which is the part the header is
-  really about.
+  (one per rank), and the certificate/pruning path is executed at stage level by m16 window b25
+  (4,899 certified, `certified_count == flags` per rank, both cases PASS). What is still true is
+  chain-level: the chain's head is a host stand-in and does not use the pruning path.
 - **Gap:** chain wiring; the finalisation (block reduction over per-block maxima) is outside the
   kernel and the design lists the whole `lm_head_argmax` as class (b) because it includes the greedy
-  selection; the chain also owes the head an exactness comparison. Pruning-path validation is
-  unstarted.
+  selection; the chain also owes the head an exactness comparison. The pruning path is measured at
+  stage level (m16 b25), but the chain does not use it yet, so chain-level pruning-path validation
+  is unstarted.
 
 ### 2.14 greedy argmax (row stage 14)
 
@@ -707,9 +711,10 @@ exercised and the host stand-ins drop 8 -> 7.
 **M4 — the full 130 + 8 run and criterion 1.**
 13. Run the full prefill+decode schedule and write the report artifacts; criterion 1's PASS definition
     is design 4.3. The run may only be called passing as the hybrid claim described there (host FFN
-    seams labelled, token path labelled hybrid, head labelled NOT YET DEVICE-EXECUTED AS A PRUNING
-    PATH), and Phase 3 claims require removing the class-(b) host seams (final norm, argmax) — which
-    need kernels (2.12/2.14) — plus wiring the merged gate/up kernel for a device FFN claim (2.8:
+    seams labelled, token path labelled hybrid, head's pruning path labelled as the m16 stage
+    measurement at b25, not a chain execution), and Phase 3 claims require removing the class-(b)
+    host seams (final norm, argmax) — which need kernels (2.12/2.14) — plus wiring the merged
+    gate/up kernel for a device FFN claim (2.8:
     kernel and typed builder are on main, but it is not wired, and the routing weight, SwiGLU,
     combine and shared expert are still unmeasured on device).
 
@@ -893,7 +898,9 @@ and is not cited.
 - `kernels/flash_mla_csa2_sm121.cu:53-58` says format 2 was never executed on a device; task-14 and
   the m8 dispatch supersede it (2.6).
 - `kernels/cert_lm_head_sm121.cu:31-38` says "never executed"; four launches are recorded (2.13).
-  The pruning path is still unexercised; that part of the header remains true and is not claimed.
+  The pruning path is measured as an m16 stage (b25: 4,899 certified, counts equal to the flags);
+  what remains true is that the chain does not execute or use it, and no chain-level pruning claim
+  is made.
 - [phase3-router.md](phase3-router.md) section 5 is the repository's router record (binary
   `8f32174e` from `15b86d0`, p50 6.8530/6.8541 ms). A later b3 window (binary `a3ba20e4`) repeated
   the ids and ULP counts with p50 6.8528/6.8534 ms, but its logs are Lead-reported node files, not

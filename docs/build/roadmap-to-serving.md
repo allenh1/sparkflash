@@ -599,11 +599,13 @@ provisional 2e-2 ceiling.
 
 The device head has now run in a full window: `--stage 5` reports device argmax 5 equal to both
 references, all 129,280 entries exact with **max |device - bf16-matched host| = 0** (value equality in
-the kernel's order), and 0 certified entries on this token, so the certificate was not exercised and
-the harness says so. That closes criterion 3's device half for the argmax and the exact logits; the
-top-5 is not claimed because a certified entry stores a bound rather than its value. What remains is
-the device column of criterion 1: the device half diffs this reference table against the device path
-and measures the per-tensor bars, and the 40-layer token harness that produces those rows. The
+the kernel's order), and 0 certified entries on this token, so the certificate was not exercised in
+that run and the harness says so; the pruning case itself passed at stage level in the m16 window
+b25 (4,899 certified, counts equal to the flags; `phase3-lm-head.md`). That closes criterion 3's
+device half for the argmax and the exact logits; the top-5 is not claimed because a certified entry
+stores a bound rather than its value. What remains is the device column of criterion 1: the device
+half diffs this reference table against the device path and measures the per-tensor bars, and the
+40-layer token harness that produces those rows. The
 groundwork for that diff is now device-measured in the fourth window (2026-10-18): the released
 `[24, n*d]` mHC predictor (B0), the B1 probes (B1) and the reference activation ceil rule (D8) run
 on the node as one chained layer-0 path - stage 0 PASS, stage 1 PASS at layers 0/1/4, stage 8 PASS
