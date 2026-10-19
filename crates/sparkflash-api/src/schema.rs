@@ -42,10 +42,11 @@ pub struct ChatCompletionRequest {
     pub logprob_token_ids: Option<Vec<u32>>,
     /// vLLM's chat `echo`: prepend the final message to the continuation.
     ///
-    /// The reference chat path cannot render a chat template yet (the router's prompt ids are
-    /// placeholders, see `prompt.rs`), so this flag is parsed for protocol compatibility and used
-    /// only for its vLLM side effect: when `prompt_logprobs` is absent it selects
-    /// `top_logprobs`'s value, as vLLM does. It does not change the prompt.
+    /// When the tokenizer seam is attached the prompt ids are the released V4.1 template's real ids
+    /// (see `encoding/seam.rs`), but echoing the final message changes the generation assembly rather
+    /// than the prompt, so it is still deferred with the logprob protocol work. This flag is parsed
+    /// for protocol compatibility and used only for its vLLM side effect: when `prompt_logprobs` is
+    /// absent it selects `top_logprobs`'s value, as vLLM does. It does not change the prompt.
     pub echo: Option<bool>,
     /// Tool definitions (accepted verbatim in Milestone 1).
     pub tools: Option<Value>,
@@ -220,7 +221,7 @@ pub struct CompletionRequest {
     pub chat_template_kwargs: Option<Value>,
 }
 
-/// `prompt` may be a single string or an array of strings.
+/// `prompt` may be a single string, an array of strings, or an array of token ids.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum PromptSpec {
@@ -228,6 +229,8 @@ pub enum PromptSpec {
     Text(String),
     /// Several prompts (joined with newlines in Milestone 1).
     Many(Vec<String>),
+    /// A pre-tokenized prompt, passed to the engine unchanged (vLLM's `int[]` form).
+    Tokens(Vec<u32>),
 }
 
 /// OpenAI `POST /v1/responses` request body.

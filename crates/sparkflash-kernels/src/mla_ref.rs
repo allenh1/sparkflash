@@ -45,7 +45,14 @@
 //! attention_with_sink_union is the attention the released prefill/decode actually computes:
 //! the engine-format window rows supplied by the caller (oldest first, all attended) concatenated
 //! with the selected compressed candidates that are not in the query's future, one f32 softmax
-//! over that union, and the sink added to the denominator after the maximum. The selected ids are
+//! over that union, and the sink added to the denominator after the maximum. The probability that
+//! the P*V product consumes is the bf16-rounded one, because the released kernel writes the f32
+//! probabilities into a bf16 tile before the GEMM (kernel.py:339-341) while the normalising sum
+//! keeps the f32 values (kernel.py:342-353); that is the native rule, F2, and the engine's
+//! reference body carries it too. The format-0/1 window paths above keep f32 probabilities on
+//! purpose: they pin the older device-format arithmetic, and the device format-2 body still keeps
+//! f32 until the F2 variant lands, so a device-vs-union comparison now reports that difference by
+//! design instead of sharing it. The selected ids are
 //! absolute token positions decoded from the FP4 latent; for a ratio-2 compressed source the
 //! caller supplies a per-position expanded view (row p = store row p / ratio) so an id is a row
 //! index again. Unlike the format-0/1 window paths above, an id outside the sliding window but at
@@ -655,14 +662,20 @@ fn union_attention_impl(
 
     // Pass three: the weighted value sum in the same order. An id past the query is skipped
     // outright, so its contribution is exactly zero rather than a small weight.
+    //
+    // kernel.py:339-341 rounds every softmax probability to bf16 before the P*V product (the
+    // cast-into-bf16-then-gemm pair), while the normalising sum above keeps the f32 probability
+    // (kernel.py:342-353). The device body still accumulates f32 until the format-2 variant lands,
+    // so a device-vs-twin comparison reports the difference by design (F2).
     let mut out = vec![0.0f32; MLA_LATENT];
     if maximum > f32::NEG_INFINITY {
         for row in 0..window_rows {
             let weight = (score_window_candidate(q, window_codes, window_scales, row as u32)
                 - maximum)
                 .exp();
+            let probability = bf16_value(bf16_bits(weight));
             for (index, value) in out.iter_mut().enumerate() {
-                *value += weight * window_kv_value(window_codes, window_scales, row, index);
+                *value += probability * window_kv_value(window_codes, window_scales, row, index);
             }
         }
         for candidate in selected {
@@ -670,8 +683,9 @@ fn union_attention_impl(
                 continue;
             }
             let weight = (score_candidate(q, kv_fp4, kv_scales, *candidate) - maximum).exp();
+            let probability = bf16_value(bf16_bits(weight));
             for (index, value) in out.iter_mut().enumerate() {
-                *value += weight * kv_latent(kv_fp4, kv_scales, *candidate as usize, index);
+                *value += probability * kv_latent(kv_fp4, kv_scales, *candidate as usize, index);
             }
         }
     }
@@ -1628,8 +1642,11 @@ mod tests {
         let single = attention_union(&q, &[], &[], 0, &kv.fp4, &kv.scales, &[0, 1], 10);
         let duplicated = attention_union(&q, &[], &[], 0, &kv.fp4, &kv.scales, &[0, 0, 1], 10);
         let lower = (-MLA_SCORE_SCALE).exp();
-        let expected_single = (lower + 2.0) / (lower + 1.0);
-        let expected_duplicated = (2.0 * lower + 2.0) / (2.0 * lower + 1.0);
+        let rounded = bf16_value(bf16_bits(lower));
+        // The P*V product uses the native bf16 probability round; the denominator keeps the f32
+        // probability (kernel.py:339-353).
+        let expected_single = (rounded + 2.0) / (lower + 1.0);
+        let expected_duplicated = (2.0 * rounded + 2.0) / (2.0 * lower + 1.0);
         assert!((single[0] - expected_single).abs() < 1e-6);
         assert!((duplicated[0] - expected_duplicated).abs() < 1e-6);
         assert!(
@@ -1650,9 +1667,10 @@ mod tests {
         let mut kv = Kv::new(1);
         kv.set(0, 0, 0x4); // 2.0 in the compressed row
         let union = attention_union(&q, &codes, &scales, 1, &kv.fp4, &kv.scales, &[0], 0);
-        // Window score 1*s, compressed score 2*s; the weights are exp(-s) and 1.
+        // Window score 1*s, compressed score 2*s; the weights are exp(-s) and 1, and the P*V
+        // operand is the bf16-rounded weight (kernel.py:339-341).
         let lower = (-MLA_SCORE_SCALE).exp();
-        let expected = (lower + 2.0) / (lower + 1.0);
+        let expected = (bf16_value(bf16_bits(lower)) + 2.0) / (lower + 1.0);
         assert!(
             (union[0] - expected).abs() < 1e-6,
             "got {} expected {expected}",
@@ -1680,7 +1698,7 @@ mod tests {
     }
 
     #[test]
-    fn union_with_no_selected_is_the_window_attention_bit_for_bit() {
+    fn union_with_no_selected_attends_the_window_rows_with_the_native_round() {
         let q: Vec<f32> = (0..MLA_LATENT)
             .map(|index| ((index as f32 * 0.013).cos() * 0.5) + ((index % 11) as f32 * 0.02))
             .collect();
@@ -1698,13 +1716,38 @@ mod tests {
         // listed; the union mode attends every supplied window row, so the equivalent window call
         // lists rows 0..window_rows. No selected compressed candidates are involved.
         let listed: Vec<u32> = (0..rows as u32).collect();
+        // The union mode is the chain's body and carries the native bf16 probability round (F2,
+        // kernel.py:339-341). The window-only path is the older format-0/1 device arithmetic and
+        // keeps f32 probabilities, so the two still attend the same rows in the same order but no
+        // longer share the last bits: the difference is exactly that round, and the bits checks
+        // below keep it from being lost again.
         let window = attention_window(&q, &codes, &scales, rows, &listed);
         let union = attention_union(&q, &codes, &scales, rows, &[], &[], &[], 0);
-        assert_eq!(bits(&window), bits(&union));
+        for (index, (window_value, union_value)) in window.iter().zip(union.iter()).enumerate() {
+            let delta = (window_value - union_value).abs();
+            assert!(
+                delta <= 5e-3,
+                "channel {index}: union {union_value} differs from window {window_value} by {delta}"
+            );
+        }
+        assert_ne!(
+            bits(&window),
+            bits(&union),
+            "the native probability round must be visible against the f32 window path"
+        );
         let window_sink = attention_with_sink_window(&q, &codes, &scales, rows, &listed, 0.75);
         let union_sink =
             attention_with_sink_union(&q, &codes, &scales, rows, &[], &[], &[], 0, 0.75);
-        assert_eq!(bits(&window_sink), bits(&union_sink));
+        for (index, (window_value, union_value)) in
+            window_sink.iter().zip(union_sink.iter()).enumerate()
+        {
+            let delta = (window_value - union_value).abs();
+            assert!(
+                delta <= 5e-3,
+                "sink channel {index}: union {union_value} differs from window {window_value} by {delta}"
+            );
+        }
+        assert_ne!(bits(&window_sink), bits(&union_sink));
     }
 
     #[test]
@@ -1793,9 +1836,14 @@ mod tests {
         for score in &scores {
             denominator += (score - maximum).exp();
         }
+        // The slow reference applies the native rule too: the probability is computed in f64 and
+        // then rounded to bf16 before the value product, while the denominator above keeps the
+        // unrounded sums (kernel.py:339-353).
         let mut expected = vec![0.0f64; MLA_LATENT];
         for (slot, score) in scores.iter().enumerate() {
-            let weight = (score - maximum).exp() / denominator;
+            let probability = (score - maximum).exp();
+            let rounded = f64::from(bf16_value(bf16_bits(probability as f32)));
+            let weight = rounded / denominator;
             for index in 0..MLA_LATENT {
                 expected[index] += weight * values[slot * MLA_LATENT + index];
             }
@@ -1834,7 +1882,9 @@ mod tests {
         let candidate_sum: f64 = scores.iter().map(|score| (score - maximum).exp()).sum();
         let mut expected_no_sink = vec![0.0f64; MLA_LATENT];
         for (slot, score) in scores.iter().enumerate() {
-            let weight = (score - maximum).exp() / candidate_sum;
+            let probability = (score - maximum).exp();
+            let rounded = f64::from(bf16_value(bf16_bits(probability as f32)));
+            let weight = rounded / candidate_sum;
             for index in 0..MLA_LATENT {
                 expected_no_sink[index] += weight * values[slot * MLA_LATENT + index];
             }

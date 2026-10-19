@@ -18,9 +18,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 
 use sparkflash_comm::oneshot::{
-    ArrivalProxy, DeviceBuffer, Dispatch, Exchange, ONESHOT_KIND, ONESHOT_PHASE, ONESHOT_RAILS,
-    ONESHOT_RANKS, ONESHOT_ROW_ELEMENTS, ONESHOT_SLOT_BYTES, RailFrame, SeamError, SequenceCounter,
-    SlotKind, SlotRegistration, row_offset,
+    ArrivalProxy, ChunkPlan, ChunkedProxy, DeviceBuffer, Dispatch, Exchange, ONESHOT_KIND,
+    ONESHOT_PHASE, ONESHOT_RAILS, ONESHOT_RANKS, ONESHOT_ROW_ELEMENTS, ONESHOT_SLOT_BYTES,
+    RailFrame, SeamError, SequenceCounter, SlotKind, SlotRegistration, row_offset,
 };
 use sparkflash_comm::{
     CommError, LoopbackCluster, LoopbackConfig, Transport, canonical_all_reduce_into,
@@ -162,6 +162,130 @@ fn four_ranks_reduce_through_the_seam_and_match_the_canonical_twin_for_one_hundr
         for handle in handles {
             handle.join().expect("rank thread");
         }
+    }
+}
+
+/// The slot rows for the chunked test, one mutex per row: a chunked exchange writes the row it
+/// owns and reads every peer's row after the barrier, and the mutex is what makes that sharing
+/// sound in a test that has no kernel to order it.
+struct ChunkState {
+    rows: Vec<std::sync::Mutex<Vec<u16>>>,
+    doorbell: [AtomicU64; ONESHOT_RANKS],
+    arrival: [AtomicU64; ONESHOT_RANKS],
+}
+
+impl ChunkState {
+    fn new(elements: usize) -> Arc<Self> {
+        Arc::new(Self {
+            rows: (0..ONESHOT_RANKS)
+                .map(|_| std::sync::Mutex::new(vec![0u16; elements]))
+                .collect(),
+            doorbell: std::array::from_fn(|_| AtomicU64::new(0)),
+            arrival: std::array::from_fn(|_| AtomicU64::new(0)),
+        })
+    }
+}
+
+#[test]
+fn four_ranks_chain_three_chunks_through_one_slot_and_match_the_canonical_twin() {
+    // A prefill-sized payload is a series of row-sized one-shot exchanges: three rows of bf16
+    // elements stand in for the 4096-token seam, and the protocol is about the order.
+    let chunk_elements = ONESHOT_ROW_ELEMENTS;
+    let chunks = 3usize;
+    let total_elements = chunk_elements * chunks;
+    let plan = ChunkPlan::new(total_elements * 2, ONESHOT_RAILS).expect("chunk plan");
+    assert_eq!(plan.chunk_count(), chunks);
+    let state = ChunkState::new(chunk_elements);
+    let barrier = Arc::new(Barrier::new(ONESHOT_RANKS));
+    let mut handles = Vec::new();
+    for rank in 0..ONESHOT_RANKS {
+        let state = Arc::clone(&state);
+        let barrier = Arc::clone(&barrier);
+        let plan = plan.clone();
+        handles.push(std::thread::spawn(move || {
+            let full = payload(rank, 7, total_elements);
+            let mut produced = vec![0u16; total_elements];
+            let mut proxy = ChunkedProxy::new(rank, plan.clone(), 0).expect("proxy");
+            for index in 0..chunks {
+                let seq = index as u64;
+                let start = index * chunk_elements;
+                // Stage the chunk into the rank's row: the kernel's row fill, before the doorbell.
+                state.rows[rank].lock().expect("row")[..chunk_elements]
+                    .copy_from_slice(&full[start..start + chunk_elements]);
+                state.doorbell[rank].store(seq, Ordering::Release);
+                for peer in 0..ONESHOT_RANKS {
+                    let mut spins = 0u32;
+                    while state.doorbell[peer].load(Ordering::Acquire) < seq {
+                        spins += 1;
+                        assert!(spins < 1_000_000, "peer {peer} never staged chunk {index}");
+                        std::hint::spin_loop();
+                    }
+                }
+                proxy.on_doorbell().expect("doorbell");
+                for peer in 0..ONESHOT_RANKS {
+                    if peer == rank {
+                        continue;
+                    }
+                    for rail in [ONESHOT_RAILS - 1, 0] {
+                        let frame = RailFrame {
+                            sender: peer as u8,
+                            rail,
+                            phase: ONESHOT_PHASE,
+                            kind: ONESHOT_KIND,
+                            sequence_low: (seq & 0xff) as u8,
+                        };
+                        if proxy.on_frame(&frame).expect("frame").is_some() {
+                            state.arrival[peer].store(seq, Ordering::Release);
+                        }
+                    }
+                }
+                assert!(proxy.current_published(), "chunk {index} not published");
+                for peer in 0..ONESHOT_RANKS {
+                    if peer == rank {
+                        continue;
+                    }
+                    let mut spins = 0u32;
+                    while state.arrival[peer].load(Ordering::Acquire) < seq {
+                        spins += 1;
+                        assert!(
+                            spins < 1_000_000,
+                            "peer {peer} never arrived for chunk {index}"
+                        );
+                        std::hint::spin_loop();
+                    }
+                }
+                // Every peer has staged and arrived for chunk i; read the rows, then hold the
+                // second barrier so nobody reuses them until every rank has finished reading.
+                barrier.wait();
+                {
+                    let guards: Vec<std::sync::MutexGuard<'_, Vec<u16>>> = state
+                        .rows
+                        .iter()
+                        .map(|row| row.lock().expect("row"))
+                        .collect();
+                    let rows: Vec<&[u16]> = guards
+                        .iter()
+                        .map(|guard| &guard[..chunk_elements])
+                        .collect();
+                    canonical_all_reduce_into(&mut produced[start..start + chunk_elements], &rows)
+                        .expect("canonical reduce");
+                }
+                barrier.wait();
+                proxy.advance().expect("advance");
+            }
+            assert!(proxy.is_finished());
+            assert_eq!(proxy.completed_chunks(), chunks);
+            let full_rows: Vec<Vec<u16>> = (0..ONESHOT_RANKS)
+                .map(|peer| payload(peer, 7, total_elements))
+                .collect();
+            let row_slices: Vec<&[u16]> = full_rows.iter().map(Vec::as_slice).collect();
+            let mut expected = vec![0u16; total_elements];
+            canonical_all_reduce_into(&mut expected, &row_slices).expect("twin");
+            assert_eq!(produced, expected, "rank {rank} chunked produce");
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("rank thread");
     }
 }
 

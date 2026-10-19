@@ -429,18 +429,19 @@ fn a_one_code_change_in_layer_17s_wq_b_flags_layer_17_and_no_other_layer() {
     // the row and rounds away in others (the quantised block input can snap to the same E4M3 code,
     // for one), which is why the format document gives every boundary its own comparison class
     // (docs/build/phase1-boundary-table.md section 5) instead of one bar for the whole row.
-    // The row's full measured result, pinned: these six tensors differ and the other twelve are
+    // The row's full measured result, pinned: these five tensors differ and the other thirteen are
     // bit-identical. The counts and deltas are deterministic for this configuration and seed and
     // are the numbers format document section 6 quotes; comparing the deltas by bits keeps the
-    // test and the document from drifting apart. The row maximum is `hc_ffn_comb`'s 5.96e-8, not
-    // `residual_out`'s 2.98e-8 - the attribution the earlier revision got wrong.
+    // test and the document from drifting apart. The row maximum is now 1.49e-8 on three tensors
+    // (`post_attention_hidden`, `pre_ffn_hidden`, `residual_out`); `hc_ffn_comb` used to carry the
+    // 5.96e-8 maximum and now rounds the one-code change away entirely, because the host reference
+    // rounds the block's bf16 module outputs the way native does (task-10, audit F5).
     let measured = [
         (boundary::ATTENTION_OUT, 64usize, 1.396_983_9e-9f32),
-        (boundary::POST_ATTENTION_HIDDEN, 17, 1.490_116_1e-8),
-        (boundary::HC_FFN_COMB, 3, 5.960_464_5e-8),
-        (boundary::PRE_FFN_HIDDEN, 8, 1.490_116_1e-8),
-        (boundary::FFN_OUT, 12, 2.328_306_4e-10),
-        (boundary::RESIDUAL_OUT, 57, 2.980_232_2e-8),
+        (boundary::POST_ATTENTION_HIDDEN, 5, 1.490_116_1e-8),
+        (boundary::PRE_FFN_HIDDEN, 4, 1.490_116_1e-8),
+        (boundary::FFN_OUT, 8, 2.328_306_4e-10),
+        (boundary::RESIDUAL_OUT, 6, 1.490_116_1e-8),
     ];
     for (name, count, max) in measured {
         let tensor = flagged
@@ -466,13 +467,13 @@ fn a_one_code_change_in_layer_17s_wq_b_flags_layer_17_and_no_other_layer() {
     }
     assert_eq!(
         flagged.differing(),
-        161,
-        "the row's measured total, across six tensors"
+        87,
+        "the row's measured total, across five tensors"
     );
     assert_eq!(
         flagged.max_abs_delta().to_bits(),
-        5.960_464_5e-8f32.to_bits(),
-        "the row maximum is the hc_ffn_comb delta, not residual_out's"
+        1.490_116_1e-8f32.to_bits(),
+        "the row maximum is the 1.49e-8 shared by three tensors"
     );
 
     // The boundary chain has no gap: every backbone layer's output stream is the next layer's

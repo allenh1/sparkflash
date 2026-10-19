@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use sparkflash_comm::oneshot::{
-    Dispatch, DispatchAddresses, DispatchLog, DispatchRecord, Exchange, LaunchPath,
+    ChunkPlan, Dispatch, DispatchAddresses, DispatchLog, DispatchRecord, Exchange, LaunchPath,
     ONESHOT_ARRIVAL_BYTES, ONESHOT_KERNEL_NAME, ONESHOT_RAILS, ONESHOT_RANKS, ONESHOT_ROW_BYTES,
     ONESHOT_ROW_ELEMENTS, ONESHOT_SLOT_ALIGN, ONESHOT_SLOT_BYTES, SequenceCounter, SlotKind,
     SlotRegistration, row_offset,
@@ -40,7 +40,7 @@ use sparkflash_engine::safetensors::SafeTensorsSource;
 use sparkflash_kernels::m4_quant::{bf16_bits, bf16_value, fp8_e4m3_decode, ue8m0_decode};
 
 /// The usage line appended to the device-chain usage.
-pub const USAGE: &str = "sparkflash device-chain --run-stage tp4-smoke --checkpoint DIR [--synthetic] --tp-rank 0..N --tp-world-size 4 --comm-backend tcp|lo|rdma --comm-peers IP,IP,... --comm-port 29601 --layer 0 --position 0 --repeats 100 --evidence-dir DIR [--resident] [--cubin-dir DIR] [--payload-elements N] [--seed N] [--comm-timeout SECS] [--comm-connect-timeout SECS] [--oneshot-preflight]";
+pub const USAGE: &str = "sparkflash device-chain --run-stage tp4-smoke --checkpoint DIR [--synthetic] --tp-rank 0..N --tp-world-size 4 --comm-backend tcp|lo|rdma --comm-peers IP,IP,... --comm-port 29601 --layer 0 --position 0 --repeats 100 --evidence-dir DIR [--resident] [--cubin-dir DIR] [--payload-elements N] [--seed N] [--comm-timeout SECS] [--comm-connect-timeout SECS] [--oneshot-preflight] [--prefill-plan-elements N]";
 
 /// The default base port; rank r uses base + r.
 pub const DEFAULT_COMM_PORT: u16 = 29601;
@@ -146,6 +146,8 @@ struct SmokeArgs {
     connect_timeout: Duration,
     /// Validate and record the host-side half of the S5.3 device-buffer seam before the run.
     oneshot_preflight: bool,
+    /// Plan the chunked prefill path (S5.4) for this many bf16 elements; host side only.
+    prefill_plan_elements: Option<usize>,
 }
 
 impl SmokeArgs {
@@ -167,6 +169,7 @@ impl SmokeArgs {
         let mut timeout = DEFAULT_TIMEOUT;
         let mut connect_timeout = DEFAULT_CONNECT_TIMEOUT;
         let mut oneshot_preflight = false;
+        let mut prefill_plan_elements = None;
         let mut synthetic = false;
 
         let mut index = 0;
@@ -270,6 +273,12 @@ impl SmokeArgs {
                 "--resident" => resident = true,
                 "--synthetic" => synthetic = true,
                 "--oneshot-preflight" => oneshot_preflight = true,
+                "--prefill-plan-elements" => {
+                    prefill_plan_elements = Some(parse_usize(
+                        "--prefill-plan-elements",
+                        take(args, &mut index, "--prefill-plan-elements")?,
+                    )?);
+                }
                 "--help" | "-h" => return Err(format!("usage: {USAGE}")),
                 other => return Err(format!("unknown argument {other}; usage: {USAGE}")),
             }
@@ -309,6 +318,7 @@ impl SmokeArgs {
             timeout,
             connect_timeout,
             oneshot_preflight,
+            prefill_plan_elements,
         };
         args.validate()?;
         Ok(args)
@@ -323,6 +333,24 @@ impl SmokeArgs {
                 "--tp-rank {} is outside a world of {}",
                 self.rank, self.world
             ));
+        }
+        if self.prefill_plan_elements.is_some() && !self.oneshot_preflight {
+            return Err(
+                "--prefill-plan-elements plans the device-buffer seam; add --oneshot-preflight"
+                    .to_string(),
+            );
+        }
+        if let Some(elements) = self.prefill_plan_elements {
+            let bytes = elements
+                .checked_mul(2)
+                .ok_or_else(|| "--prefill-plan-elements is too large".to_string())?;
+            let plan = ChunkPlan::new(bytes, ONESHOT_RAILS)
+                .map_err(|error| format!("the prefill plan is illegal: {error}"))?;
+            if plan.chunk_count() < 2 {
+                return Err(format!(
+                    "--prefill-plan-elements {elements} fits one {ONESHOT_ROW_ELEMENTS}-element row; a prefill plan needs more than one"
+                ));
+            }
         }
         if self.oneshot_preflight && self.world != ONESHOT_RANKS {
             return Err(format!(
@@ -1330,6 +1358,7 @@ fn oneshot_section(args: &SmokeArgs) -> Value {
             "validator": "device_path_ok refuses LaunchPath::HostStaging and any host_copy_bytes != 0; DispatchLog::device_path_ok names the first offending sequence",
         },
         "sequence": { "first": 0, "last": args.repeats.saturating_sub(1) as u64, "repeats": args.repeats },
+        "chunked": chunked_section(args),
         "device_buffer_form": "refused by every host transport (CommError::Unsupported); only a device path with the kernel launcher implements it",
         "proves_host_only": [
             "the comm and kernels ABI pins agree on the slot",
@@ -1366,6 +1395,63 @@ fn oneshot_section(args: &SmokeArgs) -> Value {
     })
 }
 
+/// Records the S5.4 chunked (prefill-sized) contract on the host side of the seam.
+///
+/// The plan is arithmetic over the row the ABI already pins: a payload above one row is an ordered
+/// series of row-sized one-shot exchanges, each with its own dispatch and doorbell. Nothing here
+/// posts, reduces or times anything; the window measurement is named instead.
+fn chunked_section(args: &SmokeArgs) -> Value {
+    let Some(elements) = args.prefill_plan_elements else {
+        return json!({
+            "planned": false,
+            "note": "pass --prefill-plan-elements with --oneshot-preflight to record the S5.4 chunked contract",
+        });
+    };
+    let bytes = elements.saturating_mul(2);
+    match ChunkPlan::new(bytes, ONESHOT_RAILS) {
+        Ok(plan) => {
+            let chunk_bytes = plan.chunks().first().map_or(0, |chunk| chunk.bytes());
+            let posted_bytes = plan.posted_bytes().unwrap_or(0);
+            json!({
+                "planned": true,
+                "elements": elements,
+                "bytes": bytes,
+                "row_bytes": ONESHOT_ROW_BYTES,
+                "chunks": plan.chunk_count(),
+                "chunk_bytes": chunk_bytes,
+                "posted_bytes": posted_bytes,
+                "descriptors": "one Dispatch per chunk, same slot and release/peer-epoch words, sequence base+i, strictly increasing",
+                "doorbells": "one per chunk; chunk i+1 posts only after every peer's arrival word for chunk i is published, so the 4-slot row reuse is ordered",
+                "proves_host_only": [
+                    "the payload splits into whole bf16 elements on row boundaries",
+                    "one dispatch per chunk is legal and its sequence strictly increases",
+                    "the receive state machine publishes chunk i before it advances to i+1 and refuses a future chunk's frame"
+                ],
+                "does_not_prove": [
+                    "that the launcher posts the chunks in order or at all",
+                    "any chunked latency, bandwidth, bit-identity or determinism number"
+                ],
+                "window_measurement": {
+                    "gate": "S5.4 prefill-sized collectives (4096 tokens)",
+                    "chunks": plan.chunk_count(),
+                    "metrics": [
+                        "chunked all-reduce of the 4096-token seam is bit-identical to the canonical CPU twin, every chunk, every repeat",
+                        "two runs per configuration give the same per-chunk output bytes",
+                        "no DtoH/HtoD between chunks: device pointers only",
+                        "per-chunk latency and the total against the single-3.1 path, recorded per collective",
+                        "the arrival-word reuse across chunks shows no lost or stale doorbell in the kernel trace"
+                    ],
+                    "requires": [
+                        "four GPU nodes opened by the Lead for the window",
+                        "a cuda-feature build with the kernel launcher",
+                        "S5.3's one-shot device-path gate green first"
+                    ]
+                }
+            })
+        }
+        Err(error) => json!({ "planned": true, "error": error.to_string() }),
+    }
+}
 /// Runs one rank per process over TCP.
 fn run_tcp(args: &SmokeArgs) -> Result<Vec<String>, String> {
     let addresses = args.addresses();
@@ -1478,17 +1564,7 @@ fn run_rdma(args: &SmokeArgs) -> Result<Vec<String>, String> {
 /// A window must be able to tell a real-verbs binary from a stub one from the JSON alone; the
 /// stderr banner of the build is not part of the artifact it ships.
 fn rdma_shim_flag() -> &'static str {
-    #[cfg(feature = "rdma")]
-    {
-        match sparkflash_comm::rdma::shim_mode() {
-            sparkflash_comm::rdma::ShimMode::System => "system",
-            sparkflash_comm::rdma::ShimMode::Stub => "stub",
-        }
-    }
-    #[cfg(not(feature = "rdma"))]
-    {
-        "not_built"
-    }
+    crate::comm_rdma_shim()
 }
 
 /// Runs every rank in this one process over the in-process loopback.
@@ -1579,6 +1655,21 @@ fn run_loopback(args: &SmokeArgs) -> Result<Vec<String>, String> {
             "l1_zero_mismatches": all_l1,
             "repeats_bit_identical": all_repeats,
             "l2_within_bar": all_l2,
+        },
+        "oneshot": if args.oneshot_preflight {
+            json!({
+                "contract": "host_preflight",
+                "validated_on_host": validate_oneshot_preflight(args).is_ok(),
+                "chunked": chunked_section(args),
+            })
+        } else {
+            json!({ "contract": "not_requested", "chunked": chunked_section(args) })
+        },
+        "flags": {
+            "device_execution": false,
+            "token_produced": false,
+            "cuda_feature": cfg!(feature = "cuda"),
+            "comm_rdma_shim": rdma_shim_flag(),
         },
         "verdict": if all_l1 && all_repeats && all_l2 { "PASS" } else { "FAIL" },
     });
@@ -1882,6 +1973,9 @@ mod tests {
         assert_eq!(summary["verdict"], "PASS");
         assert_eq!(summary["gates"]["l1_zero_mismatches"], true);
         assert_eq!(summary["gates"]["repeats_bit_identical"], true);
+        assert_eq!(summary["flags"]["comm_rdma_shim"], rdma_shim_flag());
+        assert_eq!(summary["flags"]["device_execution"], false);
+        assert_eq!(summary["oneshot"]["contract"], "not_requested");
     }
 
     /// Writes a tiny two-rank checkpoint whose layer-0 attention tensors follow the reference
@@ -2077,6 +2171,8 @@ mod tests {
             "--repeats",
             "7",
             "--oneshot-preflight",
+            "--prefill-plan-elements",
+            "20971520",
         ])
         .expect("a four-rank preflight parses");
         validate_oneshot_preflight(&args).expect("the contract holds");
@@ -2098,6 +2194,13 @@ mod tests {
         assert_eq!(section["dispatch_record"]["kernel"], ONESHOT_KERNEL_NAME);
         assert_eq!(section["dispatch_record"]["required_on_window_run"], true);
         assert_eq!(section["window_measurement"]["repeats"], 7);
+        assert_eq!(section["chunked"]["planned"], true);
+        assert_eq!(section["chunked"]["elements"], 20_971_520);
+        assert_eq!(section["chunked"]["bytes"], 41_943_040);
+        assert_eq!(section["chunked"]["chunks"], 20);
+        assert_eq!(section["chunked"]["chunk_bytes"], ONESHOT_ROW_BYTES);
+        assert_eq!(section["chunked"]["posted_bytes"], 3 * 41_943_040);
+        assert_eq!(section["chunked"]["window_measurement"]["chunks"], 20);
     }
 
     #[test]
@@ -2134,5 +2237,33 @@ mod tests {
         ])
         .expect("the arguments parse; the payload is refused by the seam");
         assert!(validate_oneshot_preflight(&args).is_err());
+    }
+
+    #[test]
+    fn the_prefill_plan_needs_the_device_seam_flag_and_more_than_one_row() {
+        let base = [
+            "--synthetic",
+            "--tp-rank",
+            "0",
+            "--tp-world-size",
+            "4",
+            "--comm-backend",
+            "lo",
+            "--evidence-dir",
+            "/tmp/tp4-prefill-plan",
+            "--prefill-plan-elements",
+            "20971520",
+        ];
+        let error = parse(&base).expect_err("the prefill plan belongs to the seam");
+        assert!(error.contains("--oneshot-preflight"), "{error}");
+        let mut with_seam = base.to_vec();
+        with_seam.push("--oneshot-preflight");
+        let args = parse(&with_seam).expect("the plan parses with the seam flag");
+        assert_eq!(args.prefill_plan_elements, Some(20_971_520));
+        let mut one_row = base.to_vec();
+        one_row[10] = "1048576";
+        one_row.push("--oneshot-preflight");
+        let error = parse(&one_row).expect_err("one row is not a prefill plan");
+        assert!(error.contains("needs more than one"), "{error}");
     }
 }

@@ -334,28 +334,31 @@ differ. The diff reports:
 * every other row `is_identical()`, `max_abs_delta() == 0.0`, 0 differing elements;
 * inside row 17, the eight tensors computed before `wq_b` is read (`residual_in`, `hc_in_pre`,
   `hc_attn_pre/post/comb`, `pre_attention_hidden`, `pre_attention_xhat/scales`) are bit-identical;
-* the row has **161 differing values in six tensors**: `attention_out` (64, max abs delta
-  1.3969839e-9), `post_attention_hidden` (17, 1.4901161e-8), `hc_ffn_comb` (3, 5.9604645e-8),
-  `pre_ffn_hidden` (8, 1.4901161e-8), `ffn_out` (12, 2.3283064e-10) and `residual_out` (57,
-  2.9802322e-8). `hc_ffn_pre`, `hc_ffn_post` and the four quantised tensors
+* the row has **87 differing values in five tensors**: `attention_out` (64, max abs delta
+  1.3969839e-9), `post_attention_hidden` (5, 1.4901161e-8), `pre_ffn_hidden` (4,
+  1.4901161e-8), `ffn_out` (8, 2.3283064e-10) and `residual_out` (6, 1.4901161e-8).
+  `hc_ffn_comb`, `hc_ffn_pre`, `hc_ffn_post` and the four quantised tensors
   (`pre_attention_xhat/scales`, `pre_ffn_xhat/scales`) are bit-identical in this run.
 
-The row's `max_abs_delta` of 5.9604645e-8 is not a residual-stream delta: it is the largest delta of
-the three differing `hc_ffn_comb` coefficients (destination-column entries of the FFN's Sinkhorn
-matrix). `residual_out`'s own maximum delta is 2.9802322e-8. The counts are the measured numbers of
-the committed test configuration and seed
-(`a_one_code_change_in_layer_17s_wq_b_flags_layer_17_and_no_other_layer`); that test asserts all six
-per-tensor counts and deltas and the 161 total, comparing the deltas by bits, so this paragraph
+The row's `max_abs_delta` of 1.4901161e-8 is shared by `post_attention_hidden`,
+`pre_ffn_hidden` and `residual_out`; the previous revision of this paragraph pinned
+5.9604645e-8 as an `hc_ffn_comb` coefficient delta, and task-10's bf16 pre-rounds at the host seams
+(audit F5) now round that one-code change away entirely, so `hc_ffn_comb` is bit-identical. The counts
+are the measured numbers of the committed test configuration and seed
+(`a_one_code_change_in_layer_17s_wq_b_flags_layer_17_and_no_other_layer`); that test asserts all five
+per-tensor counts and deltas and the 87 total, comparing the deltas by bits, so this paragraph
 cannot drift from the code. A one-code weight change is small, and whether a particular tensor of
 the row absorbs it or rounds it away is what gives each boundary its own comparison class (section
-5) instead of one bar for the whole row. The quantised block inputs round back to the same codes
+5) instead of one bar for the whole row. The bf16 pre-rounds make the last clause do more work:
+that is native, not a capture regression. The quantised block inputs round back to the same codes
 here, which is why section 5 permits codes to agree while the f32 stream they were quantised from
 differs; it is a fact about the perturbation's size, not about the capture. These numbers were
-re-measured after the comb-orientation correction described in section 3. An earlier revision
-reported 155 differing values and called 5.96e-8 "exactly one f32 ulp at the residual's magnitude";
-that attribution was wrong - the row maximum is an `hc_ffn_comb` coefficient delta, not a
-residual-stream delta - and the transposed comb application produced those numbers. They do not
-describe this code.
+re-measured after the comb-orientation correction described in section 3 and again after task-10's
+bf16 pre-rounds at the host seams (audit F5). An earlier revision reported 155 differing values and
+called 5.96e-8 "exactly one f32 ulp at the residual's magnitude"; that attribution was wrong - the
+row maximum was an `hc_ffn_comb` coefficient delta, not a residual-stream delta - and the
+transposed comb application produced those numbers. The 161-in-six-tensors revision predates the
+bf16 pre-rounds and no longer describes this code; 87-in-five is the current pinned measurement.
 
 ## 7. What a middle-layer change does, and the replay protocol
 
@@ -470,7 +473,7 @@ The 15 boundary tests and what each pins:
 
 | test | pins |
 | :--- | :--- |
-| `a_one_code_change_in_layer_17s_wq_b_flags_layer_17_and_no_other_layer` | the acceptance criterion: full rows, exact-bits elsewhere, layer 17 flagged, all six differing tensors with their counts and bit-pinned max deltas (161 total), input-side tensors unchanged, row-to-row stream wiring by bits |
+| `a_one_code_change_in_layer_17s_wq_b_flags_layer_17_and_no_other_layer` | the acceptance criterion: full rows, exact-bits elsewhere, layer 17 flagged, all five differing tensors with their counts and bit-pinned max deltas (87 total), input-side tensors unchanged, row-to-row stream wiring by bits |
 | `the_observed_step_is_the_plain_step_and_two_runs_capture_identically` | the capture only reads (same logits as `prefill`), determinism, and that a different seed moves the table |
 | `a_plain_decode_is_the_observed_decode` | the plain and observed decode paths return the same logits, token, draft, confidence and consumption when the MTP stages run |
 | `the_header_records_the_consumed_prefix_and_the_mtp_anchor` | the header's prefix is empty on a first step, the decode's prefix is the consumed tokens, and the MTP anchor is the sampled next token |

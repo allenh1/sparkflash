@@ -25,6 +25,7 @@ use sparkflash_trace::{
     parse_scopes_with_aliases, set_request_filter, summarize, to_chrome_trace_json,
 };
 
+use crate::encoding::{CaseError, TokenizerSeamError};
 use crate::engine::{
     EngineEvent, EngineRequest, FinishReason, InferenceEngine, LogprobSelection, LogprobsRequest,
     MODEL_MAX_OUTPUT_TOKENS, MODEL_OWNED_BY, PromptLogprobs, TokenLogprob, max_seq_len,
@@ -869,6 +870,78 @@ fn chat_logprobs_value(output: &EngineOutput, info: LogprobInfo) -> Value {
 // POST /v1/chat/completions
 // ---------------------------------------------------------------------------------------
 
+/// Maps a tokenizer-seam refusal to the OpenAI-shaped 400 (or 500 for a tokenizer failure).
+///
+/// The message text is the seam's own: the role, content-part and effort strings are byte-identical
+/// with the released vLLM image's raises, so a client (or a parity harness) sees the same word
+/// either way.
+fn tokenizer_seam_error(error: TokenizerSeamError) -> ApiError {
+    match error {
+        TokenizerSeamError::MissingMessages
+        | TokenizerSeamError::EmptyMessages
+        | TokenizerSeamError::MessageNotObject { .. }
+        | TokenizerSeamError::InvalidRole { .. }
+        | TokenizerSeamError::UnsupportedContentPart { .. }
+        | TokenizerSeamError::InvalidContent => ApiError::invalid_request(
+            error.to_string(),
+            Some("messages".to_owned()),
+            Some("invalid_messages".to_owned()),
+        ),
+        TokenizerSeamError::InvalidChatTemplateKwargs => ApiError::invalid_request(
+            error.to_string(),
+            Some("chat_template_kwargs".to_owned()),
+            Some("invalid_chat_template_kwargs".to_owned()),
+        ),
+        TokenizerSeamError::InvalidTools => ApiError::invalid_request(
+            error.to_string(),
+            Some("tools".to_owned()),
+            Some("invalid_tools".to_owned()),
+        ),
+        TokenizerSeamError::InvalidToolCalls => ApiError::invalid_request(
+            error.to_string(),
+            Some("messages".to_owned()),
+            Some("invalid_messages".to_owned()),
+        ),
+        TokenizerSeamError::InvalidReasoningEffort => ApiError::invalid_request(
+            error.to_string(),
+            Some("reasoning_effort".to_owned()),
+            Some("invalid_reasoning_effort".to_owned()),
+        ),
+        TokenizerSeamError::Render(error) => render_case_error(&error),
+        TokenizerSeamError::Tokenize(_) => ApiError::internal(error.to_string()),
+    }
+}
+
+/// Maps an official-encoder refusal to the matching parameter/code pair.
+fn render_case_error(error: &CaseError) -> ApiError {
+    let (param, code) = match error {
+        CaseError::InvalidReasoningEffort(_) => ("reasoning_effort", "invalid_reasoning_effort"),
+        CaseError::ImagePlaceholderInContent
+        | CaseError::ImagePlaceholderInReasoning
+        | CaseError::InvalidImageBlock
+        | CaseError::UnknownRole(_)
+        | CaseError::InvalidTask(_)
+        | CaseError::UnmergedToolMessage
+        | CaseError::ToolsWithoutMessages => ("messages", "invalid_messages"),
+        CaseError::InvalidThinkingMode(_) => ("chat_template_kwargs", "invalid_thinking"),
+        CaseError::InvalidCaseShape | CaseError::InvalidJson(_) => ("messages", "invalid_messages"),
+    };
+    ApiError::invalid_request(
+        error.to_string(),
+        Some(param.to_owned()),
+        Some(code.to_owned()),
+    )
+}
+
+/// A prompt summary carrying the checkpoint's real ids.
+fn tokenizer_prompt_summary(ids: Vec<u32>, text_bytes: usize) -> PromptSummary {
+    PromptSummary {
+        token_ids: ids,
+        text_bytes,
+        images: Vec::new(),
+    }
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -877,6 +950,11 @@ async fn chat_completions(
     let value = parse_json(&body)?;
     let spec = resolve_reasoning(&value)?;
     let image_carrier = find_image_carrier(&value);
+    // The chat template reads the raw body (chat_template_kwargs and the top-level
+    // reasoning_effort decide thinking and the rendered budget), so keep a copy only when a
+    // tokenizer seam is attached; the placeholder path does not need it.
+    let seam = state.tokenizer().cloned();
+    let raw_for_seam = seam.as_ref().map(|_| value.clone());
     let request: ChatCompletionRequest = serde_json::from_value(value).map_err(invalid_body)?;
     if request.messages.is_empty() {
         return Err(ApiError::invalid_request(
@@ -946,9 +1024,10 @@ async fn chat_completions(
         }
         None
     };
-    // vLLM's chat `echo` implication is deliberately not implemented: this router does not render
-    // a chat template into the prompt yet (see prompt.rs), so "the final message" is not a thing
-    // it could echo. Explicit prompt_logprobs are supported, and are refused for streams below.
+    // vLLM's chat `echo` implication is deliberately not implemented: the template now renders
+    // (see encoding/seam.rs), but echoing the final message changes the generation assembly, not
+    // the prompt seam, so it stays deferred with the logprob protocol work. Explicit
+    // prompt_logprobs are supported, and are refused for streams below.
     let prompt_logprobs = resolve_logprob_selection(
         request.prompt_logprobs,
         "prompt_logprobs",
@@ -969,7 +1048,16 @@ async fn chat_completions(
     };
     let model = resolve_model(&state, request.model.as_deref())?;
     let trace = trace_context(&headers)?;
-    let summary = summarize_chat_messages(&request.messages)?;
+    // With the seam attached, the prompt is the released server's template rendered by the
+    // official encoder port and tokenized with the checkpoint tokenizer. Without it (the
+    // weight-free router tests), the Milestone 1 heuristic keeps the placeholder path.
+    let summary = match (seam.as_ref(), raw_for_seam.as_ref()) {
+        (Some(seam), Some(raw)) => {
+            let ids = seam.encode_chat(raw).map_err(tokenizer_seam_error)?;
+            tokenizer_prompt_summary(ids, 0)
+        }
+        _ => summarize_chat_messages(&request.messages)?,
+    };
     refuse_image_carrier(image_carrier)?;
     let id = state.next_id("chatcmpl-dsv41-");
     let created = state.now_unix();
@@ -1322,9 +1410,19 @@ async fn completions(
     let request: CompletionRequest = serde_json::from_value(value).map_err(invalid_body)?;
     let model = resolve_model(&state, request.model.as_deref())?;
     let trace = trace_context(&headers)?;
-    let prompt_text = match request.prompt.as_ref() {
-        Some(PromptSpec::Text(text)) => text.clone(),
-        Some(PromptSpec::Many(items)) => items.join("\n"),
+    // `tokens` carries the pre-tokenized vLLM form straight through; `text` and the joined
+    // `many` form are tokenized with the checkpoint tokenizer when the seam is attached. Without
+    // a seam (weight-free router tests) the Milestone 1 heuristic keeps the placeholder path.
+    let (prompt_text, prompt_token_ids) = match request.prompt.as_ref() {
+        Some(PromptSpec::Text(text)) => (text.clone(), None),
+        Some(PromptSpec::Many(items)) => (items.join("\n"), None),
+        Some(PromptSpec::Tokens(ids)) => {
+            let text = state
+                .tokenizer()
+                .and_then(|seam| seam.decode(ids))
+                .unwrap_or_default();
+            (text, Some(ids.clone()))
+        }
         None => {
             return Err(ApiError::invalid_request(
                 "\"prompt\" is required",
@@ -1333,7 +1431,18 @@ async fn completions(
             ));
         }
     };
-    let summary = summarize_prompt_text(&prompt_text);
+    let summary = match prompt_token_ids {
+        Some(ids) => tokenizer_prompt_summary(ids, prompt_text.len()),
+        None => match state.tokenizer() {
+            Some(seam) => {
+                let ids = seam
+                    .encode_text(&prompt_text)
+                    .map_err(tokenizer_seam_error)?;
+                tokenizer_prompt_summary(ids, prompt_text.len())
+            }
+            None => summarize_prompt_text(&prompt_text),
+        },
+    };
     refuse_image_carrier(image_carrier)?;
     let id = state.next_id("cmpl-dsv41-");
     let created = state.now_unix();

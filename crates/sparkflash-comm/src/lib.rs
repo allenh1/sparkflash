@@ -73,10 +73,11 @@ pub use layout::{
     ScheduleTransfer, TransferPhase,
 };
 pub use oneshot::{
-    ArrivalProxy, DeviceBuffer, Dispatch, DispatchLog, DispatchRecord, Exchange, LaunchPath,
-    ONESHOT_ARRIVAL_BYTES, ONESHOT_KERNEL_NAME, ONESHOT_KIND, ONESHOT_PHASE, ONESHOT_RAILS,
-    ONESHOT_RANKS, ONESHOT_ROW_BYTES, ONESHOT_ROW_ELEMENTS, ONESHOT_SLOT_ALIGN, ONESHOT_SLOT_BYTES,
-    RailFrame, SeamError, SequenceCounter, SlotKind, SlotRegistration, arrival_offset, row_offset,
+    ArrivalProxy, Chunk, ChunkPlan, ChunkedProxy, DeviceBuffer, Dispatch, DispatchLog,
+    DispatchRecord, Exchange, LaunchPath, ONESHOT_ARRIVAL_BYTES, ONESHOT_KERNEL_NAME, ONESHOT_KIND,
+    ONESHOT_PHASE, ONESHOT_RAILS, ONESHOT_RANKS, ONESHOT_ROW_BYTES, ONESHOT_ROW_ELEMENTS,
+    ONESHOT_SLOT_ALIGN, ONESHOT_SLOT_BYTES, RailFrame, SeamError, SequenceCounter, SlotKind,
+    SlotRegistration, arrival_offset, row_offset,
 };
 pub use rail::{RailAudit, RailLedger, RailPlan, RailSplit};
 pub use reduce::{canonical_all_reduce_into, canonical_reduce_element};

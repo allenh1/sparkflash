@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::encoding::TokenizerSeam;
 use crate::engine::InferenceEngine;
 use crate::metrics::Metrics;
 
@@ -23,6 +24,7 @@ pub struct AppState {
     id_seq: Arc<AtomicU64>,
     fixed_time_unix: Option<u64>,
     max_logprobs: usize,
+    tokenizer: Option<Arc<TokenizerSeam>>,
 }
 
 impl AppState {
@@ -36,7 +38,26 @@ impl AppState {
             id_seq: Arc::new(AtomicU64::new(0)),
             fixed_time_unix: None,
             max_logprobs: crate::server::DEFAULT_MAX_LOGPROBS,
+            tokenizer: None,
         }
+    }
+
+    /// Attaches the checkpoint tokenizer and V4.1 chat template.
+    ///
+    /// A production `sparkflash serve` always attaches one, so /v1/completions prompt text
+    /// becomes the checkpoint's token ids and /v1/chat/completions renders the released
+    /// server's template. Leaving it off keeps the Milestone 1 placeholder path that the
+    /// weight-free router tests pin (`prompt.rs`).
+    #[must_use]
+    pub fn with_tokenizer(mut self, tokenizer: Arc<TokenizerSeam>) -> Self {
+        self.tokenizer = Some(tokenizer);
+        self
+    }
+
+    /// The attached tokenizer seam, if any.
+    #[must_use]
+    pub fn tokenizer(&self) -> Option<&Arc<TokenizerSeam>> {
+        self.tokenizer.as_ref()
     }
 
     /// Pins the `created`/`created_at` timestamp so tests can assert exact bytes.

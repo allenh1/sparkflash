@@ -13,6 +13,7 @@
 
 mod case;
 mod render;
+mod seam;
 
 pub use case::{
     CaseError, EncodingCase, EncodingMessage, IMAGE_PLACEHOLDER, MessageContent,
@@ -20,6 +21,10 @@ pub use case::{
     process_image_messages,
 };
 pub use render::{DEFAULT_EFFORT_SCORE, render_single_message};
+pub use seam::{
+    TEMPLATE_EFFORT_DEFAULT, TEMPLATE_EFFORT_HIGH, TEMPLATE_EFFORT_LOW, TEMPLATE_EFFORT_MAX,
+    TEMPLATE_EFFORT_XHIGH, TokenizerSeam, TokenizerSeamError,
+};
 
 use case::process_image_messages_lenient;
 

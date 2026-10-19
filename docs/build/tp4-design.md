@@ -249,6 +249,13 @@ the implicit barrier. No MPI, no torchrun, no Ray.
 ### 5.2 CLI surface (added to `sparkflash device-chain --run-stage`)
 
 ```sh
+# tp4-resident: the S5.2 loader plan and in-place read (host-only, no driver)
+--tensor-index FILE      # header dump {name: {dtype, shape}}; plans without the checkpoint data
+--checkpoint DIR         # authoritative safetensors headers; required with --read
+--tp-rank 0..3 --tp-world-size 4
+--evidence-dir DIR       # tp4-resident-rN.json per rank plus tp4-resident-summary.json
+--read                   # read this rank's slices in place (needs --checkpoint)
+
 # tp4-smoke: the S5.1 host stage (no driver opened, no device memory, no token)
 --checkpoint DIR          # snapshot dir holding model.safetensors.index.json; --synthetic instead
 --tp-rank 0..3            # this process's TP rank
@@ -571,6 +578,37 @@ one-rounding reduce rule matches (section 8). No comparison of TP=4 output token
 released-vLLM output is part of this gate (D39). This is the "TP=4 works" gate the user asked
 for; EP (task-31) unblocks after it.
 
+*Status (host side landed 2026-10-19, task-39; the window is not booked).* The resident loader's
+**plan** now exists: `sparkflash_device::resident` classifies every checkpoint name the LLM loads
+(attention, routed/shared experts, router, norms, indexer/compressor, Engram, mHC, MTP/DSPark heads,
+embedding/head) into the design groups with the section-3 rule, and `sparkflash device-chain
+--run-stage tp4-resident` plans a rank from headers alone (a tensor-index dump, or the
+checkpoint's own safetensors headers) and, with `--read`, reads the rank's slices in place through
+the S5.1 `ShardPlan` range reader. Classification is exhaustive: an unknown name is a refusal, not
+a silent skip; only `vision.*`/`aligner.*` are deliberately not loaded.
+
+Planned from the released index (95,822 tensors), rank 0: **72.308 GiB resident** (design estimate
+72.31 GiB, delta -0.002 GiB) plus the Engram tables as **188.833 GiB disk** (exactly the design's
+figure), 95,818 resident + 4 disk tensors, plan hash `0x9a59035fc40776c8`. So the section-6.3
+budget is reproduced from the headers rather than taken on trust, and a 4-rank run needs no
+repacked copy: each rank reads its own quarter where the checkpoint lies.
+
+**The plan also measures the one risk that decides read-in-place vs `pack-tp4`**: the row-rule
+slices issue **161,736,798 ranges at a mean of 480 B** (the routed-expert `w2` rows are 288 B and
+their scale rows 18 B per range), while the column/replicated groups are few large ranges. S5.1
+measured ~20 us per range on the same reader, so the syscall count alone would be ~54 minutes per
+rank before any device work - a host-computable prediction, not a measurement, but a strong one.
+The window measures the alternatives before S5.2's four-rank gate: (i) batched/vectored pread, (ii)
+read each row-parallel tensor whole (4x bytes, one range per tensor) and slice on the host, or (iii)
+`pack-tp4` (one repack, four contiguous per-rank copies). None is chosen here and none is claimed
+measured; the decision and its numbers belong in the S5.2 window evidence.
+
+The stage writes `tp4-resident-r<rank>.json` per rank and a `tp4-resident-summary.json` with
+`device_execution: false`, `token_produced: false` and `comm_rdma_shim` in every schema, and names
+the measurements it still needs: device allocation of the planned bytes, admission against
+`MemAvailable` before the load, in-place read throughput/page-cache pressure on a node, and the
+four-rank load in the S5.2 window.
+
 **S5.3 -- task-35: device-buffer collectives and the RDMA first hardware run.** Depends on S5.1;
 transport decision from 11.1. The three existing hardware gates, `rocenante-probe` on the active
 rail, the 20 us / 10 KiB one-shot bar, repeat determinism, then the GPU-buffer seam (no
@@ -631,6 +669,28 @@ contain the "rdma feature built without <infiniband/verbs.h>" warning.*
 
 **S5.4 -- task-36: prefill-sized collectives + KV.** Depends on S5.2 (coordinates with task-21):
 >2 MiB ring/chunked path, embedding all-reduce and Engram all-gather at 4096 tokens, KV per rank.
+
+*Status (host side landed 2026-10-19, task-39; the window is not booked).* The seam now has the
+chunked form prefill needs: `sparkflash_comm::oneshot::{Chunk, ChunkPlan, ChunkedProxy}` split a
+payload larger than one row into ordered chunks of at most 2 MiB, one `Exchange` per chunk with its
+own sequence number, dispatch and doorbell, reusing the same slot rows and the same release/
+peer-epoch words (`ChunkPlan::dispatches` is the per-chunk descriptor list a launcher consumes).
+Order is the contract that makes the reuse safe: chunk i+1 may be posted only after every peer's
+arrival word for chunk i is published, and the receive state machine refuses a frame whose chunk is
+not the one in flight. `sparkflash device-chain --run-stage tp4-smoke --oneshot-preflight
+--prefill-plan-elements 20971520` records the 4096-token plan in the evidence: 41,943,040 B =
+exactly 20 rows, 1,048,576 elements per chunk, 3 peers x 2 MiB posted per chunk and 125,829,120 B
+per rank over the series, under `chunked`, with its `does_not_prove` list.
+
+The host test `four_ranks_chain_three_chunks_through_one_slot_and_match_the_canonical_twin`
+(`crates/sparkflash-comm/tests/device_seam.rs`) runs four rank threads over a three-row payload
+through one slot and checks every chunk bit for bit against `canonical_all_reduce_into`; the unit
+tests refuse a future chunk's frame and refuse sizes that are not whole bf16 elements or row splits.
+**What is still a window measurement and is not claimed here**: per-chunk and total chunked latency
+against the single-seam path, bit-identity to the canonical twin for every chunk and every repeat
+twice per configuration, zero DtoH/HtoD between chunks, and the kernel trace showing no lost or
+stale doorbell when the arrival words are reused across chunks. It needs S5.3's device-path gate
+green first, then four GPU nodes opened by the Lead and a cuda-feature build with the launcher.
 
 **S5.5 -- task-37: 4-process serving orchestration.** Depends on S5.2/S5.4, coordinates with
 task-20/21/22. Feeds S7 (task-25) and S8 (task-26).

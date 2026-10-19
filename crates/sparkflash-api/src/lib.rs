@@ -18,7 +18,7 @@ pub mod server;
 pub mod state;
 pub mod telemetry_types;
 
-pub use encoding::SparkV41Encoding;
+pub use encoding::{SparkV41Encoding, TokenizerSeam, TokenizerSeamError};
 pub use engine::{
     Capabilities, Capability, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason,
     InferenceEngine, LogprobAlternative, LogprobSelection, LogprobsRequest, MODEL_ID,

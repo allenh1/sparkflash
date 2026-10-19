@@ -124,6 +124,11 @@ pub enum SeamError {
         /// The dispatch's sequence number.
         seq: u64,
     },
+    /// A payload size that is not a whole number of bf16 elements.
+    OddPayload {
+        /// The offending byte count.
+        bytes: usize,
+    },
     /// A frame arrived before the local doorbell, or for the wrong exchange.
     Protocol(String),
 }
@@ -170,6 +175,10 @@ impl fmt::Display for SeamError {
             Self::HostFallback { seq } => write!(
                 formatter,
                 "the dispatch at sequence {seq} took the host-staging path; the device seam refuses a silent fallback"
+            ),
+            Self::OddPayload { bytes } => write!(
+                formatter,
+                "{bytes} payload bytes are not whole bf16 elements"
             ),
             Self::Protocol(reason) => {
                 write!(formatter, "one-shot seam protocol violation: {reason}")
@@ -705,6 +714,310 @@ impl SequenceCounter {
     }
 }
 
+/// One chunk of a payload larger than a single one-shot row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Chunk {
+    index: usize,
+    offset_bytes: usize,
+    elements: usize,
+}
+
+impl Chunk {
+    /// The chunk's index, from zero.
+    #[must_use]
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// The byte offset of the chunk's first element in the payload.
+    #[must_use]
+    pub fn offset_bytes(&self) -> usize {
+        self.offset_bytes
+    }
+
+    /// The chunk's element count.
+    #[must_use]
+    pub fn elements(&self) -> usize {
+        self.elements
+    }
+
+    /// The chunk's byte count.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.elements * 2
+    }
+}
+
+/// The chunked form of a prefill-sized collective: one row-sized one-shot exchange per chunk,
+/// strictly in order, reusing the same slot rows.
+///
+/// **The contract (S5.4).** A payload larger than ONESHOT_ROW_BYTES is split into chunks of at most
+/// one row. Each chunk is one Exchange with its own sequence number, and the chunks run in strict
+/// order: a rank posts chunk i's rows to every peer on every rail, waits until every peer's arrival
+/// word for chunk i is published, then posts chunk i+1 into the same rows. The reuse is what bounds
+/// the ring; the order is what makes the reuse safe, so the receiver refuses a frame whose chunk is
+/// not the one in flight (see ChunkedProxy). ChunkPlan::dispatches cuts the per-chunk descriptors a
+/// launcher consumes: one dispatch per chunk, same slot and release/epoch words, strictly increasing
+/// sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkPlan {
+    total_bytes: usize,
+    rails: usize,
+    chunks: Vec<Chunk>,
+}
+
+impl ChunkPlan {
+    /// Splits a payload into row-sized chunks.
+    ///
+    /// # Errors
+    /// [SeamError::EmptyPayload] for zero bytes, [SeamError::OddPayload] for a byte count that is not
+    /// whole bf16 elements, [SeamError::RailCount] for a rail count other than 1 or ONESHOT_RAILS.
+    pub fn new(total_bytes: usize, rails: usize) -> Result<Self, SeamError> {
+        if total_bytes == 0 {
+            return Err(SeamError::EmptyPayload);
+        }
+        if rails != 1 && rails != ONESHOT_RAILS {
+            return Err(SeamError::RailCount { rails });
+        }
+        if !total_bytes.is_multiple_of(2) {
+            return Err(SeamError::OddPayload { bytes: total_bytes });
+        }
+        let mut chunks = Vec::new();
+        let mut offset = 0usize;
+        while offset < total_bytes {
+            let bytes = (total_bytes - offset).min(ONESHOT_ROW_BYTES);
+            chunks.push(Chunk {
+                index: chunks.len(),
+                offset_bytes: offset,
+                elements: bytes / 2,
+            });
+            offset += bytes;
+        }
+        Ok(Self {
+            total_bytes,
+            rails,
+            chunks,
+        })
+    }
+
+    /// The chunks, in order.
+    #[must_use]
+    pub fn chunks(&self) -> &[Chunk] {
+        &self.chunks
+    }
+
+    /// The number of chunks.
+    #[must_use]
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// The payload bytes.
+    #[must_use]
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    /// The payload elements.
+    #[must_use]
+    pub fn total_elements(&self) -> usize {
+        self.total_bytes / 2
+    }
+
+    /// The rail count.
+    #[must_use]
+    pub fn rails(&self) -> usize {
+        self.rails
+    }
+
+    /// The exchange for one chunk at a given sequence number.
+    ///
+    /// # Errors
+    /// [SeamError::Protocol] for a chunk index outside the plan, plus whatever Exchange::new refuses.
+    pub fn exchange(&self, index: usize, seq: u64) -> Result<Exchange, SeamError> {
+        let chunk = self.chunks.get(index).ok_or_else(|| {
+            SeamError::Protocol(format!(
+                "chunk {index} is outside a plan of {} chunks",
+                self.chunks.len()
+            ))
+        })?;
+        Exchange::new(seq, chunk.elements, self.rails)
+    }
+
+    /// The sequence number chunk index runs at, given the first chunk's sequence.
+    ///
+    /// # Errors
+    /// [SeamError::Protocol] for an index outside the plan or a sequence overflow.
+    pub fn chunk_seq(&self, base_seq: u64, index: usize) -> Result<u64, SeamError> {
+        if index >= self.chunks.len() {
+            return Err(SeamError::Protocol(format!(
+                "chunk {index} is outside a plan of {} chunks",
+                self.chunks.len()
+            )));
+        }
+        base_seq
+            .checked_add(index as u64)
+            .ok_or_else(|| SeamError::Protocol("the chunked sequence overflowed".to_owned()))
+    }
+
+    /// The bytes this rank posts over all chunks on all rails.
+    ///
+    /// # Errors
+    /// [SeamError::Protocol] when the total overflows.
+    pub fn posted_bytes(&self) -> Result<usize, SeamError> {
+        (ONESHOT_RANKS - 1)
+            .checked_mul(self.total_bytes)
+            .ok_or_else(|| SeamError::Protocol("the posted byte total overflowed".to_owned()))
+    }
+
+    /// One dispatch per chunk: the list a launcher consumes.
+    ///
+    /// # Errors
+    /// [SeamError] from Dispatch::new or a sequence overflow.
+    pub fn dispatches(
+        &self,
+        rank: usize,
+        slot: SlotRegistration,
+        release: u64,
+        peer_epoch: u64,
+        base_seq: u64,
+    ) -> Result<Vec<Dispatch>, SeamError> {
+        let mut dispatches = Vec::with_capacity(self.chunks.len());
+        for index in 0..self.chunks.len() {
+            let exchange = self.exchange(index, self.chunk_seq(base_seq, index)?)?;
+            dispatches.push(Dispatch::new(rank, slot, exchange, release, peer_epoch)?);
+        }
+        Ok(dispatches)
+    }
+}
+
+/// The receive-side state machine for a chunked exchange.
+///
+/// One ArrivalProxy per chunk: the chunk in flight validates the frames, and the caller advances to
+/// the next chunk after every peer's arrival word for the current chunk is published. A frame from a
+/// different chunk is refused with a chunk-order message, which is what keeps row reuse safe: the
+/// rows of chunk i+1 must not be posted before every peer has read chunk i.
+#[derive(Debug, Clone)]
+pub struct ChunkedProxy {
+    rank: usize,
+    plan: ChunkPlan,
+    base_seq: u64,
+    current: usize,
+    completed: usize,
+    proxy: ArrivalProxy,
+}
+
+impl ChunkedProxy {
+    /// Creates the state machine at chunk zero.
+    ///
+    /// # Errors
+    /// [SeamError::RankOutOfRange] plus whatever the first chunk's exchange refuses.
+    pub fn new(rank: usize, plan: ChunkPlan, base_seq: u64) -> Result<Self, SeamError> {
+        let proxy = ArrivalProxy::new(rank, plan.exchange(0, base_seq)?)?;
+        Ok(Self {
+            rank,
+            plan,
+            base_seq,
+            current: 0,
+            completed: 0,
+            proxy,
+        })
+    }
+
+    /// The plan this proxy walks.
+    #[must_use]
+    pub fn plan(&self) -> &ChunkPlan {
+        &self.plan
+    }
+
+    /// The chunk in flight.
+    #[must_use]
+    pub fn current_index(&self) -> usize {
+        self.current
+    }
+
+    /// The exchange in flight.
+    #[must_use]
+    pub fn current_exchange(&self) -> Exchange {
+        self.proxy.exchange()
+    }
+
+    /// Observes the local doorbell for the chunk in flight.
+    ///
+    /// # Errors
+    /// Whatever ArrivalProxy::on_doorbell refuses (a second doorbell for the same chunk is a
+    /// sequence regression).
+    pub fn on_doorbell(&mut self) -> Result<(), SeamError> {
+        self.proxy.on_doorbell(self.proxy.exchange().seq())
+    }
+
+    /// Observes one rail frame for the chunk in flight.
+    ///
+    /// # Errors
+    /// A frame whose sequence byte belongs to another chunk is refused as out of chunk order before
+    /// the per-chunk proxy sees it; otherwise whatever ArrivalProxy::on_frame refuses.
+    pub fn on_frame(&mut self, frame: &RailFrame) -> Result<Option<usize>, SeamError> {
+        if self.is_finished() {
+            return Err(SeamError::Protocol(
+                "a rail frame arrived after the last chunk completed".to_owned(),
+            ));
+        }
+        let expected = (self.proxy.exchange().seq() & 0xff) as u8;
+        if frame.sequence_low != expected {
+            return Err(SeamError::Protocol(format!(
+                "a frame for sequence byte {} arrived while chunk {} (sequence byte {expected}) is in flight: chunks run in strict order",
+                frame.sequence_low, self.current
+            )));
+        }
+        self.proxy.on_frame(frame)
+    }
+
+    /// The arrival word published for a peer in the current chunk, if any.
+    #[must_use]
+    pub fn arrival(&self, peer: usize) -> Option<u64> {
+        self.proxy.arrival(peer)
+    }
+
+    /// Whether every peer's arrival word for the current chunk is published.
+    #[must_use]
+    pub fn current_published(&self) -> bool {
+        self.proxy.all_published()
+    }
+
+    /// The number of chunks completed.
+    #[must_use]
+    pub fn completed_chunks(&self) -> usize {
+        self.completed
+    }
+
+    /// Whether every chunk has completed.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.completed == self.plan.chunk_count()
+    }
+
+    /// Advances to the next chunk once the current one is fully published.
+    ///
+    /// Returns true when it advanced, false when the current chunk is not complete yet or the last
+    /// chunk just completed (then is_finished turns true).
+    ///
+    /// # Errors
+    /// [SeamError] if the next chunk's exchange cannot be built (a plan built by this type cannot).
+    pub fn advance(&mut self) -> Result<bool, SeamError> {
+        if self.is_finished() || !self.proxy.all_published() {
+            return Ok(false);
+        }
+        self.completed = self.current + 1;
+        if self.completed == self.plan.chunk_count() {
+            return Ok(false);
+        }
+        self.current = self.completed;
+        let seq = self.plan.chunk_seq(self.base_seq, self.current)?;
+        self.proxy = ArrivalProxy::new(self.rank, self.plan.exchange(self.current, seq)?)?;
+        Ok(true)
+    }
+}
+
 /// How a dispatch actually moved the bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchPath {
@@ -1211,6 +1524,124 @@ mod tests {
         let dispatch = Dispatch::new(2, slot, exchange, 5, 5).expect("dispatch");
         assert_eq!(dispatch.rank(), 2);
         assert_eq!(dispatch.release(), 5);
+    }
+
+    #[test]
+    fn the_chunk_plan_cuts_the_4096_token_wo_b_seam_into_twenty_rows() {
+        // hidden 5120 bf16 x 4096 tokens = 41,943,040 B = exactly 20 rows.
+        let plan = ChunkPlan::new(5120 * 4096 * 2, ONESHOT_RAILS).expect("plan");
+        assert_eq!(plan.chunk_count(), 20);
+        assert_eq!(plan.total_elements(), 20_971_520);
+        for (index, chunk) in plan.chunks().iter().enumerate() {
+            assert_eq!(chunk.index(), index);
+            assert_eq!(chunk.elements(), ONESHOT_ROW_ELEMENTS);
+            assert_eq!(chunk.offset_bytes(), index * ONESHOT_ROW_BYTES);
+        }
+        assert_eq!(plan.posted_bytes().expect("posted"), 3 * 41_943_040);
+    }
+
+    #[test]
+    fn the_chunk_plan_splits_a_ragged_tail_and_refuses_bad_sizes() {
+        let plan = ChunkPlan::new(ONESHOT_ROW_BYTES * 2 + 10, ONESHOT_RAILS).expect("plan");
+        assert_eq!(plan.chunk_count(), 3);
+        assert_eq!(plan.chunks()[2].elements(), 5);
+        let small = ChunkPlan::new(5120 * 2, 1).expect("one row");
+        assert_eq!(small.chunk_count(), 1);
+        assert_eq!(small.chunks()[0].elements(), 5120);
+        assert!(matches!(
+            ChunkPlan::new(0, ONESHOT_RAILS),
+            Err(SeamError::EmptyPayload)
+        ));
+        assert!(matches!(
+            ChunkPlan::new(3, ONESHOT_RAILS),
+            Err(SeamError::OddPayload { bytes: 3 })
+        ));
+        assert!(matches!(
+            ChunkPlan::new(1024, 3),
+            Err(SeamError::RailCount { rails: 3 })
+        ));
+    }
+
+    #[test]
+    fn chunk_dispatches_are_ordered_and_share_the_slot() {
+        let plan = ChunkPlan::new(3 * ONESHOT_ROW_BYTES, ONESHOT_RAILS).expect("plan");
+        let slot = SlotRegistration::new(
+            SlotKind::DeviceMemory {
+                device_address: 0x1000,
+            },
+            ONESHOT_SLOT_BYTES,
+        )
+        .expect("slot");
+        let dispatches = plan.dispatches(2, slot, 7, 9, 100).expect("dispatches");
+        assert_eq!(dispatches.len(), 3);
+        for (index, dispatch) in dispatches.iter().enumerate() {
+            assert_eq!(dispatch.exchange().seq(), 100 + index as u64);
+            assert_eq!(dispatch.slot(), slot);
+            assert_eq!(dispatch.release(), 7);
+            assert_eq!(dispatch.peer_epoch(), 9);
+            assert_eq!(dispatch.rank(), 2);
+        }
+        let error = plan.exchange(3, 100).expect_err("chunk outside the plan");
+        assert!(error.to_string().contains("outside a plan"), "{error}");
+    }
+
+    #[test]
+    fn the_chunked_proxy_publishes_chunk_zero_then_advances_and_refuses_a_future_chunk() {
+        let plan = ChunkPlan::new(ONESHOT_ROW_BYTES + 5120 * 2, ONESHOT_RAILS).expect("plan");
+        let mut proxy = ChunkedProxy::new(1, plan, 40).expect("proxy");
+        proxy.on_doorbell().expect("doorbell");
+        // A frame from chunk 1 (sequence byte 41) before chunk 0 completes is refused.
+        let future = RailFrame {
+            sender: 0,
+            rail: 0,
+            phase: ONESHOT_PHASE,
+            kind: ONESHOT_KIND,
+            sequence_low: 41,
+        };
+        let error = proxy.on_frame(&future).expect_err("future chunk");
+        assert!(error.to_string().contains("strict order"), "{error}");
+        // Complete chunk 0: three peers on two rails each.
+        for peer in [0u8, 2, 3] {
+            for rail in 0..ONESHOT_RAILS {
+                let frame = RailFrame {
+                    sender: peer,
+                    rail,
+                    phase: ONESHOT_PHASE,
+                    kind: ONESHOT_KIND,
+                    sequence_low: 40,
+                };
+                proxy.on_frame(&frame).expect("frame");
+            }
+        }
+        assert!(proxy.current_published());
+        assert!(proxy.advance().expect("advance"));
+        assert_eq!(proxy.current_index(), 1);
+        assert_eq!(proxy.completed_chunks(), 1);
+        proxy.on_doorbell().expect("doorbell 2");
+        assert_eq!(proxy.current_exchange().seq(), 41);
+        for peer in [0u8, 2, 3] {
+            for rail in 0..ONESHOT_RAILS {
+                let frame = RailFrame {
+                    sender: peer,
+                    rail,
+                    phase: ONESHOT_PHASE,
+                    kind: ONESHOT_KIND,
+                    sequence_low: 41,
+                };
+                proxy.on_frame(&frame).expect("frame 2");
+            }
+        }
+        assert!(!proxy.advance().expect("advance last"));
+        assert!(proxy.is_finished());
+        assert_eq!(proxy.completed_chunks(), 2);
+        let after = RailFrame {
+            sender: 0,
+            rail: 0,
+            phase: ONESHOT_PHASE,
+            kind: ONESHOT_KIND,
+            sequence_low: 41,
+        };
+        assert!(proxy.on_frame(&after).is_err());
     }
 
     fn device_record(seq: u64) -> DispatchRecord {

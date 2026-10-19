@@ -802,6 +802,24 @@ fn quantise(values: &[f32], what: &str) -> Result<(Vec<u8>, Vec<u8>), EngineErro
     Ok((q.codes().to_vec(), q.scales().to_vec()))
 }
 
+/// Quantises a W8A8 activation the way the reference does: the value is a bf16 module output,
+/// so the f32 host value is narrowed to bf16 before the quantiser sees it (F5).
+///
+/// The narrowing is idempotent on values that are already bf16-exact (a device GEMM whose
+/// output was written as bf16 and read back as f32), so it is safe to apply at every W8A8
+/// activation seam. wo_a's MXFP8 comparison arm is deliberately not narrowed: it is not the
+/// native path, and task-6's native wo_a arm already narrows its activation.
+fn quantise_native_activation(
+    values: &[f32],
+    what: &str,
+) -> Result<(Vec<u8>, Vec<u8>), EngineError> {
+    let narrowed: Vec<f32> = values
+        .iter()
+        .map(|value| sparkflash_engine::quant::bf16_round(*value))
+        .collect();
+    quantise(&narrowed, what)
+}
+
 fn rows_of(values: &[f32], width: usize, what: &str) -> Result<usize, EngineError> {
     if width == 0 || !values.len().is_multiple_of(width) {
         return Err(EngineError::Shape {
@@ -1300,7 +1318,7 @@ impl AttentionProjectionBackend for AttentionDeviceBackend {
         limit: usize,
     ) -> Result<Vec<f32>, EngineError> {
         let _ = limit;
-        self.last_activation = Some(quantise(x, "wq_a activation")?);
+        self.last_activation = Some(quantise_native_activation(x, "wq_a activation")?);
         let out = self.dense(
             config,
             layer,
@@ -1331,7 +1349,7 @@ impl AttentionProjectionBackend for AttentionDeviceBackend {
         if layer == 0 && self.diag_wq_b_input.is_none() {
             self.diag_wq_b_input = Some(latent.to_vec());
         }
-        self.last_activation = Some(quantise(latent, "wq_b activation")?);
+        self.last_activation = Some(quantise_native_activation(latent, "wq_b activation")?);
         let out = self.dense(
             config,
             layer,
@@ -1358,7 +1376,7 @@ impl AttentionProjectionBackend for AttentionDeviceBackend {
         limit: usize,
     ) -> Result<Vec<f32>, EngineError> {
         let _ = limit;
-        self.last_activation = Some(quantise(x, "wkv activation")?);
+        self.last_activation = Some(quantise_native_activation(x, "wkv activation")?);
         let out = self.dense(
             config,
             layer,
@@ -1400,7 +1418,7 @@ impl AttentionProjectionBackend for AttentionDeviceBackend {
         let _ = limit;
         let grouped_width = config.o_groups * config.o_lora_rank;
         let rows = rows_of(grouped, grouped_width, "wo_b input")?;
-        self.last_activation = Some(quantise(grouped, "wo_b activation")?);
+        self.last_activation = Some(quantise_native_activation(grouped, "wo_b activation")?);
         let layer = self.stats.layers.saturating_sub(1);
         self.dense(
             config,
@@ -2615,5 +2633,41 @@ mod tests {
                 "{positions:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod host_seam_tests {
+    use super::*;
+
+    /// F5: a W8A8 activation is a bf16 module output in the reference, so the host staging
+    /// narrows the f32 value before the quantiser. Rounding first is not cosmetic: there are
+    /// blocks whose f32 elements straddle an E4M3 code boundary and pick a code the reference
+    /// can never pick. The block is found by a deterministic scan, so the test states the rule
+    /// rather than a magic constant.
+    #[test]
+    fn the_w8a8_activation_quantiser_reads_the_bf16_value() {
+        let mut seed = 0x5EEDu32;
+        for _ in 0..10_000 {
+            let mut block: Vec<f32> = Vec::with_capacity(32);
+            for _ in 0..32 {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                block.push((seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0);
+            }
+            let narrowed: Vec<f32> = block
+                .iter()
+                .map(|value| sparkflash_engine::quant::bf16_round(*value))
+                .collect();
+            let (codes, scales) =
+                quantise_native_activation(&block, "test activation").expect("32 divides by 32");
+            let expected = quantize_activation_fp8(&narrowed).expect("32 divides by 32");
+            assert_eq!(codes, expected.codes().to_vec());
+            assert_eq!(scales, expected.scales().to_vec());
+            let (raw_codes, _) = quantise(&block, "test activation").expect("32 divides by 32");
+            if raw_codes != codes {
+                return;
+            }
+        }
+        panic!("a bf16 pre-round must be able to change an E4M3 code");
     }
 }

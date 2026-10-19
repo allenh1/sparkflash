@@ -74,7 +74,7 @@ use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use sparkflash_api::AppState;
 use sparkflash_api::encoding::{
-    HfTokenizerEncoder, load_hf_tokenizer, resolve_reference_tokenizer,
+    HfTokenizerEncoder, TokenizerSeam, load_hf_tokenizer, resolve_reference_tokenizer,
 };
 use sparkflash_api::engine::InferenceEngine as ApiInferenceEngine;
 use sparkflash_api::engine::{
@@ -1543,7 +1543,20 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             }
         }
     };
-    let state = AppState::new(engine).with_max_logprobs(options.max_logprobs);
+    // The same tokenizer.json the engine detokenises with also drives the HTTP prompt seam:
+    // /v1/completions text becomes the checkpoint's token ids and /v1/chat/completions renders
+    // the released server's V4.1 template. Failing to load it refuses startup instead of serving
+    // placeholder ids.
+    let seam = match load_tokenizer(&tokenizer) {
+        Ok(loaded) => Arc::new(TokenizerSeam::new(loaded)),
+        Err(message) => {
+            eprintln!("sparkflash serve: {message}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    let state = AppState::new(engine)
+        .with_max_logprobs(options.max_logprobs)
+        .with_tokenizer(seam);
     let router = sparkflash_api::server::router(state);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

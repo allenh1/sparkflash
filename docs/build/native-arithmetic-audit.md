@@ -191,17 +191,17 @@ device path.
 | # | stage | native | chain | verdict | severity | evidence |
 |:--|:--|:--|:--|:--|:--|:--|
 | 8 | `wq_a` | fp8 W8A8 on the **bf16** attn_norm output, bf16 out (`model.py:636,187-205`) | device dense B12x MXFP8: engine ceil-rule quantiser over the **f32** capture (`attention_device.rs:1052`), 32x32 ue8m0 weight grid, f32 block accumulation, bf16 out (`kernels/b12x_mxfp8_dense_sm121.cu:93-113`) | `native` rule; the quantiser's input has one bf16 round missing (F5) | NONE + LOW(F5) | MEASURED: stage 8 dense 16,384/16,384 bit-exact against the in-crate `mxfp8_ref` on the same bytes; 5,120/5,120 codes and 160/160 scales at stage 0 (D23) |
-| 9 | `q_norm` | RMSNorm, bf16 out (`model.py:970`) | host f32 `query_path_with` (`engine/forward/attention.rs:1658-1720`), no bf16 round | `native, minus a round` | LOW | SOURCE; F5 |
+| 9 | `q_norm` | RMSNorm, bf16 out (`model.py:970`) | host f32 `query_path_with` (`engine/forward/attention.rs:1658-1720`), no bf16 round | `native` (task-10 narrows the norm output before the device wq_b staging) | NONE | SOURCE; test `the_host_q_norm_output_is_a_bf16_tensor_before_the_wq_b_quantiser` |
 | 10 | `wq_b` | fp8 W8A8 on the **bf16** q_norm output (`model.py:971`) | device dense MXFP8; activation quantised from the f32 q_norm vector (`attention_device.rs:1083`) | `native` rule + F5 | NONE + LOW(F5) | MEASURED: `wq_b` reproduces `mxfp8_ref` 0/32,768, max_abs 0.0 (STATUS-2026-10-19 section 3) |
 | 11 | q RoPE | f32 rotation from the bf16 value, written back into the bf16 tensor (`392-409`) | host f32 `rotate_rows` on bf16-exact values; bf16 when uploaded to the body (`attention_device.rs:1289-1292`) | `native` (one rounding, at the same point) | NONE | SOURCE; tables are a different f32 libm (F8, unverified) |
 | 12 | `wkv` | fp8 W8A8 on the bf16 attn_norm output | device dense MXFP8 from the f32 capture (`attention_device.rs:1110`) | `native` + F5 | NONE + LOW(F5) | MEASURED as #8 |
-| 13 | `kv_norm` then window RoPE | RMSNorm bf16 out; rope in place bf16; then `act_quant(kv, 32, ue8m0, inplace=True)` (`model.py:700-707`) | host f32 `window_kv_with` (`attention.rs:1723-1760`): f32 norm, f32 rope, fp8 round trip with the ceil rule (`round_trip_rows`, `attention.rs:181-233`) | `native, minus 2 rounds` | LOW | MEASURED: stage 1 reproduces the released window-row codes 5,119/5,120 and 160/160 scales (layer 0 token 0), 5,118/5,120 at layer 4 token 0 (D23) - the two missing rounds cost at most 1-2 codes in 5,120 |
+| 13 | `kv_norm` then window RoPE | RMSNorm bf16 out; rope in place bf16; then `act_quant(kv, 32, ue8m0, inplace=True)` (`model.py:700-707`) | host f32 `window_kv_with` (`attention.rs:1723-1760`): f32 norm, f32 rope, fp8 round trip with the ceil rule (`round_trip_rows`, `attention.rs:181-233`) | `native` (task-10 added the two rounds) | LOW | MEASURED before the rounds: stage 1 reproduced 5,119/5,120 codes and 160/160 scales (layer 0 token 0), 5,118/5,120 at layer 4 token 0 (D23) - the 1-2 code gap the rounds close; device re-measure is a window leg |
 | 14 | window row construction (host) | the quantiser sees a **bf16** row (the in-place result) | `engine_window_row` bf16-rounds the row before quantising and requires the two quantisers to agree (`cuda_harness.rs:220-241`) | `native` (the quantiser input is bf16, exactly as native) | NONE | SOURCE; the row it rounds is the chain's f32 rope output, see #13 |
-| 15 | compressor (ratio > 1) | f32 `wkv`/`wgate`, f32 softmax pooling, then `norm(kv.to(dtype))` = **bf16 latent** (`model.py:446-486`) | host `compressor_step`: f32 matmuls (`attention.rs:929-934`), the same pooling (`pool_group`), f32 rms_norm (`attention.rs:990`) | `native, minus a round` | LOW | SOURCE; the f32 pooling matches native's f32 pooling; F5 |
-| 16 | compressor (ratio == 1) | **bf16** `wkv` Linear then norm (`model.py:446-449,461-463`) | host f32 matmul then f32 norm (`attention.rs:913-921`) | `native, minus a round` | LOW | SOURCE; F5 |
-| 17 | compressed KV: RoPE then fp4 (block 16, E4M3 scale) in place | bf16 latent -> rope bf16 -> `fp4_act_quant(..., 16, True, e4m3)` -> bf16 cache (`model.py:757-761`) | host `write_compressed_cache`: f32 rotate then `round_trip_rows(Element::Fp4, ScaleRule::E4M3Six)` with the `6*2^-9` floor and block 16 (`attention.rs:1869-1930,207-211`) | `native` rule + F5 | NONE + LOW(F5) | SOURCE: block size, scale dtype and floor all match `kernel.py:128-181` |
-| 18 | indexer k: `wk` (bf16 GEMM), `k_norm`, rope, fp4 block 32 ue8m0 in place | bf16 Linear -> bf16 norm -> bf16 rope -> fp4 (`model.py:540-546`) | host `write_index_keys`: f32 matmul over the bf16 weights widened to f32, f32 norm, f32 rope, fp4 round trip (`attention.rs:1799-1861`) | `native, minus rounds` | LOW | SOURCE; F5 |
-| 19 | indexer q: `wq_b` **fp8 W8A8**, rope, fp4 block 32 | `ColumnParallelLinear` fp8: `act_quant` on the bf16 q_norm output, fp8 GEMM, bf16 out, then rope, then fp4 (`model.py:519,550-552`) | host `index_source_indices`: **f32 matmul over dequantised fp8 weights with no activation quantisation**, f32 rope, fp4 round trip (`attention.rs:1045-1080`) | `native, minus a quant` | MEDIUM (F3) | SOURCE; unmeasured |
+| 15 | compressor (ratio > 1) | f32 `wkv`/`wgate`, f32 softmax pooling, then `norm(kv.to(dtype))` = **bf16 latent** (`model.py:446-486`) | host `compressor_step`: f32 matmuls (`attention.rs:929-934`), the same pooling (`pool_group`), f32 rms_norm (`attention.rs:990`) | `native` (task-10: narrowed before and after the norm) | NONE | SOURCE; the f32 pooling matches native's f32 pooling; test `the_compressor_latent_is_a_bf16_tensor_before_the_fp4_quantiser` |
+| 16 | compressor (ratio == 1) | **bf16** `wkv` Linear then norm (`model.py:446-449,461-463`) | host f32 matmul then f32 norm (`attention.rs:913-921`) | `native` (task-10: the wkv output and the norm are narrowed) | NONE | SOURCE; same test as #15 |
+| 17 | compressed KV: RoPE then fp4 (block 16, E4M3 scale) in place | bf16 latent -> rope bf16 -> `fp4_act_quant(..., 16, True, e4m3)` -> bf16 cache (`model.py:757-761`) | host `write_compressed_cache`: f32 rotate then `round_trip_rows(Element::Fp4, ScaleRule::E4M3Six)` with the `6*2^-9` floor and block 16 (`attention.rs:1869-1930,207-211`) | `native` (task-10 narrows the rope writeback; the latent was already bf16 from #15) | NONE | SOURCE: block size, scale dtype and floor all match `kernel.py:128-181` |
+| 18 | indexer k: `wk` (bf16 GEMM), `k_norm`, rope, fp4 block 32 ue8m0 in place | bf16 Linear -> bf16 norm -> bf16 rope -> fp4 (`model.py:540-546`) | host `write_index_keys`: f32 matmul over the bf16 weights widened to f32, f32 norm, f32 rope, fp4 round trip (`attention.rs:1799-1861`) | `native` (task-10 narrows the k_norm output and the rope writeback before the fp4 round trip) | NONE | SOURCE; test `the_quantiser_seams_narrow_the_host_value_to_bf16_first` |
+| 19 | indexer q: `wq_b` **fp8 W8A8**, rope, fp4 block 32 | `ColumnParallelLinear` fp8: `act_quant` on the bf16 q_norm output, fp8 GEMM, bf16 out, then rope, then fp4 (`model.py:519,550-552`) | host `index_source_indices`: **f32 matmul over dequantised fp8 weights with no activation quantisation**, f32 rope, fp4 round trip (`attention.rs:1045-1080`) | `native, minus a quant` (task-10 narrows the rope writeback; the absent W8A8 activation quant is the remaining gap) | MEDIUM (F3) | SOURCE; unmeasured |
 | 20 | indexer weights and scores | `weights_proj` bf16 GEMM x float -> bf16; `einsum` bf16 x bf16 -> bf16; `relu`, `* weights` -> bf16, `sum(head)` -> bf16 (`model.py:553-557`) | host f32 throughout: f32 `index_weights` (`attention.rs:1771-1788`), f32 dot and f32 head sum (`attention.rs:1102-1119`) | `native, minus rounds` | LOW (F3) | SOURCE; unmeasured |
 | 21 | two-level top-k and reachability | on the **bf16** scores (`model.py:560-580,583-611`) | host on f32 scores; the two levels, the shift into the shared index space and the tie rule are reproduced (`attention.rs:1120-1205,1214+`) | `native` structure + F3 score dtype | LOW-MEDIUM (F3) | SOURCE; a flip needs a near-tie |
 
@@ -209,11 +209,11 @@ device path.
 
 | # | stage | native | chain | verdict | severity | evidence |
 |:--|:--|:--|:--|:--|:--|:--|
-| 22 | q, kv operands | q bf16, kv bf16 (window rows dequantised from fp8, compressed rows from fp4), sink f32 (`kernel.py:311-338`) | q bf16; window row `bf16_rn(code*scale)` (`kernels/flash_mla_csa2_seq_sm121.cu:134-141`); compressed `fp4_code * e4m3_scale` in f32, which is bf16-exact (`kernel.py:167-181` produces the same values); sink f32 | `native` | NONE | SOURCE + MEASURED: the body twin feeds the host body the same staged bytes: 0 mismatches on 66/120 layer-position pairs, worst <= 7.811069e-3 on the rest |
+| 22 | q, kv operands | q bf16, kv bf16 (window rows dequantised from fp8, compressed rows from fp4), sink f32 (`kernel.py:311-338`) | q bf16; window row `bf16_rn(code*scale)` (`kernels/flash_mla_csa2_seq_sm121.cu:134-141`); compressed `fp4_code * e4m3_scale` in f32, which is bf16-exact (`kernel.py:167-181` produces the same values); sink f32 | `native` | NONE | SOURCE + MEASURED: the body twin feeds the host body the same staged bytes: 0 mismatches on 66/120 layer-position pairs, worst <= 7.811069e-3 on the rest (measured before the task-7 F2 round; a post-F2 body twin now reports that round by design) |
 | 23 | score dot, f32 softmax, sink in the denominator after the max | f32 (`kernel.py:361-387`; sink at `383`) | f32 score, f32 max, f32 exp, sink added to the sum after the max (`flash_mla_csa2_seq_sm121.cu:319-365`) | `native` | NONE | SOURCE; MEASURED twin as #22 |
-| 24 | **each softmax probability rounded to bf16 before P.V** | `acc_s_cast = BF16`; `T.copy(acc_s, acc_s_cast)`; `T.gemm(acc_s_cast, kv_shared, acc_o)` (`kernel.py:339,377-380`) | probabilities stay f32: `acc += s_scores[slot] * value` (`flash_mla_csa2_seq_sm121.cu:375-389,475-492`) | `native, minus a round` | MEDIUM (F2) | SOURCE; invisible to every existing twin (they share the omission), so unmeasured |
+| 24 | **each softmax probability rounded to bf16 before P.V** | `acc_s_cast = BF16`; `T.copy(acc_s, acc_s_cast)`; `T.gemm(acc_s_cast, kv_shared, acc_o)` (`kernel.py:339,377-380`) | engine reference body now casts the probability to bf16 before the value product, denominator stays f32 (task-7, `sparse_attention`); the device body still accumulates f32 (F2 variant pending) | `native` in the host twin, device `native, minus a round` | MEDIUM (F2) for the device | test `the_body_probabilities_are_bf16_rounded_before_the_value_product` (fails without the cast); the kernels-crate union twin (`mla_ref.rs`) carries the same rule, so `format_two_union_equals_the_engine_reference_on_the_attended_multiset` stays bit-for-bit and the twin's own union tests moved with it |
 | 25 | output | f32 divide, bf16 out (`kernel.py:385-390`) | `__float2bfloat16_rn(acc / s_sum)` (`flash_mla_csa2_seq_sm121.cu:393`) | `native` | NONE | SOURCE |
-| 26 | inverse RoPE on the attention output | in place on the bf16 output (`model.py:775`) | host f32 `rotate_rows(..., true)` (`attention.rs:2308-2318`) | `native, minus a round` | LOW (F5) | SOURCE; feeds #27 |
+| 26 | inverse RoPE on the attention output | in place on the bf16 output (`model.py:775`) | host f32 `rotate_rows(..., true)` (`attention.rs:2308-2318`); the native wo_a arm narrows its activation to bf16 (task-6, F1) | `native` for the native arm; the MXFP8 comparison arm stays f32 by design | NONE (F1) | SOURCE; task-6 `wo_a path` ledger |
 
 ### 3.4 Output projections
 
@@ -306,8 +306,25 @@ probabilities: the "body matches on identical staged operands" result (0 mismatc
 <= 7.8e-3 elsewhere) measures the kernel against the reference, not against native. This is the one
 *body* stage where the chain and its reference share an omission native does not have.
 
-Isolation: add a bf16 cast of `s_scores` before the value loop (or a compile-time twin variant) and
-compare against a native-recorded attention output. A device-window item.
+**Status (task-7).** The engine's reference body now rounds: `sparse_attention` casts every
+softmax probability to bf16 (`quant::bf16_round`) before the P*V accumulation and keeps the
+denominator on the f32 probability, exactly the two values the reference kernel uses
+(`kernel.py:339-341` for the cast, `342-353` for the f32 sum). The pinned test
+`the_body_probabilities_are_bf16_rounded_before_the_value_product` spells the arithmetic out and
+fails when the cast is removed (verified), so the rule is proven from the reference line rather
+than read off a window. The kernels-crate union twin (`mla_ref.rs`) carries the same
+round, which keeps `format_two_union_equals_the_engine_reference_on_the_attended_multiset` bit-for-bit
+between the two host references; its expected mixtures, its window-vs-union premise and its slow
+f64 reference all moved to the rounded probability with it. The device body still keeps f32 
+(`kernels/flash_mla_csa2_seq_sm121.cu:375-389,475-492`): the host twin is now native and the
+kernel variant is the remaining leg of this task (format-2 body variant, twin comparison once the
+kernel casts too, cubin pin, window). Until that variant lands the body twin will report the
+difference on a device window - deliberately, because the omission is now visible to it instead
+of shared.
+
+The isolation proposal above is superseded by the pinned host test: the twin difference is a
+one-line cast, so a window is only needed to confirm the kernel variant did not regress anything,
+not to establish the rule.
 
 ### F3 - the indexer query projection and the score dtype. **MEDIUM.**
 
@@ -371,14 +388,51 @@ module's output). The missing rounds are:
 | inverse RoPE -> `wo_a` quantiser | bf16 (`775`) | f32 rotation | subsumed by F1 |
 | `hc_pre` collapse -> norms | bf16 (`958-961`) | f32 registers in the entry kernel | a small perturbation of every normed vector |
 
+**Status (task-10).** The host-side seams now round where native does, and each round is pinned by a
+test that fails without it:
+
+* `wq_a`/`wkv`/`wq_b`/`wo_b` activation quantisers: the device staging narrows the f32 
+  activation to bf16 before `quantize_activation_fp8` (`quantise_native_activation`, 
+  `attention_device.rs`); test `the_w8a8_activation_quantiser_reads_the_bf16_value`. q_norm's host
+  output is also narrowed in `query_path_with` before the device wq_b staging, pinned by
+  `the_host_q_norm_output_is_a_bf16_tensor_before_the_wq_b_quantiser`.
+* `kv_norm` + window RoPE -> window quantiser: `window_kv_with` narrows the norm output and the
+  rope writeback before the fp8 round trip; test `the_quantiser_seams_narrow_the_host_value_to_bf16_first`.
+* compressor `norm` -> compressed-fp4 quantiser: `compressor_step` narrows before and after the
+  norm (`kv.to(dtype)`) and `write_compressed_cache` narrows the rope writeback; test
+  `the_compressor_latent_is_a_bf16_tensor_before_the_fp4_quantiser`.
+* indexer k and q: the rope writeback is narrowed before the fp4 round trip (task-8 did the
+  q/dtype path, task-10 adds the writeback and the k path).
+* inverse RoPE -> `wo_a` quantiser: covered by F1: task-6's native `wo_a` arm rounds its activation
+  to bf16 (`WoAMode::Native`, measured 3.60/3.85/4.39% exact at layers 21/30/39). The MXFP8
+  comparison arm is deliberately left f32: it is the non-native baseline of the F1 ledger, not a
+  chain path.
+* `ffn_norm` -> routed/shared activation quantisers and the `hc_pre` collapse stay OPEN: both rounds
+  live in `moe_device.rs` and the entry kernel, which task-4/5 own this cycle. Reported, not
+  edited here.
+
+The host reference fixture is regenerated once, on the branch that carries both host-side changes
+(task-10 F5 and task-7 F2): sha256 `c9aa2cd5bb093c579cdfcb4fcc9f8f100ea22789d9841600830b0f020ae7927d`, 0/9 tokens
+changed, max |logit delta| 1.4999999999043556e-8 against the base 4bf96e9 fixture and
+5.000000000837668e-9 against the task-10-only fixture that this branch supersedes. The pinned
+boundary measurement in docs/build/phase1-boundary-table.md section 6 moves with it (87
+differing values in five tensors, was 161 in six) and was re-checked on the stacked tree.
+Regenerating a fixture by copying either base's file is not valid: only a run on the tree that
+carries the arithmetic produces the numbers above.
+
 The router is *not* in this list: its staging rounds the f32 capture to bf16 before the kernel
 (`moe_device.rs:553-556`), so the kernel sees what native's bf16 ffn_norm output would be - and the
 router twin measured the two agree to 5.96e-8. Neither is the tail: `moe_device.rs:1379-1382`
 bf16-stages the collapsed tail before the final norm, so that round is present.
 
-Measured: only the window row is measured (D23 stage 1: 5,119/5,120 codes and 160/160 scales for
-layer 0 token 0; 5,118/5,120 for layer 4 token 0; 5,120/5,120 for the other tokens and layer 1).
-The others are INFERRED to be the same class and order of magnitude.
+Measured: the window row was the only measured seam before task-10 (D23 stage 1: 5,119/5,120 codes
+and 160/160 scales for layer 0 token 0; 5,118/5,120 for layer 4 token 0; 5,120/5,120 for the
+other tokens and layer 1). That 1-2 code gap is exactly what the two missing rounds cost, so the
+host seam now carries both; re-measuring the device window codes in a window is a follow-up leg,
+not a host change. The remaining seams are INFERRED to be the same class and order of magnitude.
+The activation-quantiser rounds are structural for every block, not just the measured window row:
+the CLI test's deterministic scan finds a block where the f32 bits change an E4M3 code, which is
+why the round is a real arithmetic change and not a no-op.
 
 Note that D8's stage-0 result (the ceil rule recomputed from the captured f32 vector reproduces
 5,120/5,120 codes and 160/160 scales) does **not** cover this: it compares two quantisers on the same

@@ -670,6 +670,36 @@ fn weight(src: Reads<'_>, name: &str) -> Result<Vec<f32>, EngineError> {
     linalg::decode_by_name(src.source, name, src.limit)
 }
 
+/// Narrows a vector in place to bf16, the dtype of the reference module output that its
+/// dynamic quantisers and its bf16 GEMMs consume (F5).
+///
+/// The reference's modules are bf16 in and bf16 out: RMSNorm casts its result back to the
+/// input dtype (model.py:281-293) and the fp8 Linears hand back bf16 (model.py:187-205). A
+/// host stage that keeps the value in f32 carries bits native never had, and the quantiser that
+/// consumes it can pick a different code; rounding at the seam is the native arithmetic.
+fn narrow_bf16(values: &mut [f32]) {
+    for value in values.iter_mut() {
+        *value = quant::bf16_round(*value);
+    }
+}
+
+/// Narrows a host tensor to the bf16 value the reference module would have produced and then runs
+/// the dynamic quantiser over it (F5).
+///
+/// The reference quantisers (act_quant over fp8, fp4_act_quant) are called on bf16 tensors in
+/// every path: the window KV, the compressed latent, the indexer keys and q. A host stage that
+/// quantises f32 instead can pick a different code, so the two steps live together here.
+fn narrow_and_round_trip(
+    values: &mut [f32],
+    width: usize,
+    block: usize,
+    element: Element,
+    rule: ScaleRule,
+) {
+    narrow_bf16(values);
+    round_trip_rows(values, width, block, element, rule);
+}
+
 /// Reads a block-scaled fp8 Linear weight and multiplies in its E8M0 grid (model.py:229-232).
 ///
 /// # Errors
@@ -774,8 +804,13 @@ pub fn sparse_attention(
             }
             let row = &kv[index * head_dim..(index + 1) * head_dim];
             let weight = (dot(query, row) * scale - scores_max).exp();
+            // kernel.py:339-341 rounds every softmax probability to bf16 before the P*V
+            // product (T.copy(acc_s, acc_s_cast) then T.gemm(acc_s_cast, kv_shared, acc_o)),
+            // and the gemm's operand is that bf16 tensor. The denominator keeps the f32
+            // probability (kernel.py:342-353), so only the P*V product sees the rounded value.
+            let probability = quant::bf16_round(weight);
             for (slot, value) in output.iter_mut().zip(row.iter()) {
-                *slot += weight * value;
+                *slot += probability * value;
             }
             denominator += weight;
         }
@@ -915,7 +950,11 @@ fn compressor_step(
         let wkv = weight(src, &format!("{prefix}.attn.compressor.wkv.weight"))?;
         let mut latent = vec![0.0; seqlen * head_dim];
         linalg::matmul(&mut latent, x, &wkv, head_dim, dim, seqlen)?;
+        // At ratio 1 the reference keeps bf16 wkv weights and returns norm(wkv(x)) as a bf16
+        // tensor (model.py:446-449, 461-463).
+        narrow_bf16(&mut latent);
         linalg::rms_norm(&mut latent, &norm, head_dim, config.norm_eps as f32)?;
+        narrow_bf16(&mut latent);
         state.latent = latent;
         state.latent_rows = seqlen;
         return Ok(());
@@ -987,7 +1026,11 @@ fn compressor_step(
             }
         }
     }
+    // Above ratio 1 the pooled value is narrowed to bf16 before the norm and the norm casts
+    // its result back to bf16: norm(kv.to(dtype)) (model.py:484-486).
+    narrow_bf16(&mut latent);
     linalg::rms_norm(&mut latent, &norm, head_dim, config.norm_eps as f32)?;
+    narrow_bf16(&mut latent);
     state.latent = latent;
     state.latent_rows = rows;
     Ok(())
@@ -1127,7 +1170,8 @@ fn index_source_indices(
         &tables,
         false,
     )?;
-    round_trip_rows(
+    // The rope writes back into the bf16 q tensor (model.py:392-409, 550-552).
+    narrow_and_round_trip(
         &mut q_index,
         head_dim,
         INDEX_QUANT_BLOCK,
@@ -1725,6 +1769,9 @@ fn query_path_with(
     )?;
     let mut latent = backend.wq_a(config, layer, prefix, x, source, limit)?;
     linalg::rms_norm(&mut latent, &q_norm, rank, config.norm_eps as f32)?;
+    // RMSNorm casts back to the bf16 input dtype, and wq_b's activation quantiser consumes
+    // that bf16 value (model.py:281-293, 970-971), so the host seam narrows it (F5).
+    narrow_bf16(&mut latent);
     let mut q = backend.wq_b(config, layer, prefix, &latent, source, limit)?;
     let tables =
         rope_tables_for_layer(config, layer, &head_row_positions(start_pos, seqlen, heads));
@@ -1788,6 +1835,9 @@ fn window_kv_with(
     )?;
     let mut kv = backend.wkv(config, layer, prefix, x, source, limit)?;
     linalg::rms_norm(&mut kv, &norm, head_dim, config.norm_eps as f32)?;
+    // kv_norm casts back to bf16 (model.py:281-293, 700-707), and the fp8 window quantiser
+    // reads that bf16 value (F5).
+    narrow_bf16(&mut kv);
     let positions: Vec<usize> = (start_pos..start_pos + seqlen).collect();
     let tables = rope_tables_for_layer(config, layer, &positions);
     rotate_rows(
@@ -1798,7 +1848,9 @@ fn window_kv_with(
         &tables,
         false,
     )?;
-    round_trip_rows(
+    // The rope writes back into the bf16 row before the fp8 window quantiser reads it
+    // (model.py:700-707).
+    narrow_and_round_trip(
         &mut kv,
         head_dim,
         WINDOW_QUANT_BLOCK,
@@ -1880,6 +1932,9 @@ fn write_index_keys(
         state.latent_rows,
     )?;
     linalg::rms_norm(&mut keys, &norm, index_head_dim, config.norm_eps as f32)?;
+    // k_norm casts back to bf16 and the rope writes back into that bf16 tensor before the
+    // fp4 round trip (model.py:281-293, 392-409, 540-546), so both are narrowed (F5).
+    narrow_bf16(&mut keys);
     let first_row = start_pos / ratio;
     let positions: Vec<usize> = (0..state.latent_rows)
         .map(|row| (first_row + row) * ratio)
@@ -1893,7 +1948,9 @@ fn write_index_keys(
         &tables,
         false,
     )?;
-    round_trip_rows(
+    // The rope writes back into the bf16 key tensor before the fp4 quantiser reads it
+    // (model.py:392-409, 540-546).
+    narrow_and_round_trip(
         &mut keys,
         index_head_dim,
         INDEX_QUANT_BLOCK,
@@ -1948,7 +2005,9 @@ fn write_compressed_cache(
         &tables,
         false,
     )?;
-    round_trip_rows(
+    // The rope writes back into the bf16 latent before the compressed fp4 quantiser reads it
+    // (model.py:757-761).
+    narrow_and_round_trip(
         &mut state.latent,
         head_dim,
         COMPRESS_QUANT_BLOCK,
@@ -2420,6 +2479,7 @@ pub fn attention_projection_probe(
     )?;
     let mut latent = latent_raw.clone();
     linalg::rms_norm(&mut latent, &q_norm, rank, config.norm_eps as f32)?;
+    narrow_bf16(&mut latent);
     let q_raw = backend.wq_b(config, layer, prefix, &latent, source, limit)?;
     let latent_normed = latent.clone();
     let tables = rope_tables_for_layer(
@@ -2443,6 +2503,7 @@ pub fn attention_projection_probe(
     )?;
     let mut window_kv = wkv_raw.clone();
     linalg::rms_norm(&mut window_kv, &norm, head_dim, config.norm_eps as f32)?;
+    narrow_bf16(&mut window_kv);
     rotate_rows(
         &mut window_kv,
         1,
@@ -2451,7 +2512,7 @@ pub fn attention_projection_probe(
         &tables,
         false,
     )?;
-    round_trip_rows(
+    narrow_and_round_trip(
         &mut window_kv,
         head_dim,
         WINDOW_QUANT_BLOCK,
@@ -3769,6 +3830,165 @@ mod tests {
         assert!(
             draft_state.window.is_empty(),
             "a refused pass writes no ring rows"
+        );
+    }
+
+    /// F5: the reference's dynamic quantisers are called on bf16 tensors, so a host seam narrows the
+    /// f32 value to bf16 first. Rounding before the quantiser is not cosmetic: there are blocks whose
+    /// f32 elements straddle an E4M3 code boundary, and those pick a code the reference can never
+    /// pick. The block below is found by a deterministic scan so the test states the rule instead of
+    /// depending on hand-tuned magic constants.
+    #[test]
+    fn the_quantiser_seams_narrow_the_host_value_to_bf16_first() {
+        let mut seed = 0x5EEDu32;
+        let mut found = false;
+        for _ in 0..10_000 {
+            let mut block: Vec<f32> = Vec::with_capacity(32);
+            for _ in 0..32 {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                block.push((seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0);
+            }
+            let mut narrowed = block.clone();
+            narrow_bf16(&mut narrowed);
+            let expected = quant::quantize_activation_fp8(&narrowed)
+                .expect("32 divides by 32")
+                .dequantize();
+            let raw = quant::quantize_activation_fp8(&block)
+                .expect("32 divides by 32")
+                .dequantize();
+            if expected != raw {
+                // The scan found a block where the f32 bits would change the codes; the seam must
+                // produce what the bf16 block produces.
+                let mut mine = block.clone();
+                narrow_and_round_trip(&mut mine, 32, 32, Element::Fp8, ScaleRule::PowerOfTwo);
+                assert_eq!(
+                    mine, expected,
+                    "the seam quantises the bf16 value, not the f32 one"
+                );
+                assert_ne!(
+                    expected, raw,
+                    "quantising the f32 value picks a different code, which is the mis-rounding F5 names"
+                );
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "a bf16 pre-round must be able to change an E4M3 code; the scan found no such block"
+        );
+    }
+
+    /// F5: q_norm's output feeds wq_b's activation quantiser, and RMSNorm casts its result back to
+    /// the bf16 input dtype (model.py:281-293, 970-971), so the host seam hands over a bf16 tensor.
+    #[test]
+    fn the_host_q_norm_output_is_a_bf16_tensor_before_the_wq_b_quantiser() {
+        let config = ModelConfig {
+            compress_ratios: vec![2, 0, 0],
+            ..ModelConfig::tiny()
+        };
+        let hand = Hand::for_config(&config);
+        // Perturb the input by less than a bf16 ulp on purpose: the seam must not carry those bits.
+        let mut x = chunk(&config, 1, 0);
+        for (index, value) in x.iter_mut().enumerate() {
+            *value += 1.0 / 3000.0 * (index % 3) as f32;
+        }
+        let probe = attention_projection_probe(&config, 0, "layers.0", &x, 0, &hand, LIMIT)
+            .expect("a probe");
+        for value in &probe.latent_normed {
+            assert_eq!(
+                quant::bf16_round(*value),
+                *value,
+                "the q_norm output the wq_b quantiser reads must be a bf16 tensor"
+            );
+        }
+    }
+
+    /// F5: the compressor returns a bf16 latent (model.py:446-486, 484-486), which is what the
+    /// compressed cache's fp4 quantiser consumes on the next seam.
+    #[test]
+    fn the_compressor_latent_is_a_bf16_tensor_before_the_fp4_quantiser() {
+        let config = ModelConfig {
+            compress_ratios: vec![2, 0, 0],
+            ..ModelConfig::tiny()
+        };
+        let hand = Hand::for_config(&config);
+        let mut x = chunk(&config, 2, 0);
+        for (index, value) in x.iter_mut().enumerate() {
+            *value += 1.0 / 3000.0 * (index % 3) as f32;
+        }
+        let mut state = AttnState::for_config(&config);
+        compressor_step(
+            &config,
+            0,
+            "layers.0",
+            &x,
+            0,
+            &mut state,
+            Reads {
+                source: &hand,
+                limit: LIMIT,
+            },
+        )
+        .expect("one pooled group");
+        assert_eq!(state.latent_rows, 1);
+        for value in &state.latent {
+            assert_eq!(
+                quant::bf16_round(*value),
+                *value,
+                "the compressor latent is a bf16 tensor"
+            );
+        }
+    }
+    /// F2: every softmax probability is rounded to bf16 before the P*V product (kernel.py:339-341),
+    /// while the denominator keeps the f32 probability (kernel.py:342-353). The rounding is not a
+    /// no-op: a probability whose f32 bits sit below bf16 resolution changes the output.
+    #[test]
+    fn the_body_probabilities_are_bf16_rounded_before_the_value_product() {
+        let head_dim = 4;
+        // q = e0, so a row's score is its first slot times the scale; the two rows differ by
+        // 0.0002 there, which is below the bf16 resolution of exp(0) = 1.
+        let q = [1.0f32, 0.0, 0.0, 0.0];
+        let kv = [1.0f32, 1.0, 1.0, 1.0, 0.9998, 2.0, 2.0, 2.0];
+        let sink = [-2.0f32];
+        let indices = [0usize, 1];
+        let scale = 0.25f32;
+        let mut out = [0.0f32; 4];
+        sparse_attention(&q, &kv, &sink, &indices, 1, head_dim, scale, &mut out)
+            .expect("one head of four slots");
+
+        // The same arithmetic spelled out: the denominator sums the f32 probabilities and the
+        // sink, the numerator uses bf16(probability) * value.
+        let first = 1.0f32 * scale;
+        let second = 0.9998f32 * scale;
+        let max = first.max(second);
+        let first_probability = (first - max).exp();
+        let second_probability = (second - max).exp();
+        let denominator = (sink[0] - max).exp() + first_probability + second_probability;
+        let rounded = quant::bf16_round(second_probability);
+        let expected = [
+            (first_probability * 1.0 + rounded * 0.9998) / denominator,
+            (first_probability * 1.0 + rounded * 2.0) / denominator,
+            (first_probability * 1.0 + rounded * 2.0) / denominator,
+            (first_probability * 1.0 + rounded * 2.0) / denominator,
+        ];
+        assert_eq!(
+            out, expected,
+            "P*V uses the bf16-rounded probability and the f32 denominator"
+        );
+        let unrounded = [
+            (first_probability * 1.0 + second_probability * 0.9998) / denominator,
+            (first_probability * 1.0 + second_probability * 2.0) / denominator,
+            (first_probability * 1.0 + second_probability * 2.0) / denominator,
+            (first_probability * 1.0 + second_probability * 2.0) / denominator,
+        ];
+        assert_ne!(
+            out, unrounded,
+            "quantising the probability must be observable in the output"
+        );
+        assert_ne!(
+            rounded, second_probability,
+            "the test's probability must sit below bf16 resolution for the pin to bite"
         );
     }
 }

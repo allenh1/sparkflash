@@ -101,7 +101,7 @@ impl WeightSource for CachedWeightSource {
 }
 
 /// The usage line for this subcommand.
-pub const USAGE: &str = "sparkflash device-chain --plan-only|--dry-run|--run-stage mhc_entry|layer_zero|hybrid_token|hybrid_sequence|tp4-smoke --checkpoint DIR --cubin-dir DIR [--positions 0] [--layer 0] [--token 0] [--element-limit N] [--moe-preflight] [--moe-layer0-diagnose] [--fixture FILE --prompt-tokens N --decode-steps N] [--dump-logits FILE] [--reference-check] [--attention-twin-positions LIST] [--host-attention-from POSITION] [--operand-audit]; tp4-smoke also takes --tp-rank N --tp-world-size N --comm-backend tcp|lo --comm-peers IP,IP,... --comm-port 29601 --evidence-dir DIR";
+pub const USAGE: &str = "sparkflash device-chain --plan-only|--dry-run|--run-stage mhc_entry|layer_zero|hybrid_token|hybrid_sequence|tp4-smoke|tp4-resident --checkpoint DIR --cubin-dir DIR [--positions 0] [--layer 0] [--token 0] [--element-limit N] [--moe-preflight] [--moe-layer0-diagnose] [--fixture FILE --prompt-tokens N --decode-steps N] [--dump-logits FILE] [--reference-check] [--attention-twin-positions LIST] [--host-attention-from POSITION] [--operand-audit]; tp4-smoke also takes --tp-rank N --tp-world-size N --comm-backend tcp|lo --comm-peers IP,IP,... --comm-port 29601 --evidence-dir DIR";
 
 /// The exit code a plan-only or dry-run invocation returns: 2, refusing to serve.
 pub const PLAN_ONLY_EXIT: u8 = 2;
@@ -344,6 +344,13 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
         && arg_refs.get(1).copied() == Some("tp4-smoke")
     {
         return crate::tp4_smoke::run(&arg_refs[2..]);
+    }
+    // The tp4-resident stage is the S5.2 loader plan and read; like tp4-smoke it opens no driver,
+    // so a CPU-only build reaches it and the four-node window runs the same code.
+    if arg_refs.first().copied() == Some("--run-stage")
+        && arg_refs.get(1).copied() == Some("tp4-resident")
+    {
+        return crate::tp4_resident::run(&arg_refs[2..]);
     }
     #[cfg(feature = "cuda")]
     if arg_refs.first().copied() == Some("--run-stage") {
@@ -1172,6 +1179,14 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             twin_positions
         ));
     }
+    lines.push(
+        "host quantiser seams: bf16 pre-rounds (the reference rounds the module output before every dynamic quantiser: the W8A8 activation staging, q_norm, kv_norm/window rope, the compressor latent, the compressed-cache rope and the indexer k/q rope all narrow to bf16 first; the ffn_norm activation seams stay device-side)"
+            .to_string(),
+    );
+    lines.push(
+        "body P*V: the host twin rounds every softmax probability to bf16 before the value product (native kernel.py:339-341); the device body keeps f32 until the F2 variant lands (declared difference)"
+            .to_string(),
+    );
     let mut moe_backend = crate::moe_device::MoeDeviceBackendImpl::open(&args.cubin_dir)?;
     if args.moe_layer0_diagnose {
         moe_backend = moe_backend.with_layer0_diagnose();

@@ -206,6 +206,21 @@ catch. Rules before any window run:
 - after switching worktrees, verify the binary's `sha256` against the expected cubin pin instead of
   trusting the path;
 - in a window log, a launch/support count that matches the OTHER branch's kernel set is this bug.
+
+## Scripted edits and checkout-relative defaults
+
+Same root cause as the two hazards above, one level up: tooling defaults are CHECKOUT-relative, not
+worktree-relative. A patch script run from a worktree but writing to a relative path edited the main
+checkout instead; the diff was exactly the intended hunks, so nothing was corrupted, but the worktree
+run and the checkout silently diverged. Seen 2026-10-19 during the task-7 host work (caught and
+reverted with `git checkout --` in the same turn). Rules:
+
+- every scripted edit takes ABSOLUTE paths (`git -C <worktree>` for git commands, absolute file
+  arguments otherwise);
+- after any scripted edit, run `git -C <worktree> status --short` and `git -C <main-checkout> status
+  --short` in the same step - a clean main checkout is part of the gate, not an assumption;
+- a green gate on a tree you did not intend to edit proves nothing about the tree you did edit.
+
 ## rerere: a silent replay hazard
 
 `.git/rr-cache` (this repo sets `rerere.enabled=true`) is shared through `.git` by every worktree, and

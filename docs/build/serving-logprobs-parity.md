@@ -341,6 +341,116 @@ quantity and is not explained by this classification: under a matched 131-token 
 367 first at p=0.448, entropy 2.73 against 5.15 at p128, i.e. a stable anomaly of that query; it
 remains open and is owned by audit-dev (task-32, section 2.3).
 
+## Recorded b69 position-129 numeric comparison (O4, task-16)
+
+Scope: record, once and with caveats, the numeric comparison at position 129 of the b69 fixture
+(random-token prompt, 130 ids; position 129 is the prefill step that predicts token 130). This is a
+record of what exists, not a re-run; no server contact was made.
+
+### Provenance of "b69"
+
+b69 is the Lead-owned window of 2026-10-19 that produced the golden fixture
+`phase2-evidence/sequence-130-released.json` (sha256
+`e6df8290dcc9cfc96af27ad1a4da165e5f3d8d4e9aac0f98819b0030b738b308`) and the criterion token list
+`491, 367, 201, 80, 3302, 201, 54, 201, 4341` (host-f32 full 130+8 run in `window-b69.sh`).
+
+**The b69 device-native decode-0 dump does not exist.** `window-b69-device.sh` (2026-10-19) stopped
+vLLM at 16:15:13Z, started `device-chain --prompt-tokens 130 --decode-steps 0 --dump-logits
+runs69/logits-130x0.jsonl` at 16:17:00Z and the run was terminated before writing anything (window
+log: `RUN device-native exit=143`, `SIGTERM`; then `ls: cannot access runs69/logits-130x0.jsonl`).
+`runs69/` now contains only a 0-byte `logits-130x0.log`. So b69 contributes NO device column.
+
+The b69 window did leave a side effect: it restarted the released-snapshot vLLM (start 17:18:44Z,
+healthy 17:28:14Z), and the task-32 released oracle capture at 17:28:30Z was the first request on
+that server, 16 s after health.
+
+The only device numeric column at p129 that exists is **b70/runs70** (decode 8; dump positions
+129..137): `logits-130x8.jsonl` sha256
+`f548d9c3115c0557cc277ed1b32ce2c82985ec38d299869163759f31fc30aea6`, `logits-130x8.jsonl.bin`
+`43b31438c01955c8359457e077322fc39e6c6a76f330bdf958e87d9ddcad07b5`, `logits-130x8.log`
+`d8ba8cbc0cccc440b39123bce77f9ae37afca2473737d4347059359d3fb6b0e8`, binary
+`sparkflash_m3c_c4c_seqreuse_4f599b7_aarch64` `7e0ce4bf2390ec078f70098eb5e77881b518e5d0ed58f9155b669a355a8d48cc`.
+
+### Captures at position 129
+
+All oracle captures are on served root `1bae0e1088993b9b82de08f59de5be5a34e42170`, image
+`vllm/vllm-openai:deepseekv41-flash-0909`, `POST /v1/completions`, `max_tokens 1`,
+`temperature 0`, `top_p 1`, `ignore_eos true`, `prompt_logprobs 1000`; row p is
+`prompt_logprobs[p+1]`.
+
+| capture | oracle prompt shape | load state | oracle p129 top-1 | 491 |
+|:--|:--|:--|:--|:--|
+| released, 17:28:30Z | 139 ids (130 fixture + 8 continuation + sentinel) | not recorded (pre-protocol) | 367 at -0.1988408, p 0.820 | rank 2, -3.83 |
+| suite, 17:30:22Z | 140 ids (130 + 9 + sentinel) | not recorded | 367 at -0.0819, p 0.921 | rank 7, -5.45 |
+| task-32 warm repeats, 18:12Z (3x) | 139 ids, identical bodies | not recorded; value equals the controlled idle block (inferred idle) | bit-identical, 367 at -0.19884082674980164, p 0.820 | rank 2 |
+| task-32 matched-shape, 18:14Z | 131 ids (minimal for row 129) | not recorded; value equals the controlled idle block (inferred idle) | 367 at -0.8024, p 0.448, entropy 2.73 | rank 2 |
+| task-32 controlled concurrent load | 131 ids, same body | busy, controlled (one long generation in flight), reversible | 367 at -0.1252, p 0.882, entropy 0.73 | rank 2 |
+| device, b70/runs70 | device prefill 130 ids, dump at 129 | n/a (device) | device argmax 8060, logit 19.4155 | rank 507 |
+
+The b70 row-check line at p129 reads: `device_argmax=8060 logits_argmax=8060 reference_id=491
+hybrid_id=8060 fixture_id=491 exact_token_equal=false`; the next best device logits are
+67 at 17.9123, 16187 at 17.5096, 3108 at 17.0906, 71484 at 16.9611.
+
+### The device / f32 / oracle triple at p129
+
+    column    top-1 (value)                 top-5
+    device    8060 (logit 19.4155)          8060, 67, 16187, 3108, 71484
+    f32       491  (logit 13.3877)          491, 2463, 223, 63438, 67
+    oracle    367  (logprob -0.0819, p.92)  367, 491, 813, 37852, 67     (suite capture)
+
+    pairwise        top5   top20  top100  top1000
+    f32 / oracle    0.40   0.55   0.48    0.529
+    device / oracle 0.20   0.10   0.22    0.197
+    device / f32    0.20   0.20   0.23    -
+
+Rank of each candidate token (rank = 1 + #{logits > logit of token}):
+
+    token  f32 rank   device rank   oracle rank
+    367    7          18            1
+    491    1          507           2 (released) / 7 (suite)
+    8060   767        1             387
+
+f32 vs device over the full vocabulary at p129: mean |difference| 2.4861, max 15.009581 at index
+5986, 128,528 of 129,280 logits outside the 0.02 bar, correlation 0.533 - the class-A
+criterion-1 failure that b68 recorded and b70 reproduces bit-for-bit.
+
+One position earlier, f32 vs oracle agree: at matched 130-token shape, top-1 is 201 on both sides,
+top-100 overlap 0.80, mean |difference| 0.354, KL 0.082 (task-32 section 2.3). Device-vs-f32 at
+p128 is NOT measured: the b70 "head A/B: host_top1=201 device_top1=201 block_max_equal=true"
+line feeds the host head and the device head the same device hidden, so it validates the head step
+only; the dump starts at 129 and the device's first divergence point is unmeasured.
+
+### What remains valid from b69, and what is superseded by task-32
+
+Valid:
+
+* the fixture's f32 prefill logits at p129: top-1 491 at logit 13.3877, 367 at rank 7; current main
+  reproduces the golden fixture bit-exactly (maxdiff 0.0 at 8- and 130-token runs), so the f32
+  column is sound engine output;
+* the criterion token list and the golden fixture sha above, as recorded engine output.
+
+Superseded (do not cite without the task-32 caveats):
+
+* "the oracle is near-one-hot at p129" as a fixed property: the sharpness is capture-condition
+  dependent - p(top-1) 0.448 idle at 131 tokens, 0.820 idle at 139, 0.921 at 140, 0.882 under a
+  controlled concurrent load. The invariant across every capture is the argmax 367 (with 491
+  second/third). Section 2.4 of `docs/build/task32-root-cause.md` gives the controlled test.
+* "two independently served snapshots agree" from D38 (heretic + released): the heretic capture was
+  not shape-locked or load-state-labelled either; the agreement that stands is on the argmax only.
+* any device fidelity claim at p128 (see above), and `max_abs_delta` as a gate bar (task-32
+  section 4/4.1: the same-shape floor is 0 and the cross-shape envelope is up to 4.06 nats, so a
+  3x bar is either zero or vacuous against a ~10-nat band).
+
+### Why the b69 capture cannot be a gate
+
+The b69 capture is not shape-locked (the engine fixture is a 130-id prefill while the oracle rows
+came from 139/140-token requests; a shape-matched row would need a 131-token request) and it is not
+load-state-labelled (an external chat client was active on the instance during the window and
+prefix caching/chunked prefill make the row depend on batch composition), so its p129 numbers are a
+record of one unlabelled serving state, not a measurement protocol - and its intended device column
+was never written. It is therefore cited only as history; the position is quarantined from D40 bars
+by task-32 section 8, and the device region p129..p137 belongs to task-38.
+
 ## Tests and gates
 
 Host only, no GPU, no checkpoint:
