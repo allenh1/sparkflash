@@ -23,6 +23,26 @@
 //! does not measure is left at the zero it actually is, with the reason written beside it. There is
 //! no cluster, no rank and no rail behind this process, so nothing here reports one.
 //!
+//! # Phase-1 host TP=4 (feature `tp4-serve`)
+//!
+//! With `--features tp4-serve`, `--tp4-rank`/`--tp4-world-size`/`--tp4-peers` select one process of
+//! a four-rank host group. Rank 0 owns the HTTP listener, the tokenizer, the chat template and the
+//! streaming response; ranks 1-3 run the same resident forward and never detokenize. Every rank
+//! receives the same prompt ids once per request and the same rank-0-sampled token per step, so the
+//! lockstep arithmetic is one sequence, not four. The control channel is a small serve-owned TCP
+//! protocol (Hello/Ready/Request/Token/End/Error) on its own port; it is not the engine collective.
+//!
+//! Attention is replicated in TP mode: every rank keeps its own `SequenceState` and per-layer KV
+//! copy for the sequence, so four ranks hold four KV copies (4x KV memory) while computing
+//! identical arithmetic. There is no shared KV pool and no paged-serving claim here.
+//!
+//! Phase 1 is single-sequence and unbatched: one request runs at a time, with one more permitted to
+//! queue behind it and any further concurrent request refused by the bounded job channel. The four
+//! ranks must see the same token sequence, so batching a different request into this group would
+//! desync them; that is a stated limitation, not an implicit queue policy. Prompt logprobs are not
+//! supported on this path (the rank loop scores generated positions), and are refused rather than
+//! approximated.
+//!
 //! # The engine is `Send + Sync` (since !60), and it still has one owner thread
 //!
 //! The api crate's seam requires `Send + Sync`. Until !60 (`f72738b`, "engine: parallel reference
@@ -62,7 +82,11 @@
 //! has.
 
 use std::collections::HashMap;
+#[cfg(feature = "tp4-serve")]
+use std::io::{Read, Write};
 use std::net::SocketAddr;
+#[cfg(feature = "tp4-serve")]
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -73,6 +97,8 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
+#[cfg(feature = "tp4-serve")]
+use serde::{Deserialize, Serialize};
 use sparkflash_api::AppState;
 use sparkflash_api::encoding::{
     HfTokenizerEncoder, TokenizerSeam, load_hf_tokenizer, resolve_reference_tokenizer,
@@ -242,6 +268,216 @@ const REFUSED_CODE: &str = "refused";
 /// The exit code for a refusal: bad arguments, an unreadable tokenizer, a directory that is not a
 /// checkpoint. A runtime failure such as a bind error exits 1 instead.
 const EXIT_REFUSED: u8 = 2;
+/// The default number of ranks in the Phase-1 host TP=4 path.
+#[cfg(feature = "tp4-serve")]
+const TP4_DEFAULT_WORLD_SIZE: usize = 4;
+
+/// The default first collective port: rank R binds this plus R.
+#[cfg(feature = "tp4-serve")]
+const TP4_DEFAULT_BASE_PORT: u16 = 29601;
+
+/// The default control port is this far above the first collective port.
+#[cfg(feature = "tp4-serve")]
+const TP4_CONTROL_PORT_OFFSET: u16 = 100;
+
+/// The one honest fabric label for the host TP=4 path. It is a TCP control channel plus the
+/// engine's canonical host collective, not RoCE and not NCCL.
+#[cfg(feature = "tp4-serve")]
+const TP4_FABRIC: &str = "tcp tp4 host";
+
+/// The Phase-1 job queue: one request may be queued behind the one in flight. A second concurrent
+/// request is refused by the existing bounded queue rather than admitted, because the four ranks
+/// must run the same token sequence in lockstep and batching one sequence would desync them.
+#[cfg(feature = "tp4-serve")]
+const TP4_JOB_QUEUE: usize = 1;
+
+/// How long rank 0 waits for a missing rank, and how long every rank waits for the control peer.
+///
+/// This is a startup deadline, not a per-token deadline: open() reads the resident checkpoint and
+/// can take minutes, so it deliberately sits outside the control channel. A missing rank is a
+/// typed startup refusal, not a retry loop.
+#[cfg(feature = "tp4-serve")]
+const TP4_CONTROL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long a rank's control socket may block on one frame.
+///
+/// The timeout is a liveness guard for a dead peer, not a performance budget: a step between
+/// tokens can be tens of seconds on the reference forward. It is deliberately much larger than one
+/// token.
+#[cfg(feature = "tp4-serve")]
+const TP4_CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The Phase-1 TP=4 flags, parsed only when `--tp4-rank` is present.
+///
+/// The four ranks are four processes with the same binary. Rank 0 owns the HTTP listener, the
+/// tokenizer and the chat-template seam; ranks 1-3 run the same resident forward and never
+/// detokenize. Every rank opens the checkpoint once before the control handshake, which is why
+/// the handshake deadline is minutes rather than seconds.
+#[cfg(feature = "tp4-serve")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tp4ServeOptions {
+    /// This process's rank, 0..world_size.
+    pub rank: usize,
+    /// The number of ranks in the group.
+    pub world_size: usize,
+    /// Every rank's address, in rank order; the control hub is `peers[0]`.
+    pub peers: Vec<IpAddr>,
+    /// Rank R binds the engine collective on `base_port + R`.
+    pub base_port: u16,
+    /// Rank 0 binds the serve-owned control channel here; workers connect to it.
+    pub control_port: u16,
+}
+
+#[cfg(feature = "tp4-serve")]
+impl Tp4ServeOptions {
+    /// Parses the TP=4 flags, or returns `None` when no TP=4 flag was given.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the flag combination that is wrong: TP=4 without `--checkpoint`, with
+    /// `--synthetic`, with `--engine device` or `--device-cubin`, a rank outside the world, a
+    /// peer list of the wrong length, or a control port that collides with a collective port.
+    // One argument per TP=4 CLI flag: keep the parse site shaped like the flag surface.
+    #[allow(clippy::too_many_arguments)]
+    fn from_cli(
+        rank: Option<usize>,
+        world_size: Option<usize>,
+        peers: Option<&str>,
+        base_port: Option<u16>,
+        control_port: Option<u16>,
+        synthetic: bool,
+        checkpoint: Option<&Path>,
+        engine: EngineChoice,
+        device_cubin: Option<&Path>,
+    ) -> Result<Option<Self>, String> {
+        if rank.is_none()
+            && world_size.is_none()
+            && peers.is_none()
+            && base_port.is_none()
+            && control_port.is_none()
+        {
+            return Ok(None);
+        }
+        let rank = rank.ok_or_else(|| {
+            "--tp4-rank is required when any --tp4-* flag is given; the TP=4 path is one process per rank"
+                .to_owned()
+        })?;
+        if synthetic {
+            return Err(
+                "--synthetic cannot be combined with --tp4-rank: the TP=4 path serves the resident sharded checkpoint, and the synthetic tiny plan is a single-process path"
+                    .to_owned(),
+            );
+        }
+        if checkpoint.is_none() {
+            return Err(
+                "--tp4-rank requires --checkpoint DIR: the four ranks serve one released sharded checkpoint"
+                    .to_owned(),
+            );
+        }
+        if engine != EngineChoice::Reference || device_cubin.is_some() {
+            return Err(
+                "--tp4-rank is the host reference forward in four processes; it cannot be combined with --engine device or --device-cubin"
+                    .to_owned(),
+            );
+        }
+        let world_size = world_size.unwrap_or(TP4_DEFAULT_WORLD_SIZE);
+        if world_size == 0 {
+            return Err("--tp4-world-size needs at least one rank".to_owned());
+        }
+        if world_size > usize::from(u16::MAX) {
+            return Err("--tp4-world-size is too large for a u16 port range".to_owned());
+        }
+        if rank >= world_size {
+            return Err(format!(
+                "--tp4-rank {rank} is outside a world of {world_size}"
+            ));
+        }
+        let raw_peers = peers.ok_or_else(|| {
+            format!(
+                "--tp4-peers is required for --tp4-rank: give all {world_size} rank addresses in rank order, comma separated"
+            )
+        })?;
+        let peers = parse_tp4_peers(raw_peers)?;
+        if peers.len() != world_size {
+            return Err(format!(
+                "--tp4-peers lists {} address(es) but --tp4-world-size is {world_size}",
+                peers.len()
+            ));
+        }
+        let base_port = base_port.unwrap_or(TP4_DEFAULT_BASE_PORT);
+        let last_collective = base_port
+            .checked_add(u16::try_from(world_size - 1).map_err(|_| {
+                "--tp4-world-size is too large for a u16 collective port range".to_owned()
+            })?)
+            .ok_or_else(|| {
+                format!(
+                    "--tp4-base-port {base_port} leaves no port for rank {}",
+                    world_size - 1
+                )
+            })?;
+        let control_port = match control_port {
+            Some(port) => port,
+            None => base_port
+                .checked_add(TP4_CONTROL_PORT_OFFSET)
+                .ok_or_else(|| {
+                    format!(
+                        "--tp4-base-port {base_port} leaves no default control port; pass --tp4-control-port"
+                    )
+                })?,
+        };
+        if (base_port..=last_collective).contains(&control_port) {
+            return Err(format!(
+                "--tp4-control-port {control_port} collides with the engine collective ports {base_port}..={last_collective}"
+            ));
+        }
+        Ok(Some(Self {
+            rank,
+            world_size,
+            peers,
+            base_port,
+            control_port,
+        }))
+    }
+}
+
+/// Parses a comma-separated peer list.
+#[cfg(feature = "tp4-serve")]
+fn parse_tp4_peers(raw: &str) -> Result<Vec<IpAddr>, String> {
+    let mut peers = Vec::new();
+    for item in raw.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            return Err("--tp4-peers contains an empty address".to_owned());
+        }
+        let address = item
+            .parse::<IpAddr>()
+            .map_err(|_| format!("--tp4-peers: {item} is not an IP address"))?;
+        peers.push(address);
+    }
+    Ok(peers)
+}
+
+/// Which serve implementation this process runs.
+///
+/// The default is the single-process reference path. `Tp4` means one process in a four-rank group:
+/// rank 0 owns HTTP, ranks 1-3 are workers, and every rank runs the same resident forward.
+#[cfg(feature = "tp4-serve")]
+#[derive(Debug, Clone)]
+pub enum ServeEngine {
+    /// The existing single-process reference server, unchanged.
+    Reference,
+    /// The Phase-1 host TP=4 path.
+    Tp4(Tp4ServeOptions),
+}
+
+/// Chooses the serve implementation from the parsed options.
+#[cfg(feature = "tp4-serve")]
+fn serve_engine(options: &ServeOptions) -> ServeEngine {
+    match &options.tp4 {
+        Some(tp4) => ServeEngine::Tp4(tp4.clone()),
+        None => ServeEngine::Reference,
+    }
+}
 
 /// Everything `sparkflash serve` needs once its arguments are parsed.
 #[derive(Debug, Clone)]
@@ -284,6 +520,14 @@ pub struct ServeOptions {
     /// [build_engine] wraps the checkpoint source so the two Engram tables are paged from the
     /// packed rows instead of being read as tensors from the shards.
     pub engram_dir: Option<PathBuf>,
+    /// The Phase-1 host TP=4 group, when `--tp4-rank` was given.
+    ///
+    /// `None` is the existing single-process server. `Some` means this process is one rank of a
+    /// four-process group: rank 0 owns HTTP, every rank opens the resident checkpoint, and the
+    /// ranks run the same token ids in lockstep over the engine collective plus a serve-owned
+    /// control channel. See [ServeEngine].
+    #[cfg(feature = "tp4-serve")]
+    pub tp4: Option<Tp4ServeOptions>,
 }
 
 impl ServeOptions {
@@ -327,6 +571,18 @@ impl ServeOptions {
                     .to_owned(),
             );
         }
+        #[cfg(feature = "tp4-serve")]
+        let tp4 = Tp4ServeOptions::from_cli(
+            cli.tp4_rank,
+            cli.tp4_world_size,
+            cli.tp4_peers.as_deref(),
+            cli.tp4_base_port,
+            cli.tp4_control_port,
+            cli.synthetic,
+            checkpoint.as_deref(),
+            cli.engine,
+            cli.device_cubin.as_deref(),
+        )?;
         match (cli.synthetic, checkpoint) {
             (true, Some(_)) => Err(
                 "--synthetic and --checkpoint cannot both be given: --synthetic serves the tiny synthetic plan and --checkpoint serves a real sharded checkpoint, so choose one"
@@ -344,6 +600,8 @@ impl ServeOptions {
                 engine: cli.engine,
                 device_cubin: cli.device_cubin,
                 engram_dir: cli.engram_dir,
+                #[cfg(feature = "tp4-serve")]
+                tp4,
             }),
         }
     }
@@ -485,6 +743,29 @@ struct ServeArgs {
     /// this host path does not answer.
     #[arg(long, value_name = "DIR")]
     engram_dir: Option<PathBuf>,
+    /// The TP=4 rank of this process. Any `--tp4-*` flag switches to the Phase-1 host TP=4 path.
+    ///
+    /// Rank 0 owns HTTP, the tokenizer and the chat template; ranks 1-3 run the resident forward
+    /// and never detokenize. Every rank opens the checkpoint before the control handshake.
+    #[cfg(feature = "tp4-serve")]
+    #[arg(long, value_name = "N")]
+    tp4_rank: Option<usize>,
+    /// The number of ranks in the TP=4 group; default 4.
+    #[cfg(feature = "tp4-serve")]
+    #[arg(long, value_name = "N")]
+    tp4_world_size: Option<usize>,
+    /// Every rank's IP address in rank order, comma separated (required with `--tp4-rank`).
+    #[cfg(feature = "tp4-serve")]
+    #[arg(long, value_name = "IP,IP,...")]
+    tp4_peers: Option<String>,
+    /// Rank R binds the engine collective on this port plus R; default 29601.
+    #[cfg(feature = "tp4-serve")]
+    #[arg(long, value_name = "PORT")]
+    tp4_base_port: Option<u16>,
+    /// The serve-owned control channel rank 0 binds; default base_port + 100.
+    #[cfg(feature = "tp4-serve")]
+    #[arg(long, value_name = "PORT")]
+    tp4_control_port: Option<u16>,
 }
 
 /// What the engine thread builds: a configuration, where its weights come from, and the tokenizer.
@@ -1072,6 +1353,15 @@ fn refused(message: &str, code: &str) -> BoxStream<'static, EngineEvent> {
 
 /// The terminal event for a request that produced a token count and timings.
 fn finished_event(prompt_tokens: usize, summary: RunSummary) -> EngineEvent {
+    finished_event_with_fabric(prompt_tokens, summary, "")
+}
+
+/// The terminal event with an explicit fabric label for the stats block.
+fn finished_event_with_fabric(
+    prompt_tokens: usize,
+    summary: RunSummary,
+    fabric_mode: &str,
+) -> EngineEvent {
     let completion_tokens = summary.completion_tokens;
     EngineEvent::Finished {
         finish_reason: summary.finish_reason,
@@ -1097,7 +1387,11 @@ fn finished_event(prompt_tokens: usize, summary: RunSummary) -> EngineEvent {
                 rejected_prediction_tokens: 0,
             },
         },
-        stats: Box::new(request_stats(prompt_tokens, summary.timing)),
+        stats: Box::new(request_stats_with_fabric(
+            prompt_tokens,
+            summary.timing,
+            fabric_mode,
+        )),
     }
 }
 
@@ -1106,7 +1400,13 @@ fn finished_event(prompt_tokens: usize, summary: RunSummary) -> EngineEvent {
 /// The filled fields are the token counts taken from the usage block and the three wall-clock
 /// numbers in `timing`, all of which this process measured for this one request. Nothing here is an
 /// estimate, a projection or another machine's number.
-fn request_stats(prompt_tokens: usize, timing: RequestTiming) -> DeepSeekSparkRequestStats {
+/// The per-request telemetry with an explicit fabric label; the reference path passes "" so its
+/// existing bytes do not change.
+fn request_stats_with_fabric(
+    prompt_tokens: usize,
+    timing: RequestTiming,
+    fabric_mode: &str,
+) -> DeepSeekSparkRequestStats {
     DeepSeekSparkRequestStats {
         // The prompt length is known; every cache tier is zero because no cache exists in this
         // process, so no prefix was matched and nothing had to be replayed.
@@ -1126,8 +1426,12 @@ fn request_stats(prompt_tokens: usize, timing: RequestTiming) -> DeepSeekSparkRe
         engram_layers: default_engram_layers(),
         // One token at a time, with no draft verification: there is no speculative accounting.
         dspark_speculative: DSparkStepStats::default(),
-        // This process speaks no RoCE and runs no collective.
-        transport: RoceTransportStats::default(),
+        // The reference path passes "" (its existing bytes); the TP=4 path passes its honest
+        // fabric label. No rail byte counter or NCCL call is invented on either path.
+        transport: RoceTransportStats {
+            fabric_mode: fabric_mode.to_owned(),
+            ..RoceTransportStats::default()
+        },
         timing: RequestTimingStats {
             ttft_ms: timing.ttft_ms,
             prefill_tok_per_s: timing.prefill_tok_per_s,
@@ -1159,6 +1463,360 @@ fn cluster_snapshot() -> ClusterStatsSnapshot {
         dspark: DSparkStepStats::default(),
         timing: RequestTimingStats::default(),
         max_seq_len: max_seq_len(),
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// TP=4 serve control channel
+// ---------------------------------------------------------------------------------------
+//
+// The engine collective and the serve control channel are deliberately separate. The engine's
+// TcpTransport carries only its data collective frames (Hello/Data/Shutdown) and its send/recv
+// are not part of the Transport trait; the serve protocol is a small length-prefixed JSON frame
+// stream on its own port. Rank 0 is the hub: it accepts every worker's Hello, sends Ready only
+// after all ranks declared ready, then broadcasts Request/Token/End or an Error. Workers never
+// detokenize and never sample: they receive the prompt ids once per request and the sampled token
+// ids one per step, and each runs the same forward step on its own SequenceState.
+
+/// The largest control frame accepted: a prompt id list and a small error message fit far below
+/// this. A frame larger than this is a protocol error, not an allocation request.
+#[cfg(feature = "tp4-serve")]
+const TP4_CONTROL_MAX_FRAME: usize = 1 << 20;
+
+/// One message on the serve-owned control channel.
+#[cfg(feature = "tp4-serve")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tp4ControlFrame {
+    /// A worker's first frame: which rank this connection is.
+    Hello {
+        /// The worker rank, 1..world_size.
+        rank: u32,
+    },
+    /// Rank 0 -> worker: every rank has declared ready; requests may start.
+    Ready,
+    /// Rank 0 -> every worker: one request's prompt ids and generation budget.
+    Request {
+        /// The tokens rank 0 rendered (the chat template is already applied).
+        prompt_ids: Vec<u32>,
+        /// The request's clamped generation budget.
+        max_tokens: u32,
+    },
+    /// Rank 0 -> every worker: the sampled token for the next lockstep decode.
+    Token {
+        /// The token rank 0 sampled; workers must not sample their own.
+        token_id: u32,
+    },
+    /// The request ended normally; every worker leaves the request loop.
+    End,
+    /// The request or the group failed; every worker leaves the process.
+    Error {
+        /// The same code the HTTP error event uses, e.g. engine_gone.
+        code: String,
+        /// An operator-facing message.
+        message: String,
+    },
+}
+
+#[cfg(feature = "tp4-serve")]
+impl Tp4ControlFrame {
+    /// A short name for an unexpected-frame message.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Hello { .. } => "Hello",
+            Self::Ready => "Ready",
+            Self::Request { .. } => "Request",
+            Self::Token { .. } => "Token",
+            Self::End => "End",
+            Self::Error { .. } => "Error",
+        }
+    }
+}
+
+/// A typed control-channel refusal or transport failure.
+#[cfg(feature = "tp4-serve")]
+#[derive(Debug)]
+pub enum Tp4ControlError {
+    /// A socket read/write failed.
+    Io(std::io::Error),
+    /// A frame was not valid JSON.
+    Json(serde_json::Error),
+    /// Rank 0 waited for a rank that never connected.
+    MissingRank {
+        /// The world size the group expected.
+        world: usize,
+        /// How many ranks did connect.
+        joined: usize,
+        /// The deadline rank 0 waited.
+        waited: Duration,
+    },
+    /// A control socket timed out while a specific stage was expected.
+    Timeout {
+        /// The protocol stage that timed out.
+        stage: &'static str,
+    },
+    /// A frame was received before the group was Ready.
+    NotReady {
+        /// What the receiver was waiting for.
+        expected: &'static str,
+    },
+    /// A frame arrived that the protocol did not allow at that point.
+    UnexpectedFrame {
+        /// What the receiver expected.
+        expected: &'static str,
+        /// What it got.
+        got: Tp4ControlFrame,
+    },
+    /// A Hello named a rank outside the group or a rank that already joined.
+    BadRank {
+        /// The offending rank.
+        rank: u32,
+        /// The world size.
+        world: usize,
+    },
+    /// A frame declared a payload larger than the protocol cap.
+    FrameTooLarge {
+        /// The declared payload length.
+        bytes: usize,
+    },
+}
+
+#[cfg(feature = "tp4-serve")]
+impl std::fmt::Display for Tp4ControlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "control I/O: {error}"),
+            Self::Json(error) => write!(f, "control frame is not valid JSON: {error}"),
+            Self::MissingRank {
+                world,
+                joined,
+                waited,
+            } => write!(
+                f,
+                "TP=4 rank 0 waited {waited:?} for {world} ranks and only {joined} joined; the missing rank is a startup refusal, not a single-rank fallback"
+            ),
+            Self::Timeout { stage } => write!(f, "control timeout while waiting for {stage}"),
+            Self::NotReady { expected } => {
+                write!(f, "control frame {expected} arrived before Ready")
+            }
+            Self::UnexpectedFrame { expected, got } => {
+                write!(f, "control expected {expected}, got {}", got.kind())
+            }
+            Self::BadRank { rank, world } => {
+                write!(f, "control Hello rank {rank} is outside a world of {world}")
+            }
+            Self::FrameTooLarge { bytes } => {
+                write!(f, "control frame declares {bytes} bytes, above the cap")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tp4-serve")]
+impl std::error::Error for Tp4ControlError {}
+
+#[cfg(feature = "tp4-serve")]
+impl From<std::io::Error> for Tp4ControlError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+#[cfg(feature = "tp4-serve")]
+impl From<serde_json::Error> for Tp4ControlError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+
+/// Writes one length-prefixed JSON control frame.
+#[cfg(feature = "tp4-serve")]
+fn write_control_frame(
+    stream: &mut TcpStream,
+    frame: &Tp4ControlFrame,
+) -> Result<(), Tp4ControlError> {
+    let payload = serde_json::to_vec(frame)?;
+    let length = u32::try_from(payload.len()).map_err(|_| Tp4ControlError::FrameTooLarge {
+        bytes: payload.len(),
+    })?;
+    stream.write_all(&length.to_be_bytes())?;
+    stream.write_all(&payload)?;
+    stream.flush()?;
+    Ok(())
+}
+
+/// Reads one length-prefixed JSON control frame.
+#[cfg(feature = "tp4-serve")]
+fn read_control_frame(stream: &mut TcpStream) -> Result<Tp4ControlFrame, Tp4ControlError> {
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header)?;
+    let length = usize::try_from(u32::from_be_bytes(header)).unwrap_or(usize::MAX);
+    if length == 0 || length > TP4_CONTROL_MAX_FRAME {
+        return Err(Tp4ControlError::FrameTooLarge { bytes: length });
+    }
+    let mut payload = vec![0u8; length];
+    stream.read_exact(&mut payload)?;
+    Ok(serde_json::from_slice(&payload)?)
+}
+
+/// Rank 0's end of the control channel: one stream per worker, readiness, and broadcast.
+#[cfg(feature = "tp4-serve")]
+#[derive(Debug)]
+struct Tp4ControlHub {
+    /// Index by worker rank; rank 0 is always None (it is the hub itself).
+    streams: Vec<Option<TcpStream>>,
+    /// The number of ranks in the group.
+    world: usize,
+    /// Whether every worker has declared Hello and Ready was sent.
+    ready: bool,
+}
+
+#[cfg(feature = "tp4-serve")]
+impl Tp4ControlHub {
+    /// Binds the control listener and waits for every worker's Hello.
+    ///
+    /// The acceptance loop uses a non-blocking listener plus a deadline so a missing rank is a
+    /// typed error with the count that joined, not an indefinite accept. Ready is sent only after
+    /// every rank has connected: that is what makes a Request-before-Ready a protocol violation
+    /// rather than a race.
+    fn start(
+        address: SocketAddr,
+        world: usize,
+        timeout: Duration,
+    ) -> Result<Self, Tp4ControlError> {
+        if world == 0 {
+            return Err(Tp4ControlError::BadRank { rank: 0, world });
+        }
+        let listener = TcpListener::bind(address)?;
+        listener.set_nonblocking(true)?;
+        let deadline = Instant::now() + timeout;
+        let mut streams: Vec<Option<TcpStream>> = (0..world).map(|_| None).collect();
+        let mut joined = 0usize;
+        while joined + 1 < world {
+            if Instant::now() >= deadline {
+                return Err(Tp4ControlError::MissingRank {
+                    world,
+                    joined,
+                    waited: timeout,
+                });
+            }
+            match listener.accept() {
+                Ok((mut stream, _peer)) => {
+                    stream.set_nonblocking(false)?;
+                    stream.set_read_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
+                    stream.set_write_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
+                    let frame = read_control_frame(&mut stream)?;
+                    let Tp4ControlFrame::Hello { rank } = frame else {
+                        return Err(Tp4ControlError::UnexpectedFrame {
+                            expected: "Hello",
+                            got: frame,
+                        });
+                    };
+                    let rank = usize::try_from(rank).unwrap_or(usize::MAX);
+                    if rank == 0 || rank >= world || streams[rank].is_some() {
+                        return Err(Tp4ControlError::BadRank {
+                            rank: u32::try_from(rank).unwrap_or(u32::MAX),
+                            world,
+                        });
+                    }
+                    streams[rank] = Some(stream);
+                    joined += 1;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(Tp4ControlError::Io(error)),
+            }
+        }
+        let mut hub = Self {
+            streams,
+            world,
+            ready: false,
+        };
+        for stream in hub.streams.iter_mut().flatten() {
+            write_control_frame(stream, &Tp4ControlFrame::Ready)?;
+        }
+        hub.ready = true;
+        Ok(hub)
+    }
+
+    /// Broadcasts one frame to every worker.
+    fn broadcast(&mut self, frame: &Tp4ControlFrame) -> Result<(), Tp4ControlError> {
+        debug_assert_eq!(self.streams.len(), self.world);
+        if !self.ready {
+            return Err(Tp4ControlError::NotReady {
+                expected: "broadcast",
+            });
+        }
+        for stream in self.streams.iter_mut().flatten() {
+            write_control_frame(stream, frame)?;
+        }
+        Ok(())
+    }
+}
+
+/// One worker's end of the control channel.
+#[cfg(feature = "tp4-serve")]
+struct Tp4ControlWorker {
+    stream: TcpStream,
+    /// This worker's rank.
+    rank: u32,
+    /// The world size, for validation and messages.
+    world: usize,
+    /// Whether rank 0's Ready has been received.
+    ready: bool,
+}
+
+#[cfg(feature = "tp4-serve")]
+impl Tp4ControlWorker {
+    /// Connects to rank 0 and sends Hello; Ready is awaited separately by handshake.
+    fn connect(
+        address: SocketAddr,
+        rank: u32,
+        world: usize,
+        timeout: Duration,
+    ) -> Result<Self, Tp4ControlError> {
+        if rank == 0 || usize::try_from(rank).unwrap_or(usize::MAX) >= world {
+            return Err(Tp4ControlError::BadRank { rank, world });
+        }
+        let stream = TcpStream::connect_timeout(&address, timeout)?;
+        stream.set_read_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
+        stream.set_write_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
+        Ok(Self {
+            stream,
+            rank,
+            world,
+            ready: false,
+        })
+    }
+
+    /// Sends Hello and waits for rank 0's Ready.
+    fn handshake(&mut self) -> Result<(), Tp4ControlError> {
+        debug_assert!(usize::try_from(self.rank).unwrap_or(usize::MAX) < self.world);
+        write_control_frame(
+            &mut self.stream,
+            &Tp4ControlFrame::Hello { rank: self.rank },
+        )?;
+        let frame = read_control_frame(&mut self.stream)?;
+        match frame {
+            Tp4ControlFrame::Ready => {
+                self.ready = true;
+                Ok(())
+            }
+            other => Err(Tp4ControlError::UnexpectedFrame {
+                expected: "Ready",
+                got: other,
+            }),
+        }
+    }
+
+    /// Reads the next request-scoped frame. A frame before Ready is a typed refusal.
+    fn next_frame(&mut self) -> Result<Tp4ControlFrame, Tp4ControlError> {
+        if !self.ready {
+            return Err(Tp4ControlError::NotReady {
+                expected: "next frame",
+            });
+        }
+        read_control_frame(&mut self.stream)
     }
 }
 
@@ -1848,10 +2506,672 @@ fn run_request(
     Ok(())
 }
 
-/// Wraps a device session in the engine and prints the report's startup line.
+// ---------------------------------------------------------------------------------------
+// TP=4 rank adapter, driver, and worker loop
+// ---------------------------------------------------------------------------------------
+
+/// One forward step's output, reduced to what serve needs.
 ///
-/// The report is derived from the session (fake/real, evidence or none), so this line cannot
-/// overstate what ran; the caller only chooses which session to build.
+/// The real Tp4Rank adapter maps the engine's StepOutput into this; serve reads only the logits
+/// and the rank-0 sampled token. Workers ignore next_token (it is computed identically on every
+/// rank, but it must not drive the token stream).
+#[cfg(feature = "tp4-serve")]
+#[derive(Debug, Clone, Default)]
+pub struct Tp4Step {
+    /// The raw logits for the position just fed.
+    pub logits: Vec<f32>,
+    /// The greedy next token, when the rank produced one.
+    pub next_token: Option<u32>,
+}
+
+/// The request sampler a rank applies before its first step.
+///
+/// The reference driver consumes its engine with with_sampling once per request. A resident TP=4
+/// rank holds one engine for the process lifetime, so the same choice arrives through
+/// begin_request instead. Sampling changes only which token rank 0 chooses; it does not change the
+/// forward arithmetic, and workers keep the greedy default because they ignore next_token.
+#[cfg(feature = "tp4-serve")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tp4Sampling {
+    /// The request temperature.
+    pub temperature: f32,
+    /// The request seed.
+    pub seed: u64,
+}
+
+#[cfg(feature = "tp4-serve")]
+impl Default for Tp4Sampling {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            seed: 0,
+        }
+    }
+}
+
+/// The evidence counters the rank's extraction exposes.
+#[cfg(feature = "tp4-serve")]
+#[derive(Debug, Clone, Default)]
+pub struct Tp4RankMetrics {
+    /// Startup load time.
+    pub load_ms: u64,
+    /// Resident raw-cache bytes.
+    pub resident_cache_bytes: u64,
+    /// Resident raw-cache tensors.
+    pub resident_cache_tensors: usize,
+    /// Collective calls made by this rank.
+    pub reduce_calls: u64,
+    /// Collective elements reduced by this rank.
+    pub reduce_elements: u64,
+    /// Forward steps run by this rank.
+    pub steps: u64,
+    /// Wall milliseconds of the most recent step.
+    pub last_step_ms: u64,
+}
+
+/// The serve-side seam over tp-dev's Tp4Rank extraction.
+///
+/// This is deliberately a trait rather than a direct dependency: the serve branch compiles against
+/// a stub until the extraction lands, and the real adapter is one impl on top of the extracted
+/// Tp4Rank. The trait contains no forward arithmetic; Tp4Rank owns the lockstep loop and the
+/// resident cache.
+#[cfg(feature = "tp4-serve")]
+pub trait Tp4RankApi: Send {
+    /// Resets the per-request SequenceState and applies the request sampler.
+    ///
+    /// This runs exactly once per request on every rank, before that rank feeds the Request
+    /// frame's prompt ids: replace the rank's SequenceState with a fresh
+    /// SequenceState::new(global_config) and assert it is empty, then apply the sampler. It must
+    /// not read weights or touch the collective; the engine and collective are opened once in
+    /// open_tp4_rank and stay owned by Tp4Rank. A rank that holds InferenceEngine by value applies
+    /// the sampler with the non-consuming InferenceEngine::set_sampling(Sampling { temperature,
+    /// seed }) (task/engine-resident 74e9ff2); it must not rebuild the engine or re-read weights.
+    /// A rank that cannot apply a non-greedy sampler must return an error rather than silently run
+    /// greedy.
+    fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String>;
+
+    /// Runs the prompt through this rank's forward and returns the last position's step.
+    fn prefill(&mut self, prompt: &[u32]) -> Result<Tp4Step, String>;
+
+    /// Runs one sampled token through this rank's forward.
+    fn decode(&mut self, token: u32) -> Result<Tp4Step, String>;
+
+    /// The evidence counters this rank collected.
+    fn metrics(&self) -> Tp4RankMetrics;
+}
+
+/// What rank 0 passes to the rank factory: the checkpoint and the group geometry, not a tokenizer.
+///
+/// Token ids are the contract between serve and the rank; the tokenizer stays on rank 0 and never
+/// reaches a worker.
+#[cfg(feature = "tp4-serve")]
+#[derive(Debug, Clone)]
+pub struct Tp4RankConfig {
+    /// This process's rank.
+    pub rank: usize,
+    /// The number of ranks in the group.
+    pub world_size: usize,
+    /// Every rank's address, in rank order.
+    pub peers: Vec<IpAddr>,
+    /// Rank R binds the engine collective on base_port + R.
+    pub base_port: u16,
+    /// Rank 0's serve control port.
+    pub control_port: u16,
+    /// The released sharded checkpoint directory or index.
+    pub checkpoint: PathBuf,
+    /// The element cap for one tensor.
+    pub element_limit: usize,
+    /// The startup and control deadline.
+    pub timeout: Duration,
+}
+
+#[cfg(feature = "tp4-serve")]
+impl Tp4RankConfig {
+    /// The control channel address.
+    fn control_address(&self) -> SocketAddr {
+        SocketAddr::new(self.peers[0], self.control_port)
+    }
+}
+
+/// Builds the serve rank config from the parsed options.
+#[cfg(feature = "tp4-serve")]
+fn tp4_rank_config(
+    options: &ServeOptions,
+    tp4: &Tp4ServeOptions,
+    timeout: Duration,
+) -> Result<Tp4RankConfig, String> {
+    let checkpoint = options.checkpoint.clone().ok_or_else(|| {
+        "--tp4-rank requires --checkpoint DIR: the four ranks serve one released sharded checkpoint"
+            .to_owned()
+    })?;
+    Ok(Tp4RankConfig {
+        rank: tp4.rank,
+        world_size: tp4.world_size,
+        peers: tp4.peers.clone(),
+        base_port: tp4.base_port,
+        control_port: tp4.control_port,
+        checkpoint,
+        element_limit: options.element_limit,
+        timeout,
+    })
+}
+
+/// The serve adapter over tp-dev's extracted Tp4Rank.
+///
+/// Tp4Rank owns the resident checkpoint, the per-rank engine, the collective and the forward. This
+/// struct only maps its per-rank step API onto the serve seam; it performs no arithmetic and keeps
+/// no second copy of the sequence state.
+#[cfg(feature = "tp4-serve")]
+struct HostTp4Rank {
+    rank: crate::tp4_host::Tp4Rank,
+}
+
+#[cfg(feature = "tp4-serve")]
+impl Tp4RankApi for HostTp4Rank {
+    fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String> {
+        self.rank
+            .begin_request(crate::tp4_host::Tp4Sampling {
+                temperature: sampling.temperature,
+                seed: sampling.seed,
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    fn prefill(&mut self, prompt: &[u32]) -> Result<Tp4Step, String> {
+        let output = self
+            .rank
+            .prefill(prompt)
+            .map_err(|error| error.to_string())?;
+        Ok(Tp4Step {
+            logits: output.logits,
+            next_token: output.token,
+        })
+    }
+
+    fn decode(&mut self, token: u32) -> Result<Tp4Step, String> {
+        let output = self.rank.decode(token).map_err(|error| error.to_string())?;
+        Ok(Tp4Step {
+            logits: output.logits,
+            next_token: output.token,
+        })
+    }
+
+    fn metrics(&self) -> Tp4RankMetrics {
+        let metrics = self.rank.metrics();
+        Tp4RankMetrics {
+            load_ms: metrics.load_ms,
+            resident_cache_bytes: metrics.resident_cache_bytes,
+            resident_cache_tensors: metrics.resident_cache_tensors,
+            reduce_calls: metrics.reduce_calls,
+            reduce_elements: metrics.reduce_elements,
+            steps: metrics.steps,
+            last_step_ms: metrics.last_step_ms,
+        }
+    }
+}
+
+/// Opens this process's extracted Tp4Rank and wraps it in the serve seam.
+///
+/// The control port stays in serve: Tp4Rank opens only the engine collective on base_port + rank.
+/// resident_cache is always true here: task-57's resident path is the one this endpoint measures,
+/// and no serve flag may silently turn it into a re-read-per-token path.
+#[cfg(feature = "tp4-serve")]
+fn open_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> {
+    let rank = crate::tp4_host::Tp4Rank::open(&crate::tp4_host::Tp4RankConfig {
+        rank: config.rank,
+        world_size: config.world_size,
+        peers: config.peers.clone(),
+        base_port: config.base_port,
+        checkpoint: config.checkpoint.clone(),
+        element_limit: config.element_limit,
+        resident_cache: true,
+        timeout: config.timeout,
+    })
+    .map_err(|error| format!("TP=4 rank {} open failed: {error}", config.rank))?;
+    Ok(Box::new(HostTp4Rank { rank }))
+}
+
+/// The TP=4 HTTP driver: the same ApiInferenceEngine/EngineEvent contract as ReferenceDriver,
+/// backed by one rank-0 engine thread that owns the rank and the control hub.
+#[cfg(feature = "tp4-serve")]
+pub struct Tp4Driver {
+    model: String,
+    jobs: tokio::sync::mpsc::Sender<Job>,
+    max_tokens: usize,
+    vocab_size: usize,
+    cluster: ClusterStatsSnapshot,
+}
+
+#[cfg(feature = "tp4-serve")]
+impl Tp4Driver {
+    /// Starts the rank-0 engine thread and waits for the resident rank plus the control hub.
+    ///
+    /// The handshake is after open() and after every worker's Hello, so a missing rank or an
+    /// unreadable checkpoint refuses startup before the HTTP socket exists.
+    fn start(
+        recipe: &Recipe,
+        rank_config: Tp4RankConfig,
+        max_tokens: usize,
+    ) -> Result<Self, String> {
+        let (jobs, queued) = tokio::sync::mpsc::channel(TP4_JOB_QUEUE);
+        let (ready, reported) = std::sync::mpsc::channel();
+        let owned = recipe.clone();
+        std::thread::Builder::new()
+            .name(ENGINE_THREAD_NAME.to_owned())
+            .spawn(move || tp4_engine_thread(&owned, rank_config, queued, ready))
+            .map_err(|error| format!("cannot start the TP=4 engine thread: {error}"))?;
+        match reported.recv() {
+            Ok(Ok(())) => Ok(Self {
+                model: MODEL_ID.to_owned(),
+                jobs,
+                max_tokens,
+                vocab_size: recipe.config.vocab_size,
+                cluster: tp4_cluster_snapshot(),
+            }),
+            Ok(Err(message)) => Err(message),
+            Err(_) => Err("the TP=4 engine thread stopped before it reported ready".to_owned()),
+        }
+    }
+
+    /// A driver with a pre-filled job channel, for the one-request guard test.
+    #[cfg(test)]
+    fn for_test(jobs: tokio::sync::mpsc::Sender<Job>, max_tokens: usize) -> Self {
+        Self {
+            model: MODEL_ID.to_owned(),
+            jobs,
+            max_tokens,
+            vocab_size: 8,
+            cluster: tp4_cluster_snapshot(),
+        }
+    }
+}
+
+#[cfg(feature = "tp4-serve")]
+impl ApiInferenceEngine for Tp4Driver {
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
+    fn generate(&self, request: EngineRequest) -> BoxStream<'static, EngineEvent> {
+        if !request.images.is_empty() {
+            let missing = MissingCapability::vision();
+            return refused(&missing.to_string(), missing.code());
+        }
+        if request.prompt_tokens.is_empty() {
+            return refused(
+                "the request carries no prompt tokens, and the TP=4 forward has nothing to prefill",
+                REFUSED_CODE,
+            );
+        }
+        let prompt_tokens = request.prompt_tokens.len();
+        let max_tokens = request.max_tokens.min(self.max_tokens);
+        let (replies, answers) = tokio::sync::mpsc::channel(REPLY_BUFFER);
+        let job = Job {
+            prompt_tokens: request.prompt_tokens,
+            max_tokens,
+            temperature: request.temperature,
+            seed: request.seed.unwrap_or(0),
+            logprobs: request.logprobs,
+            replies,
+        };
+        if self.jobs.try_send(job).is_err() {
+            return refused(
+                "the TP=4 engine already has the one request it runs at a time and one queued behind it; a second concurrent request is refused because the four ranks must run the same token sequence in lockstep",
+                REFUSED_CODE,
+            );
+        }
+        let head = stream::once(async move {
+            EngineEvent::Started {
+                prompt_tokens,
+                cached_tokens: 0,
+            }
+        });
+        let answers = stream::unfold(
+            AnswerState {
+                answers,
+                done: false,
+            },
+            move |mut state| async move {
+                if state.done {
+                    return None;
+                }
+                match state.answers.recv().await {
+                    Some(Reply::Delta(text)) => Some((EngineEvent::ContentDelta(text), state)),
+                    Some(Reply::PromptLogprobs(prompt)) => {
+                        Some((EngineEvent::PromptLogprobs(prompt), state))
+                    }
+                    Some(Reply::TokenLogprobs(logprob)) => {
+                        Some((EngineEvent::TokenLogprobs(logprob), state))
+                    }
+                    Some(Reply::Done(summary)) => {
+                        state.done = true;
+                        Some((
+                            finished_event_with_fabric(prompt_tokens, *summary, TP4_FABRIC),
+                            state,
+                        ))
+                    }
+                    Some(Reply::Failed(message)) => {
+                        state.done = true;
+                        Some((
+                            EngineEvent::Error {
+                                message,
+                                code: ENGINE_ERROR_CODE.to_owned(),
+                            },
+                            state,
+                        ))
+                    }
+                    None => {
+                        state.done = true;
+                        Some((
+                            EngineEvent::Error {
+                                message:
+                                    "the TP=4 engine thread stopped before this request finished"
+                                        .to_owned(),
+                                code: ENGINE_GONE_CODE.to_owned(),
+                            },
+                            state,
+                        ))
+                    }
+                }
+            },
+        );
+        head.chain(answers).boxed()
+    }
+
+    fn cluster_stats(&self) -> ClusterStatsSnapshot {
+        self.cluster.clone()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
+
+    fn vocab_size(&self) -> Option<usize> {
+        Some(self.vocab_size)
+    }
+}
+
+/// Writes one rank's counters to stderr, where the ssh log captures them as evidence.
+#[cfg(feature = "tp4-serve")]
+fn log_tp4_metrics(rank: usize, phase: &str, metrics: &Tp4RankMetrics) {
+    eprintln!(
+        "sparkflash serve: tp4_metrics rank={rank} phase={phase} load_ms={} last_step_ms={} steps={} reduce_calls={} reduce_elements={} resident_cache_bytes={} resident_cache_tensors={}",
+        metrics.load_ms,
+        metrics.last_step_ms,
+        metrics.steps,
+        metrics.reduce_calls,
+        metrics.reduce_elements,
+        metrics.resident_cache_bytes,
+        metrics.resident_cache_tensors
+    );
+}
+
+/// Rank 0's engine thread: open the resident rank, accept the workers, then run one job at a time.
+#[cfg(feature = "tp4-serve")]
+fn tp4_engine_thread(
+    recipe: &Recipe,
+    rank_config: Tp4RankConfig,
+    mut jobs: tokio::sync::mpsc::Receiver<Job>,
+    ready: std::sync::mpsc::Sender<Result<(), String>>,
+) {
+    let built = open_tp4_rank(&rank_config)
+        .map_err(|error| format!("rank {}: {error}", rank_config.rank))
+        .and_then(|rank| {
+            log_tp4_metrics(rank_config.rank, "open", &rank.metrics());
+            let hub = Tp4ControlHub::start(
+                rank_config.control_address(),
+                rank_config.world_size,
+                rank_config.timeout,
+            )
+            .map_err(|error| format!("rank 0 control channel: {error}"))?;
+            let tokenizer = load_tokenizer(&recipe.tokenizer)?;
+            Ok((rank, hub, tokenizer))
+        });
+    let (mut rank, mut hub, tokenizer) = match built {
+        Ok(built) => built,
+        Err(message) => {
+            let _ = ready.send(Err(message));
+            return;
+        }
+    };
+    if ready.send(Ok(())).is_err() {
+        return;
+    }
+    while let Some(job) = jobs.blocking_recv() {
+        let replies = job.replies.clone();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            run_tp4_request(rank.as_mut(), &mut hub, &tokenizer, job)
+        }));
+        let failure = match outcome {
+            Ok(Ok(())) => None,
+            Ok(Err(message)) => Some(message),
+            Err(payload) => Some(format!(
+                "the TP=4 rank panicked on this request: {}",
+                panic_message(payload.as_ref())
+            )),
+        };
+        log_tp4_metrics(rank_config.rank, "request", &rank.metrics());
+        if let Some(message) = failure {
+            let code = ENGINE_ERROR_CODE.to_owned();
+            let _ = hub.broadcast(&Tp4ControlFrame::Error {
+                code: code.clone(),
+                message: message.clone(),
+            });
+            let _ = replies.blocking_send(Reply::Failed(message));
+        }
+    }
+}
+
+/// Runs one request on rank 0 while every worker runs the same ids.
+#[cfg(feature = "tp4-serve")]
+fn run_tp4_request(
+    rank: &mut dyn Tp4RankApi,
+    hub: &mut Tp4ControlHub,
+    tokenizer: &HfTokenizerEncoder,
+    job: Job,
+) -> Result<(), String> {
+    if job.logprobs.wants_prompt() {
+        return Err(
+            "prompt logprobs are not supported by the Phase-1 TP=4 path: the rank loop scores generated positions, not prompt positions"
+                .to_owned(),
+        );
+    }
+    rank.begin_request(Tp4Sampling {
+        temperature: job.temperature,
+        seed: job.seed,
+    })?;
+    let max_tokens = u32::try_from(job.max_tokens).unwrap_or(u32::MAX);
+    hub.broadcast(&Tp4ControlFrame::Request {
+        prompt_ids: job.prompt_tokens.clone(),
+        max_tokens,
+    })
+    .map_err(|error| format!("control Request: {error}"))?;
+    let request_started = Instant::now();
+    let prefill = rank.prefill(&job.prompt_tokens)?;
+    let prefill_elapsed = request_started.elapsed();
+    let want_sample = job.logprobs.wants_sample();
+    let decode_ids = |ids: &[u32]| -> Result<String, String> {
+        tokenizer.tokenizer().decode(ids, false).map_err(|error| {
+            format!(
+                "the tokenizer could not decode {} token id(s): {error}",
+                ids.len()
+            )
+        })
+    };
+    let mut logprob_decoder = LogprobDecoder::new(&decode_ids);
+    let mut decoder = tokenizer.tokenizer().decode_stream(false);
+    let mut logits = prefill.logits;
+    let mut next = prefill.next_token;
+    let mut completion_tokens = 0usize;
+    let mut ttft: Option<Duration> = None;
+    while completion_tokens < job.max_tokens {
+        let Some(token) = next else { break };
+        if ttft.is_none() {
+            ttft = Some(request_started.elapsed());
+        }
+        let piece = decoder
+            .step(token)
+            .map_err(|error| format!("the tokenizer could not decode token {token}: {error}"))?
+            .filter(|piece| !piece.is_empty());
+        if want_sample {
+            let row = log_softmax(&logits);
+            let token_string = logprob_decoder.decode(token)?;
+            let entry = token_logprob(
+                &row,
+                token,
+                token_string,
+                job.logprobs.sample,
+                &job.logprobs.token_ids,
+                &mut logprob_decoder,
+            )?;
+            if let Some(piece) = piece {
+                job.replies
+                    .blocking_send(Reply::Delta(piece))
+                    .map_err(|_| "the client stopped reading this response".to_owned())?;
+            }
+            job.replies
+                .blocking_send(Reply::TokenLogprobs(Box::new(entry)))
+                .map_err(|_| "the client stopped reading this response".to_owned())?;
+            logprob_decoder.push(token);
+        } else if let Some(piece) = piece {
+            job.replies
+                .blocking_send(Reply::Delta(piece))
+                .map_err(|_| "the client stopped reading this response".to_owned())?;
+        }
+        completion_tokens += 1;
+        // The last generated token is never fed back: max_tokens=8 is prefill plus seven
+        // decode calls. Sending it would make every rank run one extra, unnecessary step.
+        if completion_tokens >= job.max_tokens {
+            break;
+        }
+        hub.broadcast(&Tp4ControlFrame::Token { token_id: token })
+            .map_err(|error| format!("control Token: {error}"))?;
+        let step = rank.decode(token)?;
+        logits = step.logits;
+        next = step.next_token;
+    }
+    let elapsed = request_started.elapsed();
+    let timing = RequestTiming::measure(
+        job.prompt_tokens.len(),
+        completion_tokens,
+        prefill_elapsed,
+        ttft,
+        elapsed,
+    );
+    let finish_reason = if completion_tokens >= job.max_tokens {
+        FinishReason::Length
+    } else {
+        FinishReason::Stop
+    };
+    hub.broadcast(&Tp4ControlFrame::End)
+        .map_err(|error| format!("control End: {error}"))?;
+    job.replies
+        .blocking_send(Reply::Done(Box::new(RunSummary {
+            completion_tokens,
+            finish_reason,
+            timing,
+        })))
+        .map_err(|_| "the client stopped reading this response".to_owned())?;
+    Ok(())
+}
+
+/// Runs one worker rank until its control channel ends.
+#[cfg(feature = "tp4-serve")]
+fn tp4_worker(options: &ServeOptions, tp4: &Tp4ServeOptions) -> Result<(), String> {
+    let rank_config = tp4_rank_config(options, tp4, TP4_CONTROL_TIMEOUT)?;
+    let mut rank = open_tp4_rank(&rank_config)?;
+    log_tp4_metrics(rank_config.rank, "open", &rank.metrics());
+    let mut control = Tp4ControlWorker::connect(
+        rank_config.control_address(),
+        u32::try_from(rank_config.rank).map_err(|_| "rank does not fit in u32".to_owned())?,
+        rank_config.world_size,
+        rank_config.timeout,
+    )
+    .map_err(|error| format!("rank {} control connect: {error}", rank_config.rank))?;
+    control
+        .handshake()
+        .map_err(|error| format!("rank {} control handshake: {error}", rank_config.rank))?;
+    loop {
+        match control.next_frame() {
+            Ok(Tp4ControlFrame::Request {
+                prompt_ids,
+                max_tokens,
+            }) => {
+                // Workers do not sample; reset their state with the greedy default. The engine's
+                // forward arithmetic is unchanged by the sampler, and their next_token is ignored.
+                rank.begin_request(Tp4Sampling::default())?;
+                rank.prefill(&prompt_ids)?;
+                let mut decoded = 0usize;
+                loop {
+                    match control.next_frame() {
+                        Ok(Tp4ControlFrame::Token { token_id }) => {
+                            if decoded >= max_tokens as usize {
+                                return Err(format!(
+                                    "rank 0 sent more than the {max_tokens} tokens it declared"
+                                ));
+                            }
+                            rank.decode(token_id)?;
+                            decoded += 1;
+                        }
+                        Ok(Tp4ControlFrame::End) => break,
+                        Ok(Tp4ControlFrame::Error { code, message }) => {
+                            return Err(format!("rank 0 reported {code}: {message}"));
+                        }
+                        Ok(other) => {
+                            return Err(format!(
+                                "rank {} expected Token or End, got {}",
+                                rank_config.rank,
+                                other.kind()
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "rank {} control after prefill: {error}",
+                                rank_config.rank
+                            ));
+                        }
+                    }
+                }
+                log_tp4_metrics(rank_config.rank, "request", &rank.metrics());
+            }
+            Ok(Tp4ControlFrame::End) => break,
+            Ok(Tp4ControlFrame::Error { code, message }) => {
+                return Err(format!("rank 0 reported {code}: {message}"));
+            }
+            Ok(other) => {
+                return Err(format!(
+                    "rank {} expected Request, End or Error, got {}",
+                    rank_config.rank,
+                    other.kind()
+                ));
+            }
+            Err(error) => {
+                return Err(format!("rank {} control: {error}", rank_config.rank));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The cluster telemetry a TP=4 process can state: its fabric mode, not a node list or a rail.
+#[cfg(feature = "tp4-serve")]
+fn tp4_cluster_snapshot() -> ClusterStatsSnapshot {
+    ClusterStatsSnapshot {
+        model: MODEL_ID.to_owned(),
+        fabric_mode: TP4_FABRIC.to_owned(),
+        nodes: Vec::new(),
+        kv: empty_kv_snapshot(),
+        engram: default_engram_layers().to_vec(),
+        transport: RoceTransportStats {
+            fabric_mode: TP4_FABRIC.to_owned(),
+            ..RoceTransportStats::default()
+        },
+        dspark: DSparkStepStats::default(),
+        timing: RequestTimingStats::default(),
+        max_seq_len: max_seq_len(),
+    }
+}
+
 fn device_engine<S: DeviceSession + 'static>(
     session: S,
     driver: ReferenceDriver,
@@ -1875,6 +3195,81 @@ fn default_tokenizer() -> Result<PathBuf, String> {
     resolve_reference_tokenizer(exe_dir.as_deref(), cwd.as_deref())
 }
 
+/// Runs one process of the Phase-1 TP=4 group.
+///
+/// Rank 0 owns HTTP, the tokenizer, the chat template and streaming; every other rank runs the
+/// resident forward and a control worker and never loads a tokenizer. A missing rank is a typed
+/// startup refusal from Tp4Driver::start before the HTTP socket exists.
+#[cfg(feature = "tp4-serve")]
+fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
+    if tp4.rank != 0 {
+        return match tp4_worker(options, &tp4) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("sparkflash serve: rank {}: {message}", tp4.rank);
+                ExitCode::from(EXIT_REFUSED)
+            }
+        };
+    }
+    let tokenizer = match options.tokenizer.clone() {
+        Some(tokenizer) => tokenizer,
+        None => match default_tokenizer() {
+            Ok(tokenizer) => tokenizer,
+            Err(message) => {
+                eprintln!("sparkflash serve: {message}");
+                return ExitCode::from(EXIT_REFUSED);
+            }
+        },
+    };
+    let recipe = match options.recipe(&tokenizer) {
+        Ok(recipe) => recipe,
+        Err(message) => {
+            eprintln!("sparkflash serve: {message}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    let rank_config = match tp4_rank_config(options, &tp4, TP4_CONTROL_TIMEOUT) {
+        Ok(config) => config,
+        Err(message) => {
+            eprintln!("sparkflash serve: {message}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    let driver = match Tp4Driver::start(&recipe, rank_config, options.max_tokens) {
+        Ok(driver) => driver,
+        Err(message) => {
+            eprintln!("sparkflash serve: {message}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    let seam = match load_tokenizer(&tokenizer) {
+        Ok(loaded) => Arc::new(TokenizerSeam::new(loaded)),
+        Err(message) => {
+            eprintln!("sparkflash serve: {message}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    println!(
+        "sparkflash serve: TP=4 rank 0/{} on {}; control {}; workers never detokenize",
+        tp4.world_size, tp4.peers[0], tp4.control_port
+    );
+    let state = AppState::new(Arc::new(driver))
+        .with_max_logprobs(options.max_logprobs)
+        .with_tokenizer(seam);
+    let router = sparkflash_api::server::router(state);
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("sparkflash serve: cannot start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(bind_and_serve(router, options.bind))
+}
+
 /// Entry point main.rs calls: parses arguments, starts the engine, binds the router.
 pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
     let options = match ServeOptions::parse(args) {
@@ -1884,6 +3279,10 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             return ExitCode::from(EXIT_REFUSED);
         }
     };
+    #[cfg(feature = "tp4-serve")]
+    if let ServeEngine::Tp4(tp4) = serve_engine(&options) {
+        return run_tp4(&options, tp4);
+    }
     let selection = match select_engine(
         options.engine,
         options.device_cubin.as_deref(),
@@ -5093,5 +6492,249 @@ mod engram_packed_store {
         };
         assert!(error.contains("--engram-dir"), "{error}");
         assert!(error.contains(MANIFEST_NAME), "{error}");
+    }
+}
+
+#[cfg(all(test, feature = "tp4-serve"))]
+mod tp4_serve_tests {
+    use std::collections::BTreeSet;
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+
+    use futures::StreamExt;
+
+    use super::*;
+
+    fn engine_request(prompt: &[u32], max_tokens: usize) -> EngineRequest {
+        EngineRequest {
+            request_id: "tp4-test".to_owned(),
+            model: MODEL_ID.to_owned(),
+            prompt_tokens: prompt.to_vec(),
+            logprobs: LogprobsRequest::default(),
+            images: Vec::new(),
+            max_tokens,
+            temperature: 0.0,
+            top_p: 1.0,
+            thinking: false,
+            reasoning_effort: None,
+            stop: Vec::new(),
+            seed: Some(0),
+            trace_scopes: 0,
+            trace_steps: 0,
+        }
+    }
+
+    fn tp4_args(extra: &[&str]) -> Vec<String> {
+        let mut args = vec![
+            "--tp4-rank",
+            "0",
+            "--tp4-world-size",
+            "2",
+            "--tp4-peers",
+            "127.0.0.1,127.0.0.2",
+            "--checkpoint",
+            "/tmp/tp4-checkpoint",
+            "--tokenizer",
+            "/tmp/tp4-tokenizer.json",
+        ];
+        args.extend_from_slice(extra);
+        args.into_iter().map(str::to_owned).collect()
+    }
+
+    fn keys(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    let path = format!("{prefix}{key}");
+                    out.insert(path.clone());
+                    keys(child, &format!("{path}."), out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                if let Some(first) = items.first() {
+                    keys(first, &format!("{prefix}[]."), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn shape(value: &serde_json::Value) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        keys(value, "", &mut out);
+        out
+    }
+
+    #[test]
+    fn tp4_flags_parse_with_defaults() {
+        let options = ServeOptions::parse(tp4_args(&[])).expect("the TP=4 flags parse");
+        let tp4 = options.tp4.expect("the parse selected TP=4");
+        assert_eq!(tp4.rank, 0);
+        assert_eq!(tp4.world_size, 2);
+        assert_eq!(tp4.base_port, TP4_DEFAULT_BASE_PORT);
+        assert_eq!(
+            tp4.control_port,
+            TP4_DEFAULT_BASE_PORT + TP4_CONTROL_PORT_OFFSET
+        );
+        assert_eq!(
+            tp4.peers,
+            vec![
+                "127.0.0.1".parse::<IpAddr>().unwrap(),
+                "127.0.0.2".parse::<IpAddr>().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn tp4_flags_require_checkpoint_and_refuse_synthetic_and_device() {
+        let no_checkpoint = ServeOptions::parse(
+            tp4_args(&[])
+                .into_iter()
+                .filter(|arg| arg != "--checkpoint" && arg != "/tmp/tp4-checkpoint")
+                .collect::<Vec<_>>(),
+        )
+        .expect_err("TP=4 without a checkpoint must be refused");
+        assert!(no_checkpoint.contains("--checkpoint"), "{no_checkpoint}");
+
+        let synthetic = ServeOptions::parse(tp4_args(&["--synthetic"]))
+            .expect_err("TP=4 with the synthetic plan must be refused");
+        assert!(synthetic.contains("--synthetic"), "{synthetic}");
+
+        let device = ServeOptions::parse(tp4_args(&["--engine", "device"]))
+            .expect_err("TP=4 with the device engine must be refused");
+        assert!(device.contains("--engine device"), "{device}");
+    }
+
+    #[test]
+    fn tp4_flags_name_a_missing_rank_or_wrong_peer_count() {
+        let mut no_rank = tp4_args(&[]);
+        let position = no_rank.iter().position(|arg| arg == "--tp4-rank").unwrap();
+        no_rank.drain(position..position + 2);
+        let error = ServeOptions::parse(no_rank).expect_err("the other TP=4 flags need a rank");
+        assert!(error.contains("--tp4-rank"), "{error}");
+
+        let mut wrong_world = tp4_args(&[]);
+        let world_position = wrong_world
+            .iter()
+            .position(|arg| arg == "--tp4-world-size")
+            .unwrap();
+        wrong_world[world_position + 1] = "4".to_owned();
+        let error = ServeOptions::parse(wrong_world)
+            .expect_err("a two-address peer list cannot describe four ranks");
+        assert!(error.contains("--tp4-peers"), "{error}");
+    }
+
+    #[test]
+    fn control_frames_round_trip_on_a_loopback_socket() {
+        let frames = vec![
+            Tp4ControlFrame::Hello { rank: 1 },
+            Tp4ControlFrame::Ready,
+            Tp4ControlFrame::Request {
+                prompt_ids: vec![1, 2, 3],
+                max_tokens: 4,
+            },
+            Tp4ControlFrame::Token { token_id: 7 },
+            Tp4ControlFrame::End,
+            Tp4ControlFrame::Error {
+                code: "engine_gone".to_owned(),
+                message: "rank stopped".to_owned(),
+            },
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let address = listener.local_addr().expect("the listener address");
+        let echoed = frames.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the test client connects");
+            for expected in echoed {
+                let got = read_control_frame(&mut stream).expect("read one frame");
+                assert_eq!(got, expected);
+                write_control_frame(&mut stream, &got).expect("echo one frame");
+            }
+        });
+        let mut client = TcpStream::connect(address).expect("connect to the test server");
+        for frame in &frames {
+            write_control_frame(&mut client, frame).expect("write one frame");
+            let got = read_control_frame(&mut client).expect("read the echo");
+            assert_eq!(&got, frame);
+        }
+        server.join().expect("the test server joins");
+    }
+
+    #[test]
+    fn missing_rank_is_a_typed_startup_timeout() {
+        let error = Tp4ControlHub::start(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            2,
+            Duration::from_millis(80),
+        )
+        .expect_err("a missing rank cannot complete the group");
+        match error {
+            Tp4ControlError::MissingRank {
+                world,
+                joined,
+                waited,
+            } => {
+                assert_eq!(world, 2);
+                assert_eq!(joined, 0);
+                assert_eq!(waited, Duration::from_millis(80));
+            }
+            other => panic!("expected MissingRank, got {other}"),
+        }
+    }
+
+    #[test]
+    fn request_before_ready_is_refused_by_the_worker() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let address = listener.local_addr().expect("the listener address");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("the test hub connects");
+            let mut worker = Tp4ControlWorker {
+                stream,
+                rank: 1,
+                world: 2,
+                ready: false,
+            };
+            assert!(matches!(
+                worker.next_frame(),
+                Err(Tp4ControlError::NotReady { .. })
+            ));
+        });
+        let _client = TcpStream::connect(address).expect("connect to the test worker");
+        server.join().expect("the test worker joins");
+    }
+
+    #[tokio::test]
+    async fn one_request_guard_refuses_a_second_concurrent_request() {
+        let (jobs, mut queued) = tokio::sync::mpsc::channel(TP4_JOB_QUEUE);
+        let driver = Tp4Driver::for_test(jobs, 4);
+        let _first = driver.generate(engine_request(&[1, 2, 3], 2));
+        let second = driver.generate(engine_request(&[1, 2, 3], 2));
+        let events: Vec<EngineEvent> = second.collect().await;
+        assert!(
+            matches!(
+                events.first(),
+                Some(EngineEvent::Error { code, .. }) if code == REFUSED_CODE
+            ),
+            "the second concurrent request must be the existing typed refusal: {events:?}"
+        );
+        let _ = queued.try_recv();
+    }
+
+    #[test]
+    fn tp4_stats_keep_the_reference_shape_and_name_the_fabric() {
+        let timing = RequestTiming::default();
+        let reference = serde_json::to_value(request_stats_with_fabric(3, timing, ""))
+            .expect("the reference stats serialize");
+        let tp4 = serde_json::to_value(request_stats_with_fabric(3, timing, TP4_FABRIC))
+            .expect("the TP=4 stats serialize");
+        assert_eq!(
+            shape(&reference),
+            shape(&tp4),
+            "the stats keys must not drift"
+        );
+        assert_eq!(tp4["transport"]["fabric_mode"], TP4_FABRIC);
+        assert_eq!(reference["transport"]["fabric_mode"], "");
+        assert_eq!(tp4["kv_cache"]["total_prompt_tokens"], 3);
+        assert_eq!(tp4["kv_cache"]["global_kv_cached_tokens"], 0);
     }
 }

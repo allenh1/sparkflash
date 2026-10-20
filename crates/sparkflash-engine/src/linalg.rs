@@ -241,10 +241,13 @@ pub fn matmul(
     }
     let total = batch * rows;
     let multiplies = batch as u128 * rows as u128 * cols as u128;
-    // A matvec with one batch row is mostly a weight read; starting a scoped thread for it costs
-    // more than the arithmetic saves unless the row set is matrix-sized (a vocabulary head). Above
-    // that gate the split is over output rows, so every output keeps its serial reduction order.
-    if multiplies < 4_000_000 || (batch == 1 && rows < 16_384) {
+    // A matvec with fewer than four million products is mostly a weight read; starting a scoped
+    // thread for it costs more than the arithmetic saves. Above that gate the split is over output
+    // rows, so every output keeps its serial reduction order at any row count and batch size. The
+    // former extra "batch one and rows under 16_384" arm was the only reason the 5k-8k-row
+    // attention and expert GEMVs ran serially; the row split is bit-identical, so it is retired.
+    const PARALLEL_MATMUL_MIN_MULTIPLIES: u128 = 4_000_000;
+    if multiplies < PARALLEL_MATMUL_MIN_MULTIPLIES {
         for b in 0..batch {
             let xb = &x[b * cols..b * cols + cols];
             let ob = &mut out[b * rows..b * rows + rows];
@@ -626,6 +629,90 @@ mod tests {
             })
         };
         assert_eq!(bits(&run(1)), bits(&run(4)));
+    }
+
+    /// The ascending-column dot the serial arm has always used, written here so the bitwise
+    /// comparison does not depend on the arm under test.
+    fn serial_matmul_reference(
+        x: &[f32],
+        w: &[f32],
+        rows: usize,
+        cols: usize,
+        batch: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; batch * rows];
+        for b in 0..batch {
+            let xb = &x[b * cols..b * cols + cols];
+            for row in 0..rows {
+                let wr = &w[row * cols..row * cols + cols];
+                let mut acc = 0.0f32;
+                for col in 0..cols {
+                    acc += xb[col] * wr[col];
+                }
+                out[b * rows + row] = acc;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_gate_shapes_keep_the_serial_dot_order_at_one_and_twenty_threads() {
+        // The shapes the retired batch-one/rows-under-16_384 arm used to send down the serial path:
+        // the attention wo_a/wo_b GEMVs, the shared expert and an expert body. Every one is over the
+        // four-million-product gate, so the parallel arm is taken. The comparison is against an
+        // independently written ascending-column loop, not against the other arm, and it is on the
+        // raw f32 bits.
+        for (rows, cols, batch) in [
+            (2_304usize, 5_120usize, 1usize),
+            (5_121, 1_280, 1),
+            (8_192, 4_096, 1),
+        ] {
+            let x: Vec<f32> = (0..batch * cols)
+                .map(|index| ((index as f32) * 0.0017).sin())
+                .collect();
+            let w: Vec<f32> = (0..rows * cols)
+                .map(|index| ((index as f32) * 0.0023).cos())
+                .collect();
+            let want = bits(&serial_matmul_reference(&x, &w, rows, cols, batch));
+            for threads in [1usize, 3, 7, 20] {
+                let got = crate::parallel::with_reference_threads(threads, || {
+                    let mut out = vec![0.0f32; batch * rows];
+                    matmul(&mut out, &x, &w, rows, cols, batch).expect("matmul");
+                    out
+                });
+                assert_eq!(
+                    bits(&got),
+                    want,
+                    "{rows}x{cols} batch {batch} at {threads} threads"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_gate_shapes_are_deterministic_across_repeats_at_twenty_threads() {
+        let rows = 5_120usize;
+        let cols = 2_304usize;
+        let x: Vec<f32> = (0..cols)
+            .map(|index| ((index as f32) * 0.0031).sin())
+            .collect();
+        let w: Vec<f32> = (0..rows * cols)
+            .map(|index| ((index as f32) * 0.0043).cos())
+            .collect();
+        let run = |threads: usize| {
+            crate::parallel::with_reference_threads(threads, || {
+                let mut out = vec![0.0f32; rows];
+                matmul(&mut out, &x, &w, rows, cols, 1).expect("matmul");
+                out
+            })
+        };
+        let serial = bits(&run(1));
+        let first = bits(&run(20));
+        let second = bits(&run(20));
+        let odd = bits(&run(13));
+        assert_eq!(first, serial);
+        assert_eq!(second, serial);
+        assert_eq!(odd, serial);
     }
 
     #[test]

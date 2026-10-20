@@ -17,6 +17,7 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.dirname(HERE)
@@ -115,6 +116,12 @@ class ServeOutputProbeTest(unittest.TestCase):
                 ["--base-url", base_url, "--out-json", out_json, "--out-md", out_md, *extra]
             )
         return code, out_json, out_md, stdout.getvalue(), stderr.getvalue()
+
+    def write_prompts(self, prompts, name="prompts.json"):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(prompts, handle)
+        return path
 
     def buffered_routes(self, text="<|end_of_sentence|>.\n", prompt_tokens=7, completion_tokens=4, cache=None):
         def completions(body, handler):
@@ -299,6 +306,128 @@ class ServeOutputProbeTest(unittest.TestCase):
         self.assertEqual(probe.compute_rates(2.0, 4, 1.0), {"tokens_per_s": 2.0, "decode_tokens_per_s": 4.0})
         self.assertEqual(probe.compute_rates(0.0, 4, None), {"tokens_per_s": 0.0, "decode_tokens_per_s": 0.0})
         self.assertEqual(probe.compute_rates(2.0, 0, None), {"tokens_per_s": 0.0, "decode_tokens_per_s": 0.0})
+
+    def test_tp4_chat_preset_dry_run(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = probe.main(["--dry-run", "--preset", "tp4-chat"])
+        self.assertEqual(code, 0)
+        plan = json.loads(stdout.getvalue())
+        self.assertEqual(plan["preset"], "tp4-chat")
+        self.assertEqual(plan["endpoint"], "chat")
+        self.assertEqual([item["id"] for item in plan["prompts"]], ["capital", "rust-borrower", "haiku"])
+        self.assertEqual([item["max_tokens"] for item in plan["prompts"]], [32, 64, 48])
+
+    def test_chat_buffered_uses_chat_url_and_message_content(self):
+        seen = []
+
+        def chat(body, handler):
+            seen.append((handler.path, json.loads(body)))
+            return 200, {"Content-Type": "application/json"}, json.dumps(
+                {
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "choices": [
+                        {"index": 0, "message": {"role": "assistant", "content": "Paris."}, "finish_reason": "stop"}
+                    ],
+                    "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10},
+                }
+            ).encode()
+
+        server = self.start({"/v1/models": json_route(MODELS), "/v1/chat/completions": chat})
+        prompts = self.write_prompts([{"id": "capital", "prompt": "What is the capital of France?", "max_tokens": 32}])
+        code, out_json, out_md, _, stderr = self.run_probe(
+            server.base_url, "--preset", "tp4-chat", "--prompts", prompts
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(len(seen), 1)
+        path, payload = seen[0]
+        self.assertEqual(path, "/v1/chat/completions")
+        self.assertEqual(payload["messages"], [{"role": "user", "content": "What is the capital of France?"}])
+        self.assertEqual(payload["max_tokens"], 32)
+        self.assertNotIn("prompt", payload)
+        document = json.load(open(out_json, encoding="utf-8"))
+        self.assertEqual(document["endpoint"], "chat")
+        self.assertEqual(document["preset"], "tp4-chat")
+        first = document["results"][0]
+        self.assertEqual(first["text"], "Paris.")
+        self.assertEqual(first["completion_tokens"], 2)
+        self.assertEqual(first["max_tokens"], 32)
+        self.assertIn("endpoint: chat", open(out_md, encoding="utf-8").read())
+
+    def test_chat_stream_ttft_and_delta_content(self):
+        def chat(body, handler):
+            self.requests.append(json.loads(body))
+            chunks = [
+                (0.0, b'data: {"choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n'),
+                (0.05, b'data: {"choices":[{"index":0,"delta":{"content":"Par"}}]}\n\n'),
+                (
+                    0.0,
+                    b'data: {"choices":[{"index":0,"delta":{"content":"is"},"finish_reason":"stop"}]}\n\n',
+                ),
+                (0.0, b'data: {"usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10}}\n\n'),
+                (0.0, b"data: [DONE]\n\n"),
+            ]
+            return 200, {"Content-Type": "text/event-stream"}, chunks
+
+        server = self.start({"/v1/models": json_route(MODELS), "/v1/chat/completions": chat})
+        prompts = self.write_prompts([{"id": "capital", "prompt": "What is the capital of France?", "max_tokens": 32}])
+        code, out_json, _, _, stderr = self.run_probe(
+            server.base_url, "--preset", "tp4-chat", "--prompts", prompts, "--stream"
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(self.requests[0]["messages"][0]["content"], "What is the capital of France?")
+        self.assertTrue(self.requests[0]["stream"])
+        self.assertTrue(self.requests[0]["stream_options"]["include_usage"])
+        first = json.load(open(out_json, encoding="utf-8"))["results"][0]
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["text"], "Paris")
+        self.assertIsNotNone(first["ttft_s"])
+        self.assertGreaterEqual(first["ttft_s"], 0.05)
+        self.assertEqual(first["completion_tokens"], 2)
+        self.assertEqual(first["chunks"], 4)
+        self.assertTrue(first["sse_done"])
+
+    def test_remote_io_samples_over_ssh(self):
+        completed_before = mock.Mock(returncode=0, stdout="rchar: 1000\nread_bytes: 10\n", stderr="")
+        completed_after = mock.Mock(returncode=0, stdout="rchar: 2000\nread_bytes: 30\n", stderr="")
+        server = self.start(self.buffered_routes(completion_tokens=2))
+        prompts = self.write_prompts([{"id": "one", "prompt": "first"}])
+        with mock.patch("serve_output_probe.subprocess.run", side_effect=[completed_before, completed_after]) as run:
+            code, out_json, _, _, stderr = self.run_probe(
+                server.base_url,
+                "--prompts",
+                prompts,
+                "--io-pid",
+                "777",
+                "--io-ssh",
+                "test@node",
+            )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(run.call_count, 2)
+        command = run.call_args_list[0][0][0]
+        self.assertEqual(command[:4], ["ssh", "-n", "-o", "BatchMode=yes"])
+        self.assertEqual(command[4], "test@node")
+        self.assertEqual(command[5:], ["cat", "/proc/777/io"])
+        io = json.load(open(out_json, encoding="utf-8"))["results"][0]["io"]
+        self.assertEqual(io["transport"], "ssh:test@node")
+        self.assertEqual(io["rchar"], 1000)
+        self.assertEqual(io["read_bytes"], 20)
+        self.assertEqual(io["rchar_per_completion_token"], 500.0)
+        self.assertEqual(io["read_bytes_per_completion_token"], 10.0)
+
+    def test_remote_io_ssh_failure_is_recorded(self):
+        failed = mock.Mock(returncode=255, stdout="", stderr="denied")
+        server = self.start(self.buffered_routes())
+        prompts = self.write_prompts([{"id": "one", "prompt": "first"}])
+        with mock.patch("serve_output_probe.subprocess.run", return_value=failed):
+            code, out_json, _, _, _ = self.run_probe(
+                server.base_url, "--prompts", prompts, "--io-pid", "777", "--io-ssh", "test@node"
+            )
+        self.assertEqual(code, 0)
+        io = json.load(open(out_json, encoding="utf-8"))["results"][0]["io"]
+        self.assertEqual(io["transport"], "ssh:test@node")
+        self.assertIn("first /proc", io["error"])
 
     def test_proc_io_parsing_and_sampling(self):
         self.assertEqual(

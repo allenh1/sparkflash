@@ -188,9 +188,12 @@ impl InferenceEngine {
     /// The source answers global names with this rank's local specs: routed-expert
     /// `w1`/`w3` have `moe_inter_dim/world` rows and routed `w2` has
     /// `moe_inter_dim/world` input columns; every other tensor is replicated and keeps its global
-    /// shape. The engine reads each of the plan's tensors once, at construction, into a
-    /// [crate::parallel_tp::ResidentSource], so a per-token forward issues no reads against the
-    /// caller's source.
+    /// shape. The engine reads each of the plan's NON-ENGRAM tensors once, at construction, into a
+    /// [crate::parallel_tp::ResidentSource], so a per-token forward issues no whole-tensor read
+    /// against the caller's source. The two Engram table tensors per Engram layer are left in the
+    /// caller's source and paged per token through [WeightSource::read_ranges]; a source that cannot
+    /// page them falls back to a whole-tensor read under the element limit, which refuses a
+    /// released-size table.
     ///
     /// The one seam is the routed FFN output: after the local expert bodies the engine reduces it
     /// once per layer through `collective`, then adds the replicated shared expert host-f32. With
@@ -212,7 +215,7 @@ impl InferenceEngine {
         config.validate()?;
         let plan = TensorPlan::language_model(&config);
         let runtime = crate::parallel_tp::TpRuntime::new(tp, config.moe_inter_dim, collective)?;
-        let resident = crate::parallel_tp::ResidentSource::load(source.as_ref(), &plan)?;
+        let resident = crate::parallel_tp::ResidentSource::load(source, &plan)?;
         Ok(Self {
             config,
             plan,
@@ -234,6 +237,16 @@ impl InferenceEngine {
     pub fn with_sampling(mut self, sampling: Sampling) -> Self {
         self.sampling = sampling;
         self
+    }
+
+    /// Replaces how the next steps choose tokens without consuming the engine.
+    ///
+    /// [Self::with_sampling] is the builder form for a caller that can move the engine. A driver
+    /// that owns the engine across requests (serve's TP rank) cannot move it out of its own field, so
+    /// it applies one request's [Sampling] here before the request's first [Self::prefill]. The
+    /// resident weights and the TP seam state are untouched; only the sampler changes.
+    pub fn set_sampling(&mut self, sampling: Sampling) {
+        self.sampling = sampling;
     }
 
     /// The configuration this engine runs.

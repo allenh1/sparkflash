@@ -352,6 +352,13 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     {
         return crate::tp4_resident::run(&arg_refs[2..]);
     }
+    // The tp4-host stage is the S5.2 host TWIN and the four-node output run: it opens no driver and
+    // moves weights only through the checkpoint range reader, so a CPU-only build reaches it.
+    if arg_refs.first().copied() == Some("--run-stage")
+        && arg_refs.get(1).copied() == Some("tp4-host")
+    {
+        return crate::tp4_host::run(&arg_refs[2..]);
+    }
     #[cfg(feature = "cuda")]
     if arg_refs.first().copied() == Some("--run-stage") {
         return run_stage(&arg_refs[1..]);

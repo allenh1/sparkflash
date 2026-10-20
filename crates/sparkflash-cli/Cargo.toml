@@ -8,6 +8,11 @@ description = "sparkflash command line interface"
 
 [features]
 default = []
+# The Phase-1 TP=4 serving path: one process per rank, rank 0 owns the HTTP surface and the
+# control channel. Off by default so main and the existing reference server are unchanged until
+# the rank adapter lands; build with --features tp4-serve to compile the serve-side types and
+# their loopback tests.
+tp4-serve = []
 # "cuda" forwards to sparkflash-device's cfg gate for the M2 real session (the dlopen driver and
 # the pinned router cubin). The default binary has no device session path; a cuda build still links
 # no libcuda, and the session is only constructed with --engine device --device-cubin PATH. The M3-a

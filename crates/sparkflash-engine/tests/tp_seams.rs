@@ -7,8 +7,9 @@
 //!   unsharded reference, so inserting the seam changed no value;
 //! * `two-and-four-rank`: with 2 and 4 in-process ranks the logits stay inside the bars declared
 //!   on task-54 (per-seam routed-FFN relative L2 <= 5.0e-3, end-to-end logits <= 2.0e-2);
-//! * `resident`: after `new_tp` returns, a per-token forward issues no read against the caller's
-//!   source (a counting wrapper proves the count stops changing).
+//! * `resident`: after `new_tp` returns, a per-token forward issues no whole-tensor read against
+//!   the caller's source (a counting wrapper proves the count stops changing), while the Engram
+//!   tables stay in the source and are paged per token.
 //!
 //! The collective is an in-process bus (two barriers, one shared payload slot per rank) that
 //! implements the trait's canonical arithmetic exactly: bf16-round each payload, f32-accumulate in
@@ -16,14 +17,15 @@
 //! implements the same trait over TCP in the CLI.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
 use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::dtype::{DType, expert_scale_shape};
-use sparkflash_engine::forward::{InferenceEngine, SequenceState};
+use sparkflash_engine::forward::{InferenceEngine, Sampling, SequenceState};
 use sparkflash_engine::linalg::EngineError;
-use sparkflash_engine::parallel_tp::{TpCollective, TpLayout};
+use sparkflash_engine::parallel_tp::{
+    ResidentPlan, ResidentSource, TpCollective, TpLayout, is_engram_table,
+};
 use sparkflash_engine::quant::bf16_round;
 use sparkflash_engine::tensor::{TensorPlan, TensorSpec};
 use sparkflash_engine::weights::{WeightError, WeightSource};
@@ -53,7 +55,7 @@ fn rel_l2(a: &[f32], b: &[f32]) -> f64 {
 
 fn engine(config: &ModelConfig, seed: u64, limit: usize) -> InferenceEngine {
     let plan = TensorPlan::language_model(config);
-    let source = FiniteSource::from_plan(&plan, seed);
+    let source = EngramF8Source::from_plan(&plan, seed);
     InferenceEngine::new(config.clone(), Box::new(source), limit)
         .expect("the tiny configuration is usable")
 }
@@ -117,9 +119,72 @@ fn local_spec(
     })
 }
 
+/// The tiny fixture stores the Engram tables as f32, but the released checkpoint stores them as
+/// F8E4M3 rows with an E8M0 grid and the paged reader decodes that storage format directly. Serving
+/// the plan's storage dtype keeps both Engram paths - the reference's whole-table read and the
+/// resident source's per-row paging - on the same bytes, so the identity test still compares the
+/// same model.
+struct EngramF8Source {
+    inner: FiniteSource,
+    specs: BTreeMap<String, TensorSpec>,
+}
+
+impl EngramF8Source {
+    fn from_plan(plan: &TensorPlan, seed: u64) -> Self {
+        let inner = FiniteSource::from_plan(plan, seed);
+        let mut specs = BTreeMap::new();
+        for wanted in plan.specs() {
+            let served = if is_engram_table(&wanted.name) {
+                wanted.clone()
+            } else {
+                inner
+                    .spec(&wanted.name)
+                    .expect("the fixture serves its plan")
+            };
+            specs.insert(wanted.name.clone(), served);
+        }
+        Self { inner, specs }
+    }
+}
+
+impl WeightSource for EngramF8Source {
+    fn names(&self) -> Vec<String> {
+        self.specs.keys().cloned().collect()
+    }
+
+    fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
+        match self.specs.get(name) {
+            Some(spec) => Ok(spec.clone()),
+            None => Err(WeightError::Missing {
+                name: name.to_owned(),
+            }),
+        }
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+        if !is_engram_table(name) {
+            return self.inner.read(name);
+        }
+        let spec = self.spec(name)?;
+        let elements = usize::try_from(spec.elements()).expect("a tiny table fits");
+        if spec.dtype == DType::F8E8M0 {
+            // E8M0 exponent 127 is 2^0: an all-ones grid, so the decoded value is the weight alone.
+            return Ok(vec![127u8; elements]);
+        }
+        let f32_bytes = self.inner.read(name)?;
+        let mut out = Vec::with_capacity(elements);
+        for chunk in f32_bytes.as_chunks::<4>().0 {
+            out.push(sparkflash_engine::quant::e4m3_encode(f32::from_le_bytes(
+                *chunk,
+            )));
+        }
+        Ok(out)
+    }
+}
+
 /// Wraps the fixture with this rank's routed-expert slices (global names, local specs).
 struct LocalSource {
-    inner: FiniteSource,
+    inner: EngramF8Source,
     specs: BTreeMap<String, TensorSpec>,
     world: usize,
     rank: usize,
@@ -134,7 +199,7 @@ impl LocalSource {
         rank: usize,
         moe_inter_dim: usize,
     ) -> Self {
-        let inner = FiniteSource::from_plan(plan, seed);
+        let inner = EngramF8Source::from_plan(plan, seed);
         let mut specs = BTreeMap::new();
         for wanted in plan.specs() {
             let served = inner
@@ -250,12 +315,108 @@ impl WeightSource for LocalSource {
         }
         self.inner.read(name)
     }
+
+    fn read_ranges(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Option<Result<Vec<u8>, WeightError>> {
+        // The fixture tables are tiny: materialise the tensor and cut the ranges out of it. A real
+        // source pages them from the file; the resident source's contract is only that it forwards.
+        let bytes = match self.read(name) {
+            Ok(bytes) => bytes,
+            Err(error) => return Some(Err(error)),
+        };
+        let mut out = Vec::with_capacity(ranges.iter().map(|&(_, len)| len).sum());
+        for &(offset, len) in ranges {
+            let start = match usize::try_from(offset) {
+                Ok(start) => start,
+                Err(_) => {
+                    return Some(Err(WeightError::Malformed {
+                        name: name.to_owned(),
+                        detail: format!("range offset {offset} does not fit a usize"),
+                    }));
+                }
+            };
+            match start.checked_add(len).and_then(|end| bytes.get(start..end)) {
+                Some(slice) => out.extend_from_slice(slice),
+                None => {
+                    return Some(Err(WeightError::Malformed {
+                        name: name.to_owned(),
+                        detail: format!(
+                            "range {start}+{len} is past the {} byte tensor",
+                            bytes.len()
+                        ),
+                    }));
+                }
+            }
+        }
+        Some(Ok(out))
+    }
 }
 
-/// A source whose reads are counted, so a test can prove the forward stopped reading it.
+/// Per-name counts of whole-tensor reads and paged range reads.
+#[derive(Default)]
+struct ReadCounts {
+    reads: Mutex<BTreeMap<String, usize>>,
+    ranges: Mutex<BTreeMap<String, usize>>,
+}
+
+impl ReadCounts {
+    fn record(map: &Mutex<BTreeMap<String, usize>>, name: &str) {
+        let mut map = map.lock().expect("the read counter is not poisoned");
+        *map.entry(name.to_owned()).or_default() += 1;
+    }
+
+    fn read(&self, name: &str) {
+        Self::record(&self.reads, name);
+    }
+
+    fn ranged(&self, name: &str) {
+        Self::record(&self.ranges, name);
+    }
+
+    fn reads_of(&self, name: &str) -> usize {
+        self.reads
+            .lock()
+            .expect("the read counter is not poisoned")
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn ranges_of(&self, name: &str) -> usize {
+        self.ranges
+            .lock()
+            .expect("the read counter is not poisoned")
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn total_reads(&self) -> usize {
+        self.reads
+            .lock()
+            .expect("the read counter is not poisoned")
+            .values()
+            .sum()
+    }
+}
+
+/// A plan supplied as a plain name list, the shape the CLI implements for its own sharded plan.
+struct PlanNames(Vec<String>);
+
+impl ResidentPlan for PlanNames {
+    fn resident_plan_names(&self) -> Vec<String> {
+        self.0.clone()
+    }
+}
+
+/// A source whose reads are counted per name, so a test can prove which tensors the forward
+/// stopped reading and which ones it still pages.
 struct CountingSource {
     inner: LocalSource,
-    reads: Arc<AtomicUsize>,
+    counts: Arc<ReadCounts>,
 }
 
 impl WeightSource for CountingSource {
@@ -268,8 +429,22 @@ impl WeightSource for CountingSource {
     }
 
     fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
-        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.counts.read(name);
         self.inner.read(name)
+    }
+
+    fn read_ranges(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Option<Result<Vec<u8>, WeightError>> {
+        match self.inner.read_ranges(name, ranges) {
+            Some(Ok(bytes)) => {
+                self.counts.ranged(name);
+                Some(Ok(bytes))
+            }
+            other => other,
+        }
     }
 }
 
@@ -534,10 +709,10 @@ fn the_resident_source_is_not_read_again_per_token() {
     let config = ModelConfig::tiny();
     let limit = 1 << 22;
     let plan = TensorPlan::language_model(&config);
-    let reads = Arc::new(AtomicUsize::new(0));
+    let counts = Arc::new(ReadCounts::default());
     let source = CountingSource {
         inner: LocalSource::from_plan(&plan, 7, 1, 0, config.moe_inter_dim),
-        reads: Arc::clone(&reads),
+        counts: Arc::clone(&counts),
     };
     let engine = InferenceEngine::new_tp(
         config.clone(),
@@ -554,7 +729,7 @@ fn the_resident_source_is_not_read_again_per_token() {
         }),
     )
     .expect("the fixture supports the layout");
-    let after_load = reads.load(Ordering::SeqCst);
+    let after_load = counts.total_reads();
     assert!(after_load > 0, "new_tp must read the rank's tensors once");
     let mut state = SequenceState::new(&config);
     engine
@@ -564,11 +739,213 @@ fn the_resident_source_is_not_read_again_per_token() {
         .prefill(&mut state, &[11])
         .expect("the resident forward runs again");
     assert_eq!(
-        reads.load(Ordering::SeqCst),
+        counts.total_reads(),
         after_load,
         "the per-token forward read the underlying source again"
     );
     assert!(engine.tp().is_some());
+}
+
+#[test]
+fn the_resident_source_holds_shard_and_replicated_weights_and_pages_engram_tables() {
+    let config = ModelConfig::tiny();
+    let limit = 1 << 22;
+    let plan = TensorPlan::language_model(&config);
+    let paged: Vec<String> = plan
+        .specs()
+        .iter()
+        .filter(|spec| is_engram_table(&spec.name))
+        .map(|spec| spec.name.clone())
+        .collect();
+    assert!(!paged.is_empty(), "the tiny fixture has an Engram layer");
+
+    // Expected accounting from the rank's served (local) specs, computed on a throwaway fixture.
+    let probe = LocalSource::from_plan(&plan, 7, 1, 0, config.moe_inter_dim);
+    let expected_resident_bytes: usize = plan
+        .specs()
+        .iter()
+        .filter(|spec| !is_engram_table(&spec.name))
+        .map(|spec| {
+            probe
+                .spec(&spec.name)
+                .expect("the fixture serves its plan")
+                .storage_bytes() as usize
+        })
+        .sum();
+    let excluded_bytes: usize = plan
+        .specs()
+        .iter()
+        .filter(|spec| is_engram_table(&spec.name))
+        .map(|spec| spec.storage_bytes() as usize)
+        .sum();
+
+    // The engine path: construction reads every non-Engram tensor once, the forward reads none of
+    // them again, and the Engram tables are paged during the forward.
+    let counts = Arc::new(ReadCounts::default());
+    let source = CountingSource {
+        inner: LocalSource::from_plan(&plan, 7, 1, 0, config.moe_inter_dim),
+        counts: Arc::clone(&counts),
+    };
+    let engine = InferenceEngine::new_tp(
+        config.clone(),
+        Box::new(source),
+        limit,
+        TpLayout {
+            rank: 0,
+            world_size: 1,
+        },
+        Box::new(BusCollective {
+            rank: 0,
+            world: 1,
+            bus: Arc::new(Bus::new(1)),
+        }),
+    )
+    .expect("the fixture supports the layout");
+    for spec in plan.specs() {
+        if is_engram_table(&spec.name) {
+            assert_eq!(
+                counts.reads_of(&spec.name),
+                0,
+                "{} was read whole at construction",
+                spec.name
+            );
+        } else {
+            assert_eq!(
+                counts.reads_of(&spec.name),
+                1,
+                "{} was not read exactly once at construction",
+                spec.name
+            );
+        }
+    }
+    let mut state = SequenceState::new(&config);
+    engine
+        .prefill(&mut state, &[3, 7])
+        .expect("the resident forward runs");
+    engine
+        .prefill(&mut state, &[11])
+        .expect("the resident forward runs again");
+    for spec in plan.specs() {
+        if is_engram_table(&spec.name) {
+            assert!(
+                counts.ranges_of(&spec.name) > 0,
+                "{} was never paged by the forward",
+                spec.name
+            );
+            assert_eq!(
+                counts.reads_of(&spec.name),
+                0,
+                "{} was paged but also read whole",
+                spec.name
+            );
+        } else {
+            assert_eq!(
+                counts.reads_of(&spec.name),
+                1,
+                "{} was read again after construction",
+                spec.name
+            );
+        }
+    }
+
+    // The type on its own: the resident map holds the shard and replicated tensors, keeps the
+    // Engram tables out of it, forwards their ranges, and reports the bytes it holds.
+    let direct_counts = Arc::new(ReadCounts::default());
+    let direct_source = CountingSource {
+        inner: LocalSource::from_plan(&plan, 7, 1, 0, config.moe_inter_dim),
+        counts: Arc::clone(&direct_counts),
+    };
+    let resident = ResidentSource::load(Box::new(direct_source), &plan).expect("the fixture loads");
+    assert_eq!(
+        resident.paged_names(),
+        paged.as_slice(),
+        "exactly the Engram tables are paged"
+    );
+    assert_eq!(resident.resident_bytes(), expected_resident_bytes);
+    assert!(resident.is_resident("layers.0.attn_norm.weight"));
+    assert!(!resident.is_resident(&paged[0]));
+    let ranges = [(0u64, 8usize)];
+    let bytes = resident
+        .read_ranges(&paged[0], &ranges)
+        .expect("the Engram table is paged, not resident")
+        .expect("the fixture pages the table");
+    assert_eq!(bytes.len(), 8);
+    assert_eq!(direct_counts.ranges_of(&paged[0]), 1);
+    println!(
+        "measured resident: {} tensors / {} bytes resident, {} paged tensors / {} bytes excluded (engine path saw {} whole-tensor reads at construction)",
+        resident.len(),
+        resident.resident_bytes(),
+        resident.paged_names().len(),
+        excluded_bytes,
+        counts.total_reads(),
+    );
+}
+
+#[test]
+fn set_sampling_applies_a_request_sampler_without_consuming_the_engine() {
+    let config = ModelConfig::tiny();
+    let plan = TensorPlan::language_model(&config);
+    let sampling = Sampling {
+        temperature: 0.7,
+        seed: 11,
+    };
+    let mut tp_engine = InferenceEngine::new_tp(
+        config.clone(),
+        Box::new(LocalSource::from_plan(&plan, 7, 1, 0, config.moe_inter_dim)),
+        1 << 22,
+        TpLayout {
+            rank: 0,
+            world_size: 1,
+        },
+        Box::new(BusCollective {
+            rank: 0,
+            world: 1,
+            bus: Arc::new(Bus::new(1)),
+        }),
+    )
+    .expect("the fixture supports the layout");
+    tp_engine.set_sampling(sampling);
+    assert!(
+        tp_engine.tp().is_some(),
+        "set_sampling must keep the TP seam state"
+    );
+    let reference = engine(&config, 7, 1 << 22).with_sampling(sampling);
+    let mut state = SequenceState::new(&config);
+    let mut reference_state = SequenceState::new(&config);
+    let out = tp_engine
+        .prefill(&mut state, &[3, 7, 11])
+        .expect("the TP engine prefills");
+    let want = reference
+        .prefill(&mut reference_state, &[3, 7, 11])
+        .expect("the reference engine prefills");
+    assert_eq!(out.logits, want.logits);
+    assert_eq!(out.next_token, want.next_token);
+    assert!(
+        out.next_token.is_some(),
+        "a non-greedy sampler picks a token"
+    );
+}
+
+#[test]
+fn a_plan_name_list_drives_the_same_resident_set_as_the_tensor_plan() {
+    let config = ModelConfig::tiny();
+    let plan = TensorPlan::language_model(&config);
+    let names = PlanNames(plan.names().map(str::to_owned).collect());
+    let source = CountingSource {
+        inner: LocalSource::from_plan(&plan, 7, 1, 0, config.moe_inter_dim),
+        counts: Arc::new(ReadCounts::default()),
+    };
+    let resident = ResidentSource::load(Box::new(source), &names).expect("the name list loads");
+    let paged: Vec<String> = plan
+        .specs()
+        .iter()
+        .filter(|spec| is_engram_table(&spec.name))
+        .map(|spec| spec.name.clone())
+        .collect();
+    assert_eq!(resident.paged_names(), paged.as_slice());
+    assert_eq!(resident.len(), plan.specs().len() - paged.len());
+    assert!(resident.resident_bytes() > 0);
+    assert!(resident.is_resident("layers.0.attn_norm.weight"));
 }
 
 #[test]

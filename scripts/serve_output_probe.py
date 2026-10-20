@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """Measure OUTPUT (text, latency, tokens/s) of an OpenAI-compatible serve endpoint.
 
-Task-56: this is the baseline probe for the reference serve on node0
-(127.0.0.1:18000) and the same script/points are used for the TP=4 endpoint (task-55).
+Task-56/58: this is the baseline probe for the reference serve on node0
+(127.0.0.1:18000) and the same script is used for the TP=4 endpoint (task-55/58).
 Requests are sent strictly one at a time: the reference serve is a single-process,
 disk-bound engine, so parallel requests would measure queueing rather than the engine.
 
-Per prompt the probe records the decoded text, finish_reason, prompt/completion token
-counts, wall time and tokens/s; with --stream it also records time-to-first-token, the
-number of SSE chunks and the token counts inferred from chunks when the streamed usage
-block is absent. One JSON document and one markdown table are written per run.
+It speaks both OpenAI surfaces: /v1/completions (choices[].text) and
+/v1/chat/completions (choices[].message.content buffered, choices[].delta.content in SSE).
+The tp4-chat preset carries the three task-58 chat prompts with their per-prompt
+max_tokens; --base-url/--model point it at any OpenAI-compatible rank-0 front without
+code changes. With --stream it records client time-to-first-token (first non-empty text /
+delta content), SSE chunk count and chunk-inferred token counts when usage is absent.
+--io-pid samples /proc/<pid>/io around each request, locally or over --io-ssh HOST, so a
+server on another node yields rchar/read_bytes per completion token. One JSON document and
+one markdown table are written per run.
 
 A slow response is not an error: the per-request timeout is configurable and defaults to
 30 minutes. A timeout, a non-200 or a broken stream is recorded in the JSON and the probe
@@ -21,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -33,13 +39,30 @@ DEFAULT_MODELS_TIMEOUT_S = 30.0
 DEFAULT_TIMEOUT_S = 1800.0
 DEFAULT_MAX_TOKENS = 4
 DEFAULT_TEMPERATURE = 0.0
+DEFAULT_SSH_TIMEOUT_S = 15.0
+DEFAULT_ENDPOINT = "completion"
+ENDPOINTS = ("completion", "chat")
 
 # The approved single-node baseline budget is two short prompts; the same two are the
-# prompts for the TP=4 comparison. Each gets max_tokens 2 (see the task-56 baseline doc).
-DEFAULT_PROMPTS = [
+# prompts for the TP=4 comparison. Each got max_tokens 2 (see the task-56 baseline doc).
+BASELINE_PROMPTS = [
     {"id": "capital-of-france", "prompt": "The capital of France is"},
     {"id": "rust-borrow", "prompt": "In Rust, the borrow checker rejects this code because:"},
 ]
+
+# task-58: the three chat prompts (and the per-prompt max_tokens from the task card).
+TP4_CHAT_PROMPTS = [
+    {"id": "capital", "prompt": "What is the capital of France?", "max_tokens": 32},
+    {"id": "rust-borrower", "prompt": "Explain what a Rust borrow checker does in two sentences.", "max_tokens": 64},
+    {"id": "haiku", "prompt": "Write a haiku about four GPUs on one rack.", "max_tokens": 48},
+]
+
+PRESETS = {
+    "baseline": {"endpoint": "completion", "prompts": BASELINE_PROMPTS},
+    "tp4-chat": {"endpoint": "chat", "prompts": TP4_CHAT_PROMPTS},
+}
+DEFAULT_PRESET = "baseline"
+DEFAULT_PROMPTS = PRESETS[DEFAULT_PRESET]["prompts"]
 
 SERVER_TIMING_FIELDS = ("ttft_ms", "prefill_tok_per_s", "decode_tok_per_s", "min_rank_uma_free_gib")
 
@@ -64,10 +87,26 @@ def parse_proc_io(text: str) -> dict:
     return fields
 
 
-def read_proc_io(pid: int | None) -> dict | None:
-    """Read /proc/<pid>/io on the node; None when unavailable (not Linux, pid gone, no permission)."""
+def _read_proc_io_over_ssh(pid: int, ssh_host: str) -> dict | None:
+    """Read /proc/<pid>/io on another node with one non-interactive ssh call."""
+    command = ["ssh", "-n", "-o", "BatchMode=yes", ssh_host, "cat", f"/proc/{int(pid)}/io"]
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, text=True, timeout=DEFAULT_SSH_TIMEOUT_S, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return parse_proc_io(completed.stdout)
+
+
+def read_proc_io(pid: int | None, ssh_host: str | None = None) -> dict | None:
+    """Read /proc/<pid>/io locally or on ssh_host; None when unavailable/unreadable."""
     if not pid:
         return None
+    if ssh_host:
+        return _read_proc_io_over_ssh(pid, ssh_host)
     try:
         with open(f"/proc/{int(pid)}/io", encoding="utf-8") as handle:
             return parse_proc_io(handle.read())
@@ -75,13 +114,21 @@ def read_proc_io(pid: int | None) -> dict | None:
         return None
 
 
-def _attach_io(result: dict, before: dict | None, pid: int | None) -> dict:
+def _io_transport(ssh_host: str | None) -> str:
+    return f"ssh:{ssh_host}" if ssh_host else "local"
+
+
+def _attach_io(result: dict, before: dict | None, pid: int | None, ssh_host: str | None = None) -> dict:
     """Attach the request's /proc/<pid>/io deltas and their per-completion-token rates."""
-    if not before or not pid:
+    if not pid:
         return result
-    after = read_proc_io(pid)
+    transport = _io_transport(ssh_host)
+    if not before:
+        result["io"] = {"pid": pid, "transport": transport, "error": "first /proc/<pid>/io sample unavailable"}
+        return result
+    after = read_proc_io(pid, ssh_host)
     if not after:
-        result["io"] = {"pid": pid, "error": "could not re-read /proc/<pid>/io"}
+        result["io"] = {"pid": pid, "transport": transport, "error": "could not re-read /proc/<pid>/io"}
         return result
     rchar = max(0, after.get("rchar", 0) - before.get("rchar", 0))
     read_bytes = max(0, after.get("read_bytes", 0) - before.get("read_bytes", 0))
@@ -89,6 +136,7 @@ def _attach_io(result: dict, before: dict | None, pid: int | None) -> dict:
     wall = float(result.get("wall_s") or 0.0)
     result["io"] = {
         "pid": pid,
+        "transport": transport,
         "rchar": rchar,
         "read_bytes": read_bytes,
         "rchar_per_completion_token": round(rchar / tokens, 1) if tokens else None,
@@ -162,7 +210,7 @@ def resolve_model(models_document: dict, requested: str | None) -> str:
 
 
 def load_prompts(path: str | None) -> list[dict]:
-    """Load prompts from a JSON list of strings or {id, prompt} objects."""
+    """Load prompts from a JSON list of strings or {id, prompt, max_tokens} objects."""
     raw = DEFAULT_PROMPTS
     if path:
         with open(path, encoding="utf-8") as handle:
@@ -171,20 +219,33 @@ def load_prompts(path: str | None) -> list[dict]:
         raise ValueError("prompts must be a non-empty JSON list")
     prompts: list[dict] = []
     for index, item in enumerate(raw):
+        max_tokens = None
         if isinstance(item, str):
             prompt = item
             prompt_id = f"prompt-{index}"
         elif isinstance(item, dict):
             prompt = item.get("prompt")
             prompt_id = item.get("id") or f"prompt-{index}"
+            max_tokens = item.get("max_tokens")
         else:
             raise ValueError(f"prompt {index}: expected a string or an object")
         if not isinstance(prompt, str) or not prompt:
             raise ValueError(f"prompt {index}: missing non-empty 'prompt' string")
         if not isinstance(prompt_id, str) or not prompt_id:
             raise ValueError(f"prompt {index}: 'id' must be a non-empty string")
-        prompts.append({"id": prompt_id, "prompt": prompt})
+        if max_tokens is not None and (
+            not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0
+        ):
+            raise ValueError(f"prompt {index}: 'max_tokens' must be a positive integer")
+        prompts.append({"id": prompt_id, "prompt": prompt, "max_tokens": max_tokens})
     return prompts
+
+
+def select_prompts(args: argparse.Namespace) -> list[dict]:
+    """--prompts overrides the preset; otherwise the preset's prompts are copied."""
+    if args.prompts:
+        return load_prompts(args.prompts)
+    return [dict(item) for item in PRESETS[args.preset]["prompts"]]
 
 
 def _server_stats(document: dict) -> dict | None:
@@ -213,12 +274,49 @@ def _fill_usage(result: dict, usage) -> None:
     result["completion_tokens_source"] = "usage"
 
 
+def _max_tokens(item: dict, args: argparse.Namespace) -> int:
+    """Per-prompt max_tokens from the preset/file wins over the CLI default."""
+    return int(item.get("max_tokens") or args.max_tokens)
+
+
+def _completions_url(base_url: str, endpoint: str) -> str:
+    suffix = "/v1/chat/completions" if endpoint == "chat" else "/v1/completions"
+    return base_url.rstrip("/") + suffix
+
+
+def _request_payload(endpoint: str, model: str, item: dict, args: argparse.Namespace, stream: bool = False) -> dict:
+    payload = {
+        "model": model,
+        "temperature": args.temperature,
+        "max_tokens": _max_tokens(item, args),
+    }
+    if endpoint == "chat":
+        payload["messages"] = [{"role": "user", "content": item["prompt"]}]
+    else:
+        payload["prompt"] = item["prompt"]
+    if stream:
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+    return payload
+
+
+def _chat_content(message) -> str:
+    """Text from a chat message/delta; handles string content and multipart content lists."""
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "") for part in content if isinstance(part, dict)
+        )
+    return content or ""
+
+
 def _base_result(index: int, item: dict, args: argparse.Namespace) -> dict:
     return {
         "index": index,
         "id": item["id"],
         "prompt": item["prompt"],
-        "max_tokens": args.max_tokens,
+        "endpoint": getattr(args, "endpoint", DEFAULT_ENDPOINT),
+        "max_tokens": _max_tokens(item, args),
         "temperature": args.temperature,
         "ok": False,
         "http_status": None,
@@ -249,22 +347,22 @@ def _finish_result(result: dict, started: float) -> dict:
 
 def probe_buffered(base_url: str, model: str, item: dict, args: argparse.Namespace) -> dict:
     result = _base_result(item["index"], item, args)
-    payload = {
-        "model": model,
-        "prompt": item["prompt"],
-        "max_tokens": args.max_tokens,
-        "temperature": args.temperature,
-    }
+    endpoint = getattr(args, "endpoint", DEFAULT_ENDPOINT)
+    payload = _request_payload(endpoint, model, item, args)
     started = time.monotonic()
-    io_before = read_proc_io(getattr(args, "io_pid", None))
+    io_ssh = getattr(args, "io_ssh", None)
+    io_before = read_proc_io(getattr(args, "io_pid", None), io_ssh)
     try:
         status, body = _json_request(
-            base_url.rstrip("/") + "/v1/completions", payload, args.timeout
+            _completions_url(base_url, endpoint), payload, args.timeout
         )
         result["http_status"] = status
         document = json.loads(body)
         choice = (document.get("choices") or [{}])[0]
-        result["text"] = choice.get("text") or ""
+        if endpoint == "chat":
+            result["text"] = _chat_content(choice.get("message"))
+        else:
+            result["text"] = choice.get("text") or ""
         result["finish_reason"] = choice.get("finish_reason")
         _fill_usage(result, document.get("usage"))
         result["server_stats"] = _server_stats(document)
@@ -276,7 +374,7 @@ def probe_buffered(base_url: str, model: str, item: dict, args: argparse.Namespa
     except Exception as exc:  # URLError, timeout, JSON decode, malformed body
         result["error"] = describe_error(exc)
     result = _finish_result(result, started)
-    _attach_io(result, io_before, getattr(args, "io_pid", None))
+    _attach_io(result, io_before, getattr(args, "io_pid", None), io_ssh)
     return result
 
 
@@ -285,23 +383,18 @@ def probe_stream(base_url: str, model: str, item: dict, args: argparse.Namespace
     result["chunks"] = 0
     result["bad_chunks"] = 0
     result["sse_done"] = False
-    payload = {
-        "model": model,
-        "prompt": item["prompt"],
-        "max_tokens": args.max_tokens,
-        "temperature": args.temperature,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-    }
+    endpoint = getattr(args, "endpoint", DEFAULT_ENDPOINT)
+    payload = _request_payload(endpoint, model, item, args, stream=True)
     started = time.monotonic()
     parts: list[str] = []
-    io_before = read_proc_io(getattr(args, "io_pid", None))
+    io_ssh = getattr(args, "io_ssh", None)
+    io_before = read_proc_io(getattr(args, "io_pid", None), io_ssh)
     usage = None
     finish_reason = None
     ttft = None
     try:
         request = urllib.request.Request(
-            base_url.rstrip("/") + "/v1/completions",
+            _completions_url(base_url, endpoint),
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
             method="POST",
@@ -331,7 +424,10 @@ def probe_stream(base_url: str, model: str, item: dict, args: argparse.Namespace
                 if _server_timing(chunk) is not None:
                     result["server_timing"] = _server_timing(chunk)
                 for choice in chunk.get("choices") or []:
-                    piece = choice.get("text") or ""
+                    if endpoint == "chat":
+                        piece = _chat_content(choice.get("delta"))
+                    else:
+                        piece = choice.get("text") or ""
                     if piece:
                         if ttft is None:
                             ttft = time.monotonic() - started
@@ -357,7 +453,7 @@ def probe_stream(base_url: str, model: str, item: dict, args: argparse.Namespace
         result["text"] = "".join(parts) or None
         result["error"] = describe_error(exc)
     result = _finish_result(result, started)
-    _attach_io(result, io_before, getattr(args, "io_pid", None))
+    _attach_io(result, io_before, getattr(args, "io_pid", None), io_ssh)
     return result
 
 
@@ -452,24 +548,28 @@ def render_markdown(document: dict) -> str:
         "",
         f"- base URL: {document['base_url']}",
         f"- model: {document['model']}",
+        f"- endpoint: {document.get('endpoint', DEFAULT_ENDPOINT)}",
+        f"- preset: {document.get('preset', '')}",
         f"- stream: {document['stream']}",
-        f"- max_tokens: {document['max_tokens']}",
+        f"- max_tokens: {document['max_tokens']} (per-prompt overrides apply)",
         f"- temperature: {document['temperature']}",
         f"- per-request timeout: {document['request_timeout_s']} s",
+        f"- io sampling: pid={document.get('io_pid')} transport={document.get('io_ssh') or 'local'}",
         "",
-        "| # | id | prompt | completion text | prompt tok | completion tok | wall s | tok/s | TTFT s | finish | KV hit | rchar/tok |",
-        "| --: | :-- | :-- | :-- | --: | --: | --: | --: | --: | :-- | --: | --: |",
+        "| # | id | prompt | completion text | prompt tok | completion tok | max tok | wall s | tok/s | TTFT s | finish | KV hit | rchar/tok |",
+        "| --: | :-- | :-- | :-- | --: | --: | --: | --: | --: | --: | :-- | --: | --: |",
     ]
     for result in document["results"]:
         lines.append(
             "| {index} | {id} | {prompt} | {text} | {prompt_tokens} | {completion_tokens} | "
-            "{wall_s} | {tokens_per_s} | {ttft_s} | {finish} | {kv_hit} | {rchar_tok} |".format(
+            "{max_tokens} | {wall_s} | {tokens_per_s} | {ttft_s} | {finish} | {kv_hit} | {rchar_tok} |".format(
                 index=result["index"],
                 id=_cell(result["id"]),
                 prompt=_cell(result["prompt"]),
                 text=_cell(_raw_text(result)) if result.get("text") is not None else _cell(result.get("error")),
                 prompt_tokens=result.get("prompt_tokens"),
                 completion_tokens=result.get("completion_tokens"),
+                max_tokens=result.get("max_tokens"),
                 wall_s=result["wall_s"],
                 tokens_per_s=result["tokens_per_s"],
                 ttft_s=result.get("ttft_s"),
@@ -553,11 +653,14 @@ def build_document(
         "finished_utc": finished_utc,
         "base_url": args.base_url,
         "model": model,
+        "endpoint": getattr(args, "endpoint", DEFAULT_ENDPOINT),
+        "preset": getattr(args, "preset", DEFAULT_PRESET),
         "stream": bool(args.stream),
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "request_timeout_s": args.timeout,
         "io_pid": getattr(args, "io_pid", None),
+        "io_ssh": getattr(args, "io_ssh", None),
         "tag": args.tag,
         "models": models_document,
         "results": results,
@@ -567,11 +670,23 @@ def build_document(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Measure text, latency and tokens/s on an OpenAI-compatible /v1/completions endpoint.",
+        description="Measure text, latency and tokens/s on an OpenAI-compatible completion or chat endpoint.",
     )
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="serve base URL (default: %(default)s)")
     parser.add_argument("--model", default=None, help="model id; default: first id from /v1/models")
-    parser.add_argument("--prompts", default=None, help="JSON list of strings or {id, prompt} objects")
+    parser.add_argument(
+        "--preset",
+        choices=sorted(PRESETS),
+        default=DEFAULT_PRESET,
+        help="named prompt preset (default: %(default)s); tp4-chat selects the three chat prompts",
+    )
+    parser.add_argument(
+        "--endpoint",
+        choices=ENDPOINTS,
+        default=None,
+        help="completion (/v1/completions) or chat (/v1/chat/completions); default: from the preset",
+    )
+    parser.add_argument("--prompts", default=None, help="JSON list of strings or {id, prompt, max_tokens} objects")
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS, help="completion cap (default: %(default)s)")
     parser.add_argument(
         "--temperature", type=float, default=DEFAULT_TEMPERATURE, help="sampling temperature (default: %(default)s)"
@@ -587,7 +702,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--io-pid",
         type=int,
         default=None,
-        help="serve pid on this host; sample /proc/<pid>/io around each request (Linux node only)",
+        help="serve pid; sample /proc/<pid>/io around each request (Linux node only)",
+    )
+    parser.add_argument(
+        "--io-ssh",
+        default=None,
+        help="ssh target for the io pid (e.g. allenh1@192.0.2.80); samples are read over ssh",
     )
     parser.add_argument("--tag", default="", help="label written into the JSON and markdown")
     parser.add_argument("--out-json", default=None, help="JSON output path (default: serve-output-<utc>.json)")
@@ -598,8 +718,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.endpoint is None:
+        args.endpoint = PRESETS[args.preset]["endpoint"]
     try:
-        prompts = load_prompts(args.prompts)
+        prompts = select_prompts(args)
     except Exception as exc:
         print(f"serve_output_probe: bad prompts: {describe_error(exc)}", file=sys.stderr)
         return 2
@@ -607,10 +729,14 @@ def main(argv: list[str] | None = None) -> int:
         plan = {
             "base_url": args.base_url,
             "model": args.model or "(first id from /v1/models)",
+            "preset": args.preset,
+            "endpoint": args.endpoint,
             "stream": bool(args.stream),
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
             "timeout_s": args.timeout,
+            "io_pid": args.io_pid,
+            "io_ssh": args.io_ssh,
             "prompts": prompts,
         }
         print(json.dumps(plan, ensure_ascii=False, indent=2))

@@ -12,6 +12,7 @@ pub mod logits_dump;
 #[cfg(feature = "cuda")]
 pub mod moe_device;
 pub mod serve;
+pub mod tp4_host;
 pub mod tp4_resident;
 pub mod tp4_smoke;
 
