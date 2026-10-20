@@ -708,6 +708,21 @@ green first, then four GPU nodes opened by the Lead and a cuda-feature build wit
 **S5.5 -- task-37: 4-process serving orchestration.** Depends on S5.2/S5.4, coordinates with
 task-20/21/22. Feeds S7 (task-25) and S8 (task-26).
 
+*Status (host side landed 2026-10-19, task-52; the window is not booked).* The in-process
+orchestration twin behind the loopback device seam is
+`crates/sparkflash-comm/src/oneshot/loopback/orchestrate.rs`: rank 0 is the coordinator, ranks 1-3
+are participants, a readiness handshake precedes every request, the per-request first-token
+collective really runs through the seam's device path, and every served token must agree across the
+four ranks before it is broadcast. Failure injection is a deterministic policy
+(`FailurePolicy`/`RankFate`/`GuardPolicy`), and `crates/sparkflash-comm/tests/oneshot_orchestration_host.rs`
+pins guarded refusal and naive wrong-answer service for a rank that never starts, a rank that dies
+mid-request, a rank that goes silent and a rank that returns a different token, plus repeatability
+and the canonical-token happy path. `tp4-smoke --oneshot-preflight` records it under `orchestration`
+with its `does_not_prove` and unclaimed list (15.8 of rdma-backend.md). The real four-process
+orchestration - startup/readiness timing, transport-level rank death and teardown, watchdog
+deadlines, cross-node first-token/logit agreement, the per-request D40 artifact and serving latency -
+remains the S5.5 window run and is not claimed.
+
 ## 10. What could go wrong
 
 1. **RDMA dataplane first bring-up.** It has never run on real hardware; libibverbs dlopen, memory

@@ -26,8 +26,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use sparkflash_comm::oneshot::loopback::{
-    HostTwinReport, KernelDelay, ReadEpochPolicy, RingTwinConfig, RingTwinReport, run_host_twin,
-    run_host_twin_prefill, run_ring_twin,
+    GuardPolicy, HostTwinReport, KernelDelay, OrchestrationConfig, ReadEpochPolicy, RequestOutcome,
+    RingTwinConfig, RingTwinReport, ServingRequest, canonical_first_token, run_host_twin,
+    run_host_twin_prefill, run_orchestration, run_ring_twin,
 };
 use sparkflash_comm::oneshot::{
     ChunkPlan, Dispatch, DispatchAddresses, DispatchLog, DispatchRecord, Exchange, LaunchPath,
@@ -1287,7 +1288,241 @@ fn validate_oneshot_preflight(args: &SmokeArgs) -> Result<(), String> {
             .map_err(|error| format!("the one-shot sequence is illegal: {error}"))?;
     }
     validate_host_twin(args)?;
+    validate_orchestration()?;
     Ok(())
+}
+
+/// Requests the orchestration evidence uses; the orchestration is request-shaped, not payload-shaped.
+fn orchestration_requests() -> Vec<ServingRequest> {
+    (0..3).map(|id| ServingRequest::new(id, 0x5f)).collect()
+}
+
+/// A config for one orchestration scenario.
+fn orchestration_config(guard: GuardPolicy) -> OrchestrationConfig {
+    OrchestrationConfig {
+        requests: orchestration_requests(),
+        guard,
+        ..OrchestrationConfig::default()
+    }
+}
+
+/// The guarded run must refuse every injected failure, and the same policy with the guard off must
+/// serve a token that is not the canonical one: if it served the right answer anyway, the guard
+/// would be untested and the failure silently survivable.
+fn validate_orchestration() -> Result<(), String> {
+    let expected: Vec<u16> = orchestration_requests()
+        .iter()
+        .map(canonical_first_token)
+        .collect();
+    let happy = run_orchestration(orchestration_config(GuardPolicy::guarded()))
+        .map_err(|error| format!("the orchestration twin failed: {error}"))?;
+    if !happy.all_agreed {
+        return Err(format!(
+            "the orchestration ranks did not agree: {:?}",
+            happy.outcomes
+        ));
+    }
+    for (outcome, token) in happy.outcomes.iter().zip(&expected) {
+        if outcome.served_token() != Some(*token) {
+            return Err(format!(
+                "the orchestration served {:?}, the canonical token is {token}",
+                outcome.served_token()
+            ));
+        }
+    }
+    let mut startup = orchestration_config(GuardPolicy::guarded());
+    startup.failure.startup_failure = Some(2);
+    let refused = run_orchestration(startup)
+        .map_err(|error| format!("the startup-refusal twin failed: {error}"))?;
+    if refused.startup.missing() != [2] {
+        return Err(format!(
+            "the startup refusal named {:?}, expected [2]",
+            refused.startup.missing()
+        ));
+    }
+    let scenarios: [(&str, sparkflash_comm::oneshot::loopback::FailurePolicy); 3] = [
+        ("dead_rank", {
+            let mut failure = sparkflash_comm::oneshot::loopback::FailurePolicy::default();
+            failure
+                .set_fate(
+                    1,
+                    sparkflash_comm::oneshot::loopback::RankFate::Die { at_request: 0 },
+                )
+                .map_err(|error| format!("dead-rank fate: {error}"))?;
+            failure
+        }),
+        ("hung_rank", {
+            let mut failure = sparkflash_comm::oneshot::loopback::FailurePolicy::default();
+            failure
+                .set_fate(
+                    2,
+                    sparkflash_comm::oneshot::loopback::RankFate::Hang { at_request: 0 },
+                )
+                .map_err(|error| format!("hung-rank fate: {error}"))?;
+            failure
+        }),
+        ("disagreement", {
+            let mut failure = sparkflash_comm::oneshot::loopback::FailurePolicy::default();
+            failure
+                .set_fate(
+                    0,
+                    sparkflash_comm::oneshot::loopback::RankFate::CorruptToken {
+                        at_request: 0,
+                        token: 3,
+                    },
+                )
+                .map_err(|error| format!("corrupt-token fate: {error}"))?;
+            failure
+        }),
+    ];
+    for (label, failure) in scenarios {
+        let mut guarded = orchestration_config(GuardPolicy::guarded());
+        guarded.failure = failure.clone();
+        let report = run_orchestration(guarded)
+            .map_err(|error| format!("the {label} guarded twin failed: {error}"))?;
+        if report.outcomes[0].failure().is_none() {
+            return Err(format!(
+                "the {label} failure was served instead of refused: {:?}",
+                report.outcomes[0]
+            ));
+        }
+        let mut naive = orchestration_config(GuardPolicy::naive());
+        naive.failure = failure;
+        let report = run_orchestration(naive)
+            .map_err(|error| format!("the {label} naive twin failed: {error}"))?;
+        let served = report.outcomes[0].served_token().ok_or_else(|| {
+            format!("the {label} naive run refused instead of serving the wrong answer")
+        })?;
+        if served == expected[0] {
+            return Err(format!(
+                "the {label} naive run served the canonical token {served}; the guard would be untested"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The orchestration evidence section: a guarded run, the startup refusal, and each injected failure
+/// with and without its guard. No node number is claimed here.
+fn orchestration_section() -> Value {
+    let expected: Vec<u16> = orchestration_requests()
+        .iter()
+        .map(canonical_first_token)
+        .collect();
+    let happy = run_orchestration(orchestration_config(GuardPolicy::guarded()));
+    let happy_json = match &happy {
+        Ok(report) => json!({
+            "ran": true,
+            "world_size": report.world_size,
+            "requests": report.requests,
+            "startup_ready": !report.startup.refused(),
+            "served_tokens": report.outcomes.iter().map(RequestOutcome::served_token).collect::<Vec<_>>(),
+            "expected_tokens": report.expected_tokens,
+            "first_token_agreement": report.all_agreed,
+            "per_rank_served": report.per_rank_served,
+            "collective_calls": report.collective_calls,
+            "rail0_bytes": report.rail_ledger.rail0_bytes,
+            "rail1_bytes": report.rail_ledger.rail1_bytes,
+            "fan_out_bytes": report.fan_out_bytes,
+            "dispatches": report.dispatches,
+            "host_copy_bytes": report.host_copy_bytes,
+            "device_path_only": report.device_path_only,
+            "host_elapsed_ms": u64::try_from(report.elapsed.as_millis()).unwrap_or(u64::MAX),
+        }),
+        Err(error) => json!({ "ran": false, "error": error.to_string() }),
+    };
+    let mut startup = orchestration_config(GuardPolicy::guarded());
+    startup.failure.startup_failure = Some(2);
+    let startup_json = match run_orchestration(startup) {
+        Ok(report) => json!({
+            "ran": true,
+            "ready": !report.startup.refused(),
+            "missing": report.startup.missing(),
+            "served_requests": report.outcomes.len(),
+            "note": "a missing rank refuses before any request is fanned out",
+        }),
+        Err(error) => json!({ "ran": false, "error": error.to_string() }),
+    };
+    let mut dead_guarded = orchestration_config(GuardPolicy::guarded());
+    dead_guarded
+        .failure
+        .set_fate(
+            1,
+            sparkflash_comm::oneshot::loopback::RankFate::Die { at_request: 0 },
+        )
+        .ok();
+    let mut dead_naive = orchestration_config(GuardPolicy::naive());
+    dead_naive.failure = dead_guarded.failure.clone();
+    let mut hung_guarded = orchestration_config(GuardPolicy::guarded());
+    hung_guarded
+        .failure
+        .set_fate(
+            2,
+            sparkflash_comm::oneshot::loopback::RankFate::Hang { at_request: 0 },
+        )
+        .ok();
+    let mut hung_naive = orchestration_config(GuardPolicy::naive());
+    hung_naive.failure = hung_guarded.failure.clone();
+    let mut split_guarded = orchestration_config(GuardPolicy::guarded());
+    split_guarded
+        .failure
+        .set_fate(
+            0,
+            sparkflash_comm::oneshot::loopback::RankFate::CorruptToken {
+                at_request: 0,
+                token: 3,
+            },
+        )
+        .ok();
+    let mut split_naive = orchestration_config(GuardPolicy::naive());
+    split_naive.failure = split_guarded.failure.clone();
+    let failure_json = |label: &str, guarded: OrchestrationConfig, naive: OrchestrationConfig| {
+        let guarded = run_orchestration(guarded);
+        let naive = run_orchestration(naive);
+        match (&guarded, &naive) {
+            (Ok(guarded), Ok(naive)) => {
+                let refusal = guarded.outcomes.first().and_then(RequestOutcome::failure);
+                let naive_token = naive
+                    .outcomes
+                    .first()
+                    .and_then(RequestOutcome::served_token);
+                json!({
+                    "kind": label,
+                    "guarded_refused": refusal.map(|failure| failure.label()),
+                    "guarded_refused_rank": refusal.and_then(|failure| failure.rank()),
+                    "without_guard_served_token": naive_token,
+                    "canonical_token": expected[0],
+                    "guard_is_load_bearing": naive_token.is_some_and(|token| token != expected[0]),
+                })
+            }
+            _ => json!({ "kind": label, "ran": false }),
+        }
+    };
+    json!({
+        "ran": happy.is_ok(),
+        "happy": happy_json,
+        "startup": startup_json,
+        "failure_handling": [
+            failure_json("dead_rank", dead_guarded, dead_naive),
+            failure_json("hung_rank", hung_guarded, hung_naive),
+            failure_json("disagreement", split_guarded, split_naive),
+        ],
+        "does_not_prove": [
+            "that four processes exist or start in the recorded order",
+            "that a rank death is detected by the transport rather than by in-process status",
+            "that the watchdog deadline is the one a window would use",
+            "that the four nodes agree on a real model's first token",
+        ],
+        "unclaimed_node_measurements": [
+            "real four-process startup and readiness timing",
+            "real mid-request rank-death detection and teardown timing",
+            "real watchdog deadlines for a stalled rank",
+            "first-token and per-position logit agreement across the four-node mesh",
+            "the per-request D40 artifact including timings",
+            "per-request latency and throughput at serving shape",
+        ],
+        "note": "in-process four-rank orchestration behind the loopback seam; the first-token collective really runs, the failure policy is a deterministic knob, and no hardware number is claimed",
+    })
 }
 
 /// Runs the loopback host twin and requires the proofs the device path must keep.
@@ -1620,6 +1855,7 @@ fn oneshot_section(args: &SmokeArgs) -> Value {
         "sequence": { "first": 0, "last": args.repeats.saturating_sub(1) as u64, "repeats": args.repeats },
         "chunked": chunked_section(args),
         "host_twin": host_twin_section(args),
+        "orchestration": orchestration_section(),
         "device_buffer_form": "refused by every host transport (CommError::Unsupported); only a device path with the kernel launcher implements it",
         "proves_host_only": [
             "the comm and kernels ABI pins agree on the slot",
@@ -2522,6 +2758,36 @@ mod tests {
             section["host_twin"]["does_not_prove"][0],
             "that the CUDA kernel, the device-memory MR, the queue pairs or the launcher exist"
         );
+        assert_eq!(section["orchestration"]["ran"], true);
+        assert_eq!(section["orchestration"]["happy"]["ran"], true);
+        assert_eq!(
+            section["orchestration"]["happy"]["first_token_agreement"],
+            true
+        );
+        assert_eq!(
+            section["orchestration"]["happy"]["served_tokens"],
+            json!([9, 9, 9])
+        );
+        assert_eq!(
+            section["orchestration"]["happy"]["expected_tokens"],
+            json!([9, 9, 9])
+        );
+        assert_eq!(section["orchestration"]["happy"]["device_path_only"], true);
+        assert_eq!(section["orchestration"]["startup"]["ready"], false);
+        assert_eq!(section["orchestration"]["startup"]["missing"], json!([2]));
+        for scenario in section["orchestration"]["failure_handling"]
+            .as_array()
+            .expect("failure scenarios")
+        {
+            assert!(
+                scenario["guarded_refused"].as_str().is_some(),
+                "every injected failure must be refused with the guard: {scenario}"
+            );
+            assert_eq!(
+                scenario["guard_is_load_bearing"], true,
+                "without the guard the wrong answer must be served: {scenario}"
+            );
+        }
     }
 
     #[test]

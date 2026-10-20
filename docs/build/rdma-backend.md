@@ -717,3 +717,69 @@ mesh through the real path, the Engram all-gather arm with its warm/cold cache a
 10,000-replay determinism, or the absence of device-side DtoH/HtoD between chunks. Those stay named
 unclaimed in every `RingTwinReport` and in the evidence section, and need S5.3's device-path gate
 green before a window is booked.
+
+### 15.8 The four-rank serving-orchestration host twin (task-52 host portion, 2026-10-19)
+
+S5.5 is the stage where four serving processes must behave as one, and the parts a host can prove
+are the orchestration and the failure handling. `crates/sparkflash-comm/src/oneshot/loopback/orchestrate.rs`
+runs exactly that behind the loopback device seam: rank 0 is the coordinator thread, ranks 1-3 are
+participant threads, all four share one cluster, and the per-request first-token collective really
+goes through the seam's device path - each rank writes its shard logits into a `HostDeviceBuffer`,
+the four ranks call `all_reduce_bf16_device` on their own handle, and the argmax of the canonical
+one-rounding result is the rank's vote. The coordinator fans a request out, waits for every rank's
+shard, drives the collective, requires every vote to be the same token, and broadcasts the served
+token id before the next request.
+
+Failure injection is a policy knob, never a race. `FailurePolicy` names the rank that never starts
+and one `RankFate` per rank - `Alive`, `Die { at_request }`, `Hang { at_request }` or
+`CorruptToken { at_request, token }` - so a run is a pure function of its configuration and repeats
+exactly. `GuardPolicy::guarded()` requires the readiness handshake, treats a dead or silent rank as a
+typed failure and requires first-token agreement; `GuardPolicy::naive()` switches those checks off
+and is the deliberate control the tests run beside every guarded case. The synthetic shard logits are
+fixed (rank 0 prefers slot 5, ranks 1-3 together prefer slot 9), so the canonical token is 9 while a
+coordinator that trusts only rank 0 - or only the ranks that happened to answer - serves 5 or 3.
+That is the wrong answer the guard exists to prevent, and it is made observable by arithmetic rather
+than by timing.
+
+`crates/sparkflash-comm/tests/oneshot_orchestration_host.rs` pins the six properties S5.5 needs on
+the host:
+
+- **Readiness first.** With one rank never starting, the run refuses before any request is fanned
+  out, names exactly the missing rank, and records no collective and no fan-out bytes.
+- **Canonical agreement.** Three requests, all four ranks ready, every served token equals
+  `canonical_first_token`, every rank recorded every broadcast, three first-token collectives ran,
+  12 dispatch records exist (one per rank per collective), all on the device path with zero
+  host-staging bytes, and both rails moved bytes.
+- **A dead rank is a typed failure.** A guarded run reports `DeadRank { rank: 1 }` for the request and
+  every later request; the naive run beside it serves the rank-0 shard token 5, which differs from
+  the canonical 9.
+- **A silent rank is a typed failure.** Same shape with `HungRank { rank: 2 }`, again with the naive
+  run serving the wrong token. The silence is a deterministic policy event, not a watchdog race; the
+  report names the real watchdog deadline as unclaimed.
+- **A split vote is refused.** A rank-0 `CorruptToken(3)` makes the guarded run report
+  `Disagreement { tokens: [3, 9, 9, 9] }`, while the naive run serves 3 - also not the canonical
+  token.
+- **The same policy gives the same evidence twice.** Outcomes and per-rank broadcast records are
+  identical across two runs of the same failure policy.
+
+One ordering rule in the engine is worth naming because the tests caught it as an intermittent hang:
+the next request's epoch and its per-request flag reset must be published in one lock acquisition. If
+the coordinator advanced the epoch at the end of the previous request and reset the logit flags at
+the start of the next, a rank that woke on the new epoch could write its logit flag before the reset
+cleared it - the coordinator would then wait for a flag that had already been written and cleared.
+The twin now publishes both together, and a 30-replay stress run of the six tests is clean.
+
+`sparkflash device-chain --run-stage tp4-smoke --oneshot-preflight` records this under
+`orchestration`: the guarded run's served and expected tokens, agreement, per-rank broadcast records,
+collective/dispatch counts, rail bytes and host time; the startup refusal; and, for each injected
+failure, the guarded refusal label beside the token the naive policy served and a
+`guard_is_load_bearing` flag. The preflight fails if any guarded scenario is served or any naive
+scenario happens to serve the canonical token, so a guard that stopped guarding cannot pass quietly.
+The section lists its own `does_not_prove` and `unclaimed_node_measurements`.
+
+**What this still does not do.** There are no four processes, so it proves no startup ordering, no
+launch failure and no readiness timing. A dead or silent rank is an in-process status, so it proves
+nothing about transport-level death detection, teardown timing or the real watchdog deadline. The
+four nodes do not share a model's logits here, so first-token agreement on the real mesh, the
+per-request D40 artifact and per-request latency/throughput all stay unclaimed until a window run
+(and S5.3's device-path gate) claims them. No number from this section is a hardware measurement.

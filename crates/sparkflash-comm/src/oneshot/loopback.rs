@@ -62,6 +62,14 @@ pub use ring::{
     RingPlan, RingTwinConfig, RingTwinReport, run_ring_twin, run_ring_twin_with_payloads,
 };
 
+mod orchestrate;
+
+pub use orchestrate::{
+    FailureKind, FailurePolicy, GuardPolicy, OrchestrationConfig, OrchestrationReport, RankFate,
+    RequestOutcome, ServingRequest, StartupStatus, canonical_first_token, run_orchestration,
+    shard_first_token,
+};
+
 /// Ring slots the twin allocates per rank by default: the double buffer the seam design names.
 pub const HOST_TWIN_RING: usize = 2;
 
