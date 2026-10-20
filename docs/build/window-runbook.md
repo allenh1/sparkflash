@@ -119,6 +119,7 @@ import json, os
 dump = "<run>/logits-130x8.jsonl"
 rows = [json.loads(line) for line in open(dump) if line.strip()]
 assert [row["position"] for row in rows] == list(range(129, 138)), [row["position"] for row in rows]
+assert all(int(row["vocab"]) == 129280 for row in rows), {row["position"]: row["vocab"] for row in rows}
 assert os.path.basename(rows[0]["logits_bin"]) == os.path.basename(dump) + ".bin"
 assert all(int(row["logits_offset"]) == sum(int(prev["vocab"]) * 4 for prev in rows[:i])
            for i, row in enumerate(rows))
@@ -127,8 +128,10 @@ print("dump/sidecar pair consistent:", len(rows), "positions")
 EOF
 ```
 
-A dump whose rows name another sidecar, whose sidecar is the wrong length, or whose offsets do not
-tile is refused by the comparison (exit 2, nothing written) instead of being compared silently.
+A dump whose rows name another sidecar, whose sidecar is the wrong length, whose offsets do not
+tile, or whose vocab is not 129,280 is refused by the comparison (exit 2, nothing written) instead of
+being compared silently. The comparison command passes `--expect-vocab 129280` so the vocab check is
+enforced in the gate run, not only in this pre-flight.
 
 ### 2. Oracle (after the released recipe answers /v1/models)
 
@@ -136,7 +139,7 @@ tile is refused by the comparison (exit 2, nothing written) instead of being com
 python3 scripts/oracle_native.py \
   --suite scripts/oracle_prompt_suite.json \
   --fixture /home/user/phase2-evidence/sequence-130-released.json \
-  --out /home/user/phase2-evidence/window-2026-10-18/native-oracle-130.json \
+  --out /home/user/phase2-evidence/window-2026-10-18/native-oracle-130x8.json \
   --wait-seconds 2700
 ```
 
@@ -169,32 +172,42 @@ python3 scripts/oracle_native.py \
 
 ```sh
 python3 scripts/compare_native_vs_vllm.py \
-  --dump /home/user/phase2-evidence/window-2026-10-18/runs69/logits-130x0.jsonl \
-  --oracle /home/user/phase2-evidence/window-2026-10-18/native-oracle-130.json \
+  --dump /home/user/phase2-evidence/window-2026-10-18/runs70-accept/logits-130x8.jsonl \
+  --oracle /home/user/phase2-evidence/window-2026-10-18/native-oracle-130x8.json \
   --oracle-prompt b69-fixture-130 \
-  --out-json /home/user/phase2-evidence/window-2026-10-18/compare-native-vs-vllm.json \
-  --out-md /home/user/phase2-evidence/window-2026-10-18/compare-native-vs-vllm.md
+  --positions 129,130,131,132,133,134,135,136,137 \
+  --expect-vocab 129280 \
+  --out-json /home/user/phase2-evidence/window-2026-10-18/runs70-accept/compare-native-vs-vllm.json \
+  --out-md /home/user/phase2-evidence/window-2026-10-18/runs70-accept/compare-native-vs-vllm.md
 ```
 
-It joins on position (default: the intersection of dump and oracle positions) and reports per position
-and in aggregate: top-1 agreement, top-5/20/100/1000 overlap, max/mean |logprob delta| over the oracle's
-ids, KL(oracle || device) and JS of the renormalised top-k, the oracle top-k retained mass, and a
-`prefix_match` flag (device reference token vs oracle continuation token - a mismatch means the two
-distributions are conditioned on different prefixes and the row is not like-for-like). It never compares
-token identity (D39 rule 2). Add `--bars <D40 file>` to gate; without it the verdict is `UNBARED`
-(measured evidence, no verdict). Exit codes: 0 pass/unbared, 1 a declared bar failed, 2 bad input.
+It joins on position (without `--positions`: the intersection of dump and oracle positions; the gate
+command pins the list below) and reports per position and in aggregate: top-1 agreement,
+top-5/20/100/1000 overlap, max/mean |logprob delta| over the oracle's ids, KL(oracle || device) and JS
+of the renormalised top-k, the oracle top-k retained mass, and a `prefix_match` flag (device reference
+token vs oracle continuation token - a mismatch means the two distributions are conditioned on
+different prefixes and the row is not like-for-like). It never compares token identity (D39 rule 2).
+Add `--bars <D41 gate file>` to gate; without it the verdict is `UNBARED` (measured evidence, no
+verdict). Exit codes: 0 `PASS` or `UNBARED`, 1 `FAIL` or `NOT_LIKE_FOR_LIKE`, 2 bad input (including a
+bars file that is not a D41 gate file).
 
-Two shape rules matter more than the flags:
+Shape rules that matter more than the flags:
 
-* `--positions 129,130,131,132,133,134,135,136,137` is pinned, not optional. A prefill-only dump has
-  130 positions (0..129); compared against the continuation oracle it would give 130 positions, pass
+* `--positions 129,130,131,132,133,134,135,136,137` is pinned, not optional, and every requested
+  position must exist in BOTH the dump and the oracle - a missing or duplicate position is refused
+  (exit 2, nothing written), never silently dropped by intersection. A prefill-only dump has 130
+  positions (0..129); compared against the continuation oracle it would give 130 positions, pass
   `positions_min` trivially, and score mostly rows whose reference token is not the oracle's
   teacher-forced target (the sanity-prefix path, see logits-dump.md). The D40 shape is the 9-position
   full 130 + 8 claim.
+* `--expect-vocab 129280` is passed by the gate command. Without it a self-consistent dump with the
+  wrong vocab would be compared against the 129,280-vocab oracle and only the oracle id range would
+  notice; any row disagreeing is refused (exit 2).
 * `prefix_match` is tri-state. `UNKNOWN` means the dump could not prove like-for-like (no usable
   `reference_id`, or the oracle has no `target_token`); it is counted in `prefix_mismatches`, so a
-  dump that cannot prove its prefix is not silently scored. A run with any UNKNOWN/MISMATCH row is not
-  like-for-like whatever the bars say; record the count even when the run is UNBARED.
+  dump that cannot prove its prefix is not silently scored. Any UNKNOWN/MISMATCH row forces verdict
+  `NOT_LIKE_FOR_LIKE` and exit 1 even when a gate file's bars pass and even when there is no gate file;
+  the evidence file is still written with the `prefix_mismatches`/`prefix_unknown` counts.
 * **Footgun:** `--reference-check` returns immediately after the reference pass
   (`device_chain.rs`, the `if sequence && args.reference_check` early return) and writes **no dump**.
   It is a reference-only diagnostic, never the dump run; using it in a window wastes the window.
@@ -215,7 +228,13 @@ The comparison evaluates these names and refuses any other, so a typo cannot sil
 `positions_min`, `top1_agreement_min`, `top5_overlap_mean_min`, `top20_overlap_mean_min`,
 `top100_overlap_mean_min`, `top1000_overlap_mean_min`, `max_abs_delta_max`, `mean_abs_delta_max`,
 `kl_mean_max`, `kl_p95_max`, `js_mean_max`. Values are floors (`_min`) or ceilings (`_max`) over the
-aggregate object; a bar file is `{"bars": {"top1_agreement_min": 1.0, "max_abs_delta_max": 0.5, ...}}`.
+aggregate object.
+
+A `--bars` file must be a D41 gate file: `{"schema": "sparkflash-d41-bars/1", "status": "ok",
+"bar_class": "idle_distractor", "bars": {"top1_agreement_min": 1.0, ...}}`. Strictness is the
+default, there is no permissive flag: a plain `{"bars": {...}}` file (demo-scale synthetic bars,
+hand-copied provisional numbers), a `status: "requires_review"` floor file, or a busy-derived bar file
+is refused (exit 2) with no evidence file, so none of them can gate silently.
 
 ### 4. B70 acceptance window (PRE-FIX DIAGNOSTIC, tip-agnostic)
 
@@ -266,8 +285,11 @@ The run must print `reference vs fixture: positions=9 all_equal=true`; if it doe
 Then run the dump/sidecar assertion from section 1, the oracle step with a fresh
 `--only b69-fixture-130 --fixture …` request (or the `efce16c2…` suite oracle reused only after its
 sha256 **and** served root are re-verified in this window and the reuse is recorded verbatim), and
-the comparison with `--oracle-prompt b69-fixture-130` and the pinned `--positions`. A pre-fix token table
-showing 0/9 `reference_id == hybrid_id` is expected here and is not a comparison failure.
+the comparison with `--oracle-prompt b69-fixture-130`, the pinned
+`--positions 129,130,131,132,133,134,135,136,137` and `--expect-vocab 129280`. A pre-fix token table
+showing 0/9 `reference_id == hybrid_id` is expected here and is not a comparison failure. If any row's
+prefix cannot be proven (UNKNOWN/MISMATCH), the comparison still writes the evidence and exits 1 with
+verdict `NOT_LIKE_FOR_LIKE`; that is a prefix problem to investigate, not a bars failure.
 
 Artefact slots (fill at run time; never invent a sha):
 
@@ -305,9 +327,12 @@ python3 scripts/d41_floors.py --capture "$CAPTURE" \
 
 The plan carries the three required classes (`repeat`, `idle_distractor`, `busy_distractor`); the floor
 run refuses without them and exits 3 on `requires_review`, in which case the bars file is written but
-must be reviewed before it gates. `d41-bars.json` is a `sparkflash-d41-bars/1` file whose plain `bars`
-object `compare_native_vs_vllm.py --bars` consumes directly. Until that file exists the comparison is
-deliberately UNBARED: `demo-scale/bars.json` and hand-copied provisional numbers are not gates.
+must be reviewed and re-recorded before it gates. `d41-bars.json` is a `sparkflash-d41-bars/1` file
+whose plain `bars` object `compare_native_vs_vllm.py --bars` consumes directly - and the consumer now
+enforces that shape: `demo-scale/bars.json`, hand-copied provisional numbers and a `requires_review`
+floor file are refused with exit 2, not accepted as gates. Until a `status: "ok"` D41 bars file exists
+the comparison is deliberately UNBARED; a `requires_review` floor must be investigated and re-recorded
+with status `ok` before it can gate.
 
 ### Unit tests
 
@@ -317,7 +342,8 @@ python3 -m unittest discover -s scripts/tests -v
 
 The host-only suite (no server, no GPU) covers log-softmax stability, top-k/overlap, KL/JS, dump and
 oracle JSON parsing (including the dump/sidecar self-consistency checks), position/prefix mapping - a
-missing `reference_id` is UNKNOWN, not a match - bar evaluation, and an end-to-end synthetic comparison.
+missing `reference_id` is UNKNOWN, not a match - bar evaluation, the D41 gate-file shape,
+`--expect-vocab`, pinned positions, the NOT_LIKE_FOR_LIKE verdict, and an end-to-end synthetic comparison.
 
 ## Host-side staging: the window is now copy + run (2026-10-19)
 

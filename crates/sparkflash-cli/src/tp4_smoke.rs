@@ -25,7 +25,10 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use sparkflash_comm::oneshot::loopback::{HostTwinReport, run_host_twin, run_host_twin_prefill};
+use sparkflash_comm::oneshot::loopback::{
+    HostTwinReport, KernelDelay, ReadEpochPolicy, RingTwinConfig, RingTwinReport, run_host_twin,
+    run_host_twin_prefill, run_ring_twin,
+};
 use sparkflash_comm::oneshot::{
     ChunkPlan, Dispatch, DispatchAddresses, DispatchLog, DispatchRecord, Exchange, LaunchPath,
     ONESHOT_ARRIVAL_BYTES, ONESHOT_KERNEL_NAME, ONESHOT_RAILS, ONESHOT_RANKS, ONESHOT_ROW_BYTES,
@@ -59,6 +62,12 @@ pub const HOST_TWIN_SEQUENCES: usize = 8;
 /// payload four times on one host. The CPU twin reduces every element in software, so the clamp
 /// also keeps the preflight cheap; the ring shape itself is proven by the comm tests.
 pub const HOST_TWIN_CHUNKED_MAX_ELEMENTS: usize = ONESHOT_ROW_ELEMENTS + 1024;
+
+/// Payload the prefill ring twin runs in the preflight: above the 2 MiB one-shot row, two chunks.
+pub const HOST_TWIN_RING_ELEMENTS: usize = ONESHOT_ROW_ELEMENTS + 1024;
+
+/// Payload for the hazard demonstration: three chunks, so the third reuses the first chunk's slot.
+pub const HOST_TWIN_RING_HAZARD_ELEMENTS: usize = ONESHOT_ROW_ELEMENTS * 2 + 1024;
 
 /// The default frame deadline: 5 s, the TCP transport's own default.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1291,6 +1300,30 @@ fn validate_host_twin(args: &SmokeArgs) -> Result<(), String> {
     let report = run_host_twin(elements, HOST_TWIN_SEQUENCES, ONESHOT_RAILS)
         .map_err(|error| format!("the loopback host twin failed: {error}"))?;
     check_host_twin(&report, "one-shot")?;
+    if args.prefill_plan_elements.is_some() {
+        let ring = run_ring_twin(HOST_TWIN_RING_ELEMENTS, RingTwinConfig::default())
+            .map_err(|error| format!("the ring loopback host twin failed: {error}"))?;
+        check_ring_twin(&ring, "ring")?;
+        let hazard = run_ring_twin(
+            HOST_TWIN_RING_HAZARD_ELEMENTS,
+            RingTwinConfig {
+                kernel_delay: Some(KernelDelay {
+                    rank: 0,
+                    chunk: 0,
+                    duration: Duration::from_millis(1),
+                }),
+                read_epoch_policy: ReadEpochPolicy::Ignore,
+                ..RingTwinConfig::default()
+            },
+        )
+        .map_err(|error| format!("the ring hazard demonstration failed: {error}"))?;
+        if hazard.bit_identical {
+            return Err(
+                "ignoring the ring read-done epoch did not corrupt the delayed rank; the reuse hazard is not actually guarded"
+                    .to_string(),
+            );
+        }
+    }
     if let Some(planned) = args.prefill_plan_elements {
         let total = planned.min(HOST_TWIN_CHUNKED_MAX_ELEMENTS);
         if total > ONESHOT_ROW_ELEMENTS {
@@ -1298,6 +1331,36 @@ fn validate_host_twin(args: &SmokeArgs) -> Result<(), String> {
                 .map_err(|error| format!("the chunked loopback host twin failed: {error}"))?;
             check_host_twin(&report, "chunked")?;
         }
+    }
+    Ok(())
+}
+
+/// The invariants a ring host-twin run must satisfy: canonical arithmetic, zero host staging, the
+/// device path on every record and one dispatch per rank per chunk.
+fn check_ring_twin(report: &RingTwinReport, form: &str) -> Result<(), String> {
+    if !report.bit_identical {
+        return Err(format!(
+            "the {form} host twin diverged from the canonical one-rounding CPU twin on{:?}",
+            report.mismatched_ranks
+        ));
+    }
+    if report.host_copy_bytes != 0 {
+        return Err(format!(
+            "the {form} host twin recorded {} host-staging bytes; the device path must stage nothing",
+            report.host_copy_bytes
+        ));
+    }
+    if !report.device_path_only {
+        return Err(format!(
+            "the {form} host twin recorded a non-device dispatch"
+        ));
+    }
+    let expected = ONESHOT_RANKS * report.chunks;
+    if report.dispatched != expected {
+        return Err(format!(
+            "the {form} host twin recorded {} dispatches, expected {expected}",
+            report.dispatched
+        ));
     }
     Ok(())
 }
@@ -1399,10 +1462,60 @@ fn host_twin_section(args: &SmokeArgs) -> Value {
             "note": "pass --prefill-plan-elements with --oneshot-preflight to run the chunked twin",
         }),
     };
+    let ring = if args.prefill_plan_elements.is_some() {
+        let honest = run_ring_twin(HOST_TWIN_RING_ELEMENTS, RingTwinConfig::default());
+        let hazard = run_ring_twin(
+            HOST_TWIN_RING_HAZARD_ELEMENTS,
+            RingTwinConfig {
+                kernel_delay: Some(KernelDelay {
+                    rank: 0,
+                    chunk: 0,
+                    duration: Duration::from_millis(1),
+                }),
+                read_epoch_policy: ReadEpochPolicy::Ignore,
+                ..RingTwinConfig::default()
+            },
+        );
+        json!({
+            "ran": honest.is_ok(),
+            "elements": HOST_TWIN_RING_ELEMENTS,
+            "bytes": HOST_TWIN_RING_ELEMENTS * 2,
+            "oneshot_row_bytes": ONESHOT_ROW_BYTES,
+            "chunks": honest.as_ref().map_or(0, |report| report.chunks),
+            "chunk_elements": honest.as_ref().map_or_else(|_| Vec::new(), |report| report.chunk_elements.clone()),
+            "ring": honest.as_ref().map_or(0, |report| report.ring),
+            "bit_identical_to_canonical_twin": honest.as_ref().is_ok_and(|report| report.bit_identical),
+            "host_copy_bytes": honest.as_ref().map_or(0, |report| report.host_copy_bytes),
+            "device_path_only": honest.as_ref().is_ok_and(|report| report.device_path_only),
+            "dispatches": honest.as_ref().map_or(0, |report| report.dispatched),
+            "max_rank_in_flight": honest.as_ref().map_or(0, |report| report.max_rank_in_flight),
+            "host_elapsed_ms": honest.as_ref().map_or(0, |report| u64::try_from(report.elapsed.as_millis()).unwrap_or(u64::MAX)),
+            "unclaimed_node_measurements": honest.as_ref().map_or_else(|_| Vec::new(), |report| report.unclaimed.clone()),
+            "hazard": match &hazard {
+                Ok(report) => json!({
+                    "ran": true,
+                    "demonstrated": !report.bit_identical,
+                    "bit_identical_to_canonical_twin": report.bit_identical,
+                    "mismatched_ranks": report.mismatched_ranks,
+                    "elements": report.total_elements,
+                    "chunks": report.chunks,
+                    "note": "the proxy reuses chunk 0's slot for chunk 2 before rank 0's kernel reads it, with the read-done epoch deliberately ignored; the corrupted output shows why the epoch wait is load-bearing",
+                }),
+                Err(error) => json!({ "ran": false, "error": error.to_string() }),
+            },
+            "note": "in-process overlapped ring: a proxy thread stages ahead of the kernel thread; no device memory, MR, QP, kernel or hardware number",
+        })
+    } else {
+        json!({
+            "ran": false,
+            "note": "pass --prefill-plan-elements with --oneshot-preflight to run the overlapped ring twin",
+        })
+    };
     json!({
         "ran": oneshot["ran"].as_bool().unwrap_or(false),
         "oneshot": oneshot,
         "chunked": chunked,
+        "ring": ring,
         "does_not_prove": [
             "that the CUDA kernel, the device-memory MR, the queue pairs or the launcher exist",
             "any latency, bandwidth, correctness-across-the-mesh or determinism number",
@@ -1517,14 +1630,17 @@ fn oneshot_section(args: &SmokeArgs) -> Value {
             "the reduction the device path must produce equals the canonical one-rounding twin bit for bit (tests/device_seam.rs)",
             "the loopback device transport runs four-rank one-shot exchanges behind the same seam and matches the canonical twin bit for bit, in either arrival order (tests/oneshot_host.rs)",
             "every dispatch record takes the device path and records zero host-staging bytes",
-            "the two-deep slot ring and the chunked reuse order are pinned by the host twin, not assumed"
+            "the two-deep slot ring and the chunked reuse order are pinned by the host twin, not assumed",
+            "the overlapped prefill ring twin keeps a payload above the one-shot row bit-identical at chunk boundaries, with a proxy staging ahead of the kernel",
+            "the ring's read-done epoch is load-bearing: a run that ignores it and reuses a slot early is shown to corrupt the delayed rank"
         ],
         "does_not_prove": [
             "that the CUDA kernel runs or that the slot is reachable from it",
             "that the pinned-host alias or the device-memory MR registers",
             "that the QP posting and the proxy's completions agree with the NIC",
             "any latency, bandwidth or determinism number",
-            "that any number in the host_twin section is a node measurement"
+            "that any number in the host_twin section is a node measurement",
+            "any prefill latency, per-rail bandwidth, engram-gather disk latency, mesh correctness or determinism number"
         ],
         "window_measurement": {
             "gate": "S5.3 one-shot device-buffer all-reduce at decode size (QUALIFICATION 3.1)",
@@ -2369,6 +2485,33 @@ mod tests {
         assert_eq!(
             section["host_twin"]["chunked"]["bit_identical_to_canonical_twin"],
             true
+        );
+        assert_eq!(section["host_twin"]["ring"]["ran"], true);
+        assert_eq!(
+            section["host_twin"]["ring"]["elements"],
+            HOST_TWIN_RING_ELEMENTS
+        );
+        assert_eq!(section["host_twin"]["ring"]["chunks"], 2);
+        assert_eq!(section["host_twin"]["ring"]["ring"], 2);
+        assert_eq!(
+            section["host_twin"]["ring"]["bit_identical_to_canonical_twin"],
+            true
+        );
+        assert_eq!(section["host_twin"]["ring"]["host_copy_bytes"], 0);
+        assert_eq!(section["host_twin"]["ring"]["device_path_only"], true);
+        assert!(
+            section["host_twin"]["ring"]["max_rank_in_flight"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 2,
+            "the evidence run must show two chunks in flight"
+        );
+        assert_eq!(section["host_twin"]["ring"]["hazard"]["ran"], true);
+        assert_eq!(section["host_twin"]["ring"]["hazard"]["demonstrated"], true);
+        assert!(
+            section["host_twin"]["ring"]["hazard"]["mismatched_ranks"]
+                .as_array()
+                .is_some_and(|ranks| ranks.iter().any(|rank| rank == 0))
         );
         assert!(
             section["host_twin"]["unclaimed_node_measurements"]

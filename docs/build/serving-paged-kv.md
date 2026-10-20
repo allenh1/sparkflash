@@ -142,6 +142,24 @@ not this milestone:
   every launch site, the harness params mapping, the baseline pin), so it is a decision-record-level
   change with its own reviewed pin, not a task-21/43 follow-on. The argument for it must be made
   against a measured throughput number.
+* **Task-49 design (not implemented, not pinned):** docs/build/paged-read-attention-kernel-design.md
+  is the paged-read follow-on. It reads the format-2 pool directly through a device block table:
+  logical page -> physical page -> interleaved 356-byte entry, absolute position derived from page
+  index and offset, so Path A's 20th positions argument is unnecessary. Replacing kv_fp4, kv_scales
+  and index_key with the main source array, the indexer K source array, the block table and the
+  compression ratio is a **20-word new entry** (same word count as Path A, but additive: the frozen
+  19-word entry is not mutated), while Path A's positions argument only caps staging at O(selected)
+  and saves 0 B below C = 514 tokens. The design also records the byte arithmetic: at C = 137 the
+  step stages 7,055,488 B, of which 157,824 B is main KV (2.2%), 4,194,304 B is the HSI pool (59.4%,
+  a 113.8x write amplification of the 36,864 B the indexer reads) and 2,703,360 B is the window
+  (38.3%). The twin crates/sparkflash-device/tests/paged_read.rs proves the read path is the staged
+  bytes bit for bit across page boundaries, a partially filled tail page, an evicted and reused
+  block and a block table with holes; no kernel, KernelId, cubin, baseline entry or ABI change was
+  made. Recommendation in that note: do not freeze now - V1 saves 2.2% of staging at current
+  windows, V3 (main + HSI paged) saves 61.7% but needs block-table device plumbing, and no window
+  line exists to turn those bytes into time. Revisit at C > 512 (main staging >= 589,824 B/step,
+  growing 1,152 B per token) or when a profile shows the 4 MiB HSI zero-fill; freeze V3 then, not
+  Path A.
 * **Scope kept out:** full HSI pool population (the 2,048-block candidate pool and the top-512
   merge) remains phase2 open item 2; this task stages the keys for the twin and the seam and does
   not select candidates.
@@ -169,8 +187,9 @@ report, not this doc.
 * The **device run** of a served sequence attending through `flash_mla_csa2_sm121` over paged rows:
   a window measurement, not run (node/GPU freeze).
 * **HSI candidate selection** (full pool population and the top-512 merge): phase2 open item 2.
-* **Path A** (positions-array kernel / paged-read kernel): named follow-on in Section 5; its ABI cost
-  is stated there and no kernel, ABI or pin was touched.
+* **Path A** (positions-array kernel) and the **paged-read kernel** (task-49 design): named
+  follow-ons in Section 5 and docs/build/paged-read-attention-kernel-design.md; their ABI costs are
+  stated there and no kernel, ABI or pin was touched.
 * A paged store that mirrors a request's token sequence is not a claim that the serving KV is
   paged. The distinction is Section 1.1; the consumer that would make it a serving claim is the
   engine KV seam, not this module.

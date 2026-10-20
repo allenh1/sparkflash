@@ -675,3 +675,45 @@ path, 10,000-replay determinism or two-run byte identity on the nodes, or the ab
 DtoH/HtoD, which a host allocation cannot demonstrate. Those are 15.4 items 5-7 and are named
 unclaimed in every `HostTwinReport` and in the evidence section. No hardware result exists, so none
 may be cited.
+### 15.7 The overlapped ring host twin for prefill-sized collectives (task-36 host portion, 2026-10-19)
+
+Above the 2 MiB row, one slot ring carries a series of exchanges, and the point of the ring is that
+two chunks can be in flight at once. The task-35 twin proved the chunked arithmetic but ran it chunk
+by chunk on one thread per rank, so it could not show overlap or the hazard that the read-done epoch
+prevents. `crates/sparkflash-comm/src/oneshot/loopback/ring.rs` splits each rank into a **proxy
+thread** and a **kernel thread**: the proxy stages chunk i, rings the doorbell and sends its rail
+frames while the kernel is still receiving and reducing chunk i-1; the kernel owns the receive-side
+proxy, the arrival words, the four-row reduction and the read-done epoch. With a two-deep ring the
+proxy stages chunk i+2 into a slot only after every rank published its read-done epoch for that
+slot's previous use, so the cluster's per-rank in-flight slot count reaches two; with a one-deep
+ring the same wait serialises it to one.
+
+`crates/sparkflash-comm/tests/oneshot_ring_host.rs` pins the three properties that matter for S5.4:
+
+- **Bit-exactness at prefill shape.** A payload above one row is split into row-sized chunks (with a
+  shorter last chunk) and the whole payload matches `canonical_all_reduce_into` bit for bit, with
+  one dispatch per rank per chunk, zero `host_copy_bytes` and only the device launch path recorded.
+- **No dependence on ring depth or chunk boundaries.** Four configurations (ring 1 and ring 2,
+  row-sized, half-row and quarter-row chunks) all stay bit-identical to the canonical twin; a
+  one-deep ring reports one slot in flight, the two-deep ring reports two.
+- **The read-done epoch is load-bearing, shown not described.** A test knob
+  (`LoopbackDeviceConfig::kernel_delay`) stalls one rank's kernel; the same run with the epoch
+  honoured stays bit-identical while two slots are in flight, and the run with
+  `ReadEpochPolicy::Ignore` (a deliberate contract violation that no device path may use) waits for
+  the proxy to stage the premature reuse and then observes that rank's corrupted output. The
+  corruption is deterministic, not a scheduler race: with the policy ignored the delayed kernel
+  rendezvouses with its own proxy's premature staging before reading the slot.
+
+`sparkflash device-chain --run-stage tp4-smoke --oneshot-preflight --prefill-plan-elements ...`
+records the ring evidence under `host_twin.ring` (two chunks above the row, bit-identical, two slots
+in flight, the hazard demonstration `demonstrated: true` with the corrupted rank named), alongside
+the existing one-shot and clamped chunked sections.
+
+**What this still does not do.** The proxy and kernel are threads in one process, not a pinned
+spinning proxy over real QPs and a CUDA kernel over a registered device slot. It allocates no device
+memory, no MR, no completion queue; it launches no kernel. It does not measure per-chunk or total
+prefill latency at 4096 tokens, per-rail bandwidth at 40/48 MiB, correctness across the four-node
+mesh through the real path, the Engram all-gather arm with its warm/cold cache and disk latency,
+10,000-replay determinism, or the absence of device-side DtoH/HtoD between chunks. Those stay named
+unclaimed in every `RingTwinReport` and in the evidence section, and need S5.3's device-path gate
+green before a window is booked.

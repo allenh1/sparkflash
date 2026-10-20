@@ -26,7 +26,16 @@ The dump is checked for self-consistency before any metric: when a row carries
 logits_bin it must name the dump's own FILE + ".bin" sidecar, the sidecar must be
 exactly as long as the recorded blocks and the offsets must tile. prefix_match is
 tri-state, and a row that cannot prove it is like-for-like (no usable
-reference_id) is counted as a mismatch rather than silently matched.
+reference_id) is counted as a mismatch rather than silently matched. A run with any UNKNOWN or
+MISMATCH row is NOT_LIKE_FOR_LIKE and exits 1 whatever the bars say: the metrics are recorded, but the
+run is not a like-for-like comparison.
+
+A --bars file is a gate input, not a hint: it must be a D41 bar file (schema
+"sparkflash-d41-bars/1", status "ok", bar_class "idle_distractor"), and a demo-scale, provisional or
+requires_review file is refused rather than applied. --expect-vocab is the operator's declaration of
+the checkpoint's vocabulary (the released checkpoint is 129,280); a dump whose rows disagree is
+refused. --positions, when given, must all exist in both the dump and the oracle: a list that would
+silently compare fewer positions than it names is refused, not intersected.
 """
 
 from __future__ import annotations
@@ -43,6 +52,7 @@ import time
 DEFAULT_EXPECT_ROOT = "1bae0e1088993b9b82de08f59de5be5a34e42170"
 TOP_K = (5, 20, 100, 1000)
 ORACLE_SCHEMA = "sparkflash-native-oracle/1"
+GATE_BARS_SCHEMA = "sparkflash-d41-bars/1"
 
 #: Bars the harness knows how to evaluate. Threshold names carry their
 #: direction: *_min is a floor, *_max is a ceiling. The Lead's D40 record may
@@ -396,6 +406,50 @@ def evaluate_bars(bars: dict, aggregate: dict) -> dict:
     return {"pass": all(result["pass"] for result in results), "bars": results}
 
 
+def parse_positions(text: str) -> set[int]:
+    """Parse --positions into a set of non-negative ints, refusing what a gate could miscount."""
+    tokens = [token.strip() for token in text.split(",") if token.strip()]
+    if not tokens:
+        raise CompareError("--positions names no positions")
+    positions: list[int] = []
+    for token in tokens:
+        try:
+            position = int(token)
+        except ValueError as error:
+            raise CompareError(f"--positions: {token!r} is not an integer") from error
+        if position < 0:
+            raise CompareError(f"--positions: {position} is negative")
+        if position in positions:
+            raise CompareError(f"--positions: duplicate position {position}")
+        positions.append(position)
+    return set(positions)
+
+
+def check_gate_bars(bars: dict, path: str) -> None:
+    """Refuse anything that is not a D41 gate bar file (D40/D41)."""
+    if not isinstance(bars, dict):
+        raise CompareError(f"{path}: bars file is not a JSON object")
+    schema = bars.get("schema")
+    if schema != GATE_BARS_SCHEMA:
+        raise CompareError(
+            f"{path}: not a D41 gate bars file (schema {schema!r}, expected {GATE_BARS_SCHEMA!r}); "
+            "a demo-scale or hand-copied provisional bar file is not a gate"
+        )
+    status = bars.get("status")
+    if status != "ok":
+        raise CompareError(
+            f"{path}: D41 bars status {status!r} is not 'ok'; a requires_review floor file must be "
+            "reviewed and re-recorded before it can gate"
+        )
+    bar_class = bars.get("bar_class")
+    if bar_class != "idle_distractor":
+        raise CompareError(
+            f"{path}: D41 bars were derived from bar_class {bar_class!r}, not 'idle_distractor'"
+        )
+    if not isinstance(bars.get("bars"), dict) or not bars["bars"]:
+        raise CompareError(f"{path}: D41 bars file has no 'bars' object")
+
+
 def render_markdown(result: dict) -> str:
     lines = [
         "# Native chain vs vLLM oracle (D39 distributional comparison)",
@@ -476,6 +530,9 @@ def render_markdown(result: dict) -> str:
         "  when the dump carries no usable reference_id (an older dump) or the oracle has no target",
         "  token. UNKNOWN counts in 'prefix_mismatches': the row is not proven like-for-like, so it is",
         "  never silently scored as a match.",
+        "* 'NOT_LIKE_FOR_LIKE' means at least one compared row could not prove its prefix; the counts are",
+        "  in 'prefix_mismatches' and 'prefix_unknown'. It overrides PASS and UNBARED and exits 1: the",
+        "  numbers are recorded evidence, not a comparison verdict.",
         "",
     ]
     return "\n".join(lines)
@@ -489,9 +546,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--oracle-prompt", help="prompt id inside the oracle file (needed when it has several)")
     parser.add_argument("--out-json", required=True)
     parser.add_argument("--out-md", help="Markdown evidence (default: --out-json with .md)")
-    parser.add_argument("--bars", help="D40 bars JSON; without it the run is UNBARED")
+    parser.add_argument("--bars", help="D41 gate bars JSON (sparkflash-d41-bars/1); without it the run is UNBARED")
     parser.add_argument("--expect-root", default=DEFAULT_EXPECT_ROOT)
     parser.add_argument("--positions", help="comma-separated device positions to compare (default: intersection)")
+    parser.add_argument(
+        "--expect-vocab",
+        type=int,
+        help="expected logits vocabulary (D40 released checkpoint: 129280); any row disagreeing is refused",
+    )
     args = parser.parse_args(argv)
     if args.expect_root == "":
         args.expect_root = None
@@ -508,10 +570,33 @@ def main(argv: list[str] | None = None) -> int:
         oracle_positions = {int(row["position"]): row for row in prompt["positions"]}
         rows = read_dump(args.dump)
         check_dump_sidecar(rows, args.dump, bin_path)
-        wanted = None
-        if args.positions:
-            wanted = {int(value) for value in args.positions.split(",") if value.strip()}
-        compared = [row for row in rows if row["position"] in oracle_positions and (wanted is None or row["position"] in wanted)]
+        if args.expect_vocab is not None:
+            for row in rows:
+                if int(row["vocab"]) != args.expect_vocab:
+                    raise CompareError(
+                        f"position {row['position']}: vocab {row['vocab']} is not the expected "
+                        f"{args.expect_vocab} (--expect-vocab, D40 released checkpoint)"
+                    )
+        wanted = parse_positions(args.positions) if args.positions else None
+        if wanted is not None:
+            dump_positions = {row["position"] for row in rows}
+            missing_dump = sorted(wanted - dump_positions)
+            if missing_dump:
+                raise CompareError(
+                    f"--positions names {missing_dump} but the dump has no such position(s) "
+                    f"(dump positions {sorted(dump_positions)[:8]}...)"
+                )
+            missing_oracle = sorted(wanted - set(oracle_positions))
+            if missing_oracle:
+                raise CompareError(
+                    f"--positions names {missing_oracle} but the oracle has no such position(s) "
+                    f"(oracle positions {sorted(oracle_positions)[:8]}...)"
+                )
+        compared = (
+            [row for row in rows if row["position"] in wanted]
+            if wanted is not None
+            else [row for row in rows if row["position"] in oracle_positions]
+        )
         if not compared:
             raise CompareError(
                 f"no overlapping positions: dump {sorted(row['position'] for row in rows)} "
@@ -524,8 +609,12 @@ def main(argv: list[str] | None = None) -> int:
             results.append(position_metrics(row, logits, oracle_positions[row["position"]]))
         aggregate = aggregate_metrics(results)
         bars = load_json(args.bars) if args.bars else None
+        if bars is not None:
+            check_gate_bars(bars, args.bars)
         bar_result = evaluate_bars(bars, aggregate) if bars else None
         verdict = "UNBARED" if bar_result is None else ("PASS" if bar_result["pass"] else "FAIL")
+        if aggregate["prefix_mismatches"] > 0:
+            verdict = "NOT_LIKE_FOR_LIKE"
         result = {
             "schema": "sparkflash-native-comparison/1",
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

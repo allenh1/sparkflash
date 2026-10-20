@@ -698,10 +698,11 @@ The host test `four_ranks_chain_three_chunks_through_one_slot_and_match_the_cano
 (`crates/sparkflash-comm/tests/device_seam.rs`) runs four rank threads over a three-row payload
 through one slot and checks every chunk bit for bit against `canonical_all_reduce_into`; the unit
 tests refuse a future chunk's frame and refuse sizes that are not whole bf16 elements or row splits.
-The loopback host twin (15.6 of rdma-backend.md) also runs this chunked plan through the two-slot ring and matches the canonical twin chunk for chunk with zero recorded host-staging bytes, so the reuse order is exercised on the host, not only designed. **What is still a window measurement and is not claimed here**: per-chunk and total chunked latency
+The loopback host twin (15.6 of rdma-backend.md) also runs this chunked plan through the two-slot ring and matches the canonical twin chunk for chunk with zero recorded host-staging bytes, so the reuse order is exercised on the host, not only designed. The **overlapped ring host twin** (15.7; `crates/sparkflash-comm/src/oneshot/loopback/ring.rs`, `crates/sparkflash-comm/tests/oneshot_ring_host.rs`) now splits each rank into a proxy thread that stages ahead and a kernel thread that receives and reduces, so a payload above one row is reduced bit-exactly with two chunks in flight, independent of ring depth (1 or 2) and chunk size (row, half-row, quarter-row). The read-done epoch is shown to be load-bearing rather than asserted: with the epoch deliberately ignored (`ReadEpochPolicy::Ignore`, a test-only contract violation) a delayed rank's output is corrupted by its own premature slot reuse, while the honest run stays bit-identical. `tp4-smoke --oneshot-preflight --prefill-plan-elements` records that ring evidence under `host_twin.ring`, including the hazard demonstration. **What is still a window measurement and is not claimed here**: per-chunk and total chunked latency
 against the single-seam path, bit-identity to the canonical twin for every chunk and every repeat
-twice per configuration, zero DtoH/HtoD between chunks, and the kernel trace showing no lost or
-stale doorbell when the arrival words are reused across chunks. It needs S5.3's device-path gate
+twice per configuration, zero DtoH/HtoD between chunks, the kernel trace showing no lost or
+stale doorbell when the arrival words are reused across chunks, and the prefill ring's real
+per-rail bandwidth and mesh correctness. It needs S5.3's device-path gate
 green first, then four GPU nodes opened by the Lead and a cuda-feature build with the launcher.
 
 **S5.5 -- task-37: 4-process serving orchestration.** Depends on S5.2/S5.4, coordinates with

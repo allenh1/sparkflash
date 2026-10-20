@@ -56,8 +56,45 @@ use super::{
     ONESHOT_RANKS, ONESHOT_SLOT_BYTES, RailFrame, SeamError, SequenceCounter, row_offset,
 };
 
+mod ring;
+
+pub use ring::{
+    RingPlan, RingTwinConfig, RingTwinReport, run_ring_twin, run_ring_twin_with_payloads,
+};
+
 /// Ring slots the twin allocates per rank by default: the double buffer the seam design names.
 pub const HOST_TWIN_RING: usize = 2;
+
+/// How the twin treats a ring slot's read-done epoch before it stages a new chunk into that slot.
+///
+/// [ReadEpochPolicy::Honor] is the only behaviour a device transport may have: the staging write
+/// waits until every rank's kernel has finished reading the slot's previous use. [Ignore] exists
+/// solely so a test can demonstrate the hazard the wait prevents - it is a deliberate contract
+/// violation, never a mode a node run or the evidence path uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadEpochPolicy {
+    /// Wait for the read-done epoch before reusing a slot (the real rule).
+    #[default]
+    Honor,
+    /// Skip the wait and overwrite the slot before every reader is done (hazard demo only).
+    Ignore,
+}
+
+/// A deliberately slow kernel read on one rank and chunk, used to widen the ring-reuse hazard
+/// window so a test can prove the read-done epoch is load-bearing instead of describing it.
+///
+/// The host twin has no real kernel; this knob stands in for a kernel that is slower than the
+/// proxy, which is exactly the scheduling the two-deep ring has to tolerate. It changes no
+/// arithmetic and is not a performance model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelDelay {
+    /// Rank whose kernel stalls.
+    pub rank: usize,
+    /// Chunk index the stall applies to.
+    pub chunk: usize,
+    /// How long the kernel stalls before reading the slot rows.
+    pub duration: Duration,
+}
 
 /// Bytes a slot or output allocation adds so its first data byte is 8-byte aligned.
 const ALLOC_PAD: usize = 8;
@@ -75,6 +112,10 @@ pub struct LoopbackDeviceConfig {
     pub timeout: Duration,
     /// Whether peers send their frames in reverse rank and rail order.
     pub reverse_arrivals: bool,
+    /// How a ring slot's read-done epoch is treated before reuse.
+    pub read_epoch_policy: ReadEpochPolicy,
+    /// An optional, deliberate kernel-side stall (test knob; see [KernelDelay]).
+    pub kernel_delay: Option<KernelDelay>,
 }
 
 impl Default for LoopbackDeviceConfig {
@@ -85,6 +126,8 @@ impl Default for LoopbackDeviceConfig {
             rails: ONESHOT_RAILS,
             timeout: Duration::from_secs(5),
             reverse_arrivals: false,
+            read_epoch_policy: ReadEpochPolicy::Honor,
+            kernel_delay: None,
         }
     }
 }
@@ -306,6 +349,9 @@ struct State {
     read_epoch: Vec<Vec<u64>>,
     inbox: Vec<Vec<RailFrame>>,
     slot_last_seq: Vec<Option<u64>>,
+    slot_busy: Vec<Vec<bool>>,
+    rank_in_flight: Vec<usize>,
+    max_rank_in_flight: usize,
 }
 
 /// The loopback device cluster: the simulated slots, doorbells and NIC of one four-rank mesh.
@@ -371,6 +417,9 @@ impl LoopbackDeviceCluster {
             read_epoch: (0..world).map(|_| vec![0; ring]).collect(),
             inbox: (0..world).map(|_| Vec::new()).collect(),
             slot_last_seq: vec![None; ring],
+            slot_busy: (0..world).map(|_| vec![false; ring]).collect(),
+            rank_in_flight: vec![0; world],
+            max_rank_in_flight: 0,
         };
         Ok(Self {
             inner: Arc::new(Inner {
@@ -441,6 +490,17 @@ impl LoopbackDeviceCluster {
     #[must_use]
     pub fn collectives(&self) -> u64 {
         self.inner.collectives.load(Ordering::Relaxed)
+    }
+
+    /// The most ring slots one rank held in flight at once during this cluster's life.
+    ///
+    /// One means the rank serialised its ring (a one-deep ring or a proxy that never ran ahead of
+    /// its kernel); two means the two-deep pipeline actually overlapped two chunks - a staged chunk
+    /// still awaiting its read-done epoch while the next chunk was being staged. It is a shape
+    /// observation, not a latency measurement.
+    #[must_use]
+    pub fn max_rank_in_flight(&self) -> usize {
+        self.inner.state.lock().max_rank_in_flight
     }
 
     fn allocation(&self, address: u64) -> Result<Arc<OutputAllocation>, CommError> {

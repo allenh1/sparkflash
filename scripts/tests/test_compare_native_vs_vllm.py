@@ -286,6 +286,23 @@ class AggregateAndBarsTest(unittest.TestCase):
         with self.assertRaises(compare.CompareError):
             compare.evaluate_bars({"bars": {"token_equality": 1}}, aggregate)
 
+    def test_gate_bars_shape(self):
+        compare.check_gate_bars(
+            {"schema": compare.GATE_BARS_SCHEMA, "status": "ok", "bar_class": "idle_distractor",
+             "bars": {"positions_min": 1}}, "bars.json")
+        bad_documents = [
+            {"bars": {"positions_min": 1}},
+            {"schema": compare.GATE_BARS_SCHEMA, "status": "requires_review",
+             "bar_class": "idle_distractor", "bars": {"positions_min": 1}},
+            {"schema": compare.GATE_BARS_SCHEMA, "status": "ok",
+             "bar_class": "busy_distractor", "bars": {"positions_min": 1}},
+            {"schema": compare.GATE_BARS_SCHEMA, "status": "ok",
+             "bar_class": "idle_distractor", "bars": {}},
+        ]
+        for document in bad_documents:
+            with self.assertRaises(compare.CompareError):
+                compare.check_gate_bars(document, "bars.json")
+
 
 class EndToEndTest(unittest.TestCase):
     def setUp(self):
@@ -317,8 +334,19 @@ class EndToEndTest(unittest.TestCase):
         }
         with open(self.oracle, "w", encoding="utf-8") as handle:
             json.dump(oracle, handle)
+        self._write_bars()
+
+    def _write_bars(self, **overrides):
+        document = {
+            "schema": compare.GATE_BARS_SCHEMA,
+            "status": "ok",
+            "bar_class": "idle_distractor",
+            "bars": {"top1_agreement_min": 1.0, "max_abs_delta_max": 0.1, "positions_min": 2},
+        }
+        document.update(overrides)
         with open(self.bars, "w", encoding="utf-8") as handle:
-            json.dump({"bars": {"top1_agreement_min": 1.0, "max_abs_delta_max": 0.1, "positions_min": 2}}, handle)
+            json.dump(document, handle)
+        return self.bars
 
     def test_unbared_run_writes_evidence(self):
         out_json = os.path.join(self.tmp.name, "out.json")
@@ -337,6 +365,92 @@ class EndToEndTest(unittest.TestCase):
         with open(out_json, encoding="utf-8") as handle:
             result = json.load(handle)
         self.assertEqual(result["verdict"], "PASS")
+
+    def test_plain_bars_file_is_refused(self):
+        with open(self.bars, "w", encoding="utf-8") as handle:
+            json.dump({"bars": {"top1_agreement_min": 1.0}}, handle)
+        out_json = os.path.join(self.tmp.name, "out.json")
+        code = compare.main(["--dump", self.dump, "--oracle", self.oracle, "--out-json", out_json,
+                             "--bars", self.bars])
+        self.assertEqual(code, 2)
+        self.assertFalse(os.path.exists(out_json))
+
+    def test_requires_review_bars_file_is_refused(self):
+        self._write_bars(status="requires_review")
+        out_json = os.path.join(self.tmp.name, "out.json")
+        code = compare.main(["--dump", self.dump, "--oracle", self.oracle, "--out-json", out_json,
+                             "--bars", self.bars])
+        self.assertEqual(code, 2)
+        self.assertFalse(os.path.exists(out_json))
+
+    def test_busy_bar_class_is_refused(self):
+        self._write_bars(bar_class="busy_distractor")
+        out_json = os.path.join(self.tmp.name, "out.json")
+        code = compare.main(["--dump", self.dump, "--oracle", self.oracle, "--out-json", out_json,
+                             "--bars", self.bars])
+        self.assertEqual(code, 2)
+        self.assertFalse(os.path.exists(out_json))
+
+    def test_unknown_bar_name_with_gate_shape_is_refused(self):
+        self._write_bars(bars={"token_equality": 1.0})
+        out_json = os.path.join(self.tmp.name, "out.json")
+        code = compare.main(["--dump", self.dump, "--oracle", self.oracle, "--out-json", out_json,
+                             "--bars", self.bars])
+        self.assertEqual(code, 2)
+        self.assertFalse(os.path.exists(out_json))
+
+    def test_expect_vocab_mismatch_is_refused(self):
+        out_json = os.path.join(self.tmp.name, "out.json")
+        code = compare.main(["--dump", self.dump, "--oracle", self.oracle, "--out-json", out_json,
+                             "--expect-vocab", "129280"])
+        self.assertEqual(code, 2)
+        self.assertFalse(os.path.exists(out_json))
+
+    def test_positions_missing_from_dump_is_refused(self):
+        out_json = os.path.join(self.tmp.name, "out.json")
+        code = compare.main(["--dump", self.dump, "--oracle", self.oracle, "--out-json", out_json,
+                             "--positions", "0,1,2"])
+        self.assertEqual(code, 2)
+        self.assertFalse(os.path.exists(out_json))
+
+    def test_positions_missing_from_oracle_is_refused(self):
+        self._rewrite_oracle(lambda prompt: prompt.__setitem__("positions", prompt["positions"][:1]))
+        out_json = os.path.join(self.tmp.name, "out.json")
+        code = compare.main(["--dump", self.dump, "--oracle", self.oracle, "--out-json", out_json,
+                             "--positions", "1"])
+        self.assertEqual(code, 2)
+        self.assertFalse(os.path.exists(out_json))
+
+    def test_duplicate_positions_are_refused(self):
+        out_json = os.path.join(self.tmp.name, "out.json")
+        code = compare.main(["--dump", self.dump, "--oracle", self.oracle, "--out-json", out_json,
+                             "--positions", "0,0"])
+        self.assertEqual(code, 2)
+        self.assertFalse(os.path.exists(out_json))
+
+    def test_positions_pin_the_compared_set(self):
+        out_json = os.path.join(self.tmp.name, "out.json")
+        code = compare.main(["--dump", self.dump, "--oracle", self.oracle, "--out-json", out_json,
+                             "--positions", "0"])
+        self.assertEqual(code, 0)
+        with open(out_json, encoding="utf-8") as handle:
+            result = json.load(handle)
+        self.assertEqual(result["aggregate"]["positions"], 1)
+        self.assertEqual(result["verdict"], "UNBARED")
+
+    def test_not_like_for_like_overrides_passing_bars(self):
+        self._rewrite_dump(lambda row: row.pop("reference_id", None))
+        self._write_bars()
+        out_json = os.path.join(self.tmp.name, "out.json")
+        code = compare.main(["--dump", self.dump, "--oracle", self.oracle, "--out-json", out_json,
+                             "--bars", self.bars])
+        self.assertEqual(code, 1)
+        with open(out_json, encoding="utf-8") as handle:
+            result = json.load(handle)
+        self.assertEqual(result["verdict"], "NOT_LIKE_FOR_LIKE")
+        self.assertTrue(result["bars"]["pass"])
+        self.assertEqual(result["aggregate"]["prefix_mismatches"], 2)
+        self.assertEqual(result["aggregate"]["prefix_unknown"], 2)
 
     def test_wrong_root_is_rejected(self):
         out_json = os.path.join(self.tmp.name, "out.json")
@@ -365,13 +479,21 @@ class EndToEndTest(unittest.TestCase):
             for row in rows:
                 handle.write(json.dumps(row) + "\n")
 
+    def _rewrite_oracle(self, mutate):
+        with open(self.oracle, encoding="utf-8") as handle:
+            oracle = json.load(handle)
+        mutate(oracle["prompts"][0])
+        with open(self.oracle, "w", encoding="utf-8") as handle:
+            json.dump(oracle, handle)
+
     def test_dump_without_reference_id_is_flagged_not_matched(self):
         self._rewrite_dump(lambda row: row.pop("reference_id", None))
         out_json = os.path.join(self.tmp.name, "out.json")
         code = compare.main(["--dump", self.dump, "--oracle", self.oracle, "--out-json", out_json])
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 1)
         with open(out_json, encoding="utf-8") as handle:
             result = json.load(handle)
+        self.assertEqual(result["verdict"], "NOT_LIKE_FOR_LIKE")
         self.assertEqual(result["aggregate"]["prefix_mismatches"], 2)
         self.assertEqual(result["aggregate"]["prefix_unknown"], 2)
         with open(os.path.join(self.tmp.name, "out.md"), encoding="utf-8") as handle:
