@@ -310,6 +310,31 @@ On the tiny fixture most of the step is engine-internal (attention/head/decode),
 boundary this hook exposes rather than hides. The released-checkpoint per-layer numbers are
 kernel-dev's run; this document records the tool and the schema.
 
+### Bench mode (--bench-steps N): the token-per-second harness
+
+`--bench-steps N` turns the stage into the shared measurement harness for the token-per-second
+iteration (task/task16-bench, no arithmetic change). It opens the rank, calls begin_request,
+prefills the prompt once and then runs N decode() calls with no HTTP server and no token streaming.
+The evidence JSON gains a top-level `bench` object: steps_requested, steps_run, prefill_tokens,
+prefill_ms, prefill_token, decode_ms, mean_step_ms, median_step_ms, tokens_per_second
+(decode-only = steps_run * 1000 / decode_ms), the per-step wall/rchar/read/collective arrays,
+profile_on and the measurement rule. The summary gets the same object.
+
+World 1 needs no peers and no transport: Tp4Rank::open leaves the transport None and the canonical
+reduce is a strict no-op (reduce_calls stays 0, as world_one_reduce_is_a_strict_bit_no_op asserts),
+so the harness runs on the dev host with just --fixture/--checkpoint, --prompt-tokens and
+--bench-steps. World > 1 runs the same number of decode steps on every rank and records the real
+per-layer collectives. Reported on stdout as one line: steps_run, prefill ms, mean/median step and
+tokens/s. The natural metric for the iteration is tokens_per_second, not seconds per token.
+
+The bench number excludes load and prefill by construction (tokens_per_second = steps_run *
+1000 / decode_ms, decode_ms is the sum of the decode steps only; prefill_ms and the load/cache
+header are separate fields), and the evidence states that rule in bench.measure so it is never
+compared with an end-to-end tokens/s. With --profile, profile.steps holds one entry per forward
+step in order: the prefill_tokens prefill entries first, then the steps_run decode entries; bench
+also records profile_entries and profile_decode_first_index, so per-class decode averages are the
+sum over the last steps_run entries divided by steps_run.
+
 ## 9. Boundaries and what this does not prove
 
 - No driver is opened, no CUDA context is created, no GPU kernel runs, and vLLM is not used on the

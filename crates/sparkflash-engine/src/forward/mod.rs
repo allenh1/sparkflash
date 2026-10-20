@@ -34,11 +34,14 @@ pub mod layer_zero;
 pub mod mhc;
 pub mod moe;
 pub mod mtp;
+mod weight_view;
 
 use crate::config::ModelConfig;
+use crate::dtype::DType;
 use crate::forward::boundary::{BoundaryTable, LayerBoundary};
 use crate::forward::layer_zero::{LayerZeroEntry, LayerZeroEntrySource, StageEvent};
 use crate::forward::mhc::Mixes;
+use crate::forward::weight_view::WeightView;
 use crate::linalg::{self, EngineError};
 use crate::tensor::TensorPlan;
 use crate::weights::WeightSource;
@@ -492,6 +495,106 @@ fn u64_bytes(values: usize) -> u64 {
     u64::try_from(values).unwrap_or(u64::MAX).saturating_mul(4)
 }
 
+/// One embedding row per token, widened to f32.
+///
+/// The release path reads the BF16 table as stored and widens only the rows the chunk uses (the
+/// widening is exact), so a decode step no longer decodes the whole 1.3 GB table. An f32 source
+/// (every fixture) takes the same whole-table decode as before, byte for byte.
+fn embedding_rows(
+    source: &dyn WeightSource,
+    tokens: &[u32],
+    dim: usize,
+    vocab_size: usize,
+    limit: usize,
+) -> Result<Vec<f32>, EngineError> {
+    let spec = source.spec("embed.weight")?;
+    let elements = spec.elements();
+    if elements > limit as u128 {
+        return Err(EngineError::TooLarge {
+            name: "embed.weight".to_owned(),
+            elements: usize::try_from(elements).unwrap_or(usize::MAX),
+            limit,
+        });
+    }
+    let needed = vocab_size.saturating_mul(dim);
+    if elements < needed as u128 {
+        return Err(EngineError::Shape {
+            what: "embed.weight".to_owned(),
+            detail: format!(
+                "a {}x{} table has {} values, so it cannot serve vocab_size {}",
+                vocab_size, dim, elements, vocab_size
+            ),
+        });
+    }
+    let mut rows = Vec::with_capacity(tokens.len() * dim);
+    match spec.dtype {
+        DType::F32 => {
+            let table = linalg::decode_by_name(source, "embed.weight", limit)?;
+            for &token in tokens {
+                let row = (token as usize).saturating_mul(dim);
+                let Some(embedding) = table.get(row..row + dim) else {
+                    return Err(EngineError::Shape {
+                        what: "embed.weight".to_owned(),
+                        detail: format!("token {token} is outside the {vocab_size} row table"),
+                    });
+                };
+                rows.extend_from_slice(embedding);
+            }
+        }
+        DType::BF16 => {
+            let borrowed = source.read_view("embed.weight")?;
+            let owned;
+            let bytes: &[u8] = match borrowed {
+                Some(bytes) => bytes,
+                None => {
+                    owned = source.read("embed.weight")?;
+                    &owned
+                }
+            };
+            let bytes_needed = needed.checked_mul(2).ok_or_else(|| EngineError::Shape {
+                what: "embed.weight".to_owned(),
+                detail: "the table's byte count overflows".to_owned(),
+            })?;
+            if bytes.len() < bytes_needed {
+                return Err(EngineError::Shape {
+                    what: "embed.weight".to_owned(),
+                    detail: format!(
+                        "a {vocab_size}x{dim} bf16 table needs {bytes_needed} bytes, got {}",
+                        bytes.len()
+                    ),
+                });
+            }
+            for &token in tokens {
+                let row = (token as usize).saturating_mul(dim);
+                let start = row * 2;
+                let Some(slice) = bytes.get(start..start + dim * 2) else {
+                    return Err(EngineError::Shape {
+                        what: "embed.weight".to_owned(),
+                        detail: format!("token {token} is outside the {vocab_size} row table"),
+                    });
+                };
+                for pair in slice.as_chunks::<2>().0 {
+                    rows.push(crate::quant::bf16_to_f32(u16::from_le_bytes(*pair)));
+                }
+            }
+        }
+        _ => {
+            let table = linalg::decode_by_name(source, "embed.weight", limit)?;
+            for &token in tokens {
+                let row = (token as usize).saturating_mul(dim);
+                let Some(embedding) = table.get(row..row + dim) else {
+                    return Err(EngineError::Shape {
+                        what: "embed.weight".to_owned(),
+                        detail: format!("token {token} is outside the {vocab_size} row table"),
+                    });
+                };
+                rows.extend_from_slice(embedding);
+            }
+        }
+    }
+    Ok(rows)
+}
+
 fn record_stage(
     stages: &mut Option<&mut Vec<StageEvent>>,
     stage: &'static str,
@@ -578,35 +681,15 @@ impl InferenceEngine {
         let mut hashes = Vec::new();
         engram::ngram_hashes(config, &history, start_pos, &mut hashes)?;
 
-        // The embedding lookup, one row per token (model.py:1253-1255).
-        let embed = linalg::decode_by_name(source, "embed.weight", self.limit)?;
-        if embed.len() < config.vocab_size * dim {
-            return Err(EngineError::Shape {
-                what: "embed.weight".to_owned(),
-                detail: format!(
-                    "a {}x{} table has {} values, so it cannot serve vocab_size {}",
-                    config.vocab_size,
-                    dim,
-                    embed.len(),
-                    config.vocab_size
-                ),
-            });
-        }
+        // The embedding lookup, one row per token (model.py:1253-1255). The rows are widened from
+        // the stored BF16 table on the release path, so a decode step touches only its own rows.
+        let embeddings = embedding_rows(source, tokens, dim, config.vocab_size, self.limit)?;
 
         // The stream becomes [seqlen, hc, dim]: every copy starts as the same embedding, and the
         // first input mix selects copy 0 (model.py:1258-1260).
         let mut hidden = vec![0.0f32; seqlen * width];
-        for (position, &token) in tokens.iter().enumerate() {
-            let row = (token as usize) * dim;
-            let Some(embedding) = embed.get(row..row + dim) else {
-                return Err(EngineError::Shape {
-                    what: "embed.weight".to_owned(),
-                    detail: format!(
-                        "token {token} is outside the {} row table",
-                        config.vocab_size
-                    ),
-                });
-            };
+        for position in 0..seqlen {
+            let embedding = &embeddings[position * dim..][..dim];
             for copy in 0..hc {
                 hidden[(position * hc + copy) * dim..(position * hc + copy + 1) * dim]
                     .copy_from_slice(embedding);
@@ -676,9 +759,10 @@ impl InferenceEngine {
         let mut tail = collapsed[(seqlen - 1) * dim..].to_vec();
         linalg::rms_norm(&mut tail, &norm, dim, config.norm_eps as f32)?;
         let head_input = tail.clone();
-        let head = linalg::decode_by_name(source, "head.weight", self.limit)?;
+        let head =
+            WeightView::read_plain(source, "head.weight", config.vocab_size, dim, self.limit)?;
         let mut logits = vec![0.0f32; config.vocab_size];
-        linalg::matmul(&mut logits, &tail, &head, config.vocab_size, dim, 1)?;
+        head.matmul(&mut logits, &tail, config.vocab_size, dim, 1)?;
 
         let next_token = sample_gumbel(&logits, self.sampling.temperature, self.sampling.seed);
 
@@ -1387,9 +1471,15 @@ impl InferenceEngine {
         let mut tail = collapsed;
         linalg::rms_norm(&mut tail, &norm, dim, config.norm_eps as f32)?;
         let head_input = tail.clone();
-        let head = linalg::decode_by_name(self.source.as_ref(), "head.weight", self.limit)?;
+        let head = WeightView::read_plain(
+            self.source.as_ref(),
+            "head.weight",
+            config.vocab_size,
+            dim,
+            self.limit,
+        )?;
         let mut logits = vec![0.0f32; config.vocab_size];
-        linalg::matmul(&mut logits, &tail, &head, config.vocab_size, dim, 1)?;
+        head.matmul(&mut logits, &tail, config.vocab_size, dim, 1)?;
         let token = linalg::argmax(&logits).map(|index| index as u32);
         let tail_stages = vec![
             StageEvent {
@@ -1627,8 +1717,14 @@ impl InferenceEngine {
         let token = if let Some(token) = device_token {
             Some(token)
         } else {
-            let head = linalg::decode_by_name(self.source.as_ref(), "head.weight", self.limit)?;
-            linalg::matmul(&mut logits, &tail, &head, config.vocab_size, dim, 1)?;
+            let head = WeightView::read_plain(
+                self.source.as_ref(),
+                "head.weight",
+                config.vocab_size,
+                dim,
+                self.limit,
+            )?;
+            head.matmul(&mut logits, &tail, config.vocab_size, dim, 1)?;
             linalg::argmax(&logits).map(|index| index as u32)
         };
         let certified_mask = moe_backend

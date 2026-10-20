@@ -50,8 +50,10 @@
 //! source layers first, which spec section 4 already requires.
 
 use super::attention_case;
+use super::weight_view::WeightView;
 use crate::config::ModelConfig;
 use crate::linalg::{self, EngineError, ScaleGrid};
+use crate::parallel::par_aligned_mut;
 use crate::quant;
 use crate::weights::WeightSource;
 
@@ -711,21 +713,23 @@ fn narrow_and_round_trip(
     round_trip_rows(values, width, block, element, rule);
 }
 
-/// Reads a block-scaled fp8 Linear weight and multiplies in its E8M0 grid (model.py:229-232).
+/// Reads a block-scaled Linear weight in the representation its source stores it in.
+///
+/// A released checkpoint serves F8-E4M3 codes plus E8M0 Block32 scales, so this returns
+/// [WeightView::Coded] and the caller's matmul runs the fused kernel with no f32 weight buffer.
+/// An f32 source (every fixture) returns [WeightView::F32], the exact old materialised path. The
+/// dtype branch is once per weight read, never per element.
 ///
 /// # Errors
 ///
 /// As [weight], plus [EngineError::Shape] when the weight or grid does not match `rows` by `cols`.
-fn dense_weight(
-    src: Reads<'_>,
+fn dense_view<'a>(
+    src: Reads<'a>,
     name: &str,
     rows: usize,
     cols: usize,
-) -> Result<Vec<f32>, EngineError> {
-    let mut values = weight(src, &format!("{name}.weight"))?;
-    let scales = weight(src, &format!("{name}.scale"))?;
-    linalg::apply_scales(&mut values, rows, cols, &scales, ScaleGrid::Block32)?;
-    Ok(values)
+) -> Result<WeightView<'a>, EngineError> {
+    WeightView::read_dense(src.source, name, rows, cols, ScaleGrid::Block32, src.limit)
 }
 
 /// Reads a weight whose scale grid may be absent: `wo_a` is fp8 in the file and bf16 after
@@ -734,19 +738,28 @@ fn dense_weight(
 /// # Errors
 ///
 /// As [weight], plus [EngineError::Shape] when a grid that is present does not match.
-fn scaled_or_plain_weight(
-    src: Reads<'_>,
+fn scaled_or_plain_view<'a>(
+    src: Reads<'a>,
     name: &str,
     rows: usize,
     cols: usize,
-) -> Result<Vec<f32>, EngineError> {
-    let mut values = weight(src, &format!("{name}.weight"))?;
-    let scale_name = format!("{name}.scale");
-    if src.source.spec(&scale_name).is_ok() {
-        let scales = weight(src, &scale_name)?;
-        linalg::apply_scales(&mut values, rows, cols, &scales, ScaleGrid::Block32)?;
-    }
-    Ok(values)
+) -> Result<WeightView<'a>, EngineError> {
+    WeightView::read_optional_scale(src.source, name, rows, cols, ScaleGrid::Block32, src.limit)
+}
+
+/// Reads a plain BF16 (or f32) Linear weight, e.g. the compressor, indexer or head projections.
+///
+/// # Errors
+///
+/// As [weight], plus [EngineError::Shape] when the stored element count does not match `rows` by
+/// `cols`.
+fn plain_view<'a>(
+    src: Reads<'a>,
+    name: &str,
+    rows: usize,
+    cols: usize,
+) -> Result<WeightView<'a>, EngineError> {
+    WeightView::read_plain(src.source, name, rows, cols, src.limit)
 }
 
 /// The sparse attention kernel for one query: gathers `indices` out of `kv` and weights them
@@ -797,9 +810,8 @@ pub fn sparse_attention(
         ));
     }
     let rows = kv.len() / head_dim;
-    for head in 0..heads {
+    let attention_head = |head: usize, output: &mut [f32]| {
         let query = &q[head * head_dim..(head + 1) * head_dim];
-        let output = &mut out[head * head_dim..(head + 1) * head_dim];
         let mut scores_max = SCORE_FLOOR;
         for &index in indices {
             if index < rows {
@@ -832,6 +844,19 @@ pub fn sparse_attention(
             for value in output.iter_mut() {
                 *value /= denominator;
             }
+        }
+    };
+    if heads >= 4 {
+        // One lane per head: each head is an independent dot/softmax/P*V sequence, and no lane
+        // touches another head's scores or output. Per-head arithmetic and head order are unchanged.
+        par_aligned_mut(&mut out[..heads * head_dim], head_dim, 1, |first, chunk| {
+            for (index, lane) in chunk.chunks_mut(head_dim).enumerate() {
+                attention_head(first + index, lane);
+            }
+        });
+    } else {
+        for head in 0..heads {
+            attention_head(head, &mut out[head * head_dim..(head + 1) * head_dim]);
         }
     }
     Ok(())
@@ -958,9 +983,14 @@ fn compressor_step(
     let norm = weight(src, &format!("{prefix}.attn.compressor.norm.weight"))?;
     if ratio == 1 {
         // model.py:461-462: one token per group, so a plain projection with no gate and no pooling.
-        let wkv = weight(src, &format!("{prefix}.attn.compressor.wkv.weight"))?;
+        let wkv = plain_view(
+            src,
+            &format!("{prefix}.attn.compressor.wkv.weight"),
+            head_dim,
+            dim,
+        )?;
         let mut latent = vec![0.0; seqlen * head_dim];
-        linalg::matmul(&mut latent, x, &wkv, head_dim, dim, seqlen)?;
+        wkv.matmul(&mut latent, x, head_dim, dim, seqlen)?;
         // At ratio 1 the reference keeps bf16 wkv weights and returns norm(wkv(x)) as a bf16
         // tensor (model.py:446-449, 461-463).
         narrow_bf16(&mut latent);
@@ -976,12 +1006,22 @@ fn compressor_step(
         state.kv_state = vec![0.0; ratio * head_dim];
         state.score_state = vec![f32::NEG_INFINITY; ratio * head_dim];
     }
-    let wkv = weight(src, &format!("{prefix}.attn.compressor.wkv.weight"))?;
-    let wgate = weight(src, &format!("{prefix}.attn.compressor.wgate.weight"))?;
+    let wkv = plain_view(
+        src,
+        &format!("{prefix}.attn.compressor.wkv.weight"),
+        head_dim,
+        dim,
+    )?;
+    let wgate = plain_view(
+        src,
+        &format!("{prefix}.attn.compressor.wgate.weight"),
+        head_dim,
+        dim,
+    )?;
     let mut kv = vec![0.0; seqlen * head_dim];
-    linalg::matmul(&mut kv, x, &wkv, head_dim, dim, seqlen)?;
+    wkv.matmul(&mut kv, x, head_dim, dim, seqlen)?;
     let mut score = vec![0.0; seqlen * head_dim];
-    linalg::matmul(&mut score, x, &wgate, head_dim, dim, seqlen)?;
+    wgate.matmul(&mut score, x, head_dim, dim, seqlen)?;
     // One scratch weight per pool slot, reused by every group in this call.
     let mut weights = vec![0.0f32; ratio];
     let rows = end_pos / ratio - start_pos / ratio;
@@ -1197,16 +1237,38 @@ where
 
 /// The host path of the indexer query projection: read the fp8 weight in its grid and run the
 /// native rule.
+///
+/// This is [indexer_wq_b_native] with the weight kept in its stored representation, so the fp8
+/// projection runs the fused kernel instead of a materialised f32 matrix. The activation, the
+/// matmul order and the bf16 narrowing are the same calls in the same order.
 fn index_source_wq_b(request: &IndexRequest<'_>) -> Result<Vec<f32>, EngineError> {
     let config = request.config;
     let cols = config.index_n_heads.saturating_mul(config.index_head_dim);
-    let wq_b = dense_weight(
+    let inner = config.q_lora_rank;
+    let latent_values = request.seqlen.saturating_mul(inner);
+    if request.q.len() < latent_values {
+        return Err(shape(
+            "indexer wq_b",
+            format!(
+                "{} rows of {inner} values need {latent_values} latent, got {}",
+                request.seqlen,
+                request.q.len()
+            ),
+        ));
+    }
+    let wq_b = dense_view(
         request.src,
         &format!("{}.attn.indexer.wq_b", request.prefix),
         cols,
-        config.q_lora_rank,
+        inner,
     )?;
-    indexer_wq_b_native(request.q, &wq_b, request.seqlen, cols, config.q_lora_rank)
+    let activation = indexer_activation_native(&request.q[..latent_values], inner);
+    let mut out = vec![0.0; request.seqlen * cols];
+    wq_b.matmul(&mut out, &activation, cols, inner, request.seqlen)?;
+    for value in out.iter_mut() {
+        *value = quant::bf16_round(*value);
+    }
+    Ok(out)
 }
 
 /// The indexer's scores for one index source, bf16 all the way (model.py:553-557).
@@ -1847,9 +1909,9 @@ impl AttentionProjectionBackend for HostAttentionProjectionBackend {
         let dim = config.dim;
         let rank = config.q_lora_rank;
         let seqlen = rows_of(x, dim, "attention input")?;
-        let wq_a = dense_weight(src, &format!("{prefix}.attn.wq_a"), rank, dim)?;
+        let wq_a = dense_view(src, &format!("{prefix}.attn.wq_a"), rank, dim)?;
         let mut latent = vec![0.0; seqlen * rank];
-        linalg::matmul(&mut latent, x, &wq_a, rank, dim, seqlen)?;
+        wq_a.matmul(&mut latent, x, rank, dim, seqlen)?;
         Ok(latent)
     }
 
@@ -1866,9 +1928,9 @@ impl AttentionProjectionBackend for HostAttentionProjectionBackend {
         let rank = config.q_lora_rank;
         let cols = config.n_heads * config.head_dim;
         let seqlen = rows_of(latent, rank, "q latent")?;
-        let wq_b = dense_weight(src, &format!("{prefix}.attn.wq_b"), cols, rank)?;
+        let wq_b = dense_view(src, &format!("{prefix}.attn.wq_b"), cols, rank)?;
         let mut q = vec![0.0; seqlen * cols];
-        linalg::matmul(&mut q, latent, &wq_b, cols, rank, seqlen)?;
+        wq_b.matmul(&mut q, latent, cols, rank, seqlen)?;
         Ok(q)
     }
 
@@ -1885,9 +1947,9 @@ impl AttentionProjectionBackend for HostAttentionProjectionBackend {
         let dim = config.dim;
         let head_dim = config.head_dim;
         let seqlen = rows_of(x, dim, "attention input")?;
-        let wkv = dense_weight(src, &format!("{prefix}.attn.wkv"), head_dim, dim)?;
+        let wkv = dense_view(src, &format!("{prefix}.attn.wkv"), head_dim, dim)?;
         let mut kv = vec![0.0; seqlen * head_dim];
-        linalg::matmul(&mut kv, x, &wkv, head_dim, dim, seqlen)?;
+        wkv.matmul(&mut kv, x, head_dim, dim, seqlen)?;
         Ok(kv)
     }
 
@@ -1908,17 +1970,57 @@ impl AttentionProjectionBackend for HostAttentionProjectionBackend {
         let wide_row = heads * head_dim;
         let seqlen = rows_of(wide, wide_row, "attention wide")?;
         let grouped_width = groups * config.o_lora_rank;
-        let wo_a =
-            scaled_or_plain_weight(src, &format!("{prefix}.attn.wo_a"), grouped_width, group_in)?;
+        let wo_a_name = format!("{prefix}.attn.wo_a");
+        let wo_a = scaled_or_plain_view(src, &wo_a_name, grouped_width, group_in)?;
+        // A grid whose row blocks do not start on a 32-row boundary (the tiny configuration's
+        // o_lora_rank 8), or a packed grid whose block starts mid-byte, cannot slice its stored
+        // representation by row block. Those geometries keep the old materialised path, which is
+        // exact for any block size; the released checkpoint's o_lora_rank is a multiple of 32.
+        let materialised = if wo_a.row_blocks_supported(config.o_lora_rank, group_in) {
+            None
+        } else {
+            let scale_name = format!("{wo_a_name}.scale");
+            let mut values = weight(src, &format!("{wo_a_name}.weight"))?;
+            if src.source.spec(&scale_name).is_ok() {
+                let scales = weight(src, &scale_name)?;
+                linalg::apply_scales(
+                    &mut values,
+                    grouped_width,
+                    group_in,
+                    &scales,
+                    ScaleGrid::Block32,
+                )?;
+            }
+            Some(values)
+        };
         let mut grouped = vec![0.0; seqlen * grouped_width];
         for query in 0..seqlen {
-            for group in 0..groups {
-                let source = &wide[query * wide_row + group * group_in..][..group_in];
-                let block =
-                    &wo_a[group * config.o_lora_rank * group_in..][..config.o_lora_rank * group_in];
-                let dest = &mut grouped[query * grouped_width + group * config.o_lora_rank..]
-                    [..config.o_lora_rank];
-                linalg::matmul(dest, source, block, config.o_lora_rank, group_in, 1)?;
+            let wide_row_values = &wide[query * wide_row..][..wide_row];
+            let dest = &mut grouped[query * grouped_width..][..grouped_width];
+            if let Some(values) = &materialised {
+                for group in 0..groups {
+                    let source = &wide_row_values[group * group_in..][..group_in];
+                    let row_start = group * config.o_lora_rank;
+                    let block = &values[row_start * group_in..][..config.o_lora_rank * group_in];
+                    let block_out = &mut dest[row_start..][..config.o_lora_rank];
+                    linalg::matmul(block_out, source, block, config.o_lora_rank, group_in, 1)?;
+                }
+            } else if wo_a.supports_grouped() {
+                wo_a.matmul_grouped(dest, wide_row_values, groups, config.o_lora_rank, group_in)?;
+            } else {
+                for group in 0..groups {
+                    let source = &wide_row_values[group * group_in..][..group_in];
+                    let row_start = group * config.o_lora_rank;
+                    let block_out = &mut dest[row_start..][..config.o_lora_rank];
+                    wo_a.matmul_rows(
+                        block_out,
+                        source,
+                        config.o_lora_rank,
+                        group_in,
+                        1,
+                        row_start,
+                    )?;
+                }
             }
         }
         Ok(grouped)
@@ -1935,14 +2037,14 @@ impl AttentionProjectionBackend for HostAttentionProjectionBackend {
         let src = Reads { source, limit };
         let grouped_width = config.o_groups * config.o_lora_rank;
         let seqlen = rows_of(grouped, grouped_width, "grouped lo")?;
-        let wo_b = dense_weight(
+        let wo_b = dense_view(
             src,
             &format!("{prefix}.attn.wo_b"),
             config.dim,
             grouped_width,
         )?;
         let mut out = vec![0.0; seqlen * config.dim];
-        linalg::matmul(&mut out, grouped, &wo_b, config.dim, grouped_width, seqlen)?;
+        wo_b.matmul(&mut out, grouped, config.dim, grouped_width, seqlen)?;
         Ok(out)
     }
 }
@@ -2104,12 +2206,17 @@ fn index_weights(
 ) -> Result<Vec<f32>, EngineError> {
     let dim = config.dim;
     let heads = config.index_n_heads;
-    let projection = weight(src, &format!("{prefix}.attn.indexer.weights_proj.weight"))?;
+    let projection = plain_view(
+        src,
+        &format!("{prefix}.attn.indexer.weights_proj.weight"),
+        heads,
+        dim,
+    )?;
     // The projection is a bf16 Linear over the bf16 layer input and hands back bf16; the factor
     // then multiplies that bf16 tensor and narrows the product (model.py:513, 555).
     let rounded: Vec<f32> = x.iter().map(|value| quant::bf16_round(*value)).collect();
     let mut values = vec![0.0; seqlen * heads];
-    linalg::matmul(&mut values, &rounded, &projection, heads, dim, seqlen)?;
+    projection.matmul(&mut values, &rounded, heads, dim, seqlen)?;
     for value in values.iter_mut() {
         *value = quant::bf16_round(*value);
     }
@@ -2146,13 +2253,17 @@ fn write_index_keys(
     }
     let head_dim = config.head_dim;
     let index_head_dim = config.index_head_dim;
-    let wk = weight(src, &format!("{prefix}.attn.indexer.wk.weight"))?;
+    let wk = plain_view(
+        src,
+        &format!("{prefix}.attn.indexer.wk.weight"),
+        index_head_dim,
+        head_dim,
+    )?;
     let norm = weight(src, &format!("{prefix}.attn.indexer.k_norm.weight"))?;
     let mut keys = vec![0.0; state.latent_rows * index_head_dim];
-    linalg::matmul(
+    wk.matmul(
         &mut keys,
         &state.latent,
-        &wk,
         index_head_dim,
         head_dim,
         state.latent_rows,
@@ -4342,6 +4453,45 @@ mod tests {
                 many.to_bits(),
                 "value {index} differs between one projection and the chunked one"
             );
+        }
+    }
+
+    #[test]
+    fn head_parallel_sparse_attention_is_bit_identical_to_one_thread() {
+        // Heads are independent lanes: splitting them across threads must not move a single bit.
+        let heads = 8usize;
+        let head_dim = 8usize;
+        let keys = 13usize;
+        let q: Vec<f32> = (0..heads * head_dim)
+            .map(|index| 0.013 * index as f32 - 0.4)
+            .collect();
+        let kv: Vec<f32> = (0..keys * head_dim)
+            .map(|index| {
+                let mixed = (index.wrapping_mul(7) % 11) as f32;
+                (mixed - 5.0) * 0.02
+            })
+            .collect();
+        let sink: Vec<f32> = (0..heads).map(|head| 0.1 * head as f32 - 0.2).collect();
+        let indices: Vec<usize> = vec![0, 3, 4, 7, 9, 12, NO_INDEX, 2];
+        let run = |threads: usize| {
+            crate::parallel::with_reference_threads(threads, || {
+                let mut out = vec![0.0f32; heads * head_dim];
+                sparse_attention(&q, &kv, &sink, &indices, heads, head_dim, 0.5, &mut out)
+                    .expect("the sparse kernel runs");
+                out
+            })
+        };
+        let serial = run(1);
+        for threads in [2usize, 4, 20] {
+            let parallel = run(threads);
+            assert_eq!(parallel.len(), serial.len());
+            for (index, (one, many)) in serial.iter().zip(parallel.iter()).enumerate() {
+                assert_eq!(
+                    one.to_bits(),
+                    many.to_bits(),
+                    "value {index} differs between one thread and {threads}"
+                );
+            }
         }
     }
 }

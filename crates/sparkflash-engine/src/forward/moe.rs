@@ -36,6 +36,8 @@
 use std::fmt::Write as _;
 
 use crate::config::{ConfigError, ModelConfig};
+use crate::dtype::DType;
+use crate::forward::weight_view::WeightView;
 use crate::linalg::{self, EngineError, ScaleGrid};
 use crate::parallel::{enter_worker, reference_threads};
 use crate::weights::WeightSource;
@@ -181,15 +183,15 @@ impl MoeScratch {
 
     /// Reads one expert body's three weights under the caller's element limit, each already
     /// multiplied by its scale grid.
-    fn read_expert(
+    fn read_expert<'a>(
         &mut self,
         cfg: &ModelConfig,
-        src: &dyn WeightSource,
+        src: &'a dyn WeightSource,
         prefix: &str,
         body: ExpertBody,
         limit: usize,
         local_inter: Option<usize>,
-    ) -> Result<ExpertWeights, EngineError> {
+    ) -> Result<ExpertWeights<'a>, EngineError> {
         let dim = cfg.dim;
         let (inter, grid) = match body {
             ExpertBody::Routed(expert) => {
@@ -274,14 +276,15 @@ enum ExpertBody {
     Shared,
 }
 
-/// The three weights of one expert body, decoded and scaled, with its intermediate width.
-struct ExpertWeights {
+/// The three weights of one expert body, as stored (a fused view on a release source), with its
+/// intermediate width.
+struct ExpertWeights<'a> {
     /// The gate projection `w1`, `[inter, dim]`.
-    w1: Vec<f32>,
+    w1: WeightView<'a>,
     /// The up projection `w3`, `[inter, dim]`.
-    w3: Vec<f32>,
+    w3: WeightView<'a>,
     /// The down projection `w2`, `[dim, inter]`.
-    w2: Vec<f32>,
+    w2: WeightView<'a>,
     /// The intermediate width `inter` these three share.
     inter: usize,
 }
@@ -318,20 +321,151 @@ fn expert_body(
             ),
         ));
     }
-    linalg::matmul(&mut gate_branch[..inter], row, &expert.w1, inter, dim, 1)?;
-    linalg::matmul(&mut up_branch[..inter], row, &expert.w3, inter, dim, 1)?;
+    expert
+        .w1
+        .matmul(&mut gate_branch[..inter], row, inter, dim, 1)?;
+    expert
+        .w3
+        .matmul(&mut up_branch[..inter], row, inter, dim, 1)?;
     swiglu(cfg, &mut gate_branch[..inter], &up_branch[..inter])?;
     for value in &mut gate_branch[..inter] {
         *value *= weight;
     }
-    linalg::matmul(
-        &mut out[..dim],
-        &gate_branch[..inter],
-        &expert.w2,
+    expert
+        .w2
+        .matmul(&mut out[..dim], &gate_branch[..inter], dim, inter, 1)
+}
+
+/// The routed expert block for a single token: one batched F4 call for the gate/up branches of every
+/// chosen expert and one for the down projections.
+///
+/// The per-row arithmetic is [crate::linalg::matmul_f4_experts], which is bit-identical to the fused
+/// per-expert call; the routing weight is applied to the SwiGLU row before the down projection, as
+/// in [expert_body]. The contributions are written expert-ascending into `out`, the order the
+/// combine loop adds them. Returns `false` when a selected weight is not a packed F4 PerRow32
+/// weight, leaving `out` untouched so the caller can run the generic path.
+#[allow(clippy::too_many_arguments)] // the routed body's inputs; bundling them would hide the shard
+fn compute_routed_batched(
+    cfg: &ModelConfig,
+    prefix: &str,
+    x: &[f32],
+    src: &dyn WeightSource,
+    limit: usize,
+    local_inter: Option<usize>,
+    choices: &[(usize, usize, f32)],
+    out: &mut [f32],
+) -> Result<bool, EngineError> {
+    let dim = cfg.dim;
+    let inter = local_inter.unwrap_or(cfg.moe_inter_dim);
+    let count = choices.len();
+    let mut weights = Vec::with_capacity(count);
+    for &(_, expert, _) in choices {
+        let base = format!("{prefix}.ffn.experts.{expert}");
+        let w1 = WeightView::read_dense(
+            src,
+            &format!("{base}.w1"),
+            inter,
+            dim,
+            ScaleGrid::PerRow32,
+            limit,
+        )?;
+        let w3 = WeightView::read_dense(
+            src,
+            &format!("{base}.w3"),
+            inter,
+            dim,
+            ScaleGrid::PerRow32,
+            limit,
+        )?;
+        let w2 = WeightView::read_dense(
+            src,
+            &format!("{base}.w2"),
+            dim,
+            inter,
+            ScaleGrid::PerRow32,
+            limit,
+        )?;
+        if w1.f4_parts().is_none() || w3.f4_parts().is_none() || w2.f4_parts().is_none() {
+            return Ok(false);
+        }
+        if w1.grid() != Some(ScaleGrid::PerRow32)
+            || w3.grid() != Some(ScaleGrid::PerRow32)
+            || w2.grid() != Some(ScaleGrid::PerRow32)
+        {
+            return Ok(false);
+        }
+        weights.push(ExpertWeights { w1, w3, w2, inter });
+    }
+
+    // Groups are interleaved [w1_0, w3_0, w1_1, w3_1, ...], with the same token as every input.
+    let mut codes: Vec<&[u8]> = Vec::with_capacity(2 * count);
+    let mut scales: Vec<&[u8]> = Vec::with_capacity(2 * count);
+    for weight in &weights {
+        let (gate_codes, gate_scales) = weight
+            .w1
+            .f4_parts()
+            .expect("the loop checked every weight is packed F4");
+        let (up_codes, up_scales) = weight
+            .w3
+            .f4_parts()
+            .expect("the loop checked every weight is packed F4");
+        codes.push(gate_codes);
+        scales.push(gate_scales);
+        codes.push(up_codes);
+        scales.push(up_scales);
+    }
+    let xs: Vec<&[f32]> = vec![x; 2 * count];
+    let mut branches = vec![0.0f32; 2 * count * inter];
+    linalg::matmul_f4_experts(
+        &mut branches,
+        &xs,
+        &codes,
+        &scales,
+        ScaleGrid::PerRow32,
+        inter,
+        dim,
+    )?;
+    for (index, &(_, _, weight)) in choices.iter().enumerate() {
+        let (gate, up) = branches[2 * index * inter..(2 * index + 2) * inter].split_at_mut(inter);
+        swiglu(cfg, gate, up)?;
+        for value in gate.iter_mut() {
+            *value *= weight;
+        }
+    }
+
+    let codes: Vec<&[u8]> = weights
+        .iter()
+        .map(|weight| {
+            weight
+                .w2
+                .f4_parts()
+                .expect("the loop checked every weight is packed F4")
+                .0
+        })
+        .collect();
+    let scales: Vec<&[u8]> = weights
+        .iter()
+        .map(|weight| {
+            weight
+                .w2
+                .f4_parts()
+                .expect("the loop checked every weight is packed F4")
+                .1
+        })
+        .collect();
+    let xs: Vec<&[f32]> = (0..count)
+        .map(|index| &branches[2 * index * inter..(2 * index + 1) * inter])
+        .collect();
+    linalg::matmul_f4_experts(
+        &mut out[..count * dim],
+        &xs,
+        &codes,
+        &scales,
+        ScaleGrid::PerRow32,
         dim,
         inter,
-        1,
-    )
+    )?;
+    Ok(true)
 }
 
 /// The geometry one weight is expected to have, and how its scale grid maps onto it.
@@ -371,6 +505,47 @@ impl Routing<'_> {
         bias: &[f32],
         bias_vl: Option<&[f32]>,
     ) -> Result<(), EngineError> {
+        let (n_routed, topk) = self.checks(cfg, prefix, x, bias, bias_vl)?;
+        let dim = cfg.dim;
+        if gate.len() != n_routed * dim {
+            return Err(shape_error(
+                &format!("{prefix}.ffn.gate.weight"),
+                format!(
+                    "the configuration routes {n_routed} experts over {dim} values, so the weight is {} values, got {}",
+                    n_routed * dim,
+                    gate.len()
+                ),
+            ));
+        }
+        linalg::matmul(&mut self.scores[..n_routed], x, gate, n_routed, dim, 1)?;
+        self.finish(cfg, prefix, n_routed, topk, bias, bias_vl)
+    }
+
+    /// [Routing::run] over a gate weight the caller reads as a [WeightView]: the released BF16 gate
+    /// goes through the fused BF16 kernel instead of being decoded to f32 first.
+    fn run_with_gate(
+        &mut self,
+        cfg: &ModelConfig,
+        prefix: &str,
+        x: &[f32],
+        gate: &WeightView<'_>,
+        bias: &[f32],
+        bias_vl: Option<&[f32]>,
+    ) -> Result<(), EngineError> {
+        let (n_routed, topk) = self.checks(cfg, prefix, x, bias, bias_vl)?;
+        gate.matmul(&mut self.scores[..n_routed], x, n_routed, cfg.dim, 1)?;
+        self.finish(cfg, prefix, n_routed, topk, bias, bias_vl)
+    }
+
+    /// The slice and selection-bias checks both entry points share.
+    fn checks(
+        &self,
+        cfg: &ModelConfig,
+        prefix: &str,
+        x: &[f32],
+        bias: &[f32],
+        bias_vl: Option<&[f32]>,
+    ) -> Result<(usize, usize), EngineError> {
         let (n_routed, topk) = counts(cfg, prefix)?;
         let dim = cfg.dim;
         if x.len() != dim {
@@ -385,16 +560,6 @@ impl Routing<'_> {
                 format!(
                     "the scratch holds {} scores, {prefix} routes over {n_routed} experts",
                     self.scores.len()
-                ),
-            ));
-        }
-        if gate.len() != n_routed * dim {
-            return Err(shape_error(
-                &format!("{prefix}.ffn.gate.weight"),
-                format!(
-                    "the configuration routes {n_routed} experts over {dim} values, so the weight is {} values, got {}",
-                    n_routed * dim,
-                    gate.len()
                 ),
             ));
         }
@@ -416,6 +581,19 @@ impl Routing<'_> {
                 ),
             ));
         }
+        Ok((n_routed, topk))
+    }
+
+    /// The score function, selection and weighting, shared by both gate representations.
+    fn finish(
+        &mut self,
+        cfg: &ModelConfig,
+        _prefix: &str,
+        n_routed: usize,
+        topk: usize,
+        bias: &[f32],
+        bias_vl: Option<&[f32]>,
+    ) -> Result<(), EngineError> {
         let temperature = cfg.gate_temp as f32;
         // The reference divides the scores by this, so anything that is not a positive, finite
         // temperature is a configuration the router cannot run: a negative one would turn every
@@ -430,9 +608,8 @@ impl Routing<'_> {
         }
 
         // scores = linear(x, gate.weight) / gate_temp, then the configured score function
-        // (model.py:811-817).
+        // (model.py:811-817). The matmul has already written the unbiased scores.
         let scores = &mut self.scores[..n_routed];
-        linalg::matmul(scores, x, gate, n_routed, dim, 1)?;
         for value in scores.iter_mut() {
             *value /= temperature;
         }
@@ -654,17 +831,9 @@ fn routed_forward_impl(
     scratch.name.clear();
     write!(scratch.name, "{prefix}.ffn.gate.weight")
         .expect("a String cannot fail to be written to");
-    let gate = linalg::decode_by_name(src, &scratch.name, limit)?;
-    if gate.len() != n_routed * dim {
-        return Err(shape_error(
-            &scratch.name,
-            format!(
-                "the configuration routes {n_routed} experts over {dim} values, so the weight is {} values, got {}",
-                n_routed * dim,
-                gate.len()
-            ),
-        ));
-    }
+    // BF16 in the checkpoint and unquantised: the view keeps the stored bytes and the fused BF16
+    // kernel scores the token from them, so a layer no longer decodes a 384x4096 table to f32.
+    let gate = WeightView::read_plain(src, &scratch.name, n_routed, dim, limit)?;
     scratch.name.clear();
     write!(scratch.name, "{prefix}.ffn.gate.bias").expect("a String cannot fail to be written to");
     let bias = linalg::decode_by_name(src, &scratch.name, limit)?;
@@ -688,7 +857,7 @@ fn routed_forward_impl(
             selected: &mut scratch.selected,
         };
         for token in 0..tokens {
-            routing.run(
+            routing.run_with_gate(
                 cfg,
                 prefix,
                 &x[token * dim..(token + 1) * dim],
@@ -709,6 +878,30 @@ fn routed_forward_impl(
         .sort_unstable_by_key(|(token, expert, _)| (*expert, *token));
     let groups = expert_groups(&scratch.choices);
     let mut contrib = vec![0.0f32; scratch.choices.len() * dim];
+    // A fused coded expert runs its whole k-loop inside the kernel's own pool, and
+    // [crate::parallel::enter_worker] would make those kernels serial inside a worker. The fused
+    // path therefore runs one serial expert loop so every matmul gets the pool; the arithmetic is
+    // identical because [expert_body] is the same body and the contributions are disjoint rows.
+    let first_expert = format!("{prefix}.ffn.experts.0.w1.weight");
+    let fused = matches!(
+        src.spec(&first_expert).map(|spec| spec.dtype),
+        Ok(DType::F4E2M1 | DType::F8E4M3)
+    );
+    // A decode step routes one token to its top-k experts: the batched F4 kernel takes every
+    // selected expert in one parallel region, with the per-row arithmetic of the fused single call.
+    let mut batched = false;
+    if fused && tokens == 1 && !scratch.choices.is_empty() {
+        batched = compute_routed_batched(
+            cfg,
+            prefix,
+            &x[..dim],
+            src,
+            limit,
+            local_inter,
+            &scratch.choices,
+            &mut contrib,
+        )?;
+    }
     let pass = RoutedPass {
         cfg,
         prefix,
@@ -718,8 +911,14 @@ fn routed_forward_impl(
         choices: &scratch.choices,
         local_inter,
     };
-    let workers = reference_threads().min(groups.len()).max(1);
-    if workers <= 1 {
+    let workers = if fused {
+        1
+    } else {
+        reference_threads().min(groups.len()).max(1)
+    };
+    if batched {
+        // done: the batched kernel filled every choice's contribution row
+    } else if workers <= 1 {
         compute_routed(&pass, &groups, &mut contrib)?;
     } else {
         // One worker per contiguous run of experts. Every worker computes its choices' expert
@@ -810,7 +1009,13 @@ pub fn add_shared_expert(
     }
     let tokens = x.len() / dim;
     let shared = scratch.read_expert(cfg, src, prefix, ExpertBody::Shared, limit, None)?;
-    let shared_workers = reference_threads().min(tokens).max(1);
+    // Same guard as the routed experts: a fused shared expert must run outside a worker pool.
+    let shared_fused = !matches!(shared.w1, WeightView::F32(_));
+    let shared_workers = if shared_fused {
+        1
+    } else {
+        reference_threads().min(tokens).max(1)
+    };
     if shared_workers <= 1 {
         for token in 0..tokens {
             expert_body(
@@ -1051,38 +1256,26 @@ fn swiglu(
 ///
 /// [EngineError::Shape] when the decoded weight is not the declared geometry, plus whatever
 /// [crate::linalg::decode_by_name] and [crate::linalg::apply_scales] report.
-fn read_weight(
-    src: &dyn WeightSource,
+fn read_weight<'a>(
+    src: &'a dyn WeightSource,
     name: &mut String,
     base: &str,
     leaf: &str,
     geometry: &WeightGeometry,
     limit: usize,
-) -> Result<Vec<f32>, EngineError> {
+) -> Result<WeightView<'a>, EngineError> {
+    // The view reads `{name}.weight` and `{name}.scale` itself and keeps the stored rep when the
+    // source is coded, so a routed expert is never materialised as f32 on the release path.
     name.clear();
-    write!(name, "{base}.{leaf}.weight").expect("a String cannot fail to be written to");
-    let mut weight = linalg::decode_by_name(src, name, limit)?;
-    if weight.len() != geometry.rows * geometry.cols {
-        return Err(shape_error(
-            name,
-            format!(
-                "the configuration needs {} values, the source holds {}",
-                geometry.rows * geometry.cols,
-                weight.len()
-            ),
-        ));
-    }
-    name.clear();
-    write!(name, "{base}.{leaf}.scale").expect("a String cannot fail to be written to");
-    let scales = linalg::decode_by_name(src, name, limit)?;
-    linalg::apply_scales(
-        &mut weight,
+    write!(name, "{base}.{leaf}").expect("a String cannot fail to be written to");
+    WeightView::read_dense(
+        src,
+        name,
         geometry.rows,
         geometry.cols,
-        &scales,
         geometry.grid,
-    )?;
-    Ok(weight)
+        limit,
+    )
 }
 
 /// A shape refusal naming the operation that could not be applied.

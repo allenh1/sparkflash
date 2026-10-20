@@ -113,6 +113,17 @@ pub trait WeightSource: Send + Sync {
     /// The bytes of one tensor.
     fn read(&self, name: &str) -> Result<Vec<u8>, WeightError>;
 
+    /// The bytes of one tensor as a borrowed view, when the source already holds them.
+    ///
+    /// A resident source keeps every planned tensor in memory for the life of the process; handing
+    /// the forward a borrow instead of a copy removes a per-tensor memcpy from every step. A source
+    /// that cannot borrow (the default) keeps this `None` and the caller falls back to
+    /// [WeightSource::read], so no implementation is forced to change.
+    fn read_view(&self, name: &str) -> Result<Option<&[u8]>, WeightError> {
+        let _ = name;
+        Ok(None)
+    }
+
     /// Named byte ranges of one tensor, for a source that can page a table too large to hold.
     ///
     /// The released Engram tables are 98 GB of FP8 each, far past any element limit the reference

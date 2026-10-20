@@ -666,12 +666,16 @@ fn quantise_fetched(fetched: &[f32]) -> Result<(Vec<u8>, Vec<u8>), EngineError> 
 
 /// The released wkv projection: fp8 W8A8, one 32-column block at a time.
 ///
+/// Test-only now: the decode path runs [crate::linalg::matmul_f8_w8a8], which computes the same
+/// per-row arithmetic in parallel. The twin test keeps this scalar copy as the reference.
+///
 /// For every output row the block's code dot is computed in the device kernel's reduction order
 /// (the five-step `__shfl_down_sync` tree over offsets 16, 8, 4, 2, 1 of
 /// kernels/engram_wkv_sm121.cu), multiplied by that block's activation and weight scales, and
 /// accumulated over ascending blocks; the row is then rounded to bf16, the released Linear's output
 /// dtype (model.py:187-205). The tree order matters: an ascending sum over the same products rounds
 /// differently, which the twin test pins against a recorded pair.
+#[cfg(test)]
 fn wkv_native(
     act_codes: &[u8],
     act_scales: &[u8],
@@ -887,14 +891,18 @@ pub fn engram_forward(
             fetched[column * width..(column + 1) * width].copy_from_slice(&table[at..at + width]);
         }
         let (act_codes, act_scales) = quantise_fetched(&fetched)?;
-        let kv = wkv_native(
+        // The same per-row W8A8 reduction as [wkv_native], parallelised over the independent
+        // output rows by the kernel.
+        let mut kv = vec![0.0f32; out_width];
+        linalg::matmul_f8_w8a8(
+            &mut kv,
             &act_codes,
             &act_scales,
             &wkv_codes,
             &wkv_scales,
             out_width,
             fetched_width,
-        );
+        )?;
         let (key, value) = kv.split_at(hc * dim);
         for copy in 0..hc {
             let stream_at = token * hc_width + copy * dim;
@@ -1865,6 +1873,25 @@ mod tests {
             64,
             SCALE_BLOCK,
         );
+        // The decode path's parallel kernel must produce the same bytes as this scalar copy.
+        let mut kernel = vec![0.0f32; 64];
+        linalg::matmul_f8_w8a8(
+            &mut kernel,
+            &act_codes,
+            &act_scales,
+            &weight_codes,
+            &weight_scales,
+            64,
+            SCALE_BLOCK,
+        )
+        .expect("the w8a8 kernel runs");
+        for row in 0..64 {
+            assert_eq!(
+                kernel[row].to_bits(),
+                projected[row].to_bits(),
+                "kernel row {row} differs from the scalar rule"
+            );
+        }
         let mut tree_differs = false;
         for row in 0..64 {
             let mut products = [0.0f32; SCALE_BLOCK];

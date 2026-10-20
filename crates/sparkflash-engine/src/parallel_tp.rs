@@ -487,6 +487,12 @@ impl WeightSource for ResidentSource {
         }
     }
 
+    fn read_view(&self, name: &str) -> Result<Option<&[u8]>, WeightError> {
+        // The resident cache holds every non-Engram tensor for the process's life, so the forward
+        // can borrow the stored bytes instead of copying them on every step.
+        Ok(self.tensors.get(name).map(|(_, bytes)| bytes.as_slice()))
+    }
+
     fn read_ranges(
         &self,
         name: &str,

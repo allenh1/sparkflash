@@ -25,6 +25,12 @@
 //! unconditionally. It is also not a serving path: Tp4Rank exposes the per-rank step API (open, begin_request,
 //! prefill, decode, metrics) and the serve layer (task-55) owns the HTTP, tokenizer and control
 //! protocol.
+//!
+//! `--bench-steps N` is the shared timing harness for the token-per-second iteration: it runs
+//! begin_request, one prefill of the prompt, then N decode() calls with no HTTP server and no token
+//! streaming, and records per-step wall milliseconds, the mean/median step and decode-only
+//! tokens/second in the evidence JSON. It changes no arithmetic; with --profile the existing
+//! per-step and per-layer timers are the ones it records.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -76,7 +82,7 @@ const ELEMENT_LIMIT: usize = 1 << 31;
 const TWIN_MOE_INTER_DIM: usize = 128;
 
 /// The usage line for the tp4-host stage.
-pub const USAGE: &str = "sparkflash device-chain --run-stage tp4-host --tp-rank N --tp-world-size N --comm-peers IP,IP,... --comm-base-port 29601 (--fixture DIR | --checkpoint DIR) [--prompt TEXT | --prompt-tokens 3,7,11] [--max-tokens 4] [--tokenizer PATH] [--evidence-dir DIR] [--resident-cache] [--profile] [--record-seams] [--reference-check]; tp4-host --write-fixture DIR writes the 40-layer tiny twin, and one rank binds comm-base-port + tp-rank";
+pub const USAGE: &str = "sparkflash device-chain --run-stage tp4-host --tp-rank N --tp-world-size N --comm-peers IP,IP,... --comm-base-port 29601 (--fixture DIR | --checkpoint DIR) [--prompt TEXT | --prompt-tokens 3,7,11] [--max-tokens 4] [--tokenizer PATH] [--evidence-dir DIR] [--resident-cache] [--profile] [--bench-steps N] [--record-seams] [--reference-check]; tp4-host --write-fixture DIR writes the 40-layer tiny twin, and one rank binds comm-base-port + tp-rank";
 
 /// One rank's collected evidence.
 #[derive(Debug, Clone)]
@@ -116,6 +122,41 @@ struct RankOutcome {
     reference: Option<ReferenceCheck>,
     source_mode: &'static str,
     profile: Option<Profiler>,
+    bench: Option<BenchReport>,
+}
+
+/// The decode loop a bench run measured, recorded in the evidence so the natural metric
+/// (tokens/second) is a number in a file, not a line on a terminal.
+#[derive(Debug, Clone)]
+struct BenchReport {
+    /// Decode steps requested with --bench-steps.
+    steps_requested: usize,
+    /// Decode steps actually measured (a failure cannot leave this short; the loop errors).
+    steps_run: usize,
+    /// Prompt tokens the prefill consumed.
+    prefill_tokens: usize,
+    /// Wall milliseconds of the prefill.
+    prefill_ms: u64,
+    /// The token prefill selected at the last prompt position.
+    prefill_token: Option<u32>,
+    /// Per-decode-step wall milliseconds.
+    step_ms: Vec<u64>,
+    /// Per-decode-step bytes returned by read() (Engram rows only when resident).
+    step_rchar: Vec<u64>,
+    /// Per-decode-step disk-sourced bytes.
+    step_read_bytes: Vec<u64>,
+    /// Per-decode-step canonical reduce milliseconds.
+    step_collective_ms: Vec<u64>,
+    /// Decode total wall milliseconds (sum of step_ms).
+    decode_ms: u64,
+    /// Mean decode step, milliseconds.
+    mean_step_ms: f64,
+    /// Median decode step, milliseconds.
+    median_step_ms: f64,
+    /// Decode-only tokens per second: steps_run * 1000 / decode_ms.
+    tokens_per_second: f64,
+    /// Whether the --profile timers were recording during the bench.
+    profile_on: bool,
 }
 
 /// One per-layer routed seam measurement against the unsharded f32 arithmetic on the same input.
@@ -158,6 +199,7 @@ struct HostArgs {
     reference_check: bool,
     resident_cache: bool,
     profile: bool,
+    bench_steps: usize,
 }
 
 impl Default for HostArgs {
@@ -179,6 +221,7 @@ impl Default for HostArgs {
             reference_check: false,
             resident_cache: false,
             profile: false,
+            bench_steps: 0,
         }
     }
 }
@@ -252,6 +295,11 @@ impl HostArgs {
                 }
                 "--resident-cache" => parsed.resident_cache = true,
                 "--profile" => parsed.profile = true,
+                "--bench-steps" => {
+                    parsed.bench_steps = take("--bench-steps")?
+                        .parse()
+                        .map_err(|error| format!("--bench-steps: {error}"))?;
+                }
                 "--record-seams" => parsed.record_seams = true,
                 "--reference-check" => parsed.reference_check = true,
                 other => return Err(format!("unknown argument {other}")),
@@ -346,6 +394,7 @@ fn run_checked(args: &[&str]) -> Result<ExitCode, String> {
         reference_check: parsed.reference_check,
         resident_cache: parsed.resident_cache || parsed.fixture.is_none(),
         profile: parsed.profile || std::env::var("SPARKFLASH_TP4_PROFILE").as_deref() == Ok("1"),
+        bench_steps: parsed.bench_steps,
         tokenizer: parsed.tokenizer.clone(),
     };
     let transport = if parsed.world == 1 {
@@ -381,17 +430,45 @@ fn run_checked(args: &[&str]) -> Result<ExitCode, String> {
     } else {
         wall_ms as f64 / consumed as f64
     };
-    println!(
-        "tp4-host rank {}/{}: {} prompt tokens, {} generated, {} ms wall ({ms_per_token:.2} ms/token, {:.2} tokens/s), {} all-reduces",
-        outcome.rank,
-        outcome.world,
-        outcome.prompt.len(),
-        outcome.generated.len(),
-        wall_ms,
-        tokens_per_second(wall_ms, consumed),
-        outcome.reduce_calls
-    );
+    if outcome.bench.is_some() {
+        println!(
+            "tp4-host rank {}/{}: {} prompt tokens, {} generated, {} ms wall including load and prefill; the bench line below is the decode-only metric",
+            outcome.rank,
+            outcome.world,
+            outcome.prompt.len(),
+            outcome.generated.len(),
+            wall_ms
+        );
+    } else {
+        println!(
+            "tp4-host rank {}/{}: {} prompt tokens, {} generated, {} ms wall ({ms_per_token:.2} ms/token, {:.2} tokens/s), {} all-reduces",
+            outcome.rank,
+            outcome.world,
+            outcome.prompt.len(),
+            outcome.generated.len(),
+            wall_ms,
+            tokens_per_second(wall_ms, consumed),
+            outcome.reduce_calls
+        );
+    }
     println!("tp4-host tokens: {:?}", outcome.generated);
+    if let Some(bench) = &outcome.bench {
+        println!(
+            "tp4-host bench: {} decode steps ({} requested) after {}-token prefill in {} ms; mean {:.1} ms/step, median {:.1} ms, {:.3} tokens/s decode-only{}",
+            bench.steps_run,
+            bench.steps_requested,
+            bench.prefill_tokens,
+            bench.prefill_ms,
+            bench.mean_step_ms,
+            bench.median_step_ms,
+            bench.tokens_per_second,
+            if bench.profile_on {
+                " (profile on)"
+            } else {
+                ""
+            }
+        );
+    }
     if let Some(directory) = &parsed.evidence_dir {
         write_rank_evidence(directory, &outcome, wall_ms)?;
         if outcome.rank == 0 {
@@ -421,6 +498,7 @@ struct RankInput {
     reference_check: bool,
     resident_cache: bool,
     profile: bool,
+    bench_steps: usize,
     tokenizer: Option<PathBuf>,
 }
 
@@ -745,6 +823,7 @@ impl Tp4Rank {
             reference_check: false,
             resident_cache: config.resident_cache,
             profile: false,
+            bench_steps: 0,
             tokenizer: None,
         };
         Self::open_input(&input, transport, config.element_limit).map_err(Tp4Error::new)
@@ -1301,6 +1380,13 @@ impl WeightSource for SharedSource {
             return Ok(bytes);
         }
         self.inner.read(name)
+    }
+    fn read_view(&self, name: &str) -> Result<Option<&[u8]>, WeightError> {
+        Ok(self
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.tensors.get(name))
+            .map(|bytes| bytes.as_slice()))
     }
     fn read_ranges(
         &self,
@@ -1915,6 +2001,87 @@ fn plan_hash(plan: &ShardPlan) -> u64 {
 }
 
 /// Runs one rank of the host twin or the node run and returns its evidence.
+/// Runs the bench loop: one prefill of the prompt, then N decode calls with no HTTP or token
+/// streaming. The per-step cost comes from the same step path as the evidence loop, so the
+/// --profile timers are exactly the ones a normal run records.
+#[allow(clippy::too_many_arguments)]
+fn run_bench_loop(
+    rank: &mut Tp4Rank,
+    input: &RankInput,
+    step_tokens: &mut Vec<Option<u32>>,
+    step_logits: &mut Vec<Vec<f32>>,
+    step_ms: &mut Vec<u64>,
+    step_rchar: &mut Vec<u64>,
+    step_read_bytes: &mut Vec<u64>,
+    step_collective_ms: &mut Vec<u64>,
+    generated: &mut Vec<u32>,
+) -> Result<BenchReport, String> {
+    rank.begin_request(Tp4Sampling::default())
+        .map_err(|error| format!("bench begin_request: {error}"))?;
+    let prefill_started = Instant::now();
+    let last = rank
+        .prefill(&input.prompt)
+        .map_err(|error| format!("bench prefill: {error}"))?;
+    let prefill_ms = prefill_started.elapsed().as_millis() as u64;
+    let prefill_token = last.token;
+    if let Some(token) = prefill_token {
+        generated.push(token);
+    }
+    let mut next = prefill_token;
+    for step in 0..input.bench_steps {
+        let token = next.ok_or_else(|| format!("bench step {step} has no token to consume"))?;
+        let position = rank.state.tokens().len();
+        let (output, cost) = rank
+            .step_with_cost(token, position)
+            .map_err(|error| error.to_string())?;
+        step_ms.push(cost.ms);
+        step_rchar.push(cost.rchar);
+        step_read_bytes.push(cost.read_bytes);
+        step_collective_ms.push(cost.collective_ms);
+        step_tokens.push(output.token);
+        step_logits.push(output.logits);
+        next = output.token;
+        if let Some(token) = output.token {
+            generated.push(token);
+        }
+    }
+    let decode_ms = step_ms.iter().sum::<u64>();
+    let mut sorted = step_ms.clone();
+    sorted.sort_unstable();
+    let steps_run = sorted.len();
+    let median_step_ms = match steps_run {
+        0 => 0.0,
+        len if len.is_multiple_of(2) => (sorted[len / 2 - 1] + sorted[len / 2]) as f64 / 2.0,
+        len => sorted[len / 2] as f64,
+    };
+    let mean_step_ms = if steps_run == 0 {
+        0.0
+    } else {
+        decode_ms as f64 / steps_run as f64
+    };
+    let tokens_per_second = if decode_ms == 0 {
+        0.0
+    } else {
+        steps_run as f64 * 1000.0 / decode_ms as f64
+    };
+    Ok(BenchReport {
+        steps_requested: input.bench_steps,
+        steps_run,
+        prefill_tokens: input.prompt.len(),
+        prefill_ms,
+        prefill_token,
+        step_ms: step_ms.clone(),
+        step_rchar: step_rchar.clone(),
+        step_read_bytes: step_read_bytes.clone(),
+        step_collective_ms: step_collective_ms.clone(),
+        decode_ms,
+        mean_step_ms,
+        median_step_ms,
+        tokens_per_second,
+        profile_on: rank.profiler.is_some(),
+    })
+}
+
 fn run_rank(
     input: &RankInput,
     transport: Option<Box<dyn Transport>>,
@@ -1930,30 +2097,45 @@ fn run_rank(
     let mut step_rchar: Vec<u64> = Vec::with_capacity(total_steps);
     let mut step_read_bytes: Vec<u64> = Vec::with_capacity(total_steps);
     let mut step_collective_ms: Vec<u64> = Vec::with_capacity(total_steps);
-    let mut generated = Vec::with_capacity(input.max_tokens);
-    let mut next_token: Option<u32> = None;
-    for step in 0..total_steps {
-        let token = if step < input.prompt.len() {
-            input.prompt[step]
-        } else {
-            next_token.ok_or_else(|| format!("step {step} has no token to consume"))?
-        };
-        let (output, cost) = rank
-            .step_with_cost(token, step)
-            .map_err(|error| error.to_string())?;
-        step_ms.push(cost.ms);
-        step_rchar.push(cost.rchar);
-        step_read_bytes.push(cost.read_bytes);
-        step_collective_ms.push(cost.collective_ms);
-        step_tokens.push(output.token);
-        let output_token = output.token;
-        step_logits.push(output.logits);
-        next_token = output_token;
-        if step + 1 >= input.prompt.len()
-            && generated.len() < input.max_tokens
-            && let Some(token) = output_token
-        {
-            generated.push(token);
+    let mut generated = Vec::with_capacity(input.max_tokens.max(input.bench_steps + 1));
+    let mut bench: Option<BenchReport> = None;
+    if input.bench_steps > 0 {
+        bench = Some(run_bench_loop(
+            &mut rank,
+            input,
+            &mut step_tokens,
+            &mut step_logits,
+            &mut step_ms,
+            &mut step_rchar,
+            &mut step_read_bytes,
+            &mut step_collective_ms,
+            &mut generated,
+        )?);
+    } else {
+        let mut next_token: Option<u32> = None;
+        for step in 0..total_steps {
+            let token = if step < input.prompt.len() {
+                input.prompt[step]
+            } else {
+                next_token.ok_or_else(|| format!("step {step} has no token to consume"))?
+            };
+            let (output, cost) = rank
+                .step_with_cost(token, step)
+                .map_err(|error| error.to_string())?;
+            step_ms.push(cost.ms);
+            step_rchar.push(cost.rchar);
+            step_read_bytes.push(cost.read_bytes);
+            step_collective_ms.push(cost.collective_ms);
+            step_tokens.push(output.token);
+            let output_token = output.token;
+            step_logits.push(output.logits);
+            next_token = output_token;
+            if step + 1 >= input.prompt.len()
+                && generated.len() < input.max_tokens
+                && let Some(token) = output_token
+            {
+                generated.push(token);
+            }
         }
     }
     let run_ms = run_started.elapsed().as_millis() as u64;
@@ -2043,6 +2225,7 @@ fn run_rank(
         reference,
         source_mode: rank.source_mode,
         profile: rank.profiler.take(),
+        bench,
     };
     Ok(outcome)
 }
@@ -2136,6 +2319,29 @@ fn write_rank_evidence(
     Ok(())
 }
 
+/// The bench section of the evidence: the natural metric in a file.
+fn bench_json(report: &BenchReport, profile_entries: Option<usize>) -> Value {
+    json!({
+        "steps_requested": report.steps_requested,
+        "steps_run": report.steps_run,
+        "prefill_tokens": report.prefill_tokens,
+        "prefill_ms": report.prefill_ms,
+        "prefill_token": report.prefill_token,
+        "decode_ms": report.decode_ms,
+        "mean_step_ms": report.mean_step_ms,
+        "median_step_ms": report.median_step_ms,
+        "tokens_per_second": report.tokens_per_second,
+        "step_ms": report.step_ms,
+        "step_rchar": report.step_rchar,
+        "step_read_bytes": report.step_read_bytes,
+        "step_collective_ms": report.step_collective_ms,
+        "profile_on": report.profile_on,
+        "profile_entries": profile_entries,
+        "profile_decode_first_index": profile_entries.map(|_| report.prefill_tokens),
+        "measure": "decode-only: prefill(ids) once, then --bench-steps decode() calls timed with the same step path and --profile timers; no HTTP server, no token streaming; tokens_per_second = steps_run * 1000 / decode_ms; with --profile, profile.steps holds the prefill_tokens prefill entries first and then the steps_run decode entries, so decode per-class averages use the last steps_run entries",
+    })
+}
+
 fn rank_evidence(outcome: &RankOutcome, wall_ms: u64) -> Value {
     let steps = outcome.step_ms.len().max(1) as u64;
     let per_layer_max: Vec<f64> = {
@@ -2159,6 +2365,10 @@ fn rank_evidence(outcome: &RankOutcome, wall_ms: u64) -> Value {
         "generated_tokens": outcome.generated,
         "completion_text": outcome.completion_text,
         "allocator_tuning": allocator_json(tuning),
+        "bench": outcome
+            .bench
+            .as_ref()
+            .map(|bench| bench_json(bench, outcome.profile.as_ref().map(|profile| profile.steps.len()))),
         "step_tokens": outcome.step_tokens,
         "tokens_per_second": tokens_per_second(outcome.total_ms, outcome.prompt.len() + outcome.generated.len()),
         "timing": {
@@ -2209,8 +2419,6 @@ fn rank_evidence(outcome: &RankOutcome, wall_ms: u64) -> Value {
         "shard": {
             "plan_tensors": outcome.shard_tensors,
             "plan_hash": format!("{:#018x}", outcome.plan_hash),
-        "allocator_tuning": allocator_json(tuning),
-        "profile_steps": outcome.profile.as_ref().map_or(0, |profile| profile.steps.len()),
             "plan_rule": "routed experts column/row; attention, embed, head, shared, router, mHC, norms, engram replicated (Phase 1)",
             "shard_read_calls": outcome.shard_read_calls,
             "shard_read_bytes": outcome.shard_read_bytes,
@@ -2271,6 +2479,10 @@ fn write_summary(directory: &Path, outcome: &RankOutcome, wall_ms: u64) -> Resul
         "generated_tokens": outcome.generated,
         "completion_text": outcome.completion_text,
         "wall_ms": wall_ms,
+        "bench": outcome
+            .bench
+            .as_ref()
+            .map(|bench| bench_json(bench, outcome.profile.as_ref().map(|profile| profile.steps.len()))),
         "tokens_per_second": tokens_per_second(outcome.total_ms, outcome.prompt.len() + outcome.generated.len()),
         "collective": outcome.collective_label,
         "plan_hash": format!("{:#018x}", outcome.plan_hash),
@@ -2356,6 +2568,7 @@ mod tests {
                             reference_check: rank == 0,
                             resident_cache: false,
                             profile: false,
+                            bench_steps: 0,
                             tokenizer: None,
                         };
                         run_rank(&input, Some(Box::new(transport))).expect("rank")
@@ -2584,6 +2797,7 @@ mod tests {
             reference_check: false,
             resident_cache: false,
             profile: false,
+            bench_steps: 0,
             tokenizer: None,
         };
         let mut rank = Tp4Rank::open_input(&input, None, ELEMENT_LIMIT).expect("rank");
@@ -2608,5 +2822,74 @@ mod tests {
             .expect("greedy again");
         assert_eq!(rank.metrics().steps, 0, "begin_request clears the counters");
         rank.prefill(&[5]).expect("single-token prefill");
+    }
+
+    #[test]
+    fn the_bench_flag_parses_and_is_off_by_default() {
+        let off = HostArgs::parse(&["--fixture", "/tmp/twin", "--prompt-tokens", "3,7,11"])
+            .expect("parse");
+        assert_eq!(off.bench_steps, 0);
+        let on = HostArgs::parse(&[
+            "--fixture",
+            "/tmp/twin",
+            "--prompt-tokens",
+            "3,7,11",
+            "--bench-steps",
+            "10",
+        ])
+        .expect("parse");
+        assert_eq!(on.bench_steps, 10);
+    }
+
+    #[test]
+    fn the_world_one_bench_mode_runs_prefill_then_decodes_and_records_tokens_per_second() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        write_twin_fixture(directory.path()).expect("fixture");
+        let input = RankInput {
+            rank: 0,
+            world: 1,
+            source_dir: directory.path().to_path_buf(),
+            source_mode: "fixture",
+            prompt: vec![3, 7, 11],
+            max_tokens: 0,
+            record_seams: false,
+            reference_check: false,
+            resident_cache: false,
+            profile: false,
+            bench_steps: 4,
+            tokenizer: None,
+        };
+        let outcome = run_rank(&input, None).expect("bench rank");
+        assert_eq!(outcome.world, 1);
+        assert_eq!(outcome.reduce_calls, 0, "world 1 is a strict no-op");
+        assert_eq!(
+            outcome.generated.len(),
+            5,
+            "prefill token plus four decodes"
+        );
+        let bench = outcome.bench.as_ref().expect("bench report");
+        assert_eq!(bench.steps_requested, 4);
+        assert_eq!(bench.steps_run, 4);
+        assert_eq!(bench.step_ms.len(), 4);
+        assert_eq!(outcome.step_ms.len(), 4);
+        assert_eq!(bench.prefill_tokens, 3);
+        assert!(bench.prefill_ms > 0);
+        assert!(bench.mean_step_ms > 0.0);
+        assert!(bench.median_step_ms > 0.0);
+        let expected = 4.0 * 1000.0 / bench.decode_ms as f64;
+        assert!((bench.tokens_per_second - expected).abs() < 1e-9);
+        assert!(!bench.profile_on);
+        let evidence = tempfile::tempdir().expect("evidence");
+        write_rank_evidence(evidence.path(), &outcome, outcome.total_ms).expect("evidence");
+        let text = fs::read_to_string(evidence.path().join("tp4-host-r0.json")).expect("read");
+        let value: Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(value["bench"]["steps_run"], 4);
+        assert!(
+            value["bench"]["tokens_per_second"]
+                .as_f64()
+                .expect("tokens/s")
+                > 0.0
+        );
+        assert!(value["bench"]["mean_step_ms"].as_f64().expect("mean") > 0.0);
     }
 }
