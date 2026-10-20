@@ -307,6 +307,15 @@ const TP4_CONTROL_TIMEOUT: Duration = Duration::from_secs(600);
 #[cfg(feature = "tp4-serve")]
 const TP4_CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// How long a worker pauses between control-connect attempts while rank 0's hub is still binding.
+///
+/// Rank 0 binds its control hub only after its own checkpoint load, but a worker connects as soon
+/// as its load finishes, so a worker can legitimately arrive before the listener exists. Retrying
+/// on connection-refused turns that startup race into a short wait instead of a failed start; the
+/// retries stay inside the same startup budget rank 0's hub waits with.
+#[cfg(feature = "tp4-serve")]
+const TP4_CONTROL_CONNECT_RETRY: Duration = Duration::from_millis(100);
+
 /// The Phase-1 TP=4 flags, parsed only when `--tp4-rank` is present.
 ///
 /// The four ranks are four processes with the same binary. Rank 0 owns the HTTP listener, the
@@ -1554,6 +1563,13 @@ pub enum Tp4ControlError {
         /// The protocol stage that timed out.
         stage: &'static str,
     },
+    /// A worker could not reach rank 0's control hub inside the startup budget.
+    ConnectTimeout {
+        /// Rank 0's control address the worker kept trying.
+        address: SocketAddr,
+        /// How long the worker kept retrying before giving up.
+        waited: Duration,
+    },
     /// A frame was received before the group was Ready.
     NotReady {
         /// What the receiver was waiting for.
@@ -1593,6 +1609,10 @@ impl std::fmt::Display for Tp4ControlError {
             } => write!(
                 f,
                 "TP=4 rank 0 waited {waited:?} for {world} ranks and only {joined} joined; the missing rank is a startup refusal, not a single-rank fallback"
+            ),
+            Self::ConnectTimeout { address, waited } => write!(
+                f,
+                "control connect to {address} was still refused after {waited:?}; rank 0's hub was not listening within the TP=4 startup budget"
             ),
             Self::Timeout { stage } => write!(f, "control timeout while waiting for {stage}"),
             Self::NotReady { expected } => {
@@ -1769,6 +1789,12 @@ struct Tp4ControlWorker {
 #[cfg(feature = "tp4-serve")]
 impl Tp4ControlWorker {
     /// Connects to rank 0 and sends Hello; Ready is awaited separately by handshake.
+    ///
+    /// Connection-refused is retried with a short fixed pause for the whole startup budget, because
+    /// rank 0 binds its control hub only after its own checkpoint load: a worker whose load finished
+    /// first arrives before the listener exists and must wait for it rather than fail. Any other
+    /// connect error, and the budget running out, still ends the start with a typed error; running
+    /// out names the peer address and the budget in `Tp4ControlError::ConnectTimeout`.
     fn connect(
         address: SocketAddr,
         rank: u32,
@@ -1778,7 +1804,31 @@ impl Tp4ControlWorker {
         if rank == 0 || usize::try_from(rank).unwrap_or(usize::MAX) >= world {
             return Err(Tp4ControlError::BadRank { rank, world });
         }
-        let stream = TcpStream::connect_timeout(&address, timeout)?;
+        let deadline = Instant::now() + timeout;
+        let stream = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Tp4ControlError::ConnectTimeout {
+                    address,
+                    waited: timeout,
+                });
+            }
+            match TcpStream::connect_timeout(&address, remaining) {
+                Ok(stream) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    std::thread::sleep(TP4_CONTROL_CONNECT_RETRY.min(remaining));
+                }
+                Err(error) => {
+                    if Instant::now() >= deadline {
+                        return Err(Tp4ControlError::ConnectTimeout {
+                            address,
+                            waited: timeout,
+                        });
+                    }
+                    return Err(Tp4ControlError::Io(error));
+                }
+            }
+        };
         stream.set_read_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
         stream.set_write_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
         Ok(Self {
@@ -2891,6 +2941,13 @@ impl ApiInferenceEngine for Tp4Driver {
     }
 }
 
+/// Machine-readable wall clock for the serve timeline lines.
+fn epoch_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis())
+}
+
 /// Writes one rank's counters to stderr, where the ssh log captures them as evidence.
 #[cfg(feature = "tp4-serve")]
 fn log_tp4_metrics(rank: usize, phase: &str, metrics: &Tp4RankMetrics) {
@@ -2934,6 +2991,11 @@ fn tp4_engine_thread(
             return;
         }
     };
+    println!(
+        "sparkflash serve: tp4_timeline rank=0 phase=ready epoch_ms={} load_ms={}",
+        epoch_millis(),
+        rank.metrics().load_ms
+    );
     if ready.send(Ok(())).is_err() {
         return;
     }
@@ -2987,8 +3049,19 @@ fn run_tp4_request(
     })
     .map_err(|error| format!("control Request: {error}"))?;
     let request_started = Instant::now();
+    let prefill_steps_before = rank.metrics().steps;
     let prefill = rank.prefill(&job.prompt_tokens)?;
     let prefill_elapsed = request_started.elapsed();
+    // One line per request so a log reader can check the TTFT identity directly: the host
+    // prefill loop runs one decode-shaped forward per prompt token, so TTFT is linear in the
+    // prompt length at the step cost. See docs/build/tp4-host-twin.md "TTFT and readiness".
+    println!(
+        "sparkflash serve: tp4_prefill rank=0 epoch_ms={} prompt_tokens={} prefill_steps={} prefill_ms={}",
+        epoch_millis(),
+        job.prompt_tokens.len(),
+        rank.metrics().steps.saturating_sub(prefill_steps_before),
+        prefill_elapsed.as_millis()
+    );
     let want_sample = job.logprobs.wants_sample();
     let decode_ids = |ids: &[u32]| -> Result<String, String> {
         tokenizer.tokenizer().decode(ids, false).map_err(|error| {
@@ -3392,6 +3465,10 @@ async fn bind_and_serve(router: axum::Router, requested: SocketAddr) -> ExitCode
             return ExitCode::FAILURE;
         }
     };
+    println!(
+        "sparkflash serve: serve_timeline phase=bind epoch_ms={} addr={bound}",
+        epoch_millis()
+    );
     println!("sparkflash serve: listening on http://{bound}");
     if let Err(error) = axum::serve(listener, router).await {
         eprintln!("sparkflash serve: the server stopped: {error}");
@@ -6680,6 +6757,65 @@ mod tp4_serve_tests {
             }
             other => panic!("expected MissingRank, got {other}"),
         }
+    }
+
+    #[test]
+    fn worker_control_connect_retries_until_the_hub_binds() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let address = listener.local_addr().expect("the listener address");
+        // Release the port so the worker's early connect attempts are refused, exactly the
+        // rank-0-loads-slower startup race; the hub binds after a short delay.
+        drop(listener);
+        let server = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(250));
+            let listener =
+                TcpListener::bind(address).expect("the hub binds after the worker starts trying");
+            let (mut stream, _) = listener.accept().expect("the retried worker connects");
+            let frame = read_control_frame(&mut stream).expect("read the worker Hello");
+            assert!(
+                matches!(frame, Tp4ControlFrame::Hello { rank: 1 }),
+                "{frame:?}"
+            );
+            write_control_frame(&mut stream, &Tp4ControlFrame::Ready).expect("send Ready");
+        });
+        let mut worker = Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(5))
+            .expect("the connect retries until the hub is listening");
+        worker
+            .handshake()
+            .expect("the retried connection handshakes");
+        assert!(worker.ready);
+        server.join().expect("the test hub joins");
+    }
+
+    #[test]
+    fn worker_control_connect_names_the_peer_when_the_hub_never_binds() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let address = listener.local_addr().expect("the listener address");
+        drop(listener);
+        let waited = Duration::from_millis(150);
+        let error = match Tp4ControlWorker::connect(address, 1, 2, waited) {
+            Ok(_) => panic!("a hub that never binds must not report a connected worker"),
+            Err(error) => error,
+        };
+        let display = error.to_string();
+        match error {
+            Tp4ControlError::ConnectTimeout {
+                address: tried,
+                waited: reported,
+            } => {
+                assert_eq!(tried, address);
+                assert_eq!(reported, waited);
+            }
+            other => panic!("expected ConnectTimeout, got {other}"),
+        }
+        assert!(
+            display.contains(&address.to_string()),
+            "the refusal must name the peer: {display}"
+        );
+        assert!(
+            display.contains("150ms"),
+            "the refusal must name the elapsed budget: {display}"
+        );
     }
 
     #[test]

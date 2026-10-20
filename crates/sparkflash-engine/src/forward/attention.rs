@@ -145,6 +145,37 @@ pub fn published_candidates() -> (usize, usize, Vec<bool>) {
     })
 }
 
+/// The compressed KV rows currently published in the shared channel: the owning layer, the row
+/// count and the rows themselves, `head_dim` values per row.
+///
+/// Diagnostic accessor for tests that assert the channel holds one owner's **whole** cache: the
+/// reference's channel points at the last owner's cache (model.py:748, 1173), so a slot holding
+/// only the rows the most recent call appended would be a mixture with holes.
+#[must_use]
+pub fn published_compressed_rows() -> (Option<usize>, usize, Vec<f32>) {
+    with_shared(|shared| {
+        (
+            shared.compressed_owner,
+            shared.compressed_rows,
+            shared.compressed.clone(),
+        )
+    })
+}
+
+/// The index keys currently published in the shared channel, in the same shape as
+/// [published_compressed_rows]: the owning layer, the row count and the keys,
+/// `index_head_dim` values per row.
+#[must_use]
+pub fn published_index_keys() -> (Option<usize>, usize, Vec<f32>) {
+    with_shared(|shared| {
+        (
+            shared.index_owner,
+            shared.index_rows,
+            shared.index_keys.clone(),
+        )
+    })
+}
+
 /// A [EngineError::Shape] naming the item that rejected a geometry.
 fn shape(what: &str, detail: String) -> EngineError {
     EngineError::Shape {
@@ -1573,28 +1604,38 @@ fn store_rows(cache: &mut Vec<f32>, first_row: usize, new_rows: &[f32], width: u
     cache[start..start + new_rows.len()].copy_from_slice(new_rows);
 }
 
-/// Publishes `new_rows` into the channel's copy of a cache.
+/// Publishes an owner's cache into the channel.
 ///
-/// The reference's channel holds a pointer at the last owner's cache (model.py:748, 1173), so a
-/// different layer taking the slot over replaces its contents instead of extending them. That is
-/// what keeps a consumer reading one layer's cache and not a mixture of several.
+/// The reference's channel holds a pointer at the last owner's cache (model.py:748, 1173), so the
+/// slot must hold the owner's **whole** cache: a consumer reading rows `0..len` sees one layer's
+/// history, never a mixture of several layers' rows and never holes. Copying the full cache on each
+/// publication is the host equivalent of moving that pointer. Writing only the rows the current call
+/// appended assumed the owning layer stayed the same across steps, which is false whenever the
+/// backbone has more than one KV source (the released model has four: layers 2, 8, 14 and 20).
+///
+/// This changes results on the shipped decode path, not only on a chunk path: the one-token loop
+/// went through this same publication and could hand a consumer holed rows whenever the owner
+/// changed inside a step, so a real checkpoint's decode was reading a mixture that the f32 fixtures
+/// never exercised (their configs keep one source, or publish all rows at position zero, so no
+/// multi-row owner transition left a hole). Treat a change in the released checkpoint's token
+/// sequence as this fix working, not as a regression.
 fn publish_rows(
     cache: &mut Vec<f32>,
     rows: &mut usize,
     owner: &mut Option<usize>,
     layer: usize,
-    first_row: usize,
-    new_rows: &[f32],
+    owner_cache: &[f32],
     width: usize,
 ) {
-    if *owner != Some(layer) {
-        cache.clear();
-        *owner = Some(layer);
+    if width == 0 {
+        return;
     }
-    store_rows(cache, first_row, new_rows, width);
-    *rows = cache.len().checked_div(width).unwrap_or(0);
+    let published = owner_cache.len() - owner_cache.len() % width;
+    *owner = Some(layer);
+    cache.clear();
+    cache.extend_from_slice(&owner_cache[..published]);
+    *rows = published / width;
 }
-
 /// Which compressed positions each query of this chunk attends to, in the shared index space, with
 /// [`NO_INDEX`] where a query has nothing (model.py:527-580).
 ///
@@ -2244,11 +2285,27 @@ fn write_index_keys(
     state: &mut AttnState,
     src: Reads<'_>,
 ) -> Result<(), EngineError> {
-    if !owns_index_keys(config, layer) || state.latent_rows == 0 {
+    if !owns_index_keys(config, layer) {
         return Ok(());
     }
     let ratio = layer_ratio(config, layer);
     if ratio == 0 {
+        return Ok(());
+    }
+    if state.latent_rows == 0 {
+        // Publish the owner's cache even when this forward adds no key row: the reference's channel
+        // points at the owning layer's cache on every forward (model.py:748, 1173), so a consumer
+        // that runs earlier in the next step must find this owner's cache and not a later source's.
+        with_shared(|shared| {
+            publish_rows(
+                &mut shared.index_keys,
+                &mut shared.index_rows,
+                &mut shared.index_owner,
+                layer,
+                &state.indexer,
+                config.index_head_dim,
+            );
+        });
         return Ok(());
     }
     let head_dim = config.head_dim;
@@ -2301,8 +2358,7 @@ fn write_index_keys(
             &mut shared.index_rows,
             &mut shared.index_owner,
             layer,
-            first_row,
-            &keys,
+            &state.indexer,
             index_head_dim,
         );
     });
@@ -2321,7 +2377,7 @@ fn write_compressed_cache(
     start_pos: usize,
     state: &mut AttnState,
 ) -> Result<(), EngineError> {
-    if state.latent_rows == 0 || !is_kv_source(config, layer) {
+    if !is_kv_source(config, layer) {
         return Ok(());
     }
     let ratio = layer_ratio(config, layer);
@@ -2329,42 +2385,47 @@ fn write_compressed_cache(
         return Ok(());
     }
     let head_dim = config.head_dim;
-    let first_row = start_pos / ratio;
-    let positions: Vec<usize> = (0..state.latent_rows)
-        .map(|row| (first_row + row) * ratio)
-        .collect();
-    let tables = rope_tables_for_layer(config, layer, &positions);
-    rotate_rows(
-        &mut state.latent,
-        state.latent_rows,
-        head_dim,
-        config.rope_head_dim,
-        &tables,
-        false,
-    )?;
-    // The rope writes back into the bf16 latent before the compressed fp4 quantiser reads it
-    // (model.py:757-761).
-    narrow_and_round_trip(
-        &mut state.latent,
-        head_dim,
-        COMPRESS_QUANT_BLOCK,
-        Element::Fp4,
-        ScaleRule::E4M3Six,
-    );
-    let rows = std::mem::take(&mut state.latent);
-    store_rows(&mut state.compressed, first_row, &rows, head_dim);
+    // A step inside a partial group adds no row, but it still publishes the owner's whole cache
+    // below: the reference's channel points at the owning layer's cache on every forward
+    // (model.py:748, 1173), so a consumer that runs earlier in the next step must not read a later
+    // source's cache in its place.
+    if state.latent_rows > 0 {
+        let first_row = start_pos / ratio;
+        let positions: Vec<usize> = (0..state.latent_rows)
+            .map(|row| (first_row + row) * ratio)
+            .collect();
+        let tables = rope_tables_for_layer(config, layer, &positions);
+        rotate_rows(
+            &mut state.latent,
+            state.latent_rows,
+            head_dim,
+            config.rope_head_dim,
+            &tables,
+            false,
+        )?;
+        // The rope writes back into the bf16 latent before the compressed fp4 quantiser reads it
+        // (model.py:757-761).
+        narrow_and_round_trip(
+            &mut state.latent,
+            head_dim,
+            COMPRESS_QUANT_BLOCK,
+            Element::Fp4,
+            ScaleRule::E4M3Six,
+        );
+        let rows = std::mem::take(&mut state.latent);
+        store_rows(&mut state.compressed, first_row, &rows, head_dim);
+        state.latent = rows;
+    }
     with_shared(|shared| {
         publish_rows(
             &mut shared.compressed,
             &mut shared.compressed_rows,
             &mut shared.compressed_owner,
             layer,
-            first_row,
-            &rows,
+            &state.compressed,
             head_dim,
         );
     });
-    state.latent = rows;
     Ok(())
 }
 

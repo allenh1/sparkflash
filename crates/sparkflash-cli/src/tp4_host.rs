@@ -765,6 +765,16 @@ struct StepCost {
     collective_ms: u64,
 }
 
+/// The bisection switch for prefill: when set, the runner keeps the pre-batch-17 one-step-per-token
+/// loop instead of the chunked hybrid step. Read once per prefill call; the decode path never
+/// consults it.
+/// Chunked prefill is opt-in: the batch-17 serve census measured a slower endpoint TTFT with it
+/// than with the token loop, so the serve path keeps the loop as its default until the overhead is
+/// understood (batch 18). Set `SPARKFLASH_TP4_PREFILL_CHUNK=1` to run one layer-major chunk pass.
+fn prefill_chunk_enabled() -> bool {
+    std::env::var_os("SPARKFLASH_TP4_PREFILL_CHUNK").is_some()
+}
+
 /// One rank of the four-node TP=4 host path, as a library.
 ///
 /// Owns the checkpoint source, the shard plan, the one resident cache, the engine, the rank's
@@ -966,11 +976,29 @@ impl Tp4Rank {
         Ok(())
     }
 
-    /// Runs one forward step per prompt token and returns the last position's output.
+    /// Prefills the prompt and returns the last position's output. The default is the
+    /// pre-batch-17 one-step-per-token loop (one hybrid forward per prompt token).
+    ///
+    /// Set `SPARKFLASH_TP4_PREFILL_CHUNK=1` to run the batch-17 chunked hybrid step instead: one
+    /// forward per layer over the whole prompt. It is bit-identical but opt-in, because the batch-17
+    /// serve census measured a slower endpoint TTFT with the chunk path than with the loop (43.6 s
+    /// vs 39.1 s) while the bench harness measures the chunk faster (24.6 s vs 33.1 s at 37 prompt
+    /// tokens); the serve-path overhead is batch-18 work. Single-token prompts always take the
+    /// one-token path.
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, Tp4Error> {
         if tokens.is_empty() {
             return Err(Tp4Error::new("prefill needs at least one token"));
         }
+        if tokens.len() == 1 || !prefill_chunk_enabled() {
+            self.prefill_token_loop(tokens)
+        } else {
+            self.prefill_chunk(tokens)
+        }
+    }
+
+    /// The pre-batch-17 prefill: one hybrid step per prompt token. Kept for bisection and for the
+    /// one-token case; it is exactly what every earlier RUN measured.
+    fn prefill_token_loop(&mut self, tokens: &[u32]) -> Result<StepOutput, Tp4Error> {
         let mut last = StepOutput {
             token: None,
             logits: Vec::new(),
@@ -979,6 +1007,147 @@ impl Tp4Rank {
             last = self.step(token)?;
         }
         Ok(last)
+    }
+
+    /// The chunked prefill: one `run_hybrid_sequence_chunk` call over the whole prompt.
+    ///
+    /// The engine still asks the host for one provider entry per (layer, position) and one post
+    /// handoff per layer for the whole chunk; the runner feeds per-position Engram hashes and the
+    /// chunk-sized post buffers, then records ONE profile entry for the chunk (`prefill_tokens`
+    /// of them) so the decode-only slice stays the last `steps_run` entries.
+    fn prefill_chunk(&mut self, tokens: &[u32]) -> Result<StepOutput, Tp4Error> {
+        let Self {
+            config,
+            source,
+            shared,
+            engine,
+            collective,
+            backend,
+            state,
+            profiler,
+            ..
+        } = self;
+        let start_pos = state.tokens().len();
+        let seqlen = tokens.len();
+        // One embedding row per token, concatenated in token order: the chunk entry layout.
+        let mut embeddings = Vec::with_capacity(seqlen * config.dim);
+        for &token in tokens {
+            let row = read_embedding_row(source, config, token).map_err(Tp4Error::new)?;
+            embeddings.extend_from_slice(&row);
+        }
+        // The n-gram rows for every chunk position, hashed once against history + chunk; each
+        // token takes its own per_token slice of the flat [positions, layers, columns] buffer.
+        let mut history = state.tokens().to_vec();
+        history.extend_from_slice(tokens);
+        let mut hashes = Vec::new();
+        engram::ngram_hashes(config, &history, start_pos, &mut hashes)
+            .map_err(|error| Tp4Error::new(format!("engram hashes: {error}")))?;
+        let per_token = hashes.len() / seqlen.max(1);
+        backend.position = start_pos;
+        let providers = HostProviders {
+            config,
+            source: shared,
+        };
+        let profiling = profiler.is_some();
+        let mut layer_provider: Vec<(usize, u64, u64)> = Vec::new();
+        let mut layer_post: Vec<(usize, u64)> = Vec::new();
+        let mut provider = |layer: usize,
+                            position: usize,
+                            hidden: &[f32],
+                            pre_mix: &[f32],
+                            deferred: Option<&DeferredHandoff>| {
+            let started = Instant::now();
+            let span = position * per_token..(position + 1) * per_token;
+            let result = providers.deferred_entry(layer, hidden, pre_mix, deferred, &hashes[span]);
+            if profiling {
+                let micros = started.elapsed().as_micros() as u64;
+                let deferred_us = if deferred.is_some() { micros } else { 0 };
+                layer_provider.push((layer, micros, deferred_us));
+            }
+            result
+        };
+        let mut post = |layer: usize, residual: &[f32], attention_out: &[f32], mixes: &Mixes| {
+            let started = Instant::now();
+            let result = providers.post(layer, residual, attention_out, mixes);
+            if profiling {
+                layer_post.push((layer, started.elapsed().as_micros() as u64));
+            }
+            result
+        };
+        let mut layer_progress: Vec<(usize, u64)> = Vec::new();
+        let mut progress = |layer: usize, host_ms: u64| {
+            if profiling {
+                layer_progress.push((layer, host_ms));
+            }
+        };
+        let (rchar_before, read_before) = io_counters();
+        let collective_before = collective.elapsed_ms();
+        let (user_before, sys_before) = process_cpu_us();
+        let started = Instant::now();
+        let output = engine
+            .run_hybrid_sequence_chunk(
+                state,
+                tokens,
+                &embeddings,
+                start_pos,
+                &mut provider,
+                &mut post,
+                // A chunk has no attention-projection seam: the host attention runs inside the
+                // block over the chunk's positions.
+                None,
+                Some(backend),
+                &mut progress,
+            )
+            .map_err(|error| Tp4Error::new(format!("prefill chunk at {start_pos}: {error}")))?;
+        let (rchar_after, read_after) = io_counters();
+        if let Some(profiler) = profiler {
+            let (user_after, sys_after) = process_cpu_us();
+            let mut merged: Vec<ProfileLayer> = Vec::new();
+            for (layer, provider_us, deferred_us) in layer_provider.drain(..) {
+                let entry = profile_layer(&mut merged, layer);
+                entry.provider_us += provider_us;
+                entry.deferred_us += deferred_us;
+            }
+            for (layer, post_us) in layer_post.drain(..) {
+                profile_layer(&mut merged, layer).post_us += post_us;
+            }
+            for (layer, local_us, reduce_us) in backend.ffn_profile.drain(..) {
+                let entry = profile_layer(&mut merged, layer);
+                entry.ffn_local_us = local_us;
+                entry.ffn_reduce_us = reduce_us;
+            }
+            for (layer, shared_us) in backend.shared_profile.drain(..) {
+                profile_layer(&mut merged, layer).shared_us = shared_us;
+            }
+            for (layer, host_ms) in layer_progress.drain(..) {
+                profile_layer(&mut merged, layer).engine_host_ms = host_ms;
+            }
+            merged.sort_by_key(|entry| entry.layer);
+            profiler.steps.push(ProfileStep {
+                position: start_pos,
+                wall_us: started.elapsed().as_micros() as u64,
+                user_us: user_after.saturating_sub(user_before),
+                sys_us: sys_after.saturating_sub(sys_before),
+                rchar: rchar_after.saturating_sub(rchar_before),
+                read_bytes: read_after.saturating_sub(read_before),
+                collective_us: collective.elapsed_ms().saturating_sub(collective_before) * 1000,
+                layers: merged,
+            });
+        }
+        let (_, rss_peak_kib) = rss_kib();
+        let metrics = &mut self.metrics;
+        metrics.steps += seqlen as u64;
+        metrics.last_step_ms = started.elapsed().as_millis() as u64;
+        metrics.rss_peak_kib = metrics.rss_peak_kib.max(rss_peak_kib);
+        metrics.reduce_calls = self.collective.calls.load(Ordering::Relaxed);
+        metrics.reduce_elements = self.collective.elements.load(Ordering::Relaxed);
+        metrics.reduce_ms_total = self.collective.elapsed_ms();
+        metrics.shard_read_calls = self.weights.shard_read_calls();
+        metrics.shard_read_bytes = self.weights.shard_read_bytes();
+        Ok(StepOutput {
+            token: output.token,
+            logits: output.logits,
+        })
     }
 
     /// Consumes one token and returns the token that follows it.
@@ -1730,7 +1899,31 @@ impl HostProviders<'_> {
         let source = self.source;
         let prefix = format!("layers.{layer}");
         let dim = config.dim;
+        let width = config.hc_width();
         let limit = ELEMENT_LIMIT;
+        // A chunk hands over one row group per token: positions = values / hc_width. Every mHC
+        // helper below is row-count driven, so the single-position call is the positions == 1 case
+        // of the same code and produces the same bytes it always did.
+        if width == 0 || !residual.len().is_multiple_of(width) {
+            return Err(EngineError::Shape {
+                what: format!("layer {layer} host post"),
+                detail: format!(
+                    "{} residual values are not whole {width}-wide token rows",
+                    residual.len()
+                ),
+            });
+        }
+        let positions = residual.len() / width;
+        if attention_out.len() != positions * dim {
+            return Err(EngineError::Shape {
+                what: format!("layer {layer} host post"),
+                detail: format!(
+                    "attention output is {} values, expected {}",
+                    attention_out.len(),
+                    positions * dim
+                ),
+            });
+        }
         let mut x = vec![0.0f32; residual.len()];
         mhc::hc_post(
             config,
@@ -1743,9 +1936,9 @@ impl HostProviders<'_> {
         let fn_w = linalg::decode_by_name(source, &format!("{prefix}.hc_ffn_fn"), limit)?;
         let scale = linalg::decode_by_name(source, &format!("{prefix}.hc_ffn_scale"), limit)?;
         let base = linalg::decode_by_name(source, &format!("{prefix}.hc_ffn_base"), limit)?;
-        let mut ffn_mixes = Mixes::for_config(config);
+        let mut ffn_mixes = Mixes::for_tokens(config, positions);
         mhc::hc_mixes(config, &x, &fn_w, &scale, &base, &mut ffn_mixes)?;
-        let mut ffn_in = vec![0.0f32; dim];
+        let mut ffn_in = vec![0.0f32; positions * dim];
         mhc::hc_pre(config, &attn_mixes.pre, &x, &mut ffn_in)?;
         let ffn_norm = linalg::decode_by_name(source, &format!("{prefix}.ffn_norm.weight"), limit)?;
         linalg::rms_norm(&mut ffn_in, &ffn_norm, dim, config.norm_eps as f32)?;
@@ -1830,6 +2023,113 @@ impl MoeDeviceBackend for TpMoeBackend {
         limit: usize,
         out: &mut [f32],
     ) -> Result<bool, EngineError> {
+        let profile_started = Instant::now();
+        let mut scratch = MoeScratch::for_config(&self.global_config);
+        moe::add_shared_expert(
+            &self.global_config,
+            prefix,
+            x,
+            source,
+            limit,
+            &mut scratch,
+            out,
+        )?;
+        if self.profile_on {
+            self.shared_profile
+                .push((layer, profile_started.elapsed().as_micros() as u64));
+        }
+        Ok(true)
+    }
+
+    /// The chunk seam: one routed pass over the whole chunk, then one all-reduce over every token's
+    /// partial row. [moe::routed_forward] is already chunk-capable (its choice groups and its
+    /// contrib buffer are sized per chunk), and the batched F4 kernel now takes every token's
+    /// choices, so this is the same arithmetic the per-token loop ran, in one call per layer.
+    fn ffn_chunk(
+        &mut self,
+        _config: &ModelConfig,
+        layer: usize,
+        prefix: &str,
+        x: &[f32],
+        source: &dyn WeightSource,
+        limit: usize,
+        tokens: usize,
+        out: &mut [f32],
+    ) -> Result<bool, EngineError> {
+        let dim = self.local_config.dim;
+        if tokens == 0 || x.len() != tokens * dim || out.len() != tokens * dim {
+            return Err(EngineError::Shape {
+                what: format!("layer {layer} chunked routed FFN"),
+                detail: format!(
+                    "{tokens} tokens need {} values, got x {} and out {}",
+                    tokens * dim,
+                    x.len(),
+                    out.len()
+                ),
+            });
+        }
+        let profile_started = Instant::now();
+        let mut scratch = MoeScratch::for_config(&self.local_config);
+        moe::routed_forward(
+            &self.local_config,
+            prefix,
+            x,
+            &*self.local,
+            limit,
+            &mut scratch,
+            out,
+        )?;
+        let local_us = profile_started.elapsed().as_micros() as u64;
+        self.collective
+            .all_reduce_f32(out)
+            .map_err(collective_error)?;
+        if self.profile_on {
+            let reduce_us = profile_started.elapsed().as_micros() as u64 - local_us;
+            self.ffn_profile.push((layer, local_us, reduce_us));
+        }
+        if self.record_seams {
+            let mut reference_scratch = MoeScratch::for_config(&self.global_config);
+            let mut reference = vec![0.0f32; out.len()];
+            moe::routed_forward(
+                &self.global_config,
+                prefix,
+                x,
+                source,
+                limit,
+                &mut reference_scratch,
+                &mut reference,
+            )?;
+            self.seams
+                .push(seam_record(layer, self.position, &reference, out));
+        }
+        Ok(true)
+    }
+
+    /// The chunk seam of the dense shared expert: replicated, one pass over the chunk, added to the
+    /// already-reduced routed rows.
+    fn shared_expert_chunk(
+        &mut self,
+        _config: &ModelConfig,
+        layer: usize,
+        prefix: &str,
+        x: &[f32],
+        source: &dyn WeightSource,
+        limit: usize,
+        tokens: usize,
+        out: &mut [f32],
+    ) -> Result<bool, EngineError> {
+        let dim = self.global_config.dim;
+        if tokens == 0 || x.len() != tokens * dim || out.len() != tokens * dim {
+            return Err(EngineError::Shape {
+                what: format!("layer {layer} chunked shared expert"),
+                detail: format!(
+                    "{tokens} tokens need {} values, got x {} and out {}",
+                    tokens * dim,
+                    x.len(),
+                    out.len()
+                ),
+            });
+        }
         let profile_started = Instant::now();
         let mut scratch = MoeScratch::for_config(&self.global_config);
         moe::add_shared_expert(
@@ -2337,8 +2637,8 @@ fn bench_json(report: &BenchReport, profile_entries: Option<usize>) -> Value {
         "step_collective_ms": report.step_collective_ms,
         "profile_on": report.profile_on,
         "profile_entries": profile_entries,
-        "profile_decode_first_index": profile_entries.map(|_| report.prefill_tokens),
-        "measure": "decode-only: prefill(ids) once, then --bench-steps decode() calls timed with the same step path and --profile timers; no HTTP server, no token streaming; tokens_per_second = steps_run * 1000 / decode_ms; with --profile, profile.steps holds the prefill_tokens prefill entries first and then the steps_run decode entries, so decode per-class averages use the last steps_run entries",
+        "profile_decode_first_index": profile_entries.map(|entries| entries.saturating_sub(report.steps_run)),
+        "measure": "decode-only: prefill(ids) once, then --bench-steps decode() calls timed with the same step path and --profile timers; no HTTP server, no token streaming; tokens_per_second = steps_run * 1000 / decode_ms; with --profile, profile.steps holds the prefill entries first (one per prompt token on the token-loop path, one for the whole chunk on the chunked path) and then the steps_run decode entries, so decode per-class averages use the last steps_run entries",
     })
 }
 
@@ -2808,7 +3108,12 @@ mod tests {
         rank.begin_request(Tp4Sampling::default()).expect("greedy");
         let first = rank.prefill(&[3, 7, 11]).expect("prefill");
         let token = first.token.expect("prompt ends in a token");
-        assert_eq!(rank.metrics().steps, 3);
+        assert_eq!(
+            rank.metrics().steps,
+            3,
+            "steps counts consumed positions: the default token-loop prefill consumes three"
+        );
+        assert_eq!(rank.state.tokens(), &[3, 7, 11]);
         assert!(rank.decode(token).expect("decode").token.is_some());
         assert_eq!(rank.metrics().steps, 4);
         assert!(rank.metrics().last_step_ms > 0);
@@ -2822,6 +3127,61 @@ mod tests {
             .expect("greedy again");
         assert_eq!(rank.metrics().steps, 0, "begin_request clears the counters");
         rank.prefill(&[5]).expect("single-token prefill");
+    }
+
+    /// Batch 17's bar: one chunked prefill must be bit-identical to the same prompt run as single
+    /// token steps, on the fixture engine: the same logits bits and the same greedy token.
+    #[test]
+    fn the_chunked_prefill_is_bit_identical_to_single_token_steps() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        write_twin_fixture(directory.path()).expect("fixture");
+        let input = RankInput {
+            rank: 0,
+            world: 1,
+            source_dir: directory.path().to_path_buf(),
+            source_mode: "fixture",
+            prompt: Vec::new(),
+            max_tokens: 0,
+            record_seams: false,
+            reference_check: false,
+            resident_cache: false,
+            profile: false,
+            bench_steps: 0,
+            tokenizer: None,
+        };
+        let mut chunked = Tp4Rank::open_input(&input, None, ELEMENT_LIMIT).expect("chunked rank");
+        let mut looped = Tp4Rank::open_input(&input, None, ELEMENT_LIMIT).expect("token-loop rank");
+        let prompt = [3u32, 7, 11, 5, 13, 2, 9, 4];
+        chunked
+            .begin_request(Tp4Sampling::default())
+            .expect("greedy");
+        let chunked_out = chunked.prefill_chunk(&prompt).expect("chunked prefill");
+        looped
+            .begin_request(Tp4Sampling::default())
+            .expect("greedy");
+        let looped_out = looped
+            .prefill_token_loop(&prompt)
+            .expect("token-loop prefill");
+        assert_eq!(chunked.metrics().steps, prompt.len() as u64);
+        assert_eq!(looped.metrics().steps, prompt.len() as u64);
+        assert_eq!(chunked.state.tokens(), looped.state.tokens());
+        assert_eq!(
+            chunked_out.token, looped_out.token,
+            "the greedy token must agree"
+        );
+        assert_eq!(chunked_out.logits.len(), looped_out.logits.len());
+        let differing = chunked_out
+            .logits
+            .iter()
+            .zip(looped_out.logits.iter())
+            .filter(|(chunked, looped)| chunked.to_bits() != looped.to_bits())
+            .count();
+        assert_eq!(
+            differing,
+            0,
+            "chunked prefill logits differ in {differing} of {} values",
+            chunked_out.logits.len()
+        );
     }
 
     #[test]

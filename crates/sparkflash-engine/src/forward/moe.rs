@@ -63,6 +63,55 @@ pub trait MoeDeviceBackend {
         Ok(false)
     }
 
+    /// [MoeDeviceBackend::ffn] for a chunk of `tokens` tokens: `x` and `out` are
+    /// `tokens * config.dim` values.
+    ///
+    /// The one-token case delegates to [MoeDeviceBackend::ffn], so a backend that only implements
+    /// the single-token seam keeps working on decode steps. The default body returns `false` for a
+    /// real chunk, which the chunked hybrid step refuses instead of falling back to the host block:
+    /// a backend that cannot see the whole chunk (the sharded TP path) must not silently compute
+    /// the global experts.
+    #[allow(clippy::too_many_arguments)]
+    fn ffn_chunk(
+        &mut self,
+        config: &ModelConfig,
+        layer: usize,
+        prefix: &str,
+        x: &[f32],
+        source: &dyn WeightSource,
+        limit: usize,
+        tokens: usize,
+        out: &mut [f32],
+    ) -> Result<bool, EngineError> {
+        if tokens == 1 {
+            return self.ffn(config, layer, prefix, x, source, limit, out);
+        }
+        let _ = (config, layer, prefix, x, source, limit, tokens, out);
+        Ok(false)
+    }
+
+    /// [MoeDeviceBackend::shared_expert] for a chunk; the default returns `false` for a real chunk
+    /// and the host shared-expert seam runs instead (the shared expert is replicated, so that
+    /// fallback is arithmetically right and only a speed choice).
+    #[allow(clippy::too_many_arguments)]
+    fn shared_expert_chunk(
+        &mut self,
+        config: &ModelConfig,
+        layer: usize,
+        prefix: &str,
+        x: &[f32],
+        source: &dyn WeightSource,
+        limit: usize,
+        tokens: usize,
+        out: &mut [f32],
+    ) -> Result<bool, EngineError> {
+        if tokens == 1 {
+            return self.shared_expert(config, layer, prefix, x, source, limit, out);
+        }
+        let _ = (config, layer, prefix, x, source, limit, tokens, out);
+        Ok(false)
+    }
+
     /// Adds the dense shared expert to `out` (already holding the routed contribution). Returning
     /// `false` leaves `out` untouched and the host shared-expert seam runs instead.
     #[allow(clippy::too_many_arguments)]
@@ -336,12 +385,13 @@ fn expert_body(
         .matmul(&mut out[..dim], &gate_branch[..inter], dim, inter, 1)
 }
 
-/// The routed expert block for a single token: one batched F4 call for the gate/up branches of every
+/// The routed expert block for one chunk: one batched F4 call for the gate/up branches of every
 /// chosen expert and one for the down projections.
 ///
+/// Each choice is one token routed to one expert, so the group's input row is that token's own row.
 /// The per-row arithmetic is [crate::linalg::matmul_f4_experts], which is bit-identical to the fused
 /// per-expert call; the routing weight is applied to the SwiGLU row before the down projection, as
-/// in [expert_body]. The contributions are written expert-ascending into `out`, the order the
+/// in [expert_body]. The contributions are written choice-ascending into `out`, the order the
 /// combine loop adds them. Returns `false` when a selected weight is not a packed F4 PerRow32
 /// weight, leaving `out` untouched so the caller can run the generic path.
 #[allow(clippy::too_many_arguments)] // the routed body's inputs; bundling them would hide the shard
@@ -397,7 +447,13 @@ fn compute_routed_batched(
         weights.push(ExpertWeights { w1, w3, w2, inter });
     }
 
-    // Groups are interleaved [w1_0, w3_0, w1_1, w3_1, ...], with the same token as every input.
+    // Groups are interleaved [w1_0, w3_0, w1_1, w3_1, ...]. Each group's input row is the row of the
+    // token that chose this expert, so a chunk's choices batch in one kernel call without mixing
+    // tokens: the per-group dot is the single-token dot.
+    let token_rows: Vec<&[f32]> = choices
+        .iter()
+        .map(|&(token, _, _)| &x[token * dim..(token + 1) * dim])
+        .collect();
     let mut codes: Vec<&[u8]> = Vec::with_capacity(2 * count);
     let mut scales: Vec<&[u8]> = Vec::with_capacity(2 * count);
     for weight in &weights {
@@ -414,7 +470,7 @@ fn compute_routed_batched(
         codes.push(up_codes);
         scales.push(up_scales);
     }
-    let xs: Vec<&[f32]> = vec![x; 2 * count];
+    let xs: Vec<&[f32]> = token_rows.iter().flat_map(|row| [*row, *row]).collect();
     let mut branches = vec![0.0f32; 2 * count * inter];
     linalg::matmul_f4_experts(
         &mut branches,
@@ -887,14 +943,15 @@ fn routed_forward_impl(
         src.spec(&first_expert).map(|spec| spec.dtype),
         Ok(DType::F4E2M1 | DType::F8E4M3)
     );
-    // A decode step routes one token to its top-k experts: the batched F4 kernel takes every
-    // selected expert in one parallel region, with the per-row arithmetic of the fused single call.
+    // The batched F4 kernel takes every selected (token, expert) choice in one parallel region,
+    // with the per-row arithmetic of the fused single call. A decode step is the one-token case of
+    // the same call; a prefill chunk batches its choices per token, not across tokens.
     let mut batched = false;
-    if fused && tokens == 1 && !scratch.choices.is_empty() {
+    if fused && !scratch.choices.is_empty() {
         batched = compute_routed_batched(
             cfg,
             prefix,
-            &x[..dim],
+            x,
             src,
             limit,
             local_inter,

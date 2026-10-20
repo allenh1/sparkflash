@@ -431,6 +431,17 @@ pub struct DeferredHandoff {
 pub type HybridDeferredProvider<'a> = dyn FnMut(usize, &[f32], &[f32], Option<&DeferredHandoff>) -> Result<HybridEntry, EngineError>
     + 'a;
 
+/// The chunked c3b provider: the deferred provider plus the token's index inside the chunk, so a
+/// caller can apply that token's own Engram hashes and deferred epilogue.
+pub type HybridChunkDeferredProvider<'a> = dyn FnMut(
+        usize,
+        usize,
+        &[f32],
+        &[f32],
+        Option<&DeferredHandoff>,
+    ) -> Result<HybridEntry, EngineError>
+    + 'a;
+
 /// The device post callback: residual input, attention output, and the attention coefficients.
 pub type HybridPostProvider<'a> =
     dyn FnMut(usize, &[f32], &[f32], &Mixes) -> Result<HybridPost, EngineError> + 'a;
@@ -486,6 +497,24 @@ pub struct HybridTokenOutput {
     /// The raw logits, `vocab_size` values.
     pub logits: Vec<f32>,
     /// The greedy token the host argmax selected.
+    pub token: Option<u32>,
+    /// One certified byte per vocabulary entry, when the backend ran a certified screen.
+    pub certified_mask: Option<Vec<u8>>,
+}
+
+/// One chunked hybrid step's output: the tail of the last position, plus the token it selected.
+///
+/// [InferenceEngine::run_hybrid_sequence_chunk] runs the same hybrid order as
+/// [InferenceEngine::run_hybrid_sequence_step] but over a whole chunk. The per-layer trace is not
+/// returned: a chunk's trace would repeat the chunk-sized stage table once per layer for no
+/// consumer, and the runner's progress callback already reports the per-layer host time.
+#[derive(Debug, Clone)]
+pub struct HybridChunkOutput {
+    /// The collapsed and final-normed vector the head multiplied (last position only).
+    pub head_input: Vec<f32>,
+    /// The raw logits (last position only), `vocab_size` values.
+    pub logits: Vec<f32>,
+    /// The greedy token the host argmax selected for the next position.
     pub token: Option<u32>,
     /// One certified byte per vocabulary entry, when the backend ran a certified screen.
     pub certified_mask: Option<Vec<u8>>,
@@ -1051,7 +1080,7 @@ impl InferenceEngine {
         );
         if let Some(post_hook) = post.as_deref_mut() {
             let post = post_hook(layer, hidden, &scratch.attn_out, &scratch.attn_mixes)?;
-            if post.x.len() != hidden.len() || post.ffn_in.len() != config.dim {
+            if post.x.len() != hidden.len() || post.ffn_in.len() != scratch.ffn_in.len() {
                 return Err(EngineError::Shape {
                     what: format!("layer {layer} device post"),
                     detail: format!(
@@ -1059,7 +1088,7 @@ impl InferenceEngine {
                         post.x.len(),
                         hidden.len(),
                         post.ffn_in.len(),
-                        config.dim
+                        scratch.ffn_in.len()
                     ),
                 });
             }
@@ -1228,7 +1257,22 @@ impl InferenceEngine {
             u64_bytes(shared_inter),
             "shared-expert SwiGLU and activation quantisation",
         );
+        // A hybrid chunk asks the backend once for the whole chunk; a single-token step keeps the
+        // original one-token seam so every existing backend sees the call it always saw. A backend
+        // that returns `false` for a chunk is refused below rather than silently falling back to the
+        // host block: on the sharded path that fallback would compute the global experts.
+        let chunk_positions = scratch.ffn_in.len() / config.dim;
         let device_moe = match moe.as_deref_mut() {
+            Some(backend) if chunk_positions > 1 => backend.ffn_chunk(
+                config,
+                layer,
+                &prefix,
+                &scratch.ffn_in,
+                source,
+                self.limit,
+                chunk_positions,
+                &mut scratch.ffn_out,
+            )?,
             Some(backend) => backend.ffn(
                 config,
                 layer,
@@ -1264,6 +1308,12 @@ impl InferenceEngine {
                 &mut scratch.ffn_out,
             )?;
         } else if !device_moe {
+            if chunk_positions > 1 && moe.is_some() {
+                return Err(EngineError::Shape {
+                    what: format!("layer {layer} chunked hybrid FFN"),
+                    detail: "the device backend did not accept the chunk".to_owned(),
+                });
+            }
             moe::moe_forward(
                 config,
                 &prefix,
@@ -1275,6 +1325,16 @@ impl InferenceEngine {
             )?;
         } else {
             let device_shared = match moe.as_mut() {
+                Some(backend) if chunk_positions > 1 => backend.shared_expert_chunk(
+                    config,
+                    layer,
+                    &prefix,
+                    &scratch.ffn_in,
+                    source,
+                    self.limit,
+                    chunk_positions,
+                    &mut scratch.ffn_out,
+                )?,
                 Some(backend) => backend.shared_expert(
                     config,
                     layer,
@@ -1768,6 +1828,251 @@ impl InferenceEngine {
         Ok(HybridTokenOutput {
             layers,
             tail_stages,
+            head_input,
+            logits,
+            token,
+            certified_mask,
+        })
+    }
+
+    /// One chunked hybrid step: [Self::run_hybrid_sequence_step] over `tokens.len()` positions in a
+    /// single layer-major pass.
+    ///
+    /// The provider is called once per (layer, token) with that token's own hidden row and its own
+    /// deferred handoff, so every token's entry arithmetic is the same call it makes on a one-token
+    /// step. The block then runs once for the whole chunk: one attention pass, one device-post call,
+    /// one MoE backend call and (on the sharded path) one collective per layer.
+    ///
+    /// The post callback receives the chunk's `hidden` and `attention_out` and must return one `x`
+    /// row and one normalized `ffn_in` row per position, with `mixes` in [Mixes::for_tokens] layout.
+    /// `embeddings` is `tokens.len() * dim` values in token order. The returned logits and
+    /// certified mask are the last position's; `state` advances by `tokens.len()` positions.
+    ///
+    /// # Errors
+    ///
+    /// [EngineError::Shape] for an empty chunk, a start position that does not match the state, a
+    /// token outside the vocabulary, an embedding block of the wrong length, a provider/post/backend
+    /// handoff of the wrong shape, a backend that declines a chunk, or a device attention backend on
+    /// a multi-token chunk (that backend has no chunk seam), plus any weight-read or arithmetic
+    /// error the per-token hybrid step can return.
+    #[allow(clippy::too_many_arguments)] // the per-token step's own inputs plus the chunk; bundling them would hide which one is the chunk.
+    pub fn run_hybrid_sequence_chunk(
+        &self,
+        state: &mut SequenceState,
+        tokens: &[u32],
+        embeddings: &[f32],
+        start_pos: usize,
+        provider: &mut HybridChunkDeferredProvider<'_>,
+        post: &mut HybridPostProvider<'_>,
+        mut attention: Option<&mut dyn attention::AttentionProjectionBackend>,
+        mut moe_backend: Option<&mut dyn moe::MoeDeviceBackend>,
+        progress: &mut dyn FnMut(usize, u64),
+    ) -> Result<HybridChunkOutput, EngineError> {
+        let config = &self.config;
+        let dim = config.dim;
+        let hc = config.hc_mult;
+        let width = config.hc_width();
+        let seqlen = tokens.len();
+        if dim == 0 || hc == 0 || width == 0 {
+            return Err(EngineError::Shape {
+                what: "chunked hybrid chain".to_owned(),
+                detail: "dim and hc_mult must both be positive".to_owned(),
+            });
+        }
+        if seqlen == 0 {
+            return Err(EngineError::Shape {
+                what: "chunked hybrid chain".to_owned(),
+                detail: "no tokens to run".to_owned(),
+            });
+        }
+        if attention.is_some() && seqlen > 1 {
+            return Err(EngineError::Shape {
+                what: "chunked hybrid chain".to_owned(),
+                detail: "the device attention backend has no chunk seam".to_owned(),
+            });
+        }
+        if embeddings.len() != seqlen * dim {
+            return Err(EngineError::Shape {
+                what: "chunked hybrid chain embedding".to_owned(),
+                detail: format!("expected {} values, got {}", seqlen * dim, embeddings.len()),
+            });
+        }
+        for &token in tokens {
+            if token as usize >= config.vocab_size {
+                return Err(EngineError::Shape {
+                    what: "chunked hybrid chain embedding".to_owned(),
+                    detail: format!(
+                        "token {token} is outside the {} row table",
+                        config.vocab_size
+                    ),
+                });
+            }
+        }
+        if state.tokens.len() != start_pos {
+            return Err(EngineError::Shape {
+                what: "chunked hybrid sequence step".to_owned(),
+                detail: format!(
+                    "start position {start_pos} does not match the state's {} consumed tokens",
+                    state.tokens.len()
+                ),
+            });
+        }
+
+        let mut hidden = vec![0.0f32; seqlen * width];
+        for position in 0..seqlen {
+            let embedding = &embeddings[position * dim..(position + 1) * dim];
+            for copy in 0..hc {
+                hidden[(position * width) + copy * dim..(position * width) + (copy + 1) * dim]
+                    .copy_from_slice(embedding);
+            }
+        }
+        let mut pre_mix = vec![0.0f32; seqlen * hc];
+        for position in 0..seqlen {
+            pre_mix[position * hc] = 1.0;
+        }
+        let mut scratch = Scratch::for_chunk(config, seqlen);
+        let mut deferred: Option<DeferredHandoff> = None;
+        for layer in 0..config.n_layers {
+            let started = std::time::Instant::now();
+            // One entry per token, concatenated in token order: the block consumes the chunk entry
+            // exactly as the single-token block consumes one token's entry.
+            let mut entry = LayerZeroEntry {
+                pre_attention_hidden: vec![0.0f32; seqlen * dim],
+                pre: vec![0.0f32; seqlen * hc],
+                post: vec![0.0f32; seqlen * hc],
+                comb: vec![0.0f32; seqlen * hc * hc],
+                source: LayerZeroEntrySource::Host,
+            };
+            for position in 0..seqlen {
+                let token_deferred = deferred.as_ref().map(|handoff| DeferredHandoff {
+                    x: handoff.x[position * width..(position + 1) * width].to_vec(),
+                    y: handoff.y[position * dim..(position + 1) * dim].to_vec(),
+                    mixes: Mixes {
+                        pre: handoff.mixes.pre[position * hc..(position + 1) * hc].to_vec(),
+                        post: handoff.mixes.post[position * hc..(position + 1) * hc].to_vec(),
+                        comb: handoff.mixes.comb[position * hc * hc..(position + 1) * hc * hc]
+                            .to_vec(),
+                    },
+                });
+                let handoff = {
+                    let hidden_row = &hidden[position * width..(position + 1) * width];
+                    let pre_row = &pre_mix[position * hc..(position + 1) * hc];
+                    provider(
+                        layer,
+                        position,
+                        hidden_row,
+                        pre_row,
+                        token_deferred.as_ref(),
+                    )?
+                };
+                if handoff.x.len() != width {
+                    return Err(EngineError::Shape {
+                        what: format!("layer {layer} MhcEntry X"),
+                        detail: format!("expected {width} values, got {}", handoff.x.len()),
+                    });
+                }
+                hidden[position * width..(position + 1) * width].copy_from_slice(&handoff.x);
+                entry.pre_attention_hidden[position * dim..(position + 1) * dim]
+                    .copy_from_slice(&handoff.entry.pre_attention_hidden);
+                entry.pre[position * hc..(position + 1) * hc].copy_from_slice(&handoff.entry.pre);
+                entry.post[position * hc..(position + 1) * hc].copy_from_slice(&handoff.entry.post);
+                entry.comb[position * hc * hc..(position + 1) * hc * hc]
+                    .copy_from_slice(&handoff.entry.comb);
+                entry.source = handoff.entry.source;
+            }
+            let mut next_deferred = None;
+            let defer_epilogue = layer + 1 < config.n_layers;
+            self.block(
+                state,
+                layer,
+                &mut hidden,
+                &mut pre_mix,
+                &mut scratch,
+                start_pos,
+                Some(&entry),
+                None,
+                None,
+                Some(&mut *post),
+                attention.as_mut().map(|backend| {
+                    &mut **backend as &mut dyn attention::AttentionProjectionBackend
+                }),
+                moe_backend
+                    .as_deref_mut()
+                    .map(|backend| &mut *backend as &mut dyn moe::MoeDeviceBackend),
+                if defer_epilogue {
+                    Some(&mut next_deferred)
+                } else {
+                    None
+                },
+            )?;
+            if defer_epilogue {
+                deferred = Some(next_deferred.ok_or_else(|| EngineError::Shape {
+                    what: format!("layer {layer} deferred FFN epilogue"),
+                    detail: "the block did not return the deferred handoff".to_owned(),
+                })?);
+            } else {
+                deferred = None;
+            }
+            progress(layer, started.elapsed().as_millis() as u64);
+        }
+
+        // The tail runs on the last position: the collapsed copies with the last block's FFN
+        // coefficient, then the final norm and the LM head (model.py:1268-1269).
+        let mut collapsed = vec![0.0f32; seqlen * dim];
+        mhc::hc_pre(config, &pre_mix, &hidden, &mut collapsed)?;
+        let mut tail = collapsed[(seqlen - 1) * dim..].to_vec();
+        let mut device_norm = false;
+        if let Some(backend) = moe_backend.as_mut() {
+            let mut norm_bf16 = Vec::new();
+            if backend.final_norm(
+                config,
+                &tail,
+                self.source.as_ref(),
+                self.limit,
+                &mut norm_bf16,
+            )? {
+                tail = norm_bf16
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| {
+                        let bits = u16::from_le_bytes(*pair);
+                        f32::from_bits(u32::from(bits) << 16)
+                    })
+                    .collect();
+                device_norm = true;
+            }
+        }
+        if !device_norm {
+            let norm = linalg::decode_by_name(self.source.as_ref(), "norm.weight", self.limit)?;
+            linalg::rms_norm(&mut tail, &norm, dim, config.norm_eps as f32)?;
+        }
+        let head_input = tail.clone();
+        let mut logits = vec![0.0f32; config.vocab_size];
+        let device_token = match moe_backend.as_mut() {
+            Some(backend) => {
+                backend.lm_head(config, &tail, self.source.as_ref(), self.limit, &mut logits)?
+            }
+            None => None,
+        };
+        let token = if let Some(token) = device_token {
+            Some(token)
+        } else {
+            let head = WeightView::read_plain(
+                self.source.as_ref(),
+                "head.weight",
+                config.vocab_size,
+                dim,
+                self.limit,
+            )?;
+            head.matmul(&mut logits, &tail, config.vocab_size, dim, 1)?;
+            linalg::argmax(&logits).map(|index| index as u32)
+        };
+        let certified_mask = moe_backend
+            .as_ref()
+            .and_then(|backend| backend.head_certified_mask().map(<[u8]>::to_vec));
+        state.tokens.extend_from_slice(tokens);
+        Ok(HybridChunkOutput {
             head_input,
             logits,
             token,

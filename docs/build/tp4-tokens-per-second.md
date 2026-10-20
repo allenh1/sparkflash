@@ -30,21 +30,47 @@ byte-identical text. This is the end-to-end datapoint: it includes load, prefill
 it directly. It does show the serving decode path holding the benchmark's rate (0.94 vs 1.06
 tokens/s).
 
-**Known limitation: TTFT 39.13 s on a short chat prompt.** The serve path already gates HTTP
-after every worker's post-fill Hello (rank 0: fill -> control hub waits for all Hellos -> ready ->
-HTTP bind; serve.rs:2911-2944 worker order 3080-3096, driver 2751-2770, bind 3409-3417), so fill
-skew cannot leak into first-request TTFT and no readiness barrier is needed. The census TTFT
-39.134645546 s is 37 prompt tokens x one decode-shaped forward per token in the tp4_host.rs
-prefill loop at ~0.945 s/token = ~35-37 s, plus ~2 s HTTP/tokenizer overhead; the reported prefill
-tok/s 0.945 equals decode 0.938. (The 92 s first-step wait seen in a bench run is a bench-harness
-artifact - bench starts the forward as soon as a rank's own fill finishes, with no barrier - not
-the serve path.) The named fix is batch 17: wire the TP=4 host runner to the existing engine
-chunk-prefill API (InferenceEngine::prefill(&self, state, tokens), forward/mod.rs:275, public via
-lib.rs:40) instead of looping one decode-shaped step per prompt token; the remaining work is
-batch>1 correctness in parallel_tp (MoE batched F4 choice-groups plus a chunk-vs-eight-one-token
-bitwise test on a fake world-4 adapter).
+**TTFT: the pre-fix token loop, the chunk-in-serve census, and why the chunk is opt-in.**
+The serve path already gates HTTP after every worker's post-fill Hello (rank 0: fill -> control hub
+waits for all Hellos -> ready -> HTTP bind; serve.rs:2911-2944 worker order 3080-3096, driver
+2751-2770, bind 3409-3417), so fill skew cannot leak into first-request TTFT and no readiness
+barrier is needed. The pre-fix census TTFT 39.134645546 s is 37 prompt tokens x one decode-shaped
+forward per token in the tp4_host.rs prefill loop at ~0.945 s/token = ~35-37 s, plus ~2 s
+HTTP/tokenizer overhead; the reported prefill tok/s 0.945 equals decode 0.938. (The 92 s first-step
+wait seen in a bench run is a bench-harness artifact - bench starts the forward as soon as a rank's
+own fill finishes, with no barrier - not a serving datapoint.)
 
-## 3. Trajectory (four runs on the same harness)
+Batch 17 adds the chunked hybrid prefill as a bit-identical, **opt-in** capability
+(`SPARKFLASH_TP4_PREFILL_CHUNK=1`). In the bench harness it is faster (24.8 s vs 33.3 s for 37
+prompt tokens, 1.34x; section 11), but the post-fix serve census on the real endpoint measured
+**TTFT 43.624741849 s, decode 0.930641601 tokens/s, wall 111.334247828 s** for the same 37-token
+prompt and `max_tokens=64` (serve-final2 on `e8ba15b`, frozen four-way launcher, clean environment,
+`reduce_calls=2560` proving one chunk prefill), which is **slower than the pre-fix 39.13 s token
+loop**. A correctness/perf-neutral batch must not ship a slower default, so the serve path keeps
+the pre-batch-17 one-step-per-token loop as its default and the chunk stays opt-in until the
+serve-path overhead is understood (batch 18). The default-path TTFT on the flipped binary is
+**38.964443188 s** (decode 0.940163137 tokens/s, wall 105.990949154 s, same 37-token prompt and
+`max_tokens=64`; serve binary `sparkflash-serve-default` sha256 `f830d360`, evidence
+`phase2-evidence/task16-final-census-default/`; the rank log `tp4_prefill ... prefill_ms=38964` and
+`reduce_calls=4000=(37+63)*40` prove the token loop). The endpoint decode rate is unchanged by the
+flip (0.9402 vs 0.9411 chunk-in-serve and 0.9376 pre-fix), so the default swap recovers TTFT
+without touching decode. Chunk and token loop are bit-identical on the real checkpoint at
+2/4/8/16/37 prompt tokens (section 11).
+
+**Serve startup robustness: control-connect retry (task-61, lands in this batch).** The census
+attempts exposed a pre-existing startup race: rank 0 binds the control hub on port 29901 only after
+its own checkpoint load, and workers connected with no retry, so a worker that finished loading
+first died instantly on `ECONNREFUSED` (the aborted attempts are preserved under
+`phase2-evidence/task16-final-census/aborted-*`). The final-tree retry commit (`serve.rs` only,
++110/-1, `cfg(feature = tp4-serve)`) makes `Tp4ControlWorker::connect` retry `ECONNREFUSED`
+every 100 ms inside the same 600 s startup budget, then fail with a typed `ConnectTimeout` naming
+the peer address and the budget; two loopback unit tests cover connect-before-bind succeeding and
+a never-binding hub failing typed. The launcher workaround (start rank 0 first, poll 29901 before
+the workers) is **no longer required**, though the ordering remains a useful smoke test. The commit
+touches no bench path: the bench binary was rebuilt but its `.text` and `.rodata` are byte-identical
+to the 0108801 build (only symbol/debug metadata moved), so the bench numbers above stand.
+
+## 3. Trajectory (four pre-fix runs on the same harness)
 
 Each run is a linear stack on main `0174ed0`; "delta" is against the previous run's rank-0
 mean step (the canonical per-run numbers are in `phase2-evidence/task16-bench/evidence-bench-*`).
@@ -61,6 +87,18 @@ All five runs: every rank's `all_ranks_rc` 0, `tokens_identical_all_ranks`
 `[344, 436, 3338, 304, 611, 260, 201, 8197, 14, 342, 1970]`, `plan_hash`
 `0xcd8adc09d2c71d55`, `reduces_total` 720, teardown verified (0 processes, 0 listeners on
 29601-29604/29701-29704).
+
+> **PRE-FIX NOTE (batch 17).** RUN 1-5 token sequences in this page are **pre-fix artifacts**,
+> measured before the CSA shared-channel publication fix (section 10). The token loop published
+> only the rows a call appended after clearing the slot on owner change, so a consumer could read
+> holes in the shared channel cache. The corrected released-config sequence is
+> `[1192, 1623, 2734, 1918, 270, 6857, 1893, 305, 270, 10317, 1893]`; the pre-fix sequence
+> `[344, 436, 3338, 304, 611, 260, 201, 8197, 14, 342, 1970]` is void. RUN 6b re-measured the
+> fixed path on the final tree at 926.9 ms / 1.0787 tokens/s (chunked prefill) and 935.2 ms /
+> 1.0693 tokens/s (token loop), and both paths now agree token-for-token on all four ranks. The RUN 4b baseline of
+> 939.7 ms / 1.0642 tokens/s remains **comparable, but on corrected arithmetic**: same prompt and
+> decode length, decode within ~1.5%, both paths agree after the fix. The `tokens_identical_all_ranks` lists recorded in the RUN 1-5 evidence JSONs (`[344, 436, 3338, 304, 611, 260, 201, 8197, 14, 342, 1970]`) are pre-fix artifacts in the same way and are superseded by the corrected sequence above.
+
 
 ### RUN 5 (dormant change, no attributable effect)
 
@@ -225,7 +263,9 @@ with no HTTP server, no token streaming and no reference check.
   object; the summary is rank 0's.
 - With `--profile`, `profile.steps` holds one entry per forward step in order: the
   `prefill_tokens` prefill entries first, then the `steps_run` decode entries; the bench object
-  also records `profile_entries` and `profile_decode_first_index` (= `prefill_tokens`), so
+  also records `profile_entries` and `profile_decode_first_index` (= `prefill_tokens` for the
+
+token-loop prefill; 1 with the batch-17 chunked prefill, see section 11), so
   per-class decode averages are the sum over the last `steps_run` entries divided by
   `steps_run`.
 - In bench mode the legacy summary line no longer prints the end-to-end tokens/s (it includes load
@@ -243,7 +283,106 @@ SPARKFLASH_REFERENCE_THREADS=20 ./sparkflash device-chain --run-stage tp4-host \
   --bench-steps 10 --resident-cache --profile --evidence-dir <dir>
 ~~~
 
-## 10. Boundaries
+## 10. Decode-correctness fix: CSA shared-channel publication (batch 17)
+
+The batch-17 engine work includes a decode-correctness fix for the compressed shared-attention
+(CSA) channel. The channel is the host equivalent of the reference pointer slot: it points at the
+cache of the last KV source that ran (`model.py:748,1173`), so a consumer reads one source's whole
+cache and not a copy of it. `publish_rows()` used to clear the slot when the owner layer changed
+and then write only the rows the current call had appended, which produced two kinds of holes:
+
+- **owner-change holes.** With two KV sources at token step 3, layer 2 takes the slot and writes
+  row 1, then layer 5 takes it again and writes row 3. The consumer layer that runs after layer 5
+  then reads rows 0-2 as zero, because the slot was cleared on each owner change and only the
+  newly appended row was written. This is the hole that made a 37-token chunk and the same prompt
+  stepped token by token diverge; the first divergence is at the first Reuse consumer - layer 21
+  position 1 on the released checkpoint, layer 6 position 1 on a real-dtype fixture.
+- **no-new-row stale owner.** A KV source can run a forward that adds no row (a partial
+  compression group). That source must still publish its own cache so the slot carries this
+  source's cache, not the previous step later source. The old publisher only wrote appended rows,
+  so the slot could keep a stale owner's rows.
+
+`publish_rows()` now copies the owner's whole cache on every publication - the host equivalent of
+moving the reference's pointer - and a KV source publishes even when its forward adds no row.
+`write_index_keys`/`write_compressed_cache` keep their per-row work; only the publication policy
+moved. New public diagnostics `published_compressed_rows()` and `published_index_keys()` expose
+the slot's owner, row count and rows without changing behaviour.
+
+Coverage that pins it: the token-loop-only failing test (the shared channel holds its owner's whole
+compressed cache and index keys after a token loop; it fails on the old publication), and
+chunk-vs-token bit-identity at 2 and 37 tokens on a real-dtype released-config fixture (plus a
+wider config where the attention write is wider than dim). **Coverage lesson:** the F32 fixtures
+never exercised a multi-row owner transition that leaves holes - they either keep one KV source or
+publish every row at position zero - so the divergence only surfaced with real plan dtypes and a
+chunk-vs-token comparison on the released checkpoint.
+
+This is a decode-correctness fix, not a TTFT win. The shipped token loop goes through the same
+publication, so its released-checkpoint token sequence changes - and a changed sequence there is
+the fix working. The corrected released-config sequence is
+`[1192, 1623, 2734, 1918, 270, 6857, 1893, 305, 270, 10317, 1893]`; the pre-fix sequence
+`[344, 436, 3338, 304, 611, 260, 201, 8197, 14, 342, 1970]` is void. Coherence on the fixed tree: 16-token greedy generation is `We need answer simple. Need capital France Paris. Final concise.</think>The capital of`, ids `[2581, 1309, 3287, 4654, 16, 21017, 6102, 8760, 11111, 16, 19160, 47468, 16, 128822, 671, 6102, 294]`, identical on all four ranks - the corrected sequence is validated, not a regression.
+
+## 11. Chunked prefill (batch 17)
+
+The runner can prefill the prompt with one chunked hybrid step instead of one decode-shaped step
+per token; the chunk ships **opt-in** (`SPARKFLASH_TP4_PREFILL_CHUNK=1`) because the serve endpoint
+measured a slower TTFT with it than with the token loop (section 2). `run_hybrid_sequence_chunk` (engine) runs the hybrid order over a prompt chunk in one
+layer-major pass: per layer the provider is called once per (layer, token) with that token's row,
+its own deferred handoff and the chunk index; the block then runs once for the whole chunk (one
+attention pass, one device-post call, one `ffn_chunk`/`shared_expert_chunk` call, one collective
+on the sharded path), and the per-token deferred epilogues are carried as chunk-sized handoffs and
+sliced back per token on the next layer. `HybridChunkDeferredProvider` adds the chunk index; the
+post hook returns one normalized `ffn_in` row per position. The one-token
+`run_hybrid_sequence_step` is untouched and remains the decode path.
+
+MoE chunk seams: the routed FFN batches every token's choice groups into one w1+w3 call and one w2
+call (each group is still one token's row, combine still expert-ascending, bit-identical to
+per-token calls, covered by `a_chunk_gives_every_token_its_own_row`); the chunk takes the batched
+F4 kernel instead of the serial per-expert loop. `MoeDeviceBackend` gains
+`ffn_chunk`/`shared_expert_chunk` whose default declines a real chunk, and the block returns an
+error instead of falling back to the host block (that fallback would silently compute the global
+experts on the sharded TP path). The shared-expert fallback stays allowed because it is
+replicated.
+
+**Bitwise equality (5 lengths, real checkpoint, chunk vs fixed token loop):**
+
+| prompt tokens | chunk token | loop token | differing logit bits | max abs diff | chunk ms | loop ms |
+| --- | --: | --: | --: | --: | --: | --: |
+| 2 | 223 | 223 | 0 | 0.0 | 1,686 | 1,761 |
+| 4 | 28 | 28 | 0 | 0.0 | 3,086 | 3,571 |
+| 8 | 19 | 19 | 0 | 0.0 | 6,070 | 7,145 |
+| 16 | 6,723 | 6,723 | 0 | 0.0 | 11,902 | 14,299 |
+| 37 | 2,581 | 2,581 | 0 | 0.0 | 24,614 | 33,067 |
+
+Pre-fix, the same bisect differed at every length including 2 (`129,280` logit bits = all of
+them, deterministic on all four ranks), which is exactly the bug the publication fix removes.
+
+**Prefill cost (opt-in chunk enabled):** 37 prompt tokens now take **24.8 s** (chunk) vs **33.3 s** (token loop) =
+**1.34x**; decode is unchanged - the fixed chunk path measured 926.9 ms / 1.0787 tokens/s and the
+fixed token loop 935.2 ms / 1.0693 tokens/s, versus RUN 4b 939.7 ms / 1.0642 tokens/s (within ~1.5%,
+on corrected arithmetic). The bench per-rank prefill_ms is dominated by resident-fill skew wait (the
+rank that fills last sets the wall), so the comparable prefill deltas are the same-run bisect numbers
+above (24.6 s chunk vs 33.1 s loop at 37 tokens; the 24.8/33.3 s pair quoted earlier is the same trees
+earlier bisect).
+
+**Profile semantics:** a chunked prefill records ONE prefill profile entry (one
+`run_hybrid_sequence_chunk` call): `profile_entries` is 1 + steps_run and
+`profile_decode_first_index` is 1, while the token-loop escape hatch records `prefill_tokens`
+prefill entries (e.g. 18 entries / decode_first_index 8 for 8 prompt tokens + 10 decode steps).
+Decode-class averages are still the sum over the last `steps_run` entries divided by `steps_run`.
+
+**Opt-in switch:** set `SPARKFLASH_TP4_PREFILL_CHUNK=1` to enable the chunked prefill (read once per
+prefill call; the decode path never reads it). The interim `SPARKFLASH_TP4_PREFILL_TOKEN_LOOP`
+escape hatch is gone: the one-step-per-token loop is the default again, and the chunk is the
+opt-in path for comparison or bisection.
+
+**TTFT:** the pre-fix endpoint census (old binary, token loop) is 39.13 s; the chunk-in-serve
+census is 43.62 s (measured, slower, hence opt-in); the shipped default (token loop on the flipped
+tree) censused at **38.964443188 s** TTFT (decode 0.940163137 tokens/s, wall 105.99 s, repeats
+byte-identical, evidence `phase2-evidence/task16-final-census-default/`), so the flip restores the
+pre-fix TTFT and the chunk remains available only through `SPARKFLASH_TP4_PREFILL_CHUNK=1`.
+
+## 12. Boundaries
 
 - This is a host decode measurement, not a serving endpoint: no HTTP, no tokenizer, no streaming,
   no reference check. Serving TTFT and end-to-end tokens/s are separate metrics.

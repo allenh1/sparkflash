@@ -277,8 +277,10 @@ crates/sparkflash-cli/src/tp4_host.rs):
   temperature is refused with Tp4Error), resets SequenceState and the request counters while keeping
   the engine and the resident cache.
 - set_sampling(Tp4Sampling), sampling(), rank(), world_size()
-- prefill(&[u32]) -> Result<StepOutput, Tp4Error> (one step per prompt token, returns the LAST
-  position only), decode(u32) -> Result<StepOutput, Tp4Error>, metrics() -> &Tp4Metrics
+- prefill(&[u32]) -> Result<StepOutput, Tp4Error> (the pre-batch-17 one-step-per-token loop over
+  the prompt by default; SPARKFLASH_TP4_PREFILL_CHUNK=1 selects the bit-identical one-chunk hybrid
+  step instead; returns the LAST position only), decode(u32) -> Result<StepOutput, Tp4Error>,
+  metrics() -> &Tp4Metrics
 - StepOutput { token: Option<u32>, logits: Vec<f32> }; Tp4Metrics { load_ms, cache_fill_ms,
   resident_cache_bytes, resident_cache_tensors, rss_load_kib, rss_peak_kib, reduce_calls,
   reduce_elements, reduce_ms_total, shard_read_calls, shard_read_bytes, steps, last_step_ms,
@@ -334,6 +336,20 @@ compared with an end-to-end tokens/s. With --profile, profile.steps holds one en
 step in order: the prefill_tokens prefill entries first, then the steps_run decode entries; bench
 also records profile_entries and profile_decode_first_index, so per-class decode averages are the
 sum over the last steps_run entries divided by steps_run.
+Batch 17 adds the opt-in chunked prefill to that harness: with `SPARKFLASH_TP4_PREFILL_CHUNK=1`
+the prompt is prefilled in one `run_hybrid_sequence_chunk` call, so prefill time falls (24.8 s vs
+33.3 s for 37 prompt tokens, 1.34x) while the decode metric is unchanged (chunked 926.9 ms /
+1.0787 tokens/s vs token loop 935.2 ms / 1.0693 tokens/s on the final tree). The chunk is opt-in,
+not the default: the batch-17 serve endpoint census measured a slower TTFT with the chunk path than
+with the token loop (43.6 s vs 39.1 s), so the serve path keeps the loop until the overhead is
+understood (batch 18); bench runs that quote chunked prefill were taken with the opt-in switch set.
+The bench per-rank prefill_ms is fill-skew wait (the rank that fills last sets the wall), so the
+24.8 vs 33.3 s prefill delta is the same-run bisect, not the bench field. Chunk and token loop are
+bit-identical on the real checkpoint at 2/4/8/16/37 prompt tokens (0 differing logit bits). A
+chunked prefill records ONE prefill profile entry (`profile_entries` = 1 + steps_run,
+`profile_decode_first_index` = 1), not one per prompt token; the default token-loop path keeps the
+per-token entries. See docs/build/tp4-tokens-per-second.md section 11 for the bitwise table and
+section 2 for the TTFT numbers (the flipped default censused at 38.96 s TTFT vs 43.62 s with the chunk in serve).
 
 ## 9. Boundaries and what this does not prove
 
