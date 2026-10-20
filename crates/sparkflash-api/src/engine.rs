@@ -79,8 +79,13 @@ pub fn max_seq_len() -> usize {
         }
     }
 }
-/// Default maximum number of generated tokens.
-pub const MODEL_MAX_OUTPUT_TOKENS: usize = 65_536;
+/// The recipe-contract upper bound on a requested `max_tokens`.
+///
+/// The recipe uses 393,216 as its protocol upper bound; the actual generation is
+/// still lowered to the context left after the prompt by the router. The CLI's
+/// `--max-tokens` default uses the same ceiling so the serve cap cannot silently
+/// truncate a request the API advertises as legal.
+pub const MODEL_MAX_OUTPUT_TOKENS: usize = 393_216;
 /// Value reported in the OpenAI `owned_by` field.
 pub const MODEL_OWNED_BY: &str = "sparkflash";
 
@@ -1014,6 +1019,8 @@ impl MockEngine {
                 accepted_prediction_tokens: self.accepted_prediction_tokens.min(completion_tokens),
                 rejected_prediction_tokens: self.rejected_prediction_tokens.min(completion_tokens),
             },
+            prompt_cache_hit_tokens: plan.global_kv_cached_tokens,
+            prompt_cache_miss_tokens: prompt_tokens.saturating_sub(plan.global_kv_cached_tokens),
         };
 
         let stats = DeepSeekSparkRequestStats {
@@ -1239,6 +1246,8 @@ mod tests {
                             accepted_prediction_tokens: 0,
                             rejected_prediction_tokens: 0,
                         },
+                        prompt_cache_hit_tokens: 0,
+                        prompt_cache_miss_tokens: 3,
                     },
                     stats: Box::new(DeepSeekSparkRequestStats {
                         kv_cache_hit_rate: 0.0,

@@ -322,6 +322,101 @@ impl TpRuntime {
     }
 }
 
+/// The engine's view of the exact f32 all-gather the row-sharded attention path needs.
+///
+/// This is a BYTE GATHER, not a numeric collective. Rank `r`'s `local` slice is copied into
+/// `out[r * local.len() .. (r + 1) * local.len()]` with every bit preserved and no rounding, so
+/// the gathered buffer is bit-identical to the replicated computation that produced the pieces.
+/// The CLI rides it on the transport's bf16 payload channel by reinterpreting each f32 as its two
+/// little-endian u16 halves, which is lossless. Never replace this with
+/// [TpCollective::all_gather_assign]: that one rounds to bf16 on the wire by design and would
+/// break bit identity, which is why the two gathers are separate traits.
+pub trait BitGather: Send {
+    /// The number of ranks.
+    fn world(&self) -> usize;
+    /// This rank's index.
+    fn rank(&self) -> usize;
+    /// A short label for evidence ledgers.
+    fn label(&self) -> &'static str;
+
+    /// Copies every rank's `local` into `out`, in ascending rank order.
+    ///
+    /// `out.len()` must be exactly `world() * local.len()`. With `world() == 1` this is a plain
+    /// copy of `local` into `out` and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// [EngineError::Shape] when the lengths disagree or the adapter reports another rank/world
+    /// pair; otherwise whatever the adapter reports.
+    fn gather_bits(&mut self, local: &[f32], out: &mut [f32]) -> Result<(), EngineError>;
+}
+
+/// The engine's handle to the [BitGather] adapter: interior mutability so the `&self` forward
+/// paths can gather, exactly as [TpRuntime] does for its reduce.
+pub struct BitGatherHandle {
+    inner: Mutex<Box<dyn BitGather>>,
+}
+
+impl BitGatherHandle {
+    /// Wraps one adapter.
+    pub fn new(inner: Box<dyn BitGather>) -> Self {
+        Self {
+            inner: Mutex::new(inner),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Box<dyn BitGather>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The number of ranks.
+    #[must_use]
+    pub fn world(&self) -> usize {
+        self.lock().world()
+    }
+
+    /// This rank's index.
+    #[must_use]
+    pub fn rank(&self) -> usize {
+        self.lock().rank()
+    }
+
+    /// The adapter's evidence label.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        self.lock().label()
+    }
+
+    /// Gathers `local` from every rank into `out` in ascending rank order, bit-exactly.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the adapter reports, plus [EngineError::Shape] when `out` is not `world * local`.
+    pub fn gather_bits(&self, local: &[f32], out: &mut [f32]) -> Result<(), EngineError> {
+        let world = self.lock().world();
+        let expected = world
+            .checked_mul(local.len())
+            .ok_or_else(|| EngineError::Shape {
+                what: "bit gather".to_owned(),
+                detail: format!("{} segments of {} elements overflow", world, local.len()),
+            })?;
+        if out.len() != expected {
+            return Err(EngineError::Shape {
+                what: "bit gather".to_owned(),
+                detail: format!(
+                    "{} ranks of {} elements gather into {expected} slots, got {}",
+                    world,
+                    local.len(),
+                    out.len()
+                ),
+            });
+        }
+        self.lock().gather_bits(local, out)
+    }
+}
+
 /// Whether a plan name is one of the two paged Engram table tensors of an Engram layer.
 ///
 /// The released tables are ~98 GB each. [engram_forward](crate::forward::engram) pages the rows a

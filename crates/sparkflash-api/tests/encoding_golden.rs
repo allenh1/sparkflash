@@ -4,7 +4,7 @@
 //! schema (#[EncodingCase]) and rendered; the rendered prompt must equal the
 //! checked-in .txt golden byte for byte.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use deepseek_recipe_core::conversation::{Conversation, ReasoningEffort, ResponseFormat};
 use deepseek_recipe_core::messages::{InputMessage, ToolCall};
@@ -12,10 +12,12 @@ use deepseek_recipe_core::multimodal::{ImageDetail, ImageSource};
 use deepseek_recipe_core::tools::{ToolChoice, ToolDefinition};
 use deepseek_recipe_encoding::PromptEncoding;
 use deepseek_recipe_encoding::dsv41::DeepseekV41Encoding;
-use serde_json::Value;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sparkflash_api::encoding::{
     EncodingCase, HfTokenizerEncoder, IMAGE_PLACEHOLDER, MessageContent, OpenAiTool,
-    SparkV41Encoding, ThinkingMode, load_first_case, load_hf_tokenizer, reference_tokenizer_path,
+    SparkV41Encoding, ThinkingMode, TokenizerSeam, load_first_case, load_hf_tokenizer,
+    reference_tokenizer_path,
 };
 
 fn fixtures_dir() -> PathBuf {
@@ -404,4 +406,88 @@ fn mid_conversation_system_and_tool_placement_are_case_path_only() {
         let rendered = encoding.render_case(&case, None).expect("case render");
         assert_prompt_eq(case_id, &rendered.prompt, &golden_text(case_id));
     }
+}
+
+// ---------------------------------------------------------------------------
+// The vLLM id pin: every fixture prompt hash and id array must stay put.
+// ---------------------------------------------------------------------------
+
+fn task30_oracle() -> Value {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/build/task30-evidence/tokenizer-parity.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[test]
+fn fixture_prompt_hashes_and_ids_match_the_recorded_vllm_oracle() {
+    let oracle = task30_oracle();
+    let fixtures = oracle["fixtures"].as_array().expect("fixtures array");
+    let tokenizer =
+        load_hf_tokenizer(&reference_tokenizer_path()).expect("load reference tokenizer");
+    for case_id in 1..=5u32 {
+        let case = load_golden_case(case_id);
+        let rendered = SparkV41Encoding::new()
+            .render_case(&case, None)
+            .unwrap_or_else(|error| panic!("vector {case_id} failed to render: {error}"));
+        let expected = fixtures
+            .iter()
+            .find(|entry| entry["case"].as_u64() == Some(u64::from(case_id)))
+            .unwrap_or_else(|| panic!("oracle has no case {case_id}"));
+        assert_eq!(
+            sha256_hex(rendered.prompt.as_bytes()),
+            expected["prompt_sha256"].as_str().expect("prompt hash"),
+            "case {case_id}: rendered prompt hash moved"
+        );
+        let ids = <HfTokenizerEncoder as deepseek_recipe_encoding::TokenizerEncoder>::encode_ids(
+            &tokenizer,
+            &rendered.prompt,
+        )
+        .expect("tokenize rendered prompt");
+        let expected_ids: Vec<u32> = expected["ids"]
+            .as_array()
+            .expect("ids array")
+            .iter()
+            .map(|value| u32::try_from(value.as_u64().expect("id")).expect("u32 id"))
+            .collect();
+        assert_eq!(ids, expected_ids, "case {case_id}: prompt ids moved");
+        assert_eq!(
+            ids.len(),
+            expected["n_ids"].as_u64().expect("n_ids") as usize
+        );
+    }
+}
+
+#[test]
+fn pinned_user_hello_vector_is_exactly_31_ids() {
+    let oracle = task30_oracle();
+    let expected = oracle["chat"]
+        .as_array()
+        .expect("chat array")
+        .iter()
+        .find(|entry| entry["name"] == "chat_user_hello_default")
+        .expect("hello oracle");
+    let seam = TokenizerSeam::from_path(&reference_tokenizer_path()).expect("load seam tokenizer");
+    let request = json!({
+        "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+    let ids = seam.encode_chat(&request).expect("encode hello");
+    let expected_ids: Vec<u32> = expected["ids"]
+        .as_array()
+        .expect("ids array")
+        .iter()
+        .map(|value| u32::try_from(value.as_u64().expect("id")).expect("u32 id"))
+        .collect();
+    assert_eq!(
+        ids, expected_ids,
+        "the pinned 31-id user:Hello vector moved"
+    );
+    assert_eq!(ids.len(), 31);
 }

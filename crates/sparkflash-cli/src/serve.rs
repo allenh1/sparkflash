@@ -1395,6 +1395,8 @@ fn finished_event_with_fabric(
                 accepted_prediction_tokens: 0,
                 rejected_prediction_tokens: 0,
             },
+            prompt_cache_hit_tokens: 0,
+            prompt_cache_miss_tokens: prompt_tokens,
         },
         stats: Box::new(request_stats_with_fabric(
             prompt_tokens,

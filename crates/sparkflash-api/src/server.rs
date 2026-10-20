@@ -55,8 +55,12 @@ pub const TRACE_SCOPES_HEADER: &str = "x-sparkflash-trace-scopes";
 /// Optional client-supplied id that correlates a request with a trace filter.
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
-/// Default token budget when a request does not set `max_tokens`.
-pub const DEFAULT_MAX_TOKENS: usize = 4096;
+/// Default `max_tokens` outside thinking mode (deepseek-recipe 0.2 contract).
+pub const DEFAULT_NON_THINKING_MAX_TOKENS: usize = 8 * 1024;
+/// Default `max_tokens` in thinking mode, except at `max` effort.
+pub const DEFAULT_THINKING_MAX_TOKENS: usize = 64 * 1024;
+/// Default `max_tokens` in thinking mode at `max` effort.
+pub const DEFAULT_MAX_EFFORT_MAX_TOKENS: usize = 128 * 1024;
 
 /// The default cap on requested logprobs, matching vLLM's `--max-logprobs` default.
 ///
@@ -308,35 +312,109 @@ fn model_matches(requested: &str, engine_id: &str) -> bool {
 
 /// Resolves the requested output-token budget.
 ///
-/// An absent budget means [`DEFAULT_MAX_TOKENS`]; an explicit `0` or a value above the
-/// advertised ceiling [`MODEL_MAX_OUTPUT_TOKENS`] is a client error rather than being
-/// silently clamped.
+/// This follows the deepseek-recipe 0.2 contract: an absent budget means
+/// [`DEFAULT_NON_THINKING_MAX_TOKENS`], [`DEFAULT_THINKING_MAX_TOKENS`] or
+/// [`DEFAULT_MAX_EFFORT_MAX_TOKENS`] by mode; `0` and a value above the advertised
+/// [`MODEL_MAX_OUTPUT_TOKENS`] ceiling are client errors; an otherwise legal value is
+/// lowered to the context left after the prompt, and raised to at least 1.
 fn resolve_max_tokens(
     primary: Option<usize>,
     primary_name: &'static str,
     secondary: Option<usize>,
     secondary_name: &'static str,
+    spec: ReasoningSpec,
+    prompt_tokens: usize,
+    context_limit: usize,
 ) -> Result<usize, ApiError> {
-    let (field, value) = match (primary, secondary) {
-        (Some(value), _) => (primary_name, value),
-        (None, Some(value)) => (secondary_name, value),
-        (None, None) => return Ok(DEFAULT_MAX_TOKENS),
+    resolve_max_tokens_impl(
+        primary,
+        primary_name,
+        secondary,
+        secondary_name,
+        spec,
+        prompt_tokens,
+        context_limit,
+        true,
+    )
+}
+
+/// Anthropic Messages lowers an over-cap `max_tokens` to the protocol upper bound instead of
+/// rejecting it, while Chat Completions and Responses reject it (recipe 0.2 semantics).
+fn resolve_max_tokens_for_messages(
+    primary: Option<usize>,
+    primary_name: &'static str,
+    secondary: Option<usize>,
+    secondary_name: &'static str,
+    spec: ReasoningSpec,
+    prompt_tokens: usize,
+    context_limit: usize,
+) -> Result<usize, ApiError> {
+    resolve_max_tokens_impl(
+        primary,
+        primary_name,
+        secondary,
+        secondary_name,
+        spec,
+        prompt_tokens,
+        context_limit,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_max_tokens_impl(
+    primary: Option<usize>,
+    primary_name: &'static str,
+    secondary: Option<usize>,
+    secondary_name: &'static str,
+    spec: ReasoningSpec,
+    prompt_tokens: usize,
+    context_limit: usize,
+    reject_above_upper_bound: bool,
+) -> Result<usize, ApiError> {
+    let (field, mut requested) = match (primary, secondary) {
+        (Some(value), _) => (primary_name, Some(value)),
+        (None, Some(value)) => (secondary_name, Some(value)),
+        (None, None) => (primary_name, None),
     };
-    if value == 0 {
+    if requested == Some(0) {
         return Err(ApiError::invalid_request(
             format!("{field} must be at least 1"),
             Some(field.to_owned()),
             Some("invalid_max_tokens".to_owned()),
         ));
     }
-    if value > MODEL_MAX_OUTPUT_TOKENS {
+    if let Some(value) = requested
+        && value > MODEL_MAX_OUTPUT_TOKENS
+    {
+        if reject_above_upper_bound {
+            return Err(ApiError::invalid_request(
+                format!("{field} must not exceed {MODEL_MAX_OUTPUT_TOKENS}"),
+                Some(field.to_owned()),
+                Some("invalid_max_tokens".to_owned()),
+            ));
+        }
+        requested = Some(MODEL_MAX_OUTPUT_TOKENS);
+    }
+    if prompt_tokens > context_limit {
         return Err(ApiError::invalid_request(
-            format!("{field} must not exceed {MODEL_MAX_OUTPUT_TOKENS}"),
+            format!(
+                "This model's maximum context length is {context_limit} tokens. However, your \
+                 prompt is {prompt_tokens} tokens. Please reduce the length of the messages."
+            ),
             Some(field.to_owned()),
-            Some("invalid_max_tokens".to_owned()),
+            Some("context_length_exceeded".to_owned()),
         ));
     }
-    Ok(value)
+    let default = if !spec.thinking {
+        DEFAULT_NON_THINKING_MAX_TOKENS
+    } else if spec.effort == Some(100) {
+        DEFAULT_MAX_EFFORT_MAX_TOKENS
+    } else {
+        DEFAULT_THINKING_MAX_TOKENS
+    };
+    let remaining = context_limit - prompt_tokens;
+    Ok(requested.unwrap_or(default).min(remaining).max(1))
 }
 
 fn normalize_stop(stop: Option<&StopSpec>) -> Vec<String> {
@@ -361,6 +439,19 @@ struct RequestBuilder {
     trace: Option<TraceDirective>,
 }
 
+/// V4.1 thinking-mode sampling policy, adopted from deepseek-recipe 0.2.
+///
+/// This is a deliberately labelled API-surface/sampling change (task-63), not a
+/// prompt change: thinking mode fixes `temperature` at 1.0 and raises `top_p` to at
+/// least 0.95; outside thinking mode the caller's values are passed through.
+fn resolve_sampling(temperature: Option<f32>, top_p: Option<f32>, thinking: bool) -> (f32, f32) {
+    if thinking {
+        (1.0, top_p.unwrap_or(1.0).max(0.95))
+    } else {
+        (temperature.unwrap_or(1.0), top_p.unwrap_or(1.0))
+    }
+}
+
 impl RequestBuilder {
     /// Builds the seam request. The parsed image parts are passed through - never turned into a
     /// fabricated visual-token count - so the engine's `validate_request` can refuse them (see
@@ -368,14 +459,16 @@ impl RequestBuilder {
     /// inline parts carry the decoded bytes, not only a length. The handler calls
     /// `validate_request` before generation.
     fn build(self) -> EngineRequest {
+        let (temperature, top_p) =
+            resolve_sampling(self.temperature, self.top_p, self.spec.thinking);
         EngineRequest {
             request_id: self.id,
             model: self.model,
             prompt_tokens: self.summary.token_ids,
             images: self.summary.images,
             max_tokens: self.max_tokens,
-            temperature: self.temperature.unwrap_or(1.0),
-            top_p: self.top_p.unwrap_or(1.0),
+            temperature,
+            top_p,
             thinking: self.spec.thinking,
             reasoning_effort: self.spec.effort,
             stop: self.stop,
@@ -1065,16 +1158,21 @@ async fn chat_completions(
     let id = state.next_id("chatcmpl-dsv41-");
     let created = state.now_unix();
     let trace_id = trace_request_id(&headers, &id);
+    let prompt_tokens = summary.token_ids.len();
+    let max_tokens = resolve_max_tokens(
+        request.max_completion_tokens,
+        "max_completion_tokens",
+        request.max_tokens,
+        "max_tokens",
+        spec,
+        prompt_tokens,
+        max_seq_len(),
+    )?;
     let engine_request = RequestBuilder {
         id: id.clone(),
         model: model.clone(),
         summary,
-        max_tokens: resolve_max_tokens(
-            request.max_completion_tokens,
-            "max_completion_tokens",
-            request.max_tokens,
-            "max_tokens",
-        )?,
+        max_tokens,
         temperature: request.temperature,
         top_p: request.top_p,
         spec,
@@ -1463,11 +1561,6 @@ async fn completions(
     // `logprobs`'s value, and `echo` with `max_tokens == 0` is the echo-without-generation
     // request (text is the prompt, no tokens are generated, finish_reason is "length").
     let echo = request.echo.unwrap_or(false);
-    let max_tokens = if echo && request.max_tokens == Some(0) {
-        0
-    } else {
-        resolve_max_tokens(None, "max_tokens", request.max_tokens, "max_tokens")?
-    };
     let vocab_size = state.engine.vocab_size();
     let explicit_token_ids = request
         .logprob_token_ids
@@ -1537,6 +1630,19 @@ async fn completions(
                 }
                 None => summarize_prompt_text(&prompt.text),
             },
+        };
+        let max_tokens = if echo && request.max_tokens == Some(0) {
+            0
+        } else {
+            resolve_max_tokens(
+                None,
+                "max_tokens",
+                request.max_tokens,
+                "max_tokens",
+                spec,
+                summary.token_ids.len(),
+                max_seq_len(),
+            )?
         };
         // vLLM gives every prompt its own engine request id ('{request_id}-{i}'); a single-prompt
         // request keeps the response id so the engine seam sees exactly what it saw before.
@@ -1690,6 +1796,10 @@ fn sum_usage(usages: &[OpenAiUsageWithCache]) -> OpenAiUsageWithCache {
         add_usage(&mut usage, part);
     }
     usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+    usage.prompt_cache_hit_tokens = usage.prompt_tokens_details.cached_tokens;
+    usage.prompt_cache_miss_tokens = usage
+        .prompt_tokens
+        .saturating_sub(usage.prompt_tokens_details.cached_tokens);
     usage
 }
 
@@ -2134,16 +2244,21 @@ async fn responses(
     let reasoning_id = state.next_id("rs_dsv41_");
     let created = state.now_unix();
     let trace_id = trace_request_id(&headers, &response_id);
+    let prompt_tokens = summary.token_ids.len();
+    let max_tokens = resolve_max_tokens(
+        None,
+        "max_output_tokens",
+        request.max_output_tokens,
+        "max_output_tokens",
+        spec,
+        prompt_tokens,
+        max_seq_len(),
+    )?;
     let engine_request = RequestBuilder {
         id: response_id.clone(),
         model: model.clone(),
         summary,
-        max_tokens: resolve_max_tokens(
-            None,
-            "max_output_tokens",
-            request.max_output_tokens,
-            "max_output_tokens",
-        )?,
+        max_tokens,
         temperature: request.temperature,
         top_p: request.top_p,
         spec,
@@ -2233,11 +2348,21 @@ async fn messages(
     let stop = request.stop_sequences.clone().unwrap_or_default();
     let id = state.next_id("msg_dsv41_");
     let trace_id = trace_request_id(&headers, &id);
+    let prompt_tokens = summary.token_ids.len();
+    let max_tokens = resolve_max_tokens_for_messages(
+        None,
+        "max_tokens",
+        request.max_tokens,
+        "max_tokens",
+        spec,
+        prompt_tokens,
+        max_seq_len(),
+    )?;
     let engine_request = RequestBuilder {
         id: id.clone(),
         model: model.clone(),
         summary,
-        max_tokens: resolve_max_tokens(None, "max_tokens", request.max_tokens, "max_tokens")?,
+        max_tokens,
         temperature: request.temperature,
         top_p: request.top_p,
         spec,
@@ -2262,6 +2387,13 @@ async fn messages(
         content.push(json!({"type": "thinking", "thinking": output.reasoning, "signature": ""}));
     }
     content.push(json!({"type": "text", "text": output.content}));
+    // Anthropic excludes cache reads from `input_tokens` and reports them separately; the
+    // two fields must partition prompt_tokens, not both include the cached amount.
+    let cache_read_input_tokens = output.usage.prompt_tokens_details.cached_tokens;
+    let input_tokens = output
+        .usage
+        .prompt_tokens
+        .saturating_sub(cache_read_input_tokens);
     let body = json!({
         "id": id,
         "type": "message",
@@ -2271,9 +2403,9 @@ async fn messages(
         "stop_reason": anthropic_stop_reason(output.finish_reason),
         "stop_sequence": null,
         "usage": {
-            "input_tokens": output.usage.prompt_tokens,
+            "input_tokens": input_tokens,
             "output_tokens": output.usage.completion_tokens,
-            "cache_read_input_tokens": output.usage.prompt_tokens_details.cached_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
             "cache_creation_input_tokens": 0,
         },
         "x_deepseek_spark_stats": output.stats,
@@ -2512,5 +2644,189 @@ mod tests {
             trace_request_id(&headers, "chatcmpl-1").as_deref(),
             Some("chatcmpl-1")
         );
+    }
+
+    fn spec(thinking: bool, effort: Option<u8>) -> ReasoningSpec {
+        ReasoningSpec { thinking, effort }
+    }
+
+    #[test]
+    fn max_tokens_defaults_follow_the_recipe_contract() {
+        let context = 1_048_576;
+        assert_eq!(
+            resolve_max_tokens(
+                None,
+                "max_tokens",
+                None,
+                "max_tokens",
+                spec(false, None),
+                10,
+                context
+            )
+            .unwrap(),
+            DEFAULT_NON_THINKING_MAX_TOKENS
+        );
+        assert_eq!(
+            resolve_max_tokens(
+                None,
+                "max_tokens",
+                None,
+                "max_tokens",
+                spec(true, Some(50)),
+                10,
+                context
+            )
+            .unwrap(),
+            DEFAULT_THINKING_MAX_TOKENS
+        );
+        assert_eq!(
+            resolve_max_tokens(
+                None,
+                "max_tokens",
+                None,
+                "max_tokens",
+                spec(true, Some(100)),
+                10,
+                context
+            )
+            .unwrap(),
+            DEFAULT_MAX_EFFORT_MAX_TOKENS
+        );
+        assert_eq!(
+            resolve_max_tokens(
+                None,
+                "max_tokens",
+                Some(4096),
+                "max_tokens",
+                spec(true, Some(50)),
+                10,
+                context
+            )
+            .unwrap(),
+            4096
+        );
+    }
+
+    #[test]
+    fn max_tokens_is_lowered_to_the_context_left_after_the_prompt() {
+        // Explicit value lowered to the context remainder, not silently emitted past the window.
+        assert_eq!(
+            resolve_max_tokens(
+                None,
+                "max_tokens",
+                Some(300_000),
+                "max_tokens",
+                spec(true, Some(50)),
+                1_000,
+                200_000
+            )
+            .unwrap(),
+            199_000
+        );
+        // Default lowered too.
+        assert_eq!(
+            resolve_max_tokens(
+                None,
+                "max_tokens",
+                None,
+                "max_tokens",
+                spec(false, None),
+                10,
+                100
+            )
+            .unwrap(),
+            90
+        );
+        // A prompt that exactly fills the window still gets the recipe's minimum of 1.
+        assert_eq!(
+            resolve_max_tokens(
+                None,
+                "max_tokens",
+                None,
+                "max_tokens",
+                spec(true, Some(50)),
+                100,
+                100
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn max_tokens_validation_is_explicit() {
+        assert!(
+            resolve_max_tokens(
+                None,
+                "max_tokens",
+                Some(0),
+                "max_tokens",
+                spec(true, Some(50)),
+                1,
+                100
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_max_tokens(
+                None,
+                "max_tokens",
+                Some(MODEL_MAX_OUTPUT_TOKENS + 1),
+                "max_tokens",
+                spec(true, Some(50)),
+                1,
+                1_000_000
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_max_tokens(
+                None,
+                "max_tokens",
+                None,
+                "max_tokens",
+                spec(true, Some(50)),
+                101,
+                100
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn anthropic_messages_lower_an_over_cap_max_tokens_instead_of_rejecting() {
+        assert_eq!(
+            resolve_max_tokens_for_messages(
+                None,
+                "max_tokens",
+                Some(MODEL_MAX_OUTPUT_TOKENS + 1),
+                "max_tokens",
+                spec(true, Some(50)),
+                10,
+                1_048_576,
+            )
+            .unwrap(),
+            MODEL_MAX_OUTPUT_TOKENS
+        );
+        assert_eq!(
+            resolve_max_tokens_for_messages(
+                None,
+                "max_tokens",
+                Some(300_000),
+                "max_tokens",
+                spec(true, Some(50)),
+                1_000,
+                200_000,
+            )
+            .unwrap(),
+            199_000
+        );
+    }
+
+    #[test]
+    fn thinking_sampling_follows_the_labelled_v41_policy() {
+        assert_eq!(resolve_sampling(Some(0.6), Some(0.7), true), (1.0, 0.95));
+        assert_eq!(resolve_sampling(None, None, true), (1.0, 1.0));
+        assert_eq!(resolve_sampling(Some(0.6), Some(0.7), false), (0.6, 0.7));
     }
 }

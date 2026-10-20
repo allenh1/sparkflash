@@ -158,6 +158,9 @@ pub struct InferenceEngine {
     sampling: Sampling,
     /// The TP seam state when this engine runs one rank of a sharded model.
     tp: Option<crate::parallel_tp::TpRuntime>,
+    /// The exact f32 gather for row-sharded attention/head weights (batch 18). `None` means the
+    /// source serves whole tensors and every projection runs as it always has.
+    gather: Option<crate::parallel_tp::BitGatherHandle>,
 }
 
 impl InferenceEngine {
@@ -183,6 +186,7 @@ impl InferenceEngine {
             limit,
             sampling: Sampling::default(),
             tp: None,
+            gather: None,
         })
     }
 
@@ -226,6 +230,7 @@ impl InferenceEngine {
             limit,
             sampling: Sampling::default(),
             tp: Some(runtime),
+            gather: None,
         })
     }
 
@@ -233,6 +238,31 @@ impl InferenceEngine {
     #[must_use]
     pub fn tp(&self) -> Option<&crate::parallel_tp::TpRuntime> {
         self.tp.as_ref()
+    }
+
+    /// The exact f32 gather seam for a source that serves row-sharded attention/head weights.
+    ///
+    /// The source must answer `head.weight` (stages 1-2: `wq_b` and `wo_a` too; stage 3 adds
+    /// `wo_b`) with this rank's row slice, and the batch-18 shard plan must give every rank a
+    /// contiguous row block in rank order. The engine multiplies its local rows and gathers the
+    /// pieces in ascending rank order with [crate::parallel_tp::BitGather], which is a byte copy:
+    /// no value is rounded, so the result is bit-identical to the replicated computation. A source
+    /// that serves a shard with no seam configured is refused rather than silently multiplying a
+    /// partial weight.
+    ///
+    /// The MTP/DSpark stage (`prefill_with_taps`/`decode_with_taps` and the dspark block) reads its
+    /// own attention weights whole and is not wired to this seam, so a sharded source must not be
+    /// used on a path that runs those taps: the TP=4 host driver never does.
+    #[must_use]
+    pub fn with_bit_gather(mut self, gather: Box<dyn crate::parallel_tp::BitGather>) -> Self {
+        self.gather = Some(crate::parallel_tp::BitGatherHandle::new(gather));
+        self
+    }
+
+    /// The exact f32 gather seam, when this engine reads row-sharded weights.
+    #[must_use]
+    pub fn bit_gather(&self) -> Option<&crate::parallel_tp::BitGatherHandle> {
+        self.gather.as_ref()
     }
 
     /// The same engine with a different sampler.
@@ -268,6 +298,77 @@ impl InferenceEngine {
     #[must_use]
     pub fn limit(&self) -> usize {
         self.limit
+    }
+
+    /// The LM-head logits for `rows` tail positions, gathering row-sharded weights exactly.
+    ///
+    /// With a replicated `head.weight` this is the old read and matmul, unchanged. When the source
+    /// serves `vocab_size / world` rows (the batch-18 head row shard), each rank multiplies its own
+    /// rows and every rank's segment is copied into the full logit vector in ascending rank order:
+    /// a byte copy, so the gathered vector is bit-identical to the replicated matmul and the same
+    /// sample/argmax rule then runs over the same values.
+    ///
+    /// # Errors
+    ///
+    /// [EngineError::Shape] when the source serves a head slice but no gather seam is configured (a
+    /// partial weight is never used as if it were whole), or when the slice and the world do not
+    /// multiply to `vocab_size`; any weight read error otherwise.
+    fn head_logits(
+        &self,
+        source: &dyn WeightSource,
+        tail: &[f32],
+        rows: usize,
+    ) -> Result<Vec<f32>, EngineError> {
+        let dim = self.config.dim;
+        let vocab = self.config.vocab_size;
+        let spec = source.spec("head.weight")?;
+        let local_vocab = spec
+            .shape
+            .first()
+            .copied()
+            .filter(|rows| *rows > 0)
+            .unwrap_or(vocab);
+        if local_vocab == vocab {
+            let head = WeightView::read_plain(source, "head.weight", vocab, dim, self.limit)?;
+            let mut logits = vec![0.0f32; rows * vocab];
+            head.matmul(&mut logits, tail, vocab, dim, rows)?;
+            return Ok(logits);
+        }
+        let Some(gather) = self.gather.as_ref() else {
+            return Err(EngineError::Shape {
+                what: "lm head".to_owned(),
+                detail: format!(
+                    "the source serves {local_vocab} of {vocab} head rows but the engine has no rank-order gather seam"
+                ),
+            });
+        };
+        let world = gather.world();
+        if local_vocab.checked_mul(world) != Some(vocab) {
+            return Err(EngineError::Shape {
+                what: "lm head".to_owned(),
+                detail: format!(
+                    "{local_vocab} local head rows over {world} ranks are not the {vocab} vocab"
+                ),
+            });
+        }
+        let head = WeightView::read_plain(source, "head.weight", local_vocab, dim, self.limit)?;
+        let mut local = vec![0.0f32; rows * local_vocab];
+        head.matmul(&mut local, tail, local_vocab, dim, rows)?;
+        let mut gathered = vec![0.0f32; rows * vocab];
+        gather.gather_bits(&local, &mut gathered)?;
+        if rows == 1 {
+            return Ok(gathered);
+        }
+        // Rank-major [rank][row][local] to row-major [row][vocab].
+        let mut logits = vec![0.0f32; rows * vocab];
+        for rank in 0..world {
+            for row in 0..rows {
+                let from = (rank * rows + row) * local_vocab;
+                logits[row * vocab + rank * local_vocab..][..local_vocab]
+                    .copy_from_slice(&gathered[from..from + local_vocab]);
+            }
+        }
+        Ok(logits)
     }
 
     /// Consumes `tokens` as one chunk and returns the logits of the last position.
@@ -788,10 +889,7 @@ impl InferenceEngine {
         let mut tail = collapsed[(seqlen - 1) * dim..].to_vec();
         linalg::rms_norm(&mut tail, &norm, dim, config.norm_eps as f32)?;
         let head_input = tail.clone();
-        let head =
-            WeightView::read_plain(source, "head.weight", config.vocab_size, dim, self.limit)?;
-        let mut logits = vec![0.0f32; config.vocab_size];
-        head.matmul(&mut logits, &tail, config.vocab_size, dim, 1)?;
+        let logits = self.head_logits(source, &tail, 1)?;
 
         let next_token = sample_gumbel(&logits, self.sampling.temperature, self.sampling.seed);
 
@@ -1040,8 +1138,34 @@ impl InferenceEngine {
             u64_bytes(wide),
             "reference attention arithmetic over the window KV",
         );
-        match attention {
-            Some(backend) => attention::attention_forward_with_backend(
+        // Batch-18: an engine that has the exact gather seam and a rank-local attention source
+        // runs the Option-A body (one rank's head block, wo_a rows and o_lora slice). A
+        // whole-tensor source answers None and keeps the replicated path, which is also the
+        // default whenever no gather is installed.
+        let shard_geometry = match self.gather.as_ref() {
+            Some(gather) => {
+                attention::attention_shard_geometry(config, &prefix, source, gather.world())?
+            }
+            None => None,
+        };
+        if let Some((heads, groups)) = shard_geometry {
+            if attention.is_some() {
+                return Err(EngineError::Shape {
+                    what: format!("layer {layer} attention"),
+                    detail: "the batch-18 attention shard is host-only; a device projection backend cannot run it".to_owned(),
+                });
+            }
+            let gather = self
+                .gather
+                .as_ref()
+                .expect("a shard geometry implies the gather");
+            let shard = attention::AttentionShard {
+                gather,
+                rank: gather.rank(),
+                heads,
+                groups,
+            };
+            attention::attention_forward_sharded(
                 config,
                 layer,
                 &prefix,
@@ -1051,19 +1175,34 @@ impl InferenceEngine {
                 source,
                 &mut scratch.attn_out,
                 self.limit,
-                backend,
-            )?,
-            None => attention::attention_forward(
-                config,
-                layer,
-                &prefix,
-                &scratch.attn_in,
-                start_pos,
-                &mut state.attention[layer],
-                source,
-                &mut scratch.attn_out,
-                self.limit,
-            )?,
+                &shard,
+            )?;
+        } else {
+            match attention {
+                Some(backend) => attention::attention_forward_with_backend(
+                    config,
+                    layer,
+                    &prefix,
+                    &scratch.attn_in,
+                    start_pos,
+                    &mut state.attention[layer],
+                    source,
+                    &mut scratch.attn_out,
+                    self.limit,
+                    backend,
+                )?,
+                None => attention::attention_forward(
+                    config,
+                    layer,
+                    &prefix,
+                    &scratch.attn_in,
+                    start_pos,
+                    &mut state.attention[layer],
+                    source,
+                    &mut scratch.attn_out,
+                    self.limit,
+                )?,
+            }
         }
         // The projection left exactly one residual row per position; the head buffer beyond that is
         // not a dense row and must not be recorded or mixed as one.
@@ -1531,15 +1670,7 @@ impl InferenceEngine {
         let mut tail = collapsed;
         linalg::rms_norm(&mut tail, &norm, dim, config.norm_eps as f32)?;
         let head_input = tail.clone();
-        let head = WeightView::read_plain(
-            self.source.as_ref(),
-            "head.weight",
-            config.vocab_size,
-            dim,
-            self.limit,
-        )?;
-        let mut logits = vec![0.0f32; config.vocab_size];
-        head.matmul(&mut logits, &tail, config.vocab_size, dim, 1)?;
+        let logits = self.head_logits(self.source.as_ref(), &tail, 1)?;
         let token = linalg::argmax(&logits).map(|index| index as u32);
         let tail_stages = vec![
             StageEvent {
@@ -1777,14 +1908,7 @@ impl InferenceEngine {
         let token = if let Some(token) = device_token {
             Some(token)
         } else {
-            let head = WeightView::read_plain(
-                self.source.as_ref(),
-                "head.weight",
-                config.vocab_size,
-                dim,
-                self.limit,
-            )?;
-            head.matmul(&mut logits, &tail, config.vocab_size, dim, 1)?;
+            logits = self.head_logits(self.source.as_ref(), &tail, 1)?;
             linalg::argmax(&logits).map(|index| index as u32)
         };
         let certified_mask = moe_backend
@@ -2058,14 +2182,7 @@ impl InferenceEngine {
         let token = if let Some(token) = device_token {
             Some(token)
         } else {
-            let head = WeightView::read_plain(
-                self.source.as_ref(),
-                "head.weight",
-                config.vocab_size,
-                dim,
-                self.limit,
-            )?;
-            head.matmul(&mut logits, &tail, config.vocab_size, dim, 1)?;
+            logits = self.head_logits(self.source.as_ref(), &tail, 1)?;
             linalg::argmax(&logits).map(|index| index as u32)
         };
         let certified_mask = moe_backend

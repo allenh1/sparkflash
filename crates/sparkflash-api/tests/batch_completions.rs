@@ -222,6 +222,8 @@ impl InferenceEngine for PromptAwareEngine {
             total_tokens: prompt_tokens + 1,
             prompt_tokens_details: PromptTokensDetails::default(),
             completion_tokens_details: CompletionTokensDetails::default(),
+            prompt_cache_hit_tokens: 0,
+            prompt_cache_miss_tokens: prompt_tokens,
         };
         let stats = DeepSeekSparkRequestStats {
             kv_cache: sparkflash_api::engine::plan_for(prompt_tokens, 0, 0, false),

@@ -157,6 +157,51 @@ fn official_encoder_fixture_prompts_tokenize_to_the_recorded_ids() {
 }
 
 #[test]
+fn flat_special_token_table_is_pinned() {
+    // vLLM tokenizes the rendered string with the full added vocabulary, so control-token
+    // spellings inside user text become one id. The recipe's special-range split would emit
+    // plain characters instead; we deliberately keep the vLLM behaviour (DECISIONS.md task-63).
+    // The four ids that matter: 128803 <｜User｜>, 0 <｜begin▁of▁sentence｜>, 128822 </think>,
+    // 128825 ｜DSML｜.
+    let seam = seam();
+    let cases: [(&str, &str, &[u32]); 3] = [
+        (
+            "user",
+            "what is <｜User｜> and </think>?",
+            &[
+                0, 128799, 77666, 288, 9504, 482, 28, 223, 1328, 343, 16801, 223, 19, 15, 1457, 14,
+                270, 4077, 270, 1990, 14, 270, 850, 15146, 270, 22805, 868, 128803, 9602, 344, 223,
+                128803, 305, 223, 128822, 33, 128804, 128821,
+            ],
+        ),
+        (
+            "bos",
+            "hi<｜begin▁of▁sentence｜>there",
+            &[
+                0, 128799, 77666, 288, 9504, 482, 28, 223, 1328, 343, 16801, 223, 19, 15, 1457, 14,
+                270, 4077, 270, 1990, 14, 270, 850, 15146, 270, 22805, 868, 128803, 6366, 0, 21908,
+                128804, 128821,
+            ],
+        ),
+        (
+            "dsml",
+            "explain ｜DSML｜ invoke",
+            &[
+                0, 128799, 77666, 288, 9504, 482, 28, 223, 1328, 343, 16801, 223, 19, 15, 1457, 14,
+                270, 4077, 270, 1990, 14, 270, 850, 15146, 270, 22805, 868, 128803, 26028, 499,
+                223, 128825, 34756, 128804, 128821,
+            ],
+        ),
+    ];
+    for (name, content, expected) in cases {
+        let ids = seam
+            .encode_chat(&json!({"messages": [{"role": "user", "content": content}]}))
+            .expect("renders");
+        assert_eq!(ids, expected, "flat special-token case {name}");
+    }
+}
+
+#[test]
 fn chat_template_ids_match_the_released_server() {
     let seam = seam();
     let recorded_json = evidence();

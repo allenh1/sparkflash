@@ -54,6 +54,7 @@ use super::weight_view::WeightView;
 use crate::config::ModelConfig;
 use crate::linalg::{self, EngineError, ScaleGrid};
 use crate::parallel::par_aligned_mut;
+use crate::parallel_tp::BitGatherHandle;
 use crate::quant;
 use crate::weights::WeightSource;
 
@@ -673,6 +674,19 @@ fn is_index_source(config: &ModelConfig, layer: usize) -> bool {
 /// Whether the layer owns the index keys the indexer reads (model.py:500).
 fn owns_index_keys(config: &ModelConfig, layer: usize) -> bool {
     config.kv_source_layers.contains(&layer)
+}
+
+/// The KV source a consumer layer reads: the nearest preceding layer that compresses its own KV.
+///
+/// The reference resolves the same relation statically, once, and asserts the source precedes its
+/// consumer (cache_engine.py:160-172); a consumer never reads a later source or its own cache.
+fn planned_kv_source(config: &ModelConfig, layer: usize) -> Option<usize> {
+    config
+        .kv_source_layers
+        .iter()
+        .rev()
+        .copied()
+        .find(|&source| source < layer)
 }
 
 /// How many whole rows of `width` a slice holds.
@@ -1710,6 +1724,13 @@ fn compressed_indices_inner(
     }
     let owns = owns_index_keys(config, layer);
     let published = with_shared(|shared| {
+        if !owns {
+            debug_assert_eq!(
+                shared.index_owner,
+                planned_kv_source(config, layer),
+                "layer {layer} reuses index keys only from its planned kv source (cache_engine.py:160-172)"
+            );
+        }
         let keys: &[f32] = if owns {
             &state.indexer
         } else {
@@ -2090,6 +2111,100 @@ impl AttentionProjectionBackend for HostAttentionProjectionBackend {
     }
 }
 
+/// One rank's slice of the batch-18 Option-A attention shard (design brief section 3, steps 1-5).
+///
+/// The split is by OUTPUT rows: rank `r` holds heads `r * heads .. (r + 1) * heads` of `wq_b`, the
+/// matching o-groups of `wo_a`, and computes its own head block of the sparse body. Each output
+/// element's dot product is therefore still one ascending f32 accumulation over the full input
+/// (the replicated q_a latent and the full KV rows), so nothing is re-associated: the rank-local
+/// results are exactly the replicated results, and the only cross-rank operation is the exact
+/// o_lora copy in [output_projection_with].
+pub struct AttentionShard<'a> {
+    /// The exact f32 gather the o_lora copy rides.
+    pub gather: &'a BitGatherHandle,
+    /// This rank's index.
+    pub rank: usize,
+    /// The number of heads this rank owns (contiguous, a whole number of o-groups).
+    pub heads: usize,
+    /// The number of o-groups this rank owns: `heads / (n_heads / o_groups)`.
+    pub groups: usize,
+}
+
+/// The local head and o-group counts when this rank's source serves a `wq_b` output-row shard.
+///
+/// A whole-tensor source answers `None`, which is the replicated layout and keeps every old call
+/// path unchanged. A sharded source is validated here once: the head block must be whole heads, the
+/// rank's heads must be whole o-groups (64 heads / 8 groups / 4 ranks = 16 heads = 2 groups), and
+/// its `wo_a` slice must be exactly those groups' rows. Anything else is refused before the body
+/// runs, because a mis-aligned group split would silently mix heads from two groups.
+///
+/// # Errors
+///
+/// [EngineError::Shape] when the local geometry is not a whole-head, whole-group split of the
+/// replicated geometry, or when the source disagrees with itself between `wq_b` and `wo_a`.
+pub fn attention_shard_geometry(
+    config: &ModelConfig,
+    prefix: &str,
+    source: &dyn WeightSource,
+    world: usize,
+) -> Result<Option<(usize, usize)>, EngineError> {
+    let head_dim = config.head_dim;
+    let heads_full = config.n_heads;
+    let wq_b = source.spec(&format!("{prefix}.attn.wq_b.weight"))?;
+    let rows = wq_b.shape.first().copied().unwrap_or(0);
+    if rows == heads_full * head_dim {
+        return Ok(None);
+    }
+    if world == 0 || head_dim == 0 || rows == 0 || !rows.is_multiple_of(head_dim) {
+        return Err(EngineError::Shape {
+            what: "attention shard".to_owned(),
+            detail: format!(
+                "{rows} wq_b rows are not the {world} ranks' whole heads of {head_dim}"
+            ),
+        });
+    }
+    let heads = rows / head_dim;
+    if heads.checked_mul(world) != Some(heads_full) {
+        return Err(EngineError::Shape {
+            what: "attention shard".to_owned(),
+            detail: format!(
+                "{heads} local heads of {heads_full} over {world} ranks do not cover the model"
+            ),
+        });
+    }
+    let per_group = heads_full / config.o_groups.max(1);
+    if per_group == 0 || !heads.is_multiple_of(per_group) {
+        return Err(EngineError::Shape {
+            what: "attention shard".to_owned(),
+            detail: format!(
+                "{heads} local heads do not split into whole o-groups of {per_group} heads"
+            ),
+        });
+    }
+    let groups = heads / per_group;
+    if groups.checked_mul(world) != Some(config.o_groups) {
+        return Err(EngineError::Shape {
+            what: "attention shard".to_owned(),
+            detail: format!(
+                "{groups} local o-groups of {} over {world} ranks do not cover the groups",
+                config.o_groups
+            ),
+        });
+    }
+    let wo_a = source.spec(&format!("{prefix}.attn.wo_a.weight"))?;
+    let wo_a_rows = wo_a.shape.first().copied().unwrap_or(0);
+    let expected = groups * config.o_lora_rank;
+    if wo_a_rows != expected {
+        return Err(EngineError::Shape {
+            what: "attention shard".to_owned(),
+            detail: format!(
+                "wo_a serves {wo_a_rows} rows; {groups} local o-groups need {expected}"
+            ),
+        });
+    }
+    Ok(Some((heads, groups)))
+}
+
 /// The chunk's queries: `wq_b(q_norm(wq_a(x)))` with the RoPE tail rotated, and the latent the
 /// indexer projects with its own `wq_b` (model.py:770-772, 550).
 ///
@@ -2113,6 +2228,7 @@ fn query_path(
         src.source,
         src.limit,
         &mut HostAttentionProjectionBackend,
+        None,
     )
 }
 
@@ -2126,11 +2242,12 @@ fn query_path_with(
     source: &dyn WeightSource,
     limit: usize,
     backend: &mut dyn AttentionProjectionBackend,
+    shard: Option<&AttentionShard>,
 ) -> Result<(Vec<f32>, Vec<f32>), EngineError> {
     let dim = config.dim;
     let rank = config.q_lora_rank;
     let head_dim = config.head_dim;
-    let heads = config.n_heads;
+    let heads = shard.map_or(config.n_heads, |shard| shard.heads);
     let seqlen = rows_of(x, dim, "attention input")?;
     let q_norm = weight(
         Reads { source, limit },
@@ -2141,7 +2258,24 @@ fn query_path_with(
     // RMSNorm casts back to the bf16 input dtype, and wq_b's activation quantiser consumes
     // that bf16 value (model.py:281-293, 970-971), so the host seam narrows it (F5).
     narrow_bf16(&mut latent);
-    let mut q = backend.wq_b(config, layer, prefix, &latent, source, limit)?;
+    let mut q = match shard {
+        None => backend.wq_b(config, layer, prefix, &latent, source, limit)?,
+        Some(_) => {
+            // The rank's own head rows: the same ascending q_lora_rank dot per output element,
+            // just fewer output elements. wq_b stays replicated for every other driver.
+            let cols = heads * head_dim;
+            let seqlen = rows_of(&latent, rank, "q latent")?;
+            let wq_b = dense_view(
+                Reads { source, limit },
+                &format!("{prefix}.attn.wq_b"),
+                cols,
+                rank,
+            )?;
+            let mut q = vec![0.0; seqlen * cols];
+            wq_b.matmul(&mut q, &latent, cols, rank, seqlen)?;
+            q
+        }
+    };
     let tables =
         rope_tables_for_layer(config, layer, &head_row_positions(start_pos, seqlen, heads));
     rotate_rows(
@@ -2458,6 +2592,11 @@ fn fetch_compressed(
         Ok(state.compressed[..needed].to_vec())
     } else {
         with_shared(|shared| {
+            debug_assert_eq!(
+                shared.compressed_owner,
+                planned_kv_source(config, layer),
+                "layer {layer} reads the compressed cache of its planned kv source, not another layer's (cache_engine.py:160-172 asserts the source precedes its consumer)"
+            );
             if shared.compressed_rows < compress_len {
                 return Err(shape(
                     "compressed KV",
@@ -2496,6 +2635,7 @@ fn output_projection(
         src.source,
         src.limit,
         &mut HostAttentionProjectionBackend,
+        None,
     )
 }
 
@@ -2508,23 +2648,86 @@ fn output_projection_with(
     source: &dyn WeightSource,
     limit: usize,
     backend: &mut dyn AttentionProjectionBackend,
+    shard: Option<&AttentionShard>,
 ) -> Result<(), EngineError> {
     let head_dim = config.head_dim;
-    let heads = config.n_heads;
-    let wide_row = heads * head_dim;
-    if out.len() < seqlen * wide_row {
-        return Err(shape(
-            "attention output projection",
-            format!(
-                "{seqlen} rows of {wide_row} values need {} slots, got {}",
-                seqlen * wide_row,
-                out.len()
-            ),
-        ));
-    }
-    let grouped = backend.wo_a(config, prefix, &out[..seqlen * wide_row], source, limit)?;
-    let projected = backend.wo_b(config, prefix, &grouped, source, limit)?;
     let dim = config.dim;
+    let hidden_row = config.n_heads * head_dim;
+    let grouped_width = config.o_groups * config.o_lora_rank;
+    let grouped = match shard {
+        None => {
+            if out.len() < seqlen * hidden_row {
+                return Err(shape(
+                    "attention output projection",
+                    format!(
+                        "{seqlen} rows of {hidden_row} values need {} slots, got {}",
+                        seqlen * hidden_row,
+                        out.len()
+                    ),
+                ));
+            }
+            backend.wo_a(config, prefix, &out[..seqlen * hidden_row], source, limit)?
+        }
+        Some(shard) => {
+            // The rank's own o-groups of wo_a over its own heads, then the exact rank-order copy
+            // of the per-position o_lora vectors back into the full width. The copy has no
+            // arithmetic, so it reconstructs the replicated vector bit for bit.
+            let wide_row = shard.heads * head_dim;
+            if out.len() < seqlen * wide_row {
+                return Err(shape(
+                    "attention output projection",
+                    format!(
+                        "{seqlen} rows of {wide_row} local head values need {} slots, got {}",
+                        seqlen * wide_row,
+                        out.len()
+                    ),
+                ));
+            }
+            let local = wo_a_local(
+                config,
+                prefix,
+                &out[..seqlen * wide_row],
+                seqlen,
+                shard,
+                source,
+                limit,
+            )?;
+            let local_width = shard.groups * config.o_lora_rank;
+            if local.len() != seqlen * local_width {
+                return Err(shape(
+                    "attention output projection",
+                    format!(
+                        "expected {} local o_lora values, got {}",
+                        seqlen * local_width,
+                        local.len()
+                    ),
+                ));
+            }
+            let world = shard.gather.world();
+            if local_width.checked_mul(world) != Some(grouped_width) {
+                return Err(shape(
+                    "attention output projection",
+                    format!(
+                        "{local_width} local o_lora values over {world} ranks are not {grouped_width}"
+                    ),
+                ));
+            }
+            let mut gathered = vec![0.0f32; seqlen * grouped_width];
+            shard.gather.gather_bits(&local, &mut gathered)?;
+            // The gather is rank-major per call: [rank][position][local group]. wo_b reads
+            // [position][group], so repack that axis order without touching a value.
+            let mut ordered = vec![0.0f32; seqlen * grouped_width];
+            for rank in 0..world {
+                for position in 0..seqlen {
+                    let from = (rank * seqlen + position) * local_width;
+                    ordered[position * grouped_width + rank * local_width..][..local_width]
+                        .copy_from_slice(&gathered[from..from + local_width]);
+                }
+            }
+            ordered
+        }
+    };
+    let projected = backend.wo_b(config, prefix, &grouped, source, limit)?;
     if projected.len() != seqlen * dim {
         return Err(shape(
             "attention output projection",
@@ -2537,6 +2740,97 @@ fn output_projection_with(
     }
     out[..seqlen * dim].copy_from_slice(&projected);
     Ok(())
+}
+
+/// The grouped output projection over one rank's heads and o-groups.
+///
+/// This is [HostAttentionProjectionBackend::wo_a] with the rank's groups in place of all groups:
+/// the local `wide` row holds the rank's heads in order, which is exactly its groups in order
+/// because the head block is a whole number of groups. Every local row dot is the same ascending
+/// accumulation the replicated path runs for that group.
+fn wo_a_local(
+    config: &ModelConfig,
+    prefix: &str,
+    wide: &[f32],
+    seqlen: usize,
+    shard: &AttentionShard,
+    source: &dyn WeightSource,
+    limit: usize,
+) -> Result<Vec<f32>, EngineError> {
+    let src = Reads { source, limit };
+    let head_dim = config.head_dim;
+    let per_group = config.n_heads / config.o_groups;
+    let group_in = per_group * head_dim;
+    let wide_row = shard.heads * head_dim;
+    let grouped_width = shard.groups * config.o_lora_rank;
+    if wide.len() < seqlen * wide_row {
+        return Err(shape(
+            "attention wo_a",
+            format!(
+                "{seqlen} rows of {wide_row} local head values need {} slots, got {}",
+                seqlen * wide_row,
+                wide.len()
+            ),
+        ));
+    }
+    let wo_a_name = format!("{prefix}.attn.wo_a");
+    let wo_a = scaled_or_plain_view(src, &wo_a_name, grouped_width, group_in)?;
+    // The same geometry exception as the replicated path: a grid whose row blocks are not whole
+    // 32-row blocks must be materialised first. The released o_lora_rank 1024 is fine either way.
+    let materialised = if wo_a.row_blocks_supported(config.o_lora_rank, group_in) {
+        None
+    } else {
+        let scale_name = format!("{wo_a_name}.scale");
+        let mut values = weight(src, &format!("{wo_a_name}.weight"))?;
+        if src.source.spec(&scale_name).is_ok() {
+            let scales = weight(src, &scale_name)?;
+            linalg::apply_scales(
+                &mut values,
+                grouped_width,
+                group_in,
+                &scales,
+                ScaleGrid::Block32,
+            )?;
+        }
+        Some(values)
+    };
+    let mut grouped = vec![0.0; seqlen * grouped_width];
+    for query in 0..seqlen {
+        let wide_row_values = &wide[query * wide_row..][..wide_row];
+        let dest = &mut grouped[query * grouped_width..][..grouped_width];
+        if let Some(values) = &materialised {
+            for group in 0..shard.groups {
+                let source = &wide_row_values[group * group_in..][..group_in];
+                let row_start = group * config.o_lora_rank;
+                let block = &values[row_start * group_in..][..config.o_lora_rank * group_in];
+                let block_out = &mut dest[row_start..][..config.o_lora_rank];
+                linalg::matmul(block_out, source, block, config.o_lora_rank, group_in, 1)?;
+            }
+        } else if wo_a.supports_grouped() {
+            wo_a.matmul_grouped(
+                dest,
+                wide_row_values,
+                shard.groups,
+                config.o_lora_rank,
+                group_in,
+            )?;
+        } else {
+            for group in 0..shard.groups {
+                let source = &wide_row_values[group * group_in..][..group_in];
+                let row_start = group * config.o_lora_rank;
+                let block_out = &mut dest[row_start..][..config.o_lora_rank];
+                wo_a.matmul_rows(
+                    block_out,
+                    source,
+                    config.o_lora_rank,
+                    group_in,
+                    1,
+                    row_start,
+                )?;
+            }
+        }
+    }
+    Ok(grouped)
 }
 
 /// The backbone CSA2 pass for one layer (model.py:765-789).
@@ -2578,6 +2872,45 @@ pub fn attention_forward(
     )
 }
 
+/// The batch-18 Option-A attention step: one rank's head block through the sparse body, its own
+/// o-groups of wo_a, one exact o_lora all-gather and the replicated wo_b.
+///
+/// The sharded path is host-only on purpose: the body's arithmetic stays the reference f32
+/// arithmetic, and the only new primitive is the exact gather. `out` keeps the replicated
+/// contract of [attention_forward]: the first `positions * dim` values hold the residual row
+/// afterwards.
+///
+/// # Errors
+///
+/// As [attention_forward], plus the gather's own transport error.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_forward_sharded(
+    config: &ModelConfig,
+    layer: usize,
+    prefix: &str,
+    x: &[f32],
+    start_pos: usize,
+    state: &mut AttnState,
+    src: &dyn WeightSource,
+    out: &mut [f32],
+    limit: usize,
+    shard: &AttentionShard<'_>,
+) -> Result<(), EngineError> {
+    attention_forward_with(
+        config,
+        layer,
+        prefix,
+        x,
+        start_pos,
+        state,
+        src,
+        out,
+        limit,
+        &mut HostAttentionProjectionBackend,
+        Some(shard),
+    )
+}
+
 /// The attention stage of one layer with its projection and attention maths delegated to
 /// the backend: the model-level f32 path for the CPU reference
 /// (HostAttentionProjectionBackend) or a device seam. Writes the attention output for the
@@ -2595,10 +2928,35 @@ pub fn attention_forward_with_backend(
     limit: usize,
     backend: &mut dyn AttentionProjectionBackend,
 ) -> Result<(), EngineError> {
+    attention_forward_with(
+        config, layer, prefix, x, start_pos, state, src, out, limit, backend, None,
+    )
+}
+
+/// The body of [attention_forward_with_backend], with an optional output-row shard.
+///
+/// With a shard the head loop, the q rows and the o_lora rows are the rank's own; every value is
+/// produced by the same ascending-f32 arithmetic as the replicated path. The device
+/// `backend.attention` arm is skipped, because a device kernel has no rank-local head range yet.
+#[allow(clippy::too_many_arguments)]
+fn attention_forward_with(
+    config: &ModelConfig,
+    layer: usize,
+    prefix: &str,
+    x: &[f32],
+    start_pos: usize,
+    state: &mut AttnState,
+    src: &dyn WeightSource,
+    out: &mut [f32],
+    limit: usize,
+    backend: &mut dyn AttentionProjectionBackend,
+    shard: Option<&AttentionShard<'_>>,
+) -> Result<(), EngineError> {
     let src = Reads { source: src, limit };
     let dim = config.dim;
     let head_dim = config.head_dim;
-    let heads = config.n_heads;
+    let heads_full = config.n_heads;
+    let heads = shard.map_or(heads_full, |shard| shard.heads);
     let seqlen = rows_of(x, dim, "attention input")?;
     if out.len() < seqlen * dim {
         return Err(shape(
@@ -2632,11 +2990,11 @@ pub fn attention_forward_with_backend(
             ),
         ));
     }
-    if head_dim == 0 || config.o_groups == 0 || !heads.is_multiple_of(config.o_groups) {
+    if head_dim == 0 || config.o_groups == 0 || !heads_full.is_multiple_of(config.o_groups) {
         return Err(shape(
             "attention geometry",
             format!(
-                "{heads} heads of {head_dim} do not split into {} groups",
+                "{heads_full} heads of {head_dim} do not split into {} groups",
                 config.o_groups
             ),
         ));
@@ -2648,7 +3006,7 @@ pub fn attention_forward_with_backend(
     let compress_len = end_pos.checked_div(ratio).unwrap_or(0);
     let scale = (head_dim as f64).powf(-0.5) as f32;
     let (q, latent) = query_path_with(
-        config, layer, prefix, x, start_pos, src.source, src.limit, backend,
+        config, layer, prefix, x, start_pos, src.source, src.limit, backend, shard,
     )?;
     let kv_rows = window_kv_with(
         config, layer, prefix, x, start_pos, src.source, src.limit, backend,
@@ -2695,6 +3053,21 @@ pub fn attention_forward_with_backend(
     let compressed_stride = compressed_ids.len().checked_div(seqlen).unwrap_or(0);
     // The window KV the indices index into: the whole chunk during prefill, the whole ring after it.
     let sink = weight(src, &format!("{prefix}.attn.attn_sink"))?;
+    // The plan keeps attn_sink replicated; a sharded rank takes its own heads' values.
+    let sink = match shard {
+        None => sink,
+        Some(shard) => {
+            let start = shard.rank * shard.heads;
+            let end = start + shard.heads;
+            if sink.len() < heads_full {
+                return Err(shape(
+                    "attention sink",
+                    format!("{} sinks for {heads_full} heads", sink.len()),
+                ));
+            }
+            sink[start..end].to_vec()
+        }
+    };
     let mut kv = vec![0.0; (window_rows + compressed_rows.len() / head_dim) * head_dim];
     kv[window_rows * head_dim..].copy_from_slice(&compressed_rows);
     if start_pos == 0 {
@@ -2717,7 +3090,9 @@ pub fn attention_forward_with_backend(
     // The device body sees the prefill chunk at position 0, and one-ring-row decode steps through
     // the position-causal sequence entry. A backend that does not stage a decode step answers
     // false and the host loop below runs unchanged (the ring write is idempotent).
-    let device_attention = if start_pos == 0 {
+    let device_attention = if shard.is_some() {
+        false
+    } else if start_pos == 0 {
         let mut chunk_ids = Vec::with_capacity(seqlen * (window_width + compressed_stride));
         for query in 0..seqlen {
             chunk_ids.extend_from_slice(&ids[query * window_width..(query + 1) * window_width]);
@@ -2831,7 +3206,9 @@ pub fn attention_forward_with_backend(
         &tables,
         true,
     )?;
-    output_projection_with(config, prefix, out, seqlen, src.source, src.limit, backend)?;
+    output_projection_with(
+        config, prefix, out, seqlen, src.source, src.limit, backend, shard,
+    )?;
     Ok(())
 }
 
@@ -4554,5 +4931,85 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The released model has four KV sources (layers 2, 8, 14, 20), so every consumer's planned
+    /// source is the nearest preceding one and every source reads its own cache.
+    #[test]
+    fn a_consumer_plans_to_read_the_nearest_preceding_kv_source() {
+        let config = ModelConfig::v41_flash().expect("the released config parses");
+        for (layer, source) in [
+            (3, 2),
+            (7, 2),
+            (9, 8),
+            (15, 14),
+            (21, 20),
+            (24, 20),
+            (36, 20),
+            (39, 20),
+        ] {
+            assert_eq!(
+                planned_kv_source(&config, layer),
+                Some(source),
+                "layer {layer} plans to read layer {source}"
+            );
+        }
+        assert_eq!(
+            planned_kv_source(&config, 2),
+            None,
+            "the first source has no preceding source"
+        );
+    }
+
+    /// A consumer that finds its planned source's cache in the channel reads it.
+    #[test]
+    fn a_consumer_reads_its_planned_source() {
+        reset_shared_attention();
+        let config = ModelConfig {
+            kv_source_layers: vec![0, 4],
+            ..ModelConfig::tiny()
+        };
+        let head_dim = config.head_dim;
+        let owner_cache = vec![0.25f32; head_dim];
+        with_shared(|shared| {
+            publish_rows(
+                &mut shared.compressed,
+                &mut shared.compressed_rows,
+                &mut shared.compressed_owner,
+                4,
+                &owner_cache,
+                head_dim,
+            );
+        });
+        let state = AttnState::for_config(&config);
+        let rows = fetch_compressed(&config, 5, &state, 1).expect("the planned source serves");
+        assert_eq!(rows, owner_cache);
+    }
+
+    /// Another layer's cache in the channel is a layer-order regression, and the reference asserts
+    /// the owner-before-consumer relation at construction (cache_engine.py:160-172); the debug assert
+    /// turns the silent cross-segment read into a fail-fast panic.
+    #[test]
+    #[should_panic(expected = "planned kv source")]
+    fn a_consumer_refuses_an_owner_that_is_not_its_planned_source() {
+        reset_shared_attention();
+        let config = ModelConfig {
+            kv_source_layers: vec![0, 4],
+            ..ModelConfig::tiny()
+        };
+        let head_dim = config.head_dim;
+        let owner_cache = vec![0.25f32; head_dim];
+        with_shared(|shared| {
+            publish_rows(
+                &mut shared.compressed,
+                &mut shared.compressed_rows,
+                &mut shared.compressed_owner,
+                0,
+                &owner_cache,
+                head_dim,
+            );
+        });
+        let state = AttnState::for_config(&config);
+        let _ = fetch_compressed(&config, 5, &state, 1);
     }
 }

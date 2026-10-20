@@ -111,12 +111,12 @@ fn effort_resolution_is_total() {
 #[test]
 fn effort_resolution_maps_documented_values() {
     let low = resolve_reasoning_effort(Some(&json!("low")), true);
-    assert_eq!(low.score, Some(50));
+    assert_eq!(low.score, Some(25));
     assert_eq!(low.effort, Some(ReasoningEffort::Low));
     assert!(low.error.is_none());
 
     let high = resolve_reasoning_effort(Some(&json!("high")), true);
-    assert_eq!(high.score, Some(75));
+    assert_eq!(high.score, Some(50));
     assert_eq!(high.effort, Some(ReasoningEffort::High));
 
     let xhigh = resolve_reasoning_effort(Some(&json!("xhigh")), true);
@@ -128,7 +128,7 @@ fn effort_resolution_maps_documented_values() {
     assert_eq!(max.effort, Some(ReasoningEffort::Max));
 
     let absent = resolve_reasoning_effort(None, true);
-    assert_eq!(absent.score, Some(75));
+    assert_eq!(absent.score, Some(50));
     assert!(absent.error.is_none());
 
     let numeric = resolve_reasoning_effort(Some(&json!(63)), true);
@@ -167,7 +167,7 @@ fn effort_resolution_maps_documented_values() {
     );
 
     let unknown = resolve_reasoning_effort(Some(&json!("bogus")), true);
-    assert_eq!(unknown.score, Some(75));
+    assert_eq!(unknown.score, Some(50));
     assert_eq!(
         unknown.error,
         Some(ReasoningEffortError::UnknownAlias("bogus".to_owned()))

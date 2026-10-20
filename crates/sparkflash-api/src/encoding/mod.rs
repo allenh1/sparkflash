@@ -117,18 +117,19 @@ fn default_effort_spec(error: Option<ReasoningEffortError>) -> ReasoningEffortSp
     ReasoningEffortSpec {
         thinking: true,
         effort: Some(ReasoningEffort::High),
-        score: Some(75),
+        score: Some(DEFAULT_EFFORT_SCORE),
         error,
     }
 }
 
 /// Resolve the reasoning effort of a request.
 ///
-/// Accepts an integer in 1..=100, the aliases low=50, high=75, xhigh=75, and
-/// max=100, or the whole request object (whose reasoning_effort field is used).
-/// Absent values default to 75 while thinking. With thinking disabled no effort
-/// line is rendered. Out-of-range integers are clamped into 1..=100 and reported
-/// through `ReasoningEffortSpec::error`.
+/// Accepts an integer in 1..=100, the aliases low=25, high/medium=50, xhigh=75,
+/// and max=100, or the whole request object (whose reasoning_effort field is used).
+/// Absent values default to 50 (`high`) while thinking, matching the released
+/// V4.1 encoder. With thinking disabled no effort line is rendered. Out-of-range
+/// integers are clamped into 1..=100 and reported through
+/// `ReasoningEffortSpec::error`.
 pub fn resolve_reasoning_effort(
     request_value: Option<&Value>,
     thinking: bool,
@@ -187,25 +188,25 @@ pub fn resolve_reasoning_effort(
             "low" | "minimal" => ReasoningEffortSpec {
                 thinking: true,
                 effort: Some(ReasoningEffort::Low),
-                score: Some(50),
+                score: Some(TEMPLATE_EFFORT_LOW),
                 error: None,
             },
             "high" | "medium" => ReasoningEffortSpec {
                 thinking: true,
                 effort: Some(ReasoningEffort::High),
-                score: Some(75),
+                score: Some(TEMPLATE_EFFORT_HIGH),
                 error: None,
             },
             "xhigh" => ReasoningEffortSpec {
                 thinking: true,
                 effort: Some(ReasoningEffort::Xhigh),
-                score: Some(75),
+                score: Some(TEMPLATE_EFFORT_XHIGH),
                 error: None,
             },
             "max" => ReasoningEffortSpec {
                 thinking: true,
                 effort: Some(ReasoningEffort::Max),
-                score: Some(100),
+                score: Some(TEMPLATE_EFFORT_MAX),
                 error: None,
             },
             other => {
@@ -286,9 +287,10 @@ fn recipe_effort_score(conversation: &Conversation) -> Option<u8> {
         return None;
     }
     Some(match conversation.reasoning_effort {
-        Some(ReasoningEffort::Low) => 50,
-        Some(ReasoningEffort::Max) => 100,
-        None | Some(ReasoningEffort::High) | Some(ReasoningEffort::Xhigh) => 75,
+        Some(ReasoningEffort::Low) => TEMPLATE_EFFORT_LOW,
+        Some(ReasoningEffort::Max) => TEMPLATE_EFFORT_MAX,
+        Some(ReasoningEffort::Xhigh) => TEMPLATE_EFFORT_XHIGH,
+        None | Some(ReasoningEffort::High) => TEMPLATE_EFFORT_HIGH,
     })
 }
 

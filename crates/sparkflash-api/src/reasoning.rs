@@ -10,12 +10,15 @@
 //! 2. `enable_thinking` (bool)
 //! 3. the default: thinking on.
 //!
-//! The numeric table itself (which alias scores what, and the 75 default) is NOT defined
+//! The numeric table itself (which alias scores what, and the 50 default) is NOT defined
 //! here: it is owned by `crate::encoding::resolve_reasoning_effort`, the
 //! canonical API-surface resolver, and this module only adds the strict validation and the
 //! typed errors the HTTP layer reports. That keeps the two surfaces from drifting.
 
-use crate::encoding::{ReasoningEffortError, resolve_reasoning_effort};
+use crate::encoding::{
+    ReasoningEffortError, TEMPLATE_EFFORT_HIGH, TEMPLATE_EFFORT_LOW, TEMPLATE_EFFORT_MAX,
+    TEMPLATE_EFFORT_XHIGH, resolve_reasoning_effort,
+};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -23,18 +26,22 @@ use thiserror::Error;
 pub const EFFORT_MIN: u8 = 1;
 /// Highest accepted reasoning effort score.
 pub const EFFORT_MAX: u8 = 100;
-/// Score used when effort is absent, null, "medium", "high" or "xhigh".
-pub const EFFORT_DEFAULT: u8 = 75;
+/// Score used when effort is absent, null or "high".
+///
+/// This is the released V4.1 encoder's default (`high`), and the same 25/50/75/100
+/// table used by the prompt seam; recipe 0.2's separate 50/75/75/100 table is not
+/// an API default. See docs/DECISIONS.md (task-63 effort-table consolidation).
+pub const EFFORT_DEFAULT: u8 = TEMPLATE_EFFORT_HIGH;
 /// Score for "low" and "minimal".
-pub const EFFORT_LOW: u8 = 50;
-/// Score for "medium".
+pub const EFFORT_LOW: u8 = TEMPLATE_EFFORT_LOW;
+/// Score for "medium" (an alias of the default high level).
 pub const EFFORT_MEDIUM: u8 = EFFORT_DEFAULT;
 /// Score for "high".
-pub const EFFORT_HIGH: u8 = EFFORT_DEFAULT;
+pub const EFFORT_HIGH: u8 = TEMPLATE_EFFORT_HIGH;
 /// Score for "xhigh".
-pub const EFFORT_XHIGH: u8 = EFFORT_DEFAULT;
+pub const EFFORT_XHIGH: u8 = TEMPLATE_EFFORT_XHIGH;
 /// Score for "max".
-pub const EFFORT_MAX_SCORE: u8 = 100;
+pub const EFFORT_MAX_SCORE: u8 = TEMPLATE_EFFORT_MAX;
 
 /// Resolved reasoning configuration for one request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,19 +227,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn absent_and_null_effort_default_to_75() {
+    fn absent_and_null_effort_default_to_50() {
         assert_eq!(
             resolve(&json!({})).expect("empty body"),
             ReasoningSpec {
                 thinking: true,
-                effort: Some(75)
+                effort: Some(50)
             }
         );
         assert_eq!(
             resolve(&json!({"reasoning_effort": null})).expect("null effort"),
             ReasoningSpec {
                 thinking: true,
-                effort: Some(75)
+                effort: Some(50)
             }
         );
     }
@@ -288,17 +295,17 @@ mod tests {
     #[test]
     fn every_named_effort_maps_to_the_documented_score() {
         for (name, score) in [
-            ("low", 50),
-            ("minimal", 50),
-            ("medium", 75),
-            ("high", 75),
+            ("low", 25),
+            ("minimal", 25),
+            ("medium", 50),
+            ("high", 50),
             ("xhigh", 75),
             ("max", 100),
         ] {
             let spec = resolve(&json!({"reasoning_effort": name})).expect("known effort");
             assert_eq!(spec.effort, Some(score), "effort {name}");
         }
-        assert_eq!(effort_for_name("LOW"), Some(50));
+        assert_eq!(effort_for_name("LOW"), Some(25));
         assert_eq!(effort_for_name(" Max "), Some(100));
         assert_eq!(effort_for_name("extreme"), None);
     }
@@ -356,7 +363,7 @@ mod tests {
             resolve(&json!({"enable_thinking": true}))
                 .expect("on")
                 .effort,
-            Some(75)
+            Some(50)
         );
         assert!(resolve(&json!({"enable_thinking": "yes"})).is_err());
     }
@@ -385,7 +392,7 @@ mod tests {
             on,
             ReasoningSpec {
                 thinking: true,
-                effort: Some(75)
+                effort: Some(50)
             }
         );
 
@@ -411,7 +418,7 @@ mod tests {
             on_string,
             ReasoningSpec {
                 thinking: true,
-                effort: Some(75)
+                effort: Some(50)
             }
         );
     }

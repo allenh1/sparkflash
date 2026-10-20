@@ -186,6 +186,8 @@ mod tests {
                     image_tokens: 0,
                 },
                 completion_tokens_details: Default::default(),
+                prompt_cache_hit_tokens: 64,
+                prompt_cache_miss_tokens: 36,
             },
             &crate::engine::plan_for(100, 64, 0, true),
         );

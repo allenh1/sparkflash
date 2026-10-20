@@ -60,6 +60,7 @@ use sparkflash_engine::forward::{
     DeferredHandoff, HybridEntry, HybridPost, InferenceEngine, SequenceState,
 };
 use sparkflash_engine::linalg::{self, EngineError};
+use sparkflash_engine::parallel_tp::BitGather;
 use sparkflash_engine::quant;
 use sparkflash_engine::safetensors::{SafeTensorsSource, TensorHeader};
 use sparkflash_engine::tensor::{TensorPlan, TensorSpec};
@@ -92,6 +93,7 @@ struct RankOutcome {
     prompt: Vec<u32>,
     generated: Vec<u32>,
     step_tokens: Vec<Option<u32>>,
+    step_logits_sha256: Vec<String>,
     completion_text: Option<String>,
     step_ms: Vec<u64>,
     step_rchar: Vec<u64>,
@@ -117,6 +119,10 @@ struct RankOutcome {
     rss_load_kib: u64,
     rss_peak_kib: u64,
     plan_hash: u64,
+    attention_shard: String,
+    gather_calls: u64,
+    gather_elements: u64,
+    gather_ms_total: u64,
     collective_label: String,
     seams: Vec<SeamRecord>,
     reference: Option<ReferenceCheck>,
@@ -625,8 +631,17 @@ pub struct Tp4Metrics {
     pub steps: u64,
     /// Wall milliseconds of the most recent step.
     pub last_step_ms: u64,
-    /// The shard plan hash.
+    /// The shard plan hash (routed-expert rules only; unchanged by the batch-18 attention/head
+    /// rules).
     pub plan_hash: u64,
+    /// The attention/head shard mode this rank runs: a stage name, or replicated behind the hatch.
+    pub attention_shard: String,
+    /// Exact f32-bits all-gather calls.
+    pub gather_calls: u64,
+    /// Elements gathered by those calls.
+    pub gather_elements: u64,
+    /// Milliseconds spent inside those gathers.
+    pub gather_ms_total: u64,
 }
 
 /// One layer's timers for kernel-dev's decode-vs-GEMM question; only collected with --profile.
@@ -865,7 +880,9 @@ impl Tp4Rank {
             SafeTensorsSource::open(&input.source_dir, &index_path)
                 .map_err(|error| Tp4Error::new(format!("open checkpoint: {error}")))?,
         );
-        let plan = expert_shard_plan(&source, input.rank, input.world).map_err(Tp4Error::new)?;
+        let attention_shard = attention_shard_enabled(&config, input.world);
+        let plan = expert_shard_plan(&source, input.rank, input.world, attention_shard)
+            .map_err(Tp4Error::new)?;
         // One cache instance, two views: the engine's replicated reads and the rank's plan
         // slices all go through the same allocation, so the resident set is held once.
         let cache = if input.resident_cache {
@@ -875,6 +892,15 @@ impl Tp4Rank {
         } else {
             None
         };
+        if input.reference_check && input.rank == 0 {
+            let whole = reference_whole_bytes(&source, &plan)
+                .map_err(|error| Tp4Error::new(error.to_string()))?;
+            if whole > REFERENCE_WHOLE_LIMIT_BYTES {
+                return Err(Tp4Error::new(format!(
+                    "--reference-check needs {whole} bytes of whole tensors on this rank, over the {REFERENCE_WHOLE_LIMIT_BYTES} byte limit; the single-rank reference needs the full routed-expert set. Compare the default arm against the replicated arm instead (SPARKFLASH_TP4_ATTN_REPLICATED=1): their per-step step_logits_sha256 arrays must be identical."
+                )));
+            }
+        }
         let resident = match &cache {
             Some(cache) => cache.bytes(),
             None => resident_estimate(&source, &plan).map_err(Tp4Error::new)?,
@@ -888,16 +914,36 @@ impl Tp4Rank {
             inner: Arc::clone(&source),
             cache: cache.clone(),
         };
-        let engine = InferenceEngine::new(
-            config.clone(),
+        let collective = Arc::new(TpCollective::new(input.world, transport));
+        // With the attention shard on, the engine reads plan slices (the rank's row block of
+        // head.weight today) through the rank's WeightSource, and the logits are rebuilt by the exact
+        // f32-bits gather over this rank's transport. Behind the hatch the engine keeps the
+        // pre-batch-18 whole-tensor view and no seam, so the two layouts differ only in where the
+        // same rows are read.
+        let engine_source: Box<dyn WeightSource> = if attention_shard {
+            Box::new(EngineWeights {
+                full: SharedSource {
+                    inner: Arc::clone(&source),
+                    cache: cache.clone(),
+                },
+                local: Arc::clone(&weights),
+                source: Arc::clone(&source),
+            })
+        } else {
             Box::new(SharedSource {
                 inner: Arc::clone(&source),
                 cache: cache.clone(),
-            }),
-            element_limit,
-        )
-        .map_err(|error| Tp4Error::new(format!("engine: {error}")))?;
-        let collective = Arc::new(TpCollective::new(input.world, transport));
+            })
+        };
+        let mut engine = InferenceEngine::new(config.clone(), engine_source, element_limit)
+            .map_err(|error| Tp4Error::new(format!("engine: {error}")))?;
+        if attention_shard {
+            engine = engine.with_bit_gather(Box::new(Tp4BitGather {
+                rank: input.rank,
+                world: input.world,
+                collective: Arc::clone(&collective),
+            }));
+        }
         let backend = TpMoeBackend {
             local_config: local_config(&config, input.world).map_err(Tp4Error::new)?,
             global_config: config.clone(),
@@ -927,6 +973,14 @@ impl Tp4Rank {
             steps: 0,
             last_step_ms: 0,
             plan_hash: plan_hash(&plan),
+            attention_shard: if attention_shard {
+                format!("head-row+wq_b-head+wo_a-group/world{}", input.world)
+            } else {
+                "replicated".to_owned()
+            },
+            gather_calls: 0,
+            gather_elements: 0,
+            gather_ms_total: 0,
         };
         Ok(Self {
             rank: input.rank,
@@ -1144,6 +1198,9 @@ impl Tp4Rank {
         metrics.reduce_ms_total = self.collective.elapsed_ms();
         metrics.shard_read_calls = self.weights.shard_read_calls();
         metrics.shard_read_bytes = self.weights.shard_read_bytes();
+        metrics.gather_calls = self.collective.gather_calls.load(Ordering::Relaxed);
+        metrics.gather_elements = self.collective.gather_elements.load(Ordering::Relaxed);
+        metrics.gather_ms_total = self.collective.gather_ms.load(Ordering::Relaxed);
         Ok(StepOutput {
             token: output.token,
             logits: output.logits,
@@ -1305,6 +1362,9 @@ impl Tp4Rank {
         metrics.reduce_ms_total = self.collective.elapsed_ms();
         metrics.shard_read_calls = self.weights.shard_read_calls();
         metrics.shard_read_bytes = self.weights.shard_read_bytes();
+        metrics.gather_calls = self.collective.gather_calls.load(Ordering::Relaxed);
+        metrics.gather_elements = self.collective.gather_elements.load(Ordering::Relaxed);
+        metrics.gather_ms_total = self.collective.gather_ms.load(Ordering::Relaxed);
         Ok((
             StepOutput {
                 token: output.token,
@@ -1662,6 +1722,14 @@ impl WeightSource for RankWeights {
         }
     }
 
+    fn read_view(&self, name: &str) -> Result<Option<&[u8]>, WeightError> {
+        Ok(self
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.tensors.get(name))
+            .map(|bytes| bytes.as_slice()))
+    }
+
     fn read_ranges(
         &self,
         name: &str,
@@ -1672,6 +1740,84 @@ impl WeightSource for RankWeights {
             // tensor would have to translate its offsets, and no code path does that.
             Some(_) => None,
             None => WeightSource::read_ranges(&*self.source, name, ranges),
+        }
+    }
+}
+
+/// The engine view of the rank weight slices in the batch-18 attention shard.
+///
+/// Only the attention-shard names are answered from the rank's plan slice; every other name keeps
+/// the whole-tensor view the host engine was built against. That split matters because the host TP4
+/// path runs the engine over the global model and shards the routed experts in the CLI MoE backend:
+/// if the engine saw the experts' local specs too it would multiply a local weight with the global
+/// shape and refuse. So this wrapper never changes a name the batch-18 plan did not insert.
+/// Plan slices that are not attention shards (the routed experts) must still be read WHOLE when the
+/// dense engine asks for them: the resident cache holds their local slice only, so those reads
+/// bypass the cache and go to the checkpoint. The engine either does not read them at all (the TP4
+/// MoE backend owns them) or, in tiny fixtures, runs a global-expert fallback that needs the whole
+/// tensor. Reading the cache there would hand the engine a quarter-row block and fail the shape
+/// check, which is exactly what happened when the twin was first run with the cache on.
+struct EngineWeights {
+    full: SharedSource,
+    local: Arc<RankWeights>,
+    source: Arc<SafeTensorsSource>,
+}
+
+impl EngineWeights {
+    fn is_shard(&self, name: &str) -> bool {
+        self.local.plan.rule(name).is_some() && attention_shard_rule(name).is_some()
+    }
+
+    /// A plan slice the dense engine must not see sliced: a plan rule that is not an attention shard.
+    fn is_foreign_slice(&self, name: &str) -> bool {
+        self.local.plan.rule(name).is_some() && !self.is_shard(name)
+    }
+}
+
+impl WeightSource for EngineWeights {
+    fn names(&self) -> Vec<String> {
+        self.full.names()
+    }
+
+    fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
+        if self.is_shard(name) {
+            self.local.spec(name)
+        } else {
+            self.full.spec(name)
+        }
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+        if self.is_shard(name) {
+            self.local.read(name)
+        } else if self.is_foreign_slice(name) {
+            self.source.read(name)
+        } else {
+            self.full.read(name)
+        }
+    }
+
+    fn read_view(&self, name: &str) -> Result<Option<&[u8]>, WeightError> {
+        if self.is_shard(name) {
+            self.local.read_view(name)
+        } else if self.is_foreign_slice(name) {
+            Ok(None)
+        } else {
+            self.full.read_view(name)
+        }
+    }
+
+    fn read_ranges(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Option<Result<Vec<u8>, WeightError>> {
+        if self.is_shard(name) {
+            self.local.read_ranges(name, ranges)
+        } else if self.is_foreign_slice(name) {
+            Some(self.source.read_ranges(name, ranges))
+        } else {
+            self.full.read_ranges(name, ranges)
         }
     }
 }
@@ -1718,14 +1864,99 @@ fn logical_from_stored(word: &str, stored: Vec<usize>) -> Result<(DType, Vec<usi
     Ok((dtype, shape))
 }
 
-/// The Phase-1 plan: routed experts sharded by the section-3 rule, everything else replicated.
+/// Whether the batch-18 attention/head shard is on.
+///
+/// The user decision is that the bit-identical Option-A sharding is the default; the escape hatch
+/// SPARKFLASH_TP4_ATTN_REPLICATED=1 restores the pre-batch-18 replicated layout for an A/B run or
+/// for a node that must reproduce the old evidence. Every stage of the batch keeps both paths
+/// reachable and bit-identical to each other, so the hatch never changes the token sequence.
+///
+/// The split needs a model whose heads are whole blocks per rank and whose o-groups agree with the
+/// head blocks: 64 heads / 8 groups / 4 ranks is 16 heads = 2 groups per rank. The tiny twin
+/// fixture cannot satisfy that at world 4, so this answers false there and the twin runs the
+/// replicated layout; the plan hash and the token sequence are the same bar either way.
+fn attention_shard_enabled(config: &ModelConfig, world: usize) -> bool {
+    if matches!(
+        std::env::var("SPARKFLASH_TP4_ATTN_REPLICATED").as_deref(),
+        Ok("1" | "true" | "yes")
+    ) {
+        return false;
+    }
+    attention_shard_supported(config, world)
+}
+
+/// Whether the model geometry is a whole-head, whole-o-group split over world ranks.
+///
+/// The released model is (64 heads, 8 groups) so world 2 and 4 both split; world 4 of the tiny
+/// twin is (2 heads, 2 groups) and does not, which is why the twin's four-rank test runs the
+/// replicated layout.
+fn attention_shard_supported(config: &ModelConfig, world: usize) -> bool {
+    if world < 2 || config.o_groups == 0 {
+        return false;
+    }
+    let per_group = config.n_heads / config.o_groups;
+    per_group > 0
+        && config.n_heads.is_multiple_of(world)
+        && config.o_groups.is_multiple_of(world)
+        && (config.n_heads / world).is_multiple_of(per_group)
+}
+
+/// The shard rule for a checkpoint name the batch-18 attention shard splits by rank.
+///
+/// Stage 1 splits the LM head (output rows by vocab). Stage 2 adds `wq_b` output rows by head
+/// and `wo_a` output rows by o-group, for the backbone layers only: rank `r` holds heads
+/// `r * 16 .. (r + 1) * 16` = o-groups `r * 2 .. (r + 1) * 2`, which is the alignment the body
+/// needs. The `.scale` grid is row-major over the same output rows, so it splits with the
+/// weight. The rule is Column because every output-row split keeps each output element's
+/// accumulation inside one rank, which is what makes the gathered result bit-identical to the
+/// replicated computation. Stage 3 adds `wo_b` here.
+///
+/// The MTP/DSpark block is deliberately not sharded: the tp4 host driver never runs that stage,
+/// and a sharded source would make its whole-tensor attention path refuse rather than compute.
+fn attention_shard_rule(name: &str) -> Option<ShardRule> {
+    if name == "head.weight" {
+        return Some(ShardRule::Column);
+    }
+    if !name.starts_with("layers.") {
+        return None;
+    }
+    if name.ends_with(".attn.wq_b.weight")
+        || name.ends_with(".attn.wq_b.scale")
+        || name.ends_with(".attn.wo_a.weight")
+        || name.ends_with(".attn.wo_a.scale")
+    {
+        return Some(ShardRule::Column);
+    }
+    None
+}
+
+/// The Phase-1 plan: routed experts sharded by the section-3 rule, plus the batch-18 head row
+/// shard when the attention shard is on, and everything else replicated.
 fn expert_shard_plan(
     source: &SafeTensorsSource,
     rank: usize,
     world: usize,
+    attention_shard: bool,
 ) -> Result<ShardPlan, String> {
     let mut plan = ShardPlan::new(rank, world).map_err(|error| format!("shard plan: {error}"))?;
     for name in source.index().names() {
+        if attention_shard && let Some(rule) = attention_shard_rule(name) {
+            // A .scale grid is blocked in 32-row blocks over the same output rows, so it splits
+            // only when the rank's block is whole 32-row blocks. The tiny twin fixture's grids are
+            // one block and stay replicated (every rank reads the same block scale); the released
+            // 64-head geometry divides exactly.
+            if name.ends_with(".scale") {
+                let rows = source
+                    .spec(name)
+                    .map(|spec| spec.shape.first().copied().unwrap_or(0))
+                    .unwrap_or(0);
+                if rows == 0 || !rows.is_multiple_of(world) {
+                    continue;
+                }
+            }
+            plan.insert(name, rule);
+            continue;
+        }
         let Some(rule) = expert_rule(name) else {
             continue;
         };
@@ -1763,6 +1994,9 @@ struct TpCollective {
     calls: AtomicU64,
     elements: AtomicU64,
     ms: AtomicU64,
+    gather_calls: AtomicU64,
+    gather_elements: AtomicU64,
+    gather_ms: AtomicU64,
 }
 
 impl TpCollective {
@@ -1775,6 +2009,9 @@ impl TpCollective {
             calls: AtomicU64::new(0),
             elements: AtomicU64::new(0),
             ms: AtomicU64::new(0),
+            gather_calls: AtomicU64::new(0),
+            gather_elements: AtomicU64::new(0),
+            gather_ms: AtomicU64::new(0),
         }
     }
 
@@ -1810,6 +2047,83 @@ impl TpCollective {
         self.ms
             .fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// All-gathers one f32 vector across the group, in ascending rank order, with every bit
+    /// preserved.
+    ///
+    /// The transport's payload channel is a bf16-sized u16 copy, so this carries each f32 bit
+    /// pattern as its two little-endian u16 halves: a lossless byte gather with NO rounding. That is
+    /// the exactness the batch-18 row shards need; the canonical reduce's bf16 rounding is a
+    /// different operation and is deliberately not reused here. At world 1 this is a plain copy.
+    fn all_gather_f32(&self, local: &[f32], out: &mut [f32]) -> Result<(), String> {
+        let world = self.world;
+        let expected = world
+            .checked_mul(local.len())
+            .ok_or_else(|| format!("gather: {world} ranks of {} elements overflow", local.len()))?;
+        if out.len() != expected {
+            return Err(format!(
+                "gather: {world} ranks of {} elements expect {expected} slots, got {}",
+                local.len(),
+                out.len()
+            ));
+        }
+        if world == 1 {
+            out.copy_from_slice(local);
+            return Ok(());
+        }
+        let started = Instant::now();
+        let mut wire: Vec<u16> = Vec::with_capacity(local.len() * 2);
+        for value in local {
+            let bits = value.to_bits();
+            wire.push(bits as u16);
+            wire.push((bits >> 16) as u16);
+        }
+        let mut gathered = vec![0u16; wire.len() * world];
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        let transport = self
+            .transport
+            .as_deref()
+            .ok_or("world > 1 needs a transport")?;
+        transport
+            .all_gather_bf16(&wire, &mut gathered, seq)
+            .map_err(|error| format!("gather {seq}: {error}"))?;
+        for (slot, pair) in out.iter_mut().zip(gathered.as_chunks::<2>().0) {
+            *slot = f32::from_bits(u32::from(pair[0]) | (u32::from(pair[1]) << 16));
+        }
+        self.gather_calls.fetch_add(1, Ordering::Relaxed);
+        self.gather_elements
+            .fetch_add(out.len() as u64, Ordering::Relaxed);
+        self.gather_ms
+            .fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// The engine's exact all-gather seam over one rank's transport.
+struct Tp4BitGather {
+    rank: usize,
+    world: usize,
+    collective: Arc<TpCollective>,
+}
+
+impl BitGather for Tp4BitGather {
+    fn world(&self) -> usize {
+        self.world
+    }
+
+    fn rank(&self) -> usize {
+        self.rank
+    }
+
+    fn label(&self) -> &'static str {
+        "tcp-hostonly/f32-bits"
+    }
+
+    fn gather_bits(&mut self, local: &[f32], out: &mut [f32]) -> Result<(), EngineError> {
+        self.collective
+            .all_gather_f32(local, out)
+            .map_err(collective_error)
     }
 }
 
@@ -2285,9 +2599,18 @@ fn is_engram_table(name: &str) -> bool {
     name.ends_with(".engram.embed.weight") || name.ends_with(".engram.embed.scale")
 }
 
+/// The plan hash: FNV-1a over the routed-expert rules only, in name order.
+///
+/// The batch-18 attention/head rules are deliberately excluded: the evidence hard bar pins this
+/// value to 0xcd8adc09d2c71d55 across the attention-shard stages, so the hash identifies the
+/// routed-expert layout (the part that changes the arithmetic) and the attention shard reports
+/// itself in its own evidence block.
 fn plan_hash(plan: &ShardPlan) -> u64 {
     let mut text = String::new();
     for (name, rule) in plan.rules() {
+        if expert_rule(name).is_none() {
+            continue;
+        }
         text.push_str(name);
         text.push(':');
         text.push_str(match rule {
@@ -2440,10 +2763,13 @@ fn run_rank(
     }
     let run_ms = run_started.elapsed().as_millis() as u64;
     let (rchar_after, read_after) = io_counters();
+    let step_logits_sha256: Vec<String> = step_logits
+        .iter()
+        .map(|logits| logits_sha256(logits))
+        .collect();
     let reference = if input.reference_check && input.rank == 0 {
         Some(compare_with_reference(
-            &rank.engine,
-            &rank.config,
+            &rank,
             &input.prompt,
             &generated,
             &step_tokens,
@@ -2495,6 +2821,7 @@ fn run_rank(
         prompt: input.prompt.clone(),
         generated,
         step_tokens,
+        step_logits_sha256,
         completion_text,
         step_ms,
         step_rchar,
@@ -2520,6 +2847,10 @@ fn run_rank(
         rss_load_kib: rank.metrics.rss_load_kib,
         rss_peak_kib,
         plan_hash: plan_hash(&rank.plan),
+        attention_shard: rank.metrics.attention_shard.clone(),
+        gather_calls: rank.collective.gather_calls.load(Ordering::Relaxed),
+        gather_elements: rank.collective.gather_elements.load(Ordering::Relaxed),
+        gather_ms_total: rank.collective.gather_ms.load(Ordering::Relaxed),
         collective_label: rank.collective.label.clone(),
         seams: rank.backend.seams.clone(),
         reference,
@@ -2528,6 +2859,117 @@ fn run_rank(
         bench,
     };
     Ok(outcome)
+}
+
+/// The most whole-tensor memory the single-rank reference check may load.
+///
+/// Every plan split is a TP slice of a tensor the single-rank reference needs whole. On the released
+/// checkpoint that is the full routed-expert set (40 layers x 384 experts x 3 matrices, about 272
+/// GiB), which cannot fit one rank; the real-checkpoint bit-identity check is therefore the default
+/// arm against the replicated arm on the same four ranks, compared through the per-step logits
+/// digests in the evidence. Fixtures are small and stay supported.
+const REFERENCE_WHOLE_LIMIT_BYTES: u64 = 32 << 30;
+
+/// The bytes the single-rank reference needs beyond the resident cache: the whole of every tensor
+/// a plan rule splits.
+fn reference_whole_bytes(source: &SafeTensorsSource, plan: &ShardPlan) -> Result<u64, WeightError> {
+    let mut total: u64 = 0;
+    for name in plan.rules().keys() {
+        total = total
+            .saturating_add(u64::try_from(source.spec(name)?.storage_bytes()).unwrap_or(u64::MAX));
+    }
+    Ok(total)
+}
+
+/// The SHA-256 of one position logits block, little-endian f32 bytes as the arithmetic produced
+/// them. Two ranks or two layouts that claim bit-identical logits must publish the same digest.
+fn logits_sha256(logits: &[f32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for value in logits {
+        hasher.update(value.to_le_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut text = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
+/// The reference-check view: the resident cache for everything except the sharded tensors.
+///
+/// The reference run compares the rank's gathered logits against a single-rank engine that computes
+/// the pre-batch-18 layout, so it needs the WHOLE of every attention-sharded tensor. The resident
+/// cache holds the rank's slice of each one, so this source reads those whole tensors from the
+/// checkpoint once and keeps them for the comparison, and answers every other name from the cache
+/// as the forward expects. The whole tensors are the head plus, from stage 2, the wq_b and wo_a
+/// blocks of all 40 layers: about 4.3 GB on the released checkpoint (the reference check is an
+/// opt-in rank-0 diagnostic, so that is a deliberate one-off cost on that rank only).
+struct ReferenceWeights {
+    source: Arc<SafeTensorsSource>,
+    cache: Option<Arc<ResidentCache>>,
+    whole: BTreeMap<String, Arc<Vec<u8>>>,
+}
+
+impl ReferenceWeights {
+    fn new(
+        source: Arc<SafeTensorsSource>,
+        cache: Option<Arc<ResidentCache>>,
+        plan: &ShardPlan,
+    ) -> Result<Self, WeightError> {
+        let mut whole = BTreeMap::new();
+        for name in plan.rules().keys() {
+            whole.insert(name.clone(), Arc::new(source.read(name)?));
+        }
+        Ok(Self {
+            source,
+            cache,
+            whole,
+        })
+    }
+}
+
+impl WeightSource for ReferenceWeights {
+    fn names(&self) -> Vec<String> {
+        self.source.names()
+    }
+
+    fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
+        self.source.spec(name)
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+        if let Some(bytes) = self.whole.get(name) {
+            return Ok(bytes.as_ref().clone());
+        }
+        if let Some(cache) = &self.cache
+            && let Some(bytes) = cache.get(name)
+        {
+            return Ok(bytes);
+        }
+        self.source.read(name)
+    }
+
+    fn read_view(&self, name: &str) -> Result<Option<&[u8]>, WeightError> {
+        if let Some(bytes) = self.whole.get(name) {
+            return Ok(Some(bytes.as_slice()));
+        }
+        Ok(self
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.tensors.get(name))
+            .map(|bytes| bytes.as_slice()))
+    }
+
+    fn read_ranges(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Option<Result<Vec<u8>, WeightError>> {
+        Some(self.source.read_ranges(name, ranges))
+    }
 }
 
 /// The local configuration a rank's routed block runs: same model, quarter (or half) expert width.
@@ -2545,14 +2987,20 @@ fn local_config(config: &ModelConfig, world: usize) -> Result<ModelConfig, Strin
 
 /// Compares the rank's per-step logits and tokens with a fresh single-rank reference run.
 fn compare_with_reference(
-    engine: &InferenceEngine,
-    config: &ModelConfig,
+    rank: &Tp4Rank,
     prompt: &[u32],
     generated: &[u32],
     step_tokens: &[Option<u32>],
     step_logits: &[Vec<f32>],
     seams: &[SeamRecord],
 ) -> Result<ReferenceCheck, String> {
+    let config = &rank.config;
+    // A single-rank engine over the whole checkpoint, with no gather seam: this is the
+    // pre-batch-18 replicated layout the gathered logits must match bit for bit.
+    let source = ReferenceWeights::new(Arc::clone(&rank.source), rank.cache.clone(), &rank.plan)
+        .map_err(|error| format!("reference weights: {error}"))?;
+    let engine = InferenceEngine::new(config.clone(), Box::new(source), ELEMENT_LIMIT)
+        .map_err(|error| format!("reference engine: {error}"))?;
     let mut reference_tokens: Vec<Option<u32>> = Vec::with_capacity(step_tokens.len());
     let mut logits_rel_l2: Vec<f64> = Vec::with_capacity(step_logits.len());
     let mut all_tokens = prompt.to_vec();
@@ -2670,6 +3118,7 @@ fn rank_evidence(outcome: &RankOutcome, wall_ms: u64) -> Value {
             .as_ref()
             .map(|bench| bench_json(bench, outcome.profile.as_ref().map(|profile| profile.steps.len()))),
         "step_tokens": outcome.step_tokens,
+        "step_logits_sha256": outcome.step_logits_sha256,
         "tokens_per_second": tokens_per_second(outcome.total_ms, outcome.prompt.len() + outcome.generated.len()),
         "timing": {
             "wall_ms": wall_ms,
@@ -2719,13 +3168,27 @@ fn rank_evidence(outcome: &RankOutcome, wall_ms: u64) -> Value {
         "shard": {
             "plan_tensors": outcome.shard_tensors,
             "plan_hash": format!("{:#018x}", outcome.plan_hash),
-            "plan_rule": "routed experts column/row; attention, embed, head, shared, router, mHC, norms, engram replicated (Phase 1)",
+            "plan_rule": "routed experts column/row; batch-18 adds the head output-row shard (stage 1) and the wq_b/wo_a output-row shards (stage 2); wo_b, wq_a, wkv, embed, shared expert, router, mHC, norms, engram replicated",
             "shard_read_calls": outcome.shard_read_calls,
             "shard_read_bytes": outcome.shard_read_bytes,
             "resident_bytes_estimate": outcome.resident_bytes_estimate,
             "engram_tables_excluded": true,
             "resident_gib_estimate": outcome.resident_bytes_estimate as f64 / (1u64 << 30) as f64,
             "resident_source": if outcome.cache_tensors > 0 { "in-process cache of every non-Engram tensor" } else { "header-only estimate; the page cache holds the bytes" },
+        },
+        "attention_shard": {
+            "mode": outcome.attention_shard,
+            "stage": "batch-18 stage 2: head.weight vocab rows, wq_b output rows by head and wo_a output rows by o-group are rank-local; the head logits and each layer's o_lora vector are gathered exactly",
+            "exactness": "each rank-local output element is the same single ascending-f32 accumulation over the full input as the replicated path (no partial-sum split), and both gathers are rank-order copies of the f32 bits (two u16 halves on the bf16 payload channel): no rounding, so the gathered logits and o_lora are bit-identical to the replicated layout and the same argmax runs",
+            "local_rows": "rank r of world w holds heads [r*heads/w, (r+1)*heads/w) of wq_b and o-groups [r*groups/w, (r+1)*groups/w) of wo_a; the head block is whole o-groups (64 heads / 8 groups / 4 ranks = 16 heads = 2 groups)",
+            "gather_rule": "one exact head-row gather per step (vocab_size f32) and one exact o_lora gather per attention layer (o_groups*o_lora_rank f32); both are rank-major [rank][row][width] and are repacked to row-major without touching a value",
+            "replicated_on_every_rank": "wq_a, wkv, q_norm, kv_norm, attn_sink, compressors, indexer, candidate mask, KV cache, wo_b, shared expert, router, mHC, norms, embed",
+            "wo_b": "replicated in stage 2; stage 3 moves its output rows to the ranks with a residual gather",
+            "gathers": outcome.gather_calls,
+            "gather_elements": outcome.gather_elements,
+            "gather_ms_total": outcome.gather_ms_total,
+            "replicated_escape_hatch": "SPARKFLASH_TP4_ATTN_REPLICATED=1 forces the pre-batch-18 replicated layout",
+            "plan_hash_rules": "routed experts only; the plan hash is unchanged by the attention/head rules",
         },
         "collective": {
             "label": outcome.collective_label,
@@ -2756,8 +3219,8 @@ fn rank_evidence(outcome: &RankOutcome, wall_ms: u64) -> Value {
         },
         "notes": [
             "Phase 1 shards only the routed experts; the replicated remainder is numerically a no-op but is not vLLM's TP=4 layout.",
-            "One all-reduce per layer (40) plus no gather; the routed output is the only sharded seam.",
-            "Tokens are greedy argmax over the replicated head, so every rank must agree without a token gather.",
+            "One all-reduce per layer (40) for the routed block, plus one exact head-row gather per step and one exact o_lora gather per attention layer; both gathers copy bits and add no arithmetic.",
+            "Tokens are greedy argmax over the gathered head logits: every rank runs the same argmax on the same bits, so the four ranks agree without a token gather.",
             "allocator_tuning records the startup allocator tune from sparkflash_cli::allocator::tune; the pair of raised glibc thresholds is what turns the per-layer 134/168 MB buffers into retained heap, and either threshold alone is noise.",
         ],
     });
@@ -2786,6 +3249,8 @@ fn write_summary(directory: &Path, outcome: &RankOutcome, wall_ms: u64) -> Resul
         "tokens_per_second": tokens_per_second(outcome.total_ms, outcome.prompt.len() + outcome.generated.len()),
         "collective": outcome.collective_label,
         "plan_hash": format!("{:#018x}", outcome.plan_hash),
+        "attention_shard": outcome.attention_shard,
+        "gather_calls": outcome.gather_calls,
         "allocator_tuning": allocator_json(tuning),
         "profile_steps": outcome.profile.as_ref().map_or(0, |profile| profile.steps.len()),
         "resident_gib_estimate": outcome.resident_bytes_estimate as f64 / (1u64 << 30) as f64,
@@ -2837,6 +3302,7 @@ mod tests {
         world: usize,
         prompt: Vec<u32>,
         max_tokens: usize,
+        resident_cache: bool,
     ) -> Vec<RankOutcome> {
         let directory = tempfile::tempdir().expect("tempdir");
         write_twin_fixture(directory.path()).expect("fixture");
@@ -2866,7 +3332,7 @@ mod tests {
                             max_tokens,
                             record_seams: rank == 0,
                             reference_check: rank == 0,
-                            resident_cache: false,
+                            resident_cache,
                             profile: false,
                             bench_steps: 0,
                             tokenizer: None,
@@ -2922,7 +3388,7 @@ mod tests {
         let source = SafeTensorsSource::open(directory.path(), &index).expect("source");
         let config = twin_config();
         for world in [2usize, 4] {
-            let plan = expert_shard_plan(&source, 0, world).expect("plan");
+            let plan = expert_shard_plan(&source, 0, world, false).expect("plan");
             assert_eq!(plan.tp_world(), world);
             let weights = RankWeights::new(
                 Arc::new(SafeTensorsSource::open(directory.path(), &index).expect("source")),
@@ -2953,6 +3419,102 @@ mod tests {
                     .len()
                     == 1,
                 "non-expert tensors stay replicated"
+            );
+        }
+    }
+
+    #[test]
+    fn the_attention_shard_follows_the_model_geometry() {
+        let released = ModelConfig::v41_flash_cached();
+        assert!(!attention_shard_supported(released, 1));
+        assert!(attention_shard_supported(released, 2));
+        assert!(attention_shard_supported(released, 4));
+        let twin = twin_config();
+        assert!(attention_shard_supported(&twin, 2));
+        assert!(
+            !attention_shard_supported(&twin, 4),
+            "2 heads cannot give a whole o-group block to each of 4 ranks"
+        );
+    }
+
+    #[test]
+    fn the_attention_shard_adds_the_head_rule_and_keeps_the_plan_hash() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        write_twin_fixture(directory.path()).expect("fixture");
+        let index = directory.path().join("model.safetensors.index.json");
+        let source = SafeTensorsSource::open(directory.path(), &index).expect("source");
+        let config = twin_config();
+        for world in [2usize, 4] {
+            let sharded = expert_shard_plan(&source, 0, world, true).expect("sharded plan");
+            let replicated = expert_shard_plan(&source, 0, world, false).expect("replicated plan");
+            assert_eq!(
+                sharded.rule("head.weight"),
+                Some(ShardRule::Column),
+                "the attention shard splits the head by output rows"
+            );
+            assert_eq!(
+                replicated.rule("head.weight"),
+                None,
+                "the hatch keeps the head replicated"
+            );
+            assert_eq!(
+                plan_hash(&sharded),
+                plan_hash(&replicated),
+                "the hard-bar plan hash must not see the attention/head rules"
+            );
+            assert_eq!(
+                sharded.rule("layers.0.attn.wq_b.weight"),
+                Some(ShardRule::Column),
+                "the attention shard splits wq_b by output head rows"
+            );
+            assert_eq!(
+                sharded.rule("layers.0.attn.wo_a.weight"),
+                Some(ShardRule::Column),
+                "the attention shard splits wo_a by output o-group rows"
+            );
+            assert_eq!(
+                sharded.rule("layers.0.attn.wq_b.scale"),
+                None,
+                "the twin's one-block scale grid stays replicated"
+            );
+            assert_eq!(
+                sharded.rule("layers.0.attn.wo_a.scale"),
+                None,
+                "the twin's one-block scale grid stays replicated"
+            );
+            assert_eq!(
+                replicated.rule("layers.0.attn.wq_b.weight"),
+                None,
+                "the hatch keeps wq_b replicated"
+            );
+            let weights = RankWeights::new(
+                Arc::new(SafeTensorsSource::open(directory.path(), &index).expect("source")),
+                sharded,
+                None,
+            );
+            assert_eq!(
+                weights.spec("head.weight").expect("head spec").shape,
+                vec![config.vocab_size / world, config.dim],
+                "a rank holds its own row block of the head"
+            );
+            assert_eq!(
+                weights
+                    .spec("layers.0.attn.wq_b.weight")
+                    .expect("wq_b spec")
+                    .shape,
+                vec![config.n_heads * config.head_dim / world, config.q_lora_rank],
+                "a rank holds its own head rows of wq_b"
+            );
+            assert_eq!(
+                weights
+                    .spec("layers.0.attn.wo_a.weight")
+                    .expect("wo_a spec")
+                    .shape,
+                vec![
+                    config.o_groups * config.o_lora_rank / world,
+                    (config.n_heads / config.o_groups) * config.head_dim
+                ],
+                "a rank holds its own o-group rows of wo_a"
             );
         }
     }
@@ -2997,10 +3559,18 @@ mod tests {
 
     #[test]
     fn two_ranks_produce_the_reference_token_sequence() {
-        let outcomes = run_two_to_four_ranks(2, vec![3, 7, 11], 2);
+        let outcomes = run_two_to_four_ranks(2, vec![3, 7, 11], 2, false);
         assert_eq!(outcomes.len(), 2);
         assert_eq!(outcomes[0].generated, outcomes[1].generated);
         assert_eq!(outcomes[0].step_tokens, outcomes[1].step_tokens);
+        assert_eq!(
+            outcomes[0].attention_shard, "head-row+wq_b-head+wo_a-group/world2",
+            "the two-rank twin runs the sharded attention layout"
+        );
+        assert!(
+            outcomes[0].gather_calls > 0,
+            "the sharded layout must have gathered its head logits and o_lora rows"
+        );
         let reference = outcomes[0].reference.as_ref().expect("rank 0 reference");
         assert!(
             reference.tokens_equal,
@@ -3022,8 +3592,45 @@ mod tests {
     }
 
     #[test]
+    fn the_sharded_reference_check_works_with_the_resident_cache() {
+        // The resident cache holds the rank slices of the sharded attention tensors; the
+        // reference engine computes the replicated layout, so the reference source must read
+        // the whole tensors from the checkpoint. This is the real --resident-cache path that
+        // the twin tests used to skip (they ran with the cache off).
+        let outcomes = run_two_to_four_ranks(2, vec![3, 7, 11], 2, true);
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(
+            outcomes[0].attention_shard, "head-row+wq_b-head+wo_a-group/world2",
+            "the two-rank twin runs the sharded attention layout"
+        );
+        let reference = outcomes[0].reference.as_ref().expect("rank 0 reference");
+        assert!(
+            reference.tokens_equal,
+            "tokens: {:?}",
+            reference.reference_tokens
+        );
+        assert!(
+            reference.max_logits_rel_l2 <= 2.0e-2,
+            "max logits rel L2 {} over 2e-2",
+            reference.max_logits_rel_l2
+        );
+        assert_eq!(
+            outcomes[0].step_logits_sha256.len(),
+            outcomes[0].step_ms.len(),
+            "one logits digest per step"
+        );
+        assert!(
+            outcomes[0]
+                .step_logits_sha256
+                .iter()
+                .all(|digest| digest.len() == 64),
+            "the digests are SHA-256 hex"
+        );
+    }
+
+    #[test]
     fn four_ranks_produce_the_reference_token_sequence() {
-        let outcomes = run_two_to_four_ranks(4, vec![3, 7], 2);
+        let outcomes = run_two_to_four_ranks(4, vec![3, 7], 2, false);
         assert_eq!(outcomes.len(), 4);
         for outcome in &outcomes[1..] {
             assert_eq!(outcome.step_tokens, outcomes[0].step_tokens);
@@ -3048,7 +3655,7 @@ mod tests {
         write_twin_fixture(directory.path()).expect("fixture");
         let index = directory.path().join("model.safetensors.index.json");
         let source = SafeTensorsSource::open(directory.path(), &index).expect("source");
-        let plan = expert_shard_plan(&source, 0, 4).expect("plan");
+        let plan = expert_shard_plan(&source, 0, 4, false).expect("plan");
         let plan_names: Vec<String> = plan.rules().keys().cloned().collect();
         let replicated_names: Vec<String> = source
             .index()
@@ -3251,5 +3858,17 @@ mod tests {
                 > 0.0
         );
         assert!(value["bench"]["mean_step_ms"].as_f64().expect("mean") > 0.0);
+        let digests = value["step_logits_sha256"].as_array().expect("digests");
+        assert_eq!(
+            digests.len(),
+            outcome.step_ms.len(),
+            "one logits digest per evidence step"
+        );
+        assert!(
+            digests
+                .iter()
+                .all(|digest| digest.as_str().is_some_and(|text| text.len() == 64)),
+            "the digests are SHA-256 hex"
+        );
     }
 }

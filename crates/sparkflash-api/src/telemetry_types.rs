@@ -49,6 +49,16 @@ pub struct OpenAiUsageWithCache {
     pub prompt_tokens_details: PromptTokensDetails,
     /// Completion-side reasoning / speculative breakdown.
     pub completion_tokens_details: CompletionTokensDetails,
+    /// DeepSeek top-level cache-hit field: tokens served from a prefix cache.
+    ///
+    /// This duplicates `prompt_tokens_details.cached_tokens` for clients that read the
+    /// official DeepSeek API field. It is set by every constructor rather than derived at
+    /// serialization time so the batch aggregator can sum it.
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: usize,
+    /// DeepSeek top-level cache-miss field: `prompt_tokens - prompt_cache_hit_tokens`.
+    #[serde(default)]
+    pub prompt_cache_miss_tokens: usize,
 }
 
 /// Per-request and cluster-wide DeepSeek-V4.1-Flash + 4x DGX Spark telemetry block
@@ -365,6 +375,8 @@ mod tests {
                 accepted_prediction_tokens: 212,
                 rejected_prediction_tokens: 48,
             },
+            prompt_cache_hit_tokens: 28672,
+            prompt_cache_miss_tokens: 4096,
         };
         let json = serde_json::to_value(usage).expect("usage serializes");
         assert_eq!(
@@ -375,8 +387,12 @@ mod tests {
                 "total_tokens",
                 "prompt_tokens_details",
                 "completion_tokens_details",
+                "prompt_cache_hit_tokens",
+                "prompt_cache_miss_tokens",
             ])
         );
+        assert_eq!(json["prompt_cache_hit_tokens"], serde_json::json!(28672));
+        assert_eq!(json["prompt_cache_miss_tokens"], serde_json::json!(4096));
         assert_eq!(
             keys(&json["prompt_tokens_details"]),
             key_set(&[

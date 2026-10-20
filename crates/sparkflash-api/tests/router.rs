@@ -169,7 +169,7 @@ const EXPECTED_STREAM: &str = concat!(
     "\n\n",
     r#"data: {"id":"chatcmpl-dsv41-00000000","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-ai/DeepSeek-V4.1-Flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"x_deepseek_spark_stats":{"kv_cache":{"total_prompt_tokens":8,"global_kv_cached_tokens":0,"uma_hit_tokens":0,"nvme_restored_tokens":0,"swa_tail_hit":false,"encoder_swa_replay_tokens":0,"uncached_suffix_tokens":8,"decoder_swa_replay_tokens":8},"kv_cache_hit_rate":0.0,"engram_layers":[{"layer_id":1,"lookups_total":0,"tier1_drm_hits":0,"tier2_uma_hits":0,"tier3_nvme_misses":0,"hit_rate":0.0,"mean_prefetch_stall_us":0.0,"mean_gate_alpha":0.0},{"layer_id":14,"lookups_total":0,"tier1_drm_hits":0,"tier2_uma_hits":0,"tier3_nvme_misses":0,"hit_rate":0.0,"mean_prefetch_stall_us":0.0,"mean_gate_alpha":0.0}],"dspark_speculative":{"target_verify_steps":0,"draft_tokens_proposed":0,"draft_tokens_confidence_gated":0,"draft_tokens_accepted":0,"mean_tokens_per_verify_step":0.0,"acceptance_rate":0.0},"transport":{"fabric_mode":"","rocenante_oneshot_calls":0,"nccl_ring_calls":0,"rail0_rocep1s0f0_mb":0.0,"rail1_rocep2p1s0f0_mb":0.0,"l2_weight_prefetch_overlaps":0},"timing":{"ttft_ms":0.0,"prefill_tok_per_s":0.0,"decode_tok_per_s":0.0,"min_rank_uma_free_gib":0.0}}}"#,
     "\n\n",
-    r#"data: {"id":"chatcmpl-dsv41-00000000","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-ai/DeepSeek-V4.1-Flash","choices":[],"usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10,"prompt_tokens_details":{"cached_tokens":0,"uma_cached_tokens":0,"nvme_cached_tokens":0,"image_tokens":0},"completion_tokens_details":{"reasoning_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0}}}"#,
+    r#"data: {"id":"chatcmpl-dsv41-00000000","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-ai/DeepSeek-V4.1-Flash","choices":[],"usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10,"prompt_tokens_details":{"cached_tokens":0,"uma_cached_tokens":0,"nvme_cached_tokens":0,"image_tokens":0},"completion_tokens_details":{"reasoning_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0},"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":8}}"#,
     "\n\n",
     r#"data: [DONE]"#,
     "\n\n",
@@ -1022,6 +1022,61 @@ async fn completions_responses_and_messages_round_trip() {
 }
 
 #[tokio::test]
+async fn anthropic_input_tokens_exclude_cache_reads_and_partition_the_prompt() {
+    let long = "x".repeat(300);
+    let body = json!({"model": MODEL, "max_tokens": 8,
+        "messages": [{"role": "user", "content": long}]});
+    let (status, _, uncached_bytes) = send(
+        app_with(engine_with(&["Hello"])),
+        json_request("/v1/messages", &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let prompt = body_json(&uncached_bytes)["usage"]["input_tokens"]
+        .as_u64()
+        .expect("uncached input_tokens is the prompt total");
+    let (status, _, bytes) = send(
+        app_with(engine_with(&["Hello"]).with_cache(64, 0, false)),
+        json_request("/v1/messages", &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_json(&bytes);
+    let input = body["usage"]["input_tokens"]
+        .as_u64()
+        .expect("input_tokens");
+    let cache_read = body["usage"]["cache_read_input_tokens"]
+        .as_u64()
+        .expect("cache_read_input_tokens");
+    assert_eq!(
+        cache_read, 64,
+        "the mock's cache hit is reported separately"
+    );
+    assert_eq!(
+        input + cache_read,
+        prompt,
+        "Anthropic fields must partition the prompt"
+    );
+    assert_eq!(input, prompt - 64);
+}
+
+#[tokio::test]
+async fn openai_usage_carries_the_deepseek_cache_hit_and_miss_fields() {
+    let app = app_with(engine_with(&["Hello"]).with_cache(64, 0, false));
+    let (status, _, bytes) = send(
+        app,
+        json_request("/v1/chat/completions", &chat_body(&"x".repeat(300))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_json(&bytes);
+    let usage = &body["usage"];
+    let prompt = usage["prompt_tokens"].as_u64().expect("prompt tokens");
+    assert_eq!(usage["prompt_cache_hit_tokens"], json!(64));
+    assert_eq!(usage["prompt_cache_miss_tokens"], json!(prompt - 64));
+}
+
+#[tokio::test]
 async fn max_tokens_is_honoured_and_reported_as_length() {
     let mut body = chat_body("hi");
     body["max_tokens"] = json!(1);
@@ -1061,7 +1116,7 @@ async fn streaming_completions_request_is_counted_in_metrics() {
 
 #[tokio::test]
 async fn token_budget_is_validated_against_the_advertised_ceiling() {
-    for bad in [json!(0), json!(65_537), json!(1_000_000)] {
+    for bad in [json!(0), json!(393_217), json!(1_000_000)] {
         let mut body = chat_body("hi");
         body["max_tokens"] = bad.clone();
         let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
@@ -1071,7 +1126,7 @@ async fn token_budget_is_validated_against_the_advertised_ceiling() {
         assert_eq!(error["error"]["param"], "max_tokens");
     }
     let mut body = chat_body("hi");
-    body["max_tokens"] = json!(65_536);
+    body["max_tokens"] = json!(393_216);
     let (status, _, _) = send(app(), json_request("/v1/chat/completions", &body)).await;
     assert_eq!(status, StatusCode::OK, "the ceiling itself is accepted");
 

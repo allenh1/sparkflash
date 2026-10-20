@@ -96,11 +96,16 @@ impl WeightSource for CodedSource {
 }
 
 /// A finite, plan-shaped weight source: the plan's names and shapes, every tensor as finite f32.
+///
+/// Only some integration tests include this module, and the ones that need the coded dtypes never
+/// construct it; the allow keeps each test binary's dead-code pass independent of its siblings.
+#[allow(dead_code)]
 pub struct FiniteSource {
     specs: Vec<TensorSpec>,
     seed: u64,
 }
 
+#[allow(dead_code)]
 impl FiniteSource {
     /// The source for `plan`, at `seed`.
     pub fn from_plan(plan: &TensorPlan, seed: u64) -> FiniteSource {
@@ -181,3 +186,8 @@ impl WeightSource for FiniteSource {
         Ok(bytes)
     }
 }
+
+// The helpers are shared across test binaries; a binary that draws only the plain sources would
+// otherwise warn the whole module dead under -D warnings.
+#[allow(dead_code)]
+pub mod host_path;
