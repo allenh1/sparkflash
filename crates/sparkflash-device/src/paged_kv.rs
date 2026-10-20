@@ -8,7 +8,7 @@
 //!
 //! # What it produces
 //!
-//! * [window_rows]: the last min(position, 128) tokens' SWA slots, gathered oldest first from the
+//! * [window_rows]: the last min(position, `SWA_SLOTS_PER_TAIL`) tokens' SWA slots, gathered oldest first from the
 //!   sequence's tail ring into the kernel's contiguous row order. This is the rotation copy
 //!   `docs/build/phase2-device-kv-store.md` lists as open item 1; the store keeps the
 //!   reference's slot-indexed ring, the kernel wants row order.
@@ -65,7 +65,7 @@ use sparkflash_kv::paged::{PagedKvCache, PagingError, SeqId};
 pub struct SourceEntry {
     /// The physical page the token's block lives in.
     pub page: u64,
-    /// The entry's index inside that page (a page holds 64 / ratio entries).
+    /// The entry's index inside that page (a page holds `KV_PAGE_TOKENS / ratio` entries).
     pub entry_in_page: usize,
     /// The entry's index in the layer's whole source array (page * entries_per_page + entry).
     pub pool_index: usize,
@@ -78,9 +78,9 @@ pub struct SourceEntry {
 pub struct WindowRows {
     /// Packed FP4 latent codes, `rows * SWA_SLOT_DATA_BYTES`.
     pub codes: Vec<u8>,
-    /// One E8M0 scale per 32 channels, `rows * SWA_SLOT_SCALE_BYTES`.
+    /// One E8M0 scale per `SWA_FP8_SCALE_GROUP` channels, `rows * SWA_SLOT_SCALE_BYTES`.
     pub scales: Vec<u8>,
-    /// Number of rows gathered (min(position, 128); zero at position 0).
+    /// Number of rows gathered (min(position, `SWA_SLOTS_PER_TAIL`); zero at position 0).
     pub rows: usize,
 }
 
@@ -243,7 +243,7 @@ impl<'a> PagedKvView<'a> {
     /// [CandidateOperands::codes] is the kernel's `kv_fp4` operand (`MAIN_KV_DATA_BYTES` per row,
     /// packed FP4 codes) and [CandidateOperands::scales] its `kv_scales` operand
     /// (`MAIN_KV_SCALE_BYTES` E4M3 scales per row). The store keeps them interleaved inside one
-    /// 288-byte entry; the kernel wants two arrays, so this is where the split happens. Row order is
+    /// `MAIN_KV_ENTRY_BYTES`-byte entry; the kernel wants two arrays, so this is where the split happens. Row order is
     /// candidate order, which is the compact id order of [CompactCandidates].
     ///
     /// # Errors
@@ -337,7 +337,8 @@ impl<'a> PagedKvView<'a> {
     /// `layer`'s SWA tail ring, oldest row first.
     ///
     /// `tail` is one sequence's tail buffer: [sparkflash_kv::layout::SWA_TAIL_BYTES] bytes holding
-    /// all [SWA_LAYERS] layers' 128-slot rings. The ring keeps `slot = position % 128`; the kernel
+    /// all [SWA_LAYERS] layers' `SWA_SLOTS_PER_TAIL`-slot rings. The ring keeps
+    /// `slot = position % SWA_SLOTS_PER_TAIL`; the kernel
     /// wants the attended window in row order, so this is the rotation copy.
     ///
     /// # Errors

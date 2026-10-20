@@ -19,7 +19,7 @@ pub struct WindowAccounting {
     pub layout: WindowRingLayout,
     /// Backbone layers, each with its own decoder window ring.
     pub layers: usize,
-    /// One ring: 128 slots x 528 B = 67,584 B.
+    /// One ring: the layout's slot count x its slot bytes.
     pub bytes_per_layer: usize,
     /// All layer rings resident at once.
     pub total_resident_bytes: usize,
@@ -103,6 +103,9 @@ pub fn layer_rotation_segments(
 mod tests {
     use super::*;
     use crate::chain::ChainSchedule;
+    use sparkflash_kv::layout::{
+        SWA_LAYERS, SWA_SLOT_BYTES, SWA_SLOT_DATA_BYTES, SWA_SLOT_SCALE_BYTES, SWA_SLOTS_PER_TAIL,
+    };
 
     fn ring_image() -> (Vec<u8>, Vec<u8>) {
         let layout = WindowRingLayout::ENGINE;
@@ -118,14 +121,28 @@ mod tests {
     }
 
     #[test]
-    fn the_engine_window_is_128_slots_of_528_bytes() {
+    fn the_engine_window_is_the_kv_layouts_slot() {
         let accounting = WindowAccounting::for_schedule(&ChainSchedule::milestone().expect("plan"));
         assert_eq!(accounting.layout, WindowRingLayout::ENGINE);
-        assert_eq!(accounting.layout.slots, 128);
-        assert_eq!(accounting.layout.code_row_bytes, 512);
-        assert_eq!(accounting.layout.scale_row_bytes, 16);
+        assert_eq!(accounting.layout.slots, SWA_SLOTS_PER_TAIL);
+        assert_eq!(accounting.layout.code_row_bytes, SWA_SLOT_DATA_BYTES);
+        assert_eq!(accounting.layout.scale_row_bytes, SWA_SLOT_SCALE_BYTES);
+        assert_eq!(accounting.layout.slot_bytes(), SWA_SLOT_BYTES);
+        assert_eq!(
+            accounting.layout.ring_bytes(),
+            SWA_SLOTS_PER_TAIL * SWA_SLOT_BYTES
+        );
+        assert_eq!(
+            accounting.bytes_per_layer,
+            SWA_SLOTS_PER_TAIL * SWA_SLOT_BYTES
+        );
+        assert_eq!(accounting.layers, SWA_LAYERS);
+        assert_eq!(
+            accounting.total_resident_bytes,
+            SWA_LAYERS * SWA_SLOTS_PER_TAIL * SWA_SLOT_BYTES
+        );
+        // The numbers the M3-a plan and the serving byte arithmetic quote, held to the layout.
         assert_eq!(accounting.bytes_per_layer, 67_584);
-        assert_eq!(accounting.layers, 40);
         assert_eq!(accounting.total_resident_bytes, 2_703_360);
     }
 
@@ -162,18 +179,18 @@ mod tests {
         let (codes, scales) = ring_image();
         let (view_codes, view_scales) =
             layer_view_bytes(&codes, &scales, &schedule.layers[21], 5).expect("view");
-        assert_eq!(view_codes.len(), 4 * 512);
-        assert_eq!(view_scales.len(), 4 * 16);
+        assert_eq!(view_codes.len(), 4 * SWA_SLOT_DATA_BYTES);
+        assert_eq!(view_scales.len(), 4 * SWA_SLOT_SCALE_BYTES);
         for row in 0..4 {
             let slot = 2 + row;
             assert!(
-                view_codes[row * 512..(row + 1) * 512]
+                view_codes[row * SWA_SLOT_DATA_BYTES..(row + 1) * SWA_SLOT_DATA_BYTES]
                     .iter()
                     .all(|byte| *byte == slot as u8),
                 "code row {row} is slot {slot}"
             );
             assert!(
-                view_scales[row * 16..(row + 1) * 16]
+                view_scales[row * SWA_SLOT_SCALE_BYTES..(row + 1) * SWA_SLOT_SCALE_BYTES]
                     .iter()
                     .all(|byte| *byte == slot as u8),
                 "scale row {row} is slot {slot}"
@@ -182,10 +199,10 @@ mod tests {
         // The wrapped view at 129: rows are slots 2..=127 then 0..=1.
         let (wrapped, _) =
             layer_view_bytes(&codes, &scales, &schedule.layers[0], 129).expect("wrapped view");
-        assert_eq!(wrapped.len(), 128 * 512);
+        assert_eq!(wrapped.len(), SWA_SLOTS_PER_TAIL * SWA_SLOT_DATA_BYTES);
         assert_eq!(wrapped[0], 2);
-        assert_eq!(wrapped[126 * 512], 0);
-        assert_eq!(wrapped[127 * 512], 1);
+        assert_eq!(wrapped[126 * SWA_SLOT_DATA_BYTES], 0);
+        assert_eq!(wrapped[127 * SWA_SLOT_DATA_BYTES], 1);
         assert_eq!(
             layer_rotation_segments(&WindowRingLayout::ENGINE, &schedule.layers[0], 129)
                 .expect("segments"),

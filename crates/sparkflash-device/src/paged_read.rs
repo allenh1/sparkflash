@@ -37,7 +37,7 @@ use sparkflash_kv::layout::{
 /// physical page 0xFFFFFFFF.
 pub const BLOCK_TABLE_HOLE: u32 = u32::MAX;
 
-/// Entries one 64-token page holds for a source layer of the given compression ratio.
+/// Entries one `KV_PAGE_TOKENS`-token page holds for a source layer of the given compression ratio.
 ///
 /// # Errors
 /// A ratio that does not divide the page: the store only realises 1 and 2.

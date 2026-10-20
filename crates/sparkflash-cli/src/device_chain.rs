@@ -101,7 +101,7 @@ impl WeightSource for CachedWeightSource {
 }
 
 /// The usage line for this subcommand.
-pub const USAGE: &str = "sparkflash device-chain --plan-only|--dry-run|--run-stage mhc_entry|layer_zero|hybrid_token|hybrid_sequence|tp4-smoke|tp4-resident --checkpoint DIR --cubin-dir DIR [--positions 0] [--layer 0] [--token 0] [--element-limit N] [--moe-preflight] [--moe-layer0-diagnose] [--fixture FILE --prompt-tokens N --decode-steps N] [--dump-logits FILE] [--reference-check] [--attention-twin-positions LIST] [--host-attention-from POSITION] [--operand-audit]; tp4-smoke also takes --tp-rank N --tp-world-size N --comm-backend tcp|lo --comm-peers IP,IP,... --comm-port 29601 --evidence-dir DIR";
+pub const USAGE: &str = "sparkflash device-chain --plan-only|--dry-run|--run-stage mhc_entry|layer_zero|hybrid_token|hybrid_sequence|tp4-smoke|tp4-resident --checkpoint DIR --cubin-dir DIR [--positions 0] [--layer 0] [--token 0] [--element-limit N] [--moe-preflight] [--moe-layer0-diagnose] [--fixture FILE --prompt-tokens N --decode-steps N] [--dump-logits FILE] [--timing-json FILE] [--reference-check] [--attention-twin-positions LIST] [--host-attention-from POSITION] [--operand-audit]; tp4-smoke also takes --tp-rank N --tp-world-size N --comm-backend tcp|lo --comm-peers IP,IP,... --comm-port 29601 --evidence-dir DIR";
 
 /// The exit code a plan-only or dry-run invocation returns: 2, refusing to serve.
 pub const PLAN_ONLY_EXIT: u8 = 2;
@@ -397,6 +397,10 @@ struct StageArgs {
     sequence: bool,
     reference_check: bool,
     dump_logits: Option<std::path::PathBuf>,
+    // When set, the run records the D42 per-source staging lines (window rows, absolute main-KV
+    // rows, indexer key pool, host staging, H2D copies, launches, sync-gated device time) and the
+    // per-step chain time, then writes the JSON document here. None means no counter is touched.
+    timing_json: Option<std::path::PathBuf>,
     wo_a_mode: crate::attention_device::WoAMode,
     wo_a_operand_dump: Option<std::path::PathBuf>,
     // When set, replaces the in-chain attention twin's armed positions; None keeps the default
@@ -469,6 +473,7 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
     let mut time_budget_s = 3600u64;
     let mut reference_check = false;
     let mut dump_logits = None;
+    let mut timing_json = None;
     let mut wo_a_mode = crate::attention_device::WoAMode::default();
     let mut wo_a_operand_dump = None;
     let mut operand_audit = false;
@@ -529,6 +534,12 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
                     return Err("--dump-logits needs a non-empty path".to_string());
                 }
                 dump_logits = Some(std::path::PathBuf::from(value));
+            }
+            "--timing-json" => {
+                if value.is_empty() {
+                    return Err("--timing-json needs a non-empty path".to_string());
+                }
+                timing_json = Some(std::path::PathBuf::from(value));
             }
             "--prompt-tokens" => {
                 prompt_tokens = value
@@ -601,6 +612,12 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
                 .to_string(),
         );
     }
+    if timing_json.is_some() && !sequence {
+        return Err(
+            "--timing-json is only wired into hybrid_sequence, whose attention body records the D42 per-source staging lines"
+                .to_string(),
+        );
+    }
     Ok((
         stage,
         StageArgs {
@@ -619,6 +636,7 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
             reference_check,
             sequence,
             dump_logits,
+            timing_json,
             wo_a_mode,
             wo_a_operand_dump,
             attention_twin_positions,
@@ -1132,9 +1150,18 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
     }
 
     let mem_available_bytes = read_mem_available_bytes()?;
+    // The recorder exists only when --timing-json was passed. A disabled recorder is never
+    // constructed on the default path, so the default run allocates nothing and records nothing.
+    let timing = args
+        .timing_json
+        .as_ref()
+        .map(|_| crate::chain_timing::share(crate::chain_timing::Recorder::enabled()));
     let mut attention_backend =
         crate::attention_device::AttentionDeviceBackend::open(&args.cubin_dir)?
             .with_wo_a_mode(args.wo_a_mode);
+    if let Some(recorder) = &timing {
+        attention_backend = attention_backend.with_timing(std::rc::Rc::clone(recorder));
+    }
     if args.moe_layer0_diagnose || args.wo_a_operand_dump.is_some() {
         attention_backend = attention_backend.with_wo_a_native_diagnose();
     }
@@ -1986,6 +2013,14 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
                 Some(&mut moe_backend),
                 &mut progress,
             )?;
+            if let Some(recorder) = &timing {
+                recorder
+                    .borrow_mut()
+                    .record_step(crate::chain_timing::StepSample {
+                        position: position as u64,
+                        total_ns: position_started.elapsed().as_nanos() as u64,
+                    });
+            }
             tokens.push(output.token);
             // Only the diagnostic prefix and the two positions the criterion compares need the
             // per-layer/head buffers. Keeping the other 130+ outputs whole is the runner half of
@@ -2728,6 +2763,25 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             read_mem_available_bytes().unwrap_or(0),
             started.elapsed().as_millis()
         ));
+        if let (Some(path), Some(recorder)) = (&args.timing_json, &timing) {
+            recorder
+                .borrow()
+                .write(path)
+                .map_err(|error| format!("timing file {}: {error}", path.display()))?;
+            let totals = recorder.borrow().totals();
+            lines.push(format!(
+                "timing: wrote {} (schema {}; {} layer samples, {} step samples; measured staging bytes={} H2D bytes={} host_staging_ns={} sync_gated_device_ns={} step_total_ns={})",
+                path.display(),
+                crate::chain_timing::SCHEMA,
+                totals.layer_samples,
+                totals.step_samples,
+                totals.window_bytes + totals.absolute_bytes + totals.indexer_pool_bytes,
+                totals.h2d_bytes,
+                totals.host_staging_ns,
+                totals.sync_gated_device_ns,
+                totals.step_total_ns
+            ));
+        }
         return Ok(lines);
     }
     let reference_token = reference_tokens[0];
@@ -4115,6 +4169,7 @@ mod tests {
             sequence: false,
             reference_check: false,
             dump_logits: None,
+            timing_json: None,
             wo_a_mode: crate::attention_device::WoAMode::default(),
             wo_a_operand_dump: None,
             attention_twin_positions: None,
@@ -4735,5 +4790,85 @@ mod tests {
         assert!(rows[0].3);
         assert!(!rows[2].3);
         assert_eq!(rows[2].2, None);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_timing_flag_is_opt_in_and_only_for_the_sequence_arm() {
+        let (_, plain) = stage_args(&[
+            "hybrid_sequence",
+            "--checkpoint",
+            "/checkpoint",
+            "--cubin-dir",
+            "/cubins",
+            "--fixture",
+            "/fixture.json",
+            "--prompt-tokens",
+            "2",
+        ])
+        .expect("sequence args");
+        assert!(
+            plain.timing_json.is_none(),
+            "no flag constructs no recorder"
+        );
+        let (_, timed) = stage_args(&[
+            "hybrid_sequence",
+            "--checkpoint",
+            "/checkpoint",
+            "--cubin-dir",
+            "/cubins",
+            "--fixture",
+            "/fixture.json",
+            "--prompt-tokens",
+            "2",
+            "--timing-json",
+            "/tmp/timing.json",
+        ])
+        .expect("the timing flag");
+        assert_eq!(
+            timed.timing_json.as_deref(),
+            Some(std::path::Path::new("/tmp/timing.json"))
+        );
+        let error = stage_args(&[
+            "hybrid_token",
+            "--checkpoint",
+            "/checkpoint",
+            "--cubin-dir",
+            "/cubins",
+            "--timing-json",
+            "/tmp/timing.json",
+        ])
+        .expect_err("only the sequence arm records");
+        assert!(error.contains("only wired into hybrid_sequence"), "{error}");
+        let error = stage_args(&[
+            "hybrid_sequence",
+            "--checkpoint",
+            "/checkpoint",
+            "--cubin-dir",
+            "/cubins",
+            "--fixture",
+            "/fixture.json",
+            "--timing-json",
+            "",
+        ])
+        .expect_err("an empty path is refused");
+        assert!(
+            error.contains("--timing-json needs a non-empty path"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_default_plan_and_dry_run_print_no_timing_line() {
+        // Flag off is the default: the host-observable output of the two host-only arms must not
+        // gain a timing line, and a disabled recorder writes no document (chain_timing's test).
+        let plan = plan_lines().expect("the plan");
+        let dry = dry_run_lines().expect("the dry-run wiring");
+        for line in plan.iter().chain(dry.iter()) {
+            assert!(
+                !line.starts_with("timing:"),
+                "no default timing line: {line}"
+            );
+        }
     }
 }

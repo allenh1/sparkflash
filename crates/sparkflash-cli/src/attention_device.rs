@@ -26,6 +26,10 @@ use sparkflash_kernels::mxfp8_dense_launch::{self, Mxfp8DenseParams};
 use sparkflash_kernels::mxfp8_ref::b12x_weight_index;
 use sparkflash_kernels::mxfp8_wo_a_launch::{self, Mxfp8WoAParams};
 use sparkflash_kv::fp4::{dequantize_main_kv, quantize_main_kv};
+
+use crate::chain_timing::{
+    LayerSample, SharedRecorder, absolute_bytes, indexer_pool_bytes, window_bytes,
+};
 /// One packed projection weight: the value bytes and their block scales, read once per name.
 type PackedWeight = Arc<(Vec<u8>, Vec<u8>)>;
 
@@ -310,6 +314,9 @@ pub struct AttentionDeviceBackend {
     diag_wkv_raw: Option<Vec<f32>>,
     diag_window_codes: Option<Vec<u8>>,
     diag_wq_b_kernel: Option<(usize, usize, f32)>,
+    // The opt-in D42 timing recorder. None is the default run: no sample is built and no counter
+    // is touched, which is what keeps the default output and files unchanged.
+    timing: Option<SharedRecorder>,
 }
 
 impl AttentionDeviceBackend {
@@ -430,6 +437,7 @@ impl AttentionDeviceBackend {
             diag_wkv_raw: None,
             diag_window_codes: None,
             diag_wq_b_kernel: None,
+            timing: None,
         })
     }
 
@@ -437,6 +445,15 @@ impl AttentionDeviceBackend {
     #[must_use]
     pub fn stats(&self) -> AttentionDeviceStats {
         self.stats
+    }
+
+    /// Arms the opt-in D42 timing recorder: every staged sequence attention body call records its
+    /// source bytes, host staging time, H2D copies and sync-gated device time, and the chain writes
+    /// the document at the end of the run.
+    #[must_use]
+    pub fn with_timing(mut self, timing: SharedRecorder) -> Self {
+        self.timing = Some(timing);
+        self
     }
 
     /// Selects the wo_a arithmetic; the chain records its name in the run output.
@@ -951,6 +968,7 @@ impl AttentionDeviceBackend {
         if compressed_count == 0 && !selected.is_empty() {
             return Ok(false);
         }
+        let staging_started = std::time::Instant::now();
         let mut window_codes = Vec::with_capacity(window_count * 512);
         let mut window_scales = Vec::with_capacity(window_count * 16);
         for id in &window_ids {
@@ -994,6 +1012,17 @@ impl AttentionDeviceBackend {
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect();
+        let host_staging_ns = staging_started.elapsed().as_nanos() as u64;
+        // The body issues one copy per operand buffer: q, window codes, window scales, the
+        // compressed codes/scales pair (skipped when the pool is empty) plus selected and sink.
+        let h2d_calls: u64 = if compressed_codes.is_empty() { 5 } else { 7 };
+        let h2d_bytes = (q_bytes.len()
+            + window_codes.len()
+            + window_scales.len()
+            + compressed_codes.len()
+            + compressed_scales.len()
+            + selected_bytes.len()
+            + sink_bytes.len()) as u64;
         if layer == 0 && self.twin_armed(start_pos) {
             // One line per armed position, from layer 0 only: the window ids in staged order and
             // the first/last row checksums are the eviction contract. A ring-order bug shows up
@@ -1110,6 +1139,7 @@ impl AttentionDeviceBackend {
                 what: "csa2 sequence sink upload".to_owned(),
                 detail,
             })?;
+        let launch_started = std::time::Instant::now();
         let params = FlashMlaSeqParams::new(
             self.mla.q,
             self.mla.kv_fp4,
@@ -1150,6 +1180,7 @@ impl AttentionDeviceBackend {
                 what: "csa2 sequence readback".to_owned(),
                 detail,
             })?;
+        let sync_gated_device_ns = launch_started.elapsed().as_nanos() as u64;
         for (slot, value) in decode_bf16(&raw).iter().enumerate() {
             out[slot] = *value;
         }
@@ -1180,6 +1211,22 @@ impl AttentionDeviceBackend {
         self.stats.attention_launches += 1;
         if let Some(count) = self.body_by_layer.get_mut(layer) {
             *count += 1;
+        }
+        if let Some(timing) = &self.timing {
+            timing.borrow_mut().record_layer(LayerSample {
+                position: start_pos as u64,
+                layer: layer as u64,
+                window_rows: window_count as u64,
+                window_bytes: window_bytes(window_count as u64),
+                absolute_rows: compressed_count as u64,
+                absolute_bytes: absolute_bytes(pool_rows as u64),
+                indexer_pool_bytes: indexer_pool_bytes(0),
+                host_staging_ns,
+                h2d_calls,
+                h2d_bytes,
+                launches: 1,
+                sync_gated_device_ns,
+            });
         }
         Ok(true)
     }

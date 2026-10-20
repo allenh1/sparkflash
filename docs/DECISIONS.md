@@ -50,6 +50,7 @@ records the evidence and the consequence for the build. Research backing is in
 | D39 | The chain runs the checkpoint's native arithmetic; acceptance is numeric with tolerance, and vLLM is the behavioural oracle | Native arithmetic means the released forward's rule (model.py:27-30, 182-205: 32-element ue8m0-ceil activations, 32x32 ue8m0 / FP4-32 weights, f32 accumulate), not f32/BF16-class activations; token equality is retired as a criterion because generation is not deterministic, so acceptance is numeric/distributional at declared tolerances; vLLM is the behavioural oracle; Engram weights stay disk-offloaded |
 | D40 | Serving-parity measurement protocol, metric set and provisional numeric bars, declared before the first diagnostic run (D41 freezes them) | The oracle is vLLM serving the released snapshot at TP=4, temperature 0, prompt_logprobs with max-logprobs 1000 and the served root recorded (D38); the device side is the full-vocabulary --dump-logits artefact on the same token ids; the comparison reports top-1/top-5/top-20 agreement, max/mean |delta logprob| over the oracle top-100 and KL over a fixed renormalised top-100 support, per position plus aggregates; provisional bars are top-1 >= 95% of positions, median top-20 recall >= 90%, median KL <= 0.02 nat and p95 <= 0.10 nat, max |delta| <= 1.0 nat per position (no position above 2.0); D41 must freeze the thresholds from the measured oracle self-consistency floor (at least 3x the floor) before any serving claim, and a bar changed after a gate run is a new decision |
 | D42 | The engine KV/attention seam is a KV store trait (Option B), recorded but NOT implemented; an in-path diagnostic mirror is rejected | The serving KV can be claimed paged only when the engine's attention path reads and writes the paged pool as its backing store. Of the three boundaries (attention backend trait, KV store trait, engine-owned allocator handle), Option B is recorded: the engine defines a minimal store contract and keeps a host dense bit-exact default; the paged store owns allocator/sharing/eviction behind it; the scheduler owns the shared pool and page-reservation-aware admission; the HTTP driver owns request-to-sequence handles and fills only cache fields it can measure from store counters (tier and replay fields stay zero). Option A cannot produce the cache claims, Option C puts page admission in the engine before the scheduler has a capacity model. No code is approved by this decision and no branch exists: it is an engine-wide refactor to be argued against measured staging and parity numbers. The frozen 19-word attention entry stays frozen (Path A's 20th argument is a separate pin decision), a default-off diagnostic request-path mirror is explicitly rejected (it leaves the serving KV dense, hides its cost behind a flag, and makes the bookkeeping claim without the user-visible cost), and the load-bearing boundary is quoted verbatim in the entry: Option B does not fix the f32-engine vs fp4-device numeric gap, O(context) staging, HSI full-pool selection, the serial HTTP engine, or the host-resident paged pool. Evidence: docs/build/engine-kv-seam-decision.md |
+| D43 | The paged-read attention entry is designed and NOT frozen: Path B's staging is cheap at current windows, and the revisit trigger is a measured C > 512 | The follow-on to Path B is a 20-word ADDITIVE sequence entry (new symbol; the frozen 19-word `flash_mla_csa2_seq_sm121` is not mutated) that replaces kv_fp4/kv_scales/index_key with main-KV pool base + index-key pool base + block table + ratio, addressing logical_page = t/64 -> block_table[page] -> interleaved 356-byte entry (codes +0, scales +256), deriving absolute position from page+offset (so Path A's positions array is unnecessary) and treating hole entries (0xFFFFFFFF) as unattended. Its ABI cost is named the Path A way: m4_abi signature row + freeze job, KernelId/catalog, baseline 18 -> 19, typed params and arity pin, block-table device allocation/upload/invalidate plumbing, and a layout-constant pin against `sparkflash-kv::layout` (task-51 now enforces that at compile time). It is NOT frozen now because the byte arithmetic does not pay for it yet: Path B stages 7,055,488 B per step at C=137, of which main rows are 2.2%, the HSI key pool 59.4% (113.8x write amplification) and the window 38.3%; the main-paged variant saves 2.2%, main+HSI 61.7%, window-paged 100%, while Path A (the 20th positions argument) saves ZERO bytes below C=514 and is 2,048 B worse. Revisit trigger: a window at C > 512 (main staging >= 589,824 B/step) or a profile showing the 4 MiB HSI zero-fill at current C - then freeze the main+HSI variant (V3), not Path A. Twin evidence (host, no GPU): page-boundary byte equality at ratios 1 and 2, a partially filled tail page with indexer keys, an evicted+reused block where a stale table demonstrably reads the evicted bytes, and block-table holes that are skipped rather than read as page 0. Evidence: docs/build/paged-read-attention-kernel-design.md, docs/build/serving-paged-kv.md section 5/7 |
 
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
@@ -2573,3 +2574,68 @@ timing at widths 1, 4 and 16 with warmup and repeats; cached tokens and hit rate
 D40/D41 numeric lines; and a same-window vLLM baseline with the served root recorded. Without
 staging-versus-kernel separation and a same-window baseline, a result argues for Path A or a
 paged-read kernel, not for the seam.
+
+## D43 - The paged-read attention entry is designed but not frozen; the revisit trigger is a measured C > 512, and the target is main+HSI, not Path A
+
+**Date:** 2026-10-19. **Status:** design recorded, **nothing pinned** (no kernel, no KernelId, no
+baseline entry, no m4_abi row, no ABI change). Proposal and byte arithmetic:
+`docs/build/paged-read-attention-kernel-design.md`; host twin:
+`crates/sparkflash-device/{src,tests}/paged_read.rs`.
+
+### What would replace the staging
+
+Path B (D-21/D42, `docs/build/serving-paged-kv.md`) is correct and keeps the frozen 19-word
+attention entry, but it stages dense absolute-position rows per source layer per step. The
+paged-read entry reads the pool in place: a **20-word additive** argument list (new symbol - the
+frozen `flash_mla_csa2_seq_sm121` is not mutated) replaces `kv_fp4`/`kv_scales`/`index_key` with the
+main-KV pool base, the index-key pool base, the block table and the ratio, keeping q/window/selected/
+index-query/sink/outputs/position/count/trace/layer/step. Addressing is
+`logical_page = t/64 -> block_table[page] -> entry = page*(64/ratio) + (t%64)/ratio`, an interleaved
+356-byte entry with codes at +0 and scales at +256. The absolute position follows from page index
+plus offset, so Path A's 20th `positions` argument is unnecessary on this path; hole entries
+(`0xFFFFFFFF`) are unattended.
+
+### Why it is not frozen now (the numbers)
+
+Per step, one sequence, C=137: Path B stages **7,055,488 B** - main absolute rows 157,824 (2.2%),
+HSI index-key pool 4,194,304 (59.4%, a **113.8x write amplification** against the 36,864 B the indexer
+actually reads), window 2,703,360 (38.3%). The variants save: main-paged 2.2%, HSI-paged 59.4%,
+main+HSI 61.7%, window-paged 100% (6,553,600 B at C=2048 for main+HSI). Path A saves **zero bytes
+below C=514** (it is 2,048 B worse, the positions list) and 1,767,424 / 8,845,312 B at C=2048/8192.
+
+So at the windows we can currently run, a new pinned entry plus block-table device plumbing buys
+2.2% of staging - not payable. Freezing it now would add a frozen surface we would have to defend
+before anything measured argues for it.
+
+### Revisit trigger (the condition, stated so it cannot be forgotten)
+
+Freeze when a window at **C > 512** shows main-row staging at or above 589,824 B/step (about
++1,152 B per token per step), or when a profile shows the **4 MiB HSI zero-fill** dominating at
+current C. The first freeze should be **main+HSI (V3)**, not Path A, because the HSI pool is the
+dominant term. No window at C<=512 can argue for either.
+
+### ABI cost, named the Path A way
+
+New m4_abi signature row and freeze job entry; new KernelId and catalog entry; baseline pin
+18 -> 19 kernels (manifest, build.rs PROBED_KERNELS, check/regen scripts, baseline tests); a typed
+params struct with an arity pin; new block-table device allocation/upload/invalidate plumbing
+(`PagedKvCache` is host metadata today); and a layout-constant pin (356/256/288/352/64) against
+`sparkflash-kv::layout` - now enforced at compile time by D43's sibling task-51 guard in
+`crates/sparkflash-device/src/layout_contract.rs`, because a mismatch there is silent corruption
+rather than a failure. Existing launch sites are untouched by the proposal.
+
+### What the twin proves, and what it does not
+
+Host twin (5 tests, no GPU): byte-equal main rows across four page boundaries at ratios 1 and 2;
+selected candidates at and around boundaries produce bit-identical `mla_ref` attention output from
+paged vs staged operands; a partially filled tail page (137 tokens) with indexer keys equal to
+`absolute_indexer_keys` and past-query slots zero; an evicted+reused block where the paged read
+follows the current table while a stale table demonstrably reads the evicted bytes (0x11 vs 0x22);
+and block-table holes that are skipped rather than read as page 0, with out-of-range ids failing
+closed.
+
+Not proved, and not claimable from it: the device path's FP4 E2M1/E8M0 -> BF16 dequantisation
+equality (the twin is a host reference on both sides), ring rotation for the window variant,
+block-table upload plumbing, and every timing number. No throughput claim exists in either
+direction until the window lines in D42 section 6 are recorded - and the trigger above is a
+measurement, not an estimate.
