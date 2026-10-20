@@ -188,6 +188,7 @@ impl MoeScratch {
         prefix: &str,
         body: ExpertBody,
         limit: usize,
+        local_inter: Option<usize>,
     ) -> Result<ExpertWeights, EngineError> {
         let dim = cfg.dim;
         let (inter, grid) = match body {
@@ -195,7 +196,14 @@ impl MoeScratch {
                 self.base.clear();
                 write!(self.base, "{prefix}.ffn.experts.{expert}")
                     .expect("a String cannot fail to be written to");
-                (cfg.moe_inter_dim, ScaleGrid::PerRow32)
+                // The TP reference path reads only this rank's slice of the expert body. The
+                // geometry check below then compares the local bytes against the local shape,
+                // so a source that serves the global tensor is refused here rather than
+                // producing a wrong partial sum.
+                (
+                    local_inter.unwrap_or(cfg.moe_inter_dim),
+                    ScaleGrid::PerRow32,
+                )
             }
             ExpertBody::Shared => {
                 self.base.clear();
@@ -550,6 +558,56 @@ pub fn routed_forward(
     scratch: &mut MoeScratch,
     out: &mut [f32],
 ) -> Result<(), EngineError> {
+    routed_forward_impl(cfg, prefix, x, src, limit, scratch, out, None)
+}
+
+/// The TP reference path's routed experts: the same body over this rank's local shard.
+///
+/// `local_inter` is `cfg.moe_inter_dim / world`; the expert bodies read `w1`/`w3` with
+/// `local_inter` rows and `w2` with `local_inter` input columns, so `out` is this rank's
+/// partial contribution to the routed sum. The caller reduces it across ranks once per layer.
+///
+/// # Errors
+///
+/// [EngineError::Shape] when `local_inter` does not divide `cfg.moe_inter_dim`, plus the errors
+/// of [routed_forward].
+#[allow(clippy::too_many_arguments)] // the routed body's inputs plus the local width; bundling them would hide which one is the shard
+pub fn routed_forward_sharded(
+    cfg: &ModelConfig,
+    prefix: &str,
+    x: &[f32],
+    src: &dyn WeightSource,
+    limit: usize,
+    scratch: &mut MoeScratch,
+    out: &mut [f32],
+    local_inter: usize,
+) -> Result<(), EngineError> {
+    if local_inter == 0
+        || local_inter > cfg.moe_inter_dim
+        || !cfg.moe_inter_dim.is_multiple_of(local_inter)
+    {
+        return Err(shape_error(
+            "the TP routed experts",
+            format!(
+                "a local intermediate width of {local_inter} does not split {}",
+                cfg.moe_inter_dim
+            ),
+        ));
+    }
+    routed_forward_impl(cfg, prefix, x, src, limit, scratch, out, Some(local_inter))
+}
+
+#[allow(clippy::too_many_arguments)] // the routed body's inputs plus the local width; bundling them would hide which one is the shard
+fn routed_forward_impl(
+    cfg: &ModelConfig,
+    prefix: &str,
+    x: &[f32],
+    src: &dyn WeightSource,
+    limit: usize,
+    scratch: &mut MoeScratch,
+    out: &mut [f32],
+    local_inter: Option<usize>,
+) -> Result<(), EngineError> {
     let (n_routed, _) = counts(cfg, prefix)?;
     let dim = cfg.dim;
     if dim == 0 || cfg.moe_inter_dim == 0 {
@@ -658,6 +716,7 @@ pub fn routed_forward(
         src,
         limit,
         choices: &scratch.choices,
+        local_inter,
     };
     let workers = reference_threads().min(groups.len()).max(1);
     if workers <= 1 {
@@ -750,7 +809,7 @@ pub fn add_shared_expert(
         ));
     }
     let tokens = x.len() / dim;
-    let shared = scratch.read_expert(cfg, src, prefix, ExpertBody::Shared, limit)?;
+    let shared = scratch.read_expert(cfg, src, prefix, ExpertBody::Shared, limit, None)?;
     let shared_workers = reference_threads().min(tokens).max(1);
     if shared_workers <= 1 {
         for token in 0..tokens {
@@ -831,6 +890,8 @@ struct RoutedPass<'a> {
     src: &'a dyn WeightSource,
     limit: usize,
     choices: &'a [(usize, usize, f32)],
+    /// The sharded intermediate width, when the caller is one TP rank.
+    local_inter: Option<usize>,
 }
 
 /// The contiguous runs of one expert in the expert-major choice order.
@@ -872,6 +933,7 @@ fn compute_routed(
             pass.prefix,
             ExpertBody::Routed(expert),
             pass.limit,
+            pass.local_inter,
         )?;
         for (local_choice, &(token, _, weight)) in pass.choices[start..end].iter().enumerate() {
             expert_body(

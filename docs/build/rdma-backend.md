@@ -215,6 +215,13 @@ Address tables, which are easy to confuse:
 The gate table is the one the Lead measured for the four nodes' rail-1 interfaces; it is what
 `SPARK_COMM_PEERS` carries. It is not a statement about which address family the container prints.
 
+The 2026-10-20 hardware run used a mixed rail-1/rail-2 table in rank order
+`.80/.88/.59/.68` (node0, node1, node3, node2) because that is the table the Lead's management path
+reaches; it worked on the first rendezvous. The control plane uses the rank-ordered entries as
+each rank's bind address and rank 0's entry as the listener, so any table with a reachable rank-0
+entry and a locally bindable entry per rank is legal; the data plane still resolves devices and
+GIDs independently. See [rdma-bringup.md](rdma-bringup.md) section 2 before choosing a table.
+
 ## 8. Modes
 
 | `SPARK_COMM_RAIL_COUNT` | behaviour | gate 3 wording |
@@ -266,6 +273,12 @@ Not verified by this document: anything on the cluster. No device was opened, no
 the three gates and `rocenante-probe --transport rdma` have never printed a number, and the latency
 budget in gate 1 is this gate's acceptance bar (wire floor at the negotiated rate, floored at the
 specification's 20 us), not a measured cluster result.
+
+That paragraph was true when this document was written. The first four-node run happened on
+2026-10-20: [rdma-bringup.md](rdma-bringup.md) records the measured gate results (the dual-rail
+counter gate green; the 10 KiB latency gate and the 10,000-replay determinism gate not green), the
+exact mixed peer table that worked, the per-rank latency distributions, and the cleanup evidence.
+This page keeps its pre-run framing; the new page is the measurement.
 
 ## 11. Exact commands
 
@@ -361,7 +374,10 @@ window shape as section 11.3). Pass `--rank` for the node the doctor runs on and
 
 These are expectations derived from the schedule and the known gaps, written down so that the first
 run's numbers are either confirmed or visible as a named gap. They are **not** measurements and none
-of them may be quoted as a result.
+of them may be quoted as a result. The 2026-10-20 run is recorded in
+[rdma-bringup.md](rdma-bringup.md): the counter row and the 2 MiB host-staging shape were
+qualitatively confirmed, while the 10 KiB row was not (36-37 us dual-rail median against the 20 us
+bar) and the replay limit was hit at random counts rather than only at the 2 MiB gate.
 
 | gate | expected on 192.0.2.80/.84/.68/.59 | read a surprise as |
 | --- | --- | --- |

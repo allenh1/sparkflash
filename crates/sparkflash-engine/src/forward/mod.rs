@@ -153,6 +153,8 @@ pub struct InferenceEngine {
     source: Box<dyn WeightSource>,
     limit: usize,
     sampling: Sampling,
+    /// The TP seam state when this engine runs one rank of a sharded model.
+    tp: Option<crate::parallel_tp::TpRuntime>,
 }
 
 impl InferenceEngine {
@@ -177,7 +179,54 @@ impl InferenceEngine {
             source,
             limit,
             sampling: Sampling::default(),
+            tp: None,
         })
+    }
+
+    /// An engine that runs ONE RANK of the TP reference forward over its local shards.
+    ///
+    /// The source answers global names with this rank's local specs: routed-expert
+    /// `w1`/`w3` have `moe_inter_dim/world` rows and routed `w2` has
+    /// `moe_inter_dim/world` input columns; every other tensor is replicated and keeps its global
+    /// shape. The engine reads each of the plan's tensors once, at construction, into a
+    /// [crate::parallel_tp::ResidentSource], so a per-token forward issues no reads against the
+    /// caller's source.
+    ///
+    /// The one seam is the routed FFN output: after the local expert bodies the engine reduces it
+    /// once per layer through `collective`, then adds the replicated shared expert host-f32. With
+    /// `tp.world_size == 1` the adapter is a strict no-op and this engine is bit-identical to
+    /// [InferenceEngine::new].
+    ///
+    /// # Errors
+    ///
+    /// [EngineError::Config] when the configuration is not usable, [EngineError::Shape] when the
+    /// layout does not split the routed intermediate or disagrees with the adapter, and
+    /// [crate::weights::WeightError] when a planned tensor cannot be read.
+    pub fn new_tp(
+        config: ModelConfig,
+        source: Box<dyn WeightSource>,
+        limit: usize,
+        tp: crate::parallel_tp::TpLayout,
+        collective: Box<dyn crate::parallel_tp::TpCollective>,
+    ) -> Result<Self, EngineError> {
+        config.validate()?;
+        let plan = TensorPlan::language_model(&config);
+        let runtime = crate::parallel_tp::TpRuntime::new(tp, config.moe_inter_dim, collective)?;
+        let resident = crate::parallel_tp::ResidentSource::load(source.as_ref(), &plan)?;
+        Ok(Self {
+            config,
+            plan,
+            source: Box::new(resident),
+            limit,
+            sampling: Sampling::default(),
+            tp: Some(runtime),
+        })
+    }
+
+    /// The TP seam state, when this engine runs one rank of a sharded model.
+    #[must_use]
+    pub fn tp(&self) -> Option<&crate::parallel_tp::TpRuntime> {
+        self.tp.as_ref()
     }
 
     /// The same engine with a different sampler.
@@ -686,6 +735,13 @@ impl InferenceEngine {
         let config = &self.config;
         let prefix = format!("layers.{layer}");
         let source: &dyn WeightSource = self.source.as_ref();
+        if self.tp.is_some() && (attention.is_some() || moe.is_some()) {
+            return Err(EngineError::Shape {
+                what: "the TP reference block".to_owned(),
+                detail: "the sharded reference path has no device backend seam; pass none"
+                    .to_owned(),
+            });
+        }
 
         // The entry boundaries: the residual stream this block received and the input mix it will
         // consume (docs/build/phase1-boundary-table.md section 2).
@@ -1087,7 +1143,30 @@ impl InferenceEngine {
             )?,
             None => false,
         };
-        if !device_moe {
+        if let Some(tp) = &self.tp {
+            // The one Phase-1 TP seam: the routed experts are this rank's shards, the shared
+            // expert is replicated, and the routed sum crosses one all-reduce per layer.
+            moe::routed_forward_sharded(
+                config,
+                &prefix,
+                &scratch.ffn_in,
+                source,
+                self.limit,
+                &mut scratch.moe,
+                &mut scratch.ffn_out,
+                tp.local_moe_inter(),
+            )?;
+            tp.all_reduce(&mut scratch.ffn_out)?;
+            moe::add_shared_expert(
+                config,
+                &prefix,
+                &scratch.ffn_in,
+                source,
+                self.limit,
+                &mut scratch.moe,
+                &mut scratch.ffn_out,
+            )?;
+        } else if !device_moe {
             moe::moe_forward(
                 config,
                 &prefix,

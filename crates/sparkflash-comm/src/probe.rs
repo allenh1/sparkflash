@@ -46,7 +46,7 @@
 //! preemption, interrupt-coalescing burst or page fault produces, and the minimum is a best case
 //! that a link jittering far above the budget can still hit once; the median is robust to both, is
 //! what the p50 line of an RDMA latency histogram reports, and repeats from run to run. The report
-//! also carries min_us, p90_us and max_us so the spread sits next to the headline number, and
+//! also carries min_us, p90_us, p99_us and max_us so the spread sits next to the headline number, and
 //! samples so a reader can tell a three-sample number from a thousand-sample one.
 
 use std::fmt;
@@ -299,12 +299,15 @@ pub struct LatencyStats {
     pub p50_us: f64,
     /// 90th percentile by nearest rank.
     pub p90_us: f64,
+    /// 99th percentile by nearest rank: the tail the 20 us gate would miss if only the median were
+    /// recorded, and the reason the report carries the full distribution rather than one number.
+    pub p99_us: f64,
     /// Slowest sample.
     pub max_us: f64,
 }
 
 impl LatencyStats {
-    /// Computes min, median, p90 and max over the samples. Pure: no device, no clock.
+    /// Computes min, median, p90, p99 and max over the samples. Pure: no device, no clock.
     ///
     /// # Errors
     /// Returns ProbeError::Usage for an empty sample set, which has no statistic.
@@ -324,6 +327,7 @@ impl LatencyStats {
             min_us: micros[0],
             p50_us: median(&micros),
             p90_us: nearest_rank(&micros, 0.90),
+            p99_us: nearest_rank(&micros, 0.99),
             max_us: micros[micros.len() - 1],
         })
     }
@@ -420,6 +424,8 @@ pub struct ProbeReport {
     pub min_us: f64,
     /// 90th percentile of the timed samples, in microseconds.
     pub p90_us: f64,
+    /// 99th percentile of the timed samples, in microseconds.
+    pub p99_us: f64,
     /// Slowest timed sample, in microseconds.
     pub max_us: f64,
 }
@@ -439,6 +445,7 @@ impl ProbeReport {
             peers: request.peers.clone(),
             min_us: stats.min_us,
             p90_us: stats.p90_us,
+            p99_us: stats.p99_us,
             max_us: stats.max_us,
         }
     }
@@ -465,6 +472,7 @@ impl ProbeReport {
         object.insert("peers".to_owned(), json!(self.peers));
         object.insert("min_us".to_owned(), json!(self.min_us));
         object.insert("p90_us".to_owned(), json!(self.p90_us));
+        object.insert("p99_us".to_owned(), json!(self.p99_us));
         object.insert("max_us".to_owned(), json!(self.max_us));
         Value::Object(object)
     }
@@ -479,7 +487,7 @@ impl ProbeReport {
     #[must_use]
     pub fn to_human_string(&self) -> String {
         let mut text = format!(
-            "one-shot All-Reduce of {} bytes over {}: {} {:.2} us across {} samples ({} warmup discarded), min {:.2} us, p90 {:.2} us, max {:.2} us",
+            "one-shot All-Reduce of {} bytes over {}: {} {:.2} us across {} samples ({} warmup discarded), min {:.2} us, p90 {:.2} us, p99 {:.2} us, max {:.2} us",
             self.bytes,
             self.transport,
             self.statistic,
@@ -488,6 +496,7 @@ impl ProbeReport {
             self.warmup_discarded,
             self.min_us,
             self.p90_us,
+            self.p99_us,
             self.max_us
         );
         if !self.fabric {
@@ -874,6 +883,7 @@ mod tests {
         assert_eq!(even.min_us, 10.0);
         assert_eq!(even.p50_us, 25.0);
         assert_eq!(even.p90_us, 40.0);
+        assert_eq!(even.p99_us, 40.0);
         assert_eq!(even.max_us, 40.0);
         assert_eq!(even.reported_us(), even.p50_us);
 
@@ -887,10 +897,12 @@ mod tests {
         assert_eq!(odd.min_us, 1.0);
         assert_eq!(odd.p50_us, 3.0);
         assert_eq!(odd.p90_us, 5.0);
+        assert_eq!(odd.p99_us, 5.0);
 
         let single = LatencyStats::from_samples(&[Duration::from_micros(7)])
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(single.p50_us, 7.0);
+        assert_eq!(single.p99_us, 7.0);
         assert_eq!(single.spread_us(), 0.0);
 
         assert!(
@@ -908,6 +920,7 @@ mod tests {
         assert_eq!(constant.min_us, constant.p50_us);
         assert_eq!(constant.p50_us, constant.p90_us);
         assert_eq!(constant.p90_us, constant.max_us);
+        assert_eq!(constant.p99_us, constant.max_us);
 
         let varying_samples = [1, 2, 3, 4, 50, 60, 70].map(Duration::from_micros);
         let varying =
@@ -916,6 +929,7 @@ mod tests {
         assert_eq!(varying.p50_us, 4.0);
         assert_ne!(varying.p50_us, varying.min_us);
         assert_ne!(varying.p50_us, varying.max_us);
+        assert_eq!(varying.p99_us, varying.max_us);
         let mean = (1.0 + 2.0 + 3.0 + 4.0 + 50.0 + 60.0 + 70.0) / 7.0;
         assert!(
             (mean - varying.p50_us).abs() > 1.0,
@@ -944,6 +958,8 @@ mod tests {
         assert_eq!(value["fabric"], json!(true));
         assert_eq!(value["transport"], json!("rdma"));
         assert_eq!(value["bytes"], json!(DEFAULT_BYTES));
+        assert_eq!(value["min_us"], json!(10.0));
+        assert_eq!(value["p99_us"], json!(30.0));
         assert!(
             value["statistic_note"]
                 .as_str()
