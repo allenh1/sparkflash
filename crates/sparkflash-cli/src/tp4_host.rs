@@ -37,6 +37,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::allocator;
+
 use sparkflash_comm::{
     CollectiveLayout, FabricSchedule, TcpConfig, TcpTransport, Transport, bf16_to_f32,
     f32_to_bf16_rn,
@@ -593,6 +595,22 @@ fn profile_layer(merged: &mut Vec<ProfileLayer>, layer: usize) -> &mut ProfileLa
         }
     };
     &mut merged[index]
+}
+
+/// The allocator tune the process actually requested, recorded so a run is self-describing.
+///
+/// The CLI main calls [allocator::tune] at startup; the writer calls it again because the call is
+/// idempotent and because an evidence file can otherwise not tell a tuned run from an untuned one.
+fn allocator_json(tuning: allocator::Tuning) -> Value {
+    json!({
+        "enabled": tuning.enabled,
+        "mmap_threshold": tuning.mmap_threshold,
+        "trim_threshold": tuning.trim_threshold,
+        "kill_switch": allocator::KILL_SWITCH,
+        "requested_mmap_threshold_bytes": allocator::REQUESTED_MMAP_THRESHOLD_BYTES,
+        "requested_trim_threshold_bytes": allocator::REQUESTED_TRIM_THRESHOLD_BYTES,
+        "note": "pair-only win: M_MMAP_THRESHOLD moves the per-layer 134/168 MB buffers onto the heap and M_TRIM_THRESHOLD retains the freed heap; either alone is noise, and the 32 MiB row falsifies a clamp of the 1 GiB ask",
+    })
 }
 
 fn profile_json(profile: &Profiler) -> Value {
@@ -2130,6 +2148,7 @@ fn rank_evidence(outcome: &RankOutcome, wall_ms: u64) -> Value {
         }
         by_layer.into_values().collect()
     };
+    let tuning = allocator::tune();
     let mut value = json!({
         "stage": "tp4-host",
         "schema": SCHEMA_VERSION,
@@ -2139,6 +2158,7 @@ fn rank_evidence(outcome: &RankOutcome, wall_ms: u64) -> Value {
         "prompt_tokens": outcome.prompt,
         "generated_tokens": outcome.generated,
         "completion_text": outcome.completion_text,
+        "allocator_tuning": allocator_json(tuning),
         "step_tokens": outcome.step_tokens,
         "tokens_per_second": tokens_per_second(outcome.total_ms, outcome.prompt.len() + outcome.generated.len()),
         "timing": {
@@ -2189,6 +2209,7 @@ fn rank_evidence(outcome: &RankOutcome, wall_ms: u64) -> Value {
         "shard": {
             "plan_tensors": outcome.shard_tensors,
             "plan_hash": format!("{:#018x}", outcome.plan_hash),
+        "allocator_tuning": allocator_json(tuning),
         "profile_steps": outcome.profile.as_ref().map_or(0, |profile| profile.steps.len()),
             "plan_rule": "routed experts column/row; attention, embed, head, shared, router, mHC, norms, engram replicated (Phase 1)",
             "shard_read_calls": outcome.shard_read_calls,
@@ -2223,11 +2244,13 @@ fn rank_evidence(outcome: &RankOutcome, wall_ms: u64) -> Value {
             "window": "none",
             "gpu_window": "not_used",
             "mode": "host_twin",
+            "allocator_tuning": tuning.enabled,
         },
         "notes": [
             "Phase 1 shards only the routed experts; the replicated remainder is numerically a no-op but is not vLLM's TP=4 layout.",
             "One all-reduce per layer (40) plus no gather; the routed output is the only sharded seam.",
             "Tokens are greedy argmax over the replicated head, so every rank must agree without a token gather.",
+            "allocator_tuning records the startup allocator tune from sparkflash_cli::allocator::tune; the pair of raised glibc thresholds is what turns the per-layer 134/168 MB buffers into retained heap, and either threshold alone is noise.",
         ],
     });
     if let Some(profile) = &outcome.profile {
@@ -2238,6 +2261,7 @@ fn rank_evidence(outcome: &RankOutcome, wall_ms: u64) -> Value {
 
 fn write_summary(directory: &Path, outcome: &RankOutcome, wall_ms: u64) -> Result<(), String> {
     let path = directory.join("tp4-host-summary.json");
+    let tuning = allocator::tune();
     let values = json!({
         "stage": "tp4-host",
         "schema": SCHEMA_VERSION,
@@ -2250,6 +2274,7 @@ fn write_summary(directory: &Path, outcome: &RankOutcome, wall_ms: u64) -> Resul
         "tokens_per_second": tokens_per_second(outcome.total_ms, outcome.prompt.len() + outcome.generated.len()),
         "collective": outcome.collective_label,
         "plan_hash": format!("{:#018x}", outcome.plan_hash),
+        "allocator_tuning": allocator_json(tuning),
         "profile_steps": outcome.profile.as_ref().map_or(0, |profile| profile.steps.len()),
         "resident_gib_estimate": outcome.resident_bytes_estimate as f64 / (1u64 << 30) as f64,
         "resident_cache_tensors": outcome.cache_tensors,

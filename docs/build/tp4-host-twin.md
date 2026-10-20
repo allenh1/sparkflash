@@ -221,13 +221,39 @@ cache, rchar/token is 0.36 MB (Engram rows only) and compute is 13,724 ms of the
 (collective 223 ms = 1.6%). The remaining time is host matmul plus, for the non-cached classes,
 weight decode: about 13.7 s of CPU arithmetic per token across 40 layers, single-threaded per layer.
 The TP=4 host path is correct and coherent but it is **not fast**, and the next speed lever is the
-device path (M4/M5), not more residency. Run 3 (14.0 s/step, weights in-process) versus run 2
+device path (M4/M5), not more residency — with one host-side exception recorded in the next
+subsection, which halves the step before any device work. Run 3 (14.0 s/step, weights in-process) versus run 2
 (15.8 s/step, re-read from page cache) shows residency buys only about 12% wall: the cost was never
 just the `read()` bytes, it was also CPU decode of every class each token, and only residency can
 remove the reads while the compute stays. No overclaim: this is not vLLM TP=4 and not the device
 path.
 
-### Why step time is 14 s, not the 8-9 s a microbench suggests
+### The allocator correction (batch 15, kernel-dev's measurement)
+
+The "compute-bound" sentence above needs one measured correction, not a retraction. Re-raising the
+glibc large-allocation thresholds at process startup (M_MMAP_THRESHOLD and M_TRIM_THRESHOLD, both
+asked for 1 GiB) moves the per-layer attention output-projection buffers - wo_a 8192x4096 f32 (134 MB)
+and wo_b 5120x8192 f32 (168 MB), allocated and then freed once per layer - from mmap/munmap (page
+map plus zero fill per layer) onto retained heap. On the committed-binary four-rank resident run
+(same checkpoint, tokens, ports and evidence schema) the clean step goes 13.827 -> 7.929 s, the
+attention block 7.942 -> 3.251 s, the shared expert 2.017 -> 1.136 s and the reduce 0.340 -> 0.164 s;
+tokens stay [11111, 201] (" Paris"), rchar/token is unchanged (25,114 -> 25,118 B, so no re-read was
+introduced), and rank 0 VmHWM rises 90.265 -> 90.462 GiB (the retained heap).
+
+The pair is the mechanism, measured rather than inferred from the option labels: attention per layer
+is 214-219 ms untuned, 223-248 ms with the mmap raise only, 221-245 ms with the trim raise only, and
+82-94 ms with both; a 200 MB allocate-touch-free probe keeps ~205 MB of RSS after free only with
+both. Asking for both at 32 MiB behaves like untuned (211-224 ms), which falsifies the idea that
+glibc silently clamps the 1 GiB request to 32 MiB on this host: the effective values really are the
+raised pair, and the 32 MiB row is the falsification, not a caveat. Attribution: kernel-dev's branch
+task/allocator-tuning; source and the four-rank A/B live in docs/build/allocator-tuning.md, and the
+allocator_tuning header these evidence files now carry is written from
+sparkflash_cli::allocator::tune so a run is self-describing. What remains after the pair is CPU
+arithmetic, so the device path is still the next lever; the corrected conclusion is "residency
+removed the I/O, then the allocator pair removed a large share of the per-layer allocation churn",
+not "the host step was irreducible compute".
+
+### Why step time was 14 s, not the 8-9 s a microbench suggests
 
 The `breakdown` evidence (per-step `rchar`, `step_collective_ms`) plus kernel-dev's planned
 per-layer/per-class profile (task-57 follow-up: the `--profile` hook lands in the same commit as

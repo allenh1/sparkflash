@@ -34,6 +34,10 @@ struct PackEngramCli {
 }
 
 fn main() -> ExitCode {
+    let tuning = sparkflash_cli::allocator::tune();
+    if tuning.enabled && (!tuning.mmap_threshold || !tuning.trim_threshold) {
+        eprintln!("sparkflash: allocator tuning was refused by libc; continuing with defaults");
+    }
     let mut args = std::env::args();
     let _program = args.next();
     match args.next().as_deref() {
