@@ -481,6 +481,7 @@ mod cuda_launcher {
     ///
     /// This is the function [DeviceLauncher::launch] calls, so the reset and its byte sizes are
     /// tested through the same seam the real launch uses.
+    #[allow(dead_code)] // exercised by the seam tests; the batched entry launch that calls it is not wired yet
     fn launch_mhc_entry_with(
         buffers: &MhcBuffers,
         mut copy: impl FnMut(&Deviceptr, &[u8]) -> Result<(), String>,
@@ -1220,16 +1221,22 @@ mod cuda_launcher {
                     let cuda = self.cuda.as_ref().ok_or(DeviceLaunchError::Launcher {
                         detail: "the CUDA driver is unavailable".to_owned(),
                     })?;
-                    let (module, kernel) = mega_mhc_launch::load(cuda, &bytes)
-                        .map_err(|error| DeviceLaunchError::Launcher { detail: error })?;
+                    // Graph-capture path: the rendezvous scratch is cleared by a DEVICE init
+                    // kernel, not by a host H2D between launches. The scalar kernel's row 0 is
+                    // what a single-token call uses; the init clears all six rows' scratch.
+                    let (module, kernel, init_module, init_kernel) =
+                        mega_mhc_launch::load_batched(cuda, &bytes)
+                            .map_err(|error| DeviceLaunchError::Launcher { detail: error })?;
                     let params = self.mhc_params(&buffers, call);
-                    let result = launch_mhc_entry_with(
-                        &buffers,
-                        |destination, zeroes| cuda.copy_htod(destination, zeroes),
-                        || mega_mhc_launch::launch(cuda, kernel, &params),
+                    let result = mega_mhc_launch::launch_with_device_init(
+                        cuda,
+                        init_kernel,
+                        kernel,
+                        &params,
                     )
                     .map_err(|error| DeviceLaunchError::Launcher { detail: error });
                     cuda.free(module, &[]);
+                    cuda.free(init_module, &[]);
                     result
                 }
                 ChainStage::MoeRouter | ChainStage::MoeGateUp => Err(DeviceLaunchError::NotWired {

@@ -551,6 +551,10 @@ fn checked_header_len(header_len: u64, file_len: u64, source: &str) -> Result<u6
 // The source
 // ---------------------------------------------------------------------------------
 
+/// Range count above which `read_ranges` reads the tensor's whole stored region in one pass and
+/// gathers the wanted ranges out of that buffer, instead of one seek+read per range.
+const GATHER_FROM_WHOLE_TENSOR_RANGES: usize = 16;
+
 /// A [WeightSource] over a directory of safetensors shards plus the checkpoint index.
 ///
 /// The index answers names() and which shard holds a name; the shard's header answers the dtype,
@@ -738,6 +742,62 @@ impl SafeTensorsSource {
             name: name.to_string(),
             detail: format!("open {}: {error}", path.display()),
         })?;
+        // More than a handful of ranges means a tensor-column slice (one small read per stored
+        // row). Seeking and reading per range costs a syscall pair per row and dominated the
+        // four-rank arena boot (measured 416-521 s for 72.3 GiB/rank, ~4.3 ms per tensor). The
+        // tensor's whole stored region is contiguous, so read it in one sequential pass and gather
+        // the wanted ranges out of that buffer: for a column shard this reads the full tensor on
+        // each rank (4x the shard bytes per rank) but at sequential device speed instead of
+        // 160M seek+read pairs. Ranges are still identical byte-for-byte.
+        if ranges.len() > GATHER_FROM_WHOLE_TENSOR_RANGES {
+            let total_len = usize::try_from(total).map_err(|_| WeightError::Malformed {
+                name: name.to_string(),
+                detail: format!("tensor region of {total} bytes does not fit usize"),
+            })?;
+            let mut whole = vec![0u8; total_len];
+            file.seek(SeekFrom::Start(start))
+                .map_err(|error| WeightError::Io {
+                    name: name.to_string(),
+                    detail: format!("seek to byte {start} of {}: {error}", path.display()),
+                })?;
+            file.read_exact(&mut whole)
+                .map_err(|error| match error.kind() {
+                    std::io::ErrorKind::UnexpectedEof => WeightError::Malformed {
+                        name: name.to_string(),
+                        detail: format!(
+                            "{} declared {total_len} bytes from byte {start} but holds fewer",
+                            path.display()
+                        ),
+                    },
+                    _ => WeightError::Io {
+                        name: name.to_string(),
+                        detail: format!("read {}: {error}", path.display()),
+                    },
+                })?;
+            let mut out = Vec::with_capacity(ranges.iter().map(|(_, len)| *len).sum::<usize>());
+            for &(offset, len) in ranges {
+                let begin = usize::try_from(offset).map_err(|_| WeightError::Malformed {
+                    name: name.to_string(),
+                    detail: format!("range offset {offset} does not fit usize"),
+                })?;
+                let end = begin
+                    .checked_add(len)
+                    .ok_or_else(|| WeightError::Malformed {
+                        name: name.to_string(),
+                        detail: format!("range {offset}+{len} overflows"),
+                    })?;
+                if end > whole.len() {
+                    return Err(WeightError::Malformed {
+                        name: name.to_string(),
+                        detail: format!(
+                            "range {offset}..{end} is outside the tensor's {total} stored bytes"
+                        ),
+                    });
+                }
+                out.extend_from_slice(&whole[begin..end]);
+            }
+            return Ok(out);
+        }
         let mut out = Vec::new();
         for &(offset, len) in ranges {
             let end = offset

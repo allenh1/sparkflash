@@ -86,6 +86,38 @@ pub fn b12x_buffer_bytes(rows: usize, inner: usize) -> usize {
     b12x_padded_rows(rows) * inner
 }
 
+/// Permutes row-major FP8 weights into the B12x layout the kernels read.
+///
+/// The transform is a pure permutation: [b12x_weight_index] is a bijection over the buffer, so
+/// no value is changed, rounded or dropped. It is meant to run ONCE at arena-build time, before
+/// the bytes are uploaded; the device kernels never tile internally. Scales are already in the
+/// checkpoint's [ceil(rows / 32), inner / 32] grid and are returned unchanged by the caller.
+///
+/// # Panics
+/// Panics when the buffer length is not exactly cols * inner, or when inner is not a whole number
+/// of 32-value MX blocks. The row count may be any value a caller pads before tiling.
+#[must_use]
+pub fn b12x_tile_weights(raw: &[u8], cols: usize, inner: usize) -> Vec<u8> {
+    assert_eq!(
+        raw.len(),
+        cols * inner,
+        "the B12x source must be exactly cols * inner bytes"
+    );
+    assert_eq!(
+        inner % B12X_KTILE,
+        0,
+        "the B12x width must be whole micro-tiles"
+    );
+    let padded = b12x_padded_rows(cols);
+    let mut tiled = vec![0u8; padded * inner];
+    for col in 0..cols {
+        for k in 0..inner {
+            tiled[b12x_weight_index(col, k, inner)] = raw[col * inner + k];
+        }
+    }
+    tiled
+}
+
 /// The number of ue8m0 bytes an FP8 B12x scale buffer of this shape occupies: exactly the
 /// checkpoint's [ceil(rows/32), ceil(inner/32)] grid, padded to whole micro-tile rows. This is a
 /// different size from b12x_buffer_bytes, 32 times smaller for a full 32-row tile, and a stride
@@ -557,5 +589,32 @@ mod tests {
             &grouped[..lo_rank],
             "the first group must not depend on the second group's weights"
         );
+    }
+
+    #[test]
+    fn b12x_tile_weights_is_the_index_bijection_and_keeps_every_byte() {
+        for (cols, inner) in [(1usize, 32usize), (3, 64), (33, 32)] {
+            let raw: Vec<u8> = (0..cols * inner).map(|i| (i % 251) as u8).collect();
+            let tiled = b12x_tile_weights(&raw, cols, inner);
+            assert_eq!(tiled.len(), b12x_buffer_bytes(cols, inner));
+            for col in 0..cols {
+                for k in 0..inner {
+                    assert_eq!(
+                        tiled[b12x_weight_index(col, k, inner)],
+                        raw[col * inner + k],
+                        "tile ({col}, {k}) of {cols}x{inner}"
+                    );
+                }
+            }
+            let mut sorted = tiled.clone();
+            sorted.sort_unstable();
+            let mut expected = vec![0u8; b12x_buffer_bytes(cols, inner)];
+            expected[..raw.len()].copy_from_slice(&raw);
+            expected.sort_unstable();
+            assert_eq!(
+                sorted, expected,
+                "the transform is a permutation, not a rewrite"
+            );
+        }
     }
 }

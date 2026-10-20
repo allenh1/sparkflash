@@ -7,6 +7,8 @@
 //
 //   * stage 1 (indexer scoring) only scores high-speed-index tokens at or behind the query. A block
 //     whose first token is past the query publishes block_scores = -FLT_MAX and block_best = 0.
+//     The published block arrays are index head 0's: the frozen ABI carries one [hsi_blocks] pair,
+//     not one per index head, so only index head 0 writes it (its two query heads split the blocks).
 //     The base entry keeps its measured position-0 behaviour (unmasked); this entry exists so a
 //     per-position sequence caller can use block_best for candidate selection without leaking
 //     future tokens.
@@ -174,7 +176,7 @@ extern "C" __global__ void flash_mla_csa2_seq_sm121(
     const uint32_t window_rows,                      // engine format: window rows supplied, oldest first
     const uint32_t *__restrict__ selected,           // [selected_count] candidate position ids (2: absolute token positions)
     const __nv_bfloat16 *__restrict__ index_key,     // [hsi_blocks][8][index_head_dim]
-    const __nv_bfloat16 *__restrict__ index_query,   // [heads][index_head_dim]
+    const __nv_bfloat16 *__restrict__ index_query,   // [index_heads][index_head_dim]
     const float *__restrict__ sink,                  // [heads] additive per-head attention sink logit
     float *__restrict__ block_scores,                // [hsi_blocks] out: best score in the block
     uint32_t *__restrict__ block_best,               // [hsi_blocks] out: the token that scored it
@@ -189,7 +191,6 @@ extern "C" __global__ void flash_mla_csa2_seq_sm121(
     const uint32_t heads = (uint32_t)SPARK_M4_HEADS;
     // The indexer head that serves this query head: the two are different index spaces (64 query
     // heads, 32 indexer heads), so this division is required, not cosmetic.
-    const uint32_t index_head = head / (uint32_t)SPARK_M4_MLA_HEADS_PER_INDEX_HEAD;
 
     __shared__ float s_scores[SPARK_M4_MLA_MAX_ATTENDED];
     __shared__ float s_max;
@@ -228,7 +229,7 @@ extern "C" __global__ void flash_mla_csa2_seq_sm121(
         SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_CSA2_ATTN, t_enter);
     }
 
-    // Stage 1: score the HSI blocks for this head. Each block owns only its own block slot, so
+    // Stage 1: score the HSI blocks for index head 0. Each worker owns disjoint block slots, so
     // there is no cross-block communication and nothing to acquire here.
     if (lane == 0u) {
         s_max = -3.402823466e38f;
@@ -237,26 +238,32 @@ extern "C" __global__ void flash_mla_csa2_seq_sm121(
     __syncthreads();
     // The two query heads of one indexer head compute the same 128-wide dots over the same keys:
     // one indexer head serves both, and the index query is addressed by it, not by the query head.
-    // The pair therefore splits the pool instead of duplicating it. The even head takes the even
-    // HSI blocks and the odd head the odd ones, so every block is still written, by exactly one
-    // head of the pair, and the full-head launch (grid.x = SPARK_M4_HEADS) covers all 2,048. A
-    // partial launch would leave the other parity stale; that is a property of the pairing, and
-    // the fixed grid is what makes it safe.
-    const __nv_bfloat16 *query_row =
-        index_query + (uint64_t)index_head * SPARK_M4_INDEX_HEAD_DIM;
+    // block_scores/block_best are one [hsi_blocks] pair in the frozen ABI, so they can publish
+    // only ONE index head's scores. Every launch block cooperates on index head 0's query and owns
+    // a disjoint subset of the 2,048 blocks (block = worker, stride = worker count), so each block
+    // has exactly one writer and all blocks are covered. Publishing all 32 index heads into this
+    // single array was the race: whichever head wrote last won, and no head alone covered every
+    // block.
+    const __nv_bfloat16 *query_row = index_query;
     const uint32_t lane_in_warp = lane % SPARK_M4_MLA_WARP_LANES;
     const uint32_t warp = lane / SPARK_M4_MLA_WARP_LANES;
-    const uint32_t pair = head % (uint32_t)SPARK_M4_MLA_HEADS_PER_INDEX_HEAD;
-    const uint32_t pair_stride = (uint32_t)SPARK_M4_MLA_HEADS_PER_INDEX_HEAD;
-    const uint32_t blocks_per_slice = SPARK_M4_MLA_WARPS * pair_stride;
-    const uint32_t block_stride = gridDim.y * blocks_per_slice;
+    static_assert((uint32_t)SPARK_M4_HSI_BLOCKS %
+                      ((uint32_t)SPARK_M4_HEADS * SPARK_M4_MLA_WARPS) == 0u,
+                  "the fixed grid covers the index pool in whole rounds");
+    const uint32_t worker =
+        ((blockIdx.y * (uint32_t)SPARK_M4_HEADS + blockIdx.x) * SPARK_M4_MLA_WARPS) + warp;
+    const uint32_t block_stride = (uint32_t)SPARK_M4_HEADS * SPARK_M4_MLA_WARPS;
     const float q0 = __bfloat162float(query_row[lane_in_warp]);
     const float q1 = __bfloat162float(query_row[lane_in_warp + SPARK_M4_MLA_WARP_LANES]);
     const float q2 = __bfloat162float(query_row[lane_in_warp + 2u * SPARK_M4_MLA_WARP_LANES]);
     const float q3 = __bfloat162float(query_row[lane_in_warp + 3u * SPARK_M4_MLA_WARP_LANES]);
-    for (uint32_t block = blockIdx.y * blocks_per_slice + warp * pair_stride + pair;
-         block < (uint32_t)SPARK_M4_HSI_BLOCKS;
-         block += block_stride) {
+#pragma unroll
+    for (uint32_t round = 0u; round < ((uint32_t)SPARK_M4_HSI_BLOCKS / block_stride);
+         ++round) {
+        const uint32_t block = worker + round * block_stride;
+        if (block >= (uint32_t)SPARK_M4_HSI_BLOCKS) {
+            continue;
+        }
         // Position-causal indexer: only HSI tokens at or behind the query are scored. A block whose
         // first token is past the query publishes the empty result (-FLT_MAX, token 0), which is the
         // same "no attendable token" value a fully masked block would have. Without this mask the
@@ -292,6 +299,8 @@ extern "C" __global__ void flash_mla_csa2_seq_sm121(
                 }
             }
         }
+        // Each worker owns disjoint blocks, so every lane-0 write is single-writer and the
+        // published array is index head 0's scores for all 2,048 blocks.
         if (lane_in_warp == 0u) {
             block_scores[block] = best;
             block_best[block] = best_token;
@@ -503,6 +512,253 @@ extern "C" __global__ void flash_mla_csa2_seq_sm121(
         const uint32_t meta = (uint32_t)(SPARK_M4_MLA_LATENT * 2u);
         SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_CSA2_ATTN, layer_id, meta, t_enter);
         (void)heads;
+        (void)step_seq;
+    }
+    (void)t_enter;
+}
+// ---------------------------------------------------------------------------------------------
+// K8 batched sequence entry: ONE block per query head serves SIX consecutive positions. The
+// indexer's HSI key pool is read once and each key vector scores all six rows (six 128-wide dots),
+// which is the traffic win; stage 2 then runs the existing three-pass CSA-union attention six times
+// sequentially, one row at a time, reusing the same shared score array. Per-row arithmetic and
+// ordering are the scalar sequence entry's, so out[] and the block arrays are byte-identical per row.
+//
+// Batch-major layout, fixed six rows: q[6][heads][latent]; window_codes[6][window_rows][latent];
+// window_scales[6][window_rows][16]; selected[6][selected_count]; index_query[6][heads][128];
+// out[6][heads][latent]; block_scores/block_best[6][hsi_blocks]. The six positions are
+// position..position+5. This first cut requires the SAME window_rows and selected_count on every
+// row (the decode-verify case at position >= 127 has 128 window rows and one 512-id selected list
+// per row). The selected row stride is selected_count: pack the rows contiguously. A caller that
+// pads each row to a wider buffer must pass that padded width as selected_count and mask the
+// future/pad ids (the kernel already excludes candidate > that row's position), and pass the full
+// 128-row window for every row. OPEN ABI ITEM for K7: this is mandatory caller-side pad+mask, not
+// optional; a per-row window_rows/selected_count pointer pair is a follow-up symbol, not this v1.
+#define SPARK_M4_MLA_BATCH_ROWS 6u
+static_assert(SPARK_M4_MLA_BATCH_ROWS * SPARK_M4_MLA_MAX_ATTENDED <= 3840u,
+              "one row's score array is reused sequentially, so shared stays at one row");
+
+extern "C" __global__ void flash_mla_csa2_seq_batched_sm121(
+    const __nv_bfloat16 *__restrict__ q,             // [6][heads][latent]
+    const uint8_t *__restrict__ kv_fp4,              // [positions][latent/2]
+    const uint8_t *__restrict__ kv_scales,           // [positions][latent/16]
+    const uint8_t *__restrict__ window_codes,        // [6][window_rows][latent]
+    const uint8_t *__restrict__ window_scales,       // [6][window_rows][16]
+    const uint32_t window_kv_format,                 // must be 2 (CSA union)
+    const uint32_t window_rows,
+    const uint32_t *__restrict__ selected,           // [6][selected_count]
+    const __nv_bfloat16 *__restrict__ index_key,     // [hsi_blocks][8][index_head_dim]
+    const __nv_bfloat16 *__restrict__ index_query,   // [6][index_heads][index_head_dim]
+    const float *__restrict__ sink,                  // [heads]
+    float *__restrict__ block_scores,                // [6][hsi_blocks]
+    uint32_t *__restrict__ block_best,               // [6][hsi_blocks]
+    __nv_bfloat16 *__restrict__ out,                 // [6][heads][latent]
+    const uint32_t position,                         // base position; rows are position..position+5
+    const uint32_t selected_count,
+    GpuTraceRing *__restrict__ trace_ring,
+    const uint32_t layer_id,
+    const uint64_t step_seq) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+
+    __shared__ float s_scores[SPARK_M4_MLA_MAX_ATTENDED];
+    __shared__ float s_max;
+    __shared__ float s_sum;
+
+    if (window_kv_format != SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION ||
+        window_rows > (uint32_t)SPARK_M4_SWA_WINDOW ||
+        selected_count > (uint32_t)SPARK_M4_MLA_MAX_SELECTED ||
+        window_rows + selected_count > (uint32_t)SPARK_M4_MLA_MAX_ATTENDED) {
+        for (uint32_t r = 0u; r < SPARK_M4_MLA_BATCH_ROWS; ++r) {
+            for (uint32_t i = lane; i < SPARK_M4_MLA_LATENT; i += SPARK_M4_MLA_THREADS) {
+                out[(uint64_t)r * SPARK_M4_HEADS * SPARK_M4_MLA_LATENT +
+                    (uint64_t)head * SPARK_M4_MLA_LATENT + i] =
+                    __float2bfloat16_rn(__uint_as_float(0x7FC00000u));
+            }
+        }
+        return;
+    }
+
+    uint64_t t_enter = 0u;
+    if (head == 0u) {
+        SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_CSA2_ATTN, t_enter);
+    }
+
+    const uint32_t lane_in_warp = lane % SPARK_M4_MLA_WARP_LANES;
+    const uint32_t warp = lane / SPARK_M4_MLA_WARP_LANES;
+    static_assert((uint32_t)SPARK_M4_HSI_BLOCKS %
+                      ((uint32_t)SPARK_M4_HEADS * SPARK_M4_MLA_WARPS) == 0u,
+                  "the fixed grid covers the index pool in whole rounds");
+    const uint32_t worker =
+        ((blockIdx.y * (uint32_t)SPARK_M4_HEADS + blockIdx.x) * SPARK_M4_MLA_WARPS) + warp;
+    const uint32_t block_stride = (uint32_t)SPARK_M4_HEADS * SPARK_M4_MLA_WARPS;
+
+    // Six rows' four query fragments per lane, in registers; the key vector is loaded once below.
+    // The published block arrays are index head 0's, so every launch block loads index head 0's
+    // query row for the indexer; the attention below still uses each query head's own q row.
+    float qi[SPARK_M4_MLA_BATCH_ROWS][4];
+#pragma unroll
+    for (uint32_t r = 0u; r < SPARK_M4_MLA_BATCH_ROWS; ++r) {
+        const uint32_t base = lane_in_warp;
+        qi[r][0] = __bfloat162float(
+            index_query[(uint64_t)r * SPARK_M4_INDEX_HEADS * SPARK_M4_INDEX_HEAD_DIM + base]);
+        qi[r][1] = __bfloat162float(
+            index_query[(uint64_t)r * SPARK_M4_INDEX_HEADS * SPARK_M4_INDEX_HEAD_DIM +
+                        base + SPARK_M4_MLA_WARP_LANES]);
+        qi[r][2] = __bfloat162float(
+            index_query[(uint64_t)r * SPARK_M4_INDEX_HEADS * SPARK_M4_INDEX_HEAD_DIM +
+                        base + 2u * SPARK_M4_MLA_WARP_LANES]);
+        qi[r][3] = __bfloat162float(
+            index_query[(uint64_t)r * SPARK_M4_INDEX_HEADS * SPARK_M4_INDEX_HEAD_DIM +
+                        base + 3u * SPARK_M4_MLA_WARP_LANES]);
+    }
+
+    float best[SPARK_M4_MLA_BATCH_ROWS];
+    uint32_t best_token[SPARK_M4_MLA_BATCH_ROWS];
+
+#pragma unroll
+    for (uint32_t round = 0u; round < ((uint32_t)SPARK_M4_HSI_BLOCKS / block_stride);
+         ++round) {
+        const uint32_t block = worker + round * block_stride;
+        if (block >= (uint32_t)SPARK_M4_HSI_BLOCKS) {
+            continue;
+        }
+        // Each round's block is a fresh block; carrying the previous round's best into a future
+        // block was the batch-vs-scalar divergence (blocks 512+ re-published block 0..511).
+#pragma unroll
+        for (uint32_t r = 0u; r < SPARK_M4_MLA_BATCH_ROWS; ++r) {
+            best[r] = -3.402823466e38f;
+            best_token[r] = 0u;
+        }
+        const uint32_t first_token = block * SPARK_M4_HSI_BLOCK_TOKENS;
+        for (uint32_t slot = 0u; slot < (uint32_t)SPARK_M4_HSI_BLOCK_TOKENS; ++slot) {
+            const uint32_t token = first_token + slot;
+            if (token > position + (SPARK_M4_MLA_BATCH_ROWS - 1u)) {
+                break;
+            }
+            const __nv_bfloat16 *key_row =
+                index_key + ((uint64_t)block * SPARK_M4_HSI_BLOCK_TOKENS + slot) *
+                                SPARK_M4_INDEX_HEAD_DIM;
+            const float k0 = __bfloat162float(key_row[lane_in_warp]);
+            const float k1 = __bfloat162float(key_row[lane_in_warp + SPARK_M4_MLA_WARP_LANES]);
+            const float k2 = __bfloat162float(key_row[lane_in_warp + 2u * SPARK_M4_MLA_WARP_LANES]);
+            const float k3 = __bfloat162float(key_row[lane_in_warp + 3u * SPARK_M4_MLA_WARP_LANES]);
+#pragma unroll
+            for (uint32_t r = 0u; r < SPARK_M4_MLA_BATCH_ROWS; ++r) {
+                if (token <= position + r) {
+                    float score = qi[r][0] * k0 + qi[r][1] * k1 + qi[r][2] * k2 + qi[r][3] * k3;
+                    score = spark_mla_seq_warp_sum(score);
+                    if (lane_in_warp == 0u && score > best[r]) {
+                        best[r] = score;
+                        best_token[r] = token;
+                    }
+                }
+            }
+        }
+        // Disjoint worker blocks mean one writer per block, so the row arrays are deterministic.
+        if (lane_in_warp == 0u) {
+#pragma unroll
+            for (uint32_t r = 0u; r < SPARK_M4_MLA_BATCH_ROWS; ++r) {
+                block_scores[(uint64_t)r * SPARK_M4_HSI_BLOCKS + block] = best[r];
+                block_best[(uint64_t)r * SPARK_M4_HSI_BLOCKS + block] = best_token[r];
+            }
+        }
+    }
+    __syncthreads();
+
+    const uint32_t union_total = window_rows + selected_count;
+    for (uint32_t r = 0u; r < SPARK_M4_MLA_BATCH_ROWS; ++r) {
+        const uint32_t row_position = position + r;
+        const __nv_bfloat16 *q_row =
+            q + ((uint64_t)r * SPARK_M4_HEADS + head) * SPARK_M4_MLA_LATENT;
+        const uint8_t *row_window_codes =
+            window_codes + (uint64_t)r * window_rows * SPARK_M4_MLA_LATENT;
+        const uint8_t *row_window_scales = window_scales +
+            (uint64_t)r * window_rows * SPARK_M4_MLA_WINDOW_SCALES;
+        const uint32_t *row_selected = selected + (uint64_t)r * selected_count;
+        __nv_bfloat16 *row_out =
+            out + ((uint64_t)r * SPARK_M4_HEADS + head) * SPARK_M4_MLA_LATENT;
+
+        for (uint32_t slot = lane; slot < union_total; slot += SPARK_M4_MLA_THREADS) {
+            float score = 0.0f;
+            if (slot < window_rows) {
+                for (uint32_t i = 0u; i < SPARK_M4_MLA_LATENT; ++i) {
+                    score += __bfloat162float(q_row[i]) *
+                             spark_mla_seq_load_window_stored(
+                                 row_window_codes, row_window_scales, slot, i);
+                }
+                score *= SPARK_M4_MLA_SCORE_SCALE;
+            } else {
+                const uint32_t candidate = row_selected[slot - window_rows];
+                if (spark_mla_seq_union_attends(row_position, candidate) != 0u) {
+                    for (uint32_t i = 0u; i < SPARK_M4_MLA_LATENT; ++i) {
+                        const float key = spark_mla_seq_load_latent(
+                                              kv_fp4 + (uint64_t)candidate *
+                                                           (SPARK_M4_MLA_LATENT / 2u), i) *
+                                          spark_mla_seq_scale(
+                                              kv_scales + (uint64_t)candidate *
+                                                              (SPARK_M4_MLA_LATENT /
+                                                               SPARK_M4_KV_SCALE_CHANNELS),
+                                              i);
+                        score += __bfloat162float(q_row[i]) * key;
+                    }
+                    score *= SPARK_M4_MLA_SCORE_SCALE;
+                } else {
+                    score = -3.402823466e38f;
+                }
+            }
+            s_scores[slot] = score;
+        }
+        __syncthreads();
+        float local_max = -3.402823466e38f;
+        for (uint32_t slot = lane; slot < union_total; slot += SPARK_M4_MLA_THREADS) {
+            local_max = s_scores[slot] > local_max ? s_scores[slot] : local_max;
+        }
+        local_max = spark_block_max(local_max, lane, SPARK_M4_MLA_THREADS);
+        if (lane == 0u) {
+            s_max = local_max;
+        }
+        __syncthreads();
+        float local_sum = lane == 0u ? spark_exp(sink[head] - s_max) : 0.0f;
+        for (uint32_t slot = lane; slot < union_total; slot += SPARK_M4_MLA_THREADS) {
+            const float probability = spark_exp(s_scores[slot] - s_max);
+            s_scores[slot] = __bfloat162float(__float2bfloat16_rn(probability));
+            local_sum += probability;
+        }
+        local_sum = spark_block_sum(local_sum, lane, SPARK_M4_MLA_THREADS);
+        if (lane == 0u) {
+            s_sum = local_sum > 0.0f ? local_sum : 1.0f;
+        }
+        __syncthreads();
+        for (uint32_t i = lane; i < SPARK_M4_MLA_LATENT; i += SPARK_M4_MLA_THREADS) {
+            float acc = 0.0f;
+            for (uint32_t slot = 0u; slot < union_total; ++slot) {
+                if (slot < window_rows) {
+                    acc += s_scores[slot] *
+                           spark_mla_seq_load_window_stored(
+                               row_window_codes, row_window_scales, slot, i);
+                } else {
+                    const uint32_t candidate = row_selected[slot - window_rows];
+                    if (spark_mla_seq_union_attends(row_position, candidate) != 0u) {
+                        const float value = spark_mla_seq_load_latent(
+                                                kv_fp4 + (uint64_t)candidate *
+                                                             (SPARK_M4_MLA_LATENT / 2u), i) *
+                                            spark_mla_seq_scale(
+                                                kv_scales + (uint64_t)candidate *
+                                                                (SPARK_M4_MLA_LATENT /
+                                                                 SPARK_M4_KV_SCALE_CHANNELS),
+                                                i);
+                        acc += s_scores[slot] * value;
+                    }
+                }
+            }
+            row_out[i] = __float2bfloat16_rn(acc / s_sum);
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0u) {
+        const uint32_t meta = (uint32_t)(SPARK_M4_MLA_LATENT * 2u);
+        SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_CSA2_ATTN, layer_id, meta, t_enter);
         (void)step_seq;
     }
     (void)t_enter;

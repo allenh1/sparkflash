@@ -301,7 +301,7 @@ pub mod cuda {
         cuda.copy_htod(&dgate, &gate)?;
         cuda.copy_htod(&dbias, &bias)?;
 
-        let (module, kernel) = router_launch::load(&cuda, &cubin)?;
+        let (module, kernel, topk_module, topk) = router_launch::load(&cuda, &cubin)?;
         let params = RouterLaunchParams {
             x: dx,
             gate: dgate,
@@ -314,8 +314,9 @@ pub mod cuda {
             layer_id: 0,
             step_seq: 0,
         };
-        // One launch; the typed helper synchronises, so a returned Ok means the kernel completed.
-        router_launch::launch(&cuda, kernel, &params)?;
+        // Two launches (scores, then top-6); the typed helper synchronises each, so a returned Ok
+        // means both kernels completed.
+        router_launch::launch(&cuda, kernel, topk, &params)?;
 
         let mut ids = vec![0u8; ids_len];
         let mut weights = vec![0u8; weights_len];
@@ -327,13 +328,14 @@ pub mod cuda {
         let outputs = outputs_digest(&ids, &weights, &scores);
 
         cuda.free(module, &allocations);
+        cuda.free(topk_module, &[]);
         drop(cuda);
 
         Ok(ExecutionEvidence {
             kernel: router_abi::ROUTER_KERNEL,
             cubin_sha256: sha,
             cubin_bytes: cubin.len(),
-            launches: 1,
+            launches: 2,
             tokens: TOKENS,
             outputs_sha256: hex(&outputs),
         })
@@ -375,7 +377,8 @@ pub mod cuda {
 
         #[test]
         fn a_wrong_cubin_is_refused_by_the_pin_before_the_driver_is_opened() {
-            // 37,384 bytes of zeros have the pinned size but not the pinned sha256. The pin check
+            // Zeros padded to the pinned size have the pinned length but not the pinned sha256. The
+            // pin check
             // in `prove` runs before `Cuda::load`, so this stays a CPU-only test and a changed
             // cubin can never reach the driver.
             let dir = tempfile::tempdir().expect("a temporary directory");
@@ -385,7 +388,12 @@ pub mod cuda {
             let session = CudaSession::new(&path);
             let error = session.open().expect_err("the sha does not match the pin");
             assert!(error.detail().contains("not the pinned"), "{error}");
-            assert!(error.detail().contains("37384"), "{error}");
+            assert!(
+                error
+                    .detail()
+                    .contains(&router_abi::CUBIN_BYTES.to_string()),
+                "{error}"
+            );
             assert!(!error.detail().contains("MemAvailable"), "{error}");
             assert!(session.execution().is_none());
         }

@@ -118,7 +118,7 @@ use sparkflash_device::CudaSession;
 use sparkflash_device::{DeviceEngine, DeviceSession, FakeSession};
 use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::forward::{InferenceEngine, Sampling, SequenceState, StepOutput};
-use sparkflash_engine::linalg::{CHECKPOINT_TENSOR_LIMIT, REFERENCE_TENSOR_LIMIT};
+use sparkflash_engine::linalg::{CHECKPOINT_TENSOR_LIMIT, REFERENCE_TENSOR_LIMIT, argmax};
 use sparkflash_engine::loader::ReferenceWeights;
 use sparkflash_engine::synthetic::SyntheticWeights;
 use sparkflash_engine::tensor::{TensorPlan, TensorSpec};
@@ -808,6 +808,10 @@ enum Weights {
         /// The index file describing them.
         index: PathBuf,
     },
+    /// Test-only: every weight byte is zero, so the forward's logits are finite (all-zero) and the
+    /// acceptance rule has a genuinely measurable served path without a checkpoint.
+    #[cfg(test)]
+    Zero,
     /// Test-only: a source that panics once on one named tensor, so the per-request panic guard can
     /// be exercised. Compiled only into test builds that unwind; a shipped binary has the two
     /// variants above and nothing else.
@@ -1372,6 +1376,11 @@ fn finished_event_with_fabric(
     fabric_mode: &str,
 ) -> EngineEvent {
     let completion_tokens = summary.completion_tokens;
+    let dspark = summary.dspark;
+    let mut stats = request_stats_with_fabric(prompt_tokens, summary.timing, fabric_mode);
+    // The reference driver counts the engine's real MTP drafts against the target tokens it
+    // actually emitted; the TP=4 driver has no draft source yet and carries the default zero.
+    stats.dspark_speculative = dspark;
     EngineEvent::Finished {
         finish_reason: summary.finish_reason,
         usage: OpenAiUsageWithCache {
@@ -1388,21 +1397,20 @@ fn finished_event_with_fabric(
                 image_tokens: 0,
             },
             completion_tokens_details: CompletionTokensDetails {
-                // The reference engine drafts tokens in its MTP stages and this driver never
-                // verifies one, so nothing was proposed, accepted or rejected. A zero here means
-                // "not attempted", which is exactly what happened.
+                // The MTP drafter proposed real draft tokens and the acceptance rule above replayed
+                // the target against them. A gated candidate is counted as rejected here because it
+                // was proposed and not accepted; the confidence-gated subtotal is in the DSpark
+                // telemetry block instead.
                 reasoning_tokens: 0,
-                accepted_prediction_tokens: 0,
-                rejected_prediction_tokens: 0,
+                accepted_prediction_tokens: dspark.draft_tokens_accepted,
+                rejected_prediction_tokens: dspark
+                    .draft_tokens_proposed
+                    .saturating_sub(dspark.draft_tokens_accepted),
             },
             prompt_cache_hit_tokens: 0,
             prompt_cache_miss_tokens: prompt_tokens,
         },
-        stats: Box::new(request_stats_with_fabric(
-            prompt_tokens,
-            summary.timing,
-            fabric_mode,
-        )),
+        stats: Box::new(stats),
     }
 }
 
@@ -1435,7 +1443,8 @@ fn request_stats_with_fabric(
         // The forward pass owns its Engram counters and the engine API exposes none of them, so
         // this process cannot report a non-zero one.
         engram_layers: default_engram_layers(),
-        // One token at a time, with no draft verification: there is no speculative accounting.
+        // The reference path overwrites this with the request's measured MTP acceptance counters;
+        // the TP=4 path has no draft source and keeps the honest default zero.
         dspark_speculative: DSparkStepStats::default(),
         // The reference path passes "" (its existing bytes); the TP=4 path passes its honest
         // fabric label. No rail byte counter or NCCL call is invented on either path.
@@ -1910,6 +1919,173 @@ struct RunSummary {
     finish_reason: FinishReason,
     /// The wall-clock numbers measured for this request.
     timing: RequestTiming,
+    /// The real MTP-draft acceptance counters for this request.
+    dspark: DSparkStepStats,
+}
+
+/// Counts the real DSpark acceptance rule over the MTP drafts this driver produced.
+///
+/// The draft tokens are the engine's `StepOutput.draft`: the anchor (already emitted) followed by
+/// the MTP stages' sampled candidates. For a token index `t`, the block anchored at `t` predicts
+/// `t + 1`, `t + 2`, ...; the acceptance prefix is the longest run of candidates that equals the
+/// target's argmax at that position. The first mismatch is the target's bonus token, and the next
+/// block starts there. A block whose candidates all match ends at the token after the last one,
+/// which is the bonus token too.
+///
+/// This is the whole five-position rule from the investigation's section 3.1. It deliberately does
+/// not consult the scheduler's confidence cap: that cap is `sparkflash-scheduler::dspark` policy for
+/// choosing how many rows to forward, not part of the target's accept rule. The serving path has the
+/// target's real continuation, so it compares every MTP candidate and reports
+/// `draft_tokens_confidence_gated` as zero (nothing was masked).
+///
+/// The engine still decodes one token per step, so this is an accounting overlay on the target's
+/// real continuation, not a second forward pass. It is the same comparison the speculative loop
+/// would make: every acceptance counted here is a position where the MTP draft matched the target's
+/// own argmax.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct SpeculativeAccounting {
+    target_verify_steps: usize,
+    draft_tokens_proposed: usize,
+    draft_tokens_accepted: usize,
+    /// Every draft row offered to the prefix walk, whether or not the target row was finite. This
+    /// is the evidence denominator: it must not shrink when a non-finite row refuses a block.
+    rows_seen: usize,
+    /// Set when any target row was not finite. Kept separately from the row list because a
+    /// non-finite anchor row has no draft row to name.
+    nonfinite_seen: bool,
+    /// 0-based draft-row ids whose target row was not finite. The ids are in the same draft-row
+    /// space as `rows_seen`/`draft_tokens_accepted` (anchor excluded); an anchor-only non-finite row
+    /// is represented by `accept_status=nonfinite` with an empty list.
+    nonfinite_rows: Vec<usize>,
+    active: Option<ActiveDraft>,
+}
+
+/// One draft block being replayed against the token stream.
+#[derive(Debug, Clone, PartialEq)]
+struct ActiveDraft {
+    /// Every MTP draft position in the block, in order.
+    candidates: Vec<u32>,
+    /// How many of those candidates have matched so far.
+    matched: usize,
+}
+
+impl SpeculativeAccounting {
+    /// Adds one target argmax position and the MTP block anchored at that position.
+    ///
+    /// `candidates` is `StepOutput.draft[1..]`; it is empty when the step had no draft (the prefill
+    /// that starts a sequence, for example). Every candidate is checked: the confidence cap is not
+    /// an acceptance input on this path, so `draft_tokens_confidence_gated` stays zero.
+    fn observe_token(&mut self, target: u32, candidates: &[u32]) {
+        let mut start_block_here = self.active.is_none();
+        if let Some(active) = self.active.as_mut() {
+            if active.candidates.is_empty() {
+                // The block had no draft rows; the current token is the bonus token and the block
+                // for it can start now.
+                self.draft_tokens_accepted += active.matched;
+                self.active = None;
+                start_block_here = true;
+            } else if active.candidates[active.matched] == target {
+                active.matched += 1;
+                if active.matched == active.candidates.len() {
+                    // The last candidate was accepted. The current position *is* that candidate;
+                    // the next block starts at the following (bonus) token.
+                    self.draft_tokens_accepted += active.matched;
+                    self.active = None;
+                    start_block_here = false;
+                }
+            } else {
+                // The current position is the bonus token: the first draft that did not match.
+                // The next block is anchored here.
+                self.draft_tokens_accepted += active.matched;
+                self.active = None;
+                start_block_here = true;
+            }
+        }
+        if start_block_here && !candidates.is_empty() {
+            self.target_verify_steps += 1;
+            self.draft_tokens_proposed += candidates.len();
+            self.rows_seen += candidates.len();
+            self.active = Some(ActiveDraft {
+                candidates: candidates.to_vec(),
+                matched: 0,
+            });
+        }
+    }
+
+    /// Refuses a position whose target logits are not finite.
+    ///
+    /// A NaN or infinity cannot equal a draft token and cannot anchor a target step. The finite
+    /// prefix before this position still stands, but this row and every later position in its block
+    /// are not accepted, no block is started from the poisoned position, and the index is recorded
+    /// for the request's acceptance evidence.
+    fn observe_nonfinite(&mut self, candidates: &[u32]) {
+        self.nonfinite_seen = true;
+        // The row that failed is the active block's next draft row. If no block is active the
+        // poisoned row is the anchor itself, which has no draft-row id; the status still flags it.
+        if let Some(active) = self.active.as_ref() {
+            self.nonfinite_rows.push(active.matched);
+        }
+        // The rows offered at this position are part of the denominator before the non-finite check.
+        self.rows_seen += candidates.len();
+        // Commit the finite prefix that had already matched; the poisoned row itself is never
+        // counted as accepted. The block anchored here is not proposed: a non-finite target row
+        // cannot verify it.
+        if let Some(active) = self.active.take() {
+            self.draft_tokens_accepted += active.matched;
+        }
+    }
+
+    /// The one evidence line the served request emits after the guard has run.
+    ///
+    /// The canonical public convention is drafts-only: `accept_rows_seen` counts the MTP draft rows
+    /// offered (the already-emitted anchor is excluded), `accept_committed_tokens` counts the draft
+    /// rows in the finite prefix, and `accept_nonfinite_rows` carries 0-based draft-row ids in that
+    /// same space. An anchor-only non-finite row has no draft-row id, so it is `nonfinite` with an
+    /// empty list. The device acceptance path keeps the anchor as row 0 internally; its evidence
+    /// boundary converts once (subtract the anchor from `rows_seen`/`committed_tokens` and rebase
+    /// the non-finite row ids). The `accept_rows_convention=drafts_only` marker makes that
+    /// conversion explicit: a row without it, or with a different value, must not be compared to
+    /// this one. The values are derived in this method only, so they cannot disagree.
+    fn evidence_line(&self) -> String {
+        let status = if self.nonfinite_seen {
+            "nonfinite"
+        } else {
+            "accepted"
+        };
+        format!(
+            "accept_status={status} accept_nonfinite_rows={:?} accept_rows_seen={} accept_committed_tokens={} accept_rows_convention=drafts_only",
+            self.nonfinite_rows, self.rows_seen, self.draft_tokens_accepted
+        )
+    }
+
+    /// Commits a block still open when generation stops.
+    fn finish(&mut self) {
+        if let Some(active) = self.active.take() {
+            self.draft_tokens_accepted += active.matched;
+        }
+    }
+
+    /// The telemetry counters, with the rates derived by the API type.
+    fn stats(&self) -> DSparkStepStats {
+        DSparkStepStats::from_counts(
+            self.target_verify_steps,
+            self.draft_tokens_proposed,
+            0,
+            self.draft_tokens_accepted,
+        )
+    }
+}
+
+/// The target row's argmax, or `None` when any logit is NaN or infinite.
+///
+/// A non-finite row cannot accept a draft and cannot anchor a target step. Returning `None` here
+/// keeps every acceptance comparison away from NaN semantics (where `NaN != NaN` and a malformed
+/// row could otherwise look like a mismatch or, worse, a match).
+fn finite_target_argmax(logits: &[f32]) -> Option<u32> {
+    if !logits.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    argmax(logits).map(|index| index as u32)
 }
 
 /// The wall-clock numbers one request measured.
@@ -2039,6 +2215,11 @@ fn build_engine(recipe: &Recipe, element_limit: usize) -> Result<InferenceEngine
     let plan = TensorPlan::language_model(&recipe.config);
     let source: Box<dyn WeightSource> = match &recipe.weights {
         Weights::Synthetic { seed } => Box::new(SyntheticWeights::from_plan(&plan, *seed)),
+        #[cfg(test)]
+        Weights::Zero => Box::new(ZeroWeights(SyntheticWeights::from_plan(
+            &plan,
+            SYNTHETIC_WEIGHT_SEED,
+        ))),
         Weights::Checkpoint { dir, index } => {
             // The reference pass decodes the *stored* forms: `wo_a` is F8E4M3 plus its own scale
             // grid, exactly as the plan names it. [ReferenceWeights] is the source that serves
@@ -2489,8 +2670,25 @@ fn run_request(
     let mut next = prefill.next_token;
     let mut completion_tokens = 0usize;
     let mut ttft: Option<Duration> = None;
+    let mut dspark = SpeculativeAccounting::default();
+    // The MTP block anchored at the token the next iteration will emit. A fresh prefill drafts
+    // nothing; a chunked prefill that ended past position 0 does have a real block for the first
+    // generated token, so it starts from that step's draft instead of throwing it away.
+    let mut drafts_for_next = prefill
+        .draft
+        .get(1..)
+        .map_or_else(Vec::new, <[u32]>::to_vec);
     while completion_tokens < job.max_tokens {
         let Some(token) = next else { break };
+        // The accept rule compares a draft with the target's argmax, not with the sampled token.
+        // They are the same at temperature 0; at any temperature the rule's input is the argmax.
+        // A non-finite row has no valid argmax: it closes the finite prefix and is never allowed to
+        // accept a draft or anchor the next block.
+        if let Some(target_argmax) = finite_target_argmax(&logits) {
+            dspark.observe_token(target_argmax, &drafts_for_next);
+        } else {
+            dspark.observe_nonfinite(&drafts_for_next);
+        }
         if ttft.is_none() {
             ttft = Some(request_started.elapsed());
         }
@@ -2531,7 +2729,16 @@ fn run_request(
         })?;
         logits = step.logits;
         next = step.next_token;
+        // `draft[0]` is the anchor, which is the `next` token this step just sampled; only the
+        // candidates after it are drafts the target has to accept. No token from the scheduler's
+        // old philox path exists here: the MTP forward is the only producer.
+        drafts_for_next = step.draft.get(1..).map_or_else(Vec::new, <[u32]>::to_vec);
     }
+    dspark.finish();
+    // The batch-19 evidence reader keys on the engine acceptance contract's names. The line is
+    // emitted on both paths: `accepted` keeps the shape uniform, `nonfinite` names the poisoned
+    // rows and never claims their drafts were accepted.
+    eprintln!("sparkflash serve: {}", dspark.evidence_line());
     let elapsed = request_started.elapsed();
     let timing = RequestTiming::measure(
         job.prompt_tokens.len(),
@@ -2553,6 +2760,7 @@ fn run_request(
             completion_tokens,
             finish_reason,
             timing,
+            dspark: dspark.stats(),
         })))
         .map_err(|_| "the client stopped reading this response".to_owned())?;
     Ok(())
@@ -3145,6 +3353,9 @@ fn run_tp4_request(
             completion_tokens,
             finish_reason,
             timing,
+            // The TP=4 driver has no draft source in this slice, so it reports the honest zero:
+            // no MTP draft was proposed, accepted or gated on the four-rank arm.
+            dspark: DSparkStepStats::default(),
         })))
         .map_err(|_| "the client stopped reading this response".to_owned())?;
     Ok(())
@@ -3477,6 +3688,32 @@ async fn bind_and_serve(router: axum::Router, requested: SocketAddr) -> ExitCode
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// A test-only weight source whose every tensor is zero.
+///
+/// The synthetic byte generator produces random bit patterns, and in the tiny plan those decode to
+/// all-NaN logits; that is useful for the non-finite guard but useless for measuring acceptance.
+/// Zero weights keep every forward value finite (all-zero logits, all-zero drafts), so a served
+/// request exercises the real acceptance comparison and produces a non-zero accepted count without
+/// a checkpoint. It is `#[cfg(test)]` only: nothing a shipped binary builds can construct it.
+#[cfg(test)]
+struct ZeroWeights(SyntheticWeights);
+
+#[cfg(test)]
+impl WeightSource for ZeroWeights {
+    fn names(&self) -> Vec<String> {
+        self.0.names()
+    }
+
+    fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
+        self.0.spec(name)
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+        let spec = self.0.spec(name)?;
+        Ok(vec![0; spec.storage_bytes() as usize])
+    }
 }
 
 /// A weight source that panics once, on the first read of one named tensor.
@@ -4985,6 +5222,11 @@ mod tests {
     use sparkflash_api::encoding::reference_tokenizer_path;
 
     /// A driver over the synthetic tiny plan: the path every behavioural test takes.
+    ///
+    /// Its random weight bytes decode to all-NaN logits in the tiny plan, which is useful for the
+    /// non-finite guard but not for measuring acceptance. **Any synthetic test that asserts a
+    /// non-zero DSpark accepted count must use [`zero_driver`] instead**; a non-zero assertion here
+    /// would only be measuring a NaN argmax.
     fn synthetic_driver(max_tokens: usize) -> ReferenceDriver {
         let recipe = Recipe {
             config: ModelConfig::tiny(),
@@ -4996,6 +5238,20 @@ mod tests {
         };
         ReferenceDriver::start(&recipe, REFERENCE_TENSOR_LIMIT, max_tokens)
             .expect("the synthetic driver starts")
+    }
+
+    /// A driver over the tiny plan with every weight zero: finite logits, so acceptance is real.
+    /// This is the only synthetic driver a test may use when it asserts a non-zero accepted count;
+    /// see [`synthetic_driver`] for why the random-weight source cannot support that assertion.
+    fn zero_driver(max_tokens: usize) -> ReferenceDriver {
+        let recipe = Recipe {
+            config: ModelConfig::tiny(),
+            weights: Weights::Zero,
+            tokenizer: reference_tokenizer_path(),
+            engram_dir: None,
+        };
+        ReferenceDriver::start(&recipe, REFERENCE_TENSOR_LIMIT, max_tokens)
+            .expect("the zero-weight driver starts")
     }
 
     /// A driver whose weight source panics on one tensor: the guard's only way in.
@@ -5146,11 +5402,243 @@ mod tests {
         assert_eq!(usage.prompt_tokens_details.uma_cached_tokens, 0);
         assert_eq!(stats.kv_cache.global_kv_cached_tokens, 0);
         assert_eq!(stats.kv_cache_hit_rate, 0.0);
-        // No image was accepted, no draft was verified, no collective ran, no rank was visible.
+        // No image was accepted, no collective ran, no rank was visible.
         assert_eq!(usage.prompt_tokens_details.image_tokens, 0);
-        assert_eq!(stats.dspark_speculative, DSparkStepStats::default());
         assert_eq!(stats.transport, RoceTransportStats::default());
         assert_eq!(stats.timing.min_rank_uma_free_gib, 0.0);
+        // The synthetic tiny engine's random weights decode to all-NaN logits. The non-finite guard
+        // must refuse every acceptance position, so these counters are the honest zeros, and the
+        // rejected count cannot invent a draft either.
+        assert_eq!(stats.dspark_speculative, DSparkStepStats::default());
+        assert_eq!(
+            usage.completion_tokens_details.accepted_prediction_tokens,
+            0
+        );
+        assert_eq!(
+            usage.completion_tokens_details.rejected_prediction_tokens,
+            0
+        );
+    }
+
+    /// The acceptance rule is the longest matching draft prefix: three matches, then the target's
+    /// own token is the bonus. The accounting must count exactly those three, not the whole block.
+    #[test]
+    fn dspark_accounting_replays_the_acceptance_rule_on_mtp_drafts() {
+        let mut accounting = SpeculativeAccounting::default();
+        accounting.observe_token(10, &[]);
+        accounting.observe_token(11, &[12, 13, 14]);
+        accounting.observe_token(12, &[]);
+        accounting.observe_token(13, &[]);
+        accounting.observe_token(14, &[]);
+        accounting.observe_token(99, &[]);
+        accounting.finish();
+        assert_eq!(accounting.target_verify_steps, 1);
+        assert_eq!(accounting.draft_tokens_proposed, 3);
+        assert_eq!(accounting.draft_tokens_accepted, 3);
+        let stats = accounting.stats();
+        assert_eq!(stats.draft_tokens_accepted, 3);
+        assert_eq!(stats.draft_tokens_confidence_gated, 0);
+        assert_eq!(stats.acceptance_rate, 1.0);
+        assert_eq!(stats.mean_tokens_per_verify_step, 4.0);
+    }
+
+    /// A mismatch ends the block: the mismatching token is the bonus token, and the next block is
+    /// anchored there. The rejected candidates in the old block stay rejected.
+    #[test]
+    fn dspark_accounting_starts_the_next_block_at_the_bonus_token() {
+        let mut accounting = SpeculativeAccounting::default();
+        accounting.observe_token(10, &[]);
+        accounting.observe_token(11, &[12, 99, 14]);
+        accounting.observe_token(12, &[]);
+        accounting.observe_token(77, &[13]);
+        accounting.observe_token(13, &[]);
+        accounting.observe_token(14, &[]);
+        accounting.finish();
+        assert_eq!(accounting.target_verify_steps, 2);
+        assert_eq!(accounting.draft_tokens_proposed, 4);
+        assert_eq!(accounting.draft_tokens_accepted, 2);
+    }
+
+    /// Every candidate is checked; the scheduler's confidence cap is not part of the accept rule, so
+    /// a five-of-five match is five accepted tokens.
+    #[test]
+    fn dspark_accounting_accepts_every_matching_position() {
+        let mut accounting = SpeculativeAccounting::default();
+        accounting.observe_token(10, &[]);
+        accounting.observe_token(11, &[12, 13, 14, 15, 16]);
+        for token in 12..=16 {
+            accounting.observe_token(token, &[]);
+        }
+        accounting.observe_token(99, &[]);
+        accounting.finish();
+        assert_eq!(accounting.target_verify_steps, 1);
+        assert_eq!(accounting.draft_tokens_proposed, 5);
+        assert_eq!(accounting.draft_tokens_accepted, 5);
+        assert_eq!(accounting.stats().draft_tokens_confidence_gated, 0);
+    }
+
+    /// NaN and infinity are never valid target rows: neither is an argmax the accept rule may use.
+    #[test]
+    fn finite_target_argmax_refuses_nan_and_infinity() {
+        assert_eq!(finite_target_argmax(&[0.1, 0.2]), Some(1));
+        assert_eq!(finite_target_argmax(&[f32::NAN, 0.2]), None);
+        assert_eq!(finite_target_argmax(&[0.1, f32::INFINITY]), None);
+        assert_eq!(finite_target_argmax(&[0.1, f32::NEG_INFINITY]), None);
+        assert_eq!(finite_target_argmax(&[]), None);
+    }
+
+    /// A non-finite target row truncates the prefix: the finite matches before it stand, the row
+    /// itself is never accepted, no block starts from it, and the evidence carries its index.
+    #[test]
+    fn dspark_accounting_truncates_at_a_nonfinite_target_row() {
+        let mut accounting = SpeculativeAccounting::default();
+        accounting.observe_token(10, &[]);
+        accounting.observe_token(11, &[12, 13]);
+        accounting.observe_token(12, &[]);
+        accounting.observe_nonfinite(&[]);
+        accounting.observe_token(13, &[]);
+        accounting.observe_nonfinite(&[15]);
+        accounting.finish();
+        assert_eq!(accounting.target_verify_steps, 1);
+        assert_eq!(accounting.draft_tokens_proposed, 2);
+        assert_eq!(accounting.draft_tokens_accepted, 1);
+        assert_eq!(accounting.rows_seen, 3);
+        assert_eq!(
+            accounting.nonfinite_rows,
+            [1],
+            "the active block failed on its second draft row"
+        );
+        assert_eq!(
+            accounting.evidence_line(),
+            "accept_status=nonfinite accept_nonfinite_rows=[1] accept_rows_seen=3 accept_committed_tokens=1 accept_rows_convention=drafts_only"
+        );
+        assert_eq!(accounting.stats().acceptance_rate, 0.5);
+    }
+
+    /// A block that starts at token `t` must not be compared against `t` itself: the token is the
+    /// block's anchor, and the block's first draft predicts `t + 1`. This pins the `active.is_none()`
+    /// start-then-compare state machine, so an apparent off-by-one cannot be introduced silently by
+    /// comparing during the start step. (The random-weight and zero-weight synthetic models both
+    /// hide that class of bug, which is why the invariant is tested directly.)
+    #[test]
+    fn a_new_block_is_started_at_its_anchor_without_comparing_the_anchor() {
+        let mut accounting = SpeculativeAccounting::default();
+        // Iteration 0 has no previous block: an empty candidate list must contribute no rows seen
+        // and must not leave an active block behind.
+        accounting.observe_token(10, &[]);
+        assert_eq!(accounting.rows_seen, 0);
+        assert!(accounting.active.is_none());
+
+        // Token 11 is now the anchor; the block's draft rows are 12 and 13 and are only compared
+        // from token 12 onward. `rows_seen` is the offered-row denominator, so the block's rows are
+        // in it as soon as the block starts, but no row has been accepted at the anchor.
+        accounting.observe_token(11, &[12, 13]);
+        assert_eq!(accounting.draft_tokens_accepted, 0);
+        assert_eq!(accounting.rows_seen, 2);
+        let active = accounting.active.as_ref().expect("the block started");
+        assert_eq!(active.matched, 0, "the anchor was compared to a draft row");
+
+        accounting.observe_token(12, &[]);
+        assert_eq!(accounting.draft_tokens_accepted, 0);
+        assert_eq!(
+            accounting.active.as_ref().expect("still active").matched,
+            1,
+            "the first draft row is compared against token 12, not the anchor"
+        );
+
+        accounting.observe_token(13, &[]);
+        assert_eq!(accounting.draft_tokens_accepted, 2);
+        assert!(accounting.active.is_none());
+    }
+
+    /// The finite path uses the same four acceptance keys plus the convention marker and reports
+    /// the full prefix.
+    #[test]
+    fn dspark_accounting_accepts_a_full_prefix_with_uniform_evidence() {
+        let mut accounting = SpeculativeAccounting::default();
+        accounting.observe_token(10, &[]);
+        accounting.observe_token(11, &[12, 13]);
+        accounting.observe_token(12, &[]);
+        accounting.observe_token(13, &[]);
+        accounting.finish();
+        assert_eq!(
+            accounting.evidence_line(),
+            "accept_status=accepted accept_nonfinite_rows=[] accept_rows_seen=2 accept_committed_tokens=2 accept_rows_convention=drafts_only"
+        );
+    }
+
+    /// A non-finite row before any block starts cannot promote an active draft into acceptance.
+    #[test]
+    fn dspark_accounting_does_not_start_a_block_from_a_nonfinite_row() {
+        let mut accounting = SpeculativeAccounting::default();
+        accounting.observe_nonfinite(&[]);
+        accounting.observe_token(11, &[12, 13]);
+        accounting.observe_token(12, &[]);
+        accounting.observe_token(13, &[]);
+        accounting.finish();
+        assert_eq!(accounting.target_verify_steps, 1);
+        assert_eq!(accounting.draft_tokens_accepted, 2);
+        assert!(
+            accounting.nonfinite_rows.is_empty(),
+            "an anchor-only non-finite row has no draft-row id"
+        );
+        assert!(accounting.nonfinite_seen);
+        assert!(
+            accounting
+                .evidence_line()
+                .starts_with("accept_status=nonfinite accept_nonfinite_rows=[]")
+        );
+    }
+
+    /// A served request with finite logits reports the acceptance rule's count, not a hardcoded
+    /// zero. The zero-weight model has all-zero logits and all-zero MTP drafts, so every candidate
+    /// matches and the count is measured on the real serving path; the assertions compare the usage
+    /// block with the telemetry counters, not with a constant.
+    #[tokio::test]
+    async fn a_served_request_reports_the_real_mtp_acceptance_count() {
+        let driver = zero_driver(128);
+        let stream = events(&driver, request(&[1, 2, 3], 128, 0.0, 0)).await;
+        let Some(EngineEvent::Finished { usage, stats, .. }) = stream.last() else {
+            panic!("the stream did not finish: {stream:?}");
+        };
+        let dspark = stats.dspark_speculative;
+        assert!(
+            dspark.draft_tokens_accepted > 0,
+            "a 128-token finite request must accept at least one MTP draft: {dspark:?}"
+        );
+        assert_eq!(
+            usage.completion_tokens_details.accepted_prediction_tokens,
+            dspark.draft_tokens_accepted
+        );
+        assert_eq!(
+            usage.completion_tokens_details.rejected_prediction_tokens,
+            dspark.draft_tokens_proposed - dspark.draft_tokens_accepted
+        );
+        assert!(
+            dspark.draft_tokens_accepted + dspark.draft_tokens_confidence_gated
+                <= dspark.draft_tokens_proposed
+        );
+    }
+
+    /// A served request whose target rows are all non-finite accepts no draft and reports zero in
+    /// both the usage block and the DSpark telemetry. The accounting unit tests above pin the finite
+    /// rule; the real-checkpoint evidence run is what supplies a non-zero accepted count.
+    #[tokio::test]
+    async fn a_served_request_with_nonfinite_logits_accepts_nothing() {
+        let driver = synthetic_driver(128);
+        let stream = events(&driver, request(&[1, 2, 3], 128, 0.0, 0)).await;
+        let Some(EngineEvent::Finished { usage, stats, .. }) = stream.last() else {
+            panic!("the stream did not finish: {stream:?}");
+        };
+        assert_eq!(stats.dspark_speculative, DSparkStepStats::default());
+        assert_eq!(
+            usage.completion_tokens_details.accepted_prediction_tokens,
+            0
+        );
+        assert_eq!(
+            usage.completion_tokens_details.rejected_prediction_tokens,
+            0
+        );
     }
 
     #[tokio::test]

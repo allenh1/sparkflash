@@ -17,7 +17,6 @@ use sparkflash_scheduler::dspark::{DsparkProposal, ExpertSource};
 use sparkflash_scheduler::engine::{StepBoundaryScheduler, StepPhase};
 use sparkflash_scheduler::error::SchedulerError;
 use sparkflash_scheduler::indexer::IndexerPlan;
-use sparkflash_scheduler::philox::SyncFreeDrafter;
 use sparkflash_scheduler::prefill::{
     CedPrefillPlan, CollectiveBackend, L2PrefetchPlan, SeqParallelPlan,
 };
@@ -171,10 +170,10 @@ fn the_short_request_bypasses_the_background_prefill() {
     assert!(long.admitted_step >= timeline.last_chunk_step());
 }
 
-/// The DSpark block: sigmoid before the survival product, the cap decides the prefix, the mask
-/// is its complement, and the draft needs no communication.
+/// The DSpark block: sigmoid before the survival product, the cap decides the prefix, and the
+/// mask is its complement. The draft tokens themselves come from the engine's MTP forward.
 #[test]
-fn the_dspark_block_decides_the_prefix_the_mask_and_the_draft() {
+fn the_dspark_block_decides_the_prefix_and_the_mask() {
     let config = config();
     let confident = DsparkProposal::from_logits(&config, &[4.0; DSPARK_BLOCK_SIZE]).expect("block");
     assert_eq!(confident.verified_prefix(), DSPARK_BLOCK_SIZE);
@@ -198,19 +197,6 @@ fn the_dspark_block_decides_the_prefix_the_mask_and_the_draft() {
             "a doomed row cannot select fresh experts"
         );
     }
-
-    let drafter = SyncFreeDrafter::from_config(&config, 128_000).expect("drafter");
-    let first = doomed
-        .draft_tokens(&drafter, 45, RequestId(3))
-        .expect("draft");
-    let second = doomed
-        .draft_tokens(&drafter, 45, RequestId(3))
-        .expect("draft");
-    assert_eq!(
-        first, second,
-        "every rank drafts the same tokens without a broadcast"
-    );
-    assert_eq!(first.len(), DSPARK_BLOCK_SIZE);
 }
 
 /// D9 at the engine: the trace id rides on the request and is re-bound at every step boundary.

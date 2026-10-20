@@ -23,6 +23,7 @@ use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel, KernelId, Module}
 use sparkflash_kernels::lm_head_reduce_launch::{
     self as head_reduce, LmHeadReduceParams, STATUS_WINNER_CERTIFIED,
 };
+use sparkflash_kernels::lm_head_ref;
 use sparkflash_kernels::m4_quant::bf16_bits;
 use sparkflash_kernels::mxfp4_moe_launch::{self, Mxfp4MoeParams};
 use sparkflash_kernels::mxfp4_ref;
@@ -236,6 +237,7 @@ pub struct RouterTwinRecord {
 
 struct Kernels {
     router: Kernel,
+    router_topk: Kernel,
     gate_up: Kernel,
     weighted: Kernel,
     combine: Kernel,
@@ -245,6 +247,7 @@ struct Kernels {
     head_reduce: Kernel,
     rmsnorm: Kernel,
     _router_module: Module,
+    _router_topk_module: Module,
     _gate_up_module: Module,
     _weighted_module: Module,
     _combine_module: Module,
@@ -267,6 +270,8 @@ pub struct MoeDeviceBackendImpl {
     head_certified: Vec<u8>,
     // The 1.32 GB host head weight, read once and reused across sequence steps.
     head_weight: Option<Arc<Vec<u8>>>,
+    // 2.58 MB of exact BF16 block row maxima, one [vocab][40] image per rank, precomputed once.
+    head_block_max: Option<Arc<Vec<u8>>>,
 }
 
 impl MoeDeviceBackendImpl {
@@ -286,7 +291,8 @@ impl MoeDeviceBackendImpl {
         let head_reduce_bytes = verified(dir, HEAD_REDUCE)?;
         let rmsnorm_bytes = verified(dir, RMSNORM)?;
         let cuda = Cuda::load()?;
-        let (router_module, router) = router_launch::load(&cuda, &router_bytes)?;
+        let (router_module, router, router_topk_module, router_topk) =
+            router_launch::load(&cuda, &router_bytes)?;
         let (gate_up_module, gate_up) = routed_gate_up_launch::load(&cuda, &gate_up_bytes)?;
         let (weighted_module, weighted) =
             cuda.load_kernel(&weighted_bytes, KernelId::SwigluMxfp8QuantWeighted)?;
@@ -301,6 +307,7 @@ impl MoeDeviceBackendImpl {
             cuda,
             kernels: Kernels {
                 router,
+                router_topk,
                 gate_up,
                 weighted,
                 combine,
@@ -310,6 +317,7 @@ impl MoeDeviceBackendImpl {
                 head_reduce,
                 rmsnorm,
                 _router_module: router_module,
+                _router_topk_module: router_topk_module,
                 _gate_up_module: gate_up_module,
                 _weighted_module: weighted_module,
                 _combine_module: combine_module,
@@ -338,6 +346,7 @@ impl MoeDeviceBackendImpl {
             launches_by_layer: vec![0; 64],
             head_certified: Vec::new(),
             head_weight: None,
+            head_block_max: None,
         })
     }
 
@@ -505,6 +514,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         limit: usize,
         out: &mut [f32],
     ) -> Result<bool, EngineError> {
+        sparkflash_kernels::cuda_driver::stage_timing_set_layer(layer);
         let dim = config.dim;
         let inter = config.moe_inter_dim;
         let n_routed = config.n_routed_experts;
@@ -594,6 +604,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         router_launch::launch(
             &self.cuda,
             self.kernels.router,
+            self.kernels.router_topk,
             &RouterLaunchParams {
                 x: x_d,
                 gate: gate_d,
@@ -1179,6 +1190,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
         limit: usize,
         out: &mut [f32],
     ) -> Result<bool, EngineError> {
+        sparkflash_kernels::cuda_driver::stage_timing_set_layer(layer);
         let dim = config.dim;
         let inter = config.moe_inter_dim;
         if config.n_shared_experts != 1 {
@@ -1518,6 +1530,16 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
                 ),
             ));
         }
+        // The screen's per-block row maxima are a load-time precompute: one exact BF16 maximum per
+        // [entry][40] block, 2.58 MB per rank. They are cached with the head weight because they are
+        // a function of it, and the kernel's bound is then the same arithmetic the scan produced.
+        let head_block_max = if let Some(maxima) = &self.head_block_max {
+            Arc::clone(maxima)
+        } else {
+            let maxima = Arc::new(lm_head_ref::block_maxima_bf16(&head));
+            self.head_block_max = Some(Arc::clone(&maxima));
+            maxima
+        };
         let hidden_bf16: Vec<u8> = hidden
             .iter()
             .flat_map(|value| bf16_bits(*value).to_le_bytes())
@@ -1529,8 +1551,15 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             .alloc(hidden_bf16.len(), &mut allocated)
             .map_err(drv)?;
         let weight_d = self.cuda.alloc(head.len(), &mut allocated).map_err(drv)?;
+        let w_block_max_d = self
+            .cuda
+            .alloc(head_block_max.len(), &mut allocated)
+            .map_err(drv)?;
         self.cuda.copy_htod(&hidden_d, &hidden_bf16).map_err(drv)?;
         self.cuda.copy_htod(&weight_d, &head).map_err(drv)?;
+        self.cuda
+            .copy_htod(&w_block_max_d, &head_block_max)
+            .map_err(drv)?;
         let per_rank_out = per_rank * 4;
         let block_count = per_rank.div_ceil(cert_lm_head_launch::CHUNK as usize);
         let mut logits_d = Vec::with_capacity(RANKS);
@@ -1568,7 +1597,14 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             .map_err(drv)?;
         let reduce_status_d = self.cuda.alloc(4, &mut allocated).map_err(drv)?;
         let reduce_count_d = self.cuda.alloc(4, &mut allocated).map_err(drv)?;
-        ptrs.extend([hidden_d, weight_d, count_d, block_max_d, block_argmax_d]);
+        ptrs.extend([
+            hidden_d,
+            weight_d,
+            w_block_max_d,
+            count_d,
+            block_max_d,
+            block_argmax_d,
+        ]);
         ptrs.extend(logits_d.iter().copied());
         ptrs.extend(certified_d.iter().copied());
         ptrs.extend([
@@ -1582,6 +1618,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             reduce_count_d,
         ]);
         let rank_stride = per_rank * dim * 2;
+        let rank_max_stride = per_rank * lm_head_ref::LM_BLOCKS * 2;
         let mut best_value = f32::NEG_INFINITY;
         let mut best_index = 0u32;
         let mut certified_total = 0usize;
@@ -1598,6 +1635,7 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             let params = CertLmHeadParams::new(
                 hidden_d,
                 Deviceptr(weight_d.0 + (rank * rank_stride) as u64),
+                Deviceptr(w_block_max_d.0 + (rank * rank_max_stride) as u64),
                 logits_d[rank],
                 certified_d[rank],
                 count_d,

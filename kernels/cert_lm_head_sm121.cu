@@ -10,6 +10,12 @@
 //
 //   bound_j = sum over the 40 hidden blocks b of ( sum_{i in b} |h_i| ) * ( max_{i in b} |w_ji| )
 //
+// The per-block row maxima are a load-time precompute (w_block_max, [vocab][40] BF16). The
+// checkpoint weights are BF16, so each maximum is a selection of a weight already in the row; the
+// precomputed value is bit-for-bit the value the old in-kernel scan produced, and the bound below
+// is the same arithmetic in the same block order. That is why the certified flags, the pruned
+// logits and certified_count are bit-identical to the scan version, not merely within a tolerance.
+//
 //   For every entry j,  logits_j <= bound_j, since |sum_i h_i w_ji| <= sum_i |h_i| |w_ji| <=
 //   sum_b S_b M_jb. Each thread walks its entries in strictly ascending index order against its own
 //   running maximum, and skips an entry only when bound_j < running_max. Because running_max never
@@ -60,6 +66,7 @@ static_assert(SPARK_M4_VOCAB % SPARK_M4_VOCAB_PER_RANK == 0u, "the vocabulary sh
 extern "C" __global__ void cert_lm_head_sm121(
     const __nv_bfloat16 *__restrict__ hidden,   // [hidden]
     const __nv_bfloat16 *__restrict__ w,        // [vocab][hidden] bf16, this rank's shard
+    const __nv_bfloat16 *__restrict__ w_block_max, // [vocab][40] bf16, exact block row maxima
     float *__restrict__ logits,                 // [vocab] exact where certified == 0, else the bound
     uint8_t *__restrict__ certified,            // [vocab] 1 = pruned, logits holds an upper bound
     unsigned int *__restrict__ certified_count, // [1] total pruned entries, atomically accumulated
@@ -107,12 +114,10 @@ extern "C" __global__ void cert_lm_head_sm121(
         const __nv_bfloat16 *row = w + (uint64_t)entry * SPARK_M4_HIDDEN;
         float bound = 0.0f;
         for (uint32_t block = 0; block < (uint32_t)SPARK_M4_LM_BLOCKS; ++block) {
-            float row_max = 0.0f;
-            for (uint32_t i = 0; i < (uint32_t)SPARK_M4_LM_SCREEN_TILE; ++i) {
-                const float value = __bfloat162float(row[block * SPARK_M4_LM_SCREEN_TILE + i]);
-                const float magnitude = value < 0.0f ? -value : value;
-                row_max = magnitude > row_max ? magnitude : row_max;
-            }
+            // The load-time precompute selected this exact BF16 weight as the block's largest
+            // magnitude, so this replaces the old 128-value scan without changing the value.
+            const float row_max = __bfloat162float(
+                w_block_max[(uint64_t)entry * SPARK_M4_LM_BLOCKS + block]);
             bound += s_h_abs[block] * row_max;
         }
         if (bound < running_max) {
@@ -168,6 +173,160 @@ extern "C" __global__ void cert_lm_head_sm121(
     // across runs; a thread with no prunes skips the atomic, so the all-exact path is unchanged.
     if (pruned > 0u) {
         atomicAdd(certified_count, pruned);
+    }
+    (void)t_enter;
+}
+// K8 batched certified head: one launch over the six-row verify batch. The weights and the exact
+// BF16 row maxima are read once and reused across the six hidden rows; each row keeps its own
+// running maximum, pruning flags, logits and block reductions. The arithmetic of every row is the
+// scalar kernel's arithmetic in the same order (bound blocks ascending, exact dot K ascending,
+// strict '<' pruning, strict '>' maximum with the lower-index tie break), so every per-row output
+// is BIT-IDENTICAL to cert_lm_head_sm121.
+#define SPARK_M4_LM_BATCH_ROWS 6u
+
+static_assert(SPARK_M4_LM_BATCH_ROWS == 6u, "the six-row verify batch is the fixed shape");
+
+extern "C" __global__ void cert_lm_head_batched_sm121(
+    const __nv_bfloat16 *__restrict__ hidden,   // [rows][hidden]
+    const __nv_bfloat16 *__restrict__ w,        // [vocab][hidden] bf16, this rank's shard
+    const __nv_bfloat16 *__restrict__ w_block_max_t, // [40][vocab] bf16, coalesced bound reads
+    float *__restrict__ logits,                 // [rows][vocab]
+    uint8_t *__restrict__ certified,            // [rows][vocab]
+    unsigned int *__restrict__ certified_count, // [rows] total pruned entries per row
+    float *__restrict__ block_max,              // [rows][gridDim.x]
+    uint32_t *__restrict__ block_argmax,        // [rows][gridDim.x]
+    const uint32_t vocab,
+    GpuTraceRing *__restrict__ trace_ring,
+    const uint32_t layer_id,
+    const uint64_t step_seq) {
+    const uint32_t lane = threadIdx.x;
+    __shared__ float s_h_abs[SPARK_M4_LM_BATCH_ROWS][SPARK_M4_LM_BLOCKS];
+    __shared__ float s_thread_max[SPARK_M4_LM_BATCH_ROWS][SPARK_M4_LM_HEAD_THREADS];
+    __shared__ uint32_t s_thread_argmax[SPARK_M4_LM_BATCH_ROWS][SPARK_M4_LM_HEAD_THREADS];
+
+    uint64_t t_enter = 0u;
+    SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_DENSE_MXFP8, t_enter);
+
+    for (uint32_t r = 0u; r < SPARK_M4_LM_BATCH_ROWS; ++r) {
+        const __nv_bfloat16 *hidden_row = hidden + (uint64_t)r * SPARK_M4_HIDDEN;
+        for (uint32_t block = 0u; block < (uint32_t)SPARK_M4_LM_BLOCKS; ++block) {
+            float local = 0.0f;
+            for (uint32_t i = lane; i < (uint32_t)SPARK_M4_LM_SCREEN_TILE;
+                 i += SPARK_M4_LM_HEAD_THREADS) {
+                const float value =
+                    __bfloat162float(hidden_row[block * SPARK_M4_LM_SCREEN_TILE + i]);
+                local += value < 0.0f ? -value : value;
+            }
+            local = spark_block_sum(local, lane, SPARK_M4_LM_HEAD_THREADS);
+            if (lane == 0u) {
+                s_h_abs[r][block] = local;
+            }
+        }
+    }
+    __syncthreads();
+
+    const uint32_t base = blockIdx.x * SPARK_M4_LM_CHUNK;
+    float running_max[SPARK_M4_LM_BATCH_ROWS];
+    uint32_t running_argmax[SPARK_M4_LM_BATCH_ROWS];
+    unsigned int pruned[SPARK_M4_LM_BATCH_ROWS];
+#pragma unroll
+    for (uint32_t r = 0u; r < SPARK_M4_LM_BATCH_ROWS; ++r) {
+        running_max[r] = -3.402823466e38f;
+        running_argmax[r] = 0u;
+        pruned[r] = 0u;
+    }
+    for (uint32_t step = 0; step < SPARK_M4_LM_ENTRIES_PER_THREAD; ++step) {
+        const uint32_t entry = base + step * SPARK_M4_LM_HEAD_THREADS + lane;
+        if (entry >= vocab) {
+            continue;
+        }
+        const __nv_bfloat16 *row = w + (uint64_t)entry * SPARK_M4_HIDDEN;
+        float bound[SPARK_M4_LM_BATCH_ROWS];
+#pragma unroll
+        for (uint32_t r = 0u; r < SPARK_M4_LM_BATCH_ROWS; ++r) {
+            bound[r] = 0.0f;
+        }
+        for (uint32_t block = 0u; block < (uint32_t)SPARK_M4_LM_BLOCKS; ++block) {
+            const float row_max =
+                __bfloat162float(w_block_max_t[(uint64_t)block * vocab + entry]);
+#pragma unroll
+            for (uint32_t r = 0u; r < SPARK_M4_LM_BATCH_ROWS; ++r) {
+                bound[r] += s_h_abs[r][block] * row_max;
+            }
+        }
+        bool needs_exact[SPARK_M4_LM_BATCH_ROWS];
+        bool any_exact = false;
+#pragma unroll
+        for (uint32_t r = 0u; r < SPARK_M4_LM_BATCH_ROWS; ++r) {
+            needs_exact[r] = !(bound[r] < running_max[r]);
+            any_exact = any_exact || needs_exact[r];
+        }
+        float acc[SPARK_M4_LM_BATCH_ROWS];
+#pragma unroll
+        for (uint32_t r = 0u; r < SPARK_M4_LM_BATCH_ROWS; ++r) {
+            acc[r] = 0.0f;
+        }
+        if (any_exact) {
+            for (uint32_t i = 0u; i < (uint32_t)SPARK_M4_HIDDEN; ++i) {
+                const float w_value = __bfloat162float(row[i]);
+#pragma unroll
+                for (uint32_t r = 0u; r < SPARK_M4_LM_BATCH_ROWS; ++r) {
+                    if (needs_exact[r]) {
+                        acc[r] += __bfloat162float(hidden[(uint64_t)r * SPARK_M4_HIDDEN + i]) *
+                                  w_value;
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (uint32_t r = 0u; r < SPARK_M4_LM_BATCH_ROWS; ++r) {
+            const uint64_t out_index = (uint64_t)r * vocab + entry;
+            if (!needs_exact[r]) {
+                logits[out_index] = bound[r];
+                certified[out_index] = 1u;
+                pruned[r] += 1u;
+            } else {
+                logits[out_index] = acc[r];
+                certified[out_index] = 0u;
+                if (acc[r] > running_max[r] ||
+                    (acc[r] == running_max[r] && entry < running_argmax[r])) {
+                    running_max[r] = acc[r];
+                    running_argmax[r] = entry;
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (uint32_t r = 0u; r < SPARK_M4_LM_BATCH_ROWS; ++r) {
+        s_thread_max[r][lane] = running_max[r];
+        s_thread_argmax[r][lane] = running_argmax[r];
+    }
+    __syncthreads();
+    if (lane == 0u) {
+#pragma unroll
+        for (uint32_t r = 0u; r < SPARK_M4_LM_BATCH_ROWS; ++r) {
+            float best = s_thread_max[r][0];
+            uint32_t best_index = s_thread_argmax[r][0];
+            for (uint32_t i = 1u; i < SPARK_M4_LM_HEAD_THREADS; ++i) {
+                if (s_thread_max[r][i] > best ||
+                    (s_thread_max[r][i] == best && s_thread_argmax[r][i] < best_index)) {
+                    best = s_thread_max[r][i];
+                    best_index = s_thread_argmax[r][i];
+                }
+            }
+            block_max[(uint64_t)r * gridDim.x + blockIdx.x] = best;
+            block_argmax[(uint64_t)r * gridDim.x + blockIdx.x] = best_index;
+        }
+        const uint32_t meta = SPARK_M4_LM_CHUNK * 4u;
+        SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_DENSE_MXFP8, layer_id, meta, t_enter);
+        (void)step_seq;
+    }
+#pragma unroll
+    for (uint32_t r = 0u; r < SPARK_M4_LM_BATCH_ROWS; ++r) {
+        if (pruned[r] > 0u) {
+            atomicAdd(certified_count + r, pruned[r]);
+        }
     }
     (void)t_enter;
 }

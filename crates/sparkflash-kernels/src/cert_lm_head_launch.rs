@@ -1,7 +1,7 @@
 //! Typed launch capability of the certified LM head (`kernels/cert_lm_head_sm121.cu`).
 //!
 //! The argument array is the `cert_lm_head_sm121` declaration's parameter list in order - seven
-//! device pointers and the per-rank vocabulary - so a launch cannot swap the certification side
+//! eight device pointers and the per-rank vocabulary - so a launch cannot swap the certification side
 //! buffers for the logits or drop the rejection count. The declaration is pinned here against the
 //! frozen ABI's embedded copy ([m4_abi::CERT_LM_HEAD]); [PARAMS] is the pinned name and type of
 //! every parameter and [declaration_matches] is the check, with a mutation test proving it is not
@@ -23,12 +23,13 @@ pub const KERNEL: &str = "cert_lm_head_sm121";
 /// The kernel source the declaration pin is read from (the frozen ABI's embedded copy).
 pub const SOURCE: &str = m4_abi::CERT_LM_HEAD;
 /// The number of argument words a launch fills.
-pub const ARG_WORDS: usize = 11;
+pub const ARG_WORDS: usize = 12;
 
 /// The declaration's parameters in order: `(name, base type, pointer, pointee const)`.
 pub const PARAMS: [(&str, &str, bool, bool); ARG_WORDS] = [
     ("hidden", "__nv_bfloat16", true, true),
     ("w", "__nv_bfloat16", true, true),
+    ("w_block_max", "__nv_bfloat16", true, true),
     ("logits", "float", true, false),
     ("certified", "uint8_t", true, false),
     ("certified_count", "unsigned int", true, false),
@@ -62,6 +63,65 @@ pub fn declaration_matches(decl: &KernelDecl) -> bool {
         })
 }
 
+/// The K8 batched symbol: six rows in one launch, same arguments.
+pub const BATCH_KERNEL: &str = "cert_lm_head_batched_sm121";
+/// The batched head's fixed row count.
+pub const BATCH_ROWS: u32 = 6;
+/// The batched symbol's argument words: the scalar 12 plus the transposed [40][vocab] maxima.
+pub const BATCH_ARG_WORDS: usize = 13;
+
+/// One K8 batched launch's arguments. The transposed block maxima are batched-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CertLmHeadBatchParams([u64; BATCH_ARG_WORDS]);
+
+impl CertLmHeadBatchParams {
+    /// Builds the batched argument array in the batched declaration's order.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        hidden: Deviceptr,
+        w: Deviceptr,
+        w_block_max_t: Deviceptr,
+        logits: Deviceptr,
+        certified: Deviceptr,
+        certified_count: Deviceptr,
+        block_max: Deviceptr,
+        block_argmax: Deviceptr,
+        vocab: u32,
+        trace_ring: u64,
+        layer_id: u32,
+        step_seq: u64,
+    ) -> Self {
+        Self([
+            hidden.0,
+            w.0,
+            w_block_max_t.0,
+            logits.0,
+            certified.0,
+            certified_count.0,
+            block_max.0,
+            block_argmax.0,
+            u64::from(vocab),
+            trace_ring,
+            u64::from(layer_id),
+            step_seq,
+            0,
+        ])
+    }
+
+    /// The parameter words a launch passes.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u64] {
+        &self.0
+    }
+
+    /// The screened vocabulary.
+    #[must_use]
+    pub fn vocab(&self) -> u32 {
+        self.0[8] as u32
+    }
+}
+
 /// The kernel id in the shared driver's enum.
 pub const KERNEL_ID: KernelId = KernelId::CertLmHead;
 /// 128 threads, one 1024-entry vocabulary chunk per block.
@@ -69,7 +129,7 @@ pub const BLOCK: (u32, u32, u32) = (128, 1, 1);
 /// The vocabulary entries one block screens.
 pub const CHUNK: u32 = 1024;
 /// The index of `vocab` in [CertLmHeadParams::as_slice].
-pub const VOCAB_INDEX: usize = 7;
+pub const VOCAB_INDEX: usize = 8;
 
 /// The grid for a rank's `vocab` entries: `(ceil(vocab / 1024), 1, 1)`.
 ///
@@ -96,6 +156,7 @@ impl CertLmHeadParams {
     pub fn new(
         hidden: Deviceptr,
         w: Deviceptr,
+        w_block_max: Deviceptr,
         logits: Deviceptr,
         certified: Deviceptr,
         certified_count: Deviceptr,
@@ -109,6 +170,7 @@ impl CertLmHeadParams {
         Self([
             hidden.0,
             w.0,
+            w_block_max.0,
             logits.0,
             certified.0,
             certified_count.0,
@@ -142,11 +204,33 @@ pub fn load(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), String> {
     cuda.load_kernel(cubin, KERNEL_ID)
 }
 
+/// Loads the K8 batched symbol by name from the same cubin.
+pub fn load_batched(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+    cuda.load_cert_lm_head_batched(cubin)
+}
+
 /// Launches the screening pass once.
 ///
 /// # Errors
 /// Refuses a zero vocabulary, and returns the driver's error otherwise.
 pub fn launch(cuda: &Cuda, kernel: Kernel, params: &CertLmHeadParams) -> Result<(), String> {
+    let grid = grid(params.vocab())?;
+    cuda.launch(kernel, grid, BLOCK, params.as_slice())
+}
+
+/// Launches the K8 batched head once over the fixed six-row batch.
+///
+/// The batched ABI is the scalar 12 words plus `w_block_max_t` [40][vocab] at index 2;
+/// `hidden`, `logits`, `certified`, `certified_count`, `block_max` and `block_argmax` are
+/// batch-major over [BATCH_ROWS] rows.
+///
+/// # Errors
+/// Refuses a zero vocabulary, and returns the driver's error otherwise.
+pub fn launch_batched(
+    cuda: &Cuda,
+    kernel: Kernel,
+    params: &CertLmHeadBatchParams,
+) -> Result<(), String> {
     let grid = grid(params.vocab())?;
     cuda.launch(kernel, grid, BLOCK, params.as_slice())
 }
@@ -160,6 +244,7 @@ mod tests {
         CertLmHeadParams::new(
             Deviceptr(0x1000),
             Deviceptr(0x2000),
+            Deviceptr(0x2500),
             Deviceptr(0x3000),
             Deviceptr(0x4000),
             Deviceptr(0x5000),
@@ -208,7 +293,8 @@ mod tests {
         assert_eq!(
             p.as_slice(),
             [
-                0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000, 32_320, 0x8000, 7, 11
+                0x1000, 0x2000, 0x2500, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000, 32_320, 0x8000, 7,
+                11
             ]
         );
         assert_eq!(p.vocab(), 32_320);

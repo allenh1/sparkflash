@@ -10,6 +10,8 @@ use std::sync::Arc;
 use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::forward::attention::sparse_attention;
 use sparkflash_engine::forward::attention::{AttentionProjectionBackend, indexer_wq_b_chunked};
+
+use crate::resident_weights::ResidentAttention;
 use sparkflash_engine::forward::attention_case::{AttentionCaseRecord, NO_INDEX as CASE_NO_INDEX};
 use sparkflash_engine::linalg::EngineError;
 use sparkflash_engine::quant::quantize_activation_fp8;
@@ -158,6 +160,14 @@ pub struct AttentionDeviceStats {
     pub device_us: u64,
     /// Cumulative packed weight bytes uploaded.
     pub staged_bytes: u64,
+    /// Cumulative WEIGHT bytes copied host->device (must be 0 for a resident projection).
+    pub weight_h2d_bytes: u64,
+    /// The wo_a share of `weight_h2d_bytes` (per-call grouped projection uploads).
+    pub wo_a_weight_h2d_bytes: u64,
+    /// Cumulative activation bytes copied host->device.
+    pub activation_h2d_bytes: u64,
+    /// How many launches bound a resident weight pointer instead of uploading.
+    pub resident_weight_binds: u64,
     /// Cumulative activation bytes uploaded and read back.
     pub host_bytes: u64,
     /// Format-2 attention launches (one per prefill layer at position 0).
@@ -290,6 +300,9 @@ pub struct AttentionDeviceBackend {
     // Packed attention weights, read once per (layer, projection) name and reused across sequence
     // positions. This is the M3-d staging-reuse shape for the projection set; host bytes only.
     weight_cache: HashMap<String, PackedWeight>,
+    // The resident attention projection arena, when one was installed. A hit binds the arena pointer
+    // and copies no weight at all; a miss keeps the staged path above.
+    resident: Option<ResidentAttention>,
     // Which wo_a arithmetic this chain runs, set once at construction.
     wo_a_mode: WoAMode,
     // Whether the per-layer wo_a comparison (and operand dump) is armed.
@@ -423,6 +436,7 @@ impl AttentionDeviceBackend {
             body_by_layer: vec![0; 64],
             last_activation: None,
             weight_cache: HashMap::new(),
+            resident: None,
             wo_a_mode: WoAMode::default(),
             wo_a_diagnose: false,
             wo_a_compared: vec![false; 64],
@@ -439,6 +453,34 @@ impl AttentionDeviceBackend {
             diag_wq_b_kernel: None,
             timing: None,
         })
+    }
+
+    /// Installs the resident attention projection arena.
+    pub fn set_resident_attention(&mut self, resident: ResidentAttention) {
+        self.resident = Some(resident);
+    }
+
+    /// Fails the run if any attention projection uploaded a weight while the resident arena is
+    /// installed. This is the per-category hard gate: it must be an error, not a printed number,
+    /// because a silent fallback to per-call uploads makes the chain look correct while every token
+    /// pays the weight traffic.
+    fn assert_attention_weight_h2d_zero(&self) -> Result<(), String> {
+        if self.resident.is_none() || self.wo_a_diagnose || self.wo_a_operand_dump.is_some() {
+            return Ok(());
+        }
+        if self.stats.weight_h2d_bytes != 0 {
+            return Err(format!(
+                "attention weight H2D is {} bytes with a resident arena installed (wo_a {} bytes): every projection must bind the arena, not upload per call",
+                self.stats.weight_h2d_bytes, self.stats.wo_a_weight_h2d_bytes
+            ));
+        }
+        Ok(())
+    }
+
+    /// The resident attention payload bytes, if one was installed.
+    #[must_use]
+    pub fn resident_bytes(&self) -> u64 {
+        self.resident.as_ref().map_or(0, ResidentAttention::bytes)
     }
 
     /// The counters since construction.
@@ -601,6 +643,10 @@ impl AttentionDeviceBackend {
             .stats
             .staged_bytes
             .saturating_add(packed.len() as u64 + scales.len() as u64);
+        self.stats.weight_h2d_bytes = self
+            .stats
+            .weight_h2d_bytes
+            .saturating_add(packed.len() as u64 + scales.len() as u64);
         Ok(())
     }
 
@@ -638,6 +684,7 @@ impl AttentionDeviceBackend {
         inner: usize,
         rows: usize,
     ) -> Result<Vec<f32>, EngineError> {
+        sparkflash_kernels::cuda_driver::stage_timing_set_layer(layer);
         if rows * cols * 2 > MAX_OUT_BYTES {
             return Err(EngineError::Shape {
                 what: "attention dense output".to_owned(),
@@ -647,19 +694,38 @@ impl AttentionDeviceBackend {
             });
         }
         let started = std::time::Instant::now();
-        let weight =
-            self.packed_weight(src, &format!("{prefix}.attn.{weight_name}"), cols, inner)?;
+        let name = format!("{prefix}.attn.{weight_name}");
+        let resident = self
+            .resident
+            .as_ref()
+            .map(|arena| arena.bind(&name, cols, inner))
+            .transpose()
+            .map_err(|detail| EngineError::Shape {
+                what: "resident attention bind".to_owned(),
+                detail,
+            })?
+            .flatten();
+        let (weight_ptr, scales_ptr, host_weight) = match resident {
+            Some((weight, scales)) => {
+                self.stats.resident_weight_binds += 1;
+                (weight, scales, None)
+            }
+            None => {
+                let weight = self.packed_weight(src, &name, cols, inner)?;
+                self.upload_weight(&weight.0, &weight.1)
+                    .map_err(|detail| EngineError::Shape {
+                        what: "attention weight upload".to_owned(),
+                        detail,
+                    })?;
+                (self.buffers.w, self.buffers.w_scales, Some(weight))
+            }
+        };
         let codes = self
             .last_activation
             .take()
             .ok_or_else(|| EngineError::Shape {
                 what: "attention activation".to_owned(),
                 detail: "the projection backend has no quantised activation".to_owned(),
-            })?;
-        self.upload_weight(&weight.0, &weight.1)
-            .map_err(|detail| EngineError::Shape {
-                what: "attention weight upload".to_owned(),
-                detail,
             })?;
         self.stats.host_bytes = self
             .stats
@@ -674,8 +740,8 @@ impl AttentionDeviceBackend {
         let params = Mxfp8DenseParams::new(
             self.buffers.a_codes,
             self.buffers.a_scales,
-            self.buffers.w,
-            self.buffers.w_scales,
+            weight_ptr,
+            scales_ptr,
             self.buffers.out,
             u32::try_from(rows).map_err(|_| EngineError::Shape {
                 what: "attention rows".to_owned(),
@@ -700,6 +766,11 @@ impl AttentionDeviceBackend {
                 detail,
             }
         })?;
+        self.assert_attention_weight_h2d_zero()
+            .map_err(|detail| EngineError::Shape {
+                what: "attention resident gate".to_owned(),
+                detail,
+            })?;
         let read = self
             .read_out(rows * cols * 2)
             .map_err(|detail| EngineError::Shape {
@@ -713,7 +784,11 @@ impl AttentionDeviceBackend {
         self.stats.device_us += launched.elapsed().as_micros() as u64;
         self.stats.launches += 1;
         self.stats.layers = layer + 1;
-        if layer == 0 && weight_name == "wq_b.weight" && self.diag_wq_b_kernel.is_none() {
+        if let Some(weight) = host_weight.as_ref()
+            && layer == 0
+            && weight_name == "wq_b.weight"
+            && self.diag_wq_b_kernel.is_none()
+        {
             let reference = sparkflash_kernels::mxfp8_ref::dense_gemm(
                 &codes.0, &codes.1, &weight.0, &weight.1, rows, cols, inner,
             );
@@ -1793,15 +1868,44 @@ impl AttentionDeviceBackend {
             });
         }
         let started = std::time::Instant::now();
-        let weight = self.packed_weight(
-            src,
-            &format!("{prefix}.attn.wo_a.weight"),
-            config.o_groups * config.o_lora_rank,
-            wide_row / config.o_groups,
-        )?;
-        self.upload_weight(&weight.0, &weight.1)
+        let name = format!("{prefix}.attn.wo_a.weight");
+        let cols = config.o_groups * config.o_lora_rank;
+        let inner = wide_row / config.o_groups;
+        let bind = if self.wo_a_diagnose || self.wo_a_operand_dump.is_some() {
+            None
+        } else {
+            self.resident
+                .as_ref()
+                .map(|arena| arena.bind(&name, cols, inner))
+                .transpose()
+                .map_err(|detail| EngineError::Shape {
+                    what: "resident wo_a bind".to_owned(),
+                    detail,
+                })?
+                .flatten()
+        };
+        let (weight_ptr, scales_ptr, staged) = match bind {
+            Some((weight, scales)) => {
+                self.stats.resident_weight_binds += 1;
+                (weight, scales, None)
+            }
+            None => {
+                let weight = self.packed_weight(src, &name, cols, inner)?;
+                self.upload_weight(&weight.0, &weight.1)
+                    .map_err(|detail| EngineError::Shape {
+                        what: "wo_a weight upload".to_owned(),
+                        detail,
+                    })?;
+                self.stats.wo_a_weight_h2d_bytes = self
+                    .stats
+                    .wo_a_weight_h2d_bytes
+                    .saturating_add(weight.0.len() as u64 + weight.1.len() as u64);
+                (self.buffers.w, self.buffers.w_scales, Some(weight))
+            }
+        };
+        self.assert_attention_weight_h2d_zero()
             .map_err(|detail| EngineError::Shape {
-                what: "wo_a weight upload".to_owned(),
+                what: "wo_a resident gate".to_owned(),
                 detail,
             })?;
         // The reference applies the inverse rotation into the BF16 body output and reads the 512-wide
@@ -1820,8 +1924,8 @@ impl AttentionDeviceBackend {
         self.stats.staging_us += started.elapsed().as_micros() as u64;
         let params = Bf16aMxfp8wWoAParams::new(
             self.buffers.a_bf16,
-            self.buffers.w,
-            self.buffers.w_scales,
+            weight_ptr,
+            scales_ptr,
             self.buffers.out,
             u32::try_from(config.o_groups).unwrap_or(0),
             0,
@@ -1847,15 +1951,17 @@ impl AttentionDeviceBackend {
             .saturating_add((config.o_groups * config.o_lora_rank * 2) as u64);
         self.stats.device_us += launched.elapsed().as_micros() as u64;
         self.stats.launches += 1;
-        self.record_wo_a_comparison(
-            config,
-            layer,
-            wide,
-            &activation,
-            &weight.0,
-            &weight.1,
-            &grouped,
-        )?;
+        if let Some(weight) = &staged {
+            self.record_wo_a_comparison(
+                config,
+                layer,
+                wide,
+                &activation,
+                &weight.0,
+                &weight.1,
+                &grouped,
+            )?;
+        }
         Ok(grouped)
     }
 
@@ -1887,15 +1993,44 @@ impl AttentionDeviceBackend {
                 detail: "missing quantised activation".to_owned(),
             })?;
         let started = std::time::Instant::now();
-        let weight = self.packed_weight(
-            src,
-            &format!("{prefix}.attn.wo_a.weight"),
-            config.o_groups * config.o_lora_rank,
-            wide_row / config.o_groups,
-        )?;
-        self.upload_weight(&weight.0, &weight.1)
+        let name = format!("{prefix}.attn.wo_a.weight");
+        let cols = config.o_groups * config.o_lora_rank;
+        let inner = wide_row / config.o_groups;
+        let bind = if self.wo_a_diagnose || self.wo_a_operand_dump.is_some() {
+            None
+        } else {
+            self.resident
+                .as_ref()
+                .map(|arena| arena.bind(&name, cols, inner))
+                .transpose()
+                .map_err(|detail| EngineError::Shape {
+                    what: "resident wo_a bind".to_owned(),
+                    detail,
+                })?
+                .flatten()
+        };
+        let (weight_ptr, scales_ptr, staged) = match bind {
+            Some((weight, scales)) => {
+                self.stats.resident_weight_binds += 1;
+                (weight, scales, None)
+            }
+            None => {
+                let weight = self.packed_weight(src, &name, cols, inner)?;
+                self.upload_weight(&weight.0, &weight.1)
+                    .map_err(|detail| EngineError::Shape {
+                        what: "wo_a weight upload".to_owned(),
+                        detail,
+                    })?;
+                self.stats.wo_a_weight_h2d_bytes = self
+                    .stats
+                    .wo_a_weight_h2d_bytes
+                    .saturating_add(weight.0.len() as u64 + weight.1.len() as u64);
+                (self.buffers.w, self.buffers.w_scales, Some(weight))
+            }
+        };
+        self.assert_attention_weight_h2d_zero()
             .map_err(|detail| EngineError::Shape {
-                what: "wo_a weight upload".to_owned(),
+                what: "wo_a resident gate".to_owned(),
                 detail,
             })?;
         self.stats.host_bytes = self
@@ -1911,8 +2046,8 @@ impl AttentionDeviceBackend {
         let params = Mxfp8WoAParams::new(
             self.buffers.a_codes,
             self.buffers.a_scales,
-            self.buffers.w,
-            self.buffers.w_scales,
+            weight_ptr,
+            scales_ptr,
             self.buffers.out,
             u32::try_from(config.o_groups).unwrap_or(0),
             0,
@@ -1938,7 +2073,9 @@ impl AttentionDeviceBackend {
             .saturating_add((config.o_groups * config.o_lora_rank * 2) as u64);
         self.stats.device_us += launched.elapsed().as_micros() as u64;
         self.stats.launches += 1;
-        self.record_wo_a_comparison(config, layer, wide, &[], &weight.0, &weight.1, &grouped)?;
+        if let Some(weight) = &staged {
+            self.record_wo_a_comparison(config, layer, wide, &[], &weight.0, &weight.1, &grouped)?;
+        }
         Ok(grouped)
     }
 

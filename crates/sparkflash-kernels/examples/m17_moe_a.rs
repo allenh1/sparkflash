@@ -12,14 +12,14 @@
 //!
 //! The stages, each one class-declared BEFORE the numbers it is judged by:
 //!
-//! 1. ROUTER (moe_router_sm121, 37,384 B / 5992cef9...): released layers.0.ffn.gate.weight (BF16
+//! 1. ROUTER (moe_router_sm121, 25,432 B / 42f6bbdc...): released layers.0.ffn.gate.weight (BF16
 //!    [384, 5120]) and layers.0.ffn.gate.bias (F32 [384], the noaux_tc bias; bias_vl is not used).
 //!    The activation rows are the released embed.weight rows 0..tokens - a declared stand-in for
 //!    the post-attention hidden, exactly as m9_router.rs and m10_gate_up.rs declare theirs. Class:
 //!    ids EXACT against the CPU twin (router_ref, which the crate's own tests prove bit-identical
 //!    to the engine host path on this configuration), scores <= 1e-6 abs and <= 8 ULP, weights
-//!    <= 1e-6 abs and <= 16 ULP (the device uses CUDA expf/log1pf where the host uses libm), two
-//!    launches byte-identical. The device ids are the selection stages 2-4 consume, so the routed
+//!    <= 1e-6 abs and <= 16 ULP (the serial ascending-k bars; the device uses CUDA expf/log1pf
+//!    where the host uses libm), two launches byte-identical. The device ids are the selection stages 2-4 consume, so the routed
 //!    branch is routing-driven, not a forced id cycle.
 //!
 //! 2. GATE/UP (routed_gate_up_sm121, 9,752 B / 115200d2...): the w1 and w3 projections of the
@@ -69,8 +69,8 @@
 //! Usage (aarch64 node, checkpoint present):
 //!
 //! ```text
-//! m17_moe_a --checkpoint <snapshot dir> --cubin-dir <dir> --tokens 8  [--layer 0] [--repeat 0]
-//! m17_moe_a --checkpoint <snapshot dir> --cubin-dir <dir> --tokens 130 [--layer 0] [--repeat 0]
+//! m17_moe_a --checkpoint <snapshot dir> --cubin-dir <dir> --tokens 8  [--layer 0] [--repeat 0] [--dump out.bin]
+//! m17_moe_a --checkpoint <snapshot dir> --cubin-dir <dir> --tokens 130 [--layer 0] [--repeat 0] [--dump out.bin]
 //! ```
 //!
 //! The cubin dir must hold the four pinned cubins, each refused by size+sha256 before allocation:
@@ -78,6 +78,9 @@
 //! weighted epilogue; the unweighted swiglu_mxfp8_quant_sm121 is m17b's shared-expert quantiser and
 //! is not required here), b12x_mxfp4_moe_sm121.cubin (build lines: nvcc -std=c++17 -arch=sm_121a -cubin -I kernels
 //! kernels/<name>.cu -o <dir>/<name>.cubin, CUDA 13.0.3 / V13.0.88).
+//!
+//! --dump writes stage 4's final [tokens][hidden] bf16 codes, so two router cubins can be compared
+//! through the same downstream stages without adding a bypass to the cubin pins.
 
 #![forbid(unsafe_code)]
 
@@ -176,6 +179,7 @@ struct Args {
     layer: usize,
     repeat: usize,
     floor_gib: u64,
+    dump: Option<PathBuf>,
 }
 
 impl Args {
@@ -191,6 +195,7 @@ impl Args {
             layer: 0,
             repeat: 0,
             floor_gib: 32,
+            dump: None,
         };
         let mut values = values;
         while let Some(flag) = values.first().cloned() {
@@ -227,6 +232,7 @@ impl Args {
                         .parse()
                         .map_err(|error| format!("--floor-gib: {error}"))?;
                 }
+                "--dump" => args.dump = Some(PathBuf::from(next()?)),
                 other => return Err(format!("unknown argument {other}")),
             }
         }
@@ -274,7 +280,7 @@ fn run() -> Result<(), String> {
     // ---------------------------------------------------------------------------------------
     println!("--- stage 1: moe_router_sm121 (released gate weight + noaux_tc bias) ---");
     println!(
-        "comparison class (declared before any number): ids EXACT vs router_ref on all {} x {TOP_K} selections; scores max abs delta <= 1e-6 and max ULP <= 8; weights max abs delta <= 1e-6 and max ULP <= 16; two launches byte-identical. The device's expf/log1pf are not libm's exp/ln_1p, which is the only known degree of freedom; ids are pinned because a tie-crossing selection would be a finding, not a tolerance (the tie rule is the kernel's strict-greater scan, lower expert id wins).",
+        "comparison class (declared before any number): ids EXACT vs router_ref on all {} x {TOP_K} selections; scores max abs delta <= 1e-6 and max ULP <= 8; weights max abs delta <= 1e-6 and max ULP <= 16; two launches byte-identical (the serial ascending-k bars; the stage-one score is the incumbent serial sequence, not a lane tree). The device's expf/log1pf are not libm's exp/ln_1p, which is the only known degree of freedom; ids are pinned because a tie-crossing selection would be a finding, not a tolerance (the tie rule is the kernel's strict-greater scan, lower expert id wins).",
         args.tokens
     );
     let gate_bytes = snap.read_raw(
@@ -320,7 +326,8 @@ fn run() -> Result<(), String> {
     cuda.copy_htod(&x_d, &x_bytes)?;
     cuda.copy_htod(&gate_d, &gate_bytes)?;
     cuda.copy_htod(&bias_d, &bias_bytes)?;
-    let (router_module, router_kernel) = router_launch::load(&cuda, &router_cubin)?;
+    let (router_module, router_kernel, router_topk_module, router_topk) =
+        router_launch::load(&cuda, &router_cubin)?;
     let router_params = RouterLaunchParams {
         x: x_d,
         gate: gate_d,
@@ -334,11 +341,11 @@ fn run() -> Result<(), String> {
         step_seq: 0,
     };
     check_floor(args.floor_gib, "m17a stage 1 pre-launch")?;
-    router_launch::launch(&cuda, router_kernel, &router_params)?;
+    router_launch::launch(&cuda, router_kernel, router_topk, &router_params)?;
     let (device_ids, device_weights, device_scores) =
         read_router_outputs(&cuda, &ids_d, &weights_d, &scores_d, args.tokens)?;
     let first_router_bytes = router_raw_bytes(&device_ids, &device_weights, &device_scores);
-    router_launch::launch(&cuda, router_kernel, &router_params)?;
+    router_launch::launch(&cuda, router_kernel, router_topk, &router_params)?;
     let (ids_2, weights_2, scores_2) =
         read_router_outputs(&cuda, &ids_d, &weights_d, &scores_d, args.tokens)?;
     let second_router_bytes = router_raw_bytes(&ids_2, &weights_2, &scores_2);
@@ -347,6 +354,7 @@ fn run() -> Result<(), String> {
     // weights IN PLACE as its weight operand, so the multiply happens on the device rather than on a
     // host copy. (The host readback above is only the comparison twin.)
     cuda.free(router_module, &[x_d, gate_d, bias_d, ids_d, scores_d]);
+    cuda.free(router_topk_module, &[]);
 
     let ids_exact = device_ids == twin_ids;
     let id_mismatches = device_ids
@@ -984,6 +992,20 @@ fn run() -> Result<(), String> {
             first_chain.len()
         ),
     );
+    if let Some(path) = &args.dump {
+        let mut bytes = Vec::with_capacity(first_chain.len() * 2);
+        for code in &first_chain {
+            bytes.extend_from_slice(&code.to_le_bytes());
+        }
+        std::fs::write(path, &bytes)
+            .map_err(|error| format!("dump {}: {error}", path.display()))?;
+        println!(
+            "stage 4 dump: {} bytes ({} bf16 codes) written to {}",
+            bytes.len(),
+            first_chain.len(),
+            path.display()
+        );
+    }
     println!(
         "stage 4 output: {} token rows x {HIDDEN} bf16 codes (native combine: 4-rank f32 sum, per-expert bf16 round, ascending expert-id add, bf16 shared stand-in, one MoE bf16; residual belongs to hc_post and is not in this stage)",
         args.tokens

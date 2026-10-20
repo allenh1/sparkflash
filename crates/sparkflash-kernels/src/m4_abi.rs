@@ -1070,7 +1070,7 @@ const SIGNATURES: [(&str, &str, &str); 6] = [
     (
         "cert_lm_head_sm121.cu",
         "cert_lm_head_sm121",
-        "const __nv_bfloat16 *__restrict__ hidden; const __nv_bfloat16 *__restrict__ w; float *__restrict__ logits; uint8_t *__restrict__ certified; unsigned int *__restrict__ certified_count; float *__restrict__ block_max; uint32_t *__restrict__ block_argmax; const uint32_t vocab; GpuTraceRing *__restrict__ trace_ring; const uint32_t layer_id; const uint64_t step_seq",
+        "const __nv_bfloat16 *__restrict__ hidden; const __nv_bfloat16 *__restrict__ w; const __nv_bfloat16 *__restrict__ w_block_max; float *__restrict__ logits; uint8_t *__restrict__ certified; unsigned int *__restrict__ certified_count; float *__restrict__ block_max; uint32_t *__restrict__ block_argmax; const uint32_t vocab; GpuTraceRing *__restrict__ trace_ring; const uint32_t layer_id; const uint64_t step_seq",
     ),
 ];
 
@@ -1232,12 +1232,12 @@ fn the_geometry_parser_re_derives_rather_than_restates() {
 #[cfg(test)]
 const ASSERT_COUNTS: [(&str, usize); 7] = [
     ("m4_common_sm121.cuh", 20),
-    ("mega_mhc_sm121.cu", 6),
-    ("b12x_mxfp8_dense_sm121.cu", 6),
+    ("mega_mhc_sm121.cu", 7),
+    ("b12x_mxfp8_dense_sm121.cu", 15),
     ("b12x_mxfp4_moe_sm121.cu", 10),
     ("flash_mla_csa2_sm121.cu", 17),
-    ("b12x_mxfp8_wo_a_sm121.cu", 11),
-    ("cert_lm_head_sm121.cu", 8),
+    ("b12x_mxfp8_wo_a_sm121.cu", 20),
+    ("cert_lm_head_sm121.cu", 9),
 ];
 
 /// Why an assertion is not a conformance check, as a function so that the mutation test below runs
@@ -1590,8 +1590,8 @@ fn every_static_assert_in_the_milestone_holds_under_rust_too() {
         }
     }
     assert_eq!(
-        checked, 78,
-        "the milestone's static asserts must all be evaluated: 20 in the shared header plus 6, 6, \
+        checked, 98,
+        "the milestone's static asserts must all be evaluated: 20 in the shared header plus 6, 7, \
          10, 17, 11 and 8 in the six kernels. The MoE count rose from 7 to 10 with D14, which pins \
          the FP8 E4M3 activation operand's byte width in the build itself; flash_mla's rose from 13 \
          to 15 with the engine window format's two layout asserts, then to 17 with the union \

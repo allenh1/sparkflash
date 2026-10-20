@@ -22,8 +22,10 @@
 
 use crate::c_decl::{self, Consts, KernelDecl};
 
-/// The kernel symbol, which is also the cubin stem and the manifest key.
+/// The stage-one kernel symbol, which is also the cubin stem and the manifest key.
 pub const ROUTER_KERNEL: &str = "moe_router_sm121";
+/// The stage-two symbol: a second kernel in the same cubin, not a manifest key of its own.
+pub const TOPK_KERNEL: &str = "moe_router_topk_sm121";
 
 /// The kernel source, as the parser and the pins see it.
 pub const ROUTER_SOURCE: &str = include_str!("../../../kernels/moe_router_sm121.cu");
@@ -37,16 +39,20 @@ pub const N_ROUTED: u32 = 384;
 pub const HIDDEN: u32 = 5120;
 /// Experts activated per token (config.json num_experts_per_tok).
 pub const TOP_K: u32 = 6;
-/// Tokens one thread block routes.
+/// Tokens one stage-one thread block routes (one token per active lane).
 pub const TOKENS_PER_BLOCK: u32 = 8;
-/// Threads per block (32 per token).
+/// Stage-one threads per block (eight warps of 32 lanes).
 pub const THREADS: u32 = 256;
-/// Threads per token: one lane owns one expert lane.
-pub const THREADS_PER_TOKEN: u32 = THREADS / TOKENS_PER_BLOCK;
-/// Consecutive experts one thread accumulates.
-pub const EXPERTS_PER_THREAD: u32 = N_ROUTED / THREADS_PER_TOKEN;
-/// The reduction tile: one MX block of 32 values at a time.
+/// The warp width: lanes 0..7 each own one token's serial reduction.
+pub const LANES: u32 = 32;
+/// Warps per stage-one block: one warp owns one expert.
+pub const WARPS: u32 = THREADS / LANES;
+/// Consecutive experts one stage-one block owns (one per warp).
+pub const EXPERTS_PER_BLOCK: u32 = WARPS;
+/// The MX block size the hidden width divides into (the stage-one loop itself is serial).
 pub const K_TILE: u32 = 32;
+/// Stage-two threads per block (one token per thread).
+pub const TOPK_THREADS: u32 = 256;
 /// Gate temperature (config.json does not carry it; the released default is 1.0).
 pub const GATE_TEMP: f32 = 1.0;
 /// PyTorch F.softplus's threshold (model.py:816).
@@ -56,13 +62,15 @@ pub const NORM_EPS: f32 = 1e-20;
 /// The routed scaling factor (model.py:826).
 pub const ROUTE_SCALE: f32 = 1.5;
 
-/// The argument array a launch fills, in words: six pointers, tokens, trace ring, layer id, step.
+/// The stage-one argument array, in words: six pointers, tokens, trace ring, layer id, step.
 pub const ARG_WORDS: usize = 10;
+/// The stage-two argument array, in words: four pointers, tokens, trace ring, layer id, step.
+pub const TOPK_ARG_WORDS: usize = 8;
 
 /// Pinned cubin size, measured with nvcc V13.0.88 (CUDA 13.0.3) for sm_121a.
-pub const CUBIN_BYTES: usize = 37_384;
+pub const CUBIN_BYTES: usize = 25_432;
 /// Pinned cubin sha256, from the same measurement.
-pub const CUBIN_SHA256: &str = "5992cef91c3e01be46c0691a5d905877b38a2c3002d90d5c31b80a003924769b";
+pub const CUBIN_SHA256: &str = "42f6bbdcc6cf26890f2f0b1a24718e65da4ff0d0bedee7bca9a4598018b688cc";
 /// PTX membar lines in the pinned PTX: the kernel emits none (no fence, no acquire).
 pub const CUBIN_MEMBAR_LINES: usize = 0;
 /// The toolkit the pin was measured with.
@@ -94,6 +102,40 @@ pub fn constants() -> Consts {
     let mut table = Consts::parse(ROUTER_SOURCE);
     table.extend(COMMON_HEADER);
     table
+}
+
+/// The stage-two kernel's parameters, in declaration order.
+pub const TOPK_PARAMS: [(&str, &str, bool, bool); TOPK_ARG_WORDS] = [
+    ("bias", "float", true, true),
+    ("scores", "float", true, true),
+    ("ids", "uint32_t", true, false),
+    ("weights", "float", true, false),
+    ("tokens", "uint32_t", false, false),
+    ("trace_ring", "GpuTraceRing", true, false),
+    ("layer_id", "uint32_t", false, false),
+    ("step_seq", "uint64_t", false, false),
+];
+
+/// Parses the stage-two declaration out of the kernel source.
+#[must_use]
+pub fn topk_declaration() -> KernelDecl {
+    c_decl::kernel_declaration(ROUTER_SOURCE, TOPK_KERNEL)
+}
+
+/// Whether a parsed declaration has [TOPK_PARAMS]' shape and order.
+#[must_use]
+pub fn topk_declaration_matches(decl: &KernelDecl) -> bool {
+    decl.name == TOPK_KERNEL
+        && decl.extern_c
+        && decl.global
+        && decl.params.len() == TOPK_ARG_WORDS
+        && decl.params.iter().zip(TOPK_PARAMS).all(|(param, pin)| {
+            param.name == pin.0
+                && param.base == pin.1
+                && param.pointer == pin.2
+                && param.const_pointee == pin.3
+                && (!param.pointer || param.restrict)
+        })
 }
 
 /// Whether a parsed declaration has [ROUTER_PARAMS]' shape and order. Used by the mutation test,
@@ -136,11 +178,26 @@ mod tests {
     }
 
     #[test]
+    fn the_stage_two_declaration_is_the_pinned_one() {
+        let decl = topk_declaration();
+        assert!(
+            topk_declaration_matches(&decl),
+            "the stage-two declaration drifted: {decl:?}"
+        );
+        assert_eq!(decl.params.len(), TOPK_ARG_WORDS);
+        assert!(!decl.params[4].pointer, "tokens is a value");
+        assert!(decl.params[5].pointer, "trace_ring is a pointer");
+        assert_eq!(decl.params[5].base, "GpuTraceRing");
+        assert!(!decl.params[6].pointer && !decl.params[7].pointer);
+    }
+
+    #[test]
     fn the_declaration_pin_is_not_vacuous() {
         // Swap two adjacent parameter types the way a careless ABI edit would; the pin must see it.
-        let mutated = ROUTER_SOURCE.replace(
-            "    uint32_t *__restrict__ ids,                 // [tokens][top_k] selected expert ids\n    float *__restrict__ weights,",
-            "    float *__restrict__ ids,                  // [tokens][top_k] selected expert ids\n    uint32_t *__restrict__ weights,",
+        let mutated = ROUTER_SOURCE.replacen(
+            "    uint32_t *__restrict__ ids,                 // [tokens][top_k] selected expert ids (stage 2)\n    float *__restrict__ weights,                // [tokens][top_k] normalised weights (stage 2)",
+            "    float *__restrict__ ids,                    // [tokens][top_k] selected expert ids (stage 2)\n    uint32_t *__restrict__ weights,             // [tokens][top_k] normalised weights (stage 2)",
+            1,
         );
         assert_ne!(mutated, ROUTER_SOURCE, "the mutation must apply");
         let decl = c_decl::kernel_declaration(&mutated, ROUTER_KERNEL);
@@ -161,13 +218,15 @@ mod tests {
             TOKENS_PER_BLOCK as i128
         );
         assert_eq!(table.value("SPARK_ROUTER_THREADS"), THREADS as i128);
+        assert_eq!(table.value("SPARK_ROUTER_LANES"), LANES as i128);
+        assert_eq!(table.value("SPARK_ROUTER_WARPS"), WARPS as i128);
         assert_eq!(
-            table.value("SPARK_ROUTER_THREADS_PER_TOKEN"),
-            THREADS_PER_TOKEN as i128
+            table.value("SPARK_ROUTER_EXPERTS_PER_BLOCK"),
+            EXPERTS_PER_BLOCK as i128
         );
         assert_eq!(
-            table.value("SPARK_ROUTER_EXPERTS_PER_THREAD"),
-            EXPERTS_PER_THREAD as i128
+            table.value("SPARK_ROUTER_TOPK_THREADS"),
+            TOPK_THREADS as i128
         );
         assert_eq!(table.value("SPARK_ROUTER_K_TILE"), K_TILE as i128);
         assert_eq!(
@@ -226,10 +285,10 @@ mod tests {
             expected,
             "the manifest entry must be the pinned cubin"
         );
-        // The header count and toolkit are part of the same claim: eighteen entries, this toolkit.
+        // The header count and toolkit are part of the same claim: nineteen entries, this toolkit.
         assert!(
-            BASELINE.contains("eighteen baseline kernels"),
-            "the manifest header must say eighteen"
+            BASELINE.contains("nineteen baseline kernels"),
+            "the manifest header must say nineteen"
         );
         assert!(BASELINE.contains(&format!("nvcc_release={TOOLKIT_RELEASE}")));
         assert!(BASELINE.contains("arch=sm_121a"));

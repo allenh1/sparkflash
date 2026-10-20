@@ -511,3 +511,46 @@ position 129 with device token **8060** against the fixture's **491** and then a
 embedding seam can stage an arbitrary generated token. Criterion 1 therefore fails on the current
 arithmetic and is blocked on that seam; see [DECISIONS.md](../DECISIONS.md) D37 for the measured
 verdict and the precision-versus-criterion decision.
+
+## 11. D49 ring capacity: source, pin and probe (no device run)
+
+D49 pre-authorised a new ring-capacity symbol separate from the frozen `flash_mla_csa2_seq_sm121`
+entry. This batch adds ONE of the four symbols in D49's C2 set (ring / mHC rows / cert rows / lm
+rows); the other three are NOT taken here.
+
+- source: `kernels/flash_mla_csa2_ring_sm121.cu`; symbol `flash_mla_csa2_ring_sm121`.
+- capacity: `SPARK_M4_MLA_RING_CAPACITY 134u`, separate from `SPARK_M4_SWA_WINDOW 128u`; the caller's
+  slot is `position % 134`, while the attended arithmetic window stays the last 128 positions.
+- score array: `SPARK_M4_MLA_RING_MAX_ATTENDED == 646u` (512 candidates + the 134-slot ring).
+- ABI: 21 words, the frozen entry's 19 words plus explicit `ring_capacity` (word 7) and
+  `compression_ratio` (word 8). The frozen 19-word `flash_mla_csa2_seq_sm121` entry, its source and
+  its cubin pin are untouched.
+- refusals: format != 2, capacity 0 or > 134, `window_rows > ring_capacity`, ratio 0, and
+  `window_rows + selected_count > 646` all write NaN into `out[]` with no trace pair. The accept-input
+  NaN guard is engine-side (D49) and is not this kernel's input; no engine code changed here.
+- static-assert count in the new source: 19 (the sequence source has 18, one of which is the
+  batched-only BATCH_ROWS assert that this scalar ring source does not carry). The two additions are
+  the D49 capacity value 134 and the ring-holds-the-window bound; no 22 was pre-declared.
+- baseline pin: **18 -> 19**, one new cubin entry, one new `KernelId::FlashMlaCsa2Ring`. New pin:
+  `cubin_bytes=38296`, `cubin_sha256=97dbef6a5cb62a5868fe5c2c9125575d6d3825b91b45e4e352581d643914748c`,
+  `ptx_membar_lines=0`, compiled with the recorded toolkit (V13.0.88, build
+  `cuda_13.0.r13.0/compiler.36424714_0`, sm_121a). The same toolkit recompiled the existing
+  sequence entry to its recorded `ca69c110...` pin, so the pin environment is the baseline's.
+- clang stub-header probe (nvcc was not on PATH for this source edit): the build probe parsed 19 of
+  19 sources and the combined translation unit; a direct AST probe shows
+  `FunctionDecl ... flash_mla_csa2_ring_sm121 'void (...)'` with 21 `ParmVarDecl`s, including
+  `ring_capacity` and `compression_ratio`, exit 0 with empty stderr.
+
+No device run, no numerics, no serving or parity claim. The D49 gate still requires a device run of
+ the 134-slot ring; this batch only proves the new symbol parses, compiles to its own pinned cubin,
+ and does not mutate the frozen sequence entry.
+
+Branch gate fixes (recorded, not silent edits):
+
+- `ci/verify-m4-abi-split.py` gained allow-listed post-split replacements for the K8 batched mHC
+  scanner-data edits, so byte-identical regeneration still passes with the 13,924 B root+guard family
+  pin unchanged.
+- `crates/sparkflash-kernels/tests/mhc_determinism.rs` now expects one `hc_sync` atomic per mHC
+  kernel (scalar + K8 batched), while still forbidding `hc_stats` atomics.
+- baseline/manifest/probe counts moved 18 -> 19 for the new ring entry; the sequence entry's own
+  pin is unchanged.

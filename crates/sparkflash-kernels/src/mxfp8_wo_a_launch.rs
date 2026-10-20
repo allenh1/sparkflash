@@ -63,6 +63,26 @@ pub fn declaration_matches(decl: &KernelDecl) -> bool {
 
 /// The kernel id in the shared driver's enum.
 pub const KERNEL_ID: KernelId = KernelId::Mxfp8WoA;
+/// The K1 warp-per-column symbol; it shares the wo_a cubin with [KERNEL].
+pub const WARP_KERNEL: &str = "b12x_mxfp8_wo_a_warp_sm121";
+/// Warp-per-column block: eight output channels per block.
+pub const WARP_BLOCK: (u32, u32, u32) = (256, 1, 1);
+/// Output channels per warp-per-column block.
+pub const WARP_COLUMNS: u32 = 8;
+/// The K1-b A-reuse tile symbol for the grouped wo_a projection.
+pub const TILE_KERNEL: &str = "b12x_mxfp8_wo_a_tile_sm121";
+/// A-reuse wo_a block: 128 output channels of one group.
+pub const TILE_BLOCK: (u32, u32, u32) = (128, 1, 1);
+/// Output channels one A-reuse wo_a block owns.
+pub const TILE_COLUMNS: u32 = 128;
+/// The K8 batched wo_a tile symbol: up to six positions in one launch.
+pub const BATCH_KERNEL: &str = "b12x_mxfp8_wo_a_batched_sm121";
+/// Batched block: 128 channels, each thread owning all six positions.
+pub const BATCH_BLOCK: (u32, u32, u32) = (128, 1, 1);
+/// The batched kernel's fixed row count (the six-row verify batch).
+pub const BATCH_MAX_ROWS: u32 = 6;
+/// The released output LoRA rank (also the wo_a row count).
+pub const O_LORA_RANK: u32 = 1024;
 /// 256 threads, one 256-wide output-channel tile per block.
 pub const BLOCK: (u32, u32, u32) = (256, 1, 1);
 /// The output-channel tile the kernel computes per block.
@@ -136,6 +156,39 @@ pub fn load(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), String> {
     cuda.load_kernel(cubin, KERNEL_ID)
 }
 
+/// Loads the K1 warp-per-column symbol by name.
+pub fn load_warp(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+    cuda.load_wo_a_warp(cubin)
+}
+
+/// Loads the K1-b A-reuse wo_a tile symbol by name.
+pub fn load_tile(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+    cuda.load_wo_a_tile(cubin)
+}
+
+/// Loads the K8 batched wo_a symbol by name.
+pub fn load_batched(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+    cuda.load_wo_a_batched(cubin)
+}
+
+/// The K1 grid: `(ceil(O_LORA_RANK / 8), groups, 1)`.
+#[must_use]
+pub fn warp_grid(groups: u32) -> (u32, u32, u32) {
+    (O_LORA_RANK.div_ceil(WARP_COLUMNS), groups, 1)
+}
+
+/// The K1-b grid: `(ceil(O_LORA_RANK / 128), groups, 1)`.
+#[must_use]
+pub fn tile_grid(groups: u32) -> (u32, u32, u32) {
+    (O_LORA_RANK.div_ceil(TILE_COLUMNS), groups, 1)
+}
+
+/// The K8 batched grid: `(ceil(O_LORA_RANK / 128), groups, 1)`; one block computes all six rows.
+#[must_use]
+pub fn batched_grid(_rows: u32, groups: u32) -> (u32, u32, u32) {
+    (O_LORA_RANK.div_ceil(TILE_COLUMNS), groups, 1)
+}
+
 /// Launches the projection once.
 ///
 /// # Errors
@@ -143,6 +196,65 @@ pub fn load(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), String> {
 pub fn launch(cuda: &Cuda, kernel: Kernel, params: &Mxfp8WoAParams) -> Result<(), String> {
     let grid = grid(params.groups())?;
     cuda.launch(kernel, grid, BLOCK, params.as_slice())
+}
+
+/// Launches the K1 warp-per-column projection once.
+///
+/// # Errors
+/// Refuses a zero group count, and returns the driver's error otherwise.
+pub fn launch_warp(cuda: &Cuda, kernel: Kernel, params: &Mxfp8WoAParams) -> Result<(), String> {
+    if params.groups() == 0 {
+        return Err("wo_a projects at least one group, so the grid is not zero-sized".to_owned());
+    }
+    cuda.launch(
+        kernel,
+        warp_grid(params.groups()),
+        WARP_BLOCK,
+        params.as_slice(),
+    )
+}
+
+/// Launches the K1-b A-reuse wo_a tile once.
+///
+/// # Errors
+/// Refuses a zero group count, and returns the driver's error otherwise.
+pub fn launch_tile(cuda: &Cuda, kernel: Kernel, params: &Mxfp8WoAParams) -> Result<(), String> {
+    if params.groups() == 0 {
+        return Err("wo_a projects at least one group, so the grid is not zero-sized".to_owned());
+    }
+    cuda.launch(
+        kernel,
+        tile_grid(params.groups()),
+        TILE_BLOCK,
+        params.as_slice(),
+    )
+}
+
+/// Launches the K8 batched wo_a tile once over `rows` positions.
+///
+/// # Errors
+/// Refuses zero groups, zero rows, or more than [BATCH_MAX_ROWS], and returns the driver's error
+/// otherwise.
+pub fn launch_batched(
+    cuda: &Cuda,
+    kernel: Kernel,
+    params: &Mxfp8WoAParams,
+    rows: u32,
+) -> Result<(), String> {
+    if params.groups() == 0 {
+        return Err("wo_a projects at least one group, so the grid is not zero-sized".to_owned());
+    }
+    if rows != BATCH_MAX_ROWS {
+        return Err(format!(
+            "batched wo_a is the fixed six-row verify shape, not {rows} rows"
+        ));
+    }
+    cuda.launch(
+        kernel,
+        batched_grid(rows, params.groups()),
+        BATCH_BLOCK,
+        params.as_slice(),
+    )
 }
 
 #[cfg(test)]

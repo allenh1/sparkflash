@@ -164,3 +164,26 @@ Consequences for this plan:
 - **tp-dev owns the design** (docs/build/tp4-design.md, reviewed by the Lead before implementation)
   and the staged implementation tasks; wo_a (task-6), MoE combine (task-4) and the other native
   fixes stay single-rank work and are revisited for resident weights when TP=4 lands.
+
+## Addendum 2026-10-20 - K8 batched kernels and the exact router measured on device
+
+The batch-19 kernel rewrite was measured on a GB10 (node0) with its own harnesses after two
+rounds of fixes. Post-fix state, all from the tree's harnesses against rebuilt pinned cubins:
+
+- **Router (`m9_router`): PASS 7/7.** The K3-final warp-tree reduction had broken the serial
+  ascending-k contract the engine host path defines (scores 1.4305115e-6 / 131 ULP, weights
+  2.3841858e-7 / 21 ULP against bars 1e-6 / 8 and 1e-6 / 16, ids still 48/48). Restoring one
+  active lane per token with ascending k gives ids 48/48, scores 1.1920929e-7 / ULP 1, weights
+  5.9604645e-8 / ULP 2, determinism byte-identical - at **0.2279 ms per 8-token launch /
+  0.0285 ms per token**, about 2.1x the (wrong) tree version's 0.1084 ms / 0.0136 ms. The exact
+  reduction has a real step cost: 40 layers is ~1.14 ms/token of router, counted in D48.
+- **Batched six-row kernels, all byte-exact after the fixes:** cert head 6/6 rows identical
+  (2.85x one scalar launch, ~2.10x vs six sequential, 11.0% of the traffic roofline), mHC 4.32x,
+  sequence entry 6/6 identical (0.597x six sequential), lm-reduce 1.01x (no win - not a lever).
+- **The first device attempt failed, and that is the reason the gate exists:** m22/m23/m20 all
+  mismatched (m20's published index arrays came from a stage-1 loop that carried per-worker bests
+  across blocks and only covered 512 of 2048 blocks), and the router failed two numeric bars. The
+  harnesses + rebuilt pins caught it; no speed number from the broken tree is carried anywhere.
+- **Still not measured:** a token, a verify-step time, the 134-slot ring numerics, CUDA-graph
+  capture, RDMA one-shot. The 767.7 ms/step = 1.3026 tokens/s batch-18 row remains the best
+  measured decode until a device run beats it.

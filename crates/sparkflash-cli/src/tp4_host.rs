@@ -913,6 +913,9 @@ impl Tp4Rank {
         let shared = SharedSource {
             inner: Arc::clone(&source),
             cache: cache.clone(),
+            bound: Vec::new(),
+            rank: 0,
+            world: plan.tp_world(),
         };
         let collective = Arc::new(TpCollective::new(input.world, transport));
         // With the attention shard on, the engine reads plan slices (the rank's row block of
@@ -925,6 +928,9 @@ impl Tp4Rank {
                 full: SharedSource {
                     inner: Arc::clone(&source),
                     cache: cache.clone(),
+                    bound: Vec::new(),
+                    rank: 0,
+                    world: plan.tp_world(),
                 },
                 local: Arc::clone(&weights),
                 source: Arc::clone(&source),
@@ -933,6 +939,9 @@ impl Tp4Rank {
             Box::new(SharedSource {
                 inner: Arc::clone(&source),
                 cache: cache.clone(),
+                bound: Vec::new(),
+                rank: 0,
+                world: plan.tp_world(),
             })
         };
         let mut engine = InferenceEngine::new(config.clone(), engine_source, element_limit)
@@ -1098,10 +1107,7 @@ impl Tp4Rank {
             .map_err(|error| Tp4Error::new(format!("engram hashes: {error}")))?;
         let per_token = hashes.len() / seqlen.max(1);
         backend.position = start_pos;
-        let providers = HostProviders {
-            config,
-            source: shared,
-        };
+        let providers = HostProviders::for_rank(config, shared);
         let profiling = profiler.is_some();
         let mut layer_provider: Vec<(usize, u64, u64)> = Vec::new();
         let mut layer_post: Vec<(usize, u64)> = Vec::new();
@@ -1262,31 +1268,31 @@ impl Tp4Rank {
             .map_err(|error| Tp4Error::new(format!("engram hashes: {error}")))?;
         let embedding = read_embedding_row(source, config, token).map_err(Tp4Error::new)?;
         backend.position = position;
-        let providers = HostProviders {
-            config,
-            source: shared,
-        };
+        let providers = HostProviders::for_rank(config, shared);
         let profiling = profiler.is_some();
         let mut layer_provider: Vec<(usize, u64, u64)> = Vec::new();
         let mut layer_post: Vec<(usize, u64)> = Vec::new();
         let mut provider =
             |layer: usize, hidden: &[f32], pre_mix: &[f32], deferred: Option<&DeferredHandoff>| {
-                let started = Instant::now();
-                let result = providers.deferred_entry(layer, hidden, pre_mix, deferred, &hashes);
-                if profiling {
-                    let micros = started.elapsed().as_micros() as u64;
-                    let deferred_us = if deferred.is_some() { micros } else { 0 };
-                    layer_provider.push((layer, micros, deferred_us));
-                }
-                result
+                providers.deferred_entry_traced(
+                    layer,
+                    hidden,
+                    pre_mix,
+                    deferred,
+                    &hashes,
+                    profiling,
+                    &mut layer_provider,
+                )
             };
         let mut post = |layer: usize, residual: &[f32], attention_out: &[f32], mixes: &Mixes| {
-            let started = Instant::now();
-            let result = providers.post(layer, residual, attention_out, mixes);
-            if profiling {
-                layer_post.push((layer, started.elapsed().as_micros() as u64));
-            }
-            result
+            providers.post_traced(
+                layer,
+                residual,
+                attention_out,
+                mixes,
+                profiling,
+                &mut layer_post,
+            )
         };
         let mut layer_progress: Vec<(usize, u64)> = Vec::new();
         let mut progress = |layer: usize, host_ms: u64| {
@@ -1593,6 +1599,70 @@ fn rss_kib() -> (u64, u64) {
 struct SharedSource {
     inner: Arc<SafeTensorsSource>,
     cache: Option<Arc<ResidentCache>>,
+    /// Categories the device arena already owns on this rank. Reading them through the host path
+    /// would defeat the weight-H2D==0 rule, so it is an error at the source, not a slow path.
+    bound: Vec<&'static str>,
+    rank: usize,
+    world: usize,
+}
+
+/// The plan-name category a tensor belongs to, for the arena-vs-host ownership split.
+fn category_of(name: &str) -> Option<&'static str> {
+    if name.contains(".ffn.experts.") {
+        Some("routed-experts")
+    } else if name.contains(".ffn.shared_experts.") {
+        Some("shared-experts")
+    } else if name.contains(".attn.") {
+        Some("attention")
+    } else if name == "embed.weight" || name == "head.weight" {
+        Some("embedding")
+    } else if name.contains(".hc_") {
+        Some("mhc")
+    } else if name.contains("norm.weight") {
+        Some("norms")
+    } else if name.contains("engram.") {
+        Some("engram")
+    } else {
+        None
+    }
+}
+
+impl SharedSource {
+    /// The rank's host-side weight view: the twin's source plus rank/world and the categories the
+    /// arena owns. An empty `bound` list is exactly the twin's previous behaviour.
+    #[allow(dead_code)] // device-arm scaffolding: adopted when the four-rank loop is wired
+    fn for_rank(
+        inner: Arc<SafeTensorsSource>,
+        cache: Option<Arc<ResidentCache>>,
+        rank: usize,
+        world: usize,
+        bound: Vec<&'static str>,
+    ) -> Self {
+        Self {
+            inner,
+            cache,
+            bound,
+            rank,
+            world,
+        }
+    }
+
+    fn bound_refusal(&self, name: &str) -> Option<WeightError> {
+        let category = category_of(name)?;
+        if self.bound.contains(&category) {
+            Some(WeightError::Malformed {
+                name: name.to_owned(),
+                detail: format!(
+                    "rank {} of {} host weight read of an arena-owned category: ",
+                    self.rank, self.world
+                ) + &format!(
+                    "{name}: {category} is bound in the device arena; the host path must not materialise it (weight H2D must stay zero)"
+                ),
+            })
+        } else {
+            None
+        }
+    }
 }
 
 impl WeightSource for SharedSource {
@@ -1603,6 +1673,9 @@ impl WeightSource for SharedSource {
         self.inner.spec(name)
     }
     fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+        if let Some(refusal) = self.bound_refusal(name) {
+            return Err(refusal);
+        }
         if let Some(cache) = &self.cache
             && let Some(bytes) = cache.get(name)
         {
@@ -1611,6 +1684,9 @@ impl WeightSource for SharedSource {
         self.inner.read(name)
     }
     fn read_view(&self, name: &str) -> Result<Option<&[u8]>, WeightError> {
+        if let Some(refusal) = self.bound_refusal(name) {
+            return Err(refusal);
+        }
         Ok(self
             .cache
             .as_ref()
@@ -2133,7 +2209,13 @@ struct HostProviders<'a> {
     source: &'a SharedSource,
 }
 
-impl HostProviders<'_> {
+impl<'a> HostProviders<'a> {
+    /// The rank-parameterised constructor: the same config and source the twin uses, with the rank's
+    /// arena-owned categories marked so the host path refuses them instead of materialising them.
+    fn for_rank(config: &'a ModelConfig, source: &'a SharedSource) -> Self {
+        Self { config, source }
+    }
+
     fn entry(
         &self,
         layer: usize,
@@ -2200,6 +2282,48 @@ impl HostProviders<'_> {
             )?;
         }
         self.entry(layer, &x, pre_mix)
+    }
+
+    /// Provider call with the step profiler folded in: the body is the same as `deferred_entry`,
+    /// so a run with the profiler off takes the identical arithmetic and the twin's numbers cannot
+    /// change.
+    #[allow(clippy::too_many_arguments)] // the traced twin mirrors the untraced provider's arguments
+    fn deferred_entry_traced(
+        &self,
+        layer: usize,
+        hidden: &[f32],
+        pre_mix: &[f32],
+        deferred: Option<&DeferredHandoff>,
+        hashes: &[u32],
+        profiling: bool,
+        log: &mut Vec<(usize, u64, u64)>,
+    ) -> Result<HybridEntry, EngineError> {
+        let started = Instant::now();
+        let result = self.deferred_entry(layer, hidden, pre_mix, deferred, hashes);
+        if profiling {
+            let micros = started.elapsed().as_micros() as u64;
+            let deferred_us = if deferred.is_some() { micros } else { 0 };
+            log.push((layer, micros, deferred_us));
+        }
+        result
+    }
+
+    /// Post call with the step profiler folded in; identical body when profiling is off.
+    fn post_traced(
+        &self,
+        layer: usize,
+        residual: &[f32],
+        attention_out: &[f32],
+        mixes: &Mixes,
+        profiling: bool,
+        log: &mut Vec<(usize, u64)>,
+    ) -> Result<HybridPost, EngineError> {
+        let started = Instant::now();
+        let result = self.post(layer, residual, attention_out, mixes);
+        if profiling {
+            log.push((layer, started.elapsed().as_micros() as u64));
+        }
+        result
     }
 
     fn post(
@@ -3365,6 +3489,9 @@ mod tests {
             Box::new(SharedSource {
                 inner: Arc::new(source),
                 cache: None,
+                bound: Vec::new(),
+                rank: 0,
+                world: 4,
             }),
             ELEMENT_LIMIT,
         )
@@ -3870,5 +3997,47 @@ mod tests {
                 .all(|digest| digest.as_str().is_some_and(|text| text.len() == 64)),
             "the digests are SHA-256 hex"
         );
+    }
+}
+
+#[cfg(test)]
+mod rank_view_tests {
+    use super::*;
+
+    #[test]
+    fn plan_name_categories_split_arena_owned_families_from_the_host_only_ones() {
+        assert_eq!(
+            category_of("layers.0.ffn.experts.3.w1.weight"),
+            Some("routed-experts")
+        );
+        assert_eq!(
+            category_of("layers.0.ffn.shared_experts.w1.weight"),
+            Some("shared-experts")
+        );
+        assert_eq!(category_of("layers.0.attn.wq_b.weight"), Some("attention"));
+        assert_eq!(category_of("embed.weight"), Some("embedding"));
+        assert_eq!(category_of("head.weight"), Some("embedding"));
+        assert_eq!(category_of("layers.7.attn_norm.weight"), Some("norms"));
+        assert_eq!(category_of("layers.1.hc_attn_fn"), Some("mhc"));
+        assert_eq!(category_of("engram.q_weight"), Some("engram"));
+        assert_eq!(
+            category_of("layers.0.attn.compressor.wgate.weight"),
+            Some("attention")
+        );
+    }
+
+    #[test]
+    fn no_category_is_both_host_only_and_arena_owned() {
+        let host_only = ["norms", "mhc", "engram"];
+        for name in [
+            "layers.0.attn.wo_b.weight",
+            "layers.0.ffn.experts.0.w2.weight",
+        ] {
+            let category = category_of(name).expect("arena-owned names classify");
+            assert!(
+                !host_only.contains(&category),
+                "{name} must not be host-only"
+            );
+        }
     }
 }

@@ -105,11 +105,11 @@ The larger protocol-layer adoption (7-10 days) is scheduled separately, not in t
 
 Owner: **engine-dev**.
 
-- [ ] DSpark/MTP design: `TODO(engine-dev)` - link `docs/engine/mtp-dspark-design.md` from
-  branch `task/mtp-dspark-design` once merged; draft-head placement, acceptance/top-k/vocabulary
-  contract, measured acceptance and refusal modes;
-- [ ] dispatch diagnostic results: `TODO(engine-dev)` - the diagnostic's fields, what it measured
-  and what it does not prove.
+- DSpark/MTP design: **deferred out of batch 19** - `docs/engine/mtp-dspark-design.md`
+  (`task/mtp-dspark-design`) was not merged; batch 19 carries the D50 decision entry and the
+  device-wiring doc instead, and the design page lands with the batch that wires the drafter;
+- Dispatch diagnostic results: **deferred** - the diagnostic's fields and their measured scope
+  land with the serving-diagnostic batch, not here.
 
 No throughput or acceptance number is quoted here until engine-dev supplies the field names and
 the measured artefact.

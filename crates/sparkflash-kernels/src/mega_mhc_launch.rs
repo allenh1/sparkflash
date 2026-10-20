@@ -78,6 +78,16 @@ pub const KERNEL_ID: KernelId = KernelId::MegaMhcBf16;
 pub const BLOCK: (u32, u32, u32) = (128, 1, 1);
 /// The grid: one block per 1280-value tile of the 5120-wide hidden state.
 pub const GRID: (u32, u32, u32) = (4, 1, 1);
+/// K8 batched mHC symbol: one launch over six rows, grid (tiles, rows).
+pub const BATCH_KERNEL: &str = "mega_mhc_fused_bf16_batched_sm121";
+/// Device rendezvous reset symbol: clears the six rows' hc_sync and hc_stats scratch.
+pub const INIT_KERNEL: &str = "mega_mhc_init_sm121";
+/// The verifier batch is six rows.
+pub const BATCH_ROWS: u32 = 6;
+/// The batched grid keeps the four hidden tiles and adds one row dimension.
+pub const BATCH_GRID: (u32, u32, u32) = (4, BATCH_ROWS, 1);
+/// The init kernel's geometry: one block of 128 threads clears 780 floats and 12 words.
+pub const INIT_GRID: (u32, u32, u32) = (1, 1, 1);
 
 /// One launch's arguments, in the kernel declaration's order.
 ///
@@ -141,6 +151,14 @@ impl MegaMhcParams {
     }
 }
 
+/// Loads the K8 batched and init symbols by name from the same cubin.
+///
+/// # Errors
+/// Returns the driver's error when either symbol is missing.
+pub fn load_batched(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel, Module, Kernel), String> {
+    cuda.load_mega_mhc_batched(cubin)
+}
+
 /// Loads the kernel from a cubin, resolving the pinned symbol.
 ///
 /// # Errors
@@ -155,6 +173,46 @@ pub fn load(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), String> {
 /// Returns the driver's error.
 pub fn launch(cuda: &Cuda, kernel: Kernel, params: &MegaMhcParams) -> Result<(), String> {
     cuda.launch(kernel, GRID, BLOCK, params.as_slice())
+}
+
+/// Launches the SCALAR mHC with the device init kernel instead of the per-launch host H2D reset.
+///
+/// The init kernel clears the six-row scratch (harmless for a one-row launch, which uses row 0),
+/// so the pair is graph-capturable: no host copy sits between the two launches. The scalar kernel's
+/// arithmetic, grid and arguments are unchanged.
+///
+/// # Errors
+/// Returns the driver's error from either launch.
+pub fn launch_with_device_init(
+    cuda: &Cuda,
+    init_kernel: Kernel,
+    kernel: Kernel,
+    params: &MegaMhcParams,
+) -> Result<(), String> {
+    let words = params.as_slice();
+    let init_args = [words[11], words[12], 1];
+    cuda.launch(init_kernel, INIT_GRID, BLOCK, &init_args)?;
+    cuda.launch(kernel, GRID, BLOCK, words)
+}
+
+/// Launches the K8 batched mHC: the device rendezvous reset kernel, then the six-row kernel.
+///
+/// The 19-word argument order is unchanged; every pointer inside it is batch-major over
+/// [BATCH_ROWS]. `hc_stats` is [6][(tiles + 1) * 26] and `hc_sync` is [6][2], both cleared by
+/// [INIT_KERNEL] on the device, so no host H2D is needed before the launch (graph-capture safe).
+///
+/// # Errors
+/// Returns the driver's error from either launch.
+pub fn launch_batched(
+    cuda: &Cuda,
+    init_kernel: Kernel,
+    kernel: Kernel,
+    params: &MegaMhcParams,
+) -> Result<(), String> {
+    let words = params.as_slice();
+    let init_args = [words[11], words[12], u64::from(BATCH_ROWS)];
+    cuda.launch(init_kernel, INIT_GRID, BLOCK, &init_args)?;
+    cuda.launch(kernel, BATCH_GRID, BLOCK, words)
 }
 
 /// Launches the kernel `repeat` times and returns `(per-launch ms, batched ms/launch)`.
@@ -228,6 +286,15 @@ mod tests {
             ]
         );
         assert_eq!(p.as_slice().len(), ARG_WORDS);
+    }
+
+    #[test]
+    fn the_batched_geometry_is_six_rows_over_the_four_tiles() {
+        assert_eq!(BATCH_ROWS, 6);
+        assert_eq!(BATCH_GRID, (GRID.0, 6, 1));
+        assert_eq!(INIT_GRID, (1, 1, 1));
+        assert_eq!(BLOCK.0, 128);
+        assert_ne!(BATCH_KERNEL, KERNEL);
     }
 
     #[test]

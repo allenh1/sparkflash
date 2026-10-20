@@ -1,6 +1,7 @@
 //! Milestone 5 scheduling: the bounded HSI indexer, the short-request prefill bypass, the
-//! DSpark confidence cap with sync-free philox drafting, the Causal Encoder prefill bypass,
-//! sequence-parallel planning, L2 weight-prefetch planning and the trace-capture CLI.
+//! DSpark confidence policy (the engine's MTP stages own the draft tokens), the Causal Encoder
+//! prefill bypass, sequence-parallel planning, L2 weight-prefetch planning and the trace-capture
+//! CLI.
 //!
 //! Everything here is a decision engine. A plan computes what the runtime would do and
 //! returns the numbers the tests assert, so the whole milestone is exercisable with no

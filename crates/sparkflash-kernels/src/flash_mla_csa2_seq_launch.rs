@@ -46,6 +46,10 @@ pub const THREADS: u32 = 256;
 pub const GRID: (u32, u32, u32) = (HEADS as u32, 1, 1);
 /// The block geometry.
 pub const BLOCK: (u32, u32, u32) = (THREADS, 1, 1);
+/// K8 batched sequence symbol: one block per head serves six consecutive positions.
+pub const BATCH_KERNEL: &str = "flash_mla_csa2_seq_batched_sm121";
+/// Fixed six-row verifier batch.
+pub const BATCH_ROWS: usize = 6;
 
 /// The kernel's only accepted window_kv_format value: the CSA union.
 pub const FORMAT_CSA_UNION: u64 = 2;
@@ -160,6 +164,14 @@ impl FlashMlaSeqParams {
     }
 }
 
+/// Loads the K8 batched sequence symbol by name from the same cubin.
+///
+/// # Errors
+/// Returns the driver's error when the cubin does not contain [BATCH_KERNEL].
+pub fn load_batched(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+    cuda.load_flash_mla_csa2_seq_batched(cubin)
+}
+
 /// Loads the kernel from a cubin, resolving the pinned symbol.
 ///
 /// # Errors
@@ -173,6 +185,37 @@ pub fn load(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), String> {
 /// # Errors
 /// Returns the driver's error.
 pub fn launch(cuda: &Cuda, kernel: Kernel, params: &FlashMlaSeqParams) -> Result<(), String> {
+    cuda.launch(kernel, GRID, BLOCK, params.as_slice())
+}
+
+/// Launches the K8 batched sequence entry once: one block per head over six rows.
+///
+/// The 19-word ABI is unchanged; `q`, `window_codes`, `window_scales`, `selected`, `index_query`,
+/// `out`, `block_scores` and `block_best` MUST be batch-major over [BATCH_ROWS], and `position` is
+/// the first of six consecutive positions. Every row must carry the same `window_rows` and
+/// `selected_count`; the entry refuses a differing-count call by contract, not by a runtime scan.
+/// The `selected` row stride is exactly `selected_count`, so rows are packed contiguously; a caller
+/// that pads each row to a wider buffer must also pass that padded width as `selected_count`.
+/// `block_scores`/`block_best` are one [hsi_blocks] pair, not one per index head: only index head 0
+/// publishes them (its two query heads split the blocks), matching the CPU indexer reference.
+/// OPEN ABI ITEM (K7): a caller with differing per-row counts MUST pad the selected list to the
+/// common `selected_count` with future ids - the kernel already masks candidate > that row's
+/// position - and pass a full window for every row. A per-row count pointer pair is a follow-up
+/// symbol, not this v1.
+///
+/// # Errors
+/// Refuses a format other than the CSA union, an empty head list, or a position that would wrap.
+pub fn launch_batched(
+    cuda: &Cuda,
+    kernel: Kernel,
+    params: &FlashMlaSeqParams,
+) -> Result<(), String> {
+    if params.as_slice()[5] != FORMAT_CSA_UNION {
+        return Err("the batched sequence entry only runs the CSA union format".to_owned());
+    }
+    if params.as_slice()[14] + (BATCH_ROWS as u64 - 1) > u64::from(u32::MAX) {
+        return Err("the six consecutive positions would wrap u32".to_owned());
+    }
     cuda.launch(kernel, GRID, BLOCK, params.as_slice())
 }
 
@@ -247,6 +290,14 @@ mod tests {
             assert_eq!(p.word(index), p.as_slice()[index], "param {name}");
         }
         assert_eq!(p.as_slice().len(), ARG_WORDS);
+    }
+
+    #[test]
+    fn the_batched_geometry_is_one_block_per_head_over_six_rows() {
+        assert_eq!(BATCH_ROWS, 6);
+        assert_eq!(GRID, (HEADS as u32, 1, 1));
+        assert_eq!(BLOCK, (THREADS, 1, 1));
+        assert_ne!(BATCH_KERNEL, KERNEL);
     }
 
     #[test]

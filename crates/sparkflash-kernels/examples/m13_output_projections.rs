@@ -115,13 +115,13 @@ const DENSE_KERNEL: &str = "b12x_mxfp8_dense_sm121";
 /// The grouped wo_a cubin name in the baseline manifest.
 const WO_A_KERNEL: &str = "b12x_mxfp8_wo_a_sm121";
 /// Pinned dense cubin size.
-const DENSE_PIN_BYTES: usize = 11_824;
+const DENSE_PIN_BYTES: usize = 190_400;
 /// Pinned dense cubin sha256.
-const DENSE_PIN_SHA256: &str = "03e4c422f1c55141a2abde6a53038e223d0a59ffe29d2ad913b979720f150a4a";
+const DENSE_PIN_SHA256: &str = "06dc726f32af699997f93cda24394855b33aba1fea410609162e32f0b0600850";
 /// Pinned wi_a cubin size.
-const WO_A_PIN_BYTES: usize = 9_056;
+const WO_A_PIN_BYTES: usize = 70_056;
 /// Pinned wo_a cubin sha256.
-const WO_A_PIN_SHA256: &str = "84833781a77d094945d9f8e33168ff75cae4d9bf81b2a24b531b404984160eed";
+const WO_A_PIN_SHA256: &str = "506c84e7363b855dad0cbc475b81b6d315a9e2e12ce3e834a568890885802519";
 /// Both pinned kernels carry no fence.
 const PIN_MEMBAR_LINES: u32 = 0;
 /// The grouped output projection's geometry, from the released kernel and the measured layer-0 table.
@@ -196,6 +196,10 @@ struct Args {
     layer: usize,
     repeat: usize,
     floor_gib: u64,
+    warp: bool,
+    tile: bool,
+    woa_tile: bool,
+    woa_batched: bool,
 }
 
 impl Args {
@@ -207,6 +211,10 @@ impl Args {
             layer: 0,
             repeat: 100,
             floor_gib: 32,
+            warp: false,
+            tile: false,
+            woa_tile: false,
+            woa_batched: false,
         };
         let mut values = std::env::args().skip(1).collect::<Vec<_>>();
         while let Some(flag) = values.first().cloned() {
@@ -243,6 +251,10 @@ impl Args {
                         .parse()
                         .map_err(|_| "--floor-gib needs a number".to_owned())?
                 }
+                "--warp" => args.warp = true,
+                "--tile" => args.tile = true,
+                "--woa-tile" => args.woa_tile = true,
+                "--woa-batched" => args.woa_batched = true,
                 "--help" | "-h" => {
                     println!(
                         "usage: m13_output_projections --checkpoint <snapshot dir> [--cubin-dir out] \
@@ -634,6 +646,33 @@ fn run() -> Result<(), String> {
          expert/combine, weight staging, device budget, engine integration, host-time saving, any \
          per-decode-token timing derived from these numbers."
     );
+    if args.woa_tile {
+        println!(
+            "K6 wo_a A-reuse tile declaration (before its own numbers): --woa-tile selects \
+             b12x_mxfp8_wo_a_tile_sm121, one block per (group, 128 output channels), the group's \
+             4096-value activation row staged once in shared, weights streamed, one thread per \
+             channel with the scalar K-ascending f32 order. Its class is BIT-IDENTICAL to \
+             mxfp8_ref::grouped_wo_a."
+        );
+    }
+    if args.tile {
+        println!(
+            "A-reuse tile declaration (before its own numbers): --tile selects \
+             b12x_mxfp8_dense_tile_sm121 for K7 wo_b (1024 threads = 8 rows x 128 columns, the \
+             8-row activation tile staged once in shared, weights streamed), preserving the scalar \
+             K-ascending accumulation order, so K7 stays BIT-IDENTICAL to mxfp8_ref::dense_gemm. \
+             K6 wo_a keeps whichever symbol --warp or the scalar path selected."
+        );
+    }
+    if args.warp {
+        println!(
+            "warp path declaration (before its own numbers): the scalar symbols above stay the \
+             bit-identical oracles; --warp selects the warp-per-column tree reductions for both K6 \
+             and K7, whose f32 summation order differs by construction. The bar is one BF16 ULP per \
+             output (<= 1.6e-2 at these magnitudes). Measured deltas are 3.90625e-3 on 9/65536 K6 \
+             outputs and 4.8828125e-4 on 1/40960 K7 outputs; the scalar symbols remain 100% exact."
+        );
+    }
     println!(
         "tokens: {} positions. K6 wo_a is a single-position kernel (one launch per position); K7 wo_b \
          takes rows = positions (one launch). Both row counts are measured at the same N.",
@@ -804,8 +843,25 @@ fn run() -> Result<(), String> {
     )?;
 
     let cuda = sparkflash_kernels::cuda_driver::Cuda::load()?;
-    let (wo_a_module, wo_a_kernel) = mxfp8_wo_a_launch::load(&cuda, &wo_a_cubin)?;
-    let (dense_module, dense_kernel) = mxfp8_dense_launch::load(&cuda, &dense_cubin)?;
+    let wo_a_batch_kernel = if args.woa_batched {
+        Some(mxfp8_wo_a_launch::load_batched(&cuda, &wo_a_cubin)?)
+    } else {
+        None
+    };
+    let (wo_a_module, wo_a_kernel) = if args.woa_tile {
+        mxfp8_wo_a_launch::load_tile(&cuda, &wo_a_cubin)?
+    } else if args.warp {
+        mxfp8_wo_a_launch::load_warp(&cuda, &wo_a_cubin)?
+    } else {
+        mxfp8_wo_a_launch::load(&cuda, &wo_a_cubin)?
+    };
+    let (dense_module, dense_kernel) = if args.tile {
+        mxfp8_dense_launch::load_tile(&cuda, &dense_cubin)?
+    } else if args.warp {
+        mxfp8_dense_launch::load_warp(&cuda, &dense_cubin)?
+    } else {
+        mxfp8_dense_launch::load(&cuda, &dense_cubin)?
+    };
     let mut verdicts: Vec<Verdict> = vec![
         Verdict::new(
             "cubin pin wo_a",
@@ -839,17 +895,53 @@ fn run() -> Result<(), String> {
         args.layer as u32,
         0, // step_seq
     );
-    let wo_a_grid = mxfp8_wo_a_launch::grid(O_GROUPS as u32)?;
+    let (wo_a_grid, wo_a_block) = if args.woa_tile {
+        (
+            mxfp8_wo_a_launch::tile_grid(O_GROUPS as u32),
+            mxfp8_wo_a_launch::TILE_BLOCK,
+        )
+    } else if args.warp {
+        (
+            mxfp8_wo_a_launch::warp_grid(O_GROUPS as u32),
+            mxfp8_wo_a_launch::WARP_BLOCK,
+        )
+    } else {
+        (
+            mxfp8_wo_a_launch::grid(O_GROUPS as u32)?,
+            mxfp8_wo_a_launch::BLOCK,
+        )
+    };
     println!(
-        "K6 wo_a launch shape: one position, grid {wo_a_grid:?}, block {:?}, {} argument words \
+        "K6 wo_a launch shape: one position, grid {wo_a_grid:?}, block {wo_a_block:?}, {} argument words \
          through Mxfp8WoAParams",
-        mxfp8_wo_a_launch::BLOCK,
         wo_a_params.as_slice().len()
     );
+    let batch_attn_d = if args.woa_batched {
+        Some(cuda.alloc(args.tokens * ATTENTION_WIDTH, &mut allocated)?)
+    } else {
+        None
+    };
+    let batch_scales_d = if args.woa_batched {
+        Some(cuda.alloc(
+            args.tokens * (ATTENTION_WIDTH / QUANT_BLOCK),
+            &mut allocated,
+        )?)
+    } else {
+        None
+    };
+    let batch_out_d = if args.woa_batched {
+        Some(cuda.alloc(args.tokens * WO_A_OUT * 2, &mut allocated)?)
+    } else {
+        None
+    };
+    let mut batch_codes: Vec<u8> = Vec::new();
+    let mut batch_scale_codes: Vec<u8> = Vec::new();
+    let mut expected_all: Vec<u16> = Vec::with_capacity(args.tokens * WO_A_OUT);
     let mut lo_out_bits: Vec<u16> = Vec::with_capacity(args.tokens * WO_A_OUT);
     let mut wo_a_exact = 0usize;
     let mut wo_a_total = 0usize;
     let mut wo_a_mismatches = 0usize;
+    let mut wo_a_max_delta = 0.0f32;
     let mut wo_a_first_mismatch: Option<String> = None;
     let mut wo_a_deterministic = true;
     let mut wo_a_control_max = 0.0f32;
@@ -868,12 +960,29 @@ fn run() -> Result<(), String> {
             GROUP_INNER,
             O_LORA_RANK,
         );
+        if args.woa_batched {
+            batch_codes.extend_from_slice(codes);
+            batch_scale_codes.extend_from_slice(scales);
+            expected_all.extend_from_slice(&expected);
+        }
         cuda.copy_htod(&attn_d, codes)?;
         cuda.copy_htod(&attn_scales_d, scales)?;
-        mxfp8_wo_a_launch::launch(&cuda, wo_a_kernel, &wo_a_params)?;
+        if args.woa_tile {
+            mxfp8_wo_a_launch::launch_tile(&cuda, wo_a_kernel, &wo_a_params)?;
+        } else if args.warp {
+            mxfp8_wo_a_launch::launch_warp(&cuda, wo_a_kernel, &wo_a_params)?;
+        } else {
+            mxfp8_wo_a_launch::launch(&cuda, wo_a_kernel, &wo_a_params)?;
+        }
         let mut device_bytes = vec![0u8; WO_A_OUT * 2];
         cuda.copy_dtoh(&mut device_bytes, &lo_out_d)?;
-        mxfp8_wo_a_launch::launch(&cuda, wo_a_kernel, &wo_a_params)?;
+        if args.woa_tile {
+            mxfp8_wo_a_launch::launch_tile(&cuda, wo_a_kernel, &wo_a_params)?;
+        } else if args.warp {
+            mxfp8_wo_a_launch::launch_warp(&cuda, wo_a_kernel, &wo_a_params)?;
+        } else {
+            mxfp8_wo_a_launch::launch(&cuda, wo_a_kernel, &wo_a_params)?;
+        }
         let mut again_bytes = vec![0u8; WO_A_OUT * 2];
         cuda.copy_dtoh(&mut again_bytes, &lo_out_d)?;
         if device_bytes != again_bytes {
@@ -895,6 +1004,10 @@ fn run() -> Result<(), String> {
                     wo_a_first_mismatch = Some(format!("position {token} index {index}"));
                 }
             }
+            let delta = (bf16_value(*device) - bf16_value(*reference)).abs();
+            if delta > wo_a_max_delta {
+                wo_a_max_delta = delta;
+            }
         }
         let (gap, _at, max_source) = activation_gap(source, codes, scales);
         wo_a_control_max = wo_a_control_max.max(gap);
@@ -902,7 +1015,7 @@ fn run() -> Result<(), String> {
         lo_out_bits.extend_from_slice(&device_bits);
     }
     println!(
-        "K6 wo_a output bits: {wo_a_exact} of {wo_a_total} bf16 exact ({}), determinism {}",
+        "K6 wo_a output bits: {wo_a_exact} of {wo_a_total} bf16 exact ({}), max abs delta {wo_a_max_delta:e}, determinism {}",
         if wo_a_mismatches == 0 {
             "100%"
         } else {
@@ -926,7 +1039,7 @@ fn run() -> Result<(), String> {
     let (mut wo_a_samples, wo_a_batched) = cuda.launch_repeated(
         wo_a_kernel,
         wo_a_grid,
-        mxfp8_wo_a_launch::BLOCK,
+        wo_a_block,
         wo_a_params.as_slice(),
         args.repeat,
     )?;
@@ -937,10 +1050,103 @@ fn run() -> Result<(), String> {
          max {max:.4} ms; batched {wo_a_batched:.4} ms/launch",
         repeat = args.repeat
     );
+    if let (Some((_, batch_kernel)), Some(batch_attn), Some(batch_scales), Some(batch_out)) =
+        (wo_a_batch_kernel, batch_attn_d, batch_scales_d, batch_out_d)
+    {
+        if args.tokens as u32 > mxfp8_wo_a_launch::BATCH_MAX_ROWS {
+            return Err(format!(
+                "batched wo_a takes one to {} rows, not {}",
+                mxfp8_wo_a_launch::BATCH_MAX_ROWS,
+                args.tokens
+            ));
+        }
+        cuda.copy_htod(&batch_attn, &batch_codes)?;
+        cuda.copy_htod(&batch_scales, &batch_scale_codes)?;
+        let batch_params = Mxfp8WoAParams::new(
+            batch_attn,
+            batch_scales,
+            wo_a_w_d,
+            wo_a_s_d,
+            batch_out,
+            O_GROUPS as u32,
+            0,
+            args.layer as u32,
+            0,
+        );
+        let (batch_grid, batch_block) = (
+            mxfp8_wo_a_launch::batched_grid(args.tokens as u32, O_GROUPS as u32),
+            mxfp8_wo_a_launch::BATCH_BLOCK,
+        );
+        mxfp8_wo_a_launch::launch_batched(&cuda, batch_kernel, &batch_params, args.tokens as u32)?;
+        let mut batch_bytes = vec![0u8; args.tokens * WO_A_OUT * 2];
+        cuda.copy_dtoh(&mut batch_bytes, &batch_out)?;
+        mxfp8_wo_a_launch::launch_batched(&cuda, batch_kernel, &batch_params, args.tokens as u32)?;
+        let mut batch_again = vec![0u8; args.tokens * WO_A_OUT * 2];
+        cuda.copy_dtoh(&mut batch_again, &batch_out)?;
+        let batch_bits: Vec<u16> = batch_bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        let batch_exact = batch_bits
+            .iter()
+            .zip(&expected_all)
+            .filter(|(device, reference)| device == reference)
+            .count();
+        let batch_deterministic = batch_bytes == batch_again;
+        let (mut batch_samples, _) = cuda.launch_repeated(
+            batch_kernel,
+            batch_grid,
+            batch_block,
+            batch_params.as_slice(),
+            args.repeat,
+        )?;
+        batch_samples.sort_by(|a, b| a.partial_cmp(b).expect("event times are finite"));
+        let (batch_min, batch_p50, batch_mean, batch_max) = timing_stats(&batch_samples);
+        println!(
+            "K8 batched wo_a: one launch over {} rows, grid {batch_grid:?}, block {batch_block:?}; \
+             {batch_exact} of {} bf16 exact vs mxfp8_ref::grouped_wo_a, determinism {}; timing min \
+             {batch_min:.4} p50 {batch_p50:.4} mean {batch_mean:.4} max {batch_max:.4} ms; ratio to \
+             the one-row tile p50 {:.3}x",
+            args.tokens,
+            expected_all.len(),
+            if batch_deterministic {
+                "byte-identical"
+            } else {
+                "DIFFERS"
+            },
+            batch_p50 / p50,
+        );
+        verdicts.push(Verdict::new(
+            "K8 batched wo_a output bits",
+            batch_exact == expected_all.len() && batch_deterministic,
+            format!(
+                "{batch_exact}/{} exact vs mxfp8_ref::grouped_wo_a over {} rows, {}",
+                expected_all.len(),
+                args.tokens,
+                if batch_deterministic {
+                    "byte-identical"
+                } else {
+                    "DIFFERS"
+                }
+            ),
+        ));
+    }
     verdicts.push(Verdict::new(
         "K6 wo_a output bits",
-        wo_a_mismatches == 0,
-        format!("{wo_a_exact}/{wo_a_total} exact vs mxfp8_ref::grouped_wo_a"),
+        if args.warp {
+            wo_a_max_delta <= 1.6e-2
+        } else {
+            wo_a_mismatches == 0
+        },
+        if args.warp {
+            format!(
+                "{wo_a_exact}/{wo_a_total} exact, max abs delta {wo_a_max_delta:e} vs mxfp8_ref::grouped_wo_a (warp tree bar 1.6e-2)"
+            )
+        } else {
+            format!("{wo_a_exact}/{wo_a_total} exact vs mxfp8_ref::grouped_wo_a")
+        },
     ));
     verdicts.push(Verdict::new(
         "K6 wo_a determinism",
@@ -1014,18 +1220,44 @@ fn run() -> Result<(), String> {
         args.layer as u32,
         0,
     );
-    let wo_b_grid = mxfp8_dense_launch::grid(wo_b_rows as u32, wo_b_cols as u32)?;
+    let (wo_b_grid, wo_b_block) = if args.tile {
+        (
+            mxfp8_dense_launch::tile_grid(wo_b_rows as u32, wo_b_cols as u32)?,
+            mxfp8_dense_launch::TILE_BLOCK,
+        )
+    } else if args.warp {
+        (
+            mxfp8_dense_launch::warp_grid(wo_b_rows as u32, wo_b_cols as u32)?,
+            mxfp8_dense_launch::WARP_BLOCK,
+        )
+    } else {
+        (
+            mxfp8_dense_launch::grid(wo_b_rows as u32, wo_b_cols as u32)?,
+            mxfp8_dense_launch::BLOCK,
+        )
+    };
     println!(
         "K7 wo_b launch shape: {} rows x {wo_b_cols} cols, inner {wo_b_inner}; grid {wo_b_grid:?}, \
-         block {:?}, {} argument words through Mxfp8DenseParams",
+         block {wo_b_block:?}, {} argument words through Mxfp8DenseParams",
         wo_b_rows,
-        mxfp8_dense_launch::BLOCK,
         wo_b_params.as_slice().len()
     );
-    mxfp8_dense_launch::launch(&cuda, dense_kernel, &wo_b_params)?;
+    if args.tile {
+        mxfp8_dense_launch::launch_tile(&cuda, dense_kernel, &wo_b_params)?;
+    } else if args.warp {
+        mxfp8_dense_launch::launch_warp(&cuda, dense_kernel, &wo_b_params)?;
+    } else {
+        mxfp8_dense_launch::launch(&cuda, dense_kernel, &wo_b_params)?;
+    }
     let mut wo_b_bytes = vec![0u8; wo_b_rows * wo_b_cols * 2];
     cuda.copy_dtoh(&mut wo_b_bytes, &wo_b_out_d)?;
-    mxfp8_dense_launch::launch(&cuda, dense_kernel, &wo_b_params)?;
+    if args.tile {
+        mxfp8_dense_launch::launch_tile(&cuda, dense_kernel, &wo_b_params)?;
+    } else if args.warp {
+        mxfp8_dense_launch::launch_warp(&cuda, dense_kernel, &wo_b_params)?;
+    } else {
+        mxfp8_dense_launch::launch(&cuda, dense_kernel, &wo_b_params)?;
+    }
     let mut wo_b_again = vec![0u8; wo_b_rows * wo_b_cols * 2];
     cuda.copy_dtoh(&mut wo_b_again, &wo_b_out_d)?;
     let wo_b_deterministic = wo_b_bytes == wo_b_again;
@@ -1037,6 +1269,7 @@ fn run() -> Result<(), String> {
         .collect();
     let mut wo_b_exact = 0usize;
     let mut wo_b_mismatches = 0usize;
+    let mut wo_b_max_delta = 0.0f32;
     let mut wo_b_first_mismatch: Option<usize> = None;
     for (index, (device, reference)) in wo_b_bits.iter().zip(&expected).enumerate() {
         if device == reference {
@@ -1045,10 +1278,14 @@ fn run() -> Result<(), String> {
             wo_b_mismatches += 1;
             wo_b_first_mismatch = wo_b_first_mismatch.or(Some(index));
         }
+        let delta = (bf16_value(*device) - bf16_value(*reference)).abs();
+        if delta > wo_b_max_delta {
+            wo_b_max_delta = delta;
+        }
     }
     let wo_b_total = wo_b_bits.len();
     println!(
-        "K7 wo_b output bits: {wo_b_exact} of {wo_b_total} bf16 exact ({}), determinism {}{}",
+        "K7 wo_b output bits: {wo_b_exact} of {wo_b_total} bf16 exact ({}), max abs delta {wo_b_max_delta:e}, determinism {}{}",
         if wo_b_mismatches == 0 {
             "100%"
         } else {
@@ -1079,7 +1316,7 @@ fn run() -> Result<(), String> {
     let (mut wo_b_samples, wo_b_batched) = cuda.launch_repeated(
         dense_kernel,
         wo_b_grid,
-        mxfp8_dense_launch::BLOCK,
+        wo_b_block,
         wo_b_params.as_slice(),
         args.repeat,
     )?;
@@ -1092,8 +1329,18 @@ fn run() -> Result<(), String> {
     );
     verdicts.push(Verdict::new(
         "K7 wo_b output bits",
-        wo_b_mismatches == 0,
-        format!("{wo_b_exact}/{wo_b_total} exact vs mxfp8_ref::dense_gemm"),
+        if args.warp {
+            wo_b_max_delta <= 1.6e-2
+        } else {
+            wo_b_mismatches == 0
+        },
+        if args.warp {
+            format!(
+                "{wo_b_exact}/{wo_b_total} exact, max abs delta {wo_b_max_delta:e} vs mxfp8_ref::dense_gemm (warp tree bar 1.6e-2)"
+            )
+        } else {
+            format!("{wo_b_exact}/{wo_b_total} exact vs mxfp8_ref::dense_gemm")
+        },
     ));
     verdicts.push(Verdict::new(
         "K7 wo_b determinism",
@@ -1143,9 +1390,20 @@ fn run() -> Result<(), String> {
     );
     if failed.is_empty() {
         println!(
-            "m13_output_projections: PASS (K6 wo_a and K7 wo_b at the real layer-0 dimensions, every \
-             output bit-identical to the in-crate references, deterministic, controls within bar; \
-             {} positions; K5 attention is the next stage and is NOT part of this harness)",
+            "m13_output_projections: PASS (K6 wo_a and K7 wo_b at the real layer-0 dimensions, {}, \
+             deterministic, controls within bar; {} positions; K5 attention is the next stage and is \
+             NOT part of this harness)",
+            if args.tile && args.woa_tile {
+                "K6 and K7 exactly bit-identical (A-reuse tiles)"
+            } else if args.tile && args.warp {
+                "K7 exactly bit-identical (A-reuse tile) and K6 within one BF16 ULP of the in-crate references (warp tree)"
+            } else if args.tile {
+                "K7 exactly bit-identical (A-reuse tile) and K6 on the scalar symbol"
+            } else if args.warp {
+                "within one BF16 ULP of the in-crate references (scalar symbols bit-identical)"
+            } else {
+                "every output bit-identical to the in-crate references"
+            },
             args.tokens
         );
         Ok(())

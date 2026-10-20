@@ -56,6 +56,8 @@ records the evidence and the consequence for the build. Research backing is in
 | D46 | Task-63 cheap API-surface parity: one effort table (25/50/75/100, default 50), recipe `max_tokens` tiers and 393216 cap, Anthropic non-double-counted cache usage, DeepSeek cache fields, and labelled thinking sampling | Implemented as an API-surface change only: prompt ids and the five fixture arrays are unchanged and pinned; `max_tokens` defaults to 8192 non-thinking / 65536 thinking / 131072 thinking+max, explicit values are context-lowered, and the upper bound is 393216; Anthropic `input_tokens` excludes cache reads; thinking sampling is temperature 1.0 and `top_p >= 0.95` |
 | D47 | deepseek-recipe 0.2 adoption is the protocol layer only; its renderer and bundled tokenizer are never adopted | The 7-10 day migration takes converters, `StreamProcessor`, chunk generators, `OutputConstraint`, strict-schema validation, `ET_` tool-call ids, Responses/Messages SSE and tools/tool_choice/response_format/prefix/defer_loading, while `render.rs` + `reference/tokenizer.json` stay the prompt oracle; constrained decoding is not started without an explicit go |
 | D48 | Batch-19 device acceptance target: **50-60 tokens/s vLLM parity with DSpark** on this hardware, personal target **90 tokens/s single-stream**, with the derived per-step budget (<=42 ms per verify step at ~3.8 accepted tokens, 11.1 ms/accepted token, 13.9 ms weight-traffic roofline at 273 GB/s/rank, ~1.7 ms RDMA collectives, ~2.2 ms draft) | The budgets are derived from the target, not measured; they are the acceptance arithmetic for the GPU path, so every roadmap stage is judged against the 42 ms/verify-step budget rather than against the CPU stopgap. Stage results stay placeholders until owners report measured device numbers |
+| D49 | KV ring capacity 134 vs attention window 128: a NEW symbol carries capacity explicitly (slot = position % 134, window_rows = 128), pin 18 -> 19 for the ring symbol (the three batched row symbols land inside the existing mHC/cert-head/lm-reduce cubins and re-pin those, not new KernelIds), ratio explicit, NaN guard on accept | DSpark/MTP needs 134 ring slots while the arithmetic window stays 128; today `flash_mla_csa2_seq_sm121` writes NaN for 134 rows (window_rows>128 guard, MAX_ATTENDED==640 static assert). New symbol (frozen entry not mutated), explicit ratio argument instead of the candidate-count inference in attention_device.rs, and a NaN guard on the accept input; no serving claim until a device run measures the 134-slot ring |
+| D50 | Drafter unification: the MTP drafter wins; dspark.rs is demoted to a scheduler-policy model; accepted_prediction_tokens must come from the real acceptance rule | dspark.rs drafts philox-random tokens while forward/mtp.rs computes the real 3-stage draft + Markov argmax chain and serve.rs drops it (`accepted_prediction_tokens: 0`); the MTP path is the draft contract, the random path is scheduler policy only, and a serving surface reporting a DSpark metric without measured acceptance is a defect |
 
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
@@ -2810,3 +2812,60 @@ tokens/s against the 42 ms/step budget; stage rows keep placeholders until the o
 measured device run, and no measured number is invented here. The CPU stopgap 1.3026 tokens/s
 stays the best *measured* decode until a device run beats it, but it is no longer the
 acceptance bar - the budget table is.
+
+**Addendum - the tok/s gate baseline (2026-10-20).** The tok/s baseline for this gate is the
+current best **measured** decode row: **767.7 ms/step = 1.3026 tokens/s** (batch-18 default
+sharded, bit-identical, binary `bbb20cf5` on tree `8ffaae6`), **not** the 939.7 ms/step batch-16
+headline (older tree) and **not** the 7.929 s/step batch-15 TP=4 host A/B (a different baseline,
+superseded). The target row is unchanged: **50-60 tokens/s DSpark parity / 90 tokens/s stretch**.
+Sequence: DSpark wiring lands **after** batched kernels + CUDA graphs + residency (C2/C5 before
+C6); if C2 misses the step budget, the tok/s gate is reported **unmet, not redefined**.
+
+## D49 - KV ring capacity 134 vs attention window 128: a capacity argument and an explicit ratio
+
+**Evidence.** DSpark/MTP needs the KV ring to hold **134 slots** while the attention arithmetic
+window stays **128**. Today `flash_mla_csa2_seq_sm121` writes NaN for 134 rows: the kernel's
+`window_rows > 128` guard (`kernels/flash_mla_csa2_seq_sm121.cu:146-154`) and the
+`SPARK_M4_MLA_MAX_ATTENDED == 640` static assert (`:41-50`) encode the window as the ring size.
+Separately, `crates/sparkflash-cli/src/attention_device.rs:934-942` infers the compression ratio
+from the candidate count, which is wrong for rows 1..5 of a 6-row verify batch (the inferred
+ratio must become an argument).
+
+**Decision.** Make the ring capacity explicit and separate from the arithmetic window: slot =
+position % 134 (capacity) with `window_rows = 128` (arithmetic); introduce a **new symbol** that
+carries capacity as an explicit argument (the frozen 19-word entry is not mutated), bump the
+kernel pin **18 -> 19** for the new ring symbol (the other three batched row symbols land inside
+`mega_mhc_sm121`, `cert_lm_head_sm121` and `lm_head_reduce_sm121` as extra entry points, so those
+cubins re-pin but the baseline keeps nineteen kernels), and add a NaN guard on the accept input. The compression ratio also
+becomes an explicit argument instead of being inferred from the candidate count.
+
+**Consequence.** This is a semantic/ABI change to a frozen entry: the new symbol has its own ABI
+row and pin, the ratio argument is validated per layer, and the accept input is guarded against
+NaN rows. The ring symbol and the three batched row symbols were measured on device on 2026-10-20 (m20
+sequence batched 6/6 rows byte-identical, m22 cert batched 6/6, m23 mHC batched exact, m24
+lm-reduce 1.01x); the 134-slot ring itself still has no device numerics, so no serving/parity
+claim depends on it until a device run with the 134-slot ring exists, and a changed pin/ABI after
+a gate run is a new decision.
+
+## D50 - Drafter unification: the MTP drafter wins; dspark.rs is demoted to a scheduler-policy model
+
+**Evidence.** Two drafters disagree. `crates/sparkflash-scheduler/src/dspark.rs` generates
+philox-RANDOM draft tokens (`dspark.rs:16`, `:31`, `:290`, `:468`), while
+`crates/sparkflash-engine/src/forward/mtp.rs` computes the real 3-stage draft plus the Markov
+argmax chain (`mtp.rs:554`, `:766-798`), and its output is **dropped** on the serve path:
+`crates/sparkflash-cli/src/serve.rs:1388-1395` writes
+`accepted_prediction_tokens: 0`/`rejected_prediction_tokens: 0` with the comment that the driver
+never verifies a draft. That is a correctness defect today: a serving surface could report a
+DSpark metric that is not measured.
+
+**Decision.** The **MTP drafter wins**: `forward/mtp.rs` is the draft path (real stages + Markov
+argmax chain), and `dspark.rs` is demoted to a **scheduler-policy model** (survival/cap/verified
+prefix and router-mask policy), not a token generator. `accepted_prediction_tokens` must come
+from the **real acceptance rule** on the verified prefix, never from a synthetic or zero-filled
+placeholder.
+
+**Consequence.** The serve path reports acceptance only from the measured verify step; the
+random-token draft path is not a measurement source, and a serving surface that reports a DSpark
+metric while `accepted_prediction_tokens` is synthetic is a defect fixed by this entry. The
+batch-19 wiring plan (docs/investigations/mtp-dspark-device-wiring.md) is the implementation
+argument; no device number is claimed here.

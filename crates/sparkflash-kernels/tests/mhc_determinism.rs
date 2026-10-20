@@ -73,8 +73,9 @@ fn no_atomic_touches_the_grid_statistics() {
     let calls = atomic_calls(&source);
     assert_eq!(
         calls.len(),
-        1,
-        "exactly one atomic is expected in the mHC kernel - the hc_sync rendezvous counter - found: {calls:?}"
+        2,
+        "exactly one atomic per mHC kernel is expected - the hc_sync rendezvous counter in the \
+         scalar and in the six-row K8 symbol - found: {calls:?}"
     );
     for call in &calls {
         assert!(

@@ -299,3 +299,176 @@ extern "C" __global__ void lm_head_reduce_sm121(
     (void)layer_id;
     (void)step_seq;
 }
+// K8 batched reduction: one launch reduces SIX rows. The body is the scalar kernel's block
+// algorithm run once per row, in the same thread/chunk/shuffle/top-5 order and with the same
+// single-thread finalisation, so each row is BYTE-IDENTICAL to the scalar kernel's row at any
+// vocabulary length. Batch-major report arrays: token/value/status/certified_count [6], block
+// arrays [6][128], top-5 [6][5]. The block is reused across rows with a barrier between rows.
+#define SPARK_LM_REDUCE_BATCH_ROWS 6u
+static_assert(SPARK_LM_REDUCE_BATCH_ROWS == 6u, "the verifier batch is six rows");
+
+extern "C" __global__ void lm_head_reduce_batched_sm121(
+
+    const float *__restrict__ logits_r0_all,        // [32,320] rank 0 stored logits (bound where certified)
+    const float *__restrict__ logits_r1_all,        // [32,320] rank 1
+    const float *__restrict__ logits_r2_all,        // [32,320] rank 2
+    const float *__restrict__ logits_r3_all,        // [32,320] rank 3
+    const uint8_t *__restrict__ certified_r0_all,   // [32,320] rank 0 certified flags
+    const uint8_t *__restrict__ certified_r1_all,   // [32,320] rank 1
+    const uint8_t *__restrict__ certified_r2_all,   // [32,320] rank 2
+    const uint8_t *__restrict__ certified_r3_all,   // [32,320] rank 3
+    unsigned int *__restrict__ token_all,           // [1] global argmax entry (diagnostic when refused)
+    float *__restrict__ value_all,                  // [1] stored value at that entry
+    float *__restrict__ block_max_all,              // [128] the m16 block maxima
+    uint32_t *__restrict__ block_argmax_all,        // [128] the global entry that scored each block
+    float *__restrict__ top5_value_all,             // [5] descending, ties lower index
+    uint32_t *__restrict__ top5_index_all,          // [5] the global entries
+    unsigned int *__restrict__ status_all,          // [1] the pinned status bits
+    unsigned int *__restrict__ certified_count_all, // [1] total certified flags
+    GpuTraceRing *__restrict__ trace_ring,      // carried for ABI uniformity, deliberately unused
+    const uint32_t layer_id,                    // carried for ABI uniformity, deliberately unused
+    const uint64_t step_seq) {
+
+    for (uint32_t row = 0u; row < 6u; ++row) {
+        const float *logits_r0 = logits_r0_all + (uint64_t)row * SPARK_LM_REDUCE_VOCAB_PER_RANK;
+        const float *logits_r1 = logits_r1_all + (uint64_t)row * SPARK_LM_REDUCE_VOCAB_PER_RANK;
+        const float *logits_r2 = logits_r2_all + (uint64_t)row * SPARK_LM_REDUCE_VOCAB_PER_RANK;
+        const float *logits_r3 = logits_r3_all + (uint64_t)row * SPARK_LM_REDUCE_VOCAB_PER_RANK;
+        const uint8_t *certified_r0 = certified_r0_all + (uint64_t)row * SPARK_LM_REDUCE_VOCAB_PER_RANK;
+        const uint8_t *certified_r1 = certified_r1_all + (uint64_t)row * SPARK_LM_REDUCE_VOCAB_PER_RANK;
+        const uint8_t *certified_r2 = certified_r2_all + (uint64_t)row * SPARK_LM_REDUCE_VOCAB_PER_RANK;
+        const uint8_t *certified_r3 = certified_r3_all + (uint64_t)row * SPARK_LM_REDUCE_VOCAB_PER_RANK;
+        unsigned int *token = token_all + row;
+        float *value = value_all + row;
+        float *block_max = block_max_all + (uint64_t)row * SPARK_LM_REDUCE_BLOCKS;
+        uint32_t *block_argmax = block_argmax_all + (uint64_t)row * SPARK_LM_REDUCE_BLOCKS;
+        float *top5_value = top5_value_all + (uint64_t)row * SPARK_LM_REDUCE_TOP;
+        uint32_t *top5_index = top5_index_all + (uint64_t)row * SPARK_LM_REDUCE_TOP;
+        unsigned int *status = status_all + row;
+        unsigned int *certified_count = certified_count_all + row;
+                  // carried for ABI uniformity, deliberately unused
+    __shared__ float s_block_max[SPARK_LM_REDUCE_BLOCKS];
+    __shared__ uint32_t s_block_argmax[SPARK_LM_REDUCE_BLOCKS];
+    __shared__ unsigned int s_certified[SPARK_LM_REDUCE_THREADS];
+    __shared__ float s_top_value[SPARK_LM_REDUCE_THREADS * SPARK_LM_REDUCE_TOP];
+    __shared__ uint32_t s_top_index[SPARK_LM_REDUCE_THREADS * SPARK_LM_REDUCE_TOP];
+
+    const uint32_t lane = threadIdx.x % SPARK_LM_REDUCE_LANES;
+    const uint32_t warp = threadIdx.x / SPARK_LM_REDUCE_LANES;
+
+    float lane_top_value[SPARK_LM_REDUCE_TOP];
+    uint32_t lane_top_index[SPARK_LM_REDUCE_TOP];
+    for (uint32_t slot = 0u; slot < SPARK_LM_REDUCE_TOP; ++slot) {
+        lane_top_value[slot] = SPARK_LM_REDUCE_MIN;
+        lane_top_index[slot] = 0xffffffffu;
+    }
+    unsigned int lane_certified = 0u;
+
+    // One warp visits whole blocks; 128 blocks over 8 warps is 16 blocks per warp.
+    for (uint32_t chunk = warp; chunk < SPARK_LM_REDUCE_BLOCKS; chunk += SPARK_LM_REDUCE_WARPS) {
+        const uint32_t rank = chunk / SPARK_LM_REDUCE_CHUNKS_PER_RANK;
+        const uint32_t block = chunk % SPARK_LM_REDUCE_CHUNKS_PER_RANK;
+        const uint32_t base = block * SPARK_LM_REDUCE_CHUNK;
+        const uint32_t remaining = SPARK_LM_REDUCE_VOCAB_PER_RANK - base;
+        const uint32_t count = remaining < SPARK_LM_REDUCE_CHUNK ? remaining : SPARK_LM_REDUCE_CHUNK;
+        const float *logits = spark_lm_reduce_logits(rank, logits_r0, logits_r1, logits_r2, logits_r3);
+        const uint8_t *certified =
+            spark_lm_reduce_certified(rank, certified_r0, certified_r1, certified_r2, certified_r3);
+        float best_value = SPARK_LM_REDUCE_MIN;
+        uint32_t best_index = 0xffffffffu;
+        for (uint32_t step = 0u; step < SPARK_LM_REDUCE_CHUNK / SPARK_LM_REDUCE_LANES; ++step) {
+            const uint32_t local = lane + step * SPARK_LM_REDUCE_LANES;
+            if (local >= count) {
+                break;
+            }
+            const float entry_value = logits[base + local];
+            const uint32_t global = rank * SPARK_LM_REDUCE_VOCAB_PER_RANK + base + local;
+            if (spark_lm_reduce_better(entry_value, global, best_value, best_index)) {
+                best_value = entry_value;
+                best_index = global;
+            }
+            if (certified[base + local] != 0u) {
+                lane_certified += 1u;
+            }
+            spark_lm_reduce_top5_insert(entry_value, global, lane_top_value, lane_top_index);
+        }
+        spark_lm_reduce_warp_best(&best_value, &best_index);
+        if (lane == 0u) {
+            s_block_max[chunk] = best_value;
+            s_block_argmax[chunk] = best_index;
+        }
+    }
+
+    for (uint32_t slot = 0u; slot < SPARK_LM_REDUCE_TOP; ++slot) {
+        s_top_value[threadIdx.x * SPARK_LM_REDUCE_TOP + slot] = lane_top_value[slot];
+        s_top_index[threadIdx.x * SPARK_LM_REDUCE_TOP + slot] = lane_top_index[slot];
+    }
+    s_certified[threadIdx.x] = lane_certified;
+    __syncthreads();
+
+    // The finalisation is one thread: 128 block answers, the 128 certified sums and the 1,280
+    // top-5 candidates are all small, and doing it in one fixed order is what makes the answer
+    // deterministic without a second launch.
+    if (threadIdx.x == 0u) {
+        float best_value = SPARK_LM_REDUCE_MIN;
+        uint32_t best_index = 0xffffffffu;
+        for (uint32_t block = 0u; block < SPARK_LM_REDUCE_BLOCKS; ++block) {
+            if (spark_lm_reduce_better(s_block_max[block], s_block_argmax[block], best_value, best_index)) {
+                best_value = s_block_max[block];
+                best_index = s_block_argmax[block];
+            }
+        }
+        unsigned int total_certified = 0u;
+        for (uint32_t thread = 0u; thread < SPARK_LM_REDUCE_THREADS; ++thread) {
+            total_certified += s_certified[thread];
+        }
+        float top_value[SPARK_LM_REDUCE_TOP];
+        uint32_t top_index[SPARK_LM_REDUCE_TOP];
+        for (uint32_t slot = 0u; slot < SPARK_LM_REDUCE_TOP; ++slot) {
+            top_value[slot] = SPARK_LM_REDUCE_MIN;
+            top_index[slot] = 0xffffffffu;
+        }
+        for (uint32_t thread = 0u; thread < SPARK_LM_REDUCE_THREADS; ++thread) {
+            for (uint32_t slot = 0u; slot < SPARK_LM_REDUCE_TOP; ++slot) {
+                spark_lm_reduce_top5_insert(s_top_value[thread * SPARK_LM_REDUCE_TOP + slot],
+                                            s_top_index[thread * SPARK_LM_REDUCE_TOP + slot], top_value,
+                                            top_index);
+            }
+        }
+        const uint32_t winner_rank = best_index / SPARK_LM_REDUCE_VOCAB_PER_RANK;
+        const uint32_t winner_local = best_index % SPARK_LM_REDUCE_VOCAB_PER_RANK;
+        const uint8_t *winner_certified_flags = spark_lm_reduce_certified(
+            winner_rank, certified_r0, certified_r1, certified_r2, certified_r3);
+        const bool winner_certified = winner_certified_flags[winner_local] != 0u;
+        unsigned int status_bits = 0u;
+        if (total_certified != 0u) {
+            status_bits |= SPARK_LM_REDUCE_STATUS_ANY_CERTIFIED;
+        }
+        if (winner_certified) {
+            status_bits |= SPARK_LM_REDUCE_STATUS_WINNER_CERTIFIED;
+        } else if (total_certified == 0u) {
+            status_bits |= SPARK_LM_REDUCE_STATUS_TOP5_CLAIMED;
+        }
+        *token = best_index;
+        *value = best_value;
+        for (uint32_t block = 0u; block < SPARK_LM_REDUCE_BLOCKS; ++block) {
+            block_max[block] = s_block_max[block];
+            block_argmax[block] = s_block_argmax[block];
+        }
+        for (uint32_t slot = 0u; slot < SPARK_LM_REDUCE_TOP; ++slot) {
+            top5_value[slot] = top_value[slot];
+            top5_index[slot] = top_index[slot];
+        }
+        *status = status_bits;
+        *certified_count = total_certified;
+    }
+    (void)trace_ring;
+    (void)layer_id;
+    (void)step_seq;
+
+        __syncthreads();
+    }
+    (void)trace_ring;
+    (void)layer_id;
+    (void)step_seq;
+}

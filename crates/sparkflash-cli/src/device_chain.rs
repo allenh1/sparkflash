@@ -352,6 +352,13 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     {
         return crate::tp4_resident::run(&arg_refs[2..]);
     }
+    // The tp4-chain stage is the four-rank device arm: per-rank arena plus the per-layer collective.
+    // It is reachable from a CPU-only build for --plan-only and --comm-smoke.
+    if arg_refs.first().copied() == Some("--run-stage")
+        && arg_refs.get(1).copied() == Some("tp4-chain")
+    {
+        return crate::tp4_chain::run(&arg_refs[2..]);
+    }
     // The tp4-host stage is the S5.2 host TWIN and the four-node output run: it opens no driver and
     // moves weights only through the checkpoint range reader, so a CPU-only build reaches it.
     if arg_refs.first().copied() == Some("--run-stage")
@@ -400,6 +407,7 @@ struct StageArgs {
     fixture: Option<std::path::PathBuf>,
     prompt_tokens: usize,
     decode_steps: usize,
+    stop_after_layer: Option<usize>,
     time_budget_s: u64,
     sequence: bool,
     reference_check: bool,
@@ -477,6 +485,7 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
     let mut fixture = None;
     let mut prompt_tokens = 1usize;
     let mut decode_steps = 0usize;
+    let mut stop_after_layer: Option<usize> = None;
     let mut time_budget_s = 3600u64;
     let mut reference_check = false;
     let mut dump_logits = None;
@@ -561,6 +570,13 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
                     .parse::<usize>()
                     .map_err(|_| format!("--decode-steps: {value} is not a count"))?;
             }
+            "--stop-after-layer" => {
+                stop_after_layer = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| format!("--stop-after-layer: {value} is not a layer"))?,
+                );
+            }
             "--time-budget-s" => {
                 time_budget_s = value
                     .parse::<u64>()
@@ -613,6 +629,12 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
         ));
     }
     let sequence = stage == "hybrid_sequence";
+    if stop_after_layer.is_some() && !sequence {
+        return Err(
+            "--stop-after-layer is wired into hybrid_sequence: the diagnostic layer window only has meaning on a sequence run"
+                .to_string(),
+        );
+    }
     if dump_logits.is_some() && !sequence {
         return Err(
             "--dump-logits is only wired into hybrid_sequence, whose per-position logits the vLLM numeric comparison consumes"
@@ -639,6 +661,7 @@ fn stage_args(args: &[&str]) -> Result<(String, StageArgs), String> {
             fixture,
             prompt_tokens,
             decode_steps,
+            stop_after_layer,
             time_budget_s,
             reference_check,
             sequence,
@@ -707,6 +730,46 @@ fn require_hybrid_entry(
 /// The c3 hybrid-token arm. It runs the in-process reference prefill first, then the 40-layer
 /// chain with a device MhcEntry per layer and host stand-ins everywhere else. The only PASS
 /// condition is token-id equality; the top-k is reported, not gated.
+#[cfg(feature = "cuda")]
+/// Runs the hybrid-sequence stage from another stage with exactly the behaviour of
+/// `--run-stage hybrid_sequence`. World=1 host-side, no collectives; the caller is responsible for
+/// labelling its own evidence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_hybrid_sequence_for(
+    checkpoint: &std::path::Path,
+    cubin_dir: &std::path::Path,
+    prompt_tokens: usize,
+    decode_steps: usize,
+    dump_logits: Option<&std::path::Path>,
+    timing_json: Option<&std::path::Path>,
+    stop_after_layer: Option<usize>,
+) -> Result<Vec<String>, String> {
+    let args = StageArgs {
+        checkpoint: checkpoint.to_path_buf(),
+        cubin_dir: cubin_dir.to_path_buf(),
+        positions: vec![0],
+        token: 0,
+        element_limit: None,
+        moe_preflight: false,
+        moe_layer0_diagnose: false,
+        fixture: None,
+        prompt_tokens,
+        decode_steps,
+        stop_after_layer,
+        time_budget_s: 3600,
+        sequence: true,
+        reference_check: false,
+        dump_logits: dump_logits.map(std::path::Path::to_path_buf),
+        timing_json: timing_json.map(std::path::Path::to_path_buf),
+        wo_a_mode: crate::attention_device::WoAMode::default(),
+        wo_a_operand_dump: None,
+        attention_twin_positions: None,
+        host_attention_from: None,
+        operand_audit: false,
+    };
+    run_hybrid_lines(&args)
+}
+
 #[cfg(feature = "cuda")]
 fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
     use std::cell::{Cell, RefCell};
@@ -1108,6 +1171,12 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         reference_top5s.push(top5(&observed.output.logits));
         reference_logits = observed.output.logits;
         reference_boundary = Some(observed.boundary);
+        if let Some(stop) = args.stop_after_layer {
+            lines.push(format!(
+                        "DIAGNOSTIC partial model: --stop-after-layer {stop} ran layers 0..={stop} of {}; these logits are NOT the full checkpoint's and must not be compared as parity",
+                        config.n_layers
+                    ));
+        }
         let reference_token = reference_tokens[0];
         let reference_top5 = top5(&reference_logits);
         lines.push(format!(
@@ -1237,6 +1306,47 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         )
         .map_err(|error| format!("checkpoint source {}: {error}", args.checkpoint.display()))?,
     );
+    // Opt-in resident attention projections: the five per-layer projection weights (about 6 GB of
+    // E4M3 codes on one node) read, B12x-tiled and uploaded once, then bound by pointer with zero
+    // weight H2D per token. Routed experts and Engram stay staged on one node; the four-rank plan is
+    // what makes them resident, so the evidence reports the two H2D classes separately.
+    let resident_cuda: Option<sparkflash_kernels::cuda_driver::Cuda> =
+        if std::env::var("SPARKFLASH_RESIDENT_ATTENTION")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            Some(
+                sparkflash_kernels::cuda_driver::Cuda::load()
+                    .map_err(|error| format!("resident attention driver: {error}"))?,
+            )
+        } else {
+            None
+        };
+    let mut _resident_attention_allocator: Option<
+        sparkflash_device::arena::CudaArenaAllocator<'_>,
+    > = None;
+    if let Some(cuda) = resident_cuda.as_ref() {
+        // UMA-coherent managed memory on the single node: the arena is filled once and both sides
+        // see it; the projection weight H2D counter stays 0 by construction.
+        let mut allocator = sparkflash_device::arena::CudaArenaAllocator::with_mode(
+            cuda,
+            sparkflash_device::arena::AllocationMode::Unified,
+        );
+        let resident = crate::resident_weights::ResidentAttention::build(
+            &mut allocator,
+            &provider_source,
+            &config,
+        )?;
+        lines.push(format!(
+            "resident attention: {} tensors, {} bytes ({} GiB) uploaded once; projection weight H2D per token is zero, activation H2D is reported separately",
+            resident.tensors(),
+            resident.bytes(),
+            resident.bytes() as f64 / (1u64 << 30) as f64
+        ));
+        attention_backend.set_resident_attention(resident);
+        _resident_attention_allocator = Some(allocator);
+    }
 
     #[derive(Clone)]
     struct DeviceTiming {
@@ -2009,7 +2119,13 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             let position_started = Instant::now();
             let attention_before = attention_backend.stats();
             let moe_before = moe_backend.stats();
-            let output = chain_engine.run_hybrid_sequence_step(
+            let layer_window = match args.stop_after_layer {
+                Some(stop) => {
+                    sparkflash_engine::forward::StepLayers::through(stop, config.n_layers)
+                }
+                None => sparkflash_engine::forward::StepLayers::all(config.n_layers),
+            };
+            let output = chain_engine.run_hybrid_sequence_step_ranged(
                 state,
                 token,
                 &embedding,
@@ -2018,6 +2134,7 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
                 &mut post,
                 Some(&mut attention_backend),
                 Some(&mut moe_backend),
+                layer_window,
                 &mut progress,
             )?;
             if let Some(recorder) = &timing {
@@ -2134,7 +2251,16 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             }
             Ok(())
         };
+        // Warmup steps are real steps whose cost is reported separately: the cold first steps
+        // (module load, first-touch pages, plan upload) must not be averaged into steady state.
+        // SPARKFLASH_WARMUP_STEPS=1 on the device arm separates step 0 from steps 1..N in the ledger.
+        let warmup_steps: usize = std::env::var("SPARKFLASH_WARMUP_STEPS")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(0);
         for (position, token) in prompt_ids.iter().copied().enumerate() {
+            sparkflash_kernels::cuda_driver::stage_timing_set_warm(false);
+            sparkflash_kernels::cuda_driver::stage_timing_scope("prefill", 0, 0, position);
             let history = &prompt_ids[..=position];
             if let Err(error) = run_token(
                 token,
@@ -2153,6 +2279,8 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             let mut decode_token = reference_tokens[0].unwrap_or(0);
             for step in 0..args.decode_steps {
                 let position = prompt_ids.len() + step;
+                sparkflash_kernels::cuda_driver::stage_timing_set_warm(step < warmup_steps);
+                sparkflash_kernels::cuda_driver::stage_timing_scope("decode", step, 0, position);
                 let mut history = prompt_ids.clone();
                 history.extend(reference_tokens[..=step].iter().flatten().copied());
                 if let Err(error) = run_token(
@@ -2284,7 +2412,8 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
     .filter_map(|name| sparkflash_kernels::baseline::pin(name).ok().flatten())
     .map(|pin| pin.cubin_bytes as u64)
     .sum();
-    let moe_cubin_bytes: u64 = 37_384 + 9_752 + 13_000 + 10_048 + 11_824 + 21_776 + 14_888 + 31_480;
+    let moe_cubin_bytes: u64 =
+        37_384 + 9_752 + 13_000 + 10_048 + 190_400 + 21_776 + 38_088 + 31_480;
     let total_cubin_bytes = cubin_bytes + attention_cubin_bytes + moe_cubin_bytes;
     let total_device_buffer_bytes = sparkflash_device::MhcBufferPlan::LAYER_ZERO.device_bytes()
         as u64
@@ -2764,6 +2893,16 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
             reference_tokens.len(),
             if full_claim { "satisfied" } else { "sanity prefix, not a claim" }
         ));
+        let sequence_tokens = (args.prompt_tokens + args.decode_steps).max(1);
+        lines.push(format!(
+            "sequence H2D: projection_weight_bytes={} wo_a_weight_bytes={} activation_bytes={} resident_weight_binds={} weight_bytes_per_token={:.1} activation_bytes_per_token={:.1}",
+            attention_stats.weight_h2d_bytes,
+            attention_stats.wo_a_weight_h2d_bytes,
+            attention_stats.activation_h2d_bytes,
+            attention_stats.resident_weight_binds,
+            attention_stats.weight_h2d_bytes as f64 / sequence_tokens as f64,
+            attention_stats.activation_h2d_bytes as f64 / sequence_tokens as f64
+        ));
         lines.push(format!(
             "sequence metadata tail: utc_end={} mem_available_after={} total_wall_ms={} exit=0",
             utc_now(),
@@ -2775,6 +2914,13 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
                 .borrow()
                 .write(path)
                 .map_err(|error| format!("timing file {}: {error}", path.display()))?;
+            attach_stage_timing_ledger(path)?;
+            if let Some(stop) = args.stop_after_layer {
+                lines.push(format!(
+                        "DIAGNOSTIC partial model: --stop-after-layer {stop} ran layers 0..={stop} of {}; these logits are NOT the full checkpoint's and must not be compared as parity",
+                        config.n_layers
+                    ));
+            }
             let totals = recorder.borrow().totals();
             lines.push(format!(
                 "timing: wrote {} (schema {}; {} layer samples, {} step samples; measured staging bytes={} H2D bytes={} host_staging_ns={} sync_gated_device_ns={} step_total_ns={})",
@@ -3608,6 +3754,113 @@ fn format_top5(top: &[(u32, f32)]) -> String {
 }
 
 #[cfg(feature = "cuda")]
+/// Adds the per-kernel event ledger to the timing JSON when SPARKFLASH_STAGE_TIMING=1 armed it.
+///
+/// The ledger is a separate section (schema sparkflash-stage-timing/1) written into the same file so
+/// one artifact carries the step wall samples and the per-launch event samples. It is omitted
+/// entirely when the recorder was not armed, and it changes no launch: the brackets are the only
+/// difference.
+fn attach_stage_timing_ledger(path: &std::path::Path) -> Result<(), String> {
+    let Some(report) = sparkflash_kernels::cuda_driver::stage_timing_report() else {
+        return Ok(());
+    };
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("read the timing file {}: {error}", path.display()))?;
+    let mut value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| format!("parse the timing file {}: {error}", path.display()))?;
+    let kernels: Vec<serde_json::Value> = report
+        .kernels
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "phase": row.phase,
+                "kernel": row.kernel,
+                "calls": row.calls,
+                "total_ns": row.total_ns,
+                "mean_ns": row.mean_ns,
+                "min_ns": row.min_ns,
+                "max_ns": row.max_ns,
+                "first_launch_order": row.first_launch_order,
+            })
+        })
+        .collect();
+    let steps: Vec<serde_json::Value> = report
+        .steps
+        .iter()
+        .map(|row| {
+            let per_kernel: serde_json::Map<String, serde_json::Value> = row
+                .kernels
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.kernel.to_string(),
+                        serde_json::json!({
+                            "calls": entry.calls,
+                            "total_ns": entry.total_ns,
+                        }),
+                    )
+                })
+                .collect();
+            serde_json::json!({
+                "step": row.step,
+                "warm": row.warm,
+                "launches": row.launches,
+                "kernel_ns": row.kernel_ns,
+                "kernels": per_kernel,
+            })
+        })
+        .collect();
+    let Some(object) = value.as_object_mut() else {
+        return Err(format!(
+            "the timing file {} is not a JSON object",
+            path.display()
+        ));
+    };
+    object.insert(
+        "kernels_schema".to_string(),
+        serde_json::json!("sparkflash-stage-timing/1"),
+    );
+    object.insert("kernels_clock".to_string(), serde_json::json!("cuda_event"));
+    let warm_steps: Vec<&serde_json::Value> = steps
+        .iter()
+        .filter(|row| row.get("warm").and_then(serde_json::Value::as_bool) == Some(true))
+        .collect();
+    let steady_steps: Vec<&serde_json::Value> = steps
+        .iter()
+        .filter(|row| row.get("warm").and_then(serde_json::Value::as_bool) != Some(true))
+        .collect();
+    object.insert(
+        "warmup_steps".to_string(),
+        serde_json::json!(warm_steps.len()),
+    );
+    object.insert(
+        "steady_steps".to_string(),
+        serde_json::json!(steady_steps.len()),
+    );
+    object.insert("steps_warm".to_string(), serde_json::json!(warm_steps));
+    object.insert("steps_steady".to_string(), serde_json::json!(steady_steps));
+    object.insert("kernels_enabled".to_string(), serde_json::json!(true));
+    object.insert("kernels".to_string(), serde_json::Value::Array(kernels));
+    object.insert(
+        "per_step_kernels".to_string(),
+        serde_json::Value::Array(steps),
+    );
+    object.insert(
+        "kernels_dropped_names".to_string(),
+        serde_json::json!(report.dropped_names),
+    );
+    object.insert(
+        "kernels_notes".to_string(),
+        serde_json::json!("event brackets add ~1-3 us per launch; kernel_ns sums overlap and can exceed step wall; the bracketed launches are the same launches in the same order, so the arithmetic is unchanged"),
+    );
+    let text = serde_json::to_string_pretty(&value)
+        .map_err(|error| format!("serialise the timing file {}: {error}", path.display()))?;
+    std::fs::write(path, text)
+        .map_err(|error| format!("write the timing file {}: {error}", path.display()))?;
+    Ok(())
+}
+
+#[allow(dead_code)] // kept for the hybrid comparison report that is not wired yet
 fn top5_overlap(reference: &[(u32, f32)], hybrid: &[(u32, f32)]) -> usize {
     reference
         .iter()
@@ -3994,7 +4247,7 @@ mod tests {
         assert!(
             text.contains("chain_execution=false; device_execution=false; token_produced=false")
         );
-        assert!(text.contains("18 baseline pins parsed"));
+        assert!(text.contains("19 baseline pins parsed"));
         assert!(
             text.contains("crates/sparkflash-kernels/baseline/kernel_baseline.txt"),
             "the catalog names the repository path, not a crate-relative one"
@@ -4172,6 +4425,7 @@ mod tests {
             fixture: None,
             prompt_tokens: 1,
             decode_steps: 0,
+            stop_after_layer: None,
             time_budget_s: 3600,
             sequence: false,
             reference_check: false,

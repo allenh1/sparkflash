@@ -53,7 +53,7 @@
 //!
 //! PINS. Both cubins are refused by size and sha256 against the embedded baseline manifest before
 //! any device allocation: flash_mla_csa2_sm121 60,792 B / 5bfee4c7... / membar 0 (untouched base
-//! entry) and flash_mla_csa2_seq_sm121 38,080 B / f6dfc738... / membar 0.
+//! entry) and flash_mla_csa2_seq_sm121 135,656 B / 8dfd27db... / membar 0.
 //!
 //! Usage (aarch64 node):
 //!
@@ -66,6 +66,7 @@
 #![forbid(unsafe_code)]
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use half::bf16;
 use sha2::{Digest, Sha256};
@@ -89,8 +90,8 @@ const BASE_SHA256: &str = "5bfee4c7a0ece7c921e591fc6b8bd9d98c39b95d735d7c1d699ec
 
 /// The sequence entry's pin, from baseline/kernel_baseline.txt through baseline::pin.
 const SEQ_KERNEL: &str = "flash_mla_csa2_seq_sm121";
-const SEQ_BYTES: usize = 38_080;
-const SEQ_SHA256: &str = "f6dfc738a7ad867adf040384f194812337301aa888cc486d4a60923772ba28c3";
+const SEQ_BYTES: usize = 135_656;
+const SEQ_SHA256: &str = "8dfd27db78349c5333d22e405d4e50288c310d583e8e6eb82727e16ab32cd19a";
 
 /// The 2B contract's comparison bar for the attention output.
 const BAR_ABS: f32 = 2e-2;
@@ -115,6 +116,7 @@ fn main() {
 struct Args {
     cubin_dir: PathBuf,
     out: Option<PathBuf>,
+    batched: bool,
 }
 
 impl Args {
@@ -122,6 +124,7 @@ impl Args {
         let mut args = std::env::args().skip(1);
         let mut cubin_dir = None;
         let mut out = None;
+        let mut batched = false;
         while let Some(flag) = args.next() {
             match flag.as_str() {
                 "--cubin-dir" => {
@@ -130,6 +133,7 @@ impl Args {
                             .ok_or_else(|| "--cubin-dir needs a path".to_string())?,
                     ));
                 }
+                "--batched" => batched = true,
                 "--out" => {
                     out = Some(PathBuf::from(
                         args.next()
@@ -142,6 +146,7 @@ impl Args {
         Ok(Self {
             cubin_dir: cubin_dir.ok_or_else(|| "--cubin-dir is required".to_string())?,
             out,
+            batched,
         })
     }
 }
@@ -748,6 +753,289 @@ fn write_report(path: &Path, report: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Batch-major buffers for the K8 six-row sequence entry. The compressed KV pool is shared (all
+/// six rows read the same pooled rows up to the latest position); everything per row is [6][...].
+struct BatchBuffers {
+    q: Deviceptr,
+    kv_fp4: Deviceptr,
+    kv_scales: Deviceptr,
+    window_codes: Deviceptr,
+    window_scales: Deviceptr,
+    selected: Deviceptr,
+    index_key: Deviceptr,
+    index_query: Deviceptr,
+    sink: Deviceptr,
+    block_scores: Deviceptr,
+    block_best: Deviceptr,
+    out: Deviceptr,
+}
+
+impl BatchBuffers {
+    fn allocate(cuda: &Cuda, rows: usize, positions: usize) -> Result<(Self, usize), String> {
+        let mut total = 0usize;
+        let buffers = Self {
+            q: cuda.alloc(rows * HEADS * LATENT * 2, &mut total)?,
+            kv_fp4: cuda.alloc(positions * mla_ref::ROW_PACKED_BYTES, &mut total)?,
+            kv_scales: cuda.alloc(positions * mla_ref::ROW_SCALE_BYTES, &mut total)?,
+            window_codes: cuda.alloc(rows * SWA_WINDOW * LATENT, &mut total)?,
+            window_scales: cuda
+                .alloc(rows * SWA_WINDOW * mla_ref::ROW_SCALE_BYTES / 2, &mut total)?,
+            selected: cuda.alloc(rows * MAX_SELECTED * 4, &mut total)?,
+            index_key: cuda.alloc(
+                HSI_BLOCKS * HSI_BLOCK_TOKENS * INDEX_HEAD_DIM * 2,
+                &mut total,
+            )?,
+            index_query: cuda.alloc(rows * INDEX_HEADS * INDEX_HEAD_DIM * 2, &mut total)?,
+            sink: cuda.alloc(HEADS * 4, &mut total)?,
+            block_scores: cuda.alloc(rows * HSI_BLOCKS * 4, &mut total)?,
+            block_best: cuda.alloc(rows * HSI_BLOCKS * 4, &mut total)?,
+            out: cuda.alloc(rows * HEADS * LATENT * 2, &mut total)?,
+        };
+        Ok((buffers, total))
+    }
+}
+
+/// The K8 batched extension: six consecutive positions in one launch, compared per row against six
+/// scalar sequence launches on the same operands, then timed (one batched launch vs six scalar
+/// launches). Batch-major layout as the kernel's header declares. Not part of the single-position
+/// claims above: this mode is opt-in with --batched.
+fn run_batched(
+    cuda: &Cuda,
+    seq_kernel: sparkflash_kernels::cuda_driver::Kernel,
+    batch_kernel: sparkflash_kernels::cuda_driver::Kernel,
+    buffers: &Buffers,
+    repeat: usize,
+) -> Result<(), String> {
+    let rows = seq::BATCH_ROWS;
+    let base = 130usize;
+    // One shared compressed pool at the latest row; earlier rows use its prefix, exactly as the
+    // batched kernel reads the same pool. The six window rows, q and sink stay per row.
+    let big = Case::build(base + rows - 1, 0x6D32_305F_4353_4132)?;
+    let mut cases = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let position = base + row;
+        let mut case = Case::build(position, 0x6D32_305F_4353_4132)?;
+        case.selected = big.selected.clone();
+        case.sink = big.sink.clone();
+        case.kv_codes = big.kv_codes[..(position + 1) * mla_ref::ROW_PACKED_BYTES].to_vec();
+        case.kv_scales = big.kv_scales[..(position + 1) * mla_ref::ROW_SCALE_BYTES].to_vec();
+        if case.window_rows != SWA_WINDOW {
+            return Err(format!(
+                "row {position} has window_rows {}",
+                case.window_rows
+            ));
+        }
+        cases.push(case);
+    }
+    let selected_count = cases[0].selected.len();
+    if cases
+        .iter()
+        .any(|case| case.selected.len() != selected_count)
+    {
+        return Err("the six rows do not share one selected count".to_owned());
+    }
+    println!(
+        "batched mode: positions {base}..={}, {} rows, window_rows {}, selected_count {}, one shared \
+         compressed pool at position {}",
+        base + rows - 1,
+        rows,
+        SWA_WINDOW,
+        selected_count,
+        base + rows - 1
+    );
+
+    let (batch, batch_bytes) = BatchBuffers::allocate(cuda, rows, base + rows)?;
+    println!("batched device buffers: {batch_bytes} B");
+
+    // Index key/query: the same declared synthetic pool as the single-position run, copied six
+    // times for the batch-major index query.
+    let mut index_rng = Rng::new(0x6D32_305F_4353_4132);
+    let mut index_key_bits = Vec::with_capacity(HSI_BLOCKS * HSI_BLOCK_TOKENS * INDEX_HEAD_DIM);
+    for _ in 0..HSI_BLOCKS * HSI_BLOCK_TOKENS * INDEX_HEAD_DIM {
+        index_key_bits.push(index_rng.next_index_bits());
+    }
+    let mut index_query_bits = Vec::with_capacity(INDEX_HEADS * INDEX_HEAD_DIM);
+    for _ in 0..INDEX_HEADS * INDEX_HEAD_DIM {
+        index_query_bits.push(index_rng.next_index_bits());
+    }
+    let index_key_bytes = bf16_bytes_from_bits(&index_key_bits);
+    let one_index_query = bf16_bytes_from_bits(&index_query_bits);
+    let mut batch_index_query = Vec::with_capacity(rows * one_index_query.len());
+    for _ in 0..rows {
+        batch_index_query.extend_from_slice(&one_index_query);
+    }
+
+    // Upload the batch-major operands.
+    let mut q_bytes = Vec::new();
+    let mut window_codes = Vec::new();
+    let mut window_scales = Vec::new();
+    let mut selected_bytes = Vec::new();
+    for case in &cases {
+        q_bytes.extend_from_slice(&bf16_bytes_from_bits(&case.q_bits));
+        window_codes.extend_from_slice(&pad_to(&case.window_codes, SWA_WINDOW * LATENT));
+        window_scales.extend_from_slice(&pad_to(
+            &case.window_scales,
+            SWA_WINDOW * mla_ref::ROW_SCALE_BYTES / 2,
+        ));
+        // The kernel's row stride is selected_count (its header declares [6][selected_count]);
+        // padding each row to MAX_SELECTED here makes row r start at the wrong id.
+        selected_bytes.extend_from_slice(&u32_bytes(&case.selected));
+    }
+    cuda.copy_htod(&batch.q, &q_bytes)?;
+    cuda.copy_htod(&batch.window_codes, &window_codes)?;
+    cuda.copy_htod(&batch.window_scales, &window_scales)?;
+    cuda.copy_htod(&batch.selected, &selected_bytes)?;
+    cuda.copy_htod(&batch.index_key, &index_key_bytes)?;
+    cuda.copy_htod(&batch.index_query, &batch_index_query)?;
+    cuda.copy_htod(&batch.sink, &f32_bytes(&cases[0].sink))?;
+    cuda.copy_htod(
+        &batch.kv_fp4,
+        &pad_to(&big.kv_codes, (base + rows) * mla_ref::ROW_PACKED_BYTES),
+    )?;
+    cuda.copy_htod(
+        &batch.kv_scales,
+        &pad_to(&big.kv_scales, (base + rows) * mla_ref::ROW_SCALE_BYTES),
+    )?;
+    // The scalar comparison path reads the single buffers; give it the same index pool.
+    cuda.copy_htod(&buffers.index_key, &index_key_bytes)?;
+    cuda.copy_htod(&buffers.index_query, &one_index_query)?;
+
+    let params = FlashMlaSeqParams::new(
+        batch.q,
+        batch.kv_fp4,
+        batch.kv_scales,
+        batch.window_codes,
+        batch.window_scales,
+        seq::FORMAT_CSA_UNION,
+        SWA_WINDOW as u64,
+        batch.selected,
+        batch.index_key,
+        batch.index_query,
+        batch.sink,
+        batch.block_scores,
+        batch.block_best,
+        batch.out,
+        base as u64,
+        u32::try_from(selected_count).expect("selected count fits u32"),
+        0,
+        0,
+        0,
+    );
+    let first_start = Instant::now();
+    cuda.launch(
+        batch_kernel,
+        (seq::HEADS as u32, 1, 1),
+        seq::BLOCK,
+        params.as_slice(),
+    )?;
+    let first_batch_ms = first_start.elapsed().as_secs_f64() * 1.0e3;
+    let mut batch_out = vec![0u8; rows * HEADS * LATENT * 2];
+    cuda.copy_dtoh(&mut batch_out, &batch.out)?;
+    let mut batch_scores = vec![0u8; rows * HSI_BLOCKS * 4];
+    cuda.copy_dtoh(&mut batch_scores, &batch.block_scores)?;
+    let mut batch_best = vec![0u8; rows * HSI_BLOCKS * 4];
+    cuda.copy_dtoh(&mut batch_best, &batch.block_best)?;
+
+    let mut mismatched_rows = 0usize;
+    let mut scalar_samples = Vec::with_capacity(rows);
+    for (row, case) in cases.iter().enumerate() {
+        let scalar_start = Instant::now();
+        let scalar = launch_seq(cuda, seq_kernel, buffers, case, seq::GRID, false)?;
+        scalar_samples.push(scalar_start.elapsed().as_secs_f64() * 1.0e3);
+        let out_row = &batch_out[row * HEADS * LATENT * 2..(row + 1) * HEADS * LATENT * 2];
+        let scores_row = &batch_scores[row * HSI_BLOCKS * 4..(row + 1) * HSI_BLOCKS * 4];
+        let best_row = &batch_best[row * HSI_BLOCKS * 4..(row + 1) * HSI_BLOCKS * 4];
+        let out_bad = out_row != scalar.out.as_slice();
+        let scores_bad = scores_row != scalar.block_scores.as_slice();
+        let best_bad = best_row != scalar.block_best.as_slice();
+        if out_bad || scores_bad || best_bad {
+            mismatched_rows += 1;
+            if row == 0 {
+                for &b in &[0usize, 1, 511, 512, 513, 1023, 1024] {
+                    let s = b * 4;
+                    println!(
+                        "row 0 block {b}: batch score {:02x?} best {:02x?}; scalar score {:02x?} best {:02x?}",
+                        &scores_row[s..s + 4],
+                        &best_row[s..s + 4],
+                        &scalar.block_scores[s..s + 4],
+                        &scalar.block_best[s..s + 4]
+                    );
+                }
+            }
+            let out_first = out_row
+                .iter()
+                .zip(scalar.out.iter())
+                .position(|(a, b)| a != b);
+            let scores_first = scores_row
+                .iter()
+                .zip(scalar.block_scores.iter())
+                .position(|(a, b)| a != b);
+            let best_first = best_row
+                .iter()
+                .zip(scalar.block_best.iter())
+                .position(|(a, b)| a != b);
+            println!(
+                "row {row} mismatch: out {out_bad} first {out_first:?}; block_scores {scores_bad} \
+                 first {scores_first:?}; block_best {best_bad} first {best_first:?}"
+            );
+            if let Some(at) = out_first {
+                println!(
+                    "row {row} out byte {at}: batch {:02x} scalar {:02x}",
+                    out_row[at], scalar.out[at]
+                );
+            }
+            if let Some(at) = scores_first {
+                println!(
+                    "row {row} block_scores byte {at}: batch {:02x} scalar {:02x}",
+                    scores_row[at], scalar.block_scores[at]
+                );
+            }
+            if let Some(at) = best_first {
+                println!(
+                    "row {row} block_best byte {at}: batch {:02x} scalar {:02x}",
+                    best_row[at], scalar.block_best[at]
+                );
+            }
+        }
+    }
+    println!(
+        "per-row exactness: {}/{} rows byte-identical to the scalar sequence entry (out, \
+         block_scores, block_best; mismatched rows {mismatched_rows})",
+        rows - mismatched_rows,
+        rows
+    );
+
+    let (mut batch_samples, _) = cuda.launch_repeated(
+        batch_kernel,
+        (seq::HEADS as u32, 1, 1),
+        seq::BLOCK,
+        params.as_slice(),
+        repeat,
+    )?;
+    batch_samples.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+    let batch_p50 = batch_samples[batch_samples.len() / 2];
+    scalar_samples.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+    let one_row_p50 = scalar_samples[scalar_samples.len() / 2];
+    let six_sequential: f64 = scalar_samples.iter().sum();
+    println!(
+        "timing: one scalar launch p50 {one_row_p50:.4} ms (six launches summed {six_sequential:.4} \
+         ms); one batched six-row launch p50 {batch_p50:.4} ms = {:.3}x one row and {:.3}x the six \
+         sequential launches; first batched call {first_batch_ms:.4} ms vs p50 {batch_p50:.4} ms. \
+         Each scalar timing includes its own H2D uploads; the batched timing is one launch.",
+        batch_p50 / one_row_p50,
+        batch_p50 / six_sequential
+    );
+    if mismatched_rows == 0 {
+        println!(
+            "m20 batched: PASS (six distinct consecutive positions, per-row exact; no token or chain claimed)"
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "{mismatched_rows} batched rows differ from the scalar entry"
+        ))
+    }
+}
 fn run() -> Result<(), String> {
     let args = Args::parse()?;
     check_pin(BASE_KERNEL, BASE_BYTES, BASE_SHA256)?;
@@ -760,6 +1048,10 @@ fn run() -> Result<(), String> {
     let (_base_module, base_kernel) = load_flash_mla(&cuda, &base_cubin)?;
     let (_seq_module, seq_kernel) = seq::load(&cuda, &seq_cubin)?;
     let (buffers, device_bytes) = Buffers::allocate(&cuda)?;
+    if args.batched {
+        let (_batch_module, batch_kernel) = seq::load_batched(&cuda, &seq_cubin)?;
+        return run_batched(&cuda, seq_kernel, batch_kernel, &buffers, 20);
+    }
 
     let mut verdicts: Vec<Verdict> = Vec::new();
     let mut report = serde_json::json!({

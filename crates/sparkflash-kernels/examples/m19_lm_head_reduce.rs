@@ -49,8 +49,8 @@
 //! docs/build/phase3-lm-head-reduce.md. Do not cite b42 or b43 as anything but FAILURES.
 //!
 //! PINS. Both cubins are refused by size and sha256 against the embedded baseline manifest before
-//! any device allocation: cert_lm_head_sm121 14,888 B / 7394b129... / membar 0, lm_head_reduce_sm121
-//! 36,120 B / 3fcd7ba5... / membar 0. The m16 block layout is 128 blocks = four ranks x 32 chunks of 1,024
+//! any device allocation: cert_lm_head_sm121 38,088 B / 3b71c992... / membar 0, lm_head_reduce_sm121
+//! 73,704 B / 2d18f68d... / membar 0. The m16 block layout is 128 blocks = four ranks x 32 chunks of 1,024
 //! entries (the last chunk of each rank has 576).
 //!
 //! Usage (aarch64 node, checkpoint present):
@@ -81,6 +81,7 @@ use sparkflash_kernels::lm_head_reduce_launch::{
     STATUS_WINNER_CERTIFIED, TOP, VOCAB, VOCAB_PER_RANK,
 };
 use sparkflash_kernels::lm_head_reduce_ref::{self, Reduction};
+use sparkflash_kernels::lm_head_ref;
 use sparkflash_kernels::m4_quant::bf16_bits;
 
 const HIDDEN: usize = 5_120;
@@ -88,13 +89,13 @@ const RANKS: usize = 4;
 
 /// The certified screen's pin (the c4c chain launches this artifact).
 const SCREEN_KERNEL: &str = "cert_lm_head_sm121";
-const SCREEN_BYTES: usize = 14_888;
-const SCREEN_SHA256: &str = "7394b1290a3210a78ba12e6fc5414b0f4c84d1cdaf8edbcfa63b25dfcdf00493";
+const SCREEN_BYTES: usize = 38_088;
+const SCREEN_SHA256: &str = "3b71c99290ee91ca2431c0e232c644559f1c6e2bf340182fc103486789dad8f8";
 
 /// This kernel's pin, from baseline/kernel_baseline.txt through baseline::pin.
 const REDUCE_KERNEL: &str = "lm_head_reduce_sm121";
-const REDUCE_BYTES: usize = 36_120;
-const REDUCE_SHA256: &str = "3fcd7ba5e9871d01804e84825c107bf7741efac7b16982c77aced29b726b2849";
+const REDUCE_BYTES: usize = 73_704;
+const REDUCE_SHA256: &str = "2d18f68d71fbe657ed8e675f3b74c386678d51ff350a82368fff0df50c0032d3";
 
 /// The declared hidden seam pins (the same artifacts m16 declares).
 const HEAD_INPUT_BYTES: usize = HIDDEN * 4;
@@ -421,6 +422,17 @@ fn run() -> Result<(), String> {
     let mut allocated = 0usize;
     let weight_d = cuda.alloc(head.len(), &mut allocated)?;
     cuda.copy_htod(&weight_d, &head)?;
+    let block_maxima = lm_head_ref::block_maxima_bf16(&head);
+    let rank_max_bytes = VOCAB_PER_RANK * lm_head_ref::LM_BLOCKS * 2;
+    let w_block_max_d: Vec<Deviceptr> = (0..RANKS)
+        .map(|_| cuda.alloc(rank_max_bytes, &mut allocated))
+        .collect::<Result<Vec<_>, _>>()?;
+    for rank in 0..RANKS {
+        cuda.copy_htod(
+            &w_block_max_d[rank],
+            &block_maxima[rank * rank_max_bytes..(rank + 1) * rank_max_bytes],
+        )?;
+    }
     let hidden_d = cuda.alloc(HEAD_INPUT_BYTES, &mut allocated)?;
     let logits_d: Vec<Deviceptr> = (0..RANKS)
         .map(|_| cuda.alloc(VOCAB_PER_RANK * 4, &mut allocated))
@@ -464,6 +476,7 @@ fn run() -> Result<(), String> {
             screen_kernel,
             hidden_d,
             weight_d,
+            &w_block_max_d,
             rank_stride,
             &logits_d,
             &certified_d,
@@ -867,6 +880,7 @@ fn run_screen(
     kernel: Kernel,
     hidden_d: Deviceptr,
     weight_d: Deviceptr,
+    w_block_max_d: &[Deviceptr],
     rank_stride: usize,
     logits_d: &[Deviceptr],
     certified_d: &[Deviceptr],
@@ -879,6 +893,7 @@ fn run_screen(
         let params = CertLmHeadParams::new(
             hidden_d,
             Deviceptr(weight_d.0 + (rank * rank_stride) as u64),
+            w_block_max_d[rank],
             logits_d[rank],
             certified_d[rank],
             counts_d[rank],

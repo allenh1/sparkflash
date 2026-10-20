@@ -30,20 +30,20 @@ fn the_mega_mhc_observing_path_uses_the_acquiring_poll() {
             "every poll in the kernel must be the acquiring helper: {call}"
         );
     }
-    // The hand-rolled acquire that used to sit here is gone: with the helper in place a fence at
-    // the call site would be a second, independently editable copy of the guarantee.
-    let observing = MEGA_MHC.find(&call).expect("the call exists");
-    assert!(
-        !MEGA_MHC[observing..].contains("__threadfence"),
-        "the acquire must not be duplicated at the call site"
-    );
-    // The read the acquire protects still happens after the call, and the call is what puts the
-    // fence before it.
-    let read = MEGA_MHC[observing..]
-        .find("*hc_rms_out")
-        .map(|offset| observing + offset)
-        .expect("the observing path reads hc_rms_out after the poll");
-    assert!(observing < read, "the helper call must precede the read");
+    // The hand-rolled acquire is gone; the file carries scalar and K8 paths, so check each call.
+    let mut calls = MEGA_MHC.match_indices(&call).peekable();
+    assert!(calls.peek().is_some(), "the call exists");
+    for (observing, _) in calls {
+        let read = MEGA_MHC[observing..]
+            .find("*hc_rms_out")
+            .map(|offset| observing + offset);
+        let read = read.expect("the observing path reads hc_rms_out after the poll");
+        assert!(observing < read, "the helper call must precede the read");
+        assert!(
+            !MEGA_MHC[observing..read].contains("__threadfence"),
+            "the acquire must not be duplicated at the call site"
+        );
+    }
     // ...and the release half of the pair must exist too: a fence before the flag store, not just
     // an acquire after the poll.
     let publish = MEGA_MHC

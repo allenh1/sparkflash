@@ -66,6 +66,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod arena;
 pub mod budget;
 pub mod chain;
 pub mod chain_device;

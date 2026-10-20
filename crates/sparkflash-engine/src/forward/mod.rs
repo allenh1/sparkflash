@@ -163,6 +163,35 @@ pub struct InferenceEngine {
     gather: Option<crate::parallel_tp::BitGatherHandle>,
 }
 
+/// The layer window one sequence step runs. The end is inclusive; the default is the whole model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepLayers {
+    /// First layer in the window (inclusive).
+    pub start: usize,
+    /// Last layer in the window (inclusive).
+    pub end: usize,
+}
+
+impl StepLayers {
+    /// A window covering every layer of `n_layers`.
+    #[must_use]
+    pub fn all(n_layers: usize) -> Self {
+        Self {
+            start: 0,
+            end: n_layers.saturating_sub(1),
+        }
+    }
+
+    /// A window from layer 0 through `stop_after_layer`, clamped to the model.
+    #[must_use]
+    pub fn through(stop_after_layer: usize, n_layers: usize) -> Self {
+        Self {
+            start: 0,
+            end: stop_after_layer.min(n_layers.saturating_sub(1)),
+        }
+    }
+}
+
 impl InferenceEngine {
     /// An engine over a source, with the plan that source is read against.
     ///
@@ -1743,6 +1772,7 @@ impl InferenceEngine {
     /// device attention/MoE backends see the caller's accumulated KV/attention state, and `start_pos`
     /// is the position this one-token step writes. The one-token method above is a fresh-state
     /// wrapper, so the b40/b41 single-token evidence keeps the same code path.
+    /// The full-step form: every layer, no behaviour change for existing callers.
     #[allow(clippy::too_many_arguments)]
     pub fn run_hybrid_sequence_step(
         &self,
@@ -1752,8 +1782,40 @@ impl InferenceEngine {
         start_pos: usize,
         provider: &mut HybridDeferredProvider<'_>,
         post: &mut HybridPostProvider<'_>,
+        attention: Option<&mut dyn attention::AttentionProjectionBackend>,
+        moe_backend: Option<&mut dyn moe::MoeDeviceBackend>,
+        progress: &mut dyn FnMut(usize, u64),
+    ) -> Result<HybridTokenOutput, EngineError> {
+        let layer_window = StepLayers::all(self.config.n_layers);
+        self.run_hybrid_sequence_step_ranged(
+            state,
+            token,
+            embedding,
+            start_pos,
+            provider,
+            post,
+            attention,
+            moe_backend,
+            layer_window,
+            progress,
+        )
+    }
+
+    /// One deferred hybrid step over the requested layer window. Diagnostic bisection uses a window
+    /// below n_layers - 1; the numbers it produces are partial-model, not logits of the full
+    /// checkpoint, and callers must label them that way.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_hybrid_sequence_step_ranged(
+        &self,
+        state: &mut SequenceState,
+        token: u32,
+        embedding: &[f32],
+        start_pos: usize,
+        provider: &mut HybridDeferredProvider<'_>,
+        post: &mut HybridPostProvider<'_>,
         mut attention: Option<&mut dyn attention::AttentionProjectionBackend>,
         mut moe_backend: Option<&mut dyn moe::MoeDeviceBackend>,
+        layer_window: StepLayers,
         progress: &mut dyn FnMut(usize, u64),
     ) -> Result<HybridTokenOutput, EngineError> {
         let input_token = token;
@@ -1800,7 +1862,16 @@ impl InferenceEngine {
         let mut scratch = Scratch::for_chunk(config, 1);
         let mut layers = Vec::with_capacity(config.n_layers);
         let mut deferred: Option<DeferredHandoff> = None;
-        for layer in 0..config.n_layers {
+        if layer_window.start > layer_window.end || layer_window.end >= config.n_layers {
+            return Err(EngineError::Shape {
+                what: "deferred hybrid layer window".to_owned(),
+                detail: format!(
+                    "layers {}..={} are outside the {} model layers",
+                    layer_window.start, layer_window.end, config.n_layers
+                ),
+            });
+        }
+        for layer in layer_window.start..=layer_window.end {
             let mut layer_stages = Vec::new();
             // The c3b provider applies Engram itself, after it materialises the deferred FFN
             // epilogue into H_l and before it computes H_l's entry. Applying Engram here would

@@ -24,6 +24,11 @@ The only non-verbatim text, allow-listed and written out below:
      because the text they scan moved; their assertions are unchanged.
   2. the root module's freeze notice and the D26 pin comment, which now name the aggregated family
      length instead of one file's length.
+  3. the K8 scanner data updates and the acquire-guard per-call fix, applied after the split below.
+     These do not add a scanner: the certified head gained a w_block_max operand in its frozen
+     signature table, the six kernels' static-assert counts rose with their K8 symbols, and the
+     mHC file now carries scalar and six-row kernels so the guard checks every observing path.
+     They are written out as exact replacements so this script still fails on any other drift.
 
 Exit 0 means the split is exactly that regeneration; exit 1 prints the first differing line.
 
@@ -52,6 +57,80 @@ FREEZE_BULLET = "//!   * no new scanner, parser or lint for a new kernel invaria
 FREEZE_BULLET_NEW = "//!   * no new scanner, parser or lint for a new kernel invariant is added to this family; a new"
 FREEZE_LENGTH = "//!   * the file's length is pinned by ci/check-m4-abi-size.sh, wired into .gitlab-ci.yml; a change that\n//!     makes it longer fails that check, and a legitimate shrink updates the pin in the same commit.\n"
 FREEZE_LENGTH_NEW = "//!   * the family's total length is pinned by ci/check-m4-abi-size.sh, wired into .gitlab-ci.yml: the\n//!     root file plus the pinned submodules under src/m4_abi/ (the quarantine split recorded in\n//!     docs/build/m4-abi-split.md). Any net change fails that check, and a legitimate shrink updates the\n//!     pin in the same commit.\n"
+POST_SPLIT_ROOT_EDITS = [
+    (
+        '"const __nv_bfloat16 *__restrict__ hidden; const __nv_bfloat16 *__restrict__ w; float *__restrict__ logits;',
+        '"const __nv_bfloat16 *__restrict__ hidden; const __nv_bfloat16 *__restrict__ w; const __nv_bfloat16 *__restrict__ w_block_max; float *__restrict__ logits;',
+    ),
+    (
+        '    ("mega_mhc_sm121.cu", 6),\n    ("b12x_mxfp8_dense_sm121.cu", 6),',
+        '    ("mega_mhc_sm121.cu", 7),\n    ("b12x_mxfp8_dense_sm121.cu", 15),',
+    ),
+    (
+        '    ("b12x_mxfp8_wo_a_sm121.cu", 11),\n    ("cert_lm_head_sm121.cu", 8),',
+        '    ("b12x_mxfp8_wo_a_sm121.cu", 20),\n    ("cert_lm_head_sm121.cu", 9),',
+    ),
+    (
+        '        checked, 78,\n        "the milestone\'s static asserts must all be evaluated: 20 in the shared header plus 6, 6, \\\n',
+        '        checked, 98,\n        "the milestone\'s static asserts must all be evaluated: 20 in the shared header plus 6, 7, \\\n',
+    ),
+]
+
+POST_SPLIT_GUARD_EDITS = [
+    (
+        '''    // The hand-rolled acquire that used to sit here is gone: with the helper in place a fence at
+    // the call site would be a second, independently editable copy of the guarantee.
+    let observing = MEGA_MHC.find(&call).expect("the call exists");
+    assert!(
+        !MEGA_MHC[observing..].contains("__threadfence"),
+        "the acquire must not be duplicated at the call site"
+    );
+    // The read the acquire protects still happens after the call, and the call is what puts the
+    // fence before it.
+    let read = MEGA_MHC[observing..]
+        .find("*hc_rms_out")
+        .map(|offset| observing + offset)
+        .expect("the observing path reads hc_rms_out after the poll");
+    assert!(observing < read, "the helper call must precede the read");
+''',
+        '''    // The hand-rolled acquire is gone; the file carries scalar and K8 paths, so check each call.
+    let mut calls = MEGA_MHC.match_indices(&call).peekable();
+    assert!(calls.peek().is_some(), "the call exists");
+    for (observing, _) in calls {
+        let read = MEGA_MHC[observing..]
+            .find("*hc_rms_out")
+            .map(|offset| observing + offset);
+        let read = read.expect("the observing path reads hc_rms_out after the poll");
+        assert!(observing < read, "the helper call must precede the read");
+        assert!(
+            !MEGA_MHC[observing..read].contains("__threadfence"),
+            "the acquire must not be duplicated at the call site"
+        );
+    }
+''',
+    ),
+]
+
+
+def apply_post_split_edits(expected):
+    for old, new in POST_SPLIT_ROOT_EDITS:
+        if old not in expected["root"]:
+            sys.exit("error: post-split root edit target is missing: " + old[:60])
+        expected["root"] = expected["root"].replace(old, new, 1)
+    return expected
+
+
+def apply_post_split_guard_edits(formatted_guard):
+    # The guard block is applied after rustfmt: the split's raw body is still indented one level
+    # (it lived inside the old inline test module), while this replacement matches the formatted
+    # file that the repository actually reviews.
+    for old, new in POST_SPLIT_GUARD_EDITS:
+        if old not in formatted_guard:
+            sys.exit("error: post-split acquire-guard edit target is missing")
+        formatted_guard = formatted_guard.replace(old, new, 1)
+    return formatted_guard
+
+
 GLUE = "mod scanner;\npub use scanner::{\n    acquire_fence_after_poll, acquire_helper_fences_unconditionally,\n    guarded_names_are_not_redefined, observing_paths_call_the_acquiring_poll,\n    the_acquiring_poll_is_defined_exactly_once,\n};\n\n#[cfg(test)]\nuse scanner::*;\n\n#[cfg(test)]\nmod acquire_guard;\n\n"
 ADAPTER_READ = (
     "    let source =\n"
@@ -215,10 +294,12 @@ def main():
     BASE_COMMIT = args.base
     base = base_text()
     total, tests = check_family_and_pin()
-    expected = split_expected(base)
+    expected = apply_post_split_edits(split_expected(base))
     expected["root"] = format_rust(expected, "m4_abi.rs")
     expected["scanner"] = format_rust(expected, "m4_abi/scanner.rs")
-    expected["acquire_guard"] = format_rust(expected, "m4_abi/acquire_guard.rs")
+    expected["acquire_guard"] = apply_post_split_guard_edits(
+        format_rust(expected, "m4_abi/acquire_guard.rs")
+    )
     ok = True
     ok &= compare(expected["root"], ROOT_FILE, "root")
     ok &= compare(expected["scanner"], SCANNER_FILE, "scanner")

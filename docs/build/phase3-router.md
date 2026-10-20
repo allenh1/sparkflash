@@ -80,10 +80,15 @@ semantics in the harness.
 
 Cubin (pinned toolkit): `nvcc -std=c++17 -arch=sm_121a -cubin -I kernels
 kernels/moe_router_sm121.cu -o out/moe_router_sm121.cubin`, CUDA 13.0.3 (nvcc V13.0.88),
-**37,384 B, sha256
-`5992cef91c3e01be46c0691a5d905877b38a2c3002d90d5c31b80a003924769b`, 0 PTX membar lines**
+**25,432 B, sha256
+`42f6bbdcc6cf26890f2f0b1a24718e65da4ff0d0bedee7bca9a4598018b688cc`, 0 PTX membar lines**
 (measured with the same image the baseline check uses). The harness refuses any other cubin **by
 hash** before it launches it.
+
+The K3-final warp-per-expert tree (`ffabd235`, 36,344 B) measured 0.1081 ms per 8-token launch, but
+its tree reduction moved the scores to max ULP 131 and the weights to ULP 21, outside the serial
+bars below. It is not the shipping arithmetic: this pin is the restored ascending-k serial per-output
+reduction, one lane per token, so the score is the incumbent serial sequence again.
 
 Harness: `./scripts/build-aarch64.sh --example=m9_router`, then on the node
 
@@ -100,7 +105,7 @@ The harness prints its **pass bar before any number**, then measures:
 | device scores vs the twin | max abs delta <= 1e-6, max ULP <= 8 |
 | device weights vs the twin | max abs delta <= 1e-6, max ULP <= 16 (so within 16 ULP of the host path too, since host == twin) |
 | determinism | two device runs byte-identical |
-| cubin | 37,384 B and the sha above |
+| cubin | 25,432 B and the sha above |
 
 Why the device bars are not "bit-identical" everywhere: ids are exact, but the harness does not
 assert the pre-softplus GEMM separately - the device output starts at the score, so the score bar
@@ -115,11 +120,11 @@ embed row is a **stand-in**: the real router consumes the post-attention hidden,
 not have layer 0's FFN-side residual stream. Every claim is about the router arithmetic over released
 gate bytes and released activation bytes, not about end-to-end layer text.
 
-Cost note for reading the timing line: each block stages the **whole 384 x 5120 gate** in k-tiles, so
-the launch re-reads about 3.9 MB of gate per block (17 blocks at 130 tokens, about 66 MB) - the kernel
-is bandwidth-bound on the gate for small batches. The harness reports p50 per launch and per token
-with the invocation printed; do not compare it against the host seam's cost until the seam MR
-measures both sides on the same window.
+Cost note for reading the timing line: one block owns eight consecutive experts and reads each of
+their 5,120-value gate rows once per token block, so a 130-token launch has 17 token blocks (about
+17 x 3.9 MB of gate reads). The harness reports p50 per launch and per token with the invocation
+printed; do not compare it against the host seam's cost until the seam MR measures both sides on the
+same window.
 
 ## 5. The device runs (Lead's window, 2026-10-18T18:32Z)
 

@@ -11,10 +11,15 @@
 //! (EOF/EPIPE become CommError::PeerClosed) and deadlines (a silent peer becomes
 //! CommError::Timeout).
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+use parking_lot::{Condvar, Mutex};
 
 use crate::error::CommError;
 use crate::exchange::{self, Exchange, ExchangeKind, ExchangeTag, Received};
@@ -346,6 +351,353 @@ impl TcpConfig {
     }
 }
 
+/// The (layer, phase) slot a posted reduce occupies.
+///
+/// The caller names the slot, not the transport: layer 12 phase 0 is one slot, and a second post
+/// into it before the first is waited is refused. The phase is a LOCAL seam identity (for the loop,
+/// 0 = attention consumption and 1 = MoE seam); it is not written on the wire, because frame
+/// demultiplexing is by `seq` alone. Consequently `(layer, 0)` and `(layer, 1)` may both be
+/// outstanding at the same time as long as their sequence numbers differ, while two outstanding
+/// posts into the same `(layer, phase)` remain a hard error.
+///
+/// The asynchronous path is one-shot only; a hairpin's second leg stays on the synchronous API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReduceSlot {
+    /// Chain layer whose seam owns the reduction.
+    pub layer: u32,
+    /// Phase inside that layer (0 for the MoE-seam reduce).
+    pub phase: u8,
+}
+
+impl ReduceSlot {
+    /// Builds a slot identity.
+    #[must_use]
+    pub fn new(layer: u32, phase: u8) -> Self {
+        Self { layer, phase }
+    }
+}
+
+/// A reduce whose wire exchange has been posted and not yet consumed.
+///
+/// The handle owns the caller's buffer mutably until [`TcpTransport::wait_reduce`] consumes it, so
+/// the contribution cannot be overwritten between post and wait. It is deliberately not `Copy`
+/// and not `Clone`: passing it to `wait_reduce` is the only way to complete it, which is what makes
+/// a double wait a compile error and a stale handle a runtime error.
+#[must_use = "a posted reduce must be waited exactly once; dropping the handle strands the slot"]
+pub struct ReduceHandle<'a> {
+    slot: ReduceSlot,
+    seq: u64,
+    buffer: &'a mut [u16],
+}
+
+impl ReduceHandle<'_> {
+    /// The slot this reduce was posted into.
+    #[must_use]
+    pub fn slot(&self) -> ReduceSlot {
+        self.slot
+    }
+
+    /// The caller sequence number carried on the wire.
+    #[must_use]
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Number of bf16 elements this reduce covers.
+    #[must_use]
+    pub fn elements(&self) -> usize {
+        self.buffer.len()
+    }
+}
+
+/// Frames already decoded and waiting for their reduce's registered slot.
+struct PendingReduce {
+    slot: ReduceSlot,
+    elements: usize,
+    received: HashMap<usize, Vec<u16>>,
+}
+
+/// Shared state between the transport and its per-peer async reader threads.
+struct AsyncShared {
+    inner: Mutex<AsyncInner>,
+    condvar: Condvar,
+    running: AtomicBool,
+}
+
+struct AsyncInner {
+    pending: HashMap<u64, PendingReduce>,
+    slots: HashMap<ReduceSlot, u64>,
+    /// A frame can arrive before this rank posts the matching reduce (the peers post independently),
+    /// so unknown sequences are held here and adopted by `register` rather than rejected.
+    orphan: HashMap<u64, Vec<(usize, Vec<u16>)>>,
+    failure: Option<CommError>,
+}
+
+impl AsyncShared {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(AsyncInner {
+                pending: HashMap::new(),
+                slots: HashMap::new(),
+                orphan: HashMap::new(),
+                failure: None,
+            }),
+            condvar: Condvar::new(),
+            running: AtomicBool::new(true),
+        }
+    }
+
+    fn fail(&self, error: CommError) {
+        let mut inner = self.inner.lock();
+        if inner.failure.is_none() {
+            inner.failure = Some(error);
+        }
+        self.condvar.notify_all();
+    }
+
+    fn deliver(&self, peer: usize, seq: u64, payload: Vec<u16>) {
+        let mut inner = self.inner.lock();
+        if let Some(pending) = inner.pending.get_mut(&seq) {
+            if pending.received.insert(peer, payload).is_some() && inner.failure.is_none() {
+                inner.failure = Some(CommError::Protocol(format!(
+                    "peer {peer} sent two payloads for reduce seq {seq}"
+                )));
+            }
+        } else {
+            inner.orphan.entry(seq).or_default().push((peer, payload));
+        }
+        self.condvar.notify_all();
+    }
+
+    fn register(&self, slot: ReduceSlot, seq: u64, elements: usize) -> Result<(), CommError> {
+        let mut inner = self.inner.lock();
+        if let Some(existing) = inner.slots.get(&slot) {
+            return Err(CommError::Protocol(format!(
+                "reduce slot {slot:?} already has seq {existing} outstanding; one reduce per (layer, phase) slot"
+            )));
+        }
+        if inner.pending.contains_key(&seq) {
+            return Err(CommError::Protocol(format!(
+                "reduce seq {seq} is already outstanding; sequence numbers must be unique"
+            )));
+        }
+        let mut pending = PendingReduce {
+            slot,
+            elements,
+            received: HashMap::new(),
+        };
+        if let Some(orphans) = inner.orphan.remove(&seq) {
+            for (peer, payload) in orphans {
+                pending.received.insert(peer, payload);
+            }
+        }
+        inner.slots.insert(slot, seq);
+        inner.pending.insert(seq, pending);
+        Ok(())
+    }
+
+    fn abort(&self, slot: ReduceSlot, seq: u64) {
+        let mut inner = self.inner.lock();
+        if inner.slots.get(&slot).copied() == Some(seq) {
+            inner.slots.remove(&slot);
+        }
+        inner.pending.remove(&seq);
+        self.condvar.notify_all();
+    }
+
+    fn take(
+        &self,
+        slot: ReduceSlot,
+        seq: u64,
+        world_size: usize,
+        rank: usize,
+        timeout: Duration,
+    ) -> Result<Vec<(usize, Vec<u16>)>, CommError> {
+        let deadline = Instant::now() + timeout;
+        let mut inner = self.inner.lock();
+        loop {
+            if let Some(error) = inner.failure.take() {
+                inner.pending.remove(&seq);
+                if inner.slots.get(&slot).copied() == Some(seq) {
+                    inner.slots.remove(&slot);
+                }
+                return Err(error);
+            }
+            let complete = match inner.pending.get(&seq) {
+                Some(pending) if pending.slot == slot => pending.received.len() == world_size - 1,
+                Some(_) => {
+                    return Err(CommError::Protocol(format!(
+                        "reduce seq {seq} belongs to a different slot"
+                    )));
+                }
+                None => {
+                    return Err(CommError::Protocol(format!(
+                        "reduce slot {slot:?} seq {seq} has no posted exchange (dead wait or already consumed)"
+                    )));
+                }
+            };
+            if complete {
+                let pending = inner
+                    .pending
+                    .remove(&seq)
+                    .ok_or_else(|| CommError::Protocol("pending reduce vanished".to_owned()))?;
+                inner.slots.remove(&slot);
+                let mut frames: Vec<(usize, Vec<u16>)> = Vec::with_capacity(world_size - 1);
+                for (peer, payload) in pending.received {
+                    if peer == rank || peer >= world_size {
+                        return Err(CommError::Protocol(format!(
+                            "reduce seq {seq} received a payload from invalid peer {peer}"
+                        )));
+                    }
+                    if payload.len() != pending.elements {
+                        return Err(CommError::Protocol(format!(
+                            "reduce seq {seq} peer {peer} carried {} elements, expected {}",
+                            payload.len(),
+                            pending.elements
+                        )));
+                    }
+                    frames.push((peer, payload));
+                }
+                frames.sort_by_key(|(peer, _)| *peer);
+                return Ok(frames);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                outer_cleanup(&mut inner, slot, seq);
+                return Err(CommError::timeout(
+                    timeout,
+                    format!("waiting for reduce slot {slot:?} seq {seq}"),
+                ));
+            }
+            self.condvar.wait_for(&mut inner, deadline - now);
+        }
+    }
+}
+
+/// Removes a slot's pending state after a timeout; kept out of the loop body so the guard is
+/// released the same way on every path.
+fn outer_cleanup(inner: &mut AsyncInner, slot: ReduceSlot, seq: u64) {
+    inner.pending.remove(&seq);
+    if inner.slots.get(&slot).copied() == Some(seq) {
+        inner.slots.remove(&slot);
+    }
+}
+
+/// The async reader thread for one peer: frames are demultiplexed by seq into the shared state.
+fn async_reader(
+    peer: usize,
+    mut stream: TcpStream,
+    timeout: Duration,
+    max_frame_bytes: usize,
+    shared: Arc<AsyncShared>,
+) {
+    // A short read timeout is used only so the loop can observe `running`; the parser keeps the
+    // partial header/payload state across timeouts instead of restarting read_frame. A timeout in
+    // the middle of a frame must never throw the already-read bytes away (that was the first bug
+    // this loop had), and a blocking read would strand the thread on Drop.
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut header_bytes = [0u8; FRAME_HEADER_BYTES];
+    let mut header_filled = 0usize;
+    let mut payload: Vec<u8> = Vec::new();
+    let mut payload_filled = 0usize;
+    let mut have_header = false;
+    let mut pending_seq = 0u64;
+    let fail = |error: CommError| {
+        if shared.running.load(Ordering::Acquire) {
+            shared.fail(error);
+        }
+    };
+    'reader: while shared.running.load(Ordering::Acquire) {
+        let outcome = if have_header {
+            stream.read(&mut payload[payload_filled..])
+        } else {
+            stream.read(&mut header_bytes[header_filled..])
+        };
+        let filled = match outcome {
+            Ok(0) => {
+                fail(map_peer_error(
+                    peer,
+                    timeout,
+                    "async reader",
+                    CommError::Io(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                ));
+                break 'reader;
+            }
+            Ok(count) => count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue 'reader;
+            }
+            Err(error) => {
+                fail(map_peer_error(
+                    peer,
+                    timeout,
+                    "async reader",
+                    CommError::Io(error),
+                ));
+                break 'reader;
+            }
+        };
+        if have_header {
+            payload_filled += filled;
+            if payload_filled != payload.len() {
+                continue;
+            }
+            match decode_bf16(&payload) {
+                Ok(values) => shared.deliver(peer, pending_seq, values),
+                Err(error) => {
+                    fail(error);
+                    break 'reader;
+                }
+            }
+            have_header = false;
+            header_filled = 0;
+            payload.clear();
+            payload_filled = 0;
+        } else {
+            header_filled += filled;
+            if header_filled != FRAME_HEADER_BYTES {
+                continue;
+            }
+            let header = match FrameHeader::decode(&header_bytes) {
+                Ok(header) => header,
+                Err(error) => {
+                    fail(error);
+                    break 'reader;
+                }
+            };
+            if header.kind != FrameKind::ReducePayload || header.phase != 0 {
+                fail(CommError::Protocol(format!(
+                    "async reader for peer {peer} saw an unexpected frame: {header:?}"
+                )));
+                break 'reader;
+            }
+            if header.rank as usize != peer {
+                fail(CommError::Protocol(format!(
+                    "async reader for peer {peer} saw rank {} in the header",
+                    header.rank
+                )));
+                break 'reader;
+            }
+            let length = header.payload_bytes as usize;
+            if length > max_frame_bytes {
+                fail(CommError::Protocol(format!(
+                    "async frame from peer {peer} of {length} bytes exceeds the {max_frame_bytes} limit"
+                )));
+                break 'reader;
+            }
+            pending_seq = header.seq;
+            payload.resize(length, 0);
+            payload_filled = 0;
+            have_header = true;
+        }
+    }
+}
+
 /// One rank's TCP transport.
 pub struct TcpTransport {
     rank: usize,
@@ -354,6 +706,9 @@ pub struct TcpTransport {
     max_frame_bytes: usize,
     readers: Vec<Option<TcpStream>>,
     writers: Vec<Option<TcpStream>>,
+    /// Set by the first `post_reduce_bf16`; starts one demultiplexing reader per peer.
+    async_shared: Option<Arc<AsyncShared>>,
+    async_readers: Vec<JoinHandle<()>>,
 }
 
 impl TcpTransport {
@@ -477,6 +832,8 @@ impl TcpTransport {
             max_frame_bytes: config.max_frame_bytes,
             readers,
             writers,
+            async_shared: None,
+            async_readers: Vec::new(),
         })
     }
 
@@ -494,9 +851,132 @@ impl TcpTransport {
 
     /// Closes every peer socket. Used by the peer-death tests to model a rank that crashes.
     pub fn shutdown(&self) {
+        if let Some(shared) = &self.async_shared {
+            shared.running.store(false, Ordering::Release);
+        }
         for stream in self.readers.iter().chain(self.writers.iter()).flatten() {
             let _ = stream.shutdown(Shutdown::Both);
         }
+    }
+
+    /// Starts the one demultiplexing reader per peer the first time an async reduce is posted.
+    fn ensure_async(&mut self) -> Result<Arc<AsyncShared>, CommError> {
+        if let Some(shared) = &self.async_shared {
+            return Ok(Arc::clone(shared));
+        }
+        let shared = Arc::new(AsyncShared::new());
+        let mut handles = Vec::with_capacity(self.world_size.saturating_sub(1));
+        for peer in 0..self.world_size {
+            if peer == self.rank {
+                continue;
+            }
+            let stream = self.read_handle(peer)?.try_clone()?;
+            let state = Arc::clone(&shared);
+            let timeout = self.timeout;
+            let max_frame_bytes = self.max_frame_bytes;
+            handles.push(std::thread::spawn(move || {
+                async_reader(peer, stream, timeout, max_frame_bytes, state);
+            }));
+        }
+        self.async_readers = handles;
+        self.async_shared = Some(Arc::clone(&shared));
+        Ok(shared)
+    }
+
+    /// Posts a one-shot all-reduce without waiting for the peer payloads.
+    ///
+    /// The wire exchange starts inside this call: the contribution is framed and written to every
+    /// peer, and the per-peer demultiplexing readers (started on the first post) collect replies by
+    /// sequence number. The canonical reduction is deliberately NOT applied here; it is applied by
+    /// [`Self::wait_reduce`] at the consumption point, so a posted reduce can stay in flight while
+    /// the caller does other work. The result is the same canonical rule as the synchronous
+    /// one-shot path: bf16 payloads, ascending-rank f32 sum from 0.0, one bf16 RNE round.
+    ///
+    /// The asynchronous path is one-shot only (`FabricSchedule::OneShotAllToAll`). A hairpin
+    /// layout's second leg is a different schedule and stays on the synchronous API; this is
+    /// stated here rather than silently reducing with the wrong transfer list. The frame's wire
+    /// phase is always 0; the [`ReduceSlot::phase`] is local-only and is what the per-slot
+    /// outstanding map keys on.
+    ///
+    /// Exactly-once contract: the returned handle owns the buffer until `wait_reduce`, a second
+    /// post into the same slot is a hard error, and a wait with no outstanding slot is a hard
+    /// error. Sequence numbers must be unique among outstanding reduces.
+    ///
+    /// # Errors
+    /// Returns CommError::InvalidLayout for an empty/oversized buffer, CommError::Protocol for a
+    /// reused slot or sequence number, and a peer/socket error if a frame cannot be written.
+    pub fn post_reduce_bf16<'a>(
+        &mut self,
+        slot: ReduceSlot,
+        seq: u64,
+        buffer: &'a mut [u16],
+    ) -> Result<ReduceHandle<'a>, CommError> {
+        if buffer.is_empty() {
+            return Err(CommError::InvalidLayout(
+                "a posted reduce needs at least one element".to_owned(),
+            ));
+        }
+        self.check_frame(buffer.len())?;
+        let payload_bytes = u32::try_from(buffer.len() * 2).map_err(|_| {
+            CommError::InvalidLayout(format!(
+                "{} elements cannot be described by a u32 frame length",
+                buffer.len()
+            ))
+        })?;
+        let payload = encode_bf16(buffer);
+        let shared = self.ensure_async()?;
+        shared.register(slot, seq, buffer.len())?;
+        let header = FrameHeader {
+            kind: FrameKind::ReducePayload,
+            phase: 0,
+            seq,
+            rank: self.rank as u32,
+            payload_bytes,
+        };
+        for peer in 0..self.world_size {
+            if peer == self.rank {
+                continue;
+            }
+            let mut writer = match self.write_handle(peer) {
+                Ok(writer) => writer,
+                Err(error) => {
+                    shared.abort(slot, seq);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = write_frame(&mut writer, &header, &payload).map_err(|error| {
+                map_peer_error(peer, self.timeout, "posting a reduce frame", error)
+            }) {
+                shared.abort(slot, seq);
+                return Err(error);
+            }
+        }
+        Ok(ReduceHandle { slot, seq, buffer })
+    }
+
+    /// Waits for a posted reduce and applies the canonical rule in place at the consumption point.
+    ///
+    /// # Errors
+    /// Returns CommError::Timeout when a peer payload misses the transport deadline, a peer error
+    /// from the demultiplexer, or CommError::Protocol for a dead/double wait (a handle whose slot
+    /// has no outstanding exchange) or a malformed peer payload.
+    pub fn wait_reduce<'a>(
+        &mut self,
+        handle: ReduceHandle<'a>,
+    ) -> Result<&'a mut [u16], CommError> {
+        let shared = self.async_shared.as_ref().ok_or_else(|| {
+            CommError::Protocol("wait_reduce called before any post_reduce_bf16".to_owned())
+        })?;
+        let ReduceHandle { slot, seq, buffer } = handle;
+        let frames = shared.take(slot, seq, self.world_size, self.rank, self.timeout)?;
+        let own = buffer.to_vec();
+        let mut panes: Vec<&[u16]> = vec![&[]; self.world_size];
+        panes[self.rank] = own.as_slice();
+        for (peer, payload) in &frames {
+            panes[*peer] = payload.as_slice();
+        }
+        crate::reduce::canonical_all_reduce_into(buffer, &panes)?;
+        Ok(buffer)
     }
 
     fn read_handle(&self, peer: usize) -> Result<&TcpStream, CommError> {
@@ -533,6 +1013,18 @@ impl TcpTransport {
     }
 }
 
+impl Drop for TcpTransport {
+    fn drop(&mut self) {
+        // Do NOT shutdown the sockets here: a rank that has consumed its last reduce may drop
+        // before its peers have read frames already queued on the wire, and shutdown(Both) can
+        // discard them. Settling `running` lets the readers exit after their next 50 ms timeout;
+        // the socket close that follows flushes the send queue.
+        if let Some(shared) = &self.async_shared {
+            shared.running.store(false, Ordering::Release);
+        }
+    }
+}
+
 impl Transport for TcpTransport {
     fn world_size(&self) -> usize {
         self.world_size
@@ -548,12 +1040,25 @@ impl Transport for TcpTransport {
         seq: u64,
         layout: &CollectiveLayout,
     ) -> Result<(), CommError> {
+        if self.async_shared.is_some() {
+            return Err(CommError::Protocol(
+                "synchronous all_reduce after post_reduce_bf16: the async readers own the sockets; \
+                 use wait_reduce, or start a new transport"
+                    .to_owned(),
+            ));
+        }
         self.check_frame(buf.len())?;
         let mut exchange = TcpExchange::new(self);
         exchange::all_reduce(&mut exchange, self.rank, buf, seq, layout)
     }
 
     fn all_gather_bf16(&self, local: &[u16], out: &mut [u16], seq: u64) -> Result<(), CommError> {
+        if self.async_shared.is_some() {
+            return Err(CommError::Protocol(
+                "synchronous all_gather after post_reduce_bf16: the async readers own the sockets"
+                    .to_owned(),
+            ));
+        }
         self.check_frame(local.len())?;
         let mut exchange = TcpExchange::new(self);
         exchange::all_gather(&mut exchange, self.rank, local, out, seq, self.world_size)

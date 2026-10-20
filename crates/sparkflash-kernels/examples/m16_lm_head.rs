@@ -90,14 +90,15 @@ mod b2_harness;
 use self::b2_harness::{Snapshot, bytes_to_f32};
 use sparkflash_kernels::baseline;
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, KernelId};
+use sparkflash_kernels::lm_head_ref;
 use sparkflash_kernels::m4_quant::{bf16_bits, bf16_bits_to_f32};
 
 /// The cubin name in the baseline manifest (the nvcc source stem).
 const KERNEL: &str = "cert_lm_head_sm121";
 /// The pinned cubin size, from baseline/kernel_baseline.txt through baseline::pin.
-const PIN_BYTES: usize = 14_888;
+const PIN_BYTES: usize = 38_088;
 /// The pinned cubin sha256, from the same manifest.
-const PIN_SHA256: &str = "7394b1290a3210a78ba12e6fc5414b0f4c84d1cdaf8edbcfa63b25dfcdf00493";
+const PIN_SHA256: &str = "3b71c99290ee91ca2431c0e232c644559f1c6e2bf340182fc103486789dad8f8";
 /// The pinned PTX membar-line count.
 const PIN_MEMBAR_LINES: u32 = 0;
 
@@ -517,6 +518,7 @@ fn verify_cubin(path: &Path) -> Result<Vec<u8>, String> {
 struct DeviceBuffers {
     hidden: Deviceptr,
     weight: Deviceptr,
+    block_maxima: Deviceptr,
     logits: Deviceptr,
     certified: Deviceptr,
     count: Deviceptr,
@@ -529,6 +531,7 @@ impl DeviceBuffers {
         let mut allocated = 0usize;
         let hidden = cuda.alloc(HIDDEN * 2, &mut allocated)?;
         let weight = cuda.alloc(VOCAB * HIDDEN * 2, &mut allocated)?;
+        let block_maxima = cuda.alloc(VOCAB * LM_BLOCKS * 2, &mut allocated)?;
         let logits = cuda.alloc(VOCAB_PER_RANK * 4, &mut allocated)?;
         let certified = cuda.alloc(VOCAB_PER_RANK, &mut allocated)?;
         let count = cuda.alloc(4, &mut allocated)?;
@@ -538,6 +541,7 @@ impl DeviceBuffers {
             Self {
                 hidden,
                 weight,
+                block_maxima,
                 logits,
                 certified,
                 count,
@@ -614,9 +618,11 @@ fn launch_rank(
     rank: usize,
 ) -> Result<RankOutputs, String> {
     let rank_stride = (VOCAB_PER_RANK * HIDDEN * 2) as u64;
-    let params: [u64; 11] = [
+    let max_stride = (VOCAB_PER_RANK * LM_BLOCKS * 2) as u64;
+    let params: [u64; 12] = [
         buffers.hidden.0,
         buffers.weight.0 + (rank as u64) * rank_stride,
+        buffers.block_maxima.0 + (rank as u64) * max_stride,
         buffers.logits.0,
         buffers.certified.0,
         buffers.count.0,
@@ -1218,6 +1224,8 @@ fn run() -> Result<(), String> {
     println!("device buffers: {allocated} B on device 0");
     check_floor(args.floor_gib, "m16_lm_head pre-upload")?;
     cuda.copy_htod(&buffers.weight, &head)?;
+    let block_maxima = lm_head_ref::block_maxima_bf16(&head);
+    cuda.copy_htod(&buffers.block_maxima, &block_maxima)?;
     check_floor(args.floor_gib, "m16_lm_head post head upload")?;
 
     let mut failed = 0usize;
@@ -1305,6 +1313,7 @@ fn run() -> Result<(), String> {
         &[
             buffers.hidden,
             buffers.weight,
+            buffers.block_maxima,
             buffers.logits,
             buffers.certified,
             buffers.count,

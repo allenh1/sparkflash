@@ -42,8 +42,8 @@
 //! ```
 //!
 //! The cubin must be the pinned one: `nvcc -std=c++17 -arch=sm_121a -cubin -I kernels
-//! kernels/moe_router_sm121.cu -o out/moe_router_sm121.cubin` under CUDA 13.0.3 (V13.0.88), 37,384 B,
-//! sha256 `5992cef9...`; the harness refuses a different cubin by hash rather than measuring it.
+//! kernels/moe_router_sm121.cu -o out/moe_router_sm121.cubin` under CUDA 13.0.3 (V13.0.88), 25,432 B,
+//! sha256 `42f6bbdc...`; the harness refuses a different cubin by hash rather than measuring it.
 
 // The shared CUDA driver is safe-only for examples: the typed API is the whole surface, and this
 // pin keeps a future edit from opening an FFI path beside it (m4_abi checks it).
@@ -442,7 +442,7 @@ fn run() -> Result<(), String> {
     cuda.copy_htod(&x_d, &x_bytes)?;
     cuda.copy_htod(&gate_d, &gate_bytes)?;
     cuda.copy_htod(&bias_d, &bias_bytes)?;
-    let (module, kernel) = router_launch::load(&cuda, &cubin)?;
+    let (module, kernel, topk_module, topk) = router_launch::load(&cuda, &cubin)?;
     let params = RouterLaunchParams {
         x: x_d,
         gate: gate_d,
@@ -499,10 +499,10 @@ fn run() -> Result<(), String> {
     };
 
     check_floor(args.floor_gib, "m9_router pre-launch")?;
-    router_launch::launch(&cuda, kernel, &params)?;
+    router_launch::launch(&cuda, kernel, topk, &params)?;
     let (device_ids, device_weights, device_scores, first_run) = read_out(&cuda)?;
     // A second launch on the same buffers: the kernel must be deterministic byte for byte.
-    router_launch::launch(&cuda, kernel, &params)?;
+    router_launch::launch(&cuda, kernel, topk, &params)?;
     let (_, _, _, second_run) = read_out(&cuda)?;
     check_floor(args.floor_gib, "m9_router post-launch")?;
 
@@ -584,7 +584,7 @@ fn run() -> Result<(), String> {
 
     // Timing: repeat launches on the same buffers, the same discipline the stage-2 timing uses.
     let (per_launch, batched) =
-        router_launch::launch_repeated(&cuda, kernel, &params, args.repeat)?;
+        router_launch::launch_repeated(&cuda, kernel, topk, &params, args.repeat)?;
     let mut sorted = per_launch.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let p50 = sorted[sorted.len() / 2];
@@ -601,6 +601,7 @@ fn run() -> Result<(), String> {
     );
 
     cuda.free(module, &[x_d, gate_d, bias_d, ids_d, weights_d, scores_d]);
+    cuda.free(topk_module, &[]);
 
     let failures = verdicts.iter().filter(|verdict| !verdict.ok).count();
     for verdict in &verdicts {

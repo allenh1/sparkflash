@@ -137,6 +137,10 @@ pub const KERNEL_ID: KernelId = KernelId::LmHeadReduce;
 
 /// The one launch's grid: exactly one block, because the reduction finalises in that block.
 pub const GRID: (u32, u32, u32) = (1, 1, 1);
+/// K8 batched reduction symbol: the same block reduces six rows in one launch.
+pub const BATCH_KERNEL: &str = "lm_head_reduce_batched_sm121";
+/// The verifier batch is six rows.
+pub const BATCH_ROWS: u32 = 6;
 
 /// One launch's arguments, in the kernel declaration's order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +201,14 @@ impl LmHeadReduceParams {
     }
 }
 
+/// Loads the K8 batched reduction symbol by name from the same cubin.
+///
+/// # Errors
+/// Returns the driver's error when the cubin does not contain [BATCH_KERNEL].
+pub fn load_batched(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+    cuda.load_lm_head_reduce_batched(cubin)
+}
+
 /// Loads the kernel from a cubin, resolving the pinned symbol.
 ///
 /// # Errors
@@ -210,6 +222,21 @@ pub fn load(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), String> {
 /// # Errors
 /// Returns the driver's error.
 pub fn launch(cuda: &Cuda, kernel: Kernel, params: &LmHeadReduceParams) -> Result<(), String> {
+    cuda.launch(kernel, GRID, BLOCK, params.as_slice())
+}
+
+/// Launches the K8 batched reduction once over six rows.
+///
+/// The 19-word ABI is unchanged; every pointer is batch-major, with `token`, `value`, `status`
+/// and `certified_count` [6] and the block/top-5 arrays [6][...].
+///
+/// # Errors
+/// Returns the driver's error; the kernel itself is one block and has no grid launch risk.
+pub fn launch_batched(
+    cuda: &Cuda,
+    kernel: Kernel,
+    params: &LmHeadReduceParams,
+) -> Result<(), String> {
     cuda.launch(kernel, GRID, BLOCK, params.as_slice())
 }
 
@@ -275,6 +302,14 @@ mod tests {
             !declaration_matches(&decl),
             "the qualifier pin is vacuous: {decl:?}"
         );
+    }
+
+    #[test]
+    fn the_batched_reduction_is_six_rows_in_the_same_one_block() {
+        assert_eq!(BATCH_ROWS, 6);
+        assert_eq!(GRID, (1, 1, 1));
+        assert_eq!(BLOCK.0, 256);
+        assert_ne!(BATCH_KERNEL, KERNEL);
     }
 
     #[test]

@@ -83,7 +83,8 @@ pub use rail::{RailAudit, RailLedger, RailPlan, RailSplit};
 pub use reduce::{canonical_all_reduce_into, canonical_reduce_element};
 pub use tcp::{
     DEFAULT_MAX_FRAME_BYTES, FRAME_HEADER_BYTES, FRAME_MAGIC, FRAME_VERSION, FrameHeader,
-    FrameKind, TcpConfig, TcpTransport, decode_bf16, encode_bf16, read_frame, write_frame,
+    FrameKind, ReduceHandle, ReduceSlot, TcpConfig, TcpTransport, decode_bf16, encode_bf16,
+    read_frame, write_frame,
 };
 pub use telemetry::{CommTelemetry, CommTelemetrySnapshot};
 pub use transport::{LoopbackCluster, LoopbackConfig, LoopbackTransport, Transport};

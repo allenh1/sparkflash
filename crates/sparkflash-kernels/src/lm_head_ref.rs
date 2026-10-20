@@ -33,6 +33,8 @@
 //! hardware. On scalar code the bound costs a max-reduce per 128 values while the exact path costs a
 //! multiply-accumulate, and which wins belongs to a GPU measurement.
 
+use crate::m4_quant::bf16_bits_to_f32;
+
 /// The hidden width. Mirrors SPARK_M4_HIDDEN.
 pub const HIDDEN: usize = 5120;
 /// Entries of the hidden state per screen block. Mirrors SPARK_M4_LM_SCREEN_TILE.
@@ -89,6 +91,54 @@ pub fn entry_bound(hidden_block_sums: &[f32], weight_row: &[f32]) -> f32 {
         bound += block_sum * row_max;
     }
     bound
+}
+
+/// The per-block absolute maxima of a BF16 weight matrix, in the kernel's [vocab][40] layout.
+///
+/// This is the load-time precompute for the certified head: for each vocabulary entry and each
+/// 128-value screen block, the largest absolute weight in that block, stored as the BF16 bit pattern
+/// that already held it. The checkpoint's weights are BF16, so taking the maximum of a block is a
+/// selection, not a rounding: replaying these values gives exactly the same row maxima as scanning
+/// the row, and therefore exactly the same bounds, certified flags and pruned logits.
+///
+/// The input is the little-endian BF16 byte image (two bytes per weight, row-major [vocab][HIDDEN]);
+/// the output is vocab * LM_BLOCKS little-endian BF16 values. Working on bytes keeps a 1.32 GB head
+/// from needing a second 1.32 GB u16 staging copy.
+///
+/// # Panics
+/// Panics if the image is not a whole number of BF16 rows.
+#[must_use]
+pub fn block_maxima_bf16(weights_le: &[u8]) -> Vec<u8> {
+    assert_eq!(weights_le.len() % 2, 0, "BF16 weights are whole bytes");
+    let values = weights_le.len() / 2;
+    assert_eq!(
+        values % HIDDEN,
+        0,
+        "the weight image is a whole number of HIDDEN-wide rows"
+    );
+    let vocab = values / HIDDEN;
+    let mut out = vec![0u8; vocab * LM_BLOCKS * 2];
+    for entry in 0..vocab {
+        let row = &weights_le[entry * HIDDEN * 2..(entry + 1) * HIDDEN * 2];
+        for block in 0..LM_BLOCKS {
+            let mut best_bits = 0u16;
+            let mut best = 0.0f32;
+            for i in 0..SCREEN_TILE {
+                let at = (block * SCREEN_TILE + i) * 2;
+                let bits = u16::from_le_bytes([row[at], row[at + 1]]);
+                let magnitude = bf16_bits_to_f32(bits).abs();
+                if magnitude > best {
+                    best = magnitude;
+                    // Store the magnitude's BF16 bits: the sign is not part of a row maximum, and a
+                    // negative bit pattern would turn the bound into a subtraction.
+                    best_bits = bits & 0x7fff;
+                }
+            }
+            let at = (entry * LM_BLOCKS + block) * 2;
+            out[at..at + 2].copy_from_slice(&best_bits.to_le_bytes());
+        }
+    }
+    out
 }
 
 /// The exact dot product of the hidden state with one entry's weight row.
@@ -233,6 +283,40 @@ mod tests {
             }
         }
         assert_eq!(seen_certified, screening.certified);
+    }
+
+    #[test]
+    fn block_maxima_reproduce_the_scan_the_kernel_used_to_do() {
+        let vocab = 5usize;
+        let mut weights = vec![0u8; vocab * HIDDEN * 2];
+        for (index, pair) in weights.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            // A spread of magnitudes with enough variation that no block's maximum is accidental.
+            let raw = ((index as u64).wrapping_mul(6364136223846793005) >> 35) as u16;
+            let mut bits = 0x3f80u16.wrapping_add(raw & 0x0fff);
+            if index % 3 == 0 {
+                bits |= 0x8000; // negative, so a signed maximum would be wrong
+            }
+            *pair = bits.to_le_bytes();
+        }
+        let maxima = block_maxima_bf16(&weights);
+        assert_eq!(maxima.len(), vocab * LM_BLOCKS * 2);
+        for entry in 0..vocab {
+            for block in 0..LM_BLOCKS {
+                let mut expected = 0.0f32;
+                for i in 0..SCREEN_TILE {
+                    let at = (entry * HIDDEN + block * SCREEN_TILE + i) * 2;
+                    let bits = u16::from_le_bytes([weights[at], weights[at + 1]]);
+                    expected = expected.max(bf16_bits_to_f32(bits).abs());
+                }
+                let at = (entry * LM_BLOCKS + block) * 2;
+                let bits = u16::from_le_bytes([maxima[at], maxima[at + 1]]);
+                assert_eq!(
+                    bf16_bits_to_f32(bits),
+                    expected,
+                    "entry {entry} block {block} must keep its exact BF16 maximum"
+                );
+            }
+        }
     }
 
     #[test]

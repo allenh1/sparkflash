@@ -11,8 +11,11 @@
 //! the compile-time enforcement of the one-launch-path rule. The unsafe blocks in this module are
 //! the dlopen boundary: everything above it is safe code.
 
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 type CuResult = i32;
 
@@ -116,6 +119,32 @@ impl Deviceptr {
 #[derive(Clone, Copy, Debug)]
 pub struct Kernel {
     function: CuFunction,
+    /// The canonical cubin pin name, so a timing bracket can key its sample by kernel.
+    name: &'static str,
+}
+
+/// A page-locked host allocation with its UVA device mapping.
+///
+/// The host pointer is the allocation's owner; the device pointer is only a mapping into it and
+/// must not be freed separately. [Cuda::free_host_mapped] releases the host allocation.
+#[derive(Clone, Copy, Debug)]
+pub struct HostMapped {
+    host: *mut c_void,
+    device: Deviceptr,
+}
+
+impl HostMapped {
+    /// The device-visible pointer for kernel arguments.
+    #[must_use]
+    pub fn device(&self) -> Deviceptr {
+        self.device
+    }
+
+    /// The host-visible pointer the caller fills before a launch.
+    #[must_use]
+    pub fn host_ptr(&self) -> *mut c_void {
+        self.host
+    }
 }
 
 /// The opaque handle of a CUDA module.
@@ -182,6 +211,9 @@ pub enum KernelId {
     /// flash_mla_csa2_seq_sm121: the deferred sequence's position-causal CSA2 attention entry, the
     /// start_pos > 0 path the c4a-2 call-site guard currently denies.
     FlashMlaCsa2Seq,
+    /// flash_mla_csa2_ring_sm121: D49's ring-capacity CSA2 entry. Capacity is an explicit argument
+    /// separate from the 128-token arithmetic window; the frozen sequence entry is not mutated.
+    FlashMlaCsa2Ring,
     /// b12x_bf16a_mxfp8w_dense_sm121: the BF16-activation variant of the dense MXFP8 projection
     /// (D37's precision-first path); weights stay B12x FP8 codes and ue8m0 scales.
     Bf16aMxfp8wDense,
@@ -197,7 +229,7 @@ pub enum KernelId {
 
 impl KernelId {
     /// Every kernel the shared driver owns, in the order of this enum.
-    pub const ALL: [KernelId; 17] = [
+    pub const ALL: [KernelId; 18] = [
         KernelId::MegaMhcBf16,
         KernelId::Mxfp8Dense,
         KernelId::Mxfp8WoA,
@@ -210,6 +242,7 @@ impl KernelId {
         KernelId::RmsNorm,
         KernelId::LmHeadReduce,
         KernelId::FlashMlaCsa2Seq,
+        KernelId::FlashMlaCsa2Ring,
         KernelId::Bf16aMxfp8wDense,
         KernelId::Bf16aMxfp8wWoA,
         KernelId::EngramEmbed,
@@ -232,6 +265,7 @@ impl KernelId {
             KernelId::RmsNorm => "rmsnorm_sm121",
             KernelId::LmHeadReduce => "lm_head_reduce_sm121",
             KernelId::FlashMlaCsa2Seq => "flash_mla_csa2_seq_sm121",
+            KernelId::FlashMlaCsa2Ring => "flash_mla_csa2_ring_sm121",
             KernelId::Bf16aMxfp8wDense => "b12x_bf16a_mxfp8w_dense_sm121",
             KernelId::Bf16aMxfp8wWoA => "b12x_bf16a_mxfp8w_wo_a_sm121",
             KernelId::EngramEmbed => "engram_embed_sm121",
@@ -262,6 +296,7 @@ impl KernelId {
             KernelId::RmsNorm => &["rmsnorm_sm121"],
             KernelId::LmHeadReduce => &["lm_head_reduce_sm121"],
             KernelId::FlashMlaCsa2Seq => &["flash_mla_csa2_seq_sm121"],
+            KernelId::FlashMlaCsa2Ring => &["flash_mla_csa2_ring_sm121"],
             KernelId::Bf16aMxfp8wDense => &["b12x_bf16a_mxfp8w_dense_sm121"],
             KernelId::Bf16aMxfp8wWoA => &["b12x_bf16a_mxfp8w_wo_a_sm121"],
             KernelId::EngramEmbed => &["engram_embed_sm121"],
@@ -327,6 +362,272 @@ pub fn cubin_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
     ))
 }
 
+/// The chain scope a launch is attributed to: phase, step, layer and position.
+///
+/// The harness sets it at its position/step loop; every launch until the next set is attributed to
+/// that scope. All fields default to 0 (and the phase to "stage") so an unwired arm still produces
+/// a well-formed ledger row rather than a wrong one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StageScope {
+    /// The phase name: prefill, decode or a stage-arm name.
+    pub phase: &'static str,
+    /// The step index inside the phase.
+    pub step: usize,
+    /// The backbone layer, when the caller knows it.
+    pub layer: usize,
+    /// The absolute token position.
+    pub position: usize,
+}
+
+/// One kernel's aggregated device time in one phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelTimingRow {
+    /// The phase the launches were attributed to.
+    pub phase: &'static str,
+    /// The canonical cubin pin name.
+    pub kernel: &'static str,
+    /// How many launches were bracketed.
+    pub calls: u64,
+    /// The summed event time, nanoseconds.
+    pub total_ns: u64,
+    /// The mean event time, nanoseconds.
+    pub mean_ns: u64,
+    /// The shortest launch, nanoseconds.
+    pub min_ns: u64,
+    /// The longest launch, nanoseconds.
+    pub max_ns: u64,
+    /// The ordinal of the first launch of this kernel in this phase.
+    pub first_launch_order: usize,
+}
+
+/// One kernel's launches inside one step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepLaunchRow {
+    /// The canonical cubin pin name.
+    pub kernel: &'static str,
+    /// How many launches were bracketed.
+    pub calls: u64,
+    /// The summed event time, nanoseconds.
+    pub total_ns: u64,
+}
+
+/// One step's launches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepTimingRow {
+    /// The step index the scope reported.
+    pub step: usize,
+    /// True when the caller marked this step as warmup (cold-vs-steady separation).
+    pub warm: bool,
+    /// How many launches were bracketed.
+    pub launches: u64,
+    /// The summed event time, nanoseconds.
+    pub kernel_ns: u64,
+    /// The per-kernel rows, in kernel-name order.
+    pub kernels: Vec<StepLaunchRow>,
+}
+
+/// The per-kernel ledger one run collected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageTimingReport {
+    /// The per-phase, per-kernel rows, in first-launch order.
+    pub kernels: Vec<KernelTimingRow>,
+    /// The per-step rows, in step order.
+    pub steps: Vec<StepTimingRow>,
+    /// How many distinct kernel names beyond the 128-name cap were dropped.
+    pub dropped_names: usize,
+}
+
+/// The distinct-kernel cap, so a run cannot grow the ledger without bound.
+const STAGE_TIMING_KERNEL_CAP: usize = 128;
+
+#[derive(Default)]
+struct KernelRow {
+    calls: u64,
+    total_ns: u64,
+    min_ns: u64,
+    max_ns: u64,
+    first_order: usize,
+}
+
+#[derive(Default)]
+struct StepRow {
+    launches: u64,
+    kernel_ns: u64,
+    kernels: BTreeMap<&'static str, (u64, u64)>,
+    warm: bool,
+}
+
+struct StageRecorder {
+    scope: StageScope,
+    order: usize,
+    dropped: usize,
+    kernels: BTreeMap<(&'static str, &'static str), KernelRow>,
+    steps: BTreeMap<usize, StepRow>,
+}
+
+impl Default for StageRecorder {
+    fn default() -> Self {
+        Self {
+            scope: StageScope {
+                phase: "stage",
+                step: 0,
+                layer: 0,
+                position: 0,
+            },
+            order: 0,
+            dropped: 0,
+            kernels: BTreeMap::new(),
+            steps: BTreeMap::new(),
+        }
+    }
+}
+
+/// The process-wide recorder. The ledger is per process, not per [Cuda], because one chain opens
+/// several driver handles (attention, MoE and the mHC launcher) and all of their launches belong in
+/// one table.
+static STAGE_RECORDER: Mutex<Option<StageRecorder>> = Mutex::new(None);
+
+/// Set by the device arm before its dummy steps; read when a step row is first touched.
+static WARM_STEP: AtomicBool = AtomicBool::new(false);
+
+/// Whether SPARKFLASH_STAGE_TIMING=1 armed the bracket. Off by default: no events, no allocations
+/// and a byte-identical run when it is unset.
+pub fn stage_timing_enabled() -> bool {
+    std::env::var("SPARKFLASH_STAGE_TIMING").ok().as_deref() == Some("1")
+}
+
+/// Sets the scope every following launch is attributed to. A no-op when the recorder is off.
+pub fn stage_timing_scope(phase: &'static str, step: usize, layer: usize, position: usize) {
+    if !stage_timing_enabled() {
+        return;
+    }
+    let Ok(mut guard) = STAGE_RECORDER.lock() else {
+        return;
+    };
+    let Some(recorder) = guard.as_mut() else {
+        return;
+    };
+    recorder.scope = StageScope {
+        phase,
+        step,
+        layer,
+        position,
+    };
+}
+
+/// Marks subsequent steps as warmup steps until cleared. The device arm sets this for its dummy
+/// pre-serving steps and clears it before the first real token, so the ledger can split first-step
+/// (cold) time from steady-state time instead of averaging them together.
+pub fn stage_timing_set_warm(warm: bool) {
+    WARM_STEP.store(warm, Ordering::Relaxed);
+}
+
+/// Updates only the layer of the current scope (the chain's per-layer loop calls this).
+pub fn stage_timing_set_layer(layer: usize) {
+    if !stage_timing_enabled() {
+        return;
+    }
+    let Ok(mut guard) = STAGE_RECORDER.lock() else {
+        return;
+    };
+    if let Some(recorder) = guard.as_mut() {
+        recorder.scope.layer = layer;
+    }
+}
+
+/// Records one bracketed launch. Called by [Cuda::launch] only.
+fn record_launch(kernel: &'static str, elapsed_ns: u64) {
+    let Ok(mut guard) = STAGE_RECORDER.lock() else {
+        return;
+    };
+    let Some(recorder) = guard.as_mut() else {
+        return;
+    };
+    let phase = recorder.scope.phase;
+    let step = recorder.scope.step;
+    let order = recorder.order;
+    recorder.order += 1;
+    let known = recorder.kernels.contains_key(&(phase, kernel));
+    if !known && recorder.kernels.len() >= STAGE_TIMING_KERNEL_CAP {
+        recorder.dropped += 1;
+        return;
+    }
+    let row = recorder
+        .kernels
+        .entry((phase, kernel))
+        .or_insert(KernelRow {
+            first_order: order,
+            min_ns: elapsed_ns,
+            max_ns: elapsed_ns,
+            ..KernelRow::default()
+        });
+    row.calls += 1;
+    row.total_ns = row.total_ns.saturating_add(elapsed_ns);
+    row.min_ns = row.min_ns.min(elapsed_ns);
+    row.max_ns = row.max_ns.max(elapsed_ns);
+    let step_row = recorder.steps.entry(step).or_default();
+    step_row.warm = WARM_STEP.load(Ordering::Relaxed);
+    step_row.launches += 1;
+    step_row.kernel_ns = step_row.kernel_ns.saturating_add(elapsed_ns);
+    let entry = step_row.kernels.entry(kernel).or_insert((0, 0));
+    entry.0 += 1;
+    entry.1 = entry.1.saturating_add(elapsed_ns);
+}
+
+/// The ledger one run collected, or None when the recorder was never armed.
+pub fn stage_timing_report() -> Option<StageTimingReport> {
+    let guard = STAGE_RECORDER.lock().ok()?;
+    let recorder = guard.as_ref()?;
+    let mut kernels: Vec<KernelTimingRow> = recorder
+        .kernels
+        .iter()
+        .map(|((phase, kernel), row)| KernelTimingRow {
+            phase,
+            kernel,
+            calls: row.calls,
+            total_ns: row.total_ns,
+            mean_ns: row.total_ns.checked_div(row.calls).unwrap_or(0),
+            min_ns: row.min_ns,
+            max_ns: row.max_ns,
+            first_launch_order: row.first_order,
+        })
+        .collect();
+    kernels.sort_by_key(|row| row.first_launch_order);
+    let steps: Vec<StepTimingRow> = recorder
+        .steps
+        .iter()
+        .map(|(step, row)| StepTimingRow {
+            step: *step,
+            warm: row.warm,
+            launches: row.launches,
+            kernel_ns: row.kernel_ns,
+            kernels: row
+                .kernels
+                .iter()
+                .map(|(kernel, (calls, total_ns))| StepLaunchRow {
+                    kernel,
+                    calls: *calls,
+                    total_ns: *total_ns,
+                })
+                .collect(),
+        })
+        .collect();
+    Some(StageTimingReport {
+        kernels,
+        steps,
+        dropped_names: recorder.dropped,
+    })
+}
+
+/// Counts one launch bracket site, so a test can prove the bracket is armed.
+#[must_use]
+pub fn stage_timing_launches() -> u64 {
+    STAGE_RECORDER
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|recorder| recorder.order as u64))
+        .unwrap_or(0)
+}
 /// The CUDA context and the dlopen'd driver functions this process uses.
 ///
 /// The context is the retained primary context, made current for the thread that created it, and
@@ -511,6 +812,104 @@ impl Cuda {
         }
     }
 
+    /// Allocates managed (UVA/unified) memory with CU_MEM_ATTACH_GLOBAL.
+    ///
+    /// The returned pointer is valid on both the host and the device on a UMA system, so a caller
+    /// can fill an arena once and launch kernels against it without a separate copy. Device code
+    /// may migrate pages; the allocation is freed with [Cuda::free_managed] (or cuMemFree).
+    pub fn alloc_managed(&self, bytes: usize, total: &mut usize) -> Result<Deviceptr, String> {
+        unsafe {
+            let f: libloading::Symbol<
+                unsafe extern "C" fn(*mut CuDeviceptr, usize, u32) -> CuResult,
+            > = self.sym(b"cuMemAllocManaged")?;
+            let mut p: CuDeviceptr = 0;
+            const CU_MEM_ATTACH_GLOBAL: u32 = 1;
+            let r = f(&mut p, bytes, CU_MEM_ATTACH_GLOBAL);
+            if r != 0 {
+                return Err(format!("cuMemAllocManaged({bytes}) failed: {r}"));
+            }
+            *total += bytes;
+            Ok(Deviceptr(p))
+        }
+    }
+
+    /// Allocates a page-locked host slab and resolves its device mapping.
+    ///
+    /// The slab is portable and device-mapped, so the device can read it through UVA while the
+    /// host keeps the original pointer for filling and inspection. The returned [HostMapped] owns
+    /// both pointers; free it with [Cuda::free_host_mapped], not cuMemFree.
+    pub fn alloc_host_mapped(&self, bytes: usize, total: &mut usize) -> Result<HostMapped, String> {
+        unsafe {
+            let alloc: libloading::Symbol<
+                unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> CuResult,
+            > = self.sym(b"cuMemHostAlloc")?;
+            const CU_MEMHOSTALLOC_PORTABLE: u32 = 1;
+            const CU_MEMHOSTALLOC_DEVICEMAP: u32 = 2;
+            let mut host: *mut c_void = std::ptr::null_mut();
+            let r = alloc(
+                &mut host,
+                bytes,
+                CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP,
+            );
+            if r != 0 {
+                return Err(format!("cuMemHostAlloc({bytes}) failed: {r}"));
+            }
+            let get: libloading::Symbol<
+                unsafe extern "C" fn(*mut CuDeviceptr, *mut c_void, u32) -> CuResult,
+            > = match self.sym(b"cuMemHostGetDevicePointer_v2") {
+                Ok(symbol) => symbol,
+                Err(error) => {
+                    if let Ok(free) =
+                        self.sym::<unsafe extern "C" fn(*mut c_void) -> CuResult>(b"cuMemFreeHost")
+                    {
+                        let _ = free(host);
+                    }
+                    return Err(error);
+                }
+            };
+            let mut device: CuDeviceptr = 0;
+            let r = get(&mut device, host, 0);
+            if r != 0 {
+                if let Ok(free) =
+                    self.sym::<unsafe extern "C" fn(*mut c_void) -> CuResult>(b"cuMemFreeHost")
+                {
+                    let _ = free(host);
+                }
+                return Err(format!("cuMemHostGetDevicePointer failed: {r}"));
+            }
+            *total += bytes;
+            Ok(HostMapped {
+                host,
+                device: Deviceptr(device),
+            })
+        }
+    }
+
+    /// Frees an allocation returned by [Cuda::alloc_managed].
+    ///
+    /// Managed memory is released through cuMemFree, the same call as an ordinary device
+    /// allocation. The byte count is not tracked here; the caller's arena keeps its own total.
+    pub fn free_managed(&self, ptr: &Deviceptr) {
+        unsafe {
+            if let Ok(f) =
+                self.sym::<unsafe extern "C" fn(CuDeviceptr) -> CuResult>(b"cuMemFree_v2")
+            {
+                let _ = f(ptr.0);
+            }
+        }
+    }
+
+    /// Frees an allocation returned by [Cuda::alloc_host_mapped].
+    pub fn free_host_mapped(&self, mapped: &HostMapped) {
+        unsafe {
+            if let Ok(f) =
+                self.sym::<unsafe extern "C" fn(*mut c_void) -> CuResult>(b"cuMemFreeHost")
+            {
+                let _ = f(mapped.host);
+            }
+        }
+    }
+
     /// Copies host bytes to a device allocation.
     pub fn copy_htod(&self, dst: &Deviceptr, src: &[u8]) -> Result<(), String> {
         unsafe {
@@ -577,13 +976,210 @@ impl Cuda {
     /// never refer to the flash_mla kernel.
     pub fn load_kernel(&self, cubin: &[u8], id: KernelId) -> Result<(Module, Kernel), String> {
         let (module, function) = self.load_function(cubin, id.symbol())?;
-        Ok((Module(module), Kernel { function }))
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: id.cubin_names()[0],
+            },
+        ))
+    }
+
+    /// Loads the router's stage-two top-6 merge kernel from the router cubin.
+    ///
+    /// Stage two is a second symbol in the same cubin as [KernelId::MoeRouter]. It is not a new
+    /// [KernelId] because it has no cubin of its own and no independent baseline entry: the
+    /// router's cubin pin covers both symbols. The symbol is deliberately not resolvable through
+    /// [KernelId::from_cubin_name], so a harness cannot accidentally launch the merge as a router.
+    pub fn load_router_topk(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "moe_router_topk_sm121")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "moe_router_topk_sm121",
+            },
+        ))
+    }
+    /// Loads the K8 batched certified-head symbol by name from the cert cubin.
+    pub fn load_cert_lm_head_batched(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "cert_lm_head_batched_sm121")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "cert_lm_head_batched_sm121",
+            },
+        ))
+    }
+
+    /// Loads the K1 warp-per-column dense symbol from the dense cubin.
+    ///
+    /// The scalar `b12x_mxfp8_dense_sm121` symbol remains the pinned reference and the incumbent
+    /// harness target; this second symbol is the one the chain switches to after its own
+    /// tolerance-qualified run. It shares the cubin pin with the scalar symbol.
+    pub fn load_dense_warp(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "b12x_mxfp8_dense_warp_sm121")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "b12x_mxfp8_dense_warp_sm121",
+            },
+        ))
+    }
+
+    /// Loads the K1-b A-reuse tiled dense symbol by name.
+    pub fn load_dense_tile(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "b12x_mxfp8_dense_tile_sm121")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "b12x_mxfp8_dense_tile_sm121",
+            },
+        ))
+    }
+
+    /// Loads the K1-c(a) parallel-K dense symbol by name.
+    pub fn load_dense_par_k(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "b12x_mxfp8_dense_par_k_sm121")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "b12x_mxfp8_dense_par_k_sm121",
+            },
+        ))
+    }
+
+    /// Loads the K8 batched mHC main and init symbols by name.
+    pub fn load_mega_mhc_batched(
+        &self,
+        cubin: &[u8],
+    ) -> Result<(Module, Kernel, Module, Kernel), String> {
+        let (mm, mf) = self.load_function(cubin, "mega_mhc_fused_bf16_batched_sm121")?;
+        let (im, init) = self.load_function(cubin, "mega_mhc_init_sm121")?;
+        Ok((
+            Module(mm),
+            Kernel {
+                function: mf,
+                name: "mega_mhc_fused_bf16_batched_sm121",
+            },
+            Module(im),
+            Kernel {
+                function: init,
+                name: "mega_mhc_init_sm121",
+            },
+        ))
+    }
+
+    /// Loads the K8 batched LM-head reduction symbol by name.
+    pub fn load_lm_head_reduce_batched(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "lm_head_reduce_batched_sm121")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "lm_head_reduce_batched_sm121",
+            },
+        ))
+    }
+
+    /// Loads both K1-c(b) split-K symbols by name.
+    pub fn load_dense_split_k(
+        &self,
+        cubin: &[u8],
+    ) -> Result<(Module, Kernel, Module, Kernel), String> {
+        let (pm, pf) = self.load_function(cubin, "b12x_mxfp8_dense_split_k_sm121")?;
+        let (cm, cf) = self.load_function(cubin, "b12x_mxfp8_dense_split_k_combine_sm121")?;
+        Ok((
+            Module(pm),
+            Kernel {
+                function: pf,
+                name: "b12x_mxfp8_dense_split_k_sm121",
+            },
+            Module(cm),
+            Kernel {
+                function: cf,
+                name: "b12x_mxfp8_dense_split_k_combine_sm121",
+            },
+        ))
+    }
+
+    /// Loads the D49 ring-capacity CSA2 symbol by name.
+    pub fn load_flash_mla_csa2_ring(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "flash_mla_csa2_ring_sm121")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "flash_mla_csa2_ring_sm121",
+            },
+        ))
+    }
+
+    /// Loads the K8 batched CSA2 sequence symbol by name.
+    pub fn load_flash_mla_csa2_seq_batched(
+        &self,
+        cubin: &[u8],
+    ) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "flash_mla_csa2_seq_batched_sm121")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "flash_mla_csa2_seq_batched_sm121",
+            },
+        ))
+    }
+
+    /// Loads the K1 warp-per-column wo_a symbol from the wo_a cubin.
+    pub fn load_wo_a_warp(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "b12x_mxfp8_wo_a_warp_sm121")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "b12x_mxfp8_wo_a_warp_sm121",
+            },
+        ))
+    }
+
+    /// Loads the K1-b A-reuse tiled wo_a symbol by name.
+    pub fn load_wo_a_tile(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "b12x_mxfp8_wo_a_tile_sm121")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "b12x_mxfp8_wo_a_tile_sm121",
+            },
+        ))
+    }
+
+    /// Loads the K8 batched wo_a symbol by name.
+    pub fn load_wo_a_batched(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "b12x_mxfp8_wo_a_batched_sm121")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "b12x_mxfp8_wo_a_batched_sm121",
+            },
+        ))
     }
 
     /// Loads the flash_mla kernel. Used only by crate::cuda_harness's typed loader.
     pub(crate) fn load_flash_mla(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
         let (module, function) = self.load_function(cubin, "flash_mla_csa2_sm121")?;
-        Ok((Module(module), Kernel { function }))
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: FLASH_MLA_CUBIN,
+            },
+        ))
     }
 
     fn load_function(&self, cubin: &[u8], name: &str) -> Result<(CuModule, CuFunction), String> {
@@ -610,6 +1206,11 @@ impl Cuda {
     }
 
     /// Launches one non-flash_mla kernel, then synchronises the context.
+    ///
+    /// With SPARKFLASH_STAGE_TIMING=1 the launch is bracketed by one cuEventCreate pair recorded
+    /// immediately around cuLaunchKernel and resolved after the existing cuCtxSynchronize; the
+    /// bracketed launches are the same launches in the same order and nothing else changes. Without
+    /// the variable no event is created, no allocation happens and the launch path is unchanged.
     pub fn launch(
         &self,
         kernel: Kernel,
@@ -622,6 +1223,30 @@ impl Cuda {
             let mut storage: Vec<[u64; 1]> = args.iter().map(|a| [*a]).collect();
             let mut ptrs: Vec<*mut c_void> =
                 storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
+            let timing = stage_timing_enabled();
+            let mut start_event: CuEvent = std::ptr::null_mut();
+            let mut stop_event: CuEvent = std::ptr::null_mut();
+            if timing {
+                let create: libloading::Symbol<
+                    unsafe extern "C" fn(*mut CuEvent, u32) -> CuResult,
+                > = self.sym(b"cuEventCreate")?;
+                let record: libloading::Symbol<
+                    unsafe extern "C" fn(CuEvent, *mut c_void) -> CuResult,
+                > = self.sym(b"cuEventRecord")?;
+                let mut r = create(&mut start_event, 0);
+                if r == 0 {
+                    r = create(&mut stop_event, 0);
+                }
+                if r != 0 {
+                    return Err(format!(
+                        "cuEventCreate for the stage timing bracket failed: {r}"
+                    ));
+                }
+                let r = record(start_event, std::ptr::null_mut());
+                if r != 0 {
+                    return Err(format!("cuEventRecord(start) failed: {r}"));
+                }
+            }
             let r = launch(
                 kernel.function,
                 grid.0,
@@ -638,11 +1263,35 @@ impl Cuda {
             if r != 0 {
                 return Err(format!("cuLaunchKernel failed: {r}"));
             }
+            if timing {
+                let record: libloading::Symbol<
+                    unsafe extern "C" fn(CuEvent, *mut c_void) -> CuResult,
+                > = self.sym(b"cuEventRecord")?;
+                let r = record(stop_event, std::ptr::null_mut());
+                if r != 0 {
+                    return Err(format!("cuEventRecord(stop) failed: {r}"));
+                }
+            }
             let sync: libloading::Symbol<unsafe extern "C" fn() -> CuResult> =
                 self.sym(b"cuCtxSynchronize")?;
             let r = sync();
             if r != 0 {
                 return Err(format!("cuCtxSynchronize failed: {r}"));
+            }
+            if timing {
+                let elapsed: libloading::Symbol<
+                    unsafe extern "C" fn(*mut f32, CuEvent, CuEvent) -> CuResult,
+                > = self.sym(b"cuEventElapsedTime")?;
+                let destroy: libloading::Symbol<unsafe extern "C" fn(CuEvent) -> CuResult> =
+                    self.sym(b"cuEventDestroy")?;
+                let mut ms: f32 = 0.0;
+                let r = elapsed(&mut ms, start_event, stop_event);
+                destroy(start_event);
+                destroy(stop_event);
+                if r != 0 {
+                    return Err(format!("cuEventElapsedTime failed: {r}"));
+                }
+                record_launch(kernel.name, (f64::from(ms) * 1_000_000.0) as u64);
             }
             Ok(())
         }
@@ -791,5 +1440,95 @@ impl Drop for Cuda {
                 let _ = release_v2(self.dev);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stage_timing_tests {
+    use super::*;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn reset() {
+        *STAGE_RECORDER.lock().expect("lock") = Some(StageRecorder::default());
+    }
+
+    fn scope(phase: &'static str, step: usize, layer: usize, position: usize) {
+        let mut guard = STAGE_RECORDER.lock().expect("lock");
+        let recorder = guard.as_mut().expect("armed");
+        recorder.scope = StageScope {
+            phase,
+            step,
+            layer,
+            position,
+        };
+    }
+
+    #[test]
+    fn the_ledger_aggregates_per_kernel_phase_and_step() {
+        let _serial = TEST_LOCK.lock().expect("test lock");
+        reset();
+        scope("decode", 2, 5, 7);
+        record_launch("b12x_mxfp8_dense_sm121", 1_000);
+        record_launch("b12x_mxfp8_dense_sm121", 3_000);
+        record_launch("moe_router_sm121", 500);
+        let report = stage_timing_report().expect("report");
+        assert_eq!(report.kernels.len(), 2);
+        let dense = &report.kernels[0];
+        assert_eq!(dense.phase, "decode");
+        assert_eq!(dense.kernel, "b12x_mxfp8_dense_sm121");
+        assert_eq!(dense.calls, 2);
+        assert_eq!(dense.total_ns, 4_000);
+        assert_eq!(dense.mean_ns, 2_000);
+        assert_eq!(dense.min_ns, 1_000);
+        assert_eq!(dense.max_ns, 3_000);
+        assert_eq!(dense.first_launch_order, 0);
+        assert_eq!(report.steps.len(), 1);
+        assert_eq!(report.steps[0].step, 2);
+        assert_eq!(report.steps[0].launches, 3);
+        assert_eq!(report.steps[0].kernel_ns, 4_500);
+        *STAGE_RECORDER.lock().expect("lock") = None;
+    }
+
+    #[test]
+    fn the_ledger_caps_the_distinct_kernel_names() {
+        let _serial = TEST_LOCK.lock().expect("test lock");
+        reset();
+        scope("decode", 0, 0, 0);
+        let names: Vec<&'static str> = (0..STAGE_TIMING_KERNEL_CAP + 8)
+            .map(|index| Box::leak(format!("kernel_{index}").into_boxed_str()) as &'static str)
+            .collect();
+        for name in &names {
+            record_launch(name, 10);
+        }
+        let report = stage_timing_report().expect("report");
+        assert_eq!(report.kernels.len(), STAGE_TIMING_KERNEL_CAP);
+        assert_eq!(report.dropped_names, 8);
+        *STAGE_RECORDER.lock().expect("lock") = None;
+    }
+
+    #[test]
+    fn the_ledger_is_absent_until_armed_and_the_bracket_is_off_by_default() {
+        let _serial = TEST_LOCK.lock().expect("test lock");
+        *STAGE_RECORDER.lock().expect("lock") = None;
+        assert!(stage_timing_report().is_none());
+        assert_eq!(stage_timing_launches(), 0);
+    }
+
+    #[test]
+    fn warmup_steps_are_marked_so_cold_and_steady_state_can_be_reported_separately() {
+        let _serial = TEST_LOCK.lock().expect("test lock");
+        reset();
+        stage_timing_set_warm(true);
+        scope("decode", 0, 0, 0);
+        record_launch("b12x_mxfp8_dense_sm121", 9_000);
+        stage_timing_set_warm(false);
+        scope("decode", 1, 0, 0);
+        record_launch("b12x_mxfp8_dense_sm121", 1_000);
+        let report = stage_timing_report().expect("report");
+        assert_eq!(report.steps.len(), 2);
+        assert!(report.steps[0].warm, "step 0 is the warmup step");
+        assert!(!report.steps[1].warm, "step 1 is steady state");
+        *STAGE_RECORDER.lock().expect("lock") = None;
     }
 }

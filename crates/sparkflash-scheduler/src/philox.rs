@@ -1,10 +1,11 @@
-//! Counter-based Philox-4x32-10 and the sync-free DSpark draft seeder.
+//! Counter-based Philox-4x32-10, and the retired sync-free DSpark draft seeder.
 //!
-//! Spec 5.6.3 removes the per-step rank-0 draft-token broadcast by having all four ranks seed
-//! the DSpark Markov head from one deterministic counter-based philox RNG. That is only sound
-//! if the seed depends on nothing rank-local, so `draft_seed` takes no rank argument at all:
-//! a draft is a pure function of `(step, request id, position)` plus the configured noise
-//! token id, and two independent rank instances therefore agree without communicating.
+//! Spec 5.6.3 described removing the per-step rank-0 draft-token broadcast by having all four
+//! ranks seed the DSpark Markov head from one deterministic counter-based philox RNG. The serving
+//! path no longer calls this module: the engine's MTP forward is the only source of draft tokens,
+//! and the target's acceptance rule decides what is emitted. The RNG remains here as a
+//! deterministic utility for scheduler-policy work and its property tests; no token produced by it
+//! participates in a served request.
 //!
 //! The generator is Random123's philox4x32-10: ten rounds of
 //!

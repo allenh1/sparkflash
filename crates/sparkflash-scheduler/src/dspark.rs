@@ -13,9 +13,11 @@
 //! token's `ROUTER_TOP_K` = 6 experts (`DSV41_ROUTER_LIVE`), so a doomed position cannot pull
 //! fresh experts into the routing decision - the mask is the complement of the verified prefix.
 //!
-//! The draft tokens themselves come from the counter-based philox stream in [crate::philox]:
-//! its seed carries the step, the request and the position and no rank, so all four ranks draft
-//! identically without a broadcast (`DSV41_SPEC_SYNC_FREE`).
+//! This module is **policy only**: it decides a verified prefix and the router mask from the
+//! confidence scores the engine's MTP stages produce. It never generates a draft token. The
+//! serving path's single draft-token source is `sparkflash-engine`'s MTP forward
+//! (`crates/sparkflash-engine/src/forward/mtp.rs`), and the target's acceptance rule decides how
+//! many of those tokens were accepted.
 //!
 //! What this module does *not* model, stated so that "the DSpark parameters" cannot be read as
 //! the whole draft head: the rank-256 Markov head (`dspark_markov_rank` = 256) and the draft's
@@ -25,10 +27,8 @@
 //! are `DSPARK_LAYERS`, `DSPARK_BLOCK_SIZE`, `DSPARK_CONFIDENCE_CAP` and `DSPARK_VERIFY_ROWS`
 //! (review M5 test-quality).
 
-use crate::RequestId;
 use crate::config::{ROUTER_TOP_K, SchedulerConfig};
 use crate::error::SchedulerError;
-use crate::philox::SyncFreeDrafter;
 
 /// The sigmoid of a raw confidence logit.
 ///
@@ -286,30 +286,6 @@ impl DsparkProposal {
     pub fn router_mask(&self) -> Result<RouterMask, SchedulerError> {
         RouterMask::new(self.verified_prefix(), self.block_size, self.top_k)
     }
-
-    /// The block's draft tokens from the sync-free philox drafter.
-    ///
-    /// The seed carries the step, the request id and the position and no rank, so every rank
-    /// produces this vector without communicating.
-    ///
-    /// # Errors
-    /// Returns `SchedulerError::InvalidArgument` when the drafter's block size disagrees with
-    /// the proposal's.
-    pub fn draft_tokens(
-        &self,
-        drafter: &SyncFreeDrafter,
-        step: u64,
-        request: RequestId,
-    ) -> Result<Vec<u32>, SchedulerError> {
-        if drafter.block_size() != self.block_size {
-            return Err(SchedulerError::InvalidArgument(format!(
-                "the drafter proposes {} tokens, the proposal covers {}",
-                drafter.block_size(),
-                self.block_size
-            )));
-        }
-        Ok(drafter.draft(step, request.0))
-    }
 }
 
 #[cfg(test)]
@@ -463,39 +439,6 @@ mod tests {
         let config = config();
         assert_eq!(config.dspark_block_size, DSPARK_BLOCK_SIZE);
         assert_eq!(config.dspark_noise_token_id, 128_799);
-    }
-
-    /// The draft comes from philox and needs no communication: two independent drafters agree on
-    /// every position, and a different request id or step changes the tokens.
-    #[test]
-    fn the_draft_is_sync_free_and_seeded_by_step_request_and_position() {
-        let config = config();
-        let proposal = proposal(&[4.0; DSPARK_BLOCK_SIZE]);
-        let first = SyncFreeDrafter::from_config(&config, 128_000).expect("drafter");
-        let second = SyncFreeDrafter::from_config(&config, 128_000).expect("drafter");
-        let step = 45;
-        let request = RequestId(7);
-        let a = proposal.draft_tokens(&first, step, request).expect("draft");
-        let b = proposal
-            .draft_tokens(&second, step, request)
-            .expect("draft");
-        assert_eq!(a, b, "two ranks draft identically with no communication");
-        assert_eq!(a.len(), DSPARK_BLOCK_SIZE);
-        assert!(a.iter().all(|token| *token < 128_000));
-        let other_step = proposal
-            .draft_tokens(&first, step + 1, request)
-            .expect("draft");
-        assert_ne!(a, other_step, "the step separates the streams");
-        let other_request = proposal
-            .draft_tokens(&first, step, RequestId(8))
-            .expect("draft");
-        assert_ne!(a, other_request, "the request separates the streams");
-        for (position, expected) in a.iter().enumerate() {
-            assert_eq!(
-                *expected,
-                first.position_token(step, request.0, position) % 128_000
-            );
-        }
     }
 
     /// A malformed proposal is refused before any decision is made.
