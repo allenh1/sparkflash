@@ -181,8 +181,9 @@ InferenceOptions).
 for unit tests.** The spec says `1..100, default 75, low=50, high=75, max=100` (spec line 1332) and
 proposes to test against encoding.py test vectors; encoding.py maps low=25, high=50, xhigh=75,
 max=100 with default high (encoding.py:398-404). The spec's numbers match the *Rust* toolkit, so the
-two "references" cannot both be the oracle. SparkFlash-RS must pick one and document it (see the open
-questions in the final report).
+two "references" cannot both be the oracle. SparkFlash-RS picks `encoding.py`'s table on every
+API surface (D44/D46): low=25, high=50, xhigh=75, max=100, default 50; the Rust toolkit's
+50/75/75/100 renderer table is not used for prompt rendering.
 
 **D2 — The spec advertises `reasoning_effort: 1..100` on the REST surface, but the Rust pipeline
 cannot carry an arbitrary integer.** `ReasoningEffort` has exactly four variants

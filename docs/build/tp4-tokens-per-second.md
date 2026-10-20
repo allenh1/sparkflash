@@ -161,6 +161,12 @@ RUN 4b's win is mostly in `provider`/[deferred] (525.9/523.8 -> 64.0/63.0 ms) pl
 `unattributed` drop (1,342.7 -> 390.9 ms), which is where the removed per-step head/embedding
 materialisation lived.
 
+**Collective row correction.** RUN 4b's 92.2 ms `collective` bucket is rank-arrival skew (the
+slowest rank's arrival at the collective), not TCP framing cost: the measured wire cost is
+8.6 ms/step = 40 layers x 0.216 ms, so the all-reduce budget today is 8.6 ms, and a one-shot
+RDMA replacement must beat 8.6 ms, not 92 ms. Future tables state which of the two they
+measured; see docs/build/gpu-device-roadmap.md "Collective budget correction".
+
 ## 5. Fused coded-weight kernels: the bit contract
 
 All decode matmuls that previously decoded stored weights into an f32 matrix now read the stored

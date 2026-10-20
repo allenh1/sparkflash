@@ -51,6 +51,11 @@ records the evidence and the consequence for the build. Research backing is in
 | D40 | Serving-parity measurement protocol, metric set and provisional numeric bars, declared before the first diagnostic run (D41 freezes them) | The oracle is vLLM serving the released snapshot at TP=4, temperature 0, prompt_logprobs with max-logprobs 1000 and the served root recorded (D38); the device side is the full-vocabulary --dump-logits artefact on the same token ids; the comparison reports top-1/top-5/top-20 agreement, max/mean |delta logprob| over the oracle top-100 and KL over a fixed renormalised top-100 support, per position plus aggregates; provisional bars are top-1 >= 95% of positions, median top-20 recall >= 90%, median KL <= 0.02 nat and p95 <= 0.10 nat, max |delta| <= 1.0 nat per position (no position above 2.0); D41 must freeze the thresholds from the measured oracle self-consistency floor (at least 3x the floor) before any serving claim, and a bar changed after a gate run is a new decision |
 | D42 | The engine KV/attention seam is a KV store trait (Option B), recorded but NOT implemented; an in-path diagnostic mirror is rejected | The serving KV can be claimed paged only when the engine's attention path reads and writes the paged pool as its backing store. Of the three boundaries (attention backend trait, KV store trait, engine-owned allocator handle), Option B is recorded: the engine defines a minimal store contract and keeps a host dense bit-exact default; the paged store owns allocator/sharing/eviction behind it; the scheduler owns the shared pool and page-reservation-aware admission; the HTTP driver owns request-to-sequence handles and fills only cache fields it can measure from store counters (tier and replay fields stay zero). Option A cannot produce the cache claims, Option C puts page admission in the engine before the scheduler has a capacity model. No code is approved by this decision and no branch exists: it is an engine-wide refactor to be argued against measured staging and parity numbers. The frozen 19-word attention entry stays frozen (Path A's 20th argument is a separate pin decision), a default-off diagnostic request-path mirror is explicitly rejected (it leaves the serving KV dense, hides its cost behind a flag, and makes the bookkeeping claim without the user-visible cost), and the load-bearing boundary is quoted verbatim in the entry: Option B does not fix the f32-engine vs fp4-device numeric gap, O(context) staging, HSI full-pool selection, the serial HTTP engine, or the host-resident paged pool. Evidence: docs/build/engine-kv-seam-decision.md |
 | D43 | The paged-read attention entry is designed and NOT frozen: Path B's staging is cheap at current windows, and the revisit trigger is a measured C > 512 | The follow-on to Path B is a 20-word ADDITIVE sequence entry (new symbol; the frozen 19-word `flash_mla_csa2_seq_sm121` is not mutated) that replaces kv_fp4/kv_scales/index_key with main-KV pool base + index-key pool base + block table + ratio, addressing logical_page = t/64 -> block_table[page] -> interleaved 356-byte entry (codes +0, scales +256), deriving absolute position from page+offset (so Path A's positions array is unnecessary) and treating hole entries (0xFFFFFFFF) as unattended. Its ABI cost is named the Path A way: m4_abi signature row + freeze job, KernelId/catalog, baseline 18 -> 19, typed params and arity pin, block-table device allocation/upload/invalidate plumbing, and a layout-constant pin against `sparkflash-kv::layout` (task-51 now enforces that at compile time). It is NOT frozen now because the byte arithmetic does not pay for it yet: Path B stages 7,055,488 B per step at C=137, of which main rows are 2.2%, the HSI key pool 59.4% (113.8x write amplification) and the window 38.3%; the main-paged variant saves 2.2%, main+HSI 61.7%, window-paged 100%, while Path A (the 20th positions argument) saves ZERO bytes below C=514 and is 2,048 B worse. Revisit trigger: a window at C > 512 (main staging >= 589,824 B/step) or a profile showing the 4 MiB HSI zero-fill at current C - then freeze the main+HSI variant (V3), not Path A. Twin evidence (host, no GPU): page-boundary byte equality at ratios 1 and 2, a partially filled tail page with indexer keys, an evicted+reused block where a stale table demonstrably reads the evicted bytes, and block-table holes that are skipped rather than read as page 0. Evidence: docs/build/paged-read-attention-kernel-design.md, docs/build/serving-paged-kv.md section 5/7 |
+| D44 | Oracle split: vLLM `encoding.py` governs prompt rendering, `deepseek-recipe` 0.2 governs API contracts | The five published fixture id arrays stay exact under `encoding.py` prompt rendering, so prompt bytes are pinned to that oracle; API contracts (max_tokens tiers 8192/65536/131072, response_format, prefix continuation, deferred tools) come from `deepseek-recipe` 0.2. Neither oracle overrides the other: the surface picks the oracle, and a change that would move the five prompt id arrays is a fixture-breaking change needing a new decision |
+| D45 | Resident serving (task-62) is recorded as oracle/stopgap evidence, not the batch-18 roadmap | The CPU items (one long-lived four-rank instance, decode-once-at-open, zero-copy borrows, the CLI `ResidentCache` folded into the engine, flat RSS) are kept as measured evidence after the 2026-10-20 GPU scope direction made the device chain the performance path: measured 1.286 GB/step owned copies, 7.89 GB/step borrowed, flat RSS 86.00 GiB over warm rounds. Not a target, not a directive for code; the device stages live in docs/build/gpu-device-roadmap.md |
+| D46 | Task-63 cheap API-surface parity: one effort table (25/50/75/100, default 50), recipe `max_tokens` tiers and 393216 cap, Anthropic non-double-counted cache usage, DeepSeek cache fields, and labelled thinking sampling | Implemented as an API-surface change only: prompt ids and the five fixture arrays are unchanged and pinned; `max_tokens` defaults to 8192 non-thinking / 65536 thinking / 131072 thinking+max, explicit values are context-lowered, and the upper bound is 393216; Anthropic `input_tokens` excludes cache reads; thinking sampling is temperature 1.0 and `top_p >= 0.95` |
+| D47 | deepseek-recipe 0.2 adoption is the protocol layer only; its renderer and bundled tokenizer are never adopted | The 7-10 day migration takes converters, `StreamProcessor`, chunk generators, `OutputConstraint`, strict-schema validation, `ET_` tool-call ids, Responses/Messages SSE and tools/tool_choice/response_format/prefix/defer_loading, while `render.rs` + `reference/tokenizer.json` stay the prompt oracle; constrained decoding is not started without an explicit go |
+| D48 | Batch-19 device acceptance target: **50-60 tokens/s vLLM parity with DSpark** on this hardware, personal target **90 tokens/s single-stream**, with the derived per-step budget (<=42 ms per verify step at ~3.8 accepted tokens, 11.1 ms/accepted token, 13.9 ms weight-traffic roofline at 273 GB/s/rank, ~1.7 ms RDMA collectives, ~2.2 ms draft) | The budgets are derived from the target, not measured; they are the acceptance arithmetic for the GPU path, so every roadmap stage is judged against the 42 ms/verify-step budget rather than against the CPU stopgap. Stage results stay placeholders until owners report measured device numbers |
 
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
@@ -2639,3 +2644,169 @@ equality (the twin is a host reference on both sides), ring rotation for the win
 block-table upload plumbing, and every timing number. No throughput claim exists in either
 direction until the window lines in D42 section 6 are recorded - and the trigger above is a
 measurement, not an estimate.
+
+## D44 - Oracle split: vLLM `encoding.py` governs prompt rendering; `deepseek-recipe` 0.2 governs API contracts
+
+**Evidence.** The deepseek-recipe review (2026-10-20) compared the two reference surfaces
+against the same requests. Prompt rendering: the five published fixture id arrays stay exact
+under vLLM `encoding.py`'s renderer (`reference/encoding/encoding.py`), so the prompt bytes are
+pinned to that oracle and any deviation breaks the five golden fixture arrays. API contracts:
+`deepseek-recipe` 0.2 defines the request/response semantics - the three `max_tokens` tiers
+(8192 / 65536 / 131072), `response_format`, prefix continuation and deferred tools - which
+`encoding.py` does not govern.
+
+**Decision.** Keep the split deliberately and by surface:
+* **prompt rendering** - vLLM `encoding.py` is the oracle; the five fixture id arrays are the pin
+  (same rule as D3's reference-vector surface);
+* **API contracts** - `deepseek-recipe` 0.2 is the oracle: `max_tokens` at 8192/65536/131072,
+  `response_format`, prefix continuation and deferred tools.
+Neither oracle overrides the other, and neither wins by recency: the request field's surface
+picks the oracle.
+
+**Consequence.** Encoding tests that compare token ids stay on the `encoding.py` vectors;
+request/response contract tests and the serving API follow `deepseek-recipe` 0.2 semantics;
+any change that would move the five prompt id arrays is a fixture-breaking change and needs a
+new decision. The batch 18/19 plan skeleton
+(`docs/build/batch18-19-plan.md`) records which section will carry the first measurements.
+
+## D45 - Resident serving (task-62) is recorded as oracle/stopgap evidence, not the batch-18 roadmap
+
+**Evidence.** The batch-18 scope review (Lead, 2026-10-20) first named resident serving as a
+serving workstream next to the sharding stages; the same day's scope direction (*use the GPU as
+much as possible*) made the **GPU device chain the performance path**, so the CPU resident
+serving items are kept as **oracle/stopgap evidence** - measurements that the host path can be
+instrumented - and not as a roadmap. Measured: **1.286 GB/step owned copies**, **7.89 GB/step
+borrowed**, **flat RSS 86.00 GiB** over the warm rounds (Lead report; owner evidence path to
+be supplied).
+
+**Decision.** Record the CPU items - one long-lived four-rank instance, decode-once-at-open,
+zero-copy borrows, the CLI `ResidentCache` folded into the engine, and flat RSS over warm
+request rounds - as measured oracle/stopgap evidence. Do not present them as the batch-18
+plan and do not gate the batch on them. The performance-path stages are the GPU roadmap in
+`docs/build/gpu-device-roadmap.md` (device residency, occupancy rewrite, router/head,
+RDMA one-shot + CUDA graphs, DSpark k=5), each as hypothesis + gate.
+
+**Consequence.** The plan page's resident-serving section keeps the counters and labels the
+section ORACLE/STOPGAP; a future device number replaces the CPU stopgap only when it beats
+1.3026 tokens/s and states its exactness contract, and device and host numbers never share a
+table. The sharding stage-2 result (767.7 ms/step, 1.3026 tokens/s, bit-identical) is likewise
+labelled a stopgap data point, not the long-term path.
+
+**Boundary.** This entry does not authorize the KV seam refactor (D42), the paged-read entry
+(D43) or a protocol redesign; those stay separate decisions, and the task-63 API-contract
+`P0`s are a labelled sampling/API-surface change (D44), not prompt-rendering changes.
+
+## D46 - Task-63 cheap API-surface parity: one effort table, recipe max_tokens, cache usage and labelled thinking sampling
+
+**Date:** 2026-10-20. **Status:** implemented on `task/task63-render-parity`; the
+prompt-rendering oracle and all five fixture id arrays are unchanged (D44).
+
+**Evidence.** The deepseek-recipe review measured six concrete API-surface contradictions
+between our router and the recipe 0.2 contract
+(`docs/investigations/deepseek-recipe/adoption-and-api-surface-parity.md`): the absent
+`max_tokens` default, the `65_536` upper bound, three different reasoning-effort tables in
+one tree, thinking sampling not normalized, missing DeepSeek cache fields, and Anthropic
+`input_tokens` counting cached tokens twice. Recipe 0.2's request resolver gives the tiers
+8192 / 65536 / 131072 (thinking + `max`), the cap `393_216`, and lowers an explicit value to
+`context_limit - prompt_tokens` with a floor of 1.
+
+**Decision.** Adopt the recipe contract as the API surface, without touching prompt rendering:
+* **`max_tokens` / `max_completion_tokens`.** Absent means 8192 outside thinking, 65536 in
+  thinking, and 131072 in thinking with effort 100 (`max`). An explicit value must be at least
+  1 and is then lowered to the context left after the prompt (floor 1); a prompt already over
+  the context is a `context_length_exceeded` error. The upper bound is
+  `MODEL_MAX_OUTPUT_TOKENS = 393_216`: Chat Completions and Responses reject a value above it,
+  while Anthropic Messages lowers it to the bound before the context lowering (recipe
+  semantics). `/v1/models.max_output_tokens` and the CLI `serve --max-tokens` default use the
+  same 393216 ceiling so the advertised and enforcing values cannot diverge.
+* **Reasoning effort.** One table on every surface: `low`/`minimal` = 25, `high`/`medium`
+  = 50, `xhigh` = 75, `max` = 100, absent/null/default = 50 (`high`); an integer in 1..100 is
+  written through, with out-of-range values clamped and reported. The seam / API resolver and
+  `reasoning.rs` call the same constants, and `encoding::recipe_effort_score` reverses to the
+  same scores. Recipe 0.2's separate 50/75/75/100 renderer table is explicitly not adopted
+  (D44).
+* **Usage.** `OpenAiUsageWithCache` gains the DeepSeek top-level
+  `prompt_cache_hit_tokens` = `prompt_tokens_details.cached_tokens` and
+  `prompt_cache_miss_tokens` = `prompt_tokens - prompt_cache_hit_tokens`; the batch
+  aggregator recomputes both from the aggregated totals, and the streaming final usage chunk
+  carries them. Anthropic `/v1/messages` now reports
+  `input_tokens = prompt_tokens.saturating_sub(cached_tokens)`,
+  `cache_read_input_tokens = cached_tokens`, `cache_creation_input_tokens = 0`, so the two
+  fields partition the prompt instead of double-counting the hit.
+* **Sampling (labelled behaviour change).** In thinking mode `temperature` is fixed at 1.0 and
+  `top_p` is raised to at least 0.95 (`max(requested, 0.95)`, default 1.0); outside thinking
+  mode the caller's values pass through unchanged. This changes which tokens are generated for
+  a thinking request but changes no prompt id.
+
+**Tests.** `crates/sparkflash-api/tests/encoding_golden.rs` now asserts the five fixture prompt
+SHA-256 values and id arrays against
+`docs/build/task30-evidence/tokenizer-parity.json`, plus the pinned 31-id
+`user: Hello` vector; `tokenizer_seam.rs` pins the flat vLLM special-token behaviour
+(128803 / 0 / 128822 / 128825) with a table test; `router.rs` pins the max-token ceiling,
+the Anthropic cache partition, the OpenAI cache fields, and the byte-exact streaming usage;
+`server.rs`, `reasoning.rs`, `telemetry_types.rs` and `metrics.rs` carry the unit tests.
+
+**Consequence.** The API surface now follows recipe 0.2 while the prompt oracle stays D44's
+`encoding.py` + `reference/tokenizer.json`. A request that omits `max_tokens`, one that
+overlaps a prefix cache, or one that asks for thinking now gets different output fields or
+sampling than before; those are the intended contract fixes. The three test files named above
+keep the prompt hashes and id arrays frozen so a later protocol migration cannot silently
+re-render a measured prompt.
+
+## D47 - deepseek-recipe 0.2 adoption is the protocol layer only; its renderer and bundled tokenizer stay out
+
+**Date:** 2026-10-20. **Status:** scope decision recorded; the migration is not started. It is a
+7-10 day workstream, and constrained decoding remains separately gated.
+
+**Evidence.** The same review measured the 0.2 renderer against our five goldens: it differs on
+5/5 vectors (token-level deltas +2, +2, -203, +1, -4 ids), with the effort scale, trailing
+assistant header, mid-conversation tool block, missing task tokens, multi-part joining and
+image spelling all contributing (`docs/investigations/deepseek-recipe/adoption-and-api-surface-parity.md`
+section 2). Its bundled `static/tokenizers/v41/tokenizer.json` (sha256 `81f64d12...`) renames id
+129264 from the checkpoint's `<｜deepseek_image｜>` (`special: false`) to `<｜image｜>`
+(`special: true`); our served file is `reference/tokenizer.json` (sha256 `c90dfa01...`). The
+protocol crate, by contrast, is published MIT, builds on our toolchain, and already models
+what we hand-roll: request converters, `StreamProcessor` plus chunk generators,
+`OutputConstraint`, strict `json_schema` normalization, `ET_` tool-call ids,
+Responses/Messages SSE, tools/`tool_choice`/`response_format`/`prefix`/`defer_loading`.
+
+**Decision.** Migrate only the protocol layer from `deepseek-recipe` 0.1 to 0.2, in service of
+the API contract: the three request converters, output parsing/streaming
+(`StreamProcessor` + chunk generators), usage accumulation, `OutputConstraint` and strict
+schema validation, `ET_` tool-call ids, Responses/Messages SSE, and the tools/`tool_choice`/
+`response_format`/`prefix`/`defer_loading` surface. Keep `render.rs` and
+`reference/tokenizer.json` as the prompt oracle and keep vLLM `encoding.py` as the prompt
+authority (D44). Never adopt the recipe renderer, its bundled tokenizer, or its
+`special_ranges` tokenization semantics: flat vLLM tokenization stays the pinned behaviour.
+No vLLM probe is used as evidence; the contract evidence is recipe 0.2's sources, the
+DeepInfer sources and the recorded report.
+
+**Consequence.** The migration is a version bump plus a call-site migration (0.1 -> 0.2
+removes `util::json_formatter`, changes `TokenizerEncoder::encode_ids` to take special
+ranges, and adds fields to `Conversation`/`InputMessage`/`ToolDefinition`/`ImageSource`),
+followed by the protocol adoption in this order: converters and schemas; streaming and usage;
+Responses/Messages SSE; tools/`response_format`/`prefix`/`defer_loading`; then strict
+validation and `ET_` ids. At every step the five fixture prompt hashes, the five id arrays and
+the 31-id Hello vector must remain byte-identical (D46/D47 test pins), and a step that would
+move one is a fixture-breaking change requiring a new decision. Structured-output constrained
+decoding (an inference-side mask/FSM) is not part of this adoption and is not started without
+an explicit Lead go; `OutputConstraint` is derived and handed to a backend, not enforced here.
+## D48 - Batch-19 device acceptance target and its derived per-step budget
+
+**Evidence.** The user acceptance target (Lead, 2026-10-20): vLLM parity **50-60 tokens/s**
+with DSpark on this hardware, personal target **90 tokens/s single-stream**. The budget below is
+**derived** from that target (arithmetic), not measured: a verify step at ~3.8 accepted tokens
+must finish in **<=42 ms**, which is **11.1 ms/accepted token** and therefore ~90 tokens/s; the
+weight-traffic roofline at 273 GB/s/rank is **13.9 ms/step**, the RDMA collectives budget is
+**~1.7 ms/step**, and the draft budget is **~2.2 ms/step**.
+
+**Decision.** Adopt this as the batch-19 GPU-path acceptance target: 50-60 tokens/s with DSpark
+is the parity bar, 90 tokens/s single-stream is the personal target, and the per-step budgets
+are the acceptance arithmetic. The GPU roadmap (`docs/build/gpu-device-roadmap.md`) is
+written against this budget, not against 'faster than the CPU stopgap'.
+
+**Consequence.** Every roadmap stage's gate is a measured verify-step time and accepted
+tokens/s against the 42 ms/step budget; stage rows keep placeholders until the owner reports a
+measured device run, and no measured number is invented here. The CPU stopgap 1.3026 tokens/s
+stays the best *measured* decode until a device run beats it, but it is no longer the
+acceptance bar - the budget table is.
