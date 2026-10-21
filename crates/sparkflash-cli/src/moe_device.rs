@@ -79,7 +79,7 @@ type SharedScaleGrids = (Vec<u8>, Vec<u8>, Vec<u8>);
 /// w1/w3 gate/up grid is [inter/32, dim/32], and the w2 down grid is [dim/32, inter/32]. The
 /// production shapes for the released model are therefore [72, 160] and [160, 72]. A free function
 /// (rather than three inline reads) lets a unit test swap one grid and require an error.
-fn read_shared_scale_grids(
+pub(crate) fn read_shared_scale_grids(
     source: &dyn WeightSource,
     base: &str,
     inter: usize,

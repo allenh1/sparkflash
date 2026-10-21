@@ -12,11 +12,14 @@ number did not move. If a rule here conflicts with an older document's process, 
 * Every merge request states its **expected effect on ms/step before work starts**. A change with no
   expected effect on the metric is not speed work.
 
-Current: **599.94 ms** (wsa2d-lean, 2026-10-21, batch tip 4e4cea50). Before WS-A: 1201.81 ms. Rows and dates live in [speed-log.csv](build/speed-log.csv); that table is the record, not a document.
+Current: **350.39 ms** (wsd4-lean, 2026-10-21, ws-d-gemv tip 4f83eee5). Path: 1201.81 (start) ->
+599.94 (WS-A2 batch, 4e4cea50) -> 469.81 (M=1 dense re-tile, 0d8797db) -> 356.39 (decode GEMV for
+wq_a/wkv/wq_b/wo_b, 528b39fb). Rows and dates live in [speed-log.csv](build/speed-log.csv); that
+table is the record, not a document.
 
 ## 2. Milestone gates are the only progress
 
-**<= 400 ms -> <= 150 -> <= 50 -> <= 20 -> <= 11.1**. Anything else (a doc, a record, an unwired
+**<= 400 ms -> <= 150 -> <= 50 -> <= 20 -> <= 11.1**. The 400 gate is cleared (356.39). Anything else (a doc, a record, an unwired
 kernel, a re-run that confirms the same number) is not progress.
 
 ## 2b. Batch windows; one row must answer a gate decision
@@ -34,6 +37,32 @@ for 81 measured steps. So:
   table is stale, not once per merge.
 - Every row lands as one line in [speed-log.csv](build/speed-log.csv). No per-row documents.
 - Batch merge requests the same way: one branch, one pipeline, one merge for a group of slices.
+
+## 2c. Estimates come from the hardware floor
+
+When an estimate misses by ~4x, the next estimate for that block must be derived from the hardware
+floor - weight bytes / peak bandwidth, MACs / peak MACs - and never scaled from the previous
+kernel's measured rate. Kernel work is reported as GB/s achieved against peak next to ms, and the
+bar for a single-token launch is **>= 60 % of peak memory bandwidth**. Beating our own previous
+kernel is not a result.
+
+## 2d. "Host path closed" means zero host arithmetic per token
+
+The WS-A host path is closed only when the decode step reaches **zero
+crates/sparkflash-engine reference arithmetic per token** (the linalg calls and the
+forward/attention.rs / forward/engram.rs reference paths reached from tp4_forward.rs). Each
+remaining call gets a device kernel or a deletion; the compressor and the Engram projections are
+the first two. Host arithmetic is a floor that no kernel work can remove, and it blocks capturing
+the step as a CUDA graph.
+
+## 2e. Current workstreams (2026-10-21, after the WS-D un-park)
+
+| workstream | gate | who |
+| :-- | :-- | :-- |
+| WS-D decode GEMV (wq_a, wkv, wq_b, wo_b, shared expert) | >= 60 % of peak bandwidth per M=1 launch; target <= 400 ms | device-lead |
+| WS-C CUDA graph capture of the device-only segments | measured launch/sync win, byte-identical; next step to <= 150 ms | driver-fixer |
+| WS-B interconnect admin (MTU 9000, nvidia-peermem) | applied on 4/4 nodes and verified, not ticketed | comm-lead + root admin |
+| WS-A remainder: engine calls still reached per token | list, then kernel-or-delete per call | device-lead |
 
 ## 3. Rank work by the P0 table
 

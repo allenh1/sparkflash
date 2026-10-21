@@ -2252,7 +2252,8 @@ impl Layer0Projections {
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "stage": "layer0-attention-projections",
-            "kernel": NATIVE_DENSE_KERNEL,
+            "kernel": sparkflash_kernels::mxfp8_gemv_launch::KERNEL,
+            "arithmetic_family": NATIVE_DENSE_KERNEL,
             "cubin_sha256": self.cubin_sha256,
             "launches": self.launches,
             "rows": 1,
@@ -2339,7 +2340,8 @@ impl Layer0QueryPath {
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "stage": "layer0-query-path-q-norm-wq-b-rope",
-            "kernel": NATIVE_DENSE_KERNEL,
+            "kernel": sparkflash_kernels::mxfp8_gemv_launch::KERNEL,
+            "arithmetic_family": NATIVE_DENSE_KERNEL,
             "cubin_sha256": self.cubin_sha256,
             "launches": 1,
             "q_norm": {
@@ -3056,6 +3058,7 @@ fn run_layer_query_path(
 ) -> Result<Layer0QueryPath, String> {
     use sparkflash_engine::linalg;
     use sparkflash_kernels::mxfp8_dense_launch;
+    use sparkflash_kernels::mxfp8_gemv_launch;
 
     let config = request.config.ok_or_else(|| {
         "layer-0 query path: the loop was built without the model config".to_string()
@@ -3149,10 +3152,12 @@ fn run_layer_query_path(
     let kernel_dir = request
         .kernel_cubin_dir
         .ok_or_else(|| "layer-0 query path: the loop has no kernel cubin directory".to_string())?;
+    // WS-D: the decode step runs wq_b through the dedicated decode GEMV - the same per-output
+    // arithmetic as the pinned dense family, tiled one warp per 32-output B12x micro-tile with one
+    // output column per lane. It is its own symbol and its own cubin, loaded and verified by name.
     let (cubin, cubin_sha256) =
-        cached_cubin(&kernel_dir.join(format!("{NATIVE_DENSE_KERNEL}.cubin")))
-            .map_err(|error| format!("layer-0 query path: read dense cubin: {error}"))?;
-    let (module, kernel) = mxfp8_dense_launch::load(cuda, &cubin)?;
+        load_pinned_addition(kernel_dir, mxfp8_gemv_launch::KERNEL, "layer-0 query path")?;
+    let (module, kernel) = mxfp8_gemv_launch::load(cuda, &cubin)?;
     let mut allocated = 0usize;
     let a_codes = cuda
         .alloc_pooled(activation_codes.len(), &mut allocated)
@@ -3187,7 +3192,7 @@ fn run_layer_query_path(
             layer as u32,
             0,
         );
-        mxfp8_dense_launch::launch(cuda, kernel, &params)?;
+        mxfp8_gemv_launch::launch(cuda, kernel, &params)?;
         let mut raw = vec![0u8; wq_b_cols * 2];
         cuda.copy_dtoh(&mut raw, &out)
             .map_err(|error| format!("layer-0 query path: wq_b dtoh: {error}"))?;
@@ -3330,7 +3335,8 @@ impl Layer0AttentionOutput {
                 "weights": "the arena's per-rank B12x wo_a weight and scale grid (two group buffers), no repack",
             },
             "wo_b": {
-                "kernel": NATIVE_DENSE_KERNEL,
+                "kernel": sparkflash_kernels::mxfp8_gemv_launch::KERNEL,
+                "arithmetic_family": NATIVE_DENSE_KERNEL,
                 "cubin_sha256": self.wo_b_cubin_sha256,
                 "launches": 1,
                 "rows": 1,
@@ -3386,6 +3392,7 @@ fn run_layer_attention_output(
     use sparkflash_comm::transport::Transport;
     use sparkflash_kernels::bf16a_mxfp8w_wo_a_launch as wo_a_launch;
     use sparkflash_kernels::mxfp8_dense_launch;
+    use sparkflash_kernels::mxfp8_gemv_launch;
 
     let config = request.config.ok_or_else(|| {
         "layer-0 attention output: the loop was built without the model config".to_string()
@@ -3462,14 +3469,18 @@ fn run_layer_attention_output(
     let kernel_dir = request.kernel_cubin_dir.ok_or_else(|| {
         "layer-0 attention output: the loop has no kernel cubin directory".to_string()
     })?;
-    let (dense_cubin, wo_b_cubin_sha256) =
-        cached_cubin(&kernel_dir.join(format!("{NATIVE_DENSE_KERNEL}.cubin")))
-            .map_err(|error| format!("layer-0 attention output: read dense cubin: {error}"))?;
+    // WS-D: wo_b runs through the dedicated decode GEMV (one output column per lane, one warp per
+    // 32-output B12x micro-tile), its own symbol and cubin, verified against the baseline by name.
+    let (wo_b_cubin, wo_b_cubin_sha256) = load_pinned_addition(
+        kernel_dir,
+        mxfp8_gemv_launch::KERNEL,
+        "layer-0 attention output",
+    )?;
     let (wo_a_cubin, wo_a_cubin_sha256) =
         cached_cubin(&kernel_dir.join(format!("{NATIVE_WO_A_KERNEL}.cubin")))
             .map_err(|error| format!("layer-0 attention output: read wo_a cubin: {error}"))?;
     let (wo_a_module, wo_a_kernel) = wo_a_launch::load(cuda, &wo_a_cubin)?;
-    let (wo_b_module, wo_b_kernel) = mxfp8_dense_launch::load(cuda, &dense_cubin)?;
+    let (wo_b_module, wo_b_kernel) = mxfp8_gemv_launch::load(cuda, &wo_b_cubin)?;
 
     let mut allocated = 0usize;
     let attn = cuda
@@ -3551,7 +3562,7 @@ fn run_layer_attention_output(
             layer as u32,
             0,
         );
-        mxfp8_dense_launch::launch(cuda, wo_b_kernel, &wo_b_params)?;
+        mxfp8_gemv_launch::launch(cuda, wo_b_kernel, &wo_b_params)?;
         let mut partial_raw = vec![0u8; HIDDEN * 2];
         cuda.copy_dtoh(&mut partial_raw, &partial)
             .map_err(|error| format!("layer-0 attention output: wo_b dtoh: {error}"))?;
@@ -4456,42 +4467,53 @@ fn run_layer_moe_routed(
             )
             .map_err(|error| format!("MoE: s2 stage copy: {error}"))?;
         }
-        let mut params = routed_gate_up_launch::GateUpLaunchParams {
-            act_fp8,
-            act_scales,
-            w_fp4: gate_stage,
-            w_scales: gate_scale_stage,
-            expert_ids: slot_ids,
-            out: gate_out,
-            tokens: tokens as u32,
-            trace_ring: 0,
-            layer_id: 0,
-            step_seq: rank as u64,
-        };
-        routed_gate_up_launch::launch(cuda, gate_up_kernel, &params)?;
-        params.w_fp4 = up_stage;
-        params.w_scales = up_scale_stage;
-        params.out = up_out;
-        params.step_seq = rank as u64 + 1;
-        routed_gate_up_launch::launch(cuda, gate_up_kernel, &params)?;
-        probe::layer(cuda, layer, "moe_gate_up", timer);
-        let timer = BlockTimer::start(request.forward_perf.probe);
-        let weighted_words: [u64; 11] = [
-            gate_out.0,
-            up_out.0,
-            weights.0,
-            codes.0,
-            swiglu_scales.0,
-            routed_rows as u64,
-            640,
-            u64::from(10.0f32.to_bits()),
-            0,
-            0,
-            rank as u64,
-        ];
-        let weighted_grid = ((routed_rows * 640 / 32).div_ceil(8) as u32, 1, 1);
-        cuda.launch(weighted_kernel, weighted_grid, (256, 1, 1), &weighted_words)?;
-        probe::layer(cuda, layer, "moe_weighted", timer);
+        // WS-C: this stretch is launch-only in the lean path and is the decode loop's one CUDA
+        // graph candidate; the probe gate keeps the direct path where probe timers synchronize.
+        let mut run_moe_launches =
+            |cuda: &sparkflash_kernels::cuda_driver::Cuda| -> Result<(), String> {
+                let mut params = routed_gate_up_launch::GateUpLaunchParams {
+                    act_fp8,
+                    act_scales,
+                    w_fp4: gate_stage,
+                    w_scales: gate_scale_stage,
+                    expert_ids: slot_ids,
+                    out: gate_out,
+                    tokens: tokens as u32,
+                    trace_ring: 0,
+                    layer_id: 0,
+                    step_seq: rank as u64,
+                };
+                routed_gate_up_launch::launch(cuda, gate_up_kernel, &params)?;
+                params.w_fp4 = up_stage;
+                params.w_scales = up_scale_stage;
+                params.out = up_out;
+                params.step_seq = rank as u64 + 1;
+                routed_gate_up_launch::launch(cuda, gate_up_kernel, &params)?;
+                probe::layer(cuda, layer, "moe_gate_up", timer);
+                let timer = BlockTimer::start(request.forward_perf.probe);
+                let weighted_words: [u64; 11] = [
+                    gate_out.0,
+                    up_out.0,
+                    weights.0,
+                    codes.0,
+                    swiglu_scales.0,
+                    routed_rows as u64,
+                    640,
+                    u64::from(10.0f32.to_bits()),
+                    0,
+                    0,
+                    rank as u64,
+                ];
+                let weighted_grid = ((routed_rows * 640 / 32).div_ceil(8) as u32, 1, 1);
+                cuda.launch(weighted_kernel, weighted_grid, (256, 1, 1), &weighted_words)?;
+                probe::layer(cuda, layer, "moe_weighted", timer);
+                Ok(())
+            };
+        if request.forward_perf.probe {
+            run_moe_launches(cuda)?;
+        } else {
+            crate::tp4_graph::segment(cuda, "moe-compute", &mut run_moe_launches)?;
+        }
         let timer = BlockTimer::start(request.forward_perf.probe);
         let combine_params = mxfp4_moe_stored_launch::Mxfp4MoeStoredParams::new(
             codes,
@@ -4678,6 +4700,10 @@ pub struct Layer0FfnEpilogue {
     pub shared_gathered_bytes: usize,
     /// The arithmetic that produced the shared row: the released FP8 32x32 Expert or the f32 seam.
     pub shared_arith: &'static str,
+    /// The kernels the shared row came from, or empty when the host seam produced it.
+    pub shared_kernel: &'static str,
+    /// The accumulation mode those kernels ran (fused, or rounded multiply then add).
+    pub shared_mode: &'static str,
     /// sha256 of the shared-expert row itself.
     pub shared_sha256: String,
     /// The shared row's L2 norm.
@@ -4712,7 +4738,9 @@ impl Layer0FfnEpilogue {
                 "arena_reads": self.shared_reads,
                 "gather_calls": self.shared_gathers,
                 "gathered_bytes": self.shared_gathered_bytes,
-                "kernel_launched": false,
+                "kernel_launched": !self.shared_kernel.is_empty(),
+                "kernel": self.shared_kernel,
+                "arithmetic_mode": self.shared_mode,
                 "arith": self.shared_arith,
                 "row_sha256": self.shared_sha256,
                 "row_l2": self.shared_l2,
@@ -5169,6 +5197,328 @@ fn gather_shared_expert_source(
     })
 }
 
+/// The shared expert's resident device operands (WS-D).
+///
+/// The released shared expert is a replicated dense expert and the resident plan stores it
+/// TP-column/row sharded, so [gather_shared_expert_source] all-gathers the shards once per layer at
+/// loop start, and the host seam then decoded and multiplied those bytes on every position. This
+/// struct keeps the same bytes on the device instead: w1/w3/w2 B12x-tiled once per layer here
+/// (warmup, before the step timer) and their three E8M0 grids uploaded as stored, since the arena
+/// already holds them in B12x order.
+///
+/// The arithmetic is the reference's by construction. The activation is bf16-rounded and quantised
+/// with quant::quantize_activation_fp8, the same function the host seam calls; the gate, up and
+/// down products run the decode GEMV's fused mode, which is bit-identical to the engine's
+/// rounded-multiply-then-rounded-add twin because an E4M3 x E4M3 product is exact in f32 (proved
+/// over all 256 codes and every served shape in tests/mxfp8_gemv_oracle.rs); and the SwiGLU +
+/// quantise step is the wide (cols = 2304) shape of swiglu_mxfp8_quant_sm121, which rounds the
+/// activation to bf16 before quantising exactly as the released model does.
+///
+/// Lifetime: one instance is built before the position loop and borrowed by every position and
+/// layer. Its buffers belong to the process's CUDA context, so they are released when the run
+/// ends; nothing is allocated per position.
+#[cfg(feature = "cuda")]
+struct SharedExpertDevice {
+    /// One entry per layer, in plan order.
+    layers: Vec<SharedExpertDeviceLayer>,
+    /// The per-token scratch, allocated once.
+    workspace: SharedExpertWorkspace,
+    /// The fused decode GEMV.
+    gemv: sparkflash_kernels::cuda_driver::Kernel,
+    /// The SwiGLU + MX-quantise epilogue.
+    swiglu: sparkflash_kernels::cuda_driver::Kernel,
+    _gemv_module: sparkflash_kernels::cuda_driver::Module,
+    _swiglu_module: sparkflash_kernels::cuda_driver::Module,
+    /// Hidden size.
+    dim: usize,
+    /// Intermediate width (2304 on the released plan).
+    inter: usize,
+}
+
+/// One layer's resident shared-expert weights and scales, B12x-tiled.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+struct SharedExpertDeviceLayer {
+    w1: sparkflash_kernels::cuda_driver::Deviceptr,
+    s1: sparkflash_kernels::cuda_driver::Deviceptr,
+    w3: sparkflash_kernels::cuda_driver::Deviceptr,
+    s3: sparkflash_kernels::cuda_driver::Deviceptr,
+    w2: sparkflash_kernels::cuda_driver::Deviceptr,
+    s2: sparkflash_kernels::cuda_driver::Deviceptr,
+}
+
+/// The shared expert's per-token scratch: one row of each operand and result.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+struct SharedExpertWorkspace {
+    a_codes: sparkflash_kernels::cuda_driver::Deviceptr,
+    a_scales: sparkflash_kernels::cuda_driver::Deviceptr,
+    gate: sparkflash_kernels::cuda_driver::Deviceptr,
+    up: sparkflash_kernels::cuda_driver::Deviceptr,
+    codes: sparkflash_kernels::cuda_driver::Deviceptr,
+    scales: sparkflash_kernels::cuda_driver::Deviceptr,
+    out: sparkflash_kernels::cuda_driver::Deviceptr,
+}
+
+/// Stages the shared expert on the device for every layer: B12x repack, upload, budget admission.
+///
+/// Warmup only. The repack is permutation-only ([sparkflash_device::arena::tile_b12x]) and the
+/// scale grids are uploaded as stored, so this function never touches the values. It admits its
+/// own memory through [sparkflash_device::budget::BudgetAdmission] before the first allocation and
+/// refuses by name when the projection does not fit, rather than discovering it mid-repack.
+///
+/// # Errors
+/// A missing plan tensor or dtype, a repack geometry mismatch, a budget refusal, or a driver
+/// allocation/copy failure.
+#[cfg(feature = "cuda")]
+fn build_shared_expert_device(
+    cuda: &sparkflash_kernels::cuda_driver::Cuda,
+    request: &TokenStageRequest<'_>,
+    shared: &[SharedExpertGather],
+) -> Result<SharedExpertDevice, String> {
+    use sparkflash_engine::weights::WeightSource;
+    use sparkflash_kernels::mxfp8_gemv_launch;
+
+    let kernel_dir = request.kernel_cubin_dir.ok_or_else(|| {
+        "shared expert (device): the forward loop was built without --kernel-cubin-dir, so the GEMV and swiglu cubins are not staged".to_string()
+    })?;
+    let config = request.config.ok_or_else(|| {
+        "shared expert (device): the loop was built without the model config".to_string()
+    })?;
+    let dim = config.dim;
+    let inter = config
+        .moe_inter_dim
+        .checked_mul(config.n_shared_experts.max(1))
+        .ok_or_else(|| "shared expert (device): the intermediate width overflows".to_string())?;
+    if shared.len() != request.n_layers {
+        return Err(format!(
+            "shared expert (device): {} gathered layers for {} layers in the loop",
+            shared.len(),
+            request.n_layers
+        ));
+    }
+    let (gemv_cubin, _gemv_sha) =
+        load_pinned_addition(kernel_dir, mxfp8_gemv_launch::KERNEL, "shared expert")?;
+    let (gemv_module, gemv) = mxfp8_gemv_launch::load(cuda, &gemv_cubin)?;
+    let (swiglu_cubin, _swiglu_sha) =
+        load_pinned_addition(kernel_dir, "swiglu_mxfp8_quant_sm121", "shared expert")?;
+    let (swiglu_module, swiglu) = cuda.load_swiglu_quant(&swiglu_cubin)?;
+    // One B12x weight buffer and one scale grid per tensor, plus the per-token scratch.
+    let weight_bytes = (2 * inter * dim + dim * inter) as u64;
+    let scale_bytes = (2 * (inter / 32) * (dim / 32) + (dim / 32) * (inter / 32)) as u64;
+    let projected_device = request.n_layers as u64 * (weight_bytes + scale_bytes)
+        + (dim + dim / 32 + 4 * inter + inter + inter / 32 + 2 * dim) as u64;
+    // The host projection is the transient repack of one layer plus the scale grids.
+    let projected_host = weight_bytes + scale_bytes;
+    let available = sparkflash_device::budget::read_mem_available_bytes()
+        .map_err(|error| format!("shared expert (device): MemAvailable: {error}"))?;
+    sparkflash_device::budget::BudgetAdmission::admit(sparkflash_device::budget::BudgetRequest {
+        mem_available_bytes: available,
+        projected_host_bytes: projected_host,
+        projected_device_bytes: projected_device,
+    })
+    .map_err(|error| format!("shared expert (device): budget: {error}"))?;
+    let mut allocated = 0usize;
+    let mut layers = Vec::with_capacity(shared.len());
+    for (layer, gather) in shared.iter().enumerate() {
+        let source: &dyn WeightSource = &gather.source;
+        let base = format!("layers.{layer}.ffn.shared_experts");
+        let (s1, s3, s2) = crate::moe_device::read_shared_scale_grids(source, &base, inter, dim)
+            .map_err(|error| format!("shared expert (device): layer {layer} scales: {error}"))?;
+        let mut stage = |leaf: &str,
+                         cols: usize,
+                         inner: usize|
+         -> Result<sparkflash_kernels::cuda_driver::Deviceptr, String> {
+            let name = format!("{base}.{leaf}.weight");
+            let codes = source.read(&name).map_err(|error| {
+                format!("shared expert (device): layer {layer} {name}: {error}")
+            })?;
+            let tiled =
+                sparkflash_device::arena::tile_b12x(&codes, cols, inner).map_err(|error| {
+                    format!("shared expert (device): layer {layer} {name}: {error}")
+                })?;
+            let pointer = cuda.alloc(tiled.len(), &mut allocated).map_err(|error| {
+                format!("shared expert (device): layer {layer} {name} allocation: {error}")
+            })?;
+            cuda.copy_htod(&pointer, &tiled).map_err(|error| {
+                format!("shared expert (device): layer {layer} {name} upload: {error}")
+            })?;
+            Ok(pointer)
+        };
+        let w1 = stage("w1", inter, dim)?;
+        let w3 = stage("w3", inter, dim)?;
+        let w2 = stage("w2", dim, inter)?;
+        let mut upload = |bytes: &[u8],
+                          what: &str|
+         -> Result<sparkflash_kernels::cuda_driver::Deviceptr, String> {
+            let pointer = cuda.alloc(bytes.len(), &mut allocated).map_err(|error| {
+                format!("shared expert (device): layer {layer} {what} allocation: {error}")
+            })?;
+            cuda.copy_htod(&pointer, bytes).map_err(|error| {
+                format!("shared expert (device): layer {layer} {what} upload: {error}")
+            })?;
+            Ok(pointer)
+        };
+        let s1 = upload(&s1, "w1.scale")?;
+        let s3 = upload(&s3, "w3.scale")?;
+        let s2 = upload(&s2, "w2.scale")?;
+        layers.push(SharedExpertDeviceLayer {
+            w1,
+            s1,
+            w3,
+            s3,
+            w2,
+            s2,
+        });
+    }
+    let mut fresh =
+        |bytes: usize, what: &str| -> Result<sparkflash_kernels::cuda_driver::Deviceptr, String> {
+            cuda.alloc(bytes, &mut allocated).map_err(|error| {
+                format!("shared expert (device): workspace {what} allocation: {error}")
+            })
+        };
+    let workspace = SharedExpertWorkspace {
+        a_codes: fresh(dim, "a_codes")?,
+        a_scales: fresh(dim / 32, "a_scales")?,
+        gate: fresh(2 * inter, "gate")?,
+        up: fresh(2 * inter, "up")?,
+        codes: fresh(inter, "codes")?,
+        scales: fresh(inter / 32, "scales")?,
+        out: fresh(2 * dim, "out")?,
+    };
+    Ok(SharedExpertDevice {
+        layers,
+        workspace,
+        gemv,
+        swiglu,
+        _gemv_module: gemv_module,
+        _swiglu_module: swiglu_module,
+        dim,
+        inter,
+    })
+}
+
+/// Runs the shared expert for one position through the resident device operands.
+///
+/// Four launches: gate, up, the wide SwiGLU + quantise, and down. Returns the BF16 row the host
+/// reference would have produced, as f32 (the addend the f32 MoE sum takes, model.py:893-904).
+///
+/// # Errors
+/// A shape disagreement, a quantise refusal, an upload/launch/readback failure, or a non-finite
+/// BF16 row.
+#[cfg(feature = "cuda")]
+fn run_shared_expert_device(
+    cuda: &sparkflash_kernels::cuda_driver::Cuda,
+    request: &TokenStageRequest<'_>,
+    layer: usize,
+    hidden: &[f32],
+    device: &SharedExpertDevice,
+    out: &mut [f32],
+) -> Result<(), String> {
+    use sparkflash_kernels::mxfp8_dense_launch::Mxfp8DenseParams;
+    use sparkflash_kernels::mxfp8_gemv_launch;
+
+    let config = request.config.ok_or_else(|| {
+        "shared expert (device): the loop was built without the model config".to_string()
+    })?;
+    let dim = device.dim;
+    let inter = device.inter;
+    if hidden.len() != dim || out.len() != dim {
+        return Err(format!(
+            "shared expert (device): hidden {} and out {} do not match dim {dim}",
+            hidden.len(),
+            out.len()
+        ));
+    }
+    let operands = device
+        .layers
+        .get(layer)
+        .ok_or_else(|| format!("shared expert (device): layer {layer} has no resident operands"))?;
+    // The released Linear rounds its input to BF16 and then quantises it; the host seam calls the
+    // same two functions, so the operand is the reference operand, not an approximation of it.
+    let rounded: Vec<f32> = hidden
+        .iter()
+        .map(|value| sparkflash_engine::quant::bf16_round(*value))
+        .collect();
+    let quantised = sparkflash_engine::quant::quantize_activation_fp8(&rounded)
+        .map_err(|error| format!("shared expert (device): activation quantise: {error}"))?;
+    let workspace = &device.workspace;
+    cuda.copy_htod(&workspace.a_codes, quantised.codes())
+        .map_err(|error| format!("shared expert (device): activation upload: {error}"))?;
+    cuda.copy_htod(&workspace.a_scales, quantised.scales())
+        .map_err(|error| format!("shared expert (device): activation scales upload: {error}"))?;
+    let gate = Mxfp8DenseParams::new(
+        workspace.a_codes,
+        workspace.a_scales,
+        operands.w1,
+        operands.s1,
+        workspace.gate,
+        1,
+        inter as u32,
+        dim as u32,
+        0,
+        layer as u32,
+        0,
+    );
+    mxfp8_gemv_launch::launch(cuda, device.gemv, &gate)?;
+    let up = Mxfp8DenseParams::new(
+        workspace.a_codes,
+        workspace.a_scales,
+        operands.w3,
+        operands.s3,
+        workspace.up,
+        1,
+        inter as u32,
+        dim as u32,
+        0,
+        layer as u32,
+        0,
+    );
+    mxfp8_gemv_launch::launch(cuda, device.gemv, &up)?;
+    // The wide SwiGLU + quantise: cols = 2304, one row, the released clamp limit as an f32 word.
+    let blocks = (inter / WINDOW_QUANT_BLOCK) as u32;
+    let swiglu_words = [
+        workspace.gate.0,
+        workspace.up.0,
+        workspace.codes.0,
+        workspace.scales.0,
+        1,
+        inter as u64,
+        u64::from((config.swiglu_limit as f32).to_bits()),
+        0,
+        layer as u64,
+        0,
+    ];
+    cuda.launch(
+        device.swiglu,
+        (blocks.div_ceil(8), 1, 1),
+        (256, 1, 1),
+        &swiglu_words,
+    )?;
+    let down = Mxfp8DenseParams::new(
+        workspace.codes,
+        workspace.scales,
+        operands.w2,
+        operands.s2,
+        workspace.out,
+        1,
+        dim as u32,
+        inter as u32,
+        0,
+        layer as u32,
+        0,
+    );
+    mxfp8_gemv_launch::launch(cuda, device.gemv, &down)?;
+    let mut bytes = vec![0u8; dim * 2];
+    cuda.copy_dtoh(&mut bytes, &workspace.out)
+        .map_err(|error| format!("shared expert (device): readback: {error}"))?;
+    let row = bf16_from_le_bytes(&bytes)?;
+    if row.iter().any(|value| !value.is_finite()) {
+        return Err("shared expert (device): the BF16 row is not finite".to_string());
+    }
+    out.copy_from_slice(&row);
+    Ok(())
+}
 /// Runs the layer-0 FFN epilogue from the live arena: read the released shared-expert bytes, add the
 /// dense shared expert on top of the routed delta with the engine seam, then run the ffn hc_post.
 ///
@@ -5176,6 +5526,7 @@ fn gather_shared_expert_source(
 /// Refuses missing plan entries or arena slices, an unknown shared-expert dtype, a non-finite seam
 /// output, and propagates the engine seams' own refusals.
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 fn run_layer_ffn_epilogue(
     layer: usize,
     cuda: &sparkflash_kernels::cuda_driver::Cuda,
@@ -5184,6 +5535,7 @@ fn run_layer_ffn_epilogue(
     moe: &Layer0MoeRouted,
     residual: &AttentionResidualSeam,
     shared: &SharedExpertGather,
+    shared_device: Option<&SharedExpertDevice>,
 ) -> Result<Layer0FfnEpilogue, String> {
     use sparkflash_engine::forward::mhc;
     use sparkflash_engine::forward::moe;
@@ -5200,10 +5552,23 @@ fn run_layer_ffn_epilogue(
     let source = &shared.source;
     let mut scratch = moe::MoeScratch::for_config(config);
     let limit = 1usize << 40;
-    let shared_arith = if request.native_rounding.shared {
-        "native_fp8_block32_bf16"
+    // WS-D: name the kernels and the accumulation mode the shared row came from, so the row's
+    // identity evidence says which arithmetic produced it (the host seam, or the resident GEMV
+    // launches in their fused mode).
+    let (shared_arith, shared_kernel) = if shared_device.is_some() {
+        (
+            "native_fp8_block32_bf16_resident",
+            "b12x_mxfp8_gemv_m1_sm121+swiglu_mxfp8_quant_sm121",
+        )
+    } else if request.native_rounding.shared {
+        ("native_fp8_block32_bf16", "")
     } else {
-        "host_f32_reference"
+        ("host_f32_reference", "")
+    };
+    let shared_mode: &'static str = if shared_device.is_some() {
+        sparkflash_kernels::mxfp8_gemv_launch::Mode::Fused.arithmetic_mode()
+    } else {
+        "host-f32-reference"
     };
     // The shared expert runs on the same pre-FFN row the device launched. The released arm
     // produces a BF16 row (the addend of the f32 MoE sum, model.py:893-904); the default arm keeps
@@ -5211,7 +5576,16 @@ fn run_layer_ffn_epilogue(
     // either arm without a second shared-expert pass.
     let timer = BlockTimer::start(request.forward_perf.probe);
     let mut shared_only = vec![0.0f32; dim];
-    if request.native_rounding.shared {
+    if let Some(device) = shared_device {
+        run_shared_expert_device(
+            cuda,
+            request,
+            layer,
+            &seams.pre_ffn_hidden,
+            device,
+            &mut shared_only,
+        )?;
+    } else if request.native_rounding.shared {
         moe::add_shared_expert_native(
             config,
             &format!("layers.{layer}"),
@@ -5357,6 +5731,8 @@ fn run_layer_ffn_epilogue(
         shared_gathers: shared.gather_calls,
         shared_gathered_bytes: shared.full_bytes,
         shared_arith,
+        shared_kernel,
+        shared_mode,
         shared_sha256,
         shared_l2,
         shared_f32_sha256,
@@ -5392,6 +5768,35 @@ fn planned_b12x_geometry(
 
 /// Runs the layer-0 wq_a and wkv dense B12x projections from the B12x arena weights.
 ///
+/// Loads a WS-D addition's cubin from the window's staged directory and fails closed unless the
+/// staged bytes are the artifact the baseline pins.
+///
+/// The pinned kernels have a chain stage that verifies their cubin; an addition with its own symbol
+/// has no chain stage of its own, so its call sites verify it rather than assuming it. `context`
+/// prefixes the error so a refusal names the stage that would not launch.
+#[cfg(feature = "cuda")]
+fn load_pinned_addition(
+    kernel_dir: &std::path::Path,
+    kernel: &str,
+    context: &str,
+) -> Result<(std::sync::Arc<[u8]>, String), String> {
+    let cubin_name = format!("{kernel}.cubin");
+    let (cubin, cubin_sha256) = cached_cubin(&kernel_dir.join(&cubin_name))
+        .map_err(|error| format!("{context}: read {cubin_name}: {error}"))?;
+    let pinned = sparkflash_kernels::baseline::pin(kernel)
+        .map_err(|error| format!("{context}: baseline: {error}"))?
+        .ok_or_else(|| format!("{context}: the baseline does not pin {kernel}"))?;
+    if cubin.len() != pinned.cubin_bytes || cubin_sha256 != pinned.cubin_sha256 {
+        return Err(format!(
+            "{context}: the staged {cubin_name} is {} bytes sha256 {cubin_sha256}, the baseline pins {} bytes sha256 {}",
+            cubin.len(),
+            pinned.cubin_bytes,
+            pinned.cubin_sha256
+        ));
+    }
+    Ok((cubin, cubin_sha256))
+}
+
 /// This is the first real attention launch of the four-rank loop: one BF16 activation row (the mHC
 /// seam's normed attention input) against the plan-bound B12x weight/scale pairs, through the D37
 /// bf16a dense kernel family. It reads the latents back so the evidence can pin what the next stage
@@ -5409,6 +5814,7 @@ fn run_layer_attention_projections(
     parity: &mut NativeDenseParity,
 ) -> Result<Layer0Projections, String> {
     use sparkflash_kernels::mxfp8_dense_launch;
+    use sparkflash_kernels::mxfp8_gemv_launch;
 
     let wq_a_cols: usize = 1280;
     let wkv_cols: usize = 512;
@@ -5422,13 +5828,17 @@ fn run_layer_attention_projections(
     // to E4M3 codes with one ue8m0 scale per 32 values before the native dense GEMM.
     let (activation_codes, activation_scales) =
         quantise_native_activation(normed, "layer-0 projections")?;
-    let cubin_name = format!("{NATIVE_DENSE_KERNEL}.cubin");
+    // WS-D: the decode step is one output row, and the pinned 64x64 dense kernel gives each of its
+    // 256 threads a 4x4 sub-tile, so at M=1 only lanes 0-15 have a row inside the tile. The decode
+    // GEMV is the same per-output arithmetic with one warp per 32-output B12x micro-tile and one
+    // output column per lane; it is a separate symbol and a separate cubin, so the pinned dense
+    // kernel's bytes and digest are untouched, and it is loaded and verified by name here.
     let kernel_dir = request.kernel_cubin_dir.ok_or_else(|| {
         "layer-0 projections: the loop has no kernel cubin directory, so the dense B12x kernel cannot be loaded"
             .to_string()
     })?;
-    let (cubin, cubin_sha256) = cached_cubin(&kernel_dir.join(&cubin_name))
-        .map_err(|error| format!("layer-0 projections: read {cubin_name}: {error}"))?;
+    let (cubin, cubin_sha256) =
+        load_pinned_addition(kernel_dir, mxfp8_gemv_launch::KERNEL, "layer-0 projections")?;
 
     let pair_for = |name: &str| -> Result<
         (
@@ -5468,7 +5878,7 @@ fn run_layer_attention_projections(
         }
     }
 
-    let (module, kernel) = mxfp8_dense_launch::load(cuda, &cubin)?;
+    let (module, kernel) = mxfp8_gemv_launch::load(cuda, &cubin)?;
     let mut allocated = 0usize;
     let a_codes = cuda
         .alloc_pooled(activation_codes.len(), &mut allocated)
@@ -5509,7 +5919,7 @@ fn run_layer_attention_projections(
             layer as u32,
             0,
         );
-        mxfp8_dense_launch::launch(cuda, kernel, &q)?;
+        mxfp8_gemv_launch::launch(cuda, kernel, &q)?;
         let kv = mxfp8_dense_launch::Mxfp8DenseParams::new(
             a_codes,
             a_scales,
@@ -5523,7 +5933,7 @@ fn run_layer_attention_projections(
             layer as u32,
             0,
         );
-        mxfp8_dense_launch::launch(cuda, kernel, &kv)?;
+        mxfp8_gemv_launch::launch(cuda, kernel, &kv)?;
 
         let mut raw_q = vec![0u8; wq_a_cols * 2];
         cuda.copy_dtoh(&mut raw_q, &out_q)
@@ -7519,6 +7929,15 @@ fn run_forward_loop(
             &cuda, arena, request, layer, transport,
         )?);
     }
+    // WS-D: the same full-width bytes stay on the device from here on. The B12x repack of w1/w3/w2
+    // and their scale grids is warmup work inside shared_prewarm, so it is outside the step timer;
+    // from the first position on, the shared expert is four launches on resident operands instead
+    // of seven host reads, a host decode and three host matrix products per position.
+    let shared_device = if request.native_rounding.shared {
+        Some(build_shared_expert_device(&cuda, request, &shared_gathers)?)
+    } else {
+        None
+    };
     probe::run(&cuda, "shared_prewarm", shared_prewarm_timer);
     let shared_prewarm_ms = shared_started.elapsed().as_millis() as u64;
     let shared_prewarm_bytes: usize = shared_gathers.iter().map(|gather| gather.full_bytes).sum();
@@ -7879,6 +8298,7 @@ fn run_forward_loop(
                     &moe_routed,
                     &attention_residual,
                     shared,
+                    shared_device.as_ref(),
                 )?;
                 stream = ffn_epilogue.hc_post.clone();
                 if stream.iter().any(|value| !value.is_finite()) {
@@ -8056,6 +8476,8 @@ fn run_forward_loop(
                                 "ffn_out_sha256": ffn_epilogue.ffn_out_sha256,
                                 "ffn_out_l2": ffn_epilogue.ffn_out_l2,
                                 "shared_arith": ffn_epilogue.shared_arith,
+                                "shared_kernel": ffn_epilogue.shared_kernel,
+                                "shared_arithmetic_mode": ffn_epilogue.shared_mode,
                                 "shared_sha256": ffn_epilogue.shared_sha256,
                                 "shared_l2": ffn_epilogue.shared_l2,
                                 "shared_f32_sha256": ffn_epilogue.shared_f32_sha256,
@@ -10247,7 +10669,12 @@ mod tests {
             launches: 2,
         };
         let json = projections.to_json();
-        assert_eq!(json["kernel"], NATIVE_DENSE_KERNEL);
+        assert_eq!(
+            json["kernel"],
+            sparkflash_kernels::mxfp8_gemv_launch::KERNEL,
+            "the projections stage records the symbol it actually launched"
+        );
+        assert_eq!(json["arithmetic_family"], NATIVE_DENSE_KERNEL);
         assert_eq!(json["activation_quant"]["block"], 32);
         assert_eq!(json["activation_quant"]["code_bytes"], HIDDEN);
         assert_eq!(json["activation_quant"]["scale_bytes"], HIDDEN / 32);
@@ -10279,7 +10706,12 @@ mod tests {
             q_latent_bf16: vec![0.0f32; 1280],
         };
         let json = query.to_json();
-        assert_eq!(json["kernel"], NATIVE_DENSE_KERNEL);
+        assert_eq!(
+            json["kernel"],
+            sparkflash_kernels::mxfp8_gemv_launch::KERNEL,
+            "the query path records the symbol it actually launched"
+        );
+        assert_eq!(json["arithmetic_family"], NATIVE_DENSE_KERNEL);
         assert_eq!(json["wq_b"]["activation_quant"]["code_bytes"], 1280);
         assert_eq!(json["wq_b"]["activation_quant"]["scale_bytes"], 40);
 
@@ -10309,7 +10741,11 @@ mod tests {
         };
         let json = output.to_json();
         assert_eq!(json["wo_a"]["kernel"], NATIVE_WO_A_KERNEL);
-        assert_eq!(json["wo_b"]["kernel"], NATIVE_DENSE_KERNEL);
+        assert_eq!(
+            json["wo_b"]["kernel"],
+            sparkflash_kernels::mxfp8_gemv_launch::KERNEL
+        );
+        assert_eq!(json["wo_b"]["arithmetic_family"], NATIVE_DENSE_KERNEL);
         assert_eq!(json["wo_b"]["activation_quant"]["code_bytes"], 2048);
         assert_eq!(json["wo_b"]["activation_quant"]["scale_bytes"], 64);
         assert!(

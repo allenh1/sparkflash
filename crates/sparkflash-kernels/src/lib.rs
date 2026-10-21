@@ -50,6 +50,8 @@ pub mod mxfp4_moe_stored_abi;
 pub mod mxfp4_moe_stored_launch;
 pub mod mxfp4_ref;
 pub mod mxfp8_dense_launch;
+pub mod mxfp8_dense_m1_launch;
+pub mod mxfp8_gemv_launch;
 pub mod mxfp8_ref;
 pub mod mxfp8_wo_a_launch;
 pub mod rmsnorm_launch;

@@ -176,3 +176,18 @@ __device__ __forceinline__ float __fsqrt_rn(float value) {
 __device__ __forceinline__ float __fdiv_rn(float a, float b) {
     return a / b;
 }
+
+// The decode GEMV's contracted multiply-add and its warp barrier. clang treats __fmaf_rn and
+// __syncwarp as CUDA builtins only when it is compiling against the real device headers, which
+// the -nocudainc probe is not, so the stub declares them like the other intrinsics above.
+__device__ __forceinline__ float __fmaf_rn(float a, float b, float c) {
+    return a * b + c;
+}
+
+__device__ __forceinline__ unsigned int __activemask(void) {
+    return 0xffffffffu;
+}
+
+__device__ __forceinline__ void __syncwarp(unsigned int mask = 0xffffffffu) {
+    (void)mask;
+}

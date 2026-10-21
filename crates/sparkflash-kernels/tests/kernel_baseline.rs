@@ -24,7 +24,7 @@ fn nvcc() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// The twenty shipped cubins, recompiled and compared byte for byte, on a host that has nvcc.
+/// The twenty-two shipped cubins, recompiled and compared byte for byte, on a host that has nvcc.
 ///
 /// On a host WITHOUT nvcc the check returns early, and the line it prints is on the test's captured
 /// stdout, so a green `cargo test` run does not show it - libtest only shows it under `--nocapture`.
@@ -36,7 +36,7 @@ fn the_kernels_still_compile_to_the_recorded_baseline() {
     let Some(nvcc) = nvcc() else {
         println!(
             "skipping the kernel baseline check: no nvcc on PATH and SPARKFLASH_NVCC is unset or \
-             not a file, so there is nothing to compile the twenty kernels with. Run it on a CUDA host \
+             not a file, so there is nothing to compile the twenty-two kernels with. Run it on a CUDA host \
              or inside nvidia/cuda:13.0.3-devel-ubuntu22.04: /bin/sh \
              crates/sparkflash-kernels/scripts/check-kernel-baseline.sh"
         );
@@ -62,7 +62,7 @@ fn the_kernels_still_compile_to_the_recorded_baseline() {
 }
 
 /// The kernel list in `check-kernel-baseline.sh`, the manifest, the kernels on disk and the build
-/// script's `PROBED_KERNELS` table must name the same twenty kernels. The script asserts the first
+/// script's `PROBED_KERNELS` table must name the same twenty-two kernels. The script asserts the first
 /// two when it runs; this pins all four without nvcc, so a kernel file added under `kernels/` - or a
 /// probe list edited without the baseline - fails here instead of letting the success line mean less
 /// than it says.
@@ -82,12 +82,14 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
         .collect();
     assert_eq!(
         listed.len(),
-        20,
-        "the list must name every baseline kernel - the twenty entries: the six Milestone 4 \
+        22,
+        "the list must name every baseline kernel - the twenty-two entries: the six Milestone 4 \
          kernels, the M7 SwiGLU quantiser epilogue and its weighted routed variant, the task-37 \
          device router, the task-8 routed gate/up GEMM, the serving tail's RMSNorm, the certified \
-         head's device reduce, the CSA2 sequence attention entry, D49's ring-capacity CSA2 entry \
-         and the D37 BF16-activation projection pair: {listed:?}"
+         head's device reduce, the CSA2 sequence attention entry, D49's ring-capacity CSA2 entry, \
+         the D37 BF16-activation projection pair, the WS-D columns-only M=1 dense projection and the \
+         WS-D decode GEMV: \
+         {listed:?}"
     );
 
     let manifest = std::fs::read_to_string(crate_dir.join("baseline/kernel_baseline.txt"))
@@ -349,7 +351,13 @@ fn the_loader_resolves_every_name_the_pinned_baseline_uses() {
             .split_whitespace()
             .next()
             .expect("a manifest kernel line names the kernel");
-        if name == "flash_mla_csa2_sm121" {
+        // Two baseline entries are loaded by name and deliberately have no KernelId: flash_mla
+        // through load_flash_mla, and the WS-D columns-only M=1 dense symbol through
+        // Cuda::load_dense_m1.
+        if name == "flash_mla_csa2_sm121"
+            || name == "b12x_mxfp8_dense_m1_sm121"
+            || name == "b12x_mxfp8_gemv_m1_sm121"
+        {
             continue;
         }
         assert!(
@@ -360,7 +368,8 @@ fn the_loader_resolves_every_name_the_pinned_baseline_uses() {
     }
     assert_eq!(
         checked, 19,
-        "the manifest pins nineteen driver kernels (twenty entries; flash_mla has no KernelId)"
+        "the manifest pins nineteen driver kernels (twenty-two entries; flash_mla and the two WS-D \
+         M=1 dense symbol have no KernelId)"
     );
 }
 

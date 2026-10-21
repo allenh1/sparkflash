@@ -53,7 +53,7 @@ Do not "fix" those.
 | fabric netdev MTU | 1500 / 1500 on `enp1s0f1np1` and `enP2p1s0f1np1` | preflight, audit §1 row 3 |
 | DF-8972 ping | fails (needs MTU 9000) | audit `COMMANDS.md`, raw capture |
 | RDMA `active_mtu` / `max_mtu` | 1024 / 4096 | `docs/build/rdma-bringup.md` §2 (2026-10-20) |
-| `nvidia_peermem` | module present, **not loaded** | audit §1 row 5; preflight 16:36Z |
+| `nvidia_peermem` | module present, **not loaded**; load is rejected by this driver (see §5) | audit §1 row 5; preflight 16:36Z; 2026-10-21 19:18 EDT |
 | GPUDirect | not available (module absent) | audit §1 row 5 |
 | f1 rails `rocep1s0f1`, `roceP2p1s0f1` | `4: ACTIVE`, 200 Gb/s | preflight; bring-up §2 |
 | f0 twins `rocep1s0f0`, `roceP2p1s0f0` | `1: DOWN` on all four | preflight; audit §2 |
@@ -70,6 +70,145 @@ Do not "fix" those.
 per-packet header overhead; enabling GPUDirect removes the host-staging copy on the device path.
 Neither has been measured on this branch. The 2026-10-20 numbers were taken at MTU 1500 with
 GPUDirect off on host staging, so they are the correct "before" row, not a prediction.
+
+**Verification 2026-10-21 17:47 EDT (21:47Z):** a re-read on all four nodes confirmed every row
+above (netdev MTU 1500, DF-8972 fails with "frag needed", RDMA active_mtu 1024 / max_mtu 4096,
+peermem lsmod count 0) - the B1/B2 change is still **NOT applied**. Raw capture:
+`/home/user/phase2-evidence/ws-b-20261021/verify-20261021/survey-20261021-1747EDT.txt`.
+The keep gate and the re-run that decides it are §2.3.
+
+**Update 2026-10-21 19:18 EDT - host side APPLIED (runtime) and the state gate is met:** 16/16 fabric
+netdevs at MTU 9000 (including the DOWN f0 twins), RDMA `active_mtu` 4096 on all 16 ports (8 active
+f1 + the f0 twins), same-rail DF-8972 24/24 directed pairs pass, and the switch bridge was not
+touched (per-port 9000/l2mtu 9216 already admits the frames). `nvidia_peermem` still does not load,
+see §5. netplan carries `mtu: 9000` on all four ethernet blocks and passed `netplan generate`;
+`netplan apply` was deliberately not run because runtime was already correct and apply would re-run
+DHCP mid-session, so persistence is effective at next boot. State capture:
+`/home/user/phase2-evidence/ws-b-20261021/fabric-after-state-20261021T231806Z/state-after.txt`.
+The latency probe ran on quiet nodes at 2026-10-21 19:25 EDT: verdict **KEEP** (state gate met),
+table at `/home/user/phase2-evidence/ws-b-20261021/fabric-after2-20261021T232556Z/before-after.md`;
+numbers and the run-to-run tail caveat are in §2.3.
+
+### 2.3 Re-runnable before/after probe (comm-lead owns the measurement)
+
+`scripts/ws-b-fabric-verify.sh` is the single entry point. It is read-only except for staging the
+existing probe binary into the evidence directory and running the probe; it refuses a node with a GPU
+compute app or a listening `:8000` (override only with `SPARK_WSB_ALLOW_BUSY=1`), and it never
+stops or restarts vLLM. Evidence: `/home/user/phase2-evidence/ws-b-20261021/<RUN_ID>/`.
+
+| Subcommand | What it does |
+| --- | --- |
+| `state LABEL` | Read-only snapshot: 4 netdev MTUs, 4 RDMA active/max MTUs, peermem lsmod count, busy state, and the DF-8972 matrix on same-rail directed pairs only (both rails; cross-rail pairs are separate L2 islands sharing 192.0.2.0/24 and are not counted) |
+| `stage` | scp the cross-built `rocenante-probe` into the evidence dir on the active ranks |
+| `probe PHASE` | 3 groups x N ranks: dual 10 KiB, single 10 KiB (`SPARK_COMM_RAIL_COUNT=1`), dual 2 MiB; 200/200/50 samples with 20/20/5 warmup |
+| `prepare-before` | Copies the 2026-10-19 MTU-1500 per-rank JSONs in as the before column |
+| `report` | One before/after markdown table, the state gate, and KEEP / REVERT / NOT READY |
+
+Run order once the Lead says the host side is applied and the nodes are quiet:
+
+~~~bash
+cd /home/user/deepseek-v4.1-flash-spark
+export RUN_ID=fabric-after-$(date -u +%Y%m%dT%H%M%SZ)
+scripts/ws-b-fabric-verify.sh state before    # safe now, pre-change snapshot
+# ... Lead applies switch bridge MTU + host change ...
+scripts/ws-b-fabric-verify.sh all after       # state after + 3 probe groups + table
+cat /home/user/phase2-evidence/ws-b-20261021/$RUN_ID/before-after.md
+~~~
+
+Host-vs-switch isolation while applying: after the runtime MTU change on .80/.88 only, run
+`WORLDS=2 scripts/ws-b-fabric-verify.sh all after` (ranks .80 and .88; the gate shrinks to 2 nodes
+x 2 rails = 4/4 DF pairs, 8 netdevs, 4 active RDMA devices, and the before column is withheld rather
+than compared to the four-rank archive). If DF-8972 passes on the hop but fails with all four nodes,
+the switch bridge is the remaining suspect; if it fails on the hop, the fault is host-side.
+
+Literal commands, same measurement without the script. Each group's 4 ranks run concurrently and
+write one JSON per rank. Peers are the control-plane table in rank order: .80, .88, .59, .68.
+
+~~~bash
+# stage (repeat for .88, .59, .68)
+ssh allenh1@192.0.2.80 'mkdir -p /home/user/phase2-evidence/ws-b-20261021/fabric/bin'
+scp target/aarch64-unknown-linux-gnu/release/rocenante-probe \
+  allenh1@192.0.2.80:/home/user/phase2-evidence/ws-b-20261021/fabric/bin/
+# dual 10 KiB: rank 0 of 4; repeat with --rank 1/2/3 on .88/.59/.68, same peers and port
+ssh allenh1@192.0.2.80 "cd /home/user/phase2-evidence/ws-b-20261021/fabric && \
+  nohup env SPARK_COMM_RAIL_COUNT=2 \
+    SPARK_COMM_PEERS=192.0.2.80,192.0.2.88,192.0.2.59,192.0.2.68 \
+    SPARK_COMM_CONTROL_PORT=18517 SPARK_COMM_TIMEOUT_MS=5000 ./bin/rocenante-probe \
+    --rank 0 --world 4 --peer 192.0.2.80,192.0.2.88,192.0.2.59,192.0.2.68 \
+    --bytes 10240 --samples 200 --warmup 20 --json > results/after-dual-10240-rank0.json \
+    2> results/after-dual-10240-rank0.err < /dev/null & echo $! > results/after-dual-10240-rank0.pid"
+# single rail: the same line with SPARK_COMM_RAIL_COUNT=1 and port 18518 (output single-10240)
+# 2 MiB: the same line with --bytes 2097152 --samples 50 --warmup 5 and port 18519 (output dual-2097152)
+# read state (any time; the script's "state" also does the DF matrix)
+for ip in 192.0.2.80 192.0.2.88 192.0.2.59 192.0.2.68; do
+  ssh -o BatchMode=yes allenh1@$ip 'hostname
+    for n in enp1s0f1np1 enP2p1s0f1np1 enp1s0f0np0 enP2p1s0f0np0; do
+      printf "NETDEV %s mtu=%s\n" "$n" "$(cat /sys/class/net/$n/mtu)"; done
+    for d in rocep1s0f1 roceP2p1s0f1; do
+      printf "RDMA %s active=%s max=%s\n" "$d" \
+        "$(ibv_devinfo -v -d $d | awk "/active_mtu/{print \$2; exit}")" \
+        "$(ibv_devinfo -v -d $d | awk "/max_mtu/{print \$2; exit}")"; done
+    echo "PEERMEM $(lsmod | grep -cE "^(nvidia_peermem|nv_peer_mem)")"'
+done
+~~~
+
+Rail addresses for a manual DF-8972 check (the script derives them): rail 1 = .80 (rank 0),
+.84 (rank 1), .59 (rank 2), .64 (rank 3); rail 2 = .85, .88, .63, .68 in the same rank order. A
+manual check needs one ping per directed pair per rail where the source node's own rail IP is the
+source: `ping -M do -s 8972 -c 1 -W 2 <peer-rail-ip>`. Success on all pairs, both rails, is the
+DF row of the gate.
+
+**Table rows, sample counts, and the before column** (before = archived 2026-10-19 run at MTU 1500
+with GPUDirect off; it is the same probe and sizes, not a fresh measurement):
+
+| Row | After samples per rank | Before (2026-10-19) |
+| --- | --- | --- |
+| 10 KiB p50 dual rail | 200 | 36.97 us (rank spread 36.72-37.40) |
+| 10 KiB p90 dual rail | 200 | 1634.09 us (worst-rank median; tail is host scheduling) |
+| 10 KiB p50 single rail | 200 | 29.54 us (29.49-29.58) |
+| 2 MiB p50 dual rail | 50 | 8364.89 us |
+| 2 MiB posted bandwidth | 50 | 6.02 Gb/s = 1.5% of the 400 Gb/s dual-rail capacity (wire floor 125.8 us) |
+
+Posted bandwidth is (world - 1) x payload per rank at p50 over the 400 Gb/s dual-rail capacity, the
+same convention as the bring-up gate; it is reported because a 2 MiB all-reduce at 8.36 ms is
+latency-bound, not bandwidth-bound.
+
+**Measured after the change (2026-10-21 19:25 EDT, nodes quiet, vLLM stopped):** verdict **KEEP**
+(state gate 16/16, 8/8, 24/24; peermem 0/4 info). 10 KiB p50 dual rail 35.70 us (per-rank
+35.68-35.80) vs 36.97 before, -3.4%; single rail 28.70 us (28.67-28.78) vs 29.54, -2.8%; 2 MiB p50
+6787.03 us vs 8364.89, -18.9%; 2 MiB posted bandwidth 7.42 Gb/s (+23.2%, 1.9% of 400 Gb/s). The
+10 KiB p90 fell from 1634.09 us to 37.04 us and the single-rail p99 from 2092.78 us to 31.14 us, but
+those tail percentiles are not a stable fabric property: the first run of the same probe
+(`fabric-after-20261021T232441Z`) got the same p50s (36.73 / 29.18 / 6800.16 us) and the same state
+gate, yet its 2 MiB p90/p99 were 15.6 / 90.3 ms and its dual 10 KiB p99 was 3.28 ms; the second run
+was tight (2 MiB p90/p99 6.81 / 6.84 ms; 10 KiB p99 38 us). Use p50 as the comparable number and
+treat a single-run p99 as tail evidence only.
+
+**Decode-step meaning:** the Lead measured the shared-expert row lean at MTU 9000 vs 1500:
+351.56 vs 350.39 ms/step (+1.17 ms), i.e. no decode-step move. That matches the probe: the 10 KiB
+host-staging one-shot p50 changed by 1.0-1.3 us (about 3%), and the per-layer all-reduce is not the
+decode wall at this size. The MTU change is an enabler for the later device path (B6), not a decode
+win; GPUDirect has to come from the dma-buf path because peermem cannot load on this rig.
+
+**What "keep it" looks like numerically - all must hold after the change:**
+
+1. DF-8972 passes on 24/24 directed pairs (both rails, world 4; 4/4 in the two-node hop).
+2. netdev MTU reads 9000 on 16/16 fabric netdevs (4 per node: both f1 rails and both f0 twins; a
+   DOWN twin still takes the MTU and must be configured, but it is not a gate on link state).
+3. RDMA `active_mtu` reads 4096 on 8/8 active f1 devices. **Corrected expectation:** 9000 is not
+   a valid RoCE MTU - IB encodes 256/512/1024/2048/4096 and `max_mtu` reads 4096 - so the keep rule
+   must be 4096. Waiting for `active_mtu 9000` would revert a correct change.
+4. `nvidia_peermem` is **not loadable on this hardware** and is **not** a gate. 2026-10-21:
+   `modprobe nvidia-peermem` fails "could not insert: Invalid argument" on driver 580.178.04 / GB10
+   / kernel 7.0.0-1019-nvidia; the module file exists but the driver rejects it. GPUDirect has to
+   come from the dma-buf path (B6), not peermem. This is recorded as a finding in §5.
+5. No latency/bandwidth row regresses by more than 10%; a 25 us dual-rail 10 KiB p50 would meet the
+   WS-B gate but is not a condition for keeping the admin change (the 2026-10-19 before row is
+   36.97 us, so an MTU-only change is not expected to reach 25 us).
+
+Revert if any of 1-3 fails or any latency row regresses by more than 10%: `ip link set <if> mtu 1500`
+at runtime, restore `/etc/netplan/40-cx7.yaml` from the backup plus `netplan apply`. No partial
+state: the gate is all-or-nothing on the three state rows.
 
 ## 3. Rules that apply to every ticket
 
@@ -120,10 +259,19 @@ sizes and the 2 MiB prefill payload on the same wire is impossible without IP fr
 **Order:** switch first, then hosts. Setting hosts to 9000 while the switch still drops >1500
 silently black-holes large packets, including vLLM's control traffic.
 
-### B1.1 Switch half (blocked on switch admin; switch model is not recorded in this repo)
+### B1.1 Switch half (MikroTik CRS812-8DS-2DQ-2DDQ; ports already 9000, bridge 1500)
 
-The switch model and its configuration are **not** in this repository or the audit captures, so
-the exact vendor command cannot be written from here. Required settings on the four cluster ports:
+**Update 2026-10-21 18:53 EDT (RouterOS REST, read/write via the node sudo credential):** the switch
+is a **MikroTik CRS812-8DS-2DQ-2DDQ**, RouterOS 7.20.7, management 192.0.2.92. Bridge `bridge`:
+`mtu auto / actual-mtu 1500`, `l2mtu 1584`, hardware offload on. The four running cluster ports
+(`qsfp56-dd-1-1`, `1-5`, `2-1`, `2-5`, all 200G-baseCR4) **already carry `mtu 9000` /
+`l2mtu 9216`**. The host rails were still 1500 on 2026-10-21 17:47 EDT, so the DF-8972 failure is
+consistent with a host-only gap: the probe originates on the host and never exercises the switch.
+With hardware-offloaded L2 bridging, the per-port MTU/l2mtu is what admits the 9000-byte frames; the
+bridge `actual-mtu 1500` is the router's own L3 interface and is only a suspect if DF still fails
+after the hosts are at 9000. In that case raise the bridge (`/interface bridge set [find name=bridge]
+mtu=9000 l2mtu=9216`) via REST, retest, persist it on the switch, and record it here. Required
+settings on the four cluster ports:
 
 - jumbo frames: L2 MTU 9216 (or at least 9000) on the four server-facing ports and on the bridge /
   VLAN they belong to;
@@ -225,6 +373,15 @@ curl -sS -o /dev/null -w '%{http_code}\n' http://192.0.2.80:8000/v1/models
 # window; this branch does not.
 ~~~
 
+**Update 2026-10-21 19:18 EDT: applied on all four nodes.** Runtime: `ip link set ... mtu 9000`
+on both f1 rails per node (the f0 twins were already at 9000 too); persistence: `mtu: 9000` under
+all four ethernet blocks in `/etc/netplan/40-cx7.yaml`, verified with `netplan generate` and
+deliberately not `netplan apply` (runtime was already correct and apply would re-run DHCP
+mid-session; effective at next boot). Verified: netdev MTU 9000 x16, RDMA `active_mtu` 4096 x16,
+same-rail DF-8972 24/24, switch bridge untouched. Same-rail only: the two rails are separate L2
+islands sharing 192.0.2.0/24, so cross-rail pairs are not an MTU test and must not be counted as
+host failures. Rollback below still applies.
+
 **Rollback (immediate, no reboot):**
 
 ~~~bash
@@ -256,6 +413,13 @@ device-buffer one-shot seam (B6) cannot be tested and every GPU-side collective 
 four nodes. It is simply not loaded. `/etc/modules-load.d/` exists with `modules.conf` and
 `nvidia-mstflint.conf`; there is no peermem entry.
 
+**Update 2026-10-21 19:18 EDT: NOT SUPPORTED on this hardware.** `modprobe nvidia-peermem` fails
+`could not insert 'nvidia_peermem': Invalid argument` on all four nodes with driver 580.178.04,
+GB10, kernel 7.0.0-1019-nvidia. The module file exists but the driver rejects it, so this is a
+driver/hardware finding, not a misconfiguration. B2 is closed as "unsupported by this driver /
+hardware" and is removed from the keep gate. GPUDirect on this rig has to come from the dma-buf
+path (B6), not `nvidia-peermem`.
+
 Preflight, read-only:
 
 ~~~bash
@@ -264,7 +428,7 @@ ls -l /sys/module/nvidia_peermem 2>/dev/null || echo 'no sysfs entry'
 dmesg | grep -i peermem | tail -5
 ~~~
 
-Change (root, each node, in a window):
+**Attempted change (2026-10-21, all four nodes; fails - do not repeat on this rig):**
 
 ~~~bash
 sudo modprobe nvidia-peermem
@@ -278,7 +442,7 @@ cat /etc/modules-load.d/nvidia-peermem.conf
 dmesg | grep -i peermem | tail -5
 ~~~
 
-**Acceptance:**
+**Historical acceptance (not achievable on this hardware):**
 
 ~~~bash
 # phase 1 (module): loaded on 4/4 nodes
@@ -430,23 +594,45 @@ container. A first real NCCL collective needs device buffers and is B6, not this
 
 ## 9. B6 - After the infra tickets: the device seam and the first qualifying run
 
-Not an infra ticket, but the dependency that makes B1/B2/B5 measurable. Sequence:
+Not an infra ticket, but the dependency that makes B1/B5 measurable (B2 is closed as unsupported on
+this driver/hardware, see §5). Sequence:
 
 1. device-lead lands the device-buffer one-shot seam (S5.3): `Transport::all_reduce_bf16_device`
    for the RDMA backend, replacing today's `CommError::Unsupported`.
-2. B1 + B2 accepted (MTU 9000, peermem loaded): device-buffer probe/gate can run.
+2. B1 accepted (netdev 9000, active_mtu 4096, same-rail DF-8972 24/24) and the device path built on
+   dma-buf (peermem cannot load, so B6 does not wait on B2): device-buffer probe/gate can run.
 3. `scripts/ws-b-allreduce-bench.sh run` in a free window; the report must say
    `fabric=true` and the gate is p50 <= 25 us on the decode rows. The bench is
    not-yet-measured today; no number may be quoted from a loopback run.
 4. If the gate misses, the measured gap and the next single hypothesis go in
    `docs/build/ws-b-collectives-20261021.md` section 9; one change at a time.
 
+**B6 keep criterion for a future GPUDirect/dma-buf test (docs only, no run yet).** Because
+`nvidia-peermem` cannot load on this rig (B2 finding: "could not insert: Invalid argument" on
+580.178.04 / GB10 / kernel 7.0.0-1019-nvidia), the device seam has to use the dma-buf path. A future
+run is a keep only if it measures all of: (a) a one-time dmabuf export plus `ibv_reg_mr` (or the
+mlx5dv equivalent) of the 10 KiB and 2 MiB payloads succeeds and is cached, so no per-collective
+registration lands in the timed loop; (b) device-buffer one-shot 10 KiB p50 <= 25 us (bench gate;
+doctor constant 22 us) and at least 10% below the accepted 2026-10-21 host-staging baseline of
+35.70 us p50 dual rail, on the same four ranks and rails with the quiet-window state gate (16/16
+netdev 9000, 8/8 active_mtu 4096, 24/24 same-rail DF); (c) 2 MiB device-to-device posted bandwidth no
+worse than the 7.42 Gb/s host baseline and moving toward the 125.8 us wire floor; (d) bit-identical
+output against the canonical bf16 reduce (f32 accumulate in ascending rank order from 0.0, one RNE
+bf16 round) by hash; (e) an end-to-end engine step-time delta, not just the probe, because the
+2026-10-21 shared-expert row (351.56 vs 350.39 ms/step) showed MTU alone did not move the decode
+step. Any registration failure (dmabuf unsupported, MR limit, cross-rail peer visibility), a p50
+above the 35.70 us baseline, or a non-bit-identical reduce is a no-keep and is recorded in
+`docs/build/ws-b-collectives-20261021.md` section 9 with the measured gap and one next hypothesis.
+
 ## 10. Blocked-on lists (for the Lead's integration plan)
 
-**Blocked on root, four nodes:** B1 host MTU (after switch), B2 peermem, B4c Engram (unless the
-doctor is given a writable dir), B5 host NCCL.
+**Blocked on root, four nodes:** B4c Engram (unless the doctor is given a writable dir), B5 host
+NCCL. B1 host MTU is applied (runtime) and keep-accepted, with netplan persistence effective at next
+boot; B2 peermem is closed as unsupported on this driver/hardware (§5).
 
-**Blocked on switch admin:** B1 switch jumbo/PFC/ECN (model unknown), B3-B f0 ports/cabling.
+**Blocked on switch admin:** B1 switch jumbo is resolved (CRS812 ports already at mtu 9000 / l2mtu
+9216, bridge untouched); the remaining switch item is PFC/ECN lossless RoCE configuration if a
+future device path needs it. B3-B f0 ports/cabling.
 
 **Blocked on Lead/spec owner (no root):** B3-A rail naming decision; B4a clock-check definition;
 B4b uvm-64K claim.

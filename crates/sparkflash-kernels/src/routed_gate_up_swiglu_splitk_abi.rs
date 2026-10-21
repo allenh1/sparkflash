@@ -117,7 +117,7 @@ pub const PARAMS: [(&str, &str, bool, bool); ARG_WORDS] = [
 pub const SIGNATURE: &str = "const uint8_t *__restrict__ act_fp8; const uint8_t *__restrict__ act_scales; const uint8_t *__restrict__ w1_fp4; const uint8_t *__restrict__ w1_scales; const uint8_t *__restrict__ w3_fp4; const uint8_t *__restrict__ w3_scales; const uint32_t *__restrict__ expert_ids; const float *__restrict__ routing_weights; uint8_t *__restrict__ out_fp8; uint8_t *__restrict__ out_scales; const uint32_t tokens; const float limit; GpuTraceRing *__restrict__ trace_ring; const uint32_t layer_id; const uint64_t step_seq";
 
 /// The number of pinned baseline kernels today (`baseline/kernel_baseline.txt`).
-pub const BASELINE_ENTRIES_NOW: usize = 20;
+pub const BASELINE_ENTRIES_NOW: usize = 22;
 /// The baseline entry count once this kernel is pinned: the standing rule's 20 -> 21 step.
 pub const BASELINE_ENTRIES_AFTER_PIN: usize = BASELINE_ENTRIES_NOW + 1;
 
@@ -139,9 +139,9 @@ pub const PIN_CHECKLIST: [&str; 8] = [
     "1. move the source: git mv crates/sparkflash-kernels/pending_kernels/routed_gate_up_swiglu_splitk_sm121.cu kernels/routed_gate_up_swiglu_splitk_sm121.cu, and change SOURCE's include path in this module to ../../../kernels/",
     "2. add (\"routed_gate_up_swiglu_splitk_sm121.cu\", \"routed_gate_up_swiglu_splitk_sm121\") to build.rs PROBED_KERNELS and raise its declared length 20 -> 21",
     "3. add routed_gate_up_swiglu_splitk_sm121 to the kernels= list in scripts/check-kernel-baseline.sh (20 -> 21)",
-    "4. run scripts/regen-kernel-baseline.sh on the pinned toolkit, append the new kernel line to baseline/kernel_baseline.txt, and move the manifest's entry count to 21 (the header text that says twenty becomes twenty-one)",
+    "4. run scripts/regen-kernel-baseline.sh on the pinned toolkit, append the new kernel line to baseline/kernel_baseline.txt, and move the manifest's entry count to 23 (the header text that says twenty-two becomes twenty-three)",
     "5. fill CUBIN_BYTES, CUBIN_SHA256 and CUBIN_MEMBAR_LINES from that measurement and set PIN_RECORDED = true in the same commit - the_pin_is_recorded_before_the_manifest_names_it fails otherwise",
-    "6. raise the expectations that count kernels: tests/kernel_baseline.rs (listed.len() 20 -> 21, the manifest/lookup count 19 -> 20) and this module's BASELINE_ENTRIES_NOW 20 -> 21",
+    "6. raise the expectations that count kernels: tests/kernel_baseline.rs (listed.len() 22 -> 23, the manifest/lookup count 19 -> 20) and this module's BASELINE_ENTRIES_NOW 22 -> 23",
     "7. re-run the gates (fmt, clippy -D warnings, cargo test --workspace, scripts tests, cargo check -p sparkflash-kernels) and record the cubin sha256 in the D49 pin row",
     "8. run GPU_VERIFICATION_PLAN on the device and record its rows next to the kernel's tolerance row; only then may a launch site arm the kernel (the Lead's host-side writer owns that edit)",
 ];
@@ -397,9 +397,10 @@ mod tests {
         .expect("the manifest entry and the pin fields move in one commit");
         // The compile-time copy and the working tree must be the same file.
         assert_eq!(BASELINE.lines().count(), manifest.lines().count());
-        // The standing rule the checklist quotes: 20 entries today, 21 after the pin job.
-        assert_eq!(BASELINE_ENTRIES_NOW, 20);
-        assert_eq!(BASELINE_ENTRIES_AFTER_PIN, 21);
+        // The standing rule the checklist quotes: 22 entries today (the two WS-D symbols are the
+        // twentieth and twenty-first additions), 23 after the pin job.
+        assert_eq!(BASELINE_ENTRIES_NOW, 22);
+        assert_eq!(BASELINE_ENTRIES_AFTER_PIN, 23);
         // The pin job's other artifacts must agree with the manifest's state.
         let script = include_str!("../scripts/check-kernel-baseline.sh");
         let list = script

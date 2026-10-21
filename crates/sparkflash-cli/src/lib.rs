@@ -18,6 +18,8 @@ pub mod tp4_chain;
 pub mod tp4_combine;
 pub mod tp4_device_runner;
 pub mod tp4_forward;
+#[cfg(feature = "cuda")]
+pub(crate) mod tp4_graph;
 pub mod tp4_host;
 pub mod tp4_operands;
 pub mod tp4_prefill;

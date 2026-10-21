@@ -801,7 +801,7 @@ fn finish(verdicts: &[Verdict], mode: &str) -> bool {
         "  - no token is claimed from the head: the argmax is a measured equality with the twin (and the optional reference), not a serving claim, and a certified winner is a refusal;"
     );
     println!(
-        "  - no kernel or pin change is made: the harness uses the pinned rmsnorm_sm121 and cert_lm_head_sm121 from the twenty-entry baseline."
+        "  - no kernel or pin change is made: the harness uses the pinned rmsnorm_sm121 and cert_lm_head_sm121 from the twenty-two-entry baseline."
     );
     if failed == 0 {
         println!(

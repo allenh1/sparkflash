@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 type CuResult = i32;
 
@@ -72,6 +72,29 @@ fn name(code: CuResult) -> String {
 type CuDeviceptr = u64;
 type CuModule = *mut c_void;
 type CuFunction = *mut c_void;
+
+/// An opaque CUDA stream handle.
+type CuStream = *mut c_void;
+
+/// An opaque CUDA graph handle.
+type CuGraph = *mut c_void;
+
+/// An opaque CUDA graph-executable handle.
+type CuGraphExec = *mut c_void;
+
+/// `CU_STREAM_NON_BLOCKING`: capture runs on a stream this handle creates, never on the legacy
+/// default stream (which cannot be captured).
+const CU_STREAM_NON_BLOCKING: u32 = 0x1;
+
+/// `CU_STREAM_CAPTURE_MODE_GLOBAL`: record every launch issued on the capture stream.
+const CU_STREAM_CAPTURE_MODE_GLOBAL: u32 = 0;
+
+/// The launch path's graph state: no segment is active, launches go to the default stream.
+const GRAPH_DIRECT: u8 = 0;
+/// A capture is active: launches are recorded into a graph on the capture stream.
+const GRAPH_CAPTURE: u8 = 1;
+/// A record is active: launches are collected in host memory, not issued to the driver.
+const GRAPH_RECORD: u8 = 2;
 
 /// A device allocation, in the driver's flat address space.
 ///
@@ -1182,6 +1205,142 @@ impl BufferPool {
     }
 }
 
+/// A handle to one CUDA graph executable owned by the [Cuda] that instantiated it.
+///
+/// The id is only meaningful to the handle that captured it: launching with another handle's id
+/// is an error, so a stale handle cannot name a graph from a different context. The executable is
+/// destroyed by the owning handle's `Drop` (or by [Cuda::graph_destroy]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GraphId(u64);
+
+/// One kernel launch recorded while a CUDA graph segment was being captured or recorded.
+///
+/// A record is the launch's identity: the `cuFunction` handle, the grid and block, and every
+/// argument word. Two records compare equal only when all of those are identical, which is what
+/// makes replay safe. A launch whose argument vector changed - a different pooled buffer, a
+/// different weight slice, another layer - is a different record, and the wrapper executes it
+/// instead of replaying a graph captured for the old arguments. No argument is ever patched.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CudaLaunchRecord {
+    function: usize,
+    grid: (u32, u32, u32),
+    block: (u32, u32, u32),
+    args: Vec<u64>,
+}
+
+impl CudaLaunchRecord {
+    /// The launch identity as a flat word vector: the function handle, the grid, the block, then
+    /// every argument word in order.
+    ///
+    /// Two fingerprints are equal exactly when the launch lists are equal; the graph wrapper in
+    /// `sparkflash-cli` compares these instead of the private record fields.
+    pub fn fingerprint_words(&self) -> Vec<u64> {
+        let mut words = Vec::with_capacity(9 + self.args.len());
+        words.push(self.function as u64);
+        words.extend([
+            u64::from(self.grid.0),
+            u64::from(self.grid.1),
+            u64::from(self.grid.2),
+            u64::from(self.block.0),
+            u64::from(self.block.1),
+            u64::from(self.block.2),
+        ]);
+        words.extend(self.args.iter().copied());
+        words
+    }
+
+    /// A short description for a fallback report, without exposing the raw argument words.
+    pub fn describe(&self) -> String {
+        format!(
+            "grid {}x{}x{}, block {}x{}x{}, {} args",
+            self.grid.0,
+            self.grid.1,
+            self.grid.2,
+            self.block.0,
+            self.block.1,
+            self.block.2,
+            self.args.len()
+        )
+    }
+}
+
+/// The most graph executables one [Cuda] keeps alive.
+///
+/// A capture is a warm-up event, not a steady-state one. The wrapper keeps at most one executable
+/// per distinct launch list (a per-layer weight set is a distinct list), and this cap bounds a run
+/// that keeps producing new lists without replaying any of them: past the cap a segment executes
+/// its recorded launches instead of leaking another executable.
+const MAX_GRAPH_EXECUTABLES: usize = 128;
+
+/// The driver state a graph segment needs; the launch hot path never locks it.
+#[derive(Default)]
+struct GraphControl {
+    /// The private stream capture is running on; null unless [GRAPH_CAPTURE] is active.
+    capture_stream: CuStream,
+    /// Launches issued since the segment began, in order. Filled by both capture and record so a
+    /// captured graph always has the launch list it replays.
+    records: Vec<CudaLaunchRecord>,
+    /// Instantiated graph executables, keyed by [GraphId].
+    execs: BTreeMap<u64, CuGraphExec>,
+    /// The next [GraphId] to hand out; never reused, so a stale id can only fail, not alias.
+    next_exec: u64,
+}
+
+/// The non-launch operations a graph segment refuses.
+///
+/// Stream capture records kernels only. An allocation, a copy, a synchronize or a module load
+/// issued inside a segment is either illegal during capture (the driver answers with a capture
+/// error) or would silently run outside the recorded graph; both destroy the result's identity, so
+/// each entry point refuses with a named error instead. The wrapper in `sparkflash-cli` reports
+/// the refusal and falls back to the direct launch path for that segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SegmentOp {
+    Copy,
+    Synchronize,
+    Allocation,
+    Free,
+    Release,
+    ModuleLoad,
+    RepeatedLaunch,
+}
+
+impl SegmentOp {
+    fn refusal(self) -> &'static str {
+        match self {
+            SegmentOp::Copy => {
+                "a host or device copy cannot run inside a CUDA graph segment (capture records kernels only)"
+            }
+            SegmentOp::Synchronize => {
+                "cuCtxSynchronize cannot run inside a CUDA graph segment (capture cannot cross a host wait)"
+            }
+            SegmentOp::Allocation => {
+                "an allocation cannot run inside a CUDA graph segment (buffers must be checked out before capture)"
+            }
+            SegmentOp::Free => {
+                "a buffer free cannot run inside a CUDA graph segment (a captured graph reads the buffers it was captured with)"
+            }
+            SegmentOp::Release => {
+                "release_pooled cannot run inside a CUDA graph segment (the captured buffers must stay checked out across replays)"
+            }
+            SegmentOp::ModuleLoad => {
+                "a module load cannot run inside a CUDA graph segment (load and warm every kernel before capturing)"
+            }
+            SegmentOp::RepeatedLaunch => {
+                "launch_repeated cannot run inside a CUDA graph segment (it creates events and synchronizes)"
+            }
+        }
+    }
+}
+
+/// The one place that decides whether an operation may run while a graph segment is active.
+fn graph_segment_refusal(mode: u8, op: SegmentOp) -> Option<&'static str> {
+    if mode == GRAPH_DIRECT {
+        None
+    } else {
+        Some(op.refusal())
+    }
+}
+
 /// The CUDA context and the dlopen'd driver functions this process uses.
 ///
 /// The context is the retained primary context, made current for the thread that created it, and
@@ -1203,6 +1362,11 @@ pub struct Cuda {
     /// proven finished. The buffer pool's reuse fence reads both.
     issued: AtomicU64,
     completed: AtomicU64,
+    /// Capture/record bookkeeping. Only segment control and segment launches lock it; the hot
+    /// launch path reads [Cuda::graph_mode] and leaves the mutex alone in direct mode.
+    graph: Mutex<GraphControl>,
+    /// 0 direct, 1 capture, 2 record. One relaxed load at the top of every launch.
+    graph_mode: AtomicU8,
 }
 
 impl Cuda {
@@ -1214,6 +1378,9 @@ impl Cuda {
     /// # Errors
     /// The driver's cuCtxSynchronize failure code.
     pub fn synchronize(&self) -> Result<(), String> {
+        if let Some(refusal) = self.graph_refusal(SegmentOp::Synchronize) {
+            return Err(refusal.to_string());
+        }
         let sync: libloading::Symbol<unsafe extern "C" fn() -> CuResult> =
             self.sym(b"cuCtxSynchronize")?;
         let metered = probe_meter_armed();
@@ -1232,6 +1399,457 @@ impl Cuda {
         self.completed
             .store(self.issued.load(Ordering::Relaxed), Ordering::Relaxed);
         Ok(())
+    }
+
+    /// The refusal a non-launch operation gets while a graph segment is active, or `None`.
+    fn graph_refusal(&self, op: SegmentOp) -> Option<&'static str> {
+        graph_segment_refusal(self.graph_mode.load(Ordering::Relaxed), op)
+    }
+
+    /// Destroys the private stream a capture ran on, best effort.
+    fn destroy_capture_stream(&self, stream: CuStream) {
+        if stream.is_null() {
+            return;
+        }
+        if let Ok(destroy) =
+            self.sym::<unsafe extern "C" fn(CuStream) -> CuResult>(b"cuStreamDestroy_v2")
+        {
+            // SAFETY: the stream was created by this handle and is not in use after capture ended.
+            let _ = unsafe { destroy(stream) };
+        }
+    }
+
+    /// Destroys a captured graph handle, best effort.
+    fn destroy_graph_handle(&self, graph: CuGraph) {
+        if graph.is_null() {
+            return;
+        }
+        if let Ok(destroy) =
+            self.sym::<unsafe extern "C" fn(CuGraph) -> CuResult>(b"cuGraphDestroy")
+        {
+            // SAFETY: the graph was returned by cuStreamEndCapture and is not in use.
+            let _ = unsafe { destroy(graph) };
+        }
+    }
+
+    /// Destroys one instantiated graph executable, best effort.
+    fn destroy_graph_exec(&self, exec: CuGraphExec) {
+        if exec.is_null() {
+            return;
+        }
+        if let Ok(destroy) =
+            self.sym::<unsafe extern "C" fn(CuGraphExec) -> CuResult>(b"cuGraphExecDestroy")
+        {
+            // SAFETY: the executable is owned by this handle and no graph is launching now.
+            let _ = unsafe { destroy(exec) };
+        }
+    }
+
+    /// Starts a CUDA graph capture on a private stream.
+    ///
+    /// While the segment is active, [Cuda::launch] and [Cuda::launch_async] enqueue their kernels
+    /// on the capture stream (where the driver records them) and add a [CudaLaunchRecord] to the
+    /// segment. Nothing else may run: allocations, copies, synchronizes, module loads, frees and
+    /// releases are refused by their own entry points, so a capture cannot silently omit device
+    /// work that the direct path would have done. The stage-timing ledger and the probe meter are
+    /// refused up front because both bracket launches with events and a host wait.
+    ///
+    /// A segment is process-wide on this handle: start, end and abort are not meant to race other
+    /// threads' launches.
+    ///
+    /// # Errors
+    /// A segment is already active, a launch bracket is armed, or the driver refuses to create the
+    /// capture stream or begin capture.
+    pub fn graph_capture_begin(&self) -> Result<(), String> {
+        if self.graph_mode.load(Ordering::Relaxed) != GRAPH_DIRECT {
+            return Err("a CUDA graph segment is already active".to_string());
+        }
+        if stage_timing_enabled() {
+            return Err(
+                "cannot capture a CUDA graph while stage timing is armed (its event bracket is not capturable)"
+                    .to_string(),
+            );
+        }
+        if probe_meter_armed() {
+            return Err(
+                "cannot capture a CUDA graph while the probe meter is armed (its event bracket and drain are not capturable)"
+                    .to_string(),
+            );
+        }
+        let create: libloading::Symbol<unsafe extern "C" fn(*mut CuStream, u32) -> CuResult> =
+            self.sym(b"cuStreamCreate")?;
+        let mut stream: CuStream = std::ptr::null_mut();
+        // SAFETY: the symbol belongs to this context's library and the out-pointer is valid for
+        // the call; the flags are the documented non-blocking flag.
+        let r = unsafe { create(&mut stream, CU_STREAM_NON_BLOCKING) };
+        if r != 0 {
+            return Err(format!(
+                "cuStreamCreate for graph capture failed: {}",
+                name(r)
+            ));
+        }
+        let begin: libloading::Symbol<unsafe extern "C" fn(CuStream, u32) -> CuResult> = match self
+            .sym(b"cuStreamBeginCapture_v2")
+        {
+            Ok(symbol) => symbol,
+            Err(_) => match self
+                .sym::<unsafe extern "C" fn(CuStream, u32) -> CuResult>(b"cuStreamBeginCapture")
+            {
+                Ok(symbol) => symbol,
+                Err(error) => {
+                    self.destroy_capture_stream(stream);
+                    return Err(format!(
+                        "neither cuStreamBeginCapture_v2 nor cuStreamBeginCapture is available: {error}"
+                    ));
+                }
+            },
+        };
+        // SAFETY: capture mode global on a stream this handle owns; no other caller uses it.
+        let r = unsafe { begin(stream, CU_STREAM_CAPTURE_MODE_GLOBAL) };
+        if r != 0 {
+            self.destroy_capture_stream(stream);
+            return Err(format!("cuStreamBeginCapture failed: {}", name(r)));
+        }
+        let mut control = self
+            .graph
+            .lock()
+            .map_err(|error| format!("graph state lock: {error}"))?;
+        control.capture_stream = stream;
+        control.records.clear();
+        self.graph_mode.store(GRAPH_CAPTURE, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Ends stream capture, instantiates the graph, and returns its handle plus the launches the
+    /// segment issued in order.
+    ///
+    /// The capture stream is destroyed here; the graph executable is owned by this handle and is
+    /// destroyed by `Drop` or by [Cuda::graph_destroy]. Failure leaves no segment active: the
+    /// mode is already back to direct even when the driver refuses the end or the instantiate.
+    ///
+    /// # Errors
+    /// No capture is active, or the driver rejects `cuStreamEndCapture` /
+    /// `cuGraphInstantiateWithFlags`.
+    pub fn graph_capture_end(&self) -> Result<(GraphId, Vec<CudaLaunchRecord>), String> {
+        if self.graph_mode.load(Ordering::Relaxed) != GRAPH_CAPTURE {
+            return Err("no CUDA graph capture is active".to_string());
+        }
+        let mut control = self
+            .graph
+            .lock()
+            .map_err(|error| format!("graph state lock: {error}"))?;
+        let stream = std::mem::take(&mut control.capture_stream);
+        if stream.is_null() {
+            self.graph_mode.store(GRAPH_DIRECT, Ordering::Relaxed);
+            control.records.clear();
+            return Err("graph capture is active without a capture stream".to_string());
+        }
+        let end: libloading::Symbol<unsafe extern "C" fn(CuStream, *mut CuGraph) -> CuResult> =
+            match self.sym(b"cuStreamEndCapture") {
+                Ok(symbol) => symbol,
+                Err(error) => {
+                    self.destroy_capture_stream(stream);
+                    self.graph_mode.store(GRAPH_DIRECT, Ordering::Relaxed);
+                    control.records.clear();
+                    return Err(error);
+                }
+            };
+        let mut graph: CuGraph = std::ptr::null_mut();
+        // SAFETY: the stream is the capture stream this handle created and is still valid.
+        let r = unsafe { end(stream, &mut graph) };
+        self.destroy_capture_stream(stream);
+        self.graph_mode.store(GRAPH_DIRECT, Ordering::Relaxed);
+        let records = std::mem::take(&mut control.records);
+        if r != 0 {
+            self.destroy_graph_handle(graph);
+            return Err(format!("cuStreamEndCapture failed: {}", name(r)));
+        }
+        if graph.is_null() {
+            return Err("cuStreamEndCapture returned a null graph".to_string());
+        }
+        let instantiate: libloading::Symbol<
+            unsafe extern "C" fn(*mut CuGraphExec, CuGraph, u64) -> CuResult,
+        > = match self.sym(b"cuGraphInstantiateWithFlags") {
+            Ok(symbol) => symbol,
+            Err(error) => {
+                self.destroy_graph_handle(graph);
+                return Err(error);
+            }
+        };
+        let mut exec: CuGraphExec = std::ptr::null_mut();
+        // SAFETY: the graph handle is valid and owns the nodes; flags 0 instantiate immediately.
+        let r = unsafe { instantiate(&mut exec, graph, 0) };
+        self.destroy_graph_handle(graph);
+        if r != 0 {
+            return Err(format!("cuGraphInstantiateWithFlags failed: {}", name(r)));
+        }
+        if exec.is_null() {
+            return Err("cuGraphInstantiateWithFlags returned a null executable".to_string());
+        }
+        if control.execs.len() >= MAX_GRAPH_EXECUTABLES {
+            self.destroy_graph_exec(exec);
+            return Err(format!(
+                "graph executable budget ({MAX_GRAPH_EXECUTABLES}) is full; not instantiating another"
+            ));
+        }
+        control.next_exec += 1;
+        let id = GraphId(control.next_exec);
+        control.execs.insert(id.0, exec);
+        Ok((id, records))
+    }
+
+    /// Abandons an active capture, best effort: ends stream capture, destroys the graph and the
+    /// capture stream, and clears the recorded launches.
+    ///
+    /// Called by [Cuda]`s `Drop` and by the wrapper when a guarded operation ends a capture
+    /// early. A no-op when no capture is active.
+    pub fn graph_capture_abort(&self) {
+        if self.graph_mode.load(Ordering::Relaxed) != GRAPH_CAPTURE {
+            return;
+        }
+        let Ok(mut control) = self.graph.lock() else {
+            self.graph_mode.store(GRAPH_DIRECT, Ordering::Relaxed);
+            return;
+        };
+        let stream = std::mem::take(&mut control.capture_stream);
+        self.graph_mode.store(GRAPH_DIRECT, Ordering::Relaxed);
+        control.records.clear();
+        if stream.is_null() {
+            return;
+        }
+        if let Ok(end) = self
+            .sym::<unsafe extern "C" fn(CuStream, *mut CuGraph) -> CuResult>(b"cuStreamEndCapture")
+        {
+            let mut graph: CuGraph = std::ptr::null_mut();
+            // SAFETY: the stream is the capture stream this handle created; ending the capture is
+            // the only valid way to leave capture state.
+            let r = unsafe { end(stream, &mut graph) };
+            if r == 0 {
+                self.destroy_graph_handle(graph);
+            }
+        }
+        self.destroy_capture_stream(stream);
+    }
+
+    /// Starts recording launches into host memory without capturing them.
+    ///
+    /// A record lets the wrapper fingerprint what a segment would launch before it decides
+    /// whether a captured graph may be replayed. Nothing is issued to the driver, so a record
+    /// segment can run even when no graph exists yet.
+    ///
+    /// # Errors
+    /// A graph segment is already active.
+    pub fn graph_record_begin(&self) -> Result<(), String> {
+        if self.graph_mode.load(Ordering::Relaxed) != GRAPH_DIRECT {
+            return Err("a CUDA graph segment is already active".to_string());
+        }
+        let mut control = self
+            .graph
+            .lock()
+            .map_err(|error| format!("graph state lock: {error}"))?;
+        control.records.clear();
+        self.graph_mode.store(GRAPH_RECORD, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Ends a record segment and returns the launches it issued, in order.
+    ///
+    /// # Errors
+    /// No record is active.
+    pub fn graph_record_end(&self) -> Result<Vec<CudaLaunchRecord>, String> {
+        if self.graph_mode.load(Ordering::Relaxed) != GRAPH_RECORD {
+            return Err("no CUDA graph record is active".to_string());
+        }
+        let mut control = self
+            .graph
+            .lock()
+            .map_err(|error| format!("graph state lock: {error}"))?;
+        self.graph_mode.store(GRAPH_DIRECT, Ordering::Relaxed);
+        Ok(std::mem::take(&mut control.records))
+    }
+
+    /// Abandons an active record segment and clears its launches. A no-op when none is active.
+    pub fn graph_record_abort(&self) {
+        if self.graph_mode.load(Ordering::Relaxed) != GRAPH_RECORD {
+            return;
+        }
+        if let Ok(mut control) = self.graph.lock() {
+            control.records.clear();
+        }
+        self.graph_mode.store(GRAPH_DIRECT, Ordering::Relaxed);
+    }
+
+    /// Queues one captured graph executable on the default stream.
+    ///
+    /// The replay is one issue to the driver, ordered on the default stream exactly where the
+    /// direct launches it replaces would have been; the copies and readbacks around the segment
+    /// keep their order. The launch counter advances by one, which is what the pooled-buffer fence
+    /// needs: the replay cannot have completed before the queue reaches this point.
+    ///
+    /// # Errors
+    /// A segment is active, the id is not one this handle instantiated, or the driver rejects the
+    /// launch.
+    pub fn graph_launch(&self, graph: GraphId) -> Result<(), String> {
+        if self.graph_mode.load(Ordering::Relaxed) != GRAPH_DIRECT {
+            return Err("a CUDA graph segment is already active".to_string());
+        }
+        let control = self
+            .graph
+            .lock()
+            .map_err(|error| format!("graph state lock: {error}"))?;
+        let Some(exec) = control.execs.get(&graph.0).copied() else {
+            return Err(format!(
+                "unknown CUDA graph handle {} (it was not instantiated by this Cuda)",
+                graph.0
+            ));
+        };
+        let launch: libloading::Symbol<unsafe extern "C" fn(CuGraphExec, CuStream) -> CuResult> =
+            self.sym(b"cuGraphLaunch")?;
+        // SAFETY: the executable is owned by this handle and stays alive until Drop; the null
+        // stream is the default stream the surrounding copies use.
+        let r = unsafe { launch(exec, std::ptr::null_mut()) };
+        if r != 0 {
+            return Err(format!("cuGraphLaunch failed: {}", name(r)));
+        }
+        self.issued.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Queues recorded launches on the default stream, in order.
+    ///
+    /// This is the wrapper's fallback: a segment whose launch list changed since the capture
+    /// cannot replay the old graph, so the launches it just recorded are executed exactly as
+    /// recorded - same function handles, same grids and blocks, same argument words, same order.
+    /// Nothing is patched and nothing is approximated.
+    ///
+    /// The wrapper only enables graphs on the async launch path, where queuing without a drain is
+    /// the caller's existing contract; the next stream-ordered readback or synchronize is the
+    /// observation point.
+    ///
+    /// # Errors
+    /// A segment is active, or the driver rejects one of the launches.
+    pub fn graph_replay_records(&self, records: &[CudaLaunchRecord]) -> Result<(), String> {
+        if self.graph_mode.load(Ordering::Relaxed) != GRAPH_DIRECT {
+            return Err("a CUDA graph segment is already active".to_string());
+        }
+        let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
+        for (index, record) in records.iter().enumerate() {
+            let mut storage: Vec<[u64; 1]> = record.args.iter().map(|a| [*a]).collect();
+            let mut ptrs: Vec<*mut c_void> =
+                storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
+            // SAFETY: the record came from this handle's launch path, every argument is a u64 or a
+            // pointer to one that outlives the call, and the function handle is still loaded (the
+            // module cache owns it until Drop).
+            let r = unsafe {
+                launch(
+                    record.function as CuFunction,
+                    record.grid.0,
+                    record.grid.1,
+                    record.grid.2,
+                    record.block.0,
+                    record.block.1,
+                    record.block.2,
+                    0,
+                    std::ptr::null_mut(),
+                    ptrs.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if r != 0 {
+                return Err(format!(
+                    "recorded launch {index} ({}) failed: {}",
+                    record.describe(),
+                    name(r)
+                ));
+            }
+        }
+        self.issued
+            .fetch_add(records.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Destroys one graph executable this handle instantiated, best effort.
+    ///
+    /// The handle is not reused; a later [Cuda::graph_launch] with it fails as unknown.
+    pub fn graph_destroy(&self, graph: GraphId) {
+        let Ok(mut control) = self.graph.lock() else {
+            return;
+        };
+        if let Some(exec) = control.execs.remove(&graph.0) {
+            self.destroy_graph_exec(exec);
+        }
+    }
+
+    /// Queues (capture mode) or records (record mode) one launch for a graph segment.
+    ///
+    /// Capture mode enqueues the call on the segment's own stream, where the driver records it
+    /// instead of executing it, and keeps the record so a later call's launch list can be compared
+    /// against the captured one. Record mode does not call the driver at all: the wrapper decides
+    /// afterwards whether to replay a captured graph or to queue the recorded launches itself.
+    fn graph_segment_launch(
+        &self,
+        mode: u8,
+        kernel: Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        args: &[u64],
+    ) -> Result<(), String> {
+        let mut control = self
+            .graph
+            .lock()
+            .map_err(|error| format!("graph state lock: {error}"))?;
+        let record = CudaLaunchRecord {
+            function: kernel.function as usize,
+            grid,
+            block,
+            args: args.to_vec(),
+        };
+        match mode {
+            GRAPH_RECORD => {
+                control.records.push(record);
+                Ok(())
+            }
+            GRAPH_CAPTURE => {
+                let stream = control.capture_stream;
+                if stream.is_null() {
+                    return Err("graph capture is active without a capture stream".to_string());
+                }
+                let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
+                let mut storage: Vec<[u64; 1]> = args.iter().map(|a| [*a]).collect();
+                let mut ptrs: Vec<*mut c_void> =
+                    storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
+                // SAFETY: the symbol comes from this context's library, every argument is a u64
+                // or a pointer to one that outlives the call, and the stream is the private
+                // capture stream; the driver records this call into the graph being built.
+                let r = unsafe {
+                    launch(
+                        kernel.function,
+                        grid.0,
+                        grid.1,
+                        grid.2,
+                        block.0,
+                        block.1,
+                        block.2,
+                        0,
+                        stream,
+                        ptrs.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if r != 0 {
+                    return Err(format!(
+                        "cuLaunchKernel failed while capturing a graph: {}",
+                        name(r)
+                    ));
+                }
+                control.records.push(record);
+                Ok(())
+            }
+            _ => {
+                debug_assert!(false, "graph_segment_launch reached in direct mode");
+                Err("graph launch path reached in direct mode".to_string())
+            }
+        }
     }
 
     /// Opens libcuda.so.1, initialises the driver and makes the primary context current.
@@ -1383,6 +2001,8 @@ impl Cuda {
                 pool: Mutex::new(BufferPool::default()),
                 issued: AtomicU64::new(0),
                 completed: AtomicU64::new(0),
+                graph: Mutex::new(GraphControl::default()),
+                graph_mode: AtomicU8::new(GRAPH_DIRECT),
             })
         }
     }
@@ -1397,6 +2017,9 @@ impl Cuda {
 
     /// Allocates device memory and adds the byte count to the running total.
     pub fn alloc(&self, bytes: usize, total: &mut usize) -> Result<Deviceptr, String> {
+        if let Some(refusal) = self.graph_refusal(SegmentOp::Allocation) {
+            return Err(refusal.to_string());
+        }
         unsafe {
             let f: libloading::Symbol<unsafe extern "C" fn(*mut CuDeviceptr, usize) -> CuResult> =
                 self.sym(b"cuMemAlloc_v2")?;
@@ -1422,6 +2045,9 @@ impl Cuda {
     /// # Errors
     /// The driver's cuMemAlloc failure code.
     pub fn alloc_pooled(&self, bytes: usize, total: &mut usize) -> Result<Deviceptr, String> {
+        if let Some(refusal) = self.graph_refusal(SegmentOp::Allocation) {
+            return Err(refusal.to_string());
+        }
         let completed = self.completed.load(Ordering::Relaxed);
         if let Ok(mut pool) = self.pool.lock()
             && let Some(ptr) = pool.checkout(bytes, completed)
@@ -1449,6 +2075,10 @@ impl Cuda {
     /// asserts on the refusal (the crate's tests pin it through `BufferPool::release`) and a
     /// release build keeps the pool consistent and drops the bad entry.
     pub fn release_pooled(&self, ptrs: &[&Deviceptr]) {
+        if self.graph_refusal(SegmentOp::Release).is_some() {
+            debug_assert!(false, "release_pooled inside a CUDA graph segment");
+            return;
+        }
         let Ok(mut pool) = self.pool.lock() else {
             return;
         };
@@ -1481,6 +2111,9 @@ impl Cuda {
     /// can fill an arena once and launch kernels against it without a separate copy. Device code
     /// may migrate pages; the allocation is freed with [Cuda::free_managed] (or cuMemFree).
     pub fn alloc_managed(&self, bytes: usize, total: &mut usize) -> Result<Deviceptr, String> {
+        if let Some(refusal) = self.graph_refusal(SegmentOp::Allocation) {
+            return Err(refusal.to_string());
+        }
         unsafe {
             let f: libloading::Symbol<
                 unsafe extern "C" fn(*mut CuDeviceptr, usize, u32) -> CuResult,
@@ -1503,6 +2136,9 @@ impl Cuda {
     /// host keeps the original pointer for filling and inspection. The returned [HostMapped] owns
     /// both pointers; free it with [Cuda::free_host_mapped], not cuMemFree.
     pub fn alloc_host_mapped(&self, bytes: usize, total: &mut usize) -> Result<HostMapped, String> {
+        if let Some(refusal) = self.graph_refusal(SegmentOp::Allocation) {
+            return Err(refusal.to_string());
+        }
         unsafe {
             let alloc: libloading::Symbol<
                 unsafe extern "C" fn(*mut *mut c_void, usize, u32) -> CuResult,
@@ -1555,6 +2191,10 @@ impl Cuda {
     /// Managed memory is released through cuMemFree, the same call as an ordinary device
     /// allocation. The byte count is not tracked here; the caller's arena keeps its own total.
     pub fn free_managed(&self, ptr: &Deviceptr) {
+        if self.graph_refusal(SegmentOp::Free).is_some() {
+            debug_assert!(false, "a buffer free inside a CUDA graph segment");
+            return;
+        }
         // A queued kernel may still read this allocation; the async path waits before returning
         // the memory to the driver.
         if async_launches() {
@@ -1572,6 +2212,10 @@ impl Cuda {
 
     /// Frees an allocation returned by [Cuda::alloc_host_mapped].
     pub fn free_host_mapped(&self, mapped: &HostMapped) {
+        if self.graph_refusal(SegmentOp::Free).is_some() {
+            debug_assert!(false, "a buffer free inside a CUDA graph segment");
+            return;
+        }
         if async_launches() {
             let _ = self.synchronize();
         }
@@ -1587,6 +2231,9 @@ impl Cuda {
 
     /// Copies host bytes to a device allocation.
     pub fn copy_htod(&self, dst: &Deviceptr, src: &[u8]) -> Result<(), String> {
+        if let Some(refusal) = self.graph_refusal(SegmentOp::Copy) {
+            return Err(refusal.to_string());
+        }
         unsafe {
             let f: libloading::Symbol<
                 unsafe extern "C" fn(CuDeviceptr, *const c_void, usize) -> CuResult,
@@ -1606,6 +2253,9 @@ impl Cuda {
 
     /// Copies a device allocation back to host bytes.
     pub fn copy_dtoh(&self, dst: &mut [u8], src: &Deviceptr) -> Result<(), String> {
+        if let Some(refusal) = self.graph_refusal(SegmentOp::Copy) {
+            return Err(refusal.to_string());
+        }
         unsafe {
             let f: libloading::Symbol<
                 unsafe extern "C" fn(*mut c_void, CuDeviceptr, usize) -> CuResult,
@@ -1652,6 +2302,9 @@ impl Cuda {
     /// # }
     /// ```
     pub fn copy_dtod(&self, dst: &Deviceptr, src: &Deviceptr, bytes: usize) -> Result<(), String> {
+        if let Some(refusal) = self.graph_refusal(SegmentOp::Copy) {
+            return Err(refusal.to_string());
+        }
         // A stage copy is invisible to the host: its consumers are the kernels the caller launches
         // next, so the queued path is the same switch as [Cuda::launch]'s. Both bracket consumers
         // (stage timing, the probe meter) need the drained call's post-drain elapsed time and keep
@@ -1696,6 +2349,9 @@ impl Cuda {
         src: &Deviceptr,
         bytes: usize,
     ) -> Result<(), String> {
+        if let Some(refusal) = self.graph_refusal(SegmentOp::Copy) {
+            return Err(refusal.to_string());
+        }
         let copy: libloading::Symbol<
             unsafe extern "C" fn(CuDeviceptr, CuDeviceptr, usize, *mut c_void) -> CuResult,
         > = self.sym(b"cuMemcpyDtoDAsync_v2")?;
@@ -1764,6 +2420,61 @@ impl Cuda {
             Kernel {
                 function,
                 name: "b12x_mxfp8_dense_warp_sm121",
+            },
+        ))
+    }
+
+    /// Loads the WS-D columns-only M=1 dense symbol from its own cubin by name.
+    ///
+    /// This symbol lives in its own cubin (`kernels/b12x_mxfp8_dense_m1_sm121.cu`), not in the
+    /// pinned dense cubin: the addition must not move the pinned kernel's bytes or digest. The
+    /// pinned `b12x_mxfp8_dense_sm121` symbol stays the reference oracle and the frozen ABI id.
+    pub fn load_dense_m1(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "b12x_mxfp8_dense_m1_sm121")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "b12x_mxfp8_dense_m1_sm121",
+            },
+        ))
+    }
+
+    /// Loads the WS-D decode GEMV symbol from its own cubin by name.
+    ///
+    /// This symbol lives in its own cubin (`kernels/b12x_mxfp8_gemv_m1_sm121.cu`), not in the
+    /// pinned dense cubin: the addition must not move the pinned kernel's bytes or digest, and the
+    /// pinned `b12x_mxfp8_dense_sm121` symbol stays the reference oracle and the frozen ABI id.
+    pub fn load_dense_gemv(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        self.load_dense_gemv_mode(cubin, "b12x_mxfp8_gemv_m1_sm121")
+    }
+
+    /// Loads the SwiGLU + MX-quantise epilogue (`swiglu_mxfp8_quant_sm121`) by name.
+    ///
+    /// The shared expert's post-SwiGLU quantise is the wide (cols = 2304) shape of this entry
+    /// point: gate and up are bf16, the activation is rounded to bf16 exactly as the released model
+    /// casts it, and the result is the E4M3 + ue8m0 operand a down projection consumes.
+    pub fn load_swiglu_quant(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        self.load_dense_gemv_mode(cubin, "swiglu_mxfp8_quant_sm121")
+    }
+
+    /// Loads one instantiation of the decode GEMV by name.
+    ///
+    /// The kernel file emits one templated body as three symbols - the dense projections
+    /// (`b12x_mxfp8_gemv_m1_sm121`), the shared expert (`b12x_mxfp8_gemv_m1_nf_sm121`) and the
+    /// compressor seam (`b12x_mxfp8_gemv_m1_nf_f32a_sm121`) - all in the same cubin, so the mode
+    /// is a symbol lookup rather than a second module.
+    pub fn load_dense_gemv_mode(
+        &self,
+        cubin: &[u8],
+        symbol: &'static str,
+    ) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, symbol)?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: symbol,
             },
         ))
     }
@@ -1940,6 +2651,9 @@ impl Cuda {
                 return Ok(hit);
             }
         }
+        if let Some(refusal) = self.graph_refusal(SegmentOp::ModuleLoad) {
+            return Err(refusal.to_string());
+        }
         unsafe {
             let load: libloading::Symbol<
                 unsafe extern "C" fn(*mut CuModule, *const c_void) -> CuResult,
@@ -1986,6 +2700,10 @@ impl Cuda {
         block: (u32, u32, u32),
         args: &[u64],
     ) -> Result<(), String> {
+        let mode = self.graph_mode.load(Ordering::Relaxed);
+        if mode != GRAPH_DIRECT {
+            return self.graph_segment_launch(mode, kernel, grid, block, args);
+        }
         let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
         let mut storage: Vec<[u64; 1]> = args.iter().map(|a| [*a]).collect();
         let mut ptrs: Vec<*mut c_void> =
@@ -2033,6 +2751,12 @@ impl Cuda {
         block: (u32, u32, u32),
         args: &[u64],
     ) -> Result<(), String> {
+        // A graph segment intercepts before the bracket choice: the launch belongs to a capture
+        // stream, and a bracketed launch could not be captured at all.
+        let mode = self.graph_mode.load(Ordering::Relaxed);
+        if mode != GRAPH_DIRECT {
+            return self.graph_segment_launch(mode, kernel, grid, block, args);
+        }
         // The bracket consumers need the drain that follows each launch, so they always take the
         // synchronous path. Everything else takes the async path when the run selected it.
         if queued_dispatch_wanted() {
@@ -2148,6 +2872,9 @@ impl Cuda {
         args: &[u64],
         repeat: usize,
     ) -> Result<(Vec<f64>, f64), String> {
+        if let Some(refusal) = self.graph_refusal(SegmentOp::RepeatedLaunch) {
+            return Err(refusal.to_string());
+        }
         unsafe {
             let create: libloading::Symbol<unsafe extern "C" fn(*mut CuEvent, u32) -> CuResult> =
                 self.sym(b"cuEventCreate")?;
@@ -2237,6 +2964,10 @@ impl Cuda {
     /// pool's bookkeeping and reclaimed when the primary context is released, so Drop can never
     /// free it a second time. Return a pooled buffer with [Cuda::release_pooled] instead.
     pub fn free(&self, module: Module, ptrs: &[Deviceptr]) {
+        if self.graph_refusal(SegmentOp::Free).is_some() {
+            debug_assert!(false, "a buffer free inside a CUDA graph segment");
+            return;
+        }
         let cached = self
             .modules
             .lock()
@@ -2274,6 +3005,10 @@ impl Cuda {
     /// outlive them. As in [Cuda::free], a pointer the run-scope pool owns is forgotten from the
     /// pool's bookkeeping instead of being passed to cuMemFree.
     pub fn free_buffers(&self, ptrs: &[&Deviceptr]) {
+        if self.graph_refusal(SegmentOp::Free).is_some() {
+            debug_assert!(false, "a buffer free inside a CUDA graph segment");
+            return;
+        }
         let forgotten = self.forget_pooled(ptrs.iter().copied());
         if async_launches() {
             let _ = self.synchronize();
@@ -2302,6 +3037,11 @@ impl Drop for Cuda {
         if self.ctx.is_null() {
             return;
         }
+        // A capture still active when Drop runs has to be ended before the context is drained:
+        // cuStreamEndCapture is the only valid exit from capture state, and the executable it
+        // would produce is not wanted.
+        self.graph_capture_abort();
+        self.graph_record_abort();
         // No queued launch may outlive the handles it reads: drain first, then unload the cached
         // modules and free the pooled buffers, then release this process's context reference.
         let _ = self.synchronize();
@@ -2333,6 +3073,12 @@ impl Drop for Cuda {
                 pool.free.clear();
                 pool.sizes.clear();
                 pool.checked_in.clear();
+            }
+            if let Ok(mut control) = self.graph.lock() {
+                for (_id, exec) in std::mem::take(&mut control.execs) {
+                    self.destroy_graph_exec(exec);
+                }
+                control.next_exec = 0;
             }
             if let Ok(release_v2) =
                 self.sym::<unsafe extern "C" fn(i32) -> CuResult>(b"cuDevicePrimaryCtxRelease_v2")
@@ -2724,5 +3470,75 @@ mod async_launch_cache_tests {
         assert!(pool.checked_in.is_empty());
         // Forgetting twice is harmless and reports that the pool does not own it.
         assert!(!pool.forget(checked_in));
+    }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+
+    #[test]
+    fn a_graph_segment_refuses_every_non_launch_operation() {
+        // Capture records kernels only. Every other operation this driver can perform has to be
+        // refused with a named error while a segment is active, because running it outside the
+        // recorded graph (or letting the driver fail the capture) changes the arithmetic path.
+        for op in [
+            SegmentOp::Copy,
+            SegmentOp::Synchronize,
+            SegmentOp::Allocation,
+            SegmentOp::Free,
+            SegmentOp::Release,
+            SegmentOp::ModuleLoad,
+            SegmentOp::RepeatedLaunch,
+        ] {
+            assert!(
+                graph_segment_refusal(GRAPH_DIRECT, op).is_none(),
+                "{op:?} must run outside a segment"
+            );
+            let capture = graph_segment_refusal(GRAPH_CAPTURE, op)
+                .unwrap_or_else(|| panic!("{op:?} must be refused during capture"));
+            let record = graph_segment_refusal(GRAPH_RECORD, op)
+                .unwrap_or_else(|| panic!("{op:?} must be refused during a record"));
+            assert_eq!(capture, record, "one refusal text for both segment modes");
+            assert!(!capture.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_launch_record_identity_covers_grid_block_and_every_argument_word() {
+        // The graph wrapper replays only when the whole launch list compares equal. A changed
+        // argument word is a changed record: a moved pooled buffer or a different weight slice
+        // must never be replayed against a graph captured for the old address.
+        let base = CudaLaunchRecord {
+            function: 0x1000,
+            grid: (1, 1, 1),
+            block: (2, 1, 1),
+            args: vec![7, 8, 9],
+        };
+        let same = base.clone();
+        assert_eq!(base, same);
+        assert_eq!(base.fingerprint_words(), same.fingerprint_words());
+        assert_eq!(base.describe(), "grid 1x1x1, block 2x1x1, 3 args");
+
+        let mut pointer_moved = base.clone();
+        pointer_moved.args[1] = 0xdead_beef;
+        assert_ne!(
+            base, pointer_moved,
+            "a changed device pointer must be a different launch"
+        );
+        assert_ne!(base.fingerprint_words(), pointer_moved.fingerprint_words());
+
+        let mut grid_changed = base.clone();
+        grid_changed.grid.0 = 2;
+        assert_ne!(base, grid_changed);
+        assert_ne!(base.fingerprint_words(), grid_changed.fingerprint_words());
+
+        let mut function_changed = base.clone();
+        function_changed.function = 0x2000;
+        assert_ne!(base, function_changed);
+        assert_ne!(
+            base.fingerprint_words(),
+            function_changed.fingerprint_words()
+        );
     }
 }
