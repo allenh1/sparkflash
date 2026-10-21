@@ -96,7 +96,8 @@ __device__ __forceinline__ uint8_t spark_activation_quantize_block(
     if (lane == 0u) {
         *scale_out = scale;
     }
-    return spark_fp8_e4m3_encode(value / spark_ue8m0_decode(scale));
+    const float inv_scale = 1.0f / spark_ue8m0_decode(scale);
+    return spark_fp8_e4m3_encode(value * inv_scale);
 }
 
 extern "C" __global__ void swiglu_mxfp8_quant_sm121(

@@ -81,7 +81,7 @@ semantics in the harness.
 Cubin (pinned toolkit): `nvcc -std=c++17 -arch=sm_121a -cubin -I kernels
 kernels/moe_router_sm121.cu -o out/moe_router_sm121.cubin`, CUDA 13.0.3 (nvcc V13.0.88),
 **25,432 B, sha256
-`42f6bbdcc6cf26890f2f0b1a24718e65da4ff0d0bedee7bca9a4598018b688cc`, 0 PTX membar lines**
+`3b8823e84158e2956b19509e90f6aed02dbe68235c1a7f5d76ab438c51e53eb0`, 0 PTX membar lines**
 (measured with the same image the baseline check uses). The harness refuses any other cubin **by
 hash** before it launches it.
 

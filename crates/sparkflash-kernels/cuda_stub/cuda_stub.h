@@ -47,6 +47,11 @@ __device__ __forceinline__ __nv_bfloat16 __ushort_as_bfloat16(unsigned short bit
     return out;
 }
 
+// cuda_bf16.h: the raw-bits accessor the packed-store path uses (kernels/rmsnorm_sm121.cu).
+__device__ __forceinline__ unsigned short __bfloat16_as_ushort(__nv_bfloat16 value) {
+    return value.__x;
+}
+
 // Built-in variables and device runtime functions that CUDA declares in its headers. clang
 // already knows __syncthreads() as a builtin, so it is deliberately absent here.
 struct uint4 {
@@ -61,6 +66,17 @@ struct uint3 {
     unsigned int y;
     unsigned int z;
 };
+
+// vector_functions.h: make_uint4 is a device function, not a type, so the probe needs it declared
+// too (kernels/rmsnorm_sm121.cu packs four bf16 pairs into one 128-bit store through it).
+__device__ __forceinline__ uint4 make_uint4(unsigned int x, unsigned int y, unsigned int z, unsigned int w) {
+    uint4 out;
+    out.x = x;
+    out.y = y;
+    out.z = z;
+    out.w = w;
+    return out;
+}
 
 extern "C" __device__ const uint3 threadIdx;
 extern "C" __device__ const uint3 blockIdx;

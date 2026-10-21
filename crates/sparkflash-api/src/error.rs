@@ -25,8 +25,9 @@ pub struct ErrorBody {
     pub kind: String,
     /// Parameter that caused the error, when known.
     pub param: Option<String>,
-    /// Machine-readable error code, when known.
-    pub code: Option<String>,
+    /// The error's HTTP status as an integer, which is vLLM's `ErrorInfo.code` type
+    /// (`engine/protocol.py:54-62`: `code: int = 500`).
+    pub code: u16,
 }
 
 /// The complete OpenAI error envelope.
@@ -93,6 +94,22 @@ impl ApiError {
         )
     }
 
+    /// A 401 for a missing or wrong bearer API key.
+    ///
+    /// The body is the usual OpenAI error envelope; like every other error, the wire `code` is the
+    /// HTTP status integer (vLLM's `ErrorInfo.code` type), and `message` stays generic so a probe
+    /// cannot distinguish "missing" from "wrong" key.
+    #[must_use]
+    pub fn unauthorized() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_request_error",
+            "Unauthorized",
+            None,
+            Some("unauthorized".to_owned()),
+        )
+    }
+
     /// A 400 for a body that is not valid JSON.
     #[must_use]
     pub fn malformed_json(detail: impl fmt::Display) -> Self {
@@ -141,11 +158,18 @@ impl ApiError {
         )
     }
 
-    /// Overrides the machine-readable code.
+    /// Overrides the internal machine-readable code, which is kept for diagnostics only: the
+    /// wire `code` is always the HTTP status, as vLLM's `ErrorInfo` defines it.
     #[must_use]
     pub fn with_code(mut self, code: impl Into<String>) -> Self {
         self.code = Some(code.into());
         self
+    }
+
+    /// The internal machine-readable code, for diagnostics. It is not serialized.
+    #[must_use]
+    pub fn inner_code(&self) -> Option<&str> {
+        self.code.as_deref()
     }
 
     /// HTTP status.
@@ -162,7 +186,7 @@ impl ApiError {
                 message: self.message.clone(),
                 kind: self.kind.clone(),
                 param: self.param.clone(),
-                code: self.code.clone(),
+                code: self.status.as_u16(),
             },
         }
     }
@@ -247,7 +271,10 @@ mod tests {
             assert!(body.get(key).is_some(), "missing key {key}");
         }
         assert_eq!(body["type"], "invalid_request_error");
-        assert_eq!(body["code"], "model_not_found");
+        assert_eq!(
+            body["code"], 404,
+            "vLLM's ErrorInfo.code is the HTTP status integer"
+        );
         assert_eq!(body["param"], "model");
     }
 
@@ -257,10 +284,7 @@ mod tests {
         assert_eq!(error.status(), StatusCode::BAD_REQUEST);
         let envelope = error.envelope();
         assert_eq!(envelope.error.param.as_deref(), Some("reasoning_effort"));
-        assert_eq!(
-            envelope.error.code.as_deref(),
-            Some("invalid_reasoning_effort")
-        );
+        assert_eq!(envelope.error.code, 400);
 
         let thinking: ApiError = ReasoningError::InvalidThinking {
             value: "x".to_owned(),
@@ -276,10 +300,7 @@ mod tests {
     fn multimodal_errors_map_onto_400_envelopes() {
         let error: ApiError = MultimodalError::MalformedDataUrl("nope".to_owned()).into();
         assert_eq!(error.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            error.envelope().error.code.as_deref(),
-            Some("invalid_image_data_url")
-        );
+        assert_eq!(error.envelope().error.code, 400);
         assert_eq!(error.envelope().error.param.as_deref(), Some("image_url"));
     }
 }

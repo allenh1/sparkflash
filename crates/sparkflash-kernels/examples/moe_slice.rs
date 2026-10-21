@@ -43,7 +43,7 @@ const TOP_K: usize = MOE_TOP_K;
 const WIDTH_PADDED: usize = MOE_WIDTH_PADDED; // 640
 const PACKED_ROW: usize = MOE_WEIGHT_BYTES_PER_ROW; // 320
 const SCALE_ROW: usize = MOE_SCALE_BYTES_PER_ROW; // 20
-const TILE_D: usize = 256; // SPARK_M4_MOE_TILE_D, one output element per thread
+const TILE_D: usize = 32; // SPARK_M4_MOE_TILE_D, 8 parallel K groups per block
 const THREADS: u32 = 256;
 
 // Global (all four ranks) shapes as the checkpoint stores them.
@@ -435,6 +435,14 @@ fn main() -> Result<(), String> {
     // One launch by default, exactly as before --repeat existed. With --repeat the uploads, the
     // comparison and the rank/pad check are unchanged; only the launches inside the timed region
     // are repeated.
+    //
+    // --repeat is a TIMING switch only, and the comparison is valid only at repeat == 1: the
+    // accumulator is zeroed once above and the kernel ADDS every rank's partials into it, so N
+    // launches leave N times one launch's partials in the buffer while reference_acc is one
+    // launch. At repeat > 1 the "rank accumulator" line therefore compares N launches against one
+    // and is expected to read 0 exact; it is not a correctness bar. Harnesses that adjudicate this
+    // kernel must use the default single launch (window-kernels.sh runs a separate --repeat row for
+    // the timing).
     let mut timing = None;
     if args.repeat > 1 {
         timing = Some(cuda.launch_repeated(func, grid, block, &params, args.repeat)?);
@@ -502,6 +510,14 @@ fn main() -> Result<(), String> {
     );
     println!("max abs delta: {max_delta:e}");
     println!("rank-1..3 tail zero and pad tail zero in every uploaded row: {pad_clean}");
+    // The launch's own declared traffic: the weights of the slots it actually routes to, the
+    // activation rows and their scales, and the f32 slot accumulator the combine reads then
+    // rewrites. The staged arena holds every uploaded expert, so its length is NOT the launch's
+    // traffic: one decode token reads TOP_K experts, not the whole arena.
+    let routed_weight_bytes = args.tokens * TOP_K * W2_OUT * (PACKED_ROW + SCALE_ROW);
+    let launch_traffic_bytes =
+        (routed_weight_bytes + act_fp8.len() + act_scales.len() + args.tokens * TOP_K * HIDDEN * 4)
+            as u64;
     if let Some((mut per_launch, batched_ms)) = timing {
         per_launch.sort_by(|a, b| a.partial_cmp(b).expect("event times are finite"));
         let n = per_launch.len();
@@ -513,6 +529,14 @@ fn main() -> Result<(), String> {
             per_launch[0],
             per_launch[n / 2],
             per_launch[n - 1]
+        );
+        println!(
+            "{}",
+            sparkflash_kernels::roofline::line(
+                "b12x_mxfp4_moe_sm121",
+                launch_traffic_bytes,
+                per_launch[n / 2]
+            )
         );
         println!("batched ms/launch over {n} launches: {batched_ms:.4}");
         println!(

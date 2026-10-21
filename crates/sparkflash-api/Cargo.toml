@@ -6,6 +6,11 @@ license.workspace = true
 authors.workspace = true
 description = "OpenAI/Anthropic-compatible HTTP+SSE server for SparkFlash-RS"
 
+[features]
+# Exposes the synthetic four-rank token-envelope writers for other crates' host tests. The records
+# are paper values (UNMEASURED); the feature adds no device dependency.
+device-token-fixtures = []
+
 [dependencies]
 sparkflash-trace = { workspace = true }
 sparkflash-engram = { workspace = true }
@@ -36,3 +41,8 @@ tower = { workspace = true }
 http-body-util = { workspace = true }
 tempfile = { workspace = true }
 sha2 = { workspace = true }
+
+[[example]]
+name = "write_device_window"
+# The synthetic window writers live behind the fixtures feature; the default build has no example.
+required-features = ["device-token-fixtures"]

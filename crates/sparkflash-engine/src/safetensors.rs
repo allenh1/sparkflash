@@ -555,6 +555,34 @@ fn checked_header_len(header_len: u64, file_len: u64, source: &str) -> Result<u6
 /// gathers the wanted ranges out of that buffer, instead of one seek+read per range.
 const GATHER_FROM_WHOLE_TENSOR_RANGES: usize = 16;
 
+/// Largest stored tensor region [SafeTensorsSource::read_ranges] may materialise in one buffer to
+/// serve a many-range read.
+///
+/// The shortcut exists for column slices of ordinary resident tensors and is only safe while the
+/// region is small. A paged read of the Engram embed table asks for 24 rows of a 98.3 GB tensor;
+/// materialising the table to gather them was an out-of-memory kill (m1y15, first Engram read). The
+/// cap is far above every tensor the four-rank arena boot reads through this call - the largest
+/// many-range one is an attention-row shard at 20,992,000 bytes - and far below the tables, so the
+/// boot keeps its whole-gather path while a paged table goes range by range.
+pub const GATHER_WHOLE_TENSOR_MAX_BYTES: u64 = 1 << 30;
+
+/// Whether a range read of a total_bytes stored region with range_count ranges may materialise the
+/// region in one buffer.
+///
+/// This is the policy [SafeTensorsSource::read_ranges] applies: a many-range read takes the
+/// whole-tensor path only when the region fits the memory cap. It is one named rule so the reader
+/// and its tests cannot disagree about the branch, and so the cap is set in exactly one place.
+#[must_use]
+pub fn gathers_whole_tensor(
+    total_bytes: u64,
+    range_count: usize,
+    whole_tensor_max_bytes: u64,
+) -> bool {
+    range_count > GATHER_FROM_WHOLE_TENSOR_RANGES
+        && total_bytes > 0
+        && total_bytes <= whole_tensor_max_bytes
+}
+
 /// A [WeightSource] over a directory of safetensors shards plus the checkpoint index.
 ///
 /// The index answers names() and which shard holds a name; the shard's header answers the dtype,
@@ -709,7 +737,7 @@ impl SafeTensorsSource {
 }
 
 impl SafeTensorsSource {
-    /// Reads named byte ranges of one tensor, without materialising the tensor.
+    /// Reads named byte ranges of one tensor.
     ///
     /// This is the call a paged reader makes for a table too large to hold. It deliberately does not
     /// consult this source's refusal list: the list exists to stop a whole-table read under the
@@ -717,12 +745,46 @@ impl SafeTensorsSource {
     /// would otherwise apply. Each range is checked against the bytes the shard actually stores for
     /// the tensor - the header's data_offsets, not the plan's logical size, because a packed expert
     /// stores half as many bytes as its logical shape - and the ranges are concatenated in the order
-    /// given.
+    /// given. A many-range read may read the whole stored region to serve the ranges when the region
+    /// fits [GATHER_WHOLE_TENSOR_MAX_BYTES]; [SafeTensorsSource::read_ranges_paged] suppresses that
+    /// shortcut for a table that must never be materialised.
     ///
     /// # Errors
     /// [WeightError::Missing] when the name is not in the index or its shard, [WeightError::Malformed]
     /// when a range falls outside the tensor, [WeightError::Io] when the shard cannot be read.
     pub fn read_ranges(&self, name: &str, ranges: &[(u64, usize)]) -> Result<Vec<u8>, WeightError> {
+        self.read_ranges_with_policy(name, ranges, GATHER_WHOLE_TENSOR_MAX_BYTES)
+    }
+
+    /// [SafeTensorsSource::read_ranges] with every whole-tensor fast path suppressed: each range is
+    /// one seek and one read, whatever the range count, so a paged read can never materialise a
+    /// table whose stored region is tens of GB.
+    ///
+    /// # Errors
+    /// As [SafeTensorsSource::read_ranges].
+    pub fn read_ranges_paged(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Result<Vec<u8>, WeightError> {
+        self.read_ranges_with_policy(name, ranges, 0)
+    }
+
+    /// The policy-parameterised form of [SafeTensorsSource::read_ranges].
+    ///
+    /// whole_tensor_max_bytes is the largest stored region a many-range read may materialise in one
+    /// buffer. [SafeTensorsSource::read_ranges] passes [GATHER_WHOLE_TENSOR_MAX_BYTES] and
+    /// [SafeTensorsSource::read_ranges_paged] passes 0, which forces every range to its own read.
+    /// Public so a tiny container can exercise both branches of [gathers_whole_tensor].
+    ///
+    /// # Errors
+    /// As [SafeTensorsSource::read_ranges].
+    pub fn read_ranges_with_policy(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+        whole_tensor_max_bytes: u64,
+    ) -> Result<Vec<u8>, WeightError> {
         let (shard, header) = self.resolve(name)?;
         let descriptor = header.tensor(name)?;
         let (begin, finish) = (descriptor.data_offsets[0], descriptor.data_offsets[1]);
@@ -749,7 +811,16 @@ impl SafeTensorsSource {
         // the wanted ranges out of that buffer: for a column shard this reads the full tensor on
         // each rank (4x the shard bytes per rank) but at sequential device speed instead of
         // 160M seek+read pairs. Ranges are still identical byte-for-byte.
-        if ranges.len() > GATHER_FROM_WHOLE_TENSOR_RANGES {
+        //
+        // The shortcut materialises the whole region, so it is bounded by the memory cap as well as
+        // the range count: 24 rows of the 98.3 GB Engram table must take the per-range path, or the
+        // gather allocates 98 GB and the node kills the process (m1y15). Below the cap the boot's
+        // measured path is unchanged; above it the read falls through to the bounded seek path.
+        debug_assert!(
+            !gathers_whole_tensor(total, ranges.len(), whole_tensor_max_bytes)
+                || total <= whole_tensor_max_bytes
+        );
+        if gathers_whole_tensor(total, ranges.len(), whole_tensor_max_bytes) {
             let total_len = usize::try_from(total).map_err(|_| WeightError::Malformed {
                 name: name.to_string(),
                 detail: format!("tensor region of {total} bytes does not fit usize"),
@@ -853,6 +924,16 @@ impl WeightSource for SafeTensorsSource {
         ranges: &[(u64, usize)],
     ) -> Option<Result<Vec<u8>, WeightError>> {
         Some(SafeTensorsSource::read_ranges(self, name, ranges))
+    }
+
+    /// The paged form reads range by range and never buffers a whole region, so a source with a
+    /// fast whole-region path cannot turn a paged read into a large allocation.
+    fn read_ranges_paged(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Option<Result<Vec<u8>, WeightError>> {
+        Some(SafeTensorsSource::read_ranges_paged(self, name, ranges))
     }
 
     /// Every name in the index, in sorted order.

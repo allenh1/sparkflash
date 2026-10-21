@@ -1193,6 +1193,11 @@ and four-shard block assembly, and the attention/tail seams named in the c4a/c4b
 four-shard block-max/argmax assembly is still host, so c4c/c4c-norm cannot claim a device token.
 Criterion 1 remains OPEN until a full 130+8 run meets section 4.3 items 1-6.**
 
+Single-stream decode and the batched-reduce drop are a separate contract: for one position the
+head needs the four rank screens plus the exact f32 logit gather, not the batched reduce that the
+verify path uses. The harness m27_head_tail, its exactness table, the launch inventory and the
+head-stage evidence contract are in [head-tail-contract.md](head-tail-contract.md) (task-16, WS-C).
+
 ### c4c window b38: MID-RUN STAGING FAILURE - duplicated `shared_experts` in the host-twin name
 
 Window b38 ran `sparkflash_m3c_c4c_6927573_aarch64` and aborted after the layer-0 attention and

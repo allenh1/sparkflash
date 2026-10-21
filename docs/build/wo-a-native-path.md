@@ -86,7 +86,7 @@ representative of the operand wo_a is called with.
 ## Cubin
 
 b12x_bf16a_mxfp8w_wo_a_sm121 is pinned in crates/sparkflash-kernels/baseline/kernel_baseline.txt at
-8,976 B, sha256 99bcd7ccd7e8f6993fb9070381d94bcef3d527c353ad2f2417e561e528fbcc08, 0 PTX membar lines.
+8,976 B, sha256 d11a8610ff557617116c437b0bc7a0367f66a8069ccfc97373433ebd99ffd249, 0 PTX membar lines.
 It recompiles on the node with nvcc 13.0.88 (CUDA 13.0.3):
 
     /usr/local/cuda/bin/nvcc -std=c++17 -arch=sm_121a -cubin -I kernels \

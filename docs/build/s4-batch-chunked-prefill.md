@@ -10,6 +10,13 @@ not change the model's output.
 Nothing on this page is a performance claim. Section 5 names every measurement a window must
 supply, and claims none of them.
 
+**Update, 2026-10-21 (task-13):** the chunked-prefill policy below is the policy both reference
+engine paths call (the serial driver and the opt-in `--continuous-batching` host scheduler); the
+host A/B census in [s4-host-continuous-batching.md](s4-host-continuous-batching.md) measures the
+reachable batching mode. Cross-request prefill-chunk interleaving is still not implemented (a
+prompt's prefill is one scheduler step, and the default 4096-token chunk makes a short host prompt
+one chunk), and the device measurements remain window work.
+
 ## 1. What S4 has to mean, and what this slice can mean host-side
 
 `serving-parity-plan.md` section 0 gate B lists "paging, continuous batching and chunked prefill,

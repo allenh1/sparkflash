@@ -1,0 +1,38 @@
+{
+ "schema": "sparkflash-native-rounding-moe-input/1",
+ "purpose": "captured m26 stage input: the exact per-rank MoE input of the m1y5 layer-0 t1 measurement (rank 0 bundle)",
+ "layer": 0,
+ "hidden": 5120,
+ "inter_padded": 640,
+ "inter_per_rank": 576,
+ "mode": "device",
+ "expert_ids": [
+  110,
+  210,
+  341,
+  373,
+  324,
+  206
+ ],
+ "expert_ids_sha256": "7f3bf4ef6b64ec9e39e22260b9cc0408b7163ff040be8be76b9bcefd311e2418",
+ "source_record": "/home/user/ev-session-20261020/window/m1y5/kernel-m26-adjudication/raw/m26-l0-t1.json",
+ "source_record_sha256": "0ab1f3f5bd05acf90ebc36a2de1e51632d550d0264df8e049fd6d236a5bb9fa2",
+ "files": {
+  "m26-pre_ffn_hidden.f32": {
+   "bytes": 20480,
+   "sha256": "5cb581a460b0477bf43d9645e2db54d67ff8e5296355d301ad18e06ef7887c26",
+   "source": "/home/user/ev-session-20261020/window/m1y15/rank0/moe-stage-input/pre_ffn_hidden.f32"
+  },
+  "m26-act_fp8.bin": {
+   "bytes": 5120,
+   "sha256": "cd046f93caaf65101666f148fef7ac0871654a7c1984db2278041f73db754e3f",
+   "source": "/home/user/ev-session-20261020/window/m1y15/rank0/moe-stage-input/act_fp8.bin"
+  },
+  "m26-act_scales.bin": {
+   "bytes": 160,
+   "sha256": "29edb9864c76316743926cf4b73fc763b48b1d9853db092b94202850687fae5c",
+   "source": "/home/user/ev-session-20261020/window/m1y15/rank0/moe-stage-input/act_scales.bin"
+  }
+ },
+ "note": "moe-stage-input/ is the m26 --input convention for rank 0; the expert ids are the router row the device run used. Weights are not in the bundle and are a deterministic test fixture in the twin."
+}

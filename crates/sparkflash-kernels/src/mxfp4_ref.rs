@@ -68,6 +68,14 @@ pub const MOE_SCALE_BYTES_PER_ROW: usize = MOE_WIDTH_PADDED / QUANT_BLOCK;
 /// routing weight is applied before quantisation (model.py:849-851).
 pub const MOE_ACT_BYTES_PER_TOKEN: usize = MOE_TOP_K * MOE_ACT_BYTES_PER_ROW;
 
+/// The stored per-rank code row: the released plan's real 576-value slice, two FP4 per byte.
+pub const MOE_STORED_CODE_ROW: usize = MOE_WIDTH / FP4_PER_BYTE;
+/// The stored per-rank scale row: one ue8m0 byte per 32 real values; a SEPARATE tensor from the
+/// code rows, not a tail of a wider row.
+pub const MOE_STORED_SCALE_ROW: usize = MOE_WIDTH / QUANT_BLOCK;
+/// The MX blocks the stored kernel walks: 576 / 32, with no padding block.
+pub const MOE_STORED_K_BLOCKS: usize = MOE_STORED_SCALE_ROW;
+
 /// The pre-padded row strides the MoE kernel reads, as an explicit contract rather than an
 /// implicit use of `MOE_SCALE_BYTES_PER_ROW`.
 ///
@@ -335,6 +343,164 @@ pub fn moe_combine_rank(
     cost
 }
 
+/// The stored row layout b12x_mxfp4_moe_stored_sm121.cu reads: the released per-rank plan's real
+/// 576-wide rows, with the activation operand left in the A8 chain layout.
+///
+/// The two weight tensors are separate: w2.weight is [experts][d][288] packed FP4 codes and
+/// w2.scale is [experts][d][18] ue8m0 bytes. A row therefore costs 288 + 18 = 306 bytes across
+/// the two tensors, but neither tensor has a 306-byte stride - the scale grid advances 18 bytes per
+/// output row. The activation side is deliberately the A8 chain layout the incumbent kernel reads
+/// (640 E4M3 bytes and a 20-byte scale grid per routed row): the chain quantises the activation
+/// before the weight layout is known, so a switch to the stored kernel must not re-stage it, and the
+/// stored kernel reads only the first 18 of the 20 scale blocks and only columns 0..575.
+#[must_use]
+pub const fn stored_moe_layout() -> MoeRowLayout {
+    MoeRowLayout {
+        activation_row_bytes: MOE_ACT_BYTES_PER_ROW,
+        activation_scale_row_bytes: MOE_SCALE_BYTES_PER_ROW,
+        weight_row_bytes: MOE_STORED_CODE_ROW,
+        weight_scale_row_bytes: MOE_STORED_SCALE_ROW,
+    }
+}
+
+/// # Errors
+/// Returns a description of the first stride that does not match the stored layout, which is what
+/// turns a silent row misindex into a loud rejection. In particular a caller that emits interleaved
+/// 306-byte rows (the cost of one output row, not a stride) is rejected here: the stored kernel
+/// reads the code rows and the scale rows from two different tensors.
+pub fn check_stored_moe_layout(layout: MoeRowLayout) -> Result<(), String> {
+    let expected = stored_moe_layout();
+    for (name, got, want) in [
+        (
+            "activation",
+            layout.activation_row_bytes,
+            expected.activation_row_bytes,
+        ),
+        (
+            "activation scale",
+            layout.activation_scale_row_bytes,
+            expected.activation_scale_row_bytes,
+        ),
+        (
+            "stored weight code",
+            layout.weight_row_bytes,
+            expected.weight_row_bytes,
+        ),
+        (
+            "stored weight scale",
+            layout.weight_scale_row_bytes,
+            expected.weight_scale_row_bytes,
+        ),
+    ] {
+        if got != want {
+            return Err(format!(
+                "the {name} row stride is {got} bytes, but b12x_mxfp4_moe_stored_sm121 walks                  {want}: an interleaved 306-byte row or a padded 320/20 row would misindex every                  row after the first"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One TP rank's W4A8 down-projection partial on the RELEASED STORED layout: the host twin of
+/// b12x_mxfp4_moe_stored_sm121.cu.
+///
+/// The arithmetic is [moe_combine_rank]'s with the stored row contract: w is the rank's contiguous
+/// [experts][d][288] code tensor, w_scales its separate [experts][d][18] ue8m0 tensor, and the loop
+/// walks the 18 real MX blocks instead of the 20 padded ones. The activation operand is the SAME A8
+/// operand [moe_combine_rank] reads (padded 640/20 rows, columns >= 576 masked by the incumbent);
+/// this module handles no padding on the weight side, so the stored kernel needs no mask at all.
+///
+/// The two kernels are NOT bit-comparable against each other on one buffer: they read different K
+/// widths. Exactness is stated against this twin on the same stored bytes, and the de-interleave
+/// test proves the stride handling by rebuilding the padded rows and requiring both twins to agree
+/// bit-for-bit. The f32 accumulator contract is unchanged: no rounding here, one f32 add per
+/// 32-value block in ascending block order, and the caller finalises with [moe_combine_finalize].
+///
+/// # Panics
+/// Panics if the accumulator length, an activation operand length or an expert index is wrong, or if
+/// a weight buffer is too short for the declared stored shape.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn moe_combine_rank_stored(
+    slot_acc: &mut [f32],
+    act_fp8: &[u8],
+    act_scales: &[u8],
+    w: &[u8],
+    w_scales: &[u8],
+    expert_ids: &[u32],
+    tokens: usize,
+    hidden_dim: usize,
+    experts: usize,
+) -> MoeCost {
+    let routed_rows = tokens * MOE_TOP_K;
+    assert_eq!(
+        slot_acc.len(),
+        routed_rows * hidden_dim,
+        "the slot accumulator holds one f32 per (routed row, hidden index)"
+    );
+    assert!(
+        act_fp8.len() >= routed_rows * MOE_ACT_BYTES_PER_ROW,
+        "the activation operand is the A8 chain layout: {} bytes per routed row",
+        MOE_ACT_BYTES_PER_ROW
+    );
+    assert!(
+        act_scales.len() >= routed_rows * MOE_SCALE_BYTES_PER_ROW,
+        "the activation scale grid is {} ue8m0 bytes per routed row",
+        MOE_SCALE_BYTES_PER_ROW
+    );
+    assert!(
+        w.len() >= experts * hidden_dim * MOE_STORED_CODE_ROW,
+        "the stored weight buffer is too short: {experts} experts x {hidden_dim} outputs x          {MOE_STORED_CODE_ROW} code bytes"
+    );
+    assert!(
+        w_scales.len() >= experts * hidden_dim * MOE_STORED_SCALE_ROW,
+        "the stored scale buffer is too short: {experts} experts x {hidden_dim} outputs x          {MOE_STORED_SCALE_ROW} scale bytes"
+    );
+    let mut cost = MoeCost::default();
+    for token in 0..tokens {
+        for column in 0..hidden_dim {
+            let slot_base = token * MOE_TOP_K;
+            for slot in 0..MOE_TOP_K {
+                let routed_row = slot_base + slot;
+                let expert = expert_ids[routed_row] as usize;
+                assert!(expert < experts, "expert index {expert} is out of range");
+                // The A operand is the chain layout; only the first MOE_WIDTH columns are real and
+                // only the first MOE_STORED_K_BLOCKS of its 20-byte scale grid are read.
+                let act_row =
+                    &act_fp8[routed_row * MOE_ACT_BYTES_PER_ROW..][..MOE_ACT_BYTES_PER_ROW];
+                let act_scale_row =
+                    &act_scales[routed_row * MOE_SCALE_BYTES_PER_ROW..][..MOE_SCALE_BYTES_PER_ROW];
+                let weight_row = expert * hidden_dim + column;
+                let w_row = &w[weight_row * MOE_STORED_CODE_ROW..][..MOE_STORED_CODE_ROW];
+                let w_scale_row =
+                    &w_scales[weight_row * MOE_STORED_SCALE_ROW..][..MOE_STORED_SCALE_ROW];
+                let mut acc = 0.0f32;
+                for block in 0..MOE_STORED_K_BLOCKS {
+                    let base = block * QUANT_BLOCK;
+                    let act_scale = ue8m0_decode(act_scale_row[block]);
+                    let w_scale = ue8m0_decode(w_scale_row[block]);
+                    let mut partial = 0.0f32;
+                    for i in 0..QUANT_BLOCK {
+                        let index = base + i;
+                        // No mask: base + i is a real K value here. The A operand still has the
+                        // padded columns, but this loop never addresses them.
+                        let act_value = fp8_e4m3_decode(act_row[index]);
+                        let w_value = fp8_e4m3_decode(fp8_e4m3_encode(fp4_load(w_row, index)));
+                        partial += act_value * w_value;
+                        cost.macs += 1;
+                    }
+                    acc += (partial * act_scale) * w_scale;
+                    cost.weight_bytes += (QUANT_BLOCK / FP4_PER_BYTE) as u64;
+                    cost.activation_bytes += QUANT_BLOCK as u64;
+                    cost.scale_bytes += 2;
+                }
+                slot_acc[routed_row * hidden_dim + column] += acc;
+            }
+        }
+    }
+    cost
+}
+
 /// The slots of one token in ascending expert-id order, as native adds them.
 ///
 /// model.py:899-903 iterates the routed experts in ascending expert-id order (for i in range(...):
@@ -405,6 +571,71 @@ pub fn moe_combine_routed_f32(
         }
     }
     routed
+}
+
+/// The cross-rank f32 sum of every rank's slot accumulator: the operand of the native combine in
+/// a tensor-parallel MoE.
+///
+/// Native sums the ranks in f32 before any bf16 rounding: the release's `y` is `float32`, every
+/// expert output is added into it, and `dist.all_reduce(y)` runs on that f32 tensor
+/// (model.py:893-900); the single MoE rounding is after the shared expert add (model.py:903-904).
+/// A rank-partial bf16 round, or a bf16 all-reduce payload, is not that arithmetic. The ranks are
+/// added in ascending rank order, the canonical order
+/// `sparkflash_comm::reduce::canonical_all_reduce_into` uses; NCCL's own f32 reduce order is not
+/// part of the release's source, so the order is declared rather than derived from it.
+///
+/// # Panics
+/// Panics if `rank_slot_accs` is empty or if a rank's length is not
+/// `tokens * MOE_TOP_K * hidden_dim`.
+#[must_use]
+pub fn moe_combine_rank_sum(
+    rank_slot_accs: &[&[f32]],
+    tokens: usize,
+    hidden_dim: usize,
+) -> Vec<f32> {
+    assert!(
+        !rank_slot_accs.is_empty(),
+        "the native combine needs at least one rank"
+    );
+    let expected = tokens * MOE_TOP_K * hidden_dim;
+    for (rank, acc) in rank_slot_accs.iter().enumerate() {
+        assert_eq!(
+            acc.len(),
+            expected,
+            "rank {rank}'s slot accumulator is {} values, not {tokens} x {MOE_TOP_K} x {hidden_dim}",
+            acc.len()
+        );
+    }
+    let mut sum = vec![0.0f32; expected];
+    for acc in rank_slot_accs {
+        for (total, value) in sum.iter_mut().zip(acc.iter()) {
+            *total += *value;
+        }
+    }
+    sum
+}
+
+/// One complete native MoE output for a tensor-parallel rank set: the cross-rank f32 slot sum, the
+/// per-expert bf16 rounds in ascending expert-id order, the shared expert's bf16 output added, and
+/// the one MoE bf16 round (model.py:893-904, with the residual left to `hc_post`).
+///
+/// This is the combine the four-rank loop's native arm runs: [moe_combine_rank_sum] feeds
+/// [moe_combine_finalize], and the result is the bf16 row `hc_post` then mixes into the f32
+/// residual stream. The loop's current chain instead finalises each rank's partial and bf16-rounds
+/// the payload before the canonical bf16 all-reduce, and adds the shared expert in f32 afterwards.
+///
+/// # Panics
+/// Panics when [moe_combine_rank_sum] or [moe_combine_finalize] would.
+#[must_use]
+pub fn moe_combine_native(
+    rank_slot_accs: &[&[f32]],
+    shared: &[u16],
+    expert_ids: &[u32],
+    tokens: usize,
+    hidden_dim: usize,
+) -> Vec<u16> {
+    let full = moe_combine_rank_sum(rank_slot_accs, tokens, hidden_dim);
+    moe_combine_finalize(&full, shared, expert_ids, tokens, hidden_dim)
 }
 
 /// The full native MoE output for one token block: the routed f32 sum, the shared expert's bf16
@@ -970,6 +1201,196 @@ mod tests {
         assert_eq!(routed[0], 384.0);
     }
 
+    /// One captured-activation fixture committed for the native-rounding twin tests. The source
+    /// paths and digests are in `tests/fixtures/native-rounding/m26-stage-input.json`.
+    fn native_rounding_fixture(name: &str) -> Vec<u8> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/native-rounding")
+            .join(name);
+        std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+    }
+
+    /// The captured m26 expert ids, read from the committed stage-input record without a JSON
+    /// dependency: the file is a checked-in fixture, not an untrusted input.
+    fn captured_expert_ids() -> Vec<u32> {
+        let text = String::from_utf8(native_rounding_fixture("m26-stage-input.json"))
+            .expect("the fixture record is UTF-8");
+        text.split_once("\"expert_ids\": [")
+            .expect("the record names the expert ids")
+            .1
+            .split(']')
+            .next()
+            .expect("the id list is closed")
+            .split(',')
+            .map(|id| id.trim().parse::<u32>().expect("an integer expert id"))
+            .collect()
+    }
+
+    /// The captured m26 MoE input row decoded to f32: E4M3 codes times the per-32 ue8m0 scales.
+    fn captured_activation() -> Vec<f32> {
+        let codes = native_rounding_fixture("m26-act_fp8.bin");
+        let scales = native_rounding_fixture("m26-act_scales.bin");
+        assert_eq!(codes.len(), scales.len() * 32);
+        let mut values = Vec::with_capacity(codes.len());
+        for block in 0..scales.len() {
+            let scale = crate::m4_quant::ue8m0_decode(scales[block]);
+            for code in &codes[block * 32..(block + 1) * 32] {
+                values.push(crate::m4_quant::fp8_e4m3_decode(*code) * scale);
+            }
+        }
+        values
+    }
+
+    /// The captured FFN input rounded to bf16: the dtype the released shared Expert returns
+    /// (model.py:903). It plays the shared-expert output in the twin; m17b owns the real GEMM.
+    fn captured_shared_stand_in(hidden_dim: usize) -> (Vec<u16>, Vec<f32>) {
+        let bytes = native_rounding_fixture("m26-pre_ffn_hidden.f32");
+        assert_eq!(bytes.len(), hidden_dim * 4);
+        let bits: Vec<u16> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| bf16_bits(f32::from_le_bytes(*word)))
+            .collect();
+        let values: Vec<f32> = bits.iter().map(|bits| bf16_value(*bits)).collect();
+        (bits, values)
+    }
+
+    /// Deterministic stand-ins for the four rank down-projection partials, driven by the captured
+    /// activation values. The committed bundle holds the device run's `--input` bytes, not its
+    /// rank accumulators or the checkpoint weights (the checkpoint is not on this host), so the
+    /// row-to-partial map is a documented fixture map. The epilogue arithmetic under test does not
+    /// depend on how the partials were produced.
+    fn captured_rank_partials(activation: &[f32]) -> Vec<Vec<f32>> {
+        let hidden_dim = activation.len();
+        let mut ranks = Vec::with_capacity(4);
+        for rank in 0..4usize {
+            let mut acc = vec![0.0f32; MOE_TOP_K * hidden_dim];
+            for slot in 0..MOE_TOP_K {
+                for column in 0..hidden_dim {
+                    let source = (column * 7 + rank * 13 + slot * 29) % hidden_dim;
+                    let weight = 1.0 + ((column + rank * 17 + slot * 31) % 13) as f32 / 16.0;
+                    acc[slot * hidden_dim + column] =
+                        activation[source] * weight - 0.001 * rank as f32;
+                }
+            }
+            ranks.push(acc);
+        }
+        ranks
+    }
+
+    #[test]
+    fn the_native_combine_is_the_release_arithmetic_on_a_captured_activation() {
+        let ids = captured_expert_ids();
+        assert_eq!(
+            ids.len(),
+            MOE_TOP_K,
+            "the captured router row has one id per slot"
+        );
+        let activation = captured_activation();
+        let hidden_dim = activation.len();
+        let ranks = captured_rank_partials(&activation);
+        let slices: Vec<&[f32]> = ranks.iter().map(Vec::as_slice).collect();
+        let (shared, shared_f32) = captured_shared_stand_in(hidden_dim);
+
+        let native = moe_combine_native(&slices, &shared, &ids, 1, hidden_dim);
+
+        // The independent release reference: model.py:893-904. Each expert's w2 output is the f32
+        // sum of the ranks' partials rounded once to bf16; the bf16 experts are added in ascending
+        // expert-id order; the bf16 shared output is added; the MoE output is rounded once.
+        let order = moe_combine_slot_order(&ids, 0);
+        let mut reference = vec![0u16; hidden_dim];
+        for (column, expected) in reference.iter_mut().enumerate() {
+            let mut experts = [0.0f32; MOE_TOP_K];
+            for slot in 0..MOE_TOP_K {
+                let mut sum = 0.0f32;
+                for rank in &ranks {
+                    sum += rank[slot * hidden_dim + column];
+                }
+                experts[slot] = bf16_value(bf16_bits(sum));
+            }
+            let mut routed = 0.0f32;
+            for slot in order {
+                routed += experts[slot];
+            }
+            *expected = bf16_bits(routed + shared_f32[column]);
+        }
+        assert_eq!(
+            native, reference,
+            "the native combine must be the release arithmetic bit for bit"
+        );
+
+        // The loop chain as it runs today (tp4_forward.rs run_layer_moe_routed + epilogue): each
+        // rank finalises its own partial and bf16-rounds the payload before the canonical bf16
+        // all-reduce, and the shared expert is added in f32 afterwards. The comparison rounds at
+        // the same MoE-output boundary so the rank-partial/payload term is isolated from the
+        // separate missing-final-round term.
+        let mut reduced = vec![0.0f32; hidden_dim];
+        for rank in &ranks {
+            let routed = moe_combine_routed_f32(rank, &ids, 1, hidden_dim);
+            for (total, value) in reduced.iter_mut().zip(routed.iter()) {
+                *total += bf16_value(bf16_bits(*value));
+            }
+        }
+        let current: Vec<u16> = reduced
+            .iter()
+            .zip(shared_f32.iter())
+            .map(|(routed, shared)| bf16_bits(routed + shared))
+            .collect();
+        let mut mismatches = 0usize;
+        let mut max_abs = 0.0f32;
+        for (current, native) in current.iter().zip(native.iter()) {
+            if current != native {
+                mismatches += 1;
+                let difference = bf16_value(*current) - bf16_value(*native);
+                max_abs = max_abs.max(difference.abs());
+            }
+        }
+        assert!(
+            mismatches > 0,
+            "the captured fixture must distinguish the loop chain from the native epilogue"
+        );
+        assert!(
+            max_abs > 0.0,
+            "a differing bf16 slot must carry a non-zero delta"
+        );
+        let mut delta_l2 = 0.0f64;
+        let mut native_l2 = 0.0f64;
+        for (current, native) in current.iter().zip(native.iter()) {
+            let (current, native) = (
+                f64::from(bf16_value(*current)),
+                f64::from(bf16_value(*native)),
+            );
+            delta_l2 += (current - native) * (current - native);
+            native_l2 += native * native;
+        }
+        eprintln!(
+            "captured m26 activation: loop chain vs native combine {mismatches}/{hidden_dim} bf16 slots differ, max |delta| {max_abs:e}, relative L2 {:.6e}",
+            (delta_l2 / native_l2).sqrt()
+        );
+    }
+
+    #[test]
+    fn the_rank_sum_adds_in_ascending_rank_order() {
+        // The rank order is part of the arithmetic (f32 addition is not associative). Three ranks
+        // with 1e20, -1e20 and 1.0: the ascending order keeps the 1.0 because it is added after the
+        // two large values cancel; the reverse order loses it. If moe_combine_rank_sum ever
+        // reassociates or reorders, this test moves.
+        let mut top = vec![0.0f32; MOE_TOP_K];
+        top[0] = 1e20;
+        let mut bottom = vec![0.0f32; MOE_TOP_K];
+        bottom[0] = -1e20;
+        let mut one = vec![0.0f32; MOE_TOP_K];
+        one[0] = 1.0;
+        let ascending = moe_combine_rank_sum(&[&top, &bottom, &one], 1, 1);
+        assert_eq!(ascending[0], 1.0, "ascending rank order keeps the 1.0");
+        let reversed = moe_combine_rank_sum(&[&one, &bottom, &top], 1, 1);
+        assert_eq!(
+            reversed[0], 0.0,
+            "the reverse order loses the 1.0, so the declared order is observable"
+        );
+    }
+
     #[test]
     fn the_reference_quantiser_mirrors_act_quant() {
         // Rule 1, the amax floor (kernel.py:76): an all-zero block gets 2^-22, not a division by
@@ -1241,5 +1662,255 @@ mod tests {
             1,
             1,
         );
+    }
+}
+
+/// The stored-layout tests: the twin, the stride contract and the de-interleave proof.
+///
+/// These live in their own module because the incumbent tests above pin the A8 padded layout, and
+/// the point here is that the two layouts are different contracts that must not be confused.
+#[cfg(test)]
+mod stored_tests {
+    use super::*;
+    use crate::m4_quant::{QUANT_BLOCK, bf16_bits};
+
+    /// A deterministic pseudo-random byte stream (xorshift64), so the fixture needs no RNG crate.
+    fn corpus(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// The released stored shape for a small fixture: [rows][288] codes and [rows][18] scales, with
+    /// finite ue8m0 bytes (the decoder reserves 255) so a NaN cannot hide a row misindex.
+    fn stored_rows(rows: usize, seed: u64) -> (Vec<u8>, Vec<u8>) {
+        let codes = corpus(seed, rows * MOE_STORED_CODE_ROW);
+        let scales: Vec<u8> = (0..rows * MOE_STORED_SCALE_ROW)
+            .map(|index| 120 + (index % 9) as u8)
+            .collect();
+        (codes, scales)
+    }
+
+    /// Rebuild the padded A8 rows from the stored rows: the 288 real code bytes plus a tail of
+    /// code_tail, and the 18 real scales plus a tail of scale_tail.
+    fn deinterleave(
+        codes: &[u8],
+        scales: &[u8],
+        rows: usize,
+        code_tail: u8,
+        scale_tail: u8,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let mut padded_codes = Vec::with_capacity(rows * MOE_WEIGHT_BYTES_PER_ROW);
+        let mut padded_scales = Vec::with_capacity(rows * MOE_SCALE_BYTES_PER_ROW);
+        for row in 0..rows {
+            padded_codes.extend_from_slice(
+                &codes[row * MOE_STORED_CODE_ROW..(row + 1) * MOE_STORED_CODE_ROW],
+            );
+            padded_codes.extend(std::iter::repeat_n(
+                code_tail,
+                MOE_WEIGHT_BYTES_PER_ROW - MOE_STORED_CODE_ROW,
+            ));
+            padded_scales.extend_from_slice(
+                &scales[row * MOE_STORED_SCALE_ROW..(row + 1) * MOE_STORED_SCALE_ROW],
+            );
+            padded_scales.extend(std::iter::repeat_n(
+                scale_tail,
+                MOE_SCALE_BYTES_PER_ROW - MOE_STORED_SCALE_ROW,
+            ));
+        }
+        (padded_codes, padded_scales)
+    }
+
+    fn f32_bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|value| value.to_bits()).collect()
+    }
+
+    /// The A operand: the incumbent's padded 640/20 layout, computed by the reference's own
+    /// quantiser, so the stored twin is tested against the same operand the chain will feed it.
+    fn operand(tokens: usize) -> (Vec<u8>, Vec<u8>) {
+        let mut act = Vec::with_capacity(tokens * MOE_TOP_K * MOE_ACT_BYTES_PER_ROW);
+        let mut act_scales = Vec::with_capacity(tokens * MOE_TOP_K * MOE_SCALE_BYTES_PER_ROW);
+        for routed in 0..tokens * MOE_TOP_K {
+            let values: Vec<f32> = (0..MOE_WIDTH_PADDED)
+                .map(|index| ((routed * 37 + index * 11) % 19) as f32 / 8.0 - 1.0)
+                .collect();
+            let (row, scales) = routed_activation_operand(&values, 0.5);
+            act.extend_from_slice(&row);
+            act_scales.extend_from_slice(&scales);
+        }
+        (act, act_scales)
+    }
+
+    #[test]
+    fn the_stored_twin_is_the_padded_twin_on_deinterleaved_rows() {
+        // What this proves: the stored twin's row strides are the released layout's, by rebuilding
+        // the padded A8 rows from the same stored bytes and requiring the two twins to produce
+        // bit-identical f32 accumulators - the stride handling is the only difference between them.
+        let tokens = 2usize;
+        let hidden = 5usize;
+        let experts = 3usize;
+        let rows = experts * hidden;
+        let (act, act_scales) = operand(tokens);
+        let expert_ids: Vec<u32> = (0..tokens * MOE_TOP_K)
+            .map(|index| ((index * 7 + 1) % experts) as u32)
+            .collect();
+        let (codes, scales) = stored_rows(rows, 0x9e37_79b9_7f4a_7c15);
+        let shared: Vec<u16> = (0..tokens * hidden)
+            .map(|index| bf16_bits(0.25 * (index as f32 + 1.0)))
+            .collect();
+
+        let mut stored_acc = vec![0.0f32; tokens * MOE_TOP_K * hidden];
+        let stored_cost = moe_combine_rank_stored(
+            &mut stored_acc,
+            &act,
+            &act_scales,
+            &codes,
+            &scales,
+            &expert_ids,
+            tokens,
+            hidden,
+            experts,
+        );
+
+        // Two de-interleaves: zeros in the padded tail (the canonical rebuild), and NONZERO garbage
+        // there. The padded twin masks the activation at columns >= 576, so the padded tail's weight
+        // bytes cannot change a term; requiring agreement in both cases proves the stored rows are
+        // being read at their real strides rather than through the padded ones.
+        for (name, code_tail, scale_tail) in [
+            ("zero padding tail", 0x00u8, 0x00u8),
+            ("nonzero padding tail", 0x11u8, 0x7Eu8),
+        ] {
+            let (padded_codes, padded_scales) =
+                deinterleave(&codes, &scales, rows, code_tail, scale_tail);
+            assert_eq!(stored_moe_layout().weight_row_bytes, 288);
+            assert_eq!(stored_moe_layout().weight_scale_row_bytes, 18);
+            let mut padded_acc = vec![0.0f32; tokens * MOE_TOP_K * hidden];
+            let padded_cost = moe_combine_rank(
+                &mut padded_acc,
+                &act,
+                &act_scales,
+                &padded_codes,
+                &padded_scales,
+                &expert_ids,
+                tokens,
+                hidden,
+                experts,
+            );
+            assert_eq!(
+                f32_bits(&stored_acc),
+                f32_bits(&padded_acc),
+                "{name}: the stored twin's f32 accumulators must be bit-identical to the padded twin's"
+            );
+            let stored_rows_out =
+                moe_combine_finalize(&stored_acc, &shared, &expert_ids, tokens, hidden);
+            let padded_rows_out =
+                moe_combine_finalize(&padded_acc, &shared, &expert_ids, tokens, hidden);
+            assert_eq!(
+                stored_rows_out, padded_rows_out,
+                "{name}: the finalised rows must be bit-identical"
+            );
+            assert_eq!(
+                stored_cost.macs,
+                padded_cost.macs - padded_cost.padding_macs
+            );
+        }
+
+        // The stored twin walks exactly the 18 real blocks: no padding MACs at all.
+        assert_eq!(stored_cost.padding_macs, 0);
+        assert_eq!(
+            stored_cost.macs,
+            (tokens * MOE_TOP_K * hidden * MOE_STORED_K_BLOCKS * QUANT_BLOCK) as u64
+        );
+        assert_eq!(
+            stored_cost.weight_bytes,
+            (tokens * MOE_TOP_K * hidden * MOE_STORED_K_BLOCKS * (QUANT_BLOCK / FP4_PER_BYTE))
+                as u64
+        );
+    }
+
+    #[test]
+    fn the_stored_layout_is_a_different_contract_from_the_padded_one() {
+        // 306 is the cost of one output row across the two tensors, not a stride: the code tensor
+        // advances 288 bytes and the scale tensor 18, and each of those is enforced separately.
+        assert_eq!(MOE_STORED_CODE_ROW + MOE_STORED_SCALE_ROW, 306);
+        let stored = stored_moe_layout();
+        assert_eq!(check_stored_moe_layout(stored), Ok(()));
+        assert!(check_moe_layout(stored).is_err());
+        assert!(check_stored_moe_layout(pre_padded_moe_layout()).is_err());
+        assert_ne!(stored, pre_padded_moe_layout());
+
+        // An interleaved 306-byte row - the layout the design page first assumed - is rejected on
+        // both rows, so a loader cannot quietly write it and have the kernel read it as 288/18.
+        let interleaved = MoeRowLayout {
+            weight_row_bytes: 306,
+            ..stored
+        };
+        assert!(check_stored_moe_layout(interleaved).is_err());
+        // A padded 320/20 weight pair is rejected by the stored check as well.
+        let padded_weights = MoeRowLayout {
+            weight_row_bytes: MOE_WEIGHT_BYTES_PER_ROW,
+            weight_scale_row_bytes: MOE_SCALE_BYTES_PER_ROW,
+            ..stored
+        };
+        assert!(check_stored_moe_layout(padded_weights).is_err());
+        // The two layouts differ only in the weight strides, not in the activation operand: that is
+        // what keeps the A8 staging unchanged when the chain selects the stored cubin.
+        assert_eq!(
+            stored.activation_row_bytes,
+            pre_padded_moe_layout().activation_row_bytes
+        );
+        assert_eq!(
+            stored.activation_scale_row_bytes,
+            pre_padded_moe_layout().activation_scale_row_bytes
+        );
+    }
+
+    #[test]
+    fn the_stored_twin_rejects_a_short_weight_buffer() {
+        // The stride contract is also enforced by buffer length: a caller that staged the padded
+        // arena but announced the stored shape is caught before any arithmetic, not after a partial
+        // accumulation.
+        let tokens = 1usize;
+        let hidden = 2usize;
+        let experts = 1usize;
+        let (act, act_scales) = operand(tokens);
+        let (codes, scales) = stored_rows(experts * hidden, 0xdead_beef_cafe_f00d);
+        let ids = vec![0u32; tokens * MOE_TOP_K];
+        let mut acc = vec![0.0f32; tokens * MOE_TOP_K * hidden];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            moe_combine_rank_stored(
+                &mut acc,
+                &act,
+                &act_scales,
+                &codes[..codes.len() - 1],
+                &scales,
+                &ids,
+                tokens,
+                hidden,
+                experts,
+            )
+        }));
+        assert!(result.is_err(), "a short code buffer must be rejected");
+        let mut acc = vec![0.0f32; tokens * MOE_TOP_K * hidden];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            moe_combine_rank_stored(
+                &mut acc,
+                &act,
+                &act_scales,
+                &codes,
+                &scales[..scales.len() - 1],
+                &ids,
+                tokens,
+                hidden,
+                experts,
+            )
+        }));
+        assert!(result.is_err(), "a short scale buffer must be rejected");
     }
 }

@@ -24,9 +24,9 @@
 //! cross-checked against the embedded baseline manifest (the crate's single source of pins):
 //!
 //! - `b12x_mxfp8_dense_sm121`: 190,400 B,
-//!   `06dc726f32af699997f93cda24394855b33aba1fea410609162e32f0b0600850`
+//!   `d751f2b65b076659ff0c4cc37542f8ae4899ec61b7f40c3d8223ba3181f9d350`
 //! - `swiglu_mxfp8_quant_sm121`: 21,912 B,
-//!   `65818de78e210b076b9efef59339b6d36bb2b69d08a590c794c292b5073ef5e0`
+//!   `17183ac9f1652850f319b2c21860016fac90db7cea631c991649415885b31008`
 //!
 //! Build lines (nvcc 13.0.88 / CUDA 13.0.3):
 //! `nvcc -std=c++17 -arch=sm_121a -cubin -I kernels kernels/<kernel>.cu -o <dir>/<kernel>.cubin`.
@@ -87,12 +87,12 @@ const HIDDEN_SCALE_COLS: usize = HIDDEN / QUANT_BLOCK;
 
 /// The dense MXFP8 kernel shipped name / pin.
 const DENSE_KERNEL: &str = "b12x_mxfp8_dense_sm121";
-const DENSE_PIN_BYTES: usize = 190_400;
-const DENSE_PIN_SHA256: &str = "06dc726f32af699997f93cda24394855b33aba1fea410609162e32f0b0600850";
+const DENSE_PIN_BYTES: usize = 209_424;
+const DENSE_PIN_SHA256: &str = "d751f2b65b076659ff0c4cc37542f8ae4899ec61b7f40c3d8223ba3181f9d350";
 /// The SwiGLU + quantiser kernel shipped name / pin.
 const SWIGLU_KERNEL: &str = "swiglu_mxfp8_quant_sm121";
-const SWIGLU_PIN_BYTES: usize = 21_912;
-const SWIGLU_PIN_SHA256: &str = "65818de78e210b076b9efef59339b6d36bb2b69d08a590c794c292b5073ef5e0";
+const SWIGLU_PIN_BYTES: usize = 22_416;
+const SWIGLU_PIN_SHA256: &str = "17183ac9f1652850f319b2c21860016fac90db7cea631c991649415885b31008";
 
 /// One named pass/fail verdict, printed with its detail.
 struct Verdict {

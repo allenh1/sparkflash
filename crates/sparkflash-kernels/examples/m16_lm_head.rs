@@ -96,9 +96,9 @@ use sparkflash_kernels::m4_quant::{bf16_bits, bf16_bits_to_f32};
 /// The cubin name in the baseline manifest (the nvcc source stem).
 const KERNEL: &str = "cert_lm_head_sm121";
 /// The pinned cubin size, from baseline/kernel_baseline.txt through baseline::pin.
-const PIN_BYTES: usize = 38_088;
+const PIN_BYTES: usize = 36_800;
 /// The pinned cubin sha256, from the same manifest.
-const PIN_SHA256: &str = "3b71c99290ee91ca2431c0e232c644559f1c6e2bf340182fc103486789dad8f8";
+const PIN_SHA256: &str = "bbd30c8d6d358bd200b07cffa54d662c9144501b69310864933b68a0e53b6798";
 /// The pinned PTX membar-line count.
 const PIN_MEMBAR_LINES: u32 = 0;
 

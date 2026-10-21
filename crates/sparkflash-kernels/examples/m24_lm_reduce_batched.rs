@@ -27,8 +27,8 @@ use sparkflash_kernels::lm_head_reduce_launch::{
 };
 
 const KERNEL: &str = "lm_head_reduce_sm121";
-const PIN_BYTES: usize = 73_704;
-const PIN_SHA256: &str = "2d18f68d71fbe657ed8e675f3b74c386678d51ff350a82368fff0df50c0032d3";
+const PIN_BYTES: usize = 76_176;
+const PIN_SHA256: &str = "b4ef4ce8141be1678b565cdf838af46fefb4116de3dcaed97d4bca4506a61e30";
 const PIN_MEMBAR_LINES: u32 = 0;
 const ROWS: usize = 6;
 

@@ -40,8 +40,8 @@
 //!
 //! PINS. The cubin is refused by size+sha256 before any allocation, and the constants are
 //! cross-checked against the embedded baseline manifest (the crate's single source of pins) at
-//! build/test time: rmsnorm_sm121, 31,480 B,
-//! \`5f953bc0fb781afe3f9b42703b19b37f89ef45b74a4ad607938df2e2c3448579\`, 0 PTX membar lines.
+//! build/test time: rmsnorm_sm121, 34,512 B,
+//! \`fb559d1bd3666fc249c4f5b5bf46fa236004b3068355963876db43245764e678\`, 0 PTX membar lines.
 //!
 //! Usage (aarch64 node, checkpoint present):
 //!
@@ -75,8 +75,8 @@ const HIDDEN: usize = 5120;
 /// The released \`rms_norm_eps\` (config.json text_config.rms_norm_eps): 1e-20, not 1e-6.
 const RELEASED_EPS: f32 = 1e-20;
 /// The pin of kernels/rmsnorm_sm121.cu under nvcc 13.0.88 / sm_121a.
-const CUBIN_BYTES: usize = 31_480;
-const CUBIN_SHA256: &str = "5f953bc0fb781afe3f9b42703b19b37f89ef45b74a4ad607938df2e2c3448579";
+const CUBIN_BYTES: usize = 34_512;
+const CUBIN_SHA256: &str = "fb559d1bd3666fc249c4f5b5bf46fa236004b3068355963876db43245764e678";
 /// The synthetic odd width: not a multiple of eight, so the kernel takes its scalar path.
 const ODD_WIDTH: usize = 513;
 

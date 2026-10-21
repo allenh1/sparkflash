@@ -348,6 +348,74 @@ pub struct ResidentShard {
     pub ranges: usize,
 }
 
+/// The device operand layout a planned weight offers a computed kernel.
+///
+/// Derived from the plan record alone - dtype, group and shard shape - never from a pointer or an
+/// arena byte count, so a census that reads it cannot disagree with the plan silently. It is the
+/// same predicate the arena upload and the attention bind use (`crate::arena::b12x_layout`),
+/// exposed as a named value so a forward loop can state which layout it expects per tensor and
+/// refuse a bind that disagrees instead of guessing from pointer arithmetic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperandLayout {
+    /// FP8 E4M3 codes in B12x 32x32 micro-tiles plus the `[ceil(cols/32)][ceil(inner/32)]` ue8m0
+    /// scale grid: two distinct buffers, the pair a B12x-weight GEMM binds.
+    B12x {
+        /// Output rows (the kernel's `cols`; the checkpoint's first stored dimension).
+        cols: usize,
+        /// Reduction width (the kernel's `inner`; the checkpoint's second stored dimension).
+        inner: usize,
+        /// The tiled weight bytes, padding included (`mxfp8_ref::b12x_buffer_bytes`).
+        weight_bytes: u64,
+        /// The scale-grid bytes (`ceil(cols/32) * ceil(inner/32)`).
+        scale_bytes: u64,
+    },
+    /// Bytes read as stored: no B12x tiling and no scale grid (a host seam, an FP4 expert matrix,
+    /// or a stored-dtype weight that only a stored kernel may read).
+    Stored {
+        /// The safetensors dtype word the plan carries.
+        dtype: String,
+        /// The bytes this rank's slice holds.
+        bytes: u64,
+    },
+}
+
+impl ResidentShard {
+    /// The device operand layout this planned tensor offers, from the plan record only.
+    #[must_use]
+    pub fn operand_layout(&self) -> OperandLayout {
+        use crate::arena::b12x_layout;
+        match b12x_layout(self) {
+            Some((cols, inner)) => OperandLayout::B12x {
+                cols,
+                inner,
+                weight_bytes: sparkflash_kernels::mxfp8_ref::b12x_buffer_bytes(cols, inner) as u64,
+                scale_bytes: (cols.div_ceil(32) * inner.div_ceil(32)) as u64,
+            },
+            None => OperandLayout::Stored {
+                dtype: self.dtype.clone(),
+                bytes: self.shard_bytes,
+            },
+        }
+    }
+}
+
+impl OperandLayout {
+    /// Whether this is the B12x pair (`true`) or stored bytes (`false`).
+    #[must_use]
+    pub fn is_b12x(&self) -> bool {
+        matches!(self, Self::B12x { .. })
+    }
+
+    /// The layout name, for evidence and log lines.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::B12x { .. } => "b12x",
+            Self::Stored { .. } => "stored",
+        }
+    }
+}
+
 /// One group's totals, in evidence order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupTotals {
@@ -365,6 +433,61 @@ pub struct GroupTotals {
     pub stored_bytes: u64,
     /// The byte ranges the group's read issues.
     pub ranges: usize,
+}
+
+/// Compares a planned operand layout with a bind's observed pointer pair and names the tensor
+/// when they disagree, before anything launches.
+///
+/// This is the census half of the four-rank operand path: the arena bind reports the two device
+/// pointers it bound per weight, and the forward refuses a tensor whose pair cannot be the planned
+/// layout. B12x needs two live and distinct buffers (the tiled codes and the scale grid); a stored
+/// tensor repeats its one pointer in the scale slot. A null pointer, a shared pointer for a B12x
+/// operand, or a distinct pointer for a stored tensor is a reported refusal carrying the tensor
+/// name, never a launch.
+///
+/// # Errors
+/// The refusal string names the tensor, the planned layout and the observed pair.
+pub fn check_operand_bind(
+    shard: &ResidentShard,
+    weight_pointer: u64,
+    scale_pointer: u64,
+) -> Result<OperandLayout, String> {
+    let layout = shard.operand_layout();
+    match &layout {
+        OperandLayout::B12x { .. } => {
+            if weight_pointer == 0 || scale_pointer == 0 {
+                return Err(format!(
+                    "{}: plan says {} but the bind left a null pointer (weight {weight_pointer:#x}, scale {scale_pointer:#x}); refusing to launch",
+                    shard.name,
+                    layout.as_str()
+                ));
+            }
+            if weight_pointer == scale_pointer {
+                return Err(format!(
+                    "{}: plan says {} (two buffers) but weight and scale bound the same pointer {weight_pointer:#x}; refusing to launch",
+                    shard.name,
+                    layout.as_str()
+                ));
+            }
+        }
+        OperandLayout::Stored { .. } => {
+            if weight_pointer == 0 {
+                return Err(format!(
+                    "{}: plan says {} but the bind left a null weight pointer; refusing to launch",
+                    shard.name,
+                    layout.as_str()
+                ));
+            }
+            if scale_pointer != 0 && scale_pointer != weight_pointer {
+                return Err(format!(
+                    "{}: plan says {} but the bind returned a distinct scale pointer {scale_pointer:#x} (weight {weight_pointer:#x}); refusing to launch",
+                    shard.name,
+                    layout.as_str()
+                ));
+            }
+        }
+    }
+    Ok(layout)
 }
 
 /// The full per-rank resident plan.
@@ -455,6 +578,18 @@ impl ResidentPlan {
     #[must_use]
     pub fn shards(&self) -> &[ResidentShard] {
         &self.shards
+    }
+
+    /// The device operand layout of one planned tensor, by name, from the plan record alone.
+    ///
+    /// `None` when the plan does not carry the name (a host seam or a tensor this rank does not
+    /// serve); a caller must refuse that, not guess.
+    #[must_use]
+    pub fn operand_layout(&self, name: &str) -> Option<OperandLayout> {
+        self.shards
+            .iter()
+            .find(|shard| shard.name == name)
+            .map(ResidentShard::operand_layout)
     }
 
     /// The bytes this rank reads into device memory.
@@ -1015,5 +1150,219 @@ mod tests {
             assert_eq!(read.tensors, 2);
             assert_eq!(read.bytes, plan.resident_bytes());
         }
+    }
+
+    #[test]
+    fn the_operand_layout_is_the_b12x_predicate_and_a_stored_tensor_names_its_dtype() {
+        // The released layer-0 attention shapes, as the released headers carry them. wq_a/wkv are
+        // Replicated and stay whole; wq_b/wo_a split cols and wo_b splits inner on four ranks.
+        let entries = vec![
+            entry("layers.0.attn.wq_a.weight", "F8_E4M3", &[1280, 5120]),
+            entry("layers.0.attn.wq_a.scale", "F8_E8M0", &[40, 160]),
+            entry("layers.0.attn.wkv.weight", "F8_E4M3", &[512, 5120]),
+            entry("layers.0.attn.wkv.scale", "F8_E8M0", &[16, 160]),
+            entry("layers.0.attn.wq_b.weight", "F8_E4M3", &[32768, 1280]),
+            entry("layers.0.attn.wq_b.scale", "F8_E8M0", &[1024, 40]),
+            entry("layers.0.attn.wo_a.weight", "F8_E4M3", &[8192, 4096]),
+            entry("layers.0.attn.wo_a.scale", "F8_E8M0", &[256, 128]),
+            entry("layers.0.attn.wo_b.weight", "F8_E4M3", &[5120, 8192]),
+            entry("layers.0.attn.wo_b.scale", "F8_E8M0", &[160, 256]),
+            entry("layers.0.attn.q_norm.weight", "BF16", &[1280]),
+            entry("layers.0.ffn.experts.0.w2.weight", "I8", &[5120, 1152]),
+            entry("layers.0.ffn.experts.0.w2.scale", "F8_E8M0", &[5120, 72]),
+        ];
+        let plan = ResidentPlan::plan(0, 4, entries).expect("released layer-0 plan");
+        let wq_a = plan
+            .operand_layout("layers.0.attn.wq_a.weight")
+            .expect("wq_a is planned");
+        assert_eq!(
+            wq_a,
+            OperandLayout::B12x {
+                cols: 1280,
+                inner: 5120,
+                weight_bytes: 1280 * 5120,
+                scale_bytes: 40 * 160,
+            },
+            "wq_a is F8_E4M3 in the Replicated attention group: B12x, not stored"
+        );
+        let wkv = plan
+            .operand_layout("layers.0.attn.wkv.weight")
+            .expect("wkv is planned");
+        assert_eq!(
+            wkv,
+            OperandLayout::B12x {
+                cols: 512,
+                inner: 5120,
+                weight_bytes: 512 * 5120,
+                scale_bytes: 16 * 160,
+            }
+        );
+        let wo_b = plan
+            .operand_layout("layers.0.attn.wo_b.weight")
+            .expect("wo_b is planned");
+        assert_eq!(
+            wo_b,
+            OperandLayout::B12x {
+                cols: 5120,
+                inner: 2048,
+                weight_bytes: 5120 * 2048,
+                scale_bytes: 160 * 64,
+            },
+            "the Row rule splits wo_b's inner axis, not its cols"
+        );
+        // A BF16 norm is not a weight a B12x kernel can read: stored bytes, named dtype.
+        assert_eq!(
+            plan.operand_layout("layers.0.attn.q_norm.weight"),
+            Some(OperandLayout::Stored {
+                dtype: "BF16".to_string(),
+                bytes: 1280 * 2,
+            })
+        );
+        // The FP4 expert matrix is I8 (packed two per byte): stored bytes despite being a weight.
+        assert_eq!(
+            plan.operand_layout("layers.0.ffn.experts.0.w2.weight"),
+            Some(OperandLayout::Stored {
+                dtype: "I8".to_string(),
+                bytes: 5120 * 288,
+            })
+        );
+        // A name the plan does not carry is None, not an invented layout.
+        assert_eq!(plan.operand_layout("layers.0.attn.attn_sink"), None);
+        assert!(wq_a.is_b12x());
+        assert_eq!(wq_a.as_str(), "b12x");
+    }
+
+    #[test]
+    fn every_released_attention_projection_is_b12x_on_all_four_ranks() {
+        // 43 released attention layers (40 chain + 3 MTP), both weight and scale per projection,
+        // with the stored shapes the released headers carry. Each rank's slice keeps B12x layout.
+        let mut entries = Vec::new();
+        for layer in 0..CHAIN_LAYERS {
+            let prefix = format!("layers.{layer}.attn");
+            for (name, weight, scale) in [
+                ("wq_a", [1280usize, 5120], [40usize, 160]),
+                ("wq_b", [32768, 1280], [1024, 40]),
+                ("wkv", [512, 5120], [16, 160]),
+                ("wo_a", [8192, 4096], [256, 128]),
+                ("wo_b", [5120, 8192], [160, 256]),
+            ] {
+                entries.push(entry(
+                    &format!("{prefix}.{name}.weight"),
+                    "F8_E4M3",
+                    &weight,
+                ));
+                entries.push(entry(&format!("{prefix}.{name}.scale"), "F8_E8M0", &scale));
+            }
+        }
+        for layer in 0..MTP_LAYERS {
+            let prefix = format!("mtp.{layer}.attn");
+            for (name, weight, scale) in [
+                ("wq_a", [1280usize, 5120], [40usize, 160]),
+                ("wq_b", [32768, 1280], [1024, 40]),
+                ("wkv", [512, 5120], [16, 160]),
+                ("wo_a", [8192, 4096], [256, 128]),
+                ("wo_b", [5120, 8192], [160, 256]),
+            ] {
+                entries.push(entry(
+                    &format!("{prefix}.{name}.weight"),
+                    "F8_E4M3",
+                    &weight,
+                ));
+                entries.push(entry(&format!("{prefix}.{name}.scale"), "F8_E8M0", &scale));
+            }
+        }
+        for rank in 0..4 {
+            let plan = ResidentPlan::plan(rank, 4, entries.clone()).expect("plan");
+            let mut tiled = 0usize;
+            for layer in 0..CHAIN_LAYERS + MTP_LAYERS {
+                let prefix = if layer < CHAIN_LAYERS {
+                    format!("layers.{layer}.attn")
+                } else {
+                    format!("mtp.{}.attn", layer - CHAIN_LAYERS)
+                };
+                for name in ["wq_a", "wq_b", "wkv", "wo_a", "wo_b"] {
+                    let layout = plan
+                        .operand_layout(&format!("{prefix}.{name}.weight"))
+                        .expect("every projection is planned");
+                    assert!(
+                        layout.is_b12x(),
+                        "rank {rank} {prefix}.{name}.weight must be B12x, got {layout:?}"
+                    );
+                    tiled += 1;
+                }
+            }
+            assert_eq!(tiled, (CHAIN_LAYERS + MTP_LAYERS) * 5);
+        }
+    }
+
+    fn shard_named<'a>(plan: &'a ResidentPlan, name: &str) -> &'a ResidentShard {
+        plan.shards()
+            .iter()
+            .find(|shard| shard.name == name)
+            .expect("planned")
+    }
+
+    #[test]
+    fn the_bind_census_accepts_the_planned_pair_and_names_an_inconsistent_one() {
+        let entries = vec![
+            entry("layers.0.attn.wq_a.weight", "F8_E4M3", &[1280, 5120]),
+            entry("layers.0.attn.wq_a.scale", "F8_E8M0", &[40, 160]),
+            entry("layers.0.attn.q_norm.weight", "BF16", &[1280]),
+        ];
+        let plan = ResidentPlan::plan(0, 4, entries).expect("plan");
+        let wq_a = shard_named(&plan, "layers.0.attn.wq_a.weight");
+        assert!(
+            check_operand_bind(wq_a, 0x1000, 0x2000).is_ok(),
+            "two distinct buffers are the B12x pair"
+        );
+        let same = check_operand_bind(wq_a, 0x1000, 0x1000)
+            .expect_err("one buffer cannot be codes and scales");
+        assert!(
+            same.contains("layers.0.attn.wq_a.weight") && same.contains("refusing to launch"),
+            "{same}"
+        );
+        let null =
+            check_operand_bind(wq_a, 0x1000, 0).expect_err("a null scale pointer is refused");
+        assert!(
+            null.contains("null pointer") && null.contains("wq_a"),
+            "{null}"
+        );
+        let norm = shard_named(&plan, "layers.0.attn.q_norm.weight");
+        assert!(
+            check_operand_bind(norm, 0x3000, 0x3000).is_ok(),
+            "a stored tensor repeats its one pointer in the scale slot"
+        );
+        let distinct = check_operand_bind(norm, 0x3000, 0x4000)
+            .expect_err("a stored tensor has no second buffer");
+        assert!(
+            distinct.contains("q_norm.weight") && distinct.contains("distinct scale pointer"),
+            "{distinct}"
+        );
+    }
+
+    #[test]
+    fn a_fixture_bind_that_disagrees_with_the_plan_is_named_not_launched() {
+        // The deliberately inconsistent fixture: the plan carries wq_a as BF16 (a stored operand,
+        // so no B12x kernel may read it) while the bind reports the two-pointer pair a B12x kernel
+        // would need. The census must name the tensor and refuse, never launch.
+        let entries = vec![
+            entry("layers.0.attn.wq_a.weight", "BF16", &[1280, 5120]),
+            entry("layers.0.attn.wq_a.scale", "F8_E8M0", &[40, 160]),
+        ];
+        let plan = ResidentPlan::plan(0, 4, entries).expect("plan");
+        let wq_a = shard_named(&plan, "layers.0.attn.wq_a.weight");
+        assert_eq!(
+            wq_a.operand_layout(),
+            OperandLayout::Stored {
+                dtype: "BF16".to_string(),
+                bytes: 1280 * 5120 * 2,
+            }
+        );
+        let refusal = check_operand_bind(wq_a, 0x1000, 0x2000)
+            .expect_err("a stored plan operand with two buffers is refused");
+        assert!(refusal.contains("layers.0.attn.wq_a.weight"), "{refusal}");
+        assert!(refusal.contains("stored"), "{refusal}");
+        assert!(refusal.contains("distinct scale pointer"), "{refusal}");
+        assert!(refusal.contains("refusing to launch"), "{refusal}");
     }
 }

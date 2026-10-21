@@ -91,7 +91,7 @@ docker run --rm -v <repo>:/repo:ro -v <evidence>:/out nvidia/cuda:13.0.3-devel-u
 
 The task-14 cubin was built from merged main `d748b98` with nvcc V13.0.88
 (cuda_13.0.r13.0/compiler.36424714_0): 60,792 B, sha256
-`5bfee4c7a0ece7c921e591fc6b8bd9d98c39b95d735d7c1d699ec58edaa51ea3`. That is the same digest the
+`64fc2944d510885490ef1caeb680600f30b1d552c6ec31b0f6ed840ad0f09d2b`. That is the same digest the
 kernel baseline records for this kernel, so the cubin is the reviewed build.
 
 ### Command

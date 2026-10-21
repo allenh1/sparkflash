@@ -87,12 +87,13 @@ extern "C" __global__ void engram_gate_write_sm121(
     }
     __syncthreads();
 
-    const uint32_t total = hc * dim;
-    for (uint32_t index = threadIdx.x; index < total; index += blockDim.x) {
-        const uint32_t which = index / dim;
-        const uint32_t column = index % dim;
-        const float h = __bfloat162float(stream[index]);
-        const float value = __bfloat162float(kv[hc * dim + column]);
-        out[index] = __float2bfloat16_rn(__fadd_rn(h, __fmul_rn(gate_shared[which], value)));
+    const __nv_bfloat16 *value_row = kv + (uint64_t)hc * dim;
+    for (uint32_t column = threadIdx.x; column < dim; column += blockDim.x) {
+        const float value = __bfloat162float(value_row[column]);
+        for (uint32_t which = 0u; which < hc && which < SPARK_ENGRAM_MAX_HC; ++which) {
+            const uint32_t index = which * dim + column;
+            const float h = __bfloat162float(stream[index]);
+            out[index] = __float2bfloat16_rn(__fadd_rn(h, __fmul_rn(gate_shared[which], value)));
+        }
     }
 }

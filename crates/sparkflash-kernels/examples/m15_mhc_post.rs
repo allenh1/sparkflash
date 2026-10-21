@@ -78,7 +78,7 @@
 //!                   not part of the exactness claim.
 //!
 //! Cubin: the pinned mega_mhc_sm121 cubin is required - 141,632 B and
-//! 3db997ed3fafaf41ee87683d18fe7af339c84a777baa46ee2d6f528c1681b3d9, read from the tree's
+//! 7040411617954a17e89e6d9d8fcea1a872171de259a5515bde1e69a96c69af5c, read from the tree's
 //! baseline manifest (sparkflash_kernels::baseline::pin), and the harness refuses anything else by
 //! length and sha256 before the first DEVICE allocation. Build it under the pinned toolkit (CUDA 13.0.3,
 //! nvcc V13.0.88):
@@ -116,9 +116,9 @@ use sparkflash_kernels::mega_mhc_ref::{
 /// The cubin name in the baseline manifest (the nvcc source stem).
 const KERNEL: &str = "mega_mhc_sm121";
 /// The pinned cubin size, from baseline/kernel_baseline.txt through baseline::pin.
-const PIN_BYTES: usize = 141_632;
+const PIN_BYTES: usize = 151_592;
 /// The pinned cubin sha256, from the same manifest.
-const PIN_SHA256: &str = "3db997ed3fafaf41ee87683d18fe7af339c84a777baa46ee2d6f528c1681b3d9";
+const PIN_SHA256: &str = "7040411617954a17e89e6d9d8fcea1a872171de259a5515bde1e69a96c69af5c";
 /// The pinned PTX membar-line count: this kernel's grid rendezvous carries fences.
 const PIN_MEMBAR_LINES: u32 = 7;
 /// The hc_stats grid scratch the launcher must allocate: STATS x (tiles + 1).

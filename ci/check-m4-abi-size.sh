@@ -22,6 +22,12 @@
 # list before and after is byte-identical and the move is proven verbatim by
 # ci/verify-m4-abi-split.py; docs/build/m4-abi-split.md records the composition and the split.
 #
+# Pin 13,924 -> 13,926 (2026-10-21): the split-K MoE tiling (D51 tolerance arm; the split-K launch
+# stays dormant behind SPARKFLASH_ENABLE_MOE_SPLITK=1) added the two static asserts the scanner
+# counts for b12x_mxfp4_moe_sm121.cu (10 -> 12) and the matching ASSERT_COUNTS/checked pin in
+# m4_abi.rs, so the family grew by exactly the two reviewable lines. This is a scanner update to an
+# existing scanner for a kernel change, cited to the Lead's D51 decision; no new scanner was added.
+#
 # This is the cheap, always-on half of the freeze. The expensive half - that the frozen scanners
 # still agree with the kernels they read - is `cargo test -p sparkflash-kernels` in every pipeline.
 set -eu
@@ -39,7 +45,7 @@ EXPECTED_FILES="m4_abi.rs m4_abi/acquire_guard.rs m4_abi/scanner.rs"
 # declares the submodules and re-exports the moved public entry points; the aggregate below is the
 # pinned total after that move. Any later commit that changes the total changes this number in the
 # same diff, cited to a Lead decision, and that diff is the review gate.
-PINNED_LINES=13924
+PINNED_LINES=13926
 
 if [ ! -f "$ROOT_FILE" ]; then
     echo "error: $ROOT_FILE is missing; the frozen Milestone-4 ABI lint cannot be removed silently (D26)" >&2

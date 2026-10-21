@@ -16,7 +16,7 @@
 //! then re-checks the byte geometry the kernel is about to read, so a pointer with the wrong shape
 //! fails loudly.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sparkflash_device::arena::{
     ArenaAllocator, ArenaTensor, ResidentArena, TensorLayout, tile_b12x,
@@ -26,6 +26,14 @@ use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::weights::WeightSource;
 use sparkflash_kernels::cuda_driver::Deviceptr;
 use sparkflash_kernels::mxfp8_ref::b12x_buffer_bytes;
+/// Host seams are row-major BF16 weights with no scale grid and no device kernel; they are
+/// computed on the host (CompressorCache / IndexerWeights) and must never enter the device bind.
+fn is_host_seam_weight(name: &str) -> bool {
+    name.contains(".compressor.wgate.")
+        || name.contains(".compressor.wkv.")
+        || name.contains("indexer.weights_proj.")
+        || name.contains("indexer.wk.")
+}
 
 /// One resident attention projection set: the five projections of every backbone layer.
 pub struct ResidentAttention {
@@ -424,8 +432,146 @@ mod rank_plan_shape_tests {
     }
 }
 
+/// The set-based coverage report of one bind pass: every expected device-served name, every bound
+/// name, and the two differences by name.
+///
+/// A count mismatch alone is unfalsifiable (`bound 208 of 196` says nothing about which tensor is
+/// wrong), so the check compares the two name SETS and reports both directions.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BindCoverage {
+    /// Device-served names the expected-shape table says this rank's plan must bind, sorted.
+    pub expected: Vec<String>,
+    /// Names actually bound, sorted.
+    pub bound: Vec<String>,
+    /// Expected but not bound (`expected - bound`), sorted.
+    pub missing: Vec<String>,
+    /// Bound but not expected (`bound - expected`), sorted.
+    pub unexpected: Vec<String>,
+    /// Structurally excluded host seams, sorted. Not a bind set: reported so the exclusion is
+    /// visible in the evidence instead of being subtracted as a count.
+    pub host_seams: Vec<String>,
+}
+
+/// Classes with at most this many names carry every name inline in the evidence row.
+pub const SMALL_CLASS_NAMES: usize = 512;
+
+/// FNV-1a over a sorted name list: the compact identity of one side of a bind set check.
+#[must_use]
+pub fn names_digest(names: &[String]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for name in names {
+        for byte in name.as_bytes().iter().chain(std::iter::once(&b'\n')) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+impl BindCoverage {
+    /// True when the expected and bound name sets are equal (including the empty case).
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        self.missing.is_empty() && self.unexpected.is_empty()
+    }
+
+    /// The machine-readable evidence row for one bind class.
+    ///
+    /// Small classes (attention) carry every name inline. Large classes (the routed experts number
+    /// tens of thousands of names) carry a digest of each side and point at the per-rank name
+    /// manifest the same run writes, so the evidence stays readable and every name is still
+    /// published. Missing and unexpected names are always inline: a difference is never hidden.
+    #[must_use]
+    pub fn evidence(&self, class: &str) -> serde_json::Value {
+        if self.expected.len() <= SMALL_CLASS_NAMES {
+            return serde_json::json!({
+                "class": class,
+                "expected": self.expected.len(),
+                "bound": self.bound.len(),
+                "host_seams_excluded": self.host_seams.len(),
+                "missing": self.missing,
+                "unexpected": self.unexpected,
+                "complete": self.complete(),
+                "expected_names": self.expected,
+                "host_seam_names": self.host_seams,
+            });
+        }
+        serde_json::json!({
+            "class": class,
+            "expected": self.expected.len(),
+            "bound": self.bound.len(),
+            "host_seams_excluded": self.host_seams.len(),
+            "missing": self.missing,
+            "unexpected": self.unexpected,
+            "complete": self.complete(),
+            "expected_names_digest": names_digest(&self.expected),
+            "bound_names_digest": names_digest(&self.bound),
+            "names_omitted": "large class: every name is in this rank's bind name manifest, and each side's FNV-1a digest is above",
+        })
+    }
+
+    /// Every name of this class as manifest lines, one per line: "class<TAB>set<TAB>name".
+    #[must_use]
+    pub fn manifest_lines(&self, class: &str) -> Vec<String> {
+        let mut lines = Vec::with_capacity(self.expected.len() + self.unexpected.len() + 1);
+        for set in [
+            ("expected", &self.expected),
+            ("bound", &self.bound),
+            ("missing", &self.missing),
+            ("unexpected", &self.unexpected),
+            ("host_seam", &self.host_seams),
+        ] {
+            for name in set.1 {
+                lines.push(format!("{class}\t{}\t{name}", set.0));
+            }
+        }
+        lines
+    }
+}
+
+/// The set check a bind pass must pass: `expected` and `bound` have to be equal as SETS, and any
+/// difference is an error naming every tensor in both directions.
+///
+/// # Errors
+/// Any missing or unexpected name; the message lists both directions and the counts.
+pub fn check_bind_coverage(
+    class: &str,
+    expected: &BTreeSet<String>,
+    bound: &BTreeSet<String>,
+    host_seams: &BTreeSet<String>,
+) -> Result<BindCoverage, String> {
+    let coverage = BindCoverage {
+        expected: expected.iter().cloned().collect(),
+        bound: bound.iter().cloned().collect(),
+        missing: expected.difference(bound).cloned().collect(),
+        unexpected: bound.difference(expected).cloned().collect(),
+        host_seams: host_seams.iter().cloned().collect(),
+    };
+    if !coverage.complete() {
+        return Err(format!(
+            "{class} bind coverage: {} expected, {} bound, {} host seams excluded; expected-but-not-bound: {:?}; bound-but-not-expected: {:?}",
+            coverage.expected.len(),
+            coverage.bound.len(),
+            coverage.host_seams.len(),
+            coverage.missing,
+            coverage.unexpected
+        ));
+    }
+    Ok(coverage)
+}
+
+/// One bind pass: the pointers a launch binds plus its named coverage report.
+pub struct RankBind {
+    /// `(weight, scale grid)` device pointers keyed by the real plan tensor name. A stored (non-B12x)
+    /// tensor has no scale grid, so its second word repeats the weight pointer.
+    pub pointers: BTreeMap<String, (Deviceptr, Deviceptr)>,
+    /// The set check this pass satisfied; `complete()` is true or the bind returned an error.
+    pub coverage: BindCoverage,
+}
+
 /// Binds every attention-path plan shard the table covers to the rank arena and returns the
-/// (weight, scales) pointers the kernels must be launched with.
+/// `RankBind`: the (weight, scales) pointers the kernels must be launched with plus the named
+/// coverage report of this pass.
 ///
 /// This is the bind-time byte check the seam relies on: the weight slice must be exactly the B12x
 /// payload for the (cols, inner) the kernel will read, and the scale slice exactly the 32x32 grid,
@@ -440,20 +586,16 @@ pub fn bind_rank_attention(
     arena: &ResidentArena,
     plan: &ResidentPlan,
     table: &BTreeMap<String, (usize, usize)>,
-) -> Result<BTreeMap<String, (Deviceptr, Deviceptr)>, String> {
+) -> Result<RankBind, String> {
     let mut bound = BTreeMap::new();
-    let mut host_seam = 0usize;
+    let mut host_seams: BTreeSet<String> = BTreeSet::new();
     for shard in plan.shards() {
         // Host-seam tensors are row-major BF16 with no scale and no device kernel: they are
         // computed by CompressorCache / IndexerWeights on the host. They are not device weights,
         // so they are excluded from the device bind table rather than bound as B12x or demanding a
         // scale grid.
-        let host_seam_tensor = shard.name.contains(".compressor.wgate.")
-            || shard.name.contains(".compressor.wkv.")
-            || shard.name.contains("indexer.weights_proj.")
-            || shard.name.contains("indexer.wk.");
-        if host_seam_tensor {
-            host_seam += 1;
+        if is_host_seam_weight(&shard.name) {
+            host_seams.insert(shard.name.clone());
             continue;
         }
         // The table is the bind set: a planned tensor with no (cols, inner) entry is not bound. The
@@ -504,13 +646,985 @@ pub fn bind_rank_attention(
             }
         }
     }
-    let device_served = table.len() - host_seam;
-    if bound.len() != device_served {
+    // Set-based coverage, reported with names in both directions: a count mismatch alone is
+    // unfalsifiable (208 > 196 says nothing about which tensor is wrong). The expected set is the
+    // table filtered by the structural host-seam predicate - the same predicate the loop applies -
+    // so the two sets can only disagree for a real reason (a planned tensor the table does not
+    // name, or a table tensor this rank's plan does not carry).
+    let expected: BTreeSet<String> = table
+        .keys()
+        .filter(|name| !is_host_seam_weight(name))
+        .cloned()
+        .collect();
+    let bound_names: BTreeSet<String> = bound.keys().cloned().collect();
+    let coverage = check_bind_coverage("attention", &expected, &bound_names, &host_seams)?;
+    Ok(RankBind {
+        pointers: bound,
+        coverage,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// MoE and tail arena bindings: the four-rank arm's device-served sets beyond attention.
+// ---------------------------------------------------------------------------------------------
+
+/// Which routed/shared matrix a plan name names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Matrix {
+    /// Gate projection (w1).
+    Gate,
+    /// Up projection (w3).
+    Up,
+    /// Down projection (w2).
+    Down,
+}
+
+impl Matrix {
+    /// The plan's leaf name for this matrix.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gate => "w1",
+            Self::Up => "w3",
+            Self::Down => "w2",
+        }
+    }
+}
+
+/// The three router tensors per layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RouterPart {
+    /// ffn.gate.weight, BF16 [experts, dim].
+    Weight,
+    /// ffn.gate.bias, F32 [experts].
+    Bias,
+    /// ffn.gate.bias_vl, F32 [experts]; resident, unused by the text-only path.
+    BiasVl,
+}
+
+impl RouterPart {
+    /// The plan's leaf name for this router part.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Weight => "weight",
+            Self::Bias => "bias",
+            Self::BiasVl => "bias_vl",
+        }
+    }
+}
+
+/// One matrix's arena pointers: the packed weight and its scale grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatrixBind {
+    /// The packed weight bytes.
+    pub weight: Deviceptr,
+    /// The E8M0 scale grid (equal to the weight pointer for a stored tensor with no grid).
+    pub scales: Deviceptr,
+}
+
+/// The arena-resident routed experts, shared experts and routers of one rank.
+///
+/// Every one of these tensors is bound from the rank arena the streaming upload already verified;
+/// no per-token weight H2D exists on this structure at all (there is no reader and no source).
+pub struct MoeBind {
+    /// (layer, expert, matrix) -> arena pointers.
+    pub routed: BTreeMap<(usize, usize, Matrix), MatrixBind>,
+    /// (layer, matrix) -> arena pointers.
+    pub shared: BTreeMap<(usize, Matrix), MatrixBind>,
+    /// (layer, router part) -> arena pointer.
+    pub router: BTreeMap<(usize, RouterPart), Deviceptr>,
+    /// The set checks, one row per device class with its class name.
+    pub coverage: Vec<(&'static str, BindCoverage)>,
+    /// Launch-compatibility rows: what the current kernel ABIs read against what is bound.
+    pub compat: Vec<serde_json::Value>,
+}
+
+impl MoeBind {
+    /// The three matrices of one routed expert, if all three bound.
+    #[must_use]
+    pub fn expert(&self, layer: usize, expert: usize) -> Option<[MatrixBind; 3]> {
+        Some([
+            *self.routed.get(&(layer, expert, Matrix::Gate))?,
+            *self.routed.get(&(layer, expert, Matrix::Up))?,
+            *self.routed.get(&(layer, expert, Matrix::Down))?,
+        ])
+    }
+
+    /// The evidence object: every class's named coverage plus the launch-compatibility rows.
+    #[must_use]
+    pub fn evidence(&self) -> serde_json::Value {
+        serde_json::json!({
+            "classes": self.coverage.iter().map(|(class, coverage)| coverage.evidence(class)).collect::<Vec<_>>(),
+            "launch_compatibility": self.compat,
+            "weight_h2d_bytes_per_token": 0,
+            "note": "every pointer is an arena slice the resident stage verified; this bind has no reader and no source, so per-token weight H2D is structurally zero, not a counter that happens to read zero",
+        })
+    }
+}
+
+/// The tail arena pointers one rank serves: its embedding row shard, certified head shard and the
+/// final norm. Bound here so a full-rank coverage report names them; the head/token arithmetic is
+/// not wired on this arm yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TailBind {
+    /// embed.weight row shard [vocab / world, dim] BF16.
+    pub embed: Deviceptr,
+    /// head.weight row shard [vocab / world, dim] BF16.
+    pub head: Deviceptr,
+    /// norm.weight [dim] BF16 (replicated).
+    pub norm: Deviceptr,
+}
+
+/// The resident plan's tensors by the class the four-rank arm gives them, so no resident tensor is
+/// silently unaccounted for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PlanClass {
+    /// Bound by the attention projection bind.
+    AttentionProjection,
+    /// Structurally excluded host seam (compressor wkv/wgate, indexer wk/weights_proj).
+    AttentionHostSeam,
+    /// Attention auxiliaries the host reads today (sink, q/kv norms, compressor/indexer norms).
+    AttentionAux,
+    /// Bound by the routed-expert bind.
+    RoutedExpert,
+    /// Bound by the shared-expert bind.
+    SharedExpert,
+    /// Bound by the router bind.
+    Router,
+    /// Bound by the tail bind (embedding/head/norm).
+    Tail,
+    /// Multi-modal special-token embeddings carried resident by the plan but not served by the
+    /// text path (image_start/image_end/image_newline); claimed so the census stays total.
+    SpecialToken,
+    /// mHC hyper-connection weights, host f32 path on this arm.
+    Mhc,
+    /// Engram tensors (the tables themselves are disk placement).
+    Engram,
+    /// MTP/DSpark stage tensors, not on the M1 backbone path.
+    Mtp,
+    /// Nothing above claims it: a bug, reported by name.
+    Unclassified,
+}
+
+impl PlanClass {
+    /// The evidence name of this class.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AttentionProjection => "attention_projection",
+            Self::AttentionHostSeam => "attention_host_seam",
+            Self::AttentionAux => "attention_aux_host_read",
+            Self::RoutedExpert => "routed_expert",
+            Self::SharedExpert => "shared_expert",
+            Self::Router => "router",
+            Self::Tail => "tail",
+            Self::SpecialToken => "special_token",
+            Self::Mhc => "mhc",
+            Self::Engram => "engram",
+            Self::Mtp => "mtp",
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
+
+/// Every resident plan shard's class and the names nothing claims.
+pub struct PlanCensus {
+    /// Class -> resident shard count.
+    pub by_class: BTreeMap<PlanClass, usize>,
+    /// Resident shards in total.
+    pub total: usize,
+    /// Resident shard names no class claims (must be empty).
+    pub unclassified: Vec<String>,
+}
+
+impl PlanCensus {
+    /// The evidence object.
+    #[must_use]
+    pub fn evidence(&self) -> serde_json::Value {
+        let mut by_class = serde_json::Map::new();
+        for (class, count) in &self.by_class {
+            by_class.insert(class.as_str().to_string(), serde_json::json!(count));
+        }
+        serde_json::json!({
+            "resident_tensors": self.total,
+            "by_class": by_class,
+            "unclassified": self.unclassified,
+            "note": "every resident shard is claimed by exactly one class: device-bound (attention_projection, routed_expert, shared_expert, router, tail), structurally excluded host seam, or a named host/MTP class this arm does not serve yet",
+        })
+    }
+}
+
+/// Parses layers.{L}. from a plan name.
+fn plan_layer(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("layers.")?;
+    let (layer, _) = rest.split_once('.')?;
+    layer.parse().ok()
+}
+
+/// Parses layers.{L}.ffn.experts.{E}. from a plan name.
+fn plan_expert(name: &str) -> Option<usize> {
+    let rest = name.split_once(".ffn.experts.")?.1;
+    let (expert, _) = rest.split_once('.')?;
+    expert.parse().ok()
+}
+
+/// The routed/shared matrix and whether the name is the scale grid, from its leaf pair.
+fn matrix_and_scale(name: &str) -> Option<(Matrix, bool)> {
+    let mut parts = name.rsplit('.');
+    let leaf = parts.next()?;
+    let parent = parts.next()?;
+    let scale = match leaf {
+        "weight" => false,
+        "scale" => true,
+        _ => return None,
+    };
+    let matrix = match parent {
+        "w1" => Matrix::Gate,
+        "w3" => Matrix::Up,
+        "w2" => Matrix::Down,
+        _ => return None,
+    };
+    Some((matrix, scale))
+}
+
+/// Classifies one plan name by the role the four-rank arm gives it.
+#[must_use]
+pub fn classify_plan_name(
+    name: &str,
+    attention_table: &BTreeMap<String, (usize, usize)>,
+) -> PlanClass {
+    // MTP/DSpark first: its stages reuse the backbone leaf names (ffn.experts, ffn.gate,
+    // indexer.wk), so classifying by leaf would fold a stage this arm does not serve into a
+    // backbone class.
+    if name.starts_with("mtp.") {
+        return PlanClass::Mtp;
+    }
+    if is_host_seam_weight(name) {
+        return PlanClass::AttentionHostSeam;
+    }
+    if attention_table.contains_key(name) {
+        return PlanClass::AttentionProjection;
+    }
+    if name.contains(".ffn.experts.") {
+        return PlanClass::RoutedExpert;
+    }
+    if name.contains(".ffn.shared_experts.") {
+        return PlanClass::SharedExpert;
+    }
+    if name.contains(".ffn.gate.") {
+        return PlanClass::Router;
+    }
+    if matches!(name, "embed.weight" | "head.weight" | "norm.weight") {
+        return PlanClass::Tail;
+    }
+    // The released checkpoint carries three multi-modal special-token embeddings resident even on
+    // the text path (the vision tower and aligner are excluded from the plan, these three are not).
+    // They have no device kernel here, but they are claimed by name so the census stays total.
+    if matches!(name, "image_start" | "image_end" | "image_newline") {
+        return PlanClass::SpecialToken;
+    }
+    if name.contains(".engram.") || name.starts_with("engram.") {
+        return PlanClass::Engram;
+    }
+    if name.contains(".hc_") {
+        return PlanClass::Mhc;
+    }
+    if name.contains(".attn.") || name.contains(".attn_") || name.contains(".ffn_norm.") {
+        return PlanClass::AttentionAux;
+    }
+    PlanClass::Unclassified
+}
+
+/// Counts every resident plan shard by class.
+#[must_use]
+pub fn resident_plan_census(
+    plan: &ResidentPlan,
+    attention_table: &BTreeMap<String, (usize, usize)>,
+) -> PlanCensus {
+    let mut by_class: BTreeMap<PlanClass, usize> = BTreeMap::new();
+    let mut total = 0usize;
+    let mut unclassified = Vec::new();
+    for shard in plan.shards() {
+        if shard.placement != sparkflash_device::resident::Placement::Resident {
+            continue;
+        }
+        total += 1;
+        let class = classify_plan_name(&shard.name, attention_table);
+        if class == PlanClass::Unclassified {
+            unclassified.push(shard.name.clone());
+        }
+        *by_class.entry(class).or_insert(0) += 1;
+    }
+    PlanCensus {
+        by_class,
+        total,
+        unclassified,
+    }
+}
+
+/// Binds one plan weight shard (and its scale grid when the plan carries one) to the arena.
+///
+/// The byte check is the same rule for every class: a B12x-served FP8 weight must be exactly the
+/// tiled payload for its (cols, inner), a stored tensor exactly its rank shard's bytes, and a scale
+/// grid exactly its rank shard's bytes.
+fn bind_plan_pair(
+    arena: &ResidentArena,
+    shard: &sparkflash_device::resident::ResidentShard,
+    by_name: &BTreeMap<&str, &sparkflash_device::resident::ResidentShard>,
+) -> Result<MatrixBind, String> {
+    let weight = arena.slice(&shard.name).ok_or_else(|| {
+        format!(
+            "{}: no arena slice (the plan and the bind disagree)",
+            shard.name
+        )
+    })?;
+    let expected_weight = match sparkflash_device::arena::b12x_layout(shard) {
+        Some((cols, inner)) => b12x_buffer_bytes(cols, inner),
+        None => shard.shard_bytes as usize,
+    };
+    if weight.bytes != expected_weight {
         return Err(format!(
-            "bound {} of {} device-served attention tensors ({host_seam} host seams excluded): the plan is missing a tensor the expected-shape table names",
-            bound.len(),
-            device_served
+            "{}: arena slice is {} bytes but this rank's planned payload is {expected_weight}",
+            shard.name, weight.bytes
         ));
     }
-    Ok(bound)
+    let scale_name = format!("{}.scale", shard.name.trim_end_matches(".weight"));
+    let scales = match by_name.get(scale_name.as_str()) {
+        Some(scale_shard) => {
+            let slice = arena
+                .slice(&scale_name)
+                .ok_or_else(|| format!("{scale_name}: no arena slice for the scale grid"))?;
+            if slice.bytes != scale_shard.shard_bytes as usize {
+                return Err(format!(
+                    "{scale_name}: arena slice is {} bytes but this rank's planned grid is {}",
+                    slice.bytes, scale_shard.shard_bytes
+                ));
+            }
+            slice.ptr
+        }
+        None => weight.ptr,
+    };
+    Ok(MatrixBind {
+        weight: weight.ptr,
+        scales,
+    })
+}
+
+/// The MoE classes' expected name sets, derived from the model geometry rather than from the plan.
+///
+/// The plan can only be right if it carries every expert of every layer; the sets are the check's
+/// independent side, so a plan that skipped an expert would be named, not silently accepted.
+pub struct MoeExpectedSets {
+    /// Routed w1/w3 weights and scales, [layer][expert].
+    pub gate_up: BTreeSet<String>,
+    /// Routed w2 weights and scales, [layer][expert].
+    pub down: BTreeSet<String>,
+    /// Shared-expert w1/w3/w2 weights and scales, [layer].
+    pub shared: BTreeSet<String>,
+    /// Router gate weight, bias and bias_vl, [layer].
+    pub router: BTreeSet<String>,
+}
+
+/// Builds the four MoE class expected sets from the model geometry.
+#[must_use]
+pub fn moe_expected_sets(config: &ModelConfig) -> MoeExpectedSets {
+    let mut gate_up: BTreeSet<String> = BTreeSet::new();
+    let mut down: BTreeSet<String> = BTreeSet::new();
+    let mut shared: BTreeSet<String> = BTreeSet::new();
+    let mut router: BTreeSet<String> = BTreeSet::new();
+    for layer in 0..config.n_layers {
+        for expert in 0..config.n_routed_experts {
+            for matrix in [Matrix::Gate, Matrix::Up] {
+                let base = format!(
+                    "layers.{layer}.ffn.experts.{expert}.{}.weight",
+                    matrix.as_str()
+                );
+                gate_up.insert(base.clone());
+                gate_up.insert(format!("{}.scale", base.trim_end_matches(".weight")));
+            }
+            let base = format!("layers.{layer}.ffn.experts.{expert}.w2.weight");
+            down.insert(base.clone());
+            down.insert(format!("{}.scale", base.trim_end_matches(".weight")));
+        }
+        for matrix in [Matrix::Gate, Matrix::Up, Matrix::Down] {
+            let base = format!(
+                "layers.{layer}.ffn.shared_experts.{}.weight",
+                matrix.as_str()
+            );
+            shared.insert(base.clone());
+            shared.insert(format!("{}.scale", base.trim_end_matches(".weight")));
+        }
+        for part in [RouterPart::Weight, RouterPart::Bias, RouterPart::BiasVl] {
+            router.insert(format!("layers.{layer}.ffn.gate.{}", part.as_str()));
+        }
+    }
+    MoeExpectedSets {
+        gate_up,
+        down,
+        shared,
+        router,
+    }
+}
+
+/// Binds the routed experts, shared experts and routers of one rank to its arena, with one set
+/// check per device class and launch-compatibility rows for the current kernel ABIs.
+///
+/// # Errors
+/// A missing arena slice, a slice whose bytes are not the planned payload, or a class whose
+/// expected and bound name sets differ (the message names both directions).
+pub fn bind_rank_moe(
+    arena: &ResidentArena,
+    plan: &ResidentPlan,
+    config: &ModelConfig,
+) -> Result<MoeBind, String> {
+    let by_name: BTreeMap<&str, &sparkflash_device::resident::ResidentShard> = plan
+        .shards()
+        .iter()
+        .map(|shard| (shard.name.as_str(), shard))
+        .collect();
+    let empty_table: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut routed: BTreeMap<(usize, usize, Matrix), MatrixBind> = BTreeMap::new();
+    let mut shared: BTreeMap<(usize, Matrix), MatrixBind> = BTreeMap::new();
+    let mut router: BTreeMap<(usize, RouterPart), Deviceptr> = BTreeMap::new();
+    let mut routed_gate_up: BTreeSet<String> = BTreeSet::new();
+    let mut routed_down: BTreeSet<String> = BTreeSet::new();
+    let mut shared_names: BTreeSet<String> = BTreeSet::new();
+    let mut router_names: BTreeSet<String> = BTreeSet::new();
+    for shard in plan.shards() {
+        if shard.placement != sparkflash_device::resident::Placement::Resident {
+            continue;
+        }
+        // Scale shards are bound with their weight; the coverage sets still count their names.
+        if shard.name.ends_with(".scale") {
+            continue;
+        }
+        match classify_plan_name(&shard.name, &empty_table) {
+            PlanClass::RoutedExpert => {
+                let layer = plan_layer(&shard.name)
+                    .ok_or_else(|| format!("{}: no layer index", shard.name))?;
+                let expert = plan_expert(&shard.name)
+                    .ok_or_else(|| format!("{}: no expert index", shard.name))?;
+                let Some((matrix, false)) = matrix_and_scale(&shard.name) else {
+                    return Err(format!(
+                        "{}: a routed expert leaf is not a w1/w3/w2 weight",
+                        shard.name
+                    ));
+                };
+                let bind = bind_plan_pair(arena, shard, &by_name)?;
+                routed.insert((layer, expert, matrix), bind);
+                let scale = format!("{}.scale", shard.name.trim_end_matches(".weight"));
+                let set = match matrix {
+                    Matrix::Down => &mut routed_down,
+                    Matrix::Gate | Matrix::Up => &mut routed_gate_up,
+                };
+                set.insert(shard.name.clone());
+                set.insert(scale);
+            }
+            PlanClass::SharedExpert => {
+                let layer = plan_layer(&shard.name)
+                    .ok_or_else(|| format!("{}: no layer index", shard.name))?;
+                let Some((matrix, false)) = matrix_and_scale(&shard.name) else {
+                    return Err(format!(
+                        "{}: a shared-expert leaf is not a w1/w3/w2 weight",
+                        shard.name
+                    ));
+                };
+                let bind = bind_plan_pair(arena, shard, &by_name)?;
+                shared.insert((layer, matrix), bind);
+                shared_names.insert(shard.name.clone());
+                shared_names.insert(format!("{}.scale", shard.name.trim_end_matches(".weight")));
+            }
+            PlanClass::Router => {
+                let layer = plan_layer(&shard.name)
+                    .ok_or_else(|| format!("{}: no layer index", shard.name))?;
+                let part = if shard.name.ends_with(".gate.weight") {
+                    RouterPart::Weight
+                } else if shard.name.ends_with(".gate.bias") {
+                    RouterPart::Bias
+                } else if shard.name.ends_with(".gate.bias_vl") {
+                    RouterPart::BiasVl
+                } else {
+                    return Err(format!("{}: an unknown router leaf", shard.name));
+                };
+                let slice = arena
+                    .slice(&shard.name)
+                    .ok_or_else(|| format!("{}: no arena slice for the router", shard.name))?;
+                if slice.bytes != shard.shard_bytes as usize {
+                    return Err(format!(
+                        "{}: arena slice is {} bytes but this rank's planned payload is {}",
+                        shard.name, slice.bytes, shard.shard_bytes
+                    ));
+                }
+                router.insert((layer, part), slice.ptr);
+                router_names.insert(shard.name.clone());
+            }
+            _ => {}
+        }
+    }
+    // Expected sets come from the model geometry, not from the plan.
+    let expected = moe_expected_sets(config);
+    let expected_gate_up = expected.gate_up;
+    let expected_down = expected.down;
+    let expected_shared = expected.shared;
+    let expected_router = expected.router;
+    let empty: BTreeSet<String> = BTreeSet::new();
+    let coverage = vec![
+        (
+            "routed_experts_gate_up",
+            check_bind_coverage(
+                "routed_experts_gate_up",
+                &expected_gate_up,
+                &routed_gate_up,
+                &empty,
+            )?,
+        ),
+        (
+            "routed_experts_down",
+            check_bind_coverage("routed_experts_down", &expected_down, &routed_down, &empty)?,
+        ),
+        (
+            "shared_experts",
+            check_bind_coverage("shared_experts", &expected_shared, &shared_names, &empty)?,
+        ),
+        (
+            "router",
+            check_bind_coverage("router", &expected_router, &router_names, &empty)?,
+        ),
+    ];
+    let compat = vec![
+        serde_json::json!({
+            "class": "routed_experts_gate_up",
+            "launch_compatible": true,
+            "note": "routed_gate_up_sm121 reads SPARK_M4_MOE_WIDTH=576 output rows of 2560 packed bytes with the checkpoint's [576,160] row-scale grid; the arena stores exactly that per-expert slice",
+        }),
+        serde_json::json!({
+            "class": "routed_experts_down",
+            "launch_compatible": false,
+            "reason": "b12x_mxfp4_moe_sm121 reads the A8 pre-padded 640-K row layout (320 packed bytes and 20 scale bytes per output row); this rank's plan stores the checkpoint's 288-byte rows and 18-byte grid. Bound and bytes-verified, but a launch on this pointer would misindex every row after the first",
+            "remaining": "either a kernel ABI variant that reads the unpadded 576-wide K (kernel owner + repin), or a one-time boot repack of each expert's [5120,288] slice into a [5120,320] padded device area (+25.2 GiB/rank, still zero per-token H2D)",
+        }),
+        serde_json::json!({
+            "class": "shared_experts",
+            "launch_compatible": true,
+            "note": "b12x_mxfp8_dense_sm121 is runtime-shaped: w1/w3 launch with cols=576, inner=5120 and w2 with cols=5120, inner=576, which is exactly the B12x arena slice shape",
+        }),
+        serde_json::json!({
+            "class": "router",
+            "launch_compatible": true,
+            "note": "moe_router_sm121 reads the row-major BF16 [384,5120] gate weight and F32 [384] bias, which the arena stores untransformed",
+        }),
+    ];
+    Ok(MoeBind {
+        routed,
+        shared,
+        router,
+        coverage,
+        compat,
+    })
+}
+
+/// Binds the tail tensors (embedding row shard, certified head shard, final norm) to the arena.
+///
+/// # Errors
+/// A missing arena slice or a slice whose bytes are not the rank's planned payload.
+pub fn bind_rank_tail(
+    arena: &ResidentArena,
+    plan: &ResidentPlan,
+) -> Result<(TailBind, BindCoverage), String> {
+    let by_name: BTreeMap<&str, &sparkflash_device::resident::ResidentShard> = plan
+        .shards()
+        .iter()
+        .map(|shard| (shard.name.as_str(), shard))
+        .collect();
+    let point = |name: &str| -> Result<Deviceptr, String> {
+        let shard = by_name
+            .get(name)
+            .ok_or_else(|| format!("{name}: the plan does not carry the tail tensor"))?;
+        let slice = arena
+            .slice(name)
+            .ok_or_else(|| format!("{name}: no arena slice for the tail tensor"))?;
+        if slice.bytes != shard.shard_bytes as usize {
+            return Err(format!(
+                "{name}: arena slice is {} bytes but this rank's planned payload is {}",
+                slice.bytes, shard.shard_bytes
+            ));
+        }
+        Ok(slice.ptr)
+    };
+    let tail = TailBind {
+        embed: point("embed.weight")?,
+        head: point("head.weight")?,
+        norm: point("norm.weight")?,
+    };
+    let expected: BTreeSet<String> = ["embed.weight", "head.weight", "norm.weight"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let coverage = check_bind_coverage("tail", &expected, &expected, &BTreeSet::new())?;
+    Ok((tail, coverage))
+}
+
+#[cfg(test)]
+mod bind_coverage_tests {
+    use super::*;
+    use sparkflash_device::resident::{HeaderEntry, Placement, ResidentPlan};
+    use sparkflash_engine::tensor::TensorPlan;
+
+    fn names(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    fn released_plan() -> ResidentPlan {
+        let config = ModelConfig::v41_flash().expect("config");
+        let plan = TensorPlan::language_model(&config);
+        let entries: Vec<HeaderEntry> = plan
+            .specs()
+            .iter()
+            .map(|spec| {
+                // FP4 experts are stored as I8 with two values per byte in the last dimension.
+                let (dtype, shape) = if spec.dtype.name() == "F4_E2M1" {
+                    let mut shape = spec.shape.clone();
+                    let last = shape.len() - 1;
+                    shape[last] /= 2;
+                    ("I8".to_string(), shape)
+                } else {
+                    (spec.dtype.name().to_string(), spec.shape.clone())
+                };
+                HeaderEntry::new(spec.name.clone(), dtype, shape)
+            })
+            .collect();
+        ResidentPlan::plan(0, 4, entries).expect("world=4 rank 0 plan")
+    }
+
+    #[test]
+    fn the_set_check_refuses_a_difference_and_names_both_sides() {
+        let expected = names(&["layers.0.attn.wq_a.weight", "layers.0.attn.wkv.weight"]);
+        let equal = names(&["layers.0.attn.wkv.weight", "layers.0.attn.wq_a.weight"]);
+        let ok =
+            check_bind_coverage("unit", &expected, &equal, &names(&[])).expect("equal sets bind");
+        assert!(ok.complete());
+        assert_eq!(ok.expected, ok.bound);
+
+        let missing = names(&["layers.0.attn.wq_a.weight"]);
+        let error = check_bind_coverage("unit", &expected, &missing, &names(&[]))
+            .expect_err("a missing name must fail");
+        assert!(
+            error.contains("expected-but-not-bound: [\"layers.0.attn.wkv.weight\"]"),
+            "{error}"
+        );
+
+        let extra = names(&[
+            "layers.0.attn.wq_a.weight",
+            "layers.0.attn.wkv.weight",
+            "layers.0.attn.wq_b.weight",
+        ]);
+        let error = check_bind_coverage("unit", &expected, &extra, &names(&[]))
+            .expect_err("an unexpected name must fail");
+        assert!(
+            error.contains("bound-but-not-expected: [\"layers.0.attn.wq_b.weight\"]"),
+            "{error}"
+        );
+    }
+
+    /// The plan-side MoE class name sets: every resident shard classified by the bind's own
+    /// predicates. Independent of the geometry-derived expected sets, so the comparison below is a
+    /// real two-sided check and fails if a plan name is classified into the wrong class.
+    fn plan_moe_sets(
+        plan: &ResidentPlan,
+        table: &BTreeMap<String, (usize, usize)>,
+    ) -> MoeExpectedSets {
+        let mut gate_up = BTreeSet::new();
+        let mut down = BTreeSet::new();
+        let mut shared = BTreeSet::new();
+        let mut router = BTreeSet::new();
+        for shard in plan.shards() {
+            if shard.placement != Placement::Resident {
+                continue;
+            }
+            match classify_plan_name(&shard.name, table) {
+                PlanClass::RoutedExpert => {
+                    if shard.name.contains(".w2.") {
+                        down.insert(shard.name.clone());
+                    } else {
+                        gate_up.insert(shard.name.clone());
+                    }
+                }
+                PlanClass::SharedExpert => {
+                    shared.insert(shard.name.clone());
+                }
+                PlanClass::Router => {
+                    router.insert(shard.name.clone());
+                }
+                _ => {}
+            }
+        }
+        MoeExpectedSets {
+            gate_up,
+            down,
+            shared,
+            router,
+        }
+    }
+
+    #[test]
+    fn the_four_rank_moe_expected_and_plan_sets_are_equal_and_named() {
+        let config = ModelConfig::v41_flash().expect("config");
+        let table = rank_attention_plan_shapes(&config, 0, 4).expect("table");
+        let plan = released_plan();
+        let expected = moe_expected_sets(&config);
+        // Geometry, counted independently of the plan: 40 layers x 384 experts x (w1,w3) x
+        // (weight, scale) = 61,440 names; w2 = 30,720; shared 3 x 2 x 40 = 240; router 3 x 40 = 120.
+        assert_eq!(expected.gate_up.len(), 61_440);
+        assert_eq!(expected.down.len(), 30_720);
+        assert_eq!(expected.shared.len(), 240);
+        assert_eq!(expected.router.len(), 120);
+        let planned = plan_moe_sets(&plan, &table);
+        for (class, expected_side, plan_side) in [
+            ("routed gate/up", &expected.gate_up, &planned.gate_up),
+            ("routed down", &expected.down, &planned.down),
+            ("shared", &expected.shared, &planned.shared),
+            ("router", &expected.router, &planned.router),
+        ] {
+            assert_eq!(
+                expected_side,
+                plan_side,
+                "{class}: the geometry and this rank's plan disagree: \
+                 expected-but-not-planned: {:?}; planned-but-not-expected: {:?}",
+                expected_side.difference(plan_side).collect::<Vec<_>>(),
+                plan_side.difference(expected_side).collect::<Vec<_>>()
+            );
+        }
+        // Every expected weight has its scale grid in the plan: the bind pairs them and a missing
+        // grid would silently pair the weight pointer as a scale buffer.
+        let by_name: BTreeSet<&str> = plan.shards().iter().map(|s| s.name.as_str()).collect();
+        for name in &expected.gate_up {
+            if let Some(base) = name.strip_suffix(".weight") {
+                assert!(
+                    by_name.contains(format!("{base}.scale").as_str()),
+                    "{name}: the plan carries no scale grid"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_resident_plan_census_claims_every_shard_by_class() {
+        let config = ModelConfig::v41_flash().expect("config");
+        let table = rank_attention_plan_shapes(&config, 0, 4).expect("table");
+        let plan = released_plan();
+        let census = resident_plan_census(&plan, &table);
+        assert!(
+            census.unclassified.is_empty(),
+            "resident shards no class claims: {:?}",
+            census.unclassified
+        );
+        assert_eq!(census.total, plan.resident_tensors());
+        let count = |class: PlanClass| *census.by_class.get(&class).unwrap_or(&0);
+        assert_eq!(count(PlanClass::AttentionProjection), 208);
+        assert_eq!(count(PlanClass::AttentionHostSeam), 19);
+        assert_eq!(count(PlanClass::RoutedExpert), 92_160);
+        assert_eq!(count(PlanClass::SharedExpert), 240);
+        assert_eq!(count(PlanClass::Router), 120);
+        assert_eq!(count(PlanClass::Tail), 3);
+        for host_side in [
+            PlanClass::AttentionAux,
+            PlanClass::Mhc,
+            PlanClass::Engram,
+            PlanClass::Mtp,
+        ] {
+            assert!(
+                count(host_side) > 0,
+                "{}: the census must name this class, not fold it into another",
+                host_side.as_str()
+            );
+        }
+        let sum: usize = census.by_class.values().sum();
+        assert_eq!(
+            sum, census.total,
+            "every resident shard in exactly one class"
+        );
+        let evidence = census.evidence();
+        assert_eq!(evidence["resident_tensors"], census.total);
+        assert_eq!(evidence["unclassified"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn the_moe_arena_payload_predicate_matches_the_plan_shapes() {
+        let plan = released_plan();
+        let by_name: BTreeMap<&str, &sparkflash_device::resident::ResidentShard> = plan
+            .shards()
+            .iter()
+            .map(|shard| (shard.name.as_str(), shard))
+            .collect();
+        // Routed experts are stored I8 (packed FP4), so b12x_layout does not tile them and the
+        // arena slice is exactly the rank shard: 576 x 2560 = 1,474,560 bytes for w1/w3 and
+        // 5120 x 288 for w2.
+        for (name, bytes) in [
+            ("layers.0.ffn.experts.0.w1.weight", 1_474_560usize),
+            ("layers.0.ffn.experts.0.w3.weight", 1_474_560usize),
+            ("layers.0.ffn.experts.0.w2.weight", 1_474_560usize),
+            ("layers.0.ffn.experts.0.w2.scale", 92_160usize),
+            ("layers.0.ffn.gate.weight", 3_932_160usize),
+        ] {
+            let shard = by_name.get(name).expect("plan shard");
+            assert!(
+                sparkflash_device::arena::b12x_layout(shard).is_none(),
+                "{name}: stored, not B12x-tiled"
+            );
+            assert_eq!(shard.shard_bytes as usize, bytes, "{name}");
+        }
+        // The shared expert is B12x-served but NOT padded in the plan: 2304 / 4 = 576 output rows
+        // for w1/w3 and 576 reduction columns for w2, which the runtime-shaped dense kernel reads.
+        for (name, cols, inner) in [
+            ("layers.0.ffn.shared_experts.w1.weight", 576usize, 5120usize),
+            ("layers.0.ffn.shared_experts.w3.weight", 576, 5120),
+            ("layers.0.ffn.shared_experts.w2.weight", 5120, 576),
+        ] {
+            let shard = by_name.get(name).expect("plan shard");
+            assert_eq!(
+                sparkflash_device::arena::b12x_layout(shard),
+                Some((cols, inner)),
+                "{name}: the bind byte rule must tile it"
+            );
+            assert_eq!(
+                b12x_buffer_bytes(cols, inner),
+                shard.shard_bytes as usize,
+                "{name}: 576 rows are whole 32-row B12x tiles, so tiling does not change the size"
+            );
+        }
+        // The routed down-projection layout deviation the window evidence must name: the arena rows
+        // are 288 packed bytes (18 scale bytes) while the A8 pre-padded combine ABI reads 320 (20).
+        let w2 = by_name
+            .get("layers.0.ffn.experts.0.w2.weight")
+            .expect("plan shard");
+        let (rows, row_bytes) = (w2.shard_shape[0], w2.shard_shape[1]);
+        assert_eq!((rows, row_bytes), (5120, 288));
+        assert!(
+            row_bytes < 320,
+            "the combine kernel's pre-padded row is 320 bytes; the arena stores {row_bytes}"
+        );
+    }
+
+    #[test]
+    fn large_bind_classes_are_digested_and_small_classes_are_named() {
+        let config = ModelConfig::v41_flash().expect("config");
+        let expected = moe_expected_sets(&config);
+        let empty = BTreeSet::new();
+        let large = check_bind_coverage(
+            "routed_experts_gate_up",
+            &expected.gate_up,
+            &expected.gate_up,
+            &empty,
+        )
+        .expect("equal sets");
+        let evidence = large.evidence("routed_experts_gate_up");
+        assert_eq!(evidence["expected"], 61_440);
+        assert_eq!(evidence["complete"], true);
+        assert!(
+            evidence["expected_names"].is_null(),
+            "a 61,440-name class must not inline every name in the JSON"
+        );
+        assert!(evidence["expected_names_digest"].is_u64());
+        assert!(evidence["bound_names_digest"].is_u64());
+        assert_eq!(
+            large.manifest_lines("routed_experts_gate_up").len(),
+            2 * 61_440,
+            "the manifest carries every expected and bound name"
+        );
+
+        let small = check_bind_coverage(
+            "attention",
+            &names(&["layers.0.attn.wq_a.weight", "layers.0.attn.wkv.weight"]),
+            &names(&["layers.0.attn.wq_a.weight", "layers.0.attn.wkv.weight"]),
+            &names(&[]),
+        )
+        .expect("equal sets");
+        let evidence = small.evidence("attention");
+        assert_eq!(evidence["expected_names"].as_array().map(Vec::len), Some(2));
+        assert!(evidence["expected_names_digest"].is_null());
+    }
+
+    #[test]
+    fn the_four_rank_attention_expected_and_plan_sets_are_equal_and_named() {
+        let config = ModelConfig::v41_flash().expect("config");
+        let table = rank_attention_plan_shapes(&config, 0, 4).expect("table");
+        let plan = released_plan();
+        // Side A: the bind check's expected set (the table filtered by the structural host-seam
+        // predicate). Side B: the names this rank's plan can bind (a resident plan shard the table
+        // names and the predicate does not exclude). The two sets must be EQUAL; a count-only check
+        // cannot see a swap, and this test fails if they differ.
+        let expected: BTreeSet<String> = table
+            .keys()
+            .filter(|name| !is_host_seam_weight(name))
+            .cloned()
+            .collect();
+        let plan_derived: BTreeSet<String> = plan
+            .shards()
+            .iter()
+            .filter(|shard| shard.placement == Placement::Resident)
+            .filter(|shard| table.contains_key(&shard.name))
+            .filter(|shard| !is_host_seam_weight(&shard.name))
+            .map(|shard| shard.name.clone())
+            .collect();
+        assert_eq!(
+            expected,
+            plan_derived,
+            "the expected-shape table and this rank's plan disagree on the attention bind set: \
+             expected-but-not-planned: {:?}; planned-but-not-expected: {:?}",
+            expected.difference(&plan_derived).collect::<Vec<_>>(),
+            plan_derived.difference(&expected).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            expected.len(),
+            208,
+            "200 backbone projections + 8 indexer wq_b shards are device-served"
+        );
+        assert_eq!(
+            plan.shards()
+                .iter()
+                .filter(|shard| is_host_seam_weight(&shard.name))
+                .count(),
+            19,
+            "compressor wgate/wkv and indexer wk/weights_proj are host seams, counted by name"
+        );
+        // The named difference of the 2026-10-20 window: compressor tensors are host seams and must
+        // never be in the expected device set; indexer wq_b is the one indexer device weight.
+        assert!(
+            !expected.contains("layers.2.attn.compressor.wkv.weight"),
+            "compressor wkv is a host seam (CompressorCache), not a device weight"
+        );
+        assert!(
+            !expected.contains("layers.2.attn.compressor.wgate.weight"),
+            "compressor wgate is BF16 row-major on the host seam, not an FP8 B12x device weight"
+        );
+        assert!(
+            expected.contains("layers.2.attn.indexer.wq_b.weight"),
+            "the indexer wq_b is an MXFP8 B12x device weight on the rank plan"
+        );
+        // Cross-check against the bind check itself: equal sets still pass and report 208/208.
+        let coverage = check_bind_coverage("attention", &expected, &plan_derived, &names(&[]))
+            .expect("equal sets");
+        assert_eq!(coverage.expected.len(), coverage.bound.len());
+        assert!(coverage.complete());
+        assert_eq!(coverage.evidence("attention")["complete"], true);
+    }
+
+    #[test]
+    fn the_multi_modal_special_tokens_are_claimed_by_name_not_left_unclassified() {
+        // The released checkpoint carries image_start/image_end/image_newline resident; without a
+        // class the census would call them unclassified and summary.complete would be false for a
+        // reason that is not a bind defect.
+        let table: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for name in ["image_start", "image_end", "image_newline"] {
+            assert_eq!(
+                classify_plan_name(name, &table),
+                PlanClass::SpecialToken,
+                "{name}"
+            );
+        }
+        assert_eq!(PlanClass::SpecialToken.as_str(), "special_token");
+        // The backbone names are unaffected by the new class.
+        assert_eq!(classify_plan_name("embed.weight", &table), PlanClass::Tail);
+    }
 }

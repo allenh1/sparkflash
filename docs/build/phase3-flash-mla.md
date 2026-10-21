@@ -20,7 +20,7 @@ isolation; the chain wiring itself is M3's and is not in this branch.
 | item | value |
 | :--- | :--- |
 | kernel | `flash_mla_csa2_sm121` |
-| pin | 60,792 B, sha256 `5bfee4c7a0ece7c921e591fc6b8bd9d98c39b95d735d7c1d699ec58edaa51ea3`, 0 PTX membar lines |
+| pin | 60,792 B, sha256 `64fc2944d510885490ef1caeb680600f30b1d552c6ec31b0f6ed840ad0f09d2b`, 0 PTX membar lines |
 | format argument | `SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION = 2` |
 | grid / block | (64, 1, 1) blocks of (256, 1, 1) threads: one query head per block |
 | arguments | the pinned 19-word list through `cuda_harness::flash_mla_params` (q, kv_fp4, kv_scales, window_codes, window_scales, window_kv_format, window_rows, selected, index_key, index_query, sink, block_scores, block_best, out, position, selected_count, trace_ring, layer_id, step_seq) |
@@ -198,7 +198,7 @@ Evidence is node-only: `window-b11-20261018T234320Z.log`, `runs11/m14-tokens8.lo
 `/home/user/phase2-evidence/window-2026-10-18/`. Binary
 `m14_flash_mla_5efb7976_aarch64`, 3,995,840 B, sha256
 `5efb797600af22d14e91188bd012a22e869ba04fe9c4a4207d5cf8ff88782ba5`; cubin `flash_mla_csa2_sm121`,
-60,792 B, sha256 `5bfee4c7a0ece7c921e591fc6b8bd9d98c39b95d735d7c1d699ec58edaa51ea3`; MemAvailable
+60,792 B, sha256 `64fc2944d510885490ef1caeb680600f30b1d552c6ec31b0f6ed840ad0f09d2b`; MemAvailable
 117.7 GiB to 117.2 GiB (8 positions) and 117.6 GiB to 117.1 GiB (130 positions), against the 32-GiB
 floor. Old-metric numbers, retained for comparison only: 8 positions 262,136/262,144 exact
 (99.9969%), old f32-reference max abs delta 7.8060627e-3, max ULP 1, control 4.1607%; 130 positions
@@ -230,7 +230,7 @@ node-only: `/home/user/phase2-evidence/window-2026-10-18/window-b12-20261019T001
 
 Provenance: binary `m14_flash_mla_157350f4_aarch64`, 4,027,896 B, sha256
 `157350f4449ba6aa7cd9d86242291704550e591ee6bc96ff530601bcc3173587`; cubin `flash_mla_csa2_sm121`,
-60,792 B, sha256 `5bfee4c7a0ece7c921e591fc6b8bd9d98c39b95d735d7c1d699ec58edaa51ea3`, verified by the
+60,792 B, sha256 `64fc2944d510885490ef1caeb680600f30b1d552c6ec31b0f6ed840ad0f09d2b`, verified by the
 harness by size and sha256 before any device allocation; MemAvailable 117.8 GiB at start and 117.2 GiB
 at end for the 8-position run, 117.7 GiB to 117.1 GiB for the 130-position run, against the 32-GiB
 floor.

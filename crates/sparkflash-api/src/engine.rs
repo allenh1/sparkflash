@@ -272,6 +272,22 @@ pub struct EngineRequest {
     pub temperature: f32,
     /// Nucleus sampling threshold.
     pub top_p: f32,
+    /// Number of most likely tokens the candidate filter keeps: 0 and -1 disable it, values above
+    /// zero keep that many. vLLM refuses values below -1 (`sampling_params.py`: "top_k must be 0
+    /// (disable), or at least 1").
+    pub top_k: i32,
+    /// Repetition penalty over the prompt and the generated tokens so far: 1.0 disables it, above 1
+    /// discourages a repeated token, below 1 encourages it (`sampling_params.py` lines 248-253).
+    pub repetition_penalty: f32,
+    /// Presence penalty over generated tokens: subtracted once from every token that already
+    /// appears in the generated text (`sampling_params.py` lines 240-243). 0.0 disables it.
+    pub presence_penalty: f32,
+    /// Frequency penalty over generated tokens: subtracted once per occurrence from every token
+    /// in the generated text (`sampling_params.py` lines 244-246). 0.0 disables it.
+    pub frequency_penalty: f32,
+    /// Whether special tokens are hidden from the generated text; vLLM's OpenAI default is true
+    /// and an explicit false passes the raw decoded text through.
+    pub skip_special_tokens: bool,
     /// Whether the reasoning channel is enabled.
     pub thinking: bool,
     /// Reasoning effort score in `1..=100`, resolved by crate::reasoning.
@@ -643,6 +659,17 @@ pub trait InferenceEngine: Send + Sync {
     /// requests it cannot check rather than guessing a bound.
     fn vocab_size(&self) -> Option<usize> {
         None
+    }
+
+    /// Whether one request's multiple choices can be served as independent samples.
+    ///
+    /// The reference engine and the mock take one generate call per request, so repeated calls
+    /// for one response are independent draws: the default is true. An engine whose sampling
+    /// state is shared (the TP=4 group runs its four ranks as one lockstep sequence and its host
+    /// sampler is temperature+seed only) returns false, and the router refuses n > 1 with a typed
+    /// error instead of returning choices it cannot claim were drawn independently.
+    fn independent_choices(&self) -> bool {
+        true
     }
 
     /// Current cluster telemetry snapshot.
@@ -1108,6 +1135,11 @@ mod tests {
             max_tokens: 64,
             temperature: 1.0,
             top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            skip_special_tokens: true,
             thinking: true,
             reasoning_effort: Some(75),
             stop: Vec::new(),

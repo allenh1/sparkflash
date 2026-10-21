@@ -16,12 +16,14 @@
 //!
 //! # What it does not claim
 //!
-//! This is the *reference* engine: one sequence at a time, `f32`, on the CPU, with every weight
-//! decoded through [`sparkflash_engine::linalg::decode_by_name`] under an element limit. It is not
-//! a performance path and this module states no throughput figure for it. The numbers it reports
-//! are the ones it measures for one request over that request's own wall clock, and every field it
-//! does not measure is left at the zero it actually is, with the reason written beside it. There is
-//! no cluster, no rank and no rail behind this process, so nothing here reports one.
+//! This is the *reference* engine: `f32`, on the CPU, with every weight decoded through
+//! [`sparkflash_engine::linalg::decode_by_name`] under an element limit. Its default engine thread
+//! runs one sequence at a time; `--continuous-batching` opts into the S4 host scheduler described
+//! below, which interleaves up to `--max-batch` admitted requests over that same single engine. It
+//! is not a performance path and this module states no throughput figure for it. The numbers it
+//! reports are the ones it measures for one request over that request's own wall clock, and every
+//! field it does not measure is left at the zero it actually is, with the reason written beside it.
+//! There is no cluster, no rank and no rail behind this process, so nothing here reports one.
 //!
 //! # Phase-1 host TP=4 (feature `tp4-serve`)
 //!
@@ -39,9 +41,14 @@
 //! Phase 1 is single-sequence and unbatched: one request runs at a time, with one more permitted to
 //! queue behind it and any further concurrent request refused by the bounded job channel. The four
 //! ranks must see the same token sequence, so batching a different request into this group would
-//! desync them; that is a stated limitation, not an implicit queue policy. Prompt logprobs are not
-//! supported on this path (the rank loop scores generated positions), and are refused rather than
-//! approximated.
+//! desync them; that is a stated limitation, not an implicit queue policy. Prompt logprobs are
+//! served through the task-18 all-position rank contract
+//! ([tp4-prompt-logprobs-rank-contract.md](../../../docs/build/tp4-prompt-logprobs-rank-contract.md)):
+//! every rank screens its local LM-head shard and exchanges bounded candidate blocks over the
+//! forward's collectives, and the deterministic host merge reports a position only when its f32
+//! boundary proves the requested order. A top-k request is bounded (the HTTP cap is 20, the
+//! contract's bound is 63 alternatives); the whole-vocabulary -1 selection and any position whose
+//! order cannot be proven are refused with a typed message rather than approximated.
 //!
 //! # The engine is `Send + Sync` (since !60), and it still has one owner thread
 //!
@@ -62,8 +69,12 @@
 //! handoff keeps the driver weight-free and the engine on the thread that built it; no `unsafe` is
 //! involved.
 //!
-//! The consequence is that requests are serialised. That is the reference engine's own shape: one
-//! sequence, one chunk at a time, no batching. A request is one job on that thread.
+//! The default consequence is that requests are serialised: one sequence, one chunk at a time, one
+//! job at a time. The opt-in `--continuous-batching` mode keeps the same Job/Reply channel contract
+//! but admits up to `--max-batch` jobs FIFO and gives each admitted request one scheduler step per
+//! round (one prefill, then one emitted token plus one decode). That is host serving behaviour on
+//! the reference CPU engine; the device arm's batched attention, paged KV, TTFT and throughput are
+//! window measurements and are not claimed here.
 //!
 //! # Failures are events, not silence
 //!
@@ -81,7 +92,7 @@
 //! in. Nothing here has been run against a real sharded checkpoint, so nothing here claims that it
 //! has.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "tp4-serve")]
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -99,7 +110,8 @@ use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 #[cfg(feature = "tp4-serve")]
 use serde::{Deserialize, Serialize};
-use sparkflash_api::AppState;
+use sparkflash_api::device_chain::{ClaimMode, DeviceChainEnvelope};
+use sparkflash_api::device_token::{DeviceChainTokenSource, DeviceTokenSource, TokenPieceDecoder};
 use sparkflash_api::encoding::{
     HfTokenizerEncoder, TokenizerSeam, load_hf_tokenizer, resolve_reference_tokenizer,
 };
@@ -113,13 +125,18 @@ use sparkflash_api::telemetry_types::{
     CompletionTokensDetails, DSparkStepStats, DeepSeekSparkRequestStats, OpenAiUsageWithCache,
     PromptTokensDetails, RequestTimingStats, RoceTransportStats, finite_or_zero,
 };
+use sparkflash_api::{AppState, Metrics};
 #[cfg(feature = "cuda")]
 use sparkflash_device::CudaSession;
 use sparkflash_device::{DeviceEngine, DeviceSession, FakeSession};
 use sparkflash_engine::config::ModelConfig;
-use sparkflash_engine::forward::{InferenceEngine, Sampling, SequenceState, StepOutput};
+use sparkflash_engine::forward::{
+    InferenceEngine, SamplerOptions, Sampling, SequenceState, StepOutput,
+};
 use sparkflash_engine::linalg::{CHECKPOINT_TENSOR_LIMIT, REFERENCE_TENSOR_LIMIT, argmax};
 use sparkflash_engine::loader::ReferenceWeights;
+#[cfg(feature = "tp4-serve")]
+use sparkflash_engine::prompt_ranks::MergedPosition;
 use sparkflash_engine::synthetic::SyntheticWeights;
 use sparkflash_engine::tensor::{TensorPlan, TensorSpec};
 use sparkflash_engine::weights::{WeightError, WeightSource};
@@ -159,6 +176,13 @@ const REPLY_BUFFER: usize = 32;
 
 /// How many requests may wait for the engine thread before a request is refused.
 const JOB_QUEUE: usize = 64;
+
+/// The admission cap --continuous-batching uses when --max-batch is not given.
+///
+/// The queue is JOB_QUEUE jobs, and an admitted request holds one SequenceState; 32 keeps a host
+/// scheduler round under a millisecond of bookkeeping while still covering the 32-client ladder
+/// the serving census measures.
+const DEFAULT_MAX_BATCH: usize = 32;
 
 /// The seed the synthetic weight source is generated from.
 ///
@@ -264,6 +288,14 @@ const ENGINE_GONE_CODE: &str = "engine_gone";
 
 /// The error code for a request refused before any engine work, such as an image request.
 const REFUSED_CODE: &str = "refused";
+
+/// The control-channel error code for a deterministic TP=4 prompt-logprob contract refusal.
+///
+/// It is deliberately distinct from [ENGINE_ERROR_CODE]: every rank made the same decision after
+/// the same collectives, so the group can keep serving and the workers resynchronise on the next
+/// Request frame instead of exiting.
+#[cfg(feature = "tp4-serve")]
+const TP4_LOGPROBS_REFUSED_CODE: &str = "tp4_prompt_logprobs_refused";
 
 /// The exit code for a refusal: bad arguments, an unreadable tokenizer, a directory that is not a
 /// checkpoint. A runtime failure such as a bind error exits 1 instead.
@@ -511,6 +543,14 @@ pub struct ServeOptions {
     ///
     /// `usize::MAX` is how "no cap" is carried: the router compares each request against it.
     pub max_logprobs: usize,
+    /// Whether the reference engine thread runs the S4 host continuous-batching scheduler.
+    ///
+    /// Off is the serial path, byte for byte: one job at a time, the shape every existing serving
+    /// test and claim was measured on. On is the batching scheduler in this module.
+    pub continuous_batching: bool,
+    /// How many requests the scheduler admits at once; only meaningful with
+    /// [Self::continuous_batching], and 1 is a legal (degenerate) batch of one.
+    pub max_batch: usize,
     /// The element cap the reference pass applies to one tensor. Above it, a tensor is refused
     /// rather than materialised.
     ///
@@ -537,6 +577,15 @@ pub struct ServeOptions {
     /// control channel. See [ServeEngine].
     #[cfg(feature = "tp4-serve")]
     pub tp4: Option<Tp4ServeOptions>,
+    /// The bearer key every route except `/health` and `/metrics` requires, when set.
+    ///
+    /// `None` is the default and keeps the server open, exactly as before. The key is never
+    /// logged; a missing or wrong one gets the OpenAI 401 envelope.
+    pub api_key: Option<String>,
+    /// The recorded device token window to serve, when the operator passed --device-token-dir.
+    pub device_token_dir: Option<PathBuf>,
+    /// Whether a window without the writer's token_claimed assertion may be served (S7 rehearsal).
+    pub device_token_derived_claim: bool,
 }
 
 impl ServeOptions {
@@ -552,6 +601,18 @@ impl ServeOptions {
                 .map_err(|error| error.to_string())?;
         let tokenizer = cli.tokenizer;
         let checkpoint = cli.checkpoint;
+        // An empty key would authenticate only an empty bearer token; refuse it at parse time
+        // instead of turning the server into something neither open nor protected.
+        if cli
+            .api_key
+            .as_deref()
+            .is_some_and(|key| key.trim().is_empty())
+        {
+            return Err(
+                "--api-key must not be empty: an empty bearer token would be the only accepted one"
+                    .to_owned(),
+            );
+        }
         // The cap follows the source when the operator does not name one: a real checkpoint's
         // largest tensors are the embedding and the head at 661,913,600 elements each, and
         // [REFERENCE_TENSOR_LIMIT] would refuse them mid-request. This is the one place the choice
@@ -570,6 +631,44 @@ impl ServeOptions {
             }
             -1 => usize::MAX,
             value => usize::try_from(value).unwrap_or(usize::MAX),
+        };
+        // The batching scheduler is a reference-engine path: the device engine delegates its
+        // generation elsewhere and carries its own limitations, and the TP=4 group deliberately
+        // runs one job at a time so the four ranks see the same sequence. Both are refused rather
+        // than silently running serial.
+        if cli.continuous_batching && cli.engine == EngineChoice::Device {
+            return Err(
+                "--continuous-batching serves the reference engine path only: the device engine's generation path is unchanged and the scheduler state is not wired through it"
+                    .to_owned(),
+            );
+        }
+        #[cfg(feature = "tp4-serve")]
+        if cli.continuous_batching && cli.tp4_rank.is_some() {
+            return Err(
+                "--continuous-batching cannot be combined with --tp4-rank: the TP=4 group runs one request at a time so every rank sees the same token sequence, and batching a different request into the group would desync them"
+                    .to_owned(),
+            );
+        }
+        let max_batch = match cli.max_batch {
+            Some(0) => {
+                return Err(
+                    "--max-batch must be at least 1: a batch of zero would admit nothing"
+                        .to_owned(),
+                );
+            }
+            Some(value) if value > JOB_QUEUE => {
+                return Err(format!(
+                    "--max-batch {value} exceeds the {JOB_QUEUE}-request job queue, so the scheduler could never fill it"
+                ));
+            }
+            Some(_) if !cli.continuous_batching => {
+                return Err(
+                    "--max-batch needs --continuous-batching: without the scheduler the engine thread runs one request at a time and there is no batch to cap"
+                        .to_owned(),
+                );
+            }
+            Some(value) => value,
+            None => DEFAULT_MAX_BATCH,
         };
         // The packed Engram store is rows of a checkpoint's tensors; the synthetic plan carries
         // its own tiny table in memory, so there is no checkpoint to page and the combination is
@@ -592,6 +691,12 @@ impl ServeOptions {
             cli.engine,
             cli.device_cubin.as_deref(),
         )?;
+        if cli.device_token_derived_claim && cli.device_token_dir.is_none() {
+            return Err(
+                "--device-token-derived-claim needs --device-token-dir: the flag only changes how a recorded window's claim is established"
+                    .to_owned(),
+            );
+        }
         match (cli.synthetic, checkpoint) {
             (true, Some(_)) => Err(
                 "--synthetic and --checkpoint cannot both be given: --synthetic serves the tiny synthetic plan and --checkpoint serves a real sharded checkpoint, so choose one"
@@ -605,12 +710,17 @@ impl ServeOptions {
                 tokenizer,
                 max_tokens: cli.max_tokens,
                 max_logprobs,
+                continuous_batching: cli.continuous_batching,
+                max_batch,
                 element_limit,
                 engine: cli.engine,
                 device_cubin: cli.device_cubin,
                 engram_dir: cli.engram_dir,
                 #[cfg(feature = "tp4-serve")]
                 tp4,
+                api_key: cli.api_key,
+                device_token_dir: cli.device_token_dir,
+                device_token_derived_claim: cli.device_token_derived_claim,
             }),
         }
     }
@@ -633,6 +743,7 @@ impl ServeOptions {
                 },
                 tokenizer: tokenizer.to_path_buf(),
                 engram_dir: None,
+                batch: None,
             },
             (false, Some(path)) => checkpoint_recipe(path, tokenizer)?,
             (false, None) => return Err(no_weights_message()),
@@ -640,6 +751,7 @@ impl ServeOptions {
         // The parse already refused --engram-dir with --synthetic; this is where the checkpoint
         // recipe learns where its Engram rows come from.
         recipe.engram_dir = self.engram_dir.clone();
+        recipe.batch = self.continuous_batching.then_some(self.max_batch);
         Ok(recipe)
     }
 }
@@ -709,6 +821,42 @@ struct ServeArgs {
         default_value_t = 20
     )]
     max_logprobs: i64,
+    /// Require a bearer API key on every route except /health, /readyz and /metrics.
+    ///
+    /// Without it (and without SPARKFLASH_SERVE_API_KEY) the server is open, exactly as it was
+    /// before auth existed. With it, a missing or wrong Authorization: Bearer header is answered
+    /// with the OpenAI 401 envelope; /health, /readyz and /metrics stay reachable for liveness
+    /// probes, readiness probes and local scrapers.
+    #[arg(long, value_name = "KEY", env = "SPARKFLASH_SERVE_API_KEY")]
+    api_key: Option<String>,
+    /// Serve a claimed four-rank device token envelope from this window directory.
+    ///
+    /// The directory is a recorded token window (rank{rank}/tp4-forward-embed-r{rank}.json and
+    /// tp4-token-r{rank}.json, or the same files flat). A plain greedy request whose prompt is the
+    /// recorded prompt ids is answered from the envelope and labelled with the UNMEASURED device
+    /// provenance headers; every other request falls back to the engine exactly as before. The
+    /// window's claim state is printed at startup, so a refused window is visible instead of
+    /// silently serving.
+    #[arg(long, value_name = "DIR")]
+    device_token_dir: Option<PathBuf>,
+    /// Accept a window whose writer did not assert token_claimed, deriving the claim from the
+    /// complete four-rank loop evidence (consensus, per-position claimable, nine reference
+    /// matches, fed forward_ids). This is the S7 rehearsal form; it is not the S8 acceptance form.
+    #[arg(long)]
+    device_token_derived_claim: bool,
+    /// Admit several requests to one reference engine and interleave their steps.
+    ///
+    /// This is the S4 host continuous-batching scheduler: a FIFO admission queue under
+    /// --max-batch, one prefill per admitted request, then one emitted token and one decode step
+    /// per active request per scheduler step. It is the reference CPU engine, so it is a host
+    /// serving-behaviour seam and a measured diagnostic path, not a device throughput claim.
+    /// Off by default: without it the engine thread runs one request at a time, exactly as before.
+    #[arg(long)]
+    continuous_batching: bool,
+    /// The most requests the continuous-batching scheduler admits at once (requires
+    /// --continuous-batching).
+    #[arg(long, value_name = "N")]
+    max_batch: Option<usize>,
     /// The element cap the reference pass applies to one tensor; the default follows the source.
     ///
     /// `--synthetic` keeps the reference guard, [REFERENCE_TENSOR_LIMIT], which the tiny plan fits
@@ -787,6 +935,8 @@ struct Recipe {
     /// run reads them the old way (which `--synthetic` can, since its tiny table fits in memory,
     /// and which a real checkpoint does not, since the shards refuse them).
     engram_dir: Option<PathBuf>,
+    /// The continuous-batching admission cap, or None for the serial one-job-at-a-time loop.
+    batch: Option<usize>,
 }
 
 /// Where the weights come from.
@@ -866,6 +1016,7 @@ fn checkpoint_recipe(path: &Path, tokenizer: &Path) -> Result<Recipe, String> {
         // The caller attaches --engram-dir after resolving the source; a checkpoint recipe
         // itself does not know where a packed store lives.
         engram_dir: None,
+        batch: None,
     })
 }
 
@@ -1188,6 +1339,97 @@ fn load_tokenizer(path: &Path) -> Result<HfTokenizerEncoder, String> {
     load_hf_tokenizer(path).map_err(|error| format!("--tokenizer {}: {error}", path.display()))
 }
 
+/// Splits a decoded stream into the pieces a device window's token ids contribute, in order.
+///
+/// The seam decodes the ids it is given; a piece is the text decode(prefix + [id]) adds over
+/// decode(prefix). A tokenizer whose decode is not prefix-monotonic (a byte-level BPE that
+/// rewrites the previous bytes) refuses the piece instead of serving text that is not the decode
+/// of the claimed ids.
+struct SeamPieceDecoder {
+    seam: Arc<TokenizerSeam>,
+}
+
+impl TokenPieceDecoder for SeamPieceDecoder {
+    fn piece(&self, ids_so_far: &[u32], token_id: u32) -> Result<String, String> {
+        let mut ids = Vec::with_capacity(ids_so_far.len() + 1);
+        ids.extend_from_slice(ids_so_far);
+        ids.push(token_id);
+        let full = self
+            .seam
+            .decode(&ids)
+            .ok_or_else(|| format!("the tokenizer could not decode ids {ids:?}"))?;
+        let prefix = if ids_so_far.is_empty() {
+            String::new()
+        } else {
+            self.seam
+                .decode(ids_so_far)
+                .ok_or_else(|| format!("the tokenizer could not decode ids {ids_so_far:?}"))?
+        };
+        match full.strip_prefix(prefix.as_str()) {
+            Some(piece) => Ok(piece.to_owned()),
+            None => Err(format!(
+                "the tokenizer's decode is not prefix-monotonic at {} ids: {:?} does not start with {:?}",
+                ids_so_far.len(),
+                full,
+                prefix
+            )),
+        }
+    }
+}
+
+/// Builds the device token source when --device-token-dir was given, printing its claim state.
+///
+/// The window is loaded once at startup: a schema error refuses startup (a typo or a wrong window
+/// must not silently serve the host twin), while a refused claim only makes every eligible request
+/// fall back to the host twin, which is the fail-closed contract. The claim state is printed so the
+/// operator sees which form the S7 probe will exercise.
+fn device_token_source(
+    options: &ServeOptions,
+    seam: &Arc<TokenizerSeam>,
+) -> Result<Option<Arc<dyn DeviceTokenSource>>, String> {
+    let Some(dir) = options.device_token_dir.as_deref() else {
+        return Ok(None);
+    };
+    if !dir.is_dir() {
+        return Err(format!(
+            "--device-token-dir {}: not a directory",
+            dir.display()
+        ));
+    }
+    let envelope = DeviceChainEnvelope::load(dir)
+        .map_err(|error| format!("--device-token-dir {}: {error}", dir.display()))?;
+    let mode = if options.device_token_derived_claim {
+        ClaimMode::Derived
+    } else {
+        ClaimMode::Asserted
+    };
+    match envelope.claim_with(mode) {
+        Ok(claimed) => eprintln!(
+            "sparkflash serve: device token source {}: {} claim ok ({} tokens, prompt_len {}, dump {})",
+            dir.display(),
+            mode.label(),
+            claimed.tokens.len(),
+            claimed.metadata.prompt_len,
+            if claimed.logits_dump.is_some() {
+                "present"
+            } else {
+                "absent"
+            }
+        ),
+        Err(refusal) => eprintln!(
+            "sparkflash serve: device token source {}: {} claim refused, serving the host twin for every request: {refusal}",
+            dir.display(),
+            mode.label()
+        ),
+    }
+    let decoder = Arc::new(SeamPieceDecoder {
+        seam: Arc::clone(seam),
+    });
+    Ok(Some(Arc::new(
+        DeviceChainTokenSource::new(dir, decoder).with_claim_mode(mode),
+    )))
+}
+
 /// The api crate's engine, backed by the engine thread.
 ///
 /// It holds no engine state: a job in, replies out. That is what makes it `Send + Sync`; the
@@ -1201,6 +1443,14 @@ pub struct ReferenceDriver {
     /// `logprob_token_ids` are validated against the model rather than guessed.
     vocab_size: usize,
     cluster: ClusterStatsSnapshot,
+    /// Whether the engine thread runs the continuous-batching scheduler, for the queue-refusal text.
+    batched: bool,
+    /// The exporter the engine thread feeds as requests are admitted, generate and finish.
+    ///
+    /// The router serves this same registry (`AppState::with_metrics`), so the scheduler gauges,
+    /// the generator counter and the TTFT histogram describe this driver's real requests instead
+    /// of a second, empty registry.
+    metrics: Arc<Metrics>,
 }
 
 impl ReferenceDriver {
@@ -1218,9 +1468,14 @@ impl ReferenceDriver {
         let (jobs, queued) = tokio::sync::mpsc::channel(JOB_QUEUE);
         let (ready, reported) = std::sync::mpsc::channel();
         let owned = recipe.clone();
+        // The exporter is created here, before the thread, so the engine thread and the router can
+        // share one registry: the driver's own request lifecycle is what feeds the scheduler
+        // gauges, the generator counter and the TTFT histogram.
+        let metrics = Arc::new(Metrics::new());
+        let thread_metrics = Arc::clone(&metrics);
         std::thread::Builder::new()
             .name(ENGINE_THREAD_NAME.to_owned())
-            .spawn(move || engine_thread(&owned, element_limit, queued, ready))
+            .spawn(move || engine_thread(&owned, element_limit, queued, ready, thread_metrics))
             .map_err(|error| format!("cannot start the engine thread: {error}"))?;
         match reported.recv() {
             Ok(Ok(())) => Ok(Self {
@@ -1229,10 +1484,23 @@ impl ReferenceDriver {
                 max_tokens,
                 vocab_size: recipe.config.vocab_size,
                 cluster: cluster_snapshot(),
+                batched: recipe.batch.is_some(),
+                metrics,
             }),
             Ok(Err(message)) => Err(message),
             Err(_) => Err("the engine thread stopped before it reported ready".to_owned()),
         }
+    }
+}
+
+impl ReferenceDriver {
+    /// The exporter this driver's request lifecycle feeds.
+    ///
+    /// `sparkflash serve` hands the same registry to the router, so /metrics reports the
+    /// scheduler gauges, generator counter and TTFT histogram of the requests this driver ran.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
     }
 }
 
@@ -1258,20 +1526,36 @@ impl ApiInferenceEngine for ReferenceDriver {
         }
         let prompt_tokens = request.prompt_tokens.len();
         let max_tokens = request.max_tokens.min(self.max_tokens);
+        let enqueued_at = Instant::now();
         let (replies, answers) = tokio::sync::mpsc::channel(REPLY_BUFFER);
         let job = Job {
             prompt_tokens: request.prompt_tokens,
             max_tokens,
             temperature: request.temperature,
+            top_p: request.top_p,
+            top_k: request.top_k,
+            repetition_penalty: request.repetition_penalty,
+            presence_penalty: request.presence_penalty,
+            frequency_penalty: request.frequency_penalty,
+            skip_special_tokens: request.skip_special_tokens,
             seed: request.seed.unwrap_or(0),
             logprobs: request.logprobs,
+            stop: request.stop,
+            enqueued_at,
             replies,
         };
+        // The request is queued from this moment; the engine thread moves it from waiting to
+        // running when it admits it. A refused enqueue never entered the queue, so the record is
+        // taken back instead of leaving a phantom waiting request behind.
+        self.metrics.request_enqueued();
         if self.jobs.try_send(job).is_err() {
-            return refused(
-                "the engine queue is full: the reference engine runs one request at a time and the queue is bounded, so retry when the requests in flight have finished",
-                REFUSED_CODE,
-            );
+            self.metrics.request_enqueue_refused();
+            let message = if self.batched {
+                "the engine queue is full: the continuous-batching scheduler admits up to --max-batch requests and the job queue is bounded, so retry when the requests in flight have finished"
+            } else {
+                "the engine queue is full: the reference engine runs one request at a time and the queue is bounded, so retry when the requests in flight have finished"
+            };
+            return refused(message, REFUSED_CODE);
         }
         // `cached_tokens` is zero because this process has no prefix cache at all: zero is the
         // measurement, not a miss that rounded down.
@@ -1520,6 +1804,13 @@ pub enum Tp4ControlFrame {
         prompt_ids: Vec<u32>,
         /// The request's clamped generation budget.
         max_tokens: u32,
+        /// The prompt-logprobs top count the request asked for, when it asked for any.
+        ///
+        /// `None` is "no prompt logprobs"; `Some(0)` is "each prompt position's own token
+        /// only". The whole-vocabulary -1 selection is refused before a job is admitted: the
+        /// bounded candidate exchange cannot carry it.
+        #[serde(default)]
+        prompt_logprobs: Option<u32>,
     },
     /// Rank 0 -> every worker: the sampled token for the next lockstep decode.
     Token {
@@ -1889,10 +2180,30 @@ struct Job {
     max_tokens: usize,
     /// The sampling temperature the request asked for.
     temperature: f32,
+    /// The nucleus threshold the request asked for (1.0 when it named none).
+    top_p: f32,
+    /// The candidate count the request asked for (0 when it named none: disabled).
+    top_k: i32,
+    /// The repetition penalty the request asked for (1.0 when it named none: disabled).
+    repetition_penalty: f32,
+    /// The presence penalty the request asked for (0.0 when it named none: disabled).
+    presence_penalty: f32,
+    /// The frequency penalty the request asked for (0.0 when it named none: disabled).
+    frequency_penalty: f32,
+    /// Whether special tokens are hidden from the emitted text (vLLM's OpenAI default true).
+    skip_special_tokens: bool,
     /// The sampler seed, defaulting to zero when the request named none.
     seed: u64,
     /// The logprobs the request asked for; the default asks for none and costs nothing.
     logprobs: LogprobsRequest,
+    /// The stop strings the request asked for, in request order. Empty means no stop string.
+    stop: Vec<String>,
+    /// When the driver accepted the request into the engine queue.
+    ///
+    /// Captured immediately before the channel send, so the TTFT histogram built from it includes
+    /// the queue wait a client actually sees. The existing per-request timing block keeps its own
+    /// definition (from the start of run_request), so no wire field changes meaning.
+    enqueued_at: Instant,
     /// Where the events go.
     replies: tokio::sync::mpsc::Sender<Reply>,
 }
@@ -2134,7 +2445,10 @@ fn rate(count: usize, seconds: f64) -> f64 {
     finite_or_zero(count as f64 / seconds)
 }
 
-/// The engine thread: build once, then run jobs one at a time until the queue closes.
+/// The engine thread: build once, then run jobs until the queue closes.
+///
+/// The default loop runs one job at a time. A recipe with a batch cap runs the S4 host scheduler
+/// instead: FIFO admission up to that cap, round-robin steps, same replies.
 ///
 /// The engine and the tokenizer are built here rather than on the caller's thread because the
 /// engine must never leave the thread that built it, and the handshake tells the caller whether
@@ -2144,6 +2458,7 @@ fn engine_thread(
     element_limit: usize,
     mut jobs: tokio::sync::mpsc::Receiver<Job>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
+    metrics: Arc<Metrics>,
 ) {
     let built = build_engine(recipe, element_limit).and_then(|engine| {
         load_tokenizer(&recipe.tokenizer).map(|tokenizer| (Box::new(engine), tokenizer))
@@ -2159,7 +2474,16 @@ fn engine_thread(
         // The caller gave up before the engine was ready; there is nobody to serve.
         return;
     }
+    if let Some(max_batch) = recipe.batch {
+        // The opt-in S4 host scheduler: same jobs channel, same replies, admission and round-robin
+        // interleaving instead of one request at a time.
+        run_continuous_engine_loop(&mut engine, &tokenizer, &mut jobs, max_batch, &metrics);
+        return;
+    }
     while let Some(job) = jobs.blocking_recv() {
+        // The request leaves the waiting gauge and enters the running one before its first engine
+        // call; the terminal branch below returns it to zero whichever way the request ends.
+        metrics.request_admitted();
         // The sampler is per request and `with_sampling` consumes the engine, so the value inside
         // the box is replaced around the same plan and the same weight source - no weight is
         // re-read and no checkpoint is re-opened by this.
@@ -2167,12 +2491,24 @@ fn engine_thread(
             temperature: job.temperature,
             seed: job.seed,
         });
+        // The OpenAI sampling parameters are honoured on the reference path; the TP=4 host path
+        // keeps its temperature/seed-only sampler and documents that as a gap.
+        engine.set_sampler_options(SamplerOptions {
+            top_p: job.top_p,
+            top_k: job.top_k,
+            repetition_penalty: job.repetition_penalty,
+            presence_penalty: job.presence_penalty,
+            frequency_penalty: job.frequency_penalty,
+            prompt_len: job.prompt_tokens.len(),
+        });
         // A panic ends this one request rather than the process - in a build that unwinds. The
         // workspace release profile's `panic = "abort"` makes this unreachable there, and Cargo does
         // not let a package override `panic`, so a release binary aborts by design; the module docs
         // say so, and the panic test below is compiled only where unwinding is on.
         let replies = job.replies.clone();
-        let outcome = catch_unwind(AssertUnwindSafe(|| run_request(&engine, &tokenizer, job)));
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            run_request(&engine, &tokenizer, job, &metrics)
+        }));
         let failure = match outcome {
             Ok(Ok(())) => None,
             Ok(Err(message)) => Some(message),
@@ -2184,6 +2520,7 @@ fn engine_thread(
         if let Some(message) = failure {
             let _ = replies.blocking_send(Reply::Failed(message));
         }
+        metrics.request_finished();
     }
 }
 
@@ -2197,6 +2534,407 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
         text.clone()
     } else {
         "a panic whose payload is not a string".to_owned()
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Host continuous batching
+// ---------------------------------------------------------------------------------------
+//
+// The default reference loop runs one Job at a time: engine_thread receives a job, runs it to
+// completion, then receives the next. Everything a request needs to make progress between two
+// engine calls (the SequenceState, the detokeniser, the stop matcher, DSpark accounting, timing)
+// is local to run_request, so the queue wait a client sees is the whole request that is ahead of
+// it.
+//
+// This section is the S4 scheduler behind --continuous-batching: the same Job/Reply channel
+// contract, but the loop admits up to max_batch jobs FIFO, gives every admitted request one
+// scheduler step per round, and interleaves their engine calls. One step is one prefill (whole
+// prompt, the same prefill_chunked call the serial path makes), and after that one emitted token
+// plus one decode call. The engine is single-threaded and owned by this thread, so per-request
+// sampling is applied with the non-consuming set_sampling/set_sampler_options before each engine
+// call rather than by swapping the engine.
+//
+// This is host serving behaviour on the reference CPU engine, not a device claim. The device arm's
+// batched attention, paged KV and TTFT are window measurements; nothing here speaks to them. The
+// per-request state is the state the serial loop already keeps, just lifted into a slot: logprobs,
+// prompt logprobs, stop strings, DSpark accounting and timings are the same computations, and a
+// one-request batch reaches the same token sequence as the serial path.
+
+/// One scheduler step's outcome for one admitted request.
+enum BatchAdvance {
+    /// The request is still running.
+    Active,
+    /// The request's terminal reply has been sent.
+    Done,
+}
+
+/// Where one batched request is in its life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchPhase {
+    /// The prompt has not been prefilled.
+    Prefill,
+    /// The prompt is prefilled; tokens are emitted and decoded one scheduler step at a time.
+    Decode,
+}
+
+/// One admitted request's scheduling slot.
+struct BatchedRequest {
+    /// The queued request: prompt, sampler parameters, replies and stop strings.
+    job: Job,
+    /// The engine sequence this slot has consumed.
+    state: SequenceState,
+    /// When the job entered the scheduler, for the timing block.
+    started: Instant,
+    /// Prefill or generation.
+    phase: BatchPhase,
+    /// The raw logits of the position last fed, for the token about to be emitted.
+    logits: Vec<f32>,
+    /// The token the last step sampled, or None when the row produced none.
+    next: Option<u32>,
+    /// The drafts after the anchor, for the DSpark accept rule.
+    drafts_for_next: Vec<u32>,
+    /// Generated tokens so far, including the one that completed a stop string.
+    completion_tokens: usize,
+    /// Time to first token, measured at the first emission.
+    ttft: Option<Duration>,
+    /// Wall clock the prefill took.
+    prefill_elapsed: Duration,
+    /// The request's speculative-decoding accounting.
+    dspark: SpeculativeAccounting,
+    /// The stop-string matcher that owns emitted text.
+    stop_buffer: StopBuffer,
+    /// Streaming detokeniser state: the same three values tokenizers::DecodeStream keeps.
+    decode_ids: Vec<u32>,
+    /// Previously produced text, trimmed from the next decode.
+    decode_prefix: String,
+    /// The index in decode_ids the decode prefix ends at.
+    decode_prefix_index: usize,
+    /// The last (up to four) generated ids, for vLLM's byte-fallback logprob correction.
+    logprob_context: Vec<u32>,
+}
+
+impl BatchedRequest {
+    /// Lifts one queued job into a scheduling slot.
+    fn new(job: Job, config: &ModelConfig) -> Self {
+        let stop_buffer = StopBuffer::new(&job.stop);
+        Self {
+            job,
+            state: SequenceState::new(config),
+            started: Instant::now(),
+            phase: BatchPhase::Prefill,
+            logits: Vec::new(),
+            next: None,
+            drafts_for_next: Vec::new(),
+            completion_tokens: 0,
+            ttft: None,
+            prefill_elapsed: Duration::ZERO,
+            dspark: SpeculativeAccounting::default(),
+            stop_buffer,
+            decode_ids: Vec::new(),
+            decode_prefix: String::new(),
+            decode_prefix_index: 0,
+            logprob_context: Vec::new(),
+        }
+    }
+
+    /// Applies this request's sampler to the shared engine before one of its calls.
+    ///
+    /// The serial loop swaps the engine with with_sampling once per request. Here the engine is
+    /// shared by the active requests, so the same choice is applied non-consumingly before every
+    /// call: the host engine is single-threaded and this thread owns it, so nothing else runs
+    /// between the call to this method and the engine call it guards.
+    fn apply_sampling(&self, engine: &mut InferenceEngine) {
+        engine.set_sampling(Sampling {
+            temperature: self.job.temperature,
+            seed: self.job.seed,
+        });
+        engine.set_sampler_options(SamplerOptions {
+            top_p: self.job.top_p,
+            top_k: self.job.top_k,
+            repetition_penalty: self.job.repetition_penalty,
+            presence_penalty: self.job.presence_penalty,
+            frequency_penalty: self.job.frequency_penalty,
+            prompt_len: self.job.prompt_tokens.len(),
+        });
+    }
+
+    /// Sends one text delta to the client that owns this request.
+    fn send_delta(&self, text: String) -> Result<(), String> {
+        self.job
+            .replies
+            .blocking_send(Reply::Delta(text))
+            .map_err(|_| "the client stopped reading this response".to_owned())
+    }
+
+    /// Sends the terminal reply for a request that is over.
+    ///
+    /// The tail-flush and finish-reason rules are the ones run_request uses: a matched stop owns
+    /// the text and reports Stop, an exhausted budget reports Length, and the token that
+    /// completed a stop string counts as generated.
+    fn finish(&mut self, finish_reason: FinishReason) -> Result<BatchAdvance, String> {
+        let tail = self.stop_buffer.finish();
+        if !tail.is_empty() {
+            self.send_delta(tail)?;
+        }
+        self.dspark.finish();
+        eprintln!("sparkflash serve: {}", self.dspark.evidence_line());
+        let timing = RequestTiming::measure(
+            self.job.prompt_tokens.len(),
+            self.completion_tokens,
+            self.prefill_elapsed,
+            self.ttft,
+            self.started.elapsed(),
+        );
+        self.job
+            .replies
+            .blocking_send(Reply::Done(Box::new(RunSummary {
+                completion_tokens: self.completion_tokens,
+                finish_reason,
+                timing,
+                dspark: self.dspark.stats(),
+            })))
+            .map_err(|_| "the client stopped reading this response".to_owned())?;
+        Ok(BatchAdvance::Done)
+    }
+
+    /// Runs one scheduler step for this request.
+    fn advance(
+        &mut self,
+        engine: &mut InferenceEngine,
+        tokenizer: &HfTokenizerEncoder,
+        metrics: &Metrics,
+    ) -> Result<BatchAdvance, String> {
+        self.apply_sampling(engine);
+        match self.phase {
+            BatchPhase::Prefill => {
+                let want_prompt =
+                    self.job.logprobs.wants_prompt() && !self.job.prompt_tokens.is_empty();
+                let prefill = if want_prompt {
+                    let decode_ids = |ids: &[u32]| -> Result<String, String> {
+                        tokenizer.tokenizer().decode(ids, false).map_err(|error| {
+                            format!(
+                                "the tokenizer could not decode {} token id(s): {error}",
+                                ids.len()
+                            )
+                        })
+                    };
+                    let mut decoder = LogprobDecoder::new(&decode_ids);
+                    let (step, payload) = prompt_logprobs_pass(
+                        engine,
+                        &self.job.prompt_tokens,
+                        &mut self.state,
+                        &self.job.logprobs,
+                        &mut decoder,
+                    )?;
+                    self.job
+                        .replies
+                        .blocking_send(Reply::PromptLogprobs(Box::new(payload)))
+                        .map_err(|_| "the client stopped reading this response".to_owned())?;
+                    step
+                } else {
+                    let plan = ChunkedPrefillPlan::plan(
+                        self.job.prompt_tokens.len(),
+                        0,
+                        &SchedulerConfig::default(),
+                    )
+                    .map_err(|error| {
+                        format!("the chunked prefill plan could not be built: {error}")
+                    })?;
+                    prefill_chunked(engine, &mut self.state, &self.job.prompt_tokens, &plan)?
+                };
+                self.prefill_elapsed = self.started.elapsed();
+                self.logits = prefill.logits;
+                self.next = prefill.next_token;
+                self.drafts_for_next = prefill
+                    .draft
+                    .get(1..)
+                    .map_or_else(Vec::new, <[u32]>::to_vec);
+                self.phase = BatchPhase::Decode;
+                Ok(BatchAdvance::Active)
+            }
+            BatchPhase::Decode => {
+                if self.completion_tokens >= self.job.max_tokens {
+                    return self.finish(FinishReason::Length);
+                }
+                let Some(token) = self.next else {
+                    return self.finish(FinishReason::Stop);
+                };
+                if let Some(target_argmax) = finite_target_argmax(&self.logits) {
+                    self.dspark
+                        .observe_token(target_argmax, &self.drafts_for_next);
+                } else {
+                    self.dspark.observe_nonfinite(&self.drafts_for_next);
+                }
+                if self.ttft.is_none() {
+                    // Same histogram rule as the serial path: driver entry to first token, so the
+                    // scheduler queue wait and the prefill are both included.
+                    metrics
+                        .observe_time_to_first_token(self.job.enqueued_at.elapsed().as_secs_f64());
+                    self.ttft = Some(self.started.elapsed());
+                }
+                let piece = tokenizers::step_decode_stream(
+                    tokenizer.tokenizer(),
+                    vec![token],
+                    self.job.skip_special_tokens,
+                    &mut self.decode_ids,
+                    &mut self.decode_prefix,
+                    &mut self.decode_prefix_index,
+                )
+                .map_err(|error| format!("the tokenizer could not decode token {token}: {error}"))?
+                .filter(|piece| !piece.is_empty());
+                // The stop matcher owns the text: it returns only the characters safe to emit now,
+                // and a match truncates them at the stop string.
+                let emit = self.stop_buffer.push(piece.as_deref());
+                if self.job.logprobs.wants_sample() {
+                    // The logprob belongs to the token the logits just produced, so it is built
+                    // before that token is fed back in. The decoder is rebuilt from the request's
+                    // four-id context because the serial path holds it across the whole request;
+                    // the correction only reads the last four ids, so the reconstruction is exact.
+                    let row = log_softmax(&self.logits);
+                    let decode_ids = |ids: &[u32]| -> Result<String, String> {
+                        tokenizer.tokenizer().decode(ids, false).map_err(|error| {
+                            format!(
+                                "the tokenizer could not decode {} token id(s): {error}",
+                                ids.len()
+                            )
+                        })
+                    };
+                    let mut decoder = LogprobDecoder::new(&decode_ids);
+                    for &context in &self.logprob_context {
+                        decoder.push(context);
+                    }
+                    let token_string = decoder.decode(token)?;
+                    let entry = token_logprob(
+                        &row,
+                        token,
+                        token_string,
+                        self.job.logprobs.sample,
+                        &self.job.logprobs.token_ids,
+                        &mut decoder,
+                    )?;
+                    if !emit.is_empty() {
+                        self.send_delta(emit)?;
+                    }
+                    self.job
+                        .replies
+                        .blocking_send(Reply::TokenLogprobs(Box::new(entry)))
+                        .map_err(|_| "the client stopped reading this response".to_owned())?;
+                    self.logprob_context.push(token);
+                    if self.logprob_context.len() > 4 {
+                        self.logprob_context.remove(0);
+                    }
+                } else if !emit.is_empty() {
+                    self.send_delta(emit)?;
+                }
+                self.completion_tokens += 1;
+                metrics.record_generation_tokens(1);
+                if self.stop_buffer.matched() {
+                    return self.finish(FinishReason::Stop);
+                }
+                if self.completion_tokens >= self.job.max_tokens {
+                    // The serial loop decodes one more token after the budget is exhausted and then
+                    // drops it; this path stops before that unused call, which changes no output and
+                    // saves one decode per request.
+                    return self.finish(FinishReason::Length);
+                }
+                let step = engine.decode(&mut self.state, token).map_err(|error| {
+                    format!(
+                        "decode failed after {} token(s): {error}",
+                        self.completion_tokens
+                    )
+                })?;
+                self.logits = step.logits;
+                self.next = step.next_token;
+                // draft[0] is the anchor, the token this step just sampled; only the candidates
+                // after it are drafts the target has to accept.
+                self.drafts_for_next = step.draft.get(1..).map_or_else(Vec::new, <[u32]>::to_vec);
+                Ok(BatchAdvance::Active)
+            }
+        }
+    }
+}
+
+/// The engine loop for --continuous-batching: admit, step round-robin, finish until the queue
+/// closes and every admitted request is done.
+///
+/// Admission is FIFO and bounded by max_batch: the job channel already bounds how many requests a
+/// client can queue, and this bounds how many of those are in flight at once. A request keeps its
+/// engine sequence until it emits its terminal reply, then its slot is reused.
+fn run_continuous_engine_loop(
+    engine: &mut InferenceEngine,
+    tokenizer: &HfTokenizerEncoder,
+    jobs: &mut tokio::sync::mpsc::Receiver<Job>,
+    max_batch: usize,
+    metrics: &Metrics,
+) {
+    debug_assert!(max_batch >= 1);
+    let mut pending: VecDeque<Job> = VecDeque::new();
+    let mut active: Vec<BatchedRequest> = Vec::new();
+    let mut closed = false;
+    loop {
+        if active.is_empty() && pending.is_empty() {
+            match jobs.blocking_recv() {
+                Some(job) => pending.push_back(job),
+                None => break,
+            }
+        }
+        if !closed {
+            // Drain what is already waiting without blocking: an empty queue means the round-robin
+            // step below starts now, and a new request is admitted at the top of the next round.
+            while active.len() + pending.len() < max_batch {
+                match jobs.try_recv() {
+                    Ok(job) => pending.push_back(job),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        closed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        while active.len() < max_batch {
+            let Some(job) = pending.pop_front() else {
+                break;
+            };
+            let slot = BatchedRequest::new(job, engine.config());
+            // The request leaves the waiting gauge and enters the running one at admission, the
+            // same instant it gains a scheduler slot.
+            metrics.request_admitted();
+            active.push(slot);
+        }
+        let mut index = 0;
+        while index < active.len() {
+            let replies = active[index].job.replies.clone();
+            // One request's panic is that request's failure, exactly as the serial loop treats it;
+            // the build only unwinds where the workspace profile allows it.
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                active[index].advance(engine, tokenizer, metrics)
+            }));
+            match outcome {
+                Ok(Ok(BatchAdvance::Active)) => index += 1,
+                Ok(Ok(BatchAdvance::Done)) => {
+                    active.swap_remove(index);
+                    metrics.request_finished();
+                }
+                Ok(Err(message)) => {
+                    let _ = replies.blocking_send(Reply::Failed(message));
+                    active.swap_remove(index);
+                    metrics.request_finished();
+                }
+                Err(payload) => {
+                    let _ = replies.blocking_send(Reply::Failed(format!(
+                        "the reference engine panicked on this request: {}",
+                        panic_message(payload.as_ref())
+                    )));
+                    active.swap_remove(index);
+                    metrics.request_finished();
+                }
+            }
+        }
+        if closed && active.is_empty() && pending.is_empty() {
+            break;
+        }
     }
 }
 
@@ -2264,11 +3002,11 @@ fn build_engine(recipe: &Recipe, element_limit: usize) -> Result<InferenceEngine
 // Everything here is gated on the request: a request that asked for no logprobs runs the loop
 // below with `want_sample` and `want_prompt` false, so no row is normalised and no string is
 // decoded. A request for the whole vocabulary is O(vocabulary) per position by definition; a
-// prompt-logprobs request costs one forward pass per prompt token (see
-// [`prompt_logprobs_pass`]).
+// prompt-logprobs request costs one pass over the prompt in bounded spans, not one re-forward per
+// position (see [`prompt_logprobs_pass`]).
 
 /// The log-softmax of one raw-logit row, in output-token-id order.
-fn log_softmax(logits: &[f32]) -> Vec<f32> {
+pub(crate) fn log_softmax(logits: &[f32]) -> Vec<f32> {
     let max = logits
         .iter()
         .copied()
@@ -2295,7 +3033,7 @@ fn log_softmax(logits: &[f32]) -> Vec<f32> {
 
 /// The 1-based competition rank of `token_logprob` in the row: one plus the number of tokens with a
 /// strictly greater logprob, so tied tokens share a rank. That is vLLM's rank.
-fn competition_rank(logprobs: &[f32], token_logprob: f32) -> u32 {
+pub(crate) fn competition_rank(logprobs: &[f32], token_logprob: f32) -> u32 {
     let greater = logprobs
         .iter()
         .filter(|&&value| value > token_logprob)
@@ -2307,7 +3045,7 @@ fn competition_rank(logprobs: &[f32], token_logprob: f32) -> u32 {
 ///
 /// The tie-break is what makes a tie deterministic: two tokens with the same logprob are reported
 /// in token-id order, so the same request produces the same `top_logprobs` every time.
-fn compare_logprobs(logprobs: &[f32], left: usize, right: usize) -> std::cmp::Ordering {
+pub(crate) fn compare_logprobs(logprobs: &[f32], left: usize, right: usize) -> std::cmp::Ordering {
     logprobs[right]
         .partial_cmp(&logprobs[left])
         .unwrap_or(std::cmp::Ordering::Equal)
@@ -2315,7 +3053,7 @@ fn compare_logprobs(logprobs: &[f32], left: usize, right: usize) -> std::cmp::Or
 }
 
 /// The indices of the `k` largest logprobs, in descending order.
-fn top_k_indices(logprobs: &[f32], k: usize) -> Vec<usize> {
+pub(crate) fn top_k_indices(logprobs: &[f32], k: usize) -> Vec<usize> {
     let k = k.min(logprobs.len());
     if k == 0 {
         return Vec::new();
@@ -2525,17 +3263,117 @@ fn token_logprob(
     })
 }
 
-/// Feeds the prompt one token at a time to score every position, returning the step output a batch
-/// prefill would have returned.
+/// The peak logits rows one prompt-logprobs span may hold: 1 << 22 f32 values (16 MiB).
 ///
-/// This is the gated cost of prompt logprobs: the reference engine reports logits only for the
-/// position it just fed, so scoring prompt position `i` needs the forward pass after
-/// `tokens[..i]`. The prompt is therefore fed token by token - one forward pass per prompt token -
-/// only when the request asked for prompt logprobs (or for `echo` with logprobs, which asks for
-/// them implicitly). A device chain that keeps the KV cache and reports every position's logits in
-/// one pass makes this one pass; until then this is the honest O(n) implementation, and the branch
-/// document records the measured cost.
+/// This bounds activation memory, not arithmetic: the token-at-a-time and one-pass paths agree
+/// bit for bit, and `crates/sparkflash-engine/tests/chunked_prefill.rs` pins that chunk
+/// boundaries do not change a value. It is a span policy only, so a caller on the tiny plan sees
+/// one call and a released-vocabulary caller sees bounded calls, both from the same function.
+const PROMPT_LOGPROBS_ROW_BUDGET: usize = 1 << 22;
+
+/// The contiguous spans one prompt is fed to the engine in when prompt logprobs are requested.
+///
+/// The scheduler's chunk policy bounds a prefill call; this splits each chunk again so a call
+/// returns at most [`PROMPT_LOGPROBS_ROW_BUDGET`] logits values. The whole prompt is still
+/// consumed once, in order, on one [`SequenceState`]; only the row memory per call is bounded.
+fn prompt_logprobs_spans(
+    prompt_len: usize,
+    vocab_size: usize,
+) -> Result<Vec<std::ops::Range<usize>>, String> {
+    let plan = ChunkedPrefillPlan::plan(prompt_len, 0, &SchedulerConfig::default())
+        .map_err(|error| format!("the chunked prefill plan could not be built: {error}"))?;
+    let rows_per_span = (PROMPT_LOGPROBS_ROW_BUDGET / vocab_size.max(1)).max(1);
+    let mut spans = Vec::new();
+    for range in plan.ranges() {
+        let mut start = range.start;
+        while start < range.end {
+            let end = (start + rows_per_span).min(range.end);
+            spans.push(start..end);
+            start = end;
+        }
+    }
+    Ok(spans)
+}
+
+/// Scores every prompt position with one pass over the prompt, returning the step output a
+/// whole-prompt prefill would have returned.
+///
+/// The old honest implementation (kept below for the equality test) fed the prompt one token at a
+/// time and read position `i`'s distribution from the forward after `tokens[..i]`: O(n) passes
+/// with a growing prefix, because the engine reported logits only for the position it just fed.
+/// The engine now returns the LM-head rows of selected positions from the same forward, so this
+/// function feeds the prompt in contiguous spans and asks each span for the rows that score the
+/// tokens after it. Every token is consumed once and every scored distribution is computed once.
+///
+/// The payload shape and the decoder sequencing are unchanged: position 0 is `None` (no
+/// conditioning token), each later entry scores the prompt token itself, and the alternatives are
+/// decoded with the same context the token-at-a-time path had. A span only changes where a value
+/// is computed, never what it is; the equality test pins that. The final step output is the chunk
+/// prefill's, which the bit-for-bit chunked-prefill invariant equates to a whole-prompt prefill.
+///
+/// If the engine cannot serve one of the requested positions from a pass it returns an error, and
+/// this function propagates it: the request fails with the typed engine error rather than being
+/// answered with a different number. (The Phase-1 TP=4 path has no all-position rank contract and
+/// refuses prompt logprobs outright, before this function.)
 fn prompt_logprobs_pass(
+    engine: &InferenceEngine,
+    prompt: &[u32],
+    state: &mut SequenceState,
+    logprobs: &LogprobsRequest,
+    decoder: &mut LogprobDecoder<'_>,
+) -> Result<(StepOutput, PromptLogprobs), String> {
+    let prompt_len = prompt.len();
+    let mut tokens = Vec::with_capacity(prompt_len);
+    let mut positions: Vec<Option<TokenLogprob>> = vec![None; prompt_len];
+    // Position 0 has no conditioning token, so it reports `None` exactly as vLLM does.
+    tokens.push(TokenString {
+        token_id: prompt[0],
+        token: decoder.decode(prompt[0])?,
+    });
+    decoder.push(prompt[0]);
+    let spans = prompt_logprobs_spans(prompt_len, engine.config().vocab_size)?;
+    let mut feed = None;
+    for span in spans {
+        let at_end = span.end == prompt_len;
+        // Scoring token i uses the distribution after token i-1: the final position's row is the
+        // generation distribution, not a prompt position, so the last span does not ask for it.
+        let rows_needed = span.len() - usize::from(at_end);
+        let selected: Vec<usize> = (0..rows_needed).collect();
+        let produced = engine
+            .prefill_with_position_logits(state, &prompt[span.clone()], &selected)
+            .map_err(|error| format!("prefill failed: {error}"))?;
+        for (index, row) in produced.rows.iter().enumerate() {
+            let token_index = span.start + index + 1;
+            let token = decoder.decode(prompt[token_index])?;
+            tokens.push(TokenString {
+                token_id: prompt[token_index],
+                token: token.clone(),
+            });
+            let row = log_softmax(row);
+            positions[token_index] = Some(token_logprob(
+                &row,
+                prompt[token_index],
+                token,
+                logprobs.prompt,
+                &[],
+                decoder,
+            )?);
+            decoder.push(prompt[token_index]);
+        }
+        feed = Some(produced.step);
+    }
+    Ok((
+        feed.expect("a non-empty prompt has at least one span"),
+        PromptLogprobs { tokens, positions },
+    ))
+}
+
+/// The token-at-a-time prompt logprob reference the one-pass path is tested against.
+///
+/// Only the test build compiles it: it is the honest O(n) implementation this increment replaced,
+/// kept as the executable contract for the equality test (same payload, same strings, same bits).
+#[cfg(test)]
+fn prompt_logprobs_pass_token_at_a_time(
     engine: &InferenceEngine,
     prompt: &[u32],
     state: &mut SequenceState,
@@ -2552,7 +3390,6 @@ fn prompt_logprobs_pass(
         token: decoder.decode(prompt[0])?,
     });
     decoder.push(prompt[0]);
-    // Position 0 has no conditioning token, so it reports `None` exactly as vLLM does.
     positions.push(None);
     for (index, &token_id) in prompt.iter().enumerate().skip(1) {
         let row = log_softmax(&feed.logits);
@@ -2609,6 +3446,100 @@ fn prefill_chunked(
     last.ok_or_else(|| "the prompt is empty and has no prefill chunk".to_owned())
 }
 
+/// vLLM's stop-string rule for the reference driver's text stream.
+///
+/// OpenAI's `stop` is a list of strings that end generation when they are *generated*: the
+/// returned text does not contain them, and `finish_reason` becomes `"stop"`. A stop string can
+/// span token boundaries, so vLLM holds back `max(len(stop)) - 1` characters before emitting
+/// (its `SamplingParams.output_text_buffer_length`) and checks the stop strings against the held
+/// text. This is that rule, byte for byte: a partial stop string is never emitted, a completed one
+/// is removed from the output, and characters still held back when generation ends for another
+/// reason (length/EOS) are flushed rather than dropped.
+///
+/// Matching is on the decoded text and therefore on whole characters, which is what vLLM matches;
+/// a stop string is never split inside a UTF-8 sequence because `str::find` can only match at
+/// character boundaries. An empty stop string is refused by the protocol layer before a request
+/// reaches this buffer.
+struct StopBuffer {
+    /// The stop strings in request order. Empty means "no stop string": then every piece is
+    /// emitted immediately and nothing is held back.
+    sequences: Vec<String>,
+    /// How many characters of the tail can start a stop string, so they cannot be emitted yet.
+    holdback: usize,
+    /// Decoded characters generated but not emitted yet.
+    pending: String,
+    /// Whether a stop string has been matched; the driver stops after this becomes true.
+    matched: bool,
+}
+
+impl StopBuffer {
+    /// Builds the buffer; `holdback` is one less than the longest stop string, as in vLLM.
+    fn new(sequences: &[String]) -> Self {
+        let holdback = sequences
+            .iter()
+            .map(|sequence| sequence.chars().count())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        Self {
+            sequences: sequences.to_vec(),
+            holdback,
+            pending: String::new(),
+            matched: false,
+        }
+    }
+
+    /// Adds one token's decoded text (which may be empty or absent) and returns the characters that
+    /// are safe to emit now. A stop match clears the pending text and truncates the returned text
+    /// at the match, which is vLLM's "the output will not contain the stop strings".
+    fn push(&mut self, piece: Option<&str>) -> String {
+        if self.matched {
+            return String::new();
+        }
+        if let Some(piece) = piece {
+            self.pending.push_str(piece);
+        }
+        if self.sequences.is_empty() {
+            return std::mem::take(&mut self.pending);
+        }
+        if let Some(index) = self
+            .sequences
+            .iter()
+            .filter_map(|sequence| self.pending.find(sequence.as_str()))
+            .min()
+        {
+            self.matched = true;
+            let text = self.pending[..index].to_owned();
+            self.pending.clear();
+            return text;
+        }
+        let chars = self.pending.chars().count();
+        if chars <= self.holdback {
+            return String::new();
+        }
+        let emit_chars = chars - self.holdback;
+        let split = self
+            .pending
+            .char_indices()
+            .nth(emit_chars)
+            .map_or(self.pending.len(), |(index, _)| index);
+        let text = self.pending[..split].to_owned();
+        self.pending.drain(..split);
+        text
+    }
+
+    /// Returns the text still held back when generation ends without a stop match. A matched stop
+    /// has already cleared it, so this is empty on the stop path.
+    fn finish(&mut self) -> String {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Whether a stop string was matched, i.e. the request must report `"stop"`.
+    fn matched(&self) -> bool {
+        self.matched
+    }
+}
+
 /// Runs one request and sends its events, ending with exactly one terminal reply.
 ///
 /// `Ok(())` means the terminal reply was sent. `Err(message)` means the request failed and the
@@ -2617,6 +3548,7 @@ fn run_request(
     engine: &InferenceEngine,
     tokenizer: &HfTokenizerEncoder,
     job: Job,
+    metrics: &Metrics,
 ) -> Result<(), String> {
     let request_started = Instant::now();
     // A sequence per request: the engine owns no per-sequence state, which is exactly the seam this
@@ -2664,8 +3596,12 @@ fn run_request(
     }
     // The stream decoder keeps the state an incomplete UTF-8 sequence needs, so a token that only
     // completes half a character is held back instead of being emitted as a replacement character
-    // that the next token would then contradict.
-    let mut decoder = tokenizer.tokenizer().decode_stream(false);
+    // that the next token would then contradict. The client chooses whether special tokens are
+    // hidden: vLLM's OpenAI default is true, and an explicit false passes them through.
+    let mut decoder = tokenizer.tokenizer().decode_stream(job.skip_special_tokens);
+    // The stop-string rule is vLLM's: hold back up to `max(len(stop)) - 1` characters so a stop
+    // split across token boundaries is never emitted, and truncate at a match.
+    let mut stop_buffer = StopBuffer::new(&job.stop);
     let mut logits = prefill.logits;
     let mut next = prefill.next_token;
     let mut completion_tokens = 0usize;
@@ -2690,12 +3626,20 @@ fn run_request(
             dspark.observe_nonfinite(&drafts_for_next);
         }
         if ttft.is_none() {
+            // The histogram measures the request as a client saw it: from the driver accepting it
+            // into the engine queue to this first token, so the queue wait is included. The
+            // per-request timing block that goes on the wire keeps its own, post-dequeue,
+            // definition above, so this new metric changes no existing field's meaning.
+            metrics.observe_time_to_first_token(job.enqueued_at.elapsed().as_secs_f64());
             ttft = Some(request_started.elapsed());
         }
         let piece = decoder
             .step(token)
             .map_err(|error| format!("the tokenizer could not decode token {token}: {error}"))?
             .filter(|piece| !piece.is_empty());
+        // The stop matcher owns the text: it returns only the characters that are safe to emit
+        // now, and a match truncates them at the stop string.
+        let emit = stop_buffer.push(piece.as_deref());
         if want_sample {
             // The logprob belongs to the token the logits just produced, so it is built before that
             // token is fed back in.
@@ -2709,21 +3653,27 @@ fn run_request(
                 &job.logprobs.token_ids,
                 &mut logprob_decoder,
             )?;
-            if let Some(piece) = piece {
+            if !emit.is_empty() {
                 job.replies
-                    .blocking_send(Reply::Delta(piece))
+                    .blocking_send(Reply::Delta(emit))
                     .map_err(|_| "the client stopped reading this response".to_owned())?;
             }
             job.replies
                 .blocking_send(Reply::TokenLogprobs(Box::new(entry)))
                 .map_err(|_| "the client stopped reading this response".to_owned())?;
             logprob_decoder.push(token);
-        } else if let Some(piece) = piece {
+        } else if !emit.is_empty() {
             job.replies
-                .blocking_send(Reply::Delta(piece))
+                .blocking_send(Reply::Delta(emit))
                 .map_err(|_| "the client stopped reading this response".to_owned())?;
         }
         completion_tokens += 1;
+        metrics.record_generation_tokens(1);
+        if stop_buffer.matched() {
+            // The token that completed the stop string was generated (vLLM counts it), and the
+            // stop string and anything after it never reach the client.
+            break;
+        }
         let step = engine.decode(&mut state, token).map_err(|error| {
             format!("decode failed after {completion_tokens} token(s): {error}")
         })?;
@@ -2733,6 +3683,15 @@ fn run_request(
         // candidates after it are drafts the target has to accept. No token from the scheduler's
         // old philox path exists here: the MTP forward is the only producer.
         drafts_for_next = step.draft.get(1..).map_or_else(Vec::new, <[u32]>::to_vec);
+    }
+    // vLLM emits the whole generated text when generation ends for a reason other than a stop: the
+    // characters still held back so a split stop string could be detected go out here. A matched
+    // stop already cleared them, so this is empty on that path.
+    let tail = stop_buffer.finish();
+    if !tail.is_empty() {
+        job.replies
+            .blocking_send(Reply::Delta(tail))
+            .map_err(|_| "the client stopped reading this response".to_owned())?;
     }
     dspark.finish();
     // The batch-19 evidence reader keys on the engine acceptance contract's names. The line is
@@ -2747,10 +3706,12 @@ fn run_request(
         ttft,
         elapsed,
     );
-    // The request cap is the only stop this driver has: the reference engine exposes no
-    // end-of-sequence policy, so `Stop` is reported only when a step produced no token at all, and
-    // a cap of zero is reported as `Length` because the budget is what stopped it.
-    let finish_reason = if completion_tokens >= job.max_tokens {
+    // OpenAI's finish reasons: a matched stop string (or EOS, which ends the loop with no next
+    // token) is `Stop`; exhausting the token budget is `Length`. A cap of zero is `Length`
+    // because the budget is what stopped it.
+    let finish_reason = if stop_buffer.matched() {
+        FinishReason::Stop
+    } else if completion_tokens >= job.max_tokens {
         FinishReason::Length
     } else {
         FinishReason::Stop
@@ -2853,6 +3814,20 @@ pub trait Tp4RankApi: Send {
     /// Runs the prompt through this rank's forward and returns the last position's step.
     fn prefill(&mut self, prompt: &[u32]) -> Result<Tp4Step, String>;
 
+    /// Runs the prompt through this rank's forward and returns the last position's step together
+    /// with every scored prompt position's merged logprob contract.
+    ///
+    /// Selection is the OpenAI-style top count: `None` scores only the owning token and its
+    /// competition rank, `Some(n)` also returns the n best alternatives. A contract refusal (a
+    /// certified rank entry, an unprovable f32 order, a malformed shard layout) comes back as a
+    /// string beginning with the refusal prefix; every rank makes the same decision after the
+    /// same collectives, so the group can keep serving.
+    fn prefill_prompt_logprobs(
+        &mut self,
+        prompt: &[u32],
+        selection: Option<usize>,
+    ) -> Result<(Tp4Step, Vec<MergedPosition>), String>;
+
     /// Runs one sampled token through this rank's forward.
     fn decode(&mut self, token: u32) -> Result<Tp4Step, String>;
 
@@ -2948,6 +3923,24 @@ impl Tp4RankApi for HostTp4Rank {
         })
     }
 
+    fn prefill_prompt_logprobs(
+        &mut self,
+        prompt: &[u32],
+        selection: Option<usize>,
+    ) -> Result<(Tp4Step, Vec<MergedPosition>), String> {
+        let (output, merged) = self
+            .rank
+            .prefill_prompt_logprobs(prompt, selection)
+            .map_err(|error| error.to_string())?;
+        Ok((
+            Tp4Step {
+                logits: output.logits,
+                next_token: output.token,
+            },
+            merged,
+        ))
+    }
+
     fn decode(&mut self, token: u32) -> Result<Tp4Step, String> {
         let output = self.rank.decode(token).map_err(|error| error.to_string())?;
         Ok(Tp4Step {
@@ -3000,6 +3993,8 @@ pub struct Tp4Driver {
     max_tokens: usize,
     vocab_size: usize,
     cluster: ClusterStatsSnapshot,
+    /// The exporter the rank-0 engine thread feeds; the router serves this same registry.
+    metrics: Arc<Metrics>,
 }
 
 #[cfg(feature = "tp4-serve")]
@@ -3016,9 +4011,13 @@ impl Tp4Driver {
         let (jobs, queued) = tokio::sync::mpsc::channel(TP4_JOB_QUEUE);
         let (ready, reported) = std::sync::mpsc::channel();
         let owned = recipe.clone();
+        // Same sharing rule as the reference driver: one exporter, fed by the thread, served by
+        // the router.
+        let metrics = Arc::new(Metrics::new());
+        let thread_metrics = Arc::clone(&metrics);
         std::thread::Builder::new()
             .name(ENGINE_THREAD_NAME.to_owned())
-            .spawn(move || tp4_engine_thread(&owned, rank_config, queued, ready))
+            .spawn(move || tp4_engine_thread(&owned, rank_config, queued, ready, thread_metrics))
             .map_err(|error| format!("cannot start the TP=4 engine thread: {error}"))?;
         match reported.recv() {
             Ok(Ok(())) => Ok(Self {
@@ -3027,6 +4026,7 @@ impl Tp4Driver {
                 max_tokens,
                 vocab_size: recipe.config.vocab_size,
                 cluster: tp4_cluster_snapshot(),
+                metrics,
             }),
             Ok(Err(message)) => Err(message),
             Err(_) => Err("the TP=4 engine thread stopped before it reported ready".to_owned()),
@@ -3042,7 +4042,14 @@ impl Tp4Driver {
             max_tokens,
             vocab_size: 8,
             cluster: tp4_cluster_snapshot(),
+            metrics: Arc::new(Metrics::new()),
         }
+    }
+
+    /// The exporter this driver's request lifecycle feeds.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
     }
 }
 
@@ -3050,6 +4057,13 @@ impl Tp4Driver {
 impl ApiInferenceEngine for Tp4Driver {
     fn model_id(&self) -> &str {
         &self.model
+    }
+
+    /// The four ranks run one token sequence in lockstep and the host-side sampler carries no
+    /// per-sequence RNG, so choices of one request cannot be claimed independent; the router
+    /// refuses n > 1 with a typed error instead of returning repeated samples.
+    fn independent_choices(&self) -> bool {
+        false
     }
 
     fn generate(&self, request: EngineRequest) -> BoxStream<'static, EngineEvent> {
@@ -3063,18 +4077,55 @@ impl ApiInferenceEngine for Tp4Driver {
                 REFUSED_CODE,
             );
         }
+        if let Some(selection) = request.logprobs.prompt {
+            let refusal = match selection {
+                LogprobSelection::All => Some(
+                    "the whole-vocabulary -1 selection needs every vocabulary entry at every scored position, and the rank contract exchanges bounded candidate blocks instead"
+                        .to_owned(),
+                ),
+                LogprobSelection::Top(count)
+                    if count as usize >= sparkflash_engine::prompt_ranks::CANDIDATES_PER_RANK_MAX =>
+                {
+                    Some(format!(
+                        "a prompt_logprobs count of {count} exceeds the {} alternatives the rank contract can carry",
+                        sparkflash_engine::prompt_ranks::CANDIDATES_PER_RANK_MAX - 1
+                    ))
+                }
+                _ => None,
+            };
+            if let Some(detail) = refusal {
+                return refused(
+                    &format!(
+                        "{} {detail}",
+                        crate::tp4_host::PROMPT_LOGPROBS_REFUSED_PREFIX
+                    ),
+                    TP4_LOGPROBS_REFUSED_CODE,
+                );
+            }
+        }
         let prompt_tokens = request.prompt_tokens.len();
         let max_tokens = request.max_tokens.min(self.max_tokens);
+        let enqueued_at = Instant::now();
         let (replies, answers) = tokio::sync::mpsc::channel(REPLY_BUFFER);
         let job = Job {
             prompt_tokens: request.prompt_tokens,
             max_tokens,
             temperature: request.temperature,
+            top_p: request.top_p,
+            top_k: request.top_k,
+            repetition_penalty: request.repetition_penalty,
+            presence_penalty: request.presence_penalty,
+            frequency_penalty: request.frequency_penalty,
+            skip_special_tokens: request.skip_special_tokens,
             seed: request.seed.unwrap_or(0),
             logprobs: request.logprobs,
+            stop: request.stop,
+            enqueued_at,
             replies,
         };
+        self.metrics.request_enqueued();
         if self.jobs.try_send(job).is_err() {
+            self.metrics.request_enqueue_refused();
             return refused(
                 "the TP=4 engine already has the one request it runs at a time and one queued behind it; a second concurrent request is refused because the four ranks must run the same token sequence in lockstep",
                 REFUSED_CODE,
@@ -3180,6 +4231,7 @@ fn tp4_engine_thread(
     rank_config: Tp4RankConfig,
     mut jobs: tokio::sync::mpsc::Receiver<Job>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
+    metrics: Arc<Metrics>,
 ) {
     let built = open_tp4_rank(&rank_config)
         .map_err(|error| format!("rank {}: {error}", rank_config.rank))
@@ -3210,27 +4262,66 @@ fn tp4_engine_thread(
         return;
     }
     while let Some(job) = jobs.blocking_recv() {
+        metrics.request_admitted();
         let replies = job.replies.clone();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            run_tp4_request(rank.as_mut(), &mut hub, &tokenizer, job)
+            run_tp4_request(rank.as_mut(), &mut hub, &tokenizer, job, &metrics)
         }));
         let failure = match outcome {
             Ok(Ok(())) => None,
-            Ok(Err(message)) => Some(message),
-            Err(payload) => Some(format!(
+            Ok(Err(error)) => Some(error),
+            Err(payload) => Some(Tp4RequestError::Failed(format!(
                 "the TP=4 rank panicked on this request: {}",
                 panic_message(payload.as_ref())
-            )),
+            ))),
         };
         log_tp4_metrics(rank_config.rank, "request", &rank.metrics());
-        if let Some(message) = failure {
-            let code = ENGINE_ERROR_CODE.to_owned();
+        if let Some(error) = failure {
+            let (code, message) = match error {
+                Tp4RequestError::Refused(message) => {
+                    (TP4_LOGPROBS_REFUSED_CODE.to_owned(), message)
+                }
+                Tp4RequestError::Failed(message) => (ENGINE_ERROR_CODE.to_owned(), message),
+            };
             let _ = hub.broadcast(&Tp4ControlFrame::Error {
                 code: code.clone(),
                 message: message.clone(),
             });
             let _ = replies.blocking_send(Reply::Failed(message));
         }
+        metrics.request_finished();
+    }
+}
+
+/// How one TP=4 request failed.
+///
+/// The distinction matters to the group, not just to the HTTP status: a [Refused] failure was the
+/// same deterministic decision on every rank after the same collectives, so rank 0 broadcasts a
+/// typed refusal and every worker resynchronises on the next Request frame. A [Failed] failure
+/// ends the worker ranks, which is what a desynced or unreachable group must do.
+#[cfg(feature = "tp4-serve")]
+#[derive(Debug)]
+enum Tp4RequestError {
+    /// A prompt-logprob contract refusal: request-scoped and recoverable for the group.
+    Refused(String),
+    /// Anything else: the forward, the tokenizer or the control channel failed.
+    Failed(String),
+}
+
+#[cfg(feature = "tp4-serve")]
+impl From<String> for Tp4RequestError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+/// Classifies a rank error by its typed refusal prefix.
+#[cfg(feature = "tp4-serve")]
+fn classify_tp4_request_error(message: String) -> Tp4RequestError {
+    if message.starts_with(crate::tp4_host::PROMPT_LOGPROBS_REFUSED_PREFIX) {
+        Tp4RequestError::Refused(message)
+    } else {
+        Tp4RequestError::Failed(message)
     }
 }
 
@@ -3241,13 +4332,21 @@ fn run_tp4_request(
     hub: &mut Tp4ControlHub,
     tokenizer: &HfTokenizerEncoder,
     job: Job,
-) -> Result<(), String> {
-    if job.logprobs.wants_prompt() {
-        return Err(
-            "prompt logprobs are not supported by the Phase-1 TP=4 path: the rank loop scores generated positions, not prompt positions"
-                .to_owned(),
-        );
-    }
+    metrics: &Metrics,
+) -> Result<(), Tp4RequestError> {
+    // The whole-vocabulary -1 selection needs every vocabulary entry at every scored position;
+    // the rank contract exchanges bounded candidate blocks, so the request is refused before any
+    // rank does work rather than answered with a prefix of what was asked for.
+    let prompt_logprobs_frame = match job.logprobs.prompt {
+        None => None,
+        Some(LogprobSelection::Top(count)) => Some(count),
+        Some(LogprobSelection::All) => {
+            return Err(Tp4RequestError::Refused(format!(
+                "{} the whole-vocabulary -1 selection needs every vocabulary entry at every scored position, and the rank contract exchanges bounded candidate blocks instead",
+                crate::tp4_host::PROMPT_LOGPROBS_REFUSED_PREFIX
+            )));
+        }
+    };
     rank.begin_request(Tp4Sampling {
         temperature: job.temperature,
         seed: job.seed,
@@ -3256,11 +4355,44 @@ fn run_tp4_request(
     hub.broadcast(&Tp4ControlFrame::Request {
         prompt_ids: job.prompt_tokens.clone(),
         max_tokens,
+        prompt_logprobs: prompt_logprobs_frame,
     })
     .map_err(|error| format!("control Request: {error}"))?;
     let request_started = Instant::now();
     let prefill_steps_before = rank.metrics().steps;
-    let prefill = rank.prefill(&job.prompt_tokens)?;
+    let decode_ids = |ids: &[u32]| -> Result<String, String> {
+        tokenizer.tokenizer().decode(ids, false).map_err(|error| {
+            format!(
+                "the tokenizer could not decode {} token id(s): {error}",
+                ids.len()
+            )
+        })
+    };
+    let mut logprob_decoder = LogprobDecoder::new(&decode_ids);
+    // `Some(0)` is the own-token-only contract: the rank takes the same path as `None`, and the
+    // payload builder reports the competition rank of each prompt token with no alternatives.
+    let prompt_selection = prompt_logprobs_frame.map(|count| {
+        if count == 0 {
+            None
+        } else {
+            Some(count as usize)
+        }
+    });
+    let (prefill, prompt_logprobs) = match prompt_selection {
+        Some(selection) => {
+            let (step, merged) = rank
+                .prefill_prompt_logprobs(&job.prompt_tokens, selection)
+                .map_err(classify_tp4_request_error)?;
+            let payload = tp4_prompt_logprobs_payload(
+                &job.prompt_tokens,
+                &merged,
+                &job.logprobs,
+                &mut logprob_decoder,
+            )?;
+            (step, Some(payload))
+        }
+        None => (rank.prefill(&job.prompt_tokens)?, None),
+    };
     let prefill_elapsed = request_started.elapsed();
     // One line per request so a log reader can check the TTFT identity directly: the host
     // prefill loop runs one decode-shaped forward per prompt token, so TTFT is linear in the
@@ -3272,17 +4404,15 @@ fn run_tp4_request(
         rank.metrics().steps.saturating_sub(prefill_steps_before),
         prefill_elapsed.as_millis()
     );
+    // Prompt logprobs are one payload for the prompt, delivered once at the end of prefill,
+    // which is where the serial host path and vLLM deliver them.
+    if let Some(payload) = prompt_logprobs {
+        job.replies
+            .blocking_send(Reply::PromptLogprobs(Box::new(payload)))
+            .map_err(|_| "the client stopped reading this response".to_owned())?;
+    }
     let want_sample = job.logprobs.wants_sample();
-    let decode_ids = |ids: &[u32]| -> Result<String, String> {
-        tokenizer.tokenizer().decode(ids, false).map_err(|error| {
-            format!(
-                "the tokenizer could not decode {} token id(s): {error}",
-                ids.len()
-            )
-        })
-    };
-    let mut logprob_decoder = LogprobDecoder::new(&decode_ids);
-    let mut decoder = tokenizer.tokenizer().decode_stream(false);
+    let mut decoder = tokenizer.tokenizer().decode_stream(job.skip_special_tokens);
     let mut logits = prefill.logits;
     let mut next = prefill.next_token;
     let mut completion_tokens = 0usize;
@@ -3290,6 +4420,9 @@ fn run_tp4_request(
     while completion_tokens < job.max_tokens {
         let Some(token) = next else { break };
         if ttft.is_none() {
+            // Same histogram rule as the reference paths: driver entry to first token, so the
+            // rank-0 job queue wait and the host prefill are both included.
+            metrics.observe_time_to_first_token(job.enqueued_at.elapsed().as_secs_f64());
             ttft = Some(request_started.elapsed());
         }
         let piece = decoder
@@ -3322,6 +4455,7 @@ fn run_tp4_request(
                 .map_err(|_| "the client stopped reading this response".to_owned())?;
         }
         completion_tokens += 1;
+        metrics.record_generation_tokens(1);
         // The last generated token is never fed back: max_tokens=8 is prefill plus seven
         // decode calls. Sending it would make every rank run one extra, unnecessary step.
         if completion_tokens >= job.max_tokens {
@@ -3361,6 +4495,98 @@ fn run_tp4_request(
     Ok(())
 }
 
+/// Builds one TP=4 prompt position's wire entry from the merged contract values.
+///
+/// The entry list is the serial token_logprob list for a Top selection: the owning token first
+/// with its competition rank, then the alternatives with positional ranks, collapsed by token id
+/// exactly as vLLM's logprob dict collapses duplicates.
+#[cfg(feature = "tp4-serve")]
+fn token_logprob_from_merged(
+    position: &MergedPosition,
+    decoder: &mut LogprobDecoder<'_>,
+) -> Result<TokenLogprob, String> {
+    let own_token = position.own_token_id;
+    let token = decoder.decode(own_token)?;
+    let mut entries = vec![sparkflash_api::LogprobAlternative {
+        token_id: own_token,
+        token: token.clone(),
+        logprob: position.own_logprob,
+        rank: Some(position.own_rank),
+    }];
+    for (slot, alternative) in position.alternatives.iter().enumerate() {
+        entries.push(sparkflash_api::LogprobAlternative {
+            token_id: alternative.token_id,
+            token: decoder.decode(alternative.token_id)?,
+            logprob: alternative.logprob,
+            rank: Some(u32::try_from(slot + 1).unwrap_or(u32::MAX)),
+        });
+    }
+    Ok(TokenLogprob {
+        token_id: own_token,
+        token,
+        logprob: position.own_logprob,
+        rank: Some(position.own_rank),
+        top: collapse_entries(entries),
+    })
+}
+
+/// The whole prompt-logprobs payload from the TP=4 rank contract's merged positions.
+///
+/// Position 0 is None (no conditioning token), each later position reports its own token first
+/// and the alternatives after it, and the token strings are decoded with the same preceding
+/// context the serial path uses, so the payload is the serial one whenever the merge could prove
+/// the order.
+#[cfg(feature = "tp4-serve")]
+fn tp4_prompt_logprobs_payload(
+    prompt: &[u32],
+    merged: &[MergedPosition],
+    logprobs: &LogprobsRequest,
+    decoder: &mut LogprobDecoder<'_>,
+) -> Result<PromptLogprobs, String> {
+    let expected = prompt.len().saturating_sub(1);
+    if merged.len() != expected {
+        return Err(format!(
+            "the TP=4 rank contract returned {} scored positions for a {} token prompt",
+            merged.len(),
+            prompt.len()
+        ));
+    }
+    let requested = match logprobs.prompt {
+        Some(LogprobSelection::Top(count)) => count as usize,
+        _ => 0,
+    };
+    let mut tokens = Vec::with_capacity(prompt.len());
+    let mut positions: Vec<Option<TokenLogprob>> = vec![None; prompt.len()];
+    tokens.push(TokenString {
+        token_id: prompt[0],
+        token: decoder.decode(prompt[0])?,
+    });
+    decoder.push(prompt[0]);
+    for (index, position) in merged.iter().enumerate() {
+        let token_index = index + 1;
+        let own_token = prompt[token_index];
+        if position.position != index || position.own_token_id != own_token {
+            return Err(format!(
+                "the TP=4 rank contract named position {} token {} where the prompt has position {index} token {own_token}",
+                position.position, position.own_token_id
+            ));
+        }
+        if position.alternatives.len() != requested {
+            return Err(format!(
+                "the TP=4 rank contract returned {} alternatives at position {index} where the request asked for {requested}",
+                position.alternatives.len()
+            ));
+        }
+        tokens.push(TokenString {
+            token_id: own_token,
+            token: decoder.decode(own_token)?,
+        });
+        positions[token_index] = Some(token_logprob_from_merged(position, decoder)?);
+        decoder.push(own_token);
+    }
+    Ok(PromptLogprobs { tokens, positions })
+}
+
 /// Runs one worker rank until its control channel ends.
 #[cfg(feature = "tp4-serve")]
 fn tp4_worker(options: &ServeOptions, tp4: &Tp4ServeOptions) -> Result<(), String> {
@@ -3382,11 +4608,57 @@ fn tp4_worker(options: &ServeOptions, tp4: &Tp4ServeOptions) -> Result<(), Strin
             Ok(Tp4ControlFrame::Request {
                 prompt_ids,
                 max_tokens,
+                prompt_logprobs,
             }) => {
                 // Workers do not sample; reset their state with the greedy default. The engine's
                 // forward arithmetic is unchanged by the sampler, and their next_token is ignored.
                 rank.begin_request(Tp4Sampling::default())?;
-                rank.prefill(&prompt_ids)?;
+                let selection = prompt_logprobs.map(|count| {
+                    if count == 0 {
+                        None
+                    } else {
+                        Some(count as usize)
+                    }
+                });
+                let prefill = match selection {
+                    Some(selection) => rank
+                        .prefill_prompt_logprobs(&prompt_ids, selection)
+                        .map(|_| ()),
+                    None => rank.prefill(&prompt_ids).map(|_| ()),
+                };
+                if let Err(error) = prefill {
+                    if !error.starts_with(crate::tp4_host::PROMPT_LOGPROBS_REFUSED_PREFIX) {
+                        return Err(error);
+                    }
+                    // The refusal is the same deterministic decision on every rank after the same
+                    // collectives. Rank 0 sends it as its typed Error frame; drain that frame and
+                    // resynchronise on the next Request instead of taking down the group.
+                    match control.next_frame() {
+                        Ok(Tp4ControlFrame::Error { code, message })
+                            if code == TP4_LOGPROBS_REFUSED_CODE =>
+                        {
+                            println!(
+                                "sparkflash serve: tp4_prompt_logprobs_refused rank={} message={message}",
+                                rank_config.rank
+                            );
+                        }
+                        Ok(other) => {
+                            return Err(format!(
+                                "rank {} expected the prompt-logprob refusal frame, got {}",
+                                rank_config.rank,
+                                other.kind()
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "rank {} control after a prompt-logprob refusal: {error}",
+                                rank_config.rank
+                            ));
+                        }
+                    }
+                    log_tp4_metrics(rank_config.rank, "refused", &rank.metrics());
+                    continue;
+                }
                 let mut decoded = 0usize;
                 loop {
                     match control.next_frame() {
@@ -3422,6 +4694,14 @@ fn tp4_worker(options: &ServeOptions, tp4: &Tp4ServeOptions) -> Result<(), Strin
             }
             Ok(Tp4ControlFrame::End) => break,
             Ok(Tp4ControlFrame::Error { code, message }) => {
+                if code == TP4_LOGPROBS_REFUSED_CODE {
+                    println!(
+                        "sparkflash serve: tp4_prompt_logprobs_refused rank={} message={message}",
+                        rank_config.rank
+                    );
+                    log_tp4_metrics(rank_config.rank, "refused", &rank.metrics());
+                    continue;
+                }
                 return Err(format!("rank 0 reported {code}: {message}"));
             }
             Ok(other) => {
@@ -3535,13 +4815,32 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
             return ExitCode::from(EXIT_REFUSED);
         }
     };
+    // Only rank 0 owns HTTP, so only rank 0 can claim a device envelope.
+    let device_token_source = if tp4.rank == 0 {
+        match device_token_source(options, &seam) {
+            Ok(source) => source,
+            Err(message) => {
+                eprintln!("sparkflash serve: {message}");
+                return ExitCode::from(EXIT_REFUSED);
+            }
+        }
+    } else {
+        None
+    };
     println!(
         "sparkflash serve: TP=4 rank 0/{} on {}; control {}; workers never detokenize",
         tp4.world_size, tp4.peers[0], tp4.control_port
     );
+    // Same sharing rule as the reference path: the rank-0 engine thread feeds this exporter and
+    // the router serves it.
+    let metrics = driver.metrics();
     let state = AppState::new(Arc::new(driver))
+        .with_metrics(metrics)
         .with_max_logprobs(options.max_logprobs)
-        .with_tokenizer(seam);
+        .with_tokenizer(seam)
+        .with_api_key(options.api_key.clone())
+        .with_device_token_source(device_token_source);
+    let drain_state = state.clone();
     let router = sparkflash_api::server::router(state);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -3553,7 +4852,7 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    runtime.block_on(bind_and_serve(router, options.bind))
+    runtime.block_on(bind_and_serve(router, drain_state, options.bind))
 }
 
 /// Entry point main.rs calls: parses arguments, starts the engine, binds the router.
@@ -3590,6 +4889,21 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             }
         },
     };
+    // A debug-build test seam: serve a scripted completion instead of loading a checkpoint, so a
+    // wire test can drive the real binary through the real router on a host with no model. It is
+    // compiled only into debug builds and keyed by SPARKFLASH_SERVE_SCRIPT (see
+    // scripted_engine_spec); it is not part of the serving contract.
+    #[cfg(debug_assertions)]
+    if let Some(scripted) = scripted_engine_spec() {
+        let scripted = match scripted {
+            Ok(scripted) => scripted,
+            Err(message) => {
+                eprintln!("sparkflash serve: {message}");
+                return ExitCode::from(EXIT_REFUSED);
+            }
+        };
+        return run_scripted(options, tokenizer, scripted);
+    }
     let recipe = match options.recipe(&tokenizer) {
         Ok(recipe) => recipe,
         Err(message) => {
@@ -3604,6 +4918,9 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             return ExitCode::from(EXIT_REFUSED);
         }
     };
+    // The exporter the engine thread feeds; the router must serve this same registry or every
+    // request-lifecycle family would report a second, empty one.
+    let metrics = driver.metrics();
     let engine: Arc<dyn ApiInferenceEngine> = match selection {
         DeviceSelection::Reference => Arc::new(driver),
         DeviceSelection::FakeSession => match device_engine(FakeSession::new(), driver) {
@@ -3631,20 +4948,52 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             }
         }
     };
+    serve_with_engine(engine, metrics, &tokenizer, &options)
+}
+
+/// Loads the tokenizer seam, builds the app state and serves the router until stopped.
+///
+/// The checkpoint path and the debug-build scripted path both end here, so the wire contract
+/// (prompt seam, max-logprobs cap, keep-alive, router) cannot drift between them.
+fn serve_with_engine(
+    engine: Arc<dyn ApiInferenceEngine>,
+    metrics: Arc<Metrics>,
+    tokenizer: &Path,
+    options: &ServeOptions,
+) -> ExitCode {
     // The same tokenizer.json the engine detokenises with also drives the HTTP prompt seam:
     // /v1/completions text becomes the checkpoint's token ids and /v1/chat/completions renders
     // the released server's V4.1 template. Failing to load it refuses startup instead of serving
     // placeholder ids.
-    let seam = match load_tokenizer(&tokenizer) {
+    let seam = match load_tokenizer(tokenizer) {
         Ok(loaded) => Arc::new(TokenizerSeam::new(loaded)),
         Err(message) => {
             eprintln!("sparkflash serve: {message}");
             return ExitCode::from(EXIT_REFUSED);
         }
     };
+    let device_token_source = match device_token_source(options, &seam) {
+        Ok(source) => source,
+        Err(message) => {
+            eprintln!("sparkflash serve: {message}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
     let state = AppState::new(engine)
+        .with_metrics(metrics)
         .with_max_logprobs(options.max_logprobs)
-        .with_tokenizer(seam);
+        .with_tokenizer(seam)
+        .with_api_key(options.api_key.clone())
+        .with_device_token_source(device_token_source);
+    // A debug-build test seam: a wire test can shorten the keep-alive interval so an idle engine
+    // gap produces observable comment frames without waiting the production 15 s. Debug-only, so
+    // a release binary has no such switch.
+    #[cfg(debug_assertions)]
+    let state = match debug_keep_alive_ms() {
+        Some(milliseconds) => state.with_sse_keep_alive(Some(Duration::from_millis(milliseconds))),
+        None => state,
+    };
+    let drain_state = state.clone();
     let router = sparkflash_api::server::router(state);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -3656,14 +5005,118 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    runtime.block_on(bind_and_serve(router, options.bind))
+    runtime.block_on(bind_and_serve(router, drain_state, options.bind))
+}
+
+/// A scripted completion for the debug-build wire seed, read from SPARKFLASH_SERVE_SCRIPT.
+#[cfg(debug_assertions)]
+struct ScriptedEngineSpec {
+    pieces: Vec<String>,
+    finish_reason: FinishReason,
+    delay_ms: Option<u64>,
+}
+
+/// Reads the debug-build wire seed, when it is set.
+#[cfg(debug_assertions)]
+fn scripted_engine_spec() -> Option<Result<ScriptedEngineSpec, String>> {
+    let path = std::env::var_os("SPARKFLASH_SERVE_SCRIPT")?;
+    Some(parse_scripted_engine(Path::new(&path)))
+}
+
+/// Parses the debug-build wire seed.
+///
+/// Shape: {"pieces": ["first content piece", ...], "finish_reason": "stop", "delay_ms": 0}.
+/// The pieces are handed to the mock engine as its content deltas, so the wire test controls
+/// the exact token boundaries the streaming parser sees.
+#[cfg(debug_assertions)]
+fn parse_scripted_engine(path: &Path) -> Result<ScriptedEngineSpec, String> {
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        format!(
+            "cannot read SPARKFLASH_SERVE_SCRIPT {}: {error}",
+            path.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+        format!(
+            "SPARKFLASH_SERVE_SCRIPT {} is not JSON: {error}",
+            path.display()
+        )
+    })?;
+    let pieces = value
+        .get("pieces")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "SPARKFLASH_SERVE_SCRIPT needs a \"pieces\" array".to_owned())?
+        .iter()
+        .map(|piece| {
+            piece
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "SPARKFLASH_SERVE_SCRIPT pieces must be strings".to_owned())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let finish_reason = match value
+        .get("finish_reason")
+        .and_then(serde_json::Value::as_str)
+    {
+        None | Some("stop") => FinishReason::Stop,
+        Some("tool_calls") => FinishReason::ToolCalls,
+        Some(other) => {
+            return Err(format!(
+                "SPARKFLASH_SERVE_SCRIPT has an unknown finish_reason {other:?}"
+            ));
+        }
+    };
+    let delay_ms = value.get("delay_ms").and_then(serde_json::Value::as_u64);
+    Ok(ScriptedEngineSpec {
+        pieces,
+        finish_reason,
+        delay_ms,
+    })
+}
+
+/// The debug-build keep-alive override, in milliseconds.
+#[cfg(debug_assertions)]
+fn debug_keep_alive_ms() -> Option<u64> {
+    std::env::var("SPARKFLASH_SERVE_KEEP_ALIVE_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+/// Serves a scripted mock engine instead of the checkpoint (debug-build wire seed).
+#[cfg(debug_assertions)]
+fn run_scripted(
+    options: ServeOptions,
+    tokenizer: PathBuf,
+    scripted: ScriptedEngineSpec,
+) -> ExitCode {
+    use sparkflash_api::engine::MockEngine;
+    let pieces: Vec<&str> = scripted.pieces.iter().map(String::as_str).collect();
+    let mut engine = MockEngine::new(MODEL_ID)
+        .with_cluster_stats(ClusterStatsSnapshot::default())
+        .with_capabilities(Capabilities::ALL)
+        .content(&pieces)
+        .with_finish_reason(scripted.finish_reason);
+    if let Some(delay_ms) = scripted.delay_ms {
+        engine = engine.with_delay(Duration::from_millis(delay_ms));
+    }
+    eprintln!(
+        "sparkflash serve: debug scripted engine (no checkpoint): {} content piece(s), keep-alive {:?} ms",
+        scripted.pieces.len(),
+        debug_keep_alive_ms(),
+    );
+    serve_with_engine(
+        Arc::new(engine),
+        Arc::new(Metrics::new()),
+        &tokenizer,
+        &options,
+    )
 }
 
 /// Binds the requested address and serves the router until the process is stopped.
 ///
 /// The address printed is the one the listener actually bound. Those differ whenever the request
 /// left the port to the kernel (`--bind 127.0.0.1:0`), and an operator needs the real one.
-async fn bind_and_serve(router: axum::Router, requested: SocketAddr) -> ExitCode {
+async fn bind_and_serve(router: axum::Router, state: AppState, requested: SocketAddr) -> ExitCode {
     let listener = match tokio::net::TcpListener::bind(requested).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -3683,11 +5136,135 @@ async fn bind_and_serve(router: axum::Router, requested: SocketAddr) -> ExitCode
         epoch_millis()
     );
     println!("sparkflash serve: listening on http://{bound}");
-    if let Err(error) = axum::serve(listener, router).await {
-        eprintln!("sparkflash serve: the server stopped: {error}");
-        return ExitCode::FAILURE;
+    // Graceful drain: the first SIGTERM/SIGINT starts the drain, /readyz turns 503 immediately so a
+    // load balancer or readiness probe stops sending new work, and the listener stops accepting
+    // after the configured pre-stop delay. Requests already accepted are allowed to finish until
+    // the drain deadline; the process then exits 0 (or 1 if the deadline forced it).
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let server = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let _ = stop_rx.await;
+        })
+        .into_future();
+    let mut server = Box::pin(server);
+    let drain_state = state.clone();
+    let drain_metrics = Arc::clone(&state.metrics);
+    let watchdog = async move {
+        shutdown_signal().await;
+        drain_state.begin_drain();
+        drain_metrics.set_serving(false);
+        let timeout = drain_timeout();
+        println!(
+            "sparkflash serve: serve_timeline phase=drain_start epoch_ms={} timeout_ms={}",
+            epoch_millis(),
+            timeout.as_millis()
+        );
+        let delay = drain_delay();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        println!(
+            "sparkflash serve: serve_timeline phase=drain_accepting_stopped epoch_ms={}",
+            epoch_millis()
+        );
+        // The receiver drops with this future when the server wins the race below; that is
+        // harmless because the server is already over in that branch.
+        let _ = stop_tx.send(());
+    };
+    let mut watchdog = Box::pin(watchdog);
+    tokio::select! {
+        result = &mut server => return serve_result(result),
+        () = &mut watchdog => {}
     }
-    ExitCode::SUCCESS
+    // The drain signal is in and the listener has been asked to stop; bounds the time the
+    // connections already accepted may take to finish.
+    match tokio::time::timeout(drain_timeout(), &mut server).await {
+        Ok(result) => {
+            println!(
+                "sparkflash serve: serve_timeline phase=drain_complete epoch_ms={}",
+                epoch_millis()
+            );
+            serve_result(result)
+        }
+        Err(_) => {
+            eprintln!(
+                "sparkflash serve: serve_timeline phase=drain_timeout epoch_ms={} forced_exit=1",
+                epoch_millis()
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Maps the server future's result to the process exit code.
+fn serve_result(result: Result<(), std::io::Error>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("sparkflash serve: the server stopped: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Resolves on the first SIGTERM or SIGINT, the two drain signals an orchestrator sends.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = signal(SignalKind::terminate()).ok();
+        let mut interrupt = signal(SignalKind::interrupt()).ok();
+        tokio::select! {
+            _ = async {
+                match terminate.as_mut() {
+                    Some(signal) => {
+                        signal.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            } => {}
+            _ = async {
+                match interrupt.as_mut() {
+                    Some(signal) => {
+                        signal.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            } => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// The wall-clock budget a drain may take before the process is forced out.
+///
+/// \`SPARKFLASH_SERVE_DRAIN_TIMEOUT_MS\` overrides it (positive milliseconds only); the default is
+/// 30 s, long enough for a typical in-flight decode to finish and short enough that an
+/// orchestrator's termination grace period is not exceeded.
+fn drain_timeout() -> Duration {
+    drain_millis_env("SPARKFLASH_SERVE_DRAIN_TIMEOUT_MS", Duration::from_secs(30))
+}
+
+/// The grace period between the drain signal and the listener closing.
+///
+/// \`SPARKFLASH_SERVE_DRAIN_DELAY_MS\` overrides it; the default is zero because a probe-driven
+/// deployment does not need one. A Kubernetes deployment that relies on endpoint propagation may
+/// set it to a few seconds, which is the same purpose as a preStop hook.
+fn drain_delay() -> Duration {
+    drain_millis_env("SPARKFLASH_SERVE_DRAIN_DELAY_MS", Duration::ZERO)
+}
+
+/// Reads a positive millisecond duration from \`name\`, or returns \`default\` for unset/invalid.
+fn drain_millis_env(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|milliseconds| *milliseconds > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(default)
 }
 
 /// A test-only weight source whose every tensor is zero.
@@ -5235,6 +6812,7 @@ mod tests {
             },
             tokenizer: reference_tokenizer_path(),
             engram_dir: None,
+            batch: None,
         };
         ReferenceDriver::start(&recipe, REFERENCE_TENSOR_LIMIT, max_tokens)
             .expect("the synthetic driver starts")
@@ -5249,9 +6827,174 @@ mod tests {
             weights: Weights::Zero,
             tokenizer: reference_tokenizer_path(),
             engram_dir: None,
+            batch: None,
         };
         ReferenceDriver::start(&recipe, REFERENCE_TENSOR_LIMIT, max_tokens)
             .expect("the zero-weight driver starts")
+    }
+
+    /// A driver over the synthetic tiny plan with the S4 host scheduler enabled.
+    fn batched_driver(max_tokens: usize, max_batch: usize) -> ReferenceDriver {
+        let recipe = Recipe {
+            config: ModelConfig::tiny(),
+            weights: Weights::Synthetic {
+                seed: SYNTHETIC_WEIGHT_SEED,
+            },
+            tokenizer: reference_tokenizer_path(),
+            engram_dir: None,
+            batch: Some(max_batch),
+        };
+        ReferenceDriver::start(&recipe, REFERENCE_TENSOR_LIMIT, max_tokens)
+            .expect("the batched synthetic driver starts")
+    }
+
+    /// Drains two request streams concurrently and reports the order their terminal events
+    /// arrived in.
+    async fn finish_order(
+        first: BoxStream<'static, EngineEvent>,
+        second: BoxStream<'static, EngineEvent>,
+    ) -> (Vec<&'static str>, Vec<EngineEvent>, Vec<EngineEvent>) {
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<(&'static str, EngineEvent)>(4 * REPLY_BUFFER);
+        for (label, stream) in [("first", first), ("second", second)] {
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                let mut stream = stream;
+                while let Some(event) = stream.next().await {
+                    if sender.send((label, event)).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+        let mut order = Vec::new();
+        let mut first_events = Vec::new();
+        let mut second_events = Vec::new();
+        let mut terminal = 0usize;
+        while terminal < 2 {
+            let Some((label, event)) = receiver.recv().await else {
+                break;
+            };
+            let is_terminal = matches!(
+                event,
+                EngineEvent::Finished { .. } | EngineEvent::Error { .. }
+            );
+            if label == "first" {
+                first_events.push(event);
+            } else {
+                second_events.push(event);
+            }
+            if is_terminal {
+                terminal += 1;
+                order.push(label);
+            }
+        }
+        (order, first_events, second_events)
+    }
+
+    /// What two runs of the same logprob request must agree on without comparing the NaN logprob
+    /// values the synthetic tiny plan produces.
+    fn logprob_shape(
+        stream: &[EngineEvent],
+    ) -> (String, Vec<u32>, Vec<u32>, Option<FinishReason>, usize) {
+        let mut text = String::new();
+        let mut prompt_ids = Vec::new();
+        let mut sample_ids = Vec::new();
+        let mut finish = None;
+        let mut completion = 0usize;
+        for event in stream {
+            match event {
+                EngineEvent::ContentDelta(delta) => text.push_str(delta),
+                EngineEvent::PromptLogprobs(payload) => {
+                    for position in &payload.positions {
+                        let ids: Vec<u32> = position.as_ref().map_or_else(Vec::new, |entry| {
+                            let mut ids = vec![entry.token_id];
+                            ids.extend(entry.top.iter().map(|alternative| alternative.token_id));
+                            ids
+                        });
+                        prompt_ids.push(ids.len() as u32);
+                        prompt_ids.extend(ids);
+                    }
+                }
+                EngineEvent::TokenLogprobs(logprob) => {
+                    let mut ids = vec![logprob.token_id];
+                    ids.extend(logprob.top.iter().map(|alternative| alternative.token_id));
+                    sample_ids.push(ids.len() as u32);
+                    sample_ids.extend(ids);
+                }
+                EngineEvent::Finished {
+                    finish_reason,
+                    usage,
+                    ..
+                } => {
+                    finish = Some(*finish_reason);
+                    completion = usage.completion_tokens;
+                }
+                _ => {}
+            }
+        }
+        (text, prompt_ids, sample_ids, finish, completion)
+    }
+
+    #[tokio::test]
+    async fn continuous_batching_admits_both_requests_and_keeps_their_output() {
+        let long_request = request(&[1, 2, 3], 24, 0.0, 11);
+        let short_request = request(&[4, 5, 6], 2, 0.0, 13);
+        let serial = synthetic_driver(64);
+        let serial_long = without_measurements(&events(&serial, long_request.clone()).await);
+        let serial_short = without_measurements(&events(&serial, short_request.clone()).await);
+
+        let batched = batched_driver(64, 8);
+        let (order, long_events, short_events) = finish_order(
+            batched.generate(long_request),
+            batched.generate(short_request),
+        )
+        .await;
+        assert_eq!(
+            order,
+            ["second", "first"],
+            "the short request must not wait for the long one to finish: {order:?}"
+        );
+        assert_eq!(
+            without_measurements(&long_events),
+            serial_long,
+            "interleaving must not change the long request's tokens, logprobs or finish reason"
+        );
+        assert_eq!(
+            without_measurements(&short_events),
+            serial_short,
+            "interleaving must not change the short request's tokens, logprobs or finish reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn continuous_batching_carries_prompt_logprobs_and_stop_strings() {
+        let mut scored = request(&[1, 2, 3, 4], 8, 0.0, 3);
+        scored.logprobs = LogprobsRequest {
+            sample: Some(LogprobSelection::Top(2)),
+            prompt: Some(LogprobSelection::Top(2)),
+            token_ids: Vec::new(),
+        };
+        // The tiny plan's generated token decodes to the BOS special token, whose text contains
+        // a b; with skip_special_tokens false that is the first stop-string match.
+        scored.stop = vec!["b".to_owned()];
+        let filler = request(&[5, 6], 3, 0.0, 5);
+
+        let serial = synthetic_driver(64);
+        let serial_events = without_measurements(&events(&serial, scored.clone()).await);
+        let batched = batched_driver(64, 4);
+        let (_, batched_events, filler_events) =
+            finish_order(batched.generate(scored), batched.generate(filler)).await;
+        assert_eq!(
+            logprob_shape(&without_measurements(&batched_events)),
+            logprob_shape(&serial_events),
+            "the batched request's prompt logprobs, sample logprobs, stop match and counts must match the serial path"
+        );
+        assert!(
+            !filler_events.is_empty(),
+            "the filler request shares the scheduler round and its own stream is intact"
+        );
     }
 
     /// A driver whose weight source panics on one tensor: the guard's only way in.
@@ -5265,6 +7008,7 @@ mod tests {
             },
             tokenizer: reference_tokenizer_path(),
             engram_dir: None,
+            batch: None,
         };
         ReferenceDriver::start(&recipe, REFERENCE_TENSOR_LIMIT, max_tokens)
             .expect("the panicking driver starts")
@@ -5281,6 +7025,14 @@ mod tests {
             max_tokens,
             temperature,
             top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            // These driver tests compare the emitted text with a raw decode_stream(false) pass,
+            // so they ask for the explicit false passthrough; the default hiding has its own
+            // test below.
+            skip_special_tokens: false,
             thinking: false,
             reasoning_effort: None,
             stop: Vec::new(),
@@ -5771,6 +7523,33 @@ mod tests {
         );
     }
 
+    /// vLLM's OpenAI default hides special tokens; an explicit false is the only way to see them.
+    #[tokio::test]
+    async fn skip_special_tokens_hides_a_generated_special_token_unless_it_is_false() {
+        let driver = synthetic_driver(1);
+        // The synthetic plan's only generated token is the BOS special token, so the default hides
+        // it and the explicit false exposes it; nothing else about the request changes.
+        let mut hidden_request = request(&[1, 2, 3], 1, 0.0, 0);
+        hidden_request.skip_special_tokens = true;
+        let hidden = events(&driver, hidden_request).await;
+        let shown = events(&driver, request(&[1, 2, 3], 1, 0.0, 0)).await;
+        let text_of = |stream: &[EngineEvent]| -> String {
+            stream
+                .iter()
+                .filter_map(|event| match event {
+                    EngineEvent::ContentDelta(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(text_of(&hidden), "", "the default hides the special token");
+        assert!(
+            text_of(&shown).contains('\u{FF5C}'),
+            "an explicit false passes the special token through: {:?}",
+            text_of(&shown)
+        );
+    }
+
     #[tokio::test]
     async fn one_bad_request_does_not_take_the_engine_thread_with_it() {
         // A prompt token far outside the vocabulary cannot produce an answer: the engine errors when
@@ -6114,6 +7893,107 @@ mod tests {
         assert!(options.device_cubin.is_none());
         assert!(options.synthetic);
         assert!(options.checkpoint.is_none());
+    }
+
+    #[test]
+    fn the_api_key_flag_parses_and_an_empty_key_is_refused() {
+        let open = ServeOptions::parse(vec!["--synthetic".to_owned()]).expect("parses");
+        assert!(
+            open.api_key.is_none(),
+            "no flag means no auth, exactly the pre-task-20 behaviour"
+        );
+        let keyed = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--api-key".to_owned(),
+            "s3cret".to_owned(),
+        ])
+        .expect("parses");
+        assert_eq!(keyed.api_key.as_deref(), Some("s3cret"));
+        for empty in ["", "   "] {
+            let error = ServeOptions::parse(vec![
+                "--synthetic".to_owned(),
+                "--api-key".to_owned(),
+                empty.to_owned(),
+            ])
+            .expect_err("an empty bearer key is refused");
+            assert!(
+                error.contains("--api-key must not be empty"),
+                "a blank key must be named, not turned into auth that accepts only a blank token: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn continuous_batching_flags_parse_and_their_misuses_are_refused() {
+        let off = ServeOptions::parse(vec!["--synthetic".to_owned()]).expect("parses");
+        assert!(
+            !off.continuous_batching,
+            "the serial one-at-a-time loop is the default"
+        );
+        assert_eq!(off.max_batch, DEFAULT_MAX_BATCH);
+
+        let on = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--continuous-batching".to_owned(),
+        ])
+        .expect("parses");
+        assert!(on.continuous_batching);
+        assert_eq!(on.max_batch, DEFAULT_MAX_BATCH);
+
+        let wide = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--continuous-batching".to_owned(),
+            "--max-batch".to_owned(),
+            "4".to_owned(),
+        ])
+        .expect("parses");
+        assert_eq!(wide.max_batch, 4);
+        let recipe = wide
+            .recipe(&reference_tokenizer_path())
+            .expect("the recipe resolves");
+        assert_eq!(
+            recipe.batch,
+            Some(4),
+            "the parsed cap is what the engine thread reads"
+        );
+
+        let without_scheduler = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--max-batch".to_owned(),
+            "4".to_owned(),
+        ])
+        .expect_err("--max-batch alone does nothing");
+        assert!(
+            without_scheduler.contains("--continuous-batching"),
+            "{without_scheduler}"
+        );
+
+        let zero = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--continuous-batching".to_owned(),
+            "--max-batch".to_owned(),
+            "0".to_owned(),
+        ])
+        .expect_err("a batch of zero admits nothing");
+        assert!(zero.contains("at least 1"), "{zero}");
+
+        let too_wide = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--continuous-batching".to_owned(),
+            "--max-batch".to_owned(),
+            "65".to_owned(),
+        ])
+        .expect_err("the queue is the bound");
+        assert!(too_wide.contains(&JOB_QUEUE.to_string()), "{too_wide}");
+
+        let device = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--continuous-batching".to_owned(),
+            "--engine".to_owned(),
+            "device".to_owned(),
+        ])
+        .expect_err("the device engine path is unchanged");
+        assert!(device.contains("reference engine"), "{device}");
     }
 
     #[test]
@@ -6696,6 +8576,114 @@ mod tests {
         }
     }
 
+    #[test]
+    fn one_pass_prompt_logprobs_match_the_token_at_a_time_reference() {
+        let config = ModelConfig::tiny();
+        let plan = TensorPlan::language_model(&config);
+        let engine = InferenceEngine::new(
+            config.clone(),
+            Box::new(SyntheticWeights::from_plan(&plan, SYNTHETIC_WEIGHT_SEED)),
+            REFERENCE_TENSOR_LIMIT,
+        )
+        .expect("the synthetic tiny engine builds");
+        let decode = spelling_decoder;
+        let prompts = [vec![1u32], vec![1, 2, 3], vec![1, 2, 3, 4, 5, 6]];
+        let selections = [
+            LogprobSelection::Top(2),
+            LogprobSelection::Top(0),
+            LogprobSelection::All,
+        ];
+        for prompt in prompts {
+            for selection in selections {
+                let request = LogprobsRequest {
+                    sample: None,
+                    prompt: Some(selection),
+                    token_ids: Vec::new(),
+                };
+                let mut one_pass_decoder = LogprobDecoder::new(&decode);
+                let mut one_pass_state = SequenceState::new(engine.config());
+                let (one_pass_step, one_pass_payload) = prompt_logprobs_pass(
+                    &engine,
+                    &prompt,
+                    &mut one_pass_state,
+                    &request,
+                    &mut one_pass_decoder,
+                )
+                .expect("the one-pass prompt logprobs run");
+                let mut reference_decoder = LogprobDecoder::new(&decode);
+                let mut reference_state = SequenceState::new(engine.config());
+                let (reference_step, reference_payload) = prompt_logprobs_pass_token_at_a_time(
+                    &engine,
+                    &prompt,
+                    &mut reference_state,
+                    &request,
+                    &mut reference_decoder,
+                )
+                .expect("the token-at-a-time reference runs");
+                assert_eq!(one_pass_payload.tokens, reference_payload.tokens);
+                assert_eq!(
+                    one_pass_payload.positions, reference_payload.positions,
+                    "prompt {prompt:?} at {selection:?}: the payload differs from the reference"
+                );
+                assert_eq!(
+                    one_pass_step
+                        .logits
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    reference_step
+                        .logits
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    "the final logits differ from the token-at-a-time reference"
+                );
+                assert_eq!(
+                    one_pass_step
+                        .head_input
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    reference_step
+                        .head_input
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    "the final head input differs from the token-at-a-time reference"
+                );
+                assert_eq!(one_pass_step.next_token, reference_step.next_token);
+                assert_eq!(one_pass_state.tokens(), reference_state.tokens());
+                assert_eq!(one_pass_payload.positions.len(), prompt.len());
+                assert!(one_pass_payload.positions[0].is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_logprobs_spans_cover_the_prompt_within_the_row_budget() {
+        for prompt_len in [1usize, 2, 7, 4096, 4097] {
+            let vocab = PROMPT_LOGPROBS_ROW_BUDGET / 4;
+            let spans = prompt_logprobs_spans(prompt_len, vocab).expect("spans build");
+            assert_eq!(spans[0].start, 0);
+            assert_eq!(spans[spans.len() - 1].end, prompt_len);
+            for pair in spans.windows(2) {
+                assert_eq!(pair[0].end, pair[1].start, "spans are contiguous");
+            }
+            for span in &spans {
+                assert!(!span.is_empty());
+                assert!(
+                    span.len() <= 4,
+                    "a span returns at most the row budget: {span:?}"
+                );
+            }
+        }
+        let tiny = prompt_logprobs_spans(4096, 128).expect("spans build");
+        assert_eq!(
+            tiny.len(),
+            1,
+            "the tiny vocabulary fits a whole scheduler chunk in one span"
+        );
+    }
     #[tokio::test]
     async fn temperature_zero_logprobs_are_reproducible_and_cover_every_token() {
         let driver = synthetic_driver(3);
@@ -6772,6 +8760,130 @@ mod tests {
                 .all(|alternative| alternative.logprob == f32::NEG_INFINITY),
             "an all-NaN logit row reports the floor for every token"
         );
+    }
+
+    // ---- stop strings (vLLM semantics) --------------------------------------------------
+
+    #[test]
+    fn stop_buffer_holds_back_partial_stop_strings() {
+        let mut buffer = StopBuffer::new(&["zz".to_owned()]);
+        // One character is held back because appending it could complete "zz".
+        assert_eq!(buffer.push(Some("Hello")), "Hell");
+        assert_eq!(buffer.push(Some(" world")), "o worl");
+        assert!(!buffer.matched());
+        assert_eq!(buffer.finish(), "d");
+    }
+
+    #[test]
+    fn stop_buffer_truncates_at_a_match_across_token_boundaries() {
+        let mut buffer = StopBuffer::new(&["stop".to_owned()]);
+        assert_eq!(buffer.push(Some("a st")), "a");
+        // "stop" is completed by the next token; the match and everything before it in the held
+        // tail beyond the returned prefix leave the output.
+        assert_eq!(buffer.push(Some("opb")), " ");
+        assert!(buffer.matched());
+        assert_eq!(buffer.finish(), "");
+        assert_eq!(buffer.push(Some("more")), "");
+    }
+
+    #[test]
+    fn stop_buffer_uses_the_earliest_match_across_sequences() {
+        let mut buffer = StopBuffer::new(&["aaa".to_owned(), "bc".to_owned()]);
+        assert_eq!(buffer.push(Some("xxbc aaa")), "xx");
+        assert!(buffer.matched());
+    }
+
+    #[test]
+    fn stop_buffer_without_sequences_emits_every_character_immediately() {
+        let mut buffer = StopBuffer::new(&[]);
+        assert_eq!(buffer.push(Some("abc")), "abc");
+        assert_eq!(buffer.push(None), "");
+        assert_eq!(buffer.finish(), "");
+        assert!(!buffer.matched());
+    }
+
+    /// The generated text of one stream: every content delta concatenated.
+    fn generated_text(events: &[EngineEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::ContentDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_stop_string_ends_generation_and_never_reaches_the_client() {
+        let driver = synthetic_driver(16);
+        let full = events(&driver, request(&[1, 2, 3], 8, 0.0, 0)).await;
+        let full_text = generated_text(&full);
+        assert!(!full_text.is_empty(), "the synthetic plan generates text");
+        let stop: String = full_text.chars().take(3).collect();
+        let mut stopped_request = request(&[1, 2, 3], 8, 0.0, 0);
+        stopped_request.stop = vec![stop.clone()];
+        let stopped = events(&driver, stopped_request).await;
+        let stopped_text = generated_text(&stopped);
+        assert!(
+            !stopped_text.contains(&stop),
+            "the stop string must not be in the output: {stopped_text:?}"
+        );
+        assert_eq!(
+            stopped_text, "",
+            "the first token completes the stop string, so nothing before it is emitted"
+        );
+        let Some(EngineEvent::Finished {
+            finish_reason,
+            usage,
+            ..
+        }) = stopped.last()
+        else {
+            panic!("the stream did not finish: {stopped:?}");
+        };
+        assert_eq!(finish_reason, &FinishReason::Stop);
+        assert_eq!(
+            usage.completion_tokens, 1,
+            "the token that completed the stop string was generated and is counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_string_that_never_matches_does_not_change_the_output() {
+        let driver = synthetic_driver(16);
+        let full = events(&driver, request(&[1, 2, 3], 6, 0.0, 0)).await;
+        let full_text = generated_text(&full);
+        let mut held_request = request(&[1, 2, 3], 6, 0.0, 0);
+        // Longer than the output and not present in it: the held-back tail is flushed when the
+        // token budget stops generation, so the client still receives the whole text.
+        held_request.stop = vec![format!("{full_text}ZZZZ")];
+        let held = events(&driver, held_request).await;
+        assert_eq!(generated_text(&held), full_text);
+        let Some(EngineEvent::Finished { finish_reason, .. }) = held.last() else {
+            panic!("the stream did not finish: {held:?}");
+        };
+        assert_eq!(finish_reason, &FinishReason::Length);
+    }
+
+    #[tokio::test]
+    async fn stop_strings_do_not_break_the_logprob_events() {
+        let driver = synthetic_driver(16);
+        let full = events(&driver, request(&[1, 2, 3], 8, 0.0, 0)).await;
+        let full_text = generated_text(&full);
+        let stop: String = full_text.chars().take(3).collect();
+        let mut stopped_request = request(&[1, 2, 3], 8, 0.0, 0);
+        stopped_request.logprobs.sample = Some(LogprobSelection::Top(0));
+        stopped_request.stop = vec![stop.clone()];
+        let stopped = events(&driver, stopped_request).await;
+        let scored = stopped
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::TokenLogprobs(_)))
+            .count();
+        assert_eq!(scored, 1, "one generated token still carries its logprob");
+        assert_eq!(generated_text(&stopped), "");
+        let Some(EngineEvent::Finished { finish_reason, .. }) = stopped.last() else {
+            panic!("the stream did not finish: {stopped:?}");
+        };
+        assert_eq!(finish_reason, &FinishReason::Stop);
     }
 }
 
@@ -7052,6 +9164,7 @@ mod engram_packed_store {
             },
             tokenizer: reference_tokenizer_path(),
             engram_dir: Some(missing.path().to_path_buf()),
+            batch: None,
         };
         let error = match build_engine(&recipe, REFERENCE_TENSOR_LIMIT) {
             Ok(_) => panic!("a directory without a manifest cannot serve Engram rows"),
@@ -7082,6 +9195,11 @@ mod tp4_serve_tests {
             max_tokens,
             temperature: 0.0,
             top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            skip_special_tokens: true,
             thinking: false,
             reasoning_effort: None,
             stop: Vec::new(),
@@ -7199,6 +9317,12 @@ mod tp4_serve_tests {
             Tp4ControlFrame::Request {
                 prompt_ids: vec![1, 2, 3],
                 max_tokens: 4,
+                prompt_logprobs: None,
+            },
+            Tp4ControlFrame::Request {
+                prompt_ids: vec![9, 8],
+                max_tokens: 2,
+                prompt_logprobs: Some(3),
             },
             Tp4ControlFrame::Token { token_id: 7 },
             Tp4ControlFrame::End,
@@ -7225,6 +9349,272 @@ mod tp4_serve_tests {
             assert_eq!(&got, frame);
         }
         server.join().expect("the test server joins");
+    }
+
+    /// A rank-0 API stub for the control-protocol test: no forward, canned contract values.
+    struct FakeTp4Rank {
+        prompt: Vec<u32>,
+        seen_selection: Option<Option<usize>>,
+    }
+
+    impl Tp4RankApi for FakeTp4Rank {
+        fn begin_request(&mut self, _sampling: Tp4Sampling) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn prefill(&mut self, _prompt: &[u32]) -> Result<Tp4Step, String> {
+            Ok(Tp4Step {
+                logits: vec![0.0; 8],
+                next_token: Some(500),
+            })
+        }
+
+        fn prefill_prompt_logprobs(
+            &mut self,
+            prompt: &[u32],
+            selection: Option<usize>,
+        ) -> Result<(Tp4Step, Vec<MergedPosition>), String> {
+            self.seen_selection = Some(selection);
+            assert_eq!(prompt, self.prompt.as_slice());
+            let alternatives = selection.unwrap_or(0);
+            let merged = (0..prompt.len() - 1)
+                .map(|position| MergedPosition {
+                    position,
+                    own_token_id: prompt[position + 1],
+                    own_logprob: -1.25 - position as f32,
+                    own_rank: 1,
+                    alternatives: (0..alternatives)
+                        .map(|slot| sparkflash_engine::prompt_ranks::MergedAlternative {
+                            token_id: 600 + slot as u32,
+                            logprob: -2.5 - slot as f32,
+                        })
+                        .collect(),
+                })
+                .collect();
+            Ok((
+                Tp4Step {
+                    logits: vec![0.0; 8],
+                    next_token: Some(500),
+                },
+                merged,
+            ))
+        }
+
+        fn decode(&mut self, _token: u32) -> Result<Tp4Step, String> {
+            Ok(Tp4Step {
+                logits: vec![0.0; 8],
+                next_token: Some(501),
+            })
+        }
+
+        fn metrics(&self) -> Tp4RankMetrics {
+            Tp4RankMetrics {
+                load_ms: 0,
+                resident_cache_bytes: 0,
+                resident_cache_tensors: 0,
+                reduce_calls: 0,
+                reduce_elements: 0,
+                steps: 0,
+                last_step_ms: 0,
+            }
+        }
+    }
+
+    #[test]
+    fn the_prompt_logprob_request_frame_carries_the_selection_and_the_events_lead_with_the_payload()
+    {
+        let prompt = vec![100u32, 200, 300, 400];
+        let tokenizer = load_hf_tokenizer(&sparkflash_api::encoding::reference_tokenizer_path())
+            .expect("tokenizer");
+        // Bind a free loopback port, release it, and let the hub take it: the hub does not expose
+        // its bound address, and the race window is a test-only detail.
+        let probe = TcpListener::bind("127.0.0.1:0").expect("probe listener");
+        let address = probe.local_addr().expect("probe address");
+        drop(probe);
+        let control_address = address;
+        // The worker connects before the hub waits for it: connect retries until the hub binds,
+        // and the hub cannot return until every worker has said Hello.
+        let worker = thread::spawn(move || {
+            let mut control =
+                Tp4ControlWorker::connect(control_address, 1, 2, Duration::from_secs(10))
+                    .expect("worker connect");
+            control.handshake().expect("handshake");
+            let mut requests = Vec::new();
+            while let Ok(frame) = control.next_frame() {
+                match frame {
+                    Tp4ControlFrame::Request {
+                        prompt_ids,
+                        max_tokens,
+                        prompt_logprobs,
+                    } => {
+                        requests.push((prompt_ids, max_tokens, prompt_logprobs));
+                        loop {
+                            match control.next_frame().expect("decode frame") {
+                                Tp4ControlFrame::Token { token_id } => {
+                                    assert_eq!(token_id, 500);
+                                }
+                                Tp4ControlFrame::End => break,
+                                other => panic!("expected Token or End, got {other:?}"),
+                            }
+                        }
+                    }
+                    Tp4ControlFrame::End => break,
+                    other => panic!("expected Request or End, got {other:?}"),
+                }
+            }
+            requests
+        });
+        let mut hub = Tp4ControlHub::start(address, 2, Duration::from_secs(10)).expect("hub");
+        let (replies, mut answers) = tokio::sync::mpsc::channel(REPLY_BUFFER);
+        let job = Job {
+            prompt_tokens: prompt.clone(),
+            max_tokens: 2,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            skip_special_tokens: true,
+            seed: 0,
+            logprobs: LogprobsRequest {
+                sample: None,
+                prompt: Some(LogprobSelection::Top(3)),
+                token_ids: Vec::new(),
+            },
+            stop: Vec::new(),
+            enqueued_at: Instant::now(),
+            replies,
+        };
+        let metrics = Metrics::new();
+        let mut rank = FakeTp4Rank {
+            prompt: prompt.clone(),
+            seen_selection: None,
+        };
+        run_tp4_request(&mut rank, &mut hub, &tokenizer, job, &metrics).expect("request runs");
+        assert_eq!(rank.seen_selection, Some(Some(3)));
+        // Closing the hub is what ends the worker loop in the test; the real worker exits with
+        // the process.
+        drop(hub);
+        let requests = worker.join().expect("worker joins");
+        assert_eq!(
+            requests,
+            vec![(prompt.clone(), 2, Some(3u32))],
+            "the Request frame must carry the prompt-logprob selection"
+        );
+        // The first reply is the whole-prompt payload, delivered after prefill and before the
+        // first generated token, exactly where the serial host path delivers it.
+        let first = answers.try_recv().expect("the prompt payload");
+        let Reply::PromptLogprobs(payload) = first else {
+            panic!("expected PromptLogprobs first, got a different reply");
+        };
+        assert_eq!(payload.tokens.len(), prompt.len());
+        assert!(payload.positions[0].is_none());
+        for (index, position) in payload.positions.iter().enumerate().skip(1) {
+            let position = position.as_ref().expect("a scored position");
+            assert_eq!(position.token_id, prompt[index]);
+            assert_eq!(position.top.len(), 4, "own token plus three alternatives");
+            assert_eq!(position.top[0].token_id, prompt[index]);
+            assert_eq!(position.top[0].logprob, position.logprob);
+            assert_eq!(position.top[0].rank, Some(1));
+            for (slot, alternative) in position.top.iter().skip(1).enumerate() {
+                assert_eq!(alternative.rank, Some(u32::try_from(slot + 1).unwrap()));
+            }
+        }
+        // Then the generated-token deltas and the terminal reply.
+        let mut deltas = 0usize;
+        let mut done = false;
+        while let Ok(reply) = answers.try_recv() {
+            match reply {
+                Reply::Delta(_) => deltas += 1,
+                Reply::Done(_) => done = true,
+                _ => panic!("unexpected reply after the payload"),
+            }
+        }
+        assert!(deltas >= 1);
+        assert!(done, "the request must end with the Done summary");
+    }
+
+    #[test]
+    fn the_tp4_prompt_logprobs_payload_matches_the_serial_assembly() {
+        // A fabricated finite log-softmax row and a prompt that walks it: the rank contract's
+        // merged values are derived from the same row the serial formula uses, so the payload the
+        // TP=4 path builds must equal the serial token_logprob assembly exactly, strings and order
+        // included.
+        let prompt: Vec<u32> = vec![2, 5, 8, 13, 21];
+        let row: Vec<f32> = (0..64).map(|index| index as f32 * 0.7 - 6.0).collect();
+        let values = log_softmax(&row);
+        let decode_ids = |ids: &[u32]| -> Result<String, String> {
+            Ok(ids
+                .iter()
+                .map(|token| format!("<{token}>"))
+                .collect::<String>())
+        };
+        for requested in [None, Some(0u32), Some(3u32)] {
+            let selection = requested.map(LogprobSelection::Top);
+            let request = LogprobsRequest {
+                sample: None,
+                prompt: selection,
+                token_ids: Vec::new(),
+            };
+            let alternatives: usize = requested.unwrap_or(0) as usize;
+            let merged: Vec<MergedPosition> = (0..prompt.len() - 1)
+                .map(|index| {
+                    let own_token_id = prompt[index + 1];
+                    let own_logprob = values[own_token_id as usize];
+                    MergedPosition {
+                        position: index,
+                        own_token_id,
+                        own_logprob,
+                        own_rank: competition_rank(&values, own_logprob),
+                        alternatives: top_k_indices(&values, alternatives)
+                            .into_iter()
+                            .map(|token| sparkflash_engine::prompt_ranks::MergedAlternative {
+                                token_id: token as u32,
+                                logprob: values[token],
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+            let mut decoder = LogprobDecoder::new(&decode_ids);
+            let payload = tp4_prompt_logprobs_payload(&prompt, &merged, &request, &mut decoder)
+                .expect("the TP=4 payload builds");
+            // The serial assembly of the same request, with the same decoding sequence.
+            let mut serial_decoder = LogprobDecoder::new(&decode_ids);
+            let mut tokens = Vec::new();
+            let mut positions: Vec<Option<TokenLogprob>> = vec![None; prompt.len()];
+            tokens.push(TokenString {
+                token_id: prompt[0],
+                token: serial_decoder.decode(prompt[0]).expect("decode"),
+            });
+            serial_decoder.push(prompt[0]);
+            for index in 0..prompt.len() - 1 {
+                let token_index = index + 1;
+                let token = serial_decoder.decode(prompt[token_index]).expect("decode");
+                tokens.push(TokenString {
+                    token_id: prompt[token_index],
+                    token: token.clone(),
+                });
+                positions[token_index] = Some(
+                    token_logprob(
+                        &values,
+                        prompt[token_index],
+                        token,
+                        selection,
+                        &[],
+                        &mut serial_decoder,
+                    )
+                    .expect("serial token logprob"),
+                );
+                serial_decoder.push(prompt[token_index]);
+            }
+            assert_eq!(
+                payload,
+                PromptLogprobs { tokens, positions },
+                "requested {requested:?} changed the payload"
+            );
+        }
     }
 
     #[test]
@@ -7333,6 +9723,10 @@ mod tp4_serve_tests {
     async fn one_request_guard_refuses_a_second_concurrent_request() {
         let (jobs, mut queued) = tokio::sync::mpsc::channel(TP4_JOB_QUEUE);
         let driver = Tp4Driver::for_test(jobs, 4);
+        assert!(
+            !driver.independent_choices(),
+            "the router must refuse n > 1 on the lockstep TP=4 group"
+        );
         let _first = driver.generate(engine_request(&[1, 2, 3], 2));
         let second = driver.generate(engine_request(&[1, 2, 3], 2));
         let events: Vec<EngineEvent> = second.collect().await;
@@ -7362,5 +9756,59 @@ mod tp4_serve_tests {
         assert_eq!(reference["transport"]["fabric_mode"], "");
         assert_eq!(tp4["kv_cache"]["total_prompt_tokens"], 3);
         assert_eq!(tp4["kv_cache"]["global_kv_cached_tokens"], 0);
+    }
+}
+
+#[cfg(test)]
+mod device_token_serve_tests {
+    use super::*;
+    use sparkflash_api::encoding::reference_tokenizer_path;
+
+    #[test]
+    fn device_token_flags_parse_and_require_each_other() {
+        let error = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--device-token-derived-claim".to_owned(),
+        ])
+        .expect_err("the derived claim needs a window");
+        assert!(
+            error.contains("--device-token-dir"),
+            "the message names the missing flag: {error}"
+        );
+        let options = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--device-token-dir".to_owned(),
+            "/tmp/sparkflash-window".to_owned(),
+            "--device-token-derived-claim".to_owned(),
+        ])
+        .expect("the flags parse");
+        assert_eq!(
+            options.device_token_dir,
+            Some(std::path::PathBuf::from("/tmp/sparkflash-window"))
+        );
+        assert!(options.device_token_derived_claim);
+        let plain = ServeOptions::parse(vec!["--synthetic".to_owned()]).expect("parses");
+        assert_eq!(plain.device_token_dir, None);
+        assert!(!plain.device_token_derived_claim);
+    }
+
+    #[test]
+    fn the_piece_decoder_reconstructs_the_tokenizer_decode() {
+        // The device source streams pieces, but the served text must be exactly the tokenizer's
+        // decode of the claimed ids: that is the piece contract, and it is host-only.
+        let seam = Arc::new(
+            TokenizerSeam::from_path(&reference_tokenizer_path()).expect("reference tokenizer"),
+        );
+        let decoder = SeamPieceDecoder {
+            seam: Arc::clone(&seam),
+        };
+        let ids = sparkflash_api::device_chain::fixtures::DECODE_IDS;
+        let mut decoded = String::new();
+        let mut ids_so_far: Vec<u32> = Vec::new();
+        for id in ids {
+            decoded.push_str(&decoder.piece(&ids_so_far, id).expect("every piece decodes"));
+            ids_so_far.push(id);
+        }
+        assert_eq!(Some(decoded), seam.decode(&ids));
     }
 }

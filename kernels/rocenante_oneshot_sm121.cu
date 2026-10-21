@@ -87,6 +87,7 @@ extern "C" __global__ void rocenante_oneshot_allreduce_bf16_tp4(
     SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_ROCENANTE_RDMA, t_enter);
 
     // 1. Stage the local rank's contribution into its own coherent-UMA slot row.
+    #pragma unroll 4
     for (uint32_t i = tid; i < n; i += stride) {
         slot->payload[my_rank][i] = local_in[i];
     }
@@ -158,6 +159,7 @@ extern "C" __global__ void rocenante_oneshot_allreduce_bf16_tp4(
         (missing << SPARK_ROCE_DIAG_MISSING_SHIFT);
 
     if (failed == 0u) {
+        #pragma unroll 4
         for (uint32_t i = tid; i < n; i += stride) {
             float acc = 0.0f;
             #pragma unroll

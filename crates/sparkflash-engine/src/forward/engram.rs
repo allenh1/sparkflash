@@ -521,11 +521,11 @@ fn read_paged_table(
         .iter()
         .map(|&id| (id as u64 * scale_width as u64, scale_width))
         .collect();
-    let weight_bytes = match src.read_ranges(&weight_name, &weight_ranges)? {
+    let weight_bytes = match src.read_ranges_paged(&weight_name, &weight_ranges)? {
         Ok(bytes) => bytes,
         Err(error) => return Some(Err(error.into())),
     };
-    let scale_bytes = match src.read_ranges(&scale_name, &scale_ranges)? {
+    let scale_bytes = match src.read_ranges_paged(&scale_name, &scale_ranges)? {
         Ok(bytes) => bytes,
         Err(error) => return Some(Err(error.into())),
     };
@@ -1436,6 +1436,95 @@ mod tests {
             .expect("the same position again");
         assert_eq!(first, second);
         assert_ne!(first, vec![0.5f32; cfg.hc_width()]);
+    }
+
+    /// The position-major seam the four-rank loop runs must be the engine's chunk path, bit for bit.
+    ///
+    /// The loop has no chunk: it forwards one position at a time, so it hashes the prefix ending at
+    /// that position with start_pos = position, and writes one position at a time. The engine hashes
+    /// the whole chunk once with its start_pos (forward/mod.rs:1057-1067) and then, per layer in
+    /// ascending order, writes every position of that chunk before the block. This pins the
+    /// equivalence: the hash rows are identical - including a position whose look-back reaches
+    /// before the chunk start - and the written streams are byte-identical.
+    #[test]
+    fn the_position_major_write_is_the_chunk_path_bit_for_bit() {
+        let cfg = test_config();
+        assert!(
+            cfg.engram_rows(0).is_none(),
+            "layer 0 is the non-Engram control"
+        );
+        assert!(cfg.engram_rows(1).is_some(), "layer 1 is the Engram layer");
+        let source = engram_source(&cfg, |row, column| {
+            (((row * 31 + column * 17) % 11) as f32) * 0.0625 - 0.25
+        });
+        // Six tokens, forwarded from two chunk starts: start 2 exercises look-backs that reach
+        // before the chunk start (the property a boundary hash must keep), start 0 the padding
+        // before the sequence start.
+        let tokens: [u32; 6] = [7, 11, 13, 3, 19, 5];
+        assert!(tokens.iter().all(|token| *token != HASH_SENTINEL));
+        let width = cfg.hc_width();
+        let layers = cfg.engram_layer_ids.len();
+        let columns = hash_columns(&cfg);
+        for start in [0usize, 2] {
+            let seqlen = tokens.len() - start;
+            // The chunk path: one hashing pass over the full history, then every Engram layer in
+            // ascending order over the whole chunk.
+            let mut chunk_hashes = Vec::new();
+            ngram_hashes(&cfg, &tokens, start, &mut chunk_hashes).expect("chunk hashes");
+            assert_eq!(chunk_hashes.len(), seqlen * layers * columns);
+            let mut chunk_stream = vec![0.0f32; seqlen * width];
+            for (index, value) in chunk_stream.iter_mut().enumerate() {
+                *value = (((index * 7) % 13) as f32) * 0.125 - 0.5;
+            }
+            let mut chunk_written = chunk_stream.clone();
+            for layer in 0..cfg.n_layers {
+                if cfg.engram_rows(layer).is_some() {
+                    assert!(
+                        engram_forward(
+                            &cfg,
+                            layer,
+                            &mut chunk_written,
+                            &chunk_hashes,
+                            &source,
+                            BIG
+                        )
+                        .expect("chunk Engram write"),
+                        "layer {layer} wrote"
+                    );
+                }
+            }
+            assert_ne!(
+                chunk_written, chunk_stream,
+                "the chunk path must write something"
+            );
+            // The position-major path: one hash row per position from its own prefix, then one
+            // position at a time through the same layers.
+            let mut position_major = chunk_stream.clone();
+            for position in start..tokens.len() {
+                let mut hashes = Vec::new();
+                ngram_hashes(&cfg, &tokens[..=position], position, &mut hashes)
+                    .expect("position hashes");
+                let first = (position - start) * layers * columns;
+                assert_eq!(
+                    hashes.as_slice(),
+                    &chunk_hashes[first..first + layers * columns],
+                    "position {position} (start {start}) hashes its look-back differently than the chunk"
+                );
+                let row = (position - start) * width;
+                let mut stream = position_major[row..row + width].to_vec();
+                for layer in 0..cfg.n_layers {
+                    if cfg.engram_rows(layer).is_some() {
+                        engram_forward(&cfg, layer, &mut stream, &hashes, &source, BIG)
+                            .expect("position Engram write");
+                    }
+                }
+                position_major[row..row + width].copy_from_slice(&stream);
+            }
+            assert_eq!(
+                chunk_written, position_major,
+                "start {start}: the position-major write differs from the chunk path"
+            );
+        }
     }
 
     #[test]

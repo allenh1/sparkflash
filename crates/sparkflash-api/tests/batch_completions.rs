@@ -378,7 +378,7 @@ async fn an_empty_prompt_list_is_a_400() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"]["code"], "invalid_prompt");
+    assert_eq!(body["error"]["code"], 400);
 }
 
 #[tokio::test]

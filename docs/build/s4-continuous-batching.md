@@ -5,6 +5,13 @@ a976ca7 (the accepted task-44 paged-serve harness plus its missing-docs fix). Th
 the host scheduling/execution slice only. Device batching, TTFT and throughput are named window
 measurements in section 6 and no number is claimed.
 
+**Update, 2026-10-21 (task-13, branch task/serve-openai-parity):** this seam is now reachable
+from the HTTP reference path behind `--continuous-batching` / `--max-batch N` (off by default, so
+the default serial path is unchanged), and the host-side A/B census in
+[s4-host-continuous-batching.md](s4-host-continuous-batching.md) records client-measured TTFT and
+tokens/s for both modes on the synthetic host path. The device batching, device TTFT and device
+throughput measurements named in section 6 remain window work; this update claims none of them.
+
 ## 1. What task-40 left and what task-22 adds
 
 Task-40 delivered the HTTP batch contract and chunked prefill policy, but its host driver still ran

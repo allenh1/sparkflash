@@ -218,7 +218,7 @@ norm+RoPE kernel missing (Phase 3); host seam otherwise.
 ### 2.6 attention: CSA union (format 2) and window format (format 1) (row stage 6)
 
 - **Pin:** `flash_mla_csa2_sm121`, 60,792 B, sha256
-  `5bfee4c7a0ece7c921e591fc6b8bd9d98c39b95d735d7c1d699ec58edaa51ea3`
+  `64fc2944d510885490ef1caeb680600f30b1d552c6ec31b0f6ed840ad0f09d2b`
   (`kernel_baseline.txt:14`). Format-2 semantics: `kernels/flash_mla_csa2_sm121.cu:36-41`; one
   f32 softmax over window ∪ selected compressed candidates with the sink in the denominator.
 - **API a chain calls (exists, typed):** `sequence_chain::Format2AttentionCall:86` with

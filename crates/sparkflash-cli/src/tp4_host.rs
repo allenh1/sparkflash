@@ -61,6 +61,7 @@ use sparkflash_engine::forward::{
 };
 use sparkflash_engine::linalg::{self, EngineError};
 use sparkflash_engine::parallel_tp::BitGather;
+use sparkflash_engine::prompt_ranks;
 use sparkflash_engine::quant;
 use sparkflash_engine::safetensors::{SafeTensorsSource, TensorHeader};
 use sparkflash_engine::tensor::{TensorPlan, TensorSpec};
@@ -74,6 +75,21 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// The released head is 662M elements, so the engine reference limit (32M) would refuse it; the
 /// Engram tables are paged by range and never materialise, and everything else is far below this.
 const ELEMENT_LIMIT: usize = 1 << 31;
+
+/// The prefix every prompt-logprob contract refusal carries.
+///
+/// The serve control plane uses it to tell a deterministic, request-scoped refusal (the whole
+/// group made the same decision after the same collectives, so it can keep serving) from a
+/// group-fatal forward or transport failure.
+pub const PROMPT_LOGPROBS_REFUSED_PREFIX: &str = "TP=4 prompt logprobs refused:";
+
+/// The token span one prompt-logprob forward scores.
+///
+/// One span keeps the rank-local head rows bounded: span * local_vocab f32 per rank, which is
+/// about 8.3 MiB on the released vocabulary (64 * 32,320 * 4 B), and it bounds the candidate
+/// blocks the exchange carries. The serial host path uses its own row budget; a span only
+/// changes where a value is computed, never what it is.
+pub const TP4_PROMPT_LOGPROBS_SPAN: usize = 64;
 
 /// The 40-layer tiny twin's expert intermediate width.
 ///
@@ -596,6 +612,11 @@ impl std::fmt::Display for Tp4Error {
 
 impl std::error::Error for Tp4Error {}
 
+/// Wraps a contract refusal in the typed rank error, keeping the criterion text.
+fn prompt_logprobs_refusal(refusal: prompt_ranks::MergeRefusal) -> Tp4Error {
+    Tp4Error::new(format!("{PROMPT_LOGPROBS_REFUSED_PREFIX} {refusal}"))
+}
+
 impl From<String> for Tp4Error {
     fn from(message: String) -> Self {
         Self::new(message)
@@ -1059,6 +1080,278 @@ impl Tp4Rank {
         }
     }
 
+    /// Prefills the prompt and returns the last step together with the merged prompt logprobs.
+    ///
+    /// This is the TP=4 all-position rank contract's rank entry point. The prompt is fed in
+    /// bounded spans; each span asks the chunk forward for the final-normed head inputs of the
+    /// positions whose next-token distribution scores a prompt token, every rank screens its
+    /// local LM-head shard (no full-vocabulary gather), the ranks exchange candidate and
+    /// distribution blocks over the same transport the forward uses, and the deterministic host
+    /// merge turns them into the position logprobs. Rank 0 builds the wire payload; every rank
+    /// computes the same merge and discards it.
+    ///
+    /// Selection is the OpenAI-style top count: None asks only for the owning token's logprob and
+    /// rank; Some(n) also asks for the n best alternatives. The whole-vocabulary -1 selection is
+    /// refused by the caller: bounded candidate exchange cannot return it.
+    ///
+    /// # Errors
+    ///
+    /// [Tp4Error] for a forward failure, or for a typed contract refusal (certified bounds, an
+    /// unproven order, a malformed shard layout, a missing owning token, no distribution); the
+    /// refusal message names the reason. All ranks reach the same decision from the same gathered
+    /// blocks, so the group refuses together.
+    pub fn prefill_prompt_logprobs(
+        &mut self,
+        tokens: &[u32],
+        selection: Option<usize>,
+    ) -> Result<(StepOutput, Vec<prompt_ranks::MergedPosition>), Tp4Error> {
+        if tokens.is_empty() {
+            return Err(Tp4Error::new("prefill needs at least one token"));
+        }
+        let budget = prompt_ranks::candidate_budget(selection).map_err(|refusal| {
+            Tp4Error::new(format!("{PROMPT_LOGPROBS_REFUSED_PREFIX} {refusal}"))
+        })?;
+        let mut merged = Vec::new();
+        let mut feed = None;
+        let mut start = 0usize;
+        while start < tokens.len() {
+            let end = (start + TP4_PROMPT_LOGPROBS_SPAN).min(tokens.len());
+            let at_end = end == tokens.len();
+            let span = &tokens[start..end];
+            let rows_needed = span.len() - usize::from(at_end);
+            let positions: Vec<usize> = (0..rows_needed).collect();
+            let (step, head_inputs) =
+                self.prefill_chunk_with_positions(span, positions.as_slice())?;
+            if !head_inputs.is_empty() {
+                let own_tokens: Vec<u32> = (0..head_inputs.len())
+                    .map(|index| tokens[start + index + 1])
+                    .collect();
+                merged.extend(self.score_prompt_positions(
+                    &head_inputs,
+                    &own_tokens,
+                    selection,
+                    budget,
+                )?);
+            }
+            feed = Some(step);
+            start = end;
+        }
+        Ok((
+            feed.expect("a non-empty prompt has at least one span"),
+            merged,
+        ))
+    }
+
+    /// Screens this rank's head shard for the selected positions and performs the three-pass
+    /// exchange, then merges every rank's contribution.
+    fn score_prompt_positions(
+        &self,
+        head_inputs: &[Vec<f32>],
+        own_tokens: &[u32],
+        selection: Option<usize>,
+        budget: usize,
+    ) -> Result<Vec<prompt_ranks::MergedPosition>, Tp4Error> {
+        let rows = head_inputs.len();
+        let dim = self.config.dim;
+        let mut flat = Vec::with_capacity(rows * dim);
+        for row in head_inputs {
+            flat.extend_from_slice(row);
+        }
+        let shard = self
+            .engine
+            .head_rank_logits(&flat, rows)
+            .map_err(|error| Tp4Error::new(format!("rank head logits: {error}")))?;
+        // A replicated head (the pre-batch-18 hatch) has no disjoint rank shards: rank 0 carries
+        // the whole vocabulary and every other rank contributes an empty block. The merge checks
+        // that the blocks are still a contiguous partition.
+        let replicated = shard.local_vocab == self.config.vocab_size;
+        let local_rows: Vec<&[f32]> = (0..rows)
+            .map(|row| {
+                let start = row * shard.local_vocab;
+                &shard.logits[start..start + shard.local_vocab]
+            })
+            .collect();
+        let mut locals = Vec::with_capacity(rows);
+        for (row, local) in local_rows.iter().enumerate() {
+            let candidates = if replicated && self.rank != 0 {
+                prompt_ranks::local_candidates(
+                    self.rank,
+                    self.config.vocab_size,
+                    &[],
+                    None,
+                    own_tokens[row],
+                    budget,
+                )
+            } else {
+                let offset = if replicated { 0 } else { shard.offset };
+                prompt_ranks::local_candidates(
+                    self.rank,
+                    offset,
+                    local,
+                    None,
+                    own_tokens[row],
+                    budget,
+                )
+            };
+            locals.push(candidates.map_err(prompt_logprobs_refusal)?);
+        }
+        // Phase 1: the candidate blocks, one fixed-stride block per rank and position.
+        let stride = prompt_ranks::phase1_stride(budget);
+        let mut phase1_local = Vec::with_capacity(rows * stride);
+        for local in &locals {
+            phase1_local.extend_from_slice(&prompt_ranks::encode_phase1(local, budget));
+        }
+        let mut gathered = vec![0.0f32; self.world * phase1_local.len()];
+        self.collective
+            .all_gather_f32(&phase1_local, &mut gathered)
+            .map_err(Tp4Error::new)?;
+        let mut per_rank: Vec<Vec<prompt_ranks::RankPosition>> =
+            vec![Vec::with_capacity(rows); self.world];
+        for (rank, entries) in per_rank.iter_mut().enumerate() {
+            for row in 0..rows {
+                let block_start = (rank * rows + row) * stride;
+                let decoded = prompt_ranks::decode_phase1(
+                    rank,
+                    &gathered[block_start..block_start + stride],
+                    budget,
+                )
+                .map_err(prompt_logprobs_refusal)?;
+                entries.push(prompt_ranks::RankPosition {
+                    rank,
+                    offset: decoded.offset,
+                    local_vocab: decoded.local_vocab,
+                    candidates: decoded.candidates,
+                    own_value: decoded.own_value,
+                    local_max: decoded.local_max,
+                    omitted_exact_max: decoded.omitted_exact_max,
+                    certified_count: decoded.certified_count,
+                    certified_max_bound: decoded.certified_max_bound,
+                    scaled_sum_hi: 0.0,
+                    scaled_sum_lo: 0.0,
+                    greater_than_own: 0,
+                });
+            }
+        }
+        // Certified bounds are refused before any distribution scan: they are upper bounds, not
+        // exact logits (m16/m27), so the log-sum-exp and every value would be approximations.
+        for (rank, entries) in per_rank.iter().enumerate() {
+            for (row, entry) in entries.iter().enumerate() {
+                if entry.certified_count > 0 {
+                    return Err(prompt_logprobs_refusal(
+                        prompt_ranks::MergeRefusal::CertifiedEntries {
+                            position: row,
+                            rank,
+                            certified_count: entry.certified_count,
+                        },
+                    ));
+                }
+            }
+        }
+        // The global maximum and the owning token's value, from the phase-1 blocks.
+        let mut global_max = vec![f32::NEG_INFINITY; rows];
+        let mut own_values: Vec<Option<f32>> = vec![None; rows];
+        for entries in &per_rank {
+            for (row, entry) in entries.iter().enumerate() {
+                if entry.local_max.is_finite() {
+                    global_max[row] = global_max[row].max(entry.local_max);
+                }
+                if entry.own_value.is_some() {
+                    if own_values[row].is_some() {
+                        return Err(prompt_logprobs_refusal(
+                            prompt_ranks::MergeRefusal::RankLayout {
+                                detail: format!(
+                                    "owning token {} at position {row} appears on two ranks",
+                                    own_tokens[row]
+                                ),
+                            },
+                        ));
+                    }
+                    own_values[row] = entry.own_value;
+                }
+            }
+        }
+        for row in 0..rows {
+            if !global_max[row].is_finite() {
+                return Err(prompt_logprobs_refusal(
+                    prompt_ranks::MergeRefusal::NoDistribution { position: row },
+                ));
+            }
+            if own_values[row].is_none() {
+                return Err(prompt_logprobs_refusal(
+                    prompt_ranks::MergeRefusal::OwnTokenMissing {
+                        position: row,
+                        token_id: own_tokens[row],
+                    },
+                ));
+            }
+        }
+        // Phase 2: every rank's f64 partial log-sum-exp against the global maximum.
+        let mut phase2_local = Vec::with_capacity(rows * 2);
+        for row in 0..rows {
+            let (high, low) = if replicated && self.rank != 0 {
+                (0.0f32, 0.0f32)
+            } else {
+                prompt_ranks::local_scaled_sum(local_rows[row], None, global_max[row])
+            };
+            phase2_local.push(high);
+            phase2_local.push(low);
+        }
+        let mut phase2_gathered = vec![0.0f32; self.world * phase2_local.len()];
+        self.collective
+            .all_gather_f32(&phase2_local, &mut phase2_gathered)
+            .map_err(Tp4Error::new)?;
+        let mut log_sums = vec![0.0f64; rows];
+        for (row, log_sum) in log_sums.iter_mut().enumerate() {
+            let mut total = 0.0f64;
+            for (rank, entries) in per_rank.iter_mut().enumerate() {
+                let high = phase2_gathered[(rank * rows + row) * 2];
+                let low = phase2_gathered[(rank * rows + row) * 2 + 1];
+                total += prompt_ranks::join_scaled_sum(high, low);
+                entries[row].scaled_sum_hi = high;
+                entries[row].scaled_sum_lo = low;
+            }
+            if !(total.is_finite() && total > 0.0) {
+                return Err(prompt_logprobs_refusal(
+                    prompt_ranks::MergeRefusal::NoDistribution { position: row },
+                ));
+            }
+            *log_sum = total.ln();
+        }
+        // Phase 3: each rank's strictly-greater count for the owning token, on the serial
+        // formula's f32 logprob values so the integer rank is exact.
+        let mut phase3_local = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let own_logprob = prompt_ranks::logprob_of(
+                own_values[row].expect("owning value checked above"),
+                global_max[row],
+                log_sums[row],
+            );
+            let count = if replicated && self.rank != 0 {
+                0
+            } else {
+                prompt_ranks::local_greater_count(
+                    local_rows[row],
+                    None,
+                    global_max[row],
+                    log_sums[row],
+                    own_logprob,
+                )
+            };
+            phase3_local.push(count as f32);
+        }
+        let mut phase3_gathered = vec![0.0f32; self.world * rows];
+        self.collective
+            .all_gather_f32(&phase3_local, &mut phase3_gathered)
+            .map_err(Tp4Error::new)?;
+        for (rank, entries) in per_rank.iter_mut().enumerate() {
+            for (row, entry) in entries.iter_mut().enumerate() {
+                entry.greater_than_own = phase3_gathered[rank * rows + row] as u32;
+            }
+        }
+        prompt_ranks::merge(self.world, selection, own_tokens, &per_rank)
+            .map_err(prompt_logprobs_refusal)
+    }
+
     /// The pre-batch-17 prefill: one hybrid step per prompt token. Kept for bisection and for the
     /// one-token case; it is exactly what every earlier RUN measured.
     fn prefill_token_loop(&mut self, tokens: &[u32]) -> Result<StepOutput, Tp4Error> {
@@ -1079,6 +1372,21 @@ impl Tp4Rank {
     /// chunk-sized post buffers, then records ONE profile entry for the chunk (`prefill_tokens`
     /// of them) so the decode-only slice stays the last `steps_run` entries.
     fn prefill_chunk(&mut self, tokens: &[u32]) -> Result<StepOutput, Tp4Error> {
+        self.prefill_chunk_with_positions(tokens, &[])
+            .map(|(step, _rows)| step)
+    }
+
+    /// The chunked prefill with selected final-normed head inputs.
+    ///
+    /// The rows are the same collapsed residual rows the engine's serial one-pass seam returns:
+    /// the caller asks the chunk forward for the positions whose next-token distribution it needs,
+    /// and the engine norms each selected row with the same final RMS norm the last position gets.
+    /// A request with no positions is the normal prefill.
+    fn prefill_chunk_with_positions(
+        &mut self,
+        tokens: &[u32],
+        position_logits: &[usize],
+    ) -> Result<(StepOutput, Vec<Vec<f32>>), Tp4Error> {
         let Self {
             config,
             source,
@@ -1156,6 +1464,7 @@ impl Tp4Rank {
                 // block over the chunk's positions.
                 None,
                 Some(backend),
+                position_logits,
                 &mut progress,
             )
             .map_err(|error| Tp4Error::new(format!("prefill chunk at {start_pos}: {error}")))?;
@@ -1207,10 +1516,13 @@ impl Tp4Rank {
         metrics.gather_calls = self.collective.gather_calls.load(Ordering::Relaxed);
         metrics.gather_elements = self.collective.gather_elements.load(Ordering::Relaxed);
         metrics.gather_ms_total = self.collective.gather_ms.load(Ordering::Relaxed);
-        Ok(StepOutput {
-            token: output.token,
-            logits: output.logits,
-        })
+        Ok((
+            StepOutput {
+                token: output.token,
+                logits: output.logits,
+            },
+            output.position_head_inputs,
+        ))
     }
 
     /// Consumes one token and returns the token that follows it.
@@ -3473,6 +3785,308 @@ mod tests {
         outcomes
     }
 
+    /// One four-rank session over the tiny fixture with the test's own per-rank closure.
+    fn run_four_rank_sessions<T, F>(fixture: &std::path::Path, prompt: &[u32], action: F) -> Vec<T>
+    where
+        T: Send,
+        F: Fn(usize, &mut Tp4Rank) -> T + Send + Sync,
+    {
+        let world = 4usize;
+        let base_port = free_base_port(world as u16);
+        std::thread::scope(|scope| {
+            let action = &action;
+            let handles: Vec<_> = (0..world)
+                .map(|rank| {
+                    let fixture = fixture.to_path_buf();
+                    let prompt = prompt.to_vec();
+                    scope.spawn(move || {
+                        let addresses: Vec<SocketAddr> = (0..world)
+                            .map(|peer| {
+                                SocketAddr::new(
+                                    IpAddr::from([127, 0, 0, 1]),
+                                    base_port + peer as u16,
+                                )
+                            })
+                            .collect();
+                        let transport = TcpTransport::connect(
+                            TcpConfig::with_addresses(rank, addresses).expect("config"),
+                        )
+                        .expect("transport connect");
+                        let input = RankInput {
+                            rank,
+                            world,
+                            source_dir: fixture,
+                            source_mode: "fixture",
+                            prompt: prompt.clone(),
+                            max_tokens: 0,
+                            record_seams: false,
+                            reference_check: false,
+                            resident_cache: false,
+                            profile: false,
+                            bench_steps: 0,
+                            tokenizer: None,
+                        };
+                        let mut api =
+                            Tp4Rank::open_input(&input, Some(Box::new(transport)), ELEMENT_LIMIT)
+                                .expect("rank");
+                        action(rank, &mut api)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("rank thread"))
+                .collect()
+        })
+    }
+
+    /// One scored prompt position from the serial host path, for the TP=4 test comparison.
+    struct SerialPosition {
+        own_logprob: f32,
+        own_rank: u32,
+        alternatives: Vec<(u32, f32)>,
+    }
+
+    /// The serial host path's prompt logprobs on the same fixture: one full-vocabulary pass with
+    /// the serve module's own log_softmax/competition_rank/top_k_indices, no sharding.
+    fn serial_prompt_logprobs(
+        reference: &Tp4Rank,
+        prompt: &[u32],
+        selection: Option<usize>,
+    ) -> Vec<SerialPosition> {
+        let source = ReferenceWeights::new(
+            Arc::clone(&reference.source),
+            reference.cache.clone(),
+            &reference.plan,
+        )
+        .expect("reference weights");
+        let engine =
+            InferenceEngine::new(reference.config.clone(), Box::new(source), ELEMENT_LIMIT)
+                .expect("reference engine");
+        let mut state = SequenceState::new(&reference.config);
+        let positions: Vec<usize> = (0..prompt.len() - 1).collect();
+        let produced = engine
+            .prefill_with_position_logits(&mut state, prompt, &positions)
+            .expect("serial selected rows");
+        produced
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let values = crate::serve::log_softmax(row);
+                let own_token = prompt[index + 1] as usize;
+                let own_logprob = values[own_token];
+                let own_rank = crate::serve::competition_rank(&values, own_logprob);
+                let alternatives = match selection {
+                    Some(count) => crate::serve::top_k_indices(&values, count)
+                        .into_iter()
+                        .map(|token| (token as u32, values[token]))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                SerialPosition {
+                    own_logprob,
+                    own_rank,
+                    alternatives,
+                }
+            })
+            .collect()
+    }
+
+    fn assert_one_ulp(got: f32, expected: f32, what: &str) {
+        let difference = (got - expected).abs();
+        let tolerance = f32::EPSILON * expected.abs().max(1.0) * 2.0;
+        assert!(
+            difference <= tolerance,
+            "{what}: got {got}, serial host path {expected}, difference {difference} above {tolerance}"
+        );
+    }
+
+    #[test]
+    fn the_four_rank_prompt_logprob_contract_matches_the_serial_host_path() {
+        // The tiny twin fixture is the synthetic shard set: the 128-row vocabulary is split over
+        // four ranks, each rank screens its own head shard, and the merge is compared with the
+        // serial full-vocabulary path on the same weights and prompt.
+        let directory = tempfile::tempdir().expect("tempdir");
+        let fixture = write_twin_fixture(directory.path()).expect("fixture");
+        let prompt: Vec<u32> = vec![3, 7, 11, 19, 23, 29];
+        let selection = Some(3usize);
+        let rounds = 2usize;
+        let sessions = run_four_rank_sessions(directory.path(), &prompt, |rank, api| {
+            let mut merged_rounds = Vec::new();
+            for _ in 0..rounds {
+                api.begin_request(Tp4Sampling::default()).expect("begin");
+                let started = Instant::now();
+                let outcome = match api.prefill_prompt_logprobs(&prompt, selection) {
+                    Ok((step, merged)) => {
+                        assert!(
+                            step.token.is_some(),
+                            "rank {rank} prefill still selects a generation token"
+                        );
+                        Ok(merged)
+                    }
+                    Err(error) => Err(error.to_string()),
+                };
+                merged_rounds.push((outcome, started.elapsed().as_millis() as u64));
+            }
+            let serial = if rank == 0 {
+                Some(serial_prompt_logprobs(api, &prompt, selection))
+            } else {
+                None
+            };
+            (merged_rounds, serial)
+        });
+        let expected = sessions[0].1.as_ref().expect("rank 0 serial reference");
+        assert_eq!(expected.len(), prompt.len() - 1);
+        let mut probe_rounds: Vec<serde_json::Value> = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let merged = sessions[0].0[round]
+                .0
+                .as_ref()
+                .unwrap_or_else(|error| panic!("rank 0 round {round}: {error}"));
+            // Deterministic merge: every rank computes the same payload from the same gathered
+            // blocks, bit for bit.
+            let mut ranks_agree = true;
+            for rank in 1..sessions.len() {
+                if sessions[rank].0[round].0 != sessions[0].0[round].0 {
+                    ranks_agree = false;
+                }
+                assert_eq!(
+                    sessions[rank].0[round].0, sessions[0].0[round].0,
+                    "rank {rank} merge differs from rank 0 in round {round}"
+                );
+            }
+            let mut max_abs_delta = 0.0f32;
+            let mut order_equal = true;
+            for (index, position) in merged.iter().enumerate() {
+                let want = &expected[index];
+                assert_eq!(position.position, index);
+                assert_eq!(position.own_token_id, prompt[index + 1]);
+                assert_eq!(
+                    position.own_rank, want.own_rank,
+                    "own rank at scored position {index}"
+                );
+                assert_one_ulp(position.own_logprob, want.own_logprob, "own logprob");
+                max_abs_delta = max_abs_delta.max((position.own_logprob - want.own_logprob).abs());
+                let got: Vec<(u32, f32)> = position
+                    .alternatives
+                    .iter()
+                    .map(|alternative| (alternative.token_id, alternative.logprob))
+                    .collect();
+                let got_tokens: Vec<u32> = got.iter().map(|(token, _)| *token).collect();
+                let want_tokens: Vec<u32> =
+                    want.alternatives.iter().map(|(token, _)| *token).collect();
+                if got_tokens != want_tokens {
+                    order_equal = false;
+                }
+                assert_eq!(
+                    got_tokens, want_tokens,
+                    "top order at scored position {index} does not match the serial host path"
+                );
+                for ((_, got), (_, expected_value)) in got.iter().zip(&want.alternatives) {
+                    assert_one_ulp(*got, *expected_value, "alternative logprob");
+                    max_abs_delta = max_abs_delta.max((*got - *expected_value).abs());
+                }
+            }
+            let alternatives_per_position = merged
+                .first()
+                .map_or(0, |position| position.alternatives.len());
+            probe_rounds.push(serde_json::json!({
+                "round": round,
+                "wall_ms": sessions[0].0[round].1,
+                "scored_positions": merged.len(),
+                "alternatives_per_position": alternatives_per_position,
+                "ranks_agree_bitwise": ranks_agree,
+                "serial_order_equal": order_equal,
+                "max_abs_logprob_delta": max_abs_delta,
+            }));
+        }
+        assert_eq!(
+            sessions[0].0[0].0, sessions[0].0[1].0,
+            "two identical requests on the same rank must produce the same merged payload"
+        );
+        if let Some(probe_path) = std::env::var_os("SPARKFLASH_TP4_PROMPT_LOGPROBS_PROBE") {
+            let report = serde_json::json!({
+                "schema": "sparkflash-tp4-prompt-logprobs-probe/1",
+                "scope": "host path, synthetic tiny plan (40-layer twin fixture, vocab 128), UNBARED",
+                "world": sessions.len(),
+                "prompt": prompt,
+                "selection": selection,
+                "fixture_tensors": fixture.tensors,
+                "fixture_bytes": fixture.bytes,
+                "fixture_hash": fixture.hash,
+                "rounds": probe_rounds,
+                "payload_eligible": "bounded top-k: every emitted position proved at f32 precision that its requested order is the serial order",
+            });
+            std::fs::write(
+                std::path::Path::new(&probe_path),
+                serde_json::to_vec_pretty(&report).expect("probe json"),
+            )
+            .expect("probe json write");
+        }
+    }
+
+    #[test]
+    fn the_four_rank_contract_refuses_an_over_wide_request_before_any_collective() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let fixture = write_twin_fixture(directory.path()).expect("fixture");
+        let prompt: Vec<u32> = vec![5, 13, 17, 31];
+        let sessions = run_four_rank_sessions(directory.path(), &prompt, |_rank, api| {
+            // The pre-collective refusal must not poison the group: the next request runs.
+            api.begin_request(Tp4Sampling::default()).expect("begin");
+            let started = Instant::now();
+            let refused = match api.prefill_prompt_logprobs(&prompt, Some(1_000)) {
+                Ok((_, merged)) => panic!("over-wide request unexpectedly merged {merged:?}"),
+                Err(error) => error.to_string(),
+            };
+            let refusal_ms = started.elapsed().as_millis() as u64;
+            api.begin_request(Tp4Sampling::default())
+                .expect("begin again");
+            let recovered = api.prefill_prompt_logprobs(&prompt, Some(1));
+            (refused, refusal_ms, recovered.is_ok())
+        });
+        for (rank, (refused, _, recovered)) in sessions.iter().enumerate() {
+            assert!(
+                refused.contains("bounded candidate budget"),
+                "rank {rank} refusal text: {refused}"
+            );
+            assert!(
+                *recovered,
+                "rank {rank} group did not recover after the refusal"
+            );
+        }
+        let messages: Vec<&str> = sessions
+            .iter()
+            .map(|(refused, _, _)| refused.as_str())
+            .collect();
+        assert!(
+            messages.windows(2).all(|pair| pair[0] == pair[1]),
+            "every rank must refuse with the same typed message"
+        );
+        if let Some(probe_path) = std::env::var_os("SPARKFLASH_TP4_PROMPT_LOGPROBS_REFUSAL_PROBE") {
+            let report = serde_json::json!({
+                "schema": "sparkflash-tp4-prompt-logprobs-probe/1",
+                "scope": "host path, synthetic tiny plan (40-layer twin fixture, vocab 128), UNBARED",
+                "world": sessions.len(),
+                "prompt": prompt,
+                "fixture_tensors": fixture.tensors,
+                "fixture_bytes": fixture.bytes,
+                "fixture_hash": fixture.hash,
+                "requested": 1_000,
+                "candidate_budget_max": prompt_ranks::CANDIDATES_PER_RANK_MAX,
+                "refusal": sessions[0].0,
+                "refusal_ms": sessions[0].1,
+                "ranks_agree_on_message": messages.windows(2).all(|pair| pair[0] == pair[1]),
+                "recovered_after_refusal": sessions.iter().all(|(_, _, recovered)| *recovered),
+                "criterion": "a prompt top count above the bounded candidate budget is refused before any collective, so the group stays usable and no rank's order is approximated",
+            });
+            std::fs::write(
+                std::path::Path::new(&probe_path),
+                serde_json::to_vec_pretty(&report).expect("probe json"),
+            )
+            .expect("probe json write");
+        }
+    }
     #[test]
     fn the_twin_fixture_opens_and_the_reference_engine_prefills_it() {
         let directory = tempfile::tempdir().expect("tempdir");

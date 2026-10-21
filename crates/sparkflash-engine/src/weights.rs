@@ -142,6 +142,20 @@ pub trait WeightSource: Send + Sync {
         None
     }
 
+    /// [WeightSource::read_ranges] with every source-side whole-tensor fast path suppressed: each
+    /// range is read on its own, and a source must not materialise the tensor to serve it. A paged
+    /// caller uses this for a table whose stored region is tens of GB (the Engram embed tables are
+    /// 98.3 GB each), where a whole-tensor shortcut is an out-of-memory bug rather than an
+    /// optimisation. The default delegates to [WeightSource::read_ranges], which is correct for a
+    /// source whose ranges are slices of memory it already holds.
+    fn read_ranges_paged(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Option<Result<Vec<u8>, WeightError>> {
+        self.read_ranges(name, ranges)
+    }
+
     /// Whether the source holds a tensor with that name.
     fn contains(&self, name: &str) -> bool {
         self.spec(name).is_ok()

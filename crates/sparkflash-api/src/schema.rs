@@ -29,6 +29,21 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     /// Nucleus sampling threshold.
     pub top_p: Option<f32>,
+    /// Number of most likely tokens the candidate filter keeps: 0 and -1 disable it, values above
+    /// zero keep that many (vLLM's top_k; sampling_params.py).
+    pub top_k: Option<i32>,
+    /// Repetition penalty over the prompt and generated tokens; 1.0 disables it (vLLM's
+    /// repetition_penalty; sampling_params.py lines 248-253).
+    pub repetition_penalty: Option<f32>,
+    /// Presence penalty over generated tokens; 0.0 disables it (vLLM's presence_penalty;
+    /// sampling_params.py lines 240-243).
+    pub presence_penalty: Option<f32>,
+    /// Frequency penalty over generated tokens; 0.0 disables it (vLLM's frequency_penalty;
+    /// sampling_params.py lines 244-246).
+    pub frequency_penalty: Option<f32>,
+    /// Whether special tokens are hidden from the generated text. vLLM's OpenAI default is true
+    /// (chat/protocol.py:274); an explicit false passes the raw decoded text through.
+    pub skip_special_tokens: Option<bool>,
     /// Whether to report logprobs for the generated tokens.
     ///
     /// OpenAI's boolean form. When true, `top_logprobs` selects how many alternatives ride along
@@ -61,10 +76,52 @@ pub struct ChatCompletionRequest {
     pub enable_thinking: Option<bool>,
     /// Chat-template kwargs (`thinking` lives here).
     pub chat_template_kwargs: Option<Value>,
-    /// Number of choices requested; only 1 is supported.
+    /// Number of choices requested. Each choice is one independent sample of the same prompt;
+    /// a request with n > 1 is refused with a typed error on an engine that cannot guarantee
+    /// independent draws (the router keeps single-choice behaviour byte-for-byte unchanged).
     pub n: Option<usize>,
+    /// Structured-output request. `text` is the default and a no-op; `json_object` and
+    /// `json_schema` need constrained decoding, which this server does not implement, so they are
+    /// refused with a typed error rather than silently returning unconstrained text.
+    pub response_format: Option<ResponseFormat>,
     /// End-user identifier.
     pub user: Option<String>,
+}
+
+/// OpenAI `response_format` for chat completions.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    /// Plain text output, the default.
+    Text,
+    /// Unconstrained JSON-object mode.
+    ///
+    /// The model is not constrained to emit valid JSON on this server, so the request is refused
+    /// instead of returning text that may not parse.
+    JsonObject,
+    /// JSON Schema mode.
+    ///
+    /// The schema is not enforced by the decoder on this server, so the request is refused instead
+    /// of returning text that may not match the schema.
+    JsonSchema {
+        /// The OpenAI schema wrapper.
+        json_schema: JsonSchemaResponseFormat,
+    },
+}
+
+/// The `json_schema` member of a `response_format`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct JsonSchemaResponseFormat {
+    /// Schema name, required by OpenAI.
+    pub name: String,
+    /// The JSON Schema document.
+    pub schema: Value,
+    /// Whether OpenAI clients mark the schema strict; parsed, never enforced here.
+    #[serde(default)]
+    pub strict: Option<bool>,
+    /// Optional schema description.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// One chat message.
@@ -186,6 +243,21 @@ pub struct CompletionRequest {
     pub temperature: Option<f32>,
     /// Nucleus sampling threshold.
     pub top_p: Option<f32>,
+    /// Number of most likely tokens the candidate filter keeps: 0 and -1 disable it, values above
+    /// zero keep that many (vLLM's top_k; sampling_params.py).
+    pub top_k: Option<i32>,
+    /// Repetition penalty over the prompt and generated tokens; 1.0 disables it (vLLM's
+    /// repetition_penalty; sampling_params.py lines 248-253).
+    pub repetition_penalty: Option<f32>,
+    /// Presence penalty over generated tokens; 0.0 disables it (vLLM's presence_penalty;
+    /// sampling_params.py lines 240-243).
+    pub presence_penalty: Option<f32>,
+    /// Frequency penalty over generated tokens; 0.0 disables it (vLLM's frequency_penalty;
+    /// sampling_params.py lines 244-246).
+    pub frequency_penalty: Option<f32>,
+    /// Whether special tokens are hidden from the generated text. vLLM's OpenAI default is true
+    /// (completion/protocol.py:82); an explicit false passes the raw decoded text through.
+    pub skip_special_tokens: Option<bool>,
     /// Stop sequence(s).
     pub stop: Option<StopSpec>,
     /// Deterministic sampling seed.
@@ -196,6 +268,9 @@ pub struct CompletionRequest {
     /// Streaming options (`include_usage`).
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    /// Completions per prompt. The OpenAI default is 1; choice index is
+    /// `prompt_index * n + choice_index`, and each choice is an independent sample.
+    pub n: Option<usize>,
     /// Echo the prompt in the response.
     pub echo: Option<bool>,
     /// Per generated token: number of alternative logprobs, or `-1` for the whole vocabulary.

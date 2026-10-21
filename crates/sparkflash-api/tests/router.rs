@@ -6,19 +6,29 @@
 use std::io::Read as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::sync::{Mutex, MutexGuard};
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
+use futures::StreamExt as _;
 use http_body_util::BodyExt as _;
 use serde_json::{Value, json};
-use sparkflash_api::engine::{
-    Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest, InferenceEngine,
-    LogprobAlternative, MissingCapability, MockEngine, PromptLogprobs, TokenLogprob, TokenString,
+use sparkflash_api::device_chain::ClaimMode;
+use sparkflash_api::device_token::{
+    DeviceEndpoint, DeviceToken, DeviceTokenClaim, DeviceTokenRequest, DeviceTokenSource,
+    DeviceTokenStream,
 };
-use sparkflash_api::server::{disarm_traces, router};
-use sparkflash_api::state::AppState;
+use sparkflash_api::engine::{
+    Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason, InferenceEngine,
+    LogprobAlternative, MockEngine, PromptLogprobs, TokenLogprob, TokenString,
+};
+use sparkflash_api::server::{
+    DEVICE_TOKEN_CLAIM_HEADER, DEVICE_TOKEN_SOURCE_HEADER, DEVICE_TOKEN_SOURCE_UNMEASURED,
+    disarm_traces, router,
+};
+use sparkflash_api::state::{AppState, SequentialChoiceSeeds};
 use tower::ServiceExt as _;
 
 const MODEL: &str = "deepseek-ai/DeepSeek-V4.1-Flash";
@@ -91,6 +101,16 @@ impl RecordingMockEngine {
             inner: MockEngine::new(MODEL),
         }
     }
+
+    /// A scripted host-twin engine with a non-empty answer, for the device-source fallback tests.
+    fn with_content(pieces: &[&str]) -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            inner: MockEngine::new(MODEL)
+                .with_capabilities(Capabilities::ALL)
+                .content(pieces),
+        }
+    }
 }
 
 impl InferenceEngine for RecordingMockEngine {
@@ -100,6 +120,46 @@ impl InferenceEngine for RecordingMockEngine {
 
     fn generate(&self, request: EngineRequest) -> futures::stream::BoxStream<'static, EngineEvent> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.generate(request)
+    }
+
+    fn cluster_stats(&self) -> ClusterStatsSnapshot {
+        self.inner.cluster_stats()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// A scripted engine that records the normalized seam request it was handed.
+///
+/// The other recorders count entries or keep MockEngine's script; this one keeps the whole
+/// [`EngineRequest`] so a test can assert the parsed sampling parameters crossed the seam unchanged.
+struct RecordingRequestEngine {
+    requests: Arc<std::sync::Mutex<Vec<EngineRequest>>>,
+    inner: MockEngine,
+}
+
+impl RecordingRequestEngine {
+    fn new() -> Self {
+        Self {
+            requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+            inner: MockEngine::new(MODEL),
+        }
+    }
+}
+
+impl InferenceEngine for RecordingRequestEngine {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn generate(&self, request: EngineRequest) -> futures::stream::BoxStream<'static, EngineEvent> {
+        self.requests
+            .lock()
+            .expect("the request recorder is not poisoned")
+            .push(request.clone());
         self.inner.generate(request)
     }
 
@@ -189,6 +249,58 @@ async fn streaming_chat_completions_sse_is_byte_exact() {
     let text = String::from_utf8(bytes).expect("utf8");
     eprintln!("SSE_BODY_START>>>{text}<<<SSE_BODY_END");
     assert_eq!(text, EXPECTED_STREAM);
+}
+
+#[tokio::test]
+async fn an_idle_stream_is_kept_alive_with_comment_frames() {
+    // Every event after the first waits 20 ms; a 5 ms keep-alive interval therefore has to fill
+    // each engine gap with a comment frame.
+    let engine = engine_with(&["Hello", " world"]).with_delay(Duration::from_millis(20));
+    let state = AppState::new(Arc::new(engine))
+        .with_fixed_time(FIXED_TIME)
+        .with_sse_keep_alive(Some(Duration::from_millis(5)));
+    let mut body = chat_body("hi");
+    body["stream"] = json!(true);
+    let (status, _, bytes) = send(router(state), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(bytes.clone()).expect("utf8");
+    let frames: Vec<&str> = text
+        .split("\n\n")
+        .filter(|frame| !frame.is_empty())
+        .collect();
+    let comments = frames.iter().filter(|frame| **frame == ": ping").count();
+    assert!(
+        comments > 0,
+        "an idle engine gap should carry keep-alive comments: {text}"
+    );
+    assert_ne!(
+        frames.first().copied(),
+        Some(": ping"),
+        "no comment before the first event: {text}"
+    );
+    assert_eq!(
+        frames.last().copied(),
+        Some("data: [DONE]"),
+        "comments never follow the terminator: {text}"
+    );
+    assert!(
+        !sse_frames(&bytes).is_empty(),
+        "the data frames are untouched"
+    );
+}
+
+#[tokio::test]
+async fn the_keep_alive_frames_can_be_turned_off() {
+    let engine = engine_with(&["Hello", " world"]).with_delay(Duration::from_millis(20));
+    let state = AppState::new(Arc::new(engine))
+        .with_fixed_time(FIXED_TIME)
+        .with_sse_keep_alive(None);
+    let mut body = chat_body("hi");
+    body["stream"] = json!(true);
+    let (status, _, bytes) = send(router(state), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(bytes).expect("utf8");
+    assert!(!text.contains(": ping"), "keep-alive is opt-out: {text}");
 }
 
 #[tokio::test]
@@ -336,7 +448,7 @@ async fn thinking_flags_are_accepted_and_validated() {
     body["chat_template_kwargs"] = json!({"thinking": "maybe"});
     let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body_json(&bytes)["error"]["code"], "invalid_thinking");
+    assert_eq!(body_json(&bytes)["error"]["code"], 400);
 }
 
 #[tokio::test]
@@ -368,7 +480,7 @@ async fn an_image_request_is_refused_with_the_missing_capability_and_never_reach
             send(app.clone(), json_request("/v1/chat/completions", &body)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let error = body_json(&bytes);
-        assert_eq!(error["error"]["code"], MissingCapability::vision().code());
+        assert_eq!(error["error"]["code"], StatusCode::BAD_REQUEST.as_u16());
         assert_eq!(
             error["error"]["type"], "invalid_request_error",
             "a capability the engine lacks is a client error, not a server failure"
@@ -404,7 +516,7 @@ async fn a_nested_responses_image_cannot_bypass_the_refusal() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
         body_json(&bytes)["error"]["code"],
-        MissingCapability::vision().code()
+        StatusCode::BAD_REQUEST.as_u16()
     );
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -483,7 +595,7 @@ async fn the_documented_screenshot_shapes_are_refused_without_entering_the_engin
         let error = body_json(&bytes);
         assert_eq!(
             error["error"]["code"],
-            MissingCapability::vision().code(),
+            StatusCode::BAD_REQUEST.as_u16(),
             "body: {body}"
         );
         assert_eq!(error["error"]["param"], Value::Null, "body: {body}");
@@ -547,7 +659,7 @@ async fn every_route_refuses_an_untyped_image_carrier_with_the_same_typed_error(
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
         assert_eq!(
             body_json(&bytes)["error"]["code"],
-            MissingCapability::vision().code(),
+            StatusCode::BAD_REQUEST.as_u16(),
             "{uri}: {body}"
         );
     }
@@ -672,7 +784,7 @@ async fn every_route_refuses_an_image_request_with_the_same_typed_error() {
         let error = body_json(&bytes);
         assert_eq!(
             error["error"]["code"],
-            MissingCapability::vision().code(),
+            StatusCode::BAD_REQUEST.as_u16(),
             "{uri}"
         );
         assert_eq!(error["error"]["param"], Value::Null, "{uri}");
@@ -690,7 +802,7 @@ async fn malformed_image_data_url_is_a_400() {
     let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let error = body_json(&bytes);
-    assert_eq!(error["error"]["code"], "invalid_image_data_url");
+    assert_eq!(error["error"]["code"], 400);
     assert_eq!(error["error"]["param"], "image_url");
 }
 
@@ -705,7 +817,7 @@ async fn malformed_json_never_panics_and_is_openai_shaped() {
     let (status, _, bytes) = send(app(), request).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let error = body_json(&bytes);
-    assert_eq!(error["error"]["code"], "invalid_json");
+    assert_eq!(error["error"]["code"], 400);
     assert!(error["error"]["message"].is_string());
 }
 
@@ -715,7 +827,7 @@ async fn unknown_model_returns_404() {
     let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let error = body_json(&bytes);
-    assert_eq!(error["error"]["code"], "model_not_found");
+    assert_eq!(error["error"]["code"], 404);
     assert_eq!(error["error"]["param"], "model");
 }
 
@@ -769,7 +881,7 @@ async fn trace_header_rejects_unknown_scopes() {
         .insert("x-sparkflash-trace", "NOT_A_SCOPE".parse().expect("header"));
     let (status, _, bytes) = send(app(), request).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body_json(&bytes)["error"]["code"], "invalid_trace_scopes");
+    assert_eq!(body_json(&bytes)["error"]["code"], 400);
 
     let mut request = json_request("/v1/chat/completions", &chat_body("hi"));
     request.headers_mut().insert(
@@ -1122,7 +1234,7 @@ async fn token_budget_is_validated_against_the_advertised_ceiling() {
         let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "max_tokens {bad}");
         let error = body_json(&bytes);
-        assert_eq!(error["error"]["code"], "invalid_max_tokens");
+        assert_eq!(error["error"]["code"], 400);
         assert_eq!(error["error"]["param"], "max_tokens");
     }
     let mut body = chat_body("hi");
@@ -1143,7 +1255,7 @@ async fn anthropic_streaming_is_rejected_loudly() {
     let (status, _, bytes) = send(app(), json_request("/v1/messages", &body)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let error = body_json(&bytes);
-    assert_eq!(error["error"]["code"], "unsupported_parameter");
+    assert_eq!(error["error"]["code"], 400);
     assert_eq!(error["error"]["param"], "stream");
     assert!(
         error["error"]["message"]
@@ -1255,7 +1367,7 @@ async fn responses_streaming_is_rejected_loudly() {
     let (status, _, bytes) = send(app(), json_request("/v1/responses", &body)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let error = body_json(&bytes);
-    assert_eq!(error["error"]["code"], "unsupported_parameter");
+    assert_eq!(error["error"]["code"], 400);
     assert_eq!(error["error"]["param"], "stream");
     assert!(
         error["error"]["message"]
@@ -1366,7 +1478,7 @@ async fn five_independent_bypass_attacks_are_all_refused() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
         assert_eq!(
             body_json(&bytes)["error"]["code"],
-            MissingCapability::vision().code(),
+            StatusCode::BAD_REQUEST.as_u16(),
             "body: {body}"
         );
     }
@@ -1374,7 +1486,7 @@ async fn five_independent_bypass_attacks_are_all_refused() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
         body_json(&bytes)["error"]["code"],
-        MissingCapability::vision().code()
+        StatusCode::BAD_REQUEST.as_u16()
     );
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -1443,16 +1555,10 @@ async fn schema_name_maps_do_not_trip_the_refusal_but_data_carriers_still_do() {
     let defs_min_properties = json!({
         "model": MODEL,
         "messages": [{"role": "user", "content": "hi"}],
-        "response_format": {"type": "json_schema", "json_schema": {"schema":
+        "response_format": {"type": "json_schema", "json_schema": {"name": "defs", "schema":
             {"type": "object", "$defs": {"image_url": {"type": "object", "minProperties": 1}}}}},
     });
-    for body in [
-        tool_schema,
-        response_format,
-        min_properties,
-        draft07_dependencies,
-        defs_min_properties,
-    ] {
+    for body in [tool_schema, min_properties, draft07_dependencies] {
         let (status, _, bytes) =
             send(app.clone(), json_request("/v1/chat/completions", &body)).await;
         assert_eq!(
@@ -1464,8 +1570,29 @@ async fn schema_name_maps_do_not_trip_the_refusal_but_data_carriers_still_do() {
     }
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        5,
+        3,
         "generation must be entered for every schema-named text request"
+    );
+    // A response_format json_schema is refused typed before generation now (no constrained
+    // decoding backend), and the refusal is the response_format parameter, not an image carrier:
+    // the schema-name exemption still applies to the carrier scan.
+    for body in [response_format, defs_min_properties] {
+        let (status, _, bytes) =
+            send(app.clone(), json_request("/v1/chat/completions", &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        let error = body_json(&bytes);
+        assert_eq!(error["error"]["param"], "response_format", "body: {body}");
+        assert_eq!(
+            error["error"]["code"],
+            StatusCode::BAD_REQUEST.as_u16(),
+            "body: {body}"
+        );
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "the response_format refusals must not enter generation"
     );
 
     // Fail-closed, not silent: a nonstandard arguments object, an arbitrary non-exempt container,
@@ -1522,7 +1649,7 @@ async fn schema_name_maps_do_not_trip_the_refusal_but_data_carriers_still_do() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
         assert_eq!(
             body_json(&bytes)["error"]["code"],
-            MissingCapability::vision().code(),
+            StatusCode::BAD_REQUEST.as_u16(),
             "body: {body}"
         );
         assert_eq!(
@@ -1858,7 +1985,7 @@ async fn logprobs_are_validated_the_way_vllm_validates_them() {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "body: {case}");
         let body = body_json(&bytes);
-        assert_eq!(body["error"]["code"], "invalid_logprobs", "body: {case}");
+        assert_eq!(body["error"]["code"], 400, "body: {case}");
         assert_eq!(body["error"]["message"], message, "body: {case}");
     }
 
@@ -1872,7 +1999,7 @@ async fn logprobs_are_validated_the_way_vllm_validates_them() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let body = body_json(&bytes);
-    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["code"], 400);
     assert_eq!(
         body["error"]["message"],
         "`prompt_logprobs` are not available when `stream=True`."
@@ -2081,4 +2208,1732 @@ async fn streaming_completions_echo_the_prompt_in_the_first_chunk() {
         json!([10]),
         "the streamed offset continues from the text already sent"
     );
+}
+
+#[tokio::test]
+async fn health_returns_200_with_an_empty_body() {
+    // vLLM's liveness probe is a 200 with no body
+    // (vllm/entrypoints/serve/instrumentator/health.py); orchestrator probes only read the status.
+    let response = app()
+        .oneshot(get_request("/health"))
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body collects")
+        .to_bytes();
+    assert!(bytes.is_empty(), "health has no body: {bytes:?}");
+}
+
+#[tokio::test]
+async fn readyz_reports_serving_then_draining_while_health_stays_up() {
+    // Readiness is the drain signal's client-visible edge: 200 while accepting, 503 the moment the
+    // drain starts, while liveness (/health) stays 200 because the process still finishes its
+    // in-flight requests. The route is public (a probe has no bearer key) and answers from a flag,
+    // never from the engine.
+    let state = AppState::new(Arc::new(engine_with(&["Hello"]))).with_fixed_time(FIXED_TIME);
+    let app = router(state.clone());
+    let (status, _, bytes) = send(app.clone(), get_request("/readyz")).await;
+    assert_eq!(status, StatusCode::OK, "serving before the drain signal");
+    assert!(bytes.is_empty(), "readiness has no body: {bytes:?}");
+    state.begin_drain();
+    let (status, _, bytes) = send(app.clone(), get_request("/readyz")).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "draining turns readyz 503"
+    );
+    assert!(bytes.is_empty(), "readiness has no body: {bytes:?}");
+    let (status, _, _) = send(app.clone(), get_request("/health")).await;
+    assert_eq!(status, StatusCode::OK, "liveness survives the drain signal");
+    let (status, _, _) = send(app, get_request("/metrics")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the scraper keeps working during a drain"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_stop_string_is_refused_like_vllm() {
+    // vLLM's SamplingParams._verify_args: "stop cannot contain an empty string."
+    let body =
+        json!({"model": MODEL, "messages": [{"role": "user", "content": "hi"}], "stop": [""]});
+    let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let error = body_json(&bytes);
+    assert_eq!(
+        error["error"]["message"],
+        "stop cannot contain an empty string."
+    );
+    assert_eq!(error["error"]["param"], "stop");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+async fn a_non_empty_stop_string_is_accepted_and_passed_to_the_engine() {
+    let (status, _, _) = send(
+        app(),
+        json_request(
+            "/v1/chat/completions",
+            &json!({"model": MODEL, "messages": [{"role": "user", "content": "hi"}], "stop": ["END"]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// vLLM's `SamplingParams._verify_args` ranges: every refusal names its parameter and carries the
+/// vLLM message text, so a client sees the same error shape the oracle would give it.
+#[tokio::test]
+async fn out_of_range_sampling_parameters_are_refused_like_vllm() {
+    let cases = [
+        (
+            json!({"top_p": 1.5}),
+            "top_p",
+            "top_p must be in [0, 1], got 1.5.",
+        ),
+        (
+            json!({"top_k": -2}),
+            "top_k",
+            "top_k must be 0 (disable), or at least 1, got -2.",
+        ),
+        (
+            json!({"repetition_penalty": 0.0}),
+            "repetition_penalty",
+            "repetition_penalty must be greater than zero, got 0.0.",
+        ),
+        (
+            json!({"presence_penalty": 2.5}),
+            "presence_penalty",
+            "presence_penalty must be in [-2, 2], got 2.5.",
+        ),
+        (
+            json!({"frequency_penalty": -2.5}),
+            "frequency_penalty",
+            "frequency_penalty must be in [-2, 2], got -2.5.",
+        ),
+    ];
+    for (extra, parameter, message) in cases {
+        let mut body = json!({"model": MODEL, "messages": [{"role": "user", "content": "hi"}]});
+        body.as_object_mut()
+            .expect("request body is an object")
+            .extend(extra.as_object().expect("case is an object").clone());
+        let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "case {parameter}: {body}");
+        let error = body_json(&bytes);
+        assert_eq!(error["error"]["message"], message, "case {parameter}");
+        assert_eq!(error["error"]["param"], parameter, "case {parameter}");
+        assert_eq!(
+            error["error"]["type"], "invalid_request_error",
+            "case {parameter}"
+        );
+    }
+}
+
+/// `top_p` 0.0 is our documented extension: vLLM's range is (0, 1] and refuses it, while the
+/// reference sampler accepts it as "keep the single most likely token". The value must not be
+/// refused here, and the census probe relies on that.
+#[tokio::test]
+async fn top_p_zero_is_accepted_as_the_documented_extension() {
+    let body =
+        json!({"model": MODEL, "messages": [{"role": "user", "content": "hi"}], "top_p": 0.0});
+    let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+}
+
+/// The parsed sampling parameters reach the engine's normalized request unchanged.
+#[tokio::test]
+async fn sampling_parameters_reach_the_engine_request() {
+    let engine = RecordingRequestEngine::new();
+    let requests = engine.requests.clone();
+    let app = router(AppState::new(Arc::new(engine)).with_fixed_time(FIXED_TIME));
+    let body = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 4,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "top_k": 40,
+        "enable_thinking": false,
+        "repetition_penalty": 1.2,
+        "presence_penalty": 0.5,
+        "frequency_penalty": -0.25,
+        "skip_special_tokens": false,
+        "seed": 7
+    });
+    let (status, _, bytes) = send(app, json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let recorded = requests.lock().expect("the recorder is not poisoned");
+    assert_eq!(recorded.len(), 1, "exactly one request reached the engine");
+    let request = &recorded[0];
+    assert_eq!(request.temperature, 0.7);
+    assert_eq!(request.top_p, 0.9);
+    assert_eq!(request.top_k, 40);
+    assert_eq!(request.repetition_penalty, 1.2);
+    assert_eq!(request.presence_penalty, 0.5);
+    assert_eq!(request.frequency_penalty, -0.25);
+    assert!(
+        !request.skip_special_tokens,
+        "an explicit false reaches the engine"
+    );
+}
+
+/// The completions endpoint maps and validates the same five sampling parameters.
+#[tokio::test]
+async fn completions_sampling_parameters_reach_the_engine_request() {
+    let engine = RecordingRequestEngine::new();
+    let requests = engine.requests.clone();
+    let app = router(AppState::new(Arc::new(engine)).with_fixed_time(FIXED_TIME));
+    let body = json!({
+        "model": MODEL,
+        "prompt": "hi",
+        "max_tokens": 4,
+        "top_k": 3,
+        "repetition_penalty": 1.5,
+        "presence_penalty": -0.5,
+        "frequency_penalty": 0.25
+    });
+    let (status, _, bytes) = send(app, json_request("/v1/completions", &body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    {
+        let recorded = requests.lock().expect("the recorder is not poisoned");
+        assert_eq!(recorded.len(), 1, "exactly one request reached the engine");
+        let request = &recorded[0];
+        assert_eq!(request.top_k, 3);
+        assert_eq!(request.repetition_penalty, 1.5);
+        assert_eq!(request.presence_penalty, -0.5);
+        assert_eq!(request.frequency_penalty, 0.25);
+        assert!(
+            request.skip_special_tokens,
+            "the absent field resolves to vLLM's true default"
+        );
+    }
+
+    // The same endpoint refuses an out-of-range value with the vLLM message.
+    let (status, _, bytes) = send(
+        router(AppState::new(Arc::new(RecordingRequestEngine::new())).with_fixed_time(FIXED_TIME)),
+        json_request(
+            "/v1/completions",
+            &json!({"model": MODEL, "prompt": "hi", "top_k": -3}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let error = body_json(&bytes);
+    assert_eq!(
+        error["error"]["message"],
+        "top_k must be 0 (disable), or at least 1, got -3."
+    );
+    assert_eq!(error["error"]["param"], "top_k");
+}
+
+/// vLLM's `--enable-auto-tool-choice --tool-call-parser deepseek_v41` equivalent for the
+/// buffered answer: the V4.1 DSML block the model emits becomes an OpenAI `tool_calls` array and
+/// the finish reason becomes `tool_calls`.
+#[tokio::test]
+async fn deepseek_v41_dsml_tool_calls_are_parsed_on_chat_completions() {
+    let answer = [
+        "I will check the weather.",
+        "\n\n",
+        "<｜DSML｜ calls>\n",
+        "<｜DSML｜ invoke name=\"get_weather\">\n",
+        "<｜DSML｜ parameter name=\"city\" string=\"true\">Beijing</｜DSML｜ parameter>\n",
+        "<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n",
+        "</｜DSML｜ invoke>\n",
+        "</｜DSML｜ calls>",
+    ]
+    .concat();
+    let app = app_with(engine_with(&[&answer]));
+    let body = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{"type": "function", "function": {
+            "name": "get_weather",
+            "description": "Read the weather.",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+        }}],
+    });
+    let (status, _, bytes) = send(app, json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let json = body_json(&bytes);
+    let choice = &json["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls");
+    let message = &choice["message"];
+    assert_eq!(
+        message["content"], "I will check the weather.",
+        "the text before the block stays content"
+    );
+    let calls = message["tool_calls"].as_array().expect("tool_calls array");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["type"], "function");
+    assert_eq!(calls[0]["function"]["name"], "get_weather");
+    assert_eq!(
+        calls[0]["function"]["arguments"],
+        r#"{"city": "Beijing", "days": 3}"#
+    );
+    assert!(
+        calls[0]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("chatcmpl-tool-")),
+        "vLLM tool-call ids use the chatcmpl-tool- shape: {calls:?}"
+    );
+}
+
+/// The parser only runs when the client offered tools: the same DSML text stays content.
+#[tokio::test]
+async fn deepseek_v41_dsml_without_tools_stays_content() {
+    let answer = [
+        "\n\n",
+        "<｜DSML｜ calls>\n",
+        "<｜DSML｜ invoke name=\"ping\">\n",
+        "<｜DSML｜ parameter name=\"n\" string=\"false\">1</｜DSML｜ parameter>\n",
+        "</｜DSML｜ invoke>\n",
+        "</｜DSML｜ calls>",
+    ]
+    .concat();
+    let app = app_with(engine_with(&[&answer]));
+    let body = json!({"model": MODEL, "messages": [{"role": "user", "content": "hi"}]});
+    let (status, _, bytes) = send(app, json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let json = body_json(&bytes);
+    assert_eq!(json["choices"][0]["finish_reason"], "stop");
+    assert_eq!(json["choices"][0]["message"]["content"], answer);
+    assert!(
+        json["choices"][0]["message"].get("tool_calls").is_none(),
+        "no tools were offered, so no calls are lifted: {json}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Streaming DSML tool calls: the V4.1 block is parsed incrementally while the content
+// deltas arrive, and the streamed fragments must assemble to the buffered payload.
+// ---------------------------------------------------------------------------------------
+
+/// The same answer the buffered DSML test uses, as one string.
+fn dsml_stream_answer() -> String {
+    [
+        "I will check the weather.",
+        "\n\n",
+        "<｜DSML｜ calls>\n",
+        "<｜DSML｜ invoke name=\"get_weather\">\n",
+        "<｜DSML｜ parameter name=\"city\" string=\"true\">Beijing</｜DSML｜ parameter>\n",
+        "<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n",
+        "</｜DSML｜ invoke>\n",
+        "</｜DSML｜ calls>",
+    ]
+    .concat()
+}
+
+/// Splits an answer into content pieces at character boundaries, the way the engine emits them.
+///
+/// The pieces deliberately ignore DSML token/JSON boundaries: every split is a case the
+/// incremental parser has to hold state across.
+fn chunked(text: &str, char_size: usize) -> Vec<String> {
+    text.chars()
+        .collect::<Vec<_>>()
+        .chunks(char_size)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect()
+}
+
+fn stream_pieces(pieces: &[String]) -> Vec<&str> {
+    pieces.iter().map(String::as_str).collect()
+}
+
+fn tools_body(stream: bool) -> Value {
+    json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{"type": "function", "function": {
+            "name": "get_weather",
+            "description": "Read the weather.",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+        }}],
+        "stream": stream,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AssembledCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+fn assemble_streamed_calls(frames: &[Value]) -> Vec<AssembledCall> {
+    let mut calls: Vec<AssembledCall> = Vec::new();
+    for frame in frames {
+        for call in frame["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let index = call["index"].as_u64().expect("tool_call index") as usize;
+            if let Some(id) = call["id"].as_str() {
+                assert_eq!(calls.len(), index, "a call starts before its fragments");
+                calls.push(AssembledCall {
+                    id: id.to_owned(),
+                    name: call["function"]["name"].as_str().expect("name").to_owned(),
+                    arguments: call["function"]["arguments"]
+                        .as_str()
+                        .expect("the first delta carries an arguments string")
+                        .to_owned(),
+                });
+            } else {
+                calls[index].arguments.push_str(
+                    call["function"]["arguments"]
+                        .as_str()
+                        .expect("fragments are strings"),
+                );
+            }
+        }
+    }
+    calls
+}
+
+fn streamed_content(frames: &[Value]) -> String {
+    let mut content = String::new();
+    for frame in frames {
+        if let Some(text) = frame["choices"][0]["delta"]["content"].as_str() {
+            content.push_str(text);
+        }
+    }
+    content
+}
+
+#[tokio::test]
+async fn deepseek_v41_dsml_tool_calls_stream_like_the_buffered_answer() {
+    let answer = dsml_stream_answer();
+    let pieces = chunked(&answer, 7);
+    // Buffered answer from a fresh state: its id counter starts at zero.
+    let buffered_request = tools_body(false);
+    let (status, _, buffered_bytes) = send(
+        app_with(engine_with(&stream_pieces(&pieces))),
+        json_request("/v1/chat/completions", &buffered_request),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&buffered_bytes)
+    );
+    let buffered = body_json(&buffered_bytes);
+    let buffered_choice = &buffered["choices"][0];
+    assert_eq!(buffered_choice["finish_reason"], "tool_calls");
+    let buffered_calls: Vec<AssembledCall> = buffered_choice["message"]["tool_calls"]
+        .as_array()
+        .expect("buffered tool_calls")
+        .iter()
+        .map(|call| AssembledCall {
+            id: call["id"].as_str().expect("id").to_owned(),
+            name: call["function"]["name"].as_str().expect("name").to_owned(),
+            arguments: call["function"]["arguments"]
+                .as_str()
+                .expect("arguments")
+                .to_owned(),
+        })
+        .collect();
+
+    // Streaming answer from another fresh state, so the response id shapes line up.
+    let (status, _, bytes) = send(
+        app_with(engine_with(&stream_pieces(&pieces))),
+        json_request("/v1/chat/completions", &tools_body(true)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let text = String::from_utf8(bytes.clone()).expect("utf8");
+    assert_eq!(
+        text.matches("data: ").count(),
+        sse_frames(&bytes).len() + 1,
+        "one data frame per event plus the terminator"
+    );
+    assert!(text.ends_with("data: [DONE]\n\n"));
+    let frames = sse_frames(&bytes);
+    assert_eq!(
+        frames[0]["choices"][0]["delta"]["role"], "assistant",
+        "the role frame is first"
+    );
+    let finish = &frames[frames.len() - 1]["choices"][0]["finish_reason"];
+    assert_eq!(finish, "tool_calls", "the final chunk carries the override");
+    let streamed_calls = assemble_streamed_calls(&frames);
+    assert_eq!(
+        streamed_calls, buffered_calls,
+        "streamed fragments must reassemble the buffered tool_calls byte for byte"
+    );
+    assert_eq!(
+        streamed_content(&frames),
+        buffered_choice["message"]["content"]
+            .as_str()
+            .expect("buffered content"),
+        "the text before the block streams as content"
+    );
+    assert_eq!(
+        streamed_calls[0].arguments,
+        r#"{"city": "Beijing", "days": 3}"#
+    );
+    assert!(
+        !streamed_content(&frames).contains("DSML"),
+        "the DSML block itself is never sent as content"
+    );
+}
+
+#[tokio::test]
+async fn several_streamed_dsml_calls_keep_their_indices_and_order() {
+    let answer = [
+        "\n\n",
+        "<｜DSML｜ calls>\n",
+        "<｜DSML｜ invoke name=\"first\">\n",
+        "<｜DSML｜ parameter name=\"a\" string=\"true\">x</｜DSML｜ parameter>\n",
+        "</｜DSML｜ invoke>\n",
+        "<｜DSML｜ invoke name=\"second\">\n",
+        "<｜DSML｜ parameter name=\"b\" string=\"false\">true</｜DSML｜ parameter>\n",
+        "</｜DSML｜ invoke>\n",
+        "</｜DSML｜ calls>",
+    ]
+    .concat();
+    let pieces = chunked(&answer, 3);
+    let (status, _, bytes) = send(
+        app_with(engine_with(&stream_pieces(&pieces))),
+        json_request("/v1/chat/completions", &tools_body(true)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let frames = sse_frames(&bytes);
+    let calls = assemble_streamed_calls(&frames);
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| (call.name.as_str(), call.arguments.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("first", r#"{"a": "x"}"#), ("second", r#"{"b": true}"#)]
+    );
+    assert_eq!(calls[0].id, "chatcmpl-tool-00000001");
+    assert_eq!(calls[1].id, "chatcmpl-tool-00000002");
+    assert_eq!(
+        frames[frames.len() - 1]["choices"][0]["finish_reason"],
+        "tool_calls"
+    );
+    assert_eq!(streamed_content(&frames), "");
+}
+
+#[tokio::test]
+async fn a_malformed_streamed_dsml_block_ends_with_a_typed_error() {
+    let answer = [
+        "\n\n",
+        "<｜DSML｜ calls>\n",
+        "<｜DSML｜ invoke name=\"x\">\n",
+        "<｜DSML｜ junk name=\"a\" string=\"true\">v</｜DSML｜ parameter>\n",
+        "</｜DSML｜ invoke>\n",
+        "</｜DSML｜ calls>",
+    ]
+    .concat();
+    let pieces = chunked(&answer, 4);
+    let (status, _, bytes) = send(
+        app_with(engine_with(&stream_pieces(&pieces))),
+        json_request("/v1/chat/completions", &tools_body(true)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let text = String::from_utf8(bytes.clone()).expect("utf8");
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    let raw: Vec<&str> = text
+        .split("\n\n")
+        .filter(|frame| !frame.is_empty())
+        .collect();
+    assert_eq!(
+        raw.first().copied(),
+        Some(
+            r#"data: {"id":"chatcmpl-dsv41-00000000","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-ai/DeepSeek-V4.1-Flash","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#
+        ),
+        "no frame precedes the role frame"
+    );
+    let error = raw
+        .iter()
+        .find(|frame| frame.contains("\"error\""))
+        .expect("a typed error frame");
+    assert!(
+        error.contains("\"code\":\"tool_call_parse_error\""),
+        "the refusal code is typed: {error}"
+    );
+    assert_eq!(
+        raw.last().copied(),
+        Some("data: [DONE]"),
+        "the terminator is last"
+    );
+    let frames = sse_frames(&bytes);
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame["choices"][0]["finish_reason"].is_null()),
+        "no finish chunk rides a refused stream: {frames:?}"
+    );
+    // The invoke name is already known before the malformed tag arrives, so the call start may
+    // have been sent; the refusal still ends the stream without a finish chunk and later events
+    // are dropped instead of being interleaved with a broken call.
+    let calls = assemble_streamed_calls(&frames);
+    assert!(
+        calls.len() <= 1,
+        "a malformed block cannot produce more than the started call: {calls:?}"
+    );
+    assert!(
+        calls.iter().all(|call| call.name == "x"),
+        "only the call whose name was already known can start: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unterminated_streamed_dsml_block_ends_with_a_typed_error() {
+    let answer = [
+        "\n\n",
+        "<｜DSML｜ calls>\n",
+        "<｜DSML｜ invoke name=\"x\">\n",
+        "<｜DSML｜ parameter name=\"a\" string=\"true\">unfinished",
+    ]
+    .concat();
+    let pieces = chunked(&answer, 5);
+    let (status, _, bytes) = send(
+        app_with(engine_with(&stream_pieces(&pieces))),
+        json_request("/v1/chat/completions", &tools_body(true)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let text = String::from_utf8(bytes.clone()).expect("utf8");
+    assert!(text.ends_with("data: [DONE]\n\n"));
+    assert!(
+        text.contains("\"code\":\"tool_call_parse_error\""),
+        "the unterminated block is a typed error: {text}"
+    );
+    let frames = sse_frames(&bytes);
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame["choices"][0]["finish_reason"].is_null()),
+        "the error frame is terminal, without a finish chunk"
+    );
+    assert!(assemble_streamed_calls(&frames).len() <= 1);
+}
+
+#[tokio::test]
+async fn streamed_dsml_tool_call_fragments_survive_keep_alive_comments() {
+    let answer = dsml_stream_answer();
+    let pieces = chunked(&answer, 9);
+    let engine = engine_with(&stream_pieces(&pieces)).with_delay(Duration::from_millis(20));
+    let state = AppState::new(Arc::new(engine))
+        .with_fixed_time(FIXED_TIME)
+        .with_sse_keep_alive(Some(Duration::from_millis(5)));
+    let (status, _, bytes) = send(
+        router(state),
+        json_request("/v1/chat/completions", &tools_body(true)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let text = String::from_utf8(bytes.clone()).expect("utf8");
+    let raw: Vec<&str> = text
+        .split("\n\n")
+        .filter(|frame| !frame.is_empty())
+        .collect();
+    let comments = raw.iter().filter(|frame| **frame == ": ping").count();
+    assert!(
+        comments > 0,
+        "an idle engine gap should carry keep-alive comments: {text}"
+    );
+    assert_ne!(
+        raw.first().copied(),
+        Some(": ping"),
+        "no comment precedes the first event"
+    );
+    assert_eq!(
+        raw.last().copied(),
+        Some("data: [DONE]"),
+        "comments never follow the terminator"
+    );
+    assert!(
+        raw.iter()
+            .filter(|frame| **frame != ": ping")
+            .all(|frame| frame.starts_with("data: ")),
+        "a comment is a whole frame, never interleaved into a data frame: {text}"
+    );
+    let frames = sse_frames(&bytes);
+    let calls = assemble_streamed_calls(&frames);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].arguments, r#"{"city": "Beijing", "days": 3}"#);
+    assert_eq!(
+        frames[frames.len() - 1]["choices"][0]["finish_reason"],
+        "tool_calls"
+    );
+    assert_eq!(streamed_content(&frames), "I will check the weather.");
+}
+
+#[tokio::test]
+async fn dsml_streams_as_raw_content_when_no_tools_are_offered() {
+    let answer = dsml_stream_answer();
+    let pieces = chunked(&answer, 7);
+    let mut body = chat_body("hi");
+    body["stream"] = json!(true);
+    let (status, _, bytes) = send(
+        app_with(engine_with(&stream_pieces(&pieces))),
+        json_request("/v1/chat/completions", &body),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let frames = sse_frames(&bytes);
+    assert_eq!(
+        streamed_content(&frames),
+        answer,
+        "without tools the DSML text is plain content"
+    );
+    assert!(
+        assemble_streamed_calls(&frames).is_empty(),
+        "no tools were offered, so nothing is lifted"
+    );
+    assert_eq!(
+        frames[frames.len() - 1]["choices"][0]["finish_reason"],
+        "stop"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Task-20: multiple choices, response_format, bearer auth
+// ---------------------------------------------------------------------------------------
+
+/// An engine that reports it cannot draw independent choices (the TP=4 shape).
+struct SharedSamplingEngine {
+    calls: Arc<AtomicUsize>,
+    inner: MockEngine,
+}
+
+impl InferenceEngine for SharedSamplingEngine {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn generate(&self, request: EngineRequest) -> futures::stream::BoxStream<'static, EngineEvent> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.generate(request)
+    }
+
+    fn cluster_stats(&self) -> ClusterStatsSnapshot {
+        self.inner.cluster_stats()
+    }
+
+    fn independent_choices(&self) -> bool {
+        false
+    }
+}
+
+fn keyed_app(key: &str) -> Router {
+    router(
+        AppState::new(Arc::new(engine_with(&["Hello", " world"])))
+            .with_fixed_time(FIXED_TIME)
+            .with_api_key(Some(key.to_owned())),
+    )
+}
+
+fn authorized_request(uri: &str, body: Option<&Value>, header: &str) -> Request<Body> {
+    let builder = Request::builder().method(if body.is_some() { "POST" } else { "GET" });
+    let builder = builder
+        .uri(uri)
+        .header("authorization", header)
+        .header("content-type", "application/json");
+    match body {
+        Some(body) => builder
+            .body(Body::from(serde_json::to_vec(body).expect("json body")))
+            .expect("request"),
+        None => builder.body(Body::empty()).expect("request"),
+    }
+}
+
+#[tokio::test]
+async fn chat_n_two_choices_buffered_counts_the_prompt_once() {
+    let app = app();
+    let baseline = body_json(
+        &send(
+            app.clone(),
+            json_request("/v1/chat/completions", &chat_body("hi")),
+        )
+        .await
+        .2,
+    );
+    let mut body = chat_body("hi");
+    body["n"] = json!(2);
+    let (status, _, bytes) = send(app, json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let response = body_json(&bytes);
+    let choices = response["choices"].as_array().expect("choices array");
+    assert_eq!(choices.len(), 2);
+    for (index, choice) in choices.iter().enumerate() {
+        assert_eq!(choice["index"], index);
+        assert_eq!(choice["message"]["content"], "Hello world");
+        assert_eq!(choice["finish_reason"], "stop");
+    }
+    let baseline_usage = &baseline["usage"];
+    let usage = &response["usage"];
+    assert_eq!(usage["prompt_tokens"], baseline_usage["prompt_tokens"]);
+    assert_eq!(
+        usage["completion_tokens"].as_u64().expect("completion"),
+        baseline_usage["completion_tokens"]
+            .as_u64()
+            .expect("baseline completion")
+            * 2
+    );
+    assert_eq!(
+        usage["total_tokens"].as_u64().expect("total"),
+        usage["prompt_tokens"].as_u64().expect("prompt")
+            + usage["completion_tokens"].as_u64().expect("completion")
+    );
+    assert!(
+        response["x_deepseek_spark_stats"].is_object(),
+        "the extension is aggregated over the choices: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+}
+
+#[tokio::test]
+async fn chat_n_choices_carry_per_choice_ids_and_seeds() {
+    let engine = RecordingRequestEngine::new();
+    let requests = Arc::clone(&engine.requests);
+    let app = router(AppState::new(Arc::new(engine)).with_fixed_time(FIXED_TIME));
+    let mut body = chat_body("hi");
+    body["n"] = json!(3);
+    body["seed"] = json!(7);
+    let (status, _, bytes) = send(app.clone(), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let response = body_json(&bytes);
+    let id = response["id"].as_str().expect("id");
+    let recorded: Vec<EngineRequest> = requests.lock().expect("recorder").clone();
+    assert_eq!(recorded.len(), 3);
+    for (choice, request) in recorded.iter().enumerate() {
+        assert_eq!(request.request_id, format!("{id}-{choice}"));
+        assert_eq!(
+            request.seed,
+            Some(7 + choice as u64),
+            "vLLM derives choice i's seed as seed + i"
+        );
+        assert_eq!(request.prompt_tokens, recorded[0].prompt_tokens);
+    }
+    // n == 1 keeps the response id and the request's own seed, byte-compatible with pre-task-20.
+    let single = RecordingRequestEngine::new();
+    let single_requests = Arc::clone(&single.requests);
+    let app = router(AppState::new(Arc::new(single)).with_fixed_time(FIXED_TIME));
+    let mut body = chat_body("hi");
+    body["seed"] = json!(11);
+    let (status, _, bytes) = send(app, json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let response = body_json(&bytes);
+    let recorded: Vec<EngineRequest> = single_requests.lock().expect("recorder").clone();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].request_id, response["id"]);
+    assert_eq!(recorded[0].seed, Some(11));
+}
+
+/// An engine whose visible text is the seed it was called with.
+///
+/// This is the end-to-end independence probe: two choices are independent exactly when the router
+/// handed the engine two different seeds, and the wire body shows that difference as text. The
+/// inner MockEngine supplies the rest of the event stream (prompt accounting, usage, stats).
+#[derive(Clone)]
+struct SeedEchoEngine {
+    inner: MockEngine,
+}
+
+impl SeedEchoEngine {
+    fn new() -> Self {
+        Self {
+            inner: MockEngine::new(MODEL).content(&["a", "b"]),
+        }
+    }
+}
+
+impl InferenceEngine for SeedEchoEngine {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn generate(&self, request: EngineRequest) -> futures::stream::BoxStream<'static, EngineEvent> {
+        let text = request
+            .seed
+            .map_or_else(|| "seed=None".to_owned(), |seed| format!("seed={seed}"));
+        let stream = self.inner.generate(request).map(move |event| match event {
+            EngineEvent::ContentDelta(_) => EngineEvent::ContentDelta(text.clone()),
+            other => other,
+        });
+        Box::pin(stream)
+    }
+
+    fn cluster_stats(&self) -> ClusterStatsSnapshot {
+        self.inner.cluster_stats()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+fn seed_echo_app(start: u64) -> Router {
+    let state = AppState::new(Arc::new(SeedEchoEngine::new()))
+        .with_fixed_time(FIXED_TIME)
+        .with_choice_seeds(Arc::new(SequentialChoiceSeeds::starting_at(start)));
+    router(state)
+}
+
+#[tokio::test]
+async fn chat_n_unseeded_draws_an_independent_seed_per_choice() {
+    // Before this, every unseeded choice reached the driver with seed None, which the host driver
+    // maps to seed 0: n choices were n copies of one deterministic sample. The router now draws a
+    // fresh seed per choice when the caller named none, so the choices are independent draws.
+    let app = seed_echo_app(1000);
+    let mut body = chat_body("hi");
+    body["n"] = json!(2);
+    let (status, _, bytes) = send(app, json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let response = body_json(&bytes);
+    let first = response["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("choice 0 content");
+    let second = response["choices"][1]["message"]["content"]
+        .as_str()
+        .expect("choice 1 content");
+    assert_eq!(
+        first, "seed=1000seed=1000",
+        "the first draw is the first seed"
+    );
+    assert_eq!(
+        second, "seed=1001seed=1001",
+        "the second draw is a new seed"
+    );
+    assert_ne!(
+        first, second,
+        "unseeded n > 1 choices must be independent draws, not copies of seed 0"
+    );
+}
+
+#[tokio::test]
+async fn chat_streaming_n_unseeded_draws_an_independent_seed_per_choice() {
+    // The streaming fan-out resolves its seeds separately from the buffered path; this pins that
+    // the same per-choice draw reaches it (each choice's streamed text is its own seed).
+    let app = seed_echo_app(2000);
+    let mut body = chat_body("hi");
+    body["n"] = json!(2);
+    body["stream"] = json!(true);
+    let (status, _, bytes) = send(app, json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let frames = sse_frames(&bytes);
+    let mut choice_0 = String::new();
+    let mut choice_1 = String::new();
+    for frame in &frames {
+        for choice in frame["choices"].as_array().into_iter().flatten() {
+            let Some(text) = choice["delta"]["content"].as_str() else {
+                continue;
+            };
+            match choice["index"].as_u64() {
+                Some(0) => choice_0.push_str(text),
+                Some(1) => choice_1.push_str(text),
+                other => panic!("unexpected choice index {other:?}"),
+            }
+        }
+    }
+    assert_eq!(choice_0, "seed=2000seed=2000");
+    assert_eq!(choice_1, "seed=2001seed=2001");
+    assert_ne!(
+        choice_0, choice_1,
+        "streaming unseeded n > 1 choices must be independent draws"
+    );
+}
+
+#[tokio::test]
+async fn unseeded_n_one_keeps_the_seed_none_path() {
+    // n == 1 byte compatibility: an unseeded single choice still reaches the engine with seed
+    // None, exactly as before per-choice seed resolution was added.
+    let app = seed_echo_app(1000);
+    let (status, _, bytes) = send(
+        app.clone(),
+        json_request("/v1/chat/completions", &chat_body("hi")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body_json(&bytes)["choices"][0]["message"]["content"],
+        "seed=Noneseed=None"
+    );
+    // And it does not consume a draw from the seed source: the next unseeded n > 1 request still
+    // starts at the configured first seed.
+    let mut body = chat_body("hi");
+    body["n"] = json!(2);
+    let (_, _, bytes) = send(app, json_request("/v1/chat/completions", &body)).await;
+    let response = body_json(&bytes);
+    assert_eq!(
+        response["choices"][0]["message"]["content"],
+        "seed=1000seed=1000"
+    );
+}
+
+#[tokio::test]
+async fn completions_n_unseeded_draws_an_independent_seed_per_prompt_choice_pair() {
+    // Multi-prompt ordering: each (prompt, choice) pair is its own generate call and gets its own
+    // fresh seed, so a two-prompt n=2 request draws four independent seeds. Buffered completions
+    // keep prompt-major choice ordering.
+    let app = seed_echo_app(500);
+    let mut body = json!({
+        "model": MODEL,
+        "prompt": ["one", "two"],
+        "n": 2,
+        "temperature": 1.0,
+    });
+    body["max_tokens"] = json!(4);
+    let (status, _, bytes) = send(app, json_request("/v1/completions", &body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let response = body_json(&bytes);
+    let texts: Vec<&str> = response["choices"]
+        .as_array()
+        .expect("choices")
+        .iter()
+        .map(|choice| choice["text"].as_str().expect("choice text"))
+        .collect();
+    assert_eq!(texts.len(), 4);
+    assert_eq!(texts[0], "seed=500seed=500");
+    assert_eq!(texts[1], "seed=501seed=501");
+    assert_eq!(texts[2], "seed=502seed=502");
+    assert_eq!(texts[3], "seed=503seed=503");
+    for index in 0..texts.len() {
+        for other in index + 1..texts.len() {
+            assert_ne!(
+                texts[index], texts[other],
+                "choices must be independent draws: {texts:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn seeded_n_choices_stay_reproducible_and_distinct() {
+    // The caller-supplied seed keeps vLLM's seed + i derivation: a repeat of the same request
+    // reproduces the same choices, and the choices differ from each other.
+    let app = seed_echo_app(1000);
+    let mut body = chat_body("hi");
+    body["n"] = json!(2);
+    body["seed"] = json!(7);
+    let (_, _, first_bytes) = send(app.clone(), json_request("/v1/chat/completions", &body)).await;
+    let (_, _, second_bytes) = send(app, json_request("/v1/chat/completions", &body)).await;
+    let first = body_json(&first_bytes);
+    let second = body_json(&second_bytes);
+    assert_eq!(first["choices"][0]["message"]["content"], "seed=7seed=7");
+    assert_eq!(first["choices"][1]["message"]["content"], "seed=8seed=8");
+    assert_eq!(
+        first["choices"], second["choices"],
+        "a seeded request must reproduce its choices"
+    );
+}
+
+#[tokio::test]
+async fn chat_n_zero_is_refused_before_generation() {
+    let engine = RecordingEngine::default();
+    let calls = Arc::clone(&engine.calls);
+    let app = router(AppState::new(Arc::new(engine)).with_fixed_time(FIXED_TIME));
+    let mut body = chat_body("hi");
+    body["n"] = json!(0);
+    let (status, _, bytes) = send(app, json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let error = body_json(&bytes);
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(error["error"]["param"], "n");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("must be at least 1"),
+        "{error}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn chat_n_above_one_is_refused_on_an_engine_with_shared_sampling() {
+    let engine = SharedSamplingEngine {
+        calls: Arc::new(AtomicUsize::new(0)),
+        inner: MockEngine::new(MODEL),
+    };
+    let calls = Arc::clone(&engine.calls);
+    let app = router(AppState::new(Arc::new(engine)).with_fixed_time(FIXED_TIME));
+    let mut body = chat_body("hi");
+    body["n"] = json!(2);
+    let (status, _, bytes) = send(app, json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let error = body_json(&bytes);
+    assert_eq!(error["error"]["param"], "n");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("independently"),
+        "{error}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the refusal is before generation"
+    );
+}
+
+#[tokio::test]
+async fn chat_n_two_streams_each_choice_and_aggregates_usage() {
+    let app = app();
+    let baseline = body_json(
+        &send(
+            app.clone(),
+            json_request("/v1/chat/completions", &chat_body("hi")),
+        )
+        .await
+        .2,
+    );
+    let mut body = chat_body("hi");
+    body["n"] = json!(2);
+    body["stream"] = json!(true);
+    body["stream_options"] = json!({"include_usage": true});
+    let (status, _, bytes) = send(app, json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert!(
+        String::from_utf8_lossy(&bytes).ends_with("data: [DONE]\n\n"),
+        "the stream closes with [DONE]"
+    );
+    let frames = sse_frames(&bytes);
+    let role_frames: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame["choices"][0]["delta"]["role"] == "assistant")
+        .collect();
+    assert_eq!(role_frames.len(), 1, "one role chunk opens the response");
+    assert_eq!(role_frames[0]["choices"][0]["index"], 0);
+    let finish_frames: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| {
+            frame["choices"]
+                .as_array()
+                .is_some_and(|choices| !choices.is_empty())
+                && frame["choices"][0]["finish_reason"].is_string()
+        })
+        .collect();
+    assert_eq!(finish_frames.len(), 2);
+    assert_eq!(finish_frames[0]["choices"][0]["index"], 0);
+    assert_eq!(finish_frames[1]["choices"][0]["index"], 1);
+    assert!(
+        finish_frames[0].get("x_deepseek_spark_stats").is_none(),
+        "only the last choice carries the aggregate extension"
+    );
+    assert!(
+        finish_frames[1]["x_deepseek_spark_stats"].is_object(),
+        "the last choice carries the aggregate extension"
+    );
+    let usage_frame = frames
+        .iter()
+        .find(|frame| {
+            frame["choices"]
+                .as_array()
+                .is_some_and(|choices| choices.is_empty())
+                && frame.get("usage").is_some()
+        })
+        .expect("usage chunk");
+    let baseline_usage = &baseline["usage"];
+    assert_eq!(
+        usage_frame["usage"]["prompt_tokens"],
+        baseline_usage["prompt_tokens"]
+    );
+    assert_eq!(
+        usage_frame["usage"]["completion_tokens"]
+            .as_u64()
+            .expect("completion"),
+        baseline_usage["completion_tokens"]
+            .as_u64()
+            .expect("baseline completion")
+            * 2
+    );
+    let choices: Vec<u64> = frames
+        .iter()
+        .filter_map(|frame| frame["choices"][0]["index"].as_u64())
+        .collect();
+    assert_eq!(choices, vec![0, 0, 0, 0, 1, 1, 1]);
+}
+
+#[tokio::test]
+async fn completions_n_two_choices_per_prompt_keep_prompt_major_indexes() {
+    let app = app();
+    let baseline_body = json!({"model": MODEL, "prompt": ["aa", "bb"]});
+    let baseline = body_json(
+        &send(app.clone(), json_request("/v1/completions", &baseline_body))
+            .await
+            .2,
+    );
+    let body = json!({"model": MODEL, "prompt": ["aa", "bb"], "n": 2});
+    let (status, _, bytes) = send(app, json_request("/v1/completions", &body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let response = body_json(&bytes);
+    let choices = response["choices"].as_array().expect("choices");
+    let indexes: Vec<u64> = choices
+        .iter()
+        .map(|choice| choice["index"].as_u64().expect("index"))
+        .collect();
+    assert_eq!(indexes, vec![0, 1, 2, 3]);
+    let baseline_usage = &baseline["usage"];
+    let usage = &response["usage"];
+    assert_eq!(
+        usage["prompt_tokens"], baseline_usage["prompt_tokens"],
+        "a prompt is counted once however many choices it yields"
+    );
+    assert_eq!(
+        usage["completion_tokens"].as_u64().expect("completion"),
+        baseline_usage["completion_tokens"]
+            .as_u64()
+            .expect("baseline completion")
+            * 2
+    );
+}
+
+#[tokio::test]
+async fn completions_n_two_streams_choices_and_one_prompt_usage() {
+    let app = app();
+    let baseline = body_json(
+        &send(
+            app.clone(),
+            json_request("/v1/completions", &json!({"model": MODEL, "prompt": "aa"})),
+        )
+        .await
+        .2,
+    );
+    let body = json!({
+        "model": MODEL,
+        "prompt": "aa",
+        "n": 2,
+        "stream": true,
+        "stream_options": {"include_usage": true},
+    });
+    let (status, _, bytes) = send(app, json_request("/v1/completions", &body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let frames = sse_frames(&bytes);
+    let finish_indexes: Vec<u64> = frames
+        .iter()
+        .filter(|frame| {
+            frame["choices"]
+                .as_array()
+                .is_some_and(|choices| !choices.is_empty())
+                && frame["choices"][0]["finish_reason"].is_string()
+        })
+        .map(|frame| frame["choices"][0]["index"].as_u64().expect("index"))
+        .collect();
+    assert_eq!(finish_indexes, vec![0, 1]);
+    let usage_frame = frames
+        .iter()
+        .find(|frame| frame["choices"].as_array().is_some_and(Vec::is_empty))
+        .expect("usage chunk");
+    let baseline_usage = &baseline["usage"];
+    assert_eq!(
+        usage_frame["usage"]["prompt_tokens"],
+        baseline_usage["prompt_tokens"]
+    );
+    assert_eq!(
+        usage_frame["usage"]["completion_tokens"]
+            .as_u64()
+            .expect("completion"),
+        baseline_usage["completion_tokens"]
+            .as_u64()
+            .expect("baseline completion")
+            * 2
+    );
+}
+
+#[tokio::test]
+async fn completions_n_zero_is_refused_before_generation() {
+    let engine = RecordingEngine::default();
+    let calls = Arc::clone(&engine.calls);
+    let app = router(AppState::new(Arc::new(engine)).with_fixed_time(FIXED_TIME));
+    let body = json!({"model": MODEL, "prompt": "aa", "n": 0});
+    let (status, _, bytes) = send(app, json_request("/v1/completions", &body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(&bytes)["error"]["param"], "n");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn response_format_text_is_a_no_op_and_json_modes_are_refused_typed() {
+    let mut text = chat_body("hi");
+    text["response_format"] = json!({"type": "text"});
+    let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &text)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the text format is the OpenAI default and a no-op: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(
+        body_json(&bytes)["choices"][0]["message"]["content"],
+        "Hello world"
+    );
+
+    for response_format in [
+        json!({"type": "json_object"}),
+        json!({"type": "json_schema", "json_schema": {
+            "name": "answer",
+            "schema": {"type": "object", "properties": {"answer": {"type": "string"}}},
+        }}),
+    ] {
+        let mut body = chat_body("hi");
+        body["response_format"] = response_format.clone();
+        let engine = RecordingEngine::default();
+        let calls = Arc::clone(&engine.calls);
+        let app = router(AppState::new(Arc::new(engine)).with_fixed_time(FIXED_TIME));
+        let (status, _, bytes) = send(app, json_request("/v1/chat/completions", &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", response_format);
+        let error = body_json(&bytes);
+        assert_eq!(error["error"]["param"], "response_format");
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("constrained decoding"),
+            "{error}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the structured-output refusal is before generation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn response_format_malformed_json_schema_is_an_invalid_body() {
+    let engine = RecordingEngine::default();
+    let calls = Arc::clone(&engine.calls);
+    let app = router(AppState::new(Arc::new(engine)).with_fixed_time(FIXED_TIME));
+    let mut body = chat_body("hi");
+    body["response_format"] = json!({"type": "json_schema"});
+    let (status, _, bytes) = send(app, json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(&bytes)["error"]["type"], "invalid_request_error");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn bearer_key_protects_every_route_except_health_and_metrics() {
+    let app = keyed_app("s3cret");
+    // Missing Authorization.
+    let (status, _, bytes) = send(app.clone(), get_request("/v1/models")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        body_json(&bytes),
+        json!({"error": {
+            "message": "Unauthorized",
+            "type": "invalid_request_error",
+            "param": null,
+            "code": 401,
+        }})
+    );
+    // Wrong key and wrong scheme are both 401.
+    for header in ["Bearer wrong", "Basic s3cret", "s3cret", ""] {
+        let (status, _, _) =
+            send(app.clone(), authorized_request("/v1/models", None, header)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "header: {header:?}");
+    }
+    // Correct key, and the scheme is case-insensitive.
+    for header in ["Bearer s3cret", "bearer s3cret", "BEARER s3cret"] {
+        let (status, _, bytes) =
+            send(app.clone(), authorized_request("/v1/models", None, header)).await;
+        assert_eq!(status, StatusCode::OK, "header: {header:?}");
+        assert!(body_json(&bytes)["data"].is_array());
+    }
+    // POST endpoints are protected too, and the missing-key answer is the JSON envelope, not SSE.
+    let (status, headers, _) = send(
+        app.clone(),
+        json_request("/v1/chat/completions", &chat_body("hi")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_ne!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    // Liveness, readiness and the local scrape stay open.
+    for uri in ["/health", "/readyz", "/metrics"] {
+        let (status, _, _) = send(app.clone(), get_request(uri)).await;
+        assert_eq!(status, StatusCode::OK, "{uri} must stay reachable");
+    }
+}
+
+#[tokio::test]
+async fn no_api_key_keeps_the_server_open() {
+    let app = app();
+    for uri in ["/v1/models", "/health", "/readyz", "/metrics"] {
+        let (status, _, _) = send(app.clone(), get_request(uri)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+    }
+    let (status, _, _) = send(app, json_request("/v1/chat/completions", &chat_body("hi"))).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------------------
+// Device-chain token envelope scaffold (S7/S8 preparation)
+//
+// These tests use a synthetic device token source only. The nine tokens, the 130-token prompt
+// count and the streamed text are paper values: nothing here was measured on a device, and no
+// tok/s, TTFT or real token claim is asserted or implied. The host-twin fallback tests prove the
+// existing engine path is still the answer whenever the scaffold cannot serve a request.
+// ---------------------------------------------------------------------------------------
+
+/// A synthetic device token source: records the claim request and answers claimed or fallback.
+struct TestDeviceTokenSource {
+    claimed: bool,
+    calls: Arc<AtomicUsize>,
+    last: Arc<std::sync::Mutex<Option<DeviceTokenRequest>>>,
+}
+
+impl TestDeviceTokenSource {
+    fn new(claimed: bool) -> Self {
+        Self {
+            claimed,
+            calls: Arc::new(AtomicUsize::new(0)),
+            last: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn calls(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.calls)
+    }
+}
+
+impl DeviceTokenSource for TestDeviceTokenSource {
+    fn claim(&self, request: &DeviceTokenRequest) -> DeviceTokenClaim {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.last.lock().expect("device source request log") = Some(request.clone());
+        if !self.claimed {
+            return DeviceTokenClaim::Fallback {
+                reason: "synthetic host-twin fallback".to_owned(),
+            };
+        }
+        // Nine synthetic tokens, matching the scaffold's fixed-window contract. The text is a
+        // placeholder for the decoder; no device token exists for it.
+        let tokens = (0..9u32)
+            .map(|index| DeviceToken {
+                position: 129 + index,
+                token_id: 11 + index,
+                text: match index {
+                    0 => "Hello".to_owned(),
+                    1 => " device".to_owned(),
+                    _ => String::new(),
+                },
+            })
+            .collect();
+        DeviceTokenClaim::Claimed(Box::new(DeviceTokenStream {
+            tokens,
+            prompt_tokens: 130,
+            finish_reason: FinishReason::Length,
+            reference_ids: vec![11, 12, 13, 14, 15, 16, 17, 18, 19],
+            decode_positions: 9,
+            logits_dump_present: false,
+            claim_mode: ClaimMode::Asserted,
+            provenance: "synthetic test stream; UNMEASURED".to_owned(),
+        }))
+    }
+}
+
+/// The device source's last observed claim request.
+type DeviceSourceLog = Arc<std::sync::Mutex<Option<DeviceTokenRequest>>>;
+
+fn device_app(claimed: bool) -> (Router, Arc<AtomicUsize>, Arc<AtomicUsize>, DeviceSourceLog) {
+    let engine = RecordingMockEngine::with_content(&["Hello", " world"]);
+    let engine_calls = Arc::clone(&engine.calls);
+    let source = Arc::new(TestDeviceTokenSource::new(claimed));
+    let source_calls = source.calls();
+    let last = Arc::clone(&source.last);
+    let app = router(
+        AppState::new(Arc::new(engine))
+            .with_fixed_time(FIXED_TIME)
+            .with_device_token_source(Some(source)),
+    );
+    (app, engine_calls, source_calls, last)
+}
+
+#[tokio::test]
+async fn device_claimed_completions_buffered_serve_the_envelope_and_never_call_the_engine() {
+    let (app, engine_calls, source_calls, last) = device_app(true);
+    let request = json!({
+        "model": MODEL,
+        "prompt": [11, 22, 33],
+        "max_tokens": 5,
+    });
+    let (status, headers, bytes) = send(app, json_request("/v1/completions", &request)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(
+        headers
+            .get(DEVICE_TOKEN_SOURCE_HEADER)
+            .expect("the device provenance header is present"),
+        DEVICE_TOKEN_SOURCE_UNMEASURED
+    );
+    assert_eq!(
+        headers
+            .get(DEVICE_TOKEN_CLAIM_HEADER)
+            .expect("the claim form header is present"),
+        "explicit"
+    );
+    let body = body_json(&bytes);
+    assert_eq!(body["object"], "text_completion");
+    assert_eq!(body["id"], "cmpl-dsv41-00000000");
+    assert_eq!(body["created"], FIXED_TIME);
+    assert_eq!(body["model"], MODEL);
+    assert_eq!(body["choices"][0]["index"], 0);
+    assert_eq!(body["choices"][0]["text"], "Hello device");
+    assert_eq!(body["choices"][0]["finish_reason"], "length");
+    assert_eq!(body["usage"]["prompt_tokens"], 130);
+    assert_eq!(body["usage"]["completion_tokens"], 9);
+    assert_eq!(body["usage"]["total_tokens"], 139);
+    // The scaffold makes no stats/tok-s/TTFT claim: the extension is absent, not zeroed.
+    assert!(body["x_deepseek_spark_stats"].is_null());
+    assert_eq!(
+        engine_calls.load(Ordering::SeqCst),
+        0,
+        "the engine must not be entered"
+    );
+    assert_eq!(source_calls.load(Ordering::SeqCst), 1);
+    let captured = last
+        .lock()
+        .expect("device source request log")
+        .clone()
+        .expect("device source was called");
+    assert_eq!(captured.endpoint, DeviceEndpoint::Completions);
+    assert!(!captured.stream);
+    assert!(!captured.include_usage);
+    assert_eq!(captured.max_tokens, Some(5));
+    assert_eq!(captured.prompt_token_ids, Some(vec![11, 22, 33]));
+}
+
+#[tokio::test]
+async fn device_claimed_completions_stream_the_same_answer_with_an_optional_usage_chunk() {
+    let (app, engine_calls, _source_calls, _last) = device_app(true);
+    let request = json!({
+        "model": MODEL,
+        "prompt": [11, 22, 33],
+        "stream": true,
+        "stream_options": {"include_usage": true},
+    });
+    let (status, headers, bytes) = send(app, json_request("/v1/completions", &request)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(DEVICE_TOKEN_SOURCE_HEADER).expect("header"),
+        DEVICE_TOKEN_SOURCE_UNMEASURED
+    );
+    assert_eq!(
+        headers
+            .get(DEVICE_TOKEN_CLAIM_HEADER)
+            .expect("claim header"),
+        "explicit"
+    );
+    assert!(
+        bytes.ends_with(b"data: [DONE]\n\n"),
+        "the stream must terminate with [DONE]: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let frames = sse_frames(&bytes);
+    // Nine content chunks, one finish chunk and the include_usage chunk.
+    assert_eq!(frames.len(), 11);
+    assert_eq!(frames[0]["choices"][0]["text"], "Hello");
+    assert_eq!(frames[1]["choices"][0]["text"], " device");
+    assert_eq!(frames[9]["choices"][0]["finish_reason"], "length");
+    assert_eq!(frames[10]["choices"], serde_json::json!([]));
+    assert_eq!(frames[10]["usage"]["prompt_tokens"], 130);
+    assert_eq!(frames[10]["usage"]["completion_tokens"], 9);
+    assert_eq!(engine_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn device_claimed_chat_serves_the_envelope_body() {
+    let (app, engine_calls, _source_calls, last) = device_app(true);
+    let (status, headers, bytes) =
+        send(app, json_request("/v1/chat/completions", &chat_body("hi"))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(
+        headers.get(DEVICE_TOKEN_SOURCE_HEADER).expect("header"),
+        DEVICE_TOKEN_SOURCE_UNMEASURED
+    );
+    assert_eq!(
+        headers
+            .get(DEVICE_TOKEN_CLAIM_HEADER)
+            .expect("claim header"),
+        "explicit"
+    );
+    let body = body_json(&bytes);
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+    assert_eq!(body["choices"][0]["message"]["content"], "Hello device");
+    assert_eq!(body["choices"][0]["finish_reason"], "length");
+    assert_eq!(body["usage"]["prompt_tokens"], 130);
+    assert!(body["x_deepseek_spark_stats"].is_null());
+    assert_eq!(engine_calls.load(Ordering::SeqCst), 0);
+    let captured = last
+        .lock()
+        .expect("device source request log")
+        .clone()
+        .expect("device source was called");
+    assert_eq!(captured.endpoint, DeviceEndpoint::ChatCompletions);
+    assert_eq!(captured.prompt_token_ids, None);
+}
+
+#[tokio::test]
+async fn device_fallback_serves_the_host_twin_and_leaves_its_bytes_and_stats_intact() {
+    let (app, engine_calls, source_calls, _last) = device_app(false);
+    let (status, headers, bytes) =
+        send(app, json_request("/v1/chat/completions", &chat_body("hi"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers.get(DEVICE_TOKEN_SOURCE_HEADER).is_none(),
+        "a host-twin answer must not carry the device provenance header"
+    );
+    let body = body_json(&bytes);
+    assert_eq!(body["choices"][0]["message"]["content"], "Hello world");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    assert!(body["x_deepseek_spark_stats"].is_object());
+    assert_eq!(source_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        engine_calls.load(Ordering::SeqCst),
+        1,
+        "the host twin must serve the fallback"
+    );
+}
+
+#[tokio::test]
+async fn device_scaffold_never_silently_ignores_an_advanced_request_field() {
+    let (app, engine_calls, source_calls, _last) = device_app(true);
+    let mut body = chat_body("hi");
+    body["temperature"] = json!(0.5);
+    let (status, headers, bytes) = send(app, json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get(DEVICE_TOKEN_SOURCE_HEADER).is_none());
+    let response = body_json(&bytes);
+    assert_eq!(response["choices"][0]["message"]["content"], "Hello world");
+    assert_eq!(
+        source_calls.load(Ordering::SeqCst),
+        0,
+        "an ineligible request must not even consult the device source"
+    );
+    assert_eq!(engine_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn device_scaffold_falls_back_for_a_text_prompt_completion() {
+    let (app, engine_calls, _source_calls, _last) = device_app(true);
+    let request = json!({"model": MODEL, "prompt": "hi", "max_tokens": 4});
+    let (status, headers, bytes) = send(app, json_request("/v1/completions", &request)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get(DEVICE_TOKEN_SOURCE_HEADER).is_none());
+    let body = body_json(&bytes);
+    assert_eq!(body["choices"][0]["text"], "Hello world");
+    assert_eq!(engine_calls.load(Ordering::SeqCst), 1);
 }

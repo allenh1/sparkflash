@@ -72,9 +72,18 @@ extern "C" __global__ void b12x_bf16a_mxfp8w_wo_a_sm121(
     uint64_t t_enter = 0u;
     SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_DENSE_MXFP8, t_enter);
 
-    if (group < groups && column < (uint32_t)SPARK_M4_O_LORA_RANK) {
+    __shared__ __nv_bfloat16 s_a_row[SPARK_M4_BF16A_WOA_GROUP_INNER];
+    if (group < groups) {
         const __nv_bfloat16 *a_row =
             attn_bf16 + (uint64_t)group * SPARK_M4_BF16A_WOA_GROUP_INNER;
+        for (uint32_t k = lane; k < (uint32_t)SPARK_M4_BF16A_WOA_GROUP_INNER;
+             k += SPARK_M4_BF16A_WOA_THREADS) {
+            s_a_row[k] = a_row[k];
+        }
+    }
+    __syncthreads();
+
+    if (group < groups && column < (uint32_t)SPARK_M4_O_LORA_RANK) {
         // Each group owns a weight buffer AND a scale buffer, and the two are different sizes, so
         // there are two group strides. The offsets inside each buffer come from the same helpers the
         // dense kernel uses.
@@ -90,9 +99,10 @@ extern "C" __global__ void b12x_bf16a_mxfp8w_wo_a_sm121(
             const float w_scale = spark_ue8m0_decode(
                 w_scales[group_scale_base +
                          spark_b12x_scale_index(column, base, SPARK_M4_BF16A_WOA_GROUP_INNER)]);
+#pragma unroll 8
             for (uint32_t i = 0; i < SPARK_M4_QUANT_BLOCK; ++i) {
                 // bf16 -> f32 is exact; the activation enters the sum unrounded.
-                const float a_value = __bfloat162float(a_row[base + i]);
+                const float a_value = __bfloat162float(s_a_row[base + i]);
                 const float w_value =
                     spark_fp8_e4m3_decode(
                         w_fp8[group_weight_base +

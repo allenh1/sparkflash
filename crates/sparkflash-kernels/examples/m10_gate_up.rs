@@ -740,6 +740,10 @@ fn run() -> Result<(), String> {
         },
     ));
 
+    // The launch's own declared traffic: this rank's gate (or up) slice and scales plus the
+    // activation row and its scales. Quoted to the roofline line below, not to a claim.
+    let launch_traffic_bytes =
+        (w_gate.len() + s_gate.len() + act_fp8.len() + act_scales.len()) as u64;
     if args.repeat > 0 {
         let (gate_samples, gate_batched) =
             routed_gate_up_launch::launch_repeated(&cuda, kernel, &gate_params, args.repeat)?;
@@ -752,12 +756,28 @@ fn run() -> Result<(), String> {
             args.repeat,
             p50 / args.tokens as f64
         );
+        println!(
+            "{}",
+            sparkflash_kernels::roofline::line(
+                "routed_gate_up_sm121/w1",
+                launch_traffic_bytes,
+                p50
+            )
+        );
         let (min, p50_up, mean, max) = timing_stats(&up_samples);
         println!(
             "up timing, {} launches: min {min:.4} p50 {p50_up:.4} mean {mean:.4} max {max:.4} ms; \
              batched {up_batched:.4} ms/launch; {:.4} ms/token",
             args.repeat,
             p50_up / args.tokens as f64
+        );
+        println!(
+            "{}",
+            sparkflash_kernels::roofline::line(
+                "routed_gate_up_sm121/w3",
+                launch_traffic_bytes,
+                p50_up
+            )
         );
     }
 

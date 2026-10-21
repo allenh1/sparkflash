@@ -15,10 +15,16 @@ pub mod moe_device;
 pub mod resident_weights;
 pub mod serve;
 pub mod tp4_chain;
+pub mod tp4_combine;
 pub mod tp4_device_runner;
+pub mod tp4_forward;
 pub mod tp4_host;
+pub mod tp4_operands;
+pub mod tp4_prefill;
 pub mod tp4_resident;
 pub mod tp4_smoke;
+pub mod tp4_tail;
+pub mod tp4_token;
 
 /// The RDMA inline-shim build mode, embedded unconditionally in every evidence schema.
 ///

@@ -7,10 +7,11 @@
 //! embedded copy ([m4_abi::MXFP4_MOE]); [PARAMS] is the pinned name and type of every parameter
 //! and [declaration_matches] is the check, with a mutation test proving it is not vacuous.
 //!
-//! Geometry. The hidden state is the grid's second dimension: one block computes the 256-value tile
-//! `blockIdx.y` of one routed row `blockIdx.x`, so the grid is `(tokens, 20, 1)` blocks of 256
-//! threads and [grid] refuses a zero token count rather than launching an empty grid. The kernel's
-//! tile and hidden constants are asserted against [GRID_Y] in the tests.
+//! Geometry. The hidden state is the grid's second dimension: one block computes the 32-value tile
+//! `blockIdx.y` of one routed row `blockIdx.x` with 32 output columns x 8 parallel K groups, so the
+//! grid is `(tokens, 160, 1)` blocks of 256 threads and [grid] refuses a zero token count rather
+//! than launching an empty grid. The kernel's tile and hidden constants are asserted against
+//! [GRID_Y] in the tests.
 //!
 //! No cubin pin. The device chain's catalog owns the cubin's bytes and digest.
 
@@ -63,12 +64,12 @@ pub fn declaration_matches(decl: &KernelDecl) -> bool {
 
 /// The kernel id in the shared driver's enum.
 pub const KERNEL_ID: KernelId = KernelId::Mxfp4Moe;
-/// 256 threads, one 256-value hidden tile per block.
+/// 256 threads: 32 output columns x 8 parallel K groups.
 pub const BLOCK: (u32, u32, u32) = (256, 1, 1);
 /// The hidden values one block writes.
-pub const TILE_D: u32 = 256;
+pub const TILE_D: u32 = 32;
 /// The number of hidden tiles: `HIDDEN / TILE_D`.
-pub const GRID_Y: u32 = 20;
+pub const GRID_Y: u32 = 160;
 /// The index of `tokens` in [Mxfp4MoeParams::as_slice].
 pub const TOKENS_INDEX: usize = 6;
 

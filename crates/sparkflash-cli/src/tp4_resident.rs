@@ -88,26 +88,350 @@ pub(crate) fn setup_for_chain(
     Ok((setup, args.source))
 }
 
-/// Streams the rank arena and binds every attention-path tensor through the expected-shape table.
+/// The full device-set bind one rank performs inside its arena: attention projections, routed and
+/// shared experts, routers, and the tail, plus the census that accounts for every resident shard.
+///
+/// The value owns no arena reference (only the pointers and the set checks), so it outlives the
+/// streaming arena the way the evidence needs it to. A launch path must hold the arena itself
+/// alive; this struct is evidence, not an owner.
+pub(crate) struct DeviceBind {
+    /// Attention-projection bind: pointers plus the named coverage.
+    pub attention: crate::resident_weights::RankBind,
+    /// Routed/shared/router bind with its per-class coverage and launch-compatibility rows.
+    pub moe: crate::resident_weights::MoeBind,
+    /// Tail pointers (embedding row shard, certified head shard, final norm).
+    pub tail: crate::resident_weights::TailBind,
+    /// The tail bind's named coverage.
+    pub tail_coverage: crate::resident_weights::BindCoverage,
+    /// Every resident shard by class, so nothing is silently unaccounted for.
+    pub census: crate::resident_weights::PlanCensus,
+    /// Every checked name as "class<TAB>set<TAB>name", for the per-rank names manifest.
+    pub manifest_lines: Vec<String>,
+}
+
+impl DeviceBind {
+    /// The complete bind evidence object, using the same builder the progressive writes use.
+    #[must_use]
+    pub fn evidence(&self, rank: usize, world: usize, table_entries: usize) -> Value {
+        bind_evidence(
+            rank,
+            world,
+            table_entries,
+            &self.attention,
+            Some(&self.moe),
+            Some((&self.tail, &self.tail_coverage)),
+            Some(&self.census),
+            None,
+        )
+    }
+}
+
+/// Builds the bind evidence object for whatever stages have completed.
+///
+/// The same builder serves the progressive writes inside the arena epoch and the final object, so a
+/// stage that has not run yet is explicitly named rather than silently missing: a bind that fails at
+/// the MoE stage still leaves the attention result, its names and the failure string on disk.
+#[allow(clippy::too_many_arguments)]
+fn bind_evidence(
+    rank: usize,
+    world: usize,
+    table_entries: usize,
+    attention: &crate::resident_weights::RankBind,
+    moe: Option<&crate::resident_weights::MoeBind>,
+    tail: Option<(
+        &crate::resident_weights::TailBind,
+        &crate::resident_weights::BindCoverage,
+    )>,
+    census: Option<&crate::resident_weights::PlanCensus>,
+    error: Option<&str>,
+) -> Value {
+    let attention_expected = attention.coverage.expected.len();
+    let attention_bound = attention.coverage.bound.len();
+    let moe_bound: usize = moe
+        .map(|moe| {
+            moe.coverage
+                .iter()
+                .map(|(_, coverage)| coverage.bound.len())
+                .sum()
+        })
+        .unwrap_or(0);
+    let tail_bound = tail.map(|(_, coverage)| coverage.bound.len()).unwrap_or(0);
+    let device_bound = attention_bound + moe_bound + tail_bound;
+    let tail_pointers_nonzero = tail
+        .map(|(tail, _)| [tail.embed.0, tail.head.0, tail.norm.0])
+        .is_some_and(|pointers| pointers.iter().all(|pointer| *pointer != 0));
+    let complete = error.is_none()
+        && attention.coverage.complete()
+        && moe.is_some_and(|moe| moe.coverage.iter().all(|(_, coverage)| coverage.complete()))
+        && tail.is_some_and(|(_, coverage)| coverage.complete())
+        && census.is_some_and(|census| census.unclassified.is_empty());
+    let moe_evidence = match moe {
+        Some(moe) => moe.evidence(),
+        None => json!({
+            "performed": false,
+            "note": "the MoE bind has not completed; the attention bind is still on disk and is what this file shows",
+        }),
+    };
+    let tail_evidence = match tail {
+        Some((_, coverage)) => json!({
+            "tensors_bound": coverage.bound.len(),
+            "coverage": coverage.evidence("tail"),
+            "pointers_nonzero": tail_pointers_nonzero,
+            "note": "embed row shard, certified head row shard and final norm are arena-bound; the head/token arithmetic is not wired on this arm yet",
+        }),
+        None => json!({
+            "performed": false,
+            "note": "the tail bind has not completed",
+        }),
+    };
+    let census_evidence = match census {
+        Some(census) => census.evidence(),
+        None => json!({
+            "performed": false,
+            "note": "the census runs after the MoE and tail binds",
+        }),
+    };
+    json!({
+        "stage": "tp4-chain",
+        "schema": "sparkflash-tp4-bind/1",
+        "loop_step": "C1-bind",
+        "setup_only": true,
+        "rank": rank,
+        "world": world,
+        "forward": "not-run",
+        "tokens": 0,
+        "attention": {
+            "tensors_expected": attention_expected,
+            "tensors_bound": attention_bound,
+            "tensors_table_entries": table_entries,
+            "sharded": true,
+            "coverage": attention.coverage.evidence("attention"),
+            "note": "device arm: wq_b/wo_a column, wo_b row; tensors_expected is the device-served set (table minus structurally excluded host seams), so bound == expected means full coverage",
+        },
+        "moe": moe_evidence,
+        "tail": tail_evidence,
+        "census": census_evidence,
+        "error": error,
+        "summary": {
+            "device_bound_names": device_bound,
+            "per_token_weight_h2d_bytes": 0,
+            "complete": complete,
+            "check": "set equality per class, both directions named; large classes carry a names digest and the per-rank manifest file carries every name",
+        },
+        "names_manifest": format!("tp4-bind-names-r{rank}.txt"),
+        "note": "this bind file is written after every bind stage and before any collective walk or forward attempt, so a later failure cannot erase a completed bind; no token is implied by this file",
+    })
+}
+
+/// Writes the progressive bind evidence for whatever stages have completed. Called from inside the
+/// arena epoch at each stage boundary; a write error is reported but cannot change the bind result.
 #[cfg(feature = "cuda")]
-pub(crate) fn bind_attention_in_arena(
+#[allow(clippy::too_many_arguments)]
+fn write_bind_progress(
+    path: &Path,
+    rank: usize,
+    world: usize,
+    table_entries: usize,
+    attention: &crate::resident_weights::RankBind,
+    moe: Option<&crate::resident_weights::MoeBind>,
+    tail: Option<(
+        &crate::resident_weights::TailBind,
+        &crate::resident_weights::BindCoverage,
+    )>,
+    census: Option<&crate::resident_weights::PlanCensus>,
+    error: Option<&str>,
+) -> Result<(), String> {
+    let evidence = bind_evidence(
+        rank,
+        world,
+        table_entries,
+        attention,
+        moe,
+        tail,
+        census,
+        error,
+    );
+    let bytes = serde_json::to_vec_pretty(&evidence)
+        .map_err(|serialise| format!("serialise bind progress: {serialise}"))?;
+    if let Some(directory) = path.parent() {
+        fs::create_dir_all(directory)
+            .map_err(|error| format!("create {}: {error}", directory.display()))?;
+    }
+    fs::write(path, bytes).map_err(|error| format!("write {}: {error}", path.display()))
+}
+
+/// Streams the rank arena and binds every device-served tensor set: attention projections, routed
+/// and shared experts, routers, and the tail.
+///
+/// The coverage is the set check itself: every expected name, every bound name, and both
+/// differences by name, so a window log names the offending tensors instead of printing an
+/// unfalsifiable count.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn bind_in_arena(
+    arena: &sparkflash_device::arena::ResidentArena,
+    setup: &RankSetup,
+    table: &std::collections::BTreeMap<String, (usize, usize)>,
+    config: &sparkflash_engine::config::ModelConfig,
+    rank: usize,
+    world: usize,
+    evidence_dir: &Path,
+) -> Result<DeviceBind, String> {
+    let bind_path = evidence_dir.join(format!("tp4-bind-r{rank}.json"));
+    let attention = crate::resident_weights::bind_rank_attention(arena, &setup.plan, table)?;
+    // Progressive evidence, stage 1: the attention bind lands on disk before the MoE bind runs, so
+    // a MoE-stage failure still leaves the attention result for adjudication.
+    write_bind_progress(
+        &bind_path,
+        rank,
+        world,
+        table.len(),
+        &attention,
+        None,
+        None,
+        None,
+        None,
+    )?;
+    let moe = match crate::resident_weights::bind_rank_moe(arena, &setup.plan, config) {
+        Ok(moe) => moe,
+        Err(error) => {
+            write_bind_progress(
+                &bind_path,
+                rank,
+                world,
+                table.len(),
+                &attention,
+                None,
+                None,
+                None,
+                Some(&error),
+            )?;
+            return Err(error);
+        }
+    };
+    // Progressive evidence, stage 2: routed/shared/router coverage before the tail/census.
+    write_bind_progress(
+        &bind_path,
+        rank,
+        world,
+        table.len(),
+        &attention,
+        Some(&moe),
+        None,
+        None,
+        None,
+    )?;
+    let (tail, tail_coverage) = crate::resident_weights::bind_rank_tail(arena, &setup.plan)?;
+    let census = crate::resident_weights::resident_plan_census(&setup.plan, table);
+    let mut manifest_lines = attention.coverage.manifest_lines("attention");
+    for (class, coverage) in &moe.coverage {
+        manifest_lines.extend(coverage.manifest_lines(class));
+    }
+    manifest_lines.extend(tail_coverage.manifest_lines("tail"));
+    // Progressive evidence, stage 3: the complete bind, still before the walk.
+    write_bind_progress(
+        &bind_path,
+        rank,
+        world,
+        table.len(),
+        &attention,
+        Some(&moe),
+        Some((&tail, &tail_coverage)),
+        Some(&census),
+        None,
+    )?;
+    Ok(DeviceBind {
+        attention,
+        moe,
+        tail,
+        tail_coverage,
+        census,
+        manifest_lines,
+    })
+}
+
+/// Streams the rank arena and binds every device-served tensor set: attention projections, routed
+/// and shared experts, routers, and the tail.
+///
+/// The coverage is the set check itself: every expected name, every bound name, and both
+/// differences by name, so a window log names the offending tensors instead of printing an
+/// unfalsifiable count.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bind_device_sets_in_arena(
     setup: &RankSetup,
     source: &SafeTensorsSource,
     table: &std::collections::BTreeMap<String, (usize, usize)>,
-) -> Result<(usize, Value, Vec<String>), String> {
-    upload_arena_streaming(&setup.plan, &setup.shard_plan, source, |arena| {
-        let bound = crate::resident_weights::bind_rank_attention(arena, &setup.plan, table)?;
-        Ok(bound.len())
-    })
+    config: &sparkflash_engine::config::ModelConfig,
+    rank: usize,
+    world: usize,
+    evidence_dir: &Path,
+) -> Result<(DeviceBind, Value, Vec<String>), String> {
+    let (bind, arena_evidence, lines) =
+        upload_arena_streaming(&setup.plan, &setup.shard_plan, source, |arena| {
+            bind_in_arena(arena, setup, table, config, rank, world, evidence_dir)
+        })?;
+    Ok((bind, arena_evidence, lines))
+}
+
+/// Binds the device sets, then runs use_bound while the arena is still alive, and returns its
+/// value. This is the only way a forward pass can reach the arena pointers: the arena drops when
+/// the streaming epoch ends, so the pass must execute inside this call.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bind_device_sets_in_arena_with<T>(
+    setup: &RankSetup,
+    source: &SafeTensorsSource,
+    table: &std::collections::BTreeMap<String, (usize, usize)>,
+    config: &sparkflash_engine::config::ModelConfig,
+    rank: usize,
+    world: usize,
+    evidence_dir: &Path,
+    use_bound: impl FnOnce(&sparkflash_device::arena::ResidentArena, &DeviceBind) -> Result<T, String>,
+) -> Result<(DeviceBind, Value, Vec<String>, T), String> {
+    // The streaming entry point wants an FnMut; the forward epoch runs exactly once, so hold the
+    // callback in an Option and take it at the single invocation.
+    let mut use_bound = Some(use_bound);
+    let ((bind, value), arena_evidence, lines) =
+        upload_arena_streaming(&setup.plan, &setup.shard_plan, source, |arena| {
+            let bind = bind_in_arena(arena, setup, table, config, rank, world, evidence_dir)?;
+            let use_bound = use_bound
+                .take()
+                .expect("one streaming epoch calls the forward callback once");
+            let value = use_bound(arena, &bind)?;
+            Ok((bind, value))
+        })?;
+    Ok((bind, arena_evidence, lines, value))
 }
 
 /// Without the cuda feature the arena cannot be opened, so binding is refused.
 #[cfg(not(feature = "cuda"))]
-pub(crate) fn bind_attention_in_arena(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bind_device_sets_in_arena(
     _setup: &RankSetup,
     _source: &SafeTensorsSource,
     _table: &std::collections::BTreeMap<String, (usize, usize)>,
-) -> Result<(usize, Value, Vec<String>), String> {
+    _config: &sparkflash_engine::config::ModelConfig,
+    _rank: usize,
+    _world: usize,
+    _evidence_dir: &Path,
+) -> Result<(DeviceBind, Value, Vec<String>), String> {
+    Err("--loop with --upload needs a binary built with --features cuda".to_string())
+}
+
+/// Without the cuda feature the arena cannot be opened, so the forward variant is refused too.
+#[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bind_device_sets_in_arena_with<T>(
+    _setup: &RankSetup,
+    _source: &SafeTensorsSource,
+    _table: &std::collections::BTreeMap<String, (usize, usize)>,
+    _config: &sparkflash_engine::config::ModelConfig,
+    _rank: usize,
+    _world: usize,
+    _evidence_dir: &Path,
+    _use_bound: impl FnOnce(&sparkflash_device::arena::ResidentArena, &DeviceBind) -> Result<T, String>,
+) -> Result<(DeviceBind, Value, Vec<String>, T), String> {
     Err("--loop with --upload needs a binary built with --features cuda".to_string())
 }
 
@@ -751,7 +1075,7 @@ struct IndexedTensor {
 /// This is the form produced from a checkpoint's safetensors headers (\`name: {dtype, shape}\`). An
 /// Hugging Face \`model.safetensors.index.json\` is not a header dump - it has no shapes - so it is
 /// refused with a message naming the checkpoint mode instead of being half-read.
-fn entries_from_tensor_index(path: &Path) -> Result<Vec<HeaderEntry>, String> {
+pub(crate) fn entries_from_tensor_index(path: &Path) -> Result<Vec<HeaderEntry>, String> {
     let text =
         fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     let value: Value = serde_json::from_str(&text)

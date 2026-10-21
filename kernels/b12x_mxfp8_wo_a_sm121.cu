@@ -68,9 +68,22 @@ extern "C" __global__ void b12x_mxfp8_wo_a_sm121(
     uint64_t t_enter = 0u;
     SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_DENSE_MXFP8, t_enter);
 
-    if (group < groups && column < (uint32_t)SPARK_M4_O_LORA_RANK) {
+    __shared__ uint8_t s_a_row[SPARK_M4_WOA_GROUP_INNER];
+    __shared__ uint8_t s_a_scales[SPARK_M4_WOA_GROUP_INNER / SPARK_M4_QUANT_BLOCK];
+    if (group < groups) {
         const uint8_t *a_row = attn_fp8 + (uint64_t)group * SPARK_M4_WOA_GROUP_INNER;
         const uint8_t *a_scale_row = attn_scales + (uint64_t)group * k_blocks;
+        for (uint32_t k = lane; k < (uint32_t)SPARK_M4_WOA_GROUP_INNER;
+             k += SPARK_M4_WOA_THREADS) {
+            s_a_row[k] = a_row[k];
+        }
+        if (lane < k_blocks) {
+            s_a_scales[lane] = a_scale_row[lane];
+        }
+    }
+    __syncthreads();
+
+    if (group < groups && column < (uint32_t)SPARK_M4_O_LORA_RANK) {
         // Each group owns a weight buffer AND a scale buffer, and the two are different sizes, so
         // there are two group strides. The offsets inside each buffer come from the same helpers the
         // dense kernel uses.
@@ -81,12 +94,13 @@ extern "C" __global__ void b12x_mxfp8_wo_a_sm121(
         float acc = 0.0f;
         for (uint32_t block = 0; block < k_blocks; ++block) {
             const uint32_t base = block * SPARK_M4_QUANT_BLOCK;
-            const float a_scale = spark_ue8m0_decode(a_scale_row[block]);
+            const float a_scale = spark_ue8m0_decode(s_a_scales[block]);
             const float w_scale =
                 spark_ue8m0_decode(w_scales[group_scale_base +
                                             spark_b12x_scale_index(column, base, SPARK_M4_WOA_GROUP_INNER)]);
+#pragma unroll 8
             for (uint32_t i = 0; i < SPARK_M4_QUANT_BLOCK; ++i) {
-                const float a_value = spark_fp8_e4m3_decode(a_row[base + i]) * a_scale;
+                const float a_value = spark_fp8_e4m3_decode(s_a_row[base + i]) * a_scale;
                 const float w_value =
                     spark_fp8_e4m3_decode(
                         w_fp8[group_weight_base +

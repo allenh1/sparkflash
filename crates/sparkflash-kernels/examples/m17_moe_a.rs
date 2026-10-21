@@ -22,7 +22,7 @@
 //!    where the host uses libm), two launches byte-identical. The device ids are the selection stages 2-4 consume, so the routed
 //!    branch is routing-driven, not a forced id cycle.
 //!
-//! 2. GATE/UP (routed_gate_up_sm121, 9,752 B / 115200d2...): the w1 and w3 projections of the
+//! 2. GATE/UP (routed_gate_up_sm121, 15,672 B / 12ddc097...): the w1 and w3 projections of the
 //!    experts the router selected, all four 576-row rank slices of the 2304-wide intermediate (8
 //!    launches: 4 ranks x 2 projections). Weights are the released experts.<e>.w1/w3.weight (I8
 //!    packed FP4) and .scale (F8_E8M0) byte slices; the activation is the D8-quantised embed
@@ -43,7 +43,7 @@
 //!    that function, not an equal twin); any difference is a finding, never a tolerance. Two
 //!    launches byte-identical. This is the F6 seam's device closure (D33).
 //!
-//! 4. DOWN/COMBINE (b12x_mxfp4_moe_sm121, 9,976 B / 2d1fdb45...): four serial rank launches over
+//! 4. DOWN/COMBINE (b12x_mxfp4_moe_sm121, 11,704 B / ccb9d127...): four serial rank launches over
 //!    the 576-wide w2 slices of the same selected experts, each ADDING its f32 partials into one
 //!    [tokens][top_k][hidden] accumulator (audit M2/F7: the native arithmetic sums the tensor-parallel
 //!    rank partials in f32 and rounds each expert's w2 output ONCE, in the epilogue, model.py:899-903).
@@ -138,14 +138,14 @@ const QUANT_BLOCK: usize = 32;
 /// weighted variant, which multiplies each routed row by its router weight before the quantiser and
 /// so makes the combine operand device-built (the F6 seam's closure); the unweighted epilogue is
 /// still pinned in the baseline for the shared expert (m17b).
-const SWIGLU_WEIGHTED_CUBIN_BYTES: usize = 13_000;
+const SWIGLU_WEIGHTED_CUBIN_BYTES: usize = 14_224;
 const SWIGLU_WEIGHTED_CUBIN_SHA256: &str =
-    "0e602daf6f2a51f027f3a924aaa503fada7db14610b94114439c659be4150cfe";
+    "6b237e6c20301ddeda7f47ff9add5385a19e789d818388c5eb22981f1af5377e";
 /// The MXFP4 down/combine cubin pin (same source; mxfp4_moe_launch states the device chain's
 /// catalog owns the bytes, so this harness pins them here).
-const MXFP4_MOE_CUBIN_BYTES: usize = 9_976;
+const MXFP4_MOE_CUBIN_BYTES: usize = 31_656;
 const MXFP4_MOE_CUBIN_SHA256: &str =
-    "2d1fdb45fb070a40dc272d5ea9231e53bd849759d922b046299c186a05d68dc3";
+    "5ab4e5b67cd457ad4a35dc4aa351aac29fcd2b681253f90ae8e39d2265fa3824";
 
 /// The pass/fail verdict of one named check, printed with its detail.
 struct Verdict {

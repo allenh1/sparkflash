@@ -115,13 +115,13 @@ const DENSE_KERNEL: &str = "b12x_mxfp8_dense_sm121";
 /// The grouped wo_a cubin name in the baseline manifest.
 const WO_A_KERNEL: &str = "b12x_mxfp8_wo_a_sm121";
 /// Pinned dense cubin size.
-const DENSE_PIN_BYTES: usize = 190_400;
+const DENSE_PIN_BYTES: usize = 209_424;
 /// Pinned dense cubin sha256.
-const DENSE_PIN_SHA256: &str = "06dc726f32af699997f93cda24394855b33aba1fea410609162e32f0b0600850";
+const DENSE_PIN_SHA256: &str = "d751f2b65b076659ff0c4cc37542f8ae4899ec61b7f40c3d8223ba3181f9d350";
 /// Pinned wi_a cubin size.
-const WO_A_PIN_BYTES: usize = 70_056;
+const WO_A_PIN_BYTES: usize = 75_888;
 /// Pinned wo_a cubin sha256.
-const WO_A_PIN_SHA256: &str = "506c84e7363b855dad0cbc475b81b6d315a9e2e12ce3e834a568890885802519";
+const WO_A_PIN_SHA256: &str = "157dffa6d18a55bf67398876c3a19aa7890ceb9a07bd5ec8d6bf6dcb3b2e4d6e";
 /// Both pinned kernels carry no fence.
 const PIN_MEMBAR_LINES: u32 = 0;
 /// The grouped output projection's geometry, from the released kernel and the measured layer-0 table.

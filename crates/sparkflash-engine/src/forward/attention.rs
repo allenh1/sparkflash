@@ -1838,6 +1838,120 @@ pub fn compressed_indices_with_backend(
     )
 }
 
+/// One step's compressed-side reference seams, for a loop that runs the attention projections on
+/// device and only needs the reference's host-side compressor, indexer and candidate selection.
+///
+/// The four-rank device loop owns the wq/kv/wo projections on device, but the plan declares the
+/// compressor, the indexer and the two-level candidate select as host seams. This function runs
+/// exactly those seams for one query, in [attention_forward]'s order, on the caller's input row:
+/// the compressor pooling (model.py:446-486), the index keys and per-query weights
+/// (model.py:513-557), the candidate select (model.py:561-610) and the fp4 compressed cache
+/// (model.py:748-761). It advances the caller's state the same way, so a sequence of calls is the
+/// same decode-step sequence the reference sees. What it does not do is recompute the attention
+/// projections (q, kv, the output projection) or run sparse attention: the caller already ran
+/// those on device from its own weights, and doing them again would only be host arithmetic the
+/// caller does not consume.
+///
+/// The window ring is not written: the caller stages its own device KV rows and the ring is not an
+/// input to any of the seams above. The window and compressed ids are reported in the reference's
+/// own conventions so the caller can stage the kernel's operands: window_width is the number of
+/// attended window rows this query has, and the compressed ids are the shared index-space values
+/// (window_rows plus compressed row, with [NO_INDEX] where a query has nothing).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttentionSeamStep {
+    /// The layer's compression ratio (0 for a window-only layer).
+    pub ratio: usize,
+    /// The window length the compressed ids are shifted by: this step's row count on the first
+    /// chunk, the ring width after it (model.py:580, 744).
+    pub window_rows: usize,
+    /// How many window rows this query attends (ids that stand for a position).
+    pub window_width: usize,
+    /// The compressed ids this query selects, in the shared index space.
+    pub compressed_ids: Vec<usize>,
+    /// The compressed rows in row order, head_dim values per row: the caller stages these as the
+    /// kernel's fp4 store (already the quantised values the reference stored).
+    pub compressed_rows: Vec<f32>,
+}
+
+/// One query's compressed-side reference seams; see [AttentionSeamStep].
+///
+/// The caller must call this once per layer per position, in layer order, because the first
+/// index/kv source publishes the channels its consumers read in the same step.
+///
+/// # Errors
+/// [EngineError] from any weight read or shape mismatch, and the same channel refusals
+/// [compressed_indices] raises when a consumer runs before its source.
+#[allow(clippy::too_many_arguments)] // the query row, its query latent, the step position, the state, the source and the limit are distinct inputs.
+pub fn attention_seam_step(
+    config: &ModelConfig,
+    layer: usize,
+    prefix: &str,
+    x: &[f32],
+    q_latent: &[f32],
+    start_pos: usize,
+    state: &mut AttnState,
+    src: &dyn WeightSource,
+    limit: usize,
+) -> Result<AttentionSeamStep, EngineError> {
+    let src = Reads { source: src, limit };
+    let dim = config.dim;
+    let seqlen = rows_of(x, dim, "attention seam input")?;
+    if seqlen != 1 {
+        return Err(shape(
+            "attention seam step",
+            format!(
+                "{seqlen} rows: the seam step is one query at a time, which is the decode-step order the four-rank loop runs"
+            ),
+        ));
+    }
+    let end_pos = start_pos + seqlen;
+    let ratio = layer_ratio(config, layer);
+    let compress_len = end_pos.checked_div(ratio).unwrap_or(0);
+    state.step = Some((start_pos, seqlen));
+    let window_rows = if start_pos == 0 {
+        seqlen
+    } else {
+        config.window_size
+    };
+    state.window_rows = Some(window_rows);
+    let mut compressed_ids = Vec::new();
+    if ratio > 0 {
+        compressor_step(config, layer, prefix, x, start_pos, state, src)?;
+        write_index_keys(config, layer, prefix, start_pos, state, src)?;
+        if is_index_source(config, layer) && compress_len > 0 {
+            state.index_weights = index_weights(config, prefix, x, seqlen, src)?;
+        } else {
+            state.index_weights.clear();
+        }
+        compressed_indices(
+            state,
+            config,
+            layer,
+            q_latent,
+            src.source,
+            prefix,
+            &mut compressed_ids,
+            limit,
+        )?;
+        write_compressed_cache(config, layer, start_pos, state)?;
+        state.compressed_len = compress_len;
+    }
+    let ids = window_indices(config, start_pos, seqlen);
+    let window_width = ids.iter().filter(|id| **id != NO_INDEX).count();
+    let compressed_rows = if ratio > 0 {
+        fetch_compressed(config, layer, state, compress_len)?
+    } else {
+        Vec::new()
+    };
+    Ok(AttentionSeamStep {
+        ratio,
+        window_rows,
+        window_width,
+        compressed_ids,
+        compressed_rows,
+    })
+}
+
 /// The projection primitives of the attention sublayer - the five attention GEMMs plus the
 /// indexer's own wq_b - split out so a device arm can replace the matrix multiplies without
 /// replacing the host normalisation, RoPE, KV, cache, indexer scoring or softmax seams. The host
@@ -5011,5 +5125,120 @@ mod tests {
         });
         let state = AttnState::for_config(&config);
         let _ = fetch_compressed(&config, 5, &state, 1);
+    }
+
+    /// The seam step must reproduce exactly what the full reference forward captured for the same
+    /// query: the compressor cache rows, the index keys and the selected ids are the same
+    /// arithmetic in the same order, because the seam step is the same calls the full forward makes
+    /// minus the projections the device loop already ran. The comparison is against the capture
+    /// hook's record, so it also pins the id conventions the kernel staging depends on.
+    #[test]
+    fn the_seam_step_matches_the_full_forward_capture() {
+        use crate::forward::attention_case;
+        let config = ModelConfig::tiny();
+        let source = Hand::for_config(&config);
+        let dim = config.dim;
+        let layers = config.n_layers;
+        let head_dim = config.head_dim;
+        let positions = 9usize;
+        let x: Vec<f32> = (0..dim).map(|i| pattern(i) * 0.5).collect();
+        let prefix = |layer: usize| format!("layers.{layer}");
+
+        // The full forward, one query per step, capturing every layer's frame.
+        reset_shared_attention();
+        let mut full_states: Vec<AttnState> = (0..layers)
+            .map(|_| AttnState::for_config(&config))
+            .collect();
+        let mut records: Vec<Vec<attention_case::AttentionCaseRecord>> = Vec::new();
+        for position in 0..positions {
+            let mut row = Vec::new();
+            for (layer, state) in full_states.iter_mut().enumerate() {
+                attention_case::begin(&[layer], position).expect("capture");
+                let wide = (config.n_heads * head_dim).max(dim);
+                let mut out = vec![0.0f32; wide];
+                attention_forward(
+                    &config,
+                    layer,
+                    &prefix(layer),
+                    &x,
+                    position,
+                    state,
+                    &source,
+                    &mut out,
+                    LIMIT,
+                )
+                .expect("full forward");
+                let captured = attention_case::finish();
+                assert_eq!(captured.len(), 1, "one query captured");
+                row.push(captured.into_iter().next().expect("record"));
+            }
+            records.push(row);
+        }
+
+        // The seam-only path on fresh states, fed the same query latent the full forward used.
+        reset_shared_attention();
+        let mut seam_states: Vec<AttnState> = (0..layers)
+            .map(|_| AttnState::for_config(&config))
+            .collect();
+        for (position, position_records) in records.iter().enumerate() {
+            for (layer, state) in seam_states.iter_mut().enumerate() {
+                let mut backend = HostAttentionProjectionBackend;
+                let (_q, latent) = query_path_with(
+                    &config,
+                    layer,
+                    &prefix(layer),
+                    &x,
+                    position,
+                    &source,
+                    LIMIT,
+                    &mut backend,
+                    None,
+                )
+                .expect("query path");
+                let seam = attention_seam_step(
+                    &config,
+                    layer,
+                    &prefix(layer),
+                    &x,
+                    &latent,
+                    position,
+                    state,
+                    &source,
+                    LIMIT,
+                )
+                .expect("seam step");
+                let record = &position_records[layer];
+                let attended = record
+                    .window_ids
+                    .iter()
+                    .filter(|id| **id != NO_INDEX)
+                    .count();
+                assert_eq!(
+                    seam.ratio, record.ratio,
+                    "layer {layer} position {position} ratio"
+                );
+                assert_eq!(
+                    seam.window_rows, record.window_rows,
+                    "layer {layer} position {position} window rows"
+                );
+                assert_eq!(
+                    seam.window_width, attended,
+                    "layer {layer} position {position} attended window rows"
+                );
+                assert_eq!(
+                    seam.compressed_ids, record.compressed_ids,
+                    "layer {layer} position {position} compressed ids"
+                );
+                assert_eq!(
+                    seam.compressed_rows, record.compressed_kv,
+                    "layer {layer} position {position} compressed rows"
+                );
+                assert_eq!(
+                    seam.compressed_rows.len(),
+                    record.compressed_rows * head_dim,
+                    "layer {layer} position {position} compressed row count"
+                );
+            }
+        }
     }
 }

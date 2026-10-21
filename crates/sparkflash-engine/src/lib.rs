@@ -43,6 +43,7 @@ pub mod linalg;
 pub mod loader;
 pub mod parallel;
 pub mod parallel_tp;
+pub mod prompt_ranks;
 pub mod quant;
 pub mod report;
 pub mod safetensors;

@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 use sparkflash_engine::dtype::DType;
 use sparkflash_engine::safetensors::{
-    CheckpointIndex, DEFAULT_LIMIT, MAX_HEADER_BYTES, SafeTensorsHeader, SafeTensorsSource,
+    CheckpointIndex, DEFAULT_LIMIT, GATHER_WHOLE_TENSOR_MAX_BYTES, MAX_HEADER_BYTES,
+    SafeTensorsHeader, SafeTensorsSource, gathers_whole_tensor,
 };
 use sparkflash_engine::weights::{WeightError, WeightSource};
 
@@ -1258,5 +1259,103 @@ fn paged_ranges_resolve_each_tensor_in_its_own_shard() {
     assert_eq!(
         source.read_ranges("b.weight", &[(0, 4), (12, 4)]).unwrap(),
         [second[0..4].to_vec(), second[12..16].to_vec()].concat()
+    );
+}
+
+#[test]
+fn the_whole_tensor_shortcut_is_bounded_by_the_memory_cap() {
+    // A paged read of the 98.3 GB Engram table asks for 24 rows: above the range-count threshold
+    // and far above the memory cap, so it must take the per-range seek path. The alternative was a
+    // 98 GB allocation on a 128 GB node and an OOM kill at the first Engram read (m1y15).
+    assert!(!gathers_whole_tensor(
+        98_300_000_000,
+        24,
+        GATHER_WHOLE_TENSOR_MAX_BYTES
+    ));
+    // The four-rank boot's many-range reads are column slices of ordinary resident tensors:
+    // attention-row 20,992,000 bytes and experts-row 3,133,440 bytes per tensor, both under the
+    // cap, so the boot keeps its whole-gather path and its measured 320-354 s rather than the
+    // 416-521 s seek path.
+    assert!(gathers_whole_tensor(
+        20_992_000,
+        2640,
+        GATHER_WHOLE_TENSOR_MAX_BYTES
+    ));
+    assert!(gathers_whole_tensor(
+        3_133_440,
+        5120,
+        GATHER_WHOLE_TENSOR_MAX_BYTES
+    ));
+    // The 1.32 GB embedding shards have one range each, and a 16-range read is at the count
+    // threshold, so neither reaches the shortcut with or without the cap.
+    assert!(!gathers_whole_tensor(
+        1_323_827_200,
+        1,
+        GATHER_WHOLE_TENSOR_MAX_BYTES
+    ));
+    assert!(!gathers_whole_tensor(
+        1_323_827_200,
+        16,
+        GATHER_WHOLE_TENSOR_MAX_BYTES
+    ));
+    // Two gigabytes over 24 ranges is the shape the cap exists for: per-range, not whole.
+    assert!(!gathers_whole_tensor(
+        2 << 30,
+        24,
+        GATHER_WHOLE_TENSOR_MAX_BYTES
+    ));
+}
+
+#[test]
+fn both_policy_branches_of_a_many_range_read_return_identical_bytes() {
+    // Twenty-four ranges of a 64-byte tensor: above the range-count threshold, so the cap alone
+    // decides the branch. The bytes must not depend on that decision, and the cap-0 form must read
+    // exactly the same bytes one seek at a time.
+    let dir = tempfile::tempdir().unwrap();
+    let data: Vec<u8> = (0..64).collect();
+    write_container(
+        dir.path(),
+        "a.safetensors",
+        &[Entry {
+            name: "a.weight",
+            dtype: "F32",
+            shape: &[16],
+            data: &data,
+        }],
+    );
+    let source = source(dir.path(), &[("a.weight", "a.safetensors")]);
+    let ranges: Vec<(u64, usize)> = (0..24u64).map(|i| (i * 2, 2)).collect();
+    let mut expected = Vec::new();
+    for &(offset, len) in &ranges {
+        expected.extend_from_slice(&data[offset as usize..offset as usize + len]);
+    }
+    // cap u64::MAX takes the whole-tensor branch; cap 0 takes the per-range branch.
+    assert!(gathers_whole_tensor(64, ranges.len(), u64::MAX));
+    assert!(!gathers_whole_tensor(64, ranges.len(), 0));
+    assert_eq!(
+        source
+            .read_ranges_with_policy("a.weight", &ranges, u64::MAX)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        source
+            .read_ranges_with_policy("a.weight", &ranges, 0)
+            .unwrap(),
+        expected
+    );
+    // The named paged entry point is the cap-0 form: never a whole-region buffer, same bytes.
+    assert_eq!(
+        source.read_ranges_paged("a.weight", &ranges).unwrap(),
+        expected
+    );
+    // The trait form reaches the same override, so a caller holding a dyn WeightSource pages too.
+    let trait_paged: &dyn WeightSource = &source;
+    assert_eq!(
+        trait_paged
+            .read_ranges_paged("a.weight", &ranges)
+            .expect("the source serves ranges")
+            .unwrap(),
+        expected
     );
 }

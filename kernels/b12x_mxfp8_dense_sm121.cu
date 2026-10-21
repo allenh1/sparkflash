@@ -87,27 +87,46 @@ extern "C" __global__ void b12x_mxfp8_dense_sm121(
         if (row >= rows) {
             continue;
         }
+        const uint8_t *a_row = a_fp8 + (uint64_t)row * inner;
+        const uint8_t *a_scale_row = a_scales + (uint64_t)row * k_blocks;
+        float acc[SPARK_M4_DENSE_COLS_PER_THREAD];
+#pragma unroll
         for (uint32_t dj = 0; dj < SPARK_M4_DENSE_COLS_PER_THREAD; ++dj) {
-            const uint32_t col = col_base + dj;
-            if (col >= cols) {
-                continue;
+            acc[dj] = 0.0f;
+        }
+        for (uint32_t block = 0; block < k_blocks; ++block) {
+            const uint32_t base = block * SPARK_M4_QUANT_BLOCK;
+            const float a_scale = spark_ue8m0_decode(a_scale_row[block]);
+            float w_scale[SPARK_M4_DENSE_COLS_PER_THREAD];
+#pragma unroll
+            for (uint32_t dj = 0; dj < SPARK_M4_DENSE_COLS_PER_THREAD; ++dj) {
+                const uint32_t col = col_base + dj;
+                w_scale[dj] =
+                    col < cols ? spark_ue8m0_decode(w_scales[spark_b12x_scale_index(col, base, inner)])
+                               : 0.0f;
             }
-            float acc = 0.0f;
-            for (uint32_t block = 0; block < k_blocks; ++block) {
-                const uint32_t base = block * SPARK_M4_QUANT_BLOCK;
-                const float a_scale = spark_ue8m0_decode(a_scales[(uint64_t)row * k_blocks + block]);
-                const float w_scale =
-                    spark_ue8m0_decode(w_scales[spark_b12x_scale_index(col, base, inner)]);
-                for (uint32_t i = 0; i < SPARK_M4_QUANT_BLOCK; ++i) {
-                    const float a_value =
-                        spark_fp8_e4m3_decode(a_fp8[(uint64_t)row * inner + base + i]) * a_scale;
-                    const float w_value = spark_fp8_e4m3_decode(
-                                              w_fp8[spark_b12x_weight_index(col, base + i, inner)]) *
-                                          w_scale;
-                    acc += a_value * w_value;
+#pragma unroll 8
+            for (uint32_t i = 0; i < SPARK_M4_QUANT_BLOCK; ++i) {
+                const float a_value = spark_fp8_e4m3_decode(a_row[base + i]) * a_scale;
+#pragma unroll
+                for (uint32_t dj = 0; dj < SPARK_M4_DENSE_COLS_PER_THREAD; ++dj) {
+                    const uint32_t col = col_base + dj;
+                    if (col < cols) {
+                        const float w_value =
+                            spark_fp8_e4m3_decode(
+                                w_fp8[spark_b12x_weight_index(col, base + i, inner)]) *
+                            w_scale[dj];
+                        acc[dj] += a_value * w_value;
+                    }
                 }
             }
-            out[(uint64_t)row * cols + col] = __float2bfloat16_rn(acc);
+        }
+#pragma unroll
+        for (uint32_t dj = 0; dj < SPARK_M4_DENSE_COLS_PER_THREAD; ++dj) {
+            const uint32_t col = col_base + dj;
+            if (col < cols) {
+                out[(uint64_t)row * cols + col] = __float2bfloat16_rn(acc[dj]);
+            }
         }
     }
     __syncthreads();

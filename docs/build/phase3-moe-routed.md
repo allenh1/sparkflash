@@ -500,7 +500,7 @@ and printed the binary and cubin sha256s before any run:
 
 ```text
 6443d5d0729650bdf571a3907c95ef5c169296b25a55050b42bd7174b16828cd  /home/user/phase2-evidence/window-2026-10-18/bin/m17a_weighted_6443d5d0_aarch64
-0e602daf6f2a51f027f3a924aaa503fada7db14610b94114439c659be4150cfe  /home/user/phase2-evidence/window-2026-10-18/cubins/swiglu_mxfp8_quant_weighted_sm121.cubin
+6b237e6c20301ddeda7f47ff9add5385a19e789d818388c5eb22981f1af5377e  /home/user/phase2-evidence/window-2026-10-18/cubins/swiglu_mxfp8_quant_weighted_sm121.cubin
 ```
 
 The same window first ran the c4a-2 corrected all-40-layer body (05:58:36 -> 05:59:29, recorded on its
@@ -608,7 +608,7 @@ MemAvailable at m17a stage 2 rank 3 post-launch: 121203516 kB (115.6 GiB), floor
   check stage 2 rank 3: two launches byte-identical: ok (61440 gate + 61440 up bytes compared per projection)
 --- stage 3: swiglu_mxfp8_quant_weighted_sm121 on the device gate/up bf16 values, with the device router's per-row weights as the weight operand ---
 comparison class (declared before any number): E4M3 codes and ue8m0 scales BIT-EXACT against swiglu_ref::quantise_row_weighted over the same 640 bf16 values and the same per-row routing weight, for every routed row of every rank; the REAL 576-wide operand is additionally bit-exact against mxfp4_ref::routed_activation_operand over the same real values and weight (the model operand the combine consumes); two launches byte-identical. The weight operand is the router's device output buffer weights_d, read in place, so the operand is device-built and no host multiply or host quantise remains in the path (the F6 seam is closed).
-cubin: /home/user/phase2-evidence/window-2026-10-18/cubins/swiglu_mxfp8_quant_weighted_sm121.cubin (13000 B, sha256 0e602daf6f2a51f027f3a924aaa503fada7db14610b94114439c659be4150cfe)
+cubin: /home/user/phase2-evidence/window-2026-10-18/cubins/swiglu_mxfp8_quant_weighted_sm121.cubin (13000 B, sha256 6b237e6c20301ddeda7f47ff9add5385a19e789d818388c5eb22981f1af5377e)
   rank 0: rows 48, cols 640, device bytes admitted 154560, weights_d reused in place
 MemAvailable at m17a stage 3 rank 0 pre-launch: 121317756 kB (115.7 GiB), floor 32 GiB - ok
 MemAvailable at m17a stage 3 rank 0 post-launch: 121317756 kB (115.7 GiB), floor 32 GiB - ok
@@ -748,7 +748,7 @@ MemAvailable at m17a stage 2 rank 3 post-launch: 119401764 kB (113.9 GiB), floor
   check stage 2 rank 3: two launches byte-identical: ok (998400 gate + 998400 up bytes compared per projection)
 --- stage 3: swiglu_mxfp8_quant_weighted_sm121 on the device gate/up bf16 values, with the device router's per-row weights as the weight operand ---
 comparison class (declared before any number): E4M3 codes and ue8m0 scales BIT-EXACT against swiglu_ref::quantise_row_weighted over the same 640 bf16 values and the same per-row routing weight, for every routed row of every rank; the REAL 576-wide operand is additionally bit-exact against mxfp4_ref::routed_activation_operand over the same real values and weight (the model operand the combine consumes); two launches byte-identical. The weight operand is the router's device output buffer weights_d, read in place, so the operand is device-built and no host multiply or host quantise remains in the path (the F6 seam is closed).
-cubin: /home/user/phase2-evidence/window-2026-10-18/cubins/swiglu_mxfp8_quant_weighted_sm121.cubin (13000 B, sha256 0e602daf6f2a51f027f3a924aaa503fada7db14610b94114439c659be4150cfe)
+cubin: /home/user/phase2-evidence/window-2026-10-18/cubins/swiglu_mxfp8_quant_weighted_sm121.cubin (13000 B, sha256 6b237e6c20301ddeda7f47ff9add5385a19e789d818388c5eb22981f1af5377e)
   rank 0: rows 780, cols 640, device bytes admitted 2511600, weights_d reused in place
 MemAvailable at m17a stage 3 rank 0 pre-launch: 120282280 kB (114.7 GiB), floor 32 GiB - ok
 MemAvailable at m17a stage 3 rank 0 post-launch: 120282280 kB (114.7 GiB), floor 32 GiB - ok

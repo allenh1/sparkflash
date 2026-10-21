@@ -45,11 +45,11 @@ pub const TOP_K: u32 = 6;
 pub const QUANT_BLOCK: u32 = 32;
 /// MX blocks per hidden row: 5120 / 32.
 pub const K_BLOCKS: u32 = HIDDEN / QUANT_BLOCK;
-/// Threads per block: one output element per thread.
+/// Threads per block: one compute thread per (column, K group), one reducer per column.
 pub const THREADS: u32 = 256;
-/// Columns one block covers.
-pub const TILE: u32 = 256;
-/// Blocks along the output tile axis: ceil(640 / 256).
+/// Columns one block covers (the reducer threads are one per column).
+pub const TILE: u32 = 32;
+/// Blocks along the output tile axis: ceil(640 / 32).
 pub const TILES: u32 = WIDTH_PADDED.div_ceil(TILE);
 /// Packed FP4 bytes per output row: 5120 / 2.
 pub const PACKED_ROW_BYTES: u32 = HIDDEN / 2;
@@ -60,9 +60,9 @@ pub const SCALE_ROW_BYTES: u32 = K_BLOCKS;
 pub const ARG_WORDS: usize = 10;
 
 /// Pinned cubin size, measured with nvcc V13.0.88 (CUDA 13.0.3) for sm_121a.
-pub const CUBIN_BYTES: usize = 9_752;
+pub const CUBIN_BYTES: usize = 35_656;
 /// Pinned cubin sha256, from the same measurement.
-pub const CUBIN_SHA256: &str = "115200d26c3404b7169c476e350f5575dadc3fec9e8b0ec97113cd297fa6c1af";
+pub const CUBIN_SHA256: &str = "b108f7fa1a21623e876f17a8e2da5634257a6745e1d2f1233cc7d325c4a360f8";
 /// PTX membar lines in the pinned PTX: the kernel emits none (no fence, no acquire).
 pub const CUBIN_MEMBAR_LINES: usize = 0;
 /// The toolkit the pin was measured with.
@@ -227,10 +227,10 @@ mod tests {
             expected,
             "the manifest entry must be the pinned cubin"
         );
-        // The header count and toolkit are part of the same claim: this is one of nineteen entries.
+        // The header count and toolkit are part of the same claim: this is one of twenty entries.
         assert!(
-            BASELINE.contains("nineteen baseline kernels"),
-            "the manifest header must say nineteen"
+            BASELINE.contains("twenty baseline kernels"),
+            "the manifest header must say twenty"
         );
         assert!(BASELINE.contains(&format!("nvcc_release={TOOLKIT_RELEASE}")));
         assert!(BASELINE.contains("arch=sm_121a"));

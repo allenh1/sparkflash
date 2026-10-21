@@ -1,12 +1,79 @@
 //! Shared axum application state.
 
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::device_token::DeviceTokenSource;
 use crate::encoding::TokenizerSeam;
 use crate::engine::InferenceEngine;
 use crate::metrics::Metrics;
+
+/// The default interval between SSE keep-alive comment frames while an engine stream is idle.
+///
+/// Fifteen seconds is the conventional proxy-idle cadence for a streaming connection; a comment
+/// frame keeps the connection open without adding a JSON event or changing the payload.
+pub const DEFAULT_SSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+/// Draws the per-choice sampling seeds for a request that named no seed.
+///
+/// vLLM's contract for an unseeded request is "sample independently, no reproducibility"; the
+/// OpenAI API only promises determinism when the caller passes `seed`. The router therefore has
+/// to create the randomness itself for unseeded requests: with n > 1 every choice must be a
+/// different draw, not n copies of seed 0 (which is what the reference driver would otherwise
+/// generate). A source is a trait so tests can pin the exact draws while production uses
+/// process entropy.
+pub trait ChoiceSeedSource: Send + Sync {
+    /// Returns one fresh seed. Successive calls are expected to differ.
+    fn next_seed(&self) -> u64;
+}
+
+/// The production seed source: OS-seeded entropy, mixed with a monotone draw counter.
+///
+/// `std::collections::hash_map::RandomState` is seeded from the OS per process and per instance;
+/// hashing the draw counter with those random keys yields a u64 that is neither predictable from
+/// the process start time nor repeated across draws. No entropy crate is added for this.
+#[derive(Debug, Default)]
+pub struct RandomChoiceSeeds;
+
+impl ChoiceSeedSource for RandomChoiceSeeds {
+    fn next_seed(&self) -> u64 {
+        static DRAW: AtomicU64 = AtomicU64::new(0);
+        let random = RandomState::new();
+        let mut hasher = random.build_hasher();
+        hasher.write_u64(DRAW.fetch_add(1, Ordering::Relaxed));
+        hasher.write_u128(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |delta| delta.as_nanos()),
+        );
+        hasher.finish()
+    }
+}
+
+/// A deterministic seed source for tests: draws `start, start + 1, start + 2, ...`.
+#[derive(Debug)]
+pub struct SequentialChoiceSeeds {
+    next: AtomicU64,
+}
+
+impl SequentialChoiceSeeds {
+    /// A source whose first draw is `start`.
+    #[must_use]
+    pub fn starting_at(start: u64) -> Self {
+        Self {
+            next: AtomicU64::new(start),
+        }
+    }
+}
+
+impl ChoiceSeedSource for SequentialChoiceSeeds {
+    fn next_seed(&self) -> u64 {
+        self.next.fetch_add(1, Ordering::Relaxed)
+    }
+}
 
 /// Everything the handlers share.
 ///
@@ -24,7 +91,12 @@ pub struct AppState {
     id_seq: Arc<AtomicU64>,
     fixed_time_unix: Option<u64>,
     max_logprobs: usize,
+    sse_keep_alive: Option<Duration>,
     tokenizer: Option<Arc<TokenizerSeam>>,
+    api_key: Option<Arc<str>>,
+    device_token_source: Option<Arc<dyn DeviceTokenSource>>,
+    choice_seeds: Arc<dyn ChoiceSeedSource>,
+    draining: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -38,8 +110,25 @@ impl AppState {
             id_seq: Arc::new(AtomicU64::new(0)),
             fixed_time_unix: None,
             max_logprobs: crate::server::DEFAULT_MAX_LOGPROBS,
+            sse_keep_alive: Some(DEFAULT_SSE_KEEP_ALIVE),
             tokenizer: None,
+            api_key: None,
+            device_token_source: None,
+            choice_seeds: Arc::new(RandomChoiceSeeds),
+            draining: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Replaces the exporter so the engine driver and the HTTP surface share one registry.
+    ///
+    /// `sparkflash serve` builds the exporter before the engine driver, because the driver's
+    /// request lifecycle is what feeds the scheduler gauges, the generator counter and the
+    /// time-to-first-token histogram. Without this the router would export a second, empty
+    /// registry and every one of those families would read zero.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Attaches the checkpoint tokenizer and V4.1 chat template.
@@ -83,6 +172,92 @@ impl AppState {
         self.max_logprobs
     }
 
+    /// Sets the idle SSE keep-alive interval, or turns the comment frames off with None.
+    ///
+    /// The engine stream is the only source of SSE events, so a long engine pause is a long
+    /// client-visible pause; the keep-alive comment fills it without adding a JSON event.
+    #[must_use]
+    pub fn with_sse_keep_alive(mut self, interval: Option<Duration>) -> Self {
+        self.sse_keep_alive = interval;
+        self
+    }
+
+    /// The idle SSE keep-alive interval, if comment frames are enabled.
+    #[must_use]
+    pub fn sse_keep_alive(&self) -> Option<Duration> {
+        self.sse_keep_alive
+    }
+
+    /// Requires a bearer API key on every route except `/health` and `/metrics`.
+    ///
+    /// `None` is the default and preserves the pre-task-20 behaviour: the server is open. A key
+    /// turns on the middleware in [`crate::server::router`], which answers a missing or wrong
+    /// `Authorization: Bearer <key>` with the OpenAI 401 envelope.
+    #[must_use]
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key.map(Arc::from);
+        self
+    }
+
+    /// The bearer API key, when one is configured.
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    /// Installs the device-chain token source for the S7/S8 serving scaffold.
+    ///
+    /// The default is `None`: the router then serves every request from the host twin engine,
+    /// exactly as before the scaffold. When a source is installed, a plain (non-streaming or
+    /// streaming) completion request may be served from a claimed four-rank device token envelope;
+    /// an unclaimed envelope, a missing directory or an advanced request falls back to the engine.
+    #[must_use]
+    pub fn with_device_token_source(mut self, source: Option<Arc<dyn DeviceTokenSource>>) -> Self {
+        self.device_token_source = source;
+        self
+    }
+
+    /// The device-chain token source, when one is configured.
+    #[must_use]
+    pub fn device_token_source(&self) -> Option<&Arc<dyn DeviceTokenSource>> {
+        self.device_token_source.as_ref()
+    }
+
+    /// Replaces the seed source for unseeded choices (tests use a deterministic source).
+    #[must_use]
+    pub fn with_choice_seeds(mut self, choice_seeds: Arc<dyn ChoiceSeedSource>) -> Self {
+        self.choice_seeds = choice_seeds;
+        self
+    }
+
+    /// Resolves one choice's sampling seed.
+    ///
+    /// The caller's seed is vLLM's per-choice derivation (`seed + i`), which keeps a seeded
+    /// request reproducible and makes its choices distinct draws. An **unseeded** request leaves
+    /// `EngineRequest::seed` as None when it asks for one choice (the pre-existing byte-compatible
+    /// path), and draws a fresh seed for every choice when it asks for more than one: that is the
+    /// difference between n independent samples and n copies of one deterministic stream.
+    #[must_use]
+    pub fn choice_seed(&self, seed: Option<u64>, choice: usize, n: usize) -> Option<u64> {
+        match seed {
+            Some(seed) => Some(seed.wrapping_add(choice as u64)),
+            None if n > 1 => Some(self.choice_seeds.next_seed()),
+            None => None,
+        }
+    }
+
+    /// Marks the server as draining: readiness reports not-ready, requests already admitted
+    /// continue to completion.
+    pub fn begin_drain(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the drain signal has been received.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
     /// The engine's model id.
     #[must_use]
     pub fn model_id(&self) -> &str {
@@ -96,6 +271,16 @@ impl AppState {
             "{prefix}{:08x}",
             self.id_seq.fetch_add(1, Ordering::Relaxed)
         )
+    }
+
+    /// The shared response-id counter.
+    ///
+    /// A streaming response generator cannot hold an `&AppState` (the body has to be `'static`),
+    /// so it takes the counter instead and formats tool-call ids from it the same way [`Self::next_id`]
+    /// does.
+    #[must_use]
+    pub fn id_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.id_seq)
     }
 
     /// Current Unix timestamp, or the pinned one in tests.

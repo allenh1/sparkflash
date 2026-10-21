@@ -58,6 +58,8 @@ records the evidence and the consequence for the build. Research backing is in
 | D48 | Batch-19 device acceptance target: **50-60 tokens/s vLLM parity with DSpark** on this hardware, personal target **90 tokens/s single-stream**, with the derived per-step budget (<=42 ms per verify step at ~3.8 accepted tokens, 11.1 ms/accepted token, 13.9 ms weight-traffic roofline at 273 GB/s/rank, ~1.7 ms RDMA collectives, ~2.2 ms draft) | The budgets are derived from the target, not measured; they are the acceptance arithmetic for the GPU path, so every roadmap stage is judged against the 42 ms/verify-step budget rather than against the CPU stopgap. Stage results stay placeholders until owners report measured device numbers |
 | D49 | KV ring capacity 134 vs attention window 128: a NEW symbol carries capacity explicitly (slot = position % 134, window_rows = 128), pin 18 -> 19 for the ring symbol (the three batched row symbols land inside the existing mHC/cert-head/lm-reduce cubins and re-pin those, not new KernelIds), ratio explicit, NaN guard on accept | DSpark/MTP needs 134 ring slots while the arithmetic window stays 128; today `flash_mla_csa2_seq_sm121` writes NaN for 134 rows (window_rows>128 guard, MAX_ATTENDED==640 static assert). New symbol (frozen entry not mutated), explicit ratio argument instead of the candidate-count inference in attention_device.rs, and a NaN guard on the accept input; no serving claim until a device run measures the 134-slot ring |
 | D50 | Drafter unification: the MTP drafter wins; dspark.rs is demoted to a scheduler-policy model; accepted_prediction_tokens must come from the real acceptance rule | dspark.rs drafts philox-random tokens while forward/mtp.rs computes the real 3-stage draft + Markov argmax chain and serve.rs drops it (`accepted_prediction_tokens: 0`); the MTP path is the draft contract, the random path is scheduler policy only, and a serving surface reporting a DSpark metric without measured acceptance is a defect |
+| D51 | D39 amendments (performance-kernel tolerance rule and Engram residency): bit-exactness applies to the reference arm only; perf kernels keep the native quantisation but may reassociate reductions if each passes a per-kernel tolerance and the D41 suite metrics do not regress; Engram tables stay on disk but hot rows may be cached resident on the device with async prefetch of the next position | Evidence: b68 measured routed MoE at 78% of device time from the one-reducer-per-column serial-K schedule forced by twin-bit-parity; the 4B layer map measured 12 launches + 12 implicit cuCtxSynchronize and 34 alloc/free per ordinary layer at HEAD; the 4A Engram analysis measured +68.2 ms/token (4.8% of the 1407.9 ms lean step; +16-35 ms per Engram layer) and the earlier Engram rule claimed disk is not a bottleneck. This decision is explicitly NOT a response to a failing measurement: the rule-2 change addresses the measured speed blocker, and the rule-4 change follows the measured Engram cost; D39 rules 1 and 3 are unchanged. The brief that asked for this called it D50, but D50 is already the drafter-unification decision, so the amendment is recorded as D51 |
+| D52 | Interim acceptance-criteria relaxation (2026-10-21, Lead on user direction): the decode-mode vLLM recapture and the D41/option-B bar programme are parked; interim acceptance is a measured performance improvement with byte-identical logits/token evidence where the path still has it; no token-accuracy, tok/s or gate claim is made; D39/D49/D50/D51 stay in force; revisit on explicit user request | The decode-recapture window was judged a poor use of four-node time against the remaining performance work; the frozen D41 record (m1y32 7/10) and its oracle/comparator are untouched, so nothing is re-frozen or loosened by this decision |
 
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
@@ -1889,7 +1891,7 @@ compile both translation units.
 
 **Evidence and scope.** The new cubin is compiled by the pinned toolkit (nvcc V13.0.88,
 cuda_13.0.r13.0/compiler.36424714_0, `-arch=sm_121a`), 13,000 B, sha256
-`0e602daf6f2a51f027f3a924aaa503fada7db14610b94114439c659be4150cfe`,
+`6b237e6c20301ddeda7f47ff9add5385a19e789d818388c5eb22981f1af5377e`,
 `ptx_membar_lines=0`. It is a deliberate re-pin: `baseline/kernel_baseline.txt` now has **ten**
 entries (its header and the pin tests are updated with it), `build.rs`'s `PROBED_KERNELS` table
 probes ten sources and the combined probe compiles all ten, and `cuda_driver::KernelId` gained
@@ -2869,3 +2871,121 @@ random-token draft path is not a measurement source, and a serving surface that 
 metric while `accepted_prediction_tokens` is synthetic is a defect fixed by this entry. The
 batch-19 wiring plan (docs/investigations/mtp-dspark-device-wiring.md) is the implementation
 argument; no device number is claimed here.
+
+## D51 - D39 amendments: performance-kernel tolerance rule (rule 2's exactness clause) and Engram residency (rule 4)
+
+Recorded 2026-10-21 (Lead, on the user's steering brief of the same day). This entry AMENDS D39 in two
+places and leaves D39 rules 1 and 3 untouched. It is explicitly **not a response to a failing
+measurement**: the rule-2 amendment addresses a measured speed blocker, and the rule-4 amendment follows
+from a measured Engram cost. The D41 bars are a separate decision (the decode-mode recapture and the
+option-B proposal) and are not touched here.
+
+Numbering note: the brief asked for this as "D50", but D50 is already the drafter-unification decision
+(above), so the amendment is recorded as D51.
+
+### Amendment A - rule 2's exactness clause: bit-exactness is the reference arm's contract, not every kernel's
+
+What D39 rule 2 said: acceptance is a tolerance check against vLLM, but the team additionally read
+"per-stage exactness against the arithmetic twin" as requiring every performance kernel to be
+bit-identical to its CPU twin, including the serial ascending-K fold.
+
+Why that reading is amended (measured):
+
+- The routed MoE kernels were 78% of device time in b68 because the serial ascending-K schedule forced
+  one reducer thread per column; that schedule exists only to preserve the bit-identical fold.
+- The kernel rewrite already reverted to preserve bit parity: the warp-tree router reduction was reverted
+  for the same reason (kernel-occupancy-inventory, m2-critical-path-profile-20261021).
+- The path to the 66.7 ms M2 budget (m2-execution-plan-20261021) requires split-K, warp-shuffle
+  reductions, grouped GEMV/MMA and fusions; every one of those reassociates a reduction.
+- D39 itself already accepts numeric tolerance against vLLM (rule 2's first half and rule 3); the
+  bit-parity-against-our-own-twin constraint was self-imposed and is not required by the trained model.
+
+New rule:
+
+1. **Bit-exactness applies to the reference arm only.** The currently pinned bit-exact kernels stay
+   exactly as they are, behind a flag, as the regression anchor (D49 pins remain valid for them and are
+   re-pinned per the standing kernel rule).
+2. **A performance kernel must keep the same quantisation as D39 rule 1** (E4M3/FP4 inputs, ue8m0
+   scales, f32 accumulation, same model arithmetic) but **may change the reduction order** (warp
+   shuffles, tree reductions, split-K, grouped GEMV/MMA, fused epilogues).
+3. **Per-kernel tolerance check against the twin.** Each performance kernel must declare and pass a
+   measured per-kernel tolerance against the arithmetic twin (the tolerance and the measured deviation
+   are recorded with the kernel's harness/evidence; a tolerance is never inferred from a pass).
+4. **No D41 regression.** Every performance merge runs the oracle suite; if the D41 metrics get worse on
+   the suite the change is rejected, not shipped behind a flag.
+5. **Default path and reference path are separate.** A perf kernel is wired default-on only after its
+   tolerance row and the oracle-suite row are recorded; until then it stays behind a flag.
+
+Reordering an f32 sum does not change which model is computed, so this stays inside the spirit of D39
+rule 1. Reverting D39 rule 1 or rule 3 is explicitly not approved: native arithmetic stays, vLLM stays
+the behavioural oracle, and D37's token-equality bar does not come back.
+
+### Amendment B - rule 4: Engram tables stay on disk, but a resident hot-row cache plus async prefetch is allowed
+
+What D39 rule 4 said: Engram weights stay disk-offloaded, and the drive is fast enough that this is not a
+performance bottleneck.
+
+Why that is amended (measured): the 4A analysis (analysis/engram-4a-20261021/ANALYSIS.md) measured the
+two Engram layers at +22.1 ms (layer 1) and +46.1 ms (layer 14) = **+68.2 ms/token = 4.84% of the
+1407.9 ms lean decode step** (+16-35 ms per Engram layer in the earlier windows). Per call the seam reads
+157,521,920 B; the cost is re-reading the same ~150 MiB matrix, not the 188.8 GiB tables (table rows are
+1.75 MB/run, 0.004%). At the 66.7 ms M2 budget this is most of the headroom.
+
+New rule:
+
+1. The full Engram table stays on disk/offloaded; it is never fully materialised on the device.
+2. A **resident cache of hot rows on the device** is allowed, with a measured hit/miss accounting.
+3. **Async prefetch of the next position's rows** during the current step is allowed; the page index is
+   known one step ahead.
+4. Any cache/prefetch change must keep the byte-identity acceptance of the current path (logits bin sha
+   plus per-layer/stream shas) until a declared tolerance arm replaces it under Amendment A's rules.
+5. **Measured bar:** Engram overhead under 2 ms/step at the M3 milestone (25 ms/step); at M2 it must not
+   count for more than 10% of the step.
+
+### Consequence
+
+- Kernel work is unblocked by decision: split-K/warp-tree/grouped-GEMV/fused MoE schedules may proceed
+  behind a flag, each with a per-kernel tolerance row and an oracle-suite no-regression row; the pinned
+  bit-exact kernels remain the reference arm.
+- The Engram residency/prefetch work is unblocked under the measured bar, with byte-identity acceptance.
+- No acceptance bar, oracle, comparator, contract or frozen QA record changes under this decision; the
+  D41 bars are handled by the separate decode-mode recapture and option-B proposal.
+
+## D52 - Interim acceptance-criteria relaxation
+
+Date: 2026-10-21. Owner: Lead, on direct user direction ("This is not a good use of time imo. ... Your
+criteria are perhaps too strict for the time being"). Status: in force until the user asks for gate work.
+
+### Context
+
+The D41 acceptance programme (decode-mode vLLM recapture, option-B bars derived from a measured floor,
+frozen comparator, boundary annex) was fully planned and the four-node window was staged: a capture vLLM
+recipe (DSpark off, max-num-seqs 1, max-logprobs 1000, max-model-len 1048576, dtype bfloat16) rendered
+and dry-run clean. The user parked it: against the remaining distance to M2/M3/M4 the window is not
+where the time should go, and the strictness of the gate criteria is not where the leverage is today.
+
+### Decision
+
+1. The vLLM decode-recapture window is **parked**, not cancelled: QA's record, runner, comparator and
+   proposal stay exactly as they are (status proposal), no bar is declared or frozen, no frozen record
+   is touched.
+2. Interim acceptance for device work is: a **measured performance improvement** (same argv, same
+   fixture, same nodes, with the run-to-run band stated) plus **byte-identical logits/token evidence**
+   (logits .jsonl.bin sha and tokens) whenever the change did not deliberately enter a tolerance arm.
+3. No token-accuracy, tok/s, TTFT or gate-validity claim is made from an interim row; a row is a perf
+   row, not a gate row, and any document says so.
+4. D39, D49, D50 and D51 remain in force unchanged. In particular the D51 per-kernel tolerance rule,
+   split-K behind its flag, and the byte-identity requirement of the current token path are not relaxed.
+5. This decision ends when the user asks for the gate programme again; the first step then is QA's
+   parked RUN-WINDOW record with the four-node capture window.
+
+### Consequence
+
+- The measured kernel-batch merge into win/m1w25 (12ce6678) is accepted on rule 2: lean step
+  1202.2 ms vs same-kit base 1323.3/1378.3 ms and default 1807.2 ms vs 1902.8 ms, all rows with the same
+  logits sha aed6054d... and the same 9 tokens on 4/4 ranks.
+- P0 final table still needs its probe-v2 row for the per-block kernel/host split; that is measurement,
+  not a gate, so it proceeds under this decision.
+- Nothing in the D41 files, the old m1y32 record, the annotation, SUPP-001, the oracle or the comparator
+  changes.
+

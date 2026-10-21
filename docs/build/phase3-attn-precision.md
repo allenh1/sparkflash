@@ -117,8 +117,8 @@ Toolkit and flags are the repository's: nvcc `V13.0.88` (CUDA 13.0.3), `-std=c++
 
 | kernel | cubin bytes | cubin sha256 | PTX membar lines |
 | :--- | ---: | :--- | ---: |
-| `b12x_bf16a_mxfp8w_dense_sm121` | 11,736 | `3f296ae204be37c9f6099bba8c94d77b50871dcb8bba3d245a44fdc55df23684` | 0 |
-| `b12x_bf16a_mxfp8w_wo_a_sm121` | 8,976 | `99bcd7ccd7e8f6993fb9070381d94bcef3d527c353ad2f2417e561e528fbcc08` | 0 |
+| `b12x_bf16a_mxfp8w_dense_sm121` | 11,736 | `a2e0a63c8b78e3fe9117d7c12b06353bbc46af7c16019cf71e572c93806eff7e` | 0 |
+| `b12x_bf16a_mxfp8w_wo_a_sm121` | 8,976 | `d11a8610ff557617116c437b0bc7a0367f66a8069ccfc97373433ebd99ffd249` | 0 |
 
 Every pre-existing pin is unchanged by this batch (the same toolkit recompiled it to the same
 bytes), which is the check that the edit did not perturb a kernel that was already pinned.

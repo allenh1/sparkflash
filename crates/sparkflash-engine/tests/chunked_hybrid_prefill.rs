@@ -325,6 +325,7 @@ fn compare_chunk_with_token_loop(config: ModelConfig, tokens: &[u32], coded: boo
             chunk_backend
                 .as_mut()
                 .map(|backend| backend as &mut dyn MoeDeviceBackend),
+            &[],
             &mut progress,
         )
         .expect("chunked hybrid step");

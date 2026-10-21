@@ -2233,6 +2233,7 @@ dependencies = [
  "sparkflash-scheduler",
  "sparkflash-trace",
  "tempfile",
+ "tokenizers",
  "tokio",
  "tracing",
  "tracing-subscriber",

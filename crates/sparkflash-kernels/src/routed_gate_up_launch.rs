@@ -6,13 +6,13 @@
 //! count and the two trace words - so the only way to fill a word wrongly is to fill a field
 //! wrongly, and the fields are named.
 //!
-//! Geometry. One thread block computes one routed (token, slot) row's 256-column output tile, so the
-//! grid is `(tokens * top_k, ceil(640 / 256) = 3)` blocks of [crate::routed_gate_up_abi::THREADS]
-//! threads: 18 blocks for one token's six slots, and 780 x 3 blocks for a 130-token batch.
-//! The third tile covers columns 512..639; the kernel computes 512..575 and writes 576..639 as exactly
-//! zero, and it guards both the routed-row and the column range, so a full batch needs no padding
-//! logic in the caller. The launcher still refuses `tokens == 0` rather than handing the driver a
-//! zero grid. Expert ids are a caller contract the launcher cannot validate (the argument list has
+//! Geometry. One thread block computes one routed (token, slot) row's 32-column output tile with 32
+//! reducer columns x 8 parallel K groups, so the grid is `(tokens * top_k, ceil(640 / 32) = 20)`
+//! blocks of [crate::routed_gate_up_abi::THREADS] threads: 120 blocks for one token's six slots, and
+//! 780 x 20 blocks for a 130-token batch. The twentieth tile covers columns 608..639, of which the
+//! kernel computes none (576..639 are padding) and writes all 32 as exactly zero; it guards both the
+//! routed-row and the column range, so a full batch needs no padding logic in the caller. The
+//! launcher still refuses `tokens == 0` rather than handing the driver a zero grid. Expert ids are a caller contract the launcher cannot validate (the argument list has
 //! no expert count): the twin panics on an out-of-range id, and the harness generates ids inside
 //! the resident set.
 //!
@@ -161,9 +161,9 @@ mod tests {
     #[test]
     fn the_geometry_is_a_block_per_routed_row_tile() {
         assert_eq!(BLOCK, (256, 1, 1));
-        assert_eq!(grid(1), Ok((6, 3, 1)));
-        assert_eq!(grid(8), Ok((48, 3, 1)));
-        assert_eq!(grid(130), Ok((780, 3, 1)));
+        assert_eq!(grid(1), Ok((6, 20, 1)));
+        assert_eq!(grid(8), Ok((48, 20, 1)));
+        assert_eq!(grid(130), Ok((780, 20, 1)));
         assert_eq!(routed_rows(8), 48);
         assert!(
             grid(0).is_err(),

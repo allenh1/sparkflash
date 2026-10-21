@@ -104,9 +104,9 @@ use sparkflash_kernels::mxfp8_ref;
 /// The cubin name in the baseline manifest (the nvcc source stem).
 const KERNEL: &str = "b12x_mxfp8_dense_sm121";
 /// The pinned cubin size, from baseline/kernel_baseline.txt through baseline::pin.
-const PIN_BYTES: usize = 190_400;
+const PIN_BYTES: usize = 209_424;
 /// The pinned cubin sha256, from the same manifest.
-const PIN_SHA256: &str = "06dc726f32af699997f93cda24394855b33aba1fea410609162e32f0b0600850";
+const PIN_SHA256: &str = "d751f2b65b076659ff0c4cc37542f8ae4899ec61b7f40c3d8223ba3181f9d350";
 /// The pinned PTX membar-line count: the scalar dense path carries no fence.
 const PIN_MEMBAR_LINES: u32 = 0;
 /// The released attention RMS normalisation epsilon (q_norm), as the reference uses it.

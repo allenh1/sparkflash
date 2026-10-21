@@ -97,9 +97,12 @@
 // the milestone-5 integration that loads real weights and prefetches them.
 // src/mxfp4_ref.rs::check_moe_layout is the Rust-side rejection of any other layout.
 
-// One block per (token, d-tile); one output element per thread.
-#define SPARK_M4_MOE_TILE_D 256u
-#define SPARK_M4_MOE_THREADS 256u
+// One block per (token, 32-value d-tile): 32 output columns x 8 parallel K groups. The eight
+// groups split the 20 ascending block partials the reference folds serially; the reducer re-adds
+// them in ascending block order, so the split is a schedule change and not an arithmetic one.
+#define SPARK_M4_MOE_TILE_D 32u
+#define SPARK_M4_MOE_K_GROUPS 8u
+#define SPARK_M4_MOE_THREADS (SPARK_M4_MOE_TILE_D * SPARK_M4_MOE_K_GROUPS)
 // The reduction walks the padded width in whole MX blocks.
 #define SPARK_M4_MOE_K_BLOCKS (SPARK_M4_MOE_WIDTH_PADDED / SPARK_M4_QUANT_BLOCK)
 // The A operand is FP8 E4M3, one byte per value (D14). This is the pin that keeps a packed E2M1
@@ -116,7 +119,11 @@
 static_assert(SPARK_M4_MOE_WIDTH_PADDED % SPARK_M4_QUANT_BLOCK == 0u, "the padded width tiles by 32");
 static_assert(SPARK_M4_MOE_K_BLOCKS == 20u, "640 values are 20 MX blocks");
 static_assert(SPARK_M4_HIDDEN % SPARK_M4_MOE_TILE_D == 0u, "the hidden dimension tiles evenly");
-static_assert(SPARK_M4_MOE_THREADS == SPARK_M4_MOE_TILE_D, "one output element per thread");
+static_assert(SPARK_M4_MOE_THREADS == 256u, "the block is 32 columns x 8 parallel K groups");
+static_assert(SPARK_M4_MOE_TILE_D * SPARK_M4_MOE_K_GROUPS == SPARK_M4_MOE_THREADS,
+              "one thread per (column, K group)");
+static_assert(SPARK_M4_MOE_TOP_K * SPARK_M4_MOE_TILE_D <= SPARK_M4_MOE_THREADS,
+              "one reducer thread per (slot, column)");
 static_assert(SPARK_M4_MOE_TOP_K * SPARK_M4_QUANT_BLOCK == 192u, "six slots of 32 values");
 // The fp4 expert scale grid is the checkpoint's [out, in/32]: one scale per output row per 32
 // values along K, which is SPARK_B12X_KTILE values per scale, so the row stride must be exactly
@@ -156,16 +163,26 @@ extern "C" __global__ void b12x_mxfp4_moe_sm121(
     const uint32_t layer_id,
     const uint64_t step_seq) {
     const uint32_t token = blockIdx.x;
-    const uint32_t lane = threadIdx.x;
-    const uint32_t column = blockIdx.y * SPARK_M4_MOE_TILE_D + lane;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t col_local = tid % SPARK_M4_MOE_TILE_D;
+    const uint32_t group = tid / SPARK_M4_MOE_TILE_D;
+    const uint32_t column = blockIdx.y * SPARK_M4_MOE_TILE_D + col_local;
     const uint32_t packed_width = SPARK_M4_MOE_WIDTH_PADDED / SPARK_M4_FP4_PER_BYTE;
     const uint32_t scale_width = SPARK_M4_MOE_WIDTH_PADDED / SPARK_M4_QUANT_BLOCK;
     const uint64_t act_row_bytes = SPARK_M4_MOE_ACT_BYTES_PER_ROW;
+    const bool live = token < tokens;
 
     uint64_t t_enter = 0u;
     SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_MOE_MXFP4, t_enter);
 
-    if (token < tokens && column < SPARK_M4_HIDDEN) {
+    // This K group's scaled block partials: [slot][block][column-within-tile]. A 32-value block
+    // partial product is independent of every other block's, so splitting the 20 ascending blocks
+    // of the K chain across the eight groups removes the per-thread serial chain without moving a
+    // rounding: the reducer below still folds the 20 scaled partials in strictly ascending block
+    // order, with the same two exact power-of-two multiplies and one rounded add per block.
+    __shared__ float terms[SPARK_M4_MOE_TOP_K][SPARK_M4_MOE_K_BLOCKS][SPARK_M4_MOE_TILE_D];
+
+    if (live) {
         const uint64_t routed_row = ((uint64_t)token * SPARK_M4_MOE_TOP_K);
         for (uint32_t slot = 0; slot < (uint32_t)SPARK_M4_MOE_TOP_K; ++slot) {
             const uint32_t expert = expert_ids[routed_row + slot];
@@ -179,8 +196,8 @@ extern "C" __global__ void b12x_mxfp4_moe_sm121(
             const uint8_t *w_scale_row = w_scales + spark_b12x_row_scale_index(
                                                        expert * SPARK_M4_HIDDEN + column, 0u,
                                                        SPARK_M4_MOE_WIDTH_PADDED);
-            float acc = 0.0f;
-            for (uint32_t block = 0; block < SPARK_M4_MOE_K_BLOCKS; ++block) {
+            for (uint32_t block = group; block < (uint32_t)SPARK_M4_MOE_K_BLOCKS;
+                 block += (uint32_t)SPARK_M4_MOE_K_GROUPS) {
                 const uint32_t base = block * SPARK_M4_QUANT_BLOCK;
                 const float act_scale = spark_ue8m0_decode(act_scale_row[block]);
                 const float w_scale = spark_ue8m0_decode(w_scale_row[block]);
@@ -189,36 +206,55 @@ extern "C" __global__ void b12x_mxfp4_moe_sm121(
                 // (kernel.py:538-540), and the two scales are applied to the PARTIAL PRODUCT rather
                 // than to the operands (kernel.py:552-553).
                 float partial = 0.0f;
-                for (uint32_t i = 0; i < SPARK_M4_QUANT_BLOCK; ++i) {
+#pragma unroll
+                for (uint32_t b = 0u; b < SPARK_M4_QUANT_BLOCK / 2u; ++b) {
                     // The padded region of the activation contributes zero by construction: the
                     // mask below, not the caller, is what enforces it.
-                    const uint32_t index = base + i;
+                    uint32_t index = base + 2u * b;
+                    const uint8_t packed = w_row[index / 2u];
                     const float act_value = index < (uint32_t)SPARK_M4_MOE_WIDTH
                                                 ? spark_fp8_e4m3_decode(act_row[index])
                                                 : 0.0f;
-                    // The FP4 -> FP8 cast is exact on all sixteen E2M1 codes, so this round trip is
-                    // the identity; it is written out because it is what kernel.py:538-540 does, and
-                    // src/mxfp4_ref.rs enumerates the codes to prove the identity rather than assume
-                    // it. The cast produces the value the MMA consumes, exactly as the reference.
-                    const float w_value = spark_fp8_e4m3_decode(
-                        spark_fp8_e4m3_encode(spark_fp4_load(w_row, index)));
-                    partial += act_value * w_value;
+                    const float w0 = spark_fp4_e2m1_decode(spark_fp4_low_nibble(packed));
+                    partial += act_value * w0;
+                    index += 1u;
+                    const float a1 = index < (uint32_t)SPARK_M4_MOE_WIDTH
+                                         ? spark_fp8_e4m3_decode(act_row[index])
+                                         : 0.0f;
+                    const float w1 = spark_fp4_e2m1_decode(spark_fp4_high_nibble(packed));
+                    partial += a1 * w1;
                 }
-                acc += (partial * act_scale) * w_scale;
+                // The reference's block term: both scales are powers of two, so these two multiplies
+                // are exact and this is the same value the serial kernel's block term had. The
+                // explicit intrinsics pin the twin's separate-rounding contract (src/mxfp4_ref.rs
+                // multiplies, multiplies, then adds) independently of nvcc's -fmad default.
+                terms[slot][block][col_local] =
+                    __fmul_rn(__fmul_rn(partial, act_scale), w_scale);
             }
-            // The rank partial is accumulated in f32 and NOT rounded: the f32 sum over the four
-            // ranks is the expert's output, and the one bf16 rounding of that output belongs to the
-            // native epilogue (model.py:899-903), after every rank has contributed. The accumulator
-            // is laid out [tokens][top_k][d], one f32 per expert output element; one block covers
-            // one 256-value tile of one token's hidden row, so every element it writes is written
-            // by exactly one thread of exactly one block (no intra-launch race), and the four rank
-            // launches are serialized by the caller.
-            slot_acc[((uint64_t)token * SPARK_M4_MOE_TOP_K + slot) * SPARK_M4_HIDDEN + column] += acc;
         }
     }
     __syncthreads();
 
-    if (lane == 0u) {
+    // One reducer thread per (slot, output element) folds the slot's 20 scaled block partials in
+    // strictly ascending block order - the reference's only ordered arithmetic - and adds the rank
+    // partial into the f32 slot accumulator, unrounded, exactly as the serial kernel did. One
+    // reducer owns each (slot, column), so the accumulator is still written by exactly one thread.
+    const uint32_t reducers = (uint32_t)SPARK_M4_MOE_TOP_K * SPARK_M4_MOE_TILE_D;
+    if (tid < reducers) {
+        const uint32_t slot = tid / SPARK_M4_MOE_TILE_D;
+        const uint32_t col = tid % SPARK_M4_MOE_TILE_D;
+        const uint32_t out_column = blockIdx.y * SPARK_M4_MOE_TILE_D + col;
+        if (live && out_column < (uint32_t)SPARK_M4_HIDDEN) {
+            float acc = 0.0f;
+            for (uint32_t block = 0; block < (uint32_t)SPARK_M4_MOE_K_BLOCKS; ++block) {
+                acc = __fadd_rn(acc, terms[slot][block][col]);
+            }
+            slot_acc[((uint64_t)token * SPARK_M4_MOE_TOP_K + slot) * SPARK_M4_HIDDEN + out_column] += acc;
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0u) {
         // payload_meta: one f32 per (slot, output element) of this block's tile.
         const uint32_t meta = SPARK_M4_MOE_TILE_D * SPARK_M4_MOE_TOP_K * 4u;
         SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_MOE_MXFP4, layer_id, meta, t_enter);

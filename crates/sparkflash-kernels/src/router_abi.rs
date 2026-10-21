@@ -68,9 +68,9 @@ pub const ARG_WORDS: usize = 10;
 pub const TOPK_ARG_WORDS: usize = 8;
 
 /// Pinned cubin size, measured with nvcc V13.0.88 (CUDA 13.0.3) for sm_121a.
-pub const CUBIN_BYTES: usize = 25_432;
+pub const CUBIN_BYTES: usize = 27_376;
 /// Pinned cubin sha256, from the same measurement.
-pub const CUBIN_SHA256: &str = "42f6bbdcc6cf26890f2f0b1a24718e65da4ff0d0bedee7bca9a4598018b688cc";
+pub const CUBIN_SHA256: &str = "3b8823e84158e2956b19509e90f6aed02dbe68235c1a7f5d76ab438c51e53eb0";
 /// PTX membar lines in the pinned PTX: the kernel emits none (no fence, no acquire).
 pub const CUBIN_MEMBAR_LINES: usize = 0;
 /// The toolkit the pin was measured with.
@@ -285,10 +285,10 @@ mod tests {
             expected,
             "the manifest entry must be the pinned cubin"
         );
-        // The header count and toolkit are part of the same claim: nineteen entries, this toolkit.
+        // The header count and toolkit are part of the same claim: twenty entries, this toolkit.
         assert!(
-            BASELINE.contains("nineteen baseline kernels"),
-            "the manifest header must say nineteen"
+            BASELINE.contains("twenty baseline kernels"),
+            "the manifest header must say twenty"
         );
         assert!(BASELINE.contains(&format!("nvcc_release={TOOLKIT_RELEASE}")));
         assert!(BASELINE.contains("arch=sm_121a"));

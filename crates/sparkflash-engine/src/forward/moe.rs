@@ -1137,6 +1137,161 @@ pub fn add_shared_expert(
     Ok(())
 }
 
+/// The f32 reference shared-expert rows, written into a caller buffer instead of added into out.
+///
+/// [add_shared_expert] is the fused default arm; this seam exists because the native-rounding
+/// evidence has to hash the row and compare the released rounding arm against the f32 one without
+/// changing what the default arm computes. The rows are exactly the values [add_shared_expert]
+/// adds, written with assignment instead of the final add.
+pub fn shared_expert_rows(
+    cfg: &ModelConfig,
+    prefix: &str,
+    x: &[f32],
+    src: &dyn WeightSource,
+    limit: usize,
+    scratch: &mut MoeScratch,
+    rows: &mut [f32],
+) -> Result<(), EngineError> {
+    let dim = cfg.dim;
+    if dim == 0 || !x.len().is_multiple_of(dim) || rows.len() != x.len() {
+        return Err(shape_error(
+            "the shared-expert rows",
+            format!(
+                "dim {dim}, {} input values and {} row slots do not describe whole tokens",
+                x.len(),
+                rows.len()
+            ),
+        ));
+    }
+    let tokens = x.len() / dim;
+    let shared = scratch.read_expert(cfg, src, prefix, ExpertBody::Shared, limit, None)?;
+    for token in 0..tokens {
+        expert_body(
+            cfg,
+            &x[token * dim..(token + 1) * dim],
+            &shared,
+            1.0,
+            &mut scratch.gate_branch,
+            &mut scratch.up_branch,
+            &mut scratch.expert_out,
+        )?;
+        rows[token * dim..(token + 1) * dim].copy_from_slice(&scratch.expert_out[..dim]);
+    }
+    Ok(())
+}
+
+/// One released native Linear over the shared expert's coded FP8 store (model.py:181-204,
+/// 210-236): the activation is FP8-E4M3 with one E8M0 scale per 32 values, the accumulation is
+/// f32 against the coded weight, and the output is BF16. The input must already hold the stream's
+/// BF16 values; only the released F8-E4M3 32x32 store is accepted.
+fn native_linear(
+    weight: &WeightView<'_>,
+    x: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    cols: usize,
+) -> Result<(), EngineError> {
+    let released_store = matches!(
+        weight,
+        WeightView::Coded { dtype, grid, .. }
+            if *dtype == DType::F8E4M3 && *grid == ScaleGrid::Block32
+    );
+    if !released_store {
+        return Err(shape_error(
+            "the native shared expert",
+            "the released shared Expert stores F8-E4M3 weights with 32x32 E8M0 block scales (model.py:26-32, 210-236); this source does not".to_owned(),
+        ));
+    }
+    let quantised = crate::quant::quantize_activation_fp8(x)?;
+    let dequantised = quantised.dequantize();
+    weight.matmul(out, &dequantised, rows, cols, 1)?;
+    for value in out.iter_mut() {
+        *value = crate::quant::bf16_round(*value);
+    }
+    Ok(())
+}
+
+/// Adds the released native shared expert (model.py:887, 903, 841-851).
+///
+/// The shared Expert's storage dtype is the default F8-E4M3 with a 32x32 E8M0 grid, so every
+/// Linear quantises its activation to FP8 with ue8m0 scales, accumulates in f32 and returns BF16;
+/// the SwiGLU clamps follow [ModelConfig::swiglu_limit] and the SwiGLU activation is BF16 before
+/// the down projection (model.py:845-850). The row added here is therefore a BF16 row - the addend
+/// the released MoE adds before its own single output round - which is why the combine arm can
+/// consume it directly.
+pub fn add_shared_expert_native(
+    cfg: &ModelConfig,
+    prefix: &str,
+    x: &[f32],
+    src: &dyn WeightSource,
+    limit: usize,
+    scratch: &mut MoeScratch,
+    out: &mut [f32],
+) -> Result<(), EngineError> {
+    let dim = cfg.dim;
+    if dim == 0 || !x.len().is_multiple_of(dim) || out.len() != x.len() {
+        return Err(shape_error(
+            "the native shared-expert seam",
+            format!(
+                "dim {dim}, {} input values and {} output values do not describe whole tokens",
+                x.len(),
+                out.len()
+            ),
+        ));
+    }
+    let tokens = x.len() / dim;
+    let shared = scratch.read_expert(cfg, src, prefix, ExpertBody::Shared, limit, None)?;
+    let inter = shared.inter;
+    if inter > scratch.gate_branch.len() || inter > scratch.up_branch.len() {
+        return Err(shape_error(
+            "the native shared expert",
+            format!("an intermediate width of {inter} does not fit the scratch"),
+        ));
+    }
+    let mut stream = vec![0.0f32; dim];
+    let mut activation = vec![0.0f32; inter];
+    for token in 0..tokens {
+        let input = &x[token * dim..(token + 1) * dim];
+        for (slot, value) in stream.iter_mut().zip(input) {
+            *slot = crate::quant::bf16_round(*value);
+        }
+        native_linear(
+            &shared.w1,
+            &stream,
+            &mut scratch.gate_branch[..inter],
+            inter,
+            dim,
+        )?;
+        native_linear(
+            &shared.w3,
+            &stream,
+            &mut scratch.up_branch[..inter],
+            inter,
+            dim,
+        )?;
+        swiglu(
+            cfg,
+            &mut scratch.gate_branch[..inter],
+            &scratch.up_branch[..inter],
+        )?;
+        for (slot, value) in activation.iter_mut().zip(&scratch.gate_branch[..inter]) {
+            *slot = crate::quant::bf16_round(*value);
+        }
+        native_linear(
+            &shared.w2,
+            &activation,
+            &mut scratch.expert_out[..dim],
+            dim,
+            inter,
+        )?;
+        let row = &mut out[token * dim..(token + 1) * dim];
+        for (accumulated, value) in row.iter_mut().zip(&scratch.expert_out[..dim]) {
+            *accumulated += *value;
+        }
+    }
+    Ok(())
+}
+
 /// One contiguous run of a routed expert in the expert-major choice order:
 /// `(expert, first_choice, end_choice)`.
 type ChoiceGroup = (usize, usize, usize);
@@ -2019,6 +2174,319 @@ mod tests {
         for (column, value) in out.iter().enumerate().skip(1) {
             assert_eq!(*value, 2.0, "column {column} must keep its routed value");
         }
+    }
+
+    /// The independent release reference for one native Linear (model.py:181-204, 210-236):
+    /// decode the coded weight, quantise the BF16 activation to FP8 with ue8m0 block scales,
+    /// accumulate in ascending columns in f32, round the output row to BF16.
+    fn reference_native_linear(
+        source: &Hand,
+        base: &str,
+        x_bf16: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Vec<f32> {
+        let (_, _, codes) = source
+            .tensors
+            .get(&format!("{base}.weight"))
+            .expect("the fixture holds the coded weight");
+        let (_, _, scales) = source
+            .tensors
+            .get(&format!("{base}.scale"))
+            .expect("the fixture holds the block scales");
+        let quantised = quant::quantize_activation_fp8(x_bf16).expect("the activation quantises");
+        let mut activation = Vec::with_capacity(cols);
+        for (block, scale) in quantised.scales().iter().enumerate() {
+            let scale = quant::f8e8m0_to_f32(*scale);
+            for code in &quantised.codes()[block * 32..(block + 1) * 32] {
+                activation.push(quant::f8e4m3_to_f32(*code) * scale);
+            }
+        }
+        let scale_cols = cols.div_ceil(32);
+        (0..rows)
+            .map(|row| {
+                let mut acc = 0.0f32;
+                for col in 0..cols {
+                    let weight = quant::f8e4m3_to_f32(codes[row * cols + col])
+                        * quant::f8e8m0_to_f32(scales[(row / 32) * scale_cols + col / 32]);
+                    acc += activation[col] * weight;
+                }
+                quant::bf16_round(acc)
+            })
+            .collect()
+    }
+
+    /// The independent release reference for the shared Expert (model.py:843-851): BF16 stream,
+    /// two clamped SwiGLU branches, one BF16 round before the down projection, BF16 output.
+    fn reference_native_shared(
+        cfg: &ModelConfig,
+        source: &Hand,
+        prefix: &str,
+        x: &[f32],
+    ) -> Vec<f32> {
+        let dim = cfg.dim;
+        let inter = cfg.moe_inter_dim * cfg.n_shared_experts.max(1);
+        let base = format!("{prefix}.ffn.shared_experts");
+        let stream: Vec<f32> = x.iter().copied().map(quant::bf16_round).collect();
+        let gate = reference_native_linear(source, &format!("{base}.w1"), &stream, inter, dim);
+        let up = reference_native_linear(source, &format!("{base}.w3"), &stream, inter, dim);
+        let limit = cfg.swiglu_limit as f32;
+        let activation: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(gate, up)| {
+                let gate = if limit > 0.0 { gate.min(limit) } else { *gate };
+                let up = if limit > 0.0 {
+                    up.clamp(-limit, limit)
+                } else {
+                    *up
+                };
+                quant::bf16_round(linalg::silu(gate) * up)
+            })
+            .collect();
+        reference_native_linear(source, &format!("{base}.w2"), &activation, dim, inter)
+    }
+
+    /// A deterministic coded shared-expert store: the three released F8-E4M3 32x32 weights.
+    fn coded_shared(cfg: &ModelConfig, prefix: &str) -> Hand {
+        let dim = cfg.dim;
+        let inter = cfg.moe_inter_dim * cfg.n_shared_experts.max(1);
+        let values = |rows: usize, cols: usize, seed: usize| -> Vec<f32> {
+            (0..rows * cols)
+                .map(|index| 0.01 + 0.001 * ((index * 7 + seed * 13) % 23) as f32)
+                .collect()
+        };
+        Hand::default()
+            .dense(
+                &format!("{prefix}.ffn.shared_experts.w1"),
+                inter,
+                dim,
+                &values(inter, dim, 1),
+            )
+            .dense(
+                &format!("{prefix}.ffn.shared_experts.w3"),
+                inter,
+                dim,
+                &values(inter, dim, 2),
+            )
+            .dense(
+                &format!("{prefix}.ffn.shared_experts.w2"),
+                dim,
+                inter,
+                &values(dim, inter, 3),
+            )
+    }
+
+    /// One deterministic input row over the hidden width.
+    fn input_row(dim: usize, seed: usize) -> Vec<f32> {
+        (0..dim)
+            .map(|index| 0.25 + 0.01 * ((index + seed) % 17) as f32)
+            .collect()
+    }
+
+    /// The recorded f32 shared rows are exactly what the unchanged seam adds, so the epilogue can
+    /// hash the row it already computes without moving the default arm's bytes.
+    #[test]
+    fn the_recorded_shared_rows_add_to_the_unchanged_seam() {
+        let cfg = ModelConfig::tiny();
+        let dim = cfg.dim;
+        let prefix = "layers.0";
+        let source = coded_shared(&cfg, prefix);
+        let tokens = 2;
+        let mut x = vec![0.0f32; tokens * dim];
+        for token in 0..tokens {
+            x[token * dim..(token + 1) * dim].copy_from_slice(&input_row(dim, token));
+        }
+        let routed: Vec<f32> = (0..tokens * dim)
+            .map(|index| (index % 7) as f32 * 0.25 - 0.5)
+            .collect();
+        let mut scratch = MoeScratch::for_config(&cfg);
+        let mut seam = routed.clone();
+        add_shared_expert(&cfg, prefix, &x, &source, BIG, &mut scratch, &mut seam).unwrap();
+        let mut rows = vec![0.0f32; tokens * dim];
+        shared_expert_rows(&cfg, prefix, &x, &source, BIG, &mut scratch, &mut rows).unwrap();
+        let mut recorded = routed.clone();
+        for (value, row) in recorded.iter_mut().zip(&rows) {
+            *value += *row;
+        }
+        assert_eq!(
+            seam.iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<u32>>(),
+            recorded
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<u32>>(),
+            "the recorded rows must add to the unchanged seam's bytes"
+        );
+        assert!(
+            rows.iter().any(|value| *value != 0.0),
+            "the fixture row is non-zero"
+        );
+    }
+
+    /// The native shared expert is the release arithmetic: BF16 stream, FP8 activation
+    /// quantisation at every Linear, f32 accumulate, BF16 output, the released clamps and the one
+    /// BF16 round before the down projection (model.py:841-851).
+    #[test]
+    fn the_native_shared_expert_is_the_release_arithmetic() {
+        let cfg = ModelConfig::tiny();
+        let dim = cfg.dim;
+        let prefix = "layers.0";
+        let source = coded_shared(&cfg, prefix);
+        let x = input_row(dim, 0);
+        let mut scratch = MoeScratch::for_config(&cfg);
+        let mut native = vec![0.0f32; dim];
+        add_shared_expert_native(&cfg, prefix, &x, &source, BIG, &mut scratch, &mut native)
+            .unwrap();
+        let reference = reference_native_shared(&cfg, &source, prefix, &x);
+        assert_eq!(
+            native
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<u32>>(),
+            reference
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<u32>>(),
+            "the native shared expert must be the independent release reference"
+        );
+        assert!(
+            native.iter().all(|value| value.is_finite()),
+            "the native shared row must be finite"
+        );
+        assert!(
+            native
+                .iter()
+                .all(|value| quant::bf16_round(*value).to_bits() == value.to_bits()),
+            "every native output must be a BF16 value (the released w2 output)"
+        );
+        let mut f32_rows = vec![0.0f32; dim];
+        shared_expert_rows(&cfg, prefix, &x, &source, BIG, &mut scratch, &mut f32_rows).unwrap();
+        assert!(
+            f32_rows
+                .iter()
+                .zip(&native)
+                .any(|(f32_row, native_row)| f32_row.to_bits() != native_row.to_bits()),
+            "the native boundary must change the row (non-vacuous)"
+        );
+    }
+
+    /// The released shared Expert consumes the BF16 stream, so the native seam rounds its input
+    /// first: two inputs that differ only below BF16 resolution must give one row.
+    #[test]
+    fn the_native_shared_expert_treats_its_input_as_a_bf16_stream() {
+        let cfg = ModelConfig::tiny();
+        let dim = cfg.dim;
+        let prefix = "layers.0";
+        let source = coded_shared(&cfg, prefix);
+        let x = input_row(dim, 3);
+        let rounded: Vec<f32> = x.iter().copied().map(quant::bf16_round).collect();
+        assert!(
+            x.iter()
+                .zip(&rounded)
+                .any(|(value, rounded)| value.to_bits() != rounded.to_bits()),
+            "the fixture must exercise the rounding"
+        );
+        let mut scratch = MoeScratch::for_config(&cfg);
+        let mut from_f32 = vec![0.0f32; dim];
+        add_shared_expert_native(&cfg, prefix, &x, &source, BIG, &mut scratch, &mut from_f32)
+            .unwrap();
+        let mut from_bf16 = vec![0.0f32; dim];
+        add_shared_expert_native(
+            &cfg,
+            prefix,
+            &rounded,
+            &source,
+            BIG,
+            &mut scratch,
+            &mut from_bf16,
+        )
+        .unwrap();
+        assert_eq!(
+            from_f32
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<u32>>(),
+            from_bf16
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<u32>>(),
+            "the native seam must consume the BF16 stream, not the f32 bits"
+        );
+    }
+
+    /// The native arm refuses a store that is not the released F8-E4M3 32x32 one: the released
+    /// rounding is only meaningful on the released weight grid.
+    #[test]
+    fn the_native_shared_expert_refuses_a_store_without_the_released_fp8_grid() {
+        let cfg = ModelConfig::tiny();
+        let dim = cfg.dim;
+        let prefix = "layers.0";
+        let inter = cfg.moe_inter_dim * cfg.n_shared_experts.max(1);
+        let mut source = Hand::default();
+        for (leaf, rows, cols) in [("w1", inter, dim), ("w3", inter, dim), ("w2", dim, inter)] {
+            let scales = dense_scale_shape(rows, cols);
+            source = source
+                .with(
+                    &format!("{prefix}.ffn.shared_experts.{leaf}.weight"),
+                    DType::F32,
+                    &[rows, cols],
+                    f32_bytes(&vec![0.5f32; rows * cols]),
+                )
+                .with(
+                    &format!("{prefix}.ffn.shared_experts.{leaf}.scale"),
+                    DType::F8E8M0,
+                    &scales,
+                    unit_scales(scales),
+                );
+        }
+        let x = input_row(dim, 0);
+        let mut scratch = MoeScratch::for_config(&cfg);
+        let mut out = vec![0.0f32; dim];
+        let error =
+            add_shared_expert_native(&cfg, prefix, &x, &source, BIG, &mut scratch, &mut out)
+                .expect_err("an F32 store is refused");
+        assert!(format!("{error}").contains("F8-E4M3"), "{error}");
+    }
+
+    /// The committed m26 capture pins the activation quantiser on a real 20 KiB row: codes and
+    /// scales must reproduce exactly. The shared Expert consumes the BF16 stream, so the native
+    /// boundary rounds first - and that different row is why the captured f32 codes cannot stand
+    /// in for the native activation quantisation.
+    #[test]
+    fn the_captured_m26_row_pins_the_activation_quantiser() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native-rounding");
+        let read = |name: &str| {
+            std::fs::read(dir.join(name)).unwrap_or_else(|error| panic!("read {name}: {error}"))
+        };
+        let pre = read("m26-pre_ffn_hidden.f32");
+        let codes = read("m26-act_fp8.bin");
+        let scales = read("m26-act_scales.bin");
+        let values: Vec<f32> = pre
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
+            .collect();
+        assert_eq!(values.len(), 5120, "the captured row is one hidden row");
+        let quantised =
+            quant::quantize_activation_fp8(&values).expect("the captured row quantises");
+        assert_eq!(quantised.codes(), codes.as_slice(), "the captured codes");
+        assert_eq!(quantised.scales(), scales.as_slice(), "the captured scales");
+        let stream: Vec<f32> = values.iter().copied().map(quant::bf16_round).collect();
+        let native_row = quant::quantize_activation_fp8(&stream).expect("the bf16 row quantises");
+        let differing = native_row
+            .codes()
+            .iter()
+            .zip(quantised.codes())
+            .filter(|(left, right)| left != right)
+            .count();
+        assert!(
+            differing > 0,
+            "the BF16 boundary must change the captured codes"
+        );
     }
 
     /// The SwiGLU clamps follow model.py:845-847: the gate is clamped from above only and the up

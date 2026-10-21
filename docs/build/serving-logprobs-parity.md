@@ -1,5 +1,14 @@
 # Serving logprobs (vLLM parity)
 
+> Update 2026-10-21 (task-15, branch `task/serve-openai-parity`): the one-pass fix this page lists
+> as future work has landed on the reference HTTP path. The engine now returns the LM-head rows of
+> selected positions from the same forward, and the driver scores the prompt in contiguous spans
+> with the payload and bits matched to the retained token-at-a-time reference; the Phase-1 TP=4
+> path still refuses prompt logprobs because its rank prefill returns only the last position's
+> logits. See [prompt-logprobs-one-prefill.md](prompt-logprobs-one-prefill.md). The cost
+> measurements and O(n) statements below are the task-20 historical record, not the current
+> behaviour.
+
 Branch `task/serve-logprobs`, task-20 (S2). Scope: the OpenAI-protocol logprobs surface of the
 SparkFlash serving path, measured against the vLLM image the cluster runs as the behavioural
 oracle. No device code, no engine numerics, no tokenizer work: the HTTP protocol layer and the CPU
@@ -197,7 +206,8 @@ logits from one prefill this becomes one pass; that is the S3 follow-up recorded
   here is tested at the seam with `MockEngine` and on the synthetic plan, where token strings are
   the tokenizer's real decodes for the ids they score.
 * **One pass for prompt logprobs** when the device chain keeps KV and reports all-position logits
-  (S3, task-21).
+  (S3, task-21). **Landed on the reference host path in task-15** (selected prefill rows); the
+  device chain's all-position logits remain window work.
 * **`--max-logprobs` is per-process**: vLLM's flag is also per-request-capable; no per-request
   override exists in the OpenAI protocol, so this is identical.
 * The math is computed on `f32` logits with an `f64` accumulator and then rounded once to `f32`;
@@ -218,8 +228,10 @@ logits from one prefill this becomes one pass; that is the S3 follow-up recorded
 * **`prompt_logprobs` is gated and off by default.** No request gets it unless it asks, and a
   request that asks for no logprobs emits no logprob events at all. Measured cost when it is on: one
   forward pass per prompt token (18.5x TTFT for a 32-token prompt on the synthetic driver, see the
-  cost table above). The one-prefill fix is task-21/S3, so the O(n) path must not be enabled by
-  default anywhere in the serving stack.
+  cost table above; that was the task-20 measurement that motivated the fix). **Task-15 replaced
+  that O(n) path with one pass over the prompt on the reference HTTP path** (see the update at the
+  top of this page); the O(n) description here is historical. The remaining device/TP=4
+  all-position contract is window work.
 
 ## Oracle patch state and the p129 near-one-hot question
 
@@ -482,3 +494,26 @@ New coverage:
 `crates/sparkflash-api/src/{engine,schema,server,state,lib}.rs`,
 `crates/sparkflash-api/tests/router.rs`, `crates/sparkflash-cli/src/serve.rs`,
 `crates/sparkflash-device/tests/engine_offline.rs` (one struct field), and this document.
+
+
+## Interaction with stop strings (2026-10-20)
+
+The vLLM stop rule holds back max(len(stop)) - 1 characters before emitting text, so a token that
+carries a logprob can still be removed from the text by a stop match. The reference driver now
+keeps that ordering: the token that completes a stop string is sampled, counted in
+completion_tokens and carries its TokenLogprobs event, and only the text around the match is
+truncated (the stop string itself is not emitted). Unit tests in serve.rs cover the buffer and the
+driver stream; the wire-level census covers the stop/400 behaviour.
+
+
+## Interaction with generation-changing sampler options (2026-10-20)
+
+The task-8 sampler extension means the OpenAI generation-changing parameters are now honoured
+rather than dropped: `top_p`, `top_k`, `repetition_penalty`, `presence_penalty` and
+`frequency_penalty` reach the reference sampler (`forward/mod.rs` `SamplerOptions` +
+`sample`), with vLLM's raw-logit penalty order and candidate-filter semantics. This matters for
+the logprob rows above in one direction: a request that names none of those fields still takes the
+untouched `sample_gumbel` fast path, so every logprob/token pair measured before the extension
+stays reproducible; a request that names one changes the distribution and its logprobs belong to
+the new configuration. The TCPO/seed determinism claims are unchanged.
+

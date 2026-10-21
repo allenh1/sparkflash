@@ -78,6 +78,9 @@ extern "C" __global__ void engram_wkv_sm121(
     const uint8_t *scale_row = weight_scales + (uint64_t)(row / SPARK_M4_QUANT_BLOCK) * k_blocks;
 
     float accumulator = 0.0f;
+    // Unrolled so the independent code/weight loads of neighbouring k-blocks issue ahead of the
+    // shuffle reductions. Reduction and accumulation order are unchanged (bit-identical).
+#pragma unroll 4
     for (uint32_t kb = 0; kb < k_blocks; ++kb) {
         const float block_dot = spark_engram_block_dot(act_codes, weight_row, kb, lane);
         if (lane == 0u) {

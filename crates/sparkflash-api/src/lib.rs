@@ -5,6 +5,8 @@
 //! a real 4x DGX Spark engine or crate::engine::MockEngine can implement, and an axum
 //! server (crate::server::router) that needs no GPU, no checkpoint and no network to test.
 
+pub mod device_chain;
+pub mod device_token;
 pub mod encoding;
 pub mod engine;
 pub mod error;
@@ -17,6 +19,7 @@ pub mod schema;
 pub mod server;
 pub mod state;
 pub mod telemetry_types;
+pub mod tool_parser;
 
 pub use encoding::{SparkV41Encoding, TokenizerSeam, TokenizerSeamError};
 pub use engine::{

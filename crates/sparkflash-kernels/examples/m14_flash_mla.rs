@@ -75,7 +75,7 @@
 //! NOT the indexer's top-512.
 //!
 //! Cubin: flash_mla_csa2_sm121, 60,792 B, sha256
-//! 5bfee4c7a0ece7c921e591fc6b8bd9d98c39b95d735d7c1d699ec58edaa51ea3, 0 PTX membar lines, verified
+//! 64fc2944d510885490ef1caeb680600f30b1d552c6ec31b0f6ed840ad0f09d2b, 0 PTX membar lines, verified
 //! by size and sha256 against baseline/kernel_baseline.txt BEFORE the first device allocation.
 //! Build it under the pinned toolkit (CUDA 13.0.3, nvcc V13.0.88):
 //!   nvcc -std=c++17 -arch=sm_121a -cubin -I kernels kernels/flash_mla_csa2_sm121.cu -o out/flash_mla_csa2_sm121.cubin
@@ -121,9 +121,9 @@ use sparkflash_kernels::mxfp8_ref;
 /// The kernel name in the baseline manifest.
 const KERNEL: &str = "flash_mla_csa2_sm121";
 /// Pinned cubin size.
-const PIN_BYTES: usize = 60_792;
+const PIN_BYTES: usize = 69_064;
 /// Pinned cubin sha256.
-const PIN_SHA256: &str = "5bfee4c7a0ece7c921e591fc6b8bd9d98c39b95d735d7c1d699ec58edaa51ea3";
+const PIN_SHA256: &str = "64fc2944d510885490ef1caeb680600f30b1d552c6ec31b0f6ed840ad0f09d2b";
 /// The pinned kernel carries no fence.
 const PIN_MEMBAR_LINES: u32 = 0;
 /// One head per block, 256 threads.

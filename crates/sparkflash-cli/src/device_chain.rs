@@ -101,7 +101,7 @@ impl WeightSource for CachedWeightSource {
 }
 
 /// The usage line for this subcommand.
-pub const USAGE: &str = "sparkflash device-chain --plan-only|--dry-run|--run-stage mhc_entry|layer_zero|hybrid_token|hybrid_sequence|tp4-smoke|tp4-resident --checkpoint DIR --cubin-dir DIR [--positions 0] [--layer 0] [--token 0] [--element-limit N] [--moe-preflight] [--moe-layer0-diagnose] [--fixture FILE --prompt-tokens N --decode-steps N] [--dump-logits FILE] [--timing-json FILE] [--reference-check] [--attention-twin-positions LIST] [--host-attention-from POSITION] [--operand-audit]; tp4-smoke also takes --tp-rank N --tp-world-size N --comm-backend tcp|lo --comm-peers IP,IP,... --comm-port 29601 --evidence-dir DIR";
+pub const USAGE: &str = "sparkflash device-chain --plan-only|--dry-run|--run-stage mhc_entry|layer_zero|hybrid_token|hybrid_sequence|tp4-smoke|tp4-resident|attn-operands --checkpoint DIR --cubin-dir DIR [--positions 0] [--layer 0] [--token 0] [--element-limit N] [--moe-preflight] [--moe-layer0-diagnose] [--fixture FILE --prompt-tokens N --decode-steps N] [--dump-logits FILE] [--timing-json FILE] [--reference-check] [--attention-twin-positions LIST] [--host-attention-from POSITION] [--operand-audit]; tp4-smoke also takes --tp-rank N --tp-world-size N --comm-backend tcp|lo --comm-peers IP,IP,... --comm-port 29601 --evidence-dir DIR";
 
 /// The exit code a plan-only or dry-run invocation returns: 2, refusing to serve.
 pub const PLAN_ONLY_EXIT: u8 = 2;
@@ -351,6 +351,15 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
         && arg_refs.get(1).copied() == Some("tp4-resident")
     {
         return crate::tp4_resident::run(&arg_refs[2..]);
+    }
+    // The attn-operands stage is a host-only gate: it builds the rank plan from the released
+    // headers and derives every attention projection's device operand layout, so a CPU-only build
+    // reaches it and it opens no driver. A pass means the plan offers B12x operands; a stored
+    // projection fails by name instead of becoming a per-layer host repack at run time.
+    if arg_refs.first().copied() == Some("--run-stage")
+        && arg_refs.get(1).copied() == Some(crate::tp4_operands::STAGE)
+    {
+        return crate::tp4_operands::run(&arg_refs[2..]);
     }
     // The tp4-chain stage is the four-rank device arm: per-rank arena plus the per-layer collective.
     // It is reachable from a CPU-only build for --plan-only and --comm-smoke.
@@ -4247,7 +4256,7 @@ mod tests {
         assert!(
             text.contains("chain_execution=false; device_execution=false; token_produced=false")
         );
-        assert!(text.contains("19 baseline pins parsed"));
+        assert!(text.contains("20 baseline pins parsed"));
         assert!(
             text.contains("crates/sparkflash-kernels/baseline/kernel_baseline.txt"),
             "the catalog names the repository path, not a crate-relative one"

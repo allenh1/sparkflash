@@ -66,17 +66,22 @@ extern "C" __global__ void engram_embed_sm121(
     const uint32_t blocks = total / SPARK_M4_QUANT_BLOCK;
     for (uint32_t block = threadIdx.x; block < blocks; block += blockDim.x) {
         const uint32_t base = block * SPARK_M4_QUANT_BLOCK;
+        // Load the 32-value block once into registers (it was read from global memory twice).
+        float values[SPARK_M4_QUANT_BLOCK];
         float amax = 0.0f;
+#pragma unroll
         for (uint32_t i = 0; i < SPARK_M4_QUANT_BLOCK; ++i) {
             const float value = __bfloat162float(fetched[base + i]);
+            values[i] = value;
             const float magnitude = value < 0.0f ? -value : value;
             amax = magnitude > amax ? magnitude : amax;
         }
         const uint8_t scale_code = spark_act_quant_scale_code(amax);
         act_scales[block] = scale_code;
         const float scale = spark_ue8m0_decode(scale_code);
+#pragma unroll
         for (uint32_t i = 0; i < SPARK_M4_QUANT_BLOCK; ++i) {
-            float scaled = __fdiv_rn(__bfloat162float(fetched[base + i]), scale);
+            float scaled = __fdiv_rn(values[i], scale);
             if (scaled > 448.0f) {
                 scaled = 448.0f;
             }

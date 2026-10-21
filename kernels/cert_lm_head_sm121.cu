@@ -113,6 +113,7 @@ extern "C" __global__ void cert_lm_head_sm121(
         }
         const __nv_bfloat16 *row = w + (uint64_t)entry * SPARK_M4_HIDDEN;
         float bound = 0.0f;
+#pragma unroll 8
         for (uint32_t block = 0; block < (uint32_t)SPARK_M4_LM_BLOCKS; ++block) {
             // The load-time precompute selected this exact BF16 weight as the block's largest
             // magnitude, so this replaces the old 128-value scan without changing the value.
@@ -127,6 +128,7 @@ extern "C" __global__ void cert_lm_head_sm121(
             pruned += 1u;
         } else {
             float acc = 0.0f;
+#pragma unroll 8
             for (uint32_t i = 0; i < (uint32_t)SPARK_M4_HIDDEN; ++i) {
                 acc += __bfloat162float(hidden[i]) * __bfloat162float(row[i]);
             }
@@ -246,6 +248,7 @@ extern "C" __global__ void cert_lm_head_batched_sm121(
         for (uint32_t r = 0u; r < SPARK_M4_LM_BATCH_ROWS; ++r) {
             bound[r] = 0.0f;
         }
+#pragma unroll 8
         for (uint32_t block = 0u; block < (uint32_t)SPARK_M4_LM_BLOCKS; ++block) {
             const float row_max =
                 __bfloat162float(w_block_max_t[(uint64_t)block * vocab + entry]);
@@ -267,6 +270,7 @@ extern "C" __global__ void cert_lm_head_batched_sm121(
             acc[r] = 0.0f;
         }
         if (any_exact) {
+#pragma unroll 4
             for (uint32_t i = 0u; i < (uint32_t)SPARK_M4_HIDDEN; ++i) {
                 const float w_value = __bfloat162float(row[i]);
 #pragma unroll

@@ -447,6 +447,98 @@ pub fn hc_post(
     Ok(())
 }
 
+/// Rounds every value of one row to the release's BF16 dtype boundary, in place.
+///
+/// Native mHC's reductions end in a cast to the stream dtype: `hc_pre` returns `y.to(x.dtype)`
+/// (model.py:954-957), `hc_post` returns `y.type_as(x)` (model.py:962-966), and the block
+/// stream is BF16 (model.py:976-994). The released RMSNorm also returns `(weight * x).to(dtype)`
+/// (model.py:288-293). [crate::quant::bf16_round] is that cast, round-to-nearest-even included.
+pub fn bf16_round_row(values: &mut [f32]) {
+    for value in values.iter_mut() {
+        *value = crate::quant::bf16_round(*value);
+    }
+}
+
+/// `hc_pre` with the release's BF16 boundary: the collapsed row is rounded once, because native
+/// returns `y.to(x.dtype)` and `x` is the BF16 residual stream (model.py:954-957).
+///
+/// The reduction order is [hc_pre]'s; the boundary is the term native has and the f32 reference
+/// does not.
+///
+/// # Errors
+/// [hc_pre]'s shape refusals.
+pub fn hc_pre_bf16(
+    cfg: &ModelConfig,
+    pre_mix: &[f32],
+    x_hc: &[f32],
+    out: &mut [f32],
+) -> Result<(), EngineError> {
+    hc_pre(cfg, pre_mix, x_hc, out)?;
+    bf16_round_row(out);
+    Ok(())
+}
+
+/// `rms_norm` with the release's BF16 boundary: the released RMSNorm computes in f32 and returns
+/// `(weight * x).to(dtype)` (model.py:288-293), so the norm output native hands to the sublayer
+/// (and its activation quantiser) is BF16, not f32.
+///
+/// # Errors
+/// [linalg::rms_norm]'s shape refusals.
+pub fn rms_norm_bf16(
+    x: &mut [f32],
+    weight: &[f32],
+    cols: usize,
+    eps: f32,
+) -> Result<(), EngineError> {
+    linalg::rms_norm(x, weight, cols, eps)?;
+    bf16_round_row(x);
+    Ok(())
+}
+
+/// `hc_post` with the release's BF16 boundary AND its expression structure.
+///
+/// Native evaluates
+/// `post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)`
+/// (model.py:962-966): the comb sum is its own f32 reduction over the source copies, the post term
+/// is one f32 product added to it once, and the row is then rounded to BF16 by `y.type_as(x)`.
+/// [hc_post] instead seeds the accumulator with the post term and adds each comb product into it;
+/// f32 addition is not associative, so the two can disagree in the last bits before the BF16
+/// round. This function keeps the release order, then rounds.
+///
+/// # Errors
+/// [hc_post]'s shape refusals (it is run first to own the length contract, then overwritten in the
+/// release order).
+pub fn hc_post_bf16(
+    cfg: &ModelConfig,
+    x: &[f32],
+    residual_hc: &[f32],
+    post_mix: &[f32],
+    comb: &[f32],
+    out_hc: &mut [f32],
+) -> Result<(), EngineError> {
+    // [hc_post] owns the shape contract; run it so a malformed buffer is refused with the same
+    // error, then recompute in the release's order. The two passes are hc * dim values each.
+    hc_post(cfg, x, residual_hc, post_mix, comb, out_hc)?;
+    let hc = cfg.hc_mult;
+    let dim = cfg.dim;
+    let token_width = hc * dim;
+    for token in 0..out_hc.len() / token_width {
+        for copy in 0..hc {
+            for j in 0..dim {
+                let mut comb_sum = 0.0f32;
+                for source in 0..hc {
+                    comb_sum += comb[token * hc * hc + source * hc + copy]
+                        * residual_hc[token * token_width + source * dim + j];
+                }
+                let post_term = post_mix[token * hc + copy] * x[token * dim + j];
+                out_hc[token * token_width + copy * dim + j] = post_term + comb_sum;
+            }
+        }
+    }
+    bf16_round_row(out_hc);
+    Ok(())
+}
+
 /// A shape refusal naming the operation that could not be applied.
 fn shape_error(what: &str, detail: String) -> EngineError {
     EngineError::Shape {
@@ -1104,5 +1196,162 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The released geometry, for the captured rows: the fixture is 5120 wide with 4 mHC copies.
+    fn captured_config() -> ModelConfig {
+        let mut cfg = ModelConfig::tiny();
+        cfg.dim = 5120;
+        cfg.hc_mult = 4;
+        cfg
+    }
+
+    /// One committed captured-activation fixture; provenance is in the directory's
+    /// `provenance.json` (phase1 boundary v1 host capture, layer 1, position 0).
+    fn captured_fixture(name: &str) -> Vec<f32> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/native-rounding")
+            .join(name);
+        let bytes =
+            std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        assert_eq!(
+            bytes.len() % 4,
+            0,
+            "{} is not whole f32 values",
+            path.display()
+        );
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
+            .collect()
+    }
+
+    /// The capture is the f32 reference chain; the engine's own hc_post over the captured inputs
+    /// must reproduce it bit for bit or the fixture is not the chain these tests claim.
+    #[test]
+    fn the_captured_hc_post_row_is_the_reference_stream() {
+        let cfg = captured_config();
+        let dim = cfg.dim;
+        let hc = cfg.hc_mult;
+        let x = captured_fixture("attention-out-layer1-pos0.f32");
+        let residual = captured_fixture("residual_in-layer1-pos0.f32");
+        let post = captured_fixture("hc-attn-post-layer1-pos0.f32");
+        let comb = captured_fixture("hc-attn-comb-layer1-pos0.f32");
+        let expected = captured_fixture("post-attention-hidden-layer1-pos0.f32");
+        let mut out = vec![0.0f32; hc * dim];
+        hc_post(&cfg, &x, &residual, &post, &comb, &mut out).expect("hc_post");
+        assert_eq!(
+            out, expected,
+            "the engine hc_post must reproduce the captured reference stream exactly"
+        );
+    }
+
+    #[test]
+    fn the_captured_hc_post_native_rounds_and_keeps_the_release_order() {
+        let cfg = captured_config();
+        let dim = cfg.dim;
+        let hc = cfg.hc_mult;
+        let x = captured_fixture("attention-out-layer1-pos0.f32");
+        let residual = captured_fixture("residual_in-layer1-pos0.f32");
+        let post = captured_fixture("hc-attn-post-layer1-pos0.f32");
+        let comb = captured_fixture("hc-attn-comb-layer1-pos0.f32");
+        let mut native = vec![0.0f32; hc * dim];
+        hc_post_bf16(&cfg, &x, &residual, &post, &comb, &mut native).expect("hc_post_bf16");
+        // The independent release-order reference: the comb sum, then one post-term addition,
+        // then the BF16 cast. Written out so the test does not call the function it checks.
+        for copy in 0..hc {
+            for j in 0..dim {
+                let mut comb_sum = 0.0f32;
+                for source in 0..hc {
+                    comb_sum += comb[source * hc + copy] * residual[source * dim + j];
+                }
+                let post_term = post[copy] * x[j];
+                let reference = crate::quant::bf16_round(post_term + comb_sum);
+                assert_eq!(
+                    native[copy * dim + j],
+                    reference,
+                    "copy {copy} dim {j} is not the release arithmetic"
+                );
+            }
+        }
+        // Every value is BF16-representable, and the boundary actually moves values: the f32 chain
+        // on the same captured row is not bf16-representable on most entries.
+        let mut f32_out = vec![0.0f32; hc * dim];
+        hc_post(&cfg, &x, &residual, &post, &comb, &mut f32_out).expect("hc_post");
+        let mut changed = 0usize;
+        for (native, f32_value) in native.iter().zip(f32_out.iter()) {
+            assert_eq!(
+                crate::quant::bf16_round(*native),
+                *native,
+                "a native output is not BF16-representable"
+            );
+            if native != f32_value {
+                changed += 1;
+            }
+        }
+        assert!(
+            changed > 0,
+            "the captured row must contain values the BF16 boundary changes"
+        );
+        eprintln!(
+            "captured hc_post row: {changed}/{} values move at the BF16 boundary",
+            hc * dim
+        );
+    }
+
+    #[test]
+    fn the_captured_hc_pre_native_rounds_the_collapse() {
+        let cfg = captured_config();
+        let dim = cfg.dim;
+        let residual = captured_fixture("residual_in-layer1-pos0.f32");
+        let pre = captured_fixture("hc-in-pre-layer1-pos0.f32");
+        let mut native = vec![0.0f32; dim];
+        hc_pre_bf16(&cfg, &pre, &residual, &mut native).expect("hc_pre_bf16");
+        let mut f32_out = vec![0.0f32; dim];
+        hc_pre(&cfg, &pre, &residual, &mut f32_out).expect("hc_pre");
+        let mut changed = 0usize;
+        for (native, f32_value) in native.iter().zip(f32_out.iter()) {
+            assert_eq!(
+                *native,
+                crate::quant::bf16_round(*f32_value),
+                "the collapse must be its f32 value rounded once"
+            );
+            if native != f32_value {
+                changed += 1;
+            }
+        }
+        assert!(
+            changed > 0,
+            "the captured collapse must contain values the BF16 round changes"
+        );
+        eprintln!("captured hc_pre row: {changed}/{dim} values move at the BF16 boundary");
+    }
+
+    #[test]
+    fn the_captured_norm_output_is_bf16_before_the_sublayer() {
+        let cfg = captured_config();
+        let dim = cfg.dim;
+        let residual = captured_fixture("residual_in-layer1-pos0.f32");
+        let pre = captured_fixture("hc-in-pre-layer1-pos0.f32");
+        let weight = vec![1.0f32; dim];
+        let mut collapsed = vec![0.0f32; dim];
+        hc_pre_bf16(&cfg, &pre, &residual, &mut collapsed).expect("hc_pre_bf16");
+        let mut normed = collapsed.clone();
+        rms_norm_bf16(&mut normed, &weight, dim, cfg.norm_eps as f32).expect("rms_norm_bf16");
+        let mut reference = collapsed.clone();
+        linalg::rms_norm(&mut reference, &weight, dim, cfg.norm_eps as f32).expect("rms_norm");
+        bf16_round_row(&mut reference);
+        assert_eq!(
+            normed, reference,
+            "the norm boundary is one BF16 round of the f32 norm"
+        );
+        assert!(
+            normed
+                .iter()
+                .all(|value| crate::quant::bf16_round(*value) == *value),
+            "the norm output must be BF16-representable"
+        );
     }
 }

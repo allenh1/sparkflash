@@ -1,0 +1,8 @@
+# argv: ./m7_layer0-b1 --stage 8 --cubin-dir ~/hostrun/cubins --layer 0
+# binary sha256 75af37a1754f4f138cc2f802e955fef4320a24623078ec602a6e5a8e8bf995eb
+chmod: cannot access 'm7_layer0-b1': No such file or directory
+MemAvailable:   123427228 kB
+bash: line 1: ./m7_layer0-b1: No such file or directory
+# exit: 127
+# utc_end: 2026-10-18T01:13:12Z
+MemAvailable:   123427228 kB

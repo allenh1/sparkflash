@@ -187,3 +187,152 @@ rounds of fixes. Post-fix state, all from the tree's harnesses against rebuilt p
 - **Still not measured:** a token, a verify-step time, the 134-slot ring numerics, CUDA-graph
   capture, RDMA one-shot. The 767.7 ms/step = 1.3026 tokens/s batch-18 row remains the best
   measured decode until a device run beats it.
+
+## Addendum 2026-10-20 - first four-rank device window (vLLM stopped)
+
+Cluster window with the user's vLLM stopped on all four nodes; everything below is measured on the
+real GB10 nodes, not the dev box. Numbers are verbatim from the evidence JSONs in
+`/home/user/ev-window-20261020/`.
+
+- **Plans.** world=1: 285.504 GiB, 95,822 tensors (95,818 resident / 4 disk), 0.32 s. world=4 per
+  rank: **72.308 GiB**, 95,822 tensors (95,818 resident / 4 disk), 161,736,798 ranges, and the same
+  plan hash `0x9a59035fc40776c8` on all four ranks.
+- **Collectives over real TCP** (first four-node run; previously loopback only): all ranks rc=0,
+  80 reduces/step, 819,200 B payload, canonical bf16 ascending-rank sum verified element-wise,
+  `phase_order=["attn","moe"]`, steady state 14-22 ms/step at rank 0. Transport only - no forward,
+  no token.
+- **Resident arena** (the "sparks are there only to do inference" configuration): 72.308 GiB/rank
+  stored = uploaded = resident, 95,818 tensors verified against a re-read, distinct arena hash per
+  rank (genuinely sharded), peak host RSS 73.1 GiB. Boot 416.4/521.4/519.8/484.7 s on ranks 0-3.
+- **Boot speedup, measured after two changes** (single contiguous reservation for the whole plan,
+  and reading a tensor-column slice's stored region in one sequential pass instead of ~1.7k
+  seek+read pairs): 332.4/337.3/346.2/350.9 s, i.e. **1.3-1.5x**, all four ranks verified. The
+  disks measure 5.8 GB/s sequentially, so the remaining limit is the single-threaded read+copy
+  (~200-240 MB/s effective); parallel readers are the next win, not another allocation change.
+- **Two real bind bugs, found only because this ran on GPUs.** (1) `compressor.wgate` was demanded
+  as a 2,621,440 B FP8 B12x payload while the checkpoint stores 5,242,880 B = 512x5120x2 BF16;
+  kernel-dev confirmed wgate/wkv and indexer `weights_proj`/`wk` are host seams
+  (`CompressorCache`/`IndexerWeights`), not device weights, and only `indexer.wq_b` is B12x
+  MXFP8. Fixed by structurally excluding host seams from the device bind table and deriving every
+  other expectation from the arena's own `b12x_layout` predicate. (2) The coverage check then
+  reported `bound 208 of 196` and had to be made set-based over names in both directions so the
+  next run names the offending tensors.
+- **Boundary, unchanged:** no forward pass and no token has run on the four-rank device arm. MoE
+  shared/routed bindings, the head and token emission remain unbound, so the 767.7 ms/step baseline
+  and the 42 ms target are untouched. The bind-fix commits are compile-verified only; the window
+  ended on the coverage failure.
+
+Next window checklist: land the named coverage difference, bind the MoE shared/routed sets, emit a
+first token on four ranks, then re-run the D48 verify-step measurement and the async-reduce
+comparison on real links (loopback measured 66.8 ms sync vs 10.5 ms posted).
+
+
+## Addendum 2026-10-20 - task-3 (WS-E): OpenAI parity audit, stop/health landed, host census
+
+Row-level audit: [serving-openai-parity-audit.md](serving-openai-parity-audit.md). It compares the
+serve HTTP surface with the oracle vLLM's own source (extracted read-only at /tmp/vllm/src) with a
+file:line on each side and a verdict per row; no vLLM number is copied and the live server is never
+contacted. The single largest behavioural delta is sampling: only temperature and seed change
+generation on our path. top_p is parsed and passed but the reference sampler drops it, and top_k,
+min_p, penalties, logit_bias, ignore_eos, min_tokens and stop_token_ids are not in the request
+schema (unknown JSON is silently ignored).
+
+Landed on the reference serve path (host, no device):
+
+- **Stop strings now work.** The driver holds back max(len(stop)) - 1 characters so a stop split
+  across token boundaries is never emitted, truncates at the earliest match across every sequence,
+  flushes the held tail on a length finish, reports finish_reason stop and counts the completing
+  token. An empty stop string is refused with vLLM's message ("stop cannot contain an empty
+  string."). Streaming and logprob streams keep their ordering.
+- **GET /health** answers 200 with an empty body (vLLM's liveness shape). The 503 EngineDeadError
+  branch is documented but no engine-dead signal exists on this path yet.
+- **/v1/models publishes vLLM's ModelCard members**: root, parent, max_model_len and an empty
+  permission list beside the server's own context fields; the advertised endpoint list names
+  /health.
+- **New e2e HTTP test file** (crates/sparkflash-cli/tests/serve_http.rs) spawns the real
+  serve --synthetic binary on 127.0.0.1:0 and checks /health, a token-id completion, stop
+  truncation, the empty-stop 400, the SSE usage/[DONE] frames and the models card.
+
+Measured host census (HOST PATH, synthetic tiny plan, no checkpoint, no device, no CUDA; D41 floor
+not frozen, so UNBARED / diagnostic - not a gate input and never compared with a device number):
+scripts/serve-parity-census.py, current evidence
+/home/user/ev-session-20261020/serve/serve-parity-census-20261020T222156Z.{json,md,server.log},
+binary sha256 411dee72..., commit d7c9622 (branch task/serve-openai-parity; the JSON records one
+dirty entry, the census-script adaptation included in the follow-up commit). 20 capability probes
+plus a 1/8/32-client streaming ladder (64 tokens per request, temperature 0, explicit
+skip_special_tokens false so the synthetic plan's only generated token is visible):
+
+| clients | requests | accepted | TTFT p50 | end-to-end p50 | client tokens/s (aggregate) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 4 | 4 | 35.6 ms | 923 ms | 68.8 |
+| 8 | 32 | 32 | 6118 ms | 6979 ms | 72.3 |
+| 32 | 128 | 128 | 32107 ms | 33109 ms | 63.1 |
+
+Single streaming request: TTFT 33.7 ms, 966 ms end to end, 64 tokens, 66.2 client tokens/s; the
+ladder's TTFT growth is queue wait behind the single reference engine thread (recorded serving
+behaviour, not a throughput collapse), with 164/164 accepted, 0 refused, 0 failed and counters
+moved by sparkflash_requests_total +178 / sparkflash_prompt_tokens_total +1424.
+
+What the probes now show: health empty body, models card, stop truncation with finish_reason stop
+and the completing token counted, empty-stop 400, whole-vocabulary logprobs under
+--max-logprobs 1000, over-cap refusal, determinism, seed reproducibility, skip_special_tokens
+default-hides vs explicit-false shows, sampler options accepted (200) and out-of-range refused
+with vLLM's range text plus integer error.code 400, unknown-model 404 with integer error.code 404.
+Still recorded as gaps: top_p indistinguishable on non-finite synthetic logits (the candidate
+filter is unit-proven, not wire-proven), response_format/min_p accepted-and-ignored (no schema
+fields), n=2 refused, chat/tools host-limited 503s (the synthetic vocabulary cannot embed released
+tokenizer ids, so the buffered deepseek_v41 parser is not exercised over this wire), and streaming
+tool-call deltas unparsed (both superseded by task-19 below: the debug-build scripted wire seed
+exercises the buffered and streaming parser over the real socket).
+
+The pre-extension census 20261020T203700Z (commit 3f4cb3a, binary sha256 500257be..., loadavg
+20.2/17.3/14.9) measured the same workload at 52.2 single / 57.8 / 61.3 / 59.9 ladder client
+tokens/s and recorded the pre-extension gaps. The two runs are not a speed comparison: host load
+differed and the loopback census has no benchmark controls; both are regression-tracking evidence
+only.
+
+Updated by the task-8 sampler extension (one commit, engine + API + serve wiring, unit and
+serve_http coverage): top_p, top_k, repetition_penalty, presence_penalty and frequency_penalty now
+change generation on the reference path, with a default fast path that calls sample_gumbel
+verbatim so a request naming none of them is byte-identical to the pre-extension driver. The
+semantics are proven by pure unit tests against crafted finite logits (the synthetic host plan's
+logits are non-finite, so the HTTP path can only show acceptance/refusal/identity, not knob
+effects).
+
+Updated by the second task-8 unit: skip_special_tokens is now an OpenAI field on chat and
+completions (absent means vLLM's true default; explicit false passes the raw decoded text through
+and is what the synthetic-plan e2e uses to see a token), the error envelope's code is the integer
+HTTP status (vLLM ErrorInfo.code) instead of a string name, and a buffered chat answer carrying
+the V4.1 DSML block is parsed into OpenAI tool_calls with finish_reason tool_calls when the
+request offered tools (port of reference/encoding/encoding.py's generation-side parse). Streaming
+tool-call deltas, n>1, response_format/guided decoding, --api-key auth and SSE keep-alive remain
+open; the TP=4 host path also keeps its temperature/seed-only sampler and unparsed tool-call
+text.
+
+Updated by task-19: the streaming deepseek_v41 parser landed, so the SSE path fills
+delta.tool_calls (call-start delta with the id and name, argument fragments, final choice
+finish_reason tool_calls) and a malformed or unterminated block ends with one typed
+tool_call_parse_error SSE frame followed by [DONE]; the buffered and streamed payloads are pinned
+equal by split-at-every-boundary parser tests, router tests and the scripted-engine serve_http
+wire tests, with the measured tool-call-streaming-census artefact (see audit sections 11 and 12
+and [streaming-tool-calls.md](streaming-tool-calls.md)). The chat/tools wire gap above is
+superseded by that debug-build seed, and the idle SSE keep-alive comment frame landed in task-18.
+Streaming sample logprobs combined with offered tools stays a documented residual gap.
+
+Updated by task-20: the remaining OpenAI surface gaps above landed. n > 1 choices are served
+ordered on chat and completions (buffered and SSE), with per-choice ids and vLLM's seed + i, the
+prompt counted once and completion tokens summed, and the TP=4 driver refusing n > 1 typed because
+its group shares one sampling window. response_format now parses text/json_object/json_schema,
+accepts text as a no-op and refuses the JSON modes typed (param response_format) instead of
+silently ignoring them; constrained decoding remains a named gap. A bearer key via --api-key /
+SPARKFLASH_SERVE_API_KEY protects every route except /health and /metrics with the documented 401
+envelope, while no key keeps the server open as before. Evidence: router tests, scripted-engine
+serve_http wire tests and openai-surface-census-20261021T040922Z (see audit section 12 and
+[openai-surface-gaps.md](openai-surface-gaps.md)). Still open: constrained decoding,
+response_format on the completions request, the sampler fields above, and the TP=4 sampler.
+
+Next: (1) constrained decoding for response_format if the decode path can support it honestly;
+(2) the remaining sampler fields (min_p, logit_bias, bad words and token allow lists); (3) the
+sampler on the TP=4 host path (device-window work); (4) the device engine path's
+independent_choices default once its sampling seam can guarantee independent choices.
+

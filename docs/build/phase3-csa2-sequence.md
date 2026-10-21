@@ -272,9 +272,9 @@ window log (no edits, no elisions):
 
 ```
 === RUN m20-clean start 2026-10-19T09:52:02Z
-baseline manifest agrees: flash_mla_csa2_sm121 60792 B, 5bfee4c7a0ece7c921e591fc6b8bd9d98c39b95d735d7c1d699ec58edaa51ea3, 0 PTX membar lines
+baseline manifest agrees: flash_mla_csa2_sm121 60792 B, 64fc2944d510885490ef1caeb680600f30b1d552c6ec31b0f6ed840ad0f09d2b, 0 PTX membar lines
 baseline manifest agrees: flash_mla_csa2_seq_sm121 38080 B, f6dfc738a7ad867adf040384f194812337301aa888cc486d4a60923772ba28c3, 0 PTX membar lines
-cubin: /home/user/phase2-evidence/window-2026-10-18/cubins/flash_mla_csa2_sm121.cubin (60792 B, sha256 5bfee4c7a0ece7c921e591fc6b8bd9d98c39b95d735d7c1d699ec58edaa51ea3)
+cubin: /home/user/phase2-evidence/window-2026-10-18/cubins/flash_mla_csa2_sm121.cubin (60792 B, sha256 64fc2944d510885490ef1caeb680600f30b1d552c6ec31b0f6ed840ad0f09d2b)
 cubin: /home/user/phase2-evidence/window-2026-10-18/cubins/flash_mla_csa2_seq_sm121.cubin (38080 B, sha256 f6dfc738a7ad867adf040384f194812337301aa888cc486d4a60923772ba28c3)
 device 0: NVIDIA GB10 of 1 (total 124610 MiB, MemAvailable 120436 MiB)
 geometry: CSA2 sequence entry, 64 heads x 512 latent, window 128, selected bound 512, 256 threads; positions [0, 1, 2, 129, 130, 131, 132, 133, 134, 135, 136, 137]
@@ -389,9 +389,9 @@ the ones to cite.
 
 ```
 === RUN m20-csa2-seq-with-timeout start 2026-10-19T09:35:57Z
-baseline manifest agrees: flash_mla_csa2_sm121 60792 B, 5bfee4c7a0ece7c921e591fc6b8bd9d98c39b95d735d7c1d699ec58edaa51ea3, 0 PTX membar lines
+baseline manifest agrees: flash_mla_csa2_sm121 60792 B, 64fc2944d510885490ef1caeb680600f30b1d552c6ec31b0f6ed840ad0f09d2b, 0 PTX membar lines
 baseline manifest agrees: flash_mla_csa2_seq_sm121 38080 B, f6dfc738a7ad867adf040384f194812337301aa888cc486d4a60923772ba28c3, 0 PTX membar lines
-cubin: /home/user/phase2-evidence/window-2026-10-18/cubins/flash_mla_csa2_sm121.cubin (60792 B, sha256 5bfee4c7a0ece7c921e591fc6b8bd9d98c39b95d735d7c1d699ec58edaa51ea3)
+cubin: /home/user/phase2-evidence/window-2026-10-18/cubins/flash_mla_csa2_sm121.cubin (60792 B, sha256 64fc2944d510885490ef1caeb680600f30b1d552c6ec31b0f6ed840ad0f09d2b)
 cubin: /home/user/phase2-evidence/window-2026-10-18/cubins/flash_mla_csa2_seq_sm121.cubin (38080 B, sha256 f6dfc738a7ad867adf040384f194812337301aa888cc486d4a60923772ba28c3)
 device 0: NVIDIA GB10 of 1 (total 124610 MiB, MemAvailable 118633 MiB)
 geometry: CSA2 sequence entry, 64 heads x 512 latent, window 128, selected bound 512, 256 threads; positions [0, 1, 2, 129, 130, 131, 132, 133, 134, 135, 136, 137]

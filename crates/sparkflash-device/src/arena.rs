@@ -760,6 +760,42 @@ pub fn tile_b12x(weights: &[u8], cols: usize, inner: usize) -> Result<Vec<u8>, S
     Ok(tiled)
 }
 
+/// Recovers checkpoint row-major FP8 weights from one B12x micro-tiled shard.
+///
+/// The exact inverse of [tile_b12x], and the reason it exists: a resident shared-expert weight is
+/// stored B12x-tiled for the device kernels, while a host seam that reads it through the engine's
+/// WeightSource needs the checkpoint's stored row-major order. b12x_weight_index is the bijection
+/// tile_b12x permutes by, so reading through it once recovers the bytes exactly. The trailing
+/// padding of the last micro-tile row is dropped, so cols need not be a multiple of 32; inner must
+/// be, matching tile_b12x.
+///
+/// # Errors
+/// The bytes are not exactly b12x_buffer_bytes(cols, inner), or inner is not whole 32-value MX
+/// blocks.
+pub fn untile_b12x(tiled: &[u8], cols: usize, inner: usize) -> Result<Vec<u8>, String> {
+    if inner == 0 || !inner.is_multiple_of(sparkflash_kernels::mxfp8_ref::B12X_KTILE) {
+        return Err(format!(
+            "untile_b12x: inner {inner} is not whole 32-value MX blocks"
+        ));
+    }
+    let padded = sparkflash_kernels::mxfp8_ref::b12x_padded_rows(cols);
+    let expected = padded.saturating_mul(inner);
+    if tiled.len() != expected {
+        return Err(format!(
+            "untile_b12x({cols} x {inner}): expected {expected} B12x bytes (padded rows {padded}), got {}",
+            tiled.len()
+        ));
+    }
+    let mut raw = vec![0u8; cols.saturating_mul(inner)];
+    for col in 0..cols {
+        for k in 0..inner {
+            raw[col * inner + k] =
+                tiled[sparkflash_kernels::mxfp8_ref::b12x_weight_index(col, k, inner)];
+        }
+    }
+    Ok(raw)
+}
+
 /// The real allocator: device memory through Cuda, freed on drop.
 pub struct CudaArenaAllocator<'a> {
     cuda: &'a Cuda,
@@ -1132,6 +1168,27 @@ mod tests {
         )
         .expect_err("the upload must fail");
         assert!(error.contains("layers.0.attn.wq_a.weight"), "{error}");
+    }
+
+    #[test]
+    fn untiling_b12x_is_the_exact_inverse_of_tiling() {
+        // A multiple of 32 rows, a padded row count, and a row-parallel shard shape: the three
+        // geometries the shared-expert gather feeds to the inverse.
+        for (cols, inner) in [(32usize, 64usize), (33, 64), (576, 96), (64, 576)] {
+            let raw: Vec<u8> = (0..cols * inner).map(|index| (index % 251) as u8).collect();
+            let tiled = tile_b12x(&raw, cols, inner).expect("the shard tiles");
+            assert_eq!(tiled.len(), b12x_buffer_bytes(cols, inner));
+            let recovered = untile_b12x(&tiled, cols, inner).expect("the shard untiles");
+            assert_eq!(recovered, raw, "cols {cols} inner {inner}");
+        }
+        assert!(
+            untile_b12x(&[0u8; 7], 4, 32).is_err(),
+            "a short shard is refused"
+        );
+        assert!(
+            untile_b12x(&[0u8; 128], 4, 33).is_err(),
+            "a non-MX width is refused"
+        );
     }
 
     #[test]

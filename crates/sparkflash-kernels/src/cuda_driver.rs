@@ -192,6 +192,10 @@ pub enum KernelId {
     Mxfp8WoA,
     /// b12x_mxfp4_moe_sm121: the MXFP4 MoE kernel.
     Mxfp4Moe,
+    /// b12x_mxfp4_moe_stored_sm121: the same rank-partial GEMM reading the released plan's stored
+    /// 576-K rows (288 code bytes + 18 separate scale bytes per output row). Selected by plan
+    /// layout; the incumbent above stays for the A8 pre-padded path.
+    Mxfp4MoeStored,
     /// swiglu_mxfp8_quant_sm121: the SwiGLU plus MXFP8 quantiser kernel.
     SwigluMxfp8Quant,
     /// swiglu_mxfp8_quant_weighted_sm121: the same epilogue with the routing weight multiplied in
@@ -225,15 +229,22 @@ pub enum KernelId {
     EngramWkv,
     /// engram_gate_write_sm121: the Engram gate and residual write (task-9, audit F4).
     EngramGateWrite,
+    /// routed_gate_up_swiglu_splitk_sm121: the split-K grouped routed gate/up projection with the
+    /// weighted SwiGLU and the activation quantiser fused into one epilogue (D51 amendment A). A
+    /// NEW symbol: the pinned nineteen-word flash_mla entry and every pinned kernel are untouched.
+    /// Default-off at the launch site, which is the Lead's wiring; the kernel's ABI, tolerance row
+    /// and pin checklist live in crate::routed_gate_up_swiglu_splitk_abi.
+    RoutedGateUpSwigluSplitK,
 }
 
 impl KernelId {
     /// Every kernel the shared driver owns, in the order of this enum.
-    pub const ALL: [KernelId; 18] = [
+    pub const ALL: [KernelId; 20] = [
         KernelId::MegaMhcBf16,
         KernelId::Mxfp8Dense,
         KernelId::Mxfp8WoA,
         KernelId::Mxfp4Moe,
+        KernelId::Mxfp4MoeStored,
         KernelId::SwigluMxfp8Quant,
         KernelId::SwigluMxfp8QuantWeighted,
         KernelId::CertLmHead,
@@ -248,6 +259,7 @@ impl KernelId {
         KernelId::EngramEmbed,
         KernelId::EngramWkv,
         KernelId::EngramGateWrite,
+        KernelId::RoutedGateUpSwigluSplitK,
     ];
 
     /// The cubin symbol of this kernel. Private: callers name the enum, never the symbol.
@@ -257,6 +269,7 @@ impl KernelId {
             KernelId::Mxfp8Dense => "b12x_mxfp8_dense_sm121",
             KernelId::Mxfp8WoA => "b12x_mxfp8_wo_a_sm121",
             KernelId::Mxfp4Moe => "b12x_mxfp4_moe_sm121",
+            KernelId::Mxfp4MoeStored => "b12x_mxfp4_moe_stored_sm121",
             KernelId::SwigluMxfp8Quant => "swiglu_mxfp8_quant_sm121",
             KernelId::SwigluMxfp8QuantWeighted => "swiglu_mxfp8_quant_weighted_sm121",
             KernelId::CertLmHead => "cert_lm_head_sm121",
@@ -271,6 +284,7 @@ impl KernelId {
             KernelId::EngramEmbed => "engram_embed_sm121",
             KernelId::EngramWkv => "engram_wkv_sm121",
             KernelId::EngramGateWrite => "engram_gate_write_sm121",
+            KernelId::RoutedGateUpSwigluSplitK => "routed_gate_up_swiglu_splitk_sm121",
         }
     }
 
@@ -288,6 +302,7 @@ impl KernelId {
             KernelId::Mxfp8Dense => &["b12x_mxfp8_dense_sm121"],
             KernelId::Mxfp8WoA => &["b12x_mxfp8_wo_a_sm121"],
             KernelId::Mxfp4Moe => &["b12x_mxfp4_moe_sm121"],
+            KernelId::Mxfp4MoeStored => &["b12x_mxfp4_moe_stored_sm121"],
             KernelId::SwigluMxfp8Quant => &["swiglu_mxfp8_quant_sm121"],
             KernelId::SwigluMxfp8QuantWeighted => &["swiglu_mxfp8_quant_weighted_sm121"],
             KernelId::CertLmHead => &["cert_lm_head_sm121"],
@@ -302,6 +317,7 @@ impl KernelId {
             KernelId::EngramEmbed => &["engram_embed_sm121"],
             KernelId::EngramWkv => &["engram_wkv_sm121"],
             KernelId::EngramGateWrite => &["engram_gate_write_sm121"],
+            KernelId::RoutedGateUpSwigluSplitK => &["routed_gate_up_swiglu_splitk_sm121"],
         }
     }
 
@@ -628,6 +644,311 @@ pub fn stage_timing_launches() -> u64 {
         .and_then(|guard| guard.as_ref().map(|recorder| recorder.order as u64))
         .unwrap_or(0)
 }
+
+/// One reading of the driver-entry meter the forward perf probe arms.
+///
+/// The first probe kit reported host wall per block only, so a block could not be called
+/// device-bound or host-bound from its own row. This meter is the other half: the driver entry
+/// points ([Cuda::launch], [Cuda::synchronize], the three copies, the allocations, the frees and
+/// the module loads) add to these counters while the probe has them armed, and the probe turns the
+/// difference between two readings into the per-block kernel / staging / host-sync / launch
+/// overhead split the P0 gate asks for. Every field is a plain monotone counter: a consumer
+/// subtracts two readings with [ProbeMeterReading::since], so an absolute value is never quoted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProbeMeterReading {
+    /// cuLaunchKernel calls.
+    pub launches: u64,
+    /// The summed cuEventElapsedTime of those launches, in nanoseconds: the kernels' own device
+    /// time, without the host's launch or drain cost.
+    pub kernel_ns: u64,
+    /// cuCtxSynchronize calls: one per [Cuda::launch] on this driver, plus whatever the numeric
+    /// path asks for directly.
+    pub syncs: u64,
+    /// The summed host wall spent inside those cuCtxSynchronize calls, in nanoseconds. This is the
+    /// host-sync bucket: kernel_ns is device time, this is the host waiting for it.
+    pub sync_ns: u64,
+    /// cuMemcpyHtoD_v2 calls (host to device staging).
+    pub h2d_count: u64,
+    /// Bytes staged host to device.
+    pub h2d_bytes: u64,
+    /// The summed host wall of those copies, in nanoseconds.
+    pub h2d_ns: u64,
+    /// cuMemcpyDtoH_v2 calls (device to host reads).
+    pub d2h_count: u64,
+    /// Bytes read back to the host.
+    pub d2h_bytes: u64,
+    /// The summed host wall of those copies, in nanoseconds.
+    pub d2h_ns: u64,
+    /// cuMemcpyDtoD_v2 calls.
+    pub dtod_count: u64,
+    /// Bytes copied device to device.
+    pub dtod_bytes: u64,
+    /// The summed host wall of those copies, in nanoseconds.
+    pub dtod_ns: u64,
+    /// Device or managed or page-locked allocations made.
+    pub alloc_count: u64,
+    /// Allocations released.
+    pub free_count: u64,
+    /// Cubin modules loaded (one per [Cuda::load_kernel] and its siblings).
+    pub module_load_count: u64,
+}
+
+impl ProbeMeterReading {
+    /// The work that happened between an earlier reading and this one.
+    ///
+    /// Saturating because the counters are process-wide: a reading taken on one thread can be
+    /// overtaken by a launch on another, and a negative delta would be a worse answer than zero.
+    #[must_use]
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            launches: self.launches.saturating_sub(earlier.launches),
+            kernel_ns: self.kernel_ns.saturating_sub(earlier.kernel_ns),
+            syncs: self.syncs.saturating_sub(earlier.syncs),
+            sync_ns: self.sync_ns.saturating_sub(earlier.sync_ns),
+            h2d_count: self.h2d_count.saturating_sub(earlier.h2d_count),
+            h2d_bytes: self.h2d_bytes.saturating_sub(earlier.h2d_bytes),
+            h2d_ns: self.h2d_ns.saturating_sub(earlier.h2d_ns),
+            d2h_count: self.d2h_count.saturating_sub(earlier.d2h_count),
+            d2h_bytes: self.d2h_bytes.saturating_sub(earlier.d2h_bytes),
+            d2h_ns: self.d2h_ns.saturating_sub(earlier.d2h_ns),
+            dtod_count: self.dtod_count.saturating_sub(earlier.dtod_count),
+            dtod_bytes: self.dtod_bytes.saturating_sub(earlier.dtod_bytes),
+            dtod_ns: self.dtod_ns.saturating_sub(earlier.dtod_ns),
+            alloc_count: self.alloc_count.saturating_sub(earlier.alloc_count),
+            free_count: self.free_count.saturating_sub(earlier.free_count),
+            module_load_count: self
+                .module_load_count
+                .saturating_sub(earlier.module_load_count),
+        }
+    }
+
+    /// Two readings summed, which is how a scope's blocks are folded into its row.
+    #[must_use]
+    pub fn plus(self, other: Self) -> Self {
+        Self {
+            launches: self.launches.saturating_add(other.launches),
+            kernel_ns: self.kernel_ns.saturating_add(other.kernel_ns),
+            syncs: self.syncs.saturating_add(other.syncs),
+            sync_ns: self.sync_ns.saturating_add(other.sync_ns),
+            h2d_count: self.h2d_count.saturating_add(other.h2d_count),
+            h2d_bytes: self.h2d_bytes.saturating_add(other.h2d_bytes),
+            h2d_ns: self.h2d_ns.saturating_add(other.h2d_ns),
+            d2h_count: self.d2h_count.saturating_add(other.d2h_count),
+            d2h_bytes: self.d2h_bytes.saturating_add(other.d2h_bytes),
+            d2h_ns: self.d2h_ns.saturating_add(other.d2h_ns),
+            dtod_count: self.dtod_count.saturating_add(other.dtod_count),
+            dtod_bytes: self.dtod_bytes.saturating_add(other.dtod_bytes),
+            dtod_ns: self.dtod_ns.saturating_add(other.dtod_ns),
+            alloc_count: self.alloc_count.saturating_add(other.alloc_count),
+            free_count: self.free_count.saturating_add(other.free_count),
+            module_load_count: self
+                .module_load_count
+                .saturating_add(other.module_load_count),
+        }
+    }
+
+    /// Whether any counter moved. A probe row that finds a block's delta clear writes the block's
+    /// wall alone, and a test that has not touched the meter expects this to hold.
+    #[must_use]
+    pub fn is_clear(self) -> bool {
+        self == Self::default()
+    }
+}
+
+/// The meter's cells. One struct of relaxed atomics keeps the hot-path cost of an armed meter to a
+/// handful of uncontended atomic adds.
+struct ProbeMeter {
+    launches: std::sync::atomic::AtomicU64,
+    kernel_ns: std::sync::atomic::AtomicU64,
+    syncs: std::sync::atomic::AtomicU64,
+    sync_ns: std::sync::atomic::AtomicU64,
+    h2d_count: std::sync::atomic::AtomicU64,
+    h2d_bytes: std::sync::atomic::AtomicU64,
+    h2d_ns: std::sync::atomic::AtomicU64,
+    d2h_count: std::sync::atomic::AtomicU64,
+    d2h_bytes: std::sync::atomic::AtomicU64,
+    d2h_ns: std::sync::atomic::AtomicU64,
+    dtod_count: std::sync::atomic::AtomicU64,
+    dtod_bytes: std::sync::atomic::AtomicU64,
+    dtod_ns: std::sync::atomic::AtomicU64,
+    alloc_count: std::sync::atomic::AtomicU64,
+    free_count: std::sync::atomic::AtomicU64,
+    module_load_count: std::sync::atomic::AtomicU64,
+}
+
+impl ProbeMeter {
+    const fn new() -> Self {
+        Self {
+            launches: std::sync::atomic::AtomicU64::new(0),
+            kernel_ns: std::sync::atomic::AtomicU64::new(0),
+            syncs: std::sync::atomic::AtomicU64::new(0),
+            sync_ns: std::sync::atomic::AtomicU64::new(0),
+            h2d_count: std::sync::atomic::AtomicU64::new(0),
+            h2d_bytes: std::sync::atomic::AtomicU64::new(0),
+            h2d_ns: std::sync::atomic::AtomicU64::new(0),
+            d2h_count: std::sync::atomic::AtomicU64::new(0),
+            d2h_bytes: std::sync::atomic::AtomicU64::new(0),
+            d2h_ns: std::sync::atomic::AtomicU64::new(0),
+            dtod_count: std::sync::atomic::AtomicU64::new(0),
+            dtod_bytes: std::sync::atomic::AtomicU64::new(0),
+            dtod_ns: std::sync::atomic::AtomicU64::new(0),
+            alloc_count: std::sync::atomic::AtomicU64::new(0),
+            free_count: std::sync::atomic::AtomicU64::new(0),
+            module_load_count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn clear(&self) {
+        for cell in [
+            &self.launches,
+            &self.kernel_ns,
+            &self.syncs,
+            &self.sync_ns,
+            &self.h2d_count,
+            &self.h2d_bytes,
+            &self.h2d_ns,
+            &self.d2h_count,
+            &self.d2h_bytes,
+            &self.d2h_ns,
+            &self.dtod_count,
+            &self.dtod_bytes,
+            &self.dtod_ns,
+            &self.alloc_count,
+            &self.free_count,
+            &self.module_load_count,
+        ] {
+            cell.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn read(&self) -> ProbeMeterReading {
+        ProbeMeterReading {
+            launches: self.launches.load(Ordering::Relaxed),
+            kernel_ns: self.kernel_ns.load(Ordering::Relaxed),
+            syncs: self.syncs.load(Ordering::Relaxed),
+            sync_ns: self.sync_ns.load(Ordering::Relaxed),
+            h2d_count: self.h2d_count.load(Ordering::Relaxed),
+            h2d_bytes: self.h2d_bytes.load(Ordering::Relaxed),
+            h2d_ns: self.h2d_ns.load(Ordering::Relaxed),
+            d2h_count: self.d2h_count.load(Ordering::Relaxed),
+            d2h_bytes: self.d2h_bytes.load(Ordering::Relaxed),
+            d2h_ns: self.d2h_ns.load(Ordering::Relaxed),
+            dtod_count: self.dtod_count.load(Ordering::Relaxed),
+            dtod_bytes: self.dtod_bytes.load(Ordering::Relaxed),
+            dtod_ns: self.dtod_ns.load(Ordering::Relaxed),
+            alloc_count: self.alloc_count.load(Ordering::Relaxed),
+            free_count: self.free_count.load(Ordering::Relaxed),
+            module_load_count: self.module_load_count.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The process-wide meter. Process-wide, like the stage ledger, because one run opens several
+/// driver handles (attention, MoE and the mHC launcher) and all of their launches belong to the
+/// same block table.
+static PROBE_METER: ProbeMeter = ProbeMeter::new();
+
+/// Whether the forward perf probe armed the meter. Off by default: every instrumented entry point
+/// reads this one relaxed flag and does nothing else.
+static PROBE_METER_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Arms or clears the driver meter; either way its cells are cleared, so a disarmed meter never
+/// holds a stale reading and a run starts from zero.
+///
+/// Called by the forward perf probe at run scope and by this module's own tests; it is the only
+/// switch. Clearing is what lets a second token stage in one process report its own numbers instead
+/// of the first stage's plus its own.
+pub fn probe_meter_arm(armed: bool) {
+    PROBE_METER.clear();
+    PROBE_METER_ARMED.store(armed, Ordering::Relaxed);
+}
+
+/// Whether the driver meter is armed (one relaxed load, the whole off-path cost).
+#[must_use]
+pub fn probe_meter_armed() -> bool {
+    PROBE_METER_ARMED.load(Ordering::Relaxed)
+}
+
+/// The meter's absolute reading; a consumer subtracts two of them ([ProbeMeterReading::since]).
+#[must_use]
+pub fn probe_meter_read() -> ProbeMeterReading {
+    PROBE_METER.read()
+}
+
+fn note_launch(kernel_ns: u64) {
+    if !probe_meter_armed() {
+        return;
+    }
+    PROBE_METER.launches.fetch_add(1, Ordering::Relaxed);
+    PROBE_METER
+        .kernel_ns
+        .fetch_add(kernel_ns, Ordering::Relaxed);
+}
+
+fn note_sync(sync_ns: u64) {
+    if !probe_meter_armed() {
+        return;
+    }
+    PROBE_METER.syncs.fetch_add(1, Ordering::Relaxed);
+    PROBE_METER.sync_ns.fetch_add(sync_ns, Ordering::Relaxed);
+}
+
+fn note_h2d(bytes: usize, ns: u64) {
+    if !probe_meter_armed() {
+        return;
+    }
+    PROBE_METER.h2d_count.fetch_add(1, Ordering::Relaxed);
+    PROBE_METER
+        .h2d_bytes
+        .fetch_add(bytes as u64, Ordering::Relaxed);
+    PROBE_METER.h2d_ns.fetch_add(ns, Ordering::Relaxed);
+}
+
+fn note_d2h(bytes: usize, ns: u64) {
+    if !probe_meter_armed() {
+        return;
+    }
+    PROBE_METER.d2h_count.fetch_add(1, Ordering::Relaxed);
+    PROBE_METER
+        .d2h_bytes
+        .fetch_add(bytes as u64, Ordering::Relaxed);
+    PROBE_METER.d2h_ns.fetch_add(ns, Ordering::Relaxed);
+}
+
+fn note_dtod(bytes: usize, ns: u64) {
+    if !probe_meter_armed() {
+        return;
+    }
+    PROBE_METER.dtod_count.fetch_add(1, Ordering::Relaxed);
+    PROBE_METER
+        .dtod_bytes
+        .fetch_add(bytes as u64, Ordering::Relaxed);
+    PROBE_METER.dtod_ns.fetch_add(ns, Ordering::Relaxed);
+}
+
+fn note_alloc() {
+    if !probe_meter_armed() {
+        return;
+    }
+    PROBE_METER.alloc_count.fetch_add(1, Ordering::Relaxed);
+}
+
+fn note_free(count: u64) {
+    if !probe_meter_armed() || count == 0 {
+        return;
+    }
+    PROBE_METER.free_count.fetch_add(count, Ordering::Relaxed);
+}
+
+fn note_module_load() {
+    if !probe_meter_armed() {
+        return;
+    }
+    PROBE_METER
+        .module_load_count
+        .fetch_add(1, Ordering::Relaxed);
+}
+
 /// The CUDA context and the dlopen'd driver functions this process uses.
 ///
 /// The context is the retained primary context, made current for the thread that created it, and
@@ -644,6 +965,30 @@ pub struct Cuda {
 }
 
 impl Cuda {
+    /// Blocks until every queued operation on this context has completed (the M2 probe sync point).
+    ///
+    /// The forward perf probe calls this once at each timed block boundary so the host `Instant`
+    /// delta is device-inclusive; nothing on the numeric path calls it.
+    ///
+    /// # Errors
+    /// The driver's cuCtxSynchronize failure code.
+    pub fn synchronize(&self) -> Result<(), String> {
+        let sync: libloading::Symbol<unsafe extern "C" fn() -> CuResult> =
+            self.sym(b"cuCtxSynchronize")?;
+        let metered = probe_meter_armed();
+        let started = metered.then(std::time::Instant::now);
+        // SAFETY: the symbol was resolved from this context's own library and takes no arguments;
+        // it only blocks the calling thread until the context's queued work completes.
+        let r = unsafe { sync() };
+        if let Some(started) = started {
+            note_sync(started.elapsed().as_nanos() as u64);
+        }
+        if r != 0 {
+            return Err(format!("cuCtxSynchronize failed: {r}"));
+        }
+        Ok(())
+    }
+
     /// Opens libcuda.so.1, initialises the driver and makes the primary context current.
     ///
     /// cuInit alone is not enough: cuModuleLoadData and cuMemAlloc need a CURRENT context, and
@@ -808,6 +1153,7 @@ impl Cuda {
                 return Err(format!("cuMemAlloc({bytes}) failed: {r}"));
             }
             *total += bytes;
+            note_alloc();
             Ok(Deviceptr(p))
         }
     }
@@ -829,6 +1175,7 @@ impl Cuda {
                 return Err(format!("cuMemAllocManaged({bytes}) failed: {r}"));
             }
             *total += bytes;
+            note_alloc();
             Ok(Deviceptr(p))
         }
     }
@@ -878,6 +1225,7 @@ impl Cuda {
                 return Err(format!("cuMemHostGetDevicePointer failed: {r}"));
             }
             *total += bytes;
+            note_alloc();
             Ok(HostMapped {
                 host,
                 device: Deviceptr(device),
@@ -895,6 +1243,7 @@ impl Cuda {
                 self.sym::<unsafe extern "C" fn(CuDeviceptr) -> CuResult>(b"cuMemFree_v2")
             {
                 let _ = f(ptr.0);
+                note_free(1);
             }
         }
     }
@@ -906,6 +1255,7 @@ impl Cuda {
                 self.sym::<unsafe extern "C" fn(*mut c_void) -> CuResult>(b"cuMemFreeHost")
             {
                 let _ = f(mapped.host);
+                note_free(1);
             }
         }
     }
@@ -916,7 +1266,12 @@ impl Cuda {
             let f: libloading::Symbol<
                 unsafe extern "C" fn(CuDeviceptr, *const c_void, usize) -> CuResult,
             > = self.sym(b"cuMemcpyHtoD_v2")?;
+            let metered = probe_meter_armed();
+            let started = metered.then(std::time::Instant::now);
             let r = f(dst.0, src.as_ptr().cast(), src.len());
+            if let Some(started) = started {
+                note_h2d(src.len(), started.elapsed().as_nanos() as u64);
+            }
             if r != 0 {
                 return Err(format!("cuMemcpyHtoD failed: {r}"));
             }
@@ -930,7 +1285,13 @@ impl Cuda {
             let f: libloading::Symbol<
                 unsafe extern "C" fn(*mut c_void, CuDeviceptr, usize) -> CuResult,
             > = self.sym(b"cuMemcpyDtoH_v2")?;
-            let r = f(dst.as_mut_ptr().cast(), src.0, dst.len());
+            let metered = probe_meter_armed();
+            let started = metered.then(std::time::Instant::now);
+            let len = dst.len();
+            let r = f(dst.as_mut_ptr().cast(), src.0, len);
+            if let Some(started) = started {
+                note_d2h(len, started.elapsed().as_nanos() as u64);
+            }
             if r != 0 {
                 return Err(format!("cuMemcpyDtoH failed: {r}"));
             }
@@ -962,7 +1323,12 @@ impl Cuda {
             let f: libloading::Symbol<
                 unsafe extern "C" fn(CuDeviceptr, CuDeviceptr, usize) -> CuResult,
             > = self.sym(b"cuMemcpyDtoD_v2")?;
+            let metered = probe_meter_armed();
+            let started = metered.then(std::time::Instant::now);
             let r = f(dst.0, src.0, bytes);
+            if let Some(started) = started {
+                note_dtod(bytes, started.elapsed().as_nanos() as u64);
+            }
             if r != 0 {
                 return Err(format!("cuMemcpyDtoD failed: {r}"));
             }
@@ -1201,6 +1567,7 @@ impl Cuda {
             if r != 0 {
                 return Err(format!("cuModuleGetFunction({name}) failed: {r}"));
             }
+            note_module_load();
             Ok((module, func))
         }
     }
@@ -1211,6 +1578,11 @@ impl Cuda {
     /// immediately around cuLaunchKernel and resolved after the existing cuCtxSynchronize; the
     /// bracketed launches are the same launches in the same order and nothing else changes. Without
     /// the variable no event is created, no allocation happens and the launch path is unchanged.
+    ///
+    /// The forward perf probe arms the same bracket through [probe_meter_arm] instead: the event
+    /// elapsed time feeds the probe's per-block kernel_ns and the cuCtxSynchronize call feeds its
+    /// host-sync bucket. Both switches share one event pair, so a run with both set pays for the
+    /// bracket once. With neither set the bracket is skipped entirely and the path is unchanged.
     pub fn launch(
         &self,
         kernel: Kernel,
@@ -1224,9 +1596,12 @@ impl Cuda {
             let mut ptrs: Vec<*mut c_void> =
                 storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
             let timing = stage_timing_enabled();
+            let metered = probe_meter_armed();
             let mut start_event: CuEvent = std::ptr::null_mut();
             let mut stop_event: CuEvent = std::ptr::null_mut();
-            if timing {
+            // One bracket serves both consumers: the stage ledger and the probe meter.
+            let bracket = timing || metered;
+            if bracket {
                 let create: libloading::Symbol<
                     unsafe extern "C" fn(*mut CuEvent, u32) -> CuResult,
                 > = self.sym(b"cuEventCreate")?;
@@ -1263,7 +1638,7 @@ impl Cuda {
             if r != 0 {
                 return Err(format!("cuLaunchKernel failed: {r}"));
             }
-            if timing {
+            if bracket {
                 let record: libloading::Symbol<
                     unsafe extern "C" fn(CuEvent, *mut c_void) -> CuResult,
                 > = self.sym(b"cuEventRecord")?;
@@ -1274,11 +1649,15 @@ impl Cuda {
             }
             let sync: libloading::Symbol<unsafe extern "C" fn() -> CuResult> =
                 self.sym(b"cuCtxSynchronize")?;
+            let sync_started = metered.then(std::time::Instant::now);
             let r = sync();
+            if let Some(started) = sync_started {
+                note_sync(started.elapsed().as_nanos() as u64);
+            }
             if r != 0 {
                 return Err(format!("cuCtxSynchronize failed: {r}"));
             }
-            if timing {
+            if bracket {
                 let elapsed: libloading::Symbol<
                     unsafe extern "C" fn(*mut f32, CuEvent, CuEvent) -> CuResult,
                 > = self.sym(b"cuEventElapsedTime")?;
@@ -1291,7 +1670,13 @@ impl Cuda {
                 if r != 0 {
                     return Err(format!("cuEventElapsedTime failed: {r}"));
                 }
-                record_launch(kernel.name, (f64::from(ms) * 1_000_000.0) as u64);
+                let kernel_ns = (f64::from(ms) * 1_000_000.0) as u64;
+                if timing {
+                    record_launch(kernel.name, kernel_ns);
+                }
+                if metered {
+                    note_launch(kernel_ns);
+                }
             }
             Ok(())
         }
@@ -1399,6 +1784,7 @@ impl Cuda {
                 for p in ptrs {
                     let _ = f(p.0);
                 }
+                note_free(ptrs.len() as u64);
             }
             if let Ok(f) = self.sym::<unsafe extern "C" fn(CuModule) -> CuResult>(b"cuModuleUnload")
             {
@@ -1420,6 +1806,7 @@ impl Cuda {
                 for p in ptrs {
                     let _ = f(p.0);
                 }
+                note_free(ptrs.len() as u64);
             }
         }
     }
@@ -1530,5 +1917,81 @@ mod stage_timing_tests {
         assert!(report.steps[0].warm, "step 0 is the warmup step");
         assert!(!report.steps[1].warm, "step 1 is steady state");
         *STAGE_RECORDER.lock().expect("lock") = None;
+    }
+}
+
+#[cfg(test)]
+mod probe_meter_tests {
+    use super::*;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn the_meter_is_off_by_default_arms_explicitly_and_reads_back_what_was_added() {
+        let _serial = TEST_LOCK.lock().expect("test lock");
+        probe_meter_arm(false);
+        assert!(
+            !probe_meter_armed(),
+            "the default path leaves the meter off"
+        );
+        assert!(probe_meter_read().is_clear());
+        note_launch(1_000);
+        note_sync(200);
+        note_h2d(64, 10);
+        assert!(
+            probe_meter_read().is_clear(),
+            "a disarmed meter records nothing"
+        );
+
+        probe_meter_arm(true);
+        assert!(probe_meter_armed());
+        assert!(
+            probe_meter_read().is_clear(),
+            "arming clears the cells so one run reports only its own work"
+        );
+        assert!(probe_meter_read().plus(probe_meter_read()).is_clear());
+        let start = probe_meter_read();
+        note_launch(1_000);
+        note_launch(3_000);
+        note_sync(200);
+        note_h2d(64, 10);
+        note_d2h(128, 20);
+        note_dtod(256, 30);
+        note_alloc();
+        note_alloc();
+        note_free(2);
+        note_module_load();
+        let delta = probe_meter_read().since(start);
+        assert_eq!(delta.launches, 2);
+        assert_eq!(delta.kernel_ns, 4_000);
+        assert_eq!(delta.syncs, 1);
+        assert_eq!(delta.sync_ns, 200);
+        assert_eq!(delta.h2d_count, 1);
+        assert_eq!(delta.h2d_bytes, 64);
+        assert_eq!(delta.h2d_ns, 10);
+        assert_eq!(delta.d2h_count, 1);
+        assert_eq!(delta.d2h_bytes, 128);
+        assert_eq!(delta.d2h_ns, 20);
+        assert_eq!(delta.dtod_count, 1);
+        assert_eq!(delta.dtod_bytes, 256);
+        assert_eq!(delta.dtod_ns, 30);
+        assert_eq!(delta.alloc_count, 2);
+        assert_eq!(delta.free_count, 2);
+        assert_eq!(delta.module_load_count, 1);
+        assert!(!delta.is_clear());
+        probe_meter_arm(false);
+    }
+
+    #[test]
+    fn a_reading_is_never_negative_and_an_unchanged_meter_is_clear() {
+        let _serial = TEST_LOCK.lock().expect("test lock");
+        probe_meter_arm(true);
+        let before = probe_meter_read();
+        note_launch(5);
+        let after = probe_meter_read();
+        assert!(after.since(after).is_clear());
+        let backwards = before.since(after);
+        assert_eq!(backwards, ProbeMeterReading::default());
+        probe_meter_arm(false);
     }
 }

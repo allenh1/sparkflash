@@ -1,0 +1,18 @@
+# Keep the build context to sources and fixtures a release build needs.
+target/
+target-*/
+.git/
+.gitignore
+.github/
+*.log
+docs/
+scripts/tests/__pycache__/
+**/__pycache__/
+**/*.pyc
+# Evidence directories are host artifacts, not inputs.
+ev-session-*/
+phase2-evidence/
+# Local model/checkpoint payloads are mounted at run time, never baked into an image.
+models/
+*.safetensors
+*.safetensors.index.json

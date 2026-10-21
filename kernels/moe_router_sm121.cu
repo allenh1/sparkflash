@@ -190,6 +190,12 @@ extern "C" __global__ void moe_router_topk_sm121(
     uint64_t t_enter = 0u;
     SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_MOE_MXFP4, t_enter);
 
+    __shared__ float s_bias[SPARK_ROUTER_N_ROUTED];
+    for (uint32_t e = threadIdx.x; e < SPARK_ROUTER_N_ROUTED; e += blockDim.x) {
+        s_bias[e] = bias[e];
+    }
+    __syncthreads();
+
     if (token < tokens) {
         const float *row = scores + (uint64_t)token * SPARK_ROUTER_N_ROUTED;
         uint32_t chosen[SPARK_ROUTER_TOP_K];
@@ -200,17 +206,17 @@ extern "C" __global__ void moe_router_topk_sm121(
             bool have = false;
             for (uint32_t expert = 0u; expert < SPARK_ROUTER_N_ROUTED; ++expert) {
                 bool already = false;
-                for (uint32_t s = 0u; s < taken_count; ++s) {
-                    if (chosen[s] == expert) {
+#pragma unroll
+                for (uint32_t s = 0u; s < SPARK_ROUTER_TOP_K; ++s) {
+                    if (s < taken_count && chosen[s] == expert) {
                         already = true;
-                        break;
                     }
                 }
                 if (already) {
                     continue;
                 }
                 // The selection signal is the biased score; the stored weight is the unbiased one.
-                const float signal = __fadd_rn(row[expert], bias[expert]);
+                const float signal = __fadd_rn(row[expert], s_bias[expert]);
                 // Strict > keeps the lower expert id on a tie, which is the engine's rule.
                 if (!have || signal > best_signal) {
                     best = expert;

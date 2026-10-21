@@ -34,7 +34,7 @@ the stale printed-class logs are therefore regenerated: stage 2 by A/B/C, stage 
   `1bc6093` numbers are superseded: do not cherry-pick it, it predates format 2 and would revert
   the current pins.
 - **Baseline** (`crates/sparkflash-kernels/baseline/kernel_baseline.txt`): the current main cubin
-  is `flash_mla_csa2_sm121` **60,792 B, sha256 `5bfee4c7a0ece7c921e591fc6b8bd9d98c39b95d735d7c1d699ec58edaa51ea3`**
+  is `flash_mla_csa2_sm121` **60,792 B, sha256 `64fc2944d510885490ef1caeb680600f30b1d552c6ec31b0f6ed840ad0f09d2b`**
   under the pinned `nvcc V13.0.88` (CUDA 13.0.3), `arch=sm_121a`.
 - **Tree identity** (measured with git, not asserted): `1bc6093` and `826f4f0` have the same
   parent `6574390` (!30) and the same 5-file/220-28 stat, and
@@ -122,7 +122,7 @@ pinned toolkit; stop and rebuild rather than running the window.
 
 | Cubin as staged | Pinned bytes | Pinned sha256 (V13.0.88, sm_121a) |
 | :--- | :--- | :--- |
-| `flash_mla_csa2_sm121.cubin` | 60,792 | `5bfee4c7a0ece7c921e591fc6b8bd9d98c39b95d735d7c1d699ec58edaa51ea3` |
+| `flash_mla_csa2_sm121.cubin` | 60,792 | `64fc2944d510885490ef1caeb680600f30b1d552c6ec31b0f6ed840ad0f09d2b` |
 | `mega_mhc_fused_bf16_sm121.cubin` (copied/renamed from `mega_mhc_sm121.cubin`) | 70,312 | `e21293e3f6288dbe413a2b998efce6c43c8a56dd993eca5cd1bfc6138cdca618` |
 
 The full seven-entry pinned set is in
@@ -224,7 +224,7 @@ values the 2026-10-18 window actually printed are shown after each line:
    the run's geometry. The binary and cubin sha256s are NOT repeated in the per-run logs; they are
    the window log's provenance lines, quoted verbatim as
    `43603e4442829b73590bbc35a5ab433ae67cc50e94b8741822a9d0d959513cdc  .../m7_layer0_task7_aarch64` and
-   `5bfee4c7a0ece7c921e591fc6b8bd9d98c39b95d735d7c1d699ec58edaa51ea3  .../cubins/flash_mla_csa2_sm121.cubin`
+   `64fc2944d510885490ef1caeb680600f30b1d552c6ec31b0f6ed840ad0f09d2b  .../cubins/flash_mla_csa2_sm121.cubin`
    (`/home/user/phase2-evidence/window-2026-10-18/logs/window-20261018T171617Z.log`). The
    window's UTC start/end is recorded in that same log, not in the per-run logs. The stage-1 retry's
    provenance lines are in its own window log

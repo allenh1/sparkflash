@@ -129,21 +129,51 @@ __device__ __forceinline__ bool spark_lm_reduce_better(const float value, const 
 // not inserted again: a tie is one entry, not two copies of it.
 __device__ __forceinline__ void spark_lm_reduce_top5_insert(const float value, const uint32_t index,
                                                             float *top_value, uint32_t *top_index) {
+    if (!spark_lm_reduce_better(value, index, top_value[SPARK_LM_REDUCE_TOP - 1u],
+                                top_index[SPARK_LM_REDUCE_TOP - 1u])) {
+        return;
+    }
+#pragma unroll
     for (uint32_t slot = 0u; slot < SPARK_LM_REDUCE_TOP; ++slot) {
         if (top_index[slot] == index) {
             return;
         }
     }
-    for (uint32_t slot = 0u; slot < SPARK_LM_REDUCE_TOP; ++slot) {
-        if (spark_lm_reduce_better(value, index, top_value[slot], top_index[slot])) {
-            for (uint32_t move = SPARK_LM_REDUCE_TOP - 1u; move > slot; --move) {
-                top_value[move] = top_value[move - 1u];
-                top_index[move] = top_index[move - 1u];
-            }
-            top_value[slot] = value;
-            top_index[slot] = index;
-            return;
-        }
+    if (spark_lm_reduce_better(value, index, top_value[0], top_index[0])) {
+        top_value[4] = top_value[3];
+        top_index[4] = top_index[3];
+        top_value[3] = top_value[2];
+        top_index[3] = top_index[2];
+        top_value[2] = top_value[1];
+        top_index[2] = top_index[1];
+        top_value[1] = top_value[0];
+        top_index[1] = top_index[0];
+        top_value[0] = value;
+        top_index[0] = index;
+    } else if (spark_lm_reduce_better(value, index, top_value[1], top_index[1])) {
+        top_value[4] = top_value[3];
+        top_index[4] = top_index[3];
+        top_value[3] = top_value[2];
+        top_index[3] = top_index[2];
+        top_value[2] = top_value[1];
+        top_index[2] = top_index[1];
+        top_value[1] = value;
+        top_index[1] = index;
+    } else if (spark_lm_reduce_better(value, index, top_value[2], top_index[2])) {
+        top_value[4] = top_value[3];
+        top_index[4] = top_index[3];
+        top_value[3] = top_value[2];
+        top_index[3] = top_index[2];
+        top_value[2] = value;
+        top_index[2] = index;
+    } else if (spark_lm_reduce_better(value, index, top_value[3], top_index[3])) {
+        top_value[4] = top_value[3];
+        top_index[4] = top_index[3];
+        top_value[3] = value;
+        top_index[3] = index;
+    } else {
+        top_value[4] = value;
+        top_index[4] = index;
     }
 }
 

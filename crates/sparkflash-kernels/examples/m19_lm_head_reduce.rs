@@ -89,13 +89,13 @@ const RANKS: usize = 4;
 
 /// The certified screen's pin (the c4c chain launches this artifact).
 const SCREEN_KERNEL: &str = "cert_lm_head_sm121";
-const SCREEN_BYTES: usize = 38_088;
-const SCREEN_SHA256: &str = "3b71c99290ee91ca2431c0e232c644559f1c6e2bf340182fc103486789dad8f8";
+const SCREEN_BYTES: usize = 36_800;
+const SCREEN_SHA256: &str = "bbd30c8d6d358bd200b07cffa54d662c9144501b69310864933b68a0e53b6798";
 
 /// This kernel's pin, from baseline/kernel_baseline.txt through baseline::pin.
 const REDUCE_KERNEL: &str = "lm_head_reduce_sm121";
-const REDUCE_BYTES: usize = 73_704;
-const REDUCE_SHA256: &str = "2d18f68d71fbe657ed8e675f3b74c386678d51ff350a82368fff0df50c0032d3";
+const REDUCE_BYTES: usize = 76_176;
+const REDUCE_SHA256: &str = "b4ef4ce8141be1678b565cdf838af46fefb4116de3dcaed97d4bca4506a61e30";
 
 /// The declared hidden seam pins (the same artifacts m16 declares).
 const HEAD_INPUT_BYTES: usize = HIDDEN * 4;

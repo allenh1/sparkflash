@@ -85,13 +85,13 @@ use sparkflash_kernels::mla_ref;
 
 /// The base entry's pin, unchanged by this work.
 const BASE_KERNEL: &str = "flash_mla_csa2_sm121";
-const BASE_BYTES: usize = 60_792;
-const BASE_SHA256: &str = "5bfee4c7a0ece7c921e591fc6b8bd9d98c39b95d735d7c1d699ec58edaa51ea3";
+const BASE_BYTES: usize = 69_064;
+const BASE_SHA256: &str = "64fc2944d510885490ef1caeb680600f30b1d552c6ec31b0f6ed840ad0f09d2b";
 
 /// The sequence entry's pin, from baseline/kernel_baseline.txt through baseline::pin.
 const SEQ_KERNEL: &str = "flash_mla_csa2_seq_sm121";
-const SEQ_BYTES: usize = 135_656;
-const SEQ_SHA256: &str = "8dfd27db78349c5333d22e405d4e50288c310d583e8e6eb82727e16ab32cd19a";
+const SEQ_BYTES: usize = 154_464;
+const SEQ_SHA256: &str = "fedca6f4e5da2f2ec2307ae1dc610e3da9d92e185483a3480e9e90b56497ab4b";
 
 /// The 2B contract's comparison bar for the attention output.
 const BAR_ABS: f32 = 2e-2;

@@ -433,7 +433,7 @@ async fn chat_invalid_role_is_a_400_with_the_vllm_text() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"]["message"], "Invalid role: wizard");
-    assert_eq!(body["error"]["code"], "invalid_messages");
+    assert_eq!(body["error"]["code"], 400);
 }
 
 #[tokio::test]
@@ -453,7 +453,7 @@ async fn chat_unsupported_effort_is_a_400_with_the_vllm_text() {
         body["error"]["message"],
         "DeepSeek V4.1 reasoning_effort must be low, high, xhigh, max, or an integer within [1, 100] in chat_template_kwargs"
     );
-    assert_eq!(body["error"]["code"], "invalid_reasoning_effort");
+    assert_eq!(body["error"]["code"], 400);
 }
 
 fn app_without_seam() -> Router {

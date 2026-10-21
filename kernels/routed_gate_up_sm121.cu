@@ -69,9 +69,12 @@
 
 #include "m4_common_sm121.cuh"
 
-// One output element per thread; the reduction walks K in whole MX blocks.
-#define SPARK_GATE_UP_TILE 256u
-#define SPARK_GATE_UP_THREADS 256u
+// One output column per reducer thread and eight parallel K groups per block: 32 columns x 8
+// groups. The eight groups split the 160 ascending block partials the reference folds serially; the
+// reducer re-adds them in ascending block order, so the split changes the schedule, not the value.
+#define SPARK_GATE_UP_TILE 32u
+#define SPARK_GATE_UP_K_GROUPS 8u
+#define SPARK_GATE_UP_THREADS (SPARK_GATE_UP_TILE * SPARK_GATE_UP_K_GROUPS)
 // K is the whole hidden size: the block input, not the routed width.
 #define SPARK_GATE_UP_K_BLOCKS (SPARK_M4_HIDDEN / SPARK_M4_QUANT_BLOCK)
 // Packed FP4 weight bytes per output row: 5120 values, two per byte.
@@ -88,7 +91,9 @@ static_assert(SPARK_M4_MOE_WIDTH_PADDED % SPARK_M4_QUANT_BLOCK == 0u,
               "the padded routed width tiles by 32");
 static_assert(SPARK_GATE_UP_TILES * SPARK_GATE_UP_TILE >= SPARK_M4_MOE_WIDTH_PADDED,
               "the tile grid covers the padded width");
-static_assert(SPARK_GATE_UP_THREADS == SPARK_GATE_UP_TILE, "one output element per thread");
+static_assert(SPARK_GATE_UP_THREADS == 256u, "the block is 32 columns x 8 parallel K groups");
+static_assert(SPARK_GATE_UP_TILE * SPARK_GATE_UP_K_GROUPS == SPARK_GATE_UP_THREADS,
+              "one compute thread per (column, K group)");
 static_assert(SPARK_M4_MOE_TOP_K == 6u, "six routed slots per token");
 static_assert(SPARK_GATE_UP_PACKED_ROW == 2560u, "one 5120-wide FP4 row is 2560 bytes");
 static_assert(SPARK_GATE_UP_SCALE_ROW == 160u, "one 5120-wide row has 160 ue8m0 scales");
@@ -116,61 +121,86 @@ extern "C" __global__ void routed_gate_up_sm121(
     const uint32_t layer_id,
     const uint64_t step_seq) {
     const uint32_t routed_row = blockIdx.x;
-    const uint32_t column = blockIdx.y * SPARK_GATE_UP_TILE + threadIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t col_local = tid % SPARK_GATE_UP_TILE;
+    const uint32_t group = tid / SPARK_GATE_UP_TILE;
+    const uint32_t column = blockIdx.y * SPARK_GATE_UP_TILE + col_local;
+    const uint32_t live_rows = tokens * (uint32_t)SPARK_M4_MOE_TOP_K;
+    const bool live = routed_row < live_rows;
 
     uint64_t t_enter = 0u;
     SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_MOE_MXFP4, t_enter);
 
-    if (routed_row < tokens * SPARK_M4_MOE_TOP_K && column < (uint32_t)SPARK_M4_MOE_WIDTH_PADDED) {
-        __nv_bfloat16 *out_row = out + (uint64_t)routed_row * SPARK_M4_MOE_WIDTH_PADDED;
-        if (column < (uint32_t)SPARK_M4_MOE_WIDTH) {
-            // The activation row belongs to the TOKEN, not the slot: all six slots of one token
-            // reduce the same block input, and only the weight row differs.
-            const uint32_t token = routed_row / SPARK_M4_MOE_TOP_K;
-            const uint32_t expert = expert_ids[routed_row];
-            const uint8_t *act_row = act_fp8 + (uint64_t)token * SPARK_M4_HIDDEN;
-            const uint8_t *act_scale_row = act_scales + (uint64_t)token * SPARK_GATE_UP_SCALE_ROW;
-            const uint32_t weight_row = expert * (uint32_t)SPARK_M4_MOE_WIDTH + column;
-            const uint8_t *w_row = w_fp4 + (uint64_t)weight_row * SPARK_GATE_UP_PACKED_ROW;
-            const uint8_t *w_scale_row = w_scales + spark_b12x_row_scale_index(
-                                                       weight_row, 0u, (uint32_t)SPARK_M4_HIDDEN);
-            float acc = 0.0f;
-            for (uint32_t block = 0; block < SPARK_GATE_UP_K_BLOCKS; ++block) {
-                const uint32_t base = block * SPARK_M4_QUANT_BLOCK;
-                const float act_scale = spark_ue8m0_decode(act_scale_row[block]);
-                const float w_scale = spark_ue8m0_decode(w_scale_row[block]);
-                float partial = 0.0f;
-                for (uint32_t i = 0; i < SPARK_M4_QUANT_BLOCK; ++i) {
-                    const uint32_t index = base + i;
-                    // The FP4 -> FP8 cast is exact on all sixteen E2M1 codes (mxfp4_ref.rs
-                    // enumerates them), and it is written out because it is what kernel.py:538-540
-                    // does: the MMA consumes the cast value, exactly as the reference.
-                    const float act_value = spark_fp8_e4m3_decode(act_row[index]);
-                    const float w_value = spark_fp8_e4m3_decode(
-                        spark_fp8_e4m3_encode(spark_gate_up_fp4_load(w_row, index)));
-                    // Separate roundings per multiply and per add (__fmul_rn then __fadd_rn,
-                    // never a contracted FMA): the CPU twin rounds the product before the add, and
-                    // nvcc's default -fmad=true would fuse the two into one rounding. That is a
-                    // real value difference, not a style choice - the harness asserts 0 ULP.
-                    partial = __fadd_rn(partial, __fmul_rn(act_value, w_value));
-                }
-                // Both scales go on the block PARTIAL PRODUCT, as kernel.py:552-553 accumulates
-                // C_local * scale_a * scale_b; one rounded f32 add per 32-value block. The scales
-                // are powers of two, so both multiplies are exact and only the add rounds.
-                acc = __fadd_rn(acc, __fmul_rn(__fmul_rn(partial, act_scale), w_scale));
+    // This K group's scaled block partials for one routed row: [block][column-within-tile]. The 160
+    // K blocks are independent partial products, so eight groups compute them in parallel and the
+    // reducer folds them in ascending block order, which is the reference's serial order.
+    __shared__ float terms[SPARK_GATE_UP_K_BLOCKS][SPARK_GATE_UP_TILE];
+
+    if (live && column < (uint32_t)SPARK_M4_MOE_WIDTH) {
+        const uint32_t token = routed_row / (uint32_t)SPARK_M4_MOE_TOP_K;
+        const uint32_t expert = expert_ids[routed_row];
+        // The activation row is the token's row: the routing weight was folded into the activation
+        // before quantisation (model.py:849-851), so every one of the token's slots multiplies the
+        // same quantised E4M3 row and nothing here multiplies by routing again.
+        const uint8_t *act_row = act_fp8 + (uint64_t)token * SPARK_M4_HIDDEN;
+        const uint8_t *act_scale_row = act_scales + (uint64_t)token * SPARK_GATE_UP_SCALE_ROW;
+        // The weight row is this rank's slice of the expert's gate (or up) matrix, [576, 5120] FP4
+        // for one rank: the caller stages the slice and passes its rows contiguously.
+        const uint32_t weight_row = expert * (uint32_t)SPARK_M4_MOE_WIDTH + column;
+        const uint8_t *w_row = w_fp4 + (uint64_t)weight_row * SPARK_GATE_UP_PACKED_ROW;
+        const uint8_t *w_scale_row =
+            w_scales + spark_b12x_row_scale_index(weight_row, 0u, (uint32_t)SPARK_M4_HIDDEN);
+        for (uint32_t block = group; block < (uint32_t)SPARK_GATE_UP_K_BLOCKS;
+             block += (uint32_t)SPARK_GATE_UP_K_GROUPS) {
+            const uint32_t base = block * SPARK_M4_QUANT_BLOCK;
+            const float act_scale = spark_ue8m0_decode(act_scale_row[block]);
+            const float w_scale = spark_ue8m0_decode(w_scale_row[block]);
+            float partial = 0.0f;
+#pragma unroll
+            for (uint32_t b = 0u; b < SPARK_M4_QUANT_BLOCK / 2u; ++b) {
+                const uint32_t i0 = base + 2u * b;
+                const uint8_t packed = w_row[i0 / 2u];
+                const float a0 = spark_fp8_e4m3_decode(act_row[i0]);
+                const float w0 = spark_fp4_e2m1_decode(spark_gate_up_fp4_low(packed));
+                partial = __fadd_rn(partial, __fmul_rn(a0, w0));
+                const float a1 = spark_fp8_e4m3_decode(act_row[i0 + 1u]);
+                const float w1 = spark_fp4_e2m1_decode(spark_gate_up_fp4_high(packed));
+                partial = __fadd_rn(partial, __fmul_rn(a1, w1));
             }
-            out_row[column] = __float2bfloat16_rn(acc);
-        } else {
-            // Columns 576..639 are the ABI's padding: this kernel writes them zero so the pinned
-            // SwiGLU routed shape is fed deterministically whatever a caller allocated.
-            out_row[column] = __float2bfloat16_rn(0.0f);
+            // The reference's block term: both scales are powers of two, so these two multiplies are
+            // exact and this is the same value the serial kernel's block term had. The explicit
+            // intrinsics keep the twin's separate-rounding contract independent of -fmad.
+            terms[block][col_local] = __fmul_rn(__fmul_rn(partial, act_scale), w_scale);
+        }
+    }
+    __syncthreads();
+
+    // One reducer thread per output column: the 160-add ascending chain is the reference's order,
+    // and it is the only ordered arithmetic in this kernel.
+    if (tid < (uint32_t)SPARK_GATE_UP_TILE) {
+        const uint32_t out_column = blockIdx.y * SPARK_GATE_UP_TILE + tid;
+        if (live && out_column < (uint32_t)SPARK_M4_MOE_WIDTH_PADDED) {
+            __nv_bfloat16 *out_row = out + (uint64_t)routed_row * SPARK_M4_MOE_WIDTH_PADDED;
+            if (out_column < (uint32_t)SPARK_M4_MOE_WIDTH) {
+                float acc = 0.0f;
+                for (uint32_t block = 0; block < (uint32_t)SPARK_GATE_UP_K_BLOCKS; ++block) {
+                    acc = __fadd_rn(acc, terms[block][tid]);
+                }
+                out_row[out_column] = __float2bfloat16_rn(acc);
+            } else {
+                // Columns 576..639 are the ABI's padding: this kernel writes them zero so the
+                // pinned SwiGLU routed shape is fed deterministically whatever a caller allocated.
+                out_row[out_column] = __float2bfloat16_rn(0.0f);
+            }
         }
     }
     __syncthreads();
 
     // payload_meta: one bf16 per output element of this block's tile.
-    const uint32_t meta = SPARK_GATE_UP_TILE * 2u;
-    SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_MOE_MXFP4, layer_id, meta, t_enter);
-    (void)step_seq;
+    if (tid == 0u) {
+        const uint32_t meta = SPARK_GATE_UP_TILE * 2u;
+        SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_MOE_MXFP4, layer_id, meta, t_enter);
+        (void)step_seq;
+    }
     (void)t_enter;
 }

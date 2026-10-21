@@ -150,11 +150,7 @@ mod tests {
     #[test]
     fn the_embedded_baseline_parses_and_pins_every_m4_kernel() {
         let pins = pins().expect("the embedded baseline parses");
-        assert_eq!(
-            pins.len(),
-            19,
-            "the baseline pins nineteen kernels: {pins:?}"
-        );
+        assert_eq!(pins.len(), 20, "the baseline pins twenty kernels: {pins:?}");
         // m4_abi stays frozen (D26); this test only reads its name list and proves the baseline the
         // chain verifies against covers every kernel the ABI module exposes.
         for (source_name, _source) in crate::m4_abi::KERNELS {
@@ -170,6 +166,7 @@ mod tests {
             "mega_mhc_sm121",
             "b12x_mxfp8_dense_sm121",
             "b12x_mxfp4_moe_sm121",
+            "b12x_mxfp4_moe_stored_sm121",
             "flash_mla_csa2_sm121",
             "b12x_mxfp8_wo_a_sm121",
             "cert_lm_head_sm121",

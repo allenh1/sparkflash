@@ -36,8 +36,8 @@ use sparkflash_kernels::m4_quant::bf16_bits;
 use sparkflash_kernels::mega_mhc_launch::{self, MegaMhcParams};
 
 const KERNEL: &str = "mega_mhc_sm121";
-const PIN_BYTES: usize = 141_632;
-const PIN_SHA256: &str = "3db997ed3fafaf41ee87683d18fe7af339c84a777baa46ee2d6f528c1681b3d9";
+const PIN_BYTES: usize = 151_592;
+const PIN_SHA256: &str = "7040411617954a17e89e6d9d8fcea1a872171de259a5515bde1e69a96c69af5c";
 const PIN_MEMBAR_LINES: u32 = 7;
 const ROWS: usize = 6;
 const STREAMS: usize = 4;

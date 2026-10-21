@@ -117,6 +117,69 @@ impl Default for Sampling {
     }
 }
 
+/// The generation-changing sampler options a request can set.
+///
+/// Kept apart from [Sampling] so that the temperature/seed call sites and their tests stay exactly
+/// as they were: the default value below is the disabled configuration, and a step whose options
+/// are default calls [`sample_gumbel`] verbatim.
+///
+/// vLLM applies the penalties to the raw logits before temperature scaling
+/// (`sampling_params.py`: `repetition_penalty` over the prompt and the generated text so far,
+/// lines 248-253; `presence_penalty`/`frequency_penalty` over the generated text so far, lines
+/// 240-246), then temperature, then the `top_k`/`top_p` candidate filters (lines 256-262). The
+/// reference's Gumbel-max draw is distributionally the same as a draw from the filtered softmax.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SamplerOptions {
+    /// Nucleus threshold over the temperature-scaled probabilities. 1.0 disables it. 0.0 keeps
+    /// only the most likely token: our documented extension, because vLLM refuses it (its range
+    /// is (0, 1], `sampling_params.py` lines 583-585).
+    pub top_p: f32,
+    /// Keep this many most likely tokens. 0 and -1 disable it; vLLM refuses anything below
+    /// -1 (`sampling_params.py` lines 583-599: "top_k must be 0 (disable), or at least 1").
+    pub top_k: i32,
+    /// Divide the logits of already-seen tokens above zero and multiply those below it by this
+    /// value (`sampling_params.py` lines 248-253). 1.0 disables it; values above 1 discourage
+    /// repetition and values below 1 encourage it.
+    pub repetition_penalty: f32,
+    /// Subtracted once from the logit of every token that appears in the generated text
+    /// (`sampling_params.py` lines 240-243). 0.0 disables it; positive values discourage tokens
+    /// already generated.
+    pub presence_penalty: f32,
+    /// Subtracted from the logit of every generated token once per occurrence
+    /// (`sampling_params.py` lines 244-246). 0.0 disables it.
+    pub frequency_penalty: f32,
+    /// How many of the consumed tokens are the prompt. Everything at or after this index is
+    /// generated text, which is the history the presence/frequency penalties count; the
+    /// repetition penalty sees the prompt too.
+    pub prompt_len: usize,
+}
+
+impl Default for SamplerOptions {
+    fn default() -> Self {
+        Self {
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            prompt_len: 0,
+        }
+    }
+}
+
+impl SamplerOptions {
+    /// True when every option that changes generation is disabled, so [`sample`] can take the
+    /// untouched [`sample_gumbel`] path.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.top_p == 1.0
+            && self.top_k <= 0
+            && self.repetition_penalty == 1.0
+            && self.presence_penalty == 0.0
+            && self.frequency_penalty == 0.0
+    }
+}
+
 /// What one step produced.
 #[derive(Debug)]
 pub struct StepOutput {
@@ -137,6 +200,22 @@ pub struct StepOutput {
     pub consumed: usize,
 }
 
+/// One prefill chunk's output together with the LM-head rows of selected positions.
+///
+/// This is the one-pass prompt-logprobs seam: every selected position's next-token distribution is
+/// read from the same forward that consumes the chunk, instead of re-forwarding the prefix once per
+/// scored position. The rows are the same completed function of the position - the collapsed mHC
+/// residual after the final RMS norm and the LM head - so selecting a position changes what is
+/// returned, never the arithmetic that produced it.
+#[derive(Debug)]
+pub struct PositionLogits {
+    /// What [`InferenceEngine::prefill`] returns for the same chunk: the last position's logits,
+    /// head input, sampled token and draft.
+    pub step: StepOutput,
+    /// One logits row per requested position, in request order, each `vocab_size` long.
+    pub rows: Vec<Vec<f32>>,
+}
+
 /// What one observed step produced: the step's output and the boundary table recorded for it.
 #[derive(Debug)]
 pub struct ObservedStep {
@@ -144,6 +223,21 @@ pub struct ObservedStep {
     pub output: StepOutput,
     /// The per-layer boundary table, one row per layer that ran, in run order.
     pub boundary: BoundaryTable,
+}
+
+/// One rank's LM-head logits without the gather, for the TP=4 prompt-logprob contract.
+#[derive(Debug, Clone)]
+pub struct RankHeadLogits {
+    /// The rank-local rows, `rows * local_vocab` values in row-major order.
+    pub logits: Vec<f32>,
+    /// The rank's shard width in vocabulary entries.
+    pub local_vocab: usize,
+    /// The rank the gather seam reported.
+    pub rank: usize,
+    /// The world size the gather seam reported.
+    pub world: usize,
+    /// The first global token id in [Self::logits] (0 for a replicated head).
+    pub offset: usize,
 }
 
 /// The reference engine: a configuration, a plan, a weight source and a sampler.
@@ -156,6 +250,9 @@ pub struct InferenceEngine {
     source: Box<dyn WeightSource>,
     limit: usize,
     sampling: Sampling,
+    /// The generation-changing sampler options: penalties and candidate filters. The default is
+    /// the disabled configuration, so the default path calls [`sample_gumbel`] verbatim.
+    sampler: SamplerOptions,
     /// The TP seam state when this engine runs one rank of a sharded model.
     tp: Option<crate::parallel_tp::TpRuntime>,
     /// The exact f32 gather for row-sharded attention/head weights (batch 18). `None` means the
@@ -214,6 +311,7 @@ impl InferenceEngine {
             source,
             limit,
             sampling: Sampling::default(),
+            sampler: SamplerOptions::default(),
             tp: None,
             gather: None,
         })
@@ -258,6 +356,7 @@ impl InferenceEngine {
             source: Box::new(resident),
             limit,
             sampling: Sampling::default(),
+            sampler: SamplerOptions::default(),
             tp: Some(runtime),
             gather: None,
         })
@@ -309,6 +408,28 @@ impl InferenceEngine {
     /// resident weights and the TP seam state are untouched; only the sampler changes.
     pub fn set_sampling(&mut self, sampling: Sampling) {
         self.sampling = sampling;
+    }
+
+    /// The same engine with different generation-changing sampler options.
+    #[must_use]
+    pub fn with_sampler_options(mut self, options: SamplerOptions) -> Self {
+        self.sampler = options;
+        self
+    }
+
+    /// Replaces the generation-changing sampler options without consuming the engine.
+    ///
+    /// This is the per-request hook beside [Self::set_sampling]: a driver that owns its engine
+    /// across requests applies one request's penalties and candidate filters here before the
+    /// request's first [Self::prefill]. The weights and the TP seam state are untouched.
+    pub fn set_sampler_options(&mut self, options: SamplerOptions) {
+        self.sampler = options;
+    }
+
+    /// The sampler options in force.
+    #[must_use]
+    pub fn sampler_options(&self) -> SamplerOptions {
+        self.sampler
     }
 
     /// The configuration this engine runs.
@@ -400,6 +521,92 @@ impl InferenceEngine {
         Ok(logits)
     }
 
+    /// The rank-local LM-head logits for `rows` tail positions, without the exact gather.
+    ///
+    /// This is the same matmul [Self::head_logits] performs before it gathers: when the source
+    /// serves a row shard, the result is this rank's segment of the vocabulary only, which is what
+    /// the TP=4 prompt-logprob contract screens and exchanges. A replicated head returns the whole
+    /// vector and rank 0, and every rank computes the same values.
+    ///
+    /// # Errors
+    ///
+    /// [EngineError::Shape] for a shard without a matching gather seam or a mismatched tail shape;
+    /// any weight read error otherwise.
+    pub fn head_rank_logits(
+        &self,
+        tail: &[f32],
+        rows: usize,
+    ) -> Result<RankHeadLogits, EngineError> {
+        let dim = self.config.dim;
+        let vocab = self.config.vocab_size;
+        if dim == 0 || tail.len() != rows.saturating_mul(dim) {
+            return Err(EngineError::Shape {
+                what: "rank lm head".to_owned(),
+                detail: format!("{} tail values are not {rows} rows of {dim}", tail.len()),
+            });
+        }
+        let spec = self.source.spec("head.weight")?;
+        let local_vocab = spec
+            .shape
+            .first()
+            .copied()
+            .filter(|rows| *rows > 0)
+            .unwrap_or(vocab);
+        if local_vocab == vocab {
+            let head = WeightView::read_plain(
+                self.source.as_ref(),
+                "head.weight",
+                vocab,
+                dim,
+                self.limit,
+            )?;
+            let mut logits = vec![0.0f32; rows * vocab];
+            head.matmul(&mut logits, tail, vocab, dim, rows)?;
+            let world = self.gather.as_ref().map_or(1, |gather| gather.world());
+            return Ok(RankHeadLogits {
+                logits,
+                local_vocab,
+                rank: 0,
+                world,
+                offset: 0,
+            });
+        }
+        let Some(gather) = self.gather.as_ref() else {
+            return Err(EngineError::Shape {
+                what: "rank lm head".to_owned(),
+                detail: format!(
+                    "the source serves {local_vocab} of {vocab} head rows but the engine has no rank-order gather seam"
+                ),
+            });
+        };
+        let world = gather.world();
+        if local_vocab.checked_mul(world) != Some(vocab) {
+            return Err(EngineError::Shape {
+                what: "rank lm head".to_owned(),
+                detail: format!(
+                    "{local_vocab} local head rows over {world} ranks are not the {vocab} vocab"
+                ),
+            });
+        }
+        let rank = gather.rank();
+        let head = WeightView::read_plain(
+            self.source.as_ref(),
+            "head.weight",
+            local_vocab,
+            dim,
+            self.limit,
+        )?;
+        let mut logits = vec![0.0f32; rows * local_vocab];
+        head.matmul(&mut logits, tail, local_vocab, dim, rows)?;
+        Ok(RankHeadLogits {
+            logits,
+            local_vocab,
+            rank,
+            world,
+            offset: rank * local_vocab,
+        })
+    }
+
     /// Consumes `tokens` as one chunk and returns the logits of the last position.
     ///
     /// # Errors
@@ -426,6 +633,48 @@ impl InferenceEngine {
     /// [EngineError] from any weight read, decode or shape check.
     pub fn decode(&self, state: &mut SequenceState, token: u32) -> Result<StepOutput, EngineError> {
         self.run(state, &[token], None)
+    }
+
+    /// Consumes `tokens` as one chunk and returns [`Self::prefill`]'s output together with the
+    /// LM-head logits of the requested positions (0-based, inside this chunk).
+    ///
+    /// This is the one-pass form of prompt logprobs: the per-layer work runs once over the chunk,
+    /// and only the selected positions go through the final norm and the head. A caller scoring a
+    /// prompt feeds it in contiguous spans and asks each span for the distribution rows that score
+    /// the tokens after them; the sum of the spans is one pass over the prompt, where the older
+    /// token-at-a-time path re-forwarded a growing prefix per position.
+    ///
+    /// The rows are [`StepOutput::logits`] for the selected positions, computed by the same
+    /// collapse, final norm and head; the existing bit-for-bit chunked-prefill invariant means the
+    /// span boundaries do not change a value (see `tests/chunked_prefill.rs`).
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::Shape`] when the chunk is empty or a position is outside it, and any weight
+    /// read error [`Self::prefill`] returns.
+    pub fn prefill_with_position_logits(
+        &self,
+        state: &mut SequenceState,
+        tokens: &[u32],
+        positions: &[usize],
+    ) -> Result<PositionLogits, EngineError> {
+        if tokens.is_empty() {
+            return Err(EngineError::Shape {
+                what: "prefill".to_owned(),
+                detail: "no tokens to prefill".to_owned(),
+            });
+        }
+        if let Some(&position) = positions.iter().find(|&&position| position >= tokens.len()) {
+            return Err(EngineError::Shape {
+                what: "prompt logprobs".to_owned(),
+                detail: format!(
+                    "position {position} is outside the {} token prefill chunk; a position's logits require the token at that position to be in the same pass",
+                    tokens.len()
+                ),
+            });
+        }
+        let (step, rows) = self.run_selected(state, tokens, None, Some(positions))?;
+        Ok(PositionLogits { step, rows })
     }
 
     /// [Self::prefill] with the per-layer boundary table recorded
@@ -492,7 +741,7 @@ impl InferenceEngine {
         // the prefix is captured before `run` extends the sequence (BoundaryTable::diff refuses a
         // prefix mismatch even when the start position and chunk tokens agree).
         let mut boundary = BoundaryTable::new(state.len(), tokens, state.tokens());
-        let output = self.run(state, tokens, Some(&mut boundary))?;
+        let (output, _) = self.run_selected(state, tokens, Some(&mut boundary), None)?;
         Ok(ObservedStep { output, boundary })
     }
 }
@@ -648,6 +897,11 @@ pub struct HybridChunkOutput {
     pub token: Option<u32>,
     /// One certified byte per vocabulary entry, when the backend ran a certified screen.
     pub certified_mask: Option<Vec<u8>>,
+    /// One final-normed head input per requested position, in request order (empty when the caller
+    /// asked for no rows). Each row is `dim` values: the collapsed residual after the final RMS
+    /// norm, the same vector [Self::head_input] carries for the last position. It is the input a
+    /// rank-local LM-head shard multiplies, which is what the TP=4 prompt-logprob contract needs.
+    pub position_head_inputs: Vec<Vec<f32>>,
 }
 
 fn u64_bytes(values: usize) -> u64 {
@@ -808,16 +1062,170 @@ fn splitmix64(state: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Samples one token with vLLM's penalties and candidate filters applied.
+///
+/// `tokens` is every token the sequence has consumed, in order; `options.prompt_len` splits it into
+/// the prompt (seen by the repetition penalty only) and the generated text (counted by the
+/// presence/frequency penalties and by the repetition penalty too). When
+/// [SamplerOptions::is_default] holds this is [`sample_gumbel`] unchanged, so the disabled
+/// configuration cannot move a token.
+///
+/// The greedy rule is vLLM's: a temperature that is not above zero means greedy, and vLLM resets
+/// `top_p`/`top_k` at that point (`sampling_params.py` lines 530-535), so greedy is the argmax of
+/// the penalized logits and the candidate filters are ignored.
+#[must_use]
+pub fn sample(
+    logits: &[f32],
+    tokens: &[u32],
+    sampling: Sampling,
+    options: SamplerOptions,
+) -> Option<u32> {
+    if logits.is_empty() {
+        return None;
+    }
+    if options.is_default() {
+        return sample_gumbel(logits, sampling.temperature, sampling.seed);
+    }
+    let mut shaped = logits.to_vec();
+    apply_penalties(&mut shaped, tokens, options);
+    if !sampling.temperature.is_finite() || sampling.temperature <= 0.0 {
+        return linalg::argmax(&shaped).map(|index| index as u32);
+    }
+    let candidates = candidate_filter(&shaped, sampling.temperature, options);
+    keep_candidates(&mut shaped, &candidates);
+    sample_gumbel(&shaped, sampling.temperature, sampling.seed)
+}
+
+/// Applies the three vLLM penalties to `logits` in place.
+///
+/// `repetition_penalty` divides positive logits and multiplies negative ones for every token that
+/// appears in the prompt or the generated text (`sampling_params.py` lines 248-253);
+/// `presence_penalty` is subtracted once and `frequency_penalty` once per occurrence only for
+/// tokens in the generated text (lines 240-246). Tokens outside the vocabulary cannot be produced
+/// by the sampler and are ignored rather than indexing past the row.
+fn apply_penalties(logits: &mut [f32], tokens: &[u32], options: SamplerOptions) {
+    let vocab = logits.len();
+    if options.repetition_penalty > 0.0 && options.repetition_penalty != 1.0 {
+        let penalty = options.repetition_penalty;
+        let mut seen = vec![false; vocab];
+        for &token in tokens {
+            if let Some(flag) = seen.get_mut(token as usize) {
+                *flag = true;
+            }
+        }
+        for (index, &flag) in seen.iter().enumerate() {
+            if !flag {
+                continue;
+            }
+            let value = logits[index];
+            logits[index] = if value > 0.0 {
+                value / penalty
+            } else if value < 0.0 {
+                value * penalty
+            } else {
+                value
+            };
+        }
+    }
+    if options.presence_penalty != 0.0 || options.frequency_penalty != 0.0 {
+        let start = options.prompt_len.min(tokens.len());
+        let mut occurrences = vec![0u32; vocab];
+        for &token in &tokens[start..] {
+            if let Some(count) = occurrences.get_mut(token as usize) {
+                *count += 1;
+            }
+        }
+        for (index, &count) in occurrences.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            logits[index] -= options.presence_penalty + options.frequency_penalty * count as f32;
+        }
+    }
+}
+
+/// The candidate rows the filters keep, most likely first.
+///
+/// `top_k` above zero keeps that many; `top_p` below one keeps the shortest prefix of the
+/// temperature-scaled probability mass whose cumulative probability reaches it, always at least the
+/// most likely token, so 0.0 degenerates to that token (our documented extension: vLLM refuses 0.0).
+fn candidate_filter(logits: &[f32], temperature: f32, options: SamplerOptions) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..logits.len())
+        .filter(|&index| logits[index].is_finite())
+        .collect();
+    order.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+    if options.top_k > 0 {
+        let keep = usize::try_from(options.top_k).unwrap_or(usize::MAX);
+        order.truncate(keep.max(1));
+    }
+    if options.top_p < 1.0 && !order.is_empty() {
+        let temperature = f64::from(temperature);
+        let max = f64::from(logits[order[0]]) / temperature;
+        let mut total = 0.0f64;
+        let mut weights = Vec::with_capacity(order.len());
+        for &index in &order {
+            let scaled = f64::from(logits[index]) / temperature;
+            let weight = (scaled - max).exp();
+            total += weight;
+            weights.push(weight);
+        }
+        let mut cumulative = 0.0f64;
+        let mut keep = 1usize;
+        for (position, weight) in weights.iter().enumerate() {
+            cumulative += weight / total;
+            keep = position + 1;
+            if cumulative >= f64::from(options.top_p) {
+                break;
+            }
+        }
+        order.truncate(keep);
+    }
+    order
+}
+
+/// Masks every row outside `candidates` so the Gumbel draw cannot pick it.
+fn keep_candidates(logits: &mut [f32], candidates: &[usize]) {
+    let mut keep = vec![false; logits.len()];
+    for &index in candidates {
+        if let Some(flag) = keep.get_mut(index) {
+            *flag = true;
+        }
+    }
+    for (index, value) in logits.iter_mut().enumerate() {
+        if !keep[index] {
+            *value = f32::NEG_INFINITY;
+        }
+    }
+}
+
 impl InferenceEngine {
     /// The step [InferenceEngine::prefill] and [InferenceEngine::decode] both run: the whole-model
     /// order of `Transformer.forward` (model.py:1241-1272, section 3.1 of the forward-order doc),
     /// with `seqlen` positions at a time and `start_pos` already in the caches.
+    /// One step with no selected positions: the plain prefill/decode output.
     fn run(
         &self,
         state: &mut SequenceState,
         tokens: &[u32],
-        mut capture: Option<&mut BoundaryTable>,
+        capture: Option<&mut BoundaryTable>,
     ) -> Result<StepOutput, EngineError> {
+        self.run_selected(state, tokens, capture, None)
+            .map(|(step, _)| step)
+    }
+
+    /// One step, optionally reading the LM-head logits of the requested positions from the same
+    /// forward.
+    ///
+    /// The positions are 0-based inside the chunk. Callers validate them before the pass (so an
+    /// invalid request fails before it costs a pass); this function debug-asserts that and never
+    /// indexes outside the collapse.
+    fn run_selected(
+        &self,
+        state: &mut SequenceState,
+        tokens: &[u32],
+        mut capture: Option<&mut BoundaryTable>,
+        positions: Option<&[usize]>,
+    ) -> Result<(StepOutput, Vec<Vec<f32>>), EngineError> {
         let config = &self.config;
         let seqlen = tokens.len();
         let start_pos = state.tokens.len();
@@ -915,12 +1323,41 @@ impl InferenceEngine {
         let mut collapsed = vec![0.0f32; seqlen * dim];
         mhc::hc_pre(config, &pre_mix, &hidden, &mut collapsed)?;
         let norm = linalg::decode_by_name(source, "norm.weight", self.limit)?;
+        // The selected positions read the same collapse, final norm and head that produce the
+        // tail below: the per-layer pass is shared and no prefix is re-forwarded.
+        let selected_rows = match positions {
+            None => Vec::new(),
+            Some([]) => Vec::new(),
+            Some(positions) => {
+                let mut selected = Vec::with_capacity(positions.len().saturating_mul(dim));
+                for &position in positions {
+                    debug_assert!(position < seqlen);
+                    selected.extend_from_slice(&collapsed[position * dim..][..dim]);
+                }
+                for row in selected.chunks_mut(dim) {
+                    linalg::rms_norm(row, &norm, dim, config.norm_eps as f32)?;
+                }
+                let selected_logits = self.head_logits(source, &selected, positions.len())?;
+                selected_logits
+                    .chunks_exact(config.vocab_size)
+                    .map(<[f32]>::to_vec)
+                    .collect()
+            }
+        };
         let mut tail = collapsed[(seqlen - 1) * dim..].to_vec();
         linalg::rms_norm(&mut tail, &norm, dim, config.norm_eps as f32)?;
         let head_input = tail.clone();
         let logits = self.head_logits(source, &tail, 1)?;
 
-        let next_token = sample_gumbel(&logits, self.sampling.temperature, self.sampling.seed);
+        // The sampler options see the tokens consumed so far: `history` is the state before this
+        // chunk plus the chunk itself, built above for the Engram hashes. The default options take
+        // the untouched `sample_gumbel` path, so a request that sets none of them keeps producing
+        // exactly the tokens the driver produced before the options existed.
+        let next_token = if self.sampler.is_default() {
+            sample_gumbel(&logits, self.sampling.temperature, self.sampling.seed)
+        } else {
+            sample(&logits, &history, self.sampling, self.sampler)
+        };
 
         // The DSpark stages draft after this token when the tap fired (model.py:1274-1282).
         // The reference drafts nothing for the chunk at position 0: `forward_spec` returns None there
@@ -953,14 +1390,17 @@ impl InferenceEngine {
         };
 
         state.tokens.extend_from_slice(tokens);
-        Ok(StepOutput {
-            logits,
-            head_input,
-            next_token,
-            draft,
-            confidence,
-            consumed: seqlen,
-        })
+        Ok((
+            StepOutput {
+                logits,
+                head_input,
+                next_token,
+                draft,
+                confidence,
+                consumed: seqlen,
+            },
+            selected_rows,
+        ))
     }
 
     /// One block, in the order `Block.forward` runs it (model.py:968-994, section 3.2).
@@ -2061,6 +2501,7 @@ impl InferenceEngine {
         post: &mut HybridPostProvider<'_>,
         mut attention: Option<&mut dyn attention::AttentionProjectionBackend>,
         mut moe_backend: Option<&mut dyn moe::MoeDeviceBackend>,
+        position_logits: &[usize],
         progress: &mut dyn FnMut(usize, u64),
     ) -> Result<HybridChunkOutput, EngineError> {
         let config = &self.config;
@@ -2243,6 +2684,32 @@ impl InferenceEngine {
             linalg::rms_norm(&mut tail, &norm, dim, config.norm_eps as f32)?;
         }
         let head_input = tail.clone();
+        // The one-pass prompt-logprob seam for the hybrid chunk: the same collapsed rows the last
+        // position's head input comes from, final-normed for every requested position. The device
+        // final-norm backend has no per-position seam yet, so a device backend refuses instead of
+        // returning rows it did not norm.
+        let mut position_head_inputs = Vec::new();
+        if !position_logits.is_empty() {
+            if device_norm {
+                return Err(EngineError::Shape {
+                    what: "chunked hybrid all-position rows".to_owned(),
+                    detail: "the device final-norm backend has no all-position seam; run the host norm path to select rows"
+                        .to_owned(),
+                });
+            }
+            let norm = linalg::decode_by_name(self.source.as_ref(), "norm.weight", self.limit)?;
+            for &position in position_logits {
+                if position >= seqlen {
+                    return Err(EngineError::Shape {
+                        what: "chunked hybrid all-position rows".to_owned(),
+                        detail: format!("position {position} is outside the {seqlen} token chunk"),
+                    });
+                }
+                let mut row = collapsed[position * dim..(position + 1) * dim].to_vec();
+                linalg::rms_norm(&mut row, &norm, dim, config.norm_eps as f32)?;
+                position_head_inputs.push(row);
+            }
+        }
         let mut logits = vec![0.0f32; config.vocab_size];
         let device_token = match moe_backend.as_mut() {
             Some(backend) => {
@@ -2265,6 +2732,7 @@ impl InferenceEngine {
             logits,
             token,
             certified_mask,
+            position_head_inputs,
         })
     }
 }
@@ -2352,6 +2820,323 @@ mod tests {
             (0..64).any(|seed| sample_gumbel(&logits, 1.0, seed) == Some(1)),
             "a 1e-4 logit gap is well inside Gumbel noise at temperature 1"
         );
+    }
+
+    /// The disabled options are the pre-existing sampler: the new entry point and `sample_gumbel`
+    /// return the same token for every temperature, seed and logits row. This is the default-off
+    /// equivalence that lets the options exist without moving a byte of output.
+    #[test]
+    fn default_sampler_options_are_the_untouched_reference_sampler() {
+        let cases: [&[f32]; 5] = [
+            &[0.5, 2.0, -1.0],
+            &[0.0, 0.1, 0.2, 0.3],
+            &[1e-6, 1e-6, 1e-6],
+            &[10.0, -10.0, 0.0],
+            &[1.0, 0.999_9],
+        ];
+        for logits in cases {
+            for temperature in [0.0, 0.7, 1.5] {
+                for seed in 0..64 {
+                    let sampling = Sampling { temperature, seed };
+                    assert_eq!(
+                        sample(logits, &[0, 1], sampling, SamplerOptions::default()),
+                        sample_gumbel(logits, temperature, seed),
+                        "logits {logits:?} temperature {temperature} seed {seed}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `top_k` 1 is the argmax at every seed: one candidate cannot be outvoted by the noise.
+    #[test]
+    fn top_k_one_is_the_argmax_at_every_seed() {
+        let logits = [0.2f32, 0.9, -0.4, 2.5, 1.1];
+        let expected = linalg::argmax(&logits).expect("non-empty") as u32;
+        for seed in 0..256 {
+            let options = SamplerOptions {
+                top_k: 1,
+                ..SamplerOptions::default()
+            };
+            assert_eq!(
+                sample(
+                    &logits,
+                    &[1, 2],
+                    Sampling {
+                        temperature: 1.0,
+                        seed
+                    },
+                    options
+                ),
+                Some(expected)
+            );
+        }
+    }
+
+    /// `top_k` keeps exactly the most likely rows, and 0/-1 disable it (the untouched sampler).
+    #[test]
+    fn top_k_keeps_exactly_the_most_likely_rows() {
+        let logits = [0.0f32, 1.0, 2.0, 3.0, 4.0];
+        for seed in 0..256 {
+            let options = SamplerOptions {
+                top_k: 2,
+                ..SamplerOptions::default()
+            };
+            let picked = sample(
+                &logits,
+                &[],
+                Sampling {
+                    temperature: 1.0,
+                    seed,
+                },
+                options,
+            );
+            assert!(
+                matches!(picked, Some(4) | Some(3)),
+                "top_k 2 picked {picked:?} at seed {seed}"
+            );
+        }
+        for seed in 0..64 {
+            let sampling = Sampling {
+                temperature: 1.0,
+                seed,
+            };
+            for disabled in [0, -1] {
+                let options = SamplerOptions {
+                    top_k: disabled,
+                    ..SamplerOptions::default()
+                };
+                assert_eq!(
+                    sample(&logits, &[], sampling, options),
+                    sample_gumbel(&logits, 1.0, seed)
+                );
+            }
+        }
+    }
+
+    /// `top_p` 0.0 keeps only the most likely token: our documented extension, because vLLM
+    /// refuses that value. It is the argmax at every seed.
+    #[test]
+    fn top_p_zero_is_the_argmax_at_every_seed() {
+        let logits = [0.2f32, 0.9, -0.4, 2.5, 1.1];
+        let expected = linalg::argmax(&logits).expect("non-empty") as u32;
+        for seed in 0..256 {
+            let options = SamplerOptions {
+                top_p: 0.0,
+                ..SamplerOptions::default()
+            };
+            assert_eq!(
+                sample(
+                    &logits,
+                    &[],
+                    Sampling {
+                        temperature: 1.0,
+                        seed
+                    },
+                    options
+                ),
+                Some(expected)
+            );
+        }
+    }
+
+    /// `top_p` 1.0 is disabled, so it is the untouched sampler.
+    #[test]
+    fn top_p_one_is_the_untouched_sampler() {
+        let logits = [0.2f32, 0.9, -0.4, 2.5, 1.1];
+        for seed in 0..64 {
+            let sampling = Sampling {
+                temperature: 1.0,
+                seed,
+            };
+            assert_eq!(
+                sample(
+                    &logits,
+                    &[],
+                    sampling,
+                    SamplerOptions {
+                        top_p: 1.0,
+                        ..SamplerOptions::default()
+                    }
+                ),
+                sample_gumbel(&logits, 1.0, seed)
+            );
+        }
+    }
+
+    /// The nucleus keeps the shortest probability prefix that reaches the threshold. With logits
+    /// ln(1), ln(2), ln(4) the probabilities are 1/7, 2/7 and 4/7: 0.5 keeps the single 4/7 token,
+    /// 0.6 keeps the top two, and only seeds inside the kept set can be drawn.
+    #[test]
+    fn a_nucleus_keeps_only_the_probability_mass_it_names() {
+        let logits = [0.0f32, 2.0f32.ln(), 4.0f32.ln()];
+        for seed in 0..256 {
+            let one = sample(
+                &logits,
+                &[],
+                Sampling {
+                    temperature: 1.0,
+                    seed,
+                },
+                SamplerOptions {
+                    top_p: 0.5,
+                    ..SamplerOptions::default()
+                },
+            );
+            assert_eq!(one, Some(2), "0.5 keeps the 4/7 token only");
+            let two = sample(
+                &logits,
+                &[],
+                Sampling {
+                    temperature: 1.0,
+                    seed,
+                },
+                SamplerOptions {
+                    top_p: 0.6,
+                    ..SamplerOptions::default()
+                },
+            );
+            assert!(
+                matches!(two, Some(1) | Some(2)),
+                "0.6 keeps 1 and 2: {two:?}"
+            );
+        }
+    }
+
+    /// `repetition_penalty` above 1 divides a positive seen logit and multiplies a negative one,
+    /// so the repeated token loses on both sides of zero (vLLM's rule).
+    #[test]
+    fn repetition_penalty_discounts_a_seen_token_above_one() {
+        let greedy = Sampling {
+            temperature: 0.0,
+            seed: 0,
+        };
+        let logits = [10.0f32, 9.0];
+        let seen = SamplerOptions {
+            repetition_penalty: 100.0,
+            ..SamplerOptions::default()
+        };
+        assert_eq!(
+            sample(&logits, &[], greedy, SamplerOptions::default()),
+            Some(0)
+        );
+        // 10 / 100 = 0.1 falls below 9.
+        assert_eq!(sample(&logits, &[0], greedy, seen), Some(1));
+        // The negative branch: -1 * 100 = -100 falls below -2.
+        let negative = [-1.0f32, -2.0];
+        assert_eq!(sample(&negative, &[0], greedy, seen), Some(1));
+    }
+
+    /// `repetition_penalty` below 1 encourages the seen token: 1 / 0.4 = 2.5 beats 2.
+    #[test]
+    fn repetition_penalty_below_one_encourages_a_seen_token() {
+        let greedy = Sampling {
+            temperature: 0.0,
+            seed: 0,
+        };
+        let logits = [1.0f32, 2.0];
+        let seen = SamplerOptions {
+            repetition_penalty: 0.4,
+            ..SamplerOptions::default()
+        };
+        assert_eq!(
+            sample(&logits, &[], greedy, SamplerOptions::default()),
+            Some(1)
+        );
+        assert_eq!(sample(&logits, &[0], greedy, seen), Some(0));
+    }
+
+    /// `presence_penalty` lowers a generated token once, and only generated tokens: everything
+    /// before `prompt_len` is prompt and is not penalized.
+    #[test]
+    fn presence_penalty_lowers_a_generated_token_once() {
+        let greedy = Sampling {
+            temperature: 0.0,
+            seed: 0,
+        };
+        let generated = SamplerOptions {
+            presence_penalty: 2.0,
+            prompt_len: 1,
+            ..SamplerOptions::default()
+        };
+        // Token 2 is generated: 0.3 - 2 = -1.7, below token 0's 0.5.
+        assert_eq!(
+            sample(&[0.5f32, 0.4, 0.3], &[9, 2], greedy, generated),
+            Some(0)
+        );
+        // Token 2 is the prompt's last token: not penalized, so it stays the argmax.
+        let prompt_only = SamplerOptions {
+            presence_penalty: 2.0,
+            prompt_len: 2,
+            ..SamplerOptions::default()
+        };
+        assert_eq!(
+            sample(&[0.5f32, 0.4, 1.0], &[9, 2, 5], greedy, prompt_only),
+            Some(2)
+        );
+    }
+
+    /// `frequency_penalty` counts occurrences: one occurrence of 5 with penalty 2 leaves 3 and
+    /// still wins, two occurrences leave 1 and lose to 2.
+    #[test]
+    fn frequency_penalty_counts_each_occurrence() {
+        let greedy = Sampling {
+            temperature: 0.0,
+            seed: 0,
+        };
+        let options = SamplerOptions {
+            frequency_penalty: 2.0,
+            ..SamplerOptions::default()
+        };
+        let logits = [2.0f32, 5.0];
+        assert_eq!(sample(&logits, &[1], greedy, options), Some(1));
+        assert_eq!(sample(&logits, &[1, 1], greedy, options), Some(0));
+    }
+
+    /// The penalties are applied before the candidate filters: a repeated token that loses to the
+    /// penalty is no longer the top-p candidate either.
+    #[test]
+    fn penalties_apply_before_the_candidate_filters() {
+        let greedy = Sampling {
+            temperature: 0.0,
+            seed: 0,
+        };
+        let options = SamplerOptions {
+            repetition_penalty: 100.0,
+            ..SamplerOptions::default()
+        };
+        // 10 becomes 0.1, so the nucleus's most likely token is 9, not 10.
+        let logits = [10.0f32, 9.0];
+        assert_eq!(sample(&logits, &[0], greedy, options), Some(1));
+        let with_nucleus = SamplerOptions {
+            top_p: 0.0,
+            ..options
+        };
+        assert_eq!(sample(&logits, &[0], greedy, with_nucleus), Some(1));
+    }
+
+    /// The seeded draw stays a pure function of its inputs with every knob on.
+    #[test]
+    fn seeded_draws_are_reproducible_with_penalties_and_filters() {
+        let options = SamplerOptions {
+            top_p: 0.9,
+            top_k: 3,
+            repetition_penalty: 1.5,
+            presence_penalty: 0.5,
+            frequency_penalty: 0.25,
+            prompt_len: 1,
+        };
+        let logits = [0.1f32, 0.2, 0.3, 0.4, 0.5];
+        let tokens = [2u32, 3, 4];
+        for seed in 0..8 {
+            let sampling = Sampling {
+                temperature: 0.8,
+                seed,
+            };
+            let first = sample(&logits, &tokens, sampling, options);
+            assert_eq!(first, sample(&logits, &tokens, sampling, options));
+            assert!(first.is_some());
+        }
     }
 
     /// A plan-shaped source of finite numbers for tests that drive one block instead of the whole

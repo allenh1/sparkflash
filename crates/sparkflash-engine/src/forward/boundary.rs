@@ -260,7 +260,7 @@ pub struct LayerBoundary {
 
 impl LayerBoundary {
     /// An empty row for `layer`; the forward fills it in the [TENSOR_ORDER] order.
-    pub(crate) fn new(layer: usize) -> Self {
+    pub fn new(layer: usize) -> Self {
         Self {
             layer,
             tensors: Vec::with_capacity(TENSOR_ORDER.len()),
@@ -287,7 +287,7 @@ impl LayerBoundary {
 
     /// Appends a tensor, refusing a shape whose element count is not the value count. The shape
     /// check keeps the format document and the captured bytes from drifting apart silently.
-    fn push(
+    pub fn push(
         &mut self,
         name: &'static str,
         shape: Vec<usize>,
@@ -314,7 +314,7 @@ impl LayerBoundary {
 
     /// Appends an mHC stream tensor: `positions` tokens of `hc_mult` copies of `dim` values,
     /// `[positions, hc_mult, dim]`.
-    pub(crate) fn push_stream(
+    pub fn push_stream(
         &mut self,
         config: &ModelConfig,
         name: &'static str,
@@ -344,7 +344,7 @@ impl LayerBoundary {
     /// The comb sets have their own helper ([Self::push_comb]) rather than a `per_token` argument
     /// here: with `hc_mult == 1` the per-token pre/post size and the per-token comb size are both
     /// 1, so a size-chosen shape silently records a 2-D comb.
-    pub(crate) fn push_mixes(
+    pub fn push_mixes(
         &mut self,
         config: &ModelConfig,
         name: &'static str,
@@ -367,7 +367,7 @@ impl LayerBoundary {
     /// Appends one comb coefficient set: always `[positions, hc_mult, hc_mult]`, even when
     /// `hc_mult == 1`, because the released comb is a matrix per token
     /// (`docs/build/phase1-boundary-table.md` section 3).
-    pub(crate) fn push_comb(
+    pub fn push_comb(
         &mut self,
         config: &ModelConfig,
         name: &'static str,
@@ -390,7 +390,7 @@ impl LayerBoundary {
 
     /// Appends a dense `[positions, dim]` f32 tensor: a sublayer input or output before the mHC
     /// post-mix.
-    pub(crate) fn push_dense(
+    pub fn push_dense(
         &mut self,
         config: &ModelConfig,
         name: &'static str,
@@ -418,7 +418,7 @@ impl LayerBoundary {
     /// section 6 point 1 of `docs/engine/01-forward-order.md`). The row must divide into whole
     /// 32-element blocks, which is the reference's own assertion (kernel.py:108); the observed entry
     /// points refuse a configuration whose `dim` does not, before a weight is read.
-    pub(crate) fn push_block_input(
+    pub fn push_block_input(
         &mut self,
         config: &ModelConfig,
         hidden_name: &'static str,
@@ -485,7 +485,7 @@ impl BoundaryTable {
     /// passes matching values, and [Self::diff] compares the two independently so a capture bug in
     /// either field is caught. The unit tests construct a deliberately inconsistent pair to prove
     /// that the start-position check is not shadowed by the prefix check.
-    pub(crate) fn new(start_position: usize, tokens: &[u32], consumed_prefix: &[u32]) -> Self {
+    pub fn new(start_position: usize, tokens: &[u32], consumed_prefix: &[u32]) -> Self {
         Self {
             start_position,
             tokens: tokens.to_vec(),
@@ -560,7 +560,7 @@ impl BoundaryTable {
 
     /// Appends one row. The forward appends in its own order; a duplicate layer id would make a
     /// diff ambiguous, so it is refused here rather than compared arbitrarily later.
-    pub(crate) fn push_row(&mut self, row: LayerBoundary) -> Result<(), EngineError> {
+    pub fn push_row(&mut self, row: LayerBoundary) -> Result<(), EngineError> {
         if self.rows.iter().any(|held| held.layer == row.layer) {
             return Err(EngineError::Shape {
                 what: "boundary capture".to_owned(),

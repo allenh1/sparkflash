@@ -167,11 +167,18 @@ extern "C" __global__ void mega_mhc_fused_bf16_sm121(
     for (uint32_t i = tid; i < SPARK_M4_MHC_TILE_ELEMS; i += SPARK_M4_MHC_THREADS) {
         const uint32_t index = base + i;
         const float y = __bfloat162float(y_prev[index]);
+        float x_old[SPARK_M4_HC_MULT];
+#pragma unroll
+        for (uint32_t t = 0; t < n; ++t) {
+            x_old[t] = __bfloat162float(x[t * d + index]);
+        }
         float updated[SPARK_M4_HC_MULT];
+#pragma unroll
         for (uint32_t s = 0; s < n; ++s) {
             float acc = s_c[s] * y;
+#pragma unroll
             for (uint32_t t = 0; t < n; ++t) {
-                acc += s_b[s * n + t] * __bfloat162float(x[t * d + index]);
+                acc += s_b[s * n + t] * x_old[t];
             }
             updated[s] = acc;
         }
@@ -324,8 +331,11 @@ extern "C" __global__ void mega_mhc_fused_bf16_sm121(
         const uint32_t element = b * SPARK_M4_QUANT_BLOCK;
         const uint32_t index = base + element;
         float amax = 0.0f;
+        float values[SPARK_M4_QUANT_BLOCK];
+#pragma unroll
         for (uint32_t k = 0; k < SPARK_M4_QUANT_BLOCK; ++k) {
             const float value = s_xhat[element + k] * rms_weight[index + k] * inverse_rms;
+            values[k] = value;
             xhat_normed[index + k] = value;
             const float magnitude = value < 0.0f ? -value : value;
             amax = magnitude > amax ? magnitude : amax;
@@ -336,8 +346,9 @@ extern "C" __global__ void mega_mhc_fused_bf16_sm121(
         const uint8_t scale = spark_act_quant_scale_code(amax);
         xhat_scales[index / SPARK_M4_QUANT_BLOCK] = scale;
         const float inverse_scale = 1.0f / spark_ue8m0_decode(scale);
+#pragma unroll
         for (uint32_t k = 0; k < SPARK_M4_QUANT_BLOCK; ++k) {
-            const float value = s_xhat[element + k] * rms_weight[index + k] * inverse_rms;
+            const float value = values[k];
             xhat_fp8[index + k] =
                 failed != 0u ? (uint8_t)0x7Fu : spark_fp8_e4m3_encode(value * inverse_scale);
         }
@@ -471,11 +482,18 @@ extern "C" __global__ void mega_mhc_fused_bf16_batched_sm121(
     for (uint32_t i = tid; i < SPARK_M4_MHC_TILE_ELEMS; i += SPARK_M4_MHC_THREADS) {
         const uint32_t index = base + i;
         const float y = __bfloat162float(y_prev[index]);
+        float x_old[SPARK_M4_HC_MULT];
+#pragma unroll
+        for (uint32_t t = 0; t < n; ++t) {
+            x_old[t] = __bfloat162float(x[t * d + index]);
+        }
         float updated[SPARK_M4_HC_MULT];
+#pragma unroll
         for (uint32_t s = 0; s < n; ++s) {
             float acc = s_c[s] * y;
+#pragma unroll
             for (uint32_t t = 0; t < n; ++t) {
-                acc += s_b[s * n + t] * __bfloat162float(x[t * d + index]);
+                acc += s_b[s * n + t] * x_old[t];
             }
             updated[s] = acc;
         }
@@ -628,8 +646,11 @@ extern "C" __global__ void mega_mhc_fused_bf16_batched_sm121(
         const uint32_t element = b * SPARK_M4_QUANT_BLOCK;
         const uint32_t index = base + element;
         float amax = 0.0f;
+        float values[SPARK_M4_QUANT_BLOCK];
+#pragma unroll
         for (uint32_t k = 0; k < SPARK_M4_QUANT_BLOCK; ++k) {
             const float value = s_xhat[element + k] * rms_weight[index + k] * inverse_rms;
+            values[k] = value;
             xhat_normed[index + k] = value;
             const float magnitude = value < 0.0f ? -value : value;
             amax = magnitude > amax ? magnitude : amax;
@@ -640,8 +661,9 @@ extern "C" __global__ void mega_mhc_fused_bf16_batched_sm121(
         const uint8_t scale = spark_act_quant_scale_code(amax);
         xhat_scales[index / SPARK_M4_QUANT_BLOCK] = scale;
         const float inverse_scale = 1.0f / spark_ue8m0_decode(scale);
+#pragma unroll
         for (uint32_t k = 0; k < SPARK_M4_QUANT_BLOCK; ++k) {
-            const float value = s_xhat[element + k] * rms_weight[index + k] * inverse_rms;
+            const float value = values[k];
             xhat_fp8[index + k] =
                 failed != 0u ? (uint8_t)0x7Fu : spark_fp8_e4m3_encode(value * inverse_scale);
         }

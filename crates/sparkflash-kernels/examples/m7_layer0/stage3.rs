@@ -35,8 +35,9 @@ pub(crate) const MOE_EXPERT_IN_SCALES: usize = HIDDEN / 32;
 const GATE_TEMP: f32 = 1.0;
 const ROUTE_SCALE: f32 = 1.5;
 const ROUTE_NORM_EPS: f32 = 1e-20;
-/// The kernel's launch geometry: one output element per thread, 256 threads, 20 tiles of 5120.
-pub(crate) const MOE_TILE_D: u32 = 256;
+/// The kernel's launch geometry: 32 output columns x 8 parallel K groups, 256 threads, 160 tiles of
+/// 5120 (the retired old-ABI row still points at the current symbol, so it must use its tiling).
+pub(crate) const MOE_TILE_D: u32 = 32;
 pub(crate) const MOE_THREADS: u32 = 256;
 /// The stage-3 pass bar, printed before the numbers it judges.
 const STAGE3_EXACT_BAR: f64 = 99.9;

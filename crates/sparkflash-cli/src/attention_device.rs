@@ -903,7 +903,7 @@ fn quantise(values: &[f32], what: &str) -> Result<(Vec<u8>, Vec<u8>), EngineErro
 /// output was written as bf16 and read back as f32), so it is safe to apply at every W8A8
 /// activation seam. wo_a's MXFP8 comparison arm is deliberately not narrowed: it is not the
 /// native path, and task-6's native wo_a arm already narrows its activation.
-fn quantise_native_activation(
+pub(crate) fn quantise_native_activation(
     values: &[f32],
     what: &str,
 ) -> Result<(Vec<u8>, Vec<u8>), EngineError> {

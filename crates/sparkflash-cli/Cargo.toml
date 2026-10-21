@@ -38,6 +38,9 @@ sparkflash-scheduler = { workspace = true }
 sparkflash-engine = { workspace = true }
 sparkflash-device = { workspace = true }
 axum = { workspace = true }
+# The streaming detokeniser step: host continuous batching keeps the tokenizers DecodeStream state
+# in its per-request scheduler slots, and step_decode_stream is the crate's public entry for it.
+tokenizers = "0.23"
 futures = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
@@ -52,3 +55,5 @@ libc = { workspace = true }
 [dev-dependencies]
 # The `--checkpoint` fixture tests build a tiny safetensors checkpoint in a temporary directory.
 tempfile = { workspace = true }
+# The device-token window tests write a synthetic four-rank envelope: paper records, UNMEASURED.
+sparkflash-api = { workspace = true, features = ["device-token-fixtures"] }

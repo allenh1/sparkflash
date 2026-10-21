@@ -206,6 +206,8 @@ extern "C" __global__ void flash_mla_csa2_ring_sm121(
     const uint32_t index_head = head / (uint32_t)SPARK_M4_MLA_HEADS_PER_INDEX_HEAD;
 
     __shared__ float s_scores[SPARK_M4_MLA_RING_MAX_ATTENDED];
+    __shared__ float s_q[SPARK_M4_MLA_LATENT];
+    __shared__ uint32_t s_candidates[SPARK_M4_MLA_MAX_SELECTED];
     __shared__ float s_max;
     __shared__ float s_sum;
 
@@ -337,27 +339,59 @@ extern "C" __global__ void flash_mla_csa2_ring_sm121(
     // branch and their arithmetic below is unchanged.
     if (window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION) {
         const uint32_t union_total = window_rows + selected_count;
-        // Pass one: every union slot's score. A selected id past the query is excluded by score,
-        // exactly as the reference's reachability mask excludes it.
+        // Convert the query head to f32 once and cache the candidate ids, instead of re-reading
+        // and re-converting them per slot and per channel. Values are identical.
+        const __nv_bfloat16 *q_head = q + (uint64_t)head * SPARK_M4_MLA_LATENT;
+        s_q[lane] = __bfloat162float(q_head[lane]);
+        s_q[lane + SPARK_M4_MLA_THREADS] = __bfloat162float(q_head[lane + SPARK_M4_MLA_THREADS]);
+        for (uint32_t idx = lane; idx < selected_count; idx += SPARK_M4_MLA_THREADS) {
+            s_candidates[idx] = selected[idx];
+        }
+        __syncthreads();
+        // Pass one: every union slot's score, accumulated in ascending channel order exactly as
+        // before (same expression shapes, so the compiler's contraction is unchanged); only the
+        // per-channel scale decodes are hoisted to once per scale group. A selected id past the
+        // query is excluded by score, as the reference's reachability mask excludes it. The running
+        // maximum is kept in a register here (max is order independent).
+        float local_max = -3.402823466e38f;
         for (uint32_t slot = lane; slot < union_total; slot += SPARK_M4_MLA_THREADS) {
             float score = 0.0f;
             if (slot < window_rows) {
-                for (uint32_t i = 0; i < SPARK_M4_MLA_LATENT; ++i) {
-                    score += __bfloat162float(q[(uint64_t)head * SPARK_M4_MLA_LATENT + i]) *
-                             spark_mla_ring_load_window_stored(window_codes, window_scales, slot, i);
+                const uint8_t *row_codes = window_codes + (uint64_t)slot * SPARK_M4_MLA_LATENT;
+                const uint8_t *row_scales = window_scales + (uint64_t)slot * SPARK_M4_MLA_WINDOW_SCALES;
+                for (uint32_t blk = 0u; blk < SPARK_M4_MLA_WINDOW_SCALES; ++blk) {
+                    const float scale = spark_ue8m0_decode(row_scales[blk]);
+                    const uint32_t base = blk * SPARK_M4_MLA_WINDOW_QUANT_BLOCK;
+                    #pragma unroll 8
+                    for (uint32_t ch = 0u; ch < SPARK_M4_MLA_WINDOW_QUANT_BLOCK; ++ch) {
+                        const uint32_t i = base + ch;
+                        const float key = __bfloat162float(
+                            __float2bfloat16_rn(spark_fp8_e4m3_decode(row_codes[i]) * scale));
+                        score += s_q[i] * key;
+                    }
                 }
                 score *= SPARK_M4_MLA_SCORE_SCALE;
             } else {
-                const uint32_t candidate = selected[slot - window_rows];
+                const uint32_t candidate = s_candidates[slot - window_rows];
                 if (spark_mla_ring_union_attends(position, candidate) != 0u) {
-                    for (uint32_t i = 0; i < SPARK_M4_MLA_LATENT; ++i) {
-                        const float key = spark_mla_ring_load_latent(
-                                              kv_fp4 + (uint64_t)candidate * (SPARK_M4_MLA_LATENT / 2u), i) *
-                                          spark_mla_ring_scale(
-                                              kv_scales + (uint64_t)candidate *
-                                                              (SPARK_M4_MLA_LATENT / SPARK_M4_KV_SCALE_CHANNELS),
-                                              i);
-                        score += __bfloat162float(q[(uint64_t)head * SPARK_M4_MLA_LATENT + i]) * key;
+                    const uint8_t *row_fp4 =
+                        kv_fp4 + (uint64_t)candidate * (SPARK_M4_MLA_LATENT / SPARK_M4_MLA_FP4_PER_BYTE);
+                    const uint8_t *row_scales =
+                        kv_scales + (uint64_t)candidate *
+                                        (SPARK_M4_MLA_LATENT / SPARK_M4_KV_SCALE_CHANNELS);
+                    for (uint32_t grp = 0u; grp < (SPARK_M4_MLA_LATENT / SPARK_M4_KV_SCALE_CHANNELS); ++grp) {
+                        const float scale = spark_fp8_e4m3_decode(row_scales[grp]);
+                        const uint32_t byte_base = grp * (SPARK_M4_KV_SCALE_CHANNELS / SPARK_M4_MLA_FP4_PER_BYTE);
+                        const uint32_t ch_base = grp * SPARK_M4_KV_SCALE_CHANNELS;
+                        #pragma unroll
+                        for (uint32_t b = 0u; b < (SPARK_M4_KV_SCALE_CHANNELS / SPARK_M4_MLA_FP4_PER_BYTE); ++b) {
+                            const uint8_t packed = row_fp4[byte_base + b];
+                            const uint32_t i0 = ch_base + 2u * b;
+                            const float k0 = spark_fp4_e2m1_decode((uint8_t)(packed & 0x0Fu)) * scale;
+                            score += s_q[i0] * k0;
+                            const float k1 = spark_fp4_e2m1_decode((uint8_t)(packed >> 4)) * scale;
+                            score += s_q[i0 + 1u] * k1;
+                        }
                     }
                     score *= SPARK_M4_MLA_SCORE_SCALE;
                 } else {
@@ -365,11 +399,7 @@ extern "C" __global__ void flash_mla_csa2_ring_sm121(
                 }
             }
             s_scores[slot] = score;
-        }
-        __syncthreads();
-        float local_max = -3.402823466e38f;
-        for (uint32_t slot = lane; slot < union_total; slot += SPARK_M4_MLA_THREADS) {
-            local_max = s_scores[slot] > local_max ? s_scores[slot] : local_max;
+            local_max = score > local_max ? score : local_max;
         }
         local_max = spark_block_max(local_max, lane, SPARK_M4_MLA_THREADS);
         if (lane == 0u) {
@@ -392,29 +422,49 @@ extern "C" __global__ void flash_mla_csa2_ring_sm121(
             s_sum = local_sum > 0.0f ? local_sum : 1.0f;
         }
         __syncthreads();
-        // Each thread owns two latent channels and walks the union in ascending slot order: window
-        // rows first, then the selected list as supplied. That order is part of the contract.
-        for (uint32_t i = lane; i < SPARK_M4_MLA_LATENT; i += SPARK_M4_MLA_THREADS) {
-            float acc = 0.0f;
-            for (uint32_t slot = 0; slot < union_total; ++slot) {
-                if (slot < window_rows) {
-                    acc += s_scores[slot] *
-                           spark_mla_ring_load_window_stored(window_codes, window_scales, slot, i);
-                } else {
-                    const uint32_t candidate = selected[slot - window_rows];
-                    if (spark_mla_ring_union_attends(position, candidate) != 0u) {
-                        const float value = spark_mla_ring_load_latent(
-                                                kv_fp4 + (uint64_t)candidate * (SPARK_M4_MLA_LATENT / 2u), i) *
-                                            spark_mla_ring_scale(
-                                                kv_scales + (uint64_t)candidate *
-                                                                (SPARK_M4_MLA_LATENT / SPARK_M4_KV_SCALE_CHANNELS),
-                                                i);
-                        acc += s_scores[slot] * value;
-                    }
-                }
-            }
-            out[(uint64_t)head * SPARK_M4_MLA_LATENT + i] = __float2bfloat16_rn(acc / s_sum);
+        // Each thread owns two latent channels (lane, lane+256) and walks the union once in
+        // ascending slot order: window rows first, then the selected list as supplied. That order
+        // is part of the contract; each channel's accumulation order is unchanged.
+        const uint32_t i0 = lane;
+        const uint32_t i1 = lane + SPARK_M4_MLA_THREADS;
+        const uint32_t w_scale_off0 = i0 / SPARK_M4_MLA_WINDOW_QUANT_BLOCK;
+        const uint32_t w_scale_off1 = i1 / SPARK_M4_MLA_WINDOW_QUANT_BLOCK;
+        const uint32_t fp4_byte_off0 = i0 / SPARK_M4_MLA_FP4_PER_BYTE;
+        const uint32_t fp4_byte_off1 = i1 / SPARK_M4_MLA_FP4_PER_BYTE;
+        const uint32_t fp4_shift = (i0 % SPARK_M4_MLA_FP4_PER_BYTE) * 4u;
+        const uint32_t kv_scale_off0 = i0 / SPARK_M4_KV_SCALE_CHANNELS;
+        const uint32_t kv_scale_off1 = i1 / SPARK_M4_KV_SCALE_CHANNELS;
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        for (uint32_t slot = 0u; slot < window_rows; ++slot) {
+            const float prob = s_scores[slot];
+            const uint8_t *row_codes = window_codes + (uint64_t)slot * SPARK_M4_MLA_LATENT;
+            const uint8_t *row_scales = window_scales + (uint64_t)slot * SPARK_M4_MLA_WINDOW_SCALES;
+            const float v0 = __bfloat162float(__float2bfloat16_rn(
+                spark_fp8_e4m3_decode(row_codes[i0]) * spark_ue8m0_decode(row_scales[w_scale_off0])));
+            const float v1 = __bfloat162float(__float2bfloat16_rn(
+                spark_fp8_e4m3_decode(row_codes[i1]) * spark_ue8m0_decode(row_scales[w_scale_off1])));
+            acc0 += prob * v0;
+            acc1 += prob * v1;
         }
+        for (uint32_t idx = 0u; idx < selected_count; ++idx) {
+            const uint32_t candidate = s_candidates[idx];
+            if (spark_mla_ring_union_attends(position, candidate) != 0u) {
+                const float prob = s_scores[window_rows + idx];
+                const uint8_t *row_fp4 =
+                    kv_fp4 + (uint64_t)candidate * (SPARK_M4_MLA_LATENT / SPARK_M4_MLA_FP4_PER_BYTE);
+                const uint8_t *row_scales =
+                    kv_scales + (uint64_t)candidate * (SPARK_M4_MLA_LATENT / SPARK_M4_KV_SCALE_CHANNELS);
+                const uint8_t nib0 = (uint8_t)((row_fp4[fp4_byte_off0] >> fp4_shift) & 0x0Fu);
+                const uint8_t nib1 = (uint8_t)((row_fp4[fp4_byte_off1] >> fp4_shift) & 0x0Fu);
+                const float v0 = spark_fp4_e2m1_decode(nib0) * spark_fp8_e4m3_decode(row_scales[kv_scale_off0]);
+                const float v1 = spark_fp4_e2m1_decode(nib1) * spark_fp8_e4m3_decode(row_scales[kv_scale_off1]);
+                acc0 += prob * v0;
+                acc1 += prob * v1;
+            }
+        }
+        out[(uint64_t)head * SPARK_M4_MLA_LATENT + i0] = __float2bfloat16_rn(acc0 / s_sum);
+        out[(uint64_t)head * SPARK_M4_MLA_LATENT + i1] = __float2bfloat16_rn(acc1 / s_sum);
         if (lane == 0u) {
             const uint32_t meta = (uint32_t)(SPARK_M4_MLA_LATENT * 2u);
             SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_CSA2_ATTN, layer_id, meta, t_enter);

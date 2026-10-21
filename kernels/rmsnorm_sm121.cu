@@ -38,8 +38,7 @@
 // pinned cubin's PTX has the v4 load, and the clang probe (no nvcc) takes the plain uint4
 // dereference instead. The eight values are folded in ascending lane order. Any other width takes
 // the scalar path; the odd-width test in the harness exercises it (513 columns). Output stores are
-// scalar __nv_bfloat16 writes: the rounding contract is the conversion intrinsic, and packing eight
-// of them into a vector would need bit punning for an eight-value tail that is not the bottleneck.
+// packed into one 128-bit write per chunk; the rounding is still the per-element conversion intrinsic.
 //
 // INPUTS. x is [rows][cols] BF16. weight is [cols] BF16 - the released norm.weight, whose bytes
 // decode exactly to the engine's f32 weight (bf16 -> f32 is exact), so the device multiplies by the
@@ -147,14 +146,23 @@ extern "C" __global__ void rmsnorm_sm121(
                 spark_rmsnorm_load128(x_row + (uint64_t)chunk * 8u);
             const uint4 weights =
                 spark_rmsnorm_load128(weight + (uint64_t)chunk * 8u);
+            // Pack eight rounded BF16 results into one 128-bit store (same per-element
+            // arithmetic and rounding; only the store width changes).
+            uint32_t packed[4];
 #pragma unroll
-            for (int k = 0; k < 8; ++k) {
-                const float scaled = spark_rmsnorm_scale(
-                    spark_rmsnorm_chunk_value(values, k),
-                    inv,
+            for (int k = 0; k < 8; k += 2) {
+                const float lo = spark_rmsnorm_scale(
+                    spark_rmsnorm_chunk_value(values, k), inv,
                     spark_rmsnorm_chunk_value(weights, k));
-                out_row[(uint64_t)chunk * 8u + (uint64_t)k] = __float2bfloat16_rn(scaled);
+                const float hi = spark_rmsnorm_scale(
+                    spark_rmsnorm_chunk_value(values, k + 1), inv,
+                    spark_rmsnorm_chunk_value(weights, k + 1));
+                packed[k >> 1] =
+                    (uint32_t)__bfloat16_as_ushort(__float2bfloat16_rn(lo)) |
+                    ((uint32_t)__bfloat16_as_ushort(__float2bfloat16_rn(hi)) << 16);
             }
+            *reinterpret_cast<uint4 *>(out_row + (uint64_t)chunk * 8u) =
+                make_uint4(packed[0], packed[1], packed[2], packed[3]);
         }
     } else {
         for (uint32_t column = 0; column < cols; ++column) {
