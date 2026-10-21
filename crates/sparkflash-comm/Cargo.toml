@@ -32,3 +32,9 @@ half = { workspace = true }
 # runs rocenante-probe from PATH, so it is pinned here rather than left to file discovery.
 name = "rocenante-probe"
 path = "src/bin/rocenante-probe.rs"
+
+[[bin]]
+# WS-B's four-rank all-reduce microbenchmark (cold + hot, p50/p90, 25 us decode gate). It is a
+# separate binary from rocenante-probe so the doctor's field contract stays untouched.
+name = "ws-b-allreduce-bench"
+path = "src/bin/ws-b-allreduce-bench.rs"

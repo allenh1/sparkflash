@@ -28,6 +28,7 @@
 
 pub mod attention;
 pub mod attention_case;
+pub mod batch;
 pub mod boundary;
 pub mod engram;
 pub mod layer_zero;
@@ -50,6 +51,7 @@ use crate::weights::WeightSource;
 ///
 /// Each backbone layer and each MTP stage has its own window ring and compressed KV, so the caches
 /// are indexed by layer. Nothing here is shared between sequences.
+#[derive(Clone)]
 pub struct SequenceState {
     tokens: Vec<u32>,
     attention: Vec<attention::AttnState>,
@@ -83,6 +85,20 @@ impl SequenceState {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tokens.is_empty()
+    }
+
+    /// An independent copy of this state whose caches hold the same consumed prefix.
+    ///
+    /// This is the reference-level prefix-cache primitive: a caller that reaches a cached
+    /// prefix through the KV layer can fork the state that already computed it and prefill only
+    /// the uncached suffix. The copy owns its caches, so either side can continue without
+    /// touching the other's KV; the arithmetic is the whole-prompt arithmetic because the
+    /// windows, compressed rows and index keys are the ones the prefix forward wrote. The
+    /// device pool's hash-block reuse is the paged cache's job; this is its host-reference
+    /// equivalent and is tested against one whole-prompt forward in tests/batched_prefill.rs.
+    #[must_use]
+    pub fn fork(&self) -> Self {
+        self.clone()
     }
 
     /// The window row a backbone layer holds for `position`, for tests that assert what the cache

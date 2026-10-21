@@ -31,4 +31,10 @@ pub enum SchedulerError {
         /// Step the engine was waiting for.
         next: u64,
     },
+    /// The paged KV cache refused an operation the plan expected to be legal.
+    #[error(transparent)]
+    Paging(#[from] sparkflash_kv::PagingError),
+    /// The batcher's own bookkeeping no longer holds: an internal inconsistency.
+    #[error("batcher invariant: {0}")]
+    Invariant(String),
 }

@@ -219,11 +219,44 @@ impl TokenizerSeam {
     ///
     /// TokenizerSeamError::Tokenize when the tokenizer fails.
     pub fn encode_text(&self, text: &str) -> Result<Vec<u32>, TokenizerSeamError> {
+        self.encode_text_with(text, false)
+    }
+
+    /// Tokenize raw text with the caller's `add_special_tokens` choice.
+    ///
+    /// This is what `POST /tokenize` exposes (vLLM's `TokenizeCompletionRequest.add_special_tokens`,
+    /// default true). For this checkpoint's ByteLevel post-processor the flag does not change the
+    /// ids - the released `tokenizer_config.json` adds neither BOS nor EOS - but the flag still has
+    /// to reach the tokenizer instead of being assumed, because a different checkpoint may add
+    /// them and the route exists to report exactly what the tokenizer does.
+    ///
+    /// # Errors
+    ///
+    /// TokenizerSeamError::Tokenize when the tokenizer fails.
+    pub fn encode_text_with(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> Result<Vec<u32>, TokenizerSeamError> {
         self.tokenizer
             .tokenizer()
-            .encode(text, false)
+            .encode(text, add_special_tokens)
             .map(|encoding| encoding.get_ids().to_vec())
             .map_err(|error| TokenizerSeamError::Tokenize(error.to_string()))
+    }
+
+    /// The string spelling of one vocabulary id, as `POST /tokenize` reports it in `token_strs`.
+    ///
+    /// `None` for an id outside the vocabulary, which the route renders as JSON null like vLLM.
+    #[must_use]
+    pub fn token_str(&self, id: u32) -> Option<String> {
+        self.tokenizer.tokenizer().id_to_token(id)
+    }
+
+    /// The wrapped checkpoint tokenizer, for token-level work.
+    #[must_use]
+    pub fn tokenizer(&self) -> &tokenizers::Tokenizer {
+        self.tokenizer.tokenizer()
     }
 
     /// Decode ids back to text with the checkpoint tokenizer.

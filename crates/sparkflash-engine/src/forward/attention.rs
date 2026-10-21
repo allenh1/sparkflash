@@ -453,6 +453,7 @@ const EMPTY_SLOT: usize = usize::MAX;
 /// `window_size` rows of `head_dim` values: position `p` lives in slot `p % window_size`
 /// (model.py:709-718, 1044-1051). A row is either the one written for that position or gone once
 /// the ring wrapped past it, which is what [`WindowRing::row`] answers.
+#[derive(Clone)]
 pub struct WindowRing {
     /// The slot rows, `window_size * head_dim` values.
     rows: Vec<f32>,
@@ -575,6 +576,7 @@ impl WindowRing {
 /// layer it belongs to, so those buffers are sized on the first call that needs them. The reference
 /// instead preallocates every one of them for the whole model (model.py:452-453, 664-679); the
 /// caches here start empty and grow with the sequence, so a test config needs no `max_seq_len`.
+#[derive(Clone)]
 pub struct AttnState {
     /// The window ring this layer writes.
     pub window: WindowRing,

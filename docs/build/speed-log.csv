@@ -1,0 +1,8 @@
+date,commit,run,step_mean_ms,tokens_ok,logits_sha_ok,note
+2026-10-21,807bb218,m1w37-lean,1201.81,yes,yes,"pre-WS-A baseline, evidence ON"
+2026-10-21,c8bb4883,m2p1-lean,845.86,yes,yes,"WS-A row B, async, evidence off"
+2026-10-21,c8bb4883,m2p1-sync,843.94,yes,yes,sync control
+2026-10-21,c8bb4883,m2p1-probe,852.06,yes,yes,"probe row, drained path"
+2026-10-21,f5191109,m2p1b-evidence,925.19,yes,yes,"identity row, evidence ON"
+2026-10-21,f5191109,m2p1b-lean,842.69,yes,yes,gate row (clean argv)
+2026-10-21,f5191109,m2p1b-lean,842.69,yes,yes,m2p1b-lean

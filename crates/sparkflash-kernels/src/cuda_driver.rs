@@ -11,11 +11,11 @@
 //! the compile-time enforcement of the one-launch-path rule. The unsafe blocks in this module are
 //! the dlopen boundary: everything above it is safe code.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 type CuResult = i32;
 
@@ -949,6 +949,227 @@ fn note_module_load() {
         .fetch_add(1, Ordering::Relaxed);
 }
 
+/// Whether [Cuda::launch] may skip its per-launch context drain.
+///
+/// The four-rank forward loop turns this on for its own run scope through
+/// [enable_forward_async_launches]; every other caller (the kernel harnesses, the examples) leaves
+/// it off, so [Cuda::launch] keeps its historical synchronous semantics there. A launch bracket is
+/// also always synchronous: the stage-timing ledger and the probe meter both read a per-launch
+/// cuEventElapsedTime after the drain that follows the launch, so those diagnostic consumers keep
+/// the drained path even inside a forward run.
+static ASYNC_LAUNCHES: AtomicBool = AtomicBool::new(false);
+
+/// The opt-out spelling a forward run accepts: a non-empty value of `SPARKFLASH_SYNC_LAUNCHES`
+/// other than `0` puts the per-launch drain back.
+///
+/// Kept as a pure function so the mode selection is testable on a host with no device.
+#[must_use]
+fn sync_launches_requested(env: Option<&str>) -> bool {
+    match env {
+        None => false,
+        Some(value) => !value.is_empty() && value != "0",
+    }
+}
+
+/// Turns the async launch path on or off and returns the value in force.
+///
+/// The four-rank forward loop calls this once at run scope; a process that never calls it keeps
+/// the synchronous driver path.
+pub fn set_async_launches(enabled: bool) -> bool {
+    ASYNC_LAUNCHES.store(enabled, Ordering::Relaxed);
+    enabled
+}
+
+/// Whether [Cuda::launch] is allowed to leave its kernels queued.
+#[must_use]
+pub fn async_launches() -> bool {
+    ASYNC_LAUNCHES.load(Ordering::Relaxed)
+}
+
+/// Selects the forward run's launch mode from the environment and returns the value in force.
+///
+/// The default is the async path; `SPARKFLASH_SYNC_LAUNCHES=1` opts the run back into the
+/// per-launch drain (the pre-M2 host path, kept as the one-switch rollback).
+pub fn enable_forward_async_launches() -> bool {
+    let requested =
+        sync_launches_requested(std::env::var("SPARKFLASH_SYNC_LAUNCHES").ok().as_deref());
+    set_async_launches(!requested)
+}
+
+/// One run's cubin images and their loaded modules.
+///
+/// M2/C1: the four-rank layer loop used to read and hash eight cubin images and run nine
+/// cuModuleLoadData/cuModuleGetFunction pairs on every layer. A cubin is now interned once by its
+/// own bytes and its modules are resolved from the same id plus the symbol name, which turns the
+/// per-layer module path into two map lookups. Two images with equal bytes share one id; two images
+/// whose bytes differ never share an id, even when a freed buffer's address has been reused by an
+/// image of the same length. Modules owned here are unloaded by [Cuda]'s Drop, never by a per-layer
+/// free.
+#[derive(Default)]
+struct ModuleCache {
+    /// The interned images, kept so a later slice with different bytes can never be mistaken for
+    /// an earlier one and so a pointer lookup can be reused.
+    images: Vec<CachedImage>,
+    /// `(data_ptr, len)` of an interned image -> its index in `images`. A hit is the common
+    /// hot-path case, but it is only trusted after the cached bytes are compared with the slice
+    /// (one memcmp, no allocation).
+    ptr_ids: HashMap<(usize, usize), usize>,
+    next_id: u64,
+    /// `(image id, symbol name)` -> loaded module + function.
+    modules: HashMap<(u64, String), (CuModule, CuFunction)>,
+    /// The module handles this cache owns, so [Cuda::free] can leave them loaded.
+    module_ptrs: HashSet<usize>,
+}
+
+struct CachedImage {
+    id: u64,
+    bytes: Vec<u8>,
+}
+
+impl ModuleCache {
+    /// Interns one cubin image and returns its id.
+    ///
+    /// Guarantees: equal bytes always map to one id, and different bytes never share an id. The
+    /// `(pointer, length)` fast path does one map lookup plus one byte comparison and allocates
+    /// nothing; a key whose cached image no longer has the same bytes (a freed buffer's address
+    /// reused by another image of the same length) is not trusted and falls through to the
+    /// byte-comparison path, which interns the different bytes as a new id.
+    fn intern(&mut self, cubin: &[u8]) -> u64 {
+        self.intern_with_key(cubin.as_ptr() as usize, cubin.len(), cubin)
+    }
+
+    /// Interns one image under an explicit pointer key.
+    ///
+    /// [ModuleCache::intern] passes the slice's own address. The keyed form exists so a test can
+    /// pin the dangerous address-reuse direction deterministically - the same key with different
+    /// bytes must be a different id - without asking the allocator to hand a freed address back.
+    fn intern_with_key(&mut self, key_ptr: usize, key_len: usize, cubin: &[u8]) -> u64 {
+        let key = (key_ptr, key_len);
+        if let Some(&index) = self.ptr_ids.get(&key) {
+            let image = &self.images[index];
+            if image.bytes.as_slice() == cubin {
+                return image.id;
+            }
+            // The address was reused by different bytes. Do not trust the stale mapping: fall
+            // through to the byte comparison below, which either finds the equal image or
+            // interns these bytes as a new id, and remaps this key either way.
+        }
+        if let Some(index) = self
+            .images
+            .iter()
+            .position(|image| image.bytes.as_slice() == cubin)
+        {
+            let id = self.images[index].id;
+            self.ptr_ids.insert(key, index);
+            return id;
+        }
+        self.next_id += 1;
+        let id = self.next_id;
+        self.images.push(CachedImage {
+            id,
+            bytes: cubin.to_vec(),
+        });
+        self.ptr_ids.insert(key, self.images.len() - 1);
+        id
+    }
+
+    fn function(&self, image: u64, name: &str) -> Option<(CuModule, CuFunction)> {
+        self.modules.get(&(image, name.to_string())).copied()
+    }
+
+    fn insert_function(&mut self, image: u64, name: &str, module: CuModule, function: CuFunction) {
+        self.module_ptrs.insert(module as usize);
+        self.modules
+            .insert((image, name.to_string()), (module, function));
+    }
+
+    fn owns_module(&self, module: CuModule) -> bool {
+        self.module_ptrs.contains(&(module as usize))
+    }
+}
+
+/// One run's device buffers, keyed by their exact byte size.
+///
+/// M2/C2: an ordinary layer used to issue 34 cuMemAlloc/cuMemFree pairs. [Cuda::alloc_pooled]
+/// checks a released buffer of the same size out again instead, and [Cuda::release_pooled] stamps
+/// it with the launch counter current at release. A buffer is only reusable once the context's
+/// completion counter has reached that stamp, i.e. once a stream-ordered device-to-host copy or an
+/// explicit [Cuda::synchronize] taken after the release has proven every earlier launch finished.
+/// That is the exactness rule that lets the async launch path hand the same bytes back to the next
+/// layer without draining the context.
+///
+/// Ownership is tracked per pointer: a pooled allocation is checked out from the moment it is
+/// recorded until [BufferPool::release] puts it back, and checked in from that release until the
+/// next checkout. A pointer that is already checked in is refused rather than added to the free
+/// list a second time, so one allocation can never be handed to two live kernels.
+#[derive(Default)]
+struct BufferPool {
+    free: HashMap<usize, Vec<(Deviceptr, u64)>>,
+    /// Every pooled allocation, so a release knows its size and Drop knows what it owns.
+    sizes: HashMap<u64, usize>,
+    /// The subset of `sizes` currently checked in (present in `free`). A release is only
+    /// accepted for a checked-out pointer, which is what makes a double release refuse.
+    checked_in: HashSet<u64>,
+}
+
+impl BufferPool {
+    fn checkout(&mut self, bytes: usize, completed: u64) -> Option<Deviceptr> {
+        let list = self.free.get_mut(&bytes)?;
+        let index = list
+            .iter()
+            .rposition(|(_ptr, needed)| *needed <= completed)?;
+        let ptr = list.swap_remove(index).0;
+        self.checked_in.remove(&ptr.0);
+        Some(ptr)
+    }
+
+    fn record_allocation(&mut self, ptr: Deviceptr, bytes: usize) {
+        self.sizes.insert(ptr.0, bytes);
+    }
+
+    /// Returns a checked-out pooled pointer to the free list at launch stamp `needed`.
+    ///
+    /// The fence is unchanged: [BufferPool::checkout] hands the entry out again only once
+    /// `completed >= needed`. A pointer this pool does not own, and a pointer already checked in,
+    /// are refused with an error instead of inserting a duplicate free-list entry.
+    fn release(&mut self, ptr: Deviceptr, needed: u64) -> Result<(), String> {
+        let Some(bytes) = self.sizes.get(&ptr.0).copied() else {
+            return Err(format!("buffer {:#x} is not a pooled allocation", ptr.0));
+        };
+        if !self.checked_in.insert(ptr.0) {
+            return Err(format!(
+                "pooled buffer {:#x} was released twice without a checkout in between",
+                ptr.0
+            ));
+        }
+        self.free.entry(bytes).or_default().push((ptr, needed));
+        Ok(())
+    }
+
+    /// Removes a pooled pointer from the pool's bookkeeping without freeing its device memory.
+    ///
+    /// [Cuda::free] and [Cuda::free_buffers] use this for a pointer the pool owns: the driver
+    /// allocation must not be passed to cuMemFree, because the pool would free it again from Drop,
+    /// and the pool must not hand it out again. Removing the entry from the free list and from
+    /// `sizes` leaves the allocation to be reclaimed when the primary context is released. Returns
+    /// false when the pool does not own the pointer, and the caller frees it as an ordinary
+    /// allocation.
+    fn forget(&mut self, ptr: Deviceptr) -> bool {
+        let Some(bytes) = self.sizes.remove(&ptr.0) else {
+            return false;
+        };
+        if let Some(list) = self.free.get_mut(&bytes) {
+            list.retain(|(candidate, _needed)| candidate.0 != ptr.0);
+            let empty = list.is_empty();
+            if empty {
+                self.free.remove(&bytes);
+            }
+        }
+        self.checked_in.remove(&ptr.0);
+        true
+    }
+}
+
 /// The CUDA context and the dlopen'd driver functions this process uses.
 ///
 /// The context is the retained primary context, made current for the thread that created it, and
@@ -962,6 +1183,14 @@ pub struct Cuda {
     /// ordinal is what lets `Drop` make the matching release call with the right argument instead of
     /// passing a pointer through a mis-typed symbol.
     dev: i32,
+    /// The run-scope cubin/module cache (M2/C1).
+    modules: Mutex<ModuleCache>,
+    /// The run-scope device buffer pool (M2/C2).
+    pool: Mutex<BufferPool>,
+    /// Launches queued since this handle opened, and the high-water mark a completion point has
+    /// proven finished. The buffer pool's reuse fence reads both.
+    issued: AtomicU64,
+    completed: AtomicU64,
 }
 
 impl Cuda {
@@ -986,6 +1215,10 @@ impl Cuda {
         if r != 0 {
             return Err(format!("cuCtxSynchronize failed: {r}"));
         }
+        // Every launch queued before this point has completed, so the pool may reuse anything
+        // released up to the current launch counter.
+        self.completed
+            .store(self.issued.load(Ordering::Relaxed), Ordering::Relaxed);
         Ok(())
     }
 
@@ -1130,7 +1363,15 @@ impl Cuda {
                     return Err(format!("cuCtxSetCurrent failed: {r}"));
                 }
             }
-            Ok(Cuda { lib, ctx, dev })
+            Ok(Cuda {
+                lib,
+                ctx,
+                dev,
+                modules: Mutex::new(ModuleCache::default()),
+                pool: Mutex::new(BufferPool::default()),
+                issued: AtomicU64::new(0),
+                completed: AtomicU64::new(0),
+            })
         }
     }
 
@@ -1155,6 +1396,70 @@ impl Cuda {
             *total += bytes;
             note_alloc();
             Ok(Deviceptr(p))
+        }
+    }
+
+    /// Checks a pooled device buffer of exactly `bytes` out of the run scope, allocating one only
+    /// when the pool has no finished buffer of that size.
+    ///
+    /// Pair every successful call with [Cuda::release_pooled]; the pooled allocation stays owned by
+    /// the handle. A buffer that is checked in when Drop runs is freed by Drop; a buffer still
+    /// checked out then is reclaimed when the primary context is released. `total` is only advanced
+    /// when a fresh cuMemAlloc happens.
+    ///
+    /// # Errors
+    /// The driver's cuMemAlloc failure code.
+    pub fn alloc_pooled(&self, bytes: usize, total: &mut usize) -> Result<Deviceptr, String> {
+        let completed = self.completed.load(Ordering::Relaxed);
+        if let Ok(mut pool) = self.pool.lock()
+            && let Some(ptr) = pool.checkout(bytes, completed)
+        {
+            return Ok(ptr);
+        }
+        let ptr = self.alloc(bytes, total)?;
+        if let Ok(mut pool) = self.pool.lock() {
+            pool.record_allocation(ptr, bytes);
+        }
+        Ok(ptr)
+    }
+
+    /// Returns buffers from [Cuda::alloc_pooled] to the run scope.
+    ///
+    /// The buffer is stamped with the launch counter current here; [Cuda::alloc_pooled] will not
+    /// hand it out again until a stream-ordered device-to-host copy or a synchronize taken after
+    /// this point has proven every launch issued before the release finished. That fence is what
+    /// makes reuse safe while the async path still has work queued.
+    ///
+    /// A release the pool refuses - a pointer it does not own, or a second release of a pointer
+    /// that is already checked in - is not inserted into the free list, so one allocation can
+    /// never be handed to two live kernels. The signature stays a unit because the existing
+    /// callers pair it with [Cuda::alloc_pooled] and cannot ignore a `Result`; a debug build
+    /// asserts on the refusal (the crate's tests pin it through `BufferPool::release`) and a
+    /// release build keeps the pool consistent and drops the bad entry.
+    pub fn release_pooled(&self, ptrs: &[&Deviceptr]) {
+        let Ok(mut pool) = self.pool.lock() else {
+            return;
+        };
+        let needed = self.issued.load(Ordering::Relaxed);
+        for ptr in ptrs {
+            let released = pool.release(**ptr, needed);
+            debug_assert!(
+                released.is_ok(),
+                "pool release refused: {:?}",
+                released.err()
+            );
+        }
+    }
+
+    /// Forgets every pointer the run-scope pool owns and reports, in order, whether it was pooled.
+    ///
+    /// [Cuda::free] and [Cuda::free_buffers] use this so a pooled allocation is never passed to
+    /// cuMemFree: the pool owns it, and freeing it here would leave Drop to free it a second time.
+    fn forget_pooled<'a>(&self, ptrs: impl ExactSizeIterator<Item = &'a Deviceptr>) -> Vec<bool> {
+        let count = ptrs.len();
+        match self.pool.lock() {
+            Ok(mut pool) => ptrs.map(|ptr| pool.forget(*ptr)).collect(),
+            Err(_) => vec![false; count],
         }
     }
 
@@ -1238,6 +1543,11 @@ impl Cuda {
     /// Managed memory is released through cuMemFree, the same call as an ordinary device
     /// allocation. The byte count is not tracked here; the caller's arena keeps its own total.
     pub fn free_managed(&self, ptr: &Deviceptr) {
+        // A queued kernel may still read this allocation; the async path waits before returning
+        // the memory to the driver.
+        if async_launches() {
+            let _ = self.synchronize();
+        }
         unsafe {
             if let Ok(f) =
                 self.sym::<unsafe extern "C" fn(CuDeviceptr) -> CuResult>(b"cuMemFree_v2")
@@ -1250,6 +1560,9 @@ impl Cuda {
 
     /// Frees an allocation returned by [Cuda::alloc_host_mapped].
     pub fn free_host_mapped(&self, mapped: &HostMapped) {
+        if async_launches() {
+            let _ = self.synchronize();
+        }
         unsafe {
             if let Ok(f) =
                 self.sym::<unsafe extern "C" fn(*mut c_void) -> CuResult>(b"cuMemFreeHost")
@@ -1294,6 +1607,14 @@ impl Cuda {
             }
             if r != 0 {
                 return Err(format!("cuMemcpyDtoH failed: {r}"));
+            }
+            // cuMemcpyDtoH_v2 is synchronous and stream-ordered: it returns only after every
+            // launch queued before it on the default stream has finished. That makes it the
+            // observation point the async path relies on, and it advances the pool fence exactly
+            // like an explicit synchronize does.
+            if async_launches() {
+                self.completed
+                    .store(self.issued.load(Ordering::Relaxed), Ordering::Relaxed);
             }
             Ok(())
         }
@@ -1549,6 +1870,24 @@ impl Cuda {
     }
 
     fn load_function(&self, cubin: &[u8], name: &str) -> Result<(CuModule, CuFunction), String> {
+        // M2/C1: a cubin image the run has already loaded resolves to its cached module and
+        // function. The key is the image's own bytes (interned byte-for-byte, so a changed image
+        // is a new id) plus the symbol name; a caller that hands over different bytes can never
+        // hit another image's entry.
+        let image = self
+            .modules
+            .lock()
+            .map_err(|error| format!("module cache lock: {error}"))?
+            .intern(cubin);
+        {
+            let cache = self
+                .modules
+                .lock()
+                .map_err(|error| format!("module cache lock: {error}"))?;
+            if let Some(hit) = cache.function(image, name) {
+                return Ok(hit);
+            }
+        }
         unsafe {
             let load: libloading::Symbol<
                 unsafe extern "C" fn(*mut CuModule, *const c_void) -> CuResult,
@@ -1568,13 +1907,65 @@ impl Cuda {
                 return Err(format!("cuModuleGetFunction({name}) failed: {r}"));
             }
             note_module_load();
+            self.modules
+                .lock()
+                .map_err(|error| format!("module cache lock: {error}"))?
+                .insert_function(image, name, module, func);
             Ok((module, func))
         }
     }
 
-    /// Launches one non-flash_mla kernel, then synchronises the context.
+    /// Launches one non-flash_mla kernel without draining the context.
     ///
-    /// With SPARKFLASH_STAGE_TIMING=1 the launch is bracketed by one cuEventCreate pair recorded
+    /// This is the M2/C3 async entry point: it queues the launch and returns. The caller may rely
+    /// on the result only after a stream-ordered device-to-host copy (cuMemcpyDtoH is synchronous
+    /// and waits for every earlier launch on the default stream), an explicit
+    /// [Cuda::synchronize], or [Cuda::launch_repeated]'s own event wait. It must not release the
+    /// module or the memory the kernel reads before one of those boundaries; the buffer pool and
+    /// the module cache exist so the four-rank loop never has to. Arithmetic is unchanged: only
+    /// the host's wait moves.
+    ///
+    /// # Errors
+    /// The driver's cuLaunchKernel failure code.
+    pub fn launch_async(
+        &self,
+        kernel: Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        args: &[u64],
+    ) -> Result<(), String> {
+        let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
+        let mut storage: Vec<[u64; 1]> = args.iter().map(|a| [*a]).collect();
+        let mut ptrs: Vec<*mut c_void> =
+            storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
+        // SAFETY: the symbol comes from this context's library, every argument is a u64 or a
+        // pointer to one that outlives the call, and the kernel handle is crate-owned.
+        let r = unsafe {
+            launch(
+                kernel.function,
+                grid.0,
+                grid.1,
+                grid.2,
+                block.0,
+                block.1,
+                block.2,
+                0,
+                std::ptr::null_mut(),
+                ptrs.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if r != 0 {
+            return Err(format!("cuLaunchKernel failed: {r}"));
+        }
+        self.issued.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Launches one non-flash_mla kernel, draining the context unless the run selected async.
+    ///
+    /// With SPARKFLASH_STAGE_TIMING=1, or with the probe meter armed, the launch is bracketed by
+    /// one cuEventCreate pair recorded
     /// immediately around cuLaunchKernel and resolved after the existing cuCtxSynchronize; the
     /// bracketed launches are the same launches in the same order and nothing else changes. Without
     /// the variable no event is created, no allocation happens and the launch path is unchanged.
@@ -1590,6 +1981,11 @@ impl Cuda {
         block: (u32, u32, u32),
         args: &[u64],
     ) -> Result<(), String> {
+        // The bracket consumers need the drain that follows each launch, so they always take the
+        // synchronous path. Everything else takes the async path when the run selected it.
+        if !stage_timing_enabled() && !probe_meter_armed() && async_launches() {
+            return self.launch_async(kernel, grid, block, args);
+        }
         unsafe {
             let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
             let mut storage: Vec<[u64; 1]> = args.iter().map(|a| [*a]).collect();
@@ -1638,6 +2034,7 @@ impl Cuda {
             if r != 0 {
                 return Err(format!("cuLaunchKernel failed: {r}"));
             }
+            self.issued.fetch_add(1, Ordering::Relaxed);
             if bracket {
                 let record: libloading::Symbol<
                     unsafe extern "C" fn(CuEvent, *mut c_void) -> CuResult,
@@ -1657,6 +2054,8 @@ impl Cuda {
             if r != 0 {
                 return Err(format!("cuCtxSynchronize failed: {r}"));
             }
+            self.completed
+                .store(self.issued.load(Ordering::Relaxed), Ordering::Relaxed);
             if bracket {
                 let elapsed: libloading::Symbol<
                     unsafe extern "C" fn(*mut f32, CuEvent, CuEvent) -> CuResult,
@@ -1776,17 +2175,40 @@ impl Cuda {
     }
 
     /// Frees device buffers and unloads the module that produced them.
+    ///
+    /// M2/C1: a module the run-scope cache owns is left loaded (its Drop unloads it), so the
+    /// per-layer free becomes a no-op on the hot path. Everything still unloaded or freed here is
+    /// guarded by a context drain on the async path, because the driver must not recycle memory a
+    /// queued kernel may still read.
+    ///
+    /// A pointer the run-scope pool owns is not passed to cuMemFree: it is forgotten from the
+    /// pool's bookkeeping and reclaimed when the primary context is released, so Drop can never
+    /// free it a second time. Return a pooled buffer with [Cuda::release_pooled] instead.
     pub fn free(&self, module: Module, ptrs: &[Deviceptr]) {
+        let cached = self
+            .modules
+            .lock()
+            .map(|cache| cache.owns_module(module.0))
+            .unwrap_or(false);
+        let forgotten = self.forget_pooled(ptrs.iter());
+        if async_launches() && (!cached || !ptrs.is_empty()) {
+            let _ = self.synchronize();
+        }
+        let freed = forgotten.iter().filter(|is_pooled| !**is_pooled).count();
         unsafe {
             if let Ok(f) =
                 self.sym::<unsafe extern "C" fn(CuDeviceptr) -> CuResult>(b"cuMemFree_v2")
             {
-                for p in ptrs {
-                    let _ = f(p.0);
+                for (p, is_pooled) in ptrs.iter().zip(&forgotten) {
+                    if !*is_pooled {
+                        let _ = f(p.0);
+                    }
                 }
-                note_free(ptrs.len() as u64);
+                note_free(freed as u64);
             }
-            if let Ok(f) = self.sym::<unsafe extern "C" fn(CuModule) -> CuResult>(b"cuModuleUnload")
+            if !cached
+                && let Ok(f) =
+                    self.sym::<unsafe extern "C" fn(CuModule) -> CuResult>(b"cuModuleUnload")
             {
                 let _ = f(module.0);
             }
@@ -1797,16 +2219,24 @@ impl Cuda {
     /// Frees device buffers without unloading the module that produced them.
     ///
     /// Stage 7 runs several different-shaped launches per loaded module, so the module has to
-    /// outlive them.
+    /// outlive them. As in [Cuda::free], a pointer the run-scope pool owns is forgotten from the
+    /// pool's bookkeeping instead of being passed to cuMemFree.
     pub fn free_buffers(&self, ptrs: &[&Deviceptr]) {
+        let forgotten = self.forget_pooled(ptrs.iter().copied());
+        if async_launches() {
+            let _ = self.synchronize();
+        }
+        let freed = forgotten.iter().filter(|is_pooled| !**is_pooled).count();
         unsafe {
             if let Ok(f) =
                 self.sym::<unsafe extern "C" fn(CuDeviceptr) -> CuResult>(b"cuMemFree_v2")
             {
-                for p in ptrs {
-                    let _ = f(p.0);
+                for (p, is_pooled) in ptrs.iter().zip(&forgotten) {
+                    if !*is_pooled {
+                        let _ = f(p.0);
+                    }
                 }
-                note_free(ptrs.len() as u64);
+                note_free(freed as u64);
             }
         }
     }
@@ -1820,7 +2250,38 @@ impl Drop for Cuda {
         if self.ctx.is_null() {
             return;
         }
+        // No queued launch may outlive the handles it reads: drain first, then unload the cached
+        // modules and free the pooled buffers, then release this process's context reference.
+        let _ = self.synchronize();
         unsafe {
+            if let Ok(mut cache) = self.modules.lock() {
+                if let Ok(unload) =
+                    self.sym::<unsafe extern "C" fn(CuModule) -> CuResult>(b"cuModuleUnload")
+                {
+                    for (_key, (module, _function)) in cache.modules.drain() {
+                        let _ = unload(module);
+                    }
+                }
+                cache.module_ptrs.clear();
+            }
+            if let Ok(mut pool) = self.pool.lock() {
+                if let Ok(free) =
+                    self.sym::<unsafe extern "C" fn(CuDeviceptr) -> CuResult>(b"cuMemFree_v2")
+                {
+                    // Only the free lists are authoritative: a pointer still checked out belongs
+                    // to a caller, and a pointer forgotten by free()/free_buffers() is no longer
+                    // in the bookkeeping. Neither may be freed here a second time; the primary
+                    // context release below reclaims them.
+                    for list in pool.free.values() {
+                        for (ptr, _needed) in list {
+                            let _ = free(ptr.0);
+                        }
+                    }
+                }
+                pool.free.clear();
+                pool.sizes.clear();
+                pool.checked_in.clear();
+            }
             if let Ok(release_v2) =
                 self.sym::<unsafe extern "C" fn(i32) -> CuResult>(b"cuDevicePrimaryCtxRelease_v2")
             {
@@ -1993,5 +2454,198 @@ mod probe_meter_tests {
         let backwards = before.since(after);
         assert_eq!(backwards, ProbeMeterReading::default());
         probe_meter_arm(false);
+    }
+}
+
+/// M2/C3 + C1 + C2 mode and cache invariants, tested without a device.
+///
+/// The driver path itself cannot run on this host, so the parts that decide *what* the driver will
+/// do are pure data structures here: the launch-mode selection, the cubin interning key and the
+/// buffer-pool reuse fence. That is the contract the device window exercises.
+#[cfg(test)]
+mod async_launch_cache_tests {
+    use super::*;
+
+    /// Serialises the tests that touch the process-wide async switch.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn the_forward_opt_out_is_one_environment_variable() {
+        assert!(!sync_launches_requested(None));
+        assert!(!sync_launches_requested(Some("")));
+        assert!(!sync_launches_requested(Some("0")));
+        assert!(sync_launches_requested(Some("1")));
+        assert!(sync_launches_requested(Some("yes")));
+    }
+
+    #[test]
+    fn the_async_switch_is_off_until_a_run_selects_it() {
+        let _serial = TEST_LOCK.lock().expect("test lock");
+        set_async_launches(false);
+        assert!(!async_launches());
+        assert!(set_async_launches(true));
+        assert!(async_launches());
+        set_async_launches(false);
+        assert!(!async_launches());
+    }
+
+    #[test]
+    fn the_module_cache_keys_by_bytes_not_by_address() {
+        // Two live allocations with the same bytes must share one id; a third with different
+        // bytes must not. This is the "different cubin bytes -> different key" misuse case.
+        let first = vec![7u8, 8, 9];
+        let same_bytes = vec![7u8, 8, 9];
+        let different = vec![7u8, 8, 10];
+        assert_ne!(first.as_ptr(), same_bytes.as_ptr());
+        let mut cache = ModuleCache::default();
+        let first_id = cache.intern(&first);
+        assert_eq!(cache.intern(&same_bytes), first_id);
+        let different_id = cache.intern(&different);
+        assert_ne!(first_id, different_id);
+        assert_ne!(
+            (first_id, "symbol".to_string()),
+            (different_id, "symbol".to_string())
+        );
+        // The pointer fast path re-checks the cached bytes and returns the same id for the same
+        // image; it is a comparison, not an assumption that the address is enough.
+        assert_eq!(cache.intern(&first), first_id);
+    }
+
+    #[test]
+    fn a_pointer_key_reused_by_different_bytes_is_a_different_image() {
+        // The dangerous direction: image A's cubin buffer is freed and image B of the same length
+        // is allocated at the same address. A pointer-only fast path would answer A's id and
+        // load_function would silently return A's module. The byte comparison must intern B as a
+        // new id, so the two images never resolve each other's functions.
+        let first = [7u8, 8, 9, 10];
+        let second = [7u8, 8, 9, 11];
+        let key_ptr = 0xdead_0000usize;
+        let key_len = first.len();
+        let mut cache = ModuleCache::default();
+
+        let first_id = cache.intern_with_key(key_ptr, key_len, &first);
+        let first_module = 0x1111usize as CuModule;
+        let first_function = 0x2222usize as CuFunction;
+        cache.insert_function(first_id, "kernel", first_module, first_function);
+
+        // Same pointer key and length, different bytes: the reused-allocation case.
+        let second_id = cache.intern_with_key(key_ptr, key_len, &second);
+        assert_ne!(
+            second_id, first_id,
+            "a reused address with different bytes must not reuse the old image id"
+        );
+        assert!(
+            cache.function(second_id, "kernel").is_none(),
+            "the second image must not resolve the first image's loaded module"
+        );
+
+        let second_module = 0x3333usize as CuModule;
+        let second_function = 0x4444usize as CuFunction;
+        cache.insert_function(second_id, "kernel", second_module, second_function);
+        assert_eq!(
+            cache.function(first_id, "kernel"),
+            Some((first_module, first_function))
+        );
+        assert_eq!(
+            cache.function(second_id, "kernel"),
+            Some((second_module, second_function))
+        );
+        assert_ne!(
+            cache.function(first_id, "kernel"),
+            cache.function(second_id, "kernel"),
+            "each image must keep its own module and function"
+        );
+
+        // Interning the first image through the same key restores its id by byte match, not by
+        // an assumed pointer match.
+        assert_eq!(cache.intern_with_key(key_ptr, key_len, &first), first_id);
+        assert_eq!(cache.intern(&first), first_id);
+    }
+
+    #[test]
+    fn a_cached_module_is_owned_so_free_leaves_it_loaded() {
+        let mut cache = ModuleCache::default();
+        let image = cache.intern(&[1u8, 2, 3]);
+        let module = 0x1234usize as CuModule;
+        cache.insert_function(image, "kernel", module, std::ptr::null_mut());
+        assert!(cache.owns_module(module));
+        assert!(!cache.owns_module(0x9999usize as CuModule));
+        assert_eq!(
+            cache.function(image, "kernel").map(|(m, _)| m),
+            Some(module)
+        );
+        assert!(cache.function(image, "other_kernel").is_none());
+    }
+
+    #[test]
+    fn the_pool_reuses_only_after_a_completion_point_and_never_overlaps() {
+        let ptr = Deviceptr(0x1000);
+        let mut pool = BufferPool::default();
+        pool.record_allocation(ptr, 64);
+        // Nothing released yet.
+        assert_eq!(pool.checkout(64, 100), None);
+        pool.release(ptr, 5)
+            .expect("first release after a checkout");
+        // Released before launch 5; completion at 4 does not prove launch 5 finished.
+        assert_eq!(pool.checkout(64, 4), None);
+        // A completion exactly at the release stamp is enough.
+        assert_eq!(pool.checkout(64, 5), Some(ptr));
+        // Checked out means the same buffer cannot be handed out twice.
+        assert_eq!(pool.checkout(64, 5), None);
+        // Size classes are exact, so a 32-byte request never gets a 64-byte buffer.
+        assert_eq!(pool.checkout(32, u64::MAX), None);
+        // After a new release a later completion may reuse it again.
+        pool.release(ptr, 6)
+            .expect("release after the new checkout");
+        assert_eq!(pool.checkout(64, 6), Some(ptr));
+    }
+
+    #[test]
+    fn a_double_release_is_refused_and_never_duplicates_a_free_list() {
+        let ptr = Deviceptr(0x2000);
+        let mut pool = BufferPool::default();
+        pool.record_allocation(ptr, 128);
+        pool.release(ptr, 7).expect("the first release is accepted");
+        assert!(
+            pool.release(ptr, 7).is_err(),
+            "a second release of a checked-in pointer must be refused"
+        );
+        // One entry, not two: the first checkout gets the buffer and the next finds nothing, so
+        // the same allocation is never handed to two live kernels.
+        assert_eq!(pool.checkout(128, 7), Some(ptr));
+        assert_eq!(pool.checkout(128, u64::MAX), None);
+        // A pointer the pool does not own is refused too, instead of joining a free list.
+        assert!(pool.release(Deviceptr(0xbad), 7).is_err());
+    }
+
+    #[test]
+    fn a_pooled_pointer_freed_through_free_is_forgotten_not_freed_again() {
+        // Cuda::free and Cuda::free_buffers call BufferPool::forget for a pointer the pool owns.
+        // The device calls cannot run without a GPU, so the contract pinned here is the pool
+        // bookkeeping: a forgotten pointer is removed from every map, so Drop's authoritative
+        // free lists are empty and cannot pass it to cuMemFree a second time.
+        let checked_in = Deviceptr(0x3000);
+        let checked_out = Deviceptr(0x3100);
+        let mut pool = BufferPool::default();
+        pool.record_allocation(checked_in, 64);
+        pool.record_allocation(checked_out, 96);
+        pool.release(checked_in, 4).expect("release");
+        assert!(pool.forget(checked_in));
+        assert!(
+            !pool.sizes.contains_key(&checked_in.0),
+            "a forgotten pointer is no longer owned by the pool"
+        );
+        assert!(
+            pool.free.values().all(Vec::is_empty),
+            "a forgotten pointer is off every free list, so Drop frees nothing for it"
+        );
+        // A live checkout passed to free() is forgotten as well: it must not remain in the
+        // pool's ownership, or Drop would free memory the caller already handed back.
+        assert!(pool.forget(checked_out));
+        assert!(pool.sizes.is_empty());
+        assert!(pool.free.is_empty());
+        assert!(pool.checked_in.is_empty());
+        // Forgetting twice is harmless and reports that the pool does not own it.
+        assert!(!pool.forget(checked_in));
     }
 }

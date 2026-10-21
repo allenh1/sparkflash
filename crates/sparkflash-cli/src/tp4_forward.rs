@@ -976,7 +976,7 @@ fn mhc_entry_host_seam_with_digests(
             .flat_map(|value| value.to_le_bytes())
             .collect()
     };
-    let hidden_sha256 = sha256_hex(&f32_bytes(hidden));
+    let hidden_sha256 = evidence_sha256(&f32_bytes(hidden));
     let (predictor_sha256, base_sha256, norm_sha256) = match digests {
         Some(digests) => (
             digests.predictor.clone(),
@@ -984,9 +984,9 @@ fn mhc_entry_host_seam_with_digests(
             digests.norm.clone(),
         ),
         None => (
-            sha256_hex(&f32_bytes(predictor)),
-            sha256_hex(&f32_bytes(base)),
-            sha256_hex(&f32_bytes(attn_norm)),
+            evidence_sha256(&f32_bytes(predictor)),
+            evidence_sha256(&f32_bytes(base)),
+            evidence_sha256(&f32_bytes(attn_norm)),
         ),
     };
     Ok(MhcEntrySeam {
@@ -998,9 +998,9 @@ fn mhc_entry_host_seam_with_digests(
         pre: mixes.pre,
         post: mixes.post,
         comb: mixes.comb,
-        attn_in_sha256: sha256_hex(&f32_bytes(&attn_in)),
+        attn_in_sha256: evidence_sha256(&f32_bytes(&attn_in)),
         attn_in,
-        normed_sha256: sha256_hex(&f32_bytes(&normed)),
+        normed_sha256: evidence_sha256(&f32_bytes(&normed)),
         normed,
         hidden: hidden.to_vec(),
     })
@@ -1209,9 +1209,9 @@ fn decode_layer_seam_tensors(
         ));
     };
     Ok(LayerSeamTensors {
-        attn_predictor_sha256: sha256_hex(&f32_le_bytes(&attn_fn)),
-        attn_base_sha256: sha256_hex(&f32_le_bytes(&attn_base)),
-        attn_norm_sha256: sha256_hex(&f32_le_bytes(&attn_norm)),
+        attn_predictor_sha256: evidence_sha256(&f32_le_bytes(&attn_fn)),
+        attn_base_sha256: evidence_sha256(&f32_le_bytes(&attn_base)),
+        attn_norm_sha256: evidence_sha256(&f32_le_bytes(&attn_norm)),
         attn_fn,
         attn_base,
         attn_scale,
@@ -1319,6 +1319,113 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     #[cfg(feature = "cuda")]
     probe::count_sha256(bytes.len(), timer);
     digest
+}
+
+/// One process's cubin image cache (M2/C1).
+///
+/// The four-rank layer loop reads and hashes the same eight cubin images on every layer. The cache
+/// keys on the path and keeps the bytes as a shared `Arc`, so the read, the sha256 and the
+/// module-cache pointer identity are established once per run. [reset_cubin_cache] clears it at run
+/// scope, so two runs in one process cannot share a stale image.
+/// A cubin image and the sha256 its pin records, shared for the life of one run.
+#[cfg(feature = "cuda")]
+type CubinImage = (std::sync::Arc<[u8]>, String);
+
+#[cfg(feature = "cuda")]
+static CUBIN_CACHE: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, CubinImage>>> =
+    std::sync::Mutex::new(None);
+
+/// Reads one cubin image once per run and returns its bytes plus the sha256 the pins record.
+///
+/// The shared `Arc` matters twice: it removes the repeated read and hash, and it keeps the slice
+/// address stable so the driver's module cache can hit its pointer fast path on every later layer.
+///
+/// # Errors
+/// The file read failure, with the path in the message.
+#[cfg(feature = "cuda")]
+pub(crate) fn cached_cubin(path: &Path) -> Result<(std::sync::Arc<[u8]>, String), String> {
+    let mut guard = CUBIN_CACHE
+        .lock()
+        .map_err(|error| format!("cubin cache lock: {error}"))?;
+    let cache = guard.get_or_insert_with(std::collections::HashMap::new);
+    if let Some((bytes, digest)) = cache.get(path) {
+        return Ok((std::sync::Arc::clone(bytes), digest.clone()));
+    }
+    let bytes: std::sync::Arc<[u8]> = std::fs::read(path)
+        .map_err(|error| format!("read {}: {error}", path.display()))?
+        .into();
+    let digest = sha256_hex(&bytes);
+    cache.insert(
+        path.to_path_buf(),
+        (std::sync::Arc::clone(&bytes), digest.clone()),
+    );
+    Ok((bytes, digest))
+}
+
+/// Starts a fresh cubin cache at run scope.
+#[cfg(feature = "cuda")]
+pub(crate) fn reset_cubin_cache() {
+    if let Ok(mut guard) = CUBIN_CACHE.lock() {
+        *guard = Some(std::collections::HashMap::new());
+    }
+}
+
+// The evidence switch is thread-local, not process-wide, for the same reason the probe's state is:
+// one forward loop runs on one thread, and a unit test must be able to switch the chain off without
+// racing every other test in the binary. Unit-test threads build with the chain on so the pre-M2
+// evidence assertions stay meaningful; the shipped default is off, and [run_forward_loop] always
+// selects the run's mode explicitly from `SPARKFLASH_FORWARD_EVIDENCE` before the first launch.
+thread_local! {
+    static EVIDENCE_RECORD: std::cell::Cell<bool> = const { std::cell::Cell::new(cfg!(test)) };
+    static EVIDENCE_HASH_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The evidence opt-in spelling: `SPARKFLASH_FORWARD_EVIDENCE=1` (or `true` / `yes`).
+#[must_use]
+pub fn evidence_enabled_from_env(env: Option<&str>) -> bool {
+    matches!(env, Some("1" | "true" | "yes"))
+}
+
+/// Turns the evidence chain on or off and returns the value in force.
+pub fn set_evidence_record(enabled: bool) -> bool {
+    EVIDENCE_RECORD.with(|record| record.set(enabled));
+    enabled
+}
+
+/// Whether the per-layer evidence chain (layer JSON and its data-dependent digests) is recorded.
+#[must_use]
+pub fn evidence_record_enabled() -> bool {
+    EVIDENCE_RECORD.with(std::cell::Cell::get)
+}
+
+/// Selects the evidence mode from the environment at run scope.
+pub fn enable_forward_evidence_from_env() -> bool {
+    set_evidence_record(evidence_enabled_from_env(
+        std::env::var("SPARKFLASH_FORWARD_EVIDENCE").ok().as_deref(),
+    ))
+}
+
+/// The number of evidence digests actually taken on this thread (test hook).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn evidence_hash_calls() -> u64 {
+    EVIDENCE_HASH_CALLS.with(std::cell::Cell::get)
+}
+
+/// A sha256 that exists only for the evidence chain: empty when the run is not recording evidence.
+///
+/// Every per-layer/per-position data-dependent digest goes through this, so a default or
+/// --forward-lean run hashes nothing on the layer path; the probe's sha256 call counter is the
+/// proof. With the evidence flag on it is exactly [sha256_hex], so the identity kit's chain JSON is
+/// byte-identical to the pre-M2 evidence-bearing path.
+#[must_use]
+pub(crate) fn evidence_sha256(bytes: &[u8]) -> String {
+    if evidence_record_enabled() {
+        EVIDENCE_HASH_CALLS.with(|calls| calls.set(calls.get() + 1));
+        sha256_hex(bytes)
+    } else {
+        String::new()
+    }
 }
 
 /// Quantises a W8A8 activation the way the released forward does (model.py:27-30, 182-205): the
@@ -2414,14 +2521,14 @@ fn run_layer_kv_path(
     let l2 = kv.iter().map(|value| value * value).sum::<f32>().sqrt();
     let (window_codes, window_scales) = window_row_bytes(&kv)?;
     Ok(Layer0KvPath {
-        kv_norm_sha256: sha256_hex(&normed_bytes),
-        kv_post_rope_sha256: sha256_hex(&rotated_bytes),
+        kv_norm_sha256: evidence_sha256(&normed_bytes),
+        kv_post_rope_sha256: evidence_sha256(&rotated_bytes),
         kv_l2: l2,
         mla_width,
         rope_head_dim,
         position,
-        window_codes_sha256: sha256_hex(&window_codes),
-        window_scales_sha256: sha256_hex(&window_scales),
+        window_codes_sha256: evidence_sha256(&window_codes),
+        window_scales_sha256: evidence_sha256(&window_scales),
         window_codes_len: window_codes.len(),
         window_scales_len: window_scales.len(),
         window_codes,
@@ -2466,6 +2573,12 @@ pub struct AttentionBody {
     cubin_sha256: String,
     /// The HSI blocks the zeroed index key pool covers.
     index_blocks_staged: usize,
+    /// M2/C5: whether the expanded compressed store currently on the device is all zero.
+    ///
+    /// The store is a kernel input that no launch writes, so a layer whose staged store is all
+    /// zero (store_rows 0) can skip its 147,456-byte upload while this flag says the device bytes
+    /// are already zero. `open` zero-fills the store once, which makes the first skip provable.
+    store_zero: std::cell::Cell<bool>,
 }
 
 /// One executed attention body launch: the staged operands, the kernel's out, the host twin's
@@ -2641,6 +2754,7 @@ impl AttentionBody {
             sinks: Vec::with_capacity(config.n_layers),
             cubin_sha256,
             index_blocks_staged,
+            store_zero: std::cell::Cell::new(true),
         };
         for layer in 0..config.n_layers {
             let sink = read_arena_bytes(
@@ -2672,6 +2786,18 @@ impl AttentionBody {
             .map_err(|error| format!("attention body: block best zero fill: {error}"))?;
         cuda.copy_htod(&body.trace_ring, &[0u8; TRACE_RING_BYTES])
             .map_err(|error| format!("attention body: trace ring zero fill: {error}"))?;
+        // M2/C5: the expanded store is a kernel input, so after this one zero fill every layer
+        // whose staged store is all zero can skip its upload and still leave the same bytes.
+        cuda.copy_htod(
+            &body.kv_codes,
+            &vec![0u8; crate::tp4_prefill::EXPANDED_ROWS * crate::tp4_prefill::STORE_CODE_BYTES],
+        )
+        .map_err(|error| format!("attention body: expanded store codes zero fill: {error}"))?;
+        cuda.copy_htod(
+            &body.kv_scales,
+            &vec![0u8; crate::tp4_prefill::EXPANDED_ROWS * crate::tp4_prefill::STORE_SCALE_BYTES],
+        )
+        .map_err(|error| format!("attention body: expanded store scales zero fill: {error}"))?;
         Ok(body)
     }
 
@@ -2717,7 +2843,7 @@ impl AttentionBody {
             .sinks
             .get(layer)
             .ok_or_else(|| format!("attention body: no sink shard was read for layer {layer}"))?;
-        let sink_sha256 = sha256_hex(sink);
+        let sink_sha256 = evidence_sha256(sink);
         let selected_bytes: Vec<u8> = staged
             .selected
             .iter()
@@ -2751,12 +2877,26 @@ impl AttentionBody {
                 .map_err(|error| format!("attention body: window codes htod: {error}"))?;
             cuda.copy_htod(&self.window_scales, &staged.window_scales)
                 .map_err(|error| format!("attention body: window scales htod: {error}"))?;
-            cuda.copy_htod(&self.kv_codes, &staged.kv_codes)
-                .map_err(|error| format!("attention body: expanded store codes htod: {error}"))?;
-            cuda.copy_htod(&self.kv_scales, &staged.kv_scales)
-                .map_err(|error| format!("attention body: expanded store scales htod: {error}"))?;
-            cuda.copy_htod(&self.selected, &selected_bytes)
-                .map_err(|error| format!("attention body: selected htod: {error}"))?;
+            // M2/C5: the staged store is all zero exactly when store_rows is 0 (stage_attention
+            // initialises the view to zeros and only writes the selected rows). When the device
+            // store is already zero from open() or a previous zero upload, the 147,456-byte upload
+            // is a provable no-op and is skipped.
+            let store_is_zero = staged.store_rows == 0;
+            if !(store_is_zero && self.store_zero.get()) {
+                cuda.copy_htod(&self.kv_codes, &staged.kv_codes)
+                    .map_err(|error| {
+                        format!("attention body: expanded store codes htod: {error}")
+                    })?;
+                cuda.copy_htod(&self.kv_scales, &staged.kv_scales)
+                    .map_err(|error| {
+                        format!("attention body: expanded store scales htod: {error}")
+                    })?;
+                self.store_zero.set(store_is_zero);
+            }
+            if !selected_bytes.is_empty() {
+                cuda.copy_htod(&self.selected, &selected_bytes)
+                    .map_err(|error| format!("attention body: selected htod: {error}"))?;
+            }
             cuda.copy_htod(&self.sink, sink)
                 .map_err(|error| format!("attention body: sink htod: {error}"))?;
             let selected_count = u32::try_from(staged.selected.len()).map_err(|_| {
@@ -2812,7 +2952,7 @@ impl AttentionBody {
                         .to_string(),
                 );
             }
-            let out_sha256 = sha256_hex(&out_bf16);
+            let out_sha256 = evidence_sha256(&out_bf16);
             let out_l2 = values.iter().map(|value| value * value).sum::<f32>().sqrt();
             // The twin sees the bytes the kernel saw: the BF16 q as read, the layer's sink, the
             // staged window/store bytes and the ascending selected list.
@@ -2863,16 +3003,16 @@ impl AttentionBody {
                 ratio: staged.ratio,
                 grid: (self.heads as u32, 1, 1),
                 cubin_sha256: self.cubin_sha256.clone(),
-                q_sha256: sha256_hex(&query.q_post_rope_bf16),
+                q_sha256: evidence_sha256(&query.q_post_rope_bf16),
                 sink_sha256,
-                window_codes_sha256: sha256_hex(&staged.window_codes),
-                window_scales_sha256: sha256_hex(&staged.window_scales),
-                kv_codes_sha256: sha256_hex(&staged.kv_codes),
-                kv_scales_sha256: sha256_hex(&staged.kv_scales),
-                selected_sha256: sha256_hex(&selected_bytes),
+                window_codes_sha256: evidence_sha256(&staged.window_codes),
+                window_scales_sha256: evidence_sha256(&staged.window_scales),
+                kv_codes_sha256: evidence_sha256(&staged.kv_codes),
+                kv_scales_sha256: evidence_sha256(&staged.kv_scales),
+                selected_sha256: evidence_sha256(&selected_bytes),
                 out_sha256,
                 out_l2,
-                inverse_rope_sha256: sha256_hex(&activation_bf16),
+                inverse_rope_sha256: evidence_sha256(&activation_bf16),
                 inverse_rope_l2,
                 activation_bf16,
                 twin,
@@ -2998,22 +3138,22 @@ fn run_layer_query_path(
     let kernel_dir = request
         .kernel_cubin_dir
         .ok_or_else(|| "layer-0 query path: the loop has no kernel cubin directory".to_string())?;
-    let cubin = std::fs::read(kernel_dir.join(format!("{NATIVE_DENSE_KERNEL}.cubin")))
-        .map_err(|error| format!("layer-0 query path: read dense cubin: {error}"))?;
-    let cubin_sha256 = sha256_hex(&cubin);
+    let (cubin, cubin_sha256) =
+        cached_cubin(&kernel_dir.join(format!("{NATIVE_DENSE_KERNEL}.cubin")))
+            .map_err(|error| format!("layer-0 query path: read dense cubin: {error}"))?;
     let (module, kernel) = mxfp8_dense_launch::load(cuda, &cubin)?;
     let mut allocated = 0usize;
     let a_codes = cuda
-        .alloc(activation_codes.len(), &mut allocated)
+        .alloc_pooled(activation_codes.len(), &mut allocated)
         .map_err(|error| format!("layer-0 query path: activation code buffer: {error}"))?;
     let a_scales = cuda
-        .alloc(activation_scales.len(), &mut allocated)
+        .alloc_pooled(activation_scales.len(), &mut allocated)
         .map_err(|error| format!("layer-0 query path: activation scale buffer: {error}"))?;
     let out = cuda
-        .alloc(wq_b_cols * 2, &mut allocated)
+        .alloc_pooled(wq_b_cols * 2, &mut allocated)
         .map_err(|error| format!("layer-0 query path: wq_b output buffer: {error}"))?;
     let trace_ring = cuda
-        .alloc(TRACE_RING_BYTES, &mut allocated)
+        .alloc_pooled(TRACE_RING_BYTES, &mut allocated)
         .map_err(|error| format!("layer-0 query path: trace ring buffer: {error}"))?;
     cuda.copy_htod(&trace_ring, &[0u8; TRACE_RING_BYTES])
         .map_err(|error| format!("layer-0 query path: trace ring zero fill: {error}"))?;
@@ -3076,13 +3216,13 @@ fn run_layer_query_path(
         let l2 = q.iter().map(|value| value * value).sum::<f32>().sqrt();
         let q_latent_bf16 = bf16_from_le_bytes(&normed_bytes)?;
         Ok(Layer0QueryPath {
-            activation_codes_sha256: sha256_hex(&activation_codes),
-            activation_scales_sha256: sha256_hex(&activation_scales),
+            activation_codes_sha256: evidence_sha256(&activation_codes),
+            activation_scales_sha256: evidence_sha256(&activation_scales),
             activation_code_bytes: activation_codes.len(),
             activation_scale_bytes: activation_scales.len(),
-            q_norm_sha256: sha256_hex(&normed_bytes),
-            q_pre_rope_sha256: sha256_hex(&raw),
-            q_post_rope_sha256: sha256_hex(&f32_le_bytes(&q)),
+            q_norm_sha256: evidence_sha256(&normed_bytes),
+            q_pre_rope_sha256: evidence_sha256(&raw),
+            q_post_rope_sha256: evidence_sha256(&f32_le_bytes(&q)),
             q_l2: l2,
             heads_per_rank: heads,
             q_head_width,
@@ -3094,7 +3234,7 @@ fn run_layer_query_path(
             q_latent_bf16,
         })
     })();
-    cuda.free_buffers(&[&a_codes, &a_scales, &out, &trace_ring]);
+    cuda.release_pooled(&[&a_codes, &a_scales, &out, &trace_ring]);
     cuda.free(module, &[]);
     staged
 }
@@ -3310,38 +3450,38 @@ fn run_layer_attention_output(
     let kernel_dir = request.kernel_cubin_dir.ok_or_else(|| {
         "layer-0 attention output: the loop has no kernel cubin directory".to_string()
     })?;
-    let dense_cubin = fs::read(kernel_dir.join(format!("{NATIVE_DENSE_KERNEL}.cubin")))
-        .map_err(|error| format!("layer-0 attention output: read dense cubin: {error}"))?;
-    let wo_a_cubin = fs::read(kernel_dir.join(format!("{NATIVE_WO_A_KERNEL}.cubin")))
-        .map_err(|error| format!("layer-0 attention output: read wo_a cubin: {error}"))?;
-    let wo_a_cubin_sha256 = sha256_hex(&wo_a_cubin);
-    let wo_b_cubin_sha256 = sha256_hex(&dense_cubin);
+    let (dense_cubin, wo_b_cubin_sha256) =
+        cached_cubin(&kernel_dir.join(format!("{NATIVE_DENSE_KERNEL}.cubin")))
+            .map_err(|error| format!("layer-0 attention output: read dense cubin: {error}"))?;
+    let (wo_a_cubin, wo_a_cubin_sha256) =
+        cached_cubin(&kernel_dir.join(format!("{NATIVE_WO_A_KERNEL}.cubin")))
+            .map_err(|error| format!("layer-0 attention output: read wo_a cubin: {error}"))?;
     let (wo_a_module, wo_a_kernel) = wo_a_launch::load(cuda, &wo_a_cubin)?;
     let (wo_b_module, wo_b_kernel) = mxfp8_dense_launch::load(cuda, &dense_cubin)?;
 
     let mut allocated = 0usize;
     let attn = cuda
-        .alloc(body.activation_bf16.len(), &mut allocated)
+        .alloc_pooled(body.activation_bf16.len(), &mut allocated)
         .map_err(|error| format!("layer-0 attention output: attention buffer: {error}"))?;
     let lo_out = cuda
-        .alloc(groups * o_lora_rank * 2, &mut allocated)
+        .alloc_pooled(groups * o_lora_rank * 2, &mut allocated)
         .map_err(|error| format!("layer-0 attention output: wo_a output buffer: {error}"))?;
     let partial = cuda
-        .alloc(HIDDEN * 2, &mut allocated)
+        .alloc_pooled(HIDDEN * 2, &mut allocated)
         .map_err(|error| format!("layer-0 attention output: wo_b output buffer: {error}"))?;
     // The native wo_b GEMM's W8A8 activation: one row of E4M3 codes plus one ue8m0 scale per 32
     // values. The row is the wo_a BF16 output, so the buffers are the wo_b inner width.
     let wo_b_act_codes = cuda
-        .alloc(wo_b_inner, &mut allocated)
+        .alloc_pooled(wo_b_inner, &mut allocated)
         .map_err(|error| format!("layer-0 attention output: wo_b act code buffer: {error}"))?;
     let wo_b_act_scales = cuda
-        .alloc(wo_b_inner.div_ceil(32), &mut allocated)
+        .alloc_pooled(wo_b_inner.div_ceil(32), &mut allocated)
         .map_err(|error| format!("layer-0 attention output: wo_b act scale buffer: {error}"))?;
     let wo_a_ring = cuda
-        .alloc(TRACE_RING_BYTES, &mut allocated)
+        .alloc_pooled(TRACE_RING_BYTES, &mut allocated)
         .map_err(|error| format!("layer-0 attention output: wo_a trace ring: {error}"))?;
     let wo_b_ring = cuda
-        .alloc(TRACE_RING_BYTES, &mut allocated)
+        .alloc_pooled(TRACE_RING_BYTES, &mut allocated)
         .map_err(|error| format!("layer-0 attention output: wo_b trace ring: {error}"))?;
     cuda.copy_htod(&wo_a_ring, &[0u8; TRACE_RING_BYTES])
         .map_err(|error| format!("layer-0 attention output: wo_a trace ring zero fill: {error}"))?;
@@ -3462,23 +3602,23 @@ fn run_layer_attention_output(
             head_width: body.head_width,
             o_lora_rank,
             wo_a_cubin_sha256,
-            wo_a_out_sha256: sha256_hex(&lo_raw),
+            wo_a_out_sha256: evidence_sha256(&lo_raw),
             wo_a_out_l2,
             wo_b_cubin_sha256,
-            wo_b_activation_codes_sha256: sha256_hex(&wo_b_codes),
-            wo_b_activation_scales_sha256: sha256_hex(&wo_b_scale_bytes),
+            wo_b_activation_codes_sha256: evidence_sha256(&wo_b_codes),
+            wo_b_activation_scales_sha256: evidence_sha256(&wo_b_scale_bytes),
             wo_b_activation_code_bytes: wo_b_codes.len(),
             wo_b_activation_scale_bytes: wo_b_scale_bytes.len(),
-            wo_b_partial_sha256: sha256_hex(&partial_raw),
+            wo_b_partial_sha256: evidence_sha256(&partial_raw),
             wo_b_partial_l2,
-            reduced_sha256: sha256_hex(&reduced_raw),
+            reduced_sha256: evidence_sha256(&reduced_raw),
             reduced_l2,
             reduce_calls: 1,
             reduce_sequence,
             reduced_bf16: reduced_raw,
         })
     })();
-    cuda.free_buffers(&[
+    cuda.release_pooled(&[
         &attn,
         &lo_out,
         &partial,
@@ -3615,11 +3755,11 @@ pub fn attention_residual_host_seam_with(
         .map(|stream| stream.iter().map(|value| value * value).sum::<f32>().sqrt())
         .collect();
     Ok(AttentionResidualSeam {
-        attn_out_sha256: sha256_hex(attention_delta_bf16),
-        residual_sha256: sha256_hex(&f32_le_bytes(residual)),
-        post_sha256: sha256_hex(&f32_le_bytes(&entry.post)),
-        comb_sha256: sha256_hex(&f32_le_bytes(&entry.comb)),
-        out_sha256: sha256_hex(&f32_le_bytes(&out)),
+        attn_out_sha256: evidence_sha256(attention_delta_bf16),
+        residual_sha256: evidence_sha256(&f32_le_bytes(residual)),
+        post_sha256: evidence_sha256(&f32_le_bytes(&entry.post)),
+        comb_sha256: evidence_sha256(&f32_le_bytes(&entry.comb)),
+        out_sha256: evidence_sha256(&f32_le_bytes(&out)),
         out_l2,
         stream_l2,
         out,
@@ -3822,19 +3962,19 @@ pub fn layer0_ffn_host_seams_with(
         }
     }
     Ok(Layer0FfnSeams {
-        ffn_pre_sha256: sha256_hex(&f32_le_bytes(&ffn_mixes.pre)),
+        ffn_pre_sha256: evidence_sha256(&f32_le_bytes(&ffn_mixes.pre)),
         ffn_pre: ffn_mixes.pre,
-        ffn_post_sha256: sha256_hex(&f32_le_bytes(&ffn_mixes.post)),
-        ffn_comb_sha256: sha256_hex(&f32_le_bytes(&ffn_mixes.comb)),
+        ffn_post_sha256: evidence_sha256(&f32_le_bytes(&ffn_mixes.post)),
+        ffn_comb_sha256: evidence_sha256(&f32_le_bytes(&ffn_mixes.comb)),
         ffn_post: ffn_mixes.post,
         ffn_comb: ffn_mixes.comb,
-        ffn_in_sha256: sha256_hex(&f32_le_bytes(&ffn_in)),
+        ffn_in_sha256: evidence_sha256(&f32_le_bytes(&ffn_in)),
         ffn_in,
-        pre_ffn_hidden_sha256: sha256_hex(&f32_le_bytes(&pre_ffn_hidden)),
+        pre_ffn_hidden_sha256: evidence_sha256(&f32_le_bytes(&pre_ffn_hidden)),
         pre_ffn_hidden,
-        act_fp8_sha256: sha256_hex(quantised.codes()),
+        act_fp8_sha256: evidence_sha256(quantised.codes()),
         act_fp8: quantised.codes().to_vec(),
-        act_scales_sha256: sha256_hex(quantised.scales()),
+        act_scales_sha256: evidence_sha256(quantised.scales()),
         act_scales: quantised.scales().to_vec(),
     })
 }
@@ -3913,7 +4053,7 @@ impl Layer0MoeRouted {
     /// sha256 of the router id row.
     #[must_use]
     pub fn router_ids_sha256(&self) -> String {
-        sha256_hex(
+        evidence_sha256(
             &self
                 .router_ids
                 .iter()
@@ -3925,13 +4065,13 @@ impl Layer0MoeRouted {
     /// sha256 of the canonical-reduce payload.
     #[must_use]
     pub fn payload_sha256(&self) -> String {
-        sha256_hex(&self.payload)
+        evidence_sha256(&self.payload)
     }
 
     /// sha256 of the all-reduced routed delta.
     #[must_use]
     pub fn delta_sha256(&self) -> String {
-        sha256_hex(&self.delta)
+        evidence_sha256(&self.delta)
     }
 
     /// The evidence block for the refused run.
@@ -4142,9 +4282,9 @@ fn run_layer_moe_routed(
     let kernel_dir = request
         .kernel_cubin_dir
         .ok_or_else(|| "MoE: the loop has no kernel cubin directory".to_string())?;
-    type CubinPin = (Vec<u8>, (String, usize, String));
+    type CubinPin = (std::sync::Arc<[u8]>, (String, usize, String));
     let read_pin = |name: &str, want: usize| -> Result<CubinPin, String> {
-        let bytes = fs::read(kernel_dir.join(name))
+        let (bytes, digest) = cached_cubin(&kernel_dir.join(name))
             .map_err(|error| format!("MoE: read {name}: {error}"))?;
         if bytes.len() != want {
             return Err(format!(
@@ -4152,7 +4292,6 @@ fn run_layer_moe_routed(
                 bytes.len()
             ));
         }
-        let digest = sha256_hex(&bytes);
         let pin = (name.to_string(), bytes.len(), digest);
         Ok((bytes, pin))
     };
@@ -4186,7 +4325,7 @@ fn run_layer_moe_routed(
 
     let mut allocated = 0usize;
     let mut alloc = |bytes: usize, what: &str| -> Result<Deviceptr, String> {
-        cuda.alloc(bytes, &mut allocated)
+        cuda.alloc_pooled(bytes, &mut allocated)
             .map_err(|error| format!("MoE: {what}: {error}"))
     };
     let x_bf16 = alloc(tokens * dim * 2, "router x bf16")?;
@@ -4456,7 +4595,7 @@ fn run_layer_moe_routed(
             native_full_acc,
         })
     })();
-    cuda.free_buffers(&[
+    cuda.release_pooled(&[
         &x_bf16,
         &ids,
         &weights,
@@ -4983,7 +5122,7 @@ fn run_layer_ffn_epilogue(
         )
         .map_err(|error| format!("FFN epilogue: shared expert: {error}"))?;
     }
-    let shared_sha256 = sha256_hex(&f32_le_bytes(&shared_only));
+    let shared_sha256 = evidence_sha256(&f32_le_bytes(&shared_only));
     let shared_l2 = shared_only
         .iter()
         .map(|value| value * value)
@@ -5020,7 +5159,10 @@ fn run_layer_ffn_epilogue(
                 .sum::<f32>()
                 .sqrt();
             let relative = if norm == 0.0 { 0.0 } else { difference / norm };
-            (Some(sha256_hex(&f32_le_bytes(&f32_only))), Some(relative))
+            (
+                Some(evidence_sha256(&f32_le_bytes(&f32_only))),
+                Some(relative),
+            )
         } else {
             (None, None)
         };
@@ -5107,10 +5249,10 @@ fn run_layer_ffn_epilogue(
         shared_l2,
         shared_f32_sha256,
         shared_native_vs_f32_rel_l2,
-        ffn_out_sha256: sha256_hex(&f32_le_bytes(&ffn_out)),
+        ffn_out_sha256: evidence_sha256(&f32_le_bytes(&ffn_out)),
         ffn_out_l2,
         ffn_out,
-        hc_post_sha256: sha256_hex(&f32_le_bytes(&hc_post)),
+        hc_post_sha256: evidence_sha256(&f32_le_bytes(&hc_post)),
         hc_post_l2,
         hc_post,
     })
@@ -5173,9 +5315,8 @@ fn run_layer_attention_projections(
         "layer-0 projections: the loop has no kernel cubin directory, so the dense B12x kernel cannot be loaded"
             .to_string()
     })?;
-    let cubin = std::fs::read(kernel_dir.join(&cubin_name))
+    let (cubin, cubin_sha256) = cached_cubin(&kernel_dir.join(&cubin_name))
         .map_err(|error| format!("layer-0 projections: read {cubin_name}: {error}"))?;
-    let cubin_sha256 = sha256_hex(&cubin);
 
     let pair_for = |name: &str| -> Result<
         (
@@ -5221,22 +5362,22 @@ fn run_layer_attention_projections(
     let (module, kernel) = mxfp8_dense_launch::load(cuda, &cubin)?;
     let mut allocated = 0usize;
     let a_codes = cuda
-        .alloc(activation_codes.len(), &mut allocated)
+        .alloc_pooled(activation_codes.len(), &mut allocated)
         .map_err(|error| format!("layer-0 projections: activation code buffer: {error}"))?;
     let a_scales = cuda
-        .alloc(activation_scales.len(), &mut allocated)
+        .alloc_pooled(activation_scales.len(), &mut allocated)
         .map_err(|error| format!("layer-0 projections: activation scale buffer: {error}"))?;
     let out_q = cuda
-        .alloc(wq_a_cols * 2, &mut allocated)
+        .alloc_pooled(wq_a_cols * 2, &mut allocated)
         .map_err(|error| format!("layer-0 projections: wq_a latent buffer: {error}"))?;
     let out_kv = cuda
-        .alloc(wkv_cols * 2, &mut allocated)
+        .alloc_pooled(wkv_cols * 2, &mut allocated)
         .map_err(|error| format!("layer-0 projections: wkv latent buffer: {error}"))?;
     // SPARK_GPU_TRACE_ENTER dereferences the ring before it reads active_scope_mask, so a null
     // trace ring would fault inside the kernel. A zeroed ring keeps that dereference legal and its
     // mask zero, which is the trace-off state.
     let trace_ring = cuda
-        .alloc(TRACE_RING_BYTES, &mut allocated)
+        .alloc_pooled(TRACE_RING_BYTES, &mut allocated)
         .map_err(|error| format!("layer-0 projections: trace ring buffer: {error}"))?;
     cuda.copy_htod(&trace_ring, &[0u8; TRACE_RING_BYTES])
         .map_err(|error| format!("layer-0 projections: trace ring zero fill: {error}"))?;
@@ -5288,12 +5429,12 @@ fn run_layer_attention_projections(
         };
         Ok(Layer0Projections {
             cubin_sha256,
-            activation_codes_sha256: sha256_hex(&activation_codes),
-            activation_scales_sha256: sha256_hex(&activation_scales),
+            activation_codes_sha256: evidence_sha256(&activation_codes),
+            activation_scales_sha256: evidence_sha256(&activation_scales),
             activation_code_bytes: activation_codes.len(),
             activation_scale_bytes: activation_scales.len(),
-            wq_a_latent_sha256: sha256_hex(&raw_q),
-            wkv_latent_sha256: sha256_hex(&raw_kv),
+            wq_a_latent_sha256: evidence_sha256(&raw_q),
+            wkv_latent_sha256: evidence_sha256(&raw_kv),
             wq_a_l2: l2(&values_q),
             wkv_l2: l2(&values_kv),
             wq_a_latent_bytes: raw_q,
@@ -5302,7 +5443,7 @@ fn run_layer_attention_projections(
         })
     })();
 
-    cuda.free_buffers(&[&a_codes, &a_scales, &out_q, &out_kv, &trace_ring]);
+    cuda.release_pooled(&[&a_codes, &a_scales, &out_q, &out_kv, &trace_ring]);
     cuda.free(module, &[]);
     let projections = staged?;
     // wq_a and wkv are replicated at TP4: the parity re-launch on these bytes and the arena bind is
@@ -5433,9 +5574,9 @@ fn run_head_position(
     probe::head(cuda, "final_norm", timer);
     let timer = BlockTimer::start(probe_on);
     let seam_bytes = f32_le_bytes(&collapsed);
-    let seam_sha256 = sha256_hex(&seam_bytes);
+    let seam_sha256 = evidence_sha256(&seam_bytes);
     let seam_bf16 = bf16_le_bytes(&collapsed);
-    let seam_bf16_sha256 = sha256_hex(&seam_bf16);
+    let seam_bf16_sha256 = evidence_sha256(&seam_bf16);
     let total_positions = prompt_len_for(request.prompt_tokens, request.positions.max(1))
         .unwrap_or(0)
         .saturating_add(request.positions.max(1))
@@ -5544,20 +5685,20 @@ fn run_head_position(
     let claimable = !winner_certified;
     probe::head(cuda, "winner_check", timer);
     let timer = BlockTimer::start(probe_on);
-    let normed_sha256 = sha256_hex(&tail_outputs.normed_bf16);
-    let gathered_sha256 = sha256_hex(&f32_le_bytes(&gathered.full));
+    let normed_sha256 = evidence_sha256(&tail_outputs.normed_bf16);
+    let gathered_sha256 = evidence_sha256(&f32_le_bytes(&gathered.full));
     let mut head_ranks = Vec::with_capacity(request.world);
     for (rank, side) in rank_sides.iter().enumerate() {
         let base = rank * crate::tp4_tail::VOCAB_PER_RANK;
         let rank_logits = &gathered.full[base..base + crate::tp4_tail::VOCAB_PER_RANK];
         head_ranks.push(serde_json::json!({
             "rank": rank,
-            "logits_sha256": sha256_hex(&f32_le_bytes(rank_logits)),
+            "logits_sha256": evidence_sha256(&f32_le_bytes(rank_logits)),
             "logits_f32_values": rank_logits.len(),
             "certified_count": side.certified_count,
-            "certified_sha256": sha256_hex(&side.certified),
-            "block_max_sha256": sha256_hex(&f32_le_bytes(&side.block_max)),
-            "block_argmax_sha256": sha256_hex(&u32_le_bytes(&side.block_argmax)),
+            "certified_sha256": evidence_sha256(&side.certified),
+            "block_max_sha256": evidence_sha256(&f32_le_bytes(&side.block_max)),
+            "block_argmax_sha256": evidence_sha256(&u32_le_bytes(&side.block_argmax)),
         }));
     }
     probe::head(cuda, "digests", timer);
@@ -7030,6 +7171,23 @@ fn run_forward_loop(
     let prompt_len = prompt_len_for(request.prompt_tokens, positions).unwrap_or(0);
 
     let cuda = Cuda::load().map_err(|error| format!("forward loop: {error}"))?;
+    // M2 run-scope switches. The launch path is async by default because every numeric observation
+    // in this loop is a synchronous, stream-ordered cuMemcpyDtoH; SPARKFLASH_SYNC_LAUNCHES=1 puts
+    // the per-launch drain back. The per-layer evidence chain is off unless
+    // SPARKFLASH_FORWARD_EVIDENCE=1 asks for the identity kit's chain. Both are logged so a window
+    // row carries the mode it was collected with.
+    let async_launches = sparkflash_kernels::cuda_driver::enable_forward_async_launches();
+    let evidence = enable_forward_evidence_from_env();
+    reset_cubin_cache();
+    println!(
+        "forward loop: launch path {} (kernels run ahead of the host), evidence chain {}",
+        if async_launches {
+            "async"
+        } else {
+            "synchronous"
+        },
+        if evidence { "recording" } else { "off" }
+    );
     // The M2 perf probe is armed for the whole run: when the flag is off this is one relaxed atomic
     // store and the only state the writer could see stays empty.
     probe::begin_run(request.forward_perf.probe);
@@ -7367,6 +7525,9 @@ fn run_forward_loop(
     };
     let mut layer_zero: Option<LayerZero> = None;
     let mut layer_chain: Vec<serde_json::Value> = Vec::new();
+    // Counted independently of the evidence chain, so progress rows and the position record still
+    // report the layers completed when the chain is switched off.
+    let mut layers_completed: usize = 0;
     let mut position_records: Vec<serde_json::Value> = Vec::with_capacity(total_positions);
     let mut heads: Vec<HeadPosition> = Vec::with_capacity(head_count);
     let mut step_samples: Vec<f64> = Vec::with_capacity(head_count);
@@ -7456,7 +7617,7 @@ fn run_forward_loop(
                 engram_record = Some(serde_json::json!({
                     "layer": layer,
                     "hashes": engram_hashes.len(),
-                    "write_sha256": sha256_hex(&f32_le_bytes(&write)),
+                    "write_sha256": evidence_sha256(&f32_le_bytes(&write)),
                     "write_l2": write_l2,
                 }));
                 probe::layer(&cuda, layer, "engram_write", timer);
@@ -7475,7 +7636,7 @@ fn run_forward_loop(
             let cached_seams = layer_seams.layers.get(layer).ok_or_else(|| {
                 format!("forward loop: no seam cache was built for layer {layer}")
             })?;
-            let attempt: Result<(serde_json::Value, Option<LayerZero>), String> = (|| {
+            let attempt: Result<(Option<serde_json::Value>, Option<LayerZero>), String> = (|| {
                 let timer = BlockTimer::start(probe_on);
                 let (entry, mhc_reads) =
                     run_layer_mhc_entry(cached_seams, request, &stream, &attn_pre_mix)?;
@@ -7712,66 +7873,74 @@ fn run_forward_loop(
                 // THIS layer's FFN pre mix (hc_in_pre(L+1) == hc_ffn_pre(L)).
                 attn_pre_mix = ffn_seams.ffn_pre.clone();
                 let timer = BlockTimer::start(probe_on);
-                let entry_json = serde_json::json!({
-                        "layer": layer,
-                        "native_rounding": request.native_rounding.as_str(),
-                "forward_perf": { "lean": request.forward_perf.lean },
-                        "mhc_entry": {
-                            "attn_in_sha256": entry.attn_in_sha256,
-                            "normed_sha256": entry.normed_sha256,
-                            "predictor_sha256": entry.predictor_sha256,
-                            "arena_reads": mhc_reads,
-                        },
-                        "attention_body": {
-                            "position": attention_step.position,
-                            "out_sha256": attention_step.out_sha256,
-                            "inverse_rope_sha256": attention_step.inverse_rope_sha256,
-                            "window_rows": attention_step.window_rows,
-                            "selected_count": attention_step.selected_count,
-                            "store_rows": attention_step.store_rows,
-                            "ratio": attention_step.ratio,
-                            "q_sha256": attention_step.q_sha256,
-                            "sink_sha256": attention_step.sink_sha256,
-                            "staged_selected_sha256": attention_step.selected_sha256,
-                            "twin_bf16_mismatches": attention_step.twin.as_ref().map(|twin| twin.mismatches),
-                            "twin_slots": attention_step.twin.as_ref().map(|twin| twin.slots),
-                            "twin_max_abs_diff": attention_step.twin.as_ref().map(|twin| twin.max_abs),
-                            "twin_skipped": attention_step.twin.is_none(),
-                        },
-                        "attention_output": {
-                            "wo_a_out_sha256": attention_output.wo_a_out_sha256,
-                            "wo_b_partial_sha256": attention_output.wo_b_partial_sha256,
-                            "reduced_sha256": attention_output.reduced_sha256,
-                            "reduced_l2": attention_output.reduced_l2,
-                        },
-                        "attention_residual": {
-                            "out_sha256": attention_residual.out_sha256,
-                            "out_l2": attention_residual.out_l2,
-                        },
-                        "ffn_seams": {
-                            "ffn_in_sha256": ffn_seams.ffn_in_sha256,
-                            "pre_ffn_hidden_sha256": ffn_seams.pre_ffn_hidden_sha256,
-                            "act_fp8_sha256": ffn_seams.act_fp8_sha256,
-                            "act_scales_sha256": ffn_seams.act_scales_sha256,
-                        },
-                        "moe_routed": {
-                            "router_ids_sha256": moe_routed.router_ids_sha256(),
-                            "payload_sha256": moe_routed.payload_sha256(),
-                            "routed_delta_sha256": moe_routed.delta_sha256(),
-                        },
-                        "ffn_epilogue": {
-                            "ffn_out_sha256": ffn_epilogue.ffn_out_sha256,
-                            "ffn_out_l2": ffn_epilogue.ffn_out_l2,
-                            "shared_arith": ffn_epilogue.shared_arith,
-                            "shared_sha256": ffn_epilogue.shared_sha256,
-                            "shared_l2": ffn_epilogue.shared_l2,
-                            "shared_f32_sha256": ffn_epilogue.shared_f32_sha256,
-                            "shared_native_vs_f32_rel_l2": ffn_epilogue.shared_native_vs_f32_rel_l2,
-                            "hc_post_sha256": ffn_epilogue.hc_post_sha256,
-                            "hc_post_l2": ffn_epilogue.hc_post_l2,
-                        },
-                        "stream_sha256": sha256_hex(&f32_le_bytes(&stream)),
-                    });
+                // M2/C10: the layer-chain entry and every digest that only feeds it are recorded
+                // only in evidence mode. A default/--forward-lean run pays the block timer and
+                // nothing else; the probe still gets an entry_json row so both window rows can be
+                // read with the same block set.
+                let entry_json = if evidence_record_enabled() {
+                    Some(serde_json::json!({
+                            "layer": layer,
+                            "native_rounding": request.native_rounding.as_str(),
+                    "forward_perf": { "lean": request.forward_perf.lean },
+                            "mhc_entry": {
+                                "attn_in_sha256": entry.attn_in_sha256,
+                                "normed_sha256": entry.normed_sha256,
+                                "predictor_sha256": entry.predictor_sha256,
+                                "arena_reads": mhc_reads,
+                            },
+                            "attention_body": {
+                                "position": attention_step.position,
+                                "out_sha256": attention_step.out_sha256,
+                                "inverse_rope_sha256": attention_step.inverse_rope_sha256,
+                                "window_rows": attention_step.window_rows,
+                                "selected_count": attention_step.selected_count,
+                                "store_rows": attention_step.store_rows,
+                                "ratio": attention_step.ratio,
+                                "q_sha256": attention_step.q_sha256,
+                                "sink_sha256": attention_step.sink_sha256,
+                                "staged_selected_sha256": attention_step.selected_sha256,
+                                "twin_bf16_mismatches": attention_step.twin.as_ref().map(|twin| twin.mismatches),
+                                "twin_slots": attention_step.twin.as_ref().map(|twin| twin.slots),
+                                "twin_max_abs_diff": attention_step.twin.as_ref().map(|twin| twin.max_abs),
+                                "twin_skipped": attention_step.twin.is_none(),
+                            },
+                            "attention_output": {
+                                "wo_a_out_sha256": attention_output.wo_a_out_sha256,
+                                "wo_b_partial_sha256": attention_output.wo_b_partial_sha256,
+                                "reduced_sha256": attention_output.reduced_sha256,
+                                "reduced_l2": attention_output.reduced_l2,
+                            },
+                            "attention_residual": {
+                                "out_sha256": attention_residual.out_sha256,
+                                "out_l2": attention_residual.out_l2,
+                            },
+                            "ffn_seams": {
+                                "ffn_in_sha256": ffn_seams.ffn_in_sha256,
+                                "pre_ffn_hidden_sha256": ffn_seams.pre_ffn_hidden_sha256,
+                                "act_fp8_sha256": ffn_seams.act_fp8_sha256,
+                                "act_scales_sha256": ffn_seams.act_scales_sha256,
+                            },
+                            "moe_routed": {
+                                "router_ids_sha256": moe_routed.router_ids_sha256(),
+                                "payload_sha256": moe_routed.payload_sha256(),
+                                "routed_delta_sha256": moe_routed.delta_sha256(),
+                            },
+                            "ffn_epilogue": {
+                                "ffn_out_sha256": ffn_epilogue.ffn_out_sha256,
+                                "ffn_out_l2": ffn_epilogue.ffn_out_l2,
+                                "shared_arith": ffn_epilogue.shared_arith,
+                                "shared_sha256": ffn_epilogue.shared_sha256,
+                                "shared_l2": ffn_epilogue.shared_l2,
+                                "shared_f32_sha256": ffn_epilogue.shared_f32_sha256,
+                                "shared_native_vs_f32_rel_l2": ffn_epilogue.shared_native_vs_f32_rel_l2,
+                                "hc_post_sha256": ffn_epilogue.hc_post_sha256,
+                                "hc_post_l2": ffn_epilogue.hc_post_l2,
+                            },
+                            "stream_sha256": evidence_sha256(&f32_le_bytes(&stream)),
+                        }))
+                } else {
+                    None
+                };
                 probe::layer(&cuda, layer, "entry_json", timer);
                 let zero = if layer == 0 {
                     Some((
@@ -7791,19 +7960,26 @@ fn run_forward_loop(
                     None
                 };
                 Ok((entry_json, zero))
-            })();
+            })(
+            );
             match attempt {
-                Ok((mut entry_json, zero)) => {
-                    if let Some(object) = entry_json.as_object_mut() {
-                        object.insert(
-                            "wall_ms".to_string(),
-                            serde_json::json!(layer_started.elapsed().as_millis() as u64),
-                        );
-                        if let Some(engram) = engram_record.take() {
-                            object.insert("engram".to_string(), engram);
+                Ok((entry_json, zero)) => {
+                    // Clear the record every layer, even when the evidence chain is off: a stale
+                    // layer-N engram must never be attached to a later layer's entry.
+                    let engram_record = engram_record.take();
+                    if let Some(mut entry_json) = entry_json {
+                        if let Some(object) = entry_json.as_object_mut() {
+                            object.insert(
+                                "wall_ms".to_string(),
+                                serde_json::json!(layer_started.elapsed().as_millis() as u64),
+                            );
+                            if let Some(engram) = engram_record {
+                                object.insert("engram".to_string(), engram);
+                            }
                         }
+                        position_chain.push(entry_json);
                     }
-                    position_chain.push(entry_json);
+                    layers_completed = layer + 1;
                     if let Some(zero) = zero {
                         position_zero = Some(zero);
                     }
@@ -7821,6 +7997,10 @@ fn run_forward_loop(
                             object.insert(
                                 "total_positions".to_string(),
                                 serde_json::json!(total_positions),
+                            );
+                            object.insert(
+                                "layers_completed".to_string(),
+                                serde_json::json!(layers_completed),
                             );
                         }
                         let timer = BlockTimer::start(probe_on);
@@ -7840,6 +8020,10 @@ fn run_forward_loop(
                         object.insert("failed_layer".to_string(), serde_json::json!(layer));
                         object.insert("failed_position".to_string(), serde_json::json!(position));
                         object.insert("error".to_string(), serde_json::json!(error));
+                        object.insert(
+                            "layers_completed".to_string(),
+                            serde_json::json!(layers_completed),
+                        );
                     }
                     let timer = BlockTimer::start(probe_on);
                     let bytes = write_forward_progress(&progress_path, &progress)?;
@@ -7894,7 +8078,7 @@ fn run_forward_loop(
         };
         let timer = BlockTimer::start(probe_on);
         let wall_ms = position_started.elapsed().as_millis() as u64;
-        let stream_sha256 = sha256_hex(&f32_le_bytes(&stream));
+        let stream_sha256 = evidence_sha256(&f32_le_bytes(&stream));
         if position + 1 == total_positions {
             final_stream_sha256 = stream_sha256.clone();
         }
@@ -7903,7 +8087,7 @@ fn run_forward_loop(
             "wall_ms": wall_ms,
             "head_position": is_head,
             "stream_sha256": stream_sha256,
-            "layers_completed": position_chain.len(),
+            "layers_completed": layers_completed,
         });
         if let Some(head) = &head {
             let mut head_json = serde_json::json!({
@@ -7948,6 +8132,7 @@ fn run_forward_loop(
                 "head_positions".to_string(),
                 serde_json::json!(head_positions),
             );
+            object.insert("layers_completed".to_string(), serde_json::json!(n_layers));
         }
         let timer = BlockTimer::start(probe_on);
         let bytes = write_forward_progress(&progress_path, &progress)?;
@@ -7964,16 +8149,17 @@ fn run_forward_loop(
         stage.close(&cuda);
     }
     probe::run(&cuda, "tail_close", timer);
-    write_forward_progress(
-        &progress_path,
-        &forward_progress(
-            "loop_complete",
-            request,
-            n_layers,
-            &layer_chain,
-            loop_started.elapsed(),
-        ),
-    )?;
+    let mut loop_complete = forward_progress(
+        "loop_complete",
+        request,
+        n_layers,
+        &layer_chain,
+        loop_started.elapsed(),
+    );
+    if let Some(object) = loop_complete.as_object_mut() {
+        object.insert("layers_completed".to_string(), serde_json::json!(n_layers));
+    }
+    write_forward_progress(&progress_path, &loop_complete)?;
     let (
         mhc_entry,
         projections,
@@ -8087,6 +8273,20 @@ fn run_forward_loop(
             serde_json::Value::Array(layer_chain),
         );
         object.insert("layers_executed".to_string(), serde_json::json!(n_layers));
+        // The chain can legitimately be empty (the shipped default records no evidence), so the
+        // artifact says so in-band instead of leaving a reader to infer it from an empty array.
+        object.insert(
+            "evidence_mode".to_string(),
+            serde_json::json!(if evidence_record_enabled() {
+                "recording"
+            } else {
+                "off"
+            }),
+        );
+        object.insert(
+            "evidence_digest_calls".to_string(),
+            serde_json::json!(EVIDENCE_HASH_CALLS.with(std::cell::Cell::get)),
+        );
         object.insert(
             "shared_expert_prewarm".to_string(),
             serde_json::json!({
@@ -10483,5 +10683,62 @@ mod tests {
             head_seam_input_file(true, seam, alias),
             alias.display().to_string()
         );
+    }
+}
+
+#[cfg(test)]
+mod evidence_switch_tests {
+    use super::*;
+
+    // M2/C10: the default and --forward-lean rows must hash nothing on the layer path. The switch
+    // is thread-local (like the probe's state), so this test can turn it off without disturbing any
+    // other test in the binary, and the counter proves the off path takes no sha256 at all.
+    #[test]
+    fn the_evidence_chain_is_off_unless_the_environment_asks_for_it_and_the_off_path_hashes_nothing()
+     {
+        // The shipped run default: no variable means the run loop selects off.
+        assert!(!evidence_enabled_from_env(None));
+        assert!(!evidence_enabled_from_env(Some("0")));
+        assert!(evidence_enabled_from_env(Some("1")));
+        assert!(evidence_enabled_from_env(Some("true")));
+        assert!(evidence_enabled_from_env(Some("yes")));
+
+        set_evidence_record(false);
+        assert!(!evidence_record_enabled());
+        let before = evidence_hash_calls();
+        assert_eq!(evidence_sha256(b"evidence-only bytes"), "");
+        assert_eq!(evidence_hash_calls(), before);
+
+        set_evidence_record(true);
+        assert!(evidence_record_enabled());
+        assert_eq!(
+            evidence_sha256(b"evidence-only bytes"),
+            sha256_hex(b"evidence-only bytes")
+        );
+        assert_eq!(evidence_hash_calls(), before + 1);
+        set_evidence_record(false);
+    }
+
+    // The two run-scope switches must not tangle: the launch path is async by default, the
+    // environment opt-out is the only way back to the drained path, and switching the evidence
+    // chain on or off must leave the launch path alone.
+    #[test]
+    fn the_launch_path_and_the_evidence_chain_are_independent_switches() {
+        use sparkflash_kernels::cuda_driver as driver;
+        driver::set_async_launches(false);
+        assert!(!driver::async_launches());
+        // No SPARKFLASH_SYNC_LAUNCHES in the test environment, so the run-scope call restores async.
+        assert!(driver::enable_forward_async_launches());
+        assert!(driver::async_launches());
+
+        set_evidence_record(false);
+        driver::set_async_launches(false);
+        assert!(!driver::async_launches());
+        set_evidence_record(true);
+        assert!(!driver::async_launches());
+
+        driver::set_async_launches(true);
+        set_evidence_record(false);
+        assert!(driver::async_launches());
     }
 }

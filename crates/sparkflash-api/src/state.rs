@@ -53,6 +53,60 @@ impl ChoiceSeedSource for RandomChoiceSeeds {
     }
 }
 
+/// The browser cross-origin policy the router installs.
+///
+/// vLLM's server mounts a permissive CORS middleware by default (`access-control-allow-origin:
+/// *`, every method, `max-age=600`), so a browser client works against the oracle out of the
+/// box. SparkFlash matches that default and keeps an operator override: a listed origin set
+/// answers only those origins with an echoed `Access-Control-Allow-Origin` and a `Vary: Origin`,
+/// and `None` on [`AppState::with_cors`] removes the layer entirely (the pre-CORS wire bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorsConfig {
+    /// `None` allows any origin (vLLM's default, `*`); `Some(list)` allows only those origins.
+    allowed_origins: Option<Vec<String>>,
+    /// How long a browser may cache one preflight result, in seconds.
+    max_age_secs: u64,
+}
+
+impl CorsConfig {
+    /// vLLM's default: any origin, `max-age=600`.
+    #[must_use]
+    pub fn any() -> Self {
+        Self {
+            allowed_origins: None,
+            max_age_secs: 600,
+        }
+    }
+
+    /// Only these origins are allowed; every other origin gets no CORS headers.
+    #[must_use]
+    pub fn allow_list(origins: Vec<String>) -> Self {
+        Self {
+            allowed_origins: Some(origins),
+            max_age_secs: 600,
+        }
+    }
+
+    /// Overrides the preflight cache lifetime.
+    #[must_use]
+    pub fn with_max_age_secs(mut self, seconds: u64) -> Self {
+        self.max_age_secs = seconds;
+        self
+    }
+
+    /// The allowed origin list; `None` means any origin.
+    #[must_use]
+    pub fn allowed_origins(&self) -> Option<&[String]> {
+        self.allowed_origins.as_deref()
+    }
+
+    /// The preflight cache lifetime, in seconds.
+    #[must_use]
+    pub fn max_age_secs(&self) -> u64 {
+        self.max_age_secs
+    }
+}
+
 /// A deterministic seed source for tests: draws `start, start + 1, start + 2, ...`.
 #[derive(Debug)]
 pub struct SequentialChoiceSeeds {
@@ -94,6 +148,7 @@ pub struct AppState {
     sse_keep_alive: Option<Duration>,
     tokenizer: Option<Arc<TokenizerSeam>>,
     api_key: Option<Arc<str>>,
+    cors: Option<CorsConfig>,
     device_token_source: Option<Arc<dyn DeviceTokenSource>>,
     choice_seeds: Arc<dyn ChoiceSeedSource>,
     draining: Arc<AtomicBool>,
@@ -113,6 +168,7 @@ impl AppState {
             sse_keep_alive: Some(DEFAULT_SSE_KEEP_ALIVE),
             tokenizer: None,
             api_key: None,
+            cors: Some(CorsConfig::any()),
             device_token_source: None,
             choice_seeds: Arc::new(RandomChoiceSeeds),
             draining: Arc::new(AtomicBool::new(false)),
@@ -203,6 +259,22 @@ impl AppState {
     #[must_use]
     pub fn api_key(&self) -> Option<&str> {
         self.api_key.as_deref()
+    }
+
+    /// Sets the browser cross-origin policy, or removes the CORS layer with `None`.
+    ///
+    /// The default is [`CorsConfig::any`], which is what the reference vLLM server serves; `None`
+    /// restores the pre-CORS wire surface (no `access-control-*` headers and no preflight answer).
+    #[must_use]
+    pub fn with_cors(mut self, cors: Option<CorsConfig>) -> Self {
+        self.cors = cors;
+        self
+    }
+
+    /// The browser cross-origin policy, when the layer is enabled.
+    #[must_use]
+    pub fn cors(&self) -> Option<&CorsConfig> {
+        self.cors.as_ref()
     }
 
     /// Installs the device-chain token source for the S7/S8 serving scaffold.

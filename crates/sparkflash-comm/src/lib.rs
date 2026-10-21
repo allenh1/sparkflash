@@ -46,10 +46,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sparkflash_trace::{TraceScope, spark_trace_span};
 
 pub mod bf16;
+pub mod dispatch;
 pub mod error;
 mod exchange;
 pub mod fabric;
 pub mod layout;
+pub mod microbench;
+#[cfg(unix)]
+pub mod nccl;
 pub mod oneshot;
 pub mod probe;
 pub mod rail;
@@ -61,6 +65,10 @@ pub mod telemetry;
 pub mod transport;
 
 pub use bf16::{bf16_to_f32, f32_to_bf16_rn};
+pub use dispatch::{
+    BackendAvailability, CollectiveBackend, DECODE_HIDDEN_BYTES, DECODE_HIDDEN_ELEMENTS,
+    DECODE_ONESHOT_MAX_BYTES, DispatchError, DispatchPolicy,
+};
 pub use error::CommError;
 pub use fabric::{
     DeviceState, FabricTelemetrySnapshot, FabricView, MIN_RAIL_RATE_GBPS, RAIL_COUNT,
@@ -199,7 +207,8 @@ impl DualPathCommunicator {
         num_bytes: usize,
         enable_l2_weight_prefetch: bool,
     ) -> CollectiveRoute {
-        if num_bytes <= ROCENANTE_MAX_BYTES {
+        // One source of truth for the threshold; see the dispatch module and its tests.
+        if dispatch::DispatchPolicy::default().route(num_bytes) == CollectiveBackend::OneShotRdma {
             spark_trace_span!(
                 TraceScope::ROCENANTE_RDMA,
                 "dispatch_rocenante_oneshot",
@@ -242,7 +251,8 @@ impl DualPathCommunicator {
     /// that truncation is unreachable for bf16 payloads (decision D13). Larger gathers fall back
     /// to the NCCL ring.
     pub fn dispatch_all_gather_bf16(&self, layer_id: u32, num_bytes: usize) -> CollectiveRoute {
-        if num_bytes <= ROCENANTE_MAX_BYTES {
+        // One source of truth for the threshold; see the dispatch module and its tests.
+        if dispatch::DispatchPolicy::default().route(num_bytes) == CollectiveBackend::OneShotRdma {
             spark_trace_span!(
                 TraceScope::ROCENANTE_RDMA,
                 "dispatch_rocenante_allgather",

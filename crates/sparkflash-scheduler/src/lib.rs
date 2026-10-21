@@ -22,6 +22,7 @@ pub struct RequestId(
     pub u64,
 );
 
+pub mod batching;
 pub mod bypass;
 pub mod config;
 pub mod dspark;

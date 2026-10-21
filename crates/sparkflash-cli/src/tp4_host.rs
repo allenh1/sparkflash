@@ -66,6 +66,7 @@ use sparkflash_engine::quant;
 use sparkflash_engine::safetensors::{SafeTensorsSource, TensorHeader};
 use sparkflash_engine::tensor::{TensorPlan, TensorSpec};
 use sparkflash_engine::weights::{WeightError, WeightSource};
+use sparkflash_scheduler::batching::PrefillMode;
 
 /// The evidence schema version this stage writes.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -801,14 +802,50 @@ struct StepCost {
     collective_ms: u64,
 }
 
-/// The bisection switch for prefill: when set, the runner keeps the pre-batch-17 one-step-per-token
-/// loop instead of the chunked hybrid step. Read once per prefill call; the decode path never
-/// consults it.
-/// Chunked prefill is opt-in: the batch-17 serve census measured a slower endpoint TTFT with it
-/// than with the token loop, so the serve path keeps the loop as its default until the overhead is
-/// understood (batch 18). Set `SPARKFLASH_TP4_PREFILL_CHUNK=1` to run one layer-major chunk pass.
-fn prefill_chunk_enabled() -> bool {
-    std::env::var_os("SPARKFLASH_TP4_PREFILL_CHUNK").is_some()
+/// The prefill execution mode the shipped TP=4 host path uses: the one-line flip.
+///
+/// It is deliberately [PrefillMode::TokenLoop]. The batched/chunked prefill policy is implemented
+/// and tested (crates/sparkflash-scheduler/src/batching.rs, crates/sparkflash-engine/src/
+/// forward/batch.rs, tests/batched_prefill.rs), but the batch-17 serve census measured the chunked
+/// endpoint *slower* than the pre-batch-17 token loop: 43.624741849 s TTFT against 39.134645546 s
+/// at 37 prompt tokens (docs/build/tp4-tokens-per-second.md). Promoting the batched policy is
+/// therefore a measurement the endpoint row still owes, not a configuration change, so the shipped
+/// default stays on the measured-better path. Changing this constant to
+/// [PrefillMode::Batched] is the entire flip; it must land with an endpoint row that beats
+/// 39.13 s TTFT at the same prompt, or with the reason the row cannot be produced yet.
+const SHIPPED_PREFILL_MODE: PrefillMode = PrefillMode::TokenLoop;
+
+/// The legacy `SPARKFLASH_TP4_PREFILL_CHUNK` spelling, kept working as an override.
+///
+/// Before this seam any presence of the variable meant the chunked path, so a truthy value that is
+/// not a mode name still selects [PrefillMode::Batched]; 0/false/off/no select the token loop; a
+/// mode name (batched, chunk, chunked, token-loop, ...) is parsed like the new variable.
+fn mode_from_legacy_chunk_value(value: &str) -> PrefillMode {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => PrefillMode::TokenLoop,
+        named => PrefillMode::from_env_value(named).unwrap_or(PrefillMode::Batched),
+    }
+}
+
+/// The prefill mode this call runs: the shipped constant, overridable for a bisect.
+///
+/// `SPARKFLASH_TP4_PREFILL_MODE` (batched|chunk|chunked|token-loop|token_loop|loop|token) wins,
+/// then the legacy `SPARKFLASH_TP4_PREFILL_CHUNK`, then [SHIPPED_PREFILL_MODE]. An unparseable new
+/// variable warns and falls back to the shipped mode; it never silently changes the default. Read
+/// once per prefill call; the decode path never consults it.
+fn shipped_prefill_mode() -> PrefillMode {
+    if let Ok(value) = std::env::var("SPARKFLASH_TP4_PREFILL_MODE") {
+        if let Some(mode) = PrefillMode::from_env_value(&value) {
+            return mode;
+        }
+        eprintln!(
+            "sparkflash: unknown SPARKFLASH_TP4_PREFILL_MODE={value:?}; using {SHIPPED_PREFILL_MODE:?}"
+        );
+    }
+    if let Ok(value) = std::env::var("SPARKFLASH_TP4_PREFILL_CHUNK") {
+        return mode_from_legacy_chunk_value(&value);
+    }
+    SHIPPED_PREFILL_MODE
 }
 
 /// One rank of the four-node TP=4 host path, as a library.
@@ -1060,20 +1097,24 @@ impl Tp4Rank {
         Ok(())
     }
 
-    /// Prefills the prompt and returns the last position's output. The default is the
-    /// pre-batch-17 one-step-per-token loop (one hybrid forward per prompt token).
+    /// Prefills the prompt and returns the last position's output. The shipped default is the
+    /// pre-batch-17 one-step-per-token loop (one hybrid forward per prompt token); the batched
+    /// token-budget policy is implemented and tested but not yet the runtime default.
     ///
-    /// Set `SPARKFLASH_TP4_PREFILL_CHUNK=1` to run the batch-17 chunked hybrid step instead: one
-    /// forward per layer over the whole prompt. It is bit-identical but opt-in, because the batch-17
-    /// serve census measured a slower endpoint TTFT with the chunk path than with the loop (43.6 s
-    /// vs 39.1 s) while the bench harness measures the chunk faster (24.6 s vs 33.1 s at 37 prompt
-    /// tokens); the serve-path overhead is batch-18 work. Single-token prompts always take the
+    /// [SHIPPED_PREFILL_MODE] is the one-line flip; `SPARKFLASH_TP4_PREFILL_MODE` (or the legacy
+    /// `SPARKFLASH_TP4_PREFILL_CHUNK`) overrides it for a bisect. [PrefillMode::Batched] runs the
+    /// batch-17 chunked hybrid step: one forward per layer over the whole prompt. It is
+    /// bit-identical, but the batch-17 serve census measured a slower endpoint TTFT with the chunk
+    /// path than with the loop (43.6 s vs 39.1 s) while the bench harness measures the chunk faster
+    /// (24.6 s vs 33.1 s at 37 prompt tokens), so the serve path keeps the measured-better default
+    /// until the endpoint overhead is understood (batch 18). Single-token prompts always take the
     /// one-token path.
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, Tp4Error> {
         if tokens.is_empty() {
             return Err(Tp4Error::new("prefill needs at least one token"));
         }
-        if tokens.len() == 1 || !prefill_chunk_enabled() {
+        let chunked = shipped_prefill_mode() == PrefillMode::Batched;
+        if tokens.len() == 1 || !chunked {
             self.prefill_token_loop(tokens)
         } else {
             self.prefill_chunk(tokens)
@@ -4475,6 +4516,41 @@ mod tests {
             .expect("greedy again");
         assert_eq!(rank.metrics().steps, 0, "begin_request clears the counters");
         rank.prefill(&[5]).expect("single-token prefill");
+    }
+
+    /// The shipped default is a measurement decision, not a leftover. Flipping it is one constant
+    /// (SHIPPED_PREFILL_MODE) and must arrive with an endpoint row that beats the measured
+    /// token-loop TTFT; this test is the guard that the flip is deliberate.
+    #[test]
+    fn the_shipped_prefill_mode_is_the_measured_better_token_loop() {
+        assert_eq!(SHIPPED_PREFILL_MODE, PrefillMode::TokenLoop);
+        assert!(SHIPPED_PREFILL_MODE.is_token_loop());
+        assert_ne!(SHIPPED_PREFILL_MODE, PrefillMode::Batched);
+    }
+
+    /// The legacy env spelling keeps its meaning: any truthy value still means the chunked path,
+    /// an explicit negative selects the token loop, and a mode name is parsed like the new one.
+    #[test]
+    fn the_legacy_prefill_chunk_values_keep_their_meaning() {
+        for value in ["1", "true", "on", "yes", "chunk", "batched", "CHUNKED"] {
+            assert_eq!(
+                mode_from_legacy_chunk_value(value),
+                PrefillMode::Batched,
+                "{value}"
+            );
+        }
+        for value in ["0", "false", "off", "no", "token-loop", "loop", "token"] {
+            assert_eq!(
+                mode_from_legacy_chunk_value(value),
+                PrefillMode::TokenLoop,
+                "{value}"
+            );
+        }
+        assert_eq!(
+            mode_from_legacy_chunk_value("some-unknown-value"),
+            PrefillMode::Batched,
+            "legacy presence meant the chunked path"
+        );
     }
 
     /// Batch 17's bar: one chunked prefill must be bit-identical to the same prompt run as single

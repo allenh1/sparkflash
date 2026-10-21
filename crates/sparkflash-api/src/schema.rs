@@ -5,7 +5,7 @@
 //! failure can be rendered as an OpenAI-shaped error envelope.
 
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// OpenAI `POST /v1/chat/completions` request body.
 #[derive(Debug, Clone, Deserialize)]
@@ -65,6 +65,21 @@ pub struct ChatCompletionRequest {
     pub echo: Option<bool>,
     /// Tool definitions (accepted verbatim in Milestone 1).
     pub tools: Option<Value>,
+    /// OpenAI's tool-choice selector: `"none"`, `"auto"`, `"required"` or
+    /// `{"type":"function","function":{"name":...}}`.
+    ///
+    /// `"none"` is honoured: the tools are removed from the rendered prompt and the response never
+    /// carries a parsed tool call, which is what the OpenAI contract means by "do not call a tool".
+    /// `"auto"` (the default) keeps today's behaviour. `"required"` and a named function are
+    /// **refused with a typed 400**: this seam renders the tool list but has no policy that can
+    /// force a call, so accepting them would be a silent promise the server does not keep.
+    pub tool_choice: Option<Value>,
+    /// Whether the model may answer with more than one tool call in one response.
+    ///
+    /// OpenAI's default is true. An explicit false is enforced at the parser boundary: only the
+    /// first parsed call is reported (buffered and streamed), instead of returning a parallel set
+    /// the caller said it cannot accept.
+    pub parallel_tool_calls: Option<bool>,
     /// Stop sequence(s).
     #[serde(default)]
     pub stop: Option<StopSpec>,
@@ -86,6 +101,20 @@ pub struct ChatCompletionRequest {
     pub response_format: Option<ResponseFormat>,
     /// End-user identifier.
     pub user: Option<String>,
+    /// OpenAI's deprecated "sample best_of, return n" knob.
+    ///
+    /// vLLM accepts the field and ignores it (measured on the reference deployment 2026-10-21: a
+    /// single-choice request with `best_of: 2` answers one choice), so this server parses it and
+    /// documents the same no-op rather than pretending it selected a sample.
+    pub best_of: Option<usize>,
+    /// Per-token logit bias: token id (as a JSON key) to a value in `-100..=100`.
+    ///
+    /// Validated here and refused with a typed 400: the engine seam has no logits processor to apply
+    /// it, and the reference deployment refuses it as well (its speculative-decoding sampler reports
+    /// `min_p` and `logit_bias` as unsupported).
+    pub logit_bias: Option<Map<String, Value>>,
+    /// Minimum-probability sampler threshold; `0.0` means disabled and is accepted as a no-op.
+    pub min_p: Option<f32>,
 }
 
 /// OpenAI `response_format` for chat completions.
@@ -218,6 +247,12 @@ pub enum ContentPart {
 pub struct StreamOptions {
     /// Emit a final chunk carrying the usage block.
     pub include_usage: Option<bool>,
+    /// Put the running usage block on every chunk, not only on the final one.
+    ///
+    /// vLLM only honours this together with `include_usage`; the reference server answers a
+    /// request that sets it alone with a normal stream that carries no usage anywhere, and so does
+    /// this server.
+    pub continuous_usage_stats: Option<bool>,
 }
 
 /// `stop` may be a single string or an array of strings.
@@ -271,6 +306,12 @@ pub struct CompletionRequest {
     /// Completions per prompt. The OpenAI default is 1; choice index is
     /// `prompt_index * n + choice_index`, and each choice is an independent sample.
     pub n: Option<usize>,
+    /// Structured-output request, parsed with the chat rule (S2).
+    ///
+    /// The vLLM completions protocol does not carry this member and the reference deployment
+    /// ignores it; this server refuses the two JSON modes with the same typed 400 as chat rather
+    /// than silently returning unconstrained prose for a request that asked for JSON.
+    pub response_format: Option<ResponseFormat>,
     /// Echo the prompt in the response.
     pub echo: Option<bool>,
     /// Per generated token: number of alternative logprobs, or `-1` for the whole vocabulary.
@@ -294,6 +335,25 @@ pub struct CompletionRequest {
     pub enable_thinking: Option<bool>,
     /// Chat-template kwargs.
     pub chat_template_kwargs: Option<Value>,
+    /// OpenAI's deprecated "sample best_of, return n" knob.
+    ///
+    /// vLLM accepts the field and ignores it (only `n` schedules samples; measured on the
+    /// reference deployment 2026-10-21: `best_of=2, n absent` answers one choice). This schema keeps
+    /// the field for wire compatibility and documents the same no-op instead of silently dropping
+    /// an unknown member.
+    pub best_of: Option<usize>,
+    /// Per-token logit bias: token id (as a JSON key) to a value in `-100..=100`.
+    ///
+    /// Validated here (vLLM's conversion errors are copied) and then refused with a typed 400,
+    /// because the reference engine's sampler has no logits processor to apply it. The reference
+    /// deployment refuses it too - its speculative-decoding sampler reports `min_p` and
+    /// `logit_bias` as unsupported - so the status matches even though the cause differs.
+    pub logit_bias: Option<Map<String, Value>>,
+    /// Minimum-probability sampler threshold, `0.0..=1.0` with `0.0` meaning disabled.
+    ///
+    /// Validated here and refused typed for a positive value, for the same reason as
+    /// `logit_bias`; `0.0` is the disabled value and is accepted as a no-op.
+    pub min_p: Option<f32>,
 }
 
 /// `prompt` may be a single string, an array of strings, or an array of token ids.

@@ -121,6 +121,7 @@ use sparkflash_api::engine::{
     LogprobsRequest, MODEL_ID, MODEL_MAX_OUTPUT_TOKENS, MissingCapability, PromptLogprobs,
     TokenLogprob, TokenString, default_engram_layers, empty_kv_snapshot, max_seq_len,
 };
+use sparkflash_api::state::CorsConfig;
 use sparkflash_api::telemetry_types::{
     CompletionTokensDetails, DSparkStepStats, DeepSeekSparkRequestStats, OpenAiUsageWithCache,
     PromptTokensDetails, RequestTimingStats, RoceTransportStats, finite_or_zero,
@@ -582,6 +583,11 @@ pub struct ServeOptions {
     /// `None` is the default and keeps the server open, exactly as before. The key is never
     /// logged; a missing or wrong one gets the OpenAI 401 envelope.
     pub api_key: Option<String>,
+    /// The browser cross-origin policy, or `None` to serve the pre-CORS surface.
+    ///
+    /// The default is [CorsConfig::any], the same permissive default the reference vLLM server
+    /// mounts, so a browser client works without an extra flag.
+    pub cors: Option<CorsConfig>,
     /// The recorded device token window to serve, when the operator passed --device-token-dir.
     pub device_token_dir: Option<PathBuf>,
     /// Whether a window without the writer's token_claimed assertion may be served (S7 rehearsal).
@@ -613,6 +619,22 @@ impl ServeOptions {
                     .to_owned(),
             );
         }
+        // CORS: the default is the reference server's permissive policy. --no-cors serves the
+        // pre-CORS bytes (a proxy may own the policy) and --cors-allow-origin restricts the origin
+        // list instead of allowing any origin.
+        let cors = if cli.no_cors {
+            if !cli.cors_allow_origin.is_empty() {
+                return Err(
+                    "--no-cors and --cors-allow-origin cannot both be given: choose whether the CORS layer is served or who may cross origins"
+                        .to_owned(),
+                );
+            }
+            None
+        } else if cli.cors_allow_origin.is_empty() {
+            Some(CorsConfig::any())
+        } else {
+            Some(CorsConfig::allow_list(cli.cors_allow_origin.clone()))
+        };
         // The cap follows the source when the operator does not name one: a real checkpoint's
         // largest tensors are the embedding and the head at 661,913,600 elements each, and
         // [REFERENCE_TENSOR_LIMIT] would refuse them mid-request. This is the one place the choice
@@ -719,6 +741,7 @@ impl ServeOptions {
                 #[cfg(feature = "tp4-serve")]
                 tp4,
                 api_key: cli.api_key,
+                cors,
                 device_token_dir: cli.device_token_dir,
                 device_token_derived_claim: cli.device_token_derived_claim,
             }),
@@ -829,6 +852,19 @@ struct ServeArgs {
     /// probes, readiness probes and local scrapers.
     #[arg(long, value_name = "KEY", env = "SPARKFLASH_SERVE_API_KEY")]
     api_key: Option<String>,
+    /// Allow browser requests only from this origin; repeat for several. Default: any origin.
+    ///
+    /// The default matches the reference vLLM server, which mounts a CORS middleware answering
+    /// `access-control-allow-origin: *`. An explicit list answers only those origins with an echoed
+    /// allow-origin header and `Vary: Origin`.
+    #[arg(long, value_name = "ORIGIN", action = clap::ArgAction::Append)]
+    cors_allow_origin: Vec<String>,
+    /// Serve without the CORS layer: no `access-control-*` headers and no preflight answer.
+    ///
+    /// This is the pre-CORS wire surface, for a deployment behind a proxy that adds its own
+    /// policy. It cannot be combined with --cors-allow-origin.
+    #[arg(long)]
+    no_cors: bool,
     /// Serve a claimed four-rank device token envelope from this window directory.
     ///
     /// The directory is a recorded token window (rank{rank}/tp4-forward-embed-r{rank}.json and
@@ -4839,6 +4875,7 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
         .with_max_logprobs(options.max_logprobs)
         .with_tokenizer(seam)
         .with_api_key(options.api_key.clone())
+        .with_cors(options.cors.clone())
         .with_device_token_source(device_token_source);
     let drain_state = state.clone();
     let router = sparkflash_api::server::router(state);
@@ -4984,6 +5021,7 @@ fn serve_with_engine(
         .with_max_logprobs(options.max_logprobs)
         .with_tokenizer(seam)
         .with_api_key(options.api_key.clone())
+        .with_cors(options.cors.clone())
         .with_device_token_source(device_token_source);
     // A debug-build test seam: a wire test can shorten the keep-alive interval so an idle engine
     // gap produces observable comment frames without waiting the production 15 s. Debug-only, so

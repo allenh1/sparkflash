@@ -71,8 +71,32 @@ POST_SPLIT_ROOT_EDITS = [
         '    ("b12x_mxfp8_wo_a_sm121.cu", 20),\n    ("cert_lm_head_sm121.cu", 9),',
     ),
     (
+        '    ("b12x_mxfp4_moe_sm121.cu", 10),\n',
+        '    ("b12x_mxfp4_moe_sm121.cu", 12),\n',
+    ),
+    (
         '        checked, 78,\n        "the milestone\'s static asserts must all be evaluated: 20 in the shared header plus 6, 6, \\\n',
         '        checked, 98,\n        "the milestone\'s static asserts must all be evaluated: 20 in the shared header plus 6, 7, \\\n',
+    ),
+    (
+        '        checked, 98,\n',
+        '        checked, 100,\n',
+    ),
+    (
+        'the milestone\'s static asserts must all be evaluated: 20 in the shared header plus 6, 7, \\\n',
+        'the milestone\'s static asserts must all be evaluated: 20 in the shared header plus 7, 15, \\\n',
+    ),
+    (
+        '         10, 17, 11 and 8 in the six kernels. The MoE count rose from 7 to 10 with D14, which pins \\\n         the FP8 E4M3 activation operand\'s byte width in the build itself; flash_mla\'s rose from 13 \\\n         to 15 with the engine window format\'s two layout asserts, then to 17 with the union \\\n         capacity\'s two. The format VALUE is not among them: it is a runtime launch parameter and \\\n         is guarded at kernel entry instead"\n',
+        '         12, 17, 20 and 9 in the six kernels (mega_mhc, dense, MoE, flash_mla, wo_a, cert). The MoE \\\n         count rose from 10 to 12 with the split-K tiling: the 256-thread block identity and the \\\n         one-reducer-per-(slot, column) bound. D14 had raised it from 7 to 10 for the FP8 E4M3 \\\n         activation operand\'s byte width; flash_mla\'s rose from 13 to 15 with the engine window \\\n         format\'s two layout asserts, then to 17 with the union capacity\'s two. The format VALUE is \\\n         not among them: it is a runtime launch parameter and is guarded at kernel entry instead"\n',
+    ),
+    (
+        '            && code.contains("acc += (partial * act_scale) * w_scale;")\n',
+        '            && code.contains("terms[slot][block][col_local] =")\n            && code.contains("__fmul_rn(__fmul_rn(partial, act_scale), w_scale);")\n',
+    ),
+    (
+        '        "acc += (partial * act_scale) * w_scale;",\n        "acc += routing * (partial * act_scale) * w_scale;",\n',
+        '        "__fmul_rn(__fmul_rn(partial, act_scale), w_scale);",\n        "__fmul_rn(__fmul_rn(routing * partial, act_scale), w_scale);",\n',
     ),
 ]
 

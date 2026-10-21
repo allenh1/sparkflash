@@ -14,8 +14,8 @@ use std::time::Duration;
 use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{Request, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -47,7 +47,7 @@ use crate::schema::{
     ChatCompletionRequest, CompletionRequest, MessagesRequest, PromptSpec, ResponseFormat,
     ResponsesRequest, StopSpec,
 };
-use crate::state::AppState;
+use crate::state::{AppState, CorsConfig};
 use crate::telemetry_types::{
     DSparkStepStats, DeepSeekSparkRequestStats, OpenAiUsageWithCache, safe_ratio,
 };
@@ -157,6 +157,10 @@ struct StreamContext {
     trace_id: Option<String>,
     /// Whether the client offered tools, which is what turns on the streaming DSML parser.
     tools_offered: bool,
+    /// Whether more than one parsed call may be reported (`parallel_tool_calls`, default true).
+    parallel_tool_calls: bool,
+    /// Whether every chunk carries the running usage block (`stream_options.continuous_usage_stats`).
+    continuous_usage_stats: bool,
 }
 
 /// A parsed `X-SparkFlash-Trace` directive.
@@ -230,12 +234,17 @@ fn invalid_trace(message: String) -> ApiError {
 /// returns before touching the request, so the pre-auth behaviour is byte-for-byte unchanged.
 pub fn router(state: AppState) -> Router {
     let auth_state = state.clone();
-    Router::new()
+    let router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/responses", post(responses))
         .route("/v1/messages", post(messages))
         .route("/v1/models", get(list_models))
+        // The model id itself contains a slash (`deepseek-ai/DeepSeek-V4.1-Flash`), so the retrieve
+        // route needs the rest-of-path wildcard rather than a single segment.
+        .route("/v1/models/{*model}", get(retrieve_model))
+        .route("/tokenize", post(tokenize))
+        .route("/detokenize", post(detokenize))
         .route("/health", get(health))
         .route("/readyz", get(readyz))
         .route("/v1/cluster/stats", get(cluster_stats))
@@ -245,8 +254,54 @@ pub fn router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(
             auth_state,
             require_bearer_auth,
-        ))
-        .with_state(state)
+        ));
+    // The CORS layer is added last, so it is the outermost layer: a browser preflight carries no
+    // Authorization header, so it has to be answered before the bearer middleware (vLLM's
+    // middleware stack answers preflight first too). Without a policy the router is unchanged.
+    let router = match state.cors() {
+        Some(config) => router.layer(cors_layer(config)),
+        None => router,
+    };
+    router.with_state(state)
+}
+
+/// The browser cross-origin layer, mirroring the reference server's permissive default.
+///
+/// vLLM mounts a CORS middleware that answers `access-control-allow-origin: *`, every method and
+/// `max-age: 600`; the allow-headers list is explicit rather than a wildcard because the Fetch
+/// standard's `*` wildcard does not cover `Authorization`, which an OpenAI client sends on every
+/// request. A configured origin list answers only those origins and adds `Vary: Origin`.
+fn cors_layer(config: &CorsConfig) -> tower_http::cors::CorsLayer {
+    let layer = tower_http::cors::CorsLayer::new()
+        .allow_methods([
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            header::ORIGIN,
+            HeaderName::from_static(REQUEST_ID_HEADER),
+            HeaderName::from_static(TRACE_HEADER),
+            HeaderName::from_static(TRACE_STEPS_HEADER),
+            HeaderName::from_static(TRACE_SCOPES_HEADER),
+        ])
+        .max_age(Duration::from_secs(config.max_age_secs()));
+    match config.allowed_origins() {
+        None => layer.allow_origin(tower_http::cors::AllowOrigin::any()),
+        Some(origins) => layer.allow_origin(tower_http::cors::AllowOrigin::list(
+            origins
+                .iter()
+                .filter_map(|origin| HeaderValue::from_str(origin).ok())
+                .collect::<Vec<_>>(),
+        )),
+    }
 }
 
 /// The three routes reachable without the bearer key.
@@ -373,6 +428,153 @@ fn resolve_choice_count(n: Option<usize>, engine: &dyn InferenceEngine) -> Resul
         ));
     }
     Ok(n)
+}
+
+/// The tool policy a chat request asked for, resolved before generation.
+struct ToolPolicy {
+    /// Whether the tools are rendered into the prompt and a DSML block in the answer is lifted into
+    /// `tool_calls`. False when the client sent `tool_choice: "none"`.
+    tools_offered: bool,
+    /// Whether one response may carry more than one parsed call (`parallel_tool_calls`, default
+    /// true).
+    parallel: bool,
+}
+
+/// Validates OpenAI's `tool_choice`/`parallel_tool_calls` pair.
+///
+/// `"none"` and `"auto"` are honoured. `"required"` and a named function selector need a template
+/// policy that forces the call, which the V4.1 seam does not render, so they are refused with a
+/// typed 400 (the same treatment `response_format` gets) rather than accepted as a no-op. The
+/// selector is validated even when no tools are offered, because a malformed value is a client
+/// error either way.
+fn resolve_tool_policy(
+    tools: Option<&Value>,
+    tool_choice: Option<&Value>,
+    parallel_tool_calls: Option<bool>,
+) -> Result<ToolPolicy, ApiError> {
+    let offered = tools.is_some_and(|tools| !tools.is_null());
+    let parallel = parallel_tool_calls.unwrap_or(true);
+    let forced = |what: &str| {
+        ApiError::invalid_request(
+            format!(
+                "tool_choice {what} needs a prompt policy that forces a tool call, and this server \
+                 renders the tool list without one; the request is refused rather than answered \
+                 with a call the model was never required to make"
+            ),
+            Some("tool_choice".to_owned()),
+            Some("unsupported_parameter".to_owned()),
+        )
+    };
+    let malformed = || {
+        ApiError::invalid_request(
+            "tool_choice must be \"none\", \"auto\", \"required\" or a function selector",
+            Some("tool_choice".to_owned()),
+            Some("invalid_tool_choice".to_owned()),
+        )
+    };
+    let mode = match tool_choice {
+        None | Some(Value::Null) => "auto",
+        Some(Value::String(choice)) => match choice.as_str() {
+            "auto" => "auto",
+            "none" => "none",
+            "required" => return Err(forced("\"required\"")),
+            _ => return Err(malformed()),
+        },
+        Some(Value::Object(selector)) => {
+            let is_function = selector.get("type").and_then(Value::as_str) == Some("function");
+            if !is_function {
+                return Err(malformed());
+            }
+            return Err(forced("with a named function"));
+        }
+        Some(_) => return Err(malformed()),
+    };
+    Ok(ToolPolicy {
+        tools_offered: offered && mode != "none",
+        parallel,
+    })
+}
+
+/// Validates OpenAI's `logit_bias`/`min_p` and refuses the values this engine cannot apply.
+///
+/// Both need a logits processor inside the sampling path: vLLM applies `logit_bias` to the raw
+/// logits before the penalties and `min_p` as a candidate filter after `top_p`. The engine seam this
+/// server owns has no such hook, so a request that would change generation is refused typed instead
+/// of being silently dropped. The disabled values (`logit_bias: {}` and `min_p: 0.0`) are accepted
+/// as the no-ops they are, and the malformed forms get vLLM's own conversion errors first.
+fn check_sampling_extensions(
+    logit_bias: Option<&Map<String, Value>>,
+    min_p: Option<f32>,
+    vocab_size: Option<usize>,
+) -> Result<(), ApiError> {
+    if let Some(bias) = logit_bias.filter(|bias| !bias.is_empty()) {
+        let mut bad_keys: Vec<&str> = Vec::new();
+        for (key, value) in bias {
+            let Ok(id) = key.parse::<u32>() else {
+                bad_keys.push(key);
+                continue;
+            };
+            let Some(raw) = value.as_f64() else {
+                return Err(ApiError::invalid_request(
+                    format!("logit_bias value for token {id} must be a number"),
+                    Some("logit_bias".to_owned()),
+                    Some("invalid_logit_bias".to_owned()),
+                ));
+            };
+            if !(-100.0..=100.0).contains(&raw) {
+                return Err(ApiError::invalid_request(
+                    format!(
+                        "logit_bias must be a float between -100 and 100, got {raw} for token {id}"
+                    ),
+                    Some("logit_bias".to_owned()),
+                    Some("invalid_logit_bias".to_owned()),
+                ));
+            }
+            if let Some(vocab) = vocab_size
+                && id as usize >= vocab
+            {
+                return Err(ApiError::invalid_request(
+                    format!(
+                        "logit_bias names token id {id}, outside the model vocabulary ({vocab} ids)"
+                    ),
+                    Some("logit_bias".to_owned()),
+                    Some("invalid_logit_bias".to_owned()),
+                ));
+            }
+        }
+        if !bad_keys.is_empty() {
+            let listed = bad_keys
+                .iter()
+                .map(|key| format!("'{key}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ApiError::invalid_request(
+                format!(
+                    "logit_bias contains key(s) that cannot be converted to integer token IDs: [{listed}] (parameter=logit_bias, value=[{listed}])"
+                ),
+                Some("logit_bias".to_owned()),
+                Some("invalid_logit_bias".to_owned()),
+            ));
+        }
+        return Err(ApiError::invalid_request(
+            "logit_bias needs a logits processor in the sampling path, and this engine seam has none;              it is refused instead of being silently ignored. The reference deployment refuses it too,              reporting min_p and logit_bias as unsupported for its speculative decoder",
+            Some("logit_bias".to_owned()),
+            Some("unsupported_parameter".to_owned()),
+        ));
+    }
+    match min_p {
+        Some(value) if !(0.0..=1.0).contains(&value) => Err(ApiError::invalid_request(
+            format!("min_p must be between 0 and 1, got {value}"),
+            Some("min_p".to_owned()),
+            Some("invalid_min_p".to_owned()),
+        )),
+        Some(value) if value > 0.0 => Err(ApiError::invalid_request(
+            "min_p needs a candidate filter in the sampling path, and this engine seam has none; it              is refused instead of being silently ignored. The reference deployment refuses it too,              reporting min_p and logit_bias as unsupported for its speculative decoder",
+            Some("min_p".to_owned()),
+            Some("unsupported_parameter".to_owned()),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Refuses a structured-output mode this server cannot enforce.
@@ -1473,12 +1675,28 @@ async fn chat_completions(
     // reasoning_effort decide thinking and the rendered budget), so keep a copy only when a
     // tokenizer seam is attached; the placeholder path does not need it.
     let seam = state.tokenizer().cloned();
-    let raw_for_seam = seam.as_ref().map(|_| value.clone());
+    let mut raw_for_seam = seam.as_ref().map(|_| value.clone());
     let request: ChatCompletionRequest = serde_json::from_value(value).map_err(invalid_body)?;
     // vLLM's auto tool choice is enabled by `--enable-auto-tool-choice --tool-call-parser
     // deepseek_v41`; the request side of that contract is a non-null `tools` list, and the
     // answer side is parsed below before the OpenAI tool_calls array is filled.
-    let tools_offered = request.tools.as_ref().is_some_and(|tools| !tools.is_null());
+    let tool_policy = resolve_tool_policy(
+        request.tools.as_ref(),
+        request.tool_choice.as_ref(),
+        request.parallel_tool_calls,
+    )?;
+    let tools_offered = tool_policy.tools_offered;
+    if !tools_offered
+        && let Some(raw) = raw_for_seam.as_mut()
+        && let Some(map) = raw.as_object_mut()
+    {
+        // `tool_choice: "none"` removes the tools from the rendered template instead of merely
+        // ignoring the parsed call: vLLM's chat utils do not add a tool list the model is told not
+        // to use, and a prompt carrying tools changes what the model writes even when the caller
+        // forbade calls.
+        map.remove("tools");
+        map.remove("tool_choice");
+    }
     if request.messages.is_empty() {
         return Err(ApiError::invalid_request(
             "\"messages\" must be a non-empty array",
@@ -1492,6 +1710,9 @@ async fn chat_completions(
     // an impossible request (too many alternatives, out-of-vocabulary ids, streaming prompt
     // logprobs) is a 400, never a truncated answer.
     let vocab_size = state.engine.vocab_size();
+    // logit_bias/min_p are validated against the stated vocabulary, then refused typed: the engine
+    // seam has no logits processor (see the function's own comment).
+    check_sampling_extensions(request.logit_bias.as_ref(), request.min_p, vocab_size)?;
     let logprobs_requested = request.logprobs.unwrap_or(false);
     let explicit_token_ids = request
         .logprob_token_ids
@@ -1658,6 +1879,13 @@ async fn chat_completions(
             .stream_options
             .and_then(|options| options.include_usage)
             .unwrap_or(false);
+        // vLLM only reports continuous usage when include_usage is on as well; a request that asks
+        // for it alone gets a stream with no usage block at all, which is what the reference does.
+        let continuous_usage_stats = include_usage
+            && request
+                .stream_options
+                .and_then(|options| options.continuous_usage_stats)
+                .unwrap_or(false);
         Ok(chat_stream_response(
             &state,
             requests,
@@ -1668,6 +1896,8 @@ async fn chat_completions(
                 include_usage,
                 trace_id,
                 tools_offered,
+                parallel_tool_calls: tool_policy.parallel,
+                continuous_usage_stats,
             },
             logprob_info,
             trace,
@@ -1681,6 +1911,13 @@ async fn chat_completions(
         for output in &mut outputs {
             if tools_offered {
                 apply_deepseek_v41_tool_parser(output, &state);
+            }
+            if !tool_policy.parallel && output.tool_calls.len() > 1 {
+                // parallel_tool_calls = false: report the first call only, instead of handing back
+                // a parallel set the caller said it cannot accept. The block is already generated,
+                // so this is the parser-boundary enforcement point.
+                output.tool_calls.truncate(1);
+                output.finish_reason = FinishReason::ToolCalls;
             }
         }
         let usage = aggregate_usage_shared_prompt(&outputs);
@@ -1890,62 +2127,93 @@ fn next_tool_call_id(counter: &std::sync::atomic::AtomicU64) -> String {
     )
 }
 
-/// Maps incremental parser events onto streamed chat chunks.
+/// The pending streamed chunks of one choice: parser events and logprob entries.
 ///
-/// `parsed_calls` counts the calls the parser has started; the finished event turns into
-/// `finish_reason: tool_calls` when it is non-zero, matching the buffered path. `choice_index` is
-/// the response choice the fragments belong to, so n > 1 keeps each choice's tool calls separate.
-fn parser_event_chunks(
+/// When a request offers tools *and* asks for sample logprobs, vLLM reports both at once: the DSML
+/// block becomes delta.tool_calls while each chunk still carries the logprobs entries of every
+/// token generated since the previous chunk - including the marker tokens the parser removed from
+/// the content. This queue reproduces that shape: parser events and logprob entries accumulate, and
+/// a drain emits one chunk per event with the pending logprob list attached to the first chunk of
+/// the drain.
+#[derive(Default)]
+struct StreamAssembler {
     events: Vec<tool_parser::StreamToolEvent>,
-    id: &str,
-    model: &str,
-    created: u64,
-    choice_index: usize,
-    next_id: &mut impl FnMut() -> String,
-    parsed_calls: &mut usize,
-) -> Vec<Value> {
-    events
-        .into_iter()
-        .map(|event| match event {
-            tool_parser::StreamToolEvent::Content(content) => chat_chunk(
-                id,
-                model,
-                created,
-                choice_index,
-                json!({"content": content}),
-                None,
-                None,
-                None,
-            ),
-            tool_parser::StreamToolEvent::CallStart { index, name } => {
-                *parsed_calls += 1;
-                let call_id = next_id();
-                chat_chunk(
-                    id,
-                    model,
-                    created,
-                    choice_index,
-                    tool_call_delta(index, Some(call_id), Some(name), String::new()),
-                    None,
-                    None,
-                    None,
-                )
-            }
-            tool_parser::StreamToolEvent::ArgumentsDelta {
-                index,
-                arguments_delta,
-            } => chat_chunk(
-                id,
-                model,
-                created,
-                choice_index,
-                tool_call_delta(index, None, None, arguments_delta),
-                None,
-                None,
-                None,
-            ),
-        })
-        .collect()
+    logprobs: Vec<Value>,
+    calls: usize,
+}
+
+impl StreamAssembler {
+    /// Queues what the incremental parser produced for one content delta.
+    fn push(&mut self, events: Vec<tool_parser::StreamToolEvent>) {
+        self.events.extend(events);
+    }
+
+    /// How many tool calls this choice has started streaming.
+    fn calls(&self) -> usize {
+        self.calls
+    }
+
+    /// Turns the queued events into (delta, logprobs) pairs.
+    ///
+    /// A request that disabled parallel calls keeps only call index 0: later calls and their
+    /// argument fragments are dropped before they can reach the wire.
+    fn drain(
+        &mut self,
+        next_id: &mut impl FnMut() -> String,
+        parallel: bool,
+    ) -> Vec<(Value, Option<Value>)> {
+        // A logprob with no delta to ride on stays queued for the next chunk (or the terminal
+        // chunk): vLLM never drops a token's logprob just because its delta was held by the
+        // tool-call parser.
+        if self.events.is_empty() {
+            return Vec::new();
+        }
+        let mut logprobs = (!self.logprobs.is_empty())
+            .then(|| json!({"content": std::mem::take(&mut self.logprobs)}));
+        let mut chunks: Vec<(Value, Option<Value>)> = Vec::new();
+        for event in std::mem::take(&mut self.events) {
+            let delta = match event {
+                tool_parser::StreamToolEvent::Content(content) => json!({"content": content}),
+                tool_parser::StreamToolEvent::CallStart { index, name } => {
+                    if !parallel && index > 0 {
+                        continue;
+                    }
+                    self.calls += 1;
+                    tool_call_delta(index, Some(next_id()), Some(name), String::new())
+                }
+                tool_parser::StreamToolEvent::ArgumentsDelta {
+                    index,
+                    arguments_delta,
+                } => {
+                    if !parallel && index > 0 {
+                        continue;
+                    }
+                    tool_call_delta(index, None, None, arguments_delta)
+                }
+            };
+            chunks.push((delta, logprobs.take()));
+        }
+        chunks
+    }
+
+    /// The logprob entries still pending, for the terminal chunk to carry.
+    fn take_logprobs(&mut self) -> Option<Value> {
+        (!self.logprobs.is_empty()).then(|| json!({"content": std::mem::take(&mut self.logprobs)}))
+    }
+}
+
+/// Adds the running usage block to a chunk when stream_options.continuous_usage_stats is on.
+///
+/// The reference server puts usage on every chunk of such a stream and keeps the empty-choices
+/// final chunk; the counts grow with generation and the last per-chunk value is the authoritative
+/// one because the engine's own completion_tokens replaces the delta count when a choice finishes.
+fn attach_continuous_usage(chunk: &mut Value, usage: &OpenAiUsageWithCache) {
+    if let Some(map) = chunk.as_object_mut() {
+        map.insert(
+            "usage".to_owned(),
+            serde_json::to_value(usage).unwrap_or(Value::Null),
+        );
+    }
 }
 
 fn chat_stream_response(
@@ -1965,20 +2233,38 @@ fn chat_stream_response(
         include_usage,
         trace_id,
         tools_offered,
+        parallel_tool_calls,
+        continuous_usage_stats,
     } = context;
-    // The parser runs only when the client offered tools, the same switch the buffered path uses,
-    // and the response is not in streaming-logprob mode. In that mode a content delta has to
-    // travel with the per-token logprob entry it belongs to, which cannot be mapped onto
-    // tool-call fragments; the combination is a documented residual gap, not a silent mix.
-    let parse_tool_calls = tools_offered && !logprob_info.wants_sample();
+    // The parser runs whenever the client offered tools. It used to be switched off for
+    // streaming-logprob requests, which left the raw DSML block in the content; vLLM parses that
+    // combination too and puts the logprob entries on the same chunks as the tool-call deltas, so
+    // the assembler above carries both.
+    let parse_tool_calls = tools_offered;
+    let logprob_mode = logprob_info.wants_sample();
     let choice_count = requests.len();
+    let prompt_tokens = requests
+        .first()
+        .map_or(0, |request| request.prompt_tokens.len());
     let stream = async_stream::stream! {
         // The spans are emitted while this generator is polled, so the binding has to be
         // taken here rather than on the handler's stack.
         let _binding = RequestTraceBinding::new(trace_id);
+        // The running usage block of a continuous-usage stream.
+        let usage_now = |finished_completion: usize, current_completion: usize, reasoning: usize| {
+            let mut usage = OpenAiUsageWithCache::default();
+            usage.prompt_tokens = prompt_tokens;
+            usage.completion_tokens = finished_completion + current_completion;
+            usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+            usage.completion_tokens_details.reasoning_tokens = reasoning;
+            usage
+        };
+        let mut finished_completion = 0usize;
+        let mut current_completion = 0usize;
+        let mut reasoning_tokens = 0usize;
         // One assistant role chunk opens the response; later choices identify themselves with
         // their choice index instead of repeating the role, which is the OpenAI stream convention.
-        yield Ok::<Bytes, Infallible>(sse_frame(&chat_chunk(
+        let mut role_chunk = chat_chunk(
             &id,
             &model,
             created,
@@ -1987,7 +2273,14 @@ fn chat_stream_response(
             None,
             None,
             None,
-        )));
+        );
+        if continuous_usage_stats {
+            attach_continuous_usage(
+                &mut role_chunk,
+                &usage_now(finished_completion, current_completion, reasoning_tokens),
+            );
+        }
+        yield Ok::<Bytes, Infallible>(sse_frame(&role_chunk));
         let mut next_tool_id = {
             let counter = Arc::clone(&id_counter);
             move || next_tool_call_id(&counter)
@@ -1998,15 +2291,16 @@ fn chat_stream_response(
         let mut stats_parts: Vec<Box<DeepSeekSparkRequestStats>> = Vec::with_capacity(choice_count);
         let mut terminal = false;
         'choices: for (choice_index, request) in requests.into_iter().enumerate() {
-            // When logprobs are requested the text has to travel with the logprob entry of the
-            // token it belongs to, so content deltas are held here until its TokenLogprobs arrives.
+            // When logprobs are requested without a tool parser, the text has to travel with the
+            // logprob entry of the token it belongs to, so content deltas are held here until its
+            // TokenLogprobs event arrives.
             let mut buffered = String::new();
+            let mut assembler = StreamAssembler::default();
             let mut tool_parser = parse_tool_calls.then(tool_parser::ToolCallStreamParser::new);
             // A malformed or unterminated DSML block is terminal for the stream: the deltas already
             // sent cannot be taken back, so the error frame ends the response and later events are
             // dropped instead of interleaving content with a broken call.
             let mut parser_refusal: Option<String> = None;
-            let mut parser_calls = 0usize;
             let mut events = engine.generate(request);
             while let Some(event) = events.next().await {
                 match event {
@@ -2014,7 +2308,9 @@ fn chat_stream_response(
                     // Explicit prompt_logprobs are refused for streams, so this cannot arrive here.
                     EngineEvent::PromptLogprobs(_) => {}
                     EngineEvent::ReasoningDelta(text) => {
-                        yield Ok(sse_frame(&chat_chunk(
+                        current_completion += 1;
+                        reasoning_tokens += 1;
+                        let mut chunk = chat_chunk(
                             &id,
                             &model,
                             created,
@@ -2023,32 +2319,32 @@ fn chat_stream_response(
                             None,
                             None,
                             None,
-                        )));
+                        );
+                        if continuous_usage_stats {
+                            attach_continuous_usage(
+                                &mut chunk,
+                                &usage_now(
+                                    finished_completion,
+                                    current_completion,
+                                    reasoning_tokens,
+                                ),
+                            );
+                        }
+                        yield Ok(sse_frame(&chunk));
                     }
                     EngineEvent::ContentDelta(text) => {
+                        current_completion += 1;
                         if let Some(parser) = tool_parser.as_mut() {
                             if parser_refusal.is_none() {
                                 match parser.feed(&text) {
-                                    Ok(chunks) => {
-                                        for chunk in parser_event_chunks(
-                                            chunks,
-                                            &id,
-                                            &model,
-                                            created,
-                                            choice_index,
-                                            &mut next_tool_id,
-                                            &mut parser_calls,
-                                        ) {
-                                            yield Ok(sse_frame(&chunk));
-                                        }
-                                    }
+                                    Ok(chunks) => assembler.push(chunks),
                                     Err(refusal) => parser_refusal = Some(refusal.message),
                                 }
                             }
-                        } else if logprob_info.wants_sample() {
+                        } else if logprob_mode {
                             buffered.push_str(&text);
                         } else {
-                            yield Ok(sse_frame(&chat_chunk(
+                            let mut chunk = chat_chunk(
                                 &id,
                                 &model,
                                 created,
@@ -2057,61 +2353,96 @@ fn chat_stream_response(
                                 None,
                                 None,
                                 None,
-                            )));
+                            );
+                            if continuous_usage_stats {
+                                attach_continuous_usage(
+                                    &mut chunk,
+                                    &usage_now(
+                                        finished_completion,
+                                        current_completion,
+                                        reasoning_tokens,
+                                    ),
+                                );
+                            }
+                            yield Ok(sse_frame(&chunk));
                         }
                     }
                     EngineEvent::TokenLogprobs(logprob) => {
-                        if logprob_info.wants_sample() {
-                            let text = std::mem::take(&mut buffered);
-                            let logprobs =
-                                json!({"content": [chat_logprobs_entry(&logprob, logprob_info)]});
-                            yield Ok(sse_frame(&chat_chunk(
+                        if logprob_mode {
+                            if parse_tool_calls {
+                                // Queued with the parser deltas: vLLM reports the token's logprob on
+                                // whichever chunk carries the delta the token produced, including
+                                // the DSML marker tokens that never appear as content.
+                                assembler
+                                    .logprobs
+                                    .push(chat_logprobs_entry(&logprob, logprob_info));
+                            } else {
+                                let text = std::mem::take(&mut buffered);
+                                let logprobs =
+                                    json!({"content": [chat_logprobs_entry(&logprob, logprob_info)]});
+                                let mut chunk = chat_chunk(
+                                    &id,
+                                    &model,
+                                    created,
+                                    choice_index,
+                                    json!({"content": text}),
+                                    None,
+                                    Some(logprobs),
+                                    None,
+                                );
+                                if continuous_usage_stats {
+                                    attach_continuous_usage(
+                                        &mut chunk,
+                                        &usage_now(
+                                            finished_completion,
+                                            current_completion,
+                                            reasoning_tokens,
+                                        ),
+                                    );
+                                }
+                                yield Ok(sse_frame(&chunk));
+                            }
+                        }
+                    }
+                    EngineEvent::ToolCallDelta { index, id: call_id, name, arguments_delta } => {
+                        current_completion += 1;
+                        if parallel_tool_calls || index == 0 {
+                            let mut chunk = chat_chunk(
                                 &id,
                                 &model,
                                 created,
                                 choice_index,
-                                json!({"content": text}),
+                                tool_call_delta(index, call_id, name, arguments_delta),
                                 None,
-                                Some(logprobs),
                                 None,
-                            )));
+                                None,
+                            );
+                            if continuous_usage_stats {
+                                attach_continuous_usage(
+                                    &mut chunk,
+                                    &usage_now(
+                                        finished_completion,
+                                        current_completion,
+                                        reasoning_tokens,
+                                    ),
+                                );
+                            }
+                            yield Ok(sse_frame(&chunk));
                         }
-                    }
-                    EngineEvent::ToolCallDelta { index, id: call_id, name, arguments_delta } => {
-                        yield Ok(sse_frame(&chat_chunk(
-                            &id,
-                            &model,
-                            created,
-                            choice_index,
-                            tool_call_delta(index, call_id, name, arguments_delta),
-                            None,
-                            None,
-                            None,
-                        )));
                     }
                     EngineEvent::Finished { finish_reason, usage, stats } => {
                         usage_parts.push(usage);
                         if choice_count == 1 {
                             metrics.record_request(&usage, &stats.kv_cache);
                         }
+                        finished_completion += usage.completion_tokens;
+                        current_completion = 0;
                         stats_parts.push(stats);
                         if let Some(parser) = tool_parser.as_mut()
                             && parser_refusal.is_none()
                         {
                             match parser.finish() {
-                                Ok(chunks) => {
-                                    for chunk in parser_event_chunks(
-                                        chunks,
-                                        &id,
-                                        &model,
-                                        created,
-                                        choice_index,
-                                        &mut next_tool_id,
-                                        &mut parser_calls,
-                                    ) {
-                                        yield Ok(sse_frame(&chunk));
-                                    }
-                                }
+                                Ok(chunks) => assembler.push(chunks),
                                 Err(refusal) => parser_refusal = Some(refusal.message),
                             }
                         }
@@ -2132,9 +2463,9 @@ fn chat_stream_response(
                         // An engine that was asked for logprobs but emitted none for its last token
                         // has its text flushed here, without a logprob entry rather than with a
                         // fabricated one.
-                        if logprob_info.wants_sample() && !buffered.is_empty() {
+                        if logprob_mode && !parse_tool_calls && !buffered.is_empty() {
                             let text = std::mem::take(&mut buffered);
-                            yield Ok(sse_frame(&chat_chunk(
+                            let mut chunk = chat_chunk(
                                 &id,
                                 &model,
                                 created,
@@ -2143,8 +2474,46 @@ fn chat_stream_response(
                                 None,
                                 None,
                                 None,
-                            )));
+                            );
+                            if continuous_usage_stats {
+                                attach_continuous_usage(
+                                    &mut chunk,
+                                    &usage_now(
+                                        finished_completion,
+                                        current_completion,
+                                        reasoning_tokens,
+                                    ),
+                                );
+                            }
+                            yield Ok(sse_frame(&chunk));
                         }
+                        // Whatever the parser held back is emitted before the finish chunk, and the
+                        // logprob entries still pending ride on the first of those chunks.
+                        let pending = assembler.drain(&mut next_tool_id, parallel_tool_calls);
+                        for (delta, logprobs) in pending {
+                            let mut chunk = chat_chunk(
+                                &id,
+                                &model,
+                                created,
+                                choice_index,
+                                delta,
+                                None,
+                                logprobs,
+                                None,
+                            );
+                            if continuous_usage_stats {
+                                attach_continuous_usage(
+                                    &mut chunk,
+                                    &usage_now(
+                                        finished_completion,
+                                        current_completion,
+                                        reasoning_tokens,
+                                    ),
+                                );
+                            }
+                            yield Ok(sse_frame(&chunk));
+                        }
+                        let parser_calls = assembler.calls();
                         // A streamed DSML block is a tool call exactly like the buffered one: the
                         // choice ends with tool_calls, not the engine's stop.
                         let finish_reason = if parser_calls > 0 {
@@ -2153,16 +2522,27 @@ fn chat_stream_response(
                             finish_reason
                         };
                         if choice_count == 1 {
-                            yield Ok(sse_frame(&chat_chunk(
+                            let mut chunk = chat_chunk(
                                 &id,
                                 &model,
                                 created,
                                 choice_index,
                                 json!({}),
                                 Some(finish_reason),
-                                None,
+                                assembler.take_logprobs(),
                                 Some(stats_parts.last().expect("the choice's stats are recorded").as_ref()),
-                            )));
+                            );
+                            if continuous_usage_stats {
+                                attach_continuous_usage(
+                                    &mut chunk,
+                                    &usage_now(
+                                        finished_completion,
+                                        current_completion,
+                                        reasoning_tokens,
+                                    ),
+                                );
+                            }
+                            yield Ok(sse_frame(&chunk));
                             if include_usage {
                                 yield Ok(sse_frame(&chat_usage_chunk(&id, &model, created, &usage)));
                             }
@@ -2174,33 +2554,110 @@ fn chat_stream_response(
                                     .map(|(stats, usage)| (stats.as_ref(), usage))
                                     .collect();
                             let aggregate = aggregate_stats_parts(&parts);
-                            yield Ok(sse_frame(&chat_chunk(
+                            let mut chunk = chat_chunk(
                                 &id,
                                 &model,
                                 created,
                                 choice_index,
                                 json!({}),
                                 Some(finish_reason),
-                                None,
+                                assembler.take_logprobs(),
                                 Some(aggregate.as_ref()),
-                            )));
+                            );
+                            if continuous_usage_stats {
+                                attach_continuous_usage(
+                                    &mut chunk,
+                                    &usage_now(
+                                        finished_completion,
+                                        current_completion,
+                                        reasoning_tokens,
+                                    ),
+                                );
+                            }
+                            yield Ok(sse_frame(&chunk));
                         } else {
-                            yield Ok(sse_frame(&chat_chunk(
+                            let mut chunk = chat_chunk(
                                 &id,
                                 &model,
                                 created,
                                 choice_index,
                                 json!({}),
                                 Some(finish_reason),
+                                assembler.take_logprobs(),
                                 None,
-                                None,
-                            )));
+                            );
+                            if continuous_usage_stats {
+                                attach_continuous_usage(
+                                    &mut chunk,
+                                    &usage_now(
+                                        finished_completion,
+                                        current_completion,
+                                        reasoning_tokens,
+                                    ),
+                                );
+                            }
+                            yield Ok(sse_frame(&chunk));
                         }
                     }
                     EngineEvent::Error { message, code } => {
                         yield Ok(sse_frame(&json!({
                             "error": {"message": message, "type": "server_error", "param": null, "code": code},
                         })));
+                    }
+                }
+                // Parser output for this event goes out before the next engine event. A choice
+                // that is only producing reasoning logprobs still delivers them, on a delta:{}
+                // chunk (the shape vLLM uses for a chunk with no delta).
+                if parse_tool_calls {
+                    let pending = assembler.drain(&mut next_tool_id, parallel_tool_calls);
+                    if pending.is_empty() {
+                        if let Some(logprobs) = assembler.take_logprobs() {
+                            let mut chunk = chat_chunk(
+                                &id,
+                                &model,
+                                created,
+                                choice_index,
+                                json!({}),
+                                None,
+                                Some(logprobs),
+                                None,
+                            );
+                            if continuous_usage_stats {
+                                attach_continuous_usage(
+                                    &mut chunk,
+                                    &usage_now(
+                                        finished_completion,
+                                        current_completion,
+                                        reasoning_tokens,
+                                    ),
+                                );
+                            }
+                            yield Ok(sse_frame(&chunk));
+                        }
+                    } else {
+                        for (delta, logprobs) in pending {
+                            let mut chunk = chat_chunk(
+                                &id,
+                                &model,
+                                created,
+                                choice_index,
+                                delta,
+                                None,
+                                logprobs,
+                                None,
+                            );
+                            if continuous_usage_stats {
+                                attach_continuous_usage(
+                                    &mut chunk,
+                                    &usage_now(
+                                        finished_completion,
+                                        current_completion,
+                                        reasoning_tokens,
+                                    ),
+                                );
+                            }
+                            yield Ok(sse_frame(&chunk));
+                        }
                     }
                 }
             }
@@ -2224,7 +2681,6 @@ fn chat_stream_response(
     };
     sse_response(stream, trace, state.sse_keep_alive())
 }
-// ---------------------------------------------------------------------------------------
 // POST /v1/completions
 // ---------------------------------------------------------------------------------------
 
@@ -2312,6 +2768,10 @@ async fn completions(
     // request (text is the prompt, no tokens are generated, finish_reason is "length").
     let echo = request.echo.unwrap_or(false);
     let vocab_size = state.engine.vocab_size();
+    // S2: the completions schema now carries response_format with the chat refusal rule, and S5's
+    // best_of is accepted as vLLM's documented no-op. logit_bias/min_p follow the chat validation.
+    refuse_unenforceable_response_format(request.response_format.as_ref())?;
+    check_sampling_extensions(request.logit_bias.as_ref(), request.min_p, vocab_size)?;
     let explicit_token_ids = request
         .logprob_token_ids
         .as_ref()
@@ -2457,6 +2917,8 @@ async fn completions(
                 include_usage,
                 trace_id,
                 tools_offered: false,
+                parallel_tool_calls: true,
+                continuous_usage_stats: false,
             },
             logprob_info,
             echo,
@@ -3008,6 +3470,12 @@ fn completions_stream_response(
             add_completion_usage(&mut usage, part_usage);
         }
         usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+        // S6: the buffered body derives the DeepSeek hit/miss pair from the same cached-token
+        // total, so the streaming usage chunk reports them instead of two zeros.
+        usage.prompt_cache_hit_tokens = usage.prompt_tokens_details.cached_tokens;
+        usage.prompt_cache_miss_tokens = usage
+            .prompt_tokens
+            .saturating_sub(usage.prompt_tokens_details.cached_tokens);
         if !stats_parts.is_empty() {
             let parts: Vec<(&DeepSeekSparkRequestStats, &OpenAiUsageWithCache)> = stats_parts
                 .iter()
@@ -3302,7 +3770,31 @@ async fn readyz(State(state): State<AppState>) -> Response {
 }
 
 async fn list_models(State(state): State<AppState>) -> Response {
-    let created = state.now_unix();
+    let card = model_card(&state, state.now_unix());
+    Json(json!({"object": "list", "data": [card]})).into_response()
+}
+
+/// `GET /v1/models/{model}`: one model card, or the OpenAI 404 envelope.
+///
+/// The reference vLLM build answers this route with FastAPI's plain `{"detail":"Not Found"}` 404
+/// (its `models/api_router.py` in that image mounts only the list route), while the OpenAI API
+/// documents the retrieve route; this server implements the documented OpenAI behaviour, which is a
+/// superset of what the reference serves. `owned_by` stays `sparkflash`, the same intentional
+/// divergence the list route carries.
+async fn retrieve_model(
+    State(state): State<AppState>,
+    Path(model): Path<String>,
+) -> Result<Response, ApiError> {
+    // Axum's rest-of-path capture keeps the separating slash.
+    let model = model.trim_start_matches('/');
+    if !model_matches(model, state.model_id()) {
+        return Err(ApiError::model_not_found(model));
+    }
+    Ok(Json(model_card(&state, state.now_unix())).into_response())
+}
+
+/// One `/v1/models` card: shared by the list and retrieve routes so the two cannot drift.
+fn model_card(state: &AppState, created: u64) -> Value {
     // Most of the capability line is the engine's own answer, because a server must not advertise a
     // channel its engine cannot serve: `tools`, `thinking` and the reasoning-effort schema come from
     // `Capabilities`, `tool_choice` rides along with tools, and the schema is published only when
@@ -3335,6 +3827,9 @@ async fn list_models(State(state): State<AppState>) -> Response {
             "/v1/completions",
             "/v1/responses",
             "/v1/messages",
+            "/v1/models/{model}",
+            "/tokenize",
+            "/detokenize",
             "/v1/cluster/stats",
             "/v1/admin/trace",
             "/health",
@@ -3351,31 +3846,125 @@ async fn list_models(State(state): State<AppState>) -> Response {
             "names": ["low", "minimal", "medium", "high", "xhigh", "max"],
         });
     }
-    let body = json!({
-        "object": "list",
-        "data": [{
-            "id": state.model_id(),
-            "object": "model",
-            "created": created,
-            "owned_by": MODEL_OWNED_BY,
-            // vLLM's ModelCard also publishes these four members (root, parent, max_model_len and
-            // an empty permission list); OpenAI clients read `max_model_len` for context, so the
-            // card carries them beside this server's own context_length/max_output_tokens names.
-            "root": state.model_id(),
-            "parent": Value::Null,
-            "max_model_len": max_seq_len(),
-            "permission": json!([]),
-            "context_length": max_seq_len(),
-            "max_output_tokens": MODEL_MAX_OUTPUT_TOKENS,
-            "fabric_mode": state.engine.cluster_stats().fabric_mode,
-            "capabilities": advertised,
-        }],
-    });
-    Json(body).into_response()
+    json!({
+        "id": state.model_id(),
+        "object": "model",
+        "created": created,
+        "owned_by": MODEL_OWNED_BY,
+        // vLLM's ModelCard also publishes these four members (root, parent, max_model_len and
+        // an empty permission list); OpenAI clients read `max_model_len` for context, so the
+        // card carries them beside this server's own context_length/max_output_tokens names.
+        "root": state.model_id(),
+        "parent": Value::Null,
+        "max_model_len": max_seq_len(),
+        "permission": json!([]),
+        "context_length": max_seq_len(),
+        "max_output_tokens": MODEL_MAX_OUTPUT_TOKENS,
+        "fabric_mode": state.engine.cluster_stats().fabric_mode,
+        "capabilities": advertised,
+    })
 }
 
 async fn cluster_stats(State(state): State<AppState>) -> Response {
     Json(state.engine.cluster_stats()).into_response()
+}
+
+/// The tokenizer seam a token-level route needs, or the typed 503 that says why it is absent.
+///
+/// `sparkflash serve` always attaches one; the weight-free router tests (and the synthetic tiny
+/// plan's decode path) do not, so the route has to say that instead of answering from the
+/// Milestone 1 placeholder estimate, which would report ids that are not the checkpoint's.
+fn require_tokenizer(state: &AppState) -> Result<Arc<crate::encoding::TokenizerSeam>, ApiError> {
+    state.tokenizer().cloned().ok_or_else(|| {
+        ApiError::service_unavailable(
+            "this server was started without a tokenizer, so it cannot report checkpoint token ids;              start `sparkflash serve` with a tokenizer attached (the default is              reference/tokenizer.json)",
+        )
+    })
+}
+
+/// `POST /tokenize`: the checkpoint tokenizer's ids for a prompt or a rendered chat request.
+///
+/// Wire shape is the reference server's: `{count, max_model_len, tokens, token_strs}`. vLLM's
+/// request union is `{model, prompt: str}` or `{model, messages: [...]}`; a list prompt is a 400 in
+/// that schema, and when both fields are present the chat form wins (the request model's
+/// `messages` validator runs first). `add_special_tokens` defaults to true - vLLM's default for
+/// this route - and `return_token_strs` selects the per-id string array.
+async fn tokenize(State(state): State<AppState>, body: Bytes) -> Result<Response, ApiError> {
+    let value = parse_json(&body)?;
+    let _model = resolve_model(&state, value.get("model").and_then(Value::as_str))?;
+    let seam = require_tokenizer(&state)?;
+    let add_special_tokens = value
+        .get("add_special_tokens")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let return_token_strs = value
+        .get("return_token_strs")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let tokens = if value
+        .get("messages")
+        .is_some_and(|messages| !messages.is_null())
+    {
+        // The chat form tokenizes the rendered V4.1 template, so the ids are what
+        // /v1/chat/completions would prefill.
+        seam.encode_chat(&value).map_err(tokenizer_seam_error)?
+    } else if let Some(prompt) = value.get("prompt").filter(|prompt| !prompt.is_null()) {
+        let text = prompt.as_str().ok_or_else(|| {
+            ApiError::invalid_request(
+                "`prompt` must be a string; this route accepts one prompt or a `messages` array",
+                Some("prompt".to_owned()),
+                Some("invalid_prompt".to_owned()),
+            )
+        })?;
+        seam.encode_text_with(text, add_special_tokens)
+            .map_err(tokenizer_seam_error)?
+    } else {
+        return Err(ApiError::invalid_request(
+            "the request must carry `prompt` (a string) or `messages` (an array)",
+            None,
+            Some("invalid_request".to_owned()),
+        ));
+    };
+    let count = tokens.len();
+    let token_strs = return_token_strs.then(|| {
+        tokens
+            .iter()
+            .map(|id| seam.token_str(*id).map_or(Value::Null, Value::String))
+            .collect::<Vec<_>>()
+    });
+    Ok(Json(json!({
+        "count": count,
+        "max_model_len": max_seq_len(),
+        "tokens": tokens,
+        "token_strs": token_strs,
+    }))
+    .into_response())
+}
+
+/// `POST /detokenize`: the checkpoint tokenizer's text for a token-id array.
+///
+/// The reference server answers `{prompt: ""}` for ids it cannot map (its tokenizer drops them), so
+/// an undecodable array is rendered as the empty string here too instead of a made-up 4xx.
+async fn detokenize(State(state): State<AppState>, body: Bytes) -> Result<Response, ApiError> {
+    let value = parse_json(&body)?;
+    let _model = resolve_model(&state, value.get("model").and_then(Value::as_str))?;
+    let seam = require_tokenizer(&state)?;
+    let Some(tokens_value) = value.get("tokens") else {
+        return Err(ApiError::invalid_request(
+            "the request must carry `tokens` (an array of token ids)",
+            Some("tokens".to_owned()),
+            Some("invalid_tokens".to_owned()),
+        ));
+    };
+    let tokens: Vec<u32> = serde_json::from_value(tokens_value.clone()).map_err(|_| {
+        ApiError::invalid_request(
+            "`tokens` must be an array of token ids",
+            Some("tokens".to_owned()),
+            Some("invalid_tokens".to_owned()),
+        )
+    })?;
+    let prompt = seam.decode(&tokens).unwrap_or_default();
+    Ok(Json(json!({"prompt": prompt})).into_response())
 }
 
 /// Arms the requested scopes and installs (or clears) the single-request trace filter.

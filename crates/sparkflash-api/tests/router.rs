@@ -3937,3 +3937,590 @@ async fn device_scaffold_falls_back_for_a_text_prompt_completion() {
     assert_eq!(body["choices"][0]["text"], "Hello world");
     assert_eq!(engine_calls.load(Ordering::SeqCst), 1);
 }
+
+// ---------------------------------------------------------------------------------------
+// WS-F: CORS, tool policy, streaming tool calls with logprobs, continuous usage, endpoints
+// ---------------------------------------------------------------------------------------
+
+use sparkflash_api::state::CorsConfig;
+
+/// A preflight request, the shape a browser sends before a cross-origin POST.
+fn cors_preflight(uri: &str, origin: &str) -> Request<Body> {
+    Request::builder()
+        .method("OPTIONS")
+        .uri(uri)
+        .header("origin", origin)
+        .header("access-control-request-method", "POST")
+        .header(
+            "access-control-request-headers",
+            "authorization,content-type",
+        )
+        .body(Body::empty())
+        .expect("request")
+}
+
+fn request_with_origin(uri: &str, body: &Value, origin: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("origin", origin)
+        .body(Body::from(serde_json::to_vec(body).expect("json body")))
+        .expect("request")
+}
+
+fn app_with_key() -> Router {
+    router(
+        AppState::new(Arc::new(engine_with(&["Hello", " world"])))
+            .with_fixed_time(FIXED_TIME)
+            .with_api_key(Some("s3cret".to_owned())),
+    )
+}
+
+#[tokio::test]
+async fn cors_preflight_is_answered_before_the_bearer_middleware() {
+    // The browser preflight carries no Authorization header, so the CORS layer has to answer it
+    // before auth would reject it; the reference vLLM server answers preflight first too.
+    let (status, headers, _) = send(
+        app_with_key(),
+        cors_preflight("/v1/chat/completions", "https://app.example"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preflight is not a 401");
+    assert_eq!(
+        headers
+            .get("access-control-allow-origin")
+            .expect("allow origin"),
+        "*",
+        "the reference server answers access-control-allow-origin: *"
+    );
+    let methods = headers
+        .get("access-control-allow-methods")
+        .expect("allow methods")
+        .to_str()
+        .expect("ascii");
+    assert!(methods.contains("POST"), "POST is allowed: {methods}");
+    let allow_headers = headers
+        .get("access-control-allow-headers")
+        .expect("allow headers")
+        .to_str()
+        .expect("ascii");
+    assert!(
+        allow_headers.to_ascii_lowercase().contains("authorization"),
+        "the explicit list has to name Authorization (the Fetch wildcard does not cover it): {allow_headers}"
+    );
+    assert_eq!(
+        headers.get("access-control-max-age").expect("max age"),
+        "600"
+    );
+
+    // A real cross-origin request without the key still gets the 401 envelope, and the CORS layer
+    // still stamps it so the browser can read the error instead of reporting a network failure.
+    let (status, headers, bytes) = send(
+        app_with_key(),
+        request_with_origin(
+            "/v1/chat/completions",
+            &chat_body("hi"),
+            "https://app.example",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        headers
+            .get("access-control-allow-origin")
+            .expect("allow origin"),
+        "*"
+    );
+    assert_eq!(body_json(&bytes)["error"]["code"], 401);
+}
+
+#[tokio::test]
+async fn a_cors_origin_list_echoes_only_the_allowed_origin() {
+    let app = || {
+        router(
+            AppState::new(Arc::new(engine_with(&["Hello"])))
+                .with_fixed_time(FIXED_TIME)
+                .with_cors(Some(CorsConfig::allow_list(vec![
+                    "https://allowed.example".to_owned(),
+                ]))),
+        )
+    };
+    let (status, headers, _) = send(
+        app(),
+        request_with_origin(
+            "/v1/chat/completions",
+            &chat_body("hi"),
+            "https://allowed.example",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get("access-control-allow-origin")
+            .expect("allow origin"),
+        "https://allowed.example"
+    );
+    let (status, headers, _) = send(
+        app(),
+        request_with_origin(
+            "/v1/chat/completions",
+            &chat_body("hi"),
+            "https://other.example",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the request itself is not refused");
+    assert!(
+        headers.get("access-control-allow-origin").is_none(),
+        "an origin outside the list gets no allow-origin header"
+    );
+}
+
+#[tokio::test]
+async fn cors_can_be_turned_off_for_a_proxy_owned_policy() {
+    let app = router(
+        AppState::new(Arc::new(engine_with(&["Hello"])))
+            .with_fixed_time(FIXED_TIME)
+            .with_cors(None),
+    );
+    let (status, headers, _) = send(
+        app,
+        request_with_origin(
+            "/v1/chat/completions",
+            &chat_body("hi"),
+            "https://app.example",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers.get("access-control-allow-origin").is_none(),
+        "the pre-CORS wire surface has no access-control-* headers"
+    );
+}
+
+/// A two-call DSML answer, one string, for the parallel-tool-call tests.
+fn two_call_dsml() -> String {
+    [
+        "\n\n",
+        "<｜DSML｜ calls>\n",
+        "<｜DSML｜ invoke name=\"first\">\n",
+        "<｜DSML｜ parameter name=\"a\" string=\"true\">x</｜DSML｜ parameter>\n",
+        "</｜DSML｜ invoke>\n",
+        "<｜DSML｜ invoke name=\"second\">\n",
+        "<｜DSML｜ parameter name=\"b\" string=\"false\">true</｜DSML｜ parameter>\n",
+        "</｜DSML｜ invoke>\n",
+        "</｜DSML｜ calls>",
+    ]
+    .concat()
+}
+
+#[tokio::test]
+async fn parallel_tool_calls_false_reports_only_the_first_call_buffered() {
+    let engine = engine_with(&[two_call_dsml().as_str()]);
+    let mut body = tools_body(false);
+    body["parallel_tool_calls"] = json!(false);
+    let (status, _, bytes) = send(
+        app_with(engine),
+        json_request("/v1/chat/completions", &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", body_json(&bytes));
+    let body = body_json(&bytes);
+    let calls = body["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .expect("tool_calls");
+    assert_eq!(
+        calls.len(),
+        1,
+        "the at-most-one contract is enforced at the parser boundary: {body}"
+    );
+    assert_eq!(calls[0]["function"]["name"], "first");
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+}
+
+#[tokio::test]
+async fn parallel_tool_calls_false_reports_only_the_first_call_streamed() {
+    let answer = two_call_dsml();
+    let pieces = chunked(&answer, 5);
+    let mut body = tools_body(true);
+    body["parallel_tool_calls"] = json!(false);
+    let (status, _, bytes) = send(
+        app_with(engine_with(&stream_pieces(&pieces))),
+        json_request("/v1/chat/completions", &body),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let frames = sse_frames(&bytes);
+    let calls = assemble_streamed_calls(&frames);
+    assert_eq!(calls.len(), 1, "only the first call streams: {calls:?}");
+    assert_eq!(calls[0].name, "first");
+    assert_eq!(calls[0].arguments, r#"{"a": "x"}"#);
+    assert_eq!(
+        frames[frames.len() - 1]["choices"][0]["finish_reason"],
+        "tool_calls"
+    );
+}
+
+#[tokio::test]
+async fn tool_choice_none_keeps_the_block_in_the_content() {
+    let engine = engine_with(&[dsml_stream_answer().as_str()]);
+    let mut body = tools_body(false);
+    body["tool_choice"] = json!("none");
+    let (status, _, bytes) = send(
+        app_with(engine),
+        json_request("/v1/chat/completions", &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", body_json(&bytes));
+    let body = body_json(&bytes);
+    assert!(
+        body["choices"][0]["message"]["tool_calls"].is_null(),
+        "tool_choice none never lifts a call: {body}"
+    );
+    let content = body["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("content");
+    assert!(
+        content.contains("DSML"),
+        "the block stays plain content instead of being parsed: {content}"
+    );
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+}
+
+#[tokio::test]
+async fn tool_choice_required_and_named_are_refused_typed() {
+    for choice in [
+        json!("required"),
+        json!({"type": "function", "function": {"name": "get_weather"}}),
+    ] {
+        let mut body = tools_body(false);
+        body["tool_choice"] = choice;
+        let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", body_json(&bytes));
+        let body = body_json(&bytes);
+        let error = &body["error"];
+        assert_eq!(error["param"], "tool_choice");
+        assert_eq!(
+            error["code"], 400,
+            "the wire code is the HTTP status, vLLM's ErrorInfo.code"
+        );
+        assert!(
+            error["message"]
+                .as_str()
+                .expect("message")
+                .contains("forces a tool call"),
+            "the refusal names the reason: {body}"
+        );
+    }
+    let mut body = tools_body(false);
+    body["tool_choice"] = json!("bogus");
+    let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(&bytes)["error"]["param"], "tool_choice");
+    let mut body = tools_body(false);
+    body["tool_choice"] = json!(5);
+    let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(&bytes)["error"]["param"], "tool_choice");
+}
+
+/// A mock whose content pieces are the DSML answer split at character boundaries, with one
+/// scripted logprob per piece - the engine contract the router pairs with each delta.
+fn logprob_dsml_engine(pieces: &[String]) -> MockEngine {
+    let logprobs = pieces
+        .iter()
+        .enumerate()
+        .map(|(index, piece)| {
+            let token_id = u32::try_from(index).expect("small index");
+            TokenLogprob {
+                token_id,
+                token: piece.clone(),
+                logprob: -0.5,
+                rank: Some(1),
+                top: vec![alternative(token_id, piece, -0.5, 1)],
+            }
+        })
+        .collect();
+    MockEngine::new(MODEL)
+        .with_cluster_stats(ClusterStatsSnapshot::default())
+        .with_capabilities(Capabilities::ALL)
+        .content(&stream_pieces(pieces))
+        .with_token_logprobs(logprobs)
+}
+
+#[tokio::test]
+async fn streaming_tool_calls_and_logprobs_share_chunks_like_the_reference() {
+    // Measured on the reference deployment 2026-10-21: with tools offered and logprobs requested,
+    // vLLM parses the DSML block into delta.tool_calls and still reports every generated token's
+    // logprob, including the marker tokens the parser removed from the content.
+    let answer = dsml_stream_answer();
+    let pieces = chunked(&answer, 7);
+    let mut body = tools_body(false);
+    body["logprobs"] = json!(true);
+    body["top_logprobs"] = json!(0);
+    let (status, _, buffered_bytes) = send(
+        app_with(logprob_dsml_engine(&pieces)),
+        json_request("/v1/chat/completions", &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", body_json(&buffered_bytes));
+    let buffered = body_json(&buffered_bytes);
+    let buffered_calls: Vec<(String, String)> = buffered["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .expect("tool_calls")
+        .iter()
+        .map(|call| {
+            (
+                call["function"]["name"].as_str().expect("name").to_owned(),
+                call["function"]["arguments"]
+                    .as_str()
+                    .expect("arguments")
+                    .to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(buffered_calls.len(), 1);
+
+    let mut body = tools_body(true);
+    body["logprobs"] = json!(true);
+    body["top_logprobs"] = json!(0);
+    let (status, _, streamed_bytes) = send(
+        app_with(logprob_dsml_engine(&pieces)),
+        json_request("/v1/chat/completions", &body),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&streamed_bytes)
+    );
+    let frames = sse_frames(&streamed_bytes);
+    let calls = assemble_streamed_calls(&frames);
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| (call.name.clone(), call.arguments.clone()))
+            .collect::<Vec<_>>(),
+        buffered_calls,
+        "the streamed fragments reassemble the buffered answer"
+    );
+    assert_eq!(
+        streamed_content(&frames),
+        buffered["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("buffered content"),
+        "the content before the block still streams as content"
+    );
+    // Every generated token is scored exactly once, across all chunks, including the DSML markers.
+    let mut scored = Vec::new();
+    for frame in &frames {
+        for entry in frame["choices"][0]["logprobs"]["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            scored.push(entry["token"].as_str().expect("token").to_owned());
+        }
+    }
+    assert_eq!(
+        scored, pieces,
+        "one logprob entry per generated token, in order"
+    );
+    assert_eq!(
+        frames[frames.len() - 1]["choices"][0]["finish_reason"],
+        "tool_calls"
+    );
+    assert!(
+        !streamed_content(&frames).contains("DSML"),
+        "the DSML block is never content"
+    );
+}
+
+#[tokio::test]
+async fn continuous_usage_stats_put_the_running_usage_on_every_chunk() {
+    let mut body = chat_body("hi");
+    body["stream"] = json!(true);
+    body["stream_options"] = json!({"include_usage": true, "continuous_usage_stats": true});
+    let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let frames = sse_frames(&bytes);
+    assert!(
+        frames.iter().all(|frame| frame["usage"].is_object()),
+        "every chunk carries usage: {frames:?}"
+    );
+    assert_eq!(frames[0]["usage"]["prompt_tokens"], 8);
+    assert_eq!(frames[0]["usage"]["completion_tokens"], 0);
+    // The choice chunks grow the completion count; the final choices=[] chunk repeats the total.
+    let completions: Vec<u64> = frames
+        .iter()
+        .map(|frame| frame["usage"]["completion_tokens"].as_u64().expect("count"))
+        .collect();
+    assert_eq!(completions.first(), Some(&0));
+    assert_eq!(
+        completions.last(),
+        Some(&2),
+        "the engine's total closes the stream"
+    );
+    assert!(completions.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert_eq!(frames[frames.len() - 1]["usage"]["total_tokens"], 10);
+}
+
+#[tokio::test]
+async fn continuous_usage_stats_without_include_usage_adds_no_usage() {
+    // Measured on the reference deployment: continuous_usage_stats alone is ignored (no usage
+    // block anywhere), so this server does not invent one.
+    let mut body = chat_body("hi");
+    body["stream"] = json!(true);
+    body["stream_options"] = json!({"continuous_usage_stats": true});
+    let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let frames = sse_frames(&bytes);
+    assert!(frames.iter().all(|frame| frame["usage"].is_null()));
+}
+
+#[tokio::test]
+async fn models_retrieve_returns_the_same_card_as_the_list() {
+    let (status, _, listed) = send(app(), get_request("/v1/models")).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = body_json(&listed);
+    let (status, _, card) = send(app(), get_request(&format!("/v1/models/{MODEL}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    let card = body_json(&card);
+    assert_eq!(card["id"], MODEL);
+    assert_eq!(card["object"], "model");
+    assert_eq!(card["max_model_len"], listed["data"][0]["max_model_len"]);
+    assert_eq!(
+        card["capabilities"], listed["data"][0]["capabilities"],
+        "the retrieve route and the list route share one card"
+    );
+    let (status, _, bytes) = send(app(), get_request("/v1/models/no-such-model")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body_json(&bytes)["error"]["param"], "model");
+}
+
+#[tokio::test]
+async fn best_of_is_accepted_as_the_documented_no_op() {
+    // Measured on the reference deployment 2026-10-21: best_of=2 with n absent answers one choice.
+    let (status, _, bytes) = send(
+        app(),
+        json_request(
+            "/v1/completions",
+            &json!({"model": MODEL, "prompt": "hello", "best_of": 2}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", body_json(&bytes));
+    assert_eq!(
+        body_json(&bytes)["choices"]
+            .as_array()
+            .expect("choices")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn completions_response_format_is_refused_like_chat() {
+    let (status, _, bytes) = send(
+        app(),
+        json_request(
+            "/v1/completions",
+            &json!({"model": MODEL, "prompt": "hi", "response_format": {"type": "json_object"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(&bytes)["error"]["param"], "response_format");
+}
+
+#[tokio::test]
+async fn logit_bias_and_min_p_are_validated_then_refused_typed() {
+    // Non-integer key: vLLM's own conversion error text.
+    let mut body = chat_body("hi");
+    body["logit_bias"] = json!({"1.5": 1});
+    let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let error = body_json(&bytes)["error"].clone();
+    assert_eq!(error["param"], "logit_bias");
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("cannot be converted to integer token IDs")
+    );
+
+    let mut body = chat_body("hi");
+    body["logit_bias"] = json!({"7": 200});
+    let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body_json(&bytes)["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("between -100 and 100")
+    );
+
+    let mut body = chat_body("hi");
+    body["logit_bias"] = json!({"7": 1});
+    let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let error = body_json(&bytes)["error"].clone();
+    assert_eq!(error["param"], "logit_bias");
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("logits processor")
+    );
+
+    // The disabled values are no-ops, not refusals.
+    let mut body = chat_body("hi");
+    body["logit_bias"] = json!({});
+    body["min_p"] = json!(0.0);
+    let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::OK, "{}", body_json(&bytes));
+
+    // min_p > 0 needs the candidate filter the seam does not have; out of range is a plain 400.
+    let mut body = chat_body("hi");
+    body["min_p"] = json!(0.5);
+    let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(&bytes)["error"]["param"], "min_p");
+    assert!(
+        body_json(&bytes)["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("candidate filter")
+    );
+    let mut body = chat_body("hi");
+    body["min_p"] = json!(2.0);
+    let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body_json(&bytes)["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("min_p must be between 0 and 1")
+    );
+
+    // The completions schema carries the same validation.
+    let (status, _, bytes) = send(
+        app(),
+        json_request(
+            "/v1/completions",
+            &json!({"model": MODEL, "prompt": "hi", "logit_bias": {"3": -1}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(&bytes)["error"]["param"], "logit_bias");
+}

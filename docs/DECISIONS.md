@@ -60,6 +60,7 @@ records the evidence and the consequence for the build. Research backing is in
 | D50 | Drafter unification: the MTP drafter wins; dspark.rs is demoted to a scheduler-policy model; accepted_prediction_tokens must come from the real acceptance rule | dspark.rs drafts philox-random tokens while forward/mtp.rs computes the real 3-stage draft + Markov argmax chain and serve.rs drops it (`accepted_prediction_tokens: 0`); the MTP path is the draft contract, the random path is scheduler policy only, and a serving surface reporting a DSpark metric without measured acceptance is a defect |
 | D51 | D39 amendments (performance-kernel tolerance rule and Engram residency): bit-exactness applies to the reference arm only; perf kernels keep the native quantisation but may reassociate reductions if each passes a per-kernel tolerance and the D41 suite metrics do not regress; Engram tables stay on disk but hot rows may be cached resident on the device with async prefetch of the next position | Evidence: b68 measured routed MoE at 78% of device time from the one-reducer-per-column serial-K schedule forced by twin-bit-parity; the 4B layer map measured 12 launches + 12 implicit cuCtxSynchronize and 34 alloc/free per ordinary layer at HEAD; the 4A Engram analysis measured +68.2 ms/token (4.8% of the 1407.9 ms lean step; +16-35 ms per Engram layer) and the earlier Engram rule claimed disk is not a bottleneck. This decision is explicitly NOT a response to a failing measurement: the rule-2 change addresses the measured speed blocker, and the rule-4 change follows the measured Engram cost; D39 rules 1 and 3 are unchanged. The brief that asked for this called it D50, but D50 is already the drafter-unification decision, so the amendment is recorded as D51 |
 | D52 | Interim acceptance-criteria relaxation (2026-10-21, Lead on user direction): the decode-mode vLLM recapture and the D41/option-B bar programme are parked; interim acceptance is a measured performance improvement with byte-identical logits/token evidence where the path still has it; no token-accuracy, tok/s or gate claim is made; D39/D49/D50/D51 stay in force; revisit on explicit user request | The decode-recapture window was judged a poor use of four-node time against the remaining performance work; the frozen D41 record (m1y32 7/10) and its oracle/comparator are untouched, so nothing is re-frozen or loosened by this decision |
+| D53 | Speed-track operating rules (2026-10-21, Lead on user direction): one published number (lean decode ms/step on four ranks, posted daily in docs/build/speed-log.csv), milestone gates only (400/150/50/20/11.1), P0-table ranking, CI-proved byte identity (scripts/identity-gate.sh), re-measure only above ~50 ms noise, capped decision/review process, one owner per workstream, risk tolerated when CI catches and revert is fast, WS-A-only for two weeks | The repeated re-measurements recorded in D52 did not move the number; the rules change what earns credit, and docs/RULES-speed.md is the operational copy. Nothing in D39/D49/D50/D51 is relaxed: identity is now machine-checked |
 
 
 The table is an index of the entries below, not a second source of record: each row is a one-line
@@ -2989,3 +2990,44 @@ where the time should go, and the strictness of the gate criteria is not where t
 - Nothing in the D41 files, the old m1y32 record, the annotation, SUPP-001, the oracle or the comparator
   changes.
 
+## D53 - Speed-track operating rules: one number, milestone gates, CI-proved identity, capped process
+
+**Question.** After Phase 1 the team kept producing measurement records, re-measurements of the same
+9-token prompt, decision documents and "no tok/s claim is made" disclaimers while the speed number did
+not move. Which work earns credit on the 90 tok/s track, and how is verification done?
+
+**Decision** (Lead, on direct user direction 2026-10-21). Rules in force; `docs/RULES-speed.md` is the
+one-page operational copy and wins over older process text when they conflict.
+
+1. **One published number**: lean decode ms/step, mean over the four ranks, same frozen argv, posted
+   daily in `docs/build/speed-log.csv` (`scripts/speed-log.sh`). Every merge request states its
+   expected effect on that number before work starts.
+2. **Milestone gates only**: <= 400 ms, then <= 150, <= 50, <= 20, <= 11.1 ms/step. Nothing else is
+   progress on the speed track.
+3. **Rank by the P0 table**: zero-kernel host blocks (`ffn_shared`, `moe_reduce`, `mhc_entry`), the
+   per-launch drains, the `moe_gate_up` host residual. A task that does not touch a top-five row
+   waits.
+4. **CI owns identity**: `scripts/identity-gate.sh --run <window run dir>` is the single command that
+   proves 4/4 rank exit codes, the 9 reference tokens, the dumped logits bin sha and the
+   `evidence_mode` bookkeeping. It runs at the end of every row and as the `identity-gate` CI job. A
+   result CI already proves gets no document, decision number or repeated window run.
+5. **Measure less, batch more**: re-run only when the expected step change exceeds the run-to-run
+   noise (~50 ms at today's 843 ms step); otherwise batch the changes and measure once.
+6. **Cap the process**: decision records only for hard-to-reverse choices (at most ~1/week, status one
+   line); investigations time-boxed to two days then ship or drop; measured-but-unwired kernels are
+   inventory (wire or delete); no new host/CPU twins of device paths.
+7. **Unblock**: the RDMA admin items (MTU, `peermem`) are escalated to root this week; each person
+   owns one workstream (WS-A..WS-G) with an explicit exit gate.
+8. **Review question**: what did this move (ms/step, TTFT, open API gaps), and what is the next
+   biggest bar plus its owner? "Nothing, but it is confirmed" is rejected.
+9. **Risk**: a short-lived regression caught by the identity gate and reverted fast beats slow proof.
+10. **Focus**: for the next two weeks the speed team works only on WS-A - move the host blocks onto
+    the device and remove the per-launch drains and the 12 D2H observation points; WS-C/D/E/F/G stay
+    parked until the lean step is below 400 ms.
+
+**Consequence.** D52's "no tok/s claim" posture is superseded for the speed track: the claim is now the
+single measured ms/step, restated daily, and it may only move by a merge whose row passed
+`identity-gate.sh`. The 842.70 ms measurement (m2p1b-lean, f5191109) is the number the next work is
+measured against; the parked tasks are WS-C graphs, WS-D kernel audit, WS-E MTP device work, WS-F
+prefill/serving and WS-G parity. Nothing in D39/D49/D50/D51 is relaxed: byte identity is now
+machine-checked rather than document-checked.

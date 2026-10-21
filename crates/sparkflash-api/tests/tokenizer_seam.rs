@@ -456,6 +456,180 @@ async fn chat_unsupported_effort_is_a_400_with_the_vllm_text() {
     assert_eq!(body["error"]["code"], 400);
 }
 
+// ---------------------------------------------------------------------------------------
+// WS-F: /tokenize and /detokenize
+// ---------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tokenize_returns_the_checkpoint_tokenizers_ids() {
+    let seam = seam();
+    let text = "Hello world";
+    let expected = seam
+        .encode_text(text)
+        .expect("the vendored tokenizer encodes");
+    assert!(!expected.is_empty());
+    let (status, body) = post(
+        app_with_seam(),
+        "/tokenize",
+        json!({"model": MODEL, "prompt": text}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["count"], expected.len());
+    assert_eq!(ids(&body["tokens"]), expected);
+    assert!(
+        body["max_model_len"].as_u64().expect("a max length") > 0,
+        "the route reports the server's context window: {body}"
+    );
+    assert!(
+        body["token_strs"].is_null(),
+        "vLLM returns token_strs: null unless the caller asks: {body}"
+    );
+}
+
+#[tokio::test]
+async fn tokenize_can_return_the_token_strings() {
+    let seam = seam();
+    let (status, body) = post(
+        app_with_seam(),
+        "/tokenize",
+        json!({"model": MODEL, "prompt": "Hello world", "return_token_strs": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tokens = ids(&body["tokens"]);
+    let strings = body["token_strs"].as_array().expect("a string array");
+    assert_eq!(strings.len(), tokens.len());
+    for (id, text) in tokens.iter().zip(strings) {
+        assert_eq!(
+            text.as_str().expect("a string"),
+            seam.token_str(*id).expect("every id maps to a token"),
+            "token_strs is the tokenizer's own detokenization of each id"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tokenize_accepts_the_chat_messages_form() {
+    let seam = seam();
+    let messages = json!([{"role": "user", "content": "Hello world"}]);
+    let expected = seam
+        .encode_chat(&json!({"messages": messages}))
+        .expect("the chat template renders");
+    assert!(
+        expected.len() > 2,
+        "the template adds markers: {expected:?}"
+    );
+    let (status, body) = post(
+        app_with_seam(),
+        "/tokenize",
+        json!({"model": MODEL, "messages": messages}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(ids(&body["tokens"]), expected);
+}
+
+#[tokio::test]
+async fn tokenize_add_special_tokens_is_honoured() {
+    let seam = seam();
+    let text = "Hello world";
+    let with = seam
+        .encode_text_with(text, true)
+        .expect("the vendored tokenizer encodes");
+    let without = seam
+        .encode_text_with(text, false)
+        .expect("the vendored tokenizer encodes");
+    let (status, body) = post(
+        app_with_seam(),
+        "/tokenize",
+        json!({"model": MODEL, "prompt": text, "add_special_tokens": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(ids(&body["tokens"]), without);
+    assert_eq!(
+        seam.encode_text(text).expect("the route's default encodes"),
+        with,
+        "the route's default is add_special_tokens: true"
+    );
+}
+
+#[tokio::test]
+async fn tokenize_refuses_a_list_prompt_like_the_reference() {
+    // Measured on the reference deployment 2026-10-21: a list prompt is a 400.
+    let (status, body) = post(
+        app_with_seam(),
+        "/tokenize",
+        json!({"model": MODEL, "prompt": ["a", "b"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["param"], "prompt");
+}
+
+#[tokio::test]
+async fn tokenize_needs_a_prompt_or_messages() {
+    let (status, body) = post(app_with_seam(), "/tokenize", json!({"model": MODEL})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn tokenize_without_a_checkpoint_tokenizer_is_a_typed_503() {
+    let (status, body) = post(
+        app_without_seam(),
+        "/tokenize",
+        json!({"model": MODEL, "prompt": "hi"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let (status, body) = post(
+        app_without_seam(),
+        "/detokenize",
+        json!({"model": MODEL, "tokens": [1, 2]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+}
+
+#[tokio::test]
+async fn detokenize_round_trips_a_generated_prompt() {
+    let seam = seam();
+    let text = "Hello world";
+    let tokens = seam
+        .encode_text(text)
+        .expect("the vendored tokenizer encodes");
+    let (status, body) = post(
+        app_with_seam(),
+        "/detokenize",
+        json!({"model": MODEL, "tokens": tokens}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["prompt"], text);
+}
+
+#[tokio::test]
+async fn detokenize_renders_an_unmappable_id_as_the_empty_string() {
+    // Measured on the reference deployment: an out-of-vocabulary id answers 200 with {prompt: ""}.
+    let (status, body) = post(
+        app_with_seam(),
+        "/detokenize",
+        json!({"model": MODEL, "tokens": [999_999_999]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["prompt"], "");
+    let (status, body) = post(
+        app_with_seam(),
+        "/detokenize",
+        json!({"model": MODEL, "tokens": "nope"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["param"], "tokens");
+}
+
 fn app_without_seam() -> Router {
     let engine = MockEngine::new(MODEL)
         .with_cluster_stats(ClusterStatsSnapshot::default())
