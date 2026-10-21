@@ -46,6 +46,7 @@
 //!   serves whole tensors keeps the whole-table read under the element limit, which is what turns a
 //!   released-size table into an explicit refusal there.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::{ConfigError, ModelConfig};
@@ -557,6 +558,10 @@ fn read_paged_table(
     Some(Ok((table, slot_of)))
 }
 
+/// The Engram wkv codes and their scale grid: borrowed when the source already holds them, owned
+/// when it had to read them.
+type Fp8Blocks<'s> = (Cow<'s, [u8]>, Cow<'s, [u8]>);
+
 /// Reads a dense fp8 weight and applies its 32x32 E8M0 grid.
 ///
 /// # Errors
@@ -573,13 +578,13 @@ fn read_paged_table(
 /// [EngineError::TooLarge] when the logical element count is above limit, [EngineError::Missing]
 /// when the source does not hold the tensors, and [EngineError::Shape] when either tensor is not the
 /// checkpoint's dtype or length.
-fn read_fp8_blocks(
+fn read_fp8_blocks<'s>(
     name: &str,
-    src: &dyn WeightSource,
+    src: &'s dyn WeightSource,
     rows: usize,
     cols: usize,
     limit: usize,
-) -> Result<(Vec<u8>, Vec<u8>), EngineError> {
+) -> Result<Fp8Blocks<'s>, EngineError> {
     if rows * cols > limit {
         return Err(EngineError::TooLarge {
             name: name.to_owned(),
@@ -610,7 +615,14 @@ fn read_fp8_blocks(
             ),
         });
     }
-    let codes = src.read(name)?;
+    // Prefer a borrow: the Engram wkv matrix is a constant 157 MB per layer and the forward loop
+    // reads it once per layer-position. A source that holds it resident (the device loop's overlay)
+    // hands out the bytes it already has; a source that cannot borrow keeps the copy, and both give
+    // the matmul the same bytes, so no arithmetic below changes.
+    let codes = match src.read_view(name)? {
+        Some(bytes) => Cow::Borrowed(bytes),
+        None => Cow::Owned(src.read(name)?),
+    };
     if codes.len() != rows * cols {
         return Err(EngineError::Shape {
             what: name.to_owned(),
@@ -620,7 +632,10 @@ fn read_fp8_blocks(
             ),
         });
     }
-    let scales = src.read(&scale_name)?;
+    let scales = match src.read_view(&scale_name)? {
+        Some(bytes) => Cow::Borrowed(bytes),
+        None => Cow::Owned(src.read(&scale_name)?),
+    };
     if scales.len() != scale_rows * scale_cols {
         return Err(EngineError::Shape {
             what: scale_name,
@@ -898,8 +913,8 @@ pub fn engram_forward(
             &mut kv,
             &act_codes,
             &act_scales,
-            &wkv_codes,
-            &wkv_scales,
+            wkv_codes.as_ref(),
+            wkv_scales.as_ref(),
             out_width,
             fetched_width,
         )?;
@@ -1052,6 +1067,11 @@ mod tests {
                 .insert(name.to_owned(), (DType::F8E8M0, shape.to_vec(), bytes));
             self
         }
+
+        /// The bytes as a borrow, for a source that already holds them.
+        fn view(&self, name: &str) -> Option<&[u8]> {
+            self.held.get(name).map(|(_, _, data)| data.as_slice())
+        }
     }
 
     impl WeightSource for Hand {
@@ -1079,6 +1099,63 @@ mod tests {
                 .ok_or_else(|| WeightError::Missing {
                     name: name.to_owned(),
                 })
+        }
+    }
+
+    /// A [WeightSource] that can hand the Engram wkv matrices out as a borrow, and counts the copies
+    /// it is asked for instead - the device loop's overlay source, in test form.
+    struct Viewfinder<'a> {
+        inner: &'a Hand,
+        served: Vec<String>,
+        copies: std::sync::atomic::AtomicUsize,
+        borrows: std::sync::atomic::AtomicUsize,
+    }
+
+    impl<'a> Viewfinder<'a> {
+        fn over(inner: &'a Hand, cfg: &ModelConfig) -> Self {
+            let served = cfg
+                .engram_layer_ids
+                .iter()
+                .flat_map(|layer| {
+                    [
+                        format!("layers.{layer}.engram.wkv.weight"),
+                        format!("layers.{layer}.engram.wkv.scale"),
+                    ]
+                })
+                .collect();
+            Self {
+                inner,
+                served,
+                copies: std::sync::atomic::AtomicUsize::new(0),
+                borrows: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl WeightSource for Viewfinder<'_> {
+        fn names(&self) -> Vec<String> {
+            self.inner.names()
+        }
+
+        fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
+            self.inner.spec(name)
+        }
+
+        fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+            if self.served.iter().any(|served| served == name) {
+                self.copies
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.read(name)
+        }
+
+        fn read_view(&self, name: &str) -> Result<Option<&[u8]>, WeightError> {
+            if !self.served.iter().any(|served| served == name) {
+                return Ok(None);
+            }
+            self.borrows
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.inner.view(name))
         }
     }
 
@@ -1436,6 +1513,47 @@ mod tests {
             .expect("the same position again");
         assert_eq!(first, second);
         assert_ne!(first, vec![0.5f32; cfg.hc_width()]);
+    }
+
+    /// The wkv matrix is borrowed, not copied, when the source already holds it, and the write is
+    /// byte-identical either way: the read path may not change a value.
+    #[test]
+    fn a_borrowed_wkv_matrix_writes_the_same_bits_as_a_copied_one() {
+        let cfg = test_config();
+        let source = engram_source(&cfg, |row, column| {
+            (((row * 13 + column * 7) % 17) as f32) * 0.03125 - 0.25
+        });
+        let viewfinder = Viewfinder::over(&source, &cfg);
+        let hashes = [1u32, 1];
+        let mut copied = vec![0.375f32; cfg.hc_width()];
+        let mut borrowed = copied.clone();
+        engram_forward(&cfg, 1, &mut copied, &hashes, &source, BIG).expect("the copying source");
+        engram_forward(&cfg, 1, &mut borrowed, &hashes, &viewfinder, BIG)
+            .expect("the borrowing source");
+        assert_eq!(
+            viewfinder.copies.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the resident wkv matrix was copied through read"
+        );
+        assert_eq!(
+            viewfinder
+                .borrows
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the layer's codes and its scale grid are each borrowed once"
+        );
+        assert_ne!(
+            copied,
+            vec![0.375f32; cfg.hc_width()],
+            "the write did something"
+        );
+        for (index, (one, other)) in copied.iter().zip(borrowed.iter()).enumerate() {
+            assert_eq!(
+                one.to_bits(),
+                other.to_bits(),
+                "value {index} differs between the copied and the borrowed read path"
+            );
+        }
     }
 
     /// The position-major seam the four-rank loop runs must be the engine's chunk path, bit for bit.

@@ -23,6 +23,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+#[cfg(any(feature = "cuda", test))]
+use sparkflash_device::resident::OperandLayout;
 use sparkflash_device::resident::{
     CHAIN_LAYERS, HeaderEntry, MTP_LAYERS, ReadEvidence, ResidentPlan,
 };
@@ -88,6 +90,88 @@ pub(crate) fn setup_for_chain(
     Ok((setup, args.source))
 }
 
+/// The plan's by-name lookups, built once from the plan record.
+///
+/// [ResidentPlan::shards] is one flat vector of every planned tensor: on the released checkpoint it
+/// is the attention/tail sets plus 40 layers x 384 routed experts x 3 matrices x the weight and its
+/// scale, so a name lookup there is a linear scan across six figures of entries.
+/// [ResidentPlan::operand_layout] and the shard-shape lookup are exactly such scans, and the layer
+/// path used to ask for dozens of them per layer position (the attention projections, the query and
+/// output projections, the shared-expert geometry and two per routed expert). The index is built
+/// once at bind time from that same record and answers by name; a hit is a hash lookup, a miss is
+/// the same refusal the scan gave.
+///
+/// The key is the plan's own tensor name - the identifier that is stable across layers, positions
+/// and ranks. Nothing here is keyed on a pointer, an index or an arena address, so the index cannot
+/// go stale while the plan it was built from is the plan the bind was made from; a run that plans
+/// different shapes builds a different index.
+#[cfg(any(feature = "cuda", test))]
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PlanIndex {
+    entries: std::collections::HashMap<String, PlannedTensor>,
+}
+
+/// One planned tensor's per-rank geometry, as the plan record carries it.
+#[cfg(any(feature = "cuda", test))]
+#[derive(Debug, Clone)]
+struct PlannedTensor {
+    /// This rank's slice shape.
+    shard_shape: Vec<usize>,
+    /// The device operand layout the plan assigns this tensor.
+    layout: OperandLayout,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl PlanIndex {
+    /// Indexes every shard of one rank plan by tensor name.
+    #[must_use]
+    pub(crate) fn from_plan(plan: &ResidentPlan) -> Self {
+        let shards = plan.shards();
+        let mut entries = std::collections::HashMap::with_capacity(shards.len());
+        for shard in shards {
+            entries.insert(
+                shard.name.clone(),
+                PlannedTensor {
+                    shard_shape: shard.shard_shape.clone(),
+                    layout: shard.operand_layout(),
+                },
+            );
+        }
+        Self { entries }
+    }
+
+    /// This rank's shard shape of one tensor, or `None` when the plan does not carry the name.
+    #[must_use]
+    pub(crate) fn shard_shape(&self, name: &str) -> Option<&[usize]> {
+        self.entries
+            .get(name)
+            .map(|tensor| tensor.shard_shape.as_slice())
+    }
+
+    /// The device operand layout of one tensor, or `None` when the plan does not carry the name.
+    #[must_use]
+    pub(crate) fn operand_layout(&self, name: &str) -> Option<OperandLayout> {
+        self.entries.get(name).map(|tensor| tensor.layout.clone())
+    }
+
+    /// The B12x `(cols, inner)` geometry of one weight, with the same refusal a plan scan gives.
+    ///
+    /// # Errors
+    /// The tensor is planned as a stored operand, or the plan does not carry the name.
+    pub(crate) fn b12x_geometry(&self, name: &str) -> Result<(usize, usize), String> {
+        match self.operand_layout(name) {
+            Some(OperandLayout::B12x { cols, inner, .. }) => Ok((cols, inner)),
+            Some(other) => Err(format!(
+                "layer-0 query path: {name} is planned as {}; a B12x operand is required",
+                other.as_str()
+            )),
+            None => Err(format!(
+                "layer-0 query path: the rank plan does not carry {name}"
+            )),
+        }
+    }
+}
+
 /// The full device-set bind one rank performs inside its arena: attention projections, routed and
 /// shared experts, routers, and the tail, plus the census that accounts for every resident shard.
 ///
@@ -107,6 +191,10 @@ pub(crate) struct DeviceBind {
     pub census: crate::resident_weights::PlanCensus,
     /// Every checked name as "class<TAB>set<TAB>name", for the per-rank names manifest.
     pub manifest_lines: Vec<String>,
+    /// The plan's by-name geometry lookups, so the layer path never scans the shard vector.
+    /// Read only by the device layer path (`cuda`), but built for every bind so the two agree.
+    #[cfg(feature = "cuda")]
+    pub plan_index: PlanIndex,
 }
 
 impl DeviceBind {
@@ -347,6 +435,8 @@ fn bind_in_arena(
         tail_coverage,
         census,
         manifest_lines,
+        #[cfg(feature = "cuda")]
+        plan_index: PlanIndex::from_plan(&setup.plan),
     })
 }
 
@@ -1635,5 +1725,88 @@ mod tests {
         ])
         .expect_err("an unknown tensor name");
         assert!(error.contains("resident plan knows"), "{error}");
+    }
+
+    // The layer path no longer scans the plan's shard vector for a name: it asks the index the bind
+    // built once. The index must answer exactly what the plan's own scans answer - same shard shape,
+    // same operand layout - for every planned tensor, refuse a name the plan does not carry, and
+    // follow the plan it was built from (same names, different shapes -> different answers).
+    #[test]
+    fn the_plan_index_answers_like_the_plan_scans_and_follows_its_plan() {
+        use sparkflash_device::resident::{HeaderEntry, OperandLayout, ResidentPlan};
+        let plan_of = |wq_a: [usize; 2]| {
+            ResidentPlan::plan(
+                0,
+                4,
+                vec![
+                    HeaderEntry::new(
+                        "layers.0.attn.wq_a.weight".to_string(),
+                        "F8_E4M3",
+                        wq_a.to_vec(),
+                    ),
+                    HeaderEntry::new(
+                        "layers.0.attn.wq_a.scale".to_string(),
+                        "F8_E8M0",
+                        vec![wq_a[0] / 32, wq_a[1] / 32],
+                    ),
+                    HeaderEntry::new(
+                        "layers.0.ffn.gate.weight".to_string(),
+                        "BF16",
+                        vec![512, 5120],
+                    ),
+                ],
+            )
+            .expect("plan")
+        };
+        let plan = plan_of([1280, 5120]);
+        let index = PlanIndex::from_plan(&plan);
+        for shard in plan.shards() {
+            assert_eq!(
+                index.shard_shape(&shard.name),
+                Some(shard.shard_shape.as_slice()),
+                "{} shape",
+                shard.name
+            );
+            assert_eq!(
+                index.operand_layout(&shard.name),
+                plan.operand_layout(&shard.name),
+                "{} layout",
+                shard.name
+            );
+        }
+        // The B12x pair answers the same geometry the plan record carries; the BF16 gate is planned
+        // as stored bytes and the index refuses it with the plan's own wording; a name the plan does
+        // not carry is refused by name rather than guessed.
+        assert!(matches!(
+            index.operand_layout("layers.0.attn.wq_a.weight"),
+            Some(OperandLayout::B12x { .. })
+        ));
+        let wq_a_shard = plan
+            .shards()
+            .iter()
+            .find(|shard| shard.name == "layers.0.attn.wq_a.weight")
+            .expect("wq_a shard");
+        assert_eq!(
+            index
+                .b12x_geometry("layers.0.attn.wq_a.weight")
+                .expect("b12x geometry"),
+            (wq_a_shard.shard_shape[0], wq_a_shard.shard_shape[1])
+        );
+        let stored = index
+            .b12x_geometry("layers.0.ffn.gate.weight")
+            .expect_err("the BF16 gate is a stored operand");
+        assert!(stored.contains("a B12x operand is required"), "{stored}");
+        let missing = index
+            .b12x_geometry("layers.0.nope.weight")
+            .expect_err("an unplanned name");
+        assert!(missing.contains("does not carry"), "{missing}");
+        assert_eq!(index.shard_shape("layers.0.nope.weight"), None);
+        // The same names on a different plan answer with that plan's shapes: the index holds the
+        // plan record it was built from, never a remembered geometry.
+        let other = PlanIndex::from_plan(&plan_of([640, 2560]));
+        assert_ne!(
+            other.shard_shape("layers.0.attn.wq_a.weight"),
+            index.shard_shape("layers.0.attn.wq_a.weight")
+        );
     }
 }

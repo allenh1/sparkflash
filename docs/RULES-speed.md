@@ -12,12 +12,28 @@ number did not move. If a rule here conflicts with an older document's process, 
 * Every merge request states its **expected effect on ms/step before work starts**. A change with no
   expected effect on the metric is not speed work.
 
-Current: **842.70 ms** (m2p1b-lean, 2026-10-21, commit f5191109). Baseline before WS-A: 1201.81 ms.
+Current: **599.94 ms** (wsa2d-lean, 2026-10-21, batch tip 4e4cea50). Before WS-A: 1201.81 ms. Rows and dates live in [speed-log.csv](build/speed-log.csv); that table is the record, not a document.
 
 ## 2. Milestone gates are the only progress
 
 **<= 400 ms -> <= 150 -> <= 50 -> <= 20 -> <= 11.1**. Anything else (a doc, a record, an unwired
 kernel, a re-run that confirms the same number) is not progress.
+
+## 2b. Batch windows; one row must answer a gate decision
+
+A row is a fresh four-rank process: it pays the full checkpoint upload before the first decode step
+(~6-7 min on four GB10s) whether it runs 9 steps or 90. Nine rows of that is an hour of cluster time
+for 81 measured steps. So:
+
+- Batch slices into one window. A window is justified when the accumulated expected movement is
+  above the ~50 ms noise floor, or when a numerics-affecting slice needs its byte-identity row.
+  Never run one window per slice.
+- Do not file a row whose answer is already known from CI (identity gate, counter assertions) or
+  from construction. A row exists to decide something.
+- The probe row is for picking the next slice, not for reporting a delta. Run it when the block
+  table is stale, not once per merge.
+- Every row lands as one line in [speed-log.csv](build/speed-log.csv). No per-row documents.
+- Batch merge requests the same way: one branch, one pipeline, one merge for a group of slices.
 
 ## 3. Rank work by the P0 table
 

@@ -224,6 +224,41 @@ pub fn matmul(
     cols: usize,
     batch: usize,
 ) -> Result<(), EngineError> {
+    matmul_checked(out, x, w, rows, cols, batch, false)
+}
+
+/// [matmul] with the output-row split forced on, for a caller that knows its matvec is the block's
+/// wall clock even though it sits under [matmul]'s four-million-product gate.
+///
+/// The compressor seam is that caller: it multiplies one query by two `[512 x 5120]` weights per
+/// position, 2.6M products each, and a serial pass over the pair is the whole ref_seam block. The
+/// split is [matmul]'s own - over output rows - so every output keeps its serial ascending-column
+/// reduction and the values are bit-identical to [matmul] at any thread count.
+///
+/// # Errors
+///
+/// As [matmul].
+pub(crate) fn matmul_hot_rows(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    batch: usize,
+) -> Result<(), EngineError> {
+    matmul_checked(out, x, w, rows, cols, batch, true)
+}
+
+/// [matmul]'s body, with the row split's threshold overridable.
+fn matmul_checked(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    batch: usize,
+    force_row_split: bool,
+) -> Result<(), EngineError> {
     let geometry = format!("{batch}x{cols} by {rows}x{cols}");
     if x.len() < batch * cols || w.len() < rows * cols || out.len() < batch * rows {
         return Err(EngineError::Shape {
@@ -247,7 +282,7 @@ pub fn matmul(
     // former extra "batch one and rows under 16_384" arm was the only reason the 5k-8k-row
     // attention and expert GEMVs ran serially; the row split is bit-identical, so it is retired.
     const PARALLEL_MATMUL_MIN_MULTIPLIES: u128 = 4_000_000;
-    if multiplies < PARALLEL_MATMUL_MIN_MULTIPLIES {
+    if !force_row_split && multiplies < PARALLEL_MATMUL_MIN_MULTIPLIES {
         for b in 0..batch {
             let xb = &x[b * cols..b * cols + cols];
             let ob = &mut out[b * rows..b * rows + rows];

@@ -1405,6 +1405,18 @@ pub fn enable_forward_evidence_from_env() -> bool {
     ))
 }
 
+/// Whether a per-layer device readback exists only to feed the layer-chain evidence record.
+///
+/// C10 records the layer-chain entry (and every digest that feeds it) only in evidence mode, so a
+/// default or `--forward-lean` run has no consumer for these bytes. The reads are skipped rather
+/// than issued and dropped: every `cuMemcpyDtoH` is a stream-ordered drain, so an unread copy is a
+/// sync point that puts the host seam behind the layer's device launches for nothing.
+#[must_use]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn layer_evidence_readbacks() -> bool {
+    evidence_record_enabled()
+}
+
 /// The number of evidence digests actually taken on this thread (test hook).
 #[cfg(test)]
 #[must_use]
@@ -3081,13 +3093,12 @@ fn run_layer_query_path(
     let (activation_codes, activation_scales) =
         quantise_native_activation(&activation_values, "layer-0 query path")?;
 
-    let plan = request.resident_plan.ok_or_else(|| {
-        "layer-0 query path: the loop was built without the rank plan".to_string()
-    })?;
-    let (wq_b_cols, wq_b_inner) =
-        planned_b12x_geometry(plan, &format!("layers.{layer}.attn.wq_b.weight"))?;
-    let (wq_a_cols, wq_a_inner) =
-        planned_b12x_geometry(plan, &format!("layers.{layer}.attn.wq_a.weight"))?;
+    let (wq_b_cols, wq_b_inner) = bind
+        .plan_index
+        .b12x_geometry(&format!("layers.{layer}.attn.wq_b.weight"))?;
+    let (wq_a_cols, wq_a_inner) = bind
+        .plan_index
+        .b12x_geometry(&format!("layers.{layer}.attn.wq_a.weight"))?;
     if (wq_a_cols, wq_a_inner) != (rank_width, HIDDEN) {
         return Err(format!(
             "layer-0 query path: the plan's wq_a geometry is {wq_a_cols}x{wq_a_inner}, the model config says {rank_width}x{HIDDEN}"
@@ -3379,9 +3390,6 @@ fn run_layer_attention_output(
     let config = request.config.ok_or_else(|| {
         "layer-0 attention output: the loop was built without the model config".to_string()
     })?;
-    let plan = request.resident_plan.ok_or_else(|| {
-        "layer-0 attention output: the loop was built without the rank plan".to_string()
-    })?;
     let world = request.world;
     if world == 0 || !config.o_groups.is_multiple_of(world) {
         return Err(format!(
@@ -3414,7 +3422,9 @@ fn run_layer_attention_output(
             groups * group_inner * 2
         ));
     }
-    let wo_a_geometry = planned_b12x_geometry(plan, &format!("layers.{layer}.attn.wo_a.weight"))?;
+    let wo_a_geometry = bind
+        .plan_index
+        .b12x_geometry(&format!("layers.{layer}.attn.wo_a.weight"))?;
     if wo_a_geometry != (groups * o_lora_rank, group_inner) {
         return Err(format!(
             "layer-0 attention output: the plan's wo_a is {wo_a_geometry:?}, the per-rank launch expects {:?} (world {world}, o_groups {} -> {groups} groups/rank, heads_per_rank {heads}, head_width {}, group_inner {group_inner}, o_lora_rank {o_lora_rank})",
@@ -3424,7 +3434,9 @@ fn run_layer_attention_output(
             heads = body.heads_per_rank
         ));
     }
-    let wo_b_geometry = planned_b12x_geometry(plan, &format!("layers.{layer}.attn.wo_b.weight"))?;
+    let wo_b_geometry = bind
+        .plan_index
+        .b12x_geometry(&format!("layers.{layer}.attn.wo_b.weight"))?;
     let wo_b_inner = groups * o_lora_rank;
     if wo_b_geometry != (HIDDEN, wo_b_inner) {
         return Err(format!(
@@ -4014,21 +4026,22 @@ pub struct Layer0MoeRouted {
     pub pins: Vec<(String, usize, String)>,
     /// Router ids in row order (slot indices into the sorted unique selection).
     pub router_ids: Vec<u32>,
-    /// The router's normalised weights including routed_scaling_factor.
+    /// The router's normalised weights including routed_scaling_factor (evidence record only; empty
+    /// when the evidence chain is off).
     pub router_weights: Vec<f32>,
-    /// The router's full score vectors.
+    /// The router's full score vectors (evidence record only; empty when the evidence chain is off).
     pub router_scores: Vec<f32>,
     /// The sorted unique global expert ids.
     pub slot_ids: Vec<u32>,
     /// The router stage-two ids (global), for the record.
     pub global_ids: Vec<u32>,
-    /// The gate projection output (BF16 bytes).
+    /// The gate projection output (BF16 bytes; evidence record only, empty when evidence is off).
     pub gate_raw: Vec<u8>,
-    /// The up projection output (BF16 bytes).
+    /// The up projection output (BF16 bytes; evidence record only, empty when evidence is off).
     pub up_raw: Vec<u8>,
-    /// The weighted SWiGLU MXFP8 codes.
+    /// The weighted SWiGLU MXFP8 codes (evidence record only, empty when evidence is off).
     pub swiglu_codes: Vec<u8>,
-    /// The weighted SWiGLU ue8m0 scales.
+    /// The weighted SWiGLU ue8m0 scales (evidence record only, empty when evidence is off).
     pub swiglu_scales: Vec<u8>,
     /// The stored-combine rank accumulator (f32 values).
     pub slot_acc: Vec<f32>,
@@ -4164,27 +4177,13 @@ impl Layer0MoeRouted {
     }
 }
 
-/// The planned shard shape of one tensor, or None when the plan does not carry it.
-#[cfg(feature = "cuda")]
-fn planned_shard_shape(
-    plan: Option<&sparkflash_device::resident::ResidentPlan>,
-    name: &str,
-) -> Option<Vec<usize>> {
-    plan.and_then(|plan| {
-        plan.shards()
-            .iter()
-            .find(|shard| shard.name == name)
-            .map(|shard| shard.shard_shape.clone())
-    })
-}
-
 /// The per-rank slice base pointers of one routed-expert matrix, accepting either the plan's sharded
 /// slice shape or the released full shape (in which case the rank's slice offset is added).
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn routed_slice_base(
     bind: &crate::resident_weights::MoeBind,
-    plan: Option<&sparkflash_device::resident::ResidentPlan>,
+    plan_index: &crate::tp4_resident::PlanIndex,
     layer: usize,
     expert: usize,
     matrix: crate::resident_weights::Matrix,
@@ -4199,9 +4198,11 @@ fn routed_slice_base(
     let scale_name = format!("layers.{layer}.ffn.experts.{expert}.{leaf}.scale");
     let slice_values = slice_shape[0] * slice_shape[1];
     let scale_slice = slice_shape[0] * (slice_shape[1] / 16);
-    let weight_shape = planned_shard_shape(plan, &weight_name)
+    let weight_shape = plan_index
+        .shard_shape(&weight_name)
         .ok_or_else(|| format!("MoE: the rank plan does not carry {weight_name}"))?;
-    let scale_shape = planned_shard_shape(plan, &scale_name)
+    let scale_shape = plan_index
+        .shard_shape(&scale_name)
         .ok_or_else(|| format!("MoE: the rank plan does not carry {scale_name}"))?;
     let weight_values = weight_shape.iter().product::<usize>();
     let weight = if weight_values == slice_values {
@@ -4261,7 +4262,6 @@ fn run_layer_moe_routed(
     let config = request
         .config
         .ok_or_else(|| "MoE: the loop was built without the model config".to_string())?;
-    let plan = request.resident_plan;
     let world = request.world;
     let rank = request.rank;
     let tokens = 1usize;
@@ -4380,17 +4380,24 @@ fn run_layer_moe_routed(
             .iter()
             .map(|chunk| u32::from_le_bytes(*chunk))
             .collect();
-        let mut weights_raw = vec![0u8; routed_rows * 4];
-        cuda.copy_dtoh(&mut weights_raw, &weights)
-            .map_err(|error| format!("MoE: router weights dtoh: {error}"))?;
-        let router_weights = f32_from_le_bytes(&weights_raw)?;
-        let mut scores_raw = vec![0u8; tokens * experts * 4];
-        cuda.copy_dtoh(&mut scores_raw, &scores)
-            .map_err(|error| format!("MoE: router scores dtoh: {error}"))?;
-        let router_scores = f32_from_le_bytes(&scores_raw)?;
-        if router_scores.iter().any(|value| !value.is_finite()) {
-            return Err("MoE: the router wrote a non-finite score".to_string());
-        }
+        // The score row and the weight row are read back only for the evidence record; the launches
+        // consume the device buffers in place, and the numeric host path needs the ids alone.
+        let (router_weights, router_scores) = if layer_evidence_readbacks() {
+            let mut weights_raw = vec![0u8; routed_rows * 4];
+            cuda.copy_dtoh(&mut weights_raw, &weights)
+                .map_err(|error| format!("MoE: router weights dtoh: {error}"))?;
+            let mut scores_raw = vec![0u8; tokens * experts * 4];
+            cuda.copy_dtoh(&mut scores_raw, &scores)
+                .map_err(|error| format!("MoE: router scores dtoh: {error}"))?;
+            let router_weights = f32_from_le_bytes(&weights_raw)?;
+            let router_scores = f32_from_le_bytes(&scores_raw)?;
+            if router_scores.iter().any(|value| !value.is_finite()) {
+                return Err("MoE: the router wrote a non-finite score".to_string());
+            }
+            (router_weights, router_scores)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let (router_ids, slots) = moe_slots(&global_ids, experts)?;
         let slot_raw: Vec<u8> = router_ids.iter().flat_map(|id| id.to_le_bytes()).collect();
         cuda.copy_htod(&slot_ids, &slot_raw)
@@ -4404,7 +4411,7 @@ fn run_layer_moe_routed(
         for (slot, id) in slots.iter().enumerate() {
             let (w1, s1) = routed_slice_base(
                 &bind.moe,
-                plan,
+                &bind.plan_index,
                 layer,
                 *id as usize,
                 crate::resident_weights::Matrix::Gate,
@@ -4414,7 +4421,7 @@ fn run_layer_moe_routed(
             )?;
             let (w3, s3) = routed_slice_base(
                 &bind.moe,
-                plan,
+                &bind.plan_index,
                 layer,
                 *id as usize,
                 crate::resident_weights::Matrix::Up,
@@ -4424,7 +4431,7 @@ fn run_layer_moe_routed(
             )?;
             let (w2, s2) = routed_slice_base(
                 &bind.moe,
-                plan,
+                &bind.plan_index,
                 layer,
                 *id as usize,
                 crate::resident_weights::Matrix::Down,
@@ -4562,18 +4569,25 @@ fn run_layer_moe_routed(
                 (slot_acc, rank_routed, payload, delta, reduce_sequence, None)
             };
         probe::layer(cuda, layer, "moe_reduce", timer);
-        let mut gate_raw = vec![0u8; routed_rows * 640 * 2];
-        let mut up_raw = vec![0u8; routed_rows * 640 * 2];
-        let mut codes_raw = vec![0u8; routed_rows * 640];
-        let mut scales_raw = vec![0u8; routed_rows * 20];
-        cuda.copy_dtoh(&mut gate_raw, &gate_out)
-            .map_err(|error| format!("MoE: gate dtoh: {error}"))?;
-        cuda.copy_dtoh(&mut up_raw, &up_out)
-            .map_err(|error| format!("MoE: up dtoh: {error}"))?;
-        cuda.copy_dtoh(&mut codes_raw, &codes)
-            .map_err(|error| format!("MoE: codes dtoh: {error}"))?;
-        cuda.copy_dtoh(&mut scales_raw, &swiglu_scales)
-            .map_err(|error| format!("MoE: scales dtoh: {error}"))?;
+        // The four stage readbacks below are the evidence record's stage digests and nothing else:
+        // the combine consumes the device buffers, so a lean run has no numeric consumer for them.
+        let (gate_raw, up_raw, codes_raw, scales_raw) = if layer_evidence_readbacks() {
+            let mut gate_raw = vec![0u8; routed_rows * 640 * 2];
+            let mut up_raw = vec![0u8; routed_rows * 640 * 2];
+            let mut codes_raw = vec![0u8; routed_rows * 640];
+            let mut scales_raw = vec![0u8; routed_rows * 20];
+            cuda.copy_dtoh(&mut gate_raw, &gate_out)
+                .map_err(|error| format!("MoE: gate dtoh: {error}"))?;
+            cuda.copy_dtoh(&mut up_raw, &up_out)
+                .map_err(|error| format!("MoE: up dtoh: {error}"))?;
+            cuda.copy_dtoh(&mut codes_raw, &codes)
+                .map_err(|error| format!("MoE: codes dtoh: {error}"))?;
+            cuda.copy_dtoh(&mut scales_raw, &swiglu_scales)
+                .map_err(|error| format!("MoE: scales dtoh: {error}"))?;
+            (gate_raw, up_raw, codes_raw, scales_raw)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
         Ok(Layer0MoeRouted {
             rank,
             pins,
@@ -4820,6 +4834,104 @@ impl sparkflash_engine::weights::WeightSource for ArenaHostSource {
             }),
         }
     }
+}
+
+/// A checkpoint source with the Engram wkv matrices held resident, so the per-position read of a
+/// constant weight becomes a borrow.
+///
+/// [sparkflash_engine::forward::engram::engram_forward] reads `layers.{l}.engram.wkv.weight` and its
+/// scale grid on every call, and [sparkflash_engine::safetensors::SafeTensorsSource] has no
+/// `read_view`: through it the loop allocates and copies 157 MB per layer-position (~43 GB over a
+/// released-length run) for two matrices that never change. The loop loads them once and this overlay
+/// serves those bytes, which the engine's read path prefers; every other name, and the paged Engram
+/// tables, delegate to the wrapped source unchanged.
+#[cfg(any(feature = "cuda", test))]
+struct EngramResidentSource<'a> {
+    inner: &'a dyn sparkflash_engine::weights::WeightSource,
+    resident: std::collections::BTreeMap<String, Vec<u8>>,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl<'a> EngramResidentSource<'a> {
+    /// Reads each name once. Nothing mutates the bytes afterwards, which is what lets
+    /// [sparkflash_engine::weights::WeightSource::read_view] hand out a borrow.
+    fn preload(
+        inner: &'a dyn sparkflash_engine::weights::WeightSource,
+        names: &[String],
+    ) -> Result<Self, String> {
+        let mut resident = std::collections::BTreeMap::new();
+        for name in names {
+            let bytes = inner
+                .read(name)
+                .map_err(|error| format!("forward loop: Engram preload {name}: {error}"))?;
+            resident.insert(name.clone(), bytes);
+        }
+        Ok(Self { inner, resident })
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl sparkflash_engine::weights::WeightSource for EngramResidentSource<'_> {
+    fn names(&self) -> Vec<String> {
+        self.inner.names()
+    }
+
+    fn spec(
+        &self,
+        name: &str,
+    ) -> Result<sparkflash_engine::tensor::TensorSpec, sparkflash_engine::weights::WeightError>
+    {
+        self.inner.spec(name)
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>, sparkflash_engine::weights::WeightError> {
+        match self.resident.get(name) {
+            Some(bytes) => Ok(bytes.clone()),
+            None => self.inner.read(name),
+        }
+    }
+
+    fn read_view(
+        &self,
+        name: &str,
+    ) -> Result<Option<&[u8]>, sparkflash_engine::weights::WeightError> {
+        match self.resident.get(name) {
+            Some(bytes) => Ok(Some(bytes.as_slice())),
+            None => self.inner.read_view(name),
+        }
+    }
+
+    fn read_ranges(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Option<Result<Vec<u8>, sparkflash_engine::weights::WeightError>> {
+        self.inner.read_ranges(name, ranges)
+    }
+
+    fn read_ranges_paged(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Option<Result<Vec<u8>, sparkflash_engine::weights::WeightError>> {
+        self.inner.read_ranges_paged(name, ranges)
+    }
+}
+
+/// The tensors [EngramResidentSource] holds: each Engram layer's wkv codes and scale grid, the two
+/// names [sparkflash_engine::forward::engram::engram_forward] reads on every call.
+#[cfg(any(feature = "cuda", test))]
+fn engram_weight_names(config: &sparkflash_engine::config::ModelConfig) -> Vec<String> {
+    config
+        .engram_layer_ids
+        .iter()
+        .flat_map(|layer| {
+            [
+                format!("layers.{layer}.engram.wkv.weight"),
+                format!("layers.{layer}.engram.wkv.scale"),
+            ]
+        })
+        .collect()
 }
 
 /// The gathered, replicated released shared-expert view for one layer.
@@ -5340,9 +5452,6 @@ fn run_layer_attention_projections(
     };
     let (wq_a_weight, wq_a_scales) = pair_for(&format!("layers.{layer}.attn.wq_a.weight"))?;
     let (wkv_weight, wkv_scales) = pair_for(&format!("layers.{layer}.attn.wkv.weight"))?;
-    let plan = request.resident_plan.ok_or_else(|| {
-        "layer-0 projections: the loop was built without the rank plan".to_string()
-    })?;
     for (name, cols, inner) in [
         (
             &format!("layers.{layer}.attn.wq_a.weight"),
@@ -5351,7 +5460,7 @@ fn run_layer_attention_projections(
         ),
         (&format!("layers.{layer}.attn.wkv.weight"), wkv_cols, HIDDEN),
     ] {
-        let (planned_cols, planned_inner) = planned_b12x_geometry(plan, name)?;
+        let (planned_cols, planned_inner) = bind.plan_index.b12x_geometry(name)?;
         if (planned_cols, planned_inner) != (cols, inner) {
             return Err(format!(
                 "layer-0 projections: {name} is planned {planned_cols}x{planned_inner}, the launch expects {cols}x{inner}"
@@ -7311,6 +7420,24 @@ fn run_forward_loop(
             ));
         }
     }
+    // The two Engram wkv matrices are constant, but the seam reads them once per layer-position and
+    // [sparkflash_engine::safetensors::SafeTensorsSource] cannot borrow: without this the loop copies
+    // 157 MB per layer-position. Hold them resident once and let the engine's read path borrow them.
+    // Value-transparent: the same bytes reach the same matmul in the same order.
+    let engram_resident = match engram_source {
+        Some(source) => Some(EngramResidentSource::preload(
+            source,
+            &engram_weight_names(config),
+        )?),
+        None => None,
+    };
+    let engram_read_source: Option<&dyn sparkflash_engine::weights::WeightSource> =
+        match &engram_resident {
+            Some(resident) => Some(resident as &dyn sparkflash_engine::weights::WeightSource),
+            None => {
+                engram_source.map(|source| source as &dyn sparkflash_engine::weights::WeightSource)
+            }
+        };
     let total_positions = request
         .prefill_limit
         .map_or(full_positions, |limit| limit.min(full_positions));
@@ -7545,7 +7672,7 @@ fn run_forward_loop(
         // One row of layers x columns ids; a look-back past the sequence start pads with
         // engram_pad_id, as the reference does.
         let timer = BlockTimer::start(probe_on);
-        let engram_hashes = match engram_source {
+        let engram_hashes = match engram_read_source {
             Some(_) => {
                 let history = request.prompt_tokens.get(..=position).ok_or_else(|| {
                     format!(
@@ -7593,7 +7720,7 @@ fn run_forward_loop(
             // window can attribute the row-1/row-14 stream step to this seam alone.
             let mut engram_record: Option<serde_json::Value> = None;
             let timer = BlockTimer::start(probe_on);
-            if let Some(source) = engram_source
+            if let Some(source) = engram_read_source
                 && config.engram_rows(layer).is_some()
             {
                 let before = stream.clone();
@@ -10719,6 +10846,21 @@ mod evidence_switch_tests {
         set_evidence_record(false);
     }
 
+    // C10 records the layer-chain entry only in evidence mode, so the six evidence-only device
+    // readbacks in the MoE layer (router weights and scores, the gate and up outputs, the weighted
+    // SWiGLU codes and scales) exist only when that record is on. The copy sites must ask exactly
+    // this question; asking it here proves the switch they see is the record switch, and that a
+    // lean run never issues the drain.
+    #[test]
+    fn the_moe_evidence_readbacks_exist_only_in_evidence_mode() {
+        set_evidence_record(false);
+        assert!(!layer_evidence_readbacks());
+        set_evidence_record(true);
+        assert!(layer_evidence_readbacks());
+        set_evidence_record(false);
+        assert!(!layer_evidence_readbacks());
+    }
+
     // The two run-scope switches must not tangle: the launch path is async by default, the
     // environment opt-out is the only way back to the drained path, and switching the evidence
     // chain on or off must leave the launch path alone.
@@ -10740,5 +10882,203 @@ mod evidence_switch_tests {
         driver::set_async_launches(true);
         set_evidence_record(false);
         assert!(driver::async_launches());
+    }
+
+    /// A [sparkflash_engine::weights::WeightSource] over in-memory bytes with read counters, so the
+    /// Engram overlay can be checked without a checkpoint: a resident read must not touch it at all.
+    struct CountingSource {
+        held: BTreeMap<String, (sparkflash_engine::tensor::TensorSpec, Vec<u8>)>,
+        reads: std::sync::atomic::AtomicUsize,
+        paged: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingSource {
+        fn new() -> Self {
+            Self {
+                held: BTreeMap::new(),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+                paged: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn put(
+            &mut self,
+            name: &str,
+            dtype: sparkflash_engine::dtype::DType,
+            shape: &[usize],
+            bytes: &[u8],
+        ) {
+            self.held.insert(
+                name.to_owned(),
+                (
+                    sparkflash_engine::tensor::TensorSpec {
+                        name: name.to_owned(),
+                        dtype,
+                        shape: shape.to_vec(),
+                    },
+                    bytes.to_vec(),
+                ),
+            );
+        }
+    }
+
+    impl sparkflash_engine::weights::WeightSource for CountingSource {
+        fn names(&self) -> Vec<String> {
+            self.held.keys().cloned().collect()
+        }
+
+        fn spec(
+            &self,
+            name: &str,
+        ) -> Result<sparkflash_engine::tensor::TensorSpec, sparkflash_engine::weights::WeightError>
+        {
+            self.held
+                .get(name)
+                .map(|(spec, _)| spec.clone())
+                .ok_or_else(|| sparkflash_engine::weights::WeightError::Missing {
+                    name: name.to_owned(),
+                })
+        }
+
+        fn read(&self, name: &str) -> Result<Vec<u8>, sparkflash_engine::weights::WeightError> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.held
+                .get(name)
+                .map(|(_, bytes)| bytes.clone())
+                .ok_or_else(|| sparkflash_engine::weights::WeightError::Missing {
+                    name: name.to_owned(),
+                })
+        }
+
+        fn read_ranges_paged(
+            &self,
+            name: &str,
+            ranges: &[(u64, usize)],
+        ) -> Option<Result<Vec<u8>, sparkflash_engine::weights::WeightError>> {
+            self.paged
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let wanted: usize = ranges.iter().map(|(_, length)| length).sum();
+            Some(
+                self.held
+                    .get(name)
+                    .map(|(_, bytes)| bytes[..wanted].to_vec())
+                    .ok_or_else(|| sparkflash_engine::weights::WeightError::Missing {
+                        name: name.to_owned(),
+                    }),
+            )
+        }
+    }
+
+    /// The overlay is the whole fix for the per-position copy: the resident matrices are read once
+    /// and then borrowed, and every other name - including the paged Engram tables - still reaches
+    /// the wrapped source.
+    #[test]
+    fn the_engram_overlay_holds_the_wkv_matrices_and_delegates_everything_else() {
+        use sparkflash_engine::dtype::DType;
+        use sparkflash_engine::weights::WeightSource;
+        let mut inner = CountingSource::new();
+        inner.put(
+            "layers.1.engram.wkv.weight",
+            DType::F8E4M3,
+            &[2, 2],
+            &[1, 2, 3, 4],
+        );
+        inner.put("layers.1.engram.wkv.scale", DType::F8E8M0, &[1, 1], &[7]);
+        inner.put(
+            "layers.1.engram.embed.weight",
+            DType::F8E4M3,
+            &[1, 2],
+            &[5, 6],
+        );
+
+        let names = vec![
+            "layers.1.engram.wkv.weight".to_owned(),
+            "layers.1.engram.wkv.scale".to_owned(),
+        ];
+        let overlay = EngramResidentSource::preload(&inner, &names).expect("the matrices preload");
+        assert_eq!(
+            inner.reads.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "each resident matrix is read exactly once"
+        );
+
+        for (name, expected) in [
+            ("layers.1.engram.wkv.weight", &[1u8, 2, 3, 4][..]),
+            ("layers.1.engram.wkv.scale", &[7u8][..]),
+        ] {
+            assert_eq!(
+                overlay.read_view(name).expect("a resident view result"),
+                Some(expected),
+                "{name} is not served as a borrow"
+            );
+            assert_eq!(
+                overlay.read(name).expect("a resident copy").as_slice(),
+                expected
+            );
+        }
+        assert_eq!(
+            inner.reads.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "a resident name reached the wrapped source"
+        );
+
+        assert_eq!(
+            overlay
+                .read_view("layers.1.engram.wkv.weight")
+                .expect("a resident view result"),
+            Some(&[1u8, 2, 3, 4][..])
+        );
+        assert_eq!(
+            overlay
+                .read_view("nothing")
+                .expect("an absent name is a delegated miss"),
+            None
+        );
+        assert_eq!(
+            overlay
+                .read("layers.1.engram.embed.weight")
+                .expect("a delegated read"),
+            vec![5u8, 6]
+        );
+        assert_eq!(
+            inner.reads.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "the delegated read is the wrapped one"
+        );
+        assert!(overlay.spec("layers.1.engram.embed.weight").is_ok());
+        assert!(overlay.spec("nothing").is_err());
+        assert!(
+            overlay
+                .names()
+                .contains(&"layers.1.engram.embed.weight".to_owned())
+        );
+        let paged = overlay
+            .read_ranges_paged("layers.1.engram.embed.weight", &[(0, 2)])
+            .expect("the overlay serves the paged Engram path")
+            .expect("the paged bytes");
+        assert_eq!(paged, vec![5u8, 6]);
+        assert_eq!(
+            inner.paged.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the paged read was not delegated"
+        );
+    }
+
+    /// The resident list is exactly each Engram layer's wkv codes and grid - the two names the seam
+    /// reads on every call.
+    #[test]
+    fn the_engram_resident_names_are_each_layers_wkv_codes_and_grid() {
+        let mut config = sparkflash_engine::config::ModelConfig::tiny();
+        config.engram_layer_ids = vec![1, 14];
+        assert_eq!(
+            engram_weight_names(&config),
+            vec![
+                "layers.1.engram.wkv.weight".to_owned(),
+                "layers.1.engram.wkv.scale".to_owned(),
+                "layers.14.engram.wkv.weight".to_owned(),
+                "layers.14.engram.wkv.scale".to_owned(),
+            ]
+        );
     }
 }

@@ -6,3 +6,9 @@ date,commit,run,step_mean_ms,tokens_ok,logits_sha_ok,note
 2026-10-21,f5191109,m2p1b-evidence,925.19,yes,yes,"identity row, evidence ON"
 2026-10-21,f5191109,m2p1b-lean,842.69,yes,yes,gate row (clean argv)
 2026-10-21,f5191109,m2p1b-lean,842.69,yes,yes,m2p1b-lean
+2026-10-21,1ed3684d,wsa2-lean,624.56,yes,yes,wsa2-lean
+2026-10-21,68d81670,wsa2c-chain,679.81,yes,yes,wsa2c-chain
+2026-10-21,68d81670,wsa2c-lean,602.53,yes,yes,wsa2c-lean
+2026-10-21,68d81670,wsa2c-probe,612.11,yes,yes,wsa2c-probe
+2026-10-21,4e4cea50,wsa2d-chain,676.44,yes,yes,wsa2d-chain
+2026-10-21,4e4cea50,wsa2d-lean,599.94,yes,yes,wsa2d-lean

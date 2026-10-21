@@ -40,6 +40,20 @@ PY
     python3 - "$CSV" "$RUN" "$COMMIT" "$NOTE" <<'PY'
 import csv, datetime, json, os, statistics, sys
 csv_path, run, commit, note = sys.argv[1:5]
+# The published number must name the commit that produced it, not whatever branch happens to be
+# checked out where the row is filed. The row's run.meta names its tag; the staged provenance for
+# that tag is the measured commit. --commit still wins when given.
+if commit in ("", "-"):
+    tag = os.path.basename(run.rstrip("/")).split("-")[0]
+    meta = os.path.join(run, "run.meta")
+    if os.path.exists(meta):
+        for line in open(meta):
+            if line.startswith("tag="):
+                tag = line.split("=", 1)[1].strip()
+    stage_root = os.environ.get("SPARKFLASH_STAGE_ROOT", "/home/user/ev-session-window")
+    provenance = os.path.join(stage_root, tag, "stage", "provenance.txt")
+    if os.path.exists(provenance):
+        commit = open(provenance).read().strip()[:12]
 means = []
 for r in range(4):
     path = os.path.join(run, f"rank{r}", f"tp4-token-r{r}.json")

@@ -996,6 +996,18 @@ pub fn enable_forward_async_launches() -> bool {
     set_async_launches(!requested)
 }
 
+/// Whether a driver call that only *queues* device work may skip its per-call drain.
+///
+/// The launch path and the device-to-device stage copy share this one decision: both are invisible
+/// to the host, and both are made safe by the next observation point (a stream-ordered
+/// [Cuda::copy_dtoh] or an explicit [Cuda::synchronize]). Either bracket consumer - the stage-timing
+/// ledger or the probe meter - reads a post-drain elapsed time, so its presence puts both calls
+/// back on the drained path.
+#[must_use]
+fn queued_dispatch_wanted() -> bool {
+    !stage_timing_enabled() && !probe_meter_armed() && async_launches()
+}
+
 /// One run's cubin images and their loaded modules.
 ///
 /// M2/C1: the four-rank layer loop used to read and hash eight cubin images and run nine
@@ -1640,6 +1652,13 @@ impl Cuda {
     /// # }
     /// ```
     pub fn copy_dtod(&self, dst: &Deviceptr, src: &Deviceptr, bytes: usize) -> Result<(), String> {
+        // A stage copy is invisible to the host: its consumers are the kernels the caller launches
+        // next, so the queued path is the same switch as [Cuda::launch]'s. Both bracket consumers
+        // (stage timing, the probe meter) need the drained call's post-drain elapsed time and keep
+        // the synchronous path.
+        if queued_dispatch_wanted() {
+            return self.copy_dtod_async(dst, src, bytes);
+        }
         unsafe {
             let f: libloading::Symbol<
                 unsafe extern "C" fn(CuDeviceptr, CuDeviceptr, usize) -> CuResult,
@@ -1655,6 +1674,39 @@ impl Cuda {
             }
             Ok(())
         }
+    }
+
+    /// Queues one device-to-device copy on the default stream and returns without draining.
+    ///
+    /// The copy sits in the default stream's order exactly where the synchronous call sat: it runs
+    /// after every launch issued before it and before every launch issued after it, so a staging
+    /// buffer it fills is read by the next launch as the drained copy's bytes were. The host must
+    /// not read the destination until an observation point - [Cuda::copy_dtoh] or
+    /// [Cuda::synchronize] - and the launch counter is advanced so the pooled-buffer fence keeps
+    /// the buffer out of circulation until one of those proves the copy finished.
+    ///
+    /// Not metered: the probe's `dtod_ms` bucket times the drained call, and an armed meter keeps
+    /// [Cuda::copy_dtod] on that drained path, so a queued copy is never inside a meter window.
+    ///
+    /// # Errors
+    /// The driver's cuMemcpyDtoDAsync failure code.
+    pub fn copy_dtod_async(
+        &self,
+        dst: &Deviceptr,
+        src: &Deviceptr,
+        bytes: usize,
+    ) -> Result<(), String> {
+        let copy: libloading::Symbol<
+            unsafe extern "C" fn(CuDeviceptr, CuDeviceptr, usize, *mut c_void) -> CuResult,
+        > = self.sym(b"cuMemcpyDtoDAsync_v2")?;
+        // SAFETY: the symbol comes from this context's library, both pointers are device addresses
+        // this process owns, and the null stream is the default stream the launches use.
+        let r = unsafe { copy(dst.0, src.0, bytes, std::ptr::null_mut()) };
+        if r != 0 {
+            return Err(format!("cuMemcpyDtoDAsync failed: {r}"));
+        }
+        self.issued.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Loads one non-flash_mla kernel from a cubin image.
@@ -1983,7 +2035,7 @@ impl Cuda {
     ) -> Result<(), String> {
         // The bracket consumers need the drain that follows each launch, so they always take the
         // synchronous path. Everything else takes the async path when the run selected it.
-        if !stage_timing_enabled() && !probe_meter_armed() && async_launches() {
+        if queued_dispatch_wanted() {
             return self.launch_async(kernel, grid, block, args);
         }
         unsafe {
@@ -2487,6 +2539,31 @@ mod async_launch_cache_tests {
         assert!(async_launches());
         set_async_launches(false);
         assert!(!async_launches());
+    }
+
+    // The launch path and the stage-copy path must never disagree: a queued copy is only safe
+    // because the queued launches it feeds are queued too, and a bracket consumer must put both
+    // back on the drained path or its elapsed time would be measured after a drain that no longer
+    // follows the call. One predicate decides both, and this is that predicate's truth table.
+    #[test]
+    fn a_stage_copy_is_queued_exactly_when_a_launch_is() {
+        let _serial = TEST_LOCK.lock().expect("test lock");
+        set_async_launches(false);
+        assert!(!queued_dispatch_wanted(), "drained run queues nothing");
+        assert!(set_async_launches(true));
+        assert!(
+            queued_dispatch_wanted(),
+            "queued run queues launches and copies"
+        );
+        probe_meter_arm(true);
+        assert!(
+            !queued_dispatch_wanted(),
+            "the probe meter's per-launch bracket keeps both calls drained"
+        );
+        probe_meter_arm(false);
+        assert!(queued_dispatch_wanted());
+        set_async_launches(false);
+        assert!(!queued_dispatch_wanted());
     }
 
     #[test]

@@ -3750,6 +3750,11 @@ fn write_summary(directory: &Path, outcome: &RankOutcome, wall_ms: u64) -> Resul
 mod tests {
     use super::*;
 
+    /// The adjacent-range probe releases its listeners before the ranks bind, so two tests running
+    /// in parallel can pick the same range and fail with AddrInUse. Test-only: pick and use a range
+    /// under one lock, so the features sweep cannot make CI flaky.
+    static PORT_RANGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn free_base_port(world: u16) -> u16 {
         for attempt in 0..200u16 {
             let candidate = 21000 + attempt * 8;
@@ -3781,6 +3786,9 @@ mod tests {
         max_tokens: usize,
         resident_cache: bool,
     ) -> Vec<RankOutcome> {
+        let _range = PORT_RANGE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let directory = tempfile::tempdir().expect("tempdir");
         write_twin_fixture(directory.path()).expect("fixture");
         let base_port = free_base_port(world as u16);
@@ -3833,6 +3841,9 @@ mod tests {
         F: Fn(usize, &mut Tp4Rank) -> T + Send + Sync,
     {
         let world = 4usize;
+        let _range = PORT_RANGE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let base_port = free_base_port(world as u16);
         std::thread::scope(|scope| {
             let action = &action;

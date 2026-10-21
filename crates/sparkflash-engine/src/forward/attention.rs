@@ -570,6 +570,25 @@ impl WindowRing {
     }
 }
 
+/// The compressor seam's constant weights, decoded once per layer.
+///
+/// A KV-source layer's seam step runs on every position it serves, and its compressor matrices never
+/// change, so reading and decoding them per position was pure waste: the released geometry's pair is
+/// two `[head_dim x dim]` tensors (2.6M values each) and the seam's own cached source hands out a
+/// fresh copy of the bytes on every call. The decoded values are exactly what the materialised view
+/// path would have produced - `quant::decode` widens every stored dtype exactly - so the matvec over
+/// them is bit-identical to the fused view's.
+#[derive(Clone)]
+struct CompressorWeights {
+    /// `compressor.norm.weight`: the f32 RMS norm applied after the projection.
+    norm: Vec<f32>,
+    /// `compressor.wkv.weight`, `[head_dim x dim]` row-major f32.
+    wkv: Vec<f32>,
+    /// `compressor.wgate.weight`, `[head_dim x dim]` row-major; absent at ratio 1, which has no
+    /// gate.
+    wgate: Option<Vec<f32>>,
+}
+
 /// The attention state one layer owns: its window ring, its compressed KV and the indexer's keys.
 ///
 /// The compressor's pool width is the layer's `compress_ratio`, and this type does not know which
@@ -578,6 +597,9 @@ impl WindowRing {
 /// caches here start empty and grow with the sequence, so a test config needs no `max_seq_len`.
 #[derive(Clone)]
 pub struct AttnState {
+    /// The compressor's decoded weights, filled on this layer's first seam step and reused for the
+    /// run (see [CompressorWeights]). Sequence state [AttnState::reset] drops; this does not.
+    compressor: Option<Box<CompressorWeights>>,
     /// The window ring this layer writes.
     pub window: WindowRing,
     /// The compressed KV rows this layer published, `head_dim` values per row
@@ -617,6 +639,7 @@ impl AttnState {
     #[must_use]
     pub fn for_config(config: &ModelConfig) -> Self {
         Self {
+            compressor: None,
             window: WindowRing::for_config(config),
             compressed: Vec::new(),
             compressed_len: 0,
@@ -647,6 +670,7 @@ impl AttnState {
         self.index_weights.clear();
         self.kv_state.clear();
         self.score_state.clear();
+        // The compressor weights are the layer's, not the sequence's: they stay across a reset.
     }
 }
 
@@ -1017,8 +1041,16 @@ fn compressor_step(
     state: &mut AttnState,
     src: Reads<'_>,
 ) -> Result<(), EngineError> {
-    state.latent.clear();
-    state.latent_rows = 0;
+    let AttnState {
+        compressor,
+        latent: latent_out,
+        latent_rows,
+        kv_state,
+        score_state,
+        ..
+    } = state;
+    latent_out.clear();
+    *latent_rows = 0;
     let ratio = layer_ratio(config, layer);
     if ratio == 0 || !is_kv_source(config, layer) {
         return Ok(());
@@ -1027,48 +1059,42 @@ fn compressor_step(
     let head_dim = config.head_dim;
     let seqlen = rows_of(x, dim, "compressor input")?;
     let end_pos = start_pos + seqlen;
-    let norm = weight(src, &format!("{prefix}.attn.compressor.norm.weight"))?;
+    // One decode of this layer's compressor weights per run; the seam runs them on every position.
+    if compressor.is_none() {
+        *compressor = Some(Box::new(read_compressor_weights(
+            config, prefix, ratio, src,
+        )?));
+    }
+    let cached = compressor
+        .as_deref()
+        .expect("the compressor weights were just read");
     if ratio == 1 {
         // model.py:461-462: one token per group, so a plain projection with no gate and no pooling.
-        let wkv = plain_view(
-            src,
-            &format!("{prefix}.attn.compressor.wkv.weight"),
-            head_dim,
-            dim,
-        )?;
         let mut latent = vec![0.0; seqlen * head_dim];
-        wkv.matmul(&mut latent, x, head_dim, dim, seqlen)?;
+        linalg::matmul_hot_rows(&mut latent, x, &cached.wkv, head_dim, dim, seqlen)?;
         // At ratio 1 the reference keeps bf16 wkv weights and returns norm(wkv(x)) as a bf16
         // tensor (model.py:446-449, 461-463).
         narrow_bf16(&mut latent);
-        linalg::rms_norm(&mut latent, &norm, head_dim, config.norm_eps as f32)?;
+        linalg::rms_norm(&mut latent, &cached.norm, head_dim, config.norm_eps as f32)?;
         narrow_bf16(&mut latent);
-        state.latent = latent;
-        state.latent_rows = seqlen;
+        *latent_out = latent;
+        *latent_rows = seqlen;
         return Ok(());
     }
     // Above ratio 1 the reference keeps a partial group between steps; its buffers are the layer's
     // ratio, so they are sized on first use here.
-    if state.kv_state.len() != ratio * head_dim {
-        state.kv_state = vec![0.0; ratio * head_dim];
-        state.score_state = vec![f32::NEG_INFINITY; ratio * head_dim];
+    if kv_state.len() != ratio * head_dim {
+        *kv_state = vec![0.0; ratio * head_dim];
+        *score_state = vec![f32::NEG_INFINITY; ratio * head_dim];
     }
-    let wkv = plain_view(
-        src,
-        &format!("{prefix}.attn.compressor.wkv.weight"),
-        head_dim,
-        dim,
-    )?;
-    let wgate = plain_view(
-        src,
-        &format!("{prefix}.attn.compressor.wgate.weight"),
-        head_dim,
-        dim,
-    )?;
+    let wgate = cached.wgate.as_deref().ok_or_else(|| EngineError::Shape {
+        what: "compressor weights".to_owned(),
+        detail: format!("layer {layer} pools at ratio {ratio} but its gate matrix was not read"),
+    })?;
     let mut kv = vec![0.0; seqlen * head_dim];
-    wkv.matmul(&mut kv, x, head_dim, dim, seqlen)?;
+    linalg::matmul_hot_rows(&mut kv, x, &cached.wkv, head_dim, dim, seqlen)?;
     let mut score = vec![0.0; seqlen * head_dim];
-    wgate.matmul(&mut score, x, head_dim, dim, seqlen)?;
+    linalg::matmul_hot_rows(&mut score, x, wgate, head_dim, dim, seqlen)?;
     // One scratch weight per pool slot, reused by every group in this call.
     let mut weights = vec![0.0f32; ratio];
     let rows = end_pos / ratio - start_pos / ratio;
@@ -1092,9 +1118,9 @@ fn compressor_step(
         }
         for slot in 0..remainder {
             let row = seqlen - remainder + slot;
-            state.kv_state[slot * head_dim..(slot + 1) * head_dim]
+            kv_state[slot * head_dim..(slot + 1) * head_dim]
                 .copy_from_slice(&kv[row * head_dim..(row + 1) * head_dim]);
-            state.score_state[slot * head_dim..(slot + 1) * head_dim]
+            score_state[slot * head_dim..(slot + 1) * head_dim]
                 .copy_from_slice(&score[row * head_dim..(row + 1) * head_dim]);
         }
     } else {
@@ -1105,16 +1131,16 @@ fn compressor_step(
         for row in 0..seqlen {
             let position = start_pos + row;
             let slot = position % ratio;
-            state.kv_state[slot * head_dim..(slot + 1) * head_dim]
+            kv_state[slot * head_dim..(slot + 1) * head_dim]
                 .copy_from_slice(&kv[row * head_dim..(row + 1) * head_dim]);
-            state.score_state[slot * head_dim..(slot + 1) * head_dim]
+            score_state[slot * head_dim..(slot + 1) * head_dim]
                 .copy_from_slice(&score[row * head_dim..(row + 1) * head_dim]);
             if (position + 1).is_multiple_of(ratio) {
                 let dest = &mut latent[written * head_dim..(written + 1) * head_dim];
                 pool_group(
                     dest,
-                    &state.kv_state,
-                    &state.score_state,
+                    kv_state,
+                    score_state,
                     0,
                     ratio,
                     head_dim,
@@ -1127,11 +1153,78 @@ fn compressor_step(
     // Above ratio 1 the pooled value is narrowed to bf16 before the norm and the norm casts
     // its result back to bf16: norm(kv.to(dtype)) (model.py:484-486).
     narrow_bf16(&mut latent);
-    linalg::rms_norm(&mut latent, &norm, head_dim, config.norm_eps as f32)?;
+    linalg::rms_norm(&mut latent, &cached.norm, head_dim, config.norm_eps as f32)?;
     narrow_bf16(&mut latent);
-    state.latent = latent;
-    state.latent_rows = rows;
+    *latent_out = latent;
+    *latent_rows = rows;
     Ok(())
+}
+
+/// Reads and decodes one layer's compressor weights for [AttnState]'s cache.
+///
+/// The values are the source's own: `quant::decode` handles every dtype the plan stores these
+/// tensors in, so an F32 tensor is a straight read and a BF16 one widens exactly, which is what the
+/// fused view's matmul does with the same bytes.
+///
+/// # Errors
+///
+/// [EngineError] from the weight read, the element limit, or a tensor whose element count is not
+/// [ModelConfig::head_dim] rows of [ModelConfig::dim].
+fn read_compressor_weights(
+    config: &ModelConfig,
+    prefix: &str,
+    ratio: usize,
+    src: Reads<'_>,
+) -> Result<CompressorWeights, EngineError> {
+    let dim = config.dim;
+    let head_dim = config.head_dim;
+    let norm = weight(src, &format!("{prefix}.attn.compressor.norm.weight"))?;
+    let wkv = decoded_compressor_weight(
+        src,
+        &format!("{prefix}.attn.compressor.wkv.weight"),
+        head_dim,
+        dim,
+    )?;
+    let wgate = if ratio == 1 {
+        None
+    } else {
+        Some(decoded_compressor_weight(
+            src,
+            &format!("{prefix}.attn.compressor.wgate.weight"),
+            head_dim,
+            dim,
+        )?)
+    };
+    Ok(CompressorWeights { norm, wkv, wgate })
+}
+
+/// One `[rows x cols]` compressor weight, decoded to the f32 values the matvec reads.
+///
+/// # Errors
+///
+/// [EngineError::Shape] when the source decodes a different element count, and the read errors of
+/// [linalg::decode_by_name].
+fn decoded_compressor_weight(
+    src: Reads<'_>,
+    name: &str,
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<f32>, EngineError> {
+    let expected = rows.checked_mul(cols).ok_or_else(|| EngineError::Shape {
+        what: "compressor weight".to_owned(),
+        detail: format!("{name} is {rows}x{cols}, which overflows"),
+    })?;
+    let values = linalg::decode_by_name(src.source, name, src.limit)?;
+    if values.len() != expected {
+        return Err(EngineError::Shape {
+            what: "compressor weight".to_owned(),
+            detail: format!(
+                "{name} is {rows}x{cols}, so it is {expected} values; the source decoded {}",
+                values.len()
+            ),
+        });
+    }
+    Ok(values)
 }
 
 /// The geometry and inputs one indexer call needs, so that the helper taking them stays inside the
@@ -3610,6 +3703,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::dtype::DType;
+    use crate::parallel::with_reference_threads;
     use crate::tensor::{TensorPlan, TensorSpec};
     use crate::weights::WeightError;
 
@@ -5242,5 +5336,164 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A [Hand] that counts the reads each tensor name sees.
+    struct Counting<'a> {
+        inner: &'a Hand,
+        reads: std::sync::Mutex<BTreeMap<String, usize>>,
+    }
+
+    impl<'a> Counting<'a> {
+        fn new(inner: &'a Hand) -> Self {
+            Self {
+                inner,
+                reads: std::sync::Mutex::new(BTreeMap::new()),
+            }
+        }
+
+        fn reads_of(&self, name: &str) -> usize {
+            self.reads
+                .lock()
+                .expect("read counter")
+                .get(name)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    impl WeightSource for Counting<'_> {
+        fn names(&self) -> Vec<String> {
+            self.inner.names()
+        }
+
+        fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
+            self.inner.spec(name)
+        }
+
+        fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+            *self
+                .reads
+                .lock()
+                .expect("read counter")
+                .entry(name.to_owned())
+                .or_insert(0) += 1;
+            self.inner.read(name)
+        }
+    }
+
+    /// The query latent the compressor seam tests feed: the index keys it holds only need values.
+    fn zero_latent(config: &ModelConfig) -> Vec<f32> {
+        vec![0.0; config.n_heads * config.head_dim]
+    }
+
+    /// The seam state a cold-versus-warm comparison checks beyond the seam's own fields.
+    fn seam_state(state: &AttnState) -> (Vec<f32>, Vec<f32>, usize, &[f32], &[f32]) {
+        (
+            state.compressed.clone(),
+            state.indexer.clone(),
+            state.compressed_len,
+            &state.kv_state,
+            &state.score_state,
+        )
+    }
+
+    #[test]
+    fn the_compressor_weights_are_read_once_per_layer() {
+        let config = ModelConfig::tiny();
+        let hand = Hand::for_config(&config);
+        let counting = Counting::new(&hand);
+        let x = chunk(&config, 1, 0);
+        let q = zero_latent(&config);
+        reset_shared_attention();
+        let mut state = AttnState::for_config(&config);
+        for position in 0..3 {
+            attention_seam_step(
+                &config, 0, "layers.0", &x, &q, position, &mut state, &counting, LIMIT,
+            )
+            .expect("seam step");
+        }
+        // Layer 0 is a KV source at ratio 2: one projection and one gate, decoded once.
+        assert_eq!(
+            counting.reads_of("layers.0.attn.compressor.wkv.weight"),
+            1,
+            "the wkv weight was decoded more than once"
+        );
+        assert_eq!(
+            counting.reads_of("layers.0.attn.compressor.wgate.weight"),
+            1,
+            "the gate weight was decoded more than once"
+        );
+    }
+
+    #[test]
+    fn the_compressor_cache_is_value_transparent() {
+        let config = ModelConfig::tiny();
+        let hand = Hand::for_config(&config);
+        let x = chunk(&config, 1, 0);
+        let q = zero_latent(&config);
+        reset_shared_attention();
+        let mut warm = AttnState::for_config(&config);
+        for position in 0..2 {
+            attention_seam_step(
+                &config, 0, "layers.0", &x, &q, position, &mut warm, &hand, LIMIT,
+            )
+            .expect("seam step");
+        }
+        // The same state twice: one keeps the decoded weights, the other drops them and decodes
+        // again, exactly as the per-position path did. The seam and the state must not differ.
+        let mut cold = warm.clone();
+        cold.compressor = None;
+        let warm_seam =
+            attention_seam_step(&config, 0, "layers.0", &x, &q, 2, &mut warm, &hand, LIMIT)
+                .expect("warm seam step");
+        let cold_seam =
+            attention_seam_step(&config, 0, "layers.0", &x, &q, 2, &mut cold, &hand, LIMIT)
+                .expect("cold seam step");
+        assert_eq!(warm_seam, cold_seam, "the seam step differs with a cache");
+        assert_eq!(warm.latent, cold.latent, "the latent differs with a cache");
+        assert_eq!(
+            seam_state(&warm),
+            seam_state(&cold),
+            "the seam state differs with a cache"
+        );
+    }
+
+    #[test]
+    fn the_compressor_row_split_is_bit_identical_across_thread_counts() {
+        let config = ModelConfig::tiny();
+        let hand = Hand::for_config(&config);
+        let x = chunk(&config, 1, 0);
+        let q = zero_latent(&config);
+        let run = |threads: usize| {
+            reset_shared_attention();
+            let mut state = AttnState::for_config(&config);
+            let mut seams = Vec::new();
+            for position in 0..4 {
+                seams.push(
+                    with_reference_threads(threads, || {
+                        attention_seam_step(
+                            &config, 0, "layers.0", &x, &q, position, &mut state, &hand, LIMIT,
+                        )
+                    })
+                    .expect("seam step"),
+                );
+            }
+            (seams, seam_state(&state).0, seam_state(&state).1)
+        };
+        let (serial_seams, serial_compressed, serial_indexer) = run(1);
+        let (wide_seams, wide_compressed, wide_indexer) = run(4);
+        assert_eq!(
+            serial_seams, wide_seams,
+            "the seam steps differ by thread count"
+        );
+        assert_eq!(
+            serial_compressed, wide_compressed,
+            "the compressed rows differ by thread count"
+        );
+        assert_eq!(
+            serial_indexer, wide_indexer,
+            "the index keys differ by thread count"
+        );
     }
 }
