@@ -637,3 +637,128 @@ fn the_f32_store_mode_writes_f32_accumulators_and_all_four_modes_match_their_ref
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The ref_seam slice: the served indexer wq_b shape on the pinned f32-activation GEMV.
+//
+// The ref_seam slice moves `layers.N.attn.indexer.wq_b` (eight layers, one query row, 4096 output
+// columns, 1280 reduction values, fp8 E4M3 weight with a 32x32 ue8m0 grid) from the engine's host
+// native rule onto this GEMV in [Mode::NonFusedF32Activation]. The host rule is
+// `indexer_wq_b_native`; the fixture below is the same one the pre-change pin test
+// (`crates/sparkflash-cli/tests/indexer_wq_b_pin.rs`) commits, so the last assertion in this test
+// is literally "the kernel's model reproduces the committed pin".
+// ---------------------------------------------------------------------------------------------
+
+/// The served decode shape of the indexer's own wq_b.
+const INDEXER_COLS: usize = 4096;
+/// `config.q_lora_rank`.
+const INDEXER_INNER: usize = 1280;
+
+/// The pinned fixture's latent row: 1280 bf16-exact signed multiples of 2^-3.
+fn indexer_latent_row() -> Vec<f32> {
+    (0..INDEXER_INNER)
+        .map(|k| {
+            let magnitude = ((k * 37 + 13) % 251) as f32 * 0.125;
+            if k % 3 == 0 { -magnitude } else { magnitude }
+        })
+        .collect()
+}
+
+/// The pinned fixture's weight code for logical element (n, k).
+fn indexer_weight_code(n: usize, k: usize) -> u8 {
+    let magnitude = u8::try_from(((n * INDEXER_INNER + k) * 37 + 11) % 0x7e).expect("below 0x7e");
+    if (n + k).is_multiple_of(2) {
+        magnitude
+    } else {
+        magnitude | 0x80
+    }
+}
+
+/// The pinned fixture's ue8m0 grid code: 2^-6 through 2^0.
+fn indexer_scale_code(n: usize, k: usize) -> u8 {
+    u8::try_from(121 + (n / QUANT_BLOCK + k / QUANT_BLOCK) % 7).expect("below 128")
+}
+
+/// The pinned fixture's B12x weight bytes and grid.
+fn indexer_weight_bytes() -> (Vec<u8>, Vec<u8>) {
+    let mut codes = vec![0u8; INDEXER_COLS * INDEXER_INNER];
+    let mut scales = vec![0u8; INDEXER_COLS.div_ceil(QUANT_BLOCK) * (INDEXER_INNER / QUANT_BLOCK)];
+    for n in 0..INDEXER_COLS {
+        for k in 0..INDEXER_INNER {
+            codes[b12x_weight_index(n, k, INDEXER_INNER)] = indexer_weight_code(n, k);
+            scales[b12x_scale_index(n, k, INDEXER_INNER)] = indexer_scale_code(n, k);
+        }
+    }
+    (codes, scales)
+}
+
+fn indexer_sha256_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn indexer_sha256_f32(values: &[f32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for value in values {
+        hasher.update(value.to_bits().to_le_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[test]
+fn the_f32_activation_gemv_reproduces_the_pinned_indexer_wq_b_bits() {
+    use sparkflash_engine::forward::attention::{indexer_activation_native, indexer_wq_b_native};
+    use sparkflash_kernels::mxfp8_ref::b12x_weight;
+
+    let latent = indexer_latent_row();
+    let (codes, scales) = indexer_weight_bytes();
+    // The fixture bytes are the committed pin's bytes: this test is reading the same operands.
+    assert_eq!(
+        indexer_sha256_f32(&latent),
+        "6dda4fe4bf7d417496bea8cf5afd5544a2f36e632649934374dcae44a73ce69d",
+        "the pinned latent fixture bytes changed"
+    );
+    assert_eq!(
+        indexer_sha256_bytes(&codes),
+        "cabd3a06c788e90d9fe702b58336b80e7bc7af427431e0e478e4ef99f986ec4b",
+        "the pinned B12x weight bytes changed"
+    );
+    assert_eq!(
+        indexer_sha256_bytes(&scales),
+        "71cda0968355da54be89cdf54f4d1cd056a43629aa6e30f5dca709e8a7b10f09",
+        "the pinned ue8m0 grid changed"
+    );
+
+    // The host reference: the dequantised B12x weight, the native activation rule, one bf16 round.
+    let mut weight = vec![0.0f32; INDEXER_COLS * INDEXER_INNER];
+    for n in 0..INDEXER_COLS {
+        for k in 0..INDEXER_INNER {
+            weight[n * INDEXER_INNER + k] = b12x_weight(&codes, &scales, n, k, INDEXER_INNER);
+        }
+    }
+    let host = indexer_wq_b_native(&latent, &weight, 1, INDEXER_COLS, INDEXER_INNER)
+        .expect("served shape");
+    assert_eq!(
+        indexer_sha256_f32(&host),
+        "839216b2b8e8ed4cdcf1721264588627a7403580307c62786f07c4d2dc6f4e32",
+        "the committed pre-change pin of the host indexer wq_b moved"
+    );
+
+    // The kernel's model for this mode: the engine's own activation row staged as f32, then the
+    // pinned tiling and the rounded multiply / rounded add chain, one bf16 round at the store.
+    let activation = indexer_activation_native(&latent, INDEXER_INNER);
+    let model = f32_activation_model(&activation, &codes, &scales, INDEXER_COLS, INDEXER_INNER);
+    let host_bits: Vec<u16> = host.iter().map(|value| bf16_bits(*value)).collect();
+    assert_eq!(
+        model, host_bits,
+        "the f32-activation GEMV is not the host indexer wq_b rule on the served decode shape"
+    );
+}

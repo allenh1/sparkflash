@@ -25,7 +25,7 @@ use sparkflash_comm::transport::Transport;
 use crate::tp4_resident;
 
 /// How the stage was invoked.
-pub const USAGE: &str = "sparkflash device-chain --run-stage tp4-chain (--checkpoint DIR | --tensor-index FILE) --tp-rank R --tp-world-size 4 --evidence-dir DIR [--plan-only] [--upload] [--comm-peers IP,IP,IP,IP] [--comm-base-port 29601] [--comm-timeout 120] [--comm-connect-timeout 120] [--comm-smoke] [--decode-steps N] [--prompt-tokens N] [--cubin-dir DIR] [--forward --forward-preflight --kernel-cubin-dir DIR --token-ids ID,ID --forward-reference-ids ID,ID] [--native-rounding none|combine|mhc|shared|both|LIST] [--forward-native-dense-parity [LAYER[:POSITION]]] [--forward-lean] [--forward-perf-probe]";
+pub const USAGE: &str = "sparkflash device-chain --run-stage tp4-chain (--checkpoint DIR | --tensor-index FILE) --tp-rank R --tp-world-size 4 --evidence-dir DIR [--plan-only] [--upload] [--comm-peers IP,IP,IP,IP] [--comm-base-port 29601] [--comm-timeout 120] [--comm-connect-timeout 120] [--comm-smoke] [--decode-steps N] [--prompt-tokens N] [--cubin-dir DIR] [--forward --forward-preflight --kernel-cubin-dir DIR --token-ids ID,ID --forward-reference-ids ID,ID] [--native-rounding none|combine|mhc|shared|both|LIST] [--forward-native-dense-parity [LAYER[:POSITION]]] [--forward-lean] [--forward-perf-probe] [--forward-perf-probe-nosync]";
 
 /// The parsed argv.
 #[derive(Debug)]
@@ -81,6 +81,10 @@ struct ChainArgs {
     /// --forward-perf-probe: the default-off M2 host timing probe (diagnostics only; one context
     /// synchronise per block, a separate tp4-forward-perf-r{rank}.json, no numeric or logits change).
     forward_perf_probe: bool,
+    /// --forward-perf-probe-nosync: the same per-block instrumentation with no boundary drain, so a
+    /// block's wall is the host's and the device time arrives from one run-end event harvest
+    /// (diagnostics only: same separate perf file, its mode line says which wall clock it used).
+    forward_perf_probe_nosync: bool,
 }
 
 /// When the device arm should capture per-step CUDA graphs.
@@ -124,6 +128,7 @@ impl ChainArgs {
         let mut native_dense_parity: Option<crate::tp4_forward::NativeDenseParitySpec> = None;
         let mut forward_lean = false;
         let mut forward_perf_probe = false;
+        let mut forward_perf_probe_nosync = false;
         let mut index = 0;
         while index < args.len() {
             let flag = args[index];
@@ -224,6 +229,7 @@ impl ChainArgs {
                 }
                 "--forward-lean" => forward_lean = true,
                 "--forward-perf-probe" => forward_perf_probe = true,
+                "--forward-perf-probe-nosync" => forward_perf_probe_nosync = true,
                 "--verify-weights" => {
                     #[allow(unused_unsafe)]
                     unsafe {
@@ -313,6 +319,15 @@ impl ChainArgs {
         if forward_perf_probe && !forward {
             return Err("--forward-perf-probe is only used by --forward".to_string());
         }
+        if forward_perf_probe_nosync && !forward {
+            return Err("--forward-perf-probe-nosync is only used by --forward".to_string());
+        }
+        if forward_perf_probe && forward_perf_probe_nosync {
+            return Err(
+                "--forward-perf-probe and --forward-perf-probe-nosync measure different wall clocks and cannot share a run: pick one"
+                    .to_string(),
+            );
+        }
         if !reference_ids.is_empty() && !forward {
             return Err("--forward-reference-ids is only used by --forward".to_string());
         }
@@ -352,6 +367,7 @@ impl ChainArgs {
             native_dense_parity,
             forward_lean,
             forward_perf_probe,
+            forward_perf_probe_nosync,
         })
     }
 }
@@ -450,7 +466,8 @@ fn build_token_request<'a>(
         native_rounding: args.native_rounding,
         native_dense_parity: args.native_dense_parity,
         forward_perf: crate::tp4_forward::ForwardPerf {
-            probe: args.forward_perf_probe,
+            probe: args.forward_perf_probe || args.forward_perf_probe_nosync,
+            probe_nosync: args.forward_perf_probe_nosync,
             lean: args.forward_lean,
         },
     }
@@ -492,6 +509,12 @@ fn write_forward_evidence(
     if args.forward_perf_probe {
         lines.push(format!(
             "tp4-chain r{} forward: perf_probe=on (diagnostics only: one cuCtxSynchronize per block, separate tp4-forward-perf-r{}.json; NOT a D41 gate row)",
+            args.rank, args.rank
+        ));
+    }
+    if args.forward_perf_probe_nosync {
+        lines.push(format!(
+            "tp4-chain r{} forward: perf_probe=nosync (diagnostics only: no per-block cuCtxSynchronize, host-only wall_ms + one run-end event harvest for kernel_ns, separate tp4-forward-perf-r{}.json; NOT a D41 gate row)",
             args.rank, args.rank
         ));
     }

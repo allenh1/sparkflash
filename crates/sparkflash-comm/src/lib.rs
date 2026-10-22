@@ -56,6 +56,7 @@ pub mod microbench;
 pub mod nccl;
 pub mod oneshot;
 pub mod probe;
+mod profile;
 pub mod rail;
 #[cfg(feature = "rdma")]
 pub mod rdma;

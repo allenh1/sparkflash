@@ -4,7 +4,10 @@
 //! connect upward, so every pair has exactly one socket). Payloads travel in framed messages:
 //! a 24-byte little-endian header followed by the raw bf16 bytes. A reader thread per expected
 //! frame drains the socket while the calling thread writes, which is what keeps a symmetric
-//! 4-rank all-to-all from deadlocking on full socket buffers.
+//! 4-rank all-to-all from deadlocking on full socket buffers. When the whole cluster is on this
+//! host (loopback peers), small exchanges instead read their peer frames sequentially after the
+//! sends, which removes three thread handoffs per call; `SPARK_COMM_SEQUENTIAL_READ=1` / `=0`
+//! forces that choice either way for an experiment.
 //!
 //! What this backend proves that the loopback cannot: framing and byte order on a real
 //! byte stream, partial reads (the tests feed frames one byte at a time), peer death
@@ -14,8 +17,8 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -709,6 +712,9 @@ pub struct TcpTransport {
     /// Set by the first `post_reduce_bf16`; starts one demultiplexing reader per peer.
     async_shared: Option<Arc<AsyncShared>>,
     async_readers: Vec<JoinHandle<()>>,
+    /// Whether small exchanges read peer frames sequentially after the sends instead of spawning
+    /// one reader thread per peer. See [SEQUENTIAL_READ_MAX_BYTES].
+    sequential_read: bool,
 }
 
 impl TcpTransport {
@@ -825,6 +831,11 @@ impl TcpTransport {
                 )));
             }
         }
+        // The sequential read is a measured win only where the peers share this host (loopback,
+        // no switch round trip). On a real cluster it is opt-in via SPARK_COMM_SEQUENTIAL_READ,
+        // so the default row keeps the reader threads that overlapping sends with waits relies on.
+        let sequential_read =
+            sequential_read_override().unwrap_or_else(|| cluster_is_loopback(&config));
         Ok(Self {
             rank: config.rank,
             world_size,
@@ -834,6 +845,7 @@ impl TcpTransport {
             writers,
             async_shared: None,
             async_readers: Vec::new(),
+            sequential_read,
         })
     }
 
@@ -933,6 +945,12 @@ impl TcpTransport {
             rank: self.rank as u32,
             payload_bytes,
         };
+        // One write per peer: the header is prepended to the encoded payload once and the same
+        // frame buffer is written to every peer. Posting is on the critical path of the issue half
+        // of an overlapped reduce, so the extra 24-byte copy is cheaper than three more syscalls.
+        let mut frame = Vec::with_capacity(FRAME_HEADER_BYTES + payload.len());
+        frame.extend_from_slice(&header.encode());
+        frame.extend_from_slice(&payload);
         for peer in 0..self.world_size {
             if peer == self.rank {
                 continue;
@@ -944,11 +962,14 @@ impl TcpTransport {
                     return Err(error);
                 }
             };
-            if let Err(error) = write_frame(&mut writer, &header, &payload).map_err(|error| {
-                map_peer_error(peer, self.timeout, "posting a reduce frame", error)
-            }) {
+            if let Err(error) = writer.write_all(&frame).and_then(|()| writer.flush()) {
                 shared.abort(slot, seq);
-                return Err(error);
+                return Err(map_peer_error(
+                    peer,
+                    self.timeout,
+                    "posting a reduce frame",
+                    CommError::Io(error),
+                ));
             }
         }
         Ok(ReduceHandle { slot, seq, buffer })
@@ -1176,11 +1197,58 @@ fn read_expected(
 /// One reader thread's join handle: the peer it read from and the decoded payload.
 type ReaderHandle = JoinHandle<Result<(usize, Vec<u16>), CommError>>;
 
+/// Payload bytes up to which one exchange may read its peer frames sequentially instead of
+/// spawning one reader thread per peer.
+///
+/// The synchronous path sends its whole contribution to every peer before it reads anything, so a
+/// sequential read after the sends is deadlock-free only while the outstanding writes fit in the
+/// socket send buffers. A 10 KiB contribution on four ranks is 3 x 10 KiB, far below the default
+/// buffer, while a 2 MiB contribution is not: above this threshold the exchange keeps the reader
+/// threads that were always used. The threshold applies to the sum of the frames this rank
+/// expects, which is the same magnitude as the writes it has just made.
+///
+/// The size alone does not select the path: [TcpTransport::sequential_read] must also be set,
+/// which is the default only for an all-loopback cluster. On a real cluster the reader threads
+/// stay in the row until a row measures that the sequential path is not slower there.
+const SEQUENTIAL_READ_MAX_BYTES: usize = 256 * 1024;
+
+/// True only when this rank and every peer it dials are addressed on this host.
+///
+/// That is the one topology in which the local bench measured the sequential small-frame read as
+/// strictly better: the peers' frames are microseconds away, so there is no switch round trip for
+/// a read-after-send to serialise behind.
+fn cluster_is_loopback(config: &TcpConfig) -> bool {
+    if !config.local_address().ip().is_loopback() {
+        return false;
+    }
+    (0..config.world_size).all(|peer| {
+        peer == config.rank
+            || config
+                .peer_address(peer)
+                .is_ok_and(|address| address.ip().is_loopback())
+    })
+}
+
+/// `SPARK_COMM_SEQUENTIAL_READ=1` forces the sequential small-frame read, `=0` forces the
+/// reader threads; unset or any other value keeps the topology default.
+fn sequential_read_override() -> Option<bool> {
+    static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
+    *OVERRIDE.get_or_init(
+        || match std::env::var("SPARK_COMM_SEQUENTIAL_READ").as_deref() {
+            Ok("1" | "true") => Some(true),
+            Ok("0" | "false") => Some(false),
+            _ => None,
+        },
+    )
+}
+
 /// The TCP side of the schedule driver.
 struct TcpExchange<'a> {
     transport: &'a TcpTransport,
     tag: Option<ExchangeTag>,
     readers: Vec<ReaderHandle>,
+    /// When set, the frames this exchange expects and no reader threads were spawned.
+    sequential: Option<Vec<(usize, usize)>>,
 }
 
 impl<'a> TcpExchange<'a> {
@@ -1189,6 +1257,7 @@ impl<'a> TcpExchange<'a> {
             transport,
             tag: None,
             readers: Vec::new(),
+            sequential: None,
         }
     }
 
@@ -1200,6 +1269,19 @@ impl<'a> TcpExchange<'a> {
 impl Exchange for TcpExchange<'_> {
     fn prepare(&mut self, tag: ExchangeTag, expected: &[(usize, usize)]) -> Result<(), CommError> {
         self.tag = Some(tag);
+        // Small exchanges read peer frames after the sends in collect(); only larger ones pay for
+        // one reader thread per peer. Both paths run the same read_expected parser and both feed
+        // the same validate_received, so the schedule sees identical frames either way.
+        let expected_bytes: usize = expected
+            .iter()
+            .map(|(_, elements)| elements.saturating_mul(2))
+            .sum();
+        if expected_bytes <= SEQUENTIAL_READ_MAX_BYTES && self.transport.sequential_read {
+            crate::profile::record_read_path(true);
+            self.sequential = Some(expected.to_vec());
+            return Ok(());
+        }
+        crate::profile::record_read_path(false);
         for (peer, elements) in expected {
             let reader = self.transport.read_handle(*peer)?.try_clone()?;
             let peer = *peer;
@@ -1207,8 +1289,12 @@ impl Exchange for TcpExchange<'_> {
             let timeout = self.timeout();
             let max_frame_bytes = self.transport.max_frame_bytes;
             let handle = std::thread::spawn(move || {
+                let wait_clock = crate::profile::peer_wait_clock();
                 let mut reader = reader;
-                read_expected(&mut reader, peer, tag, elements, timeout, max_frame_bytes)
+                let result =
+                    read_expected(&mut reader, peer, tag, elements, timeout, max_frame_bytes);
+                crate::profile::record_peer_wait(wait_clock);
+                result
             });
             self.readers.push(handle);
         }
@@ -1250,11 +1336,59 @@ impl Exchange for TcpExchange<'_> {
         };
         let bytes = encode_bf16(payload);
         let mut writer = self.transport.write_handle(to)?;
-        write_frame(&mut writer, &header, &bytes)
-            .map_err(|error| map_peer_error(to, self.timeout(), "writing a payload frame", error))
+        // A small frame goes out as one write instead of a 24-byte header write followed by the
+        // payload write: on the served shape that halves the syscalls per peer, and the extra
+        // 24-byte copy is irrelevant. Large frames keep the direct two-write path so a 2 MiB
+        // payload is never copied into a second buffer just to save a syscall.
+        if bytes.len() <= SEQUENTIAL_READ_MAX_BYTES {
+            let mut frame = Vec::with_capacity(FRAME_HEADER_BYTES + bytes.len());
+            frame.extend_from_slice(&header.encode());
+            frame.extend_from_slice(&bytes);
+            writer
+                .write_all(&frame)
+                .and_then(|()| writer.flush())
+                .map_err(|error| {
+                    map_peer_error(
+                        to,
+                        self.timeout(),
+                        "writing a payload frame",
+                        CommError::Io(error),
+                    )
+                })
+        } else {
+            write_frame(&mut writer, &header, &bytes).map_err(|error| {
+                map_peer_error(to, self.timeout(), "writing a payload frame", error)
+            })
+        }
     }
 
     fn collect(&mut self, expected: &[(usize, usize)]) -> Result<Vec<Received>, CommError> {
+        if let Some(peers) = self.sequential.take() {
+            let tag = self.tag.ok_or_else(|| {
+                CommError::Protocol("collect() before prepare() on the TCP exchange".to_owned())
+            })?;
+            let mut frames = Vec::with_capacity(peers.len());
+            for (peer, elements) in peers {
+                let wait_clock = crate::profile::peer_wait_clock();
+                let mut reader = self.transport.read_handle(peer)?.try_clone()?;
+                let result = read_expected(
+                    &mut reader,
+                    peer,
+                    tag,
+                    elements,
+                    self.timeout(),
+                    self.transport.max_frame_bytes,
+                );
+                crate::profile::record_peer_wait(wait_clock);
+                let (peer, payload) = result?;
+                frames.push(Received {
+                    from: peer,
+                    payload,
+                });
+            }
+            exchange::validate_received(expected, &frames)?;
+            return Ok(frames);
+        }
         let mut first_error: Option<CommError> = None;
         let mut frames = Vec::with_capacity(self.readers.len());
         for handle in self.readers.drain(..) {
@@ -1285,6 +1419,7 @@ impl Exchange for TcpExchange<'_> {
     }
 
     fn finish(&mut self) -> Result<(), CommError> {
+        self.sequential = None;
         for handle in self.readers.drain(..) {
             let _ = handle.join();
         }
@@ -1295,6 +1430,28 @@ impl Exchange for TcpExchange<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sequential small-frame read defaults to the all-loopback topology only, so a cluster
+    /// row keeps the reader threads until an experiment asks for the other path.
+    #[test]
+    fn sequential_read_defaults_to_loopback_only() {
+        assert!(cluster_is_loopback(&TcpConfig::loopback4(0, 19000)));
+        let addresses: Vec<SocketAddr> = (0..4)
+            .map(|rank| format!("192.0.2.{}:29601", 80 + rank).parse().unwrap())
+            .collect();
+        let cluster = TcpConfig::with_addresses(1, addresses).unwrap();
+        assert!(!cluster_is_loopback(&cluster));
+        // One non-loopback peer is enough: the read must not assume the others are local.
+        let mixed: Vec<SocketAddr> = vec![
+            "127.0.0.1:29601".parse().unwrap(),
+            "127.0.0.1:29602".parse().unwrap(),
+            "192.0.2.59:29603".parse().unwrap(),
+            "127.0.0.1:29604".parse().unwrap(),
+        ];
+        assert!(!cluster_is_loopback(
+            &TcpConfig::with_addresses(0, mixed).unwrap()
+        ));
+    }
 
     /// A reader that hands out one byte per call, so read_exact has to reassemble the frame.
     struct DribbleReader<'a> {

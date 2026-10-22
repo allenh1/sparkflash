@@ -1019,6 +1019,25 @@ fn pool_group(
     }
 }
 
+/// Checks that a device arm's rows have the shape the host rule would have produced.
+///
+/// The seam's device arms return plain f32 rows so the host code after the projection cannot tell
+/// them apart from the host rule's output. A row count that does not match is a broken arm, not a
+/// fallback: the seam has already decided the geometry, so an arm that cannot fill it returns
+/// None instead, and this check is for the arm that filled it wrongly.
+fn device_rows(rows: Vec<f32>, expected: usize, what: &str) -> Result<Vec<f32>, EngineError> {
+    if rows.len() != expected {
+        return Err(EngineError::Shape {
+            what: what.to_owned(),
+            detail: format!(
+                "the device arm returned {} values, the host rule produces {expected}",
+                rows.len()
+            ),
+        });
+    }
+    Ok(rows)
+}
+
 /// Pools `ratio` consecutive pre-RoPE KV rows into one latent with a learned softmax gate
 /// (model.py:429-486).
 ///
@@ -1032,6 +1051,7 @@ fn pool_group(
 /// # Errors
 ///
 /// [EngineError] from any weight read or shape mismatch, including an input that is not whole rows.
+#[allow(clippy::too_many_arguments)] // the seam step's inputs plus the arm it may delegate to
 fn compressor_step(
     config: &ModelConfig,
     layer: usize,
@@ -1040,6 +1060,7 @@ fn compressor_step(
     start_pos: usize,
     state: &mut AttnState,
     src: Reads<'_>,
+    mut backend: Option<&mut dyn AttentionProjectionBackend>,
 ) -> Result<(), EngineError> {
     let AttnState {
         compressor,
@@ -1070,8 +1091,20 @@ fn compressor_step(
         .expect("the compressor weights were just read");
     if ratio == 1 {
         // model.py:461-462: one token per group, so a plain projection with no gate and no pooling.
-        let mut latent = vec![0.0; seqlen * head_dim];
-        linalg::matmul_hot_rows(&mut latent, x, &cached.wkv, head_dim, dim, seqlen)?;
+        // The device arm, when it serves this layer, hands back the projection's f32 accumulators;
+        // only the host rule is replaced, the narrowing and the norm below still run.
+        let device = match backend.as_mut() {
+            Some(arm) => arm.compressor_wkv(config, layer, prefix, x, src.source, src.limit)?,
+            None => None,
+        };
+        let mut latent = match device {
+            Some(rows) => device_rows(rows, seqlen * head_dim, "compressor wkv projection")?,
+            None => {
+                let mut host = vec![0.0; seqlen * head_dim];
+                linalg::matmul_hot_rows(&mut host, x, &cached.wkv, head_dim, dim, seqlen)?;
+                host
+            }
+        };
         // At ratio 1 the reference keeps bf16 wkv weights and returns norm(wkv(x)) as a bf16
         // tensor (model.py:446-449, 461-463).
         narrow_bf16(&mut latent);
@@ -1091,10 +1124,33 @@ fn compressor_step(
         what: "compressor weights".to_owned(),
         detail: format!("layer {layer} pools at ratio {ratio} but its gate matrix was not read"),
     })?;
-    let mut kv = vec![0.0; seqlen * head_dim];
-    linalg::matmul_hot_rows(&mut kv, x, &cached.wkv, head_dim, dim, seqlen)?;
-    let mut score = vec![0.0; seqlen * head_dim];
-    linalg::matmul_hot_rows(&mut score, x, wgate, head_dim, dim, seqlen)?;
+    // Above ratio 1 both projections are replaced together or not at all: a group's latent is
+    // pooled from the pair, so mixing one arm's rows with the other host rule's rows is not a state
+    // the seam has. Each call is a no-op on None, which leaves that projection's host rule to run.
+    let device_kv = match backend.as_mut() {
+        Some(arm) => arm.compressor_wkv(config, layer, prefix, x, src.source, src.limit)?,
+        None => None,
+    };
+    let device_score = match backend.as_mut() {
+        Some(arm) => arm.compressor_wgate(config, layer, prefix, x, src.source, src.limit)?,
+        None => None,
+    };
+    let kv = match device_kv {
+        Some(rows) => device_rows(rows, seqlen * head_dim, "compressor wkv projection")?,
+        None => {
+            let mut host = vec![0.0; seqlen * head_dim];
+            linalg::matmul_hot_rows(&mut host, x, &cached.wkv, head_dim, dim, seqlen)?;
+            host
+        }
+    };
+    let score = match device_score {
+        Some(rows) => device_rows(rows, seqlen * head_dim, "compressor wgate projection")?,
+        None => {
+            let mut host = vec![0.0; seqlen * head_dim];
+            linalg::matmul_hot_rows(&mut host, x, wgate, head_dim, dim, seqlen)?;
+            host
+        }
+    };
     // One scratch weight per pool slot, reused by every group in this call.
     let mut weights = vec![0.0f32; ratio];
     let rows = end_pos / ratio - start_pos / ratio;
@@ -1262,8 +1318,10 @@ struct IndexRequest<'a> {
 /// The q_norm output is a bf16 tensor, and the ColumnParallelLinear at the model dtype
 /// quantises it to E4M3 over 32-value blocks with power-of-two scales before the fp8 GEMM.
 /// This is the one implementation of that step: the host path and the device arm's twin both
-/// reach it through [indexer_wq_b_native].
-fn indexer_activation_native(latent: &[f32], width: usize) -> Vec<f32> {
+/// reach it through [indexer_wq_b_native]. It is also public so a device arm stages exactly this
+/// row - the same bf16 narrowing and the same fp8 round trip - instead of re-deriving it, which is
+/// what keeps the device arm's f32 activation input the host rule's input.
+pub fn indexer_activation_native(latent: &[f32], width: usize) -> Vec<f32> {
     let mut values: Vec<f32> = latent
         .iter()
         .map(|value| quant::bf16_round(*value))
@@ -1988,6 +2046,46 @@ pub fn attention_seam_step(
     src: &dyn WeightSource,
     limit: usize,
 ) -> Result<AttentionSeamStep, EngineError> {
+    attention_seam_step_with_backend(
+        config,
+        layer,
+        prefix,
+        x,
+        q_latent,
+        start_pos,
+        state,
+        src,
+        limit,
+        &mut HostAttentionProjectionBackend,
+    )
+}
+
+/// [attention_seam_step] with an attention projection backend that may run the indexer's query
+/// projection on a device.
+///
+/// The compressor, the index keys, the per-query weights, the candidate select and the fp4 cache
+/// stay host code exactly as in [attention_seam_step]: the only statement the backend is consulted
+/// for is the indexer's own wq_b ([AttentionProjectionBackend::indexer_wq_b]), which the host arm
+/// runs as [indexer_wq_b_native]. A backend that returns `None` for a layer leaves that layer's
+/// projection to the host rule, so a backend that cannot serve a shape falls back to exactly the
+/// host arithmetic instead of changing it.
+///
+/// # Errors
+///
+/// As [attention_seam_step], plus whatever the backend returns.
+#[allow(clippy::too_many_arguments)] // the same distinct inputs as [attention_seam_step], plus the backend.
+pub fn attention_seam_step_with_backend(
+    config: &ModelConfig,
+    layer: usize,
+    prefix: &str,
+    x: &[f32],
+    q_latent: &[f32],
+    start_pos: usize,
+    state: &mut AttnState,
+    src: &dyn WeightSource,
+    limit: usize,
+    backend: &mut dyn AttentionProjectionBackend,
+) -> Result<AttentionSeamStep, EngineError> {
     let src = Reads { source: src, limit };
     let dim = config.dim;
     let seqlen = rows_of(x, dim, "attention seam input")?;
@@ -2011,14 +2109,32 @@ pub fn attention_seam_step(
     state.window_rows = Some(window_rows);
     let mut compressed_ids = Vec::new();
     if ratio > 0 {
-        compressor_step(config, layer, prefix, x, start_pos, state, src)?;
-        write_index_keys(config, layer, prefix, start_pos, state, src)?;
+        compressor_step(
+            config,
+            layer,
+            prefix,
+            x,
+            start_pos,
+            state,
+            src,
+            Some(&mut *backend),
+        )?;
+        write_index_keys(
+            config,
+            layer,
+            prefix,
+            start_pos,
+            state,
+            src,
+            Some(&mut *backend),
+        )?;
         if is_index_source(config, layer) && compress_len > 0 {
-            state.index_weights = index_weights(config, prefix, x, seqlen, src)?;
+            state.index_weights =
+                index_weights(config, layer, prefix, x, seqlen, src, Some(&mut *backend))?;
         } else {
             state.index_weights.clear();
         }
-        compressed_indices(
+        compressed_indices_with_backend(
             state,
             config,
             layer,
@@ -2027,6 +2143,7 @@ pub fn attention_seam_step(
             prefix,
             &mut compressed_ids,
             limit,
+            backend,
         )?;
         write_compressed_cache(config, layer, start_pos, state)?;
         state.compressed_len = compress_len;
@@ -2118,6 +2235,81 @@ pub trait AttentionProjectionBackend {
         limit: usize,
     ) -> Result<Option<Vec<f32>>, EngineError> {
         let _ = (config, layer, prefix, latent, src, limit);
+        Ok(None)
+    }
+
+    /// The compressor's `wkv` projection over the layer input: `[seqlen][head_dim]` f32
+    /// accumulators, exactly what the host `matmul_hot_rows` call in [compressor_step] produces.
+    ///
+    /// The rows are not narrowed, normed or pooled here. At ratio 1 the caller narrows and norms
+    /// them; above ratio 1 the caller pools them. `None` leaves the projection to the engine's host
+    /// rule, which is what the host implementation returns.
+    fn compressor_wkv(
+        &mut self,
+        config: &ModelConfig,
+        layer: usize,
+        prefix: &str,
+        x: &[f32],
+        src: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Option<Vec<f32>>, EngineError> {
+        let _ = (config, layer, prefix, x, src, limit);
+        Ok(None)
+    }
+
+    /// The compressor's `wgate` projection over the layer input: `[seqlen][head_dim]` f32
+    /// accumulators, the counterpart of [Self::compressor_wkv] that `wgate` runs on
+    /// (model.py:455-458).
+    ///
+    /// `None` leaves the projection to the engine's host rule.
+    fn compressor_wgate(
+        &mut self,
+        config: &ModelConfig,
+        layer: usize,
+        prefix: &str,
+        x: &[f32],
+        src: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Option<Vec<f32>>, EngineError> {
+        let _ = (config, layer, prefix, x, src, limit);
+        Ok(None)
+    }
+
+    /// The indexer's key projection `wk` over this step's latent:
+    /// `[latent_rows][index_head_dim]` f32 accumulators, before the k_norm, the RoPE and the fp4
+    /// round trip.
+    ///
+    /// `None` leaves the projection to the engine's host rule.
+    fn indexer_wk(
+        &mut self,
+        config: &ModelConfig,
+        layer: usize,
+        prefix: &str,
+        latent: &[f32],
+        src: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Option<Vec<f32>>, EngineError> {
+        let _ = (config, layer, prefix, latent, src, limit);
+        Ok(None)
+    }
+
+    /// The indexer's per-query weights projection `weights_proj` over the layer input, rounded
+    /// to bf16 as its bf16 Linear hands it on and BEFORE the index factor multiplies it
+    /// (model.py:513, 555): `[seqlen][index_n_heads]` f32 values, every one bf16-representable.
+    ///
+    /// `None` leaves the projection to the engine's host rule.
+    #[allow(clippy::too_many_arguments)] // the seam's inputs plus the layer the arm stages by
+    fn indexer_weights_proj(
+        &mut self,
+        config: &ModelConfig,
+        layer: usize,
+        prefix: &str,
+        x: &[f32],
+        seqlen: usize,
+        src: &dyn WeightSource,
+        limit: usize,
+    ) -> Result<Option<Vec<f32>>, EngineError> {
+        let _ = (config, layer, prefix, x, seqlen, src, limit);
         Ok(None)
     }
 
@@ -2583,27 +2775,43 @@ fn window_kv_with(
 /// [EngineError] from any weight read or shape mismatch.
 fn index_weights(
     config: &ModelConfig,
+    layer: usize,
     prefix: &str,
     x: &[f32],
     seqlen: usize,
     src: Reads<'_>,
+    mut backend: Option<&mut dyn AttentionProjectionBackend>,
 ) -> Result<Vec<f32>, EngineError> {
     let dim = config.dim;
     let heads = config.index_n_heads;
-    let projection = plain_view(
-        src,
-        &format!("{prefix}.attn.indexer.weights_proj.weight"),
-        heads,
-        dim,
-    )?;
     // The projection is a bf16 Linear over the bf16 layer input and hands back bf16; the factor
-    // then multiplies that bf16 tensor and narrows the product (model.py:513, 555).
-    let rounded: Vec<f32> = x.iter().map(|value| quant::bf16_round(*value)).collect();
-    let mut values = vec![0.0; seqlen * heads];
-    projection.matmul(&mut values, &rounded, heads, dim, seqlen)?;
-    for value in values.iter_mut() {
-        *value = quant::bf16_round(*value);
-    }
+    // then multiplies that bf16 tensor and narrows the product (model.py:513, 555). A device arm
+    // that serves the projection returns the same bf16-rounded rows, so the factor below still runs
+    // here, on whichever rows the projection produced.
+    let device = match backend.as_mut() {
+        Some(arm) => {
+            arm.indexer_weights_proj(config, layer, prefix, x, seqlen, src.source, src.limit)?
+        }
+        None => None,
+    };
+    let mut values = match device {
+        Some(rows) => device_rows(rows, seqlen * heads, "indexer weights_proj projection")?,
+        None => {
+            let projection = plain_view(
+                src,
+                &format!("{prefix}.attn.indexer.weights_proj.weight"),
+                heads,
+                dim,
+            )?;
+            let rounded: Vec<f32> = x.iter().map(|value| quant::bf16_round(*value)).collect();
+            let mut host = vec![0.0; seqlen * heads];
+            projection.matmul(&mut host, &rounded, heads, dim, seqlen)?;
+            for value in host.iter_mut() {
+                *value = quant::bf16_round(*value);
+            }
+            host
+        }
+    };
     let factor = ((config.index_head_dim as f64).powf(-0.5) * (heads as f64).powf(-0.5)) as f32;
     for value in values.iter_mut() {
         *value = quant::bf16_round(*value * factor);
@@ -2627,6 +2835,7 @@ fn write_index_keys(
     start_pos: usize,
     state: &mut AttnState,
     src: Reads<'_>,
+    mut backend: Option<&mut dyn AttentionProjectionBackend>,
 ) -> Result<(), EngineError> {
     if !owns_index_keys(config, layer) {
         return Ok(());
@@ -2653,21 +2862,38 @@ fn write_index_keys(
     }
     let head_dim = config.head_dim;
     let index_head_dim = config.index_head_dim;
-    let wk = plain_view(
-        src,
-        &format!("{prefix}.attn.indexer.wk.weight"),
-        index_head_dim,
-        head_dim,
-    )?;
+    // A device arm that serves this layer's wk returns the projection's f32 accumulators. The
+    // k_norm, the bf16 narrowing, the RoPE and the fp4 round trip below are the host rule either
+    // way, so an arm only ever replaces the one matmul.
+    let device = match backend.as_mut() {
+        Some(arm) => arm.indexer_wk(config, layer, prefix, &state.latent, src.source, src.limit)?,
+        None => None,
+    };
     let norm = weight(src, &format!("{prefix}.attn.indexer.k_norm.weight"))?;
-    let mut keys = vec![0.0; state.latent_rows * index_head_dim];
-    wk.matmul(
-        &mut keys,
-        &state.latent,
-        index_head_dim,
-        head_dim,
-        state.latent_rows,
-    )?;
+    let mut keys = match device {
+        Some(rows) => device_rows(
+            rows,
+            state.latent_rows * index_head_dim,
+            "indexer wk projection",
+        )?,
+        None => {
+            let wk = plain_view(
+                src,
+                &format!("{prefix}.attn.indexer.wk.weight"),
+                index_head_dim,
+                head_dim,
+            )?;
+            let mut host = vec![0.0; state.latent_rows * index_head_dim];
+            wk.matmul(
+                &mut host,
+                &state.latent,
+                index_head_dim,
+                head_dim,
+                state.latent_rows,
+            )?;
+            host
+        }
+    };
     linalg::rms_norm(&mut keys, &norm, index_head_dim, config.norm_eps as f32)?;
     // k_norm casts back to bf16 and the rope writes back into that bf16 tensor before the
     // fp4 round trip (model.py:281-293, 392-409, 540-546), so both are narrowed (F5).
@@ -3231,11 +3457,11 @@ fn attention_forward_with(
     let mut compressed_ids: Vec<usize> = Vec::new();
     let mut compressed_rows: Vec<f32> = Vec::new();
     if ratio > 0 {
-        compressor_step(config, layer, prefix, x, start_pos, state, src)?;
+        compressor_step(config, layer, prefix, x, start_pos, state, src, None)?;
         // The index keys read the latent before the compressed cache rotates it (model.py:531).
-        write_index_keys(config, layer, prefix, start_pos, state, src)?;
+        write_index_keys(config, layer, prefix, start_pos, state, src, None)?;
         if is_index_source(config, layer) && compress_len > 0 {
-            state.index_weights = index_weights(config, prefix, x, seqlen, src)?;
+            state.index_weights = index_weights(config, layer, prefix, x, seqlen, src, None)?;
         } else {
             state.index_weights.clear();
         }
@@ -4990,6 +5216,7 @@ mod tests {
                 source: &hand,
                 limit: LIMIT,
             },
+            None,
         )
         .expect("one pooled group");
         assert_eq!(state.latent_rows, 1);
@@ -5456,6 +5683,126 @@ mod tests {
             seam_state(&warm),
             seam_state(&cold),
             "the seam state differs with a cache"
+        );
+    }
+
+    /// A backend that answers nothing and counts how often the seam step asks for the indexer's
+    /// projection. The other five projections are the attention sublayer's, which the seam step
+    /// does not run at all, so a call to one of them is a bug in what the step consults the
+    /// backend for; panicking names it instead of hiding it.
+    struct AskedOnlyIndexer {
+        asked: usize,
+    }
+
+    impl AttentionProjectionBackend for AskedOnlyIndexer {
+        fn wq_a(
+            &mut self,
+            _config: &ModelConfig,
+            _layer: usize,
+            _prefix: &str,
+            _x: &[f32],
+            _src: &dyn WeightSource,
+            _limit: usize,
+        ) -> Result<Vec<f32>, EngineError> {
+            panic!("the seam step must not ask the backend for wq_a")
+        }
+
+        fn wq_b(
+            &mut self,
+            _config: &ModelConfig,
+            _layer: usize,
+            _prefix: &str,
+            _latent: &[f32],
+            _src: &dyn WeightSource,
+            _limit: usize,
+        ) -> Result<Vec<f32>, EngineError> {
+            panic!("the seam step must not ask the backend for wq_b")
+        }
+
+        fn wkv(
+            &mut self,
+            _config: &ModelConfig,
+            _layer: usize,
+            _prefix: &str,
+            _x: &[f32],
+            _src: &dyn WeightSource,
+            _limit: usize,
+        ) -> Result<Vec<f32>, EngineError> {
+            panic!("the seam step must not ask the backend for wkv")
+        }
+
+        fn wo_a(
+            &mut self,
+            _config: &ModelConfig,
+            _prefix: &str,
+            _wide: &[f32],
+            _src: &dyn WeightSource,
+            _limit: usize,
+        ) -> Result<Vec<f32>, EngineError> {
+            panic!("the seam step must not ask the backend for wo_a")
+        }
+
+        fn wo_b(
+            &mut self,
+            _config: &ModelConfig,
+            _prefix: &str,
+            _grouped: &[f32],
+            _src: &dyn WeightSource,
+            _limit: usize,
+        ) -> Result<Vec<f32>, EngineError> {
+            panic!("the seam step must not ask the backend for wo_b")
+        }
+
+        fn indexer_wq_b(
+            &mut self,
+            _config: &ModelConfig,
+            _layer: usize,
+            _prefix: &str,
+            _latent: &[f32],
+            _src: &dyn WeightSource,
+            _limit: usize,
+        ) -> Result<Option<Vec<f32>>, EngineError> {
+            self.asked += 1;
+            // None keeps the host native rule, which is what makes this the transparency test.
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn the_seam_step_with_a_backend_is_the_host_seam_step_until_the_backend_answers() {
+        let config = ModelConfig::tiny();
+        let hand = Hand::for_config(&config);
+        let x = chunk(&config, 1, 0);
+        let q = zero_latent(&config);
+        let run = |backend: &mut dyn AttentionProjectionBackend| {
+            reset_shared_attention();
+            let mut state = AttnState::for_config(&config);
+            let mut seams = Vec::new();
+            for position in 0..4 {
+                seams.push(
+                    attention_seam_step_with_backend(
+                        &config, 0, "layers.0", &x, &q, position, &mut state, &hand, LIMIT, backend,
+                    )
+                    .expect("seam step"),
+                );
+            }
+            (seams, seam_state(&state).0, seam_state(&state).1)
+        };
+        let host = run(&mut HostAttentionProjectionBackend);
+        let mut asked = AskedOnlyIndexer { asked: 0 };
+        let with_backend = run(&mut asked);
+        assert_eq!(
+            host.0, with_backend.0,
+            "a backend that answers None changed the seam steps"
+        );
+        assert_eq!(
+            (host.1, host.2),
+            (with_backend.1, with_backend.2),
+            "a backend that answers None changed the seam state"
+        );
+        assert!(
+            asked.asked > 0,
+            "the backend was never asked for the indexer's projection, so the index-source layer did not reach it"
         );
     }
 

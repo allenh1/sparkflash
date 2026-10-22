@@ -502,6 +502,84 @@ pub fn e4m3_encode(value: f32) -> u8 {
     }
 }
 
+/// The E4M3 code nearest an f32 by bit arithmetic: round to nearest, ties to the even mantissa,
+/// saturating at the top of the range (0x7E, never the NaN code at 0x7F), a NaN encoded as 0x7F.
+///
+/// This is [e4m3_encode]'s answer without the bisection: the activation quantiser runs it once per
+/// element on every seam, and the search over the 127 finite codes made that row several times more
+/// expensive than the conversion it denotes. [e4m3_encode] remains the definition and the oracle;
+/// the tests compare the two bit for bit, exhaustively over every f32 bit pattern as well as on the
+/// shipped rows.
+#[must_use]
+fn e4m3_encode_bits(value: f32) -> u8 {
+    let bits = value.to_bits();
+    let sign = (bits >> 31) & 1;
+    let exponent = (bits >> 23) & 0xFF;
+    let mantissa = bits & 0x007F_FFFF;
+    let sign_byte = (sign << 7) as u8;
+    let magnitude = bits & 0x7FFF_FFFF;
+
+    if magnitude < 0x0080_0000 {
+        // Zero and f32 subnormals: the E4M3 subnormal step is 2^-9, and a tie at exactly 2^-10
+        // rounds to the even code, which is zero.
+        let rounds_up = f32::from_bits(magnitude) > 0.000_976_562_5;
+        return sign_byte | u8::from(rounds_up);
+    }
+    if exponent == 0xFF {
+        if mantissa != 0 {
+            return E4M3_NAN; // the canonical positive quiet NaN for either sign
+        }
+        return sign_byte | E4M3_MAX_CODE;
+    }
+
+    let significand = 0x0080_0000 | mantissa;
+    let unbiased = exponent as i32 - 127;
+
+    // The subnormal range is handled first, from the unrounded significand: the code is
+    // round(significand / 2^(14 - unbiased)) because the step is 2^-9. A value that rounds up to
+    // 2^-6 is then a tie at the subnormal boundary, and deriving it from the carried exponent (as
+    // the normal path does) would round it a full step too high.
+    if unbiased < -6 {
+        let shift = 14 - unbiased;
+        if shift >= 32 {
+            return sign_byte;
+        }
+        let code = significand >> shift;
+        let tail = significand & ((1u32 << shift) - 1);
+        let half = 1u32 << (shift - 1);
+        let mut rounded = code;
+        if tail > half || (tail == half && (rounded & 1) != 0) {
+            rounded += 1;
+        }
+        if rounded >= 8 {
+            return sign_byte | 0x08; // 2^-6, the smallest normal
+        }
+        return sign_byte | rounded as u8;
+    }
+
+    // Normal range: E4M3 keeps three of the 23 mantissa bits, so the rounding point is bit 20 of
+    // the 24-bit significand.
+    let mut kept = significand >> 20;
+    let remainder = significand & 0x000F_FFFF;
+    let mut exponent_value = unbiased;
+    if remainder > 0x0008_0000 || (remainder == 0x0008_0000 && (kept & 1) != 0) {
+        kept += 1;
+    }
+    if kept == 16 {
+        kept = 8;
+        exponent_value += 1;
+    }
+    // Saturation: exponent field 15 with mantissa field 7 is the E4M3 NaN, so a value that rounds
+    // up to 1.875 * 2^8 (= 480) has nowhere to go and saturates to 448, exactly as the bisection
+    // settles on 0x7E for anything at or past the top of the range.
+    if exponent_value > 8 || (exponent_value == 8 && kept == 15) {
+        return sign_byte | E4M3_MAX_CODE;
+    }
+    let exponent_field = (exponent_value + 7) as u32;
+    let mantissa_field = kept - 8;
+    sign_byte | ((exponent_field as u8) << 3) | mantissa_field as u8
+}
+
 /// Encodes an f32 as the nearest E2M1 nibble, ties going to the even mantissa.
 ///
 /// The same shape as [e4m3_encode] over a grid of eight magnitudes, saturated at 6. The format has
@@ -669,6 +747,14 @@ fn block_scale_code(block: &[f32], max_inv: f32, floor: f32) -> u8 {
 /// floor is not a hack to avoid a division by zero - it is what the reference does, and it is why a
 /// zero block survives a round trip instead of turning into NaN.
 ///
+/// Step 3's encoder is [e4m3_encode_bits], not [e4m3_encode]'s bisection over the 127 finite codes.
+/// They are the same function of the f32 bits - nearest code, ties to the even mantissa, saturation
+/// falling out of the same carry - and the tests pin that over every finite code and its neighbours,
+/// the BF16 ties, NaN payloads, +-inf, the saturation boundary, 200k random bit patterns, and (in
+/// the ignored release test) all 2^32 f32 bit patterns. [e4m3_encode] stays as the definition and the
+/// oracle; this is a hot path (it is the FFN seam's quantise, and a GEMM's whole A operand), and the
+/// bisection costs eight decodes per value.
+///
 /// # Errors
 ///
 /// [QuantError::BlockSize] when the element count is not a whole number of blocks. The reference
@@ -690,7 +776,46 @@ pub fn quantize_activation_fp8(values: &[f32]) -> Result<QuantisedFp8, QuantErro
         // E8M0 is exact as well.
         let scale = f8e8m0_to_f32(code);
         for &value in block {
-            codes.push(e4m3_encode(
+            codes.push(e4m3_encode_bits(
+                (value / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX),
+            ));
+        }
+    }
+    Ok(QuantisedFp8 { codes, scales })
+}
+
+/// [quantize_activation_fp8] with the BF16 narrowing fused into its blocks.
+///
+/// The seam path narrows a row to BF16 before quantising it (the released W8A8 rule: the activation
+/// is a BF16 module output). This is that composition in one pass - each value is rounded with
+/// [bf16_round] before its block scale is chosen and before it is divided - and it produces the
+/// bytes of quantize_activation_fp8 over the narrowed row. The encoder inside is
+/// [e4m3_encode_bits], whose answers the tests pin to [e4m3_encode].
+///
+/// The per-element divide stays a divide: it is the reference's operation, and a reciprocal
+/// multiply would be a second rounding to argue about rather than the same one.
+///
+/// # Errors
+///
+/// [QuantError::BlockSize] when the element count is not a whole number of [SCALE_BLOCK]s.
+pub fn quantize_activation_fp8_narrowed(values: &[f32]) -> Result<QuantisedFp8, QuantError> {
+    if !values.len().is_multiple_of(SCALE_BLOCK) {
+        return Err(QuantError::BlockSize {
+            elements: values.len(),
+        });
+    }
+    let mut codes = Vec::with_capacity(values.len());
+    let mut scales = Vec::with_capacity(values.len() / SCALE_BLOCK);
+    for block in values.as_chunks::<SCALE_BLOCK>().0 {
+        let mut block_values = [0.0f32; SCALE_BLOCK];
+        for (narrowed, value) in block_values.iter_mut().zip(block) {
+            *narrowed = bf16_round(*value);
+        }
+        let code = block_scale_code(&block_values, FP8_MAX_INV, ACTIVATION_AMAX_FLOOR);
+        scales.push(code);
+        let scale = f8e8m0_to_f32(code);
+        for value in block_values {
+            codes.push(e4m3_encode_bits(
                 (value / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX),
             ));
         }
@@ -799,5 +924,225 @@ mod tests {
             decode(DType::F16, &codes, elements),
             Err(QuantError::Unsupported { dtype: DType::F16 })
         ));
+    }
+    /// The bit-arithmetic encoder must give the bisection's exact answer: on the values that sit on
+    /// a rounding boundary, on every one of the 127 finite codes and its neighbours, and on a
+    /// deterministic sweep of the f32 bit space.
+    #[test]
+    fn the_bit_encoder_matches_the_bisection_encoder() {
+        let mut values: Vec<f32> = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            448.0,
+            -448.0,
+            464.0,
+            448.5,
+            512.0,
+            0.000_976_562_5,
+            0.000_976_562_4,
+            0.000_976_562_6,
+            2.0f32.powi(-9),
+            7.0 * 2.0f32.powi(-9),
+            7.5 * 2.0f32.powi(-9),
+            2.0f32.powi(-6),
+            1.0 + 2.0f32.powi(-4),
+            1.0 + 3.0 * 2.0f32.powi(-4),
+            1.0 - 2.0f32.powi(-5),
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            -f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(0x7fc0_0001),
+            f32::from_bits(0xffc0_1234),
+            f32::from_bits(0x0000_0001),
+        ];
+        for code in 0..=0x7E {
+            let value = f8e4m3_to_f32(code);
+            values.push(value);
+            values.push(-value);
+            values.push(f32::from_bits(value.to_bits().wrapping_add(1)));
+            values.push(f32::from_bits(value.to_bits().wrapping_sub(1)));
+        }
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for _ in 0..200_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            values.push(f32::from_bits(state as u32));
+        }
+        for (index, value) in values.iter().enumerate() {
+            assert_eq!(
+                e4m3_encode_bits(*value),
+                e4m3_encode(*value),
+                "value {index} ({value:?}, {:#010x})",
+                value.to_bits()
+            );
+        }
+    }
+
+    /// The shipped activation quantiser is the bisection reference, byte for byte.
+    ///
+    /// The encoder inside it is now the bit conversion; this keeps [e4m3_encode]'s bisection as the
+    /// oracle and compares the whole quantiser - block scale, decode, divide, clamp, code - against a
+    /// reference implementation of the same rule that calls the bisection.
+    #[test]
+    fn the_activation_quantiser_is_the_bisection_reference() {
+        fn reference(values: &[f32]) -> (Vec<u8>, Vec<u8>) {
+            let mut codes = Vec::with_capacity(values.len());
+            let mut scales = Vec::with_capacity(values.len() / SCALE_BLOCK);
+            for block in values.as_chunks::<SCALE_BLOCK>().0 {
+                let code = block_scale_code(block, FP8_MAX_INV, ACTIVATION_AMAX_FLOOR);
+                scales.push(code);
+                let scale = f8e8m0_to_f32(code);
+                for &value in block {
+                    codes.push(e4m3_encode(
+                        (value / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX),
+                    ));
+                }
+            }
+            (codes, scales)
+        }
+        let mut rows: Vec<Vec<f32>> = Vec::new();
+        // The shipped activation widths, a flat row, and one that saturates the top code.
+        for width in [1280usize, 2048, 5120] {
+            rows.push(
+                (0..width)
+                    .map(|index| ((index % 61) as f32 - 30.0) * 0.05)
+                    .collect(),
+            );
+        }
+        rows.push(vec![0.0; 5120]);
+        rows.push(vec![448.0; 5120]);
+        rows.push(vec![-1000.0; 5120]);
+        rows.push(vec![f32::NAN; 64]);
+        rows.push(
+            (0..5120)
+                .map(|index| match index % 7 {
+                    0 => f32::INFINITY,
+                    1 => f32::NEG_INFINITY,
+                    2 => f32::from_bits(0x0000_0001),
+                    3 => 0.0,
+                    _ => (index as f32) * 0.000_976_562_5,
+                })
+                .collect(),
+        );
+        // A random sweep, one row per block offset so block edges move.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for round in 0..24 {
+            let mut row = Vec::with_capacity(5120);
+            for _ in 0..5120 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                row.push((state >> 40) as f32 / 1024.0 - 0.5);
+            }
+            row.rotate_left(round * 32);
+            rows.push(row);
+        }
+        for (index, values) in rows.iter().enumerate() {
+            let shipped = quantize_activation_fp8(values).expect("quantise");
+            let (codes, scales) = reference(values);
+            assert_eq!(
+                shipped.codes(),
+                codes.as_slice(),
+                "codes differ on row {index}"
+            );
+            assert_eq!(
+                shipped.scales(),
+                scales.as_slice(),
+                "scales differ on row {index}"
+            );
+        }
+    }
+
+    /// Every f32 bit pattern, against the bisection. The encoder is a pure function of the bits, so
+    /// this is the whole proof for it; run it in release:
+    ///   cargo test --release -p sparkflash-engine --lib every_f32 -- --ignored --nocapture
+    #[test]
+    #[ignore = "exhaustive over 2^32 bit patterns: run in release"]
+    fn every_f32_bit_pattern_encodes_to_the_bisections_code() {
+        let mut mismatches = 0usize;
+        for bits in 0..=u32::MAX {
+            let value = f32::from_bits(bits);
+            if e4m3_encode_bits(value) != e4m3_encode(value) {
+                mismatches += 1;
+                assert!(
+                    mismatches <= 8,
+                    "more than eight mismatches; first at {bits:#010x}"
+                );
+            }
+        }
+        assert_eq!(mismatches, 0);
+        println!("every one of the 2^32 f32 bit patterns encodes identically");
+    }
+
+    /// The fused narrowed quantiser must produce the two-step path's bytes: BF16-narrow the row, then
+    /// run the shipped quantiser. Checked on the shipped activation widths (the query path's 1280,
+    /// the attention output's 2048, the projections' 5120) and on the value edges.
+    #[test]
+    fn the_narrowed_quantiser_matches_the_two_step_path() {
+        let mut state = 0x1319_8a2e_0370_7344u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / 1024.0 - 0.5
+        };
+        let edges: [f32; 16] = [
+            0.0,
+            -0.0,
+            1.0,
+            1.0 + 2.0f32.powi(-9),
+            1.0 + 2.0f32.powi(-4),
+            -1.0 - 2.0f32.powi(-4),
+            448.0,
+            f32::MAX,
+            -f32::MAX,
+            f32::MIN_POSITIVE,
+            f32::from_bits(0x0000_0001),
+            f32::from_bits(0x7fc0_0001),
+            f32::from_bits(0xffc0_1234),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            2.0f32.powi(-9),
+        ];
+        for count in [32usize, 64, 96, 1280, 2048, 5120] {
+            for fill in 0..3 {
+                let mut values: Vec<f32> = (0..count).map(|_| next()).collect();
+                if fill == 1 {
+                    for (index, value) in values.iter_mut().enumerate() {
+                        *value = edges[index % edges.len()];
+                    }
+                }
+                if fill == 2 {
+                    // One whole block of NaNs (scale becomes NaN), one of infinities, one of zeros.
+                    for (index, value) in values.iter_mut().enumerate() {
+                        *value = match (index / 32) % 3 {
+                            0 => f32::from_bits(0x7fc0_0001),
+                            1 => f32::INFINITY,
+                            _ => 0.0,
+                        };
+                    }
+                }
+                let narrowed: Vec<f32> = values.iter().map(|value| bf16_round(*value)).collect();
+                let expected = quantize_activation_fp8(&narrowed).expect("quantised");
+                let actual = quantize_activation_fp8_narrowed(&values).expect("quantised");
+                assert_eq!(
+                    actual.codes(),
+                    expected.codes(),
+                    "codes differ at {count} values, fill {fill}"
+                );
+                assert_eq!(
+                    actual.scales(),
+                    expected.scales(),
+                    "scales differ at {count} values, fill {fill}"
+                );
+            }
+        }
+        let error = quantize_activation_fp8_narrowed(&[1.0; 33]).expect_err("refused");
+        assert!(matches!(error, QuantError::BlockSize { elements: 33 }));
     }
 }

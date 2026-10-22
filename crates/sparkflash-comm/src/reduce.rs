@@ -46,6 +46,23 @@ pub fn canonical_all_reduce_into(out: &mut [u16], payloads: &[&[u16]]) -> Result
             )));
         }
     }
+    // The four-rank world is the only shape the served decode path uses, and it is worth
+    // unrolling the inner loop for it: the additions below are the same sequence of f32 adds in
+    // the same ascending rank order as the generic loop (0.0f, then rank 0, 1, 2, 3, one RNE
+    // round), just with the pane indexing hoisted out of the element loop. No reassociation and
+    // no precision change: a compiler may not reassociate floating-point additions without fast
+    // math, and this crate does not enable it.
+    if let [pane0, pane1, pane2, pane3] = payloads {
+        for (slot, value) in out.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            acc += bf16_to_f32(pane0[slot]);
+            acc += bf16_to_f32(pane1[slot]);
+            acc += bf16_to_f32(pane2[slot]);
+            acc += bf16_to_f32(pane3[slot]);
+            *value = f32_to_bf16_rn(acc);
+        }
+        return Ok(());
+    }
     for (slot, value) in out.iter_mut().enumerate() {
         let mut acc = 0.0f32;
         for payload in payloads {

@@ -36,6 +36,8 @@ pub mod engram_native_ref;
 pub mod engram_wkv_launch;
 pub mod flash_mla_csa2_ring_launch;
 pub mod flash_mla_csa2_seq_launch;
+pub mod hostw_gemv_launch;
+pub mod hostw_gemv_ref;
 pub mod lm_head_reduce_launch;
 pub mod lm_head_reduce_ref;
 pub mod lm_head_ref;

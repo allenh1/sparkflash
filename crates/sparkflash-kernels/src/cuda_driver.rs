@@ -1172,6 +1172,17 @@ static PROBE_METER: ProbeMeter = ProbeMeter::new();
 /// reads this one relaxed flag and does nothing else.
 static PROBE_METER_ARMED: AtomicBool = AtomicBool::new(false);
 
+/// Armed by the no-sync probe mode (`--forward-perf-probe-nosync`): every launch records one event
+/// pair and leaves the launch queued, and the elapsed times are resolved once at run end by
+/// [Cuda::probe_meter_harvest]. The counters keep recording because [meter_recording] reads both
+/// flags, so a host-only-wall row keeps its launch/sync/copy census and its readback waits; only
+/// the device time moves off the block wall and into the harvest.
+static PROBE_METER_DEFERRED: AtomicBool = AtomicBool::new(false);
+
+/// The unresolved deferred event pairs, one `(start, stop)` handle per launch, in launch order.
+/// Handles travel as `usize` so the static stays `Send`; the driver reinterprets them as events.
+static DEFERRED_EVENTS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
 /// Arms or clears the driver meter; either way its cells are cleared, so a disarmed meter never
 /// holds a stale reading and a run starts from zero.
 ///
@@ -1195,6 +1206,41 @@ pub fn probe_meter_read() -> ProbeMeterReading {
     PROBE_METER.read()
 }
 
+/// Arms the no-sync (host-only wall) probe meter: launches queue and record one event pair each,
+/// and the pairs are resolved by [Cuda::probe_meter_harvest] after the run's final synchronize.
+///
+/// This is a diagnostic switch, never an arithmetic one: the launch order, the kernel arguments and
+/// the copied bytes are the drained path's, and only the host's wait moves off the block wall. The
+/// counters the probe differences are still written, so a row keeps its census next to a wall that
+/// no longer contains the device.
+pub fn probe_meter_arm_deferred(armed: bool) {
+    PROBE_METER_DEFERRED.store(armed, Ordering::Relaxed);
+    if armed && let Ok(mut events) = DEFERRED_EVENTS.lock() {
+        events.clear();
+    }
+}
+
+/// Whether the no-sync meter is armed (the host-only-wall probe mode).
+#[must_use]
+pub fn probe_meter_deferred() -> bool {
+    PROBE_METER_DEFERRED.load(Ordering::Relaxed)
+}
+
+/// Whether a driver entry point the probe counts should add to the meter: the drained meter or the
+/// no-sync one. Both feed the same counters, so a row's census and readback waits are comparable
+/// across the two probe modes.
+fn meter_recording() -> bool {
+    probe_meter_armed() || probe_meter_deferred()
+}
+
+/// Counts one queued launch on the no-sync path; its kernel time arrives from the harvest.
+fn note_launch_queued() {
+    if !probe_meter_deferred() {
+        return;
+    }
+    PROBE_METER.launches.fetch_add(1, Ordering::Relaxed);
+}
+
 fn note_launch(kernel_ns: u64) {
     if !probe_meter_armed() {
         return;
@@ -1206,7 +1252,7 @@ fn note_launch(kernel_ns: u64) {
 }
 
 fn note_sync(sync_ns: u64) {
-    if !probe_meter_armed() {
+    if !meter_recording() {
         return;
     }
     PROBE_METER.syncs.fetch_add(1, Ordering::Relaxed);
@@ -1214,7 +1260,7 @@ fn note_sync(sync_ns: u64) {
 }
 
 fn note_h2d(bytes: usize, ns: u64) {
-    if !probe_meter_armed() {
+    if !meter_recording() {
         return;
     }
     PROBE_METER.h2d_count.fetch_add(1, Ordering::Relaxed);
@@ -1225,7 +1271,7 @@ fn note_h2d(bytes: usize, ns: u64) {
 }
 
 fn note_d2h(bytes: usize, ns: u64) {
-    if !probe_meter_armed() {
+    if !meter_recording() {
         return;
     }
     PROBE_METER.d2h_count.fetch_add(1, Ordering::Relaxed);
@@ -1236,7 +1282,7 @@ fn note_d2h(bytes: usize, ns: u64) {
 }
 
 fn note_dtod(bytes: usize, ns: u64) {
-    if !probe_meter_armed() {
+    if !meter_recording() {
         return;
     }
     PROBE_METER.dtod_count.fetch_add(1, Ordering::Relaxed);
@@ -1247,21 +1293,21 @@ fn note_dtod(bytes: usize, ns: u64) {
 }
 
 fn note_alloc() {
-    if !probe_meter_armed() {
+    if !meter_recording() {
         return;
     }
     PROBE_METER.alloc_count.fetch_add(1, Ordering::Relaxed);
 }
 
 fn note_free(count: u64) {
-    if !probe_meter_armed() || count == 0 {
+    if !meter_recording() || count == 0 {
         return;
     }
     PROBE_METER.free_count.fetch_add(count, Ordering::Relaxed);
 }
 
 fn note_module_load() {
-    if !probe_meter_armed() {
+    if !meter_recording() {
         return;
     }
     PROBE_METER
@@ -1680,7 +1726,7 @@ impl Cuda {
         }
         let sync: libloading::Symbol<unsafe extern "C" fn() -> CuResult> =
             self.sym(b"cuCtxSynchronize")?;
-        let metered = probe_meter_armed();
+        let metered = meter_recording();
         let started = metered.then(std::time::Instant::now);
         // SAFETY: the symbol was resolved from this context's own library and takes no arguments;
         // it only blocks the calling thread until the context's queued work completes.
@@ -1767,9 +1813,9 @@ impl Cuda {
                     .to_string(),
             );
         }
-        if probe_meter_armed() {
+        if meter_recording() {
             return Err(
-                "cannot capture a CUDA graph while the probe meter is armed (its event bracket and drain are not capturable)"
+                "cannot capture a CUDA graph while a probe meter is armed (its event bracket is not capturable)"
                     .to_string(),
             );
         }
@@ -2656,7 +2702,7 @@ impl Cuda {
             let f: libloading::Symbol<
                 unsafe extern "C" fn(CuDeviceptr, *const c_void, usize) -> CuResult,
             > = self.sym(b"cuMemcpyHtoD_v2")?;
-            let metered = probe_meter_armed();
+            let metered = meter_recording();
             let started = metered.then(std::time::Instant::now);
             let r = f(dst.0, src.as_ptr().cast(), src.len());
             if let Some(started) = started {
@@ -2678,7 +2724,7 @@ impl Cuda {
             let f: libloading::Symbol<
                 unsafe extern "C" fn(*mut c_void, CuDeviceptr, usize) -> CuResult,
             > = self.sym(b"cuMemcpyDtoH_v2")?;
-            let metered = probe_meter_armed();
+            let metered = meter_recording();
             let started = metered.then(std::time::Instant::now);
             let len = dst.len();
             let r = f(dst.as_mut_ptr().cast(), src.0, len);
@@ -2734,7 +2780,7 @@ impl Cuda {
             let f: libloading::Symbol<
                 unsafe extern "C" fn(CuDeviceptr, CuDeviceptr, usize) -> CuResult,
             > = self.sym(b"cuMemcpyDtoD_v2")?;
-            let metered = probe_meter_armed();
+            let metered = meter_recording();
             let started = metered.then(std::time::Instant::now);
             let r = f(dst.0, src.0, bytes);
             if let Some(started) = started {
@@ -3176,6 +3222,11 @@ impl Cuda {
         if mode != GRAPH_DIRECT {
             return self.graph_segment_launch(mode, kernel, grid, block, args);
         }
+        // The no-sync probe queues the launch and records one event pair for it; the elapsed times
+        // are resolved once at run end, so a block's wall never contains the device wait.
+        if probe_meter_deferred() {
+            return self.launch_deferred(kernel, grid, block, args);
+        }
         // The bracket consumers need the drain that follows each launch, so they always take the
         // synchronous path. Everything else takes the async path when the run selected it.
         if queued_dispatch_wanted() {
@@ -3273,6 +3324,138 @@ impl Cuda {
                 }
             }
             Ok(())
+        }
+    }
+
+    /// Launches one kernel on the no-sync probe path: queued, bracketed by one event pair, and
+    /// resolved at run end by [Cuda::probe_meter_harvest].
+    ///
+    /// The events bracket exactly the cuLaunchKernel, so their elapsed time is the kernel's device
+    /// time and not the host gap around it; nothing drains, so the caller must not read anything
+    /// the kernel writes until an observation point. The launch counter and the meter's launch
+    /// census advance exactly as on the drained path.
+    fn launch_deferred(
+        &self,
+        kernel: Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        args: &[u64],
+    ) -> Result<(), String> {
+        unsafe {
+            let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
+            let create: libloading::Symbol<unsafe extern "C" fn(*mut CuEvent, u32) -> CuResult> =
+                self.sym(b"cuEventCreate")?;
+            let record: libloading::Symbol<unsafe extern "C" fn(CuEvent, *mut c_void) -> CuResult> =
+                self.sym(b"cuEventRecord")?;
+            let destroy: libloading::Symbol<unsafe extern "C" fn(CuEvent) -> CuResult> =
+                self.sym(b"cuEventDestroy")?;
+            let mut start_event: CuEvent = std::ptr::null_mut();
+            let mut stop_event: CuEvent = std::ptr::null_mut();
+            let mut r = create(&mut start_event, 0);
+            if r == 0 {
+                r = create(&mut stop_event, 0);
+            }
+            if r != 0 {
+                if !start_event.is_null() {
+                    destroy(start_event);
+                }
+                if !stop_event.is_null() {
+                    destroy(stop_event);
+                }
+                return Err(format!(
+                    "cuEventCreate for the no-sync probe bracket failed: {r}"
+                ));
+            }
+            let r = record(start_event, std::ptr::null_mut());
+            if r != 0 {
+                destroy(start_event);
+                destroy(stop_event);
+                return Err(format!("cuEventRecord(start) failed: {r}"));
+            }
+            let mut storage: Vec<[u64; 1]> = args.iter().map(|a| [*a]).collect();
+            let mut ptrs: Vec<*mut c_void> =
+                storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
+            let r = launch(
+                kernel.function,
+                grid.0,
+                grid.1,
+                grid.2,
+                block.0,
+                block.1,
+                block.2,
+                0,
+                std::ptr::null_mut(),
+                ptrs.as_mut_ptr(),
+                std::ptr::null_mut(),
+            );
+            if r != 0 {
+                destroy(start_event);
+                destroy(stop_event);
+                return Err(format!("cuLaunchKernel failed: {r}"));
+            }
+            let r = record(stop_event, std::ptr::null_mut());
+            if r != 0 {
+                destroy(start_event);
+                destroy(stop_event);
+                return Err(format!("cuEventRecord(stop) failed: {r}"));
+            }
+            self.issued.fetch_add(1, Ordering::Relaxed);
+            note_launch_queued();
+            if let Ok(mut events) = DEFERRED_EVENTS.lock() {
+                events.push((start_event as usize, stop_event as usize));
+            }
+            Ok(())
+        }
+    }
+
+    /// Resolves the no-sync probe's per-launch brackets: one cuEventElapsedTime per queued launch,
+    /// in launch order, then destroys the events.
+    ///
+    /// The caller must have observed the context first (the run's final [Cuda::synchronize]); an
+    /// elapsed time read before the work has run is not a measurement. The returned vector holds one
+    /// kernel-ns figure per launch the deferred meter counted since the run armed it, so a block
+    /// row's kernel_ns is the sum of its own launch-count slice of this vector.
+    ///
+    /// # Errors
+    /// A cuEventElapsedTime failure, with the launch index named. Every created event is destroyed
+    /// either way.
+    pub fn probe_meter_harvest(&self) -> Result<Vec<u64>, String> {
+        let events: Vec<(usize, usize)> = match DEFERRED_EVENTS.lock() {
+            Ok(mut guard) => guard.drain(..).collect(),
+            Err(error) => error.into_inner().drain(..).collect(),
+        };
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let elapsed: libloading::Symbol<
+            unsafe extern "C" fn(*mut f32, CuEvent, CuEvent) -> CuResult,
+        > = self.sym(b"cuEventElapsedTime")?;
+        let destroy: libloading::Symbol<unsafe extern "C" fn(CuEvent) -> CuResult> =
+            self.sym(b"cuEventDestroy")?;
+        let mut durations = Vec::with_capacity(events.len());
+        let mut failure: Option<String> = None;
+        for (index, (start_event, stop_event)) in events.into_iter().enumerate() {
+            let start = start_event as CuEvent;
+            let stop = stop_event as CuEvent;
+            let mut ms: f32 = 0.0;
+            // SAFETY: both handles are events this meter created for one launch, the out-pointer is
+            // valid for the call, and the caller's synchronize has completed both of them.
+            let r = unsafe { elapsed(&mut ms, start, stop) };
+            unsafe {
+                destroy(start);
+                destroy(stop);
+            }
+            if r == 0 {
+                durations.push((f64::from(ms) * 1_000_000.0) as u64);
+            } else if failure.is_none() {
+                failure = Some(format!(
+                    "cuEventElapsedTime for deferred launch {index} failed: {r}"
+                ));
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(durations),
         }
     }
 

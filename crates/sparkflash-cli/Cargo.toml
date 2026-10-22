@@ -17,7 +17,11 @@ tp4-serve = []
 # the pinned router cubin). The default binary has no device session path; a cuda build still links
 # no libcuda, and the session is only constructed with --engine device --device-cubin PATH. The M3-a
 # device-chain plan arm needs no feature: it opens no driver.
-cuda = ["sparkflash-device/cuda"]
+# The `rdma` arm is part of the cuda feature so the window's staging script
+# (scripts/build-aarch64.sh --features=cuda) produces a binary that can resolve the RoCE reduce
+# transport. The backend stays inert unless SPARK_COMM_REDUCE=roce asks for it; a TCP row is the
+# row it always was, and the run prints the path it resolved.
+cuda = ["sparkflash-device/cuda", "rdma"]
 # The real libibverbs RDMA backend, forwarded from sparkflash-comm. No build dependency is added
 # (libibverbs is dlopen'd at run time); this only compiles the backend in and makes
 # --comm-backend rdma reachable. The four-node window is still what the run needs.

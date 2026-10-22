@@ -38,3 +38,10 @@ path = "src/bin/rocenante-probe.rs"
 # separate binary from rocenante-probe so the doctor's field contract stays untouched.
 name = "ws-b-allreduce-bench"
 path = "src/bin/ws-b-allreduce-bench.rs"
+
+[[bin]]
+# Isolated host-only per-call measurement of the served 10 KiB reduce over TCP: sync total,
+# and in async mode the post and wait halves separately, with the canonical reference checked
+# on every rank. Used by the comm reduce workstream; it touches no GPU and no node config.
+name = "comm-reduce-bench"
+path = "src/bin/comm-reduce-bench.rs"

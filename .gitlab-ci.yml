@@ -240,6 +240,19 @@ identity-gate:
     - bash scripts/identity-gate.sh --self-test
     - python3 -m unittest scripts/tests/test_identity_gate.py -v
 
+# Numerical correctness gate (D54). CI has no GPU and no four-node rig, so this job proves the two
+# things that can be proved without one: the declared bars are what the documents say they are, and
+# the checker accepts an identical row and rejects a perturbed one (self-test builds a synthetic dump,
+# freezes it, then perturbs a logit outside the bars). The same command runs on every device row
+# (scripts/numerical-gate.sh --run <window run dir>), so a row's correctness result needs no document
+# and no hand re-run.
+numerical-gate:
+  stage: test
+  script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends python3
+    - bash scripts/numerical-gate.sh --self-test
+
 # Performance-regression gate. There is no GPU and no server in CI, so this job does not measure
 # anything: it reads the committed baseline (docs/build/d38-vllm-baseline-*.json) and a NEWER
 # comparable capture if one is committed, then compares the client-measured decode tok/s p50 and

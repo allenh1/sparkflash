@@ -16,12 +16,28 @@
 //!
 //! Nested calls run serially: a function called from inside a worker is already inside the parallel
 //! region and does not spawn a second level.
+//!
+//! The machine thread count is cached: [std::thread::available_parallelism] is not a cheap fact on
+//! this host - it reads the cgroup CPU-quota files every time - and it measured 27.6 us per call,
+//! which the helpers pay on every invocation whether or not they end up spawning anything. The
+//! count is a property of the process, so it is computed once; the environment override is still
+//! read per call, so a run that sets it after startup still sees it.
 
 use std::cell::Cell;
 
 thread_local! {
     static IN_PARALLEL: Cell<bool> = const { Cell::new(false) };
     static OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// The machine's parallelism, computed once: asking for it costs a cgroup read.
+fn cached_parallelism() -> usize {
+    static MACHINE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MACHINE.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+    })
 }
 
 /// The thread count used when nothing pins one.
@@ -32,9 +48,7 @@ fn machine_threads() -> usize {
     {
         return value;
     }
-    std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1)
+    cached_parallelism()
 }
 
 /// The thread count the helpers will use on the current thread.

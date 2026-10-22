@@ -196,41 +196,10 @@ pub fn hc_mixes(
         ));
     }
 
-    let hc_eps = cfg.hc_eps as f32;
-    let norm_eps = cfg.norm_eps as f32;
-    for token in 0..tokens {
-        let token_x = &x_hc[token * width..(token + 1) * width];
-        // mean(x^2) over this token's flattened stream. This is the specification's own
-        // x.pow(2).mean(-1) (model.py:949-950): [linalg::mean] averages a slice, and materialising
-        // x^2 into a buffer to hand it one would allocate inside a per-token loop.
-        let mean_square = token_x.iter().map(|value| value * value).sum::<f32>() / width as f32;
-        let rsqrt = 1.0 / (mean_square + norm_eps).sqrt();
-
-        for (coefficient, bias) in base.iter().enumerate().take(hc) {
-            let mix = project(fn_w, coefficient, width, token_x)? * rsqrt;
-            mixes.pre[token * hc + coefficient] = linalg::sigmoid(mix * scale[0] + *bias) + hc_eps;
-        }
-        for coefficient in 0..hc {
-            let row = hc + coefficient;
-            let mix = project(fn_w, row, width, token_x)? * rsqrt;
-            mixes.post[token * hc + coefficient] =
-                2.0 * linalg::sigmoid(mix * scale[1] + base[row]);
-        }
-        for row in 0..hc {
-            for col in 0..hc {
-                let coefficient = 2 * hc + row * hc + col;
-                let mix = project(fn_w, coefficient, width, token_x)? * rsqrt;
-                mixes.comb[token * hc * hc + row * hc + col] = mix * scale[2] + base[coefficient];
-            }
-        }
-        split_sinkhorn(
-            &mut mixes.comb[token * hc * hc..(token + 1) * hc * hc],
-            hc,
-            cfg.hc_sinkhorn_iters,
-            hc_eps,
-        );
-    }
-    Ok(())
+    // The projection, then the coefficient tail over it. [hc_mixes] is exactly these two, so a
+    // caller that already has the projection can skip the first half and get the same mixes.
+    let projection = hc_projection(cfg, x_hc, fn_w)?;
+    hc_mixes_from_projection(cfg, &projection, scale, base, mixes)
 }
 
 /// One token's `x_hc` against row `row` of the `hc_*_fn` weight: the `fn_w * x_hc` of model.py:951,
@@ -253,6 +222,349 @@ fn project(fn_w: &[f32], row: usize, width: usize, token_x: &[f32]) -> Result<f3
         1,
     )?;
     Ok(raw)
+}
+
+/// The largest coefficient-row count the interleaved projection keeps in one stack array.
+///
+/// The released model has `2 * hc_mult + hc_mult^2` = 24 with `hc_mult = 4`; the bound exists so
+/// a malformed configuration is refused instead of overflowing a fixed-size accumulator array.
+const MAX_MIX_HC: usize = 32;
+
+/// The `hc_*_fn` projection of a chunk: the raw `[mix_hc]` dot products per token and the sum of
+/// squares each token's `rsqrt` factor is built from.
+///
+/// This is the first half of [hc_mixes] - the dot products of every `hc_*_fn` row - separated from
+/// the coefficient arithmetic so that it can be evaluated in the loop order the host likes
+/// ([hc_projection_transposed]) without duplicating the tail. [hc_projection] is the same function
+/// in [hc_mixes]'s own loop order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HcProjection {
+    /// `mix_hc` raw dot products per token, token by token, before the `rsqrt`.
+    pub raw: Vec<f32>,
+    /// `sum(x^2)` over each token's flattened `hc_mult * dim` stream, in stream order.
+    pub sum_squares: Vec<f32>,
+}
+
+/// [hc_mixes]'s projection in its own order: every coefficient row one at a time, ascending `k`,
+/// one accumulator.
+///
+/// # Errors
+///
+/// [EngineError::Shape] when the stream or the weight disagrees with the configuration.
+pub fn hc_projection(
+    cfg: &ModelConfig,
+    x_hc: &[f32],
+    fn_w: &[f32],
+) -> Result<HcProjection, EngineError> {
+    let width = cfg.hc_width();
+    let mix_hc = cfg.hc_mix_count();
+    let tokens = check_projection_geometry(cfg, x_hc, fn_w.len(), "hc projection")?;
+    let mut raw = vec![0.0f32; tokens * mix_hc];
+    let mut sum_squares = vec![0.0f32; tokens];
+    for token in 0..tokens {
+        let token_x = &x_hc[token * width..(token + 1) * width];
+        // mean(x^2)'s numerator: the specification's own x.pow(2).mean(-1) (model.py:949-950).
+        sum_squares[token] = token_x.iter().map(|value| value * value).sum::<f32>();
+        for coefficient in 0..mix_hc {
+            raw[token * mix_hc + coefficient] = project(fn_w, coefficient, width, token_x)?;
+        }
+    }
+    Ok(HcProjection { raw, sum_squares })
+}
+
+/// [hc_projection] with the loop order swapped: `k` outer, coefficient rows inner.
+///
+/// Every row's accumulation is still one accumulator in ascending `k` - the inner loop adds at most
+/// one term to any given row per step - so the value of each dot product is the same expression
+/// sequence as [hc_projection]'s and the bytes are identical by construction. What changes is that
+/// all `mix_hc` rows are in flight at once, which is what lets an out-of-order core overlap their
+/// dependency chains, and the weight is read in its transposed `[width][mix_hc]` layout
+/// ([hc_transpose_predictor]), so each `k` reads `mix_hc` contiguous f32 values instead of one value
+/// from each of `mix_hc` rows 80 KB apart.
+///
+/// # Errors
+///
+/// [EngineError::Shape] when the stream, the transposed weight or the configuration disagree, or
+/// when the configuration has more than [MAX_MIX_HC] coefficient rows.
+pub fn hc_projection_transposed(
+    cfg: &ModelConfig,
+    x_hc: &[f32],
+    fn_w_transposed: &[f32],
+) -> Result<HcProjection, EngineError> {
+    let width = cfg.hc_width();
+    let mix_hc = cfg.hc_mix_count();
+    let tokens = check_projection_geometry(cfg, x_hc, fn_w_transposed.len(), "hc projection")?;
+    if mix_hc > MAX_MIX_HC {
+        return Err(shape_error(
+            "hc projection",
+            format!(
+                "{mix_hc} coefficient rows are more than the {MAX_MIX_HC} the interleaved pass holds"
+            ),
+        ));
+    }
+    let mut raw = vec![0.0f32; tokens * mix_hc];
+    let mut sum_squares = vec![0.0f32; tokens];
+    let mut acc = [0.0f32; MAX_MIX_HC];
+    for token in 0..tokens {
+        let token_x = &x_hc[token * width..(token + 1) * width];
+        // The same iterator sum [hc_projection] runs: one accumulator, ascending, no reassociation.
+        sum_squares[token] = token_x.iter().map(|value| value * value).sum::<f32>();
+        let raw_token = &mut raw[token * mix_hc..(token + 1) * mix_hc];
+        if mix_hc == RELEASED_MIX_HC {
+            project_transposed_released(width, token_x, fn_w_transposed, raw_token);
+        } else {
+            let acc = &mut acc[..mix_hc];
+            acc.fill(0.0);
+            for k in 0..width {
+                let a = token_x[k];
+                let column = &fn_w_transposed[k * mix_hc..(k + 1) * mix_hc];
+                for (slot, weight) in acc.iter_mut().zip(column) {
+                    *slot += a * *weight;
+                }
+            }
+            raw_token.copy_from_slice(acc);
+        }
+    }
+    Ok(HcProjection { raw, sum_squares })
+}
+
+/// The released model's coefficient-row count: `2 * hc_mult + hc_mult^2` with `hc_mult = 4`.
+///
+/// It gets its own projection loop because a compile-time row count lets the accumulators stay in
+/// registers: the aarch64 backend keeps the six four-lane groups in vector registers and the inner
+/// body is six `fmul v.4s` and six `fadd v.4s` per `k` - the multiply and the add stay separate, so
+/// no part of the chain is fused into an `fmla` - with no spill and no bounds check in the loop.
+/// Every lane is one coefficient row, accumulating in ascending `k` with one accumulator, which is
+/// [hc_projection]'s own chain.
+const RELEASED_MIX_HC: usize = 24;
+
+/// One token's projection with the released [RELEASED_MIX_HC] rows: four coefficient rows per lane
+/// group, the same multiply-then-add sequence per row as [hc_projection].
+#[inline]
+fn project_transposed_released(
+    width: usize,
+    token_x: &[f32],
+    fn_w_transposed: &[f32],
+    raw: &mut [f32],
+) {
+    let mut acc = [0.0f32; RELEASED_MIX_HC];
+    for k in 0..width {
+        let a = token_x[k];
+        let column = &fn_w_transposed[k * RELEASED_MIX_HC..(k + 1) * RELEASED_MIX_HC];
+        let (columns, _) = column.as_chunks::<4>();
+        for (slots, weights) in acc.as_chunks_mut::<4>().0.iter_mut().zip(columns) {
+            slots[0] += a * weights[0];
+            slots[1] += a * weights[1];
+            slots[2] += a * weights[2];
+            slots[3] += a * weights[3];
+        }
+    }
+    raw.copy_from_slice(&acc);
+}
+
+/// [hc_mixes]'s coefficient arithmetic over an already-computed [HcProjection]: the `rsqrt`, the
+/// three scaled-and-biased groups, the split sinkhorn, and every buffer check.
+///
+/// The operations are [hc_mixes]'s own, in its order: `rsqrt` is `1 / sqrt(sum_squares / width +
+/// norm_eps)` and each mix is `raw * rsqrt`.
+///
+/// # Errors
+///
+/// [EngineError::Shape] when `scale`, `base`, `mixes` or the projection disagree with the
+/// configuration.
+pub fn hc_mixes_from_projection(
+    cfg: &ModelConfig,
+    projection: &HcProjection,
+    scale: &[f32],
+    base: &[f32],
+    mixes: &mut Mixes,
+) -> Result<(), EngineError> {
+    let hc = cfg.hc_mult;
+    let width = cfg.hc_width();
+    let mix_hc = cfg.hc_mix_count();
+    if hc == 0 || width == 0 {
+        return Err(shape_error(
+            "hc mixes",
+            "the configuration has no mHC copies".to_owned(),
+        ));
+    }
+    let tokens = projection.sum_squares.len();
+    if projection.raw.len() != tokens * mix_hc {
+        return Err(shape_error(
+            "hc mixes",
+            format!(
+                "{tokens} tokens need {} raw projection values, got {}",
+                tokens * mix_hc,
+                projection.raw.len()
+            ),
+        ));
+    }
+    if scale.len() != 3 {
+        return Err(shape_error(
+            "hc mixes",
+            format!(
+                "scale holds pre, post and comb, so it is 3 long, got {}",
+                scale.len()
+            ),
+        ));
+    }
+    if base.len() != mix_hc {
+        return Err(shape_error(
+            "hc mixes",
+            format!("base is {mix_hc} long, got {}", base.len()),
+        ));
+    }
+    if mixes.pre.len() != tokens * hc
+        || mixes.post.len() != tokens * hc
+        || mixes.comb.len() != tokens * hc * hc
+    {
+        return Err(shape_error(
+            "hc mixes",
+            format!(
+                "{tokens} tokens need {} + {} + {} coefficient values, got {} + {} + {}",
+                tokens * hc,
+                tokens * hc,
+                tokens * hc * hc,
+                mixes.pre.len(),
+                mixes.post.len(),
+                mixes.comb.len()
+            ),
+        ));
+    }
+
+    let hc_eps = cfg.hc_eps as f32;
+    let norm_eps = cfg.norm_eps as f32;
+    for token in 0..tokens {
+        let mean_square = projection.sum_squares[token] / width as f32;
+        let rsqrt = 1.0 / (mean_square + norm_eps).sqrt();
+        let raw = &projection.raw[token * mix_hc..(token + 1) * mix_hc];
+
+        for (coefficient, bias) in base.iter().enumerate().take(hc) {
+            let mix = raw[coefficient] * rsqrt;
+            mixes.pre[token * hc + coefficient] = linalg::sigmoid(mix * scale[0] + *bias) + hc_eps;
+        }
+        for coefficient in 0..hc {
+            let row = hc + coefficient;
+            let mix = raw[row] * rsqrt;
+            mixes.post[token * hc + coefficient] =
+                2.0 * linalg::sigmoid(mix * scale[1] + base[row]);
+        }
+        for row in 0..hc {
+            for col in 0..hc {
+                let coefficient = 2 * hc + row * hc + col;
+                let mix = raw[coefficient] * rsqrt;
+                mixes.comb[token * hc * hc + row * hc + col] = mix * scale[2] + base[coefficient];
+            }
+        }
+        split_sinkhorn(
+            &mut mixes.comb[token * hc * hc..(token + 1) * hc * hc],
+            hc,
+            cfg.hc_sinkhorn_iters,
+            hc_eps,
+        );
+    }
+    Ok(())
+}
+
+/// [hc_mixes] with the projection evaluated in [hc_projection_transposed]'s loop order.
+///
+/// `fn_w_transposed` is the `[width][mix_hc]` transpose of the `[mix_hc][width]` `hc_*_fn` weight
+/// ([hc_transpose_predictor]); the mixes are the values [hc_mixes] produces, because both evaluate
+/// each row's dot product with the same operations in the same order.
+///
+/// # Errors
+///
+/// [hc_projection_transposed]'s and [hc_mixes_from_projection]'s refusals.
+pub fn hc_mixes_transposed(
+    cfg: &ModelConfig,
+    x_hc: &[f32],
+    fn_w_transposed: &[f32],
+    scale: &[f32],
+    base: &[f32],
+    mixes: &mut Mixes,
+) -> Result<(), EngineError> {
+    let projection = hc_projection_transposed(cfg, x_hc, fn_w_transposed)?;
+    hc_mixes_from_projection(cfg, &projection, scale, base, mixes)
+}
+
+/// Transposes a `[mix_hc][hc_mult * dim]` `hc_*_fn` weight into [hc_projection_transposed]'s
+/// `[hc_mult * dim][mix_hc]` layout: value `(row, k)` lands at `out[k * mix_hc + row]`.
+///
+/// This moves every value; it does not re-encode one. The transposed copy is the same f32 bits, and
+/// a caller does it once per layer when the weights are staged rather than once per call.
+///
+/// # Errors
+///
+/// [EngineError::Shape] when the weight or `out` is not `mix_hc * width` long.
+pub fn hc_transpose_predictor(
+    cfg: &ModelConfig,
+    fn_w: &[f32],
+    out: &mut [f32],
+) -> Result<(), EngineError> {
+    let width = cfg.hc_width();
+    let mix_hc = cfg.hc_mix_count();
+    if width == 0 || mix_hc == 0 || fn_w.len() != mix_hc * width || out.len() != fn_w.len() {
+        return Err(shape_error(
+            "hc transpose",
+            format!(
+                "the hc fn weight is [{}] = {} values and the transposed copy the same, got {} and {}",
+                mix_hc,
+                mix_hc * width,
+                fn_w.len(),
+                out.len()
+            ),
+        ));
+    }
+    for row in 0..mix_hc {
+        for k in 0..width {
+            out[k * mix_hc + row] = fn_w[row * width + k];
+        }
+    }
+    Ok(())
+}
+
+/// Validates a projection's stream and weight lengths and returns the token count.
+///
+/// # Errors
+///
+/// [EngineError::Shape] when the configuration has no copies, the stream is not whole tokens, or the
+/// weight is not `mix_hc * width` long.
+fn check_projection_geometry(
+    cfg: &ModelConfig,
+    x_hc: &[f32],
+    weight_len: usize,
+    what: &str,
+) -> Result<usize, EngineError> {
+    let hc = cfg.hc_mult;
+    let width = cfg.hc_width();
+    let mix_hc = cfg.hc_mix_count();
+    if hc == 0 || width == 0 {
+        return Err(shape_error(
+            what,
+            "the configuration has no mHC copies".to_owned(),
+        ));
+    }
+    if !x_hc.len().is_multiple_of(width) {
+        return Err(shape_error(
+            what,
+            format!(
+                "{} stream values are not a whole number of {width}-wide tokens",
+                x_hc.len()
+            ),
+        ));
+    }
+    if weight_len != mix_hc * width {
+        return Err(shape_error(
+            what,
+            format!(
+                "the hc fn weight is [{}] = {}, got {}",
+                mix_hc,
+                mix_hc * width,
+                weight_len
+            ),
+        ));
+    }
+    Ok(x_hc.len() / width)
 }
 
 /// One column normalisation of the `[hc, hc]` `comb`, with `hc_eps` in the denominator
@@ -1327,6 +1639,128 @@ mod tests {
             "the captured collapse must contain values the BF16 round changes"
         );
         eprintln!("captured hc_pre row: {changed}/{dim} values move at the BF16 boundary");
+    }
+
+    /// A deterministic f32 stream for the projection tests: values in the range the coefficient
+    /// arithmetic actually sees, from a 64-bit LCG so the test has no dependency.
+    fn projection_values(count: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..count)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let bits = ((state >> 40) as u32) & 0x00ff_ffff;
+                (f32::from_bits(bits | 0x3f00_0000) - 1.5) * 0.25
+            })
+            .collect()
+    }
+
+    /// [hc_mixes] is exactly [hc_projection] plus [hc_mixes_from_projection]: no operation, order or
+    /// rounding moves when the two halves are called separately.
+    #[test]
+    fn the_split_is_bit_identical_to_the_combined_function() {
+        let cfg = crate::config::ModelConfig::tiny();
+        let width = cfg.hc_width();
+        let mix_hc = cfg.hc_mix_count();
+        let scale = vec![1.25f32, -0.5, 0.75];
+        let base = projection_values(mix_hc, 0x5555_aaaa);
+        for tokens in [1usize, 3] {
+            let stream = projection_values(tokens * width, 0x1234_5678 + tokens as u64);
+            let fn_w = projection_values(mix_hc * width, 0x9abc_def0);
+            let mut combined = Mixes::for_tokens(&cfg, tokens);
+            hc_mixes(&cfg, &stream, &fn_w, &scale, &base, &mut combined).expect("combined");
+            let projection = hc_projection(&cfg, &stream, &fn_w).expect("projection");
+            let mut split = Mixes::for_tokens(&cfg, tokens);
+            hc_mixes_from_projection(&cfg, &projection, &scale, &base, &mut split).expect("split");
+            assert_eq!(combined, split, "{tokens} tokens");
+        }
+    }
+
+    /// The interleaved loop reorders iterations, not operations: every coefficient row's dot product
+    /// and every token's sum of squares is the same expression sequence in the same order, so the
+    /// transposed pass is the ordered pass bit for bit - at the shipped geometry and at a small one.
+    #[test]
+    fn the_transposed_projection_is_the_ordered_projection() {
+        let shipped = crate::config::ModelConfig::v41_flash_cached();
+        let tiny = crate::config::ModelConfig::tiny();
+        for (cfg, tokens) in [(shipped, 1usize), (shipped, 3), (&tiny, 1), (&tiny, 2)] {
+            let width = cfg.hc_width();
+            let mix_hc = cfg.hc_mix_count();
+            let stream = projection_values(tokens * width, 0x1111_2222 + tokens as u64);
+            let fn_w = projection_values(mix_hc * width, 0x3333_4444);
+            let mut transposed = vec![0.0f32; fn_w.len()];
+            hc_transpose_predictor(cfg, &fn_w, &mut transposed).expect("transpose");
+            let ordered = hc_projection(cfg, &stream, &fn_w).expect("ordered");
+            let interleaved =
+                hc_projection_transposed(cfg, &stream, &transposed).expect("interleaved");
+            assert_eq!(
+                interleaved
+                    .sum_squares
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                ordered
+                    .sum_squares
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "{tokens} tokens: the sum of squares"
+            );
+            assert_eq!(
+                interleaved
+                    .raw
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                ordered
+                    .raw
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "{tokens} tokens: the coefficient rows"
+            );
+        }
+    }
+
+    /// The transposed mixes are the ordered mixes, and the transpose itself only moves values.
+    #[test]
+    fn the_transposed_mixes_are_the_ordered_mixes() {
+        let cfg = crate::config::ModelConfig::tiny();
+        let width = cfg.hc_width();
+        let mix_hc = cfg.hc_mix_count();
+        let stream = projection_values(width, 0x0f0f_0f0f);
+        let fn_w = projection_values(mix_hc * width, 0xf0f0_f0f0);
+        let scale = vec![1.25f32, -0.5, 0.75];
+        let base = projection_values(mix_hc, 0x2468_ace0);
+        let mut transposed = vec![0.0f32; fn_w.len()];
+        hc_transpose_predictor(&cfg, &fn_w, &mut transposed).expect("transpose");
+        // The transposed copy holds the same multiset of bits, and every value is in its slot.
+        let mut sorted_original = fn_w.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+        let mut sorted_transposed = transposed
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        sorted_original.sort_unstable();
+        sorted_transposed.sort_unstable();
+        assert_eq!(sorted_original, sorted_transposed);
+        for row in 0..mix_hc {
+            for k in 0..width {
+                assert_eq!(
+                    transposed[k * mix_hc + row].to_bits(),
+                    fn_w[row * width + k].to_bits(),
+                    "row {row} k {k}"
+                );
+            }
+        }
+        let mut ordered = Mixes::for_config(&cfg);
+        hc_mixes(&cfg, &stream, &fn_w, &scale, &base, &mut ordered).expect("ordered");
+        let mut interleaved = Mixes::for_config(&cfg);
+        hc_mixes_transposed(&cfg, &stream, &transposed, &scale, &base, &mut interleaved)
+            .expect("interleaved");
+        assert_eq!(ordered, interleaved);
+        // The transpose refuses a buffer that is not the whole weight.
+        assert!(hc_transpose_predictor(&cfg, &fn_w, &mut vec![0.0f32; fn_w.len() - 1]).is_err());
     }
 
     #[test]

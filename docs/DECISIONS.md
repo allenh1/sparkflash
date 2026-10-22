@@ -3031,3 +3031,46 @@ single measured ms/step, restated daily, and it may only move by a merge whose r
 measured against; the parked tasks are WS-C graphs, WS-D kernel audit, WS-E MTP device work, WS-F
 prefill/serving and WS-G parity. Nothing in D39/D49/D50/D51 is relaxed: byte identity is now
 machine-checked rather than document-checked.
+
+## D54 - The speed row's correctness gate is numerical, not byte-identical
+
+Date: 2026-10-22. Owner: Lead, on direct user direction ("Replace 'logits sha ... identical' with a
+numerical gate ... Keep the bit-exact CPU twin as the reference, not as the product"). Status: in
+force. Amends D52 item 2 and makes D39 rule 2 operational for the speed track.
+
+### Decision
+
+1. **A speed row is gated numerically.** `scripts/numerical-gate.sh --run <row> [...]` compares each
+   rank's dumped logits against a frozen reference for the same fixture and prints one PASS/FAIL line
+   per rank. The bars are declared in the script before any run: greedy argmax tokens identical to the
+   reference; top-1 agreement 1.00; top-5 set overlap >= 0.80 (mean Jaccard); top-50 id overlap >= 0.96;
+   max |delta logprob| <= 2.0e-2 nats over the reference top-100; mean |delta logprob| <= 2.0e-3 nats;
+   KL(ref || run) <= 1.0e-4 nats over the shared support renormalised on both sides; every value finite.
+2. **The reference is an artifact, not a re-run.** The bit-exact CPU twin's published instantiation is
+   frozen by `--freeze` into `docs/build/reference/speed-gate/<fixture>/`, keyed by
+   sha256(positions, prompt_len, ids). The twin stays the *reference implementation*; the product is
+   allowed to differ inside the bars. A new prompt has no reference until one is frozen, so the
+   programme extends to N prompts x M tokens by freezing N fixtures - no gate change.
+3. **Byte identity is no longer the product gate.** `scripts/identity-gate.sh --run` stays as the
+   strict check, used when a slice claims bit identity (a pure layout change, a pointer/geometry
+   refactor). It is not the acceptance bar for a slice that deliberately changes arithmetic order.
+4. **The gate reports the fixture's tightest margin.** The current 9-token fixture has a top1-top2
+   margin of 0.0038 nats at position 4, so the token bar is effectively tighter than the 2.0e-2
+   logprob bar at that position. The gate prints the reference's smallest margin with every row, so a
+   flip lands in the record next to the near tie that produced it - a flip inside the margin is a tie
+   (D39 rule 2), not a defect, and the logprob metrics still have to pass for the row to gate.
+
+### What this does not license
+
+Changed arithmetic (a different quantisation rule, dtype or set of terms), a non-finite value, a
+loosened bar without a measured noise floor, or a token-free change to the frozen reference. A
+tolerance arm is entered deliberately, is named in the row and in the merge request, and its measured
+distance is recorded - it never arrives as a silent side effect of a speed slice.
+
+### Consequence
+
+Slices that change summation order - split reductions, tree sums, device kernels whose parallel
+dimension divides a sum - become admissible on measurement. That is the class the byte-identity
+reading of D52 item 2 was blocking (D39/D52 as the team has been applying them), and it is the class
+this track now needs, because the remaining host blocks are reductions and their device candidates all
+reorder a sum.

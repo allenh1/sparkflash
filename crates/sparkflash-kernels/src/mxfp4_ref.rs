@@ -560,17 +560,39 @@ pub fn moe_combine_routed_f32(
     let mut routed = vec![0.0f32; tokens * hidden_dim];
     for token in 0..tokens {
         let order = moe_combine_slot_order(expert_ids, token);
-        for column in 0..hidden_dim {
-            let mut total = 0.0f32;
-            for slot in order {
-                let expert_output = slot_acc[(token * MOE_TOP_K + slot) * hidden_dim + column];
-                let rounded = crate::m4_quant::bf16_value(bf16_bits(expert_output));
-                total += rounded;
+        let target = &mut routed[token * hidden_dim..(token + 1) * hidden_dim];
+        // Slot-outer, column-inner: every column still sees the slots in the same ascending
+        // expert-id order starting from 0.0, so the adds are the same sequence of f32 additions,
+        // but the columns are independent, so the rounding and the adds vectorise instead of
+        // running one six-deep dependent chain per column.
+        for slot in order {
+            let expert_row = &slot_acc[(token * MOE_TOP_K + slot) * hidden_dim..][..hidden_dim];
+            for (total, expert_output) in target.iter_mut().zip(round_expert_row(expert_row)) {
+                *total += expert_output;
             }
-            routed[token * hidden_dim + column] = total;
         }
     }
     routed
+}
+
+/// Rounds one expert row to the bf16 values the combine adds, bit for bit as the reference does.
+///
+/// The reference round is half::bf16::from_f32 (round to nearest even, NaN quieted) widened back
+/// with bf16_value, which is exact. This is the same rule written compactly over the whole row so
+/// the adds per column stay vectorisable: no multiply appears, so no contraction can change a
+/// rounding, and the per-column add sequence is untouched.
+#[inline]
+fn round_expert_row(expert_row: &[f32]) -> impl Iterator<Item = f32> + '_ {
+    expert_row.iter().copied().map(|value| {
+        let bits = value.to_bits();
+        let rounded = if bits & 0x7fff_ffff > 0x7f80_0000 {
+            (bits >> 16) | 0x0040
+        } else {
+            let lsb = (bits >> 16) & 1;
+            bits.wrapping_add(0x7fff + lsb) >> 16
+        };
+        f32::from_bits(rounded << 16)
+    })
 }
 
 /// The cross-rank f32 sum of every rank's slot accumulator: the operand of the native combine in
@@ -1199,6 +1221,141 @@ mod tests {
         // six identical slots then add to 384.0.
         let routed = moe_combine_routed_f32(&slot_acc, &ids, tokens, hidden_dim);
         assert_eq!(routed[0], 384.0);
+    }
+
+    /// The combine's original arithmetic, kept as the oracle: column-major, one dependent six-add
+    /// chain per column, half::bf16 round per expert output. The shipped body must produce its exact
+    /// bits, because f32 addition is not associative and the ascending-expert-id order is part of
+    /// the released arithmetic.
+    fn routed_combine_oracle(
+        slot_acc: &[f32],
+        expert_ids: &[u32],
+        tokens: usize,
+        hidden_dim: usize,
+    ) -> Vec<f32> {
+        let mut routed = vec![0.0f32; tokens * hidden_dim];
+        for token in 0..tokens {
+            let order = moe_combine_slot_order(expert_ids, token);
+            for column in 0..hidden_dim {
+                let mut total = 0.0f32;
+                for slot in order {
+                    let expert_output = slot_acc[(token * MOE_TOP_K + slot) * hidden_dim + column];
+                    total += bf16_value(bf16_bits(expert_output));
+                }
+                routed[token * hidden_dim + column] = total;
+            }
+        }
+        routed
+    }
+
+    fn assert_same_bits(left: &[f32], right: &[f32]) {
+        assert_eq!(left.len(), right.len(), "length");
+        for (index, (left, right)) in left.iter().zip(right).enumerate() {
+            assert_eq!(
+                left.to_bits(),
+                right.to_bits(),
+                "value {index}: {left:?} ({:#010x}) vs {right:?} ({:#010x})",
+                left.to_bits(),
+                right.to_bits()
+            );
+        }
+    }
+
+    /// The slot-outer shape is a loop reordering only: on the shipped decode shape (one token, six
+    /// routed slots, 5120 columns) it must reproduce the column-major oracle bit for bit.
+    #[test]
+    fn the_shipped_routed_combine_matches_the_column_major_oracle() {
+        let hidden_dim = 5120usize;
+        let tokens = 1usize;
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / 16.0 - 0.5
+        };
+        for round in 0..4 {
+            let slot_acc: Vec<f32> = (0..tokens * MOE_TOP_K * hidden_dim)
+                .map(|_| next())
+                .collect();
+            let mut ids: Vec<u32> = (0..MOE_TOP_K)
+                .map(|slot| (round * 97 + slot * 61) as u32 % 384)
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            if ids.len() < MOE_TOP_K {
+                ids = (0..MOE_TOP_K as u32).rev().collect();
+            }
+            let ids = ids[..MOE_TOP_K].to_vec();
+            let shipped = moe_combine_routed_f32(&slot_acc, &ids, tokens, hidden_dim);
+            let oracle = routed_combine_oracle(&slot_acc, &ids, tokens, hidden_dim);
+            assert_same_bits(&shipped, &oracle);
+        }
+    }
+
+    /// The rounding edges that f32 addition and bf16 can produce must match too: signed zeros,
+    /// subnormals, the largest finite value, exact bf16 ties (round to even), and the non-finite
+    /// patterns the quieting rule distinguishes from the overflow path.
+    #[test]
+    fn the_routed_combine_matches_the_oracle_on_rounding_edges() {
+        let hidden_dim = 16usize;
+        let tokens = 2usize;
+        let edges: [f32; 16] = [
+            0.0,
+            -0.0,
+            1.0,
+            1.0 + 2.0f32.powi(-8),
+            1.0 + 2.0f32.powi(-9),
+            3.0 + 3.0 * 2.0f32.powi(-8),
+            f32::MAX,
+            -f32::MAX,
+            f32::MIN_POSITIVE,
+            2.0f32.powi(-133),
+            f32::from_bits(0x7fc0_0001),
+            f32::from_bits(0xffc0_0001),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            2.0f32.powi(127) * (1.0 + 2.0f32.powi(-8)),
+            2.0f32.powi(-8),
+        ];
+        let slot_acc: Vec<f32> = (0..tokens * MOE_TOP_K * hidden_dim)
+            .map(|index| edges[index % edges.len()])
+            .collect();
+        let ids: Vec<u32> = vec![11, 4, 300, 91, 55, 7, 200, 33, 8, 120, 4, 91];
+        let shipped = moe_combine_routed_f32(&slot_acc, &ids, tokens, hidden_dim);
+        let oracle = routed_combine_oracle(&slot_acc, &ids, tokens, hidden_dim);
+        assert_same_bits(&shipped, &oracle);
+    }
+
+    /// Token blocks and odd widths: the outer token loop must not change the per-column order.
+    #[test]
+    fn the_routed_combine_matches_the_oracle_across_tokens_and_widths() {
+        let mut state = 0x0ddc_0ffe_1234_5678u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / 8.0 - 1.0
+        };
+        for tokens in 1..=3usize {
+            for hidden_dim in [1usize, 2, 3, 7, 31, 32, 33] {
+                let slot_acc: Vec<f32> = (0..tokens * MOE_TOP_K * hidden_dim)
+                    .map(|_| next())
+                    .collect();
+                let ids: Vec<u32> = (0..tokens)
+                    .flat_map(|token| {
+                        let mut row: Vec<u32> = (0..MOE_TOP_K)
+                            .map(|slot| ((token * 31 + slot * 17) % 384) as u32)
+                            .collect();
+                        row.sort_unstable();
+                        row
+                    })
+                    .collect();
+                let shipped = moe_combine_routed_f32(&slot_acc, &ids, tokens, hidden_dim);
+                let oracle = routed_combine_oracle(&slot_acc, &ids, tokens, hidden_dim);
+                assert_same_bits(&shipped, &oracle);
+            }
+        }
     }
 
     /// One captured-activation fixture committed for the native-rounding twin tests. The source

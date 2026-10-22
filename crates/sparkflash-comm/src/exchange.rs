@@ -211,18 +211,26 @@ fn reduce_one_shot(
         kind: ExchangeKind::Reduce,
         phase: 0,
     };
+    // Phase instrumentation is a no-op unless SPARK_COMM_PROFILE is set; it reads clocks only
+    // and never touches the payload or the reduction order.
+    let mut timer = crate::profile::CallTimer::start();
     exchange.prepare(tag, &expected)?;
+    timer.mark_prepare();
     for transfer in transfers
         .iter()
         .filter(|transfer| transfer.phase == TransferPhase::OneShot && transfer.from == rank)
     {
+        let send_clock = timer.send_clock();
         exchange.send(
             transfer.to,
             transfer.elements.clone(),
             &buf[transfer.elements.clone()],
         )?;
+        timer.record_send(send_clock);
     }
+    timer.mark_send();
     let received = exchange.collect(&expected)?;
+    timer.mark_collect();
     validate_received(&expected, &received)?;
     let own: Vec<u16> = buf.to_vec();
     let mut panes: Vec<&[u16]> = vec![&[]; layout.world_size()];
@@ -230,7 +238,9 @@ fn reduce_one_shot(
     for frame in &received {
         panes[frame.from] = frame.payload.as_slice();
     }
-    reduce::canonical_all_reduce_into(buf, &panes)
+    let reduced = reduce::canonical_all_reduce_into(buf, &panes);
+    timer.mark_reduce();
+    reduced
 }
 
 /// Hairpin schedule: reduce-scatter raw contributions to the chunk owners, reduce each chunk in
