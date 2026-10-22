@@ -5,7 +5,7 @@
 # This is the deployable form of the serving binary: a multi-stage build of the host reference
 # path (no GPU, no CUDA, no checkpoint in the image). The default image serves the tiny synthetic
 # plan so it can be smoke-tested anywhere; a real deployment mounts a checkpoint and a tokenizer
-# and overrides the command (see docs/build/serve-deployment.md). A device/TP=4 image is the same
+# and overrides the command (see docs/build/serving.md). A device/TP=4 image is the same
 # Dockerfile built with --build-arg SPARKFLASH_FEATURES="tp4-serve cuda" on a CUDA-capable build
 # host; the runtime below stays CPU-only and the device path is a device-window concern.
 #

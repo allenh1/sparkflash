@@ -62,7 +62,7 @@ impl CollectiveBackend {
     /// Whether this backend carries the bit-identical canonical reduction contract.
     ///
     /// The one-shot path does; the NCCL ring is implementation- and topology-dependent and is not
-    /// covered by that contract (see docs/build/ws-b-collectives-20261021.md).
+    /// covered by that contract (see docs/archive/build/ws-b-collectives-20261021.md).
     #[must_use]
     pub const fn is_bit_identical(self) -> bool {
         matches!(self, Self::OneShotRdma)

@@ -27,7 +27,7 @@
 // Verification status: source added for the c4a-2 start_pos > 0 extension, compiled and pinned, and
 // exercised by examples/m20_csa2_sequence.rs (device vs mla_ref::attention_with_sink_union per
 // position, position-0 byte identity against the base entry, causal indexer twin, determinism).
-// The window record lives in docs/build/phase3-csa2-sequence.md; until that window reports, this file
+// The window record lives in docs/archive/build/phase3-csa2-sequence.md; until that window reports, this file
 // carries no device measurement.
 
 #include "m4_common_sm121.cuh"

@@ -793,7 +793,7 @@ pub fn attention_operand_census(
 
 /// The checkpoint's native dense projection kernel: E4M3 activation codes with one ue8m0 scale per
 /// 32 contiguous values against B12x E4M3 weights, f32 accumulate, bf16 output (D39 rule 1;
-/// docs/build/native-kernel-arithmetic-audit.md section 2.1). The native kernel for wq_a, wkv, wq_b
+/// docs/archive/build/native-kernel-arithmetic-audit.md section 2.1). The native kernel for wq_a, wkv, wq_b
 /// and wo_b; the D37 bf16a dense family computes a different model (audit Appendix A) and is not
 /// native for any of them.
 pub const NATIVE_DENSE_KERNEL: &str = "b12x_mxfp8_dense_sm121";

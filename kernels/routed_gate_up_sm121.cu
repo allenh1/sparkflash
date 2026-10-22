@@ -41,7 +41,7 @@
 //     folding it into this GEMM would be a different arithmetic (mxfp4_ref.rs pins that difference
 //     with a mutation). This kernel's contract is therefore the unrouted gate/up tensor; the
 //     activation stage is the pinned swiglu_mxfp8_quant_sm121 kernel, and a weighted variant of that
-//     activation stage is a separate, named gap (docs/build/phase3-gate-up.md);
+//     activation stage is a separate, named gap (docs/archive/build/phase3-gate-up.md);
 //   * the shared expert does not use this kernel at all: its w1/w3 are a dense FP8 [2304, 5120]
 //     projection on the checkpoint's 32x32 grid, already served by b12x_mxfp8_dense_sm121 with
 //     runtime inner/cols (stage-7 K13/K14 run at K=5120 -> 2,304 and match bit for bit).

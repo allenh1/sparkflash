@@ -103,7 +103,7 @@ pub const TOKEN_LOOP_CHUNK_TOKENS: usize = 1;
 
 /// Measured cost of one decode-shaped forward on the four-rank TP=4 host path, in milliseconds.
 ///
-/// Evidence: docs/build/tp4-tokens-per-second.md line 38 - the pre-fix census TTFT of
+/// Evidence: docs/archive/build/tp4-tokens-per-second.md line 38 - the pre-fix census TTFT of
 /// 39.134645546 s is 37 prompt tokens at ~0.945 s/token plus ~2 s HTTP/tokenizer overhead. This
 /// is a measured number for the *token-loop* path; it is used only by [PrefillCostEstimate],
 /// which labels its output an estimate.
@@ -111,13 +111,13 @@ pub const MEASURED_TOKEN_LOOP_MS_PER_PROMPT_TOKEN: f64 = 945.0;
 
 /// Measured cost of the batch-17 whole-prompt chunk prefill in the *bench* harness, in
 /// milliseconds per prompt token: 24.6 s for 37 tokens (evidence:
-/// docs/build/tp4-tokens-per-second.md line 371-373). Bench only; the serve endpoint measured
+/// docs/archive/build/tp4-tokens-per-second.md line 371-373). Bench only; the serve endpoint measured
 /// this path *slower* than the token loop (43.62 s at 37 tokens, same document line 46-51).
 pub const MEASURED_BENCH_CHUNK_MS_PER_PROMPT_TOKEN: f64 = 664.9;
 
 /// Measured cost of the batch-17 whole-prompt chunk prefill at the *serve endpoint*, in
 /// milliseconds per prompt token: 43.624741849 s for 37 tokens (evidence:
-/// docs/build/tp4-tokens-per-second.md line 46-51). Slower than the token loop; the overhead is
+/// docs/archive/build/tp4-tokens-per-second.md line 46-51). Slower than the token loop; the overhead is
 /// the open batch-18 question and is why the CLI default stayed on the token loop.
 pub const MEASURED_ENDPOINT_CHUNK_MS_PER_PROMPT_TOKEN: f64 = 1179.0;
 

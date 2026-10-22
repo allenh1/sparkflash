@@ -2,7 +2,7 @@
 //! skeleton, M3-b is layer-0 weight staging and a budget-gated first-stage path; none is a chain
 //! execution.**
 //!
-//! Milestones M1, M2 and M3-a of `docs/build/device-forward-chain.md` section 7. The crate exists so
+//! Milestones M1, M2 and M3-a of `docs/archive/build/device-forward-chain.md` section 7. The crate exists so
 //! the serving seam's capability boundary becomes real and a device session is proved through it:
 //!
 //! - It implements the api engine seam, [`sparkflash_api::engine::InferenceEngine`] (design 1.2:

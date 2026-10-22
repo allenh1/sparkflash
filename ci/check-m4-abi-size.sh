@@ -20,7 +20,7 @@
 #
 # The aggregate replaced the single-file 13,906 pin in the quarantine split (task-27): the test
 # list before and after is byte-identical and the move is proven verbatim by
-# ci/verify-m4-abi-split.py; docs/build/m4-abi-split.md records the composition and the split.
+# ci/verify-m4-abi-split.py; docs/archive/build/m4-abi-split.md records the composition and the split.
 #
 # Pin 13,924 -> 13,926 (2026-10-21): the split-K MoE tiling (D51 tolerance arm; the split-K launch
 # stays dormant behind SPARKFLASH_ENABLE_MOE_SPLITK=1) added the two static asserts the scanner

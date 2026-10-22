@@ -118,7 +118,7 @@
 //!
 //! Stages 1, 2 and 3 take --layer N and read that layer's tensor names; the released run used layer 0
 //! for development, and the same stages pass unchanged on other layers: stage 1 at layers 1, 4, 14
-//! and 39, stages 2 and 3 at layer 14 (recon logs in docs/build/phase1-boundary-table.md section 11),
+//! and 39, stages 2 and 3 at layer 14 (recon logs in docs/archive/build/phase1-boundary-table.md section 11),
 //! so the per-layer kernels are not layer-0-specific. Stage 0 is the CPU-only exception: it needs
 //! the host boundary row and compares that row's captured layer-0 coefficients, so it is layer 0
 //! only. Stage 7 is the chained replay: it runs the layer's kernels in order, captures all eighteen

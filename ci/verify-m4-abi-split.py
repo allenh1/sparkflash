@@ -56,7 +56,7 @@ FREEZE_TITLE_NEW = "//! # FREEZE (D26, 2026-10-18): no new source-text scanners 
 FREEZE_BULLET = "//!   * no new scanner, parser or lint for a new kernel invariant is added to this file; a new"
 FREEZE_BULLET_NEW = "//!   * no new scanner, parser or lint for a new kernel invariant is added to this family; a new"
 FREEZE_LENGTH = "//!   * the file's length is pinned by ci/check-m4-abi-size.sh, wired into .gitlab-ci.yml; a change that\n//!     makes it longer fails that check, and a legitimate shrink updates the pin in the same commit.\n"
-FREEZE_LENGTH_NEW = "//!   * the family's total length is pinned by ci/check-m4-abi-size.sh, wired into .gitlab-ci.yml: the\n//!     root file plus the pinned submodules under src/m4_abi/ (the quarantine split recorded in\n//!     docs/build/m4-abi-split.md). Any net change fails that check, and a legitimate shrink updates the\n//!     pin in the same commit.\n"
+FREEZE_LENGTH_NEW = "//!   * the family's total length is pinned by ci/check-m4-abi-size.sh, wired into .gitlab-ci.yml: the\n//!     root file plus the pinned submodules under src/m4_abi/ (the quarantine split recorded in\n//!     docs/archive/build/m4-abi-split.md). Any net change fails that check, and a legitimate shrink updates the\n//!     pin in the same commit.\n"
 POST_SPLIT_ROOT_EDITS = [
     (
         '"const __nv_bfloat16 *__restrict__ hidden; const __nv_bfloat16 *__restrict__ w; float *__restrict__ logits;',

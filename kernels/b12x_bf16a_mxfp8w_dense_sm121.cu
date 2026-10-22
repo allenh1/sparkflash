@@ -3,7 +3,7 @@
 // The BF16-activation variant of the dense MXFP8 GEMM: same weights, same layout, same tile and
 // grid geometry, same trace ABI as b12x_mxfp8_dense_sm121.cu, with the ACTIVATION operand in
 // __nv_bfloat16 instead of E4M3 + ue8m0 block scales. This is the D37 precision-first path for
-// the attention projections (docs/DECISIONS.md D37, docs/build/phase3-attn-precision.md): the
+// the attention projections (docs/DECISIONS.md D37, docs/archive/build/phase3-attn-precision.md): the
 // activation quantiser is removed from the GEMM's input, while the weights stay exactly the
 // B12x FP8 codes and ue8m0 scales the checkpoint ships.
 //

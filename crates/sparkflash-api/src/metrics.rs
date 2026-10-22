@@ -14,7 +14,7 @@
 //! `vllm:time_to_first_token_seconds` with vLLM's default bucket layout
 //! (vllm/v1/metrics/buckets.py). Only facts the host path can measure are exported: there is no
 //! prefix-cache counter because this process has no prefix cache, and no GPU-cache gauge on a
-//! CPU reference path. See docs/build/serve-ops-metrics.md.
+//! CPU reference path. See docs/archive/build/serve-ops-metrics.md.
 
 use prometheus::{
     Encoder, GaugeVec, Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec, Opts, Registry,

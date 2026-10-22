@@ -1,7 +1,7 @@
 // kernels/layer_seams_sm121.cu
 //
 // The eight device kernels of the whole-layer device port's seam image
-// (docs/build/ws-whole-layer-device-port-20261022.md,
+// (docs/archive/build/ws-whole-layer-device-port-20261022.md,
 // task/layer-seams), in the contract order of crates/sparkflash-cli/src/layer_device.rs:
 //
 //   1. mhc_entry_bf16  - the mHC entry of one token: the released [2n + n^2, n*d] coefficient
@@ -336,7 +336,7 @@ __device__ __forceinline__ void spark_seam_coefficient_tail(
 //
 // x_bf16, when not null, is the FFN block's input AFTER its RMS pre-norm, narrowed to BF16 with
 // RNE. That is the host arm's pre_ffn_hidden (rms_norm output, whose router input is its BF16 RNE
-// round - docs/build/moe-stage-contract.md H3b), NOT the pre-norm hc_pre collapse: the router routes
+// round - docs/archive/build/moe-stage-contract.md H3b), NOT the pre-norm hc_pre collapse: the router routes
 // on the normalized hidden. The write therefore lives in the norm loop, beside normed[], so the row
 // cannot be produced before the value it narrows exists. A null pointer writes nothing (the
 // attention entry has no consumer for it).
@@ -494,7 +494,7 @@ extern "C" __global__ void mhc_entry_bf16(
 // 2. mhc_ffn_seams: the FFN's mHC entry, its RMSNorm and its activation quantiser.
 // ---------------------------------------------------------------------------------------------
 // The x_bf16 out word is the host arm's pre_ffn_hidden: the FFN block's RMS-normed input in f32,
-// narrowed to BF16 with RNE - the device router's operand (docs/build/moe-stage-contract.md H3b).
+// narrowed to BF16 with RNE - the device router's operand (docs/archive/build/moe-stage-contract.md H3b).
 // It is NOT the pre-norm hc_pre collapse; the norm loop writes it beside seam_row, which is the same
 // value. Under native_bf16 the released boundary already made the normed value bf16-representable,
 // so the narrowing is idempotent and one rule covers both arms. It is the ABI's one optional

@@ -10,7 +10,7 @@
 //! # Certificate semantics (m16/m27)
 //!
 //! The device screen stores one certification byte per vocabulary entry. The measured semantics
-//! (docs/build/phase3-lm-head.md, docs/build/device-forward-chain.md, and the host twin in
+//! (docs/archive/build/phase3-lm-head.md, docs/archive/build/device-forward-chain.md, and the host twin in
 //! crates/sparkflash-cli/src/tp4_host.rs) are:
 //!
 //! * certified == 0 entries store the exact f32 logit;

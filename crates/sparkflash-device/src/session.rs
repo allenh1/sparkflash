@@ -4,7 +4,7 @@
 //! on a CPU-only CI host. M2 adds `cuda::CudaSession` behind the `cuda` feature: it opens the
 //! driver, loads the pinned router cubin, allocates the router buffers and executes exactly one real
 //! kernel launch, then reports the evidence and nothing else (design
-//! `docs/build/device-forward-chain.md` 7 M2). Neither session claims a forward chain, a token or a
+//! `docs/archive/build/device-forward-chain.md` 7 M2). Neither session claims a forward chain, a token or a
 //! logit; M2 is a session/launch proof.
 //!
 //! The trait is the seam the engine holds. It is `Send + Sync`, and the engine is `Send + Sync`

@@ -20,7 +20,7 @@
 //!   and in holes), so the indexer's block scores are unchanged.
 //!
 //! What this module is not: a device launch, a measured throughput claim, or a frozen ABI. The
-//! design note docs/build/paged-read-attention-kernel-design.md records the argument set such a
+//! design note docs/archive/build/paged-read-attention-kernel-design.md records the argument set such a
 //! kernel would need and the cost of pinning it.
 
 use sparkflash_kernels::m4_quant::bf16_bits;

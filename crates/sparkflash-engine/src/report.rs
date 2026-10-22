@@ -15,7 +15,7 @@
 //! [WeightSource] the caller passes - [crate::synthetic::SyntheticWeights] in tests, the real
 //! checkpoint through the CLI's loader on the node - and the comparison here is host-vs-host, so
 //! its bar is bit-exactness of two runs of the same input, not agreement with the released model.
-//! The device half (docs/build/roadmap-to-serving.md section 4.5 criteria 1 and 3) diffs this
+//! The device half (docs/archive/build/roadmap-to-serving.md section 4.5 criteria 1 and 3) diffs this
 //! table against the device path and bar by bar; this module produces the reference table it diffs.
 
 use std::collections::BTreeSet;

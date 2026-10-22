@@ -13,7 +13,7 @@
 //! 4. a row-parallel seam's result is within the declared L2 bar of the single-rank f32 twin;
 //! 5. every rank writes its own evidence JSON with the same schema.
 //!
-//! It is the S5.1 deliverable of docs/build/tp4-design.md section 9 and the code behind the
+//! It is the S5.1 deliverable of docs/archive/build/tp4-design.md section 9 and the code behind the
 //! section-5.5 window command. Pass criteria: 0 mismatches against the canonical twin, 100
 //! repeats bit-identical, the wo_b seam within the L2 bar, and one evidence file per rank.
 

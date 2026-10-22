@@ -1,6 +1,6 @@
 //! WS-B four-rank all-reduce microbenchmark binary.
 //!
-//! This is the executable form of docs/build/ws-b-collectives-20261021.md section 6 and the
+//! This is the executable form of docs/archive/build/ws-b-collectives-20261021.md section 6 and the
 //! runner is scripts/ws-b-allreduce-bench.sh. It measures the one-shot fabric path at the decode
 //! sizes the 25 us p50 gate is written for (10,240 B is the hidden_5120 bf16 expert reduce), plus
 //! the 2 MiB one-shot boundary, cold and hot.
@@ -140,7 +140,7 @@ fn main() -> ExitCode {
             eprintln!("ws-b-allreduce-bench: {error}");
             if let BenchError::Unavailable(_) = error {
                 eprintln!(
-                    "ws-b-allreduce-bench: on this four-node cluster the fabric prerequisites are tracked in docs/build/ws-b-infra-tickets-20261021.md (MTU 9000, nvidia-peermem, f0/f1 rail naming); no number was produced"
+                    "ws-b-allreduce-bench: on this four-node cluster the fabric prerequisites are tracked in docs/archive/build/ws-b-infra-tickets-20261021.md (MTU 9000, nvidia-peermem, f0/f1 rail naming); no number was produced"
                 );
             }
             ExitCode::from(error.exit_code() as u8)

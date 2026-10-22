@@ -550,7 +550,7 @@ fn main() -> Result<(), String> {
 
 // ---------------------------------------------------------------------------------------------
 // Raw CUDA driver API, resolved through dlopen. Nothing links libcuda: the driver is dlopen'd at
-// run time on the node, which is the invariant docs/build/device-path-design.md records.
+// run time on the node, which is the invariant docs/archive/build/device-path-design.md records.
 // ---------------------------------------------------------------------------------------------
 
 type CuResult = i32;

@@ -1,5 +1,5 @@
 //! Phase 1 one-token harness (host half): run one token through the reference and print the
-//! report that docs/build/roadmap-to-serving.md section 4.5 defines.
+//! report that docs/archive/build/roadmap-to-serving.md section 4.5 defines.
 //!
 //! Usage:
 //!   cargo run -p sparkflash-engine --example one_token [--token N]
@@ -16,7 +16,7 @@
 //! pass decodes the plan's F8E4M3 and applies the separate scale tensor itself. The two Engram
 //! tables (98 GB of FP8 each) are read row by row through read_ranges, so the run does not allocate
 //! them; the loader's byte limit (2 GiB) still bounds every other tensor. This is the reference table
-//! the device half diffs against (docs/build/phase1-boundary-table.md), and it needs the node: the
+//! the device half diffs against (docs/archive/build/phase1-boundary-table.md), and it needs the node: the
 //! checkpoint is not on this host.
 use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::linalg::CHECKPOINT_TENSOR_LIMIT;

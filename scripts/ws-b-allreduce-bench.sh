@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # WS-B four-rank all-reduce microbenchmark runner (task-02 / WS-B, 2026-10-21).
 #
-# This is the executable form of docs/build/ws-b-collectives-20261021.md section 6. It stages and
+# This is the executable form of docs/archive/build/ws-b-collectives-20261021.md section 6. It stages and
 # launches the existing bench binary (crates/sparkflash-comm/src/bin/ws-b-allreduce-bench.rs) on
 # the four GB10 nodes; the binary owns every number, the runner owns nothing but files and
 # processes. No number is available until 'run' completes on the nodes, and no runner path may
@@ -19,7 +19,7 @@
 # human authorisation plus a restore path: docker stop vllm_node on all four nodes, restore with
 # "python3 run-recipe.py deepseek-v4.1-flash-1017-heretic" on .80, ~13 min to health. Confirm the
 # container name, recipe path and health check against the serving owner's runbook before use.
-# This refusal is why no fabric number exists today - see docs/build/ws-b-infra-tickets-20261021.md 3.1.
+# This refusal is why no fabric number exists today - see docs/archive/build/ws-b-infra-tickets-20261021.md 3.1.
 #
 # Usage:
 #   scripts/ws-b-allreduce-bench.sh preflight    read-only busy/MTU/peermem/port check on all four nodes

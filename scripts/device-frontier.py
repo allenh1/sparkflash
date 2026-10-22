@@ -85,7 +85,7 @@ OPEN-TIME REFUSAL ROWS (exit 3) - the arm refused inside DeviceLayer::open
     refusal out of the per-rank chain log (the only place it is written), prints it verbatim, names
     the stage that was being opened (mhc_entry for layer 0), reports what the row DOES have
     (bind/loop/token JSON, run.meta), and exits 3 with verdict OPEN-REFUSAL. The rule is recorded in
-    docs/RULES-speed.md: such a row is never a frontier stage, never a ms/step, and no published
+    docs/RULES.md: such a row is never a frontier stage, never a ms/step, and no published
     number changes. Exit 2 stays reserved for a row whose documents are missing with no named
     open-time refusal to explain the absence.
 

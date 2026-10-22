@@ -46,7 +46,7 @@
 //! argmax and top-5 stored `local` instead of `base + local`, so block 1 reported block 0's entry
 //! and a certified winner's flag was read at the wrong index). That is fixed too, the kernel is
 //! re-pinned again, and the b42/b43 failure records stay in
-//! docs/build/phase3-lm-head-reduce.md. Do not cite b42 or b43 as anything but FAILURES.
+//! docs/archive/build/phase3-lm-head-reduce.md. Do not cite b42 or b43 as anything but FAILURES.
 //!
 //! PINS. Both cubins are refused by size and sha256 against the embedded baseline manifest before
 //! any device allocation: cert_lm_head_sm121 38,088 B / 3b71c992... / membar 0, lm_head_reduce_sm121

@@ -10,7 +10,7 @@
 //!
 //! * [window_rows]: the last min(position, `SWA_SLOTS_PER_TAIL`) tokens' SWA slots, gathered oldest first from the
 //!   sequence's tail ring into the kernel's contiguous row order. This is the rotation copy
-//!   `docs/build/phase2-device-kv-store.md` lists as open item 1; the store keeps the
+//!   `docs/archive/build/phase2-device-kv-store.md` lists as open item 1; the store keeps the
 //!   reference's slot-indexed ring, the kernel wants row order.
 //! * [candidate_rows]: the main-KV row of each selected compressed entry, gathered from the paged
 //!   global-KV pool in candidate order. The kernel's `kv_fp4`/`kv_scales` operands are flat
@@ -42,7 +42,7 @@
 //! pool in absolute block order, so the pinned kernel sees absolute ids and absolute positions and
 //! both stages are correct for reasons a reviewer can check without new kernel logic. That staging
 //! is O(context) per source layer per step - a throughput cost recorded in
-//! docs/build/serving-paged-kv.md, which also names the positions-array kernel as the follow-on
+//! docs/archive/build/serving-paged-kv.md, which also names the positions-array kernel as the follow-on
 //! that would make it O(candidates) at the price of a frozen-ABI change (FlashMlaParams 19 -> 20).
 //! The device run of this path - a served sequence attending through flash_mla over paged rows - is
 //! a window measurement and is recorded as unclaimed; the CPU twin below is what the tests assert.
@@ -409,7 +409,7 @@ impl<'a> PagedKvView<'a> {
     /// Cost: one MAIN_KV_ENTRY_BYTES copy per position per source layer per step, and the window
     /// rows are still gathered separately. That is the price of leaving the pinned kernel ABI
     /// untouched; the positions-array kernel that would make staging O(candidates) is the named
-    /// follow-on in docs/build/serving-paged-kv.md.
+    /// follow-on in docs/archive/build/serving-paged-kv.md.
     ///
     /// # Errors
     /// Unknown sequence, a position beyond the sequence, a layer with no compressed KV, or a pool

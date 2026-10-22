@@ -15,7 +15,7 @@
 // other kernel files'. A CPU-only host still gets the clang CUDA frontend check against
 // cuda_stub/cuda_stub.h through build.rs, exactly as for every other kernel.
 //
-// SEMANTICS (docs/build/ws-kv-path-semantics-20261022.md, sections 2 and 3):
+// SEMANTICS (docs/archive/build/ws-kv-path-semantics-20261022.md, sections 2 and 3):
 //
 //   rope_rotate_bf16 - row and out MAY alias (the same buffer): each pair reads both of its inputs
 //   before writing either, and no thread touches another pair's values, so in-place rotation needs no

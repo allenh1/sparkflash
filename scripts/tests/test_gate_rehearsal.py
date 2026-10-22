@@ -24,7 +24,7 @@ flagged run an evidence file whose verdict is not PASS/UNBARED):
   * a capture with a missing required class (d41_floors exits 2, writes nothing)
   * a floors run that emits requires_review (d41_floors exits 3; the consumer refuses its bars)
 
-What cannot be rehearsed offline is listed in docs/build/acceptance-gate-rehearsal.md.
+What cannot be rehearsed offline is listed in docs/archive/build/acceptance-gate-rehearsal.md.
 
 Run with:
 

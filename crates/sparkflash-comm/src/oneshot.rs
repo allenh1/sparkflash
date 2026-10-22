@@ -1,6 +1,6 @@
 //! The device-buffer one-shot collective seam contract.
 //!
-//! `docs/build/rdma-backend.md` section 15 names the gap this module starts to close: the CUDA
+//! `docs/archive/build/rdma-backend.md` section 15 names the gap this module starts to close: the CUDA
 //! one-shot kernel (`kernels/rocenante_oneshot_sm121.cu` with the slot ABI in its `.cuh`) and the
 //! RDMA data plane in [`crate::rdma`] describe two protocols that never meet. The kernel stages a
 //! rank's row in coherent UMA and waits on host-written arrival words; the data plane moves frames
@@ -351,7 +351,7 @@ pub struct RailFrame {
 
 /// The receive-side proxy state machine for one exchange.
 ///
-/// Section 15.2(b) of `docs/build/rdma-backend.md` describes the shape: poll the local doorbell,
+/// Section 15.2(b) of `docs/archive/build/rdma-backend.md` describes the shape: poll the local doorbell,
 /// post the rows, drain the send CQ, and publish each peer's arrival word once both rails' frames
 /// for the exchange have been observed. Only the transitions are here; the QP posting and polling
 /// sit above this type.
@@ -509,7 +509,7 @@ impl ArrivalProxy {
 
 /// How the one-shot slot is registered with ibverbs.
 ///
-/// Section 15.5 of `docs/build/rdma-backend.md` leaves both forms unverified on this hardware, so
+/// Section 15.5 of `docs/archive/build/rdma-backend.md` leaves both forms unverified on this hardware, so
 /// the one-shot path keeps them separate instead of assuming one: the pinned-host form has a host
 /// address plus the device alias `cuMemHostGetDevicePointer` returns, the device form registers the
 /// device allocation directly (dmabuf) and has no host address.

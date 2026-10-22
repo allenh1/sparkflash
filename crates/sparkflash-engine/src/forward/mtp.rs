@@ -268,7 +268,7 @@ pub fn confidence(
 /// `attn_mixes` per position and one `ffn_mixes` reused position by position, and the second half
 /// of the loop works one position at a time. A capture has to collect the per-position values into
 /// one row, which is what these buffers are for. They exist only when a table was asked for; the
-/// default pass allocates nothing here (docs/build/phase1-boundary-table.md section 1).
+/// default pass allocates nothing here (docs/archive/build/phase1-boundary-table.md section 1).
 struct StageBoundary {
     residual_in: Vec<f32>,
     input_mix: Vec<f32>,
@@ -399,7 +399,7 @@ pub fn dspark_forward(
 }
 
 /// [dspark_forward] with the per-stage boundary rows appended to `capture`, layer id
-/// `n_layers + stage` (docs/build/phase1-boundary-table.md section 1).
+/// `n_layers + stage` (docs/archive/build/phase1-boundary-table.md section 1).
 ///
 /// `capture` is the table the backbone rows of the same step are in; the stages append their own
 /// rows so one observed step is one table. The arithmetic is [dspark_forward]'s.
@@ -546,7 +546,7 @@ pub(crate) fn dspark_forward_observed(
     let mut scratch = MoeScratch::for_config(config);
 
     // The capture buffers exist only when a table was asked for: the default pass allocates nothing
-    // here (docs/build/phase1-boundary-table.md section 1).
+    // here (docs/archive/build/phase1-boundary-table.md section 1).
     let mut captured = capture.is_some().then(|| StageBoundary::new(config, block));
 
     // The stages in order (model.py:1277-1279), each one the block of section 3.2, whose attention
@@ -679,7 +679,7 @@ pub(crate) fn dspark_forward_observed(
         }
         // The stage's output boundaries and its row: the residual out is the stream after the last
         // position, and the row is appended with layer id n_layers + stage
-        // (docs/build/phase1-boundary-table.md section 1).
+        // (docs/archive/build/phase1-boundary-table.md section 1).
         if let Some(table) = capture.as_deref_mut() {
             let buffers = captured.take().ok_or_else(|| {
                 shape_error(

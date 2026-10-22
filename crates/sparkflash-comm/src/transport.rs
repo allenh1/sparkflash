@@ -54,7 +54,7 @@ pub trait Transport: Send + Sync {
     /// All-reduces a **device** buffer in place through the one-shot kernel seam.
     ///
     /// This is the device-buffer form of the collective described in
-    /// `docs/build/rdma-backend.md` section 15: the payload never crosses the host. The host-slice
+    /// `docs/archive/build/rdma-backend.md` section 15: the payload never crosses the host. The host-slice
     /// `all_reduce_bf16` above stays the only form loopback, TCP and every CI test implement, and
     /// it is deliberately not a default fallback for this one. A backend that has not wired the
     /// kernel and the proxy refuses with [`CommError::Unsupported`] naming the prerequisite, so a

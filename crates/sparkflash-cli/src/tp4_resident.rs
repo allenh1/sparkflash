@@ -37,7 +37,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// The stage's command line.
 pub const USAGE: &str = "sparkflash device-chain --run-stage tp4-resident (--tensor-index FILE | --checkpoint DIR) --tp-rank 0..3 --tp-world-size 4 --evidence-dir DIR [--read] [--upload] [--design-gib 72.31]";
 
-/// The design's per-rank resident budget, in GiB (docs/build/tp4-design.md section 6.3).
+/// The design's per-rank resident budget, in GiB (docs/archive/build/tp4-design.md section 6.3).
 pub const DESIGN_RESIDENT_GIB: f64 = 72.31;
 
 /// Runs the stage and turns a failure into a message on stderr.

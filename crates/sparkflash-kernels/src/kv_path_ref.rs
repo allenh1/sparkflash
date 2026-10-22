@@ -10,7 +10,7 @@
 //!   block, 1e-4 floor, round-up-to-a-power-of-two E8M0 scale, +-448 clamp, E4M3 round-to-nearest-even.
 //!   It delegates to the m4 format oracle, which is the same code the engine path asserts byte
 //!   equality against, so a divergence here is a divergence in the format and not in the arithmetic
-//!   around it (see docs/build/ws-kv-path-semantics-20261022.md section 3).
+//!   around it (see docs/archive/build/ws-kv-path-semantics-20261022.md section 3).
 //! * [kv_append_rule] states the visibility rule as an executable check rather than prose: the
 //!   append of position p happens after p's window read, so the cache length at the top of position p
 //!   must be exactly p, and the row written at p is visible to positions p+1 and later only.

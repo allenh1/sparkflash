@@ -431,7 +431,7 @@ pub struct V1Tensor {
 
 /// A phase-1 host boundary v1 pair: the text manifest plus the blob it indexes.
 ///
-/// The format is \`docs/build/phase1-boundary-table.md\` section 3: a header, then \`row N\` markers and
+/// The format is \`docs/archive/build/phase1-boundary-table.md\` section 3: a header, then \`row N\` markers and
 /// one \`tensor <row> <name> <dtype> <dims> <offset> <bytes>\` line per tensor. Stage 0 reads two
 /// f32 tensors from row 0 and the coefficient tensors that row captured, so it needs a reader that
 /// checks the pair's own consistency rather than trusting the offsets.

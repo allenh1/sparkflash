@@ -2,7 +2,7 @@
 //
 // The BF16-activation variant of the grouped output projection wo_a: the grouped twin of
 // b12x_bf16a_mxfp8w_dense_sm121.cu and the D37 precision-first path for K6 (docs/DECISIONS.md
-// D37, docs/build/phase3-attn-precision.md). Weights are exactly the B12x FP8 codes and ue8m0
+// D37, docs/archive/build/phase3-attn-precision.md). Weights are exactly the B12x FP8 codes and ue8m0
 // scales that b12x_mxfp8_wo_a_sm121.cu reads; the activation operand is __nv_bfloat16 instead of
 // E4M3 codes plus per-32 ue8m0 scales.
 //

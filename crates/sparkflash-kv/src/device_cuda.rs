@@ -3,7 +3,7 @@
 //! Nothing here computes: it allocates device memory, copies bytes in and out, frees it, and
 //! reports the driver's free-memory figure so a run can be measured against the store's own
 //! accounting. No kernel is loaded or launched. The driver is resolved through dlopen, so no
-//! process links libcuda; this is the same invariant docs/build/device-path-design.md records
+//! process links libcuda; this is the same invariant docs/archive/build/device-path-design.md records
 //! for the project's other device probes.
 //!
 //! The primary context is retained with CU_CTX_LMEM_RESIZE_TO_MAX (0x10), the flag the existing

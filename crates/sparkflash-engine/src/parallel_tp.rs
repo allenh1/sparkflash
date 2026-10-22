@@ -1,7 +1,7 @@
 //! The tensor-parallel seam: a rank's collective adapter and a resident shard source.
 //!
 //! This module is the engine half of the Phase-1 TP path described in
-//! `docs/build/tp4-design.md` section 3 and `docs/build/engine-tp-seams.md`. It holds three things:
+//! `docs/archive/build/tp4-design.md` section 3 and `docs/archive/build/engine-tp-seams.md`. It holds three things:
 //!
 //! * [TpCollective], the adapter trait the CLI implements over its transport. No transport type
 //!   crosses this boundary: the engine only sees f32 buffers and a rank/world pair, which is what
@@ -18,7 +18,7 @@
 //! (wq_a/wkv/wq_b/wo_a/wo_b), the embedding, the head and the shared expert are REPLICATED, so the
 //! one collective per layer is the routed-FFN all-reduce after the local expert bodies. The
 //! deviations from the full section-3 map and the numeric bar they do (not) spend are recorded in
-//! `docs/build/engine-tp-seams.md`.
+//! `docs/archive/build/engine-tp-seams.md`.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;

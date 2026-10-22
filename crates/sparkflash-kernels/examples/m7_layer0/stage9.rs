@@ -96,7 +96,7 @@ fn stage9_dims(name: &str) -> Vec<usize> {
     }
 }
 
-/// The v1 dtype token of one boundary tensor name (docs/build/phase1-boundary-table.md section 3).
+/// The v1 dtype token of one boundary tensor name (docs/archive/build/phase1-boundary-table.md section 3).
 fn stage9_v1_dtype(name: &str) -> &'static str {
     match name {
         "pre_attention_xhat" | "pre_ffn_xhat" => "u8-e4m3",

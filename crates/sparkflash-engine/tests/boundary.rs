@@ -1,6 +1,6 @@
 //! The Phase 1 per-layer boundary table, and the perturbation test that makes the diff able to fail.
 //!
-//! Spec: `docs/build/phase1-boundary-table.md` (the format) and `docs/build/roadmap-to-serving.md`
+//! Spec: `docs/archive/build/phase1-boundary-table.md` (the format) and `docs/archive/build/roadmap-to-serving.md`
 //! section 4.5 criteria 1 and 2 (the table and the perturbation test are Phase 1's exit criteria).
 //!
 //! What is asserted here, in the terms the roadmap uses:
@@ -164,7 +164,7 @@ impl WeightSource for BoundarySource {
             let clean = quant::f32_from_le_bytes(
                 bytes[at..at + 4].try_into().expect("four bytes of an f32"),
             );
-            // The stored form is FP8 E4M3 (docs/build/device-path-design.md section 2): a
+            // The stored form is FP8 E4M3 (docs/archive/build/device-path-design.md section 2): a
             // one-code change takes the clean value's code and moves it one step.
             let code = quant::e4m3_encode(clean);
             let changed = quant::f8e4m3_to_f32(code ^ 1);
@@ -257,7 +257,7 @@ fn assert_row_is_documented(config: &ModelConfig, row: &LayerBoundary, positions
     assert_eq!(shape(boundary::RESIDUAL_OUT), vec![positions, hc, dim]);
 
     // The two formats: streams and sublayer outputs are f32, the quantised block input is raw E4M3
-    // code bytes and E8M0 scale bytes (docs/build/phase1-boundary-table.md section 4).
+    // code bytes and E8M0 scale bytes (docs/archive/build/phase1-boundary-table.md section 4).
     for f32_name in [
         boundary::RESIDUAL_IN,
         boundary::HC_IN_PRE,
@@ -458,7 +458,7 @@ fn a_one_code_change_in_layer_17s_wq_b_flags_layer_17_and_no_other_layer() {
     // the row is computed from. A one-code weight change is small: it survives in some values of
     // the row and rounds away in others (the quantised block input can snap to the same E4M3 code,
     // for one), which is why the format document gives every boundary its own comparison class
-    // (docs/build/phase1-boundary-table.md section 5) instead of one bar for the whole row.
+    // (docs/archive/build/phase1-boundary-table.md section 5) instead of one bar for the whole row.
     // The row's full measured result, pinned: these five tensors differ and the other thirteen are
     // bit-identical. The counts and deltas are deterministic for this configuration and seed and
     // are the numbers format document section 6 quotes; comparing the deltas by bits keeps the

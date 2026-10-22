@@ -12,7 +12,7 @@
 //!
 //! kernels/b12x_hostw_gemv_m1_sm121.cu replaces the first line only, for weights with no MXFP8
 //! encoding: compressor.wkv is bf16 at ratio == 1 and f32 above it, and compressor.norm.weight is
-//! bf16 (docs/build/native-arithmetic-audit.md:153; model.py:446-449, 461-486). Its
+//! bf16 (docs/archive/build/native-arithmetic-audit.md:153; model.py:446-449, 461-486). Its
 //! b12x_hostw_gemv_m1_bf16w_f32o_sm121 / b12x_hostw_gemv_m1_f32w_f32o_sm121 rows are
 //! __fadd_rn(acc, __fmul_rn(a, w)) with one accumulator per output column, ascending K, which is
 //! matmul_checked's inner loop exactly.

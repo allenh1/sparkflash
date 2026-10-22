@@ -1,8 +1,8 @@
 //! The M3 hybrid 40-layer chain skeleton: the CED schedule, the per-layer stage order, the planned
 //! host-seam set and the ledger self-check, with no device execution and no token.
 //!
-//! **Scope.** This module is M3-a plumbing (design docs/build/device-forward-chain.md section 7 M3
-//! and docs/build/serving-readiness.md 3.3 M3-a). It constructs the 130 + 8 schedule, names the 40
+//! **Scope.** This module is M3-a plumbing (design docs/archive/build/device-forward-chain.md section 7 M3
+//! and docs/archive/build/serving-readiness.md 3.3 M3-a). It constructs the 130 + 8 schedule, names the 40
 //! layer executions and every stage in the per-layer graph, and fixes the host-seam plan before a
 //! run: the plan constructs the expected seam set, the run records seams, and the self-check fails
 //! on a planned seam with no record **and** on a record with no plan entry. It does not launch a

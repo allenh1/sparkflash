@@ -16,7 +16,7 @@
 //! continuation and the c2 trace comparison, with `--token 0` as its only accepted token. Both
 //! refuse every other stage, claim no token or chain, and are not full chain runs. A Bar comparison
 //! is a failure, not a success. The labels are printed verbatim so a plan cannot be read as a device
-//! result (docs/build/device-forward-chain.md 4.3 item 3).
+//! result (docs/archive/build/device-forward-chain.md 4.3 item 3).
 
 use std::collections::HashMap;
 use std::process::ExitCode;

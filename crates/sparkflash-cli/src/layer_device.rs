@@ -493,7 +493,7 @@ impl LayerBuffers {
     /// minimum), so a length that is not that number means a stage would hand a kernel a pointer
     /// into a buffer of the wrong dtype or width. This is the open-time half of the dtype audit;
     /// the launch-time half is each kernel's own signature (see
-    /// docs/build/layer-device-dtype-audit-20261022.md for the pair-by-pair list).
+    /// docs/archive/build/layer-device-dtype-audit-20261022.md for the pair-by-pair list).
     ///
     /// # Errors
     /// The first span whose length is not its contract width rounded to the alignment, named with

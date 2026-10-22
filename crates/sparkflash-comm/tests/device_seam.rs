@@ -12,7 +12,7 @@
 //! after every rail, sequences advance strictly, a frame outside the dispatch is refused, and the
 //! reduction is the canonical one-rounding order. What it cannot prove, and the S5.3 window must:
 //! that the CUDA kernel, the pinned slot, the memory registration and the QP posting actually
-//! implement this contract on the nodes (docs/build/rdma-backend.md section 15.4, items 5-7).
+//! implement this contract on the nodes (docs/archive/build/rdma-backend.md section 15.4, items 5-7).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};

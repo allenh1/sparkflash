@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The speed row's correctness gate: NUMERICAL, not byte-identical (D53).
+# The speed row's correctness gate: NUMERICAL, not byte-identical (D54).
 #
 #   scripts/numerical-gate.sh --freeze <run-dir> <reference-dir>   # freeze a fixture's reference
 #   scripts/numerical-gate.sh --run <run-dir> [more run dirs...]   # gate rows against the reference
@@ -9,7 +9,7 @@
 # fixture (the fixture key is sha256 of positions + prompt_len + tokens, so a different prompt simply
 # has no reference until one is frozen) and prints one PASS/FAIL line with the measured metrics.
 #
-# The bars are DECLARED HERE, before the run, per D39 rule 2 and D53:
+# The bars are DECLARED HERE, before the run, per D39 rule 2 and D54:
 #   greedy argmax tokens      identical to the reference tokens        (hard)
 #   top-1 agreement           1.00 of the decode positions             (hard)
 #   top-5 set overlap         >= 0.80 mean Jaccard over positions      (hard)
@@ -218,9 +218,9 @@ def cmd_run(runs, refdir):
             else:
                 print("PASS " + line)
     if failures:
-        print(f"NUMERICAL GATE FAIL: {failures} rank(s) outside the declared bars (D53)")
+        print(f"NUMERICAL GATE FAIL: {failures} rank(s) outside the declared bars (D54)")
         return 1
-    print("NUMERICAL GATE PASS: tokens identical and every rank inside the declared bars (D53)")
+    print("NUMERICAL GATE PASS: tokens identical and every rank inside the declared bars (D54)")
     return 0
 
 

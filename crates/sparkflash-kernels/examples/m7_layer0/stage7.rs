@@ -15,7 +15,7 @@ use crate::stage8::*;
 // separate program.
 // ---------------------------------------------------------------------------------------------
 
-/// The B2 comparison class of one boundary tensor (docs/build/phase1-boundary-table.md section 5).
+/// The B2 comparison class of one boundary tensor (docs/archive/build/phase1-boundary-table.md section 5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum BoundaryClass {
     ExactBits,
@@ -1168,7 +1168,7 @@ pub(crate) fn stage7(args: &Args) -> Result<(), String> {
         attn_coeffs[HC_MULT * HC_MULT + HC_MULT..HC_MULT * HC_MULT + 2 * HC_MULT].to_vec();
     let attn_comb: Vec<f32> = {
         // The kernel writes B[destination][source]; the boundary row stores
-        // comb[source][destination] (docs/build/phase1-boundary-table.md section 2).
+        // comb[source][destination] (docs/archive/build/phase1-boundary-table.md section 2).
         let mut comb = vec![0.0f32; HC_MULT * HC_MULT];
         for destination in 0..HC_MULT {
             for source in 0..HC_MULT {

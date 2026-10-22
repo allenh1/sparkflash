@@ -14,7 +14,7 @@
 //!
 //! The peer table is the rail-1 address table (192.0.2.80 = node0 = rank 0, .84 = node1 = rank 1,
 //! .68 = node2 = rank 2, .59 = node3 = rank 3). The deployed vLLM container instead uses a mixed
-//! rail-2 table; docs/build/rdma-backend.md explains why those are different and why neither
+//! rail-2 table; docs/archive/build/rdma-backend.md explains why those are different and why neither
 //! should be "fixed".
 //!
 //! Without SPARK_COMM_HW_PERMISSION=1 every gate panics immediately instead of touching the

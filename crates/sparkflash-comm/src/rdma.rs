@@ -25,7 +25,7 @@
 //!
 //! The staging buffer is host memory. The specification's slot design is device memory reached by
 //! GPUNetIO; posting from registered host memory is the part of the backend that is real today, and
-//! docs/build/rdma-backend.md states that limit instead of implying a GPU path exists.
+//! docs/archive/build/rdma-backend.md states that limit instead of implying a GPU path exists.
 
 mod abi;
 mod dataplane;
@@ -77,7 +77,7 @@ pub struct RdmaConfig {
     pub rank: usize,
     /// Control-plane addresses in rank order. The live cluster uses the rail-1 address table:
     /// 192.0.2.80 (node0), .84 (node1), .68 (node2), .59 (node3). The deployed vLLM container
-    /// instead sees a mixed rail-2 table; see docs/build/rdma-backend.md before "fixing" either.
+    /// instead sees a mixed rail-2 table; see docs/archive/build/rdma-backend.md before "fixing" either.
     pub peers: Vec<String>,
     /// Port rank 0 listens on and every rank connects to.
     pub control_port: u16,

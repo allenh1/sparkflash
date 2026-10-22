@@ -682,7 +682,7 @@ fn released_row_into_kernel_row(kernel_row: usize) -> usize {
 /// kernel order, with the comb terms transposed. Permuting the rows without this mapping makes the
 /// kernel apply one group's projection to another group's activation, and a device comparison
 /// cannot catch it because both sides share the permutation - a test pins this mapping instead
-/// (docs/build/roadmap-to-serving.md section 10, open unknown 2).
+/// (docs/archive/build/roadmap-to-serving.md section 10, open unknown 2).
 ///
 /// # Panics
 /// Panics if `released` is not `PREDICTOR_ROWS * HC_MULT * HIDDEN` long or `kernel_rows` is not the

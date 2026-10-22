@@ -17,7 +17,7 @@
 //!     because they gate the kernels today: the freeze is on length, not on correctness;
 //!   * the family's total length is pinned by ci/check-m4-abi-size.sh, wired into .gitlab-ci.yml: the
 //!     root file plus the pinned submodules under src/m4_abi/ (the quarantine split recorded in
-//!     docs/build/m4-abi-split.md). Any net change fails that check, and a legitimate shrink updates the
+//!     docs/archive/build/m4-abi-split.md). Any net change fails that check, and a legitimate shrink updates the
 //!     pin in the same commit.
 //!
 //! Decision record: docs/DECISIONS.md D26.

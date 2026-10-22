@@ -148,7 +148,7 @@ def check_dump_sidecar(rows: list[dict], dump_path: str, bin_path: str) -> None:
     When the dump carries logits_bin (the writer always does) it must name that same
     sidecar, the file actually read must have that name, its length must be exactly the sum
     of the recorded blocks, and the offsets must tile in dump order - the frozen schema in
-    docs/build/logits-dump.md. A dump moved next to another run's sidecar is refused instead
+    docs/archive/build/logits-dump.md. A dump moved next to another run's sidecar is refused instead
     of being compared silently.
     """
     expected_name = os.path.basename(dump_path) + ".bin"

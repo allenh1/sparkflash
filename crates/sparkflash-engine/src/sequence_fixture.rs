@@ -880,7 +880,7 @@ impl CertifiedMask {
 ///
 /// The certified LM head returns an exact logit where the bit is 0 and an upper bound (strictly
 /// below the running maximum that pruned the entry) where it is 1. The comparison contract
-/// (design `docs/build/device-forward-chain.md` 4.2) compares only the exact entries plus the
+/// (design `docs/archive/build/device-forward-chain.md` 4.2) compares only the exact entries plus the
 /// argmax entry, because a certified bound cannot be compared per entry; the mask travels with the
 /// values so the compared set is auditable.
 #[derive(Debug, Clone, PartialEq)]

@@ -1,7 +1,7 @@
 //! The cubin catalog and its fail-closed verification.
 //!
 //! The device chain must not launch a cubin it has not verified against the repository baseline
-//! (docs/build/device-forward-chain.md 4.2 and 7 M3): the catalog is parsed from
+//! (docs/archive/build/device-forward-chain.md 4.2 and 7 M3): the catalog is parsed from
 //! crates/sparkflash-kernels/baseline/kernel_baseline.txt through sparkflash_kernels::baseline,
 //! not from hand-copied
 //! SHA-256 constants, and [verify_pins] checks size **and** digest before any launch path exists.

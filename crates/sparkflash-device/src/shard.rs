@@ -21,7 +21,7 @@ use sparkflash_engine::safetensors::SafeTensorsSource;
 ///
 /// The rules mirror the released reference: column-parallel linears split the output axis,
 /// row-parallel linears split the input axis, and the replicated tensors are held whole on every
-/// rank (docs/build/tp4-design.md section 3 has the per-tensor map).
+/// rank (docs/archive/build/tp4-design.md section 3 has the per-tensor map).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShardRule {
     /// Every rank holds the whole tensor (the reference's disable_tp / ReplicatedLinear tensors).

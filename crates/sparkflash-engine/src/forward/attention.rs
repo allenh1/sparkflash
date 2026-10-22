@@ -4533,7 +4533,7 @@ mod tests {
     /// the top-k cannot separate the two positions and the tie rule (lower position) decides. The
     /// f32 score ordering would pick the other one. At the planned window lengths the released
     /// configuration never reaches this regime: index_topk (512) exceeds n_pos, so every reachable
-    /// position is selected whatever the scores say (docs/build/indexer-native-dtype.md).
+    /// position is selected whatever the scores say (docs/archive/build/indexer-native-dtype.md).
     #[test]
     fn the_bf16_score_path_can_erase_a_margin_the_f32_path_keeps() {
         let q = [1.0f32, 0.0];

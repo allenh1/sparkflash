@@ -1,6 +1,6 @@
 //! The paged-read attention kernel's CPU twin (task-49, design only).
 //!
-//! The design note docs/build/paged-read-attention-kernel-design.md proposes a kernel that reads
+//! The design note docs/archive/build/paged-read-attention-kernel-design.md proposes a kernel that reads
 //! the paged pool directly instead of the Path B dense staging. Before such an entry is frozen, the
 //! read path it would use has to be proved to be the bytes the staging path already produces. These
 //! tests are that proof, and they are the only evidence: no kernel, no cubin, no device launch, no

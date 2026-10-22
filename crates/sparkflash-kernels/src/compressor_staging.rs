@@ -1,7 +1,7 @@
 //! Staging the compressor projections for the host-weight GEMV, and the store-width rule.
 //!
 //! The compressor matrices are the checkpoint f32 (ratio > 1) or bf16 (ratio == 1) weights
-//! (docs/build/native-arithmetic-audit.md:153; model.py:446-449, 461-486), so the kernel that
+//! (docs/archive/build/native-arithmetic-audit.md:153; model.py:446-449, 461-486), so the kernel that
 //! reproduces their rows is b12x_hostw_gemv_m1_sm121, not the MXFP8 GEMV: the latter decodes
 //! E4M3 + ue8m0 and cannot read either dtype. This module is the wrapper the stage body calls:
 //! it permutes a weight into the kernel B12x order once per layer per run

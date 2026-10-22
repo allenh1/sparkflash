@@ -48,7 +48,7 @@ Usage (one command; no third party packages, stdlib only):
     python3 scripts/d38_vllm_recapture.py \
         --base-url http://192.0.2.80:8000 --model deepseek-v4.1-flash \
         --out-json docs/build/d38-vllm-baseline-20261021.json \
-        --out-md   docs/build/d38-vllm-recapture-20261021.md
+        --out-md   docs/archive/build/d38-vllm-recapture-20261021.md
 
 Exit codes: 0 capture written (all samples ok), 1 capture written with failed samples, 2 bad
 input / missing fixture (no capture), 3 dry-run completed.
@@ -1161,7 +1161,7 @@ def write_markdown(document: dict, out_md: str) -> None:
     lines.append(
         "D52 is in force: this is a PERF row, not a gate row. No token-accuracy, tok/s, TTFT or "
         "gate-validity claim is made from it (docs/DECISIONS.md D52 item 3). The released-root "
-        "parity programme is documented in docs/build/ws-g-vllm-parity-plan-20261021.md and stays "
+        "parity programme is documented in docs/archive/build/ws-g-vllm-parity-plan-20261021.md and stays "
         "parked until the Lead authorises a GPU window; this capture is the deployment reference "
         "that work will replace, not a substitute for it."
     )

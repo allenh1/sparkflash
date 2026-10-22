@@ -1,4 +1,4 @@
-//! Four-rank device runner (option A of docs/investigations/four-rank-device-loop.md).
+//! Four-rank device runner (option A of docs/archive/investigations/four-rank-device-loop.md).
 //!
 //! This module is the skeleton of the arena-resident arm: weights come from each rank's plan/arena,
 //! a layer has two reduce seams (attention, MoE), and the host staging path is structurally absent -

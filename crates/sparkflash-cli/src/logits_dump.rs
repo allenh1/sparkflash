@@ -4,7 +4,7 @@
 //! object per compared position plus `FILE.bin`, consecutive little-endian f32 blocks holding the
 //! full vocabulary logits in the same position order. This module is the single implementation of
 //! that artefact: the device chain calls [write_logits_dump] from `hybrid_sequence`, the field set
-//! is documented in docs/build/logits-dump.md, and the frozen consumer is
+//! is documented in docs/archive/build/logits-dump.md, and the frozen consumer is
 //! `scripts/compare_native_vs_vllm.py` (its `read_dump` / `read_logits` functions).
 //!
 //! The dump changes no arithmetic and writes no stdout line: it reads only values the stage already

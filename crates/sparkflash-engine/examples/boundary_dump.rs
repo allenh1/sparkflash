@@ -1,6 +1,6 @@
 //! Phase 1 boundary dump: write one step in the version 1 manifest-plus-blob format.
 //!
-//! Spec: docs/build/phase1-boundary-table.md. The pair PREFIX.manifest and PREFIX.blob is what a
+//! Spec: docs/archive/build/phase1-boundary-table.md. The pair PREFIX.manifest and PREFIX.blob is what a
 //! device run emits too, so boundary_diff can compare the two without a translation layer.
 //!
 //! Usage:
@@ -10,7 +10,7 @@
 //!
 //! The last two flags write the head's own inputs and outputs as raw little-endian f32, which is
 //! what the device head harness will consume (no device head example is committed yet; see
-//! docs/build/roadmap-to-serving.md criterion 3): it runs `cert_lm_head_sm121` over the same
+//! docs/archive/build/roadmap-to-serving.md criterion 3): it runs `cert_lm_head_sm121` over the same
 //! `head_input` and compares its logits with the reference ones.
 use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::forward::{InferenceEngine, SequenceState};

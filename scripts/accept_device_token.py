@@ -14,7 +14,7 @@ Inputs (all explicit; nothing is auto-promoted):
       - a "tp4-host" evidence JSON (step_tokens/generated_tokens) - accepted as twin evidence, and
         as device evidence only when explicitly passed under --device and then labelled by schema.
   * --device-dump - the arm's own full-vocabulary dump (JSONL + sidecar, frozen
-    docs/build/logits-dump.md schema) when it writes one. **Explicit only**: a directory scan never
+    docs/archive/build/logits-dump.md schema) when it writes one. **Explicit only**: a directory scan never
     picks up a dump, so a world=1 hybrid-dump-logits.jsonl cannot be mistaken for the four-rank
     device dump. --dump-source records the provenance label.
   * --twin (repeatable) - host-twin evidence (same prompt and step count as the device run);
@@ -24,7 +24,7 @@ Inputs (all explicit; nothing is auto-promoted):
     UNMEASURED when the device evidence has no explicit positions).
   * --oracle-bars - a real "sparkflash-d41-bars/1" gate file; without it the oracle leg is
     **UNBARED** (measured metrics, no verdict). No bars file exists today (see
-    docs/build/d41-floor-verdict-20261020.md). --provisional-d40 prints the published D40
+    docs/archive/build/d41-floor-verdict-20261020.md). --provisional-d40 prints the published D40
     provisional values as D40-PROVISIONAL-NOT-A-GATE diagnostics only.
 
 Verdicts written to the JSON/MD (each independent):

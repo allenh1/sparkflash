@@ -22,7 +22,7 @@
 //!
 //! [InferenceEngine::prefill_observed] and [InferenceEngine::decode_observed] run this exact pass
 //! and also return the per-layer [boundary::BoundaryTable] Phase 1 diffs the device against
-//! (`docs/build/phase1-boundary-table.md`, `docs/build/roadmap-to-serving.md` section 4.5). The two
+//! (`docs/archive/build/phase1-boundary-table.md`, `docs/archive/build/roadmap-to-serving.md` section 4.5). The two
 //! entry points delegate to the same `run` with a table instead of `None`, so the default path is
 //! the same code and keeps its determinism; [boundary] documents what is recorded and in what order.
 
@@ -694,7 +694,7 @@ impl InferenceEngine {
     }
 
     /// [Self::prefill] with the per-layer boundary table recorded
-    /// (`docs/build/phase1-boundary-table.md`).
+    /// (`docs/archive/build/phase1-boundary-table.md`).
     ///
     /// The forward is the one [Self::prefill] runs and the returned [ObservedStep::output] is what
     /// [Self::prefill] would have returned; the capture only reads.
@@ -720,7 +720,7 @@ impl InferenceEngine {
     }
 
     /// [Self::decode] with the per-layer boundary table recorded, including the DSpark stages when
-    /// they run (`docs/build/phase1-boundary-table.md`).
+    /// they run (`docs/archive/build/phase1-boundary-table.md`).
     ///
     /// # Errors
     ///
@@ -1453,7 +1453,7 @@ impl InferenceEngine {
         }
 
         // The entry boundaries: the residual stream this block received and the input mix it will
-        // consume (docs/build/phase1-boundary-table.md section 2).
+        // consume (docs/archive/build/phase1-boundary-table.md section 2).
         if let Some(row) = boundary.as_deref_mut() {
             row.push_stream(config, boundary::RESIDUAL_IN, hidden.to_vec())?;
             row.push_mixes(config, boundary::HC_IN_PRE, pre_mix.to_vec())?;

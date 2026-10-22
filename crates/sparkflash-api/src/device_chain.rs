@@ -59,7 +59,7 @@ pub struct EnvelopeMetadata {
     ///
     /// Empty for the m1y7 records (the field did not exist yet). The serving consumer refuses to
     /// replay an envelope whose prompt cannot be matched, so the S8 probe needs this field: see
-    /// docs/build/serving-s7-s8-plan.md, wiring point W2.
+    /// docs/archive/build/serving-s7-s8-plan.md, wiring point W2.
     pub prompt_ids: Vec<u32>,
     /// Whether any rank's forward record asserts a claimed token.
     pub token_claimed: bool,

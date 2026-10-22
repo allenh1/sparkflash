@@ -814,7 +814,7 @@ struct StepCost {
 /// It is deliberately [PrefillMode::TokenLoop]. The batched/chunked host prefill policy is
 /// implemented and tested, but the batch-17 serve census measured the chunked endpoint *slower*
 /// than the pre-batch-17 token loop: 43.624741849 s TTFT against 39.134645546 s at 37 prompt tokens
-/// (docs/build/tp4-tokens-per-second.md). Promoting the host policy therefore requires a comparable
+/// (docs/archive/build/tp4-tokens-per-second.md). Promoting the host policy therefore requires a comparable
 /// endpoint measurement; the shipped default stays on the measured-better path.
 ///
 /// This constant selects only Tp4Rank's host hybrid execution. It does not affect tp4_forward's

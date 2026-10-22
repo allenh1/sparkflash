@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # RDMA bring-up runner for the four-node DGX Spark fabric (task-35).
 #
-# This is the executable form of docs/build/rdma-bringup.md. It does not invent a measurement:
+# This is the executable form of docs/archive/build/rdma-bringup.md. It does not invent a measurement:
 # every number a run records comes from the existing hardware gates (crates/sparkflash-comm/tests/
 # hardware_gates.rs) and from rocenante-probe (crates/sparkflash-comm/src/bin/rocenante-probe.rs).
 # The runner only stages, launches, collects, and stops those binaries.

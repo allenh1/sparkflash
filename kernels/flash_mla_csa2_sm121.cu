@@ -57,7 +57,7 @@
 // Format 2 WAS first executed on a device on 2026-10-18 in a Lead-sequenced window: the
 // m14_flash_mla harness ran this cubin on real checkpoint bytes and PASSed at 8 and 130 query
 // positions within the declared stage-2 tolerance class (not bit-identity; the m14 record in
-// docs/build/phase3-flash-mla.md holds the measured numbers). That execution does not turn the
+// docs/archive/build/phase3-flash-mla.md holds the measured numbers). That execution does not turn the
 // class into a bit-identity claim, and the released kernel was not compared.
 
 #include "m4_common_sm121.cuh"

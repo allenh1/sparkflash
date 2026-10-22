@@ -50,7 +50,7 @@
 //!               [--evidence out.json] [--dump routed_delta.bf16] [--repeat 0]
 //! ~~~
 //!
-//! --input is the twin-expanded bundle (see docs/build/moe-stage-contract.md): pre_ffn_hidden.f32
+//! --input is the twin-expanded bundle (see docs/archive/build/moe-stage-contract.md): pre_ffn_hidden.f32
 //! (tokens*5120 f32 LE) and, optionally, act_fp8.bin / act_scales.bin for the H4 operand. Without
 //! --input the released embed.weight rows 0..tokens are the declared pre-FFN stand-in.
 //! --twin-only runs the CPU twin and prints/records the EXPECTED evidence record; the device run
@@ -1109,7 +1109,7 @@ fn run_device(args: &Args) -> Result<StageOutcome, String> {
     }
 
     // ---------------------------------------------------------------------------------------
-    // Evidence record: the measured side of docs/build/moe-stage-contract.md section 4.
+    // Evidence record: the measured side of docs/archive/build/moe-stage-contract.md section 4.
     // ---------------------------------------------------------------------------------------
     let cubin_pins = json!([
         {"name": "moe_router_sm121", "cubin_bytes": rabi::CUBIN_BYTES, "cubin_sha256": rabi::CUBIN_SHA256},

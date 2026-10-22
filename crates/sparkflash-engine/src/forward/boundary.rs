@@ -1,7 +1,7 @@
 //! Per-layer boundary capture: the Phase 1 boundary table the device path is diffed against.
 //!
-//! Spec: `docs/build/phase1-boundary-table.md` (the format, the tensor order, the byte order and the
-//! comparison classes) and `docs/build/roadmap-to-serving.md` section 4.5 criteria 1 and 2 (the
+//! Spec: `docs/archive/build/phase1-boundary-table.md` (the format, the tensor order, the byte order and the
+//! comparison classes) and `docs/archive/build/roadmap-to-serving.md` section 4.5 criteria 1 and 2 (the
 //! per-layer table is the Phase 1 deliverable and the perturbation test is what makes it a test).
 //! The points captured are the ones `docs/engine/01-forward-order.md` section 3.2 defines - the
 //! block order of `Block.forward` (model.py:968-994) - read between the operations rather than
@@ -366,7 +366,7 @@ impl LayerBoundary {
 
     /// Appends one comb coefficient set: always `[positions, hc_mult, hc_mult]`, even when
     /// `hc_mult == 1`, because the released comb is a matrix per token
-    /// (`docs/build/phase1-boundary-table.md` section 3).
+    /// (`docs/archive/build/phase1-boundary-table.md` section 3).
     pub fn push_comb(
         &mut self,
         config: &ModelConfig,
@@ -859,7 +859,7 @@ impl BoundaryTensorDiff {
 }
 /// The v1 format token and element width of one boundary tensor.
 ///
-/// The name decides the format (section 2 and section 4 of docs/build/phase1-boundary-table.md): the
+/// The name decides the format (section 2 and section 4 of docs/archive/build/phase1-boundary-table.md): the
 /// two quantised block inputs are E4M3 code bytes, their companions are E8M0 scale bytes, and every
 /// other tensor is f32. A name outside TENSOR_ORDER has no token.
 fn v1_format(name: &str) -> Option<(&'static str, usize)> {
@@ -900,7 +900,7 @@ fn v1_number<T: std::str::FromStr>(token: Option<&str>, field: &str) -> Result<T
 
 impl BoundaryTable {
     /// Writes this step in the version 1 manifest-plus-blob format of
-    /// docs/build/phase1-boundary-table.md section 4.
+    /// docs/archive/build/phase1-boundary-table.md section 4.
     ///
     /// The manifest is text: one header line per field (the version, the step, the prefix, the MTP
     /// anchor and the backbone layer count), one row line per row and one tensor line per tensor in

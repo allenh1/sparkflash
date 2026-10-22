@@ -698,7 +698,7 @@ fn device_chat_eligibility(
 ///
 /// The fallback reason is deliberately not logged or surfaced here: the scaffold's contract is that
 /// the host path is the answer, and the reason already lives in the typed refusal record that a
-/// future live source will log. docs/build/serving-s7-s8-plan.md records that wiring point.
+/// future live source will log. docs/archive/build/serving-s7-s8-plan.md records that wiring point.
 fn claim_device_token(state: &AppState, request: DeviceTokenRequest) -> Option<DeviceTokenStream> {
     let source = state.device_token_source()?;
     match source.claim(&request) {

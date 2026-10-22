@@ -479,7 +479,7 @@ mod tests {
 //
 // Everything below is policy and arithmetic. It plans the draft forward and measures a verify
 // step; it never executes one on a device, and it says so in every report it produces. The WS-E
-// plan is docs/build/ws-e-mtp-device-20261021.md; this is the testable half of it.
+// plan is docs/archive/build/ws-e-mtp-device-20261021.md; this is the testable half of it.
 
 /// Drafts the MTP block proposes per verify step: the specification's block size, five.
 pub const MTP_DRAFT_K: usize = DSPARK_BLOCK_SIZE;
@@ -498,7 +498,7 @@ pub const TARGET_TOKENS_PER_SECOND: f64 = 90.0;
 /// Measured CPU host-twin accepted draft tokens (out of MEASURED_HOST_TWIN_VERIFY_STEPS).
 ///
 /// Evidence: /home/user/dspark-accept-evidence/ (24 accepted in 42 verify steps, CI
-/// 1.333..1.810 accepted tokens per verify step), described in docs/build/tp4-host-twin.md. This
+/// 1.333..1.810 accepted tokens per verify step), described in docs/archive/build/tp4-host-twin.md. This
 /// is a measured *host-twin* number: it is not a device measurement and the WS-E plan must not
 /// present it as one.
 pub const MEASURED_HOST_TWIN_ACCEPTED: u64 = 24;

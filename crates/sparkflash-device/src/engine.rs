@@ -1,6 +1,6 @@
 //! M2: `DeviceEngine`, the serving engine in front of a device session.
 //!
-//! This is design `docs/build/device-forward-chain.md` 1.3, 7 M1 and 7 M2:
+//! This is design `docs/archive/build/device-forward-chain.md` 1.3, 7 M1 and 7 M2:
 //!
 //! - **Seam only.** It implements [`sparkflash_api::engine::InferenceEngine`] over a
 //!   [`DeviceSession`] and delegates `generate` to a reference `Arc<dyn InferenceEngine>`.

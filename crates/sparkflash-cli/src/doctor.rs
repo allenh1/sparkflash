@@ -921,7 +921,7 @@ fn parse_max_clock_from_query(raw: &str) -> Option<u64> {
 /// Reads an SM clock range from the query forms `nvidia-smi` exposes, in order.
 ///
 /// The two-field query is the direct form, but it is not portable: on GB10 it exits 2 with empty
-/// stderr (the window recorded in `docs/build/aarch64-pipeline.md` appendix C), and the old
+/// stderr (the window recorded in `docs/archive/build/aarch64-pipeline.md` appendix C), and the old
 /// single-form probe turned that into a failed check for a clock window it had never read. The cap
 /// alone and then the full `-q -d CLOCK` table are the fallbacks; when every form fails the gate
 /// reports "not applicable", because a cap that was never read is not a cap that was exceeded.
@@ -3247,7 +3247,7 @@ mod tests {
 
     #[test]
     fn the_clock_probe_falls_back_to_the_cap_alone_when_the_pair_query_is_refused() {
-        // GB10 evidence (docs/build/aarch64-pipeline.md appendix C): the two-field query exits 2
+        // GB10 evidence (docs/archive/build/aarch64-pipeline.md appendix C): the two-field query exits 2
         // with empty stderr, so the single-form probe failed a node whose clocks it never read.
         let range = clock_range_from(
             Err(ProbeError::Unavailable(

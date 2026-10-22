@@ -20,7 +20,7 @@
 //! a token mask also needs the engine's token-to-bytes table. `crates/sparkflash-api` can only
 //! refuse the request with a typed error today (see `refuse_unenforceable_response_format`), which
 //! is what the router keeps doing. The exact seam is written down in
-//! `docs/build/ws-f-api-20261021.md`: an `EngineRequest` field carrying a token mask callback plus a
+//! `docs/archive/build/ws-f-api-20261021.md`: an `EngineRequest` field carrying a token mask callback plus a
 //! token-bytes table on the engine seam. This module is the part that seam would consume, and it is
 //! fully unit-tested here so the hook can be wired without re-deriving JSON grammar rules.
 //!

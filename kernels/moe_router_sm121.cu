@@ -54,7 +54,7 @@
 // mismatch into a silent no-op.
 //
 // Verification status: compiled by nvcc 13.0.3 for sm_121a (the committed baseline records the
-// cubin length, sha256 and PTX membar count; docs/build/phase3-router.md records the window recipe
+// cubin length, sha256 and PTX membar count; docs/archive/build/phase3-router.md records the window recipe
 // and the Lead's measured runs, and states that the pre-softplus GEMM is not separately asserted),
 // parsed by the clang frontend through the stub headers on this host, and its ABI and constants are
 // pinned by src/router_abi.rs. The measured comparison class is device-versus-twin, with the host

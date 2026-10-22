@@ -18,7 +18,7 @@ script is the reproducible half of that rule. It refuses to invent numbers:
   * top-k set overlap is k = 20 / 100 / 1000. The old top-5 bar is dropped
     because the measured floor is below it (k >= 20 only).
 
-Input is the offline capture schema of docs/build/d41-floor-schema.md
+Input is the offline capture schema of docs/archive/build/d41-floor-schema.md
 ("sparkflash-d41-capture/1"), produced by scripts/d41_recapture.py. Output is
 one JSON document ("sparkflash-d41-floors/1"), one markdown table, and
 optionally a D41 bar file ("sparkflash-d41-bars/1") that

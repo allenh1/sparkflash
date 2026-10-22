@@ -5,7 +5,7 @@
 //! activations for the bf16 q_norm latent (act_quant: one absolute maximum per 32-value block, the
 //! 1e-4 amax floor, a ue8m0 round-up-to-power-of-two scale) and the checkpoint's own fp8 wq_b codes
 //! plus its 32x32 ue8m0 grid, and gets bf16 rows back; rope, the fp4 q round trip, the scores and
-//! the top-k stay host and are already native (docs/build/indexer-native-dtype.md).
+//! the top-k stay host and are already native (docs/archive/build/indexer-native-dtype.md).
 //!
 //! The Lead's decision (2026-10-19) is that the already-pinned, already-measured
 //! b12x_mxfp8_dense_sm121 IS that arithmetic, so this milestone adds no kernel, no KernelId, no

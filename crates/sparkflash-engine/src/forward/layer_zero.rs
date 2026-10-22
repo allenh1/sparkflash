@@ -564,14 +564,14 @@ pub const fn default_limit() -> usize {
 
 /// The measured m11 b7 bar on the 24 mixed mHC coefficients (max absolute delta).
 ///
-/// docs/build/phase3-mhc-entry.md records `hc_coeffs B/A/C` within the declared `1e-4` bar at
+/// docs/archive/build/phase3-mhc-entry.md records `hc_coeffs B/A/C` within the declared `1e-4` bar at
 /// b7; the kernel's fixed-order tile reduction and the CPU twin's accumulation order are the
 /// reason this is a bar rather than bit identity.
 pub const M11_HC_COEFF_BAR: f32 = 1e-4;
 
 /// The measured m11 b7 bar on `1/rms(X_hat)` (max absolute delta).
 ///
-/// docs/build/phase3-mhc-entry.md records a maximum of `2.746582e-4` at b7 against the
+/// docs/archive/build/phase3-mhc-entry.md records a maximum of `2.746582e-4` at b7 against the
 /// declared `3e-4` bar. The host RMSNorm accumulates the row's sum in a different order from the
 /// kernel's tile reduction, so the scalar carries this bar; the `xhat_normed` capture is exact
 /// when built with the device's own scalar, as m11 measured.

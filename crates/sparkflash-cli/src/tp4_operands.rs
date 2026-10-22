@@ -55,7 +55,7 @@ pub const USAGE: &str = "sparkflash device-chain --run-stage attn-operands (--te
 
 /// The checkpoint's native dense projection kernel family (wq_a, wkv, wq_b, wo_b): E4M3
 /// activation codes with ue8m0 block-32 scales against B12x E4M3 weights, f32 accumulate, bf16
-/// output (D39 rule 1; docs/build/native-kernel-arithmetic-audit.md section 2.1).
+/// output (D39 rule 1; docs/archive/build/native-kernel-arithmetic-audit.md section 2.1).
 pub const KERNEL_DENSE: &str = "b12x_mxfp8_dense_sm121";
 /// The BF16-activation grouped wo_a kernel: the released rule's native projection for wo_a only
 /// (D39 task-29 note).

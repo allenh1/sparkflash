@@ -448,7 +448,7 @@ pub struct FfnSeamsParams {
     /// [dim / 32] u8 out: its ue8m0 block scales.
     pub act_scales: Deviceptr,
     /// [dim] bf16 out, or 0: the FFN block's RMS-normed input narrowed to BF16 with RNE, which is
-    /// the router's input (docs/build/moe-stage-contract.md H3b). It is the norm's *output*, not the
+    /// the router's input (docs/archive/build/moe-stage-contract.md H3b). It is the norm's *output*, not the
     /// pre-norm hc_pre collapse; the kernel writes it in the norm loop beside seam_row. It writes
     /// nothing for a null pointer, so a launcher passes 0 until the layer's buffers carve the span.
     /// The host arm's `pre_ffn_hidden` is this f32 row and the router narrows it at the launch.

@@ -12,7 +12,7 @@
 //! window_bytes, absolute_bytes and indexer_pool_bytes helpers here, so the byte formulas are
 //! exercised by host tests even though the uploads themselves need a device.
 //!
-//! See docs/build/device-chain-timing.md for what is measured versus inferred.
+//! See docs/archive/build/device-chain-timing.md for what is measured versus inferred.
 
 use std::cell::RefCell;
 use std::io;

@@ -20,8 +20,8 @@
 //! [\`ResidentPlan::read_all\`] is the in-place read and is what a node runs; it delegates to
 //! \`ShardPlan\`, so the range arithmetic has one implementation.
 //!
-//! The design's per-rank budget (docs/build/tp4-design.md section 6.3) is 72.31 GiB. This plan
-//! computes the same categories from the released headers; docs/build/tp4-design.md records the
+//! The design's per-rank budget (docs/archive/build/tp4-design.md section 6.3) is 72.31 GiB. This plan
+//! computes the same categories from the released headers; docs/archive/build/tp4-design.md records the
 //! comparison instead of implying the estimate was re-measured here.
 
 use std::collections::BTreeMap;

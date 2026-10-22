@@ -301,7 +301,7 @@ fn the_probe_table_parser_handles_wrapping_one_liners_and_count_drift() {
 /// The manifest keys the fused Mega-MHC kernel by its source-file stem, \`mega_mhc_sm121\`, while
 /// the harness and the device open the cubin by its symbol, \`mega_mhc_fused_bf16_sm121\`. Run D
 /// failed on 2026-10-18 because the pinned artifact had been copied under the manifest's name and
-/// the harness opened the symbol's name (docs/build/phase3-indexer.md sections 2 and 3). A cubin's
+/// the harness opened the symbol's name (docs/archive/build/phase3-indexer.md sections 2 and 3). A cubin's
 /// file name is not part of its ABI, so both names resolve to the same kernel; this test fails if
 /// either the manifest key or the alias list drifts away from the other.
 #[test]

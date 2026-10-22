@@ -828,7 +828,7 @@ mod tests {
         // The kernel's out word is `__float2bfloat16_rn(value)` in the norm loop, where `value` is
         // the row's RMS-normed f32 (already bf16-representable under native_bf16). That is the host
         // arm's `pre_ffn_hidden` - the norm's OUTPUT, which is what the router routes on
-        // (docs/build/moe-stage-contract.md H3b) - not the pre-norm hc_pre collapse. This twin
+        // (docs/archive/build/moe-stage-contract.md H3b) - not the pre-norm hc_pre collapse. This twin
         // states both arms so the out word cannot drift back to the collapse without a red test.
         let (hc, dim) = (4, 256);
         let pre = stream(hc, 91, 0.5);

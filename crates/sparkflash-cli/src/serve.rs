@@ -11,7 +11,7 @@
 //! same reference engine. Without a cubin it is the M1 fake session (no driver, no launch,
 //! `vision: false`). With `--device-cubin PATH` and a binary built with the `cuda` feature it
 //! is the M2 real session: one pinned `moe_router_sm121` launch, evidence only, no chain and no
-//! token claim (design `docs/build/device-forward-chain.md` 1.3, 7 M1, 7 M2). It is not the
+//! token claim (design `docs/archive/build/device-forward-chain.md` 1.3, 7 M1, 7 M2). It is not the
 //! default: `--engine reference` is, and that path is unchanged. The first real chain is M3.
 //!
 //! # What it does not claim
@@ -43,7 +43,7 @@
 //! ranks must see the same token sequence, so batching a different request into this group would
 //! desync them; that is a stated limitation, not an implicit queue policy. Prompt logprobs are
 //! served through the task-18 all-position rank contract
-//! ([tp4-prompt-logprobs-rank-contract.md](../../../docs/build/tp4-prompt-logprobs-rank-contract.md)):
+//! ([tp4-prompt-logprobs-rank-contract.md](../../../docs/archive/build/tp4-prompt-logprobs-rank-contract.md)):
 //! every rank screens its local LM-head shard and exchanges bounded candidate blocks over the
 //! forward's collectives, and the deterministic host merge reports a position only when its f32
 //! boundary proves the requested order. A top-k request is bounded (the HTTP cap is 20, the
@@ -216,7 +216,7 @@ const _: () = {
 /// missing-capability path, refuses non-greedy sampling, claims no device execution); with
 /// `--device-cubin` and a binary built with the `cuda` feature it is the M2 real session (one
 /// pinned `moe_router_sm121` launch as an execution proof, evidence only, still no chain and no
-/// token claim). Design `docs/build/device-forward-chain.md` 1.3, 7 M1, 7 M2.
+/// token claim). Design `docs/archive/build/device-forward-chain.md` 1.3, 7 M1, 7 M2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum EngineChoice {
     /// The existing CPU reference engine: unchanged serving behaviour.
@@ -4470,7 +4470,7 @@ fn run_tp4_request(
     let prefill_elapsed = request_started.elapsed();
     // One line per request so a log reader can check the TTFT identity directly: the host
     // prefill loop runs one decode-shaped forward per prompt token, so TTFT is linear in the
-    // prompt length at the step cost. See docs/build/tp4-host-twin.md "TTFT and readiness".
+    // prompt length at the step cost. See docs/archive/build/tp4-host-twin.md "TTFT and readiness".
     println!(
         "sparkflash serve: tp4_prefill rank=0 epoch_ms={} prompt_tokens={} prefill_steps={} prefill_ms={}",
         epoch_millis(),

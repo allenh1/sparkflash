@@ -163,7 +163,7 @@ For production use, we additionally release [deepseek-recipe](https://github.com
 
 ## Minimal Inference
 
-Please refer to the [`inference`](inference/README.md) folder for instructions on weight conversion and running inference locally.
+Please refer to the `inference` folder (upstream) for instructions on weight conversion and running inference locally.
 
 **Recommended sampling parameters:**
 
@@ -176,7 +176,7 @@ Please refer to the [`inference`](inference/README.md) folder for instructions o
 
 ## Reproducing DeepSWE Benchmark Results
 
-The [`evaluation`](evaluation/README.md) folder contains step-by-step instructions for reproducing the DeepSWE v1.1 benchmark results, covering both the `dsh-minimal` agent and the official `mini-swe-agent`. The patch required to integrate `dsh-minimal` with [Pier](https://github.com/datacurve-ai/pier) is also included there.
+The `evaluation` folder (upstream) contains step-by-step instructions for reproducing the DeepSWE v1.1 benchmark results, covering both the `dsh-minimal` agent and the official `mini-swe-agent`. The patch required to integrate `dsh-minimal` with [Pier](https://github.com/datacurve-ai/pier) is also included there.
 
 ## License
 

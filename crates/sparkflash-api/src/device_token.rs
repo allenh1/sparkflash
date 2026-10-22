@@ -10,7 +10,7 @@
 //! The source reads a static claimed envelope directory. That is the S8 probe shape: replay one
 //! recorded token window against the request that produced it. A live device source will replace
 //! the reader with a tail over the window directory and a prompt-match check once a token claims;
-//! docs/build/serving-s7-s8-plan.md records exactly what changes. Nothing here measures tokens
+//! docs/archive/build/serving-s7-s8-plan.md records exactly what changes. Nothing here measures tokens
 //! per second or time to first token, and every test is synthetic and labelled UNMEASURED.
 
 use std::path::{Path, PathBuf};
@@ -186,7 +186,7 @@ impl DeviceChainTokenSource {
     /// wrong question with real-looking device tokens. The scaffold therefore requires both the
     /// request's token prompt and the envelope's recorded prompt ids, and matches them exactly. The
     /// m1y7 records do not carry prompt ids yet, so until the device side writes them (wiring point
-    /// W2 in docs/build/serving-s7-s8-plan.md) every request falls back to the host twin, including
+    /// W2 in docs/archive/build/serving-s7-s8-plan.md) every request falls back to the host twin, including
     /// every chat request: a chat text prompt has no token ids to compare.
     fn verify_prompt(
         &self,
@@ -262,7 +262,7 @@ impl DeviceTokenSource for DeviceChainTokenSource {
         };
         // The scaffold serves a fixed window: a max_tokens smaller than the claimed batch truncates
         // it, and the finish reason is length in both cases because a device window has no EOS
-        // marker yet. docs/build/serving-s7-s8-plan.md records that rule as a wiring point.
+        // marker yet. docs/archive/build/serving-s7-s8-plan.md records that rule as a wiring point.
         if let Some(limit) = request.max_tokens {
             tokens.truncate(limit);
         }
@@ -300,7 +300,7 @@ struct CachedWindowClaim {
 
 /// A live window follower token source for serving device tokens as windows complete.
 ///
-/// Implements W5 from `docs/build/serving-s7-s8-plan.md`: instead of requiring a fixed static
+/// Implements W5 from `docs/archive/build/serving-s7-s8-plan.md`: instead of requiring a fixed static
 /// directory, this source monitors an active window directory or parent directory, invalidates
 /// cache when the run ID or modification timestamp transitions, ensures all rank pairs are
 /// present, verifies the prompt, and serves claimed tokens.

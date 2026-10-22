@@ -1,6 +1,6 @@
 //! The loopback host twin of the device-buffer one-shot path.
 //!
-//! docs/build/rdma-backend.md section 15 leaves the device path unimplemented because every piece
+//! docs/archive/build/rdma-backend.md section 15 leaves the device path unimplemented because every piece
 //! of it needs a device: a pinned-host allocation with a device alias, an ibverbs memory region,
 //! the proxy thread that posts work requests, and the CUDA kernel that reduces the slot rows.
 //! This module implements the same protocol in process memory, behind the existing loopback
@@ -25,7 +25,7 @@
 //!   dispatch records, so the shape is a value a test can assert rather than a comment.
 //!
 //! What this does not do, and what no host run may claim: allocate device memory, register an MR,
-//! post a work request or launch the kernel (docs/build/rdma-backend.md section 15.3 items 1, 3,
+//! post a work request or launch the kernel (docs/archive/build/rdma-backend.md section 15.3 items 1, 3,
 //! 4 and 5). It also produces no node number. [HostTwinReport] names latency, bandwidth and
 //! four-node mesh correctness as unclaimed; the window is the only place they can be measured.
 //!

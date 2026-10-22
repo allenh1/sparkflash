@@ -1,4 +1,4 @@
-//! Measurement harness for `docs/build/reference-parallelism.md`.
+//! Measurement harness for `docs/archive/build/reference-parallelism.md`.
 //!
 //! Builds the released configuration with only the first `layers` backbone layers (no MTP stages, no
 //! Engram tables, no KV-source layers), then times a 130-token prefill and `decode_steps` decode
@@ -11,7 +11,7 @@
 //!   cargo run --release -p sparkflash-engine --example reference_parallel_bench -- [layers] [decode_steps]
 //!
 //! This is a measurement tool for the parallel-reference change under
-//! `docs/build/reference-parallelism.md`. It is not a reference run and never generates a fixture.
+//! `docs/archive/build/reference-parallelism.md`. It is not a reference run and never generates a fixture.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
