@@ -146,20 +146,37 @@ class FrontierTest(unittest.TestCase):
         self.assertIn("no D54 arm", text)
 
     def test_an_18_stage_chain_stopping_at_reference_seam_is_a_finding(self):
-        # reference_seam is stage index 6; an 18-stage chain would have to stop at ffn_epilogue.
+        # reference_seam is stage index 6; an 18-stage chain would have to stop at moe_shared.
         # This is the literal-reading counterexample, kept so the tool answers it with exit 1.
         docs = {rank: rank_document(rank, chain=list(frontier.STAGE_ORDER[:18]), stopped="reference_seam") for rank in (0, 1, 2, 3)}
         result = self.evaluate(self.write_row(docs))
         self.assertEqual(result["exit_code"], 1)
         self.assertIn("frontier-stopped", self.finding_ids(result))
 
-    def test_refusal_at_reference_seam_is_the_next_expected_frontier(self):
-        # Once the merge settles: engram_write is a no-op on layer 0, the stages through kv_path
-        # have bodies, reference_seam still refuses. Six stages ran, so it stops at index 6.
+    def test_refusal_at_reference_seam_is_coherent_at_index_6(self):
+        # reference_seam is the compressor/indexer/compressed-cache write stage; six stages ran, so
+        # it stops at index 6. ref_select (index 7) is the next boundary after it.
         docs = {rank: rank_document(rank, chain=list(frontier.STAGE_ORDER[:6]), stopped="reference_seam") for rank in (0, 1, 2, 3)}
         result = self.evaluate(self.write_row(docs))
         self.assertEqual(result["exit_code"], 0, result["findings"])
         self.assertEqual(frontier.STAGE_ORDER[6], "reference_seam")
+
+    def test_refusal_at_ref_select_is_coherent_with_a_7_stage_chain(self):
+        # The ref_select split: the stages through reference_seam ran, ref_select refuses. Seven
+        # stages ran, so it stops at index 7. This is the boundary whose failure is not a rounding:
+        # a different top-k SET changes the attended context.
+        docs = {rank: rank_document(rank, chain=list(frontier.STAGE_ORDER[:7]), stopped="ref_select") for rank in (0, 1, 2, 3)}
+        result = self.evaluate(self.write_row(docs))
+        self.assertEqual(result["exit_code"], 0, result["findings"])
+        self.assertEqual(frontier.STAGE_ORDER[7], "ref_select")
+        self.assertEqual(len(frontier.STAGE_ORDER), 20)
+
+    def test_an_8_stage_chain_stopping_at_ref_select_is_a_finding(self):
+        # Chain length 8 would put the next stage at stage_attention, not ref_select.
+        docs = {rank: rank_document(rank, chain=list(frontier.STAGE_ORDER[:8]), stopped="ref_select") for rank in (0, 1, 2, 3)}
+        result = self.evaluate(self.write_row(docs))
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("frontier-stopped", self.finding_ids(result))
 
     # ---- the known defect is a finding, not a tolerated shape ------------
 
@@ -221,25 +238,24 @@ class FrontierTest(unittest.TestCase):
         self.assertEqual(result["exit_code"], 1)
         self.assertIn("frontier-prefix", self.finding_ids(result))
 
-    def test_refusal_at_moe_shared_is_coherent_with_a_17_stage_chain(self):
-        # The tree state immediately after the moe_shared amendment: the 17 stages before it ran
-        # (through all_reduce_rdma_arm), the arm refused at moe_shared, which is the 18th stage.
-        # The chain length must equal the index of the stopped stage, so 17 is coherent.
-        docs = {rank: rank_document(rank, chain=list(frontier.STAGE_ORDER[:17]), stopped="moe_shared") for rank in (0, 1, 2, 3)}
+    def test_refusal_at_moe_shared_is_coherent_with_an_18_stage_chain(self):
+        # moe_shared is the shared-expert stage at index 18: the 18 stages before it ran (through
+        # all_reduce_rdma_arm), the arm refused there. Chain length must equal the index, so 18.
+        docs = {rank: rank_document(rank, chain=list(frontier.STAGE_ORDER[:18]), stopped="moe_shared") for rank in (0, 1, 2, 3)}
         result = self.evaluate(self.write_row(docs))
         self.assertEqual(result["exit_code"], 0, result["findings"])
-        self.assertEqual(frontier.STAGE_ORDER.index("moe_shared"), 17)
-        self.assertEqual(len(frontier.STAGE_ORDER), 19)
+        self.assertEqual(frontier.STAGE_ORDER.index("moe_shared"), 18)
+        self.assertEqual(len(frontier.STAGE_ORDER), 20)
 
-    def test_refusal_at_moe_shared_with_an_18_stage_chain_is_a_finding(self):
-        # The boundary off-by-one: 18 stages "ran" and the arm still stopped at moe_shared. Under
-        # the unchanged index rule the next stage after 18 is ffn_epilogue, so this is incoherent.
-        docs = {rank: rank_document(rank, chain=list(frontier.STAGE_ORDER[:18]), stopped="moe_shared") for rank in (0, 1, 2, 3)}
+    def test_refusal_at_moe_shared_with_a_19_stage_chain_is_a_finding(self):
+        # The boundary off-by-one: 19 stages "ran" and the arm still stopped at moe_shared. Under
+        # the unchanged index rule the next stage after 19 is ffn_epilogue, so this is incoherent.
+        docs = {rank: rank_document(rank, chain=list(frontier.STAGE_ORDER[:19]), stopped="moe_shared") for rank in (0, 1, 2, 3)}
         result = self.evaluate(self.write_row(docs))
         self.assertEqual(result["exit_code"], 1)
         self.assertIn("frontier-stopped", self.finding_ids(result))
 
-    def test_probe_row_with_all_19_stages_and_no_stop_is_a_finding(self):
+    def test_probe_row_with_all_20_stages_and_no_stop_is_a_finding(self):
         docs = {rank: rank_document(rank, chain=list(frontier.STAGE_ORDER), stopped=None) for rank in (0, 1, 2, 3)}
         result = self.evaluate(self.write_row(docs))
         self.assertEqual(result["exit_code"], 1)
@@ -406,9 +422,9 @@ class FrontierTest(unittest.TestCase):
         self.assertEqual(result["exit_code"], 1)
         self.assertIn("status", self.finding_ids(result))
 
-    def test_require_complete_needs_the_full_19_stage_chain(self):
+    def test_require_complete_needs_the_full_20_stage_chain(self):
         docs = {
-            rank: rank_document(rank, status=frontier.STATUS_COMPLETED, chain=list(frontier.STAGE_ORDER[:18]), stopped=None)
+            rank: rank_document(rank, status=frontier.STATUS_COMPLETED, chain=list(frontier.STAGE_ORDER[:19]), stopped=None)
             for rank in (0, 1, 2, 3)
         }
         root = self.write_row(docs, self.complete_token_bodies())
@@ -519,7 +535,7 @@ class FrontierTest(unittest.TestCase):
     def test_built_in_selftest_covers_both_directions(self):
         code, out, _err = self.run_cli(["--selftest"])
         self.assertEqual(code, 0, out)
-        self.assertIn("16 of 16 case(s)", out)
+        self.assertIn("18 of 18 case(s)", out)
         self.assertIn("expected=0 got=0", out)
         self.assertIn("expected=1 got=1", out)
         self.assertIn("expected=2 got=2", out)
@@ -531,7 +547,7 @@ class FrontierTest(unittest.TestCase):
         with open(os.path.join(target, "manifest.json"), "r", encoding="utf-8") as handle:
             manifest = json.load(handle)
         self.assertTrue(manifest["synthetic"])
-        self.assertEqual(len(manifest["cases"]), 16)
+        self.assertEqual(len(manifest["cases"]), 18)
 
     # ---- the committed fixtures are the CI proof of the exit codes ------
 
@@ -546,7 +562,10 @@ class FrontierTest(unittest.TestCase):
         # The four directions the probe verdict depends on, named so a regression is obvious.
         self.assertEqual(expected["coherent-6-stage-kv_path"], 0)
         self.assertEqual(expected["coherent-refusal-at-reference_seam"], 0)
+        self.assertEqual(expected["coherent-refusal-at-ref_select"], 0)
+        self.assertEqual(expected["off-by-one-8-stage-chain-at-ref_select"], 1)
         self.assertEqual(expected["incoherent-18-stage-chain-at-reference_seam"], 1)
+        self.assertEqual(expected["off-by-one-19-stage-chain-at-moe_shared"], 1)
         self.assertEqual(expected["coherent-refusal-at-moe_shared"], 0)
         self.assertEqual(expected["degenerate-no-stage-ran-kv_path"], 1)
         self.assertEqual(expected["rank-different-chain"], 1)

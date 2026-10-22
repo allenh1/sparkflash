@@ -13,17 +13,23 @@ THE FRONTIER, AND WHY PARSING IT IS THE POINT
     StageRuns::summary() in crates/sparkflash-cli/src/layer_device.rs is free text:
       "device-only through A -> B -> C (3 stage(s)); stopped at <stage>: <message>"
       "no stage ran; stopped at <stage>: <message>"                      (degenerate)
-      "device-only through A -> ... -> ffn_epilogue (19 stage(s))"       (completed)
-    The stage order is STAGE_CONTRACTS (layer_device.rs), listed once in STAGE_ORDER below: 19
-    stages, with moe_shared between all_reduce_rdma_arm and ffn_epilogue (the shared expert had no
-    stage of its own in the first 18-stage contract). Adding a stage is a one-line change to
-    STAGE_ORDER; every prefix and length check in this tool reads that constant.
+      "device-only through A -> ... -> ffn_epilogue (20 stage(s))"       (completed)
+    The stage order is STAGE_CONTRACTS (layer_device.rs), listed once in STAGE_ORDER below: 20
+    stages. Two boundaries deserve their reason here, because they are the ones a frontier is read
+    at. moe_shared sits between all_reduce_rdma_arm and ffn_epilogue: the shared expert had no stage
+    of its own in the first 18-stage contract. ref_select sits between reference_seam and
+    stage_attention, because the seam is NOT one boundary tensor: reference_seam is the
+    compressor/indexer/compressed-cache write (reusable GEMV + rmsnorm, no new symbol), while
+    ref_select is the candidate score + top-k with the ascending-id tie-break. The latter is new
+    kernel work and the one place where a wrong result is not a rounding difference - a different
+    top-k SET changes the attended context. Adding a stage is a one-line change to STAGE_ORDER;
+    every prefix and length check in this tool reads that constant.
     kv_path stays ONE stage, and the reason is checkable from the read it performs: the window slice
     is [position - window_width ..= position - 1], so the row appended at position is outside every
     read the current step performs. For decode, append-before-read and append-after-read produce the
     same number, so splitting rotate/quant from append would add a stage without changing a value.
-    Multi-position/prefill is the condition that will force that split (and a 20th stage); until it
-    lands, the contract is 19.
+    Multi-position/prefill is the condition that will force that split (and a 21st stage); until it
+    lands, the contract is 20.
     The check that makes this tool worth running: the chain must be an exact PREFIX of that
     order, and the stopped stage must be the NEXT stage after the chain (the chain length is its
     index). A refusal whose chain is "no stage ran" while it stopped at kv_path is a contradiction.
@@ -56,7 +62,7 @@ PROBE MODE (default) - a refused row's four documents
     verdict line says so.
 
 COMPLETE MODE (--require-complete) - a later stage's completed layer
-    status == "completed" on all four, no "message" key, and a complete frontier: all 19 stages
+    status == "completed" on all four, no "message" key, and a complete frontier: all 20 stages
     exactly in STAGE_ORDER order and no "; stopped at". Geometry as above. THEN, and only then, the
     row is ELIGIBLE for the D54 numerical gate, so the tool verifies the gate's inputs actually
     exist: per rank a tp4-token-r{rank}.json (tokens.positions/tokens.prompt_len/tokens.ids,
@@ -122,7 +128,7 @@ STATUS_COMPLETED = "completed"
 #: arm evidence in the document: SPARKFLASH_LAYER_DEVICE is not recorded there.
 DEVICE_ARM = "device layer (opt-in): no per-layer PCIe copy, no per-stage observation read"
 
-#: STAGE_CONTRACTS order from layer_device.rs (19 stages). The chain must be a prefix of this, and
+#: STAGE_CONTRACTS order from layer_device.rs (20 stages). The chain must be a prefix of this, and
 #: a refused chain must stop at the next stage; every length check below derives from len(STAGE_ORDER),
 #: so the next amendment is one line here.
 STAGE_ORDER = (
@@ -133,6 +139,7 @@ STAGE_ORDER = (
     "query_path",
     "kv_path",
     "reference_seam",
+    "ref_select",
     "stage_attention",
     "attention_body",
     "attention_output",
@@ -380,10 +387,10 @@ def synthetic_cases() -> list:
             "documents": docs_for(chain=list(STAGE_ORDER[:5]), stopped="kv_path"),
         }
     )
-    # 1a. The next expected frontier once the merge settles: engram_write is a no-op on layer 0,
-    # the stages through kv_path have bodies, and reference_seam still refuses. reference_seam is
-    # stage index 6, so the coherent chain is 6 stages (a literal "18-stage chain stopped at
-    # reference_seam" would violate the unchanged index rule and is a finding, not this state).
+    # 1a. A refusal at reference_seam (index 6): the compressor/indexer/compressed-cache write,
+    # reusable GEMV + rmsnorm. Coherent for a 6-stage chain; ref_select (index 7) is the next
+    # boundary after it, and the two are separate lines because a wrong ref_select changes the
+    # top-k SET, not a rounding.
     cases.append(
         {
             "name": "coherent-refusal-at-reference_seam",
@@ -393,7 +400,7 @@ def synthetic_cases() -> list:
         }
     )
     # 1a-neg. The literal reading of "an 18-stage chain stopping at reference_seam": chain length
-    # 18 would put the next stage at ffn_epilogue, not reference_seam, so the tool reports a finding
+    # 18 would put the next stage at moe_shared, not reference_seam, so the tool reports a finding
     # under the unchanged index rule. Kept so that claim is checkable instead of argued: if such a
     # document ever appears, the merge or the frontier is wrong, and exit 1 is the correct answer.
     cases.append(
@@ -404,27 +411,47 @@ def synthetic_cases() -> list:
             "documents": docs_for(chain=list(STAGE_ORDER[:18]), stopped="reference_seam"),
         }
     )
-    # 1b. The state right after the moe_shared amendment lands and before its body is written: the
-    # stages before moe_shared ran and the arm refused at moe_shared. moe_shared is the 18th stage
-    # (index 17), so "chain length == index of the stopped stage" makes this a 17-stage chain. This
-    # case would be a wrong-next-stage finding under a stale 18-stage order.
+    # 1a2. The next expected frontier after the ref_select split: the stages through reference_seam
+    # ran and ref_select refuses (candidate score + top-k with ascending-id tie-break). Seven stages
+    # ran, so it stops at index 7; this is the boundary whose failure is not a rounding difference -
+    # a different top-k set changes the attended context.
+    cases.append(
+        {
+            "name": "coherent-refusal-at-ref_select",
+            "mode": "probe",
+            "expected": EXIT_COHERENT,
+            "documents": docs_for(chain=list(STAGE_ORDER[:7]), stopped="ref_select"),
+        }
+    )
+    # 1a3. The same boundary off-by-one: an 8-stage chain that still reports ref_select as the stop.
+    # Chain length 8 puts the next stage at stage_attention, so this is a finding.
+    cases.append(
+        {
+            "name": "off-by-one-8-stage-chain-at-ref_select",
+            "mode": "probe",
+            "expected": EXIT_INCOHERENT,
+            "documents": docs_for(chain=list(STAGE_ORDER[:8]), stopped="ref_select"),
+        }
+    )
+    # 1b. A refusal at moe_shared, the shared-expert stage: moe_shared is the 19th stage (index 18),
+    # so "chain length == index of the stopped stage" makes this an 18-stage chain.
     cases.append(
         {
             "name": "coherent-refusal-at-moe_shared",
             "mode": "probe",
             "expected": EXIT_COHERENT,
-            "documents": docs_for(chain=list(STAGE_ORDER[:17]), stopped="moe_shared"),
+            "documents": docs_for(chain=list(STAGE_ORDER[:18]), stopped="moe_shared"),
         }
     )
-    # 1c. The boundary off-by-one a hand-written frontier would carry: an 18-stage chain stopping
-    # at moe_shared. Chain length 18 puts the next stage at ffn_epilogue, so this is a finding, not
-    # the post-amendment state. The tool must refuse to read the 18th stage as "ran" here.
+    # 1c. The boundary off-by-one a hand-written frontier would carry: a 19-stage chain stopping at
+    # moe_shared. Chain length 19 puts the next stage at ffn_epilogue, so this is a finding, not the
+    # post-amendment state. The tool must refuse to read the 19th stage as "ran" here.
     cases.append(
         {
-            "name": "off-by-one-18-stage-chain-at-moe_shared",
+            "name": "off-by-one-19-stage-chain-at-moe_shared",
             "mode": "probe",
             "expected": EXIT_INCOHERENT,
-            "documents": docs_for(chain=list(STAGE_ORDER[:18]), stopped="moe_shared"),
+            "documents": docs_for(chain=list(STAGE_ORDER[:19]), stopped="moe_shared"),
         }
     )
     # 2. The known defect: the refused document lost the chain but still says kv_path stopped it.
@@ -507,7 +534,7 @@ def synthetic_cases() -> list:
             ),
         }
     )
-    # 9. A completed layer with the full 19-stage frontier and the numerical gate's inputs.
+    # 9. A completed layer with the full 20-stage frontier and the numerical gate's inputs.
     token_documents = {}
     tokens_by_rank = {}
     for rank in DEFAULT_RANKS:
@@ -516,7 +543,7 @@ def synthetic_cases() -> list:
         tokens_by_rank[rank] = token_documents[rank]
     cases.append(
         {
-            "name": "complete-19-stage",
+            "name": "complete-20-stage",
             "mode": "complete",
             "expected": EXIT_COHERENT,
             "documents": {rank: rank_document(rank, status=STATUS_COMPLETED) for rank in DEFAULT_RANKS},
@@ -539,7 +566,7 @@ def synthetic_cases() -> list:
             "mode": "complete",
             "expected": EXIT_INCOHERENT,
             "documents": {
-                rank: rank_document(rank, status=STATUS_COMPLETED, chain=list(STAGE_ORDER[:18]), stopped=None)
+                rank: rank_document(rank, status=STATUS_COMPLETED, chain=list(STAGE_ORDER[:19]), stopped=None)
                 for rank in DEFAULT_RANKS
             },
         }
@@ -1354,7 +1381,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--require-complete",
         action="store_true",
-        help="later stage: require status=completed, full 19-stage frontier, gate inputs present",
+        help="later stage: require status=completed, full 20-stage frontier, gate inputs present",
     )
     parser.add_argument(
         "--ranks",

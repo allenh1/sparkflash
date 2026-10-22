@@ -23,6 +23,20 @@
       "synthetic": true
     },
     {
+      "case": "coherent-refusal-at-ref_select",
+      "mode": "probe",
+      "expected_exit": 0,
+      "row_dir": "coherent-refusal-at-ref_select",
+      "synthetic": true
+    },
+    {
+      "case": "off-by-one-8-stage-chain-at-ref_select",
+      "mode": "probe",
+      "expected_exit": 1,
+      "row_dir": "off-by-one-8-stage-chain-at-ref_select",
+      "synthetic": true
+    },
+    {
       "case": "coherent-refusal-at-moe_shared",
       "mode": "probe",
       "expected_exit": 0,
@@ -30,10 +44,10 @@
       "synthetic": true
     },
     {
-      "case": "off-by-one-18-stage-chain-at-moe_shared",
+      "case": "off-by-one-19-stage-chain-at-moe_shared",
       "mode": "probe",
       "expected_exit": 1,
-      "row_dir": "off-by-one-18-stage-chain-at-moe_shared",
+      "row_dir": "off-by-one-19-stage-chain-at-moe_shared",
       "synthetic": true
     },
     {
@@ -86,10 +100,10 @@
       "synthetic": true
     },
     {
-      "case": "complete-19-stage",
+      "case": "complete-20-stage",
       "mode": "complete",
       "expected_exit": 0,
-      "row_dir": "complete-19-stage",
+      "row_dir": "complete-20-stage",
       "synthetic": true
     },
     {

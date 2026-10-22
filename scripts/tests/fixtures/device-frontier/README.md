@@ -15,8 +15,10 @@ rewritten, to keep it relative to this directory).
 | coherent-6-stage-kv_path | probe | 0 |
 | coherent-refusal-at-reference_seam | probe | 0 |
 | incoherent-18-stage-chain-at-reference_seam | probe | 1 |
+| coherent-refusal-at-ref_select | probe | 0 |
+| off-by-one-8-stage-chain-at-ref_select | probe | 1 |
 | coherent-refusal-at-moe_shared | probe | 0 |
-| off-by-one-18-stage-chain-at-moe_shared | probe | 1 |
+| off-by-one-19-stage-chain-at-moe_shared | probe | 1 |
 | degenerate-no-stage-ran-kv_path | probe | 1 |
 | rank-different-chain | probe | 1 |
 | host-arm-document | probe | 1 |
@@ -24,7 +26,7 @@ rewritten, to keep it relative to this directory).
 | empty-rank-document | probe | 2 |
 | bad-rope-geometry | probe | 1 |
 | note-without-not-host-validated | probe | 1 |
-| complete-19-stage | complete | 0 |
+| complete-20-stage | complete | 0 |
 | require-complete-on-refused-row | complete | 1 |
 | completed-frontier-incomplete | complete | 1 |
 | complete-without-logits-bins | complete | 2 |

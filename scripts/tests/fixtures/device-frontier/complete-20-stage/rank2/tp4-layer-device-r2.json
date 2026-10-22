@@ -1,11 +1,11 @@
 {
   "arm": "device layer (opt-in): no per-layer PCIe copy, no per-stage observation read",
-  "frontier": "device-only through engram_write -> mhc_entry -> quantise_prologue -> attention_projections -> query_path -> kv_path -> reference_seam -> stage_attention -> attention_body -> attention_output -> all_reduce -> attention_residual -> ffn_seams -> moe_router -> moe_routed -> all_reduce_moe -> all_reduce_rdma_arm -> moe_shared -> ffn_epilogue (19 stage(s))",
+  "frontier": "device-only through engram_write -> mhc_entry -> quantise_prologue -> attention_projections -> query_path -> kv_path -> reference_seam -> ref_select -> stage_attention -> attention_body -> attention_output -> all_reduce -> attention_residual -> ffn_seams -> moe_router -> moe_routed -> all_reduce_moe -> all_reduce_rdma_arm -> moe_shared -> ffn_epilogue (20 stage(s))",
   "layer": 0,
   "max_positions": 4096,
   "note": "the whole device prefix ran for this layer; no device value is validated against the host reference until the cluster row",
   "position": 0,
-  "rank": 3,
+  "rank": 2,
   "rope_table_bytes": 2097152,
   "schema": "sparkflash-tp4-layer-device-frontier/1",
   "slab_bytes": 67108864,
