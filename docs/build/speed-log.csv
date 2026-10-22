@@ -21,6 +21,9 @@ date,commit,run,step_mean_ms,tokens_ok,logits_sha_ok,note
 2026-10-21,4f83eee5,wsd4-lean,350.39,yes,yes,wsd4-lean
 2026-10-21,4f83eee5,wsd4-probe,405.94,yes,yes,wsd4-probe
 2026-10-21,4f83eee5,wsd4-lean-fabric,351.56,yes,yes,wsd4-lean-fabric
-2026-10-21,d6020787,wsd5-chain,333.92,yes,yes,wsd5-chain
-2026-10-21,d6020787,wsd5-lean,256.17,yes,yes,wsd5-lean
-2026-10-21,d6020787,wsd5-probe,265.58,yes,yes,wsd5-probe
+2026-10-21,44172974,wsd5-chain,333.92,yes,yes,wsd5-chain
+2026-10-21,44172974,wsd5-lean,256.17,yes,yes,wsd5-lean
+2026-10-21,44172974,wsd5-probe,265.58,yes,yes,wsd5-probe
+2026-10-21,3813ecbe,wsd6-chain,328.61,yes,yes,wsd6-chain
+2026-10-21,3813ecbe,wsd6-lean,249.25,yes,yes,wsd6-lean
+2026-10-21,3813ecbe,wsd6-probe,260.67,yes,yes,wsd6-probe

@@ -134,8 +134,12 @@ a byte count; regenerate and review the diff, exactly as scripts/regen-kernel-ba
 
 ## 5. Not in scope / open questions for the implementer
 
-- The +25.2 GiB/rank repack remains rejected; this design is the only alternative that does not need
-  it.
+- The +25.2 GiB/rank repack **in device memory on every boot** remains rejected. Two alternatives
+  now exist and neither needs it: (a) this design, the stored-layout kernel, which adds no disk
+  bytes; and (b) the offline prepad in `docs/build/boot-convert.md`, where `sparkflash convert`
+  writes the 640-wide rows once into the per-rank file, so the +25.2 GiB/rank is file bytes and
+  boot does no repack at all — the incumbent padded kernel then launches unmodified. (a) is the
+  choice when disk is the constraint, (b) when changing no kernel is.
 - The plan's scale placement was confirmed to be a separate tensor (section 1); the design keeps it
   local to the two pointer expressions.
 - No device measurement exists for this kernel until a GPU window runs m25_moe_stored; the variant

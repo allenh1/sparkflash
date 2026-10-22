@@ -15,6 +15,10 @@ use crate::cuda_driver::{Cuda, Deviceptr, Kernel, KernelId, Module};
 /// The kernel id in the shared driver's enum, named here so a caller need not import the driver.
 pub const KERNEL_ID: KernelId = KernelId::EngramWkv;
 
+/// The cubin's pinned name (crates/sparkflash-kernels/baseline/kernel_baseline.txt), the key a
+/// caller verifies the staged bytes by before it loads them.
+pub const KERNEL: &str = "engram_wkv_sm121";
+
 /// The number of argument words the kernel declaration takes.
 pub const ARG_WORDS: usize = 10;
 

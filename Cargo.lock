@@ -2258,6 +2258,8 @@ name = "sparkflash-device"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "serde",
+ "serde_json",
  "sha2",
  "sparkflash-api",
  "sparkflash-engine",
@@ -2307,7 +2309,9 @@ dependencies = [
  "bytemuck",
  "cudarc",
  "half",
+ "libc",
  "libloading 0.8.9",
+ "memmap2",
  "serde",
  "serde_json",
  "sha2",

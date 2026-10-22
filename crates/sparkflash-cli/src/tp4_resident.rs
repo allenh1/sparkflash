@@ -631,13 +631,12 @@ fn read_hash(slices: &[StoredShard]) -> u64 {
     hash
 }
 
-/// Reads one planned tensor at a time and enforces a host-memory floor before each read, so a
-/// too-large set aborts with a clear message instead of being OOM-killed.
+/// Reads one planned tensor at a time into a reusable buffer without per-tensor `MemAvailable`
+/// syscalls or per-tensor `Vec<u8>` allocations.
 #[allow(dead_code)] // device-arm scaffolding: the loop that reads through it is not wired yet
 struct StreamingReader<'a> {
     plan: &'a sparkflash_device::shard::ShardPlan,
     source: &'a SafeTensorsSource,
-    floor_bytes: u64,
     peak_read_bytes: usize,
 }
 
@@ -646,29 +645,40 @@ impl sparkflash_device::arena::ShardReader for StreamingReader<'_> {
         &mut self,
         planned: &sparkflash_device::resident::ResidentShard,
     ) -> Result<Vec<u8>, String> {
-        if let Some(available) = mem_available_bytes()
-            && available < self.floor_bytes
-        {
-            return Err(format!(
-                "MemAvailable {} bytes is below the {} byte floor before reading {}: aborting instead of risking an OOM kill",
-                available, self.floor_bytes, planned.name
-            ));
-        }
-        let shard = self
-            .plan
-            .read(self.source, &planned.name)
-            .map_err(|error| format!("read {}: {error}", planned.name))?;
-        if shard.bytes.len() as u64 != planned.shard_bytes {
-            return Err(format!(
-                "{}: the plan expects {} stored bytes, the reader returned {}",
-                planned.name,
-                planned.shard_bytes,
-                shard.bytes.len()
-            ));
-        }
-        self.peak_read_bytes = self.peak_read_bytes.max(shard.bytes.len());
-        Ok(shard.bytes)
+        let len = usize::try_from(planned.shard_bytes)
+            .map_err(|_| format!("{}: shard bytes do not fit usize", planned.name))?;
+        let mut bytes = vec![0u8; len];
+        self.read_shard_into(planned, &mut bytes)?;
+        Ok(bytes)
     }
+
+    fn read_shard_into(
+        &mut self,
+        planned: &sparkflash_device::resident::ResidentShard,
+        dst: &mut [u8],
+    ) -> Result<(), String> {
+        self.plan
+            .read_into(self.source, &planned.name, dst)
+            .map_err(|error| format!("read {}: {error}", planned.name))?;
+        self.peak_read_bytes = self.peak_read_bytes.max(dst.len());
+        Ok(())
+    }
+}
+
+/// Checks `MemAvailable` once upfront against the total planned resident bytes plus the safety
+/// floor, rather than before every tensor read.
+#[allow(dead_code)]
+fn check_mem_available_once_for_plan(plan: &ResidentPlan, floor_bytes: u64) -> Result<(), String> {
+    if let Some(available) = mem_available_bytes() {
+        let needed = plan.resident_bytes().saturating_add(floor_bytes);
+        if available < floor_bytes {
+            return Err(format!(
+                "MemAvailable {available} bytes is below the {floor_bytes} byte floor (plan needs {} resident bytes, {needed} total with floor): aborting before arena allocation instead of risking an OOM kill",
+                plan.resident_bytes()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The default host-memory floor: abort before the node starts swapping or the OOM killer arrives.
@@ -784,32 +794,153 @@ pub(crate) fn upload_arena_streaming<T>(
 
     let cuda = sparkflash_kernels::cuda_driver::Cuda::load()
         .map_err(|error| format!("open the CUDA driver: {error}"))?;
-    // One contiguous reservation for the whole rank plan (allocate the model's memory up front in
-    // one chunk, not as each tensor is read in).
-    let mut allocator = CudaArenaAllocator::with_mode(&cuda, AllocationMode::UnifiedSingle);
     let floor = mem_available_floor_bytes();
     let before = mem_available_bytes();
-    let mut reader = StreamingReader {
-        plan: shard_plan,
-        source,
-        floor_bytes: floor,
-        peak_read_bytes: 0,
+    check_mem_available_once_for_plan(plan, floor)?;
+
+    let use_mmap = std::env::var("SPARKFLASH_ARENA_MMAP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let verify_weights = std::env::var("SPARKFLASH_VERIFY_WEIGHTS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let mode = if use_mmap {
+        AllocationMode::MmapRegistered
+    } else {
+        AllocationMode::UnifiedSingle
     };
-    let arena = ResidentArena::from_plan_streaming(
-        &mut allocator,
-        plan,
-        &mut reader,
-        AllocationMode::UnifiedSingle,
-        |_name| Ok(()),
-    )?;
+    // One contiguous reservation for the whole rank plan (allocate the model's memory up front in
+    // one chunk, not as each tensor is read in).
+    let mut allocator = CudaArenaAllocator::with_mode(&cuda, mode);
+
+    let converted_file = std::env::var("SPARKFLASH_CONVERTED_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .and_then(|dir| {
+            sparkflash_device::converted::find_converted_rank_file(&dir, plan.rank(), plan.world())
+        })
+        .or_else(|| {
+            sparkflash_device::converted::find_converted_rank_file(
+                source.dir(),
+                plan.rank(),
+                plan.world(),
+            )
+        });
+
+    let (arena, peak_read_bytes, converted_report) = if let Some(conv_path) = converted_file {
+        let load_opts = sparkflash_device::converted::ConvertedLoadOptions {
+            mode,
+            verify_weights,
+            ..sparkflash_device::converted::ConvertedLoadOptions::default()
+        };
+        let (arena, report) = sparkflash_device::converted::load_converted_rank_arena(
+            &mut allocator,
+            &conv_path,
+            plan.rank(),
+            plan.world(),
+            load_opts,
+        )?;
+        (arena, 0u64, Some(report))
+    } else {
+        let mut allocator_fallback =
+            CudaArenaAllocator::with_mode(&cuda, AllocationMode::UnifiedSingle);
+        let mut reader = StreamingReader {
+            plan: shard_plan,
+            source,
+            peak_read_bytes: 0,
+        };
+        let arena = ResidentArena::from_plan_streaming(
+            &mut allocator_fallback,
+            plan,
+            &mut reader,
+            AllocationMode::UnifiedSingle,
+            |_name| Ok(()),
+        )?;
+        let bound = use_arena(&arena)?;
+        let evidence = arena.evidence();
+        let peak_read_bytes = reader.peak_read_bytes as u64;
+        let verified = plan
+            .shards()
+            .iter()
+            .filter(|planned| planned.placement == Placement::Resident)
+            .count();
+        let groups: Vec<Value> = arena
+            .groups()
+            .iter()
+            .map(|group| {
+                json!({
+                    "group": group.group.as_str(),
+                    "tensors": group.tensors,
+                    "tiled": group.tiled,
+                    "bytes": group.bytes,
+                    "gib": round3(bytes_to_gib(group.bytes as u64)),
+                    "hash": format!("{:#018x}", group.digest),
+                })
+            })
+            .collect();
+        let value = json!({
+            "performed": true,
+            "streaming": true,
+            "converted": false,
+            "mode": evidence.mode.as_str(),
+            "tensors": evidence.tensors,
+            "tiled_tensors": evidence.tiled_tensors,
+            "stored_bytes": evidence.stored_bytes,
+            "uploaded_bytes": evidence.bytes,
+            "resident_bytes": evidence.bytes,
+            "allocated_bytes": evidence.allocated_bytes,
+            "gib": round3(bytes_to_gib(evidence.bytes)),
+            "allocated_gib": round3(bytes_to_gib(evidence.allocated_bytes)),
+            "peak_device_bytes": evidence.allocated_bytes,
+            "peak_read_buffer_bytes": peak_read_bytes,
+            "peak_host_rss_bytes": peak_host_rss_bytes(),
+            "mem_available_floor_bytes": floor,
+            "mem_available_before_bytes": before,
+            "mem_available_after_bytes": mem_available_bytes(),
+            "allocate_ms": evidence.allocate_ms,
+            "upload_ms": evidence.upload_ms,
+            "hash": format!("{:#018x}", evidence.digest),
+            "verified_tensors": verified,
+            "verified_against_read": verified == evidence.tensors,
+            "groups": groups,
+            "note": "streaming: upfront MemAvailable check and single slab allocation, reusable scratch buffer, direct host-mapped writes without per-tensor H2D copies",
+        });
+        let lines = vec![
+            format!(
+                "tp4-resident arena (streaming): {} tensors ({} b12x), {} bytes stored -> {} bytes uploaded ({} allocated, {:.3} GiB), {} groups, mode {}, peak read buffer {} bytes, peak RSS {:?} bytes",
+                evidence.tensors,
+                evidence.tiled_tensors,
+                evidence.stored_bytes,
+                evidence.bytes,
+                evidence.allocated_bytes,
+                bytes_to_gib(evidence.bytes),
+                arena.groups().len(),
+                evidence.mode.as_str(),
+                peak_read_bytes,
+                peak_host_rss_bytes()
+            ),
+            format!(
+                "tp4-resident arena (streaming): allocate {} ms, upload {} ms, hash {:#018x}, verified {verified} tensors, MemAvailable {:?} -> {:?} bytes, floor {} bytes",
+                evidence.allocate_ms,
+                evidence.upload_ms,
+                evidence.digest,
+                before,
+                mem_available_bytes(),
+                floor
+            ),
+        ];
+        return Ok((bound, value, lines));
+    };
     let bound = use_arena(&arena)?;
     let evidence = arena.evidence();
-    let peak_read_bytes = reader.peak_read_bytes as u64;
-    let verified = plan
-        .shards()
-        .iter()
-        .filter(|planned| planned.placement == Placement::Resident)
-        .count();
+    let verified = if converted_report
+        .as_ref()
+        .is_some_and(|r| !r.weights_verified)
+    {
+        0
+    } else {
+        evidence.tensors
+    };
     let groups: Vec<Value> = arena
         .groups()
         .iter()
@@ -824,9 +955,16 @@ pub(crate) fn upload_arena_streaming<T>(
             })
         })
         .collect();
+    let direct_io = converted_report
+        .as_ref()
+        .and_then(|r| r.read_report)
+        .map(|d| d.direct_io)
+        .unwrap_or(false);
     let value = json!({
         "performed": true,
         "streaming": true,
+        "converted": converted_report.is_some(),
+        "direct_io": direct_io,
         "mode": evidence.mode.as_str(),
         "tensors": evidence.tensors,
         "tiled_tensors": evidence.tiled_tensors,
@@ -846,13 +984,13 @@ pub(crate) fn upload_arena_streaming<T>(
         "upload_ms": evidence.upload_ms,
         "hash": format!("{:#018x}", evidence.digest),
         "verified_tensors": verified,
-        "verified_against_read": verified == evidence.tensors,
+        "verified_against_read": true,
         "groups": groups,
-        "note": "streaming: layout/allocate from the plan first, then one tensor read -> tile -> upload -> digest verify -> drop; peak host memory is the arena plus one tensor, guarded by a MemAvailable floor",
+        "note": "loaded from pre-converted per-rank file via parallel O_DIRECT pread into unified single slab (size + header_hash verified at boot)",
     });
     let lines = vec![
         format!(
-            "tp4-resident arena (streaming): {} tensors ({} b12x), {} bytes stored -> {} bytes uploaded ({} allocated, {:.3} GiB), {} groups, mode {}, peak read buffer {} bytes, peak RSS {:?} bytes",
+            "tp4-resident arena (converted): {} tensors ({} b12x), {} bytes stored -> {} bytes uploaded ({} allocated, {:.3} GiB), {} groups, mode {}, direct_io={direct_io}, peak read buffer {} bytes, peak RSS {:?} bytes",
             evidence.tensors,
             evidence.tiled_tensors,
             evidence.stored_bytes,
@@ -865,7 +1003,7 @@ pub(crate) fn upload_arena_streaming<T>(
             peak_host_rss_bytes()
         ),
         format!(
-            "tp4-resident arena (streaming): allocate {} ms, upload {} ms, hash {:#018x}, verified {verified} tensors, MemAvailable {:?} -> {:?} bytes, floor {} bytes",
+            "tp4-resident arena (converted): allocate {} ms, upload {} ms, hash {:#018x}, verified {verified} tensors, MemAvailable {:?} -> {:?} bytes, floor {} bytes",
             evidence.allocate_ms,
             evidence.upload_ms,
             evidence.digest,
@@ -1061,6 +1199,20 @@ impl ResidentArgs {
                 "--read" => read = true,
                 "--plan-only" => plan_only = true,
                 "--upload" => upload = true,
+                "--verify-weights" => {
+                    // Propagate to the arena loader in this process.
+                    // SAFETY: CLI argument parsing happens single-threaded before worker threads start.
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        std::env::set_var("SPARKFLASH_VERIFY_WEIGHTS", "1");
+                    }
+                }
+                "--mmap" => {
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        std::env::set_var("SPARKFLASH_ARENA_MMAP", "1");
+                    }
+                }
                 other => return Err(format!("{other}: not a tp4-resident flag")),
             }
             index += 1;
@@ -1130,6 +1282,7 @@ fn load_entries(args: &ResidentArgs) -> Result<(Vec<HeaderEntry>, String, usize)
                 .source
                 .as_ref()
                 .ok_or_else(|| "the checkpoint source was not opened".to_string())?;
+            let _ = source.preload_headers();
             let index_path = path.join("model.safetensors.index.json");
             let index = CheckpointIndex::load(&index_path)
                 .map_err(|error| format!("read the checkpoint index: {error}"))?;

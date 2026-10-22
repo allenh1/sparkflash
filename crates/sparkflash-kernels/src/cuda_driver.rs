@@ -146,6 +146,155 @@ pub struct Kernel {
     name: &'static str,
 }
 
+/// Summary of a parallel direct-I/O file read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectReadReport {
+    /// Total logical bytes read into the destination buffer.
+    pub bytes_read: usize,
+    /// Number of chunk reads issued across the worker pool.
+    pub chunks: usize,
+    /// Worker threads used.
+    pub concurrency: usize,
+    /// Chunk size in bytes.
+    pub chunk_bytes: usize,
+    /// Whether `O_DIRECT` remained active for the read.
+    pub direct_io: bool,
+}
+
+/// Default chunk size for parallel direct I/O (16 MiB, a multiple of 4096).
+pub const DEFAULT_DIRECT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+/// Default number of concurrent reads in flight for parallel direct I/O.
+pub const DEFAULT_DIRECT_CONCURRENCY: usize = 8;
+/// Required alignment for `O_DIRECT` offsets, lengths, and buffer addresses.
+pub const DIRECT_IO_ALIGN: usize = 4096;
+
+/// Opens a file with `O_DIRECT` if supported by the filesystem, returning `(file, is_direct)`.
+fn open_for_direct_read(path: &Path, want_direct: bool) -> Result<(std::fs::File, bool), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if want_direct
+        && let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)
+    {
+        return Ok((file, true));
+    }
+    let file =
+        std::fs::File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    Ok((file, false))
+}
+
+/// Reads `dst.len()` bytes starting at `file_offset` from `path` directly into `dst` using a
+/// bounded thread pool issuing `pread` (`read_exact_at`) over `chunk_bytes` (8-16 MiB) chunks.
+///
+/// When `use_odirect` is true and the file offset, chunk length, and destination pointer are
+/// 4096-byte aligned, the read goes straight from the NVMe `O_DIRECT` descriptor into `dst` with
+/// zero intermediate buffers. If `O_DIRECT` is rejected by the filesystem (e.g. tmpfs in unit
+/// tests) or on a non-aligned tail chunk, that chunk falls back to the buffered descriptor so the
+/// read is always exact.
+///
+/// # Errors
+/// Returns an error if the file cannot be opened or any chunk read fails or hits EOF.
+pub fn read_file_parallel_into_slice(
+    path: &Path,
+    file_offset: u64,
+    dst: &mut [u8],
+    chunk_bytes: usize,
+    concurrency: usize,
+    use_odirect: bool,
+) -> Result<DirectReadReport, String> {
+    use std::os::unix::fs::FileExt;
+    let total_len = dst.len();
+    let chunk_bytes = chunk_bytes.max(DIRECT_IO_ALIGN);
+    let chunk_bytes = (chunk_bytes / DIRECT_IO_ALIGN) * DIRECT_IO_ALIGN;
+    let concurrency = concurrency.clamp(1, 32);
+    if total_len == 0 {
+        return Ok(DirectReadReport {
+            bytes_read: 0,
+            chunks: 0,
+            concurrency,
+            chunk_bytes,
+            direct_io: false,
+        });
+    }
+    let (direct_file, opened_direct) = open_for_direct_read(path, use_odirect)?;
+    let buffered_file =
+        std::fs::File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let direct_used = AtomicBool::new(opened_direct);
+    let mut chunks_vec: Vec<(usize, &mut [u8])> = Vec::new();
+    let mut rel_offset = 0usize;
+    for slice in dst.chunks_mut(chunk_bytes) {
+        let len = slice.len();
+        chunks_vec.push((rel_offset, slice));
+        rel_offset += len;
+    }
+    let total_chunks = chunks_vec.len();
+    let workers = concurrency.min(total_chunks);
+    let queue = Mutex::new(chunks_vec.into_iter());
+    let first_error: Mutex<Option<String>> = Mutex::new(None);
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    if first_error
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .is_some()
+                    {
+                        break;
+                    }
+                    let next = queue.lock().unwrap_or_else(|p| p.into_inner()).next();
+                    let Some((rel, slice)) = next else {
+                        break;
+                    };
+                    let at = file_offset + rel as u64;
+                    let ptr_addr = slice.as_ptr() as usize;
+                    let aligned = (at as usize).is_multiple_of(DIRECT_IO_ALIGN)
+                        && slice.len().is_multiple_of(DIRECT_IO_ALIGN)
+                        && ptr_addr.is_multiple_of(DIRECT_IO_ALIGN);
+                    let result = if opened_direct && aligned {
+                        match direct_file.read_exact_at(slice, at) {
+                            Ok(()) => Ok(()),
+                            Err(_) => {
+                                direct_used.store(false, Ordering::Relaxed);
+                                buffered_file.read_exact_at(slice, at)
+                            }
+                        }
+                    } else {
+                        if slice.len() == chunk_bytes {
+                            direct_used.store(false, Ordering::Relaxed);
+                        }
+                        buffered_file.read_exact_at(slice, at)
+                    };
+                    if let Err(error) = result {
+                        let mut guard = first_error.lock().unwrap_or_else(|p| p.into_inner());
+                        if guard.is_none() {
+                            *guard = Some(format!(
+                                "parallel pread {} at offset {at} ({} bytes): {error}",
+                                path.display(),
+                                slice.len()
+                            ));
+                        }
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    if let Some(err) = first_error.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        return Err(err);
+    }
+    Ok(DirectReadReport {
+        bytes_read: total_len,
+        chunks: total_chunks,
+        concurrency: workers,
+        chunk_bytes,
+        direct_io: direct_used.load(Ordering::Relaxed),
+    })
+}
+
 /// A page-locked host allocation with its UVA device mapping.
 ///
 /// The host pointer is the allocation's owner; the device pointer is only a mapping into it and
@@ -154,7 +303,13 @@ pub struct Kernel {
 pub struct HostMapped {
     host: *mut c_void,
     device: Deviceptr,
+    len: usize,
 }
+
+// Safety: `HostMapped` points to a page-locked, portable CUDA host slab (`CU_MEMHOSTALLOC_PORTABLE`)
+// whose address range `host..host+len` is valid across threads until `Cuda::free_host_mapped`.
+unsafe impl Send for HostMapped {}
+unsafe impl Sync for HostMapped {}
 
 impl HostMapped {
     /// The device-visible pointer for kernel arguments.
@@ -167,6 +322,148 @@ impl HostMapped {
     #[must_use]
     pub fn host_ptr(&self) -> *mut c_void {
         self.host
+    }
+
+    /// Length of the mapped host slab in bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the slab is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Writes `src` directly into the host-mapped slab at `offset`, with no separate H2D copy.
+    ///
+    /// # Errors
+    /// Returns an error if `offset + src.len()` exceeds the slab length.
+    pub fn write_at(&self, offset: usize, src: &[u8]) -> Result<(), String> {
+        let end = offset
+            .checked_add(src.len())
+            .ok_or_else(|| format!("host-mapped write {offset}+{} overflows", src.len()))?;
+        if end > self.len {
+            return Err(format!(
+                "host-mapped write {offset}..{end} exceeds allocation of {} bytes",
+                self.len
+            ));
+        }
+        if src.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.as_ptr(),
+                (self.host as *mut u8).add(offset),
+                src.len(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Reads bytes from the host-mapped slab at `offset` into `dst`.
+    ///
+    /// # Errors
+    /// Returns an error if `offset + dst.len()` exceeds the slab length.
+    pub fn read_at(&self, offset: usize, dst: &mut [u8]) -> Result<(), String> {
+        let end = offset
+            .checked_add(dst.len())
+            .ok_or_else(|| format!("host-mapped read {offset}+{} overflows", dst.len()))?;
+        if end > self.len {
+            return Err(format!(
+                "host-mapped read {offset}..{end} exceeds allocation of {} bytes",
+                self.len
+            ));
+        }
+        if dst.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (self.host as *const u8).add(offset),
+                dst.as_mut_ptr(),
+                dst.len(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Streams `total_len` bytes from `path` (starting at `file_offset`) directly into this
+    /// host-mapped slab at `arena_offset` using parallel `O_DIRECT` / `pread` chunks, with no
+    /// intermediate `Vec<u8>` and no H2D copy.
+    ///
+    /// # Errors
+    /// Returns an error if the range exceeds the slab or any file read fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_file_parallel(
+        &self,
+        path: &Path,
+        file_offset: u64,
+        arena_offset: usize,
+        total_len: usize,
+        chunk_bytes: usize,
+        concurrency: usize,
+        use_odirect: bool,
+    ) -> Result<DirectReadReport, String> {
+        let end = arena_offset
+            .checked_add(total_len)
+            .ok_or_else(|| format!("host-mapped file read {arena_offset}+{total_len} overflows"))?;
+        if end > self.len {
+            return Err(format!(
+                "host-mapped file read {arena_offset}..{end} exceeds allocation of {} bytes",
+                self.len
+            ));
+        }
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut((self.host as *mut u8).add(arena_offset), total_len)
+        };
+        read_file_parallel_into_slice(
+            path,
+            file_offset,
+            dst,
+            chunk_bytes,
+            concurrency,
+            use_odirect,
+        )
+    }
+}
+
+/// A read-only `mmap` of a converted rank file registered with the CUDA driver for zero-copy
+/// unified-memory access on GB10 (`cuMemHostRegister` + `cuMemHostGetDevicePointer_v2`).
+#[derive(Debug)]
+pub struct RegisteredMmap {
+    mmap: memmap2::Mmap,
+    host: *mut c_void,
+    device: Deviceptr,
+    len: usize,
+    registered: bool,
+}
+
+impl RegisteredMmap {
+    /// Device-visible base pointer for kernel arguments.
+    #[must_use]
+    pub fn device(&self) -> Deviceptr {
+        self.device
+    }
+
+    /// Mapped byte slice on the host.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.mmap[..self.len]
+    }
+
+    /// Length of the mapped region in bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the mapped region is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }
 
@@ -2182,7 +2479,128 @@ impl Cuda {
             Ok(HostMapped {
                 host,
                 device: Deviceptr(device),
+                len: bytes,
             })
+        }
+    }
+
+    /// Maps `len` bytes of `path` starting at 4096-aligned `offset` into the process address space
+    /// and registers the mapping with the CUDA driver (`cuMemHostRegister_v2` with
+    /// `CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP`), resolving the GPU
+    /// `Deviceptr`. On a warm restart, pages come straight from the Linux page cache in seconds
+    /// with zero read syscalls and zero H2D copies.
+    pub fn mmap_registered(
+        &self,
+        path: &Path,
+        offset: u64,
+        len: usize,
+        total: &mut usize,
+    ) -> Result<RegisteredMmap, String> {
+        if let Some(refusal) = self.graph_refusal(SegmentOp::Allocation) {
+            return Err(refusal.to_string());
+        }
+        let file = std::fs::File::open(path)
+            .map_err(|error| format!("open {} for mmap: {error}", path.display()))?;
+        let mmap = unsafe {
+            memmap2::MmapOptions::new()
+                .offset(offset)
+                .len(len)
+                .map(&file)
+                .map_err(|error| {
+                    format!(
+                        "mmap {} (offset {offset}, len {len}): {error}",
+                        path.display()
+                    )
+                })?
+        };
+        let _ = mmap.advise(memmap2::Advice::Sequential);
+        let host = mmap.as_ptr() as *mut c_void;
+        let register_len = len.next_multiple_of(DIRECT_IO_ALIGN);
+        unsafe {
+            const CU_MEMHOSTREGISTER_PORTABLE: u32 = 1;
+            const CU_MEMHOSTREGISTER_DEVICEMAP: u32 = 2;
+            const CU_MEMHOSTREGISTER_READ_ONLY: u32 = 8;
+            let reg: Result<
+                libloading::Symbol<unsafe extern "C" fn(*mut c_void, usize, u32) -> CuResult>,
+                String,
+            > = self
+                .sym(b"cuMemHostRegister_v2")
+                .or_else(|_| self.sym(b"cuMemHostRegister"));
+            let registered = true;
+            if let Ok(reg_fn) = reg {
+                let mut r = reg_fn(
+                    host,
+                    register_len,
+                    CU_MEMHOSTREGISTER_PORTABLE
+                        | CU_MEMHOSTREGISTER_DEVICEMAP
+                        | CU_MEMHOSTREGISTER_READ_ONLY,
+                );
+                if r != 0 {
+                    // Fallback without READ_ONLY flag for drivers that reject it on file-backed mappings.
+                    r = reg_fn(
+                        host,
+                        register_len,
+                        CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP,
+                    );
+                }
+                if r != 0 {
+                    return Err(format!(
+                        "cuMemHostRegister({register_len}) on {} failed: {}",
+                        path.display(),
+                        name(r)
+                    ));
+                }
+            } else {
+                return Err("cuMemHostRegister_v2 symbol not found in CUDA driver".to_string());
+            }
+            let get: libloading::Symbol<
+                unsafe extern "C" fn(*mut CuDeviceptr, *mut c_void, u32) -> CuResult,
+            > = self.sym(b"cuMemHostGetDevicePointer_v2")?;
+            let mut device: CuDeviceptr = 0;
+            let r = get(&mut device, host, 0);
+            if r != 0 {
+                if registered
+                    && let Ok(unreg) = self.sym::<unsafe extern "C" fn(*mut c_void) -> CuResult>(
+                        b"cuMemHostUnregister",
+                    )
+                {
+                    let _ = unreg(host);
+                }
+                return Err(format!(
+                    "cuMemHostGetDevicePointer on mmap failed: {}",
+                    name(r)
+                ));
+            }
+            *total += len;
+            note_alloc();
+            Ok(RegisteredMmap {
+                mmap,
+                host,
+                device: Deviceptr(device),
+                len,
+                registered,
+            })
+        }
+    }
+
+    /// Unregisters and drops a `RegisteredMmap` created by [Cuda::mmap_registered].
+    pub fn free_mmap_registered(&self, mapped: &RegisteredMmap) {
+        if self.graph_refusal(SegmentOp::Free).is_some() {
+            debug_assert!(false, "a buffer free inside a CUDA graph segment");
+            return;
+        }
+        if async_launches() {
+            let _ = self.synchronize();
+        }
+        if mapped.registered {
+            unsafe {
+                if let Ok(unreg) = self
+                    .sym::<unsafe extern "C" fn(*mut c_void) -> CuResult>(b"cuMemHostUnregister")
+                {
+                    let _ = unreg(mapped.host);
+                    note_free(1);
+                }
+            }
         }
     }
 

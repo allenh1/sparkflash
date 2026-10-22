@@ -245,6 +245,51 @@ impl ShardPlan {
             .collect()
     }
 
+    /// Reads this rank's slice of one planned tensor directly into `dst`, without allocating a
+    /// fresh `Vec<u8>`.
+    ///
+    /// # Errors
+    /// [ShardError::Plan] when the plan does not name the tensor, its shape cannot be split, or
+    /// `dst.len()` does not match `shard_bytes`; [ShardError::Weights] when the checkpoint read fails.
+    pub fn read_into(
+        &self,
+        source: &SafeTensorsSource,
+        name: &str,
+        dst: &mut [u8],
+    ) -> Result<VerifiedTensor, ShardError> {
+        let rule = self
+            .rule(name)
+            .ok_or_else(|| ShardError::Plan(format!("the plan does not describe {name}")))?;
+        let header = source.header(name)?;
+        let descriptor = header.tensor(name)?;
+        let geometry = self.geometry(name, rule, &descriptor.shape, descriptor.byte_len())?;
+        if dst.len() as u64 != geometry.shard_bytes {
+            return Err(ShardError::Plan(format!(
+                "{name}: destination buffer is {} bytes, expected {} shard bytes",
+                dst.len(),
+                geometry.shard_bytes
+            )));
+        }
+        let ranges = self.byte_ranges(rule, &descriptor.shape, geometry);
+        source.read_ranges_into(name, &ranges, dst)?;
+        let mut shard_shape = descriptor.shape.clone();
+        match rule {
+            ShardRule::Replicated => {}
+            ShardRule::Column => shard_shape[0] /= self.tp_world,
+            ShardRule::Row => shard_shape[1] /= self.tp_world,
+        }
+        Ok(VerifiedTensor {
+            name: name.to_owned(),
+            rule,
+            dtype: descriptor.dtype.clone(),
+            stored_shape: descriptor.shape.clone(),
+            shard_shape,
+            shard_bytes: geometry.shard_bytes,
+            row_bytes: geometry.row_bytes,
+            ranges: geometry.ranges,
+        })
+    }
+
     /// Reads this rank's slice of one planned tensor.
     ///
     /// # Errors
@@ -257,22 +302,22 @@ impl ShardPlan {
         let header = source.header(name)?;
         let descriptor = header.tensor(name)?;
         let geometry = self.geometry(name, rule, &descriptor.shape, descriptor.byte_len())?;
-        let ranges = self.byte_ranges(rule, &descriptor.shape, geometry);
-        let bytes = source.read_ranges(name, &ranges)?;
-        let mut shard_shape = descriptor.shape.clone();
-        match rule {
-            ShardRule::Replicated => {}
-            ShardRule::Column => shard_shape[0] /= self.tp_world,
-            ShardRule::Row => shard_shape[1] /= self.tp_world,
-        }
+        let len = usize::try_from(geometry.shard_bytes).map_err(|_| {
+            ShardError::Plan(format!(
+                "{name}: shard bytes {} do not fit usize",
+                geometry.shard_bytes
+            ))
+        })?;
+        let mut bytes = vec![0u8; len];
+        let verified = self.read_into(source, name, &mut bytes)?;
         Ok(StoredShard {
-            name: name.to_owned(),
-            rule,
-            dtype: descriptor.dtype.clone(),
-            stored_shape: descriptor.shape.clone(),
-            shard_shape,
+            name: verified.name,
+            rule: verified.rule,
+            dtype: verified.dtype,
+            stored_shape: verified.stored_shape,
+            shard_shape: verified.shard_shape,
             bytes,
-            ranges: geometry.ranges,
+            ranges: verified.ranges,
         })
     }
 

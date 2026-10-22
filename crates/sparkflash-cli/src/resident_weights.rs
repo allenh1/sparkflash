@@ -979,9 +979,16 @@ fn bind_plan_pair(
             shard.name
         )
     })?;
-    let expected_weight = match sparkflash_device::arena::b12x_layout(shard) {
-        Some((cols, inner)) => b12x_buffer_bytes(cols, inner),
-        None => shard.shard_bytes as usize,
+    let expected_weight = if weight.layout == TensorLayout::MoePadded640
+        && let Some((rows, _unpadded, padded_row)) =
+            sparkflash_device::arena::moe_padded_640_layout(shard)
+    {
+        rows * padded_row
+    } else {
+        match sparkflash_device::arena::b12x_layout(shard) {
+            Some((cols, inner)) => b12x_buffer_bytes(cols, inner),
+            None => shard.shard_bytes as usize,
+        }
     };
     if weight.bytes != expected_weight {
         return Err(format!(
@@ -995,10 +1002,18 @@ fn bind_plan_pair(
             let slice = arena
                 .slice(&scale_name)
                 .ok_or_else(|| format!("{scale_name}: no arena slice for the scale grid"))?;
-            if slice.bytes != scale_shard.shard_bytes as usize {
+            let expected_scale = if slice.layout == TensorLayout::MoePadded640
+                && let Some((rows, _unpadded, padded_row)) =
+                    sparkflash_device::arena::moe_padded_640_layout(scale_shard)
+            {
+                rows * padded_row
+            } else {
+                scale_shard.shard_bytes as usize
+            };
+            if slice.bytes != expected_scale {
                 return Err(format!(
-                    "{scale_name}: arena slice is {} bytes but this rank's planned grid is {}",
-                    slice.bytes, scale_shard.shard_bytes
+                    "{scale_name}: arena slice is {} bytes but this rank's planned grid is {expected_scale}",
+                    slice.bytes
                 ));
             }
             slice.ptr
@@ -1192,18 +1207,32 @@ pub fn bind_rank_moe(
             check_bind_coverage("router", &expected_router, &router_names, &empty)?,
         ),
     ];
+    let down_is_padded_640 = expected_down.iter().any(|name| {
+        arena
+            .slice(name)
+            .is_some_and(|slice| slice.layout == TensorLayout::MoePadded640)
+    });
+    let down_compat = if down_is_padded_640 {
+        serde_json::json!({
+            "class": "routed_experts_down",
+            "launch_compatible": true,
+            "note": "sparkflash convert pre-padded w2 to the 640-K row layout (320 packed bytes and 20 scale bytes per output row) offline; zero boot repack",
+        })
+    } else {
+        serde_json::json!({
+            "class": "routed_experts_down",
+            "launch_compatible": false,
+            "reason": "b12x_mxfp4_moe_sm121 reads the A8 pre-padded 640-K row layout (320 packed bytes and 20 scale bytes per output row); this rank's unconverted plan stores the checkpoint's 288-byte rows and 18-byte grid",
+            "remaining": "either launch the stored-layout kernel variant (b12x_mxfp4_moe_stored_sm121) or run `sparkflash convert` once offline to pre-pad w2 to the 640-wide layout with no boot repack",
+        })
+    };
     let compat = vec![
         serde_json::json!({
             "class": "routed_experts_gate_up",
             "launch_compatible": true,
             "note": "routed_gate_up_sm121 reads SPARK_M4_MOE_WIDTH=576 output rows of 2560 packed bytes with the checkpoint's [576,160] row-scale grid; the arena stores exactly that per-expert slice",
         }),
-        serde_json::json!({
-            "class": "routed_experts_down",
-            "launch_compatible": false,
-            "reason": "b12x_mxfp4_moe_sm121 reads the A8 pre-padded 640-K row layout (320 packed bytes and 20 scale bytes per output row); this rank's plan stores the checkpoint's 288-byte rows and 18-byte grid. Bound and bytes-verified, but a launch on this pointer would misindex every row after the first",
-            "remaining": "either a kernel ABI variant that reads the unpadded 576-wide K (kernel owner + repin), or a one-time boot repack of each expert's [5120,288] slice into a [5120,320] padded device area (+25.2 GiB/rank, still zero per-token H2D)",
-        }),
+        down_compat,
         serde_json::json!({
             "class": "shared_experts",
             "launch_compatible": true,

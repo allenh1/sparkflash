@@ -26,6 +26,7 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use sparkflash_engine::safetensors::SafeTensorsSource;
 
 use crate::shard::{ShardError, ShardPlan, ShardRule};
@@ -52,7 +53,7 @@ pub fn dtype_bytes(dtype: &str) -> Option<usize> {
 }
 
 /// Whether a planned tensor is read once into device memory or left on NVMe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Placement {
     /// Read once at start-up and kept in device memory.
     Resident,
@@ -72,7 +73,7 @@ impl Placement {
 }
 
 /// The weight group a tensor belongs to, as the design's per-rank table groups them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ResidentGroup {
     /// Attention projections every rank holds whole (\`wq_a\`, \`wkv\`, q/kv norms).
     AttentionReplicated,

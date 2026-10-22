@@ -17,6 +17,8 @@ sparkflash-engine = { path = "../sparkflash-engine" }
 half = { workspace = true }
 bytemuck = { workspace = true }
 thiserror = { workspace = true }
+libc = { workspace = true }
+memmap2 = { workspace = true }
 cudarc = { workspace = true, optional = true }
 # The shared CUDA driver (src/cuda_driver.rs) resolves the driver API with dlopen at run time, so
 # nothing links libcuda and a CPU-only build is unaffected. Same crate and version family cudarc

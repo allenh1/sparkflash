@@ -70,6 +70,7 @@ pub mod arena;
 pub mod budget;
 pub mod chain;
 pub mod chain_device;
+pub mod converted;
 pub mod cubins;
 pub mod engine;
 pub mod layer_zero;

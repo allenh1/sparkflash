@@ -420,7 +420,7 @@ fn run_checked(args: &[&str]) -> Result<ExitCode, String> {
         bench_steps: parsed.bench_steps,
         tokenizer: parsed.tokenizer.clone(),
     };
-    let transport = if parsed.world == 1 {
+    let tcp_config = if parsed.world == 1 {
         None
     } else {
         let addresses: Vec<SocketAddr> = parsed
@@ -440,12 +440,19 @@ fn run_checked(args: &[&str]) -> Result<ExitCode, String> {
                 .with_timeout(Duration::from_secs(180))
                 .with_connect_timeout(Duration::from_secs(60));
         }
-        let transport =
-            TcpTransport::connect(config).map_err(|error| format!("tcp connect: {error}"))?;
-        Some(Box::new(transport) as Box<dyn Transport>)
+        Some(config)
     };
     let started = Instant::now();
-    let outcome = run_rank(&input, transport)?;
+    // Connect the collective only AFTER this rank finishes its ResidentCache fill, so all four
+    // ranks load in parallel without waiting on one another during the fill.
+    let outcome = run_rank_with_transport(&input, move || match tcp_config {
+        None => Ok(None),
+        Some(config) => {
+            let transport =
+                TcpTransport::connect(config).map_err(|error| format!("tcp connect: {error}"))?;
+            Ok(Some(Box::new(transport) as Box<dyn Transport>))
+        }
+    })?;
     let wall_ms = started.elapsed().as_millis() as u64;
     let consumed = outcome.prompt.len() + outcome.generated.len();
     let ms_per_token = if consumed == 0 {
@@ -875,10 +882,11 @@ pub struct Tp4Rank {
 }
 
 impl Tp4Rank {
-    /// Opens the checkpoint, builds the rank's plan and resident cache, and connects the
-    /// collective. Engram tables stay on disk and are paged by read_ranges.
+    /// Opens the checkpoint, builds the rank's plan and resident cache in parallel with all other
+    /// ranks, and only connects the collective AFTER the fill has finished. Engram tables stay on
+    /// disk and are paged by read_ranges.
     pub fn open(config: &Tp4RankConfig) -> Result<Self, Tp4Error> {
-        let transport = if config.world_size == 1 {
+        let tcp = if config.world_size == 1 {
             None
         } else {
             let addresses: Vec<SocketAddr> = config
@@ -887,13 +895,12 @@ impl Tp4Rank {
                 .enumerate()
                 .map(|(peer, ip)| SocketAddr::new(*ip, config.base_port + peer as u16))
                 .collect();
-            let tcp = TcpConfig::with_addresses(config.rank, addresses)
-                .map_err(|error| Tp4Error::new(format!("tcp config: {error}")))?
-                .with_timeout(config.timeout)
-                .with_connect_timeout(config.timeout);
-            let transport = TcpTransport::connect(tcp)
-                .map_err(|error| Tp4Error::new(format!("tcp connect: {error}")))?;
-            Some(Box::new(transport) as Box<dyn Transport>)
+            Some(
+                TcpConfig::with_addresses(config.rank, addresses)
+                    .map_err(|error| Tp4Error::new(format!("tcp config: {error}")))?
+                    .with_timeout(config.timeout)
+                    .with_connect_timeout(config.timeout),
+            )
         };
         let input = RankInput {
             rank: config.rank,
@@ -909,22 +916,35 @@ impl Tp4Rank {
             bench_steps: 0,
             tokenizer: None,
         };
-        Self::open_input(&input, transport, config.element_limit).map_err(Tp4Error::new)
+        Self::open_input_with_transport(
+            &input,
+            move || match tcp {
+                None => Ok(None),
+                Some(tcp) => {
+                    let transport = TcpTransport::connect(tcp)
+                        .map_err(|error| Tp4Error::new(format!("tcp connect: {error}")))?;
+                    Ok(Some(Box::new(transport) as Box<dyn Transport>))
+                }
+            },
+            config.element_limit,
+        )
     }
 
     /// Builds a rank from the CLI's parsed input; the CLI --run-stage tp4-host path goes through
     /// this together with the per-step evidence loop.
+    #[cfg(test)]
     fn open_input(
         input: &RankInput,
         transport: Option<Box<dyn Transport>>,
         element_limit: usize,
     ) -> Result<Self, String> {
-        Self::open_input_inner(input, transport, element_limit).map_err(|error| error.to_string())
+        Self::open_input_with_transport(input, move || Ok(transport), element_limit)
+            .map_err(|error| error.to_string())
     }
 
-    fn open_input_inner(
+    fn open_input_with_transport(
         input: &RankInput,
-        transport: Option<Box<dyn Transport>>,
+        connect_transport: impl FnOnce() -> Result<Option<Box<dyn Transport>>, Tp4Error>,
         element_limit: usize,
     ) -> Result<Self, Tp4Error> {
         let load_started = Instant::now();
@@ -975,6 +995,9 @@ impl Tp4Rank {
             rank: 0,
             world: plan.tp_world(),
         };
+        // Connect the collective transport only AFTER the resident cache fill has completed on
+        // this rank, so all four ranks load in parallel and no rank blocks on another during fill.
+        let transport = connect_transport()?;
         let collective = Arc::new(TpCollective::new(input.world, transport));
         // With the attention shard on, the engine reads plan slices (the rank's row block of
         // head.weight today) through the rank's WeightSource, and the logits are rebuilt by the exact
@@ -1883,6 +1906,7 @@ impl ResidentCache {
     /// Reads every plan slice and every non-table checkpoint tensor once, in that order.
     fn load(source: &SafeTensorsSource, plan: &ShardPlan) -> Result<Self, String> {
         let started = Instant::now();
+        let _ = source.preload_headers();
         let mut tensors = BTreeMap::new();
         let mut plan_bytes = 0u64;
         let mut replicated_bytes = 0u64;
@@ -3182,11 +3206,24 @@ fn run_bench_loop(
     })
 }
 
+#[cfg(test)]
 fn run_rank(
     input: &RankInput,
     transport: Option<Box<dyn Transport>>,
 ) -> Result<RankOutcome, String> {
-    let mut rank = Tp4Rank::open_input(input, transport, ELEMENT_LIMIT)?;
+    run_rank_with_transport(input, move || Ok(transport))
+}
+
+fn run_rank_with_transport(
+    input: &RankInput,
+    connect_transport: impl FnOnce() -> Result<Option<Box<dyn Transport>>, String>,
+) -> Result<RankOutcome, String> {
+    let mut rank = Tp4Rank::open_input_with_transport(
+        input,
+        move || connect_transport().map_err(Tp4Error::new),
+        ELEMENT_LIMIT,
+    )
+    .map_err(|error| error.to_string())?;
     let load_ms = rank.metrics.load_ms;
     let (rchar_before, read_before) = io_counters();
     let run_started = Instant::now();

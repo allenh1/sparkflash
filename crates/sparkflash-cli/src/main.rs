@@ -17,7 +17,7 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use sparkflash_cli::{device_chain, doctor, serve};
+use sparkflash_cli::{convert, device_chain, doctor, serve};
 use sparkflash_engram::packer::{CliArgs, run_cli};
 
 /// `pack-engram` options, shared verbatim with the standalone binary.
@@ -44,10 +44,13 @@ fn main() -> ExitCode {
         Some("doctor") => doctor::run(args),
         Some("trace") => sparkflash_scheduler::trace_cli::run(args),
         Some("pack-engram") => pack_engram(args),
+        Some("convert") => convert::run(args),
         Some("serve") => serve::run(args),
         Some("device-chain") => device_chain::run(args),
         _ => {
-            println!("sparkflash: usage: sparkflash <doctor|trace|pack-engram|serve|device-chain>");
+            println!(
+                "sparkflash: usage: sparkflash <doctor|trace|pack-engram|convert|serve|device-chain>"
+            );
             ExitCode::SUCCESS
         }
     }

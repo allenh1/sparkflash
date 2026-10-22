@@ -970,13 +970,7 @@ fn mhc_entry_host_seam_with_digests(
             ));
         }
     }
-    let f32_bytes = |values: &[f32]| -> Vec<u8> {
-        values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect()
-    };
-    let hidden_sha256 = evidence_sha256(&f32_bytes(hidden));
+    let hidden_sha256 = evidence_f32_sha256(hidden);
     let (predictor_sha256, base_sha256, norm_sha256) = match digests {
         Some(digests) => (
             digests.predictor.clone(),
@@ -984,9 +978,9 @@ fn mhc_entry_host_seam_with_digests(
             digests.norm.clone(),
         ),
         None => (
-            evidence_sha256(&f32_bytes(predictor)),
-            evidence_sha256(&f32_bytes(base)),
-            evidence_sha256(&f32_bytes(attn_norm)),
+            evidence_f32_sha256(predictor),
+            evidence_f32_sha256(base),
+            evidence_f32_sha256(attn_norm),
         ),
     };
     Ok(MhcEntrySeam {
@@ -998,9 +992,9 @@ fn mhc_entry_host_seam_with_digests(
         pre: mixes.pre,
         post: mixes.post,
         comb: mixes.comb,
-        attn_in_sha256: evidence_sha256(&f32_bytes(&attn_in)),
+        attn_in_sha256: evidence_f32_sha256(&attn_in),
         attn_in,
-        normed_sha256: evidence_sha256(&f32_bytes(&normed)),
+        normed_sha256: evidence_f32_sha256(&normed),
         normed,
         hidden: hidden.to_vec(),
     })
@@ -1209,9 +1203,9 @@ fn decode_layer_seam_tensors(
         ));
     };
     Ok(LayerSeamTensors {
-        attn_predictor_sha256: evidence_sha256(&f32_le_bytes(&attn_fn)),
-        attn_base_sha256: evidence_sha256(&f32_le_bytes(&attn_base)),
-        attn_norm_sha256: evidence_sha256(&f32_le_bytes(&attn_norm)),
+        attn_predictor_sha256: evidence_f32_sha256(&attn_fn),
+        attn_base_sha256: evidence_f32_sha256(&attn_base),
+        attn_norm_sha256: evidence_f32_sha256(&attn_norm),
         attn_fn,
         attn_base,
         attn_scale,
@@ -1435,6 +1429,23 @@ pub(crate) fn evidence_sha256(bytes: &[u8]) -> String {
     if evidence_record_enabled() {
         EVIDENCE_HASH_CALLS.with(|calls| calls.set(calls.get() + 1));
         sha256_hex(bytes)
+    } else {
+        String::new()
+    }
+}
+
+/// [evidence_sha256] of an f32 row's little-endian bytes, with the byte materialisation behind
+/// the same switch.
+///
+/// The per-layer digests are recorded only in evidence mode, but the calling seam used to serialise
+/// its row before [evidence_sha256] could return the empty string: one allocation and one copy per
+/// f32 buffer per seam per layer, i.e. host work with no consumer in a default or --forward-lean
+/// run. This helper checks the flag first, so the lean path allocates nothing and the evidence path
+/// hashes the identical bytes.
+#[must_use]
+pub(crate) fn evidence_f32_sha256(values: &[f32]) -> String {
+    if evidence_record_enabled() {
+        evidence_sha256(&f32_le_bytes(values))
     } else {
         String::new()
     }
@@ -3238,7 +3249,7 @@ fn run_layer_query_path(
             activation_scale_bytes: activation_scales.len(),
             q_norm_sha256: evidence_sha256(&normed_bytes),
             q_pre_rope_sha256: evidence_sha256(&raw),
-            q_post_rope_sha256: evidence_sha256(&f32_le_bytes(&q)),
+            q_post_rope_sha256: evidence_f32_sha256(&q),
             q_l2: l2,
             heads_per_rank: heads,
             q_head_width,
@@ -3779,10 +3790,10 @@ pub fn attention_residual_host_seam_with(
         .collect();
     Ok(AttentionResidualSeam {
         attn_out_sha256: evidence_sha256(attention_delta_bf16),
-        residual_sha256: evidence_sha256(&f32_le_bytes(residual)),
-        post_sha256: evidence_sha256(&f32_le_bytes(&entry.post)),
-        comb_sha256: evidence_sha256(&f32_le_bytes(&entry.comb)),
-        out_sha256: evidence_sha256(&f32_le_bytes(&out)),
+        residual_sha256: evidence_f32_sha256(residual),
+        post_sha256: evidence_f32_sha256(&entry.post),
+        comb_sha256: evidence_f32_sha256(&entry.comb),
+        out_sha256: evidence_f32_sha256(&out),
         out_l2,
         stream_l2,
         out,
@@ -3985,15 +3996,15 @@ pub fn layer0_ffn_host_seams_with(
         }
     }
     Ok(Layer0FfnSeams {
-        ffn_pre_sha256: evidence_sha256(&f32_le_bytes(&ffn_mixes.pre)),
+        ffn_pre_sha256: evidence_f32_sha256(&ffn_mixes.pre),
         ffn_pre: ffn_mixes.pre,
-        ffn_post_sha256: evidence_sha256(&f32_le_bytes(&ffn_mixes.post)),
-        ffn_comb_sha256: evidence_sha256(&f32_le_bytes(&ffn_mixes.comb)),
+        ffn_post_sha256: evidence_f32_sha256(&ffn_mixes.post),
+        ffn_comb_sha256: evidence_f32_sha256(&ffn_mixes.comb),
         ffn_post: ffn_mixes.post,
         ffn_comb: ffn_mixes.comb,
-        ffn_in_sha256: evidence_sha256(&f32_le_bytes(&ffn_in)),
+        ffn_in_sha256: evidence_f32_sha256(&ffn_in),
         ffn_in,
-        pre_ffn_hidden_sha256: evidence_sha256(&f32_le_bytes(&pre_ffn_hidden)),
+        pre_ffn_hidden_sha256: evidence_f32_sha256(&pre_ffn_hidden),
         pre_ffn_hidden,
         act_fp8_sha256: evidence_sha256(quantised.codes()),
         act_fp8: quantised.codes().to_vec(),
@@ -4904,6 +4915,16 @@ impl<'a> EngramResidentSource<'a> {
     }
 }
 
+#[cfg(feature = "cuda")]
+impl EngramResidentSource<'_> {
+    /// The bytes [EngramResidentSource::preload] holds for a name, for a caller that needs them
+    /// once: the device wkv arm uploads the 157 MB matrix at run scope instead of reading it on
+    /// every layer-position. The borrow keeps the preload's single read.
+    fn resident_bytes(&self, name: &str) -> Option<&[u8]> {
+        self.resident.get(name).map(Vec::as_slice)
+    }
+}
+
 #[cfg(any(feature = "cuda", test))]
 impl sparkflash_engine::weights::WeightSource for EngramResidentSource<'_> {
     fn names(&self) -> Vec<String> {
@@ -4966,6 +4987,220 @@ fn engram_weight_names(config: &sparkflash_engine::config::ModelConfig) -> Vec<S
             ]
         })
         .collect()
+}
+
+/// The device arm of the Engram wkv seam: the already-pinned `engram_wkv_sm121` kernel over the
+/// resident 157 MB W8A8 matrix, with the host fetch, activation quantise, gate and write unchanged.
+///
+/// Why the arithmetic is the same: the module docs of
+/// [sparkflash_engine::forward::engram] state the host seam and the three Engram kernels implement
+/// the native dtype rule op for op, and the host matmul the seam replaces
+/// ([sparkflash_engine::linalg::matmul_f8_w8a8]) is pinned bit-for-bit against
+/// `wkv_native`, which is the kernel's five-step shuffle-tree reduction written out
+/// (kernels/engram_wkv_sm121.cu). This arm therefore moves the [out_width][inner] block-dot
+/// arithmetic only: it hands the kernel exactly the activation codes/scales the host path would
+/// have multiplied, decodes the kernel's bf16 output back to f32 (bf16-exact) and lets the engine
+/// run its existing f32 gate and write over that vector. The device's only declared deviation in
+/// this head is the gate's sigmoid, and the gate stays on the host.
+///
+/// The weights are uploaded once at run scope: each Engram layer's matrix is a constant, and the
+/// released loop would otherwise read it on every layer-position (the block's 18.8 ms per call is
+/// that matmul, not I/O: the resident overlay already keeps the bytes).
+#[cfg(feature = "cuda")]
+struct EngramWkvDevice<'a> {
+    cuda: &'a sparkflash_kernels::cuda_driver::Cuda,
+    kernel: sparkflash_kernels::cuda_driver::Kernel,
+    /// One (codes, scales) device pair per Engram layer that owns a table.
+    weights: std::collections::BTreeMap<usize, (Deviceptr, Deviceptr)>,
+    /// [inner] E4M3 activation codes of the current call, one small upload.
+    act_codes: Deviceptr,
+    /// [inner / 32] E8M0 activation block scales of the current call.
+    act_scales: Deviceptr,
+    /// [out_width] bf16 kernel output, copied back for the host gate.
+    out: Deviceptr,
+    /// Bytes of the bf16 output buffer (two per value).
+    out_bytes: usize,
+    /// The reduction width (hash columns x Engram head width; 6,144 released).
+    inner: usize,
+    /// The kernel's output width (dim x (hc + 1); 25,600 released).
+    out_width: usize,
+    /// Every device allocation this arm owns, freed when the run scope drops it.
+    allocations: Vec<Deviceptr>,
+}
+
+#[cfg(feature = "cuda")]
+impl<'a> EngramWkvDevice<'a> {
+    /// Verifies the pinned cubin, uploads each Engram layer's wkv matrix and allocates the
+    /// per-call staging buffers.
+    ///
+    /// # Errors
+    /// A geometry that is not whole 32-value blocks, a missing resident overlay tensor, a staged
+    /// cubin that disagrees with the baseline pin, an allocation or an upload failure.
+    fn build(
+        cuda: &'a sparkflash_kernels::cuda_driver::Cuda,
+        config: &sparkflash_engine::config::ModelConfig,
+        kernel_dir: &std::path::Path,
+        resident: &EngramResidentSource<'_>,
+    ) -> Result<Self, String> {
+        let inner =
+            sparkflash_engine::forward::engram::hash_columns(config) * config.engram_head_dim;
+        let out_width = config.dim * (config.hc_mult + 1);
+        if inner == 0 || out_width == 0 {
+            return Err(format!(
+                "Engram device wkv: the configuration gives out_width {out_width} inner {inner}"
+            ));
+        }
+        if !inner.is_multiple_of(32) || !out_width.is_multiple_of(32) {
+            return Err(format!(
+                "Engram device wkv: {out_width}x{inner} is not whole 32-value blocks, so it is not the released checkpoint layout"
+            ));
+        }
+        let (cubin, _sha256) = load_pinned_addition(
+            kernel_dir,
+            sparkflash_kernels::engram_wkv_launch::KERNEL,
+            "Engram device wkv",
+        )?;
+        let (_module, kernel) = sparkflash_kernels::engram_wkv_launch::load(cuda, &cubin)?;
+        let mut allocated = 0usize;
+        let mut allocations = Vec::new();
+        let mut weights = std::collections::BTreeMap::new();
+        let want_codes = out_width * inner;
+        let want_scales = out_width.div_ceil(32) * inner.div_ceil(32);
+        for &layer in &config.engram_layer_ids {
+            let codes_name = format!("layers.{layer}.engram.wkv.weight");
+            let scales_name = format!("layers.{layer}.engram.wkv.scale");
+            let codes = resident.resident_bytes(&codes_name).ok_or_else(|| {
+                format!("Engram device wkv: the resident overlay holds no {codes_name}")
+            })?;
+            let scales = resident.resident_bytes(&scales_name).ok_or_else(|| {
+                format!("Engram device wkv: the resident overlay holds no {scales_name}")
+            })?;
+            if codes.len() != want_codes || scales.len() != want_scales {
+                return Err(format!(
+                    "Engram device wkv: {codes_name} is {} bytes and {scales_name} {} bytes; the {out_width}x{inner} checkpoint layout is {want_codes} and {want_scales}",
+                    codes.len(),
+                    scales.len()
+                ));
+            }
+            let codes_dev = cuda.alloc(codes.len(), &mut allocated).map_err(|error| {
+                format!("Engram device wkv: {codes_name} device buffer: {error}")
+            })?;
+            allocations.push(codes_dev);
+            cuda.copy_htod(&codes_dev, codes)
+                .map_err(|error| format!("Engram device wkv: {codes_name} upload: {error}"))?;
+            let scales_dev = cuda.alloc(scales.len(), &mut allocated).map_err(|error| {
+                format!("Engram device wkv: {scales_name} device buffer: {error}")
+            })?;
+            allocations.push(scales_dev);
+            cuda.copy_htod(&scales_dev, scales)
+                .map_err(|error| format!("Engram device wkv: {scales_name} upload: {error}"))?;
+            weights.insert(layer, (codes_dev, scales_dev));
+        }
+        let act_codes = cuda
+            .alloc(inner, &mut allocated)
+            .map_err(|error| format!("Engram device wkv: activation code buffer: {error}"))?;
+        allocations.push(act_codes);
+        let act_scales = cuda
+            .alloc(inner.div_ceil(32), &mut allocated)
+            .map_err(|error| format!("Engram device wkv: activation scale buffer: {error}"))?;
+        allocations.push(act_scales);
+        let out_bytes = out_width * 2;
+        let out = cuda
+            .alloc(out_bytes, &mut allocated)
+            .map_err(|error| format!("Engram device wkv: output buffer: {error}"))?;
+        allocations.push(out);
+        Ok(Self {
+            cuda,
+            kernel,
+            weights,
+            act_codes,
+            act_scales,
+            out,
+            out_bytes,
+            inner,
+            out_width,
+            allocations,
+        })
+    }
+
+    /// Runs the wkv projection for one layer-position through the pinned kernel.
+    ///
+    /// `out` receives the kernel's bf16 output decoded to f32, i.e. exactly the values the host
+    /// `matmul_f8_w8a8` arm hands the gate.
+    ///
+    /// # Errors
+    /// A geometry disagreement, a layer without a resident matrix, or a copy/launch failure.
+    fn project(
+        &self,
+        layer: usize,
+        act_codes: &[u8],
+        act_scales: &[u8],
+        out_width: usize,
+        inner: usize,
+        out: &mut [f32],
+    ) -> Result<(), String> {
+        if out_width != self.out_width || inner != self.inner {
+            return Err(format!(
+                "Engram device wkv: the seam asked for {out_width}x{inner}, the resident kernel geometry is {}x{}",
+                self.out_width, self.inner
+            ));
+        }
+        if act_codes.len() != inner
+            || act_scales.len() != inner.div_ceil(32)
+            || out.len() != out_width
+        {
+            return Err(format!(
+                "Engram device wkv: {} codes, {} scales and {} outputs do not describe one {out_width}x{inner} row",
+                act_codes.len(),
+                act_scales.len(),
+                out.len()
+            ));
+        }
+        let &(weight, weight_scales) = self.weights.get(&layer).ok_or_else(|| {
+            format!("Engram device wkv: no resident wkv matrix for layer {layer}")
+        })?;
+        self.cuda
+            .copy_htod(&self.act_codes, act_codes)
+            .map_err(|error| format!("Engram device wkv: activation code htod: {error}"))?;
+        self.cuda
+            .copy_htod(&self.act_scales, act_scales)
+            .map_err(|error| format!("Engram device wkv: activation scale htod: {error}"))?;
+        let params = sparkflash_kernels::engram_wkv_launch::EngramWkvLaunchParams {
+            act_codes: self.act_codes,
+            act_scales: self.act_scales,
+            weight,
+            weight_scales,
+            out: self.out,
+            out_width: out_width as u32,
+            inner: inner as u32,
+            trace_ring: 0,
+            layer_id: layer as u32,
+            step_seq: 0,
+        };
+        sparkflash_kernels::engram_wkv_launch::launch(self.cuda, self.kernel, &params)?;
+        let mut raw = vec![0u8; self.out_bytes];
+        self.cuda
+            .copy_dtoh(&mut raw, &self.out)
+            .map_err(|error| format!("Engram device wkv: output dtoh: {error}"))?;
+        let values = bf16_from_le_bytes(&raw)?;
+        if values.len() != out.len() {
+            return Err(format!(
+                "Engram device wkv: the kernel returned {} values, the seam expects {}",
+                values.len(),
+                out.len()
+            ));
+        }
+        out.copy_from_slice(&values);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for EngramWkvDevice<'_> {
+    fn drop(&mut self) {
+        let allocations: Vec<&Deviceptr> = self.allocations.iter().collect();
+        self.cuda.free_buffers(&allocations);
+    }
 }
 
 /// The gathered, replicated released shared-expert view for one layer.
@@ -5842,7 +6077,7 @@ fn run_layer_ffn_epilogue(
             &mut shared_only,
         )?;
     }
-    let shared_sha256 = evidence_sha256(&f32_le_bytes(&shared_only));
+    let shared_sha256 = evidence_f32_sha256(&shared_only);
     let shared_l2 = shared_only
         .iter()
         .map(|value| value * value)
@@ -5879,10 +6114,7 @@ fn run_layer_ffn_epilogue(
                 .sum::<f32>()
                 .sqrt();
             let relative = if norm == 0.0 { 0.0 } else { difference / norm };
-            (
-                Some(evidence_sha256(&f32_le_bytes(&f32_only))),
-                Some(relative),
-            )
+            (Some(evidence_f32_sha256(&f32_only)), Some(relative))
         } else {
             (None, None)
         };
@@ -5972,10 +6204,10 @@ fn run_layer_ffn_epilogue(
         shared_l2,
         shared_f32_sha256,
         shared_native_vs_f32_rel_l2,
-        ffn_out_sha256: evidence_sha256(&f32_le_bytes(&ffn_out)),
+        ffn_out_sha256: evidence_f32_sha256(&ffn_out),
         ffn_out_l2,
         ffn_out,
-        hc_post_sha256: evidence_sha256(&f32_le_bytes(&hc_post)),
+        hc_post_sha256: evidence_f32_sha256(&hc_post),
         hc_post_l2,
         hc_post,
     })
@@ -6440,18 +6672,18 @@ fn run_head_position(
     probe::head(cuda, "winner_check", timer);
     let timer = BlockTimer::start(probe_on);
     let normed_sha256 = evidence_sha256(&tail_outputs.normed_bf16);
-    let gathered_sha256 = evidence_sha256(&f32_le_bytes(&gathered.full));
+    let gathered_sha256 = evidence_f32_sha256(&gathered.full);
     let mut head_ranks = Vec::with_capacity(request.world);
     for (rank, side) in rank_sides.iter().enumerate() {
         let base = rank * crate::tp4_tail::VOCAB_PER_RANK;
         let rank_logits = &gathered.full[base..base + crate::tp4_tail::VOCAB_PER_RANK];
         head_ranks.push(serde_json::json!({
             "rank": rank,
-            "logits_sha256": evidence_sha256(&f32_le_bytes(rank_logits)),
+            "logits_sha256": evidence_f32_sha256(rank_logits),
             "logits_f32_values": rank_logits.len(),
             "certified_count": side.certified_count,
             "certified_sha256": evidence_sha256(&side.certified),
-            "block_max_sha256": evidence_sha256(&f32_le_bytes(&side.block_max)),
+            "block_max_sha256": evidence_f32_sha256(&side.block_max),
             "block_argmax_sha256": evidence_sha256(&u32_le_bytes(&side.block_argmax)),
         }));
     }
@@ -8083,6 +8315,17 @@ fn run_forward_loop(
                 engram_source.map(|source| source as &dyn sparkflash_engine::weights::WeightSource)
             }
         };
+    // The Engram wkv projection is the one host seam with an already-pinned device kernel that
+    // computes the same W8A8 block dots (see EngramWkvDevice): upload the constant matrices once
+    // and launch the kernel per layer-position instead of running the 157 M-MAC host matmul. The
+    // host fetch, activation quantise, gate and write stay exactly where they are. A run without a
+    // staged cubin directory (preflight, host-only paths) keeps the host matmul.
+    let engram_wkv_device = match (&engram_resident, request.kernel_cubin_dir) {
+        (Some(resident), Some(kernel_dir)) => {
+            Some(EngramWkvDevice::build(&cuda, config, kernel_dir, resident)?)
+        }
+        _ => None,
+    };
     let total_positions = request
         .prefill_limit
         .map_or(full_positions, |limit| limit.min(full_positions));
@@ -8383,30 +8626,66 @@ fn run_forward_loop(
             if let Some(source) = engram_read_source
                 && config.engram_rows(layer).is_some()
             {
-                let before = stream.clone();
-                sparkflash_engine::forward::engram::engram_forward(
-                    config,
-                    layer,
-                    &mut stream,
-                    &engram_hashes,
-                    source,
-                    ENGRAM_ELEMENT_LIMIT,
-                )
+                // The write record is evidence only: the array below is the difference the seam
+                // made to the stream, and nothing outside the evidence chain reads it. A lean run
+                // skips the clone, the subtraction and the l2 instead of materialising them.
+                let before = evidence_record_enabled().then(|| stream.clone());
+                match &engram_wkv_device {
+                    Some(device) => {
+                        let mut projection =
+                            |act_codes: &[u8],
+                             act_scales: &[u8],
+                             _wkv_codes: &[u8],
+                             _wkv_scales: &[u8],
+                             out_width: usize,
+                             inner: usize,
+                             out: &mut [f32]| {
+                                device
+                                    .project(layer, act_codes, act_scales, out_width, inner, out)
+                                    .map_err(|error| {
+                                        sparkflash_engine::linalg::EngineError::Shape {
+                                            what: "Engram device wkv".to_owned(),
+                                            detail: error,
+                                        }
+                                    })
+                            };
+                        sparkflash_engine::forward::engram::engram_forward_with_projection(
+                            config,
+                            layer,
+                            &mut stream,
+                            &engram_hashes,
+                            source,
+                            ENGRAM_ELEMENT_LIMIT,
+                            &mut projection,
+                        )
+                    }
+                    None => sparkflash_engine::forward::engram::engram_forward(
+                        config,
+                        layer,
+                        &mut stream,
+                        &engram_hashes,
+                        source,
+                        ENGRAM_ELEMENT_LIMIT,
+                    ),
+                }
                 .map_err(|error| {
                     format!("Engram seam: layer {layer} position {position}: {error}")
                 })?;
-                let mut write = vec![0.0f32; stream.len()];
-                for ((slot, after), prior) in write.iter_mut().zip(stream.iter()).zip(before.iter())
-                {
-                    *slot = after - prior;
+                if let Some(before) = before {
+                    let mut write = vec![0.0f32; stream.len()];
+                    for ((slot, after), prior) in
+                        write.iter_mut().zip(stream.iter()).zip(before.iter())
+                    {
+                        *slot = after - prior;
+                    }
+                    let write_l2 = write.iter().map(|value| value * value).sum::<f32>().sqrt();
+                    engram_record = Some(serde_json::json!({
+                        "layer": layer,
+                        "hashes": engram_hashes.len(),
+                        "write_sha256": evidence_f32_sha256(&write),
+                        "write_l2": write_l2,
+                    }));
                 }
-                let write_l2 = write.iter().map(|value| value * value).sum::<f32>().sqrt();
-                engram_record = Some(serde_json::json!({
-                    "layer": layer,
-                    "hashes": engram_hashes.len(),
-                    "write_sha256": evidence_sha256(&f32_le_bytes(&write)),
-                    "write_l2": write_l2,
-                }));
                 probe::layer(&cuda, layer, "engram_write", timer);
             }
             let traced =
@@ -8728,7 +9007,7 @@ fn run_forward_loop(
                                 "hc_post_sha256": ffn_epilogue.hc_post_sha256,
                                 "hc_post_l2": ffn_epilogue.hc_post_l2,
                             },
-                            "stream_sha256": evidence_sha256(&f32_le_bytes(&stream)),
+                            "stream_sha256": evidence_f32_sha256(&stream),
                         }))
                 } else {
                     None
@@ -8870,7 +9149,7 @@ fn run_forward_loop(
         };
         let timer = BlockTimer::start(probe_on);
         let wall_ms = position_started.elapsed().as_millis() as u64;
-        let stream_sha256 = evidence_sha256(&f32_le_bytes(&stream));
+        let stream_sha256 = evidence_f32_sha256(&stream);
         if position + 1 == total_positions {
             final_stream_sha256 = stream_sha256.clone();
         }
@@ -11520,6 +11799,25 @@ mod evidence_switch_tests {
         assert_eq!(
             evidence_sha256(b"evidence-only bytes"),
             sha256_hex(b"evidence-only bytes")
+        );
+        assert_eq!(evidence_hash_calls(), before + 1);
+        set_evidence_record(false);
+    }
+
+    // The f32-row digest helper must make the byte materialisation conditional, not only the hash:
+    // a default/--forward-lean run serialises nothing, and the hash counter stays put; an evidence
+    // run hashes exactly the bytes the inline call used to build.
+    #[test]
+    fn the_f32_row_digest_serialises_only_in_evidence_mode() {
+        set_evidence_record(false);
+        let values = vec![1.0f32, -2.5, 0.0, 123.25];
+        let before = evidence_hash_calls();
+        assert_eq!(evidence_f32_sha256(&values), "");
+        assert_eq!(evidence_hash_calls(), before);
+        set_evidence_record(true);
+        assert_eq!(
+            evidence_f32_sha256(&values),
+            sha256_hex(&f32_le_bytes(&values))
         );
         assert_eq!(evidence_hash_calls(), before + 1);
         set_evidence_record(false);

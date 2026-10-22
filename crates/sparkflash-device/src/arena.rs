@@ -27,9 +27,16 @@
 //! not tile internally, so a tensor must be tiled exactly once - in this arena, never again.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Instant;
 
-use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
+use serde::{Deserialize, Serialize};
+use sparkflash_kernels::cuda_driver::{
+    Cuda, Deviceptr, DirectReadReport, HostMapped, RegisteredMmap, read_file_parallel_into_slice,
+};
+use sparkflash_kernels::mxfp4_ref::{
+    MOE_SCALE_BYTES_PER_ROW, MOE_STORED_CODE_ROW, MOE_STORED_SCALE_ROW, MOE_WEIGHT_BYTES_PER_ROW,
+};
 use sparkflash_kernels::mxfp8_ref::b12x_buffer_bytes;
 
 use crate::resident::{Placement, ResidentGroup, ResidentPlan, ResidentShard};
@@ -43,12 +50,13 @@ use crate::shard::StoredShard;
 pub const ARENA_ALIGNMENT: usize = 256;
 
 /// The FNV-1a 64 offset basis, matching the plan and read digests.
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 /// The FNV-1a 64 prime.
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+pub const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// FNV-1a 64 over a byte slice.
-fn fnv1a(bytes: &[u8]) -> u64 {
+#[must_use]
+pub fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash = FNV_OFFSET;
     for byte in bytes {
         hash ^= u64::from(*byte);
@@ -58,7 +66,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 /// How the arena's device slabs are allocated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AllocationMode {
     /// Plain device memory (cuMemAlloc): the default and what every current launch accepts.
     Device,
@@ -70,6 +78,11 @@ pub enum AllocationMode {
     /// plan's resident bytes are known before any read, so the arena is allocated once and every
     /// tensor is streamed into its offset. Same device memory kind as Unified.
     UnifiedSingle,
+    /// One contiguous page-locked host-mapped slab (`cuMemHostAlloc` with `PORTABLE | DEVICEMAP`)
+    /// on unified LPDDR5x memory (GB10): CPU reads go straight into the arena with zero H2D copy.
+    HostMappedSingle,
+    /// Zero-copy `mmap` of a pre-converted per-rank file registered with `cuMemHostRegister`.
+    MmapRegistered,
 }
 
 impl AllocationMode {
@@ -80,17 +93,22 @@ impl AllocationMode {
             Self::Device => "device",
             Self::Unified => "unified",
             Self::UnifiedSingle => "unified-single-slab",
+            Self::HostMappedSingle => "host-mapped-single-slab",
+            Self::MmapRegistered => "mmap-registered",
         }
     }
 }
 
 /// Which weight layout a resident tensor is stored in on the device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TensorLayout {
     /// The checkpoint's stored order, uploaded unchanged.
     Stored,
     /// The B12x micro-tile order the dense FP8 kernels walk, applied once at load.
     B12x,
+    /// Routed MoE down-projection (`w2`) padded to the 640-wide K layout (`320` packed weight
+    /// bytes or `20` E8M0 scale bytes per output row).
+    MoePadded640,
 }
 
 impl TensorLayout {
@@ -100,6 +118,7 @@ impl TensorLayout {
         match self {
             Self::Stored => "stored",
             Self::B12x => "b12x",
+            Self::MoePadded640 => "moe-padded-640",
         }
     }
 }
@@ -120,6 +139,51 @@ pub trait ArenaAllocator {
     /// # Errors
     /// The driver's copy error.
     fn upload(&mut self, destination: &Deviceptr, bytes: &[u8]) -> Result<(), String>;
+
+    /// Reads `len` bytes from `path` at `file_offset` directly into `destination` using parallel
+    /// `O_DIRECT` / `pread` chunks (8-16 MiB, 4-8 reads in flight). On a unified host-mapped
+    /// allocator, this reads straight into the final arena buffer with no intermediate `Vec<u8>`
+    /// and no separate H2D copy.
+    ///
+    /// # Errors
+    /// File open/read failure or upload error.
+    #[allow(clippy::too_many_arguments)]
+    fn upload_from_file_parallel(
+        &mut self,
+        destination: &Deviceptr,
+        path: &Path,
+        file_offset: u64,
+        len: usize,
+        chunk_bytes: usize,
+        concurrency: usize,
+        use_odirect: bool,
+    ) -> Result<DirectReadReport, String> {
+        let mut buf = vec![0u8; len];
+        let report = read_file_parallel_into_slice(
+            path,
+            file_offset,
+            &mut buf,
+            chunk_bytes,
+            concurrency,
+            use_odirect,
+        )?;
+        self.upload(destination, &buf)?;
+        Ok(report)
+    }
+
+    /// Maps `len` bytes of `path` starting at `file_offset` directly as the arena slab via
+    /// `mmap` + `cuMemHostRegister` when supported by the allocator, returning its device pointer.
+    ///
+    /// # Errors
+    /// If the allocator does not support `mmap` registration or the driver refuses it.
+    fn mmap_from_file(
+        &mut self,
+        _path: &Path,
+        _file_offset: u64,
+        _len: usize,
+    ) -> Result<Deviceptr, String> {
+        Err("this arena allocator does not support mmap registration".to_string())
+    }
 }
 
 /// One tensor as the arena builder takes it: its name, its design group, its bytes and the layout
@@ -211,9 +275,41 @@ pub struct ResidentArena {
 pub trait ShardReader {
     /// Reads exactly the bytes the plan marks resident for this tensor.
     fn read_shard(&mut self, planned: &ResidentShard) -> Result<Vec<u8>, String>;
+
+    /// Reads the planned resident bytes directly into `dst`, avoiding a per-tensor `Vec<u8>`
+    /// allocation when the caller reuses a scratch buffer.
+    fn read_shard_into(&mut self, planned: &ResidentShard, dst: &mut [u8]) -> Result<(), String> {
+        let bytes = self.read_shard(planned)?;
+        if bytes.len() != dst.len() {
+            return Err(format!(
+                "{}: reader returned {} bytes, destination buffer is {} bytes",
+                planned.name,
+                bytes.len(),
+                dst.len()
+            ));
+        }
+        dst.copy_from_slice(&bytes);
+        Ok(())
+    }
 }
 
 impl ResidentArena {
+    /// Constructs a `ResidentArena` directly from pre-converted parts after a single sequential or
+    /// parallel direct-I/O read into the arena slab.
+    #[must_use]
+    pub fn from_converted_parts(
+        slices: BTreeMap<String, ArenaSlice>,
+        groups: Vec<GroupArena>,
+        allocated_bytes: u64,
+        evidence: ArenaEvidence,
+    ) -> Self {
+        Self {
+            slices,
+            groups,
+            allocated_bytes,
+            evidence,
+        }
+    }
     /// Allocates one slab per group and uploads every tensor once.
     ///
     /// Ordering is deterministic: groups in ResidentGroup order, tensors in the order the caller
@@ -240,7 +336,7 @@ impl ResidentArena {
                 return Err(format!("arena tensor {} appears twice", tensor.name));
             }
             let payload = match (tensor.layout, tensor.b12x) {
-                (TensorLayout::Stored, None) => tensor.bytes.to_vec(),
+                (TensorLayout::Stored | TensorLayout::MoePadded640, None) => tensor.bytes.to_vec(),
                 (TensorLayout::B12x, Some((cols, inner))) => {
                     tile_b12x(tensor.bytes, cols, inner)
                         .map_err(|error| format!("arena tensor {}: {error}", tensor.name))?
@@ -251,9 +347,9 @@ impl ResidentArena {
                         tensor.name
                     ));
                 }
-                (TensorLayout::Stored, Some(_)) => {
+                (TensorLayout::Stored | TensorLayout::MoePadded640, Some(_)) => {
                     return Err(format!(
-                        "arena tensor {} is stored but has B12x geometry",
+                        "arena tensor {} is stored/moe-padded but has B12x geometry",
                         tensor.name
                     ));
                 }
@@ -492,7 +588,10 @@ impl ResidentArena {
             }
             layout.push((*group, offsets, offset, tiled));
         }
-        if mode == AllocationMode::UnifiedSingle {
+        if matches!(
+            mode,
+            AllocationMode::UnifiedSingle | AllocationMode::HostMappedSingle
+        ) {
             // One reservation for the whole plan: the resident bytes are known before any read, so
             // the whole arena is allocated up front and every group gets a base inside it. This is
             // the four-rank arm's request: one chunk for the model, not one allocation per read.
@@ -537,6 +636,12 @@ impl ResidentArena {
         let mut stored_bytes = 0u64;
         let mut tiled_tensors = 0usize;
         let mut digest = FNV_OFFSET;
+        let max_stored: usize = slots
+            .iter()
+            .filter_map(|slot| usize::try_from(slot.stored).ok())
+            .max()
+            .unwrap_or(0);
+        let mut scratch: Vec<u8> = vec![0u8; max_stored];
         for (group, entries) in &by_group {
             let (base, offsets, _) = slabs
                 .get(group)
@@ -556,20 +661,18 @@ impl ResidentArena {
                 let planned = planned_shards
                     .get(slot.planned)
                     .ok_or_else(|| format!("{}: planned shard vanished", slot.name))?;
-                let raw = reader.read_shard(planned)?;
-                if raw.len() as u64 != slot.stored {
-                    return Err(format!(
-                        "{}: the plan expects {} stored bytes, the reader returned {}",
-                        slot.name,
-                        slot.stored,
-                        raw.len()
-                    ));
-                }
-                let payload = match slot.b12x {
-                    Some((cols, inner)) => tile_b12x(&raw, cols, inner)
-                        .map_err(|error| format!("{}: {error}", slot.name))?,
-                    None => raw,
+                let stored_len = usize::try_from(slot.stored)
+                    .map_err(|_| format!("{}: stored bytes do not fit usize", slot.name))?;
+                reader.read_shard_into(planned, &mut scratch[..stored_len])?;
+                let raw = &scratch[..stored_len];
+                let tiled_buf: Option<Vec<u8>> = match slot.b12x {
+                    Some((cols, inner)) => Some(
+                        tile_b12x(raw, cols, inner)
+                            .map_err(|error| format!("{}: {error}", slot.name))?,
+                    ),
+                    None => None,
                 };
+                let payload: &[u8] = tiled_buf.as_deref().unwrap_or(raw);
                 if payload.len() != slot.payload {
                     return Err(format!(
                         "{}: payload is {} bytes, the layout reserved {}",
@@ -581,9 +684,9 @@ impl ResidentArena {
                 let offset = offsets[slot_index];
                 let ptr = base.offset(offset);
                 allocator
-                    .upload(&ptr, &payload)
+                    .upload(&ptr, payload)
                     .map_err(|error| format!("arena upload {}: {error}", slot.name))?;
-                let slice_digest = fnv1a(&payload);
+                let slice_digest = fnv1a(payload);
                 stored_bytes = stored_bytes.saturating_add(slot.stored);
                 payload_bytes = payload_bytes.saturating_add(payload.len() as u64);
                 if slot.layout == TensorLayout::B12x {
@@ -796,11 +899,131 @@ pub fn untile_b12x(tiled: &[u8], cols: usize, inner: usize) -> Result<Vec<u8>, S
     Ok(raw)
 }
 
+/// Whether a resident tensor is a routed MoE down-projection (`w2.weight` or `w2.scale`) that
+/// `sparkflash convert` pre-pads to the 640-wide K layout (`320` packed weight bytes or `20` E8M0
+/// scale bytes per output row).
+///
+/// Returns `Some((rows, unpadded_row_bytes, padded_row_bytes))`.
+#[must_use]
+pub fn moe_padded_640_layout(planned: &ResidentShard) -> Option<(usize, usize, usize)> {
+    if planned.group != ResidentGroup::ExpertsRow {
+        return None;
+    }
+    let [rows, row_bytes] = planned.shard_shape.as_slice() else {
+        return None;
+    };
+    if *rows == 0 {
+        return None;
+    }
+    if planned.name.ends_with(".w2.weight")
+        && planned.dtype == "I8"
+        && *row_bytes == MOE_STORED_CODE_ROW
+    {
+        return Some((*rows, MOE_STORED_CODE_ROW, MOE_WEIGHT_BYTES_PER_ROW));
+    }
+    if planned.name.ends_with(".w2.scale")
+        && planned.dtype == "F8_E8M0"
+        && *row_bytes == MOE_STORED_SCALE_ROW
+    {
+        return Some((*rows, MOE_STORED_SCALE_ROW, MOE_SCALE_BYTES_PER_ROW));
+    }
+    None
+}
+
+/// Pads each row of a routed MoE down-projection shard (`w2.weight` or `w2.scale`) from its
+/// stored 576-wide K row (`288` code bytes or `18` scale bytes) to the 640-wide K row (`320` code
+/// bytes or `20` scale bytes) expected by `b12x_mxfp4_moe_sm121`.
+///
+/// # Errors
+/// Returns an error if `raw.len() != rows * unpadded_row_bytes` or `padded_row_bytes < unpadded_row_bytes`.
+pub fn pad_moe_rows_640(
+    raw: &[u8],
+    rows: usize,
+    unpadded_row_bytes: usize,
+    padded_row_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    if padded_row_bytes < unpadded_row_bytes {
+        return Err(format!(
+            "pad_moe_rows_640: padded_row_bytes {padded_row_bytes} < unpadded_row_bytes {unpadded_row_bytes}"
+        ));
+    }
+    let expected = rows.saturating_mul(unpadded_row_bytes);
+    if raw.len() != expected {
+        return Err(format!(
+            "pad_moe_rows_640: expected {expected} bytes ({rows} x {unpadded_row_bytes}), got {}",
+            raw.len()
+        ));
+    }
+    let mut out = vec![0u8; rows.saturating_mul(padded_row_bytes)];
+    for row in 0..rows {
+        let src_start = row * unpadded_row_bytes;
+        let dst_start = row * padded_row_bytes;
+        out[dst_start..dst_start + unpadded_row_bytes]
+            .copy_from_slice(&raw[src_start..src_start + unpadded_row_bytes]);
+    }
+    Ok(out)
+}
+
+/// Orders a group's tensor indices so that every `.weight` tensor is immediately followed by its
+/// companion `.scale` tensor (when present in the same group), keeping scales physically next to
+/// their weights on disk and in the arena.
+#[must_use]
+pub fn order_scales_next_to_weights<'a, F>(count: usize, name_of: F) -> Vec<usize>
+where
+    F: Fn(usize) -> &'a str,
+{
+    let mut by_name: BTreeMap<&str, usize> = BTreeMap::new();
+    for index in 0..count {
+        by_name.insert(name_of(index), index);
+    }
+    let mut visited = vec![false; count];
+    let mut ordered = Vec::with_capacity(count);
+    for index in 0..count {
+        if visited[index] {
+            continue;
+        }
+        let name = name_of(index);
+        if let Some(stem) = name.strip_suffix(".scale") {
+            let weight_name = format!("{stem}.weight");
+            if let Some(&weight_idx) = by_name.get(weight_name.as_str())
+                && !visited[weight_idx]
+            {
+                visited[weight_idx] = true;
+                ordered.push(weight_idx);
+            }
+            visited[index] = true;
+            ordered.push(index);
+        } else if let Some(stem) = name.strip_suffix(".weight") {
+            visited[index] = true;
+            ordered.push(index);
+            let scale_name = format!("{stem}.scale");
+            if let Some(&scale_idx) = by_name.get(scale_name.as_str())
+                && !visited[scale_idx]
+            {
+                visited[scale_idx] = true;
+                ordered.push(scale_idx);
+            }
+        } else {
+            visited[index] = true;
+            ordered.push(index);
+        }
+    }
+    ordered
+}
+
 /// The real allocator: device memory through Cuda, freed on drop.
+///
+/// On unified-memory systems (DGX Spark GB10), `Unified`, `UnifiedSingle`, and `HostMappedSingle`
+/// allocate page-locked host-mapped memory (`cuMemHostAlloc` with `PORTABLE | DEVICEMAP`) first so
+/// CPU file reads (`O_DIRECT` parallel `pread`) and writes go straight into the final GPU-visible
+/// buffer with zero `cuMemcpyHtoD`. If `cuMemHostAlloc` is unavailable, `Unified` and
+/// `UnifiedSingle` fall back to `cuMemAllocManaged`.
 pub struct CudaArenaAllocator<'a> {
     cuda: &'a Cuda,
     mode: AllocationMode,
     pointers: Vec<Deviceptr>,
+    host_mapped: Vec<HostMapped>,
+    mmap_registered: Vec<RegisteredMmap>,
 }
 
 impl<'a> CudaArenaAllocator<'a> {
@@ -811,18 +1034,20 @@ impl<'a> CudaArenaAllocator<'a> {
             cuda,
             mode: AllocationMode::Device,
             pointers: Vec::new(),
+            host_mapped: Vec::new(),
+            mmap_registered: Vec::new(),
         }
     }
 
-    /// An allocator for one mode. AllocationMode::Unified allocates UVA-coherent managed memory
-    /// (cuMemAllocManaged, CU_MEM_ATTACH_GLOBAL) through the kernel driver wrapper.
-    /// managed-memory driver method lands.
+    /// An allocator for one mode.
     #[must_use]
     pub fn with_mode(cuda: &'a Cuda, mode: AllocationMode) -> Self {
         Self {
             cuda,
             mode,
             pointers: Vec::new(),
+            host_mapped: Vec::new(),
+            mmap_registered: Vec::new(),
         }
     }
 
@@ -831,28 +1056,120 @@ impl<'a> CudaArenaAllocator<'a> {
     pub fn mode(&self) -> AllocationMode {
         self.mode
     }
+
+    /// Finds the host-mapped slab and byte offset containing `destination`, if any.
+    fn find_host_mapped(&self, destination: &Deviceptr) -> Option<(&HostMapped, usize)> {
+        for mapped in &self.host_mapped {
+            let base = mapped.device().0;
+            if destination.0 >= base {
+                let offset = usize::try_from(destination.0 - base).ok()?;
+                if offset <= mapped.len() {
+                    return Some((mapped, offset));
+                }
+            }
+        }
+        None
+    }
 }
 
 impl ArenaAllocator for CudaArenaAllocator<'_> {
     fn allocate(&mut self, bytes: usize) -> Result<Deviceptr, String> {
         let mut total = 0usize;
-        let pointer = match self.mode {
-            AllocationMode::Device => self.cuda.alloc(bytes, &mut total)?,
-            AllocationMode::Unified | AllocationMode::UnifiedSingle => {
-                self.cuda.alloc_managed(bytes, &mut total)?
+        match self.mode {
+            AllocationMode::Device => {
+                let pointer = self.cuda.alloc(bytes, &mut total)?;
+                self.pointers.push(pointer);
+                Ok(pointer)
             }
-        };
-        self.pointers.push(pointer);
-        Ok(pointer)
+            AllocationMode::HostMappedSingle => {
+                let mapped = self.cuda.alloc_host_mapped(bytes, &mut total)?;
+                let device = mapped.device();
+                self.host_mapped.push(mapped);
+                Ok(device)
+            }
+            AllocationMode::Unified | AllocationMode::UnifiedSingle => {
+                // Prefer zero-copy host-mapped memory (`cuMemHostAlloc`) on GB10 unified memory so
+                // CPU reads and writes go straight into the arena without `cuMemcpyHtoD`.
+                if let Ok(mapped) = self.cuda.alloc_host_mapped(bytes, &mut total) {
+                    let device = mapped.device();
+                    self.host_mapped.push(mapped);
+                    return Ok(device);
+                }
+                let pointer = self.cuda.alloc_managed(bytes, &mut total)?;
+                self.pointers.push(pointer);
+                Ok(pointer)
+            }
+            AllocationMode::MmapRegistered => {
+                Err("AllocationMode::MmapRegistered uses mmap_from_file, not allocate".to_string())
+            }
+        }
     }
 
     fn upload(&mut self, destination: &Deviceptr, bytes: &[u8]) -> Result<(), String> {
+        if let Some((mapped, offset)) = self.find_host_mapped(destination) {
+            return mapped.write_at(offset, bytes);
+        }
         self.cuda.copy_htod(destination, bytes)
+    }
+
+    fn upload_from_file_parallel(
+        &mut self,
+        destination: &Deviceptr,
+        path: &Path,
+        file_offset: u64,
+        len: usize,
+        chunk_bytes: usize,
+        concurrency: usize,
+        use_odirect: bool,
+    ) -> Result<DirectReadReport, String> {
+        if let Some((mapped, offset)) = self.find_host_mapped(destination) {
+            return mapped.read_file_parallel(
+                path,
+                file_offset,
+                offset,
+                len,
+                chunk_bytes,
+                concurrency,
+                use_odirect,
+            );
+        }
+        let mut buf = vec![0u8; len];
+        let report = read_file_parallel_into_slice(
+            path,
+            file_offset,
+            &mut buf,
+            chunk_bytes,
+            concurrency,
+            use_odirect,
+        )?;
+        self.upload(destination, &buf)?;
+        Ok(report)
+    }
+
+    fn mmap_from_file(
+        &mut self,
+        path: &Path,
+        file_offset: u64,
+        len: usize,
+    ) -> Result<Deviceptr, String> {
+        let mut total = 0usize;
+        let mapped = self
+            .cuda
+            .mmap_registered(path, file_offset, len, &mut total)?;
+        let device = mapped.device();
+        self.mmap_registered.push(mapped);
+        Ok(device)
     }
 }
 
 impl Drop for CudaArenaAllocator<'_> {
     fn drop(&mut self) {
+        for mapped in &self.mmap_registered {
+            self.cuda.free_mmap_registered(mapped);
+        }
+        for mapped in &self.host_mapped {
+            self.cuda.free_host_mapped(mapped);
+        }
         if self.pointers.is_empty() {
             return;
         }
@@ -861,7 +1178,10 @@ impl Drop for CudaArenaAllocator<'_> {
                 let references: Vec<&Deviceptr> = self.pointers.iter().collect();
                 self.cuda.free_buffers(&references);
             }
-            AllocationMode::Unified | AllocationMode::UnifiedSingle => {
+            AllocationMode::Unified
+            | AllocationMode::UnifiedSingle
+            | AllocationMode::HostMappedSingle
+            | AllocationMode::MmapRegistered => {
                 for pointer in &self.pointers {
                     self.cuda.free_managed(pointer);
                 }
@@ -871,7 +1191,8 @@ impl Drop for CudaArenaAllocator<'_> {
 }
 
 /// Rounds a byte count up to ARENA_ALIGNMENT.
-fn align_up(bytes: usize) -> usize {
+#[must_use]
+pub fn align_up(bytes: usize) -> usize {
     match bytes % ARENA_ALIGNMENT {
         0 => bytes,
         remainder => bytes + (ARENA_ALIGNMENT - remainder),
@@ -879,9 +1200,15 @@ fn align_up(bytes: usize) -> usize {
 }
 
 /// Whole milliseconds of an elapsed instant.
-fn elapsed_ms(started: Instant) -> u64 {
+#[must_use]
+pub fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis() as u64
 }
+/// Unused import silence helper for default direct constants re-exported for callers.
+pub use sparkflash_kernels::cuda_driver::{
+    DEFAULT_DIRECT_CHUNK_BYTES as DIRECT_CHUNK_BYTES,
+    DEFAULT_DIRECT_CONCURRENCY as DIRECT_CONCURRENCY,
+};
 
 #[cfg(test)]
 mod tests {

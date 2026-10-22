@@ -224,6 +224,18 @@ impl ChainArgs {
                 }
                 "--forward-lean" => forward_lean = true,
                 "--forward-perf-probe" => forward_perf_probe = true,
+                "--verify-weights" => {
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        std::env::set_var("SPARKFLASH_VERIFY_WEIGHTS", "1");
+                    }
+                }
+                "--mmap" => {
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        std::env::set_var("SPARKFLASH_ARENA_MMAP", "1");
+                    }
+                }
                 other => return Err(format!("unknown flag {other}")),
             }
         }
@@ -805,28 +817,20 @@ fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
             }
         }
     }
-    // The walk keeps its own transport, opened BEFORE the arena epoch and reused after it (a second
-    // open would compete for the same ports).
-    let mut forward_transport = if forward_ready.is_some() && !args.peers.is_empty() {
-        Some(open_transport(args)?)
-    } else {
-        None
-    };
-    // The forward loop gets a transport on its own port range instead of sharing the walk's: if a
-    // rank that finished the loop reached the walk while a slower rank was still in it, the two
-    // collective protocols would interleave frames (m1x). The loop ends with a barrier and this
-    // transport is closed before the walk starts.
-    let forward_loop_transport = if forward_ready.is_some() && !args.peers.is_empty() {
-        Some(open_transport_with_base(
-            args,
-            args.base_port + FORWARD_LOOP_PORT_OFFSET,
-        )?)
-    } else {
-        None
-    };
+    // Load all four ranks' resident arenas in parallel BEFORE opening any collective transport or
+    // Hello barrier: no rank waits on another during the fill.
+    let mut forward_transport = None;
+    let mut forward_loop_transport = None;
     let (bind, bind_evidence, arena_evidence, bound, attention_expected, forward_outcome) = if args
         .plan_only
     {
+        if forward_ready.is_some() && !args.peers.is_empty() {
+            forward_transport = Some(open_transport(args)?);
+            forward_loop_transport = Some(open_transport_with_base(
+                args,
+                args.base_port + FORWARD_LOOP_PORT_OFFSET,
+            )?);
+        }
         (
             None,
             serde_json::json!({
@@ -871,6 +875,13 @@ fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
                         args.world,
                         &args.evidence_dir,
                         |arena, bind| {
+                            if !args.peers.is_empty() {
+                                forward_transport = Some(open_transport(args)?);
+                                forward_loop_transport = Some(open_transport_with_base(
+                                    args,
+                                    args.base_port + FORWARD_LOOP_PORT_OFFSET,
+                                )?);
+                            }
                             let transport = forward_loop_transport.as_ref();
                             Ok(crate::tp4_forward::run_with_arena(
                                 &request, &plan, arena, bind, transport,

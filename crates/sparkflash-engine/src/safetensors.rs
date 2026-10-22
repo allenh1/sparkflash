@@ -31,7 +31,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -599,6 +600,7 @@ pub struct SafeTensorsSource {
     limit: u128,
     refused: BTreeSet<String>,
     headers: Mutex<BTreeMap<String, Arc<SafeTensorsHeader>>>,
+    files: Mutex<BTreeMap<String, Arc<File>>>,
 }
 
 impl SafeTensorsSource {
@@ -610,6 +612,7 @@ impl SafeTensorsSource {
             limit: DEFAULT_LIMIT,
             refused: BTreeSet::new(),
             headers: Mutex::new(BTreeMap::new()),
+            files: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -723,6 +726,39 @@ impl SafeTensorsSource {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// The open file handle cache, without a panic on a poisoned mutex.
+    fn files(&self) -> MutexGuard<'_, BTreeMap<String, Arc<File>>> {
+        self.files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Opens or reuses a cached file handle for one shard.
+    fn file_of_shard(&self, shard: &str, tensor_name: &str) -> Result<Arc<File>, WeightError> {
+        if let Some(cached) = self.files().get(shard) {
+            return Ok(Arc::clone(cached));
+        }
+        let path = self.shard_path(shard);
+        let file = Arc::new(File::open(&path).map_err(|error| WeightError::Io {
+            name: tensor_name.to_string(),
+            detail: format!("open {}: {error}", path.display()),
+        })?);
+        self.files().insert(shard.to_string(), Arc::clone(&file));
+        Ok(file)
+    }
+
+    /// Pre-parses and caches the safetensors header of every distinct shard file in the index.
+    ///
+    /// # Errors
+    /// [WeightError::Malformed] or [WeightError::Io] if any shard header cannot be read or parsed.
+    pub fn preload_headers(&self) -> Result<(), WeightError> {
+        let shards: BTreeSet<String> = self.index.weight_map.values().cloned().collect();
+        for shard in shards {
+            let _ = self.header_of_shard(&shard)?;
+        }
+        Ok(())
+    }
+
     /// The shard file name and parsed header for a tensor.
     ///
     /// A shard-level failure is relabelled here: [SafeTensorsHeader] is asked for a file, while
@@ -770,21 +806,42 @@ impl SafeTensorsSource {
         self.read_ranges_with_policy(name, ranges, 0)
     }
 
-    /// The policy-parameterised form of [SafeTensorsSource::read_ranges].
-    ///
-    /// whole_tensor_max_bytes is the largest stored region a many-range read may materialise in one
-    /// buffer. [SafeTensorsSource::read_ranges] passes [GATHER_WHOLE_TENSOR_MAX_BYTES] and
-    /// [SafeTensorsSource::read_ranges_paged] passes 0, which forces every range to its own read.
-    /// Public so a tiny container can exercise both branches of [gathers_whole_tensor].
+    /// Reads named byte ranges of one tensor directly into caller-provided `dst` without allocating
+    /// an output `Vec<u8>`.
     ///
     /// # Errors
-    /// As [SafeTensorsSource::read_ranges].
-    pub fn read_ranges_with_policy(
+    /// As [SafeTensorsSource::read_ranges], plus [WeightError::Malformed] if `dst.len()` does not
+    /// equal the sum of the range lengths.
+    pub fn read_ranges_into(
         &self,
         name: &str,
         ranges: &[(u64, usize)],
+        dst: &mut [u8],
+    ) -> Result<(), WeightError> {
+        self.read_ranges_into_with_policy(name, ranges, dst, GATHER_WHOLE_TENSOR_MAX_BYTES)
+    }
+
+    /// The policy-parameterised form of [SafeTensorsSource::read_ranges_into].
+    ///
+    /// # Errors
+    /// As [SafeTensorsSource::read_ranges_into].
+    pub fn read_ranges_into_with_policy(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+        dst: &mut [u8],
         whole_tensor_max_bytes: u64,
-    ) -> Result<Vec<u8>, WeightError> {
+    ) -> Result<(), WeightError> {
+        let expected_out: usize = ranges.iter().map(|(_, len)| *len).sum();
+        if dst.len() != expected_out {
+            return Err(WeightError::Malformed {
+                name: name.to_string(),
+                detail: format!(
+                    "destination slice is {} bytes, but the requested ranges sum to {expected_out}",
+                    dst.len()
+                ),
+            });
+        }
         let (shard, header) = self.resolve(name)?;
         let descriptor = header.tensor(name)?;
         let (begin, finish) = (descriptor.data_offsets[0], descriptor.data_offsets[1]);
@@ -800,22 +857,7 @@ impl SafeTensorsSource {
                 ),
             })?;
         let path = self.shard_path(shard);
-        let mut file = File::open(&path).map_err(|error| WeightError::Io {
-            name: name.to_string(),
-            detail: format!("open {}: {error}", path.display()),
-        })?;
-        // More than a handful of ranges means a tensor-column slice (one small read per stored
-        // row). Seeking and reading per range costs a syscall pair per row and dominated the
-        // four-rank arena boot (measured 416-521 s for 72.3 GiB/rank, ~4.3 ms per tensor). The
-        // tensor's whole stored region is contiguous, so read it in one sequential pass and gather
-        // the wanted ranges out of that buffer: for a column shard this reads the full tensor on
-        // each rank (4x the shard bytes per rank) but at sequential device speed instead of
-        // 160M seek+read pairs. Ranges are still identical byte-for-byte.
-        //
-        // The shortcut materialises the whole region, so it is bounded by the memory cap as well as
-        // the range count: 24 rows of the 98.3 GB Engram table must take the per-range path, or the
-        // gather allocates 98 GB and the node kills the process (m1y15). Below the cap the boot's
-        // measured path is unchanged; above it the read falls through to the bounded seek path.
+        let file = self.file_of_shard(shard, name)?;
         debug_assert!(
             !gathers_whole_tensor(total, ranges.len(), whole_tensor_max_bytes)
                 || total <= whole_tensor_max_bytes
@@ -826,12 +868,7 @@ impl SafeTensorsSource {
                 detail: format!("tensor region of {total} bytes does not fit usize"),
             })?;
             let mut whole = vec![0u8; total_len];
-            file.seek(SeekFrom::Start(start))
-                .map_err(|error| WeightError::Io {
-                    name: name.to_string(),
-                    detail: format!("seek to byte {start} of {}: {error}", path.display()),
-                })?;
-            file.read_exact(&mut whole)
+            file.read_exact_at(&mut whole, start)
                 .map_err(|error| match error.kind() {
                     std::io::ErrorKind::UnexpectedEof => WeightError::Malformed {
                         name: name.to_string(),
@@ -845,7 +882,7 @@ impl SafeTensorsSource {
                         detail: format!("read {}: {error}", path.display()),
                     },
                 })?;
-            let mut out = Vec::with_capacity(ranges.iter().map(|(_, len)| *len).sum::<usize>());
+            let mut cursor = 0usize;
             for &(offset, len) in ranges {
                 let begin = usize::try_from(offset).map_err(|_| WeightError::Malformed {
                     name: name.to_string(),
@@ -865,11 +902,12 @@ impl SafeTensorsSource {
                         ),
                     });
                 }
-                out.extend_from_slice(&whole[begin..end]);
+                dst[cursor..cursor + len].copy_from_slice(&whole[begin..end]);
+                cursor += len;
             }
-            return Ok(out);
+            return Ok(());
         }
-        let mut out = Vec::new();
+        let mut cursor = 0usize;
         for &(offset, len) in ranges {
             let end = offset
                 .checked_add(len as u64)
@@ -891,13 +929,7 @@ impl SafeTensorsSource {
                     name: name.to_string(),
                     detail: format!("byte {start}+{offset} overflows a file offset"),
                 })?;
-            file.seek(SeekFrom::Start(at))
-                .map_err(|error| WeightError::Io {
-                    name: name.to_string(),
-                    detail: format!("seek to byte {at} of {}: {error}", path.display()),
-                })?;
-            let mut buffer = vec![0u8; len];
-            file.read_exact(&mut buffer)
+            file.read_exact_at(&mut dst[cursor..cursor + len], at)
                 .map_err(|error| match error.kind() {
                     std::io::ErrorKind::UnexpectedEof => WeightError::Malformed {
                         name: name.to_string(),
@@ -911,8 +943,29 @@ impl SafeTensorsSource {
                         detail: format!("read {}: {error}", path.display()),
                     },
                 })?;
-            out.extend_from_slice(&buffer);
+            cursor += len;
         }
+        Ok(())
+    }
+
+    /// The policy-parameterised form of [SafeTensorsSource::read_ranges].
+    ///
+    /// whole_tensor_max_bytes is the largest stored region a many-range read may materialise in one
+    /// buffer. [SafeTensorsSource::read_ranges] passes [GATHER_WHOLE_TENSOR_MAX_BYTES] and
+    /// [SafeTensorsSource::read_ranges_paged] passes 0, which forces every range to its own read.
+    /// Public so a tiny container can exercise both branches of [gathers_whole_tensor].
+    ///
+    /// # Errors
+    /// As [SafeTensorsSource::read_ranges].
+    pub fn read_ranges_with_policy(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+        whole_tensor_max_bytes: u64,
+    ) -> Result<Vec<u8>, WeightError> {
+        let total_out: usize = ranges.iter().map(|(_, len)| *len).sum();
+        let mut out = vec![0u8; total_out];
+        self.read_ranges_into_with_policy(name, ranges, &mut out, whole_tensor_max_bytes)?;
         Ok(out)
     }
 }
@@ -1007,16 +1060,8 @@ impl WeightSource for SafeTensorsSource {
         // Safe: bytes <= readable <= usize::MAX.
         let mut out = vec![0u8; bytes as usize];
         let path = self.shard_path(shard);
-        let mut file = File::open(&path).map_err(|error| WeightError::Io {
-            name: name.to_string(),
-            detail: format!("open {}: {error}", path.display()),
-        })?;
-        file.seek(SeekFrom::Start(start))
-            .map_err(|error| WeightError::Io {
-                name: name.to_string(),
-                detail: format!("seek to byte {start} of {}: {error}", path.display()),
-            })?;
-        file.read_exact(&mut out)
+        let file = self.file_of_shard(shard, name)?;
+        file.read_exact_at(&mut out, start)
             .map_err(|error| match error.kind() {
                 std::io::ErrorKind::UnexpectedEof => WeightError::Malformed {
                     name: name.to_string(),

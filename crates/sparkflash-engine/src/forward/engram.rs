@@ -727,6 +727,44 @@ fn wkv_native(
     out
 }
 
+/// The W8A8 projection of one Engram token's act-quantised row: the host W8A8 matmul, or a device
+/// kernel that computes the same reduction over the same operands.
+///
+/// Arguments, in order: the activation E4M3 codes ([inner]), their E8M0 block scales
+/// ([inner / 32]), the wkv weight codes ([out_width][inner]), its E8M0 block grid
+/// ([out_width / 32][inner / 32]), `out_width`, `inner`, and the output row ([out_width] values,
+/// which the released Linear leaves bf16). The caller has already validated the geometry, so the
+/// callback only reports its own launch or read failure.
+pub type EngramProjection<'a> =
+    dyn FnMut(&[u8], &[u8], &[u8], &[u8], usize, usize, &mut [f32]) -> Result<(), EngineError> + 'a;
+
+/// [engram_forward_with_projection] with the host W8A8 matmul, which is the reference arithmetic.
+///
+/// # Errors
+///
+/// [engram_forward_with_projection]'s refusals.
+pub fn engram_forward(
+    cfg: &ModelConfig,
+    layer: usize,
+    x_hc: &mut [f32],
+    hashes: &[u32],
+    src: &dyn WeightSource,
+    limit: usize,
+) -> Result<bool, EngineError> {
+    let mut host = |act_codes: &[u8],
+                    act_scales: &[u8],
+                    wkv_codes: &[u8],
+                    wkv_scales: &[u8],
+                    out_width: usize,
+                    inner: usize,
+                    out: &mut [f32]| {
+        linalg::matmul_f8_w8a8(
+            out, act_codes, act_scales, wkv_codes, wkv_scales, out_width, inner,
+        )
+    };
+    engram_forward_with_projection(cfg, layer, x_hc, hashes, src, limit, &mut host)
+}
+
 /// Writes the n-gram lookup of one layer into the residual stream.
 ///
 /// This is Engram.forward (model.py:350-365) for one chunk, on the INPUT of an Engram layer, before
@@ -757,13 +795,14 @@ fn wkv_native(
 /// engram_num_embeddings - and the reference indexes the table with the id directly, so the layout
 /// must FIT the table. [Layout::for_config] refuses a configuration where it does not, naming both
 /// numbers, and this check is the second line of defence for a caller that assembled the ids itself.
-pub fn engram_forward(
+pub fn engram_forward_with_projection(
     cfg: &ModelConfig,
     layer: usize,
     x_hc: &mut [f32],
     hashes: &[u32],
     src: &dyn WeightSource,
     limit: usize,
+    projection: &mut EngramProjection<'_>,
 ) -> Result<bool, EngineError> {
     let Some(rows) = cfg.engram_rows(layer) else {
         return Ok(false);
@@ -906,17 +945,18 @@ pub fn engram_forward(
             fetched[column * width..(column + 1) * width].copy_from_slice(&table[at..at + width]);
         }
         let (act_codes, act_scales) = quantise_fetched(&fetched)?;
-        // The same per-row W8A8 reduction as [wkv_native], parallelised over the independent
-        // output rows by the kernel.
+        // The same per-row W8A8 reduction as [wkv_native]: the host arm runs it over the
+        // independent output rows in parallel, a device arm runs a kernel that computes the same
+        // block dots in the same order.
         let mut kv = vec![0.0f32; out_width];
-        linalg::matmul_f8_w8a8(
-            &mut kv,
+        projection(
             &act_codes,
             &act_scales,
             wkv_codes.as_ref(),
             wkv_scales.as_ref(),
             out_width,
             fetched_width,
+            &mut kv,
         )?;
         let (key, value) = kv.split_at(hc * dim);
         for copy in 0..hc {
@@ -2131,6 +2171,76 @@ mod tests {
             tree_differs,
             "the tree order must be observable against an ascending sum on some row"
         );
+    }
+
+    #[test]
+    fn the_projection_seam_hands_the_device_arithmetic_the_same_operands() {
+        // The device arm of the Engram wkv seam is a callback: the engine still fetches the table
+        // rows, act-quantises them and runs the gate and the write on the host, and only the
+        // [out_width][inner] W8A8 block dot moves to a kernel. This test runs the seam twice on the
+        // same fixture - once through the production host matmul and once through a closure that
+        // calls the kernel's pinned reduction order ([wkv_native], the scalar twin of
+        // kernels/engram_wkv_sm121.cu) - and requires bit-equal streams. That pins both the operands
+        // the callback receives and the arithmetic it stands in for.
+        let cfg = test_config();
+        let layer = 1;
+        let source = engram_source(&cfg, |row, column| {
+            let step = ((row * 7 + column * 13) % 61) as f32 - 30.0;
+            step / 4.0
+        });
+        let columns = hash_columns(&cfg);
+        let hashes: Vec<u32> = (0..columns as u32).map(|column| column + 1).collect();
+        let stream = || -> Vec<f32> {
+            (0..cfg.hc_width())
+                .map(|index| ((index as f32) * 0.37).sin() * 2.0)
+                .collect()
+        };
+        let mut host = stream();
+        assert!(engram_forward(&cfg, layer, &mut host, &hashes, &source, BIG).expect("host seam"));
+        let mut device_twin = stream();
+        let mut saw: Option<(usize, usize)> = None;
+        let mut projection = |act_codes: &[u8],
+                              act_scales: &[u8],
+                              wkv_codes: &[u8],
+                              wkv_scales: &[u8],
+                              out_width: usize,
+                              inner: usize,
+                              out: &mut [f32]| {
+            saw = Some((out_width, inner));
+            let kv = wkv_native(
+                act_codes, act_scales, wkv_codes, wkv_scales, out_width, inner,
+            );
+            assert_eq!(kv.len(), out.len(), "the projection width");
+            out.copy_from_slice(&kv);
+            Ok(())
+        };
+        assert!(
+            engram_forward_with_projection(
+                &cfg,
+                layer,
+                &mut device_twin,
+                &hashes,
+                &source,
+                BIG,
+                &mut projection,
+            )
+            .expect("projection seam")
+        );
+        assert_eq!(
+            saw,
+            Some((
+                cfg.dim * (cfg.hc_mult + 1),
+                hash_columns(&cfg) * cfg.engram_head_dim
+            )),
+            "the callback is handed the released wkv geometry"
+        );
+        for (index, (host_value, twin_value)) in host.iter().zip(&device_twin).enumerate() {
+            assert_eq!(
+                host_value.to_bits(),
+                twin_value.to_bits(),
+                "element {index}: the device-order projection must leave the stream bit-equal"
+            );
+        }
     }
 
     #[test]
