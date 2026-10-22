@@ -262,6 +262,21 @@ fn scalar_non_fused(
     cols: usize,
     inner: usize,
 ) -> Vec<u16> {
+    scalar_non_fused_accumulators(a_values, w, w_scales, cols, inner)
+        .into_iter()
+        .map(bf16_bits)
+        .collect()
+}
+
+/// The same scalar reference without the output rounding: the f32 accumulator itself, which is what
+/// the f32-store mode writes.
+fn scalar_non_fused_accumulators(
+    a_values: &[f32],
+    w: &[u8],
+    w_scales: &[u8],
+    cols: usize,
+    inner: usize,
+) -> Vec<f32> {
     let k_blocks = inner / QUANT_BLOCK;
     (0..cols)
         .map(|col| {
@@ -275,7 +290,7 @@ fn scalar_non_fused(
                     acc += a_values[base + i] * w_value;
                 }
             }
-            bf16_bits(acc)
+            acc
         })
         .collect()
 }
@@ -399,10 +414,25 @@ fn f32_activation_model(
     cols: usize,
     inner: usize,
 ) -> Vec<u16> {
+    f32_activation_accumulators(a_row, w, w_scales, cols, inner)
+        .into_iter()
+        .map(bf16_bits)
+        .collect()
+}
+
+/// The same tiling and staging with the f32 STORE: the accumulator is written as the f32 value
+/// itself, not rounded to bf16. This is the model of [Mode::NonFusedF32ActivationF32Stores].
+fn f32_activation_accumulators(
+    a_row: &[f32],
+    w: &[u8],
+    w_scales: &[u8],
+    cols: usize,
+    inner: usize,
+) -> Vec<f32> {
     let k_blocks = inner / QUANT_BLOCK;
     let out_columns = OUT_COLUMNS as usize;
     let tiles = cols.div_ceil(out_columns);
-    let mut out = vec![0u16; cols];
+    let mut out = vec![0.0f32; cols];
     for tile in 0..tiles {
         for lane in 0..out_columns {
             let col = tile * out_columns + lane;
@@ -419,7 +449,7 @@ fn f32_activation_model(
                     acc += a_row[base + i] * w_value;
                 }
             }
-            out[col] = bf16_bits(acc);
+            out[col] = acc;
         }
     }
     out
@@ -495,6 +525,115 @@ fn every_e4m3_code_survives_the_f16_round_trip() {
             round_tripped.to_bits(),
             decoded.to_bits(),
             "E4M3 code {code:#04x} ({decoded}) must survive the f16 widening exactly"
+        );
+    }
+}
+
+/// Claim (d): the fourth instantiation stores the f32 ACCUMULATOR, and the fourth instantiation does
+/// not change the other three. On every served shape each mode is compared against its own reference:
+///
+/// * [Mode::Fused] against [dense_gemm], the pinned dense kernel's CPU twin (bf16 words);
+/// * [Mode::NonFused] against the scalar rounded-multiply-then-rounded-add of the decoded coded row
+///   (bf16 words);
+/// * [Mode::NonFusedF32Activation] against the same scalar model on the raw f32 row (bf16 words);
+/// * [Mode::NonFusedF32ActivationF32Stores] against the same scalar model on the raw f32 row but
+///   compared as f32 accumulator bits, not bf16 words.
+///
+/// The last assertion is the point of the mode: a bf16 store would have moved at least one of these
+/// accumulators (they are not all on the bf16 grid), so an f32-store mode that rounded its output
+/// cannot pass this test.
+#[test]
+fn the_f32_store_mode_writes_f32_accumulators_and_all_four_modes_match_their_references() {
+    for (name, cols, inner) in SERVED_SHAPES {
+        let (a, a_scales) = activation_row(inner, 3);
+        let (w, w_scales) = weight_buffer(cols, inner, 11);
+        // A raw f32 row for the two f32-activation modes: not E4M3-coded, so quantising it would
+        // change the values (the f32-reference arm never does).
+        let a_row: Vec<f32> = (0..inner)
+            .map(|k| ((k as u32).wrapping_mul(29) % 211) as f32 * 0.013 - 1.1)
+            .collect();
+
+        // 1. Fused / coded: the pinned dense twin.
+        let oracle = dense_gemm(&a, &a_scales, &w, &w_scales, 1, cols, inner);
+        let (fused, _) = gemv_model(
+            &a,
+            &a_scales,
+            &w,
+            &w_scales,
+            cols,
+            inner,
+            PIPELINE as usize,
+            Mode::Fused,
+        );
+        assert_eq!(
+            fused, oracle,
+            "{name}: the fused mode must stay the pinned arithmetic"
+        );
+
+        // 2. NonFused / coded: rounded multiply then rounded add on the decoded coded row.
+        let a_values = decoded_activation(&a, &a_scales, inner);
+        let reference = scalar_non_fused(&a_values, &w, &w_scales, cols, inner);
+        let (non_fused, _) = gemv_model(
+            &a,
+            &a_scales,
+            &w,
+            &w_scales,
+            cols,
+            inner,
+            PIPELINE as usize,
+            Mode::NonFused,
+        );
+        assert_eq!(
+            non_fused, reference,
+            "{name}: the non-fused coded mode must stay the rounded multiply then rounded add"
+        );
+
+        // 3. NonFusedF32Activation: the raw row staged unchanged, bf16 store.
+        let reference_bf16 = scalar_non_fused(&a_row, &w, &w_scales, cols, inner);
+        let f32a = f32_activation_model(&a_row, &w, &w_scales, cols, inner);
+        assert_eq!(
+            f32a, reference_bf16,
+            "{name}: the f32-activation mode must stay the bf16 store of the f32-row arithmetic"
+        );
+
+        // 4. NonFusedF32ActivationF32Stores: the f32 accumulator itself.
+        let reference_accumulators =
+            scalar_non_fused_accumulators(&a_row, &w, &w_scales, cols, inner);
+        let stored = f32_activation_accumulators(&a_row, &w, &w_scales, cols, inner);
+        assert_eq!(
+            stored.len(),
+            cols,
+            "{name}: one f32 accumulator per output column"
+        );
+        for (value, reference) in stored.iter().zip(&reference_accumulators) {
+            assert_eq!(
+                value.to_bits(),
+                reference.to_bits(),
+                "{name}: the f32-store mode must write the f32 accumulator bit for bit"
+            );
+        }
+        // Non-vacuous on this data: at least one accumulator is not representable as bf16, so a
+        // bf16 store (the other modes' last step) would have changed the row.
+        let moved = stored
+            .iter()
+            .filter(|value| {
+                let rounded = f32::from_bits(u32::from(bf16_bits(**value)) << 16);
+                rounded.to_bits() != value.to_bits()
+            })
+            .count();
+        assert!(
+            moved > 0,
+            "{name}: every f32 accumulator is on the bf16 grid, so this data cannot prove the store is f32"
+        );
+        // And the f32-store row is not equal to the bf16-store row it replaces, taken as f32 values:
+        // that is exactly the difference the identity gate would see if the store rounded.
+        let widened: Vec<f32> = f32a
+            .iter()
+            .map(|bits| f32::from_bits(u32::from(*bits) << 16))
+            .collect();
+        assert_ne!(
+            stored, widened,
+            "{name}: the f32 store and the bf16 store must not agree as f32 rows"
         );
     }
 }

@@ -4702,8 +4702,12 @@ pub struct Layer0FfnEpilogue {
     pub shared_arith: &'static str,
     /// The kernels the shared row came from, or empty when the host seam produced it.
     pub shared_kernel: &'static str,
-    /// The accumulation mode those kernels ran (fused, or rounded multiply then add).
+    /// The accumulation mode those kernels ran (fused, or rounded multiply then add, and whether
+    /// the output was stored bf16 or f32).
     pub shared_mode: &'static str,
+    /// The symbol of every launch the shared-expert block ran, in launch order. The f32-reference
+    /// arm lists the three GEMV launches; the coded native arm also lists the SwiGLU epilogue.
+    pub launch_symbols: Vec<&'static str>,
     /// sha256 of the shared-expert row itself.
     pub shared_sha256: String,
     /// The shared row's L2 norm.
@@ -4738,10 +4742,12 @@ impl Layer0FfnEpilogue {
                 "arena_reads": self.shared_reads,
                 "gather_calls": self.shared_gathers,
                 "gathered_bytes": self.shared_gathered_bytes,
-                "kernel_launched": !self.shared_kernel.is_empty(),
+                "kernel_launched": !self.launch_symbols.is_empty(),
                 "kernel": self.shared_kernel,
                 "arithmetic_mode": self.shared_mode,
                 "arith": self.shared_arith,
+                "launch_symbols": self.launch_symbols,
+                "launch_count": self.launch_symbols.len(),
                 "row_sha256": self.shared_sha256,
                 "row_l2": self.shared_l2,
                 "f32_row_sha256": self.shared_f32_sha256,
@@ -5223,11 +5229,14 @@ struct SharedExpertDevice {
     layers: Vec<SharedExpertDeviceLayer>,
     /// The per-token scratch, allocated once.
     workspace: SharedExpertWorkspace,
-    /// The fused decode GEMV.
+    /// The fused decode GEMV (the coded native arm).
     gemv: sparkflash_kernels::cuda_driver::Kernel,
-    /// The SwiGLU + MX-quantise epilogue.
+    /// The decode GEMV's f32-activation, f32-store instantiation (the f32-reference arm).
+    gemv_f32: sparkflash_kernels::cuda_driver::Kernel,
+    /// The SwiGLU + MX-quantise epilogue (the coded native arm only; the f32 arm's SwiGLU is host).
     swiglu: sparkflash_kernels::cuda_driver::Kernel,
     _gemv_module: sparkflash_kernels::cuda_driver::Module,
+    _gemv_f32_module: sparkflash_kernels::cuda_driver::Module,
     _swiglu_module: sparkflash_kernels::cuda_driver::Module,
     /// Hidden size.
     dim: usize,
@@ -5258,6 +5267,16 @@ struct SharedExpertWorkspace {
     codes: sparkflash_kernels::cuda_driver::Deviceptr,
     scales: sparkflash_kernels::cuda_driver::Deviceptr,
     out: sparkflash_kernels::cuda_driver::Deviceptr,
+    /// The f32-reference arm's activation row: the pre-FFN hidden row, 5120 f32 = 20 KB.
+    a_f32: sparkflash_kernels::cuda_driver::Deviceptr,
+    /// The f32-reference arm's gate row, 2304 f32.
+    gate_f32: sparkflash_kernels::cuda_driver::Deviceptr,
+    /// The f32-reference arm's up row, 2304 f32.
+    up_f32: sparkflash_kernels::cuda_driver::Deviceptr,
+    /// The f32-reference arm's SwiGLU row, 2304 f32.
+    swiglu_f32: sparkflash_kernels::cuda_driver::Deviceptr,
+    /// The f32-reference arm's down output, 5120 f32.
+    out_f32: sparkflash_kernels::cuda_driver::Deviceptr,
 }
 
 /// Stages the shared expert on the device for every layer: B12x repack, upload, budget admission.
@@ -5300,14 +5319,25 @@ fn build_shared_expert_device(
     let (gemv_cubin, _gemv_sha) =
         load_pinned_addition(kernel_dir, mxfp8_gemv_launch::KERNEL, "shared expert")?;
     let (gemv_module, gemv) = mxfp8_gemv_launch::load(cuda, &gemv_cubin)?;
+    // The same cubin carries the f32-reference arm's symbol; both modes are loaded here because
+    // which arm runs is decided per token by --native-rounding, not at build time.
+    let (gemv_f32_module, gemv_f32) = mxfp8_gemv_launch::load_mode(
+        cuda,
+        &gemv_cubin,
+        mxfp8_gemv_launch::Mode::NonFusedF32ActivationF32Stores,
+    )?;
     let (swiglu_cubin, _swiglu_sha) =
         load_pinned_addition(kernel_dir, "swiglu_mxfp8_quant_sm121", "shared expert")?;
     let (swiglu_module, swiglu) = cuda.load_swiglu_quant(&swiglu_cubin)?;
     // One B12x weight buffer and one scale grid per tensor, plus the per-token scratch.
     let weight_bytes = (2 * inter * dim + dim * inter) as u64;
     let scale_bytes = (2 * (inter / 32) * (dim / 32) + (dim / 32) * (inter / 32)) as u64;
-    let projected_device = request.n_layers as u64 * (weight_bytes + scale_bytes)
-        + (dim + dim / 32 + 4 * inter + inter + inter / 32 + 2 * dim) as u64;
+    // The per-token scratch of both arms: the coded arm's row plus the f32 arm's five f32 buffers
+    // (a_f32 20 KB, gate/up/swiglu 9.2 KB each, out_f32 20 KB).
+    let workspace_bytes =
+        dim + dim / 32 + 4 * inter + inter + inter / 32 + 2 * dim + 8 * dim + 12 * inter;
+    let projected_device =
+        request.n_layers as u64 * (weight_bytes + scale_bytes) + workspace_bytes as u64;
     // The host projection is the transient repack of one layer plus the scale grids.
     let projected_host = weight_bytes + scale_bytes;
     let available = sparkflash_device::budget::read_mem_available_bytes()
@@ -5385,13 +5415,20 @@ fn build_shared_expert_device(
         codes: fresh(inter, "codes")?,
         scales: fresh(inter / 32, "scales")?,
         out: fresh(2 * dim, "out")?,
+        a_f32: fresh(4 * dim, "a_f32")?,
+        gate_f32: fresh(4 * inter, "gate_f32")?,
+        up_f32: fresh(4 * inter, "up_f32")?,
+        swiglu_f32: fresh(4 * inter, "swiglu_f32")?,
+        out_f32: fresh(4 * dim, "out_f32")?,
     };
     Ok(SharedExpertDevice {
         layers,
         workspace,
         gemv,
+        gemv_f32,
         swiglu,
         _gemv_module: gemv_module,
+        _gemv_f32_module: gemv_f32_module,
         _swiglu_module: swiglu_module,
         dim,
         inter,
@@ -5519,6 +5556,189 @@ fn run_shared_expert_device(
     out.copy_from_slice(&row);
     Ok(())
 }
+
+/// The engine's `sigmoid`, copied rather than called because `moe::swiglu` is private: the two
+/// branches are part of the arithmetic (the negative branch keeps `exp(x)` below one), not a
+/// stylistic choice, and the f32 reference's row must be reproduced bit for bit.
+#[cfg(feature = "cuda")]
+fn shared_sigmoid(x: f32) -> f32 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let exp = x.exp();
+        exp / (1.0 + exp)
+    }
+}
+
+/// `silu(x) = x * sigmoid(x)`, the engine's `linalg::silu` expression.
+#[cfg(feature = "cuda")]
+fn shared_silu(x: f32) -> f32 {
+    x * shared_sigmoid(x)
+}
+
+/// The f32-reference SwiGLU over the intermediate row: exactly `engine::forward::moe`'s `swiglu`,
+/// i.e. the reference's clamps (each wrapped in `limit > 0`) around `silu`, and NO bf16 rounding.
+///
+/// # Errors
+/// Mismatched gate, up and output lengths.
+#[cfg(feature = "cuda")]
+fn shared_swiglu_f32(limit: f32, gate: &[f32], up: &[f32], out: &mut [f32]) -> Result<(), String> {
+    if gate.len() != up.len() || out.len() != gate.len() {
+        return Err(format!(
+            "shared expert (f32 device): swiglu over {} gate, {} up and {} output values",
+            gate.len(),
+            up.len(),
+            out.len()
+        ));
+    }
+    if limit > 0.0 {
+        for ((slot, gate), up) in out.iter_mut().zip(gate).zip(up) {
+            let clamped_gate = gate.min(limit);
+            let clamped_up = up.clamp(-limit, limit);
+            *slot = shared_silu(clamped_gate) * clamped_up;
+        }
+    } else {
+        for ((slot, gate), up) in out.iter_mut().zip(gate).zip(up) {
+            *slot = shared_silu(*gate) * *up;
+        }
+    }
+    Ok(())
+}
+
+/// Runs the shared expert's f32-reference arm for one position on resident device operands.
+///
+/// This is the arithmetic of the host `shared_expert_rows` seam - no activation quantisation and no
+/// bf16 boundary rounding - with the three long reductions on the device's decode GEMV and only the
+/// 2304-wide SwiGLU on the host:
+///
+/// * H2D the f32 pre-FFN row (20 KB, no bf16 round, no quantise),
+/// * gate through the f32-activation/f32-store GEMV,
+/// * up through the same GEMV,
+/// * D2H gate and up as f32 (2 x 9.2 KB), host SwiGLU (clamps only),
+/// * H2D the SwiGLU row as f32 (9.2 KB), down through the same GEMV,
+/// * D2H 20 KB f32 and copy into the row with no bf16 round.
+///
+/// The f32-store kernel writes the accumulator itself, so the row is bit-identical to the host f32
+/// reference while the weight traffic runs on the device.
+///
+/// # Errors
+/// A shape disagreement, a quantise-free upload/launch/readback failure, or a non-finite row.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn run_shared_expert_f32_device(
+    cuda: &sparkflash_kernels::cuda_driver::Cuda,
+    request: &TokenStageRequest<'_>,
+    layer: usize,
+    hidden: &[f32],
+    device: &SharedExpertDevice,
+    out: &mut [f32],
+) -> Result<(), String> {
+    use sparkflash_kernels::mxfp8_dense_launch::Mxfp8DenseParams;
+    use sparkflash_kernels::mxfp8_gemv_launch::{self, Mode};
+
+    let config = request.config.ok_or_else(|| {
+        "shared expert (f32 device): the loop was built without the model config".to_string()
+    })?;
+    let dim = device.dim;
+    let inter = device.inter;
+    if hidden.len() != dim || out.len() != dim {
+        return Err(format!(
+            "shared expert (f32 device): hidden {} and out {} do not match dim {dim}",
+            hidden.len(),
+            out.len()
+        ));
+    }
+    let operands = device.layers.get(layer).ok_or_else(|| {
+        format!("shared expert (f32 device): layer {layer} has no resident operands")
+    })?;
+    // Attribute the three launches to this layer in the stage-timing ledger, as the other device
+    // stages do, so the probe can read ffn_shared's kernel time and launch count.
+    sparkflash_kernels::cuda_driver::stage_timing_set_layer(layer);
+    let workspace = &device.workspace;
+    // H2D the f32 row unchanged. The host reference this arm replaces rounds neither to bf16 nor to
+    // E4M3: the row it multiplies is the pre-FFN hidden row itself.
+    cuda.copy_htod(&workspace.a_f32, &f32_le_bytes(hidden))
+        .map_err(|error| format!("shared expert (f32 device): activation upload: {error}"))?;
+    let gemv = |activation: sparkflash_kernels::cuda_driver::Deviceptr,
+                weight: sparkflash_kernels::cuda_driver::Deviceptr,
+                weight_scales: sparkflash_kernels::cuda_driver::Deviceptr,
+                output: sparkflash_kernels::cuda_driver::Deviceptr,
+                cols: usize,
+                inner: usize|
+     -> Result<(), String> {
+        let params = Mxfp8DenseParams::new(
+            activation,
+            workspace.a_scales,
+            weight,
+            weight_scales,
+            output,
+            1,
+            cols as u32,
+            inner as u32,
+            0,
+            layer as u32,
+            0,
+        );
+        mxfp8_gemv_launch::launch_mode(
+            cuda,
+            device.gemv_f32,
+            Mode::NonFusedF32ActivationF32Stores,
+            &params,
+        )
+    };
+    gemv(
+        workspace.a_f32,
+        operands.w1,
+        operands.s1,
+        workspace.gate_f32,
+        inter,
+        dim,
+    )
+    .map_err(|error| format!("shared expert (f32 device): gate launch: {error}"))?;
+    gemv(
+        workspace.a_f32,
+        operands.w3,
+        operands.s3,
+        workspace.up_f32,
+        inter,
+        dim,
+    )
+    .map_err(|error| format!("shared expert (f32 device): up launch: {error}"))?;
+    let mut gate_bytes = vec![0u8; inter * 4];
+    cuda.copy_dtoh(&mut gate_bytes, &workspace.gate_f32)
+        .map_err(|error| format!("shared expert (f32 device): gate readback: {error}"))?;
+    let mut up_bytes = vec![0u8; inter * 4];
+    cuda.copy_dtoh(&mut up_bytes, &workspace.up_f32)
+        .map_err(|error| format!("shared expert (f32 device): up readback: {error}"))?;
+    let gate = f32_from_le_bytes(&gate_bytes)
+        .map_err(|error| format!("shared expert (f32 device): gate decode: {error}"))?;
+    let up = f32_from_le_bytes(&up_bytes)
+        .map_err(|error| format!("shared expert (f32 device): up decode: {error}"))?;
+    let mut swiglu = vec![0.0f32; inter];
+    shared_swiglu_f32(config.swiglu_limit as f32, &gate, &up, &mut swiglu)?;
+    cuda.copy_htod(&workspace.swiglu_f32, &f32_le_bytes(&swiglu))
+        .map_err(|error| format!("shared expert (f32 device): swiglu upload: {error}"))?;
+    gemv(
+        workspace.swiglu_f32,
+        operands.w2,
+        operands.s2,
+        workspace.out_f32,
+        dim,
+        inter,
+    )
+    .map_err(|error| format!("shared expert (f32 device): down launch: {error}"))?;
+    let mut out_bytes = vec![0u8; dim * 4];
+    cuda.copy_dtoh(&mut out_bytes, &workspace.out_f32)
+        .map_err(|error| format!("shared expert (f32 device): readback: {error}"))?;
+    let row = f32_from_le_bytes(&out_bytes)
+        .map_err(|error| format!("shared expert (f32 device): output decode: {error}"))?;
+    if row.iter().any(|value| !value.is_finite()) {
+        return Err("shared expert (f32 device): the f32 row is not finite".to_string());
+    }
+    // No bf16 round: the f32 store is the reference row.
+    out.copy_from_slice(&row);
+    Ok(())
+}
 /// Runs the layer-0 FFN epilogue from the live arena: read the released shared-expert bytes, add the
 /// dense shared expert on top of the routed delta with the engine seam, then run the ffn hc_post.
 ///
@@ -5552,31 +5772,58 @@ fn run_layer_ffn_epilogue(
     let source = &shared.source;
     let mut scratch = moe::MoeScratch::for_config(config);
     let limit = 1usize << 40;
-    // WS-D: name the kernels and the accumulation mode the shared row came from, so the row's
-    // identity evidence says which arithmetic produced it (the host seam, or the resident GEMV
-    // launches in their fused mode).
-    let (shared_arith, shared_kernel) = if shared_device.is_some() {
+    // WS-D: name the kernels, the per-launch symbols and the accumulation mode the shared row came
+    // from, so the row's identity evidence says which arithmetic produced it and whether the arm
+    // stores bf16 or f32.
+    //
+    // The plan always carries one shared expert (ModelConfig: n_shared_experts == 1), so a missing
+    // device staging is a REFUSAL, never a fallback: the host f32 seam is what this device arm
+    // replaces, and silently running it again is the regression the row exists to remove.
+    let Some(device) = shared_device else {
+        return Err(format!(
+            "FFN epilogue: layer {layer} has a shared expert in the plan but no resident device shared expert; refusing the host arithmetic fallback"
+        ));
+    };
+    let (shared_arith, shared_kernel, shared_mode, launch_symbols): (
+        &'static str,
+        &'static str,
+        &'static str,
+        Vec<&'static str>,
+    ) = if request.native_rounding.shared {
         (
             "native_fp8_block32_bf16_resident",
             "b12x_mxfp8_gemv_m1_sm121+swiglu_mxfp8_quant_sm121",
+            sparkflash_kernels::mxfp8_gemv_launch::Mode::Fused.arithmetic_mode(),
+            vec![
+                sparkflash_kernels::mxfp8_gemv_launch::KERNEL,
+                sparkflash_kernels::mxfp8_gemv_launch::KERNEL,
+                "swiglu_mxfp8_quant_sm121",
+                sparkflash_kernels::mxfp8_gemv_launch::KERNEL,
+            ],
         )
-    } else if request.native_rounding.shared {
-        ("native_fp8_block32_bf16", "")
     } else {
-        ("host_f32_reference", "")
+        // The f32-reference arm: the same arithmetic the host seam ran, on the device, with the
+        // f32 accumulator stored as f32. `arith` stays host_f32_reference because the row IS the
+        // host reference's row bit for bit; the arithmetic_mode records how the device produced it.
+        (
+            "host_f32_reference",
+            sparkflash_kernels::mxfp8_gemv_launch::KERNEL_NONFUSED_F32_ACTIVATION_F32_OUT,
+            sparkflash_kernels::mxfp8_gemv_launch::Mode::NonFusedF32ActivationF32Stores
+                .arithmetic_mode(),
+            vec![
+                sparkflash_kernels::mxfp8_gemv_launch::KERNEL_NONFUSED_F32_ACTIVATION_F32_OUT,
+                sparkflash_kernels::mxfp8_gemv_launch::KERNEL_NONFUSED_F32_ACTIVATION_F32_OUT,
+                sparkflash_kernels::mxfp8_gemv_launch::KERNEL_NONFUSED_F32_ACTIVATION_F32_OUT,
+            ],
+        )
     };
-    let shared_mode: &'static str = if shared_device.is_some() {
-        sparkflash_kernels::mxfp8_gemv_launch::Mode::Fused.arithmetic_mode()
-    } else {
-        "host-f32-reference"
-    };
-    // The shared expert runs on the same pre-FFN row the device launched. The released arm
+    // The shared expert runs on the same pre-FFN row the device launched. The coded native arm
     // produces a BF16 row (the addend of the f32 MoE sum, model.py:893-904); the default arm keeps
     // the f32 reference row. It is computed once into its own row so the evidence can hash it in
     // either arm without a second shared-expert pass.
     let timer = BlockTimer::start(request.forward_perf.probe);
     let mut shared_only = vec![0.0f32; dim];
-    if let Some(device) = shared_device {
+    if request.native_rounding.shared {
         run_shared_expert_device(
             cuda,
             request,
@@ -5585,28 +5832,15 @@ fn run_layer_ffn_epilogue(
             device,
             &mut shared_only,
         )?;
-    } else if request.native_rounding.shared {
-        moe::add_shared_expert_native(
-            config,
-            &format!("layers.{layer}"),
-            &seams.pre_ffn_hidden,
-            source,
-            limit,
-            &mut scratch,
-            &mut shared_only,
-        )
-        .map_err(|error| format!("FFN epilogue: native shared expert: {error}"))?;
     } else {
-        moe::shared_expert_rows(
-            config,
-            &format!("layers.{layer}"),
+        run_shared_expert_f32_device(
+            cuda,
+            request,
+            layer,
             &seams.pre_ffn_hidden,
-            source,
-            limit,
-            &mut scratch,
+            device,
             &mut shared_only,
-        )
-        .map_err(|error| format!("FFN epilogue: shared expert: {error}"))?;
+        )?;
     }
     let shared_sha256 = evidence_sha256(&f32_le_bytes(&shared_only));
     let shared_l2 = shared_only
@@ -5733,6 +5967,7 @@ fn run_layer_ffn_epilogue(
         shared_arith,
         shared_kernel,
         shared_mode,
+        launch_symbols,
         shared_sha256,
         shared_l2,
         shared_f32_sha256,
@@ -7931,9 +8166,15 @@ fn run_forward_loop(
     }
     // WS-D: the same full-width bytes stay on the device from here on. The B12x repack of w1/w3/w2
     // and their scale grids is warmup work inside shared_prewarm, so it is outside the step timer;
-    // from the first position on, the shared expert is four launches on resident operands instead
-    // of seven host reads, a host decode and three host matrix products per position.
-    let shared_device = if request.native_rounding.shared {
+    // from the first position on, the shared expert's three matrix products run on resident
+    // operands instead of seven host reads, a host decode and three host matrix products per
+    // position.
+    //
+    // The staging is UNCONDITIONAL on the cuda path whenever the plan carries a shared expert: the
+    // arm (coded native vs f32 reference) is selected per token by --native-rounding. A missing
+    // --kernel-cubin-dir or a cubin that does not match the baseline is a hard error here, never a
+    // fallback to the host f32 seam.
+    let shared_device = if config.n_shared_experts >= 1 {
         Some(build_shared_expert_device(&cuda, request, &shared_gathers)?)
     } else {
         None
@@ -8478,6 +8719,8 @@ fn run_forward_loop(
                                 "shared_arith": ffn_epilogue.shared_arith,
                                 "shared_kernel": ffn_epilogue.shared_kernel,
                                 "shared_arithmetic_mode": ffn_epilogue.shared_mode,
+                                "shared_launch_symbols": ffn_epilogue.launch_symbols,
+                                "shared_launch_count": ffn_epilogue.launch_symbols.len(),
                                 "shared_sha256": ffn_epilogue.shared_sha256,
                                 "shared_l2": ffn_epilogue.shared_l2,
                                 "shared_f32_sha256": ffn_epilogue.shared_f32_sha256,

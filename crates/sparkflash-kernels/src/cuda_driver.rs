@@ -2460,10 +2460,11 @@ impl Cuda {
 
     /// Loads one instantiation of the decode GEMV by name.
     ///
-    /// The kernel file emits one templated body as three symbols - the dense projections
-    /// (`b12x_mxfp8_gemv_m1_sm121`), the shared expert (`b12x_mxfp8_gemv_m1_nf_sm121`) and the
-    /// compressor seam (`b12x_mxfp8_gemv_m1_nf_f32a_sm121`) - all in the same cubin, so the mode
-    /// is a symbol lookup rather than a second module.
+    /// The kernel file emits one templated body as four symbols - the dense projections
+    /// (`b12x_mxfp8_gemv_m1_sm121`), the shared expert's coded arm (`b12x_mxfp8_gemv_m1_nf_sm121`),
+    /// the compressor seam (`b12x_mxfp8_gemv_m1_nf_f32a_sm121`) and the shared expert's
+    /// f32-reference arm (`b12x_mxfp8_gemv_m1_f32a_f32o_sm121`) - all in the same cubin, so the
+    /// mode is a symbol lookup rather than a second module.
     pub fn load_dense_gemv_mode(
         &self,
         cubin: &[u8],

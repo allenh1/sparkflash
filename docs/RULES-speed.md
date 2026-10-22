@@ -12,14 +12,17 @@ number did not move. If a rule here conflicts with an older document's process, 
 * Every merge request states its **expected effect on ms/step before work starts**. A change with no
   expected effect on the metric is not speed work.
 
-Current: **350.39 ms** (wsd4-lean, 2026-10-21, ws-d-gemv tip 4f83eee5). Path: 1201.81 (start) ->
+Current: **256.17 ms** (wsd5-lean, 2026-10-22, ws-d-gemv tip d6020787). Path: 1201.81 (start) ->
 599.94 (WS-A2 batch, 4e4cea50) -> 469.81 (M=1 dense re-tile, 0d8797db) -> 356.39 (decode GEMV for
-wq_a/wkv/wq_b/wo_b, 528b39fb). Rows and dates live in [speed-log.csv](build/speed-log.csv); that
+wq_a/wkv/wq_b/wo_b, 528b39fb) -> 350.39 (shared-expert wiring, 4f83eee5; partial - the device arm
+was gated off, see 2f) -> 256.17 (shared expert's f32 reference arm on the device, d6020787,
+bit-identical: 3 GEMV launches/layer at 171.1 GB/s kernel-side = 62.7 % of peak, host block
+0.277 ms/layer against 2.623). Rows and dates live in [speed-log.csv](build/speed-log.csv); that
 table is the record, not a document.
 
 ## 2. Milestone gates are the only progress
 
-**<= 400 ms -> <= 150 -> <= 50 -> <= 20 -> <= 11.1**. The 400 gate is cleared (356.39). Anything else (a doc, a record, an unwired
+**<= 400 ms -> <= 150 -> <= 50 -> <= 20 -> <= 11.1**. The 400 gate is cleared (256.17); next gate is 150. Anything else (a doc, a record, an unwired
 kernel, a re-run that confirms the same number) is not progress.
 
 ## 2b. Batch windows; one row must answer a gate decision

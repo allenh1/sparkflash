@@ -12,9 +12,9 @@
 //! tiling decides which thread owns an output, never the order of its sum. There is no split-K and
 //! no reassociation, so bit identity is by construction and the identity gate keeps its meaning.
 //!
-//! THREE ENTRY POINTS, ONE BODY. The kernel file instantiates one templated body three times, and
-//! the three differ only in the two operations the seam they serve is pinned to - never in the
-//! tiling, the prefetch schedule or which thread owns an output:
+//! FOUR ENTRY POINTS, ONE BODY. The kernel file instantiates one templated body four times, and the
+//! four differ only in the operations the seam they serve is pinned to - never in the tiling, the
+//! prefetch schedule or which thread owns an output:
 //!
 //! * [Mode::Fused] / [KERNEL] - the dense projections. One contracted fma per element.
 //! * [Mode::NonFused] / [KERNEL_NONFUSED] - the engine's coded-matmul twin, the arithmetic a
@@ -33,10 +33,16 @@
 //!   row unchanged in shared memory and keeps the weights F8 coded on the device, decoding them
 //!   in-kernel with the same table arithmetic the host's one-time decode used, so the value is
 //!   identical and the traffic stays at the coded bytes.
+//! * [Mode::NonFusedF32ActivationF32Stores] / [KERNEL_NONFUSED_F32_ACTIVATION_F32_OUT] - the
+//!   shared expert's f32-reference arm on the device. Same f32-activation staging as the compressor
+//!   mode, but the output is the f32 accumulator itself rather than its bf16 rounding: the host row
+//!   it replaces (shared_expert_rows -> expert_body) keeps the f32 row end to end, with no
+//!   activation quantisation and no bf16 boundary rounding, so a bf16 store would move the values.
 //!
-//! The activation pointer of [Mode::NonFusedF32Activation] arrives in the a_fp8 word as
-//! const float* and a_scales is unused; the word count and the declaration shape are the same
-//! eleven words in all three modes, so one parameter builder fills every launch.
+//! The activation pointer of the f32-activation modes arrives in the a_fp8 word as const float* and
+//! a_scales is unused; in the f32-store mode the out word is a float* holding four bytes per output
+//! column. The word count and the declaration shape are the same eleven words in all four modes, so
+//! one parameter builder fills every launch.
 //!
 //! This module is an addition, in the form of the standing new-symbol rule
 //! (`routed_gate_up_swiglu_splitk_abi`): the pinned kernel's source, cubin bytes, digest and
@@ -68,6 +74,10 @@ pub const KERNEL_NONFUSED: &str = "b12x_mxfp8_gemv_m1_nf_sm121";
 /// The compressor instantiation: rounded multiply then rounded add, f32 activation row.
 pub const KERNEL_NONFUSED_F32_ACTIVATION: &str = "b12x_mxfp8_gemv_m1_nf_f32a_sm121";
 
+/// The shared expert's f32-reference instantiation: f32 activation row and f32 accumulators stored
+/// as f32 (no quantisation, no bf16 output rounding).
+pub const KERNEL_NONFUSED_F32_ACTIVATION_F32_OUT: &str = "b12x_mxfp8_gemv_m1_f32a_f32o_sm121";
+
 /// Which instantiation of the one body a launch runs.
 ///
 /// The mode is a compile-time parameter in the kernel file, so this value only selects the symbol
@@ -80,13 +90,20 @@ pub enum Mode {
     NonFused,
     /// The compressor seam: a rounded multiply then a rounded add, f32 activation row.
     NonFusedF32Activation,
+    /// The shared expert's f32 reference: f32 activation row and f32 accumulators stored as f32.
+    NonFusedF32ActivationF32Stores,
 }
 
 impl Mode {
     /// Every mode, in the order the file declares its entry points.
     #[must_use]
-    pub fn all() -> [Self; 3] {
-        [Self::Fused, Self::NonFused, Self::NonFusedF32Activation]
+    pub fn all() -> [Self; 4] {
+        [
+            Self::Fused,
+            Self::NonFused,
+            Self::NonFusedF32Activation,
+            Self::NonFusedF32ActivationF32Stores,
+        ]
     }
 
     /// The symbol this mode loads.
@@ -96,6 +113,7 @@ impl Mode {
             Self::Fused => KERNEL,
             Self::NonFused => KERNEL_NONFUSED,
             Self::NonFusedF32Activation => KERNEL_NONFUSED_F32_ACTIVATION,
+            Self::NonFusedF32ActivationF32Stores => KERNEL_NONFUSED_F32_ACTIVATION_F32_OUT,
         }
     }
 
@@ -106,6 +124,9 @@ impl Mode {
             Self::Fused => "fused-multiply-add",
             Self::NonFused => "rounded-multiply-then-rounded-add",
             Self::NonFusedF32Activation => "rounded-multiply-then-rounded-add-f32-activation",
+            Self::NonFusedF32ActivationF32Stores => {
+                "rounded-multiply-then-rounded-add-f32-activation-f32-stores"
+            }
         }
     }
 }
@@ -188,9 +209,9 @@ pub const MAX_INNER: u32 = 5120;
 
 /// The compiled artifact's byte count, as nvcc V13.0.88 (CUDA 13.0.3) compiles
 /// `kernels/b12x_mxfp8_gemv_m1_sm121.cu` for sm_121a with the baseline's flags.
-pub const CUBIN_BYTES: usize = 84512;
+pub const CUBIN_BYTES: usize = 112512;
 /// The compiled artifact's SHA-256, from the same build as [CUBIN_BYTES].
-pub const CUBIN_SHA256: &str = "b1c7737f727c41fecf90b10ecacb908624c86bf64491d9b2ce939c016f08ba3c";
+pub const CUBIN_SHA256: &str = "c33cd129f0003e1a4778bdced1fe788bf1f4a1be84fe8033c7989bc8d4bab469";
 
 /// The kernel id a caller would use if it resolved the symbol through the shared driver's enum.
 ///
@@ -361,17 +382,58 @@ mod tests {
             symbols.push(mode.symbol());
             modes.push(mode.arithmetic_mode());
         }
-        // Three distinct symbols, three distinct arithmetic names: the evidence record is only
+        // Four distinct symbols, four distinct arithmetic names: the evidence record is only
         // meaningful if a reader can tell which accumulate a launch ran.
         symbols.sort_unstable();
         symbols.dedup();
-        assert_eq!(symbols.len(), 3, "one symbol per mode");
+        assert_eq!(symbols.len(), 4, "one symbol per mode");
         modes.sort_unstable();
         modes.dedup();
-        assert_eq!(modes.len(), 3, "one arithmetic name per mode");
+        assert_eq!(modes.len(), 4, "one arithmetic name per mode");
         // The fused mode is the dense ABI pin: declaration_matches is KERNEL's name plus PARAMS.
         assert!(declaration_matches(&declaration_of(Mode::Fused)));
         assert!(!declaration_matches(&declaration_of(Mode::NonFused)));
+    }
+
+    // The cubin pin is one manifest entry for one file, and that file must declare exactly the
+    // four entry points the modes name: a fifth symbol would be a kernel the baseline does not
+    // pin, and a missing one would make a mode load a symbol the cubin does not carry.
+    #[test]
+    fn the_one_kernel_file_declares_exactly_the_four_mode_symbols() {
+        let mut declared = Vec::new();
+        let mut rest = SOURCE;
+        while let Some(found) = rest.find("extern \"C\" __global__ void ") {
+            rest = &rest[found + "extern \"C\" __global__ void ".len()..];
+            let end = rest
+                .find('(')
+                .expect("a kernel declaration opens its parameter list");
+            declared.push(rest[..end].trim().to_owned());
+        }
+        declared.sort_unstable();
+        let mut expected: Vec<String> = Mode::all()
+            .iter()
+            .map(|mode| mode.symbol().to_owned())
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(
+            declared, expected,
+            "the one GEMV file declares exactly the four modes"
+        );
+        // And the f32-store mode is exactly the f32-activation staging plus the f32 store: its
+        // arithmetic name must carry both, so evidence can tell it from the bf16-store f32a mode.
+        assert_eq!(
+            Mode::NonFusedF32ActivationF32Stores.symbol(),
+            KERNEL_NONFUSED_F32_ACTIVATION_F32_OUT
+        );
+        assert!(
+            Mode::NonFusedF32ActivationF32Stores
+                .arithmetic_mode()
+                .contains("f32-stores")
+        );
+        assert_ne!(
+            Mode::NonFusedF32ActivationF32Stores.arithmetic_mode(),
+            Mode::NonFusedF32Activation.arithmetic_mode()
+        );
     }
 
     #[test]

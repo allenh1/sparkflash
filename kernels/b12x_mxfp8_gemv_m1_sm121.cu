@@ -12,9 +12,9 @@
 // lane's 32 K-bytes for a K-block are contiguous and 32-byte aligned, so a warp reads the whole
 // tile with two 128-bit loads per lane (1024 coalesced bytes per K-block).
 //
-// ONE KERNEL BODY, THREE INSTANTIATIONS. The body is templated on two compile-time switches, so the
-// three entry points differ only in the two operations the seam they serve is pinned to, never in
-// the tiling, the prefetch schedule or the ownership of an output:
+// ONE KERNEL BODY, FOUR INSTANTIATIONS. The body is templated on three compile-time switches, so the
+// four entry points differ only in the operations the seam they serve is pinned to, never in the
+// tiling, the prefetch schedule or the ownership of an output:
 //
 //   b12x_mxfp8_gemv_m1_sm121        k_fused = true,  k_coded_activation = true
 //       The dense projections (wq_a, wkv, wq_b, wo_b). acc = fma(a_value, w_value, acc).
@@ -40,12 +40,22 @@
 //       and the traffic stays at the coded weight bytes rather than four times them. The activation
 //       pointer is passed in the a_fp8 word, reinterpreted as const float*, and a_scales is unused.
 //
+//   b12x_mxfp8_gemv_m1_f32a_f32o_sm121   k_fused = false, k_coded_activation = false, k_out_f32 = true
+//       The shared expert's f32-reference arm on the device. Its host reference is
+//       sparkflash-engine's shared_expert_rows -> expert_body -> WeightView::matmul (the coded
+//       matmul: rounded multiply then rounded add), then swiglu with clamps only, then the down
+//       projection, and it keeps the f32 accumulator as its row: no activation quantisation and no
+//       bf16 boundary rounding anywhere. This mode is therefore the f32-activation staging PLUS an
+//       f32 store - the accumulator itself, not __float2bfloat16_rn(acc) - so the row it writes is
+//       bit for bit the row the host reference returns, not a bf16 rounding of it.
+//
 // BIT IDENTITY. Lane j owns one output column and keeps the only accumulator for it, so the sum is
 // exactly the pinned contract: acc starts at 0, K ascends in 32-value MX blocks and ascends inside
 // each block, each element is one accumulate of a_value * w_value with a_value = the activation
 // value for that K (decoded E4M3 x ue8m0 in the coded modes, the f32 row itself in the f32 mode) and
 // w_value = decode(w) * w_scale (one ue8m0 weight scale per 32x32 block, the same byte for the whole
-// warp), and the single __float2bfloat16_rn happens at the end. There is no split-K, no tree
+// warp), and the output is the accumulator either stored as f32 (k_out_f32) or rounded once with
+// __float2bfloat16_rn. There is no split-K, no tree
 // reduction and no reassociation here: this kernel changes WHICH THREAD owns an output, never the
 // order of its sum. The coded activation decode is done once per launch into shared memory in f32
 // (E4M3 codes are exactly representable in f16, so the cvt.e4m3x2 -> f16 -> f32 round trip is the
@@ -159,14 +169,16 @@ __device__ __forceinline__ void spark_m4_gemv_block(const uint4 w_lo, const uint
 
 // The body of every entry point. k_coded_activation picks how the 5120-wide (or narrower) operand
 // row reaches shared memory: decoded once from E4M3 codes and ue8m0 scales, or copied unchanged from
-// an f32 row for the seam whose host reference never quantises its activation.
-template <bool k_fused, bool k_coded_activation>
+// an f32 row for the seam whose host reference never quantises its activation. k_out_f32 picks what
+// the ~half million accumulators are written as: the bf16 rounding of the dense and coded-native
+// seams, or the f32 accumulator itself for the f32-reference arm whose host row never rounds.
+template <bool k_fused, bool k_coded_activation, bool k_out_f32>
 __device__ __forceinline__ void spark_m4_gemv_m1_body(
     const uint8_t *__restrict__ a_fp8,     // [rows][inner] E4M3 activations, row 0 only
     const uint8_t *__restrict__ a_scales,  // [rows][inner / 32] ue8m0, one per MX block
     const uint8_t *__restrict__ w_fp8,     // B12x tiled E4M3 weights
     const uint8_t *__restrict__ w_scales,  // B12x tiled ue8m0 weight scales
-    __nv_bfloat16 *__restrict__ out,       // [rows][cols] bf16 result
+    __nv_bfloat16 *__restrict__ out,       // [rows][cols], bf16, or f32 when k_out_f32
     const uint32_t rows,
     const uint32_t cols,
     const uint32_t inner,
@@ -269,13 +281,20 @@ __device__ __forceinline__ void spark_m4_gemv_m1_body(
                                          w_scale_code, acc);
         }
 
-        out[col] = __float2bfloat16_rn(acc);
+        if constexpr (k_out_f32) {
+            // The f32-store arm has no output rounding: the host reference it replaces keeps the
+            // f32 accumulator as the row it hands on, so storing anything narrower would move it.
+            reinterpret_cast<float *>(out)[col] = acc;
+        } else {
+            out[col] = __float2bfloat16_rn(acc);
+        }
     }
     __syncwarp(0xffffffffu);
 
     if (lane == 0u) {
-        // payload_meta: one bf16 per output element of this block's tile (M=1: one row x 32 cols).
-        const uint32_t meta = SPARK_M4_GEMV_OUTPUTS_PER_TILE * 2u;
+        // payload_meta: one output word per element of this block's tile (M=1: one row x 32 cols);
+        // the word is bf16 except in the f32-store mode, where it is the f32 accumulator.
+        const uint32_t meta = SPARK_M4_GEMV_OUTPUTS_PER_TILE * (k_out_f32 ? 4u : 2u);
         SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_DENSE_MXFP8, layer_id, meta, t_enter);
         (void)step_seq;
     }
@@ -289,8 +308,8 @@ extern "C" __global__ void b12x_mxfp8_gemv_m1_sm121(
     __nv_bfloat16 *__restrict__ out, const uint32_t rows, const uint32_t cols,
     const uint32_t inner, GpuTraceRing *__restrict__ trace_ring, const uint32_t layer_id,
     const uint64_t step_seq) {
-    spark_m4_gemv_m1_body<true, true>(a_fp8, a_scales, w_fp8, w_scales, out, rows, cols, inner,
-                                      trace_ring, layer_id, step_seq);
+    spark_m4_gemv_m1_body<true, true, false>(a_fp8, a_scales, w_fp8, w_scales, out, rows, cols,
+                                             inner, trace_ring, layer_id, step_seq);
 }
 
 // The shared expert: the engine's rounded-multiply-then-rounded-add twin, coded activation.
@@ -300,8 +319,8 @@ extern "C" __global__ void b12x_mxfp8_gemv_m1_nf_sm121(
     __nv_bfloat16 *__restrict__ out, const uint32_t rows, const uint32_t cols,
     const uint32_t inner, GpuTraceRing *__restrict__ trace_ring, const uint32_t layer_id,
     const uint64_t step_seq) {
-    spark_m4_gemv_m1_body<false, true>(a_fp8, a_scales, w_fp8, w_scales, out, rows, cols, inner,
-                                       trace_ring, layer_id, step_seq);
+    spark_m4_gemv_m1_body<false, true, false>(a_fp8, a_scales, w_fp8, w_scales, out, rows, cols,
+                                              inner, trace_ring, layer_id, step_seq);
 }
 
 // The compressor seam: the engine's rounded-multiply-then-rounded-add twin, f32 activation row.
@@ -311,6 +330,19 @@ extern "C" __global__ void b12x_mxfp8_gemv_m1_nf_f32a_sm121(
     __nv_bfloat16 *__restrict__ out, const uint32_t rows, const uint32_t cols,
     const uint32_t inner, GpuTraceRing *__restrict__ trace_ring, const uint32_t layer_id,
     const uint64_t step_seq) {
-    spark_m4_gemv_m1_body<false, false>(a_fp8, a_scales, w_fp8, w_scales, out, rows, cols, inner,
-                                        trace_ring, layer_id, step_seq);
+    spark_m4_gemv_m1_body<false, false, false>(a_fp8, a_scales, w_fp8, w_scales, out, rows, cols,
+                                               inner, trace_ring, layer_id, step_seq);
+}
+
+// The shared expert's f32-reference arm: f32 activation staging and the f32 accumulator stored as
+// f32. Its host twin keeps the row at f32 end to end (no quantise, no bf16 rounding), so this is the
+// only instantiation that must not round its output.
+extern "C" __global__ void b12x_mxfp8_gemv_m1_f32a_f32o_sm121(
+    const uint8_t *__restrict__ a_fp8, const uint8_t *__restrict__ a_scales,
+    const uint8_t *__restrict__ w_fp8, const uint8_t *__restrict__ w_scales,
+    __nv_bfloat16 *__restrict__ out, const uint32_t rows, const uint32_t cols,
+    const uint32_t inner, GpuTraceRing *__restrict__ trace_ring, const uint32_t layer_id,
+    const uint64_t step_seq) {
+    spark_m4_gemv_m1_body<false, false, true>(a_fp8, a_scales, w_fp8, w_scales, out, rows, cols,
+                                              inner, trace_ring, layer_id, step_seq);
 }
