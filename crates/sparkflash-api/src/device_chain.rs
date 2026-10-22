@@ -1756,6 +1756,53 @@ pub mod fixtures {
             .expect("synthetic record write");
     }
 
+    /// Writes a claimed fixture window recorded for an arbitrary prompt.
+    ///
+    /// The stock [`write_envelope`] records the synthetic 130-id prompt. A chat request's prompt is
+    /// whatever the released template renders and the checkpoint tokenizer produces, so the
+    /// exact-prompt rule needs a window whose metadata describes *that* prompt. Every derived field
+    /// is recomputed (prompt length, first step position, forwarded rows, batch positions, and the
+    /// rank-0 logits dump's positions), so the result passes the same consistency checks a
+    /// device-written window passes — it is still a paper record, UNMEASURED.
+    pub fn write_envelope_for_prompt(dir: &Path, prompt: &[u32]) {
+        assert!(
+            !prompt.is_empty(),
+            "a window needs at least one prompt token"
+        );
+        write_envelope(dir, true);
+        let prompt_len = u32::try_from(prompt.len()).expect("prompt fits in u32");
+        let first_step_position = prompt_len - 1;
+        let positions: Vec<u32> =
+            (first_step_position..first_step_position + DECODE_POSITIONS).collect();
+        // The full run feeds prompt_len + decode_positions - 1 teacher-forced rows: the prompt,
+        // then the prompt's last token (the record's prompt_token), then the first eight decoded
+        // ids. forward_ids[prompt_len - 1] is therefore the prompt_token, as the claim check
+        // requires.
+        let mut forward_ids: Vec<u32> = prompt[..prompt.len() - 1].to_vec();
+        forward_ids.push(20462);
+        forward_ids.extend_from_slice(&DECODE_IDS[..DECODE_POSITIONS as usize - 1]);
+        for rank in 0..FOUR_RANK_WORLD {
+            let embed = dir.join(format!("tp4-forward-embed-r{rank}.json"));
+            rewrite_value(&embed, |record| {
+                record["prompt_len"] = json!(prompt_len);
+                record["first_step_position"] = json!(first_step_position);
+                record["prompt_ids"] = json!(prompt);
+                record["prefill_tokens"] = json!(prompt_len);
+                record["forward_ids"] = json!(forward_ids);
+                record["tokens"]["positions"] = json!(positions);
+            });
+            let token = dir.join(format!("tp4-token-r{rank}.json"));
+            rewrite_value(&token, |record| {
+                record["tokens"]["start_position"] = json!(first_step_position);
+                record["tokens"]["prompt_len"] = json!(prompt_len);
+                record["tokens"]["positions"] = json!(positions);
+                if rank == 0 {
+                    record["logits_dump"]["positions"] = json!(positions);
+                }
+            });
+        }
+    }
+
     /// Moves a flat fixture envelope into the device window's rank{rank}/ layout.
     pub fn relocate_to_rank_directories(dir: &Path) {
         for rank in 0..FOUR_RANK_WORLD {

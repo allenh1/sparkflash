@@ -82,8 +82,76 @@ The command it prints for rank R is exactly:
 Environment knobs (all also documented in the script header): `SPARKFLASH_BIN`,
 `SPARKFLASH_HTTP_BIND`, `SPARKFLASH_TP4_BASE_PORT`, `SPARKFLASH_TP4_CONTROL_PORT`,
 `SPARKFLASH_LOG_ROOT`, `SPARKFLASH_RUN_ID`, `SPARKFLASH_DRAIN_DELAY_MS`,
-`SPARKFLASH_DRAIN_TIMEOUT_MS`, `SSH_USER`, `SSH_OPTS`. Rank 0 exports the drain knobs to its
-process; every rank gets the same environment so the command builder has one path.
+`SPARKFLASH_DRAIN_TIMEOUT_MS`, `SPARKFLASH_DEVICE_TOKEN_DIR`, `SPARKFLASH_DEVICE_TOKEN_LIVE`,
+`SPARKFLASH_DEVICE_TOKEN_DERIVED_CLAIM`, `SSH_USER`, `SSH_OPTS`. Rank 0 exports the drain knobs to
+its process; every rank gets the same environment so the command builder has one path. The device
+token window flags are rank-0 only (workers never detokenize).
+
+### 2.1 Serving a device token window
+
+A claimed four-rank window can be served instead of the host twin. The window must record the exact
+prompt it answered, and since W4 chat carries the rendered prompt's ids, so a chat request can be
+served from it too:
+
+    export SPARKFLASH_DEVICE_TOKEN_DIR=/var/lib/spark/windows     # one window, or a parent
+    export SPARKFLASH_DEVICE_TOKEN_LIVE=1                         # follow it as a live directory
+    scripts/serve-four-node.sh launch
+
+- Without `--device-token-live` the directory must already hold one complete claimed window; it is
+  loaded once at startup and the claim state is printed.
+- With it, the directory is a parent: the newest subdirectory holding a complete four-rank token
+  pair is served, re-read when the rank-0 token file or `run.meta` run id changes, and every other
+  request (different prompt, no window yet, refused claim) falls back to the host twin.
+- `SPARKFLASH_DEVICE_TOKEN_DERIVED_CLAIM=1` selects the derived claim form (S7 rehearsal) for a
+  window whose writer did not assert `token_claimed`.
+
+A claimed response carries `x-sparkflash-token-source: <source> (UNMEASURED)` and
+`x-sparkflash-token-claim: explicit|derived`. The source name distinguishes the one-shot envelope
+(`device-chain-envelope`) from the live follower (`device-chain-live-window`).
+
+#### Producing the window
+
+The window is written by the device arm, not by `serve`. One `tp4-smoke` run per rank, all four
+into the same evidence directory:
+
+    for R in 0 1 2 3; do
+      sparkflash device-chain --run-stage tp4-smoke \
+        --checkpoint "$SPARKFLASH_CHECKPOINT" \
+        --tp-rank "$R" --tp-world-size 4 \
+        --comm-backend tcp --comm-peers "$PEERS" --comm-port 29601 \
+        --evidence-dir "$WINDOW/rank$R"
+    done
+
+That writes `tp4-forward-embed-r{R}.json` and `tp4-token-r{R}.json` per rank, which is exactly the
+pair `DeviceChainEnvelope::load` reads (flat, or under `rank{R}/`, both accepted). Then:
+
+    export SPARKFLASH_DEVICE_TOKEN_DIR="$WINDOW"   # or its parent, with _LIVE=1
+    scripts/serve-four-node.sh launch
+
+**The exact-prompt rule is the whole contract.** A window answers one prompt. For `/v1/completions`
+that prompt is the `int[]` you send; for `/v1/chat/completions` it is the *rendered* chat prompt
+(template + tokenizer), so the window must have been recorded for the same message list and the same
+template settings. Anything else falls back to the host twin, which is correct behaviour and not a
+failure. A window whose claim is refused (no `token_claimed`, failed reference matches) serves
+nothing until the device arm writes one that claims.
+
+### 2.2 Boot output
+
+Startup prints the reference server's resolved-decision lines plus a shard-loading progress bar:
+
+    (APIServer pid=273) INFO 10-22 14:53:36 [serve.rs:5021] Resolved architecture: DeepseekV41ForCausalLM
+    (APIServer pid=273) INFO 10-22 14:53:36 [serve.rs:5024] Using max model len 1048576
+    (APIServer pid=273) INFO 10-22 14:53:36 [serve.rs:5028] Prefill mode: token-loop (...)
+    (APIServer pid=273) INFO 10-22 14:53:52 [tp4_host.rs:970] Resolved architecture: DeepseekV41ForCausalLM
+    Loading checkpoint tensors:  62% Completed | 496/800 [00:22<00:14,  1.24it/s]
+    (APIServer pid=273) INFO 10-22 14:56:10 [serve.rs:5250] Starting server on http://0.0.0.0:8000
+    (APIServer pid=273) INFO 10-22 14:56:10 [serve.rs:5254] Application startup complete.
+
+`[file:line]` names the branch that decided the value, so a reader can jump to it. Nothing in these
+lines is a measurement. `SPARKFLASH_BOOT_LOG=0` (or `off`/`quiet`) silences them; `progress`
+keeps only the bar. The bar is rewritten in place on a terminal and printed one line per 10% into a
+redirected log.
+
 
 Contracts this skeleton fixes without running it:
 

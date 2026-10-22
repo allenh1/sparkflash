@@ -149,6 +149,19 @@ impl PrefillMode {
         }
     }
 
+    /// The operator-facing name of this mode, for a boot line or a metrics label.
+    ///
+    /// Deliberately distinct from [`Self::from_env_value`], which accepts several spellings: the
+    /// label is the canonical one, so a log line and an env var cannot disagree about which mode
+    /// actually ran.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Batched => "chunked",
+            Self::TokenLoop => "token-loop",
+        }
+    }
+
     /// Chunk size this mode forwards a prompt in, given the configured batched chunk size.
     #[must_use]
     pub const fn chunk_tokens(self, configured: usize) -> usize {

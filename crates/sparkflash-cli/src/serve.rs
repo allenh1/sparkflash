@@ -111,7 +111,9 @@ use futures::stream::{self, BoxStream};
 #[cfg(feature = "tp4-serve")]
 use serde::{Deserialize, Serialize};
 use sparkflash_api::device_chain::{ClaimMode, DeviceChainEnvelope};
-use sparkflash_api::device_token::{DeviceChainTokenSource, DeviceTokenSource, TokenPieceDecoder};
+use sparkflash_api::device_token::{
+    DeviceChainTokenSource, DeviceTokenSource, LiveWindowTokenSource, TokenPieceDecoder,
+};
 use sparkflash_api::encoding::{
     HfTokenizerEncoder, TokenizerSeam, load_hf_tokenizer, resolve_reference_tokenizer,
 };
@@ -243,6 +245,18 @@ pub enum DeviceSelection {
     FakeSession,
     /// The M2 real session: open the driver and run one pinned router launch from this cubin.
     CudaSession(PathBuf),
+}
+
+impl DeviceSelection {
+    /// The operator-facing name of this selection, for a boot line.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Reference => "--engine reference (CPU host twin)",
+            Self::FakeSession => "--engine device (M1 fake session)",
+            Self::CudaSession(_) => "--engine device (M2 cubin session)",
+        }
+    }
 }
 
 /// Decides which engine to construct, purely, so the selection rules are testable on a CPU host.
@@ -592,6 +606,9 @@ pub struct ServeOptions {
     pub device_token_dir: Option<PathBuf>,
     /// Whether a window without the writer's token_claimed assertion may be served (S7 rehearsal).
     pub device_token_derived_claim: bool,
+    /// Whether `--device-token-dir` is a *live* directory to follow (W5) rather than one fixed
+    /// window to load once.
+    pub device_token_live: bool,
 }
 
 impl ServeOptions {
@@ -744,6 +761,7 @@ impl ServeOptions {
                 cors,
                 device_token_dir: cli.device_token_dir,
                 device_token_derived_claim: cli.device_token_derived_claim,
+                device_token_live: cli.device_token_live,
             }),
         }
     }
@@ -875,6 +893,16 @@ struct ServeArgs {
     /// silently serving.
     #[arg(long, value_name = "DIR")]
     device_token_dir: Option<PathBuf>,
+    /// Follow --device-token-dir as a live window directory instead of loading one fixed window.
+    ///
+    /// With this flag the directory is a *parent* to watch: the source picks the newest completed
+    /// `tp4-token-r*.json` set under it, re-reads when the run id or the rank-0 token file changes,
+    /// and reloads only on that transition. A request is served only when its prompt ids match the
+    /// active window exactly, so a window that is still being written, or one recorded for a
+    /// different prompt, falls back to the host twin rather than answering with the wrong tokens.
+    /// Without the flag the directory must already hold one complete claimed window, as before.
+    #[arg(long, requires = "device_token_dir")]
+    device_token_live: bool,
     /// Accept a window whose writer did not assert token_claimed, deriving the claim from the
     /// complete four-rank loop evidence (consensus, per-position claimable, nine reference
     /// matches, fed forward_ids). This is the S7 rehearsal form; it is not the S8 acceptance form.
@@ -1432,13 +1460,26 @@ fn device_token_source(
             dir.display()
         ));
     }
-    let envelope = DeviceChainEnvelope::load(dir)
-        .map_err(|error| format!("--device-token-dir {}: {error}", dir.display()))?;
     let mode = if options.device_token_derived_claim {
         ClaimMode::Derived
     } else {
         ClaimMode::Asserted
     };
+    let decoder: Arc<dyn TokenPieceDecoder> = Arc::new(SeamPieceDecoder {
+        seam: Arc::clone(seam),
+    });
+    if options.device_token_live {
+        eprintln!(
+            "sparkflash serve: device token source {}: live window follower ({} claim), serving a request only when its prompt ids match the active window",
+            dir.display(),
+            mode.label()
+        );
+        return Ok(Some(Arc::new(
+            LiveWindowTokenSource::new(dir, decoder).with_claim_mode(mode),
+        )));
+    }
+    let envelope = DeviceChainEnvelope::load(dir)
+        .map_err(|error| format!("--device-token-dir {}: {error}", dir.display()))?;
     match envelope.claim_with(mode) {
         Ok(claimed) => eprintln!(
             "sparkflash serve: device token source {}: {} claim ok ({} tokens, prompt_len {}, dump {})",
@@ -1458,9 +1499,6 @@ fn device_token_source(
             mode.label()
         ),
     }
-    let decoder = Arc::new(SeamPieceDecoder {
-        seam: Arc::clone(seam),
-    });
     Ok(Some(Arc::new(
         DeviceChainTokenSource::new(dir, decoder).with_claim_mode(mode),
     )))
@@ -4804,6 +4842,7 @@ fn default_tokenizer() -> Result<PathBuf, String> {
 /// startup refusal from Tp4Driver::start before the HTTP socket exists.
 #[cfg(feature = "tp4-serve")]
 fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
+    crate::bootlog::init();
     if tp4.rank != 0 {
         return match tp4_worker(options, &tp4) {
             Ok(()) => ExitCode::SUCCESS,
@@ -4813,6 +4852,7 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
             }
         };
     }
+    let role = crate::bootlog::role_label(tp4.rank);
     let tokenizer = match options.tokenizer.clone() {
         Some(tokenizer) => tokenizer,
         None => match default_tokenizer() {
@@ -4823,6 +4863,11 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
             }
         },
     };
+    crate::bootlog::info(
+        &role,
+        "serve.rs:4820",
+        format!("Tokenizer: {}", tokenizer.display()),
+    );
     let recipe = match options.recipe(&tokenizer) {
         Ok(recipe) => recipe,
         Err(message) => {
@@ -4837,6 +4882,39 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
             return ExitCode::from(EXIT_REFUSED);
         }
     };
+    crate::bootlog::info(
+        &role,
+        "serve.rs:4833",
+        format!(
+            "Tensor parallel size {} (rank {} of {}), peers {}, collective base port {}, nccl backend tcp",
+            tp4.world_size,
+            tp4.rank,
+            tp4.world_size,
+            tp4.peers
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            tp4.base_port
+        ),
+    );
+    crate::bootlog::info(
+        &role,
+        "serve.rs:4840",
+        format!(
+            "Prefill mode: {} (host rank loop; the device forward is a separate arm)",
+            crate::tp4_host::shipped_prefill_mode().label()
+        ),
+    );
+    crate::bootlog::info(
+        &role,
+        "serve.rs:4846",
+        format!(
+            "Detokenization: rank 0 only; workers stream token ids over control {}",
+            tp4.control_port
+        ),
+    );
+    let load_started = std::time::Instant::now();
     let driver = match Tp4Driver::start(&recipe, rank_config, options.max_tokens) {
         Ok(driver) => driver,
         Err(message) => {
@@ -4844,6 +4922,14 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
             return ExitCode::from(EXIT_REFUSED);
         }
     };
+    crate::bootlog::info(
+        &role,
+        "serve.rs:4856",
+        format!(
+            "Loading weights took {:.2}s",
+            load_started.elapsed().as_secs_f64()
+        ),
+    );
     let seam = match load_tokenizer(&tokenizer) {
         Ok(loaded) => Arc::new(TokenizerSeam::new(loaded)),
         Err(message) => {
@@ -4948,6 +5034,40 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             return ExitCode::from(EXIT_REFUSED);
         }
     };
+
+    crate::bootlog::init();
+    let role = "APIServer";
+    crate::bootlog::info(
+        role,
+        "serve.rs:5018",
+        format!("Tokenizer: {}", tokenizer.display()),
+    );
+    crate::bootlog::info(
+        role,
+        "serve.rs:5021",
+        format!(
+            "Resolved architecture: DeepseekV41ForCausalLM (engine {})",
+            selection.label()
+        ),
+    );
+    crate::bootlog::info(
+        role,
+        "serve.rs:5024",
+        format!(
+            "Using max model len {}",
+            sparkflash_api::engine::max_seq_len()
+        ),
+    );
+    crate::bootlog::info(
+        role,
+        "serve.rs:5028",
+        format!(
+            "Prefill mode: {} (host rank loop; the device forward is a separate arm)",
+            crate::tp4_host::shipped_prefill_mode().label()
+        ),
+    );
+    crate::bootlog::info(role, "serve.rs:5033", "Loading model from scratch...");
+    let load_started = std::time::Instant::now();
     let driver = match ReferenceDriver::start(&recipe, options.element_limit, options.max_tokens) {
         Ok(driver) => driver,
         Err(message) => {
@@ -4955,6 +5075,16 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             return ExitCode::from(EXIT_REFUSED);
         }
     };
+    // The host path audits the checkpoint's headers and opens the shard index; the weight bytes
+    // themselves are read per layer on first use, so this is the open cost, not a full load.
+    crate::bootlog::info(
+        role,
+        "serve.rs:5040",
+        format!(
+            "Checkpoint opened in {:.2}s; weight bytes are read lazily per layer",
+            load_started.elapsed().as_secs_f64()
+        ),
+    );
     // The exporter the engine thread feeds; the router must serve this same registry or every
     // request-lifecycle family would report a second, empty one.
     let metrics = driver.metrics();
@@ -5174,6 +5304,16 @@ async fn bind_and_serve(router: axum::Router, state: AppState, requested: Socket
         epoch_millis()
     );
     println!("sparkflash serve: listening on http://{bound}");
+    crate::bootlog::info(
+        "APIServer",
+        "serve.rs:5250",
+        format!("Starting server on http://{bound}"),
+    );
+    crate::bootlog::info(
+        "APIServer",
+        "serve.rs:5254",
+        "Application startup complete.",
+    );
     // Graceful drain: the first SIGTERM/SIGINT starts the drain, /readyz turns 503 immediately so a
     // load balancer or readiness probe stops sending new work, and the listener stops accepting
     // after the configured pre-stop delay. Requests already accepted are allowed to finish until
@@ -9828,6 +9968,32 @@ mod device_token_serve_tests {
         let plain = ServeOptions::parse(vec!["--synthetic".to_owned()]).expect("parses");
         assert_eq!(plain.device_token_dir, None);
         assert!(!plain.device_token_derived_claim);
+        assert!(!plain.device_token_live);
+    }
+
+    #[test]
+    fn the_live_follower_needs_a_window_directory() {
+        let error = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--device-token-live".to_owned(),
+        ])
+        .expect_err("--device-token-live alone has nothing to follow");
+        assert!(
+            error.contains("--device-token-dir"),
+            "the message names the missing flag: {error}"
+        );
+        let options = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--device-token-dir".to_owned(),
+            "/tmp/sparkflash-windows".to_owned(),
+            "--device-token-live".to_owned(),
+        ])
+        .expect("the live follower parses with a directory");
+        assert!(options.device_token_live);
+        assert_eq!(
+            options.device_token_dir,
+            Some(std::path::PathBuf::from("/tmp/sparkflash-windows"))
+        );
     }
 
     #[test]

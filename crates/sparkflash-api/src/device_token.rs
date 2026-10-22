@@ -80,6 +80,12 @@ pub struct DeviceTokenStream {
     pub logits_dump_present: bool,
     /// How the claim was established (an explicit device assertion or the derived loop evidence).
     pub claim_mode: ClaimMode,
+    /// The identity of the source that produced this claim (`source_name` of the source).
+    ///
+    /// Carried on the stream rather than read from the router's `AppState`, because the response
+    /// header names *which* device source answered: a live window follower and a one-shot envelope
+    /// are different provenances and an operator reading a capture needs to tell them apart.
+    pub source: &'static str,
     /// Human-readable provenance of the claimed record (directory, world, dump state).
     pub provenance: String,
 }
@@ -270,6 +276,7 @@ impl DeviceTokenSource for DeviceChainTokenSource {
             decode_positions,
             logits_dump_present: dump_present,
             claim_mode: self.claim_mode,
+            source: self.source_name(),
             provenance: format!(
                 "{} (world {}, prompt_len {}, first_step_position {}, claim {}, logits_dump {})",
                 self.dir.display(),
@@ -278,6 +285,254 @@ impl DeviceTokenSource for DeviceChainTokenSource {
                 claimed.metadata.first_step_position,
                 self.claim_mode.label(),
                 if dump_present { "present" } else { "absent" }
+            ),
+        }))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedWindowClaim {
+    dir: PathBuf,
+    mtime: Option<std::time::SystemTime>,
+    run_id: Option<String>,
+    envelope: ClaimedEnvelope,
+}
+
+/// A live window follower token source for serving device tokens as windows complete.
+///
+/// Implements W5 from `docs/build/serving-s7-s8-plan.md`: instead of requiring a fixed static
+/// directory, this source monitors an active window directory or parent directory, invalidates
+/// cache when the run ID or modification timestamp transitions, ensures all rank pairs are
+/// present, verifies the prompt, and serves claimed tokens.
+pub struct LiveWindowTokenSource {
+    dir: PathBuf,
+    decoder: Arc<dyn TokenPieceDecoder>,
+    claim_mode: ClaimMode,
+    cached: std::sync::Mutex<Option<CachedWindowClaim>>,
+}
+
+impl LiveWindowTokenSource {
+    /// Builds a live follower source over a window or parent directory.
+    #[must_use]
+    pub fn new(dir: impl Into<PathBuf>, decoder: Arc<dyn TokenPieceDecoder>) -> Self {
+        Self {
+            dir: dir.into(),
+            decoder,
+            claim_mode: ClaimMode::Asserted,
+            cached: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Selects the claim form this source accepts.
+    #[must_use]
+    pub fn with_claim_mode(mut self, claim_mode: ClaimMode) -> Self {
+        self.claim_mode = claim_mode;
+        self
+    }
+
+    /// The claim form this source accepts.
+    #[must_use]
+    pub fn claim_mode(&self) -> ClaimMode {
+        self.claim_mode
+    }
+
+    /// The directory this source monitors.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn resolve_active_window(&self) -> Result<PathBuf, String> {
+        if !self.dir.is_dir() {
+            return Err(format!(
+                "monitored path {} is not a directory",
+                self.dir.display()
+            ));
+        }
+        if self.dir.join("tp4-token-r0.json").is_file()
+            || self.dir.join("rank0").join("tp4-token-r0.json").is_file()
+        {
+            return Ok(self.dir.clone());
+        }
+        let entries = std::fs::read_dir(&self.dir)
+            .map_err(|error| format!("read dir {}: {error}", self.dir.display()))?;
+        let mut candidates = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir()
+                && (path.join("tp4-token-r0.json").is_file()
+                    || path.join("rank0").join("tp4-token-r0.json").is_file())
+            {
+                let mtime = entry.metadata().and_then(|m| m.modified()).ok();
+                candidates.push((path, mtime));
+            }
+        }
+        if candidates.is_empty() {
+            return Err(format!(
+                "no completed device token window found in {}",
+                self.dir.display()
+            ));
+        }
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+        Ok(candidates.remove(0).0)
+    }
+
+    fn read_run_id(dir: &Path) -> Option<String> {
+        let meta_path = dir.join("run.meta");
+        if let Ok(content) = std::fs::read_to_string(meta_path) {
+            for line in content.lines() {
+                if let Some(rest) = line.strip_prefix("run=") {
+                    return Some(rest.split_whitespace().next().unwrap_or(rest).to_owned());
+                }
+            }
+        }
+        None
+    }
+
+    fn window_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+        let token0 = if dir.join("tp4-token-r0.json").is_file() {
+            dir.join("tp4-token-r0.json")
+        } else {
+            dir.join("rank0").join("tp4-token-r0.json")
+        };
+        std::fs::metadata(token0).and_then(|m| m.modified()).ok()
+    }
+
+    fn decode(&self, claimed: &ClaimedEnvelope) -> Result<Vec<DeviceToken>, String> {
+        let ids: Vec<u32> = claimed.tokens.iter().map(|token| token.token_id).collect();
+        let mut tokens = Vec::with_capacity(ids.len());
+        for (index, token) in claimed.tokens.iter().enumerate() {
+            let piece = self
+                .decoder
+                .piece(&ids[..index], token.token_id)
+                .map_err(|error| format!("detokenizer failed at position {index}: {error}"))?;
+            tokens.push(DeviceToken {
+                position: token.position,
+                token_id: token.token_id,
+                text: piece,
+            });
+        }
+        Ok(tokens)
+    }
+
+    fn verify_prompt(
+        &self,
+        claimed: &ClaimedEnvelope,
+        request: &DeviceTokenRequest,
+    ) -> Result<(), String> {
+        let Some(requested) = request.prompt_token_ids.as_ref() else {
+            return Err(
+                "live device window requires explicit prompt token ids to verify alignment"
+                    .to_owned(),
+            );
+        };
+        if claimed.metadata.prompt_ids.is_empty() {
+            return Err(
+                "the envelope does not record prompt_ids, so the request prompt cannot be matched"
+                    .to_owned(),
+            );
+        }
+        if &claimed.metadata.prompt_ids != requested {
+            return Err(format!(
+                "the request prompt ({} ids) does not match the active window ({} ids)",
+                requested.len(),
+                claimed.metadata.prompt_ids.len()
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl DeviceTokenSource for LiveWindowTokenSource {
+    fn source_name(&self) -> &'static str {
+        "device-chain-live-window"
+    }
+
+    fn claim(&self, request: &DeviceTokenRequest) -> DeviceTokenClaim {
+        let active_dir = match self.resolve_active_window() {
+            Ok(dir) => dir,
+            Err(reason) => return DeviceTokenClaim::Fallback { reason },
+        };
+        let mtime = Self::window_mtime(&active_dir);
+        let run_id = Self::read_run_id(&active_dir);
+
+        let mut lock = self
+            .cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let needs_reload = match lock.as_ref() {
+            Some(cached) => {
+                cached.dir != active_dir || cached.mtime != mtime || cached.run_id != run_id
+            }
+            None => true,
+        };
+
+        if needs_reload {
+            let envelope = match DeviceChainEnvelope::load(&active_dir) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    return DeviceTokenClaim::Fallback {
+                        reason: format!(
+                            "live device envelope load failed in {}: {error}",
+                            active_dir.display()
+                        ),
+                    };
+                }
+            };
+            let claimed = match envelope.claim_with(self.claim_mode) {
+                Ok(claimed) => claimed,
+                Err(refusal) => {
+                    return DeviceTokenClaim::Fallback {
+                        reason: format!(
+                            "live device token not claimed in {}: {refusal}",
+                            active_dir.display()
+                        ),
+                    };
+                }
+            };
+            *lock = Some(CachedWindowClaim {
+                dir: active_dir,
+                mtime,
+                run_id,
+                envelope: claimed,
+            });
+        }
+
+        let cached = lock.as_ref().expect("cached claim is present");
+        let claimed = &cached.envelope;
+
+        if let Err(reason) = self.verify_prompt(claimed, request) {
+            return DeviceTokenClaim::Fallback { reason };
+        }
+
+        let mut tokens = match self.decode(claimed) {
+            Ok(tokens) => tokens,
+            Err(error) => return DeviceTokenClaim::Fallback { reason: error },
+        };
+
+        if let Some(limit) = request.max_tokens {
+            tokens.truncate(limit);
+        }
+
+        let decode_positions = claimed.metadata.decode_positions.max(DECODE_POSITIONS);
+        let dump_present = claimed.logits_dump.is_some();
+
+        DeviceTokenClaim::Claimed(Box::new(DeviceTokenStream {
+            tokens,
+            prompt_tokens: u64::from(claimed.metadata.prompt_len),
+            finish_reason: FinishReason::Length,
+            reference_ids: claimed.metadata.reference_ids.clone(),
+            decode_positions,
+            logits_dump_present: dump_present,
+            claim_mode: self.claim_mode,
+            source: self.source_name(),
+            provenance: format!(
+                "live-window: {} (prompt_len {}, first_step_position {}, claim {}, run_id {})",
+                cached.dir.display(),
+                claimed.metadata.prompt_len,
+                claimed.metadata.first_step_position,
+                self.claim_mode.label(),
+                cached.run_id.as_deref().unwrap_or("none")
             ),
         }))
     }
@@ -729,5 +984,55 @@ mod tests {
         let (_dir, source) = source(true, Arc::new(BracketedDecoder));
         assert_eq!(source.source_name(), "device-chain-envelope");
         assert!(source.dir().is_dir());
+    }
+
+    #[test]
+    fn live_window_token_source_serves_from_monitored_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sub = dir.path().join("m1y7");
+        std::fs::create_dir_all(&sub).expect("create sub");
+        write_envelope(&sub, true);
+        std::fs::write(sub.join("run.meta"), "run=m1y7 tag=test\n").expect("write run.meta");
+
+        let source = LiveWindowTokenSource::new(dir.path(), Arc::new(BracketedDecoder));
+        assert_eq!(source.source_name(), "device-chain-live-window");
+
+        let req = request(DeviceEndpoint::ChatCompletions, None);
+        match source.claim(&req) {
+            DeviceTokenClaim::Claimed(stream) => {
+                assert_eq!(stream.tokens.len(), 9);
+                assert!(stream.provenance.contains("run_id m1y7"));
+            }
+            DeviceTokenClaim::Fallback { reason } => {
+                panic!("expected claim, got fallback: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn live_window_token_source_invalidates_when_window_transitions() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sub1 = dir.path().join("window_1");
+        std::fs::create_dir_all(&sub1).expect("create sub1");
+        write_envelope(&sub1, true);
+        std::fs::write(sub1.join("run.meta"), "run=w1 tag=test\n").expect("write run.meta");
+
+        let source = LiveWindowTokenSource::new(dir.path(), Arc::new(BracketedDecoder));
+        let req = request(DeviceEndpoint::ChatCompletions, None);
+        let DeviceTokenClaim::Claimed(s1) = source.claim(&req) else {
+            panic!("first claim failed");
+        };
+        assert!(s1.provenance.contains("run_id w1"));
+
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let sub2 = dir.path().join("window_2");
+        std::fs::create_dir_all(&sub2).expect("create sub2");
+        write_envelope(&sub2, true);
+        std::fs::write(sub2.join("run.meta"), "run=w2 tag=test\n").expect("write run.meta");
+
+        let DeviceTokenClaim::Claimed(s2) = source.claim(&req) else {
+            panic!("second claim failed");
+        };
+        assert!(s2.provenance.contains("run_id w2"));
     }
 }

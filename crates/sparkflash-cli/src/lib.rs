@@ -6,6 +6,7 @@
 pub mod allocator;
 #[cfg(feature = "cuda")]
 pub mod attention_device;
+pub mod bootlog;
 pub mod chain_timing;
 pub mod convert;
 pub mod device_chain;

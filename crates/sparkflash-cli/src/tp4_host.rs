@@ -809,17 +809,16 @@ struct StepCost {
     collective_ms: u64,
 }
 
-/// The prefill execution mode the shipped TP=4 host path uses: the one-line flip.
+/// The prefill execution mode the shipped TP=4 host path uses.
 ///
-/// It is deliberately [PrefillMode::TokenLoop]. The batched/chunked prefill policy is implemented
-/// and tested (crates/sparkflash-scheduler/src/batching.rs, crates/sparkflash-engine/src/
-/// forward/batch.rs, tests/batched_prefill.rs), but the batch-17 serve census measured the chunked
-/// endpoint *slower* than the pre-batch-17 token loop: 43.624741849 s TTFT against 39.134645546 s
-/// at 37 prompt tokens (docs/build/tp4-tokens-per-second.md). Promoting the batched policy is
-/// therefore a measurement the endpoint row still owes, not a configuration change, so the shipped
-/// default stays on the measured-better path. Changing this constant to
-/// [PrefillMode::Batched] is the entire flip; it must land with an endpoint row that beats
-/// 39.13 s TTFT at the same prompt, or with the reason the row cannot be produced yet.
+/// It is deliberately [PrefillMode::TokenLoop]. The batched/chunked host prefill policy is
+/// implemented and tested, but the batch-17 serve census measured the chunked endpoint *slower*
+/// than the pre-batch-17 token loop: 43.624741849 s TTFT against 39.134645546 s at 37 prompt tokens
+/// (docs/build/tp4-tokens-per-second.md). Promoting the host policy therefore requires a comparable
+/// endpoint measurement; the shipped default stays on the measured-better path.
+///
+/// This constant selects only Tp4Rank's host hybrid execution. It does not affect tp4_forward's
+/// CUDA position loop, implement GPU multi-row batching, or connect that loop to live serving.
 const SHIPPED_PREFILL_MODE: PrefillMode = PrefillMode::TokenLoop;
 
 /// The legacy `SPARKFLASH_TP4_PREFILL_CHUNK` spelling, kept working as an override.
@@ -840,19 +839,31 @@ fn mode_from_legacy_chunk_value(value: &str) -> PrefillMode {
 /// then the legacy `SPARKFLASH_TP4_PREFILL_CHUNK`, then [SHIPPED_PREFILL_MODE]. An unparseable new
 /// variable warns and falls back to the shipped mode; it never silently changes the default. Read
 /// once per prefill call; the decode path never consults it.
-fn shipped_prefill_mode() -> PrefillMode {
-    if let Ok(value) = std::env::var("SPARKFLASH_TP4_PREFILL_MODE") {
-        if let Some(mode) = PrefillMode::from_env_value(&value) {
-            return mode;
-        }
+///
+/// Public so `serve` can print the mode it is actually about to run in its boot banner: a mode that
+/// is only visible through an env var is a mode nobody can confirm from the log.
+#[must_use]
+pub fn shipped_prefill_mode() -> PrefillMode {
+    let mode = std::env::var("SPARKFLASH_TP4_PREFILL_MODE").ok();
+    let legacy_chunk = std::env::var("SPARKFLASH_TP4_PREFILL_CHUNK").ok();
+    if let Some(value) = mode.as_deref()
+        && PrefillMode::from_env_value(value).is_none()
+    {
         eprintln!(
             "sparkflash: unknown SPARKFLASH_TP4_PREFILL_MODE={value:?}; using {SHIPPED_PREFILL_MODE:?}"
         );
     }
-    if let Ok(value) = std::env::var("SPARKFLASH_TP4_PREFILL_CHUNK") {
-        return mode_from_legacy_chunk_value(&value);
+    prefill_mode_from_overrides(mode.as_deref(), legacy_chunk.as_deref())
+}
+
+/// Pure override resolution, so precedence tests need no process-global environment mutation.
+fn prefill_mode_from_overrides(mode: Option<&str>, legacy_chunk: Option<&str>) -> PrefillMode {
+    if let Some(value) = mode {
+        // The new spelling wins even when invalid: do not silently enable the chunk via a
+        // stale legacy override after announcing that we are using the shipped default.
+        return PrefillMode::from_env_value(value).unwrap_or(SHIPPED_PREFILL_MODE);
     }
-    SHIPPED_PREFILL_MODE
+    legacy_chunk.map_or(SHIPPED_PREFILL_MODE, mode_from_legacy_chunk_value)
 }
 
 /// One rank of the four-node TP=4 host path, as a library.
@@ -961,6 +972,7 @@ impl Tp4Rank {
         let attention_shard = attention_shard_enabled(&config, input.world);
         let plan = expert_shard_plan(&source, input.rank, input.world, attention_shard)
             .map_err(Tp4Error::new)?;
+        boot_config(input, &config, &plan, &source, attention_shard);
         // One cache instance, two views: the engine's replicated reads and the rank's plan
         // slices all go through the same allocation, so the resident set is held once.
         let cache = if input.resident_cache {
@@ -1124,9 +1136,10 @@ impl Tp4Rank {
     /// pre-batch-17 one-step-per-token loop (one hybrid forward per prompt token); the batched
     /// token-budget policy is implemented and tested but not yet the runtime default.
     ///
-    /// [SHIPPED_PREFILL_MODE] is the one-line flip; `SPARKFLASH_TP4_PREFILL_MODE` (or the legacy
-    /// `SPARKFLASH_TP4_PREFILL_CHUNK`) overrides it for a bisect. [PrefillMode::Batched] runs the
-    /// batch-17 chunked hybrid step: one forward per layer over the whole prompt. It is
+    /// `SPARKFLASH_TP4_PREFILL_MODE` (or the legacy `SPARKFLASH_TP4_PREFILL_CHUNK`) overrides
+    /// [SHIPPED_PREFILL_MODE] for a host-path bisect. [PrefillMode::Batched] runs the batch-17
+    /// chunked host hybrid step: one forward per layer over the whole prompt, not GPU multi-row
+    /// execution or the separate tp4_forward CUDA loop. It is
     /// bit-identical, but the batch-17 serve census measured a slower endpoint TTFT with the chunk
     /// path than with the loop (43.6 s vs 39.1 s) while the bench harness measures the chunk faster
     /// (24.6 s vs 33.1 s at 37 prompt tokens), so the serve path keeps the measured-better default
@@ -1902,31 +1915,157 @@ struct ResidentCache {
     fill_ms: u64,
 }
 
+/// Emits the resolved-decision boot lines for one rank, in the reference server's log shape.
+///
+/// Every value here is a resolved configuration fact read from the checkpoint's own index and the
+/// engine config; none of them is a measurement. The point is that an operator watching a
+/// multi-minute startup can see *what* this rank decided and *why* before the weights are read,
+/// instead of only learning it from a post-hoc metrics line.
+fn boot_config(
+    input: &RankInput,
+    config: &ModelConfig,
+    plan: &ShardPlan,
+    source: &SafeTensorsSource,
+    attention_shard: bool,
+) {
+    let role = crate::bootlog::role_label(input.rank);
+    crate::bootlog::init();
+    crate::bootlog::info(
+        &role,
+        "tp4_host.rs:970",
+        "Resolved architecture: DeepseekV41ForCausalLM",
+    );
+    crate::bootlog::info(
+        &role,
+        "tp4_host.rs:974",
+        format!(
+            "Tensor parallel size {} (rank {} of {}), attention sharding {}",
+            input.world,
+            input.rank,
+            input.world,
+            if attention_shard {
+                "on (per-rank head rows)"
+            } else {
+                "off (replicated)"
+            }
+        ),
+    );
+    crate::bootlog::info(
+        &role,
+        "tp4_host.rs:984",
+        format!(
+            "Using max model len {} (trained {}, rope factor {})",
+            sparkflash_api::engine::max_seq_len(),
+            config.original_seq_len,
+            config.rope_factor
+        ),
+    );
+    crate::bootlog::info(
+        &role,
+        "tp4_host.rs:990",
+        format!(
+            "Model config: {} layers, dim {}, {} routed experts ({} active), {} MTP stage(s), vocab {}",
+            config.n_layers,
+            config.dim,
+            config.n_routed_experts,
+            config.n_activated_experts,
+            config.n_mtp_layers,
+            config.vocab_size
+        ),
+    );
+    crate::bootlog::info(
+        &role,
+        "tp4_host.rs:1000",
+        format!(
+            "Checkpoint {}: {} shard(s), {} tensor(s), {} on disk",
+            input.source_dir.display(),
+            source.index().len(),
+            source.index().names().count(),
+            crate::bootlog::human_bytes(checkpoint_disk_bytes(&input.source_dir))
+        ),
+    );
+    crate::bootlog::info(
+        &role,
+        "tp4_host.rs:1008",
+        format!(
+            "This rank's plan: {} slice rule(s), resident cache {}",
+            plan.rules().len(),
+            if input.resident_cache {
+                "on"
+            } else {
+                "off (streaming)"
+            }
+        ),
+    );
+    if input.resident_cache {
+        crate::bootlog::info(&role, "tp4_host.rs:1013", "Loading model from scratch...");
+    } else {
+        crate::bootlog::info(
+            &role,
+            "tp4_host.rs:1013",
+            "Streaming weights from disk (resident cache off)",
+        );
+    }
+}
+
+/// The total size of the `*.safetensors` files in a checkpoint directory.
+///
+/// A directory walk rather than the index, because the reference server prints the on-disk size and
+/// the two differ when the index lists a shard twice or the snapshot carries an extra file. A read
+/// error contributes zero: this number is informational and must never fail a boot.
+fn checkpoint_disk_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"))
+        })
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|meta| meta.len())
+        .sum()
+}
+
 impl ResidentCache {
     /// Reads every plan slice and every non-table checkpoint tensor once, in that order.
+    ///
+    /// The boot log gets one progress bar over the reads, because this fill is the long pole of a
+    /// multi-minute startup: a 48-shard checkpoint with tens of thousands of validators would
+    /// otherwise print nothing between "loading model" and the first request.
     fn load(source: &SafeTensorsSource, plan: &ShardPlan) -> Result<Self, String> {
         let started = Instant::now();
         let _ = source.preload_headers();
         let mut tensors = BTreeMap::new();
         let mut plan_bytes = 0u64;
         let mut replicated_bytes = 0u64;
+        let replicated: Vec<&str> = source
+            .index()
+            .names()
+            .filter(|name| plan.rule(name).is_none() && !is_engram_table(name))
+            .collect();
+        let total = plan.rules().len().saturating_add(replicated.len());
+        let mut bar = crate::bootlog::Progress::new("Loading checkpoint tensors", total);
         for name in plan.rules().keys() {
             let shard = plan
                 .read(source, name)
                 .map_err(|error| format!("resident cache {name}: {error}"))?;
             plan_bytes = plan_bytes.saturating_add(shard.bytes.len() as u64);
             tensors.insert(name.to_owned(), Arc::new(shard.bytes));
+            bar.advance(1);
         }
-        for name in source.index().names() {
-            if plan.rule(name).is_some() || is_engram_table(name) {
-                continue;
-            }
+        for name in replicated {
             let bytes = source
                 .read(name)
                 .map_err(|error| format!("resident cache {name}: {error}"))?;
             replicated_bytes = replicated_bytes.saturating_add(bytes.len() as u64);
             tensors.insert(name.to_owned(), Arc::new(bytes));
+            bar.advance(1);
         }
+        bar.finish();
         Ok(Self {
             tensors,
             plan_bytes,
@@ -4566,14 +4705,47 @@ mod tests {
         rank.prefill(&[5]).expect("single-token prefill");
     }
 
-    /// The shipped default is a measurement decision, not a leftover. Flipping it is one constant
-    /// (SHIPPED_PREFILL_MODE) and must arrive with an endpoint row that beats the measured
-    /// token-loop TTFT; this test is the guard that the flip is deliberate.
+    /// The shipped host default is a measurement decision, not a leftover. Promoting the chunk
+    /// requires an endpoint row that beats the measured token-loop TTFT; this test guards that
+    /// decision and makes no claim about the separate CUDA forward path.
     #[test]
     fn the_shipped_prefill_mode_is_the_measured_better_token_loop() {
         assert_eq!(SHIPPED_PREFILL_MODE, PrefillMode::TokenLoop);
         assert!(SHIPPED_PREFILL_MODE.is_token_loop());
         assert_ne!(SHIPPED_PREFILL_MODE, PrefillMode::Batched);
+    }
+
+    #[test]
+    fn prefill_override_precedence_matches_the_announced_fallback() {
+        assert_eq!(
+            prefill_mode_from_overrides(None, None),
+            SHIPPED_PREFILL_MODE
+        );
+        assert_eq!(
+            prefill_mode_from_overrides(None, Some("1")),
+            PrefillMode::Batched
+        );
+        assert_eq!(
+            prefill_mode_from_overrides(None, Some("off")),
+            PrefillMode::TokenLoop
+        );
+        assert_eq!(
+            prefill_mode_from_overrides(Some("token-loop"), Some("1")),
+            PrefillMode::TokenLoop
+        );
+        assert_eq!(
+            prefill_mode_from_overrides(Some("batched"), Some("off")),
+            PrefillMode::Batched
+        );
+        for invalid in ["", "invalid-mode", "true"] {
+            for legacy in [None, Some("1"), Some("batched"), Some("off")] {
+                assert_eq!(
+                    prefill_mode_from_overrides(Some(invalid), legacy),
+                    SHIPPED_PREFILL_MODE,
+                    "invalid new override {invalid:?} must not fall through to {legacy:?}"
+                );
+            }
+        }
     }
 
     /// The legacy env spelling keeps its meaning: any truthy value still means the chunked path,

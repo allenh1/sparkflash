@@ -377,16 +377,65 @@ earlier bisect).
 prefill entries (e.g. 18 entries / decode_first_index 8 for 8 prompt tokens + 10 decode steps).
 Decode-class averages are still the sum over the last `steps_run` entries divided by `steps_run`.
 
-**Opt-in switch:** set `SPARKFLASH_TP4_PREFILL_CHUNK=1` to enable the chunked prefill (read once per
-prefill call; the decode path never reads it). The interim `SPARKFLASH_TP4_PREFILL_TOKEN_LOOP`
-escape hatch is gone: the one-step-per-token loop is the default again, and the chunk is the
-opt-in path for comparison or bisection.
+**Opt-in switch (host rank only):** set `SPARKFLASH_TP4_PREFILL_MODE=batched` to enable chunked
+host prefill, or `SPARKFLASH_TP4_PREFILL_MODE=token-loop` to force the token loop. When the new
+variable is absent, the legacy `SPARKFLASH_TP4_PREFILL_CHUNK=1` also enables the chunk; its
+`0`/`false`/`off`/`no` values select the token loop. An invalid new-mode value warns and uses the
+shipped default, even if a legacy override is present. The mode is read once per ordinary
+`Tp4Rank::prefill` call; decode never reads it. Prompt-logprobs prefill has its own bounded chunk
+path and does not consult this switch. The interim `SPARKFLASH_TP4_PREFILL_TOKEN_LOOP` escape
+hatch is gone: the one-step-per-token loop is the default, and the chunk is opt-in for comparison
+or bisection.
 
 **TTFT:** the pre-fix endpoint census (old binary, token loop) is 39.13 s; the chunk-in-serve
 census is 43.62 s (measured, slower, hence opt-in); the shipped default (token loop on the flipped
 tree) censused at **38.964443188 s** TTFT (decode 0.940163137 tokens/s, wall 105.99 s, repeats
 byte-identical, evidence `phase2-evidence/task16-final-census-default/`), so the flip restores the
 pre-fix TTFT and the chunk remains available only through `SPARKFLASH_TP4_PREFILL_CHUNK=1`.
+
+### Host chunks are not CUDA prefill batching
+
+`SHIPPED_PREFILL_MODE` in [tp4_host.rs](../../crates/sparkflash-cli/src/tp4_host.rs) selects
+`Tp4Rank::prefill_token_loop` versus `prefill_chunk_with_positions`. The chunk calls
+`run_hybrid_sequence_chunk` with **no attention-projection backend**: its attention remains in
+the host engine. The host serve adapter maps that rank API onto HTTP. Changing this constant is
+not a GPU optimization and does not connect the separate CUDA forward loop to serving.
+
+[tp4_forward.rs](../../crates/sparkflash-cli/src/tp4_forward.rs) instead runs a position-major
+loop, initializing each position from one embedding row and then visiting every layer. Its
+[tp4_prefill.rs](../../crates/sparkflash-cli/src/tp4_prefill.rs) helper advances compressor,
+indexer and candidate state one `(layer, position)` at a time; its name does not imply multi-row
+CUDA execution. GPU batched prefill needs separate integration:
+
+- A persistent device rank/session implementing request reset, prompt prefill and sampled-token
+  decode while retaining the bound arena, transport, weights and per-layer attention state.
+- Layer-major prompt chunks with actual multi-row device projections/FFNs and chunk-sized
+  collective payloads. Preserve causal window/compressor/indexer publication order, each token's
+  Engram history and mHC residual stream; do not relabel a position loop as batching.
+- The last prompt row's head result handed to serving, then the generated token fed into decode
+  rather than a teacher-forced continuation. Reset per-request KV/compressor state without
+  dropping resident weights. Declare unsupported prompt-logprobs or sampling explicitly.
+- Targeted host/device correctness checks and a comparable **live endpoint** TTFT measurement,
+  recording prompt length, load/warmup and decode separately before promoting a default. The
+  host chunk/loop measurements above are not evidence of GPU batching or fast CUDA serving.
+
+### What the serving side now has
+
+Two of those integration items have a runnable, tested seam — neither is GPU batching:
+
+- **Chat can reach a claimed device window** (W4): `/v1/chat/completions` renders and tokenizes the
+  prompt through the seam before the device claim, so a window recorded for that exact prompt is
+  served from the device arm instead of always falling back. `/v1/completions` already could.
+- **A live window follower** (W5): `serve --device-token-dir DIR --device-token-live` watches a
+  parent directory, serves the newest completed four-rank window, re-reads on a run-id/mtime
+  transition, and applies the exact-prompt rule. The `x-sparkflash-token-source` header names the
+  source that answered.
+
+What that does **not** buy: the served tokens are still a replay of one recorded prompt at the
+device arm's recorded speed, not live device inference driven by the request. The HTTP path's own
+forward is still the host rank loop (`~0.94 tok/s` decode, `~39 s` TTFT for 37 prompt tokens).
+A persistent `Tp4RankApi` over `tp4_forward` remains the open item.
+
 
 ## 12. Boundaries
 

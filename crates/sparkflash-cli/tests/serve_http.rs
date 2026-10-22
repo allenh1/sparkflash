@@ -2146,6 +2146,62 @@ fn a_device_token_window_serves_its_claimed_completion_and_labels_it_unmeasured(
 }
 
 #[test]
+fn a_device_window_recorded_for_the_rendered_chat_prompt_serves_the_chat_endpoint() {
+    // W4 over the real binary: chat renders + tokenizes the prompt before asking the device
+    // source, so a window recorded for exactly that prompt is claimable from
+    // /v1/chat/completions instead of always falling back to the host twin.
+    let seam = sparkflash_api::encoding::TokenizerSeam::from_path(
+        &sparkflash_api::encoding::reference_tokenizer_path(),
+    )
+    .expect("reference tokenizer");
+    let body = serde_json::json!({
+        "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 9,
+    });
+    // The server renders the released template from the raw request body and tokenizes it; the
+    // window must record those exact ids for the exact-match rule to accept the request.
+    let ids = seam
+        .encode_chat(&body)
+        .expect("the chat prompt renders and tokenizes");
+    let window = tempfile::tempdir().expect("window dir");
+    fixtures::write_envelope_for_prompt(window.path(), &ids);
+    let window_arg = window.path().to_str().expect("temporary paths are UTF-8");
+    let server = SyntheticServer::start_with(&["--device-token-dir", window_arg]);
+
+    let expected = seam
+        .decode(&fixtures::DECODE_IDS)
+        .expect("the claimed ids decode");
+    let response = server.request(
+        "POST",
+        "/v1/chat/completions",
+        Some(&serde_json::to_string(&body).expect("chat body")),
+    );
+    assert_eq!(
+        response.status,
+        200,
+        "log: {} body: {}",
+        server.log(),
+        response.text()
+    );
+    assert_eq!(
+        response.header("x-sparkflash-token-source"),
+        Some("device-chain-envelope (UNMEASURED)"),
+        "the chat request must reach the device source, not the host twin: {}",
+        server.log()
+    );
+    assert_eq!(
+        response.header("x-sparkflash-token-claim"),
+        Some("explicit")
+    );
+    let json = response.json();
+    assert_eq!(json["object"], "chat.completion");
+    assert_eq!(json["choices"][0]["message"]["content"], expected.as_str());
+    assert_eq!(json["choices"][0]["finish_reason"], "length");
+    assert_eq!(json["usage"]["prompt_tokens"], ids.len());
+}
+
+#[test]
 fn the_serve_help_documents_the_device_token_flags() {
     // Wiring W3 is a CLI surface, so the documented flags are part of the contract the node
     // operator follows. This runs the real binary's help, not the parser.
@@ -2162,6 +2218,109 @@ fn the_serve_help_documents_the_device_token_flags() {
     );
     assert!(help.contains("--device-token-dir"), "{help}");
     assert!(help.contains("--device-token-derived-claim"), "{help}");
+    assert!(help.contains("--device-token-live"), "{help}");
+}
+
+#[test]
+fn a_live_window_follower_serves_the_newest_completed_window_and_falls_back_for_the_rest() {
+    // W5 over the real binary: the operator points --device-token-dir at a *parent* directory and
+    // passes --device-token-live. The source must find the completed window underneath it, serve
+    // the recorded prompt, and fall back (host twin, no device header) for anything else.
+    let parent = tempfile::tempdir().expect("parent dir");
+    let window = parent.path().join("window_a");
+    std::fs::create_dir_all(&window).expect("window directory");
+    fixtures::write_envelope(&window, true);
+    std::fs::write(window.join("run.meta"), "run=live-a tag=test\n").expect("run meta");
+    let parent_arg = parent.path().to_str().expect("temporary paths are UTF-8");
+    let server =
+        SyntheticServer::start_with(&["--device-token-dir", parent_arg, "--device-token-live"]);
+    let seam = sparkflash_api::encoding::TokenizerSeam::from_path(
+        &sparkflash_api::encoding::reference_tokenizer_path(),
+    )
+    .expect("reference tokenizer");
+    let ids = fixtures::DECODE_IDS;
+    let expected = seam.decode(&ids).expect("the claimed ids decode");
+
+    let body = serde_json::json!({
+        "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "prompt": fixtures::prompt_ids(),
+        "max_tokens": 9,
+    })
+    .to_string();
+    let response = server.request("POST", "/v1/completions", Some(&body));
+    assert_eq!(response.status, 200, "log: {}", server.log());
+    assert_eq!(
+        response.header("x-sparkflash-token-source"),
+        Some("device-chain-live-window (UNMEASURED)"),
+        "the live source labels its own claim: {}",
+        server.log()
+    );
+    assert_eq!(response.json()["choices"][0]["text"], expected.as_str());
+
+    // A prompt the active window did not record falls back, and the fallback is the host twin.
+    let host_body = serde_json::json!({
+        "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "prompt": [1, 2, 3, 4, 5, 6, 7, 8],
+        "max_tokens": 4,
+    })
+    .to_string();
+    let host = server.request("POST", "/v1/completions", Some(&host_body));
+    assert_eq!(host.status, 200, "log: {}", server.log());
+    assert!(
+        host.header("x-sparkflash-token-source").is_none(),
+        "the fallback answer carries no device provenance header"
+    );
+}
+
+#[test]
+fn a_live_window_follower_serves_a_window_recorded_after_startup() {
+    // The follower must re-read on transition, not snapshot at boot: start with an empty parent,
+    // then write the window the request will ask for, and only then send it.
+    let parent = tempfile::tempdir().expect("parent dir");
+    let parent_arg = parent.path().to_str().expect("temporary paths are UTF-8");
+    let server =
+        SyntheticServer::start_with(&["--device-token-dir", parent_arg, "--device-token-live"]);
+    // Before any window exists the live source reports the absence and the host twin answers.
+    // (A small prompt, because the synthetic host twin's embedding table only holds 128 rows; the
+    // fixture prompt ids are 1000..1129 and the host twin is only expected to answer the ids the
+    // device window recorded.)
+    let early_body = serde_json::json!({
+        "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "prompt": [1, 2, 3, 4, 5, 6, 7, 8],
+        "max_tokens": 4,
+    })
+    .to_string();
+    let early = server.request("POST", "/v1/completions", Some(&early_body));
+    assert_eq!(
+        early.status,
+        200,
+        "log: {} body: {}",
+        server.log(),
+        early.text()
+    );
+    assert!(
+        early.header("x-sparkflash-token-source").is_none(),
+        "no window yet, so the host twin answers"
+    );
+
+    let window = parent.path().join("window_b");
+    std::fs::create_dir_all(&window).expect("window directory");
+    fixtures::write_envelope(&window, true);
+    std::fs::write(window.join("run.meta"), "run=live-b tag=test\n").expect("run meta");
+
+    let window_body = serde_json::json!({
+        "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "prompt": fixtures::prompt_ids(),
+        "max_tokens": 9,
+    })
+    .to_string();
+    let response = server.request("POST", "/v1/completions", Some(&window_body));
+    assert_eq!(
+        response.header("x-sparkflash-token-source"),
+        Some("device-chain-live-window (UNMEASURED)"),
+        "the window written after startup is picked up: {}",
+        server.log()
+    );
 }
 
 #[test]

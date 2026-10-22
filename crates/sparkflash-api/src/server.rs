@@ -651,6 +651,7 @@ fn device_completion_eligibility(request: &CompletionRequest) -> Option<DeviceTo
 fn device_chat_eligibility(
     request: &ChatCompletionRequest,
     image_absent: bool,
+    prompt_token_ids: Option<Vec<u32>>,
 ) -> Option<DeviceTokenRequest> {
     if !image_absent
         || request.n.unwrap_or(1) != 1
@@ -689,7 +690,7 @@ fn device_chat_eligibility(
             .unwrap_or(false),
         model: None,
         max_tokens: request.max_completion_tokens.or(request.max_tokens),
-        prompt_token_ids: None,
+        prompt_token_ids,
     })
 }
 
@@ -709,8 +710,17 @@ fn claim_device_token(state: &AppState, request: DeviceTokenRequest) -> Option<D
 /// The response header naming the device-chain envelope provenance for a claimed body.
 pub const DEVICE_TOKEN_SOURCE_HEADER: &str = "x-sparkflash-token-source";
 
-/// The header value; UNMEASURED is part of the provenance, not a decoration.
+/// The header value for the one-shot envelope source; UNMEASURED is part of the provenance, not a
+/// decoration.
 pub const DEVICE_TOKEN_SOURCE_UNMEASURED: &str = "device-chain-envelope (UNMEASURED)";
+
+/// The value [`device_token_response`] actually sends: the source's own name plus the
+/// unmeasured marker, so a live window follower and a static envelope are distinguishable on the
+/// wire instead of both claiming to be `device-chain-envelope`.
+#[must_use]
+pub fn device_token_source_label(source: &str) -> String {
+    format!("{source} (UNMEASURED)")
+}
 
 /// The header naming how the claim was established: explicit device assertion or derived evidence.
 pub const DEVICE_TOKEN_CLAIM_HEADER: &str = "x-sparkflash-token-claim";
@@ -761,9 +771,11 @@ fn device_token_response(
         };
         json_response(body, trace)
     };
+    let label = device_token_source_label(stream.source);
     response.headers_mut().insert(
         HeaderName::from_static(DEVICE_TOKEN_SOURCE_HEADER),
-        HeaderValue::from_static(DEVICE_TOKEN_SOURCE_UNMEASURED),
+        HeaderValue::from_str(&label)
+            .unwrap_or_else(|_| HeaderValue::from_static(DEVICE_TOKEN_SOURCE_UNMEASURED)),
     );
     response.headers_mut().insert(
         HeaderName::from_static(DEVICE_TOKEN_CLAIM_HEADER),
@@ -1789,11 +1801,22 @@ async fn chat_completions(
     };
     let model = resolve_model(&state, request.model.as_deref())?;
     let trace = trace_context(&headers)?;
+    // With the seam attached, the prompt is the released server's template rendered by the
+    // official encoder port and tokenized with the checkpoint tokenizer. Without it (the
+    // weight-free router tests), the Milestone 1 heuristic keeps the placeholder path.
+    let (summary, prompt_token_ids) = match (seam.as_ref(), raw_for_seam.as_ref()) {
+        (Some(seam), Some(raw)) => {
+            let ids = seam.encode_chat(raw).map_err(tokenizer_seam_error)?;
+            (tokenizer_prompt_summary(ids.clone(), 0), Some(ids))
+        }
+        _ => (summarize_chat_messages(&request.messages)?, None),
+    };
     // Device-chain scaffold: a plain chat request may be served from a claimed four-rank token
     // envelope; an unclaimed envelope, a missing source or any advanced field continues to the host
     // twin below, so the existing serve path stays byte-identical.
-    if let Some(claim) = device_chat_eligibility(&request, image_carrier.is_none())
-        .and_then(|token_request| claim_device_token(&state, token_request))
+    if let Some(claim) =
+        device_chat_eligibility(&request, image_carrier.is_none(), prompt_token_ids)
+            .and_then(|token_request| claim_device_token(&state, token_request))
     {
         return Ok(device_token_response(
             &claim,
@@ -1809,16 +1832,6 @@ async fn chat_completions(
             trace,
         ));
     }
-    // With the seam attached, the prompt is the released server's template rendered by the
-    // official encoder port and tokenized with the checkpoint tokenizer. Without it (the
-    // weight-free router tests), the Milestone 1 heuristic keeps the placeholder path.
-    let summary = match (seam.as_ref(), raw_for_seam.as_ref()) {
-        (Some(seam), Some(raw)) => {
-            let ids = seam.encode_chat(raw).map_err(tokenizer_seam_error)?;
-            tokenizer_prompt_summary(ids, 0)
-        }
-        _ => summarize_chat_messages(&request.messages)?,
-    };
     refuse_image_carrier(image_carrier)?;
     let id = state.next_id("chatcmpl-dsv41-");
     let created = state.now_unix();

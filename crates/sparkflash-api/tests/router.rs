@@ -3730,6 +3730,7 @@ impl DeviceTokenSource for TestDeviceTokenSource {
             decode_positions: 9,
             logits_dump_present: false,
             claim_mode: ClaimMode::Asserted,
+            source: "device-chain-envelope",
             provenance: "synthetic test stream; UNMEASURED".to_owned(),
         }))
     }
@@ -3884,6 +3885,45 @@ async fn device_claimed_chat_serves_the_envelope_body() {
         .expect("device source was called");
     assert_eq!(captured.endpoint, DeviceEndpoint::ChatCompletions);
     assert_eq!(captured.prompt_token_ids, None);
+}
+
+#[tokio::test]
+async fn device_claimed_chat_with_tokenizer_seam_captures_prompt_token_ids() {
+    let engine = RecordingMockEngine::with_content(&["Hello", " world"]);
+    let engine_calls = Arc::clone(&engine.calls);
+    let source = Arc::new(TestDeviceTokenSource::new(true));
+    let last = Arc::clone(&source.last);
+    let seam = Arc::new(
+        sparkflash_api::encoding::TokenizerSeam::from_path(
+            &sparkflash_api::encoding::reference_tokenizer_path(),
+        )
+        .expect("load reference tokenizer seam"),
+    );
+    let app = router(
+        AppState::new(Arc::new(engine))
+            .with_fixed_time(FIXED_TIME)
+            .with_tokenizer(seam)
+            .with_device_token_source(Some(source)),
+    );
+    let (status, _headers, bytes) =
+        send(app, json_request("/v1/chat/completions", &chat_body("hi"))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(engine_calls.load(Ordering::SeqCst), 0);
+    let captured = last
+        .lock()
+        .expect("device source request log")
+        .clone()
+        .expect("device source was called");
+    assert_eq!(captured.endpoint, DeviceEndpoint::ChatCompletions);
+    let prompt_ids = captured
+        .prompt_token_ids
+        .expect("prompt token ids must be captured by tokenizer seam for W4");
+    assert!(!prompt_ids.is_empty());
 }
 
 #[tokio::test]

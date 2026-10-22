@@ -27,6 +27,9 @@
 #   SPARKFLASH_LOG_ROOT    remote log directory (default <repo>/target/serve-tp4)
 #   SPARKFLASH_DRAIN_DELAY_MS    rank-0 pre-stop delay (default 5000)
 #   SPARKFLASH_DRAIN_TIMEOUT_MS  rank-0 drain deadline (default 30000)
+#   SPARKFLASH_DEVICE_TOKEN_DIR  token window (or live window parent) served by rank 0
+#   SPARKFLASH_DEVICE_TOKEN_LIVE=1        follow that directory as a live window directory (W5)
+#   SPARKFLASH_DEVICE_TOKEN_DERIVED_CLAIM=1  accept a window without the device's claim assertion
 #   SSH_USER, SSH_OPTS     ssh user and options (defaults: current user, BatchMode)
 #   SPARKFLASH_DRY_RUN=1   same as print, for scripts that want one code path
 set -euo pipefail
@@ -47,6 +50,9 @@ LOG_ROOT="${SPARKFLASH_LOG_ROOT:-$REPO_ROOT/target/serve-tp4}"
 RUN_ID="${SPARKFLASH_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 DRAIN_DELAY_MS="${SPARKFLASH_DRAIN_DELAY_MS:-5000}"
 DRAIN_TIMEOUT_MS="${SPARKFLASH_DRAIN_TIMEOUT_MS:-30000}"
+DEVICE_TOKEN_DIR="${SPARKFLASH_DEVICE_TOKEN_DIR:-}"
+DEVICE_TOKEN_LIVE="${SPARKFLASH_DEVICE_TOKEN_LIVE:-0}"
+DEVICE_TOKEN_DERIVED_CLAIM="${SPARKFLASH_DEVICE_TOKEN_DERIVED_CLAIM:-0}"
 
 read -r -a NODES <<< "$NODES_RAW"
 die() { printf 'serve-four-node: %s\n' "$*" >&2; exit 1; }
@@ -65,7 +71,8 @@ rank_env() {
 }
 
 # The one command line per rank. Rank 0 binds the public HTTP address; ranks 1-3 keep a loopback
-# bind because they never serve HTTP.
+# bind because they never serve HTTP. The device token window flags are rank-0 only: workers never
+# detokenize, so a window on a worker would be an unused second copy.
 rank_command() {
     local rank="$1"
     printf '%s serve --checkpoint %s --tokenizer %s' "$BIN" "$CHECKPOINT" "$TOKENIZER"
@@ -73,6 +80,11 @@ rank_command() {
     printf ' --tp4-base-port %s --tp4-control-port %s' "$BASE_PORT" "$CONTROL_PORT"
     if [ "$rank" -eq 0 ]; then
         printf ' --bind %s' "$HTTP_BIND"
+        if [ -n "$DEVICE_TOKEN_DIR" ]; then
+            printf ' --device-token-dir %s' "$DEVICE_TOKEN_DIR"
+            [ "$DEVICE_TOKEN_LIVE" = "1" ] && printf ' --device-token-live'
+            [ "$DEVICE_TOKEN_DERIVED_CLAIM" = "1" ] && printf ' --device-token-derived-claim'
+        fi
     else
         printf ' --bind 127.0.0.1:0'
     fi

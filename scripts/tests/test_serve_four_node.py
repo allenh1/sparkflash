@@ -102,6 +102,43 @@ class PrintPlanTests(unittest.TestCase):
         self.assertEqual(result.stdout.count("ssh -n"), 4)
         self.assertIn("--tp4-rank 3", result.stdout)
 
+    def test_device_token_window_reaches_rank_zero_only(self) -> None:
+        result = run_script(
+            "print", env=base_env(SPARKFLASH_DEVICE_TOKEN_DIR="/var/lib/spark/windows")
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = [line for line in result.stdout.splitlines() if line.strip().startswith("ssh -n")]
+        self.assertEqual(len(lines), 4)
+        self.assertIn("--device-token-dir /var/lib/spark/windows", lines[0])
+        for line in lines[1:]:
+            self.assertNotIn("--device-token-dir", line)
+
+    def test_live_follower_flag_is_opt_in(self) -> None:
+        plain = run_script("print", env=base_env(SPARKFLASH_DEVICE_TOKEN_DIR="/var/lib/spark/w"))
+        self.assertNotIn("--device-token-live", plain.stdout)
+        live = run_script(
+            "print",
+            env=base_env(
+                SPARKFLASH_DEVICE_TOKEN_DIR="/var/lib/spark/w",
+                SPARKFLASH_DEVICE_TOKEN_LIVE="1",
+            ),
+        )
+        self.assertEqual(live.returncode, 0, live.stderr)
+        lines = [line for line in live.stdout.splitlines() if line.strip().startswith("ssh -n")]
+        self.assertIn("--device-token-live", lines[0])
+        self.assertNotIn("--device-token-live", lines[1])
+
+    def test_device_token_flags_are_absent_without_a_window_directory(self) -> None:
+        result = run_script(
+            "print",
+            env=base_env(
+                SPARKFLASH_DEVICE_TOKEN_LIVE="1",
+                SPARKFLASH_DEVICE_TOKEN_DERIVED_CLAIM="1",
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--device-token", result.stdout)
+
 
 class RefusalTests(unittest.TestCase):
     """A malformed topology must fail before any ssh command is built."""

@@ -249,6 +249,8 @@ would answer the wrong question with real-looking device tokens. Synthetic test 
 router tests exercise the claimed chat assembly path; the production source will serve chat only
 after W2 and W4.
 
+**Status.** W4 and W5 are implemented on this branch and covered by wire tests; see section 11.
+
 ## 5. Exact wiring once a token claims
 
 W1 (device, device-lead): make the reference attention body the real thing. m1y7 ran the CSA union
@@ -279,12 +281,27 @@ then verify they equal the envelope's prompt_ids (W2). Until then a chat request
 host twin even when a claimed envelope exists. This is the chat equivalent of the completions
 token-prompt requirement and it must not be bypassed for convenience.
 
+**Done.** `chat_completions` now encodes the rendered prompt through the seam *before* the device
+claim and threads the ids into `device_chat_eligibility`, so a chat request whose rendered prompt
+is the recorded one is served from the window. With no seam attached (weight-free router tests) the
+ids stay `None` and the transcript path is unchanged.
+
 W5 (serve): the static-directory source is the S8 replay harness. A live source replaces the load
 with a window follower: wait for a token_claimed transition (do not claim on an intermediate
 record), read the four rank pairs atomically (rank0 last or a completion marker), require the exact
 prompt match, and serve once per window or with an explicit cache keyed by the window run id. A
 change of run id must invalidate the cached claim. Until W5 the static reader must not be pointed
 at a live loop directory that is still being written.
+
+**Done, with one deliberate simplification.** `--device-token-live` installs `LiveWindowTokenSource`
+(`crates/sparkflash-api/src/device_token.rs`). It resolves the newest directory under the monitored
+path that holds a complete four-rank pair, keys its cache on (directory, rank-0 token-file mtime,
+`run.meta` run id), reloads the envelope only on that transition, and applies the same
+exact-prompt rule. Readiness is "the rank-0 token record is present", not "a `token_claimed`
+transition was observed" — the writer publishes `tp4-token-r{rank}.json` per rank, so a window is
+served only once all four are on disk and `claim_with` accepts them; until then the source falls
+back with a named reason. That is a weaker atomicity argument than a completion marker and is
+sufficient because a claim that fails re-reads on the next request.
 
 W6 (serve): observability. Add a counter for device-served responses and for fallbacks with their
 typed reason, keep the provenance header, and do not add timing fields until a timing protocol is
@@ -813,3 +830,32 @@ proves the fail-closed fallback over the same routes.
 No token-acceptance claim, no tok/s or TTFT claim is made from the m1y34 rows: they are M2
 performance rows, the served bodies are UNMEASURED provenance, and the synthetic window is paper
 evidence only.
+
+### 12.8 W4 and W5 on this base
+
+W4 (chat prompt capture) is implemented in `crates/sparkflash-api/src/server.rs`. The seam encodes
+the rendered chat prompt before the device claim, so `DeviceTokenRequest.prompt_token_ids` is
+populated for chat exactly as it already was for a token completions prompt; with no seam attached
+the ids stay `None` and the placeholder path is untouched. A chat request whose rendered prompt is
+not the recorded window still falls back to the host twin, which is the intended rule.
+
+W5 (live window follower) is implemented as `LiveWindowTokenSource` and installed by
+`--device-token-live` (which requires `--device-token-dir`). The flag makes the directory a parent
+to watch: the source picks the newest subdirectory holding a complete four-rank token pair, caches
+the claimed envelope keyed on (directory, rank-0 token mtime, `run.meta` run id), and re-reads only
+when one of those changes. Before any window exists, or for a prompt the window did not record, it
+falls back with a named reason.
+
+New host e2e tests (real binary + loopback socket):
+
+- a window recorded for the rendered chat prompt serves `/v1/chat/completions` from the device
+  source with the UNMEASURED header (W4, end to end);
+- the live follower serves the completed window under a parent directory and falls back for a
+  different prompt;
+- the live follower picks up a window written *after* startup, so it re-reads on transition rather
+  than snapshotting at boot.
+
+Boot logging: `serve` now prints the reference server's resolved-decision lines (architecture, max
+model len, tensor-parallel rank, prefill mode, tokenizer, load time, bound address) plus a
+single-line shard-loading progress bar. `SPARKFLASH_BOOT_LOG=0` silences them; nothing in them is
+a measurement.
