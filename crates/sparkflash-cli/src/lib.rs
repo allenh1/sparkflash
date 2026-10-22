@@ -11,6 +11,7 @@ pub mod chain_timing;
 pub mod convert;
 pub mod device_chain;
 pub mod doctor;
+pub mod layer_device;
 pub mod logits_dump;
 #[cfg(feature = "cuda")]
 pub mod moe_device;
@@ -25,6 +26,7 @@ pub(crate) mod tp4_graph;
 pub mod tp4_host;
 pub mod tp4_operands;
 pub mod tp4_prefill;
+pub mod tp4_reduce;
 pub mod tp4_resident;
 pub mod tp4_smoke;
 pub mod tp4_tail;

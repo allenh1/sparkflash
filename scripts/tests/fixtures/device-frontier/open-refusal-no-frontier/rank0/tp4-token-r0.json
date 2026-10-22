@@ -1,0 +1,22 @@
+{
+  "note": "the row never reached token generation; this file is shape only",
+  "positions_run": 0,
+  "rank": 0,
+  "schema": "sparkflash-tp4-token/1",
+  "synthetic": true,
+  "tokens": {
+    "ids": [
+      52479,
+      56659,
+      101226,
+      82590,
+      3235,
+      110894,
+      99524,
+      9807,
+      75
+    ],
+    "positions": [],
+    "prompt_len": 0
+  }
+}

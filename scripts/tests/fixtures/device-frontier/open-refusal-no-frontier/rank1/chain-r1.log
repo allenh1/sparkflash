@@ -1,0 +1,3 @@
+device 0: synthetic device for the open-refusal fixture
+forward reduce: requested="" path=tcp (reference exchange)
+tp4-chain: forward refused on rank 1: layer device seams: layer 0: layer device weight: no hc_attn_fn for layer 0 in the resolved set

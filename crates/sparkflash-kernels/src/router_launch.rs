@@ -146,8 +146,9 @@ pub fn load(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel, Module, Kernel
 /// Launches stage one, then stage two.
 ///
 /// # Errors
-/// Refuses tokens == 0, and returns the driver's error otherwise. The driver's launch path
-/// synchronises each launch, so the score slices from stage one are visible to stage two.
+/// Refuses tokens == 0, and returns the driver's error otherwise. The two launches are ordered by
+/// the stream they share (stream 0), not by a driver sync: under enable_forward_async_launches the
+/// host runs ahead, so stage two reading stage one's scores is a same-stream ordering guarantee.
 pub fn launch(
     cuda: &Cuda,
     router: Kernel,

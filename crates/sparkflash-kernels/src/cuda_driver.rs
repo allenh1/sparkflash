@@ -659,6 +659,12 @@ impl KernelId {
 /// owns its symbol and its typed launches, so it sits outside the driver's kernel-id vocabulary.
 pub const FLASH_MLA_CUBIN: &str = "flash_mla_csa2_sm121";
 
+/// The cubin name of the kv-path kernels, which have no [`KernelId`]: one cubin carries three
+/// symbols (`rope_rotate_bf16`, `window_quant_fp8_bf16`, `kv_append_bf16`) and one baseline entry,
+/// and a [`KernelId`] names one symbol of one cubin. `crate::kv_path_launch` owns their typed
+/// launches and resolves each symbol by name from this cubin.
+pub const KV_PATH_CUBIN: &str = "kv_path_sm121";
+
 /// The built cubin for a kernel name, under `dir`, for a harness that launches it.
 ///
 /// The kernel's [`KernelId::cubin_names`] are tried in order - the symbol first, then any documented
@@ -674,11 +680,13 @@ pub const FLASH_MLA_CUBIN: &str = "flash_mla_csa2_sm121";
 pub fn cubin_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
     let candidates: &[&str] = if name == FLASH_MLA_CUBIN {
         &[FLASH_MLA_CUBIN]
+    } else if name == KV_PATH_CUBIN {
+        &[KV_PATH_CUBIN]
     } else {
         KernelId::from_cubin_name(name)
             .ok_or_else(|| {
                 format!(
-                    "{name} is not one of the shared driver kernels; the flash_mla kernel is loaded through cuda_harness::load_flash_mla and has no KernelId"
+                    "{name} is not one of the shared driver kernels; flash_mla and the kv-path cubin are loaded through their own typed helpers and have no KernelId"
                 )
             })?
             .cubin_names()
@@ -2872,6 +2880,81 @@ impl Cuda {
         ))
     }
 
+    /// Loads the five layer-seam symbols from the one cubin the whole-layer port pins
+    /// (kernels/layer_seams_sm121.cu).
+    ///
+    /// The five kernels share a cubin and its baseline pin, so they are resolved together: a staged
+    /// image that carries one symbol and not the others is refused here rather than surfacing as a
+    /// nil function at launch. The cache interns the image bytes once; each symbol still resolves to
+    /// its own module handle (the driver hands out one module per load), so the caller frees all
+    /// five.
+    ///
+    /// # Errors
+    /// The driver's error when the cubin does not load or is missing one of the five symbols.
+    #[allow(clippy::type_complexity)]
+    pub fn load_layer_seams(
+        &self,
+        cubin: &[u8],
+    ) -> Result<
+        (
+            Module,
+            Kernel,
+            Module,
+            Kernel,
+            Module,
+            Kernel,
+            Module,
+            Kernel,
+            Module,
+            Kernel,
+            Module,
+            Kernel,
+            Module,
+            Kernel,
+            Module,
+            Kernel,
+        ),
+        String,
+    > {
+        use crate::layer_seams_launch as seams;
+        let load = |symbol: &'static str| -> Result<(Module, Kernel), String> {
+            let (module, function) = self.load_function(cubin, symbol)?;
+            Ok((
+                Module(module),
+                Kernel {
+                    function,
+                    name: symbol,
+                },
+            ))
+        };
+        let entry = load(seams::ENTRY_KERNEL)?;
+        let ffn = load(seams::FFN_KERNEL)?;
+        let prologue = load(seams::PROLOGUE_KERNEL)?;
+        let attn_residual = load(seams::ATTN_RESIDUAL_KERNEL)?;
+        let ffn_epilogue = load(seams::FFN_EPILOGUE_KERNEL)?;
+        let shared_swiglu = load(seams::SHARED_SWIGLU_KERNEL)?;
+        let prologue_bf16 = load(seams::PROLOGUE_BF16_KERNEL)?;
+        let rope_rows = load(seams::ROPE_ROWS_KERNEL)?;
+        Ok((
+            entry.0,
+            entry.1,
+            ffn.0,
+            ffn.1,
+            prologue.0,
+            prologue.1,
+            attn_residual.0,
+            attn_residual.1,
+            ffn_epilogue.0,
+            ffn_epilogue.1,
+            shared_swiglu.0,
+            shared_swiglu.1,
+            prologue_bf16.0,
+            prologue_bf16.1,
+            rope_rows.0,
+            rope_rows.1,
+        ))
+    }
+
     /// Loads the K1 warp-per-column dense symbol from the dense cubin.
     ///
     /// The scalar `b12x_mxfp8_dense_sm121` symbol remains the pinned reference and the incumbent
@@ -2884,6 +2967,74 @@ impl Cuda {
             Kernel {
                 function,
                 name: "b12x_mxfp8_dense_warp_sm121",
+            },
+        ))
+    }
+
+    /// Loads the kv-path rope rotation by name from the kv_path cubin.
+    ///
+    /// kernels/kv_path_sm121.cu carries three symbols and one baseline entry, so the symbols have
+    /// no KernelId: the by-name route is the same one the M=1 dense and decode GEMV symbols use for
+    /// a kernel with its own cubin.
+    pub fn load_rope_rotate(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "rope_rotate_bf16")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "rope_rotate_bf16",
+            },
+        ))
+    }
+
+    /// Loads the kv-path fused kv_norm + rope kernel by name from the kv_path cubin.
+    pub fn load_kv_norm_rope(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "kv_norm_rope_bf16")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "kv_norm_rope_bf16",
+            },
+        ))
+    }
+
+    /// ref_select_sm121: the reference candidate select, loaded by name from its own cubin (the
+    /// pin is owned by the launch module's constants, and no KernelId routes to it).
+    ///
+    /// # Errors
+    /// Returns the driver's error when the cubin does not contain the symbol.
+    pub fn load_ref_select(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "ref_select_sm121")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "ref_select_sm121",
+            },
+        ))
+    }
+
+    /// Loads the kv-path cache append by name from the kv_path cubin.
+    pub fn load_kv_append(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "kv_append_bf16")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "kv_append_bf16",
+            },
+        ))
+    }
+
+    /// Loads the kv-path window quantiser by name from the kv_path cubin.
+    pub fn load_window_quant(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "window_quant_fp8_bf16")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "window_quant_fp8_bf16",
             },
         ))
     }

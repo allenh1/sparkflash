@@ -71,6 +71,22 @@ class FrontierTest(unittest.TestCase):
         frontier.write_row(root, documents, token_documents, layout=layout)
         return root
 
+    def write_open_refusal_row(self, name="open-refusal"):
+        """A refused-at-open row: bind/loop/token JSON, rc and chain log, no layer-device document."""
+        root = self.write_row({}, name=name)
+        for relative, content in frontier.open_refusal_files().items():
+            path = os.path.join(root, relative)
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            if isinstance(content, dict):
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(content, handle)
+            else:
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(content)
+        return root
+
     def complete_documents(self, **overrides):
         return {rank: rank_document(rank, status=frontier.STATUS_COMPLETED) for rank in (0, 1, 2, 3)}
 
@@ -317,6 +333,61 @@ class FrontierTest(unittest.TestCase):
         self.assertEqual(result["exit_code"], 2)
         self.assertIn("row directory does not exist", result["stop_reason"])
 
+    # ---- open-time refusal: exit 3, not a frontier and not missing evidence ----
+
+    def test_open_time_refusal_is_its_own_verdict(self):
+        result = self.evaluate(self.write_open_refusal_row())
+        self.assertEqual(result["exit_code"], 3, result["findings"])
+        self.assertNotEqual(result["exit_code"], 2)
+        self.assertEqual(result["verdict"], "OPEN-REFUSAL")
+        self.assertTrue(result["not_a_frontier_row"])
+        info = result["open_refusal"]
+        self.assertEqual(info["stage"], "mhc_entry")
+        self.assertEqual(info["layer"], 0)
+        self.assertIn(
+            "layer device seams: layer 0: layer device weight: no hc_attn_fn for layer 0 in the resolved set",
+            info["line"],
+        )
+        self.assertTrue(info["uniform"])
+        self.assertEqual(len(info["refusals"]), 4)
+        self.assertEqual(len(info["evidence"]["bind"]), 4)
+        self.assertEqual(len(info["evidence"]["loop"]), 4)
+        self.assertEqual(len(info["evidence"]["token"]), 4)
+
+    def test_open_time_refusal_renders_the_blocker_and_the_rule(self):
+        text = frontier.render(self.evaluate(self.write_open_refusal_row(name="open-refusal-render")))
+        self.assertIn("OPEN REFUSAL (exit 3)", text)
+        self.assertIn("no hc_attn_fn for layer 0 in the resolved set", text)
+        self.assertIn("mhc_entry (layer 0)", text)
+        self.assertIn("NOT 'missing evidence'", text)
+        self.assertIn("NOT a frontier stage, NOT a ms/step", text)
+
+    def test_open_time_refusal_under_require_complete_stays_exit_3(self):
+        result = self.evaluate(self.write_open_refusal_row(name="open-refusal-complete"), require_complete=True)
+        self.assertEqual(result["exit_code"], 3)
+        self.assertTrue(any("not applicable" in warning for warning in result["warnings"]))
+
+    def test_open_time_refusal_needs_no_layer_device_document(self):
+        root = self.write_open_refusal_row(name="open-refusal-absent")
+        self.assertEqual(
+            [name for name in os.listdir(root) if name.startswith("tp4-layer-device")], []
+        )
+        self.assertEqual(self.code(root), 3)
+
+    def test_documents_missing_without_a_named_refusal_stay_exit_2(self):
+        # A bare absence with no open-time refusal line is still "cannot testify", not a refusal.
+        result = self.evaluate(self.write_row({}))
+        self.assertEqual(result["exit_code"], 2)
+        self.assertIn("rank document(s) missing", result["stop_reason"])
+
+    def test_open_time_refusal_cli_exit_code_and_verdict_line(self):
+        code, out, _err = self.run_cli(
+            ["--row-dir", self.write_open_refusal_row(name="open-refusal-cli")]
+        )
+        self.assertEqual(code, 3, out)
+        self.assertIn("OPEN REFUSAL (exit 3)", out)
+        self.assertIn("no hc_attn_fn for layer 0 in the resolved set", out)
+
     # ---- geometry, bookkeeping, note, schema ----------------------------
 
     def test_rope_geometry_formula_is_checked(self):
@@ -535,10 +606,11 @@ class FrontierTest(unittest.TestCase):
     def test_built_in_selftest_covers_both_directions(self):
         code, out, _err = self.run_cli(["--selftest"])
         self.assertEqual(code, 0, out)
-        self.assertIn("18 of 18 case(s)", out)
+        self.assertIn("19 of 19 case(s)", out)
         self.assertIn("expected=0 got=0", out)
         self.assertIn("expected=1 got=1", out)
         self.assertIn("expected=2 got=2", out)
+        self.assertIn("expected=3 got=3", out)
 
     def test_write_fixtures_writes_a_synthetic_manifest(self):
         target = os.path.join(self.tmp, "fixtures")
@@ -547,7 +619,7 @@ class FrontierTest(unittest.TestCase):
         with open(os.path.join(target, "manifest.json"), "r", encoding="utf-8") as handle:
             manifest = json.load(handle)
         self.assertTrue(manifest["synthetic"])
-        self.assertEqual(len(manifest["cases"]), 18)
+        self.assertEqual(len(manifest["cases"]), 19)
 
     # ---- the committed fixtures are the CI proof of the exit codes ------
 
@@ -570,6 +642,7 @@ class FrontierTest(unittest.TestCase):
         self.assertEqual(expected["degenerate-no-stage-ran-kv_path"], 1)
         self.assertEqual(expected["rank-different-chain"], 1)
         self.assertEqual(expected["missing-rank-document"], 2)
+        self.assertEqual(expected["open-refusal-no-frontier"], 3)
         for case in manifest["cases"]:
             row = os.path.join(FIXTURES, case["case"])
             result = frontier.evaluate(row, require_complete=case["mode"] == "complete")

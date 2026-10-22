@@ -242,3 +242,29 @@ is ~1.5 ms per tensor of overhead that is not disk. A load-path slice is open on
 per-shard reads instead of per-tensor work, queue depth, and any per-tensor thread-count query (the
 same cgroup-read bug that cost the host seams 27.6 us per call would cost 44 minutes at this tensor
 count if the loader has its own copy of it).
+
+### Correction (2026-10-22, from the load-path investigation): the rows never used the converted loader
+
+The table above compares two windows on the *default* path, and one framing in it is wrong, so it is
+corrected here rather than left to mislead. The rows run with `converted:false` and a streaming
+arena: they never touch the O_DIRECT converted loader that `!158` added. The 240-266 s upload is the
+**serial streaming walk**, and its cost is now decomposed rather than attributed:
+
+- per tensor a zeroed whole-tensor bounce buffer + `pread` + copy (safetensors `read_ranges_into`),
+  then the optional b12x repack, then the arena memcpy;
+- then an FNV-1a digest over the payload **on the same thread**, measured at ~0.64 GB/s: that is
+  **~121 s of the ~254 s**;
+- the read itself is disk-bound at ~91 s (the ~860 MB/s observed during a row), plus ~25 s of misc.
+
+So the honest statement is: the *default* path is 254 s of which **half is a hash nobody reads in the
+steady state**, and a read+hash worker pool with a single-range fast path (no bounce buffer) plus a
+per-phase `LoadTrace` (read / tile / digest / upload) measures **254 -> ~100-110 s**, i.e. a cold start
+of ~300 -> ~190 s. That work exists as a local commit on `task/loader-fast` (`2f1110af`, not pushed;
+its identity test already caught one real pooled-buffer bug) and is **parked behind the whole-layer
+device port**, which is where the user has directed the effort. It needs one gating pass and one row
+when a window opens.
+
+The earlier claim that the O_DIRECT loader took the upload from 329 s to 240 s was comparing a window
+on a different path against today's default; it is withdrawn. The measured comparison that survives is
+default-path 254 s against a pool-fast-path build measured on the box at ~100-110 s, with the digest
+as the largest single component.

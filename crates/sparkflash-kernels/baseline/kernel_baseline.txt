@@ -1,4 +1,4 @@
-# Kernel baseline: what nvcc compiles the twenty-three baseline kernels into (the six Milestone 4 kernels,
+# Kernel baseline: what nvcc compiles the twenty-seven baseline kernels into (the six Milestone 4 kernels,
 # the M7 SwiGLU quantiser epilogue and its weighted routed variant, the task-37 device router, the
 # task-8 routed gate/up GEMM, the serving tail's standalone final RMSNorm, the certified head's
 # device reduce, the CSA2 sequence attention entry, D49's ring-capacity CSA2 entry, the D37
@@ -43,3 +43,7 @@ kernel engram_embed_sm121 cubin_bytes=25376 cubin_sha256=353b6c346f94591a31d516d
 kernel engram_wkv_sm121 cubin_bytes=15008 cubin_sha256=44b128541a4056ae19d1adc434ad3837b4ad49747f34bc4df6b283270a198513 ptx_membar_lines=0
 kernel engram_gate_write_sm121 cubin_bytes=20264 cubin_sha256=590b1189a93e1b8f447bd07023df2d134f438a699c156d4ad4cceafb0d0a1527 ptx_membar_lines=0
 kernel b12x_hostw_gemv_m1_sm121 cubin_bytes=73848 cubin_sha256=ca1d8498830cddfcdb9a3f1a72e777cb0360a80e4ce7be18af514695bda6bc72 ptx_membar_lines=0
+kernel layer_seams_sm121 cubin_bytes=170672 cubin_sha256=7f5859b762fd02df2ac7be565ef41e2410158020173cebdd8e79fb732c4fb8ea ptx_membar_lines=0
+kernel kv_path_sm121 cubin_bytes=57976 cubin_sha256=65a5891b123d9da0b858823abaf80d11b39dbe07a7ecdfd71e5eb780e4a19487 ptx_membar_lines=0
+kernel ref_select_sm121 cubin_bytes=28264 cubin_sha256=b90baccac9937386c54c5fa69da88e41d759d3218ff2a1ac220dcfbba860f3e8 ptx_membar_lines=0
+kernel compressed_append_sm121 cubin_bytes=23800 cubin_sha256=77026c93f196ca290203e37b62b56a4e83853d9c5ef1eba9a6b68b72f449f7da ptx_membar_lines=0

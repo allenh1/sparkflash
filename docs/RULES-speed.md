@@ -110,6 +110,16 @@ for 81 measured steps. So:
   from construction. A row exists to decide something.
 - The probe row is for picking the next slice, not for reporting a delta. Run it when the block
   table is stale, not once per merge.
+- **A row that ends at open is a result, not a number.** The first four-rank device probe row
+  (pld1-probe2, 2026-10-22) had all four ranks exit 2 inside \`DeviceLayer::open\` with
+  \`layer device seams: layer 0: layer device weight: no hc_attn_fn for layer 0 in the resolved set\`:
+  the arm opened, the NCCL bootstrap agreed on four ranks, and the weight lookup refused before any
+  stage walk, so the row wrote bind/loop/token JSON and its chain log but no \`tp4-layer-device\`
+  frontier. That is the correct cheap outcome. Record it with
+  \`python3 scripts/device-frontier.py --row-dir <row>\` -> verdict \`OPEN REFUSAL\` (exit 3), the
+  verbatim blocker and the stage being opened (\`mhc_entry\` for layer 0). Never write it to
+  speed-log.csv as a ms/step, never call it a frontier stage, and never file it as missing evidence
+  (exit 2): the expensive part never ran, and no published number changes.
 - Every row lands as one line in [speed-log.csv](build/speed-log.csv). No per-row documents.
 - Batch merge requests the same way: one branch, one pipeline, one merge for a group of slices.
 

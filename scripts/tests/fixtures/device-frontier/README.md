@@ -30,7 +30,9 @@ rewritten, to keep it relative to this directory).
 | require-complete-on-refused-row | complete | 1 |
 | completed-frontier-incomplete | complete | 1 |
 | complete-without-logits-bins | complete | 2 |
+| open-refusal-no-frontier | probe | 3 |
 
 Exit codes: 0 = coherent (a refused probe, or a gate-eligible completed layer), 1 = a finding
 (rank disagreement, lost-chain contradiction, host arm, bad geometry, ...), 2 = cannot testify
-(missing/unreadable/empty document or missing numerical-gate input) - a stop, never a pass.
+(missing/unreadable/empty document or missing numerical-gate input) - a stop, never a pass;
+3 = the arm refused at open (blocker named, no frontier, no stage walk) - not missing evidence, not a ms/step.

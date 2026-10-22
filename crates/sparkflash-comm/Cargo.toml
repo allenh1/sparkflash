@@ -12,6 +12,10 @@ default = []
 # time, so a default build still links nothing and the feature only compiles the backend module
 # (and the doctor's rocenante-probe fabric path) into the crate.
 rdma = []
+# The GPU-initiated RDMA all-reduce arm. Design only while nvidia-peermem is root-blocked: the
+# feature exists so the ARMED shape cannot rot, and selecting the arm is a typed refusal (never a
+# silent fallback to NCCL) until the peermem rebuild lands and the implementation starts.
+gpu-rdma-reduce = []
 
 [dependencies]
 serde = { workspace = true }
@@ -38,6 +42,13 @@ path = "src/bin/rocenante-probe.rs"
 # separate binary from rocenante-probe so the doctor's field contract stays untouched.
 name = "ws-b-allreduce-bench"
 path = "src/bin/ws-b-allreduce-bench.rs"
+
+[[bin]]
+# Four-rank fabric comparison of the layer's all-reduce arms: the host spawn/join reduce the loop
+# runs today versus a dlopen'd vendored libnccl doing one enqueue per call. No GPU is needed to
+# build it; the runner is scripts/gpu-reduce-bench.sh.
+name = "gpu-reduce-bench"
+path = "src/bin/gpu-reduce-bench.rs"
 
 [[bin]]
 # Isolated host-only per-call measurement of the served 10 KiB reduce over TCP: sync total,

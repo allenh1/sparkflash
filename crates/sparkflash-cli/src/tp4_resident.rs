@@ -181,6 +181,10 @@ impl PlanIndex {
 pub(crate) struct DeviceBind {
     /// Attention-projection bind: pointers plus the named coverage.
     pub attention: crate::resident_weights::RankBind,
+    /// The ten stored seam tensors per layer (six mHC F32 + four BF16 norms): pointers plus the
+    /// named coverage. A second pointer family over the same arena; the device arm merges it into
+    /// the one WEIGHT_NAMES key space, the host arm never reads it.
+    pub mhc_seam: crate::resident_weights::RankBind,
     /// Routed/shared/router bind with its per-class coverage and launch-compatibility rows.
     pub moe: crate::resident_weights::MoeBind,
     /// Tail pointers (embedding row shard, certified head shard, final norm).
@@ -206,6 +210,7 @@ impl DeviceBind {
             world,
             table_entries,
             &self.attention,
+            Some(&self.mhc_seam),
             Some(&self.moe),
             Some((&self.tail, &self.tail_coverage)),
             Some(&self.census),
@@ -225,6 +230,7 @@ fn bind_evidence(
     world: usize,
     table_entries: usize,
     attention: &crate::resident_weights::RankBind,
+    mhc_seam: Option<&crate::resident_weights::RankBind>,
     moe: Option<&crate::resident_weights::MoeBind>,
     tail: Option<(
         &crate::resident_weights::TailBind,
@@ -244,7 +250,10 @@ fn bind_evidence(
         })
         .unwrap_or(0);
     let tail_bound = tail.map(|(_, coverage)| coverage.bound.len()).unwrap_or(0);
-    let device_bound = attention_bound + moe_bound + tail_bound;
+    let mhc_seam_bound = mhc_seam
+        .map(|class| class.coverage.bound.len())
+        .unwrap_or(0);
+    let device_bound = attention_bound + moe_bound + tail_bound + mhc_seam_bound;
     let tail_pointers_nonzero = tail
         .map(|(tail, _)| [tail.embed.0, tail.head.0, tail.norm.0])
         .is_some_and(|pointers| pointers.iter().all(|pointer| *pointer != 0));
@@ -252,6 +261,7 @@ fn bind_evidence(
         && attention.coverage.complete()
         && moe.is_some_and(|moe| moe.coverage.iter().all(|(_, coverage)| coverage.complete()))
         && tail.is_some_and(|(_, coverage)| coverage.complete())
+        && mhc_seam.is_some_and(|class| class.coverage.complete())
         && census.is_some_and(|census| census.unclassified.is_empty());
     let moe_evidence = match moe {
         Some(moe) => moe.evidence(),
@@ -296,6 +306,18 @@ fn bind_evidence(
             "coverage": attention.coverage.evidence("attention"),
             "note": "device arm: wq_b/wo_a column, wo_b row; tensors_expected is the device-served set (table minus structurally excluded host seams), so bound == expected means full coverage",
         },
+        "mhc_seam": match mhc_seam {
+            Some(class) => json!({
+                "tensors_expected": class.coverage.expected.len(),
+                "tensors_bound": class.coverage.bound.len(),
+                "coverage": class.coverage.evidence("mhc_seam"),
+                "note": "the ten stored seam tensors per layer (six mHC F32 + the two block norms and the two q/kv norms, BF16): already resident in the plan's arena and bound here as stored pointers; the four norms are not in the attention projection class, so no name is bound twice; a device row's grep -c hc_ on the names manifest should read 240",
+            }),
+            None => json!({
+                "performed": false,
+                "note": "the mhc_seam bind has not completed",
+            }),
+        },
         "moe": moe_evidence,
         "tail": tail_evidence,
         "census": census_evidence,
@@ -321,6 +343,7 @@ fn write_bind_progress(
     world: usize,
     table_entries: usize,
     attention: &crate::resident_weights::RankBind,
+    mhc_seam: Option<&crate::resident_weights::RankBind>,
     moe: Option<&crate::resident_weights::MoeBind>,
     tail: Option<(
         &crate::resident_weights::TailBind,
@@ -334,6 +357,7 @@ fn write_bind_progress(
         world,
         table_entries,
         attention,
+        mhc_seam,
         moe,
         tail,
         census,
@@ -379,7 +403,28 @@ fn bind_in_arena(
         None,
         None,
         None,
+        None,
     )?;
+    // The seam class: a second pointer family over the same arena, additive - no allocation, no
+    // read, no copy, and the shards are already resident because the plan enumerates them.
+    let mhc_seam = match crate::resident_weights::bind_rank_mhc_seam(arena, &setup.plan, config) {
+        Ok(class) => class,
+        Err(error) => {
+            write_bind_progress(
+                &bind_path,
+                rank,
+                world,
+                table.len(),
+                &attention,
+                None,
+                None,
+                None,
+                None,
+                Some(&error),
+            )?;
+            return Err(error);
+        }
+    };
     let moe = match crate::resident_weights::bind_rank_moe(arena, &setup.plan, config) {
         Ok(moe) => moe,
         Err(error) => {
@@ -389,6 +434,7 @@ fn bind_in_arena(
                 world,
                 table.len(),
                 &attention,
+                Some(&mhc_seam),
                 None,
                 None,
                 None,
@@ -404,6 +450,7 @@ fn bind_in_arena(
         world,
         table.len(),
         &attention,
+        Some(&mhc_seam),
         Some(&moe),
         None,
         None,
@@ -412,6 +459,7 @@ fn bind_in_arena(
     let (tail, tail_coverage) = crate::resident_weights::bind_rank_tail(arena, &setup.plan)?;
     let census = crate::resident_weights::resident_plan_census(&setup.plan, table);
     let mut manifest_lines = attention.coverage.manifest_lines("attention");
+    manifest_lines.extend(mhc_seam.coverage.manifest_lines("mhc_seam"));
     for (class, coverage) in &moe.coverage {
         manifest_lines.extend(coverage.manifest_lines(class));
     }
@@ -423,6 +471,7 @@ fn bind_in_arena(
         world,
         table.len(),
         &attention,
+        Some(&mhc_seam),
         Some(&moe),
         Some((&tail, &tail_coverage)),
         Some(&census),
@@ -430,6 +479,7 @@ fn bind_in_arena(
     )?;
     Ok(DeviceBind {
         attention,
+        mhc_seam,
         moe,
         tail,
         tail_coverage,

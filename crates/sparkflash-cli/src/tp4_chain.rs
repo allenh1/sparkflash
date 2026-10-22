@@ -445,9 +445,20 @@ fn build_token_request<'a>(
     weights: Option<&'a sparkflash_engine::safetensors::SafeTensorsSource>,
 ) -> crate::tp4_forward::TokenStageRequest<'a> {
     let (combine_rows, combine_bytes) = combine_geometry_from_plan(&setup.plan);
+    // The run's ONE arm decision: each switch is read here, exactly once, and carried in the
+    // request. Evidence recording forces the host arm, so the chain's bootstrap must gate on this
+    // decision (request.arm.is_device()) rather than on the device switch alone.
+    let (arm, evidence) = crate::layer_device::decide_layer_arm(
+        std::env::var(crate::layer_device::LAYER_DEVICE_ENV)
+            .ok()
+            .as_deref(),
+        std::env::var("SPARKFLASH_FORWARD_EVIDENCE").ok().as_deref(),
+    );
     crate::tp4_forward::TokenStageRequest {
         rank: args.rank,
         world: args.world,
+        arm,
+        evidence,
         n_layers,
         positions: args.decode_steps.max(1),
         evidence_dir: &args.evidence_dir,
@@ -465,6 +476,11 @@ fn build_token_request<'a>(
         prefill_limit: args.prefill_limit,
         native_rounding: args.native_rounding,
         native_dense_parity: args.native_dense_parity,
+        // None here is the HOST arm and the plan-only default. The arena path's closure in run_loop
+        // replaces this field with Some(DeviceReduce) after the bootstrap opens the run's
+        // communicator before the timed region (one open per run, before layer 0); nothing else fills
+        // it, so the field has exactly one writer on the device arm.
+        reduce: None,
         forward_perf: crate::tp4_forward::ForwardPerf {
             probe: args.forward_perf_probe || args.forward_perf_probe_nosync,
             probe_nosync: args.forward_perf_probe_nosync,
@@ -541,6 +557,38 @@ fn open_transport(args: &ChainArgs) -> Result<TcpTransport, String> {
 /// sockets: the loop runs inside the arena epoch, before the walk, and a first prefill gather frame
 /// must not be able to land in a walk all-reduce stream (m1x failed exactly that way).
 const FORWARD_LOOP_PORT_OFFSET: u16 = 100;
+
+/// bf16 elements of ONE per-layer device collective: the two per-layer reduces (attention output
+/// and the routed MoE delta) are both the plan's dim, 5,120 bf16 = 10,240 B per call in the released
+/// config. This is layer_device's constant, not a second copy: the port's rungs and the warm-up must
+/// agree on the count or the warm-up does not warm the shape the loop enqueues.
+const REDUCE_PAYLOAD_ELEMENTS: usize = crate::layer_device::REDUCE_ELEMENTS;
+
+/// Device scratch bytes for the communicator's setup warm-up: one payload's worth of bf16, the
+/// in-place buffer the three warm-up collectives reduce over. Setup only; freed after the run.
+const REDUCE_SCRATCH_BYTES: usize = REDUCE_PAYLOAD_ELEMENTS * 2;
+
+/// The per-process behaviour switches the bootstrap's agreement word carries.
+///
+/// These MIRROR the readers in tp4_forward, which use PRESENCE semantics
+/// (std::env::var(...).is_ok()); a per-rank difference here changes arithmetic with no failure, which
+/// is exactly why the word crosses the bootstrap gather and is refused on mismatch. If a reader changes
+/// its acceptance rule, or a new per-process arithmetic switch appears, this word must change with it
+/// in the same edit. (SPARKFLASH_DEVICE_TRACE / _EVENTS belong to the trace reader in the review
+/// branch; they are carried here so a rank with one set cannot silently join a run without it.)
+fn behaviour_toggles() -> u16 {
+    let mut word = 0u16;
+    if std::env::var("SPARKFLASH_SEAM_REF_HOST").is_ok() {
+        word |= 1 << 0;
+    }
+    if std::env::var("SPARKFLASH_DEVICE_TRACE").is_ok() {
+        word |= 1 << 1;
+    }
+    if std::env::var("SPARKFLASH_DEVICE_TRACE_EVENTS").is_ok() {
+        word |= 1 << 2;
+    }
+    word
+}
 
 /// [open_transport] on an explicit base port, for the forward loop's separate protocol range.
 fn open_transport_with_base(args: &ChainArgs, base_port: u16) -> Result<TcpTransport, String> {
@@ -906,9 +954,108 @@ fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
                                 )?);
                             }
                             let transport = forward_loop_transport.as_ref();
-                            Ok(crate::tp4_forward::run_with_arena(
+                            // The run's ONE NCCL communicator (crate::tp4_reduce): the id rendezvous
+                            // over this loop's own transport, one open on every rank, the setup
+                            // warm-up and its single sync - all before layer 0 and outside the timed
+                            // region. Any failure here aborts this rank BEFORE run_with_arena, so a
+                            // bootstrap failure can never reach a layer (every peer aborts through the
+                            // same gather timeout: no rank opens alone, no half-open communicator).
+                            //
+                            // Gated on the arm the loop will actually take: the request's decision,
+                            // computed once by decide_layer_arm before this closure ran (which is
+                            // also why evidence recording, which forces the host arm, cannot open a
+                            // communicator here). HOST ARM: no Cuda::load, no scratch allocation, no open, no
+                            // warm-up enqueues, reduce stays None - that arm produced 179.81 ms/step
+                            // and must not acquire a libnccl dependency or a new setup cost. DEVICE
+                            // ARM: the sequence above runs on every rank, and the two collective
+                            // bodies enqueue on the handle this block attaches.
+                            let mut reduce_cuda: Option<sparkflash_kernels::cuda_driver::Cuda> =
+                                None;
+                            let mut reduce_scratch: Option<
+                                sparkflash_kernels::cuda_driver::Deviceptr,
+                            > = None;
+                            let mut run_reduce: Option<
+                                std::cell::RefCell<sparkflash_comm::RunReduce>,
+                            > = None;
+                            if request.arm.is_device()
+                                && let Some(transport) = transport
+                            {
+                                // The rendezvous agreement words: the arm bit, the run's
+                                // native-rounding selection, the per-process behaviour switches and
+                                // the plan digest. Every rank must match or no rank enters NCCL.
+                                let reduce_config =
+                                    sparkflash_comm::device_reduce::BootstrapConfig {
+                                        native_rounding: u16::from(args.native_rounding.combine)
+                                            | (u16::from(args.native_rounding.mhc) << 1)
+                                            | (u16::from(args.native_rounding.shared) << 2),
+                                        env_toggles: behaviour_toggles(),
+                                        plan_digest: setup.plan.plan_hash(),
+                                    };
+                                let cuda = sparkflash_kernels::cuda_driver::Cuda::load().map_err(
+                                    |error| {
+                                        format!(
+                                            "forward reduce bootstrap r{}: opening the run's CUDA context for the setup sync: {error}",
+                                            args.rank
+                                        )
+                                    },
+                                )?;
+                                let mut allocated = 0usize;
+                                let scratch = cuda
+                                    .alloc(REDUCE_SCRATCH_BYTES, &mut allocated)
+                                    .map_err(|error| {
+                                        format!(
+                                            "forward reduce bootstrap r{}: allocating the {REDUCE_SCRATCH_BYTES}-byte warm-up scratch: {error}",
+                                            args.rank
+                                        )
+                                    })?;
+                                let opened = crate::tp4_reduce::open_run_reduce(
+                                    transport,
+                                    args.world,
+                                    args.rank,
+                                    0, // the legacy default stream: every launch of this loop is on it
+                                    scratch.0,
+                                    REDUCE_PAYLOAD_ELEMENTS,
+                                    reduce_config,
+                                )
+                                .map_err(|error| {
+                                    format!(
+                                        "forward reduce bootstrap r{}: {error}; aborting this rank before any layer - a bootstrap failure must not reach a layer",
+                                        args.rank
+                                    )
+                                });
+                                match opened {
+                                    Ok(opened) => {
+                                        run_reduce = Some(std::cell::RefCell::new(opened));
+                                        reduce_scratch = Some(scratch);
+                                        reduce_cuda = Some(cuda);
+                                    }
+                                    Err(error) => {
+                                        // A surviving process must not leak the setup scratch: free
+                                        // it before the rank aborts the run.
+                                        cuda.free_buffers(&[&scratch]);
+                                        return Err(error);
+                                    }
+                                }
+                            }
+                            // The request borrows the handle for the whole run: every rank attaches
+                            // the SAME communicator to both per-layer stages, and the field replacement
+                            // below is the only place a TokenStageRequest's reduce becomes Some.
+                            let request = crate::tp4_forward::TokenStageRequest {
+                                reduce: run_reduce.as_ref().map(crate::tp4_forward::DeviceReduce),
+                                ..request
+                            };
+                            let outcome = crate::tp4_forward::run_with_arena(
                                 &request, &plan, arena, bind, transport,
-                            ))
+                            );
+                            // The run has returned; its teardown sync has observed the last collective.
+                            // Only now are the setup scratch and (at scope end, via Drop) the
+                            // communicator released - never before a run's last enqueue completed.
+                            if let (Some(cuda), Some(scratch)) =
+                                (reduce_cuda.as_ref(), reduce_scratch.as_ref())
+                            {
+                                cuda.free_buffers(&[scratch]);
+                            }
+                            Ok(outcome)
                         },
                     )?;
                 (bind, arena_evidence, _arena_lines, Some(outcome))

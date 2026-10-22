@@ -4256,7 +4256,15 @@ mod tests {
         assert!(
             text.contains("chain_execution=false; device_execution=false; token_produced=false")
         );
-        assert!(text.contains("23 baseline pins parsed"));
+        // The count is derived, not hardcoded: a kernel added to the catalog must not fail this
+        // test for the number alone (the count is the catalog's, and the catalog is asserted above).
+        let pins_now = sparkflash_device::cubins::baseline_pins()
+            .expect("baseline")
+            .len();
+        assert!(
+            text.contains(&format!("{pins_now} baseline pins parsed")),
+            "the plan quotes the catalog's own pin count ({pins_now})"
+        );
         assert!(
             text.contains("crates/sparkflash-kernels/baseline/kernel_baseline.txt"),
             "the catalog names the repository path, not a crate-relative one"

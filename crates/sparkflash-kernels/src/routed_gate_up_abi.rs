@@ -230,8 +230,8 @@ mod tests {
         // The header count and toolkit are part of the same claim: this is one of twenty-one
         // entries.
         assert!(
-            BASELINE.contains("twenty-three baseline kernels"),
-            "the manifest header must say twenty-three"
+            BASELINE.contains("twenty-seven baseline kernels"),
+            "the manifest header must say twenty-seven"
         );
         assert!(BASELINE.contains(&format!("nvcc_release={TOOLKIT_RELEASE}")));
         assert!(BASELINE.contains("arch=sm_121a"));

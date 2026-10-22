@@ -23,6 +23,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "cuda")]
+use crate::layer_device::LayerStages;
+#[cfg(feature = "cuda")]
+use sparkflash_kernels::cuda_driver::Cuda;
 use sparkflash_kernels::cuda_driver::Deviceptr;
 
 use sparkflash_comm::tcp::TcpTransport;
@@ -285,6 +289,23 @@ impl Drop for ForwardReduce<'_> {
             self.tcp_calls.get()
         );
     }
+}
+
+/// Writes the device arm's frontier line as its own document.
+///
+/// Why it exists: a device-stage refusal returns before the end-of-run record is assembled, so
+/// without this the frontier would exist only in the error text. The first device row is a frontier
+/// probe, so the frontier has to be a file a collector can read, on both the completed and the
+/// refused path. It states the arm, the stage the arm stopped at, the refusal verbatim, and the
+/// geometry the row was built with.
+pub fn write_layer_device_frontier(
+    path: &std::path::Path,
+    body: &serde_json::Value,
+) -> Result<usize, String> {
+    let json = serde_json::to_vec_pretty(body)
+        .map_err(|error| format!("layer device frontier json: {error}"))?;
+    std::fs::write(path, &json).map_err(|error| format!("write {}: {error}", path.display()))?;
+    Ok(json.len())
 }
 
 /// The default-off M2 forward diagnostics switches (--forward-lean, --forward-perf-probe).
@@ -2436,12 +2457,39 @@ fn native_dense_parity_checks(
 pub const DEFAULT_COMBINE_ROWS: usize = 5120;
 
 /// One rank's forward/token stage request.
+/// The run's device reduce handle as the token stage carries it.
+///
+/// The handle itself is comm's object, opened by the chain's bootstrap before the timed region and
+/// owned there; this wrapper only lets the request keep its `Debug`/`Clone` derives without
+/// requiring `RunReduce: Debug` (a communicator is not a printable value). The collective stages
+/// borrow it: one handle, both per-layer collectives, no clone of any communicator state.
+#[derive(Clone, Copy)]
+pub struct DeviceReduce<'a>(pub &'a std::cell::RefCell<sparkflash_comm::RunReduce>);
+
+impl std::fmt::Debug for DeviceReduce<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("device reduce handle")
+    }
+}
+
+/// One rank's forward/token stage request: the arm decision, the loop geometry, the evidence and
+/// kernel roots, and the device reduce handle it borrows.
+///
+/// The arm is carried as a value and never re-read from the environment below the decision site, so
+/// the loop, the chain's bootstrap and the evidence record cannot disagree about it.
 #[derive(Debug, Clone)]
 pub struct TokenStageRequest<'a> {
     /// This rank.
     pub rank: usize,
     /// The world size (4).
     pub world: usize,
+    /// The arm this run takes, decided ONCE by the caller from the two raw switches
+    /// ([crate::layer_device::decide_layer_arm]) before any device work. The loop, the chain's
+    /// bootstrap and the record all read this field; nothing below re-reads the environment.
+    pub arm: crate::layer_device::LayerArm,
+    /// Whether the per-layer evidence chain is recorded - the same decision's second half, carried
+    /// so the loop does not read `SPARKFLASH_FORWARD_EVIDENCE` again after the bootstrap.
+    pub evidence: bool,
     /// Layers in the loop (40 on the released plan).
     pub n_layers: usize,
     /// Decode positions requested (`--decode-steps`); the loop advances at most this many.
@@ -2490,6 +2538,11 @@ pub struct TokenStageRequest<'a> {
     pub native_dense_parity: Option<NativeDenseParitySpec>,
     /// The default-off M2 lean measurement switch.
     pub forward_perf: ForwardPerf,
+    /// The run's device reduce handle, opened by the chain's bootstrap before the timed region and
+    /// owned there. One handle for the whole run carries both per-layer collectives; None means no
+    /// communicator was opened (the host arm, or the bootstrap's open refused), and the two device
+    /// collective stages then refuse by name - the host arm's collectives stay host-side.
+    pub reduce: Option<DeviceReduce<'a>>,
 }
 
 /// What the token stage produced: a run, or a refusal envelope with its named reason.
@@ -7077,6 +7130,9 @@ struct SharedExpertDevice {
     dim: usize,
     /// Intermediate width (2304 on the released plan).
     inter: usize,
+    /// The bytes this prewarm allocated on the device (every operand and the scratch), so the run
+    /// record can state the arm's shared-expert cost instead of estimating it.
+    device_bytes: usize,
 }
 
 /// One layer's resident shared-expert weights and scales, B12x-tiled.
@@ -7089,6 +7145,85 @@ struct SharedExpertDeviceLayer {
     s3: sparkflash_kernels::cuda_driver::Deviceptr,
     w2: sparkflash_kernels::cuda_driver::Deviceptr,
     s2: sparkflash_kernels::cuda_driver::Deviceptr,
+}
+
+/// The routed MoE geometry the arm asserts at open.
+///
+/// The released four-rank shape is the only one the routed kernels are launched for (world 4, 384
+/// experts, top-6, 576 rows per rank), so a config that disagrees refuses at open rather than stage
+/// a weight whose slice shape is wrong. The routed expert slices are arena pointers, not copies:
+/// the arm holds them and every token's six experts index into them.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoutedGeometry {
+    /// Hidden size.
+    dim: usize,
+    /// `moe_inter_dim`: the expert intermediate width before the rank split.
+    inter: usize,
+    /// `moe_inter_dim / world`: the rows this rank's gate/up shard and down shard's inner width.
+    local_inter: usize,
+    /// `n_routed_experts`.
+    experts: usize,
+    /// `n_activated_experts`: the router's top-k.
+    top_k: usize,
+    /// The four-rank world.
+    world: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl RoutedGeometry {
+    /// The released routed shape, refused by name for any other config.
+    ///
+    /// # Errors
+    /// A world other than four, a routed/activated expert count or width that is not the released
+    /// one, or an intermediate width that does not split into whole 32-value blocks.
+    fn new(config: &sparkflash_engine::config::ModelConfig, world: usize) -> Result<Self, String> {
+        let dim = config.dim;
+        let inter = config.moe_inter_dim;
+        let experts = config.n_routed_experts;
+        let top_k = config.n_activated_experts;
+        if world == 0 || !inter.is_multiple_of(world) {
+            return Err(format!(
+                "layer device routed MoE: intermediate width {inter} does not split over {world} ranks"
+            ));
+        }
+        let local_inter = inter / world;
+        for (name, values) in [("dim", dim), ("inter", inter), ("local_inter", local_inter)] {
+            if values == 0 || !values.is_multiple_of(32) {
+                return Err(format!(
+                    "layer device routed MoE: {name} {values} is not a whole number of 32-value blocks"
+                ));
+            }
+        }
+        if top_k == 0 || top_k > experts {
+            return Err(format!(
+                "layer device routed MoE: top-{top_k} does not fit {experts} routed experts"
+            ));
+        }
+        Ok(Self {
+            dim,
+            inter,
+            local_inter,
+            experts,
+            top_k,
+            world,
+        })
+    }
+}
+
+/// The shared expert's operands and scratch as the layer arm keeps them after `attach_shared`.
+///
+/// The pointers are the prewarm's own (`SharedExpertDevice`): the layer arm copies the addresses,
+/// not the data, so the gather stays one-per-run and the buffers stay one-per-run too. `device_bytes`
+/// is the prewarm's allocation total, recorded in `layer_device_memory` so the arm's cost is a
+/// stated number.
+#[cfg(feature = "cuda")]
+#[derive(Clone)]
+struct SharedExpertOperands {
+    layers: Vec<SharedExpertDeviceLayer>,
+    workspace: SharedExpertWorkspace,
+    inter: usize,
+    device_bytes: usize,
 }
 
 /// The shared expert's per-token scratch: one row of each operand and result.
@@ -7267,6 +7402,7 @@ fn build_shared_expert_device(
         _swiglu_module: swiglu_module,
         dim,
         inter,
+        device_bytes: allocated,
     })
 }
 
@@ -8612,6 +8748,15 @@ pub(crate) mod probe {
         static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
     }
 
+    thread_local! {
+        /// One execution of a steady-state loop stage, counted rather than timed.
+        ///
+        /// The loop closes no probe block per stage: a block's record costs a boundary drain (the
+        /// twelve D2H observation points this branch removed). The counters are per run, and only the
+        /// run record reads them.
+        static STAGE_COUNTS: RefCell<BTreeMap<&'static str, u64>> = const { RefCell::new(BTreeMap::new()) };
+    }
+
     /// The cheap gate the hot helpers read: false is the default path.
     static ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -8898,6 +9043,27 @@ pub(crate) mod probe {
         timer: BlockTimer,
     ) {
         record(cuda, Scope::Layer(layer), name, timer);
+    }
+
+    /// Counts one execution of a steady-state loop stage: no timer, no snapshot, no drain.
+    pub(crate) fn count(name: &'static str) {
+        STAGE_COUNTS.with(|counts| *counts.borrow_mut().entry(name).or_insert(0) += 1);
+    }
+
+    /// One stage's count as this thread has recorded it, for a per-position written gate.
+    pub(crate) fn stage_count(name: &'static str) -> u64 {
+        STAGE_COUNTS.with(|counts| counts.borrow().get(name).copied().unwrap_or(0))
+    }
+
+    /// The per-run stage counts, ascending by name, for the run record.
+    pub(crate) fn stage_counts() -> Vec<(&'static str, u64)> {
+        STAGE_COUNTS.with(|counts| {
+            counts
+                .borrow()
+                .iter()
+                .map(|(name, count)| (*name, *count))
+                .collect()
+        })
     }
 
     /// Records a head-scope block (grouped under the current position).
@@ -9969,6 +10135,121 @@ fn run_layer_mhc_entry(
 /// A directory or file write failure, or a BF16 decode failure.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
+/// The stage timing ring's event capacity: `SPARKFLASH_DEVICE_TRACE_EVENTS` when set, else the
+/// module default.
+///
+/// A capacity that is not a power of two, or exceeds the maximum, is refused rather than rounded:
+/// the ring header stores `capacity - 1` in a `u32` mask, so a rounded value would silently change
+/// which slots the kernels write.
+#[cfg(feature = "cuda")]
+fn device_trace_capacity() -> Result<usize, String> {
+    let Some(raw) = std::env::var("SPARKFLASH_DEVICE_TRACE_EVENTS").ok() else {
+        return Ok(sparkflash_kernels::device_trace::DEFAULT_CAPACITY);
+    };
+    let capacity: usize = raw
+        .parse()
+        .map_err(|_| format!("SPARKFLASH_DEVICE_TRACE_EVENTS={raw} is not an event count"))?;
+    if !capacity.is_power_of_two() || capacity > sparkflash_kernels::device_trace::MAX_CAPACITY {
+        return Err(format!(
+            "SPARKFLASH_DEVICE_TRACE_EVENTS={capacity} is not a power of two no larger than {}",
+            sparkflash_kernels::device_trace::MAX_CAPACITY
+        ));
+    }
+    Ok(capacity)
+}
+
+/// The probe record's `stage_trace` object for a decoded ring.
+///
+/// Built outside `DeviceLayer` so a unit test can pin the record's shape with a synthetic ring; the
+/// decode and the stage attribution are pinned in `sparkflash_kernels::device_trace`.
+#[cfg(feature = "cuda")]
+fn stage_trace_document(
+    decoded: &sparkflash_kernels::device_trace::DecodedRing,
+) -> serde_json::Value {
+    let (rows, unattributed) = sparkflash_kernels::device_trace::stages(&decoded.events);
+    serde_json::json!({
+        "source": "host-mapped GpuTraceRing; one record per launch, read with no copy and no synchronize",
+        "capacity": decoded.capacity,
+        "events_written": decoded.written,
+        "events_read": decoded.events.len(),
+        "wrapped": decoded.wrapped,
+        "unattributed_events": unattributed,
+        "stages": rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "stage": row.stage,
+                    "calls": row.calls,
+                    "total_ns": row.total_ns,
+                    "min_ns": row.min_ns,
+                    "mean_ns": row.mean_ns(),
+                    "max_ns": row.max_ns,
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+#[cfg(all(test, feature = "cuda"))]
+mod stage_trace_tests {
+    use super::*;
+    use sparkflash_kernels::device_trace;
+
+    /// A two-event ring: one `mhc_entry` launch of 10 ns and one `ffn_seams` launch of 30 ns.
+    fn decoded_ring() -> device_trace::DecodedRing {
+        let capacity = 2usize;
+        let mut bytes = vec![0u8; device_trace::ring_bytes(capacity)];
+        bytes[..device_trace::TRACE_HEADER_BYTES].copy_from_slice(&device_trace::header_bytes(
+            capacity,
+            device_trace::SEAM_SCOPE_MASK,
+        ));
+        for (slot, code, start, end) in [
+            (0usize, device_trace::STAGE_MHC_ENTRY, 100u64, 110u64),
+            (1, device_trace::STAGE_FFN_SEAMS, 200, 230),
+        ] {
+            let base = device_trace::TRACE_HEADER_BYTES + slot * device_trace::TRACE_EVENT_BYTES;
+            bytes[base..base + 8].copy_from_slice(&start.to_le_bytes());
+            bytes[base + 8..base + 16].copy_from_slice(&end.to_le_bytes());
+            // Scope bit index 11 is DENSE_MXFP8 in the kernel encoding (__ffsll of 1 << 10).
+            bytes[base + 20..base + 24].copy_from_slice(&(11u32 << 8).to_le_bytes());
+            bytes[base + 28..base + 32].copy_from_slice(&code.to_le_bytes());
+        }
+        bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+        device_trace::decode(&bytes).expect("decode")
+    }
+
+    #[test]
+    fn the_stage_trace_document_carries_one_row_per_stage_and_the_measured_durations() {
+        let document = stage_trace_document(&decoded_ring());
+        assert_eq!(document["capacity"], 2);
+        assert_eq!(document["events_written"], 2);
+        assert_eq!(document["events_read"], 2);
+        assert_eq!(document["wrapped"], false);
+        assert_eq!(document["unattributed_events"], 0);
+        let stages = document["stages"].as_array().expect("stages array");
+        assert_eq!(stages.len(), device_trace::STAGE_TABLE.len());
+        let entry = stages
+            .iter()
+            .find(|row| row["stage"] == "mhc_entry")
+            .expect("entry row");
+        assert_eq!(entry["calls"], 1);
+        assert_eq!(entry["total_ns"], 10);
+        assert_eq!(entry["mean_ns"], 10);
+        assert_eq!(entry["min_ns"], 10);
+        assert_eq!(entry["max_ns"], 10);
+        let ffn = stages
+            .iter()
+            .find(|row| row["stage"] == "ffn_seams")
+            .expect("ffn row");
+        assert_eq!(ffn["total_ns"], 30);
+        let rope = stages
+            .iter()
+            .find(|row| row["stage"] == "rope_rows")
+            .expect("rope row");
+        assert_eq!(rope["calls"], 0);
+    }
+}
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 fn write_boundary_trace_row(
     trace_root: &std::path::Path,
     position: usize,
@@ -10006,6 +10287,2529 @@ fn write_boundary_trace_row(
             .map_err(|error| format!("boundary trace {}: {error}", path.display()))?;
     }
     Ok(())
+}
+
+/// The eight seam kernels the whole-layer port launches, resolved from their one pinned cubin.
+///
+/// The eight symbols are one image and one baseline pin; the driver hands out one module handle per
+/// symbol load, so eight handles keep the image resident and the drop frees all eight. One ABI, one
+/// owner: every argument array is `sparkflash_kernels::layer_seams_launch`'s (pinned against the
+/// parsed kernel source), and this struct only carries what open resolved.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug)]
+struct LayerSeamKernels {
+    /// `mhc_entry_bf16`: the mHC entry's projection and coefficient tail, hc_pre and the
+    /// attention block's RMSNorm, in one launch.
+    entry: sparkflash_kernels::cuda_driver::Kernel,
+    /// `mhc_ffn_seams`: the FFN's mHC entry, its RMSNorm and its activation quantiser.
+    ffn_seams: sparkflash_kernels::cuda_driver::Kernel,
+    /// `w8a8_prologue_e4m3`: the attention projection's activation quantiser.
+    prologue: sparkflash_kernels::cuda_driver::Kernel,
+    /// `w8a8_prologue_bf16_e4m3`: the same quantiser over the bf16 q_norm row, which is the
+    /// reference's operand (the f32 variant over-read a half-width span).
+    #[allow(dead_code)]
+    prologue_bf16: sparkflash_kernels::cuda_driver::Kernel,
+    /// `mhc_attn_residual`: the attention sublayer's hc_post over the reduced delta.
+    attn_residual: sparkflash_kernels::cuda_driver::Kernel,
+    /// `mhc_ffn_epilogue`: the shared-expert add and the FFN's hc_post.
+    ffn_epilogue: sparkflash_kernels::cuda_driver::Kernel,
+    /// `shared_swiglu_f32`: the shared expert's activation, launched by `moe_shared` (gemv's stage)
+    /// when its default arm runs; loaded here so the seam image stays one cubin and one open.
+    #[allow(dead_code)]
+    shared_swiglu: sparkflash_kernels::cuda_driver::Kernel,
+    /// `rope_rotate_rows_bf16`: the attention output's RoPE over the body's per-rank head rows,
+    /// with the rotation's sign as an argument word (1 forward, -1 the output's inverse). Loaded
+    /// here so the symbol, its ABI pin and its module are one image; the `attention_output` stage
+    /// owns the launch.
+    #[allow(dead_code)]
+    rope_rows: sparkflash_kernels::cuda_driver::Kernel,
+    /// The eight module handles (one per symbol: the driver hands out one module per load) keep
+    /// the image resident; all eight are freed by `DeviceLayer`'s drop.
+    entry_module: sparkflash_kernels::cuda_driver::Module,
+    ffn_module: sparkflash_kernels::cuda_driver::Module,
+    prologue_module: sparkflash_kernels::cuda_driver::Module,
+    #[allow(dead_code)]
+    prologue_bf16_module: sparkflash_kernels::cuda_driver::Module,
+    attn_residual_module: sparkflash_kernels::cuda_driver::Module,
+    ffn_epilogue_module: sparkflash_kernels::cuda_driver::Module,
+    #[allow(dead_code)]
+    shared_swiglu_module: sparkflash_kernels::cuda_driver::Module,
+    #[allow(dead_code)]
+    rope_rows_module: sparkflash_kernels::cuda_driver::Module,
+}
+
+#[cfg(feature = "cuda")]
+/// Resolves one attention-path weight from the bind, by plan tensor name.
+///
+/// Unused until a stage body asks for a weight: the prefix stages are the first consumers, so
+/// this is the honest state (the ABI is pinned by the layer_device tests), not a stub.
+#[allow(dead_code)]
+///
+/// # Errors
+/// The name is absent, or its weight word is zero (a null device pointer).
+fn resolve_weight(
+    pointers: &std::collections::BTreeMap<String, (Deviceptr, Deviceptr)>,
+    plan_name: &str,
+) -> Result<Deviceptr, String> {
+    let by_name: std::collections::BTreeMap<String, (u64, u64)> = pointers
+        .iter()
+        .map(|(name, (weight, scales))| (name.clone(), (weight.0, scales.0)))
+        .collect();
+    let address = crate::layer_device::resolve_weight(&by_name, plan_name)?;
+    Ok(Deviceptr(address))
+}
+
+/// The typed weights the port's stages need: one entry per (layer, index into WEIGHT_NAMES),
+/// resolved once at open by scanning the bind's keys. Never a per-position string lookup: the loop
+/// this port exists to speed up must not carry a host map lookup per position.
+#[derive(Debug, Clone, Default)]
+#[cfg(feature = "cuda")]
+#[allow(dead_code)]
+struct LayerWeights {
+    by_layer: std::collections::BTreeMap<(usize, usize), (Deviceptr, Deviceptr)>,
+}
+
+#[cfg(feature = "cuda")]
+#[allow(dead_code)]
+impl LayerWeights {
+    /// Merges the two bind classes into the one name map, then resolves the WEIGHT_NAMES keys
+    /// once. The mHC seam tensors are their own class (mhc_seam, ten stored tensors per layer:
+    /// six hc_* plus the four block norms); they are NOT in the attention class, so a resolve that
+    /// read only attention refused at layer 0 first seam on the probe row.
+    ///
+    /// # Errors
+    /// * the class is present but bound nothing while it expects names (the class sentence, with
+    ///   the coverage counters verbatim, so a missing class is never reported as a missing tensor);
+    /// * one name arrives from both classes with different addresses (a bind bug, refused rather
+    ///   than let map order pick a winner).
+    fn resolve(
+        attention: Option<&crate::resident_weights::RankBind>,
+        mhc_seam: Option<&crate::resident_weights::RankBind>,
+    ) -> Result<Self, String> {
+        let mut pointers: std::collections::BTreeMap<String, (u64, u64)> =
+            std::collections::BTreeMap::new();
+        let merge = |class: &crate::resident_weights::RankBind,
+                     pointers: &mut std::collections::BTreeMap<String, (u64, u64)>|
+         -> Result<(), String> {
+            for (name, (weight, scales)) in &class.pointers {
+                let pair = (weight.0, scales.0);
+                if let Some(previous) = pointers.insert(name.clone(), pair)
+                    && previous != pair
+                {
+                    return Err(format!(
+                        "layer device weight: {name} bound twice with different addresses ({:#x} vs {:#x})",
+                        previous.0, pair.0
+                    ));
+                }
+            }
+            Ok(())
+        };
+        if let Some(class) = mhc_seam {
+            let coverage = &class.coverage;
+            if coverage.bound.is_empty() && !coverage.expected.is_empty() {
+                let first: Vec<&str> = coverage
+                    .missing
+                    .iter()
+                    .take(4)
+                    .map(std::string::String::as_str)
+                    .collect();
+                return Err(format!(
+                    "layer device seams: the bind has no mhc_seam class: {} expected, {} bound, {} host seams excluded; expected-but-not-bound: [{}]",
+                    coverage.expected.len(),
+                    coverage.bound.len(),
+                    coverage.host_seams.len(),
+                    first.join(", ")
+                ));
+            }
+            merge(class, &mut pointers)?;
+        }
+        if let Some(class) = attention {
+            merge(class, &mut pointers)?;
+        }
+        let by_layer = crate::layer_device::collect_layer_weight_pairs(&pointers)
+            .into_iter()
+            .map(|(key, (weight, scales))| (key, (Deviceptr(weight), Deviceptr(scales))))
+            .collect();
+        Ok(Self { by_layer })
+    }
+
+    /// One layer's weight word, by its logical key in WEIGHT_NAMES.
+    fn get(&self, layer: usize, key: &str) -> Result<Deviceptr, String> {
+        Ok(self.pair(layer, key)?.0)
+    }
+
+    /// One layer's (weight, scale grid) pair: the GEMV launchers take the fp8 weight and its scale
+    /// grid as separate words, so a weight-only map cannot drive them.
+    fn pair(&self, layer: usize, key: &str) -> Result<(Deviceptr, Deviceptr), String> {
+        let index = crate::layer_device::WEIGHT_NAMES
+            .iter()
+            .position(|(name, _)| *name == key)
+            .ok_or_else(|| format!("layer device weight: {key} is not a WEIGHT_NAMES key"))?;
+        self.by_layer.get(&(layer, index)).copied().ok_or_else(|| {
+            format!("layer device weight: no {key} for layer {layer} in the resolved set")
+        })
+    }
+}
+
+/// The plan builds both block norms as BF16 (`engine/tensor.rs:193` for `attn_norm.weight` and
+/// `engine/tensor.rs:197` for `ffn_norm.weight`), so the seam kernels read the BF16 weight branch.
+/// The flag stays an ABI word because the kernel pins both paths; it is a property of the plan,
+/// not of a run option, which is why it is a constant here.
+#[cfg(feature = "cuda")]
+const SEAM_NORM_BF16: u32 = 1;
+
+/// Whether the whole-layer device arm has a shared-expert row for the FFN epilogue: it does not.
+///
+/// The arm's weight set carries no shared-expert weight and there is no device shared-expert launch,
+/// so `moe_routed` produces the routed delta alone and the reference's shared add has no row to
+/// read. The epilogue's ABI carries the decision as an argument word (`shared_present`) rather than
+/// as a compile-time variant, so the launch says which arithmetic it ran. When the shared expert
+/// lands, gemv writes the row at `workspace.seam_row` base (f32 by default, BF16 only under
+/// `--native-rounding shared`), this const flips, and the dtype word `shared_bf16` - already
+/// `native_shared` from the request - carries the arm.
+#[cfg(feature = "cuda")]
+const FFN_EPILOGUE_SHARED_PRESENT: bool = true;
+
+/// The FFN epilogue's shared-row encoding word: 1 means the row at `workspace.seam_row` base is the
+/// coded shared-expert GEMV's BF16 store, which the epilogue widens before its f32 add. That is the
+/// store's encoding, not an arm choice - the host default arm widens the same BF16 store
+/// (tp4_forward.rs:7402-7410) - so 1 is the value the launch passes whenever a shared row exists;
+/// 0 would mean an f32 row, which no device producer writes today. Both rounding arms therefore pass
+/// the same word here, and the arm that differs is named upstream (the coded M3 shared store).
+#[cfg(feature = "cuda")]
+/// One layer's mHC seam weights: the six tensors the entry and FFN predictors read, plus the two
+/// block norms.
+///
+/// Resolved once at open **from [`LayerWeights`]**, so the pointers come through the same
+/// WEIGHT_NAMES resolution as every other weight and there is no second lookup path. This struct is
+/// a precomputed view, not an alternative resolver: `SeamLayerWeights::resolve` only reads
+/// `LayerWeights::get`.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SeamLayerWeights {
+    /// `hc_attn_fn`: [24][4 * 5,120] f32.
+    attn_fn: Deviceptr,
+    /// `hc_attn_base`: [24] f32.
+    attn_base: Deviceptr,
+    /// `hc_attn_scale`: [3] f32.
+    attn_scale: Deviceptr,
+    /// `attn_norm.weight`: [5,120] BF16.
+    attn_norm: Deviceptr,
+    /// `hc_ffn_fn`: [24][4 * 5,120] f32.
+    ffn_fn: Deviceptr,
+    /// `hc_ffn_base`: [24] f32.
+    ffn_base: Deviceptr,
+    /// `hc_ffn_scale`: [3] f32.
+    ffn_scale: Deviceptr,
+    /// `ffn_norm.weight`: [5,120] BF16.
+    ffn_norm: Deviceptr,
+}
+
+#[cfg(feature = "cuda")]
+impl SeamLayerWeights {
+    /// Every layer's seam weights, from the one weight table.
+    fn resolve(weights: &LayerWeights, layers: usize) -> Result<Vec<Self>, String> {
+        (0..layers)
+            .map(|layer| {
+                let get = |key: &str| {
+                    weights
+                        .get(layer, key)
+                        .map_err(|error| format!("layer device seams: layer {layer}: {error}"))
+                };
+                Ok(Self {
+                    attn_fn: get("hc_attn_fn")?,
+                    attn_base: get("hc_attn_base")?,
+                    attn_scale: get("hc_attn_scale")?,
+                    attn_norm: get("attn_norm")?,
+                    ffn_fn: get("hc_ffn_fn")?,
+                    ffn_base: get("hc_ffn_base")?,
+                    ffn_scale: get("hc_ffn_scale")?,
+                    ffn_norm: get("ffn_norm")?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// One projection launch's shape: `cols` is the **output** width and `inner` the **reduction**
+/// width, in the order `Mxfp8DenseParams::new(..., cols, inner, ...)` takes them. Both are unsigned
+/// and adjacent, so a transposition compiles; that is why each is asserted against config at open
+/// and never derived at launch.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProjectionShape {
+    cols: u32,
+    inner: u32,
+}
+
+#[cfg(feature = "cuda")]
+/// The device-only layer of the lean decode loop.
+///
+/// See [`crate::layer_device`] for the contract. The spans are one device allocation carved by
+/// [`crate::layer_device::LayerBuffers::carve`]; the buffer-owning rules (no copying the residual
+/// back to the host between layers, no allocation and no host bytes in a stage) are the module's.
+/// The boundary methods below are the only copies the layer loop makes: one H2D at the position's
+/// start and three D2H at its end (residual, mix, and nothing else).
+///
+/// The mHC entry, the activation prologue and the FFN seam run here; the stages between them that
+/// are still being landed by other slices (the reference seam, the attention block, the residual,
+/// the MoE indexer and the epilogue) refuse by name with their ABI inline
+/// ([crate::layer_device::not_landed]) instead of falling back to the host arm.
+struct DeviceLayer<'a> {
+    cuda: &'a Cuda,
+    buffers: crate::layer_device::LayerBuffers,
+    slab: Deviceptr,
+    /// The layers whose Engram rows exist: the write stage is a no-op for every other layer.
+    engram_rows: Vec<usize>,
+    hc_mult: usize,
+    dim: usize,
+    /// Whether the released BF16 boundaries are applied (`--native-rounding mhc`): the mHC kernels
+    /// round hc_pre, the block norm and the stream at the same points the host reference does.
+    native_bf16: u32,
+    /// The config's mHC epsilon, as the f32 the seam kernels take.
+    hc_eps: f32,
+    /// The config's Sinkhorn iteration count.
+    sinkhorn_iters: u32,
+    /// The configured RMSNorm epsilon (the released 1e-20).
+    ///
+    /// Read by `row_norm`, which no stage calls yet: `query_path` and `attention_projections` are
+    /// the two call sites and both are behind the activation prologue, so the kernel is landed and
+    /// wired to nothing until that lands. The contract test pins its ABI; this annotation is the
+    /// honest state, not a stub.
+    #[allow(dead_code)]
+    eps: f32,
+    /// The device row-norm kernel (`rmsnorm_sm121`), loaded once at open. This is the first seam
+    /// kernel this branch lands: `query_path` (the q_norm over the q_lora latent) and
+    /// `attention_projections` (the row norm before the activation prologue) both start with it,
+    /// and it is the reason those two stages are the first runnable device prefix.
+    #[allow(dead_code)]
+    row_norm: (
+        sparkflash_kernels::cuda_driver::Module,
+        sparkflash_kernels::cuda_driver::Kernel,
+    ),
+    /// The seam kernels, loaded and pinned at open (before the loop's first clock).
+    kernels: LayerSeamKernels,
+    /// The decode GEMV (`b12x_mxfp8_gemv_m1_sm121`), loaded once at open: the activation codes and
+    /// ue8m0 scales the prologue writes are its A operand, so the projection stages never quantise
+    /// on the host.
+    gemv: (
+        sparkflash_kernels::cuda_driver::Module,
+        sparkflash_kernels::cuda_driver::Kernel,
+    ),
+    /// The three projection shapes, asserted against config at open (not at launch).
+    projections: [ProjectionShape; 3],
+    /// The attention-path bind: the slab owns no weights (rule 2), so stages resolve the names
+    /// they need once here rather than looking them up per position.
+    #[allow(dead_code)]
+    attention: Option<&'a crate::resident_weights::RankBind>,
+    /// The run's reduce handle, when the chain's bootstrap opened one. One handle for the whole
+    /// run: both per-layer collectives enqueue onto it. None is the host arm or a refused open, and
+    /// the two collective stages then refuse by name.
+    reduce: Option<DeviceReduce<'a>>,
+    /// The typed weights the stages need, resolved once at open through WEIGHT_NAMES.
+    weights: LayerWeights,
+    /// Every layer's mHC seam weights, resolved once at open from `weights` (same table, one path).
+    seam_weights: Vec<SeamLayerWeights>,
+    /// The rope kernel (`rope_rotate_bf16`), loaded from the kv-path image at open.
+    rope_kernel: (
+        sparkflash_kernels::cuda_driver::Module,
+        sparkflash_kernels::cuda_driver::Kernel,
+    ),
+    /// The run's position budget, which the rope spans are sized for; a position beyond it is a
+    /// refusal at the stage, never a clamp.
+    max_positions: usize,
+    /// How many f32 values one table has per position (rope_head_dim / 2).
+    rope_pairs: u32,
+    /// The rope tail width (config.rope_head_dim, 64 released).
+    rope_head_dim: u32,
+    /// The per-rank head count and head width the q rope walks (16 heads of 512).
+    heads_per_rank: u32,
+    head_width: u32,
+    /// Each layer's rope table class (`compress_ratio(layer) > 0`), resolved at open.
+    compress_ratio: Vec<usize>,
+    /// The device KV cache: the run's history, one layer run per layer (rule 7 - the arm owns it,
+    /// the host cache is not a second view of it).
+    kv_cache: crate::layer_device::DeviceKvCache,
+    /// The window quantiser's ring: one `WindowRingLayout` per layer over one run allocation.
+    kv_ring: sparkflash_kernels::kv_path_ref::WindowRingLayout,
+    kv_ring_base: u64,
+    /// The window quantiser and cache-append kernels, from the same kv-path image as the rope.
+    kv_quant_kernel: (
+        sparkflash_kernels::cuda_driver::Module,
+        sparkflash_kernels::cuda_driver::Kernel,
+    ),
+    kv_append_kernel: (
+        sparkflash_kernels::cuda_driver::Module,
+        sparkflash_kernels::cuda_driver::Kernel,
+    ),
+    /// The cache's physical ring rows (== max_positions): the append writes slot position % rows.
+    capacity_rows: usize,
+    /// How many positions `begin_position` has accepted: it must start at 0 and stay contiguous,
+    /// because the cache has no prefill path.
+    positions_begun: usize,
+    /// How many rows each layer's cache has appended so far. Before the append at `position` it
+    /// must equal `position`, which is what makes `kv_append_rule` a real check instead of a
+    /// tautology: a skipped or doubled append refuses here rather than writing the wrong slot.
+    appended_rows: Vec<usize>,
+    /// comm-lead's fused `kv_norm_rope_bf16` (task-26). None until the kv image carries it, and
+    /// while it is None `kv_path` refuses rather than write a ring row without the kv_norm.
+    kv_norm_rope: Option<(
+        sparkflash_kernels::cuda_driver::Module,
+        sparkflash_kernels::cuda_driver::Kernel,
+    )>,
+    /// The gathered shared-expert operands and scratch; None means the gather did not happen and
+    /// `moe_shared` refuses by name rather than compute a partial shared row.
+    shared: Option<SharedExpertOperands>,
+    /// The coded shared-expert GEMV (`Mode::NonFused`: rounded multiply then rounded add) and its
+    /// SwiGLU + MX-quantise epilogue, both loaded at open from the same pinned images the host path
+    /// uses.
+    shared_gemv: (
+        sparkflash_kernels::cuda_driver::Module,
+        sparkflash_kernels::cuda_driver::Kernel,
+    ),
+    shared_swiglu: (
+        sparkflash_kernels::cuda_driver::Module,
+        sparkflash_kernels::cuda_driver::Kernel,
+    ),
+    /// `moe_inter_dim * n_shared_experts`: the shared expert's intermediate width, checked against
+    /// the gather at attach time.
+    shared_inter: usize,
+    /// The released SwiGLU clamp limit, as the f32 word the epilogue takes.
+    swiglu_limit: f32,
+    /// The default arm's f32-reference GEMV instantiation (`f32a/f32o`, the same pinned cubin).
+    shared_gemv_f32: (
+        sparkflash_kernels::cuda_driver::Module,
+        sparkflash_kernels::cuda_driver::Kernel,
+    ),
+    /// Whether the default arm's device f32 SwiGLU is loaded. It is one of the seam image's seven
+    /// symbols (freed by this layer's drop through `kernels.shared_swiglu_module`, so the field
+    /// carries a flag and not a second handle), and the host does that SwiGLU in Rust between two
+    /// D2H/H2D pairs: the port's whole point is to remove that round trip.
+    shared_swiglu_f32: bool,
+    /// `--native-rounding shared` (the M3 arm): the fused coded path and `shared_bf16 = 1`.
+    native_shared: bool,
+    /// The released routed geometry, asserted at open.
+    routed_geometry: RoutedGeometry,
+    /// (layer, expert, matrix) arena pointers for this rank's shard of every routed expert:
+    /// attached once after open, never copied. None means the routed stage refuses by name.
+    routed: Option<Vec<Vec<[crate::resident_weights::MatrixBind; 3]>>>,
+    /// (gate BF16 [experts][dim], bias F32 [experts]) arena pointers for the router, per layer.
+    /// Attached after open; None means the router stage refuses by name.
+    router: Option<Vec<(Deviceptr, Deviceptr)>>,
+    /// The two router kernels (stage one and the top-k stage two), loaded at open from the pinned
+    /// moe_router_sm121 cubin. None means the cubin was not staged and the stage refuses at open.
+    router_kernels: Option<(
+        sparkflash_kernels::cuda_driver::Module,
+        sparkflash_kernels::cuda_driver::Kernel,
+        sparkflash_kernels::cuda_driver::Module,
+        sparkflash_kernels::cuda_driver::Kernel,
+    )>,
+    /// The ffn_seams probe count this layer last saw, for the router's per-position written gate.
+    ffn_seams_seen: u64,
+    /// The layer's own stage record: reset at the start of every `run_layer`, one entry per stage
+    /// that ran, and the refusal when it stops. The frontier the probe report carries is this, not
+    /// a fabrication from the contract list.
+    runs: crate::layer_device::StageRuns,
+    /// The two run allocations' byte sizes, stated in the record so the arm's memory is one number.
+    kv_cache_bytes: usize,
+    kv_ring_bytes: usize,
+    /// The stage timing ring, when `SPARKFLASH_DEVICE_TRACE=1`: host-mapped coherent storage
+    /// the seam kernels record one trace event per launch into, and the host reads with no copy
+    /// and no synchronize. `None` (the default) leaves every launch's ring word zero, so a run
+    /// without the variable is byte-identical to one before the ring existed.
+    seam_trace: Option<sparkflash_kernels::cuda_driver::HostMapped>,
+    /// The ring's capacity in events, for the record; zero when the ring is not armed.
+    seam_trace_capacity: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl<'a> DeviceLayer<'a> {
+    /// Allocates the layer's one device slab and carves it into its spans.
+    ///
+    /// The arity is the call site's list: the resident plan joins the six arguments the loop already
+    /// has, and grouping them into a struct would hide which of them this function refuses on.
+    #[allow(clippy::too_many_arguments)]
+    fn open(
+        cuda: &'a Cuda,
+        config: &sparkflash_engine::config::ModelConfig,
+        kernel_cubin_dir: Option<&std::path::Path>,
+        world: usize,
+        max_positions: usize,
+        attention: Option<&'a crate::resident_weights::RankBind>,
+        mhc_seam: Option<&'a crate::resident_weights::RankBind>,
+        plan: Option<&'a sparkflash_device::resident::ResidentPlan>,
+        native_mhc: bool,
+    ) -> Result<Self, String> {
+        // The device arm's collectives are the four-rank chain's; a single-rank device run has no
+        // communicator to reduce with, and failing here names the real reason instead of failing
+        // later inside all_reduce with a message that blames the bootstrap. Host arm: unaffected.
+        if world == 1 {
+            return Err("layer device: the device arm needs the four-rank chain (world 1 has no communicator for its per-layer collectives); run the host arm for a single rank".to_owned());
+        }
+        let dim = HIDDEN;
+        if config.dim != dim {
+            return Err(format!(
+                "layer device: the loop's rows are {dim}-wide but the config says {}",
+                config.dim
+            ));
+        }
+        let hc_mult = config.hc_mult;
+        // The seam kernels are compiled for the released geometry and silently return on anything
+        // else, so a config that disagrees is refused here rather than producing a zero-valued row.
+        sparkflash_kernels::layer_seams_launch::check_seam_geometry(
+            u32::try_from(dim)
+                .map_err(|_| format!("layer device: {dim} columns do not fit the seam ABI"))?,
+            u32::try_from(hc_mult).map_err(|_| {
+                format!("layer device: hc_mult {hc_mult} does not fit the seam ABI")
+            })?,
+            u32::try_from(PREDICTOR_ROWS).map_err(|_| {
+                format!("layer device: {PREDICTOR_ROWS} coefficient rows do not fit the seam ABI")
+            })?,
+        )
+        .map_err(|error| format!("layer device: {error}"))?;
+        // The two block norms are decoded as BF16 (SEAM_NORM_BF16 is the word the seam ABI takes),
+        // which is the plan's own encoding for them (engine/tensor.rs:193-199). A device seam handed
+        // an F32 row would stride it as BF16 - half the row read, garbage after - and say nothing,
+        // so the dtype is refused here the way the host seam refuses it before position 0
+        // (read_layer_seam_raw). Every layer is checked, and the refusal names the tensor and both
+        // encodings.
+        let norm_dtype = if SEAM_NORM_BF16 == 1 { "BF16" } else { "F32" };
+        for layer in 0..config.n_layers {
+            for name in [
+                format!("layers.{layer}.attn_norm.weight"),
+                format!("layers.{layer}.ffn_norm.weight"),
+            ] {
+                match planned_dtype(plan, &name) {
+                    Some(dtype) if dtype == norm_dtype => {}
+                    Some(other) => {
+                        return Err(format!(
+                            "layer device: {name} is planned as {other}; the seam kernels decode the block norms as {norm_dtype} (SEAM_NORM_BF16 = {SEAM_NORM_BF16})"
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "layer device: the rank plan does not carry {name}, so the block norm's encoding is unknown; the seam kernels decode it as {norm_dtype} (SEAM_NORM_BF16 = {SEAM_NORM_BF16})"
+                        ));
+                    }
+                }
+            }
+        }
+        // The widest activation row the layer quantises: a dim-wide row for the attention
+        // projections and the FFN's gate/up row, as the plan's geometry allows. The seam kernels
+        // bound-check what they actually read.
+        let act_row = dim.max(2 * config.moe_inter_dim);
+        let topk = config.n_activated_experts.max(1);
+        let vocab_pad = config.vocab_size.next_multiple_of(256);
+        if world == 0 || !config.n_heads.is_multiple_of(world) {
+            return Err(format!(
+                "layer device: {} heads do not divide across {world} ranks",
+                config.n_heads
+            ));
+        }
+        // wq_b is sharded over the head axis: 16 heads * 512 = 8,192 bf16 = 16,384 B per rank.
+        let q_cols = (config.n_heads / world) * config.head_dim;
+        let geometry = crate::layer_device::LayerGeometry {
+            dim,
+            hc_mult,
+            act_row,
+            topk,
+            vocab_pad,
+            q_cols,
+            max_positions,
+        };
+        let bytes = crate::layer_device::LayerBuffers::bytes(&geometry);
+        let mut total = 0usize;
+        let slab = cuda
+            .alloc(bytes, &mut total)
+            .map_err(|error| format!("layer device: allocate {bytes} bytes: {error}"))?;
+        let engram_rows = (0..config.n_layers)
+            .filter(|layer| config.engram_rows(*layer).is_some())
+            .collect();
+        // The first seam kernel this branch lands, loaded once at open: the row-norm both consumer
+        // stages start with. A device arm with no kernel directory refuses here rather than at the
+        // first layer, because that is a build mistake, not a model result.
+        let kernel_dir = kernel_cubin_dir.ok_or_else(|| {
+            "layer device: the loop has no kernel cubin directory, so the row-norm kernel cannot be loaded".to_string()
+        })?;
+        let norm_bytes = std::fs::read(crate::tp4_tail::cubin_path(kernel_dir, "rmsnorm_sm121"))
+            .map_err(|error| format!("layer device: row-norm cubin: {error}"))?;
+        let row_norm = sparkflash_kernels::rmsnorm_launch::load(cuda, &norm_bytes)
+            .map_err(|error| format!("layer device: load rmsnorm_sm121: {error}"))?;
+        // The seam kernels are one pinned image: read, digest-checked against its baseline pin and
+        // resolved before the loop's clock starts, so no module load lands inside the steady state.
+        // Eight symbols share the image and its pin. Five are launched by stage bodies on this tip
+        // (entry, FFN seams, prologue, attention residual, FFN epilogue); shared_swiglu_f32, the
+        // bf16 prologue and rope_rotate_rows_bf16 are launched by the stages gemv owns, so an image
+        // missing any one of them, or a pin that moved, refuses here instead of inside a later
+        // position.
+        let (seam_cubin, _seam_sha256) = load_pinned_addition(
+            kernel_dir,
+            sparkflash_kernels::layer_seams_launch::CUBIN,
+            "layer device seams",
+        )?;
+        let (
+            entry_module,
+            entry,
+            ffn_module,
+            ffn_seams,
+            prologue_module,
+            prologue,
+            attn_residual_module,
+            attn_residual,
+            ffn_epilogue_module,
+            ffn_epilogue,
+            seam_swiglu_module,
+            seam_swiglu,
+            prologue_bf16_module,
+            prologue_bf16,
+            rope_rows_module,
+            rope_rows,
+        ) = sparkflash_kernels::layer_seams_launch::load(cuda, &seam_cubin)
+            .map_err(|error| format!("layer device seams: {error}"))?;
+        // The decode GEMV: the same kernel the host path's four-rank projection uses, pinned by its
+        // own baseline entry. Loaded here so its absence or a bad pin refuses at open, not at the
+        // first position, and so no module load lands inside the steady state.
+        let gemv_bytes = std::fs::read(crate::tp4_tail::cubin_path(
+            kernel_dir,
+            sparkflash_kernels::mxfp8_gemv_launch::KERNEL,
+        ))
+        .map_err(|error| format!("layer device: decode GEMV cubin: {error}"))?;
+        let gemv =
+            sparkflash_kernels::mxfp8_gemv_launch::load(cuda, &gemv_bytes).map_err(|error| {
+                format!(
+                    "layer device: load {}: {error}",
+                    sparkflash_kernels::mxfp8_gemv_launch::KERNEL
+                )
+            })?;
+        let buffers = crate::layer_device::LayerBuffers::carve(slab.0, &geometry);
+        // Every span whose dtype a contract names is checked against its width here, at open: a
+        // span carved for one dtype and handed to a kernel that reads another is the class of bug
+        // the query_path latent prologue exposed, and it must fail at setup, not in a launch.
+        buffers.assert_contract_widths(&geometry)?;
+        let routed_geometry = RoutedGeometry::new(config, world)?;
+        // The router's two kernels come from one pinned cubin; a staged directory that does not
+        // carry it leaves the router unloaded and the stage refusing at open, not at layer 0.
+        let router_kernels = match kernel_cubin_dir {
+            Some(dir) => {
+                let (cubin, _sha256) =
+                    load_pinned_addition(dir, "moe_router_sm121", "layer device router")?;
+                Some(sparkflash_kernels::router_launch::load(cuda, &cubin)?)
+            }
+            None => None,
+        };
+        // The rope tables: two classes, uploaded ONCE here, outside the loop. The content is the
+        // engine's host builder (`rope_tables_for_layer` reduced to a range) and it is a function of
+        // the class, not the layer, so four arrays cover forty layers.
+        let (kv_cubin, _kv_sha256) = load_pinned_addition(
+            kernel_dir,
+            sparkflash_kernels::cuda_driver::KV_PATH_CUBIN,
+            "layer device kv path",
+        )?;
+        let (rope_module, rope_kernel) =
+            sparkflash_kernels::kv_path_launch::load_rope_rotate(cuda, &kv_cubin)
+                .map_err(|error| format!("layer device kv path: rope kernel: {error}"))?;
+        let (quant_module, quant_kernel) =
+            sparkflash_kernels::kv_path_launch::load_window_quant(cuda, &kv_cubin)
+                .map_err(|error| format!("layer device kv path: window quantiser: {error}"))?;
+        let (append_module, append_kernel) =
+            sparkflash_kernels::kv_path_launch::load_kv_append(cuda, &kv_cubin)
+                .map_err(|error| format!("layer device kv path: cache append: {error}"))?;
+        // comm-lead's fused norm + rope (task-26): the host norms the f32 kv latent with kv_norm
+        // and rounds once after the rope; this kernel widens the bf16 latent, norms in f32 and
+        // rounds once after the rope. The declared deviation is the input (see the kernel file).
+        let (norm_rope_module, norm_rope_kernel) =
+            sparkflash_kernels::kv_path_launch::load_kv_norm_rope(cuda, &kv_cubin).map_err(
+                |error| format!("layer device kv path: fused norm+rope kernel: {error}"),
+            )?;
+        // The run's device cache and the window quantiser's ring: one allocation each, sized from
+        // the same capacity the rope spans use, so nothing grows mid-loop.
+        let capacity_rows = max_positions;
+        let row_values = 2 * config.head_dim;
+        let kv_cache_bytes =
+            crate::layer_device::DeviceKvCache::bytes(config.n_layers, capacity_rows, row_values);
+        let kv_cache_ptr = cuda.alloc(kv_cache_bytes, &mut total)?;
+        let kv_cache = crate::layer_device::DeviceKvCache::new(
+            kv_cache_ptr.0,
+            config.n_layers,
+            capacity_rows,
+            row_values,
+        )?;
+        let kv_ring = sparkflash_kernels::kv_path_ref::WindowRingLayout::new(capacity_rows)?;
+        // The shared expert's two kernels load here even though its operands arrive later through
+        // `attach_shared`: a missing image or symbol must be an open-time refusal, not a
+        // first-position surprise. The operand addresses come from the run's single gather.
+        let (shared_gemv_module, shared_gemv_kernel) = {
+            let (cubin, _sha) = load_pinned_addition(
+                kernel_dir,
+                sparkflash_kernels::mxfp8_gemv_launch::KERNEL,
+                "layer device shared expert",
+            )?;
+            sparkflash_kernels::mxfp8_gemv_launch::load_mode(
+                cuda,
+                &cubin,
+                sparkflash_kernels::mxfp8_gemv_launch::Mode::NonFused,
+            )?
+        };
+        let (shared_swiglu_module, shared_swiglu_kernel) = {
+            let (cubin, _sha) = load_pinned_addition(
+                kernel_dir,
+                "swiglu_mxfp8_quant_sm121",
+                "layer device shared expert",
+            )?;
+            cuda.load_swiglu_quant(&cubin)?
+        };
+        let (shared_gemv_f32_module, shared_gemv_f32_kernel) = {
+            let (cubin, _sha) = load_pinned_addition(
+                kernel_dir,
+                sparkflash_kernels::mxfp8_gemv_launch::KERNEL,
+                "layer device shared expert (f32 reference arm)",
+            )?;
+            sparkflash_kernels::mxfp8_gemv_launch::load_mode(
+                cuda,
+                &cubin,
+                sparkflash_kernels::mxfp8_gemv_launch::Mode::NonFusedF32ActivationF32Stores,
+            )?
+        };
+        let shared_inter = config
+            .moe_inter_dim
+            .checked_mul(config.n_shared_experts.max(1))
+            .ok_or_else(|| {
+                "layer device shared expert: the intermediate width overflows".to_owned()
+            })?;
+        let swiglu_limit = config.swiglu_limit as f32;
+        let ring_bytes = kv_ring.total_bytes(config.n_layers)?;
+        let kv_ring_ptr = cuda.alloc(ring_bytes, &mut total)?;
+        let mut representatives: [Option<usize>; crate::layer_device::ROPE_TABLE_CLASSES] =
+            [None; crate::layer_device::ROPE_TABLE_CLASSES];
+        for layer in 0..config.n_layers {
+            let class = sparkflash_kernels::kv_path_ref::rope_table_class(config, layer)?;
+            representatives
+                .get_mut(class)
+                .and_then(|slot| slot.get_or_insert(layer).into());
+        }
+        let mut rope_pairs = 0usize;
+        for (class, representative) in representatives.iter().enumerate() {
+            let span = match class {
+                0 => buffers.workspace.rope_tables_plain,
+                _ => buffers.workspace.rope_tables_compressed,
+            };
+            let layer = (*representative).ok_or_else(|| {
+                format!(
+                    "layer device: no layer of rope table class {class} exists, so its table cannot be built; the two classes are chosen by compress_ratio(layer) > 0"
+                )
+            })?;
+            let range =
+                sparkflash_kernels::kv_path_ref::rope_tables_range(config, layer, max_positions)?;
+            rope_pairs = range.pairs();
+            let mut table: Vec<f32> = Vec::with_capacity(range.positions() * range.pairs() * 2);
+            for position in 0..range.positions() {
+                table.extend_from_slice(range.cos(position)?);
+            }
+            for position in 0..range.positions() {
+                table.extend_from_slice(range.sin(position)?);
+            }
+            let bytes = f32_le_bytes(&table);
+            if bytes.len() > span.len {
+                return Err(format!(
+                    "layer device: rope class {class} needs {} B, the span is {} B for {max_positions} positions",
+                    bytes.len(),
+                    span.len
+                ));
+            }
+            cuda.copy_htod(&Deviceptr(span.device), &bytes)
+                .map_err(|error| format!("layer device: rope class {class} upload: {error}"))?;
+        }
+        // The three projection shapes, with the host path as provenance:
+        //   wq_a: attention.rs:2375-2377  dense_view(..., dim) + matmul(&mut latent, x, rank, dim, seqlen)
+        //         -> cols = q_lora_rank (1,280), inner = dim (5,120)
+        //   wkv:  attention.rs:2413-2418  dense_view(..., head_dim, dim) + matmul(..., head_dim, dim, ...)
+        //         -> cols = head_dim (512), inner = dim (5,120)
+        //   wq_b: fn wq_b, cols = n_heads * head_dim (32,768) globally, dense_view(..., cols, rank)
+        //         -> per-rank Column shard: cols = q_cols (8,192), inner = q_lora_rank (1,280)
+        let inner = u32::try_from(dim)
+            .map_err(|_| format!("layer device: dim {dim} does not fit the GEMV's u32"))?;
+        let q_lora_cols = u32::try_from(config.q_lora_rank).map_err(|_| {
+            format!(
+                "layer device: q_lora_rank {} does not fit",
+                config.q_lora_rank
+            )
+        })?;
+        let kv_cols = u32::try_from(config.head_dim)
+            .map_err(|_| format!("layer device: head_dim {} does not fit", config.head_dim))?;
+        let q_cols_u32 = u32::try_from(q_cols)
+            .map_err(|_| format!("layer device: q cols {q_cols} do not fit"))?;
+        for (name, cols) in [
+            ("q_lora_rank", q_lora_cols),
+            ("head_dim", kv_cols),
+            ("q cols", q_cols_u32),
+        ] {
+            if cols == 0 {
+                return Err(format!(
+                    "layer device: {name} is zero, so the GEMV has no output"
+                ));
+            }
+        }
+        if inner > sparkflash_kernels::mxfp8_gemv_launch::MAX_INNER {
+            return Err(format!(
+                "layer device: inner {inner} exceeds the GEMV's reduction limit {}",
+                sparkflash_kernels::mxfp8_gemv_launch::MAX_INNER
+            ));
+        }
+        let projections = [
+            ProjectionShape {
+                cols: q_lora_cols,
+                inner,
+            },
+            ProjectionShape {
+                cols: kv_cols,
+                inner,
+            },
+            ProjectionShape {
+                cols: q_cols_u32,
+                inner: q_lora_cols,
+            },
+        ];
+        // The span sizes those shapes imply. A short span is refused here rather than overrun at
+        // position 0. (The bind carries addresses only, so the weight's own byte length is not
+        // available to compare the product against; the two factors are checked against config
+        // separately above, which is what catches a transposition.)
+        for (name, shape, span) in [
+            ("q_lora", projections[0], buffers.workspace.q_lora),
+            ("kv_latent", projections[1], buffers.workspace.kv_latent),
+            ("q", projections[2], buffers.workspace.q),
+        ] {
+            let needed = usize::try_from(shape.cols)
+                .ok()
+                .and_then(|cols| cols.checked_mul(2))
+                .ok_or_else(|| format!("layer device: {name} width {} overflows", shape.cols))?;
+            if span.len < needed {
+                return Err(format!(
+                    "layer device: {name} span is {} B, the shape needs {needed} B",
+                    span.len
+                ));
+            }
+        }
+        let weights = LayerWeights::resolve(attention, mhc_seam)?;
+        let seam_weights = SeamLayerWeights::resolve(&weights, config.n_layers)?;
+        let hc_eps = config.hc_eps as f32;
+        // The stage timing ring: one host-mapped allocation the seam kernels write their 32-byte
+        // trace events into. Host-mapped because the host reads it later with no copy and no
+        // synchronize; the kernels only need its device pointer. Off by default, so the launch
+        // words stay zero and the run is unchanged unless SPARKFLASH_DEVICE_TRACE=1 asks for it.
+        let (seam_trace, seam_trace_capacity) =
+            if std::env::var("SPARKFLASH_DEVICE_TRACE").ok().as_deref() == Some("1") {
+                let capacity = device_trace_capacity()?;
+                let mut host_total = 0usize;
+                let ring = cuda
+                    .alloc_host_mapped(
+                        sparkflash_kernels::device_trace::ring_bytes(capacity),
+                        &mut host_total,
+                    )
+                    .map_err(|error| format!("layer device: stage trace ring: {error}"))?;
+                ring.write_at(
+                    0,
+                    &sparkflash_kernels::device_trace::header_bytes(
+                        capacity,
+                        sparkflash_kernels::device_trace::SEAM_SCOPE_MASK,
+                    ),
+                )
+                .map_err(|error| format!("layer device: stage trace header: {error}"))?;
+                (Some(ring), capacity)
+            } else {
+                (None, 0usize)
+            };
+        let sinkhorn_iters = u32::try_from(config.hc_sinkhorn_iters).map_err(|_| {
+            format!(
+                "layer device: {} Sinkhorn iterations do not fit the seam ABI",
+                config.hc_sinkhorn_iters
+            )
+        })?;
+        Ok(Self {
+            cuda,
+            buffers,
+            slab,
+            engram_rows,
+            hc_mult,
+            dim,
+            native_bf16: u32::from(native_mhc),
+            shared: None,
+            shared_gemv: (shared_gemv_module, shared_gemv_kernel),
+            shared_swiglu: (shared_swiglu_module, shared_swiglu_kernel),
+            shared_inter,
+            swiglu_limit,
+            shared_gemv_f32: (shared_gemv_f32_module, shared_gemv_f32_kernel),
+            shared_swiglu_f32: true,
+            native_shared: false,
+            hc_eps,
+            sinkhorn_iters,
+            eps: config.norm_eps as f32,
+            row_norm,
+            kernels: LayerSeamKernels {
+                entry,
+                ffn_seams,
+                prologue,
+                attn_residual,
+                ffn_epilogue,
+                entry_module,
+                ffn_module,
+                prologue_module,
+                attn_residual_module,
+                ffn_epilogue_module,
+                shared_swiglu: seam_swiglu,
+                shared_swiglu_module: seam_swiglu_module,
+                prologue_bf16,
+                prologue_bf16_module,
+                rope_rows,
+                rope_rows_module,
+            },
+            gemv,
+            projections,
+            weights,
+            seam_weights,
+            attention,
+            reduce: None,
+            rope_kernel: (rope_module, rope_kernel),
+            max_positions,
+            rope_pairs: u32::try_from(rope_pairs)
+                .map_err(|_| format!("layer device: {rope_pairs} rope pairs do not fit u32"))?,
+            rope_head_dim: u32::try_from(config.rope_head_dim).map_err(|_| {
+                format!(
+                    "layer device: rope_head_dim {} does not fit",
+                    config.rope_head_dim
+                )
+            })?,
+            heads_per_rank: (q_cols_u32 / kv_cols),
+            head_width: kv_cols,
+            compress_ratio: (0..config.n_layers)
+                .map(|layer| config.compress_ratio(layer).unwrap_or(0))
+                .collect(),
+            kv_cache,
+            kv_ring,
+            kv_ring_base: kv_ring_ptr.0,
+            kv_quant_kernel: (quant_module, quant_kernel),
+            kv_append_kernel: (append_module, append_kernel),
+            capacity_rows,
+            kv_cache_bytes,
+            routed_geometry,
+            routed: None,
+            router: None,
+            router_kernels,
+            ffn_seams_seen: 0,
+            runs: crate::layer_device::StageRuns::default(),
+            positions_begun: 0,
+            appended_rows: vec![0; config.n_layers],
+            kv_norm_rope: Some((norm_rope_module, norm_rope_kernel)),
+            kv_ring_bytes: ring_bytes,
+            seam_trace,
+            seam_trace_capacity,
+        })
+    }
+
+    /// The ring word every seam launch carries: the host-mapped ring's device pointer, or zero.
+    ///
+    /// Zero is the trace contract's null ring: every store through it is guarded, so a kernel handed
+    /// zero writes no event. That is the default arm, byte-identical to a build without the ring.
+    fn seam_trace_ring(&self) -> u64 {
+        self.seam_trace.as_ref().map_or(0, |ring| ring.device().0)
+    }
+
+    /// Decodes the stage timing ring into the probe record's `stage_trace` object, or `None`.
+    ///
+    /// This is a plain read of host-mapped coherent memory: no copy and no synchronize happen here,
+    /// so the caller must only call it at a point where the launches that wrote the ring have
+    /// completed. The decode itself (layout, wrap-around, stage attribution) is pinned in
+    /// `sparkflash_kernels::device_trace`.
+    fn seam_trace_document(&self) -> Option<serde_json::Value> {
+        let ring = self.seam_trace.as_ref()?;
+        let mut bytes = vec![0u8; ring.len()];
+        ring.read_at(0, &mut bytes).ok()?;
+        let decoded = sparkflash_kernels::device_trace::decode(&bytes).ok()?;
+        let mut document = stage_trace_document(&decoded);
+        if let Some(object) = document.as_object_mut() {
+            object.insert(
+                "capacity_requested".to_string(),
+                serde_json::json!(self.seam_trace_capacity),
+            );
+        }
+        Some(document)
+    }
+    /// The armed ring's capacity and event count, without decoding events.
+    ///
+    /// A record may still be half written while the kernels that write it are in flight, so the
+    /// frontier row emitted mid-run reports only the header's counters (one word, advanced with an
+    /// atomicAdd and coherent on this UMA part); durations come from `seam_trace_document` at a
+    /// boundary where the launches that wrote them have completed.
+    fn seam_trace_header_document(&self) -> Option<serde_json::Value> {
+        let ring = self.seam_trace.as_ref()?;
+        let mut header = [0u8; 16];
+        ring.read_at(0, &mut header).ok()?;
+        let written = u32::from_le_bytes(header[8..12].try_into().ok()?);
+        let mask = u32::from_le_bytes(header[12..16].try_into().ok()?);
+        let capacity = mask as usize + 1;
+        Some(serde_json::json!({
+            "capacity": capacity,
+            "capacity_requested": self.seam_trace_capacity,
+            "events_written": written,
+            "wrapped": written as usize > capacity,
+            "durations": "not decoded mid-run: the frontier row is emitted while launches may still be in flight; a completed run decodes them",
+        }))
+    }
+    /// The device row-norm: `[rows][cols]` BF16 in, a `[cols]` BF16 weight, `[rows][cols]` BF16 out.
+    ///
+    /// The kernel is `rmsnorm_sm121` through its typed launcher (nine argument words, one thread
+    /// per row, grid `ceil(rows / 256)`), so a wrong word is a wrong named field rather than a
+    /// misplaced pointer. The spans are checked against the geometry before the launch: a short
+    /// span is a refusal, never an overrun.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    fn row_norm(
+        &self,
+        input: crate::layer_device::DeviceSpan,
+        weight: crate::layer_device::DeviceSpan,
+        output: crate::layer_device::DeviceSpan,
+        rows: u32,
+        cols: u32,
+        layer_id: u32,
+        step_seq: u64,
+    ) -> Result<(), String> {
+        let row_bytes = usize::try_from(cols)
+            .map_err(|_| format!("layer device row norm: {cols} columns do not fit a usize"))?;
+        let needed = usize::try_from(rows)
+            .ok()
+            .and_then(|rows| rows.checked_mul(row_bytes))
+            .and_then(|values| values.checked_mul(2))
+            .ok_or_else(|| {
+                format!("layer device row norm: {rows} x {cols} BF16 values overflow")
+            })?;
+        if input.len < needed || output.len < needed {
+            return Err(format!(
+                "layer device row norm: {rows} x {cols} BF16 needs {needed} bytes, the contract's spans are {} in and {} out",
+                input.len, output.len
+            ));
+        }
+        if weight.len < row_bytes * 2 {
+            return Err(format!(
+                "layer device row norm: the weight row is {cols} BF16 values ({} bytes), the span is {}",
+                row_bytes * 2,
+                weight.len
+            ));
+        }
+        let params = sparkflash_kernels::rmsnorm_launch::RmsNormLaunchParams {
+            x: Deviceptr(input.device),
+            weight: Deviceptr(weight.device),
+            out: Deviceptr(output.device),
+            rows,
+            cols,
+            eps: self.eps,
+            trace_ring: 0,
+            layer_id,
+            step_seq,
+        };
+        sparkflash_kernels::rmsnorm_launch::launch(self.cuda, self.row_norm.1, &params)
+            .map_err(|error| format!("layer device row norm: {error}"))
+    }
+
+    /// One layer's seam weights, from the set open resolved through WEIGHT_NAMES.
+    fn seam_layer(&self, layer: usize, stage: &str) -> Result<SeamLayerWeights, String> {
+        self.seam_weights.get(layer).copied().ok_or_else(|| {
+            format!(
+                "layer device stage {stage}: layer {layer} has no seam weights (open resolved {})",
+                self.seam_weights.len()
+            )
+        })
+    }
+
+    /// The refusal for one stage, looked up in the contract table.
+    /// One decode GEMV for the prefix: `A` is the prologue's E4M3 codes and ue8m0 scales, `B` the
+    /// fp8 weight and its scale grid, `out` the span the stage owns. The shape is the one asserted
+    /// at open; the launcher refuses a zero `cols` or an `inner` longer than `MAX_INNER`.
+    fn launch_projection(
+        &mut self,
+        slot: usize,
+        name: &str,
+        layer: usize,
+        position: usize,
+    ) -> Result<(), String> {
+        use sparkflash_kernels::mxfp8_dense_launch as gemv;
+        let out = match slot {
+            0 => self.buffers.workspace.q_lora,
+            1 => self.buffers.workspace.kv_latent,
+            _ => self.buffers.workspace.q,
+        };
+        let (weight, scales) = self
+            .weights
+            .pair(layer, name)
+            .map_err(|error| format!("layer device stage attention_projections: {error}"))?;
+        let shape = self.projections[slot.min(2)];
+        let layer_id = u32::try_from(layer).map_err(|_| {
+            format!("layer device projection: layer {layer} does not fit the trace's u32")
+        })?;
+        let step_seq = u64::try_from(position).map_err(|_| {
+            format!("layer device projection: position {position} does not fit u64")
+        })?;
+        let params = gemv::Mxfp8DenseParams::new(
+            Deviceptr(self.buffers.workspace.act_codes.device),
+            Deviceptr(self.buffers.workspace.act_scales.device),
+            weight,
+            scales,
+            Deviceptr(out.device),
+            1,
+            shape.cols,
+            shape.inner,
+            0,
+            layer_id,
+            step_seq,
+        );
+        gemv::launch(self.cuda, self.gemv.1, &params).map_err(|error| {
+            format!("layer device stage attention_projections: {name}: {error}")
+        })?;
+        probe::count("attention_projections");
+        Ok(())
+    }
+
+    /// The q rope tail, rotated in place in the `q` span: one launch per head, using the class's
+    /// table span and this position's slice. Out-of-range positions are refused with both numbers
+    /// rather than clamped, because a clamped table rotates by another position's angle.
+    fn rotate_q(&self, layer: usize, position: usize) -> Result<(), String> {
+        use sparkflash_kernels::kv_path_launch as kv;
+        if position >= self.max_positions {
+            return Err(format!(
+                "layer device stage query_path: position {position} is outside the {}-position rope tables sized at open; extend max_positions rather than clamping",
+                self.max_positions
+            ));
+        }
+        let ratio = self.compress_ratio.get(layer).copied().ok_or_else(|| {
+            format!("layer device stage query_path: layer {layer} has no rope class")
+        })?;
+        let span = if ratio > 0 {
+            self.buffers.workspace.rope_tables_compressed
+        } else {
+            self.buffers.workspace.rope_tables_plain
+        };
+        let pairs = usize::try_from(self.rope_pairs)
+            .map_err(|_| "layer device rope: pair count does not fit a usize".to_owned())?;
+        let table_bytes = self
+            .max_positions
+            .checked_mul(pairs)
+            .and_then(|values| values.checked_mul(4))
+            .ok_or_else(|| "layer device rope: the table offset overflows".to_owned())?;
+        let offset = position
+            .checked_mul(pairs)
+            .and_then(|values| values.checked_mul(4))
+            .ok_or_else(|| "layer device rope: the position offset overflows".to_owned())?;
+        let position_u32 = u32::try_from(position)
+            .map_err(|_| format!("layer device rope: position {position} does not fit u32"))?;
+        let table_slice = pairs
+            .checked_mul(4)
+            .ok_or_else(|| "layer device rope: the table slice overflows".to_owned())?;
+        let head_bytes = usize::try_from(self.head_width)
+            .ok()
+            .and_then(|width| width.checked_mul(2))
+            .ok_or_else(|| "layer device rope: the head width overflows".to_owned())?;
+        for head in 0..self.heads_per_rank {
+            let row =
+                self.buffers.workspace.q.device + u64::from(head) * u64::from(self.head_width) * 2;
+            let params = kv::RopeRotateParams {
+                row: Deviceptr(row),
+                cos: Deviceptr(span.device + offset as u64),
+                sin: Deviceptr(span.device + table_bytes as u64 + offset as u64),
+                out: Deviceptr(row),
+                head_width: self.head_width,
+                rope_head_dim: self.rope_head_dim,
+                position: position_u32,
+            };
+            params.check_spans(head_bytes, head_bytes, table_slice)?;
+            kv::launch_rope_rotate(self.cuda, self.rope_kernel.1, &params).map_err(|error| {
+                format!("layer device stage query_path: q rope head {head}: {error}")
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The run's position budget the rope spans were sized for; the record states it beside the
+    /// memory account so the two cannot disagree.
+    fn max_positions(&self) -> usize {
+        self.max_positions
+    }
+
+    /// The run's device KV cache size (the history the arm owns).
+    fn kv_cache_bytes(&self) -> usize {
+        self.kv_cache_bytes
+    }
+
+    /// The window quantiser's ring size for the whole run.
+    fn kv_ring_bytes(&self) -> usize {
+        self.kv_ring_bytes
+    }
+
+    /// Enqueues one per-layer bf16 all-reduce over the layer's own spans.
+    ///
+    /// One enqueue on the run's one handle, count in bf16 elements (never bytes), no synchronise
+    /// and no readback: the layer's launches and this enqueue share the legacy default stream
+    /// (stream id 0), which is what makes the ordering the stream's rather than a host wait's.
+    /// Every rank enqueues the same sequence of collectives because the stage sequence is uniform.
+    ///
+    /// # Safety
+    /// The two spans are this layer's carved device rows, at least count bf16 values each, and the
+    /// handle was opened for this run's world and rank - all three are enforced here before the
+    /// enqueue.
+    fn reduce_row(
+        &self,
+        stage: &'static str,
+        input: crate::layer_device::DeviceSpan,
+        output: crate::layer_device::DeviceSpan,
+    ) -> Result<(), String> {
+        let Some(reduce) = self.reduce else {
+            return Err(format!(
+                "layer device stage {stage}: the run carries no device reduce handle - the chain's bootstrap did not open one (the host arm) or its open was refused; the host arm's collectives stay host-side"
+            ));
+        };
+        let count = self.dim;
+        let needed = count
+            .checked_mul(2)
+            .ok_or_else(|| format!("layer device stage {stage}: the row byte width overflows"))?;
+        for (name, span) in [("input", input), ("output", output)] {
+            if span.len < needed {
+                return Err(format!(
+                    "layer device stage {stage}: the {name} span is {} B but {count} bf16 elements need {needed} B",
+                    span.len
+                ));
+            }
+        }
+        let mut handle = reduce.0.try_borrow_mut().map_err(|_| {
+            format!(
+                "layer device stage {stage}: the run's reduce handle is already borrowed - one collective at a time per step"
+            )
+        })?;
+        // SAFETY: the spans are the layer's carved device rows with at least count bf16 values each
+        // (checked above), stream 0 is the stream every launch of this run uses, and the handle was
+        // opened for this run's world and rank by the bootstrap.
+        unsafe { handle.reduce_bf16(0, input.device, output.device, count) }
+            .map_err(|error| format!("layer device stage {stage}: {error}"))?;
+        probe::count(stage);
+        Ok(())
+    }
+    /// Attaches the run's reduce handle (opened by the chain's bootstrap before the
+    /// timed region). Called right after open: open's arity is the driver call site's, so the
+    /// handle joins the layer here instead of widening it.
+    /// Attaches the router's per-layer weight/bias arena pointers.
+    ///
+    /// Both are the plan's own slices (BF16 gate [experts][dim], F32 bias [experts]); nothing is
+    /// copied. Called once after open, next to attach_routed.
+    fn attach_router(&mut self, bind: &crate::tp4_resident::DeviceBind) -> Result<(), String> {
+        if self.router.is_some() {
+            return Err("layer device router: attached twice".to_owned());
+        }
+        let mut layers = Vec::with_capacity(self.compress_ratio.len());
+        for layer in 0..self.compress_ratio.len() {
+            let gate = bind
+                .moe
+                .router
+                .get(&(layer, crate::resident_weights::RouterPart::Weight))
+                .copied()
+                .ok_or_else(|| {
+                    format!("layer device router: the bind has no gate weight for layer {layer}")
+                })?;
+            let bias = bind
+                .moe
+                .router
+                .get(&(layer, crate::resident_weights::RouterPart::Bias))
+                .copied()
+                .ok_or_else(|| {
+                    format!("layer device router: the bind has no gate bias for layer {layer}")
+                })?;
+            if gate.0 == 0 || bias.0 == 0 {
+                return Err(format!(
+                    "layer device router: layer {layer} bound a null router pointer; refusing to launch"
+                ));
+            }
+            layers.push((gate, bias));
+        }
+        self.router = Some(layers);
+        Ok(())
+    }
+
+    fn attach_reduce(&mut self, reduce: Option<DeviceReduce<'a>>) -> Result<(), String> {
+        if self.reduce.is_some() {
+            return Err(
+                "layer device reduce: attached twice; the run has exactly one communicator"
+                    .to_owned(),
+            );
+        }
+        self.reduce = reduce;
+        Ok(())
+    }
+
+    /// Attaches this rank's routed expert shards.
+    ///
+    /// Called once, right after open: every (layer, expert, matrix) arena pointer is resolved here
+    /// through the same slice rule the host path uses (`routed_slice_base`), so a rank plan whose
+    /// shard shape disagrees with the released routed geometry is refused at setup, naming the
+    /// layer and expert. Nothing is copied: the routed launch indexes these arena slices.
+    fn attach_routed(
+        &mut self,
+        bind: &crate::tp4_resident::DeviceBind,
+        rank: usize,
+    ) -> Result<(), String> {
+        if self.routed.is_some() {
+            return Err("layer device routed MoE: attached twice".to_owned());
+        }
+        let geometry = self.routed_geometry;
+        if rank >= geometry.world {
+            return Err(format!(
+                "layer device routed MoE: rank {rank} is outside the {}-rank world",
+                geometry.world
+            ));
+        }
+        let n_layers = self.compress_ratio.len();
+        let mut layers = Vec::with_capacity(n_layers);
+        for layer in 0..n_layers {
+            let mut experts = Vec::with_capacity(geometry.experts);
+            for expert in 0..geometry.experts {
+                let mut pair = [crate::resident_weights::MatrixBind {
+                    weight: Deviceptr(0),
+                    scales: Deviceptr(0),
+                }; 3];
+                let wanted = [
+                    (
+                        crate::resident_weights::Matrix::Gate,
+                        "w1",
+                        [geometry.local_inter, geometry.dim / 2],
+                    ),
+                    (
+                        crate::resident_weights::Matrix::Up,
+                        "w3",
+                        [geometry.local_inter, geometry.dim / 2],
+                    ),
+                    (
+                        crate::resident_weights::Matrix::Down,
+                        "w2",
+                        [geometry.dim, geometry.inter / 2 / geometry.world],
+                    ),
+                ];
+                for (index, (matrix, leaf, shape)) in wanted.into_iter().enumerate() {
+                    let (weight, scales) = routed_slice_base(
+                        &bind.moe,
+                        &bind.plan_index,
+                        layer,
+                        expert,
+                        matrix,
+                        leaf,
+                        rank,
+                        shape,
+                    )
+                    .map_err(|error| format!("layer device routed MoE: {error}"))?;
+                    pair[index] = crate::resident_weights::MatrixBind { weight, scales };
+                }
+                experts.push(pair);
+            }
+            layers.push(experts);
+        }
+        self.routed = Some(layers);
+        Ok(())
+    }
+
+    /// How many (layer, expert) pairs hold resolved routed slices, for the record.
+    fn routed_experts_bound(&self) -> usize {
+        self.routed
+            .as_ref()
+            .map_or(0, |layers| layers.iter().map(Vec::len).sum())
+    }
+
+    /// The routed geometry as the record states it.
+    fn routed_geometry_evidence(&self) -> serde_json::Value {
+        let geometry = self.routed_geometry;
+        serde_json::json!({
+            "dim": geometry.dim,
+            "inter": geometry.inter,
+            "local_inter": geometry.local_inter,
+            "experts": geometry.experts,
+            "top_k": geometry.top_k,
+            "world": geometry.world,
+        })
+    }
+
+    /// Selects the shared expert's arm: `true` is the M3 native (fused coded) arm, `false` the
+    /// default f32-reference arm. The two are not interchangeable and a row must declare which one
+    /// ran; the frontier documents state it as `shared_arm`.
+    fn set_native_shared(&mut self, native_shared: bool) {
+        self.native_shared = native_shared;
+    }
+
+    /// Which shared-expert arm this layer would run, for the record.
+    fn shared_arm(&self) -> &'static str {
+        if self.shared.is_none() {
+            "none (no gather)"
+        } else if self.native_shared {
+            "coded-native (fused coded GEMV, BF16 shared row, shared_bf16 = 1)"
+        } else if !self.shared_swiglu_f32 {
+            "f32-reference-on-device (blocked: the device f32 SwiGLU is not loaded)"
+        } else {
+            "f32-reference-on-device (expf silu with a true divide; a declared D54 tolerance item, not bit-identical to the host row)"
+        }
+    }
+
+    /// The shared expert's gathered bytes, as the prewarm allocated them (0 when the gather did not
+    /// happen).
+    fn shared_expert_bytes(&self) -> usize {
+        self.shared.as_ref().map_or(0, |shared| shared.device_bytes)
+    }
+
+    /// Attaches the run's single shared-expert gather to this layer.
+    ///
+    /// Called once, right after `open`: the gather is prewarm work shared by every layer and every
+    /// position, so the layer holds its addresses and never gathers again. The shapes are asserted
+    /// against the arm's own geometry here - a plan whose shared expert disagrees refuses at setup,
+    /// not at the first position that reaches `moe_shared`.
+    fn attach_shared(&mut self, shared: &SharedExpertDevice) -> Result<(), String> {
+        if self.shared.is_some() {
+            return Err("layer device shared expert: attached twice".to_owned());
+        }
+        if shared.dim != self.dim {
+            return Err(format!(
+                "layer device shared expert: the gather is {}-wide, the layer is {}-wide",
+                shared.dim, self.dim
+            ));
+        }
+        if shared.inter != self.shared_inter {
+            return Err(format!(
+                "layer device shared expert: the gather's intermediate width is {}, moe_inter_dim * n_shared_experts is {}",
+                shared.inter, self.shared_inter
+            ));
+        }
+        let n_layers = self.compress_ratio.len();
+        if shared.layers.len() != n_layers {
+            return Err(format!(
+                "layer device shared expert: the gather has {} layer(s), the arm has {n_layers}",
+                shared.layers.len()
+            ));
+        }
+        self.shared = Some(SharedExpertOperands {
+            layers: shared.layers.clone(),
+            workspace: shared.workspace,
+            inter: shared.inter,
+            device_bytes: shared.device_bytes,
+        });
+        Ok(())
+    }
+
+    /// This layer's stage record: what ran, and where it stopped.
+    fn runs(&self) -> &crate::layer_device::StageRuns {
+        &self.runs
+    }
+
+    fn refusal(stage: &'static str) -> String {
+        match crate::layer_device::STAGE_CONTRACTS
+            .iter()
+            .find(|entry| entry.stage == stage)
+        {
+            Some(entry) => {
+                let blocker = crate::layer_device::STAGE_BLOCKERS
+                    .iter()
+                    .find(|(stage, _)| *stage == entry.stage)
+                    .map_or("", |(_, blocker)| *blocker);
+                crate::layer_device::not_landed_with_blocker(
+                    entry.stage,
+                    entry.kernel,
+                    entry.signature,
+                    blocker,
+                )
+            }
+            None => format!("layer device stage {stage}: no contract entry in the table"),
+        }
+    }
+
+    /// Copies host f32 words into one device span.
+    fn copy_in(&self, span: crate::layer_device::DeviceSpan, values: &[f32]) -> Result<(), String> {
+        let bytes = f32_le_bytes(values);
+        if bytes.len() > span.len {
+            return Err(format!(
+                "layer device: {} bytes into the {} byte span the contract sized",
+                bytes.len(),
+                span.len
+            ));
+        }
+        self.cuda
+            .copy_htod(&Deviceptr(span.device), &bytes)
+            .map_err(|error| {
+                format!(
+                    "layer device: host to device at {:#x}: {error}",
+                    span.device
+                )
+            })
+    }
+
+    /// Copies one device span back to host f32 words.
+    fn copy_out(
+        &self,
+        span: crate::layer_device::DeviceSpan,
+        values: &mut [f32],
+    ) -> Result<(), String> {
+        if values.len() * 4 > span.len {
+            return Err(format!(
+                "layer device: {} bytes out of the {} byte span the contract sized",
+                values.len() * 4,
+                span.len
+            ));
+        }
+        let mut bytes = vec![0u8; values.len() * 4];
+        self.cuda
+            .copy_dtoh(&mut bytes, &Deviceptr(span.device))
+            .map_err(|error| {
+                format!(
+                    "layer device: device to host at {:#x}: {error}",
+                    span.device
+                )
+            })?;
+        for (slot, word) in values.iter_mut().zip(bytes.as_chunks::<4>().0) {
+            *slot = f32::from_le_bytes(*word);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for DeviceLayer<'_> {
+    fn drop(&mut self) {
+        // One image, eight symbols, eight module handles: every handle is freed, and they are freed
+        // before the slab their launches read.
+        for module in [
+            self.kernels.entry_module,
+            self.kernels.ffn_module,
+            self.kernels.prologue_module,
+            self.kernels.attn_residual_module,
+            self.kernels.ffn_epilogue_module,
+            self.kernels.shared_swiglu_module,
+            self.kernels.prologue_bf16_module,
+            self.kernels.rope_rows_module,
+        ] {
+            self.cuda.free(module, &[]);
+        }
+        if let Some(ring) = self.seam_trace.take() {
+            self.cuda.free_host_mapped(&ring);
+        }
+        self.cuda.free_buffers(&[&self.slab]);
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl crate::layer_device::LayerStages for DeviceLayer<'_> {
+    fn buffers(&self) -> &crate::layer_device::LayerBuffers {
+        &self.buffers
+    }
+
+    /// The layer's whole chain, recorded stage by stage.
+    ///
+    /// The trait's default body is the same order, but it cannot say which stages ran, and the
+    /// probe row's frontier is exactly that answer. Every call goes through `StageRuns::record`, so
+    /// a refusal leaves the honest prefix (the stages that really ran) instead of the empty record
+    /// `from_refusal` would build from the message alone.
+    fn run_layer(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        // Divergence rule (Lead's, and it governs every refusal in this loop): a stage refusal must
+        // be deterministic from the plan and the kernel set - identical on all four ranks - or it
+        // must happen at open. Every refusal on this branch is a missing symbol, a wrong span
+        // width, a missing producer word or a shape disagreement, i.e. a property of the plan, so
+        // all four ranks see it at open or at the same stage simultaneously. The rule exists so a
+        // mid-run divergence is a bug in a refusal, not a race to be tolerated: there is no abort
+        // handshake in the timed region, and an unanticipated abort (OOM, Xid, fault) is made
+        // detectable and void by the outer timeout, never tolerated.
+        let mut runs = crate::layer_device::StageRuns::default();
+        let outcome = (|| {
+            runs.record("engram_write", self.engram_write(layer, position))?;
+            runs.record("mhc_entry", self.mhc_entry(layer, position))?;
+            runs.record("quantise_prologue", self.quantise_prologue(layer, position))?;
+            runs.record(
+                "attention_projections",
+                self.attention_projections(layer, position),
+            )?;
+            runs.record("query_path", self.query_path(layer, position))?;
+            runs.record("kv_path", self.kv_path(layer, position))?;
+            runs.record("reference_seam", self.reference_seam(layer, position))?;
+            runs.record("stage_attention", self.stage_attention(layer, position))?;
+            runs.record("attention_body", self.attention_body(layer, position))?;
+            runs.record("attention_output", self.attention_output(layer, position))?;
+            runs.record("all_reduce", self.all_reduce(layer, position))?;
+            runs.record(
+                "attention_residual",
+                self.attention_residual(layer, position),
+            )?;
+            runs.record("ffn_seams", self.ffn_seams(layer, position))?;
+            runs.record("moe_router", self.moe_router(layer, position))?;
+            runs.record("moe_routed", self.moe_routed(layer, position))?;
+            runs.record("all_reduce_moe", self.all_reduce_moe(layer, position))?;
+            runs.record("moe_shared", self.moe_shared(layer, position))?;
+            runs.record("ffn_epilogue", self.ffn_epilogue(layer, position))
+        })();
+        self.runs = runs;
+        outcome
+    }
+
+    fn begin_position(&mut self, position: usize, hidden: &[f32]) -> Result<(), String> {
+        // The cache starts empty and the counter starts at zero, so a first position after 0 would
+        // only surface at the first append as a slot mismatch. Refuse here, naming both numbers:
+        // the device arm starts at position 0 and has no cache-prefill path. A resume run is an
+        // explicit feature (prefill rows 0..position through the same append path), not a counter
+        // reset and not a silent slot mismatch.
+        if position != self.positions_begun {
+            let reason = if self.positions_begun == 0 {
+                "the device arm starts at position 0 and has no cache-prefill path".to_owned()
+            } else {
+                format!(
+                    "positions must be contiguous: {} positions have begun, so this one is out of order",
+                    self.positions_begun
+                )
+            };
+            return Err(format!(
+                "layer device begin_position: position {position} but {} position(s) have begun; {reason}",
+                self.positions_begun
+            ));
+        }
+        self.positions_begun += 1;
+        let mut row = Vec::with_capacity(self.hc_mult * hidden.len());
+        for _ in 0..self.hc_mult {
+            row.extend_from_slice(hidden);
+        }
+        self.copy_in(self.buffers.residual.stream, &row)?;
+        let mut seed = vec![0.0f32; self.hc_mult];
+        if let Some(first) = seed.first_mut() {
+            *first = 1.0;
+        }
+        self.copy_in(self.buffers.residual.pre_mix, &seed)
+    }
+
+    fn engram_write(&mut self, layer: usize, _position: usize) -> Result<(), String> {
+        if !self.engram_rows.contains(&layer) {
+            return Ok(());
+        }
+        Err(Self::refusal("engram_write"))
+    }
+
+    fn mhc_entry(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        use sparkflash_kernels::layer_seams_launch as seams;
+        // The mHC entry in one launch: the 24-row projection over the 4 x 5,120 hc stream, the
+        // pre/post/comb coefficient tail (thread 0, split Sinkhorn), hc_pre with the block's
+        // RMSNorm, and the hc rows the residual and FFN seams read. The pre mix it consumes is the
+        // previous layer's FFN pre set (the identity seed at position start), and this seam's own
+        // pre set goes to attn_mix (its pre region is the same
+        // table the FFN block's hc_pre reads), so residual.pre_mix keeps its incoming value until
+        // the FFN seam rotates it: the reference consumes the two pre sets in that order
+        // (hc_pre(pre_mix_in) here, hc_pre(attn pre) at the FFN).
+        let layer_id = u32::try_from(layer).map_err(|_| {
+            format!("layer device stage mhc_entry: layer {layer} does not fit the trace's u32")
+        })?;
+        let step_seq = u64::try_from(position).map_err(|_| {
+            format!("layer device stage mhc_entry: position {position} does not fit u64")
+        })?;
+        let weights = self.seam_layer(layer, "mhc_entry")?;
+        let residual = self.buffers.residual;
+        let (dim, hc_mult) = (self.dim, self.hc_mult);
+        let stream_needed = hc_mult
+            .checked_mul(dim)
+            .and_then(|values| values.checked_mul(4))
+            .ok_or("layer device stage mhc_entry: the hc stream width overflows")?;
+        for (name, span) in [
+            ("residual.stream", residual.stream),
+            ("residual.hc_rows", residual.hc_rows),
+        ] {
+            if span.len < stream_needed {
+                return Err(format!(
+                    "layer device stage mhc_entry: {name} is {} B, the {hc_mult}-copy {dim}-wide \
+                     f32 stream needs {stream_needed} B",
+                    span.len
+                ));
+            }
+        }
+        let row_needed = dim
+            .checked_mul(4)
+            .ok_or("layer device stage mhc_entry: the row width overflows")?;
+        if residual.normed.len < row_needed {
+            return Err(format!(
+                "layer device stage mhc_entry: residual.normed is {} B, the {dim}-wide f32 row \
+                 needs {row_needed} B",
+                residual.normed.len
+            ));
+        }
+        let pre_needed = hc_mult
+            .checked_mul(4)
+            .ok_or("layer device stage mhc_entry: the pre-mix width overflows")?;
+        if residual.pre_mix.len < pre_needed {
+            return Err(format!(
+                "layer device stage mhc_entry: residual.pre_mix is {} B, the {hc_mult}-value f32 \
+                 mix needs {pre_needed} B",
+                residual.pre_mix.len
+            ));
+        }
+        let mix_needed = (seams::RELEASED_ROWS as usize)
+            .checked_mul(4)
+            .ok_or("layer device stage mhc_entry: the mix width overflows")?;
+        let attn_mix = self.buffers.workspace.attn_mix;
+        if attn_mix.len < mix_needed {
+            return Err(format!(
+                "layer device stage mhc_entry: workspace.attn_mix is {} B, the {} coefficient values \
+                 need {mix_needed} B",
+                attn_mix.len,
+                seams::RELEASED_ROWS
+            ));
+        }
+        let trace_ring = self.seam_trace_ring();
+        let params = seams::EntryParams {
+            residual: Deviceptr(residual.stream.device),
+            attn_pre_mix: Deviceptr(residual.pre_mix.device),
+            fn_w: weights.attn_fn,
+            hc_base: weights.attn_base,
+            hc_scale: weights.attn_scale,
+            norm_w: weights.attn_norm,
+            mix_table: Deviceptr(attn_mix.device),
+            hc_rows: Deviceptr(residual.hc_rows.device),
+            normed: Deviceptr(residual.normed.device),
+            norm_bf16: SEAM_NORM_BF16,
+            native_bf16: self.native_bf16,
+            sinkhorn_iterations: self.sinkhorn_iters,
+            norm_eps: self.eps,
+            hc_eps: self.hc_eps,
+            trace_ring,
+            layer_id,
+            step_seq,
+        };
+        seams::launch_entry(self.cuda, self.kernels.entry, &params)?;
+        probe::count("mhc_entry");
+        Ok(())
+    }
+
+    fn quantise_prologue(&mut self, layer: usize, _position: usize) -> Result<(), String> {
+        use sparkflash_kernels::layer_seams_launch as seams;
+        // The contract's span check stays the gate (`PrologueLaunch` is the span owner, and it no
+        // longer emits argument words); the launch goes through the typed seam launcher, which owns
+        // the eight-word ABI including the uniform trace tail. The ring is null, and a null ring
+        // writes nothing: every store in the kernel sits behind its pinned null guard.
+        let cols = u32::try_from(self.dim)
+            .map_err(|_| format!("layer device prologue: {} columns do not fit u32", self.dim))?;
+        // The attention prologue reads the f32 normed row, so its span check is the f32 one: the
+        // bf16 width would accept a half-size span for a four-byte read.
+        let launch = crate::layer_device::PrologueLaunch::new_f32(
+            self.buffers.residual.normed,
+            self.buffers.workspace.act_codes,
+            self.buffers.workspace.act_scales,
+            1,
+            cols,
+        )?;
+        let layer_id = u32::try_from(layer).map_err(|_| {
+            format!("layer device prologue: layer {layer} does not fit the trace's u32")
+        })?;
+        let trace_ring = self.seam_trace_ring();
+        let params = seams::PrologueParams {
+            normed: Deviceptr(launch.row.device),
+            codes: Deviceptr(launch.codes.device),
+            scales: Deviceptr(launch.scales.device),
+            cols: launch.cols,
+            rows: launch.rows,
+            trace_ring,
+            layer_id,
+            step_seq: 0,
+        };
+        seams::launch_prologue(self.cuda, self.kernels.prologue, &params)?;
+        probe::count("quantise_prologue");
+        Ok(())
+    }
+    fn attention_projections(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        self.launch_projection(0, "wq_a", layer, position)?;
+        self.launch_projection(1, "wkv", layer, position)
+    }
+
+    fn query_path(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        let layer_id = u32::try_from(layer).map_err(|_| {
+            format!("layer device stage query_path: layer {layer} does not fit the trace's u32")
+        })?;
+        let step_seq = u64::try_from(position).map_err(|_| {
+            format!("layer device stage query_path: position {position} does not fit u64")
+        })?;
+        let cols = self.projections[0].cols;
+        let weight = self
+            .weights
+            .get(layer, "q_norm")
+            .map_err(|error| format!("layer device stage query_path: {error}"))?;
+        let weight_span = crate::layer_device::DeviceSpan::new(
+            weight.0,
+            usize::try_from(cols)
+                .ok()
+                .and_then(|cols| cols.checked_mul(2))
+                .ok_or_else(|| {
+                    "layer device stage query_path: the q_norm width overflows".to_owned()
+                })?,
+        );
+        // The q_norm over the wq_a latent: rmsnorm_sm121 takes distinct in/out, which is why the
+        // slab carries q_normed beside q_lora.
+        self.row_norm(
+            self.buffers.workspace.q_lora,
+            weight_span,
+            self.buffers.workspace.q_normed,
+            1,
+            cols,
+            layer_id,
+            step_seq,
+        )?;
+        // The latent's activation quantise into the same codes/scales span, at the latent's width.
+        // q_normed is the row norm's BF16 output (2,560 B of 1,280 values), so this is the bf16
+        // variant: the host's q_norm output is a bf16 tensor (attention.rs:1318-1341) and that is
+        // the row the reference quantises. The f32 variant here would read 5,120 B out of a 2,560 B
+        // span - the width check below is the operand width this kernel reads, not half of it.
+        {
+            use sparkflash_kernels::layer_seams_launch as seams;
+            let row = self.buffers.workspace.q_normed;
+            let needed = usize::try_from(cols)
+                .map_err(|_| {
+                    "layer device stage query_path: the cols do not fit a usize".to_owned()
+                })?
+                .checked_mul(2)
+                .ok_or("layer device stage query_path: the bf16 row width overflows")?;
+            if row.len < needed {
+                return Err(format!(
+                    "layer device stage query_path: q_normed is {} B but the bf16 quantiser reads {needed} B ({cols} values of 2 B); the f32 variant would have read twice the span",
+                    row.len
+                ));
+            }
+            let blocks = usize::try_from(cols)
+                .map_err(|_| {
+                    "layer device stage query_path: the cols do not fit a usize".to_owned()
+                })?
+                .div_ceil(32);
+            let codes = crate::layer_device::DeviceSpan::new(
+                self.buffers.workspace.act_codes.device,
+                blocks,
+            );
+            let scales = crate::layer_device::DeviceSpan::new(
+                self.buffers.workspace.act_scales.device,
+                blocks.div_ceil(32),
+            );
+            let trace_ring = self.seam_trace_ring();
+            let params = seams::PrologueBf16Params {
+                normed: Deviceptr(row.device),
+                codes: Deviceptr(codes.device),
+                scales: Deviceptr(scales.device),
+                cols,
+                rows: 1,
+                trace_ring,
+                layer_id,
+                step_seq,
+            };
+            seams::launch_prologue_bf16(self.cuda, self.kernels.prologue_bf16, &params)?;
+        }
+        // wq_b: inner = q_lora_rank (1,280), cols = the per-rank q width, out = q.
+        self.launch_projection(2, "wq_b", layer, position)?;
+        // The q rope tail, in place in q: one launch per head, out may alias the row.
+        self.rotate_q(layer, position)
+    }
+
+    fn kv_path(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        use sparkflash_kernels::kv_path_launch as kv;
+        // The fused kernel is loaded at open, so its absence is an open-time refusal, not a
+        // first-position one. The ordering check below is the design rule: the append must come
+        // after the window read of this position, so the cache is exactly position rows long when
+        // it runs.
+        // The ordering check the design piece is about: the append must come after the window read
+        // of this position, so the cache is exactly `position` rows long when it runs. A longer
+        // cache means the append ran before the read, and the rule refuses with that sentence.
+        let row_width = usize::try_from(self.head_width).map_err(|_| {
+            "layer device stage kv_path: head_width does not fit a usize".to_owned()
+        })?;
+        let appended = self.appended_rows.get(layer).copied().ok_or_else(|| {
+            format!("layer device stage kv_path: layer {layer} has no cache row count")
+        })?;
+        sparkflash_kernels::kv_path_ref::kv_append_rule(appended, position, row_width)
+            .map_err(|error| format!("layer device stage kv_path: {error}"))?;
+        if position >= self.max_positions {
+            return Err(format!(
+                "layer device stage kv_path: position {position} is outside the {}-row cache; extend max_positions rather than wrapping the slot",
+                self.max_positions
+            ));
+        }
+        let position_u32 = u32::try_from(position).map_err(|_| {
+            format!("layer device stage kv_path: position {position} does not fit u32")
+        })?;
+        let pairs = usize::try_from(self.rope_pairs).map_err(|_| {
+            "layer device stage kv_path: pair count does not fit a usize".to_owned()
+        })?;
+        let table_bytes = self
+            .max_positions
+            .checked_mul(pairs)
+            .and_then(|values| values.checked_mul(4))
+            .ok_or_else(|| "layer device stage kv_path: the table offset overflows".to_owned())?;
+        let offset = position
+            .checked_mul(pairs)
+            .and_then(|values| values.checked_mul(4))
+            .ok_or_else(|| {
+                "layer device stage kv_path: the position offset overflows".to_owned()
+            })?;
+        let table_slice = pairs
+            .checked_mul(4)
+            .ok_or_else(|| "layer device stage kv_path: the table slice overflows".to_owned())?;
+        let ratio = self.compress_ratio.get(layer).copied().ok_or_else(|| {
+            format!("layer device stage kv_path: layer {layer} has no rope class")
+        })?;
+        let rope_span = if ratio > 0 {
+            self.buffers.workspace.rope_tables_compressed
+        } else {
+            self.buffers.workspace.rope_tables_plain
+        };
+        // 1. The MLA latent's kv_norm then rope tail, out of place into kv_rotated: one 512-wide row,
+        // 64-long tail, one bf16 rounding at the end (the host's order, tp4_forward.rs:3032-3038).
+        // The declared deviation is the operand: the device latent is bf16 where the host keeps f32,
+        // so the kernel widens it. Everything after the widening is the host's arithmetic.
+        let kv_norm = self
+            .weights
+            .get(layer, "kv_norm")
+            .map_err(|error| format!("layer device stage kv_path: {error}"))?;
+        let Some((_, norm_rope_kernel)) = self.kv_norm_rope else {
+            return Err(
+                "layer device stage kv_path: the fused kv_norm_rope_bf16 kernel was not loaded at open"
+                    .to_owned(),
+            );
+        };
+        let fused = kv::KvNormRopeParams {
+            row: Deviceptr(self.buffers.workspace.kv_latent.device),
+            norm: kv_norm,
+            eps: self.eps,
+            cos: Deviceptr(rope_span.device + offset as u64),
+            sin: Deviceptr(rope_span.device + table_bytes as u64 + offset as u64),
+            out: Deviceptr(self.buffers.workspace.kv_rotated.device),
+            head_width: self.head_width,
+            rope_head_dim: self.rope_head_dim,
+        };
+        fused.check_spans(
+            self.buffers.workspace.kv_latent.len,
+            row_width * 2,
+            table_slice,
+            table_slice,
+            self.buffers.workspace.kv_rotated.len,
+        )?;
+        kv::launch_kv_norm_rope(self.cuda, norm_rope_kernel, &fused)
+            .map_err(|error| format!("layer device stage kv_path: kv norm+rope: {error}"))?;
+        // 2. The window row's E4M3/E8M0 round trip into this layer's ring slot.
+        let slot = self.kv_ring.slot_for(position);
+        let ring_layer = self.kv_ring_base + self.kv_ring.layer_offset(layer) as u64;
+        let codes = ring_layer + self.kv_ring.codes_offset(slot)? as u64;
+        let scales = ring_layer + self.kv_ring.scales_offset(slot)? as u64;
+        let quant = kv::WindowQuantParams {
+            row: Deviceptr(self.buffers.workspace.kv_rotated.device),
+            codes: Deviceptr(codes),
+            scales: Deviceptr(scales),
+            cols: self.head_width,
+            block: 32,
+        };
+        quant.check_spans(
+            self.buffers.workspace.kv_rotated.len,
+            sparkflash_kernels::kv_path_ref::WINDOW_CODE_BYTES,
+            sparkflash_kernels::kv_path_ref::WINDOW_SCALE_BYTES,
+        )?;
+        kv::launch_window_quant(self.cuda, self.kv_quant_kernel.1, &quant)
+            .map_err(|error| format!("layer device stage kv_path: window quantiser: {error}"))?;
+        // 3. This position's k/v rows into the cache slot (the latent is both k and v; the row is
+        // 2 * head_dim wide, k then v).
+        let cache = self.kv_cache.layer_span(layer)?;
+        let rows = u32::try_from(self.capacity_rows)
+            .map_err(|_| "layer device stage kv_path: capacity_rows does not fit u32".to_owned())?;
+        let append = kv::KvAppendParams {
+            k_row: Deviceptr(self.buffers.workspace.kv_rotated.device),
+            v_row: Deviceptr(self.buffers.workspace.kv_rotated.device),
+            cache: Deviceptr(cache.device),
+            rows,
+            head_dim: self.head_width,
+            position: position_u32,
+        };
+        append.validate()?;
+        append.check_spans(
+            self.buffers.workspace.kv_rotated.len,
+            self.buffers.workspace.kv_rotated.len,
+            cache.len,
+        )?;
+        kv::launch_kv_append(self.cuda, self.kv_append_kernel.1, &append)
+            .map_err(|error| format!("layer device stage kv_path: cache append: {error}"))?;
+        if let Some(count) = self.appended_rows.get_mut(layer) {
+            *count = appended + 1;
+        }
+        probe::count("kv_path");
+        Ok(())
+    }
+
+    fn reference_seam(&mut self, _layer: usize, _position: usize) -> Result<(), String> {
+        Err(Self::refusal("reference_seam"))
+    }
+
+    fn ref_select(&mut self, _layer: usize, _position: usize) -> Result<(), String> {
+        Err(Self::refusal("ref_select"))
+    }
+
+    fn stage_attention(&mut self, _layer: usize, _position: usize) -> Result<(), String> {
+        Err(Self::refusal("stage_attention"))
+    }
+
+    fn attention_body(&mut self, _layer: usize, _position: usize) -> Result<(), String> {
+        Err(Self::refusal("attention_body"))
+    }
+
+    fn attention_output(&mut self, _layer: usize, _position: usize) -> Result<(), String> {
+        Err(Self::refusal("attention_output"))
+    }
+
+    fn all_reduce(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        // Divergence rule (Lead's, and it is this stage's contract too): a stage refusal must be
+        // deterministic from the plan and the kernel set - identical on all four ranks - or it must
+        // happen at open. This stage's only refusal is the missing handle or a short carved span, a
+        // property of the run's setup, so all four ranks refuse it together or none does; there is
+        // no mid-run branch here that could fire on one rank alone. An unanticipated abort (OOM,
+        // Xid, fault) is void by the outer timeout, never tolerated by a handshake in the timed
+        // region.
+        let _ = (layer, position);
+        let input = self.buffers.workspace.attn_out_bf16;
+        let output = self.buffers.workspace.reduced_bf16;
+        self.reduce_row("all_reduce", input, output)
+    }
+
+    fn attention_residual(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        use sparkflash_kernels::layer_seams_launch as seams;
+        // The attention sublayer's hc_post in one launch: the all-reduced BF16 delta mixed back onto
+        // the hc stream with the entry's post mixes and Sinkhorn comb matrix. It reads
+        // residual.hc_rows - the entry's own copy of the stream, which is exactly the residual the
+        // reference hands hc_post - and writes residual.stream in place. hc_post mixes the four
+        // copies at a fixed column and never across columns, so reading the four sources for a
+        // column before writing its four outputs cannot see a half-updated stream; the twin's
+        // in-place test is what proves that, not this comment. There is no pre-mix term to consume:
+        // hc_pre takes a pre set, hc_post never does, so the mix table's post (+hc) and comb (+2hc)
+        // regions are the whole input.
+        let layer_id = u32::try_from(layer).map_err(|_| {
+            format!(
+                "layer device stage attention_residual: layer {layer} does not fit the trace's u32"
+            )
+        })?;
+        let step_seq = u64::try_from(position).map_err(|_| {
+            format!("layer device stage attention_residual: position {position} does not fit u64")
+        })?;
+        let residual = self.buffers.residual;
+        let workspace = self.buffers.workspace;
+        let (dim, hc_mult) = (self.dim, self.hc_mult);
+        let stream_needed = hc_mult
+            .checked_mul(dim)
+            .and_then(|values| values.checked_mul(4))
+            .ok_or("layer device stage attention_residual: the hc stream width overflows")?;
+        for (name, span) in [
+            ("residual.hc_rows", residual.hc_rows),
+            ("residual.stream", residual.stream),
+        ] {
+            if span.len < stream_needed {
+                return Err(format!(
+                    "layer device stage attention_residual: {name} is {} B, the {hc_mult}-copy {dim}-wide f32 stream needs {stream_needed} B",
+                    span.len
+                ));
+            }
+        }
+        let delta_needed = dim
+            .checked_mul(2)
+            .ok_or("layer device stage attention_residual: the delta width overflows")?;
+        if workspace.reduced_bf16.len < delta_needed {
+            return Err(format!(
+                "layer device stage attention_residual: workspace.reduced_bf16 is {} B, the {dim}-wide BF16 delta needs {delta_needed} B",
+                workspace.reduced_bf16.len
+            ));
+        }
+        let mix_needed = (seams::RELEASED_ROWS as usize)
+            .checked_mul(4)
+            .ok_or("layer device stage attention_residual: the mix width overflows")?;
+        if workspace.attn_mix.len < mix_needed {
+            return Err(format!(
+                "layer device stage attention_residual: workspace.attn_mix is {} B, the {} coefficient values need {mix_needed} B",
+                workspace.attn_mix.len,
+                seams::RELEASED_ROWS
+            ));
+        }
+        let trace_ring = self.seam_trace_ring();
+        let params = seams::AttnResidualParams {
+            hc_rows: Deviceptr(residual.hc_rows.device),
+            mix_table: Deviceptr(workspace.attn_mix.device),
+            reduced_bf16: Deviceptr(workspace.reduced_bf16.device),
+            stream_out: Deviceptr(residual.stream.device),
+            native_bf16: self.native_bf16,
+            trace_ring,
+            layer_id,
+            step_seq,
+        };
+        seams::launch_attn_residual(self.cuda, self.kernels.attn_residual, &params)?;
+        probe::count("attention_residual");
+        Ok(())
+    }
+
+    fn ffn_seams(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        use sparkflash_kernels::layer_seams_launch as seams;
+        // The FFN seam in one launch: the FFN predictor over the post-attention hc stream, its
+        // coefficient tail and hc_pre, the FFN block's RMSNorm into the seam row, and the
+        // activation quantiser over that row (the MXFP8 gate/up operand). Its hc_pre input is the
+        // attention seam's pre set (attn_mix's first hc values) and its own pre set rotates into
+        // residual.pre_mix, which is what the next layer's entry reads. The FFN seam writes no
+        // second hc_rows copy: nothing on the device read it (attention_residual consumes the
+        // entry's copy, and ffn_epilogue reads residual.stream in place), so that output was dead
+        // and the overlap with the entry's span went with it.
+        let layer_id = u32::try_from(layer).map_err(|_| {
+            format!("layer device stage ffn_seams: layer {layer} does not fit the trace's u32")
+        })?;
+        let step_seq = u64::try_from(position).map_err(|_| {
+            format!("layer device stage ffn_seams: position {position} does not fit u64")
+        })?;
+        let weights = self.seam_layer(layer, "ffn_seams")?;
+        let residual = self.buffers.residual;
+        let workspace = self.buffers.workspace;
+        let (dim, hc_mult) = (self.dim, self.hc_mult);
+        let stream_needed = hc_mult
+            .checked_mul(dim)
+            .and_then(|values| values.checked_mul(4))
+            .ok_or("layer device stage ffn_seams: the hc stream width overflows")?;
+        for (name, span) in [("residual.stream", residual.stream)] {
+            if span.len < stream_needed {
+                return Err(format!(
+                    "layer device stage ffn_seams: {name} is {} B, the {hc_mult}-copy {dim}-wide \
+                     f32 stream needs {stream_needed} B",
+                    span.len
+                ));
+            }
+        }
+        let row_needed = dim
+            .checked_mul(4)
+            .ok_or("layer device stage ffn_seams: the row width overflows")?;
+        if workspace.seam_row.len < row_needed {
+            return Err(format!(
+                "layer device stage ffn_seams: workspace.seam_row is {} B, the {dim}-wide f32 row \
+                 needs {row_needed} B",
+                workspace.seam_row.len
+            ));
+        }
+        let pre_needed = hc_mult
+            .checked_mul(4)
+            .ok_or("layer device stage ffn_seams: the pre-mix width overflows")?;
+        if residual.pre_mix.len < pre_needed {
+            return Err(format!(
+                "layer device stage ffn_seams: residual.pre_mix is {} B, the {hc_mult}-value f32 \
+                 mix needs {pre_needed} B",
+                residual.pre_mix.len
+            ));
+        }
+        let mix_needed = (seams::RELEASED_ROWS as usize)
+            .checked_mul(4)
+            .ok_or("layer device stage ffn_seams: the mix width overflows")?;
+        if workspace.ffn_mix.len < mix_needed {
+            return Err(format!(
+                "layer device stage ffn_seams: workspace.ffn_mix is {} B, the {} coefficient values \
+                 need {mix_needed} B",
+                workspace.ffn_mix.len,
+                seams::RELEASED_ROWS
+            ));
+        }
+        let scale_needed = dim.div_ceil(32);
+        if workspace.act_codes.len < dim || workspace.act_scales.len < scale_needed {
+            return Err(format!(
+                "layer device stage ffn_seams: the activation spans are {} codes and {} scales, the \
+                 {dim}-wide row needs {dim} and {scale_needed}",
+                workspace.act_codes.len, workspace.act_scales.len
+            ));
+        }
+        let trace_ring = self.seam_trace_ring();
+        let params = seams::FfnSeamsParams {
+            stream: Deviceptr(residual.stream.device),
+            attn_pre_mix: Deviceptr(workspace.attn_mix.device),
+            fn_w: weights.ffn_fn,
+            hc_base: weights.ffn_base,
+            hc_scale: weights.ffn_scale,
+            norm_w: weights.ffn_norm,
+            mix_table: Deviceptr(workspace.ffn_mix.device),
+            pre_mix: Deviceptr(residual.pre_mix.device),
+            seam_row: Deviceptr(workspace.seam_row.device),
+            act_codes: Deviceptr(workspace.act_codes.device),
+            act_scales: Deviceptr(workspace.act_scales.device),
+            // The device router's input: the NORMED pre-FFN row (the host arm's pre_ffn_hidden,
+            // moe-stage-contract H3b), RNE-narrowed by ffn_seams at word 11 - the same value
+            // seam_row holds, NOT the hc_pre collapse. It is this branch's carved span
+            // (workspace.ffn_x_bf16), so the non-null write path is taken.
+            x_bf16: Deviceptr(workspace.ffn_x_bf16.device),
+            norm_bf16: SEAM_NORM_BF16,
+            native_bf16: self.native_bf16,
+            sinkhorn_iterations: self.sinkhorn_iters,
+            norm_eps: self.eps,
+            hc_eps: self.hc_eps,
+            trace_ring,
+            layer_id,
+            step_seq,
+        };
+        seams::launch_ffn_seams(self.cuda, self.kernels.ffn_seams, &params)?;
+        probe::count("ffn_seams");
+        Ok(())
+    }
+
+    fn moe_router(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        // The router's operand is the pre-FFN hidden row ffn_seams wrote as BF16 - not the normed
+        // row at seam_row's base. The stage refuses unless ffn_seams actually ran for THIS position:
+        // its probe counter must have advanced since the router last looked, so a stale row from an
+        // earlier position cannot produce plausible routing (the probe is the seam stages' own
+        // counter, not a second mechanism).
+        let now = probe::stage_count("ffn_seams");
+        if now == self.ffn_seams_seen {
+            return Err(format!(
+                "layer device stage moe_router (layer {layer}, position {position}): ffn_seams has not run since this stage last ran (probe count unchanged at {now}), so under the fixed stage order this position was not staged; the router would read a stale row"
+            ));
+        }
+        self.ffn_seams_seen = now;
+        let Some(kernels) = self.router_kernels else {
+            return Err(format!(
+                "layer device stage moe_router (layer {layer}, position {position}): the router kernels were not loaded at open (the staged cubin directory carries no moe_router_sm121)"
+            ));
+        };
+        let Some(router) = self.router.as_ref() else {
+            return Err(format!(
+                "layer device stage moe_router (layer {layer}, position {position}): no router bind was attached"
+            ));
+        };
+        let (gate, bias) = router.get(layer).copied().ok_or_else(|| {
+            format!("layer device stage moe_router: layer {layer} has no router pointers")
+        })?;
+        let dim = self.dim;
+        let experts = self.routed_geometry.experts;
+        let top_k = self.routed_geometry.top_k;
+        let x = self.buffers.workspace.ffn_x_bf16;
+        if x.len < dim * 2 {
+            return Err(format!(
+                "layer device stage moe_router: workspace.ffn_x_bf16 is {} B, {dim} bf16 values need {} B",
+                x.len,
+                dim * 2
+            ));
+        }
+        let ids = self.buffers.workspace.moe_ids;
+        let weights = self.buffers.workspace.moe_weights;
+        let scores = self.buffers.workspace.logits;
+        for (name, span, needed) in [
+            ("workspace.moe_ids", ids, top_k * 4),
+            ("workspace.moe_weights", weights, top_k * 4),
+            ("workspace.logits", scores, experts * 4),
+        ] {
+            if span.len < needed {
+                return Err(format!(
+                    "layer device stage moe_router: {name} is {} B, {needed} B needed",
+                    span.len
+                ));
+            }
+        }
+        let layer_id = u32::try_from(layer)
+            .map_err(|_| "layer device stage moe_router: layer does not fit u32".to_owned())?;
+        let step_seq = u64::try_from(position)
+            .map_err(|_| "layer device stage moe_router: position does not fit u64".to_owned())?;
+        let params = sparkflash_kernels::router_launch::RouterLaunchParams {
+            x: Deviceptr(x.device),
+            gate,
+            bias,
+            ids: Deviceptr(ids.device),
+            weights: Deviceptr(weights.device),
+            scores: Deviceptr(scores.device),
+            tokens: 1,
+            // The shipped router cubins are trace-disabled builds: a code here would name a record
+            // that is never written (driver-fixer's finding on the same class).
+            trace_ring: 0,
+            layer_id,
+            step_seq,
+        };
+        sparkflash_kernels::router_launch::launch(self.cuda, kernels.1, kernels.3, &params)?;
+        probe::count("moe_router");
+        Ok(())
+    }
+
+    fn moe_routed(&mut self, _layer: usize, _position: usize) -> Result<(), String> {
+        Err(Self::refusal("moe_routed"))
+    }
+
+    fn moe_shared(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        use sparkflash_kernels::mxfp8_dense_launch::Mxfp8DenseParams;
+        use sparkflash_kernels::mxfp8_gemv_launch;
+        let Some(shared) = self.shared.as_ref().cloned() else {
+            return Err("layer device stage moe_shared: the shared-expert gather did not happen (attach_shared was not called, or the plan carries no shared expert); refusing rather than compute a shared row from a partial set".to_owned());
+        };
+        let operands = shared.layers.get(layer).copied().ok_or_else(|| {
+            format!("layer device stage moe_shared: layer {layer} has no gathered operands")
+        })?;
+        let dim = self.dim;
+        let inter = shared.inter;
+        let dim_u32 = u32::try_from(dim)
+            .map_err(|_| "layer device stage moe_shared: dim does not fit u32".to_owned())?;
+        let inter_u32 = u32::try_from(inter)
+            .map_err(|_| "layer device stage moe_shared: inter does not fit u32".to_owned())?;
+        let layer_id = u32::try_from(layer)
+            .map_err(|_| "layer device stage moe_shared: layer does not fit u32".to_owned())?;
+        let step_seq = u64::try_from(position)
+            .map_err(|_| "layer device stage moe_shared: position does not fit u64".to_owned())?;
+        let workspace = shared.workspace;
+        let shared_row = Deviceptr(self.buffers.workspace.seam_row.device);
+        // The activation is the f32 normed row `ffn_seams` wrote at seam_row's base. Stage order puts
+        // `moe_router` and `moe_routed` before this stage, and nothing after it reads the normed
+        // row, so the f32 arm reads it in place and the shared row overwrites it: no copy of the
+        // activation row, and the coded arm's prologue is the only consumer that must run first.
+        if !self.native_shared {
+            use sparkflash_kernels::layer_seams_launch as seams;
+            if !self.shared_swiglu_f32 {
+                return Err(
+                    "layer device stage moe_shared: the default (f32-reference) arm needs the device f32 SwiGLU and the seam image did not load it"
+                        .to_owned(),
+                );
+            }
+            // The default arm is f32-reference arithmetic ON THE DEVICE: three f32a/f32o GEMVs (the
+            // f32 activation row is seam_row's base itself, no quantise step) and one device SwwiGLU.
+            // The host does that SwiGLU in Rust between two D2H/H2D pairs; this removes the round
+            // trip. Declared deviation: expf/true-divide vs Rust exp, a D54 tolerance item.
+            let f32_launch = |activation: Deviceptr,
+                              weight: Deviceptr,
+                              weight_scales: Deviceptr,
+                              output: Deviceptr,
+                              cols: u32,
+                              inner: u32|
+             -> Result<(), String> {
+                let params = Mxfp8DenseParams::new(
+                    activation,
+                    workspace.a_scales,
+                    weight,
+                    weight_scales,
+                    output,
+                    1,
+                    cols,
+                    inner,
+                    0,
+                    layer_id,
+                    step_seq,
+                );
+                mxfp8_gemv_launch::launch_mode(
+                    self.cuda,
+                    self.shared_gemv_f32.1,
+                    mxfp8_gemv_launch::Mode::NonFusedF32ActivationF32Stores,
+                    &params,
+                )
+            };
+            f32_launch(
+                shared_row,
+                operands.w1,
+                operands.s1,
+                workspace.gate_f32,
+                inter_u32,
+                dim_u32,
+            )
+            .map_err(|error| format!("layer device stage moe_shared: w1 (f32 arm): {error}"))?;
+            f32_launch(
+                shared_row,
+                operands.w3,
+                operands.s3,
+                workspace.up_f32,
+                inter_u32,
+                dim_u32,
+            )
+            .map_err(|error| format!("layer device stage moe_shared: w3 (f32 arm): {error}"))?;
+            let swiglu = seams::SharedSwigluParams {
+                gate: workspace.gate_f32,
+                up: workspace.up_f32,
+                out: workspace.swiglu_f32,
+                limit: self.swiglu_limit,
+                inter: inter_u32,
+            };
+            seams::launch_shared_swiglu(self.cuda, self.kernels.shared_swiglu, &swiglu).map_err(
+                |error| format!("layer device stage moe_shared: swiglu (f32 arm): {error}"),
+            )?;
+            f32_launch(
+                workspace.swiglu_f32,
+                operands.w2,
+                operands.s2,
+                shared_row,
+                dim_u32,
+                inter_u32,
+            )
+            .map_err(|error| format!("layer device stage moe_shared: w2 (f32 arm): {error}"))?;
+            probe::count("moe_shared");
+            return Ok(());
+        }
+        // 1. The normed row at seam_row's base is f32 (ffn_seams wrote it that way); the activation
+        // prologue is the same launch the attention row uses, at the shared expert's width.
+        {
+            use sparkflash_kernels::layer_seams_launch as seams;
+            // The activation is the f32 normed row at seam_row's base: the f32 span check.
+            let launch = crate::layer_device::PrologueLaunch::new_f32(
+                self.buffers.workspace.seam_row,
+                crate::layer_device::DeviceSpan::new(workspace.a_codes.0, dim),
+                crate::layer_device::DeviceSpan::new(workspace.a_scales.0, dim.div_ceil(32)),
+                1,
+                dim_u32,
+            )?;
+            let params = seams::PrologueParams {
+                normed: Deviceptr(launch.row.device),
+                codes: Deviceptr(launch.codes.device),
+                scales: Deviceptr(launch.scales.device),
+                cols: launch.cols,
+                rows: launch.rows,
+                trace_ring: 0,
+                layer_id,
+                step_seq,
+            };
+            seams::launch_prologue(self.cuda, self.kernels.prologue, &params)?;
+        }
+        // 2. w1 and w3: cols = inter, inner = dim, the gathered B12x operands.
+        let gate = Mxfp8DenseParams::new(
+            workspace.a_codes,
+            workspace.a_scales,
+            operands.w1,
+            operands.s1,
+            workspace.gate,
+            1,
+            inter_u32,
+            dim_u32,
+            0,
+            layer_id,
+            step_seq,
+        );
+        mxfp8_gemv_launch::launch(self.cuda, self.shared_gemv.1, &gate)
+            .map_err(|error| format!("layer device stage moe_shared: w1: {error}"))?;
+        let up = Mxfp8DenseParams::new(
+            workspace.a_codes,
+            workspace.a_scales,
+            operands.w3,
+            operands.s3,
+            workspace.up,
+            1,
+            inter_u32,
+            dim_u32,
+            0,
+            layer_id,
+            step_seq,
+        );
+        mxfp8_gemv_launch::launch(self.cuda, self.shared_gemv.1, &up)
+            .map_err(|error| format!("layer device stage moe_shared: w3: {error}"))?;
+        // 3. The wide SwiGLU + MX-quantise: the released clamp limit as an f32 word, one row.
+        let blocks = (inter / WINDOW_QUANT_BLOCK) as u32;
+        let swiglu_words = [
+            workspace.gate.0,
+            workspace.up.0,
+            workspace.codes.0,
+            workspace.scales.0,
+            1,
+            inter as u64,
+            u64::from(self.swiglu_limit.to_bits()),
+            0,
+            layer as u64,
+            step_seq,
+        ];
+        self.cuda.launch(
+            self.shared_swiglu.1,
+            (blocks.div_ceil(8), 1, 1),
+            (256, 1, 1),
+            &swiglu_words,
+        )?;
+        // 4. w2: cols = dim, inner = inter, and it writes the BF16 shared row DIRECTLY over
+        // seam_row's base. BF16 rather than f32 on purpose: the coded GEMV's store is BF16 and the
+        // epilogue widens it (shared_bf16 = 1), which is exactly the host's widen-on-readback. The
+        // f32 normed row is consumed above before this overwrite, and no later stage reads it.
+        let down = Mxfp8DenseParams::new(
+            workspace.codes,
+            workspace.scales,
+            operands.w2,
+            operands.s2,
+            shared_row,
+            1,
+            dim_u32,
+            inter_u32,
+            0,
+            layer_id,
+            step_seq,
+        );
+        mxfp8_gemv_launch::launch(self.cuda, self.shared_gemv.1, &down)
+            .map_err(|error| format!("layer device stage moe_shared: w2: {error}"))?;
+        probe::count("moe_shared");
+        Ok(())
+    }
+
+    fn all_reduce_moe(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        // Same divergence rule as all_reduce: the only refusal is the run-level missing handle or a
+        // short carved span.
+        let _ = (layer, position);
+        let input = self.buffers.workspace.moe_delta_bf16;
+        let output = self.buffers.workspace.moe_reduced_bf16;
+        self.reduce_row("all_reduce_moe", input, output)
+    }
+
+    fn ffn_epilogue(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        use sparkflash_kernels::layer_seams_launch as seams;
+        // The FFN epilogue in one launch: the FFN seam's hc_post over the post-attention hc stream,
+        // with the routed MoE delta as its block output. The reference adds the shared expert's row
+        // to the widened routed delta before that hc_post, and this arm now has that row: the
+        // `moe_shared` stage runs before this one and leaves its row at seam_row's base, so
+        // FFN_EPILOGUE_SHARED_PRESENT is true and the ABI's shared_present word says the add
+        // happens. `shared_bf16` selects how the epilogue reads that row: 0 for the default arm's
+        // f32 row, 1 for the coded arm's BF16 store, which is the same `native_shared` word the arm
+        // selection used - one decision, one word. If the arm cannot run, `moe_shared` refuses and
+        // this stage is never reached, so the epilogue cannot add a stale row. moe_delta is the row
+        // all_reduce_moe wrote; the epilogue adds no reduce of its own.
+        let layer_id = u32::try_from(layer).map_err(|_| {
+            format!("layer device stage ffn_epilogue: layer {layer} does not fit the trace's u32")
+        })?;
+        let step_seq = u64::try_from(position).map_err(|_| {
+            format!("layer device stage ffn_epilogue: position {position} does not fit u64")
+        })?;
+        let residual = self.buffers.residual;
+        let workspace = self.buffers.workspace;
+        let (dim, hc_mult) = (self.dim, self.hc_mult);
+        let stream_needed = hc_mult
+            .checked_mul(dim)
+            .and_then(|values| values.checked_mul(4))
+            .ok_or("layer device stage ffn_epilogue: the hc stream width overflows")?;
+        if residual.stream.len < stream_needed {
+            return Err(format!(
+                "layer device stage ffn_epilogue: residual.stream is {} B, the {hc_mult}-copy {dim}-wide f32 stream needs {stream_needed} B",
+                residual.stream.len
+            ));
+        }
+        let delta_needed = dim
+            .checked_mul(2)
+            .ok_or("layer device stage ffn_epilogue: the delta width overflows")?;
+        if workspace.moe_reduced_bf16.len < delta_needed {
+            return Err(format!(
+                "layer device stage ffn_epilogue: workspace.moe_reduced_bf16 is {} B, the {dim}-wide BF16 delta needs {delta_needed} B",
+                workspace.moe_reduced_bf16.len
+            ));
+        }
+        let mix_needed = (seams::RELEASED_ROWS as usize)
+            .checked_mul(4)
+            .ok_or("layer device stage ffn_epilogue: the mix width overflows")?;
+        if workspace.ffn_mix.len < mix_needed {
+            return Err(format!(
+                "layer device stage ffn_epilogue: workspace.ffn_mix is {} B, the {} coefficient values need {mix_needed} B",
+                workspace.ffn_mix.len,
+                seams::RELEASED_ROWS
+            ));
+        }
+        let trace_ring = self.seam_trace_ring();
+        let params = seams::FfnEpilogueParams {
+            stream: Deviceptr(residual.stream.device),
+            moe_delta: Deviceptr(workspace.moe_reduced_bf16.device),
+            shared_row: Deviceptr(workspace.seam_row.device),
+            mix_table: Deviceptr(workspace.ffn_mix.device),
+            stream_out: Deviceptr(residual.stream.device),
+            shared_present: u32::from(FFN_EPILOGUE_SHARED_PRESENT),
+            shared_bf16: u32::from(self.native_shared),
+            native_bf16: self.native_bf16,
+            trace_ring,
+            layer_id,
+            step_seq,
+        };
+        seams::launch_ffn_epilogue(self.cuda, self.kernels.ffn_epilogue, &params)?;
+        probe::count("ffn_epilogue");
+        Ok(())
+    }
+
+    fn residual_out(&mut self) -> Result<Vec<f32>, String> {
+        let mut values = vec![0.0f32; self.hc_mult * self.dim];
+        self.copy_out(self.buffers.residual.stream, &mut values)?;
+        Ok(values)
+    }
+
+    fn attn_pre_mix_out(&mut self) -> Result<Vec<f32>, String> {
+        let mut values = vec![0.0f32; self.hc_mult];
+        self.copy_out(self.buffers.residual.pre_mix, &mut values)?;
+        Ok(values)
+    }
 }
 
 /// Runs the four-rank forward loop. This is the only GPU entry point of the module.
@@ -10092,7 +12896,7 @@ fn run_forward_loop(
     // SPARKFLASH_FORWARD_EVIDENCE=1 asks for the identity kit's chain. Both are logged so a window
     // row carries the mode it was collected with.
     let async_launches = sparkflash_kernels::cuda_driver::enable_forward_async_launches();
-    let evidence = enable_forward_evidence_from_env();
+    let evidence = set_evidence_record(request.evidence);
     reset_cubin_cache();
     println!(
         "forward loop: launch path {} (kernels run ahead of the host), evidence chain {}",
@@ -10549,6 +13353,43 @@ fn run_forward_loop(
     let mut heads: Vec<HeadPosition> = Vec::with_capacity(head_count);
     let mut step_samples: Vec<f64> = Vec::with_capacity(head_count);
     let mut final_stream_sha256 = String::new();
+    // The device-only layer (`crate::layer_device`): one allocation for the residual and every
+    // stage's workspace, and the host stops seeing the residual between the position's first copy
+    // and its last. `SPARKFLASH_LAYER_DEVICE=0` selects the bit-exact host arm below instead; that
+    // arm is the reference, and it is the one that crosses PCIe per stage.
+    // The arm, and its reason for the record: evidence recording forces the host reference (it
+    // needs the per-position readbacks the device arm does not make), and the device layer is
+    // opt-in until one full layer runs device-only. No arm is chosen silently.
+    let layer_arm = request.arm;
+    let mut device_frontier: Option<String> = None;
+    let mut layer_device: Option<DeviceLayer<'_>> = if layer_arm.is_device() {
+        Some(DeviceLayer::open(
+            &cuda,
+            config,
+            request.kernel_cubin_dir,
+            request.world,
+            total_positions,
+            bound.as_ref().map(|(_arena, bind)| &bind.attention),
+            bound.as_ref().map(|(_arena, bind)| &bind.mhc_seam),
+            request.resident_plan,
+            request.native_rounding.mhc,
+        )?)
+    } else {
+        None
+    };
+    // The run's single shared-expert gather is attached here, before the first position: prewarm
+    // work, one per run, and `moe_shared` refuses by name if it is missing.
+    if let Some(device) = layer_device.as_mut() {
+        if let Some(shared) = shared_device.as_ref() {
+            device.attach_shared(shared)?;
+        }
+        device.set_native_shared(request.native_rounding.shared);
+        device.attach_reduce(request.reduce)?;
+        if let Some(bind) = bound.as_ref().map(|(_arena, bind)| bind) {
+            device.attach_routed(bind, request.rank)?;
+            device.attach_router(bind)?;
+        }
+    }
     let loop_total_timer = BlockTimer::start(probe_on);
     for position in 0..total_positions {
         let position_started = std::time::Instant::now();
@@ -10600,16 +13441,90 @@ fn run_forward_loop(
         let mut attn_pre_mix = vec![0.0f32; config_hc];
         attn_pre_mix[0] = 1.0;
         probe::position(&cuda, "stream_init", timer);
+        // The layer loop's first boundary copy: the position's residual goes to the device once,
+        // and every layer after this one reads and writes it in place.
+        if let Some(device) = layer_device.as_mut() {
+            device.begin_position(position, &hidden)?;
+        }
         for layer in 0..n_layers {
+            // The lean loop's steady state on this branch: the whole layer on device pointers. The
+            // residual lives in DeviceLayer's slab, so nothing between begin_position and
+            // residual_out crosses PCIe: no host quantise, no host SIMD seam, no host reduce
+            // machinery, no host MoE router or combine, and no per-stage observation read.
+            if let Some(device) = layer_device.as_mut() {
+                if let Err(error) = device.run_layer(layer, position) {
+                    // The frontier is emitted before the run aborts: a probe row whose frontier
+                    // exists only in stderr is not machine-readable, and the row that stops here is
+                    // the frontier probe itself.
+                    // The layer's own record: the stages that really ran before the refusal, not an
+                    // empty record built from the message. A probe row that says "no stage ran"
+                    // when five did is worse than no probe row.
+                    // The run is stopping here, so one synchronize on this abort path makes the
+                    // host-mapped timing ring coherent before it is read. This is not the steady
+                    // state: an armed ring adds no sync to a launch, only a read at a boundary.
+                    let _ = device.cuda.synchronize();
+                    let stage_trace = device.seam_trace_document();
+                    let document = serde_json::json!({
+                        "schema": "sparkflash-tp4-layer-device-frontier/1",
+                        "rank": request.rank,
+                        "world": request.world,
+                        "arm": layer_arm.why(),
+                        "status": "refused",
+                        "layer": layer,
+                        "position": position,
+                        "tolerance_arm": std::env::var("SPARKFLASH_TOLERANCE_ARM").ok(),
+                        "stages_ran": device.runs().stages(),
+                        "frontier": device.runs().summary(),
+                        "message": error,
+                        "max_positions": device.max_positions(),
+                        "rope_table_bytes": 2 * crate::layer_device::rope_table_span_bytes(device.max_positions()),
+                        "slab_bytes": device.buffers().total_bytes(),
+                        "stage_trace": stage_trace,
+                        "note": "the device arm stopped at the stage named in frontier; no device value in this row is validated against the host reference",
+                    });
+                    let path = request
+                        .evidence_dir
+                        .join(format!("tp4-layer-device-r{}.json", request.rank));
+                    write_layer_device_frontier(&path, &document)?;
+                    return Err(format!("layer {layer} position {position}: {error}"));
+                }
+                probe::count("layer_device");
+                if device_frontier.is_none() {
+                    // The same record, on the completed path: what the layer object actually ran.
+                    let summary = device.runs().summary();
+                    let document = serde_json::json!({
+                        "schema": "sparkflash-tp4-layer-device-frontier/1",
+                        "rank": request.rank,
+                        "world": request.world,
+                        "arm": layer_arm.why(),
+                        "status": "completed",
+                        "layer": layer,
+                        "position": position,
+                        "tolerance_arm": std::env::var("SPARKFLASH_TOLERANCE_ARM").ok(),
+                        "stages_ran": device.runs().stages(),
+                        "frontier": summary,
+                        "max_positions": device.max_positions(),
+                        "rope_table_bytes": 2 * crate::layer_device::rope_table_span_bytes(device.max_positions()),
+                        "slab_bytes": device.buffers().total_bytes(),
+                        "stage_trace": device.seam_trace_header_document(),
+                        "note": "the whole device prefix ran for this layer; no device value is validated against the host reference until the cluster row",
+                    });
+                    let path = request
+                        .evidence_dir
+                        .join(format!("tp4-layer-device-r{}.json", request.rank));
+                    write_layer_device_frontier(&path, &document)?;
+                    device_frontier = Some(summary);
+                }
+                layers_completed = layer + 1;
+                continue;
+            }
             let layer_started = std::time::Instant::now();
-            let layer_total_timer = BlockTimer::since(layer_started, probe_on);
             // Engram write (layers 1 and 14 only): the stream this block starts from gains
             // bf16_round(stream + gate[copy] * value[d]) before the block's own mHC entry, exactly
             // where the engine's host forward applies it (model.py:365). The write is identical on
             // all four ranks, so it costs no collective; the layer record keeps its sha/l2 so the
             // window can attribute the row-1/row-14 stream step to this seam alone.
             let mut engram_record: Option<serde_json::Value> = None;
-            let timer = BlockTimer::start(probe_on);
             if let Some(source) = engram_read_source
                 && config.engram_rows(layer).is_some()
             {
@@ -10673,7 +13588,7 @@ fn run_forward_loop(
                         "write_l2": write_l2,
                     }));
                 }
-                probe::layer(&cuda, layer, "engram_write", timer);
+                probe::count("engram_write");
             }
             let traced =
                 request.rank == 0 && trace_root.is_some() && trace_positions.contains(&position);
@@ -10690,11 +13605,9 @@ fn run_forward_loop(
                 format!("forward loop: no seam cache was built for layer {layer}")
             })?;
             let attempt: Result<(Option<serde_json::Value>, Option<LayerZero>), String> = (|| {
-                let timer = BlockTimer::start(probe_on);
                 let (entry, mhc_reads) =
                     run_layer_mhc_entry(cached_seams, request, &stream, &attn_pre_mix)?;
-                probe::layer(&cuda, layer, "mhc_entry", timer);
-                let timer = BlockTimer::start(probe_on);
+                probe::count("mhc_entry");
                 let projections = run_layer_attention_projections(
                     layer,
                     &cuda,
@@ -10705,8 +13618,7 @@ fn run_forward_loop(
                     position,
                     &mut native_dense_parity,
                 )?;
-                probe::layer(&cuda, layer, "attention_projections", timer);
-                let timer = BlockTimer::start(probe_on);
+                probe::count("attention_projections");
                 let query_path = run_layer_query_path(
                     layer,
                     &cuda,
@@ -10718,11 +13630,10 @@ fn run_forward_loop(
                     position,
                     &mut native_dense_parity,
                 )?;
-                probe::layer(&cuda, layer, "query_path", timer);
-                let timer = BlockTimer::start(probe_on);
+                probe::count("query_path");
                 let kv_path =
                     run_layer_kv_path(layer, &cuda, request, arena, &projections, position)?;
-                probe::layer(&cuda, layer, "kv_path", timer);
+                probe::count("kv_path");
                 let cache = kv_cache.get_mut(layer).ok_or_else(|| {
                     format!("forward loop: no kv cache row list was built for layer {layer}")
                 })?;
@@ -10737,7 +13648,6 @@ fn run_forward_loop(
                 // and the candidate select see this block's normed row and this rank's q latent,
                 // never a second reference forward. The seam gives the window width, the ascending
                 // shared compressed ids and the compressed rows they land on.
-                let timer = BlockTimer::start(probe_on);
                 let seam = match seam_wq_b.as_mut() {
                     Some(device) => reference_attention.step_with_backend(
                         layer,
@@ -10753,7 +13663,7 @@ fn run_forward_loop(
                         &query_path.q_latent_bf16,
                     )?,
                 };
-                probe::layer(&cuda, layer, "ref_seam", timer);
+                probe::count("ref_seam");
                 if seam.window_width == 0 || seam.window_width > cache.len() {
                     return Err(format!(
                         "forward loop: layer {layer} position {position}: the reference seam attended {} rows, the chain has {} rows cached",
@@ -10762,12 +13672,10 @@ fn run_forward_loop(
                     ));
                 }
                 let window_start = cache.len() - seam.window_width;
-                let timer = BlockTimer::start(probe_on);
                 let window_rows: Vec<(Vec<u8>, Vec<u8>)> = cache[window_start..].to_vec();
                 let staged = attention_staging.stage(layer, &window_rows, &seam)?;
-                probe::layer(&cuda, layer, "stage_attention", timer);
+                probe::count("stage_attention");
                 let twin_requested = request.forward_perf.twin_requested(is_head, position);
-                let timer = BlockTimer::start(probe_on);
                 let attention_step = body.run(
                     &cuda,
                     request,
@@ -10778,8 +13686,7 @@ fn run_forward_loop(
                     twin_requested,
                 )?;
                 attention_staging.recycle(staged);
-                probe::layer(&cuda, layer, "attention_body", timer);
-                let timer = BlockTimer::start(probe_on);
+                probe::count("attention_body");
                 let attention_output = run_layer_attention_output(
                     layer,
                     &cuda,
@@ -10792,9 +13699,8 @@ fn run_forward_loop(
                     &mut native_dense_parity,
                     &mut attention_output_scratch,
                 )?;
-                probe::layer(&cuda, layer, "attention_output", timer);
+                probe::count("attention_output");
                 native_dense_parity.finish(request);
-                let timer = BlockTimer::start(probe_on);
                 let attention_residual = attention_residual_host_seam_with(
                     request.config.ok_or_else(|| {
                         "layer attention residual: the loop was built without the model config"
@@ -10804,11 +13710,10 @@ fn run_forward_loop(
                     &attention_output.reduced_bf16,
                     request.native_rounding.mhc,
                 )?;
-                probe::layer(&cuda, layer, "attention_residual", timer);
-                let timer = BlockTimer::start(probe_on);
+                probe::count("attention_residual");
                 let ffn_seams =
                     run_layer_ffn_seams(cached_seams, request, &attention_residual, &entry.pre)?;
-                probe::layer(&cuda, layer, "ffn_seams", timer);
+                probe::count("ffn_seams");
                 let moe_routed = run_layer_moe_routed(
                     layer, &cuda, request, bind, &ffn_seams, transport, &reduce,
                 )?;
@@ -10941,7 +13846,6 @@ fn run_forward_loop(
                 // The reference's cross-layer pre mix: the next layer's attention hc_pre consumes
                 // THIS layer's FFN pre mix (hc_in_pre(L+1) == hc_ffn_pre(L)).
                 attn_pre_mix = ffn_seams.ffn_pre.clone();
-                let timer = BlockTimer::start(probe_on);
                 // M2/C10: the layer-chain entry and every digest that only feeds it are recorded
                 // only in evidence mode. A default/--forward-lean run pays the block timer and
                 // nothing else; the probe still gets an entry_json row so both window rows can be
@@ -11014,7 +13918,7 @@ fn run_forward_loop(
                 } else {
                     None
                 };
-                probe::layer(&cuda, layer, "entry_json", timer);
+                probe::count("entry_json");
                 let zero = if layer == 0 {
                     Some((
                         entry,
@@ -11056,7 +13960,7 @@ fn run_forward_loop(
                     if let Some(zero) = zero {
                         position_zero = Some(zero);
                     }
-                    probe::layer(&cuda, layer, "layer_total", layer_total_timer);
+                    probe::count("layer_total");
                     if request.forward_perf.progress_due(is_head, layer, n_layers) {
                         let mut progress = forward_progress(
                             "running",
@@ -11129,6 +14033,12 @@ fn run_forward_loop(
                         format!("boundary replay write {}: {error}", manifest_path.display())
                     })?;
             }
+        }
+        // The layer loop's boundary copy: the residual comes back once per position (the certified
+        // head's input), never once per layer. The mix the head needs rides with it.
+        if let Some(device) = layer_device.as_mut() {
+            stream = device.residual_out()?;
+            attn_pre_mix = device.attn_pre_mix_out()?;
         }
         let head = if is_head {
             Some(run_head_position(
@@ -11358,6 +14268,92 @@ fn run_forward_loop(
                 "recording"
             } else {
                 "off"
+            }),
+        );
+        object.insert(
+            "stage_counts".to_string(),
+            serde_json::json!(
+                probe::stage_counts()
+                    .into_iter()
+                    .map(|(stage, count)| serde_json::json!({"stage": stage, "count": count}))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        // The run boundary's collective check, before any number is reported. A rank that skips a
+        // collective hangs the reduce rather than failing it, so this counter is the only
+        // host-visible trace of the divergence: a mismatch refuses the run instead of printing both
+        // numbers. The per-rank numbers go into the record so the four ranks can be compared; the
+        // cross-rank comparison itself is verify_collective_counts_agree, called by whoever gathers
+        // the four records.
+        let expected_collectives = n_layers * crate::layer_device::COLLECTIVES_PER_LAYER;
+        let enqueued_collectives: usize = probe::stage_counts()
+            .iter()
+            .filter(|(stage, _)| matches!(*stage, "all_reduce" | "all_reduce_moe"))
+            .map(|(_, count)| usize::try_from(*count).unwrap_or(usize::MAX))
+            .sum();
+        if layer_arm.is_device() {
+            crate::layer_device::verify_collective_count(
+                expected_collectives,
+                enqueued_collectives,
+            )?;
+        }
+        object.insert(
+            "layer_device".to_string(),
+            serde_json::json!(match &device_frontier {
+                Some(frontier) => format!("{}; {frontier}", layer_arm.why()),
+                None => format!("{}; no device layer completed", layer_arm.why()),
+            }),
+        );
+        object.insert(
+            "collective_check".to_string(),
+            serde_json::json!({
+                "rank": request.rank,
+                "world": request.world,
+                "expected": expected_collectives,
+                "enqueued": enqueued_collectives,
+                "agrees_with_expected": enqueued_collectives == expected_collectives,
+                "note": "per-rank; verify_collective_counts_agree refuses a run whose four counts differ. The three warm_up reduces are setup and are not counted",
+            }),
+        );
+        // The arm's memory and its collective count, in the same record as the slab: one struct,
+        // one number, so the reduce arm's cost cannot drift from the account. The communicator's
+        // own stats.arena_bytes is its number; here the slab and the scratch it shares with the
+        // warm-up are stated.
+        object.insert(
+            "layer_device_memory".to_string(),
+            serde_json::json!({
+                "slab_bytes": layer_device.as_ref().map_or(0, |device| device.buffers().total_bytes()),
+                "max_positions": layer_device.as_ref().map_or(0, |device| device.max_positions()),
+                "rope_table_bytes": crate::layer_device::ROPE_TABLE_CLASSES * crate::layer_device::rope_table_span_bytes(
+                    layer_device.as_ref().map_or(0, |device| device.max_positions()),
+                ),
+                "kv_cache_bytes": layer_device.as_ref().map_or(0, |device| device.kv_cache_bytes()),
+                "window_ring_bytes": layer_device.as_ref().map_or(0, |device| device.kv_ring_bytes()),
+                "shared_expert_bytes": layer_device
+                    .as_ref()
+                    .map_or(0, |device| device.shared_expert_bytes()),
+                "shared_arm": layer_device
+                    .as_ref()
+                    .map_or("none (no layer device arm)", |device| device.shared_arm()),
+                "routed_geometry": layer_device.as_ref().map_or(
+                    serde_json::Value::Null,
+                    |device| device.routed_geometry_evidence(),
+                ),
+                "routed_experts_bound": layer_device
+                    .as_ref()
+                    .map_or(0, |device| device.routed_experts_bound()),
+                "reduce_scratch_bytes": 2 * HIDDEN * 4,
+                "reduce_arena_reserve_bytes": crate::layer_device::REDUCE_ARENA_RESERVE_BYTES,
+                "note": "slab_bytes is the layer's one device allocation (residual and every stage workspace); reduce_scratch_bytes is the 40 KiB span the NCCL warm-up and the RDMA arm share; reduce_arena_reserve_bytes is the communicator's init-time reserve, whose own number is stats.arena_bytes",
+            }),
+        );
+        object.insert(
+            "layer_collectives".to_string(),
+            serde_json::json!({
+                "collectives_per_layer": crate::layer_device::COLLECTIVES_PER_LAYER,
+                "elements": crate::layer_device::REDUCE_ELEMENTS,
+                "expected": n_layers * crate::layer_device::COLLECTIVES_PER_LAYER,
+                "note": "the counter must come out exactly expected: the three warm_up reduces are setup and are not in the stats",
             }),
         );
         object.insert(
@@ -11995,6 +14991,134 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cuda")]
+    fn coverage(expected: &[&str], bound: &[&str]) -> crate::resident_weights::BindCoverage {
+        let expected: Vec<String> = expected.iter().map(|name| (*name).to_owned()).collect();
+        let bound: Vec<String> = bound.iter().map(|name| (*name).to_owned()).collect();
+        let missing = expected
+            .iter()
+            .filter(|name| !bound.contains(name))
+            .cloned()
+            .collect();
+        crate::resident_weights::BindCoverage {
+            expected,
+            bound,
+            missing,
+            unexpected: Vec::new(),
+            host_seams: Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn class(names: &[(&str, u64)], expected: &[&str]) -> crate::resident_weights::RankBind {
+        use sparkflash_kernels::cuda_driver::Deviceptr;
+        let mut pointers = std::collections::BTreeMap::new();
+        for (name, address) in names {
+            pointers.insert(
+                (*name).to_owned(),
+                (Deviceptr(*address), Deviceptr(*address)),
+            );
+        }
+        let bound: Vec<&str> = names.iter().map(|(name, _)| *name).collect();
+        crate::resident_weights::RankBind {
+            pointers,
+            coverage: coverage(expected, &bound),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn the_mhc_seam_class_is_merged_into_the_one_weight_index_space() {
+        use super::LayerWeights;
+        let attention = class(
+            &[("layers.0.attn.wq_a.weight", 0x1000)],
+            &["layers.0.attn.wq_a.weight"],
+        );
+        let mhc = class(
+            &[
+                ("layers.0.hc_attn_fn", 0x2000),
+                ("layers.0.hc_attn_base", 0x2100),
+                ("layers.0.hc_attn_scale", 0x2200),
+                ("layers.0.hc_ffn_fn", 0x2300),
+                ("layers.0.hc_ffn_base", 0x2400),
+                ("layers.0.hc_ffn_scale", 0x2500),
+                ("layers.0.attn_norm.weight", 0x2600),
+                ("layers.0.ffn_norm.weight", 0x2700),
+                ("layers.0.attn.q_norm.weight", 0x2800),
+                ("layers.0.attn.kv_norm.weight", 0x2900),
+            ],
+            &[
+                "layers.0.hc_attn_fn",
+                "layers.0.hc_attn_base",
+                "layers.0.hc_attn_scale",
+                "layers.0.hc_ffn_fn",
+                "layers.0.hc_ffn_base",
+                "layers.0.hc_ffn_scale",
+                "layers.0.attn_norm.weight",
+                "layers.0.ffn_norm.weight",
+                "layers.0.attn.q_norm.weight",
+                "layers.0.attn.kv_norm.weight",
+            ],
+        );
+        let weights = LayerWeights::resolve(Some(&attention), Some(&mhc)).expect("one map");
+        for (key, address) in [
+            ("hc_attn_fn", 0x2000),
+            ("hc_ffn_fn", 0x2300),
+            ("attn_norm", 0x2600),
+            ("ffn_norm", 0x2700),
+            ("q_norm", 0x2800),
+            ("kv_norm", 0x2900),
+            ("wq_a", 0x1000),
+        ] {
+            assert_eq!(
+                weights.get(0, key).expect(key).0,
+                address,
+                "{key} resolves through the one (layer, WEIGHT_NAMES) index space"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn a_name_bound_twice_with_different_addresses_is_refused() {
+        use super::LayerWeights;
+        let attention = class(
+            &[("layers.0.attn_norm.weight", 0x1000)],
+            &["layers.0.attn_norm.weight"],
+        );
+        let mhc = class(
+            &[("layers.0.attn_norm.weight", 0x2000)],
+            &["layers.0.attn_norm.weight"],
+        );
+        let error = LayerWeights::resolve(Some(&attention), Some(&mhc)).expect_err("duplicate");
+        assert!(
+            error.contains("bound twice with different addresses"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn an_absent_mhc_seam_class_is_named_as_a_class_not_a_tensor() {
+        use super::LayerWeights;
+        let attention = class(
+            &[("layers.0.attn.wq_a.weight", 0x1000)],
+            &["layers.0.attn.wq_a.weight"],
+        );
+        let mut absent = class(&[], &["layers.0.hc_attn_fn", "layers.0.hc_ffn_fn"]);
+        absent.pointers.clear();
+        let error = LayerWeights::resolve(Some(&attention), Some(&absent)).expect_err("absent");
+        assert!(error.contains("no mhc_seam class"), "{error}");
+        assert!(
+            error.contains("2 expected, 0 bound"),
+            "the coverage counters are quoted verbatim: {error}"
+        );
+        assert!(
+            error.contains("hc_attn_fn") && error.contains("hc_ffn_fn"),
+            "the expected-but-not-bound names are listed: {error}"
+        );
+    }
+
     fn request<'a>(dir: &'a Path, kernels: Option<&'a Path>) -> TokenStageRequest<'a> {
         TokenStageRequest {
             rank: 0,
@@ -12017,6 +15141,9 @@ mod tests {
             native_rounding: NativeRounding::NONE,
             native_dense_parity: None,
             forward_perf: ForwardPerf::OFF,
+            reduce: None,
+            arm: crate::layer_device::LayerArm::Host("test"),
+            evidence: false,
         }
     }
 

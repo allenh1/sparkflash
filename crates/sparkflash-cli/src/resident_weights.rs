@@ -361,6 +361,151 @@ pub fn rank_attention_plan_shapes(
     Ok(map)
 }
 
+/// The ten stored per-layer tensors the whole-layer device seam bodies read and the attention
+/// projection bind cannot carry: the six mHC tensors, the two block norms and the q/kv norms. Every
+/// one is planned as a stored operand (no B12x payload, no scale grid), which is why it is not in
+/// the attention projection table and why this class binds it by stored_bytes instead of a geometry.
+///
+/// The list is (plan-name suffix, planned dtype), in the order a reader meets them: the two block
+/// norms the seam bodies take as norm_w, then the q/kv norms the attention body reads, then the mHC
+/// pair. The suffixes are the real plan names engine/tensor.rs:186-216 builds for every layer.
+pub const MHC_SEAM_PARTS: [(&str, &str); 10] = [
+    ("attn_norm.weight", "BF16"),
+    ("ffn_norm.weight", "BF16"),
+    ("attn.q_norm.weight", "BF16"),
+    ("attn.kv_norm.weight", "BF16"),
+    ("hc_attn_fn", "F32"),
+    ("hc_attn_base", "F32"),
+    ("hc_attn_scale", "F32"),
+    ("hc_ffn_fn", "F32"),
+    ("hc_ffn_base", "F32"),
+    ("hc_ffn_scale", "F32"),
+];
+
+/// The class's plan names for one rank, layer-major in plan-name order. The set is the same on
+/// every rank (the ten are Resident and replicated: no EP/TP split), which is what makes an absent
+/// class's refusal sentence identical on all four ranks.
+#[must_use]
+pub fn mhc_seam_plan_names(config: &ModelConfig) -> Vec<String> {
+    let mut names = Vec::with_capacity(config.n_layers * MHC_SEAM_PARTS.len());
+    for layer in 0..config.n_layers {
+        for (suffix, _dtype) in MHC_SEAM_PARTS {
+            names.push(format!("layers.{layer}.{suffix}"));
+        }
+    }
+    names
+}
+
+/// One layer's stored bytes for the class, from the plan builder's shapes: six F32 mHC tensors
+/// (fn [mix_hc][hc_dim], base [mix_hc], scale [3] per sublayer) plus the four BF16 norms.
+///
+/// # Errors
+/// A geometry so large the byte count overflows u64 (never at released geometry).
+pub fn mhc_seam_layer_bytes(config: &ModelConfig) -> Result<u64, String> {
+    let hc_mult =
+        u64::try_from(config.hc_mult).map_err(|_| "mhc_seam: hc_mult overflows".to_string())?;
+    let dim = u64::try_from(config.dim).map_err(|_| "mhc_seam: dim overflows".to_string())?;
+    let mix_hc = (2 + hc_mult)
+        .checked_mul(hc_mult)
+        .ok_or_else(|| "mhc_seam: mix_hc overflows".to_string())?;
+    let hc_dim = hc_mult
+        .checked_mul(dim)
+        .ok_or_else(|| "mhc_seam: hc_dim overflows".to_string())?;
+    let fn_bytes = mix_hc
+        .checked_mul(hc_dim)
+        .and_then(|values| values.checked_mul(4))
+        .ok_or_else(|| "mhc_seam: the fn matrix overflows".to_string())?;
+    let base_bytes = mix_hc
+        .checked_mul(4)
+        .ok_or_else(|| "mhc_seam: the base row overflows".to_string())?;
+    let scale_bytes = 3u64 * 4;
+    let sublayer = fn_bytes
+        .checked_add(base_bytes)
+        .and_then(|bytes| bytes.checked_add(scale_bytes))
+        .ok_or_else(|| "mhc_seam: one sublayer overflows".to_string())?;
+    let norms = dim
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_mul(2))
+        .and_then(|bytes| {
+            bytes.checked_add(u64::try_from(config.q_lora_rank).ok()?.checked_mul(2)?)
+        })
+        .and_then(|bytes| bytes.checked_add(u64::try_from(config.head_dim).ok()?.checked_mul(2)?))
+        .ok_or_else(|| "mhc_seam: the norm rows overflow".to_string())?;
+    sublayer
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(norms))
+        .ok_or_else(|| "mhc_seam: the layer total overflows".to_string())
+}
+
+/// Binds the mhc_seam class: the ten stored tensors of every layer, from the same already-uploaded
+/// plan arena the attention bind reads. Additive by construction - it allocates nothing, reads
+/// nothing, copies nothing; it turns plan shard bytes into pointers and reports its own coverage.
+///
+/// The expected set comes from the config alone, so an absent class reports the same sentence on
+/// every rank; bound names come from the plan, so a plan-vs-index disagreement is named in both
+/// directions like every other class.
+///
+/// # Errors
+/// A resident shard whose planned dtype or stored byte count is not the class's stored layout, a
+/// missing arena slice (the plan and the arena disagree), a null pointer, or incomplete coverage.
+pub fn bind_rank_mhc_seam(
+    arena: &ResidentArena,
+    plan: &ResidentPlan,
+    config: &ModelConfig,
+) -> Result<RankBind, String> {
+    let expected: BTreeSet<String> = mhc_seam_plan_names(config).into_iter().collect();
+    let mut bound: BTreeMap<String, (Deviceptr, Deviceptr)> = BTreeMap::new();
+    for shard in plan.shards() {
+        if shard.placement != sparkflash_device::resident::Placement::Resident {
+            continue;
+        }
+        let Some((suffix, dtype)) = MHC_SEAM_PARTS
+            .iter()
+            .find(|(suffix, _dtype)| shard.name.ends_with(suffix))
+        else {
+            continue;
+        };
+        if shard.dtype != *dtype {
+            return Err(format!(
+                "{}: planned as {}, the plan builder writes {dtype} for {suffix}",
+                shard.name, shard.dtype
+            ));
+        }
+        if sparkflash_device::arena::b12x_layout(shard).is_some() {
+            return Err(format!(
+                "{}: planned with a B12x geometry; the mhc_seam class binds stored tensors only",
+                shard.name
+            ));
+        }
+        let slice = arena.slice(&shard.name).ok_or_else(|| {
+            format!(
+                "{}: no arena slice (the plan and the table disagree)",
+                shard.name
+            )
+        })?;
+        let expected_bytes = shard.stored_bytes as usize;
+        if slice.bytes != expected_bytes {
+            return Err(format!(
+                "{}: arena slice is {} bytes but the stored {} layout expects {expected_bytes} bytes (no B12x, no scale)",
+                shard.name, slice.bytes, shard.dtype
+            ));
+        }
+        if slice.ptr.0 == 0 {
+            return Err(format!(
+                "{}: the arena maps it to a null pointer",
+                shard.name
+            ));
+        }
+        bound.insert(shard.name.clone(), (slice.ptr, slice.ptr));
+    }
+    let bound_names: BTreeSet<String> = bound.keys().cloned().collect();
+    let coverage = check_bind_coverage("mhc_seam", &expected, &bound_names, &BTreeSet::new())?;
+    Ok(RankBind {
+        pointers: bound,
+        coverage,
+    })
+}
+
 #[cfg(test)]
 mod rank_plan_shape_tests {
     use super::*;
@@ -1452,6 +1597,11 @@ mod bind_coverage_tests {
         let count = |class: PlanClass| *census.by_class.get(&class).unwrap_or(&0);
         assert_eq!(count(PlanClass::AttentionProjection), 208);
         assert_eq!(count(PlanClass::AttentionHostSeam), 19);
+        // The mhc_seam class does not move these: the six mHC tensors stay Mhc and the four
+        // per-layer norms stay AttentionAux, which is why the bind gets its own second pointer
+        // family instead of a wider attention table (the probe row's census read 240 / 416).
+        assert_eq!(count(PlanClass::Mhc), 240);
+        assert_eq!(count(PlanClass::AttentionAux), 416);
         assert_eq!(count(PlanClass::RoutedExpert), 92_160);
         assert_eq!(count(PlanClass::SharedExpert), 240);
         assert_eq!(count(PlanClass::Router), 120);
@@ -1655,5 +1805,137 @@ mod bind_coverage_tests {
         assert_eq!(PlanClass::SpecialToken.as_str(), "special_token");
         // The backbone names are unaffected by the new class.
         assert_eq!(classify_plan_name("embed.weight", &table), PlanClass::Tail);
+    }
+}
+
+#[cfg(test)]
+mod mhc_seam_class_tests {
+    use super::*;
+    use sparkflash_device::resident::{HeaderEntry, Placement, ResidentPlan};
+    use sparkflash_engine::tensor::TensorPlan;
+
+    fn released_config() -> ModelConfig {
+        ModelConfig::v41_flash().expect("config")
+    }
+
+    fn released_plan() -> ResidentPlan {
+        let config = released_config();
+        let plan = TensorPlan::language_model(&config);
+        let entries: Vec<HeaderEntry> = plan
+            .specs()
+            .iter()
+            .map(|spec| {
+                let (dtype, shape) = if spec.dtype.name() == "F4_E2M1" {
+                    let mut shape = spec.shape.clone();
+                    let last = shape.len() - 1;
+                    shape[last] /= 2;
+                    ("I8".to_string(), shape)
+                } else {
+                    (spec.dtype.name().to_string(), spec.shape.clone())
+                };
+                HeaderEntry::new(spec.name.clone(), dtype, shape)
+            })
+            .collect();
+        ResidentPlan::plan(0, 4, entries).expect("world=4 rank 0 plan")
+    }
+
+    #[test]
+    fn the_class_is_ten_names_per_layer_and_already_in_the_plan() {
+        let config = released_config();
+        let names = mhc_seam_plan_names(&config);
+        assert_eq!(MHC_SEAM_PARTS.len(), 10, "six mHC tensors and four norms");
+        assert_eq!(names.len(), 400, "ten per layer over forty layers");
+        let plan = released_plan();
+        let mut resident: BTreeMap<&str, (u64, &str)> = BTreeMap::new();
+        for shard in plan.shards() {
+            if shard.placement == Placement::Resident {
+                resident.insert(
+                    shard.name.as_str(),
+                    (shard.stored_bytes, shard.dtype.as_str()),
+                );
+            }
+        }
+        let mut total = 0u64;
+        for name in &names {
+            let (bytes, dtype) = *resident.get(name.as_str()).unwrap_or_else(|| {
+                panic!("{name} is not a resident plan shard: the plan already carries this class")
+            });
+            let planned_dtype = MHC_SEAM_PARTS
+                .iter()
+                .find(|(suffix, _dtype)| name.ends_with(suffix))
+                .map(|(_suffix, dtype)| *dtype)
+                .expect("a known suffix");
+            assert_eq!(dtype, planned_dtype, "{name} dtype");
+            total += bytes;
+        }
+        let per_layer = mhc_seam_layer_bytes(&config).expect("bytes");
+        assert_eq!(per_layer, 3_956_440, "3,932,376 mHC + 24,064 norms");
+        assert_eq!(
+            total,
+            per_layer * 40,
+            "the class is already charged in the plan"
+        );
+        assert_eq!(total, 158_257_600);
+    }
+
+    #[test]
+    fn the_attention_class_is_not_widened_by_the_seam_class() {
+        let config = released_config();
+        let names: BTreeSet<String> = mhc_seam_plan_names(&config).into_iter().collect();
+        let table = rank_attention_plan_shapes(&config, 0, 4).expect("table");
+        for name in &names {
+            assert!(
+                !table.contains_key(name),
+                "{name} must not enter the attention table"
+            );
+        }
+        let mut mhc = 0usize;
+        let mut aux = 0usize;
+        for name in &names {
+            match classify_plan_name(name, &table) {
+                PlanClass::Mhc => {
+                    assert!(name.contains(".hc_"), "{name}");
+                    mhc += 1;
+                }
+                PlanClass::AttentionAux => {
+                    assert!(!name.contains(".hc_"), "{name}");
+                    aux += 1;
+                }
+                other => panic!("{name}: classified {}", other.as_str()),
+            }
+        }
+        assert_eq!(
+            (mhc, aux),
+            (240, 160),
+            "the census keeps naming both classes"
+        );
+        let attention: BTreeSet<String> = table
+            .keys()
+            .filter(|name| !is_host_seam_weight(name))
+            .cloned()
+            .collect();
+        assert!(
+            names.is_disjoint(&attention),
+            "a name bound twice would merge badly"
+        );
+    }
+
+    #[test]
+    fn an_absent_class_refuses_by_name_and_a_short_class_names_the_tensor() {
+        let config = released_config();
+        let expected: BTreeSet<String> = mhc_seam_plan_names(&config).into_iter().collect();
+        let none: BTreeSet<String> = BTreeSet::new();
+        let error = check_bind_coverage("mhc_seam", &expected, &none, &none).expect_err("absent");
+        assert!(
+            error.contains("mhc_seam bind coverage: 400 expected, 0 bound, 0 host seams excluded"),
+            "{error}"
+        );
+        assert!(error.contains("layers.0.hc_attn_fn"), "{error}");
+        let mut short = expected.clone();
+        assert!(short.remove("layers.7.hc_ffn_scale"));
+        let error = check_bind_coverage("mhc_seam", &expected, &short, &none).expect_err("short");
+        assert!(error.contains("399 bound"), "{error}");
+        assert!(error.contains("layers.7.hc_ffn_scale"), "{error}");
+        assert_eq!(expected.len(), mhc_seam_plan_names(&config).len());
     }
 }

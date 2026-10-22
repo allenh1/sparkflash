@@ -1,0 +1,11 @@
+{
+  "forward": "requested",
+  "loop_step": "C1-setup",
+  "rank": 1,
+  "schema": "sparkflash-tp4-loop/1",
+  "setup_only": true,
+  "stage": "tp4-chain",
+  "synthetic": true,
+  "tokens": 0,
+  "world": 4
+}

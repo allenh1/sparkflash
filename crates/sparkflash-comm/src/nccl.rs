@@ -274,6 +274,14 @@ pub enum NcclError {
         /// The missing symbol.
         symbol: &'static str,
     },
+    /// The selected all-reduce arm cannot run: not built, not implemented, or blocked on an
+    /// infrastructure item.
+    ArmUnavailable {
+        /// The arm's stable label.
+        arm: &'static str,
+        /// Why it cannot run, in the words the run record reports.
+        detail: String,
+    },
     /// The library is older than the 2.28 floor.
     Version {
         /// Version code reported by `ncclGetVersion`.
@@ -292,6 +300,10 @@ pub enum NcclError {
     },
     /// The caller passed an unusable configuration (bad world/rank, malformed unique id).
     Config(String),
+    /// The run's rendezvous failed before NCCL was entered: the unique-id exchange over the run's
+    /// own TCP transport. This is an abort-before-NCCL error on purpose - no rank has opened a
+    /// communicator when it occurs, so no peer can be left inside a collective.
+    Bootstrap(String),
 }
 
 impl fmt::Display for NcclError {
@@ -302,6 +314,12 @@ impl fmt::Display for NcclError {
                 "could not load NCCL ({}); host libnccl is absent on the four nodes (measured 2026-10-21) and NCCL 2.28.3 exists only inside the {NCCL_OBSERVED_IMAGE} image, so a host-process NCCL path needs WS-B infra ticket B5: {detail}",
                 tried.join(" or ")
             ),
+            Self::ArmUnavailable { arm, detail } => {
+                write!(
+                    formatter,
+                    "the {arm} all-reduce arm is unavailable: {detail}"
+                )
+            }
             Self::MissingSymbol { library, symbol } => write!(
                 formatter,
                 "{library} is loaded but does not export {symbol}; this binding needs the NCCL 2.28+ C API surface and refuses rather than calling through a null entry point"
@@ -324,11 +342,26 @@ impl fmt::Display for NcclError {
                 "{call} failed with ncclResult_t {result}: {detail}"
             ),
             Self::Config(text) => write!(formatter, "invalid NCCL configuration: {text}"),
+            Self::Bootstrap(text) => write!(
+                formatter,
+                "NCCL bootstrap failed before any communicator was opened: {text}"
+            ),
         }
     }
 }
 
 impl std::error::Error for NcclError {}
+
+/// Test-only: tries to open exactly the given names and returns the typed absence when none is
+/// there.
+///
+/// The production loader always uses NCCL_LIBRARY_NAMES; this hook exists so the absence refusal can
+/// be pinned on a host that may or may not have libnccl installed.
+#[cfg(test)]
+pub(crate) fn load_named_for_test(names: &[&'static str]) -> Result<NcclApi, NcclError> {
+    let loader: Box<dyn SymbolLoader> = Box::new(DlLoader::open_named(names)?);
+    NcclApi::from_loader(loader)
+}
 
 /// A source of dynamically resolved symbols, split out so the loader is testable without a library.
 pub trait SymbolLoader {
@@ -347,21 +380,30 @@ struct DlLoader {
 
 impl DlLoader {
     fn open() -> Result<Self, NcclError> {
+        Self::open_named(&NCCL_LIBRARY_NAMES)
+    }
+
+    /// Opens the first of the names that dlopen finds, and reports the typed absence otherwise.
+    ///
+    /// The name list is a parameter so a test can ask for a soname no host has: pinning the refusal
+    /// shape must not depend on whether the machine happens to ship libnccl. Production always
+    /// passes NCCL_LIBRARY_NAMES.
+    fn open_named(names: &[&'static str]) -> Result<Self, NcclError> {
         let mut detail = String::from("dlopen returned a null handle without a dlerror message");
-        for name in NCCL_LIBRARY_NAMES {
-            let cname = CString::new(name).expect("soname has no interior nul");
+        for name in names {
+            let cname = CString::new(*name).expect("soname has no interior nul");
             // SAFETY: cname is a valid NUL-terminated string and the flags are dlopen constants.
             let handle = unsafe { libc::dlopen(cname.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
             if !handle.is_null() {
                 return Ok(Self {
                     handle,
-                    name: name.to_owned(),
+                    name: (*name).to_owned(),
                 });
             }
             detail = dl_error();
         }
         Err(NcclError::LibraryAbsent {
-            tried: NCCL_LIBRARY_NAMES.to_vec(),
+            tried: names.to_vec(),
             detail,
         })
     }
@@ -597,6 +639,25 @@ impl NcclApi {
         rank: usize,
         unique_id: NcclUniqueId,
     ) -> Result<NcclComm<'_>, NcclError> {
+        let handle = self.comm_init_rank_handle(world_size, rank, unique_id)?;
+        Ok(NcclComm { api: self, handle })
+    }
+
+    /// Creates the raw communicator handle, without borrowing the library.
+    ///
+    /// This is the form an owned wrapper needs: it can hold the library and the handle in one
+    /// object and destroy the handle in Drop, which a borrowing NcclComm cannot express without a
+    /// self-referential struct.
+    ///
+    /// # Errors
+    /// Returns NcclError::Config for a rank outside the world or a zero world, and
+    /// NcclError::Call when NCCL refuses the communicator.
+    pub(crate) fn comm_init_rank_handle(
+        &self,
+        world_size: usize,
+        rank: usize,
+        unique_id: NcclUniqueId,
+    ) -> Result<NcclCommHandle, NcclError> {
         if world_size == 0 {
             return Err(NcclError::Config(
                 "a communicator needs at least one rank".to_owned(),
@@ -622,7 +683,70 @@ impl NcclApi {
         if result != NCCL_SUCCESS {
             return Err(self.call_error("ncclCommInitRankConfig", result));
         }
-        Ok(NcclComm { api: self, handle })
+        Ok(handle)
+    }
+
+    /// Destroys a raw communicator handle created by Self::comm_init_rank_handle.
+    ///
+    /// A null handle is a no-op, so a teardown path can call this unconditionally.
+    ///
+    /// # Errors
+    /// Returns NcclError::Call when NCCL reports a failure; the caller has already given up the
+    /// handle either way, because NCCL marks a communicator destroyed once destroy is entered.
+    pub(crate) fn comm_destroy_handle(&self, handle: NcclCommHandle) -> Result<(), NcclError> {
+        if handle.is_null() {
+            return Ok(());
+        }
+        // SAFETY: the handle came from ncclCommInitRankConfig and this is its single destroy.
+        let result = unsafe {
+            let function: CommDestroyFn = std::mem::transmute(self.raw.comm_destroy);
+            function(handle)
+        };
+        if result == NCCL_SUCCESS {
+            Ok(())
+        } else {
+            Err(self.call_error("ncclCommDestroy", result))
+        }
+    }
+
+    /// Enqueues one bf16 AllReduce(Sum) on a raw communicator handle.
+    ///
+    /// NcclComm::all_reduce_bf16 delegates here; owned wrappers call this directly.
+    ///
+    /// # Safety
+    /// The handle must be live; send must point to at least count bf16 values and recv to at least
+    /// count writable bf16 values, both in memory NCCL can access on the current device; stream
+    /// must be a valid CUDA stream on that device or NULL for the default stream.
+    ///
+    /// # Errors
+    /// Returns NcclError::Call when NCCL refuses the enqueue.
+    pub(crate) unsafe fn enqueue_all_reduce_bf16(
+        &self,
+        handle: NcclCommHandle,
+        send: *const c_void,
+        recv: *mut c_void,
+        count: usize,
+        op: NcclRedOp,
+        stream: CudaStream,
+    ) -> Result<(), NcclError> {
+        // SAFETY: the caller upholds the handle, pointer and stream contract documented above.
+        let result = unsafe {
+            let function: AllReduceFn = std::mem::transmute(self.raw.all_reduce);
+            function(
+                send,
+                recv,
+                count,
+                NcclDataType::Bfloat16 as c_int,
+                op as c_int,
+                handle,
+                stream,
+            )
+        };
+        if result == NCCL_SUCCESS {
+            Ok(())
+        } else {
+            Err(self.call_error("ncclAllReduce", result))
+        }
     }
 
     /// Opens a group so several collectives are enqueued in one NCCL launch.
@@ -692,22 +816,9 @@ impl NcclComm<'_> {
         stream: CudaStream,
     ) -> Result<(), NcclError> {
         // SAFETY: the caller upholds the pointer and stream contract documented above.
-        let result = unsafe {
-            let function: AllReduceFn = std::mem::transmute(self.api.raw.all_reduce);
-            function(
-                send,
-                recv,
-                count,
-                NcclDataType::Bfloat16 as c_int,
-                op as c_int,
-                self.handle,
-                stream,
-            )
-        };
-        if result == NCCL_SUCCESS {
-            Ok(())
-        } else {
-            Err(self.api.call_error("ncclAllReduce", result))
+        unsafe {
+            self.api
+                .enqueue_all_reduce_bf16(self.handle, send, recv, count, op, stream)
         }
     }
 
@@ -749,14 +860,9 @@ impl NcclComm<'_> {
 
 impl Drop for NcclComm<'_> {
     fn drop(&mut self) {
-        if self.handle.is_null() {
-            return;
-        }
-        // SAFETY: the handle came from ncclCommInitRankConfig and is destroyed exactly once here.
-        unsafe {
-            let function: CommDestroyFn = std::mem::transmute(self.api.raw.comm_destroy);
-            let _ = function(self.handle);
-        }
+        // The handle came from ncclCommInitRankConfig and is destroyed exactly once here; a failed
+        // destroy still consumes it, so the error is not actionable in Drop.
+        let _ = self.api.comm_destroy_handle(self.handle);
         self.handle = ptr::null_mut();
     }
 }
@@ -800,6 +906,22 @@ mod tests {
         fn symbol(&self, name: &str) -> Option<*mut c_void> {
             self.symbols.get(name).copied()
         }
+    }
+
+    #[test]
+    fn a_missing_library_is_a_typed_refusal_not_a_fallback() {
+        // A soname no host ships: the refusal shape is checked independently of what is installed.
+        let names = ["libnccl-absent-for-test.so.2"];
+        let error = match load_named_for_test(&names) {
+            Ok(_) => panic!("an absent library must refuse"),
+            Err(error) => error,
+        };
+        match &error {
+            NcclError::LibraryAbsent { tried, .. } => assert_eq!(tried, &names),
+            other => panic!("expected LibraryAbsent, got {other:?}"),
+        }
+        let text = error.to_string();
+        assert!(text.contains("libnccl-absent-for-test.so.2"), "{text}");
     }
 
     fn api_with_all() -> NcclApi {

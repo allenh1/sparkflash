@@ -126,6 +126,13 @@
       "expected_exit": 2,
       "row_dir": "complete-without-logits-bins",
       "synthetic": true
+    },
+    {
+      "case": "open-refusal-no-frontier",
+      "mode": "probe",
+      "expected_exit": 3,
+      "row_dir": "open-refusal-no-frontier",
+      "synthetic": true
     }
   ]
 }

@@ -76,12 +76,27 @@ COMPLETE MODE (--require-complete) - a later stage's completed layer
     document carries tolerance_arm and declared_utc plus a row start timestamp, the ordering
     (declared before the row) is checked.
 
+OPEN-TIME REFUSAL ROWS (exit 3) - the arm refused inside DeviceLayer::open
+    The first four-rank device probe row wrote no tp4-layer-device document at all: the arm opened,
+    the NCCL bootstrap agreed on four ranks, and DeviceLayer::open refused while resolving a weight
+    ("layer device seams: layer 0: layer device weight: no hc_attn_fn for layer 0 in the resolved
+    set"). No stage walk started, so there is no stage timing and no frontier to check. That is the
+    correct cheap outcome, not a malformed row and not a missing-evidence row: this tool parses the
+    refusal out of the per-rank chain log (the only place it is written), prints it verbatim, names
+    the stage that was being opened (mhc_entry for layer 0), reports what the row DOES have
+    (bind/loop/token JSON, run.meta), and exits 3 with verdict OPEN-REFUSAL. The rule is recorded in
+    docs/RULES-speed.md: such a row is never a frontier stage, never a ms/step, and no published
+    number changes. Exit 2 stays reserved for a row whose documents are missing with no named
+    open-time refusal to explain the absence.
+
 EXIT CODES (the rule that matters: 2 is a STOP, never a retry, never a pass)
     0  coherent: a real frontier probe (default), or a gate-eligible completed layer
     1  incoherent: a finding (rank disagreement, lost chain, host arm, wrong status, bad geometry,
        missing not-host-validated wording, incomplete completed frontier, unusable gate input)
     2  cannot testify: a rank document or required gate input is missing, unreadable, empty, not
        JSON, or not a JSON object. Nothing is inferred and nothing is passed.
+    3  arm refused at open: the blocker is named, no frontier exists, no stage walk started. A
+       verdict about the row (the expensive thing never ran), not a pass and not a measurement.
 
 WHAT IT DOES NOT DO
     It never contacts a node and never runs the numerical gate; it reads files in the row directory
@@ -174,6 +189,21 @@ NOTE_NEEDLES = (
 EXIT_COHERENT = 0
 EXIT_INCOHERENT = 1
 EXIT_CANNOT_TESTIFY = 2
+EXIT_OPEN_REFUSAL = 3
+
+#: DeviceLayer::open writes this when a weight lookup refuses. Only the per-rank chain log carries
+#: it: a row that stops here never reaches the stage walk, so no frontier document is written.
+OPEN_REFUSAL_MARKER = "layer device seams: layer "
+#: The stage being opened when the layer-0 device weight resolution refuses (mhc_entry's weight).
+OPEN_REFUSAL_STAGE = "mhc_entry"
+OPEN_REFUSAL_STAGES = {"layer device weight": OPEN_REFUSAL_STAGE}
+#: Everything a refused-at-open row still writes (the frontier document is absent by definition).
+OPEN_REFUSAL_EVIDENCE = (
+    ("bind", "tp4-bind-r{rank}.json"),
+    ("loop", "tp4-loop-r{rank}.json"),
+    ("token", "tp4-token-r{rank}.json"),
+)
+OPEN_REFUSAL_LOG_SUFFIXES = (".log", ".txt", ".out", ".err")
 
 STATUS_PASS = "PASS"
 STATUS_FINDING = "FINDING"
@@ -580,6 +610,18 @@ def synthetic_cases() -> list:
             "documents": {rank: rank_document(rank, status=STATUS_COMPLETED) for rank in DEFAULT_RANKS},
         }
     )
+    # 12. The first four-rank device probe row: the arm refused inside DeviceLayer::open, so no
+    # tp4-layer-device document exists, but bind/loop/token JSON and the chain log do. Exit 3 is a
+    # verdict about the row; exit 2 would call a truthful refusal "missing evidence".
+    cases.append(
+        {
+            "name": "open-refusal-no-frontier",
+            "mode": "probe",
+            "expected": EXIT_OPEN_REFUSAL,
+            "documents": {},
+            "extra_files": open_refusal_files(),
+        }
+    )
     return cases
 
 
@@ -613,6 +655,18 @@ def write_fixture_set(root: str) -> list:
             )
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write(corruption["content"])
+        for relative, content in sorted((case.get("extra_files") or {}).items()):
+            path = os.path.join(case_dir, relative)
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            if isinstance(content, dict):
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(content, handle, indent=2, sort_keys=True)
+                    handle.write("\n")
+            else:
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(content)
         manifest.append(
             {
                 "case": case["name"],
@@ -849,6 +903,198 @@ def check_frontier(documents: dict, record: dict, *, require_complete: bool):
     return parsed_by_rank
 
 
+def parse_open_refusal_line(line: str):
+    """Parse one 'layer device seams: layer <N>: <message>' line, or return None."""
+    index = line.find(OPEN_REFUSAL_MARKER)
+    if index < 0:
+        return None
+    tail = line[index + len(OPEN_REFUSAL_MARKER):]
+    layer_text, separator, message = tail.partition(": ")
+    if not separator:
+        return None
+    try:
+        layer = int(layer_text.strip())
+    except ValueError:
+        return None
+    message = message.strip()
+    if not message:
+        return None
+    return {"line": line.strip(), "layer": layer, "message": message}
+
+
+def open_refusal_stage(message: str) -> str:
+    """The stage being opened: the weight-resolution prefix names it; unknown prefixes stay honest."""
+    for prefix, stage in OPEN_REFUSAL_STAGES.items():
+        if message.startswith(prefix):
+            return stage
+    return "unresolved (open)"
+
+
+def detect_open_refusal(row_dir: str, ranks):
+    """Return the open-time refusal evidence, or None when no log names one.
+
+    Called only when NO rank wrote a frontier document. A row that failed inside DeviceLayer::open
+    never reaches the stage walk, so the refusal exists only in the per-rank chain log; requiring a
+    named refusal is exactly what keeps a genuinely malformed row at exit 2 instead of excusing it.
+    """
+    refusals = []
+    logs = []
+    for dirpath, dirnames, filenames in os.walk(row_dir):
+        dirnames.sort()
+        for filename in sorted(filenames):
+            if not filename.lower().endswith(OPEN_REFUSAL_LOG_SUFFIXES):
+                continue
+            path = os.path.join(dirpath, filename)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                    text = handle.read()
+            except OSError:
+                continue
+            for line in text.splitlines():
+                parsed = parse_open_refusal_line(line)
+                if parsed is None:
+                    continue
+                logs.append(os.path.abspath(path))
+                refusals.append(
+                    {
+                        "log": os.path.abspath(path),
+                        "line": parsed["line"],
+                        "layer": parsed["layer"],
+                        "message": parsed["message"],
+                    }
+                )
+                break
+    if not refusals:
+        return None
+    first = refusals[0]
+    evidence = {"bind": [], "loop": [], "token": [], "run_meta": None, "argv": None}
+    for rank in ranks:
+        for kind, template in OPEN_REFUSAL_EVIDENCE:
+            candidate = os.path.join(
+                row_dir, RANK_DIR_TEMPLATE.format(rank=rank), template.format(rank=rank)
+            )
+            if os.path.isfile(candidate):
+                evidence[kind].append(candidate)
+    for name, key in (("run.meta", "run_meta"), ("argv.txt", "argv")):
+        candidate = os.path.join(row_dir, name)
+        if os.path.isfile(candidate):
+            evidence[key] = candidate
+    messages = {refusal["message"] for refusal in refusals}
+    layers = {refusal["layer"] for refusal in refusals}
+    return {
+        "line": first["line"],
+        "layer": first["layer"],
+        "message": first["message"],
+        "stage": open_refusal_stage(first["message"]),
+        "open_call": "DeviceLayer::open",
+        "refusals": refusals,
+        "uniform": len(messages) == 1 and len(layers) == 1,
+        "evidence": evidence,
+    }
+
+
+def open_refusal_files(ranks=DEFAULT_RANKS) -> dict:
+    """Synthetic files a refused-at-open row writes: bind/loop/token JSON, rc, chain log, run.meta.
+
+    Shape taken from the first four-rank probe row (2026-10-22): no tp4-layer-device document,
+    because the arm refused before any stage walk.
+    """
+    files = {}
+    ids = [52479, 56659, 101226, 82590, 3235, 110894, 99524, 9807, 75]
+    for rank in ranks:
+        directory = RANK_DIR_TEMPLATE.format(rank=rank)
+        files[directory + "/chain-r{}.log".format(rank)] = (
+            "device 0: synthetic device for the open-refusal fixture\n"
+            "forward reduce: requested=\"\" path=tcp (reference exchange)\n"
+            "tp4-chain: forward refused on rank {}: layer device seams: layer 0: layer device "
+            "weight: no hc_attn_fn for layer 0 in the resolved set\n".format(rank)
+        )
+        files[directory + "/chain-r{}.rc".format(rank)] = "2\n"
+        files[directory + "/tp4-bind-r{}.json".format(rank)] = {
+            "synthetic": True,
+            "stage": "tp4-chain",
+            "schema": "sparkflash-tp4-bind/1",
+            "loop_step": "C1-bind",
+            "setup_only": True,
+            "rank": rank,
+            "world": len(ranks),
+            "forward": "not-run",
+            "tokens": 0,
+        }
+        files[directory + "/tp4-loop-r{}.json".format(rank)] = {
+            "synthetic": True,
+            "stage": "tp4-chain",
+            "schema": "sparkflash-tp4-loop/1",
+            "loop_step": "C1-setup",
+            "setup_only": True,
+            "rank": rank,
+            "world": len(ranks),
+            "forward": "requested",
+            "tokens": 0,
+        }
+        files[directory + "/tp4-token-r{}.json".format(rank)] = {
+            "synthetic": True,
+            "schema": "sparkflash-tp4-token/1",
+            "rank": rank,
+            "positions_run": 0,
+            "tokens": {"positions": [], "prompt_len": 0, "ids": ids},
+            "note": "the row never reached token generation; this file is shape only",
+        }
+    files["run.meta"] = "run=synthetic-open-refusal kind=raw synthetic=true\n"
+    files["argv.txt"] = "rank 0: --synthetic-open-refusal-fixture\n"
+    return files
+
+
+def _open_refusal_result(mode: str, row_dir: str, ranks, info: dict, require_complete: bool) -> dict:
+    """Build the exit-3 verdict document for a row whose arm refused inside DeviceLayer::open."""
+    evidence = info["evidence"]
+    warnings = []
+    if require_complete:
+        warnings.append(
+            "--require-complete was requested, but no layer was walked: completion is not applicable "
+            "to this row"
+        )
+    if not info["uniform"]:
+        warnings.append(
+            "rank logs do not all carry the same refusal line; inspect the row before recording it"
+        )
+    warnings.append(
+        "row evidence present: bind={}/{} loop={}/{} token={}/{} run_meta={} argv={}".format(
+            len(evidence["bind"]),
+            len(ranks),
+            len(evidence["loop"]),
+            len(ranks),
+            len(evidence["token"]),
+            len(ranks),
+            bool(evidence["run_meta"]),
+            bool(evidence["argv"]),
+        )
+    )
+    return {
+        "schema": "sparkflash-device-frontier-check/1",
+        "mode": mode,
+        "row_dir": os.path.abspath(row_dir),
+        "ranks": list(ranks),
+        "checks": [
+            {
+                "id": "rank-documents-present",
+                "status": "OPEN-REFUSAL",
+                "detail": "no rank wrote tp4-layer-device-r*.json: the arm refused inside "
+                "DeviceLayer::open, before any stage walk",
+            },
+            {"id": "open-time-refusal", "status": "OPEN-REFUSAL", "detail": info["line"]},
+        ],
+        "findings": [],
+        "warnings": warnings,
+        "stop_reason": None,
+        "verdict": "OPEN-REFUSAL",
+        "exit_code": EXIT_OPEN_REFUSAL,
+        "not_a_measurement": True,
+        "not_a_frontier_row": True,
+        "open_refusal": info,
+    }
+
+
 class Record:
     """Check accumulator: PASS / FINDING / STOP lines and the two verdicts."""
 
@@ -924,6 +1170,12 @@ def evaluate(
     try:
         paths, missing = locate_documents(row_dir, DOC_TEMPLATE, ranks)
         if missing:
+            if not paths:
+                # Zero documents is the refused-at-open shape. Classify it only when a rank log
+                # names the refusal: a bare absence stays exit 2.
+                refusal = detect_open_refusal(row_dir, ranks)
+                if refusal is not None:
+                    return _open_refusal_result(mode, row_dir, ranks, refusal, require_complete)
             detail = "; ".join(
                 "rank {}: expected one of {}".format(item["rank"], ", ".join(item["expected"]))
                 for item in missing
@@ -1329,7 +1581,12 @@ def _complete_gate_readiness(row_dir: str, ranks, record: Record, reference_root
 def render(result: dict) -> str:
     """Human-readable rendering of the verdict document."""
     lines = []
-    label = "COMPLETE LAYER (D54 numerical-gate eligibility)" if result["mode"] == "complete" else "FRONTIER PROBE (refused row)"
+    if result["verdict"] == "OPEN-REFUSAL":
+        label = "OPEN-TIME REFUSAL (no frontier row)"
+    elif result["mode"] == "complete":
+        label = "COMPLETE LAYER (D54 numerical-gate eligibility)"
+    else:
+        label = "FRONTIER PROBE (refused row)"
     lines.append("device-frontier check: " + label)
     lines.append("row: " + result["row_dir"])
     lines.append("ranks under test: " + ", ".join(str(rank) for rank in result["ranks"]))
@@ -1348,7 +1605,30 @@ def render(result: dict) -> str:
     for warning in result["warnings"]:
         lines.append("  WARN    " + warning)
     lines.append("")
-    if result["verdict"] == "COHERENT-PROBE":
+    if result["verdict"] == "OPEN-REFUSAL":
+        info = result.get("open_refusal") or {}
+        lines.append(
+            "verdict: OPEN REFUSAL (exit 3) - the arm refused at DeviceLayer::open, blocker named, "
+            "NO frontier exists."
+        )
+        lines.append(
+            "  this is the correct cheap outcome, NOT a frontier stage, NOT a ms/step and NOT "
+            "'missing evidence': no stage walk started, so no layer-device document exists to check."
+        )
+        lines.append("  blocker: {}".format(info.get("message")))
+        lines.append(
+            "  stage being opened: {} (layer {})".format(
+                info.get("stage"), info.get("layer")
+            )
+        )
+        lines.append("  refusal line: {}".format(info.get("line")))
+        if info.get("uniform"):
+            lines.append(
+                "  rank logs: {} of {} carry the same refusal line".format(
+                    len(info.get("refusals") or []), len(result["ranks"])
+                )
+            )
+    elif result["verdict"] == "COHERENT-PROBE":
         lines.append(
             "verdict: COHERENT PROBE - this row is a probe, NOT a measurement: it declares no D54 "
             "arm, no ms/step and no numerical result, and it must not be quoted as one."

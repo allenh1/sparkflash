@@ -46,6 +46,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sparkflash_trace::{TraceScope, spark_trace_span};
 
 pub mod bf16;
+pub mod device_reduce;
 pub mod dispatch;
 pub mod error;
 mod exchange;
@@ -66,6 +67,7 @@ pub mod telemetry;
 pub mod transport;
 
 pub use bf16::{bf16_to_f32, f32_to_bf16_rn};
+pub use device_reduce::{DeviceReduce, DeviceReduceStats, ReduceArm, RunReduce};
 pub use dispatch::{
     BackendAvailability, CollectiveBackend, DECODE_HIDDEN_BYTES, DECODE_HIDDEN_ELEMENTS,
     DECODE_ONESHOT_MAX_BYTES, DispatchError, DispatchPolicy,
