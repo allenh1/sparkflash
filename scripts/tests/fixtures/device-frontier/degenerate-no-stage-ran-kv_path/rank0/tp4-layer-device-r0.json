@@ -1,0 +1,16 @@
+{
+  "arm": "device layer (opt-in): no per-layer PCIe copy, no per-stage observation read",
+  "frontier": "no stage ran; stopped at kv_path: synthetic refusal text",
+  "layer": 0,
+  "max_positions": 4096,
+  "message": "layer device stage kv_path: synthetic refusal for the checker self-test",
+  "note": "the device arm stopped at the stage named in frontier; no device value in this row is validated against the host reference",
+  "position": 0,
+  "rank": 0,
+  "rope_table_bytes": 2097152,
+  "schema": "sparkflash-tp4-layer-device-frontier/1",
+  "slab_bytes": 67108864,
+  "status": "refused",
+  "synthetic": true,
+  "world": 4
+}

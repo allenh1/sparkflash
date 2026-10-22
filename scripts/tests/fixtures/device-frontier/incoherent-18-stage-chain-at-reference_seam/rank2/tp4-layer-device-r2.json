@@ -1,0 +1,16 @@
+{
+  "arm": "device layer (opt-in): no per-layer PCIe copy, no per-stage observation read",
+  "frontier": "device-only through engram_write -> mhc_entry -> quantise_prologue -> attention_projections -> query_path -> kv_path -> reference_seam -> stage_attention -> attention_body -> attention_output -> all_reduce -> attention_residual -> ffn_seams -> moe_router -> moe_routed -> all_reduce_moe -> all_reduce_rdma_arm -> moe_shared (18 stage(s)); stopped at reference_seam: synthetic refusal text",
+  "layer": 0,
+  "max_positions": 4096,
+  "message": "layer device stage reference_seam: synthetic refusal for the checker self-test",
+  "note": "the device arm stopped at the stage named in frontier; no device value in this row is validated against the host reference",
+  "position": 0,
+  "rank": 2,
+  "rope_table_bytes": 2097152,
+  "schema": "sparkflash-tp4-layer-device-frontier/1",
+  "slab_bytes": 67108864,
+  "status": "refused",
+  "synthetic": true,
+  "world": 4
+}

@@ -1,0 +1,22 @@
+{
+  "logits_dump": {
+    "bin": "rank3/tp4-logits-r3.jsonl.bin",
+    "rows": 2,
+    "vocab": 16
+  },
+  "positions_run": 2,
+  "rank": 3,
+  "schema": "sparkflash-tp4-token/1",
+  "synthetic": true,
+  "tokens": {
+    "ids": [
+      7,
+      8
+    ],
+    "positions": [
+      0,
+      1
+    ],
+    "prompt_len": 3
+  }
+}

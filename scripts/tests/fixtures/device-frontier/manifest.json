@@ -1,0 +1,117 @@
+{
+  "synthetic": true,
+  "cases": [
+    {
+      "case": "coherent-6-stage-kv_path",
+      "mode": "probe",
+      "expected_exit": 0,
+      "row_dir": "coherent-6-stage-kv_path",
+      "synthetic": true
+    },
+    {
+      "case": "coherent-refusal-at-reference_seam",
+      "mode": "probe",
+      "expected_exit": 0,
+      "row_dir": "coherent-refusal-at-reference_seam",
+      "synthetic": true
+    },
+    {
+      "case": "incoherent-18-stage-chain-at-reference_seam",
+      "mode": "probe",
+      "expected_exit": 1,
+      "row_dir": "incoherent-18-stage-chain-at-reference_seam",
+      "synthetic": true
+    },
+    {
+      "case": "coherent-refusal-at-moe_shared",
+      "mode": "probe",
+      "expected_exit": 0,
+      "row_dir": "coherent-refusal-at-moe_shared",
+      "synthetic": true
+    },
+    {
+      "case": "off-by-one-18-stage-chain-at-moe_shared",
+      "mode": "probe",
+      "expected_exit": 1,
+      "row_dir": "off-by-one-18-stage-chain-at-moe_shared",
+      "synthetic": true
+    },
+    {
+      "case": "degenerate-no-stage-ran-kv_path",
+      "mode": "probe",
+      "expected_exit": 1,
+      "row_dir": "degenerate-no-stage-ran-kv_path",
+      "synthetic": true
+    },
+    {
+      "case": "rank-different-chain",
+      "mode": "probe",
+      "expected_exit": 1,
+      "row_dir": "rank-different-chain",
+      "synthetic": true
+    },
+    {
+      "case": "host-arm-document",
+      "mode": "probe",
+      "expected_exit": 1,
+      "row_dir": "host-arm-document",
+      "synthetic": true
+    },
+    {
+      "case": "missing-rank-document",
+      "mode": "probe",
+      "expected_exit": 2,
+      "row_dir": "missing-rank-document",
+      "synthetic": true
+    },
+    {
+      "case": "empty-rank-document",
+      "mode": "probe",
+      "expected_exit": 2,
+      "row_dir": "empty-rank-document",
+      "synthetic": true
+    },
+    {
+      "case": "bad-rope-geometry",
+      "mode": "probe",
+      "expected_exit": 1,
+      "row_dir": "bad-rope-geometry",
+      "synthetic": true
+    },
+    {
+      "case": "note-without-not-host-validated",
+      "mode": "probe",
+      "expected_exit": 1,
+      "row_dir": "note-without-not-host-validated",
+      "synthetic": true
+    },
+    {
+      "case": "complete-19-stage",
+      "mode": "complete",
+      "expected_exit": 0,
+      "row_dir": "complete-19-stage",
+      "synthetic": true
+    },
+    {
+      "case": "require-complete-on-refused-row",
+      "mode": "complete",
+      "expected_exit": 1,
+      "row_dir": "require-complete-on-refused-row",
+      "synthetic": true
+    },
+    {
+      "case": "completed-frontier-incomplete",
+      "mode": "complete",
+      "expected_exit": 1,
+      "row_dir": "completed-frontier-incomplete",
+      "synthetic": true
+    },
+    {
+      "case": "complete-without-logits-bins",
+      "mode": "complete",
+      "expected_exit": 2,
+      "row_dir": "complete-without-logits-bins",
+      "synthetic": true
+    }
+  ]
+}
