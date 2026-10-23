@@ -140,6 +140,12 @@ __device__ __forceinline__ float fmaxf(float a, float b) {
     return a > b ? a : b;
 }
 
+// The S1 compressor pooling's empty-group test. CUDA's math.h provides this as a builtin; the
+// stub declares it so the clang probe can type-check `!isfinite(max)`. No semantics are needed.
+__device__ __forceinline__ bool isfinite(float value) {
+    return __builtin_isfinite(value);
+}
+
 __device__ __forceinline__ float fminf(float a, float b) {
     return a < b ? a : b;
 }

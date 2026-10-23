@@ -66,7 +66,7 @@ shas = {json.load(open(os.path.join(run, f"rank{r}", f"tp4-token-r{r}.json"))).g
 tokens_ok = "yes" if len(tokens) == 1 else "NO"
 sha_ok = "yes" if len(shas) == 1 and None not in shas else "NO"
 with open(csv_path, "a", newline="") as handle:
-    writer = csv.writer(handle)
+    writer = csv.writer(handle, lineterminator="\n")
     writer.writerow([datetime.date.today().isoformat(), commit, os.path.basename(run.rstrip("/")),
                      f"{statistics.fmean(means):.2f}", tokens_ok, sha_ok, note])
 print(f"logged {os.path.basename(run.rstrip('/'))}: {statistics.fmean(means):.2f} ms/step "

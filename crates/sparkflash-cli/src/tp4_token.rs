@@ -78,6 +78,16 @@ pub struct Tokens {
     pub top1_margins: Vec<f64>,
     /// The SHA-256 of the full-vocabulary vector(s) as f32-le, or `null` when no dump was written.
     pub logits_sha256: Option<String>,
+    /// The teacher-forced list the run was given: the whole `--token-ids` argument.
+    ///
+    /// Recorded separately from [`Self::ids`] (the run's own answers) because D55's fixture key is
+    /// built from these: a device arm that flips a token answered the same question and must stay
+    /// comparable with the reference, which is the whole point of teacher forcing. The whole list,
+    /// not just its tail, because the prompt is part of the question - two prompts of the same
+    /// length with the same forced tail are different questions. Empty on a run that predates the
+    /// field, and the gate then falls back to `ids` (the D54 key).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forced_ids: Vec<u32>,
 }
 
 impl Tokens {

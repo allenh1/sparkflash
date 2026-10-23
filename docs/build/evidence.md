@@ -120,6 +120,7 @@ prompt-prefix relation and the next-token target before comparing.
 | `d38-vllm-baseline-20261021.json` | CI perf-regression baseline (`scripts/perf_regression_gate.py`). |
 | `d41-*.json` | Frozen D41 floors/bars and their metadata. |
 | `reference/speed-gate/` | Frozen CPU-twin reference for the numerical gate. |
+| `s1-window-evidence/` | The 2026-10-23 S1 device-arm rows that decided D55: what each row is and its node path. The raw ~20 MB dumps stay on the nodes, per the rules below. |
 
 ## Rules
 

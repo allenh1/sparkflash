@@ -71,6 +71,7 @@ pub mod mxfp8_dense_m1_launch;
 pub mod mxfp8_gemv_launch;
 pub mod mxfp8_ref;
 pub mod mxfp8_wo_a_launch;
+pub mod pool_group_launch;
 pub mod ref_select_launch;
 pub mod ref_select_ref;
 pub mod rmsnorm_launch;

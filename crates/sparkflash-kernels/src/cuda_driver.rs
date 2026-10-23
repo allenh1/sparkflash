@@ -2880,6 +2880,37 @@ impl Cuda {
         ))
     }
 
+    /// Loads the routed data path's staging gather from `moe_routed_device_sm121`.
+    ///
+    /// The cubin carries two symbols and no [KernelId] names either of them (a `KernelId` names one
+    /// symbol of one pinned cubin), so both are resolved by name here; the launch module
+    /// (`moe_routed_device`) owns the arithmetic and the pin, this loader only resolves the handle.
+    pub fn load_moe_routed_stage(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "moe_expert_stage_sm121")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "moe_expert_stage_sm121",
+            },
+        ))
+    }
+
+    /// Loads the routed data path's combine epilogue from `moe_routed_device_sm121`.
+    ///
+    /// The second symbol of the same cubin; see [`Cuda::load_moe_routed_stage`] for why it is
+    /// resolved by name.
+    pub fn load_moe_routed_combine(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "moe_routed_combine_sm121")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "moe_routed_combine_sm121",
+            },
+        ))
+    }
+
     /// Loads the five layer-seam symbols from the one cubin the whole-layer port pins
     /// (kernels/layer_seams_sm121.cu).
     ///
@@ -3051,6 +3082,98 @@ impl Cuda {
             Kernel {
                 function,
                 name: "engram_write_bf16",
+            },
+        ))
+    }
+
+    /// pool_group_f32: the compressor's ratio-axis softmax pooling, loaded by name from its own
+    /// cubin (the pin is owned by the launch module's constants, and no KernelId routes to it).
+    ///
+    /// # Errors
+    /// Returns the driver's error when the cubin does not contain the symbol.
+    pub fn load_pool_group(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "pool_group_f32")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "pool_group_f32",
+            },
+        ))
+    }
+
+    /// Loads `k_norm_f32_to_bf16` from `pool_group_sm121.cubin`.
+    pub fn load_k_norm_f32_to_bf16(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "k_norm_f32_to_bf16")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "k_norm_f32_to_bf16",
+            },
+        ))
+    }
+
+    /// Loads `fp4_round_trip_bf16_to_f32` from `pool_group_sm121.cubin`.
+    pub fn load_fp4_round_trip(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "fp4_round_trip_bf16_to_f32")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "fp4_round_trip_bf16_to_f32",
+            },
+        ))
+    }
+
+    /// Loads `scale_index_weights_bf16_to_f32` from `pool_group_sm121.cubin`.
+    pub fn load_scale_index_weights(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "scale_index_weights_bf16_to_f32")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "scale_index_weights_bf16_to_f32",
+            },
+        ))
+    }
+
+    /// Loads `hc_pre_collapse_bf16` from `pool_group_sm121.cubin`.
+    pub fn load_hc_pre_collapse(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "hc_pre_collapse_bf16")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "hc_pre_collapse_bf16",
+            },
+        ))
+    }
+
+    /// compressed_append_sm121: the completed group's native FP4 store, loaded by name from its own
+    /// cubin (the pin is owned by the launch module's constants and no KernelId routes to it).
+    ///
+    /// # Errors
+    /// Returns the driver's error when the cubin does not contain the symbol.
+    pub fn load_compressed_append(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "compressed_append_sm121")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "compressed_append_sm121",
+            },
+        ))
+    }
+
+    /// Loads `compressed_selected_fill_sm121` from `compressed_append_sm121.cubin`.
+    pub fn load_compressed_selected_fill(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "compressed_selected_fill_sm121")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "compressed_selected_fill_sm121",
             },
         ))
     }

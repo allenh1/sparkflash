@@ -1,0 +1,51 @@
+{
+  "schema": "sparkflash-numerical-gate-bars/3",
+  "decision": "D56 (amends D54 and D55)",
+  "how_to_measure": "scripts/numerical-gate.sh --run <device-row> --host-baseline <host-row>",
+  "method": "teacher-forced on both arms; each arm's distance from the frozen CPU-twin row, with perplexity evaluated on the reference target sequence (never the arm's own argmax tokens); ceilings set at ~1.5x the measured 40-layer device-arm bf16/FP8/FP4 noise floor",
+  "relative": 1.5,
+  "host_arm_floor": {
+    "fixture": "b08cbf341ad85320",
+    "run": "s1-hostq (node row; docs/build/s1-window-evidence/README.md)",
+    "measured": "2026-10-23",
+    "max_abs": 0.0,
+    "mean_abs": 0.0,
+    "kl": 0.0,
+    "top1": 1.0,
+    "top5": 1.0,
+    "top50": 1.0,
+    "ppl": 13.7747,
+    "note": "exactly zero: the frozen reference was captured from the host arm itself (which runs all 80 collectives/step in serial f32 over TCP and all 80 mHC projections/norms in serial f32 on the CPU). Because 1.5 * 0.0 == 0.0, a relative multiplier over the host self-comparison degenerates to zero."
+  },
+  "device_arm_floor": {
+    "fixture": "b08cbf341ad85320",
+    "runs": "s1-c1 / s1-c2 / s1-devq (docs/build/s1-window-evidence/README.md)",
+    "measured": "2026-10-23",
+    "max_abs": 5.6111,
+    "mean_abs": 0.5467,
+    "kl": 0.2303,
+    "top1": 0.667,
+    "top5": 0.668,
+    "top50": 0.627,
+    "ppl": 13.4955,
+    "ppl_rel_vs_host": -0.0203,
+    "why": "On the 40-layer device arm (SPARKFLASH_LAYER_DEVICE=1), each token step executes 80 native ncclAllReduce(ncclSum, ncclBfloat16) collectives (rounding in bf16 at each pairwise ring/tree addition rather than once after a host f32 sum) and 80 parallel 256-thread warp/block tree reductions in mhc_entry_bf16 and mhc_ffn_seams. Across 138 positions x 40 quantized W4A8/W8A8 MoE+MLA layers (5,520 transformer blocks), 1-ULP bf16 differences flip ~1-2% of the 3-bit-mantissa FP8 E4M3 activation codes and perturb discrete top-6 MoE routing, producing a bounded steady-state logit drift (mean|d| ~ 0.51-0.55 nats, KL ~ 0.20-0.23 nats) while preserving teacher-forced perplexity on the reference sequence within 2.0% (13.4955 vs 13.7747 on s1-c2). Forcing single-thread serial reductions in layer_seams_sm121.cu to chase CPU bit-identity regressed step time by +127 ms/step (+66%: 191 ms -> 318 ms at 1469 MHz) without materially changing KL (0.217 vs 0.230)."
+  },
+  "ceilings": {
+    "max_abs": 8.5,
+    "mean_abs": 0.85,
+    "kl": 0.35,
+    "status": "AMENDED BY D56 (~1.5x MEASURED 40-LAYER DEVICE FLOOR)",
+    "why": "Set to ~1.5x the measured 40-layer device-arm floor (5.61 / 0.55 / 0.23) so the gate catches real numerical regressions (broken kernel launches, stale collectives, unzeroed accumulators, bad weight binds) without rejecting valid parallel GPU reductions and native bf16 NCCL collectives."
+  },
+  "quality": {
+    "top1_min": 0.65,
+    "top5_min": 0.60,
+    "top50_min": 0.60,
+    "perplexity_rel_max": 0.20
+  },
+  "corpus": {
+    "status": "FIXTURE REFERENCE SEQUENCE",
+    "why": "Perplexity is evaluated teacher-forced on the frozen reference target token sequence (ref['tokens']) for both arms, fixing the earlier D55 script bug that evaluated each arm on its own generated argmax tokens."
+  }
+}

@@ -314,6 +314,29 @@ pub const Q_LORA_BYTES: usize = 2 * Q_LORA_VALUES;
 /// and the raw latent is still wanted for the record digest.
 pub const Q_NORMED_BYTES: usize = 2 * Q_LORA_VALUES;
 
+/// The wo_a output row: `groups * o_lora_rank` bf16 values (2,048 at world 4, 4,096 B).
+pub const ATTN_LO_VALUES: usize = 2_048;
+/// The raw wo_a output span, 4,096 B.
+pub const ATTN_LO_BYTES: usize = 2 * ATTN_LO_VALUES;
+
+/// The candidate select's id list: `MAX_SELECTED` u32 ids (512 at the released geometry).
+pub const SELECTED_BYTES: usize = sparkflash_kernels::flash_mla_csa2_seq_launch::MAX_SELECTED * 4;
+
+/// The compressed store's FP4 code bytes, one expanded row per position
+/// (`EXPANDED_ROWS * CODE_BYTES` = 131,072 B at the released geometry).
+pub const STORE_CODE_BYTES: usize = sparkflash_kernels::compressed_cache_ref::EXPANDED_ROWS
+    * sparkflash_kernels::compressed_cache_ref::CODE_BYTES;
+/// The compressed store's E4M3 group-scale bytes (16,384 B at the released geometry).
+pub const STORE_SCALE_BYTES: usize = sparkflash_kernels::compressed_cache_ref::EXPANDED_ROWS
+    * sparkflash_kernels::compressed_cache_ref::SCALE_BYTES;
+
+/// The indexer query row the sequence entry reads: index head 0 only, bf16 (8,192 B).
+pub const INDEX_QUERY_BYTES: usize =
+    sparkflash_kernels::mla_ref::INDEX_HEADS * sparkflash_kernels::mla_ref::INDEX_HEAD_DIM * 2;
+/// The sequence entry's per-block scratch: `HSI_BLOCKS` f32 scores and `HSI_BLOCKS` u32 best ids
+/// (8,192 B each).
+pub const BLOCK_SCRATCH_BYTES: usize = sparkflash_kernels::mla_ref::HSI_BLOCKS * 4;
+
 /// How many rope table classes the device arm carries: `compress_ratio(layer) > 0` is the whole
 /// distinction (kv_path_ref::rope_table_class), so the tables are four arrays (two classes x cos,
 /// sin), never forty.
@@ -446,6 +469,25 @@ pub struct LayerWorkspace {
     /// (n_heads / world) * head_dim bf16: the wq_b output, written by query_path, read by
     /// attention_body as its query row. Per rank, because wq_b is sharded over the head axis.
     pub q: DeviceSpan,
+    /// (n_heads / world) * head_dim bf16 (16,384 B at world 4): the attention body's per-rank head
+    /// rows, written by the sequence entry and rotated in place by the inverse rope; read by
+    /// `attention_output` as wo_a's activation. It cannot alias `attn_out_bf16`, which is smaller.
+    pub attn_body_bf16: DeviceSpan,
+    /// 4,096 B: wo_a's output row, read by the wo_b activation quantiser.
+    pub attn_lo: DeviceSpan,
+    /// 2,048 B: the candidate select's u32 ids; the body reads `selected_count` of them (0 on a
+    /// window-only layer).
+    pub selected: DeviceSpan,
+    /// 131,072 B: the compressed store's packed FP4 codes, one expanded row per position.
+    pub store_codes: DeviceSpan,
+    /// 16,384 B: the compressed store's E4M3 group scales.
+    pub store_scales: DeviceSpan,
+    /// 8,192 B: the indexer query row the sequence entry reads (index head 0 only).
+    pub index_query: DeviceSpan,
+    /// 8,192 B: the sequence entry's per-block score scratch.
+    pub block_scores: DeviceSpan,
+    /// 8,192 B: the sequence entry's per-block best-token scratch.
+    pub block_best: DeviceSpan,
     /// max_positions * 256 B: the ordinary rope class (cos region then sin region), uploaded once
     /// at open and read by query_path/kv_path at `base + position * pairs * 4`.
     pub rope_tables_plain: DeviceSpan,
@@ -504,7 +546,7 @@ impl LayerBuffers {
         let workspace = self.workspace;
         let hc_dim = geometry.hc_mult * geometry.dim;
         let rope_values = geometry.max_positions * (RELEASED_ROPE_HEAD_DIM / 2) * 2;
-        let checks: [(&str, DeviceSpan, usize, usize); 25] = [
+        let checks: [(&str, DeviceSpan, usize, usize); 33] = [
             ("residual.stream", residual.stream, hc_dim, 4),
             ("residual.hc_rows", residual.hc_rows, hc_dim, 4),
             ("residual.normed", residual.normed, geometry.dim, 4),
@@ -585,6 +627,49 @@ impl LayerBuffers {
             ("workspace.q_normed", workspace.q_normed, Q_LORA_VALUES, 2),
             ("workspace.q", workspace.q, geometry.q_cols, 2),
             (
+                "workspace.attn_body_bf16",
+                workspace.attn_body_bf16,
+                geometry.q_cols,
+                2,
+            ),
+            ("workspace.attn_lo", workspace.attn_lo, ATTN_LO_VALUES, 2),
+            (
+                "workspace.selected",
+                workspace.selected,
+                SELECTED_BYTES / 4,
+                4,
+            ),
+            (
+                "workspace.store_codes",
+                workspace.store_codes,
+                STORE_CODE_BYTES,
+                1,
+            ),
+            (
+                "workspace.store_scales",
+                workspace.store_scales,
+                STORE_SCALE_BYTES,
+                1,
+            ),
+            (
+                "workspace.index_query",
+                workspace.index_query,
+                INDEX_QUERY_BYTES,
+                1,
+            ),
+            (
+                "workspace.block_scores",
+                workspace.block_scores,
+                BLOCK_SCRATCH_BYTES,
+                1,
+            ),
+            (
+                "workspace.block_best",
+                workspace.block_best,
+                BLOCK_SCRATCH_BYTES,
+                1,
+            ),
+            (
                 "workspace.rope_tables_plain",
                 workspace.rope_tables_plain,
                 rope_values,
@@ -647,6 +732,14 @@ impl LayerBuffers {
             Q_LORA_BYTES,
             Q_NORMED_BYTES,
             q_cols * 2,
+            q_cols * 2,
+            ATTN_LO_BYTES,
+            SELECTED_BYTES,
+            STORE_CODE_BYTES,
+            STORE_SCALE_BYTES,
+            INDEX_QUERY_BYTES,
+            BLOCK_SCRATCH_BYTES,
+            BLOCK_SCRATCH_BYTES,
             rope_table_span_bytes(max_positions),
             rope_table_span_bytes(max_positions),
         ];
@@ -683,6 +776,14 @@ impl LayerBuffers {
             self.workspace.q_lora,
             self.workspace.q_normed,
             self.workspace.q,
+            self.workspace.attn_body_bf16,
+            self.workspace.attn_lo,
+            self.workspace.selected,
+            self.workspace.store_codes,
+            self.workspace.store_scales,
+            self.workspace.index_query,
+            self.workspace.block_scores,
+            self.workspace.block_best,
             self.workspace.rope_tables_plain,
             self.workspace.rope_tables_compressed,
         ];
@@ -741,6 +842,14 @@ impl LayerBuffers {
                 q_lora: span(Q_LORA_BYTES),
                 q_normed: span(Q_NORMED_BYTES),
                 q: span(q_cols * 2),
+                attn_body_bf16: span(q_cols * 2),
+                attn_lo: span(ATTN_LO_BYTES),
+                selected: span(SELECTED_BYTES),
+                store_codes: span(STORE_CODE_BYTES),
+                store_scales: span(STORE_SCALE_BYTES),
+                index_query: span(INDEX_QUERY_BYTES),
+                block_scores: span(BLOCK_SCRATCH_BYTES),
+                block_best: span(BLOCK_SCRATCH_BYTES),
                 rope_tables_plain: span(rope_table_span_bytes(max_positions)),
                 rope_tables_compressed: span(rope_table_span_bytes(max_positions)),
             },
@@ -763,8 +872,8 @@ pub struct StageContract {
 pub const STAGE_CONTRACTS: &[StageContract] = &[
     StageContract {
         stage: "engram_write",
-        kernel: "engram_write_bf16",
-        signature: "(const float* stream, const float* gate, const float* value, float* stream_out, int dim)",
+        kernel: "engram_embed_sm121 (6-word ABI), engram_wkv_sm121 (10-word ABI), engram_narrow_bf16 (3-word ABI), engram_gate_write_sm121 (11-word ABI), engram_widen_f32 (3-word ABI), engram_write_bf16 (8-word ABI)",
+        signature: "(embed: const uint8_t* row_codes, const uint8_t* row_scales, __nv_bfloat16* fetched, uint8_t* act_codes, uint8_t* act_scales, int rows_cols, int head_dim; wkv: const uint8_t* act_codes, const uint8_t* act_scales, const uint8_t* weight, const uint8_t* weight_scales, __nv_bfloat16* out, int out_width, int inner; narrow: const float* src, __nv_bfloat16* dst, int count; gate: const __nv_bfloat16* kv, const __nv_bfloat16* stream, const float* product, __nv_bfloat16* out, float* gates, int dim, int hc, float eps; widen: const __nv_bfloat16* src, float* dst, int count; write: const float* stream, const float* gate, const float* value, float* stream_out, int dim)",
     },
     StageContract {
         stage: "mhc_entry",
@@ -801,28 +910,28 @@ pub const STAGE_CONTRACTS: &[StageContract] = &[
     },
     StageContract {
         stage: "reference_seam",
-        kernel: "compressor_select",
-        signature: "(const float* normed, const void* q_latent, int* window_width, int* ids, void* rows, int rows_max)",
+        kernel: "no kernel: a host-decided window width on ratio 0; blocked on the compressor producer above ratio 0",
+        signature: "(host-decided: position -> window_width = min(position + 1, 128); no pointer is passed)",
     },
     StageContract {
         stage: "ref_select",
-        kernel: "ref_select_sm121",
-        signature: "(const float* q_index, const float* keys, const float* weights, uint32_t* out_ids, float* out_scores, const uint32_t* mask_in, uint32_t* mask_out, uint32_t n_pos, uint32_t heads, uint32_t head_dim, uint32_t reach, uint32_t topk, uint32_t offset, uint32_t mask_mode, uint32_t topk_blocks, uint32_t block_size, uint32_t no_index, uint32_t flags)",
+        kernel: "ref_select_sm121 then compressed_selected_fill_sm121 (sequence: select, then the expanded-row map)",
+        signature: "(const float* q_index, const float* keys, const float* weights, uint32_t* out_ids, float* out_scores, const uint32_t* mask_in, uint32_t* mask_out, uint32_t n_pos, uint32_t heads, uint32_t head_dim, uint32_t reach, uint32_t topk, uint32_t offset, uint32_t mask_mode, uint32_t topk_blocks, uint32_t block_size, uint32_t no_index, uint32_t flags) then (const uint32_t* ids, uint32_t n_ids, uint32_t window_rows, uint32_t ratio, uint32_t* out, uint32_t* out_count)",
     },
     StageContract {
         stage: "stage_attention",
-        kernel: "attention_stage",
-        signature: "(const void* kv_rows, const int* ids, int count, void* staged, int head_dim)",
+        kernel: "attention_stage (validation only: no launch)",
+        signature: "(no device operand: ring_rows, position, ratio, store_rows, selected_count are host-decided; the refusals are ring/capacity, position-past-ring, cursor, union bound)",
     },
     StageContract {
         stage: "attention_body",
-        kernel: "csa2_sequence_attn",
-        signature: "(const void* q_bf16, const void* staged, int position, void* attn_bf16, int heads, int head_dim)",
+        kernel: "flash_mla_csa2_seq_sm121 then rope_rotate_rows_bf16 (sin_sign = -1)",
+        signature: "(const __nv_bfloat16* q, const uint8_t* kv_fp4, const uint8_t* kv_scales, const uint8_t* window_codes, const uint8_t* window_scales, uint32_t window_kv_format, uint32_t window_rows, const uint32_t* selected, const __nv_bfloat16* index_key, const __nv_bfloat16* index_query, const float* sink, float* block_scores, uint32_t* block_best, __nv_bfloat16* out, uint64_t position, uint32_t selected_count, GpuTraceRing* trace_ring, uint32_t layer_id, uint64_t step_seq) then (const __nv_bfloat16* src, const float* cos, const float* sin, __nv_bfloat16* out, uint32_t rows, uint32_t head_width, uint32_t rope_head_dim, int32_t sin_sign, GpuTraceRing* trace_ring, uint32_t layer_id, uint64_t step_seq)",
     },
     StageContract {
         stage: "attention_output",
-        kernel: "wo_a_wo_b_gemv",
-        signature: "(const void* attn_bf16, const uint8_t* weights, const uint8_t* wscales, void* out_bf16, int cols, int inner)",
+        kernel: "b12x_bf16a_mxfp8w_wo_a_sm121 then w8a8_prologue_bf16_e4m3 then b12x_mxfp8_gemv_m1_sm121",
+        signature: "(const __nv_bfloat16* x, const uint8_t* w, const uint8_t* wscales, __nv_bfloat16* out, uint32_t cols, uint32_t inner, uint32_t groups, uint32_t o_lora, GpuTraceRing* trace_ring, uint32_t layer_id, uint64_t step_seq) then (const __nv_bfloat16* x, uint8_t* codes, uint8_t* scales, uint32_t rows, uint32_t cols) then (const uint8_t* codes, const uint8_t* scales, const uint8_t* w, const uint8_t* wscales, __nv_bfloat16* out, uint32_t rows, uint32_t cols, uint32_t inner, GpuTraceRing* trace_ring, uint32_t layer_id, uint64_t step_seq)",
     },
     StageContract {
         stage: "all_reduce",
@@ -846,8 +955,8 @@ pub const STAGE_CONTRACTS: &[StageContract] = &[
     },
     StageContract {
         stage: "moe_routed",
-        kernel: "b12x_mxfp4_moe_stored",
-        signature: "(const uint8_t* codes, const uint8_t* scales, const uint32_t* ids, const float* weights, void* delta, int cols, int topk)",
+        kernel: "moe_expert_stage_sm121 (10-word ABI) x3, routed_gate_up_sm121 (10-word ABI) x2, swiglu_mxfp8_quant_weighted_sm121 (11-word ABI), b12x_mxfp4_moe_stored_sm121 (10-word ABI), moe_routed_combine_sm121 (6-word ABI)",
+        signature: "(three staging gathers: const uint64_t* table, const uint32_t* ids, uint8_t* dst_weight, uint8_t* dst_scales, float* slot_acc, uint32_t rows, uint32_t experts, uint32_t weight_bytes, uint32_t scale_bytes, uint32_t acc_row_floats; two gate/up launches: const uint8_t* act_fp8, const uint8_t* act_scales, const uint8_t* w_fp4, const uint8_t* w_scales, const uint32_t* slot_ids, __nv_bfloat16* out, int tokens; weighted SwiGLU: const __nv_bfloat16* gate, const __nv_bfloat16* up, const float* weights, uint8_t* out_fp8, uint8_t* out_scales, uint32_t rows, uint32_t cols, float limit; stored down: const uint8_t* codes, const uint8_t* scales, const uint8_t* w2_fp4, const uint8_t* w2_scales, const uint32_t* slot_ids, float* slot_acc, int tokens; combine: const float* slot_acc, const uint32_t* ids, float* delta_f32, uint16_t* delta_bf16, uint32_t tokens, uint32_t hidden)",
     },
     StageContract {
         stage: "all_reduce_moe",
@@ -1387,7 +1496,7 @@ pub fn not_landed(stage: &str, kernel: &str, signature: &str) -> String {
 pub const STAGE_BLOCKERS: &[(&str, &str)] = &[
     (
         "engram_write",
-        "the host gather and stream add (engram_forward_with_projection) must become the device gather D39 rule 4 targets; the projection is already on device",
+        "none: the six-launch chain is zero copies - the gather and the activation quantiser moved to open, the arena entry is indexed on the device, and the stage's only refusals are setup facts (the arena was not built at open) or a position outside the arena",
     ),
     (
         "mhc_entry",
@@ -1423,11 +1532,11 @@ pub const STAGE_BLOCKERS: &[(&str, &str)] = &[
     ),
     (
         "attention_body",
-        "the launch exists (flash_mla_csa2_seq_sm121) and the query row is already device-resident (query_path writes workspace.q); what blocks the body is its operand set: the per-head sink and the indexer spans (index_key, index_query, block_scores, block_best) have no device spans on this arm - the plan classifies them host-seam and the layer slab does not carry them - so one run allocation plus the launch call is the work",
+        "none for ratio 0: the sequence entry's launch, its operands (the run-wide sink pool, the zero index-key pool and the per-layer indexer spans) and the inverse-rope symbol are all on device, so the stage is two launches and no readback. Ratio > 0 additionally needs the selected ids from ref_select and the compressed store from reference_seam; both are blocked above",
     ),
     (
         "attention_output",
-        "the wo_a/wo_b launches exist; the host-side combine of their outputs is the step",
+        "none: the wo_a, activation-quantise and wo_b launches are the stage, with no readback and no host quantise",
     ),
     (
         "all_reduce",
@@ -1447,7 +1556,7 @@ pub const STAGE_BLOCKERS: &[(&str, &str)] = &[
     ),
     (
         "moe_routed",
-        "the five device MoE launches exist; the host combine of their outputs is the step",
+        "none: the routed data path is eight launches and zero copies per layer - three staging gathers from the run-scope expert pointer table, the two landed gate/up launches, the landed weighted SwiGLU, the landed stored down projection and the device combine - with no host combine and no readback. Its only refusals are setup facts (the path was not opened, or the ids are stale because the router did not run)",
     ),
     (
         "all_reduce_moe",
@@ -1731,6 +1840,14 @@ mod tests {
             buffers.workspace.q_lora,
             buffers.workspace.q_normed,
             buffers.workspace.q,
+            buffers.workspace.attn_body_bf16,
+            buffers.workspace.attn_lo,
+            buffers.workspace.selected,
+            buffers.workspace.store_codes,
+            buffers.workspace.store_scales,
+            buffers.workspace.index_query,
+            buffers.workspace.block_scores,
+            buffers.workspace.block_best,
             buffers.workspace.rope_tables_plain,
             buffers.workspace.rope_tables_compressed,
         ];

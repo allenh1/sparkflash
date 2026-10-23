@@ -417,6 +417,57 @@ mod device {
             Ok(values)
         }
 
+        /// Screens the rank's vocabulary directly from `self.buffers.hidden` (already populated on
+        /// device alongside a zeroed `self.buffers.certified_count`), performing only the single
+        /// logits D2H readback.
+        pub fn screen_device(
+            &self,
+            cuda: &Cuda,
+            layer_id: u32,
+            step_seq: u64,
+        ) -> Result<Vec<f32>, String> {
+            let norm = rmsnorm_launch::RmsNormLaunchParams {
+                x: self.buffers.hidden,
+                weight: self.norm_weight,
+                out: self.buffers.normed,
+                rows: 1,
+                cols: HIDDEN as u32,
+                eps: self.eps,
+                trace_ring: 0,
+                layer_id,
+                step_seq,
+            };
+            rmsnorm_launch::launch(cuda, self.rmsnorm, &norm)?;
+            let head = cert_lm_head_launch::CertLmHeadParams::new(
+                self.buffers.normed,
+                self.head_weight,
+                self.buffers.w_block_max,
+                self.buffers.logits,
+                self.buffers.certified,
+                self.buffers.certified_count,
+                self.buffers.block_max,
+                self.buffers.block_argmax,
+                VOCAB_PER_RANK as u32,
+                0,
+                layer_id,
+                step_seq,
+            );
+            cert_lm_head_launch::launch(cuda, self.head, &head)?;
+            let mut raw = vec![0u8; LOGITS_BYTES_PER_RANK];
+            cuda.copy_dtoh(&mut raw, &self.buffers.logits)
+                .map_err(|error| format!("tail logits dtoh: {error}"))?;
+            let mut values = Vec::with_capacity(VOCAB_PER_RANK);
+            for index in (0..raw.len()).step_by(4) {
+                values.push(f32::from_le_bytes([
+                    raw[index],
+                    raw[index + 1],
+                    raw[index + 2],
+                    raw[index + 3],
+                ]));
+            }
+            Ok(values)
+        }
+
         /// Reads the screen pass's side buffers back for the evidence record: the normed BF16 row,
         /// the certified mask and count, and the per-chunk block maxima and argmax. The logits are
         /// read by [TailStage::screen] itself; every digest in the record comes from these buffers.

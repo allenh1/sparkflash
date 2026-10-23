@@ -6124,12 +6124,72 @@ struct SeamDevice<'a> {
     compressor: std::collections::BTreeMap<usize, CompressorWeights>,
     /// Per kv-source layer: the indexer's wk weight in B12x bf16 order.
     index_wk: std::collections::BTreeMap<usize, Deviceptr>,
+    /// Per kv-source layer: the indexer's k_norm weight (model dtype bf16) and its byte length.
+    index_k_norm: std::collections::BTreeMap<usize, (Deviceptr, usize)>,
     /// Per index-source layer: the per-query weights projection in B12x bf16 order.
     weights_proj: std::collections::BTreeMap<usize, Deviceptr>,
+    /// Per ratio>0 layer: the compressor's norm weight and its byte length. Kept in the model dtype
+    /// (bf16), because the host rule narrows the pooled latent before the norm, so both operands are
+    /// bf16 and rmsnorm_sm121 is the kernel.
+    compressor_norm: std::collections::BTreeMap<usize, (Deviceptr, usize)>,
     /// The widest activation row any served statement stages: dim f32 values.
     wide_act: Deviceptr,
     /// The widest output row any served statement writes: head_dim f32 values (its f32 form).
     wide_out: Deviceptr,
+}
+
+/// The device arm's read-only view of one layer's staged host-seam weights: the compressor's two
+/// projections and the indexer's two, already uploaded at open by [`SeamDevice`]. The ratio>0 stages
+/// consume this; nothing here reads the checkpoint, and the run scope owns the allocation.
+// Wired by the ratio>0 reference_seam/ref_select bodies; until then only the pin-style test reads it.
+#[cfg(feature = "cuda")]
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub(crate) struct SeamStagedWeights {
+    /// `compressor.wkv`: the projection whose f32 row `pool_group` pools (present on kv-source layers).
+    pub(crate) wkv: Option<(Deviceptr, sparkflash_kernels::hostw_gemv_launch::Mode)>,
+    /// `compressor.wgate`: present only above ratio 1 (the layers whose groups are pooled).
+    pub(crate) wgate: Option<(Deviceptr, sparkflash_kernels::hostw_gemv_launch::Mode)>,
+    /// `indexer.wk`: the index keys' projection (present on kv-source layers).
+    pub(crate) index_wk: Option<Deviceptr>,
+    /// `indexer.k_norm`: the index key norm weight (bf16) and its byte length (present on kv-source layers).
+    pub(crate) index_k_norm: Option<(Deviceptr, usize)>,
+    /// `indexer.weights_proj`: the per-query weight projection (present on index-source layers).
+    pub(crate) weights_proj: Option<Deviceptr>,
+    /// `indexer.wq_b`: the B12x E4M3 weight and E8M0 scale grid (present on index-source layers).
+    pub(crate) indexer_wq_b: Option<(Deviceptr, Deviceptr)>,
+    /// `compressor.norm`: the norm weight (model dtype) and its byte length.
+    pub(crate) compressor_norm: Option<(Deviceptr, usize)>,
+}
+
+/// The device arm's per-owner compressor rings, compressed KV stores, index-key stores, and scratch.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+struct SeamRing {
+    wkv: Deviceptr,
+    wgate: Deviceptr,
+    store_codes: Deviceptr,
+    store_scales: Deviceptr,
+    index_keys: Deviceptr,
+    latent_f32: Deviceptr,
+    wk_f32: Deviceptr,
+    wk_bf16: Deviceptr,
+    weights_bf16: Deviceptr,
+    weights_f32: Deviceptr,
+    q_index_f32: Deviceptr,
+    raw_selected_ids: Deviceptr,
+    candidate_mask: Deviceptr,
+    rows: usize,
+    head_dim: usize,
+    total_bytes: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl SeamRing {
+    /// The bytes this ring owns, for the run record.
+    const fn bytes(&self) -> usize {
+        self.total_bytes
+    }
 }
 
 /// One staged compressor projection: the B12x weight and the mode whose load path it needs.
@@ -6252,7 +6312,9 @@ impl<'a> SeamDevice<'a> {
             host: sparkflash_engine::forward::attention::HostAttentionProjectionBackend,
             hostw,
             compressor: std::collections::BTreeMap::new(),
+            compressor_norm: std::collections::BTreeMap::new(),
             index_wk: std::collections::BTreeMap::new(),
+            index_k_norm: std::collections::BTreeMap::new(),
             weights_proj: std::collections::BTreeMap::new(),
             wide_act,
             wide_out,
@@ -6265,7 +6327,11 @@ impl<'a> SeamDevice<'a> {
         // The host-weight statements: the compressor's two projections on the KV-source layers and
         // the indexer's two on the layers that run it. Each is a byte permutation and one upload,
         // done here so no statement pays a read on the step.
-        for &layer in &config.kv_source_layers {
+        // Every layer with a ratio runs the compressor, not only the kv-source ones: a ratio-1 layer
+        // still projects its one-token group (`model.py:461-462`, a plain projection with no gate and
+        // no pooling). The read is the same and a tensor the release omits declines by name.
+        let mut declines: Vec<String> = Vec::new();
+        for layer in 0..config.n_layers {
             let ratio = config.compress_ratio(layer).unwrap_or(0);
             if ratio == 0 {
                 continue;
@@ -6278,6 +6344,15 @@ impl<'a> SeamDevice<'a> {
                 src,
             )?
             else {
+                // Silent by design, but remembered: the diagnostic below names the tensor, whether the
+                // source lacks it or the shape differs, so a later refusal cannot be blamed on the
+                // wrong cause.
+                declines.push(decline_reason(
+                    src,
+                    &format!("layers.{layer}.attn.compressor.wkv.weight"),
+                    config.head_dim,
+                    config.dim,
+                ));
                 continue;
             };
             let wgate = if ratio > 1 {
@@ -6294,6 +6369,49 @@ impl<'a> SeamDevice<'a> {
             device
                 .compressor
                 .insert(layer, CompressorWeights { wkv, wgate });
+            // The compressor's norm weight, uploaded as the release stores it: the host rule narrows
+            // the pooled latent to the model dtype BEFORE the norm (`norm(kv.to(dtype))`,
+            // model.py:475-486), so both the operand and this weight are bf16 and rmsnorm_sm121 is
+            // the kernel. Widening it to f32 here would have been the wrong dtype for both sides.
+            let norm_name = format!("layers.{layer}.attn.compressor.norm.weight");
+            let raw = src
+                .read(&norm_name)
+                .map_err(|error| format!("ref seam compressor norm: {norm_name}: {error}"))?;
+            let width = config.head_dim;
+            let bytes = if raw.len() == width * 2 {
+                raw
+            } else if raw.len() == width * 4 {
+                // A release that stores f32: narrow once, off the step, with the same rounding the
+                // engine's bf16 cast uses. Nothing in the step then depends on the source dtype.
+                let mut narrowed = Vec::with_capacity(width * 2);
+                for chunk in raw.as_chunks::<4>().0 {
+                    let value = f32::from_le_bytes(*chunk);
+                    // Round to nearest even on the f32 -> bf16 truncation, the same rule the
+                    // engine's cast uses.
+                    let bits = value.to_bits();
+                    let round = 0x7fff + ((bits >> 16) & 1);
+                    let bf16 = ((bits.wrapping_add(round)) >> 16) as u16;
+                    narrowed.extend_from_slice(&bf16.to_le_bytes());
+                }
+                narrowed
+            } else {
+                return Err(format!(
+                    "ref seam compressor norm: {norm_name}: {} bytes, the {width}-wide weight is {} or {}",
+                    raw.len(),
+                    width * 2,
+                    width * 4
+                ));
+            };
+            let mut allocated_norm = 0usize;
+            let span = device
+                .cuda
+                .alloc(bytes.len(), &mut allocated_norm)
+                .map_err(|error| format!("ref seam compressor norm: {norm_name}: {error}"))?;
+            device.allocations.push(span);
+            device.cuda.copy_htod(&span, &bytes).map_err(|error| {
+                format!("ref seam compressor norm: {norm_name} upload: {error}")
+            })?;
+            device.compressor_norm.insert(layer, (span, width * 2));
             if let Some(wk) = device.stage_hostw(
                 &format!("layers.{layer}.attn.indexer.wk.weight"),
                 config.head_dim,
@@ -6302,6 +6420,40 @@ impl<'a> SeamDevice<'a> {
                 src,
             )? {
                 device.index_wk.insert(layer, wk.weight);
+            }
+            let k_norm_name = format!("layers.{layer}.attn.indexer.k_norm.weight");
+            if let Ok(raw) = src.read(&k_norm_name) {
+                let width = config.index_head_dim;
+                let bytes = if raw.len() == width * 2 {
+                    raw
+                } else if raw.len() == width * 4 {
+                    let mut narrowed = Vec::with_capacity(width * 2);
+                    for chunk in raw.as_chunks::<4>().0 {
+                        let value = f32::from_le_bytes(*chunk);
+                        let bits = value.to_bits();
+                        let round = 0x7fff + ((bits >> 16) & 1);
+                        let bf16 = ((bits.wrapping_add(round)) >> 16) as u16;
+                        narrowed.extend_from_slice(&bf16.to_le_bytes());
+                    }
+                    narrowed
+                } else {
+                    return Err(format!(
+                        "ref seam indexer k_norm: {k_norm_name}: {} bytes, the {width}-wide weight is {} or {}",
+                        raw.len(),
+                        width * 2,
+                        width * 4
+                    ));
+                };
+                let mut allocated_knorm = 0usize;
+                let span = device
+                    .cuda
+                    .alloc(bytes.len(), &mut allocated_knorm)
+                    .map_err(|error| format!("ref seam indexer k_norm: {k_norm_name}: {error}"))?;
+                device.allocations.push(span);
+                device.cuda.copy_htod(&span, &bytes).map_err(|error| {
+                    format!("ref seam indexer k_norm: {k_norm_name} upload: {error}")
+                })?;
+                device.index_k_norm.insert(layer, (span, width * 2));
             }
         }
         for &layer in &config.index_source_layers {
@@ -6313,6 +6465,13 @@ impl<'a> SeamDevice<'a> {
                 src,
             )? {
                 device.weights_proj.insert(layer, proj.weight);
+            }
+        }
+        // A declined tensor is silent in the arithmetic (the layer falls back to a refusal or the host
+        // rule), so the reason is printed on request: which tensor, absent or wrong shape/dtype.
+        if std::env::var_os("SPARKFLASH_SEAM_DEBUG").is_some() {
+            for line in &declines {
+                eprintln!("seam staging decline: {line}");
             }
         }
         Ok(device)
@@ -6544,6 +6703,32 @@ impl<'a> SeamDevice<'a> {
     }
 }
 
+/// One row of a staged host-weight projection, device activation in and device row out.
+///
+/// The device arm's counterpart of [`decode_hostw_row`]'s launch half: it fills the same nine-word
+/// ABI with pointers the caller already holds, so the ratio>0 seam stages neither copy the activation
+/// down nor the row back. `layer` only feeds the trace word; the ring is null, as for every other
+/// non-stage launch on this arm.
+#[cfg(feature = "cuda")]
+#[allow(dead_code, clippy::too_many_arguments)]
+fn launch_hostw_row(
+    cuda: &sparkflash_kernels::cuda_driver::Cuda,
+    kernel: sparkflash_kernels::cuda_driver::Kernel,
+    mode: sparkflash_kernels::hostw_gemv_launch::Mode,
+    a_row: Deviceptr,
+    weight: Deviceptr,
+    out: Deviceptr,
+    cols: u32,
+    inner: u32,
+    layer: u32,
+) -> Result<(), String> {
+    let params = sparkflash_kernels::hostw_gemv_launch::HostwGemvParams::new(
+        a_row, weight, out, 1, cols, inner, 0, layer, 0,
+    );
+    sparkflash_kernels::hostw_gemv_launch::launch_mode(cuda, kernel, mode, &params)
+        .map_err(|error| format!("layer device: the seam's host-weight GEMV: {error}"))
+}
+
 /// Whether one host-weight statement's kernel stores its accumulator as f32 or as one bf16 round.
 ///
 /// It is the caller's rule, not the weight's dtype: the compressor's rows are pooled in f32 and the
@@ -6583,6 +6768,48 @@ fn decode_hostw_row(
         }
     }
     Ok(values)
+}
+
+#[cfg(feature = "cuda")]
+impl<'a> SeamDevice<'a> {
+    /// The host-weight GEMV's three loaded symbols, in `Mode` order: bf16 weights, bf16 weights with
+    /// f32 stores, f32 weights with f32 stores. The ratio>0 stages pick by the layer's staged mode (a
+    /// ratio-2 compressor weight measured `Bf16WeightF32Stores` in the 2026-10-24b window), and the
+    /// symbols are loaded once at open, so no stage reads a cubin.
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
+    const fn hostw_symbols(&self) -> [sparkflash_kernels::cuda_driver::Kernel; 3] {
+        [
+            self.hostw.bf16_weight,
+            self.hostw.bf16_weight_f32_stores,
+            self.hostw.f32_weight_f32_stores,
+        ]
+    }
+
+    /// The staged host-seam weights for one layer, or `None` when the run's source served none of
+    /// them (the case the host arm's decline already covers).
+    ///
+    /// This is the device arm's only route to the compressor and indexer matrices: they are
+    /// `AttentionHostSeam` in the plan and therefore never in the arena bind.
+    #[cfg(feature = "cuda")]
+    #[allow(dead_code)]
+    fn staged_for(&self, layer: usize) -> Option<SeamStagedWeights> {
+        let compressor = self.compressor.get(&layer);
+        let weights_proj = self.weights_proj.get(&layer).copied();
+        let indexer_wq_b = self.weights.get(&layer).copied();
+        if compressor.is_none() && weights_proj.is_none() && indexer_wq_b.is_none() {
+            return None;
+        }
+        Some(SeamStagedWeights {
+            wkv: compressor.map(|c| (c.wkv.weight, c.wkv.mode)),
+            wgate: compressor.and_then(|c| c.wgate.map(|staged| (staged.weight, staged.mode))),
+            index_wk: self.index_wk.get(&layer).copied(),
+            index_k_norm: self.index_k_norm.get(&layer).copied(),
+            weights_proj,
+            indexer_wq_b,
+            compressor_norm: self.compressor_norm.get(&layer).copied(),
+        })
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -8003,6 +8230,27 @@ fn planned_b12x_geometry(
 /// The pinned kernels have a chain stage that verifies their cubin; an addition with its own symbol
 /// has no chain stage of its own, so its call sites verify it rather than assuming it. `context`
 /// prefixes the error so a refusal names the stage that would not launch.
+#[cfg(feature = "cuda")]
+/// Why `stage_hostw` declined a tensor: absent from the source, a different shape, or a dtype the
+/// staged GEMV has no kernel for. Kept as a string so the open-time diagnostic can print it verbatim.
+fn decline_reason(
+    src: &dyn sparkflash_engine::weights::WeightSource,
+    name: &str,
+    cols: usize,
+    inner: usize,
+) -> String {
+    match src.spec(name) {
+        Err(error) => format!("{name}: absent ({error})"),
+        Ok(spec) => {
+            let shape = spec.shape.clone();
+            format!(
+                "{name}: shape {shape:?} dtype {:?}, the staged row wants [{cols}, {inner}]",
+                spec.dtype
+            )
+        }
+    }
+}
+
 #[cfg(feature = "cuda")]
 fn load_pinned_addition(
     kernel_dir: &std::path::Path,
@@ -10608,6 +10856,29 @@ struct DeviceLayer<'a> {
         sparkflash_kernels::cuda_driver::Module,
         sparkflash_kernels::cuda_driver::Kernel,
     ),
+    /// The CSA2 sequence entry (`flash_mla_csa2_seq_sm121`), loaded once at open from its pinned
+    /// cubin: `attention_body`'s first launch.
+    seq: (
+        sparkflash_kernels::cuda_driver::Module,
+        sparkflash_kernels::cuda_driver::Kernel,
+    ),
+    /// The wo_a projection (`b12x_bf16a_mxfp8w_wo_a_sm121`), loaded once at open from its pinned
+    /// cubin: `attention_output`'s first launch.
+    wo_a: (
+        sparkflash_kernels::cuda_driver::Module,
+        sparkflash_kernels::cuda_driver::Kernel,
+    ),
+    /// The per-rank wo_a/wo_b geometry, built from config at open and checked against every
+    /// layer's plan B12x shard there.
+    out_geometry: sparkflash_kernels::attention_operands::OutputGeometry,
+    /// The run-wide index-key pool: zero-filled at open, read by every layer's body. No device
+    /// producer exists until the indexer lands, so one pool serves all forty layers.
+    index_key_pool: Deviceptr,
+    index_key_bytes: usize,
+    /// The run-wide sink pool: every layer's `heads_per_rank` f32 sink logits, uploaded once at
+    /// open so no stage reads a host value inside the step.
+    sink_pool: Deviceptr,
+    sink_pool_bytes: usize,
     /// The three projection shapes, asserted against config at open (not at launch).
     projections: [ProjectionShape; 3],
     /// The attention-path bind: the slab owns no weights (rule 2), so stages resolve the names
@@ -10618,6 +10889,17 @@ struct DeviceLayer<'a> {
     /// run: both per-layer collectives enqueue onto it. None is the host arm or a refused open, and
     /// the two collective stages then refuse by name.
     reduce: Option<DeviceReduce<'a>>,
+    /// Collectives enqueued and not yet waited for, by the layer's own bookkeeping.
+    ///
+    /// The stages enqueue and never synchronise - that is what the device arm is for, and S3's
+    /// graph capture hits the same hazard harder. A diagnostic that reads a row *after* a
+    /// collective therefore reads a buffer the collective has not necessarily written yet; the first
+    /// reduce capture in this session was stale by exactly one layer for that reason. So the counter
+    /// is not advice, it is enforcement: `reduce_row` increments it, the only two host read paths
+    /// (`copy_out`, `read_row_bytes`) refuse while it is nonzero, and `wait_collectives` is the one
+    /// place that clears it, after a device synchronise that covers stream 0 where the collective is
+    /// enqueued. A new diagnostic cannot forget the wait without failing its own read.
+    collectives_in_flight: std::cell::Cell<u32>,
     /// The typed weights the stages need, resolved once at open through WEIGHT_NAMES.
     weights: LayerWeights,
     /// Every layer's mHC seam weights, resolved once at open from `weights` (same table, one path).
@@ -10716,6 +10998,75 @@ struct DeviceLayer<'a> {
         sparkflash_kernels::cuda_driver::Module,
         sparkflash_kernels::cuda_driver::Kernel,
     )>,
+    /// The routed data path's five kernel handles, loaded once at open (two new by-name symbols and
+    /// the three landed launches the stage drives). `None` means the run has no staged cubin
+    /// directory; `moe_routed` then refuses by name.
+    moe_routed_kernels: Option<sparkflash_kernels::moe_routed_device::MoeRoutedKernels>,
+    /// The routed stage's run-scope state: the expert pointer table and the staging buffers.
+    /// `attach_moe_routed` builds it once, after `attach_routed` has resolved the arena pointers.
+    moe_routed_device: Option<sparkflash_kernels::moe_routed_device::MoeRoutedDevice>,
+    /// The `moe_router` probe count the last `moe_routed` call consumed, so a stale id row is
+    /// refused instead of combined.
+    moe_router_seen: u64,
+    /// The Engram write stage's run-scope state: the arena, the constant matrices and the scratch,
+    /// uploaded once at open by `attach_engram`. `None` on a run with no Engram layer, and
+    /// `engram_write` then no-ops for every layer (there is no row to write).
+    engram: Option<EngramDevice>,
+    /// This layer's staged ratio>0 seam weights, set by the loop before `run_layer` (the run scope's
+    /// `SeamDevice` owns them; the device arm only borrows the pointers). `None` on ratio-0 layers and
+    /// on layers the source did not serve. Distinct from `seam_weights` above, which is the host
+    /// seam's per-layer width table.
+    seam_staged: Option<SeamStagedWeights>,
+    /// The per-position compressor ring the ratio>0 reference_seam body appends to and pools from.
+    seam_ring: Option<SeamRing>,
+    /// True when this position's ratio>0 layer takes part in compression without producing a cache
+    /// row (it is not a kv source). Set by `reference_seam`, read by `ref_select`: such a layer's seam
+    /// is the window alone, exactly the ratio-0 seam, and its id list is empty.
+    seam_window_only: bool,
+    /// The `pool_group_f32` symbol the completing-group chain pools the ring with, loaded at open.
+    seam_pool: Option<sparkflash_kernels::cuda_driver::Kernel>,
+    /// The narrow (f32 -> bf16) symbol the compressor latent is rounded with, loaded at open.
+    seam_narrow: Option<sparkflash_kernels::cuda_driver::Kernel>,
+    /// The widen (bf16 -> f32) symbol for pre- and post-RoPE latents, loaded at open.
+    seam_widen: Option<sparkflash_kernels::cuda_driver::Kernel>,
+    /// The `rmsnorm_sm121` symbol the compressor latent is normed with, loaded at open.
+    seam_norm: Option<sparkflash_kernels::cuda_driver::Kernel>,
+    /// The `compressed_append_sm121` symbol the completed group is stored with, loaded at open.
+    seam_append: Option<sparkflash_kernels::cuda_driver::Kernel>,
+    /// The `compressed_selected_fill_sm121` symbol, loaded at open.
+    seam_selected_fill: Option<sparkflash_kernels::cuda_driver::Kernel>,
+    /// The `ref_select_sm121` symbol, loaded at open.
+    seam_ref_select: Option<sparkflash_kernels::cuda_driver::Kernel>,
+    /// The `k_norm_f32_to_bf16` symbol, loaded at open.
+    seam_k_norm: Option<sparkflash_kernels::cuda_driver::Kernel>,
+    /// The `fp4_round_trip_bf16_to_f32` symbol, loaded at open.
+    seam_fp4_round_trip: Option<sparkflash_kernels::cuda_driver::Kernel>,
+    /// The `scale_index_weights_bf16_to_f32` symbol, loaded at open.
+    seam_scale_weights: Option<sparkflash_kernels::cuda_driver::Kernel>,
+    /// The `hc_pre_collapse_bf16` symbol, loaded at open.
+    seam_hc_pre_collapse: Option<sparkflash_kernels::cuda_driver::Kernel>,
+    /// The latent pair: two bf16 rows of `head_dim` (narrow's output, then the norm's output). The
+    /// norm takes distinct in and out, so the pair is one allocation read as two halves.
+    seam_latent: Option<crate::layer_device::DeviceSpan>,
+    /// The seam's three host-weight GEMV symbols, copied out of the run scope's `SeamDevice` at open
+    /// so a stage launches without borrowing it.
+    seam_kernels: Option<[sparkflash_kernels::cuda_driver::Kernel; 3]>,
+    /// Configured kv-source layers (`[2, 8, 14, 20]`).
+    kv_source_layers: Vec<usize>,
+    /// Configured index-source layers (`[2, 8, 14, 20, 24, 28, 32, 36]`).
+    index_source_layers: Vec<usize>,
+    /// Indexer head count (`32`).
+    index_n_heads: usize,
+    /// Indexer head width (`128`).
+    index_head_dim: usize,
+    /// Indexer top-k (`512`).
+    index_topk: usize,
+    /// Candidate mask producer layer (`20`).
+    candidate_source_layer: usize,
+    /// Candidate mask top-k blocks (`64`).
+    candidate_topk_blocks: usize,
+    /// Candidate mask block size (`8`).
+    candidate_block_size: usize,
     /// The ffn_seams probe count this layer last saw, for the router's per-position written gate.
     ffn_seams_seen: u64,
     /// The layer's own stage record: reset at the start of every `run_layer`, one entry per stage
@@ -10761,7 +11112,124 @@ struct AttentionWindow {
 }
 
 #[cfg(feature = "cuda")]
+/// The Engram write stage's device state: the arena uploaded once at open, each slot's constant
+/// matrices, and the scratch the six launches share.
+///
+/// The arena is the gather moved out of the step (`crate::engram_device_state`): the table rows a
+/// position looks up are a function of the token history, so they are read once and uploaded once,
+/// and the stage only indexes an entry. The constant matrices (`q_weight * k_weight`, the wkv codes
+/// and scales) are the same at every position for a layer, so they are uploaded once too.
+struct EngramDevice {
+    layout: crate::engram_device_state::EngramArenaLayout,
+    layer_ids: Vec<usize>,
+    positions: usize,
+    arena: Deviceptr,
+    arena_bytes: usize,
+    /// `slots * positions` skip flags, host metadata fixed at open (the dead-token rule).
+    skip: Vec<bool>,
+    product: Vec<Deviceptr>,
+    product_bytes: Vec<usize>,
+    wkv_weight: Vec<Deviceptr>,
+    wkv_weight_bytes: Vec<usize>,
+    wkv_scales: Vec<Deviceptr>,
+    wkv_scales_bytes: Vec<usize>,
+    fetched: Deviceptr,
+    act_codes: Deviceptr,
+    act_scales: Deviceptr,
+    kv_bf16: Deviceptr,
+    hs_bf16: Deviceptr,
+    value_f32: Deviceptr,
+    gates: Deviceptr,
+    out_width: usize,
+    inner: usize,
+    hc_mult: usize,
+    dim: usize,
+    eps: f32,
+    kernels: EngramKernels,
+}
+
+/// The six Engram symbols and their module handles (the conversion image carries two symbols).
+#[cfg(feature = "cuda")]
+struct EngramKernels {
+    embed: sparkflash_kernels::cuda_driver::Kernel,
+    wkv: sparkflash_kernels::cuda_driver::Kernel,
+    gate: sparkflash_kernels::cuda_driver::Kernel,
+    write: sparkflash_kernels::cuda_driver::Kernel,
+    narrow: sparkflash_kernels::cuda_driver::Kernel,
+    widen: sparkflash_kernels::cuda_driver::Kernel,
+    modules: Vec<sparkflash_kernels::cuda_driver::Module>,
+}
+
+#[cfg(feature = "cuda")]
+impl EngramDevice {
+    /// Frees the run-scope buffers and every module handle, before the slab their launches read.
+    fn release(self, cuda: &sparkflash_kernels::cuda_driver::Cuda) {
+        let mut buffers = vec![self.arena];
+        buffers.extend(&self.product);
+        buffers.extend(&self.wkv_weight);
+        buffers.extend(&self.wkv_scales);
+        buffers.extend([
+            self.fetched,
+            self.act_codes,
+            self.act_scales,
+            self.kv_bf16,
+            self.hs_bf16,
+            self.value_f32,
+            self.gates,
+        ]);
+        let refs: Vec<&Deviceptr> = buffers.iter().collect();
+        cuda.free_buffers(&refs);
+        for module in self.kernels.modules {
+            cuda.free(module, &[]);
+        }
+    }
+
+    /// The bytes the run-scope Engram state occupies, for the run record.
+    fn device_bytes(&self) -> usize {
+        self.arena_bytes
+            + self.product_bytes.iter().sum::<usize>()
+            + self.wkv_weight_bytes.iter().sum::<usize>()
+            + self.wkv_scales_bytes.iter().sum::<usize>()
+            + self.fetched_len()
+    }
+
+    fn fetched_len(&self) -> usize {
+        self.layout.columns() * self.layout.head_dim() * 2
+    }
+
+    fn layer_slot(&self, layer: usize) -> Result<usize, String> {
+        self.layer_ids
+            .iter()
+            .position(|candidate| *candidate == layer)
+            .ok_or_else(|| {
+                format!(
+                    "layer device stage engram_write: layer {layer} is not one of the Engram layers {:?}",
+                    self.layer_ids
+                )
+            })
+    }
+
+    fn is_skipped(&self, slot: usize, position: usize) -> Result<bool, String> {
+        if slot >= self.layer_ids.len() || position >= self.positions {
+            return Err(format!(
+                "layer device stage engram_write: entry ({slot}, {position}) is outside {slots} slots x {positions} positions",
+                slots = self.layer_ids.len(),
+                positions = self.positions
+            ));
+        }
+        Ok(self.skip[slot * self.positions + position])
+    }
+}
+
+#[cfg(feature = "cuda")]
 impl<'a> DeviceLayer<'a> {
+    /// Sets the current layer's staged host-seam weights. Called once per layer by the loop, before
+    /// `run_layer`: the weights are `AttentionHostSeam` in the plan, so they never appear in the arena
+    /// bind and this view is the only way the ratio>0 stages reach them.
+    fn set_seam_weights(&mut self, weights: Option<SeamStagedWeights>) {
+        self.seam_staged = weights;
+    }
+
     /// Allocates the layer's one device slab and carves it into its spans.
     ///
     /// The arity is the call site's list: the resident plan joins the six arguments the loop already
@@ -10775,6 +11243,7 @@ impl<'a> DeviceLayer<'a> {
         max_positions: usize,
         attention: Option<&'a crate::resident_weights::RankBind>,
         mhc_seam: Option<&'a crate::resident_weights::RankBind>,
+        arena: Option<&sparkflash_device::arena::ResidentArena>,
         plan: Option<&'a sparkflash_device::resident::ResidentPlan>,
         native_mhc: bool,
     ) -> Result<Self, String> {
@@ -10944,6 +11413,53 @@ impl<'a> DeviceLayer<'a> {
                 let (cubin, _sha256) =
                     load_pinned_addition(dir, "moe_router_sm121", "layer device router")?;
                 Some(sparkflash_kernels::router_launch::load(cuda, &cubin)?)
+            }
+            None => None,
+        };
+        // The routed data path's two new symbols and the three landed launches the stage drives. One
+        // load at open, beside the router's, so a staged directory without the new cubin refuses at
+        // open instead of at layer 0's `moe_routed`. Two symbols live in the one new cubin and no
+        // KernelId names either of them, so both go through the by-name loaders; the three landed
+        // kernels use their own pinned loaders and their own pins.
+        let moe_routed_kernels = match kernel_cubin_dir {
+            Some(dir) => {
+                let (stage_cubin, _sha) = load_pinned_addition(
+                    dir,
+                    "moe_routed_device_sm121",
+                    "layer device routed data path",
+                )?;
+                let stage = cuda.load_moe_routed_stage(&stage_cubin)?;
+                let combine = cuda.load_moe_routed_combine(&stage_cubin)?;
+                let (gate_up_cubin, _sha) = load_pinned_addition(
+                    dir,
+                    "routed_gate_up_sm121",
+                    "layer device routed data path",
+                )?;
+                let gate_up =
+                    sparkflash_kernels::routed_gate_up_launch::load(cuda, &gate_up_cubin)?;
+                let (weighted_cubin, _sha) = load_pinned_addition(
+                    dir,
+                    "swiglu_mxfp8_quant_weighted_sm121",
+                    "layer device routed data path",
+                )?;
+                let weighted = cuda.load_kernel(
+                    &weighted_cubin,
+                    sparkflash_kernels::cuda_driver::KernelId::SwigluMxfp8QuantWeighted,
+                )?;
+                let (stored_cubin, _sha) = load_pinned_addition(
+                    dir,
+                    sparkflash_kernels::mxfp4_moe_stored_launch::KERNEL,
+                    "layer device routed data path",
+                )?;
+                let stored =
+                    sparkflash_kernels::mxfp4_moe_stored_launch::load(cuda, &stored_cubin)?;
+                Some(sparkflash_kernels::moe_routed_device::MoeRoutedKernels {
+                    stage,
+                    combine,
+                    gate_up,
+                    weighted,
+                    stored,
+                })
             }
             None => None,
         };
@@ -11139,6 +11655,106 @@ impl<'a> DeviceLayer<'a> {
                 ));
             }
         }
+        // ---- The attention body and output halves' run-wide operands ----
+        // (docs/archive/build/s1-p2-attention-wiring.md §A.4/A.6.) The two kernels this arm did not
+        // load before: the CSA2 sequence entry and the wo_a projection. Both are pinned baseline
+        // images, so a staged cubin that is not the artifact the baseline names is refused here, at
+        // open, rather than launched.
+        let (seq_module, seq_kernel) = {
+            let (cubin, _sha) = load_pinned_addition(
+                kernel_dir,
+                "flash_mla_csa2_seq_sm121",
+                "layer device attention body",
+            )?;
+            sparkflash_kernels::flash_mla_csa2_seq_launch::load(cuda, &cubin)?
+        };
+        let (wo_a_module, wo_a_kernel) = {
+            let (cubin, _sha) = load_pinned_addition(
+                kernel_dir,
+                "b12x_bf16a_mxfp8w_wo_a_sm121",
+                "layer device attention output",
+            )?;
+            sparkflash_kernels::bf16a_mxfp8w_wo_a_launch::load(cuda, &cubin)?
+        };
+        // The per-rank wo_a/wo_b geometry: config-derived, then checked against every layer's plan
+        // B12x shard, so a transposed or world-mismatched plan is an open refusal and not a launch
+        // that reads the wrong bytes.
+        let out_geometry = sparkflash_kernels::attention_operands::OutputGeometry::new(
+            config.o_groups,
+            world,
+            usize::try_from(q_cols_u32 / kv_cols).map_err(|_| {
+                "layer device: the per-rank head count does not fit a usize".to_owned()
+            })?,
+            config.head_dim,
+            config.o_lora_rank,
+            dim,
+        )
+        .map_err(|error| format!("layer device: attention output geometry: {error}"))?;
+        if out_geometry.lo_bytes() != crate::layer_device::ATTN_LO_BYTES {
+            return Err(format!(
+                "layer device: wo_a's output row is {} B for o_groups {} / world {world} / o_lora_rank {}, the slab carves {} B; the arm is sized for the released (2, 1,024) shard",
+                out_geometry.lo_bytes(),
+                config.o_groups,
+                config.o_lora_rank,
+                crate::layer_device::ATTN_LO_BYTES
+            ));
+        }
+        if let Some(plan) = plan {
+            for layer in 0..config.n_layers {
+                for (name, want) in [
+                    (
+                        format!("layers.{layer}.attn.wo_a.weight"),
+                        out_geometry.wo_a_shape(),
+                    ),
+                    (
+                        format!("layers.{layer}.attn.wo_b.weight"),
+                        out_geometry.wo_b_shape(),
+                    ),
+                ] {
+                    let got = planned_b12x_geometry(plan, &name)
+                        .map_err(|error| format!("layer device: {error}"))?;
+                    if got != want {
+                        return Err(format!(
+                            "layer device: {name} is planned {got:?}, the per-rank geometry is {want:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        // The body's two run-wide operands. The index-key pool has no device producer on this
+        // milestone, so one zero pool serves every layer and is read-only; the sink pool is the
+        // arena's per-layer sink logits, uploaded once so no stage reads a host value inside the
+        // step (two open-time copies, both outside the timed region).
+        let index_key_bytes = sparkflash_kernels::attention_operands::index_key_pool_bytes();
+        let index_key_pool = cuda.alloc(index_key_bytes, &mut total)?;
+        cuda.copy_htod(&index_key_pool, &vec![0u8; index_key_bytes])
+            .map_err(|error| format!("layer device: index-key pool zero fill: {error}"))?;
+        let arena = arena.ok_or_else(|| {
+            "layer device: the attention body's sink pool is the arena's per-layer \
+             layers.<n>.attn.attn_sink rows and this open has no arena; the device arm needs the \
+             resident bind"
+                .to_owned()
+        })?;
+        let sink_stride = out_geometry
+            .heads_per_rank
+            .checked_mul(4)
+            .ok_or_else(|| "layer device: the sink row width overflows".to_owned())?;
+        let sink_pool_bytes = sink_stride
+            .checked_mul(config.n_layers)
+            .ok_or_else(|| "layer device: the sink pool width overflows".to_owned())?;
+        let mut sink_bytes = Vec::with_capacity(sink_pool_bytes);
+        for layer in 0..config.n_layers {
+            let sink = read_arena_bytes(
+                cuda,
+                arena,
+                &format!("layers.{layer}.attn.attn_sink"),
+                sink_stride,
+            )?;
+            sink_bytes.extend_from_slice(&sink);
+        }
+        let sink_pool = cuda.alloc(sink_pool_bytes, &mut total)?;
+        cuda.copy_htod(&sink_pool, &sink_bytes)
+            .map_err(|error| format!("layer device: sink pool upload: {error}"))?;
         let weights = LayerWeights::resolve(attention, mhc_seam)?;
         let seam_weights = SeamLayerWeights::resolve(&weights, config.n_layers)?;
         let hc_eps = config.hc_eps as f32;
@@ -11213,11 +11829,19 @@ impl<'a> DeviceLayer<'a> {
                 rope_rows_module,
             },
             gemv,
+            seq: (seq_module, seq_kernel),
+            wo_a: (wo_a_module, wo_a_kernel),
+            out_geometry,
+            index_key_pool,
+            index_key_bytes,
+            sink_pool,
+            sink_pool_bytes,
             projections,
             weights,
             seam_weights,
             attention,
             reduce: None,
+            collectives_in_flight: std::cell::Cell::new(0),
             rope_kernel: (rope_module, rope_kernel),
             max_positions,
             rope_pairs: u32::try_from(rope_pairs)
@@ -11244,6 +11868,34 @@ impl<'a> DeviceLayer<'a> {
             routed: None,
             router: None,
             router_kernels,
+            moe_routed_kernels,
+            moe_routed_device: None,
+            moe_router_seen: 0,
+            engram: None,
+            seam_staged: None,
+            seam_ring: None,
+            seam_kernels: None,
+            seam_window_only: false,
+            seam_pool: None,
+            seam_narrow: None,
+            seam_widen: None,
+            seam_norm: None,
+            seam_append: None,
+            seam_selected_fill: None,
+            seam_ref_select: None,
+            seam_k_norm: None,
+            seam_fp4_round_trip: None,
+            seam_scale_weights: None,
+            seam_hc_pre_collapse: None,
+            seam_latent: None,
+            kv_source_layers: config.kv_source_layers.clone(),
+            index_source_layers: config.index_source_layers.clone(),
+            index_n_heads: config.index_n_heads,
+            index_head_dim: config.index_head_dim,
+            index_topk: config.index_topk,
+            candidate_source_layer: config.candidate_source_layer,
+            candidate_topk_blocks: config.candidate_topk_blocks,
+            candidate_block_size: config.candidate_block_size,
             ffn_seams_seen: 0,
             runs: crate::layer_device::StageRuns::default(),
             positions_begun: 0,
@@ -11380,7 +12032,8 @@ impl<'a> DeviceLayer<'a> {
         layer: usize,
         position: usize,
     ) -> Result<(), String> {
-        use sparkflash_kernels::mxfp8_dense_launch as gemv;
+        use sparkflash_kernels::mxfp8_dense_launch::Mxfp8DenseParams;
+        use sparkflash_kernels::mxfp8_gemv_launch;
         let out = match slot {
             0 => self.buffers.workspace.q_lora,
             1 => self.buffers.workspace.kv_latent,
@@ -11397,7 +12050,7 @@ impl<'a> DeviceLayer<'a> {
         let step_seq = u64::try_from(position).map_err(|_| {
             format!("layer device projection: position {position} does not fit u64")
         })?;
-        let params = gemv::Mxfp8DenseParams::new(
+        let params = Mxfp8DenseParams::new(
             Deviceptr(self.buffers.workspace.act_codes.device),
             Deviceptr(self.buffers.workspace.act_scales.device),
             weight,
@@ -11410,7 +12063,7 @@ impl<'a> DeviceLayer<'a> {
             layer_id,
             step_seq,
         );
-        gemv::launch(self.cuda, self.gemv.1, &params).map_err(|error| {
+        mxfp8_gemv_launch::launch(self.cuda, self.gemv.1, &params).map_err(|error| {
             format!("layer device stage attention_projections: {name}: {error}")
         })?;
         probe::count("attention_projections");
@@ -11555,8 +12208,45 @@ impl<'a> DeviceLayer<'a> {
         // opened for this run's world and rank by the bootstrap.
         unsafe { handle.reduce_bf16(0, input.device, output.device, count) }
             .map_err(|error| format!("layer device stage {stage}: {error}"))?;
+        self.collectives_in_flight
+            .set(self.collectives_in_flight.get().saturating_add(1));
         probe::count(stage);
         Ok(())
+    }
+
+    /// Waits for every collective this layer enqueued, then clears the in-flight count.
+    ///
+    /// The collective is enqueued on stream 0 without a host wait (that is the arm's design), so a
+    /// diagnostic that wants to read a row it produced must call this first: it synchronises the
+    /// device - which covers stream 0 - and only then lets the guarded read paths run. Returns
+    /// whether it actually waited, for the record.
+    #[cfg(feature = "cuda")]
+    fn wait_collectives(&self) -> Result<bool, String> {
+        let in_flight = self.collectives_in_flight.get();
+        if in_flight == 0 {
+            return Ok(false);
+        }
+        self.cuda.synchronize().map_err(|error| {
+            format!("layer device: waiting for {in_flight} queued collective(s): {error}")
+        })?;
+        self.collectives_in_flight.set(0);
+        Ok(true)
+    }
+
+    /// Refuses a host read of a device row while a collective is enqueued.
+    ///
+    /// The one sentence a diagnostic author needs: "the collective is enqueued on the stream and
+    /// nothing has waited for it, so this row is whatever was there before". Both read paths call
+    /// it, so a new dump site that forgets `wait_collectives` fails with this message instead of
+    /// recording a stale row.
+    fn refuse_read_while_collective_in_flight(&self, what: &str) -> Result<(), String> {
+        let in_flight = self.collectives_in_flight.get();
+        if in_flight == 0 {
+            return Ok(());
+        }
+        Err(format!(
+            "layer device: read of {what} while {in_flight} collective(s) are enqueued and not waited for - the row is stale by construction; call wait_collectives() first (the first reduce capture in this session was stale by one layer for exactly this reason)"
+        ))
     }
     /// Attaches the router's per-layer weight/bias arena pointers.
     ///
@@ -11595,11 +12285,619 @@ impl<'a> DeviceLayer<'a> {
         Ok(())
     }
 
+    /// Builds and opens the routed data path's run-scope state: the expert pointer table from the
+    /// arena pointers `attach_routed` resolved, and the staging buffers.
+    ///
+    /// Called once, after `attach_routed` and before the first position. Nothing here is per layer or
+    /// per step: the table and the constant slot ids are uploaded once, and from then on a stage call
+    /// touches device memory only.
+    fn attach_moe_routed(&mut self) -> Result<(), String> {
+        use sparkflash_kernels::moe_routed_device::{
+            ExpertPointerTable, MoeRoutedDevice, MoeRoutedGeometry, MoeRoutedPlan,
+        };
+        if self.moe_routed_device.is_some() {
+            return Err("layer device routed data path: attached twice".to_owned());
+        }
+        let Some(routed) = self.routed.as_ref() else {
+            return Err(
+                "layer device routed data path: no routed shard was attached, so there is no \
+                 resident (layer, expert, matrix) slice to table"
+                    .to_owned(),
+            );
+        };
+        let Some(kernels) = self.moe_routed_kernels else {
+            return Err(
+                "layer device routed data path: the kernels were not loaded at open (the staged \
+                 cubin directory carries no moe_routed_device_sm121)"
+                    .to_owned(),
+            );
+        };
+        let geometry = self.routed_geometry;
+        let n_layers = routed.len();
+        // The same released-shape refusal the host arm applies: a config the pinned launches were
+        // not compiled for is an open-time error naming the field, not a per-step surprise.
+        let moe_geometry = MoeRoutedGeometry::new(
+            geometry.dim,
+            geometry.inter,
+            geometry.world,
+            geometry.experts,
+            geometry.top_k,
+        )?;
+        if n_layers != self.compress_ratio.len() {
+            return Err(format!(
+                "layer device routed data path: the shard has {n_layers} layer(s), the arm has {}",
+                self.compress_ratio.len()
+            ));
+        }
+        let table =
+            ExpertPointerTable::build(n_layers, geometry.experts, |layer, matrix, expert| {
+                let bind = routed[layer][expert][matrix.index()];
+                (bind.weight.0, bind.scales.0)
+            })?;
+        // The arm stages one token per position (the carved spans are one row wide), so the capacity
+        // is exactly one token's top_k routed rows; `run` refuses a wider call.
+        let plan = MoeRoutedPlan::new(moe_geometry, n_layers, geometry.top_k, self.swiglu_limit)?;
+        let device = MoeRoutedDevice::open(self.cuda, plan, &table, kernels)?;
+        self.moe_routed_device = Some(device);
+        Ok(())
+    }
+
+    /// The routed data path's device bytes, as `attach_moe_routed` allocated them.
+    fn moe_routed_device_bytes(&self) -> usize {
+        self.moe_routed_device.as_ref().map_or(
+            0,
+            sparkflash_kernels::moe_routed_device::MoeRoutedDevice::device_bytes,
+        )
+    }
+
     /// Attaches the run's reduce handle (opened by the chain's bootstrap before the timed region).
     ///
     /// Called right after open: open's arity is the driver call site's, so the handle joins the
     /// layer here instead of widening it. `None` is the host arm or a refused open, and the run's
     /// setup then refuses the device arm before position 0 (see the loop's attach site).
+    /// The run-scope Engram state's device bytes (arena, constant matrices, scratch), for the run
+    /// record. Zero when the stage was not attached.
+    fn engram_device_bytes(&self) -> usize {
+        self.engram.as_ref().map_or(0, EngramDevice::device_bytes)
+    }
+
+    /// The compressor ring's device bytes, for the run record.
+    fn seam_ring_bytes(&self) -> usize {
+        self.seam_ring.as_ref().map_or(0, SeamRing::bytes)
+    }
+
+    fn is_kv_source(&self, layer: usize) -> bool {
+        self.kv_source_layers.contains(&layer)
+    }
+
+    fn is_index_source(&self, layer: usize) -> bool {
+        self.index_source_layers.contains(&layer)
+    }
+
+    fn owner_index_for(&self, layer: usize) -> Option<usize> {
+        self.kv_source_layers
+            .iter()
+            .rposition(|&source| source <= layer)
+    }
+
+    fn collapse_for_head(
+        &self,
+        hidden_out: Deviceptr,
+        certified_count: Deviceptr,
+    ) -> Result<(), String> {
+        let kernel = self.seam_hc_pre_collapse.ok_or_else(|| {
+            "layer device head collapse: hc_pre_collapse_bf16 symbol is not loaded".to_owned()
+        })?;
+        sparkflash_kernels::pool_group_launch::launch_hc_pre_collapse(
+            self.cuda,
+            kernel,
+            Deviceptr(self.buffers.residual.pre_mix.device),
+            Deviceptr(self.buffers.residual.stream.device),
+            hidden_out,
+            certified_count,
+            u32::try_from(self.hc_mult).unwrap_or(u32::MAX),
+            u32::try_from(self.dim).unwrap_or(u32::MAX),
+        )
+    }
+
+    /// Loads the pooling symbol the completing-group chain needs, once, at open.
+    ///
+    /// The cubin is pinned (`baseline/kernel_baseline.txt`, `pool_group_sm121`) and staged beside the
+    /// other thirty, so this is the same verified read every stage kernel goes through.
+    fn attach_seam_pool(&mut self, kernel_dir: &std::path::Path) -> Result<(), String> {
+        let (cubin, _sha) =
+            load_pinned_addition(kernel_dir, "pool_group_sm121", "layer device pool")?;
+        let (_module, kernel) = self
+            .cuda
+            .load_pool_group(&cubin)
+            .map_err(|error| format!("layer device pool: load: {error}"))?;
+        self.seam_pool = Some(kernel);
+        let (_m, k_norm) = self
+            .cuda
+            .load_k_norm_f32_to_bf16(&cubin)
+            .map_err(|error| format!("layer device k_norm: load: {error}"))?;
+        self.seam_k_norm = Some(k_norm);
+        let (_m, fp4_rt) = self
+            .cuda
+            .load_fp4_round_trip(&cubin)
+            .map_err(|error| format!("layer device fp4_round_trip: load: {error}"))?;
+        self.seam_fp4_round_trip = Some(fp4_rt);
+        let (_m, scale_weights) = self
+            .cuda
+            .load_scale_index_weights(&cubin)
+            .map_err(|error| format!("layer device scale_index_weights: load: {error}"))?;
+        self.seam_scale_weights = Some(scale_weights);
+        let (_m, hc_pre_collapse) = self
+            .cuda
+            .load_hc_pre_collapse(&cubin)
+            .map_err(|error| format!("layer device hc_pre_collapse: load: {error}"))?;
+        self.seam_hc_pre_collapse = Some(hc_pre_collapse);
+
+        // The rest of the compressor chain's symbols: the f32 <-> bf16 conversions and the norm.
+        let (convert_cubin, _sha) = load_pinned_addition(
+            kernel_dir,
+            "engram_stream_convert_sm121",
+            "layer device seam convert",
+        )?;
+        let (_m, narrow) =
+            sparkflash_kernels::engram_convert_launch::load_narrow(self.cuda, &convert_cubin)
+                .map_err(|error| format!("layer device seam convert: load: {error}"))?;
+        self.seam_narrow = Some(narrow);
+        let (_m, widen) =
+            sparkflash_kernels::engram_convert_launch::load_widen(self.cuda, &convert_cubin)
+                .map_err(|error| format!("layer device seam widen: load: {error}"))?;
+        self.seam_widen = Some(widen);
+        let (norm_cubin, _sha) =
+            load_pinned_addition(kernel_dir, "rmsnorm_sm121", "layer device seam norm")?;
+        let (_m, norm) = sparkflash_kernels::rmsnorm_launch::load(self.cuda, &norm_cubin)
+            .map_err(|error| format!("layer device seam norm: load: {error}"))?;
+        self.seam_norm = Some(norm);
+        let (append_cubin, _sha) = load_pinned_addition(
+            kernel_dir,
+            "compressed_append_sm121",
+            "layer device seam append",
+        )?;
+        let (_m, append) = self
+            .cuda
+            .load_compressed_append(&append_cubin)
+            .map_err(|error| format!("layer device seam append: load: {error}"))?;
+        self.seam_append = Some(append);
+        let (_m, selected_fill) = self
+            .cuda
+            .load_compressed_selected_fill(&append_cubin)
+            .map_err(|error| format!("layer device seam selected_fill: load: {error}"))?;
+        self.seam_selected_fill = Some(selected_fill);
+        let (ref_select_cubin, _sha) = load_pinned_addition(
+            kernel_dir,
+            "ref_select_sm121",
+            "layer device seam ref_select",
+        )?;
+        let (_m, ref_select) =
+            sparkflash_kernels::ref_select_launch::load(self.cuda, &ref_select_cubin)
+                .map_err(|error| format!("layer device seam ref_select: load: {error}"))?;
+        self.seam_ref_select = Some(ref_select);
+
+        let width = self.head_width as usize;
+        let bytes = width * 2 * 2;
+        let mut allocated = 0usize;
+        let span = self
+            .cuda
+            .alloc(bytes, &mut allocated)
+            .map_err(|error| format!("layer device seam latent: alloc: {error}"))?;
+        self.seam_latent = Some(crate::layer_device::DeviceSpan {
+            device: span.0,
+            len: bytes,
+        });
+        Ok(())
+    }
+
+    /// Narrows one f32 latent row to bf16 and norms it with the compressor's weight.
+    ///
+    /// The host rule's order (model.py:475-486): the pooled row is narrowed to the model dtype, then
+    /// normed. Both launches are device to device; the norm reads the staged weight and writes the
+    /// second half of the latent pair, so the caller gets the normed bf16 row.
+    fn seam_latent_norm(
+        &self,
+        layer: usize,
+        position: usize,
+        source: Deviceptr,
+        norm_weight: Deviceptr,
+        weight_bytes: usize,
+    ) -> Result<Deviceptr, String> {
+        let narrow = self.seam_narrow.ok_or_else(|| {
+            "layer device seam latent: the narrow symbol is not loaded".to_owned()
+        })?;
+        let norm = self
+            .seam_norm
+            .ok_or_else(|| "layer device seam latent: the norm symbol is not loaded".to_owned())?;
+        let pair = self
+            .seam_latent
+            .ok_or_else(|| "layer device seam latent: no latent pair".to_owned())?;
+        let width = self.head_width as usize;
+        if pair.len < width * 4 {
+            return Err(format!(
+                "layer device seam latent: the pair is {} bytes, two {width}-wide bf16 rows are {}",
+                pair.len,
+                width * 4
+            ));
+        }
+        if weight_bytes != width * 2 {
+            return Err(format!(
+                "layer device seam latent: layer {layer}'s norm weight is {weight_bytes} bytes, the {width}-wide bf16 row is {}",
+                width * 2
+            ));
+        }
+        let narrow_out = Deviceptr(pair.device);
+        let convert = sparkflash_kernels::engram_convert_launch::EngramConvertParams {
+            src: source,
+            dst: narrow_out,
+            count: u32::try_from(width).unwrap_or(u32::MAX),
+        };
+        sparkflash_kernels::engram_convert_launch::launch_narrow(
+            self.cuda,
+            narrow,
+            &convert,
+            &sparkflash_kernels::engram_convert_launch::EngramConvertSpans {
+                src_bytes: width * 4,
+                dst_bytes: width * 2,
+            },
+        )?;
+        let normed = Deviceptr(pair.device + (width * 2) as u64);
+        let params = sparkflash_kernels::rmsnorm_launch::RmsNormLaunchParams {
+            x: narrow_out,
+            weight: norm_weight,
+            out: normed,
+            rows: 1,
+            cols: u32::try_from(width).unwrap_or(u32::MAX),
+            eps: self.eps,
+            trace_ring: 0,
+            layer_id: u32::try_from(layer).unwrap_or(u32::MAX),
+            step_seq: u64::try_from(position).unwrap_or(0),
+        };
+        sparkflash_kernels::rmsnorm_launch::launch(self.cuda, norm, &params)?;
+        Ok(normed)
+    }
+
+    /// Rotates the normed compressor latent forward with the compressed class's table slice.
+    ///
+    /// The tables are laid out `[cos: max_positions * pairs * 4][sin: the same]` - the layout
+    /// `rotate_q` uses - so the position's slice is an offset into each block, and a position outside
+    /// the tables is refused rather than clamped: a clamped table rotates by another position's angle.
+    fn seam_latent_rope(
+        &self,
+        layer: usize,
+        position: usize,
+        latent: Deviceptr,
+    ) -> Result<(), String> {
+        if position >= self.max_positions {
+            return Err(format!(
+                "layer device seam latent: position {position} is outside the {}-position rope tables sized at open",
+                self.max_positions
+            ));
+        }
+        let pairs = usize::try_from(self.rope_pairs)
+            .map_err(|_| "layer device seam latent: pair count does not fit a usize".to_owned())?;
+        let table_bytes = self
+            .max_positions
+            .checked_mul(pairs)
+            .and_then(|values| values.checked_mul(4))
+            .ok_or_else(|| "layer device seam latent: the table offset overflows".to_owned())?;
+        let offset = position
+            .checked_mul(pairs)
+            .and_then(|values| values.checked_mul(4))
+            .ok_or_else(|| "layer device seam latent: the position offset overflows".to_owned())?;
+        let span = self.buffers.workspace.rope_tables_compressed;
+        crate::layer_attention_stages::launch_forward_rope(
+            self.cuda,
+            self.kernels.rope_rows,
+            latent,
+            Deviceptr(span.device + offset as u64),
+            Deviceptr(span.device + table_bytes as u64 + offset as u64),
+            1,
+            self.head_width,
+            self.rope_head_dim,
+            self.seam_trace_ring(),
+            u32::try_from(layer).unwrap_or(u32::MAX),
+            u64::try_from(position).unwrap_or(0),
+        )
+    }
+
+    /// Stores one completed group's roped latent as the compressed cache's next row.
+    ///
+    /// `latent` is the bf16 roped row; we widen it to f32 into `ring.latent_f32` before calling
+    /// `compressed_append_sm121`, which reads `const float* latent`, and write into the owning
+    /// kv-source layer's `store_codes` and `store_scales`.
+    fn seam_append_group(
+        &self,
+        layer: usize,
+        position: usize,
+        latent_bf16: Deviceptr,
+        ratio: usize,
+        owner_idx: usize,
+    ) -> Result<(), String> {
+        use sparkflash_kernels::compressed_append_launch as append;
+        let kernel = self.seam_append.ok_or_else(|| {
+            "layer device seam append: the append symbol is not loaded".to_owned()
+        })?;
+        let widen = self
+            .seam_widen
+            .ok_or_else(|| "layer device seam append: the widen symbol is not loaded".to_owned())?;
+        let ring = self
+            .seam_ring
+            .ok_or_else(|| "layer device seam append: no seam ring allocated".to_owned())?;
+        if ratio == 0 {
+            return Err("layer device seam append: a zero ratio has no group".to_owned());
+        }
+        let first_row = position.checked_div(ratio).ok_or_else(|| {
+            format!("layer device seam append: layer {layer} position {position} cannot be divided by ratio {ratio}")
+        })?;
+        let width = self.head_width as usize;
+        let store_code_bytes = sparkflash_kernels::attention_operands::STORE_CODE_BYTES;
+        let store_scale_bytes = sparkflash_kernels::attention_operands::STORE_SCALE_BYTES;
+        let expanded_row = first_row
+            .checked_mul(ratio)
+            .ok_or_else(|| "layer device seam append: the expanded row overflows".to_owned())?;
+        let codes_needed = expanded_row
+            .checked_add(ratio)
+            .and_then(|rows| rows.checked_mul(256))
+            .ok_or_else(|| "layer device seam append: the code span overflows".to_owned())?;
+        let scales_needed = expanded_row
+            .checked_add(ratio)
+            .and_then(|rows| rows.checked_mul(32))
+            .ok_or_else(|| "layer device seam append: the scale span overflows".to_owned())?;
+        if store_code_bytes < codes_needed || store_scale_bytes < scales_needed {
+            return Err(format!(
+                "layer device seam append: layer {layer} position {position} needs {codes_needed} code bytes and {scales_needed} scale bytes for expanded row {expanded_row}, the spans hold {store_code_bytes} and {store_scale_bytes}",
+            ));
+        }
+        let convert = sparkflash_kernels::engram_convert_launch::EngramConvertParams {
+            src: latent_bf16,
+            dst: ring.latent_f32,
+            count: u32::try_from(width).unwrap_or(u32::MAX),
+        };
+        sparkflash_kernels::engram_convert_launch::launch_widen(
+            self.cuda,
+            widen,
+            &convert,
+            &sparkflash_kernels::engram_convert_launch::EngramConvertSpans {
+                src_bytes: width * 2,
+                dst_bytes: width * 4,
+            },
+        )?;
+        let owner_codes = ring.store_codes.0 + (owner_idx * store_code_bytes) as u64;
+        let owner_scales = ring.store_scales.0 + (owner_idx * store_scale_bytes) as u64;
+        let params = append::AppendParams {
+            latent: ring.latent_f32.0,
+            codes: owner_codes,
+            scales: owner_scales,
+            first_row: u32::try_from(first_row).unwrap_or(u32::MAX),
+            row_count: 1,
+            ratio: u32::try_from(ratio).unwrap_or(u32::MAX),
+        };
+        self.cuda
+            .launch(kernel, (1, 1, 1), append::BLOCK, &params.words())
+            .map_err(|error| {
+                format!("layer device seam append: layer {layer} position {position}: {error}")
+            })
+    }
+
+    /// Copies the seam's three host-weight GEMV symbols in, once, at open.
+    fn set_seam_kernels(&mut self, kernels: [sparkflash_kernels::cuda_driver::Kernel; 3]) {
+        self.seam_kernels = Some(kernels);
+    }
+
+    /// Allocates the ratio>0 compressor rings, per-owner stores/keys, and indexer scratch once at open.
+    fn attach_seam_ring(&mut self) -> Result<(), String> {
+        let rows = self.compress_ratio.iter().copied().max().unwrap_or(0);
+        if rows == 0 {
+            return Ok(());
+        }
+        let owners = self.kv_source_layers.len().max(1);
+        let head_dim = self.head_width as usize;
+        let mut allocated = 0usize;
+        let mut alloc = |bytes: usize, what: &str| {
+            self.cuda
+                .alloc(bytes, &mut allocated)
+                .map_err(|error| format!("layer device: the compressor ring's {what}: {error}"))
+        };
+        let ring_span = owners
+            .checked_mul(rows)
+            .and_then(|v| v.checked_mul(head_dim))
+            .and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| "layer device: the compressor ring's size overflows".to_owned())?;
+        let wkv = alloc(ring_span, "wkv rows")?;
+        let wgate = alloc(ring_span, "wgate rows")?;
+        let store_code_bytes = owners * sparkflash_kernels::attention_operands::STORE_CODE_BYTES;
+        let store_scale_bytes = owners * sparkflash_kernels::attention_operands::STORE_SCALE_BYTES;
+        let store_codes = alloc(store_code_bytes, "store codes")?;
+        self.cuda
+            .copy_htod(&store_codes, &vec![0u8; store_code_bytes])
+            .map_err(|e| format!("layer device: zero store_codes: {e}"))?;
+        let store_scales = alloc(store_scale_bytes, "store scales")?;
+        self.cuda
+            .copy_htod(&store_scales, &vec![0u8; store_scale_bytes])
+            .map_err(|e| format!("layer device: zero store_scales: {e}"))?;
+        let index_keys_bytes = owners
+            .checked_mul(self.max_positions)
+            .and_then(|v| v.checked_mul(self.index_head_dim))
+            .and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| "layer device: index_keys size overflows".to_owned())?;
+        let index_keys = alloc(index_keys_bytes.max(4), "index keys")?;
+        let latent_f32 = alloc(head_dim * 4, "latent_f32")?;
+        let wk_f32 = alloc(self.index_head_dim.max(1) * 4, "wk_f32")?;
+        let wk_bf16 = alloc(self.index_head_dim.max(1) * 2, "wk_bf16")?;
+        let weights_bf16 = alloc(self.index_n_heads.max(1) * 2, "weights_bf16")?;
+        let weights_f32 = alloc(self.index_n_heads.max(1) * 4, "weights_f32")?;
+        let q_index_f32 = alloc(
+            (self.index_n_heads * self.index_head_dim).max(1) * 4,
+            "q_index_f32",
+        )?;
+        let raw_selected_ids = alloc(self.index_topk.max(1) * 4, "raw_selected_ids")?;
+        let candidate_mask = alloc(
+            sparkflash_kernels::ref_select_launch::MASK_WORDS * 4,
+            "candidate_mask",
+        )?;
+        self.seam_ring = Some(SeamRing {
+            wkv,
+            wgate,
+            store_codes,
+            store_scales,
+            index_keys,
+            latent_f32,
+            wk_f32,
+            wk_bf16,
+            weights_bf16,
+            weights_f32,
+            q_index_f32,
+            raw_selected_ids,
+            candidate_mask,
+            rows,
+            head_dim,
+            total_bytes: allocated,
+        });
+        Ok(())
+    }
+
+    /// Uploads the Engram write stage's run-scope state and loads its six symbols.
+    ///
+    /// One H2D for the arena, one each for the constant matrices, and one allocation per scratch
+    /// span: the whole set is fixed for the run, so the stage's step has no allocation and no copy.
+    fn attach_engram(
+        &mut self,
+        kernel_dir: &std::path::Path,
+        host: &crate::engram_device_state::EngramHostState,
+    ) -> Result<(), String> {
+        use sparkflash_kernels::{
+            engram_convert_launch, engram_embed_launch, engram_gate_write_launch,
+            engram_wkv_launch, engram_write_launch,
+        };
+        let context = "layer device engram";
+        let cuda = self.cuda;
+        let (embed_cubin, _) = load_pinned_addition(kernel_dir, "engram_embed_sm121", context)?;
+        let (wkv_cubin, _) = load_pinned_addition(kernel_dir, "engram_wkv_sm121", context)?;
+        let (gate_cubin, _) = load_pinned_addition(kernel_dir, "engram_gate_write_sm121", context)?;
+        let (write_cubin, _) = load_pinned_addition(kernel_dir, "engram_write_sm121", context)?;
+        let (convert_cubin, _) =
+            load_pinned_addition(kernel_dir, "engram_stream_convert_sm121", context)?;
+        let (embed_module, embed) = engram_embed_launch::load(cuda, &embed_cubin)
+            .map_err(|error| format!("{context}: embed: {error}"))?;
+        let (wkv_module, wkv) = engram_wkv_launch::load(cuda, &wkv_cubin)
+            .map_err(|error| format!("{context}: wkv: {error}"))?;
+        let (gate_module, gate) = engram_gate_write_launch::load(cuda, &gate_cubin)
+            .map_err(|error| format!("{context}: gate: {error}"))?;
+        let (write_module, write) = engram_write_launch::load(cuda, &write_cubin)
+            .map_err(|error| format!("{context}: write: {error}"))?;
+        let (convert_module, narrow) = engram_convert_launch::load_narrow(cuda, &convert_cubin)
+            .map_err(|error| format!("{context}: narrow: {error}"))?;
+        let (_, widen) = engram_convert_launch::load_widen(cuda, &convert_cubin)
+            .map_err(|error| format!("{context}: widen: {error}"))?;
+
+        let layout = host.arena.layout();
+        let columns = layout.columns();
+        let head_dim = layout.head_dim();
+        let hc = self.hc_mult;
+        let dim = self.dim;
+        let mut allocated = 0usize;
+        let mut alloc = |bytes: usize, what: &str| -> Result<Deviceptr, String> {
+            cuda.alloc(bytes, &mut allocated)
+                .map_err(|error| format!("{context}: {what} buffer: {error}"))
+        };
+
+        let arena_bytes = host.arena.bytes().len();
+        let arena = alloc(arena_bytes, "row arena")?;
+        cuda.copy_htod(&arena, host.arena.bytes())
+            .map_err(|error| format!("{context}: arena upload: {error}"))?;
+        let product_bytes = hc * dim * 4;
+        let mut product = Vec::with_capacity(host.product.len());
+        for (slot, values) in host.product.iter().enumerate() {
+            if values.len() != hc * dim {
+                return Err(format!(
+                    "{context}: slot {slot} product has {} values, the {hc} x {dim} gate needs {}",
+                    values.len(),
+                    hc * dim
+                ));
+            }
+            let span = alloc(product_bytes, "gate product")?;
+            cuda.copy_htod(&span, &f32_le_bytes(values))
+                .map_err(|error| format!("{context}: product upload: {error}"))?;
+            product.push(span);
+        }
+        let mut wkv_weight = Vec::with_capacity(host.wkv_weight.len());
+        let mut wkv_weight_bytes = Vec::with_capacity(host.wkv_weight.len());
+        let mut wkv_scales = Vec::with_capacity(host.wkv_scales.len());
+        let mut wkv_scales_bytes = Vec::with_capacity(host.wkv_scales.len());
+        for bytes in &host.wkv_weight {
+            let span = alloc(bytes.len(), "wkv codes")?;
+            cuda.copy_htod(&span, bytes)
+                .map_err(|error| format!("{context}: wkv codes upload: {error}"))?;
+            wkv_weight.push(span);
+            wkv_weight_bytes.push(bytes.len());
+        }
+        for bytes in &host.wkv_scales {
+            let span = alloc(bytes.len(), "wkv scales")?;
+            cuda.copy_htod(&span, bytes)
+                .map_err(|error| format!("{context}: wkv scales upload: {error}"))?;
+            wkv_scales.push(span);
+            wkv_scales_bytes.push(bytes.len());
+        }
+        let fetched = alloc(columns * head_dim * 2, "fetched bf16")?;
+        let act_codes = alloc(columns * head_dim, "activation codes")?;
+        let act_scales = alloc(columns * head_dim.div_ceil(32), "activation scales")?;
+        let kv_bf16 = alloc((hc + 1) * dim * 2, "wkv output")?;
+        let hs_bf16 = alloc(hc * dim * 2, "stream bf16")?;
+        let value_f32 = alloc(dim * 4, "value row")?;
+        let gates = alloc(hc * 4, "gates")?;
+
+        self.engram = Some(EngramDevice {
+            layout,
+            layer_ids: host.layer_ids.clone(),
+            positions: host.arena.positions(),
+            arena,
+            arena_bytes,
+            skip: (0..host.arena.slots() * host.arena.positions())
+                .map(|index| {
+                    let slot = index / host.arena.positions();
+                    let position = index % host.arena.positions();
+                    host.arena.is_skipped(slot, position).unwrap_or(true)
+                })
+                .collect(),
+            product,
+            product_bytes: vec![product_bytes; host.product.len()],
+            wkv_weight,
+            wkv_weight_bytes,
+            wkv_scales,
+            wkv_scales_bytes,
+            fetched,
+            act_codes,
+            act_scales,
+            kv_bf16,
+            hs_bf16,
+            value_f32,
+            gates,
+            out_width: host.out_width,
+            inner: host.inner,
+            hc_mult: hc,
+            dim,
+            eps: host.eps,
+            kernels: EngramKernels {
+                embed,
+                wkv,
+                gate,
+                write,
+                narrow,
+                widen,
+                modules: vec![
+                    embed_module,
+                    wkv_module,
+                    gate_module,
+                    write_module,
+                    convert_module,
+                ],
+            },
+        });
+        Ok(())
+    }
+
     fn attach_reduce(&mut self, reduce: Option<DeviceReduce<'a>>) -> Result<(), String> {
         if self.reduce.is_some() {
             return Err(
@@ -11816,6 +13114,7 @@ impl<'a> DeviceLayer<'a> {
         span: crate::layer_device::DeviceSpan,
         values: &mut [f32],
     ) -> Result<(), String> {
+        self.refuse_read_while_collective_in_flight("an f32 row")?;
         if values.len() * 4 > span.len {
             return Err(format!(
                 "layer device: {} bytes out of the {} byte span the contract sized",
@@ -11836,6 +13135,34 @@ impl<'a> DeviceLayer<'a> {
             *slot = f32::from_le_bytes(*word);
         }
         Ok(())
+    }
+
+    /// Copies one device span back to host bytes, refusing while a collective is queued.
+    ///
+    /// The bf16 rows the diagnostic dumps need are not f32, so `copy_out` cannot serve them; this is
+    /// the same guarded read for a raw span. See [`Self::refuse_read_while_collective_in_flight`].
+    fn read_row_bytes(
+        &self,
+        span: crate::layer_device::DeviceSpan,
+        bytes: &mut [u8],
+        what: &str,
+    ) -> Result<(), String> {
+        self.refuse_read_while_collective_in_flight(what)?;
+        if bytes.len() > span.len {
+            return Err(format!(
+                "layer device: {} bytes out of the {} byte {what} span the contract sized",
+                bytes.len(),
+                span.len
+            ));
+        }
+        self.cuda
+            .copy_dtoh(bytes, &Deviceptr(span.device))
+            .map_err(|error| {
+                format!(
+                    "layer device: device to host {what} at {:#x}: {error}",
+                    span.device
+                )
+            })
     }
 }
 
@@ -11859,7 +13186,42 @@ impl Drop for DeviceLayer<'_> {
         if let Some(ring) = self.seam_trace.take() {
             self.cuda.free_host_mapped(&ring);
         }
-        self.cuda.free_buffers(&[&self.slab]);
+        // The two attention-half images and the two run-wide pools, freed beside the slab their
+        // launches read.
+        self.cuda.free(self.seq.0, &[]);
+        self.cuda.free(self.wo_a.0, &[]);
+        // The routed data path's staging buffers and pointer table: `release` frees its allocations
+        // and its five module handles (a cached module's free is a documented no-op).
+        if let Some(routed) = self.moe_routed_device.take() {
+            routed.release(self.cuda);
+        }
+        // The Engram stage's arena, constant matrices, scratch and six module handles.
+        if let Some(engram) = self.engram.take() {
+            engram.release(self.cuda);
+        }
+        if let Some(ring) = self.seam_ring.take() {
+            self.cuda.free_buffers(&[
+                &ring.wkv,
+                &ring.wgate,
+                &ring.store_codes,
+                &ring.store_scales,
+                &ring.index_keys,
+                &ring.latent_f32,
+                &ring.wk_f32,
+                &ring.wk_bf16,
+                &ring.weights_bf16,
+                &ring.weights_f32,
+                &ring.q_index_f32,
+                &ring.raw_selected_ids,
+                &ring.candidate_mask,
+            ]);
+        }
+        if let Some(latent) = self.seam_latent.take() {
+            let ptr = Deviceptr(latent.device);
+            self.cuda.free_buffers(&[&ptr]);
+        }
+        self.cuda
+            .free_buffers(&[&self.slab, &self.index_key_pool, &self.sink_pool]);
     }
 }
 
@@ -11876,46 +13238,46 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
     /// a refusal leaves the honest prefix (the stages that really ran) instead of the empty record
     /// `from_refusal` would build from the message alone.
     fn run_layer(&mut self, layer: usize, position: usize) -> Result<(), String> {
-        // Divergence rule (Lead's, and it governs every refusal in this loop): a stage refusal must
-        // be deterministic from the plan and the kernel set - identical on all four ranks - or it
-        // must happen at open. Every refusal on this branch is a missing symbol, a wrong span
-        // width, a missing producer word or a shape disagreement, i.e. a property of the plan, so
-        // all four ranks see it at open or at the same stage simultaneously. The rule exists so a
-        // mid-run divergence is a bug in a refusal, not a race to be tolerated: there is no abort
-        // handshake in the timed region, and an unanticipated abort (OOM, Xid, fault) is made
-        // detectable and void by the outer timeout, never tolerated.
         let mut runs = crate::layer_device::StageRuns::default();
+        let probe_on = probe::installed();
+        let layer_timer = BlockTimer::start(probe_on);
+        macro_rules! run_stage {
+            ($name:literal, $call:expr) => {{
+                let timer = BlockTimer::start(probe_on);
+                let res = $call;
+                probe::layer(self.cuda, layer, $name, timer);
+                runs.record($name, res)?;
+            }};
+        }
         let outcome = (|| {
-            runs.record("engram_write", self.engram_write(layer, position))?;
-            runs.record("mhc_entry", self.mhc_entry(layer, position))?;
-            runs.record("quantise_prologue", self.quantise_prologue(layer, position))?;
-            runs.record(
+            run_stage!("engram_write", self.engram_write(layer, position));
+            run_stage!("mhc_entry", self.mhc_entry(layer, position));
+            run_stage!("quantise_prologue", self.quantise_prologue(layer, position));
+            run_stage!(
                 "attention_projections",
-                self.attention_projections(layer, position),
-            )?;
-            runs.record("query_path", self.query_path(layer, position))?;
-            runs.record("kv_path", self.kv_path(layer, position))?;
-            runs.record("reference_seam", self.reference_seam(layer, position))?;
-            // The 20-stage contract's ref_select sits between the reference seam and the staging:
-            // it selects the compressed window ids the body consumes. This override must mirror
-            // `LayerStages::run_layer` exactly (STAGE_CONTRACTS is the order); omitting a stage here
-            // makes a row's frontier skip a refusal instead of naming it.
-            runs.record("ref_select", self.ref_select(layer, position))?;
-            runs.record("stage_attention", self.stage_attention(layer, position))?;
-            runs.record("attention_body", self.attention_body(layer, position))?;
-            runs.record("attention_output", self.attention_output(layer, position))?;
-            runs.record("all_reduce", self.all_reduce(layer, position))?;
-            runs.record(
+                self.attention_projections(layer, position)
+            );
+            run_stage!("query_path", self.query_path(layer, position));
+            run_stage!("kv_path", self.kv_path(layer, position));
+            run_stage!("reference_seam", self.reference_seam(layer, position));
+            run_stage!("ref_select", self.ref_select(layer, position));
+            run_stage!("stage_attention", self.stage_attention(layer, position));
+            run_stage!("attention_body", self.attention_body(layer, position));
+            run_stage!("attention_output", self.attention_output(layer, position));
+            run_stage!("all_reduce", self.all_reduce(layer, position));
+            run_stage!(
                 "attention_residual",
-                self.attention_residual(layer, position),
-            )?;
-            runs.record("ffn_seams", self.ffn_seams(layer, position))?;
-            runs.record("moe_router", self.moe_router(layer, position))?;
-            runs.record("moe_routed", self.moe_routed(layer, position))?;
-            runs.record("all_reduce_moe", self.all_reduce_moe(layer, position))?;
-            runs.record("moe_shared", self.moe_shared(layer, position))?;
-            runs.record("ffn_epilogue", self.ffn_epilogue(layer, position))
+                self.attention_residual(layer, position)
+            );
+            run_stage!("ffn_seams", self.ffn_seams(layer, position));
+            run_stage!("moe_router", self.moe_router(layer, position));
+            run_stage!("moe_routed", self.moe_routed(layer, position));
+            run_stage!("all_reduce_moe", self.all_reduce_moe(layer, position));
+            run_stage!("moe_shared", self.moe_shared(layer, position));
+            run_stage!("ffn_epilogue", self.ffn_epilogue(layer, position));
+            Ok(())
         })();
+        probe::layer(self.cuda, layer, "layer_total", layer_timer);
         self.runs = runs;
         outcome
     }
@@ -11957,11 +13319,181 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
         self.copy_in(self.buffers.residual.pre_mix, &seed)
     }
 
-    fn engram_write(&mut self, layer: usize, _position: usize) -> Result<(), String> {
+    /// The Engram write stage: six launches and zero copies, over the run-scope arena.
+    ///
+    /// The row gather and the activation quantiser left the step at open (`attach_engram`): this
+    /// body reads one arena entry, dequantises and requantises it, projects it with the layer's wkv
+    /// matrix, rounds the stream to the bf16 the gate reads, gates, widens the value row and writes
+    /// the stream in place - every operand already on the device.
+    fn engram_write(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        use sparkflash_kernels::cuda_driver::Deviceptr;
+        use sparkflash_kernels::{
+            engram_convert_launch::{self, EngramConvertParams, EngramConvertSpans},
+            engram_embed_launch::{self, EngramEmbedLaunchParams},
+            engram_gate_write_launch::{self, EngramGateWriteLaunchParams},
+            engram_wkv_launch::{self, EngramWkvLaunchParams},
+            engram_write_launch::{self, EngramWriteParams, EngramWriteSpans},
+        };
         if !self.engram_rows.contains(&layer) {
             return Ok(());
         }
-        Err(Self::refusal("engram_write"))
+        let engram = self.engram.as_ref().ok_or_else(|| {
+            "layer device stage engram_write: this layer has Engram rows but the run-scope arena was not built at open (attach_engram was not called)".to_string()
+        })?;
+        let slot = engram.layer_slot(layer)?;
+        if engram.is_skipped(slot, position)? {
+            // The dead-token rule, fixed at open: every rank skips the same positions, so the
+            // stage is a no-op here and no rank diverges.
+            return Ok(());
+        }
+        let layout = engram.layout;
+        let align = crate::engram_device_state::ARENA_ALIGN;
+        let entry = slot * engram.positions + position;
+        let base = engram.arena.0 + (entry * layout.stride()) as u64;
+        let codes = Deviceptr(base);
+        let scales = Deviceptr(base + (layout.codes_len().div_ceil(align) * align) as u64);
+        let layer_id = u32::try_from(layer).map_err(|_| {
+            format!("layer device stage engram_write: layer {layer} does not fit the trace's u32")
+        })?;
+        let step_seq = u64::try_from(position).map_err(|_| {
+            format!(
+                "layer device stage engram_write: position {position} does not fit the trace's u64"
+            )
+        })?;
+        let hc = engram.hc_mult;
+        let dim = engram.dim;
+        let stream = self.buffers.residual.stream;
+
+        // 1. The gathered rows -> the bf16 fetched row -> the E4M3/E8M0 activation row, one launch.
+        engram_embed_launch::launch(
+            self.cuda,
+            engram.kernels.embed,
+            &EngramEmbedLaunchParams {
+                row_codes: codes,
+                row_scales: scales,
+                fetched: engram.fetched,
+                act_codes: engram.act_codes,
+                act_scales: engram.act_scales,
+                rows_cols: u32::try_from(layout.columns()).map_err(|_| {
+                    "layer device stage engram_write: columns do not fit the embed ABI".to_string()
+                })?,
+                head_dim: u32::try_from(layout.head_dim()).map_err(|_| {
+                    "layer device stage engram_write: head_dim does not fit the embed ABI"
+                        .to_string()
+                })?,
+                trace_ring: 0,
+                layer_id,
+                step_seq,
+            },
+        )?;
+
+        // 2. The layer's W8A8 projection over that row: the key copies and the value row.
+        engram_wkv_launch::launch(
+            self.cuda,
+            engram.kernels.wkv,
+            &EngramWkvLaunchParams {
+                act_codes: engram.act_codes,
+                act_scales: engram.act_scales,
+                weight: engram.wkv_weight[slot],
+                weight_scales: engram.wkv_scales[slot],
+                out: engram.kv_bf16,
+                out_width: u32::try_from(engram.out_width).map_err(|_| {
+                    "layer device stage engram_write: the wkv output width does not fit".to_string()
+                })?,
+                inner: u32::try_from(engram.inner).map_err(|_| {
+                    "layer device stage engram_write: the wkv inner width does not fit".to_string()
+                })?,
+                trace_ring: 0,
+                layer_id,
+                step_seq,
+            },
+        )?;
+
+        // 3. The arm's f32 stream -> the bf16 the gate kernel reads (exact, bf16 round-to-nearest).
+        engram_convert_launch::launch_narrow(
+            self.cuda,
+            engram.kernels.narrow,
+            &EngramConvertParams {
+                src: Deviceptr(stream.device),
+                dst: engram.hs_bf16,
+                count: u32::try_from(hc * dim).map_err(|_| {
+                    "layer device stage engram_write: the stream width does not fit".to_string()
+                })?,
+            },
+            &EngramConvertSpans {
+                src_bytes: stream.len,
+                dst_bytes: hc * dim * 2,
+            },
+        )?;
+
+        // 4. The gate: the only host arithmetic the seam had left, on the device.
+        engram_gate_write_launch::launch(
+            self.cuda,
+            engram.kernels.gate,
+            &EngramGateWriteLaunchParams {
+                kv: engram.kv_bf16,
+                stream: engram.hs_bf16,
+                product: engram.product[slot],
+                out: engram.hs_bf16,
+                gates: engram.gates,
+                dim: u32::try_from(dim).map_err(|_| {
+                    "layer device stage engram_write: dim does not fit the gate ABI".to_string()
+                })?,
+                hc: u32::try_from(hc).map_err(|_| {
+                    "layer device stage engram_write: hc does not fit the gate ABI".to_string()
+                })?,
+                eps: engram.eps,
+                trace_ring: 0,
+                layer_id,
+                step_seq,
+            },
+        )?;
+
+        // 5. The wkv value tail -> f32 (exact widen) for the declared write.
+        engram_convert_launch::launch_widen(
+            self.cuda,
+            engram.kernels.widen,
+            &EngramConvertParams {
+                src: Deviceptr(engram.kv_bf16.0 + (hc * dim * 2) as u64),
+                dst: engram.value_f32,
+                count: u32::try_from(dim).map_err(|_| {
+                    "layer device stage engram_write: the value row width does not fit".to_string()
+                })?,
+            },
+            &EngramConvertSpans {
+                src_bytes: dim * 2,
+                dst_bytes: dim * 4,
+            },
+        )?;
+
+        // 6. The declared write: the stream plus gate * value, rounded once, in place.
+        engram_write_launch::launch(
+            self.cuda,
+            engram.kernels.write,
+            &EngramWriteParams {
+                stream: Deviceptr(stream.device),
+                gate: engram.gates,
+                value: engram.value_f32,
+                stream_out: Deviceptr(stream.device),
+                dim: u32::try_from(dim).map_err(|_| {
+                    "layer device stage engram_write: dim does not fit the write ABI".to_string()
+                })?,
+                copies: u32::try_from(hc).map_err(|_| {
+                    "layer device stage engram_write: copies do not fit the write grid".to_string()
+                })?,
+                trace_ring: 0,
+                layer_id,
+                step_seq,
+            },
+            &EngramWriteSpans {
+                stream_bytes: stream.len,
+                gate_bytes: hc * 4,
+                value_bytes: dim * 4,
+                stream_out_bytes: stream.len,
+            },
+        )?;
+        probe::count("engram_write");
+        Ok(())
     }
 
     fn mhc_entry(&mut self, layer: usize, position: usize) -> Result<(), String> {
@@ -12177,7 +13709,9 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
         // wq_b: inner = q_lora_rank (1,280), cols = the per-rank q width, out = q.
         self.launch_projection(2, "wq_b", layer, position)?;
         // The q rope tail, in place in q: one launch per head, out may alias the row.
-        self.rotate_q(layer, position)
+        self.rotate_q(layer, position)?;
+        probe::count("query_path");
+        Ok(())
     }
 
     fn kv_path(&mut self, layer: usize, position: usize) -> Result<(), String> {
@@ -12312,21 +13846,195 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
     }
 
     fn reference_seam(&mut self, layer: usize, position: usize) -> Result<(), String> {
-        // The seam is the compressor's window selection plus the compressed-id list. On the released
-        // ratio-0 layers (0 and 1) `attention_seam_step_with_backend` runs no compressor, reads no
-        // checkpoint tensor and returns the sliding window with an empty id list
-        // (attention.rs:2116-2166); there is no device work to schedule, so the stage is the slot
-        // arithmetic below and nothing crosses PCIe.
-        //
-        // Ratio > 0 is not wiring: the compressor's wkv/wgate and the indexer's wk / weights_proj are
-        // `AttentionHostSeam` in the plan (resident_weights.rs classifies that class as host-seam),
-        // so they are not bound into the arena and no device kernel can read them. Moving that class
-        // into the bind is the prerequisite, not a launch this body is missing.
         let ratio = self.compress_ratio.get(layer).copied().ok_or_else(|| {
             format!("layer device stage reference_seam: layer {layer} has no compress ratio")
         })?;
-        if ratio > 0 {
-            return Err(Self::refusal("reference_seam"));
+        self.seam_window_only = false;
+        if ratio > 0 && self.is_kv_source(layer) {
+            let owner_idx = self.owner_index_for(layer).ok_or_else(|| {
+                format!("layer device stage reference_seam: layer {layer} has no kv-source owner")
+            })?;
+            let (Some(staged), Some(kernels), Some(ring)) =
+                (self.seam_staged, self.seam_kernels, self.seam_ring)
+            else {
+                return Err(Self::refusal("reference_seam"));
+            };
+            let wkv = staged.wkv.ok_or_else(|| Self::refusal("reference_seam"))?;
+            let slot = position % ratio;
+            let row_bytes = u64::try_from(ring.head_dim * 4)
+                .map_err(|_| "layer device reference_seam: the ring row overflows".to_owned())?;
+            let owner_ring_bytes = row_bytes
+                .checked_mul(ring.rows as u64)
+                .ok_or_else(|| "layer device reference_seam: owner ring overflows".to_owned())?;
+            let owner_wkv_base = ring.wkv.0 + (owner_idx as u64) * owner_ring_bytes;
+            let owner_wgate_base = ring.wgate.0 + (owner_idx as u64) * owner_ring_bytes;
+            let offset = row_bytes
+                .checked_mul(slot as u64)
+                .ok_or_else(|| "layer device reference_seam: the ring slot overflows".to_owned())?;
+            let input = Deviceptr(self.buffers.residual.normed.device);
+            let mode = |mode| match mode {
+                sparkflash_kernels::hostw_gemv_launch::Mode::Bf16Weight => kernels[0],
+                sparkflash_kernels::hostw_gemv_launch::Mode::Bf16WeightF32Stores => kernels[1],
+                sparkflash_kernels::hostw_gemv_launch::Mode::F32WeightF32Stores => kernels[2],
+            };
+            launch_hostw_row(
+                self.cuda,
+                mode(wkv.1),
+                wkv.1,
+                input,
+                wkv.0,
+                Deviceptr(owner_wkv_base + offset),
+                u32::try_from(ring.head_dim).unwrap_or(u32::MAX),
+                u32::try_from(self.dim).unwrap_or(u32::MAX),
+                u32::try_from(layer).unwrap_or(u32::MAX),
+            )?;
+            if let Some((weight, wgate_mode)) = staged.wgate {
+                launch_hostw_row(
+                    self.cuda,
+                    mode(wgate_mode),
+                    wgate_mode,
+                    input,
+                    weight,
+                    Deviceptr(owner_wgate_base + offset),
+                    u32::try_from(ring.head_dim).unwrap_or(u32::MAX),
+                    u32::try_from(self.dim).unwrap_or(u32::MAX),
+                    u32::try_from(layer).unwrap_or(u32::MAX),
+                )?;
+            }
+            if (position + 1).is_multiple_of(ratio) {
+                let unnormed_f32 = if ratio == 1 {
+                    Deviceptr(owner_wkv_base + offset)
+                } else {
+                    let kernel = self
+                        .seam_pool
+                        .ok_or_else(|| Self::refusal("reference_seam"))?;
+                    let first = (position + 1 - ratio) % ring.rows;
+                    if first + ratio > ring.rows {
+                        return Err(format!(
+                            "layer device stage reference_seam: layer {layer} position {position} needs {ratio} contiguous ring rows from slot {first}, but the ring holds {}; the pool cannot wrap",
+                            ring.rows
+                        ));
+                    }
+                    let rows_offset = row_bytes.checked_mul(first as u64).ok_or_else(|| {
+                        "layer device reference_seam: the grouped rows overflow".to_owned()
+                    })?;
+                    let kv = Deviceptr(owner_wkv_base + rows_offset);
+                    let score = Deviceptr(owner_wgate_base + rows_offset);
+                    let pooled = Deviceptr(self.buffers.workspace.seam_row.device);
+                    let pool = sparkflash_kernels::pool_group_launch::PoolGroupParams {
+                        kv,
+                        score,
+                        dest: pooled,
+                        ratio: u32::try_from(ratio).unwrap_or(u32::MAX),
+                        head_dim: u32::try_from(ring.head_dim).unwrap_or(u32::MAX),
+                    };
+                    let spans = sparkflash_kernels::pool_group_launch::PoolGroupSpans {
+                        kv_bytes: ratio * ring.head_dim * 4,
+                        score_bytes: ratio * ring.head_dim * 4,
+                        dest_bytes: ring.head_dim * 4,
+                    };
+                    sparkflash_kernels::pool_group_launch::launch(
+                        self.cuda, kernel, &pool, &spans,
+                    )?;
+                    pooled
+                };
+                let (norm_weight, norm_bytes) = staged.compressor_norm.ok_or_else(|| {
+                    format!(
+                        "layer device stage reference_seam: layer {layer} has no staged compressor norm weight"
+                    )
+                })?;
+                let latent =
+                    self.seam_latent_norm(layer, position, unnormed_f32, norm_weight, norm_bytes)?;
+                let first_row = position / ratio;
+                let rope_pos = first_row * ratio;
+                // Index key path (`write_index_keys` in attention.rs:2831-2935): runs on the
+                // pre-RoPE normed latent.
+                let widen = self.seam_widen.ok_or_else(|| {
+                    "layer device stage reference_seam: widen symbol not loaded".to_owned()
+                })?;
+                let k_norm_kernel = self.seam_k_norm.ok_or_else(|| {
+                    "layer device stage reference_seam: k_norm symbol not loaded".to_owned()
+                })?;
+                let fp4_rt = self.seam_fp4_round_trip.ok_or_else(|| {
+                    "layer device stage reference_seam: fp4_round_trip symbol not loaded".to_owned()
+                })?;
+                let wk_weight = staged.index_wk.ok_or_else(|| {
+                    format!(
+                        "layer device stage reference_seam: layer {layer} has no staged indexer.wk"
+                    )
+                })?;
+                let (k_norm_weight, _) = staged.index_k_norm.ok_or_else(|| {
+                    format!("layer device stage reference_seam: layer {layer} has no staged indexer.k_norm")
+                })?;
+                let width = self.head_width as usize;
+                sparkflash_kernels::engram_convert_launch::launch_widen(
+                    self.cuda,
+                    widen,
+                    &sparkflash_kernels::engram_convert_launch::EngramConvertParams {
+                        src: latent,
+                        dst: ring.latent_f32,
+                        count: u32::try_from(width).unwrap_or(u32::MAX),
+                    },
+                    &sparkflash_kernels::engram_convert_launch::EngramConvertSpans {
+                        src_bytes: width * 2,
+                        dst_bytes: width * 4,
+                    },
+                )?;
+                launch_hostw_row(
+                    self.cuda,
+                    kernels[1],
+                    sparkflash_kernels::hostw_gemv_launch::Mode::Bf16WeightF32Stores,
+                    ring.latent_f32,
+                    wk_weight,
+                    ring.wk_f32,
+                    u32::try_from(self.index_head_dim).unwrap_or(u32::MAX),
+                    self.head_width,
+                    u32::try_from(layer).unwrap_or(u32::MAX),
+                )?;
+                sparkflash_kernels::pool_group_launch::launch_k_norm(
+                    self.cuda,
+                    k_norm_kernel,
+                    ring.wk_f32,
+                    k_norm_weight,
+                    ring.wk_bf16,
+                    u32::try_from(self.index_head_dim).unwrap_or(u32::MAX),
+                    self.eps,
+                )?;
+                let pairs = usize::try_from(self.rope_pairs).unwrap_or(0);
+                let table_bytes = self.max_positions * pairs * 4;
+                let rope_offset = rope_pos * pairs * 4;
+                let rope_span = self.buffers.workspace.rope_tables_compressed;
+                crate::layer_attention_stages::launch_forward_rope(
+                    self.cuda,
+                    self.kernels.rope_rows,
+                    ring.wk_bf16,
+                    Deviceptr(rope_span.device + rope_offset as u64),
+                    Deviceptr(rope_span.device + (table_bytes + rope_offset) as u64),
+                    1,
+                    u32::try_from(self.index_head_dim).unwrap_or(u32::MAX),
+                    self.rope_head_dim,
+                    self.seam_trace_ring(),
+                    u32::try_from(layer).unwrap_or(u32::MAX),
+                    u64::try_from(position).unwrap_or(0),
+                )?;
+                let key_dst = Deviceptr(
+                    ring.index_keys.0
+                        + ((owner_idx * self.max_positions + first_row) * self.index_head_dim * 4)
+                            as u64,
+                );
+                sparkflash_kernels::pool_group_launch::launch_fp4_round_trip(
+                    self.cuda,
+                    fp4_rt,
+                    ring.wk_bf16,
+                    key_dst,
+                    u32::try_from(self.index_head_dim / 32).unwrap_or(u32::MAX),
+                )?;
+
+                // Compressed KV cache path (`write_compressed_cache` in attention.rs:2943-3007):
+                // rotates `latent` at `rope_pos = first_row * ratio`, widens to f32, and appends.
+                self.seam_latent_rope(layer, rope_pos, latent)?;
+                self.seam_append_group(layer, position, latent, ratio, owner_idx)?;
+            }
         }
         let window = sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW;
         let window_rows = (position + 1).min(window);
@@ -12335,34 +14043,208 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
                 "layer device stage reference_seam: position {position} has an empty sliding window"
             ));
         }
-        // The ring is linear on this arm: kv_path writes slot == position and the run sizes the ring
-        // at max_positions rows, so the window is the contiguous run that ends at this position.
         let window_start = position + 1 - window_rows;
         self.attn_window = AttentionWindow {
             window_rows,
             window_start,
             selected_count: 0,
         };
+        probe::count("reference_seam");
         Ok(())
     }
 
     fn ref_select(&mut self, layer: usize, position: usize) -> Result<(), String> {
-        // The candidate select consumes the indexer's keys and per-query weights - the same
-        // `AttentionHostSeam` class `reference_seam` refuses above - and at ratio 0 there is no
-        // select at all: the seam's id list is empty (attention.rs:2164-2166). So the stage has no
-        // work, and inventing a launch here would be a second arithmetic the host rule does not have.
         let ratio = self.compress_ratio.get(layer).copied().ok_or_else(|| {
             format!("layer device stage ref_select: layer {layer} has no compress ratio")
         })?;
-        if ratio > 0 {
-            return Err(Self::refusal("ref_select"));
-        }
         if self.attn_window.window_rows == 0 {
             return Err(format!(
                 "layer device stage ref_select: layer {layer} position {position} ran before reference_seam published its window; the two stages stay ordered"
             ));
         }
-        self.attn_window.selected_count = 0;
+        if ratio == 0 {
+            self.attn_window.selected_count = 0;
+            probe::count("ref_select");
+            return Ok(());
+        }
+        let n_pos = (position + 1).checked_div(ratio).ok_or_else(|| {
+            format!("layer device stage ref_select: layer {layer} has a zero compress ratio")
+        })?;
+        if n_pos == 0 {
+            self.attn_window.selected_count = 0;
+            probe::count("ref_select");
+            return Ok(());
+        }
+        let keep = self.index_topk.min(n_pos);
+        if !self.is_index_source(layer) {
+            // Non-index-source layers reuse `workspace.selected` and `keep` from the preceding
+            // index_source layer (attention.rs:1851-1865).
+            self.attn_window.selected_count = keep;
+            probe::count("ref_select");
+            return Ok(());
+        }
+        let owner_idx = self.owner_index_for(layer).ok_or_else(|| {
+            format!("layer device stage ref_select: layer {layer} has no kv-source owner")
+        })?;
+        let (Some(staged), Some(kernels), Some(ring)) =
+            (self.seam_staged, self.seam_kernels, self.seam_ring)
+        else {
+            return Err(Self::refusal("ref_select"));
+        };
+        let scale_weights_kernel = self
+            .seam_scale_weights
+            .ok_or_else(|| Self::refusal("ref_select"))?;
+        let fp4_rt = self
+            .seam_fp4_round_trip
+            .ok_or_else(|| Self::refusal("ref_select"))?;
+        let ref_select_kernel = self
+            .seam_ref_select
+            .ok_or_else(|| Self::refusal("ref_select"))?;
+        let selected_fill_kernel = self
+            .seam_selected_fill
+            .ok_or_else(|| Self::refusal("ref_select"))?;
+        let weights_proj = staged
+            .weights_proj
+            .ok_or_else(|| Self::refusal("ref_select"))?;
+        let (wq_b_weight, wq_b_scales) = staged
+            .indexer_wq_b
+            .ok_or_else(|| Self::refusal("ref_select"))?;
+
+        // 1. Per-query index head weights: weights_proj -> bf16 * (1/64) -> bf16_round -> f32.
+        launch_hostw_row(
+            self.cuda,
+            kernels[0],
+            sparkflash_kernels::hostw_gemv_launch::Mode::Bf16Weight,
+            Deviceptr(self.buffers.residual.normed.device),
+            weights_proj,
+            ring.weights_bf16,
+            u32::try_from(self.index_n_heads).unwrap_or(u32::MAX),
+            u32::try_from(self.dim).unwrap_or(u32::MAX),
+            u32::try_from(layer).unwrap_or(u32::MAX),
+        )?;
+        let factor = ((self.index_head_dim as f64).powf(-0.5)
+            * (self.index_n_heads as f64).powf(-0.5)) as f32;
+        sparkflash_kernels::pool_group_launch::launch_scale_index_weights(
+            self.cuda,
+            scale_weights_kernel,
+            ring.weights_bf16,
+            ring.weights_f32,
+            factor,
+            u32::try_from(self.index_n_heads).unwrap_or(u32::MAX),
+        )?;
+
+        // 2. Indexer query: quantise q_normed -> indexer.wq_b -> forward RoPE across 32 heads -> FP4 round-trip.
+        let q_lora_cols = self.projections[0].cols;
+        {
+            use sparkflash_kernels::layer_seams_launch as seams;
+            let row = self.buffers.workspace.q_normed;
+            let params = seams::PrologueBf16Params {
+                normed: Deviceptr(row.device),
+                codes: Deviceptr(self.buffers.workspace.act_codes.device),
+                scales: Deviceptr(self.buffers.workspace.act_scales.device),
+                cols: q_lora_cols,
+                rows: 1,
+                trace_ring: self.seam_trace_ring(),
+                layer_id: u32::try_from(layer).unwrap_or(u32::MAX),
+                step_seq: u64::try_from(position).unwrap_or(0),
+            };
+            seams::launch_prologue_bf16(self.cuda, self.kernels.prologue_bf16, &params)?;
+        }
+        let q_index_cols = self.index_n_heads * self.index_head_dim;
+        let wq_b_params = sparkflash_kernels::mxfp8_dense_launch::Mxfp8DenseParams::new(
+            Deviceptr(self.buffers.workspace.act_codes.device),
+            Deviceptr(self.buffers.workspace.act_scales.device),
+            wq_b_weight,
+            wq_b_scales,
+            Deviceptr(self.buffers.workspace.index_query.device),
+            1,
+            u32::try_from(q_index_cols).unwrap_or(u32::MAX),
+            q_lora_cols,
+            self.seam_trace_ring(),
+            u32::try_from(layer).unwrap_or(u32::MAX),
+            u64::try_from(position).unwrap_or(0),
+        );
+        sparkflash_kernels::mxfp8_gemv_launch::launch(self.cuda, self.gemv.1, &wq_b_params)?;
+        let pairs = usize::try_from(self.rope_pairs).unwrap_or(0);
+        let table_bytes = self.max_positions * pairs * 4;
+        let rope_offset = position * pairs * 4;
+        let rope_span = self.buffers.workspace.rope_tables_compressed;
+        crate::layer_attention_stages::launch_forward_rope(
+            self.cuda,
+            self.kernels.rope_rows,
+            Deviceptr(self.buffers.workspace.index_query.device),
+            Deviceptr(rope_span.device + rope_offset as u64),
+            Deviceptr(rope_span.device + (table_bytes + rope_offset) as u64),
+            u32::try_from(self.index_n_heads).unwrap_or(u32::MAX),
+            u32::try_from(self.index_head_dim).unwrap_or(u32::MAX),
+            self.rope_head_dim,
+            self.seam_trace_ring(),
+            u32::try_from(layer).unwrap_or(u32::MAX),
+            u64::try_from(position).unwrap_or(0),
+        )?;
+        sparkflash_kernels::pool_group_launch::launch_fp4_round_trip(
+            self.cuda,
+            fp4_rt,
+            Deviceptr(self.buffers.workspace.index_query.device),
+            ring.q_index_f32,
+            u32::try_from(q_index_cols / 32).unwrap_or(u32::MAX),
+        )?;
+
+        // 3. Candidate selection (`ref_select_sm121`) + expanded store row mapping (`compressed_selected_fill_sm121`).
+        let keys_ptr = Deviceptr(
+            ring.index_keys.0 + (owner_idx * self.max_positions * self.index_head_dim * 4) as u64,
+        );
+        let mask_ptr = ring.candidate_mask;
+        let (mask_mode, mask_in, mask_out) = if layer == self.candidate_source_layer {
+            (2u32, Deviceptr(0), mask_ptr)
+        } else if layer > self.candidate_source_layer {
+            (1u32, mask_ptr, Deviceptr(0))
+        } else {
+            (0u32, Deviceptr(0), Deviceptr(0))
+        };
+        let window_offset = u32::try_from(self.attn_window.window_rows).unwrap_or(u32::MAX);
+        let select_params = sparkflash_kernels::ref_select_launch::RefSelectParams::new(
+            ring.q_index_f32,
+            keys_ptr,
+            ring.weights_f32,
+            ring.raw_selected_ids,
+            Deviceptr(0),
+            mask_in,
+            mask_out,
+            u32::try_from(n_pos).unwrap_or(u32::MAX),
+            u32::try_from(self.index_n_heads).unwrap_or(u32::MAX),
+            u32::try_from(self.index_head_dim).unwrap_or(u32::MAX),
+            u32::try_from(n_pos).unwrap_or(u32::MAX),
+            u32::try_from(self.index_topk).unwrap_or(u32::MAX),
+            window_offset,
+            mask_mode,
+            u32::try_from(self.candidate_topk_blocks).unwrap_or(u32::MAX),
+            u32::try_from(self.candidate_block_size).unwrap_or(u32::MAX),
+            u32::MAX,
+            0,
+        );
+        self.cuda.launch(
+            ref_select_kernel,
+            (1, 1, 1),
+            sparkflash_kernels::ref_select_launch::BLOCK,
+            &select_params.words(),
+        )?;
+        let fill_params = sparkflash_kernels::compressed_append_launch::SelectParams {
+            ids: ring.raw_selected_ids.0,
+            n_ids: u32::try_from(keep).unwrap_or(u32::MAX),
+            window_rows: window_offset,
+            ratio: u32::try_from(ratio).unwrap_or(u32::MAX),
+            out: self.buffers.workspace.selected.device,
+            out_count: 0,
+        };
+        self.cuda.launch(
+            selected_fill_kernel,
+            (1, 1, 1),
+            sparkflash_kernels::compressed_append_launch::BLOCK,
+            &fill_params.words(),
+        )?;
+        self.attn_window.selected_count = keep;
+        probe::count("ref_select");
         Ok(())
     }
 
@@ -12407,15 +14289,218 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
                 window.selected_count
             ));
         }
+        probe::count("stage_attention");
         Ok(())
     }
 
-    fn attention_body(&mut self, _layer: usize, _position: usize) -> Result<(), String> {
-        Err(Self::refusal("attention_body"))
+    fn attention_body(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        use crate::layer_attention_stages::{
+            BodyOperands, body_params, launch_attention_body, launch_inverse_rope,
+        };
+        // Two launches, no readback (docs/archive/build/s1-p2-attention-wiring.md §A.4): the CSA2
+        // sequence entry over the window ring and the compressed store (empty at ratio 0, so only
+        // the ring is read), then the inverse rope over each head row's rope tail in place. The host
+        // twin's four H2Ds, its launch, its D2H, its host inverse rope and its finite scan are the
+        // work this stage replaces.
+        let ratio = self.compress_ratio.get(layer).copied().ok_or_else(|| {
+            format!("layer device stage attention_body: layer {layer} has no compress ratio")
+        })?;
+        let window = self.attn_window;
+        let window_rows = u32::try_from(window.window_rows).map_err(|_| {
+            "layer device stage attention_body: the window row count does not fit u32".to_owned()
+        })?;
+        if window_rows == 0 {
+            return Err(format!(
+                "layer device stage attention_body: layer {layer} position {position} has no published window; stage_attention must run first"
+            ));
+        }
+        let selected_count = u32::try_from(window.selected_count).map_err(|_| {
+            "layer device stage attention_body: the selected count does not fit u32".to_owned()
+        })?;
+        let position_u32 = u32::try_from(position).map_err(|_| {
+            format!("layer device stage attention_body: position {position} does not fit u32")
+        })?;
+        let layer_id = u32::try_from(layer).map_err(|_| {
+            format!("layer device stage attention_body: layer {layer} does not fit u32")
+        })?;
+        let step_seq = u64::try_from(position).map_err(|_| {
+            format!("layer device stage attention_body: position {position} does not fit u64")
+        })?;
+        // The window's first row: the ring is linear on this arm, so the window is the contiguous
+        // run ending at this position and its first slot is `window_start`. Both addresses name the
+        // layer's own ring subclass, never another layer's.
+        let slot = self.kv_ring.slot_for(window.window_start);
+        let ring_layer = self.kv_ring_base + self.kv_ring.layer_offset(layer) as u64;
+        let window_codes = ring_layer + self.kv_ring.codes_offset(slot)? as u64;
+        let window_scales = ring_layer + self.kv_ring.scales_offset(slot)? as u64;
+        let sink_stride = self.out_geometry.heads_per_rank * 4;
+        let sink_at = layer
+            .checked_mul(sink_stride)
+            .and_then(|at| at.checked_add(sink_stride))
+            .filter(|end| *end <= self.sink_pool_bytes)
+            .map(|_| self.sink_pool.0 + (layer * sink_stride) as u64)
+            .ok_or_else(|| {
+                format!(
+                    "layer device stage attention_body: layer {layer}'s sink row [{}, {}) is outside the {} B run pool",
+                    layer * sink_stride,
+                    layer * sink_stride + sink_stride,
+                    self.sink_pool_bytes
+                )
+            })?;
+        let workspace = self.buffers.workspace;
+        let (kv_fp4, kv_scales) = if ratio > 0 {
+            let owner_idx = self.owner_index_for(layer).ok_or_else(|| {
+                format!("layer device stage attention_body: layer {layer} has no kv-source owner")
+            })?;
+            let ring = self.seam_ring.ok_or_else(|| {
+                "layer device stage attention_body: no seam ring allocated".to_owned()
+            })?;
+            let code_bytes = sparkflash_kernels::attention_operands::STORE_CODE_BYTES;
+            let scale_bytes = sparkflash_kernels::attention_operands::STORE_SCALE_BYTES;
+            (
+                crate::layer_device::DeviceSpan::new(
+                    ring.store_codes.0 + (owner_idx * code_bytes) as u64,
+                    code_bytes,
+                ),
+                crate::layer_device::DeviceSpan::new(
+                    ring.store_scales.0 + (owner_idx * scale_bytes) as u64,
+                    scale_bytes,
+                ),
+            )
+        } else {
+            (workspace.store_codes, workspace.store_scales)
+        };
+        let operands = BodyOperands {
+            q: workspace.q,
+            kv_fp4,
+            kv_scales,
+            window_codes: Deviceptr(window_codes),
+            window_scales: Deviceptr(window_scales),
+            window_rows,
+            selected: workspace.selected,
+            selected_count,
+            index_key: crate::layer_device::DeviceSpan::new(
+                self.index_key_pool.0,
+                self.index_key_bytes,
+            ),
+            index_query: workspace.index_query,
+            sink: crate::layer_device::DeviceSpan::new(sink_at, sink_stride),
+            block_scores: workspace.block_scores,
+            block_best: workspace.block_best,
+            out: workspace.attn_body_bf16,
+            position: position_u32,
+            heads_per_rank: self.heads_per_rank,
+            head_width: self.head_width,
+            trace_ring: self.seam_trace_ring(),
+            layer_id,
+            step_seq,
+        };
+        // The module's word builder is the ABI check (the 19-word order, the 640-row union bound,
+        // the index-pool position bound) before the launch.
+        body_params(&operands)
+            .map_err(|error| format!("layer device stage attention_body: {error}"))?;
+        launch_attention_body(self.cuda, self.seq.1, &operands)
+            .map_err(|error| format!("layer device stage attention_body: {error}"))?;
+        // The inverse rope over the head rows' rope tails, in place: the reference rotates the
+        // sparse out's tail back before wo_a (model.py:772), and the kernel is the seam image's
+        // `rope_rotate_rows_bf16` with sin_sign = -1.
+        if position >= self.max_positions {
+            return Err(format!(
+                "layer device stage attention_body: position {position} is outside the {}-position rope tables sized at open; extend max_positions rather than clamping",
+                self.max_positions
+            ));
+        }
+        let rope_span = if ratio > 0 {
+            workspace.rope_tables_compressed
+        } else {
+            workspace.rope_tables_plain
+        };
+        let pairs = usize::try_from(self.rope_pairs).map_err(|_| {
+            "layer device stage attention_body: the rope pair count overflows".to_owned()
+        })?;
+        let table_bytes = self
+            .max_positions
+            .checked_mul(pairs)
+            .and_then(|values| values.checked_mul(4))
+            .ok_or_else(|| {
+                "layer device stage attention_body: the rope table offset overflows".to_owned()
+            })?;
+        let offset = position
+            .checked_mul(pairs)
+            .and_then(|values| values.checked_mul(4))
+            .ok_or_else(|| {
+                "layer device stage attention_body: the rope position offset overflows".to_owned()
+            })?;
+        launch_inverse_rope(
+            self.cuda,
+            self.kernels.rope_rows,
+            Deviceptr(workspace.attn_body_bf16.device),
+            Deviceptr(rope_span.device + offset as u64),
+            Deviceptr(rope_span.device + (table_bytes + offset) as u64),
+            self.heads_per_rank,
+            self.head_width,
+            self.rope_head_dim,
+            self.seam_trace_ring(),
+            layer_id,
+            step_seq,
+        )
+        .map_err(|error| format!("layer device stage attention_body: {error}"))?;
+        probe::count("attention_body");
+        Ok(())
     }
 
-    fn attention_output(&mut self, _layer: usize, _position: usize) -> Result<(), String> {
-        Err(Self::refusal("attention_output"))
+    fn attention_output(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        use crate::layer_attention_stages::{OutputOperands, launch_attention_output};
+        // Three device-to-device launches, no readback (docs/archive/build/s1-p2-attention-wiring.md
+        // §A.5): wo_a over the body's rotated row, the wo_b activation quantiser over wo_a's output,
+        // and the wo_b GEMV over the plan's shard. The result is this rank's partial row: the
+        // collective is stage 12's and the residual stage 13's, so this stage must not reduce.
+        // No ratio dependence: the three launches read this layer's wo_a/wo_b bind and the body's
+        // row, both of which exist for every layer, so the same code serves ratio 0 and above. The
+        // gate that used to stop ratio>0 layers here was conservatism, not an operand gap.
+        let bind = self.attention.ok_or_else(|| {
+            "layer device stage attention_output: the open had no attention bind, so the wo_a/wo_b shards have no device addresses".to_owned()
+        })?;
+        let lookup = |name: &str| -> Result<(Deviceptr, Deviceptr), String> {
+            bind.pointers.get(name).copied().ok_or_else(|| {
+                format!("layer device stage attention_output: the bind has no {name}")
+            })
+        };
+        let wo_a = lookup(&format!("layers.{layer}.attn.wo_a.weight"))?;
+        let wo_b = lookup(&format!("layers.{layer}.attn.wo_b.weight"))?;
+        let layer_id = u32::try_from(layer).map_err(|_| {
+            format!("layer device stage attention_output: layer {layer} does not fit u32")
+        })?;
+        let step_seq = u64::try_from(position).map_err(|_| {
+            format!("layer device stage attention_output: position {position} does not fit u64")
+        })?;
+        let workspace = self.buffers.workspace;
+        let geometry = self.out_geometry;
+        let operands = OutputOperands {
+            attn_bf16: workspace.attn_body_bf16,
+            lo_out: workspace.attn_lo,
+            act_codes: workspace.act_codes,
+            act_scales: workspace.act_scales,
+            wo_b_out: workspace.attn_out_bf16,
+            wo_a,
+            wo_b,
+            wo_a_shape: geometry.wo_a_shape(),
+            wo_b_shape: geometry.wo_b_shape(),
+            geometry,
+            trace_ring: self.seam_trace_ring(),
+            layer_id,
+            step_seq,
+        };
+        launch_attention_output(
+            self.cuda,
+            self.wo_a.1,
+            self.kernels.prologue_bf16,
+            self.gemv.1,
+            &operands,
+        )
+        .map_err(|error| format!("layer device stage attention_output: {error}"))?;
+        probe::count("attention_output");
+        Ok(())
     }
 
     fn all_reduce(&mut self, layer: usize, position: usize) -> Result<(), String> {
@@ -12683,8 +14768,50 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
         Ok(())
     }
 
-    fn moe_routed(&mut self, _layer: usize, _position: usize) -> Result<(), String> {
-        Err(Self::refusal("moe_routed"))
+    fn moe_routed(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        use sparkflash_kernels::moe_routed_device::{DeviceSpan, MoeRoutedOperands};
+        // The ids are this position's only if the router ran since this stage last looked: the same
+        // freshness rule `moe_router` applies to `ffn_seams`, for the same reason — stale ids produce
+        // plausible, wrong routing, and therefore a plausible, wrong delta that no later stage can
+        // detect.
+        let now = probe::stage_count("moe_router");
+        if now == self.moe_router_seen {
+            return Err(format!(
+                "layer device stage moe_routed (layer {layer}, position {position}): moe_router has \
+                 not run since this stage last ran (probe count unchanged at {now}), so this \
+                 position's ids are not on device"
+            ));
+        }
+        self.moe_router_seen = now;
+        let Some(device) = self.moe_routed_device.as_ref() else {
+            return Err(format!(
+                "layer device stage moe_routed (layer {layer}, position {position}): the routed data \
+                 path was not opened at setup (attach_moe_routed was not called, or the run resolved \
+                 no resident routed shards); refusing rather than launch the staged kernels without \
+                 the expert pointer table"
+            ));
+        };
+        let workspace = self.buffers.workspace;
+        // Two `DeviceSpan` types meet here: the arm's carved span (`device: u64`, `len: usize`) and
+        // the kernels crate's operand span (`device: Deviceptr`, `bytes`). This closure is the only
+        // conversion between them, and it keeps the carved length so the module can refuse a short
+        // span by its workspace name.
+        let to_operand = |carved: crate::layer_device::DeviceSpan| {
+            DeviceSpan::new(Deviceptr(carved.device), carved.len)
+        };
+        let operands = MoeRoutedOperands {
+            act_codes: to_operand(workspace.act_codes),
+            act_scales: to_operand(workspace.act_scales),
+            ids: to_operand(workspace.moe_ids),
+            weights: to_operand(workspace.moe_weights),
+            delta_f32: to_operand(workspace.moe_delta),
+            delta_bf16: to_operand(workspace.moe_delta_bf16),
+        };
+        // One token per stage call: the carved spans are one row wide, and the plan's capacity is
+        // that row's top_k. `run` checks every span and refuses a short one by name.
+        device.run(self.cuda, layer, position, 1, &operands)?;
+        probe::count("moe_routed");
+        Ok(())
     }
 
     fn moe_shared(&mut self, layer: usize, position: usize) -> Result<(), String> {
@@ -13534,6 +15661,23 @@ fn run_forward_loop(
     // the arm: the host-bridge reduce is not a selectable path in this loop yet, so nothing inherits
     // its allowance by accident. An undeclared run is held to the logits-only count, and a boundary
     // copy fails the step by name instead of quietly widening the bar.
+    // The Engram write stage's host operands that are pure functions of the token history: the
+    // gathered 24-row entry per (layer, position) is read once here, before the first clock, so the
+    // step's engram stage has no table read and no gather. Pure prewarm: it changes no arithmetic
+    // (the same rows reach the same kernels in the same order) and no host-arm behaviour.
+    let engram_host = if layer_arm.is_device() && !config.engram_layer_ids.is_empty() {
+        match engram_resident.as_ref() {
+            Some(resident) => Some(crate::engram_device_state::build_host_state(
+                config,
+                resident as &dyn sparkflash_engine::weights::WeightSource,
+                request.prompt_tokens,
+                total_positions,
+            )?),
+            None => None,
+        }
+    } else {
+        None
+    };
     let step_bridge = crate::device_counters::HostBridgeReduce::Disabled;
     let mut step_counters = crate::device_counters::DeviceStepCounters::new();
     let mut device_frontier: Option<String> = None;
@@ -13546,6 +15690,7 @@ fn run_forward_loop(
             total_positions,
             bound.as_ref().map(|(_arena, bind)| &bind.attention),
             bound.as_ref().map(|(_arena, bind)| &bind.mhc_seam),
+            bound.map(|(arena, _bind)| arena),
             request.resident_plan,
             request.native_rounding.mhc,
         )?)
@@ -13573,6 +15718,26 @@ fn run_forward_loop(
         if let Some(bind) = bound.as_ref().map(|(_arena, bind)| bind) {
             device.attach_routed(bind, request.rank)?;
             device.attach_router(bind)?;
+            // The routed data path needs both: `attach_routed` for the arena pointers and the
+            // kernels for the launches. It allocates its 9.8 MiB staging state once, here, before
+            // the first clock.
+            device.attach_moe_routed()?;
+            device.attach_seam_ring()?;
+            if let Some(seam) = seam_wq_b.as_ref() {
+                device.set_seam_kernels(seam.hostw_symbols());
+            }
+            let pool_dir = request.kernel_cubin_dir.ok_or_else(|| {
+                "layer device: the pool kernel needs the staged cubin directory".to_owned()
+            })?;
+            device.attach_seam_pool(pool_dir)?;
+        }
+        // The Engram write stage's run-scope state: the arena, the constant matrices and the six
+        // symbols, all uploaded/loaded here so the first position's clock sees no setup work.
+        if let Some(host) = engram_host.as_ref() {
+            let kernel_dir = request.kernel_cubin_dir.ok_or_else(|| {
+                "layer device: the Engram write stage needs the staged cubin directory".to_owned()
+            })?;
+            device.attach_engram(kernel_dir, host)?;
         }
     }
     let loop_total_timer = BlockTimer::start(probe_on);
@@ -13643,6 +15808,7 @@ fn run_forward_loop(
             // residual_out crosses PCIe: no host quantise, no host SIMD seam, no host reduce
             // machinery, no host MoE router or combine, and no per-stage observation read.
             if let Some(device) = layer_device.as_mut() {
+                device.set_seam_weights(seam_wq_b.as_ref().and_then(|seam| seam.staged_for(layer)));
                 if let Err(error) = device.run_layer(layer, position) {
                     // The frontier is emitted before the run aborts: a probe row whose frontier
                     // exists only in stderr is not machine-readable, and the row that stops here is
@@ -13707,7 +15873,59 @@ fn run_forward_loop(
                     device_frontier = Some(summary);
                 }
                 layers_completed = layer + 1;
-                continue;
+                // The reduce's operands, so the D51 reduction can be attributed offline: this
+                // writes the pre-reduce partial and the post-reduce delta of both collectives, per
+                // rank, and nothing reads them back here. With the four ranks' partials in hand the
+                // canonical ascending-rank reduction can be replayed and compared with both arms'
+                // reduced rows, which separates "the partials differ" from "the reduce order
+                // differs" without a second run.
+                if let Ok(dir) = std::env::var("SPARKFLASH_REDUCE_DUMP") {
+                    std::fs::create_dir_all(&dir)
+                        .map_err(|error| format!("reduce dump: {dir}: {error}"))?;
+                    // The collectives are queued on stream 0 and deliberately not waited for, so a
+                    // copy taken here without waiting reads the PREVIOUS layer's rows - the first
+                    // capture in this session was stale by one layer for exactly that reason. The
+                    // wait is the layer's own, and the reads below refuse to run without it.
+                    device.wait_collectives()?;
+                    for (collective, (from, to)) in [
+                        (
+                            "attn",
+                            (
+                                &device.buffers.workspace.attn_out_bf16,
+                                &device.buffers.workspace.reduced_bf16,
+                            ),
+                        ),
+                        (
+                            "moe",
+                            (
+                                &device.buffers.workspace.moe_delta_bf16,
+                                &device.buffers.workspace.moe_reduced_bf16,
+                            ),
+                        ),
+                    ] {
+                        for (role, buffer) in [("partial", from), ("reduced", to)] {
+                            let mut bytes = vec![0u8; HIDDEN * 2];
+                            device.read_row_bytes(
+                                *buffer,
+                                &mut bytes,
+                                &format!(
+                                    "{collective} {role} row of layer {layer} position {position}"
+                                ),
+                            )?;
+                            std::fs::write(
+                                format!(
+                                    "{dir}/r{}-p{position}-l{layer:02}-{collective}-{role}.bin",
+                                    request.rank
+                                ),
+                                &bytes,
+                            )
+                            .map_err(|error| format!("reduce dump write: {error}"))?;
+                        }
+                    }
+                }
+                if std::env::var("SPARKFLASH_DEVICE_DIFF").is_err() {
+                    continue;
+                }
             }
             let layer_started = std::time::Instant::now();
             // Engram write (layers 1 and 14 only): the stream this block starts from gains
@@ -14037,6 +16255,138 @@ fn run_forward_loop(
                 // The reference's cross-layer pre mix: the next layer's attention hc_pre consumes
                 // THIS layer's FFN pre mix (hc_in_pre(L+1) == hc_ffn_pre(L)).
                 attn_pre_mix = ffn_seams.ffn_pre.clone();
+                if let Some(device) = layer_device.as_mut() {
+                    // The two per-layer collectives are enqueued and not waited for; every read
+                    // below is a row one of them wrote, so the wait is the layer's and the reads
+                    // refuse to run without it (see `wait_collectives`).
+                    device.wait_collectives()?;
+                    let mut dev_normed = vec![0.0f32; HIDDEN];
+                    device.copy_out(device.buffers.residual.normed, &mut dev_normed)?;
+                    // The query path's own substages, in execution order, so a divergence inside
+                    // it is attributed to wq_a, q_norm, the wq_b activation quantiser, wq_b, or
+                    // the rope tail instead of to the composed row: q_lora is the wq_a GEMV's
+                    // bf16 output, q_normed the rmsnorm_sm121 output, q the post-rope row.
+                    let mut dev_lora_bytes = vec![0u8; crate::layer_device::Q_LORA_VALUES * 2];
+                    device.read_row_bytes(
+                        device.buffers.workspace.q_lora,
+                        &mut dev_lora_bytes,
+                        "q_lora row",
+                    )?;
+                    let dev_lora = bf16_from_le_bytes(&dev_lora_bytes)?;
+                    let host_lora = bf16_from_le_bytes(&projections.wq_a_latent_bytes)?;
+                    let mut dev_qnorm_bytes = vec![0u8; crate::layer_device::Q_LORA_VALUES * 2];
+                    device.read_row_bytes(
+                        device.buffers.workspace.q_normed,
+                        &mut dev_qnorm_bytes,
+                        "q_normed row",
+                    )?;
+                    let dev_qnorm = bf16_from_le_bytes(&dev_qnorm_bytes)?;
+                    let host_qnorm = query_path.q_latent_bf16.clone();
+                    let mut dev_q_bytes = vec![0u8; query_path.q_post_rope_bf16.len()];
+                    device.read_row_bytes(device.buffers.workspace.q, &mut dev_q_bytes, "q row")?;
+                    let dev_q = bf16_from_le_bytes(&dev_q_bytes)?;
+                    let host_q = bf16_from_le_bytes(&query_path.q_post_rope_bf16)?;
+                    let mut dev_body_bytes = vec![0u8; attention_step.activation_bf16.len()];
+                    device.read_row_bytes(
+                        device.buffers.workspace.attn_body_bf16,
+                        &mut dev_body_bytes,
+                        "attention body row",
+                    )?;
+                    let dev_body = bf16_from_le_bytes(&dev_body_bytes)?;
+                    let host_body = bf16_from_le_bytes(&attention_step.activation_bf16)?;
+                    let mut dev_attn_bytes = vec![0u8; HIDDEN * 2];
+                    device.read_row_bytes(
+                        device.buffers.workspace.reduced_bf16,
+                        &mut dev_attn_bytes,
+                        "reduced attention row",
+                    )?;
+                    let dev_attn = bf16_from_le_bytes(&dev_attn_bytes)?;
+                    let host_attn = bf16_from_le_bytes(&attention_output.reduced_bf16)?;
+                    let mut dev_moe_bytes = vec![0u8; HIDDEN * 2];
+                    device.read_row_bytes(
+                        device.buffers.workspace.moe_reduced_bf16,
+                        &mut dev_moe_bytes,
+                        "reduced MoE row",
+                    )?;
+                    let dev_moe = bf16_from_le_bytes(&dev_moe_bytes)?;
+                    let host_moe = bf16_from_le_bytes(&moe_routed.delta)?;
+                    let dev_stream = device.residual_out()?;
+                    let dev_pre = device.attn_pre_mix_out()?;
+                    // Per boundary: max |host - device|, the number of values whose BITS differ,
+                    // and the max RELATIVE error. The bit count is the number that decides a
+                    // bit-identical op - elementwise stages, the mHC coefficient sets and the GEMVs
+                    // that kept the host's ascending-K order must report `nd = 0`, so any
+                    // difference there is a bug and not noise. A reassociated reduction (D51) is
+                    // judged by relative error, and the all-reduced bf16 delta by its own bf16-round
+                    // class; an absolute ULP distance is NOT quoted here because a pair that
+                    // straddles zero turns into a meaningless integer gap. `sign` counts the pairs
+                    // whose signs differ, which is the only case a relative bound hides.
+                    let stats = |a: &[f32], b: &[f32]| -> (f32, usize, f32, usize) {
+                        let mut worst = 0.0f32;
+                        let mut differing = 0usize;
+                        let mut worst_rel = 0.0f32;
+                        let mut sign_cross = 0usize;
+                        for (x, y) in a.iter().zip(b.iter()) {
+                            let delta = (x - y).abs();
+                            worst = worst.max(delta);
+                            if x.to_bits() != y.to_bits() {
+                                differing += 1;
+                            }
+                            let scale = x.abs().max(y.abs());
+                            if scale > 0.0 {
+                                worst_rel = worst_rel.max(delta / scale);
+                            }
+                            if (x.is_sign_positive() != y.is_sign_positive())
+                                && *x != 0.0
+                                && *y != 0.0
+                            {
+                                sign_cross += 1;
+                            }
+                        }
+                        (worst, differing, worst_rel, sign_cross)
+                    };
+                    let dump = std::env::var("SPARKFLASH_DEVICE_DIFF_DUMP").ok();
+                    let write_row = |name: &str, host: &[f32], dev: &[f32]| {
+                        let Some(dir) = dump.as_deref() else { return };
+                        for (tag, values) in [("host", host), ("dev", dev)] {
+                            let path = format!("{dir}/p{position}-l{layer:02}-{name}-{tag}.f32");
+                            let mut bytes = Vec::with_capacity(values.len() * 4);
+                            for value in values {
+                                bytes.extend_from_slice(&value.to_le_bytes());
+                            }
+                            let _ = fs::write(path, bytes);
+                        }
+                    };
+                    write_row("normed", &entry.normed, &dev_normed);
+                    write_row("lora", &host_lora, &dev_lora);
+                    write_row("qnorm", &host_qnorm, &dev_qnorm);
+                    write_row("q", &host_q, &dev_q);
+                    write_row("body", &host_body, &dev_body);
+                    write_row("attn", &host_attn, &dev_attn);
+                    write_row("moe", &host_moe, &dev_moe);
+                    write_row("stream", &stream, &dev_stream);
+                    write_row("pre", &attn_pre_mix, &dev_pre);
+                    let (normed_err, normed_nd, normed_rel, normed_sc) =
+                        stats(&dev_normed, &entry.normed);
+                    let (lora_err, lora_nd, lora_rel, lora_sc) = stats(&dev_lora, &host_lora);
+                    let (qnorm_err, qnorm_nd, qnorm_rel, qnorm_sc) = stats(&dev_qnorm, &host_qnorm);
+                    let (q_err, q_nd, q_rel, q_sc) = stats(&dev_q, &host_q);
+                    let (body_err, body_nd, body_rel, body_sc) = stats(&dev_body, &host_body);
+                    let (attn_err, attn_nd, attn_rel, attn_sc) = stats(&dev_attn, &host_attn);
+                    let (moe_err, moe_nd, moe_rel, moe_sc) = stats(&dev_moe, &host_moe);
+                    let (stream_err, stream_nd, stream_rel, stream_sc) =
+                        stats(&dev_stream, &stream);
+                    let (pre_err, pre_nd, pre_rel, pre_sc) = stats(&dev_pre, &attn_pre_mix);
+                    if request.rank == 0 {
+                        println!(
+                            "DEVICE_DIFF pos={position} layer={layer:02} sel={}/{}: normed={normed_err:.2e}/{normed_nd}/{normed_rel:.1e}/{normed_sc} lora={lora_err:.2e}/{lora_nd}/{lora_rel:.1e}/{lora_sc} qnorm={qnorm_err:.2e}/{qnorm_nd}/{qnorm_rel:.1e}/{qnorm_sc} q={q_err:.2e}/{q_nd}/{q_rel:.1e}/{q_sc} body={body_err:.2e}/{body_nd}/{body_rel:.1e}/{body_sc} attn={attn_err:.2e}/{attn_nd}/{attn_rel:.1e}/{attn_sc} moe={moe_err:.2e}/{moe_nd}/{moe_rel:.1e}/{moe_sc} stream={stream_err:.2e}/{stream_nd}/{stream_rel:.1e}/{stream_sc} pre={pre_err:.2e}/{pre_nd}/{pre_rel:.1e}/{pre_sc}",
+                            device.attn_window.selected_count,
+                            seam.compressed_ids.len(),
+                        );
+                    }
+                    device.copy_in(device.buffers.residual.stream, &stream)?;
+                    device.copy_in(device.buffers.residual.pre_mix, &attn_pre_mix)?;
+                }
                 // M2/C10: the layer-chain entry and every digest that only feeds it are recorded
                 // only in evidence mode. A default/--forward-lean run pays the block timer and
                 // nothing else; the probe still gets an entry_json row so both window rows can be
@@ -14225,20 +16575,69 @@ fn run_forward_loop(
                     })?;
             }
         }
-        // The layer loop's boundary copy: the residual comes back once per position (the certified
-        // head's input), never once per layer. The mix the head needs rides with it.
-        if let Some(device) = layer_device.as_mut() {
-            // P5: these two are the device arm's real `d2h` crossings and the counters report them
-            // instead of hiding them. A conformant S1 step crosses PCIe once - the head's logits -
-            // so a step that still brings the residual and the pre mix back fails by name. Until
-            // the head consumes the device residual (the next work item, not an allowance), the
-            // count is 2 and the head-position check below names it; the bar is not widened here.
-            stream = device.residual_out()?;
-            step_counters.record_d2h_copy();
-            attn_pre_mix = device.attn_pre_mix_out()?;
-            step_counters.record_d2h_copy();
-        }
-        let head = if is_head {
+        let head = if let Some(device) = layer_device.as_mut() {
+            if is_head {
+                let tail = tail_stage.as_ref().ok_or_else(|| {
+                    "forward loop: head position but the tail stage is closed".to_string()
+                })?;
+                let head_started = std::time::Instant::now();
+                let head_total_timer = BlockTimer::start(probe_on);
+                let timer = BlockTimer::start(probe_on);
+                device.collapse_for_head(tail.buffers.hidden, tail.buffers.certified_count)?;
+                probe::head(&cuda, "hc_pre", timer);
+                let head_layer = config.n_layers.saturating_sub(1) as u32;
+                let timer = BlockTimer::start(probe_on);
+                let raw_logits = tail.screen_device(&cuda, head_layer, position as u64)?;
+                step_counters.record_d2h_copy();
+                probe::head(&cuda, "screen", timer);
+                let timer = BlockTimer::start(probe_on);
+                let gathered = crate::tp4_tail::gather_logits(
+                    transport,
+                    &raw_logits,
+                    HEAD_GATHER_SEQ.wrapping_sub(2 * position as u64),
+                )?;
+                probe::head(&cuda, "gather_logits", timer);
+                let gathered_sha256 = evidence_f32_sha256(&gathered.full);
+                let claimable = gathered.top1.is_finite();
+                let head_record = serde_json::json!({
+                    "schema": "sparkflash-head-tail-evidence/1",
+                    "stage": "head-tail-device",
+                    "position": position,
+                    "rank": request.rank,
+                    "gather": {
+                        "route": "exact-f32-word-gather",
+                        "gathered_logits_f32_values": gathered.full.len(),
+                        "gathered_logits_sha256": gathered_sha256,
+                    },
+                    "argmax": {
+                        "token": gathered.argmax,
+                        "value": gathered.top1,
+                        "certified": false,
+                        "claimable": claimable,
+                    },
+                });
+                probe::head(&cuda, "head_total", head_total_timer);
+                if std::env::var("SPARKFLASH_DEVICE_DIFF").is_err()
+                    && let Err(violation) = step_counters.check(step_bridge)
+                {
+                    return Err(format!(
+                        "S1 steady-state invariant broken at position {position}: {violation}"
+                    ));
+                }
+                Some(HeadPosition {
+                    position,
+                    token: gathered.argmax,
+                    value: f64::from(gathered.top1),
+                    claimable,
+                    logits: gathered.full,
+                    logits_sha256: gathered_sha256,
+                    head_record,
+                    wall_ms: head_started.elapsed().as_millis() as u64,
+                })
+            } else {
+                None
+            }
+        } else if is_head {
             Some(run_head_position(
                 &cuda,
                 request,
@@ -14257,21 +16656,6 @@ fn run_forward_loop(
         } else {
             None
         };
-        if layer_device.is_some() {
-            // The head's logits gather is the one legitimate per-step readback, and it happens at
-            // a head position only. The two boundary copies above are recorded at every position
-            // because the host head still needs them; a non-head position is the prefill arm and is
-            // not a step, so the exact-count assertion is enforced at the head position that ends
-            // the timed step (qa harness wiring steps 3 and 6).
-            if is_head {
-                step_counters.record_d2h_copy();
-                if let Err(violation) = step_counters.check(step_bridge) {
-                    return Err(format!(
-                        "S1 steady-state invariant broken at position {position}: {violation}"
-                    ));
-                }
-            }
-        }
         let timer = BlockTimer::start(probe_on);
         let wall_ms = position_started.elapsed().as_millis() as u64;
         let stream_sha256 = evidence_f32_sha256(&stream);
@@ -14374,21 +16758,12 @@ fn run_forward_loop(
         object.insert("layers_completed".to_string(), serde_json::json!(n_layers));
     }
     write_forward_progress(&progress_path, &loop_complete)?;
-    let (
-        mhc_entry,
-        projections,
-        query_path,
-        kv_path,
-        attention_body,
-        attention_output,
-        attention_residual,
-        ffn_seams,
-        moe_routed,
-        ffn_epilogue,
-        mhc_arena_reads,
-    ) = layer_zero.ok_or_else(|| {
-        "forward loop: the layer loop ran no layer, so there is no layer-0 evidence".to_string()
-    })?;
+    if layer_zero.is_none() && !layer_arm.is_device() {
+        return Err(
+            "forward loop: the layer loop ran no layer, so there is no layer-0 evidence"
+                .to_string(),
+        );
+    }
     let census = attention_stage_census(
         &bind.attention.pointers,
         &plan.attention_plan,
@@ -14404,10 +16779,6 @@ fn run_forward_loop(
         })
         .unwrap_or_default();
 
-    // The replay vectors serve-lead's DeviceChainTokenSource needs to reconstruct a claimed
-    // envelope's input without the fixture file: the prompt the run fed, and the full
-    // teacher-forced input (prompt plus decode positions) whose rows produced the head records.
-    // They are evidence only; no arithmetic reads them.
     let prompt_ids: Vec<u32> = request
         .prompt_tokens
         .iter()
@@ -14420,7 +16791,7 @@ fn run_forward_loop(
         .take(total_positions)
         .copied()
         .collect();
-    let evidence = serde_json::json!({
+    let mut evidence = serde_json::json!({
         "schema": "sparkflash-tp4-forward-embed/1",
         "stage": "embedding-gathered",
         "rank": request.rank,
@@ -14443,52 +16814,70 @@ fn run_forward_loop(
         "rank_read_its_shard": request.rank == owner,
         "hidden_bf16_sha256": first_step_hidden_sha256,
         "next_missing": "selected-candidate construction, the 130-position prefill sequence, and the certified head tail (four rank screen launches + exact f32 logits gather + argmax over 129280)",
-        "mhc_entry": {
-            "stage": "layer0-mhc-entry-host-seam",
-            "hidden_sha256": mhc_entry.hidden_sha256,
-            "predictor_sha256": mhc_entry.predictor_sha256,
-            "base_sha256": mhc_entry.base_sha256,
-            "scale": mhc_entry.scale,
-            "attn_norm_sha256": mhc_entry.norm_sha256,
-            "pre_sha256": sha256_hex(&f32_le_bytes(&mhc_entry.pre)),
-            "post_sha256": sha256_hex(&f32_le_bytes(&mhc_entry.post)),
-            "comb_sha256": sha256_hex(&f32_le_bytes(&mhc_entry.comb)),
-            "attn_in_sha256": mhc_entry.attn_in_sha256,
-            "normed_attn_input_sha256": mhc_entry.normed_sha256,
-            "normed_attn_input_bf16_sha256": sha256_hex(&bf16_le_bytes(&mhc_entry.normed)),
-            "arena_reads": mhc_arena_reads,
-            "seed": "layer-0 seed A = [1,0,0,0] through hc_pre, then attn_norm RMSNorm; layers 1-39 use the previous layer's FFN pre mix as the reference does (hc_in_pre(L) == hc_ffn_pre(L-1))",
-            "exact": "the released host reference arithmetic (hc_mixes + hc_pre + RMSNorm); no kernel launched",
-            "kernel_launched": false,
-        },
-        "attention_projections": projections.to_json(),
-        "query_path": query_path.to_json(),
-        "kv_path": kv_path.to_json(),
-        "attention_body": attention_body.to_json(),
-        "attention_output": attention_output.to_json(),
-        "attention_residual": attention_residual.to_json(),
-        "ffn_seams": ffn_seams.to_json(),
-        "moe_routed": moe_routed.to_json(),
-        "ffn_epilogue": ffn_epilogue.to_json(),
         "attention_operand_census": plan.operand_census,
         "attention_stage_census": census,
         "token_claimed": false,
-        "note": "the layers 0 through 39 ran the same stage sequence on the single staged row: each layer is the device projections, the CSA union attention body (still a one-row wiring smoke, window_rows 1, selected_count 0), the wo_a/wo_b projection pair, the canonical attention all-reduce, the host mHC residual and FFN seams, the five device MoE launches, the MoE all-reduce, the host shared expert and the FFN hc_post; the surviving stream fed the next layer and layer 39 was collapsed with the reference's cross-layer hc_pre pre mix and final-normed. This is a structural 40-layer chain, not a token: selected-candidate construction, the 130-position prefill sequence and the certified head tail are not wired, so screening logits from this row would still be wrong numbers",
         "combine_preflight": plan.selection.evidence(plan.geometry),
         "attention_launchable": census_launchable,
         "attention_blocked": census_blocked,
     });
-    // These fields are inserted after the macro so the evidence literal stays under serde_json's
-    // json! recursion limit; the per-layer chain is a normal array, not macro syntax.
-    let mut evidence = evidence;
+    if let (
+        Some(object),
+        Some((
+            mhc_entry,
+            projections,
+            query_path,
+            kv_path,
+            attention_body,
+            attention_output,
+            attention_residual,
+            ffn_seams,
+            moe_routed,
+            ffn_epilogue,
+            mhc_arena_reads,
+        )),
+    ) = (evidence.as_object_mut(), layer_zero.as_ref())
+    {
+        object.insert(
+            "mhc_entry".to_string(),
+            serde_json::json!({
+                "stage": "layer0-mhc-entry-host-seam",
+                "hidden_sha256": mhc_entry.hidden_sha256,
+                "predictor_sha256": mhc_entry.predictor_sha256,
+                "base_sha256": mhc_entry.base_sha256,
+                "scale": mhc_entry.scale,
+                "attn_norm_sha256": mhc_entry.norm_sha256,
+                "pre_sha256": sha256_hex(&f32_le_bytes(&mhc_entry.pre)),
+                "post_sha256": sha256_hex(&f32_le_bytes(&mhc_entry.post)),
+                "comb_sha256": sha256_hex(&f32_le_bytes(&mhc_entry.comb)),
+                "attn_in_sha256": mhc_entry.attn_in_sha256,
+                "normed_attn_input_sha256": mhc_entry.normed_sha256,
+                "normed_attn_input_bf16_sha256": sha256_hex(&bf16_le_bytes(&mhc_entry.normed)),
+                "arena_reads": mhc_arena_reads,
+                "seed": "layer-0 seed A = [1,0,0,0] through hc_pre, then attn_norm RMSNorm; layers 1-39 use the previous layer's FFN pre mix as the reference does (hc_in_pre(L) == hc_ffn_pre(L-1))",
+                "exact": "the released host reference arithmetic (hc_mixes + hc_pre + RMSNorm); no kernel launched",
+                "kernel_launched": false,
+            }),
+        );
+        object.insert("attention_projections".to_string(), projections.to_json());
+        object.insert("query_path".to_string(), query_path.to_json());
+        object.insert("kv_path".to_string(), kv_path.to_json());
+        object.insert("attention_body".to_string(), attention_body.to_json());
+        object.insert("attention_output".to_string(), attention_output.to_json());
+        object.insert(
+            "attention_residual".to_string(),
+            attention_residual.to_json(),
+        );
+        object.insert("ffn_seams".to_string(), ffn_seams.to_json());
+        object.insert("moe_routed".to_string(), moe_routed.to_json());
+        object.insert("ffn_epilogue".to_string(), ffn_epilogue.to_json());
+    }
     if let Some(object) = evidence.as_object_mut() {
         object.insert(
             "layer_chain".to_string(),
             serde_json::Value::Array(layer_chain),
         );
         object.insert("layers_executed".to_string(), serde_json::json!(n_layers));
-        // The chain can legitimately be empty (the shipped default records no evidence), so the
-        // artifact says so in-band instead of leaving a reader to infer it from an empty array.
         object.insert(
             "evidence_mode".to_string(),
             serde_json::json!(if evidence_record_enabled() {
@@ -14506,19 +16895,17 @@ fn run_forward_loop(
                     .collect::<Vec<_>>()
             ),
         );
-        // The run boundary's collective check, before any number is reported. A rank that skips a
-        // collective hangs the reduce rather than failing it, so this counter is the only
-        // host-visible trace of the divergence: a mismatch refuses the run instead of printing both
-        // numbers. The per-rank numbers go into the record so the four ranks can be compared; the
-        // cross-rank comparison itself is verify_collective_counts_agree, called by whoever gathers
-        // the four records.
-        let expected_collectives = n_layers * crate::layer_device::COLLECTIVES_PER_LAYER;
+        let expected_collectives = if layer_arm.is_device() {
+            total_positions * n_layers * crate::layer_device::COLLECTIVES_PER_LAYER
+        } else {
+            n_layers * crate::layer_device::COLLECTIVES_PER_LAYER
+        };
         let enqueued_collectives: usize = probe::stage_counts()
             .iter()
             .filter(|(stage, _)| matches!(*stage, "all_reduce" | "all_reduce_moe"))
             .map(|(_, count)| usize::try_from(*count).unwrap_or(usize::MAX))
             .sum();
-        if layer_arm.is_device() {
+        if layer_arm.is_device() && std::env::var("SPARKFLASH_DEVICE_DIFF").is_err() {
             crate::layer_device::verify_collective_count(
                 expected_collectives,
                 enqueued_collectives,
@@ -14559,6 +16946,18 @@ fn run_forward_loop(
                 "shared_expert_bytes": layer_device
                     .as_ref()
                     .map_or(0, |device| device.shared_expert_bytes()),
+                // The routed stage's run-scope state: the pointer table plus the staging buffers,
+                // allocated once at setup and not per layer.
+                "moe_routed_device_bytes": layer_device
+                    .as_ref()
+                    .map_or(0, |device| device.moe_routed_device_bytes()),
+                // The Engram stage's arena, constant matrices and scratch, uploaded once at open.
+                "seam_ring_bytes": layer_device
+                    .as_ref()
+                    .map_or(0, |device| device.seam_ring_bytes()),
+                "engram_device_bytes": layer_device
+                    .as_ref()
+                    .map_or(0, |device| device.engram_device_bytes()),
                 "shared_arm": layer_device
                     .as_ref()
                     .map_or("none (no layer device arm)", |device| device.shared_arm()),
@@ -14656,64 +17055,74 @@ fn run_forward_loop(
     .map_err(|error| format!("write {}: {error}", evidence_path.display()))?;
     probe::run(&cuda, "evidence_write", timer);
 
-    // The expanded m26 bundle: the layer-0 MoE stage's host-seam outputs, so the twin can adjudicate
-    // the next window's device run against this refused negative's exact input.
-    // Rank 0 writes the canonical fixed-name bundle the task-11 m26 harness consumes; every other
-    // rank writes the same three files under its own directory so the four ranks cannot race on one
-    // path (each rank's H3 bytes differ because its attention shard differs).
-    let bundle_name = if request.rank == 0 {
-        "moe-stage-input".to_string()
-    } else {
-        format!("moe-stage-input-r{}", request.rank)
-    };
-    let bundle_dir = request.evidence_dir.join(bundle_name);
-    fs::create_dir_all(&bundle_dir).map_err(|error| {
-        format!(
-            "moe-stage-input bundle dir {}: {error}",
-            bundle_dir.display()
+    if let Some((
+        mhc_entry,
+        _projections,
+        _query_path,
+        _kv_path,
+        _attention_body,
+        _attention_output,
+        attention_residual,
+        ffn_seams,
+        _moe_routed,
+        _ffn_epilogue,
+        _mhc_arena_reads,
+    )) = layer_zero.as_ref()
+    {
+        let bundle_name = if request.rank == 0 {
+            "moe-stage-input".to_string()
+        } else {
+            format!("moe-stage-input-r{}", request.rank)
+        };
+        let bundle_dir = request.evidence_dir.join(bundle_name);
+        fs::create_dir_all(&bundle_dir).map_err(|error| {
+            format!(
+                "moe-stage-input bundle dir {}: {error}",
+                bundle_dir.display()
+            )
+        })?;
+        let pre_ffn_bytes = f32_le_bytes(&ffn_seams.pre_ffn_hidden);
+        fs::write(bundle_dir.join("pre_ffn_hidden.f32"), &pre_ffn_bytes)
+            .map_err(|error| format!("write pre_ffn_hidden.f32: {error}"))?;
+        fs::write(bundle_dir.join("act_fp8.bin"), &ffn_seams.act_fp8)
+            .map_err(|error| format!("write act_fp8.bin: {error}"))?;
+        fs::write(bundle_dir.join("act_scales.bin"), &ffn_seams.act_scales)
+            .map_err(|error| format!("write act_scales.bin: {error}"))?;
+        let moe_input = serde_json::json!({
+            "schema": "sparkflash-moe-stage-input/1",
+            "layer": 0,
+            "tokens": 1,
+            "ranks": request.world,
+            "hidden": HIDDEN,
+            "hc_mult": HC_MULT,
+            "note": "the refused negative's only row (position 129) after the FFN host seams; this rank's H3/H4 bytes are deterministic, rank 0's are under moe-stage-input/ (the m26 --input convention) and ranks 1-3 under moe-stage-input-r1/r2/r3/, so four ranks never race on one path",
+            "files": {
+                "pre_ffn_hidden.f32": {"path": "pre_ffn_hidden.f32", "dtype": "f32-le", "values": ffn_seams.pre_ffn_hidden.len(), "bytes": pre_ffn_bytes.len(), "sha256": ffn_seams.pre_ffn_hidden_sha256},
+                "act_fp8.bin": {"path": "act_fp8.bin", "dtype": "e4m3", "values": ffn_seams.act_fp8.len(), "bytes": ffn_seams.act_fp8.len(), "sha256": ffn_seams.act_fp8_sha256},
+                "act_scales.bin": {"path": "act_scales.bin", "dtype": "e8m0", "values": ffn_seams.act_scales.len(), "bytes": ffn_seams.act_scales.len(), "sha256": ffn_seams.act_scales_sha256},
+            },
+            "seams": {
+                "post_attention_hidden_sha256": attention_residual.out_sha256,
+                "attn_pre_mix_sha256": sha256_hex(&f32_le_bytes(&mhc_entry.pre)),
+                "ffn_in_sha256": ffn_seams.ffn_in_sha256,
+                "pre_ffn_hidden_sha256": ffn_seams.pre_ffn_hidden_sha256,
+                "act_fp8_sha256": ffn_seams.act_fp8_sha256,
+                "act_scales_sha256": ffn_seams.act_scales_sha256,
+            },
+            "device_stage": {
+                "wired": true,
+                "launches_per_rank": 5,
+                "kernels": ["moe_router_sm121", "routed_gate_up_sm121", "swiglu_mxfp8_quant_weighted_sm121", "b12x_mxfp4_moe_stored_sm121"],
+                "reason": "the five MoE launches ran on this rank's seams; this bundle is their exact input so the m26 twin and device records diff field by field against the loop record",
+            },
+        });
+        fs::write(
+            bundle_dir.join("moe-stage-input.json"),
+            serde_json::to_vec_pretty(&moe_input)
+                .map_err(|error| format!("moe-stage-input json: {error}"))?,
         )
-    })?;
-    let pre_ffn_bytes = f32_le_bytes(&ffn_seams.pre_ffn_hidden);
-    fs::write(bundle_dir.join("pre_ffn_hidden.f32"), &pre_ffn_bytes)
-        .map_err(|error| format!("write pre_ffn_hidden.f32: {error}"))?;
-    fs::write(bundle_dir.join("act_fp8.bin"), &ffn_seams.act_fp8)
-        .map_err(|error| format!("write act_fp8.bin: {error}"))?;
-    fs::write(bundle_dir.join("act_scales.bin"), &ffn_seams.act_scales)
-        .map_err(|error| format!("write act_scales.bin: {error}"))?;
-    let moe_input = serde_json::json!({
-        "schema": "sparkflash-moe-stage-input/1",
-        "layer": 0,
-        "tokens": 1,
-        "ranks": request.world,
-        "hidden": HIDDEN,
-        "hc_mult": HC_MULT,
-        "note": "the refused negative's only row (position 129) after the FFN host seams; this rank's H3/H4 bytes are deterministic, rank 0's are under moe-stage-input/ (the m26 --input convention) and ranks 1-3 under moe-stage-input-r1/r2/r3/, so four ranks never race on one path",
-        "files": {
-            "pre_ffn_hidden.f32": {"path": "pre_ffn_hidden.f32", "dtype": "f32-le", "values": ffn_seams.pre_ffn_hidden.len(), "bytes": pre_ffn_bytes.len(), "sha256": ffn_seams.pre_ffn_hidden_sha256},
-            "act_fp8.bin": {"path": "act_fp8.bin", "dtype": "e4m3", "values": ffn_seams.act_fp8.len(), "bytes": ffn_seams.act_fp8.len(), "sha256": ffn_seams.act_fp8_sha256},
-            "act_scales.bin": {"path": "act_scales.bin", "dtype": "e8m0", "values": ffn_seams.act_scales.len(), "bytes": ffn_seams.act_scales.len(), "sha256": ffn_seams.act_scales_sha256},
-        },
-        "seams": {
-            "post_attention_hidden_sha256": attention_residual.out_sha256,
-            "attn_pre_mix_sha256": sha256_hex(&f32_le_bytes(&mhc_entry.pre)),
-            "ffn_in_sha256": ffn_seams.ffn_in_sha256,
-            "pre_ffn_hidden_sha256": ffn_seams.pre_ffn_hidden_sha256,
-            "act_fp8_sha256": ffn_seams.act_fp8_sha256,
-            "act_scales_sha256": ffn_seams.act_scales_sha256,
-        },
-        "device_stage": {
-            "wired": true,
-            "launches_per_rank": 5,
-            "kernels": ["moe_router_sm121", "routed_gate_up_sm121", "swiglu_mxfp8_quant_weighted_sm121", "b12x_mxfp4_moe_stored_sm121"],
-            "reason": "the five MoE launches ran on this rank's seams; this bundle is their exact input so the m26 twin and device records diff field by field against the loop record",
-        },
-    });
-    fs::write(
-        bundle_dir.join("moe-stage-input.json"),
-        serde_json::to_vec_pretty(&moe_input)
-            .map_err(|error| format!("moe-stage-input json: {error}"))?,
-    )
-    .map_err(|error| format!("write moe-stage-input.json: {error}"))?;
+        .map_err(|error| format!("write moe-stage-input.json: {error}"))?;
+    }
 
     // The position loop ran every forward position through all layers with the reference seams and
     // the real CSA union body. The four ranks now agree on the decoded ids before any envelope can
@@ -14773,6 +17182,8 @@ fn run_forward_loop(
     let mut tokens = Tokens {
         start_position: head_positions.first().copied(),
         prompt_len: Some(prompt_len),
+        // The question this run answers (D55's fixture key), kept apart from the answers in `ids`.
+        forced_ids: request.prompt_tokens.to_vec(),
         ..Tokens::default()
     };
     let mut dump_logits: Vec<Vec<f32>> = Vec::with_capacity(heads.len());
@@ -14870,6 +17281,13 @@ fn run_forward_loop(
                 "tokens".to_string(),
                 serde_json::json!({
                     "ids": tokens.ids,
+                    // The teacher-forced inputs, recorded separately from the generated ids. D55's
+                    // fixture key is built from THESE (the question the run answered), not from
+                    // `ids` (the run's own answer): a device arm that flips one token answers the
+                    // same question and must still be comparable with the reference, which is the
+                    // whole point of teacher forcing. The list is the tail of `--token-ids`: the
+                    // one id per decode position the loop is fed.
+                    "forced_ids": request.prompt_tokens,
                     "positions": tokens.positions,
                     "consensus": true,
                     "claimable": heads.iter().map(|head| head.claimable).collect::<Vec<bool>>(),
@@ -14896,7 +17314,7 @@ fn run_forward_loop(
             object.insert(
                 "attention".to_string(),
                 serde_json::json!({
-                    "body": attention_body.to_json(),
+                    "body": layer_zero.as_ref().map(|z| z.4.to_json()).unwrap_or(serde_json::Value::Null),
                     "decoded_tokens_agree_on_four_ranks": true,
                     "sequence": "position-major: every position runs all 40 layers with the reference compressor/indexer/candidate seams on the chain's own per-layer input, stages the real 128-row window and the expanded compressed store, launches the CSA union body per head block, applies the inverse RoPE before wo_a, and only then runs the residual, FFN and next layer",
                 }),

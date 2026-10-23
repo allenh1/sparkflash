@@ -1,0 +1,89 @@
+{
+  "schema": "sparkflash-s1-device-bounds/1",
+  "why": "Declared before the run that is judged (docs/build/s1-result.md). Kept as the debugger's class table after D55 demoted the boundary diff from gate to debugger: the verdict is the FIRST boundary in execution order that leaves its class, not the count of differing rows, because a composed diff propagates and the count measures the propagation, not the faults.",
+  "classes": {
+    "bit_exact": "The device op is the host op's arithmetic in the host's order. Zero differing values is the bar; any differing value is a bug, not noise.",
+    "ulp1_f32": "A reduction whose association differs from the host's (D51). Bar: every differing value is within 1 f32 ULP of the host value, and no value changes sign.",
+    "bf16_round": "A boundary the host itself rounds to BF16 (the all-reduced attention delta and the routed-MoE delta). Bar: every differing value is within 1 BF16 code of the host value.",
+    "composed": "Not an independent op: the value inherits whatever the boundaries before it did. Judged only through first_differing(), never on its own."
+  },
+  "boundaries": [
+    {
+      "name": "normed",
+      "stage": "mhc_entry",
+      "class": "ulp1_f32",
+      "row": "pre_attention_hidden",
+      "note": "the entry's hc_pre collapse and its RMS norm: the reference sums sequentially in f32, the seam kernel sums per-thread then in a warp tree, so this is a D51 reassociated reduction and never bit-exact by construction"
+    },
+    {
+      "name": "lora",
+      "stage": "attention_projections",
+      "class": "bit_exact",
+      "row": null,
+      "note": "the wq_a GEMV over the prologue's E4M3 codes; both arms launch b12x_mxfp8_gemv_m1_sm121 with the host's ascending-K order"
+    },
+    {
+      "name": "qnorm",
+      "stage": "query_path",
+      "class": "bit_exact",
+      "row": null,
+      "note": "rmsnorm_sm121 owns one row per thread and walks columns ascending, which is the engine's linalg::rms_norm order one for one"
+    },
+    {
+      "name": "q",
+      "stage": "query_path",
+      "class": "bit_exact",
+      "row": null,
+      "note": "the wq_b GEMV and the rope tail: same GEMV order, same rope tables, same rotation"
+    },
+    {
+      "name": "body",
+      "stage": "stage_attention",
+      "class": "bit_exact",
+      "row": "attention_out",
+      "note": "the CSA2 sequence entry is the same cubin both arms launch; the window/store/index operands are the same rows"
+    },
+    {
+      "name": "attn",
+      "stage": "all_reduce",
+      "class": "bf16_round",
+      "row": null,
+      "note": "the four per-rank wo_b partials are summed; the host's TCP reduce and the device's kernel sum them in different orders, and the released boundary narrows the delta to BF16, so 1 BF16 code is the class"
+    },
+    {
+      "name": "moe",
+      "stage": "moe_routed",
+      "class": "composed",
+      "row": null,
+      "note": "inherits attn through the hc_post residual mix"
+    },
+    {
+      "name": "stream",
+      "stage": "ffn_epilogue",
+      "class": "composed",
+      "row": "residual_out",
+      "note": "inherits attn and moe"
+    },
+    {
+      "name": "pre",
+      "stage": "mhc_entry",
+      "class": "composed",
+      "row": "hc_in_pre",
+      "note": "the mHC coefficient sets are elementwise given the projection, but the projection's sum is the same reassociation as normed, so the set inherits it rather than being independent"
+    }
+  ],
+  "positions": {
+    "shallow": [
+      0,
+      1,
+      2
+    ],
+    "deep": [
+      129,
+      131,
+      137
+    ],
+    "why": "position 0 is the easiest case: no rope phase, one KV row, no ring wrap. The deep set crosses the 128-row window wrap and runs the compressed store and the indexer's selection over a full history, which is where a position-dependent bug lives."
+  },
+  "role": "DEBUGGER, not a gate (D55). Read by scripts/s1-first-diff.py to localise a divergence AFTER the amended numerical gate (D54/D55) fails, or when a slice claims bit identity. No row is filed against this file and it decides no PASS/FAIL."
+}

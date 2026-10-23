@@ -381,21 +381,47 @@ pub fn e4m3_encode(value: f32) -> u8 {
 /// The activation quantiser over one row: one ue8m0 scale per 32 values, E4M3 codes.
 ///
 /// Returns (codes, scales). The row length must be a whole number of blocks.
+///
+/// This is the **FFN** rule: the reference quantises the pre-norm hidden as a raw f32 row, so the
+/// values encoded are the f32 values, not their BF16 rounds (the rule is stated in the FFN seam's
+/// evidence, `crates/sparkflash-cli/src/tp4_forward.rs`: "the activation quantiser still takes the
+/// f32 row"). The attention projections' rule is the narrowed one below; the difference is a real
+/// semantic difference, not a detail, and the two agree only on rows that are already
+/// BF16-representable.
 #[must_use]
 pub fn quantise_activation(values: &[f32]) -> (Vec<u8>, Vec<u8>) {
+    quantise_activation_with(values, |value| value)
+}
+
+/// The attention projections' activation quantiser: the reference's BF16 narrowing, then the MX
+/// block rule.
+///
+/// D39 rule 1 says the W8A8 activation is a BF16 module output - `bf16_round` and then
+/// `quantize_activation_fp8`, which is `sparkflash_engine::quant::quantize_activation_fp8_narrowed` -
+/// so both the block amax and the codes are taken over BF16-representable values. The device kernel
+/// `w8a8_prologue_e4m3` is this function's arithmetic (one RNE narrowing per read); the FFN seam's
+/// `spark_seam_quantise_row` deliberately is NOT, because the FFN's reference takes the f32 row.
+#[must_use]
+pub fn quantise_activation_narrowed(values: &[f32]) -> (Vec<u8>, Vec<u8>) {
+    quantise_activation_with(values, bf16_round)
+}
+
+fn quantise_activation_with(values: &[f32], narrow: impl Fn(f32) -> f32) -> (Vec<u8>, Vec<u8>) {
     let mut codes = Vec::with_capacity(values.len());
     let mut scales = Vec::with_capacity(values.len() / SCALE_BLOCK);
     for block in values.chunks(SCALE_BLOCK) {
         let amax = block
             .iter()
-            .fold(0.0f32, |accumulated, &value| accumulated.max(value.abs()))
+            .fold(0.0f32, |accumulated, &value| {
+                accumulated.max(narrow(value).abs())
+            })
             .max(ACTIVATION_AMAX_FLOOR);
         let code = e8m0_encode_ceil(amax * (1.0 / FP8_E4M3_MAX));
         scales.push(code);
         let scale = f8e8m0_to_f32(code);
         for &value in block {
             codes.push(e4m3_encode(
-                (value / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX),
+                (narrow(value) / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX),
             ));
         }
     }
@@ -638,6 +664,43 @@ mod tests {
             assert_eq!(codes, reference.codes(), "codes of row {index}");
             assert_eq!(scales, reference.scales(), "scales of row {index}");
         }
+    }
+
+    /// The attention prologue's rule: the reference narrows the row to BF16 first and quantises the
+    /// narrowed values, and the device kernel `w8a8_prologue_e4m3` narrows per read. This twin is
+    /// the engine's `quantize_activation_fp8_narrowed`, bit for bit - and it is NOT the FFN rule:
+    /// on a row that is not BF16-representable the two produce different codes, which is why the
+    /// two functions exist separately instead of one calling the other.
+    #[test]
+    fn the_narrowed_quantiser_is_the_engine_narrowed_quantiser_bit_for_bit() {
+        let rows: Vec<Vec<f32>> = vec![
+            vec![0.0f32; 64],
+            vec![1e-8f32; 32]
+                .into_iter()
+                .chain(vec![-1e-9f32; 32])
+                .collect(),
+            vec![1e9f32; 32]
+                .into_iter()
+                .chain(vec![1e9f32; 32])
+                .collect(),
+            stream(5120, 61, 4.0),
+            stream(256, 62, 0.001),
+        ];
+        let mut differed_from_the_ffn_rule = 0usize;
+        for (index, row) in rows.into_iter().enumerate() {
+            let (codes, scales) = quantise_activation_narrowed(&row);
+            let reference = quant::quantize_activation_fp8_narrowed(&row).expect("whole blocks");
+            assert_eq!(codes, reference.codes(), "codes of row {index}");
+            assert_eq!(scales, reference.scales(), "scales of row {index}");
+            if quantise_activation(&row).0 != codes {
+                differed_from_the_ffn_rule += 1;
+            }
+        }
+        assert!(
+            differed_from_the_ffn_rule > 0,
+            "a generic row must distinguish the two rules, or this test proves nothing about which \
+             one the attention prologue uses"
+        );
     }
 
     #[test]

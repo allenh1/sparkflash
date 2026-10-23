@@ -6,12 +6,14 @@
 pub mod allocator;
 #[cfg(feature = "cuda")]
 pub mod attention_device;
+pub mod attn_seam_weights;
 pub mod bootlog;
 pub mod chain_timing;
 pub mod convert;
 pub mod device_chain;
 pub mod device_counters;
 pub mod doctor;
+pub mod engram_device_state;
 pub mod layer_attention_stages;
 pub mod layer_device;
 pub mod logits_dump;

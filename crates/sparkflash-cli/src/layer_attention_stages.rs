@@ -480,6 +480,80 @@ pub fn inverse_rope_params(
     Ok(params)
 }
 
+/// The forward-rope launch's argument words: the compressor latent's rotation.
+///
+/// It is the same `rope_rotate_rows_bf16` the body uses with `sin_sign = -1`, called with `sin_sign =
+/// +1` - the forward rotation `engine::linalg::rope_rotate` performs. `src` and `out` are the same
+/// row, and each pair reads before it writes, which is why the launcher can rotate in place; the
+/// compressor path still passes distinct latitudes because its input is f32.
+///
+/// # Errors
+/// The launcher's own geometry refusals (zero rows, a zero or odd rope tail, a tail wider than the
+/// row, a sign that is not ±1).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_rope_params(
+    row: Deviceptr,
+    cos: Deviceptr,
+    sin: Deviceptr,
+    rows: u32,
+    head_width: u32,
+    rope_head_dim: u32,
+    trace_ring: u64,
+    layer_id: u32,
+    step_seq: u64,
+) -> Result<RopeRowsParams, String> {
+    let params = RopeRowsParams {
+        src: row,
+        cos,
+        sin,
+        out: row,
+        rows,
+        head_width,
+        rope_head_dim,
+        sin_sign: 1,
+        trace_ring,
+        layer_id,
+        step_seq,
+    };
+    params
+        .validate()
+        .map_err(|error| format!("compressor latent: the forward rope: {error}"))?;
+    Ok(params)
+}
+
+/// Launches the forward rope over the compressor's latent row.
+///
+/// # Errors
+/// [`forward_rope_params`]'s refusals, or the launcher's driver error.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_forward_rope(
+    cuda: &Cuda,
+    kernel: Kernel,
+    row: Deviceptr,
+    cos: Deviceptr,
+    sin: Deviceptr,
+    rows: u32,
+    head_width: u32,
+    rope_head_dim: u32,
+    trace_ring: u64,
+    layer_id: u32,
+    step_seq: u64,
+) -> Result<(), String> {
+    let params = forward_rope_params(
+        row,
+        cos,
+        sin,
+        rows,
+        head_width,
+        rope_head_dim,
+        trace_ring,
+        layer_id,
+        step_seq,
+    )?;
+    seams::launch_rope_rows(cuda, kernel, &params)
+        .map_err(|error| format!("compressor latent: the forward rope launch: {error}"))
+}
+
 /// Launches the inverse rope over the body's per-rank head rows.
 ///
 /// # Errors

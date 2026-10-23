@@ -579,6 +579,15 @@ extern "C" __global__ void mhc_ffn_seams(
 // independent lanes inside ONE block (the launcher's grid, not a block per MX block); the launch is
 // tiny either way and the semantics do not depend on the split because the block value set is fixed
 // by the layout.
+// THE NARROWING IS PART OF THE REFERENCE'S RULE, NOT A FLOURISH. The reference's W8A8 activation is a
+// BF16 module output: it narrows the f32 row to BF16 with RNE and *then* quantises the narrowed
+// values (D39 rule 1; the host arm's `quantise_native_activation` is `bf16_round` followed by
+// `quantize_activation_fp8`, and the shared expert's host path narrows the same way). So the amax and
+// the codes here are taken over bf16-representable values; encoding the raw f32 row would encode
+// bytes the reference never had. This is NOT the FFN activation's rule: the reference quantises the
+// FFN's pre-norm hidden as a raw f32 row (the evidence rule in
+// `crates/sparkflash-cli/src/tp4_forward.rs`, "the activation quantiser still takes the f32 row"), so
+// `spark_seam_quantise_row` below deliberately does not narrow.
 // The BF16-input variant of the quantiser. The host's q_norm output is a bf16 tensor
 // (attention.rs:1318-1341), so the reference quantises the values it sees *after* that rounding:
 // widening the bf16 row here is the reference's operand, while quantising an unrounded f32 row
@@ -653,9 +662,13 @@ extern "C" __global__ void w8a8_prologue_e4m3(
     const uint32_t row = block / blocks_per_row;
     const uint32_t within = block % blocks_per_row;
     const float *source = normed + (uint64_t)row * cols + (uint64_t)within * SPARK_M4_QUANT_BLOCK;
+    // The reference's operand is the BF16-narrowed row (header comment above): amax and both encode
+    // loops read the RNE-narrowed value, one narrowing per read, exactly as `bf16_round` then
+    // `quantize_activation_fp8` composes on the host.
     float amax = 0.0f;
     for (uint32_t index = 0; index < SPARK_M4_QUANT_BLOCK; ++index) {
-        const float magnitude = source[index] < 0.0f ? -source[index] : source[index];
+        const float narrowed = __bfloat162float(__float2bfloat16_rn(source[index]));
+        const float magnitude = narrowed < 0.0f ? -narrowed : narrowed;
         amax = magnitude > amax ? magnitude : amax;
     }
     const uint8_t scale = spark_act_quant_scale_code(amax);
@@ -663,7 +676,8 @@ extern "C" __global__ void w8a8_prologue_e4m3(
     scales[(uint64_t)row * blocks_per_row + within] = scale;
     uint8_t *destination = codes + (uint64_t)row * cols + (uint64_t)within * SPARK_M4_QUANT_BLOCK;
     for (uint32_t index = 0; index < SPARK_M4_QUANT_BLOCK; ++index) {
-        destination[index] = spark_fp8_e4m3_encode(__fmul_rn(source[index], inverse));
+        destination[index] = spark_fp8_e4m3_encode(
+            __fmul_rn(__bfloat162float(__float2bfloat16_rn(source[index])), inverse));
     }
     if (trace_ring != nullptr) {
         SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_DENSE_MXFP8, layer_id, SPARK_SEAM_STAGE_PROLOGUE_BF16, trace_enter);

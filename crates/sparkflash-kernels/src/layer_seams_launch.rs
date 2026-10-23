@@ -7,7 +7,9 @@
 //!   split Sinkhorn comb), the hc_pre collapse and the input RMS pre-norm of one token;
 //! * mhc_ffn_seams - the same for the FFN predictor, plus the FFN activation quantiser, so the
 //!   FFN's E4M3 code row is produced in the same launch that makes the row it encodes;
-//! * w8a8_prologue_e4m3 - the attention projection's activation quantiser over the normed row;
+//! * w8a8_prologue_e4m3 - the attention projection's activation quantiser over the normed row,
+//!   with the reference's BF16 narrowing applied before the MX block rule (D39 rule 1: the W8A8
+//!   activation is a BF16 module output, so the amax and the codes are the narrowed values');
 //! * mhc_attn_residual - the attention sublayer's hc_post over the reduced delta, the entry's hc
 //!   rows and its post+comb table;
 //! * mhc_ffn_epilogue - the shared expert added onto the reduced routed MoE delta and the FFN's
@@ -61,7 +63,10 @@ pub const SOURCE: &str = include_str!("../../../kernels/layer_seams_sm121.cu");
 pub const ENTRY_KERNEL: &str = "mhc_entry_bf16";
 /// The FFN seam kernel's symbol.
 pub const FFN_KERNEL: &str = "mhc_ffn_seams";
-/// The activation quantiser's symbol.
+/// The activation quantiser's symbol. Its row is narrowed to BF16 with RNE before the MX block
+/// rule, which is the reference's composition (`bf16_round` then `quantize_activation_fp8`); the
+/// FFN seam's fused quantiser deliberately does not narrow, because the FFN's reference takes the
+/// raw f32 row.
 pub const PROLOGUE_KERNEL: &str = "w8a8_prologue_e4m3";
 /// The BF16-input variant of the activation quantiser: the bf16 q_norm row is the reference's
 /// operand, so the projection quantises the values after that rounding rather than over-reading the
