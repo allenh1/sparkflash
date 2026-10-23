@@ -16,6 +16,13 @@ rdma = []
 # feature exists so the ARMED shape cannot rot, and selecting the arm is a typed refusal (never a
 # silent fallback to NCCL) until the peermem rebuild lands and the implementation starts.
 gpu-rdma-reduce = []
+# The declared S1 host-bridge fallback: device->host, the host reduce, host->device. OFF BY DEFAULT
+# because it is the one declared exception to "the reduced row never crosses PCIe in steady state":
+# it exists for an S1 run whose node cannot start the device arm, it is opened only as
+# sparkflash_comm::host_bridge::HostBridgeReduce, and it is typed, counted and labelled
+# reduce=host-bridge in the row. A default build refuses it with a typed ArmUnavailable. Enable it
+# for an S1 run with --features sparkflash-comm/s1-host-bridge.
+s1-host-bridge = []
 
 [dependencies]
 serde = { workspace = true }

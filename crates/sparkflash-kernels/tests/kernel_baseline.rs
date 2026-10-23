@@ -24,7 +24,7 @@ fn nvcc() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// The twenty-five shipped cubins, recompiled and compared byte for byte, on a host that has nvcc.
+/// The thirty shipped cubins, recompiled and compared byte for byte, on a host that has nvcc.
 ///
 /// On a host WITHOUT nvcc the check returns early, and the line it prints is on the test's captured
 /// stdout, so a green `cargo test` run does not show it - libtest only shows it under `--nocapture`.
@@ -36,7 +36,7 @@ fn the_kernels_still_compile_to_the_recorded_baseline() {
     let Some(nvcc) = nvcc() else {
         println!(
             "skipping the kernel baseline check: no nvcc on PATH and SPARKFLASH_NVCC is unset or \
-             not a file, so there is nothing to compile the twenty-five kernels with. Run it on a CUDA host \
+             not a file, so there is nothing to compile the thirty kernels with. Run it on a CUDA host \
              or inside nvidia/cuda:13.0.3-devel-ubuntu22.04: /bin/sh \
              crates/sparkflash-kernels/scripts/check-kernel-baseline.sh"
         );
@@ -62,7 +62,7 @@ fn the_kernels_still_compile_to_the_recorded_baseline() {
 }
 
 /// The kernel list in `check-kernel-baseline.sh`, the manifest, the kernels on disk and the build
-/// script's `PROBED_KERNELS` table must name the same twenty-seven kernels. The script asserts the first
+/// script's `PROBED_KERNELS` table must name the same thirty kernels. The script asserts the first
 /// two when it runs; this pins all four without nvcc, so a kernel file added under `kernels/` - or a
 /// probe list edited without the baseline - fails here instead of letting the success line mean less
 /// than it says.
@@ -82,14 +82,16 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
         .collect();
     assert_eq!(
         listed.len(),
-        27,
-        "the list must name every baseline kernel - the twenty-five entries: the six Milestone 4 \
+        30,
+        "the list must name every baseline kernel - the thirty entries: the six Milestone 4 \
          kernels, the M7 SwiGLU quantiser epilogue and its weighted routed variant, the task-37 \
          device router, the task-8 routed gate/up GEMM, the serving tail's RMSNorm, the certified \
          head's device reduce, the CSA2 sequence attention entry, D49's ring-capacity CSA2 entry, \
          the D37 BF16-activation projection pair, the WS-D columns-only M=1 dense projection, the \
-         WS-D decode GEMV, the ref_seam host-weight decode GEMV, the layer-seam mHC cubin \
-         and the layer port's kv-path triple in one cubin: \
+         WS-D decode GEMV, the ref_seam host-weight decode GEMV, the layer-seam mHC cubin, \
+         the layer port's kv-path triple in one cubin, and the three S1 device-layer sources \
+         (Engram gate/write, the two-direction stream conversion cubin, the routed-MoE \
+         staging/combine pair): \
          {listed:?}"
     );
 
@@ -352,12 +354,14 @@ fn the_loader_resolves_every_name_the_pinned_baseline_uses() {
             .split_whitespace()
             .next()
             .expect("a manifest kernel line names the kernel");
-        // Six baseline entries are loaded by name and deliberately have no KernelId: flash_mla
+        // Nine baseline entries are loaded by name and deliberately have no KernelId: flash_mla
         // through load_flash_mla, the WS-D columns-only M=1 dense symbol through
         // Cuda::load_dense_m1, the WS-D decode GEMV and the host-weight GEMV through their own
         // name loaders, the whole-layer port's three-symbol seam cubin through
-        // Cuda::load_layer_seams and the kv-path cubin through its three by-name loaders (one
-        // image, three symbols, one pin, and a KernelId names one symbol).
+        // Cuda::load_layer_seams, the kv-path cubin through its three by-name loaders (one image,
+        // three symbols, one pin, and a KernelId names one symbol), and the three S1 device-layer
+        // cubins through their own by-name loaders (Engram gate/write, the two-direction stream
+        // conversion pair, the routed-MoE staging/combine pair).
         if name == "flash_mla_csa2_sm121"
             || name == "b12x_mxfp8_dense_m1_sm121"
             || name == "b12x_mxfp8_gemv_m1_sm121"
@@ -366,6 +370,9 @@ fn the_loader_resolves_every_name_the_pinned_baseline_uses() {
             || name == "kv_path_sm121"
             || name == "ref_select_sm121"
             || name == "compressed_append_sm121"
+            || name == "engram_write_sm121"
+            || name == "engram_stream_convert_sm121"
+            || name == "moe_routed_device_sm121"
         {
             continue;
         }
@@ -377,8 +384,9 @@ fn the_loader_resolves_every_name_the_pinned_baseline_uses() {
     }
     assert_eq!(
         checked, 19,
-        "the manifest pins nineteen driver kernels (twenty-five entries; flash_mla, the three \
-         WS-D/ref_seam M=1 symbols, the layer-seam cubin and the kv-path cubin have no KernelId)"
+        "the manifest pins nineteen driver kernels (thirty entries; flash_mla, the three \
+         WS-D/ref_seam M=1 symbols, the layer-seam cubin, the kv-path cubin and the three S1 \
+         device-layer cubins have no KernelId)"
     );
 }
 

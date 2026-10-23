@@ -11,7 +11,7 @@ Current-state handbook for the RDMA/collective layer on the four DGX Spark nodes
 | --- | --- | --- |
 | host-staged one-shot RDMA all-reduce | implemented, measured on 4 nodes, **not** wired into the forward row | MEASURED |
 | canonical host reduce over TCP | implemented; the reference semantics and the fallback | MEASURED |
-| NCCL 2.28+ binding (dlopen) | implemented; no fabric run of the NCCL arm exists | DESIGN |
+| NCCL 2.28+ binding (dlopen) | implemented; the only four-rank run of this arm is an **INVALID** unlocked 10 KiB bench (`valid: false`, clocks 208/3003 MHz, bit-exact `max_ulp 0`); the clock-locked gate has no row. The S1-0 80 reduces/step walk is the TCP reference skeleton, not this arm | DESIGN for the gate; MEASURED (invalid diagnostic) |
 | device-buffer seam (`all_reduce_bf16_device`) | `CommError::Unsupported` stub | DESIGN |
 | 25 us p50 decode all-reduce gate | never met on this fabric | MEASURED (missed) |
 | MTU 9000 on hosts | applied and persisted 2026-10-21 | MEASURED |
@@ -231,7 +231,7 @@ order is not the canonical rank order — that is the arm, not a defect.
 | blocker | effect | owner |
 | --- | --- | --- |
 | `nvidia-peermem` rebuild (needs root) | GPU-initiated RDMA arm unbuildable; only NCCL over socket/RoCE is available | root |
-| no fabric run of either device arm | NCCL arm cost is DESIGN only; `gpu-reduce-bench` has no number | comm-lead + a ~3 idle-node-minute window |
+| the clock-locked 10 KiB NCCL gate is still unmeasured | the four-rank NCCL bench was run **unlocked only** (`valid: false`, bit-exact): `nvidia-smi -lgc` needs root/passwordless sudo, so its p50/p99 are INVALID and are not a gate row. The S1-0 80/step walk is TCP and says nothing about NCCL's cost | root (clock-lock privilege) + comm |
 | `IBV_WC_RETRY_EXC_ERR` and ~2 ms stalls | 1/5 dual-rail 10,000-replay runs completed; 2 MiB is ~46x its bar | comm + data plane |
 | 25 us p50 gate | missed by 1.4x at 35.70 us even at MTU 9000 | comm / fabric |
 | device seam returns `Unsupported` | no zero-copy collective; kernel and data plane remain two protocols (slot geometry, arrival signalling, rail split, caller model) | device-lead |

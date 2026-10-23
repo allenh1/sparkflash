@@ -3039,6 +3039,54 @@ impl Cuda {
         ))
     }
 
+    /// engram_write_bf16: the Engram residual write, loaded by name from its own cubin (the pin is
+    /// owned by the launch module's constants, and no KernelId routes to it).
+    ///
+    /// # Errors
+    /// Returns the driver's error when the cubin does not contain the symbol.
+    pub fn load_engram_write(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "engram_write_bf16")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "engram_write_bf16",
+            },
+        ))
+    }
+
+    /// engram_narrow_bf16: the f32 -> bf16 stream conversion, loaded by name from its own cubin (the
+    /// pin is owned by the launch module's constants, and no KernelId routes to it).
+    ///
+    /// # Errors
+    /// Returns the driver's error when the cubin does not contain the symbol.
+    pub fn load_engram_narrow(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "engram_narrow_bf16")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "engram_narrow_bf16",
+            },
+        ))
+    }
+
+    /// engram_widen_f32: the bf16 -> f32 stream conversion, loaded by name from the same cubin as
+    /// the narrow.
+    ///
+    /// # Errors
+    /// Returns the driver's error when the cubin does not contain the symbol.
+    pub fn load_engram_widen(&self, cubin: &[u8]) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, "engram_widen_f32")?;
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                name: "engram_widen_f32",
+            },
+        ))
+    }
+
     /// Loads the WS-D columns-only M=1 dense symbol from its own cubin by name.
     ///
     /// This symbol lives in its own cubin (`kernels/b12x_mxfp8_dense_m1_sm121.cu`), not in the

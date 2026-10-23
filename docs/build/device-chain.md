@@ -24,7 +24,7 @@ into the ABI crate).
 | Arm | Selection | Properties |
 | :-- | :-- | :-- |
 | Host reference | default | Bit-exact CPU/GPU lean loop; current published number. |
-| Device layer | `SPARKFLASH_LAYER_DEVICE=1` | One layer device-resident; opt-in until the whole layer runs. A missing kernel refuses by name with its signature. |
+| Device layer | `SPARKFLASH_LAYER_DEVICE=1` | One layer device-resident; opt-in until the whole layer runs. A missing kernel refuses by name with its signature. **On hardware since 2026-10-23**: opens on all four ranks, runs the nine wired stages of layer 0, refuses at `attention_body`. |
 
 There is no "run what is landed" mode: a half-device layer that silently mixes arms is the failure
 mode the contract prevents. A refusal prints the stage, the missing kernel and the contract.
@@ -36,31 +36,43 @@ The stage order is the dependency order in `LayerStages::run_layer`. The contrac
 
 | # | Stage | Kernel / operation | State |
 | --: | :-- | :-- | :-- |
-| 1 | `engram_write` | `engram_embed/wkv/gate_write_sm121` | layer 0 no-op; later layers unwritten |
-| 2 | `mhc_entry` | `mhc_entry_bf16` (20-word ABI) | landed |
-| 3 | `quantise_prologue` | `w8a8_prologue_e4m3` | landed |
-| 4 | `attention_projections` | `b12x_mxfp8_gemv_m1_sm121` | landed |
-| 5 | `query_path` | rmsnorm, `w8a8_prologue_bf16_e4m3`, wq_b GEMV, 16 rope launches | landed; rope launch count is a hoist candidate |
-| 6 | `kv_path` | `kv_norm_rope_bf16`, `window_quant_fp8_bf16`, `kv_append_bf16` | landed; declared bf16-latent widening (D54 item, 2 % bound) |
-| 7 | `reference_seam` | `b12x_hostw_gemv_m1_sm121` + index writes | refuses: compressor weights, compressed-cache/index writes, `AttnState` residency |
-| 8 | `ref_select` | `ref_select_sm121` (18 words) | line landed; kernel pinned; top-k over <= 16,384 candidates, ascending-id tie-break; body still unwired |
-| 9 | `stage_attention` | native FP4 expanded store | refuses; expanded store is the chosen cache-native form |
-| 10 | `attention_body` | `flash_mla_csa2_seq_sm121` | wiring not started; ring pointer, `window_rows = min(position,128)`, `selected_count` |
-| 11 | `attention_output` | inverse rope (new), `b12x_bf16a_mxfp8w_wo_a_sm121`, `w8a8_prologue_bf16_e4m3`, GEMV | not started; inverse rope is the only new kernel |
-| 12 | `all_reduce` | `comm_all_reduce_bf16` (NCCL) | refuses until bootstrap; one `RunReduce` per run |
-| 13 | `attention_residual` | `mhc_attn_residual` | landed |
-| 14 | `ffn_seams` | `mhc_ffn_seams` | landed; `ffn_x_bf16` out row in flight |
-| 15 | `moe_router` | `moe_router_sm121`, `moe_router_topk_sm121` | not started; needs the un-normalised bf16 pre-FFN row |
-| 16 | `moe_routed` | `b12x_mxfp4_moe_stored_sm121` + 3 | plumbing landed; per-expert loop, f32 delta -> bf16 pre-reduce |
-| 17 | `all_reduce_moe` | `comm_all_reduce_bf16` | refuses; same handle/sequence as #12 |
-| 18 | `all_reduce_rdma_arm` | GPU-initiated RDMA | typed refusal unless `gpu-rdma-reduce` is built |
-| 19 | `moe_shared` | 3 GEMVs + `shared_swiglu_f32` / coded arm | landed, both arms |
-| 20 | `ffn_epilogue` | `mhc_ffn_epilogue` | landed; `shared_present=0` until #19's row is declared |
+| 1 | `engram_write` | `engram_write_bf16` + the two stream conversions | layer 0 no-op wired and **ran**; later layers still refuse (at-open row arena + 6-launch chain unwired) |
+| 2 | `mhc_entry` | `mhc_entry_bf16` (20-word ABI) | landed and **ran** on layer 0 |
+| 3 | `quantise_prologue` | `w8a8_prologue_e4m3` | landed and **ran** |
+| 4 | `attention_projections` | `b12x_mxfp8_gemv_m1_sm121` | landed and **ran** |
+| 5 | `query_path` | rmsnorm, `w8a8_prologue_bf16_e4m3`, wq_b GEMV, 16 rope launches | landed and **ran**; rope launch count is a hoist candidate |
+| 6 | `kv_path` | `kv_norm_rope_bf16`, `window_quant_fp8_bf16`, `kv_append_bf16` | landed and **ran**; declared bf16-latent widening (D54 item, 2 % bound) |
+| 7 | `reference_seam` | `b12x_hostw_gemv_m1_sm121` + index writes | **ratio 0** wired as window metadata (no launch) and **ran**; ratio>0 refuses (compressor/index host-seam class) |
+| 8 | `ref_select` | `ref_select_sm121` (18 words) | **ratio 0** identity no-op wired and **ran**; ratio>0 unwired; kernel pinned, top-k over <= 16,384 candidates, ascending-id tie-break |
+| 9 | `stage_attention` | native FP4 expanded store | **ratio 0** validation-only wired and **ran**; ratio>0 refuses (expanded store unwired) |
+| 10 | `attention_body` | `flash_mla_csa2_seq_sm121` | **refuses: the frontier.** Launch exists and the query row is device-resident; the per-head sink and indexer spans are not allocated on the arm. 19-word builder + inverse-rope builder landed and tested |
+| 11 | `attention_output` | inverse rope (new), `b12x_bf16a_mxfp8w_wo_a_sm121`, `w8a8_prologue_bf16_e4m3`, GEMV | refuses; 8/8/11-word builders landed, wiring pending |
+| 12 | `all_reduce` | `comm_all_reduce_bf16` (NCCL) | enqueue wired; not reached in a step. The 2026-10-23 run's 80/step walk is the **TCP reference skeleton**, not this stage; the NCCL arm's only four-rank run is an INVALID unlocked 10 KiB bench |
+| 13 | `attention_residual` | `mhc_attn_residual` | landed; not reached in a step |
+| 14 | `ffn_seams` | `mhc_ffn_seams` | landed; writes the `ffn_x_bf16` row the router reads; feeds #15's probe guard |
+| 15 | `moe_router` | `moe_router_sm121`, `moe_router_topk_sm121` | wired, guarded by the `ffn_seams` probe count; not reached in a step |
+| 16 | `moe_routed` | `b12x_mxfp4_moe_stored_sm121` + 3 | device path (staging table + ordered combine, 8 launches/0 copies) landed and pinned; stage body refuses |
+| 17 | `all_reduce_moe` | `comm_all_reduce_bf16` | wired; same handle/sequence as #12 |
+| 18 | `moe_shared` | 3 GEMVs + `shared_swiglu_f32` / coded arm | landed, both arms; not reached in a step |
+| 19 | `all_reduce_rdma_arm` | GPU-initiated RDMA | typed refusal unless `gpu-rdma-reduce` is built; never called by the NCCL arm |
+| 20 | `ffn_epilogue` | `mhc_ffn_epilogue` | landed |
 
-**Frontier: `reference_seam` by stage order.** The first device-arm probe row is a frontier probe,
-not a speed row; if it completes a layer it must pass the numerical gate. `ref_select` and
-`compressed_append` are pinned but their stage bodies are unwired; the remaining new kernel is the
-inverse rope in `attention_output`.
+**Frontier: `attention_body` (stage 10), measured on hardware on 2026-10-23.** The S1-0 probe ran the
+frozen nine-position argv on four ranks with `SPARKFLASH_LAYER_DEVICE=1`: the arm opened on 4/4 ranks,
+`mhc_seam` bound `400 expected = 400 bound`, the arena bind was complete (attention 208/208 with 19
+declared host seams, census 95,818 resident, per-token weight H2D 0 by construction), the 40-layer
+reference walk over TCP executed its 80 reduces/step (the NCCL arm's enqueue is never reached: the
+stop is at stage 10, before `all_reduce` at stage 12), and layer 0 position 0 ran stages 1-9 before the
+named refusal at stage 10. All four
+ranks exited rc=2 (documented refusal). No step completed, so there is no ms/step and no D54 row;
+`docs/build/s1-result.md` is the record and the raw evidence is archived at
+`docs/archive/build/s1-device-probe-20261023/`.
+
+The first device-arm probe row is a frontier probe, not a speed row; if it completes a layer it must
+pass the numerical gate. The remaining new kernel for the attention half is the inverse rope in
+`attention_output`; the bodies to wire next are `attention_body`, `attention_output`, the Engram
+6-launch chain and `moe_routed`, then the device head (the arm cannot report `d2h = 1` until the host
+head stops consuming the residual).
 
 ## Memory and ownership invariants
 
@@ -131,12 +143,22 @@ A device-arm row that fails the numerical gate is a port bug, not a tolerance qu
 publish ms/step from `win/layer-device` until one full layer runs device-only and the branch is
 measured as a whole.
 
+S1-0 ran on 2026-10-23 with the frozen nine-position argv (four ranks, cross-built `aarch64` binary,
+30/30 cubin pins, NCCL 2.31.2); its outputs are in `docs/build/s1-result.md` and the archived evidence
+bundle. The run's only numbers are open/bind figures: the forward stops at layer 0 position 0, so it
+is not a speed row and carries no tolerance arm.
+
 ## Open items
 
-- Wire: `ref_select`, compressed-store append, `moe_router` body, `attention_body` /
-  `attention_output`, `reference_seam` and `stage_attention` bodies; write the inverse-rope kernel.
-- Bring up NCCL bootstrap and the two per-layer reduces.
-- Finish `AttnState` residency and the device KV ownership move.
+- Wire: `attention_body` (sink/index spans), `attention_output` (inverse rope + wo_a/wo_b), the Engram
+  at-open row arena + 6-launch chain, and `moe_routed`; then the device head so a completed step can
+  report `d2h = 1`.
+- Ratio>0 `reference_seam`/`ref_select`/`stage_attention`: move the 19 `AttentionHostSeam` operands
+  into the bind and port the compressor/index path (19 tensors, no arena today).
+- An S1-a mixed-arm loop (the arm is chosen once per run today) and the frozen 32×128 D54 fixture.
+- The clock-locked 10 KiB collectives gate: the only four-rank NCCL bench is bit-exact but INVALID
+  (unlocked clocks), and `nvidia-smi -lgc` needs root/passwordless sudo on the nodes, so no valid gate
+  row exists yet. The 80/step reference walk is TCP.
 - Flip the default to the device arm (one commit) after one full device-only layer.
 - Then: CUDA graph capture and the GEMV re-tile.
 
@@ -150,4 +172,7 @@ measured as a whole.
 `ws-run-pld1-probe1-20261022.md`, `ws-layer-stage-scorecard-20261022.md`,
 `head-stage-loop.md`, `head-tail-contract.md`, `moe-stage-contract.md`, `m25-stored-chain-abi.md`,
 `engine-tp-seams.md`, `engine-kv-seam-decision.md`, `phase2-device-kv-store.md`,
-`gpu-device-roadmap.md`, `roadmap-to-serving.md`, `serving-readiness.md`, `phase1-boundary-table.md`.
+`gpu-device-roadmap.md`, `roadmap-to-serving.md`, `serving-readiness.md`, `phase1-boundary-table.md`,
+plus the S1 device-port window records `s1-p1-engram-wiring.md`, `s1-p2-attention-wiring.md`,
+`s1-p3-moe-wiring.md`, `s1-p4-collectives.md`, `s1-qa-harness.md` and the 2026-10-23 probe bundle
+`s1-device-probe-20261023/`.

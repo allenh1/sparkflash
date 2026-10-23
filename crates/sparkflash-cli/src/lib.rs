@@ -10,7 +10,9 @@ pub mod bootlog;
 pub mod chain_timing;
 pub mod convert;
 pub mod device_chain;
+pub mod device_counters;
 pub mod doctor;
+pub mod layer_attention_stages;
 pub mod layer_device;
 pub mod logits_dump;
 #[cfg(feature = "cuda")]

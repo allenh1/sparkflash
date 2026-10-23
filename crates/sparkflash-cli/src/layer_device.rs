@@ -1411,19 +1411,19 @@ pub const STAGE_BLOCKERS: &[(&str, &str)] = &[
     ),
     (
         "reference_seam",
-        "the seam's window selection is device work already; the stage is blocked on the kv_path row it consumes",
+        "wired for the released ratio-0 layers (0 and 1): the seam is the sliding-window metadata and an empty id list there, with no launch and no copy. Layers 2..39 (ratio 2 then 1) are a port, not wiring: the compressor's wkv/wgate and the indexer's wk/weights_proj are AttentionHostSeam in the plan (not bound into the arena), and the compressed side needs pool_group/narrow, the compressed append and the candidate select on device",
     ),
     (
         "ref_select",
-        "the kernel, its CPU twin and its cubin pin are landed; the body is refused because its operands (the window keys and the reference indexer query) have no device spans until the kv_path re-point lands the window ring",
+        "wired as the identity no-op for ratio-0 layers: the seam's id list is empty there, so there is nothing to select. Ratio>0 needs the indexer key/weight class in the arena bind (AttentionHostSeam today) and the pinned ref_select_sm121 launch over the window ring; the kernel itself is landed and pinned",
     ),
     (
         "stage_attention",
-        "the row staging is a host copy through StagedAttention today; the kernel takes device rows",
+        "wired as validation for ratio-0 layers: the window rows are already in the device ring and the stage checks the ring row count, the window bounds and the empty candidate list without copying anything. Ratio>0 also stages the selected ids and the compressed store rows, and the compressed-store producer is the reference_seam port above",
     ),
     (
         "attention_body",
-        "the flash_mla_csa2_seq_sm121 launch exists, but its query row arrives through the host structs the stages above build",
+        "the launch exists (flash_mla_csa2_seq_sm121) and the query row is already device-resident (query_path writes workspace.q); what blocks the body is its operand set: the per-head sink and the indexer spans (index_key, index_query, block_scores, block_best) have no device spans on this arm - the plan classifies them host-seam and the layer slab does not carry them - so one run allocation plus the launch call is the work",
     ),
     (
         "attention_output",

@@ -117,7 +117,7 @@ pub const PARAMS: [(&str, &str, bool, bool); ARG_WORDS] = [
 pub const SIGNATURE: &str = "const uint8_t *__restrict__ act_fp8; const uint8_t *__restrict__ act_scales; const uint8_t *__restrict__ w1_fp4; const uint8_t *__restrict__ w1_scales; const uint8_t *__restrict__ w3_fp4; const uint8_t *__restrict__ w3_scales; const uint32_t *__restrict__ expert_ids; const float *__restrict__ routing_weights; uint8_t *__restrict__ out_fp8; uint8_t *__restrict__ out_scales; const uint32_t tokens; const float limit; GpuTraceRing *__restrict__ trace_ring; const uint32_t layer_id; const uint64_t step_seq";
 
 /// The number of pinned baseline kernels today (`baseline/kernel_baseline.txt`).
-pub const BASELINE_ENTRIES_NOW: usize = 27;
+pub const BASELINE_ENTRIES_NOW: usize = 30;
 /// The baseline entry count once this kernel is pinned: the standing rule's 20 -> 21 step.
 pub const BASELINE_ENTRIES_AFTER_PIN: usize = BASELINE_ENTRIES_NOW + 1;
 
@@ -397,11 +397,11 @@ mod tests {
         .expect("the manifest entry and the pin fields move in one commit");
         // The compile-time copy and the working tree must be the same file.
         assert_eq!(BASELINE.lines().count(), manifest.lines().count());
-        // The standing rule the checklist quotes: 25 entries today (the two WS-D symbols, the
-        // host-weight GEMV, the layer-seam cubin and the kv-path cubin are the latest additions),
-        // 26 after the pin job.
-        assert_eq!(BASELINE_ENTRIES_NOW, 27);
-        assert_eq!(BASELINE_ENTRIES_AFTER_PIN, 28);
+        // The standing rule the checklist quotes: 30 entries today (the two WS-D symbols, the
+        // host-weight GEMV, the layer-seam cubin, the kv-path cubin and the three S1 device-layer
+        // cubins are the latest additions), 31 after the pin job.
+        assert_eq!(BASELINE_ENTRIES_NOW, 30);
+        assert_eq!(BASELINE_ENTRIES_AFTER_PIN, 31);
         // The pin job's other artifacts must agree with the manifest's state.
         let script = include_str!("../scripts/check-kernel-baseline.sh");
         let list = script

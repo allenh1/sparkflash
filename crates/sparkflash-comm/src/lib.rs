@@ -51,6 +51,7 @@ pub mod dispatch;
 pub mod error;
 mod exchange;
 pub mod fabric;
+pub mod host_bridge;
 pub mod layout;
 pub mod microbench;
 #[cfg(unix)]
@@ -78,6 +79,9 @@ pub use fabric::{
     RAIL_OVERRIDE_ENV, RailOverride, RailSelection, RailSelectionSource, RailTelemetrySnapshot,
     RdmaDevice, SPEC_RAIL0_INTERFACE, SPEC_RAIL1_INTERFACE, SYSFS_INFINIBAND_ROOT, SelectedRail,
     parse_rate_gbps, spec_device,
+};
+pub use host_bridge::{
+    BridgeIo, BridgeStage, HOST_BRIDGE_FEATURE, HOST_BRIDGE_LABEL, HostBridgeReduce,
 };
 pub use layout::{
     CollectiveLayout, FabricLink, FabricSchedule, MAX_FRAME_ELEMENTS, REFERENCE_WORLD_SIZE,

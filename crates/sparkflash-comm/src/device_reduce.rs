@@ -37,6 +37,14 @@
 //!    detection, not completion), then the stats read, then close(handle) exactly once on the
 //!    path that also closes the transport.
 //!
+//! The async-failure check is [`RunReduce::check_async_failure`]. It is optional at the symbol
+//! level: a library that does not export `ncclCommGetAsyncError` loads and runs, the check returns
+//! `Ok` and [`RunReduce::async_failure_check_available`] is false, and the port's step sync is then
+//! the only detection (the run record must say so rather than claim a check it could not perform).
+//! When the symbol is present, `ncclSuccess` and `ncclInProgress` are "no failure" and every other
+//! communicator status is [`NcclError::AsyncFailure`] - a failure detected after completion has
+//! already been observed, so the run must abort on every rank.
+//!
 //! Invariants: the reduced row never crosses PCIe in steady state; the only legitimate readback is
 //! the logits at the position boundary; every rank enqueues the same collectives in the same order,
 //! so no rank-conditional path may skip a reduce - a skip hangs the communicator instead of failing
@@ -70,6 +78,40 @@
 //! defect: D54 admits it, the bench measures its deviation, and any claim beyond the declared bars
 //! would have to go back through the canonical path instead.
 //!
+//! ## The declared S1 host-bridge exception (typed, counted, opt-in, never a fallback)
+//!
+//! S1 ships one declared exception to "the reduced row never crosses PCIe in steady state": when the
+//! device arm cannot run on a node, the two per-layer collectives MAY run through the declared
+//! host-bridge arm - a device->host copy of this rank's row, the host reduce the lean loop already
+//! implements ([`crate::tcp::TcpTransport`] over the run's own transport), and a host->device copy
+//! back into the caller's output span. The declaration is these five clauses:
+//!
+//! 1. **It is the only permitted copy besides the final logits.** No other stage, seam, observation
+//!    point or intermediate row may acquire a D2H/H2D pair; the bridge is not a general escape hatch.
+//! 2. **Only the two per-layer collectives are representable.**
+//!    [`crate::host_bridge::BridgeStage`] has exactly two variants, the attention delta (`all_reduce`)
+//!    and the routed MoE delta (`all_reduce_moe`), and [`crate::host_bridge::BridgeStage::parse`]
+//!    refuses every other stage name. A stage cannot ask for the bridge and get one.
+//! 3. **It is opt-in, twice.** The implementation is behind the off-by-default `s1-host-bridge`
+//!    cargo feature, and a run must construct [`crate::host_bridge::HostBridgeReduce`] for it
+//!    explicitly. No default path, inherited arm or environment variable reaches it implicitly.
+//! 4. **It is typed.** It is not a device communicator: [`ReduceArm::HostBridge`] exists so the row
+//!    can say `reduce=host-bridge`, and [`ReduceArm::require_available`] refuses it for
+//!    [`RunReduce`]/[`DeviceReduce`] before any library or communicator is touched. There is no code
+//!    path that opens NCCL when the host bridge was selected - a silent fallback in either direction
+//!    is the failure this type exists to make impossible.
+//! 5. **It is counted.** A completed bridge reduce records the same collective/element/byte counters
+//!    as a device reduce, plus `bridge_collectives`, `bridge_d2h_bytes` and `bridge_h2d_bytes` in
+//!    [`DeviceReduceStats`], so the run record can print `reduce=host-bridge` and the extra copies
+//!    without a new observation point. A bridge that fails at either copy or at the host reduce is
+//!    not counted: the run is aborting, and a partial bridge must not appear as completed work.
+//!
+//! Arithmetic: the host reduce is the canonical rank-order f32-accumulate-then-round path
+//! ([`crate::reduce`]), so this arm is the strict-mode arithmetic rather than the NCCL arm's ring
+//! order; D54's declared tolerance is over-satisfied by construction, and the cost is the two PCIe
+//! copies plus the blocking exchange. It exists for an S1 run that cannot start the device arm, not
+//! as a performance path, and it is never enabled by default.
+//!
 //! ## Why device addresses, not buffers
 //!
 //! The port's rows live in the arena and are handed around as Deviceptr; this crate has no CUDA
@@ -98,6 +140,12 @@ pub enum ReduceArm {
     /// GPU-initiated RDMA with GPUDirect: the reduce kernels write peer device memory over the
     /// fabric. Designed but not implemented while nvidia-peermem is root-blocked.
     GpuRdma,
+    /// The declared S1 exception: device->host, host reduce, host->device. This is NOT a device
+    /// collector arm - it is the stable label (`host-bridge`) for the one permitted copy path, and
+    /// every device API refuses it by name. Open it only as
+    /// [`crate::host_bridge::HostBridgeReduce`] under the off-by-default `s1-host-bridge` feature;
+    /// a run that selects this label can never fall through to NCCL.
+    HostBridge,
 }
 
 impl ReduceArm {
@@ -107,7 +155,17 @@ impl ReduceArm {
         match self {
             Self::Nccl => "nccl",
             Self::GpuRdma => "gpu_rdma",
+            Self::HostBridge => "host-bridge",
         }
+    }
+
+    /// Whether this arm is a device communicator (the two reduced rows never cross PCIe).
+    ///
+    /// The host-bridge arm is the declared S1 exception and is deliberately not one: it copies both
+    /// ways, so a caller that holds a device handle cannot mistake it for a device arm.
+    #[must_use]
+    pub const fn is_device(self) -> bool {
+        !matches!(self, Self::HostBridge)
     }
 
     /// Whether this build contains the arm's implementation.
@@ -116,6 +174,7 @@ impl ReduceArm {
         match self {
             Self::Nccl => true,
             Self::GpuRdma => cfg!(feature = "gpu-rdma-reduce"),
+            Self::HostBridge => cfg!(feature = "s1-host-bridge"),
         }
     }
 
@@ -123,7 +182,9 @@ impl ReduceArm {
     ///
     /// This is the no-silent-fallback rule: a caller that asked for gpu_rdma never gets NCCL's
     /// transport without asking again, because a run that fell back silently would publish numbers
-    /// under the wrong arm.
+    /// under the wrong arm. The same rule makes the host-bridge label refuse every device call site
+    /// unconditionally - it is only ever opened as
+    /// [`crate::host_bridge::HostBridgeReduce`], never as a device communicator.
     ///
     /// # Errors
     /// Returns NcclError::ArmUnavailable naming the arm and why it cannot run.
@@ -137,6 +198,18 @@ impl ReduceArm {
                 } else {
                     "this build has the gpu-rdma-reduce feature off; rebuild with the feature to arm it (no silent fallback to nccl)".to_owned()
                 },
+            }),
+            Self::HostBridge => Err(NcclError::ArmUnavailable {
+                arm: self.as_str(),
+                detail: format!(
+                    "the host-bridge arm is the declared S1 exception (device->host, host reduce, host->device), not a device collector: RunReduce/DeviceReduce refuse it so a run can never enqueue NCCL under the host-bridge label (no silent fallback in either direction); open it as HostBridgeReduce under the {} feature, which is {} in this build",
+                    crate::host_bridge::HOST_BRIDGE_FEATURE,
+                    if cfg!(feature = "s1-host-bridge") {
+                        "enabled"
+                    } else {
+                        "off"
+                    }
+                ),
             }),
         }
     }
@@ -178,14 +251,21 @@ fn payload_bytes(count: usize) -> Result<u64, NcclError> {
 
 /// What the layer reports about its cross-rank collectives instead of a per-position D2H record.
 ///
-/// Every field is a monotone counter of work actually enqueued; a failed enqueue is not counted, so
-/// a run that falls back to the host reduce reports fewer device collectives rather than a lie.
+/// Every field is a monotone counter of work actually completed; a failed enqueue is not counted, so
+/// a run that falls back to the host reduce reports fewer device collectives rather than a lie. The
+/// `bridge_*` fields are the declared S1 exception's account: how many of those collectives went
+/// through the device->host / host reduce / host->device path and how many bytes each direction
+/// carried. They stay zero on a device-only run, which is what makes "no PCIe copy in steady state"
+/// a checkable statement in the record rather than a comment.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeviceReduceStats {
     collectives: u64,
     elements: u64,
     bytes: u64,
     arena_bytes: u64,
+    bridge_collectives: u64,
+    bridge_d2h_bytes: u64,
+    bridge_h2d_bytes: u64,
 }
 
 impl DeviceReduceStats {
@@ -217,11 +297,53 @@ impl DeviceReduceStats {
         self.arena_bytes
     }
 
+    /// Collectives of the total that ran through the declared S1 host bridge.
+    ///
+    /// Non-zero only under `reduce=host-bridge`; a device-only run reports zero here, which is the
+    /// in-record proof that the steady-state loop took no D2H/H2D copy.
+    #[must_use]
+    pub const fn bridge_collectives(&self) -> u64 {
+        self.bridge_collectives
+    }
+
+    /// Bytes copied device->host by the host bridge (one payload per bridged collective).
+    #[must_use]
+    pub const fn bridge_d2h_bytes(&self) -> u64 {
+        self.bridge_d2h_bytes
+    }
+
+    /// Bytes copied host->device by the host bridge (one payload per bridged collective).
+    #[must_use]
+    pub const fn bridge_h2d_bytes(&self) -> u64 {
+        self.bridge_h2d_bytes
+    }
+
+    /// Copies per bridged collective: the D2H half and the H2D half. Fixed at two by the bridge's
+    /// contract, so a caller cannot invent a one-way bridge.
+    #[must_use]
+    pub const fn bridge_copies(&self) -> u64 {
+        self.bridge_collectives.wrapping_mul(2)
+    }
+
     fn set_arena_bytes(&mut self, bytes: u64) {
         self.arena_bytes = bytes;
     }
 
     fn record(&mut self, bytes: u64) {
+        self.record_completed(bytes);
+    }
+
+    /// Records one completed host-bridge collective: the same collective/element/byte counters a
+    /// device collective moves, plus the two copy counters. A failed bridge is not recorded, so a
+    /// run whose bridge aborted cannot claim the collective.
+    pub(crate) fn record_bridged(&mut self, bytes: u64) {
+        self.record_completed(bytes);
+        self.bridge_collectives = self.bridge_collectives.wrapping_add(1);
+        self.bridge_d2h_bytes = self.bridge_d2h_bytes.wrapping_add(bytes);
+        self.bridge_h2d_bytes = self.bridge_h2d_bytes.wrapping_add(bytes);
+    }
+
+    fn record_completed(&mut self, bytes: u64) {
         let elements = bytes / size_of::<u16>() as u64;
         self.collectives = self.collectives.wrapping_add(1);
         self.elements = self.elements.wrapping_add(elements);
@@ -382,6 +504,29 @@ impl<'api> DeviceReduce<'api> {
     #[must_use]
     pub fn as_raw(&self) -> nccl::NcclCommHandle {
         self.comm.as_raw()
+    }
+
+    /// Queries the communicator's asynchronous error status at the run boundary.
+    ///
+    /// Failure detection, not completion: call it after the step's sync and before reading
+    /// [`Self::stats`]. A library without `ncclCommGetAsyncError` returns `Ok` and
+    /// [`Self::async_failure_check_available`] is false (a documented no-op, not a failure).
+    ///
+    /// # Errors
+    /// Returns [`NcclError::Call`] when the query itself fails and [`NcclError::AsyncFailure`] when
+    /// the communicator reports an asynchronous failure; either one is an all-rank abort.
+    pub fn check_async_failure(&self) -> Result<(), NcclError> {
+        // SAFETY: the communicator is live for as long as self borrows the library.
+        unsafe { self.api.check_async_failure(self.comm.as_raw()) }
+    }
+
+    /// Whether the loaded library exports the run-boundary failure check.
+    ///
+    /// False means only the port's step sync detects a failure; the run record should state that
+    /// instead of claiming this check ran.
+    #[must_use]
+    pub fn async_failure_check_available(&self) -> bool {
+        self.api.has_async_failure_check()
     }
 }
 
@@ -589,6 +734,31 @@ impl RunReduce {
     #[must_use]
     pub const fn stats(&self) -> DeviceReduceStats {
         self.stats
+    }
+
+    /// Queries the communicator's asynchronous error status at the run boundary.
+    ///
+    /// Call it after the step's sync and before reading [`Self::stats`]: failure detection, not
+    /// completion. A library that predates `ncclCommGetAsyncError` returns `Ok` and
+    /// [`Self::async_failure_check_available`] is false - a documented no-op, not a failure; the run
+    /// record must then state that the sync was the only detection.
+    ///
+    /// # Errors
+    /// Returns [`NcclError::Call`] when the query itself fails and [`NcclError::AsyncFailure`] when
+    /// the communicator reports an asynchronous failure; either one means the run must abort on
+    /// every rank.
+    pub fn check_async_failure(&self) -> Result<(), NcclError> {
+        // SAFETY: the communicator is live until Drop, which runs before the library is released.
+        unsafe { self.api.check_async_failure(self.comm) }
+    }
+
+    /// Whether the loaded library exports the run-boundary failure check.
+    ///
+    /// False means only the port's step sync detects a failure; the run record should state that
+    /// instead of claiming this check ran.
+    #[must_use]
+    pub fn async_failure_check_available(&self) -> bool {
+        self.api.has_async_failure_check()
     }
 }
 
@@ -1085,6 +1255,43 @@ mod tests {
     }
 
     #[test]
+    fn the_host_bridge_arm_is_never_a_device_collector_arm() {
+        // The declared S1 exception exists as a label and a counted path, never as something a
+        // device handle can open: this is the no-silent-fallback property, on CPU, with no NCCL.
+        let arm = ReduceArm::HostBridge;
+        assert_eq!(arm.as_str(), "host-bridge");
+        assert!(!arm.is_device());
+        assert!(ReduceArm::Nccl.is_device());
+        assert_eq!(arm.is_built(), cfg!(feature = "s1-host-bridge"));
+        match arm.require_available() {
+            Err(NcclError::ArmUnavailable {
+                arm: reported,
+                detail,
+            }) => {
+                assert_eq!(reported, "host-bridge");
+                assert!(detail.contains("HostBridgeReduce"), "{detail}");
+                assert!(detail.contains("s1-host-bridge"), "{detail}");
+                assert!(detail.contains("no silent fallback"), "{detail}");
+            }
+            other => panic!("expected ArmUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opening_the_host_bridge_through_the_device_api_refuses_before_any_library() {
+        // Host-bridge selected for a device collector is an arm refusal, not a run: no NCCL load,
+        // no communicator, no fallback to nccl underneath the host-bridge label.
+        let id = NcclUniqueId::from_bytes([0u8; nccl::NCCL_UNIQUE_ID_BYTES]);
+        let error = RunReduce::open_with_arm(4, 0, id, ReduceArm::HostBridge, 0)
+            .expect_err("the host-bridge arm must refuse the device collector");
+        assert!(matches!(error, NcclError::ArmUnavailable { .. }));
+        // And the label is not silently rewritten to nccl in the refusal.
+        let text = error.to_string();
+        assert!(text.contains("host-bridge"), "{text}");
+        assert!(!text.contains("NCCL library"), "{text}");
+    }
+
+    #[test]
     fn a_zero_rank_world_is_refused() {
         assert!(matches!(validate_spec(0, 0), Err(NcclError::Config(_))));
     }
@@ -1130,8 +1337,52 @@ mod tests {
                 elements: 0,
                 bytes: 0,
                 arena_bytes: 0,
+                bridge_collectives: 0,
+                bridge_d2h_bytes: 0,
+                bridge_h2d_bytes: 0,
             }
         );
+        assert_eq!(DeviceReduceStats::default().bridge_copies(), 0);
+    }
+
+    #[test]
+    fn a_bridged_collective_moves_the_shared_counters_and_the_copy_account() {
+        // One completed host-bridge collective of the layer payload: same collective/element/byte
+        // accounting as the device arm, plus exactly one D2H half and one H2D half.
+        let mut stats = DeviceReduceStats::default();
+        stats.record_bridged(10_240);
+        assert_eq!(stats.collectives(), 1);
+        assert_eq!(stats.elements(), 5_120);
+        assert_eq!(stats.bytes(), 10_240);
+        assert_eq!(stats.bridge_collectives(), 1);
+        assert_eq!(stats.bridge_d2h_bytes(), 10_240);
+        assert_eq!(stats.bridge_h2d_bytes(), 10_240);
+        assert_eq!(stats.bridge_copies(), 2);
+    }
+
+    #[test]
+    fn a_device_only_run_reports_no_bridge_copies() {
+        // The steady-state assertion the record relies on: device collectives never move the bridge
+        // counters, so `bridge_collectives() == 0` is a checkable "no PCIe copy" statement.
+        let mut stats = DeviceReduceStats::default();
+        stats.record(10_240);
+        assert_eq!(stats.collectives(), 1);
+        assert_eq!(stats.bridge_collectives(), 0);
+        assert_eq!(stats.bridge_copies(), 0);
+        assert_eq!(stats.bridge_d2h_bytes(), 0);
+        assert_eq!(stats.bridge_h2d_bytes(), 0);
+    }
+
+    #[test]
+    fn a_mixed_run_keeps_the_device_and_bridge_accounts_separate() {
+        let mut stats = DeviceReduceStats::default();
+        stats.record(10_240);
+        stats.record_bridged(10_240);
+        assert_eq!(stats.collectives(), 2);
+        assert_eq!(stats.elements(), 10_240);
+        assert_eq!(stats.bytes(), 20_480);
+        assert_eq!(stats.bridge_collectives(), 1);
+        assert_eq!(stats.bridge_copies(), 2);
     }
 
     #[test]

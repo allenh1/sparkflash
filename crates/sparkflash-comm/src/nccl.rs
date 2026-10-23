@@ -51,6 +51,16 @@
 //! [`NcclApi::load`] returns [`NcclError::LibraryAbsent`] naming both sonames and the vLLM image.
 //! The dispatcher must treat that as "NCCL unavailable" and refuse a >2 MiB collective or chunk it,
 //! never silently substitute the one-shot path; see [`crate::dispatch::DispatchPolicy::route_with`].
+//!
+//! ## Run-boundary failure detection
+//!
+//! `ncclCommGetAsyncError` is the one entry point this binding treats as optional. A library that
+//! exports it gets a real failure check ([`NcclApi::check_async_failure`]): the query's own failure
+//! is [`NcclError::Call`], `ncclSuccess`/`ncclInProgress` are "no failure", and any other
+//! communicator status is [`NcclError::AsyncFailure`]. A library without the symbol loads and runs;
+//! [`NcclApi::has_async_failure_check`] then reports the check as unavailable (a documented no-op,
+//! not an error) and the port's step sync is the only detection. The distinction matters because
+//! the run record must not claim a check that could not be performed.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fmt;
@@ -69,6 +79,10 @@ pub const NCCL_UNIQUE_ID_BYTES: usize = 128;
 pub const NCCL_OBSERVED_IMAGE: &str = "vllm-node:latest";
 
 /// NCCL entry points the dispatcher requires, in resolution order.
+///
+/// [`ASYNC_ERROR_SYMBOL`] is resolved separately and is optional: a library that predates it loads
+/// and runs, and the run boundary then reports the failure check as unavailable
+/// ([`NcclApi::has_async_failure_check`]) instead of treating the absence as an error.
 pub const REQUIRED_SYMBOLS: [&str; 9] = [
     "ncclGetVersion",
     "ncclGetUniqueId",
@@ -81,6 +95,13 @@ pub const REQUIRED_SYMBOLS: [&str; 9] = [
     "ncclGetErrorString",
 ];
 
+/// The optional run-boundary failure-detection entry point.
+///
+/// Resolved when present, never required: see [`NcclApi::check_async_failure`] for what a missing
+/// symbol means (the port's step sync remains the only detection) and for the typed failure it
+/// reports when the symbol is present.
+pub const ASYNC_ERROR_SYMBOL: &str = "ncclCommGetAsyncError";
+
 /// The opaque `ncclComm_t` handle.
 pub type NcclCommHandle = *mut c_void;
 
@@ -89,6 +110,13 @@ pub type CudaStream = *mut c_void;
 
 /// NCCL's success code.
 pub const NCCL_SUCCESS: c_int = 0;
+
+/// `ncclInProgress`: an asynchronous operation is still running.
+///
+/// `ncclCommGetAsyncError` reports this as the communicator's status while work is in flight; it is
+/// not a failure and the run boundary must not treat it as one. The value is the NCCL ABI's and is
+/// pinned by a test.
+pub const NCCL_IN_PROGRESS: c_int = 7;
 
 /// Encodes an NCCL version the way `ncclGetVersion` reports it.
 #[must_use]
@@ -298,12 +326,36 @@ pub enum NcclError {
         /// `ncclGetErrorString` text when it could be read, otherwise the numeric code.
         detail: String,
     },
+    /// The communicator reported an asynchronous operation failure at the run boundary.
+    ///
+    /// This is failure detection, not completion: the step's own sync has already observed the
+    /// collective, and this says the communicator's internal work failed (a transport drop, a peer's
+    /// error, or a CUDA fault surfacing through NCCL). The run must abort on every rank, because the
+    /// failed collective changed no rank's result consistently.
+    AsyncFailure {
+        /// The `ncclResult_t` the communicator reported asynchronously.
+        result: c_int,
+        /// `ncclGetErrorString` text for that result.
+        detail: String,
+    },
     /// The caller passed an unusable configuration (bad world/rank, malformed unique id).
     Config(String),
     /// The run's rendezvous failed before NCCL was entered: the unique-id exchange over the run's
     /// own TCP transport. This is an abort-before-NCCL error on purpose - no rank has opened a
     /// communicator when it occurs, so no peer can be left inside a collective.
     Bootstrap(String),
+    /// The declared S1 host-bridge fallback failed while it was running.
+    ///
+    /// The bridge is the one permitted device->host / host reduce / host->device path, so its
+    /// failure is reported by name and phase rather than flattened into a device-collective error:
+    /// the run record must be able to say which half of the only permitted copy failed. A failed
+    /// phase is not counted in [`crate::device_reduce::DeviceReduceStats`].
+    HostBridge {
+        /// Which half failed: `device-to-host`, `host-reduce` or `host-to-device`.
+        phase: &'static str,
+        /// What the phase reported.
+        detail: String,
+    },
 }
 
 impl fmt::Display for NcclError {
@@ -341,10 +393,18 @@ impl fmt::Display for NcclError {
                 formatter,
                 "{call} failed with ncclResult_t {result}: {detail}"
             ),
+            Self::AsyncFailure { result, detail } => write!(
+                formatter,
+                "the communicator reported an asynchronous failure at the run boundary: ncclResult_t {result}: {detail}; this is failure detection, not completion - the step sync has already observed the collective, and the run must abort on every rank"
+            ),
             Self::Config(text) => write!(formatter, "invalid NCCL configuration: {text}"),
             Self::Bootstrap(text) => write!(
                 formatter,
                 "NCCL bootstrap failed before any communicator was opened: {text}"
+            ),
+            Self::HostBridge { phase, detail } => write!(
+                formatter,
+                "the declared S1 host-bridge fallback failed at {phase}: {detail}; a failed bridge is not counted and the run must abort on every rank"
             ),
         }
     }
@@ -473,6 +533,9 @@ type AllGatherFn = unsafe extern "C" fn(
 type GroupFn = unsafe extern "C" fn() -> c_int;
 type CommDestroyFn = unsafe extern "C" fn(NcclCommHandle) -> c_int;
 type GetErrorStringFn = unsafe extern "C" fn(c_int) -> *const c_char;
+/// `ncclCommGetAsyncError(ncclComm_t, ncclResult_t *asyncError) -> ncclResult_t`: the return value
+/// is the query's own result; `asyncError` is the communicator's asynchronous status.
+type CommGetAsyncErrorFn = unsafe extern "C" fn(NcclCommHandle, *mut c_int) -> c_int;
 
 struct RawApi {
     get_version: *mut c_void,
@@ -484,6 +547,8 @@ struct RawApi {
     group_end: *mut c_void,
     comm_destroy: *mut c_void,
     get_error_string: *mut c_void,
+    /// Optional: None when the loaded library predates `ncclCommGetAsyncError`.
+    comm_get_async_error: Option<*mut c_void>,
 }
 
 /// A loaded NCCL library plus its resolved entry points.
@@ -544,6 +609,9 @@ impl NcclApi {
             group_end: resolve("ncclGroupEnd")?,
             comm_destroy: resolve("ncclCommDestroy")?,
             get_error_string: resolve("ncclGetErrorString")?,
+            // Optional: an image without it loads and runs; the boundary reports the check as
+            // unavailable rather than refusing a library that is otherwise complete.
+            comm_get_async_error: loader.symbol(ASYNC_ERROR_SYMBOL),
         };
         Ok(Self {
             loader,
@@ -587,8 +655,17 @@ impl NcclApi {
 
     /// Builds the error for a failed NCCL call, using `ncclGetErrorString` for the detail.
     fn call_error(&self, call: &'static str, result: c_int) -> NcclError {
+        NcclError::Call {
+            call,
+            result,
+            detail: self.error_text(result),
+        }
+    }
+
+    /// `ncclGetErrorString` text for a result code, or the numeric code when it cannot be read.
+    fn error_text(&self, result: c_int) -> String {
         // SAFETY: the symbol resolved as ncclGetErrorString; NCCL owns the returned string.
-        let detail = unsafe {
+        unsafe {
             let function: GetErrorStringFn = std::mem::transmute(self.raw.get_error_string);
             let pointer = function(result);
             if pointer.is_null() {
@@ -596,12 +673,70 @@ impl NcclApi {
             } else {
                 CStr::from_ptr(pointer).to_string_lossy().into_owned()
             }
-        };
-        NcclError::Call {
-            call,
-            result,
-            detail,
         }
+    }
+
+    /// Whether the loaded library exports `ncclCommGetAsyncError`.
+    ///
+    /// This is the failure check's availability, not a failure: a library without the symbol is
+    /// complete for everything this binding requires, and the port's step sync is then the only
+    /// failure detection. The run record should state this so a run is not accused of skipping a
+    /// check it could not perform.
+    #[must_use]
+    pub fn has_async_failure_check(&self) -> bool {
+        self.raw.comm_get_async_error.is_some()
+    }
+
+    /// Queries the communicator's asynchronous error status: failure detection, not completion.
+    ///
+    /// Called at the run boundary, after the step's sync and before the counters are read. Two rules
+    /// keep the result honest:
+    /// * **The check is optional at the symbol level.** A library without
+    ///   [`ASYNC_ERROR_SYMBOL`] returns `Ok(())` here and [`Self::has_async_failure_check`] reports
+    ///   the check as unavailable; an absent symbol is not a failure and never becomes one.
+    /// * **Only a real asynchronous failure is an error.** `ncclSuccess` and `ncclInProgress` both
+    ///   mean "no failure reported" (`ncclInProgress` is normal while work is in flight); every
+    ///   other communicator status is [`NcclError::AsyncFailure`], and a failure of the query call
+    ///   itself is [`NcclError::Call`].
+    ///
+    /// # Safety
+    /// `handle` must be a live communicator created by this library and not yet destroyed.
+    ///
+    /// # Errors
+    /// Returns [`NcclError::Call`] when the query call fails and [`NcclError::AsyncFailure`] when the
+    /// communicator reports an asynchronous failure.
+    pub(crate) unsafe fn check_async_failure(
+        &self,
+        handle: NcclCommHandle,
+    ) -> Result<(), NcclError> {
+        let Some(symbol) = self.raw.comm_get_async_error else {
+            return Ok(());
+        };
+        let mut async_error: c_int = NCCL_SUCCESS;
+        // SAFETY: the caller guarantees a live handle; symbol resolved as ncclCommGetAsyncError and
+        // async_error is a valid out-parameter for it.
+        let result = unsafe {
+            let function: CommGetAsyncErrorFn = std::mem::transmute(symbol);
+            function(handle, &mut async_error)
+        };
+        if result != NCCL_SUCCESS {
+            return Err(self.call_error(ASYNC_ERROR_SYMBOL, result));
+        }
+        self.classify_async_error(async_error)
+    }
+
+    /// Maps the communicator's asynchronous status to this binding's result.
+    ///
+    /// Split out so the mapping is testable without a library or a device: `ncclSuccess` and
+    /// `ncclInProgress` are "no failure", everything else is a typed failure.
+    fn classify_async_error(&self, async_error: c_int) -> Result<(), NcclError> {
+        if async_error == NCCL_SUCCESS || async_error == NCCL_IN_PROGRESS {
+            return Ok(());
+        }
+        Err(NcclError::AsyncFailure {
+            result: async_error,
+            detail: self.error_text(async_error),
+        })
     }
 
     /// Asks NCCL for a fresh unique id. Rank 0 does this and broadcasts the 128 bytes.
@@ -896,6 +1031,63 @@ mod tests {
             loader.symbols.remove(symbol);
             loader
         }
+
+        /// `with_all` plus a callable `ncclCommGetAsyncError` and a callable `ncclGetErrorString`.
+        ///
+        /// The failure path reads the detail through `ncclGetErrorString`, so that entry has to be a
+        /// real function here; `with_all`'s dummy addresses are only ever resolved, never called.
+        fn with_async(entry: *mut c_void) -> Self {
+            let mut loader = Self::with_all();
+            loader
+                .symbols
+                .insert("ncclGetErrorString", fake_error_entry(fake_error_string));
+            loader.symbols.insert(ASYNC_ERROR_SYMBOL, entry);
+            loader
+        }
+    }
+
+    unsafe extern "C" fn fake_error_string(code: c_int) -> *const c_char {
+        match code {
+            2 => c"simulated asynchronous system error".as_ptr(),
+            _ => c"simulated nccl error".as_ptr(),
+        }
+    }
+
+    unsafe extern "C" fn async_ok(_handle: NcclCommHandle, out: *mut c_int) -> c_int {
+        unsafe {
+            *out = NCCL_SUCCESS;
+        }
+        NCCL_SUCCESS
+    }
+
+    unsafe extern "C" fn async_in_progress(_handle: NcclCommHandle, out: *mut c_int) -> c_int {
+        unsafe {
+            *out = NCCL_IN_PROGRESS;
+        }
+        NCCL_SUCCESS
+    }
+
+    unsafe extern "C" fn async_system_failure(_handle: NcclCommHandle, out: *mut c_int) -> c_int {
+        unsafe {
+            *out = 2;
+        }
+        NCCL_SUCCESS
+    }
+
+    unsafe extern "C" fn async_query_fails(_handle: NcclCommHandle, _out: *mut c_int) -> c_int {
+        3
+    }
+
+    /// The symbol-table representation of a callable fake entry point.
+    fn fake_entry(
+        function: unsafe extern "C" fn(NcclCommHandle, *mut c_int) -> c_int,
+    ) -> *mut c_void {
+        function as *const () as *mut c_void
+    }
+
+    /// The symbol-table representation of the fake `ncclGetErrorString`.
+    fn fake_error_entry(function: unsafe extern "C" fn(c_int) -> *const c_char) -> *mut c_void {
+        function as *const () as *mut c_void
     }
 
     impl SymbolLoader for FakeLoader {
@@ -926,6 +1118,11 @@ mod tests {
 
     fn api_with_all() -> NcclApi {
         NcclApi::from_loader(Box::new(FakeLoader::with_all()))
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn api_with_async(entry: *mut c_void) -> NcclApi {
+        NcclApi::from_loader(Box::new(FakeLoader::with_async(entry)))
             .unwrap_or_else(|error| panic!("{error}"))
     }
 
@@ -991,6 +1188,9 @@ mod tests {
         ] {
             assert_eq!(op as c_int, value);
         }
+        // The run-boundary check's "still running" code is the NCCL ABI's, not this crate's guess.
+        assert_eq!(NCCL_SUCCESS, 0);
+        assert_eq!(NCCL_IN_PROGRESS, 7);
     }
 
     #[test]
@@ -1003,6 +1203,66 @@ mod tests {
             "from_loader must not call into the library; only load() probes the version"
         );
         assert_eq!(api.version_string(), None);
+        assert!(
+            !api.has_async_failure_check(),
+            "a library without ncclCommGetAsyncError must load: the boundary check is optional"
+        );
+    }
+
+    #[test]
+    fn a_missing_async_error_symbol_is_a_documented_no_op() {
+        let api = api_with_all();
+        assert!(!api.has_async_failure_check());
+        // SAFETY: no symbol is present, so the check calls nothing; the null handle is never dereferenced.
+        assert_eq!(unsafe { api.check_async_failure(ptr::null_mut()) }, Ok(()));
+    }
+
+    #[test]
+    fn the_async_failure_check_reports_only_real_asynchronous_failures() {
+        let handle = ptr::without_provenance_mut(0x1000);
+
+        let api = api_with_async(fake_entry(async_ok));
+        assert!(api.has_async_failure_check());
+        // SAFETY: the fake ignores the handle.
+        assert_eq!(unsafe { api.check_async_failure(handle) }, Ok(()));
+
+        let api = api_with_async(fake_entry(async_in_progress));
+        // SAFETY: the fake ignores the handle.
+        assert_eq!(
+            unsafe { api.check_async_failure(handle) },
+            Ok(()),
+            "ncclInProgress means work is in flight, not that it failed"
+        );
+
+        let api = api_with_async(fake_entry(async_system_failure));
+        // SAFETY: the fake ignores the handle.
+        match unsafe { api.check_async_failure(handle) } {
+            Err(NcclError::AsyncFailure { result, detail }) => {
+                assert_eq!(result, 2);
+                assert!(
+                    detail.contains("simulated asynchronous system error"),
+                    "{detail}"
+                );
+                let text = NcclError::AsyncFailure { result, detail }.to_string();
+                assert!(text.contains("run boundary"), "{text}");
+                assert!(text.contains("not completion"), "{text}");
+                assert!(text.contains("abort on every rank"), "{text}");
+            }
+            other => panic!("expected AsyncFailure, got {other:?}"),
+        }
+
+        let api = api_with_async(fake_entry(async_query_fails));
+        // SAFETY: the fake ignores the handle.
+        match unsafe { api.check_async_failure(handle) } {
+            Err(NcclError::Call { call, result, .. }) => {
+                assert_eq!(call, ASYNC_ERROR_SYMBOL);
+                assert_eq!(
+                    result, 3,
+                    "the query's own failure is a Call, not an AsyncFailure"
+                );
+            }
+            other => panic!("expected Call, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1083,5 +1343,18 @@ mod tests {
         .to_string();
         assert!(!text.contains("falling back"), "{text}");
         assert!(!text.contains("using oneshot"), "{text}");
+    }
+
+    #[test]
+    fn a_host_bridge_failure_names_the_phase_and_the_no_count_rule() {
+        let text = NcclError::HostBridge {
+            phase: "host-reduce",
+            detail: "peer rank 2 is no longer reachable".to_owned(),
+        }
+        .to_string();
+        assert!(text.contains("host-bridge"), "{text}");
+        assert!(text.contains("host-reduce"), "{text}");
+        assert!(text.contains("not counted"), "{text}");
+        assert!(text.contains("abort on every rank"), "{text}");
     }
 }

@@ -437,17 +437,49 @@ pub fn mhc_seam_layer_bytes(config: &ModelConfig) -> Result<u64, String> {
         .ok_or_else(|| "mhc_seam: the layer total overflows".to_string())
 }
 
+/// The shards the mhc_seam bind selects: the expected backbone names, looked up in the plan by
+/// **exact name**, in config order.
+///
+/// This is the F1b fix and it is a rule, not an optimisation. The earlier pass scanned
+/// `plan.shards()` and matched every shard whose name *ended with* one of the ten suffixes. The 30
+/// MTP-lane tensors (`mtp.0/1/2`, ten each) carry the same suffixes, so they bound as well and the
+/// coverage equality refused 400 expected / 430 bound at open. The device arm is the 40 backbone
+/// layers; the MTP lanes are a different consumer (S5), so the selection is derived from the
+/// expected name set and the plan is only ever consulted by exact name. No suffix scan remains in
+/// this class, and `bound == expected` is asserted by the caller.
+fn mhc_seam_bound_shards<'a>(
+    plan: &'a ResidentPlan,
+    config: &ModelConfig,
+) -> Vec<(&'a sparkflash_device::resident::ResidentShard, &'static str)> {
+    let by_name: BTreeMap<&str, &sparkflash_device::resident::ResidentShard> = plan
+        .shards()
+        .iter()
+        .map(|shard| (shard.name.as_str(), shard))
+        .collect();
+    let mut selected = Vec::with_capacity(config.n_layers * MHC_SEAM_PARTS.len());
+    for layer in 0..config.n_layers {
+        for (suffix, dtype) in MHC_SEAM_PARTS {
+            let name = format!("layers.{layer}.{suffix}");
+            if let Some(shard) = by_name.get(name.as_str()) {
+                selected.push((*shard, dtype));
+            }
+        }
+    }
+    selected
+}
+
 /// Binds the mhc_seam class: the ten stored tensors of every layer, from the same already-uploaded
 /// plan arena the attention bind reads. Additive by construction - it allocates nothing, reads
 /// nothing, copies nothing; it turns plan shard bytes into pointers and reports its own coverage.
 ///
 /// The expected set comes from the config alone, so an absent class reports the same sentence on
-/// every rank; bound names come from the plan, so a plan-vs-index disagreement is named in both
-/// directions like every other class.
+/// every rank; the selected names are exactly that set (F1b), so a plan-vs-index disagreement is
+/// named in both directions like every other class and an MTP-lane tensor can never bind.
 ///
 /// # Errors
-/// A resident shard whose planned dtype or stored byte count is not the class's stored layout, a
-/// missing arena slice (the plan and the arena disagree), a null pointer, or incomplete coverage.
+/// A selected shard whose placement, planned dtype or stored byte count is not the class's stored
+/// layout, a missing arena slice (the plan and the arena disagree), a null pointer, a bound set that
+/// differs from the expected set, or incomplete coverage.
 pub fn bind_rank_mhc_seam(
     arena: &ResidentArena,
     plan: &ResidentPlan,
@@ -455,16 +487,18 @@ pub fn bind_rank_mhc_seam(
 ) -> Result<RankBind, String> {
     let expected: BTreeSet<String> = mhc_seam_plan_names(config).into_iter().collect();
     let mut bound: BTreeMap<String, (Deviceptr, Deviceptr)> = BTreeMap::new();
-    for shard in plan.shards() {
+    for (shard, dtype) in mhc_seam_bound_shards(plan, config) {
         if shard.placement != sparkflash_device::resident::Placement::Resident {
-            continue;
+            return Err(format!(
+                "{}: planned as {:?}, the mhc_seam class binds Resident tensors only",
+                shard.name, shard.placement
+            ));
         }
-        let Some((suffix, dtype)) = MHC_SEAM_PARTS
+        let suffix = MHC_SEAM_PARTS
             .iter()
-            .find(|(suffix, _dtype)| shard.name.ends_with(suffix))
-        else {
-            continue;
-        };
+            .find(|(part, _dtype)| shard.name.ends_with(part))
+            .map(|(part, _dtype)| *part)
+            .unwrap_or("<unknown>");
         if shard.dtype != *dtype {
             return Err(format!(
                 "{}: planned as {}, the plan builder writes {dtype} for {suffix}",
@@ -499,6 +533,19 @@ pub fn bind_rank_mhc_seam(
         bound.insert(shard.name.clone(), (slice.ptr, slice.ptr));
     }
     let bound_names: BTreeSet<String> = bound.keys().cloned().collect();
+    // The F1b assertion, kept here rather than only inside the coverage report: the bound set is
+    // built from the expected set, so a difference means the derivation itself was edited. It is
+    // unreachable by construction and is stated anyway, because "400 expected, 430 bound" is the
+    // exact failure this class had and the next reader should not have to infer the invariant.
+    if bound_names != expected {
+        return Err(format!(
+            "mhc_seam bind: {} expected, {} bound; the bind must derive from the expected backbone \
+             names (layers.0..{}) and never from a suffix scan over the plan",
+            expected.len(),
+            bound_names.len(),
+            config.n_layers - 1
+        ));
+    }
     let coverage = check_bind_coverage("mhc_seam", &expected, &bound_names, &BTreeSet::new())?;
     Ok(RankBind {
         pointers: bound,
@@ -573,6 +620,66 @@ mod rank_plan_shape_tests {
             table.get("layers.2.attn.compressor.wkv.weight").copied(),
             Some((config.head_dim, config.dim)),
             "compressor wkv is replicated, both axes whole"
+        );
+    }
+
+    #[test]
+    fn the_mhc_seam_bind_is_the_expected_backbone_set_and_never_binds_the_mtp_lanes() {
+        // F1b, pinned as a unit test rather than left to the first open on a node. The old pass
+        // suffix-matched every resident shard, so the 30 MTP-lane tensors (mtp.0/1/2, ten each)
+        // bound too and the coverage check refused 400 expected / 430 bound.
+        let config = ModelConfig::v41_flash().expect("config");
+        let plan = released_plan();
+
+        // The fixture must actually carry the lanes, or the assertion below proves nothing. The
+        // plan carries all 2,401 `mtp.*` tensors; the 30 that matter are the ten seam-shaped ones
+        // per lane, because those are what a suffix scan would have bound.
+        let mut mtp_seam_names: BTreeSet<String> = BTreeSet::new();
+        for stage in 0..config.n_mtp_layers {
+            for (suffix, _dtype) in MHC_SEAM_PARTS {
+                mtp_seam_names.insert(format!("mtp.{stage}.{suffix}"));
+            }
+        }
+        let present: Vec<&str> = plan
+            .shards()
+            .iter()
+            .filter(|shard| mtp_seam_names.contains(&shard.name))
+            .map(|shard| shard.name.as_str())
+            .collect();
+        assert_eq!(
+            present.len(),
+            mtp_seam_names.len(),
+            "the released plan carries the ten seam-shaped tensors per MTP lane, so a suffix scan \
+             would over-bind them"
+        );
+        assert!(
+            mtp_seam_names
+                .iter()
+                .any(|name| name.ends_with(MHC_SEAM_PARTS[0].0)),
+            "the MTP names share the seam suffixes that the old scan matched"
+        );
+
+        let selected = mhc_seam_bound_shards(&plan, &config);
+        let expected: BTreeSet<String> = mhc_seam_plan_names(&config).into_iter().collect();
+        assert_eq!(expected.len(), config.n_layers * MHC_SEAM_PARTS.len());
+        assert_eq!(selected.len(), expected.len(), "400 expected, 400 bound");
+        let names: BTreeSet<String> = selected
+            .iter()
+            .map(|(shard, _)| shard.name.clone())
+            .collect();
+        assert_eq!(
+            names, expected,
+            "the bound names are exactly the expected names"
+        );
+        assert!(
+            selected
+                .iter()
+                .all(|(shard, _)| shard.name.starts_with("layers.")),
+            "no MTP-lane tensor may enter the backbone bind"
+        );
+        assert!(
+            selected.iter().all(|(shard, dtype)| shard.dtype == *dtype),
+            "every selected shard carries the class's planned dtype"
         );
     }
 }

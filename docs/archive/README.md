@@ -6,7 +6,7 @@ Historical records kept for provenance. They contain superseded numbers, rules a
 
 | Directory / file | Contents |
 | :-- | :-- |
-| `build/` | The old `docs/build/` tree: phase-3 kernel harnesses, device/speed-track windows, serving and TP=4 plans, D38/D41/D48 protocols, fabric bring-up, build records. 140+ files. |
+| `build/` | The old `docs/build/` tree: phase-3 kernel harnesses, device/speed-track windows, serving and TP=4 plans, D38/D41/D48 protocols, fabric bring-up, build records. 140+ files, including the S1 device-port window records (`s1-p*.md`, `s1-qa-harness.md`) and the 2026-10-23 S1-0 probe bundle (`s1-device-probe-20261023/`). |
 | `build/task32-evidence-README.md`, `build/task53-evidence-README.md` | The old READMEs for the evidence bundles that remain under `docs/build/`. |
 | `decisions-full.md` | The full D1-D54 decision log with evidence and consequences. The current register is [`../DECISIONS.md`](../DECISIONS.md). |
 | `RULES-speed.md` | The 2026-10-21 speed-track rules, superseded by [`../RULES.md`](../RULES.md). |

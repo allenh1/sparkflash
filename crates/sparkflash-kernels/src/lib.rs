@@ -21,6 +21,7 @@
 //! payload; see roce_reduce's module documentation.
 
 pub mod abi;
+pub mod attention_operands;
 pub mod attention_stage;
 pub mod baseline;
 pub mod bf16a_mxfp8w_launch;
@@ -35,11 +36,13 @@ pub mod compressor_staging;
 pub mod cuda_driver;
 pub mod cuda_harness;
 pub mod device_trace;
+pub mod engram_convert_launch;
 pub mod engram_embed_launch;
 pub mod engram_gate_write_launch;
 pub mod engram_head_ref;
 pub mod engram_native_ref;
 pub mod engram_wkv_launch;
+pub mod engram_write_launch;
 pub mod flash_mla_csa2_ring_launch;
 pub mod flash_mla_csa2_seq_launch;
 pub mod hostw_gemv_launch;
@@ -58,6 +61,7 @@ pub mod m7_layer0_shapes;
 pub mod mega_mhc_launch;
 pub mod mega_mhc_ref;
 pub mod mla_ref;
+pub mod moe_routed_device;
 pub mod mxfp4_moe_launch;
 pub mod mxfp4_moe_stored_abi;
 pub mod mxfp4_moe_stored_launch;

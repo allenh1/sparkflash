@@ -2725,6 +2725,18 @@ pub(crate) fn run_with_arena(
 ) -> TokenStageOutcome {
     match run_forward_loop(request, plan, Some((arena, bind)), transport) {
         Ok(run) => {
+            // The run boundary: the async-failure query means something only after this process has
+            // enqueued every launch of the run (and the last head logits copy has drained the
+            // default stream). A reported failure is a communicator abort, not a partial result, so
+            // the run refuses instead of returning numbers the library was already unhappy about.
+            if let Some(reduce) = request.reduce
+                && let Err(error) = reduce.0.borrow().check_async_failure()
+            {
+                return refused(
+                    request,
+                    format!("run boundary: NCCL asynchronous failure check: {error}"),
+                );
+            }
             let positions_run = run.tokens.ids.len();
             if positions_run == 0 {
                 return refused(
@@ -10720,6 +10732,32 @@ struct DeviceLayer<'a> {
     seam_trace: Option<sparkflash_kernels::cuda_driver::HostMapped>,
     /// The ring's capacity in events, for the record; zero when the ring is not armed.
     seam_trace_capacity: usize,
+    /// The attention window this position's seam stages produced, for `stage_attention` and the
+    /// body: which ring rows the query attends and how many compressed ids the select produced.
+    /// On the released ratio-0 layers (0 and 1) the seam has no compressor and no select, so this
+    /// metadata *is* the stage's whole output (`attention.rs:2109-2151`: ratio 0 returns the
+    /// window, empty ids and empty rows).
+    attn_window: AttentionWindow,
+}
+
+/// One position's attention window metadata, produced by `reference_seam` and `ref_select`.
+///
+/// This is host metadata about device rows - slot arithmetic from `position`, never a read of a
+/// device value - so filling it costs no PCIe crossing and cannot hide a copy. The rows themselves
+/// stay in the device ring; only a ratio-0 seam fills this without a launch, and a ratio-0 seam has
+/// no rows to stage (see the bodies).
+// Without the `cuda` feature the `impl` that fills this struct is not compiled, so the field type
+// would be the only reference to it; the attribute keeps both feature configurations warning-free
+// without pretending the struct is unused on the arm that uses it.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AttentionWindow {
+    /// How many window rows this query attends, oldest first, current row included.
+    window_rows: usize,
+    /// The first attended row's slot in the layer's linear window ring.
+    window_start: usize,
+    /// How many compressed ids the candidate select produced (0 for the ratio-0 class).
+    selected_count: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -10754,6 +10792,18 @@ impl<'a> DeviceLayer<'a> {
             ));
         }
         let hc_mult = config.hc_mult;
+        // The pinned CSA2 sequence entry attends at most SWA_WINDOW sliding-window rows
+        // (flash_mla_csa2_seq_launch::MAX_ATTENDED is selected + SWA_WINDOW), and the ratio-0
+        // reference seam hands it `min(position + 1, window_size)` rows. A config whose window is
+        // not the pinned 128 is refused here, at open, rather than producing a launch whose window
+        // the kernel would truncate silently.
+        if config.window_size != sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW {
+            return Err(format!(
+                "layer device: the config's window is {} rows but the pinned CSA2 sequence entry attends the released {}",
+                config.window_size,
+                sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW
+            ));
+        }
         // The seam kernels are compiled for the released geometry and silently return on anything
         // else, so a config that disagrees is refused here rather than producing a zero-valued row.
         sparkflash_kernels::layer_seams_launch::check_seam_geometry(
@@ -11202,6 +11252,7 @@ impl<'a> DeviceLayer<'a> {
             kv_ring_bytes: ring_bytes,
             seam_trace,
             seam_trace_capacity,
+            attn_window: AttentionWindow::default(),
         })
     }
 
@@ -11441,6 +11492,25 @@ impl<'a> DeviceLayer<'a> {
         self.kv_ring_bytes
     }
 
+    /// The communicator's own counters, read from the run's handle for the record.
+    ///
+    /// `None` means this arm has no handle (the host arm, or a refused open). The record reads
+    /// `arena_bytes` from here rather than printing the reserved-arena constant, so the account
+    /// cannot claim a number the communicator did not report.
+    fn reduce_stats(&self) -> Option<sparkflash_comm::device_reduce::DeviceReduceStats> {
+        self.reduce.map(|reduce| reduce.0.borrow().stats())
+    }
+
+    /// Whether the loaded library exposes `ncclCommGetAsyncError`, read for the record.
+    ///
+    /// `None` means this arm has no handle. `Some(false)` is not a failure: the symbol is optional,
+    /// the check is then a documented no-op, and the record must say "step sync only" rather than
+    /// credit the run with a check the library cannot perform.
+    fn reduce_async_failure_check_available(&self) -> Option<bool> {
+        self.reduce
+            .map(|reduce| reduce.0.borrow().async_failure_check_available())
+    }
+
     /// Enqueues one per-layer bf16 all-reduce over the layer's own spans.
     ///
     /// One enqueue on the run's one handle, count in bf16 elements (never bytes), no synchronise
@@ -11488,9 +11558,6 @@ impl<'a> DeviceLayer<'a> {
         probe::count(stage);
         Ok(())
     }
-    /// Attaches the run's reduce handle (opened by the chain's bootstrap before the
-    /// timed region). Called right after open: open's arity is the driver call site's, so the
-    /// handle joins the layer here instead of widening it.
     /// Attaches the router's per-layer weight/bias arena pointers.
     ///
     /// Both are the plan's own slices (BF16 gate [experts][dim], F32 bias [experts]); nothing is
@@ -11528,6 +11595,11 @@ impl<'a> DeviceLayer<'a> {
         Ok(())
     }
 
+    /// Attaches the run's reduce handle (opened by the chain's bootstrap before the timed region).
+    ///
+    /// Called right after open: open's arity is the driver call site's, so the handle joins the
+    /// layer here instead of widening it. `None` is the host arm or a refused open, and the run's
+    /// setup then refuses the device arm before position 0 (see the loop's attach site).
     fn attach_reduce(&mut self, reduce: Option<DeviceReduce<'a>>) -> Result<(), String> {
         if self.reduce.is_some() {
             return Err(
@@ -11824,6 +11896,11 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
             runs.record("query_path", self.query_path(layer, position))?;
             runs.record("kv_path", self.kv_path(layer, position))?;
             runs.record("reference_seam", self.reference_seam(layer, position))?;
+            // The 20-stage contract's ref_select sits between the reference seam and the staging:
+            // it selects the compressed window ids the body consumes. This override must mirror
+            // `LayerStages::run_layer` exactly (STAGE_CONTRACTS is the order); omitting a stage here
+            // makes a row's frontier skip a refusal instead of naming it.
+            runs.record("ref_select", self.ref_select(layer, position))?;
             runs.record("stage_attention", self.stage_attention(layer, position))?;
             runs.record("attention_body", self.attention_body(layer, position))?;
             runs.record("attention_output", self.attention_output(layer, position))?;
@@ -11864,6 +11941,10 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
             ));
         }
         self.positions_begun += 1;
+        // A new position's window and selected list are unknown until this position's seam stages
+        // publish them; a stale value from the previous position is exactly the kind of silent
+        // carry-over the stage order is meant to prevent.
+        self.attn_window = AttentionWindow::default();
         let mut row = Vec::with_capacity(self.hc_mult * hidden.len());
         for _ in 0..self.hc_mult {
             row.extend_from_slice(hidden);
@@ -12230,16 +12311,103 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
         Ok(())
     }
 
-    fn reference_seam(&mut self, _layer: usize, _position: usize) -> Result<(), String> {
-        Err(Self::refusal("reference_seam"))
+    fn reference_seam(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        // The seam is the compressor's window selection plus the compressed-id list. On the released
+        // ratio-0 layers (0 and 1) `attention_seam_step_with_backend` runs no compressor, reads no
+        // checkpoint tensor and returns the sliding window with an empty id list
+        // (attention.rs:2116-2166); there is no device work to schedule, so the stage is the slot
+        // arithmetic below and nothing crosses PCIe.
+        //
+        // Ratio > 0 is not wiring: the compressor's wkv/wgate and the indexer's wk / weights_proj are
+        // `AttentionHostSeam` in the plan (resident_weights.rs classifies that class as host-seam),
+        // so they are not bound into the arena and no device kernel can read them. Moving that class
+        // into the bind is the prerequisite, not a launch this body is missing.
+        let ratio = self.compress_ratio.get(layer).copied().ok_or_else(|| {
+            format!("layer device stage reference_seam: layer {layer} has no compress ratio")
+        })?;
+        if ratio > 0 {
+            return Err(Self::refusal("reference_seam"));
+        }
+        let window = sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW;
+        let window_rows = (position + 1).min(window);
+        if window_rows == 0 {
+            return Err(format!(
+                "layer device stage reference_seam: position {position} has an empty sliding window"
+            ));
+        }
+        // The ring is linear on this arm: kv_path writes slot == position and the run sizes the ring
+        // at max_positions rows, so the window is the contiguous run that ends at this position.
+        let window_start = position + 1 - window_rows;
+        self.attn_window = AttentionWindow {
+            window_rows,
+            window_start,
+            selected_count: 0,
+        };
+        Ok(())
     }
 
-    fn ref_select(&mut self, _layer: usize, _position: usize) -> Result<(), String> {
-        Err(Self::refusal("ref_select"))
+    fn ref_select(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        // The candidate select consumes the indexer's keys and per-query weights - the same
+        // `AttentionHostSeam` class `reference_seam` refuses above - and at ratio 0 there is no
+        // select at all: the seam's id list is empty (attention.rs:2164-2166). So the stage has no
+        // work, and inventing a launch here would be a second arithmetic the host rule does not have.
+        let ratio = self.compress_ratio.get(layer).copied().ok_or_else(|| {
+            format!("layer device stage ref_select: layer {layer} has no compress ratio")
+        })?;
+        if ratio > 0 {
+            return Err(Self::refusal("ref_select"));
+        }
+        if self.attn_window.window_rows == 0 {
+            return Err(format!(
+                "layer device stage ref_select: layer {layer} position {position} ran before reference_seam published its window; the two stages stay ordered"
+            ));
+        }
+        self.attn_window.selected_count = 0;
+        Ok(())
     }
 
-    fn stage_attention(&mut self, _layer: usize, _position: usize) -> Result<(), String> {
-        Err(Self::refusal("stage_attention"))
+    fn stage_attention(&mut self, layer: usize, position: usize) -> Result<(), String> {
+        // Validation only (attention_stage.rs): the window rows are already in the device ring and
+        // the selected list (none at ratio 0) is already a device list, so this stage checks the
+        // invariants the host staging would have enforced and copies nothing back.
+        let appended = self.appended_rows.get(layer).copied().ok_or_else(|| {
+            format!("layer device stage stage_attention: layer {layer} has no cache row count")
+        })?;
+        if appended != position + 1 {
+            return Err(format!(
+                "layer device stage stage_attention: layer {layer}'s cache is {appended} rows at position {position}; the window read must follow this position's append"
+            ));
+        }
+        let window = self.attn_window;
+        let expected =
+            (position + 1).min(sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW);
+        if window.window_rows != expected {
+            return Err(format!(
+                "layer device stage stage_attention: the seam published {} rows for layer {layer} position {position}, the sliding window is {expected}",
+                window.window_rows
+            ));
+        }
+        let ring_rows = self.kv_ring.rows();
+        if window
+            .window_start
+            .checked_add(window.window_rows)
+            .is_none_or(|end| end > ring_rows)
+        {
+            return Err(format!(
+                "layer device stage stage_attention: layer {layer} window [{}, {}) is outside the {} row ring at position {position}",
+                window.window_start,
+                window.window_start + window.window_rows,
+                ring_rows
+            ));
+        }
+        let ratio = self.compress_ratio.get(layer).copied().unwrap_or(0);
+        if ratio == 0 && window.selected_count != 0 {
+            return Err(format!(
+                "layer device stage stage_attention: layer {layer} has no compressor (ratio 0) but the select published {} ids; a ratio-0 window has no compressed candidates",
+                window.selected_count
+            ));
+        }
+        Ok(())
     }
 
     fn attention_body(&mut self, _layer: usize, _position: usize) -> Result<(), String> {
@@ -13361,6 +13529,13 @@ fn run_forward_loop(
     // needs the per-position readbacks the device arm does not make), and the device layer is
     // opt-in until one full layer runs device-only. No arm is chosen silently.
     let layer_arm = request.arm;
+    // P5: the steady-state invariants of a device step, counted at the call sites where the lean
+    // loop can cross a boundary (docs/build/s1-qa-harness.md). The declaration is a run fact, like
+    // the arm: the host-bridge reduce is not a selectable path in this loop yet, so nothing inherits
+    // its allowance by accident. An undeclared run is held to the logits-only count, and a boundary
+    // copy fails the step by name instead of quietly widening the bar.
+    let step_bridge = crate::device_counters::HostBridgeReduce::Disabled;
+    let mut step_counters = crate::device_counters::DeviceStepCounters::new();
     let mut device_frontier: Option<String> = None;
     let mut layer_device: Option<DeviceLayer<'_>> = if layer_arm.is_device() {
         Some(DeviceLayer::open(
@@ -13385,6 +13560,16 @@ fn run_forward_loop(
         }
         device.set_native_shared(request.native_rounding.shared);
         device.attach_reduce(request.reduce)?;
+        // The two per-layer collectives are not optional on this arm: without the run's handle
+        // every layer's stage 12 refuses, which would surface as a layer-0 abort inside the timed
+        // region on one rank's log instead of a setup refusal that all four ranks share. Refuse
+        // here, before the first position, so the reason is a run-scope fact.
+        if request.reduce.is_none() {
+            return Err(
+                "layer device: the device arm's per-layer collectives need the run's reduce handle, but the chain's bootstrap opened none; refusing before position 0 rather than at layer 0 stage 12"
+                    .to_owned(),
+            );
+        }
         if let Some(bind) = bound.as_ref().map(|(_arena, bind)| bind) {
             device.attach_routed(bind, request.rank)?;
             device.attach_router(bind)?;
@@ -13396,6 +13581,12 @@ fn run_forward_loop(
         // The head flag is position metadata only; it is computed here so the probe can tag this
         // position before the first position block is recorded.
         let is_head = position + head_count >= total_positions;
+        // A *step* in the S1 sense is a head position: the timed decoder step that ends in a
+        // readback. The counters reset here, so the run's warm-up and every prefill position are
+        // outside the invariant they assert (docs/build/s1-qa-harness.md, wiring step 2).
+        if layer_device.is_some() && is_head {
+            step_counters.reset();
+        }
         probe::begin_position(position, is_head);
         let position_total_timer = BlockTimer::since(position_started, probe_on);
         // The Engram n-gram hash row for THIS position: the tokens up to and including this row's
@@ -14037,8 +14228,15 @@ fn run_forward_loop(
         // The layer loop's boundary copy: the residual comes back once per position (the certified
         // head's input), never once per layer. The mix the head needs rides with it.
         if let Some(device) = layer_device.as_mut() {
+            // P5: these two are the device arm's real `d2h` crossings and the counters report them
+            // instead of hiding them. A conformant S1 step crosses PCIe once - the head's logits -
+            // so a step that still brings the residual and the pre mix back fails by name. Until
+            // the head consumes the device residual (the next work item, not an allowance), the
+            // count is 2 and the head-position check below names it; the bar is not widened here.
             stream = device.residual_out()?;
+            step_counters.record_d2h_copy();
             attn_pre_mix = device.attn_pre_mix_out()?;
+            step_counters.record_d2h_copy();
         }
         let head = if is_head {
             Some(run_head_position(
@@ -14059,6 +14257,21 @@ fn run_forward_loop(
         } else {
             None
         };
+        if layer_device.is_some() {
+            // The head's logits gather is the one legitimate per-step readback, and it happens at
+            // a head position only. The two boundary copies above are recorded at every position
+            // because the host head still needs them; a non-head position is the prefill arm and is
+            // not a step, so the exact-count assertion is enforced at the head position that ends
+            // the timed step (qa harness wiring steps 3 and 6).
+            if is_head {
+                step_counters.record_d2h_copy();
+                if let Err(violation) = step_counters.check(step_bridge) {
+                    return Err(format!(
+                        "S1 steady-state invariant broken at position {position}: {violation}"
+                    ));
+                }
+            }
+        }
         let timer = BlockTimer::start(probe_on);
         let wall_ms = position_started.elapsed().as_millis() as u64;
         let stream_sha256 = evidence_f32_sha256(&stream);
@@ -14085,6 +14298,20 @@ fn run_forward_loop(
                 head_json["matches_reference"] = serde_json::json!(*reference == head.token);
             }
             record["head"] = head_json;
+        }
+        if layer_device.is_some() {
+            // The row's own evidence of the invariant: raw counts plus the one summary line the S1
+            // row quotes. A row whose `enforced` is false is a prefill position and carries no
+            // claim; the head position's summary is the one that can gate a number.
+            record["device_step_invariants"] = serde_json::json!({
+                "step": step_counters.step(),
+                "d2h_copies": step_counters.d2h_copies(),
+                "allocations": step_counters.allocations(),
+                "sync_waits": step_counters.sync_waits(),
+                "bridge": step_bridge.label(),
+                "enforced": is_head,
+                "summary": step_counters.summary(step_bridge),
+            });
         }
         position_records.push(record);
         probe::position(&cuda, "position_record", timer);
@@ -14343,8 +14570,32 @@ fn run_forward_loop(
                     .as_ref()
                     .map_or(0, |device| device.routed_experts_bound()),
                 "reduce_scratch_bytes": 2 * HIDDEN * 4,
-                "reduce_arena_reserve_bytes": crate::layer_device::REDUCE_ARENA_RESERVE_BYTES,
-                "note": "slab_bytes is the layer's one device allocation (residual and every stage workspace); reduce_scratch_bytes is the 40 KiB span the NCCL warm-up and the RDMA arm share; reduce_arena_reserve_bytes is the communicator's init-time reserve, whose own number is stats.arena_bytes",
+                // The communicator's own number, not the reserved-arena constant: the two agree at
+                // the released geometry only by coincidence, and a record that prints the constant
+                // cannot reveal a handle whose reservation changed.
+                "reduce_arena_reserve_bytes": layer_device
+                    .as_ref()
+                    .and_then(crate::tp4_forward::DeviceLayer::reduce_stats)
+                    .map_or(0, |stats| stats.arena_bytes()),
+                "reduce_collectives_enqueued": layer_device
+                    .as_ref()
+                    .and_then(crate::tp4_forward::DeviceLayer::reduce_stats)
+                    .map_or(0, |stats| stats.collectives()),
+                "reduce_bytes_enqueued": layer_device
+                    .as_ref()
+                    .and_then(crate::tp4_forward::DeviceLayer::reduce_stats)
+                    .map_or(0, |stats| stats.bytes()),
+                "reduce_async_failure_check": layer_device
+                    .as_ref()
+                    .and_then(crate::tp4_forward::DeviceLayer::reduce_async_failure_check_available)
+                    .map_or("not available (no device reduce handle)", |available| {
+                        if available {
+                            "available (ncclCommGetAsyncError resolved)"
+                        } else {
+                            "symbol absent: step sync only"
+                        }
+                    }),
+                "note": "slab_bytes is the layer's one device allocation (residual and every stage workspace); reduce_scratch_bytes is the 40 KiB span the NCCL warm-up and the RDMA arm share; reduce_arena_reserve_bytes is the communicator's stats.arena_bytes read at the boundary, and reduce_collectives_enqueued/reduce_bytes_enqueued are its own counters (0 when this run has no device handle)",
             }),
         );
         object.insert(

@@ -1,0 +1,92 @@
+{
+  "schema": "sparkflash-reduce-gate/1",
+  "stamp": "20261023T001129Z",
+  "git_head": "fe281804fec741dac79a9f1ab8c3db534dce0c1d",
+  "payload_bytes": 10240,
+  "samples": 10000,
+  "warmup": 200,
+  "mode": "sync",
+  "thresholds": {
+    "p50_max_us": 30.0,
+    "p99_max_us": 60.0
+  },
+  "clock": {
+    "locked": false,
+    "min_clock_pct": 90.0,
+    "max_mhz": {
+      "0": 3003.0,
+      "1": 3003.0,
+      "2": 3003.0,
+      "3": 3003.0
+    },
+    "valid": false
+  },
+  "histogram_paths": [
+    "/home/user/deepseek-v4.1-flash-spark/target/gpu-reduce/20261023T001129Z/histogram-rank0.json",
+    "/home/user/deepseek-v4.1-flash-spark/target/gpu-reduce/20261023T001129Z/histogram-rank1.json",
+    "/home/user/deepseek-v4.1-flash-spark/target/gpu-reduce/20261023T001129Z/histogram-rank2.json",
+    "/home/user/deepseek-v4.1-flash-spark/target/gpu-reduce/20261023T001129Z/histogram-rank3.json"
+  ],
+  "ranks": [
+    {
+      "rank": 0,
+      "p50_us": 48.27,
+      "p99_us": 81.79,
+      "gate_pass": false,
+      "min_clock_mhz": 208.0,
+      "mean_clock_mhz": 1434.4492753623188,
+      "power_w_mean": 9.40231884057971,
+      "histogram_present": true,
+      "status": 6
+    },
+    {
+      "rank": 1,
+      "p50_us": 48.32,
+      "p99_us": 80.35,
+      "gate_pass": false,
+      "min_clock_mhz": 208.0,
+      "mean_clock_mhz": 1511.6376811594203,
+      "power_w_mean": 7.086811594202898,
+      "histogram_present": true,
+      "status": 6
+    },
+    {
+      "rank": 2,
+      "p50_us": 48.27,
+      "p99_us": 81.84,
+      "gate_pass": false,
+      "min_clock_mhz": 208.0,
+      "mean_clock_mhz": 1298.8059701492537,
+      "power_w_mean": 8.626865671641792,
+      "histogram_present": true,
+      "status": 6
+    },
+    {
+      "rank": 3,
+      "p50_us": 48.16,
+      "p99_us": 79.73,
+      "gate_pass": false,
+      "min_clock_mhz": 208.0,
+      "mean_clock_mhz": 1342.358208955224,
+      "power_w_mean": 8.86089552238806,
+      "histogram_present": true,
+      "status": 6
+    }
+  ],
+  "valid": false,
+  "pass": false,
+  "clock_problems": [
+    "rank 0 clock dropped to 208 MHz, below 90% of its 3003 MHz max",
+    "rank 1 clock dropped to 208 MHz, below 90% of its 3003 MHz max",
+    "rank 2 clock dropped to 208 MHz, below 90% of its 3003 MHz max",
+    "rank 3 clock dropped to 208 MHz, below 90% of its 3003 MHz max",
+    "clocks were not locked (an unlocked gate is invalid)",
+    "SPARK_REDUCE_ALLOW_UNLOCKED=1 labelled this run invalid"
+  ],
+  "latency_problems": [
+    "rank 0 latency gate failed (p50 48.27 us <= 30.0, p99 81.79 us <= 60.0)",
+    "rank 1 latency gate failed (p50 48.32 us <= 30.0, p99 80.35 us <= 60.0)",
+    "rank 2 latency gate failed (p50 48.27 us <= 30.0, p99 81.84 us <= 60.0)",
+    "rank 3 latency gate failed (p50 48.16 us <= 30.0, p99 79.73 us <= 60.0)"
+  ]
+}
