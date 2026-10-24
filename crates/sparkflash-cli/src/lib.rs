@@ -20,6 +20,7 @@ pub mod logits_dump;
 #[cfg(feature = "cuda")]
 pub mod moe_device;
 pub mod resident_weights;
+pub mod run_header;
 pub mod serve;
 pub mod tp4_chain;
 pub mod tp4_combine;

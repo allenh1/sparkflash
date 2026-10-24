@@ -436,29 +436,26 @@ fn combine_geometry_from_plan(
     (rows, bytes)
 }
 
-/// Builds the C4-token request from the argv and the rank plan.
+/// Builds the C4-token request from the argv, the rank plan and the run header.
 fn build_token_request<'a>(
     args: &'a ChainArgs,
     setup: &'a tp4_resident::RankSetup,
     config: &'a sparkflash_engine::config::ModelConfig,
     n_layers: usize,
     weights: Option<&'a sparkflash_engine::safetensors::SafeTensorsSource>,
+    header: &crate::run_header::RunHeader,
 ) -> crate::tp4_forward::TokenStageRequest<'a> {
     let (combine_rows, combine_bytes) = combine_geometry_from_plan(&setup.plan);
-    // The run's ONE arm decision: each switch is read here, exactly once, and carried in the
-    // request. Evidence recording forces the host arm, so the chain's bootstrap must gate on this
-    // decision (request.arm.is_device()) rather than on the device switch alone.
-    let (arm, evidence) = crate::layer_device::decide_layer_arm(
-        std::env::var(crate::layer_device::LAYER_DEVICE_ENV)
-            .ok()
-            .as_deref(),
-        std::env::var("SPARKFLASH_FORWARD_EVIDENCE").ok().as_deref(),
-    );
+    // The run's ONE arm decision was made by the header (crate::run_header::RunHeader::decide),
+    // which read each switch exactly once at startup; the request carries it. Evidence recording
+    // forces the host arm, so the chain's bootstrap must gate on this decision
+    // (request.arm.is_device()) rather than on the device switch alone.
     crate::tp4_forward::TokenStageRequest {
         rank: args.rank,
         world: args.world,
-        arm,
-        evidence,
+        arm: header.arm,
+        evidence: header.evidence,
+        header: header.clone(),
         n_layers,
         positions: args.decode_steps.max(1),
         evidence_dir: &args.evidence_dir,
@@ -837,6 +834,44 @@ fn resident_argv(args: &ChainArgs) -> Vec<String> {
 /// C1 of the device loop: per-rank plan setup, arena streaming and attention binding only.
 /// No forward pass, no token - the evidence says setup_only: true and must not be read as a step.
 fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
+    // ---- S2-a run header: the arm and the collective path, decided before anything else ----
+    // A forward run that does not name its collective path (SPARK_COMM_REDUCE), names one that does
+    // not match its arm, or spells the arm switch wrong refuses here, with an envelope that records
+    // what the operator set, before the plan setup, the arena boot and any transport.
+    let header = if args.forward {
+        match crate::run_header::RunHeader::from_env() {
+            Ok(header) => {
+                // Printed now rather than returned with the report lines: a run that fails later
+                // returns only its error, and the log must still open with the header.
+                for line in header.lines(args.rank) {
+                    println!("{line}");
+                }
+                Some(header)
+            }
+            Err(reason) => {
+                let mut envelope = crate::tp4_token::TokenEnvelope::refused(
+                    args.rank,
+                    args.world,
+                    format!("run header: {reason}"),
+                );
+                envelope.run_header = Some(crate::run_header::RunHeader::observed_json(|name| {
+                    std::env::var(name).ok()
+                }));
+                let outcome = crate::tp4_forward::TokenStageOutcome::Refused(envelope);
+                fs::create_dir_all(&args.evidence_dir)
+                    .map_err(|error| format!("create {}: {error}", args.evidence_dir.display()))?;
+                for line in write_forward_evidence(args, &outcome)? {
+                    println!("{line}");
+                }
+                return Err(format!(
+                    "forward refused on rank {}: run header: {reason}",
+                    args.rank
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let resident_args = resident_argv(args);
     let refs: Vec<&str> = resident_args.iter().map(String::as_str).collect();
     let (setup, source) = tp4_resident::setup_for_chain(&refs)?;
@@ -856,8 +891,8 @@ fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
         (setup.plan.resident_bytes() as f64) / (1024.0 * 1024.0 * 1024.0),
         setup.plan.plan_hash()
     )];
-    if args.forward && args.plan_only {
-        let request = build_token_request(args, &setup, &config, config.n_layers, weights);
+    if let (true, Some(header)) = (args.forward && args.plan_only, header.as_ref()) {
+        let request = build_token_request(args, &setup, &config, config.n_layers, weights, header);
         let outcome = crate::tp4_forward::refused_outcome(
             &request,
             "--forward needs --upload: the forward loop runs inside the arena epoch, and --plan-only never opens one".to_string(),
@@ -874,8 +909,8 @@ fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
         crate::tp4_forward::TokenStageRequest<'_>,
         crate::tp4_forward::ForwardPlan,
     )> = None;
-    if args.forward {
-        let request = build_token_request(args, &setup, &config, config.n_layers, weights);
+    if let Some(header) = header.as_ref() {
+        let request = build_token_request(args, &setup, &config, config.n_layers, weights, header);
         match crate::tp4_forward::preflight(&request) {
             Ok(plan) => forward_ready = Some((request, plan)),
             Err(outcome) => {

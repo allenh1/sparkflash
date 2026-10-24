@@ -67,10 +67,11 @@
 //!    spawn or join, and the next stage is queued behind it on the same stream. The spans are the
 //!    layer's, the communicator handle is the run's, and the call shape is fixed: device
 //!    addresses plus the stream.
-//! 5. **The device layer is opt-in until it is whole.** `SPARKFLASH_LAYER_DEVICE=1` selects it; the
-//!    default is the host sequence, and a stage whose kernel (or whose device step) is missing
-//!    refuses by name instead of falling back. The flip to device-default is one commit, made only
-//!    when the last seam kernel is landed and one full layer runs device-only.
+//! 5. **The device layer is the default arm (S2).** S1 closed with all 40 layers, 20 stages each,
+//!    device-only in one decode step, so the device arm is what an unset `SPARKFLASH_LAYER_DEVICE`
+//!    selects. `SPARKFLASH_LAYER_DEVICE=0` (or `host`) keeps the bit-exact host sequence selectable;
+//!    a spelling the parser does not know refuses at startup instead of guessing an arm. A stage
+//!    whose kernel (or whose device step) is missing still refuses by name instead of falling back.
 //! 7. **The KV cache is per-arm.** The device arm owns a device cache (`DeviceKvCache`) created by
 //!    `DeviceLayer::open` beside the layer slab; the host arm keeps the host-resident cache it
 //!    has always used. Nothing mutable is shared between the arms, a run never mixes them, and the
@@ -127,39 +128,35 @@
 //! The `all_reduce_rdma_arm` row is not a stage: it pins the RDMA arm's kernel so both transports are
 //! stated in one table, and the NCCL arm never launches it.
 
-/// The switch: the device layer is `opt-in` until one full layer runs device-only
-/// (`SPARKFLASH_LAYER_DEVICE=1`). The default is the host sequence, because a binary that refuses
-/// at layer 0 first seam must not be the default on a branch anything might run for a row. The flip
-/// to device-default is one commit, made only when the last seam kernel is landed.
+/// The switch: the device layer is the default arm since S2 (the whole 40-layer, 20-stage step runs
+/// device-only; S1 closed 2026-10-23). Unset or empty, `1`, `device`, `true` and `yes` select it;
+/// `0`, `host`, `false` and `no` keep the bit-exact host sequence selectable. Any other spelling
+/// refuses at startup: a typo must not pick an arm.
 pub const LAYER_DEVICE_ENV: &str = "SPARKFLASH_LAYER_DEVICE";
-
-/// Whether the steady-state loop runs the device-only layer.
-#[must_use]
-pub fn layer_device_enabled() -> bool {
-    parse_device_switch(std::env::var(LAYER_DEVICE_ENV).ok().as_deref())
-}
 
 /// The switch's parser, over the raw value so a test can pin every spelling without touching the
 /// process environment (the suite runs tests in parallel and must not race a shared variable).
-#[must_use]
-fn parse_device_switch(value: Option<&str>) -> bool {
-    match value {
-        Some(value) => {
-            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
-        }
-        None => false,
-    }
-}
-
-/// Whether this run asked for the device arm - the same predicate [layer_device_enabled] uses, not
-/// a second parser.
 ///
-/// The chain's bootstrap asks this before opening a communicator: the host arm must not acquire a
-/// libnccl dependency, pay NCCL init, or enqueue the setup collectives. Keeping one predicate means
-/// the arm the loop selects and the arm the bootstrap gates on cannot drift apart.
-#[must_use]
-pub fn device_arm_requested() -> bool {
-    layer_device_enabled()
+/// `Ok(true)` is the device arm, `Ok(false)` the host arm. The value is matched exactly (ASCII case
+/// aside): `" 1"` is not `1`, because a padded value usually means a quoting mistake in a launch
+/// script, and the arm a row ran is too important to guess.
+///
+/// # Errors
+/// A value that names neither arm, with the accepted spellings.
+pub fn parse_device_switch(value: Option<&str>) -> Result<bool, String> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(true);
+    };
+    let is = |names: &[&str]| names.iter().any(|name| value.eq_ignore_ascii_case(name));
+    if is(&["1", "device", "true", "yes"]) {
+        Ok(true)
+    } else if is(&["0", "host", "false", "no"]) {
+        Ok(false)
+    } else {
+        Err(format!(
+            "{LAYER_DEVICE_ENV}={value:?} names neither arm: unset, 1, device, true or yes is the device arm (the default); 0, host, false or no is the host arm"
+        ))
+    }
 }
 
 /// Collectives the layer makes: the attention delta and the routed MoE delta. A run record's
@@ -493,7 +490,17 @@ pub struct LayerWorkspace {
     pub rope_tables_plain: DeviceSpan,
     /// max_positions * 256 B: the compressed class (the YaRN/compress theta builder), same layout.
     pub rope_tables_compressed: DeviceSpan,
+    /// `3 * dim * 4` B (61,440 B at dim 5,120): fixed contiguous span for the DSpark/Eagle3
+    /// drafter taps (`dspark_target_layer_ids = [37, 38, 39]`), carved at open so S3 CUDA Graph
+    /// capture and S5 DSpark have fixed device addresses for all three hidden-row exports.
+    pub dspark_aux_taps: DeviceSpan,
 }
+
+/// The three DSpark/Eagle3 auxiliary target backbone layers (`dspark_target_layer_ids = [37, 38, 39]`).
+pub const DSPARK_AUX_LAYERS: [usize; 3] = [37, 38, 39];
+
+/// Number of DSpark/Eagle3 auxiliary target layer taps per position (`cat(main_hiddens)` = `3 * dim`).
+pub const DSPARK_AUX_TAP_COUNT: usize = DSPARK_AUX_LAYERS.len();
 
 /// The slab's geometry: everything the carve needs, in one value, so adding a span does not grow
 /// a positional argument list that a caller can silently transpose.
@@ -546,7 +553,7 @@ impl LayerBuffers {
         let workspace = self.workspace;
         let hc_dim = geometry.hc_mult * geometry.dim;
         let rope_values = geometry.max_positions * (RELEASED_ROPE_HEAD_DIM / 2) * 2;
-        let checks: [(&str, DeviceSpan, usize, usize); 33] = [
+        let checks: [(&str, DeviceSpan, usize, usize); 34] = [
             ("residual.stream", residual.stream, hc_dim, 4),
             ("residual.hc_rows", residual.hc_rows, hc_dim, 4),
             ("residual.normed", residual.normed, geometry.dim, 4),
@@ -675,6 +682,12 @@ impl LayerBuffers {
                 rope_values,
                 4,
             ),
+            (
+                "workspace.dspark_aux_taps",
+                workspace.dspark_aux_taps,
+                DSPARK_AUX_TAP_COUNT * geometry.dim,
+                4,
+            ),
         ];
         for (name, span, values, bytes_per_value) in checks {
             let needed = values.checked_mul(bytes_per_value).ok_or_else(|| {
@@ -742,8 +755,27 @@ impl LayerBuffers {
             BLOCK_SCRATCH_BYTES,
             rope_table_span_bytes(max_positions),
             rope_table_span_bytes(max_positions),
+            DSPARK_AUX_TAP_COUNT * dim * 4,
         ];
         spans.iter().map(|&bytes| align_up(bytes.max(ALIGN))).sum()
+    }
+
+    /// Returns the fixed `[dim]` f32 device sub-span inside `workspace.dspark_aux_taps` for the
+    /// DSpark/Eagle3 auxiliary target layers (`[37, 38, 39]`), or `None` for any other layer.
+    #[must_use]
+    pub fn dspark_aux_tap_span(&self, layer: usize, dim: usize) -> Option<DeviceSpan> {
+        let tap_idx = DSPARK_AUX_LAYERS
+            .iter()
+            .position(|&target| target == layer)?;
+        let row_bytes = dim.checked_mul(4)?;
+        let offset = tap_idx.checked_mul(row_bytes)?;
+        if offset.checked_add(row_bytes)? > self.workspace.dspark_aux_taps.len {
+            return None;
+        }
+        Some(DeviceSpan::new(
+            self.workspace.dspark_aux_taps.device + offset as u64,
+            row_bytes,
+        ))
     }
 
     /// The bytes this carve actually spends, span by span: the slab's own number for the record.
@@ -786,6 +818,7 @@ impl LayerBuffers {
             self.workspace.block_best,
             self.workspace.rope_tables_plain,
             self.workspace.rope_tables_compressed,
+            self.workspace.dspark_aux_taps,
         ];
         residual
             .iter()
@@ -852,6 +885,7 @@ impl LayerBuffers {
                 block_best: span(BLOCK_SCRATCH_BYTES),
                 rope_tables_plain: span(rope_table_span_bytes(max_positions)),
                 rope_tables_compressed: span(rope_table_span_bytes(max_positions)),
+                dspark_aux_taps: span(DSPARK_AUX_TAP_COUNT * dim * 4),
             },
         }
     }
@@ -1597,14 +1631,14 @@ pub fn not_landed_with_blocker(
 
 /// Which arm the layer loop runs, and why.
 ///
-/// The device arm is opt-in until one full layer runs device-only; the host arm is the bit-exact
-/// reference and the only arm that can record evidence, because it is the only one that reads back
-/// per position.
+/// The device arm is the default since S2; the host arm is the bit-exact reference, selectable with
+/// `SPARKFLASH_LAYER_DEVICE=0`, and the only arm that can record evidence, because it is the only
+/// one that reads back per position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerArm {
     /// The bit-exact host sequence, with the reason it was selected.
     Host(&'static str),
-    /// The device-only layer, opted in by `SPARKFLASH_LAYER_DEVICE=1`.
+    /// The device-only layer: the default, or `SPARKFLASH_LAYER_DEVICE=1` said explicitly.
     Device,
 }
 
@@ -1621,7 +1655,7 @@ impl LayerArm {
         match self {
             Self::Host(reason) => reason,
             Self::Device => {
-                "device layer (opt-in): no per-layer PCIe copy, no per-stage observation read"
+                "device layer (the default since S2): no per-layer PCIe copy, no per-stage observation read"
             }
         }
     }
@@ -1633,17 +1667,17 @@ impl LayerArm {
 /// recording run is forced to the host arm and the record says so: never a silent switch, and never
 /// a device arm that claims to record and returns nothing.
 #[must_use]
-pub fn select_layer_arm(device_opt_in: bool, evidence_recording: bool) -> LayerArm {
+pub fn select_layer_arm(device_switch: bool, evidence_recording: bool) -> LayerArm {
     if evidence_recording {
         return LayerArm::Host(
             "host arm (evidence recording forces it: the device arm has no per-position readback)",
         );
     }
-    if device_opt_in {
+    if device_switch {
         LayerArm::Device
     } else {
         LayerArm::Host(
-            "host arm (the default until the layer is whole; SPARKFLASH_LAYER_DEVICE=1 opts in)",
+            "host arm (selected by SPARKFLASH_LAYER_DEVICE=0: the bit-exact host sequence; the device arm is the default)",
         )
     }
 }
@@ -1655,13 +1689,19 @@ pub fn select_layer_arm(device_opt_in: bool, evidence_recording: bool) -> LayerA
 /// arm again. This exists because two independent decisions can drift: evidence recording forces the
 /// host arm, so a bootstrap that keys on the device switch alone would open a communicator for the
 /// arm that must never need libnccl.
-#[must_use]
-pub fn decide_layer_arm(device: Option<&str>, evidence: Option<&str>) -> (LayerArm, bool) {
+///
+/// # Errors
+/// A device switch spelling that names neither arm ([`parse_device_switch`]); the chain refuses the
+/// run at startup with it rather than picking an arm.
+pub fn decide_layer_arm(
+    device: Option<&str>,
+    evidence: Option<&str>,
+) -> Result<(LayerArm, bool), String> {
     let evidence = crate::tp4_forward::evidence_enabled_from_env(evidence);
-    (
-        select_layer_arm(parse_device_switch(device), evidence),
+    Ok((
+        select_layer_arm(parse_device_switch(device)?, evidence),
         evidence,
-    )
+    ))
 }
 
 /// The device layer: one implementor per stage, sequenced by [`LayerStages::run_layer`].
@@ -1850,6 +1890,7 @@ mod tests {
             buffers.workspace.block_best,
             buffers.workspace.rope_tables_plain,
             buffers.workspace.rope_tables_compressed,
+            buffers.workspace.dspark_aux_taps,
         ];
         let mut end = 0u64;
         for span in spans {
@@ -1907,8 +1948,16 @@ mod tests {
             "{}",
             forced.why()
         );
-        assert!(select_layer_arm(false, false).why().contains("default"));
-        assert!(select_layer_arm(true, false).why().contains("opt-in"));
+        assert!(
+            select_layer_arm(false, false)
+                .why()
+                .contains("SPARKFLASH_LAYER_DEVICE=0")
+        );
+        assert!(
+            select_layer_arm(true, false)
+                .why()
+                .contains("the default since S2")
+        );
     }
 
     #[test]
@@ -2217,54 +2266,65 @@ mod tests {
         // The matrix the bootstrap gate depends on: evidence recording forces the host arm even when
         // the device switch is on, so a chain that gated on the device switch alone would open a
         // communicator for the arm that must never need libnccl.
-        for device in [None, Some("0"), Some("false"), Some("no"), Some("")] {
+        let decide = |device, evidence| {
+            decide_layer_arm(device, evidence).unwrap_or_else(|error| panic!("{error}"))
+        };
+        for device in [
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("host"),
+            Some("HOST"),
+        ] {
             for evidence in [None, Some("0"), Some("1")] {
-                let (arm, recorded) = decide_layer_arm(device, evidence);
+                let (arm, recorded) = decide(device, evidence);
                 assert!(!arm.is_device(), "{device:?}/{evidence:?} must stay host");
                 assert_eq!(recorded, evidence == Some("1"));
             }
         }
-        for evidence in [None, Some("0")] {
-            let (arm, _) = decide_layer_arm(Some("1"), evidence);
-            assert!(
-                arm.is_device(),
-                "the opt-in spelling with evidence off is the device arm"
-            );
+        for device in [None, Some(""), Some("1"), Some("device")] {
+            for evidence in [None, Some("0")] {
+                let (arm, _) = decide(device, evidence);
+                assert!(
+                    arm.is_device(),
+                    "{device:?} with evidence off is the device arm (the S2 default)"
+                );
+            }
         }
-        for device in [Some("1"), Some("true"), Some("YES")] {
+        for device in [None, Some("1"), Some("true"), Some("YES")] {
             for evidence in [Some("1"), Some("true"), Some("yes")] {
-                let (arm, recorded) = decide_layer_arm(device, evidence);
+                let (arm, recorded) = decide(device, evidence);
                 assert!(!arm.is_device(), "evidence recording forces the host arm");
                 assert!(recorded);
             }
         }
-        assert!(!decide_layer_arm(Some(" 1"), None).0.is_device());
+        // A padded or unknown spelling refuses instead of picking either arm.
+        for device in [" 1", "on", "dev", "2"] {
+            let error = decide_layer_arm(Some(device), None)
+                .expect_err("an unknown spelling must refuse, not pick an arm");
+            assert!(error.contains(LAYER_DEVICE_ENV), "{error}");
+            assert!(error.contains("names neither arm"), "{error}");
+        }
     }
 
     #[test]
-    fn the_device_arm_predicate_is_the_switch_parser_and_has_one_default() {
-        // Every spelling the parser accepts, and the one it refuses, without touching the process
+    fn the_device_arm_is_the_default_and_the_host_arm_stays_selectable() {
+        // Every spelling the parser accepts, and the ones it refuses, without touching the process
         // environment (the suite runs tests in parallel).
-        assert!(!parse_device_switch(None), "unset is the host arm");
-        for value in ["1", "true", "TRUE", "yes", "Yes"] {
-            assert!(parse_device_switch(Some(value)), "{value} opts in");
+        assert_eq!(
+            parse_device_switch(None),
+            Ok(true),
+            "unset is the device arm"
+        );
+        assert_eq!(parse_device_switch(Some("")), Ok(true), "empty is unset");
+        for value in ["1", "device", "DEVICE", "true", "TRUE", "yes", "Yes"] {
+            assert_eq!(parse_device_switch(Some(value)), Ok(true), "{value}");
         }
-        for value in ["0", "false", "no", "", "device"] {
-            assert!(!parse_device_switch(Some(value)), "{value} stays host");
+        for value in ["0", "host", "Host", "false", "no", "NO"] {
+            assert_eq!(parse_device_switch(Some(value)), Ok(false), "{value}");
         }
-        // The bootstrap's predicate is the loop's predicate: same function, not a second parser.
-        assert_eq!(device_arm_requested(), layer_device_enabled());
-    }
-
-    #[test]
-    fn the_device_layer_is_opt_in() {
-        // The switch reads the process environment, so the default is only assertable when the
-        // variable is absent - which is how every test and every row runs it.
-        if std::env::var(LAYER_DEVICE_ENV).is_err() {
-            assert!(
-                !layer_device_enabled(),
-                "the device layer must be opt-in until one full layer runs device-only"
-            );
+        for value in [" 1", "1 ", "on", "off", "devices", "-1"] {
+            assert!(parse_device_switch(Some(value)).is_err(), "{value:?}");
         }
     }
 
@@ -2315,12 +2375,10 @@ mod tests {
         let span = DeviceSpan::new(0x40, 1024);
         assert_eq!(span.offset(0x40).device, 0x80);
         assert_eq!(span.offset(0x40).len, 960);
-        // The switch itself is read from the process environment, so only its default is asserted
-        // here; the loop's arm is exercised by the forward loop's tests.
-        assert!(matches!(
-            std::env::var(LAYER_DEVICE_ENV).ok().as_deref(),
-            None | Some("1") | Some("0") | Some("false")
-        ));
+        // The switch itself is read from the process environment, so only that whatever value the
+        // suite runs under parses is asserted here; the loop's arm is exercised by the forward
+        // loop's tests.
+        assert!(parse_device_switch(std::env::var(LAYER_DEVICE_ENV).ok().as_deref()).is_ok());
     }
 
     #[test]
@@ -2378,6 +2436,27 @@ mod tests {
             .expect_err("a half-width span must be refused");
         assert!(error.contains("workspace.q_normed"), "{error}");
         assert!(error.contains("1280"), "{error}");
+    }
+
+    #[test]
+    fn the_dspark_taps_are_three_fixed_f32_rows_and_only_layers_37_to_39_have_one() {
+        let geometry = geometry();
+        let buffers = LayerBuffers::carve(0x1_0000, &geometry);
+        let taps = buffers.workspace.dspark_aux_taps;
+        assert_eq!(taps.len, 3 * geometry.dim * 4);
+        let row = geometry.dim * 4;
+        for (index, layer) in DSPARK_AUX_LAYERS.into_iter().enumerate() {
+            let span = buffers
+                .dspark_aux_tap_span(layer, geometry.dim)
+                .unwrap_or_else(|| panic!("layer {layer} is a DSpark tap"));
+            assert_eq!(span.device, taps.device + (index * row) as u64);
+            assert_eq!(span.len, row);
+        }
+        for layer in [0, 36, 40] {
+            assert!(buffers.dspark_aux_tap_span(layer, geometry.dim).is_none());
+        }
+        // A row wider than the carve does not fit the last tap: refused, never a span past the end.
+        assert!(buffers.dspark_aux_tap_span(39, geometry.dim + 1).is_none());
     }
 
     #[test]

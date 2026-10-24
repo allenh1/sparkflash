@@ -266,6 +266,8 @@ pub struct DeviceReduceStats {
     bridge_collectives: u64,
     bridge_d2h_bytes: u64,
     bridge_h2d_bytes: u64,
+    registered_buffers: u64,
+    registered_bytes: u64,
 }
 
 impl DeviceReduceStats {
@@ -325,8 +327,28 @@ impl DeviceReduceStats {
         self.bridge_collectives.wrapping_mul(2)
     }
 
+    /// Buffers the run registered with the communicator at open (`ncclCommRegister`).
+    ///
+    /// Zero means nothing was registered: the record must then say so rather than claim the S2-a
+    /// rule held. Registration is setup, not layer work, so it never moves the collective counters.
+    #[must_use]
+    pub const fn registered_buffers(&self) -> u64 {
+        self.registered_buffers
+    }
+
+    /// Bytes covered by those registrations, summed over the buffers as the caller passed them.
+    #[must_use]
+    pub const fn registered_bytes(&self) -> u64 {
+        self.registered_bytes
+    }
+
     fn set_arena_bytes(&mut self, bytes: u64) {
         self.arena_bytes = bytes;
+    }
+
+    fn set_registered(&mut self, buffers: u64, bytes: u64) {
+        self.registered_buffers = buffers;
+        self.registered_bytes = bytes;
     }
 
     fn record(&mut self, bytes: u64) {
@@ -556,12 +578,16 @@ pub struct RunReduce {
     world: usize,
     rank: usize,
     stats: DeviceReduceStats,
+    /// NCCL's handles for the buffers registered at open, released before the communicator.
+    registrations: Vec<*mut c_void>,
 }
 
 impl Drop for RunReduce {
     fn drop(&mut self) {
-        // Drop runs before the fields, so the communicator is destroyed while the library is still
-        // loaded. A failed destroy still consumes the handle, so the error is not actionable here.
+        // Drop runs before the fields, so the registrations are released and the communicator is
+        // destroyed while the library is still loaded. A failed release or destroy still consumes
+        // the handle, so the error is not actionable here.
+        let _ = self.deregister_buffers();
         let _ = self.api.comm_destroy_handle(self.comm);
     }
 }
@@ -629,6 +655,7 @@ impl RunReduce {
             world,
             rank,
             stats,
+            registrations: Vec::new(),
         };
         Ok(Box::into_raw(Box::new(run)).cast::<c_void>())
     }
@@ -706,6 +733,84 @@ impl RunReduce {
         Ok(())
     }
 
+    /// Registers the run's collective buffers with the communicator: once, at open (S2-a).
+    ///
+    /// `spans` are `(device address, bytes)` pairs: the layer's collective inputs and outputs. They
+    /// are fixed for the whole run, so registering them before the first position means no step
+    /// pays a registration and a later graph capture (S3) sees the same registered addresses.
+    /// A second call while registrations are held is refused: the run registers once, and a caller
+    /// that needs a new set (the bench, between payload sizes) releases the old one first with
+    /// [`Self::deregister_buffers`]. On a failure part-way, the registrations already made are
+    /// released before the error returns, so a refused open holds nothing.
+    ///
+    /// # Safety
+    /// Every span must be device memory on the communicator's device that stays allocated until
+    /// [`Self::deregister_buffers`] (or Drop) releases it, and no collective may be in flight on
+    /// these buffers while they are released.
+    ///
+    /// # Errors
+    /// Returns NcclError::Config for an empty span list, a repeated registration, or a null or empty
+    /// span, and NcclError::Call when NCCL refuses a registration.
+    pub unsafe fn register_buffers(&mut self, spans: &[(u64, usize)]) -> Result<(), NcclError> {
+        if spans.is_empty() {
+            return Err(NcclError::Config(
+                "register_buffers needs at least one span; the run registers its collective buffers at open".to_owned(),
+            ));
+        }
+        if !self.registrations.is_empty() {
+            return Err(NcclError::Config(format!(
+                "register_buffers called while {} registration(s) are held; the run registers its collective buffers once, at open",
+                self.registrations.len()
+            )));
+        }
+        let mut bytes = 0u64;
+        for (address, len) in spans {
+            // SAFETY: the caller upholds the span contract; the communicator is live until Drop.
+            let registered = unsafe {
+                self.api
+                    .comm_register_handle(self.comm, *address as *mut c_void, *len)
+            };
+            match registered {
+                Ok(registration) => {
+                    self.registrations.push(registration);
+                    bytes = bytes.saturating_add(*len as u64);
+                }
+                Err(error) => {
+                    let _ = self.deregister_buffers();
+                    return Err(error);
+                }
+            }
+        }
+        self.stats
+            .set_registered(self.registrations.len() as u64, bytes);
+        Ok(())
+    }
+
+    /// Releases every registration [`Self::register_buffers`] made, newest first.
+    ///
+    /// Call it after the last collective on those buffers has completed and before the buffers are
+    /// freed; Drop calls it too, so a run that forgot still releases them before the destroy. The
+    /// registered counters fall back to zero. Every registration is released even when one fails,
+    /// and the first failure is the one returned.
+    ///
+    /// # Errors
+    /// Returns NcclError::Call when NCCL refuses a release.
+    pub fn deregister_buffers(&mut self) -> Result<(), NcclError> {
+        let mut first_error = None;
+        while let Some(registration) = self.registrations.pop() {
+            // SAFETY: the registration was made on this live communicator by register_buffers and
+            // is released exactly once here (it has just been popped).
+            let released = unsafe { self.api.comm_deregister_handle(self.comm, registration) };
+            if let Err(error) = released
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        self.stats.set_registered(0, 0);
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// The arm this communicator was opened for.
     #[must_use]
     pub const fn arm(&self) -> ReduceArm {
@@ -728,6 +833,12 @@ impl RunReduce {
     #[must_use]
     pub fn library_version(&self) -> Option<String> {
         self.api.version_string()
+    }
+
+    /// The loaded library's soname (`libnccl.so.2` on the nodes), for the run record.
+    #[must_use]
+    pub fn library_name(&self) -> &str {
+        self.api.library_name()
     }
 
     /// The counters as of this call.
@@ -1151,6 +1262,33 @@ pub unsafe fn warm_up(
     unsafe { run_mut(handle)?.warm_up(stream, scratch, count) }
 }
 
+/// Registers buffers with the run's opaque handle: the bench's form of RunReduce::register_buffers.
+///
+/// # Safety
+/// Same contract as RunReduce::register_buffers, plus handle must be live.
+///
+/// # Errors
+/// Same as RunReduce::register_buffers, plus NcclError::Config for a null handle.
+pub unsafe fn register_buffers(
+    handle: *mut c_void,
+    spans: &[(u64, usize)],
+) -> Result<(), NcclError> {
+    // SAFETY: the caller upholds the handle's contract.
+    unsafe { run_mut(handle)?.register_buffers(spans) }
+}
+
+/// Releases the registrations held by the run's opaque handle.
+///
+/// # Safety
+/// handle must be live, and no collective may be in flight on the registered buffers.
+///
+/// # Errors
+/// Same as RunReduce::deregister_buffers, plus NcclError::Config for a null handle.
+pub unsafe fn deregister_buffers(handle: *mut c_void) -> Result<(), NcclError> {
+    // SAFETY: the caller upholds the handle's contract.
+    unsafe { run_mut(handle)?.deregister_buffers() }
+}
+
 /// Closes the run's communicator: the one teardown call, on the same path as the transport close.
 ///
 /// A null handle is a no-op, so a teardown path can call this unconditionally.
@@ -1340,9 +1478,27 @@ mod tests {
                 bridge_collectives: 0,
                 bridge_d2h_bytes: 0,
                 bridge_h2d_bytes: 0,
+                registered_buffers: 0,
+                registered_bytes: 0,
             }
         );
         assert_eq!(DeviceReduceStats::default().bridge_copies(), 0);
+    }
+
+    #[test]
+    fn the_registration_account_is_setup_and_never_moves_the_collective_counters() {
+        // The four collective spans of the layer (two inputs, two outputs, 10,240 B each).
+        let mut stats = DeviceReduceStats::default();
+        stats.set_registered(4, 4 * 10_240);
+        assert_eq!(stats.registered_buffers(), 4);
+        assert_eq!(stats.registered_bytes(), 40_960);
+        assert_eq!(stats.collectives(), 0);
+        assert_eq!(stats.bytes(), 0);
+        stats.record(10_240);
+        assert_eq!(stats.registered_buffers(), 4);
+        stats.set_registered(0, 0);
+        assert_eq!(stats.registered_buffers(), 0);
+        assert_eq!(stats.collectives(), 1);
     }
 
     #[test]
@@ -1411,6 +1567,14 @@ mod tests {
             ));
             assert!(matches!(
                 warm_up(null, 0, 0, 5_120),
+                Err(NcclError::Config(_))
+            ));
+            assert!(matches!(
+                register_buffers(null, &[(0x1000, 10_240)]),
+                Err(NcclError::Config(_))
+            ));
+            assert!(matches!(
+                deregister_buffers(null),
                 Err(NcclError::Config(_))
             ));
             // close is the teardown path, so a null handle must be a no-op rather than a panic.

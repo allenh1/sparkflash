@@ -99,39 +99,31 @@ type RoceReduceHandle = sparkflash_comm::rdma::RdmaTransport;
 enum RoceReduceHandle {}
 
 #[cfg(feature = "cuda")]
-/// The transport the two per-layer reduces take (`SPARK_COMM_REDUCE`).
+/// The transport the two per-layer reduces take (`SPARK_COMM_REDUCE`, decided and checked against
+/// the arm by [crate::run_header::RunHeader::decide] before this slot exists).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReduceSwitch {
-    /// The reference exchange the forward has always used, and the default.
+    /// The host arm's reference exchange.
     Tcp,
-    /// The canonical RoCE one-shot: the same schedule driver and the same reduction rule.
+    /// The host arm's canonical RoCE one-shot: the same schedule driver and the same reduction rule.
     Roce,
+    /// The device arm: both per-layer collectives enqueue on the run's NCCL communicator. This host
+    /// slot then counts zero calls, except under the `SPARKFLASH_DEVICE_DIFF` debug twin, whose host
+    /// stages reduce over the reference TCP exchange and are counted in `tcp_calls`.
+    Nccl,
 }
 
 #[cfg(feature = "cuda")]
 impl ReduceSwitch {
-    /// Parses a `SPARK_COMM_REDUCE` value. Unset/empty and `tcp` are the reference path; `roce`
-    /// (also `rdma`) asks for the one-shot; anything else is reported by [`Self::from_env`] as a
-    /// typo and treated as `tcp`, so the row's line always names the path that actually ran.
+    /// The slot for the header's path. There is no parse here and no default: the header refused an
+    /// unset or unknown `SPARK_COMM_REDUCE` at startup.
     #[must_use]
-    pub fn parse(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "roce" | "rdma" => Self::Roce,
-            _ => Self::Tcp,
+    pub fn for_path(path: crate::run_header::ReducePath) -> Self {
+        match path {
+            crate::run_header::ReducePath::Tcp => Self::Tcp,
+            crate::run_header::ReducePath::Roce => Self::Roce,
+            crate::run_header::ReducePath::Nccl => Self::Nccl,
         }
-    }
-
-    /// Reads the switch from the environment and returns the value the run reports.
-    fn from_env() -> (Self, String) {
-        let raw = std::env::var("SPARK_COMM_REDUCE").unwrap_or_default();
-        let switch = Self::parse(&raw);
-        let requested = raw.trim();
-        if switch == Self::Tcp && !requested.is_empty() && !requested.eq_ignore_ascii_case("tcp") {
-            println!(
-                "forward reduce: SPARK_COMM_REDUCE={requested:?} is not roce|tcp; keeping the tcp exchange"
-            );
-        }
-        (switch, requested.to_owned())
     }
 }
 
@@ -187,6 +179,9 @@ pub struct ForwardReduce<'a> {
     /// Requested switch, resolved path and (on a fallback) why. Printed before position 0 and again
     /// when the run drops the slot, so a row can prove which path its calls took even if it fails.
     report: String,
+    /// The device arm's slot: the per-layer collectives are NCCL enqueues, so `tcp_calls` stays 0
+    /// unless the `SPARKFLASH_DEVICE_DIFF` debug twin runs the host stages beside them.
+    nccl: bool,
     roce_calls: Cell<u64>,
     tcp_calls: Cell<u64>,
 }
@@ -215,6 +210,12 @@ impl<'a> ForwardReduce<'a> {
                 report.push_str("path=tcp (reference exchange)");
                 None
             }
+            ReduceSwitch::Nccl => {
+                report.push_str(
+                    "path=nccl (device arm: both per-layer collectives enqueue on the run's NCCL communicator; this host slot makes no reduce call outside the SPARKFLASH_DEVICE_DIFF debug twin, whose host stages use the tcp exchange)",
+                );
+                None
+            }
             ReduceSwitch::Roce => {
                 let ready = [u16::from(maybe_roce.is_some())];
                 let mut seen = vec![0u16; world];
@@ -237,6 +238,7 @@ impl<'a> ForwardReduce<'a> {
             tcp,
             roce,
             report,
+            nccl: switch == ReduceSwitch::Nccl,
             roce_calls: Cell::new(0),
             tcp_calls: Cell::new(0),
         })
@@ -245,7 +247,13 @@ impl<'a> ForwardReduce<'a> {
     /// The path this run resolved to, for the evidence line.
     #[must_use]
     pub fn path(&self) -> &'static str {
-        if self.roce.is_some() { "roce" } else { "tcp" }
+        if self.nccl {
+            "nccl"
+        } else if self.roce.is_some() {
+            "roce"
+        } else {
+            "tcp"
+        }
     }
 
     /// All-reduces in place on the run's reduce path.
@@ -2490,6 +2498,10 @@ pub struct TokenStageRequest<'a> {
     /// Whether the per-layer evidence chain is recorded - the same decision's second half, carried
     /// so the loop does not read `SPARKFLASH_FORWARD_EVIDENCE` again after the bootstrap.
     pub evidence: bool,
+    /// The run header the two fields above were copied from ([crate::run_header::RunHeader]): the
+    /// collective path the reduce slot takes, and the switches and NCCL transport environment every
+    /// envelope this request writes records.
+    pub header: crate::run_header::RunHeader,
     /// Layers in the loop (40 on the released plan).
     pub n_layers: usize,
     /// Decode positions requested (`--decode-steps`); the loop advances at most this many.
@@ -2595,7 +2607,27 @@ fn refused(request: &TokenStageRequest<'_>, error: String) -> TokenStageOutcome 
     envelope.launch_census = TokenEnvelope::refusal_census(
         "combine preflight refused before any routed expert launched",
     );
+    envelope.run_header = Some(run_header_record(request));
     TokenStageOutcome::Refused(envelope)
+}
+
+/// The request's run header with the NCCL build filled in when the run holds a communicator: the
+/// library's own version string and the soname it was loaded from (S2-a). Without a communicator
+/// (the host arm, or a refusal before the bootstrap) `nccl_build` stays null. The registered
+/// collective buffers are the layer's, so the forward record states them while the layer is alive
+/// (`layer_device_memory.reduce_registered_*`); the envelope is written after its teardown.
+#[must_use]
+pub fn run_header_record(request: &TokenStageRequest<'_>) -> serde_json::Value {
+    let mut header = request.header.to_json();
+    if let Some(reduce) = request.reduce
+        && let Ok(run) = reduce.0.try_borrow()
+    {
+        header["nccl_build"] = serde_json::json!({
+            "version": run.library_version(),
+            "library": run.library_name(),
+        });
+    }
+    header
 }
 
 /// Wraps a named refusal reason into the envelope shape without running any preflight.
@@ -2745,7 +2777,7 @@ pub(crate) fn run_with_arena(
                         .to_string(),
                 );
             }
-            TokenStageOutcome::Ran(TokenEnvelope::ran(
+            let mut envelope = TokenEnvelope::ran(
                 request.rank,
                 request.world,
                 run.tokens,
@@ -2754,7 +2786,9 @@ pub(crate) fn run_with_arena(
                 REDUCE_CALLS_PER_STEP,
                 run.dump,
                 run.launch_census,
-            ))
+            );
+            envelope.run_header = Some(run_header_record(request));
+            TokenStageOutcome::Ran(envelope)
         }
         Err(error) => refused(request, error),
     }
@@ -11221,6 +11255,29 @@ impl EngramDevice {
     }
 }
 
+/// One kv-source owner's compressed store, `(code bytes, scale bytes)`: a row per expanded position
+/// the run can reach (`max_positions`), never fewer than the kernel module's `EXPANDED_ROWS`.
+///
+/// The open-time allocation, the seam append and the attention body all stride the owners by these
+/// two numbers, so they are computed here and nowhere else: an append and a body that disagreed on
+/// the stride would read another owner's rows without any error. The index keys beside the store
+/// are already sized by `max_positions`, and the body kernel indexes the store by candidate row
+/// with no cap of its own, so a run past 512 positions needs the store to be this long too.
+///
+/// # Errors
+/// The byte counts overflow `usize`.
+#[cfg(feature = "cuda")]
+fn seam_store_owner_bytes(max_positions: usize) -> Result<(usize, usize), String> {
+    use sparkflash_kernels::compressed_cache_ref::{CODE_BYTES, SCALE_BYTES};
+    let rows = max_positions.max(sparkflash_kernels::attention_operands::EXPANDED_ROWS);
+    let bytes = |per_row: usize| {
+        rows.checked_mul(per_row).ok_or_else(|| {
+            format!("layer device: a {rows}-row compressed store of {per_row} B rows overflows")
+        })
+    };
+    Ok((bytes(CODE_BYTES)?, bytes(SCALE_BYTES)?))
+}
+
 #[cfg(feature = "cuda")]
 impl<'a> DeviceLayer<'a> {
     /// Sets the current layer's staged host-seam weights. Called once per layer by the loop, before
@@ -12632,8 +12689,7 @@ impl<'a> DeviceLayer<'a> {
             format!("layer device seam append: layer {layer} position {position} cannot be divided by ratio {ratio}")
         })?;
         let width = self.head_width as usize;
-        let store_code_bytes = sparkflash_kernels::attention_operands::STORE_CODE_BYTES;
-        let store_scale_bytes = sparkflash_kernels::attention_operands::STORE_SCALE_BYTES;
+        let (store_code_bytes, store_scale_bytes) = seam_store_owner_bytes(self.max_positions)?;
         let expanded_row = first_row
             .checked_mul(ratio)
             .ok_or_else(|| "layer device seam append: the expanded row overflows".to_owned())?;
@@ -12707,8 +12763,11 @@ impl<'a> DeviceLayer<'a> {
             .ok_or_else(|| "layer device: the compressor ring's size overflows".to_owned())?;
         let wkv = alloc(ring_span, "wkv rows")?;
         let wgate = alloc(ring_span, "wgate rows")?;
-        let store_code_bytes = owners * sparkflash_kernels::attention_operands::STORE_CODE_BYTES;
-        let store_scale_bytes = owners * sparkflash_kernels::attention_operands::STORE_SCALE_BYTES;
+        let (owner_code_bytes, owner_scale_bytes) = seam_store_owner_bytes(self.max_positions)?;
+        let (store_code_bytes, store_scale_bytes) = owners
+            .checked_mul(owner_code_bytes)
+            .zip(owners.checked_mul(owner_scale_bytes))
+            .ok_or_else(|| "layer device: the compressed stores' size overflows".to_owned())?;
         let store_codes = alloc(store_code_bytes, "store codes")?;
         self.cuda
             .copy_htod(&store_codes, &vec![0u8; store_code_bytes])
@@ -12898,12 +12957,40 @@ impl<'a> DeviceLayer<'a> {
         Ok(())
     }
 
+    /// Attaches the run's communicator and registers the layer's four collective spans with it.
+    ///
+    /// S2-a: the two per-layer collectives read and write the same four slab rows on every layer and
+    /// position, so they are registered once, here, before position 0 (`ncclCommRegister`), and
+    /// deregistered in `Drop` before the slab is freed. Registration is setup, never per step, and a
+    /// refused registration refuses the run: the record states the registered spans, so a run that
+    /// silently went unregistered could not be told from one that did.
     fn attach_reduce(&mut self, reduce: Option<DeviceReduce<'a>>) -> Result<(), String> {
         if self.reduce.is_some() {
             return Err(
                 "layer device reduce: attached twice; the run has exactly one communicator"
                     .to_owned(),
             );
+        }
+        if let Some(handle) = reduce {
+            let workspace = &self.buffers.workspace;
+            let spans = [
+                workspace.attn_out_bf16,
+                workspace.reduced_bf16,
+                workspace.moe_delta_bf16,
+                workspace.moe_reduced_bf16,
+            ]
+            .map(|span| (span.device, span.len));
+            let mut run = handle.0.try_borrow_mut().map_err(|_| {
+                "layer device reduce: the run's handle is already borrowed at attach".to_owned()
+            })?;
+            // SAFETY: the four spans are rows carved from this layer's live slab, each its full
+            // carved length, and the slab outlives the registration: Drop deregisters before it
+            // frees the slab.
+            unsafe { run.register_buffers(&spans) }.map_err(|error| {
+                format!(
+                    "layer device reduce: registering the four collective spans with the communicator (ncclCommRegister): {error}"
+                )
+            })?;
         }
         self.reduce = reduce;
         Ok(())
@@ -13169,6 +13256,15 @@ impl<'a> DeviceLayer<'a> {
 #[cfg(feature = "cuda")]
 impl Drop for DeviceLayer<'_> {
     fn drop(&mut self) {
+        // The communicator's registrations point into the slab, so they end first: one sync so no
+        // enqueued collective still reads a registered span, then the deregistration (S2-a). Both
+        // are teardown, after the run's last step; a failure here cannot change a result.
+        if let Some(reduce) = self.reduce {
+            let _ = self.cuda.synchronize();
+            if let Ok(mut run) = reduce.0.try_borrow_mut() {
+                let _ = run.deregister_buffers();
+            }
+        }
         // One image, eight symbols, eight module handles: every handle is freed, and they are freed
         // before the slab their launches read.
         for module in [
@@ -14355,8 +14451,8 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
             let ring = self.seam_ring.ok_or_else(|| {
                 "layer device stage attention_body: no seam ring allocated".to_owned()
             })?;
-            let code_bytes = sparkflash_kernels::attention_operands::STORE_CODE_BYTES;
-            let scale_bytes = sparkflash_kernels::attention_operands::STORE_SCALE_BYTES;
+            let (code_bytes, scale_bytes) = seam_store_owner_bytes(self.max_positions)
+                .map_err(|error| format!("layer device stage attention_body: {error}"))?;
             (
                 crate::layer_device::DeviceSpan::new(
                     ring.store_codes.0 + (owner_idx * code_bytes) as u64,
@@ -14613,14 +14709,12 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
             .checked_mul(dim)
             .and_then(|values| values.checked_mul(4))
             .ok_or("layer device stage ffn_seams: the hc stream width overflows")?;
-        for (name, span) in [("residual.stream", residual.stream)] {
-            if span.len < stream_needed {
-                return Err(format!(
-                    "layer device stage ffn_seams: {name} is {} B, the {hc_mult}-copy {dim}-wide \
-                     f32 stream needs {stream_needed} B",
-                    span.len
-                ));
-            }
+        if residual.stream.len < stream_needed {
+            return Err(format!(
+                "layer device stage ffn_seams: residual.stream is {} B, the {hc_mult}-copy \
+                 {dim}-wide f32 stream needs {stream_needed} B",
+                residual.stream.len
+            ));
         }
         let row_needed = dim
             .checked_mul(4)
@@ -15139,13 +15233,16 @@ fn run_forward_loop(
                 .to_string(),
         );
     };
-    // The two per-layer reduces take the reference TCP exchange unless `SPARK_COMM_REDUCE=roce`
-    // asks for the canonical RoCE one-shot and every rank can open it. The switch is resolved once,
-    // before the loop's first collective: the barrier and the agreement gather below are what keep
-    // all four ranks on one transport (see ForwardReduce::resolve). A default run never issues
-    // either of them, so its collectives, bytes and arithmetic are exactly the ones they were
-    // before this slot existed.
-    let (reduce_switch, reduce_requested) = ReduceSwitch::from_env();
+    // The host arm's two per-layer reduces take the reference TCP exchange unless
+    // `SPARK_COMM_REDUCE=roce` asks for the canonical RoCE one-shot and every rank can open it; the
+    // device arm's are NCCL enqueues (`nccl`) and this slot only reports that. The path was decided
+    // and checked against the arm once, at startup (crate::run_header), and is resolved here before
+    // the loop's first collective: the barrier and the agreement gather below are what keep all four
+    // ranks on one transport (see ForwardReduce::resolve). A tcp or nccl run never issues either of
+    // them, so its collectives, bytes and arithmetic are exactly the ones they were before this slot
+    // existed.
+    let reduce_switch = ReduceSwitch::for_path(request.header.reduce);
+    let reduce_requested = request.header.reduce.as_str();
     if reduce_switch == ReduceSwitch::Roce {
         // The QP endpoint exchange has a bounded deadline and the arena upload ends at a different
         // time on every rank, so one one-word reduce on the already-connected reference transport
@@ -15169,7 +15266,7 @@ fn run_forward_loop(
         transport,
         &maybe_roce,
         reduce_switch,
-        &reduce_requested,
+        reduce_requested,
         &roce_detail,
         request.world,
     )?;
@@ -15653,8 +15750,8 @@ fn run_forward_loop(
     // and its last. `SPARKFLASH_LAYER_DEVICE=0` selects the bit-exact host arm below instead; that
     // arm is the reference, and it is the one that crosses PCIe per stage.
     // The arm, and its reason for the record: evidence recording forces the host reference (it
-    // needs the per-position readbacks the device arm does not make), and the device layer is
-    // opt-in until one full layer runs device-only. No arm is chosen silently.
+    // needs the per-position readbacks the device arm does not make), and otherwise the device
+    // layer is the default since S2. No arm is chosen silently.
     let layer_arm = request.arm;
     // P5: the steady-state invariants of a device step, counted at the call sites where the lean
     // loop can cross a boundary (docs/build/s1-qa-harness.md). The declaration is a run fact, like
@@ -16918,6 +17015,7 @@ fn run_forward_loop(
                 None => format!("{}; no device layer completed", layer_arm.why()),
             }),
         );
+        object.insert("run_header".to_string(), run_header_record(request));
         object.insert(
             "collective_check".to_string(),
             serde_json::json!({
@@ -16984,6 +17082,16 @@ fn run_forward_loop(
                     .as_ref()
                     .and_then(crate::tp4_forward::DeviceLayer::reduce_stats)
                     .map_or(0, |stats| stats.bytes()),
+                // S2-a: the collective spans registered with the communicator once, at attach
+                // (ncclCommRegister), and still registered when the record is assembled.
+                "reduce_registered_buffers": layer_device
+                    .as_ref()
+                    .and_then(crate::tp4_forward::DeviceLayer::reduce_stats)
+                    .map_or(0, |stats| stats.registered_buffers()),
+                "reduce_registered_bytes": layer_device
+                    .as_ref()
+                    .and_then(crate::tp4_forward::DeviceLayer::reduce_stats)
+                    .map_or(0, |stats| stats.registered_bytes()),
                 "reduce_async_failure_check": layer_device
                     .as_ref()
                     .and_then(crate::tp4_forward::DeviceLayer::reduce_async_failure_check_available)
@@ -16994,7 +17102,7 @@ fn run_forward_loop(
                             "symbol absent: step sync only"
                         }
                     }),
-                "note": "slab_bytes is the layer's one device allocation (residual and every stage workspace); reduce_scratch_bytes is the 40 KiB span the NCCL warm-up and the RDMA arm share; reduce_arena_reserve_bytes is the communicator's stats.arena_bytes read at the boundary, and reduce_collectives_enqueued/reduce_bytes_enqueued are its own counters (0 when this run has no device handle)",
+                "note": "slab_bytes is the layer's one device allocation (residual and every stage workspace); reduce_scratch_bytes is the 40 KiB span the NCCL warm-up and the RDMA arm share; reduce_arena_reserve_bytes is the communicator's stats.arena_bytes read at the boundary, and reduce_collectives_enqueued/reduce_bytes_enqueued are its own counters (0 when this run has no device handle); reduce_registered_buffers/bytes are the collective spans registered once at attach (4 on the device arm)",
             }),
         );
         object.insert(
@@ -17813,6 +17921,12 @@ mod tests {
             reduce: None,
             arm: crate::layer_device::LayerArm::Host("test"),
             evidence: false,
+            header: crate::run_header::RunHeader::decide(|name| match name {
+                "SPARKFLASH_LAYER_DEVICE" => Some("0".to_string()),
+                "SPARK_COMM_REDUCE" => Some("tcp".to_string()),
+                _ => None,
+            })
+            .expect("the host test header decides"),
         }
     }
 
@@ -19986,14 +20100,33 @@ mod evidence_switch_tests {
 
     #[test]
     #[cfg(feature = "cuda")]
-    fn reduce_switch_parses_only_the_two_paths_and_a_typo_stays_on_the_reference() {
-        assert_eq!(ReduceSwitch::parse("roce"), ReduceSwitch::Roce);
-        assert_eq!(ReduceSwitch::parse(" RDMA "), ReduceSwitch::Roce);
-        assert_eq!(ReduceSwitch::parse("tcp"), ReduceSwitch::Tcp);
-        assert_eq!(ReduceSwitch::parse(""), ReduceSwitch::Tcp);
-        // A typo keeps the reference path and from_env reports it; it never silently picks the
-        // one-shot, and the row's line always names the path that actually ran.
-        assert_eq!(ReduceSwitch::parse("roc"), ReduceSwitch::Tcp);
+    fn reduce_switch_follows_the_header_path_and_has_no_default_of_its_own() {
+        use crate::run_header::ReducePath;
+        assert_eq!(ReduceSwitch::for_path(ReducePath::Roce), ReduceSwitch::Roce);
+        assert_eq!(ReduceSwitch::for_path(ReducePath::Tcp), ReduceSwitch::Tcp);
+        assert_eq!(ReduceSwitch::for_path(ReducePath::Nccl), ReduceSwitch::Nccl);
+        // An unset value or a typo never reaches the slot: the header refuses it at startup, so the
+        // row's line always names the path the run asked for (crate::run_header tests).
+        assert!(ReducePath::parse(Some("roc")).is_err());
+        assert!(ReducePath::parse(None).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn the_compressed_store_holds_every_reachable_position_and_never_fewer_than_512_rows() {
+        use sparkflash_kernels::attention_operands::{STORE_CODE_BYTES, STORE_SCALE_BYTES};
+        // At or below 512 positions the store is the kernel module's fixed one, byte for byte.
+        assert_eq!(
+            seam_store_owner_bytes(0),
+            Ok((STORE_CODE_BYTES, STORE_SCALE_BYTES))
+        );
+        assert_eq!(
+            seam_store_owner_bytes(138),
+            Ok((STORE_CODE_BYTES, STORE_SCALE_BYTES))
+        );
+        // The S2-e soak's 1,129 positions: one 256 B code row and one 32 B scale row each.
+        assert_eq!(seam_store_owner_bytes(1_129), Ok((1_129 * 256, 1_129 * 32)));
+        assert!(seam_store_owner_bytes(usize::MAX).is_err());
     }
     /// The loop's quantiser must feed the seams the two-step reference's bytes: narrow the row to
     /// BF16, then run the engine's quantiser, on the three shipped activation widths.

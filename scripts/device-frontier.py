@@ -43,8 +43,8 @@ PROBE MODE (default) - a refused row's four documents
     a. all four documents present, parseable, same schema, same "frontier" string. A rank whose
        frontier differs is a real finding: it means the stage order or a refusal path differs per
        rank, so the row cannot serve as a probe.
-    b. status == "refused"; arm == the device arm string (DEVICE_ARM below : layer_arm.why() from
-       layer_device.rs). A host-arm document masquerading as a probe is exit 1, never a warning.
+    b. status == "refused"; arm is a device arm string (DEVICE_ARMS below : layer_arm.why() from
+       layer_device.rs, S2 and S1 spellings). A host-arm document masquerading as a probe is exit 1, never a warning.
        The row's SPARKFLASH_LAYER_DEVICE is NOT recorded in the document (the arm string is the
        only arm evidence), so this tool does not pretend to look for it.
     c. frontier chain is the exact prefix of STAGE_ORDER and the stopped stage is the next stage;
@@ -141,7 +141,13 @@ STATUS_COMPLETED = "completed"
 
 #: layer_arm.why() for LayerArm::Device, verbatim from layer_device.rs. The arm string is the only
 #: arm evidence in the document: SPARKFLASH_LAYER_DEVICE is not recorded there.
-DEVICE_ARM = "device layer (opt-in): no per-layer PCIe copy, no per-stage observation read"
+DEVICE_ARM = "device layer (the default since S2): no per-layer PCIe copy, no per-stage observation read"
+
+#: The same arm's string before S2 made it the default (S1 and earlier rows, and the fixtures).
+DEVICE_ARM_S1 = "device layer (opt-in): no per-layer PCIe copy, no per-stage observation read"
+
+#: Every spelling a device-arm document may carry. The arm is the same; only its default changed.
+DEVICE_ARMS = (DEVICE_ARM, DEVICE_ARM_S1)
 
 #: STAGE_CONTRACTS order from layer_device.rs (20 stages). The chain must be a prefix of this, and
 #: a refused chain must stop at the next stage; every length check below derives from len(STAGE_ORDER),
@@ -1204,11 +1210,11 @@ def evaluate(
                 "rank {}: schema {!r} != {!r}".format(rank, schema, expect_schema),
             )
         arm = document.get("arm")
-        if arm != DEVICE_ARM:
+        if arm not in DEVICE_ARMS:
             record.finding(
                 "arm-device",
-                "rank {}: arm {!r} is not the device arm string; a host-arm document cannot be a "
-                "device probe (expected {!r})".format(rank, arm, DEVICE_ARM),
+                "rank {}: arm {!r} is not a device arm string; a host-arm document cannot be a "
+                "device probe (expected one of {!r})".format(rank, arm, DEVICE_ARMS),
             )
         if "rank" in document and document.get("rank") != rank:
             record.finding(

@@ -1,5 +1,5 @@
 {
-  "arm": "device layer (opt-in): no per-layer PCIe copy, no per-stage observation read",
+  "arm": "device layer (the default since S2): no per-layer PCIe copy, no per-stage observation read",
   "frontier": "device-only through engram_write -> mhc_entry -> quantise_prologue -> attention_projections -> query_path -> kv_path -> reference_seam -> ref_select -> stage_attention -> attention_body -> attention_output -> all_reduce -> attention_residual -> ffn_seams -> moe_router -> moe_routed -> all_reduce_moe -> all_reduce_rdma_arm (18 stage(s)); stopped at moe_shared: synthetic refusal text",
   "layer": 0,
   "max_positions": 4096,

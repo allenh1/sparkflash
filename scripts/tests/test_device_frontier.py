@@ -216,13 +216,18 @@ class FrontierTest(unittest.TestCase):
         docs = {
             rank: rank_document(
                 rank,
-                arm="host arm (the default until the layer is whole; SPARKFLASH_LAYER_DEVICE=1 opts in)",
+                arm="host arm (selected by SPARKFLASH_LAYER_DEVICE=0: the bit-exact host sequence; the device arm is the default)",
             )
             for rank in (0, 1, 2, 3)
         }
         result = self.evaluate(self.write_row(docs))
         self.assertEqual(result["exit_code"], 1)
         self.assertIn("arm-device", self.finding_ids(result))
+
+    def test_the_s1_device_arm_spelling_still_passes(self):
+        # Rows filed before S2 flipped the default carry the opt-in spelling of the same arm.
+        docs = {rank: rank_document(rank, arm=frontier.DEVICE_ARM_S1) for rank in (0, 1, 2, 3)}
+        self.assertEqual(self.code(self.write_row(docs)), 0)
 
     def test_an_explicitly_next_stage_stop_passes(self):
         # Five stages ran, so the refusal at the sixth (kv_path) is exactly right.

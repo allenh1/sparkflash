@@ -23,8 +23,8 @@ into the ABI crate).
 
 | Arm | Selection | Properties |
 | :-- | :-- | :-- |
-| Host reference | default | Bit-exact CPU/GPU lean loop; current published number. |
-| Device layer | `SPARKFLASH_LAYER_DEVICE=1` | One layer device-resident; opt-in until the whole layer runs. A missing kernel refuses by name with its signature. **On hardware since 2026-10-23**: opens on all four ranks, runs the nine wired stages of layer 0, refuses at `attention_body`. |
+| Host reference | `SPARKFLASH_LAYER_DEVICE=0` (or `host`); forced by evidence recording | Bit-exact CPU/GPU lean loop and the numerical gate's host baseline. Needs `SPARK_COMM_REDUCE=tcp` or `roce`. |
+| Device layer | **the default since S2** (unset, `1` or `device`) | All 40 layers, 20 stages each, device-only in one decode step since S1 closed ([`s1-result.md`](s1-result.md) §8). Needs `SPARK_COMM_REDUCE=nccl`. A missing kernel still refuses by name with its signature; a switch spelling that names neither arm refuses at startup. |
 
 There is no "run what is landed" mode: a half-device layer that silently mixes arms is the failure
 mode the contract prevents. A refusal prints the stage, the missing kernel and the contract.
@@ -67,6 +67,12 @@ named refusal at stage 10. All four
 ranks exited rc=2 (documented refusal). No step completed, so there is no ms/step and no D54 row;
 `docs/build/s1-result.md` is the record and the raw evidence is archived at
 `docs/archive/build/s1-device-probe-20261023/`.
+
+**Superseded the same day: S1 closed.** All 20 stages now run on all 40 layers, plus the device
+head, in one decode step: `d2h=1 / alloc=0 / sync=0`, D56 gate PASS, 202.67 ms/step four-rank mean
+at 1500 MHz ([`s1-result.md`](s1-result.md) §8). The State column above and the frontier paragraph
+record the S1-0 probe. S2 made the device arm the default. The capture-safety audit of each stage's
+host arguments is [`s2-extent-args.md`](s2-extent-args.md).
 
 The first device-arm probe row is a frontier probe, not a speed row; if it completes a layer it must
 pass the numerical gate. The remaining new kernel for the attention half is the inverse rope in
@@ -138,6 +144,7 @@ router reads the un-normalised row.
 | `scripts/check-collective-count.py` | All four rank records agree: `layers x 2` collectives. |
 | `scripts/check-kernel-baseline.sh` | Pinned cubin baseline; required before staging. |
 | `scripts/identity-gate.sh --run <row>` | Strict byte identity, only when the slice claims it. |
+| `scripts/s2-verdict.py replicates\|soak --run <row>` | S2 header (device / nccl / build), invariants, registered spans, NCCL faults; replicate agreement or soak tail. |
 
 A device-arm row that fails the numerical gate is a port bug, not a tolerance question. Do not
 publish ms/step from `win/layer-device` until one full layer runs device-only and the branch is
@@ -156,11 +163,16 @@ is not a speed row and carries no tolerance arm.
 - Ratio>0 `reference_seam`/`ref_select`/`stage_attention`: move the 19 `AttentionHostSeam` operands
   into the bind and port the compressor/index path (19 tensors, no arena today).
 - An S1-a mixed-arm loop (the arm is chosen once per run today) and the frozen 32×128 D54 fixture.
-- The clock-locked 10 KiB collectives gate: the only four-rank NCCL bench is bit-exact but INVALID
-  (unlocked clocks), and `nvidia-smi -lgc` needs root/passwordless sudo on the nodes, so no valid gate
-  row exists yet. The 80/step reference walk is TCP.
-- Flip the default to the device arm (one commit) after one full device-only layer.
-- Then: CUDA graph capture and the GEMV re-tile.
+- The clock-locked 10 KiB collectives gate (S2-a): `scripts/gpu-reduce-bench.sh gate` is implemented
+  (1500 MHz lock, GDR evidence from NCCL's INFO log, registered buffers) and has **no locked row**.
+  The `s2w01` boost run FAILs it on latency (p50 48.3–48.5 us, p99 85.2–87.3 us) and GDR. GB10
+  reports neither GPUDirect RDMA nor DMA-BUF, so the GDR clause needs a Lead decision.
+- The default flip landed in S2: the device arm is the default and `SPARK_COMM_REDUCE` is required.
+  In window `s2w01`, at boost clocks, the S2-d pair (146.03 / 145.28 ms, numerical gate PASS) and
+  the S2-e soak (PASS) ran. The **1500 MHz-locked** S2-d pair is still owed; see
+  [`s2-result.md`](s2-result.md).
+- Then: CUDA graph capture (S3, starting from [`s2-extent-args.md`](s2-extent-args.md)) and the
+  GEMV / MoE re-tile (S4).
 
 ## Archived sources
 

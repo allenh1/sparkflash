@@ -250,6 +250,11 @@ pub struct TokenEnvelope {
     pub launch_census: serde_json::Value,
     /// Whether the hybrid (non-TP) sequence ran inside this stage; always `false` on this arm.
     pub hybrid_sequence_executed: bool,
+    /// The run header ([`crate::run_header`]): the arm, the collective path, the switches and the
+    /// NCCL transport environment the run started from, plus the NCCL build once a communicator
+    /// opened. Absent only in envelopes written before S2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_header: Option<serde_json::Value>,
 }
 
 impl TokenEnvelope {
@@ -284,6 +289,7 @@ impl TokenEnvelope {
                 "forward refused before any routed expert launched",
             ),
             hybrid_sequence_executed: false,
+            run_header: None,
         }
     }
 
@@ -318,6 +324,7 @@ impl TokenEnvelope {
             error: None,
             launch_census,
             hybrid_sequence_executed: false,
+            run_header: None,
         }
     }
 

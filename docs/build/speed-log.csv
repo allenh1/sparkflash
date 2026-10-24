@@ -65,3 +65,5 @@ date,commit,run,step_mean_ms,tokens_ok,logits_sha_ok,note
 2026-10-23,33ac2dcc,s1-c,202.67,yes,yes,"S1 40-layer device arm replicate 1 (s1-c-rep1), 1500 MHz clock lock (1462-1488 MHz, 8.8-11.4 W), median 191.75 ms (-52.25 ms vs host locked), d2h=1 alloc=0 sync=0, D56 numerical gate PASS"
 2026-10-23,33ac2dcc,s1-c-rep2,202.75,yes,yes,"S1 40-layer device arm replicate 2, 1500 MHz clock lock (1462-1488 MHz, 8.9-11.5 W), median 193.50 ms (within 2 ms of s1-c), d2h=1 alloc=0 sync=0, D56 numerical gate PASS"
 2026-10-23,51b3fd94,s1-c1-boost,142.94,yes,yes,"S1 40-layer device arm unlocked boost clocks (2405 MHz), median 135.00 ms (-44.81 ms vs 179.81 published), d2h=1 alloc=0 sync=0, D56 numerical gate PASS"
+2026-10-23,a42b1aa1,s2-d,146.03,yes,yes,"S2 device arm by default (SPARK_COMM_REDUCE=nccl, registered buffers), boost clocks (2405-2411 MHz), median 139.00 ms, replicate 1, d2h=1 alloc=0 sync=0, D56 numerical gate PASS"
+2026-10-23,a42b1aa1,s2-d-rep2,145.28,yes,yes,"S2 device arm by default (SPARK_COMM_REDUCE=nccl, registered buffers), boost clocks (2405-2411 MHz), median 138.50 ms, replicate 2 (delta 0.75 ms vs s2-d), d2h=1 alloc=0 sync=0, D56 numerical gate PASS"

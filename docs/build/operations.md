@@ -52,7 +52,10 @@ started until the service is actually gone; a half-stopped cluster produces unat
    scripts/run-fourrank.sh <tag> <row> token
    ```
    with `SPARKFLASH_SYNC_LAUNCHES=1` for a sync control and `SPARKFLASH_FORWARD_EVIDENCE=1` for an
-   evidence row. The device arm is opt-in with `SPARKFLASH_LAYER_DEVICE=1`.
+   evidence row. The device arm is the default since S2; `SPARKFLASH_LAYER_DEVICE=0` selects the
+   host arm. **Every forward run must set `SPARK_COMM_REDUCE`** (there is no default): `nccl` for
+   the device arm, `tcp` or `roce` for the host arm (and for every evidence row, which forces the
+   host arm). An unset or mismatched value refuses at startup with a `run_header` in the envelope.
 4. Never stage/copy while a row is running. Never run two rows at once on the same nodes.
 
 ### 2.4 Gate the row
@@ -62,6 +65,9 @@ scripts/numerical-gate.sh --run <row-dir>      # product gate (D54)
 scripts/identity-gate.sh --run <row-dir>       # strict mode, only if bit identity is claimed
 scripts/device-frontier.py --row-dir <row-dir> # device-arm rows: stage frontier / refusal
 scripts/check-collective-count.py              # device-arm rows: layers x 2 on all four ranks
+scripts/s2-verdict.py replicates --run A --run B   # S2-d: two locked replicates within 2 ms
+scripts/s2-verdict.py soak --run <row-dir>         # S2-e: 1,000 steps, p99 <= 1.10x median
+scripts/gpu-reduce-bench.sh gate               # S2-a: 10 KiB NCCL, 1500 MHz lock, GDR, registered
 ```
 
 A failed numerical gate is a port bug, not a tolerance question. A row that ends at open is an

@@ -531,16 +531,17 @@ case "$POSITION" in
 esac
 
 # Fail closed before comparing anything: this tool needs both arms run on a node. The host arm is
-# forced by evidence recording, the device arm is SPARKFLASH_LAYER_DEVICE=1, and both need the real
-# kernels; a CPU-only checkout cannot produce the observation copies.
+# forced by evidence recording, the device arm is the default (SPARKFLASH_LAYER_DEVICE unset or 1),
+# each names its collective path (SPARK_COMM_REDUCE: tcp for the host arm, nccl for the device arm),
+# and both need the real kernels; a CPU-only checkout cannot produce the observation copies.
 if ! gpu_present; then
   fail_closed \
     "no GPU on this host, so neither the host arm nor the device arm can be run and no observation copies exist." \
     "/dev/nvidia*: absent; nvidia-smi: absent." \
     "The host-arm vs device-arm diff runs on a node: run the host arm with" \
-    "  SPARKFLASH_BOUNDARY_TRACE=<host-trace> SPARKFLASH_TRACE_POSITIONS=<position>" \
+    "  SPARK_COMM_REDUCE=tcp SPARKFLASH_BOUNDARY_TRACE=<host-trace> SPARKFLASH_TRACE_POSITIONS=<position>" \
     "(rank 0 writes the rows; evidence recording selects the host arm), run the device arm with" \
-    "  SPARKFLASH_LAYER_DEVICE=1 and the dev-gated observation writer pointed at <device-trace>," \
+    "  SPARK_COMM_REDUCE=nccl and the dev-gated observation writer pointed at <device-trace>," \
     "then diff them here with --host <host-trace> --device <device-trace>." \
     "Failing closed: exit 2. Nothing was compared."
 fi

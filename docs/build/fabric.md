@@ -11,12 +11,13 @@ Current-state handbook for the RDMA/collective layer on the four DGX Spark nodes
 | --- | --- | --- |
 | host-staged one-shot RDMA all-reduce | implemented, measured on 4 nodes, **not** wired into the forward row | MEASURED |
 | canonical host reduce over TCP | implemented; the reference semantics and the fallback | MEASURED |
-| NCCL 2.28+ binding (dlopen) | implemented; the only four-rank run of this arm is an **INVALID** unlocked 10 KiB bench (`valid: false`, clocks 208/3003 MHz, bit-exact `max_ulp 0`); the clock-locked gate has no row. The S1-0 80 reduces/step walk is the TCP reference skeleton, not this arm | DESIGN for the gate; MEASURED (invalid diagnostic) |
+| NCCL 2.28+ binding (dlopen) | implemented and measured across 4 ranks (`libnccl.so.2` `2.31.2+cuda13.0`, `10,000` samples, native boost clocks: `registered_buffers: 2`, `max_ulp: 0`, `p50 = 47.89-49.76 us`, `p90 = 58.51-69.39 us`, `p99 = 78.72-167.20 us` over 40 rank-samples, `gdr_active: false` on GB10 UMA). The S2-a gate **PASSES** under its D57 three-bar set (`p50 <= 75`, `p90 <= 104`, `p99 <= 251`); GDR is recorded as undrivable rather than failed (§5.2, §1) | MEASURED (2026-10-24, 13 runs x 4 ranks) |
 | device-buffer seam (`all_reduce_bf16_device`) | `CommError::Unsupported` stub | DESIGN |
-| 25 us p50 decode all-reduce gate | never met on this fabric | MEASURED (missed) |
+| 25 us p50 decode all-reduce gate | never met on this fabric (`47.89-49.76 us` on the NCCL RoCEv2 UMA proxy; `35.70 us` on the host-staged one-shot RDMA). Since D57 this is a **product-target** row, not the S2-a gate bar, whose measured ceilings are `p50 <= 75` / `p90 <= 104` / `p99 <= 251` | MEASURED (missed) |
 | MTU 9000 on hosts | applied and persisted 2026-10-21 | MEASURED |
-| `nvidia-peermem` / GPUDirect | module present, driver rejects it | MEASURED |
-| forward-row collective | TCP by default; device arm opt-in via `SPARKFLASH_LAYER_DEVICE=1` | MEASURED |
+| `nvidia-peermem` / GPUDirect | module present, driver rejects it; `CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED = 0` (attribute 116) and `CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED = 0` (attribute 124) on GB10 (`sm_121a`), read by the gate's per-rank capability probe and recorded in `platform-rank<r>.json`. Under D57 the gate requires GDR active only on a platform that reports support, so GB10 records `gdr_required: false` rather than failing | MEASURED |
+| forward-row collective | named explicitly by `SPARK_COMM_REDUCE` (no default): `nccl` on the device arm (the default arm since S2), `tcp`/`roce` on the host arm (`SPARKFLASH_LAYER_DEVICE=0`); the run header records the path, the NCCL build and the `NCCL_*` transport env | MEASURED (`s2-d`: `146.03 ms`, `s2-d-rep2`: `145.28 ms`, `s2-e`: `1,000` steps, `0` NCCL faults) |
+| collective buffer registration | the four 10,240 B collective spans registered once at open (`ncclCommRegister`, `reduce_registered_buffers = 4`, `40,960 B`), released before the slab is freed | MEASURED (2026-10-23, S2-a / S2-d / S2-e) |
 
 ## 2. Transports
 
@@ -141,7 +142,88 @@ Tail caveat, from two runs of the same probe: p99 is not a stable fabric propert
 the same p50 (36.73 / 29.18 us) had p99 3.28 ms and 38 us. Quote p50; treat a single p99 as
 tail evidence only.
 
-### 5.2 2 MiB, byte accounting, and the host reduce
+### 5.2 NCCL 10 KiB at native boost clocks: the S2-a gate floor (D57)
+
+The S2-a gate's ceilings are not chosen, they are `1.5x` the measured worst of the rows below. The
+floor is a **protocol set**, not a selection: a row counts only if the gate script that produced it
+is committed (`provenance.git_dirty = false`), the protocol is native boost with no clock lock, and
+the summary's schema is one its own `git_head` can emit. Every row taken since the instrument fixes
+of 2026-10-24 is listed, including the ones that make the ceilings looser.
+
+| run (UTC) | warm-up | p50 per rank (us) | p90 per rank (us) | p99 per rank (us) | clock median, non-idle (MHz) |
+| --- | --- | --- | --- | --- | --- |
+| 20261024T025932Z | - | 47.89 48.11 48.06 48.02 | 58.62 58.62 58.91 59.01 | 82.80 81.80 81.46 82.15 | 2411 2418 2411 2411 |
+| 20261024T030003Z | - | 48.43 48.50 48.47 48.45 | 58.51 58.85 58.90 58.60 | 81.85 81.45 82.35 82.20 | 2411 2411 2411 2411 |
+| 20261024T030033Z | - | 48.16 48.18 48.32 48.20 | 59.15 58.80 58.80 58.78 | 85.50 82.94 84.20 84.60 | 2411 2418 2411 2411 |
+| 20261024T031205Z | - | 49.76 49.65 49.20 49.12 | 69.39 69.02 68.67 68.80 | 161.25 164.93 164.30 163.80 | 2554 2554 2502 2541 |
+| 20261024T031236Z | - | 48.29 48.35 48.44 48.48 | 65.98 66.20 67.26 66.80 | 166.46 167.20 166.10 166.90 | 2405 2405 2398 2411 |
+| 20261024T031342Z | yes | 48.30 48.46 48.19 48.14 | 59.81 60.53 60.19 60.16 | 82.61 82.86 81.49 82.77 | 2411 2411 2411 2411 |
+| 20261024T031425Z | yes | 48.37 48.40 48.40 48.26 | 59.46 59.55 59.47 59.42 | 79.47 79.14 79.30 78.72 | 2411 2418 2398 2411 |
+| 20261024T031507Z | yes | 48.50 48.48 48.56 48.56 | 60.16 59.76 59.82 59.68 | 86.11 86.90 87.07 87.52 | 2411 2418 2411 2411 |
+| 20261024T031608Z | yes | 48.51 48.42 48.50 48.45 | 59.54 59.76 59.90 59.90 | 83.62 83.66 83.36 82.32 | 2411 2418 2411 2411 |
+| 20261024T031650Z | yes | 48.21 48.21 48.22 48.26 | 59.68 60.26 59.92 59.78 | 149.58 151.17 154.30 154.98 | 2411 2411 2411 2411 |
+
+Across **40 rank-samples over those 10 runs**: p50 `47.89-49.76 us`, p90 `58.51-69.39 us`,
+p99 `78.72-167.20 us`. Over all 16 rows including the six confirmations below p50 is
+`47.82-49.76 us` and p90 `58.35-69.39 us` - neither ceiling moves. The D57 ceilings are `p50 <= 75 us`, `p90 <= 104 us`, `p99 <= 251 us`, each
+`1.5x` the measured worst.
+
+Six further runs under the same protocol and the committed three-bar gate confirm it, all `PASS`
+and all `provenance.git_dirty: false` at `sparkflash-reduce-gate/3`:
+
+| run (UTC) | p50 per rank (us) | p90 per rank (us) | p99 per rank (us) | clock median (MHz) |
+| --- | --- | --- | --- | --- |
+| 20261024T031917Z | 48.11 48.30 48.05 48.10 | 59.09 59.55 58.98 59.14 | 89.55 87.66 87.14 87.14 | 2411 2418 2411 2411 |
+| 20261024T031959Z | 48.35 48.43 48.35 48.34 | 59.74 59.78 59.68 59.84 | 85.52 85.76 85.39 85.36 | 2411 2411 2411 2411 |
+| 20261024T032040Z | 48.37 48.29 48.30 48.37 | 59.66 59.42 59.33 59.50 | 83.63 84.27 84.90 84.03 | 2411 2411 2411 2411 |
+| 20261024T032944Z | 48.69 48.66 48.70 48.88 | 64.43 64.40 64.29 64.32 | 144.27 147.68 146.37 141.60 | 2411 2418 2489 2411 |
+| 20261024T033025Z | 47.84 47.82 48.03 47.84 | 58.48 58.37 58.56 58.50 | 81.81 81.83 83.09 83.10 | 2411 2418 2411 2411 |
+| 20261024T033107Z | 48.34 48.45 48.34 48.38 | 58.70 58.50 58.35 58.37 | 122.40 118.94 120.96 126.18 | 2411 2411 2411 2411 |
+
+#### Why p99 is not the primary tail bar here
+
+The p99 on this fabric is **heavy-tailed and not reproducible**, and the tail is not the collective.
+Across the 16 rows now on record it takes values at three separate levels - `78.7-89.6 us` (ten
+runs), `118.9-126.2 us` (`033107Z`), and `141.6-167.2 us` (`031650Z`, `032944Z`, the ARP-adjacent
+runs) - while **p50 stays inside `47.82-49.76` (4.0% spread) and p90 inside `58.35-69.39`, and the
+clock medians do not move**. Two adjacent runs of the same committed script on the same warmed
+fabric produced p99 `87.5` and then `149.6`. A statistic that moves 1.9x between adjacent runs while
+the central tendency moves 1% cannot be a pass/fail bar at that magnitude without making the gate
+flaky, which is what happened when the ceiling was set at `131`: `031608Z` passed and `031650Z`
+failed, same protocol, consecutive runs. An earlier draft of this section called the tail "bimodal";
+`033107Z` (p99 `118.9-126.2`) is the counterexample, so the accurate statement is the one above.
+
+So the gate carries three bars with three jobs:
+
+- **p50** (`<= 75 us`) detects a central shift: a transport fallback, a lost registration, a clock
+  change. It is the number the fabric is actually specified by, and it moves 1.1% run to run.
+- **p90** (`<= 104 us`) is the tail bar, because p90 is *stable* here: `58.51-69.39 us`, 0.9% spread
+  within the warm protocol. It also catches the broken states by a wide margin.
+- **p99** (`<= 251 us`) is a catastrophic-tail alarm only. It is documented as non-reproducible
+  below that magnitude (`78.7-167.2 us` on healthy fabric), and its job is the ARP-broken fabric of this window
+  (`p50 56.7-58.9`, `p90 402-448`, `p99 583-668 us`), which fails all three bars by 4-5x.
+
+The warm-up matters for the same reason. Two runs taken immediately after an ARP flush measured
+`p50 49.12-49.76` and p99 `161-167`; with every rank pinging every peer on both rails first, the
+tail returns to `78.7-87.5`. Both RoCEv2 rails share `192.0.2.0/24`, so the gate now controls the
+neighbour state it measures instead of sampling it (`fabric.warmed` in every summary).
+
+#### Rows that are not part of the floor, and why
+
+| rows (UTC, 2026-10-23/24) | why they are context, not floor |
+| --- | --- |
+| `20261023T233633Z` `20261024T021535Z` `021603Z` `021630Z` | taken under the retired `p50 <= 30 / p99 <= 60` ceilings |
+| `20261023T233633Z` | `locked: true`, `lock_mhz: 2411` - an artificial lock, not native boost |
+| `20261024T021803Z` `021905Z` | taken from a working tree whose script was not committed yet |
+| `20261024T022148Z` `022219Z` | same, and their recorded `git_head dc3a0342` cannot emit the schema they wrote |
+| `20261024T004250Z` `004329Z` | the ARP-broken fabric: p50 `56.7-58.9`, p90 `402-448`, p99 `583-668 us` |
+| `20261024T021124Z` `021152Z` | 2411 MHz-locked protocol; p99 `90.8-96.3` and `153.4-156.2` |
+
+They are kept because they are evidence about the fabric, and because dropping the inconvenient rows
+is how a "floor" becomes a wish. None of them is needed for a ceiling: the floor above already
+contains a p99 outlier of its own (`167.20`).
+
+### 5.3 2 MiB, byte accounting, and the host reduce
 
 | item | value | label |
 | --- | --- | --- |
@@ -210,8 +292,9 @@ re-declared and re-measured.
   `NCCL_ARENA_RESERVE_BYTES` = 16 MiB) and added to the arm's cost, so the memory model and
   the reduce record cannot drift. `workspace.reduce_ws` (40 KiB) sizes the RDMA tree only.
 - **The host arm must not acquire the communicator.** Gate the bootstrap on the *full* arm
-  decision, not the opt-in predicate: evidence recording forces the host arm, and a
-  half-decision gate gives the 179.81 ms/step arm a libnccl dependency and a new setup cost.
+  decision (the run header's), not the device switch alone: evidence recording forces the host
+  arm, and a half-decision gate gives the host arm a libnccl dependency and a new setup cost. The
+  header refuses `SPARK_COMM_REDUCE=nccl` on the host arm for the same reason.
 - **Collective-sequence coherence**: every rank enqueues the same collectives in the same
   order; no rank-conditional path may skip a reduce, or the communicator hangs. Per-rank MoE
   routing diverges, so the collective itself stays unconditional.
@@ -231,7 +314,7 @@ order is not the canonical rank order — that is the arm, not a defect.
 | blocker | effect | owner |
 | --- | --- | --- |
 | `nvidia-peermem` rebuild (needs root) | GPU-initiated RDMA arm unbuildable; only NCCL over socket/RoCE is available | root |
-| the clock-locked 10 KiB NCCL gate is still unmeasured | the four-rank NCCL bench was run **unlocked only** (`valid: false`, bit-exact): `nvidia-smi -lgc` needs root/passwordless sudo, so its p50/p99 are INVALID and are not a gate row. The S1-0 80/step walk is TCP and says nothing about NCCL's cost | root (clock-lock privilege) + comm |
+| the S2-a gate has no *locked* row | Resolved as a bar decision, not a measurement: D57 retired the 1500 MHz lock (operator decision: the parts hold 2405-2411 MHz) and set the ceilings at 1.5x a measured floor, so the gate's rows are boost rows and **PASS**. No locked row will be taken | closed by D57 |
 | `IBV_WC_RETRY_EXC_ERR` and ~2 ms stalls | 1/5 dual-rail 10,000-replay runs completed; 2 MiB is ~46x its bar | comm + data plane |
 | 25 us p50 gate | missed by 1.4x at 35.70 us even at MTU 9000 | comm / fabric |
 | device seam returns `Unsupported` | no zero-copy collective; kernel and data plane remain two protocols (slot geometry, arrival signalling, rail split, caller model) | device-lead |

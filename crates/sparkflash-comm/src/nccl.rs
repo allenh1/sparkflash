@@ -11,11 +11,13 @@
 //!
 //! [`NcclApi::load`] resolves the subset of the NCCL 2.x C API the dispatcher needs:
 //! `ncclGetVersion`, `ncclGetUniqueId`, `ncclCommInitRankConfig`, `ncclAllReduce`,
-//! `ncclAllGather`, `ncclGroupStart`, `ncclGroupEnd`, `ncclCommDestroy` and
-//! `ncclGetErrorString`. The first two are not in the task's six-function list but are
-//! prerequisites for a real communicator: the version probe enforces the 2.28 floor, and a
-//! unique id is what bootstraps the four ranks. They are resolved as required symbols so a
-//! truncated library fails at load with a named symbol rather than at the first collective.
+//! `ncclAllGather`, `ncclGroupStart`, `ncclGroupEnd`, `ncclCommDestroy`, `ncclGetErrorString`,
+//! `ncclCommRegister` and `ncclCommDeregister`. The first two are not in the task's six-function
+//! list but are prerequisites for a real communicator: the version probe enforces the 2.28 floor,
+//! and a unique id is what bootstraps the four ranks. The registration pair (NCCL 2.19+, so inside
+//! the floor) is how the run registers its collective buffers once at open (S2-a). They are
+//! resolved as required symbols so a truncated library fails at load with a named symbol rather
+//! than at the first collective.
 //!
 //! ## The ABI choices that matter
 //!
@@ -83,7 +85,7 @@ pub const NCCL_OBSERVED_IMAGE: &str = "vllm-node:latest";
 /// [`ASYNC_ERROR_SYMBOL`] is resolved separately and is optional: a library that predates it loads
 /// and runs, and the run boundary then reports the failure check as unavailable
 /// ([`NcclApi::has_async_failure_check`]) instead of treating the absence as an error.
-pub const REQUIRED_SYMBOLS: [&str; 9] = [
+pub const REQUIRED_SYMBOLS: [&str; 11] = [
     "ncclGetVersion",
     "ncclGetUniqueId",
     "ncclCommInitRankConfig",
@@ -93,6 +95,27 @@ pub const REQUIRED_SYMBOLS: [&str; 9] = [
     "ncclGroupEnd",
     "ncclCommDestroy",
     "ncclGetErrorString",
+    "ncclCommRegister",
+    "ncclCommDeregister",
+];
+
+/// The NCCL environment variables that decide which transport a run's collectives take.
+///
+/// NCCL reads them itself at communicator init and this binding never sets them; the run header and
+/// the bench JSON record each one's value (or its absence) so a row states the fabric configuration
+/// it ran with (S2-a), instead of a later reader inferring it from a launch script. The first five
+/// are the issue's list (`NCCL_IB_HCA`, the GDR level, `NCCL_ALGO`/`NCCL_PROTO`); the rest are the
+/// knobs the deployed recipe sets (fabric.md) and the registration switch.
+pub const TRANSPORT_ENV: [&str; 9] = [
+    "NCCL_IB_HCA",
+    "NCCL_NET_GDR_LEVEL",
+    "NCCL_NET_GDR_READ",
+    "NCCL_ALGO",
+    "NCCL_PROTO",
+    "NCCL_IB_GID_INDEX",
+    "NCCL_SOCKET_IFNAME",
+    "NCCL_DMABUF_ENABLE",
+    "NCCL_LOCAL_REGISTER",
 ];
 
 /// The optional run-boundary failure-detection entry point.
@@ -536,6 +559,11 @@ type GetErrorStringFn = unsafe extern "C" fn(c_int) -> *const c_char;
 /// `ncclCommGetAsyncError(ncclComm_t, ncclResult_t *asyncError) -> ncclResult_t`: the return value
 /// is the query's own result; `asyncError` is the communicator's asynchronous status.
 type CommGetAsyncErrorFn = unsafe extern "C" fn(NcclCommHandle, *mut c_int) -> c_int;
+/// `ncclCommRegister(const ncclComm_t, void *buff, size_t size, void **handle) -> ncclResult_t`.
+type CommRegisterFn =
+    unsafe extern "C" fn(NcclCommHandle, *mut c_void, usize, *mut *mut c_void) -> c_int;
+/// `ncclCommDeregister(const ncclComm_t, void *handle) -> ncclResult_t`.
+type CommDeregisterFn = unsafe extern "C" fn(NcclCommHandle, *mut c_void) -> c_int;
 
 struct RawApi {
     get_version: *mut c_void,
@@ -547,6 +575,8 @@ struct RawApi {
     group_end: *mut c_void,
     comm_destroy: *mut c_void,
     get_error_string: *mut c_void,
+    comm_register: *mut c_void,
+    comm_deregister: *mut c_void,
     /// Optional: None when the loaded library predates `ncclCommGetAsyncError`.
     comm_get_async_error: Option<*mut c_void>,
 }
@@ -609,6 +639,8 @@ impl NcclApi {
             group_end: resolve("ncclGroupEnd")?,
             comm_destroy: resolve("ncclCommDestroy")?,
             get_error_string: resolve("ncclGetErrorString")?,
+            comm_register: resolve("ncclCommRegister")?,
+            comm_deregister: resolve("ncclCommDeregister")?,
             // Optional: an image without it loads and runs; the boundary reports the check as
             // unavailable rather than refusing a library that is otherwise complete.
             comm_get_async_error: loader.symbol(ASYNC_ERROR_SYMBOL),
@@ -841,6 +873,78 @@ impl NcclApi {
             Ok(())
         } else {
             Err(self.call_error("ncclCommDestroy", result))
+        }
+    }
+
+    /// Registers one device buffer with a raw communicator handle and returns NCCL's registration.
+    ///
+    /// Registration is setup, never step work: the caller registers the run's collective buffers
+    /// once at open and deregisters them before the communicator is destroyed. A zero-byte or null
+    /// buffer is refused before NCCL is entered, because NCCL would accept neither and its error
+    /// would not name the buffer.
+    ///
+    /// # Safety
+    /// The handle must be live, and `buffer` must be the start of `bytes` bytes of device memory on
+    /// the communicator's device that stays allocated until the registration is deregistered.
+    ///
+    /// # Errors
+    /// Returns NcclError::Config for a null or empty buffer and NcclError::Call when NCCL refuses.
+    pub(crate) unsafe fn comm_register_handle(
+        &self,
+        handle: NcclCommHandle,
+        buffer: *mut c_void,
+        bytes: usize,
+    ) -> Result<*mut c_void, NcclError> {
+        if buffer.is_null() || bytes == 0 {
+            return Err(NcclError::Config(format!(
+                "ncclCommRegister needs a non-null buffer of at least one byte, got {buffer:p} with {bytes} bytes"
+            )));
+        }
+        let mut registration: *mut c_void = ptr::null_mut();
+        // SAFETY: the caller upholds the handle and buffer contract; registration is a valid
+        // out-parameter for ncclCommRegister.
+        let result = unsafe {
+            let function: CommRegisterFn = std::mem::transmute(self.raw.comm_register);
+            function(handle, buffer, bytes, &mut registration)
+        };
+        if result != NCCL_SUCCESS {
+            return Err(self.call_error("ncclCommRegister", result));
+        }
+        if registration.is_null() {
+            return Err(NcclError::Config(format!(
+                "ncclCommRegister returned success but a null registration for {bytes} bytes at {buffer:p}"
+            )));
+        }
+        Ok(registration)
+    }
+
+    /// Releases one registration made by [`Self::comm_register_handle`].
+    ///
+    /// A null registration is a no-op, so a teardown path can call this unconditionally.
+    ///
+    /// # Safety
+    /// The handle must be the live communicator the registration was made on, and the registration
+    /// must not have been released already.
+    ///
+    /// # Errors
+    /// Returns NcclError::Call when NCCL reports a failure.
+    pub(crate) unsafe fn comm_deregister_handle(
+        &self,
+        handle: NcclCommHandle,
+        registration: *mut c_void,
+    ) -> Result<(), NcclError> {
+        if registration.is_null() {
+            return Ok(());
+        }
+        // SAFETY: the caller upholds the handle and registration contract documented above.
+        let result = unsafe {
+            let function: CommDeregisterFn = std::mem::transmute(self.raw.comm_deregister);
+            function(handle, registration)
+        };
+        if result == NCCL_SUCCESS {
+            Ok(())
+        } else {
+            Err(self.call_error("ncclCommDeregister", result))
         }
     }
 
@@ -1267,7 +1371,7 @@ mod tests {
 
     #[test]
     fn every_required_symbol_is_named_and_a_missing_one_is_a_typed_error() {
-        assert_eq!(REQUIRED_SYMBOLS.len(), 9);
+        assert_eq!(REQUIRED_SYMBOLS.len(), 11);
         for (index, symbol) in REQUIRED_SYMBOLS.iter().enumerate() {
             assert_eq!(
                 REQUIRED_SYMBOLS[index], *symbol,
@@ -1356,5 +1460,127 @@ mod tests {
         assert!(text.contains("host-reduce"), "{text}");
         assert!(text.contains("not counted"), "{text}");
         assert!(text.contains("abort on every rank"), "{text}");
+    }
+
+    unsafe extern "C" fn register_ok(
+        _comm: NcclCommHandle,
+        _buffer: *mut c_void,
+        _bytes: usize,
+        out: *mut *mut c_void,
+    ) -> c_int {
+        unsafe {
+            *out = ptr::without_provenance_mut(0x5150);
+        }
+        NCCL_SUCCESS
+    }
+
+    unsafe extern "C" fn register_refused(
+        _comm: NcclCommHandle,
+        _buffer: *mut c_void,
+        _bytes: usize,
+        _out: *mut *mut c_void,
+    ) -> c_int {
+        3
+    }
+
+    unsafe extern "C" fn register_null(
+        _comm: NcclCommHandle,
+        _buffer: *mut c_void,
+        _bytes: usize,
+        _out: *mut *mut c_void,
+    ) -> c_int {
+        NCCL_SUCCESS
+    }
+
+    unsafe extern "C" fn deregister_ok(_comm: NcclCommHandle, _registration: *mut c_void) -> c_int {
+        NCCL_SUCCESS
+    }
+
+    /// `with_all` plus callable registration entries and a callable `ncclGetErrorString`.
+    fn api_with_register(
+        register: unsafe extern "C" fn(
+            NcclCommHandle,
+            *mut c_void,
+            usize,
+            *mut *mut c_void,
+        ) -> c_int,
+    ) -> NcclApi {
+        let mut loader = FakeLoader::with_all();
+        loader
+            .symbols
+            .insert("ncclGetErrorString", fake_error_entry(fake_error_string));
+        loader
+            .symbols
+            .insert("ncclCommRegister", register as *const () as *mut c_void);
+        loader.symbols.insert(
+            "ncclCommDeregister",
+            deregister_ok as unsafe extern "C" fn(NcclCommHandle, *mut c_void) -> c_int as *const ()
+                as *mut c_void,
+        );
+        NcclApi::from_loader(Box::new(loader)).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    #[test]
+    fn the_gate_script_forwards_exactly_the_recorded_transport_env() {
+        // scripts/gpu-reduce-bench.sh forwards the operator's NCCL_FORWARD list to every rank; the
+        // bench JSON and the run header record TRANSPORT_ENV. The two lists must be the same names,
+        // or the gate would compare a variable it never forwarded.
+        let script = include_str!("../../../scripts/gpu-reduce-bench.sh");
+        let start = script
+            .find("NCCL_FORWARD=(")
+            .unwrap_or_else(|| panic!("the gate script declares NCCL_FORWARD"));
+        let body = &script[start + "NCCL_FORWARD=(".len()..];
+        let end = body
+            .find(')')
+            .unwrap_or_else(|| panic!("NCCL_FORWARD is closed"));
+        let forwarded: Vec<&str> = body[..end].split_whitespace().collect();
+        assert_eq!(forwarded, TRANSPORT_ENV);
+    }
+
+    #[test]
+    fn a_registration_round_trips_and_an_empty_buffer_never_reaches_nccl() {
+        let api = api_with_register(register_ok);
+        let comm: NcclCommHandle = ptr::without_provenance_mut(0x10);
+        let buffer: *mut c_void = ptr::without_provenance_mut(0x1000);
+        // SAFETY: the fakes never dereference the handle or the buffer.
+        let registration = unsafe { api.comm_register_handle(comm, buffer, 10_240) }
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(!registration.is_null());
+        // SAFETY: as above; the registration is the fake's and is released once.
+        unsafe { api.comm_deregister_handle(comm, registration) }
+            .unwrap_or_else(|error| panic!("{error}"));
+        // SAFETY: a null registration is the documented no-op and calls nothing.
+        unsafe { api.comm_deregister_handle(comm, ptr::null_mut()) }
+            .unwrap_or_else(|error| panic!("{error}"));
+        for (pointer, bytes) in [(buffer, 0usize), (ptr::null_mut(), 16)] {
+            // SAFETY: the argument check refuses before any entry point is called.
+            match unsafe { api.comm_register_handle(comm, pointer, bytes) } {
+                Err(NcclError::Config(text)) => {
+                    assert!(text.contains("ncclCommRegister"), "{text}")
+                }
+                other => panic!("an empty or null buffer must be a Config refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_or_null_registration_is_an_error_never_a_handle() {
+        let comm: NcclCommHandle = ptr::without_provenance_mut(0x10);
+        let buffer: *mut c_void = ptr::without_provenance_mut(0x1000);
+        let refused = api_with_register(register_refused);
+        // SAFETY: the fake never dereferences the handle or the buffer.
+        match unsafe { refused.comm_register_handle(comm, buffer, 10_240) } {
+            Err(NcclError::Call { call, result, .. }) => {
+                assert_eq!(call, "ncclCommRegister");
+                assert_eq!(result, 3);
+            }
+            other => panic!("a refused registration must be a Call error, got {other:?}"),
+        }
+        let null = api_with_register(register_null);
+        // SAFETY: as above.
+        match unsafe { null.comm_register_handle(comm, buffer, 10_240) } {
+            Err(NcclError::Config(text)) => assert!(text.contains("null registration"), "{text}"),
+            other => panic!("a null registration must not be returned as a handle, got {other:?}"),
+        }
     }
 }

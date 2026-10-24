@@ -1,5 +1,5 @@
 {
-  "arm": "device layer (opt-in): no per-layer PCIe copy, no per-stage observation read",
+  "arm": "device layer (the default since S2): no per-layer PCIe copy, no per-stage observation read",
   "frontier": "device-only through engram_write -> mhc_entry -> quantise_prologue -> attention_projections -> query_path (5 stage(s)); stopped at kv_path: synthetic refusal text",
   "layer": 0,
   "max_positions": 4096,

@@ -13,6 +13,12 @@
 //!   cost of enqueuing N reduces back to back with one synchronise at the end - the shape a layer
 //!   port uses when it does not read the result back.
 //!
+//! The device arm registers its send and receive buffers with the communicator (`ncclCommRegister`)
+//! before the warm-up and releases them after the correctness readback, the run's S2-a shape: the
+//! run registers its four collective spans once at open. The JSON states the registration and the
+//! NCCL transport environment the process ran with (sparkflash_comm::nccl::TRANSPORT_ENV), so the
+//! gate verdict reads both from the measurement itself rather than from the launch script.
+//!
 //! The binary never reads the result back to the host in the timed section. The one readback is
 //! the correctness check: both arms are compared against the canonical rank-order f32 reduce with
 //! one bf16 round (sparkflash_comm::reduce), so a tolerance arm can quote its exact deviation.
@@ -29,14 +35,17 @@
 //! per-call total as the gated number, and writes a per-rank histogram:
 //!   gpu-reduce-bench --rank 0 --world 4 --control 192.0.2.80:19755 --device-only \
 //!       --bytes 10240 --samples 10000 --warmup 200 --mode sync \
-//!       --p50-max-us 30 --p99-max-us 60 --histogram /path/histogram-rank0.json --json
+//!       --p50-max-us 75 --p90-max-us 104 --p99-max-us 251 \
+//!       --histogram /path/histogram-rank0.json --json
 //!
 //! Exit codes: 0 measured (and the gate passed when thresholds were given), 2 usage (clap), 3 any
 //! setup or measurement error (transport, library, exchange, or a payload that mismatched the
 //! canonical reference badly - more than 2 ULP or non-finite), 6 the device-arm latency gate failed
-//! (p50 or p99 over its ceiling; the measurement is real and is printed before this exit). The clock
-//! lock and its validity rule live in scripts/gpu-reduce-bench.sh: this binary cannot lock clocks
-//! and must not be quoted as a clock-locked number on its own.
+//! (p50, p90 or p99 over its ceiling; the measurement is real and is printed before this exit). All
+//! three ceilings are required together, because `docs/DECISIONS.md` D57 makes p90 a bar: the p99 on
+//! this fabric is bimodal, so a p99-only tail bar is either flaky or useless. The clock protocol and
+//! its validity rule live in scripts/gpu-reduce-bench.sh: this binary cannot lock clocks and must not
+//! be quoted as a clock-row number on its own.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -47,7 +56,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use sparkflash_comm::device_reduce::{self, RunReduce};
 use sparkflash_comm::layout::{CollectiveLayout, FabricSchedule};
-use sparkflash_comm::nccl::{NcclApi, NcclUniqueId};
+use sparkflash_comm::nccl::{NcclApi, NcclUniqueId, TRANSPORT_ENV};
 use sparkflash_comm::reduce::canonical_reduce_element;
 use sparkflash_comm::tcp::{TcpConfig, TcpTransport};
 use sparkflash_comm::transport::Transport;
@@ -314,9 +323,12 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     histogram: Option<PathBuf>,
     /// The gate's p50 ceiling in microseconds for the device arm's per-call total. Requires
-    /// --p99-max-us; a violation is exit code 6.
+    /// --p90-max-us and --p99-max-us; a violation is exit code 6.
     #[arg(long = "p50-max-us", value_name = "US")]
     p50_max_us: Option<f64>,
+    /// The gate's p90 ceiling in microseconds for the device arm's per-call total.
+    #[arg(long = "p90-max-us", value_name = "US")]
+    p90_max_us: Option<f64>,
     /// The gate's p99 ceiling in microseconds for the device arm's per-call total.
     #[arg(long = "p99-max-us", value_name = "US")]
     p99_max_us: Option<f64>,
@@ -545,6 +557,12 @@ fn run(args: &Args) -> Result<bool, String> {
     if args.p50_max_us.is_some() != args.p99_max_us.is_some() {
         return Err("the gate needs both --p50-max-us and --p99-max-us (a one-sided gate is not the declared gate)".to_owned());
     }
+    // DECISIONS.md D57 makes p90 a bar in its own right: the p99 on this fabric is bimodal, so a
+    // p99-only tail bar is either flaky or useless. A gate run without a p90 ceiling would be a
+    // weaker gate than the decision records, so it is refused rather than silently downgraded.
+    if args.p50_max_us.is_some() != args.p90_max_us.is_some() {
+        return Err("the gate needs --p90-max-us alongside --p50-max-us and --p99-max-us (D57: p90 is a bar)".to_owned());
+    }
     if !args.device_only && (args.addrs.is_empty() || args.addrs.len() != args.world) {
         return Err("--addrs needs one IP:PORT per rank unless --device-only is used".to_owned());
     }
@@ -668,6 +686,12 @@ fn run(args: &Args) -> Result<bool, String> {
             .collect();
         cuda.upload(send, &source)?;
         cuda.upload(recv, &vec![0u8; *size])?;
+        // The run's S2-a shape: the collective's own buffers are registered before the first
+        // enqueue on them, and released only after the last one completed (below).
+        // SAFETY: send and recv are live device allocations of size bytes on this device; they are
+        // freed only after deregister_buffers below.
+        unsafe { device_reduce::register_buffers(handle, &[(send, *size), (recv, *size)]) }
+            .map_err(|error| format!("register send/recv: {error}"))?;
         let reduce = |count: usize| -> Result<(), String> {
             // SAFETY: send/recv are device allocations of size bytes, the stream is live, and the
             // reduce is enqueued on the same device this process made current.
@@ -716,15 +740,16 @@ fn run(args: &Args) -> Result<bool, String> {
         // gate percentiles read the same array.
         total_us.sort_unstable();
         let p50_us = percentile(&total_us, 50.0);
+        let p90_us = percentile(&total_us, 90.0);
         let p99_us = percentile(&total_us, 99.0);
-        let gate_json = match (args.p50_max_us, args.p99_max_us) {
-            (Some(p50_max), Some(p99_max)) => {
-                let pass = p50_us <= p50_max && p99_us <= p99_max;
+        let gate_json = match (args.p50_max_us, args.p90_max_us, args.p99_max_us) {
+            (Some(p50_max), Some(p90_max), Some(p99_max)) => {
+                let pass = p50_us <= p50_max && p90_us <= p90_max && p99_us <= p99_max;
                 if !pass {
                     gate_failed = true;
                 }
                 format!(
-                    ",\"gate\":{{\"p50_us\":{p50_us:.2},\"p99_us\":{p99_us:.2},\"p50_max_us\":{p50_max:.2},\"p99_max_us\":{p99_max:.2},\"pass\":{pass}}}"
+                    ",\"gate\":{{\"p50_us\":{p50_us:.2},\"p90_us\":{p90_us:.2},\"p99_us\":{p99_us:.2},\"p50_max_us\":{p50_max:.2},\"p90_max_us\":{p90_max:.2},\"p99_max_us\":{p99_max:.2},\"pass\":{pass}}}"
                 )
             }
             _ => String::new(),
@@ -755,11 +780,13 @@ fn run(args: &Args) -> Result<bool, String> {
         let stats = unsafe { device_reduce::stats(handle) }
             .map_err(|error| format!("reduce stats: {error}"))?;
         let stats_json = format!(
-            ",\"stats\":{{\"collectives\":{},\"elements\":{},\"bytes\":{},\"arena_bytes\":{}}}",
+            ",\"stats\":{{\"collectives\":{},\"elements\":{},\"bytes\":{},\"arena_bytes\":{},\"registered_buffers\":{},\"registered_bytes\":{}}}",
             stats.collectives(),
             stats.elements(),
             stats.bytes(),
-            stats.arena_bytes()
+            stats.arena_bytes(),
+            stats.registered_buffers(),
+            stats.registered_bytes()
         );
         arms_json.push(format!(
             "{{\"arm\":\"nccl\",\"bytes\":{size},\"elements\":{elements},\"mode\":\"{}\",\"batch\":{batch},{}, \"enqueue\":{{{}}},\"check\":{{\"differing\":{differing},\"max_ulp\":{max_ulp},\"finite\":{finite}}}{stats_json}{gate_json}}}",
@@ -767,6 +794,11 @@ fn run(args: &Args) -> Result<bool, String> {
             summary(&mut total_us),
             summary(&mut enqueue_us)
         ));
+        // The correctness readback's stream sync above observed the last collective on these
+        // buffers, so the registrations can be released before the buffers are freed.
+        // SAFETY: the handle is live and nothing is in flight on send/recv.
+        unsafe { device_reduce::deregister_buffers(handle) }
+            .map_err(|error| format!("deregister send/recv: {error}"))?;
         cuda.free(send);
         cuda.free(recv);
         cuda.free(scratch);
@@ -775,8 +807,18 @@ fn run(args: &Args) -> Result<bool, String> {
     unsafe { device_reduce::close(handle) };
     cuda.stream_destroy(stream);
     let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_owned());
+    // Each transport variable's value as this process saw it, null when unset: NCCL read the same
+    // environment at init, so this is the configuration the measured collectives ran with.
+    let env_json = TRANSPORT_ENV
+        .iter()
+        .map(|name| match std::env::var(name) {
+            Ok(value) => format!("\"{name}\":\"{}\"", json_escape(&value)),
+            Err(_) => format!("\"{name}\":null"),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     let document = format!(
-        "{{\"host\":\"{}\",\"rank\":{},\"world\":{},\"device_only\":{},\"connect_ms\":{connect_ms:.1},\"nccl\":{{\"library\":\"{}\",\"version\":\"{}\"}},\"arms\":[{}]}}",
+        "{{\"host\":\"{}\",\"rank\":{},\"world\":{},\"device_only\":{},\"connect_ms\":{connect_ms:.1},\"nccl\":{{\"library\":\"{}\",\"version\":\"{}\",\"env\":{{{env_json}}}}},\"arms\":[{}]}}",
         json_escape(&host),
         args.rank,
         args.world,
@@ -792,9 +834,10 @@ fn run(args: &Args) -> Result<bool, String> {
     }
     if gate_failed {
         eprintln!(
-            "gpu-reduce-bench: rank {}: GATE FAILED: the device arm's p50/p99 crossed the declared ceiling (p50 <= {} us, p99 <= {} us); the measured numbers above are real and the verdict is FAIL",
+            "gpu-reduce-bench: rank {}: GATE FAILED: the device arm's p50/p90/p99 crossed a declared ceiling (p50 <= {} us, p90 <= {} us, p99 <= {} us); the measured numbers above are real and the verdict is FAIL",
             args.rank,
             args.p50_max_us.unwrap_or(0.0),
+            args.p90_max_us.unwrap_or(0.0),
             args.p99_max_us.unwrap_or(0.0)
         );
     }
