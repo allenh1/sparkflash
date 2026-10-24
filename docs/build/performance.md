@@ -8,17 +8,41 @@ and the cost model; the authoritative row history is [`speed-log.csv`](speed-log
 
 | | |
 | :-- | :-- |
-| Published | **179.81 ms/step** (2026-10-22, `cd233423`, four-rank mean, identity PASS) |
-| Replicate | 180.00 ms/step (`wsd28-host3a`) |
-| Implied rate | 5.56 tok/s at one token/step |
+| Published | **146.03 ms/step** (2026-10-23, `a42b1aa1`, `s2-d`, four-rank mean, D56 numerical gate PASS) |
+| Replicate | 145.28 ms/step (`s2-d-rep2`, delta 0.75 ms) |
+| Median / clean-step band | 139.00 / 138.50 ms; steady-state steps 1..8 at 138-141 ms |
+| Implied rate | 6.85 tok/s mean, 7.19 tok/s median (one token/step) |
+| Sustained (1,000-step soak, `s2-e`) | median 151.0 ms, last-100 median 159 ms; the ramp is +13.6% on the **median** (first-100 median 140 -> last-100 median 159). The first-100 *mean* is not usable - it is 273 ms because of the single 13,274 ms stall |
 | 90 tok/s | 11.1 ms/step |
-| Next gate | **<= 150 ms/step** (400 cleared) |
-| Host floor | ~175 ms/step measured; the tree is within ~5 ms of it |
+| Next gate | **<= 50 ms/step** - 150 is cleared on the mean (`146.03`, and `s1-c1-boost` 142.94 before it), but not on the sustained figure |
+| Kernel time bound (what capture cannot remove) | `113-139 ms/step` at boost: floor from the `1500 MHz` probe (`186.397 ms/step`, `s1-result.md` §8.2) scaled by the clock ratio, ceiling from the `139.00 ms` step. `3.2-4.0x` the `35 ms` target - why the step is kernel-bound (D58) |
 
-The number is not comparable across base commits. The 179.81 row is on `cd233423` (Batch 4 + seam
-warm pass + host-weight GEMV seam arm + attention staging slot + mHC host-SIMD projection + one-pass
-activation quantiser + seam tail fixes). Any candidate must be measured in the same window on the
-same base.
+The number is not comparable across base commits. The published row is `s2-d` on `a42b1aa1` (the S2
+device-by-default tree: `SPARK_COMM_REDUCE=nccl`, registered collective buffers, whole layer on
+device). That base is **not** main's current tree: !173 squash-merged the S2 branch as `f361c350`
+after review fixes that landed on that branch past `a42b1aa1`, so main carries code the row was not
+measured on and its effect on ms/step is unmeasured. The S4 probe row re-measures on main, and until
+it does, `146.03` is the row for `a42b1aa1` and main's number is unmeasured rather than assumed. The previous published row, `179.81` on `cd233423`, is the host-arm tree before the S2
+port, and `s1-c1-boost` (`142.94`) is the S1 40-layer device arm at unlocked boost clocks. Any
+candidate must be measured in the same window on the same base.
+
+**Where the time is** (D58): kernel time. *Cannot reach the target before the kernels do.* A step is at least as long as its GPU kernel work.
+Measured at `1500 MHz` (`s1-c-probe`, rank 0 at 1482 MHz) the probe gives `186.397 ms/step` over 40
+layers + head, but that is not a like-for-like comparison with a boost step: the same kernels cannot
+beat the clock ratio (`1.62-1.65x`, most favourably `1.649x`), so at boost their time is at least
+`186.397 / 1.649 = 113 ms` (`3.2x` the `35 ms` target) and at most the `139.00 ms` step (`4.0x`).
+Either bound keeps `35 ms` out of reach until kernel time falls by at least `3.2x`. The `1500 MHz` row
+is not re-measured - no locked run is taken any more, the hardware sits at 2405-2418 MHz - so S4's
+boost-clock probe row supersedes it.
+So capture cannot reach the target before the kernels do
+([`s3-capture-audit.md`](s3-capture-audit.md)).
+
+Two numbers that look like they belong in that argument do **not**, and are labelled here so they are
+not quoted as measurements: the collectives' `~3.87 ms` share is an estimate from the sync-mode bench
+(`s2-result.md` §3.1 item 1), and per-step host-busy time is **unmeasured** - the step counters record
+`d2h_copies` at one call site and assert the allocation/sync counts rather than hooking them
+(`device_counters.rs`; instrumenting the driver's copy and stream calls is a prerequisite for any
+host-free claim).
 
 ## Trajectory
 
@@ -72,7 +96,7 @@ cross-rank exchanges whose host machinery was ~29.5 ms/step. The device port rem
 
 Measured MTP acceptance length is **1.571 accepted/verify step** (host twin, 24/42, 95 % CI
 1.333-1.810; p50 1.000, p90 3.000). At that AL, 90 tok/s needs **17.46 ms/verify step**
-(`1000 * 1.571 / 90`). At 179.81 ms/step, MTP would give ~1.86 tok/s; the remaining work is the
+(`1000 * 1.571 / 90`). At the standing `146.03 ms/step`, MTP would give ~10.8 tok/s (`1000 * 1.571 / 146.03`); the remaining work is the
 layer port, not MTP tuning.
 
 ## Constraints the measurements established

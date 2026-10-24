@@ -246,7 +246,8 @@ on the real nodes is the drift signature, not transport slowness.
 
 Arithmetic from the per-call numbers (ESTIMATE, 40 layers x 2 calls/layer): 77.9 ms/step at
 0.974 ms/call, 23.6 at 0.295 ms, 9.0 at 113 us, 2.9 at 35.7 us. Host machinery in the lean
-loop is 29.5 ms/step; the published lean-loop row stays 179.81 ms/step.
+loop is 29.5 ms/step; the published row is the device arm's `146.03 ms/step` (`s2-d`), with the host
+lean loop's `179.81` kept as the reference-path history.
 
 ## 6. Infra state
 

@@ -18,17 +18,28 @@ them. Code-level contracts (ABI, formats, flags) still win over prose.
   row, and the same base commit. No other speed number is published.
 - It is appended to [`docs/build/speed-log.csv`](build/speed-log.csv) with
   `scripts/speed-log.sh append --run <window run dir>`; `print` renders the table.
-- **Current: 179.81 ms/step** (2026-10-22, integration `cd233423`, four-rank mean, identity PASS;
-  replicate 180.00). 90 tok/s = 11.1 ms/step.
+- **Current: 146.03 ms/step** (2026-10-23, `s2-d` on `a42b1aa1`, four-rank mean, D56 numerical gate
+  PASS; replicate `s2-d-rep2` 145.28, median 139.00 / 138.50, `d2h = 1 / alloc = 0 / sync = 0`).
+  90 tok/s = 11.1 ms/step. The step is **kernel-bound** (D58,
+  [`build/s3-capture-audit.md`](build/s3-capture-audit.md)). *Cannot reach the target before the kernels do.* A step is at least as long as its GPU kernel work. Measured at `1500 MHz` (`s1-c-probe`, rank 0 at 1482 MHz) the probe gives `186.397 ms/step` over 40 layers + head, but that is not a like-for-like comparison with a boost step: the same kernels cannot beat the clock ratio (`1.62-1.65x`, most favourably `1.649x`), so at boost their time is at least `186.397 / 1.649 = 113 ms` (`3.2x` the `35 ms` target) and at most the `139.00 ms` step (`4.0x`). Either bound keeps `35 ms` out of reach until kernel time falls by at least `3.2x`. The `1500 MHz` row is not re-measured - no locked run is taken any more, the hardware sits at 2405-2418 MHz - so S4's boost-clock probe row supersedes it.
+  The collectives' `3.87 ms` share is an **estimate** (sync-mode bench, labelled in `s2-result.md`
+  §3.1) and per-step host-busy time is **unmeasured** - do not quote either as a measurement. The
+  sustained figure over 1,000 steps is `151-159 ms` (`s2-e`, +13.6% on the median), so long-run claims
+  quote that, not the 9-step row.
 - Historical numbers are not comparable across base commits, and a row only counts in the window
-  and on the base it was measured on. Quote history only with its commit.
+  and on the base it was measured on. Quote history only with its commit. Note that the standing
+  number's base (`a42b1aa1`) is **not** main's tree - !173 squash-merged the S2 branch as
+  `f361c350` after further review fixes - so main's current speed is unmeasured until S4's probe row
+  lands; do not present `146.03` as a main measurement.
 - Every merge request states its **expected effect on ms/step before work starts**. A change with no
   expected effect is not speed work.
 
 ## 2. Gates and targets
 
 - Speed gates, in order: **<= 400 ms (cleared) -> <= 150 -> <= 50 -> <= 20 -> <= 11.1 ms/step**.
-  The next gate is 150.
+  150 is cleared on the 9-step mean (`146.03`, and `s1-c1-boost` 142.94 before it) but not on the
+  1,000-step sustained figure (`151-159 ms`); the next gate that decides new work is **50 ms/step**,
+  and the remaining gap to it is kernel time (D58).
 - Product target: **50-60 tok/s** at vLLM parity with DSpark. Personal target: **90 tok/s**
   single-stream.
 - With the measured MTP acceptance length of **1.571 accepted/verify step**, 90 tok/s needs a
@@ -212,10 +223,14 @@ by ~25 ms; three move it by ~200 ms.
 - **Plan of record: the whole-layer device port** on `win/layer-device`. One branch, one goal: a
   decoder layer that runs entirely on the GPU, with no D2H in the steady state, tree reductions on
   device, and the cross-rank all-reduce on the GPU.
-- Intermediate commits on that branch may be slower than 179.81. **No published number until the
-  whole layer runs and the branch is measured as a whole.** 179.81 remains the standing number.
-- Next gates, in order: first device-only prefix runs; one full device-only layer runs; the default
-  flips to the device arm; then graph capture and the GEMV re-tile.
+- Intermediate commits may be slower than the standing number. **No published number until a row is
+  measured as a whole.** The standing number is the one in section 1 (`146.03 ms/step`, `s2-d`), and
+  the whole-layer prefix gate below is cleared: the default has flipped to the device arm.
+- Next gates, in order: the per-stage GPU table and host-time measurement (S4's first task, D58);
+  then the GEMV/MoE re-tile that attacks the 65.1% of kernel time in `moe_routed`,
+  `attention_output` and `moe_router`; `<= 50 ms/step` is the next speed gate that decides work.
+  Graph capture is **not** next: a step cannot be shorter than its kernel time, which is `3.2-4.0x`
+  the `35 ms` S3 target at boost clocks (D58, [`build/s3-capture-audit.md`](build/s3-capture-audit.md)).
 - Parked until then: host-seam micro-optimisation, partial-port measurement, and WS-C/D/E/F/G speed
   work. Serving/API parity work continues on its own track and does not consume speed windows.
 - Each workstream has **one owner and one exit gate**. Unblock, don't work around.

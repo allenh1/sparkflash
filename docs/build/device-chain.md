@@ -13,7 +13,7 @@ runs entirely on device, with no steady-state D2H and the cross-rank all-reduce 
 | Chain wiring | `sparkflash-device/src/chain.rs`, `window.rs`, `cubins.rs` | 40-layer plan, boundary stages, masked comparator. |
 | Device layer | `crates/sparkflash-cli/src/layer_device.rs` | One device slab, 13 spans, the `LayerStages` trait and `run_layer` order. |
 | Kernel ABI | `crates/sparkflash-kernels/` | Pinned cubins, launchers, CPU reference twins, `KERNEL_CONTRACTS`. |
-| Host lean loop | `crates/sparkflash-cli/src/tp4_forward.rs` | Reference path and the source of the current 179.81 ms/step number. |
+| Host lean loop | `crates/sparkflash-cli/src/tp4_forward.rs` | Reference path. Its `179.81 ms/step` row is superseded by the device arm's `146.03 ms/step` (`s2-d`); the host loop is kept as the reference arithmetic, not as the published number. |
 
 Dependency direction: `sparkflash-cli -> sparkflash-device -> {api, kernels, engine, kv, scheduler,
 trace}`. No cycle; the chain is not inside `engine` (a leaf) or `kernels` (would pull the HTTP stack
@@ -171,7 +171,9 @@ is not a speed row and carries no tolerance arm.
   In window `s2w01`, at boost clocks, the S2-d pair (146.03 / 145.28 ms, numerical gate PASS) and
   the S2-e soak (PASS) ran. The **1500 MHz-locked** S2-d pair is still owed; see
   [`s2-result.md`](s2-result.md).
-- Then: CUDA graph capture (S3, starting from [`s2-extent-args.md`](s2-extent-args.md)) and the
+- Then: the per-stage GPU table / host-time measurement (S4's first task, D58), the kernel re-tile, and
+  only after that CUDA graph capture (S3, starting from [`s2-extent-args.md`](s2-extent-args.md)), which
+  cannot beat kernel time ([`s3-capture-audit.md`](s3-capture-audit.md)) and the
   GEMV / MoE re-tile (S4).
 
 ## Archived sources
