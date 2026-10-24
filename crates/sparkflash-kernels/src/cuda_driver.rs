@@ -51,6 +51,48 @@ type LaunchFn = unsafe extern "C" fn(
     *mut c_void,
 ) -> CuResult;
 
+/// cuLaunchKernelEx, for the programmatic-dependent launch of the opt kernels.
+type LaunchExFn = unsafe extern "C" fn(
+    *const CuLaunchConfig,
+    CuFunction,
+    *mut *mut c_void,
+    *mut *mut c_void,
+) -> CuResult;
+
+/// CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION.
+const CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION: u32 = 6;
+
+/// CUlaunchAttribute: the id, padding to 8, and the 64-byte value union.
+#[repr(C)]
+struct CuLaunchAttribute {
+    id: u32,
+    pad: [u8; 4],
+    value: [u64; 8],
+}
+
+/// CUlaunchConfig.
+#[repr(C)]
+struct CuLaunchConfig {
+    grid_x: u32,
+    grid_y: u32,
+    grid_z: u32,
+    block_x: u32,
+    block_y: u32,
+    block_z: u32,
+    shared_bytes: u32,
+    stream: *mut c_void,
+    attrs: *mut CuLaunchAttribute,
+    num_attrs: u32,
+}
+
+/// Whether opt_* kernels launch with programmatic stream serialization (every opt kernel opens
+/// with griddepcontrol.launch_dependents + griddepcontrol.wait, so stream order holds). On unless
+/// SPARKFLASH_PDL=0.
+fn pdl_enabled() -> bool {
+    static PDL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PDL.get_or_init(|| std::env::var("SPARKFLASH_PDL").as_deref() != Ok("0"))
+}
+
 /// The driver's CUresult names, so a report says OUT_OF_MEMORY rather than 2.
 fn name(code: CuResult) -> String {
     let s = match code {
@@ -85,6 +127,7 @@ type CuGraphExec = *mut c_void;
 /// `CU_STREAM_NON_BLOCKING`: capture runs on a stream this handle creates, never on the legacy
 /// default stream (which cannot be captured).
 const CU_STREAM_NON_BLOCKING: u32 = 0x1;
+const CU_EVENT_DISABLE_TIMING: u32 = 0x2;
 
 /// `CU_STREAM_CAPTURE_MODE_GLOBAL`: record every launch issued on the capture stream.
 const CU_STREAM_CAPTURE_MODE_GLOBAL: u32 = 0;
@@ -144,6 +187,22 @@ pub struct Kernel {
     function: CuFunction,
     /// The canonical cubin pin name, so a timing bracket can key its sample by kernel.
     name: &'static str,
+}
+
+impl Kernel {
+    /// The raw function word and pin name, for a crate-internal dispatch table that must be
+    /// `Sync` (a raw CUfunction is not).
+    pub(crate) fn to_raw(self) -> (u64, &'static str) {
+        (self.function as u64, self.name)
+    }
+
+    /// Rebuilds a handle from [`Kernel::to_raw`]'s word.
+    pub(crate) fn from_raw(function: u64, name: &'static str) -> Self {
+        Self {
+            function: function as CuFunction,
+            name,
+        }
+    }
 }
 
 /// Summary of a parallel direct-I/O file read.
@@ -1692,6 +1751,13 @@ fn graph_segment_refusal(mode: u8, op: SegmentOp) -> Option<&'static str> {
     }
 }
 
+/// A non-blocking stream beside the run's stream for hint work ([Cuda::side_launch]); it lives for
+/// the run (the context's teardown releases it).
+pub struct SideStream {
+    stream: CuStream,
+    event: CuEvent,
+}
+
 /// The CUDA context and the dlopen'd driver functions this process uses.
 ///
 /// The context is the retained primary context, made current for the thread that created it, and
@@ -2837,6 +2903,48 @@ impl Cuda {
         Ok(())
     }
 
+    /// Queues a copy of `bytes` bytes at `offset` in a pinned host slab to a device allocation on
+    /// the default stream and returns without draining. The slab must hold those bytes unchanged
+    /// until an observation point ([Cuda::copy_dtoh] or [Cuda::synchronize]) after this call.
+    ///
+    /// # Errors
+    /// A range outside the slab, or the driver's cuMemcpyHtoDAsync failure code.
+    pub fn copy_htod_async(
+        &self,
+        dst: &Deviceptr,
+        src: &HostMapped,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(), String> {
+        if let Some(refusal) = self.graph_refusal(SegmentOp::Copy) {
+            return Err(refusal.to_string());
+        }
+        if offset.checked_add(bytes).is_none_or(|end| end > src.len) {
+            return Err(format!(
+                "copy_htod_async: {offset}+{bytes} is outside the {}-byte slab",
+                src.len
+            ));
+        }
+        let copy: libloading::Symbol<
+            unsafe extern "C" fn(CuDeviceptr, *const c_void, usize, *mut c_void) -> CuResult,
+        > = self.sym(b"cuMemcpyHtoDAsync_v2")?;
+        // SAFETY: the source range is inside the page-locked slab (checked), the destination is a
+        // device address this process owns, and the null stream is the default stream.
+        let r = unsafe {
+            copy(
+                dst.0,
+                src.host.cast::<u8>().add(offset).cast(),
+                bytes,
+                std::ptr::null_mut(),
+            )
+        };
+        if r != 0 {
+            return Err(format!("cuMemcpyHtoDAsync failed: {r}"));
+        }
+        self.issued.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Loads one non-flash_mla kernel from a cubin image.
     ///
     /// The cubin symbol is chosen by the KernelId, not by the caller, so the returned handle can
@@ -2850,6 +2958,12 @@ impl Cuda {
                 name: id.cubin_names()[0],
             },
         ))
+    }
+
+    /// Loads any symbol by name from a cubin image, with no pin: the opt kernels' loader.
+    pub fn load_named(&self, cubin: &[u8], name: &'static str) -> Result<(Module, Kernel), String> {
+        let (module, function) = self.load_function(cubin, name)?;
+        Ok((Module(module), Kernel { function, name }))
     }
 
     /// Loads the router's stage-two top-6 merge kernel from the router cubin.
@@ -3491,10 +3605,45 @@ impl Cuda {
         if mode != GRAPH_DIRECT {
             return self.graph_segment_launch(mode, kernel, grid, block, args);
         }
-        let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
         let mut storage: Vec<[u64; 1]> = args.iter().map(|a| [*a]).collect();
         let mut ptrs: Vec<*mut c_void> =
             storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
+        if kernel.name.starts_with("opt_") && pdl_enabled() {
+            let launch_ex: libloading::Symbol<LaunchExFn> = self.sym(b"cuLaunchKernelEx")?;
+            let mut attribute = CuLaunchAttribute {
+                id: CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION,
+                pad: [0; 4],
+                value: [0; 8],
+            };
+            attribute.value[0] = 1;
+            let config = CuLaunchConfig {
+                grid_x: grid.0,
+                grid_y: grid.1,
+                grid_z: grid.2,
+                block_x: block.0,
+                block_y: block.1,
+                block_z: block.2,
+                shared_bytes: 0,
+                stream: std::ptr::null_mut(),
+                attrs: &mut attribute,
+                num_attrs: 1,
+            };
+            // SAFETY: as below; the config and its one attribute outlive the call.
+            let r = unsafe {
+                launch_ex(
+                    &config,
+                    kernel.function,
+                    ptrs.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if r != 0 {
+                return Err(format!("cuLaunchKernelEx failed: {r}"));
+            }
+            self.issued.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
         // SAFETY: the symbol comes from this context's library, every argument is a u64 or a
         // pointer to one that outlives the call, and the kernel handle is crate-owned.
         let r = unsafe {
@@ -3516,6 +3665,88 @@ impl Cuda {
             return Err(format!("cuLaunchKernel failed: {r}"));
         }
         self.issued.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Creates a [SideStream]: a non-blocking stream and the event that orders it after the run's
+    /// stream.
+    ///
+    /// # Errors
+    /// The driver's cuStreamCreate or cuEventCreate failure code.
+    pub fn side_stream(&self) -> Result<SideStream, String> {
+        let create: libloading::Symbol<unsafe extern "C" fn(*mut CuStream, u32) -> CuResult> =
+            self.sym(b"cuStreamCreate")?;
+        let event_create: libloading::Symbol<unsafe extern "C" fn(*mut CuEvent, u32) -> CuResult> =
+            self.sym(b"cuEventCreate")?;
+        let mut stream: CuStream = std::ptr::null_mut();
+        let mut event: CuEvent = std::ptr::null_mut();
+        // SAFETY: the symbols belong to this context's library and the out-pointers are valid for
+        // the calls; the flags are the documented non-blocking and disable-timing flags.
+        let r = unsafe { create(&mut stream, CU_STREAM_NON_BLOCKING) };
+        if r != 0 {
+            return Err(format!("cuStreamCreate for the side stream failed: {r}"));
+        }
+        let r = unsafe { event_create(&mut event, CU_EVENT_DISABLE_TIMING) };
+        if r != 0 {
+            return Err(format!("cuEventCreate for the side stream failed: {r}"));
+        }
+        Ok(SideStream { stream, event })
+    }
+
+    /// Launches `kernel` on `side` after everything already queued on the run's stream, without
+    /// the run's stream waiting for it, so the kernel must only read what no later launch writes.
+    /// Outside direct launches (a graph capture or record) it launches nothing: side work is a
+    /// hint.
+    ///
+    /// # Errors
+    /// The driver's cuEventRecord, cuStreamWaitEvent or cuLaunchKernel failure code.
+    pub fn side_launch(
+        &self,
+        side: &SideStream,
+        kernel: Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        args: &[u64],
+    ) -> Result<(), String> {
+        if self.graph_mode.load(Ordering::Relaxed) != GRAPH_DIRECT {
+            return Ok(());
+        }
+        let record: libloading::Symbol<unsafe extern "C" fn(CuEvent, CuStream) -> CuResult> =
+            self.sym(b"cuEventRecord")?;
+        let wait: libloading::Symbol<unsafe extern "C" fn(CuStream, CuEvent, u32) -> CuResult> =
+            self.sym(b"cuStreamWaitEvent")?;
+        let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
+        let mut storage: Vec<[u64; 1]> = args.iter().map(|a| [*a]).collect();
+        let mut ptrs: Vec<*mut c_void> =
+            storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
+        // SAFETY: the symbols come from this context's library, the event and stream belong to
+        // `side`, and every kernel argument is a u64 or a pointer to one that outlives the call.
+        unsafe {
+            let r = record(side.event, std::ptr::null_mut());
+            if r != 0 {
+                return Err(format!("cuEventRecord for the side stream failed: {r}"));
+            }
+            let r = wait(side.stream, side.event, 0);
+            if r != 0 {
+                return Err(format!("cuStreamWaitEvent for the side stream failed: {r}"));
+            }
+            let r = launch(
+                kernel.function,
+                grid.0,
+                grid.1,
+                grid.2,
+                block.0,
+                block.1,
+                block.2,
+                0,
+                side.stream,
+                ptrs.as_mut_ptr(),
+                std::ptr::null_mut(),
+            );
+            if r != 0 {
+                return Err(format!("cuLaunchKernel on the side stream failed: {r}"));
+            }
+        }
         Ok(())
     }
 

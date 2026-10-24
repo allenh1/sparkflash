@@ -696,6 +696,113 @@ impl RunReduce {
         Ok(())
     }
 
+    /// `rows` AllReduce(Sum)s of `count` bf16 values each (row r at `input + r * count * 2`), in one
+    /// NCCL group: every row stays its own collective, so each element is summed exactly as the
+    /// single-row call sums it, while the group launches once.
+    ///
+    /// # Safety
+    /// Same contract as reduce_bf16, over `rows * count` values.
+    ///
+    /// # Errors
+    /// As reduce_bf16.
+    pub unsafe fn reduce_bf16_rows(
+        &mut self,
+        stream: u64,
+        input: u64,
+        output: u64,
+        count: usize,
+        rows: usize,
+    ) -> Result<(), NcclError> {
+        let bytes = payload_bytes(count)?;
+        self.api.group_start()?;
+        for row in 0..rows {
+            let at = (row * count * 2) as u64;
+            // SAFETY: the caller upholds the device-address and stream contract documented above.
+            let enqueued = unsafe {
+                self.api.enqueue_all_reduce_bf16(
+                    self.comm,
+                    (input + at) as *const c_void,
+                    (output + at) as *mut c_void,
+                    count,
+                    NcclRedOp::Sum,
+                    stream as CudaStream,
+                )
+            };
+            if let Err(error) = enqueued {
+                let _ = self.api.group_end();
+                return Err(error);
+            }
+            self.stats.record(bytes);
+        }
+        self.api.group_end()
+    }
+
+    /// The one-shot exchange: this rank's `count` bf16 values go to every peer and every peer's row
+    /// lands at `gather + peer * count * 2` (this rank's own slot is left untouched), all in one
+    /// NCCL group, so the step costs one network hop instead of the ring's 2 * (world - 1). The
+    /// caller sums the rows in rank order, which gives every rank the same bits.
+    ///
+    /// # Safety
+    /// Same contract as reduce_bf16; `gather` holds `world * count` bf16 values.
+    ///
+    /// # Errors
+    /// NcclError::Call when the library lacks the point-to-point calls or refuses an enqueue.
+    pub unsafe fn exchange_bf16(
+        &mut self,
+        send: u64,
+        gather: u64,
+        count: usize,
+        stream: u64,
+    ) -> Result<(), NcclError> {
+        let bytes = payload_bytes(count)?;
+        self.api.group_start()?;
+        for peer in 0..self.world {
+            if peer == self.rank {
+                continue;
+            }
+            let slot = gather + (peer * count * 2) as u64;
+            // SAFETY: the caller upholds the pointer, device and stream contract documented above.
+            let enqueued = unsafe {
+                self.api
+                    .enqueue_send_bf16(
+                        self.comm,
+                        send as *const c_void,
+                        count,
+                        peer as i32,
+                        stream as CudaStream,
+                    )
+                    .and_then(|()| {
+                        self.api.enqueue_recv_bf16(
+                            self.comm,
+                            slot as *mut c_void,
+                            count,
+                            peer as i32,
+                            stream as CudaStream,
+                        )
+                    })
+            };
+            if let Err(error) = enqueued {
+                let _ = self.api.group_end();
+                return Err(error);
+            }
+        }
+        self.api.group_end()?;
+        self.stats.record(bytes);
+        Ok(())
+    }
+
+    /// Whether the one-shot exchange is available (the library exports ncclSend and ncclRecv).
+    #[must_use]
+    pub fn has_exchange(&self) -> bool {
+        self.api.has_point_to_point()
+    }
+
+    /// This handle's (world, rank).
+    #[must_use]
+    pub fn world_rank(&self) -> (usize, usize) {
+        (self.world, self.rank)
+    }
+
     /// Enqueues the setup warm-up: WARM_UP_COLLECTIVES in-place reduces over scratch.
     ///
     /// Use the layer's real payload count so the same path is warmed. The call returns after

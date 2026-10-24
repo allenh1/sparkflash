@@ -104,5 +104,27 @@ pub fn launch(
             params.hc
         ));
     }
+    let word = OPT_FUNCTION.load(std::sync::atomic::Ordering::Acquire);
+    if word != 0 && params.dim.is_multiple_of(2) {
+        return cuda.launch(
+            Kernel::from_raw(word, OPT_SYMBOL),
+            (params.hc, 1, 1),
+            BLOCK,
+            &params.words(),
+        );
+    }
     cuda.launch(kernel, grid(), BLOCK, &params.words())
+}
+
+static OPT_FUNCTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const OPT_SYMBOL: &str = "opt_engram_gate_write";
+
+/// Loads the block-per-copy gate write (opt_misc_sm121.cubin) and routes [`launch`] through it.
+///
+/// # Errors
+/// The driver's error when the cubin lacks the symbol.
+pub fn install_opt(cuda: &Cuda, cubin: &[u8]) -> Result<Module, String> {
+    let (module, kernel) = cuda.load_named(cubin, OPT_SYMBOL)?;
+    OPT_FUNCTION.store(kernel.to_raw().0, std::sync::atomic::Ordering::Release);
+    Ok(module)
 }

@@ -95,6 +95,9 @@ pub struct TensorView<'a> {
     pub data: &'a [u8],
 }
 
+/// An open weight file and the byte region `(start, len)` of one tensor in it.
+pub type FileRegion = (std::sync::Arc<std::fs::File>, u64, u64);
+
 /// A source of weights.
 ///
 /// `Send + Sync` is part of the contract because the reference pass reads experts concurrently:
@@ -154,6 +157,14 @@ pub trait WeightSource: Send + Sync {
         ranges: &[(u64, usize)],
     ) -> Option<Result<Vec<u8>, WeightError>> {
         self.read_ranges(name, ranges)
+    }
+
+    /// The open file and the byte region `(start, len)` that hold a tensor's stored bytes, for a
+    /// caller that issues its own concurrent reads (the runtime Engram gather, whose 256-byte
+    /// lookups are latency-bound one at a time). `None` when the source does not serve from a file.
+    fn file_region(&self, name: &str) -> Option<Result<FileRegion, WeightError>> {
+        let _ = name;
+        None
     }
 
     /// Whether the source holds a tensor with that name.

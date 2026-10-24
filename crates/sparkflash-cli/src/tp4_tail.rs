@@ -192,7 +192,7 @@ pub fn cubin_path(dir: &Path, symbol: &str) -> PathBuf {
 mod device {
     use super::{
         CHUNKS_PER_RANK, HIDDEN, LOGITS_BYTES_PER_RANK, TAIL_CUBINS, VOCAB_PER_RANK,
-        W_BLOCK_MAX_BYTES, cubin_path,
+        W_BLOCK_MAX_BYTES, cubin_path, join_f32_words, split_f32_words,
     };
     use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel, Module};
     use sparkflash_kernels::{cert_lm_head_launch, lm_head_ref, rmsnorm_launch};
@@ -415,6 +415,93 @@ mod device {
                 ]));
             }
             Ok(values)
+        }
+
+        /// The generation head: the same norm and head launches as [TailStage::screen_device], then
+        /// only the per-chunk maxima come back (two small copies instead of the shard's logits),
+        /// and one four-word gather gives every rank the global winner. The reduction keeps the
+        /// reference tie rule: chunks and ranks are visited in vocabulary order and a later entry
+        /// wins only when strictly greater. Returns (token, logit).
+        pub fn screen_device_argmax(
+            &self,
+            cuda: &Cuda,
+            transport: &dyn sparkflash_comm::transport::Transport,
+            layer_id: u32,
+            step_seq: u64,
+            seq: u64,
+        ) -> Result<(u32, f32), String> {
+            let norm = rmsnorm_launch::RmsNormLaunchParams {
+                x: self.buffers.hidden,
+                weight: self.norm_weight,
+                out: self.buffers.normed,
+                rows: 1,
+                cols: HIDDEN as u32,
+                eps: self.eps,
+                trace_ring: 0,
+                layer_id,
+                step_seq,
+            };
+            rmsnorm_launch::launch(cuda, self.rmsnorm, &norm)?;
+            let head = cert_lm_head_launch::CertLmHeadParams::new(
+                self.buffers.normed,
+                self.head_weight,
+                self.buffers.w_block_max,
+                self.buffers.logits,
+                self.buffers.certified,
+                self.buffers.certified_count,
+                self.buffers.block_max,
+                self.buffers.block_argmax,
+                VOCAB_PER_RANK as u32,
+                0,
+                layer_id,
+                step_seq,
+            );
+            cert_lm_head_launch::launch(cuda, self.head, &head)?;
+            let chunks = CHUNKS_PER_RANK;
+            let mut max_bytes = vec![0u8; chunks * 4];
+            let mut arg_bytes = vec![0u8; chunks * 4];
+            cuda.copy_dtoh(&mut max_bytes, &self.buffers.block_max)
+                .map_err(|error| format!("tail block max dtoh: {error}"))?;
+            cuda.copy_dtoh(&mut arg_bytes, &self.buffers.block_argmax)
+                .map_err(|error| format!("tail block argmax dtoh: {error}"))?;
+            let mut best = (f32::NEG_INFINITY, 0u32, false);
+            for chunk in 0..chunks {
+                let at = chunk * 4;
+                let value = f32::from_le_bytes([
+                    max_bytes[at],
+                    max_bytes[at + 1],
+                    max_bytes[at + 2],
+                    max_bytes[at + 3],
+                ]);
+                let index = u32::from_le_bytes([
+                    arg_bytes[at],
+                    arg_bytes[at + 1],
+                    arg_bytes[at + 2],
+                    arg_bytes[at + 3],
+                ]);
+                if !best.2 || value > best.0 {
+                    best = (value, index, true);
+                }
+            }
+            let mut words = split_f32_words(&[best.0]);
+            words.push((best.1 >> 16) as u16);
+            words.push(best.1 as u16);
+            let world = transport.world_size();
+            let mut gathered = vec![0u16; world * 4];
+            transport
+                .all_gather_bf16(&words, &mut gathered, seq)
+                .map_err(|error| format!("argmax all-gather: {error}"))?;
+            let mut winner = (f32::NEG_INFINITY, 0u32, false);
+            for rank in 0..world {
+                let w = &gathered[rank * 4..rank * 4 + 4];
+                let value = join_f32_words(&w[..2])?[0];
+                let index =
+                    ((u32::from(w[2]) << 16) | u32::from(w[3])) + (rank * VOCAB_PER_RANK) as u32;
+                if !winner.2 || value > winner.0 {
+                    winner = (value, index, true);
+                }
+            }
+            Ok((winner.1, winner.0))
         }
 
         /// Screens the rank's vocabulary directly from `self.buffers.hidden` (already populated on

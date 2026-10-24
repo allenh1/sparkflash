@@ -140,6 +140,39 @@ impl Layout {
     }
 }
 
+/// Every configuration field [Layout::for_config] reads.
+type LayoutKey = (Vec<usize>, usize, Vec<usize>, usize, usize, usize);
+
+/// The last layout built: drawing its primes costs a quarter of a millisecond, and decode hashes a
+/// few rows every step.
+static LAYOUT: std::sync::Mutex<Option<(LayoutKey, std::sync::Arc<Layout>)>> =
+    std::sync::Mutex::new(None);
+
+impl Layout {
+    /// [Layout::for_config], reused while the configuration's layout fields are unchanged.
+    fn cached(cfg: &ModelConfig) -> Result<std::sync::Arc<Layout>, EngineError> {
+        let key = (
+            cfg.engram_layer_ids.clone(),
+            cfg.engram_vocab_size,
+            cfg.engram_num_embeddings.clone(),
+            cfg.engram_max_ngram_size,
+            cfg.engram_n_heads,
+            cfg.engram_compressed_vocab_size,
+        );
+        let mut last = LAYOUT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((built, layout)) = last.as_ref()
+            && *built == key
+        {
+            return Ok(layout.clone());
+        }
+        let layout = std::sync::Arc::new(Self::for_config(cfg)?);
+        *last = Some((key, layout.clone()));
+        Ok(layout)
+    }
+}
+
 /// The smallest prime above start that has not been handed out yet (engram.py:9-14).
 fn find_next_prime(start: u64, seen: &BTreeSet<u64>) -> u64 {
     let mut candidate = start.saturating_add(1);
@@ -422,7 +455,7 @@ pub fn ngram_hashes(
     if layers == 0 || columns == 0 || orders == 0 {
         return Ok(());
     }
-    let layout = Layout::for_config(cfg)?;
+    let layout = Layout::cached(cfg)?;
     let seqlen = tokens.len() - start_pos;
     out.reserve(seqlen * layers * columns);
     // One scratch row of look-back tokens, allocated once for the whole chunk.

@@ -1133,16 +1133,39 @@ impl ArenaAllocator for CudaArenaAllocator<'_> {
                 use_odirect,
             );
         }
-        let mut buf = vec![0u8; len];
-        let report = read_file_parallel_into_slice(
-            path,
-            file_offset,
-            &mut buf,
-            chunk_bytes,
+        // Device memory: stream the file through one 1 GiB page-aligned window (read, then copy), so
+        // the host never holds a second copy of the whole rank.
+        const WINDOW: usize = 1 << 30;
+        const ALIGN: usize = 4096;
+        let mut storage = vec![0u8; WINDOW.min(len) + ALIGN];
+        let shift = storage.as_ptr().align_offset(ALIGN);
+        let mut done = 0usize;
+        let mut report = DirectReadReport {
+            bytes_read: 0,
+            chunks: 0,
             concurrency,
-            use_odirect,
-        )?;
-        self.upload(destination, &buf)?;
+            chunk_bytes,
+            direct_io: use_odirect,
+        };
+        while done < len {
+            let n = (len - done).min(WINDOW);
+            let buf = &mut storage[shift..shift + n];
+            let part = read_file_parallel_into_slice(
+                path,
+                file_offset + done as u64,
+                buf,
+                chunk_bytes,
+                concurrency,
+                use_odirect,
+            )?;
+            self.upload(&destination.offset(done), buf)?;
+            report.chunks += part.chunks;
+            report.concurrency = part.concurrency;
+            report.chunk_bytes = part.chunk_bytes;
+            report.direct_io &= part.direct_io;
+            done += n;
+        }
+        report.bytes_read = len;
         Ok(report)
     }
 

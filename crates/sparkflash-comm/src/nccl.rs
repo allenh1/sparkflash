@@ -554,6 +554,12 @@ type AllGatherFn = unsafe extern "C" fn(
     CudaStream,
 ) -> c_int;
 type GroupFn = unsafe extern "C" fn() -> c_int;
+/// `ncclSend(const void *, size_t, ncclDataType_t, int peer, ncclComm_t, cudaStream_t)`.
+type SendFn =
+    unsafe extern "C" fn(*const c_void, usize, c_int, c_int, NcclCommHandle, CudaStream) -> c_int;
+/// `ncclRecv(void *, size_t, ncclDataType_t, int peer, ncclComm_t, cudaStream_t)`.
+type RecvFn =
+    unsafe extern "C" fn(*mut c_void, usize, c_int, c_int, NcclCommHandle, CudaStream) -> c_int;
 type CommDestroyFn = unsafe extern "C" fn(NcclCommHandle) -> c_int;
 type GetErrorStringFn = unsafe extern "C" fn(c_int) -> *const c_char;
 /// `ncclCommGetAsyncError(ncclComm_t, ncclResult_t *asyncError) -> ncclResult_t`: the return value
@@ -579,6 +585,9 @@ struct RawApi {
     comm_deregister: *mut c_void,
     /// Optional: None when the loaded library predates `ncclCommGetAsyncError`.
     comm_get_async_error: Option<*mut c_void>,
+    /// Optional point-to-point entry points (the one-shot exchange).
+    send: Option<*mut c_void>,
+    recv: Option<*mut c_void>,
 }
 
 /// A loaded NCCL library plus its resolved entry points.
@@ -644,6 +653,8 @@ impl NcclApi {
             // Optional: an image without it loads and runs; the boundary reports the check as
             // unavailable rather than refusing a library that is otherwise complete.
             comm_get_async_error: loader.symbol(ASYNC_ERROR_SYMBOL),
+            send: loader.symbol("ncclSend"),
+            recv: loader.symbol("ncclRecv"),
         };
         Ok(Self {
             loader,
@@ -988,6 +999,82 @@ impl NcclApi {
         }
     }
 
+    /// Enqueues a bf16 send of `count` values to `peer` on a raw communicator handle.
+    ///
+    /// # Safety
+    /// The handle must be live and `send` a device buffer of at least `count` bf16 values that stays
+    /// live until the stream reaches the operation.
+    ///
+    /// # Errors
+    /// NcclError::Call when the library lacks ncclSend or refuses the enqueue.
+    pub(crate) unsafe fn enqueue_send_bf16(
+        &self,
+        handle: NcclCommHandle,
+        send: *const c_void,
+        count: usize,
+        peer: c_int,
+        stream: CudaStream,
+    ) -> Result<(), NcclError> {
+        let Some(symbol) = self.raw.send else {
+            return Err(self.call_error("ncclSend", -1));
+        };
+        // SAFETY: the symbol resolved as ncclSend; the caller upholds the buffer contract.
+        let result = unsafe {
+            let function: SendFn = std::mem::transmute(symbol);
+            function(
+                send,
+                count,
+                NcclDataType::Bfloat16 as c_int,
+                peer,
+                handle,
+                stream,
+            )
+        };
+        if result == NCCL_SUCCESS {
+            Ok(())
+        } else {
+            Err(self.call_error("ncclSend", result))
+        }
+    }
+
+    /// Enqueues a bf16 receive of `count` values from `peer` on a raw communicator handle.
+    ///
+    /// # Safety
+    /// The handle must be live and `recv` a writable device buffer of at least `count` bf16 values
+    /// that stays live until the stream reaches the operation.
+    ///
+    /// # Errors
+    /// NcclError::Call when the library lacks ncclRecv or refuses the enqueue.
+    pub(crate) unsafe fn enqueue_recv_bf16(
+        &self,
+        handle: NcclCommHandle,
+        recv: *mut c_void,
+        count: usize,
+        peer: c_int,
+        stream: CudaStream,
+    ) -> Result<(), NcclError> {
+        let Some(symbol) = self.raw.recv else {
+            return Err(self.call_error("ncclRecv", -1));
+        };
+        // SAFETY: the symbol resolved as ncclRecv; the caller upholds the buffer contract.
+        let result = unsafe {
+            let function: RecvFn = std::mem::transmute(symbol);
+            function(
+                recv,
+                count,
+                NcclDataType::Bfloat16 as c_int,
+                peer,
+                handle,
+                stream,
+            )
+        };
+        if result == NCCL_SUCCESS {
+            Ok(())
+        } else {
+            Err(self.call_error("ncclRecv", result))
+        }
+    }
+
     /// Opens a group so several collectives are enqueued in one NCCL launch.
     ///
     /// # Errors
@@ -1003,6 +1090,12 @@ impl NcclApi {
         } else {
             Err(self.call_error("ncclGroupStart", result))
         }
+    }
+
+    /// Whether the library exports ncclSend and ncclRecv.
+    #[must_use]
+    pub fn has_point_to_point(&self) -> bool {
+        self.raw.send.is_some() && self.raw.recv.is_some()
     }
 
     /// Closes a group.
@@ -1034,6 +1127,50 @@ impl NcclComm<'_> {
     #[must_use]
     pub fn as_raw(&self) -> NcclCommHandle {
         self.handle
+    }
+
+    /// Enqueues a bf16 send of `count` values to `peer` (inside a group for the one-shot exchange).
+    ///
+    /// # Safety
+    /// `send` is a device buffer of at least `count` bf16 values that stays live until the stream
+    /// reaches the operation.
+    ///
+    /// # Errors
+    /// [`NcclError::Call`] when the library lacks ncclSend or refuses the enqueue.
+    pub unsafe fn send_bf16(
+        &self,
+        send: *const c_void,
+        count: usize,
+        peer: c_int,
+        stream: CudaStream,
+    ) -> Result<(), NcclError> {
+        // SAFETY: the caller upholds the buffer contract.
+        unsafe {
+            self.api
+                .enqueue_send_bf16(self.handle, send, count, peer, stream)
+        }
+    }
+
+    /// Enqueues a bf16 receive of `count` values from `peer`.
+    ///
+    /// # Safety
+    /// `recv` is a device buffer of at least `count` bf16 values that stays live until the stream
+    /// reaches the operation.
+    ///
+    /// # Errors
+    /// [`NcclError::Call`] when the library lacks ncclRecv or refuses the enqueue.
+    pub unsafe fn recv_bf16(
+        &self,
+        recv: *mut c_void,
+        count: usize,
+        peer: c_int,
+        stream: CudaStream,
+    ) -> Result<(), NcclError> {
+        // SAFETY: the caller upholds the buffer contract.
+        unsafe {
+            self.api
+                .enqueue_recv_bf16(self.handle, recv, count, peer, stream)
+        }
     }
 
     /// Enqueues one bf16 AllReduce(Sum) on the caller's stream.

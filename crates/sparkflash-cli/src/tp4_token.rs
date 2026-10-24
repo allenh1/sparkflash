@@ -456,7 +456,19 @@ impl TokenEnvelope {
         if dump.vocab != VOCAB {
             return Err(format!("dump vocab {} is not {VOCAB}", dump.vocab));
         }
-        if dump.rows != self.tokens.ids.len() || dump.positions != self.tokens.positions {
+        // A lean-head run (SPARKFLASH_LEAN_HEAD=1) dumps only the heads that read their logits
+        // back: a subset of the token block's positions, never a position outside it.
+        let lean = std::env::var("SPARKFLASH_LEAN_HEAD").as_deref() == Ok("1");
+        let paired = if lean {
+            dump.rows == dump.positions.len()
+                && dump
+                    .positions
+                    .iter()
+                    .all(|position| self.tokens.positions.contains(position))
+        } else {
+            dump.rows == self.tokens.ids.len() && dump.positions == self.tokens.positions
+        };
+        if !paired {
             return Err(format!(
                 "dump ({} rows, {:?} positions) does not match the token block ({} ids)",
                 dump.rows,

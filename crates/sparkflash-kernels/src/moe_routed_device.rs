@@ -1183,7 +1183,42 @@ pub struct MoeRoutedDevice {
     slot_acc: Deviceptr,
     slot_ids: Deviceptr,
     kernels: MoeRoutedKernels,
+    opt: Option<OptMoeKernels>,
+    /// An f32 [tokens][5120] row the opt combine adds after the routed slots (the rank's shared
+    /// expert partial), or 0 for none.
+    addend: std::cell::Cell<u64>,
     device_bytes: usize,
+}
+
+/// The fused two-launch routed path (kernels/opt_moe_sm121.cu): gate+up+SwiGLU+quantise reading the
+/// expert slices in place, then down+combine. Bit-identical to the staged eight-launch chain.
+#[derive(Debug, Clone, Copy)]
+pub struct OptMoeKernels {
+    /// `opt_moe_gate_up_sm121`.
+    pub gate_up: (Module, Kernel),
+    /// `opt_moe_down_combine_sm121`.
+    pub down: (Module, Kernel),
+    /// `opt_moe_gate_up_dedup_sm121`, `opt_moe_down_dedup_sm121`, `opt_moe_combine_sm121`: the
+    /// multi-token path that reads each distinct expert once (bit-identical to the two above).
+    pub dedup: [(Module, Kernel); 3],
+}
+
+impl OptMoeKernels {
+    /// Loads both symbols from the opt cubin (unpinned).
+    ///
+    /// # Errors
+    /// The driver's load error.
+    pub fn load(cuda: &Cuda, cubin: &[u8]) -> Result<Self, String> {
+        Ok(Self {
+            gate_up: cuda.load_named(cubin, "opt_moe_gate_up_sm121")?,
+            down: cuda.load_named(cubin, "opt_moe_down_combine_sm121")?,
+            dedup: [
+                cuda.load_named(cubin, "opt_moe_gate_up_dedup_sm121")?,
+                cuda.load_named(cubin, "opt_moe_down_dedup_sm121")?,
+                cuda.load_named(cubin, "opt_moe_combine_sm121")?,
+            ],
+        })
+    }
 }
 
 impl MoeRoutedDevice {
@@ -1322,6 +1357,8 @@ impl MoeRoutedDevice {
                 slot_acc,
                 slot_ids: slot_ids_ptr,
                 kernels,
+                opt: None,
+                addend: std::cell::Cell::new(0),
                 device_bytes: allocated,
             })
         })();
@@ -1333,6 +1370,147 @@ impl MoeRoutedDevice {
                 Err(error)
             }
         }
+    }
+
+    /// Selects the fused two-launch path for every later [Self::run].
+    pub fn set_opt(&mut self, opt: Option<OptMoeKernels>) {
+        self.opt = opt;
+    }
+
+    /// Sets the f32 row the opt combine adds into the delta (0 = none). Only the opt path reads it.
+    pub fn set_addend(&self, addend: u64) {
+        self.addend.set(addend);
+    }
+
+    /// True when the fused opt kernels serve this device (the only path that reads the addend).
+    #[must_use]
+    pub fn has_opt(&self) -> bool {
+        self.opt.is_some()
+    }
+
+    /// The fused path: two launches, no staging copy.
+    fn run_opt(
+        &self,
+        cuda: &Cuda,
+        opt: &OptMoeKernels,
+        layer: usize,
+        tokens: usize,
+        rows: usize,
+        operands: &MoeRoutedOperands,
+    ) -> Result<(), String> {
+        let experts = self.plan.geometry().experts as u64;
+        let gate = self
+            .table
+            .offset(self.plan.table_word_offset(layer, RoutedMatrix::Gate) * 8);
+        let up = self
+            .table
+            .offset(self.plan.table_word_offset(layer, RoutedMatrix::Up) * 8);
+        let down = self
+            .table
+            .offset(self.plan.table_word_offset(layer, RoutedMatrix::Down) * 8);
+        let rows_u32 =
+            u32::try_from(rows).map_err(|_| "moe_routed opt: rows overflow".to_owned())?;
+        let tokens_u32 =
+            u32::try_from(tokens).map_err(|_| "moe_routed opt: tokens overflow".to_owned())?;
+        if tokens > 1 && rows <= 64 && std::env::var("SPARKFLASH_MOE_DEDUP").as_deref() != Ok("0") {
+            return self.run_dedup(cuda, opt, (gate, up, down), tokens_u32, rows_u32, operands);
+        }
+        let gate_up_args = [
+            gate.0,
+            up.0,
+            operands.ids.device.0,
+            operands.weights.device.0,
+            operands.act_codes.device.0,
+            operands.act_scales.device.0,
+            self.codes.0,
+            self.scales.0,
+            u64::from(rows_u32),
+            experts,
+            u64::from(self.plan.limit().to_bits()),
+        ];
+        cuda.launch(
+            opt.gate_up.1,
+            ((INTER / WORLD / QUANT_BLOCK) as u32, rows_u32, 1),
+            (128, 1, 1),
+            &gate_up_args,
+        )
+        .map_err(|error| format!("moe_routed opt: gate/up: {error}"))?;
+        let down_args = [
+            down.0,
+            operands.ids.device.0,
+            self.codes.0,
+            self.scales.0,
+            operands.delta_f32.device.0,
+            operands.delta_bf16.device.0,
+            u64::from(tokens_u32),
+            experts,
+            self.addend.get(),
+        ];
+        cuda.launch(
+            opt.down.1,
+            ((HIDDEN / 32) as u32, tokens_u32, 1),
+            (256, 1, 1),
+            &down_args,
+        )
+        .map_err(|error| format!("moe_routed opt: down/combine: {error}"))
+    }
+
+    /// The multi-token fused path: gate/up per distinct expert (which also writes the row grouping
+    /// into the unused gate-out buffer), down per distinct expert into the slot accumulators, then
+    /// the per-token combine.
+    fn run_dedup(
+        &self,
+        cuda: &Cuda,
+        opt: &OptMoeKernels,
+        (gate, up, down): (Deviceptr, Deviceptr, Deviceptr),
+        tokens: u32,
+        rows: u32,
+        operands: &MoeRoutedOperands,
+    ) -> Result<(), String> {
+        let experts = self.plan.geometry().experts as u64;
+        let plan = self.gate_out.0;
+        cuda.launch(
+            opt.dedup[0].1,
+            ((INTER / WORLD / QUANT_BLOCK) as u32, rows, 1),
+            (128, 1, 1),
+            &[
+                gate.0,
+                up.0,
+                operands.ids.device.0,
+                operands.weights.device.0,
+                operands.act_codes.device.0,
+                operands.act_scales.device.0,
+                self.codes.0,
+                self.scales.0,
+                u64::from(rows),
+                experts,
+                u64::from(self.plan.limit().to_bits()),
+                plan,
+            ],
+        )
+        .map_err(|error| format!("moe_routed dedup: gate/up: {error}"))?;
+        cuda.launch(
+            opt.dedup[1].1,
+            // Two 32-column tiles per block (OPT_MOE_DD_TILES).
+            ((HIDDEN / 64) as u32, rows, 1),
+            (256, 1, 1),
+            &[down.0, plan, self.codes.0, self.scales.0, self.slot_acc.0],
+        )
+        .map_err(|error| format!("moe_routed dedup: down: {error}"))?;
+        cuda.launch(
+            opt.dedup[2].1,
+            ((HIDDEN / 256) as u32, tokens, 1),
+            (256, 1, 1),
+            &[
+                operands.ids.device.0,
+                self.slot_acc.0,
+                operands.delta_f32.device.0,
+                operands.delta_bf16.device.0,
+                u64::from(tokens),
+                self.addend.get(),
+            ],
+        )
+        .map_err(|error| format!("moe_routed dedup: combine: {error}"))
     }
 
     /// The plan this device was opened with.
@@ -1372,6 +1550,9 @@ impl MoeRoutedDevice {
         operands: &MoeRoutedOperands,
     ) -> Result<(), String> {
         let rows = self.plan.check_operands(layer, tokens, operands)?;
+        if let Some(opt) = self.opt.as_ref() {
+            return self.run_opt(cuda, opt, layer, tokens, rows, operands);
+        }
         let geometry = *self.plan.geometry();
         let tokens_u32 = u32::try_from(tokens)
             .map_err(|_| format!("moe_routed device: {tokens} tokens do not fit a launch word"))?;

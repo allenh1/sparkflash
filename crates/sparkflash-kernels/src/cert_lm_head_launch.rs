@@ -209,12 +209,35 @@ pub fn load_batched(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), Strin
     cuda.load_cert_lm_head_batched(cubin)
 }
 
+static OPT_FUNCTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const OPT_SYMBOL: &str = "opt_lm_head";
+
+/// Loads the exact warp-per-row head (opt_misc_sm121.cubin) and routes [`launch`] through it: same
+/// grid and outputs, every logit exact, nothing certified.
+///
+/// # Errors
+/// The driver's error when the cubin lacks the symbol.
+pub fn install_opt(cuda: &Cuda, cubin: &[u8]) -> Result<Module, String> {
+    let (module, kernel) = cuda.load_named(cubin, OPT_SYMBOL)?;
+    OPT_FUNCTION.store(kernel.to_raw().0, std::sync::atomic::Ordering::Release);
+    Ok(module)
+}
+
 /// Launches the screening pass once.
 ///
 /// # Errors
 /// Refuses a zero vocabulary, and returns the driver's error otherwise.
 pub fn launch(cuda: &Cuda, kernel: Kernel, params: &CertLmHeadParams) -> Result<(), String> {
     let grid = grid(params.vocab())?;
+    let word = OPT_FUNCTION.load(std::sync::atomic::Ordering::Acquire);
+    if word != 0 {
+        return cuda.launch(
+            Kernel::from_raw(word, OPT_SYMBOL),
+            grid,
+            (512, 1, 1),
+            params.as_slice(),
+        );
+    }
     cuda.launch(kernel, grid, BLOCK, params.as_slice())
 }
 

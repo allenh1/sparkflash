@@ -257,6 +257,263 @@ pub fn load_mode(cuda: &Cuda, cubin: &[u8], mode: Mode) -> Result<(Module, Kerne
     cuda.load_dense_gemv_mode(cubin, mode.symbol())
 }
 
+/// The split-K opt GEMV (kernels/opt_gemv_sm121.cu): when installed, every decode GEMV launch is
+/// served by it - same operands, 8 warps per 32-column tile instead of one.
+static OPT_FUNCTIONS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+const OPT_SYMBOLS: [&str; 3] = [
+    "opt_gemv_fp8a_bf16o_t1",
+    "opt_gemv_f32a_bf16o_t1",
+    "opt_gemv_f32a_f32o_t1",
+];
+
+/// The up-to-8-token instantiations [`launch_opt`] uses for a multi-row (verify) launch, indexed
+/// as [`OptKind`]. Per-token arithmetic is the t1 kernel's, so a row's output is bit-identical.
+static OPT_ROWS_FUNCTIONS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+const OPT_ROWS_SYMBOLS: [&str; 4] = [
+    "opt_gemv_fp8a_bf16o_t8",
+    "opt_gemv_f32a_bf16o_t8",
+    "opt_gemv_f32a_f32o_t8",
+    "opt_gemv_bf16a_bf16o_t8",
+];
+
+/// The 2- and 4-token instantiations, indexed as [`OptKind`]: a narrow or short multi-row launch
+/// splits its tokens over more blocks with them. Bit-identical to the t8 form per token.
+static OPT_T2_FUNCTIONS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+const OPT_T2_SYMBOLS: [&str; 4] = [
+    "opt_gemv_fp8a_bf16o_t2",
+    "opt_gemv_f32a_bf16o_t2",
+    "opt_gemv_f32a_f32o_t2",
+    "opt_gemv_bf16a_bf16o_t2",
+];
+static OPT_T4_FUNCTIONS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+const OPT_T4_SYMBOLS: [&str; 4] = [
+    "opt_gemv_fp8a_bf16o_t4",
+    "opt_gemv_f32a_bf16o_t4",
+    "opt_gemv_f32a_f32o_t4",
+    "opt_gemv_bf16a_bf16o_t4",
+];
+
+/// Loads the opt GEMV symbols and routes [`launch`] through them. The module is returned so the
+/// caller keeps it loaded for the run.
+pub fn install_opt(cuda: &Cuda, cubin: &[u8]) -> Result<Module, String> {
+    let mut module = None;
+    for (slot, symbol) in OPT_FUNCTIONS.iter().zip(OPT_SYMBOLS) {
+        let (m, k) = cuda.load_named(cubin, symbol)?;
+        slot.store(k.to_raw().0, std::sync::atomic::Ordering::Release);
+        module = Some(m);
+    }
+    for (slot, symbol) in OPT_ROWS_FUNCTIONS
+        .iter()
+        .zip(OPT_ROWS_SYMBOLS)
+        .chain(OPT_T2_FUNCTIONS.iter().zip(OPT_T2_SYMBOLS))
+        .chain(OPT_T4_FUNCTIONS.iter().zip(OPT_T4_SYMBOLS))
+    {
+        let (m, k) = cuda.load_named(cubin, symbol)?;
+        slot.store(k.to_raw().0, std::sync::atomic::Ordering::Release);
+        module = Some(m);
+    }
+    module.ok_or_else(|| "opt gemv: no symbols".to_owned())
+}
+
+fn opt_for(kernel: Kernel) -> Option<Kernel> {
+    let index = match kernel.to_raw().1 {
+        KERNEL | KERNEL_NONFUSED => 0,
+        KERNEL_NONFUSED_F32_ACTIVATION => 1,
+        KERNEL_NONFUSED_F32_ACTIVATION_F32_OUT => 2,
+        _ => return None,
+    };
+    let word = OPT_FUNCTIONS[index].load(std::sync::atomic::Ordering::Acquire);
+    (word != 0).then(|| Kernel::from_raw(word, OPT_SYMBOLS[index]))
+}
+
+/// Which opt GEMV instantiation [`launch_opt`] runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptKind {
+    /// E4M3 + ue8m0 activation, bf16 output.
+    Fp8aBf16o,
+    /// f32 activation, bf16 output.
+    F32aBf16o,
+    /// f32 activation, f32 output.
+    F32aF32o,
+    /// bf16 activation, bf16 output (multi-row launches only; the t1 form lives with wo_a).
+    Bf16aBf16o,
+}
+
+/// The opt GEMV's full argument set: `groups` independent [cols][inner] products over the grid's
+/// y axis, each with its own activation, weight, scale and output offset; `k_stride_blocks` is the
+/// tile-row stride of a K-slice of a wider matrix (0 = `inner / 32`). Strides are in elements of
+/// their buffer (bytes for weights and scales).
+#[derive(Debug, Clone, Copy)]
+pub struct OptArgs {
+    /// Activation rows (E4M3, f32 or bf16 by kind).
+    pub a: u64,
+    /// The E4M3 activation's MX scales (unused by the f32 and bf16 kinds).
+    pub a_scales: u64,
+    /// Swizzled E4M3 weight tiles.
+    pub w: u64,
+    /// The weights' UE8M0 block scales.
+    pub ws: u64,
+    /// Output rows.
+    pub out: u64,
+    /// Output columns per group.
+    pub cols: u32,
+    /// Reduction length per group.
+    pub inner: u32,
+    /// Activation rows, 1..=8.
+    pub tokens: u32,
+    /// Elements between consecutive tokens' activations.
+    pub a_tok_stride: u64,
+    /// Elements between consecutive tokens' outputs.
+    pub out_tok_stride: u64,
+    /// Independent products on the grid's y axis.
+    pub groups: u32,
+    /// Activation elements between groups.
+    pub a_grp_stride: u64,
+    /// Weight bytes between groups.
+    pub w_grp_stride: u64,
+    /// Scale bytes between groups.
+    pub s_grp_stride: u64,
+    /// Output elements between groups.
+    pub out_grp_stride: u64,
+    /// Tile-row stride in MX blocks (0 = `inner / 32`).
+    pub k_stride_blocks: u32,
+}
+
+/// True once [`install_opt`] has run.
+#[must_use]
+pub fn opt_installed() -> bool {
+    OPT_FUNCTIONS[0].load(std::sync::atomic::Ordering::Acquire) != 0
+}
+
+/// Launches one opt GEMV over 1..=8 tokens, choosing how many tokens each block serves (see the
+/// body). Every choice gives the same bits per token: a token's chain does not depend on it.
+pub fn launch_opt(cuda: &Cuda, kind: OptKind, args: &OptArgs) -> Result<(), String> {
+    use std::sync::atomic::Ordering::Acquire;
+    let index = match kind {
+        OptKind::Fp8aBf16o => 0,
+        OptKind::F32aBf16o => 1,
+        OptKind::F32aF32o => 2,
+        OptKind::Bf16aBf16o => 3,
+    };
+    if args.tokens == 0
+        || args.tokens > 8
+        || !args.cols.is_multiple_of(32)
+        || !args.inner.is_multiple_of(32)
+        || args.groups == 0
+    {
+        return Err(format!("opt gemv: unsupported shape {args:?}"));
+    }
+    // Tokens per block: the fewer, the more blocks stream the weights, at the price of re-reading
+    // them once per block. A narrow matrix needs the blocks (one token each when it is very narrow,
+    // two when narrow); a mid-width one at up to four tokens still gains from the shorter
+    // accumulator set, a wide one (enough blocks already) does not.
+    let blocks = (args.cols / 32) * args.groups;
+    let one = if index == 3 {
+        0
+    } else {
+        OPT_FUNCTIONS[index].load(Acquire)
+    };
+    let mut per_block = if (args.tokens == 1 || blocks <= SPLIT_BLOCKS) && one != 0 {
+        1
+    } else if blocks <= NARROW_BLOCKS {
+        2
+    } else if args.tokens <= 4 && blocks < WIDE_BLOCKS {
+        4
+    } else {
+        8
+    };
+    // A block whose rows do not fit the kernel's staging bytes reads them from global memory at
+    // several microseconds per extra token, so fewer tokens per block that stage are faster.
+    let element_bytes = match kind {
+        OptKind::Fp8aBf16o => 1,
+        OptKind::Bf16aBf16o => 2,
+        OptKind::F32aBf16o | OptKind::F32aF32o => 4,
+    };
+    let staged = |per_block: u32| {
+        let live = per_block.min(args.tokens);
+        let scales = if element_bytes == 1 {
+            live * (args.inner / 32)
+        } else {
+            0
+        };
+        let budget = if per_block == 1 {
+            OPT_STAGE_T1
+        } else {
+            OPT_STAGE
+        };
+        live * args.inner * element_bytes + scales <= budget
+    };
+    while per_block > 2 && !staged(per_block) {
+        per_block /= 2;
+    }
+    let (word, symbol) = match per_block {
+        1 => (one, OPT_SYMBOLS[index]),
+        2 => (OPT_T2_FUNCTIONS[index].load(Acquire), OPT_T2_SYMBOLS[index]),
+        4 => (OPT_T4_FUNCTIONS[index].load(Acquire), OPT_T4_SYMBOLS[index]),
+        _ => (
+            OPT_ROWS_FUNCTIONS[index].load(Acquire),
+            OPT_ROWS_SYMBOLS[index],
+        ),
+    };
+    if word == 0 {
+        return Err("opt gemv: not installed".to_owned());
+    }
+    cuda.launch(
+        Kernel::from_raw(word, symbol),
+        (args.cols / 32, args.groups, args.tokens.div_ceil(per_block)),
+        (256, 1, 1),
+        &[
+            args.a,
+            args.a_scales,
+            args.w,
+            args.ws,
+            args.out,
+            u64::from(args.cols),
+            u64::from(args.inner),
+            u64::from(args.tokens),
+            args.a_tok_stride,
+            args.out_tok_stride,
+            args.a_grp_stride,
+            args.w_grp_stride,
+            args.s_grp_stride,
+            args.out_grp_stride,
+            u64::from(args.k_stride_blocks),
+        ],
+    )
+}
+
+/// The widest matrix (blocks per token) [launch_opt] splits to one token per block.
+const SPLIT_BLOCKS: u32 = 16;
+
+/// The widest matrix (blocks per token) [launch_opt] splits to two tokens per block.
+const NARROW_BLOCKS: u32 = 48;
+
+/// From this many blocks per token [launch_opt] keeps up to eight tokens per block.
+const WIDE_BLOCKS: u32 = 256;
+
+/// The opt GEMV's activation staging bytes per block (OPT_G_STAGE, OPT_G_STAGE_T1).
+const OPT_STAGE: u32 = 48128;
+const OPT_STAGE_T1: u32 = 20480;
+
 /// Launches the decode GEMV once.
 ///
 /// # Errors
@@ -266,6 +523,18 @@ pub fn load_mode(cuda: &Cuda, cubin: &[u8], mode: Mode) -> Result<(Module, Kerne
 pub fn launch(cuda: &Cuda, kernel: Kernel, params: &Mxfp8DenseParams) -> Result<(), String> {
     check(params)?;
     let grid = grid(params.rows(), params.cols())?;
+    if let Some(opt) = opt_for(kernel) {
+        let p = params.as_slice();
+        let (cols, inner) = (u64::from(params.cols()), u64::from(params.inner()));
+        return cuda.launch(
+            opt,
+            grid,
+            (256, 1, 1),
+            &[
+                p[0], p[1], p[2], p[3], p[4], cols, inner, 1, inner, cols, 0, 0, 0, 0, 0,
+            ],
+        );
+    }
     cuda.launch(kernel, grid, BLOCK, params.as_slice())
 }
 

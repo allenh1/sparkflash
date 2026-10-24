@@ -989,6 +989,20 @@ impl WeightSource for SafeTensorsSource {
         Some(SafeTensorsSource::read_ranges_paged(self, name, ranges))
     }
 
+    fn file_region(&self, name: &str) -> Option<Result<(Arc<File>, u64, u64), WeightError>> {
+        let region = || -> Result<(Arc<File>, u64, u64), WeightError> {
+            let (shard, header) = self.resolve(name)?;
+            let descriptor = header.tensor(name)?;
+            let [begin, end] = descriptor.data_offsets;
+            Ok((
+                self.file_of_shard(shard, name)?,
+                header.data_start + begin,
+                end.saturating_sub(begin),
+            ))
+        };
+        Some(region())
+    }
+
     /// Every name in the index, in sorted order.
     fn names(&self) -> Vec<String> {
         self.index.names().map(str::to_string).collect()

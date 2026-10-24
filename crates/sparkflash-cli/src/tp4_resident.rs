@@ -854,10 +854,16 @@ pub(crate) fn upload_arena_streaming<T>(
     let verify_weights = std::env::var("SPARKFLASH_VERIFY_WEIGHTS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    // Plain device memory (cuMemAlloc) by default: on GB10 the GPU streams a host-mapped slab at
+    // about half the bandwidth of cuMemAlloc memory (measured 113 vs 237 GB/s on the same GEMV),
+    // so the resident weights live in device allocations unless SPARKFLASH_ARENA_HOSTMAPPED=1.
+    let host_mapped = std::env::var("SPARKFLASH_ARENA_HOSTMAPPED").as_deref() == Ok("1");
     let mode = if use_mmap {
         AllocationMode::MmapRegistered
-    } else {
+    } else if host_mapped {
         AllocationMode::UnifiedSingle
+    } else {
+        AllocationMode::Device
     };
     // One contiguous reservation for the whole rank plan (allocate the model's memory up front in
     // one chunk, not as each tensor is read in).
@@ -892,8 +898,12 @@ pub(crate) fn upload_arena_streaming<T>(
         )?;
         (arena, 0u64, Some(report))
     } else {
-        let mut allocator_fallback =
-            CudaArenaAllocator::with_mode(&cuda, AllocationMode::UnifiedSingle);
+        let stream_mode = if mode == AllocationMode::Device {
+            AllocationMode::Device
+        } else {
+            AllocationMode::UnifiedSingle
+        };
+        let mut allocator_fallback = CudaArenaAllocator::with_mode(&cuda, stream_mode);
         let mut reader = StreamingReader {
             plan: shard_plan,
             source,
@@ -903,7 +913,7 @@ pub(crate) fn upload_arena_streaming<T>(
             &mut allocator_fallback,
             plan,
             &mut reader,
-            AllocationMode::UnifiedSingle,
+            stream_mode,
             |_name| Ok(()),
         )?;
         let bound = use_arena(&arena)?;

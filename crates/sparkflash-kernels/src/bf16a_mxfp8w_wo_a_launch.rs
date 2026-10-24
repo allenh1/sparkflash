@@ -135,12 +135,52 @@ pub fn load(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), String> {
     cuda.load_kernel(cubin, KERNEL_ID)
 }
 
+/// The split-K opt GEMV's bf16-activation symbol (kernels/opt_gemv_sm121.cu): when installed, the
+/// grouped wo_a runs as 32-column tiles x groups with 8 warps each instead of 256-column tiles.
+static OPT_FUNCTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const OPT_SYMBOL: &str = "opt_gemv_bf16a_bf16o_t1";
+
+/// Loads the opt wo_a symbol and routes [`launch`] through it.
+pub fn install_opt(cuda: &Cuda, cubin: &[u8]) -> Result<Module, String> {
+    let (module, kernel) = cuda.load_named(cubin, OPT_SYMBOL)?;
+    OPT_FUNCTION.store(kernel.to_raw().0, std::sync::atomic::Ordering::Release);
+    Ok(module)
+}
+
 /// Launches the projection once.
 ///
 /// # Errors
 /// Refuses a zero group count, and returns the driver's error otherwise.
 pub fn launch(cuda: &Cuda, kernel: Kernel, params: &Bf16aMxfp8wWoAParams) -> Result<(), String> {
     let grid = grid(params.groups())?;
+    let word = OPT_FUNCTION.load(std::sync::atomic::Ordering::Acquire);
+    if word != 0 {
+        // [attn, w, w_scales, out, groups, trace, layer, step]; one group is [1024][4096].
+        let p = params.as_slice();
+        let (cols, inner) = (1024u64, 4096u64);
+        return cuda.launch(
+            Kernel::from_raw(word, OPT_SYMBOL),
+            (1024 / 32, grid.0, 1),
+            (256, 1, 1),
+            &[
+                p[0],
+                0,
+                p[1],
+                p[2],
+                p[3],
+                cols,
+                inner,
+                1,
+                inner * p[4],
+                cols * p[4],
+                inner,
+                cols * inner,
+                (cols / 32) * (inner / 32),
+                cols,
+                0,
+            ],
+        );
+    }
     cuda.launch(kernel, grid, BLOCK, params.as_slice())
 }
 

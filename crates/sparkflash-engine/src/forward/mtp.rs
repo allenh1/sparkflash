@@ -398,6 +398,64 @@ pub fn dspark_forward(
     )
 }
 
+/// Seeds every stage's ring at `start_pos` from the taps without drafting: the main_x and ring
+/// writes of [dspark_forward] (model.py:1128-1130, 1040-1043), for a position whose draft is not
+/// needed. `main_hidden` holds whole rows of the target taps, in tap order.
+///
+/// # Errors
+///
+/// [EngineError::Shape] when the tap buffer is not whole rows or the stage count is wrong, and any
+/// weight read error.
+pub fn dspark_seed(
+    config: &ModelConfig,
+    start_pos: usize,
+    main_hidden: &[f32],
+    stages: &mut [AttnState],
+    src: &dyn WeightSource,
+    limit: usize,
+) -> Result<(), EngineError> {
+    let dim = config.dim;
+    let width = config.dspark_target_layer_ids.len() * dim;
+    if width == 0 || main_hidden.is_empty() || !main_hidden.len().is_multiple_of(width) {
+        return Err(shape_error(
+            "dspark seed",
+            format!(
+                "taps of {} values are not whole {width}-wide rows",
+                main_hidden.len()
+            ),
+        ));
+    }
+    if stages.len() != config.n_mtp_layers {
+        return Err(shape_error(
+            "dspark seed",
+            format!(
+                "{} MTP stages need {} attention states",
+                config.n_mtp_layers,
+                stages.len()
+            ),
+        ));
+    }
+    let rows = main_hidden.len() / width;
+    let proj = read_dense("mtp.0.main_proj.weight", src, dim, width, limit)?;
+    let main_norm = linalg::decode_by_name(src, "mtp.0.main_norm.weight", limit)?;
+    let mut main_x = vec![0.0f32; rows * dim];
+    linalg::matmul(&mut main_x, main_hidden, &proj, dim, width, rows)?;
+    linalg::rms_norm(&mut main_x, &main_norm, dim, config.norm_eps as f32)?;
+    for (stage, state) in stages.iter_mut().enumerate() {
+        attention::dspark_seed_ring(
+            config,
+            stage,
+            &format!("mtp.{stage}"),
+            &main_x,
+            start_pos,
+            state,
+            src,
+            limit,
+        )?;
+    }
+    Ok(())
+}
+
 /// [dspark_forward] with the per-stage boundary rows appended to `capture`, layer id
 /// `n_layers + stage` (docs/archive/build/phase1-boundary-table.md section 1).
 ///

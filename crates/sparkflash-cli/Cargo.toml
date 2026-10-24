@@ -21,7 +21,7 @@ tp4-serve = []
 # (scripts/build-aarch64.sh --features=cuda) produces a binary that can resolve the RoCE reduce
 # transport. The backend stays inert unless SPARK_COMM_REDUCE=roce asks for it; a TCP row is the
 # row it always was, and the run prints the path it resolved.
-cuda = ["sparkflash-device/cuda", "rdma"]
+cuda = ["sparkflash-device/cuda", "rdma", "dep:io-uring"]
 # The real libibverbs RDMA backend, forwarded from sparkflash-comm. No build dependency is added
 # (libibverbs is dlopen'd at run time); this only compiles the backend in and makes
 # --comm-backend rdma reachable. The four-node window is still what the run needs.
@@ -55,6 +55,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 libc = { workspace = true }
+# The DSpark verify's Engram reads (cuda builds only: the device paths are Linux-only).
+io-uring = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The `--checkpoint` fixture tests build a tiny safetensors checkpoint in a temporary directory.

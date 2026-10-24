@@ -399,6 +399,20 @@ pub fn load_kv_norm_rope(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), 
     cuda.load_kv_norm_rope(cubin)
 }
 
+static OPT_FUNCTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const OPT_SYMBOL: &str = "opt_kv_norm_rope";
+
+/// Loads the block-parallel kv norm + rope (opt_misc_sm121.cubin) and routes
+/// [`launch_kv_norm_rope`] through it.
+///
+/// # Errors
+/// The driver's error when the cubin lacks the symbol.
+pub fn install_opt(cuda: &Cuda, cubin: &[u8]) -> Result<Module, String> {
+    let (module, kernel) = cuda.load_named(cubin, OPT_SYMBOL)?;
+    OPT_FUNCTION.store(kernel.to_raw().0, std::sync::atomic::Ordering::Release);
+    Ok(module)
+}
+
 /// Launches the fused kv_norm + rope for one row.
 ///
 /// # Errors
@@ -409,6 +423,12 @@ pub fn launch_kv_norm_rope(
     params: &KvNormRopeParams,
 ) -> Result<(), String> {
     params.validate()?;
+    let word = OPT_FUNCTION.load(std::sync::atomic::Ordering::Acquire);
+    let kernel = if word == 0 {
+        kernel
+    } else {
+        Kernel::from_raw(word, OPT_SYMBOL)
+    };
     cuda.launch(kernel, GRID, BLOCK, &params.words())
 }
 

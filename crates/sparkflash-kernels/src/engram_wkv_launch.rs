@@ -112,5 +112,27 @@ pub fn launch(cuda: &Cuda, kernel: Kernel, params: &EngramWkvLaunchParams) -> Re
         ));
     }
     let grid = grid(params.out_width)?;
+    let word = OPT_FUNCTION.load(std::sync::atomic::Ordering::Acquire);
+    if word != 0 {
+        return cuda.launch(
+            Kernel::from_raw(word, OPT_SYMBOL),
+            grid,
+            BLOCK,
+            &params.words(),
+        );
+    }
     cuda.launch(kernel, grid, BLOCK, &params.words())
+}
+
+static OPT_FUNCTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const OPT_SYMBOL: &str = "opt_engram_wkv";
+
+/// Loads the sixteen-byte-load wkv (opt_misc_sm121.cubin) and routes [`launch`] through it.
+///
+/// # Errors
+/// The driver's error when the cubin lacks the symbol.
+pub fn install_opt(cuda: &Cuda, cubin: &[u8]) -> Result<Module, String> {
+    let (module, kernel) = cuda.load_named(cubin, OPT_SYMBOL)?;
+    OPT_FUNCTION.store(kernel.to_raw().0, std::sync::atomic::Ordering::Release);
+    Ok(module)
 }

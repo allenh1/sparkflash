@@ -2219,6 +2219,7 @@ dependencies = [
  "axum",
  "clap",
  "futures",
+ "io-uring",
  "libc",
  "serde",
  "serde_json",

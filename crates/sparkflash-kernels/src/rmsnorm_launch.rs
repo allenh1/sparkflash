@@ -86,6 +86,19 @@ pub fn load(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), String> {
     cuda.load_kernel(cubin, KERNEL_ID)
 }
 
+static OPT_FUNCTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const OPT_SYMBOL: &str = "opt_rmsnorm_bf16";
+
+/// Loads the block-per-row RMSNorm (opt_misc_sm121.cubin) and routes [`launch`] through it.
+///
+/// # Errors
+/// The driver's error when the cubin lacks the symbol.
+pub fn install_opt(cuda: &Cuda, cubin: &[u8]) -> Result<Module, String> {
+    let (module, kernel) = cuda.load_named(cubin, OPT_SYMBOL)?;
+    OPT_FUNCTION.store(kernel.to_raw().0, std::sync::atomic::Ordering::Release);
+    Ok(module)
+}
+
 /// Launches the kernel for one parameter set.
 ///
 /// # Errors
@@ -93,6 +106,15 @@ pub fn load(cuda: &Cuda, cubin: &[u8]) -> Result<(Module, Kernel), String> {
 pub fn launch(cuda: &Cuda, kernel: Kernel, params: &RmsNormLaunchParams) -> Result<(), String> {
     if params.cols == 0 {
         return Err("the RMSNorm normalises at least one column, so cols is not zero".to_owned());
+    }
+    let word = OPT_FUNCTION.load(std::sync::atomic::Ordering::Acquire);
+    if word != 0 {
+        return cuda.launch(
+            Kernel::from_raw(word, OPT_SYMBOL),
+            (params.rows, 1, 1),
+            (256, 1, 1),
+            &params.words(),
+        );
     }
     let grid = grid(params.rows)?;
     cuda.launch(kernel, grid, BLOCK, &params.words())

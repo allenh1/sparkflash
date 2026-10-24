@@ -3740,6 +3740,38 @@ pub fn attention_projection_probe(
     })
 }
 
+/// The DSpark ring write alone: the main rows' KV stored at their own positions, which is what
+/// [dspark_attention_forward] does before it drafts (model.py:1040-1043, 1065). For a position whose
+/// draft is not wanted, so the ring still holds every position a later draft attends.
+///
+/// # Errors
+///
+/// [EngineError] from any weight read or shape mismatch.
+#[allow(clippy::too_many_arguments)] // dspark_attention_forward's inputs minus the draft rows.
+pub fn dspark_seed_ring(
+    config: &ModelConfig,
+    stage: usize,
+    prefix: &str,
+    main_x: &[f32],
+    start_pos: usize,
+    state: &mut AttnState,
+    src: &dyn WeightSource,
+    limit: usize,
+) -> Result<(), EngineError> {
+    let src = Reads { source: src, limit };
+    let head_dim = config.head_dim;
+    let main_rows = rows_of(main_x, config.dim, "dspark main input")?;
+    let layer = config.n_layers + stage;
+    let main_kv = window_kv(config, layer, prefix, main_x, start_pos, src)?;
+    for row in 0..main_rows {
+        state.window.write(
+            start_pos + row,
+            &main_kv[row * head_dim..(row + 1) * head_dim],
+        )?;
+    }
+    Ok(())
+}
+
 /// The DSpark stage pass, which attends the main rows through its own ring (model.py:1032-1074).
 ///
 /// `start_pos` is the position of the first row of `main_x`, which is what the reference's own

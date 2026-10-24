@@ -43,6 +43,8 @@
 // executed on a GPU on this branch, and its achieved bandwidth is the window row's measurement, not
 // this file's.
 
+#pragma once  // kernels/opt_rows_sm121.cu includes this file for its row-batched form
+
 #include "m4_common_sm121.cuh"
 
 // One warp per B12x micro-tile: 32 output columns, 32 threads, one lane per column.
