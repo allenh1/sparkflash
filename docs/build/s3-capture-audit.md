@@ -32,8 +32,8 @@ at least `3.2x` - which is S4's job, and the reason capture is sequenced after i
 is the S1 tree's kernel time and is **not re-measured**: no `1500 MHz` locked run is taken any more
 (the hardware sits at 2405-2418 MHz and the protocol is boost clocks), so the re-tile needs the
 per-stage table re-measured at boost; taking that row is what section 5 is about, and once its
-documents are rendered (a renderer that does not yet exist is a separate S4 task, section 5) that
-table, not this bound, becomes the number the re-tile works from.
+documents are rendered (`scripts/tp4-perf-table.py`, section 5) that table, not this bound, becomes
+the number the re-tile works from.
 
 So the correct sequencing is: **shrink kernel time first (S4: `moe_routed` 38.6%, `attention_output`
 18.8%, `moe_router` 7.7% of the 40-layer kernel total, `s1-result.md` section 8.2), then re-ask
@@ -102,7 +102,7 @@ not a launcher, is now S4's first task.
 | item | owner | why |
 | :-- | :-- | :-- |
 | **the one runnable single-factor row**: attempt 2's argv (12-token, `--decode-steps 9`) with `--forward-lean` dropped, device arm + NCCL + probe at boost | **S4, first task** | §5: every probe stall so far is device+NCCL under boost *with* lean, and both probe completions differ from them in more than one factor; dropping lean is the only single-factor variation the binary accepts without a code change |
-| then a renderer for the S1-style table: per-stage `kernel ms/step` over the decode positions | **S4** | §5: no in-tree tool does this - `tp4-probe-attribution.py` reads rank 0 only, sums `wall_ms` and skips the `head`-flagged decode positions, so extending it (or writing it) is part of the task |
+| render the S1-style table from the row: per-stage `kernel ms/step` over the decode positions | **S4, renderer done** | §5: `scripts/tp4-perf-table.py` now renders it and reproduces `s1-c-probe`'s published table; the row it must render is the item above |
 | `moe_routed` (38.6%), `attention_output` (18.8%), `moe_router` (7.7%) re-tiling | **S4** | the 40-layer kernel table says these are 65.1% of kernel time |
 | instrument `copy_htod` / `copy_dtoh` / stream calls so the step's host interactions are counted, not asserted | **S4 (prerequisite for any host-free claim)** | section 3.1 |
 | capture prerequisites H1 (one non-blocking stream), H4 (device position word), fixed topology, H2/H3 | **after S4, re-evaluated with a measured host time** | `s2-result.md` section 4.1; gated on kernel time dropping toward the target |
@@ -248,11 +248,17 @@ path. Anything involving arm/reduce pairs is a code change, not a row.
 
 1. One row, single factor: **attempt 2's argv** (12-token prompt, `--decode-steps 9`, device arm, NCCL,
    boost) with `--forward-lean` dropped, so the probe and everything else stay as they were.
-2. Then the table: no in-tree tool renders the S1-style table. `scripts/tp4-probe-attribution.py` reads
+2. Then the table. No in-tree tool rendered the S1-style table: `scripts/tp4-probe-attribution.py` reads
    rank 0 only, sums the per-layer `wall_ms` and skips the `head`-flagged positions (which are the
    decode positions), so it is not the renderer for `s1-result.md` §8.2's `kernel ms/step` over decode
-   positions. Extending it — or writing that renderer — is part of S4's table task, together with
-   stating the clock window and the step count beside the table.
+   positions. That gap is closed: `scripts/tp4-perf-table.py` renders §8.2's table from a probe row,
+   and on `s1-c-probe` at `--steady 8` it reproduces every stage row that row records (the kernel
+   column exactly; wall to the document's rounding convention, and the document's `all_gather` line
+   has no row in the probe document at all), including the `2,029.5 / 179.216 / 4,480.4 / 161.184`
+   subtotal and the `2,032.5 / 186.397 / 203.944` step total. `--expect` pins the kernel column. It
+   always prints the position range and the row's probe mode beside the table, and the clock window
+   when the row ships a `gpu.csv`. What it still needs is a completed device-arm row to render: the
+   row is what is blocked, not the arithmetic.
 3. If a later row shows the probe cannot be run on the production configuration, the finding is about
    the instrument plus the S2 launch path, and section 3 already lists the stream/copy instrumentation
    that is unbuilt; the same recording change would serve both.
