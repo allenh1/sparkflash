@@ -25,6 +25,7 @@
 #include <stdint.h>
 
 #include "m4_common_sm121.cuh"
+#include "opt_sample_sm121.cuh"
 #include "m4_activation_quant_sm121.cuh"
 
 #define OD_HIDDEN 5120u
@@ -249,8 +250,9 @@ extern "C" __global__ void __launch_bounds__(OD_A_THREADS) opt_draft_attn(
 #define OD_LM_MAXR 8u
 #define OD_MARKOV_RANK 256u
 
-// Block x scores vocabulary entries [x * 1024, x * 1024 + 1024) of the slice for every row:
-// logits_all + y * vocab + entry.
+// Warp w of block x scores vocabulary entry x * 16 + w of the slice, then every gridDim.x * 16
+// entries on, for every row: logits_all + y * vocab + entry. An entry's dot product is one warp's
+// whatever the grid, so the grid only sets how many SMs stream the head (one block per SM).
 extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_logits(
     const __nv_bfloat16 *__restrict__ hidden_all,  // [rows][5120]
     const __nv_bfloat16 *__restrict__ w,           // [vocab][5120], the rank's slice
@@ -263,10 +265,7 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_logits(
     const uint32_t warp = t >> 5;
     const uint32_t per = OD_HIDDEN / 8u;
     const uint4 *hidden4 = reinterpret_cast<const uint4 *>(hidden_all);
-    const uint32_t base = blockIdx.x * OD_LM_CHUNK;
-    for (uint32_t r = warp; r < OD_LM_CHUNK; r += OD_LM_WARPS) {
-        const uint32_t entry = base + r;
-        if (entry >= vocab) break;
+    for (uint32_t entry = blockIdx.x * OD_LM_WARPS + warp; entry < vocab; entry += gridDim.x * OD_LM_WARPS) {
         const uint4 *row = reinterpret_cast<const uint4 *>(w + (uint64_t)entry * OD_HIDDEN);
         uint4 wv[20];
 #pragma unroll
@@ -322,7 +321,8 @@ __device__ __forceinline__ float od_dot16_fp8(uint4 w, uint4 h0, uint4 h1) {
     return acc;
 }
 
-// opt_draft_logits over the E4M3 copy: lane l reads 16-byte chunks l + 32 i (K-block chunk / 2).
+// opt_draft_logits over the E4M3 copy (the same entry walk): lane l reads 16-byte chunks l + 32 i
+// (K-block chunk / 2).
 extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_logits_fp8(
     const __nv_bfloat16 *__restrict__ hidden_all,  // [rows][5120]
     const uint8_t *__restrict__ codes,             // [vocab][5120]
@@ -336,10 +336,7 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_logits_fp8
     const uint32_t warp = t >> 5;
     const uint32_t per = OD_HIDDEN / 8u;
     const uint4 *hidden4 = reinterpret_cast<const uint4 *>(hidden_all);
-    const uint32_t base = blockIdx.x * OD_LM_CHUNK;
-    for (uint32_t r = warp; r < OD_LM_CHUNK; r += OD_LM_WARPS) {
-        const uint32_t entry = base + r;
-        if (entry >= vocab) break;
+    for (uint32_t entry = blockIdx.x * OD_LM_WARPS + warp; entry < vocab; entry += gridDim.x * OD_LM_WARPS) {
         const uint4 *row = reinterpret_cast<const uint4 *>(codes + (uint64_t)entry * OD_HIDDEN);
         const uint8_t *srow = scales + (uint64_t)entry * (OD_HIDDEN / 32u);
         uint4 wv[10];
@@ -367,7 +364,9 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_logits_fp8
 
 // Draft step i: logit(v) = logits_all[i][v] + markov_head[v] . markov_embed[ids[i]] over the rank's
 // slice (markov_head already offset to the slice's first row), block maxima over 1024 entries, ties
-// to the lower index (the reference's argmax).
+// to the lower index (the reference's argmax). With inv_t != 0 the value is logit * inv_t plus the
+// serving sampler's noise at the position the step drafts (pos0 + step), opt_rows_lm_head's rule,
+// so the draft is a sample under the same noise the verify head will use.
 extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov(
     const float *__restrict__ logits_all,          // [rows][vocab]
     const uint32_t *__restrict__ ids,              // [block + 1] global ids
@@ -377,7 +376,11 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov(
     float *__restrict__ block_max,                 // [chunks]
     uint32_t *__restrict__ block_arg,              // [chunks], slice-local index
     const uint32_t vocab,
-    float *__restrict__ block_sum) {               // [chunks], sum of exp(logit - block_max)
+    float *__restrict__ block_sum,                 // [chunks], sum of exp(logit - block_max)
+    const float inv_t,
+    const uint64_t seed,
+    const uint32_t pos0,
+    const uint32_t id_base) {
     OPT_PDL_ENTRY();
     __shared__ float s_best[OD_LM_WARPS];
     __shared__ float s_sum[OD_LM_WARPS];
@@ -397,7 +400,9 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov(
         if (entry >= vocab) break;
         const uint4 h = od_ldw(reinterpret_cast<const uint4 *>(markov_head + (uint64_t)entry * OD_MARKOV_RANK) + lane);
         const float bias = od_warp_sum(od_dot8(h, e, 0.0f));
-        const float value = logits[entry] + bias;
+        const float logit = logits[entry] + bias;
+        const float value =
+            inv_t == 0.0f ? logit : fmaf(logit, inv_t, opt_sample_gumbel(seed, pos0 + step, id_base + entry));
         if (best_i == 0xffffffffu) {
             best = value; best_i = entry; sum = 1.0f;
         } else if (value > best) {

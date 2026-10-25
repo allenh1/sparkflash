@@ -791,6 +791,43 @@ impl RunReduce {
         Ok(())
     }
 
+    /// [Self::exchange_bf16] as one in-place ring AllGather: the same bits land in the same slots
+    /// (nothing is summed), at the ring's bandwidth instead of 3 point-to-point sends of the whole
+    /// slot. For large slots, where the sends crawl; a decode row keeps the one-hop exchange.
+    ///
+    /// # Safety
+    /// Same contract as exchange_bf16; `send` is `gather + rank * count * 2`.
+    ///
+    /// # Errors
+    /// NcclError::Config for a zero or overflowing count, NcclError::Call when NCCL refuses it.
+    pub unsafe fn gather_bf16(
+        &mut self,
+        send: u64,
+        gather: u64,
+        count: usize,
+        stream: u64,
+    ) -> Result<(), NcclError> {
+        let bytes = payload_bytes(count)?;
+        if send != gather + (self.rank * count * 2) as u64 {
+            return Err(NcclError::Config(format!(
+                "the in-place gather sends rank {}'s slot, not {send:#x} of {gather:#x}",
+                self.rank
+            )));
+        }
+        // SAFETY: the caller upholds the pointer, device and stream contract documented above.
+        unsafe {
+            self.api.enqueue_all_gather_bf16(
+                self.comm,
+                send as *const c_void,
+                gather as *mut c_void,
+                count,
+                stream as CudaStream,
+            )?;
+        }
+        self.stats.record(bytes);
+        Ok(())
+    }
+
     /// Whether the one-shot exchange is available (the library exports ncclSend and ncclRecv).
     #[must_use]
     pub fn has_exchange(&self) -> bool {

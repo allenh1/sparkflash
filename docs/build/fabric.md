@@ -94,6 +94,17 @@ unavailable arm is a **typed refusal**, never a silent fallback.
   single-rail mode the counter gate asserts rail 1 == 0 and prints that the run is not
   dual-rail evidence.
 
+- **NCCL on both functions** (S6, 2026-10-24): `NCCL_IB_HCA=roceP2p1s0f1,rocep1s0f1
+  NCCL_IB_GID_INDEX=1`. With the IPv4 GID (index 3) the run hangs at the first collective: another
+  host on the LAN (`d8:d6:68:cc:79:1c`) answers ARP for `192.0.2.80`, node0's rail-1 address, so
+  node1, node3 and the Mac all hold that MAC for `.80` and node0's rail-1 RoCE traffic goes to the
+  wrong host. Index 1 is the RoCE v2 GID of the IPv6 link-local address, whose MAC the RDMA core
+  derives from the GID itself (no ARP), so both functions connect with no system change. Each
+  PCIe function caps NCCL at ~12 GB/s (its P2C path); both give a 24 GB/s topology bandwidth and a
+  measured ~22 GB/s bus bandwidth for the bulk prefill's 21-42 MB all-reduces (2.6 -> 1.5 ms at
+  2K rows), with decode unchanged (chat-ref 59.3-59.7 tok/s). Fixing the address collision would
+  let index 3 work too; that is a LAN change, not one this project makes.
+
 Dual rail is **our** gate requirement (aggregate >= 180 Gbps, QUALIFICATION 3.3), not a
 description of the deployed reference: vLLM's recipe sets `NCCL_IB_HCA=rocep1s0f1`,
 `NCCL_SOCKET_IFNAME=enp1s0f1np1`, `NCCL_IB_GID_INDEX=3` — one rail (D29). No document may

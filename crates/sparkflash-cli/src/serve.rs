@@ -151,6 +151,11 @@ use sparkflash_kv::PrefixMatchPlan;
 use sparkflash_scheduler::config::SchedulerConfig;
 use sparkflash_scheduler::prefill::ChunkedPrefillPlan;
 
+#[cfg(feature = "tp4-serve")]
+mod device;
+#[cfg(feature = "tp4-serve")]
+pub use device::DeviceServeOptions;
+
 /// The index file a sharded safetensors checkpoint is described by.
 const CHECKPOINT_INDEX_NAME: &str = "model.safetensors.index.json";
 
@@ -382,6 +387,8 @@ pub struct Tp4ServeOptions {
     pub base_port: u16,
     /// Rank 0 binds the serve-owned control channel here; workers connect to it.
     pub control_port: u16,
+    /// The device forward with DSpark (`--tp4-device`) instead of the host twin.
+    pub device: Option<DeviceServeOptions>,
 }
 
 #[cfg(feature = "tp4-serve")]
@@ -492,6 +499,7 @@ impl Tp4ServeOptions {
             peers,
             base_port,
             control_port,
+            device: None,
         }))
     }
 }
@@ -719,17 +727,27 @@ impl ServeOptions {
             );
         }
         #[cfg(feature = "tp4-serve")]
-        let tp4 = Tp4ServeOptions::from_cli(
-            cli.tp4_rank,
-            cli.tp4_world_size,
-            cli.tp4_peers.as_deref(),
-            cli.tp4_base_port,
-            cli.tp4_control_port,
-            cli.synthetic,
-            checkpoint.as_deref(),
-            cli.engine,
-            cli.device_cubin.as_deref(),
-        )?;
+        let tp4 = {
+            let mut tp4 = Tp4ServeOptions::from_cli(
+                cli.tp4_rank,
+                cli.tp4_world_size,
+                cli.tp4_peers.as_deref(),
+                cli.tp4_base_port,
+                cli.tp4_control_port,
+                cli.synthetic,
+                checkpoint.as_deref(),
+                cli.engine,
+                cli.device_cubin.as_deref(),
+            )?;
+            if let Some(tp4) = tp4.as_mut() {
+                tp4.device = DeviceServeOptions::from_cli(
+                    cli.tp4_device,
+                    cli.max_model_len,
+                    cli.tp4_evidence_dir,
+                )?;
+            }
+            tp4
+        };
         if cli.device_token_derived_claim && cli.device_token_dir.is_none() {
             return Err(
                 "--device-token-derived-claim needs --device-token-dir: the flag only changes how a recorded window's claim is established"
@@ -987,6 +1005,22 @@ struct ServeArgs {
     #[cfg(feature = "tp4-serve")]
     #[arg(long, value_name = "PORT")]
     tp4_control_port: Option<u16>,
+    /// Serve the device forward with DSpark speculative decoding from these kernel cubins.
+    ///
+    /// Every rank runs the `tp4-chain` device epoch (NCCL over the RoCE rail, the resident arena,
+    /// the on-device drafter) and serves one request at a time through it; requests queue behind
+    /// the one on the device. Without the flag the TP=4 group is the host twin.
+    #[cfg(feature = "tp4-serve")]
+    #[arg(long, value_name = "DIR", requires = "tp4_rank")]
+    tp4_device: Option<PathBuf>,
+    /// The longest prompt plus completion the device path serves; default and ceiling 65520.
+    #[cfg(feature = "tp4-serve")]
+    #[arg(long, value_name = "N", requires = "tp4_device")]
+    max_model_len: Option<usize>,
+    /// Where each rank's device epoch writes its bind evidence; default the current directory.
+    #[cfg(feature = "tp4-serve")]
+    #[arg(long, value_name = "DIR", requires = "tp4_device")]
+    tp4_evidence_dir: Option<PathBuf>,
 }
 
 /// What the engine thread builds: a configuration, where its weights come from, and the tokenizer.
@@ -1856,10 +1890,16 @@ fn cluster_snapshot() -> ClusterStatsSnapshot {
 // detokenize and never sample: they receive the prompt ids once per request and the sampled token
 // ids one per step, and each runs the same forward step on its own SequenceState.
 
-/// The largest control frame accepted: a prompt id list and a small error message fit far below
-/// this. A frame larger than this is a protocol error, not an allocation request.
+/// The largest control frame accepted: a device tick's prompt id lists (rank 0 stops admitting at
+/// [`TP4_TICK_PROMPT_IDS`] ids) and a small error message fit below this. A frame larger than this
+/// is a protocol error, not an allocation request.
 #[cfg(feature = "tp4-serve")]
-const TP4_CONTROL_MAX_FRAME: usize = 1 << 20;
+const TP4_CONTROL_MAX_FRAME: usize = 8 << 20;
+
+/// The prompt ids one device tick's admissions carry at most (about 7 bytes each in JSON): a
+/// request past this joins at the next tick.
+#[cfg(feature = "tp4-serve")]
+pub(crate) const TP4_TICK_PROMPT_IDS: usize = 768 << 10;
 
 /// One message on the serve-owned control channel.
 #[cfg(feature = "tp4-serve")]
@@ -1891,6 +1931,14 @@ pub enum Tp4ControlFrame {
         /// The token rank 0 sampled; workers must not sample their own.
         token_id: u32,
     },
+    /// Rank 0 -> every worker, before each device scheduler tick: the requests that join and
+    /// the sequences that end there (a stop string matched, or the client left).
+    DeviceTick {
+        /// The new requests, in arrival order.
+        admit: Vec<Tp4DeviceAdmit>,
+        /// The sequence ids that end before the tick runs.
+        cancel: Vec<u64>,
+    },
     /// The request ended normally; every worker leaves the request loop.
     End,
     /// The request or the group failed; every worker leaves the process.
@@ -1911,10 +1959,33 @@ impl Tp4ControlFrame {
             Self::Ready => "Ready",
             Self::Request { .. } => "Request",
             Self::Token { .. } => "Token",
+            Self::DeviceTick { .. } => "DeviceTick",
             Self::End => "End",
             Self::Error { .. } => "Error",
         }
     }
+}
+
+/// One request on the device path, with its sampler, as a device tick admits it.
+#[cfg(feature = "tp4-serve")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tp4DeviceAdmit {
+    /// The sequence id rank 0 gave the request: later ticks cancel it by this id.
+    pub seq: u64,
+    /// The tokens rank 0 rendered (the chat template is already applied).
+    pub prompt_ids: Vec<u32>,
+    /// The request's clamped generation budget.
+    pub max_tokens: u32,
+    /// The temperature's f32 bits (0 is greedy); bits keep the frame `Eq`.
+    pub temperature_bits: u32,
+    /// The nucleus threshold's f32 bits.
+    pub top_p_bits: u32,
+    /// The candidate count (0 keeps every token).
+    pub top_k: u32,
+    /// The sampler seed every rank draws its noise from.
+    pub seed: u64,
+    /// The ids that end the request once emitted.
+    pub stop_ids: Vec<u32>,
 }
 
 /// A typed control-channel refusal or transport failure.
@@ -2034,8 +2105,12 @@ fn write_control_frame(
     let length = u32::try_from(payload.len()).map_err(|_| Tp4ControlError::FrameTooLarge {
         bytes: payload.len(),
     })?;
-    stream.write_all(&length.to_be_bytes())?;
-    stream.write_all(&payload)?;
+    // One write per frame: with TCP_NODELAY a frame is one segment, not a header the peer
+    // waits on while the payload sits behind Nagle.
+    let mut bytes = Vec::with_capacity(4 + payload.len());
+    bytes.extend_from_slice(&length.to_be_bytes());
+    bytes.extend_from_slice(&payload);
+    stream.write_all(&bytes)?;
     stream.flush()?;
     Ok(())
 }
@@ -2098,6 +2173,7 @@ impl Tp4ControlHub {
             match listener.accept() {
                 Ok((mut stream, _peer)) => {
                     stream.set_nonblocking(false)?;
+                    stream.set_nodelay(true)?;
                     stream.set_read_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
                     stream.set_write_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
                     let frame = read_control_frame(&mut stream)?;
@@ -2205,6 +2281,7 @@ impl Tp4ControlWorker {
                 }
             }
         };
+        stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
         stream.set_write_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
         Ok(Self {
@@ -4843,6 +4920,9 @@ fn default_tokenizer() -> Result<PathBuf, String> {
 #[cfg(feature = "tp4-serve")]
 fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
     crate::bootlog::init();
+    if let Some(device) = tp4.device.as_ref() {
+        return device::run(options, &tp4, device);
+    }
     if tp4.rank != 0 {
         return match tp4_worker(options, &tp4) {
             Ok(()) => ExitCode::SUCCESS,

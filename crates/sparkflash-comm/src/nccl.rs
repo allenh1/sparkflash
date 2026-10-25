@@ -999,6 +999,42 @@ impl NcclApi {
         }
     }
 
+    /// Enqueues one bf16 AllGather of `send_count` values per rank on a raw communicator handle.
+    ///
+    /// # Safety
+    /// The handle must be live; send must point to at least send_count bf16 values and recv to
+    /// send_count * world writable bf16 values in NCCL-accessible memory (send may be recv's own
+    /// slot, NCCL's in-place form); stream must be a valid CUDA stream on that device or NULL.
+    ///
+    /// # Errors
+    /// Returns NcclError::Call when NCCL refuses the enqueue.
+    pub(crate) unsafe fn enqueue_all_gather_bf16(
+        &self,
+        handle: NcclCommHandle,
+        send: *const c_void,
+        recv: *mut c_void,
+        send_count: usize,
+        stream: CudaStream,
+    ) -> Result<(), NcclError> {
+        // SAFETY: the caller upholds the handle, pointer and stream contract documented above.
+        let result = unsafe {
+            let function: AllGatherFn = std::mem::transmute(self.raw.all_gather);
+            function(
+                send,
+                recv,
+                send_count,
+                NcclDataType::Bfloat16 as c_int,
+                handle,
+                stream,
+            )
+        };
+        if result == NCCL_SUCCESS {
+            Ok(())
+        } else {
+            Err(self.call_error("ncclAllGather", result))
+        }
+    }
+
     /// Enqueues a bf16 send of `count` values to `peer` on a raw communicator handle.
     ///
     /// # Safety

@@ -12,6 +12,7 @@ pub mod chain_timing;
 pub mod convert;
 pub mod device_chain;
 pub mod device_counters;
+pub mod device_link;
 pub mod doctor;
 pub mod engram_device_state;
 pub mod layer_attention_stages;

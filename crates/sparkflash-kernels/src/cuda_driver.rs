@@ -2767,6 +2767,166 @@ impl Cuda {
         }
     }
 
+    /// The device's pinned allocation property for the virtual memory calls: device memory on this
+    /// context's device, no export handle (CUmemAllocationProp, 32 bytes).
+    fn vmm_prop(&self) -> [u8; 32] {
+        let mut prop = [0u8; 32];
+        prop[0..4].copy_from_slice(&1i32.to_le_bytes()); // CU_MEM_ALLOCATION_TYPE_PINNED
+        prop[8..12].copy_from_slice(&1i32.to_le_bytes()); // CU_MEM_LOCATION_TYPE_DEVICE
+        prop[12..16].copy_from_slice(&self.dev.to_le_bytes());
+        prop
+    }
+
+    /// The minimum granularity of a physical allocation and of a mapping (2 MiB on GB10), or None
+    /// when the device has no virtual memory management.
+    #[must_use]
+    pub fn vmm_granularity(&self) -> Option<usize> {
+        let prop = self.vmm_prop();
+        let get: libloading::Symbol<unsafe extern "C" fn(*mut usize, *const u8, i32) -> CuResult> =
+            self.sym(b"cuMemGetAllocationGranularity").ok()?;
+        let mut granularity = 0usize;
+        // SAFETY: prop is a CUmemAllocationProp image and the out pointer is a live usize.
+        let r = unsafe { get(&mut granularity, prop.as_ptr(), 0) };
+        (r == 0 && granularity > 0).then_some(granularity)
+    }
+
+    /// Reserves `bytes` of device virtual address space (a multiple of the granularity) with no
+    /// memory behind it: [Cuda::vmm_map] backs parts of it.
+    ///
+    /// # Errors
+    /// The driver's cuMemAddressReserve failure code.
+    pub fn vmm_reserve(&self, bytes: usize) -> Result<Deviceptr, String> {
+        let reserve: libloading::Symbol<
+            unsafe extern "C" fn(*mut CuDeviceptr, usize, usize, CuDeviceptr, u64) -> CuResult,
+        > = self.sym(b"cuMemAddressReserve")?;
+        let mut base: CuDeviceptr = 0;
+        // SAFETY: the out pointer is a live u64; no fixed address and no flags are requested.
+        let r = unsafe { reserve(&mut base, bytes, 0, 0, 0) };
+        if r != 0 {
+            return Err(format!("cuMemAddressReserve({bytes}) failed: {}", name(r)));
+        }
+        Ok(Deviceptr(base))
+    }
+
+    /// Returns a range [Cuda::vmm_reserve] reserved; every mapping in it must be gone.
+    pub fn vmm_free(&self, base: Deviceptr, bytes: usize) {
+        if let Ok(free) =
+            self.sym::<unsafe extern "C" fn(CuDeviceptr, usize) -> CuResult>(b"cuMemAddressFree")
+        {
+            // SAFETY: base and bytes are a reservation this handle made.
+            let _ = unsafe { free(base.0, bytes) };
+        }
+    }
+
+    /// Creates `bytes` (a multiple of the granularity) of physical device memory and returns its
+    /// handle, mapped nowhere yet.
+    ///
+    /// # Errors
+    /// The driver's cuMemCreate failure code (OUT_OF_MEMORY when the device is full).
+    pub fn vmm_create(&self, bytes: usize) -> Result<u64, String> {
+        let prop = self.vmm_prop();
+        let create: libloading::Symbol<
+            unsafe extern "C" fn(*mut u64, usize, *const u8, u64) -> CuResult,
+        > = self.sym(b"cuMemCreate")?;
+        let mut handle = 0u64;
+        // SAFETY: prop is a CUmemAllocationProp image and the out pointer is a live u64.
+        let r = unsafe { create(&mut handle, bytes, prop.as_ptr(), 0) };
+        if r != 0 {
+            return Err(format!("cuMemCreate({bytes}) failed: {}", name(r)));
+        }
+        note_alloc();
+        Ok(handle)
+    }
+
+    /// Releases a physical allocation [Cuda::vmm_create] made; its memory is freed once no
+    /// mapping refers to it.
+    pub fn vmm_release(&self, handle: u64) {
+        if let Ok(release) = self.sym::<unsafe extern "C" fn(u64) -> CuResult>(b"cuMemRelease") {
+            // SAFETY: handle came from cuMemCreate on this context.
+            let _ = unsafe { release(handle) };
+            note_free(1);
+        }
+    }
+
+    /// Maps the physical allocation `handle` (`bytes` long) at `at` inside a reservation and makes
+    /// it readable and writable by this device.
+    ///
+    /// # Errors
+    /// The driver's cuMemMap or cuMemSetAccess failure code.
+    pub fn vmm_map(&self, at: Deviceptr, bytes: usize, handle: u64) -> Result<(), String> {
+        let map: libloading::Symbol<
+            unsafe extern "C" fn(CuDeviceptr, usize, usize, u64, u64) -> CuResult,
+        > = self.sym(b"cuMemMap")?;
+        let access: libloading::Symbol<
+            unsafe extern "C" fn(CuDeviceptr, usize, *const u8, usize) -> CuResult,
+        > = self.sym(b"cuMemSetAccess")?;
+        // SAFETY: at..at+bytes lies in a reservation this handle made and handle is a live
+        // physical allocation of bytes.
+        let r = unsafe { map(at.0, bytes, 0, handle, 0) };
+        if r != 0 {
+            return Err(format!(
+                "cuMemMap({bytes} at {:#x}) failed: {}",
+                at.0,
+                name(r)
+            ));
+        }
+        // CUmemAccessDesc: the device location, then CU_MEM_ACCESS_FLAGS_PROT_READWRITE.
+        let mut desc = [0u8; 12];
+        desc[0..4].copy_from_slice(&1i32.to_le_bytes());
+        desc[4..8].copy_from_slice(&self.dev.to_le_bytes());
+        desc[8..12].copy_from_slice(&3i32.to_le_bytes());
+        // SAFETY: the range was just mapped and desc is one CUmemAccessDesc image.
+        let r = unsafe { access(at.0, bytes, desc.as_ptr(), 1) };
+        if r != 0 {
+            return Err(format!(
+                "cuMemSetAccess({bytes} at {:#x}) failed: {}",
+                at.0,
+                name(r)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Unmaps `bytes` at `at` (a range [Cuda::vmm_map] mapped). Nothing queued may still read it.
+    ///
+    /// # Errors
+    /// The driver's cuMemUnmap failure code.
+    pub fn vmm_unmap(&self, at: Deviceptr, bytes: usize) -> Result<(), String> {
+        let unmap: libloading::Symbol<unsafe extern "C" fn(CuDeviceptr, usize) -> CuResult> =
+            self.sym(b"cuMemUnmap")?;
+        // SAFETY: the range is one this handle mapped.
+        let r = unsafe { unmap(at.0, bytes) };
+        if r != 0 {
+            return Err(format!(
+                "cuMemUnmap({bytes} at {:#x}) failed: {}",
+                at.0,
+                name(r)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Queues `bytes` bytes of `value` at `dst` on the default stream.
+    ///
+    /// # Errors
+    /// The driver's cuMemsetD8Async failure code.
+    pub fn memset_d8_async(&self, dst: Deviceptr, value: u8, bytes: usize) -> Result<(), String> {
+        if let Some(refusal) = self.graph_refusal(SegmentOp::Copy) {
+            return Err(refusal.to_string());
+        }
+        let set: libloading::Symbol<
+            unsafe extern "C" fn(CuDeviceptr, u8, usize, *mut c_void) -> CuResult,
+        > = self.sym(b"cuMemsetD8Async")?;
+        // SAFETY: dst..dst+bytes is device memory this process owns; the null stream is the
+        // default stream the launches use.
+        let r = unsafe { set(dst.0, value, bytes, std::ptr::null_mut()) };
+        if r != 0 {
+            return Err(format!("cuMemsetD8Async({bytes}) failed: {}", name(r)));
+        }
+        self.issued.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Copies host bytes to a device allocation.
     pub fn copy_htod(&self, dst: &Deviceptr, src: &[u8]) -> Result<(), String> {
         if let Some(refusal) = self.graph_refusal(SegmentOp::Copy) {

@@ -911,8 +911,13 @@ fn metrics_report_the_ops_families_the_driver_feeds() {
         assert_eq!(response.status, 200, "log: {}", serial.log());
         assert_eq!(response.json()["usage"]["completion_tokens"], max_tokens);
     }
-    // Two requests generated 4 + 3 tokens and each produced exactly one TTFT sample.
-    let metrics = metrics_text(&serial);
+    // Two requests generated 4 + 3 tokens and each produced exactly one TTFT sample. The worker
+    // leaves the running gauge just after it sends the final reply, so the gauge is waited for.
+    let metrics = wait_for_metrics(
+        &serial,
+        &[("sparkflash_num_requests_running", 0.0)],
+        GAUGE_POLL_TIMEOUT,
+    );
     assert_eq!(
         metric_value(&metrics, "sparkflash_requests_total"),
         2.0,
@@ -1017,7 +1022,11 @@ fn metrics_report_the_ops_families_the_driver_feeds() {
         queued.join().expect("the queued client finishes").status,
         200
     );
-    let after = metrics_text(&serial);
+    let after = wait_for_metrics(
+        &serial,
+        &[("sparkflash_num_requests_running", 0.0)],
+        GAUGE_POLL_TIMEOUT,
+    );
     assert_eq!(
         metric_value(&after, "sparkflash_num_requests_running"),
         0.0,
@@ -1089,7 +1098,11 @@ fn batched_metrics_report_two_running_requests_and_one_waiting_slot() {
             batched.log()
         );
     }
-    let after = metrics_text(&batched);
+    let after = wait_for_metrics(
+        &batched,
+        &[("sparkflash_num_requests_running", 0.0)],
+        GAUGE_POLL_TIMEOUT,
+    );
     assert_eq!(
         metric_value(&after, "sparkflash_num_requests_running"),
         0.0,

@@ -11,6 +11,7 @@
 #include <stdint.h>
 
 #include "m4_common_sm121.cuh"
+#include "m4_activation_quant_sm121.cuh"
 
 extern "C" __global__ void opt_rope_heads_bf16(
     __nv_bfloat16 *__restrict__ rows,   // [tokens][heads][head_width], rotated in place
@@ -416,4 +417,187 @@ extern "C" __global__ void __launch_bounds__(256) opt_sum_ranks_bf16(
     }
     const __nv_bfloat162 o = __floats2bfloat162_rn(a, b);
     reinterpret_cast<uint32_t *>(out)[p] = *reinterpret_cast<const uint32_t *>(&o);
+}
+
+// opt_pool_rows: pool_group_f32 over a chunk's completed compressor groups at once. Group i pools
+//   rows i * ratio .. i * ratio + ratio - 1 of kv / score ([rows][head_dim] f32) into dest[i]; the
+//   arithmetic per element is pool_group_f32's (the max, the ascending exp sum, the ascending
+//   weighted sum with a division per row). Grid (ceil(head_dim / 128), groups), 128 threads.
+extern "C" __global__ void __launch_bounds__(128) opt_pool_rows(
+    const float *__restrict__ kv, const float *__restrict__ score, float *__restrict__ dest,
+    const uint32_t ratio, const uint32_t head_dim) {
+    OPT_PDL_ENTRY();
+    const uint32_t element = blockIdx.x * blockDim.x + threadIdx.x;
+    if (element >= head_dim) return;
+    const uint64_t base = (uint64_t)blockIdx.y * ratio * head_dim;
+    kv += base;
+    score += base;
+    float *out = dest + (uint64_t)blockIdx.y * head_dim;
+    float max = -__builtin_huge_valf();
+    for (uint32_t row = 0; row < ratio; ++row) max = fmaxf(max, score[(uint64_t)row * head_dim + element]);
+    if (!isfinite(max)) {
+        out[element] = 0.0f;
+        return;
+    }
+    float total = 0.0f;
+    float acc = 0.0f;
+    for (uint32_t row = 0; row < ratio; ++row) total += expf(score[(uint64_t)row * head_dim + element] - max);
+    for (uint32_t row = 0; row < ratio; ++row) {
+        const float weight = expf(score[(uint64_t)row * head_dim + element] - max);
+        const float normalised = total > 0.0f ? weight / total : 0.0f;
+        acc += normalised * kv[(uint64_t)row * head_dim + element];
+    }
+    out[element] = acc;
+}
+
+// opt_k_norm_rows: k_norm_f32_to_bf16 over `rows` key rows, one thread per row with that kernel's
+//   sequential sums, so every row is bit-identical to the single-row launch. Grid ceil(rows / 128).
+extern "C" __global__ void __launch_bounds__(128) opt_k_norm_rows(
+    const float *__restrict__ x, const __nv_bfloat16 *__restrict__ weight,
+    __nv_bfloat16 *__restrict__ out, const uint32_t cols, const float eps, const uint32_t rows) {
+    OPT_PDL_ENTRY();
+    const uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows || cols == 0u) return;
+    const float *xr = x + (uint64_t)r * cols;
+    __nv_bfloat16 *o = out + (uint64_t)r * cols;
+    float sum = 0.0f;
+    for (uint32_t c = 0u; c < cols; ++c) sum = __fadd_rn(sum, __fmul_rn(xr[c], xr[c]));
+    const float mean = __fdiv_rn(sum, static_cast<float>(cols));
+    const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(mean, eps)));
+    for (uint32_t c = 0u; c < cols; ++c) o[c] = __float2bfloat16_rn(__fmul_rn(__fmul_rn(xr[c], inv), __bfloat162float(weight[c])));
+}
+
+// opt_bulk_engram_embed: engram_embed_sm121 over a chunk's rows at once. Row r's arena entry is
+//   entries + r * stride (its scales at + scales_at); a thread re-quantises one 32-value block, which
+//   shares one source scale, with that kernel's arithmetic, so every row is bit-identical to the
+//   single-row launch. Grid (rows), 256 threads.
+extern "C" __global__ void __launch_bounds__(256) opt_bulk_engram_embed(
+    const uint8_t *__restrict__ entries, const uint64_t stride, const uint64_t scales_at,
+    uint8_t *__restrict__ act_codes, uint8_t *__restrict__ act_scales, const uint32_t inner) {
+    OPT_PDL_ENTRY();
+    const uint32_t blocks = inner / SPARK_M4_QUANT_BLOCK;
+    const uint8_t *codes = entries + (uint64_t)blockIdx.x * stride;
+    const uint8_t *scales = codes + scales_at;
+    uint8_t *out_codes = act_codes + (uint64_t)blockIdx.x * inner;
+    uint8_t *out_scales = act_scales + (uint64_t)blockIdx.x * blocks;
+    for (uint32_t block = threadIdx.x; block < blocks; block += blockDim.x) {
+        const uint4 *src = reinterpret_cast<const uint4 *>(codes + block * SPARK_M4_QUANT_BLOCK);
+        uint4 raw[2] = {__ldg(src), __ldg(src + 1)};
+        const uint8_t *in = reinterpret_cast<const uint8_t *>(raw);
+        const float source_scale = spark_ue8m0_decode(__ldg(scales + block));
+        float values[SPARK_M4_QUANT_BLOCK];
+        float amax = 0.0f;
+#pragma unroll
+        for (uint32_t i = 0; i < SPARK_M4_QUANT_BLOCK; ++i) {
+            const float value = __bfloat162float(
+                __float2bfloat16_rn(__fmul_rn(spark_fp8_e4m3_decode(in[i]), source_scale)));
+            values[i] = value;
+            const float magnitude = value < 0.0f ? -value : value;
+            amax = magnitude > amax ? magnitude : amax;
+        }
+        const uint8_t scale_code = spark_act_quant_scale_code(amax);
+        out_scales[block] = scale_code;
+        const float scale = spark_ue8m0_decode(scale_code);
+        uint4 packed[2];
+        uint8_t *out = reinterpret_cast<uint8_t *>(packed);
+#pragma unroll
+        for (uint32_t i = 0; i < SPARK_M4_QUANT_BLOCK; ++i) {
+            float scaled = __fdiv_rn(values[i], scale);
+            if (scaled > 448.0f) {
+                scaled = 448.0f;
+            }
+            if (scaled < -448.0f) {
+                scaled = -448.0f;
+            }
+            out[i] = spark_fp8_e4m3_encode(scaled);
+        }
+        uint4 *dst = reinterpret_cast<uint4 *>(out_codes + block * SPARK_M4_QUANT_BLOCK);
+        dst[0] = packed[0];
+        dst[1] = packed[1];
+    }
+}
+
+// opt_bulk_engram_post: the Engram stage after the wkv over a chunk's rows at once: the narrow,
+//   opt_engram_gate_write's gates, the widen and engram_write_bf16 of every row in one launch. Row
+//   r's stream ([hc][dim] f32) becomes bf16(stream + gate[c] * value), its kv row at kv_all + r *
+//   kv_stride (key [hc][dim] then value [dim], bf16); a row with live[r] == 0 is left alone. The
+//   sums are block trees over the 256 threads (not the single-row launch's 8-warp order), so a gate
+//   can differ from it in the last bits. Grid (rows), 256 threads; hc <= 4, dim even.
+extern "C" __global__ void __launch_bounds__(256) opt_bulk_engram_post(
+    float *__restrict__ stream_all, const __nv_bfloat16 *__restrict__ kv_all,
+    const float *__restrict__ product, const uint8_t *__restrict__ live, const uint32_t dim,
+    const uint32_t hc, const float eps, const uint32_t kv_stride) {
+    OPT_PDL_ENTRY();
+    const uint32_t row = blockIdx.x;
+    if (live[row] == 0u || hc > 4u) return;
+    __shared__ float s_part[4][3][8];
+    __shared__ float s_gate[4];
+    const uint32_t t = threadIdx.x;
+    const uint32_t pairs = dim >> 1u;
+    float *stream = stream_all + (uint64_t)row * hc * dim;
+    const __nv_bfloat16 *kv = kv_all + (uint64_t)row * kv_stride;
+    for (uint32_t copy = 0u; copy < hc; ++copy) {
+        const float2 *s2 = reinterpret_cast<const float2 *>(stream + (uint64_t)copy * dim);
+        const uint32_t *k2 = reinterpret_cast<const uint32_t *>(kv + (uint64_t)copy * dim);
+        const float2 *p2 = reinterpret_cast<const float2 *>(product + (uint64_t)copy * dim);
+        float hs = 0.0f, ks = 0.0f, dot = 0.0f;
+        for (uint32_t p = t; p < pairs; p += 256u) {
+            const float2 sv = s2[p];
+            const uint32_t kw = __ldg(k2 + p);
+            const float2 pr = __ldg(p2 + p);
+            const float h0 = __bfloat162float(__float2bfloat16_rn(sv.x));
+            const float h1 = __bfloat162float(__float2bfloat16_rn(sv.y));
+            const float k0 = opt_m_bf16lo(kw), k1 = opt_m_bf16hi(kw);
+            hs = __fadd_rn(__fadd_rn(hs, __fmul_rn(h0, h0)), __fmul_rn(h1, h1));
+            ks = __fadd_rn(__fadd_rn(ks, __fmul_rn(k0, k0)), __fmul_rn(k1, k1));
+            dot = __fadd_rn(__fadd_rn(dot, __fmul_rn(__fmul_rn(h0, pr.x), k0)),
+                            __fmul_rn(__fmul_rn(h1, pr.y), k1));
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            hs = __fadd_rn(hs, __shfl_xor_sync(0xffffffffu, hs, o));
+            ks = __fadd_rn(ks, __shfl_xor_sync(0xffffffffu, ks, o));
+            dot = __fadd_rn(dot, __shfl_xor_sync(0xffffffffu, dot, o));
+        }
+        if ((t & 31u) == 0u) {
+            s_part[copy][0][t >> 5] = hs;
+            s_part[copy][1][t >> 5] = ks;
+            s_part[copy][2][t >> 5] = dot;
+        }
+    }
+    __syncthreads();
+    if (t < hc) {
+        float a = s_part[t][0][0], b = s_part[t][1][0], d = s_part[t][2][0];
+#pragma unroll
+        for (int w = 1; w < 8; ++w) {
+            a = __fadd_rn(a, s_part[t][0][w]);
+            b = __fadd_rn(b, s_part[t][1][w]);
+            d = __fadd_rn(d, s_part[t][2][w]);
+        }
+        const float dim_f = (float)dim;
+        const float stream_inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(a, dim_f), eps)));
+        const float key_inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(b, dim_f), eps)));
+        const float rstd = __fmul_rn(stream_inv, key_inv);
+        const float scale = __fdiv_rn(1.0f, __fsqrt_rn(dim_f));
+        const float scaled_dot = __fmul_rn(__fmul_rn(d, rstd), scale);
+        const float magnitude = fabsf(scaled_dot);
+        const float clamped = magnitude > 1.0e-6f ? magnitude : 1.0e-6f;
+        const float root = __fsqrt_rn(clamped);
+        const float signed_root = scaled_dot < 0.0f ? -root : root;
+        s_gate[t] = __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-signed_root)));
+    }
+    __syncthreads();
+    const uint32_t *v2 = reinterpret_cast<const uint32_t *>(kv + (uint64_t)hc * dim);
+    for (uint32_t copy = 0u; copy < hc; ++copy) {
+        const float gate = s_gate[copy];
+        float2 *s2 = reinterpret_cast<float2 *>(stream + (uint64_t)copy * dim);
+        for (uint32_t p = t; p < pairs; p += 256u) {
+            const float2 sv = s2[p];
+            const uint32_t vw = __ldg(v2 + p);
+            float2 o;
+            o.x = __bfloat162float(__float2bfloat16_rn(__fadd_rn(sv.x, __fmul_rn(gate, opt_m_bf16lo(vw)))));
+            o.y = __bfloat162float(__float2bfloat16_rn(__fadd_rn(sv.y, __fmul_rn(gate, opt_m_bf16hi(vw)))));
+            s2[p] = o;
+        }
+    }
 }

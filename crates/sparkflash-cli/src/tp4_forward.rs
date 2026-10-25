@@ -37,9 +37,18 @@ use crate::tp4_prefill::{StagedAttention, TwinStats};
 use crate::tp4_token::{REDUCE_CALLS_PER_STEP, StepMs, TokenEnvelope, Tokens};
 
 #[cfg(feature = "cuda")]
+mod batch;
+#[cfg(feature = "cuda")]
+mod bulk;
+#[cfg(feature = "cuda")]
 mod draft;
 #[cfg(feature = "cuda")]
+mod lanes;
+#[cfg(feature = "cuda")]
 mod rows;
+// Pure host code, built (and tested) without the device too; only the device path uses it.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+mod sample;
 #[cfg(feature = "cuda")]
 mod spec;
 
@@ -10987,6 +10996,10 @@ struct DeviceLayer<'a> {
     /// The run's position budget, which the rope spans are sized for; a position beyond it is a
     /// refusal at the stage, never a clamp.
     max_positions: usize,
+    /// The positions the single sequence's own cache, window ring, compressed stores and index
+    /// keys (and the drafter's rings) are allocated for: `max_positions`, or a token size when
+    /// lanes will hold every sequence's state instead.
+    pub(super) sequence_rows: usize,
     /// How many f32 values one table has per position (rope_head_dim / 2).
     rope_pairs: u32,
     /// The rope tail width (config.rope_head_dim, 64 released).
@@ -11011,7 +11024,7 @@ struct DeviceLayer<'a> {
         sparkflash_kernels::cuda_driver::Module,
         sparkflash_kernels::cuda_driver::Kernel,
     ),
-    /// The cache's physical ring rows (== max_positions): the append writes slot position % rows.
+    /// The cache's physical ring rows (== sequence_rows): the append writes slot position % rows.
     capacity_rows: usize,
     /// How many positions `begin_position` has accepted: it must start at 0 and stay contiguous,
     /// because the cache has no prefill path.
@@ -11114,13 +11127,8 @@ struct DeviceLayer<'a> {
         sparkflash_kernels::cuda_driver::Deviceptr,
     )>,
     /// The indexer select (opt_select_sm121.cubin): a grid-wide score pass then the one-block
-    /// select over the scores, unless SPARKFLASH_OPT_SELECT=0. (module, scores, select_pre, buffer)
-    opt_select: Option<(
-        sparkflash_kernels::cuda_driver::Module,
-        sparkflash_kernels::cuda_driver::Kernel,
-        sparkflash_kernels::cuda_driver::Kernel,
-        sparkflash_kernels::cuda_driver::Deviceptr,
-    )>,
+    /// select over the scores, unless SPARKFLASH_OPT_SELECT=0.
+    opt_select: Option<OptSelect>,
     /// The routed stage's run-scope state: the expert pointer table and the staging buffers.
     /// `attach_moe_routed` builds it once, after `attach_routed` has resolved the arena pointers.
     moe_routed_device: Option<sparkflash_kernels::moe_routed_device::MoeRoutedDevice>,
@@ -11212,6 +11220,18 @@ struct DeviceLayer<'a> {
     /// metadata *is* the stage's whole output (`attention.rs:2109-2151`: ratio 0 returns the
     /// window, empty ids and empty rows).
     attn_window: AttentionWindow,
+    /// The sequences' lanes when the run serves several at once (`attach_lanes`): the window
+    /// ring, compressor rings, stores and index keys above are then the selected lane's.
+    #[cfg(feature = "cuda")]
+    lanes: Option<Box<lanes::Lanes<'a>>>,
+    /// The selected lane's drafter stage rings, in place of the drafter's own.
+    draft_rings: Option<[(u64, u64); 3]>,
+    /// The bf16 cache was freed (the lanes hold the history): the rows step writes no cache row
+    /// and the M = 1 path refuses.
+    kv_cache_off: bool,
+    /// The rows step's segments when it serves several lanes at once (empty: one sequence).
+    #[cfg(feature = "cuda")]
+    segs: Vec<lanes::Seg>,
 }
 
 /// One position's attention window metadata, produced by `reference_seam` and `ref_select`.
@@ -11250,6 +11270,9 @@ struct EngramDevice {
     arena_bytes: usize,
     /// `slots * positions` skip flags, host metadata fixed at open (the dead-token rule).
     skip: Vec<bool>,
+    /// The arena is indexed by step row, not position (lanes): `positions` is then the most rows
+    /// a step uploads, and each step's gathers fill rows 0.. and their flags.
+    by_row: bool,
     product: Vec<Deviceptr>,
     product_bytes: Vec<usize>,
     wkv_weight: Vec<Deviceptr>,
@@ -11332,6 +11355,11 @@ impl EngramDevice {
             })
     }
 
+    /// The arena row of a step's row 0 at position `p0`: p0 by position, 0 by step row.
+    fn base(&self, p0: usize) -> usize {
+        if self.by_row { 0 } else { p0 }
+    }
+
     fn is_skipped(&self, slot: usize, position: usize) -> Result<bool, String> {
         if slot >= self.layer_ids.len() || position >= self.positions {
             return Err(format!(
@@ -11342,6 +11370,56 @@ impl EngramDevice {
         }
         Ok(self.skip[slot * self.positions + position])
     }
+}
+
+/// The indexer select's opt kernels (opt_select_sm121.cubin) and their buffers.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+struct OptSelect {
+    _module: sparkflash_kernels::cuda_driver::Module,
+    /// opt_select_scores: one block per compressed position.
+    scores: sparkflash_kernels::cuda_driver::Kernel,
+    /// The radix select opt_ref_select_fast, or with SPARKFLASH_SELECT_RANK=1 the O(n^2) rank form
+    /// opt_ref_select_pre it replaces.
+    select: sparkflash_kernels::cuda_driver::Kernel,
+    /// The select's block width.
+    width: u32,
+    /// The most compressed positions the select serves: the run's positions for the radix select,
+    /// the rank form's table for the rank form.
+    capacity: usize,
+    /// The f32 scores opt_select_scores writes, one per position.
+    scores_out: sparkflash_kernels::cuda_driver::Deviceptr,
+    /// The radix select's keys and flags past its shared-memory table (5 bytes a position).
+    scratch: sparkflash_kernels::cuda_driver::Deviceptr,
+    /// The batched rows select (opt_select_scores_rows, opt_select_rows) beside the radix select;
+    /// none with the rank form.
+    rows: Option<(
+        sparkflash_kernels::cuda_driver::Kernel,
+        sparkflash_kernels::cuda_driver::Kernel,
+    )>,
+    /// The f32 scores `scores_out` holds and the u32 words `scratch` holds.
+    scores_floats: usize,
+    scratch_words: usize,
+}
+
+/// The lanes a DSpark epoch serves from: SPARKFLASH_LANES, else 32 when it serves a link (each
+/// sequence's state in a lane of its own, so several run at once) and none for the harness, which
+/// keeps the single sequence's allocations.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn planned_lanes(serving: bool) -> Result<usize, String> {
+    match std::env::var("SPARKFLASH_LANES") {
+        Ok(value) => value
+            .parse::<usize>()
+            .map_err(|_| format!("SPARKFLASH_LANES={value}: not a count")),
+        Err(_) if serving => Ok(32),
+        Err(_) => Ok(0),
+    }
+}
+
+/// The candidate mask's words for a run of `max_positions`: the rank form's fixed table, or one bit
+/// a position past it.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn candidate_mask_words(max_positions: usize) -> usize {
+    sparkflash_kernels::ref_select_launch::MASK_WORDS.max(max_positions.div_ceil(32))
 }
 
 /// One kv-source owner's compressed store, `(code bytes, scale bytes)`: a row per expanded position
@@ -11392,6 +11470,7 @@ impl<'a> DeviceLayer<'a> {
         arena: Option<&sparkflash_device::arena::ResidentArena>,
         plan: Option<&'a sparkflash_device::resident::ResidentPlan>,
         native_mhc: bool,
+        lanes_planned: bool,
     ) -> Result<Self, String> {
         // The device arm's collectives are the four-rank chain's; a single-rank device run has no
         // communicator to reduce with, and failing here names the real reason instead of failing
@@ -11657,10 +11736,46 @@ impl<'a> DeviceLayer<'a> {
                 let (cubin, _sha) = cached_cubin(&dir.join("opt_select_sm121.cubin"))
                     .map_err(|error| format!("layer device opt select: {error}"))?;
                 let (module, scores) = cuda.load_named(&cubin, "opt_select_scores")?;
-                let (_m2, pre) = cuda.load_named(&cubin, "opt_ref_select_pre")?;
+                let rank = std::env::var("SPARKFLASH_SELECT_RANK").as_deref() == Ok("1");
+                let (name, width, capacity) = if rank {
+                    (
+                        "opt_ref_select_pre",
+                        sparkflash_kernels::ref_select_launch::BLOCK.0,
+                        sparkflash_kernels::ref_select_launch::MAX_POSITIONS,
+                    )
+                } else {
+                    // opt_select_sm121.cu's FAST_MAX_POS.
+                    ("opt_ref_select_fast", 1024, max_positions.min(1 << 21))
+                };
+                let (_m2, select) = cuda.load_named(&cubin, name)?;
+                let rows = if rank {
+                    None
+                } else {
+                    let (_m3, scores_rows) = cuda.load_named(&cubin, "opt_select_scores_rows")?;
+                    let (_m4, select_rows) = cuda.load_named(&cubin, "opt_select_rows")?;
+                    Some((scores_rows, select_rows))
+                };
                 let mut total = 0usize;
-                let buffer = cuda.alloc(4096 * 4, &mut total)?;
-                Some((module, scores, pre, buffer))
+                let table = max_positions.max(sparkflash_kernels::ref_select_launch::MAX_POSITIONS);
+                // A rows step's R_MAX rows of scores and select scratch (n + n / 4 words a row),
+                // each over every position (a ratio-1 layer compresses none away).
+                let rows_cap = rows::R_MAX;
+                let scores_floats = (rows_cap * (table + 4)).max(table);
+                let scratch_words = (rows_cap * (table + table.div_ceil(4) + 1)).max(2 * table);
+                let scores_out = cuda.alloc(scores_floats * 4, &mut total)?;
+                let scratch = cuda.alloc(scratch_words * 4, &mut total)?;
+                Some(OptSelect {
+                    _module: module,
+                    scores,
+                    select,
+                    width,
+                    capacity,
+                    scores_out,
+                    scratch,
+                    rows,
+                    scores_floats,
+                    scratch_words,
+                })
             }
             _ => None,
         };
@@ -11731,8 +11846,15 @@ impl<'a> DeviceLayer<'a> {
                 |error| format!("layer device kv path: fused norm+rope kernel: {error}"),
             )?;
         // The run's device cache and the window quantiser's ring: one allocation each, sized from
-        // the same capacity the rope spans use, so nothing grows mid-loop.
-        let capacity_rows = max_positions;
+        // the same capacity the rope spans use, so nothing grows mid-loop. When lanes will hold
+        // every sequence's state (attach_lanes frees these), they are allocated at a token size:
+        // at the 1M-token context the cache alone would be 160 GiB.
+        let sequence_rows = if lanes_planned {
+            sparkflash_kernels::attention_operands::EXPANDED_ROWS.min(max_positions)
+        } else {
+            max_positions
+        };
+        let capacity_rows = sequence_rows;
         let row_values = 2 * config.head_dim;
         let kv_cache_bytes =
             crate::layer_device::DeviceKvCache::bytes(config.n_layers, capacity_rows, row_values);
@@ -11743,7 +11865,7 @@ impl<'a> DeviceLayer<'a> {
             capacity_rows,
             row_values,
         )?;
-        let kv_ring = sparkflash_kernels::kv_path_ref::WindowRingLayout::new(capacity_rows)?;
+        let kv_ring = sparkflash_kernels::kv_path_ref::WindowRingLayout::new(max_positions)?;
         // The shared expert's two kernels load here even though its operands arrive later through
         // `attach_shared`: a missing image or symbol must be an open-time refusal, not a
         // first-position surprise. The operand addresses come from the run's single gather.
@@ -11786,7 +11908,8 @@ impl<'a> DeviceLayer<'a> {
                 "layer device shared expert: the intermediate width overflows".to_owned()
             })?;
         let swiglu_limit = config.swiglu_limit as f32;
-        let ring_bytes = kv_ring.total_bytes(config.n_layers)?;
+        let ring_bytes = sparkflash_kernels::kv_path_ref::WindowRingLayout::new(sequence_rows)?
+            .total_bytes(config.n_layers)?;
         let kv_ring_ptr = cuda.alloc(ring_bytes, &mut total)?;
         let mut representatives: [Option<usize>; crate::layer_device::ROPE_TABLE_CLASSES] =
             [None; crate::layer_device::ROPE_TABLE_CLASSES];
@@ -12087,6 +12210,7 @@ impl<'a> DeviceLayer<'a> {
             collectives_in_flight: std::cell::Cell::new(0),
             rope_kernel: (rope_module, rope_kernel),
             max_positions,
+            sequence_rows,
             rope_pairs: u32::try_from(rope_pairs)
                 .map_err(|_| format!("layer device: {rope_pairs} rope pairs do not fit u32"))?,
             rope_head_dim: u32::try_from(config.rope_head_dim).map_err(|_| {
@@ -12159,6 +12283,12 @@ impl<'a> DeviceLayer<'a> {
             seam_trace,
             seam_trace_capacity,
             attn_window: AttentionWindow::default(),
+            #[cfg(feature = "cuda")]
+            lanes: None,
+            draft_rings: None,
+            kv_cache_off: false,
+            #[cfg(feature = "cuda")]
+            segs: Vec::new(),
         })
     }
 
@@ -12683,6 +12813,16 @@ impl<'a> DeviceLayer<'a> {
             )
         })?;
         let (world, rank) = handle.world_rank();
+        if rows > 8 {
+            // A bulk prefill chunk: one collective over every row (summed in NCCL's order, which
+            // the bulk path does not hold to the single-row bits).
+            // SAFETY: as below, over rows * count values (checked above).
+            unsafe { handle.reduce_bf16(0, input.device, output.device, count * rows) }
+                .map_err(|error| format!("layer device stage {stage}: {error}"))?;
+            self.collectives_in_flight
+                .set(self.collectives_in_flight.get().saturating_add(1));
+            return Ok(());
+        }
         if rows > 1 && !(self.opt_oneshot.is_some() && handle.has_exchange()) {
             // SAFETY: as below, over rows * count values (checked above).
             unsafe { handle.reduce_bf16_rows(0, input.device, output.device, count, rows) }
@@ -13244,7 +13384,7 @@ impl<'a> DeviceLayer<'a> {
             .ok_or_else(|| "layer device: the compressor ring's size overflows".to_owned())?;
         let wkv = alloc(ring_span, "wkv rows")?;
         let wgate = alloc(ring_span, "wgate rows")?;
-        let (owner_code_bytes, owner_scale_bytes) = seam_store_owner_bytes(self.max_positions)?;
+        let (owner_code_bytes, owner_scale_bytes) = seam_store_owner_bytes(self.sequence_rows)?;
         let (store_code_bytes, store_scale_bytes) = owners
             .checked_mul(owner_code_bytes)
             .zip(owners.checked_mul(owner_scale_bytes))
@@ -13258,7 +13398,7 @@ impl<'a> DeviceLayer<'a> {
             .copy_htod(&store_scales, &vec![0u8; store_scale_bytes])
             .map_err(|e| format!("layer device: zero store_scales: {e}"))?;
         let index_keys_bytes = owners
-            .checked_mul(self.max_positions)
+            .checked_mul(self.sequence_rows)
             .and_then(|v| v.checked_mul(self.index_head_dim))
             .and_then(|v| v.checked_mul(4))
             .ok_or_else(|| "layer device: index_keys size overflows".to_owned())?;
@@ -13274,7 +13414,7 @@ impl<'a> DeviceLayer<'a> {
         )?;
         let raw_selected_ids = alloc(self.index_topk.max(1) * 4, "raw_selected_ids")?;
         let candidate_mask = alloc(
-            sparkflash_kernels::ref_select_launch::MASK_WORDS * 4,
+            candidate_mask_words(self.max_positions) * 4,
             "candidate_mask",
         )?;
         self.seam_ring = Some(SeamRing {
@@ -13401,6 +13541,7 @@ impl<'a> DeviceLayer<'a> {
                     host.arena.is_skipped(slot, position).unwrap_or(true)
                 })
                 .collect(),
+            by_row: false,
             product,
             product_bytes: vec![product_bytes; host.product.len()],
             wkv_weight,
@@ -13776,8 +13917,22 @@ impl Drop for DeviceLayer<'_> {
         if let Some(engram) = self.engram.take() {
             engram.release(self.cuda);
         }
-        if let Some(ring) = self.seam_ring.take() {
-            self.cuda.free_buffers(&[
+        if let Some(mut ring) = self.seam_ring.take() {
+            // With lanes the rings, stores and keys are the selected lane's, inside the lanes'
+            // reservation (they drop with it); the single sequence's were freed at attach.
+            #[cfg(feature = "cuda")]
+            if self.lanes.is_some() {
+                for ptr in [
+                    &mut ring.wkv,
+                    &mut ring.wgate,
+                    &mut ring.store_codes,
+                    &mut ring.store_scales,
+                    &mut ring.index_keys,
+                ] {
+                    *ptr = Deviceptr(0);
+                }
+            }
+            let owned: Vec<&Deviceptr> = [
                 &ring.wkv,
                 &ring.wgate,
                 &ring.store_codes,
@@ -13791,7 +13946,11 @@ impl Drop for DeviceLayer<'_> {
                 &ring.q_index_f32,
                 &ring.raw_selected_ids,
                 &ring.candidate_mask,
-            ]);
+            ]
+            .into_iter()
+            .filter(|ptr| ptr.0 != 0)
+            .collect();
+            self.cuda.free_buffers(&owned);
         }
         if let Some(latent) = self.seam_latent.take() {
             let ptr = Deviceptr(latent.device);
@@ -13860,6 +14019,7 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
     }
 
     fn begin_position(&mut self, position: usize, hidden: &[f32]) -> Result<(), String> {
+        self.check_state()?;
         // The cache starts empty and the counter starts at zero, so a first position after 0 would
         // only surface at the first append as a slot mismatch. Refuse here, naming both numbers:
         // the device arm starts at position 0 and has no cache-prefill path. A resume run is an
@@ -14420,6 +14580,11 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
             .map_err(|error| format!("layer device stage kv_path: window quantiser: {error}"))?;
         // 3. This position's k/v rows into the cache slot (the latent is both k and v; the row is
         // 2 * head_dim wide, k then v).
+        if self.kv_cache_off {
+            return Err(
+                "layer device stage kv_path: the run serves lanes; the M = 1 cache is gone".into(),
+            );
+        }
         let cache = self.kv_cache.layer_span(layer)?;
         let rows = u32::try_from(self.capacity_rows)
             .map_err(|_| "layer device stage kv_path: capacity_rows does not fit u32".to_owned())?;
@@ -14829,26 +14994,34 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
             0,
         );
         let words = select_params.words();
-        if let Some((_, scores_kernel, pre_kernel, buffer)) = self.opt_select
-            && words[7] <= 4096
+        if let Some(select) = self.opt_select.as_ref()
+            && n_pos <= select.capacity
             && words[8] <= 128
         {
             self.cuda.launch(
-                scores_kernel,
+                select.scores,
                 (u32::try_from(words[7].max(1)).unwrap_or(1), 1, 1),
                 (256, 1, 1),
                 &[
-                    words[0], words[1], words[2], buffer.0, words[7], words[8], words[9],
+                    words[0],
+                    words[1],
+                    words[2],
+                    select.scores_out.0,
+                    words[7],
+                    words[8],
+                    words[9],
                 ],
             )?;
             let mut pre_words = words.to_vec();
-            pre_words.push(buffer.0);
-            self.cuda.launch(
-                pre_kernel,
-                (1, 1, 1),
-                sparkflash_kernels::ref_select_launch::BLOCK,
-                &pre_words,
-            )?;
+            pre_words.extend([select.scores_out.0, select.scratch.0]);
+            self.cuda
+                .launch(select.select, (1, 1, 1), (select.width, 1, 1), &pre_words)?;
+        } else if n_pos > sparkflash_kernels::ref_select_launch::MAX_POSITIONS {
+            // The rank form scores at most its table and would clamp the rest away silently.
+            return Err(format!(
+                "layer device stage ref_select: layer {layer} has {n_pos} compressed positions at position {position}; ref_select_sm121 scores at most {} (the radix select serves up to 2097152)",
+                sparkflash_kernels::ref_select_launch::MAX_POSITIONS
+            ));
         } else {
             self.cuda.launch(
                 ref_select_kernel,
@@ -15963,7 +16136,18 @@ fn run_forward_loop(
             full_positions
         ));
     }
-    let mut prefill_hidden: Vec<u8> = Vec::with_capacity(full_positions * row_bytes);
+    // Serving keeps every sequence's state in lanes (attached in the DSpark epoch below), so the
+    // device opens the single sequence's position-sized state small, and the passes before the
+    // first step cover the harness prompt only: the epoch gathers each step's embeddings and
+    // Engram rows itself, and serving's placeholder ids span the whole 1M-position capacity.
+    let dspark = std::env::var("SPARKFLASH_DSPARK").as_deref() == Ok("1");
+    let lanes_planned = dspark && planned_lanes(crate::device_link::installed())? > 0;
+    let gathered_positions = if lanes_planned {
+        prompt_len.clamp(1, full_positions)
+    } else {
+        full_positions
+    };
+    let mut prefill_hidden: Vec<u8> = Vec::with_capacity(gathered_positions * row_bytes);
     let mut first_step_hidden_sha256 = String::new();
     let mut first_step_owner = 0usize;
     let mut first_step_row = 0usize;
@@ -15978,7 +16162,10 @@ fn run_forward_loop(
     // and cache states. Nothing arithmetic changes: the gather loop, its order and its bytes are
     // the same, and the only added work is one probe synchronise at the split point.
     let mut timer = BlockTimer::start(probe_on);
-    for (position, &prompt_token) in request.prompt_tokens[..full_positions].iter().enumerate() {
+    for (position, &prompt_token) in request.prompt_tokens[..gathered_positions]
+        .iter()
+        .enumerate()
+    {
         let (owner, row) = embedding_location(prompt_token);
         // Only the owner reads its arena shard row; the other ranks contribute zeros.
         let local_bytes = if request.rank == owner {
@@ -16143,6 +16330,11 @@ fn run_forward_loop(
             None => None,
         }
     };
+    let engram_positions = if lanes_planned {
+        prompt_len.clamp(1, total_positions)
+    } else {
+        total_positions
+    };
     // !158's loader reads the checkpoint with O_DIRECT and so never fills the page cache; the
     // buffered loader it replaced did, which is why the seam reads used to be hits. Warm the two
     // families the loop re-reads - the reference attention seams and the paged Engram rows this
@@ -16153,7 +16345,7 @@ fn run_forward_loop(
     if seam_warm_enabled() {
         reference_attention.warm_seams()?;
         if let Some(source) = engram_read_source {
-            warm_engram_rows(config, request.prompt_tokens, total_positions, source)?;
+            warm_engram_rows(config, request.prompt_tokens, engram_positions, source)?;
         }
     }
     let body = AttentionBody::open(
@@ -16404,7 +16596,7 @@ fn run_forward_loop(
                 config,
                 resident as &dyn sparkflash_engine::weights::WeightSource,
                 request.prompt_tokens,
-                total_positions,
+                engram_positions,
             )?),
             None => None,
         }
@@ -16426,6 +16618,7 @@ fn run_forward_loop(
             bound.map(|(arena, _bind)| arena),
             request.resident_plan,
             request.native_rounding.mhc,
+            lanes_planned,
         )?)
     } else {
         None
@@ -16485,9 +16678,8 @@ fn run_forward_loop(
         .and_then(|value| value.parse().ok())
         .unwrap_or(prompt_len);
     // Speculative decoding with the on-device DSpark drafter (SPARKFLASH_DSPARK=1, k drafts per
-    // step from SPARKFLASH_DSPARK_K, default 3, verified to the depth spec's DepthPolicy picks):
+    // step from SPARKFLASH_DSPARK_K, default 5, verified to the depth spec's DepthPolicy picks):
     // the run ends inside spec::run_spec.
-    let dspark = std::env::var("SPARKFLASH_DSPARK").as_deref() == Ok("1");
     let mut rows_state = match (
         rows_n,
         dspark,
@@ -16580,7 +16772,7 @@ fn run_forward_loop(
         let k: usize = std::env::var("SPARKFLASH_DSPARK_K")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(3);
+            .unwrap_or(5);
         if k == 0 || k > draft::BLOCK || k + 1 > rows::R_MAX {
             return Err(format!(
                 "SPARKFLASH_DSPARK_K={k}: needs 1..={}",
@@ -16590,7 +16782,6 @@ fn run_forward_loop(
         let staged: Vec<Option<SeamStagedWeights>> = (0..n_layers)
             .map(|layer| seam_wq_b.as_ref().and_then(|seam| seam.staged_for(layer)))
             .collect();
-        let prompt_rows = bf16_from_le_bytes(&prefill_hidden[..prompt_len * row_bytes])?;
         let inputs = spec::SpecInputs {
             config,
             tail: tail_stage
@@ -16601,23 +16792,58 @@ fn run_forward_loop(
             staged: &staged,
             embed: bind.tail.embed,
             prompt: &request.prompt_tokens[..prompt_len],
-            prompt_rows: &prompt_rows,
             rank: request.rank,
             world: request.world,
+            bulk: None,
         };
         let counter = Cell::new(0u64);
         let noise = spec::gather_rows(&cuda, &inputs, &counter, &[config.dspark_noise_token_id])?;
         let drafter = draft::DraftState::open(device, arena, dir, noise)?;
-        rows.taps = Some({
-            let (kernel, sink) = drafter.tap_sink();
-            (kernel, sink, config.dspark_target_layer_ids.clone())
-        });
+        let (tap_kernel, sink) = drafter.tap_sink();
+        rows.taps = Some((tap_kernel, sink, config.dspark_target_layer_ids.clone()));
+        // The bulk prefill's rows state, SPARKFLASH_PREFILL_CHUNK rows per chunk (8 or less keeps
+        // every prompt on the exact rows step). 4096 by sweep: a 32K prompt takes 15.2 s at 2048,
+        // 13.6 s at 4096 (the MoE weights read once for twice the rows) and 13.8 s at 8192.
+        let chunk: usize = std::env::var("SPARKFLASH_PREFILL_CHUNK")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4096);
+        // `sparkflash serve --tp4-device` installs a link before the epoch: serve its requests
+        // instead of the one-shot generation.
+        let link = crate::device_link::take();
+        let lane_count = planned_lanes(link.is_some())?;
+        if lane_count > 0 {
+            device.attach_lanes(&lanes::LaneGeometry {
+                count: lane_count,
+                draft_ring_rows: drafter.ring_rows(),
+                engram_rows: chunk.max(rows::R_MAX),
+            })?;
+        }
+        let mut bulk_rows = if chunk > rows::R_MAX {
+            Some(rows::RowsState::open_with(device, dir, chunk)?)
+        } else {
+            None
+        };
+        if let Some(state) = bulk_rows.as_mut() {
+            let taps = state.bulk.as_ref().map_or(0, |bulk| bulk.taps);
+            state.taps = Some((tap_kernel, taps, config.dspark_target_layer_ids.clone()));
+        }
+        let inputs = spec::SpecInputs {
+            bulk: bulk_rows.as_ref(),
+            ..inputs
+        };
         let max_new: usize = std::env::var("SPARKFLASH_DSPARK_STEPS")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(usize::MAX);
-        spec::run_spec(device, rows, &drafter, &inputs, k, max_new)?;
+        match link {
+            Some(mut link) => spec::serve(device, rows, &drafter, &inputs, k, link.as_mut())?,
+            None => spec::run_spec(device, rows, &drafter, &inputs, k, max_new)?,
+        }
         drafter.release(&cuda);
+        if let Some(state) = bulk_rows.take() {
+            state.release(&cuda);
+        }
         if let Some(rows) = rows_state.take() {
             rows.release(&cuda);
         }

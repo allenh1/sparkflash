@@ -14,7 +14,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -78,6 +78,13 @@ pub const DEFAULT_MAX_LOGPROBS: usize = 20;
 
 /// vLLM's cap on the length of `logprob_token_ids`.
 pub const MAX_LOGPROB_TOKEN_IDS: usize = 128;
+
+/// The largest request body the API reads, in bytes.
+///
+/// axum's extractors stop at 2 MB by default, which a 1M-token prompt passes several times over
+/// (about 4 MB as plain text, 8 MB as token ids, more again once JSON-escaped). vLLM's server has
+/// no body cap, so this one is sized for the model's whole context with room to spare.
+pub const MAX_REQUEST_BODY_BYTES: usize = 64 << 20;
 
 /// Capacity of the host-side GPU trace ring, in events.
 ///
@@ -251,6 +258,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/trace", post(admin_trace))
         .route("/v1/admin/trace/dump", get(trace_dump))
         .route("/metrics", get(metrics))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
             auth_state,
             require_bearer_auth,
@@ -2994,10 +3002,12 @@ fn completion_body(
         .map(|(output, (prompt_index, choice_index))| {
             let prompt = &prompts[*prompt_index];
             let index = *prompt_index * n + *choice_index;
+            // A completion has no reasoning field: an engine's reasoning channel is part of the
+            // text, as it is in the raw output.
             let text = if echo {
-                format!("{}{}", prompt.text, output.content)
+                format!("{}{}{}", prompt.text, output.reasoning, output.content)
             } else {
-                output.content.clone()
+                format!("{}{}", output.reasoning, output.content)
             };
             let logprobs = if logprob_info.wants_sample() {
                 let mut positions = Vec::new();
@@ -3363,8 +3373,8 @@ fn completions_stream_response(
                 EngineEvent::PromptLogprobs(payload) => {
                     prompt_logprobs[request_index] = Some(*payload)
                 }
-                EngineEvent::ReasoningDelta(_) => {}
-                EngineEvent::ContentDelta(text) => {
+                // A completion has no reasoning field: the reasoning channel is text here.
+                EngineEvent::ReasoningDelta(text) | EngineEvent::ContentDelta(text) => {
                     if logprob_info.wants_sample() {
                         buffered[request_index].push_str(&text);
                     } else {

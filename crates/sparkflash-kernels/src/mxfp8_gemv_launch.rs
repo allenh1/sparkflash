@@ -334,6 +334,80 @@ pub fn install_opt(cuda: &Cuda, cubin: &[u8]) -> Result<Module, String> {
     module.ok_or_else(|| "opt gemv: no symbols".to_owned())
 }
 
+/// The tensor-core GEMMs (kernels/opt_mma_sm121.cu), indexed as [`OptKind`]: [`launch_opt`] runs
+/// a launch of more than 8 tokens (the bulk prefill) through them once [`install_mma`] has run.
+static OPT_MMA_FUNCTIONS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+const OPT_MMA_SYMBOLS: [&str; 4] = [
+    "opt_mma_fp8_bf16o",
+    "opt_mma_f32a_bf16o",
+    "opt_mma_f32a_f32o",
+    "opt_mma_bf16a_bf16o",
+];
+
+/// Loads the tensor-core GEMM symbols, which [`launch_opt`] then uses above 8 tokens. The module is
+/// returned so the caller keeps it loaded for the run.
+pub fn install_mma(cuda: &Cuda, cubin: &[u8]) -> Result<Module, String> {
+    let mut module = None;
+    for (slot, symbol) in OPT_MMA_FUNCTIONS.iter().zip(OPT_MMA_SYMBOLS) {
+        let (m, k) = cuda.load_named(cubin, symbol)?;
+        slot.store(k.to_raw().0, std::sync::atomic::Ordering::Release);
+        module = Some(m);
+    }
+    module.ok_or_else(|| "opt mma: no symbols".to_owned())
+}
+
+/// True once [`install_mma`] has run.
+#[must_use]
+pub fn mma_installed() -> bool {
+    OPT_MMA_FUNCTIONS[0].load(std::sync::atomic::Ordering::Acquire) != 0
+}
+
+/// The tensor-core form of [`launch_opt`]: 128 x 128 output tiles. The FP8 kernel walks the token
+/// tiles fastest (its weights are the wider operand), the f32/bf16 kernels the column tiles (their
+/// activation rows are).
+fn launch_mma(cuda: &Cuda, index: usize, args: &OptArgs) -> Result<(), String> {
+    let word = OPT_MMA_FUNCTIONS[index].load(std::sync::atomic::Ordering::Acquire);
+    if word == 0 {
+        return Err(format!(
+            "opt gemv: {} tokens need the tensor-core GEMMs, which are not installed",
+            args.tokens
+        ));
+    }
+    let (m_tiles, n_tiles) = (args.tokens.div_ceil(128), args.cols.div_ceil(128));
+    let grid = if index == 0 {
+        (m_tiles, n_tiles, args.groups)
+    } else {
+        (n_tiles, m_tiles, args.groups)
+    };
+    cuda.launch(
+        Kernel::from_raw(word, OPT_MMA_SYMBOLS[index]),
+        grid,
+        (256, 1, 1),
+        &[
+            args.a,
+            args.a_scales,
+            args.w,
+            args.ws,
+            args.out,
+            u64::from(args.cols),
+            u64::from(args.inner),
+            u64::from(args.tokens),
+            args.a_tok_stride,
+            args.out_tok_stride,
+            args.a_grp_stride,
+            args.w_grp_stride,
+            args.s_grp_stride,
+            args.out_grp_stride,
+            u64::from(args.k_stride_blocks),
+        ],
+    )
+}
+
 fn opt_for(kernel: Kernel) -> Option<Kernel> {
     let index = match kernel.to_raw().1 {
         KERNEL | KERNEL_NONFUSED => 0,
@@ -378,7 +452,7 @@ pub struct OptArgs {
     pub cols: u32,
     /// Reduction length per group.
     pub inner: u32,
-    /// Activation rows, 1..=8.
+    /// Activation rows: 1..=8 on the GEMV, more on the tensor-core GEMMs.
     pub tokens: u32,
     /// Elements between consecutive tokens' activations.
     pub a_tok_stride: u64,
@@ -405,7 +479,8 @@ pub fn opt_installed() -> bool {
 }
 
 /// Launches one opt GEMV over 1..=8 tokens, choosing how many tokens each block serves (see the
-/// body). Every choice gives the same bits per token: a token's chain does not depend on it.
+/// body). Every choice gives the same bits per token: a token's chain does not depend on it. More
+/// tokens (a bulk prefill chunk) run on the tensor-core GEMMs, which round differently.
 pub fn launch_opt(cuda: &Cuda, kind: OptKind, args: &OptArgs) -> Result<(), String> {
     use std::sync::atomic::Ordering::Acquire;
     let index = match kind {
@@ -415,17 +490,20 @@ pub fn launch_opt(cuda: &Cuda, kind: OptKind, args: &OptArgs) -> Result<(), Stri
         OptKind::Bf16aBf16o => 3,
     };
     if args.tokens == 0
-        || args.tokens > 8
         || !args.cols.is_multiple_of(32)
         || !args.inner.is_multiple_of(32)
         || args.groups == 0
     {
         return Err(format!("opt gemv: unsupported shape {args:?}"));
     }
+    if args.tokens > 8 {
+        return launch_mma(cuda, index, args);
+    }
     // Tokens per block: the fewer, the more blocks stream the weights, at the price of re-reading
-    // them once per block. A narrow matrix needs the blocks (one token each when it is very narrow,
-    // two when narrow); a mid-width one at up to four tokens still gains from the shorter
-    // accumulator set, a wide one (enough blocks already) does not.
+    // them once per block (from L2: the kernel runs a tile's splits side by side). A narrow matrix
+    // needs the blocks (one token each when it is very narrow, two when narrow); a mid-width one at
+    // up to four tokens still gains from the shorter accumulator set, a wide one (enough blocks
+    // already) does not.
     let blocks = (args.cols / 32) * args.groups;
     let one = if index == 3 {
         0

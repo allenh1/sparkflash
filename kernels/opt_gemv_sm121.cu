@@ -25,8 +25,11 @@
 // per-token widening.
 //
 // Shapes: cols % 32 == 0, inner % 32 == 0. Grid (cols / 32, groups, ceil(tokens / MAXT)), block
-// 256: block z serves tokens z * MAXT .. z * MAXT + MAXT - 1 (fewer in the last). A token's chain does
-// not depend on MAXT, the split or the staging, so every instantiation and grid gives the same bits.
+// 256: each block serves one tile and tokens z * MAXT .. z * MAXT + MAXT - 1 (fewer in the last). The
+// blocks are numbered token split fastest (block (x, z) runs tile (z * gridDim.x + x) / gridDim.z), so
+// a tile's splits run side by side and all but the first read its weights from L2, not DRAM. A
+// token's chain does not depend on MAXT, the split, the numbering or the staging, so every
+// instantiation and grid gives the same bits.
 
 #include "opt_pdl_sm121.cuh"
 #include <cuda_bf16.h>
@@ -184,10 +187,12 @@ __device__ __forceinline__ void opt_gemv_body(
 
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5;
-    const uint32_t tile = blockIdx.x;
+    // Token split fastest: consecutive blocks are the splits of one tile.
+    const uint32_t lin = blockIdx.z * gridDim.x + blockIdx.x;
+    const uint32_t tile = lin / gridDim.z;
     const uint32_t group = blockIdx.y;
     const uint32_t k_blocks = inner >> 5;
-    const uint32_t z0 = blockIdx.z * (uint32_t)MAXT;
+    const uint32_t z0 = (lin - tile * gridDim.z) * (uint32_t)MAXT;
     const uint32_t live = tokens - z0 < (uint32_t)MAXT ? tokens - z0 : (uint32_t)MAXT;
 
     // A K-slice of a wider matrix keeps the full matrix's tile-row stride.

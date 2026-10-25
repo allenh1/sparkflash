@@ -1221,6 +1221,57 @@ impl OptMoeKernels {
     }
 }
 
+/// The chunked-prefill routed path's kernels (kernels/opt_mma_sm121.cu) and scratch, owned by the
+/// caller and sized for `max_tokens`.
+#[derive(Debug, Clone, Copy)]
+pub struct MoeBulk {
+    /// `opt_mma_moe_plan`.
+    pub plan: Kernel,
+    /// `opt_mma_moe_gate_up`.
+    pub gate_up: Kernel,
+    /// `opt_mma_moe_down`.
+    pub down: Kernel,
+    /// `opt_mma_moe_combine`.
+    pub combine: Kernel,
+    /// `[tokens * top_k]` u32: the routed rows grouped by expert.
+    pub sorted: Deviceptr,
+    /// `[max_items][4]` u32 work items.
+    pub items: Deviceptr,
+    /// The work-item count (one u32).
+    pub items_count: Deviceptr,
+    /// `[tokens * top_k][576]` E4M3 SwiGLU codes.
+    pub codes: Deviceptr,
+    /// `[tokens * top_k][18]` ue8m0 scales of `codes`.
+    pub scales: Deviceptr,
+    /// `[tokens * top_k][5120]` bf16 per-row down outputs.
+    pub slot: Deviceptr,
+    /// The tokens the buffers are sized for.
+    pub max_tokens: usize,
+}
+
+impl MoeBulk {
+    /// The work-item bound for `tokens`: one per expert plus one per 64 routed rows.
+    #[must_use]
+    pub fn max_items(tokens: usize) -> usize {
+        EXPERTS + tokens * TOP_K / 64 + 1
+    }
+
+    /// The device bytes of each scratch buffer for `tokens`, in field order (sorted, items,
+    /// items_count, codes, scales, slot).
+    #[must_use]
+    pub fn buffer_bytes(tokens: usize) -> [usize; 6] {
+        let rows = tokens * TOP_K;
+        [
+            rows * 4,
+            Self::max_items(tokens) * 16,
+            16,
+            rows * LOCAL_INTER,
+            rows * (LOCAL_INTER / QUANT_BLOCK),
+            rows * HIDDEN * 2,
+        ]
+    }
+}
+
 impl MoeRoutedDevice {
     /// Allocates and fills the run-scope device state.
     ///
@@ -1511,6 +1562,98 @@ impl MoeRoutedDevice {
             ],
         )
         .map_err(|error| format!("moe_routed dedup: combine: {error}"))
+    }
+
+    /// The chunked-prefill path ([MoeBulk]): groups the routed rows by expert, runs each group's
+    /// gate/up and down on the FP4 tensor cores, then the per-token combine (adding the addend).
+    /// Not bit-identical to [Self::run]: the slot partials round through bf16.
+    ///
+    /// # Errors
+    /// A token count above the bulk buffers' capacity, and any driver launch error.
+    pub fn run_bulk(
+        &self,
+        cuda: &Cuda,
+        bulk: &MoeBulk,
+        layer: usize,
+        tokens: usize,
+        operands: &MoeRoutedOperands,
+    ) -> Result<(), String> {
+        if tokens == 0 || tokens > bulk.max_tokens {
+            return Err(format!(
+                "moe_routed bulk: {tokens} tokens outside the capacity of {}",
+                bulk.max_tokens
+            ));
+        }
+        let experts = self.plan.geometry().experts;
+        let table = |matrix| {
+            self.table
+                .offset(self.plan.table_word_offset(layer, matrix) * 8)
+                .0
+        };
+        let rows = (tokens * TOP_K) as u32;
+        let max_items = MoeBulk::max_items(tokens) as u32;
+        cuda.launch(
+            bulk.plan,
+            (1, 1, 1),
+            (1024, 1, 1),
+            &[
+                operands.ids.device.0,
+                u64::from(rows),
+                experts as u64,
+                bulk.sorted.0,
+                bulk.items.0,
+                bulk.items_count.0,
+            ],
+        )
+        .map_err(|error| format!("moe_routed bulk: plan: {error}"))?;
+        cuda.launch(
+            bulk.gate_up,
+            ((LOCAL_INTER / 64) as u32, max_items, 1),
+            (256, 1, 1),
+            &[
+                table(RoutedMatrix::Gate),
+                table(RoutedMatrix::Up),
+                bulk.sorted.0,
+                bulk.items.0,
+                bulk.items_count.0,
+                operands.weights.device.0,
+                operands.act_codes.device.0,
+                operands.act_scales.device.0,
+                bulk.codes.0,
+                bulk.scales.0,
+                u64::from(self.plan.limit().to_bits()),
+            ],
+        )
+        .map_err(|error| format!("moe_routed bulk: gate/up: {error}"))?;
+        cuda.launch(
+            bulk.down,
+            ((HIDDEN / 128) as u32, max_items, 1),
+            (256, 1, 1),
+            &[
+                table(RoutedMatrix::Down),
+                bulk.sorted.0,
+                bulk.items.0,
+                bulk.items_count.0,
+                bulk.codes.0,
+                bulk.scales.0,
+                bulk.slot.0,
+            ],
+        )
+        .map_err(|error| format!("moe_routed bulk: down: {error}"))?;
+        cuda.launch(
+            bulk.combine,
+            ((HIDDEN / 256) as u32, tokens as u32, 1),
+            (256, 1, 1),
+            &[
+                operands.ids.device.0,
+                bulk.slot.0,
+                operands.delta_f32.device.0,
+                operands.delta_bf16.device.0,
+                tokens as u64,
+                self.addend.get(),
+            ],
+        )
+        .map_err(|error| format!("moe_routed bulk: combine: {error}"))
     }
 
     /// The plan this device was opened with.

@@ -26,7 +26,7 @@ use sparkflash_api::engine::{
 };
 use sparkflash_api::server::{
     DEVICE_TOKEN_CLAIM_HEADER, DEVICE_TOKEN_SOURCE_HEADER, DEVICE_TOKEN_SOURCE_UNMEASURED,
-    disarm_traces, router,
+    MAX_REQUEST_BODY_BYTES, disarm_traces, router,
 };
 use sparkflash_api::state::{AppState, SequentialChoiceSeeds};
 use tower::ServiceExt as _;
@@ -370,6 +370,36 @@ async fn non_streaming_chat_completion_round_trip() {
     assert_eq!(stats["kv_cache"]["total_prompt_tokens"], 8);
     assert_eq!(stats["kv_cache"]["uncached_suffix_tokens"], 8);
     assert_eq!(stats["engram_layers"].as_array().expect("layers").len(), 2);
+}
+
+#[tokio::test]
+async fn a_whole_context_prompt_fits_the_body_limit_and_a_larger_body_is_refused() {
+    // A whole-context prompt is several MB of JSON, past axum's 2 MB extractor default (this one is
+    // 3 MB and, by the mock's count, within the 1M-token context).
+    let long = "Record 1: item 7919 weighs 104 grams.\n".repeat(80_000);
+    let (status, _, bytes) = send(
+        app(),
+        json_request("/v1/chat/completions", &chat_body(&long)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(
+        body_json(&bytes)["choices"][0]["message"]["content"],
+        "Hello world"
+    );
+
+    let over = "x".repeat(MAX_REQUEST_BODY_BYTES);
+    let (status, _, _) = send(
+        app(),
+        json_request("/v1/chat/completions", &chat_body(&over)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[tokio::test]

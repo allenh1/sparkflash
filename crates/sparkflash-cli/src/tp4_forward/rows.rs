@@ -39,12 +39,17 @@ pub(super) struct RowsKernels {
     pub(super) post: Kernel,
     pub(super) kv: Kernel,
     attn: Kernel,
+    /// opt_rows_attn_{scores, softmax, values}: opt_rows_attn in three kernels for 16 heads a
+    /// rank, bit-identical to it (None under SPARKFLASH_ATTN_SPLIT=0).
+    attn_split: Option<[Kernel; 3]>,
     pub(super) inv_rope: Kernel,
     lm_head: Kernel,
     pub(super) fold: Kernel,
     /// opt_rows_argmax_pick and opt_rows_store_u32: the device side of the argmax gathers.
     pub(super) pick: Kernel,
     pub(super) store: Kernel,
+    /// opt_rows_topc: a row's slice statistics for the truncated sampler.
+    topc: Kernel,
     /// opt_rows_embed_own and opt_rows_embed_stream: the rows' embedding streams from device ids.
     embed_own: Kernel,
     embed_stream: Kernel,
@@ -53,6 +58,10 @@ pub(super) struct RowsKernels {
     /// opt_rows_hostw_{bf16w, bf16w_f32o, f32w_f32o}, by hostw_gemv_launch::Mode.
     hostw: [Kernel; 3],
     prefetch_l2: Kernel,
+    /// opt_rows_prologue_bf16 and opt_rows_shared_swiglu: layer_seams' activation quantiser and
+    /// shared-expert SwiGLU with the PDL entry ([RowsState::quantise_bf16], [RowsState::swiglu]).
+    prologue: Kernel,
+    swiglu: Kernel,
 }
 
 /// The per-row device buffers, each `[R_MAX][natural width]`.
@@ -93,6 +102,11 @@ pub(super) struct RowsBuffers {
     pub(super) shared_swiglu: u64,
     pub(super) shared_out: u64,
     pub(super) selected: u64,
+    /// The split attention's scores `[R_MAX][16][640]` f32, probabilities `[R_MAX][640][16]` f32
+    /// and sums `[R_MAX][16]` f32.
+    attn_scores: u64,
+    attn_probs: u64,
+    attn_ssum: u64,
     pub(super) masks: u64,
     pub(super) seam_partials: u64,
     pub(super) seam_row_buf: u64,
@@ -118,6 +132,12 @@ pub(super) struct RowsBuffers {
     pub(super) argmax_gather: u64,
     /// The verify head's picks, `[ids rows | values rows]`.
     pub(super) lm_picks: u64,
+    /// `[R_MAX]` u32: a prompt chunk's token ids, for the device embedding gather.
+    pub(super) row_ids: u64,
+    /// The head's raw logits `[R_MAX][vocab slice]` f32, for the truncated sampler.
+    logits: u64,
+    /// `[GATHER_WORLD][R_MAX][TOPC_WORDS]` u32: each rank's opt_rows_topc slots, exchanged in place.
+    topc_gather: u64,
     /// `[GATHER_WORLD][R_MAX][dim]` bf16: each rank's owned embedding rows, exchanged in place.
     embed_gather: u64,
 }
@@ -133,16 +153,26 @@ pub(super) struct RowsState {
     kv_cols: usize,
     lo_cols: usize,
     pub(super) shared_local: usize,
-    mask_bytes: usize,
+    pub(super) mask_bytes: usize,
     engram_inner: usize,
     engram_out: usize,
     gathers: Cell<u64>,
+    /// A bulk chunk's FFN post of this layer, left for the next layer's attention seam to fuse
+    /// (opt_bulk_mhc_post_partials): the stream rows of the chunk are stale until it runs.
+    post_pending: Cell<Option<usize>>,
     /// The DSpark tap capture (spec mode): opt_draft_taps, the `[R_MAX][3][dim]` f32 tap buffer,
     /// and the target layers in tap order. Before each target layer the rows' streams are
     /// hc-averaged into their tap slot.
     pub(super) taps: Option<(Kernel, u64, Vec<usize>)>,
     /// The side stream the all-reduce windows' L2 prefetches run on (SPARKFLASH_L2_PREFETCH=0: none).
     side: Option<sparkflash_kernels::cuda_driver::SideStream>,
+    /// The most rows a step takes: R_MAX, or a bulk prefill chunk's capacity.
+    pub(super) cap: usize,
+    /// The bulk prefill's kernels and chunk scratch (a state opened above R_MAX rows).
+    pub(super) bulk: Option<super::bulk::BulkState>,
+    /// The head's per-row noise when one step's rows sample under several requests' samplers:
+    /// `[R_MAX][4]` u32 for opt_rows_lm_head, then `[R_MAX][4]` for opt_rows_topc.
+    pub(super) head_params: sparkflash_kernels::cuda_driver::HostMapped,
 }
 
 impl RowsState {
@@ -152,6 +182,16 @@ impl RowsState {
     /// Refuses a layer whose fast path is not the opt one, or a geometry the row kernels do not
     /// hold, and returns any load or allocation error.
     pub(super) fn open(device: &DeviceLayer<'_>, kernel_dir: &Path) -> Result<Self, String> {
+        Self::open_with(device, kernel_dir, R_MAX)
+    }
+
+    /// [Self::open] with the row buffers carved for `cap` rows; above R_MAX the state is a bulk
+    /// prefill state (super::bulk), whose head buffers stay R_MAX rows (the head reads one row).
+    pub(super) fn open_with(
+        device: &DeviceLayer<'_>,
+        kernel_dir: &Path,
+        cap: usize,
+    ) -> Result<Self, String> {
         let refuse = |what: &str| Err(format!("rows: {what}"));
         if device.dim != 5120 || device.hc_mult != 4 {
             return refuse("the row kernels hold dim 5120 and hc 4 only");
@@ -181,11 +221,21 @@ impl RowsState {
         let post = load("opt_rows_mhc_post")?;
         let kv = load("opt_rows_kv")?;
         let attn = load("opt_rows_attn")?;
+        let attn_split = if std::env::var("SPARKFLASH_ATTN_SPLIT").as_deref() == Ok("0") {
+            None
+        } else {
+            Some([
+                load("opt_rows_attn_scores")?,
+                load("opt_rows_attn_softmax")?,
+                load("opt_rows_attn_values")?,
+            ])
+        };
         let inv_rope = load("opt_rows_inv_rope")?;
         let lm_head = load("opt_rows_lm_head")?;
         let fold = load("opt_rows_argmax_fold")?;
         let pick = load("opt_rows_argmax_pick")?;
         let store = load("opt_rows_store_u32")?;
+        let topc = load("opt_rows_topc")?;
         let embed_own = load("opt_rows_embed_own")?;
         let embed_stream = load("opt_rows_embed_stream")?;
         let engram_wkv = load("opt_rows_engram_wkv")?;
@@ -196,23 +246,29 @@ impl RowsState {
             load("opt_rows_hostw_f32w_f32o")?,
         ];
         let prefetch_l2 = load("opt_rows_prefetch_l2")?;
+        let prologue = load("opt_rows_prologue_bf16")?;
+        let swiglu = load("opt_rows_shared_swiglu")?;
         let kernels = RowsKernels {
             _modules: modules,
             seam,
             post,
             kv,
             attn,
+            attn_split,
             inv_rope,
             lm_head,
             fold,
             pick,
             store,
+            topc,
             embed_own,
             embed_stream,
             engram_wkv,
             rank_permute,
             hostw,
             prefetch_l2,
+            prologue,
+            swiglu,
         };
 
         let dim = device.dim;
@@ -228,7 +284,7 @@ impl RowsState {
         let shared_local = shared.inter / device.routed_geometry.world;
         let top_k = device.routed_geometry.top_k;
         let experts = device.routed_geometry.experts;
-        let mask_bytes = sparkflash_kernels::ref_select_launch::MASK_WORDS * 4;
+        let mask_bytes = candidate_mask_words(device.max_positions) * 4;
         let (engram_inner, engram_out) = device
             .engram
             .as_ref()
@@ -236,7 +292,7 @@ impl RowsState {
         let chunks = crate::tp4_tail::CHUNKS_PER_RANK;
         let index_heads = device.index_n_heads;
         let index_cols = index_heads * device.index_head_dim;
-        let r = R_MAX;
+        let r = cap.max(R_MAX);
         let mut allocations = Vec::new();
         let mut total = 0usize;
         let mut alloc = |bytes: usize| -> Result<u64, String> {
@@ -281,6 +337,9 @@ impl RowsState {
             shared_swiglu: alloc(r * shared_local * 4)?,
             shared_out: alloc(r * dim * 4)?,
             selected: alloc(r * SELECTED_STRIDE * 4)?,
+            attn_scores: alloc(R_MAX * ATTN_HEADS * ATTN_MAX_ATTENDED * 4)?,
+            attn_probs: alloc(R_MAX * ATTN_MAX_ATTENDED * ATTN_HEADS * 4)?,
+            attn_ssum: alloc(R_MAX * ATTN_HEADS * 4)?,
             masks: alloc(r * mask_bytes)?,
             seam_partials: alloc(r * SEAM_PARTIAL_FLOATS * 4)?,
             seam_row_buf: alloc(r * dim * 4)?,
@@ -293,20 +352,25 @@ impl RowsState {
             idx_weights_f32: alloc(r * index_heads * 4)?,
             idx_query: alloc(r * index_cols * 2)?,
             idx_q_f32: alloc(r * index_cols * 4)?,
-            lm_hidden: alloc(r * dim * 2)?,
-            lm_normed: alloc(r * dim * 2)?,
-            lm_block_max: alloc(r * chunks * 4)?,
-            lm_block_arg: alloc(r * chunks * 4)?,
-            lm_value: alloc(r * 4)?,
-            lm_index: alloc(r * 4)?,
-            argmax_gather: alloc(GATHER_WORLD * r * 8)?,
-            lm_picks: alloc(r * 8)?,
+            lm_hidden: alloc(R_MAX * dim * 2)?,
+            lm_normed: alloc(R_MAX * dim * 2)?,
+            lm_block_max: alloc(R_MAX * chunks * 4)?,
+            lm_block_arg: alloc(R_MAX * chunks * 4)?,
+            lm_value: alloc(R_MAX * 4)?,
+            lm_index: alloc(R_MAX * 4)?,
+            argmax_gather: alloc(GATHER_WORLD * R_MAX * 8)?,
+            lm_picks: alloc(R_MAX * 8)?,
+            row_ids: alloc(r * 4)?,
+            logits: alloc(R_MAX * crate::tp4_tail::VOCAB_PER_RANK * 4)?,
+            topc_gather: alloc(GATHER_WORLD * R_MAX * super::sample::TOPC_WORDS * 4)?,
             embed_gather: alloc(GATHER_WORLD * r * dim * 2)?,
         };
+        let head_params = cuda.alloc_host_mapped(R_MAX * 8 * 4, &mut 0)?;
         Ok(Self {
             kernels,
             b,
             allocations,
+            head_params,
             q_cols,
             lora_cols,
             kv_cols,
@@ -316,23 +380,85 @@ impl RowsState {
             engram_inner,
             engram_out,
             gathers: Cell::new(0),
+            post_pending: Cell::new(None),
             taps: None,
+            // A bulk chunk's stages read far more than the L2 holds, so it prefetches nothing.
             side: match std::env::var("SPARKFLASH_L2_PREFETCH").as_deref() {
                 Ok("0") => None,
+                _ if r > R_MAX => None,
                 _ => Some(cuda.side_stream()?),
             },
+            cap: r,
+            bulk: if r > R_MAX {
+                Some(super::bulk::BulkState::open(device, kernel_dir, r)?)
+            } else {
+                None
+            },
         })
+    }
+
+    /// The MX quantiser of `n` rows of `cols` bf16 values into E4M3 codes and ue8m0 scales
+    /// (w8a8_prologue_bf16_e4m3's arithmetic, a warp per 32-value block).
+    pub(super) fn quantise_bf16(
+        &self,
+        cuda: &Cuda,
+        normed: u64,
+        codes: u64,
+        scales: u64,
+        cols: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        let blocks = (n * cols / 32).div_ceil(8);
+        cuda.launch(
+            self.kernels.prologue,
+            (blocks as u32, 1, 1),
+            (256, 1, 1),
+            &[normed, codes, scales, cols as u64, n as u64],
+        )
+    }
+
+    /// The shared expert's SwiGLU over `inter` f32 elements (shared_swiglu_f32's arithmetic).
+    pub(super) fn swiglu(
+        &self,
+        cuda: &Cuda,
+        gate: u64,
+        up: u64,
+        out: u64,
+        limit: f32,
+        inter: usize,
+    ) -> Result<(), String> {
+        cuda.launch(
+            self.kernels.swiglu,
+            ((inter as u32).div_ceil(256), 1, 1),
+            (256, 1, 1),
+            &[gate, up, out, u64::from(limit.to_bits()), inter as u64],
+        )
     }
 
     /// Frees the row buffers (the modules drop with the state).
     pub(super) fn release(self, cuda: &Cuda) {
         let borrowed: Vec<&Deviceptr> = self.allocations.iter().collect();
         cuda.free_buffers(&borrowed);
+        cuda.free_host_mapped(&self.head_params);
+        if let Some(bulk) = self.bulk {
+            bulk.release(cuda);
+        }
     }
 }
 
 /// The selected list's row stride in u32 ids (`workspace.selected` is 2,048 B).
 const SELECTED_STRIDE: usize = 512;
+
+/// The split attention's heads a rank and slots a row (OR_A3_HEADS, OR_A_MAX_ATTENDED), and the
+/// slots a scores block takes (OR_A3_CHUNK).
+const ATTN_HEADS: usize = 16;
+const ATTN_MAX_ATTENDED: usize = 640;
+const ATTN_SCORE_CHUNK: usize = 32;
+
+/// opt_select_scores_rows' positions a tile (SR_TILE), and the blocks a batched select's scores
+/// spread over (each strides over its row's tiles).
+const SELECT_SCORE_TILE: usize = 16;
+const SELECT_SCORE_BLOCKS: usize = 384;
 
 fn span(device: u64, len: usize) -> DeviceSpan {
     DeviceSpan::new(device, len)
@@ -358,7 +484,7 @@ impl DeviceLayer<'_> {
                 hidden.len()
             ));
         }
-        self.check_begin(p0, n)?;
+        self.check_begin(p0, n, rows.cap)?;
         let mut stream = Vec::with_capacity(n * self.hc_mult * dim * 4);
         let mut seed = Vec::with_capacity(n * self.hc_mult * 4);
         for row in hidden.chunks_exact(dim) {
@@ -389,16 +515,31 @@ impl DeviceLayer<'_> {
         n: usize,
         exchange: (usize, usize),
     ) -> Result<usize, String> {
-        self.check_begin(p0, n)?;
+        self.check_begin(p0, n, rows.cap)?;
         self.embed_rows_on_device(rows, embed, ids, n, n, 0, exchange)?;
         self.positions_begun = p0 + n;
         self.attn_window = AttentionWindow::default();
         Ok(n)
     }
 
-    fn check_begin(&self, p0: usize, n: usize) -> Result<(), String> {
-        if n == 0 || n > R_MAX {
-            return Err(format!("rows: {n} rows are not 1..={R_MAX}"));
+    /// [Self::begin_rows_device] for rows whose embeddings are already queued (the draft's
+    /// `verify` rows, checked with [Self::check_begin] before they were): the bookkeeping.
+    pub(super) fn begin_rows_queued(
+        &mut self,
+        rows: &RowsState,
+        p0: usize,
+        n: usize,
+    ) -> Result<usize, String> {
+        self.check_begin(p0, n, rows.cap)?;
+        self.positions_begun = p0 + n;
+        self.attn_window = AttentionWindow::default();
+        Ok(n)
+    }
+
+    pub(super) fn check_begin(&self, p0: usize, n: usize, cap: usize) -> Result<(), String> {
+        self.check_state()?;
+        if n == 0 || n > cap {
+            return Err(format!("rows: {n} rows are not 1..={cap}"));
         }
         if p0 != self.positions_begun {
             return Err(format!(
@@ -431,10 +572,10 @@ impl DeviceLayer<'_> {
         noise: u64,
         (_world, rank): (usize, usize),
     ) -> Result<(), String> {
-        if self.dim != HIDDEN || self.hc_mult != 4 || n == 0 || n > total || total > R_MAX {
+        if self.dim != HIDDEN || self.hc_mult != 4 || n == 0 || n > total || total > rows.cap {
             return Err(format!(
-                "rows: the device embedding gather takes 1..={R_MAX} rows of {} x 4, not {n} of {total} rows of {} x {}",
-                HIDDEN, self.dim, self.hc_mult
+                "rows: the device embedding gather takes 1..={} rows of {} x 4, not {n} of {total} rows of {} x {}",
+                rows.cap, HIDDEN, self.dim, self.hc_mult
             ));
         }
         let gather = rows.b.embed_gather;
@@ -451,7 +592,11 @@ impl DeviceLayer<'_> {
                 gather + (rank * count * 2) as u64,
             ],
         )?;
-        self.exchange_slots(gather, count, rank, "embedding gather")?;
+        if n > R_MAX {
+            self.gather_slots(gather, count, rank, "embedding gather")?;
+        } else {
+            self.exchange_slots(gather, count, rank, "embedding gather")?;
+        }
         self.cuda.launch(
             rows.kernels.embed_stream,
             (total as u32, 1, 1),
@@ -477,6 +622,22 @@ impl DeviceLayer<'_> {
         }
     }
 
+    /// The latest position at or before `next` the rows can resume from over the state a longer
+    /// sequence left: the compressor ring holds only the last SEAM_RING_ROWS positions' rows, so a
+    /// later position may have overwritten a row of the group still open at `next`. A multiple of
+    /// every compress ratio leaves no group open.
+    pub(super) fn resume_boundary(&self, next: usize) -> usize {
+        fn gcd(a: usize, b: usize) -> usize {
+            if b == 0 { a } else { gcd(b, a % b) }
+        }
+        let step = self
+            .compress_ratio
+            .iter()
+            .filter(|&&ratio| ratio > 0)
+            .fold(1, |step, &ratio| step / gcd(step, ratio) * ratio);
+        next - next % step
+    }
+
     /// One layer over rows p0..p0+n.
     pub(super) fn run_layer_rows(
         &mut self,
@@ -487,6 +648,18 @@ impl DeviceLayer<'_> {
     ) -> Result<(), String> {
         let b = rows.b;
         let dim = self.dim;
+        let bulk = rows.bulk.is_some() && n > R_MAX;
+        // The previous layer's FFN post, when it was left to this seam (a step that failed midway
+        // can leave one behind; the next step's layer 0 begins from fresh rows and drops it).
+        let pending = match rows.post_pending.take() {
+            Some(previous) if layer > 0 && previous + 1 != layer => {
+                return Err(format!(
+                    "rows layer {layer}: layer {previous}'s deferred post was never run"
+                ));
+            }
+            Some(_) => layer > 0,
+            None => false,
+        };
         if let Some((kernel, taps, layers)) = rows.taps.as_ref()
             && let Some(tap) = layers.iter().position(|&target| target == layer)
         {
@@ -499,29 +672,55 @@ impl DeviceLayer<'_> {
         }
         self.rows_engram(rows, layer, p0, n)?;
         let weights = self.seam_layer(layer, "rows entry")?;
-        self.rows_seam(
-            rows,
-            n,
-            b.stream,
-            b.pre_mix,
-            self.hc_mult as u32,
-            [
-                weights.attn_fn.0,
-                weights.attn_base.0,
-                weights.attn_scale.0,
-                weights.attn_norm.0,
-            ],
-            b.attn_mix,
-            0,
-            b.hc_rows,
-            b.normed,
-            b.act_codes,
-            b.act_scales,
-            0,
-            1,
-        )?;
+        let attn_w = [
+            weights.attn_fn.0,
+            weights.attn_base.0,
+            weights.attn_scale.0,
+            weights.attn_norm.0,
+        ];
+        let attn_out = [b.attn_mix, 0, b.normed, b.act_codes, b.act_scales, 0];
+        if pending {
+            self.rows_post_seam(
+                rows,
+                n,
+                [b.stream, b.ffn_mix, b.moe_reduced],
+                b.stream,
+                b.pre_mix,
+                self.hc_mult as u32,
+                attn_w,
+                attn_out[0],
+                attn_out[1],
+                attn_out[2],
+                attn_out[3],
+                attn_out[4],
+                attn_out[5],
+                1,
+            )?;
+        } else {
+            // A bulk chunk's attention post reads the stream in place (nothing writes it before
+            // the post), so its seam keeps no copy of it.
+            self.rows_seam(
+                rows,
+                n,
+                b.stream,
+                b.pre_mix,
+                self.hc_mult as u32,
+                attn_w,
+                attn_out[0],
+                attn_out[1],
+                if bulk { 0 } else { b.hc_rows },
+                attn_out[2],
+                attn_out[3],
+                attn_out[4],
+                attn_out[5],
+                1,
+            )?;
+        }
         self.rows_query_kv(rows, layer, p0, n)?;
-        self.rows_seam_select(rows, layer, p0, n)?;
+        match rows.bulk.as_ref().filter(|_| n > R_MAX) {
+            Some(bulk) => self.bulk_seam_select(rows, bulk, layer, p0, n)?,
+            None => self.rows_seam_select(rows, layer, p0, n)?,
+        }
         self.rows_attention(rows, layer, p0, n)?;
         self.rows_output(rows, layer, n)?;
         self.prefetch_ffn(rows, layer, &weights)?;
@@ -531,10 +730,14 @@ impl DeviceLayer<'_> {
             span(b.reduced, n * dim * 2),
             n,
         )?;
-        self.rows_post(rows, n, b.hc_rows, b.attn_mix, b.reduced, b.stream)?;
-        self.rows_seam(
+        self.rows_post_seam(
             rows,
             n,
+            [
+                if bulk { b.stream } else { b.hc_rows },
+                b.attn_mix,
+                b.reduced,
+            ],
             b.stream,
             b.attn_mix,
             MIX_ROWS as u32,
@@ -546,7 +749,6 @@ impl DeviceLayer<'_> {
             ],
             b.ffn_mix,
             b.pre_mix,
-            0,
             b.seam_row,
             b.ffn_codes,
             b.ffn_scales,
@@ -561,6 +763,20 @@ impl DeviceLayer<'_> {
             span(b.moe_reduced, n * dim * 2),
             n,
         )?;
+        // A bulk chunk leaves the post to the next layer's seam, unless that layer reads the stream
+        // before its seam (a DSpark tap, an Engram write) or this is the last layer.
+        let next = layer + 1;
+        let defer = bulk
+            && self.seam_layer(next, "rows post").is_ok()
+            && !self.engram_rows.contains(&next)
+            && !rows
+                .taps
+                .as_ref()
+                .is_some_and(|(_, _, layers)| layers.contains(&next));
+        if defer {
+            rows.post_pending.set(Some(layer));
+            return Ok(());
+        }
         self.rows_post(rows, n, b.stream, b.ffn_mix, b.moe_reduced, b.stream)
     }
 
@@ -657,6 +873,34 @@ impl DeviceLayer<'_> {
         quant_narrow: u32,
     ) -> Result<(), String> {
         let b = rows.b;
+        if let Some(bulk) = rows.bulk.as_ref().filter(|_| n > R_MAX) {
+            // A bulk chunk: the partials with each fn_w column held across 32 rows, then the
+            // tails one block a row (no tickets).
+            self.cuda.launch(
+                bulk.k.seam_partials,
+                (40, n.div_ceil(32) as u32, 1),
+                (128, 1, 1),
+                &[
+                    stream,
+                    in_pre,
+                    w[0],
+                    hc_rows,
+                    b.seam_partials,
+                    b.seam_row_buf,
+                    n as u64,
+                    u64::from(self.native_bf16),
+                    u64::from(in_pre_stride),
+                ],
+            )?;
+            return self.bulk_seam_tail(
+                rows,
+                bulk,
+                n,
+                w,
+                [mix, pre_mix_out, normed, codes, scales, x_bf16],
+                quant_narrow,
+            );
+        }
         self.cuda.launch(
             rows.kernels.seam,
             (80, n as u32, 1),
@@ -685,6 +929,116 @@ impl DeviceLayer<'_> {
                 u64::from(self.eps.to_bits()),
                 u64::from(self.hc_eps.to_bits()),
                 u64::from(in_pre_stride),
+                MIX_ROWS as u64,
+            ],
+        )
+    }
+
+    /// rows_post of `post` (residual, mix, delta) into `stream`, then the seam that reads it
+    /// ([`Self::rows_seam`]'s arguments, no hc_rows copy). A bulk chunk computes the post's rows and
+    /// the seam's partials in one pass over the stream.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn rows_post_seam(
+        &self,
+        rows: &RowsState,
+        n: usize,
+        post: [u64; 3],
+        stream: u64,
+        in_pre: u64,
+        in_pre_stride: u32,
+        w: [u64; 4],
+        mix: u64,
+        pre_mix_out: u64,
+        normed: u64,
+        codes: u64,
+        scales: u64,
+        x_bf16: u64,
+        quant_narrow: u32,
+    ) -> Result<(), String> {
+        let Some(bulk) = rows.bulk.as_ref().filter(|_| n > R_MAX) else {
+            self.rows_post(rows, n, post[0], post[1], post[2], stream)?;
+            return self.rows_seam(
+                rows,
+                n,
+                stream,
+                in_pre,
+                in_pre_stride,
+                w,
+                mix,
+                pre_mix_out,
+                0,
+                normed,
+                codes,
+                scales,
+                x_bf16,
+                quant_narrow,
+            );
+        };
+        let b = rows.b;
+        self.cuda.launch(
+            bulk.k.post_partials,
+            (40, n.div_ceil(32) as u32, 1),
+            (128, 1, 1),
+            &[
+                post[0],
+                post[1],
+                post[2],
+                stream,
+                MIX_ROWS as u64,
+                in_pre,
+                w[0],
+                b.seam_partials,
+                b.seam_row_buf,
+                n as u64,
+                u64::from(self.native_bf16),
+                u64::from(in_pre_stride),
+            ],
+        )?;
+        self.bulk_seam_tail(
+            rows,
+            bulk,
+            n,
+            w,
+            [mix, pre_mix_out, normed, codes, scales, x_bf16],
+            quant_narrow,
+        )
+    }
+
+    /// opt_bulk_mhc_tail over the chunk's rows once the partials are in: `out` is (mix,
+    /// pre_mix_out, normed, codes, scales, x_bf16).
+    fn bulk_seam_tail(
+        &self,
+        rows: &RowsState,
+        bulk: &super::bulk::BulkState,
+        n: usize,
+        w: [u64; 4],
+        out: [u64; 6],
+        quant_narrow: u32,
+    ) -> Result<(), String> {
+        let b = rows.b;
+        let [mix, pre_mix_out, normed, codes, scales, x_bf16] = out;
+        self.cuda.launch(
+            bulk.k.seam_tail,
+            (n as u32, 1, 1),
+            (256, 1, 1),
+            &[
+                w[1],
+                w[2],
+                w[3],
+                mix,
+                pre_mix_out,
+                normed,
+                codes,
+                scales,
+                x_bf16,
+                b.seam_partials,
+                b.seam_row_buf,
+                u64::from(SEAM_NORM_BF16),
+                u64::from(self.native_bf16),
+                u64::from(quant_narrow),
+                u64::from(self.sinkhorn_iters),
+                u64::from(self.eps.to_bits()),
+                u64::from(self.hc_eps.to_bits()),
                 MIX_ROWS as u64,
             ],
         )
@@ -742,11 +1096,20 @@ impl DeviceLayer<'_> {
         }
         let slot = engram.layer_slot(layer)?;
         let mut live = Vec::with_capacity(n);
+        let base = engram.base(p0);
         for row in 0..n {
-            live.push(!engram.is_skipped(slot, p0 + row)?);
+            live.push(!engram.is_skipped(slot, base + row)?);
         }
         if !live.iter().any(|&on| on) {
             return Ok(());
+        }
+        if let Some(bulk) = rows.bulk.as_ref().filter(|_| n > R_MAX) {
+            if engram.hc_mult > 4 || !engram.dim.is_multiple_of(2) {
+                return Err(
+                    "rows engram: the bulk post takes hc <= 4 copies of an even width".into(),
+                );
+            }
+            return self.bulk_engram(rows, bulk, slot, &live, p0, n);
         }
         let b = rows.b;
         let layout = engram.layout;
@@ -754,7 +1117,7 @@ impl DeviceLayer<'_> {
         let (hc, dim) = (engram.hc_mult, engram.dim);
         let layer_id = layer as u32;
         for row in 0..n {
-            let entry = slot * engram.positions + p0 + row;
+            let entry = slot * engram.positions + base + row;
             let base = engram.arena.0 + (entry * layout.stride()) as u64;
             engram_embed_launch::launch(
                 self.cuda,
@@ -892,6 +1255,9 @@ impl DeviceLayer<'_> {
                 ],
             )
         };
+        if let Some(bulk) = rows.bulk.as_ref().filter(|_| n > R_MAX) {
+            return self.bulk_engram_wkv(rows, bulk, weight, scales, out_width, inner, n);
+        }
         let split = self.reduce.and_then(|reduce| {
             let handle = reduce.0.try_borrow().ok()?;
             let (world, rank) = handle.world_rank();
@@ -960,7 +1326,6 @@ impl DeviceLayer<'_> {
         p0: usize,
         n: usize,
     ) -> Result<(), String> {
-        use sparkflash_kernels::layer_seams_launch as seams;
         let b = rows.b;
         let dim = self.dim;
         let tokens = n as u32;
@@ -1022,87 +1387,83 @@ impl DeviceLayer<'_> {
             layer as u32,
             p0 as u64,
         )?;
-        seams::launch_prologue_bf16(
-            self.cuda,
-            self.kernels.prologue_bf16,
-            &seams::PrologueBf16Params {
-                normed: Deviceptr(b.q_normed),
-                codes: Deviceptr(b.q_codes),
-                scales: Deviceptr(b.q_scales),
-                cols: lora as u32,
-                rows: tokens,
-                trace_ring: 0,
-                layer_id: layer as u32,
-                step_seq: p0 as u64,
-            },
-        )?;
+        rows.quantise_bf16(self.cuda, b.q_normed, b.q_codes, b.q_scales, lora, n)?;
         gemv("wq_b", b.q_codes, b.q_scales, b.q, rows.q_cols, lora)?;
         let (cos, sin) = self.rows_rope_tables(layer)?;
-        let pair_bytes = (self.rope_pairs as usize * 4 * p0) as u64;
         let (_, rope) = self.opt_rope.ok_or("rows: the opt rope is not loaded")?;
-        self.cuda.launch(
-            rope,
-            (self.heads_per_rank, tokens, 1),
-            (32, 1, 1),
-            &[
-                b.q,
-                cos + pair_bytes,
-                sin + pair_bytes,
-                u64::from(self.head_width),
-                u64::from(self.rope_head_dim),
-                u64::from(self.heads_per_rank),
-                u64::from(self.rope_pairs),
-            ],
-        )?;
-        // The kv tail: kv_norm, rope, the window row's round trip, the cache append, per row.
         let kv_norm = self
             .weights
             .get(layer, "kv_norm")
             .map_err(|error| format!("rows kv_norm: {error}"))?;
-        let ring_layer = self.kv_ring_base + self.kv_ring.layer_offset(layer) as u64;
-        let ring_codes = ring_layer + self.kv_ring.codes_offset(0)? as u64;
-        let ring_scales = ring_layer + self.kv_ring.scales_offset(0)? as u64;
-        let cache = self.kv_cache.layer_span(layer)?;
-        let appended = self
-            .appended_rows
-            .get(layer)
-            .copied()
-            .ok_or("rows: no cache count")?;
-        if appended != p0 {
-            return Err(format!(
-                "rows kv: layer {layer}'s cache holds {appended} rows, the step starts at {p0}"
-            ));
-        }
-        self.cuda.launch(
-            rows.kernels.kv,
-            (tokens, 1, 1),
-            (256, 1, 1),
-            &[
-                b.kv_latent,
-                kv_norm.0,
-                u64::from(self.eps.to_bits()),
-                cos,
-                sin,
-                b.kv_rotated,
-                ring_codes,
-                ring_scales,
-                cache.device,
-                self.capacity_rows as u64,
-                self.kv_ring.rows() as u64,
-                u64::from(self.head_width),
-                u64::from(self.rope_head_dim),
-                p0 as u64,
-            ],
-        )?;
-        if let Some(count) = self.appended_rows.get_mut(layer) {
-            *count = p0 + n;
+        // The q rope and the kv tail (kv_norm, rope, the window row's round trip, the cache append)
+        // run per sequence: each reads its rows' positions and writes its own lane's ring.
+        for seg in self.step_segs(p0, n) {
+            self.enter_seg(&seg)?;
+            let (row0, count) = (seg.row0 as u64, seg.n as u32);
+            let pair_bytes = (self.rope_pairs as usize * 4 * seg.p0) as u64;
+            self.cuda.launch(
+                rope,
+                (self.heads_per_rank, count, 1),
+                (32, 1, 1),
+                &[
+                    b.q + row0 * (rows.q_cols * 2) as u64,
+                    cos + pair_bytes,
+                    sin + pair_bytes,
+                    u64::from(self.head_width),
+                    u64::from(self.rope_head_dim),
+                    u64::from(self.heads_per_rank),
+                    u64::from(self.rope_pairs),
+                ],
+            )?;
+            let ring_layer = self.kv_ring_base + self.kv_ring.layer_offset(layer) as u64;
+            let ring_codes = ring_layer + self.kv_ring.codes_offset(0)? as u64;
+            let ring_scales = ring_layer + self.kv_ring.scales_offset(0)? as u64;
+            let cache = self.kv_cache.layer_span(layer)?;
+            let appended = self
+                .appended_rows
+                .get(layer)
+                .copied()
+                .ok_or("rows: no cache count")?;
+            if appended != seg.p0 {
+                return Err(format!(
+                    "rows kv: layer {layer}'s cache holds {appended} rows, the step starts at {}",
+                    seg.p0
+                ));
+            }
+            let kv_row = row0 * (rows.kv_cols * 2) as u64;
+            self.cuda.launch(
+                rows.kernels.kv,
+                (count, 1, 1),
+                (256, 1, 1),
+                &[
+                    b.kv_latent + kv_row,
+                    kv_norm.0,
+                    u64::from(self.eps.to_bits()),
+                    cos,
+                    sin,
+                    b.kv_rotated + kv_row,
+                    ring_codes,
+                    ring_scales,
+                    if self.kv_cache_off { 0 } else { cache.device },
+                    self.capacity_rows as u64,
+                    self.kv_ring.rows() as u64,
+                    u64::from(self.head_width),
+                    u64::from(self.rope_head_dim),
+                    seg.p0 as u64,
+                ],
+            )?;
+            if let Some(count) = self.appended_rows.get_mut(layer) {
+                *count = seg.p0 + seg.n;
+            }
         }
         Ok(())
     }
 
     /// The compressor seam and the indexer select, per row through the M = 1 stages with the
     /// layer's views on the row: normed (the compressor input), q_normed (the index query input),
-    /// selected (the row's list, kept across layers) and the candidate mask.
+    /// selected (the row's list, kept across layers) and the candidate mask. When the rows'
+    /// indexer GEMVs ran together (rows_seam_prepare), an index-source layer's select runs once
+    /// per segment after its rows' seams instead ([Self::rows_index_select]).
     fn rows_seam_select(
         &mut self,
         rows: &RowsState,
@@ -1112,40 +1473,172 @@ impl DeviceLayer<'_> {
     ) -> Result<(), String> {
         let b = rows.b;
         let saved = self.buffers;
-        let saved_ring = self.seam_ring;
+        // The row views replace the ring's three scratch pointers only: its other pointers are the
+        // selected lane's, which the rows below may change.
+        let saved_scratch = self
+            .seam_ring
+            .map(|ring| (ring.candidate_mask, ring.weights_f32, ring.q_index_f32));
         let dim = self.dim;
         let lora = rows.lora_cols;
         let prepared = self.rows_seam_prepare(rows, layer, p0, n)?;
         let heads = self.index_n_heads;
         let index_cols = heads * self.index_head_dim;
+        let segs = self.step_segs(p0, n);
+        let batched = prepared && self.rows_select_batched(layer, &segs);
         let mut outcome = Ok(());
-        for row in 0..n {
-            self.buffers.residual.normed = span(b.normed + (row * dim * 4) as u64, dim * 4);
-            self.buffers.workspace.q_normed = span(b.q_normed + (row * lora * 2) as u64, lora * 2);
-            self.buffers.workspace.selected = span(
-                b.selected + (row * SELECTED_STRIDE * 4) as u64,
-                SELECTED_STRIDE * 4,
-            );
-            if let (Some(ring), Some(saved)) = (self.seam_ring.as_mut(), saved_ring) {
-                ring.candidate_mask = Deviceptr(b.masks + (row * rows.mask_bytes) as u64);
-                if prepared {
-                    ring.weights_f32 = Deviceptr(b.idx_weights_f32 + (row * heads * 4) as u64);
-                    ring.q_index_f32 = Deviceptr(b.idx_q_f32 + (row * index_cols * 4) as u64);
-                }
-                let _ = saved;
-            }
-            self.seam_rows_prepared = prepared;
-            outcome = self
-                .reference_seam(layer, p0 + row)
-                .and_then(|()| self.ref_select(layer, p0 + row));
-            if outcome.is_err() {
+        'segs: for seg in &segs {
+            if let Err(error) = self.enter_seg(seg) {
+                outcome = Err(error);
                 break;
+            }
+            for row in seg.row0..seg.row0 + seg.n {
+                let position = seg.p0 + row - seg.row0;
+                self.buffers.residual.normed = span(b.normed + (row * dim * 4) as u64, dim * 4);
+                self.buffers.workspace.q_normed =
+                    span(b.q_normed + (row * lora * 2) as u64, lora * 2);
+                self.buffers.workspace.selected = span(
+                    b.selected + (row * SELECTED_STRIDE * 4) as u64,
+                    SELECTED_STRIDE * 4,
+                );
+                if let Some(ring) = self.seam_ring.as_mut() {
+                    ring.candidate_mask = Deviceptr(b.masks + (row * rows.mask_bytes) as u64);
+                    if prepared {
+                        ring.weights_f32 = Deviceptr(b.idx_weights_f32 + (row * heads * 4) as u64);
+                        ring.q_index_f32 = Deviceptr(b.idx_q_f32 + (row * index_cols * 4) as u64);
+                    }
+                }
+                self.seam_rows_prepared = prepared;
+                outcome = self.reference_seam(layer, position);
+                if outcome.is_ok() && !batched {
+                    outcome = self.ref_select(layer, position);
+                }
+                if outcome.is_err() {
+                    break 'segs;
+                }
+            }
+            if batched {
+                outcome = self.rows_index_select(rows, layer, seg);
+                if outcome.is_err() {
+                    break;
+                }
             }
         }
         self.seam_rows_prepared = false;
         self.buffers = saved;
-        self.seam_ring = saved_ring;
+        if let (Some(ring), Some((mask, weights, query))) = (self.seam_ring.as_mut(), saved_scratch)
+        {
+            ring.candidate_mask = mask;
+            ring.weights_f32 = weights;
+            ring.q_index_f32 = query;
+        }
         outcome
+    }
+
+    /// Whether an index-source layer's select runs batched over each segment's rows: the opt
+    /// select's row kernels are loaded (not the rank form, not SPARKFLASH_ROWS_SELECT=0), the
+    /// indexer geometry is theirs, and every segment's scores and scratch fit.
+    fn rows_select_batched(&self, layer: usize, segs: &[super::lanes::Seg]) -> bool {
+        let ratio = self.compress_ratio.get(layer).copied().unwrap_or(0);
+        let Some(select) = self.opt_select.as_ref() else {
+            return false;
+        };
+        if ratio == 0
+            || select.rows.is_none()
+            || !self.is_index_source(layer)
+            || self.index_n_heads > 64
+            || self.index_head_dim != 128
+            || std::env::var("SPARKFLASH_ROWS_SELECT").as_deref() == Ok("0")
+        {
+            return false;
+        }
+        segs.iter().all(|seg| {
+            let reach = (seg.p0 + seg.n) / ratio;
+            let stride = reach.next_multiple_of(4);
+            reach <= select.capacity
+                && seg.n * stride <= select.scores_floats
+                && seg.n * (reach + reach.div_ceil(4)) <= select.scratch_words
+        })
+    }
+
+    /// One segment's index-source select, batched: opt_select_scores_rows scores every row's
+    /// reachable compressed positions, then opt_select_rows takes each row's top-k into its
+    /// selected list as expanded store rows (what ref_select's select and fill write) and writes
+    /// or reads its candidate mask. Every row's chain is the M = 1 select's.
+    fn rows_index_select(
+        &mut self,
+        rows: &RowsState,
+        layer: usize,
+        seg: &super::lanes::Seg,
+    ) -> Result<(), String> {
+        let ratio = self.compress_ratio.get(layer).copied().unwrap_or(0);
+        let reach = (seg.p0 + seg.n) / ratio.max(1);
+        if reach == 0 {
+            return Ok(());
+        }
+        let owner = self
+            .owner_index_for(layer)
+            .ok_or_else(|| format!("rows select: layer {layer} has no kv-source owner"))?;
+        let (Some(ring), Some(select)) = (self.seam_ring, self.opt_select.as_ref()) else {
+            return Err(Self::refusal("rows select"));
+        };
+        let Some((scores_rows, select_rows)) = select.rows else {
+            return Err(Self::refusal("rows select"));
+        };
+        let b = rows.b;
+        let heads = self.index_n_heads;
+        let index_cols = heads * self.index_head_dim;
+        let row0 = seg.row0;
+        let keys =
+            ring.index_keys.0 + (owner * self.max_positions * self.index_head_dim * 4) as u64;
+        let stride = reach.next_multiple_of(4);
+        let tiles = reach.div_ceil(SELECT_SCORE_TILE);
+        let blocks = tiles.min((SELECT_SCORE_BLOCKS / seg.n).max(1));
+        self.cuda.launch(
+            scores_rows,
+            (blocks as u32, seg.n as u32, 1),
+            (256, 1, 1),
+            &[
+                b.idx_q_f32 + (row0 * index_cols * 4) as u64,
+                keys,
+                b.idx_weights_f32 + (row0 * heads * 4) as u64,
+                select.scores_out.0,
+                seg.p0 as u64,
+                ratio as u64,
+                stride as u64,
+                heads as u64,
+            ],
+        )?;
+        let mask_mode = match layer.cmp(&self.candidate_source_layer) {
+            std::cmp::Ordering::Less => 0u64,
+            std::cmp::Ordering::Equal => 2,
+            std::cmp::Ordering::Greater => 1,
+        };
+        let masks = b.masks + (row0 * rows.mask_bytes) as u64;
+        self.cuda.launch(
+            select_rows,
+            (seg.n as u32, 1, 1),
+            (1024, 1, 1),
+            &[
+                select.scores_out.0,
+                b.selected + (row0 * SELECTED_STRIDE * 4) as u64,
+                if mask_mode == 1 { masks } else { 0 },
+                if mask_mode == 2 { masks } else { 0 },
+                select.scratch.0,
+                seg.n as u64,
+                seg.p0 as u64,
+                ratio as u64,
+                self.index_topk as u64,
+                mask_mode,
+                self.candidate_topk_blocks as u64,
+                self.candidate_block_size as u64,
+                stride as u64,
+                SELECTED_STRIDE as u64,
+                (rows.mask_bytes / 4) as u64,
+                (reach + reach.div_ceil(4)) as u64,
+            ],
+        )?;
+        self.attn_window.selected_count = self.index_topk.min((seg.p0 + seg.n) / ratio);
+        Ok(())
     }
 
     /// The row-local GEMVs of the compressor seam (wkv, wgate into the rows' ring slots) and of the
@@ -1166,11 +1659,13 @@ impl DeviceLayer<'_> {
         let (Some(staged), Some(ring)) = (self.seam_staged, self.seam_ring) else {
             return Ok(false);
         };
+        let segs = self.step_segs(p0, n);
         let kv_source = self.is_kv_source(layer);
-        let index = self.is_index_source(layer) && (p0 + n) / ratio.max(1) > 0;
+        let index = self.is_index_source(layer)
+            && segs.iter().any(|seg| (seg.p0 + seg.n) / ratio.max(1) > 0);
         if ratio == 0
             || (!kv_source && !index)
-            || n + ratio > ring.rows + 1
+            || segs.iter().any(|seg| seg.n + ratio > ring.rows + 1)
             || std::env::var("SPARKFLASH_ROWS_INDEXER").as_deref() == Ok("0")
         {
             return Ok(false);
@@ -1206,17 +1701,22 @@ impl DeviceLayer<'_> {
             let (wkv, wkv_mode) = staged.wkv.ok_or("rows seam: no staged compressor wkv")?;
             let row_bytes = ring.head_dim * 4;
             let owner_base = owner * ring.rows * row_bytes;
-            let mut row = 0;
-            while row < n {
-                let slot = (p0 + row) % ring.rows;
-                let run = (ring.rows - slot).min(n - row);
-                let a = b.normed + (row * dim * 4) as u64;
-                let at = (owner_base + slot * row_bytes) as u64;
-                hostw(wkv_mode, a, wkv, ring.wkv.0 + at, ring.head_dim, run)?;
-                if let Some((wgate, wgate_mode)) = staged.wgate {
-                    hostw(wgate_mode, a, wgate, ring.wgate.0 + at, ring.head_dim, run)?;
+            // Each sequence's rows land in its own lane's compressor ring.
+            for seg in &segs {
+                self.enter_seg(seg)?;
+                let ring = self.seam_ring.ok_or("rows seam: no compressor ring")?;
+                let mut row = 0;
+                while row < seg.n {
+                    let slot = (seg.p0 + row) % ring.rows;
+                    let run = (ring.rows - slot).min(seg.n - row);
+                    let a = b.normed + ((seg.row0 + row) * dim * 4) as u64;
+                    let at = (owner_base + slot * row_bytes) as u64;
+                    hostw(wkv_mode, a, wkv, ring.wkv.0 + at, ring.head_dim, run)?;
+                    if let Some((wgate, wgate_mode)) = staged.wgate {
+                        hostw(wgate_mode, a, wgate, ring.wgate.0 + at, ring.head_dim, run)?;
+                    }
+                    row += run;
                 }
-                row += run;
             }
         }
         if index {
@@ -1273,7 +1773,8 @@ impl DeviceLayer<'_> {
             let table_bytes = self.max_positions * pairs * 4;
             let tables = self.buffers.workspace.rope_tables_compressed.device;
             for row in 0..n {
-                let rope_offset = ((p0 + row) * pairs * 4) as u64;
+                let (_, position) = Self::row_seg(&segs, row)?;
+                let rope_offset = (position * pairs * 4) as u64;
                 crate::layer_attention_stages::launch_forward_rope(
                     cuda,
                     self.kernels.rope_rows,
@@ -1285,7 +1786,7 @@ impl DeviceLayer<'_> {
                     self.rope_head_dim,
                     self.seam_trace_ring(),
                     layer as u32,
-                    (p0 + row) as u64,
+                    position as u64,
                 )?;
             }
             sparkflash_kernels::pool_group_launch::launch_fp4_round_trip(
@@ -1314,9 +1815,6 @@ impl DeviceLayer<'_> {
             .get(layer)
             .copied()
             .ok_or("rows: no compress ratio")?;
-        let ring_layer = self.kv_ring_base + self.kv_ring.layer_offset(layer) as u64;
-        let ring_codes = ring_layer + self.kv_ring.codes_offset(0)? as u64;
-        let ring_scales = ring_layer + self.kv_ring.scales_offset(0)? as u64;
         let sink_stride = self.out_geometry.heads_per_rank * 4;
         if (layer + 1) * sink_stride > self.sink_pool_bytes {
             return Err(format!(
@@ -1324,61 +1822,120 @@ impl DeviceLayer<'_> {
             ));
         }
         let sink = self.sink_pool.0 + (layer * sink_stride) as u64;
-        let (kv_fp4, kv_scales) = if ratio > 0 {
-            let owner = self
-                .owner_index_for(layer)
-                .ok_or_else(|| format!("rows attention: layer {layer} has no kv-source owner"))?;
-            let ring = self.seam_ring.ok_or("rows attention: no seam ring")?;
-            let (code_bytes, scale_bytes) = seam_store_owner_bytes(self.max_positions)?;
-            (
-                ring.store_codes.0 + (owner * code_bytes) as u64,
-                ring.store_scales.0 + (owner * scale_bytes) as u64,
-            )
-        } else {
-            (
-                self.buffers.workspace.store_codes.device,
-                self.buffers.workspace.store_scales.device,
-            )
-        };
-        self.cuda.launch(
-            rows.kernels.attn,
-            (self.heads_per_rank, n as u32, 1),
-            (256, 1, 1),
-            &[
-                b.q,
-                kv_fp4,
-                kv_scales,
-                ring_codes,
-                ring_scales,
-                b.selected,
-                sink,
-                b.attn_body,
-                p0 as u64,
-                ratio as u64,
-                self.index_topk as u64,
-                SELECTED_STRIDE as u64,
-                self.kv_ring.rows() as u64,
-            ],
-        )?;
+        // A bulk chunk runs the tensor-core attention (16 heads as the MMA's M), one block a row.
+        let bulk_attn = rows
+            .bulk
+            .as_ref()
+            .filter(|_| n > R_MAX && self.heads_per_rank == 16)
+            .map(|bulk| bulk.k.attn);
         let (cos, sin) = self.rows_rope_tables(layer)?;
-        self.cuda.launch(
-            rows.kernels.inv_rope,
-            (self.heads_per_rank, n as u32, 1),
-            (32, 1, 1),
-            &[
-                b.attn_body,
-                cos,
-                sin,
-                u64::from(self.head_width),
-                u64::from(self.rope_head_dim),
-                p0 as u64,
-            ],
-        )
+        let q_row = (rows.q_cols * 2) as u64;
+        // Each sequence attends its own lane's window ring and compressed store.
+        for seg in self.step_segs(p0, n) {
+            self.enter_seg(&seg)?;
+            let ring_layer = self.kv_ring_base + self.kv_ring.layer_offset(layer) as u64;
+            let ring_codes = ring_layer + self.kv_ring.codes_offset(0)? as u64;
+            let ring_scales = ring_layer + self.kv_ring.scales_offset(0)? as u64;
+            let (kv_fp4, kv_scales) = if ratio > 0 {
+                let owner = self.owner_index_for(layer).ok_or_else(|| {
+                    format!("rows attention: layer {layer} has no kv-source owner")
+                })?;
+                let ring = self.seam_ring.ok_or("rows attention: no seam ring")?;
+                let (code_bytes, scale_bytes) = seam_store_owner_bytes(self.max_positions)?;
+                (
+                    ring.store_codes.0 + (owner * code_bytes) as u64,
+                    ring.store_scales.0 + (owner * scale_bytes) as u64,
+                )
+            } else {
+                (
+                    self.buffers.workspace.store_codes.device,
+                    self.buffers.workspace.store_scales.device,
+                )
+            };
+            let (row0, count) = (seg.row0 as u64, seg.n as u32);
+            let selected = b.selected + row0 * (SELECTED_STRIDE * 4) as u64;
+            let attn_body = b.attn_body + row0 * q_row;
+            let geometry = [seg.p0 as u64, ratio as u64, self.index_topk as u64];
+            let ring = [SELECTED_STRIDE as u64, self.kv_ring.rows() as u64];
+            match (bulk_attn, rows.kernels.attn_split) {
+                (None, Some([scores, softmax, values])) if self.heads_per_rank == 16 => {
+                    let attn_scores =
+                        b.attn_scores + row0 * (ATTN_HEADS * ATTN_MAX_ATTENDED * 4) as u64;
+                    let attn_probs =
+                        b.attn_probs + row0 * (ATTN_MAX_ATTENDED * ATTN_HEADS * 4) as u64;
+                    let attn_ssum = b.attn_ssum + row0 * (ATTN_HEADS * 4) as u64;
+                    let chunks = ATTN_MAX_ATTENDED.div_ceil(ATTN_SCORE_CHUNK) as u32;
+                    let mut args = vec![
+                        b.q + row0 * q_row,
+                        kv_fp4,
+                        kv_scales,
+                        ring_codes,
+                        ring_scales,
+                        selected,
+                        attn_scores,
+                    ];
+                    args.extend(geometry);
+                    args.extend(ring);
+                    self.cuda
+                        .launch(scores, (chunks, count, 1), (256, 1, 1), &args)?;
+                    let mut args = vec![attn_scores, sink, attn_probs, attn_ssum];
+                    args.extend(geometry);
+                    self.cuda
+                        .launch(softmax, (ATTN_HEADS as u32, count, 1), (256, 1, 1), &args)?;
+                    let mut args = vec![
+                        kv_fp4,
+                        kv_scales,
+                        ring_codes,
+                        ring_scales,
+                        selected,
+                        attn_probs,
+                        attn_ssum,
+                        attn_body,
+                    ];
+                    args.extend(geometry);
+                    args.extend(ring);
+                    self.cuda
+                        .launch(values, (8, count, 1), (256, 1, 1), &args)?;
+                }
+                _ => {
+                    let (attn, grid) = match bulk_attn {
+                        Some(kernel) => (kernel, (count, 1, 1)),
+                        None => (rows.kernels.attn, (self.heads_per_rank, count, 1)),
+                    };
+                    let mut args = vec![
+                        b.q + row0 * q_row,
+                        kv_fp4,
+                        kv_scales,
+                        ring_codes,
+                        ring_scales,
+                        selected,
+                        sink,
+                        attn_body,
+                    ];
+                    args.extend(geometry);
+                    args.extend(ring);
+                    self.cuda.launch(attn, grid, (256, 1, 1), &args)?;
+                }
+            }
+            self.cuda.launch(
+                rows.kernels.inv_rope,
+                (self.heads_per_rank, count, 1),
+                (32, 1, 1),
+                &[
+                    b.attn_body + row0 * q_row,
+                    cos,
+                    sin,
+                    u64::from(self.head_width),
+                    u64::from(self.rope_head_dim),
+                    seg.p0 as u64,
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     /// wo_a over both groups, the bf16 quantiser, wo_b.
     fn rows_output(&mut self, rows: &RowsState, layer: usize, n: usize) -> Result<(), String> {
-        use sparkflash_kernels::layer_seams_launch as seams;
         let b = rows.b;
         let bind = self.attention.ok_or("rows output: no attention bind")?;
         let lookup = |name: String| -> Result<(Deviceptr, Deviceptr), String> {
@@ -1417,20 +1974,7 @@ impl DeviceLayer<'_> {
         )
         .map_err(|error| format!("rows wo_a: {error}"))?;
         let lo = rows.lo_cols;
-        seams::launch_prologue_bf16(
-            self.cuda,
-            self.kernels.prologue_bf16,
-            &seams::PrologueBf16Params {
-                normed: Deviceptr(b.attn_lo),
-                codes: Deviceptr(b.o_codes),
-                scales: Deviceptr(b.o_scales),
-                cols: lo as u32,
-                rows: tokens,
-                trace_ring: 0,
-                layer_id: layer as u32,
-                step_seq: 0,
-            },
-        )?;
+        rows.quantise_bf16(self.cuda, b.attn_lo, b.o_codes, b.o_scales, lo, n)?;
         launch_opt(
             self.cuda,
             OptKind::Fp8aBf16o,
@@ -1464,7 +2008,6 @@ impl DeviceLayer<'_> {
         p0: usize,
         n: usize,
     ) -> Result<(), String> {
-        use sparkflash_kernels::layer_seams_launch as seams;
         use sparkflash_kernels::moe_routed_device::{DeviceSpan as MoeSpan, MoeRoutedOperands};
         let b = rows.b;
         let dim = self.dim;
@@ -1475,21 +2018,26 @@ impl DeviceLayer<'_> {
             .and_then(|router| router.get(layer).copied())
             .ok_or_else(|| format!("rows router: layer {layer} has no router pointers"))?;
         let (_, router_kernel, ticket) = self.opt_router.ok_or("rows: no opt router")?;
-        self.cuda.launch(
-            router_kernel,
-            (48, 1, 1),
-            (256, 1, 1),
-            &[
-                b.ffn_x,
-                gate.0,
-                bias.0,
-                b.moe_ids,
-                b.moe_weights,
-                b.scores,
-                n as u64,
-                ticket.0,
-            ],
-        )?;
+        let bulk = rows.bulk.as_ref().filter(|_| n > R_MAX);
+        if let Some(bulk) = bulk {
+            self.bulk_router(rows, bulk, gate.0, bias.0, n)?;
+        } else {
+            self.cuda.launch(
+                router_kernel,
+                (48, 1, 1),
+                (256, 1, 1),
+                &[
+                    b.ffn_x,
+                    gate.0,
+                    bias.0,
+                    b.moe_ids,
+                    b.moe_weights,
+                    b.scores,
+                    n as u64,
+                    ticket.0,
+                ],
+            )?;
+        }
         // The shared expert's rank slice: gate/up as [group][row][local], SwiGLU, down.
         let shared = self
             .shared
@@ -1528,16 +2076,13 @@ impl DeviceLayer<'_> {
             },
         )
         .map_err(|error| format!("rows shared gate/up: {error}"))?;
-        seams::launch_shared_swiglu(
+        rows.swiglu(
             self.cuda,
-            self.kernels.shared_swiglu,
-            &seams::SharedSwigluParams {
-                gate: Deviceptr(b.shared_gate),
-                up: Deviceptr(b.shared_gate + (n * local * 4) as u64),
-                out: Deviceptr(b.shared_swiglu),
-                limit: self.swiglu_limit,
-                inter: (n * local) as u32,
-            },
+            b.shared_gate,
+            b.shared_gate + (n * local * 4) as u64,
+            b.shared_swiglu,
+            self.swiglu_limit,
+            n * local,
         )
         .map_err(|error| format!("rows shared swiglu: {error}"))?;
         let kb0 = rank * local_tiles;
@@ -1579,7 +2124,10 @@ impl DeviceLayer<'_> {
             delta_bf16: operand(b.delta_bf16, n * dim * 2),
         };
         device.set_addend(b.shared_out);
-        device.run(self.cuda, layer, p0, n, &operands)
+        match bulk {
+            Some(bulk) => device.run_bulk(self.cuda, &bulk.moe, layer, n, &operands),
+            None => device.run(self.cuda, layer, p0, n, &operands),
+        }
     }
 
     /// (world, rank) when the run's reduce handle carries the one-shot exchange: the argmax and
@@ -1616,6 +2164,32 @@ impl DeviceLayer<'_> {
         // this run uses.
         unsafe { handle.exchange_bf16(mine, gather, count, 0) }
             .map_err(|error| format!("{what}: exchange: {error}"))?;
+        drop(handle);
+        self.collectives_in_flight
+            .set(self.collectives_in_flight.get().saturating_add(1));
+        Ok(())
+    }
+
+    /// [Self::exchange_slots] as one ring AllGather (the same bits in the same slots), for a bulk
+    /// chunk's slots: the point-to-point sends of a 2K-row embedding slot take ~110 ms.
+    fn gather_slots(
+        &self,
+        gather: u64,
+        count: usize,
+        rank: usize,
+        what: &str,
+    ) -> Result<(), String> {
+        let reduce = self
+            .reduce
+            .ok_or_else(|| format!("{what}: no reduce handle"))?;
+        let mut handle = reduce
+            .0
+            .try_borrow_mut()
+            .map_err(|_| format!("{what}: the reduce handle is already borrowed"))?;
+        let mine = gather + (rank * count * 2) as u64;
+        // SAFETY: as exchange_slots; this rank's slot is the in-place AllGather's send buffer.
+        unsafe { handle.gather_bf16(mine, gather, count, 0) }
+            .map_err(|error| format!("{what}: gather: {error}"))?;
         drop(handle);
         self.collectives_in_flight
             .set(self.collectives_in_flight.get().saturating_add(1));
@@ -1677,6 +2251,51 @@ impl DeviceLayer<'_> {
         transport: &dyn sparkflash_comm::transport::Transport,
         n: usize,
     ) -> Result<Vec<(u32, f32)>, String> {
+        self.head_rows_sampled(rows, tail, transport, n, &super::sample::Sampler::GREEDY, 0)
+    }
+
+    /// [`Self::head_rows`] under `sampler`: row y's token lands at sequence index `index0 + y`
+    /// (the noise's position). Greedy is the argmax; temperature-only adds the noise in the head
+    /// kernel; a truncated sampler cuts and samples on the host from the exchanged opt_rows_topc
+    /// slots (the device exchange only). A sampled row's value is 0.
+    pub(super) fn head_rows_sampled(
+        &self,
+        rows: &RowsState,
+        tail: &crate::tp4_tail::TailStage,
+        transport: &dyn sparkflash_comm::transport::Transport,
+        n: usize,
+        sampler: &super::sample::Sampler,
+        index0: usize,
+    ) -> Result<Vec<(u32, f32)>, String> {
+        let samplers: Vec<_> = (0..n).map(|row| (*sampler, index0 + row)).collect();
+        self.head_rows_multi(rows, tail, transport, &samplers)
+    }
+
+    /// The head over rows of several requests: row y samples under `samplers[y].0` with its token
+    /// at sequence index `samplers[y].1`. Rows that share one sampler at consecutive indices take
+    /// the head kernel's scalar noise (the single request's path); otherwise each row's noise comes
+    /// from the per-row parameters, and a truncated row is picked on the host while the others take
+    /// the device argmax.
+    pub(super) fn head_rows_multi(
+        &self,
+        rows: &RowsState,
+        tail: &crate::tp4_tail::TailStage,
+        transport: &dyn sparkflash_comm::transport::Transport,
+        samplers: &[(super::sample::Sampler, usize)],
+    ) -> Result<Vec<(u32, f32)>, String> {
+        let n = samplers.len();
+        let Some(&(sampler, index0)) = samplers.first() else {
+            return Ok(Vec::new());
+        };
+        if n > R_MAX {
+            return Err(format!("rows head: {n} rows are more than {R_MAX}"));
+        }
+        // Greedy rows draw no noise, so an all-greedy step is one sampler's too.
+        let uniform = samplers
+            .iter()
+            .enumerate()
+            .all(|(row, &(other, index))| other == sampler && index == index0 + row)
+            || samplers.iter().all(|(other, _)| other.is_greedy());
         let b = rows.b;
         let dim = self.dim;
         let kernel = self
@@ -1707,6 +2326,35 @@ impl DeviceLayer<'_> {
         };
         sparkflash_kernels::rmsnorm_launch::launch(self.cuda, self.row_norm.1, &norm)?;
         let chunks = crate::tp4_tail::CHUNKS_PER_RANK;
+        let vocab = crate::tp4_tail::VOCAB_PER_RANK;
+        let truncated: Vec<bool> = samplers.iter().map(|(s, _)| s.truncated()).collect();
+        let any_truncated = truncated.iter().any(|&cut| cut);
+        let sampled = samplers.iter().any(|(s, _)| !s.is_greedy());
+        let (inv_t, seed) = if uniform {
+            sampler.head_noise()
+        } else {
+            (0, 0)
+        };
+        // The per-row noise ({inv_t bits, position, seed lo, seed hi}, then the topc temperatures
+        // at R_MAX * 4 words), written before the launch reads them (the last step's head is done:
+        // its picks were read back).
+        let params = if uniform {
+            0
+        } else {
+            let mut words = [0u32; R_MAX * 8];
+            for (row, (sampler, index)) in samplers.iter().enumerate() {
+                let (inv_t, seed) = sampler.head_noise();
+                words[row * 4] = inv_t as u32;
+                words[row * 4 + 1] = *index as u32;
+                words[row * 4 + 2] = seed as u32;
+                words[row * 4 + 3] = (seed >> 32) as u32;
+                words[R_MAX * 4 + row * 4] = sampler.inv_t().to_bits();
+            }
+            let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            rows.head_params.write_at(0, &bytes)?;
+            rows.head_params.device().0
+        };
+        let id_base = self.device_exchange().map_or(0, |(_, rank)| rank * vocab);
         self.cuda.launch(
             rows.kernels.lm_head,
             (chunks as u32, 1, 1),
@@ -1716,10 +2364,70 @@ impl DeviceLayer<'_> {
                 tail.head_weight.0,
                 b.lm_block_max,
                 b.lm_block_arg,
-                crate::tp4_tail::VOCAB_PER_RANK as u64,
+                vocab as u64,
                 n as u64,
+                if any_truncated { b.logits } else { 0 },
+                inv_t,
+                seed,
+                index0 as u64,
+                id_base as u64,
+                params,
             ],
         )?;
+        let mut picked: Vec<Option<u32>> = vec![None; n];
+        if any_truncated {
+            let Some((world, rank)) = self.device_exchange() else {
+                return Err(
+                    "rows head: top-k / top-p sampling needs the device exchange (SPARKFLASH_DEVICE_GATHER)"
+                        .to_owned(),
+                );
+            };
+            let words = super::sample::TOPC_WORDS;
+            self.cuda.launch(
+                rows.kernels.topc,
+                (n as u32, 1, 1),
+                (1024, 1, 1),
+                &[
+                    b.logits,
+                    vocab as u64,
+                    u64::from(sampler.inv_t().to_bits()),
+                    id_base as u64,
+                    b.topc_gather + (rank * n * words * 4) as u64,
+                    if uniform {
+                        0
+                    } else {
+                        params + (R_MAX * 16) as u64
+                    },
+                ],
+            )?;
+            self.exchange_slots(b.topc_gather, n * words * 2, rank, "top-p gather")?;
+            let mut bytes = vec![0u8; world * n * words * 4];
+            self.cuda.copy_dtoh(&mut bytes, &Deviceptr(b.topc_gather))?;
+            let slots: Vec<u32> = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| u32::from_le_bytes(*word))
+                .collect();
+            for (row, (sampler, index)) in samplers.iter().enumerate() {
+                if truncated[row] {
+                    picked[row] =
+                        Some(sampler.pick_truncated(&slots, n, row, world, *index as u32));
+                }
+            }
+            if truncated.iter().all(|&cut| cut) {
+                return Ok(picked
+                    .into_iter()
+                    .map(|id| (id.unwrap_or(0), 0.0))
+                    .collect());
+            }
+        }
+        if sampled && self.device_exchange().is_none() {
+            return Err(
+                "rows head: sampling needs the device exchange (SPARKFLASH_DEVICE_GATHER)"
+                    .to_owned(),
+            );
+        }
         if let Some((world, rank)) = self.device_exchange() {
             let picks = self.argmax_on_device(
                 rows,
@@ -1736,7 +2444,10 @@ impl DeviceLayer<'_> {
                 u32::from_le_bytes([words[at], words[at + 1], words[at + 2], words[at + 3]])
             };
             return Ok((0..n)
-                .map(|row| (word(row * 4), f32::from_bits(word((n + row) * 4))))
+                .map(|row| match picked[row] {
+                    Some(id) => (id, 0.0),
+                    None => (word(row * 4), f32::from_bits(word((n + row) * 4))),
+                })
                 .collect());
         }
         self.cuda.launch(
