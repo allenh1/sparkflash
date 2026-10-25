@@ -34,6 +34,7 @@ path = "src/main.rs"
 [dependencies]
 sparkflash-trace = { workspace = true }
 sparkflash-api = { workspace = true }
+sparkflash-vision = { workspace = true }
 sparkflash-engram = { workspace = true }
 sparkflash-kv = { workspace = true }
 sparkflash-comm = { workspace = true }

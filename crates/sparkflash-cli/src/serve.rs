@@ -1781,8 +1781,8 @@ fn finished_event_with_fabric(
             total_tokens: prompt_tokens + completion_tokens,
             prompt_tokens_details: PromptTokensDetails {
                 // This process has no KV pool and no persistent tier, so nothing was served from a
-                // cache; and an image request was refused before it got here, so no visual token
-                // was counted. These zeros are the state of the world, not a missing measurement.
+                // cache, and the host paths refuse images. These zeros are the state of the world,
+                // not a missing measurement; the device driver sets its prefix and image counts.
                 cached_tokens: 0,
                 uma_cached_tokens: 0,
                 nvme_cached_tokens: 0,
@@ -1896,6 +1896,11 @@ fn cluster_snapshot() -> ClusterStatsSnapshot {
 #[cfg(feature = "tp4-serve")]
 const TP4_CONTROL_MAX_FRAME: usize = 8 << 20;
 
+/// The largest canvas a [`Tp4ControlFrame::DevicePixels`] frame carries: the largest span
+/// (`vision_max_n_token` tokens) is about 1024 cells of 42 x 42 RGB pixels, 5.4 MB.
+#[cfg(feature = "tp4-serve")]
+const TP4_CONTROL_MAX_PIXELS: usize = 16 << 20;
+
 /// The prompt ids one device tick's admissions carry at most (about 7 bytes each in JSON): a
 /// request past this joins at the next tick.
 #[cfg(feature = "tp4-serve")]
@@ -1939,6 +1944,17 @@ pub enum Tp4ControlFrame {
         /// The sequence ids that end before the tick runs.
         cancel: Vec<u64>,
     },
+    /// Rank 0 -> the vision tower's rank only, before the DeviceTick that admits the request: the
+    /// canvas of image `image` of sequence `seq`, as `bytes` raw RGB bytes that follow the frame on
+    /// the wire (a canvas is megabytes; JSON would triple it).
+    DevicePixels {
+        /// The sequence the image belongs to.
+        seq: u64,
+        /// The image's index in the admission's `images`.
+        image: u32,
+        /// The canvas bytes after the frame.
+        bytes: u64,
+    },
     /// The request ended normally; every worker leaves the request loop.
     End,
     /// The request or the group failed; every worker leaves the process.
@@ -1960,6 +1976,7 @@ impl Tp4ControlFrame {
             Self::Request { .. } => "Request",
             Self::Token { .. } => "Token",
             Self::DeviceTick { .. } => "DeviceTick",
+            Self::DevicePixels { .. } => "DevicePixels",
             Self::End => "End",
             Self::Error { .. } => "Error",
         }
@@ -1986,6 +2003,28 @@ pub struct Tp4DeviceAdmit {
     pub seed: u64,
     /// The ids that end the request once emitted.
     pub stop_ids: Vec<u32>,
+    /// The prompt's images in prompt order; the canvases go to the tower rank in
+    /// [`Tp4ControlFrame::DevicePixels`] frames.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<Tp4DeviceImage>,
+}
+
+/// One image span of an admission: where it sits in the prompt and the canvas it is made from.
+#[cfg(feature = "tp4-serve")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tp4DeviceImage {
+    /// The span's first position.
+    pub start: u64,
+    /// Token rows.
+    pub n_llm_h: u32,
+    /// Token columns.
+    pub n_llm_w: u32,
+    /// Canvas height in pixels.
+    pub best_height: u32,
+    /// Canvas width in pixels.
+    pub best_width: u32,
+    /// The canvas's content key, hex.
+    pub key: String,
 }
 
 /// A typed control-channel refusal or transport failure.
@@ -2115,6 +2154,42 @@ fn write_control_frame(
     Ok(())
 }
 
+/// Writes a [`Tp4ControlFrame::DevicePixels`] frame and its canvas bytes.
+#[cfg(feature = "tp4-serve")]
+fn write_control_pixels(
+    stream: &mut TcpStream,
+    seq: u64,
+    image: u32,
+    pixels: &[u8],
+) -> Result<(), Tp4ControlError> {
+    if pixels.len() > TP4_CONTROL_MAX_PIXELS {
+        return Err(Tp4ControlError::FrameTooLarge {
+            bytes: pixels.len(),
+        });
+    }
+    let frame = Tp4ControlFrame::DevicePixels {
+        seq,
+        image,
+        bytes: pixels.len() as u64,
+    };
+    write_control_frame(stream, &frame)?;
+    stream.write_all(pixels)?;
+    stream.flush()?;
+    Ok(())
+}
+
+/// Reads the `bytes` canvas bytes that follow a [`Tp4ControlFrame::DevicePixels`] frame.
+#[cfg(feature = "tp4-serve")]
+fn read_control_pixels(stream: &mut TcpStream, bytes: u64) -> Result<Vec<u8>, Tp4ControlError> {
+    let length = usize::try_from(bytes).unwrap_or(usize::MAX);
+    if length > TP4_CONTROL_MAX_PIXELS {
+        return Err(Tp4ControlError::FrameTooLarge { bytes: length });
+    }
+    let mut pixels = vec![0u8; length];
+    stream.read_exact(&mut pixels)?;
+    Ok(pixels)
+}
+
 /// Reads one length-prefixed JSON control frame.
 #[cfg(feature = "tp4-serve")]
 fn read_control_frame(stream: &mut TcpStream) -> Result<Tp4ControlFrame, Tp4ControlError> {
@@ -2224,6 +2299,26 @@ impl Tp4ControlHub {
         }
         Ok(())
     }
+
+    /// Sends worker `rank` the canvas of image `image` of sequence `seq`.
+    fn send_pixels(
+        &mut self,
+        rank: usize,
+        seq: u64,
+        image: u32,
+        pixels: &[u8],
+    ) -> Result<(), Tp4ControlError> {
+        if !self.ready {
+            return Err(Tp4ControlError::NotReady { expected: "pixels" });
+        }
+        let stream = self.streams.get_mut(rank).and_then(Option::as_mut).ok_or(
+            Tp4ControlError::BadRank {
+                rank: u32::try_from(rank).unwrap_or(u32::MAX),
+                world: self.world,
+            },
+        )?;
+        write_control_pixels(stream, seq, image, pixels)
+    }
 }
 
 /// One worker's end of the control channel.
@@ -2320,6 +2415,11 @@ impl Tp4ControlWorker {
             });
         }
         read_control_frame(&mut self.stream)
+    }
+
+    /// Reads the canvas bytes after a [`Tp4ControlFrame::DevicePixels`] frame.
+    fn next_pixels(&mut self, bytes: u64) -> Result<Vec<u8>, Tp4ControlError> {
+        read_control_pixels(&mut self.stream, bytes)
     }
 }
 
@@ -7280,6 +7380,7 @@ mod tests {
             prompt_tokens: prompt.to_vec(),
             logprobs: LogprobsRequest::default(),
             images: Vec::new(),
+            vision: Vec::new(),
             max_tokens,
             temperature,
             top_p: 1.0,
@@ -9450,6 +9551,7 @@ mod tp4_serve_tests {
             prompt_tokens: prompt.to_vec(),
             logprobs: LogprobsRequest::default(),
             images: Vec::new(),
+            vision: Vec::new(),
             max_tokens,
             temperature: 0.0,
             top_p: 1.0,

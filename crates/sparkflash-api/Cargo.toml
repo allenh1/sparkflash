@@ -19,6 +19,10 @@ deepseek-recipe = { workspace = true }
 deepseek-recipe-core = { workspace = true }
 deepseek-recipe-encoding = { workspace = true }
 tokenizers = "0.23"
+sparkflash-vision = { workspace = true }
+# Fetches http(s) image URLs (the recipe client: rustls, five redirects); already in the lock via
+# tokenizers -> hf-hub.
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
 
 axum = { workspace = true }
 tower-http = { workspace = true }

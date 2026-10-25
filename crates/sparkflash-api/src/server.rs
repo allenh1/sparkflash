@@ -52,6 +52,10 @@ use crate::telemetry_types::{
     DSparkStepStats, DeepSeekSparkRequestStats, OpenAiUsageWithCache, safe_ratio,
 };
 use crate::tool_parser;
+use crate::vision::{
+    VisionImage, fetch_enabled as image_fetch_enabled, place_images, prepare_images,
+    refuse_unread_image, take_chat_images,
+};
 
 /// Decode-side trace request header.
 pub const TRACE_HEADER: &str = "x-sparkflash-trace";
@@ -83,8 +87,9 @@ pub const MAX_LOGPROB_TOKEN_IDS: usize = 128;
 ///
 /// axum's extractors stop at 2 MB by default, which a 1M-token prompt passes several times over
 /// (about 4 MB as plain text, 8 MB as token ids, more again once JSON-escaped). vLLM's server has
-/// no body cap, so this one is sized for the model's whole context with room to spare.
-pub const MAX_REQUEST_BODY_BYTES: usize = 64 << 20;
+/// no body cap, so this one is sized for the model's whole context with room to spare, and for the
+/// recipe's 64 MiB of images a request sent inline (about 86 MiB once base64-encoded).
+pub const MAX_REQUEST_BODY_BYTES: usize = 128 << 20;
 
 /// Capacity of the host-side GPU trace ring, in events.
 ///
@@ -399,10 +404,24 @@ fn invalid_body(error: serde_json::Error) -> ApiError {
 /// `type`) is refused with the same HTTP 400 `unsupported_capability` as the capability
 /// seam, and the message names the shape and JSON path found. It runs before
 /// `validate_request` because the typed seam only sees the parts a parser understood.
-fn refuse_image_carrier(carrier: Option<String>) -> Result<(), ApiError> {
+///
+/// With `vision` (the engine has the tower loaded) only the routes that do not read images yet
+/// call it, and the message says so instead of blaming the engine.
+fn refuse_image_carrier(carrier: Option<String>, vision: bool) -> Result<(), ApiError> {
     let Some(shape) = carrier else {
         return Ok(());
     };
+    if vision {
+        return Err(ApiError::invalid_request(
+            format!(
+                "this route does not read images (only /v1/chat/completions does, DECISIONS.md \
+                 D59): the request body carries an image at {shape}; the request is refused rather \
+                 than answered from its text tokens alone"
+            ),
+            None,
+            Some("unsupported_capability".to_owned()),
+        ));
+    }
     Err(ApiError::invalid_request(
         format!(
             "this engine does not implement the vision capability: the request body carries an \
@@ -975,6 +994,8 @@ struct RequestBuilder {
     seed: Option<u64>,
     logprobs: LogprobsRequest,
     trace: Option<TraceDirective>,
+    /// The prepared images, whose spans are already expanded in `summary.token_ids`.
+    vision: Vec<VisionImage>,
 }
 
 /// V4.1 thinking-mode sampling policy, adopted from deepseek-recipe 0.2.
@@ -991,11 +1012,10 @@ fn resolve_sampling(temperature: Option<f32>, top_p: Option<f32>, thinking: bool
 }
 
 impl RequestBuilder {
-    /// Builds the seam request. The parsed image parts are passed through - never turned into a
+    /// Builds the seam request. Unprepared image parts are passed through - never turned into a
     /// fabricated visual-token count - so the engine's `validate_request` can refuse them (see
-    /// [`crate::engine::MissingCapability`]) and a future vision engine has the payload it needs:
-    /// inline parts carry the decoded bytes, not only a length. The handler calls
-    /// `validate_request` before generation.
+    /// [`crate::engine::MissingCapability`]); prepared images ride in `vision`, their spans already
+    /// in the prompt. The handler calls `validate_request` before generation.
     ///
     /// The sampling parameters are validated here, once, for every endpoint that can carry them;
     /// the messages are vLLM's own (with one documented extension: `top_p` 0.0 is accepted as
@@ -1008,6 +1028,7 @@ impl RequestBuilder {
             model: self.model,
             prompt_tokens: self.summary.token_ids,
             images: self.summary.images,
+            vision: self.vision,
             max_tokens: self.max_tokens,
             temperature,
             top_p: validate_top_p(top_p)?,
@@ -1812,7 +1833,7 @@ async fn chat_completions(
     // With the seam attached, the prompt is the released server's template rendered by the
     // official encoder port and tokenized with the checkpoint tokenizer. Without it (the
     // weight-free router tests), the Milestone 1 heuristic keeps the placeholder path.
-    let (summary, prompt_token_ids) = match (seam.as_ref(), raw_for_seam.as_ref()) {
+    let (mut summary, prompt_token_ids) = match (seam.as_ref(), raw_for_seam.as_ref()) {
         (Some(seam), Some(raw)) => {
             let ids = seam.encode_chat(raw).map_err(tokenizer_seam_error)?;
             (tokenizer_prompt_summary(ids.clone(), 0), Some(ids))
@@ -1840,7 +1861,25 @@ async fn chat_completions(
             trace,
         ));
     }
-    refuse_image_carrier(image_carrier)?;
+    // The vision path (D59): for an engine with the vision tower, each image part is prepared and
+    // its placeholder (the template renders one per part) expanded to the image's span, so the
+    // prompt length below counts the visual tokens. A carrier left once the parts are taken is a
+    // shape this route does not read, refused rather than answered without its image.
+    let mut vision = Vec::new();
+    let capabilities = state.engine.capabilities();
+    if image_carrier.is_some()
+        && capabilities.vision
+        && let Some(raw) = raw_for_seam.as_ref()
+    {
+        let (images, stripped) = take_chat_images(raw)?;
+        refuse_unread_image(&stripped)?;
+        let prepared = prepare_images(images, image_fetch_enabled()).await?;
+        let (ids, placed) = place_images(&summary.token_ids, prepared)?;
+        summary.token_ids = ids;
+        vision = placed;
+    } else {
+        refuse_image_carrier(image_carrier, capabilities.vision)?;
+    }
     let id = state.next_id("chatcmpl-dsv41-");
     let created = state.now_unix();
     let trace_id = trace_request_id(&headers, &id);
@@ -1871,6 +1910,7 @@ async fn chat_completions(
         seed: request.seed,
         logprobs,
         trace,
+        vision,
     }
     .build()?;
     // One engine request per choice. The reference engine serves one sequence per request, so n
@@ -2780,7 +2820,7 @@ async fn completions(
             ));
         }
     };
-    refuse_image_carrier(image_carrier)?;
+    refuse_image_carrier(image_carrier, state.engine.capabilities().vision)?;
     let id = state.next_id("cmpl-dsv41-");
     let created = state.now_unix();
     let trace_id = trace_request_id(&headers, &id);
@@ -2907,6 +2947,7 @@ async fn completions(
                     seed: state.choice_seed(request.seed, choice, n),
                     logprobs: logprobs.clone(),
                     trace,
+                    vision: Vec::new(),
                 }
                 .build()?,
             );
@@ -3568,7 +3609,7 @@ async fn responses(
     if let Some(input) = request.input.as_ref() {
         summary.absorb(summarize_responses_input(input)?);
     }
-    refuse_image_carrier(image_carrier)?;
+    refuse_image_carrier(image_carrier, state.engine.capabilities().vision)?;
 
     let response_id = state.next_id("resp_dsv41_");
     let message_id = state.next_id("msg_dsv41_");
@@ -3602,6 +3643,7 @@ async fn responses(
         seed: None,
         logprobs: LogprobsRequest::default(),
         trace,
+        vision: Vec::new(),
     }
     .build()?;
     state
@@ -3680,7 +3722,7 @@ async fn messages(
     let model = resolve_model(&state, request.model.as_deref())?;
     let trace = trace_context(&headers)?;
     let summary = summarize_anthropic_messages(request.system.as_ref(), &request.messages)?;
-    refuse_image_carrier(image_carrier)?;
+    refuse_image_carrier(image_carrier, state.engine.capabilities().vision)?;
     let stop = request.stop_sequences.clone().unwrap_or_default();
     let id = state.next_id("msg_dsv41_");
     let trace_id = trace_request_id(&headers, &id);
@@ -3711,6 +3753,7 @@ async fn messages(
         seed: None,
         logprobs: LogprobsRequest::default(),
         trace,
+        vision: Vec::new(),
     }
     .build()?;
     state
@@ -3823,26 +3866,16 @@ fn model_card(state: &AppState, created: u64) -> Value {
     // `Capabilities`, `tool_choice` rides along with tools, and the schema is published only when
     // the engine honours it.
     //
-    // `multimodal` and `image_url` are the exception: they are fixed `false` rather than read from
-    // a capability field. The image path is 263 `vision.*`/`aligner.*` tensors plus the three image
-    // delimiters that the tensor plan does not load (DECISIONS.md D18), so no engine in this
-    // workspace can serve an image part. A request carrying one is refused with
-    // `unsupported_capability` before generation (D27); advertising `true` would be a claim no
-    // engine can honour.
-    //
-    // This block is the single wiring point for a future vision engine: re-add `vision` to
-    // `Capabilities`, derive `multimodal` and `image_url` from it here, and override
-    // `InferenceEngine::validate_request` with the image forward - which consumes the
-    // `EngineRequest::images` parts already carried through the seam (including the decoded bytes
-    // of inline images) and produces the visual-token ids - in the same reviewed change. Until then no code path can print `true`, so the constants
-    // cannot drift from the refusal.
+    // `multimodal` and `image_url` are `Capabilities::vision`: true only for an engine with the
+    // vision tower loaded, the same fact that decides whether the chat route prepares an image or
+    // refuses it (DECISIONS.md D59).
     let capabilities = state.engine.capabilities();
     let mut advertised = json!({
         "streaming": true,
         "tools": capabilities.tools,
         "tool_choice": capabilities.tools,
-        "multimodal": false,
-        "image_url": false,
+        "multimodal": capabilities.vision,
+        "image_url": capabilities.vision,
         "thinking": capabilities.thinking,
         "chat_template_kwargs": if capabilities.thinking { json!(["thinking"]) } else { json!([]) },
         "endpoints": [

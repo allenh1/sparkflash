@@ -21,6 +21,7 @@ use crate::telemetry_types::{
     CompletionTokensDetails, DSparkStepStats, DeepSeekSparkRequestStats, OpenAiUsageWithCache,
     PromptTokensDetails, RequestTimingStats, RoceTransportStats, finite_or_zero,
 };
+use crate::vision::VisionImage;
 
 /// Canonical Hugging Face model id served by this cluster.
 pub const MODEL_ID: &str = "deepseek-ai/DeepSeek-V4.1-Flash";
@@ -252,20 +253,24 @@ pub struct EngineRequest {
     pub request_id: String,
     /// Resolved model id.
     pub model: String,
-    /// Prompt token ids (placeholder ids in Milestone 1).
+    /// Prompt token ids (placeholder ids in Milestone 1). Each image's span is already expanded in
+    /// place: every position of it is [`sparkflash_vision::IMAGE_TOKEN_ID`], and [`Self::vision`]
+    /// says where each span starts and what fills it.
     pub prompt_tokens: Vec<u32>,
     /// The logprobs this request asks for. The default asks for none: no log-softmax, no top-k and
     /// no extra event, so a request that did not ask for logprobs pays nothing for the feature.
     pub logprobs: LogprobsRequest,
-    /// Image content parts carried by the prompt, in request order.
+    /// Image content parts the router did not prepare, in request order.
     ///
-    /// The router passes the parsed parts through and [`InferenceEngine::validate_request`] refuses
-    /// any request that has one with [`MissingCapability::vision`] before generation: no engine in
-    /// this workspace implements the image path, so there is no honest visual-token count to carry
-    /// beside them. Inline parts carry the decoded payload bytes, so a vision front end can decode
-    /// them to pixels and derive the ids, never from an assumed grid: the future wiring point has
-    /// the payload it needs.
+    /// These are the parts of a request served without the vision path (the placeholder prompt
+    /// path, or an engine without [`Capabilities::vision`]): there is no canvas and no span for
+    /// them, and [`InferenceEngine::validate_request`] refuses any request that has one with
+    /// [`MissingCapability::vision`] before generation, rather than answer from the text alone or
+    /// charge a visual-token count from an assumed grid.
     pub images: Vec<ImagePart>,
+    /// The prepared images, in prompt order: each span's place in [`Self::prompt_tokens`] and its
+    /// canvas (DECISIONS.md D59). Filled only for an engine that declares [`Capabilities::vision`].
+    pub vision: Vec<VisionImage>,
     /// Hard cap on generated tokens.
     pub max_tokens: usize,
     /// Sampling temperature.
@@ -541,18 +546,11 @@ impl ClusterStatsSnapshot {
 /// has not declared a channel is treated as not having it, so `GET /v1/models` can never advertise
 /// a capability by omission. A driver opts in by saying what it really does.
 ///
-/// There is deliberately no `vision` (or `multimodal`) field. The image path is the 263
-/// `vision.*`/`aligner.*` tensors plus the three image delimiters, and the tensor plan does not
-/// load any of them (DECISIONS.md D18), so no engine in this workspace can serve an image. A
-/// channel no driver can implement is not a capability that defaults to `false`; it is absent, and
-/// a request that needs it is refused with [`MissingCapability`] rather than answered from its text
-/// tokens or charged a visual-token count derived from an assumed image grid. When the vision path
-/// is wired, the channel returns here as a field that is `true` only for an engine that really
-/// carries the tensors - and `server::list_models` derives `multimodal`/`image_url` from it instead
-/// of the constants there today, in the same change that overrides `validate_request`. The parsed
-/// payload - including the decoded bytes of inline images - is already carried on
-/// [`EngineRequest::images`], so only the vision forward (which decodes those bytes to pixels) and
-/// the visual-token ids are missing.
+/// [`Self::vision`] is `true` only for an engine that has loaded the vision tower, the aligner and
+/// the three image delimiters (DECISIONS.md D59, amending D18). `GET /v1/models` derives
+/// `multimodal` and `image_url` from it, and the chat route prepares images only for such an
+/// engine; any other engine has a request with an image refused with [`MissingCapability`] rather
+/// than answered from its text tokens alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Capabilities {
     /// Whether the engine can emit tool calls.
@@ -561,16 +559,19 @@ pub struct Capabilities {
     pub thinking: bool,
     /// Whether the engine honours a caller's `reasoning_effort`.
     pub reasoning_effort: bool,
+    /// Whether the engine turns prepared images ([`EngineRequest::vision`]) into visual tokens.
+    pub vision: bool,
 }
 
 impl Capabilities {
-    /// Every optional channel this workspace implements, declared: what an engine that does all of
-    /// it answers. Vision is not in the list because no engine here implements it (see the type
-    /// docs).
+    /// Every text channel, declared: what a text engine that does all of it answers. Vision is
+    /// left out, because it depends on the vision tower being loaded rather than on the driver; an
+    /// engine with it says `Capabilities { vision: true, ..Capabilities::ALL }`.
     pub const ALL: Self = Self {
         tools: true,
         thinking: true,
         reasoning_effort: true,
+        vision: false,
     };
 }
 
@@ -629,16 +630,17 @@ impl MissingCapability {
 
     /// The missing vision capability, with the reason the image path cannot be served.
     ///
-    /// The reason is the same one [`Capabilities`] cites: the image path is 263
-    /// `vision.*`/`aligner.*` tensors plus the three image delimiters, and the tensor plan loads
-    /// none of them (DECISIONS.md D18).
+    /// The reason is the one [`Capabilities::vision`] stands for: the image path is 263
+    /// `vision.*`/`aligner.*` tensors plus the three image delimiters, and this engine has not
+    /// loaded them (DECISIONS.md D18, D59).
     #[must_use]
     pub fn vision() -> Self {
         Self {
             capability: Capability::Vision,
-            detail: "the 263 vision/aligner tensors and the three image delimiters are not wired into \
-                     the tensor plan (DECISIONS.md D18), so an image part cannot be turned into visual \
-                     tokens; the request is refused rather than answered from its text tokens alone",
+            detail: "the 263 vision/aligner tensors and the three image delimiters are not loaded by \
+                     this engine (DECISIONS.md D18, D59), so an image part cannot be turned into \
+                     visual tokens; the request is refused rather than answered from its text tokens \
+                     alone",
         }
     }
 }
@@ -686,16 +688,15 @@ pub trait InferenceEngine: Send + Sync {
 
     /// Checks that this engine can serve `request` before any generation.
     ///
-    /// The default implementation refuses a request that carries an image part with
-    /// [`MissingCapability::vision`]: no engine in this workspace implements the image path, and
-    /// [`Capabilities`] deliberately has no vision channel to consult. An engine that really can
-    /// serve images overrides this method together with the capability surface, so the refusal and
-    /// the advertisement stay the same fact.
+    /// The default implementation refuses, with [`MissingCapability::vision`], a request that
+    /// carries an unprepared image part, or prepared images when [`Self::capabilities`] does not
+    /// declare vision: the refusal and the advertisement are the same fact.
     ///
     /// # Errors
     /// [`MissingCapability`] naming the first channel the request needs and the engine lacks.
     fn validate_request(&self, request: &EngineRequest) -> Result<(), MissingCapability> {
-        if !request.images.is_empty() {
+        if !request.images.is_empty() || (!request.vision.is_empty() && !self.capabilities().vision)
+        {
             return Err(MissingCapability::vision());
         }
         Ok(())
@@ -1036,10 +1037,9 @@ impl MockEngine {
                 cached_tokens: plan.global_kv_cached_tokens,
                 uma_cached_tokens: plan.uma_hit_tokens,
                 nvme_cached_tokens: plan.nvme_restored_tokens,
-                // No engine here produces visual tokens. The router refuses an image request via
-                // validate_request; a direct caller that bypasses that check still gets no
-                // fabricated count from this mock.
-                image_tokens: 0,
+                // The prepared spans' positions, which a vision engine reports; unprepared parts are
+                // refused by validate_request and never counted.
+                image_tokens: crate::vision::image_tokens(&request.vision),
             },
             completion_tokens_details: CompletionTokensDetails {
                 reasoning_tokens,
@@ -1132,6 +1132,7 @@ mod tests {
             prompt_tokens: vec![1, 2, 3],
             logprobs: LogprobsRequest::default(),
             images: Vec::new(),
+            vision: Vec::new(),
             max_tokens: 64,
             temperature: 1.0,
             top_p: 1.0,
@@ -1186,16 +1187,47 @@ mod tests {
     }
 
     #[test]
-    fn the_capability_set_has_no_vision_channel() {
-        // A struct literal, so re-adding a `vision` field fails to compile until this test and the
-        // refusal in `validate_request` are updated together: there is no channel to advertise while
-        // the 263 vision/aligner tensors are unwired (DECISIONS.md D18, D27).
-        let every_implemented_channel = Capabilities {
+    fn all_declares_every_text_channel_and_leaves_vision_out() {
+        // A struct literal, so a new channel fails to compile until this test says whether `ALL`
+        // covers it. Vision is declared by an engine with the tower loaded, never by `ALL` (D59).
+        let every_text_channel = Capabilities {
             tools: true,
             thinking: true,
             reasoning_effort: true,
+            vision: false,
         };
-        assert_eq!(Capabilities::ALL, every_implemented_channel);
+        assert_eq!(Capabilities::ALL, every_text_channel);
+    }
+
+    fn prepared_image() -> VisionImage {
+        let grid = sparkflash_vision::Geometry::V41.grid(42, 42);
+        VisionImage {
+            span: sparkflash_vision::ImageSpan {
+                start: 1,
+                grid,
+                key: [0; 32],
+            },
+            pixels: vec![0; 42 * 42 * 3].into(),
+        }
+    }
+
+    #[test]
+    fn prepared_images_pass_only_an_engine_that_declares_vision() {
+        let mut request = request();
+        request.vision = vec![prepared_image()];
+        let text = MockEngine::new(MODEL_ID).with_capabilities(Capabilities::ALL);
+        assert_eq!(
+            text.validate_request(&request).map_err(|e| e.capability()),
+            Err(Capability::Vision)
+        );
+        let vision = MockEngine::new(MODEL_ID).with_capabilities(Capabilities {
+            vision: true,
+            ..Capabilities::ALL
+        });
+        assert_eq!(vision.validate_request(&request), Ok(()));
+        // An unprepared part has no canvas and no span, whatever the engine declares.
+        request.images = vec![ImagePart::Placeholder];
+        assert!(vision.validate_request(&request).is_err());
     }
 
     #[test]

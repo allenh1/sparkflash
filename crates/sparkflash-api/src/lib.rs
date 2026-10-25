@@ -21,6 +21,7 @@ pub mod server;
 pub mod state;
 pub mod telemetry_types;
 pub mod tool_parser;
+pub mod vision;
 
 pub use encoding::{SparkV41Encoding, TokenizerSeam, TokenizerSeamError};
 pub use engine::{
@@ -40,3 +41,4 @@ pub use telemetry_types::{
     CompletionTokensDetails, DSparkStepStats, DeepSeekSparkRequestStats, OpenAiUsageWithCache,
     PromptTokensDetails, RequestTimingStats, RoceTransportStats,
 };
+pub use vision::VisionImage;

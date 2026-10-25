@@ -21,6 +21,11 @@
 //! Lanes are backed as they grow. When the budget cannot back a step, free lanes give their memory
 //! back (least recently used first), then the newest running sequence is preempted: it gives up its
 //! lane and waits again, and recomputes its tokens when it gets one.
+//!
+//! A prompt's image spans (super::vision) are held as [`HASH_SENTINEL`] tokens, the reference's
+//! Engram mask: no n-gram reads through them. Their embedding uploads carry the placeholder id,
+//! and a lane's prefix is shared only up to the first image span the two prompts do not hold alike
+//! (the same place, grid and canvas key).
 
 use super::draft::{AnchorRow, BLOCK, DraftState};
 use super::lanes::{SLIDE_STEP, Seg, slide_floor};
@@ -32,7 +37,10 @@ use super::spec::{
 };
 use super::*;
 use crate::device_link::{DeviceFinish, DeviceJob};
+use sparkflash_api::VisionImage;
+use sparkflash_engine::forward::engram::HASH_SENTINEL;
 use sparkflash_kernels::cuda_driver::HostMapped;
+use sparkflash_vision::{IMAGE_TOKEN_ID, ImageSpan};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -76,8 +84,10 @@ enum Phase {
 /// One sequence on the scheduler.
 struct Seq {
     id: u64,
-    /// The prompt, then every token emitted.
+    /// The prompt, then every token emitted; an image span's positions hold [`HASH_SENTINEL`].
     tokens: Vec<u32>,
+    /// The prompt's images, in prompt order (the canvases on the tower rank only).
+    images: Vec<VisionImage>,
     prompt_len: usize,
     max_new: usize,
     sampler: Sampler,
@@ -123,6 +133,8 @@ struct Lane {
     /// The tokens whose state the lane holds, position by position: a finished sequence's stay
     /// for a later request that shares their prefix.
     resident: Vec<u32>,
+    /// The image spans that start in `resident`.
+    spans: Vec<ImageSpan>,
     /// The sequence on the lane.
     seq: Option<u64>,
     /// The tick the lane was last given up (least recently used goes first).
@@ -316,6 +328,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         self.admit_seq(
             id,
             &job.prompt,
+            &job.images,
             job.max_tokens.max(1),
             sampler,
             &job.stop_ids,
@@ -323,10 +336,12 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn admit_seq(
         &mut self,
         id: u64,
         prompt: &[u32],
+        images: &[VisionImage],
         max_new: usize,
         sampler: Sampler,
         stop_ids: &[u32],
@@ -338,6 +353,29 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 prompt.len(),
                 self.room
             ));
+        }
+        let mut tokens = prompt.to_vec();
+        if !images.is_empty() {
+            if !self.device.has_vision() || self.exchange.is_none() {
+                return Err(
+                    "images need the vision tower and the device exchange, and this epoch has not both"
+                        .to_owned(),
+                );
+            }
+            let mut next = 0;
+            for image in images {
+                let span = &image.span;
+                if span.start < next || span.end() > tokens.len() {
+                    return Err(format!(
+                        "an image span at {}..{} is out of order or past the {}-token prompt",
+                        span.start,
+                        span.end(),
+                        tokens.len()
+                    ));
+                }
+                tokens[span.start..span.end()].fill(HASH_SENTINEL);
+                next = span.end();
+            }
         }
         if !sampler.is_greedy() && self.exchange.is_none() {
             return Err(
@@ -353,7 +391,8 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         policy.adaptive &= sampler.is_greedy();
         self.seqs.push(Seq {
             id,
-            tokens: prompt.to_vec(),
+            tokens,
+            images: images.to_vec(),
             prompt_len: prompt.len(),
             max_new,
             sampler,
@@ -473,6 +512,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         self.admit_seq(
             id,
             request.prompt,
+            &[],
             request.max_new,
             request.sampler,
             request.stop_ids,
@@ -507,7 +547,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             let ids: Vec<u32> = (0..len as u32)
                 .map(|i| 1000 + i.wrapping_mul(7919) % 90_000)
                 .collect();
-            self.admit_seq(u64::MAX - index as u64, &ids, 8, greedy, &[], true)?;
+            self.admit_seq(u64::MAX - index as u64, &ids, &[], 8, greedy, &[], true)?;
         }
         while !self.idle() {
             for emission in self.tick()? {
@@ -525,6 +565,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
     /// Lane `lane` holds nothing any more (its memory goes back to the pool).
     fn forget(&mut self, lane: usize) -> Result<(), String> {
         self.lanes[lane].resident.clear();
+        self.lanes[lane].spans.clear();
         if self.attached {
             self.device.release_lane(lane)?;
         }
@@ -550,6 +591,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
     ) -> Result<SpecOutcome, String> {
         let id = self.seqs[index].id;
         self.drop_reads(id)?;
+        self.device.vision_release(id);
         let seq = &mut self.seqs[index];
         seq.done = true;
         if let Some(lane) = seq.lane.take() {
@@ -557,8 +599,15 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             lane.seq = None;
             lane.used = self.ticks;
             lane.resident.clear();
-            lane.resident
-                .extend_from_slice(&seq.tokens[..valid.min(seq.tokens.len())]);
+            let valid = valid.min(seq.tokens.len());
+            lane.resident.extend_from_slice(&seq.tokens[..valid]);
+            lane.spans.clear();
+            lane.spans.extend(
+                seq.images
+                    .iter()
+                    .map(|image| image.span)
+                    .filter(|span| span.start < valid),
+            );
         }
         Ok(SpecOutcome {
             emitted: seq.tokens[seq.prompt_len..].to_vec(),
@@ -638,12 +687,21 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             };
             let target = self.seqs[index].target();
             let wanted = &self.seqs[index].tokens[..target];
+            let images = &self.seqs[index].images;
             let common = |lane: &Lane| {
-                lane.resident
+                let shared = lane
+                    .resident
                     .iter()
                     .zip(wanted)
                     .take_while(|(held, want)| held == want)
-                    .count()
+                    .count();
+                // Equal span tokens are not equal images: stop at the first span the lane does
+                // not hold alike.
+                images
+                    .iter()
+                    .map(|image| image.span)
+                    .find(|span| span.start < shared && !lane.spans.contains(span))
+                    .map_or(shared, |span| span.start)
             };
             let free = (0..self.lanes.len()).filter(|&lane| self.lanes[lane].seq.is_none());
             let Some((lane, shared)) = free
@@ -714,6 +772,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             let lane_state = &mut self.lanes[lane];
             lane_state.seq = Some(id);
             lane_state.resident.truncate(start);
+            lane_state.spans.retain(|span| span.start < start);
             let seq = &mut self.seqs[index];
             seq.lane = Some(lane);
             seq.pos = start;
@@ -790,6 +849,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
     fn preempt(&mut self, index: usize) -> Result<(), String> {
         let id = self.seqs[index].id;
         self.drop_reads(id)?;
+        self.device.vision_release(id);
         let seq = &mut self.seqs[index];
         let Some(lane) = seq.lane.take() else {
             return Ok(());
@@ -884,13 +944,12 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             }
             match self.exchange {
                 Some(exchange) => {
-                    let ids: Vec<u8> = seq.tokens[p..p + n]
-                        .iter()
-                        .flat_map(|id| id.to_le_bytes())
-                        .collect();
+                    let ids = upload_ids(&seq.tokens[p..p + n]);
                     self.device
                         .cuda
                         .copy_htod(&Deviceptr(rows.b.row_ids), &ids)?;
+                    let seq = &self.seqs[index];
+                    self.device.vision_begin(seq.id, &seq.images, p, n)?;
                     self.device.begin_rows_device(
                         rows,
                         p,
@@ -911,6 +970,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 }
             }
             self.device.spec_layers(rows, inputs.staged, p, n)?;
+            self.device.vision_end();
             self.device.draft_seed(rows, draft, p, n)?;
             let seq = &self.seqs[index];
             if p + n == target && seq.emitted() == 0 {
@@ -996,14 +1056,13 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             None => submit(self.device, &self.seqs[index].tokens, p, chunk(p), 0)?,
         };
         let n = current.as_ref().map_or_else(|| chunk(p), |next| next.n);
-        let tokens = &self.seqs[index].tokens;
-        let ids: Vec<u8> = tokens[p..p + n]
-            .iter()
-            .flat_map(|id| id.to_le_bytes())
-            .collect();
+        let ids = upload_ids(&self.seqs[index].tokens[p..p + n]);
         self.device
             .cuda
             .copy_htod(&Deviceptr(state.b.row_ids), &ids)?;
+        let seq = &self.seqs[index];
+        self.device.vision_begin(seq.id, &seq.images, p, n)?;
+        let tokens = &self.seqs[index].tokens;
         self.device
             .begin_rows_device(state, p, inputs.embed.0, state.b.row_ids, n, exchange)?;
         let after = p + n;
@@ -1032,6 +1091,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             }
             _ => self.device.spec_layers(state, inputs.staged, p, n)?,
         }
+        self.device.vision_end();
         self.prefill_next = next;
         self.device.draft_seed(state, draft, p, n)?;
         self.seqs[index].pos = after;
@@ -1403,6 +1463,22 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         }
         Ok(n)
     }
+}
+
+/// A chunk's token ids as the embedding upload takes them: an image span's positions are the
+/// placeholder's row (the tower rank overwrites them before the exchange).
+fn upload_ids(tokens: &[u32]) -> Vec<u8> {
+    tokens
+        .iter()
+        .map(|&id| {
+            if id == HASH_SENTINEL {
+                IMAGE_TOKEN_ID
+            } else {
+                id
+            }
+        })
+        .flat_map(u32::to_le_bytes)
+        .collect()
 }
 
 impl Drop for Batch<'_, '_, '_> {

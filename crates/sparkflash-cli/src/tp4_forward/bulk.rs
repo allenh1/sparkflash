@@ -79,7 +79,7 @@ pub(super) struct BulkState {
     select_scratch: u64,
     select_words: usize,
     /// The router's raw dots, `[cap][experts]` f32.
-    dots: u64,
+    pub(super) dots: u64,
     /// The chunk's DSpark taps, `[cap][3][dim]` f32 (the rows state's tap sink).
     pub(super) taps: u64,
     /// With Engram: the two pinned buffers a chunk's table reads land in (a chunk's reads run

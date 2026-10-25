@@ -310,7 +310,7 @@ impl<S: DeviceSession + 'static> InferenceEngine for DeviceEngine<S> {
     }
 
     fn validate_request(&self, request: &EngineRequest) -> Result<(), MissingCapability> {
-        if !request.images.is_empty() {
+        if !request.images.is_empty() || !request.vision.is_empty() {
             return Err(MissingCapability::vision());
         }
         Ok(())

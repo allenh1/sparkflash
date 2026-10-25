@@ -14,8 +14,31 @@
 //! decisions, so every rank runs the same steps with the same samplers, emits the same tokens (the
 //! sampler's noise is a pure function of the seed and the position), and ends every sequence at
 //! the same tick.
+//!
+//! A request's images (DECISIONS.md D59) travel with it: every rank gets each span's place, grid
+//! and content key, and the rank that owns the image placeholder's embedding row ([`tower_rank`])
+//! also gets the canvas and runs the vision tower; the span rows reach the other ranks through the
+//! embedding exchange, like any token's.
 
+use std::path::Path;
 use std::sync::Mutex;
+
+/// The vision tower's cubin in the `--tp4-device` cubin directory: serving takes images when it is
+/// there and SPARKFLASH_VISION is not 0.
+pub const VISION_CUBIN: &str = "opt_vision_sm121.cubin";
+
+/// Whether the device path serves images with the cubins in `cubins`: every rank asks the same
+/// question of the same staged directory, so every rank gives the same answer.
+#[must_use]
+pub fn vision_enabled(cubins: &Path) -> bool {
+    std::env::var("SPARKFLASH_VISION").as_deref() != Ok("0") && cubins.join(VISION_CUBIN).is_file()
+}
+
+/// The rank that runs the vision tower: the owner of the image placeholder's embedding row.
+#[must_use]
+pub const fn tower_rank() -> usize {
+    sparkflash_vision::IMAGE_TOKEN_ID as usize / crate::tp4_tail::VOCAB_PER_RANK
+}
 
 /// One request as the device loop runs it: identical on every rank.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +58,10 @@ pub struct DeviceJob {
     /// Token ids that end the request (emitted, then stop): the end-of-sequence id unless the
     /// request ignores it.
     pub stop_ids: Vec<u32>,
+    /// The prompt's images in prompt order: each span's place in `prompt` (every span position
+    /// holds the placeholder id), grid and content key. The canvas is there on the
+    /// [`tower_rank`] only and empty on the others.
+    pub images: Vec<sparkflash_api::VisionImage>,
 }
 
 /// Why a device request ended.

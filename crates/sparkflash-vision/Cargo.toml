@@ -1,0 +1,16 @@
+[package]
+name = "sparkflash-vision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The vision path's image front end: decoding, the reference resize plan, Pillow-exact resampling and the image token span"
+
+[dependencies]
+gif = "0.14"
+image-webp = "0.2"
+png = "0.18"
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+zune-core = "0.5"
+zune-jpeg = "0.5"

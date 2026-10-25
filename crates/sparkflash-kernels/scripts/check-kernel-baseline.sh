@@ -1,5 +1,5 @@
 #!/bin/sh
-# Verifies that nvcc still compiles the forty-one baseline kernels to the recorded baseline.
+# Verifies that nvcc still compiles the forty-two baseline kernels to the recorded baseline.
 #
 # This is the check that would catch a kernel silently changing: it recompiles each kernel to a cubin
 # and to PTX, and compares the cubin bytes, the cubin sha256 and the PTX membar count with
@@ -16,7 +16,7 @@ set -eu
 crate_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 baseline="$crate_dir/baseline/kernel_baseline.txt"
 nvcc=${SPARKFLASH_NVCC:-nvcc}
-kernels="mega_mhc_sm121 b12x_mxfp8_dense_sm121 b12x_mxfp8_dense_m1_sm121 b12x_mxfp8_gemv_m1_sm121 b12x_mxfp4_moe_sm121 b12x_mxfp4_moe_stored_sm121 flash_mla_csa2_sm121 b12x_mxfp8_wo_a_sm121 cert_lm_head_sm121 swiglu_mxfp8_quant_sm121 moe_router_sm121 routed_gate_up_sm121 swiglu_mxfp8_quant_weighted_sm121 rmsnorm_sm121 lm_head_reduce_sm121 flash_mla_csa2_seq_sm121 flash_mla_csa2_ring_sm121 b12x_bf16a_mxfp8w_dense_sm121 b12x_bf16a_mxfp8w_wo_a_sm121 engram_embed_sm121 engram_wkv_sm121 engram_gate_write_sm121 b12x_hostw_gemv_m1_sm121 layer_seams_sm121 kv_path_sm121 ref_select_sm121 compressed_append_sm121 engram_write_sm121 engram_stream_convert_sm121 moe_routed_device_sm121 pool_group_sm121 opt_attn_sm121 opt_draft_sm121 opt_gemv_sm121 opt_misc_sm121 opt_moe_sm121 opt_router_sm121 opt_rows_sm121 opt_seams_sm121 opt_select_sm121 opt_mma_sm121"
+kernels="mega_mhc_sm121 b12x_mxfp8_dense_sm121 b12x_mxfp8_dense_m1_sm121 b12x_mxfp8_gemv_m1_sm121 b12x_mxfp4_moe_sm121 b12x_mxfp4_moe_stored_sm121 flash_mla_csa2_sm121 b12x_mxfp8_wo_a_sm121 cert_lm_head_sm121 swiglu_mxfp8_quant_sm121 moe_router_sm121 routed_gate_up_sm121 swiglu_mxfp8_quant_weighted_sm121 rmsnorm_sm121 lm_head_reduce_sm121 flash_mla_csa2_seq_sm121 flash_mla_csa2_ring_sm121 b12x_bf16a_mxfp8w_dense_sm121 b12x_bf16a_mxfp8w_wo_a_sm121 engram_embed_sm121 engram_wkv_sm121 engram_gate_write_sm121 b12x_hostw_gemv_m1_sm121 layer_seams_sm121 kv_path_sm121 ref_select_sm121 compressed_append_sm121 engram_write_sm121 engram_stream_convert_sm121 moe_routed_device_sm121 pool_group_sm121 opt_attn_sm121 opt_draft_sm121 opt_gemv_sm121 opt_misc_sm121 opt_moe_sm121 opt_router_sm121 opt_rows_sm121 opt_seams_sm121 opt_select_sm121 opt_mma_sm121 opt_vision_sm121"
 
 if [ ! -f "$baseline" ]; then
     echo "no baseline at $baseline" >&2

@@ -59,3 +59,7 @@ sparkflash-kv = { workspace = true, features = ["cuda"] }
 # The device run reads the node golden fixture (SequenceFixture derives Deserialize) and writes
 # its own JSON report; the library itself does not depend on a JSON writer.
 serde_json = { workspace = true }
+# The vision tower's golden check (examples/vision_golden.rs) builds the canvas with the image
+# front end the server uses, so the patches it checks are the served ones. Dev-only: the library
+# takes a canvas and never decodes an image.
+sparkflash-vision = { workspace = true }

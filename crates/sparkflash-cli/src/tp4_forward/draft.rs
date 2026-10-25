@@ -563,7 +563,16 @@ impl DeviceLayer<'_> {
                     (32, 1, 1),
                     &[draft.ids, u64::from(anchor)],
                 )?;
-                self.embed_rows_on_device(rows, embed, draft.ids, 1, n, draft.noise, exchange)?;
+                self.embed_rows_on_device(
+                    rows,
+                    embed,
+                    draft.ids,
+                    1,
+                    n,
+                    draft.noise,
+                    exchange,
+                    false,
+                )?;
             }
             AnchorRow::Host(anchor_row) => {
                 let mut stream = Vec::with_capacity(n * hc * dim * 4);
@@ -1063,6 +1072,7 @@ impl DeviceLayer<'_> {
                     verify,
                     0,
                     (world, rank),
+                    false,
                 )?;
             }
             let mut words = vec![0u8; (BLOCK + 1) * 8];

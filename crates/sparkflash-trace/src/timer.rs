@@ -5,11 +5,10 @@
 //! a monotonic process clock so the whole crate stays testable on x86 build hosts.
 
 use std::sync::OnceLock;
-use std::time::Instant;
-
-fn fallback_epoch() -> &'static Instant {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    EPOCH.get_or_init(Instant::now)
+#[cfg(not(target_arch = "aarch64"))]
+fn fallback_epoch() -> &'static std::time::Instant {
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now)
 }
 
 /// Frequency of the counter returned by read_counter, in Hz.

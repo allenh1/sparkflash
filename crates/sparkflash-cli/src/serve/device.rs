@@ -45,11 +45,13 @@ use sparkflash_engine::config::ModelConfig;
 use super::{
     ENGINE_ERROR_CODE, ENGINE_GONE_CODE, EXIT_REFUSED, REFUSED_CODE, RequestTiming, RunSummary,
     ServeOptions, StopBuffer, TP4_CONTROL_TIMEOUT, TP4_TICK_PROMPT_IDS, Tp4ControlFrame,
-    Tp4ControlHub, Tp4ControlWorker, Tp4DeviceAdmit, Tp4ServeOptions, bind_and_serve,
-    default_tokenizer, epoch_millis, finished_event_with_fabric, load_tokenizer, refused,
-    tp4_cluster_snapshot,
+    Tp4ControlHub, Tp4ControlWorker, Tp4DeviceAdmit, Tp4DeviceImage, Tp4ServeOptions,
+    bind_and_serve, default_tokenizer, epoch_millis, finished_event_with_fabric, load_tokenizer,
+    refused, tp4_cluster_snapshot,
 };
 use crate::device_link::{DeviceFinish, DeviceJob, DeviceLink, DeviceOutcome, DeviceTick};
+use sparkflash_api::VisionImage;
+use sparkflash_vision::{Geometry, Grid, IMAGE_TOKEN_ID, ImageSpan};
 
 /// Positions kept past `--max-model-len` for the last verify block (k drafts, the draft block and
 /// the bonus row), so a request that fills the context still has its rows.
@@ -149,6 +151,8 @@ pub struct DeviceDriver {
     metrics: Arc<Metrics>,
     seeds: RandomState,
     draws: AtomicU64,
+    /// Whether the epoch runs the vision tower (the cubin is staged; DECISIONS.md D59).
+    vision: bool,
 }
 
 impl DeviceDriver {
@@ -178,6 +182,69 @@ fn unsupported(request: &EngineRequest) -> Option<&'static str> {
     None
 }
 
+/// Why the prompt's image spans cannot be what the router built (each span in bounds, in order and
+/// apart, every span position and no other holding the placeholder, the grid the canvas makes, and
+/// a canvas of that size), if they are not.
+fn bad_spans(prompt: &[u32], images: &[VisionImage]) -> Option<String> {
+    let mut next = 0usize;
+    for (index, image) in images.iter().enumerate() {
+        let span = &image.span;
+        let grid = span.grid;
+        let patch = Geometry::V41.patch;
+        if grid.best_height == 0
+            || grid.best_width == 0
+            || grid.best_height % patch != 0
+            || grid.best_width % patch != 0
+            || Geometry::V41.grid(grid.best_height, grid.best_width) != grid
+        {
+            return Some(format!("image {index}: {grid:?} is not a canvas's grid"));
+        }
+        if image.pixels.len() != grid.best_height * grid.best_width * 3 {
+            return Some(format!(
+                "image {index}: {} canvas bytes for a {} x {} canvas",
+                image.pixels.len(),
+                grid.best_width,
+                grid.best_height
+            ));
+        }
+        if span.start < next || span.end() > prompt.len() {
+            return Some(format!(
+                "image {index}: positions {}..{} overlap the span before it or pass the {}-token prompt",
+                span.start,
+                span.end(),
+                prompt.len()
+            ));
+        }
+        if let Some(offset) = prompt[next..span.start]
+            .iter()
+            .position(|&id| id == IMAGE_TOKEN_ID)
+        {
+            return Some(format!(
+                "position {}: the image placeholder outside an image span",
+                next + offset
+            ));
+        }
+        if prompt[span.start..span.end()]
+            .iter()
+            .any(|&id| id != IMAGE_TOKEN_ID)
+        {
+            return Some(format!(
+                "image {index}: a position of its span does not hold the placeholder"
+            ));
+        }
+        next = span.end();
+    }
+    prompt[next..]
+        .iter()
+        .position(|&id| id == IMAGE_TOKEN_ID)
+        .map(|offset| {
+            format!(
+                "position {}: the image placeholder outside an image span",
+                next + offset
+            )
+        })
+}
+
 impl ApiInferenceEngine for DeviceDriver {
     fn model_id(&self) -> &str {
         MODEL_ID
@@ -190,12 +257,15 @@ impl ApiInferenceEngine for DeviceDriver {
     }
 
     fn generate(&self, request: EngineRequest) -> BoxStream<'static, EngineEvent> {
-        if !request.images.is_empty() {
+        if !request.images.is_empty() || (!request.vision.is_empty() && !self.vision) {
             let missing = MissingCapability::vision();
             return refused(&missing.to_string(), missing.code());
         }
         if let Some(reason) = unsupported(&request) {
             return refused(reason, REFUSED_CODE);
+        }
+        if let Some(reason) = bad_spans(&request.prompt_tokens, &request.vision) {
+            return refused(&reason, REFUSED_CODE);
         }
         let prompt_tokens = request.prompt_tokens.len();
         if prompt_tokens == 0 {
@@ -234,6 +304,7 @@ impl ApiInferenceEngine for DeviceDriver {
             seed,
             stop_ids: vec![self.end_of_sequence],
             prompt: request.prompt_tokens,
+            images: request.vision,
         };
         let (events, answers) = tokio::sync::mpsc::unbounded_channel();
         let pending = Pending {
@@ -289,9 +360,13 @@ impl ApiInferenceEngine for DeviceDriver {
     }
 
     /// Tool calls are parsed from the content by the router; the reasoning channel and the
-    /// effort are the chat template's, which renders both into the prompt this path runs.
+    /// effort are the chat template's, which renders both into the prompt this path runs. Images
+    /// are served when the epoch runs the vision tower.
     fn capabilities(&self) -> Capabilities {
-        Capabilities::ALL
+        Capabilities {
+            vision: self.vision,
+            ..Capabilities::ALL
+        }
     }
 
     fn vocab_size(&self) -> Option<usize> {
@@ -462,6 +537,8 @@ impl Live {
                 if let EngineEvent::Finished { usage, .. } = &mut event {
                     usage.completion_tokens_details.reasoning_tokens = self.reasoning_tokens;
                     usage.prompt_tokens_details.cached_tokens = outcome.cached_tokens;
+                    usage.prompt_tokens_details.image_tokens =
+                        sparkflash_api::vision::image_tokens(&self.pending.job.images);
                     usage.prompt_cache_hit_tokens = outcome.cached_tokens;
                     usage.prompt_cache_miss_tokens =
                         prompt_tokens.saturating_sub(outcome.cached_tokens);
@@ -491,13 +568,69 @@ fn admit_frame(seq: u64, job: &DeviceJob) -> Tp4DeviceAdmit {
         top_k: job.top_k,
         seed: job.seed,
         stop_ids: job.stop_ids.clone(),
+        images: job
+            .images
+            .iter()
+            .map(|image| {
+                let span = &image.span;
+                let narrow = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
+                Tp4DeviceImage {
+                    start: span.start as u64,
+                    n_llm_h: narrow(span.grid.n_llm_h),
+                    n_llm_w: narrow(span.grid.n_llm_w),
+                    best_height: narrow(span.grid.best_height),
+                    best_width: narrow(span.grid.best_width),
+                    key: span.key.iter().map(|byte| format!("{byte:02x}")).collect(),
+                }
+            })
+            .collect(),
     }
 }
 
-/// The request a worker reads from an admission.
-fn admitted_job(admit: Tp4DeviceAdmit) -> (u64, DeviceJob) {
-    (
-        admit.seq,
+/// The request a worker reads from an admission, with its canvases from `pixels` (the tower
+/// rank's, by (sequence, image)); an image without one gets an empty canvas.
+///
+/// # Errors
+/// An image's key is not 64 hex digits.
+fn admitted_job(
+    admit: Tp4DeviceAdmit,
+    pixels: &mut std::collections::HashMap<(u64, u32), Arc<[u8]>>,
+) -> Result<(u64, DeviceJob), String> {
+    let seq = admit.seq;
+    let mut images = Vec::with_capacity(admit.images.len());
+    for (index, image) in admit.images.into_iter().enumerate() {
+        let mut key = [0u8; 32];
+        let hex = image.key.as_bytes();
+        if hex.len() != 64 {
+            return Err(format!(
+                "sequence {seq} image {index}: a key of {} digits",
+                hex.len()
+            ));
+        }
+        for (byte, pair) in key.iter_mut().zip(hex.as_chunks::<2>().0) {
+            let pair = std::str::from_utf8(pair).map_err(|error| error.to_string())?;
+            *byte = u8::from_str_radix(pair, 16)
+                .map_err(|_| format!("sequence {seq} image {index}: the key is not hex"))?;
+        }
+        let index = u32::try_from(index).unwrap_or(u32::MAX);
+        images.push(VisionImage {
+            span: ImageSpan {
+                start: image.start as usize,
+                grid: Grid {
+                    n_llm_h: image.n_llm_h as usize,
+                    n_llm_w: image.n_llm_w as usize,
+                    best_height: image.best_height as usize,
+                    best_width: image.best_width as usize,
+                },
+                key,
+            },
+            pixels: pixels
+                .remove(&(seq, index))
+                .unwrap_or_else(|| Arc::from(&[][..])),
+        });
+    }
+    Ok((
+        seq,
         DeviceJob {
             prompt: admit.prompt_ids,
             max_tokens: admit.max_tokens as usize,
@@ -506,8 +639,9 @@ fn admitted_job(admit: Tp4DeviceAdmit) -> (u64, DeviceJob) {
             top_k: admit.top_k,
             seed: admit.seed,
             stop_ids: admit.stop_ids,
+            images,
         },
-    )
+    ))
 }
 
 /// Rank 0's link: the driver's queue in, the control broadcast and the stream events out.
@@ -577,6 +711,18 @@ impl DeviceLink for HubLink {
             ids += pending.job.prompt.len();
             self.admit(pending, &mut tick.admit);
         }
+        // The canvases go to the tower rank ahead of the tick that admits their requests.
+        let tower = crate::device_link::tower_rank();
+        if tower != 0 {
+            for (seq, job) in &tick.admit {
+                for (index, image) in job.images.iter().enumerate() {
+                    let index = u32::try_from(index).unwrap_or(u32::MAX);
+                    self.hub
+                        .send_pixels(tower, *seq, index, &image.pixels)
+                        .map_err(|error| format!("control DevicePixels: {error}"))?;
+                }
+            }
+        }
         self.hub
             .broadcast(&Tp4ControlFrame::DeviceTick {
                 admit: tick
@@ -614,15 +760,37 @@ impl DeviceLink for HubLink {
 /// A worker's link: the same decisions, read from rank 0.
 struct WorkerLink {
     control: Tp4ControlWorker,
+    /// The canvases that came ahead of their admissions (the tower rank's), by (sequence, image).
+    pixels: std::collections::HashMap<(u64, u32), Arc<[u8]>>,
 }
 
 impl DeviceLink for WorkerLink {
     fn tick(&mut self, _idle: bool, _room: usize) -> Result<Option<DeviceTick>, String> {
-        match self.control.next_frame() {
-            Ok(Tp4ControlFrame::DeviceTick { admit, cancel }) => Ok(Some(DeviceTick {
-                admit: admit.into_iter().map(admitted_job).collect(),
-                cancel,
-            })),
+        let rank = self.control.rank;
+        let mut frame = self.control.next_frame();
+        while let Ok(Tp4ControlFrame::DevicePixels { seq, image, bytes }) = frame {
+            let pixels = self
+                .control
+                .next_pixels(bytes)
+                .map_err(|error| format!("rank {rank} control pixels: {error}"))?;
+            self.pixels.insert((seq, image), pixels.into());
+            frame = self.control.next_frame();
+        }
+        match frame {
+            Ok(Tp4ControlFrame::DeviceTick { admit, cancel }) => {
+                let admit = admit
+                    .into_iter()
+                    .map(|admit| admitted_job(admit, &mut self.pixels))
+                    .collect::<Result<Vec<_>, _>>()?;
+                // A canvas is for the tick that admits its request, never a later one.
+                if !self.pixels.is_empty() {
+                    return Err(format!(
+                        "rank {rank}: {} canvases arrived for requests the tick does not admit",
+                        self.pixels.len()
+                    ));
+                }
+                Ok(Some(DeviceTick { admit, cancel }))
+            }
             Ok(Tp4ControlFrame::End) => {
                 LEADER_ENDED.store(true, Ordering::SeqCst);
                 Ok(None)
@@ -811,7 +979,10 @@ pub(super) fn run(
                 .set_read_timeout(None)
                 .map_err(|error| format!("control: {error}"))?;
             watch_leader(&worker.stream, tp4.rank)?;
-            crate::device_link::install(Box::new(WorkerLink { control: worker }));
+            crate::device_link::install(Box::new(WorkerLink {
+                control: worker,
+                pixels: std::collections::HashMap::new(),
+            }));
             Ok(())
         })();
         if let Err(message) = started {
@@ -890,6 +1061,7 @@ fn start_leader(
         metrics: Arc::clone(&metrics),
         seeds: RandomState::new(),
         draws: AtomicU64::new(0),
+        vision: crate::device_link::vision_enabled(&device.cubins),
     };
     let state = AppState::new(Arc::new(driver))
         .with_metrics(metrics)
@@ -965,6 +1137,7 @@ mod tests {
             top_k: 20,
             seed: u64::MAX - 3,
             stop_ids: vec![1],
+            images: Vec::new(),
         };
         let frame = Tp4ControlFrame::DeviceTick {
             admit: vec![admit_frame(9, &job)],
@@ -977,6 +1150,72 @@ mod tests {
         };
         assert_eq!(cancel, vec![4]);
         let [admit] = <[Tp4DeviceAdmit; 1]>::try_from(admit).unwrap();
-        assert_eq!(admitted_job(admit), (9, job));
+        let mut pixels = std::collections::HashMap::new();
+        assert_eq!(admitted_job(admit, &mut pixels), Ok((9, job)));
+    }
+
+    /// A 42 x 84 canvas: one token row of two tokens, a span of 1 + 3 + 1 positions.
+    fn image(start: usize) -> VisionImage {
+        let grid = Geometry::V41.grid(42, 84);
+        VisionImage {
+            span: ImageSpan {
+                start,
+                grid,
+                key: [0xa5; 32],
+            },
+            pixels: vec![7u8; 42 * 84 * 3].into(),
+        }
+    }
+
+    #[test]
+    fn an_image_admission_round_trips_its_spans_and_takes_its_canvas() {
+        let mut prompt = vec![0, 5];
+        prompt.extend([IMAGE_TOKEN_ID; 5]);
+        prompt.push(9);
+        let job = DeviceJob {
+            prompt,
+            max_tokens: 8,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            seed: 1,
+            stop_ids: vec![1],
+            images: vec![image(2)],
+        };
+        assert_eq!(bad_spans(&job.prompt, &job.images), None);
+        let wire = serde_json::to_vec(&admit_frame(3, &job)).unwrap();
+        let admit: Tp4DeviceAdmit = serde_json::from_slice(&wire).unwrap();
+        // The tower rank: its canvas came ahead of the admission.
+        let mut pixels = std::collections::HashMap::new();
+        pixels.insert((3, 0), Arc::clone(&job.images[0].pixels));
+        assert_eq!(
+            admitted_job(admit.clone(), &mut pixels),
+            Ok((3, job.clone()))
+        );
+        assert!(pixels.is_empty());
+        // Any other rank: the span without the canvas.
+        let (_, other) = admitted_job(admit, &mut pixels).unwrap();
+        assert_eq!(other.images[0].span, job.images[0].span);
+        assert!(other.images[0].pixels.is_empty());
+    }
+
+    #[test]
+    fn spans_that_are_not_the_routers_are_refused() {
+        let mut prompt = vec![0, 5];
+        prompt.extend([IMAGE_TOKEN_ID; 5]);
+        prompt.push(9);
+        assert!(bad_spans(&prompt, &[image(4)]).is_some(), "past the prompt");
+        assert!(bad_spans(&prompt, &[image(1)]).is_some(), "a text position");
+        assert!(bad_spans(&prompt, &[]).is_some(), "a stray placeholder");
+        let mut short = image(2);
+        short.pixels = vec![0u8; 3].into();
+        assert!(bad_spans(&prompt, &[short]).is_some(), "the canvas size");
+        let mut two = prompt.clone();
+        two.extend([IMAGE_TOKEN_ID; 5]);
+        assert_eq!(bad_spans(&two, &[image(2), image(8)]), None);
+        assert!(
+            bad_spans(&two, &[image(8), image(2)]).is_some(),
+            "out of order"
+        );
     }
 }

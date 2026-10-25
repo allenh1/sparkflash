@@ -1071,7 +1071,7 @@ async fn models_reports_the_engines_own_capabilities() {
         .clone();
     assert_eq!(
         caps["multimodal"], false,
-        "no engine in this workspace has a vision path, so multimodal is never advertised"
+        "an engine that has not declared the vision tower is not advertised as multimodal"
     );
     assert_eq!(caps["image_url"], false);
     assert_eq!(caps["tools"], false, "no tool calls, no tools");
@@ -1087,10 +1087,9 @@ async fn models_reports_the_engines_own_capabilities() {
         "streaming is the server's own capability, not the engine's"
     );
 
-    // And an engine that declares every implemented channel is advertised with every implemented
-    // channel. `Capabilities::ALL` has no vision member, so even the widest declaration cannot
-    // advertise multimodal/image_url: the image path is not a channel to opt into while the 263
-    // vision/aligner tensors are unwired (D18, D27).
+    // And an engine that declares every text channel is advertised with every text channel.
+    // `Capabilities::ALL` leaves vision out, so it does not advertise multimodal/image_url: only an
+    // engine with the vision tower loaded declares that (D59; tests/vision_chat.rs).
     let seeing = MockEngine::new(MODEL).with_capabilities(Capabilities::ALL);
     assert_eq!(seeing.capabilities(), Capabilities::ALL);
     let (status, _, bytes) = send(app_with(seeing), get_request("/v1/models")).await;

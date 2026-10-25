@@ -51,6 +51,8 @@ mod rows;
 mod sample;
 #[cfg(feature = "cuda")]
 mod spec;
+#[cfg(feature = "cuda")]
+mod vision;
 
 /// The safety interlock flag: without it, `--forward` produces a refusal envelope naming it.
 pub const PREFLIGHT_FLAG: &str = "--forward-preflight";
@@ -11078,6 +11080,9 @@ struct DeviceLayer<'a> {
     /// (gate BF16 [experts][dim], bias F32 [experts]) arena pointers for the router, per layer.
     /// Attached after open; None means the router stage refuses by name.
     router: Option<Vec<(Deviceptr, Deviceptr)>>,
+    /// The image tokens' routing bias (`bias_vl`, F32 [experts]) per layer, attached with the
+    /// router.
+    router_vl: Option<Vec<Deviceptr>>,
     /// The two router kernels (stage one and the top-k stage two), loaded at open from the pinned
     /// moe_router_sm121 cubin. None means the cubin was not staged and the stage refuses at open.
     router_kernels: Option<(
@@ -11224,6 +11229,9 @@ struct DeviceLayer<'a> {
     /// ring, compressor rings, stores and index keys above are then the selected lane's.
     #[cfg(feature = "cuda")]
     lanes: Option<Box<lanes::Lanes<'a>>>,
+    /// The vision path when the epoch serves images (`open_vision`).
+    #[cfg(feature = "cuda")]
+    vision: Option<Box<vision::VisionState>>,
     /// The selected lane's drafter stage rings, in place of the drafter's own.
     draft_rings: Option<[(u64, u64); 3]>,
     /// The bf16 cache was freed (the lanes hold the history): the rows step writes no cache row
@@ -12234,6 +12242,7 @@ impl<'a> DeviceLayer<'a> {
             routed_geometry,
             routed: None,
             router: None,
+            router_vl: None,
             router_kernels,
             moe_routed_kernels,
             moe_opt_kernels,
@@ -12285,6 +12294,8 @@ impl<'a> DeviceLayer<'a> {
             attn_window: AttentionWindow::default(),
             #[cfg(feature = "cuda")]
             lanes: None,
+            #[cfg(feature = "cuda")]
+            vision: None,
             draft_rings: None,
             kv_cache_off: false,
             #[cfg(feature = "cuda")]
@@ -12908,15 +12919,16 @@ impl<'a> DeviceLayer<'a> {
             "layer device: read of {what} while {in_flight} collective(s) are enqueued and not waited for - the row is stale by construction; call wait_collectives() first (the first reduce capture in this session was stale by one layer for exactly this reason)"
         ))
     }
-    /// Attaches the router's per-layer weight/bias arena pointers.
+    /// Attaches the router's per-layer weight/bias arena pointers, and the image tokens' bias.
     ///
-    /// Both are the plan's own slices (BF16 gate [experts][dim], F32 bias [experts]); nothing is
-    /// copied. Called once after open, next to attach_routed.
+    /// All are the plan's own slices (BF16 gate [experts][dim], F32 bias and bias_vl [experts]);
+    /// nothing is copied. Called once after open, next to attach_routed.
     fn attach_router(&mut self, bind: &crate::tp4_resident::DeviceBind) -> Result<(), String> {
         if self.router.is_some() {
             return Err("layer device router: attached twice".to_owned());
         }
         let mut layers = Vec::with_capacity(self.compress_ratio.len());
+        let mut biases_vl = Vec::with_capacity(self.compress_ratio.len());
         for layer in 0..self.compress_ratio.len() {
             let gate = bind
                 .moe
@@ -12934,14 +12946,24 @@ impl<'a> DeviceLayer<'a> {
                 .ok_or_else(|| {
                     format!("layer device router: the bind has no gate bias for layer {layer}")
                 })?;
-            if gate.0 == 0 || bias.0 == 0 {
+            let bias_vl = bind
+                .moe
+                .router
+                .get(&(layer, crate::resident_weights::RouterPart::BiasVl))
+                .copied()
+                .ok_or_else(|| {
+                    format!("layer device router: the bind has no gate bias_vl for layer {layer}")
+                })?;
+            if gate.0 == 0 || bias.0 == 0 || bias_vl.0 == 0 {
                 return Err(format!(
                     "layer device router: layer {layer} bound a null router pointer; refusing to launch"
                 ));
             }
             layers.push((gate, bias));
+            biases_vl.push(bias_vl);
         }
         self.router = Some(layers);
+        self.router_vl = Some(biases_vl);
         Ok(())
     }
 
@@ -16811,6 +16833,11 @@ fn run_forward_loop(
         // `sparkflash serve --tp4-device` installs a link before the epoch: serve its requests
         // instead of the one-shot generation.
         let link = crate::device_link::take();
+        // Serving with the vision cubin staged takes images (DECISIONS.md D59): every rank opens the
+        // routing kernel, the tower rank the tower too.
+        if link.is_some() && crate::device_link::vision_enabled(dir) {
+            device.open_vision(dir, request.weights, chunk.max(rows::R_MAX))?;
+        }
         let lane_count = planned_lanes(link.is_some())?;
         if lane_count > 0 {
             device.attach_lanes(&lanes::LaneGeometry {
@@ -16840,6 +16867,7 @@ fn run_forward_loop(
             Some(mut link) => spec::serve(device, rows, &drafter, &inputs, k, link.as_mut())?,
             None => spec::run_spec(device, rows, &drafter, &inputs, k, max_new)?,
         }
+        device.release_vision();
         drafter.release(&cuda);
         if let Some(state) = bulk_rows.take() {
             state.release(&cuda);

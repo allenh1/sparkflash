@@ -1,0 +1,19 @@
+# Pillow 13.0.0, numpy 2.5.4
+# file exact width height rgb_sha256 | file lossy width height pillow_decode.png
+rgb8.png exact 37 23 e69544d5b7cc982cbbe82c6fe9cac708c4b06025c2610e8221d811e11703e6ef
+rgba8.png exact 29 31 fee765c6e52e27343294f147b9bf5ff737a177f55d56cdff6a7748d50e5f840f
+la8.png exact 19 17 d6277e9ea29608f83fbb1899a66f444364432cfc7505e373d3a32b2958b75d56
+gray8.png exact 19 17 c21c3e68e66912b5a73e3df5fa468f15042d590bc3a9a3ac9c0b3951a5c4d8d4
+gray1.png exact 23 9 34ffb4ac7d793a2898e2a473db096bdd2f4e533b9acbab41847bd4e087e57a1b
+palette_trns.png exact 21 13 a315b7457c326994add04a25241f469d4f70309851a6cc7175abdc9ae7040640
+rgb16.png exact 11 7 a09abba0740afe42b31d2978b6c124b01c85e10c9fc1c716ade65a41c869e333
+rgba16.png exact 11 7 57e37603087ecadb69a9f92af3ea0165d968e1e259ba4858593d60a0f6b6b38e
+gray16.png exact 11 7 e8fe14660ee1e34cde7388a3a3ba558494300d11158082f5ed669106f917c994
+q90_444.jpg lossy 45 29 q90_444.pillow.png
+q75_420.jpg lossy 45 29 q75_420.pillow.png
+q85_422_progressive.jpg lossy 45 29 q85_422_progressive.pillow.png
+gray.jpg lossy 45 29 gray.pillow.png
+anim.gif exact 33 21 b0f837e13bfaf474c431304328d83b0b6abb69585b4478cbdd3ccb70f00f119c
+lossless.webp exact 27 19 ebddec9ddbff6af13121b4da82526858ca0136e8f2650a144f6802b54af0ed89
+lossy.webp lossy 31 17 lossy.pillow.png
+anim.webp exact 17 11 01a5d962dff86601912d692dc7174cc6095e1b0b552b8f8a260bdca34aa7eee4

@@ -691,7 +691,7 @@ impl<'a> DeviceLayer<'a> {
             self.enter_seg(seg)?;
             self.check_begin(seg.p0, seg.n, rows::R_MAX)?;
         }
-        self.embed_rows_on_device(rows, embed, ids, n, n, 0, exchange)?;
+        self.embed_rows_on_device(rows, embed, ids, n, n, 0, exchange, false)?;
         for seg in segs {
             self.enter_seg(seg)?;
             self.positions_begun = seg.p0 + seg.n;

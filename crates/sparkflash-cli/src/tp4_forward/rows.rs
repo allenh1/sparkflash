@@ -516,7 +516,7 @@ impl DeviceLayer<'_> {
         exchange: (usize, usize),
     ) -> Result<usize, String> {
         self.check_begin(p0, n, rows.cap)?;
-        self.embed_rows_on_device(rows, embed, ids, n, n, 0, exchange)?;
+        self.embed_rows_on_device(rows, embed, ids, n, n, 0, exchange, true)?;
         self.positions_begun = p0 + n;
         self.attn_window = AttentionWindow::default();
         Ok(n)
@@ -560,7 +560,9 @@ impl DeviceLayer<'_> {
     /// Writes `total` rows' streams and identity pre mixes: rows below `n` are the embeddings of
     /// the token ids at `ids` (device u32), rows from `n` on are `noise` (device f32 `[dim]`). Each
     /// owner copies its rows into its slot of the embedding gather and the exchange fills the
-    /// peers' slots, so the rows never pass through the host.
+    /// peers' slots, so the rows never pass through the host. With `spans` the rows are a prefill
+    /// chunk's: the tower rank overwrites its image span rows in its slot before the exchange
+    /// (super::vision).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn embed_rows_on_device(
         &self,
@@ -571,6 +573,7 @@ impl DeviceLayer<'_> {
         total: usize,
         noise: u64,
         (_world, rank): (usize, usize),
+        spans: bool,
     ) -> Result<(), String> {
         if self.dim != HIDDEN || self.hc_mult != 4 || n == 0 || n > total || total > rows.cap {
             return Err(format!(
@@ -592,6 +595,9 @@ impl DeviceLayer<'_> {
                 gather + (rank * count * 2) as u64,
             ],
         )?;
+        if spans {
+            self.vision_inject(gather + (rank * count * 2) as u64)?;
+        }
         if n > R_MAX {
             self.gather_slots(gather, count, rank, "embedding gather")?;
         } else {
@@ -2021,6 +2027,7 @@ impl DeviceLayer<'_> {
         let bulk = rows.bulk.as_ref().filter(|_| n > R_MAX);
         if let Some(bulk) = bulk {
             self.bulk_router(rows, bulk, gate.0, bias.0, n)?;
+            self.vision_route(layer, bulk.dots, true, b.moe_ids, b.moe_weights)?;
         } else {
             self.cuda.launch(
                 router_kernel,
@@ -2037,6 +2044,7 @@ impl DeviceLayer<'_> {
                     ticket.0,
                 ],
             )?;
+            self.vision_route(layer, b.scores, false, b.moe_ids, b.moe_weights)?;
         }
         // The shared expert's rank slice: gate/up as [group][row][local], SwiGLU, down.
         let shared = self

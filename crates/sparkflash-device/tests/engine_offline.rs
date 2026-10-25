@@ -70,6 +70,7 @@ fn request(temperature: f32) -> EngineRequest {
         prompt_tokens: vec![1, 2, 3],
         logprobs: sparkflash_api::LogprobsRequest::default(),
         images: Vec::new(),
+        vision: Vec::new(),
         max_tokens: 4,
         temperature,
         top_p: 1.0,
