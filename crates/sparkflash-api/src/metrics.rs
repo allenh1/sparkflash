@@ -17,13 +17,13 @@
 //! CPU reference path. See docs/archive/build/serve-ops-metrics.md.
 
 use prometheus::{
-    Encoder, GaugeVec, Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec, Opts, Registry,
-    TextEncoder,
+    Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 use sparkflash_kv::PrefixMatchPlan;
 
 use crate::engine::ClusterStatsSnapshot;
-use crate::telemetry_types::{OpenAiUsageWithCache, finite_or_zero};
+use crate::telemetry_types::{DeepSeekSparkRequestStats, OpenAiUsageWithCache, finite_or_zero};
 
 /// vLLM's default bucket layout for the time-to-first-token histogram.
 ///
@@ -56,6 +56,18 @@ pub struct Metrics {
     requests_rejected_total: IntCounter,
     global_kv_hit_tokens_total: IntCounter,
     swa_tail_cache_hits_total: IntCounter,
+    /// DSpark draft tokens accepted by the target model, cumulative.
+    draft_tokens_accepted_total: IntCounter,
+    /// DSpark draft tokens proposed by the drafter, cumulative.
+    draft_tokens_proposed_total: IntCounter,
+    /// The last completed request's decode speed.
+    last_decode_tokens_per_second: Gauge,
+    /// The last completed request's prefill speed.
+    last_prefill_tokens_per_second: Gauge,
+    /// The last completed request's DSpark acceptance rate in [0, 1].
+    last_acceptance_rate: Gauge,
+    /// The last completed request's time to first token, in seconds.
+    last_time_to_first_token_seconds: Gauge,
     engram_lookups_total: IntGaugeVec,
     engram_hit_rate: GaugeVec,
     trace_active_scope_mask: IntGauge,
@@ -90,6 +102,36 @@ impl Metrics {
         let swa_tail_cache_hits_total = IntCounter::new(
             "sparkflash_swa_tail_cache_hits_total",
             "Total requests whose SWA tail was found in the ring",
+        )
+        .expect("static metric descriptor");
+        let draft_tokens_accepted_total = IntCounter::new(
+            "sparkflash_draft_tokens_accepted_total",
+            "Total DSpark draft tokens accepted by the target model",
+        )
+        .expect("static metric descriptor");
+        let draft_tokens_proposed_total = IntCounter::new(
+            "sparkflash_draft_tokens_proposed_total",
+            "Total DSpark draft tokens proposed by the drafter",
+        )
+        .expect("static metric descriptor");
+        let last_decode_tokens_per_second = Gauge::new(
+            "sparkflash_last_decode_tokens_per_second",
+            "Decode tokens per second measured for the most recently completed request",
+        )
+        .expect("static metric descriptor");
+        let last_prefill_tokens_per_second = Gauge::new(
+            "sparkflash_last_prefill_tokens_per_second",
+            "Prefill tokens per second measured for the most recently completed request",
+        )
+        .expect("static metric descriptor");
+        let last_acceptance_rate = Gauge::new(
+            "sparkflash_last_acceptance_rate",
+            "DSpark draft acceptance rate for the most recently completed request",
+        )
+        .expect("static metric descriptor");
+        let last_time_to_first_token_seconds = Gauge::new(
+            "sparkflash_last_time_to_first_token_seconds",
+            "Time to first token for the most recently completed request, in seconds",
         )
         .expect("static metric descriptor");
         let engram_lookups_total = IntGaugeVec::new(
@@ -170,6 +212,12 @@ impl Metrics {
             Box::new(serving.clone()),
             Box::new(requests_rejected_total.clone()),
             Box::new(time_to_first_token_seconds.clone()),
+            Box::new(draft_tokens_accepted_total.clone()),
+            Box::new(draft_tokens_proposed_total.clone()),
+            Box::new(last_decode_tokens_per_second.clone()),
+            Box::new(last_prefill_tokens_per_second.clone()),
+            Box::new(last_acceptance_rate.clone()),
+            Box::new(last_time_to_first_token_seconds.clone()),
         ] {
             registry
                 .register(collector)
@@ -193,7 +241,33 @@ impl Metrics {
             time_to_first_token_seconds,
             serving,
             requests_rejected_total,
+            draft_tokens_accepted_total,
+            draft_tokens_proposed_total,
+            last_decode_tokens_per_second,
+            last_prefill_tokens_per_second,
+            last_acceptance_rate,
+            last_time_to_first_token_seconds,
         }
+    }
+
+    /// Records the speculative and timing facts of one completed request.
+    ///
+    /// The counters are cumulative so a dashboard can derive a rate over any window; the gauges
+    /// are the last completed request's values, which is what the control plane's per-request
+    /// graph shows. Both are cheap increments/sets in the existing request-completion path.
+    pub fn record_request_stats(&self, stats: &DeepSeekSparkRequestStats) {
+        self.draft_tokens_accepted_total
+            .inc_by(stats.dspark_speculative.draft_tokens_accepted as u64);
+        self.draft_tokens_proposed_total
+            .inc_by(stats.dspark_speculative.draft_tokens_proposed as u64);
+        self.last_decode_tokens_per_second
+            .set(finite_or_zero(stats.timing.decode_tok_per_s));
+        self.last_prefill_tokens_per_second
+            .set(finite_or_zero(stats.timing.prefill_tok_per_s));
+        self.last_acceptance_rate
+            .set(finite_or_zero(stats.dspark_speculative.acceptance_rate));
+        self.last_time_to_first_token_seconds
+            .set(finite_or_zero(stats.timing.ttft_ms / 1_000.0));
     }
 
     /// Records the aggregate counters of one completed request.
@@ -349,6 +423,19 @@ mod tests {
             },
             &crate::engine::plan_for(100, 64, 0, true),
         );
+        metrics.record_request_stats(&DeepSeekSparkRequestStats {
+            kv_cache: crate::engine::plan_for(100, 64, 0, true),
+            kv_cache_hit_rate: 0.64,
+            engram_layers: crate::engine::default_engram_layers(),
+            dspark_speculative: crate::telemetry_types::DSparkStepStats::from_counts(10, 50, 0, 40),
+            transport: crate::telemetry_types::RoceTransportStats::default(),
+            timing: crate::telemetry_types::RequestTimingStats {
+                ttft_ms: 250.0,
+                prefill_tok_per_s: 4_000.0,
+                decode_tok_per_s: 120.0,
+                min_rank_uma_free_gib: 8.0,
+            },
+        });
         let snapshot = ClusterStatsSnapshot::sample();
         metrics.observe_cluster(&snapshot, 0b1010_0101);
         let text = metrics.render();
@@ -361,11 +448,19 @@ mod tests {
             "sparkflash_engram_hit_rate",
             "sparkflash_trace_active_scope_mask",
             "sparkflash_uma_free_gib",
+            "sparkflash_draft_tokens_accepted_total",
+            "sparkflash_draft_tokens_proposed_total",
+            "sparkflash_last_decode_tokens_per_second",
+            "sparkflash_last_prefill_tokens_per_second",
+            "sparkflash_last_acceptance_rate",
+            "sparkflash_last_time_to_first_token_seconds",
         ] {
             assert!(text.contains(name), "missing metric {name}\n{text}");
         }
         assert!(text.contains("layer=\"1\""));
         assert!(text.contains("rank=\"0\""));
+        assert!(text.contains("sparkflash_draft_tokens_accepted_total 40"));
+        assert!(text.contains("sparkflash_last_decode_tokens_per_second 120"));
     }
 
     #[test]

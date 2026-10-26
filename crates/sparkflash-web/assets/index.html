@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>SparkFlash Control</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23161a20'/%3E%3Cpath d='M18 5 9 18h6l-2 9 10-14h-6z' fill='%235b8def'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <svg width="0" height="0" class="sprite" aria-hidden="true">
+    <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13.5 2 4 14h6.5L9 22l11-13h-6.6z"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5z"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="1.5"/></symbol>
+    <symbol id="i-pulse" viewBox="0 0 24 24"><path d="M3 12h4l2.5-6 5 12 2.5-6H21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="m16 16 4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M15.5 5.5v-.5a1.5 1.5 0 0 0-1.5-1.5H6A1.5 1.5 0 0 0 4.5 5v8A1.5 1.5 0 0 0 6 14.5h.5" fill="none" stroke="currentColor" stroke-width="1.8"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4.5v4h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-convert" viewBox="0 0 24 24"><path d="M4 8h13l-3.5-3.5M20 16H7l3.5 3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3.5 2.5 20h19z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M12 10v4.5M12 17.2v.1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+  </svg>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#overview" aria-label="SparkFlash Control">
+        <span class="brand-mark"><svg><use href="#i-bolt"/></svg></span>
+        <span class="brand-name">SparkFlash</span>
+        <span class="brand-sep" aria-hidden="true"></span>
+        <span class="brand-sub">Cluster console</span>
+      </a>
+      <nav class="tabs" role="tablist" aria-label="Sections">
+        <a role="tab" href="#overview" data-tab="overview">Overview</a>
+        <a role="tab" href="#setup" data-tab="setup">Setup</a>
+        <a role="tab" href="#activity" data-tab="activity">Activity <span class="tab-count hidden" id="tab-running"></span></a>
+      </nav>
+      <div class="status" id="cluster-status" title="">
+        <span class="status-dot"></span>
+        <span class="status-text" id="cluster-status-text">Connecting</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div id="banners" class="banners">
+      <div id="health-banner" class="banner bad hidden" role="alert">
+        <svg class="banner-icon"><use href="#i-alert"/></svg>
+        <div><strong>Rank 0 reports the device loop is not making progress.</strong> <span id="health-reason"></span></div>
+      </div>
+      <div id="config-error" class="banner bad hidden" role="alert">
+        <svg class="banner-icon"><use href="#i-alert"/></svg>
+        <div id="config-error-text"></div>
+      </div>
+    </div>
+
+    <!-- Overview -->
+    <section class="page" id="page-overview" data-page="overview" aria-labelledby="overview-title">
+      <div class="page-head">
+        <div>
+          <h1 id="overview-title">Overview</h1>
+          <p class="page-sub" id="overview-sub">Waiting for rank 0</p>
+        </div>
+        <div class="actions">
+          <button id="action-status" class="btn" type="button"><svg><use href="#i-pulse"/></svg>Rank status</button>
+          <button id="action-stop" class="btn btn-danger" type="button"><svg><use href="#i-stop"/></svg>Stop</button>
+          <button id="action-launch" class="btn btn-primary" type="button"><svg><use href="#i-play"/></svg>Launch cluster</button>
+        </div>
+      </div>
+
+      <div class="kpis" aria-label="Current serving figures">
+        <article class="kpi" data-kpi="decode">
+          <div class="kpi-label">Decode <span>last request</span></div>
+          <div class="kpi-value"><span id="kpi-decode">—</span><small>tok/s</small></div>
+          <svg class="spark" id="spark-decode" preserveAspectRatio="none" aria-hidden="true"></svg>
+        </article>
+        <article class="kpi" data-kpi="prefill">
+          <div class="kpi-label">Prefill <span>last request</span></div>
+          <div class="kpi-value"><span id="kpi-prefill">—</span><small>tok/s</small></div>
+          <svg class="spark" id="spark-prefill" preserveAspectRatio="none" aria-hidden="true"></svg>
+        </article>
+        <article class="kpi" data-kpi="throughput">
+          <div class="kpi-label">Generation <span>all requests</span></div>
+          <div class="kpi-value"><span id="kpi-throughput">—</span><small>tok/s</small></div>
+          <svg class="spark" id="spark-throughput" preserveAspectRatio="none" aria-hidden="true"></svg>
+        </article>
+        <article class="kpi" data-kpi="accept">
+          <div class="kpi-label">Draft acceptance <span>DSpark</span></div>
+          <div class="kpi-value"><span id="kpi-accept">—</span><small id="kpi-accept-note" class="hidden">none proposed</small></div>
+          <svg class="spark" id="spark-accept" preserveAspectRatio="none" aria-hidden="true"></svg>
+        </article>
+        <article class="kpi" data-kpi="cache">
+          <div class="kpi-label">Prefix cache hit <span>tokens</span></div>
+          <div class="kpi-value"><span id="kpi-cache">—</span><small id="kpi-cache-note" class="hidden">not reported</small></div>
+          <svg class="spark" id="spark-cache" preserveAspectRatio="none" aria-hidden="true"></svg>
+        </article>
+        <article class="kpi" data-kpi="requests">
+          <div class="kpi-label">Requests <span id="kpi-requests-hint">running · waiting</span></div>
+          <div class="kpi-value"><span id="kpi-running">—</span><small class="sep">/</small><span id="kpi-waiting" class="dim">—</span></div>
+          <svg class="spark" id="spark-requests" preserveAspectRatio="none" aria-hidden="true"></svg>
+        </article>
+      </div>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>Performance</h2>
+            <p class="panel-sub" id="telemetry-hint">Sampled from rank 0 outside the inference path.</p>
+          </div>
+          <div class="segmented" role="group" aria-label="Time window">
+            <button type="button" data-window="300">5m</button>
+            <button type="button" data-window="900" class="active">15m</button>
+            <button type="button" data-window="3600">1h</button>
+            <button type="button" data-window="21600">6h</button>
+            <button type="button" data-window="86400">24h</button>
+          </div>
+        </div>
+        <div class="charts">
+          <figure class="chart" data-chart="decode_tok_per_s">
+            <figcaption><span class="swatch c1"></span>Decode speed<strong id="chart-decode-now">—</strong></figcaption>
+            <svg id="chart-decode" role="img" aria-label="Decode speed over time"></svg>
+          </figure>
+          <figure class="chart" data-chart="prefill_tok_per_s">
+            <figcaption><span class="swatch c2"></span>Prefill speed<strong id="chart-prefill-now">—</strong></figcaption>
+            <svg id="chart-prefill" role="img" aria-label="Prefill speed over time"></svg>
+          </figure>
+          <figure class="chart" data-chart="acceptance_rate">
+            <figcaption><span class="swatch c3"></span>Draft acceptance<strong id="chart-accept-now">—</strong></figcaption>
+            <svg id="chart-accept" role="img" aria-label="Draft acceptance over time"></svg>
+          </figure>
+          <figure class="chart" data-chart="cache_hit_rate">
+            <figcaption><span class="swatch c4"></span>Prefix cache hit rate<strong id="chart-cache-now">—</strong></figcaption>
+            <svg id="chart-cache" role="img" aria-label="Prefix cache hit rate over time"></svg>
+          </figure>
+          <figure class="chart wide" data-chart="generated_tok_per_s">
+            <figcaption><span class="swatch c5"></span>Generation throughput, all requests<strong id="chart-throughput-now">—</strong></figcaption>
+            <svg id="chart-throughput" role="img" aria-label="Tokens generated per second over time"></svg>
+          </figure>
+        </div>
+      </section>
+
+      <div class="grid-2">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Ranks</h2>
+              <p class="panel-sub" id="ranks-sub">Reported by rank 0 at start-up.</p>
+            </div>
+            <span class="tag" id="fabric-badge">—</span>
+          </div>
+          <div class="table-wrap">
+            <table class="table ranks">
+              <thead><tr><th>Rank</th><th>Host</th><th class="w-mem">Unified memory free</th><th class="num">GPU clock</th><th class="num">Rail</th></tr></thead>
+              <tbody id="cluster-nodes"><tr><td colspan="5" class="empty">No cluster snapshot yet. Start the server and this table fills in.</td></tr></tbody>
+            </table>
+          </div>
+          <p id="cluster-error" class="note warn hidden"></p>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Tokens served</h2>
+              <p class="panel-sub">Prompt and generated tokens per UTC day, last 14 days.</p>
+            </div>
+            <div class="totals">
+              <div><span>Today</span><strong id="kpi-today">—</strong></div>
+              <div><span>All time</span><strong id="daily-total">—</strong></div>
+            </div>
+          </div>
+          <svg id="chart-daily" class="daily" role="img" aria-label="Tokens served by day"></svg>
+          <p id="daily-empty" class="empty">No completed tokens recorded yet.</p>
+        </section>
+      </div>
+    </section>
+
+    <!-- Setup -->
+    <section class="page hidden" id="page-setup" data-page="setup" aria-labelledby="setup-title">
+      <div class="page-head">
+        <div>
+          <h1 id="setup-title">Setup</h1>
+          <p class="page-sub"><span id="config-path">loading configuration…</span> <span class="tag" id="config-exists">not saved yet</span></p>
+        </div>
+        <div class="actions">
+          <button id="reload-config" class="btn" type="button"><svg><use href="#i-refresh"/></svg>Reload file</button>
+          <button id="action-convert" class="btn" type="button"><svg><use href="#i-convert"/></svg>Convert all ranks</button>
+        </div>
+      </div>
+
+      <div class="setup-grid">
+        <form id="config-form" class="panel form" autocomplete="off" spellcheck="false">
+          <fieldset>
+            <legend>Model and runtime</legend>
+            <div class="fields">
+              <div class="field span-2">
+                <span id="model-id-label">Model <em>Hugging Face ID, from the cache on the lead node</em></span>
+                <div class="input-row">
+                  <select id="model-id" aria-labelledby="model-id-label" aria-describedby="model-source"></select>
+                  <button id="rescan-models" class="btn btn-icon" type="button" title="Rescan the Hugging Face cache" aria-label="Rescan the Hugging Face cache"><svg><use href="#i-refresh"/></svg></button>
+                </div>
+                <small id="model-source" class="model-source">Reading the Hugging Face cache…</small>
+              </div>
+              <label class="field">
+                <span>Architecture</span>
+                <select id="model-weights"></select>
+                <small>The weight format the engine loads.</small>
+              </label>
+              <label class="field">
+                <span>Engine</span>
+                <select id="engine-kind"></select>
+                <small>Only the TP=4 device engine ships today.</small>
+              </label>
+              <label class="field">
+                <span>Max context <em>tokens</em></span>
+                <input id="max-context" type="number" min="1" max="1048576" step="1" required>
+                <div class="chips" aria-label="Context presets">
+                  <button class="chip" type="button" data-context="131072">128K</button>
+                  <button class="chip" type="button" data-context="262144">256K</button>
+                  <button class="chip" type="button" data-context="524288">512K</button>
+                  <button class="chip" type="button" data-context="1048576">1M</button>
+                </div>
+              </label>
+              <label class="field">
+                <span>Max concurrency <em>sequences</em></span>
+                <input id="max-concurrency" type="number" min="1" max="32" step="1" required>
+                <small>Sets <code>SPARKFLASH_LANES</code>; 32 is the engine's design point.</small>
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Nodes <small>Rank order is launch order.</small></legend>
+            <div class="table-wrap">
+              <table class="table nodes">
+                <thead><tr><th>Rank</th><th>SSH host</th><th>RoCE peer</th><th>Lead</th><th>SSH</th><th></th></tr></thead>
+                <tbody id="node-rows"></tbody>
+              </table>
+            </div>
+            <div class="fields three">
+              <label class="field">
+                <span>SSH user</span>
+                <input id="ssh-user" type="text" placeholder="current user">
+              </label>
+              <label class="field">
+                <span>Rank 0 HTTP bind</span>
+                <input id="http-bind" type="text" placeholder="0.0.0.0:8000">
+              </label>
+              <label class="field">
+                <span>Collective base port</span>
+                <input id="base-port" type="number" min="1" max="65535">
+              </label>
+            </div>
+          </fieldset>
+
+          <details class="section">
+            <summary>Paths on every node</summary>
+            <div class="fields">
+              <label class="field span-2"><span>Checkout root</span><input id="repo-root" type="text"></label>
+              <label class="field"><span>Server binary</span><input id="binary" type="text"></label>
+              <label class="field"><span>Launcher script</span><input id="serve-script" type="text"></label>
+              <label class="field span-2"><span>Checkpoint <em>empty uses the model's snapshot in the Hugging Face cache</em></span><input id="checkpoint" type="text"></label>
+              <label class="field span-2"><span>Hugging Face cache <em>empty uses HF_HUB_CACHE or ~/.cache/huggingface/hub</em></span><input id="hub-cache" type="text"></label>
+              <label class="field span-2"><span>Tokenizer <em>empty derives it from the checkpoint</em></span><input id="tokenizer" type="text"></label>
+              <label class="field"><span>Converted weights</span><input id="converted-dir" type="text"></label>
+              <label class="field"><span>Kernel cubins</span><input id="cubins" type="text"></label>
+              <label class="field"><span>NCCL library directory</span><input id="nccl-lib" type="text" placeholder="system NCCL when empty"></label>
+              <label class="field"><span>Remote log root</span><input id="log-root" type="text"></label>
+            </div>
+          </details>
+
+          <details class="section">
+            <summary>Fabric and SSH</summary>
+            <div class="fields">
+              <label class="field"><span>NCCL_IB_HCA</span><input id="nccl-ib-hca" type="text" placeholder="e.g. rocep1s0f1"></label>
+              <label class="field"><span>NCCL_SOCKET_IFNAME</span><input id="nccl-socket-ifname" type="text" placeholder="e.g. enp1s0f1np1"></label>
+              <label class="field"><span>NCCL_IB_GID_INDEX</span><input id="nccl-gid" type="number" min="0" max="65535"></label>
+              <label class="field"><span>SSH probe timeout <em>seconds</em></span><input id="ssh-timeout" type="number" min="1" max="60"></label>
+              <label class="field span-2"><span>Extra SSH options <em>one argument per line</em></span><textarea id="ssh-options" rows="4"></textarea></label>
+              <label class="field span-2"><span>Extra rank environment <em>KEY=VALUE per line</em></span><textarea id="extra-env" rows="3" placeholder="NCCL_NET_GDR_LEVEL=5"></textarea></label>
+            </div>
+          </details>
+
+          <details class="section">
+            <summary>Control plane and telemetry</summary>
+            <div class="fields">
+              <label class="field"><span>Web bind <em>restart to apply</em></span><input id="web-bind" type="text"></label>
+              <label class="field"><span>Rank 0 serve URL</span><input id="serve-url" type="text"></label>
+              <label class="field span-2"><span>Extra allowed host names <em>one per line, e.g. a reverse proxy's</em></span><textarea id="allowed-hosts" rows="2"></textarea></label>
+              <label class="field"><span>Discovery timeout <em>seconds</em></span><input id="discovery-timeout" type="number" min="1" max="60"></label>
+              <label class="field"><span>Sample interval <em>seconds</em></span><input id="stats-interval" type="number" min="1" max="300"></label>
+              <label class="field"><span>History retention <em>seconds</em></span><input id="stats-retention" type="number" min="60"></label>
+              <label class="field"><span>Idle flush interval <em>seconds</em></span><input id="stats-flush" type="number" min="1"></label>
+              <label class="field span-2"><span>Telemetry snapshot path</span><input id="stats-path" type="text"></label>
+              <label class="check span-2"><input id="advertise" type="checkbox"><span>Advertise this lead node over mDNS</span></label>
+            </div>
+          </details>
+
+          <div class="savebar" id="savebar" aria-live="polite">
+            <span class="savebar-text">Unsaved changes</span>
+            <button id="discard-config" class="btn btn-ghost" type="button">Discard</button>
+            <button id="save-config" class="btn btn-primary" type="button">Save configuration</button>
+          </div>
+        </form>
+
+        <aside class="setup-side">
+          <section class="panel">
+            <div class="panel-head">
+              <div><h2>Bring-up</h2><p class="panel-sub">One-time steps before the first launch.</p></div>
+              <span class="tag" id="setup-progress">0 / 4</span>
+            </div>
+            <ol class="steps">
+              <li id="step-config"><span class="step-mark"></span><div><strong>Save the configuration</strong><small>Writes the TOML on this node.</small></div></li>
+              <li id="step-ssh"><span class="step-mark"></span><div><strong>Prove passwordless SSH</strong><small>Every rank answers a batch-mode login.</small></div></li>
+              <li id="step-convert"><span class="step-mark"></span><div><strong>Convert each rank</strong><small>Once per checkpoint, with the cluster stopped.</small></div></li>
+              <li id="step-launch"><span class="step-mark"></span><div><strong>Launch and wait for ready</strong><small>Rank 0 answers on its serve URL.</small></div></li>
+            </ol>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div><h2>Discovery</h2><p class="panel-sub">mDNS finds candidates; an SSH probe proves the login.</p></div>
+              <button id="discover" class="btn btn-sm" type="button"><svg><use href="#i-search"/></svg><span>Scan</span></button>
+            </div>
+            <div class="table-wrap">
+              <table class="table discovery">
+                <thead><tr><th>Host</th><th>Address</th><th>SSH</th><th></th></tr></thead>
+                <tbody id="discovery-rows"><tr><td colspan="4" class="empty">No scan yet.</td></tr></tbody>
+              </table>
+            </div>
+            <div id="fix-wrap" class="codeblock hidden">
+              <div class="codeblock-head">
+                <span>Run on this node to enable passwordless SSH</span>
+                <button id="copy-fix" class="btn btn-ghost btn-xs" type="button"><svg><use href="#i-copy"/></svg>Copy</button>
+              </div>
+              <pre id="fix-command"></pre>
+            </div>
+          </section>
+        </aside>
+      </div>
+    </section>
+
+    <!-- Activity -->
+    <section class="page hidden" id="page-activity" data-page="activity" aria-labelledby="activity-title">
+      <div class="page-head">
+        <div>
+          <h1 id="activity-title">Activity</h1>
+          <p class="page-sub">Launches, stops, status checks and conversions started from this console. Logs keep the last 400 lines.</p>
+        </div>
+      </div>
+      <div class="activity-grid">
+        <section class="panel flush">
+          <div class="panel-head padded">
+            <h2>Jobs</h2>
+            <span class="tag" id="job-count">0</span>
+          </div>
+          <div id="jobs" class="jobs" role="listbox" aria-label="Jobs"></div>
+        </section>
+        <section class="panel flush log-panel">
+          <div class="panel-head padded">
+            <div>
+              <h2 id="log-title">Log</h2>
+              <p class="panel-sub mono" id="log-meta">Select a job to see its output.</p>
+            </div>
+            <button id="copy-command" class="btn btn-ghost btn-xs hidden" type="button"><svg><use href="#i-copy"/></svg>Copy command</button>
+          </div>
+          <pre id="job-log" class="log"></pre>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span id="footer-config">—</span>
+    <span id="footer-advert">mDNS advertisement unavailable</span>
+  </footer>
+
+  <dialog id="confirm" class="dialog">
+    <form method="dialog">
+      <h3 id="confirm-title">Are you sure?</h3>
+      <p id="confirm-body"></p>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn btn-ghost" type="submit">Cancel</button>
+        <button value="ok" id="confirm-ok" class="btn btn-primary" type="submit">Confirm</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+  <div id="chart-tip" class="chart-tip hidden" aria-hidden="true"></div>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>

@@ -35,10 +35,15 @@
 #   SPARKFLASH_LOG_ROOT    remote log directory (default <repo>/target/serve-tp4)
 #   SPARKFLASH_DRAIN_DELAY_MS    rank-0 pre-stop delay (default 5000)
 #   SPARKFLASH_DRAIN_TIMEOUT_MS  rank-0 drain deadline (default 30000)
+#   SPARK_MAX_SEQ_LEN      served sequence window (forwarded to every rank; the web UI sets it)
+#   SPARKFLASH_LANES       concurrent sequence slots (forwarded to every rank; the web UI sets it)
 #   SPARKFLASH_DEVICE_TOKEN_DIR  token window (or live window parent) served by rank 0
 #   SPARKFLASH_DEVICE_TOKEN_LIVE=1        follow that directory as a live window directory (W5)
 #   SPARKFLASH_DEVICE_TOKEN_DERIVED_CLAIM=1  accept a window without the device's claim assertion
 #   SSH_USER, SSH_OPTS     ssh user and options (defaults: current user, BatchMode)
+#   SPARK_LOCAL_RANKS      ranks that run on this node without ssh (space separated, e.g. "0";
+#                          the web UI sets it from `local = true`), for a lead that cannot ssh to
+#                          itself
 #   SPARKFLASH_DRY_RUN=1   same as print, for scripts that want one code path
 set -euo pipefail
 
@@ -66,11 +71,18 @@ NCCL_LIB="${SPARKFLASH_NCCL_LIB:-}"
 CONVERTED_DIR="${SPARKFLASH_CONVERTED_DIR:-}"
 
 read -r -a NODES <<< "$NODES_RAW"
+read -r -a LOCAL_RANKS <<< "${SPARK_LOCAL_RANKS:-}"
 die() { printf 'serve-four-node: %s\n' "$*" >&2; exit 1; }
 
 [ "${#NODES[@]}" -eq 4 ] || die "SPARK_NODES needs exactly 4 addresses in rank order, got ${#NODES[@]}"
-[ -n "$CHECKPOINT" ] || die "SPARKFLASH_CHECKPOINT is required"
-[ -n "$TOKENIZER" ] || die "SPARKFLASH_TOKENIZER is required"
+# Only a start reads the weights; stop and status work without them.
+if [ "$MODE" = print ] || [ "$MODE" = launch ]; then
+    [ -n "$CHECKPOINT" ] || die "SPARKFLASH_CHECKPOINT is required"
+    [ -n "$TOKENIZER" ] || die "SPARKFLASH_TOKENIZER is required"
+fi
+for rank in ${LOCAL_RANKS[@]+"${LOCAL_RANKS[@]}"}; do
+    case "$rank" in 0|1|2|3) ;; *) die "SPARK_LOCAL_RANKS entries must be ranks 0-3, got '$rank'" ;; esac
+done
 PEERS="$(IFS=,; printf '%s' "${NODES[*]}")"
 if [ -n "${SPARK_PEERS:-}" ]; then
     read -r -a PEER_LIST <<< "$SPARK_PEERS"
@@ -84,6 +96,10 @@ fi
 rank_env() {
     printf 'SPARKFLASH_SERVE_DRAIN_DELAY_MS=%s SPARKFLASH_SERVE_DRAIN_TIMEOUT_MS=%s' \
         "$DRAIN_DELAY_MS" "$DRAIN_TIMEOUT_MS"
+    # The two settings the control plane owns. They are forwarded from the launcher environment
+    # rather than hard-coded so a web-driven launch and a hand-written one run the same flags.
+    [ -n "${SPARK_MAX_SEQ_LEN:-}" ] && printf ' SPARK_MAX_SEQ_LEN=%s' "$SPARK_MAX_SEQ_LEN"
+    [ -n "${SPARKFLASH_LANES:-}" ] && printf ' SPARKFLASH_LANES=%s' "$SPARKFLASH_LANES"
     if [ -n "$CUBINS" ]; then
         printf ' SPARK_COMM_REDUCE=nccl SPARKFLASH_LEAN_HEAD=1'
         [ -n "$NCCL_LIB" ] && printf ' LD_LIBRARY_PATH=%s${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}' "$NCCL_LIB"
@@ -117,9 +133,32 @@ rank_command() {
     fi
 }
 
+is_local() {
+    local rank="$1" entry
+    for entry in ${LOCAL_RANKS[@]+"${LOCAL_RANKS[@]}"}; do
+        [ "$entry" = "$rank" ] && return 0
+    done
+    return 1
+}
+
+# Runs a command for one rank: on this node for a local rank, over ssh otherwise.
 remote() {
     local rank="$1"; shift
-    ssh -n ${SSH_OPTS} "${SSH_USER:+$SSH_USER@}${NODES[$rank]}" "$*"
+    if is_local "$rank"; then
+        bash -c "$*" < /dev/null
+    else
+        ssh -n ${SSH_OPTS} "${SSH_USER:+$SSH_USER@}${NODES[$rank]}" "$*"
+    fi
+}
+
+# The detached start for one rank. `exec` replaces the backgrounded shell with the rank, so
+# nothing keeps the caller's stdout open: without it ssh (and a web job) waits until the rank
+# exits, and `$!` is the rank's own pid.
+start_line() {
+    local rank="$1"
+    printf "mkdir -p '%s/%s' && cd '%s' && exec nohup env %s %s > '%s/%s/rank%s.log' 2>&1 &" \
+        "$LOG_ROOT" "$RUN_ID" "$REPO_ROOT" "$(rank_env)" "$(rank_command "$rank")" \
+        "$LOG_ROOT" "$RUN_ID" "$rank"
 }
 
 print_plan() {
@@ -128,10 +167,13 @@ print_plan() {
     printf 'serve-four-node: peers %s\n' "$PEERS"
     local rank
     for rank in 0 1 2 3; do
-        printf 'serve-four-node: rank %s -> %s\n' "$rank" "${NODES[$rank]}"
-        printf '  ssh -n %s@%s "mkdir -p %s/%s && cd %s && nohup env %s %s > %s/%s/rank%s.log 2>&1 &"\n' \
-            "$SSH_USER" "${NODES[$rank]}" "$LOG_ROOT" "$RUN_ID" "$REPO_ROOT" \
-            "$(rank_env)" "$(rank_command "$rank")" "$LOG_ROOT" "$RUN_ID" "$rank"
+        if is_local "$rank"; then
+            printf 'serve-four-node: rank %s -> %s (this node)\n' "$rank" "${NODES[$rank]}"
+            printf '  bash -c "%s"\n' "$(start_line "$rank")"
+        else
+            printf 'serve-four-node: rank %s -> %s\n' "$rank" "${NODES[$rank]}"
+            printf '  ssh -n %s@%s "%s"\n' "$SSH_USER" "${NODES[$rank]}" "$(start_line "$rank")"
+        fi
     done
     printf 'serve-four-node: rank 0 serves http://%s/health, /readyz and /metrics\n' "$HTTP_BIND"
 }
@@ -146,7 +188,7 @@ case "$MODE" in
         mkdir -p "$LOG_ROOT/$RUN_ID"
         print_plan > "$local_plan"
         for rank in 0 1 2 3; do
-            remote "$rank" "mkdir -p '$LOG_ROOT/$RUN_ID' && cd '$REPO_ROOT' && nohup env $(rank_env) $(rank_command "$rank") > '$LOG_ROOT/$RUN_ID/rank$rank.log' 2>&1 & echo $!" \
+            remote "$rank" "$(start_line "$rank") echo \$!" \
                 | sed "s/^/rank $rank pid /"
         done
         printf 'serve-four-node: launched; commands in %s\n' "$local_plan"
@@ -156,14 +198,15 @@ case "$MODE" in
         for rank in 0 1 2 3; do
             # SIGTERM is the drain signal: rank 0 turns /readyz 503, finishes in-flight requests and
             # exits 0. The pattern is the exact rank flag, so no other serve process is matched.
-            remote "$rank" "pkill -TERM -f 'sparkflash serve --checkpoint .* --tp4-rank $rank ' >/dev/null 2>&1 || true" || true
+            # The bracket keeps the pattern from matching the shell that carries it.
+            remote "$rank" "pkill -TERM -f '[s]parkflash serve --checkpoint .* --tp4-rank $rank ' >/dev/null 2>&1 || true" || true
             printf 'serve-four-node: rank %s SIGTERM sent\n' "$rank"
         done
         printf 'serve-four-node: in-flight requests drain for up to %s ms\n' "$DRAIN_TIMEOUT_MS"
         ;;
     status)
         for rank in 0 1 2 3; do
-            if remote "$rank" "pgrep -f 'tp4-rank $rank ' >/dev/null" >/dev/null 2>&1; then
+            if remote "$rank" "pgrep -f '[t]p4-rank $rank ' >/dev/null" >/dev/null 2>&1; then
                 printf 'serve-four-node: rank %s running on %s\n' "$rank" "${NODES[$rank]}"
             else
                 printf 'serve-four-node: rank %s not running on %s\n' "$rank" "${NODES[$rank]}"

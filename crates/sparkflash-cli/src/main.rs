@@ -47,9 +47,12 @@ fn main() -> ExitCode {
         Some("convert") => convert::run(args),
         Some("serve") => serve::run(args),
         Some("device-chain") => device_chain::run(args),
+        // `sparkflash --web` is the requested spelling; `sparkflash web` is the same entry point
+        // with a conventional subcommand. Both hand the remaining arguments to the web crate.
+        Some("--web") | Some("web") => sparkflash_web::run(args),
         _ => {
             println!(
-                "sparkflash: usage: sparkflash <doctor|trace|pack-engram|convert|serve|device-chain>"
+                "sparkflash: usage: sparkflash <--web|doctor|trace|pack-engram|convert|serve|device-chain>"
             );
             ExitCode::SUCCESS
         }

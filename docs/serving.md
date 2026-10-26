@@ -4,6 +4,10 @@
 model. [scripts/serve-four-node.sh](../scripts/serve-four-node.sh) builds and launches the four
 command lines over ssh; this page describes what it sets up and what the server offers.
 
+The lead node can drive the same launcher and converter from a browser:
+[`sparkflash --web`](web.md) reads a TOML file, discovers the four nodes, and turns conversion and
+launch into buttons. The manual path below remains the reference for what those buttons run.
+
 ## Prerequisites
 
 On every node, at the same paths:
@@ -61,7 +65,7 @@ turns 200 when it accepts requests. If any rank dies, the others exit rather tha
 | `GET /v1/models`, `/v1/models/{id}` | The served model is `deepseek-ai/DeepSeek-V4.1-Flash` |
 | `POST /tokenize`, `/detokenize` | vLLM-compatible |
 | `GET /health`, `/readyz` | Liveness (503, with the reason, once the device loop has failed or stalled), and readiness (also 503 while draining) |
-| `GET /metrics` | Prometheus: requests running / waiting / rejected, prompt and generated tokens, time to first token |
+| `GET /metrics` | Prometheus: requests running / waiting / rejected, prompt and generated tokens, time to first token, DSpark accepted/proposed counters and last-request decode/prefill/acceptance gauges |
 | `GET /v1/cluster/stats` | JSON: per-node state, KV cache, speculation and request timing statistics |
 
 Authentication is off by default; `--api-key KEY` (or `SPARKFLASH_SERVE_API_KEY`) requires a

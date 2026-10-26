@@ -1,0 +1,103 @@
+# SparkFlash lead-node configuration.
+#
+# Copy to sparkflash.toml beside the checkout (or pass --config PATH) and edit the four nodes.
+# `sparkflash --web` loads this file, the web form saves it atomically, and every launcher and
+# converter command is derived from it.
+#
+# Relative paths resolve against [paths].repo_root, which itself resolves against the process
+# working directory. Production installs normally use absolute paths.
+
+[model]
+# Model means the weights. Only the released V4.1-Flash checkpoint ships in this build.
+weights = "deepseek-v4.1-flash"
+# The checkpoint's Hugging Face model ID.
+id = "deepseek-ai/DeepSeek-V4.1-Flash"
+# The checkpoint directory, the same path on every node. Empty looks `id` up in the Hugging Face
+# hub cache: <cache>/models--<org>--<name>/snapshots/<refs/main>.
+checkpoint = ""
+# The hub cache to look in. Empty means HF_HUB_CACHE, else $HF_HOME/hub, else
+# ~/.cache/huggingface/hub.
+hub_cache = ""
+# Empty derives <checkpoint>/tokenizer.json.
+tokenizer = ""
+# The directory `sparkflash convert` writes one file per rank into.
+converted_dir = "/data/sparkflash-conv"
+# The cubin directory built by scripts/build-cubins.sh.
+cubins = "/opt/sparkflash/cubins"
+
+[engine]
+# Engine means how the weights run. The TP=4 device engine is the only one today.
+kind = "deepseek-v4.1-flash"
+# false runs the CPU host twin and is only useful for a smoke test.
+device = true
+
+[runtime]
+# SPARK_MAX_SEQ_LEN. 1,048,576 is the model maximum.
+max_context_tokens = 1048576
+# SPARKFLASH_LANES. 32 is the engine design point.
+max_concurrency = 32
+
+[cluster]
+# Rank 0's public HTTP bind (SPARKFLASH_HTTP_BIND).
+http_bind = "0.0.0.0:8000"
+# Rank R uses base_port + R for the engine collectives.
+base_port = 29601
+# Empty means the user running the control plane.
+ssh_user = "spark"
+ssh_options = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
+# Exactly four nodes, in rank order. `local = true` runs that rank's convert, launch, stop and
+# status commands on the lead node rather than over SSH, so the lead needs no SSH key for itself.
+# The peer is the RoCE address the collectives use.
+nodes = [
+  { ssh = "spark0", peer = "10.0.0.1", local = true },
+  { ssh = "spark1", peer = "10.0.0.2", local = false },
+  { ssh = "spark2", peer = "10.0.0.3", local = false },
+  { ssh = "spark3", peer = "10.0.0.4", local = false },
+]
+
+[paths]
+# The checkout on every node.
+repo_root = "/opt/sparkflash"
+# The binary from `cargo build --release -p sparkflash-cli --features cuda,tp4-serve`.
+binary = "target/release/sparkflash"
+serve_script = "scripts/serve-four-node.sh"
+# Empty means NCCL is installed system-wide.
+nccl_lib = "/opt/nccl/lib"
+# The remote logs from scripts/serve-four-node.sh.
+log_root = "target/serve-tp4"
+
+[network]
+# Leave empty to let NCCL choose. On a ConnectX-7 Spark these are the values from ibv_devices.
+nccl_ib_hca = ""
+nccl_socket_ifname = ""
+# 3 is the usual RoCEv2 GID index.
+nccl_ib_gid_index = 3
+# Extra environment exported to every rank.
+[network.env]
+# NCCL_NET_GDR_LEVEL = "5"
+# NCCL_DMABUF_ENABLE = "1"
+
+[web]
+# The control plane's own listener. All interfaces, because Sparks run headless. It has no login:
+# keep it on a trusted network, or use "127.0.0.1:8790" with an SSH tunnel.
+bind = "0.0.0.0:8790"
+# Rank 0 as seen from the lead node, used for /metrics and /v1/cluster/stats.
+serve_url = "http://127.0.0.1:8000"
+# Host names the UI answers besides IP literals, localhost and this machine's own name, for
+# example a reverse proxy's public name. Any other Host header is refused (DNS-rebinding guard).
+allowed_hosts = []
+# How long one mDNS browse collects answers.
+discovery_timeout_secs = 3
+# One SSH probe's connection timeout.
+ssh_timeout_secs = 5
+# Publish _sparkflash._tcp.local. so other leads can find this one.
+advertise = true
+
+[stats]
+# Sampling runs outside inference. Two seconds is cheap and smooth enough for the charts.
+sample_interval_secs = 2
+# In-memory graph history; the UI offers 5m/15m/1h/6h/24h.
+retention_secs = 86400
+# Written only while running == 0 and waiting == 0, at most once per flush interval.
+persist_path = "target/web/stats.json"
+flush_interval_secs = 60

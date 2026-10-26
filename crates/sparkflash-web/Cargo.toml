@@ -1,0 +1,23 @@
+[package]
+name = "sparkflash-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Lead-node web control plane for SparkFlash"
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+ureq = { version = "2.12", default-features = false }
+mdns-sd = { version = "0.21", default-features = false }
+
+[dev-dependencies]
+tower = { workspace = true }
+http-body-util = { workspace = true }
+tempfile = { workspace = true }

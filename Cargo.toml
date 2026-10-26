@@ -11,6 +11,7 @@ members = [
     "crates/sparkflash-engine",
     "crates/sparkflash-device",
     "crates/sparkflash-vision",
+    "crates/sparkflash-web",
 ]
 resolver = "2"
 
@@ -32,6 +33,7 @@ sparkflash-kernels = { path = "crates/sparkflash-kernels" }
 sparkflash-engine = { path = "crates/sparkflash-engine" }
 sparkflash-device = { path = "crates/sparkflash-device" }
 sparkflash-vision = { path = "crates/sparkflash-vision" }
+sparkflash-web = { path = "crates/sparkflash-web" }
 
 tokio = { version = "1.43", features = ["full", "rt-multi-thread", "parking_lot"] }
 axum = { version = "0.8", features = ["http2", "json", "macros"] }
@@ -39,6 +41,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-br"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "0.8"
 bytes = "1.9"
 futures = "0.3"
 async-stream = "0.3"

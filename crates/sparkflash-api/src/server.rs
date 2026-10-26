@@ -1984,6 +1984,7 @@ async fn chat_completions(
         let usage = aggregate_usage_shared_prompt(&outputs);
         let stats = aggregate_stats(&outputs);
         state.metrics.record_request(&usage, &stats.kv_cache);
+        state.metrics.record_request_stats(&stats);
         Ok(json_response(
             chat_completions_body(&outputs, &id, created, &model, logprob_info),
             trace,
@@ -2495,6 +2496,7 @@ fn chat_stream_response(
                         usage_parts.push(usage);
                         if choice_count == 1 {
                             metrics.record_request(&usage, &stats.kv_cache);
+                            metrics.record_request_stats(&stats);
                         }
                         finished_completion += usage.completion_tokens;
                         current_completion = 0;
@@ -2734,6 +2736,7 @@ fn chat_stream_response(
             let stats = aggregate_stats_parts(&parts);
             let usage = aggregate_usage_shared_prompt_parts(&usage_parts);
             metrics.record_request(&usage, &stats.kv_cache);
+            metrics.record_request_stats(&stats);
             if include_usage && !terminal {
                 yield Ok(sse_frame(&chat_usage_chunk(&id, &model, created, &usage)));
             }
@@ -2995,6 +2998,7 @@ async fn completions(
         let usage = aggregate_completion_usage(&outputs, &request_plan);
         let stats = aggregate_stats(&outputs);
         state.metrics.record_request(&usage, &stats.kv_cache);
+        state.metrics.record_request_stats(&stats);
         let body = completion_body(
             &outputs,
             &prompts,
@@ -3547,6 +3551,7 @@ fn completions_stream_response(
                 .collect();
             let stats = aggregate_stats_parts(&parts);
             metrics.record_request(&usage, &stats.kv_cache);
+            metrics.record_request_stats(&stats);
         }
         if include_usage {
             // vLLM emits one final usage chunk after every choice has finished, with the usage
@@ -3655,6 +3660,7 @@ async fn responses(
     state
         .metrics
         .record_request(&output.usage, &output.stats.kv_cache);
+    state.metrics.record_request_stats(&output.stats);
 
     let mut items = Vec::new();
     if !output.reasoning.is_empty() {
@@ -3765,6 +3771,7 @@ async fn messages(
     state
         .metrics
         .record_request(&output.usage, &output.stats.kv_cache);
+    state.metrics.record_request_stats(&output.stats);
 
     let mut content = Vec::new();
     if !output.reasoning.is_empty() {

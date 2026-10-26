@@ -48,8 +48,8 @@ use super::{
     ENGINE_ERROR_CODE, ENGINE_GONE_CODE, EXIT_REFUSED, REFUSED_CODE, RequestTiming, RunSummary,
     ServeOptions, StopBuffer, TP4_CONTROL_TIMEOUT, TP4_TICK_PROMPT_IDS, Tp4ControlFrame,
     Tp4ControlHub, Tp4ControlWorker, Tp4DeviceAdmit, Tp4DeviceImage, Tp4ServeOptions,
-    bind_and_serve, default_tokenizer, epoch_millis, finished_event_with_fabric, load_tokenizer,
-    refused, tp4_cluster_snapshot,
+    bind_and_serve, control_frame_bytes, control_pixels_bytes, default_tokenizer, epoch_millis,
+    finished_event_with_fabric, load_tokenizer, refused, tp4_cluster_snapshot,
 };
 use crate::device_link::{DeviceFinish, DeviceJob, DeviceLink, DeviceOutcome, DeviceTick};
 use sparkflash_api::VisionImage;
@@ -749,9 +749,77 @@ fn admitted_job(
     ))
 }
 
+/// Rank 0's control frames, each worker's written by a thread of its own. A tick decided ahead
+/// ([`DeviceLink::ahead`]) goes out while the workers are still in the tick before it and read
+/// nothing; written on the device thread, a frame larger than the sockets hold (a long prompt's
+/// admission, an image's canvas) held that thread in the write before it launched the tick's
+/// remaining collectives, which the workers waited in: the group deadlocked.
+struct ControlWriters {
+    /// By worker rank (rank 0's is None): the frames its thread writes, in order.
+    queues: Vec<Option<mpsc::Sender<Arc<[u8]>>>>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl ControlWriters {
+    /// Takes the hub's streams over: from here on only these threads write to the workers.
+    fn start(hub: Tp4ControlHub) -> Result<Self, String> {
+        let mut queues = Vec::new();
+        let mut threads = Vec::new();
+        for (rank, stream) in hub.streams.into_iter().enumerate() {
+            let Some(mut stream) = stream else {
+                queues.push(None);
+                continue;
+            };
+            let (queue, frames) = mpsc::channel::<Arc<[u8]>>();
+            let thread = std::thread::Builder::new()
+                .name(format!("sparkflash-ctl-r{rank}"))
+                .spawn(move || {
+                    use std::io::Write as _;
+                    for frame in frames {
+                        if let Err(error) = stream.write_all(&frame).and_then(|()| stream.flush()) {
+                            eprintln!(
+                                "sparkflash serve: rank {rank} control write: {error}; the group cannot serve, exiting"
+                            );
+                            exit_now(1);
+                        }
+                    }
+                })
+                .map_err(|error| format!("rank {rank} control writer: {error}"))?;
+            queues.push(Some(queue));
+            threads.push(thread);
+        }
+        Ok(Self { queues, threads })
+    }
+
+    /// Queues `frame` for worker `rank`.
+    fn send(&self, rank: usize, frame: Arc<[u8]>) -> Result<(), String> {
+        self.queues
+            .get(rank)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| format!("control: no worker rank {rank}"))?
+            .send(frame)
+            .map_err(|_| format!("control: rank {rank}'s writer is gone"))
+    }
+
+    /// Queues `frame` for every worker.
+    fn broadcast(&self, frame: &Arc<[u8]>) -> Result<(), String> {
+        (0..self.queues.len())
+            .filter(|&rank| self.queues[rank].is_some())
+            .try_for_each(|rank| self.send(rank, Arc::clone(frame)))
+    }
+
+    /// Writes every queued frame, then stops the threads.
+    fn close(&mut self) {
+        self.queues.clear();
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Rank 0's link: the driver's queue in, the control broadcast and the stream events out.
 struct HubLink {
-    hub: Tp4ControlHub,
+    control: ControlWriters,
     jobs: mpsc::Receiver<Pending>,
     /// Fired at the first tick: the epoch is open and HTTP may bind.
     ready: Option<mpsc::Sender<()>>,
@@ -815,7 +883,10 @@ impl HubLink {
                     }
                     Err(_) => {
                         // The driver is gone: every worker leaves its loop.
-                        let _ = self.hub.broadcast(&Tp4ControlFrame::End);
+                        if let Ok(end) = control_frame_bytes(&Tp4ControlFrame::End) {
+                            let _ = self.control.broadcast(&end.into());
+                        }
+                        self.control.close();
                         return Ok(None);
                     }
                 }
@@ -834,23 +905,23 @@ impl HubLink {
             for (seq, job) in &tick.admit {
                 for (index, image) in job.images.iter().enumerate() {
                     let index = u32::try_from(index).unwrap_or(u32::MAX);
-                    self.hub
-                        .send_pixels(tower, *seq, index, &image.pixels)
+                    let frame = control_pixels_bytes(*seq, index, &image.pixels)
                         .map_err(|error| format!("control DevicePixels: {error}"))?;
+                    self.control.send(tower, frame.into())?;
                 }
             }
         }
-        self.hub
-            .broadcast(&Tp4ControlFrame::DeviceTick {
-                admit: tick
-                    .admit
-                    .iter()
-                    .map(|(seq, job)| admit_frame(*seq, job))
-                    .collect(),
-                cancel: tick.cancel.clone(),
-                hold_prefill,
-            })
-            .map_err(|error| format!("control DeviceTick: {error}"))?;
+        let frame = control_frame_bytes(&Tp4ControlFrame::DeviceTick {
+            admit: tick
+                .admit
+                .iter()
+                .map(|(seq, job)| admit_frame(*seq, job))
+                .collect(),
+            cancel: tick.cancel.clone(),
+            hold_prefill,
+        })
+        .map_err(|error| format!("control DeviceTick: {error}"))?;
+        self.control.broadcast(&frame.into())?;
         Ok(Some(tick))
     }
 }
@@ -1257,13 +1328,14 @@ fn start_leader(
     let hub = Tp4ControlHub::start(control, tp4.world_size, TP4_CONTROL_TIMEOUT)
         .map_err(|error| format!("rank 0 control channel: {error}"))?;
     watch_workers(&hub)?;
+    let control = ControlWriters::start(hub)?;
     let (jobs, queued) = mpsc::sync_channel(DEVICE_JOB_QUEUE);
     let (ready, readied) = mpsc::channel();
     let metrics = Arc::new(Metrics::new());
     let health = Arc::new(DeviceHealth::new(stall_after()));
     watch_loop(Arc::clone(&health))?;
     crate::device_link::install(Box::new(HubLink {
-        hub,
+        control,
         jobs: queued,
         ready: Some(ready),
         tokenizer,
@@ -1335,6 +1407,41 @@ fn start_leader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_control_frame_the_sockets_cannot_hold_does_not_wait_for_the_worker() {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client = TcpStream::connect(listener.local_addr().expect("address")).expect("connect");
+        let (mut worker, _) = listener.accept().expect("accept");
+        let hub = Tp4ControlHub {
+            streams: vec![None, Some(client)],
+            world: 2,
+            ready: true,
+        };
+        let mut control = ControlWriters::start(hub).expect("writers");
+        // Far more than a loopback socket pair buffers while the worker reads nothing (it is
+        // still in the tick before), as a long prompt's admission can be.
+        let big: Arc<[u8]> = (0..16u32 << 20).map(|i| (i % 251) as u8).collect();
+        let end: Arc<[u8]> = Arc::from(&b"end"[..]);
+        control.send(1, Arc::clone(&big)).expect("queued");
+        control.broadcast(&end).expect("queued");
+        assert!(
+            control.send(0, Arc::clone(&end)).is_err(),
+            "rank 0 has no writer"
+        );
+        let read = std::thread::spawn(move || {
+            let mut got = vec![0u8; big.len() + 3];
+            worker
+                .read_exact(&mut got)
+                .expect("the worker reads both frames");
+            assert!(got[..big.len()] == big[..], "the big frame arrives whole");
+            assert_eq!(&got[big.len()..], b"end", "and the frames keep their order");
+        });
+        // Closing writes what is queued before the threads stop.
+        control.close();
+        read.join().expect("reader");
+    }
 
     #[test]
     fn health_reports_a_failure_and_a_stall_but_never_an_idle_wait() {

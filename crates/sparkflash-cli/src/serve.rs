@@ -2137,34 +2137,35 @@ impl From<serde_json::Error> for Tp4ControlError {
     }
 }
 
+/// One length-prefixed JSON control frame, as it goes on the wire.
+#[cfg(feature = "tp4-serve")]
+fn control_frame_bytes(frame: &Tp4ControlFrame) -> Result<Vec<u8>, Tp4ControlError> {
+    let payload = serde_json::to_vec(frame)?;
+    let length = u32::try_from(payload.len()).map_err(|_| Tp4ControlError::FrameTooLarge {
+        bytes: payload.len(),
+    })?;
+    let mut bytes = Vec::with_capacity(4 + payload.len());
+    bytes.extend_from_slice(&length.to_be_bytes());
+    bytes.extend_from_slice(&payload);
+    Ok(bytes)
+}
+
 /// Writes one length-prefixed JSON control frame.
 #[cfg(feature = "tp4-serve")]
 fn write_control_frame(
     stream: &mut TcpStream,
     frame: &Tp4ControlFrame,
 ) -> Result<(), Tp4ControlError> {
-    let payload = serde_json::to_vec(frame)?;
-    let length = u32::try_from(payload.len()).map_err(|_| Tp4ControlError::FrameTooLarge {
-        bytes: payload.len(),
-    })?;
     // One write per frame: with TCP_NODELAY a frame is one segment, not a header the peer
     // waits on while the payload sits behind Nagle.
-    let mut bytes = Vec::with_capacity(4 + payload.len());
-    bytes.extend_from_slice(&length.to_be_bytes());
-    bytes.extend_from_slice(&payload);
-    stream.write_all(&bytes)?;
+    stream.write_all(&control_frame_bytes(frame)?)?;
     stream.flush()?;
     Ok(())
 }
 
-/// Writes a [`Tp4ControlFrame::DevicePixels`] frame and its canvas bytes.
+/// A [`Tp4ControlFrame::DevicePixels`] frame and its canvas bytes, as they go on the wire.
 #[cfg(feature = "tp4-serve")]
-fn write_control_pixels(
-    stream: &mut TcpStream,
-    seq: u64,
-    image: u32,
-    pixels: &[u8],
-) -> Result<(), Tp4ControlError> {
+fn control_pixels_bytes(seq: u64, image: u32, pixels: &[u8]) -> Result<Vec<u8>, Tp4ControlError> {
     if pixels.len() > TP4_CONTROL_MAX_PIXELS {
         return Err(Tp4ControlError::FrameTooLarge {
             bytes: pixels.len(),
@@ -2175,10 +2176,9 @@ fn write_control_pixels(
         image,
         bytes: pixels.len() as u64,
     };
-    write_control_frame(stream, &frame)?;
-    stream.write_all(pixels)?;
-    stream.flush()?;
-    Ok(())
+    let mut bytes = control_frame_bytes(&frame)?;
+    bytes.extend_from_slice(pixels);
+    Ok(bytes)
 }
 
 /// Reads the `bytes` canvas bytes that follow a [`Tp4ControlFrame::DevicePixels`] frame.
@@ -2301,26 +2301,6 @@ impl Tp4ControlHub {
             write_control_frame(stream, frame)?;
         }
         Ok(())
-    }
-
-    /// Sends worker `rank` the canvas of image `image` of sequence `seq`.
-    fn send_pixels(
-        &mut self,
-        rank: usize,
-        seq: u64,
-        image: u32,
-        pixels: &[u8],
-    ) -> Result<(), Tp4ControlError> {
-        if !self.ready {
-            return Err(Tp4ControlError::NotReady { expected: "pixels" });
-        }
-        let stream = self.streams.get_mut(rank).and_then(Option::as_mut).ok_or(
-            Tp4ControlError::BadRank {
-                rank: u32::try_from(rank).unwrap_or(u32::MAX),
-                world: self.world,
-            },
-        )?;
-        write_control_pixels(stream, seq, image, pixels)
     }
 }
 

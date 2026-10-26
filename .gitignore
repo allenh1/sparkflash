@@ -11,6 +11,8 @@
 *.trace.json.gz
 /engram-*.bin
 /tmp
+# The lead-node web control plane's local config (sparkflash.toml.example is committed).
+/sparkflash.toml
 
 # Editors / OS
 .DS_Store

@@ -82,6 +82,24 @@ curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' -
 `scripts/serve-four-node.sh stop` drains in-flight requests and shuts the group down. More on
 flags, the API surface and tuning: [docs/serving.md](docs/serving.md).
 
+## Or let the lead node do the setup
+
+`sparkflash --web` turns the manual bring-up above into a dark control plane on the lead node. It
+reads `sparkflash.toml`, finds the other Sparks over mDNS, checks passwordless SSH (and prints the
+`ssh-copy-id` command when it fails), runs the one-time per-rank conversion, launches/stops the
+four ranks, and graphs decode speed, prefill, DSpark acceptance, cache hit rate, tokens by day and
+per-rank state. History is written to disk only while the cluster is idle, never during inference.
+
+```bash
+cp sparkflash.toml.example sparkflash.toml     # edit the four nodes and paths
+target/release/sparkflash --web --config sparkflash.toml
+# control plane on http://127.0.0.1:8790
+```
+
+The model (weights) and engine (how they run) are separate selectors, with V4.1-Flash the only
+choice in each today. The full config, routes, discovery and telemetry design are in
+[docs/web.md](docs/web.md).
+
 ## Why DGX Spark owners should care
 
 A DGX Spark is not a small datacenter GPU. It has 128 GB of memory shared by the CPU and GPU, about
@@ -191,6 +209,7 @@ crates/
   sparkflash-scheduler/  batching and speculation scheduling
   sparkflash-vision/     image decoding and resizing for the vision path
   sparkflash-trace/      CPU and GPU trace points
+  sparkflash-web/        `sparkflash --web`: TOML control plane, mDNS/SSH discovery, jobs, graphs
 kernels/                 CUDA sources (compiled to cubins by scripts/build-cubins.sh)
 scripts/                 launch, build and verification tooling
 docs/                    design, performance, serving and model architecture
