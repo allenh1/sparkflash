@@ -19,7 +19,6 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 authors = ["SparkFlash Team"]
-repository = "https://example.com/sparkflash"
 rust-version = "1.88"
 
 [workspace.dependencies]

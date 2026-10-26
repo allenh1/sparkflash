@@ -1,6 +1,6 @@
 # 03 — MoE: gate, experts, quantisation, and the hash-layer contrast
 
-References: /home/user/dsv41-research/inference/model.py (Gate 792-827, Expert 830-851, MoE 854-904),
+References: <checkpoint>/inference/model.py (Gate 792-827, Expert 830-851, MoE 854-904),
 convert.py, kernel.py, config.json, tech_report.txt.
 
 ---

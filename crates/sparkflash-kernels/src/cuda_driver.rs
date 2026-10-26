@@ -1758,6 +1758,18 @@ pub struct SideStream {
     event: CuEvent,
 }
 
+impl SideStream {
+    /// The raw stream handle, for a library (NCCL) that enqueues its own work on it.
+    #[must_use]
+    pub fn raw(&self) -> u64 {
+        self.stream as u64
+    }
+}
+
+/// An event a [SideStream] marks and the run's stream waits on ([Cuda::side_mark],
+/// [Cuda::run_wait]); it lives for the run, like the side stream.
+pub struct StreamEvent(CuEvent);
+
 /// The CUDA context and the dlopen'd driver functions this process uses.
 ///
 /// The context is the retained primary context, made current for the thread that created it, and
@@ -3851,6 +3863,121 @@ impl Cuda {
             return Err(format!("cuEventCreate for the side stream failed: {r}"));
         }
         Ok(SideStream { stream, event })
+    }
+
+    /// [Self::side_stream] at the context's greatest stream priority: when SMs free up, its
+    /// blocks are scheduled before the run's stream's (a collective's ring kernel waits on its
+    /// peers, so it should not queue behind a long compute grid).
+    ///
+    /// # Errors
+    /// The driver's cuCtxGetStreamPriorityRange, cuStreamCreateWithPriority or cuEventCreate
+    /// failure code.
+    pub fn side_stream_urgent(&self) -> Result<SideStream, String> {
+        let range: libloading::Symbol<unsafe extern "C" fn(*mut i32, *mut i32) -> CuResult> =
+            self.sym(b"cuCtxGetStreamPriorityRange")?;
+        let create: libloading::Symbol<unsafe extern "C" fn(*mut CuStream, u32, i32) -> CuResult> =
+            self.sym(b"cuStreamCreateWithPriority")?;
+        let event_create: libloading::Symbol<unsafe extern "C" fn(*mut CuEvent, u32) -> CuResult> =
+            self.sym(b"cuEventCreate")?;
+        let (mut least, mut greatest) = (0i32, 0i32);
+        let mut stream: CuStream = std::ptr::null_mut();
+        let mut event: CuEvent = std::ptr::null_mut();
+        // SAFETY: the symbols belong to this context's library and the out-pointers are valid for
+        // the calls; the flags are the documented non-blocking and disable-timing flags.
+        let r = unsafe { range(&mut least, &mut greatest) };
+        if r != 0 {
+            return Err(format!("cuCtxGetStreamPriorityRange failed: {r}"));
+        }
+        let r = unsafe { create(&mut stream, CU_STREAM_NON_BLOCKING, greatest) };
+        if r != 0 {
+            return Err(format!("cuStreamCreateWithPriority failed: {r}"));
+        }
+        let r = unsafe { event_create(&mut event, CU_EVENT_DISABLE_TIMING) };
+        if r != 0 {
+            return Err(format!("cuEventCreate for the side stream failed: {r}"));
+        }
+        Ok(SideStream { stream, event })
+    }
+
+    /// Creates a [StreamEvent] (timing disabled).
+    ///
+    /// # Errors
+    /// The driver's cuEventCreate failure code.
+    pub fn stream_event(&self) -> Result<StreamEvent, String> {
+        let event_create: libloading::Symbol<unsafe extern "C" fn(*mut CuEvent, u32) -> CuResult> =
+            self.sym(b"cuEventCreate")?;
+        let mut event: CuEvent = std::ptr::null_mut();
+        // SAFETY: the symbol belongs to this context's library and the out-pointer is valid.
+        let r = unsafe { event_create(&mut event, CU_EVENT_DISABLE_TIMING) };
+        if r != 0 {
+            return Err(format!("cuEventCreate failed: {r}"));
+        }
+        Ok(StreamEvent(event))
+    }
+
+    /// Orders `side` after everything queued so far on the run's stream (the run's stream does
+    /// not wait). Direct launches only: a graph segment has no second stream.
+    ///
+    /// # Errors
+    /// Inside a graph segment, or the driver's cuEventRecord or cuStreamWaitEvent failure code.
+    pub fn side_follow_run(&self, side: &SideStream) -> Result<(), String> {
+        if self.graph_mode.load(Ordering::Relaxed) != GRAPH_DIRECT {
+            return Err("side_follow_run: a graph segment is active".to_owned());
+        }
+        let record: libloading::Symbol<unsafe extern "C" fn(CuEvent, CuStream) -> CuResult> =
+            self.sym(b"cuEventRecord")?;
+        let wait: libloading::Symbol<unsafe extern "C" fn(CuStream, CuEvent, u32) -> CuResult> =
+            self.sym(b"cuStreamWaitEvent")?;
+        // SAFETY: the symbols come from this context's library; the event and stream belong to
+        // `side` and the null stream is the run's stream.
+        unsafe {
+            let r = record(side.event, std::ptr::null_mut());
+            if r != 0 {
+                return Err(format!("cuEventRecord on the run's stream failed: {r}"));
+            }
+            let r = wait(side.stream, side.event, 0);
+            if r != 0 {
+                return Err(format!("cuStreamWaitEvent on the side stream failed: {r}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Records `event` on `side` after everything queued there so far.
+    ///
+    /// # Errors
+    /// Inside a graph segment, or the driver's cuEventRecord failure code.
+    pub fn side_mark(&self, side: &SideStream, event: &StreamEvent) -> Result<(), String> {
+        if self.graph_mode.load(Ordering::Relaxed) != GRAPH_DIRECT {
+            return Err("side_mark: a graph segment is active".to_owned());
+        }
+        let record: libloading::Symbol<unsafe extern "C" fn(CuEvent, CuStream) -> CuResult> =
+            self.sym(b"cuEventRecord")?;
+        // SAFETY: the symbol comes from this context's library; both handles are live.
+        let r = unsafe { record(event.0, side.stream) };
+        if r != 0 {
+            return Err(format!("cuEventRecord on the side stream failed: {r}"));
+        }
+        Ok(())
+    }
+
+    /// Makes the run's stream wait for `event`'s last record before anything queued after this.
+    ///
+    /// # Errors
+    /// Inside a graph segment, or the driver's cuStreamWaitEvent failure code.
+    pub fn run_wait(&self, event: &StreamEvent) -> Result<(), String> {
+        if self.graph_mode.load(Ordering::Relaxed) != GRAPH_DIRECT {
+            return Err("run_wait: a graph segment is active".to_owned());
+        }
+        let wait: libloading::Symbol<unsafe extern "C" fn(CuStream, CuEvent, u32) -> CuResult> =
+            self.sym(b"cuStreamWaitEvent")?;
+        // SAFETY: the symbol comes from this context's library; the event is live and the null
+        // stream is the run's stream.
+        let r = unsafe { wait(std::ptr::null_mut(), event.0, 0) };
+        if r != 0 {
+            return Err(format!("cuStreamWaitEvent on the run's stream failed: {r}"));
+        }
+        Ok(())
     }
 
     /// Launches `kernel` on `side` after everything already queued on the run's stream, without

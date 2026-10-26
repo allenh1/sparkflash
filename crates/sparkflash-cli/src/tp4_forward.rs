@@ -2554,6 +2554,9 @@ pub struct TokenStageRequest<'a> {
     pub checkpoint_dir: Option<&'a Path>,
     /// The safetensors index file; absent means checkpoint_dir/model.safetensors.index.json.
     pub checkpoint_index: Option<&'a Path>,
+    /// The tokenizer.json whose compressed token map the Engram n-grams are hashed over; absent
+    /// means checkpoint_dir/tokenizer.json.
+    pub engram_tokenizer: Option<&'a Path>,
     /// The rank plan's checkpoint source, when the run opened one. The released model writes Engram
     /// into the residual stream at layers 1 and 14, and those tables are 98 GB each: the seam pages
     /// them through this range-capable source instead of the arena. A config with Engram layers and
@@ -10986,6 +10989,16 @@ struct DeviceLayer<'a> {
     /// place that clears it, after a device synchronise that covers stream 0 where the collective is
     /// enqueued. A new diagnostic cannot forget the wait without failing its own read.
     collectives_in_flight: std::cell::Cell<u32>,
+    /// The whole embedding table on this rank (Self::replicate_embedding), or None: each rank
+    /// holds its vocabulary shard and a row comes from its owner.
+    embed_table: Option<u64>,
+    /// The paired bulk chunks' collective stream (Self::open_bulk_comm): their all-reduces run
+    /// on it, each after an event of the run's stream, while the other chunk computes.
+    bulk_comm: Option<sparkflash_kernels::cuda_driver::SideStream>,
+    /// The tensor-parallel world a bulk chunk's mHC seams are split over by rows
+    /// (Self::enable_prefill_sp; SPARKFLASH_PREFILL_SP=0 turns it off), or None: every rank runs
+    /// every row's.
+    prefill_sp: Option<usize>,
     /// The typed weights the stages need, resolved once at open through WEIGHT_NAMES.
     weights: LayerWeights,
     /// Every layer's mHC seam weights, resolved once at open from `weights` (same table, one path).
@@ -11398,9 +11411,11 @@ struct OptSelect {
     scores_out: sparkflash_kernels::cuda_driver::Deviceptr,
     /// The radix select's keys and flags past its shared-memory table (5 bytes a position).
     scratch: sparkflash_kernels::cuda_driver::Deviceptr,
-    /// The batched rows select (opt_select_scores_rows, opt_select_rows) beside the radix select;
+    /// The batched rows select (opt_select_scores_rows, opt_select_rows, and
+    /// opt_select_scores_seg, the 32-head scores a segment's rows share) beside the radix select;
     /// none with the rank form.
     rows: Option<(
+        sparkflash_kernels::cuda_driver::Kernel,
         sparkflash_kernels::cuda_driver::Kernel,
         sparkflash_kernels::cuda_driver::Kernel,
     )>,
@@ -11725,8 +11740,8 @@ impl<'a> DeviceLayer<'a> {
                     .map_err(|error| format!("layer device opt oneshot: {error}"))?;
                 let (module, kernel) = cuda.load_named(&cubin, "opt_sum_ranks_bf16")?;
                 let mut total = 0usize;
-                // Eight ranks' rows, for up to eight rows a step (the multi-row verify step).
-                let gather = cuda.alloc(8 * 8 * 5120 * 2, &mut total)?;
+                // Eight ranks' rows, for up to R_MAX rows a step (the multi-row verify step).
+                let gather = cuda.alloc(8 * rows::R_MAX * 5120 * 2, &mut total)?;
                 Some((module, kernel, gather))
             }
             _ => None,
@@ -11761,7 +11776,8 @@ impl<'a> DeviceLayer<'a> {
                 } else {
                     let (_m3, scores_rows) = cuda.load_named(&cubin, "opt_select_scores_rows")?;
                     let (_m4, select_rows) = cuda.load_named(&cubin, "opt_select_rows")?;
-                    Some((scores_rows, select_rows))
+                    let (_m5, scores_seg) = cuda.load_named(&cubin, "opt_select_scores_seg")?;
+                    Some((scores_rows, select_rows, scores_seg))
                 };
                 let mut total = 0usize;
                 let table = max_positions.max(sparkflash_kernels::ref_select_launch::MAX_POSITIONS);
@@ -12216,6 +12232,9 @@ impl<'a> DeviceLayer<'a> {
             attention,
             reduce: None,
             collectives_in_flight: std::cell::Cell::new(0),
+            embed_table: None,
+            bulk_comm: None,
+            prefill_sp: None,
             rope_kernel: (rope_module, rope_kernel),
             max_positions,
             sequence_rows,
@@ -12713,6 +12732,7 @@ impl<'a> DeviceLayer<'a> {
                         u64::from(self.rope_head_dim),
                         u64::from(self.heads_per_rank),
                         pairs as u64,
+                        0,
                     ],
                 )
                 .map_err(|error| format!("layer device stage query_path: q rope: {error}"));
@@ -12824,7 +12844,7 @@ impl<'a> DeviceLayer<'a> {
             )
         })?;
         let (world, rank) = handle.world_rank();
-        if rows > 8 {
+        if rows > rows::R_MAX {
             // A bulk prefill chunk: one collective over every row (summed in NCCL's order, which
             // the bulk path does not hold to the single-row bits).
             // SAFETY: as below, over rows * count values (checked above).
@@ -12847,13 +12867,13 @@ impl<'a> DeviceLayer<'a> {
                 if handle.has_exchange()
                     && world <= 8
                     && count <= 5120
-                    && rows <= 8
+                    && rows <= rows::R_MAX
                     && count.is_multiple_of(2) =>
             {
                 // The rows travel as one block: the sum is per element in rank order, so each
                 // row's arithmetic is the single-row exchange's.
                 let count = count * rows;
-                // SAFETY: as below; the gather buffer holds 8 ranks x 8 rows of 5120 bf16 values.
+                // SAFETY: as below; the gather buffer holds 8 ranks x R_MAX rows of 5120 bf16 values.
                 unsafe { handle.exchange_bf16(input.device, gather.0, count, 0) }
                     .map_err(|error| format!("layer device stage {stage}: {error}"))?;
                 let pairs = (count / 2) as u32;
@@ -12883,6 +12903,193 @@ impl<'a> DeviceLayer<'a> {
             .set(self.collectives_in_flight.get().saturating_add(1));
         probe::count(stage);
         Ok(())
+    }
+
+    /// A bulk chunk's all-reduce of `rows` rows on the collective stream ([Self::open_bulk_comm]):
+    /// it starts once everything queued on the run's stream so far is done and marks `done`, which
+    /// the chunk's next reader waits on (rows::RowsState::overlap). The sum is the run's-stream
+    /// collective's (one NCCL all-reduce over every row).
+    fn reduce_rows_overlapped(
+        &self,
+        stage: &'static str,
+        input: crate::layer_device::DeviceSpan,
+        output: crate::layer_device::DeviceSpan,
+        rows: usize,
+        done: &sparkflash_kernels::cuda_driver::StreamEvent,
+    ) -> Result<(), String> {
+        let count = self.dim;
+        let comm = self
+            .bulk_comm
+            .as_ref()
+            .ok_or_else(|| format!("layer device stage {stage}: no collective stream"))?;
+        let reduce = self.reduce.ok_or_else(|| {
+            format!("layer device stage {stage}: the run carries no reduce handle")
+        })?;
+        let needed = count * 2 * rows;
+        if rows <= rows::R_MAX || input.len < needed || output.len < needed {
+            return Err(format!(
+                "layer device stage {stage}: {rows} rows do not fit an overlapped all-reduce"
+            ));
+        }
+        let mut handle = reduce.0.try_borrow_mut().map_err(|_| {
+            format!("layer device stage {stage}: the run's reduce handle is already borrowed")
+        })?;
+        self.cuda.side_follow_run(comm)?;
+        // SAFETY: the spans hold rows * count bf16 values (checked above), the collective stream
+        // belongs to this run's context, and every rank queues the same collectives in the same
+        // order on it (the paired chunks' schedule is the same on every rank).
+        unsafe {
+            if handle.has_bulk() {
+                handle.reduce_bf16_bulk(comm.raw(), input.device, output.device, count * rows)
+            } else {
+                handle.reduce_bf16(comm.raw(), input.device, output.device, count * rows)
+            }
+        }
+        .map_err(|error| format!("layer device stage {stage}: {error}"))?;
+        self.cuda.side_mark(comm, done)?;
+        self.collectives_in_flight
+            .set(self.collectives_in_flight.get().saturating_add(1));
+        Ok(())
+    }
+
+    /// A sequence-parallel bulk chunk's collective on the collective stream: a ReduceScatter of
+    /// `count` bf16 values per rank from `input` (`world * count` values) into `output`, or an
+    /// AllGather of `count` values from `input` into `output` (`world * count`; `input` may be this
+    /// rank's block of it). As [Self::reduce_rows_overlapped] it starts once everything queued on
+    /// the run's stream so far is done and marks `done`.
+    fn bulk_collective(
+        &self,
+        stage: &'static str,
+        gather: bool,
+        input: u64,
+        output: u64,
+        count: usize,
+        done: &sparkflash_kernels::cuda_driver::StreamEvent,
+    ) -> Result<(), String> {
+        let comm = self
+            .bulk_comm
+            .as_ref()
+            .ok_or_else(|| format!("layer device stage {stage}: no collective stream"))?;
+        let reduce = self.reduce.ok_or_else(|| {
+            format!("layer device stage {stage}: the run carries no reduce handle")
+        })?;
+        let mut handle = reduce.0.try_borrow_mut().map_err(|_| {
+            format!("layer device stage {stage}: the run's reduce handle is already borrowed")
+        })?;
+        self.cuda.side_follow_run(comm)?;
+        // SAFETY: the callers' spans hold the counts documented above, the collective stream
+        // belongs to this run's context, and every rank queues the same bulk collectives in the
+        // same order (a chunk's schedule is the same on every rank).
+        unsafe {
+            if gather {
+                handle.all_gather_bf16_bulk(comm.raw(), input, output, count)
+            } else {
+                handle.reduce_scatter_bf16_bulk(comm.raw(), input, output, count)
+            }
+        }
+        .map_err(|error| format!("layer device stage {stage}: {error}"))?;
+        self.cuda.side_mark(comm, done)?;
+        self.collectives_in_flight
+            .set(self.collectives_in_flight.get().saturating_add(1));
+        probe::count(stage);
+        Ok(())
+    }
+
+    /// Splits bulk chunks' mHC seams over the `world` ranks by rows (SPARKFLASH_PREFILL_SP=0
+    /// keeps them whole): each layer's all-reduces become a ReduceScatter into the rank's own
+    /// rows, whose posts and seams it alone runs, and an AllGather of their bf16 normed rows.
+    /// Needs the bulk communicator ([Self::open_bulk_comm] with SPARKFLASH_BULK_CTAS > 0);
+    /// without it, a no-op.
+    fn enable_prefill_sp(&mut self, world: usize) -> Result<(), String> {
+        let Some(reduce) = self.reduce.filter(|_| self.bulk_comm.is_some()) else {
+            return Ok(());
+        };
+        let bulk = reduce
+            .0
+            .try_borrow()
+            .map_err(|_| "layer device: the run's reduce handle is already borrowed".to_owned())?
+            .has_bulk();
+        if bulk && world > 1 {
+            self.prefill_sp = Some(world);
+        }
+        Ok(())
+    }
+
+    /// Opens the paired bulk chunks' collective stream (at the context's greatest priority) and
+    /// their communicator: a child of the run's on SPARKFLASH_BULK_CTAS CTAs (default 8; 0 keeps
+    /// the parent's 64, which starve the chunk computing under the all-reduce). Every rank opens it
+    /// at the same point of setup.
+    fn open_bulk_comm(&mut self) -> Result<(), String> {
+        if self.bulk_comm.is_some() {
+            return Ok(());
+        }
+        let ctas: u32 = match std::env::var("SPARKFLASH_BULK_CTAS") {
+            Ok(raw) => raw
+                .parse()
+                .map_err(|_| format!("SPARKFLASH_BULK_CTAS={raw:?} is not a CTA count"))?,
+            Err(_) => 8,
+        };
+        if let Some(reduce) = self.reduce.filter(|_| ctas > 0) {
+            reduce
+                .0
+                .try_borrow_mut()
+                .map_err(|_| {
+                    "layer device: the run's reduce handle is already borrowed".to_owned()
+                })?
+                .open_bulk(ctas)
+                .map_err(|error| format!("layer device: the bulk communicator: {error}"))?;
+        }
+        self.bulk_comm = Some(self.cuda.side_stream_urgent()?);
+        Ok(())
+    }
+
+    /// Connects the bulk communicator before the first prompt (NCCL connects a communicator's
+    /// rings at its first collective): in-place all-reduces over `scratch`, then a sync. Every rank
+    /// calls it at the same point of setup.
+    fn warm_bulk_comm(&self, scratch: crate::layer_device::DeviceSpan) -> Result<(), String> {
+        let (Some(comm), Some(reduce)) = (self.bulk_comm.as_ref(), self.reduce) else {
+            return Ok(());
+        };
+        let mut handle = reduce
+            .0
+            .try_borrow_mut()
+            .map_err(|_| "layer device: the run's reduce handle is already borrowed".to_owned())?;
+        if !handle.has_bulk() {
+            return Ok(());
+        }
+        let count = scratch.len / 2;
+        for _ in 0..sparkflash_comm::device_reduce::WARM_UP_COLLECTIVES {
+            // SAFETY: scratch is a device span of count bf16 values this setup owns, the stream
+            // belongs to this run's context, and every rank enqueues the same warm-up.
+            unsafe { handle.reduce_bf16_bulk(comm.raw(), scratch.device, scratch.device, count) }
+                .map_err(|error| format!("layer device: bulk warm-up: {error}"))?;
+        }
+        // The split seams' collectives connect their own algorithms' channels.
+        if let Some(world) = self.prefill_sp {
+            let (part, rank) = (count / world, self.tp_rank as u64);
+            let own = scratch.device + rank * (part * 2) as u64;
+            for _ in 0..sparkflash_comm::device_reduce::WARM_UP_COLLECTIVES {
+                // SAFETY: as above; the ReduceScatter's output is this rank's block of scratch
+                // (NCCL's in-place form), and the AllGather's input is that block.
+                unsafe {
+                    handle
+                        .reduce_scatter_bf16_bulk(comm.raw(), scratch.device, own, part)
+                        .and_then(|()| {
+                            handle.all_gather_bf16_bulk(comm.raw(), own, scratch.device, part)
+                        })
+                }
+                .map_err(|error| format!("layer device: bulk warm-up: {error}"))?;
+            }
+        }
+        drop(handle);
+        self.cuda
+            .synchronize()
+            .map_err(|error| format!("layer device: bulk warm-up: {error}"))
+    }
+
+    /// Whether paired bulk chunks can run (the collective stream is open).
+    fn bulk_comm_open(&self) -> bool {
+        self.bulk_comm.is_some()
     }
 
     /// Waits for every collective this layer enqueued, then clears the in-flight count.
@@ -13016,7 +13223,7 @@ impl<'a> DeviceLayer<'a> {
                 let bind = routed[layer][expert][matrix.index()];
                 (bind.weight.0, bind.scales.0)
             })?;
-        // Capacity for a verify step's up-to-8 rows (`rows::R_MAX`); the M=1 step runs one token.
+        // Capacity for a verify step's rows (`rows::R_MAX`); the M=1 step runs one token.
         let plan = MoeRoutedPlan::new(
             moe_geometry,
             n_layers,
@@ -16750,7 +16957,18 @@ fn run_forward_loop(
     // The runtime Engram gather of a generated position (its entry is a function of tokens the
     // fixture does not hold): concurrent reads of the paged tables.
     let engram_reader = match engram_read_source {
-        Some(source) if generate || dspark => Some(spec::EngramReader::open(config, source)?),
+        Some(source) if generate || dspark => {
+            let tokenizer = match (request.engram_tokenizer, request.checkpoint_dir) {
+                (Some(path), _) => path.to_path_buf(),
+                (None, Some(dir)) => dir.join("tokenizer.json"),
+                (None, None) => {
+                    return Err(
+                        "engram reader: no tokenizer.json for the compressed token map".to_owned(),
+                    );
+                }
+            };
+            Some(spec::EngramReader::open(config, source, &tokenizer)?)
+        }
         _ => None,
     };
     let gather_embedding_row = |position: usize, token: u32| -> Result<Vec<u8>, String> {
@@ -16817,6 +17035,7 @@ fn run_forward_loop(
             rank: request.rank,
             world: request.world,
             bulk: None,
+            bulk_more: &[],
         };
         let counter = Cell::new(0u64);
         let noise = spec::gather_rows(&cuda, &inputs, &counter, &[config.dspark_noise_token_id])?;
@@ -16838,6 +17057,7 @@ fn run_forward_loop(
         if link.is_some() && crate::device_link::vision_enabled(dir) {
             device.open_vision(dir, request.weights, chunk.max(rows::R_MAX))?;
         }
+        device.replicate_embedding(bind.tail.embed.0)?;
         let lane_count = planned_lanes(link.is_some())?;
         if lane_count > 0 {
             device.attach_lanes(&lanes::LaneGeometry {
@@ -16846,17 +17066,61 @@ fn run_forward_loop(
                 engram_rows: chunk.max(rows::R_MAX),
             })?;
         }
-        let mut bulk_rows = if chunk > rows::R_MAX {
-            Some(rows::RowsState::open_with(device, dir, chunk)?)
+        // More bulk states, so SPARKFLASH_PREFILL_WAYS chunks of a long prompt (default 3) run
+        // together, their collectives under each other's launches (SPARKFLASH_PREFILL_PAIR=0 or
+        // WAYS=1: one chunk at a time). Their seams split over the ranks by rows unless
+        // SPARKFLASH_PREFILL_SP=0, and they share the routed experts' rows, so the chunks' routed
+        // experts read each expert's weights once (DeviceLayer::rows_moe_merged).
+        let ways: usize = match std::env::var("SPARKFLASH_PREFILL_PAIR").as_deref() {
+            Ok("0") => 1,
+            _ => std::env::var("SPARKFLASH_PREFILL_WAYS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(3),
+        };
+        let moe_share = if chunk > rows::R_MAX
+            && ways > 1
+            && ways <= sparkflash_kernels::moe_routed_device::MAX_BULK_SEGMENTS
+        {
+            // A way holds a bulk state's rows (the drafter's floor included).
+            let stride = chunk.max(draft::DRAFT_ROWS);
+            Some(bulk::MoeShare::open(device, stride, ways)?)
         } else {
             None
         };
-        if let Some(state) = bulk_rows.as_mut() {
+        let way_of = |way: usize| moe_share.as_ref().map(|share| (share, way));
+        let mut bulk_rows = if chunk > rows::R_MAX {
+            Some(rows::RowsState::open_shared(device, dir, chunk, way_of(0))?)
+        } else {
+            None
+        };
+        let mut more_rows = Vec::new();
+        if bulk_rows.is_some() && ways > 1 {
+            device.open_bulk_comm()?;
+            if std::env::var("SPARKFLASH_PREFILL_SP").as_deref() != Ok("0") {
+                device.enable_prefill_sp(request.world)?;
+            }
+            for way in 1..ways {
+                more_rows.push(rows::RowsState::open_shared(
+                    device,
+                    dir,
+                    chunk,
+                    way_of(way),
+                )?);
+            }
+            let pair = &more_rows[0];
+            device.warm_bulk_comm(crate::layer_device::DeviceSpan {
+                device: pair.b.attn_out,
+                len: pair.cap * HIDDEN * 2,
+            })?;
+        }
+        for state in bulk_rows.iter_mut().chain(more_rows.iter_mut()) {
             let taps = state.bulk.as_ref().map_or(0, |bulk| bulk.taps);
             state.taps = Some((tap_kernel, taps, config.dspark_target_layer_ids.clone()));
         }
         let inputs = spec::SpecInputs {
             bulk: bulk_rows.as_ref(),
+            bulk_more: &more_rows,
             ..inputs
         };
         let max_new: usize = std::env::var("SPARKFLASH_DSPARK_STEPS")
@@ -16868,9 +17132,18 @@ fn run_forward_loop(
             None => spec::run_spec(device, rows, &drafter, &inputs, k, max_new)?,
         }
         device.release_vision();
+        if let Some(table) = device.embed_table.take() {
+            cuda.free_buffers(&[&Deviceptr(table)]);
+        }
         drafter.release(&cuda);
         if let Some(state) = bulk_rows.take() {
             state.release(&cuda);
+        }
+        for state in more_rows {
+            state.release(&cuda);
+        }
+        if let Some(share) = moe_share {
+            share.release(&cuda);
         }
         if let Some(rows) = rows_state.take() {
             rows.release(&cuda);
@@ -19092,6 +19365,7 @@ mod tests {
             config: None,
             checkpoint_dir: None,
             checkpoint_index: None,
+            engram_tokenizer: None,
             weights: None,
             prefill_limit: None,
             native_rounding: NativeRounding::NONE,

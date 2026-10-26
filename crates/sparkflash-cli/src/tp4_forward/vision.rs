@@ -254,6 +254,14 @@ impl DeviceLayer<'_> {
         }
     }
 
+    /// Whether the rows being embedded carry image spans (vision_inject writes them into this
+    /// rank's gather slot): the same answer on every rank.
+    pub(super) fn vision_rows(&self) -> bool {
+        self.vision
+            .as_ref()
+            .is_some_and(|vision| vision.current.is_some())
+    }
+
     /// The chunk's layers ran: its span rows are no longer routed apart.
     pub(super) fn vision_end(&mut self) {
         if let Some(vision) = self.vision.as_mut() {

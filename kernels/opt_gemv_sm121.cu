@@ -125,6 +125,15 @@ __device__ __forceinline__ void opt_g_act_fp8_pairs(const uint8_t *row, const ui
     scale = opt_g_ue8m0(opt_g_lds8<STAGED>(srow + kb));
 }
 
+// The 32 activation values of K-block kb of one row staged as f16 (64 bytes), as 16 f16x2 pairs.
+__device__ __forceinline__ void opt_g_act_f16_pairs(const uint8_t *row, uint32_t kb, uint32_t v[16]) {
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const uint4 u = opt_g_lda<true>(row + kb * 64u + q * 16u);
+        v[4 * q] = u.x; v[4 * q + 1] = u.y; v[4 * q + 2] = u.z; v[4 * q + 3] = u.w;
+    }
+}
+
 // The 32 activation values of K-block kb of one token row, as f32, plus the block scale (1 unless
 // FP8). `row` is the row's first byte; `srow` its first E4M3 scale.
 template <int AMODE, bool STAGED>
@@ -164,9 +173,15 @@ __device__ __forceinline__ void opt_g_act(const uint8_t *row, const uint8_t *sro
     }
 }
 
-template <bool B>
+// Where a block's token rows are read from: global memory, shared memory as staged (the input
+// encoding), or shared memory widened (E4M3 rows as f16, their scales as f32).
+#define OPT_G_GLOBAL 0
+#define OPT_G_STAGED 1
+#define OPT_G_WIDE 2
+
+template <int S>
 struct opt_g_tag {
-    static constexpr bool value = B;
+    static constexpr int value = S;
 };
 
 template <int AMODE, bool OUT_F32, int MAXT>
@@ -177,9 +192,8 @@ __device__ __forceinline__ void opt_gemv_body(
     const uint64_t a_tok_stride, const uint64_t out_tok_stride,
     const uint64_t a_grp_stride, const uint64_t w_grp_stride, const uint64_t s_grp_stride,
     const uint64_t out_grp_stride, const uint32_t k_stride_blocks) {
-    // E4M3 activations with several tokens: f16x2 operands and the mixed-precision FMA (one token
-    // is faster on the f32 chain).
-    constexpr bool PAIRS = AMODE == OPT_A_FP8 && MAXT > 1;
+    // E4M3 activations with several tokens, or widened in shared memory: f16x2 operands and the
+    // mixed-precision FMA (one token converted per lane is faster on the f32 chain).
     constexpr uint32_t EB = AMODE == OPT_A_BF16 ? 2u : AMODE == OPT_A_FP8 ? 1u : 4u;
     constexpr uint32_t STAGE = MAXT == 1 ? OPT_G_STAGE_T1 : OPT_G_STAGE;
     static_assert(STAGE >= OPT_G_WARPS * MAXT * 32u * 4u, "the warp partials reuse the staging bytes");
@@ -221,11 +235,38 @@ __device__ __forceinline__ void opt_gemv_body(
     }
 
     // Stage the rows behind the weight prologue: row t at t * row_bytes, the E4M3 scales after them.
+    // E4M3 rows are widened to f16 (exact) and their scales to f32 when that fits, so a lane reads
+    // operands instead of converting every token's codes itself (32 lanes converting the same bytes);
+    // otherwise they are copied as they are.
     const uint32_t row_bytes = inner * EB;
+    const uint32_t wide_bytes = inner * 2u;
+    const uint32_t wide_scale_off = live * wide_bytes;
+    const bool wide = AMODE == OPT_A_FP8 && wide_scale_off + live * k_blocks * 4u <= STAGE;
     const uint32_t scale_off = live * row_bytes;
     const uint32_t need = scale_off + (AMODE == OPT_A_FP8 ? live * k_blocks : 0u);
-    const bool staged = need <= STAGE;
-    if (staged) {
+    const bool staged = wide || need <= STAGE;
+    if (wide) {
+        const uint32_t row16 = inner / 16u;
+#pragma unroll 4
+        for (uint32_t idx = threadIdx.x; idx < live * row16; idx += OPT_G_THREADS) {
+            const uint32_t t = idx / row16;
+            const uint32_t c = idx - t * row16;
+            const uint8_t *src = reinterpret_cast<const uint8_t *>(a) + a_base + (uint64_t)t * a_tok_stride;
+            const uint4 u = __ldg(reinterpret_cast<const uint4 *>(src) + c);
+            uint8_t *dst = s_mem + t * wide_bytes + c * 32u;
+            *reinterpret_cast<uint4 *>(dst) = make_uint4(opt_g_e4m3x2(u.x), opt_g_e4m3x2(u.x >> 16),
+                                                         opt_g_e4m3x2(u.y), opt_g_e4m3x2(u.y >> 16));
+            *reinterpret_cast<uint4 *>(dst + 16u) = make_uint4(opt_g_e4m3x2(u.z), opt_g_e4m3x2(u.z >> 16),
+                                                               opt_g_e4m3x2(u.w), opt_g_e4m3x2(u.w >> 16));
+        }
+        float *s_scale = reinterpret_cast<float *>(s_mem + wide_scale_off);
+        for (uint32_t idx = threadIdx.x; idx < live * k_blocks; idx += OPT_G_THREADS) {
+            const uint32_t t = idx / k_blocks;
+            const uint32_t c = idx - t * k_blocks;
+            s_scale[idx] = opt_g_ue8m0(__ldg(a_scales + (a_base + (uint64_t)t * a_tok_stride) / 32u + c));
+        }
+        __syncthreads();
+    } else if (staged) {
         const uint32_t row16 = row_bytes / 16u;
 #pragma unroll 4
         for (uint32_t idx = threadIdx.x; idx < live * row16; idx += OPT_G_THREADS) {
@@ -245,7 +286,9 @@ __device__ __forceinline__ void opt_gemv_body(
     }
 
     auto main_loop = [&](auto tag) {
-        constexpr bool STAGED = decltype(tag)::value;
+        constexpr int SRC = decltype(tag)::value;
+        constexpr bool STAGED = SRC != OPT_G_GLOBAL;
+        constexpr bool PAIRS = AMODE == OPT_A_FP8 && (MAXT > 1 || SRC == OPT_G_WIDE);
         for (uint32_t i0 = 0; i0 < mine; i0 += OPT_G_DEPTH) {
 #pragma unroll
             for (uint32_t d = 0; d < OPT_G_DEPTH; ++d) {
@@ -280,21 +323,29 @@ __device__ __forceinline__ void opt_gemv_body(
                     for (int t = 0; t < MAXT; ++t) {
                         if (t < (int)live) {
                             const uint64_t base = a_base + (uint64_t)t * a_tok_stride;
-                            const uint8_t *row = STAGED ? s_mem + t * row_bytes
-                                                        : reinterpret_cast<const uint8_t *>(a) + base * EB;
-                            const uint8_t *srow = STAGED ? s_mem + scale_off + t * k_blocks : a_scales + base / 32u;
                             float ascale;
                             float blk = 0.0f;
-                            if constexpr (PAIRS) {
+                            if constexpr (SRC == OPT_G_WIDE) {
                                 uint32_t ap[16];
-                                opt_g_act_fp8_pairs<STAGED>(row, srow, kb, ap, ascale);
+                                opt_g_act_f16_pairs(s_mem + t * wide_bytes, kb, ap);
+                                ascale = reinterpret_cast<const float *>(s_mem + wide_scale_off)[t * k_blocks + kb];
 #pragma unroll
                                 for (int j = 0; j < 16; ++j) blk = opt_g_fma2_f16(ap[j], wp[j], blk);
                             } else {
-                                float av[32];
-                                opt_g_act<AMODE, STAGED>(row, srow, kb, av, ascale);
+                                const uint8_t *row = STAGED ? s_mem + t * row_bytes
+                                                            : reinterpret_cast<const uint8_t *>(a) + base * EB;
+                                const uint8_t *srow = STAGED ? s_mem + scale_off + t * k_blocks : a_scales + base / 32u;
+                                if constexpr (PAIRS) {
+                                    uint32_t ap[16];
+                                    opt_g_act_fp8_pairs<STAGED>(row, srow, kb, ap, ascale);
 #pragma unroll
-                                for (int e = 0; e < 32; ++e) blk = __fmaf_rn(av[e], wf[e], blk);
+                                    for (int j = 0; j < 16; ++j) blk = opt_g_fma2_f16(ap[j], wp[j], blk);
+                                } else {
+                                    float av[32];
+                                    opt_g_act<AMODE, STAGED>(row, srow, kb, av, ascale);
+#pragma unroll
+                                    for (int e = 0; e < 32; ++e) blk = __fmaf_rn(av[e], wf[e], blk);
+                                }
                             }
                             acc[t] = __fmaf_rn(blk, wscale * ascale, acc[t]);
                         }
@@ -303,10 +354,18 @@ __device__ __forceinline__ void opt_gemv_body(
             }
         }
     };
-    if (staged) {
-        main_loop(opt_g_tag<true>{});
+    if constexpr (AMODE == OPT_A_FP8) {
+        if (wide) {
+            main_loop(opt_g_tag<OPT_G_WIDE>{});
+        } else if (staged) {
+            main_loop(opt_g_tag<OPT_G_STAGED>{});
+        } else {
+            main_loop(opt_g_tag<OPT_G_GLOBAL>{});
+        }
+    } else if (staged) {
+        main_loop(opt_g_tag<OPT_G_STAGED>{});
     } else {
-        main_loop(opt_g_tag<false>{});
+        main_loop(opt_g_tag<OPT_G_GLOBAL>{});
     }
 
     // The warp partials reuse the staging bytes once every warp is done with the rows.

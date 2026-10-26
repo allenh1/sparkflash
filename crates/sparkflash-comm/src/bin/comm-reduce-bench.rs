@@ -19,7 +19,7 @@
 //! ```
 //!
 //! Four-node run: pass the address table instead of the loopback scheme, for example
-//! `--rank 0 --addrs 192.0.2.80:19701,192.0.2.88:19701,192.0.2.59:19701,192.0.2.68:19701`.
+//! `--rank 0 --addrs 198.51.100.80:19701,198.51.100.88:19701,198.51.100.59:19701,198.51.100.68:19701`.
 //!
 //! Set `SPARK_COMM_PROFILE=1` to get the phase breakdown line from the transport in addition to
 //! this binary's latency line (the profile line is written to stderr, one window every 40 calls).

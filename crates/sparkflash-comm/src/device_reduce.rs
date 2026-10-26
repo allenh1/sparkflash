@@ -580,14 +580,17 @@ pub struct RunReduce {
     stats: DeviceReduceStats,
     /// NCCL's handles for the buffers registered at open, released before the communicator.
     registrations: Vec<*mut c_void>,
+    /// The bulk prefill's child communicator ([Self::open_bulk]), or null.
+    bulk: nccl::NcclCommHandle,
 }
 
 impl Drop for RunReduce {
     fn drop(&mut self) {
-        // Drop runs before the fields, so the registrations are released and the communicator is
-        // destroyed while the library is still loaded. A failed release or destroy still consumes
-        // the handle, so the error is not actionable here.
+        // Drop runs before the fields, so the registrations are released and the communicators are
+        // destroyed (the child first) while the library is still loaded. A failed release or
+        // destroy still consumes the handle, so the error is not actionable here.
         let _ = self.deregister_buffers();
+        let _ = self.api.comm_destroy_handle(self.bulk);
         let _ = self.api.comm_destroy_handle(self.comm);
     }
 }
@@ -656,6 +659,7 @@ impl RunReduce {
             rank,
             stats,
             registrations: Vec::new(),
+            bulk: std::ptr::null_mut(),
         };
         Ok(Box::into_raw(Box::new(run)).cast::<c_void>())
     }
@@ -689,6 +693,138 @@ impl RunReduce {
                 output as *mut c_void,
                 count,
                 NcclRedOp::Sum,
+                stream as CudaStream,
+            )?;
+        }
+        self.stats.record(bytes);
+        Ok(())
+    }
+
+    /// Splits off the bulk prefill's communicator: the same ranks, its collectives on at most
+    /// `max_ctas` CTAs. A ring all-reduce holds every CTA it runs on for the whole collective (most
+    /// of an SM's shared memory each) while it waits on the network, so the default 64 starve the
+    /// kernels a paired chunk runs under it; a few CTAs carry the NIC's bandwidth as well. A
+    /// channel count changes how a ring sums an element, so the decode path keeps the parent.
+    /// Collective over the parent: every rank calls it at the same point. A second call is a no-op.
+    ///
+    /// # Errors
+    /// As NcclApi::comm_split_handle (a library without ncclCommSplit is MissingSymbol).
+    pub fn open_bulk(&mut self, max_ctas: u32) -> Result<(), NcclError> {
+        if self.bulk.is_null() {
+            self.bulk = self.api.comm_split_handle(self.comm, self.rank, max_ctas)?;
+        }
+        Ok(())
+    }
+
+    /// Whether [Self::open_bulk] opened the child communicator.
+    #[must_use]
+    pub fn has_bulk(&self) -> bool {
+        !self.bulk.is_null()
+    }
+
+    /// [Self::reduce_bf16] on the bulk communicator ([Self::open_bulk]).
+    ///
+    /// # Safety
+    /// As reduce_bf16; every rank enqueues the same sequence of bulk collectives.
+    ///
+    /// # Errors
+    /// NcclError::Config when the bulk communicator is not open, otherwise as reduce_bf16.
+    pub unsafe fn reduce_bf16_bulk(
+        &mut self,
+        stream: u64,
+        input: u64,
+        output: u64,
+        count: usize,
+    ) -> Result<(), NcclError> {
+        if self.bulk.is_null() {
+            return Err(NcclError::Config(
+                "the bulk communicator is not open".to_owned(),
+            ));
+        }
+        let bytes = payload_bytes(count)?;
+        // SAFETY: the caller upholds the device-address and stream contract documented above.
+        unsafe {
+            self.api.enqueue_all_reduce_bf16(
+                self.bulk,
+                input as *const c_void,
+                output as *mut c_void,
+                count,
+                NcclRedOp::Sum,
+                stream as CudaStream,
+            )?;
+        }
+        self.stats.record(bytes);
+        Ok(())
+    }
+
+    /// The bulk communicator's bf16 ReduceScatter(Sum): this rank's `output` gets the ranks' sum
+    /// of `input`'s block `rank * recv_count ..` (the input holds `world * recv_count` values).
+    ///
+    /// # Safety
+    /// As reduce_bf16, for an input of `world * recv_count` values and an output of `recv_count`;
+    /// every rank enqueues the same sequence of bulk collectives.
+    ///
+    /// # Errors
+    /// NcclError::Config when the bulk communicator is not open, otherwise as
+    /// NcclApi::enqueue_reduce_scatter_bf16.
+    pub unsafe fn reduce_scatter_bf16_bulk(
+        &mut self,
+        stream: u64,
+        input: u64,
+        output: u64,
+        recv_count: usize,
+    ) -> Result<(), NcclError> {
+        if self.bulk.is_null() {
+            return Err(NcclError::Config(
+                "the bulk communicator is not open".to_owned(),
+            ));
+        }
+        let bytes = payload_bytes(recv_count)?;
+        // SAFETY: the caller upholds the device-address and stream contract documented above.
+        unsafe {
+            self.api.enqueue_reduce_scatter_bf16(
+                self.bulk,
+                input as *const c_void,
+                output as *mut c_void,
+                recv_count,
+                stream as CudaStream,
+            )?;
+        }
+        self.stats.record(bytes);
+        Ok(())
+    }
+
+    /// The bulk communicator's bf16 AllGather: `send_count` values from every rank's `input`,
+    /// rank r's at `output + r * send_count * 2` (`input` may be this rank's own block of
+    /// `output`, NCCL's in-place form).
+    ///
+    /// # Safety
+    /// As reduce_bf16, for an input of `send_count` values and an output of `world * send_count`;
+    /// every rank enqueues the same sequence of bulk collectives.
+    ///
+    /// # Errors
+    /// NcclError::Config when the bulk communicator is not open, otherwise as
+    /// NcclApi::enqueue_all_gather_bf16.
+    pub unsafe fn all_gather_bf16_bulk(
+        &mut self,
+        stream: u64,
+        input: u64,
+        output: u64,
+        send_count: usize,
+    ) -> Result<(), NcclError> {
+        if self.bulk.is_null() {
+            return Err(NcclError::Config(
+                "the bulk communicator is not open".to_owned(),
+            ));
+        }
+        let bytes = payload_bytes(send_count)?;
+        // SAFETY: the caller upholds the device-address and stream contract documented above.
+        unsafe {
+            self.api.enqueue_all_gather_bf16(
+                self.bulk,
+                input as *const c_void,
+                output as *mut c_void,
+                send_count,
                 stream as CudaStream,
             )?;
         }
@@ -1003,8 +1139,13 @@ impl RunReduce {
     /// the communicator reports an asynchronous failure; either one means the run must abort on
     /// every rank.
     pub fn check_async_failure(&self) -> Result<(), NcclError> {
-        // SAFETY: the communicator is live until Drop, which runs before the library is released.
-        unsafe { self.api.check_async_failure(self.comm) }
+        // SAFETY: the communicators are live until Drop, which runs before the library is released.
+        unsafe { self.api.check_async_failure(self.comm) }?;
+        if self.bulk.is_null() {
+            return Ok(());
+        }
+        // SAFETY: as above; the bulk communicator is non-null, so open_bulk created it.
+        unsafe { self.api.check_async_failure(self.bulk) }
     }
 
     /// Whether the loaded library exports the run-boundary failure check.

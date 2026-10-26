@@ -25,7 +25,7 @@
    "path": "/home/user/ev-session-20261020/qa/o4/compare-native-vs-vllm.json",
    "sha256": "fc91dd5360ba127e442e36d19f127936bf36a28e5a720bb5e9337ea303e9487b"
   },
-  "proposal_script_sha256": "3bad5a4819dd9a6663f74bf09426dccf64476e40af5369c7768f74e5b3b5091d",
+  "proposal_script_sha256": "7117f8ea57103b2804f4b31343c54e3d48bc043ab2fdab648304c544f8104704",
   "provisional_source": "docs/DECISIONS.md D40 (quoted, never changed here)",
   "flat_prob": 0.05
  },

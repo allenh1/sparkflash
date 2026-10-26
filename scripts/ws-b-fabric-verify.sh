@@ -31,11 +31,11 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EVIDENCE_ROOT="${EVIDENCE_ROOT:-/home/user/phase2-evidence/ws-b-20261021}"
 RUN_ID="${RUN_ID:-fabric-verify-$(date -u +%Y%m%dT%H%M%SZ)}"
 DIR="$EVIDENCE_ROOT/$RUN_ID"
-SSH_USER="${SSH_USER:-allenh1}"
+SSH_USER="${SSH_USER:-user}"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8)
-NODES=(192.0.2.80 192.0.2.88 192.0.2.59 192.0.2.68)
-NAMES=(node0 node1 node3 node2)
-PEERS="${SPARK_COMM_PEERS:-192.0.2.80,192.0.2.88,192.0.2.59,192.0.2.68}"
+NODES=(198.51.100.80 198.51.100.88 198.51.100.59 198.51.100.68)
+NAMES=(spark-0 spark-1 spark-2 spark-3)
+PEERS="${SPARK_COMM_PEERS:-198.51.100.80,198.51.100.88,198.51.100.59,198.51.100.68}"
 WORLD="${WORLDS:-4}"
 CONTROL_PORT_BASE="${SPARK_COMM_CONTROL_PORT:-18517}"
 SIZE_LAT=10240
@@ -120,7 +120,7 @@ state() {
     read_addrs
     local out="$DIR/state-$label.txt"
     : > "$out"
-    echo "# DF matrix: same-rail directed pairs only. rail1 netdev enp1s0f1np1 (one address each), rail2 enP2p1s0f1np1 (one address each). Cross-rail pairs cross separate L2 islands sharing 192.0.2.0/24 and are not an MTU test; they are not counted." >> "$out"
+    echo "# DF matrix: same-rail directed pairs only. rail1 netdev enp1s0f1np1 (one address each), rail2 enP2p1s0f1np1 (one address each). Cross-rail pairs cross separate L2 islands sharing 198.51.100.0/24 and are not an MTU test; they are not counted." >> "$out"
     local rank peer ri addr r1 r2
     for rank in $(ranks); do
         {

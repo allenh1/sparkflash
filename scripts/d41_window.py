@@ -52,7 +52,7 @@ RECAPTURE = os.path.join(SCRIPT_DIR, "d41_recapture.py")
 FLOOR_TOOL = os.path.join(SCRIPT_DIR, "d41_floors.py")
 FLIP_TOOL = os.path.join(SCRIPT_DIR, "d41_flip_investigation.py")
 DEFAULT_PLAN = os.path.join(SCRIPT_DIR, "d41_capture_plan.json")
-FROZEN_PLAN_SHA256 = "22746d98123a4ee67b33edf18c432e5fe067728076a1494b1ebd2514727353a6"
+FROZEN_PLAN_SHA256 = "1913dc33cead963b8458c40d882ced14b63abaef916553241dedfab4f555a784"
 DEFAULT_EXPECT_ROOT = "1bae0e1088993b9b82de08f59de5be5a34e42170"
 
 

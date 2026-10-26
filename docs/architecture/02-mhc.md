@@ -1,6 +1,6 @@
 # 02 — Hyper-Connections (mHC): exact math, tensor inventory, and what Mega-mHC must compute
 
-References: /home/user/dsv41-research/inference/model.py, kernel.py, tech_report.txt.
+References: <checkpoint>/inference/model.py, kernel.py, tech_report.txt.
 Config: hc_mult = 4, hc_sinkhorn_iters = 20, hc_eps = 1e-06 (config.json text_config).
 
 ---

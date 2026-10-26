@@ -3,13 +3,13 @@
 //! The tp4-host resident path allocates and then frees the attention output-projection weights as
 //! f32 on every layer: wo_a is 8192x4096 (134 MB) and wo_b 5120x8192 (168 MB). With the default
 //! 128 KiB mmap threshold those buffers are mmap'd and munmap'd per layer, so a decode step pays
-//! for page mapping and zero-fill instead of reusing pages. Measured on node0 (aarch64,
+//! for page mapping and zero-fill instead of reusing pages. Measured on spark-0 (aarch64,
 //! released checkpoint, 20 threads): one attention_forward block was 217 ms/layer and 86-96 ms/layer
 //! after the thresholds were raised, about 5 s/token over the 40 backbone layers; a four-rank
 //! resident profile step fell from 13.83 s to 7.90 s with identical tokens. This changes only
 //! allocation behaviour, never arithmetic; a later buffer-reuse change can subsume it.
 //!
-//! Attribution matters more than the option names: on node0 only the pair of raises gives the
+//! Attribution matters more than the option names: on spark-0 only the pair of raises gives the
 //! win (attention 214-219 ms/layer untuned, 223-248 ms with only the mmap threshold, 221-245 ms
 //! with only the trim threshold, 82-94 ms with both); a 200 MB allocate-touch-free probe keeps
 //! 205 MB of RSS after free only with the pair, so the mmap raise moves these buffers onto the heap

@@ -815,11 +815,11 @@ mod tests {
 
     #[test]
     fn the_doctors_invocation_parses_into_a_fabric_request() {
-        let request = request_of(&["--bytes", "10240", "--peer", "192.0.2.85", "--json"])
+        let request = request_of(&["--bytes", "10240", "--peer", "198.51.100.85", "--json"])
             .unwrap_or_else(|error| panic!("the doctor's invocation must parse: {error}"));
         assert_eq!(request.bytes, DEFAULT_BYTES);
         assert_eq!(request.bytes, 10 * 1024);
-        assert_eq!(request.peers, vec!["192.0.2.85".to_owned()]);
+        assert_eq!(request.peers, vec!["198.51.100.85".to_owned()]);
         assert_eq!(request.transport, TransportChoice::Rdma);
         assert!(request.transport.is_fabric());
         assert_eq!(request.samples, DEFAULT_SAMPLES);
@@ -1143,7 +1143,7 @@ mod tests {
     /// requested 50 samples, and hold a finite positive latency. From each node, all four at once:
     ///
     ///     SPARK_COMM_RANK=<0..3> SPARK_COMM_WORLD=4 \
-    ///     SPARK_COMM_PEERS=192.0.2.80,192.0.2.84,192.0.2.68,192.0.2.59 \
+    ///     SPARK_COMM_PEERS=198.51.100.80,198.51.100.84,198.51.100.68,198.51.100.59 \
     ///     cargo test -p sparkflash-comm --features rdma --lib --release \
     ///         probe::tests::the_fabric_gate_measures_a_real_one_shot_all_reduce -- --ignored --nocapture
     #[cfg(feature = "rdma")]

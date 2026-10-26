@@ -41,7 +41,7 @@
 //     the Criterion-1 gap the window-only formats cannot express. Formats 0 and 1 keep their own
 //     exclusion rules unchanged.
 //
-// Verification status: executed on node0 (GB10, sm_121a) on 2026-10-17. nvcc 13.0.3
+// Verification status: executed on spark-0 (GB10, sm_121a) on 2026-10-17. nvcc 13.0.3
 // compiles it for sm_121a, clang parses it against the stub headers, src/m4_abi.rs pins the
 // signature and geometry, and src/mla_ref.rs defines and tests the numerics (including that the
 // online softmax equals a two-pass softmax and that the sliding window predicate is applied
@@ -318,7 +318,7 @@ extern "C" __global__ void flash_mla_csa2_sm121(
     // blockIdx.y exists only to slice the indexer's HSI pool, but stage 2 used to run unguarded
     // in every slice: each blockIdx.y re-ran the whole attention for the same head and wrote the
     // same out[] values. At a grid of 64 that performed 64 times the attention work for one
-    // result, and the launch paid about 1.47 ms for it at 128 candidates (measured on node0
+    // result, and the launch paid about 1.47 ms for it at 128 candidates (measured on spark-0
     // as the --tokens 130 minus --tokens 1 difference at grid.y 64, before this guard). One
     // execution of that attention is 0.068 ms, so the redundant copies overlapped rather than
     // serialising; the work was still real. Only slice 0 runs the attention now.

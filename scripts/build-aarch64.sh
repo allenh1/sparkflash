@@ -2,7 +2,7 @@
 # Cross-compile the SparkFlash workspace for the aarch64 head node from this x86_64 dev box.
 #
 # WHY THIS EXISTS
-#   The head node (node0 / 192.0.2.80) is aarch64 with no cargo and no rustc, and while the
+#   The head node (spark-0 / 198.51.100.80) is aarch64 with no cargo and no rustc, and while the
 #   vLLM inference runs it has roughly 3 GB of memory available out of about 121 GB. Compiling there
 #   is forbidden: a cargo build would thrash that headroom and endanger the running inference. Every
 #   binary we put on that node is built here and copied over.

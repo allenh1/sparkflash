@@ -72,6 +72,48 @@ pub fn hash_window(layer_index: usize, window: &[i64; MAX_NGRAM_SIZE]) -> [u32; 
     columns
 }
 
+/// The columns of positions `start..history.len()` of a raw-id history, appended to `out` as
+/// `[position][layer][column]`: the stateless form of [`NgramHasher::push`] for a caller that
+/// keeps the whole history (the serving loop, whose rows can be rewound and redrafted).
+///
+/// Each raw id goes through `compressor` first, exactly as `push` does; the reference hashes
+/// compressed ids, never raw ones. A raw id equal to `dead` marks a position outside every
+/// n-gram (an image span), like a `false` in `push`'s token mask: it blocks the longer n-grams
+/// of the positions after it, and its own row is filled with `dead` so the caller can skip it.
+///
+/// # Panics
+/// Panics when `start` is past the end of `history`.
+pub fn hash_history(
+    compressor: &TokenizerCompressor,
+    history: &[u32],
+    start: usize,
+    dead: u32,
+    out: &mut Vec<u32>,
+) {
+    assert!(start <= history.len(), "start is past the history");
+    let pad = i64::from(compressor.pad_id());
+    out.reserve((history.len() - start) * ENGRAM_LAYERS * HASH_COLUMNS);
+    for position in start..history.len() {
+        if history[position] == dead {
+            out.resize(out.len() + ENGRAM_LAYERS * HASH_COLUMNS, dead);
+            continue;
+        }
+        let mut blocked = false;
+        let mut window = [pad; MAX_NGRAM_SIZE];
+        for (shift, slot) in window.iter_mut().enumerate() {
+            // Blocked is sticky: before the sequence start or through a dead id, this shift and
+            // every longer one keep the pad.
+            match position.checked_sub(shift).map(|at| history[at]) {
+                Some(id) if !blocked && id != dead => *slot = i64::from(compressor.compress(id)),
+                _ => blocked = true,
+            }
+        }
+        for layer in 0..ENGRAM_LAYERS {
+            out.extend_from_slice(&hash_window(layer, &window));
+        }
+    }
+}
+
 /// Streaming 24-column n-gram hasher over one persistent compressed-id cache.
 ///
 /// The cache is indexed by absolute position and survives across calls, which is exactly how

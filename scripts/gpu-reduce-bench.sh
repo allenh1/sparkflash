@@ -56,12 +56,12 @@ TARGET=aarch64-unknown-linux-gnu
 BIN=${CARGO_TARGET_DIR:-$ROOT/target}/$TARGET/release/gpu-reduce-bench
 DEPS=${SPARK_NCCL_DEPS:-$ROOT/target/deps/nccl}
 LIB=$DEPS/libnccl.so.2
-SSH_USER=${SSH_USER:-allenh1}
+SSH_USER=${SSH_USER:-user}
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
-NODES=(${SPARK_NODES:-192.0.2.80 192.0.2.88 192.0.2.59 192.0.2.68})
-NAMES=(node0 node1 node3 node2)
+NODES=(${SPARK_NODES:-198.51.100.80 198.51.100.88 198.51.100.59 198.51.100.68})
+NAMES=(spark-0 spark-1 spark-2 spark-3)
 # The second RoCEv2 rail. The bench talks on both, so the gate's warm-up has to cover both.
-RAIL2=(${SPARK_RAIL2_NODES:-192.0.2.85 192.0.2.84 192.0.2.63 192.0.2.64})
+RAIL2=(${SPARK_RAIL2_NODES:-198.51.100.85 198.51.100.84 198.51.100.63 198.51.100.64})
 BASE_PORT=${SPARK_REDUCE_PORT:-19701}
 CONTROL_PORT=${SPARK_REDUCE_CONTROL_PORT:-19755}
 ADDRS=""
@@ -737,7 +737,7 @@ sys.exit(2 if not valid else 1)
 PY
 }
 
-# A gate must not measure a cold fabric. Both RoCEv2 rails share 192.0.2.0/24, so a peer's
+# A gate must not measure a cold fabric. Both RoCEv2 rails share 198.51.100.0/24, so a peer's
 # neighbour entry can resolve on the wrong interface and the first use after any change pays for the
 # resolution. Measured in this window: two runs taken immediately after an ARP flush had p99
 # 161-167 us while the same script on a warm fabric measured 81-85 us -- a 2x tail difference caused

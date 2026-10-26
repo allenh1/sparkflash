@@ -257,15 +257,16 @@ extern "C" __global__ void __launch_bounds__(BLOCK) opt_ref_select_pre(OPT_SEL_P
 // The rank definition is unchanged: a position (or a candidate block) is chosen when fewer than
 // `keep` others stand before it in the total order (score descending, id ascending). Under a
 // strict total order the chosen set is exactly the `keep` largest (key, -id) pairs, so it is found
-// here as a threshold instead: a four-pass 8-bit radix select finds the keep-th largest score key
-// T and how many of the ids holding T are taken (`need`), and an id is chosen when its key exceeds
-// T, or equals T and fewer than `need` lower ids hold T. The chosen ids are then written in
-// ascending id order by a block scan. Scores map to keys by their float order, with -0 folded into
+// here as a threshold instead: a radix select (radix_threshold) finds the keep-th largest score
+// key T and how many of the ids holding T are taken (`need`), and an id is chosen when its key
+// exceeds T, or equals T and fewer than `need` lower ids hold T. The chosen ids are then written in
+// ascending id order by a warp sweep. Scores map to keys by their float order, with -0 folded into
 // +0 because the float compare ties them.
 //
-// LIMITS. Up to FAST_MAX_POS compressed positions, not the rank form's MAX_POS: the keys and the
-// chosen flags live in shared memory up to MAX_POS positions and in `scratch` (n_pos * 5 bytes,
-// global) beyond. The masks are read and written in place (global): the mask written is
+// LIMITS. Up to FAST_MAX_POS compressed positions, not the rank form's MAX_POS: the block keys
+// (mask_mode 2) and the gathered candidates (mask_mode 1) live in shared memory up to MAX_POS
+// positions and in `scratch` (n_pos * 5 bytes, global) beyond. The masks are read and written in
+// place (global): the mask written is
 // max(MAX_MASK_WORDS, ceil(n_pos / 32)) words. Grid (1), FAST_BLOCK threads; the 18 ref_select
 // words, then the scores opt_select_scores wrote and the scratch.
 // ---------------------------------------------------------------------------------------------
@@ -308,88 +309,193 @@ __device__ __forceinline__ uint32_t block_exclusive(uint32_t value, uint32_t* s_
     return result;
 }
 
-// Flags the `keep` largest keys of keys[0..n) by (key descending, id ascending) into chosen[]
-// (1 or 0). keep <= n. Thread t owns ids [t * per, (t + 1) * per) for the scans. `hist` holds 256
-// words, `s_var` 2, `s_warp` 33.
-__device__ __forceinline__ void select_largest(const uint32_t* keys, uint32_t n, uint32_t keep,
-                                               uint8_t* chosen, uint32_t* hist, uint32_t* s_var,
-                                               uint32_t* s_warp) {
+constexpr uint32_t FAST_WARPS = FAST_BLOCK / 32;
+// The radix select's widest digit: its first pass counts 12 bits.
+constexpr uint32_t RADIX_BINS = 4096;
+
+// true when an order key is a bf16 value's: its low 16 bits are then fixed by its top bit (0 for
+// a non-negative value's key, all ones for a negative value's).
+__device__ __forceinline__ bool bf16_key(uint32_t key) {
+    return (key & 0xFFFFu) == ((key & 0x80000000u) != 0u ? 0u : 0xFFFFu);
+}
+
+// A stored score as f32: f32 scores as they are, bf16 ones (the bulk scorer's) widened exactly.
+__device__ __forceinline__ float load_score(const float* p) { return *p; }
+__device__ __forceinline__ float load_score(const uint16_t* p) {
+    return __uint_as_float(static_cast<uint32_t>(*p) << 16);
+}
+
+// The key of id i: a query's score with the reach and a consumed candidate mask applied
+// (opt_ref_select_body's two masks).
+template <typename T>
+struct ScoreKey {
+    const T* __restrict__ pre;
+    const uint32_t* __restrict__ mask;
+    uint32_t reach;
+    __device__ __forceinline__ float score(uint32_t i) const {
+        float value = load_score(pre + i);
+        if (i >= reach) value = -__builtin_huge_valf();
+        if (mask != nullptr && (mask[i >> 5] & (1u << (i & 31u))) == 0u) value = -__builtin_huge_valf();
+        return value;
+    }
+    __device__ __forceinline__ uint32_t operator()(uint32_t i) const { return order_key(score(i)); }
+};
+
+// The key of id i, stored (by this block, so read coherently).
+struct StoredKey {
+    const uint32_t* keys;
+    __device__ __forceinline__ uint32_t operator()(uint32_t i) const { return keys[i]; }
+};
+
+// The keep-th largest key T of key(0 .. n) by (key descending, id ascending), 0 < keep < n, and
+// how many of the ids holding T are chosen (`need`): an id is chosen when its key exceeds T, or
+// equals T and fewer than `need` lower ids hold T. Under a strict total order that is exactly the
+// rank form's chosen set. A radix select from the top: each pass counts the keys under the prefix
+// found so far by their next digit (12, 4, 8 and 8 bits) and takes the digit holding the keep-th.
+// When every key is a bf16 value's (bf16_key), the 16 bits under the first two digits are fixed
+// by the top bit, so the last two passes are not run. `hist` holds RADIX_BINS words, `s_var` 2,
+// `s_warp` 33. Every thread of the block calls it and gets the same T and need.
+template <typename Key>
+__device__ __forceinline__ void radix_threshold(const Key& key, uint32_t n, uint32_t keep,
+                                                uint32_t* hist, uint32_t* s_var, uint32_t* s_warp,
+                                                uint32_t& threshold, uint32_t& need) {
     const uint32_t tid = threadIdx.x;
-    if (keep >= n || keep == 0u) {
-        const uint8_t all = keep >= n ? 1u : 0u;
-        for (uint32_t i = tid; i < n; i += FAST_BLOCK) chosen[i] = all;
+    uint32_t prefix = 0u, prefix_mask = 0u, remaining = keep;
+    bool all_bf16 = false;
+#pragma unroll 1
+    for (uint32_t pass = 0; pass < 4u; ++pass) {
+        const uint32_t width = pass == 0u ? 12u : pass == 1u ? 4u : 8u;
+        const uint32_t shift = pass == 0u ? 20u : pass == 1u ? 16u : pass == 2u ? 8u : 0u;
+        const uint32_t bins = 1u << width;
+        for (uint32_t i = tid; i < bins; i += FAST_BLOCK) hist[i] = 0u;
         __syncthreads();
-        return;
-    }
-    if (tid == 0u) {
-        s_var[0] = 0u;
-        s_var[1] = keep;
-    }
-    uint32_t prefix_mask = 0u;
-    for (int shift = 24; shift >= 0; shift -= 8) {
-        for (uint32_t i = tid; i < 256u; i += FAST_BLOCK) hist[i] = 0u;
-        __syncthreads();
-        const uint32_t prefix = s_var[0];
-        for (uint32_t i = tid; i < n; i += FAST_BLOCK) {
-            const uint32_t key = keys[i];
-            if ((key & prefix_mask) == prefix) atomicAdd(&hist[(key >> shift) & 255u], 1u);
+        bool odd = false;
+        for (uint32_t i0 = tid; i0 < n; i0 += 4u * FAST_BLOCK) {
+            uint32_t k[4];
+#pragma unroll
+            for (uint32_t u = 0; u < 4u; ++u) {
+                const uint32_t i = i0 + u * FAST_BLOCK;
+                k[u] = i < n ? key(i) : 0u;
+            }
+#pragma unroll
+            for (uint32_t u = 0; u < 4u; ++u) {
+                if (i0 + u * FAST_BLOCK < n) {
+                    odd |= !bf16_key(k[u]);
+                    if ((k[u] & prefix_mask) == prefix) atomicAdd(&hist[(k[u] >> shift) & (bins - 1u)], 1u);
+                }
+            }
         }
-        __syncthreads();
-        if (tid < 32u) {
-            // Lane l holds digits 255 - 8l down to 248 - 8l: the scan runs from the top digit.
-            uint32_t local[8];
-            uint32_t sum = 0u;
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                local[j] = hist[255u - 8u * tid - static_cast<uint32_t>(j)];
-                sum += local[j];
-            }
-            uint32_t inclusive = sum;
-#pragma unroll
-            for (int o = 1; o < 32; o <<= 1) {
-                const uint32_t up = __shfl_up_sync(0xFFFFFFFFu, inclusive, o);
-                if (tid >= static_cast<uint32_t>(o)) inclusive += up;
-            }
-            const uint32_t remaining = s_var[1];
-            uint32_t above = inclusive - sum;
-            __syncwarp();
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                if (above < remaining && above + local[j] >= remaining) {
-                    const uint32_t digit = 255u - 8u * tid - static_cast<uint32_t>(j);
-                    s_var[0] = prefix | (digit << shift);
+        if (pass == 0u) {
+            all_bf16 = __syncthreads_or(odd ? 1 : 0) == 0;
+        } else {
+            __syncthreads();
+        }
+        // The digits top down, `per` to a thread: the keep-th key's digit is the one where the
+        // count of keys above it first reaches `remaining`.
+        const uint32_t per = bins > FAST_BLOCK ? bins / FAST_BLOCK : 1u;
+        const bool owns = tid * per < bins;
+        const uint32_t top = owns ? bins - tid * per : 0u;
+        uint32_t sum = 0u;
+        if (owns) {
+            for (uint32_t j = 0; j < per; ++j) sum += hist[top - 1u - j];
+        }
+        uint32_t above = block_exclusive(sum, s_warp);
+        if (owns) {
+            for (uint32_t j = 0; j < per; ++j) {
+                const uint32_t count = hist[top - 1u - j];
+                if (above < remaining && above + count >= remaining) {
+                    s_var[0] = top - 1u - j;
                     s_var[1] = remaining - above;
                 }
-                above += local[j];
+                above += count;
             }
         }
         __syncthreads();
-        prefix_mask |= 255u << shift;
-    }
-    const uint32_t threshold = s_var[0];
-    const uint32_t need = s_var[1];
-    // The ids holding the threshold, in ascending order: the first `need` of them are taken.
-    const uint32_t per = (n + FAST_BLOCK - 1u) / FAST_BLOCK;
-    const uint32_t base = tid * per;
-    const uint32_t stop = base + per < n ? base + per : n;
-    uint32_t ties = 0u;
-    for (uint32_t i = base; i < stop; ++i) ties += keys[i] == threshold ? 1u : 0u;
-    uint32_t before_ties = block_exclusive(ties, s_warp);
-    for (uint32_t i = base; i < stop; ++i) {
-        const uint32_t key = keys[i];
-        uint8_t take = key > threshold ? 1u : 0u;
-        if (key == threshold) {
-            take = before_ties < need ? 1u : 0u;
-            before_ties += 1u;
+        prefix |= s_var[0] << shift;
+        remaining = s_var[1];
+        prefix_mask |= (bins - 1u) << shift;
+        if (pass == 1u && all_bf16) {
+            prefix |= (prefix & 0x80000000u) != 0u ? 0u : 0xFFFFu;
+            break;
         }
-        chosen[i] = take;
+    }
+    threshold = prefix;
+    need = remaining;
+}
+
+// The chosen ids of key(0 .. n) given radix_threshold's T and need, ascending: visit(id, key,
+// slot) runs once per chosen id, slot being its rank among them. Warp w sweeps the ids
+// [w * span, (w + 1) * span) a lane per id, twice: the first sweep counts its keys above T and
+// at T, so the second knows the ties and the chosen ids of every lower warp. `s_cnt` holds
+// 2 * FAST_WARPS words.
+template <typename Key, typename Visit>
+__device__ __forceinline__ void choose_sweep(const Key& key, uint32_t n, uint32_t threshold,
+                                             uint32_t need, uint32_t* s_cnt, Visit visit) {
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const uint32_t span = ((n + FAST_WARPS - 1u) / FAST_WARPS + 31u) & ~31u;
+    const uint32_t lo = warp * span < n ? warp * span : n;
+    const uint32_t hi = n - lo < span ? n : lo + span;
+    uint32_t above = 0u, ties = 0u;
+    for (uint32_t i = lo + lane; i < hi; i += 32u) {
+        const uint32_t k = key(i);
+        above += k > threshold ? 1u : 0u;
+        ties += k == threshold ? 1u : 0u;
+    }
+    above = __reduce_add_sync(0xFFFFFFFFu, above);
+    ties = __reduce_add_sync(0xFFFFFFFFu, ties);
+    if (lane == 0u) {
+        s_cnt[warp] = above;
+        s_cnt[FAST_WARPS + warp] = ties;
+    }
+    __syncthreads();
+    uint32_t ties_before = 0u, above_before = 0u;
+    for (uint32_t w = 0; w < warp; ++w) {
+        above_before += s_cnt[w];
+        ties_before += s_cnt[FAST_WARPS + w];
+    }
+    uint32_t chosen = above_before + (ties_before < need ? ties_before : need);
+    const uint32_t lower = (1u << lane) - 1u;
+    for (uint32_t base = lo; base < hi; base += 32u) {
+        const uint32_t i = base + lane;
+        const bool valid = i < hi;
+        const uint32_t k = valid ? key(i) : 0u;
+        const bool tie = valid && k == threshold;
+        const uint32_t tie_bits = __ballot_sync(0xFFFFFFFFu, tie);
+        const bool take = valid && (k > threshold || (tie && ties_before + __popc(tie_bits & lower) < need));
+        const uint32_t take_bits = __ballot_sync(0xFFFFFFFFu, take);
+        if (take) visit(i, k, chosen + __popc(take_bits & lower));
+        ties_before += __popc(tie_bits);
+        chosen += __popc(take_bits);
     }
     __syncthreads();
 }
 
+// The `keep` largest of key(0 .. n), visited as choose_sweep does.
+template <typename Key, typename Visit>
+__device__ __forceinline__ void choose_largest(const Key& key, uint32_t n, uint32_t keep,
+                                               uint32_t* hist, uint32_t* s_var, uint32_t* s_warp,
+                                               uint32_t* s_cnt, Visit visit) {
+    if (keep == 0u) return;
+    if (keep >= n) {
+        for (uint32_t i = threadIdx.x; i < n; i += FAST_BLOCK) visit(i, key(i), i);
+        __syncthreads();
+        return;
+    }
+    uint32_t threshold, need;
+    radix_threshold(key, n, keep, hist, s_var, s_warp, threshold, need);
+    choose_sweep(key, n, threshold, need, s_cnt, visit);
+}
+
 // One query's select over its scores `pre` (the body of both kernels below). A chosen position p
 // is written as p * id_scale + offset when it is reachable (no_index otherwise).
-__device__ __forceinline__ void fast_select(const float* __restrict__ pre, uint32_t* __restrict__ scratch,
+//
+// A consumed candidate mask (mask_mode 1) leaves most positions at -inf: when more than `keep`
+// positions are set, the set ones are gathered in ascending order (key and position, in
+// `scratch`) and the select runs over those. A set position's key is above -inf's whenever the
+// keep-th largest of them is, and then no cleared position can be chosen, so the chosen set is
+// the full select's; otherwise the full select runs.
+template <typename T>
+__device__ __forceinline__ void fast_select(const T* __restrict__ pre, uint32_t* __restrict__ scratch,
                                             uint32_t* __restrict__ out_ids, float* __restrict__ out_scores,
                                             const uint32_t* __restrict__ mask_in,
                                             uint32_t* __restrict__ mask_out, uint32_t n_pos,
@@ -397,82 +503,123 @@ __device__ __forceinline__ void fast_select(const float* __restrict__ pre, uint3
                                             uint32_t id_scale, uint32_t mask_mode,
                                             uint32_t topk_blocks, uint32_t block_size,
                                             uint32_t no_index) {
-    __shared__ uint32_t s_key_small[MAX_POS];
-    __shared__ uint8_t s_chosen_small[MAX_POS];
-    __shared__ uint32_t s_hist[256];
+    __shared__ uint32_t s_store_small[MAX_POS];
+    __shared__ uint32_t s_hist[RADIX_BINS];
     __shared__ uint32_t s_warp[33];
     __shared__ uint32_t s_var[2];
+    __shared__ uint32_t s_cnt[2 * FAST_WARPS];
 
     const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u, warp = tid >> 5;
     const uint32_t n = n_pos < FAST_MAX_POS ? n_pos : FAST_MAX_POS;
     const bool small = n <= static_cast<uint32_t>(MAX_POS);
-    uint32_t* s_key = small ? s_key_small : scratch;
-    uint8_t* s_chosen = small ? s_chosen_small : reinterpret_cast<uint8_t*>(scratch + n);
+    uint32_t* store = small ? s_store_small : scratch;
+    const uint32_t capacity = small ? static_cast<uint32_t>(MAX_POS) : n + n / 4u;
     const uint32_t n_words = (n + 31u) / 32u;
     const uint32_t out_words = n_words > static_cast<uint32_t>(MAX_MASK_WORDS) ? n_words : MAX_MASK_WORDS;
+    const uint32_t empty = order_key(-__builtin_huge_valf());
 
     // Level one: the HSI candidate block mask (opt_ref_select_body's mask_mode 2).
-    if (mask_mode == 2u && block_size != 0u && n != 0u) {
-        // The blocks' keys live in s_key until the positions' keys replace them below.
+    if (mask_mode == 2u && block_size != 0u && n != 0u && mask_out != nullptr) {
         const uint32_t num_blocks = (n + block_size - 1u) / block_size;
-        const uint32_t empty = order_key(-__builtin_huge_valf());
         for (uint32_t block = tid; block < num_blocks; block += FAST_BLOCK) {
             const uint32_t start = block * block_size;
             const uint32_t stop = (start + block_size) < n ? (start + block_size) : n;
             float best = -__builtin_huge_valf();
             for (uint32_t position = start; position < stop; ++position) {
-                best = pre[position] > best ? pre[position] : best;
+                const float value = load_score(pre + position);
+                best = value > best ? value : best;
             }
-            s_key[block] = order_key(best);
+            store[block] = order_key(best);
         }
+        for (uint32_t word = tid; word < out_words; word += FAST_BLOCK) mask_out[word] = 0u;
         __syncthreads();
         if (reach > 0u && tid == 0u) {
             const uint32_t last = (reach - 1u) / block_size;
-            if (last < num_blocks) s_key[last] = order_key(__builtin_huge_valf());
+            if (last < num_blocks) store[last] = order_key(__builtin_huge_valf());
         }
         __syncthreads();
         const uint32_t keep_blocks = topk_blocks < num_blocks ? topk_blocks : num_blocks;
-        select_largest(s_key, num_blocks, keep_blocks, s_chosen, s_hist, s_var, s_warp);
-        if (mask_out != nullptr) {
-            for (uint32_t word = tid; word < out_words; word += FAST_BLOCK) {
-                uint32_t bits = 0u;
-                for (uint32_t bit = 0; bit < 32u; ++bit) {
-                    const uint32_t position = word * 32u + bit;
-                    if (position < n) {
-                        const uint32_t block = position / block_size;
-                        if (s_chosen[block] != 0u && s_key[block] != empty) bits |= 1u << bit;
-                    }
-                }
-                mask_out[word] = bits;
-            }
+        // A chosen block whose best score is -inf is dropped; a kept block sets its positions.
+        choose_largest(StoredKey{store}, num_blocks, keep_blocks, s_hist, s_var, s_warp, s_cnt,
+                       [&](uint32_t block, uint32_t key, uint32_t) {
+                           if (key == empty) return;
+                           const uint32_t start = block * block_size;
+                           const uint32_t stop = (start + block_size) < n ? (start + block_size) : n;
+                           for (uint32_t p = start; p < stop;) {
+                               const uint32_t end = ((p >> 5) + 1u) * 32u < stop ? ((p >> 5) + 1u) * 32u : stop;
+                               const uint32_t count = end - p;
+                               const uint32_t bits = (count == 32u ? 0xFFFFFFFFu : (1u << count) - 1u) << (p & 31u);
+                               atomicOr(&mask_out[p >> 5], bits);
+                               p = end;
+                           }
+                       });
+    }
+
+    const ScoreKey<T> score_key{pre, mask_mode == 1u ? mask_in : nullptr, reach};
+    if (out_scores != nullptr) {
+        for (uint32_t position = tid; position < n; position += FAST_BLOCK) {
+            out_scores[position] = score_key.score(position);
+        }
+    }
+    const uint32_t keep = topk < n ? topk : n;
+    const auto emit = [&](uint32_t position, uint32_t slot) {
+        out_ids[slot] = position < reach ? position * id_scale + offset : no_index;
+    };
+    if (score_key.mask != nullptr && keep != 0u && keep < n) {
+        // The set positions, counted by warp over the mask words, then gathered in order.
+        const uint32_t span = ((n_words + FAST_WARPS - 1u) / FAST_WARPS + 31u) & ~31u;
+        const uint32_t lo = warp * span < n_words ? warp * span : n_words;
+        const uint32_t hi = n_words - lo < span ? n_words : lo + span;
+        const auto set_bits = [&](uint32_t word) {
+            const uint32_t bits = mask_in[word];
+            return (word + 1u) * 32u <= n ? bits : bits & ((1u << (n - word * 32u)) - 1u);
+        };
+        uint32_t count = 0u;
+        for (uint32_t word = lo + lane; word < hi; word += 32u) count += __popc(set_bits(word));
+        count = __reduce_add_sync(0xFFFFFFFFu, count);
+        if (lane == 0u) s_cnt[warp] = count;
+        __syncthreads();
+        uint32_t total = 0u, at = 0u;
+        for (uint32_t w = 0; w < FAST_WARPS; ++w) {
+            at += w < warp ? s_cnt[w] : 0u;
+            total += s_cnt[w];
         }
         __syncthreads();
-    }
-    for (uint32_t position = tid; position < n; position += FAST_BLOCK) {
-        float score = pre[position];
-        if (position >= reach) score = -__builtin_huge_valf();
-        if (mask_mode == 1u && (mask_in[position >> 5] & (1u << (position & 31u))) == 0u) {
-            score = -__builtin_huge_valf();
+        if (total > keep && 2u * total <= capacity) {
+            uint32_t* cand_pos = store + total;
+            for (uint32_t base = lo; base < hi; base += 32u) {
+                const uint32_t word = base + lane;
+                uint32_t bits = word < hi ? set_bits(word) : 0u;
+                const uint32_t mine = __popc(bits);
+                uint32_t inclusive = mine;
+#pragma unroll
+                for (int o = 1; o < 32; o <<= 1) {
+                    const uint32_t up = __shfl_up_sync(0xFFFFFFFFu, inclusive, o);
+                    if (lane >= static_cast<uint32_t>(o)) inclusive += up;
+                }
+                uint32_t slot = at + inclusive - mine;
+                while (bits != 0u) {
+                    const uint32_t position = word * 32u + static_cast<uint32_t>(__ffs(bits) - 1);
+                    bits &= bits - 1u;
+                    store[slot] = score_key(position);
+                    cand_pos[slot] = position;
+                    slot += 1u;
+                }
+                at += __shfl_sync(0xFFFFFFFFu, inclusive, 31);
+            }
+            __syncthreads();
+            uint32_t threshold, need;
+            radix_threshold(StoredKey{store}, total, keep, s_hist, s_var, s_warp, threshold, need);
+            if (threshold > empty) {
+                choose_sweep(StoredKey{store}, total, threshold, need, s_cnt,
+                             [&](uint32_t i, uint32_t, uint32_t slot) { emit(cand_pos[i], slot); });
+                return;
+            }
         }
-        if (out_scores != nullptr) out_scores[position] = score;
-        s_key[position] = order_key(score);
     }
-    __syncthreads();
-
-    const uint32_t keep = topk < n ? topk : n;
-    select_largest(s_key, n, keep, s_chosen, s_hist, s_var, s_warp);
-    const uint32_t per = (n + FAST_BLOCK - 1u) / FAST_BLOCK;
-    const uint32_t base = tid * per;
-    const uint32_t stop = base + per < n ? base + per : n;
-    uint32_t mine = 0u;
-    for (uint32_t i = base; i < stop; ++i) mine += s_chosen[i] != 0u ? 1u : 0u;
-    uint32_t slot = block_exclusive(mine, s_warp);
-    for (uint32_t position = base; position < stop; ++position) {
-        if (s_chosen[position] != 0u) {
-            out_ids[slot] = position < reach ? position * id_scale + offset : no_index;
-            slot += 1u;
-        }
-    }
+    choose_largest(score_key, n, keep, s_hist, s_var, s_warp, s_cnt,
+                   [&](uint32_t position, uint32_t, uint32_t slot) { emit(position, slot); });
 }
 
 extern "C" __global__ void __launch_bounds__(FAST_BLOCK) opt_ref_select_fast(OPT_SEL_PARAMS,
@@ -494,14 +641,15 @@ extern "C" __global__ void __launch_bounds__(FAST_BLOCK) opt_ref_select_fast(OPT
 // selected[y] ascending as expanded store rows (position * ratio, what compressed_selected_fill
 // writes), its candidate mask in mask_in/out + y * mask_stride. Grid (blocks), 1024 threads: the
 // blocks stride over the rows, each with its own `scratch_words` of scratch (n + n / 4 words for
-// the most compressed positions n a row reaches).
-extern "C" __global__ void __launch_bounds__(FAST_BLOCK) opt_select_rows(
-    const float* __restrict__ scores, uint32_t* __restrict__ selected,
+// the most compressed positions n a row reaches). opt_select_rows reads f32 scores,
+// opt_select_rows_bf16 the bulk scorer's bf16 ones (the same values, so the same choice).
+template <typename T>
+__device__ __forceinline__ void select_rows_body(
+    const T* __restrict__ scores, uint32_t* __restrict__ selected,
     const uint32_t* __restrict__ mask_in, uint32_t* __restrict__ mask_out,
     uint32_t* __restrict__ scratch, uint32_t tokens, uint32_t p0, uint32_t ratio, uint32_t topk,
     uint32_t mask_mode, uint32_t topk_blocks, uint32_t block_size, uint32_t score_stride,
     uint32_t selected_stride, uint32_t mask_stride, uint32_t scratch_words) {
-    OPT_PDL_ENTRY();
     uint32_t* mine = scratch + static_cast<size_t>(blockIdx.x) * scratch_words;
     for (uint32_t y = blockIdx.x; y < tokens; y += gridDim.x) {
         const uint32_t n = (p0 + y + 1u) / ratio;
@@ -514,6 +662,28 @@ extern "C" __global__ void __launch_bounds__(FAST_BLOCK) opt_select_rows(
                     mask_mode, topk_blocks, block_size, 0xFFFFFFFFu);
         __syncthreads();
     }
+}
+
+#define OPT_SELECT_ROWS_PARAMS                                                                     \
+    uint32_t *__restrict__ selected, const uint32_t *__restrict__ mask_in,                         \
+        uint32_t *__restrict__ mask_out, uint32_t *__restrict__ scratch, uint32_t tokens,          \
+        uint32_t p0, uint32_t ratio, uint32_t topk, uint32_t mask_mode, uint32_t topk_blocks,      \
+        uint32_t block_size, uint32_t score_stride, uint32_t selected_stride, uint32_t mask_stride, \
+        uint32_t scratch_words
+#define OPT_SELECT_ROWS_ARGS                                                                        \
+    selected, mask_in, mask_out, scratch, tokens, p0, ratio, topk, mask_mode, topk_blocks,         \
+        block_size, score_stride, selected_stride, mask_stride, scratch_words
+
+extern "C" __global__ void __launch_bounds__(FAST_BLOCK) opt_select_rows(
+    const float* __restrict__ scores, OPT_SELECT_ROWS_PARAMS) {
+    OPT_PDL_ENTRY();
+    select_rows_body(scores, OPT_SELECT_ROWS_ARGS);
+}
+
+extern "C" __global__ void __launch_bounds__(FAST_BLOCK) opt_select_rows_bf16(
+    const uint16_t* __restrict__ scores, OPT_SELECT_ROWS_PARAMS) {
+    OPT_PDL_ENTRY();
+    select_rows_body(scores, OPT_SELECT_ROWS_ARGS);
 }
 
 // One block per compressed position: warp w scores heads w, w+8, ... (a warp tree per dot, the
@@ -639,6 +809,189 @@ extern "C" __global__ void __launch_bounds__(BLOCK) opt_select_scores_rows(
             out[base + threadIdx.x] = round_bf16(sum);
         }
         __syncthreads();
+    }
+}
+
+// opt_select_scores_rows' scores, bit for bit, for a 32-head indexer, with the rows of one segment
+// (one sequence's positions p0 .. p0 + rows - 1) sharing each key tile: the keys are read once a
+// segment, not once a row. Grid (blocks), SG_SLICE * rows * slices threads (rows <= SG_ROWS): a
+// row slice is 64 threads, lane octet 8g .. 8g + 7 holding heads g, g + 8, g + 16 and g + 24's
+// queries in registers, and slice z scores row z % rows at the tile's positions z / rows,
+// z / rows + slices, .... The next tile streams in (cp.async, a second buffer) while this one is
+// scored.
+//
+// A dot is the same 32 lane chains (lane L: dims L, L + 32, L + 64, L + 96, fma ascending) and the
+// same xor tree. The octet splits the chains by L % 8: the tree's levels 16 and 8 keep L % 8, so
+// each thread folds its 4 chains a head without leaving the thread, and levels 4, 2 and 1 are the
+// octet's shuffles, transposed as opt_select_scores_rows' upper levels are (a thread keeps half
+// its heads and sends the other half to its partner, which keeps those). Each key value a thread
+// reads feeds its four heads (a shared-memory broadcast costs about four cycles a warp, so a key
+// value must feed four fmas). Then a thread per (row, position) folds the heads in ascending order.
+// A head's term is a bf16 value (or 0), so the terms wait in bf16.
+//
+// mask_in (mask_mode 1, a consumed candidate mask; row y's at mask_in + y * mask_stride words): a
+// position whose bit is clear in a row's mask is not scored for that row (the select overwrites
+// its score with -inf), and a tile no row needs is not read.
+constexpr uint32_t SG_HEADS = 32;
+constexpr uint32_t SG_TILE = 32;
+constexpr uint32_t SG_ROWS = 8;
+constexpr uint32_t SG_SLICE = 64;
+constexpr uint32_t SG_CHAINS = 4;
+constexpr uint32_t SG_GROUP = 4;
+
+__device__ __forceinline__ void sg_copy4(float* dst, const float* src) {
+    const uint32_t to = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(to), "l"(src) : "memory");
+}
+
+// The first tile at or after `base` (stepping `step`) that some row needs, with the union of the
+// rows' mask words and this row's; n_top when none is left.
+__device__ __forceinline__ uint32_t sg_next(const uint32_t* __restrict__ mask_in, uint32_t base,
+                                            uint32_t step, uint32_t n_top, uint32_t rows,
+                                            uint32_t mask_stride, uint32_t row, uint32_t& need,
+                                            uint32_t& mine) {
+    need = 0xFFFFFFFFu;
+    mine = 0xFFFFFFFFu;
+    if (mask_in == nullptr) return base < n_top ? base : n_top;
+    for (; base < n_top; base += step) {
+        need = 0u;
+        for (uint32_t r = 0; r < rows; ++r) {
+            const uint32_t word = mask_in[static_cast<size_t>(r) * mask_stride + base / 32u];
+            need |= word;
+            mine = r == row ? word : mine;
+        }
+        if (need != 0u) return base;
+    }
+    return n_top;
+}
+
+extern "C" __global__ void __launch_bounds__(SG_SLICE * SG_ROWS) opt_select_scores_seg(
+    const float* __restrict__ q_index, const float* __restrict__ keys,
+    const float* __restrict__ weights, float* __restrict__ scores,
+    const uint32_t* __restrict__ mask_in, uint32_t p0, uint32_t ratio, uint32_t score_stride,
+    uint32_t mask_stride, uint32_t rows) {
+    OPT_PDL_ENTRY();
+    // Two key tiles, dim 32 i + L at [i * 32 + (L & 7) * 4 + (L >> 3)]: a thread's chains in order.
+    __shared__ __align__(16) float s_k[2][SG_TILE][SR_DIM];
+    // The head terms, [row][position][head].
+    __shared__ __align__(16) __nv_bfloat16 s_c[SG_ROWS][SG_TILE][SG_HEADS];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t slices = blockDim.x / (SG_SLICE * rows);
+    const uint32_t z = tid / SG_SLICE;
+    const uint32_t row = z % rows, slice = z / rows;
+    const uint32_t group = (tid >> 3) & 7u, eighth = tid & 7u;
+    const uint32_t reach_top = (p0 + rows) / ratio;
+    const uint32_t n_top = reach_top < FAST_MAX_POS ? reach_top : FAST_MAX_POS;
+    const uint32_t reach = (p0 + row + 1u) / ratio;
+    const uint32_t n_row = reach < FAST_MAX_POS ? reach : FAST_MAX_POS;
+    const uint32_t step = gridDim.x * SG_TILE;
+    // q[g][i][m]: dim 32 i + 8 m + eighth of head group + 8 g of this row.
+    float q[SG_GROUP][SR_DPL][SG_CHAINS];
+#pragma unroll
+    for (uint32_t g = 0; g < SG_GROUP; ++g) {
+        const float* q_head =
+            q_index + (static_cast<size_t>(row) * SG_HEADS + group + 8u * g) * SR_DIM + eighth;
+#pragma unroll
+        for (uint32_t i = 0; i < SR_DPL; ++i) {
+#pragma unroll
+            for (uint32_t m = 0; m < SG_CHAINS; ++m) q[g][i][m] = q_head[32u * i + 8u * m];
+        }
+    }
+    // After the transposed levels lane (eighth) holds head group + 8 j, j = 2 * bit 2 + bit 1;
+    // the even lane of each pair finishes it.
+    const uint32_t hi = (eighth >> 2) & 1u, mid = (eighth >> 1) & 1u;
+    const uint32_t my_head = group + 8u * (2u * hi + mid);
+    const float weight = weights[static_cast<size_t>(row) * SG_HEADS + my_head];
+    // Thread t copies the words t, t + blockDim, ... of a tile's SG_TILE keys.
+    auto fetch = [&](uint32_t base, uint32_t need, uint32_t buf) {
+        const uint32_t tile = n_top - base < SG_TILE ? n_top - base : SG_TILE;
+        for (uint32_t c = tid; c < SG_TILE * SR_DIM; c += blockDim.x) {
+            const uint32_t p = c / SR_DIM, d = c % SR_DIM, l = d & 31u;
+            if (p < tile && ((need >> p) & 1u) != 0u) {
+                sg_copy4(&s_k[buf][p][(d & ~31u) + (l & 7u) * 4u + (l >> 3)],
+                         keys + static_cast<size_t>(base + p) * SR_DIM + d);
+            }
+        }
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+    };
+    uint32_t need, mine;
+    uint32_t base = sg_next(mask_in, blockIdx.x * SG_TILE, step, n_top, rows, mask_stride, row, need, mine);
+    uint32_t buf = 0u;
+    if (base < n_top) fetch(base, need, buf);
+    while (base < n_top) {
+        uint32_t need_next, mine_next;
+        const uint32_t next =
+            sg_next(mask_in, base + step, step, n_top, rows, mask_stride, row, need_next, mine_next);
+        if (next < n_top) {
+            fetch(next, need_next, buf ^ 1u);
+            asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+        } else {
+            asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+        }
+        __syncthreads();
+        const uint32_t tile = n_top - base < SG_TILE ? n_top - base : SG_TILE;
+        for (uint32_t p = slice; p < tile; p += slices) {
+            if (base + p >= n_row || ((mine >> p) & 1u) == 0u) continue;
+            const float* k = &s_k[buf][p][eighth * 4u];
+            float c[SG_GROUP][SG_CHAINS];
+#pragma unroll
+            for (uint32_t i = 0; i < SR_DPL; ++i) {
+                const float4 kv = *reinterpret_cast<const float4*>(k + 32u * i);
+#pragma unroll
+                for (uint32_t g = 0; g < SG_GROUP; ++g) {
+                    c[g][0] = fmaf(q[g][i][0], kv.x, i == 0u ? 0.0f : c[g][0]);
+                    c[g][1] = fmaf(q[g][i][1], kv.y, i == 0u ? 0.0f : c[g][1]);
+                    c[g][2] = fmaf(q[g][i][2], kv.z, i == 0u ? 0.0f : c[g][2]);
+                    c[g][3] = fmaf(q[g][i][3], kv.w, i == 0u ? 0.0f : c[g][3]);
+                }
+            }
+            // Chain m is lane L = 8 m + eighth: levels 16 and 8 pair m with m ^ 2 and m ^ 1.
+            float t[SG_GROUP];
+#pragma unroll
+            for (uint32_t g = 0; g < SG_GROUP; ++g) {
+                const float a = c[g][0] + c[g][2], b = c[g][1] + c[g][3];
+                t[g] = a + b;
+            }
+            // Level 4 (lane ^ 4): keep heads 2 hi, 2 hi + 1, send the other two.
+            const float k0 = hi ? t[2] : t[0], k1 = hi ? t[3] : t[1];
+            const float r0 = __shfl_xor_sync(0xffffffffu, hi ? t[0] : t[2], 4);
+            const float r1 = __shfl_xor_sync(0xffffffffu, hi ? t[1] : t[3], 4);
+            const float u0 = k0 + r0, u1 = k1 + r1;
+            // Level 2 (lane ^ 2): keep head 2 hi + mid; level 1 (lane ^ 1).
+            const float v = (mid ? u1 : u0) + __shfl_xor_sync(0xffffffffu, mid ? u0 : u1, 2);
+            const float dot = v + __shfl_xor_sync(0xffffffffu, v, 1);
+            if ((eighth & 1u) == 0u) {
+                const float raw = round_bf16(dot);
+                s_c[row][p][my_head] =
+                    __float2bfloat16_rn(raw > 0.0f ? round_bf16(__fmul_rn(raw, weight)) : 0.0f);
+            }
+        }
+        __syncthreads();
+        for (uint32_t item = tid; item < rows * SG_TILE; item += blockDim.x) {
+            const uint32_t r = item / SG_TILE, p = item % SG_TILE;
+            const uint32_t reach_r = (p0 + r + 1u) / ratio;
+            const uint32_t word =
+                mask_in != nullptr ? mask_in[static_cast<size_t>(r) * mask_stride + base / 32u] : 0xFFFFFFFFu;
+            if (p < tile && base + p < reach_r && ((word >> p) & 1u) != 0u) {
+                const uint4* terms = reinterpret_cast<const uint4*>(&s_c[r][p][0]);
+                float sum = 0.0f;
+#pragma unroll
+                for (uint32_t v = 0; v < SG_HEADS / 8u; ++v) {
+                    const uint4 w4 = terms[v];
+                    const uint32_t w[4] = {w4.x, w4.y, w4.z, w4.w};
+#pragma unroll
+                    for (uint32_t h = 0; h < 4u; ++h) {
+                        sum = __fadd_rn(sum, __uint_as_float(w[h] << 16));
+                        sum = __fadd_rn(sum, __uint_as_float(w[h] & 0xFFFF0000u));
+                    }
+                }
+                scores[static_cast<size_t>(r) * score_stride + base + p] = round_bf16(sum);
+            }
+        }
+        base = next;
+        need = need_next;
+        mine = mine_next;
+        buf ^= 1u;
     }
 }
 

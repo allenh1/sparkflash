@@ -7,7 +7,7 @@ checkpoint tensor that order consumes.
 Sources, all read-only: `inference/model.py`, `inference/kernel.py`, `inference/engram.py`,
 `inference/generate.py`, `inference/convert.py`, `inference/config.json`, the repository root
 `config.json`, `model.safetensors.index.json` and `tech_report.txt` under
-`/home/user/dsv41-research`. Line numbers are from those files as they exist on this machine.
+`<checkpoint>`. Line numbers are from those files as they exist on this machine.
 
 Two conventions used throughout:
 
@@ -27,7 +27,7 @@ where this document corrects it.
 The index is the whole authority on names. Its own metadata and the counts, from the exact command:
 
 ```bash
-cd /home/user/dsv41-research && python3 -c "import json; wm=json.load(open('model.safetensors.index.json'))['weight_map']; print('tensors', len(wm)); print('shards', len(set(wm.values())))"
+cd <checkpoint> && python3 -c "import json; wm=json.load(open('model.safetensors.index.json'))['weight_map']; print('tensors', len(wm)); print('shards', len(set(wm.values())))"
 ```
 
 raw output:
@@ -40,7 +40,7 @@ shards 48
 and for the declared byte total:
 
 ```bash
-cd /home/user/dsv41-research && python3 -c "import json; d=json.load(open('model.safetensors.index.json')); print('metadata.total_size', d['metadata']['total_size'])"
+cd <checkpoint> && python3 -c "import json; d=json.load(open('model.safetensors.index.json')); print('metadata.total_size', d['metadata']['total_size'])"
 ```
 
 ```
@@ -652,13 +652,13 @@ PY
 # language model 509315486040 / image path 970536960 / total 510286023000  (= metadata.total_size)
 
 # tensor and shard counts (the numbers asserted in section 1)
-cd /home/user/dsv41-research && python3 -c "import json; wm=json.load(open('model.safetensors.index.json'))['weight_map']; print('tensors', len(wm)); print('shards', len(set(wm.values())))"
+cd <checkpoint> && python3 -c "import json; wm=json.load(open('model.safetensors.index.json'))['weight_map']; print('tensors', len(wm)); print('shards', len(set(wm.values())))"
 
 # declared byte total
-cd /home/user/dsv41-research && python3 -c "import json; print('total_size', json.load(open('model.safetensors.index.json'))['metadata']['total_size'])"
+cd <checkpoint> && python3 -c "import json; print('total_size', json.load(open('model.safetensors.index.json'))['metadata']['total_size'])"
 
 # every distinct name pattern in the index, with a count and an example (94 rows)
-cd /home/user/dsv41-research && python3 -c "
+cd <checkpoint> && python3 -c "
 import json,re,collections
 wm=json.load(open('model.safetensors.index.json'))['weight_map']
 g=collections.defaultdict(list)

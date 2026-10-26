@@ -1,6 +1,6 @@
 # 04 — Engram: tokenizer compression, prime-modulus hashing, layout, and the lookup path
 
-References: /home/user/dsv41-research/inference/engram.py (184 lines) and model.py:296-365.
+References: <checkpoint>/inference/engram.py (184 lines) and model.py:296-365.
 Config (config.json text_config): engram_layer_ids [1, 14], engram_num_embeddings
 [384006168, 384016682], engram_vocab_size 16000000, engram_max_ngram_size 4, engram_n_heads 8,
 engram_head_dim 256, engram_pad_token_id 2, engram_compressed_vocab_size 99092.

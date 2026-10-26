@@ -17,7 +17,7 @@ use sparkflash_engram::compress::{
     EngramError, RAW_VOCAB_SIZE, REFERENCE_TOKENIZER_SHA256, REFERENCE_TOKENIZER_SHA256_HEX,
     TokenizerCompressor, sha256_file,
 };
-use sparkflash_engram::hash::{HASH_COLUMNS, NgramHasher, hash_window};
+use sparkflash_engram::hash::{HASH_COLUMNS, NgramHasher, hash_history, hash_window};
 use sparkflash_engram::primes::{MULTIPLIERS, OFFSETS, PRIMES};
 
 /// The exact tokenizer.json the fixtures were generated from; a change must regenerate them.
@@ -311,6 +311,61 @@ fn golden_hash_cases_match_the_reference() {
                 .push(&ids, mask.as_deref())
                 .expect("the fixture fits the cache");
             assert_columns_match(&format!("{name} step {step_index}"), &actual, expected_step);
+        }
+    }
+}
+
+/// The stateless whole-history form the serving loop uses gives the reference's columns at every
+/// live position of every scenario, from any start; a masked position reads as the dead id.
+#[test]
+fn history_hashes_match_the_reference() {
+    const DEAD_ID: u32 = u32::MAX;
+    let cases = load_hash_cases();
+    for scenario in cases["cases"].as_array().expect("cases must be an array") {
+        let name = scenario["name"].as_str().expect("scenario name");
+        let mut history = Vec::new();
+        let mut expected = Vec::new();
+        for (step, expected_step) in scenario["steps"]
+            .as_array()
+            .expect("steps must be an array")
+            .iter()
+            .zip(scenario["expected"].as_array().expect("expected array"))
+        {
+            let ids = step["ids"].as_array().expect("ids must be an array");
+            let mask = step["mask"].as_array();
+            for (index, id) in ids.iter().enumerate() {
+                let live = mask.is_none_or(|mask| mask[index].as_bool().expect("mask bool"));
+                history.push(if live {
+                    id.as_u64().expect("id must be an integer") as u32
+                } else {
+                    DEAD_ID
+                });
+            }
+            expected.extend(expected_step.as_array().expect("positions array").iter());
+        }
+        assert_eq!(history.len(), expected.len(), "{name}: position count");
+        for start in [0, history.len() / 2, history.len() - 1] {
+            let mut columns = Vec::new();
+            hash_history(shared_compressor(), &history, start, DEAD_ID, &mut columns);
+            assert_eq!(columns.len(), (history.len() - start) * 2 * HASH_COLUMNS);
+            for (position, row) in columns.chunks(2 * HASH_COLUMNS).enumerate() {
+                let position = start + position;
+                if history[position] == DEAD_ID {
+                    assert!(
+                        row.iter().all(|&id| id == DEAD_ID),
+                        "{name}: dead row {position}"
+                    );
+                    continue;
+                }
+                let want: Vec<u32> = expected[position]
+                    .as_array()
+                    .expect("layers array")
+                    .iter()
+                    .flat_map(|layer| layer.as_array().expect("columns array"))
+                    .map(|id| id.as_u64().expect("column must be an integer") as u32)
+                    .collect();
+                assert_eq!(row, want, "{name}: position {position} from start {start}");
+            }
         }
     }
 }

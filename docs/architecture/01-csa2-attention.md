@@ -1,6 +1,6 @@
 # 01 — CSA2: Compressed Sparse Attention 2, the Indexer, and the Hierarchical Sparse Indexer
 
-All line numbers refer to /home/user/dsv41-research/inference/model.py unless stated otherwise.
+All line numbers refer to <checkpoint>/inference/model.py unless stated otherwise.
 Constants come from config.json / inference/config.json.
 
 ---

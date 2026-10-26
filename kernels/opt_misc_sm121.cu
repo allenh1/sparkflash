@@ -5,6 +5,8 @@
 // opt_rope_heads_bf16: the q rope of every head of the rank in one launch, in place. Grid (heads,
 //   tokens), one warp per head; the arithmetic is rope_rotate_bf16's (adjacent pairs, rounded
 //   multiplies and adds, one bf16 rounding), so the result is bit-identical to the per-head launch.
+//   With a row table ({lane offset, position} per token, the batched rows of several sequences)
+//   token t's cos row is the table's row at its position instead.
 
 #include "opt_pdl_sm121.cuh"
 #include <cuda_bf16.h>
@@ -20,13 +22,15 @@ extern "C" __global__ void opt_rope_heads_bf16(
     const uint32_t head_width,
     const uint32_t rope_head_dim,
     const uint32_t heads,
-    const uint32_t pair_stride) {
-    OPT_PDL_ENTRY();       // floats between consecutive tokens' cos rows
+    const uint32_t pair_stride,          // floats between consecutive tokens' cos rows
+    const uint64_t *__restrict__ row_tab) {  // null, or the batched rows (cos is the table base)
+    OPT_PDL_ENTRY();
     const uint32_t head = blockIdx.x;
     const uint32_t token = blockIdx.y;
     __nv_bfloat16 *row = rows + ((uint64_t)token * heads + head) * head_width;
-    const float *c = cos + (uint64_t)token * pair_stride;
-    const float *s = sin + (uint64_t)token * pair_stride;
+    const uint64_t at = row_tab == nullptr ? token : __ldg(row_tab + 2u * token + 1u);
+    const float *c = cos + at * pair_stride;
+    const float *s = sin + at * pair_stride;
     const uint32_t start = head_width - rope_head_dim;
     const uint32_t pairs = rope_head_dim >> 1u;
     for (uint32_t pair = threadIdx.x; pair < pairs; pair += blockDim.x) {

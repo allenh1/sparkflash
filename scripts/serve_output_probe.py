@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Measure OUTPUT (text, latency, tokens/s) of an OpenAI-compatible serve endpoint.
 
-Task-56/58: this is the baseline probe for the reference serve on node0
+Task-56/58: this is the baseline probe for the reference serve on spark-0
 (127.0.0.1:18000) and the same script is used for the TP=4 endpoint (task-55/58).
 Requests are sent strictly one at a time: the reference serve is a single-process,
 disk-bound engine, so parallel requests would measure queueing rather than the engine.
@@ -707,7 +707,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--io-ssh",
         default=None,
-        help="ssh target for the io pid (e.g. allenh1@192.0.2.80); samples are read over ssh",
+        help="ssh target for the io pid (e.g. user@198.51.100.80); samples are read over ssh",
     )
     parser.add_argument("--tag", default="", help="label written into the JSON and markdown")
     parser.add_argument("--out-json", default=None, help="JSON output path (default: serve-output-<utc>.json)")

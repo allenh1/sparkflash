@@ -15,7 +15,7 @@ HONESTY RULES (enforced by the document this script writes)
     * A vLLM baseline is only comparable when it was captured on the checkpoint the repo's
       parity oracle uses. D38's released root is
       .../snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170; the live deployment has
-      historically served the ...-heretic snapshot 12d58ad0.... A different root is recorded as
+      historically served the ...-finetune snapshot 12d58ad0.... A different root is recorded as
       d38_root_precondition.met = false and the document is marked gate_eligible = false; it is
       then a DEPLOYMENT baseline, never a parity gate.
     * Co-tenant load is recorded, not hidden. The server-reported num_requests_running is sampled
@@ -46,7 +46,7 @@ WHAT IS MEASURED
 Usage (one command; no third party packages, stdlib only):
 
     python3 scripts/d38_vllm_recapture.py \
-        --base-url http://192.0.2.80:8000 --model deepseek-v4.1-flash \
+        --base-url http://198.51.100.80:8000 --model deepseek-v4.1-flash \
         --out-json docs/build/d38-vllm-baseline-20261021.json \
         --out-md   docs/archive/build/d38-vllm-recapture-20261021.md
 
@@ -73,7 +73,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 SCHEMA = "sparkflash-d38-vllm-baseline/1"
-DEFAULT_BASE_URL = "http://192.0.2.80:8000"
+DEFAULT_BASE_URL = "http://198.51.100.80:8000"
 DEFAULT_MODEL = "deepseek-v4.1-flash"
 DEFAULT_TIMEOUT_S = 600.0
 DEFAULT_SEED = 20261021
@@ -83,7 +83,7 @@ DEFAULT_SSH_TIMEOUT_S = 15.0
 #: D38 root: the released snapshot the fixture, the device engine and the frozen D41 oracle use.
 D38_RELEASED_ROOT = "1bae0e1088993b9b82de08f59de5be5a34e42170"
 #: The deployment observed on 2026-10-21 (serving-readiness.md 5.1: "not a parity target").
-KNOWN_HERETIC_ROOT = "12d58ad0878b5008e80d720251adb969a0069412"
+KNOWN_FINETUNE_ROOT = "12d58ad0878b5008e80d720251adb969a0069412"
 
 FIXTURE_PATH = "/home/user/phase2-evidence/sequence-130-released.json"
 D41_PLAN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "d41_capture_plan.json")
@@ -1050,8 +1050,8 @@ def root_check(models_document: dict, expect_root: str) -> dict:
         "served_root_id": root_id,
         "served_model": entry.get("id") if isinstance(entry, dict) else None,
         "met": met,
-        "known_heretic_root": KNOWN_HERETIC_ROOT,
-        "served_known_heretic_snapshot": root_id == KNOWN_HERETIC_ROOT,
+        "known_finetune_root": KNOWN_FINETUNE_ROOT,
+        "served_known_finetune_snapshot": root_id == KNOWN_FINETUNE_ROOT,
         "consequence": (
             "served root matches the released snapshot: rows are parity-join candidates"
             if met
@@ -1484,7 +1484,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, help="request timeout s")
     parser.add_argument(
         "--ssh-hosts",
-        default="192.0.2.80,192.0.2.88,192.0.2.59,192.0.2.68",
+        default="198.51.100.80,198.51.100.88,198.51.100.59,198.51.100.68",
         help="comma-separated nodes for read-only provenance (argv/GPU); empty disables",
     )
     parser.add_argument("--out-json", required=True, help="evidence JSON to write")

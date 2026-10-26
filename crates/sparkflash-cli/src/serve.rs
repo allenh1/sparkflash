@@ -1013,7 +1013,7 @@ struct ServeArgs {
     #[cfg(feature = "tp4-serve")]
     #[arg(long, value_name = "DIR", requires = "tp4_rank")]
     tp4_device: Option<PathBuf>,
-    /// The longest prompt plus completion the device path serves; default and ceiling 65520.
+    /// The longest prompt plus completion the device path serves; default and ceiling 1,048,576.
     #[cfg(feature = "tp4-serve")]
     #[arg(long, value_name = "N", requires = "tp4_device")]
     max_model_len: Option<usize>,
@@ -1943,6 +1943,9 @@ pub enum Tp4ControlFrame {
         admit: Vec<Tp4DeviceAdmit>,
         /// The sequence ids that end before the tick runs.
         cancel: Vec<u64>,
+        /// The tick holds a long prefill back for a decode step (rank 0's clock).
+        #[serde(default)]
+        hold_prefill: bool,
     },
     /// Rank 0 -> the vision tower's rank only, before the DeviceTick that admits the request: the
     /// canvas of image `image` of sequence `seq`, as `bytes` raw RGB bytes that follow the frame on

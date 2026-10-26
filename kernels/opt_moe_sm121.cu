@@ -333,7 +333,8 @@ OPT_MOE_DOWN_ENTRY(opt_moe_down_combine_k3_sm121, 3u)
 // kernel's, in the same order, so every output is bit-identical to it.
 //
 // The plan (grouping the routed rows by expert) is recomputed by every block in shared memory from
-// the router's ids: rows <= OPT_MOE_PLAN_MAX, one thread per row, O(rows) per thread.
+// the router's ids: rows <= OPT_MOE_PLAN_MAX (the gate/up block's 128 threads), one thread per row,
+// O(rows) per thread.
 //
 // opt_moe_gate_up_dedup: grid (576 / 32, rows), 128 threads; block y serves distinct expert y (blocks
 //   past the distinct count exit). Same outputs as opt_moe_gate_up.
@@ -344,7 +345,7 @@ OPT_MOE_DOWN_ENTRY(opt_moe_down_combine_k3_sm121, 3u)
 // opt_moe_combine: grid (5120 / 256, tokens), 256 threads; the routed combine of the slot values
 //   (ascending expert id, each rounded to bf16, f32 adds, then the addend), as opt_moe_down_combine.
 
-#define OPT_MOE_PLAN_MAX 64u
+#define OPT_MOE_PLAN_MAX 128u
 
 struct OptMoePlan {
     uint32_t count;                       // distinct experts

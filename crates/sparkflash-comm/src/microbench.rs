@@ -811,10 +811,10 @@ mod tests {
             world: 4,
             rank: 0,
             peers: vec![
-                "192.0.2.80".to_owned(),
-                "192.0.2.88".to_owned(),
-                "192.0.2.59".to_owned(),
-                "192.0.2.68".to_owned(),
+                "198.51.100.80".to_owned(),
+                "198.51.100.88".to_owned(),
+                "198.51.100.59".to_owned(),
+                "198.51.100.68".to_owned(),
             ],
             timeout: Duration::from_millis(2_000),
         }
@@ -1075,7 +1075,7 @@ mod tests {
     #[test]
     fn nccl_is_refused_until_the_library_and_device_buffers_exist() {
         let mut plan = plan(BenchTransport::Nccl, &[("prefill_4mib", 4 * 1024 * 1024)]);
-        plan.peers = vec!["192.0.2.80".to_owned(); 4];
+        plan.peers = vec!["198.51.100.80".to_owned(); 4];
         match run(&plan) {
             Err(BenchError::Unavailable(text)) => {
                 assert!(text.contains("libnccl.so.2"), "{text}");

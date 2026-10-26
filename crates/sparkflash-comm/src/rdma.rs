@@ -76,7 +76,7 @@ pub struct RdmaConfig {
     /// Rank this process serves.
     pub rank: usize,
     /// Control-plane addresses in rank order. The live cluster uses the rail-1 address table:
-    /// 192.0.2.80 (node0), .84 (node1), .68 (node2), .59 (node3). The deployed vLLM container
+    /// 198.51.100.80 (node0), .84 (node1), .68 (node2), .59 (node3). The deployed vLLM container
     /// instead sees a mixed rail-2 table; see docs/archive/build/rdma-backend.md before "fixing" either.
     pub peers: Vec<String>,
     /// Port rank 0 listens on and every rank connects to.
@@ -149,7 +149,7 @@ impl RdmaConfig {
         }
         if world_size > 1 && peers.len() != world_size {
             return Err(CommError::InvalidLayout(format!(
-                "SPARK_COMM_PEERS must name one control-plane address per rank for world {world_size}, got {} ({peers:?}). The rail-1 table is 192.0.2.80,192.0.2.84,192.0.2.68,192.0.2.59 in rank order",
+                "SPARK_COMM_PEERS must name one control-plane address per rank for world {world_size}, got {} ({peers:?}). The rail-1 table is 198.51.100.80,198.51.100.84,198.51.100.68,198.51.100.59 in rank order",
                 peers.len()
             )));
         }
@@ -710,7 +710,7 @@ mod tests {
         let good = RdmaConfig {
             world_size: 4,
             rank: 0,
-            peers: vec!["192.0.2.80".to_owned(); 4],
+            peers: vec!["198.51.100.80".to_owned(); 4],
             control_port: DEFAULT_CONTROL_PORT,
             gid_index: DEFAULT_GID_INDEX,
             port: DEFAULT_RDMA_PORT,

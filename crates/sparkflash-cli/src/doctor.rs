@@ -2735,7 +2735,7 @@ mod tests {
 
     fn cluster() -> Options {
         Options {
-            nodes: vec!["192.0.2.84".to_owned()],
+            nodes: vec!["198.51.100.84".to_owned()],
             local: true,
             ..Options::default()
         }
@@ -3077,9 +3077,9 @@ mod tests {
     fn three_peer_cluster() -> Options {
         Options {
             nodes: vec![
-                "192.0.2.84".to_owned(),
-                "192.0.2.68".to_owned(),
-                "192.0.2.59".to_owned(),
+                "198.51.100.84".to_owned(),
+                "198.51.100.68".to_owned(),
+                "198.51.100.59".to_owned(),
             ],
             ..cluster()
         }
@@ -3095,7 +3095,7 @@ mod tests {
             .iter()
             .find(|call| call.starts_with("rdma-bandwidth"))
             .unwrap_or_else(|| panic!("no bandwidth probe was recorded: {calls:?}"));
-        for peer in ["192.0.2.84", "192.0.2.68", "192.0.2.59"] {
+        for peer in ["198.51.100.84", "198.51.100.68", "198.51.100.59"] {
             assert!(
                 bandwidth.contains(peer),
                 "the bandwidth probe did not hand {peer} to the measurement: {bandwidth}"
@@ -3106,8 +3106,8 @@ mod tests {
                 .details
                 .iter()
                 .any(|detail| detail.contains("worst-case")
-                    && detail.contains("192.0.2.84")
-                    && detail.contains("192.0.2.59")),
+                    && detail.contains("198.51.100.84")
+                    && detail.contains("198.51.100.59")),
             "the evidence must name every probed peer: {:?}",
             outcome.details
         );
@@ -3849,7 +3849,7 @@ GPU 00000000:01:00.0\n\
         let args = DoctorArgs::try_parse_from([
             "sparkflash doctor",
             "--nodes",
-            "192.0.2.80,192.0.2.84",
+            "198.51.100.80,198.51.100.84",
             "--rank",
             "1",
             "--apply",
@@ -3877,7 +3877,7 @@ GPU 00000000:01:00.0\n\
             nodes: vec![
                 "self".to_owned(),
                 "localhost".to_owned(),
-                "192.0.2.84".to_owned(),
+                "198.51.100.84".to_owned(),
             ],
             rank: 2,
             ..Options::default()
@@ -3885,7 +3885,7 @@ GPU 00000000:01:00.0\n\
         assert!(peer_is_self("self", &options));
         assert!(peer_is_self("localhost", &options));
         assert!(peer_is_self("2", &options));
-        assert!(!peer_is_self("192.0.2.84", &options));
+        assert!(!peer_is_self("198.51.100.84", &options));
     }
 
     #[test]

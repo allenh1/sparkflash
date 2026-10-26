@@ -84,6 +84,18 @@ const END_OF_SEQUENCE: &str = "<｜end▁of▁sentence｜>";
 /// follows as a lost leader.
 static LEADER_ENDED: AtomicBool = AtomicBool::new(false);
 
+/// Ends the process now, without the C exit handlers: CUDA's tears the context down, which waits
+/// for the kernels in flight, and a collective whose peer has gone never finishes, so a rank whose
+/// group failed would stay up, holding its memory and its port. Rust runs no destructors on exit
+/// either, so only the standard streams need flushing.
+fn exit_now(code: i32) -> ! {
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: _exit takes no pointers and does not return.
+    unsafe { libc::_exit(code) }
+}
+
 /// The device path's flags, parsed only with `--tp4-device`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceServeOptions {
@@ -432,7 +444,8 @@ impl Live {
         metrics: &Metrics,
     ) -> bool {
         for &token in tokens {
-            if self.stop.matched() {
+            // A tick sent ahead runs one more step after the stream ends: its tokens go nowhere.
+            if self.stop.matched() || self.failed.is_some() {
                 break;
             }
             self.completion_tokens += 1;
@@ -478,7 +491,7 @@ impl Live {
                 }
             }
         }
-        !(self.stop.matched() || self.closed)
+        !(self.stop.matched() || self.closed || self.failed.is_some())
     }
 
     /// The request is over: the held-back text, then the terminal event.
@@ -658,6 +671,8 @@ struct HubLink {
     /// Sequences whose stream ended early: the next tick cancels them.
     ending: Vec<u64>,
     next_seq: u64,
+    /// The next tick, already broadcast by [`DeviceLink::ahead`].
+    sent: Option<DeviceTick>,
 }
 
 impl HubLink {
@@ -674,16 +689,22 @@ impl HubLink {
         admit.push((seq, pending.job.clone()));
         self.live.insert(seq, Live::new(pending));
     }
-}
 
-impl DeviceLink for HubLink {
-    fn tick(&mut self, idle: bool, room: usize) -> Result<Option<DeviceTick>, String> {
+    /// Decides a tick and broadcasts it: `idle` blocks for a request (None: the driver is gone
+    /// and every worker was told to leave).
+    fn decide(
+        &mut self,
+        idle: bool,
+        room: usize,
+        hold_prefill: bool,
+    ) -> Result<Option<DeviceTick>, String> {
         if let Some(ready) = self.ready.take() {
             let _ = ready.send(());
         }
         let mut tick = DeviceTick {
             admit: Vec::new(),
             cancel: std::mem::take(&mut self.ending),
+            hold_prefill,
         };
         for (&seq, live) in &self.live {
             if live.pending.events.is_closed() && !tick.cancel.contains(&seq) {
@@ -731,9 +752,31 @@ impl DeviceLink for HubLink {
                     .map(|(seq, job)| admit_frame(*seq, job))
                     .collect(),
                 cancel: tick.cancel.clone(),
+                hold_prefill,
             })
             .map_err(|error| format!("control DeviceTick: {error}"))?;
         Ok(Some(tick))
+    }
+}
+
+impl DeviceLink for HubLink {
+    fn tick(
+        &mut self,
+        idle: bool,
+        room: usize,
+        hold_prefill: bool,
+    ) -> Result<Option<DeviceTick>, String> {
+        match self.sent.take() {
+            Some(tick) => Ok(Some(tick)),
+            None => self.decide(idle, room, hold_prefill),
+        }
+    }
+
+    fn ahead(&mut self, room: usize, hold_prefill: bool) -> Result<(), String> {
+        if self.sent.is_none() {
+            self.sent = self.decide(false, room, hold_prefill)?;
+        }
+        Ok(())
     }
 
     fn emit(&mut self, seq: u64, tokens: &[u32], last: bool) {
@@ -765,7 +808,12 @@ struct WorkerLink {
 }
 
 impl DeviceLink for WorkerLink {
-    fn tick(&mut self, _idle: bool, _room: usize) -> Result<Option<DeviceTick>, String> {
+    fn tick(
+        &mut self,
+        _idle: bool,
+        _room: usize,
+        _hold_prefill: bool,
+    ) -> Result<Option<DeviceTick>, String> {
         let rank = self.control.rank;
         let mut frame = self.control.next_frame();
         while let Ok(Tp4ControlFrame::DevicePixels { seq, image, bytes }) = frame {
@@ -777,7 +825,11 @@ impl DeviceLink for WorkerLink {
             frame = self.control.next_frame();
         }
         match frame {
-            Ok(Tp4ControlFrame::DeviceTick { admit, cancel }) => {
+            Ok(Tp4ControlFrame::DeviceTick {
+                admit,
+                cancel,
+                hold_prefill,
+            }) => {
                 let admit = admit
                     .into_iter()
                     .map(|admit| admitted_job(admit, &mut self.pixels))
@@ -789,7 +841,11 @@ impl DeviceLink for WorkerLink {
                         self.pixels.len()
                     ));
                 }
-                Ok(Some(DeviceTick { admit, cancel }))
+                Ok(Some(DeviceTick {
+                    admit,
+                    cancel,
+                    hold_prefill,
+                }))
             }
             Ok(Tp4ControlFrame::End) => {
                 LEADER_ENDED.store(true, Ordering::SeqCst);
@@ -838,7 +894,7 @@ fn watch_workers(hub: &Tp4ControlHub) -> Result<(), String> {
                             eprintln!(
                                 "sparkflash serve: rank {rank} closed its control channel; the group cannot serve, exiting"
                             );
-                            std::process::exit(1);
+                            exit_now(1);
                         }
                         Ok(_) => {}
                     }
@@ -874,7 +930,7 @@ fn watch_leader(stream: &TcpStream, rank: usize) -> Result<(), String> {
                         eprintln!(
                             "sparkflash serve: rank {rank}: rank 0 closed the control channel, exiting"
                         );
-                        std::process::exit(1);
+                        exit_now(1);
                     }
                 }
             }
@@ -904,11 +960,18 @@ fn epoch_args(
     // The harness's prompt is `ids.len() - positions + 1` tokens long: `positions` ids make a
     // one-token prompt (id 0, the BOS), which the serving loop never runs.
     let ids = vec!["0"; positions].join(",");
+    // The Engram n-grams hash the compressed ids of the tokenizer the requests are encoded with.
+    let tokenizer = match options.tokenizer.clone() {
+        Some(path) => path,
+        None => default_tokenizer()?,
+    };
     let args: Vec<String> = [
         "--run-stage",
         "tp4-chain",
         "--checkpoint",
         &checkpoint.display().to_string(),
+        "--engram-tokenizer",
+        &tokenizer.display().to_string(),
         "--tp-rank",
         &tp4.rank.to_string(),
         "--tp-world-size",
@@ -1046,6 +1109,7 @@ fn start_leader(
         live: std::collections::BTreeMap::new(),
         ending: Vec::new(),
         next_seq: 0,
+        sent: None,
     }));
     let mut cluster = tp4_cluster_snapshot();
     cluster.fabric_mode = DEVICE_FABRIC.to_owned();
@@ -1090,16 +1154,14 @@ fn start_leader(
                 Ok(runtime) => runtime,
                 Err(error) => {
                     eprintln!("sparkflash serve: cannot start the async runtime: {error}");
-                    std::process::exit(1);
+                    exit_now(1);
                 }
             };
             let router = sparkflash_api::server::router(state.clone());
             let code = runtime.block_on(bind_and_serve(router, state, bind));
-            use std::io::Write as _;
-            let _ = std::io::stdout().flush();
             // The HTTP side is the server: when it ends (a drain, or a bind failure), so does
             // the process, and the workers follow when the control channel closes.
-            std::process::exit(i32::from(code != ExitCode::SUCCESS));
+            exit_now(i32::from(code != ExitCode::SUCCESS));
         })
         .map_err(|error| format!("cannot start the HTTP thread: {error}"))?;
     Ok(())
@@ -1142,13 +1204,19 @@ mod tests {
         let frame = Tp4ControlFrame::DeviceTick {
             admit: vec![admit_frame(9, &job)],
             cancel: vec![4],
+            hold_prefill: true,
         };
         let wire = serde_json::to_vec(&frame).unwrap();
-        let Tp4ControlFrame::DeviceTick { admit, cancel } = serde_json::from_slice(&wire).unwrap()
+        let Tp4ControlFrame::DeviceTick {
+            admit,
+            cancel,
+            hold_prefill,
+        } = serde_json::from_slice(&wire).unwrap()
         else {
             panic!("not a DeviceTick");
         };
         assert_eq!(cancel, vec![4]);
+        assert!(hold_prefill);
         let [admit] = <[Tp4DeviceAdmit; 1]>::try_from(admit).unwrap();
         let mut pixels = std::collections::HashMap::new();
         assert_eq!(admitted_job(admit, &mut pixels), Ok((9, job)));

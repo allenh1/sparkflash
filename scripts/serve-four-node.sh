@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Single-command four-node TP=4 serving launcher (skeleton).
+# Single-command four-node TP=4 serving launcher.
 #
 # This is the host-side command builder and process launcher for the four-rank serving topology:
 # one sparkflash serve process per node, rank 0 owning HTTP, the tokenizer and the control
 # channel, ranks 1-3 running the resident forward. It does not make a measurement and does not
 # claim one: the print mode is offline, and a launch only starts what the operator staged.
 #
-# The binary must be built with the tp4-serve feature:
-#   cargo build --release --features tp4-serve -p sparkflash-cli
+# The binary must be built with the tp4-serve feature (and cuda for the device path):
+#   cargo build --release -p sparkflash-cli --features cuda,tp4-serve
 #
 # Usage:
 #   scripts/serve-four-node.sh print     print the four commands (default; no network access)
@@ -19,6 +19,14 @@
 #   SPARK_NODES            4 node addresses in rank order (space separated)
 #   SPARKFLASH_CHECKPOINT  sharded checkpoint directory, same path on every node
 #   SPARKFLASH_TOKENIZER   tokenizer.json path, same path on every node
+# Device path (what makes it fast; leave SPARKFLASH_CUBINS unset for the CPU reference engine):
+#   SPARKFLASH_CUBINS      cubin directory on every node (scripts/build-cubins.sh): --tp4-device
+#   SPARK_PEERS            the four RoCE addresses the collectives use, in rank order
+#                          (default: SPARK_NODES)
+#   SPARKFLASH_NCCL_LIB    directory holding libnccl.so.2 on every node (prepended to LD_LIBRARY_PATH)
+#   SPARKFLASH_CONVERTED_DIR  directory of `sparkflash convert` rank files on every node (fast boot)
+#   NCCL_*                 every NCCL_ variable set here is passed to every rank (NCCL_IB_HCA,
+#                          NCCL_SOCKET_IFNAME, NCCL_IB_GID_INDEX, ...)
 # Options:
 #   SPARKFLASH_BIN         binary on every node (default <repo>/target/release/sparkflash)
 #   SPARKFLASH_HTTP_BIND   rank-0 HTTP bind (default 0.0.0.0:8000)
@@ -37,7 +45,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODE="${1:-print}"
 [ "${SPARKFLASH_DRY_RUN:-0}" = "1" ] && MODE=print
-SSH_USER="${SSH_USER:-${USER:-allenh1}}"
+SSH_USER="${SSH_USER:-${USER:-}}"
 SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=8}"
 NODES_RAW="${SPARK_NODES:-}"
 CHECKPOINT="${SPARKFLASH_CHECKPOINT:-}"
@@ -53,6 +61,9 @@ DRAIN_TIMEOUT_MS="${SPARKFLASH_DRAIN_TIMEOUT_MS:-30000}"
 DEVICE_TOKEN_DIR="${SPARKFLASH_DEVICE_TOKEN_DIR:-}"
 DEVICE_TOKEN_LIVE="${SPARKFLASH_DEVICE_TOKEN_LIVE:-0}"
 DEVICE_TOKEN_DERIVED_CLAIM="${SPARKFLASH_DEVICE_TOKEN_DERIVED_CLAIM:-0}"
+CUBINS="${SPARKFLASH_CUBINS:-}"
+NCCL_LIB="${SPARKFLASH_NCCL_LIB:-}"
+CONVERTED_DIR="${SPARKFLASH_CONVERTED_DIR:-}"
 
 read -r -a NODES <<< "$NODES_RAW"
 die() { printf 'serve-four-node: %s\n' "$*" >&2; exit 1; }
@@ -61,6 +72,11 @@ die() { printf 'serve-four-node: %s\n' "$*" >&2; exit 1; }
 [ -n "$CHECKPOINT" ] || die "SPARKFLASH_CHECKPOINT is required"
 [ -n "$TOKENIZER" ] || die "SPARKFLASH_TOKENIZER is required"
 PEERS="$(IFS=,; printf '%s' "${NODES[*]}")"
+if [ -n "${SPARK_PEERS:-}" ]; then
+    read -r -a PEER_LIST <<< "$SPARK_PEERS"
+    [ "${#PEER_LIST[@]}" -eq 4 ] || die "SPARK_PEERS needs exactly 4 addresses in rank order, got ${#PEER_LIST[@]}"
+    PEERS="$(IFS=,; printf '%s' "${PEER_LIST[*]}")"
+fi
 
 # The environment every rank starts with. The drain knobs only matter on rank 0, which owns the
 # HTTP surface, but exporting them uniformly keeps the four command lines identical apart from the
@@ -68,6 +84,16 @@ PEERS="$(IFS=,; printf '%s' "${NODES[*]}")"
 rank_env() {
     printf 'SPARKFLASH_SERVE_DRAIN_DELAY_MS=%s SPARKFLASH_SERVE_DRAIN_TIMEOUT_MS=%s' \
         "$DRAIN_DELAY_MS" "$DRAIN_TIMEOUT_MS"
+    if [ -n "$CUBINS" ]; then
+        printf ' SPARK_COMM_REDUCE=nccl SPARKFLASH_LEAN_HEAD=1'
+        [ -n "$NCCL_LIB" ] && printf ' LD_LIBRARY_PATH=%s${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}' "$NCCL_LIB"
+        local var
+        for var in $(compgen -e | grep '^NCCL_' || true); do
+            printf ' %s=%s' "$var" "${!var}"
+        done
+    fi
+    [ -n "$CONVERTED_DIR" ] && printf ' SPARKFLASH_CONVERTED_DIR=%s' "$CONVERTED_DIR"
+    return 0
 }
 
 # The one command line per rank. Rank 0 binds the public HTTP address; ranks 1-3 keep a loopback
@@ -78,6 +104,7 @@ rank_command() {
     printf '%s serve --checkpoint %s --tokenizer %s' "$BIN" "$CHECKPOINT" "$TOKENIZER"
     printf ' --tp4-rank %s --tp4-world-size 4 --tp4-peers %s' "$rank" "$PEERS"
     printf ' --tp4-base-port %s --tp4-control-port %s' "$BASE_PORT" "$CONTROL_PORT"
+    [ -n "$CUBINS" ] && printf ' --tp4-device %s' "$CUBINS"
     if [ "$rank" -eq 0 ]; then
         printf ' --bind %s' "$HTTP_BIND"
         if [ -n "$DEVICE_TOKEN_DIR" ]; then
@@ -92,7 +119,7 @@ rank_command() {
 
 remote() {
     local rank="$1"; shift
-    ssh -n ${SSH_OPTS} "$SSH_USER${NODES[$rank]}" "$*"
+    ssh -n ${SSH_OPTS} "${SSH_USER:+$SSH_USER@}${NODES[$rank]}" "$*"
 }
 
 print_plan() {

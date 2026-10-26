@@ -1,29 +1,12 @@
-# Engineering handbooks
+# Data files
 
-Current-state documents. Process rules live in [`../RULES.md`](../RULES.md); decisions live in
-[`../DECISIONS.md`](../DECISIONS.md).
+Machine-readable records that tests and scripts read. None of this is documentation; see
+[../README.md](../README.md) for that.
 
-| Handbook | Read it for |
+| Path | Read by |
 | :-- | :-- |
-| [device-chain.md](device-chain.md) | Device path architecture, stage contracts, whole-layer port status and invariants. |
-| [performance.md](performance.md) | The published ms/step, per-block host/kernel split, measurement constraints, trajectory. |
-| [kernels.md](kernels.md) | Kernel inventory, native arithmetic rules, pins, phase-3 harness status. |
-| [four-rank.md](four-rank.md) | TP=4 host execution, host twin, token evidence, logprob rank contract. |
-| [serving.md](serving.md) | HTTP surfaces, scheduler, paged KV, deployment, metrics, remaining gaps. |
-| [fabric.md](fabric.md) | RDMA, NCCL, collectives, exactness, fabric prerequisites. |
-| [build-deploy.md](build-deploy.md) | aarch64 toolchain, boot conversion, container and deployment. |
-| [operations.md](operations.md) | Window sequence, qualification gates, evidence collection, review procedure. |
-| [evidence.md](evidence.md) | Artifact schemas and consumers. |
-
-## Non-markdown assets (stay in this directory)
-
-- [`speed-log.csv`](speed-log.csv) — the authoritative record of published speed rows
-  (`scripts/speed-log.sh`).
-- [`reference/speed-gate/`](reference/speed-gate/) — frozen CPU-twin reference artifacts for
-  `scripts/numerical-gate.sh`.
-- [`d38-vllm-baseline-20261021.json`](d38-vllm-baseline-20261021.json) — CI perf-regression
-  baseline.
-- `task30-evidence/`, `task32-evidence/`, `task53-evidence/` — frozen JSON evidence bundles.
-- `d41-*.json` — frozen D41 bars/floors.
-
-Historical build records were moved to [`../archive/build/`](../archive/build/).
+| `task30-evidence/tokenizer-parity.json` | `sparkflash-api` tests: pinned token ids from the reference tokenizer |
+| `task32-evidence/` | `scripts/d41_capture_plan*.json` (pinned digests of early probe rows) |
+| `reference/speed-gate/` | `scripts/numerical-gate.sh`, `scripts/device-frontier.py`: frozen per-rank references and bars for the numerical gate |
+| `reference/s1-device-bounds.json` | `scripts/s1-first-diff.py`: per-layer divergence bounds |
+| `speed-log.csv` | `scripts/speed-log.sh`: the early ms/step history (see [../performance.md](../performance.md) for current numbers) |

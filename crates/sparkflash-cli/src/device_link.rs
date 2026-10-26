@@ -104,17 +104,38 @@ pub struct DeviceTick {
     pub admit: Vec<(u64, DeviceJob)>,
     /// Sequences that end before the tick runs (a stop string matched, or the client left).
     pub cancel: Vec<u64>,
+    /// The tick holds a long prefill back for a decode step: rank 0's scheduler decides on its
+    /// clock (the decoders' share of a long prefill's time) and every rank holds the same ticks.
+    pub hold_prefill: bool,
 }
 
 /// One rank's end of the serving loop.
 pub trait DeviceLink: Send {
     /// The next tick's decisions, the same on every rank; `None` ends the loop. With `idle` (no
     /// sequence is on the device or waiting for it) it blocks until a request arrives; otherwise
-    /// it returns at once. It admits at most `room` requests.
+    /// it returns at once. It admits at most `room` requests. `hold_prefill` is this rank's
+    /// scheduler's answer for [`DeviceTick::hold_prefill`]: rank 0's is the one every rank gets.
     ///
     /// # Errors
     /// The control channel failed; the group cannot continue.
-    fn tick(&mut self, idle: bool, room: usize) -> Result<Option<DeviceTick>, String>;
+    fn tick(
+        &mut self,
+        idle: bool,
+        room: usize,
+        hold_prefill: bool,
+    ) -> Result<Option<DeviceTick>, String>;
+
+    /// Rank 0 decides the next tick now, under the running tick's device work, and sends it:
+    /// the workers find it waiting when they finish this tick, and the next [`Self::tick`] returns
+    /// it. `room` and `hold_prefill` are as for that call; it never blocks (a request that comes
+    /// later waits for the tick after). A cancellation decided after it waits for the tick after
+    /// too: the sequence runs one more step, its tokens dropped. A worker's link ignores it.
+    ///
+    /// # Errors
+    /// The control channel failed; the group cannot continue.
+    fn ahead(&mut self, _room: usize, _hold_prefill: bool) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Sequence `seq`'s tokens from this tick (its first carries the prefill's token). `last` is
     /// true when the sequence ends with them. When rank 0's stream must end before that (a stop

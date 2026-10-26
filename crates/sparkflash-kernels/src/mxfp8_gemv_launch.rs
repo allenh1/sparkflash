@@ -482,13 +482,27 @@ pub fn opt_installed() -> bool {
 /// body). Every choice gives the same bits per token: a token's chain does not depend on it. More
 /// tokens (a bulk prefill chunk) run on the tensor-core GEMMs, which round differently.
 pub fn launch_opt(cuda: &Cuda, kind: OptKind, args: &OptArgs) -> Result<(), String> {
-    use std::sync::atomic::Ordering::Acquire;
-    let index = match kind {
-        OptKind::Fp8aBf16o => 0,
-        OptKind::F32aBf16o => 1,
-        OptKind::F32aF32o => 2,
-        OptKind::Bf16aBf16o => 3,
-    };
+    let index = opt_index(kind, args)?;
+    if args.tokens > 8 {
+        return launch_mma(cuda, index, args);
+    }
+    launch_gemv(cuda, kind, index, args)
+}
+
+/// [launch_opt] that keeps more than 8 tokens on the GEMV (split over the grid's z axis, at most
+/// 8 per block) rather than the tensor-core GEMMs: every token's bits are the GEMV's, at the price
+/// of reading the weights once per 8 tokens (mostly from L2). For a few dozen rows, such as several
+/// sequences' draft blocks.
+///
+/// # Errors
+/// As [launch_opt].
+pub fn launch_opt_split(cuda: &Cuda, kind: OptKind, args: &OptArgs) -> Result<(), String> {
+    let index = opt_index(kind, args)?;
+    launch_gemv(cuda, kind, index, args)
+}
+
+/// The kind's slot in the installed function tables, after the shape checks every launch shares.
+fn opt_index(kind: OptKind, args: &OptArgs) -> Result<usize, String> {
     if args.tokens == 0
         || !args.cols.is_multiple_of(32)
         || !args.inner.is_multiple_of(32)
@@ -496,28 +510,45 @@ pub fn launch_opt(cuda: &Cuda, kind: OptKind, args: &OptArgs) -> Result<(), Stri
     {
         return Err(format!("opt gemv: unsupported shape {args:?}"));
     }
-    if args.tokens > 8 {
-        return launch_mma(cuda, index, args);
-    }
-    // Tokens per block: the fewer, the more blocks stream the weights, at the price of re-reading
-    // them once per block (from L2: the kernel runs a tile's splits side by side). A narrow matrix
-    // needs the blocks (one token each when it is very narrow, two when narrow); a mid-width one at
-    // up to four tokens still gains from the shorter accumulator set, a wide one (enough blocks
-    // already) does not.
+    Ok(match kind {
+        OptKind::Fp8aBf16o => 0,
+        OptKind::F32aBf16o => 1,
+        OptKind::F32aF32o => 2,
+        OptKind::Bf16aBf16o => 3,
+    })
+}
+
+fn launch_gemv(cuda: &Cuda, kind: OptKind, index: usize, args: &OptArgs) -> Result<(), String> {
+    use std::sync::atomic::Ordering::Acquire;
+    // Tokens per block (every form gives a token the same bits): about four, so a block's
+    // accumulators stay short while few splits re-read the weights (from L2: the kernel runs a
+    // tile's splits side by side). A wide matrix with a long reduction has the blocks already and
+    // takes eight from five tokens; a very narrow one splits further to get them; bf16 rows run a
+    // ragged second block of four slowly. By sweep over the decode shapes at 1 to 16 tokens.
     let blocks = (args.cols / 32) * args.groups;
     let one = if index == 3 {
         0
     } else {
         OPT_FUNCTIONS[index].load(Acquire)
     };
-    let mut per_block = if (args.tokens == 1 || blocks <= SPLIT_BLOCKS) && one != 0 {
+    let mut per_block = if args.tokens == 1 && one != 0 {
         1
-    } else if blocks <= NARROW_BLOCKS {
+    } else if blocks >= WIDE_BLOCKS && args.inner >= WIDE_INNER {
+        match args.tokens {
+            0..=2 => 2,
+            3..=4 => 4,
+            _ => 8,
+        }
+    } else if blocks <= SPLIT_BLOCKS && one != 0 {
+        match args.tokens {
+            0..=3 => 1,
+            4..=10 => 2,
+            _ => 4,
+        }
+    } else if args.tokens <= 2 || (index == 3 && matches!(args.tokens, 5..=6)) {
         2
-    } else if args.tokens <= 4 && blocks < WIDE_BLOCKS {
-        4
     } else {
-        8
+        4
     };
     // A block whose rows do not fit the kernel's staging bytes reads them from global memory at
     // several microseconds per extra token, so fewer tokens per block that stage are faster.
@@ -579,14 +610,13 @@ pub fn launch_opt(cuda: &Cuda, kind: OptKind, args: &OptArgs) -> Result<(), Stri
     )
 }
 
-/// The widest matrix (blocks per token) [launch_opt] splits to one token per block.
+/// The widest matrix (blocks per token) [launch_opt] splits to one or two tokens per block.
 const SPLIT_BLOCKS: u32 = 16;
 
-/// The widest matrix (blocks per token) [launch_opt] splits to two tokens per block.
-const NARROW_BLOCKS: u32 = 48;
-
-/// From this many blocks per token [launch_opt] keeps up to eight tokens per block.
-const WIDE_BLOCKS: u32 = 256;
+/// From this many blocks per token, and a reduction of at least [WIDE_INNER], [launch_opt] keeps
+/// up to eight tokens per block.
+const WIDE_BLOCKS: u32 = 128;
+const WIDE_INNER: u32 = 1024;
 
 /// The opt GEMV's activation staging bytes per block (OPT_G_STAGE, OPT_G_STAGE_T1).
 const OPT_STAGE: u32 = 48128;

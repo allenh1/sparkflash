@@ -13,7 +13,7 @@
 
 use super::batch::{Batch, Emission, Pools};
 use super::draft::DraftState;
-use super::rows::RowsState;
+use super::rows::{R_MAX, RowsState};
 use super::sample::Sampler;
 use super::*;
 use crate::device_link::{DeviceFinish, DeviceLink, DeviceOutcome};
@@ -39,6 +39,8 @@ pub(super) struct SpecInputs<'s> {
     pub(super) world: usize,
     /// The bulk prefill's rows state (super::bulk), when one is open.
     pub(super) bulk: Option<&'s RowsState>,
+    /// More bulk states of the same capacity, for chunks run together (prefill_layers_paired).
+    pub(super) bulk_more: &'s [RowsState],
 }
 
 /// The shortest uncached prompt the bulk prefill takes (SPARKFLASH_PREFILL_BULK_MIN, default 256):
@@ -105,6 +107,9 @@ pub(super) fn gather_rows(
 /// files and the byte each tensor starts at.
 pub(super) struct EngramReader {
     slots: Vec<(Arc<fs::File>, u64, Arc<fs::File>, u64)>,
+    /// The tokenizer's compressed token map: the n-grams are hashed over compressed ids
+    /// (engram.py's token map), never over raw ones.
+    compressor: sparkflash_engram::compress::TokenizerCompressor,
     /// Entries already read, by (file, byte): the tables are weights, so an n-gram seen again (or a
     /// redrafted row) costs a copy instead of a device read.
     cache: Mutex<EntryCache>,
@@ -135,8 +140,23 @@ impl EngramReader {
     pub(super) fn open(
         config: &sparkflash_engine::config::ModelConfig,
         source: &dyn sparkflash_engine::weights::WeightSource,
+        tokenizer: &Path,
     ) -> Result<Self, String> {
         use std::os::fd::AsRawFd as _;
+        // The hash constants (primes, offsets, multipliers) are the released model's two layers.
+        if config.engram_layer_ids != sparkflash_engram::ENGRAM_LAYERS
+            || sparkflash_engine::forward::engram::hash_columns(config)
+                != sparkflash_engram::hash::HASH_COLUMNS
+        {
+            return Err(format!(
+                "engram reader: layers {:?} with {} hash columns are not the released Engram layout",
+                config.engram_layer_ids,
+                sparkflash_engine::forward::engram::hash_columns(config)
+            ));
+        }
+        let compressor =
+            sparkflash_engram::compress::TokenizerCompressor::from_tokenizer_json(tokenizer)
+                .map_err(|error| format!("engram reader: {}: {error}", tokenizer.display()))?;
         let region = |name: String| -> Result<(Arc<fs::File>, u64), String> {
             let (file, start, _len) = source
                 .file_region(&name)
@@ -155,6 +175,7 @@ impl EngramReader {
         }
         Ok(Self {
             slots,
+            compressor,
             cache: Mutex::new(std::collections::HashMap::new()),
             cached: std::env::var("SPARKFLASH_ENGRAM_CACHE").as_deref() != Ok("0"),
         })
@@ -719,7 +740,7 @@ impl<'r> Reads<'r> {
 }
 
 impl DeviceLayer<'_> {
-    /// Hashes rows p0..p0+n of `history` (the arena build's n-gram hashes), sets their skip flags
+    /// Hashes rows p0..p0+n of `history` through the compressed token map, sets their skip flags
     /// and returns the table reads that fill their entries, staged at rows row0.. of `cap` per slot.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn engram_plan<'r>(
@@ -758,13 +779,13 @@ impl DeviceLayer<'_> {
         let mut per_slot: Vec<Vec<ReadJob<'_>>> = vec![Vec::new(); slots];
         let mut hashes = Vec::new();
         let mut skips = Vec::with_capacity(n * slots);
-        sparkflash_engine::forward::engram::ngram_hashes(
-            config,
+        sparkflash_engram::hash::hash_history(
+            &reader.compressor,
             &history[..p0 + n],
             p0,
+            sparkflash_engine::forward::engram::HASH_SENTINEL,
             &mut hashes,
-        )
-        .map_err(|error| format!("engram set: hashes at {p0}..{}: {error}", p0 + n))?;
+        );
         for row in 0..n {
             let position = p0 + row;
             for (slot, slot_jobs) in per_slot.iter_mut().enumerate() {
@@ -1004,6 +1025,118 @@ impl DeviceLayer<'_> {
         Ok(waited)
     }
 
+    /// Consecutive bulk chunks of one sequence (each chunk's rows right after the one before),
+    /// their layers interleaved so that each chunk's collectives run on the collective stream under
+    /// the other chunks' launches: per layer, the chunks' attention halves in order, then their FFN
+    /// halves in the same order. Each chunk's launches are its single-chunk launches in their
+    /// order, and a chunk's attention at a layer is queued after the chunk before it has written
+    /// that layer's caches, so the results are the chunks' run one after the other. Each chunk's
+    /// Engram reads (`task`, staged in its pinned buffer) are waited for and uploaded just before
+    /// its slot's layer (the chunks share the arena rows: the run's stream orders each upload after
+    /// the previous chunk's reads of them). `then` runs once every layer is
+    /// queued. Returns the ms spent waiting for reads.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn prefill_layers_paired<'r>(
+        &mut self,
+        chunks: &[(
+            &RowsState,
+            usize,
+            usize,
+            Option<(&GatherTask<'r>, &HostMapped)>,
+        )],
+        staged: &[Option<SeamStagedWeights>],
+        engram_layers: &[usize],
+        reads: Option<&Reads<'r>>,
+        then: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<f64, String> {
+        if !self.bulk_comm_open() || chunks.is_empty() {
+            return Err("paired prefill: no collective stream or no chunk".to_owned());
+        }
+        for &(rows, _, n, _) in chunks {
+            if rows.bulk.is_none() || n <= R_MAX {
+                return Err(format!("paired prefill: {n} rows are not a bulk chunk"));
+            }
+            rows.overlap.set(true);
+        }
+        // Split seams ([Self::enable_prefill_sp]) add an AllGather after each seam: the chunks'
+        // seams run first, then their halves past them, so each gather runs under the later
+        // chunks' seams (and the earlier chunks' rests).
+        let split = chunks
+            .iter()
+            .any(|&(rows, _, n, _)| self.sp_rows(rows, n).is_some());
+        // Split, the chunks' routed experts run as one pass over the expert weights when their
+        // states share the routed rows ([Self::rows_moe_merged]; SPARKFLASH_PREFILL_MOE_MERGE=0:
+        // a pass a chunk). Each row's values are its chunk's own pass's.
+        let merged: Vec<(&RowsState, usize)> =
+            chunks.iter().map(|&(rows, _, n, _)| (rows, n)).collect();
+        let merge = split
+            && chunks.len() > 1
+            && std::env::var("SPARKFLASH_PREFILL_MOE_MERGE").as_deref() != Ok("0")
+            && chunks.iter().all(|&(rows, ..)| rows.moe_way.is_some());
+        let result: Result<f64, String> = (|| {
+            let mut waited = 0.0;
+            for (layer, weights) in staged.iter().enumerate() {
+                self.set_seam_weights(*weights);
+                let slot = engram_layers.iter().position(|&target| target == layer);
+                for &(rows, p0, n, task) in chunks {
+                    if let (Some(reads), Some((task, pinned)), Some(slot)) = (reads, task, slot) {
+                        let started = std::time::Instant::now();
+                        reads.wait(task, slot)?;
+                        waited += started.elapsed().as_secs_f64() * 1e3;
+                        let gather = &task.gather;
+                        self.engram_apply(gather)?;
+                        let at = self.engram_entry(slot, gather.at, gather.stride)?;
+                        let (offset, bytes) = gather.slot_span(slot);
+                        self.cuda.copy_htod_async(&at, pinned, offset, bytes)?;
+                    }
+                    if split {
+                        self.run_layer_attn_seam(rows, layer, p0, n)?;
+                    } else {
+                        self.run_layer_attn(rows, layer, p0, n)?;
+                    }
+                }
+                if split {
+                    for &(rows, p0, n, _) in chunks {
+                        self.run_layer_attn_rest(rows, layer, p0, n)?;
+                    }
+                    for &(rows, _, n, _) in chunks {
+                        self.run_layer_ffn_seam(rows, layer, n)?;
+                    }
+                }
+                if merge {
+                    for &(rows, _, n, _) in chunks {
+                        self.ffn_rest_inputs(rows, layer, n)?;
+                    }
+                    self.rows_moe_merged(&merged, layer)?;
+                    for &(rows, _, n, _) in chunks {
+                        self.ffn_rest_tail(rows, layer, n)?;
+                    }
+                    continue;
+                }
+                for &(rows, p0, n, _) in chunks {
+                    if split {
+                        self.run_layer_ffn_rest(rows, layer, p0, n)?;
+                    } else {
+                        self.run_layer_ffn(rows, layer, p0, n)?;
+                    }
+                }
+            }
+            for &(rows, _, n, _) in chunks {
+                self.rows_ar_wait(rows, n)?;
+            }
+            Ok(waited)
+        })();
+        for &(rows, ..) in chunks {
+            rows.end_overlap(result.is_err());
+        }
+        let waited = result?;
+        then(self)?;
+        if !self.wait_collectives()? {
+            self.cuda.synchronize()?;
+        }
+        Ok(waited)
+    }
+
     pub(super) fn spec_layers(
         &mut self,
         rows: &RowsState,
@@ -1020,26 +1153,33 @@ impl DeviceLayer<'_> {
     }
 }
 
-/// The modelled cost of a verify of 1..=6 rows on GB10 (ms, the backbone rows step with the
-/// head), and of one draft: only the differences matter to the depth choice.
-const VERIFY_MS: [f64; 6] = [24.5, 30.2, 36.2, 38.6, 42.6, 48.5];
-const DRAFT_MS: f64 = 4.0;
+/// The modelled wall of a c=1 step on GB10 that verifies `depth` drafts (ms): the draft, the
+/// backbone rows step and the head, measured at 27 ms plus 4 ms a verified row (each row reads its
+/// own six experts a layer). Only the differences matter to the depth choice.
+const STEP_MS: f64 = 27.0;
+const ROW_MS: f64 = 4.0;
 /// The draft-probability bins the acceptance calibration counts in.
 const CALIBRATION_EDGES: [f32; 7] = [0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99];
 /// The pseudo-count of the calibration prior (each bin starts at the draft's own probability).
 const CALIBRATION_PRIOR: f64 = 4.0;
 
-/// How many of the k drafts a step verifies (SPARKFLASH_DSPARK_DEPTH=fixed, the default: all k,
-/// or adaptive). Adaptive picks the depth d that maximises
-///   sum_{j <= d} prod_{i <= j} q_i  -  rate * verify_ms(d + 1),
+fn step_ms(depth: usize) -> f64 {
+    STEP_MS + ROW_MS * depth as f64
+}
+
+/// How many of the k drafts a step verifies (SPARKFLASH_DSPARK_DEPTH=adaptive, the default, or
+/// fixed: all k). Adaptive picks the depth d that maximises
+///   sum_{j <= d} prod_{i <= j} q_i  -  rate * step_ms(d),
 /// the expected accepted drafts less what the extra rows cost at the run's modelled token rate,
 /// where q_i is the acceptance probability of draft i given the ones before it were accepted:
-/// the draft's softmax probability, calibrated by the acceptances seen so far in its bin. Every
-/// input (the exchanged probabilities, the acceptances, the static cost table) is the same on
-/// every rank, so every rank picks the same depth and launches the same collectives. On the chat,
-/// code and story prompts (k = 5 adaptive against k = 3 fixed) it moved the rate by -3..+5% per
-/// prompt and left the mean unchanged: the draft's probabilities are overconfident on chat and
-/// underconfident on code, and 130-token runs are too short to calibrate them.
+/// the draft's softmax probability, calibrated by the acceptances seen so far in its bin. Under a
+/// sampler the probabilities are of the noised scores; the calibration learns what they are worth.
+/// Every input (the exchanged probabilities, the acceptances, the static cost model) is the same
+/// on every rank, so every rank picks the same depth and launches the same collectives. At c=1 on
+/// GB10 (k = 5) it took prose at 2K context from 52.0 / 56.8 to 59.9 / 65.3 tok/s and the
+/// explanation prompts from 57.1 / 67.4 to 64.8 / 73.0, and left code at 107-112 (its drafts are
+/// accepted to the full depth); pinned to depth 5 (SPARKFLASH_DSPARK_MIN_DEPTH=5) it ran as fixed,
+/// so the host read of the probabilities costs nothing.
 pub(super) struct DepthPolicy {
     pub(super) adaptive: bool,
     k: usize,
@@ -1053,8 +1193,8 @@ pub(super) struct DepthPolicy {
 impl DepthPolicy {
     pub(super) fn from_env(k: usize) -> Result<Self, String> {
         let adaptive = match std::env::var("SPARKFLASH_DSPARK_DEPTH").as_deref() {
-            Ok("adaptive") => true,
-            Err(_) | Ok("fixed") => false,
+            Err(_) | Ok("adaptive") => true,
+            Ok("fixed") => false,
             Ok(other) => {
                 return Err(format!(
                     "SPARKFLASH_DSPARK_DEPTH={other}: adaptive or fixed"
@@ -1093,20 +1233,32 @@ impl DepthPolicy {
         } else {
             0.06
         };
-        let (mut best, mut best_score) = (0usize, -rate * VERIFY_MS[0]);
-        let (mut chain, mut gain) = (1.0f64, 0.0f64);
-        for d in 1..=self.k.min(VERIFY_MS.len() - 1) {
-            let p = f64::from(probs[d - 1]);
-            let b = Self::bin(probs[d - 1]);
-            chain *=
-                (self.accepted[b] + CALIBRATION_PRIOR * p) / (self.seen[b] + CALIBRATION_PRIOR);
-            gain += chain;
-            let score = gain - rate * VERIFY_MS[d];
+        let (mut best, mut best_score) = (0usize, -rate * step_ms(0));
+        let mut gain = 0.0f64;
+        let chain = self.chain(probs);
+        for (d, chained) in (1..).zip(&chain) {
+            gain += chained;
+            let score = gain - rate * step_ms(d);
             if score > best_score {
                 (best, best_score) = (d, score);
             }
         }
         best.max(self.min_depth)
+    }
+
+    /// The calibrated probability that drafts 0..=j are all accepted, for each of the k drafts.
+    pub(super) fn chain(&self, probs: &[f32]) -> Vec<f64> {
+        let mut chain = 1.0f64;
+        probs
+            .iter()
+            .take(self.k)
+            .map(|&p| {
+                let b = Self::bin(p);
+                chain *= (self.accepted[b] + CALIBRATION_PRIOR * f64::from(p))
+                    / (self.seen[b] + CALIBRATION_PRIOR);
+                chain
+            })
+            .collect()
     }
 
     /// A step verified `depth` drafts and accepted the first `m`: drafts 0..m were accepted and
@@ -1122,7 +1274,7 @@ impl DepthPolicy {
             }
         }
         self.tokens += (m + 1) as f64;
-        self.ms += DRAFT_MS + VERIFY_MS[depth.min(VERIFY_MS.len() - 1)];
+        self.ms += step_ms(depth);
     }
 }
 
@@ -1344,7 +1496,10 @@ pub(super) fn serve(
         if inputs.rank == 0 {
             println!("sparkflash serve: {}", batch.describe());
         }
-        while let Some(tick) = link.tick(batch.idle(), batch.room())? {
+        // SPARKFLASH_TICK_AHEAD=0: rank 0 decides each tick when the last one ends, and the
+        // workers wait for its frame at every step.
+        let send_ahead = std::env::var("SPARKFLASH_TICK_AHEAD").as_deref() != Ok("0");
+        while let Some(tick) = link.tick(batch.idle(), batch.room(), batch.hold_prefill())? {
             for id in tick.cancel {
                 if let Some(outcome) = batch.cancel(id)? {
                     link.finish(id, Ok(&outcome.device()))?;
@@ -1356,7 +1511,14 @@ pub(super) fn serve(
                     link.finish(*id, Err(&error))?;
                 }
             }
-            let emissions = match batch.tick() {
+            let mut ahead = |room, hold| {
+                if send_ahead {
+                    link.ahead(room, hold)
+                } else {
+                    Ok(())
+                }
+            };
+            let emissions = match batch.tick(tick.hold_prefill, &mut ahead) {
                 Ok(emissions) => emissions,
                 Err(error) => {
                     // A failure inside a step may have left the ranks at different collectives.
@@ -1414,6 +1576,11 @@ mod tests {
     fn merged_gathers_keep_each_slot_together_in_row_order() {
         let reader = EngramReader {
             slots: Vec::new(),
+            compressor: sparkflash_engram::compress::TokenizerCompressor::from_lookup(
+                vec![0; 3],
+                sparkflash_engram::layout::COMPRESSED_VOCAB_SIZE,
+            )
+            .expect("lookup"),
             cache: Mutex::new(std::collections::HashMap::new()),
             cached: true,
         };

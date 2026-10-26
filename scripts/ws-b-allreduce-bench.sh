@@ -7,7 +7,7 @@
 # processes. No number is available until 'run' completes on the nodes, and no runner path may
 # invent one.
 #
-# The live TP4 vLLM deployment (http://192.0.2.80:8000, ~111/121 GB per node) is sharing this
+# The live TP4 vLLM deployment (http://198.51.100.80:8000, ~111/121 GB per node) is sharing this
 # fabric and also serves this session's agent harness. This runner NEVER stops, restarts or
 # reconfigures it, and it refuses to launch a benchmark while a GPU process or the :8000 listener
 # is present (override only for a deliberately supervised, coordinated run with
@@ -17,7 +17,7 @@
 # Operational blocker (Lead's report, not measured here): a "free window" is not "vLLM is stopped",
 # because stopping it cuts the model backend of the sessions coordinating the run. It needs explicit
 # human authorisation plus a restore path: docker stop vllm_node on all four nodes, restore with
-# "python3 run-recipe.py deepseek-v4.1-flash-1017-heretic" on .80, ~13 min to health. Confirm the
+# "python3 run-recipe.py deepseek-v4.1-flash-1017-finetune" on .80, ~13 min to health. Confirm the
 # container name, recipe path and health check against the serving owner's runbook before use.
 # This refusal is why no fabric number exists today - see docs/archive/build/ws-b-infra-tickets-20261021.md 3.1.
 #
@@ -44,10 +44,10 @@
 #   SPARK_WSB_ALLOW_BUSY  1 permits a run while the nodes are busy (only with a coordinated window)
 #
 # Rank table: the table the 2026-10-20 bring-up used and the one the probe runner records:
-#   rank 0 node0 192.0.2.80
-#   rank 1 node1 192.0.2.88
-#   rank 2 node3 192.0.2.59
-#   rank 3 node2 192.0.2.68
+#   rank 0 spark-0 198.51.100.80
+#   rank 1 spark-1 198.51.100.88
+#   rank 2 spark-2 198.51.100.59
+#   rank 3 spark-3 198.51.100.68
 #
 set -euo pipefail
 
@@ -56,11 +56,11 @@ EVIDENCE_ROOT="${EVIDENCE_ROOT:-/home/user/phase2-evidence/ws-b-20261021}"
 RUN_ID="${RUN_ID:-ws-b-allreduce-$(date -u +%Y%m%dT%H%M%SZ)}"
 REMOTE_DIR="$EVIDENCE_ROOT/$RUN_ID"
 LOCAL_DIR="${LOCAL_DIR:-$REPO_ROOT/target/ws-b-allreduce/$RUN_ID}"
-SSH_USER="${SSH_USER:-allenh1}"
+SSH_USER="${SSH_USER:-user}"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8)
-NODES=(${SPARK_NODES:-192.0.2.80 192.0.2.88 192.0.2.59 192.0.2.68})
-NAMES=(node0 node1 node3 node2)
-PEERS="${SPARK_COMM_PEERS:-192.0.2.80,192.0.2.88,192.0.2.59,192.0.2.68}"
+NODES=(${SPARK_NODES:-198.51.100.80 198.51.100.88 198.51.100.59 198.51.100.68})
+NAMES=(spark-0 spark-1 spark-2 spark-3)
+PEERS="${SPARK_COMM_PEERS:-198.51.100.80,198.51.100.88,198.51.100.59,198.51.100.68}"
 CONTROL_PORT="${SPARK_COMM_CONTROL_PORT:-18516}"
 TIMEOUT_MS="${SPARK_COMM_TIMEOUT_MS:-5000}"
 SAMPLES="${SAMPLES:-200}"

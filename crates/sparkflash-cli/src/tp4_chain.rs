@@ -25,7 +25,7 @@ use sparkflash_comm::transport::Transport;
 use crate::tp4_resident;
 
 /// How the stage was invoked.
-pub const USAGE: &str = "sparkflash device-chain --run-stage tp4-chain (--checkpoint DIR | --tensor-index FILE) --tp-rank R --tp-world-size 4 --evidence-dir DIR [--plan-only] [--upload] [--comm-peers IP,IP,IP,IP] [--comm-base-port 29601] [--comm-timeout 120] [--comm-connect-timeout 120] [--comm-smoke] [--decode-steps N] [--prompt-tokens N] [--cubin-dir DIR] [--forward --forward-preflight --kernel-cubin-dir DIR --token-ids ID,ID --forward-reference-ids ID,ID] [--native-rounding none|combine|mhc|shared|both|LIST] [--forward-native-dense-parity [LAYER[:POSITION]]] [--forward-lean] [--forward-perf-probe] [--forward-perf-probe-nosync]";
+pub const USAGE: &str = "sparkflash device-chain --run-stage tp4-chain (--checkpoint DIR | --tensor-index FILE) --tp-rank R --tp-world-size 4 --evidence-dir DIR [--plan-only] [--upload] [--comm-peers IP,IP,IP,IP] [--comm-base-port 29601] [--comm-timeout 120] [--comm-connect-timeout 120] [--comm-smoke] [--decode-steps N] [--prompt-tokens N] [--cubin-dir DIR] [--engram-tokenizer FILE] [--forward --forward-preflight --kernel-cubin-dir DIR --token-ids ID,ID --forward-reference-ids ID,ID] [--native-rounding none|combine|mhc|shared|both|LIST] [--forward-native-dense-parity [LAYER[:POSITION]]] [--forward-lean] [--forward-perf-probe] [--forward-perf-probe-nosync]";
 
 /// The parsed argv.
 #[derive(Debug)]
@@ -34,6 +34,8 @@ struct ChainArgs {
     world: usize,
     checkpoint: Option<PathBuf>,
     tensor_index: Option<PathBuf>,
+    /// The tokenizer.json of the Engram token map (default: the checkpoint's own).
+    engram_tokenizer: Option<PathBuf>,
     plan_only: bool,
     #[allow(dead_code)] // parsed for the loop arm that is not wired yet
     upload: bool,
@@ -104,6 +106,7 @@ impl ChainArgs {
         let mut world: Option<usize> = None;
         let mut checkpoint: Option<PathBuf> = None;
         let mut tensor_index: Option<PathBuf> = None;
+        let mut engram_tokenizer: Option<PathBuf> = None;
         let mut evidence_dir: Option<PathBuf> = None;
         let mut peers_raw: Option<String> = None;
         let mut base_port = 29601u16;
@@ -150,6 +153,9 @@ impl ChainArgs {
                 }
                 "--checkpoint" => checkpoint = Some(PathBuf::from(take("--checkpoint")?)),
                 "--tensor-index" => tensor_index = Some(PathBuf::from(take("--tensor-index")?)),
+                "--engram-tokenizer" => {
+                    engram_tokenizer = Some(PathBuf::from(take("--engram-tokenizer")?));
+                }
                 "--evidence-dir" => evidence_dir = Some(PathBuf::from(take("--evidence-dir")?)),
                 "--comm-peers" => peers_raw = Some(take("--comm-peers")?),
                 "--comm-base-port" => {
@@ -343,6 +349,7 @@ impl ChainArgs {
             world,
             checkpoint,
             tensor_index,
+            engram_tokenizer,
             plan_only,
             upload,
             loop_mode,
@@ -469,6 +476,7 @@ fn build_token_request<'a>(
         config: Some(config),
         checkpoint_dir: args.checkpoint.as_deref(),
         checkpoint_index: args.tensor_index.as_deref(),
+        engram_tokenizer: args.engram_tokenizer.as_deref(),
         weights,
         prefill_limit: args.prefill_limit,
         native_rounding: args.native_rounding,

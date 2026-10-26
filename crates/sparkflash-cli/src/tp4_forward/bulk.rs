@@ -13,12 +13,15 @@ use super::rows::RowsState;
 use super::*;
 use sparkflash_kernels::cuda_driver::{HostMapped, Kernel, Module};
 use sparkflash_kernels::hostw_gemv_launch::Mode;
-use sparkflash_kernels::moe_routed_device::MoeBulk;
+use sparkflash_kernels::moe_routed_device::{BulkRows, MoeBulk};
 use sparkflash_kernels::mxfp8_gemv_launch::{OptArgs, OptKind, launch_opt};
 
-/// The indexer scores buffer, in floats: a chunk whose rows times compressed positions exceed it is
-/// scored and selected in row slices.
-const SCORE_FLOATS: usize = 32 << 20;
+/// The indexer scores buffer, in bf16 scores: a chunk whose rows times compressed positions exceed
+/// it is scored and selected in row slices.
+const SCORE_ENTRIES: usize = 64 << 20;
+/// opt_mma_index_scores' rows per block (one per warp) and 128-key tiles per block.
+const SCORE_ROWS: usize = 8;
+const SCORE_TILES: usize = 8;
 /// opt_select_rows' blocks.
 const SELECT_BLOCKS: usize = 96;
 /// opt_select_sm121.cu's FAST_MAX_POS: the most compressed positions the select serves.
@@ -28,8 +31,12 @@ pub(super) struct BulkKernels {
     _modules: Vec<Module>,
     pack: Kernel,
     scores: Kernel,
-    /// opt_mma_hostw_{bf16w, bf16w_f32o, f32w_f32o}, by hostw_gemv_launch::Mode.
+    /// opt_mma_hostw_{bf16w, bf16w_f32o, f32w_f32o}, by hostw_gemv_launch::Mode, and their
+    /// bf16-activation forms opt_mma_hostw_bf16a_*.
     hostw: [Kernel; 3],
+    hostw_bf16a: [Kernel; 3],
+    /// opt_mma_bf16a_f32o: a split chunk's shared expert gate/up from its gathered bf16 rows.
+    pub(super) bf16a_f32o: Kernel,
     router_dots: Kernel,
     router_topk: Kernel,
     /// opt_mma_fp8_rows_bf16o: the Engram wkv (row-major E4M3 weights).
@@ -41,6 +48,9 @@ pub(super) struct BulkKernels {
     pub(super) seam_partials: Kernel,
     pub(super) seam_tail: Kernel,
     pub(super) post_partials: Kernel,
+    /// opt_bulk_seam_derive: a split seam's codes and scales (and, given a buffer, f32 rows) from
+    /// its gathered bf16 rows.
+    pub(super) seam_derive: Kernel,
     /// opt_bulk_engram_{embed, post}: the Engram stage around the wkv over the chunk.
     engram_embed: Kernel,
     engram_post: Kernel,
@@ -48,6 +58,108 @@ pub(super) struct BulkKernels {
     pool_rows: Kernel,
     k_norm_rows: Kernel,
     rope: Kernel,
+}
+
+/// The routed-expert rows and scratch the interleaved bulk states share, so one pass over the
+/// expert weights serves all their chunks (DeviceLayer::rows_moe_merged): way i's FFN codes and
+/// scales, expert ids and routing weights are rows i * stride .. of one buffer each, and the
+/// grouping, SwiGLU codes and down partials (MoeBulk) span every way. The ways' MoE launches all
+/// run on the run's stream, so a way's own pass may use the scratch too.
+pub(super) struct MoeShare {
+    /// The rows a way holds (its rows state's row buffers).
+    pub(super) stride: usize,
+    pub(super) ways: usize,
+    /// Every way's rows from way 0's.
+    pub(super) rows: BulkRows,
+    sorted: Deviceptr,
+    items: Deviceptr,
+    items_count: Deviceptr,
+    codes: Deviceptr,
+    scales: Deviceptr,
+    slot: Deviceptr,
+    allocations: Vec<Deviceptr>,
+}
+
+/// A bulk state's place in a [MoeShare].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MoeWay {
+    pub(super) way: usize,
+    pub(super) stride: usize,
+    /// The share's rows from way 0's.
+    pub(super) base: BulkRows,
+}
+
+impl MoeShare {
+    /// Carves `ways` ways of `stride` rows for `device`'s geometry.
+    pub(super) fn open(
+        device: &DeviceLayer<'_>,
+        stride: usize,
+        ways: usize,
+    ) -> Result<Self, String> {
+        let cuda = device.cuda;
+        let dim = device.dim;
+        let top_k = device.routed_geometry.top_k;
+        let tokens = stride * ways;
+        let mut allocations = Vec::new();
+        let mut total = 0usize;
+        let mut alloc = |bytes: usize, zero: bool| -> Result<Deviceptr, String> {
+            let ptr = cuda.alloc(bytes.max(16), &mut total)?;
+            if zero {
+                cuda.copy_htod(&ptr, &vec![0u8; bytes.max(16)])?;
+            }
+            allocations.push(ptr);
+            Ok(ptr)
+        };
+        let rows = BulkRows {
+            act_codes: alloc(tokens * dim, true)?.0,
+            act_scales: alloc(tokens * dim / 32, true)?.0,
+            ids: alloc(tokens * top_k * 4, true)?.0,
+            weights: alloc(tokens * top_k * 4, true)?.0,
+        };
+        let [sorted, items, items_count, codes, scales, slot] = MoeBulk::buffer_bytes(tokens);
+        Ok(Self {
+            stride,
+            ways,
+            rows,
+            sorted: alloc(sorted, false)?,
+            items: alloc(items, false)?,
+            items_count: alloc(items_count, false)?,
+            codes: alloc(codes, false)?,
+            scales: alloc(scales, false)?,
+            slot: alloc(slot, false)?,
+            allocations,
+        })
+    }
+
+    /// Way `way`'s place, refused past the share.
+    pub(super) fn way(&self, way: usize) -> Result<MoeWay, String> {
+        if way >= self.ways {
+            return Err(format!("bulk share: way {way} of {}", self.ways));
+        }
+        Ok(MoeWay {
+            way,
+            stride: self.stride,
+            base: self.rows,
+        })
+    }
+
+    pub(super) fn release(self, cuda: &Cuda) {
+        let borrowed: Vec<&Deviceptr> = self.allocations.iter().collect();
+        cuda.free_buffers(&borrowed);
+    }
+}
+
+impl MoeWay {
+    /// The way's own rows of the share for `dim` wide rows and `top_k` experts a row.
+    pub(super) fn rows(&self, dim: usize, top_k: usize) -> BulkRows {
+        let first = self.way * self.stride;
+        BulkRows {
+            act_codes: self.base.act_codes + (first * dim) as u64,
+            act_scales: self.base.act_scales + (first * dim / 32) as u64,
+            ids: self.base.ids + (first * top_k * 4) as u64,
+            weights: self.base.weights + (first * top_k * 4) as u64,
+        }
+    }
 }
 
 /// The bulk chunk's kernels and its chunk-wide scratch (the row buffers are the [`RowsState`]'s,
@@ -67,10 +179,11 @@ pub(super) struct BulkState {
     /// The groups' index keys: f32, then normed and roped bf16.
     wk_f32: u64,
     wk_bf16: u64,
-    /// The rows' index queries as E2M1 codes (one per byte) and ue8m0 scales.
+    /// The rows' index queries as packed E2M1 codes (two per byte) and ue8m0 scales.
     q_codes: u64,
     q_scales: u64,
-    /// The owner's index keys as E2M1 codes and scales, `[max_positions][index_head_dim]`.
+    /// The owner's index keys as packed E2M1 codes in MMA fragment order (opt_bulk_fp4_pack) and
+    /// scales, `max_positions` keys.
     k_codes: u64,
     k_scales: u64,
     scores: u64,
@@ -82,6 +195,9 @@ pub(super) struct BulkState {
     pub(super) dots: u64,
     /// The chunk's DSpark taps, `[cap][3][dim]` f32 (the rows state's tap sink).
     pub(super) taps: u64,
+    /// A split chunk's last-row exchange (rows::DeviceLayer::sp_finish): per rank a slot of one
+    /// row's stream then its pre mix, f32.
+    pub(super) sp_last: u64,
     /// With Engram: the two pinned buffers a chunk's table reads land in (a chunk's reads run
     /// under the chunk before it), and the live flags `[slots][positions]` the post kernel reads
     /// through the mapping (host-written as each slot's layer is queued; by position, so a chunk
@@ -93,11 +209,12 @@ pub(super) struct BulkState {
 
 impl BulkState {
     /// Loads the bulk kernels (installing the tensor-core GEMMs `launch_opt` runs above 8 tokens)
-    /// and carves the chunk scratch for `cap` rows.
+    /// and carves the chunk scratch for `cap` rows (the routed experts' from `share` when given).
     pub(super) fn open(
         device: &DeviceLayer<'_>,
         kernel_dir: &Path,
         cap: usize,
+        share: Option<&MoeShare>,
     ) -> Result<Self, String> {
         let cuda = device.cuda;
         let mut modules = Vec::new();
@@ -131,6 +248,12 @@ impl BulkState {
                 load(&mma, "opt_mma_hostw_bf16w_f32o")?,
                 load(&mma, "opt_mma_hostw_f32w_f32o")?,
             ],
+            hostw_bf16a: [
+                load(&mma, "opt_mma_hostw_bf16a_bf16w")?,
+                load(&mma, "opt_mma_hostw_bf16a_bf16w_f32o")?,
+                load(&mma, "opt_mma_hostw_bf16a_f32w_f32o")?,
+            ],
+            bf16a_f32o: load(&mma, "opt_mma_bf16a_f32o")?,
             router_dots: load(&mma, "opt_mma_router_dots")?,
             router_topk: load(&mma, "opt_mma_router_topk")?,
             engram_wkv: load(&mma, "opt_mma_fp8_rows_bf16o")?,
@@ -138,9 +261,10 @@ impl BulkState {
             seam_partials: load(&rows_cubin, "opt_bulk_mhc_partials")?,
             seam_tail: load(&rows_cubin, "opt_bulk_mhc_tail")?,
             post_partials: load(&rows_cubin, "opt_bulk_mhc_post_partials")?,
+            seam_derive: load(&rows_cubin, "opt_bulk_seam_derive")?,
             engram_embed: load(&misc, "opt_bulk_engram_embed")?,
             engram_post: load(&misc, "opt_bulk_engram_post")?,
-            select_rows: load(&select, "opt_select_rows")?,
+            select_rows: load(&select, "opt_select_rows_bf16")?,
             pool_rows: load(&misc, "opt_pool_rows")?,
             k_norm_rows: load(&misc, "opt_k_norm_rows")?,
             rope: load(&misc, "opt_rope_heads_bf16")?,
@@ -156,19 +280,36 @@ impl BulkState {
             allocations.push(ptr);
             Ok(ptr.0)
         };
-        let [sorted, items, items_count, codes, scales, slot] = MoeBulk::buffer_bytes(cap);
-        let moe = MoeBulk {
-            plan: moe_kernels[0],
-            gate_up: moe_kernels[1],
-            down: moe_kernels[2],
-            combine: moe_kernels[3],
-            sorted: Deviceptr(alloc(sorted)?),
-            items: Deviceptr(alloc(items)?),
-            items_count: Deviceptr(alloc(items_count)?),
-            codes: Deviceptr(alloc(codes)?),
-            scales: Deviceptr(alloc(scales)?),
-            slot: Deviceptr(alloc(slot)?),
-            max_tokens: cap,
+        let moe = match share {
+            Some(share) => MoeBulk {
+                plan: moe_kernels[0],
+                gate_up: moe_kernels[1],
+                down: moe_kernels[2],
+                combine: moe_kernels[3],
+                sorted: share.sorted,
+                items: share.items,
+                items_count: share.items_count,
+                codes: share.codes,
+                scales: share.scales,
+                slot: share.slot,
+                max_tokens: share.stride * share.ways,
+            },
+            None => {
+                let [sorted, items, items_count, codes, scales, slot] = MoeBulk::buffer_bytes(cap);
+                MoeBulk {
+                    plan: moe_kernels[0],
+                    gate_up: moe_kernels[1],
+                    down: moe_kernels[2],
+                    combine: moe_kernels[3],
+                    sorted: Deviceptr(alloc(sorted)?),
+                    items: Deviceptr(alloc(items)?),
+                    items_count: Deviceptr(alloc(items_count)?),
+                    codes: Deviceptr(alloc(codes)?),
+                    scales: Deviceptr(alloc(scales)?),
+                    slot: Deviceptr(alloc(slot)?),
+                    max_tokens: cap,
+                }
+            }
         };
         let ring_rows = cap + 16;
         // A row reaches at most max_positions compressed positions (ratio 1).
@@ -205,11 +346,12 @@ impl BulkState {
             q_scales: alloc(cap * index_cols / 32)?,
             k_codes: alloc(device.max_positions * index_dim)?,
             k_scales: alloc(device.max_positions * index_dim / 32)?,
-            scores: alloc(SCORE_FLOATS * 4)?,
+            scores: alloc(SCORE_ENTRIES * 2)?,
             select_scratch: alloc(SELECT_BLOCKS * select_words * 4)?,
             select_words,
             dots: alloc(cap * device.routed_geometry.experts * 4)?,
             taps: alloc(cap * 3 * device.dim * 4)?,
+            sp_last: alloc(super::rows::GATHER_WORLD * (device.hc_mult + 1) * device.dim * 4)?,
             engram_staging,
             engram_live,
             allocations,
@@ -230,17 +372,64 @@ impl BulkState {
         }
     }
 
-    fn hostw_kernel(&self, mode: Mode) -> Kernel {
-        match mode {
-            Mode::Bf16Weight => self.k.hostw[0],
-            Mode::Bf16WeightF32Stores => self.k.hostw[1],
-            Mode::F32WeightF32Stores => self.k.hostw[2],
+    /// One of the bf16-body tensor-core GEMMs (opt_mma_sm121.cu's OptArgs list) over `args`:
+    /// 128 x 128 output tiles, the column tiles fastest (launch_opt's f32 / bf16 form).
+    pub(super) fn mma(&self, cuda: &Cuda, kernel: Kernel, args: &OptArgs) -> Result<(), String> {
+        cuda.launch(
+            kernel,
+            (
+                args.cols.div_ceil(128),
+                args.tokens.div_ceil(128),
+                args.groups,
+            ),
+            (256, 1, 1),
+            &[
+                args.a,
+                args.a_scales,
+                args.w,
+                args.ws,
+                args.out,
+                u64::from(args.cols),
+                u64::from(args.inner),
+                u64::from(args.tokens),
+                args.a_tok_stride,
+                args.out_tok_stride,
+                args.a_grp_stride,
+                args.w_grp_stride,
+                args.s_grp_stride,
+                args.out_grp_stride,
+                u64::from(args.k_stride_blocks),
+            ],
+        )
+    }
+
+    /// The hostw kernel of `mode` over f32 rows, or bf16 rows with `bf16a`.
+    fn hostw_kernel(&self, mode: Mode, bf16a: bool) -> Kernel {
+        let index = match mode {
+            Mode::Bf16Weight => 0,
+            Mode::Bf16WeightF32Stores => 1,
+            Mode::F32WeightF32Stores => 2,
+        };
+        if bf16a {
+            self.k.hostw_bf16a[index]
+        } else {
+            self.k.hostw[index]
         }
     }
 }
 
 impl DeviceLayer<'_> {
-    /// A host-weight projection of `tokens` f32 rows (`[tokens][inner]`) on the tensor cores.
+    /// The chunk's normed rows for the host-weight projections: a split chunk's gathered bf16 rows
+    /// (ffn_x until its FFN seam, [Self::sp_rows]), else the f32 rows; true for the bf16 form.
+    fn bulk_normed(&self, rows: &RowsState, n: usize) -> (u64, bool) {
+        match self.sp_rows(rows, n) {
+            Some(_) => (rows.b.ffn_x, true),
+            None => (rows.b.normed, false),
+        }
+    }
+
+    /// A host-weight projection of `tokens` f32 (or, by the kernel, bf16) rows (`[tokens][inner]`)
+    /// on the tensor cores.
     #[allow(clippy::too_many_arguments)]
     fn bulk_hostw(
         &self,
@@ -298,6 +487,7 @@ impl DeviceLayer<'_> {
                 u64::from(self.rope_head_dim),
                 heads as u64,
                 (pairs * step) as u64,
+                0,
             ],
         )
     }
@@ -355,7 +545,6 @@ impl DeviceLayer<'_> {
         let owner_base = owner * ring.rows * row_bytes;
         let ring_row = |position: usize| (owner_base + (position % ring.rows) * row_bytes) as u64;
         let cuda = self.cuda;
-        let b = rows.b;
         // Copies scratch rows [from, from + count) to or from the ring rows of positions
         // p0 - lead + from.., one contiguous run at a time.
         let ring_copy = |scratch: u64, ring_base: u64, from: usize, count: usize, to_ring: bool| {
@@ -376,11 +565,12 @@ impl DeviceLayer<'_> {
         if let Some((wgate, mode)) = staged.wgate {
             projections.push((wgate, mode, bulk.wgate, ring.wgate.0));
         }
+        let (normed, bf16a) = self.bulk_normed(rows, n);
         for &(weight, mode, scratch, ring_base) in &projections {
             ring_copy(scratch, ring_base, 0, lead, false)?;
             self.bulk_hostw(
-                bulk.hostw_kernel(mode),
-                b.normed,
+                bulk.hostw_kernel(mode, bf16a),
+                normed,
                 weight.0,
                 scratch + (lead * row_bytes) as u64,
                 hd,
@@ -470,10 +660,9 @@ impl DeviceLayer<'_> {
                 .seam_fp4_round_trip
                 .ok_or_else(|| refusal("no FP4 round trip"))?;
             let index_dim = self.index_head_dim;
-            to_f32(bulk.latent_normed, bulk.latent_f32)?;
             self.bulk_hostw(
-                bulk.k.hostw[1],
-                bulk.latent_f32,
+                bulk.hostw_kernel(Mode::Bf16WeightF32Stores, true),
+                bulk.latent_normed,
                 wk.0,
                 bulk.wk_f32,
                 index_dim,
@@ -570,9 +759,10 @@ impl DeviceLayer<'_> {
         let b = rows.b;
         let (heads, index_dim) = (self.index_n_heads, self.index_head_dim);
         let index_cols = heads * index_dim;
+        let (normed, bf16a) = self.bulk_normed(rows, n);
         self.bulk_hostw(
-            bulk.k.hostw[0],
-            b.normed,
+            bulk.hostw_kernel(Mode::Bf16Weight, bf16a),
+            normed,
             weights_proj.0,
             b.idx_weights_bf16,
             heads,
@@ -620,12 +810,12 @@ impl DeviceLayer<'_> {
             Deviceptr(b.idx_q_f32),
             (n * index_cols / 32) as u32,
         )?;
-        let pack = |src: u64, codes: u64, scales: u64, blocks: usize| {
+        let pack = |src: u64, codes: u64, scales: u64, blocks: usize, frag: u64| {
             cuda.launch(
                 bulk.k.pack,
                 ((blocks as u32).div_ceil(256), 1, 1),
                 (256, 1, 1),
-                &[src, codes, scales, blocks as u64],
+                &[src, codes, scales, blocks as u64, frag],
             )
         };
         pack(
@@ -633,12 +823,14 @@ impl DeviceLayer<'_> {
             bulk.q_codes,
             bulk.q_scales,
             n * index_cols / 32,
+            0,
         )?;
         pack(
             ring.index_keys.0 + (owner * self.max_positions * index_dim * 4) as u64,
             bulk.k_codes,
             bulk.k_scales,
             n_max * index_dim / 32,
+            1,
         )?;
         let mask_mode = match layer.cmp(&self.candidate_source_layer) {
             std::cmp::Ordering::Less => 0u64,
@@ -646,19 +838,24 @@ impl DeviceLayer<'_> {
             std::cmp::Ordering::Greater => 1,
         };
         let mask_bytes = rows.mask_bytes;
-        let stride = n_max.next_multiple_of(4);
-        let slice = ((SCORE_FLOATS / stride) / 4 * 4).max(4);
+        let stride = n_max.next_multiple_of(8);
+        let slice = ((SCORE_ENTRIES / stride) / SCORE_ROWS * SCORE_ROWS).max(SCORE_ROWS);
         let mut y0 = 0;
         while y0 < n {
             let m = slice.min(n - y0);
             let keys = (p0 + y0 + m) / ratio;
             if keys > 0 {
+                let masks = b.masks + (y0 * mask_bytes) as u64;
                 cuda.launch(
                     bulk.k.scores,
-                    ((keys as u32).div_ceil(128), (m as u32).div_ceil(4), 1),
+                    (
+                        m.div_ceil(SCORE_ROWS) as u32,
+                        keys.div_ceil(128 * SCORE_TILES) as u32,
+                        1,
+                    ),
                     (256, 1, 1),
                     &[
-                        bulk.q_codes + (y0 * index_cols) as u64,
+                        bulk.q_codes + (y0 * index_cols / 2) as u64,
                         bulk.q_scales + (y0 * index_cols / 32) as u64,
                         bulk.k_codes,
                         bulk.k_scales,
@@ -668,9 +865,11 @@ impl DeviceLayer<'_> {
                         (p0 + y0) as u64,
                         ratio as u64,
                         stride as u64,
+                        SCORE_TILES as u64,
+                        if mask_mode == 1 { masks } else { 0 },
+                        (mask_bytes / 4) as u64,
                     ],
                 )?;
-                let masks = b.masks + (y0 * mask_bytes) as u64;
                 cuda.launch(
                     bulk.k.select_rows,
                     (SELECT_BLOCKS as u32, 1, 1),
@@ -738,9 +937,9 @@ impl DeviceLayer<'_> {
         )
     }
 
-    /// The chunk's Engram stage at `slot`: the embed of every row's arena entry, the wkv, then the
-    /// gates and the stream write of the rows `live` marks (three launches for the chunk).
-    #[allow(clippy::too_many_arguments)]
+    /// The chunk's Engram stage at `slot` over its rows `first ..` (`live.len()` of them, all of
+    /// them but a split chunk's): the embed of every row's arena entry, the wkv, then the gates and
+    /// the stream write of the rows `live` marks (three launches).
     pub(super) fn bulk_engram(
         &self,
         rows: &RowsState,
@@ -748,8 +947,9 @@ impl DeviceLayer<'_> {
         slot: usize,
         live: &[bool],
         p0: usize,
-        n: usize,
+        first: usize,
     ) -> Result<(), String> {
+        let n = live.len();
         let engram = self
             .engram
             .as_ref()
@@ -758,11 +958,12 @@ impl DeviceLayer<'_> {
             .engram_live
             .as_ref()
             .ok_or("bulk engram: no live flags")?;
-        let at = slot * engram.positions + engram.base(p0);
-        if live.len() != n || at + n > mask.len() {
+        let at = slot * engram.positions + engram.base(p0) + first;
+        if at + n > mask.len() {
             return Err(format!(
-                "bulk engram: rows {p0}..{} are outside the flags",
-                p0 + n
+                "bulk engram: rows {}..{} are outside the flags",
+                p0 + first,
+                p0 + first + n
             ));
         }
         // SAFETY: inside the mapping (checked), and no queued launch reads these positions' flags.
@@ -802,7 +1003,7 @@ impl DeviceLayer<'_> {
             (n as u32, 1, 1),
             (256, 1, 1),
             &[
-                b.stream,
+                b.stream + (first * self.hc_mult * self.dim * 4) as u64,
                 b.engram_kv,
                 engram.product[slot].0,
                 mask.device().0 + at as u64,

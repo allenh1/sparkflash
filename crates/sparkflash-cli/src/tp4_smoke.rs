@@ -2253,7 +2253,7 @@ mod tests {
             "--tp-world-size",
             "2",
             "--comm-peers",
-            "192.0.2.80,192.0.2.88",
+            "198.51.100.80,198.51.100.88",
             "--comm-port",
             "29601",
             "--evidence-dir",
@@ -2261,8 +2261,8 @@ mod tests {
         ])
         .expect("parse");
         let addresses = args.addresses();
-        assert_eq!(addresses[0].to_string(), "192.0.2.80:29601");
-        assert_eq!(addresses[1].to_string(), "192.0.2.88:29602");
+        assert_eq!(addresses[0].to_string(), "198.51.100.80:29601");
+        assert_eq!(addresses[1].to_string(), "198.51.100.88:29602");
     }
 
     #[test]
@@ -2275,7 +2275,7 @@ mod tests {
             "--tp-world-size",
             "4",
             "--comm-peers",
-            "192.0.2.80,192.0.2.88",
+            "198.51.100.80,198.51.100.88",
             "--evidence-dir",
             "/tmp/e",
         ])

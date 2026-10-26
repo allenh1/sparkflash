@@ -50,7 +50,6 @@ SOURCE_MANIFESTS = [
     "crates/sparkflash-api/tests/router.rs",
     "crates/sparkflash-cli/src/serve.rs",
     "crates/sparkflash-cli/tests/serve_http.rs",
-    "docs/archive/build/serving-openai-parity-audit.md",
     "scripts/openai-surface-census.py",
 ]
 NON_CLAIMS = [

@@ -1,6 +1,6 @@
 # 06 — Vision: DeepSeek-ViT, the 3x3 aligner, and the image-token span protocol
 
-References: /home/user/dsv41-research/inference/vision.py (119 lines),
+References: <checkpoint>/inference/vision.py (119 lines),
 image_processor.py (173 lines), model.py:1224-1239 and 1253-1256.
 
 **Status (2026-10-18).** This document specifies the reference vision path. The vision forward (the

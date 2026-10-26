@@ -297,7 +297,7 @@ def self_test():
               stalled["pass"] and len(stalled["notes"]) == 4 and "worst step 2000.0 ms" in stalled["notes"][0])
         check("a replicate verdict says the clock protocol is not in the row",
               replicates([write_row(root, "r", steady), write_row(root, "s", steady)], 2.0)["notes"] == [CLOCK_NOTE])
-        timeout = "node3:123:456 [0] NCCL WARN NET/IB : Got completion with error 12, opcode 0"
+        timeout = "spark-2:123:456 [0] NCCL WARN NET/IB : Got completion with error 12, opcode 0"
         result = soak(write_row(root, "p", flat, fault=timeout), 1000, 1.10)
         check("an NCCL warning fails the soak", not result["pass"] and result["nccl_faults"] == 1)
         check("nearest-rank p99 of 1..100 is 99", percentile(list(range(1, 101)), 0.99) == 99)

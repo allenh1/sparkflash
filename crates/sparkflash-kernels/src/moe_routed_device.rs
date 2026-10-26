@@ -109,6 +109,10 @@ pub const ROUTED_MATRICES: usize = 3;
 /// layer has 384 resident experts.
 pub const MAX_ROUTED_ROWS: usize = 256;
 
+/// The routed rows the multi-row (dedup) kernels group in one plan (opt_moe_sm121.cu's
+/// OPT_MOE_PLAN_MAX): 16 verify rows of top-6 fit.
+const DEDUP_MAX_ROWS: usize = 128;
+
 /// One routed expert matrix, in the order the table and the bind use.
 ///
 /// The variant order is the table's matrix axis and the `[Gate, Up, Down]` order
@@ -1249,6 +1253,24 @@ pub struct MoeBulk {
     pub max_tokens: usize,
 }
 
+/// The most chunks one [MoeRoutedDevice::run_bulk_rows] pass groups (opt_mma_moe_plan's
+/// OMM_MAX_SEGS).
+pub const MAX_BULK_SEGMENTS: usize = 4;
+
+/// A bulk pass's token rows (device addresses): the FP8 activation codes `[tokens][5120]` and their
+/// scales `[tokens][160]`, the routed expert ids and routing weights `[tokens][top_k]`.
+#[derive(Clone, Copy, Debug)]
+pub struct BulkRows {
+    /// E4M3 activation codes.
+    pub act_codes: u64,
+    /// ue8m0 scales of `act_codes`, one per 32.
+    pub act_scales: u64,
+    /// u32 routed expert ids.
+    pub ids: u64,
+    /// f32 routing weights.
+    pub weights: u64,
+}
+
 impl MoeBulk {
     /// The work-item bound for `tokens`: one per expert plus one per 64 routed rows.
     #[must_use]
@@ -1463,7 +1485,10 @@ impl MoeRoutedDevice {
             u32::try_from(rows).map_err(|_| "moe_routed opt: rows overflow".to_owned())?;
         let tokens_u32 =
             u32::try_from(tokens).map_err(|_| "moe_routed opt: tokens overflow".to_owned())?;
-        if tokens > 1 && rows <= 64 && std::env::var("SPARKFLASH_MOE_DEDUP").as_deref() != Ok("0") {
+        if tokens > 1
+            && rows <= DEDUP_MAX_ROWS
+            && std::env::var("SPARKFLASH_MOE_DEDUP").as_deref() != Ok("0")
+        {
             return self.run_dedup(cuda, opt, (gate, up, down), tokens_u32, rows_u32, operands);
         }
         let gate_up_args = [
@@ -1578,9 +1603,59 @@ impl MoeRoutedDevice {
         tokens: usize,
         operands: &MoeRoutedOperands,
     ) -> Result<(), String> {
-        if tokens == 0 || tokens > bulk.max_tokens {
+        self.run_bulk_rows(
+            cuda,
+            bulk,
+            layer,
+            tokens,
+            &[tokens],
+            &BulkRows {
+                act_codes: operands.act_codes.device.0,
+                act_scales: operands.act_scales.device.0,
+                ids: operands.ids.device.0,
+                weights: operands.weights.device.0,
+            },
+        )?;
+        self.combine_bulk(
+            cuda,
+            bulk,
+            0,
+            tokens,
+            operands.ids.device.0,
+            operands.delta_f32.device.0,
+            operands.delta_bf16.device.0,
+        )
+    }
+
+    /// [Self::run_bulk]'s grouping, gate/up and down over several chunks' tokens at once, so each
+    /// expert's weights are read about once for all of them: chunk s is the first `counts[s]` of
+    /// the `stride` tokens from token s * stride of `rows` (the rows between are gaps no work item
+    /// reads), and its routed rows' down outputs land in the slot rows from s * stride * top-k.
+    /// Each row's values are the ones its chunk computes alone; [Self::combine_bulk] then sums each
+    /// chunk's tokens.
+    ///
+    /// # Errors
+    /// More than four chunks, tokens past the bulk buffers' capacity, and any driver launch error.
+    pub fn run_bulk_rows(
+        &self,
+        cuda: &Cuda,
+        bulk: &MoeBulk,
+        layer: usize,
+        stride: usize,
+        counts: &[usize],
+        rows: &BulkRows,
+    ) -> Result<(), String> {
+        let span = match counts {
+            [] => 0,
+            [.., last] => (counts.len() - 1) * stride + last,
+        };
+        if counts.len() > MAX_BULK_SEGMENTS
+            || span == 0
+            || span > bulk.max_tokens
+            || counts.iter().any(|&count| count > stride)
+        {
             return Err(format!(
-                "moe_routed bulk: {tokens} tokens outside the capacity of {}",
+                "moe_routed bulk: chunks of {counts:?} tokens {stride} apart outside the capacity of {}",
                 bulk.max_tokens
             ));
         }
@@ -1590,19 +1665,27 @@ impl MoeRoutedDevice {
                 .offset(self.plan.table_word_offset(layer, matrix) * 8)
                 .0
         };
-        let rows = (tokens * TOP_K) as u32;
-        let max_items = MoeBulk::max_items(tokens) as u32;
+        let routed = (span * TOP_K) as u32;
+        let max_items = MoeBulk::max_items(span) as u32;
+        // One chunk needs no segments; several are segments of `stride` tokens.
+        let segments = if counts.len() > 1 { stride as u64 } else { 0 };
+        let count = |s: usize| counts.get(s).map_or(0, |&count| count as u64);
         cuda.launch(
             bulk.plan,
             (1, 1, 1),
             (1024, 1, 1),
             &[
-                operands.ids.device.0,
-                u64::from(rows),
+                rows.ids,
+                u64::from(routed),
                 experts as u64,
                 bulk.sorted.0,
                 bulk.items.0,
                 bulk.items_count.0,
+                segments,
+                count(0),
+                count(1),
+                count(2),
+                count(3),
             ],
         )
         .map_err(|error| format!("moe_routed bulk: plan: {error}"))?;
@@ -1616,9 +1699,9 @@ impl MoeRoutedDevice {
                 bulk.sorted.0,
                 bulk.items.0,
                 bulk.items_count.0,
-                operands.weights.device.0,
-                operands.act_codes.device.0,
-                operands.act_scales.device.0,
+                rows.weights,
+                rows.act_codes,
+                rows.act_scales,
                 bulk.codes.0,
                 bulk.scales.0,
                 u64::from(self.plan.limit().to_bits()),
@@ -1639,16 +1722,40 @@ impl MoeRoutedDevice {
                 bulk.slot.0,
             ],
         )
-        .map_err(|error| format!("moe_routed bulk: down: {error}"))?;
+        .map_err(|error| format!("moe_routed bulk: down: {error}"))
+    }
+
+    /// [Self::run_bulk]'s per-token combine for one chunk of [Self::run_bulk_rows]: its `tokens`
+    /// tokens from token `first` of the pass (`ids` is the chunk's own routing), adding the addend.
+    ///
+    /// # Errors
+    /// Tokens past the bulk buffers' capacity, and any driver launch error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn combine_bulk(
+        &self,
+        cuda: &Cuda,
+        bulk: &MoeBulk,
+        first: usize,
+        tokens: usize,
+        ids: u64,
+        delta_f32: u64,
+        delta_bf16: u64,
+    ) -> Result<(), String> {
+        if tokens == 0 || first + tokens > bulk.max_tokens {
+            return Err(format!(
+                "moe_routed bulk: combine of {tokens} tokens from {first} outside the capacity of {}",
+                bulk.max_tokens
+            ));
+        }
         cuda.launch(
             bulk.combine,
             ((HIDDEN / 256) as u32, tokens as u32, 1),
             (256, 1, 1),
             &[
-                operands.ids.device.0,
-                bulk.slot.0,
-                operands.delta_f32.device.0,
-                operands.delta_bf16.device.0,
+                ids,
+                bulk.slot.0 + (first * TOP_K * HIDDEN * 2) as u64,
+                delta_f32,
+                delta_bf16,
                 tokens as u64,
                 self.addend.get(),
             ],

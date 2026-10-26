@@ -192,7 +192,8 @@ def base_text():
     )
     if result.returncode != 0:
         sys.exit("error: cannot read " + BASE_PATH + " at " + BASE_COMMIT + ": " + result.stderr.strip())
-    return result.stdout
+    # Two comments have since had the build machine's home directory replaced with /home/user.
+    return re.sub(r"/home/[^/\s]+/wt/", "/home/user/wt/", result.stdout)
 
 
 def slice_base(base):

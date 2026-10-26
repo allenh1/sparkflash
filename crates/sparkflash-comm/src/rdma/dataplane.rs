@@ -1136,8 +1136,8 @@ mod tests {
         let mut raw = [0u8; 16];
         raw[10] = 0xff;
         raw[11] = 0xff;
-        raw[12] = 192;
-        raw[13] = 168;
+        raw[12] = 10;
+        raw[13] = 0;
         raw[14] = 1;
         raw[15] = octet;
         IbvGid { raw }
@@ -1361,7 +1361,7 @@ mod tests {
         );
 
         let peer_gid = gid(84);
-        assert_eq!(peer_gid.kind(), GidKind::RoceV2Ipv4([192, 168, 1, 84]));
+        assert_eq!(peer_gid.kind(), GidKind::RoceV2Ipv4([10, 0, 1, 84]));
         let (attr, mask) = rtr_attr(1, 0x1234, peer_gid, 3, mtu::MTU_1024);
         assert_eq!(attr.qp_state, qp_state::RTR);
         assert_eq!(attr.dest_qp_num, 0x1234);

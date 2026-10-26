@@ -1,8 +1,0 @@
-device 0: NVIDIA GB10 of 1 (total 124608 MiB, MemAvailable 119280 MiB)
-device 0: NVIDIA GB10 of 1 (total 124608 MiB, MemAvailable 43393 MiB)
-device 0: NVIDIA GB10 of 1 (total 124608 MiB, MemAvailable 41502 MiB)
-forward reduce: requested="" path=tcp (reference exchange)
-device 0: NVIDIA GB10 of 1 (total 124608 MiB, MemAvailable 41494 MiB)
-forward loop: launch path async (kernels run ahead of the host), evidence chain off
-forward reduce: requested="" path=tcp (reference exchange) path=tcp roce_calls=0 tcp_calls=0
-tp4-chain: forward refused on rank 0: layer 0 position 0: layer device stage attention_body: kernel csa2_sequence_attn is not landed on this branch; contract: (const void* q_bf16, const void* staged, int position, void* attn_bf16, int heads, int head_dim); this stage also still needs: the launch exists (flash_mla_csa2_seq_sm121) and the query row is already device-resident (query_path writes workspace.q); what blocks the body is its operand set: the per-head sink and the indexer spans (index_key, index_query, block_scores, block_best) have no device spans on this arm - the plan classifies them host-seam and the layer slab does not carry them - so one run allocation plus the launch call is the work

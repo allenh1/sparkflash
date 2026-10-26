@@ -953,17 +953,17 @@ mod tests {
         assert_eq!(zero.kind(), GidKind::Unspecified);
         assert!(zero.describe().contains("unspecified"));
 
-        // ::ffff:192.0.2.80
+        // ::ffff:198.51.100.80
         let mut ipv4 = [0u8; 16];
         ipv4[10] = 0xff;
         ipv4[11] = 0xff;
-        ipv4[12] = 192;
-        ipv4[13] = 168;
+        ipv4[12] = 10;
+        ipv4[13] = 0;
         ipv4[14] = 1;
         ipv4[15] = 80;
         let gid = IbvGid { raw: ipv4 };
-        assert_eq!(gid.kind(), GidKind::RoceV2Ipv4([192, 168, 1, 80]));
-        assert_eq!(gid.describe(), "RoCEv2 IPv4 192.0.2.80");
+        assert_eq!(gid.kind(), GidKind::RoceV2Ipv4([10, 0, 1, 80]));
+        assert_eq!(gid.describe(), "RoCEv2 IPv4 198.51.100.80");
 
         // fe80::1: an IPv6 link-local GID.
         let mut ipv6 = [0u8; 16];

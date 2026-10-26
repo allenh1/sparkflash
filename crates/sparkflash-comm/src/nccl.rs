@@ -570,6 +570,28 @@ type CommRegisterFn =
     unsafe extern "C" fn(NcclCommHandle, *mut c_void, usize, *mut *mut c_void) -> c_int;
 /// `ncclCommDeregister(const ncclComm_t, void *handle) -> ncclResult_t`.
 type CommDeregisterFn = unsafe extern "C" fn(NcclCommHandle, *mut c_void) -> c_int;
+/// `ncclCommSplit(ncclComm_t, int color, int key, ncclComm_t *newcomm, ncclConfig_t *) -> ncclResult_t`.
+type CommSplitFn =
+    unsafe extern "C" fn(NcclCommHandle, c_int, c_int, *mut NcclCommHandle, *mut c_void) -> c_int;
+
+/// `ncclConfig_t` as NCCL 2.17 laid it out: the fields through `netName`. The struct is versioned
+/// (`size`, `magic`, `version`) and every later release copies only `size` bytes of it and gives
+/// the fields past them their defaults, so this prefix is the supported way to set `maxCTAs`
+/// without mirroring the current, longer layout.
+#[repr(C)]
+struct NcclConfigV217 {
+    size: usize,
+    magic: u32,
+    version: u32,
+    blocking: c_int,
+    cga_cluster_size: c_int,
+    min_ctas: c_int,
+    max_ctas: c_int,
+    net_name: *const c_char,
+}
+
+/// `NCCL_CONFIG_UNDEF_INT`: the field keeps NCCL's default (its environment variable, if set).
+const NCCL_CONFIG_UNDEF_INT: c_int = c_int::MIN;
 
 struct RawApi {
     get_version: *mut c_void,
@@ -588,6 +610,10 @@ struct RawApi {
     /// Optional point-to-point entry points (the one-shot exchange).
     send: Option<*mut c_void>,
     recv: Option<*mut c_void>,
+    /// Optional: `ncclCommSplit` (NCCL 2.18+), for a child communicator with its own CTA cap.
+    comm_split: Option<*mut c_void>,
+    /// Optional: `ncclReduceScatter`, for the bulk prefill's sequence-parallel seams.
+    reduce_scatter: Option<*mut c_void>,
 }
 
 /// A loaded NCCL library plus its resolved entry points.
@@ -655,6 +681,8 @@ impl NcclApi {
             comm_get_async_error: loader.symbol(ASYNC_ERROR_SYMBOL),
             send: loader.symbol("ncclSend"),
             recv: loader.symbol("ncclRecv"),
+            comm_split: loader.symbol("ncclCommSplit"),
+            reduce_scatter: loader.symbol("ncclReduceScatter"),
         };
         Ok(Self {
             loader,
@@ -864,6 +892,67 @@ impl NcclApi {
         Ok(handle)
     }
 
+    /// A child of `parent` over the same ranks (one color, keyed by `rank`) whose collectives run
+    /// on at most `max_ctas` CTAs. Collective over `parent`: every rank calls it at the same point
+    /// of its collective sequence. The child has its own channels and buffers (no resource
+    /// sharing), so its collectives can run beside the parent's.
+    ///
+    /// # Errors
+    /// NcclError::Config for a zero cap, NcclError::MissingSymbol when the library has no
+    /// `ncclCommSplit`, and NcclError::Call when NCCL refuses the split.
+    pub(crate) fn comm_split_handle(
+        &self,
+        parent: NcclCommHandle,
+        rank: usize,
+        max_ctas: u32,
+    ) -> Result<NcclCommHandle, NcclError> {
+        let split = self
+            .raw
+            .comm_split
+            .ok_or_else(|| NcclError::MissingSymbol {
+                library: self.loader.library_name().to_owned(),
+                symbol: "ncclCommSplit",
+            })?;
+        let cap = c_int::try_from(max_ctas)
+            .ok()
+            .filter(|&cap| cap > 0)
+            .ok_or_else(|| NcclError::Config(format!("a CTA cap of {max_ctas} is not usable")))?;
+        let key = c_int::try_from(rank)
+            .map_err(|_| NcclError::Config(format!("rank {rank} does not fit in an int")))?;
+        let mut config = NcclConfigV217 {
+            size: std::mem::size_of::<NcclConfigV217>(),
+            magic: 0xcafe_beef,
+            version: 21_700,
+            blocking: NCCL_CONFIG_UNDEF_INT,
+            cga_cluster_size: NCCL_CONFIG_UNDEF_INT,
+            min_ctas: NCCL_CONFIG_UNDEF_INT,
+            max_ctas: cap,
+            net_name: ptr::null(),
+        };
+        let mut handle: NcclCommHandle = ptr::null_mut();
+        // SAFETY: the symbol resolved as ncclCommSplit; parent is a live communicator, handle a
+        // valid out-parameter and config a 2.17-versioned ncclConfig_t that outlives the call.
+        let result = unsafe {
+            let function: CommSplitFn = std::mem::transmute(split);
+            function(
+                parent,
+                0,
+                key,
+                &mut handle,
+                (&raw mut config).cast::<c_void>(),
+            )
+        };
+        if result != NCCL_SUCCESS {
+            return Err(self.call_error("ncclCommSplit", result));
+        }
+        if handle.is_null() {
+            return Err(NcclError::Config(
+                "ncclCommSplit returned no communicator for this rank".to_owned(),
+            ));
+        }
+        Ok(handle)
+    }
+
     /// Destroys a raw communicator handle created by Self::comm_init_rank_handle.
     ///
     /// A null handle is a no-op, so a teardown path can call this unconditionally.
@@ -996,6 +1085,53 @@ impl NcclApi {
             Ok(())
         } else {
             Err(self.call_error("ncclAllReduce", result))
+        }
+    }
+
+    /// Enqueues one bf16 ReduceScatter(Sum) on a raw communicator handle: rank r's `recv` gets the
+    /// sum over the ranks of their `send` values `r * recv_count ..` (`ncclReduceScatter`'s
+    /// signature is AllReduce's, with the per-rank count).
+    ///
+    /// # Safety
+    /// The handle must be live; send must point to at least recv_count * world bf16 values and recv
+    /// to recv_count writable ones, in NCCL-accessible memory; stream must be a valid CUDA stream on
+    /// that device or NULL.
+    ///
+    /// # Errors
+    /// NcclError::MissingSymbol when the library lacks ncclReduceScatter, NcclError::Call when NCCL
+    /// refuses the enqueue.
+    pub(crate) unsafe fn enqueue_reduce_scatter_bf16(
+        &self,
+        handle: NcclCommHandle,
+        send: *const c_void,
+        recv: *mut c_void,
+        recv_count: usize,
+        stream: CudaStream,
+    ) -> Result<(), NcclError> {
+        let entry = self
+            .raw
+            .reduce_scatter
+            .ok_or_else(|| NcclError::MissingSymbol {
+                library: self.loader.library_name().to_owned(),
+                symbol: "ncclReduceScatter",
+            })?;
+        // SAFETY: the caller upholds the handle, pointer and stream contract documented above.
+        let result = unsafe {
+            let function: AllReduceFn = std::mem::transmute(entry);
+            function(
+                send,
+                recv,
+                recv_count,
+                NcclDataType::Bfloat16 as c_int,
+                NcclRedOp::Sum as c_int,
+                handle,
+                stream,
+            )
+        };
+        if result == NCCL_SUCCESS {
+            Ok(())
+        } else {
+            Err(self.call_error("ncclReduceScatter", result))
         }
     }
 

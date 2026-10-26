@@ -1,14 +1,18 @@
 # 00 — Overview: Hyperparameters, Parameter Arithmetic, Checkpoint Tensor Map
 
+"The spec" in these documents is the project's initial design specification, written before the
+checkpoint was studied; the "Spec deltas" sections record where it was wrong. It was removed before
+release and remains in the git history.
+
 Sources of truth used in this document (nothing here is inferred from the spec):
 
-- /home/user/dsv41-research/config.json — released HF config (the **real** hyperparameters).
-- /home/user/dsv41-research/inference/config.json — the runtime config that generate.py feeds
+- <checkpoint>/config.json — released HF config (the **real** hyperparameters).
+- <checkpoint>/inference/config.json — the runtime config that generate.py feeds
   straight into ModelArgs(**json.load(...)) (inference/generate.py:121-123).
-- /home/user/dsv41-research/inference/model.py — reference forward implementation.
-- /home/user/dsv41-research/model.safetensors.index.json — 96,085 tensor names in 48 shards,
+- <checkpoint>/inference/model.py — reference forward implementation.
+- <checkpoint>/model.safetensors.index.json — 96,085 tensor names in 48 shards,
   metadata.total_size = 510286023000.
-- /home/user/dsv41-research/tech_report.txt — the 51-page report (cited as tech_report.txt p.N).
+- <checkpoint>/tech_report.txt — the 51-page report (cited as tech_report.txt p.N).
 
 ---
 

@@ -19,10 +19,30 @@
 use super::*;
 use crate::layer_device::DeviceSpan;
 use sparkflash_kernels::cuda_driver::{Kernel, Module};
-use sparkflash_kernels::mxfp8_gemv_launch::{OptArgs, OptKind, launch_opt};
+use sparkflash_kernels::mxfp8_gemv_launch::{OptArgs, OptKind, launch_opt, launch_opt_split};
 
-/// The widest verify step: the t8 GEMV, the router and the head kernels hold eight rows.
-pub(super) const R_MAX: usize = 8;
+/// The widest verify step. The t8 GEMV takes the rows eight to a block, the router and the Engram
+/// wkv eight to a weight pass, and the head all sixteen in one launch ([HEAD_ROWS]); every row's
+/// arithmetic is the single-row kernel's.
+pub(super) const R_MAX: usize = 16;
+
+/// The rows one opt_rows_lm_head launch serves (its OR_LM_MAXR).
+const HEAD_ROWS: usize = 16;
+
+/// [launch_opt] with up to `gemv_rows` tokens kept on the t8 GEMV (each token's bits the
+/// single-row kernel's); more are a bulk chunk, for the tensor-core GEMMs.
+pub(super) fn launch_opt_rows(
+    cuda: &Cuda,
+    kind: OptKind,
+    args: &OptArgs,
+    gemv_rows: usize,
+) -> Result<(), String> {
+    if args.tokens as usize <= gemv_rows {
+        launch_opt_split(cuda, kind, args)
+    } else {
+        launch_opt(cuda, kind, args)
+    }
+}
 
 /// The mix table's coefficient rows (pre 4, post 4, comb 16).
 const MIX_ROWS: usize = 24;
@@ -32,10 +52,25 @@ const SEAM_PARTIAL_FLOATS: usize = 80 * 32;
 const ROWS_GATHER_SEQ: u64 = u64::MAX - 0xC_0000;
 /// The most ranks the device gathers carve a slot for.
 pub(super) const GATHER_WORLD: usize = 8;
+/// The DSpark tap slots a row's tap buffer holds (`[rows][SP_TAPS][dim]` f32).
+const SP_TAPS: usize = 3;
+
+/// A split bulk chunk's rows on this rank ([DeviceLayer::sp_rows]): it posts and seams rows
+/// `first .. first + count`, block `rank` of the chunk padded to `world * part` rows.
+#[derive(Clone, Copy)]
+pub(super) struct SpRows {
+    pub(super) first: usize,
+    pub(super) count: usize,
+    pub(super) part: usize,
+}
 
 pub(super) struct RowsKernels {
     _modules: Vec<Module>,
     pub(super) seam: Kernel,
+    /// opt_rows_mhc_partials_rb{1, 2, 4} and opt_rows_mhc_tail: opt_rows_mhc_seam in two launches,
+    /// bit-identical to it, the partials sharing each fn_w read across 1, 2 or 4 rows and every
+    /// row's tail on its own 1024-thread block (None under SPARKFLASH_SEAM_SPLIT=0).
+    seam_split: Option<([Kernel; 3], Kernel)>,
     pub(super) post: Kernel,
     pub(super) kv: Kernel,
     attn: Kernel,
@@ -50,11 +85,13 @@ pub(super) struct RowsKernels {
     pub(super) store: Kernel,
     /// opt_rows_topc: a row's slice statistics for the truncated sampler.
     topc: Kernel,
-    /// opt_rows_embed_own and opt_rows_embed_stream: the rows' embedding streams from device ids.
-    embed_own: Kernel,
+    /// opt_rows_embed_own and opt_rows_embed_stream: the rows' embedding streams from device ids;
+    /// opt_rows_embed_table: the same from the whole table on this rank.
+    pub(super) embed_own: Kernel,
     embed_stream: Kernel,
+    embed_table: Kernel,
     engram_wkv: Kernel,
-    rank_permute: Kernel,
+    pub(super) rank_permute: Kernel,
     /// opt_rows_hostw_{bf16w, bf16w_f32o, f32w_f32o}, by hostw_gemv_launch::Mode.
     hostw: [Kernel; 3],
     prefetch_l2: Kernel,
@@ -62,6 +99,8 @@ pub(super) struct RowsKernels {
     /// shared-expert SwiGLU with the PDL entry ([RowsState::quantise_bf16], [RowsState::swiglu]).
     prologue: Kernel,
     swiglu: Kernel,
+    /// opt_rows_hc_pre_collapse: hc_pre_collapse_bf16 over a grid of rows in one launch.
+    pub(super) hc_collapse: Kernel,
 }
 
 /// The per-row device buffers, each `[R_MAX][natural width]`.
@@ -134,12 +173,15 @@ pub(super) struct RowsBuffers {
     pub(super) lm_picks: u64,
     /// `[R_MAX]` u32: a prompt chunk's token ids, for the device embedding gather.
     pub(super) row_ids: u64,
+    /// `[R_MAX][2]` u64: a step over several lanes' rows, row r's lane offset and position
+    /// ([DeviceLayer::upload_row_table]).
+    row_tab: u64,
     /// The head's raw logits `[R_MAX][vocab slice]` f32, for the truncated sampler.
     logits: u64,
     /// `[GATHER_WORLD][R_MAX][TOPC_WORDS]` u32: each rank's opt_rows_topc slots, exchanged in place.
     topc_gather: u64,
     /// `[GATHER_WORLD][R_MAX][dim]` bf16: each rank's owned embedding rows, exchanged in place.
-    embed_gather: u64,
+    pub(super) embed_gather: u64,
 }
 
 /// The run-scope state of the multi-row step: its kernels and row buffers.
@@ -160,6 +202,8 @@ pub(super) struct RowsState {
     /// A bulk chunk's FFN post of this layer, left for the next layer's attention seam to fuse
     /// (opt_bulk_mhc_post_partials): the stream rows of the chunk are stale until it runs.
     post_pending: Cell<Option<usize>>,
+    /// The segments whose row table `b.row_tab` holds (empty: none).
+    row_tab_for: std::cell::RefCell<Vec<super::lanes::Seg>>,
     /// The DSpark tap capture (spec mode): opt_draft_taps, the `[R_MAX][3][dim]` f32 tap buffer,
     /// and the target layers in tap order. Before each target layer the rows' streams are
     /// hc-averaged into their tap slot.
@@ -170,12 +214,42 @@ pub(super) struct RowsState {
     pub(super) cap: usize,
     /// The bulk prefill's kernels and chunk scratch (a state opened above R_MAX rows).
     pub(super) bulk: Option<super::bulk::BulkState>,
+    /// Paired bulk chunks (DeviceLayer::prefill_layers_paired): this chunk's all-reduces run on
+    /// the device's collective stream and mark `ar_done`, and the run's stream waits on it only at
+    /// the result's first reader (`ar_pending`), so the other chunk's launches queued between run
+    /// under the collective. `post_after_ar`: the FFN post the last all-reduce feeds when no seam
+    /// fuses it, left for after that wait.
+    pub(super) overlap: Cell<bool>,
+    ar_done: Option<sparkflash_kernels::cuda_driver::StreamEvent>,
+    ar_pending: Cell<bool>,
+    post_after_ar: Cell<bool>,
+    /// A bulk state's place in the routed-expert rows the interleaved states share (None: its own).
+    pub(super) moe_way: Option<super::bulk::MoeWay>,
     /// The head's per-row noise when one step's rows sample under several requests' samplers:
     /// `[R_MAX][4]` u32 for opt_rows_lm_head, then `[R_MAX][4]` for opt_rows_topc.
     pub(super) head_params: sparkflash_kernels::cuda_driver::HostMapped,
 }
 
 impl RowsState {
+    /// opt_rows_hc_pre_collapse of `groups` x `k` rows: output row g k + r from row g stride + r of
+    /// pre_mix and stream, into `out` (bf16), zeroing *certified_count.
+    pub(super) fn hc_collapse(
+        &self,
+        cuda: &Cuda,
+        pre_mix: u64,
+        stream: u64,
+        out: u64,
+        certified_count: u64,
+        (groups, k, stride): (usize, usize, usize),
+    ) -> Result<(), String> {
+        cuda.launch(
+            self.kernels.hc_collapse,
+            (5120 / 256, k as u32, groups as u32),
+            (256, 1, 1),
+            &[pre_mix, stream, out, certified_count, stride as u64],
+        )
+    }
+
     /// Loads opt_rows_sm121.cubin and carves the row buffers for `device`'s geometry.
     ///
     /// # Errors
@@ -191,6 +265,17 @@ impl RowsState {
         device: &DeviceLayer<'_>,
         kernel_dir: &Path,
         cap: usize,
+    ) -> Result<Self, String> {
+        Self::open_shared(device, kernel_dir, cap, None)
+    }
+
+    /// [Self::open_with] for a bulk state that is way `way` of `share`: its routed-expert rows and
+    /// scratch are the share's.
+    pub(super) fn open_shared(
+        device: &DeviceLayer<'_>,
+        kernel_dir: &Path,
+        cap: usize,
+        share: Option<(&super::bulk::MoeShare, usize)>,
     ) -> Result<Self, String> {
         let refuse = |what: &str| Err(format!("rows: {what}"));
         if device.dim != 5120 || device.hc_mult != 4 {
@@ -218,6 +303,18 @@ impl RowsState {
             Ok(kernel)
         };
         let seam = load("opt_rows_mhc_seam")?;
+        let seam_split = if std::env::var("SPARKFLASH_SEAM_SPLIT").as_deref() == Ok("0") {
+            None
+        } else {
+            Some((
+                [
+                    load("opt_rows_mhc_partials_rb1")?,
+                    load("opt_rows_mhc_partials_rb2")?,
+                    load("opt_rows_mhc_partials_rb4")?,
+                ],
+                load("opt_rows_mhc_tail")?,
+            ))
+        };
         let post = load("opt_rows_mhc_post")?;
         let kv = load("opt_rows_kv")?;
         let attn = load("opt_rows_attn")?;
@@ -238,6 +335,7 @@ impl RowsState {
         let topc = load("opt_rows_topc")?;
         let embed_own = load("opt_rows_embed_own")?;
         let embed_stream = load("opt_rows_embed_stream")?;
+        let embed_table = load("opt_rows_embed_table")?;
         let engram_wkv = load("opt_rows_engram_wkv")?;
         let rank_permute = load("opt_rows_rank_permute")?;
         let hostw = [
@@ -248,9 +346,11 @@ impl RowsState {
         let prefetch_l2 = load("opt_rows_prefetch_l2")?;
         let prologue = load("opt_rows_prologue_bf16")?;
         let swiglu = load("opt_rows_shared_swiglu")?;
+        let hc_collapse = load("opt_rows_hc_pre_collapse")?;
         let kernels = RowsKernels {
             _modules: modules,
             seam,
+            seam_split,
             post,
             kv,
             attn,
@@ -263,12 +363,14 @@ impl RowsState {
             topc,
             embed_own,
             embed_stream,
+            embed_table,
             engram_wkv,
             rank_permute,
             hostw,
             prefetch_l2,
             prologue,
             swiglu,
+            hc_collapse,
         };
 
         let dim = device.dim;
@@ -293,6 +395,17 @@ impl RowsState {
         let index_heads = device.index_n_heads;
         let index_cols = index_heads * device.index_head_dim;
         let r = cap.max(R_MAX);
+        // The drafter runs several sequences' blocks through the row buffers at once: they hold
+        // that many rows even where a step holds R_MAX.
+        let d = r.max(super::draft::DRAFT_ROWS);
+        let moe_way = match share {
+            Some((share, _)) if share.stride != d || r <= R_MAX => {
+                return refuse("a bulk share's ways hold the rows of a bulk state");
+            }
+            Some((share, way)) => Some(share.way(way)?),
+            None => None,
+        };
+        let shared = moe_way.map(|way| way.rows(dim, top_k));
         let mut allocations = Vec::new();
         let mut total = 0usize;
         let mut alloc = |bytes: usize| -> Result<u64, String> {
@@ -302,48 +415,60 @@ impl RowsState {
             Ok(ptr.0)
         };
         let b = RowsBuffers {
-            stream: alloc(r * hc_width * 4)?,
-            hc_rows: alloc(r * hc_width * 4)?,
-            normed: alloc(r * dim * 4)?,
-            pre_mix: alloc(r * device.hc_mult * 4)?,
-            attn_mix: alloc(r * MIX_ROWS * 4)?,
-            ffn_mix: alloc(r * MIX_ROWS * 4)?,
-            act_codes: alloc(r * dim)?,
-            act_scales: alloc(r * dim / 32)?,
-            q_lora: alloc(r * lora_cols * 2)?,
-            q_normed: alloc(r * lora_cols * 2)?,
-            q_codes: alloc(r * lora_cols)?,
-            q_scales: alloc(r * lora_cols / 32)?,
-            q: alloc(r * q_cols * 2)?,
-            kv_latent: alloc(r * kv_cols * 2)?,
-            kv_rotated: alloc(r * kv_cols * 2)?,
-            attn_body: alloc(r * q_cols * 2)?,
-            attn_lo: alloc(r * lo_cols * 2)?,
-            o_codes: alloc(r * lo_cols)?,
-            o_scales: alloc(r * lo_cols / 32)?,
-            attn_out: alloc(r * dim * 2)?,
-            reduced: alloc(r * dim * 2)?,
-            seam_row: alloc(r * dim * 4)?,
-            ffn_codes: alloc(r * dim)?,
-            ffn_scales: alloc(r * dim / 32)?,
-            ffn_x: alloc(r * dim * 2)?,
-            moe_ids: alloc(r * top_k * 4)?,
-            moe_weights: alloc(r * top_k * 4)?,
-            scores: alloc(r * experts * 4)?,
-            delta_f32: alloc(r * dim * 4)?,
-            delta_bf16: alloc(r * dim * 2)?,
-            moe_reduced: alloc(r * dim * 2)?,
-            shared_gate: alloc(2 * r * shared_local * 4)?,
-            shared_swiglu: alloc(r * shared_local * 4)?,
-            shared_out: alloc(r * dim * 4)?,
+            stream: alloc(d * hc_width * 4)?,
+            hc_rows: alloc(d * hc_width * 4)?,
+            normed: alloc(d * dim * 4)?,
+            pre_mix: alloc(d * device.hc_mult * 4)?,
+            attn_mix: alloc(d * MIX_ROWS * 4)?,
+            ffn_mix: alloc(d * MIX_ROWS * 4)?,
+            act_codes: alloc(d * dim)?,
+            act_scales: alloc(d * dim / 32)?,
+            q_lora: alloc(d * lora_cols * 2)?,
+            q_normed: alloc(d * lora_cols * 2)?,
+            q_codes: alloc(d * lora_cols)?,
+            q_scales: alloc(d * lora_cols / 32)?,
+            q: alloc(d * q_cols * 2)?,
+            kv_latent: alloc(d * kv_cols * 2)?,
+            kv_rotated: alloc(d * kv_cols * 2)?,
+            attn_body: alloc(d * q_cols * 2)?,
+            attn_lo: alloc(d * lo_cols * 2)?,
+            o_codes: alloc(d * lo_cols)?,
+            o_scales: alloc(d * lo_cols / 32)?,
+            attn_out: alloc(d * dim * 2)?,
+            reduced: alloc(d * dim * 2)?,
+            seam_row: alloc(d * dim * 4)?,
+            ffn_codes: match shared {
+                Some(rows) => rows.act_codes,
+                None => alloc(d * dim)?,
+            },
+            ffn_scales: match shared {
+                Some(rows) => rows.act_scales,
+                None => alloc(d * dim / 32)?,
+            },
+            ffn_x: alloc(d * dim * 2)?,
+            moe_ids: match shared {
+                Some(rows) => rows.ids,
+                None => alloc(d * top_k * 4)?,
+            },
+            moe_weights: match shared {
+                Some(rows) => rows.weights,
+                None => alloc(d * top_k * 4)?,
+            },
+            scores: alloc(d * experts * 4)?,
+            delta_f32: alloc(d * dim * 4)?,
+            delta_bf16: alloc(d * dim * 2)?,
+            moe_reduced: alloc(d * dim * 2)?,
+            shared_gate: alloc(2 * d * shared_local * 4)?,
+            shared_swiglu: alloc(d * shared_local * 4)?,
+            shared_out: alloc(d * dim * 4)?,
             selected: alloc(r * SELECTED_STRIDE * 4)?,
             attn_scores: alloc(R_MAX * ATTN_HEADS * ATTN_MAX_ATTENDED * 4)?,
             attn_probs: alloc(R_MAX * ATTN_MAX_ATTENDED * ATTN_HEADS * 4)?,
             attn_ssum: alloc(R_MAX * ATTN_HEADS * 4)?,
             masks: alloc(r * mask_bytes)?,
-            seam_partials: alloc(r * SEAM_PARTIAL_FLOATS * 4)?,
-            seam_row_buf: alloc(r * dim * 4)?,
-            seam_tickets: alloc(r * 4)?,
+            seam_partials: alloc(d * SEAM_PARTIAL_FLOATS * 4)?,
+            seam_row_buf: alloc(d * dim * 4)?,
+            seam_tickets: alloc(d * 4)?,
             engram_codes: alloc(r * engram_inner)?,
             engram_scales: alloc(r * engram_inner / 32)?,
             engram_kv: alloc(r * engram_out * 2)?,
@@ -352,8 +477,8 @@ impl RowsState {
             idx_weights_f32: alloc(r * index_heads * 4)?,
             idx_query: alloc(r * index_cols * 2)?,
             idx_q_f32: alloc(r * index_cols * 4)?,
-            lm_hidden: alloc(R_MAX * dim * 2)?,
-            lm_normed: alloc(R_MAX * dim * 2)?,
+            lm_hidden: alloc(d * dim * 2)?,
+            lm_normed: alloc(d * dim * 2)?,
             lm_block_max: alloc(R_MAX * chunks * 4)?,
             lm_block_arg: alloc(R_MAX * chunks * 4)?,
             lm_value: alloc(R_MAX * 4)?,
@@ -361,6 +486,7 @@ impl RowsState {
             argmax_gather: alloc(GATHER_WORLD * R_MAX * 8)?,
             lm_picks: alloc(R_MAX * 8)?,
             row_ids: alloc(r * 4)?,
+            row_tab: alloc(R_MAX * 16)?,
             logits: alloc(R_MAX * crate::tp4_tail::VOCAB_PER_RANK * 4)?,
             topc_gather: alloc(GATHER_WORLD * R_MAX * super::sample::TOPC_WORDS * 4)?,
             embed_gather: alloc(GATHER_WORLD * r * dim * 2)?,
@@ -381,6 +507,7 @@ impl RowsState {
             engram_out,
             gathers: Cell::new(0),
             post_pending: Cell::new(None),
+            row_tab_for: std::cell::RefCell::new(Vec::new()),
             taps: None,
             // A bulk chunk's stages read far more than the L2 holds, so it prefetches nothing.
             side: match std::env::var("SPARKFLASH_L2_PREFETCH").as_deref() {
@@ -390,11 +517,35 @@ impl RowsState {
             },
             cap: r,
             bulk: if r > R_MAX {
-                Some(super::bulk::BulkState::open(device, kernel_dir, r)?)
+                Some(super::bulk::BulkState::open(
+                    device,
+                    kernel_dir,
+                    r,
+                    share.map(|(share, _)| share),
+                )?)
             } else {
                 None
             },
+            overlap: Cell::new(false),
+            ar_done: if r > R_MAX {
+                Some(cuda.stream_event()?)
+            } else {
+                None
+            },
+            ar_pending: Cell::new(false),
+            post_after_ar: Cell::new(false),
+            moe_way,
         })
+    }
+
+    /// Ends a paired chunk's overlap; after a failure also drops the wait and the post its last
+    /// collective left behind (the next chunk begins from fresh rows).
+    pub(super) fn end_overlap(&self, failed: bool) {
+        self.overlap.set(false);
+        if failed {
+            self.ar_pending.set(false);
+            self.post_after_ar.set(false);
+        }
     }
 
     /// The MX quantiser of `n` rows of `cols` bf16 values into E4M3 codes and ue8m0 scales
@@ -459,6 +610,13 @@ const ATTN_SCORE_CHUNK: usize = 32;
 /// spread over (each strides over its row's tiles).
 const SELECT_SCORE_TILE: usize = 16;
 const SELECT_SCORE_BLOCKS: usize = 384;
+
+/// opt_select_scores_seg's heads, positions a tile and rows (SG_HEADS, SG_TILE, SG_ROWS), and the
+/// blocks its tiles spread over (SPARKFLASH_SEG_BLOCKS overrides).
+const SELECT_SEG_HEADS: usize = 32;
+const SELECT_SEG_TILE: usize = 32;
+const SELECT_SEG_ROWS: usize = 8;
+const SELECT_SEG_BLOCKS: usize = 96;
 
 fn span(device: u64, len: usize) -> DeviceSpan {
     DeviceSpan::new(device, len)
@@ -581,6 +739,16 @@ impl DeviceLayer<'_> {
                 rows.cap, HIDDEN, self.dim, self.hc_mult
             ));
         }
+        if let Some(table) = self.embed_table
+            && !(spans && self.vision_rows())
+        {
+            return self.cuda.launch(
+                rows.kernels.embed_table,
+                (total as u32, 1, 1),
+                (256, 1, 1),
+                &[table, ids, n as u64, noise, rows.b.stream, rows.b.pre_mix],
+            );
+        }
         let gather = rows.b.embed_gather;
         let count = n * self.dim;
         self.cuda.launch(
@@ -619,6 +787,33 @@ impl DeviceLayer<'_> {
         )
     }
 
+    /// Gathers every rank's embedding shard into a whole table on this rank (one AllGather at boot,
+    /// vocab x hidden bf16, 1.3 GB): a step's embedding rows are then read here instead of
+    /// exchanged with their owners, so the steps' first collectives after a host wait go.
+    /// SPARKFLASH_EMBED_REPLICA=0 keeps the shard alone.
+    ///
+    /// # Errors
+    /// The allocation, the copy or the gather failed.
+    pub(super) fn replicate_embedding(&mut self, shard: u64) -> Result<(), String> {
+        if std::env::var("SPARKFLASH_EMBED_REPLICA").as_deref() == Ok("0") {
+            return Ok(());
+        }
+        let Some((world, rank)) = self.device_exchange() else {
+            return Ok(());
+        };
+        let count = crate::tp4_tail::VOCAB_PER_RANK * self.dim;
+        let table = self.cuda.alloc(world * count * 2, &mut 0)?;
+        self.cuda.copy_dtod(
+            &Deviceptr(table.0 + (rank * count * 2) as u64),
+            &Deviceptr(shard),
+            count * 2,
+        )?;
+        self.gather_slots(table.0, count, rank, "embedding replica")?;
+        self.wait_collectives()?;
+        self.embed_table = Some(table.0);
+        Ok(())
+    }
+
     /// Moves the position counters back to `next` after a verify step accepted rows below it: every
     /// state a later row wrote is addressed by position and is rewritten before it is read.
     pub(super) fn rewind_rows(&mut self, next: usize) {
@@ -652,9 +847,42 @@ impl DeviceLayer<'_> {
         p0: usize,
         n: usize,
     ) -> Result<(), String> {
+        self.run_layer_attn(rows, layer, p0, n)?;
+        self.run_layer_ffn(rows, layer, p0, n)
+    }
+
+    /// The layer's attention half: the previous layer's post (fused into the entry seam when it
+    /// was deferred), the taps and Engram, the entry seam, q/kv, the select, the attention, the
+    /// output projection, through the queued attention all-reduce.
+    pub(super) fn run_layer_attn(
+        &mut self,
+        rows: &RowsState,
+        layer: usize,
+        p0: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        self.run_layer_attn_seam(rows, layer, p0, n)?;
+        self.run_layer_attn_rest(rows, layer, p0, n)
+    }
+
+    /// The attention half up to its seam: the previous layer's post, the taps and Engram and the
+    /// entry seam (of the rank's own rows of a split chunk, then their AllGather).
+    pub(super) fn run_layer_attn_seam(
+        &mut self,
+        rows: &RowsState,
+        layer: usize,
+        p0: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        self.rows_ar_wait(rows, n)?;
         let b = rows.b;
         let dim = self.dim;
         let bulk = rows.bulk.is_some() && n > R_MAX;
+        let sp = self.sp_rows(rows, n);
+        let (first, count) = sp.map_or((0, n), |sp| (sp.first, sp.count));
+        let own = |base: u64, row_bytes: usize| base + (first * row_bytes) as u64;
+        let (stream_bytes, pre_bytes, mix_bytes) =
+            (self.hc_mult * dim * 4, self.hc_mult * 4, MIX_ROWS * 4);
         // The previous layer's FFN post, when it was left to this seam (a step that failed midway
         // can leave one behind; the next step's layer 0 begins from fresh rows and drops it).
         let pending = match rows.post_pending.take() {
@@ -671,12 +899,16 @@ impl DeviceLayer<'_> {
         {
             self.cuda.launch(
                 *kernel,
-                (20, n as u32, 1),
+                (20, count as u32, 1),
                 (256, 1, 1),
-                &[b.stream, *taps, tap as u64],
+                &[
+                    own(b.stream, stream_bytes),
+                    own(*taps, SP_TAPS * dim * 4),
+                    tap as u64,
+                ],
             )?;
         }
-        self.rows_engram(rows, layer, p0, n)?;
+        self.rows_engram(rows, layer, p0, n, (first, count))?;
         let weights = self.seam_layer(layer, "rows entry")?;
         let attn_w = [
             weights.attn_fn.0,
@@ -684,14 +916,31 @@ impl DeviceLayer<'_> {
             weights.attn_scale.0,
             weights.attn_norm.0,
         ];
-        let attn_out = [b.attn_mix, 0, b.normed, b.act_codes, b.act_scales, 0];
+        // A split chunk's seam writes its rows' bf16 normed rows (into ffn_x, free until the FFN
+        // seam) for the AllGather, and the derive the codes of every row after it; the f32 rows'
+        // readers take the gathered bf16 rows instead.
+        let attn_out = match sp {
+            Some(_) => [
+                own(b.attn_mix, mix_bytes),
+                0,
+                0,
+                0,
+                0,
+                own(b.ffn_x, dim * 2),
+            ],
+            None => [b.attn_mix, 0, b.normed, b.act_codes, b.act_scales, 0],
+        };
         if pending {
             self.rows_post_seam(
                 rows,
-                n,
-                [b.stream, b.ffn_mix, b.moe_reduced],
-                b.stream,
-                b.pre_mix,
+                count,
+                [
+                    own(b.stream, stream_bytes),
+                    own(b.ffn_mix, mix_bytes),
+                    own(b.moe_reduced, dim * 2),
+                ],
+                own(b.stream, stream_bytes),
+                own(b.pre_mix, pre_bytes),
                 self.hc_mult as u32,
                 attn_w,
                 attn_out[0],
@@ -707,9 +956,9 @@ impl DeviceLayer<'_> {
             // the post), so its seam keeps no copy of it.
             self.rows_seam(
                 rows,
-                n,
-                b.stream,
-                b.pre_mix,
+                count,
+                own(b.stream, stream_bytes),
+                own(b.pre_mix, pre_bytes),
                 self.hc_mult as u32,
                 attn_w,
                 attn_out[0],
@@ -722,6 +971,37 @@ impl DeviceLayer<'_> {
                 1,
             )?;
         }
+        if let Some(sp) = sp {
+            self.sp_collective(
+                rows,
+                "all_gather",
+                true,
+                own(b.ffn_x, dim * 2),
+                b.ffn_x,
+                sp.part * dim,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The attention half past its seam: (a split chunk's codes of every row from the gathered
+    /// rows,) q/kv, the select, the attention and the output projection, through the queued
+    /// attention all-reduce (a split chunk's ReduceScatter into its own rows).
+    pub(super) fn run_layer_attn_rest(
+        &mut self,
+        rows: &RowsState,
+        layer: usize,
+        p0: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        let b = rows.b;
+        let dim = self.dim;
+        let sp = self.sp_rows(rows, n);
+        if sp.is_some() {
+            self.rows_ar_wait(rows, n)?;
+            self.sp_derive(rows, b.ffn_x, 0, b.act_codes, b.act_scales, n)?;
+        }
+        let weights = self.seam_layer(layer, "rows entry")?;
         self.rows_query_kv(rows, layer, p0, n)?;
         match rows.bulk.as_ref().filter(|_| n > R_MAX) {
             Some(bulk) => self.bulk_seam_select(rows, bulk, layer, p0, n)?,
@@ -730,22 +1010,74 @@ impl DeviceLayer<'_> {
         self.rows_attention(rows, layer, p0, n)?;
         self.rows_output(rows, layer, n)?;
         self.prefetch_ffn(rows, layer, &weights)?;
-        self.reduce_rows(
-            "all_reduce",
-            span(b.attn_out, n * dim * 2),
-            span(b.reduced, n * dim * 2),
-            n,
-        )?;
+        match sp {
+            Some(sp) => self.sp_collective(
+                rows,
+                "reduce_scatter",
+                false,
+                b.attn_out,
+                b.reduced + (sp.first * dim * 2) as u64,
+                sp.part * dim,
+            ),
+            None => self.reduce_layer_rows(
+                rows,
+                "all_reduce",
+                span(b.attn_out, n * dim * 2),
+                span(b.reduced, n * dim * 2),
+                n,
+            ),
+        }
+    }
+
+    /// The layer's FFN half: the post of the attention and the FFN seam, the MoE, through the
+    /// queued MoE all-reduce (its post deferred to the next layer's seam where that can fuse it).
+    pub(super) fn run_layer_ffn(
+        &mut self,
+        rows: &RowsState,
+        layer: usize,
+        p0: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        self.run_layer_ffn_seam(rows, layer, n)?;
+        self.run_layer_ffn_rest(rows, layer, p0, n)
+    }
+
+    /// The FFN half up to its seam: the attention's post and the FFN seam (of the rank's own rows
+    /// of a split chunk, then their AllGather).
+    pub(super) fn run_layer_ffn_seam(
+        &mut self,
+        rows: &RowsState,
+        layer: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        self.rows_ar_wait(rows, n)?;
+        let b = rows.b;
+        let dim = self.dim;
+        let bulk = rows.bulk.is_some() && n > R_MAX;
+        let sp = self.sp_rows(rows, n);
+        let (first, count) = sp.map_or((0, n), |sp| (sp.first, sp.count));
+        let own = |base: u64, row_bytes: usize| base + (first * row_bytes) as u64;
+        let (stream_bytes, pre_bytes, mix_bytes) =
+            (self.hc_mult * dim * 4, self.hc_mult * 4, MIX_ROWS * 4);
+        let weights = self.seam_layer(layer, "rows ffn")?;
+        let (seam_row, codes, scales) = match sp {
+            Some(_) => (0, 0, 0),
+            None => (b.seam_row, b.ffn_codes, b.ffn_scales),
+        };
         self.rows_post_seam(
             rows,
-            n,
+            count,
             [
-                if bulk { b.stream } else { b.hc_rows },
-                b.attn_mix,
-                b.reduced,
+                if bulk {
+                    own(b.stream, stream_bytes)
+                } else {
+                    b.hc_rows
+                },
+                own(b.attn_mix, mix_bytes),
+                own(b.reduced, dim * 2),
             ],
-            b.stream,
-            b.attn_mix,
+            own(b.stream, stream_bytes),
+            own(b.attn_mix, mix_bytes),
             MIX_ROWS as u32,
             [
                 weights.ffn_fn.0,
@@ -753,27 +1085,159 @@ impl DeviceLayer<'_> {
                 weights.ffn_scale.0,
                 weights.ffn_norm.0,
             ],
-            b.ffn_mix,
-            b.pre_mix,
-            b.seam_row,
-            b.ffn_codes,
-            b.ffn_scales,
-            b.ffn_x,
+            own(b.ffn_mix, mix_bytes),
+            own(b.pre_mix, pre_bytes),
+            if seam_row == 0 {
+                0
+            } else {
+                own(seam_row, dim * 4)
+            },
+            codes,
+            scales,
+            own(b.ffn_x, dim * 2),
             0,
         )?;
-        self.rows_moe(rows, layer, p0, n)?;
-        self.prefetch_attention(rows, layer + 1)?;
-        self.reduce_rows(
-            "all_reduce_moe",
-            span(b.delta_bf16, n * dim * 2),
-            span(b.moe_reduced, n * dim * 2),
-            n,
+        if let Some(sp) = sp {
+            self.sp_collective(
+                rows,
+                "all_gather",
+                true,
+                own(b.ffn_x, dim * 2),
+                b.ffn_x,
+                sp.part * dim,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The FFN half past its seam: (a split chunk's codes of every row from the gathered rows,) the MoE, through the queued MoE all-reduce (its post deferred to the next
+    /// layer's seam where that can fuse it). A split chunk's last layer posts its own rows and
+    /// gathers what the head and the drafter read ([Self::sp_finish]).
+    pub(super) fn run_layer_ffn_rest(
+        &mut self,
+        rows: &RowsState,
+        layer: usize,
+        p0: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        self.ffn_rest_inputs(rows, layer, n)?;
+        self.rows_moe_routed(rows, layer, p0, n)?;
+        self.ffn_rest_tail(rows, layer, n)
+    }
+
+    /// [Self::run_layer_ffn_rest] up to the routed experts: (a split chunk's codes of every row,)
+    /// the router and the shared expert.
+    pub(super) fn ffn_rest_inputs(
+        &mut self,
+        rows: &RowsState,
+        layer: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        let b = rows.b;
+        if self.sp_rows(rows, n).is_some() {
+            self.rows_ar_wait(rows, n)?;
+            self.sp_derive(rows, b.ffn_x, 0, b.ffn_codes, b.ffn_scales, n)?;
+        }
+        self.rows_moe_inputs(rows, layer, n)
+    }
+
+    /// The routed experts of several bulk chunks' rows (`(state, rows)` of ways of one
+    /// [super::bulk::MoeShare]) as one pass over the expert weights, then each chunk's combine
+    /// over its shared expert. Every row's values are the ones its chunk's own pass gives.
+    pub(super) fn rows_moe_merged(
+        &mut self,
+        chunks: &[(&RowsState, usize)],
+        layer: usize,
+    ) -> Result<(), String> {
+        use sparkflash_kernels::moe_routed_device::MAX_BULK_SEGMENTS;
+        let device = self
+            .moe_routed_device
+            .as_ref()
+            .ok_or("rows: no routed device")?;
+        let (first, _) = chunks.first().ok_or("rows merged moe: no chunks")?;
+        let share = first
+            .moe_way
+            .ok_or("rows merged moe: not a shared bulk state")?;
+        let bulk = first
+            .bulk
+            .as_ref()
+            .ok_or("rows merged moe: not a bulk state")?;
+        let mut counts = [0usize; MAX_BULK_SEGMENTS];
+        let mut used = 0;
+        for &(state, n) in chunks {
+            let way = state
+                .moe_way
+                .filter(|way| way.base.ids == share.base.ids && way.way < MAX_BULK_SEGMENTS)
+                .ok_or("rows merged moe: a chunk outside the share")?;
+            if n <= R_MAX || counts[way.way] != 0 {
+                return Err(format!(
+                    "rows merged moe: way {} twice or {n} rows",
+                    way.way
+                ));
+            }
+            counts[way.way] = n;
+            used = used.max(way.way + 1);
+        }
+        device.run_bulk_rows(
+            self.cuda,
+            &bulk.moe,
+            layer,
+            share.stride,
+            &counts[..used],
+            &share.base,
         )?;
+        for &(state, n) in chunks {
+            let b = state.b;
+            let way = state.moe_way.map_or(0, |way| way.way);
+            device.set_addend(b.shared_out);
+            device.combine_bulk(
+                self.cuda,
+                &bulk.moe,
+                way * share.stride,
+                n,
+                b.moe_ids,
+                b.delta_f32,
+                b.delta_bf16,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// [Self::run_layer_ffn_rest] past the routed experts: the queued MoE reduce and the post.
+    pub(super) fn ffn_rest_tail(
+        &mut self,
+        rows: &RowsState,
+        layer: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        let b = rows.b;
+        let dim = self.dim;
+        let bulk = rows.bulk.is_some() && n > R_MAX;
+        let sp = self.sp_rows(rows, n);
+        self.prefetch_attention(rows, layer + 1)?;
+        match sp {
+            Some(sp) => self.sp_collective(
+                rows,
+                "reduce_scatter_moe",
+                false,
+                b.delta_bf16,
+                b.moe_reduced + (sp.first * dim * 2) as u64,
+                sp.part * dim,
+            )?,
+            None => self.reduce_layer_rows(
+                rows,
+                "all_reduce_moe",
+                span(b.delta_bf16, n * dim * 2),
+                span(b.moe_reduced, n * dim * 2),
+                n,
+            )?,
+        }
         // A bulk chunk leaves the post to the next layer's seam, unless that layer reads the stream
         // before its seam (a DSpark tap, an Engram write) or this is the last layer.
         let next = layer + 1;
+        let last = self.seam_layer(next, "rows post").is_err();
         let defer = bulk
-            && self.seam_layer(next, "rows post").is_ok()
+            && !last
             && !self.engram_rows.contains(&next)
             && !rows
                 .taps
@@ -783,7 +1247,204 @@ impl DeviceLayer<'_> {
             rows.post_pending.set(Some(layer));
             return Ok(());
         }
-        self.rows_post(rows, n, b.stream, b.ffn_mix, b.moe_reduced, b.stream)
+        if let Some(sp) = sp.filter(|_| last) {
+            self.rows_ar_wait(rows, n)?;
+            self.sp_post(rows, sp)?;
+            return self.sp_finish(rows, sp, n);
+        }
+        if rows.ar_pending.get() {
+            rows.post_after_ar.set(true);
+            return Ok(());
+        }
+        match sp {
+            Some(sp) => self.sp_post(rows, sp),
+            None => self.rows_post(rows, n, b.stream, b.ffn_mix, b.moe_reduced, b.stream),
+        }
+    }
+
+    /// The rows of a bulk chunk of `n` rows this rank posts and seams when the device splits them
+    /// ([DeviceLayer::enable_prefill_sp]); None when it does not, or when a rank's share would
+    /// be a rows step's (the same answer on every rank: it depends on `n` alone).
+    pub(super) fn sp_rows(&self, rows: &RowsState, n: usize) -> Option<SpRows> {
+        let world = self.prefill_sp?;
+        if rows.bulk.is_none() || rows.ar_done.is_none() || n <= R_MAX {
+            return None;
+        }
+        let part = n.div_ceil(world);
+        if part * world > rows.cap || n <= (world - 1) * part + R_MAX {
+            return None;
+        }
+        let first = self.tp_rank * part;
+        Some(SpRows {
+            first,
+            count: part.min(n - first),
+            part,
+        })
+    }
+
+    /// A split chunk's collective on the collective stream ([DeviceLayer::bulk_collective]):
+    /// paired, the chunk's next reader waits for it (`ar_pending`); alone, the run's stream at once.
+    fn sp_collective(
+        &self,
+        rows: &RowsState,
+        stage: &'static str,
+        gather: bool,
+        input: u64,
+        output: u64,
+        count: usize,
+    ) -> Result<(), String> {
+        let done = rows
+            .ar_done
+            .as_ref()
+            .ok_or_else(|| format!("rows {stage}: the chunk has no collective event"))?;
+        self.bulk_collective(stage, gather, input, output, count, done)?;
+        if rows.overlap.get() {
+            rows.ar_pending.set(true);
+            Ok(())
+        } else {
+            self.cuda.run_wait(done)
+        }
+    }
+
+    /// opt_bulk_seam_derive over the chunk's `n` gathered bf16 rows `x`: their FP8 codes and
+    /// scales into `codes` and `scales` (and their f32 rows into a non-null `normed`).
+    fn sp_derive(
+        &self,
+        rows: &RowsState,
+        x: u64,
+        normed: u64,
+        codes: u64,
+        scales: u64,
+        n: usize,
+    ) -> Result<(), String> {
+        let bulk = rows.bulk.as_ref().ok_or("rows derive: not a bulk chunk")?;
+        self.cuda.launch(
+            bulk.k.seam_derive,
+            ((self.dim / 1024) as u32, n as u32, 1),
+            (128, 1, 1),
+            &[x, normed, codes, scales],
+        )
+    }
+
+    /// A split chunk's FFN post of its own rows.
+    fn sp_post(&self, rows: &RowsState, sp: SpRows) -> Result<(), String> {
+        let b = rows.b;
+        let own = |base: u64, row_bytes: usize| base + (sp.first * row_bytes) as u64;
+        let stream = own(b.stream, self.hc_mult * self.dim * 4);
+        self.rows_post(
+            rows,
+            sp.count,
+            stream,
+            own(b.ffn_mix, MIX_ROWS * 4),
+            own(b.moe_reduced, self.dim * 2),
+            stream,
+        )
+    }
+
+    /// A split chunk's drafter seed ([DeviceLayer::draft_seed]): the in-place AllGather of
+    /// `count` bf16 words a rank from `mine` into `chunk`, which the run's stream waits for.
+    pub(super) fn sp_seed_gather(
+        &self,
+        rows: &RowsState,
+        mine: u64,
+        chunk: u64,
+        count: usize,
+    ) -> Result<(), String> {
+        let overlap = rows.overlap.replace(false);
+        let result = self.sp_collective(rows, "all_gather_seed", true, mine, chunk, count);
+        rows.overlap.set(overlap);
+        result
+    }
+
+    /// After a split chunk's last post: the last row's stream and pre mix (the head's, which rank
+    /// `(n - 1) / part` posted) into that row on every rank, through each rank's slot of
+    /// `sp_last`; the run's stream waits for it. (The drafter seeds each rank's own rows from
+    /// their taps and gathers the seeded ring entries.)
+    fn sp_finish(&self, rows: &RowsState, sp: SpRows, n: usize) -> Result<(), String> {
+        let b = rows.b;
+        let bulk = rows.bulk.as_ref().ok_or("rows finish: not a bulk chunk")?;
+        let overlap = rows.overlap.replace(false);
+        let result = (|| {
+            let (stream_bytes, pre_bytes) = (self.hc_mult * self.dim * 4, self.hc_mult * 4);
+            let slot_bytes = stream_bytes + pre_bytes;
+            let mine = bulk.sp_last + (self.tp_rank * slot_bytes) as u64;
+            let row = (sp.first + sp.count - 1) as u64;
+            let cuda = self.cuda;
+            cuda.copy_dtod_async(
+                &Deviceptr(mine),
+                &Deviceptr(b.stream + row * stream_bytes as u64),
+                stream_bytes,
+            )?;
+            cuda.copy_dtod_async(
+                &Deviceptr(mine + stream_bytes as u64),
+                &Deviceptr(b.pre_mix + row * pre_bytes as u64),
+                pre_bytes,
+            )?;
+            self.sp_collective(
+                rows,
+                "all_gather_last",
+                true,
+                mine,
+                bulk.sp_last,
+                slot_bytes / 2,
+            )?;
+            let owner = bulk.sp_last + ((n - 1) / sp.part * slot_bytes) as u64;
+            let last = (n - 1) as u64;
+            cuda.copy_dtod_async(
+                &Deviceptr(b.stream + last * stream_bytes as u64),
+                &Deviceptr(owner),
+                stream_bytes,
+            )?;
+            cuda.copy_dtod_async(
+                &Deviceptr(b.pre_mix + last * pre_bytes as u64),
+                &Deviceptr(owner + stream_bytes as u64),
+                pre_bytes,
+            )
+        })();
+        rows.overlap.set(overlap);
+        result
+    }
+
+    /// A layer's all-reduce of `n` rows: on the collective stream when `rows` is a paired bulk
+    /// chunk ([RowsState::overlap]), else on the run's stream.
+    fn reduce_layer_rows(
+        &self,
+        rows: &RowsState,
+        stage: &'static str,
+        input: crate::layer_device::DeviceSpan,
+        output: crate::layer_device::DeviceSpan,
+        n: usize,
+    ) -> Result<(), String> {
+        match rows
+            .ar_done
+            .as_ref()
+            .filter(|_| rows.overlap.get() && n > R_MAX)
+        {
+            Some(done) => {
+                self.reduce_rows_overlapped(stage, input, output, n, done)?;
+                rows.ar_pending.set(true);
+                Ok(())
+            }
+            None => self.reduce_rows(stage, input, output, n),
+        }
+    }
+
+    /// A paired chunk's next reader of its last all-reduce: the run's stream waits for the
+    /// collective, then the FFN post it fed runs when no seam fuses it. Nothing without overlap.
+    pub(super) fn rows_ar_wait(&self, rows: &RowsState, n: usize) -> Result<(), String> {
+        if rows.ar_pending.replace(false)
+            && let Some(done) = rows.ar_done.as_ref()
+        {
+            self.cuda.run_wait(done)?;
+        }
+        if rows.post_after_ar.replace(false) {
+            let b = rows.b;
+            match self.sp_rows(rows, n) {
+                Some(sp) => self.sp_post(rows, sp)?,
+                None => self.rows_post(rows, n, b.stream, b.ffn_mix, b.moe_reduced, b.stream)?,
+            }
+        }
+        Ok(())
     }
 
     /// Queues opt_rows_prefetch_l2 over `spans` on the side stream (none without one): it starts
@@ -836,8 +1497,11 @@ impl DeviceLayer<'_> {
     }
 
     /// During the MoE all-reduce: what layer `layer` (the next one) reads first, its entry seam's
-    /// mix weights, wq_a and wkv.
+    /// mix weights, wq_a and wkv, then wq_b (off under SPARKFLASH_PREFETCH_WQB=0).
     fn prefetch_attention(&self, rows: &RowsState, layer: usize) -> Result<(), String> {
+        static WQB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let wqb =
+            *WQB.get_or_init(|| std::env::var("SPARKFLASH_PREFETCH_WQB").as_deref() != Ok("0"));
         let Ok(weights) = self.seam_layer(layer, "prefetch") else {
             return Ok(());
         };
@@ -853,7 +1517,11 @@ impl DeviceLayer<'_> {
                 (weights.attn_fn.0, MIX_ROWS * hc_width * 4),
                 matrix("wq_a", rows.lora_cols),
                 matrix("wkv", rows.kv_cols),
-                (0, 0),
+                self.weights
+                    .pair(layer, "wq_b")
+                    .ok()
+                    .filter(|_| wqb)
+                    .map_or((0, 0), |(w, _)| (w.0, rows.q_cols * rows.lora_cols)),
             ],
         )
     }
@@ -905,6 +1573,55 @@ impl DeviceLayer<'_> {
                 w,
                 [mix, pre_mix_out, normed, codes, scales, x_bf16],
                 quant_narrow,
+            );
+        }
+        if let Some((partials, tail)) = rows.kernels.seam_split.as_ref() {
+            // Rows a block in the partials: 4 from 8 rows, 2 from 2 (the bench's fastest).
+            let (kernel, per) = match n {
+                0..=1 => (partials[0], 1),
+                2..=7 => (partials[1], 2),
+                _ => (partials[2], 4),
+            };
+            self.cuda.launch(
+                kernel,
+                (80, n.div_ceil(per) as u32, 1),
+                (256, 1, 1),
+                &[
+                    stream,
+                    in_pre,
+                    w[0],
+                    hc_rows,
+                    b.seam_partials,
+                    b.seam_row_buf,
+                    u64::from(self.native_bf16),
+                    u64::from(in_pre_stride),
+                    n as u64,
+                ],
+            )?;
+            return self.cuda.launch(
+                *tail,
+                (n as u32, 1, 1),
+                (1024, 1, 1),
+                &[
+                    w[1],
+                    w[2],
+                    w[3],
+                    mix,
+                    pre_mix_out,
+                    normed,
+                    codes,
+                    scales,
+                    x_bf16,
+                    b.seam_partials,
+                    b.seam_row_buf,
+                    u64::from(SEAM_NORM_BF16),
+                    u64::from(self.native_bf16),
+                    u64::from(quant_narrow),
+                    u64::from(self.sinkhorn_iters),
+                    u64::from(self.eps.to_bits()),
+                    u64::from(self.hc_eps.to_bits()),
+                    MIX_ROWS as u64,
+                ],
             );
         }
         self.cuda.launch(
@@ -1083,6 +1800,7 @@ impl DeviceLayer<'_> {
         layer: usize,
         p0: usize,
         n: usize,
+        (first, count): (usize, usize),
     ) -> Result<(), String> {
         use sparkflash_kernels::{
             engram_convert_launch::{self, EngramConvertParams, EngramConvertSpans},
@@ -1115,7 +1833,7 @@ impl DeviceLayer<'_> {
                     "rows engram: the bulk post takes hc <= 4 copies of an even width".into(),
                 );
             }
-            return self.bulk_engram(rows, bulk, slot, &live, p0, n);
+            return self.bulk_engram(rows, bulk, slot, &live[first..first + count], p0, first);
         }
         let b = rows.b;
         let layout = engram.layout;
@@ -1307,6 +2025,68 @@ impl DeviceLayer<'_> {
         )
     }
 
+    /// Writes the row table of a step over several lanes' rows: row r's lane offset from the
+    /// first segment's lane (the same for its window ring and its compressed store) and its
+    /// position. The q rope, the kv tail and the split attention then run once over all the rows
+    /// instead of once per lane. Without lanes, or with the bf16 cache (one per run, not per lane),
+    /// or with SPARKFLASH_ROW_TABLE=0, they stay per segment.
+    pub(super) fn upload_row_table(
+        &self,
+        rows: &RowsState,
+        segs: &[super::lanes::Seg],
+    ) -> Result<(), String> {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        rows.row_tab_for.borrow_mut().clear();
+        let off = *OFF.get_or_init(|| std::env::var("SPARKFLASH_ROW_TABLE").as_deref() == Ok("0"));
+        let Some(lanes) = self.lanes.as_ref() else {
+            return Ok(());
+        };
+        if off || segs.len() < 2 || !self.kv_cache_off || rows.cap > R_MAX {
+            return Ok(());
+        }
+        let first = lanes.pointers(segs[0].lane);
+        let mut words = Vec::with_capacity(2 * R_MAX);
+        for seg in segs {
+            let lane = lanes.pointers(seg.lane);
+            let offset = lane.kv_ring.wrapping_sub(first.kv_ring);
+            if lane.store_codes.wrapping_sub(first.store_codes) != offset
+                || lane.store_scales.wrapping_sub(first.store_scales) != offset
+            {
+                return Ok(());
+            }
+            for row in 0..seg.n {
+                words.push(offset);
+                words.push((seg.p0 + row) as u64);
+            }
+        }
+        if words.len() > 2 * R_MAX {
+            return Ok(());
+        }
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        self.cuda.copy_htod(&Deviceptr(rows.b.row_tab), &bytes)?;
+        rows.row_tab_for.borrow_mut().extend_from_slice(segs);
+        Ok(())
+    }
+
+    /// The row table when the step's rows are several lanes' and [Self::upload_row_table] wrote
+    /// it for them.
+    fn row_table(&self, rows: &RowsState, segs: &[super::lanes::Seg]) -> Option<u64> {
+        (segs.len() > 1 && rows.row_tab_for.borrow().as_slice() == segs).then_some(rows.b.row_tab)
+    }
+
+    /// The launches of the step's segments: one over all the rows with the row table, else one
+    /// per segment.
+    fn row_units(segs: &[super::lanes::Seg], table: Option<u64>) -> Vec<super::lanes::Seg> {
+        match (table, segs.first()) {
+            (Some(_), Some(&first)) => vec![super::lanes::Seg {
+                n: segs.iter().map(|seg| seg.n).sum(),
+                row0: 0,
+                ..first
+            }],
+            _ => segs.to_vec(),
+        }
+    }
+
     /// The rope table pair (cos base, sin base) of `layer`'s class.
     pub(super) fn rows_rope_tables(&self, layer: usize) -> Result<(u64, u64), String> {
         let ratio = self
@@ -1346,7 +2126,7 @@ impl DeviceLayer<'_> {
                 .weights
                 .pair(layer, name)
                 .map_err(|error| format!("rows {name}: {error}"))?;
-            launch_opt(
+            launch_opt_rows(
                 self.cuda,
                 OptKind::Fp8aBf16o,
                 &OptArgs {
@@ -1367,6 +2147,7 @@ impl DeviceLayer<'_> {
                     out_grp_stride: 0,
                     k_stride_blocks: 0,
                 },
+                R_MAX,
             )
             .map_err(|error| format!("rows {name}: {error}"))
         };
@@ -1402,11 +2183,31 @@ impl DeviceLayer<'_> {
             .get(layer, "kv_norm")
             .map_err(|error| format!("rows kv_norm: {error}"))?;
         // The q rope and the kv tail (kv_norm, rope, the window row's round trip, the cache append)
-        // run per sequence: each reads its rows' positions and writes its own lane's ring.
-        for seg in self.step_segs(p0, n) {
+        // run per sequence: each reads its rows' positions and writes its own lane's ring. With
+        // the row table one launch serves every lane's rows.
+        let segs = self.step_segs(p0, n);
+        let table = self.row_table(rows, &segs);
+        for seg in &segs {
+            self.enter_seg(seg)?;
+            let appended = self
+                .appended_rows
+                .get(layer)
+                .copied()
+                .ok_or("rows: no cache count")?;
+            if appended != seg.p0 {
+                return Err(format!(
+                    "rows kv: layer {layer}'s cache holds {appended} rows, the step starts at {}",
+                    seg.p0
+                ));
+            }
+        }
+        for seg in Self::row_units(&segs, table) {
             self.enter_seg(&seg)?;
             let (row0, count) = (seg.row0 as u64, seg.n as u32);
-            let pair_bytes = (self.rope_pairs as usize * 4 * seg.p0) as u64;
+            let pair_bytes = match table {
+                Some(_) => 0,
+                None => (self.rope_pairs as usize * 4 * seg.p0) as u64,
+            };
             self.cuda.launch(
                 rope,
                 (self.heads_per_rank, count, 1),
@@ -1419,23 +2220,13 @@ impl DeviceLayer<'_> {
                     u64::from(self.rope_head_dim),
                     u64::from(self.heads_per_rank),
                     u64::from(self.rope_pairs),
+                    table.unwrap_or(0),
                 ],
             )?;
             let ring_layer = self.kv_ring_base + self.kv_ring.layer_offset(layer) as u64;
             let ring_codes = ring_layer + self.kv_ring.codes_offset(0)? as u64;
             let ring_scales = ring_layer + self.kv_ring.scales_offset(0)? as u64;
             let cache = self.kv_cache.layer_span(layer)?;
-            let appended = self
-                .appended_rows
-                .get(layer)
-                .copied()
-                .ok_or("rows: no cache count")?;
-            if appended != seg.p0 {
-                return Err(format!(
-                    "rows kv: layer {layer}'s cache holds {appended} rows, the step starts at {}",
-                    seg.p0
-                ));
-            }
             let kv_row = row0 * (rows.kv_cols * 2) as u64;
             self.cuda.launch(
                 rows.kernels.kv,
@@ -1456,8 +2247,12 @@ impl DeviceLayer<'_> {
                     u64::from(self.head_width),
                     u64::from(self.rope_head_dim),
                     seg.p0 as u64,
+                    table.unwrap_or(0),
                 ],
             )?;
+        }
+        for seg in &segs {
+            self.enter_seg(seg)?;
             if let Some(count) = self.appended_rows.get_mut(layer) {
                 *count = seg.p0 + seg.n;
             }
@@ -1587,7 +2382,7 @@ impl DeviceLayer<'_> {
         let (Some(ring), Some(select)) = (self.seam_ring, self.opt_select.as_ref()) else {
             return Err(Self::refusal("rows select"));
         };
-        let Some((scores_rows, select_rows)) = select.rows else {
+        let Some((scores_rows, select_rows, scores_seg)) = select.rows else {
             return Err(Self::refusal("rows select"));
         };
         let b = rows.b;
@@ -1597,29 +2392,57 @@ impl DeviceLayer<'_> {
         let keys =
             ring.index_keys.0 + (owner * self.max_positions * self.index_head_dim * 4) as u64;
         let stride = reach.next_multiple_of(4);
-        let tiles = reach.div_ceil(SELECT_SCORE_TILE);
-        let blocks = tiles.min((SELECT_SCORE_BLOCKS / seg.n).max(1));
-        self.cuda.launch(
-            scores_rows,
-            (blocks as u32, seg.n as u32, 1),
-            (256, 1, 1),
-            &[
-                b.idx_q_f32 + (row0 * index_cols * 4) as u64,
-                keys,
-                b.idx_weights_f32 + (row0 * heads * 4) as u64,
-                select.scores_out.0,
-                seg.p0 as u64,
-                ratio as u64,
-                stride as u64,
-                heads as u64,
-            ],
-        )?;
         let mask_mode = match layer.cmp(&self.candidate_source_layer) {
             std::cmp::Ordering::Less => 0u64,
             std::cmp::Ordering::Equal => 2,
             std::cmp::Ordering::Greater => 1,
         };
         let masks = b.masks + (row0 * rows.mask_bytes) as u64;
+        if heads == SELECT_SEG_HEADS && seg.n <= SELECT_SEG_ROWS {
+            // The segment's rows share each key tile; a consumed mask skips what no row needs.
+            let tiles = reach.div_ceil(SELECT_SEG_TILE);
+            let cap = std::env::var("SPARKFLASH_SEG_BLOCKS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(SELECT_SEG_BLOCKS)
+                .max(1);
+            let slices = (4 / seg.n).max(1);
+            self.cuda.launch(
+                scores_seg,
+                (tiles.min(cap) as u32, 1, 1),
+                ((64 * seg.n * slices) as u32, 1, 1),
+                &[
+                    b.idx_q_f32 + (row0 * index_cols * 4) as u64,
+                    keys,
+                    b.idx_weights_f32 + (row0 * heads * 4) as u64,
+                    select.scores_out.0,
+                    if mask_mode == 1 { masks } else { 0 },
+                    seg.p0 as u64,
+                    ratio as u64,
+                    stride as u64,
+                    (rows.mask_bytes / 4) as u64,
+                    seg.n as u64,
+                ],
+            )?;
+        } else {
+            let tiles = reach.div_ceil(SELECT_SCORE_TILE);
+            let blocks = tiles.min((SELECT_SCORE_BLOCKS / seg.n).max(1));
+            self.cuda.launch(
+                scores_rows,
+                (blocks as u32, seg.n as u32, 1),
+                (256, 1, 1),
+                &[
+                    b.idx_q_f32 + (row0 * index_cols * 4) as u64,
+                    keys,
+                    b.idx_weights_f32 + (row0 * heads * 4) as u64,
+                    select.scores_out.0,
+                    seg.p0 as u64,
+                    ratio as u64,
+                    stride as u64,
+                    heads as u64,
+                ],
+            )?;
+        }
         self.cuda.launch(
             select_rows,
             (seg.n as u32, 1, 1),
@@ -1752,7 +2575,7 @@ impl DeviceLayer<'_> {
             )?;
             // ref_select quantises q_normed exactly as rows_query_kv already did into q_codes.
             let lora = rows.lora_cols;
-            launch_opt(
+            launch_opt_rows(
                 cuda,
                 OptKind::Fp8aBf16o,
                 &OptArgs {
@@ -1773,6 +2596,7 @@ impl DeviceLayer<'_> {
                     out_grp_stride: 0,
                     k_stride_blocks: 0,
                 },
+                R_MAX,
             )
             .map_err(|error| format!("rows indexer wq_b: {error}"))?;
             let pairs = self.rope_pairs as usize;
@@ -1836,8 +2660,14 @@ impl DeviceLayer<'_> {
             .map(|bulk| bulk.k.attn);
         let (cos, sin) = self.rows_rope_tables(layer)?;
         let q_row = (rows.q_cols * 2) as u64;
-        // Each sequence attends its own lane's window ring and compressed store.
-        for seg in self.step_segs(p0, n) {
+        // Each sequence attends its own lane's window ring and compressed store: the split
+        // attention runs every lane's rows in one launch with the row table.
+        let segs = self.step_segs(p0, n);
+        let table = self.row_table(rows, &segs).filter(|_| {
+            bulk_attn.is_none() && rows.kernels.attn_split.is_some() && self.heads_per_rank == 16
+        });
+        let last = segs.last().copied();
+        for seg in Self::row_units(&segs, table) {
             self.enter_seg(&seg)?;
             let ring_layer = self.kv_ring_base + self.kv_ring.layer_offset(layer) as u64;
             let ring_codes = ring_layer + self.kv_ring.codes_offset(0)? as u64;
@@ -1882,10 +2712,12 @@ impl DeviceLayer<'_> {
                     ];
                     args.extend(geometry);
                     args.extend(ring);
+                    args.push(table.unwrap_or(0));
                     self.cuda
                         .launch(scores, (chunks, count, 1), (256, 1, 1), &args)?;
                     let mut args = vec![attn_scores, sink, attn_probs, attn_ssum];
                     args.extend(geometry);
+                    args.push(table.unwrap_or(0));
                     self.cuda
                         .launch(softmax, (ATTN_HEADS as u32, count, 1), (256, 1, 1), &args)?;
                     let mut args = vec![
@@ -1900,6 +2732,7 @@ impl DeviceLayer<'_> {
                     ];
                     args.extend(geometry);
                     args.extend(ring);
+                    args.push(table.unwrap_or(0));
                     self.cuda
                         .launch(values, (8, count, 1), (256, 1, 1), &args)?;
                 }
@@ -1934,8 +2767,13 @@ impl DeviceLayer<'_> {
                     u64::from(self.head_width),
                     u64::from(self.rope_head_dim),
                     seg.p0 as u64,
+                    table.unwrap_or(0),
                 ],
             )?;
+        }
+        // The last segment's lane stays selected, as after a per-segment loop.
+        if let Some(seg) = last {
+            self.enter_seg(&seg)?;
         }
         Ok(())
     }
@@ -1956,7 +2794,7 @@ impl DeviceLayer<'_> {
         let groups = geometry.groups as u64;
         let (cols, inner) = (geometry.o_lora_rank as u64, geometry.group_inner as u64);
         let tokens = n as u32;
-        launch_opt(
+        launch_opt_rows(
             self.cuda,
             OptKind::Bf16aBf16o,
             &OptArgs {
@@ -1977,11 +2815,12 @@ impl DeviceLayer<'_> {
                 out_grp_stride: cols,
                 k_stride_blocks: 0,
             },
+            R_MAX,
         )
         .map_err(|error| format!("rows wo_a: {error}"))?;
         let lo = rows.lo_cols;
         rows.quantise_bf16(self.cuda, b.attn_lo, b.o_codes, b.o_scales, lo, n)?;
-        launch_opt(
+        launch_opt_rows(
             self.cuda,
             OptKind::Fp8aBf16o,
             &OptArgs {
@@ -2002,19 +2841,14 @@ impl DeviceLayer<'_> {
                 out_grp_stride: 0,
                 k_stride_blocks: 0,
             },
+            R_MAX,
         )
         .map_err(|error| format!("rows wo_b: {error}"))
     }
 
-    /// The router, the rank-split shared expert and the fused routed experts over the rows.
-    fn rows_moe(
-        &mut self,
-        rows: &RowsState,
-        layer: usize,
-        p0: usize,
-        n: usize,
-    ) -> Result<(), String> {
-        use sparkflash_kernels::moe_routed_device::{DeviceSpan as MoeSpan, MoeRoutedOperands};
+    /// The router and the rank-split shared expert over the rows (the fused routed experts are
+    /// [Self::rows_moe_routed]).
+    fn rows_moe_inputs(&mut self, rows: &RowsState, layer: usize, n: usize) -> Result<(), String> {
         let b = rows.b;
         let dim = self.dim;
         let tokens = n as u32;
@@ -2061,28 +2895,29 @@ impl DeviceLayer<'_> {
         let rank = self.tp_rank as u64;
         let dim_blocks = (dim / 32) as u64;
         let local_tiles = (local / 32) as u64;
-        launch_opt(
-            self.cuda,
-            OptKind::F32aF32o,
-            &OptArgs {
-                a: b.seam_row,
-                a_scales: 0,
-                w: ops.w1.0 + rank * local_tiles * dim_blocks * 1024,
-                ws: ops.s1.0 + rank * local_tiles * dim_blocks,
-                out: b.shared_gate,
-                cols: local as u32,
-                inner: dim as u32,
-                tokens,
-                a_tok_stride: dim as u64,
-                out_tok_stride: local as u64,
-                groups: 2,
-                a_grp_stride: 0,
-                w_grp_stride: ops.w3.0.wrapping_sub(ops.w1.0),
-                s_grp_stride: ops.s3.0.wrapping_sub(ops.s1.0),
-                out_grp_stride: (n * local) as u64,
-                k_stride_blocks: 0,
-            },
-        )
+        let gate_up = |a: u64| OptArgs {
+            a,
+            a_scales: 0,
+            w: ops.w1.0 + rank * local_tiles * dim_blocks * 1024,
+            ws: ops.s1.0 + rank * local_tiles * dim_blocks,
+            out: b.shared_gate,
+            cols: local as u32,
+            inner: dim as u32,
+            tokens,
+            a_tok_stride: dim as u64,
+            out_tok_stride: local as u64,
+            groups: 2,
+            a_grp_stride: 0,
+            w_grp_stride: ops.w3.0.wrapping_sub(ops.w1.0),
+            s_grp_stride: ops.s3.0.wrapping_sub(ops.s1.0),
+            out_grp_stride: (n * local) as u64,
+            k_stride_blocks: 0,
+        };
+        // A split chunk's FFN rows are its gathered bf16 rows (no f32 seam rows).
+        match bulk.filter(|_| self.sp_rows(rows, n).is_some()) {
+            Some(bulk) => bulk.mma(self.cuda, bulk.k.bf16a_f32o, &gate_up(b.ffn_x)),
+            None => launch_opt_rows(self.cuda, OptKind::F32aF32o, &gate_up(b.seam_row), R_MAX),
+        }
         .map_err(|error| format!("rows shared gate/up: {error}"))?;
         rows.swiglu(
             self.cuda,
@@ -2094,7 +2929,7 @@ impl DeviceLayer<'_> {
         )
         .map_err(|error| format!("rows shared swiglu: {error}"))?;
         let kb0 = rank * local_tiles;
-        launch_opt(
+        launch_opt_rows(
             self.cuda,
             OptKind::F32aF32o,
             &OptArgs {
@@ -2115,8 +2950,23 @@ impl DeviceLayer<'_> {
                 out_grp_stride: 0,
                 k_stride_blocks: (inter / 32) as u32,
             },
+            R_MAX,
         )
-        .map_err(|error| format!("rows shared down: {error}"))?;
+        .map_err(|error| format!("rows shared down: {error}"))
+    }
+
+    /// The fused routed experts over the rows, adding the shared expert's rows.
+    fn rows_moe_routed(
+        &mut self,
+        rows: &RowsState,
+        layer: usize,
+        p0: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        use sparkflash_kernels::moe_routed_device::{DeviceSpan as MoeSpan, MoeRoutedOperands};
+        let b = rows.b;
+        let dim = self.dim;
+        let bulk = rows.bulk.as_ref().filter(|_| n > R_MAX);
         let device = self
             .moe_routed_device
             .as_ref()
@@ -2250,8 +3100,8 @@ impl DeviceLayer<'_> {
     }
 
     /// The head over the rows: hc collapse per row, the final norm, one pass of the vocabulary
-    /// shard for every row, the per-row fold, then the cross-rank argmax. Returns (token, value)
-    /// per row.
+    /// shard for every [HEAD_ROWS] rows, the per-row fold, then the cross-rank argmax. Returns
+    /// (token, value) per row.
     pub(super) fn head_rows(
         &self,
         rows: &RowsState,
@@ -2306,21 +3156,14 @@ impl DeviceLayer<'_> {
             || samplers.iter().all(|(other, _)| other.is_greedy());
         let b = rows.b;
         let dim = self.dim;
-        let kernel = self
-            .seam_hc_pre_collapse
-            .ok_or("rows head: hc_pre_collapse_bf16 is not loaded")?;
-        for row in 0..n {
-            sparkflash_kernels::pool_group_launch::launch_hc_pre_collapse(
-                self.cuda,
-                kernel,
-                Deviceptr(b.pre_mix + (row * self.hc_mult * 4) as u64),
-                Deviceptr(b.stream + (row * self.hc_mult * dim * 4) as u64),
-                Deviceptr(b.lm_hidden + (row * dim * 2) as u64),
-                tail.buffers.certified_count,
-                self.hc_mult as u32,
-                dim as u32,
-            )?;
-        }
+        rows.hc_collapse(
+            self.cuda,
+            b.pre_mix,
+            b.stream,
+            b.lm_hidden,
+            tail.buffers.certified_count.0,
+            (1, n, 0),
+        )?;
         let norm = sparkflash_kernels::rmsnorm_launch::RmsNormLaunchParams {
             x: Deviceptr(b.lm_hidden),
             weight: tail.norm_weight,
@@ -2363,25 +3206,37 @@ impl DeviceLayer<'_> {
             rows.head_params.device().0
         };
         let id_base = self.device_exchange().map_or(0, |(_, rank)| rank * vocab);
-        self.cuda.launch(
-            rows.kernels.lm_head,
-            (chunks as u32, 1, 1),
-            (512, 1, 1),
-            &[
-                b.lm_normed,
-                tail.head_weight.0,
-                b.lm_block_max,
-                b.lm_block_arg,
-                vocab as u64,
-                n as u64,
-                if any_truncated { b.logits } else { 0 },
-                inv_t,
-                seed,
-                index0 as u64,
-                id_base as u64,
-                params,
-            ],
-        )?;
+        // HEAD_ROWS rows a pass over the vocabulary shard: each piece's chunk maxima, logits and
+        // noise are its rows of the step's.
+        for row0 in (0..n).step_by(HEAD_ROWS) {
+            self.cuda.launch(
+                rows.kernels.lm_head,
+                (chunks as u32, 1, 1),
+                (512, 1, 1),
+                &[
+                    b.lm_normed + (row0 * dim * 2) as u64,
+                    tail.head_weight.0,
+                    b.lm_block_max + (row0 * chunks * 4) as u64,
+                    b.lm_block_arg + (row0 * chunks * 4) as u64,
+                    vocab as u64,
+                    HEAD_ROWS.min(n - row0) as u64,
+                    if any_truncated {
+                        b.logits + (row0 * vocab * 4) as u64
+                    } else {
+                        0
+                    },
+                    inv_t,
+                    seed,
+                    (index0 + row0) as u64,
+                    id_base as u64,
+                    if params == 0 {
+                        0
+                    } else {
+                        params + (row0 * 16) as u64
+                    },
+                ],
+            )?;
+        }
         let mut picked: Vec<Option<u32>> = vec![None; n];
         if any_truncated {
             let Some((world, rank)) = self.device_exchange() else {

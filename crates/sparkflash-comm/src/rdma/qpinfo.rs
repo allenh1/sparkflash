@@ -927,7 +927,7 @@ mod tests {
 
         // The all-zero GID is refused. A record is: header 12 + world/count 8 + rank 4 +
         // frame cap 4 + slot bytes 8 + rail count 1 + reserved 3, so rank 0 rail 0's GID
-        // occupies bytes 40..56 (the ::ffff:192.0.2.80 form).
+        // occupies bytes 40..56 (the ::ffff:198.51.100.80 form).
         assert_eq!(good[50], 0xff);
         let mut zero_gid = good.clone();
         for byte in &mut zero_gid[40..56] {

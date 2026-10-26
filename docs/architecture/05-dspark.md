@@ -1,6 +1,6 @@
 # 05 — DSpark: the three-stage MTP head, its attention, and the confidence path
 
-References: /home/user/dsv41-research/inference/model.py (DSparkAttention 1032-1074,
+References: <checkpoint>/inference/model.py (DSparkAttention 1032-1074,
 DSparkMarkovHead 1077-1086, DSparkConfidenceHead 1089-1097, DSparkBlock 1100-1156,
 get_dspark_topk_idxs 1020-1029, Transformer.forward_spec 1274-1282, sample 1285-1292).
 

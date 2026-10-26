@@ -312,7 +312,7 @@ extern "C" __global__ void flash_mla_csa2_seq_sm121(
     // blockIdx.y exists only to slice the indexer's HSI pool, but stage 2 used to run unguarded
     // in every slice: each blockIdx.y re-ran the whole attention for the same head and wrote the
     // same out[] values. At a grid of 64 that performed 64 times the attention work for one
-    // result, and the launch paid about 1.47 ms for it at 128 candidates (measured on node0
+    // result, and the launch paid about 1.47 ms for it at 128 candidates (measured on spark-0
     // as the --tokens 130 minus --tokens 1 difference at grid.y 64, before this guard). One
     // execution of that attention is 0.068 ms, so the redundant copies overlapped rather than
     // serialising; the work was still real. Only slice 0 runs the attention now.

@@ -22,7 +22,7 @@ The script:
      directory (default /home/user/ev-session-20261020/serve/).
 
 No request ever leaves the loopback interface. The live vLLM oracle on
-192.0.2.80:8000 is never contacted: this script has no code path that can
+198.51.100.80:8000 is never contacted: this script has no code path that can
 address it.
 """
 
@@ -988,7 +988,7 @@ def build_json(
             "TTFT and tokens/s are client-measured over loopback and include queue wait; a "
             "concurrency rung can therefore be slower than its predecessor by design",
             "no vLLM comparison is made and no vLLM number is reproduced here; the vLLM "
-            "oracle on 192.0.2.80:8000 is never contacted",
+            "oracle on 198.51.100.80:8000 is never contacted",
             "text and latency probes pass skip_special_tokens: false because the synthetic "
             "plan's only generated token is the BOS special token, which vLLM's OpenAI default "
             "now hides; the default hiding has its own capability probe",

@@ -18,6 +18,9 @@
 //   pipeline; warp (wm, wn) computes 64 tokens x one 32-column weight tile (4 x 4 MMA tiles).
 //   Blocks with the same column tile are adjacent in launch order, so a weight tile is read from
 //   DRAM about once while the activation rows stay in L2.
+// opt_mma_fp8_rowscale_f32o: the same over row-major E4M3 weights with one ue8m0 per row per 32
+//   along K (the MX layout of opt_draft_head_fp8's copy of the head), f32 out: the drafter's head
+//   logits, which need not match the GEMV's bits.
 
 #include "opt_pdl_sm121.cuh"
 #include <cuda_bf16.h>
@@ -78,8 +81,9 @@ __device__ __forceinline__ uint32_t om_w_off(uint32_t tile, uint32_t row, uint32
 }
 
 // W_ROWS: row-major E4M3 weights ([cols][inner], the Engram wkv's) instead of B12x tiles; the
-// scales are the same one per 32 x 32 block.
-template <bool OUT_F32, bool W_ROWS = false>
+// scales are the same one per 32 x 32 block, or with W_RSCALE one per row per 32 along K
+// ([cols][inner / 32]).
+template <bool OUT_F32, bool W_ROWS = false, bool W_RSCALE = false>
 __device__ __forceinline__ void opt_mma_fp8_body(
     const uint8_t *__restrict__ a, const uint8_t *__restrict__ a_scales, const uint8_t *__restrict__ w,
     const uint8_t *__restrict__ ws, void *__restrict__ out, const uint32_t cols, const uint32_t inner,
@@ -89,7 +93,7 @@ __device__ __forceinline__ void opt_mma_fp8_body(
     __shared__ __align__(128) uint8_t s_a[2][OM_BM * OM_A_ROW];
     __shared__ __align__(128) uint8_t s_w[2][OM_W_TILES * 1024u];
     __shared__ uint8_t s_as[2][OM_BM * OM_KB];
-    __shared__ uint8_t s_ws[2][OM_W_TILES];
+    __shared__ uint8_t s_ws[2][W_RSCALE ? OM_BN * OM_KB : OM_W_TILES];
 
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
@@ -144,6 +148,15 @@ __device__ __forceinline__ void opt_mma_fp8_body(
                 s_as[buf][tid * OM_KB + j] =
                     token < tokens && kb < k_blocks ? __ldg(as_grp + (uint64_t)token * a_tok_stride / 32u + kb) : (uint8_t)0;
             }
+        } else if (W_RSCALE) {
+            // Thread 128 + c loads column c's scales (OM_BN = 128 columns).
+            const uint32_t col = tid - OM_BM;
+#pragma unroll
+            for (uint32_t j = 0; j < OM_KB; ++j) {
+                const uint32_t kb = kb0 + j;
+                s_ws[buf][col * OM_KB + j] =
+                    n0 + col < cols && kb < k_blocks ? __ldg(ws + (uint64_t)(n0 + col) * k_blocks + kb) : (uint8_t)0;
+            }
         } else if (tid < OM_BM + OM_W_TILES) {
             const uint32_t tile = tid - OM_BM;
             const uint32_t ct = tile / OM_KB;
@@ -191,7 +204,11 @@ __device__ __forceinline__ void opt_mma_fp8_body(
                     const uint32_t r23 = 16u + 8u * sub + row;
                     om_ldsm4(om_smem(&s_w[buf][om_w_off(tile, r23, half)]), b[2][0], b[2][1], b[3][0], b[3][1]);
                 }
-                const uint32_t sfb = s_ws[buf][tile];
+                // A tile's scale, or column (lane / 4) of each n8 sub-tile's (the B scale lanes).
+                uint32_t sfb[4];
+#pragma unroll
+                for (uint32_t nt = 0; nt < 4u; ++nt)
+                    sfb[nt] = W_RSCALE ? s_ws[buf][(wn * 32u + nt * 8u + (lane >> 2)) * OM_KB + j] : s_ws[buf][tile];
 #pragma unroll
                 for (uint32_t mt = 0; mt < 4u; ++mt) {
                     const uint32_t rb = wm * 64u + mt * 16u;
@@ -201,7 +218,7 @@ __device__ __forceinline__ void opt_mma_fp8_body(
                     om_ldsm4(om_smem(&s_a[buf][om_a_off(row, chunk)]), af[0], af[1], af[2], af[3]);
                     const uint32_t sfa = s_as[buf][(rb + (lane >> 2) + 8u * (lane & 1u)) * OM_KB + j];
 #pragma unroll
-                    for (uint32_t nt = 0; nt < 4u; ++nt) om_mma_e4m3(acc[mt][nt], af, b[nt][0], b[nt][1], sfa, sfb);
+                    for (uint32_t nt = 0; nt < 4u; ++nt) om_mma_e4m3(acc[mt][nt], af, b[nt][0], b[nt][1], sfa, sfb[nt]);
                 }
             }
         }
@@ -261,6 +278,16 @@ extern "C" __global__ void __launch_bounds__(OM_THREADS) opt_mma_fp8_rows_bf16o(
                                   0u, 0u, 0u, 0u, 0u);
 }
 
+// The drafter's head logits: row-major weights with per-row scales, f32 out (groups 1).
+extern "C" __global__ void __launch_bounds__(OM_THREADS) opt_mma_fp8_rowscale_f32o(
+    const uint8_t *__restrict__ a, const uint8_t *__restrict__ a_scales, const uint8_t *__restrict__ w,
+    const uint8_t *__restrict__ ws, float *__restrict__ out, const uint32_t cols, const uint32_t inner,
+    const uint32_t tokens, const uint64_t a_tok_stride, const uint64_t out_tok_stride) {
+    OPT_PDL_ENTRY();
+    opt_mma_fp8_body<true, true, true>(a, a_scales, w, ws, out, cols, inner, tokens, a_tok_stride,
+                                       out_tok_stride, 0u, 0u, 0u, 0u, 0u);
+}
+
 // ---- f32 and bf16 activations: the same B12x E4M3 weights on the bf16 tensor cores.
 //
 // opt_mma_{f32a_f32o, f32a_bf16o, bf16a_bf16o}: the opt GEMV's f32- and bf16-activation kinds
@@ -282,6 +309,7 @@ extern "C" __global__ void __launch_bounds__(OM_THREADS) opt_mma_fp8_rows_bf16o(
 #define OB_W_BF16 1   // host weights: the same tiling, bf16 elements, no scales
 #define OB_W_F32 2    // host weights, f32 elements (split like an f32 activation)
 #define OB_W_ROW 3    // plain row-major bf16 [cols][inner] (the router gate)
+#define OB_W_FP8ROW 4 // row-major E4M3 [cols][inner], one ue8m0 per row per 32 along K (the drafter head)
 #define OB_LD 40u   // bf16 per shared row: 32 + 8 padding, 80 bytes, so ldmatrix phases do not conflict
 
 __device__ __forceinline__ void ob_mma(float d[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
@@ -328,8 +356,9 @@ __device__ __forceinline__ void opt_mma_bf16_body(
 
     const uint64_t a_grp = group * a_grp_stride;
     // A weight element's bytes: E4M3 codes, or the host weights' bf16 / f32.
-    constexpr uint32_t WB = WMODE == OB_W_FP8 ? 1u : WMODE == OB_W_F32 ? 4u : 2u;
-    const uint8_t *w_grp = WMODE == OB_W_ROW ? w + group * w_grp_stride
+    constexpr bool WFP8 = WMODE == OB_W_FP8 || WMODE == OB_W_FP8ROW;
+    constexpr uint32_t WB = WFP8 ? 1u : WMODE == OB_W_F32 ? 4u : 2u;
+    const uint8_t *w_grp = WMODE == OB_W_ROW || WMODE == OB_W_FP8ROW ? w + group * w_grp_stride
                                              : w + group * w_grp_stride + (uint64_t)(n0 >> 5) * k_row * 1024u * WB;
     const uint8_t *ws_grp = WMODE == OB_W_FP8 ? ws + group * s_grp_stride + (uint64_t)(n0 >> 5) * k_row : ws;
 
@@ -365,13 +394,18 @@ __device__ __forceinline__ void opt_mma_bf16_body(
             if constexpr (WMODE == OB_W_ROW) {
                 const uint64_t col = n0 + w_tile * 32u + w_col;
                 src = reinterpret_cast<const uint4 *>(w_grp + (col * inner + kb * 32u + w_half * 16u) * 2u);
+            } else if constexpr (WMODE == OB_W_FP8ROW) {
+                const uint64_t col = n0 + w_tile * 32u + w_col;
+                src = reinterpret_cast<const uint4 *>(w_grp + col * inner + kb * 32u + w_half * 16u);
             } else {
                 const uint8_t *tile = w_grp + ((uint64_t)w_tile * k_row + kb) * 1024u * WB;
                 src = reinterpret_cast<const uint4 *>(tile + (w_col * 32u + w_half * 16u) * WB);
             }
 #pragma unroll
             for (uint32_t v = 0; v < WB; ++v) rw[v] = __ldg(src + v);
-            rs = WMODE == OB_W_FP8 ? __ldg(ws_grp + (uint64_t)w_tile * k_row + kb) : (uint8_t)127u;
+            rs = WMODE == OB_W_FP8      ? __ldg(ws_grp + (uint64_t)w_tile * k_row + kb)
+                 : WMODE == OB_W_FP8ROW ? __ldg(ws + (uint64_t)(n0 + w_tile * 32u + w_col) * k_row + kb)
+                                        : (uint8_t)127u;
         } else {
 #pragma unroll
             for (uint32_t v = 0; v < WB; ++v) rw[v] = make_uint4(0u, 0u, 0u, 0u);
@@ -403,7 +437,7 @@ __device__ __forceinline__ void opt_mma_bf16_body(
         }
         const uint32_t w_at = (w_tile * 32u + w_col) * OB_LD + w_half * 16u;
         __nv_bfloat16 *dst = &s_w[w_at];
-        if constexpr (WMODE == OB_W_FP8) {
+        if constexpr (WFP8) {
             const float scale = opt_ue8m0_f32(rs);
             const uint4 r = rw[0];
             *reinterpret_cast<uint4 *>(dst) =
@@ -531,25 +565,41 @@ __device__ __forceinline__ void opt_mma_bf16_body(
 OPT_MMA_BF16_ENTRY(opt_mma_f32a_f32o, OB_A_F32, true)
 OPT_MMA_BF16_ENTRY(opt_mma_f32a_bf16o, OB_A_F32, false)
 OPT_MMA_BF16_ENTRY(opt_mma_bf16a_bf16o, OB_A_BF16, false)
+OPT_MMA_BF16_ENTRY(opt_mma_bf16a_f32o, OB_A_BF16, true)
+
+// The drafter's head logits: bf16 rows x the row-major E4M3 head copy (opt_draft_head_fp8), f32
+// out. Grid (ceil(cols / 128), ceil(tokens / 128)), 256 threads; cols a multiple of 32.
+extern "C" __global__ void __launch_bounds__(OM_THREADS) opt_mma_bf16a_fp8row_f32o(
+    const __nv_bfloat16 *__restrict__ a, const uint8_t *__restrict__ w, const uint8_t *__restrict__ ws,
+    float *__restrict__ out, const uint32_t cols, const uint32_t inner, const uint32_t tokens,
+    const uint64_t a_tok_stride, const uint64_t out_tok_stride) {
+    OPT_PDL_ENTRY();
+    opt_mma_bf16_body<OB_A_BF16, OB_W_FP8ROW, true>(a, w, ws, out, cols, inner, tokens, a_tok_stride, out_tok_stride,
+                                                   0u, 0u, 0u, 0u, 0u);
+}
 
 // opt_mma_hostw_{bf16w, bf16w_f32o, f32w_f32o}: the host-weight GEMVs (b12x_hostw_gemv_m1's three
 //   modes: an f32 activation row against bf16 or f32 weights in the B12x tiling) over many rows.
 //   Grid (ceil(cols / 128), ceil(tokens / 128)), 256 threads. f32 weights are split like the
-//   activation: head x head + tail x head + head x tail.
-#define OPT_MMA_HOSTW_ENTRY(name, WMODE, W_T, OUTF32)                                               \
+//   activation: head x head + tail x head + head x tail. The bf16a forms take bf16 activation rows
+//   (a sequence-parallel seam's gathered rows), the f32 forms' bits on bf16-exact values.
+#define OPT_MMA_HOSTW_ENTRY(name, AMODE, A_T, WMODE, W_T, OUTF32)                                   \
     extern "C" __global__ void __launch_bounds__(OM_THREADS) name(                                 \
-        const float *__restrict__ a, const W_T *__restrict__ w, void *__restrict__ out,           \
+        const A_T *__restrict__ a, const W_T *__restrict__ w, void *__restrict__ out,             \
         const uint32_t cols, const uint32_t inner, const uint32_t tokens,                          \
         const uint64_t a_tok_stride, const uint64_t out_tok_stride) {                              \
         OPT_PDL_ENTRY();                                                                           \
-        opt_mma_bf16_body<OB_A_F32, WMODE, OUTF32>(a, reinterpret_cast<const uint8_t *>(w), nullptr, out, \
-                                                   cols, inner, tokens, a_tok_stride,              \
-                                                   out_tok_stride, 0u, 0u, 0u, 0u, 0u);            \
+        opt_mma_bf16_body<AMODE, WMODE, OUTF32>(a, reinterpret_cast<const uint8_t *>(w), nullptr, out, \
+                                                cols, inner, tokens, a_tok_stride,                 \
+                                                out_tok_stride, 0u, 0u, 0u, 0u, 0u);               \
     }
 
-OPT_MMA_HOSTW_ENTRY(opt_mma_hostw_bf16w, OB_W_BF16, __nv_bfloat16, false)
-OPT_MMA_HOSTW_ENTRY(opt_mma_hostw_bf16w_f32o, OB_W_BF16, __nv_bfloat16, true)
-OPT_MMA_HOSTW_ENTRY(opt_mma_hostw_f32w_f32o, OB_W_F32, float, true)
+OPT_MMA_HOSTW_ENTRY(opt_mma_hostw_bf16w, OB_A_F32, float, OB_W_BF16, __nv_bfloat16, false)
+OPT_MMA_HOSTW_ENTRY(opt_mma_hostw_bf16w_f32o, OB_A_F32, float, OB_W_BF16, __nv_bfloat16, true)
+OPT_MMA_HOSTW_ENTRY(opt_mma_hostw_f32w_f32o, OB_A_F32, float, OB_W_F32, float, true)
+OPT_MMA_HOSTW_ENTRY(opt_mma_hostw_bf16a_bf16w, OB_A_BF16, __nv_bfloat16, OB_W_BF16, __nv_bfloat16, false)
+OPT_MMA_HOSTW_ENTRY(opt_mma_hostw_bf16a_bf16w_f32o, OB_A_BF16, __nv_bfloat16, OB_W_BF16, __nv_bfloat16, true)
+OPT_MMA_HOSTW_ENTRY(opt_mma_hostw_bf16a_f32w_f32o, OB_A_BF16, __nv_bfloat16, OB_W_F32, float, true)
 
 // The router over a chunk: opt_mma_router_dots writes the raw gate dots [tokens][experts] (bf16
 //   x against the row-major bf16 gate, f32 accumulation; grid (experts / 128, ceil(tokens / 128))),
@@ -634,7 +684,9 @@ extern "C" __global__ void __launch_bounds__(256) opt_mma_router_topk(
 //
 // opt_mma_moe_plan: one block of 1024 threads. Counts the rows per expert, lays the groups out in
 //   expert order, splits each into items of <= 64 rows and scatters the row ids. items[i] =
-//   (expert, first, count, 0); items_count[0] = the item count.
+//   (expert, first, count, 0); items_count[0] = the item count. With seg_tokens != 0 the tokens
+//   are segments of seg_tokens (several chunks' rows, each at its segment's start) and only the
+//   first seg_n[s] tokens of segment s are routed: the rest are gaps no item holds.
 // opt_mma_moe_gate_up: grid (576 / 64, max items), 256 threads; block (x, y) = item y, intermediate
 //   columns 64 x .. 64 x + 63, gate and up together. Epilogue: the opt_moe chain (bf16 gate and up,
 //   clamp, SwiGLU, routing weight, bf16, MX quantiser) into codes [rows][576], scales [rows][18].
@@ -687,16 +739,28 @@ __device__ __forceinline__ uint32_t omm_w_off(uint32_t col, uint32_t block) {
     return col * OMM_W_ROW + ((block ^ ((col >> 1) & 3u)) << 4);
 }
 
+#define OMM_MAX_SEGS 4u
+
 extern "C" __global__ void __launch_bounds__(1024) opt_mma_moe_plan(
     const uint32_t *__restrict__ ids, const uint32_t rows, const uint32_t experts,
-    uint32_t *__restrict__ sorted, uint32_t *__restrict__ items, uint32_t *__restrict__ items_count) {
+    uint32_t *__restrict__ sorted, uint32_t *__restrict__ items, uint32_t *__restrict__ items_count,
+    const uint32_t seg_tokens, const uint32_t seg_n0, const uint32_t seg_n1, const uint32_t seg_n2,
+    const uint32_t seg_n3) {
     OPT_PDL_ENTRY();
     __shared__ uint32_t s_count[512];
     __shared__ uint32_t s_cursor[512];
     const uint32_t tid = threadIdx.x;
+    const uint32_t seg_n[OMM_MAX_SEGS] = {seg_n0, seg_n1, seg_n2, seg_n3};
+    auto live = [&](uint32_t r) {
+        if (seg_tokens == 0u) return true;
+        const uint32_t token = r / OMM_TOPK;
+        const uint32_t seg = token / seg_tokens;
+        return seg < OMM_MAX_SEGS && token - seg * seg_tokens < seg_n[seg];
+    };
     for (uint32_t e = tid; e < 512u; e += blockDim.x) s_count[e] = 0u;
     __syncthreads();
     for (uint32_t r = tid; r < rows; r += blockDim.x) {
+        if (!live(r)) continue;
         const uint32_t id = ids[r] < experts ? ids[r] : 0u;
         atomicAdd(&s_count[id], 1u);
     }
@@ -719,6 +783,7 @@ extern "C" __global__ void __launch_bounds__(1024) opt_mma_moe_plan(
     }
     __syncthreads();
     for (uint32_t r = tid; r < rows; r += blockDim.x) {
+        if (!live(r)) continue;
         const uint32_t id = ids[r] < experts ? ids[r] : 0u;
         sorted[atomicAdd(&s_cursor[id], 1u)] = r;
     }
@@ -1039,14 +1104,17 @@ extern "C" __global__ void __launch_bounds__(256) opt_mma_moe_combine(
 // ---- The indexer over a chunk: the scores on the FP4 tensor cores.
 //
 // opt_bulk_fp4_pack: re-encodes FP4 round-tripped f32 values (an E2M1 value times a power of two
-//   per 32, as fp4_round_trip_bf16_to_f32 writes them) as E2M1 codes in 8-bit containers (bits
-//   5:2, the kind::mxf8f6f4 operand form) plus one ue8m0 per 32. With the scale 2^(E - 2), E the
-//   exponent of the block's largest magnitude, every value is a code times the scale exactly (the
-//   E2M1 grid is closed under doubling up to 6), so the MMA multiplies the reference's operands.
-//   One thread per 32-value block.
+//   per 32, as fp4_round_trip_bf16_to_f32 writes them) as packed E2M1 codes (two per byte, the
+//   lower dimension in the low nibble: the kind::mxf4nvf4 operand form) plus one ue8m0 per 32.
+//   With the scale 2^(E - 2), E the exponent of the block's largest magnitude, every value is a
+//   code times the scale exactly (the E2M1 grid is closed under doubling up to 6), so the MMA
+//   multiplies the reference's operands. One thread per 32-value block. frag = 0 writes the codes
+//   row-major (16 bytes per block: the queries); frag = 1 writes 128-wide rows (the keys) in MMA
+//   fragment order: eight keys per 512 bytes, the 16 bytes lane l of a warp loads at l * 16, i.e.
+//   key 8 G + g's dimensions 32 c + 8 q .. + 7 at G * 512 + (4 g + q) * 16 + 4 c.
 extern "C" __global__ void __launch_bounds__(256) opt_bulk_fp4_pack(
     const float *__restrict__ src, uint8_t *__restrict__ codes, uint8_t *__restrict__ scales,
-    const uint32_t blocks) {
+    const uint32_t blocks, const uint32_t frag) {
     OPT_PDL_ENTRY();
     const uint32_t blk = blockIdx.x * blockDim.x + threadIdx.x;
     if (blk >= blocks) return;
@@ -1064,31 +1132,67 @@ extern "C" __global__ void __launch_bounds__(256) opt_bulk_fp4_pack(
     (void)frexpf(amax, &ex);   // amax = m 2^ex, m in [0.5, 1): the largest exponent E is ex - 1
     const int code = amax > 0.0f ? max(1, min(254, ex - 3 + 127)) : 127;
     const float inv = __uint_as_float((uint32_t)(254 - code) << 23);   // 2^-(code - 127)
-    uint32_t packed[8];
+    uint32_t packed[4];
 #pragma unroll
-    for (int w = 0; w < 8; ++w) {
+    for (int w = 0; w < 4; ++w) {
         uint32_t word = 0u;
 #pragma unroll
-        for (int b = 0; b < 4; ++b) {
-            const uint32_t nibble = spark_fp4_e2m1_encode_fallback(x[4 * w + b] * inv);
-            word |= (nibble << 2) << (8 * b);
-        }
+        for (int n = 0; n < 8; ++n) word |= (uint32_t)spark_fp4_e2m1_encode_fallback(x[8 * w + n] * inv) << (4 * n);
         packed[w] = word;
     }
-    uint4 *out = reinterpret_cast<uint4 *>(codes + (uint64_t)blk * 32u);
-    out[0] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
-    out[1] = make_uint4(packed[4], packed[5], packed[6], packed[7]);
+    if (frag == 0u) {
+        *reinterpret_cast<uint4 *>(codes + (uint64_t)blk * 16u) = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+    } else {
+        const uint32_t key = blk >> 2, c = blk & 3u;
+        uint32_t *base = reinterpret_cast<uint32_t *>(codes + (uint64_t)(key >> 3) * 512u + (key & 7u) * 64u + c * 4u);
+#pragma unroll
+        for (int w = 0; w < 4; ++w) base[w * 4] = packed[w];
+    }
     scales[blk] = (uint8_t)code;
 }
 
-__device__ __forceinline__ void om_mma_e2m1(float d[4], const uint32_t a[4], uint32_t b0, uint32_t b1,
+__device__ __forceinline__ void om_mma_nvf4(float d[4], const uint32_t a[4], uint32_t b0, uint32_t b1,
                                             uint32_t sfa, uint32_t sfb) {
     asm volatile(
-        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e2m1.e2m1.f32.ue8m0 "
+        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 "
         "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3},{%10},{%11,%12},{%13},{%14,%15};\n"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "h"((uint16_t)0),
           "h"((uint16_t)0), "r"(sfb), "h"((uint16_t)0), "h"((uint16_t)0));
+}
+// d = a x b + 0: an accumulator's first K-block, so no zero fill is kept live.
+__device__ __forceinline__ void om_mma_nvf4_first(float d[4], const uint32_t a[4], uint32_t b0, uint32_t b1,
+                                                  uint32_t sfa, uint32_t sfb) {
+    asm volatile(
+        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 "
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%14,%14,%14,%14},{%10},{%11,%12},{%13},{%11,%12};\n"
+        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "h"((uint16_t)0),
+          "h"((uint16_t)0), "r"(sfb), "f"(0.0f));
+}
+// The pair (lo, hi) with negatives clamped to 0, rounded to bf16 (lo in the low half).
+__device__ __forceinline__ uint32_t ois_relu_bf16x2(float lo, float hi) {
+    uint32_t d;
+    asm("cvt.rn.relu.bf16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(hi), "f"(lo));
+    return d;
+}
+__device__ __forceinline__ uint32_t ois_bf16x2(float lo, float hi) {
+    uint32_t d;
+    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(d) : "f"(hi), "f"(lo));
+    return d;
+}
+// x * w in bf16 pairs, rounded once: the product of two bf16 values is exact in f32, so this is
+// the reference's bf16(raw * weight).
+__device__ __forceinline__ uint32_t ois_mul_bf16x2(uint32_t x, uint32_t w) {
+    uint32_t d;
+    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(d) : "r"(x), "r"(w));
+    return d;
+}
+// lo += the pair's low bf16, hi += its high bf16: one rounded f32 add each (FHADD.BF16).
+__device__ __forceinline__ void ois_fold(float &lo, float &hi, uint32_t pair) {
+    asm("{\n\t.reg .b16 l, h;\n\tmov.b32 {l, h}, %2;\n\tadd.rn.f32.bf16 %0, l, %0;\n\tadd.rn.f32.bf16 %1, h, %1;\n\t}"
+        : "+f"(lo), "+f"(hi)
+        : "r"(pair));
 }
 
 // opt_mma_index_scores: the index scores of a chunk's rows against the compressed keys. Row y is
@@ -1096,128 +1200,145 @@ __device__ __forceinline__ void om_mma_e2m1(float d[4], const uint32_t a[4], uin
 //   reference's chain: per head, raw = bf16(dot(q_head, key)); if raw > 0 the head adds
 //   bf16(raw * weight); the heads are folded in ascending order with rounded adds and the sum is
 //   rounded to bf16. The dots are the MMA's (exact products, f32 accumulation in its own order);
-//   everything after them is the reference's arithmetic.
-//   Operands from opt_bulk_fp4_pack: q [tokens][32 heads][128], keys [n][128], 4 ue8m0 per 128.
-//   Grid (ceil(max reach / 128), ceil(tokens / 4)), 256 threads: a block owns 4 rows x 128 keys;
-//   warp w computes row w / 2 against keys 64 (w % 2) .. + 63 (2 x 8 MMA tiles over K = 128),
-//   then folds its terms 16 keys at a time through shared memory, one lane per key.
-#define OIS_KEYS 128u
-#define OIS_DIM 128u
-#define OIS_HEADS 32u
-extern "C" __global__ void __launch_bounds__(OM_THREADS) opt_mma_index_scores(
+//   everything after them is the reference's arithmetic. The scores land as bf16 (they are bf16
+//   values), `scores[y * score_stride + key]`.
+//   Operands from opt_bulk_fp4_pack: q [tokens][32 heads][64 bytes] (frag 0), keys in fragment
+//   order (frag 1), 4 ue8m0 per 128. weights: the rows' 32 head weights, bf16 values in f32.
+//   mask_in (or null): a consumed candidate mask per row (mask_stride words); an eight-key group
+//   with no candidate is not computed and a 64-key run with none is not written (opt_select_rows
+//   reads neither).
+//   Grid (ceil(tokens / 8), ceil(max reach / (128 tiles_per_block))), 256 threads: warp w owns row
+//   8 blockIdx.x + w over the block's keys, 64 at a time: its q fragments stay in registers, the
+//   keys stream from global (one 16-byte load per lane per 8 keys; the block's other rows find
+//   them in L1), 32 MMAs (m16n8k64 kind::mxf4nvf4: 32 heads x 64 keys x 128), the products to
+//   shared memory as bf16 pairs [32 key pairs][32 heads] (head h of pair p at h ^ (8 (p % 4) +
+//   4 (p / 4 % 2)): conflict-free stores, and conflict-free 16-byte loads for the fold), then lane
+//   l folds keys 2 l and 2 l + 1 while the next 64 keys load. No block barriers: the warps drift,
+//   so one's MMAs run under another's fold.
+#define OIS_ROWS 8u
+#define OIS_PASS 64u
+#define OIS_QROW 64u   // packed bytes per head (and per key)
+extern "C" __global__ void __launch_bounds__(OM_THREADS, 2) opt_mma_index_scores(
     const uint8_t *__restrict__ q_codes, const uint8_t *__restrict__ q_scales,
-    const uint8_t *__restrict__ k_codes, const uint8_t *__restrict__ k_scales,
-    const float *__restrict__ weights, float *__restrict__ scores, const uint32_t tokens,
-    const uint32_t p0, const uint32_t ratio, const uint32_t score_stride) {
+    const uint8_t *__restrict__ k_frag, const uint8_t *__restrict__ k_scales,
+    const float *__restrict__ weights, uint16_t *__restrict__ scores, const uint32_t tokens,
+    const uint32_t p0, const uint32_t ratio, const uint32_t score_stride, const uint32_t tiles_per_block,
+    const uint32_t *__restrict__ mask_in, const uint32_t mask_stride) {
     OPT_PDL_ENTRY();
-    __shared__ __align__(128) uint8_t s_k[OIS_KEYS * OIS_DIM];
-    __shared__ __align__(16) uint8_t s_ks[OIS_KEYS * 4u];
-    __shared__ float s_t[8][16][OIS_HEADS + 1u];
+    __shared__ __align__(16) uint32_t s_t[OIS_ROWS][32u * 32u];
 
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t warp = tid >> 5;
-    const uint32_t y0 = blockIdx.y * 4u;
-    const uint32_t key0 = blockIdx.x * OIS_KEYS;
-    if (y0 >= tokens) return;
-    const uint32_t y_last = min(y0 + 3u, tokens - 1u);
-    const uint32_t reach_max = (p0 + y_last + 1u) / ratio;
-    if (key0 >= reach_max) return;
-    const uint32_t n_keys = min(OIS_KEYS, reach_max - key0);
-
-    // Keys: 128 rows of 8 chunks; chunk c of key r lives at c ^ (r % 8), so the eight keys an MMA
-    // fragment load reads fall in eight bank groups.
-#pragma unroll
-    for (uint32_t i = 0; i < 4u; ++i) {
-        const uint32_t idx = tid + i * OM_THREADS;
-        const uint32_t key = idx >> 3;
-        const uint32_t c = idx & 7u;
-        const bool valid = key < n_keys;
-        const uint8_t *src = valid ? k_codes + (uint64_t)(key0 + key) * OIS_DIM + c * 16u : k_codes;
-        om_cp16(om_smem(&s_k[key * OIS_DIM + ((c ^ (key & 7u)) << 4)]), src, valid);
-    }
-    om_commit();
-    if (tid < OIS_KEYS) {
-        *reinterpret_cast<uint32_t *>(&s_ks[tid * 4u]) =
-            tid < n_keys ? __ldg(reinterpret_cast<const uint32_t *>(k_scales + (uint64_t)(key0 + tid) * 4u)) : 0u;
-    }
-    om_wait<0>();
-    __syncthreads();
-
-    const uint32_t y = y0 + (warp >> 1);
-    const uint32_t n_row = y < tokens ? (p0 + y + 1u) / ratio : 0u;
-    const uint32_t kh0 = (warp & 1u) * 64u;
-    if (key0 + kh0 >= n_row) return;   // no later barrier: the warps below only use their own slots
-
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t y = blockIdx.x * OIS_ROWS + warp;
+    if (y >= tokens) return;   // no barriers below
+    const uint32_t n_row = (p0 + y + 1u) / ratio;
+    const uint32_t key_begin = blockIdx.y * tiles_per_block * 128u;
+    const uint32_t key_end = min(key_begin + tiles_per_block * 128u, n_row);
+    if (key_begin >= key_end) return;
     const uint32_t g = lane >> 2;
     const uint32_t q = lane & 3u;
-    const uint8_t *qrow = q_codes + (uint64_t)y * OIS_HEADS * OIS_DIM;
-    uint32_t a[2][4][4];
-    uint32_t sfa[2][4];
-#pragma unroll
-    for (uint32_t mt = 0; mt < 2u; ++mt) {
-        const uint32_t h0 = mt * 16u + g;
-#pragma unroll
-        for (uint32_t kb = 0; kb < 4u; ++kb) {
-            a[mt][kb][0] = __ldg(reinterpret_cast<const uint32_t *>(qrow + h0 * OIS_DIM + kb * 32u + 4u * q));
-            a[mt][kb][1] = __ldg(reinterpret_cast<const uint32_t *>(qrow + (h0 + 8u) * OIS_DIM + kb * 32u + 4u * q));
-            a[mt][kb][2] = __ldg(reinterpret_cast<const uint32_t *>(qrow + h0 * OIS_DIM + kb * 32u + 16u + 4u * q));
-            a[mt][kb][3] = __ldg(reinterpret_cast<const uint32_t *>(qrow + (h0 + 8u) * OIS_DIM + kb * 32u + 16u + 4u * q));
-            sfa[mt][kb] = __ldg(q_scales + ((uint64_t)y * OIS_HEADS + mt * 16u + (lane >> 2) + 8u * (lane & 1u)) * 4u + kb);
-        }
-    }
-    float acc[8][2][4];
-#pragma unroll
-    for (uint32_t nt = 0; nt < 8u; ++nt)
-#pragma unroll
-        for (uint32_t mt = 0; mt < 2u; ++mt)
-#pragma unroll
-            for (uint32_t e = 0; e < 4u; ++e) acc[nt][mt][e] = 0.0f;
-#pragma unroll
-    for (uint32_t nt = 0; nt < 8u; ++nt) {
-        const uint32_t key = kh0 + nt * 8u + g;
-#pragma unroll
-        for (uint32_t kb = 0; kb < 4u; ++kb) {
-            const uint32_t b0 = *reinterpret_cast<const uint32_t *>(&s_k[key * OIS_DIM + (((2u * kb) ^ (key & 7u)) << 4) + 4u * q]);
-            const uint32_t b1 = *reinterpret_cast<const uint32_t *>(&s_k[key * OIS_DIM + (((2u * kb + 1u) ^ (key & 7u)) << 4) + 4u * q]);
-            const uint32_t sfb = s_ks[key * 4u + kb];
-#pragma unroll
-            for (uint32_t mt = 0; mt < 2u; ++mt) om_mma_e2m1(acc[nt][mt], a[mt][kb], b0, b1, sfa[mt][kb], sfb);
-        }
-    }
 
-    // The lane's four heads: g, g + 8, 16 + g, 24 + g (acc[.][mt][e]: head 16 mt + g + 8 (e / 2)).
-    float w[2][2];
+    // The row's A fragments: heads 16 mt + g (+ 8), dimensions 64 kb + 8 q .. (+ 32); the scale
+    // pair of head 16 mt + g + 8 (lane % 2); the weights of the lane's heads as bf16 pairs.
+    uint32_t a[2][2][4];
+    uint32_t sfa[2][2];
+    uint32_t w2[2][2];
+    {
+        const uint8_t *qrow = q_codes + (uint64_t)y * 32u * OIS_QROW;
 #pragma unroll
-    for (uint32_t mt = 0; mt < 2u; ++mt) {
-        w[mt][0] = __ldg(weights + (uint64_t)y * OIS_HEADS + mt * 16u + g);
-        w[mt][1] = __ldg(weights + (uint64_t)y * OIS_HEADS + mt * 16u + g + 8u);
-    }
+        for (uint32_t mt = 0; mt < 2u; ++mt) {
+            const uint32_t h0 = mt * 16u + g;
 #pragma unroll
-    for (uint32_t round = 0; round < 4u; ++round) {
+            for (uint32_t kb = 0; kb < 2u; ++kb) {
+                a[mt][kb][0] = __ldg(reinterpret_cast<const uint32_t *>(qrow + h0 * OIS_QROW + kb * 32u + 4u * q));
+                a[mt][kb][1] = __ldg(reinterpret_cast<const uint32_t *>(qrow + (h0 + 8u) * OIS_QROW + kb * 32u + 4u * q));
+                a[mt][kb][2] = __ldg(reinterpret_cast<const uint32_t *>(qrow + h0 * OIS_QROW + kb * 32u + 16u + 4u * q));
+                a[mt][kb][3] = __ldg(reinterpret_cast<const uint32_t *>(qrow + (h0 + 8u) * OIS_QROW + kb * 32u + 16u + 4u * q));
+            }
+            const uint32_t sw = __ldg(reinterpret_cast<const uint32_t *>(q_scales) + (uint64_t)y * 32u + mt * 16u + g + 8u * (lane & 1u));
+            sfa[mt][0] = sw & 0xFFFFu;
+            sfa[mt][1] = sw >> 16;
 #pragma unroll
-        for (uint32_t j = 0; j < 2u; ++j) {
-            const uint32_t nt = 2u * round + j;
-#pragma unroll
-            for (uint32_t mt = 0; mt < 2u; ++mt) {
-#pragma unroll
-                for (uint32_t e = 0; e < 4u; ++e) {
-                    const uint32_t head = mt * 16u + g + 8u * (e >> 1);
-                    const uint32_t keyl = j * 8u + 2u * q + (e & 1u);
-                    const float raw = __bfloat162float(__float2bfloat16_rn(acc[nt][mt][e]));
-                    s_t[warp][keyl][head] =
-                        raw > 0.0f ? __bfloat162float(__float2bfloat16_rn(__fmul_rn(raw, w[mt][e >> 1]))) : 0.0f;
-                }
+            for (uint32_t hh = 0; hh < 2u; ++hh) {
+                const uint32_t wb = __float_as_uint(__ldg(weights + (uint64_t)y * 32u + mt * 16u + g + 8u * hh)) >> 16;
+                w2[mt][hh] = wb | (wb << 16);
             }
         }
-        __syncwarp();
-        const uint32_t key = key0 + kh0 + round * 16u + lane;
-        if (lane < 16u && key < n_row) {
-            float sum = 0.0f;
+    }
+    const uint32_t *mrow = mask_in != nullptr ? mask_in + (uint64_t)y * mask_stride : nullptr;
+    // The eight-key groups of the 64 keys at kbase that are computed (bit nt).
+    const auto pass_groups = [&](uint32_t kbase) -> uint32_t {
+        if (mrow == nullptr) return 0xFFu;
+        const uint32_t m0 = __ldg(mrow + kbase / 32u), m1 = __ldg(mrow + kbase / 32u + 1u);
+        uint32_t bits = 0u;
 #pragma unroll
-            for (uint32_t h = 0; h < OIS_HEADS; ++h) sum = __fadd_rn(sum, s_t[warp][lane][h]);
-            scores[(uint64_t)y * score_stride + key] = __bfloat162float(__float2bfloat16_rn(sum));
+        for (uint32_t b = 0; b < 4u; ++b) {
+            bits |= ((m0 >> (8u * b)) & 0xFFu) != 0u ? 1u << b : 0u;
+            bits |= ((m1 >> (8u * b)) & 0xFFu) != 0u ? 1u << (b + 4u) : 0u;
         }
+        return bits;
+    };
+    uint4 bf[8];
+    uint32_t sb[8];
+    const auto fetch = [&](uint32_t kbase, uint32_t groups) {
+#pragma unroll
+        for (uint32_t nt = 0; nt < 8u; ++nt) {
+            const uint32_t key = kbase + nt * 8u;
+            if (((groups >> nt) & 1u) != 0u && key < n_row) {
+                bf[nt] = __ldg(reinterpret_cast<const uint4 *>(k_frag + (uint64_t)(key / 8u) * 512u) + lane);
+                sb[nt] = __ldg(reinterpret_cast<const uint32_t *>(k_scales) + min(key + g, n_row - 1u));
+            } else {
+                bf[nt] = make_uint4(0u, 0u, 0u, 0u);
+                sb[nt] = 0x7F7F7F7Fu;
+            }
+        }
+    };
+    uint32_t *st = s_t[warp];
+    uint32_t kbase = key_begin;
+    fetch(kbase, pass_groups(kbase));
+    while (kbase < key_end) {
+        float acc[8][2][4];
+#pragma unroll
+        for (uint32_t nt = 0; nt < 8u; ++nt) {
+#pragma unroll
+            for (uint32_t mt = 0; mt < 2u; ++mt) {
+                om_mma_nvf4_first(acc[nt][mt], a[mt][0], bf[nt].x, bf[nt].y, sfa[mt][0], sb[nt] & 0xFFFFu);
+                om_mma_nvf4(acc[nt][mt], a[mt][1], bf[nt].z, bf[nt].w, sfa[mt][1], sb[nt] >> 16);
+            }
+        }
+        // acc[nt][mt][e]: head 16 mt + g + 8 (e / 2), key 8 nt + 2 q + e % 2: pair 4 nt + q.
+#pragma unroll
+        for (uint32_t nt = 0; nt < 8u; ++nt)
+#pragma unroll
+            for (uint32_t mt = 0; mt < 2u; ++mt)
+#pragma unroll
+                for (uint32_t hh = 0; hh < 2u; ++hh) {
+                    const uint32_t raw = ois_relu_bf16x2(acc[nt][mt][2u * hh], acc[nt][mt][2u * hh + 1u]);
+                    const uint32_t swz = (q << 3) | ((nt & 1u) << 2);
+                    st[(nt * 4u + q) * 32u + ((mt * 16u + 8u * hh + g) ^ swz)] = ois_mul_bf16x2(raw, w2[mt][hh]);
+                }
+        __syncwarp();
+        const uint32_t here = kbase;
+        // The next 64 keys with a candidate (a consumed mask can leave whole runs without one).
+        uint32_t groups = 0u;
+        kbase += OIS_PASS;
+        while (kbase < key_end && (groups = pass_groups(kbase)) == 0u) kbase += OIS_PASS;
+        if (kbase < key_end) fetch(kbase, groups);
+        float lo = 0.0f, hi = 0.0f;
+        const uint32_t swz = ((lane & 3u) << 3) | (((lane >> 2) & 1u) << 2);
+#pragma unroll
+        for (uint32_t i = 0; i < 8u; ++i) {
+            const uint4 v = *reinterpret_cast<const uint4 *>(&st[lane * 32u + ((4u * i) ^ swz)]);
+            ois_fold(lo, hi, v.x);
+            ois_fold(lo, hi, v.y);
+            ois_fold(lo, hi, v.z);
+            ois_fold(lo, hi, v.w);
+        }
+        const uint32_t key = here + 2u * lane;
+        const uint32_t out = ois_bf16x2(lo, hi);
+        uint16_t *dst = scores + (uint64_t)y * score_stride + key;
+        if (key + 1u < n_row) *reinterpret_cast<uint32_t *>(dst) = out;
+        else if (key < n_row) *dst = (uint16_t)(out & 0xFFFFu);
         __syncwarp();
     }
 }

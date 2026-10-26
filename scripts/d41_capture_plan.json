@@ -19,7 +19,7 @@
    "sentinel_token": 0
   },
   "prompt_ids_source": "task-32 b69 fixture prompt ids (130) sha256 d02339f8d761a89dd9bc140624fbfe2904c8b3eb073bb3292ad319e5cff42dc6",
-  "close_margin_evidence": "docs/build/task32-evidence/length-probe-rows.json sha256 5fae4ee9933a551e9a1da486971ceb6e1c37fd9b8c78402e7fc90d67607f6400"
+  "close_margin_evidence": "docs/build/task32-evidence/length-probe-rows.json sha256 fcdb5d3806b5f04e3aa9ee8d5af012f1a338dd2008c7d89393db6c8377d738e2"
  },
  "recipe": {
   "max_tokens": 1,

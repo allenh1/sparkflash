@@ -8,10 +8,10 @@
 #
 # Rank table used by this runner (the table the 2026-10-20 run used, and the one task-53/55 should
 # use for this cluster; see the doc for why it differs from the design doc's rail-1 default):
-#   rank 0 node0 192.0.2.80
-#   rank 1 node1 192.0.2.88
-#   rank 2 node3 192.0.2.59
-#   rank 3 node2 192.0.2.68
+#   rank 0 spark-0 198.51.100.80
+#   rank 1 spark-1 198.51.100.88
+#   rank 2 spark-2 198.51.100.59
+#   rank 3 spark-3 198.51.100.68
 #
 # Usage:
 #   scripts/rdma-bringup.sh build                 cross-build the gate and probe binaries
@@ -40,11 +40,11 @@ EVIDENCE_ROOT="${EVIDENCE_ROOT:-/home/user/phase2-evidence/window-2026-10-18}"
 RUN_ID="${RUN_ID:-rdma-t35-$(date -u +%Y%m%dT%H%M%SZ)}"
 REMOTE_DIR="$EVIDENCE_ROOT/$RUN_ID"
 LOCAL_DIR="${LOCAL_DIR:-$REPO_ROOT/target/rdma-bringup/$RUN_ID}"
-SSH_USER="${SSH_USER:-allenh1}"
+SSH_USER="${SSH_USER:-user}"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8)
-NODES=(${SPARK_NODES:-192.0.2.80 192.0.2.88 192.0.2.59 192.0.2.68})
-NAMES=(node0 node1 node3 node2)
-PEERS="${SPARK_COMM_PEERS:-192.0.2.80,192.0.2.88,192.0.2.59,192.0.2.68}"
+NODES=(${SPARK_NODES:-198.51.100.80 198.51.100.88 198.51.100.59 198.51.100.68})
+NAMES=(spark-0 spark-1 spark-2 spark-3)
+PEERS="${SPARK_COMM_PEERS:-198.51.100.80,198.51.100.88,198.51.100.59,198.51.100.68}"
 CONTROL_PORT="${SPARK_COMM_CONTROL_PORT:-18515}"
 TIMEOUT_MS="${SPARK_COMM_TIMEOUT_MS:-60000}"
 SAMPLES="${SAMPLES:-200}"

@@ -53,8 +53,8 @@ DECODE_STEPS="${DECODE_STEPS:-1}"
 WALL_LIMIT="${WALL_LIMIT:-1500}"
 MEM_FLOOR_MIB="${MEM_FLOOR_MIB:-97280}"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
-SSH_TARGETS=(node0 192.0.2.88 192.0.2.59 192.0.2.68)
-PEERS_CSV="192.0.2.80,192.0.2.88,192.0.2.59,192.0.2.68"
+SSH_TARGETS=(spark-0 198.51.100.88 198.51.100.59 198.51.100.68)
+PEERS_CSV="198.51.100.80,198.51.100.88,198.51.100.59,198.51.100.68"
 KERNEL_CUBIN_DIR="${KERNEL_CUBIN_DIR:-/home/user/sparkflash-bin/cubins}"
 TOKEN_IDS="${TOKEN_IDS:-}"
 # Teacher-forced reference token per dumped position (QA like-for-like vector). Optional: when set,
@@ -129,7 +129,7 @@ mode_rank_local() {
         --warmup-steps "$WARMUP_STEPS" --decode-steps "$DECODE_STEPS"
 }
 
-remote() { local node="$1"; shift; ssh -n "${SSH_OPTS[@]}" "allenh1@$node" "$@" </dev/null; }
+remote() { local node="$1"; shift; ssh -n "${SSH_OPTS[@]}" "user@$node" "$@" </dev/null; }
 
 mode_preflight() {
     local failures=0 rank node
@@ -162,7 +162,7 @@ mode_stage() {
         remote_dir="$(dirname "$REMOTE_BIN")"
         echo "stage: rank $rank -> $node:$REMOTE_BIN"
         remote "$node" "mkdir -p '$remote_dir'" || { echo "FAIL stage: rank $rank mkdir"; return 1; }
-        scp -q -o BatchMode=yes -o ConnectTimeout=15 "$BIN" "allenh1@$node:$REMOTE_BIN" || { echo "FAIL stage: rank $rank scp"; return 1; }
+        scp -q -o BatchMode=yes -o ConnectTimeout=15 "$BIN" "user@$node:$REMOTE_BIN" || { echo "FAIL stage: rank $rank scp"; return 1; }
         remote "$node" "chmod +x '$REMOTE_BIN'" || { echo "FAIL stage: rank $rank chmod"; return 1; }
         stage_sha="$(remote "$node" "sha256sum '$REMOTE_BIN' | cut -d' ' -f1")"
         if [[ "$stage_sha" != "$bin_sha" ]]; then echo "FAIL stage: rank $rank sha mismatch staged=$stage_sha local=$bin_sha"; return 1; fi
@@ -204,7 +204,7 @@ mode_collect() {
         evidence="$(rank_evidence_dir "$rank")"
         mkdir -p "$out/rank$rank"
         echo "collect: rank $rank $node:$evidence -> $out/rank$rank"
-        scp -q -o BatchMode=yes -o ConnectTimeout=15 -r "allenh1@$node:$evidence/." "$out/rank$rank/" || { echo "FAIL collect: rank $rank"; return 1; }
+        scp -q -o BatchMode=yes -o ConnectTimeout=15 -r "user@$node:$evidence/." "$out/rank$rank/" || { echo "FAIL collect: rank $rank"; return 1; }
     done
 }
 

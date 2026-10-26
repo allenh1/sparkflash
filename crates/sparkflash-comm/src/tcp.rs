@@ -239,7 +239,7 @@ pub struct TcpConfig {
     /// Explicit listen address for this rank.
     ///
     /// This is separate from [TcpConfig::peer_addrs] so a rank may bind a wildcard or a
-    /// specific interface (`0.0.0.0:29601`, `192.0.2.80:29601`) while its peers dial a
+    /// specific interface (`0.0.0.0:29601`, `198.51.100.80:29601`) while its peers dial a
     /// routable address for the same port. When `None`, this rank binds
     /// `127.0.0.1:(base_port + rank)`.
     pub bind_addr: Option<SocketAddr>,
@@ -1437,7 +1437,7 @@ mod tests {
     fn sequential_read_defaults_to_loopback_only() {
         assert!(cluster_is_loopback(&TcpConfig::loopback4(0, 19000)));
         let addresses: Vec<SocketAddr> = (0..4)
-            .map(|rank| format!("192.0.2.{}:29601", 80 + rank).parse().unwrap())
+            .map(|rank| format!("198.51.100.{}:29601", 80 + rank).parse().unwrap())
             .collect();
         let cluster = TcpConfig::with_addresses(1, addresses).unwrap();
         assert!(!cluster_is_loopback(&cluster));
@@ -1445,7 +1445,7 @@ mod tests {
         let mixed: Vec<SocketAddr> = vec![
             "127.0.0.1:29601".parse().unwrap(),
             "127.0.0.1:29602".parse().unwrap(),
-            "192.0.2.59:29603".parse().unwrap(),
+            "198.51.100.59:29603".parse().unwrap(),
             "127.0.0.1:29604".parse().unwrap(),
         ];
         assert!(!cluster_is_loopback(

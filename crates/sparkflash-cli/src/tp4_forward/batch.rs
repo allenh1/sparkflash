@@ -8,15 +8,21 @@
 //!
 //! 1. gives free lanes to waiting sequences, oldest first; a sequence resumes from the longest
 //!    prefix of its tokens a free lane still holds (an agent's turns resend the conversation);
-//! 2. runs one prefill chunk of the oldest sequence still prefilling: a whole bulk chunk when no
-//!    sequence decodes, else SPARKFLASH_PREFILL_CHUNK_BUSY rows (or SPARKFLASH_PREFILL_EXACT_BUSY
-//!    exact steps), so a new request does not stall the running ones for its whole prompt;
+//! 2. runs one prefill chunk of the sequence with the fewest rows left to prefill (an agent's
+//!    cached turn does not wait behind a cold prompt): a whole bulk chunk when no sequence decodes,
+//!    else SPARKFLASH_PREFILL_CHUNK_BUSY rows (or SPARKFLASH_PREFILL_EXACT_BUSY exact steps), so a
+//!    new request does not stall the running ones for its whole prompt. Before its chunk it copies
+//!    the state of the positions another lane holds more of than its own, so sequences admitted
+//!    together with one system prompt prefill it once. A long prompt's chunks leave the decoders
+//!    some ticks of their own in between ([`DecodeShare`]);
 //! 3. runs one decode step over every decoding sequence. A lone sequence takes the speculative
-//!    step (draft, verify, accept); two or more take one plain rows step together, one row each
-//!    (R_MAX rows per step), each row under its own sampler at its own position. Every rows-step
-//!    row is computed as if alone (bit-identical to M = 1 on the exact path) and the sampler's
-//!    noise is a function of (seed, position, id), so a sequence emits the same tokens whatever it
-//!    shares the device with.
+//!    step (draft, verify, accept); up to eight (MAX_SEQS) take one speculative step together (each
+//!    drafts, and the step's R_MAX rows go to the anchors and then to the drafts most likely
+//!    accepted); more take one plain rows step together, one row each (R_MAX rows per step). Every
+//!    row is under its own sampler at its own position. Every rows-step row is computed as if
+//!    alone (bit-identical to M = 1 on the exact path) and the sampler's noise is a function of
+//!    (seed, position, id), so a sequence emits the same tokens whatever it shares the device
+//!    with.
 //!
 //! Lanes are backed as they grow. When the budget cannot back a step, free lanes give their memory
 //! back (least recently used first), then the newest running sequence is preempted: it gives up its
@@ -27,7 +33,7 @@
 //! and a lane's prefix is shared only up to the first image span the two prompts do not hold alike
 //! (the same place, grid and canvas key).
 
-use super::draft::{AnchorRow, BLOCK, DraftState};
+use super::draft::{AnchorRow, BLOCK, DraftBlock, DraftState, MAX_SEQS};
 use super::lanes::{SLIDE_STEP, Seg, slide_floor};
 use super::rows::{R_MAX, RowsState};
 use super::sample::Sampler;
@@ -44,26 +50,121 @@ use sparkflash_vision::{IMAGE_TOKEN_ID, ImageSpan};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// A tick's call to rank 0's link with the next tick's room and hold, made once the decode
+/// step's device work is queued ([`crate::device_link::DeviceLink::ahead`]).
+pub(super) type Ahead<'a> = &'a mut dyn FnMut(usize, bool) -> Result<(), String>;
+
 /// Sequences that may wait for a lane, past the lanes themselves.
 const QUEUE: usize = 64;
+/// The fewest positions a sequence takes from another lane ([`Batch::adopt`]).
+const ADOPT_MIN: usize = 64;
 
 /// A bulk prefill chunk's rows while another sequence decodes (SPARKFLASH_PREFILL_CHUNK_BUSY).
+/// Every chunk reads every expert's weights (about a quarter second), so a smaller one stalls the
+/// decoders more often for less prefill: 2048 rows stall them about a second at a time.
 fn busy_chunk() -> usize {
     std::env::var("SPARKFLASH_PREFILL_CHUNK_BUSY")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(512usize)
+        .unwrap_or(2048usize)
         .max(1)
 }
 
 /// Exact prefill steps (R_MAX rows each) per tick while another sequence decodes
-/// (SPARKFLASH_PREFILL_EXACT_BUSY).
+/// (SPARKFLASH_PREFILL_EXACT_BUSY): two, 32 rows.
 fn busy_exact_steps() -> usize {
     std::env::var("SPARKFLASH_PREFILL_EXACT_BUSY")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(4usize)
+        .unwrap_or(2usize)
         .max(1)
+}
+
+/// The least calibrated chain probability a draft needs for a verify row of a shared speculative
+/// step (SPARKFLASH_BATCH_SPEC_FLOOR); SPARKFLASH_BATCH_SPEC=0 gives several sequences the plain
+/// step instead.
+fn batch_spec_floor() -> Option<f64> {
+    if std::env::var("SPARKFLASH_BATCH_SPEC").as_deref() == Ok("0") {
+        return None;
+    }
+    Some(
+        std::env::var("SPARKFLASH_BATCH_SPEC_FLOOR")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0.2),
+    )
+}
+
+/// A prefill with at most this many rows left never waits for the decoders (an agent's turn after
+/// its cached prefix): [`DecodeShare`] spaces out the chunks of long prompts only.
+const SHARE_MIN_ROWS: usize = 16384;
+
+/// The decoders' share of the device's time while long prompts prefill. A chunk stalls every
+/// decoding sequence for its whole length (a second or more), so one decode step a chunk leaves
+/// them at ~2 tokens/s for the minutes a cold 200K prompt takes. They get up to `most` of the time
+/// (SPARKFLASH_DECODE_SHARE, default 0.5; 0 runs a chunk every tick), but no more than lets every
+/// prompt still prefilling reach its first token `deadline_ms` after its admission
+/// (SPARKFLASH_PREFILL_DEADLINE_MS, default 200 s: an agent client gives a request up after 300 s
+/// without a token), at the last chunk's cost per row.
+#[derive(Clone, Copy, Debug)]
+struct DecodeShare {
+    most: f64,
+    deadline_ms: f64,
+}
+
+impl DecodeShare {
+    fn from_env() -> Self {
+        let read = |name: &str, default: f64| -> f64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+        Self {
+            most: read("SPARKFLASH_DECODE_SHARE", 0.5).clamp(0.0, 0.9),
+            deadline_ms: read("SPARKFLASH_PREFILL_DEADLINE_MS", 200_000.0),
+        }
+    }
+
+    /// The share of time the decoders may take: `prefills` are the prompts still prefilling in the
+    /// order they run, each as (rows left, ms since admission), at `row_ms` a row.
+    fn allowed(&self, prefills: &[(usize, f64)], row_ms: f64) -> f64 {
+        let mut need = 0.0;
+        let mut share = self.most;
+        for &(left, age_ms) in prefills {
+            need += left as f64 * row_ms;
+            let budget = self.deadline_ms - age_ms;
+            if budget <= need {
+                return 0.0;
+            }
+            share = share.min(1.0 - need / budget);
+        }
+        share
+    }
+}
+
+/// Shares `budget` verify rows among the sequences' drafts, the likeliest accepted first: each
+/// row goes to the sequence whose next draft has the highest chain probability (the lowest
+/// sequence on a tie), while that is at least `floor`. A sequence's chain falls with depth, so
+/// this maximises the expected accepted drafts.
+fn share_rows(chains: &[Vec<f64>], budget: usize, floor: f64) -> Vec<usize> {
+    let mut depths = vec![0usize; chains.len()];
+    for _ in 0..budget {
+        let mut best: Option<(usize, f64)> = None;
+        for (index, (chain, &depth)) in chains.iter().zip(&depths).enumerate() {
+            if let Some(&p) = chain.get(depth)
+                && p >= floor
+                && best.is_none_or(|(_, q)| p > q)
+            {
+                best = Some((index, p));
+            }
+        }
+        match best {
+            Some((index, _)) => depths[index] += 1,
+            None => break,
+        }
+    }
+    depths
 }
 
 /// Exact prefill rows per tick while no sequence decodes: a long prompt runs over many ticks, so
@@ -210,6 +311,9 @@ pub(super) struct Batch<'b, 'a, 'r> {
     /// position, reads), started at the end of its last step to run under the draft.
     ahead: Option<(u64, usize, Arc<GatherTask<'r>>)>,
     prefill_next: Option<PrefillReads<'r>>,
+    /// The later chunks' reads of the next bulk tick that runs several (each staged in its own
+    /// rows state, SpecInputs::bulk_more).
+    prefill_more: Vec<Option<PrefillReads<'r>>>,
     ticks: u64,
     exchange: Option<(usize, usize)>,
     counter: Cell<u64>,
@@ -220,6 +324,17 @@ pub(super) struct Batch<'b, 'a, 'r> {
     exact_prefill: bool,
     busy_chunk: usize,
     busy_exact_steps: usize,
+    /// The shared speculative step's draft floor ([`batch_spec_floor`]); None: the plain step.
+    spec_floor: Option<f64>,
+    share: DecodeShare,
+    /// This rank's clock for [`DecodeShare`]: the last long prefill chunk's tick (ms, and ms a
+    /// row), and the ticks' time since it.
+    chunk_ms: f64,
+    row_ms: f64,
+    since_chunk_ms: f64,
+    /// The running tick's start and whether it ran a long chunk, for [`Self::hold_after`].
+    tick_started: Instant,
+    tick_chunk: bool,
     print: bool,
     trace: bool,
     preemptions: usize,
@@ -264,6 +379,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             seqs: Vec::new(),
             ahead: None,
             prefill_next: None,
+            prefill_more: Vec::new(),
             ticks: 0,
             exchange,
             counter: Cell::new(0),
@@ -273,6 +389,13 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             exact_prefill: std::env::var("SPARKFLASH_PREFILL_EXACT").as_deref() == Ok("1"),
             busy_chunk: busy_chunk(),
             busy_exact_steps: busy_exact_steps(),
+            spec_floor: batch_spec_floor(),
+            share: DecodeShare::from_env(),
+            chunk_ms: 0.0,
+            row_ms: 0.0,
+            since_chunk_ms: 0.0,
+            tick_started: Instant::now(),
+            tick_chunk: false,
             print: inputs.rank == 0 && std::env::var("SPARKFLASH_SPEC_TRACE").as_deref() == Ok("1"),
             trace: inputs.rank == 0
                 && std::env::var("SPARKFLASH_BATCH_TRACE").as_deref() == Ok("1"),
@@ -386,9 +509,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         if self.seqs.iter().any(|seq| seq.id == id) {
             return Err(format!("sequence {id} is already on the device"));
         }
-        let mut policy = DepthPolicy::from_env(self.k)?;
-        // The draft probabilities are of the noised scores under a sampler, not a calibrated guess.
-        policy.adaptive &= sampler.is_greedy();
+        let policy = DepthPolicy::from_env(self.k)?;
         self.seqs.push(Seq {
             id,
             tokens,
@@ -436,33 +557,134 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         Ok(Some(outcome))
     }
 
-    /// Runs one tick: placements, one prefill chunk, one decode step.
+    /// Whether a sequence decodes.
+    fn decoding(&self) -> bool {
+        self.seqs
+            .iter()
+            .any(|seq| !seq.done && seq.phase == Phase::Decode)
+    }
+
+    /// The prefilling sequences in the order their chunks run, each as (rows left, index): the
+    /// fewest rows left first (ties to the oldest), so a turn that reuses a cached prefix does not
+    /// wait behind a long cold prompt.
+    fn prefill_order(&self) -> Vec<(usize, usize)> {
+        let mut order: Vec<(usize, usize)> = self
+            .seqs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, seq)| match seq.phase {
+                Phase::Prefill { target, .. } if !seq.done => {
+                    Some((target.saturating_sub(seq.pos), index))
+                }
+                _ => None,
+            })
+            .collect();
+        order.sort_unstable();
+        order
+    }
+
+    /// This rank's answer for the next tick's [`DeviceTick::hold_prefill`] (rank 0's is the one
+    /// every rank runs): whether the decoders have not yet had their [`DecodeShare`] of the time
+    /// since the last long chunk.
+    ///
+    /// [`DeviceTick::hold_prefill`]: crate::device_link::DeviceTick::hold_prefill
+    pub(super) fn hold_prefill(&self) -> bool {
+        self.hold_since(self.since_chunk_ms)
+    }
+
+    /// [`Self::hold_prefill`] as it will stand when the running tick ends, `since_chunk_ms`
+    /// projected to now: the answer rank 0 sends ahead under the tick's device work.
+    fn hold_after(&self) -> bool {
+        self.hold_since(if self.tick_chunk {
+            0.0
+        } else {
+            self.since_chunk_ms + self.tick_started.elapsed().as_secs_f64() * 1e3
+        })
+    }
+
+    /// Whether the decoders have had less than their share when `since_ms` passed since the
+    /// last long chunk.
+    fn hold_since(&self, since_ms: f64) -> bool {
+        let order = self.prefill_order();
+        if self.row_ms == 0.0
+            || order
+                .first()
+                .is_none_or(|&(left, _)| left <= SHARE_MIN_ROWS)
+            || !self.decoding()
+        {
+            return false;
+        }
+        let prefills: Vec<(usize, f64)> = order
+            .iter()
+            .map(|&(left, index)| {
+                (
+                    left,
+                    self.seqs[index].admitted.elapsed().as_secs_f64() * 1e3,
+                )
+            })
+            .collect();
+        let share = self.share.allowed(&prefills, self.row_ms);
+        share > 0.0 && since_ms < self.chunk_ms * share / (1.0 - share)
+    }
+
+    /// Hands rank 0's link the next tick's room and hold under this step's device work, so the
+    /// next tick's decisions reach the workers before they finish this one. The room counts the
+    /// sequences that end in this tick: the next tick only has more.
+    fn send_ahead(&self, ahead: Ahead<'_>) -> Result<(), String> {
+        ahead(self.room(), self.hold_after())
+    }
+
+    /// Runs one tick: placements, one prefill chunk (unless `hold`, rank 0's
+    /// [`Self::hold_prefill`], keeps a long one back), one decode step. The decode step calls
+    /// `ahead` with the next tick's room and hold once its device work is queued.
     ///
     /// # Errors
     /// A step failed: the ranks may have desynchronised, so the group cannot continue.
-    pub(super) fn tick(&mut self) -> Result<Vec<Emission>, String> {
+    pub(super) fn tick(&mut self, hold: bool, ahead: Ahead<'_>) -> Result<Vec<Emission>, String> {
         self.ticks += 1;
         let started = Instant::now();
+        self.tick_started = started;
+        self.tick_chunk = false;
         let mut out = Vec::new();
         self.place(&mut out)?;
-        let decoding = self
-            .seqs
-            .iter()
-            .any(|seq| !seq.done && seq.phase == Phase::Decode);
+        let decoding = self.decoding();
         let mut prefilled = None;
-        if let Some(index) = self
-            .seqs
-            .iter()
-            .position(|seq| !seq.done && matches!(seq.phase, Phase::Prefill { .. }))
-        {
-            let from = self.seqs[index].pos;
-            self.prefill(index, decoding, &mut out)?;
-            // A preempted sequence went back to position 0.
-            let ran = self.seqs[index].pos.saturating_sub(from);
-            prefilled = Some((self.seqs[index].id, from, ran));
+        let mut long_chunk = None;
+        if let Some(&(_, index)) = self.prefill_order().first() {
+            // The rows another lane holds are copied, not run (prefill's own adopt then finds
+            // nothing more): the clock below counts only the rows the chunk computes.
+            self.adopt(index)?;
+            let seq = &self.seqs[index];
+            let left = match seq.phase {
+                Phase::Prefill { target, .. } => target.saturating_sub(seq.pos),
+                Phase::Waiting | Phase::Decode => 0,
+            };
+            // Every rank takes the same branch: the rows left and `decoding` are the scheduler's
+            // state, and `hold` is rank 0's.
+            if !(hold && decoding && left > SHARE_MIN_ROWS) {
+                let from = self.seqs[index].pos;
+                self.prefill(index, decoding, &mut out)?;
+                // A preempted sequence went back to position 0.
+                let ran = self.seqs[index].pos.saturating_sub(from);
+                prefilled = Some((self.seqs[index].id, from, ran));
+                if left > SHARE_MIN_ROWS && ran > 0 {
+                    long_chunk = Some(ran);
+                    self.tick_chunk = true;
+                }
+            }
         }
         let prefill_ms = started.elapsed().as_secs_f64() * 1e3;
-        let batch = self.decode(&mut out)?;
+        let batch = self.decode(&mut out, ahead)?;
+        // The decode step reads its tokens back, so the tick's wall time covers its device work.
+        let tick_ms = started.elapsed().as_secs_f64() * 1e3;
+        match long_chunk {
+            Some(ran) => {
+                self.chunk_ms = tick_ms;
+                self.row_ms = tick_ms / ran as f64;
+                self.since_chunk_ms = 0.0;
+            }
+            None => self.since_chunk_ms += tick_ms,
+        }
         if self.trace {
             let (held, budget) = self.device.lane_memory();
             println!(
@@ -519,7 +741,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             request.exact,
         )?;
         loop {
-            for emission in self.tick()? {
+            for emission in self.tick(false, &mut |_, _| Ok(()))? {
                 let last = emission.done.is_some();
                 let go = on_step(&emission.tokens, last)?;
                 if let Some(done) = emission.done {
@@ -550,7 +772,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             self.admit_seq(u64::MAX - index as u64, &ids, &[], 8, greedy, &[], true)?;
         }
         while !self.idle() {
-            for emission in self.tick()? {
+            for emission in self.tick(false, &mut |_, _| Ok(()))? {
                 if let Some(Err(error)) = emission.done {
                     return Err(format!("warm-up: {error}"));
                 }
@@ -634,8 +856,9 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         }
         if self
             .prefill_next
-            .as_ref()
-            .is_some_and(|next| next.seq == id)
+            .iter()
+            .chain(self.prefill_more.iter().flatten())
+            .any(|next| next.seq == id)
         {
             self.wait_prefill_next()?;
         }
@@ -650,11 +873,41 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         Ok(())
     }
 
+    /// Waits for (and drops) the next bulk chunks' reads in flight.
     fn wait_prefill_next(&mut self) -> Result<(), String> {
+        self.wait_prefill_more()?;
         if let (Some(next), Some(reads)) = (self.prefill_next.take(), self.pools.prefill.as_ref()) {
             reads.wait_all(&next.task)?;
         }
         Ok(())
+    }
+
+    fn wait_prefill_more(&mut self) -> Result<(), String> {
+        for slot in 0..self.prefill_more.len() {
+            self.wait_prefill_slot(slot)?;
+        }
+        Ok(())
+    }
+
+    fn wait_prefill_slot(&mut self, slot: usize) -> Result<(), String> {
+        if let (Some(next), Some(reads)) = (
+            self.prefill_more.get_mut(slot).and_then(Option::take),
+            self.pools.prefill.as_ref(),
+        ) {
+            reads.wait_all(&next.task)?;
+        }
+        Ok(())
+    }
+
+    /// Whether sequence `index`'s bulk ticks run several chunks at once ([`Self::prefill_bulk`]):
+    /// with more rows states, the collective stream and nothing decoding (a tick with decoders runs
+    /// one short chunk), and without images (their tower rows are a single chunk's). Every rank
+    /// answers alike.
+    fn pairs(&self, index: usize, decoding: bool) -> bool {
+        !decoding
+            && !self.inputs.bulk_more.is_empty()
+            && self.device.bulk_comm_open()
+            && self.seqs[index].images.is_empty()
     }
 
     /// Sequence `index` ends here with `finish` and the state of `..valid`: its emission.
@@ -688,28 +941,14 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             let target = self.seqs[index].target();
             let wanted = &self.seqs[index].tokens[..target];
             let images = &self.seqs[index].images;
-            let common = |lane: &Lane| {
-                let shared = lane
-                    .resident
-                    .iter()
-                    .zip(wanted)
-                    .take_while(|(held, want)| held == want)
-                    .count();
-                // Equal span tokens are not equal images: stop at the first span the lane does
-                // not hold alike.
-                images
-                    .iter()
-                    .map(|image| image.span)
-                    .find(|span| span.start < shared && !lane.spans.contains(span))
-                    .map_or(shared, |span| span.start)
-            };
             let free = (0..self.lanes.len()).filter(|&lane| self.lanes[lane].seq.is_none());
             let Some((lane, shared)) = free
                 .map(|lane| {
+                    let held = &self.lanes[lane];
                     (
                         lane,
                         if self.reuse {
-                            common(&self.lanes[lane])
+                            common_prefix(&held.resident, &held.spans, wanted, images)
                         } else {
                             0
                         },
@@ -740,10 +979,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 self.forget(lane)?;
                 start = 0;
             }
-            let bulk = self.inputs.bulk.is_some()
-                && self.exchange.is_some()
-                && !self.exact_prefill
-                && target - start >= bulk_min();
+            let bulk = self.bulk_from(target, start);
             // A long prompt's lane grows a tick's rows at a time as it prefills (its window rows
             // sliding back behind it), so placing it backs the first tick only; one that cannot
             // fit even alone is refused now, not at the end of its prefill.
@@ -785,14 +1021,100 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         }
     }
 
+    /// Whether a prefill from `start` to `target` takes the bulk chunks.
+    fn bulk_from(&self, target: usize, start: usize) -> bool {
+        self.inputs.bulk.is_some()
+            && self.exchange.is_some()
+            && !self.exact_prefill
+            && target - start >= bulk_min()
+    }
+
+    /// Sequence `index`, about to prefill from its position, takes the state of the positions it
+    /// shares with another lane when that lane holds more of them than its own (sequences that
+    /// share a system prompt, admitted together, prefill it once): the rows are copied, not run
+    /// again.
+    fn adopt(&mut self, index: usize) -> Result<(), String> {
+        let seq = &self.seqs[index];
+        let (Phase::Prefill { target, .. }, Some(own)) = (seq.phase, seq.lane) else {
+            return Ok(());
+        };
+        if !self.reuse || !self.attached {
+            return Ok(());
+        }
+        let wanted = &seq.tokens[..target];
+        let mut best: Option<(usize, usize)> = None;
+        for (lane, held) in self.lanes.iter().enumerate() {
+            if lane == own {
+                continue;
+            }
+            let shared = match held.seq {
+                // A running sequence's lane holds the positions below its own.
+                Some(id) => {
+                    let Some(other) = self.seqs.iter().find(|other| other.id == id) else {
+                        continue;
+                    };
+                    let spans: Vec<ImageSpan> = other
+                        .images
+                        .iter()
+                        .map(|image| image.span)
+                        .filter(|span| span.start < other.pos)
+                        .collect();
+                    common_prefix(&other.tokens[..other.pos], &spans, wanted, &seq.images)
+                }
+                None => common_prefix(&held.resident, &held.spans, wanted, &seq.images),
+            };
+            if best.is_none_or(|(most, _)| shared > most) {
+                best = Some((shared, lane));
+            }
+        }
+        let Some((shared, src)) = best else {
+            return Ok(());
+        };
+        // At least the prompt's last row runs, for the first token's logits.
+        let cap = if seq.emitted() == 0 {
+            target - 1
+        } else {
+            target
+        };
+        let start = self.device.resume_boundary(shared.min(cap));
+        if start < seq.pos + ADOPT_MIN {
+            return Ok(());
+        }
+        let floor = self.device.lane_floor(src).max(self.device.lane_floor(own));
+        if floor > 0
+            && start < floor + 2 * sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW
+        {
+            return Ok(());
+        }
+        if !self.device.copy_lane_prefix(own, src, start)? {
+            return Ok(());
+        }
+        let bulk = self.bulk_from(target, start);
+        let seq = &mut self.seqs[index];
+        seq.pos = start;
+        seq.phase = Phase::Prefill { target, bulk };
+        seq.reused = Some(seq.reused.unwrap_or(0).max(start));
+        Ok(())
+    }
+
     /// The most rows one tick's prefill of a sequence runs (a bulk chunk, or exact rows steps):
-    /// its lane is backed that far ahead.
+    /// its lane is backed that far ahead. A busy chunk may take a tail too short for a chunk of
+    /// its own ([`bulk_rows`]).
     fn tick_rows(&self, bulk: bool, decoding: bool) -> usize {
         match self.inputs.bulk {
-            Some(state) if bulk && decoding => self.busy_chunk.min(state.cap),
+            Some(state) if bulk && decoding => (self.busy_chunk + bulk_min()).min(state.cap),
             Some(state) if bulk => state.cap,
             _ if decoding => self.busy_exact_steps * R_MAX,
             _ => EXACT_TICK_ROWS,
+        }
+    }
+
+    /// The bulk chunk a tick runs and the most it may stretch to ([`bulk_rows`]).
+    fn bulk_budget(&self, decoding: bool) -> (usize, usize) {
+        let most = self.tick_rows(true, decoding);
+        match self.inputs.bulk {
+            Some(state) if decoding => (self.busy_chunk.min(state.cap), most),
+            _ => (most, most),
         }
     }
 
@@ -877,12 +1199,16 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         decoding: bool,
         out: &mut Vec<Emission>,
     ) -> Result<(), String> {
+        self.adopt(index)?;
         let Phase::Prefill { target, bulk } = self.seqs[index].phase else {
             return Ok(());
         };
         let lane = self.seqs[index].lane.ok_or("prefill: no lane")?;
         let p = self.seqs[index].pos;
-        let ahead = self.tick_rows(bulk, decoding);
+        let mut ahead = self.tick_rows(bulk, decoding);
+        if bulk && self.pairs(index, decoding) {
+            ahead *= 1 + self.inputs.bulk_more.len();
+        }
         if !self.make_room(index, target.min(p + ahead) + BLOCK + self.k + 2)? {
             // Preempted: it waits for a lane again.
             return Ok(());
@@ -990,31 +1316,31 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         Ok(first)
     }
 
-    /// One bulk chunk (not bit-identical to M = 1; see super::bulk). Its Engram reads were
-    /// submitted under the chunk before it (or now, for a first chunk), and the next chunk's go out
-    /// under this one's device time. The last chunk's last row samples the first token.
+    /// One bulk chunk (not bit-identical to M = 1; see super::bulk), or several (one per bulk rows
+    /// state) when the sequence [pairs](Self::pairs) and has more chunks left of more than R_MAX
+    /// rows each: their layers interleave so that each chunk's collectives run under the others'
+    /// launches ([`DeviceLayer::prefill_layers_paired`]), with the same results as the chunks run
+    /// one after the other. A chunk's Engram reads were submitted under the tick before it (or now, for a first
+    /// chunk), and the next tick's go out under this one's device time. The last chunk's last row
+    /// samples the first token.
     fn prefill_bulk(
         &mut self,
         index: usize,
         target: usize,
         decoding: bool,
     ) -> Result<Option<u32>, String> {
-        let (rows, inputs, draft) = (self.rows, self.inputs, self.draft);
+        let (inputs, draft) = (self.inputs, self.draft);
         let state = inputs.bulk.ok_or("prefill: no bulk rows state")?;
         let exchange = self
             .exchange
             .ok_or("prefill: the bulk chunks need the exchange")?;
-        let staging = state
-            .bulk
-            .as_ref()
-            .and_then(|bulk| bulk.engram_staging.as_ref())
-            .filter(|_| inputs.engram.is_some());
+        let staging = bulk_staging(state, inputs);
         let pools = self.pools;
         let reads = pools.prefill.as_ref().filter(|_| staging.is_some());
         let id = self.seqs[index].id;
         let p = self.seqs[index].pos;
-        let budget = self.tick_rows(true, decoding);
-        let chunk = |p: usize| budget.min(target - p);
+        let (budget, most) = self.bulk_budget(decoding);
+        let chunk = |p: usize| bulk_rows(target - p, budget, most);
         let pending = match self.prefill_next.take() {
             Some(next) if next.seq == id && next.p == p => Some(next),
             Some(next) => {
@@ -1028,6 +1354,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                       tokens: &[u32],
                       p: usize,
                       n: usize,
+                      staging: Option<&[HostMapped; 2]>,
                       buffer: usize|
          -> Result<Option<PrefillReads<'r>>, String> {
             let (Some(reader), Some(reads), Some(staging)) = (inputs.engram, reads, staging) else {
@@ -1053,52 +1380,192 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         };
         let current = match pending {
             Some(next) => Some(next),
-            None => submit(self.device, &self.seqs[index].tokens, p, chunk(p), 0)?,
+            None => submit(
+                self.device,
+                &self.seqs[index].tokens,
+                p,
+                chunk(p),
+                staging,
+                0,
+            )?,
         };
         let n = current.as_ref().map_or_else(|| chunk(p), |next| next.n);
-        let ids = upload_ids(&self.seqs[index].tokens[p..p + n]);
-        self.device
-            .cuda
-            .copy_htod(&Deviceptr(state.b.row_ids), &ids)?;
-        let seq = &self.seqs[index];
-        self.device.vision_begin(seq.id, &seq.images, p, n)?;
-        let tokens = &self.seqs[index].tokens;
-        self.device
-            .begin_rows_device(state, p, inputs.embed.0, state.b.row_ids, n, exchange)?;
-        let after = p + n;
-        let mut next = None;
-        match (reads, staging) {
-            (Some(reads), Some(staging)) => {
-                let gathered = current
-                    .as_ref()
-                    .map(|current| (&*current.task, &staging[current.buffer]));
-                let buffer = current.as_ref().map_or(0, |current| current.buffer);
-                self.device.prefill_layers_gathered(
-                    state,
-                    inputs.staged,
-                    &inputs.config.engram_layer_ids,
-                    reads,
-                    gathered,
-                    p,
-                    n,
-                    |device| {
-                        if after < target {
-                            next = submit(device, tokens, after, chunk(after), buffer ^ 1)?;
-                        }
-                        Ok(())
-                    },
-                )?;
+        let buffer = current.as_ref().map_or(0, |current| current.buffer);
+        let several =
+            self.pairs(index, decoding) && n > R_MAX && p + n < target && chunk(p + n) > R_MAX;
+        if !several {
+            // A later slot's reads are for a chunk this tick runs on the first rows state.
+            self.wait_prefill_more()?;
+            let ids = upload_ids(&self.seqs[index].tokens[p..p + n]);
+            self.device
+                .cuda
+                .copy_htod(&Deviceptr(state.b.row_ids), &ids)?;
+            let seq = &self.seqs[index];
+            self.device.vision_begin(seq.id, &seq.images, p, n)?;
+            let tokens = &self.seqs[index].tokens;
+            self.device.begin_rows_device(
+                state,
+                p,
+                inputs.embed.0,
+                state.b.row_ids,
+                n,
+                exchange,
+            )?;
+            let after = p + n;
+            let mut next = None;
+            match reads {
+                Some(reads) => {
+                    self.device.prefill_layers_gathered(
+                        state,
+                        inputs.staged,
+                        &inputs.config.engram_layer_ids,
+                        reads,
+                        chunk_reads(current.as_ref(), staging),
+                        p,
+                        n,
+                        |device| {
+                            if after < target {
+                                next = submit(
+                                    device,
+                                    tokens,
+                                    after,
+                                    chunk(after),
+                                    staging,
+                                    buffer ^ 1,
+                                )?;
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
+                None => self.device.spec_layers(state, inputs.staged, p, n)?,
             }
-            _ => self.device.spec_layers(state, inputs.staged, p, n)?,
+            self.device.vision_end();
+            self.prefill_next = next;
+            self.device.draft_seed(state, draft, p, n)?;
+            self.seqs[index].pos = after;
+            if after < target || self.seqs[index].emitted() > 0 {
+                return Ok(None);
+            }
+            return self.bulk_first(index, state, n, target).map(Some);
         }
-        self.device.vision_end();
-        self.prefill_next = next;
-        self.device.draft_seed(state, draft, p, n)?;
+        // The chunks this tick runs together: the first, then one on each further rows state while
+        // another chunk of more than R_MAX rows follows.
+        let more = inputs.bulk_more;
+        if self.prefill_more.len() < more.len() {
+            self.prefill_more.resize_with(more.len(), || None);
+        }
+        let mut slots = vec![(state, p, n, current, staging, buffer)];
+        let mut end = p + n;
+        for (slot, state_i) in more.iter().enumerate() {
+            if end >= target || chunk(end) <= R_MAX {
+                break;
+            }
+            let staging_i = bulk_staging(state_i, inputs);
+            let pending = match self.prefill_more[slot].take() {
+                Some(next) if next.seq == id && next.p == end => Some(next),
+                Some(next) => {
+                    self.prefill_more[slot] = Some(next);
+                    self.wait_prefill_slot(slot)?;
+                    None
+                }
+                None => None,
+            };
+            let current_i = match pending {
+                Some(next) => Some(next),
+                None => submit(
+                    self.device,
+                    &self.seqs[index].tokens,
+                    end,
+                    chunk(end),
+                    staging_i,
+                    buffer,
+                )?,
+            };
+            let n_i = current_i.as_ref().map_or_else(|| chunk(end), |next| next.n);
+            let buffer_i = current_i.as_ref().map_or(buffer, |current| current.buffer);
+            slots.push((state_i, end, n_i, current_i, staging_i, buffer_i));
+            end += n_i;
+        }
+        for slot in slots.len() - 1..more.len() {
+            self.wait_prefill_slot(slot)?;
+        }
+        for &(state, p, n, ..) in &slots {
+            let ids = upload_ids(&self.seqs[index].tokens[p..p + n]);
+            self.device
+                .cuda
+                .copy_htod(&Deviceptr(state.b.row_ids), &ids)?;
+            self.device.begin_rows_device(
+                state,
+                p,
+                inputs.embed.0,
+                state.b.row_ids,
+                n,
+                exchange,
+            )?;
+        }
+        let tokens = &self.seqs[index].tokens;
+        let after = end;
+        let chunks: Vec<_> = slots
+            .iter()
+            .map(|(state, p, n, current, staging, _)| {
+                (*state, *p, *n, chunk_reads(current.as_ref(), *staging))
+            })
+            .collect();
+        let mut next: Vec<Option<PrefillReads<'r>>> = slots.iter().map(|_| None).collect();
+        self.device.prefill_layers_paired(
+            &chunks,
+            inputs.staged,
+            &inputs.config.engram_layer_ids,
+            reads,
+            |device| {
+                // The next tick's chunks, when it runs them as this one did.
+                let mut at = after;
+                for (slot, &(.., staging, buffer)) in slots.iter().enumerate() {
+                    if at >= target {
+                        break;
+                    }
+                    let n_next = chunk(at);
+                    if slot > 0 && n_next <= R_MAX {
+                        break;
+                    }
+                    next[slot] = submit(device, tokens, at, n_next, staging, buffer ^ 1)?;
+                    if n_next <= R_MAX {
+                        break;
+                    }
+                    at += n_next;
+                }
+                Ok(())
+            },
+        )?;
+        drop(chunks);
+        let mut next = next.into_iter();
+        self.prefill_next = next.next().flatten();
+        for (slot, reads) in next.enumerate() {
+            self.prefill_more[slot] = reads;
+        }
+        for &(state, p, n, ..) in &slots {
+            self.device.draft_seed(state, draft, p, n)?;
+        }
         self.seqs[index].pos = after;
         if after < target || self.seqs[index].emitted() > 0 {
             return Ok(None);
         }
-        // The head reads the last row only: its stream and pre mix move to the decode rows.
+        let &(last, _, n_last, ..) = slots.last().ok_or("prefill: no bulk chunk")?;
+        self.bulk_first(index, last, n_last, target).map(Some)
+    }
+
+    /// The first token of sequence `index`, from the last row of the bulk chunk of `n` rows that
+    /// ended its prompt on `state`: the head reads that row only, so its stream and pre mix move
+    /// to the decode rows.
+    fn bulk_first(
+        &mut self,
+        index: usize,
+        state: &RowsState,
+        n: usize,
+        target: usize,
+    ) -> Result<u32, String> {
+        let (rows, inputs) = (self.rows, self.inputs);
         let row = (n - 1) as u64;
         let hc = self.device.hc_mult;
         let stream_bytes = (hc * self.device.dim * 4) as u64;
@@ -1121,11 +1588,11 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             &sampler,
             target,
         )?;
-        Ok(Some(picks[0].0))
+        Ok(picks[0].0)
     }
 
     /// One decode step over every decoding sequence; returns the rows it ran.
-    fn decode(&mut self, out: &mut Vec<Emission>) -> Result<usize, String> {
+    fn decode(&mut self, out: &mut Vec<Emission>, ahead: Ahead<'_>) -> Result<usize, String> {
         let limit = self.device.max_positions;
         let decoding = |seqs: &[Seq]| -> Vec<usize> {
             (0..seqs.len())
@@ -1146,11 +1613,18 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let decoding = decoding(&self.seqs);
         match decoding.as_slice() {
             [] => Ok(0),
-            [index] => self.spec_step(*index, out),
+            [index] => self.spec_step(*index, out, ahead),
+            many if self.spec_floor.is_some()
+                && self.exchange.is_some()
+                && 2 * many.len() <= R_MAX
+                && many.len() <= MAX_SEQS =>
+            {
+                self.spec_multi_step(many, out, ahead)
+            }
             many => {
                 let mut rows = 0;
                 for group in many.chunks(R_MAX) {
-                    rows += self.plain_step(group, out)?;
+                    rows += self.plain_step(group, out, &mut *ahead)?;
                 }
                 Ok(rows)
             }
@@ -1188,7 +1662,12 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
     /// The speculative step of a lone sequence: draft from the anchor, verify [anchor, drafts]
     /// as one rows step, accept the drafts while each equals the verify pick before it, and emit
     /// the accepted drafts plus the pick after them.
-    fn spec_step(&mut self, index: usize, out: &mut Vec<Emission>) -> Result<usize, String> {
+    fn spec_step(
+        &mut self,
+        index: usize,
+        out: &mut Vec<Emission>,
+        ahead: Ahead<'_>,
+    ) -> Result<usize, String> {
         let (rows, inputs, draft, k) = (self.rows, self.inputs, self.draft, self.k);
         let lane = self.seqs[index].lane.ok_or("decode: no lane")?;
         self.enter(lane)?;
@@ -1203,7 +1682,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         if self.ahead.is_none() {
             self.read_ahead(index)?;
         }
-        let ahead = self.ahead.take().map(|(_, _, task)| task);
+        let reads = self.ahead.take().map(|(_, _, task)| task);
         let sampler = self.seqs[index].sampler;
         let anchor = self.seqs[index].tokens[pos];
         let anchor_row = match self.exchange {
@@ -1301,10 +1780,11 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             self.pools.decode.as_ref(),
             gather.zip(self.staging.as_ref().map(Staging::of)),
             self.staging.as_ref(),
-            ahead,
+            reads,
             pos,
             n,
         )?;
+        self.send_ahead(ahead)?;
         let picks = self.device.head_rows_sampled(
             rows,
             inputs.tail,
@@ -1362,7 +1842,12 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
 
     /// One plain rows step over the sequences `group` (up to R_MAX, each its own lane): each
     /// sequence's anchor is one row at its own position, sampled under its own sampler.
-    fn plain_step(&mut self, group: &[usize], out: &mut Vec<Emission>) -> Result<usize, String> {
+    fn plain_step(
+        &mut self,
+        group: &[usize],
+        out: &mut Vec<Emission>,
+        ahead: Ahead<'_>,
+    ) -> Result<usize, String> {
         let (rows, inputs, draft) = (self.rows, self.inputs, self.draft);
         let exchange = self
             .exchange
@@ -1412,6 +1897,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             rows.b.row_ids,
             exchange,
         )?;
+        let (room, hold) = (self.room(), self.hold_after());
         let result = (|| {
             self.device.spec_layers_gathered(
                 rows,
@@ -1424,6 +1910,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 0,
                 n,
             )?;
+            ahead(room, hold)?;
             let samplers: Vec<(Sampler, usize)> = group
                 .iter()
                 .map(|&index| (self.seqs[index].sampler, self.seqs[index].pos + 1))
@@ -1463,10 +1950,224 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         }
         Ok(n)
     }
+    /// One speculative step over the sequences `group` (each its own lane, at most R_MAX / 2 and
+    /// MAX_SEQS): one draft pass drafts every sequence's block from its anchor
+    /// ([DeviceLayer::draft_blocks]), the step's R_MAX rows go to the anchors and then to the drafts
+    /// most likely accepted ([`share_rows`]), and one rows step verifies every sequence's
+    /// [anchor, drafts] as its own segment. Each sequence then accepts as [Self::spec_step] does.
+    fn spec_multi_step(
+        &mut self,
+        group: &[usize],
+        out: &mut Vec<Emission>,
+        ahead: Ahead<'_>,
+    ) -> Result<usize, String> {
+        let (rows, inputs, draft, k) = (self.rows, self.inputs, self.draft, self.k);
+        let exchange = self
+            .exchange
+            .ok_or("decode: several sequences need the exchange")?;
+        let floor = self.spec_floor.unwrap_or(0.0);
+        // The step's reads land in the decode staging.
+        self.wait_ahead()?;
+        let t0 = Instant::now();
+        let blocks = group
+            .iter()
+            .map(|&index| {
+                let seq = &self.seqs[index];
+                Ok(DraftBlock {
+                    lane: seq.lane.ok_or("decode: no lane")?,
+                    d: seq.pos,
+                    anchor: seq.tokens[seq.pos],
+                    sampler: seq.sampler,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        // No sequence can take more draft rows than the anchors leave, so none drafts deeper.
+        let depth = k.min(R_MAX - group.len());
+        let drafted =
+            self.device
+                .draft_blocks(rows, draft, inputs.tail, inputs.embed.0, &blocks, depth)?;
+        let t1 = Instant::now();
+        let chains: Vec<Vec<f64>> = group
+            .iter()
+            .zip(&drafted)
+            .map(|(&index, (_, probs))| self.seqs[index].policy.chain(probs))
+            .collect();
+        let depths = share_rows(&chains, R_MAX - group.len(), floor);
+        let mut segs = Vec::with_capacity(group.len());
+        let mut ids = Vec::with_capacity(R_MAX * 4);
+        let mut parts = Vec::new();
+        let mut row0 = 0;
+        for ((&index, (drafts, _)), &depth) in group.iter().zip(&drafted).zip(&depths) {
+            let seq = &mut self.seqs[index];
+            let (pos, n) = (seq.pos, depth + 1);
+            seq.verified += depth;
+            seq.tokens.truncate(pos + 1);
+            seq.tokens.extend_from_slice(&drafts[..depth]);
+            segs.push(Seg {
+                lane: seq.lane.ok_or("decode: no lane")?,
+                p0: pos,
+                n,
+                row0,
+            });
+            ids.extend(
+                seq.tokens[pos..pos + n]
+                    .iter()
+                    .flat_map(|id| id.to_le_bytes()),
+            );
+            if let Some(reader) = inputs.engram
+                && let Some(part) = self.device.engram_plan(
+                    inputs.config,
+                    reader,
+                    &seq.tokens,
+                    pos,
+                    n,
+                    row0,
+                    R_MAX,
+                )?
+            {
+                parts.push(part);
+            }
+            row0 += n;
+        }
+        let gather = EngramGather::merge(parts)?;
+        self.device
+            .cuda
+            .copy_htod(&Deviceptr(rows.b.row_ids), &ids)?;
+        let n = self.device.begin_rows_segments(
+            rows,
+            &segs,
+            inputs.embed.0,
+            rows.b.row_ids,
+            exchange,
+        )?;
+        let (room, hold) = (self.room(), self.hold_after());
+        let result = (|| {
+            self.device.spec_layers_gathered(
+                rows,
+                inputs.staged,
+                &inputs.config.engram_layer_ids,
+                self.pools.decode.as_ref(),
+                gather.zip(self.staging.as_ref().map(Staging::of)),
+                self.staging.as_ref(),
+                None,
+                0,
+                n,
+            )?;
+            ahead(room, hold)?;
+            let samplers: Vec<(Sampler, usize)> = group
+                .iter()
+                .zip(&segs)
+                .flat_map(|(&index, seg)| {
+                    let sampler = self.seqs[index].sampler;
+                    (0..seg.n).map(move |row| (sampler, seg.p0 + 1 + row))
+                })
+                .collect();
+            let picks =
+                self.device
+                    .head_rows_multi(rows, inputs.tail, inputs.transport, &samplers)?;
+            // Every verify row seeds its lane's drafter rings: a rejected draft's row sits where
+            // the next draft block writes its own rows, before anything reads it.
+            self.device.draft_seed(rows, draft, 0, n)?;
+            Ok::<_, String>(picks)
+        })();
+        self.device.clear_segments();
+        let picks = result?;
+        let (draft_ms, verify_ms) = (
+            (t1 - t0).as_secs_f64() * 1e3,
+            t1.elapsed().as_secs_f64() * 1e3,
+        );
+        for ((&index, (drafts, probs)), seg) in group.iter().zip(&drafted).zip(&segs) {
+            let depth = seg.n - 1;
+            let seq = &mut self.seqs[index];
+            let pos = seq.pos;
+            let mut m = 0usize;
+            while m < depth && drafts[m] == picks[seg.row0 + m].0 {
+                m += 1;
+            }
+            seq.policy.observe(probs, depth, m);
+            seq.steps += 1;
+            seq.accepted += m;
+            seq.draft_ms += draft_ms;
+            seq.verify_ms += verify_ms;
+            let mut step = drafts[..m].to_vec();
+            step.push(picks[seg.row0 + m].0);
+            let emitted = seq.emitted() - depth;
+            let finish = cut_step(&mut step, emitted, seq.max_new, &seq.stop_ids, seq.exact);
+            if self.print {
+                println!(
+                    "spec multi step {}: seq {} pos {pos} drafts {drafts:?} probs {probs:.3?} depth {depth} accepted {m}",
+                    seq.steps, seq.id
+                );
+            }
+            seq.tokens.truncate(pos + 1);
+            seq.tokens.extend_from_slice(&step);
+            if let Some(finish) = finish {
+                self.finish(index, finish, pos, step, out)?;
+                continue;
+            }
+            seq.pos = pos + m + 1;
+            let id = seq.id;
+            self.enter(seg.lane)?;
+            self.device.rewind_rows(pos + m + 1);
+            out.push(Emission {
+                seq: id,
+                tokens: step,
+                done: None,
+            });
+        }
+        Ok(n)
+    }
 }
 
 /// A chunk's token ids as the embedding upload takes them: an image span's positions are the
 /// placeholder's row (the tower rank overwrites them before the exchange).
+/// The rows of the next bulk chunk with `left` rows of the prompt to go: `budget`, or all of them
+/// when they fit `most`, so no short tail takes a chunk (and a read of every expert's weights) of
+/// its own.
+fn bulk_rows(left: usize, budget: usize, most: usize) -> usize {
+    if left <= most { left } else { budget }
+}
+
+/// How many leading positions of `wanted` a lane holding `held` (its image spans `spans`) holds
+/// alike: the common prefix, cut at the first of the prompt's `images` the lane does not hold alike
+/// (equal span tokens are not equal images).
+fn common_prefix(
+    held: &[u32],
+    spans: &[ImageSpan],
+    wanted: &[u32],
+    images: &[VisionImage],
+) -> usize {
+    let shared = held
+        .iter()
+        .zip(wanted)
+        .take_while(|(held, want)| held == want)
+        .count();
+    images
+        .iter()
+        .map(|image| image.span)
+        .find(|span| span.start < shared && !spans.contains(span))
+        .map_or(shared, |span| span.start)
+}
+
+/// A bulk chunk's reads in flight and the pinned buffer they land in.
+fn chunk_reads<'c, 'r, 's>(
+    current: Option<&'c PrefillReads<'r>>,
+    staging: Option<&'s [HostMapped; 2]>,
+) -> Option<(&'c GatherTask<'r>, &'s HostMapped)> {
+    current
+        .zip(staging)
+        .map(|(current, staging)| (&*current.task, &staging[current.buffer]))
+}
+
+/// A bulk rows state's pinned Engram staging pair, when the run reads Engram.
+fn bulk_staging<'s>(state: &'s RowsState, inputs: &SpecInputs<'_>) -> Option<&'s [HostMapped; 2]> {
+    state
+        .bulk
+        .as_ref()
+        .and_then(|bulk| bulk.engram_staging.as_ref())
+        .filter(|_| inputs.engram.is_some())
+}
+
 fn upload_ids(tokens: &[u32]) -> Vec<u8> {
     tokens
         .iter()
@@ -1491,5 +2192,62 @@ impl Drop for Batch<'_, '_, '_> {
         if let Some(staging) = self.staging.take() {
             self.device.cuda.free_host_mapped(&staging);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DecodeShare, bulk_rows, common_prefix, share_rows};
+
+    #[test]
+    fn the_decoders_get_what_the_prefill_deadlines_leave() {
+        let share = DecodeShare {
+            most: 0.5,
+            deadline_ms: 200_000.0,
+        };
+        let allowed = |prefills: &[(usize, f64)], row_ms| share.allowed(prefills, row_ms);
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // 100K rows at 0.75 ms need 75 s of the 200 s: capped at half.
+        assert!(close(allowed(&[(100_000, 0.0)], 0.75), 0.5));
+        // 200K rows need 150 s: a quarter of the time is spare.
+        assert!(close(allowed(&[(200_000, 0.0)], 0.75), 0.25));
+        // The prompt after it waits for both: 50 s of its 100 s are spare, or 10 s of its 60 s.
+        assert!(close(
+            allowed(&[(40_000, 0.0), (40_000, 100_000.0)], 0.625),
+            0.5
+        ));
+        assert!(close(
+            allowed(&[(40_000, 0.0), (40_000, 140_000.0)], 0.625),
+            1.0 / 6.0
+        ));
+        // Late: every tick prefills.
+        assert!(close(allowed(&[(200_000, 60_000.0)], 0.75), 0.0));
+        assert!(close(allowed(&[], 0.75), 0.5));
+    }
+
+    #[test]
+    fn a_short_tail_rides_with_the_chunk_before_it() {
+        assert_eq!(bulk_rows(540, 512, 768), 540);
+        assert_eq!(bulk_rows(769, 512, 768), 512);
+        assert_eq!(bulk_rows(5000, 4096, 4096), 4096);
+        assert_eq!(bulk_rows(100, 4096, 4096), 100);
+    }
+
+    #[test]
+    fn a_lane_shares_the_prompt_up_to_the_first_difference() {
+        assert_eq!(common_prefix(&[1, 2, 3, 4], &[], &[1, 2, 3, 9, 9], &[]), 3);
+        assert_eq!(common_prefix(&[1, 2], &[], &[1, 2, 3], &[]), 2);
+        assert_eq!(common_prefix(&[], &[], &[1], &[]), 0);
+    }
+
+    #[test]
+    fn rows_go_to_the_likeliest_drafts_down_to_the_floor() {
+        let chains = [vec![0.9, 0.8, 0.3], vec![0.95, 0.5, 0.1], vec![0.15]];
+        // 0.95 (b), 0.9 (a), 0.8 (a), 0.5 (b), 0.3 (a); 0.15 and 0.1 are under the floor.
+        assert_eq!(share_rows(&chains, 8, 0.2), [3, 2, 0]);
+        assert_eq!(share_rows(&chains, 3, 0.2), [2, 1, 0]);
+        assert_eq!(share_rows(&chains, 0, 0.2), [0, 0, 0]);
+        // A tie goes to the lower sequence.
+        assert_eq!(share_rows(&[vec![0.5], vec![0.5]], 1, 0.0), [1, 0]);
     }
 }

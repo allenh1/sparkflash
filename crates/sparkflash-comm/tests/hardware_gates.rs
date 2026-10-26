@@ -7,18 +7,18 @@
 //! `text
 //! SPARK_COMM_HW_PERMISSION=1 \
 //! SPARK_COMM_RANK=<0..3> SPARK_COMM_WORLD=4 \
-//! SPARK_COMM_PEERS=192.0.2.80,192.0.2.84,192.0.2.68,192.0.2.59 \
+//! SPARK_COMM_PEERS=198.51.100.80,198.51.100.84,198.51.100.68,198.51.100.59 \
 //! SPARK_COMM_CONTROL_PORT=18515 \
 //! cargo test -p sparkflash-comm --features rdma --release --test hardware_gates -- --ignored --exact --nocapture <name>
 //! `
 //!
-//! The peer table is the rail-1 address table (192.0.2.80 = node0 = rank 0, .84 = node1 = rank 1,
+//! The peer table is the rail-1 address table (198.51.100.80 = node0 = rank 0, .84 = node1 = rank 1,
 //! .68 = node2 = rank 2, .59 = node3 = rank 3). The deployed vLLM container instead uses a mixed
 //! rail-2 table; docs/archive/build/rdma-backend.md explains why those are different and why neither
 //! should be "fixed".
 //!
 //! Without SPARK_COMM_HW_PERMISSION=1 every gate panics immediately instead of touching the
-//! cluster, so a mistyped --ignored cannot quietly reach 192.0.2.80/.84/.68/.59.
+//! cluster, so a mistyped --ignored cannot quietly reach 198.51.100.80/.84/.68/.59.
 //!
 //! `SPARK_COMM_RAIL_COUNT` selects the mode: 2 (default) is the specification's dual rail and what
 //! the dual-rail counter gate asserts; 1 is the single-rail configuration the deployed vLLM
@@ -51,7 +51,7 @@ fn hardware_permission() -> bool {
 fn require_permission(test: &str) {
     assert!(
         hardware_permission(),
-        "refusing to run {test}: it needs the live 4x DGX Spark RoCE fabric (192.0.2.80/.84/.68/.59). \
+        "refusing to run {test}: it needs the live 4x DGX Spark RoCE fabric (198.51.100.80/.84/.68/.59). \
 Set {PERMISSION_ENV}=1 only with explicit per-run approval from the Lead."
     );
 }

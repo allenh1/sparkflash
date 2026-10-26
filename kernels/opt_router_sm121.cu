@@ -1,6 +1,7 @@
 // kernels/opt_router_sm121.cu
 //
-// The decode router in one launch: scores and top-k for up to OPT_R_MAX_TOKENS tokens.
+// The decode router in one launch: scores and top-k for any number of tokens, scored
+// OPT_R_MAX_TOKENS at a time (a later group re-reads the warp's gate row, from L1/L2).
 //
 // Stage one is warp-per-expert with split K: lane l reads 8 bf16 of the gate row at k = 8 * (l + 32 i),
 // so a warp reads 512 contiguous bytes per step, and the 32 lane partials are folded with a xor
@@ -53,9 +54,11 @@ __device__ __forceinline__ void opt_router_body(
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5;
     const uint32_t expert = blockIdx.x * OPT_R_WARPS + warp;
-    const uint32_t live = tokens < OPT_R_MAX_TOKENS ? tokens : OPT_R_MAX_TOKENS;
 
-    {
+    for (uint32_t t0 = 0u; t0 < tokens; t0 += OPT_R_MAX_TOKENS) {
+        const uint32_t live = tokens - t0 < OPT_R_MAX_TOKENS ? tokens - t0 : OPT_R_MAX_TOKENS;
+        const __nv_bfloat16 *xg = x + (uint64_t)t0 * OPT_R_HIDDEN;
+        float *sg = scores + (uint64_t)t0 * OPT_R_EXPERTS;
         float acc[OPT_R_MAX_TOKENS];
 #pragma unroll
         for (uint32_t t = 0; t < OPT_R_MAX_TOKENS; ++t) acc[t] = 0.0f;
@@ -69,7 +72,7 @@ __device__ __forceinline__ void opt_router_body(
             for (uint32_t t = 0; t < OPT_R_MAX_TOKENS; ++t) {
                 if (t < live) {
                     float xf[8];
-                    opt_r_bf16x8(__ldg(reinterpret_cast<const uint4 *>(x + (uint64_t)t * OPT_R_HIDDEN) + v), xf);
+                    opt_r_bf16x8(__ldg(reinterpret_cast<const uint4 *>(xg + (uint64_t)t * OPT_R_HIDDEN) + v), xf);
 #pragma unroll
                     for (int j = 0; j < 8; ++j) acc[t] = __fmaf_rn(xf[j], wf[j], acc[t]);
                 }
@@ -81,7 +84,7 @@ __device__ __forceinline__ void opt_router_body(
                 float s = acc[t];
 #pragma unroll
                 for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
-                if (lane == 0u) scores[(uint64_t)t * OPT_R_EXPERTS + expert] = opt_r_score(s);
+                if (lane == 0u) sg[(uint64_t)t * OPT_R_EXPERTS + expert] = opt_r_score(s);
             }
         }
     }
@@ -101,7 +104,7 @@ __device__ __forceinline__ void opt_router_body(
     // and no pick waits on a block barrier.
     static_assert(OPT_R_EXPERTS % 32u == 0u, "whole warps of experts");
     constexpr uint32_t PER_LANE = OPT_R_EXPERTS / 32u;
-    for (uint32_t t = warp; t < live; t += OPT_R_WARPS) {
+    for (uint32_t t = warp; t < tokens; t += OPT_R_WARPS) {
         float sc[PER_LANE], sig[PER_LANE];
 #pragma unroll
         for (uint32_t j = 0; j < PER_LANE; ++j) {

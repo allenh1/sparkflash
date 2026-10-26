@@ -28,12 +28,12 @@
 //! --bytes defaults to that payload plus the two-token shape as a scaling row.
 //!
 //! Usage (four nodes; the runner is scripts/gpu-reduce-bench.sh):
-//!   gpu-reduce-bench --rank 0 --world 4 --addrs 192.0.2.80:19701,... \
-//!       --control 192.0.2.80:19755 --bytes 10240,20480 --samples 200 --warmup 20 --json
+//!   gpu-reduce-bench --rank 0 --world 4 --addrs 198.51.100.80:19701,... \
+//!       --control 198.51.100.80:19755 --bytes 10240,20480 --samples 200 --warmup 20 --json
 //!
 //! The gate form measures ONLY the device arm at the served 10,240 B payload, with the synchronous
 //! per-call total as the gated number, and writes a per-rank histogram:
-//!   gpu-reduce-bench --rank 0 --world 4 --control 192.0.2.80:19755 --device-only \
+//!   gpu-reduce-bench --rank 0 --world 4 --control 198.51.100.80:19755 --device-only \
 //!       --bytes 10240 --samples 10000 --warmup 200 --mode sync \
 //!       --p50-max-us 75 --p90-max-us 104 --p99-max-us 251 \
 //!       --histogram /path/histogram-rank0.json --json

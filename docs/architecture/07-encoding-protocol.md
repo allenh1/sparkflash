@@ -5,7 +5,7 @@ other** on the reasoning-effort scale:
 
 | Source | Path | Scale |
 | :--- | :--- | :--- |
-| Python (dataset/eval encoder) | /home/user/dsv41-research/encoding/encoding.py | low 25, high 50, xhigh 75, max 100; default "high" = 50 (encoding.py:398-404) |
+| Python (dataset/eval encoder) | <checkpoint>/encoding/encoding.py | low 25, high 50, xhigh 75, max 100; default "high" = 50 (encoding.py:398-404) |
 | Rust toolkit (deepseek-recipe) | .../deepseek-recipe-encoding-0.1.0/src/v4/dsv41.rs | Low 50, High/Xhigh/(None) 75, Max 100 (dsv41.rs:6-15) |
 | Shared template | both | "Reasoning Effort: {n} (range 1-100, the higher the value, the more thorough the reasoning)\n\n" |
 

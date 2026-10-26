@@ -10,7 +10,7 @@
 //! over that union with the per-head checkpoint sink in the denominator after the maximum. Window
 //! b11 was the first device execution of format 2 in a Lead window; window b12 (the corrected
 //! bf16-vs-bf16 measurement) is the standing record in docs/archive/build/phase3-flash-mla.md. Before b11
-//! the kernel's own header recorded formats 0 and 1 as the measured columns (node0,
+//! the kernel's own header recorded formats 0 and 1 as the measured columns (spark-0,
 //! 2026-10-17) and format 2 as not yet executed on a device.
 //!
 //! What it is not, explicitly NOT claimed:

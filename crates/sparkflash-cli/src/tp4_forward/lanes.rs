@@ -21,8 +21,10 @@ use super::*;
 
 /// The physical memory every lane's chunks may hold together (SPARKFLASH_LANE_MEMORY_MB overrides
 /// it). A fixed number, not the device's free memory: every rank runs the same scheduler, so every
-/// rank must refuse the same growth.
-const DEFAULT_BUDGET_BYTES: usize = 12 << 30;
+/// rank must refuse the same growth. A 250K-token sequence holds ~1.9 GB, so this keeps eight
+/// agents' conversations (and the free lanes' cached prefixes) resident, and a serving rank still
+/// has ~10 GiB available.
+const DEFAULT_BUDGET_BYTES: usize = 24 << 30;
 /// [`Lanes::ensure`] backs rows in steps of this many, so a decode step rarely maps anything.
 const ROW_QUANTUM: usize = 2048;
 /// The window ring rows a lane keeps behind its position: the window (128 rows) and the verify
@@ -311,6 +313,38 @@ impl Lanes<'_> {
         }
         self.floor[lane] = self.floor[lane].max(floor);
         Ok(slid.len())
+    }
+
+    /// Copies every part lane `src` holds for positions `..rows` into lane `dst` (the window rings
+    /// from row `floor`, at or above both lanes' floors), backing `dst` that far first. Returns
+    /// false, copying nothing, when the budget cannot back it.
+    ///
+    /// # Errors
+    /// A driver failure backing `dst` or queueing a copy.
+    fn copy_prefix(
+        &mut self,
+        dst: usize,
+        src: usize,
+        rows: usize,
+        floor: usize,
+    ) -> Result<bool, String> {
+        if !self.ensure(dst, rows)? {
+            return Ok(false);
+        }
+        let dst_base = self.base + (dst * self.stride) as u64;
+        let src_base = self.base + (src * self.stride) as u64;
+        for region in &self.regions {
+            let (from, to) = region.live(rows, floor);
+            if from < to {
+                let at = (region.offset + from) as u64;
+                self.cuda.copy_dtod_async(
+                    &Deviceptr(dst_base + at),
+                    &Deviceptr(src_base + at),
+                    to - from,
+                )?;
+            }
+        }
+        Ok(true)
     }
 
     /// Returns every chunk of lane `lane` to the pool. The device must be idle: nothing queued may
@@ -691,6 +725,7 @@ impl<'a> DeviceLayer<'a> {
             self.enter_seg(seg)?;
             self.check_begin(seg.p0, seg.n, rows::R_MAX)?;
         }
+        self.upload_row_table(rows, segs)?;
         self.embed_rows_on_device(rows, embed, ids, n, n, 0, exchange, false)?;
         for seg in segs {
             self.enter_seg(seg)?;
@@ -768,5 +803,51 @@ impl<'a> DeviceLayer<'a> {
             .as_mut()
             .ok_or("lanes: none attached")?
             .slide(lane, floor)
+    }
+
+    /// Gives lane `dst` lane `src`'s state of positions `..rows`, a resume boundary `src` has run
+    /// past: its window rings start at the higher of the two floors, and its position counters
+    /// are `src`'s cut at `rows`, so it resumes at `rows` as if it had run them. False, copying
+    /// nothing, when the budget cannot back `dst` that far.
+    ///
+    /// # Errors
+    /// No lanes, a lane outside them, or a driver failure.
+    pub(super) fn copy_lane_prefix(
+        &mut self,
+        dst: usize,
+        src: usize,
+        rows: usize,
+    ) -> Result<bool, String> {
+        let lanes = self.lanes.as_ref().ok_or("lanes: none attached")?;
+        if dst == src || dst.max(src) >= lanes.count() {
+            return Err(format!(
+                "lanes: lane {src} to lane {dst} of {}",
+                lanes.count()
+            ));
+        }
+        let floor = lanes.floor(dst).max(lanes.floor(src));
+        self.slide_lane(dst, floor)?;
+        let lanes = self.lanes.as_mut().ok_or("lanes: none attached")?;
+        if !lanes.copy_prefix(dst, src, rows, floor)? {
+            return Ok(false);
+        }
+        let counts: Vec<usize> = if lanes.selected == src {
+            &self.appended_rows
+        } else {
+            &lanes.host[src].appended_rows
+        }
+        .iter()
+        .map(|&count| count.min(rows))
+        .collect();
+        if lanes.selected == dst {
+            self.positions_begun = rows;
+            self.appended_rows = counts;
+            self.attn_window = AttentionWindow::default();
+        } else {
+            let host = &mut lanes.host[dst];
+            host.positions_begun = rows;
+            host.appended_rows = counts;
+        }
+        Ok(true)
     }
 }

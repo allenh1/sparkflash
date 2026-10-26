@@ -1,7 +1,7 @@
 //! The task-53 host TWIN: four ranks, one checkpoint, one token sequence.
 //!
 //! The single-node reference engine answers one completion request by re-reading the weights for
-//! every token (measured at 2m54s for a 7-token prompt plus 4 completion tokens on node0, about
+//! every token (measured at 2m54s for a 7-token prompt plus 4 completion tokens on spark-0, about
 //! 16s/token, cold). This stage is the opposite end of that curve: the per-rank slices are read from
 //! the checkpoint where it lies, the node's page cache holds them after the first sweep, and the only
 //! bytes a warm token pays for are the slices it decodes.
