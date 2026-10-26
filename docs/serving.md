@@ -21,6 +21,24 @@ On every node, at the same paths:
 | Converted weights | `sparkflash convert` (below): one ~78 GB file per rank, for a ~25 s boot |
 | Networking | the four nodes reach each other over RoCE (ConnectX-7) and over ssh from the launch host |
 
+### Network
+
+A Spark's ConnectX-7 reaches the GB10 over two PCIe Gen5 x4 links of about 100 Gb/s each, so each
+cabled port appears as two RDMA devices, each with its own netdev and address. For a cable in the
+second port they are `rocep1s0f1` (`enp1s0f1np1`) and `roceP2p1s0f1` (`enP2p1s0f1np1`). One device
+carries about half of the port's 200 Gb/s; list both in `NCCL_IB_HCA` to use all of it. A cable in
+the other port adds no bandwidth, because both ports share the same two links.
+
+With `NCCL_IB_GID_INDEX=3` (RoCE v2 over IPv4), NCCL takes each peer's MAC address from the node's
+ARP cache once, when it connects, and never checks it again. A stale entry, for example one left by
+a device that used to hold a peer's address, makes every connection to that address fail about
+30 s after launch with `IBV_WC_RETRY_EXC_ERR`, while ping and ssh still work because ordinary
+traffic re-resolves it. Before launching, `ip neigh show <address>` on every node should give the
+MAC in that peer's `/sys/class/net/<netdev>/address`; pinging the address from each netdev
+refreshes a stale entry. If a node's two netdevs share a subnet, each must answer ARP only for its
+own address (`arp_ignore=1`), or peers can cache the other half's MAC. Index 1 (RoCE v2 over the
+IPv6 link-local address) derives the MAC from the address and does not use the ARP cache.
+
 ### Converting the weights
 
 Run once per node, for that node's rank (or `--ranks 0,1,2,3` on one machine and copy the files):
@@ -44,7 +62,8 @@ export SPARKFLASH_TOKENIZER=$SPARKFLASH_CHECKPOINT/tokenizer.json
 export SPARKFLASH_CUBINS=/opt/sparkflash/cubins
 export SPARKFLASH_NCCL_LIB=/opt/nccl/lib
 export SPARKFLASH_CONVERTED_DIR=/data/sparkflash-conv
-export NCCL_IB_HCA=<your RoCE device> NCCL_SOCKET_IFNAME=<its netdev> NCCL_IB_GID_INDEX=3
+export NCCL_IB_HCA=<both RoCE devices of the cabled port> NCCL_SOCKET_IFNAME=<one of their netdevs>
+export NCCL_IB_GID_INDEX=3
 scripts/serve-four-node.sh print    # show the four commands
 scripts/serve-four-node.sh launch   # start them
 scripts/serve-four-node.sh status

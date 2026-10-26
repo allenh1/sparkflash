@@ -1,7 +1,8 @@
 # Performance
 
-Measured on four DGX Sparks (GB10, 128 GB each) at tensor parallelism 4, NCCL over one 200 Gb/s
-RoCE link per node, default GPU clocks, serving `deepseek-ai/DeepSeek-V4.1-Flash` from the
+Measured on four DGX Sparks (GB10, 128 GB each) at tensor parallelism 4, one network cable per
+node with NCCL on one of its two RoCE devices (about 100 Gb/s; [serving.md](serving.md#network)
+explains the two), default GPU clocks, serving `deepseek-ai/DeepSeek-V4.1-Flash` from the
 `sparkflash convert` per-rank files. All numbers are client-side, over HTTP streaming, on
 2026-10-26 unless marked otherwise.
 
@@ -66,8 +67,10 @@ Tokens per verify step here, by stream count (1 / 2 / 4 / 8 / 16): prose 3.2 / 2
 - **One stream:** level. SparkFlash is ahead on code and JSON and behind on prose and structured
   output. It verifies the same tokens per step SGLang reports (~3 on prose, ~6 on code), so the
   difference is step time: ~39 ms (prose) and ~45 ms (code) here against ~33 and ~39 ms there.
-  Its collectives use a one-shot RDMA kernel on both network ports (~2.6 ms of all-reduce per
-  step); SparkFlash uses NCCL on one port.
+  Its collectives use a one-shot RDMA kernel on both RoCE devices of its one cable (~2.6 ms of
+  all-reduce per step); SparkFlash used NCCL on one of the two. Moving SparkFlash to both left its
+  step time unchanged (36.4 ms against 36.3 ms median in an A/B check with the same weights), so
+  the link's bandwidth is not what separates them.
 - **Two to eight streams:** SGLang pulls ahead, 1.3x per stream at four code streams and 1.8x at
   eight. SparkFlash verifies at most 16 rows per step across all sequences, and its decode GEMVs
   run on CUDA cores so that greedy output does not depend on the batch. Each extra row costs

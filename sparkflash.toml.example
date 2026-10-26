@@ -67,7 +67,10 @@ nccl_lib = "/opt/nccl/lib"
 log_root = "target/serve-tp4"
 
 [network]
-# Leave empty to let NCCL choose. On a ConnectX-7 Spark these are the values from ibv_devices.
+# The RoCE devices NCCL uses, comma-separated; empty lets NCCL use every active one. A Spark's
+# ConnectX-7 reaches the GB10 over two PCIe Gen5 x4 links of about 100 Gb/s each, so each cabled
+# port shows up as two devices, one per link, and only both together carry the port's 200 Gb/s.
+# `rdma link` lists them; for a cable in the second port they are "rocep1s0f1,roceP2p1s0f1".
 nccl_ib_hca = ""
 nccl_socket_ifname = ""
 # 3 is the usual RoCEv2 GID index.

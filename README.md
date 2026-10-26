@@ -64,7 +64,7 @@ export SPARKFLASH_TOKENIZER=/data/DeepSeek-V4.1-Flash/tokenizer.json
 export SPARKFLASH_CONVERTED_DIR=/data/sparkflash-conv
 export SPARKFLASH_CUBINS=$PWD/target/cubins
 export SPARKFLASH_NCCL_LIB=$PWD/target/deps/nccl
-export NCCL_IB_HCA=<RoCE device, e.g. from ibv_devices> NCCL_SOCKET_IFNAME=<its netdev>
+export NCCL_IB_HCA=<both RoCE devices of the cabled port, from rdma link> NCCL_SOCKET_IFNAME=<one of their netdevs>
 export NCCL_IB_GID_INDEX=3 NCCL_NET_GDR_LEVEL=5 NCCL_DMABUF_ENABLE=1
 scripts/serve-four-node.sh launch
 ```
@@ -142,7 +142,7 @@ exchange for start-up time, determinism and a small, self-contained serving stac
 | Prefill, ~32K-token prompt | 3,400 tok/s | **5,700 tok/s** | 4,800 tok/s |
 | Launch to serving | **25 s** | 2-7 minutes | 160-170 s |
 | Greedy output at any concurrency | **identical** (decode always; prefill in exact mode) | can vary with the batch | identical run to run |
-| Network | one 200 Gb/s port per node | not stated | both ports, switched fabric |
+| Network, per node | one cable, one of its two RoCE devices | not stated | one cable, both RoCE devices |
 | In the serving path | one Rust binary per node | Python, PyTorch, JIT kernels | Python, PyTorch, JIT kernels |
 
 The vLLM figures are self-reported by community members for four Sparks (TileLang-based recipe,
@@ -163,7 +163,9 @@ What this means in practice:
 - **Reproducibility:** greedy decode does not depend on what else is running, and with
   `SPARKFLASH_PREFILL_EXACT=1` neither does prefill, so an agent's behaviour can be replayed
   exactly and regressions bisected.
-- **Hardware:** SparkFlash reaches its numbers on one network port per node.
+- **Network:** both use one cable per node. SparkFlash's figures used one of the cable's two RoCE
+  devices, about half its bandwidth; moving to both left its step time unchanged, so the gaps
+  below are not the network.
 - **Raw speed:** one stream is level with the MiaAI-Lab SGLang build (ahead on code and JSON,
   behind on prose). Under load SGLang is well ahead, 1.3x per stream at four code streams and
   1.8x at eight, and past eight streams SparkFlash stops speculating, so sixteen streams get
