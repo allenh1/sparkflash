@@ -18,16 +18,18 @@
 //! so every rank emits the same tokens and ends every request at the same tick.
 //!
 //! A rank that dies takes the server down: rank 0 watches every worker's control socket and exits
-//! when one closes, and a worker exits when rank 0's closes, instead of waiting in a collective.
+//! when one closes, and a worker exits when rank 0's closes, instead of waiting in a collective. A
+//! loop that fails ends its process too ([`DeviceLink::fail`]), and rank 0's `/health` answers 503
+//! once its loop has failed or has gone SPARKFLASH_STALL_SECS without a tick while it has
+//! work.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -83,6 +85,83 @@ const END_OF_SEQUENCE: &str = "<｜end▁of▁sentence｜>";
 /// Set once a worker has read rank 0's End, so its watchdog does not treat the close that
 /// follows as a lost leader.
 static LEADER_ENDED: AtomicBool = AtomicBool::new(false);
+
+/// How long a failed loop's process lingers before it exits: rank 0's streams carry the error to
+/// their clients, and a worker lets rank 0 report its own failure before the worker's exit closes
+/// a control socket under it.
+const FAIL_GRACE: Duration = Duration::from_secs(1);
+
+/// How long rank 0's loop may go without a tick while sequences are on it or waiting for it before
+/// `/health` reports it stuck: SPARKFLASH_STALL_SECS, 120 s by default. The longest tick (three bulk
+/// prefill chunks) takes seconds.
+fn stall_after() -> Duration {
+    let secs = std::env::var("SPARKFLASH_STALL_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&secs| secs > 0)
+        .unwrap_or(120);
+    Duration::from_secs(secs)
+}
+
+/// Whether rank 0's loop can serve. [`HubLink`] records its ticks and its failure; [`DeviceDriver`]
+/// reports them on `/health` and refuses requests while the loop cannot take them.
+struct DeviceHealth {
+    /// The loop's error: it stopped, and the process is exiting.
+    failed: OnceLock<String>,
+    epoch: Instant,
+    /// When the loop last began a tick or took a request, in ms after `epoch`.
+    beat_ms: AtomicU64,
+    /// The loop waits for a request: nothing is on the device.
+    idle: AtomicBool,
+    stall: Duration,
+}
+
+impl DeviceHealth {
+    fn new(stall: Duration) -> Self {
+        Self {
+            failed: OnceLock::new(),
+            epoch: Instant::now(),
+            beat_ms: AtomicU64::new(0),
+            idle: AtomicBool::new(true),
+            stall,
+        }
+    }
+
+    /// The loop is making progress; with `idle` it is about to wait for a request.
+    fn beat(&self, idle: bool) {
+        let ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.beat_ms.store(ms, Ordering::Release);
+        self.idle.store(idle, Ordering::Release);
+    }
+
+    fn fail(&self, error: &str) {
+        let _ = self.failed.set(error.to_owned());
+    }
+
+    /// How long the loop has gone without a tick at `now` while it has work, past the stall limit.
+    fn stalled(&self, now: Instant) -> Option<Duration> {
+        if self.idle.load(Ordering::Acquire) {
+            return None;
+        }
+        let beat = self.epoch + Duration::from_millis(self.beat_ms.load(Ordering::Acquire));
+        let quiet = now.saturating_duration_since(beat);
+        (quiet > self.stall).then_some(quiet)
+    }
+
+    /// Why the loop cannot serve, if it cannot.
+    fn check(&self) -> Result<(), String> {
+        if let Some(error) = self.failed.get() {
+            return Err(format!("the device loop failed: {error}"));
+        }
+        match self.stalled(Instant::now()) {
+            Some(quiet) => Err(format!(
+                "the device loop has made no progress for {} s",
+                quiet.as_secs()
+            )),
+            None => Ok(()),
+        }
+    }
+}
 
 /// Ends the process now, without the C exit handlers: CUDA's tears the context down, which waits
 /// for the kernels in flight, and a collective whose peer has gone never finishes, so a rank whose
@@ -165,6 +244,7 @@ pub struct DeviceDriver {
     draws: AtomicU64,
     /// Whether the epoch runs the vision tower (the cubin is staged; DECISIONS.md D59).
     vision: bool,
+    health: Arc<DeviceHealth>,
 }
 
 impl DeviceDriver {
@@ -269,6 +349,9 @@ impl ApiInferenceEngine for DeviceDriver {
     }
 
     fn generate(&self, request: EngineRequest) -> BoxStream<'static, EngineEvent> {
+        if let Err(reason) = self.health.check() {
+            return refused(&reason, ENGINE_GONE_CODE);
+        }
         if !request.images.is_empty() || (!request.vision.is_empty() && !self.vision) {
             let missing = MissingCapability::vision();
             return refused(&missing.to_string(), missing.code());
@@ -328,14 +411,19 @@ impl ApiInferenceEngine for DeviceDriver {
             events,
         };
         self.metrics.request_enqueued();
-        if self.jobs.try_send(pending).is_err() {
+        if let Err(error) = self.jobs.try_send(pending) {
             self.metrics.request_enqueue_refused();
-            return refused(
-                &format!(
-                    "the device queue is full: {DEVICE_JOB_QUEUE} requests are waiting for the device"
+            return match error {
+                mpsc::TrySendError::Full(_) => refused(
+                    &format!(
+                        "the device queue is full: {DEVICE_JOB_QUEUE} requests are waiting for the device"
+                    ),
+                    REFUSED_CODE,
                 ),
-                REFUSED_CODE,
-            );
+                mpsc::TrySendError::Disconnected(_) => {
+                    refused("the device loop stopped", ENGINE_GONE_CODE)
+                }
+            };
         }
         let head = stream::once(async move {
             EngineEvent::Started {
@@ -379,6 +467,10 @@ impl ApiInferenceEngine for DeviceDriver {
             vision: self.vision,
             ..Capabilities::ALL
         }
+    }
+
+    fn health(&self) -> Result<(), String> {
+        self.health.check()
     }
 
     fn vocab_size(&self) -> Option<usize> {
@@ -673,6 +765,7 @@ struct HubLink {
     next_seq: u64,
     /// The next tick, already broadcast by [`DeviceLink::ahead`].
     sent: Option<DeviceTick>,
+    health: Arc<DeviceHealth>,
 }
 
 impl HubLink {
@@ -716,7 +809,10 @@ impl HubLink {
             let block = idle && tick.admit.is_empty() && tick.cancel.is_empty();
             let pending = if block {
                 match self.jobs.recv() {
-                    Ok(pending) => pending,
+                    Ok(pending) => {
+                        self.health.beat(false);
+                        pending
+                    }
                     Err(_) => {
                         // The driver is gone: every worker leaves its loop.
                         let _ = self.hub.broadcast(&Tp4ControlFrame::End);
@@ -766,6 +862,7 @@ impl DeviceLink for HubLink {
         room: usize,
         hold_prefill: bool,
     ) -> Result<Option<DeviceTick>, String> {
+        self.health.beat(idle);
         match self.sent.take() {
             Some(tick) => Ok(Some(tick)),
             None => self.decide(idle, room, hold_prefill),
@@ -797,6 +894,30 @@ impl DeviceLink for HubLink {
         }
         self.ending.retain(|&ending| ending != seq);
         Ok(())
+    }
+
+    /// `/health` turns 503 and new requests are refused; the requests still on the device and the
+    /// ones queued for it get the error; then the process exits (the workers follow when the
+    /// control channel closes).
+    fn fail(&mut self, error: &str) {
+        self.health.fail(error);
+        eprintln!(
+            "sparkflash serve: device_failure epoch_ms={} the device loop failed, exiting: {error}",
+            epoch_millis()
+        );
+        for (_, live) in std::mem::take(&mut self.live) {
+            live.finish(Err(error), &self.metrics);
+        }
+        while let Ok(pending) = self.jobs.try_recv() {
+            self.metrics.request_admitted();
+            let _ = pending.events.send(EngineEvent::Error {
+                message: format!("the device loop failed: {error}"),
+                code: ENGINE_GONE_CODE.to_owned(),
+            });
+            self.metrics.request_finished();
+        }
+        std::thread::sleep(FAIL_GRACE);
+        exit_now(1);
     }
 }
 
@@ -868,6 +989,17 @@ impl DeviceLink for WorkerLink {
     fn finish(&mut self, _seq: u64, _outcome: Result<&DeviceOutcome, &str>) -> Result<(), String> {
         Ok(())
     }
+
+    fn fail(&mut self, error: &str) {
+        eprintln!(
+            "sparkflash serve: rank {}: the device loop failed, exiting: {error}",
+            self.control.rank
+        );
+        // Rank 0 reports its own failure first; its exit closes the control channel, and the
+        // leader watch ends this process then if the grace has not.
+        std::thread::sleep(2 * FAIL_GRACE);
+        exit_now(1);
+    }
 }
 
 /// Exits rank 0 when a worker's control socket closes: a dead rank must fail the server, not
@@ -936,6 +1068,35 @@ fn watch_leader(stream: &TcpStream, rank: usize) -> Result<(), String> {
             }
         })
         .map_err(|error| format!("rank {rank} control watch: {error}"))?;
+    Ok(())
+}
+
+/// Logs when rank 0's loop stalls and when it moves again, so a stall leaves its time in the log
+/// whether or not anything polled `/health`.
+fn watch_loop(health: Arc<DeviceHealth>) -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("sparkflash-watch-loop".to_owned())
+        .spawn(move || {
+            let mut stalled = false;
+            loop {
+                std::thread::sleep(Duration::from_secs(5));
+                let quiet = health.stalled(Instant::now());
+                match (stalled, quiet) {
+                    (false, Some(quiet)) => eprintln!(
+                        "sparkflash serve: device_stall epoch_ms={} the device loop has made no progress for {} s; /health answers 503",
+                        epoch_millis(),
+                        quiet.as_secs()
+                    ),
+                    (true, None) => eprintln!(
+                        "sparkflash serve: device_stall epoch_ms={} the device loop moves again",
+                        epoch_millis()
+                    ),
+                    _ => {}
+                }
+                stalled = quiet.is_some();
+            }
+        })
+        .map_err(|error| format!("loop watch: {error}"))?;
     Ok(())
 }
 
@@ -1099,6 +1260,8 @@ fn start_leader(
     let (jobs, queued) = mpsc::sync_channel(DEVICE_JOB_QUEUE);
     let (ready, readied) = mpsc::channel();
     let metrics = Arc::new(Metrics::new());
+    let health = Arc::new(DeviceHealth::new(stall_after()));
+    watch_loop(Arc::clone(&health))?;
     crate::device_link::install(Box::new(HubLink {
         hub,
         jobs: queued,
@@ -1110,6 +1273,7 @@ fn start_leader(
         ending: Vec::new(),
         next_seq: 0,
         sent: None,
+        health: Arc::clone(&health),
     }));
     let mut cluster = tp4_cluster_snapshot();
     cluster.fabric_mode = DEVICE_FABRIC.to_owned();
@@ -1126,6 +1290,7 @@ fn start_leader(
         seeds: RandomState::new(),
         draws: AtomicU64::new(0),
         vision: crate::device_link::vision_enabled(&device.cubins),
+        health,
     };
     let state = AppState::new(Arc::new(driver))
         .with_metrics(metrics)
@@ -1170,6 +1335,32 @@ fn start_leader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_reports_a_failure_and_a_stall_but_never_an_idle_wait() {
+        let health = DeviceHealth::new(Duration::from_secs(120));
+        let later = Instant::now() + Duration::from_secs(600);
+        assert_eq!(health.check(), Ok(()));
+        assert_eq!(
+            health.stalled(later),
+            None,
+            "a loop waiting for a request is not stuck"
+        );
+        health.beat(false);
+        assert_eq!(health.stalled(Instant::now()), None);
+        let quiet = health
+            .stalled(later)
+            .expect("ten quiet minutes with work is a stall");
+        assert!(quiet > Duration::from_secs(590), "{quiet:?}");
+        health.beat(true);
+        assert_eq!(health.stalled(later), None);
+        health.fail("CUDA error 700");
+        health.fail("a later error");
+        assert_eq!(
+            health.check(),
+            Err("the device loop failed: CUDA error 700".to_owned())
+        );
+    }
 
     #[test]
     fn the_capacity_is_bounded_by_the_select_table() {

@@ -686,6 +686,15 @@ pub trait InferenceEngine: Send + Sync {
         Capabilities::default()
     }
 
+    /// Whether the engine can still serve: `/health` and `/readyz` answer 503 with the reason when
+    /// it cannot (its loop failed, or has made no progress for too long).
+    ///
+    /// # Errors
+    /// Why the engine cannot serve.
+    fn health(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Checks that this engine can serve `request` before any generation.
     ///
     /// The default implementation refuses, with [`MissingCapability::vision`], a request that
@@ -765,6 +774,8 @@ pub struct MockEngine {
     prompt_logprobs: Option<PromptLogprobs>,
     /// The vocabulary size this mock reports to `logprobs=-1` validation; `None` means unstated.
     vocab_size: Option<usize>,
+    /// What this mock answers for [`InferenceEngine::health`]; `None` is healthy.
+    unhealthy: Option<String>,
 }
 
 impl MockEngine {
@@ -787,6 +798,7 @@ impl MockEngine {
             token_logprobs: Vec::new(),
             prompt_logprobs: None,
             vocab_size: None,
+            unhealthy: None,
         }
     }
 
@@ -826,6 +838,13 @@ impl MockEngine {
     #[must_use]
     pub fn with_vocab_size(mut self, vocab_size: usize) -> Self {
         self.vocab_size = Some(vocab_size);
+        self
+    }
+
+    /// Reports the engine unable to serve, for `reason`, on [`InferenceEngine::health`].
+    #[must_use]
+    pub fn with_unhealthy(mut self, reason: impl Into<String>) -> Self {
+        self.unhealthy = Some(reason.into());
         self
     }
 
@@ -1101,6 +1120,10 @@ impl InferenceEngine for MockEngine {
 
     fn capabilities(&self) -> Capabilities {
         self.capabilities
+    }
+
+    fn health(&self) -> Result<(), String> {
+        self.unhealthy.clone().map_or(Ok(()), Err)
     }
 
     fn vocab_size(&self) -> Option<usize> {

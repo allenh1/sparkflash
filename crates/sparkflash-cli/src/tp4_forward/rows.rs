@@ -712,6 +712,23 @@ impl DeviceLayer<'_> {
                 self.max_positions
             ));
         }
+        // Outside the rows its lane backs, a step would write (or its window read) unmapped
+        // memory: a device fault on every rank that names no cause.
+        if let Some(lanes) = self.lanes.as_ref() {
+            let lane = lanes.selected;
+            let (backed, floor) = (lanes.backed(lane), lanes.floor(lane));
+            if p0 + n > backed {
+                return Err(format!(
+                    "rows: positions {p0}..{} pass the {backed} rows lane {lane} backs",
+                    p0 + n
+                ));
+            }
+            if floor > 0 && p0 < floor + sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW {
+                return Err(format!(
+                    "rows: position {p0}'s window reads below lane {lane}'s floor {floor}"
+                ));
+            }
+        }
         Ok(())
     }
 

@@ -3809,30 +3809,45 @@ fn anthropic_stop_reason(reason: FinishReason) -> &'static str {
 // GET /health, /readyz, /v1/models, /v1/cluster/stats, /v1/admin/trace/dump, /metrics
 // ---------------------------------------------------------------------------------------
 
-/// `GET /health`: vLLM's liveness probe, a 200 with an empty body.
+/// `GET /health`: vLLM's liveness probe, a 200 with an empty body while the engine can serve.
 ///
 /// vLLM answers 200 when its engine client is healthy and 503 when it is dead
-/// (`vllm/entrypoints/serve/instrumentator/health.py`). This process answers the request from the
-/// same router that serves inference, so a 200 here means the listener and the router are alive;
-/// the one death vLLM distinguishes is the engine thread disappearing, which this router reports
-/// per request as `engine_gone`. It is deliberately not wired to a 503 yet: that needs a health
-/// flag the driver sets when its thread exits, and this probe does not claim more than it measures.
-async fn health() -> Response {
-    Response::new(Body::empty())
+/// (`vllm/entrypoints/serve/instrumentator/health.py`). Here the engine says
+/// ([`InferenceEngine::health`]): a 503 carries its reason as plain text (a loop that failed, or
+/// one that has made no progress for too long).
+async fn health(State(state): State<AppState>) -> Response {
+    match state.engine.health() {
+        Ok(()) => Response::new(Body::empty()),
+        Err(reason) => unavailable(reason),
+    }
 }
 
-/// `GET /readyz`: 200 while accepting requests, 503 once the drain signal was received.
+/// `GET /readyz`: 200 while accepting requests, 503 once the drain signal was received or while
+/// the engine cannot serve (with its reason, as `/health` gives it).
 ///
 /// Readiness is separate from liveness on purpose: during a graceful drain the process is still
 /// alive and finishes its in-flight requests (so `/health` stays 200), but an orchestrator or load
 /// balancer should stop sending it new work as soon as `/readyz` turns 503. The route answers
-/// from one atomic flag, so it also works while the engine is busy and never blocks on a request.
+/// from flags, so it also works while the engine is busy and never blocks on a request.
 async fn readyz(State(state): State<AppState>) -> Response {
+    if let Err(reason) = state.engine.health() {
+        return unavailable(reason);
+    }
     let mut response = Response::new(Body::empty());
     if state.is_draining() {
         *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
     }
     response
+}
+
+/// A probe's 503 with its reason as plain text.
+fn unavailable(reason: String) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        reason,
+    )
+        .into_response()
 }
 
 async fn list_models(State(state): State<AppState>) -> Response {

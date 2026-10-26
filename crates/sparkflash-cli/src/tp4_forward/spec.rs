@@ -1479,68 +1479,83 @@ pub(super) fn serve(
 ) -> Result<(), String> {
     std::thread::scope(|scope| {
         let pools = Pools::start(scope, inputs);
-        let mut batch = Batch::new(device, rows, draft, inputs, &pools, k)?;
-        // Before rank 0 binds HTTP, so the first client does not pay the lazy module loads and
-        // first-use collective setup (a warm 2K prompt's prefill is ~0.3 s faster than a cold
-        // one's). SPARKFLASH_WARMUP=0 skips it.
-        if std::env::var("SPARKFLASH_WARMUP").as_deref() != Ok("0") {
-            let started = std::time::Instant::now();
-            batch.warm_up()?;
-            if inputs.rank == 0 {
-                println!(
-                    "sparkflash serve: warm-up {:.0} ms",
-                    started.elapsed().as_secs_f64() * 1e3
-                );
-            }
+        let mut batch = Batch::new(device, rows, draft, inputs, &pools, k)
+            .inspect_err(|error| link.fail(error))?;
+        let served = serve_ticks(&mut batch, inputs, link);
+        // The link hears of a failure before the scheduler and its read pools are torn down.
+        if let Err(error) = &served {
+            link.fail(error);
         }
-        if inputs.rank == 0 {
-            println!("sparkflash serve: {}", batch.describe());
-        }
-        // SPARKFLASH_TICK_AHEAD=0: rank 0 decides each tick when the last one ends, and the
-        // workers wait for its frame at every step.
-        let send_ahead = std::env::var("SPARKFLASH_TICK_AHEAD").as_deref() != Ok("0");
-        while let Some(tick) = link.tick(batch.idle(), batch.room(), batch.hold_prefill())? {
-            for id in tick.cancel {
-                if let Some(outcome) = batch.cancel(id)? {
-                    link.finish(id, Ok(&outcome.device()))?;
-                }
-            }
-            for (id, job) in &tick.admit {
-                // The same decision on every rank, before any collective: the group carries on.
-                if let Err(error) = batch.admit(*id, job) {
-                    link.finish(*id, Err(&error))?;
-                }
-            }
-            let mut ahead = |room, hold| {
-                if send_ahead {
-                    link.ahead(room, hold)
-                } else {
-                    Ok(())
-                }
-            };
-            let emissions = match batch.tick(tick.hold_prefill, &mut ahead) {
-                Ok(emissions) => emissions,
-                Err(error) => {
-                    // A failure inside a step may have left the ranks at different collectives.
-                    for id in batch.ids() {
-                        let _ = link.finish(id, Err(&error));
-                    }
-                    return Err(error);
-                }
-            };
-            for Emission { seq, tokens, done } in emissions {
-                if !tokens.is_empty() {
-                    link.emit(seq, &tokens, done.is_some());
-                }
-                match done {
-                    Some(Ok(outcome)) => link.finish(seq, Ok(&outcome.device()))?,
-                    Some(Err(error)) => link.finish(seq, Err(&error))?,
-                    None => {}
-                }
-            }
-        }
-        Ok(())
+        served
     })
+}
+
+/// [`serve`]'s warm-up and tick loop on its scheduler.
+fn serve_ticks(
+    batch: &mut Batch<'_, '_, '_>,
+    inputs: &SpecInputs<'_>,
+    link: &mut dyn DeviceLink,
+) -> Result<(), String> {
+    // Before rank 0 binds HTTP, so the first client does not pay the lazy module loads and
+    // first-use collective setup (a warm 2K prompt's prefill is ~0.3 s faster than a cold
+    // one's). SPARKFLASH_WARMUP=0 skips it.
+    if std::env::var("SPARKFLASH_WARMUP").as_deref() != Ok("0") {
+        let started = std::time::Instant::now();
+        batch.warm_up()?;
+        if inputs.rank == 0 {
+            println!(
+                "sparkflash serve: warm-up {:.0} ms",
+                started.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
+    if inputs.rank == 0 {
+        println!("sparkflash serve: {}", batch.describe());
+    }
+    // SPARKFLASH_TICK_AHEAD=0: rank 0 decides each tick when the last one ends, and the
+    // workers wait for its frame at every step.
+    let send_ahead = std::env::var("SPARKFLASH_TICK_AHEAD").as_deref() != Ok("0");
+    while let Some(tick) = link.tick(batch.idle(), batch.room(), batch.hold_prefill())? {
+        for id in tick.cancel {
+            if let Some(outcome) = batch.cancel(id)? {
+                link.finish(id, Ok(&outcome.device()))?;
+            }
+        }
+        for (id, job) in &tick.admit {
+            // The same decision on every rank, before any collective: the group carries on.
+            if let Err(error) = batch.admit(*id, job) {
+                link.finish(*id, Err(&error))?;
+            }
+        }
+        let mut ahead = |room, hold| {
+            if send_ahead {
+                link.ahead(room, hold)
+            } else {
+                Ok(())
+            }
+        };
+        let emissions = match batch.tick(tick.hold_prefill, &mut ahead) {
+            Ok(emissions) => emissions,
+            Err(error) => {
+                // A failure inside a step may have left the ranks at different collectives.
+                for id in batch.ids() {
+                    let _ = link.finish(id, Err(&error));
+                }
+                return Err(error);
+            }
+        };
+        for Emission { seq, tokens, done } in emissions {
+            if !tokens.is_empty() {
+                link.emit(seq, &tokens, done.is_some());
+            }
+            match done {
+                Some(Ok(outcome)) => link.finish(seq, Ok(&outcome.device()))?,
+                Some(Err(error)) => link.finish(seq, Err(&error))?,
+                None => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

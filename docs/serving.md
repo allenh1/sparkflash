@@ -60,7 +60,7 @@ turns 200 when it accepts requests. If any rank dies, the others exit rather tha
 | `POST /v1/messages` | Anthropic Messages API, buffered |
 | `GET /v1/models`, `/v1/models/{id}` | The served model is `deepseek-ai/DeepSeek-V4.1-Flash` |
 | `POST /tokenize`, `/detokenize` | vLLM-compatible |
-| `GET /health`, `/readyz` | Liveness, and readiness (503 while draining) |
+| `GET /health`, `/readyz` | Liveness (503, with the reason, once the device loop has failed or stalled), and readiness (also 503 while draining) |
 | `GET /metrics` | Prometheus: requests running / waiting / rejected, prompt and generated tokens, time to first token |
 | `GET /v1/cluster/stats` | JSON: per-node state, KV cache, speculation and request timing statistics |
 
@@ -90,6 +90,11 @@ bearer token on every route except health, readiness and metrics.
 - **Context.** Up to 1,048,576 tokens per sequence (`--max-model-len` lowers it).
 - **Sampling.** Greedy below `temperature` 1e-5. Seeded requests (`seed`) are reproducible, and
   speculation does not change what they produce.
+- **Failures.** A device error ends every request on the device and queued for it with an error,
+  and all four ranks exit, so a process supervisor can restart the group. When the loop makes no
+  progress for `SPARKFLASH_STALL_SECS` (120 s) while it has work, `/health` and `/readyz` answer
+  503 with the reason and new requests are refused; the server log records when the stall began
+  and ended.
 
 ## Tuning knobs
 

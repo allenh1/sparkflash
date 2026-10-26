@@ -2287,6 +2287,28 @@ async fn readyz_reports_serving_then_draining_while_health_stays_up() {
 }
 
 #[tokio::test]
+async fn an_engine_that_cannot_serve_turns_health_and_readyz_503_with_its_reason() {
+    // A loop that failed or stopped making progress is the death vLLM's probe reports as a 503:
+    // both probes say so, with the engine's reason, and the scraper keeps working.
+    let reason = "the device loop has made no progress for 130 s";
+    let state = AppState::new(Arc::new(engine_with(&["Hello"]).with_unhealthy(reason)))
+        .with_fixed_time(FIXED_TIME);
+    let app = router(state);
+    for uri in ["/health", "/readyz"] {
+        let (status, headers, bytes) = send(app.clone(), get_request(uri)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        assert_eq!(
+            headers.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("text/plain; charset=utf-8"),
+            "{uri}"
+        );
+        assert_eq!(String::from_utf8_lossy(&bytes), reason, "{uri}");
+    }
+    let (status, _, _) = send(app, get_request("/metrics")).await;
+    assert_eq!(status, StatusCode::OK, "the scraper still answers");
+}
+
+#[tokio::test]
 async fn an_empty_stop_string_is_refused_like_vllm() {
     // vLLM's SamplingParams._verify_args: "stop cannot contain an empty string."
     let body =

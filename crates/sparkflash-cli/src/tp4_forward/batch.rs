@@ -1204,11 +1204,20 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             return Ok(());
         };
         let lane = self.seqs[index].lane.ok_or("prefill: no lane")?;
-        let p = self.seqs[index].pos;
+        let (id, p) = (self.seqs[index].id, self.seqs[index].pos);
         let mut ahead = self.tick_rows(bulk, decoding);
         if bulk && self.pairs(index, decoding) {
             ahead *= 1 + self.inputs.bulk_more.len();
         }
+        // A chunk whose Engram reads went out under the tick before keeps that tick's size
+        // ([`Self::prefill_bulk`]): a whole bulk chunk when nothing decoded then, which a tick with
+        // a decoder now would back only a busy chunk's rows of.
+        let pending = self
+            .prefill_next
+            .as_ref()
+            .filter(|next| bulk && next.seq == id && next.p == p)
+            .map_or(0, |next| next.n);
+        let ahead = ahead.max(pending);
         if !self.make_room(index, target.min(p + ahead) + BLOCK + self.k + 2)? {
             // Preempted: it waits for a lane again.
             return Ok(());
