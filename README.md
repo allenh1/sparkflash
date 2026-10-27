@@ -224,6 +224,14 @@ docs/                    design, performance, serving and model architecture
 reference/               upstream model card, tokenizer and encoding reference
 ```
 
+## Contributing
+
+Contributions are welcome under the Apache-2.0 license. Start with
+[CONTRIBUTING.md](CONTRIBUTING.md): it states the commit sign-off rule, the CI gates, and the
+evidence a new model must bring (tested configuration, clean and measured kernels, benchmark
+protocol, weights revision, paper or reference implementation, licensing, and supported
+platforms).
+
 ## Status
 
 SparkFlash serves one model, DeepSeek-V4.1-Flash, on one topology: four DGX Sparks at tensor

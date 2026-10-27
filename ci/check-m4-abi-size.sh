@@ -1,4 +1,18 @@
 #!/bin/sh
+# Copyright (c) 2026 Hunter L. Allen
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Size ratchet for the frozen Milestone-4 ABI module family (D26):
 # crates/sparkflash-kernels/src/m4_abi.rs plus the pinned submodules under src/m4_abi/.
 #
@@ -41,11 +55,11 @@ SUB_DIR="$SRC/m4_abi"
 # it. This list is checked exactly, so the sum cannot be moved to a different file unnoticed.
 EXPECTED_FILES="m4_abi.rs m4_abi/acquire_guard.rs m4_abi/scanner.rs"
 
-# Pre-split baseline (main 0639413, one file): 13,906 lines. The split adds only the glue that
+# Pre-split baseline (main d7ed586a, one file): 13,906 lines. The split adds only the glue that
 # declares the submodules and re-exports the moved public entry points; the aggregate below is the
 # pinned total after that move. Any later commit that changes the total changes this number in the
 # same diff, cited to a Lead decision, and that diff is the review gate.
-PINNED_LINES=13926
+PINNED_LINES=13968
 
 if [ ! -f "$ROOT_FILE" ]; then
     echo "error: $ROOT_FILE is missing; the frozen Milestone-4 ABI lint cannot be removed silently (D26)" >&2

@@ -1,8 +1,22 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hunter L. Allen
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Verify that the m7_layer0 split moved code without changing it.
 
 The harness was one file, crates/sparkflash-kernels/examples/m7_layer0.rs (8,224 lines at main
-2245a4e), and is now examples/m7_layer0/main.rs plus one module per stage. This script is the
+2245a4e, rewritten as ab8a2621), and is now examples/m7_layer0/main.rs plus one module per stage. This script is the
 proof that the move is verbatim: it rebuilds every original line range from the base commit and
 compares it with the current files after removing only the lines the split added - the per-module
 imports, the crate-root layout comment and mod/use glue, and the pub(crate) visibility the
@@ -20,7 +34,7 @@ import re
 import subprocess
 import sys
 
-BASE_COMMIT = "2245a4e"
+BASE_COMMIT = "ab8a2621"
 EXAMPLE = "crates/sparkflash-kernels/examples/m7_layer0"
 ORIGINAL = EXAMPLE + ".rs"
 
@@ -85,6 +99,18 @@ def strip_visibility(lines):
     return out
 
 
+def strip_license_header(text):
+    """Drop the Apache-2.0 notice the relicense added above every source file."""
+    marker = "// Copyright (c) 2026 Hunter L. Allen"
+    end_marker = "// limitations under the License.\n\n"
+    if not text.startswith(marker):
+        return text
+    end = text.find(end_marker)
+    if end < 0:
+        raise SystemExit("error: a split file starts with the license header but does not end it")
+    return text[end + len(end_marker):]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default=BASE_COMMIT)
@@ -99,7 +125,7 @@ def main():
 
     for name, (start, end) in SLICES.items():
         path = split_dir / (name + ".rs")
-        actual = path.read_text().splitlines(keepends=True)
+        actual = strip_license_header(path.read_text()).splitlines(keepends=True)
         header = [line + "\n" for line in IMPORTS[name]]
         if actual[:len(header)] != header:
             print("FAIL", name, "header is not the expected import block")
@@ -126,7 +152,7 @@ def main():
             ok = False
 
     main_path = split_dir / "main.rs"
-    text = main_path.read_text().replace(PATH_IN_SPLIT, PATH_IN_ORIGINAL)
+    text = strip_license_header(main_path.read_text()).replace(PATH_IN_SPLIT, PATH_IN_ORIGINAL)
     kept = [line for line in text.splitlines(keepends=True) if not GLUE.match(line)]
     expected_main = original[0:850] + original[4331:4363]
     if collapse(expected_main) == collapse(kept):
