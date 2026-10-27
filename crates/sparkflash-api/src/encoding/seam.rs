@@ -77,6 +77,13 @@
 //!   mode the renderer refuses it with its typed UnknownRole error. Any role
 //!   outside system/user/assistant/tool is refused as Invalid role: <role>,
 //!   the exact vLLM text.
+//! * Only an image content part becomes the image placeholder's id. vLLM
+//!   tokenizes the rendered string, so the placeholder's spelling anywhere in
+//!   the conversation (a tool result showing source code that names it, say)
+//!   becomes the same id, and the request then fails for want of an image.
+//!   Here that spelling is tokenized as the text it is. Every other id is
+//!   unchanged: the chat prompt is tokenized with the checkpoint tokenizer
+//!   minus that one added token, split where the image parts were rendered.
 //!
 //! # Token id evidence
 //!
@@ -179,6 +186,12 @@ pub enum TokenizerSeamError {
 /// Milestone 1 placeholder path; a production serve always attaches one.
 pub struct TokenizerSeam {
     tokenizer: HfTokenizerEncoder,
+    /// The checkpoint tokenizer without the image placeholder among its added
+    /// tokens, for chat prompts: the placeholder's spelling in client text
+    /// tokenizes as the text it is, and only image parts become its id.
+    chat_tokenizer: tokenizers::Tokenizer,
+    /// The image placeholder's id, when the vocabulary has one.
+    image_id: Option<u32>,
 }
 
 impl std::fmt::Debug for TokenizerSeam {
@@ -197,7 +210,14 @@ impl TokenizerSeam {
     /// Wrap an already loaded checkpoint tokenizer.
     #[must_use]
     pub fn new(tokenizer: HfTokenizerEncoder) -> Self {
-        Self { tokenizer }
+        let image_id = tokenizer.tokenizer().token_to_id(IMAGE_PLACEHOLDER);
+        let chat_tokenizer = without_added_token(tokenizer.tokenizer(), IMAGE_PLACEHOLDER)
+            .unwrap_or_else(|| tokenizer.tokenizer().clone());
+        Self {
+            tokenizer,
+            chat_tokenizer,
+            image_id,
+        }
     }
 
     /// Load the seam from a tokenizer.json path.
@@ -273,6 +293,9 @@ impl TokenizerSeam {
     /// vLLM wrapper's rules depend on fields the named structs do not all keep
     /// (for example arbitrary chat_template_kwargs).
     ///
+    /// Each image part becomes the placeholder's id; the placeholder's spelling
+    /// in any text of the request is tokenized as text (see the module docs).
+    ///
     /// # Errors
     ///
     /// A typed TokenizerSeamError for every refusal path; callers map it to an
@@ -288,9 +311,10 @@ impl TokenizerSeam {
             return Err(TokenizerSeamError::EmptyMessages);
         }
 
+        let image_text = image_marker(request);
         let mut messages = Vec::with_capacity(messages_array.len());
         for (index, message) in messages_array.iter().enumerate() {
-            messages.push(normalize_message(index, message)?);
+            messages.push(normalize_message(index, message, &image_text)?);
         }
 
         attach_tools(&mut messages, request.get("tools"))?;
@@ -313,8 +337,51 @@ impl TokenizerSeam {
             true,
             Some(effort.score),
         )?;
-        self.encode_text(&prompt)
+        let mut ids = Vec::new();
+        for (index, text) in prompt.split(image_text.as_str()).enumerate() {
+            if index > 0 {
+                match self.image_id {
+                    Some(id) => ids.push(id),
+                    None => ids.extend(self.encode_text(IMAGE_PLACEHOLDER)?),
+                }
+            }
+            let encoding = self
+                .chat_tokenizer
+                .encode(text, false)
+                .map_err(|error| TokenizerSeamError::Tokenize(error.to_string()))?;
+            ids.extend_from_slice(encoding.get_ids());
+        }
+        Ok(ids)
     }
+}
+
+/// `tokenizer` without `content` among its added tokens, so that spelling
+/// tokenizes as ordinary text; None when it is not an added token.
+fn without_added_token(
+    tokenizer: &tokenizers::Tokenizer,
+    content: &str,
+) -> Option<tokenizers::Tokenizer> {
+    let mut json: Value = serde_json::from_str(&tokenizer.to_string(false).ok()?).ok()?;
+    let added = json.get_mut("added_tokens")?.as_array_mut()?;
+    let count = added.len();
+    added.retain(|token| token.get("content").and_then(Value::as_str) != Some(content));
+    if added.len() == count {
+        return None;
+    }
+    json.to_string().parse().ok()
+}
+
+/// What the template renders an image part as until the prompt is tokenized:
+/// a number between two private-use characters, the first such marker that
+/// occurs nowhere in the request. Every occurrence in the rendered prompt is
+/// then an image part's, and the placeholder's spelling in client text stays
+/// text.
+fn image_marker(request: &Value) -> String {
+    let body = request.to_string();
+    (0_u64..)
+        .map(|n| format!("\u{e000}{n}\u{e001}"))
+        .find(|marker| !body.contains(marker.as_str()))
+        .expect("a finite request leaves a marker free")
 }
 
 /// The thinking flag and rendered budget the template will use.
@@ -349,8 +416,13 @@ fn python_repr(value: Option<&Value>) -> String {
     }
 }
 
-/// Normalise one raw OpenAI message exactly as _normalize_messages does.
-fn normalize_message(index: usize, message: &Value) -> Result<EncodingMessage, TokenizerSeamError> {
+/// Normalise one raw OpenAI message exactly as _normalize_messages does, with
+/// each image part rendered as `image_text` rather than the placeholder.
+fn normalize_message(
+    index: usize,
+    message: &Value,
+    image_text: &str,
+) -> Result<EncodingMessage, TokenizerSeamError> {
     let object = message
         .as_object()
         .ok_or(TokenizerSeamError::MessageNotObject { index })?;
@@ -386,7 +458,7 @@ fn normalize_message(index: usize, message: &Value) -> Result<EncodingMessage, T
                             .to_owned(),
                     ),
                     Some("image_url" | "input_image" | "image_pil") => {
-                        rendered.push(IMAGE_PLACEHOLDER.to_owned());
+                        rendered.push(image_text.to_owned());
                     }
                     _ => {
                         return Err(TokenizerSeamError::UnsupportedContentPart {

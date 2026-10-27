@@ -173,18 +173,22 @@ async fn the_url_length_limit_bounds_fetched_urls_not_inline_images() {
 }
 
 #[tokio::test]
-async fn a_placeholder_without_its_image_is_refused() {
-    // A literal placeholder typed into the text is one more placeholder token than there are
-    // images: the spans cannot be placed, so the request is refused rather than misaligned.
+async fn a_placeholder_typed_into_the_text_is_text() {
+    // The placeholder's spelling in a text part is not a second image: the one image part gets
+    // the one span, and the spelling reaches the model as text.
     let body = chat(json!([
         {"type": "text", "text": "<｜deepseek_image｜>"},
         {"type": "image_url", "image_url": {"url": data_url("image/png", DOT)}},
     ]));
+    let ids = template_ids(&body);
+    assert_eq!(ids.iter().filter(|&&id| id == IMAGE_TOKEN_ID).count(), 1);
     let (status, response) = send(app(true), "POST", "/v1/chat/completions", Some(body)).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
-    assert_eq!(response["error"]["param"], "messages");
-    let message = response["error"]["message"].as_str().unwrap();
-    assert!(message.contains("placeholder"), "{message}");
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["usage"]["prompt_tokens_details"]["image_tokens"],
+        184
+    );
+    assert_eq!(response["usage"]["prompt_tokens"], ids.len() - 1 + 184);
 }
 
 #[tokio::test]

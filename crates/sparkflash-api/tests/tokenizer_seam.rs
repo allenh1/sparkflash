@@ -324,6 +324,74 @@ fn developer_role_matches_the_released_encoder() {
     );
 }
 
+const PLACEHOLDER: &str = "<｜deepseek_image｜>";
+
+fn placeholder_id(seam: &TokenizerSeam) -> u32 {
+    seam.tokenizer()
+        .token_to_id(PLACEHOLDER)
+        .expect("the image placeholder is a token")
+}
+
+#[test]
+fn the_image_placeholder_spelled_in_text_stays_text() {
+    // An agent reading source that names the placeholder: the spelling in a user message, a tool
+    // call and a tool result is text, not an image the request does not carry.
+    let seam = seam();
+    let source = format!("pub const IMAGE_PLACEHOLDER: &str = \"{PLACEHOLDER}\";");
+    let ids = seam
+        .encode_chat(&json!({
+            "messages": [
+                {"role": "user", "content": format!("Where is {PLACEHOLDER} defined?")},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "grep", "arguments": json!({"pattern": PLACEHOLDER}).to_string()}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": source},
+            ]
+        }))
+        .expect("the chat body renders");
+    assert!(!ids.contains(&placeholder_id(&seam)));
+    let text = seam.decode(&ids).expect("the ids decode");
+    assert_eq!(text.matches(PLACEHOLDER).count(), 3, "{text}");
+    assert!(text.contains(&source), "{text}");
+}
+
+#[test]
+fn only_image_parts_become_the_placeholder_id() {
+    let seam = seam();
+    let image = json!({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}});
+    // The second request also spells the marker the template renders image parts as before
+    // tokenizing; that text stays text too.
+    for text in [
+        PLACEHOLDER.to_owned(),
+        format!("{PLACEHOLDER} \u{e000}0\u{e001}"),
+    ] {
+        let ids = seam
+            .encode_chat(&json!({
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": text},
+                    image,
+                    {"type": "text", "text": "and"},
+                    image,
+                ]}]
+            }))
+            .expect("the chat body renders");
+        let id = placeholder_id(&seam);
+        assert_eq!(ids.iter().filter(|&&token| token == id).count(), 2);
+        let decoded = seam.decode(&ids).expect("the ids decode");
+        assert!(decoded.contains(&format!("{text}\n\n{PLACEHOLDER}\n\nand\n\n{PLACEHOLDER}")));
+    }
+    // With the spelling gone from the text, the ids are those of the rendered string.
+    let body = json!({"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "What is this?"},
+        image,
+    ]}]});
+    let ids = seam.encode_chat(&body).expect("the chat body renders");
+    let rendered = seam.decode(&ids).expect("the ids decode");
+    assert_eq!(seam.encode_text(&rendered).expect("the text encodes"), ids);
+}
+
 fn app_with_seam() -> Router {
     let engine = MockEngine::new(MODEL)
         .with_cluster_stats(ClusterStatsSnapshot::default())

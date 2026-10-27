@@ -3,9 +3,10 @@
 //!
 //! The chat template renders every `image_url` / `input_image` part as one image placeholder
 //! (`encoding/seam.rs`), so the rendered prompt has one [`sparkflash_vision::IMAGE_TOKEN_ID`] per
-//! part, in message and part order. [`take_chat_images`] collects the parts in that order, and the
-//! handler pairs them with the placeholders, refusing a request where the two counts differ (a
-//! literal placeholder typed into a text part, an `image_pil` part that carries no data).
+//! part, in message and part order, and the placeholder's spelling in text stays text.
+//! [`take_chat_images`] collects the parts in that order, and the handler pairs them with the
+//! placeholders, refusing a request where the two counts differ (an `image_pil` part that carries
+//! no data).
 //!
 //! Each part is then fetched (an http(s) URL) or taken inline (a base64 data URL) and prepared by
 //! [`sparkflash_vision::prepare`]: decoded, planned and padded exactly as the reference
