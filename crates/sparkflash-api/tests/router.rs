@@ -3945,8 +3945,8 @@ async fn device_claimed_chat_with_tokenizer_seam_captures_prompt_token_ids() {
     let source = Arc::new(TestDeviceTokenSource::new(true));
     let last = Arc::clone(&source.last);
     let seam = Arc::new(
-        sparkflash_api::encoding::TokenizerSeam::from_path(
-            &sparkflash_api::encoding::reference_tokenizer_path(),
+        sparkflash_model_deepseek_v41::encoding::TokenizerSeam::from_path(
+            &sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path(),
         )
         .expect("load reference tokenizer seam"),
     );
@@ -3975,6 +3975,70 @@ async fn device_claimed_chat_with_tokenizer_seam_captures_prompt_token_ids() {
         .prompt_token_ids
         .expect("prompt token ids must be captured by tokenizer seam for W4");
     assert!(!prompt_ids.is_empty());
+}
+
+#[tokio::test]
+async fn responses_and_messages_are_not_implemented_with_the_checkpoint_tokenizer() {
+    // Both routes size their prompt with placeholder ids. A real engine (the tokenizer attached)
+    // would generate from those instead of the request, so they are refused until implemented.
+    let engine = RecordingEngine::default();
+    let calls = Arc::clone(&engine.calls);
+    let seam = Arc::new(
+        sparkflash_model_deepseek_v41::encoding::TokenizerSeam::from_path(
+            &sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path(),
+        )
+        .expect("load reference tokenizer seam"),
+    );
+    let app = router(
+        AppState::new(Arc::new(engine))
+            .with_fixed_time(FIXED_TIME)
+            .with_tokenizer(seam),
+    );
+    let bodies = [
+        (
+            "/v1/responses",
+            json!({"model": MODEL, "input": "What is 2 + 2?"}),
+        ),
+        (
+            "/v1/messages",
+            json!({"model": MODEL, "max_tokens": 8,
+                   "messages": [{"role": "user", "content": "What is 2 + 2?"}]}),
+        ),
+    ];
+    for (uri, body) in bodies {
+        let (status, _, bytes) = send(app.clone(), json_request(uri, &body)).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{uri}");
+        let message = body_json(&bytes)["error"]["message"]
+            .as_str()
+            .expect("an error message")
+            .to_owned();
+        assert!(
+            message.starts_with(&format!("{uri} is not implemented yet")),
+            "{message}"
+        );
+        assert!(message.contains("/v1/chat/completions"), "{message}");
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no refused request reached generation"
+    );
+    let (status, _, bytes) = send(app, get_request("/v1/models")).await;
+    assert_eq!(status, StatusCode::OK);
+    let card = body_json(&bytes);
+    let endpoints = card["data"][0]["capabilities"]["endpoints"]
+        .as_array()
+        .expect("endpoints is an array");
+    assert!(
+        endpoints.iter().any(|e| e == "/v1/chat/completions"),
+        "{endpoints:?}"
+    );
+    assert!(
+        !endpoints
+            .iter()
+            .any(|e| e == "/v1/responses" || e == "/v1/messages"),
+        "the refused routes are not advertised: {endpoints:?}"
+    );
 }
 
 #[tokio::test]

@@ -10,15 +10,10 @@
 //! 2. `enable_thinking` (bool)
 //! 3. the default: thinking on.
 //!
-//! The numeric table itself (which alias scores what, and the 50 default) is NOT defined
-//! here: it is owned by `crate::encoding::resolve_reasoning_effort`, the
-//! canonical API-surface resolver, and this module only adds the strict validation and the
-//! typed errors the HTTP layer reports. That keeps the two surfaces from drifting.
+//! The numeric table is the protocol-level default (low/minimal 25, medium/high 50,
+//! xhigh 75, max 100, absent 50). A model pack may expose the same aliases through its
+//! encoding surface; a test pins the two tables against each other so they cannot drift.
 
-use crate::encoding::{
-    ReasoningEffortError, TEMPLATE_EFFORT_HIGH, TEMPLATE_EFFORT_LOW, TEMPLATE_EFFORT_MAX,
-    TEMPLATE_EFFORT_XHIGH, resolve_reasoning_effort,
-};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -31,17 +26,17 @@ pub const EFFORT_MAX: u8 = 100;
 /// This is the released V4.1 encoder's default (`high`), and the same 25/50/75/100
 /// table used by the prompt seam; recipe 0.2's separate 50/75/75/100 table is not
 /// an API default. See docs/DECISIONS.md (task-63 effort-table consolidation).
-pub const EFFORT_DEFAULT: u8 = TEMPLATE_EFFORT_HIGH;
+pub const EFFORT_DEFAULT: u8 = 50;
 /// Score for "low" and "minimal".
-pub const EFFORT_LOW: u8 = TEMPLATE_EFFORT_LOW;
+pub const EFFORT_LOW: u8 = 25;
 /// Score for "medium" (an alias of the default high level).
 pub const EFFORT_MEDIUM: u8 = EFFORT_DEFAULT;
 /// Score for "high".
-pub const EFFORT_HIGH: u8 = TEMPLATE_EFFORT_HIGH;
+pub const EFFORT_HIGH: u8 = 50;
 /// Score for "xhigh".
-pub const EFFORT_XHIGH: u8 = TEMPLATE_EFFORT_XHIGH;
+pub const EFFORT_XHIGH: u8 = 75;
 /// Score for "max".
-pub const EFFORT_MAX_SCORE: u8 = TEMPLATE_EFFORT_MAX;
+pub const EFFORT_MAX_SCORE: u8 = 100;
 
 /// Resolved reasoning configuration for one request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,26 +95,23 @@ pub enum ReasoningError {
 #[must_use]
 pub fn effort_for_name(name: &str) -> Option<u8> {
     let normalized = name.trim().to_ascii_lowercase();
-    let spec = resolve_reasoning_effort(Some(&Value::String(normalized)), true);
-    if spec.error.is_none() {
-        spec.score
-    } else {
-        None
+    match normalized.as_str() {
+        "low" | "minimal" => Some(EFFORT_LOW),
+        "medium" | "high" => Some(EFFORT_HIGH),
+        "xhigh" => Some(EFFORT_XHIGH),
+        "max" => Some(EFFORT_MAX_SCORE),
+        _ => None,
     }
 }
 
 /// Scores a string spelling through the canonical encoding table, translating its error
 /// into this module's typed error.
 fn alias_score(text: &str) -> Result<Option<u8>, ReasoningError> {
-    let normalized = text.trim().to_ascii_lowercase();
-    let spec = resolve_reasoning_effort(Some(&Value::String(normalized)), true);
-    match spec.error {
-        None => Ok(spec.score),
-        Some(ReasoningEffortError::UnknownAlias(_)) => Err(ReasoningError::UnknownEffort {
+    effort_for_name(text)
+        .map(Some)
+        .ok_or_else(|| ReasoningError::UnknownEffort {
             value: text.to_owned(),
-        }),
-        Some(_) => Err(ReasoningError::InvalidEffortType { kind: "string" }),
-    }
+        })
 }
 
 /// Resolves the reasoning configuration of a request body.
@@ -225,6 +217,7 @@ fn render(value: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use sparkflash_model_deepseek_v41::encoding::resolve_reasoning_effort;
 
     #[test]
     fn absent_and_null_effort_default_to_50() {
@@ -271,8 +264,8 @@ mod tests {
     }
 
     #[test]
-    fn alias_table_is_delegated_to_the_encoding_surface() {
-        // Drift guard: if crate::encoding changes a score, this fails instead of silently
+    fn alias_table_matches_the_v41_encoding_surface() {
+        // Drift guard: if the model pack changes a score, this fails instead of silently
         // producing two different API tables.
         for (name, score) in [
             ("low", EFFORT_LOW),

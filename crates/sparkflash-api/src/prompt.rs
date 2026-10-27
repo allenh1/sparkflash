@@ -7,9 +7,11 @@
 //! a fixed chat-template overhead per message and a fixed reply primer.
 //!
 //! This heuristic is the fallback for a router with no checkpoint tokenizer attached (the
-//! weight-free tests). A production `sparkflash serve` attaches `crate::encoding::TokenizerSeam`,
+//! weight-free tests). A production `sparkflash serve` attaches a model pack's `PromptCodec`,
 //! and then `/v1/completions` and `/v1/chat/completions` carry the checkpoint's real token ids
-//! instead of these placeholders.
+//! instead of these placeholders. `/v1/responses` and `/v1/messages` have no tokenizer path yet,
+//! so with the seam attached they are refused as not implemented rather than served these
+//! placeholders.
 //!
 //! Image content parts are **recorded**, not charged. The vision path is 263
 //! `vision.*`/`aligner.*` tensors plus the three image delimiters, none of which the tensor plan

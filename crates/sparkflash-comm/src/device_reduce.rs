@@ -927,6 +927,63 @@ impl RunReduce {
         Ok(())
     }
 
+    /// The two-shot exchange's first half: chunk `peer` of this rank's `world * chunk` bf16 values
+    /// at `send` goes to `peer`, and every peer's chunk `rank` lands at `gather + peer * chunk * 2`
+    /// (this rank's own slot is left untouched), all in one NCCL group. The caller sums its chunk in
+    /// rank order and shares it with [Self::exchange_bf16], so each rank sends half the one-shot
+    /// exchange's bytes and every element is still summed in the one-shot's order.
+    ///
+    /// # Safety
+    /// Same contract as reduce_bf16; `send` holds `world * chunk` bf16 values and `gather` holds
+    /// `world * chunk`.
+    ///
+    /// # Errors
+    /// NcclError::Call when the library lacks the point-to-point calls or refuses an enqueue.
+    pub unsafe fn scatter_bf16(
+        &mut self,
+        send: u64,
+        gather: u64,
+        chunk: usize,
+        stream: u64,
+    ) -> Result<(), NcclError> {
+        let bytes = payload_bytes(chunk)?;
+        self.api.group_start()?;
+        for peer in 0..self.world {
+            if peer == self.rank {
+                continue;
+            }
+            let theirs = send + (peer * chunk * 2) as u64;
+            let slot = gather + (peer * chunk * 2) as u64;
+            // SAFETY: the caller upholds the pointer, device and stream contract documented above.
+            let enqueued = unsafe {
+                self.api
+                    .enqueue_send_bf16(
+                        self.comm,
+                        theirs as *const c_void,
+                        chunk,
+                        peer as i32,
+                        stream as CudaStream,
+                    )
+                    .and_then(|()| {
+                        self.api.enqueue_recv_bf16(
+                            self.comm,
+                            slot as *mut c_void,
+                            chunk,
+                            peer as i32,
+                            stream as CudaStream,
+                        )
+                    })
+            };
+            if let Err(error) = enqueued {
+                let _ = self.api.group_end();
+                return Err(error);
+            }
+        }
+        self.api.group_end()?;
+        self.stats.record(bytes);
+        Ok(())
+    }
+
     /// [Self::exchange_bf16] as one in-place ring AllGather: the same bits land in the same slots
     /// (nothing is summed), at the ring's bandwidth instead of 3 point-to-point sends of the whole
     /// slot. For large slots, where the sends crawl; a decode row keeps the one-hop exchange.

@@ -312,6 +312,76 @@ const OPT_T4_SYMBOLS: [&str; 4] = [
     "opt_gemv_bf16a_bf16o_t4",
 ];
 
+/// The rows GEMV forms, as [`RowsForm`]: a block serves up to `tokens` tokens of `tiles` 32-column
+/// tiles, staging the activations a K chunk at a time. Bit-identical to the t1..t8 forms per token.
+static OPT_GR_FUNCTIONS: [std::sync::atomic::AtomicU64; 7] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+const OPT_GR_SYMBOLS: [&str; 7] = [
+    "opt_gemv_rows_fp8a_bf16o_r8c2",
+    "opt_gemv_rows_fp8a_bf16o_r8c1",
+    "opt_gemv_rows_fp8a_bf16o_r4c1",
+    "opt_gemv_rows_bf16a_bf16o_r8c2",
+    "opt_gemv_rows_bf16a_bf16o_r8c1",
+    "opt_gemv_rows_f32a_f32o_r4c2",
+    "opt_gemv_rows_f32a_f32o_r4c1",
+];
+
+/// One rows GEMV form: its slot in [`OPT_GR_FUNCTIONS`], tokens and tiles per block.
+#[derive(Debug, Clone, Copy)]
+struct RowsForm {
+    slot: usize,
+    tokens: u32,
+    tiles: u32,
+}
+
+const fn form(slot: usize, tokens: u32, tiles: u32) -> RowsForm {
+    RowsForm {
+        slot,
+        tokens,
+        tiles,
+    }
+}
+
+/// The rows form for a launch of `tokens` tokens of kind `index` over `blocks` tiles (all groups)
+/// and an `inner` reduction, or None where the t1..t8 forms are as fast. By sweep over the decode
+/// projections at 2 to 32 tokens. E4M3: a wide matrix gains from five tokens, a narrower one from
+/// nine, a narrow one from seventeen. bf16 (wo_a): from thirteen. f32: the long gate/up reduction
+/// (whose rows do not stage in the t4 form) from five, the wide down projection from nine.
+fn rows_form(index: usize, blocks: u32, inner: u32, tokens: u32) -> Option<RowsForm> {
+    const R8C2: RowsForm = form(0, 8, 2);
+    const R8C1: RowsForm = form(1, 8, 1);
+    const R4C1: RowsForm = form(2, 4, 1);
+    const B8C2: RowsForm = form(3, 8, 2);
+    const B8C1: RowsForm = form(4, 8, 1);
+    const F4C2: RowsForm = form(5, 4, 2);
+    const F4C1: RowsForm = form(6, 4, 1);
+    match index {
+        0 if blocks >= WIDE_BLOCKS => (tokens >= 5).then_some(R8C2),
+        0 if blocks >= ROWS_MID_BLOCKS => match tokens {
+            0..=8 => None,
+            9..=12 => Some(R4C1),
+            13..=16 => Some(R8C1),
+            _ => Some(R8C2),
+        },
+        0 => (tokens > 16).then_some(R4C1),
+        2 if blocks >= WIDE_BLOCKS => (tokens >= 9).then_some(F4C2),
+        2 if inner >= ROWS_LONG_INNER => (tokens >= 5).then_some(F4C1),
+        3 if blocks >= ROWS_MID_BLOCKS && inner >= ROWS_LONG_INNER => match tokens {
+            0..=12 => None,
+            13..=16 => Some(B8C1),
+            _ => Some(B8C2),
+        },
+        _ => None,
+    }
+}
+
 /// Loads the opt GEMV symbols and routes [`launch`] through them. The module is returned so the
 /// caller keeps it loaded for the run.
 pub fn install_opt(cuda: &Cuda, cubin: &[u8]) -> Result<Module, String> {
@@ -326,6 +396,7 @@ pub fn install_opt(cuda: &Cuda, cubin: &[u8]) -> Result<Module, String> {
         .zip(OPT_ROWS_SYMBOLS)
         .chain(OPT_T2_FUNCTIONS.iter().zip(OPT_T2_SYMBOLS))
         .chain(OPT_T4_FUNCTIONS.iter().zip(OPT_T4_SYMBOLS))
+        .chain(OPT_GR_FUNCTIONS.iter().zip(OPT_GR_SYMBOLS))
     {
         let (m, k) = cuda.load_named(cubin, symbol)?;
         slot.store(k.to_raw().0, std::sync::atomic::Ordering::Release);
@@ -388,23 +459,7 @@ fn launch_mma(cuda: &Cuda, index: usize, args: &OptArgs) -> Result<(), String> {
         Kernel::from_raw(word, OPT_MMA_SYMBOLS[index]),
         grid,
         (256, 1, 1),
-        &[
-            args.a,
-            args.a_scales,
-            args.w,
-            args.ws,
-            args.out,
-            u64::from(args.cols),
-            u64::from(args.inner),
-            u64::from(args.tokens),
-            args.a_tok_stride,
-            args.out_tok_stride,
-            args.a_grp_stride,
-            args.w_grp_stride,
-            args.s_grp_stride,
-            args.out_grp_stride,
-            u64::from(args.k_stride_blocks),
-        ],
+        &opt_words(args),
     )
 }
 
@@ -526,6 +581,21 @@ fn launch_gemv(cuda: &Cuda, kind: OptKind, index: usize, args: &OptArgs) -> Resu
     // takes eight from five tokens; a very narrow one splits further to get them; bf16 rows run a
     // ragged second block of four slowly. By sweep over the decode shapes at 1 to 16 tokens.
     let blocks = (args.cols / 32) * args.groups;
+    if let Some(form) = rows_form(index, blocks, args.inner, args.tokens) {
+        let word = OPT_GR_FUNCTIONS[form.slot].load(Acquire);
+        if word != 0 {
+            return cuda.launch(
+                Kernel::from_raw(word, OPT_GR_SYMBOLS[form.slot]),
+                (
+                    (args.cols / 32).div_ceil(form.tiles),
+                    args.groups,
+                    args.tokens.div_ceil(form.tokens),
+                ),
+                (256, 1, 1),
+                &opt_words(args),
+            );
+        }
+    }
     let one = if index == 3 {
         0
     } else {
@@ -590,24 +660,29 @@ fn launch_gemv(cuda: &Cuda, kind: OptKind, index: usize, args: &OptArgs) -> Resu
         Kernel::from_raw(word, symbol),
         (args.cols / 32, args.groups, args.tokens.div_ceil(per_block)),
         (256, 1, 1),
-        &[
-            args.a,
-            args.a_scales,
-            args.w,
-            args.ws,
-            args.out,
-            u64::from(args.cols),
-            u64::from(args.inner),
-            u64::from(args.tokens),
-            args.a_tok_stride,
-            args.out_tok_stride,
-            args.a_grp_stride,
-            args.w_grp_stride,
-            args.s_grp_stride,
-            args.out_grp_stride,
-            u64::from(args.k_stride_blocks),
-        ],
+        &opt_words(args),
     )
+}
+
+/// The fifteen argument words every opt GEMV and tensor-core GEMM entry takes.
+fn opt_words(args: &OptArgs) -> [u64; 15] {
+    [
+        args.a,
+        args.a_scales,
+        args.w,
+        args.ws,
+        args.out,
+        u64::from(args.cols),
+        u64::from(args.inner),
+        u64::from(args.tokens),
+        args.a_tok_stride,
+        args.out_tok_stride,
+        args.a_grp_stride,
+        args.w_grp_stride,
+        args.s_grp_stride,
+        args.out_grp_stride,
+        u64::from(args.k_stride_blocks),
+    ]
 }
 
 /// The widest matrix (blocks per token) [launch_opt] splits to one or two tokens per block.
@@ -617,6 +692,12 @@ const SPLIT_BLOCKS: u32 = 16;
 /// up to eight tokens per block.
 const WIDE_BLOCKS: u32 = 128;
 const WIDE_INNER: u32 = 1024;
+
+/// From this many blocks per token (and below [WIDE_BLOCKS]), an E4M3 launch of nine or more tokens
+/// takes a rows form; a narrower one only above sixteen tokens.
+const ROWS_MID_BLOCKS: u32 = 32;
+/// From this reduction length a bf16 or f32 launch below [WIDE_BLOCKS] takes a rows form.
+const ROWS_LONG_INNER: u32 = 4096;
 
 /// The opt GEMV's activation staging bytes per block (OPT_G_STAGE, OPT_G_STAGE_T1).
 const OPT_STAGE: u32 = 48128;

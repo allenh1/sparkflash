@@ -1,23 +1,24 @@
 # SparkFlash
 
-**DeepSeek-V4.1-Flash on four NVIDIA DGX Sparks: 118 tok/s single-stream, 25 s boot, 1M context.**
+**DeepSeek-V4.1-Flash on four NVIDIA DGX Sparks: 125 tok/s single-stream, 25 s boot, 1M context.**
 
 SparkFlash is an inference server written from scratch in Rust and CUDA for exactly one job:
 serving [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) on a
 four-node DGX Spark (GB10) cluster. Every kernel is written for `sm_121a`, the weights are stored
 in the layout those kernels read, and the whole serving path, from HTTP to the last collective, is
-one native binary per node. It speaks the OpenAI and Anthropic APIs, so existing clients and
-coding agents work unchanged.
+one native binary per node. It speaks the OpenAI Chat Completions API, so existing clients and
+coding agents that use it work unchanged.
 
 | Measured on 4x DGX Spark | |
 | :-- | --: |
-| Single stream, code | **117.9 tok/s** |
-| Single stream, prose | **69.8 tok/s** |
-| 4 concurrent streams, code | **44.5 tok/s each** |
-| 8 concurrent agents, code | **25 tok/s each** (157 tok/s total) |
-| 200K-token prompt, cold | **64 s** to first token |
+| Single stream, code | **125.5 tok/s** |
+| Single stream, prose | **73.9 tok/s** |
+| 4 concurrent streams, code | **51 tok/s each** |
+| 8 concurrent agents, code | **30.5 tok/s each** (180 tok/s total) |
+| 16 concurrent agents, code | **18.8 tok/s each** (200 tok/s total) |
+| 200K-token prompt, cold | **57 s** to first token |
 | Context per sequence | **1,048,576 tokens** |
-| Launch to serving | **25 s** |
+| Server start to serving | **25 s** |
 
 Details and methodology: [docs/performance.md](docs/performance.md).
 
@@ -134,15 +135,15 @@ exchange for start-up time, determinism and a small, self-contained serving stac
 
 | | SparkFlash | vLLM, community recipe | SGLang, MiaAI-Lab build |
 | :-- | :-- | :-- | :-- |
-| Single stream, code | **126.6 tok/s** | 76.0 tok/s | 124.8 tok/s |
-| Single stream, prose | 81.7 tok/s | 62.4 tok/s | **87.7 tok/s** |
-| 4 streams, code, each | 47.5 tok/s | not stated | **63.2 tok/s** |
-| 8 streams, code, total | 158 tok/s | 264 tok/s | **310 tok/s** |
-| 16 streams, code, total | 171 tok/s | not stated | **438 tok/s** |
-| Prefill, ~32K-token prompt | 3,400 tok/s | **5,700 tok/s** | 4,800 tok/s |
-| Launch to serving | **25 s** | 2-7 minutes | 160-170 s |
+| Single stream, code | **131.8 tok/s** | 76.0 tok/s | 124.8 tok/s |
+| Single stream, prose | 86.2 tok/s | 62.4 tok/s | **87.7 tok/s** |
+| 4 streams, code, each | 60.8 tok/s | not stated | **63.2 tok/s** |
+| 8 streams, code, total | 270 tok/s | 264 tok/s | **310 tok/s** |
+| 16 streams, code, total | 304 tok/s | not stated | **438 tok/s** |
+| Prefill, ~32K-token prompt | 3,950 tok/s | **5,700 tok/s** | 4,800 tok/s |
+| Start-up to serving | **25 s** | 2-7 minutes | 160-170 s |
 | Greedy output at any concurrency | **identical** (decode always; prefill in exact mode) | can vary with the batch | identical run to run |
-| Network, per node | one cable, one of its two RoCE devices | not stated | one cable, both RoCE devices |
+| Network, per node | one cable, both RoCE devices | not stated | one cable, both RoCE devices |
 | In the serving path | one Rust binary per node | Python, PyTorch, JIT kernels | Python, PyTorch, JIT kernels |
 
 The vLLM figures are self-reported by community members for four Sparks (TileLang-based recipe,
@@ -163,26 +164,27 @@ What this means in practice:
 - **Reproducibility:** greedy decode does not depend on what else is running, and with
   `SPARKFLASH_PREFILL_EXACT=1` neither does prefill, so an agent's behaviour can be replayed
   exactly and regressions bisected.
-- **Network:** both use one cable per node. SparkFlash's figures used one of the cable's two RoCE
-  devices, about half its bandwidth; moving to both left its step time unchanged, so the gaps
+- **Network:** both use one cable per node and both of its RoCE devices, so the differences
   below are not the network.
 - **Raw speed:** one stream is level with the MiaAI-Lab SGLang build (ahead on code and JSON,
-  behind on prose). Under load SGLang is well ahead, 1.3x per stream at four code streams and
-  1.8x at eight, and past eight streams SparkFlash stops speculating, so sixteen streams get
-  ~12 tok/s each against ~29. Both Python stacks also prefill long prompts faster. Closing these
-  gaps is the next work; see [docs/performance.md](docs/performance.md).
+  2% behind on prose). Up to eight streams it is close: 4% behind per stream at four code
+  streams and 7% at eight. SparkFlash now speculates for up to 32 sequences, so sixteen code
+  streams get 23 tok/s each against SGLang's 29, where they used to get ~12. SGLang still has
+  more aggregate throughput at sixteen streams (1.3-1.8x), and both Python stacks prefill long
+  prompts faster. Closing these gaps is the next work; see
+  [docs/performance.md](docs/performance.md).
 
 ### API
 
-One server answers OpenAI Chat Completions, Completions and Responses and the Anthropic Messages
-API, with V4.1's tool calls parsed into standard `tool_calls`, its reasoning returned separately,
-images, `n`, `seed` and `stop`, plus vLLM-compatible `/tokenize`, `/detokenize`, `/metrics`,
-`/health` and `/readyz`.
+One server answers OpenAI Chat Completions and Completions, with V4.1's tool calls parsed into
+standard `tool_calls`, its reasoning returned separately, images, `n`, `seed` and `stop`, plus
+vLLM-compatible `/tokenize`, `/detokenize`, `/metrics`, `/health` and `/readyz`.
 
-Not supported yet: `logprobs`, repetition, presence and frequency penalties, and `response_format`
-JSON modes (these return an error rather than being ignored); streaming on the Responses and
-Messages routes; and `ignore_eos` / `min_tokens`, which are ignored (generation stops at the
-end-of-sequence token).
+Not supported yet: the OpenAI Responses and Anthropic Messages routes, which answer 501 until they
+are implemented ([docs/serving.md](docs/serving.md#not-supported-yet) lists what that takes);
+`logprobs`, repetition, presence and frequency penalties, and `response_format` JSON modes (these
+return an error rather than being ignored); and `ignore_eos` / `min_tokens`, which are ignored
+(generation stops at the end-of-sequence token).
 
 ## Building and testing without a cluster
 
@@ -200,15 +202,19 @@ The device path builds with `--features cuda,tp4-serve` and needs CUDA 13 and `s
 
 ```
 crates/
-  sparkflash-cli/        the `sparkflash` binary: serve, convert, the TP=4 device runtime
-  sparkflash-api/        OpenAI / Anthropic HTTP + SSE server, chat template, tool and reasoning parsing
+  sparkflash-cli/        the `sparkflash` binary: serve, convert, models, the TP=4 device runtime
+  sparkflash-api/        OpenAI / Anthropic HTTP + SSE server, tool and reasoning parsing
+  sparkflash-model/      model descriptors, registry, engine selectors and PromptCodec contract
+  sparkflash-model-deepseek-v41/  the V4.1 model pack: config, plans, host forward, encoding, loader
+  sparkflash-weights/    generic storage formats, safetensors container, weight sources, host arithmetic
   sparkflash-kernels/    sm_121a CUDA kernels' Rust bindings and CPU reference kernels
   sparkflash-device/     device arena, converted-weight loader, device sessions
   sparkflash-comm/       NCCL and one-shot RDMA collectives
-  sparkflash-engine/     model configuration, tensor plan, the reference forward
+  sparkflash-engine/     compatibility facade re-exporting the V4.1 host pack
   sparkflash-engram/     Engram n-gram hashing and table storage
   sparkflash-kv/         KV cache planning
   sparkflash-scheduler/  batching and speculation scheduling
+  sparkflash-serve/      model-agnostic host driver and request lifecycle
   sparkflash-vision/     image decoding and resizing for the vision path
   sparkflash-trace/      CPU and GPU trace points
   sparkflash-web/        `sparkflash --web`: TOML control plane, mDNS/SSH discovery, jobs, graphs
@@ -221,4 +227,16 @@ reference/               upstream model card, tokenizer and encoding reference
 ## Status
 
 SparkFlash serves one model, DeepSeek-V4.1-Flash, on one topology: four DGX Sparks at tensor
-parallelism 4. Other models, node counts and GPUs are not supported.
+parallelism 4. Other models, node counts and GPUs are not supported yet. The model identity and
+selector boundary now lives in `sparkflash-model`, and the V4.1 host model — plans, reference
+forward, checkpoint loader, sequence fixture and prompt encoding — lives in
+`sparkflash-model-deepseek-v41`; `sparkflash-engine` is a compatibility facade. The generic
+storage container, weight sources and host arithmetic are in `sparkflash-weights`, the HTTP
+layer holds `Arc<dyn PromptCodec>`, and a toy dense model in `sparkflash-model`'s tests keeps
+the contracts from assuming V4.1 geometry. Shared telemetry and the vision front end are model
+contracts too, so `sparkflash-api`'s normal dependency tree no longer contains the V4.1 pack,
+Engram, KV or the vision crate. `sparkflash-model::backend` names the host execution seam, and
+`sparkflash-serve` now provides a generic `HostDriver` over it; its toy test serves a chat
+completion through the real router without any V4.1 type. The V4.1 reference driver still lives
+in the CLI until the remaining Phase 3 move. The path to a second model is
+[docs/multi-model-plan.md](docs/multi-model-plan.md).

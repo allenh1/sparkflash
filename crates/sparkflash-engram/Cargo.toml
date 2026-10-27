@@ -9,6 +9,7 @@ description = "Deterministic Engram conditional-memory engine (hash, tiered cach
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+sparkflash-model = { workspace = true }
 sparkflash-trace = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }

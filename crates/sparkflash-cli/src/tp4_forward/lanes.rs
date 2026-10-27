@@ -665,14 +665,6 @@ impl<'a> DeviceLayer<'a> {
         }
     }
 
-    /// The segment and position of step row `row`.
-    pub(super) fn row_seg(segs: &[Seg], row: usize) -> Result<(Seg, usize), String> {
-        segs.iter()
-            .find(|seg| (seg.row0..seg.row0 + seg.n).contains(&row))
-            .map(|seg| (*seg, seg.p0 + row - seg.row0))
-            .ok_or_else(|| format!("rows: step row {row} is in no segment"))
-    }
-
     /// Installs the segments the next rows step runs (empty: the single sequence again). Checks
     /// that they tile rows 0.. in order and that each lane appears once.
     pub(super) fn set_segments(&mut self, segs: &[Seg]) -> Result<(), String> {

@@ -14,7 +14,7 @@ use deepseek_recipe_encoding::PromptEncoding;
 use deepseek_recipe_encoding::dsv41::DeepseekV41Encoding;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sparkflash_api::encoding::{
+use sparkflash_model_deepseek_v41::encoding::{
     EncodingCase, HfTokenizerEncoder, IMAGE_PLACEHOLDER, MessageContent, OpenAiTool,
     SparkV41Encoding, ThinkingMode, TokenizerSeam, load_first_case, load_hf_tokenizer,
     reference_tokenizer_path,

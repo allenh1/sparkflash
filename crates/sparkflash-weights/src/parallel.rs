@@ -76,7 +76,7 @@ fn inside_parallel() -> bool {
 /// A routine that spawns its own workers (the MoE expert pass does, so one thread owns a whole
 /// expert's read, decode and arithmetic) calls this first: the generic helpers then stay serial
 /// inside the worker instead of oversubscribing the machine.
-pub(crate) fn enter_worker() {
+pub fn enter_worker() {
     IN_PARALLEL.with(|cell| cell.set(true));
 }
 
@@ -85,7 +85,7 @@ pub(crate) fn enter_worker() {
 /// The chunk boundaries are always element boundaries; `offset` is the chunk's element index in
 /// the whole slice. The closure must only write its own chunk: every chunk is disjoint, which is
 /// why the result cannot depend on scheduling.
-pub(crate) fn par_chunks_mut<T, F>(data: &mut [T], min_chunk: usize, body: F)
+pub fn par_chunks_mut<T, F>(data: &mut [T], min_chunk: usize, body: F)
 where
     T: Send,
     F: Fn(usize, &mut [T]) + Sync,
@@ -115,7 +115,7 @@ where
 /// them. Splitting on unit boundaries is what lets a row-wise routine keep its row arithmetic and
 /// still run on several threads: the row index a chunk starts at is `first_unit`, and the rows in
 /// the chunk are exactly the serial routine's rows, visited in the same order.
-pub(crate) fn par_aligned_mut<T, F>(data: &mut [T], unit: usize, min_units: usize, body: F)
+pub fn par_aligned_mut<T, F>(data: &mut [T], unit: usize, min_units: usize, body: F)
 where
     T: Send,
     F: Fn(usize, &mut [T]) + Sync,

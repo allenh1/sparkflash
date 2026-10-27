@@ -69,7 +69,7 @@
 //! A note on the package brief's "up to 256 x (w_ptr, s_ptr)" table: 256 cannot be the expert count
 //! of the released layer (it has 384 resident experts), so this module reads it as the routed-row
 //! **capacity** [MAX_ROUTED_ROWS]: the number of (token, slot) rows one stage call may stage. The
-//! released decode is one token, i.e. six rows; a batch of up to 42 tokens (252 rows) still fits.
+//! released decode is one token, i.e. six rows; a verify step of up to 64 tokens (384 rows) fits.
 //!
 //! # Out of scope
 //!
@@ -104,14 +104,14 @@ pub const QUANT_BLOCK: usize = 32;
 pub const ROUTED_MATRICES: usize = 3;
 /// The routed rows (token-slot pairs) one stage call may hold, i.e. the staging capacity.
 ///
-/// This is the "up to 256" table capacity of the package brief. It is a capacity, not a model
-/// constant, and it is deliberately the routed-row ceiling rather than an expert count: the released
-/// layer has 384 resident experts.
-pub const MAX_ROUTED_ROWS: usize = 256;
+/// The package brief's "up to 256" table capacity, raised to a 64-row verify step's routed rows. It
+/// is a capacity, not a model constant, and it is deliberately the routed-row ceiling rather than an
+/// expert count (that it equals the released layer's 384 resident experts is a coincidence).
+pub const MAX_ROUTED_ROWS: usize = 384;
 
 /// The routed rows the multi-row (dedup) kernels group in one plan (opt_moe_sm121.cu's
-/// OPT_MOE_PLAN_MAX): 16 verify rows of top-6 fit.
-const DEDUP_MAX_ROWS: usize = 128;
+/// OPT_MOE_PLAN_MAX): 64 verify rows of top-6 fit.
+const DEDUP_MAX_ROWS: usize = 384;
 
 /// One routed expert matrix, in the order the table and the bind use.
 ///
@@ -1545,9 +1545,11 @@ impl MoeRoutedDevice {
     ) -> Result<(), String> {
         let experts = self.plan.geometry().experts as u64;
         let plan = self.gate_out.0;
+        // A block row per distinct expert; there are at most as many as rows, or as experts.
+        let groups = rows.min(self.plan.geometry().experts as u32);
         cuda.launch(
             opt.dedup[0].1,
-            ((INTER / WORLD / QUANT_BLOCK) as u32, rows, 1),
+            ((INTER / WORLD / QUANT_BLOCK) as u32, groups, 1),
             (128, 1, 1),
             &[
                 gate.0,
@@ -1567,9 +1569,9 @@ impl MoeRoutedDevice {
         .map_err(|error| format!("moe_routed dedup: gate/up: {error}"))?;
         cuda.launch(
             opt.dedup[1].1,
-            // Two 32-column tiles per block (OPT_MOE_DD_TILES).
-            ((HIDDEN / 64) as u32, rows, 1),
-            (256, 1, 1),
+            // Two 32-column tiles per block (OPT_MOE_DD_TILES), two of a tile's 576 chunks a thread.
+            ((HIDDEN / 64) as u32, groups, 1),
+            (288, 1, 1),
             &[down.0, plan, self.codes.0, self.scales.0, self.slot_acc.0],
         )
         .map_err(|error| format!("moe_routed dedup: down: {error}"))?;
@@ -1590,8 +1592,9 @@ impl MoeRoutedDevice {
     }
 
     /// The chunked-prefill path ([MoeBulk]): groups the routed rows by expert, runs each group's
-    /// gate/up and down on the FP4 tensor cores, then the per-token combine (adding the addend).
-    /// Not bit-identical to [Self::run]: the slot partials round through bf16.
+    /// gate/up and down on the FP4 tensor cores, then the per-token combine (adding the addend)
+    /// into `delta_bf16` alone (the bulk prefill reads only the bf16 sums; `delta_f32` is left as
+    /// it was). Not bit-identical to [Self::run]: the slot partials round through bf16.
     ///
     /// # Errors
     /// A token count above the bulk buffers' capacity, and any driver launch error.
@@ -1622,7 +1625,7 @@ impl MoeRoutedDevice {
             0,
             tokens,
             operands.ids.device.0,
-            operands.delta_f32.device.0,
+            0,
             operands.delta_bf16.device.0,
         )
     }
@@ -1726,7 +1729,8 @@ impl MoeRoutedDevice {
     }
 
     /// [Self::run_bulk]'s per-token combine for one chunk of [Self::run_bulk_rows]: its `tokens`
-    /// tokens from token `first` of the pass (`ids` is the chunk's own routing), adding the addend.
+    /// tokens from token `first` of the pass (`ids` is the chunk's own routing), adding the addend,
+    /// into `delta_bf16` and, unless it is 0, `delta_f32`.
     ///
     /// # Errors
     /// Tokens past the bulk buffers' capacity, and any driver launch error.
@@ -2390,11 +2394,11 @@ mod tests {
         assert!(MoeRoutedPlan::new(geometry, 40, MAX_ROUTED_ROWS + 1, 10.0).is_err());
         assert!(MoeRoutedPlan::new(geometry, 40, TOP_K, f32::NAN).is_err());
         assert!(MoeRoutedPlan::new(geometry, 40, TOP_K, f32::INFINITY).is_err());
-        // The 256-row ceiling admits 42 tokens (252 rows) and refuses 43 (258).
+        // The 384-row ceiling admits 64 tokens (384 rows) and refuses 65 (390).
         let plan = MoeRoutedPlan::new(geometry, 40, MAX_ROUTED_ROWS, 10.0).expect("the ceiling");
         assert_eq!(plan.routed_rows(1).expect("one token"), TOP_K);
-        assert_eq!(plan.routed_rows(42).expect("42 tokens"), 252);
-        assert!(plan.routed_rows(43).is_err());
+        assert_eq!(plan.routed_rows(64).expect("64 tokens"), 384);
+        assert!(plan.routed_rows(65).is_err());
         assert!(plan.routed_rows(0).is_err());
         // The released decode plan stages one token's six rows and refuses a second token.
         let released = released_plan();

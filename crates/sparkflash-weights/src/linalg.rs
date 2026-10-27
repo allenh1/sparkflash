@@ -80,7 +80,7 @@ pub const REFERENCE_TENSOR_LIMIT: usize = 32 * 1024 * 1024;
 ///
 /// The released plan's largest materialised tensor is `embed.weight` with 661,913,600 elements
 /// (`head.weight` ties it exactly); the 98 GB Engram tables are paged through
-/// [crate::loader::ReferenceWeights] and never materialised, so every other planned tensor is
+/// the V4.1 `ReferenceWeights` source and never materialised, so every other planned tensor is
 /// smaller (the next largest non-Engram tensor is `mtp.0.main_proj.weight` with 78,643,200
 /// elements). `1 << 30` elements is 4 GiB of `f32`, which admits all of them.
 ///
@@ -238,7 +238,7 @@ pub fn matmul(
 /// # Errors
 ///
 /// As [matmul].
-pub(crate) fn matmul_hot_rows(
+pub fn matmul_hot_rows(
     out: &mut [f32],
     x: &[f32],
     w: &[f32],

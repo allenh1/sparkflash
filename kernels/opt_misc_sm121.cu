@@ -427,16 +427,10 @@ extern "C" __global__ void __launch_bounds__(256) opt_sum_ranks_bf16(
 //   rows i * ratio .. i * ratio + ratio - 1 of kv / score ([rows][head_dim] f32) into dest[i]; the
 //   arithmetic per element is pool_group_f32's (the max, the ascending exp sum, the ascending
 //   weighted sum with a division per row). Grid (ceil(head_dim / 128), groups), 128 threads.
-extern "C" __global__ void __launch_bounds__(128) opt_pool_rows(
-    const float *__restrict__ kv, const float *__restrict__ score, float *__restrict__ dest,
-    const uint32_t ratio, const uint32_t head_dim) {
-    OPT_PDL_ENTRY();
-    const uint32_t element = blockIdx.x * blockDim.x + threadIdx.x;
-    if (element >= head_dim) return;
-    const uint64_t base = (uint64_t)blockIdx.y * ratio * head_dim;
-    kv += base;
-    score += base;
-    float *out = dest + (uint64_t)blockIdx.y * head_dim;
+__device__ __forceinline__ void opt_pool_element(const float *__restrict__ kv,
+                                                 const float *__restrict__ score,
+                                                 float *__restrict__ out, const uint32_t ratio,
+                                                 const uint32_t head_dim, const uint32_t element) {
     float max = -__builtin_huge_valf();
     for (uint32_t row = 0; row < ratio; ++row) max = fmaxf(max, score[(uint64_t)row * head_dim + element]);
     if (!isfinite(max)) {
@@ -452,6 +446,17 @@ extern "C" __global__ void __launch_bounds__(128) opt_pool_rows(
         acc += normalised * kv[(uint64_t)row * head_dim + element];
     }
     out[element] = acc;
+}
+
+extern "C" __global__ void __launch_bounds__(128) opt_pool_rows(
+    const float *__restrict__ kv, const float *__restrict__ score, float *__restrict__ dest,
+    const uint32_t ratio, const uint32_t head_dim) {
+    OPT_PDL_ENTRY();
+    const uint32_t element = blockIdx.x * blockDim.x + threadIdx.x;
+    if (element >= head_dim) return;
+    const uint64_t base = (uint64_t)blockIdx.y * ratio * head_dim;
+    opt_pool_element(kv + base, score + base, dest + (uint64_t)blockIdx.y * head_dim, ratio,
+                     head_dim, element);
 }
 
 // opt_k_norm_rows: k_norm_f32_to_bf16 over `rows` key rows, one thread per row with that kernel's
@@ -521,25 +526,18 @@ extern "C" __global__ void __launch_bounds__(256) opt_bulk_engram_embed(
     }
 }
 
-// opt_bulk_engram_post: the Engram stage after the wkv over a chunk's rows at once: the narrow,
-//   opt_engram_gate_write's gates, the widen and engram_write_bf16 of every row in one launch. Row
-//   r's stream ([hc][dim] f32) becomes bf16(stream + gate[c] * value), its kv row at kv_all + r *
-//   kv_stride (key [hc][dim] then value [dim], bf16); a row with live[r] == 0 is left alone. The
-//   sums are block trees over the 256 threads (not the single-row launch's 8-warp order), so a gate
-//   can differ from it in the last bits. Grid (rows), 256 threads; hc <= 4, dim even.
-extern "C" __global__ void __launch_bounds__(256) opt_bulk_engram_post(
-    float *__restrict__ stream_all, const __nv_bfloat16 *__restrict__ kv_all,
-    const float *__restrict__ product, const uint8_t *__restrict__ live, const uint32_t dim,
-    const uint32_t hc, const float eps, const uint32_t kv_stride) {
-    OPT_PDL_ENTRY();
-    const uint32_t row = blockIdx.x;
-    if (live[row] == 0u || hc > 4u) return;
+// opt_engram_post_row: the Engram stage after the wkv for one row: the narrow, opt_engram_gate_write's
+//   gates, the widen and engram_write_bf16. The row's stream ([hc][dim] f32) becomes bf16(stream +
+//   gate[c] * value), its kv row is key [hc][dim] then value [dim] (bf16). Each copy's three sums take
+//   opt_engram_gate_write's order (a thread's pairs, the warp's shuffle tree, then the 8 warps in
+//   turn), so the row is bit-identical to the single-row launches. 256 threads; hc <= 4, dim even.
+__device__ __forceinline__ void opt_engram_post_row(
+    float *__restrict__ stream, const __nv_bfloat16 *__restrict__ kv,
+    const float *__restrict__ product, const uint32_t dim, const uint32_t hc, const float eps) {
     __shared__ float s_part[4][3][8];
     __shared__ float s_gate[4];
     const uint32_t t = threadIdx.x;
     const uint32_t pairs = dim >> 1u;
-    float *stream = stream_all + (uint64_t)row * hc * dim;
-    const __nv_bfloat16 *kv = kv_all + (uint64_t)row * kv_stride;
     for (uint32_t copy = 0u; copy < hc; ++copy) {
         const float2 *s2 = reinterpret_cast<const float2 *>(stream + (uint64_t)copy * dim);
         const uint32_t *k2 = reinterpret_cast<const uint32_t *>(kv + (uint64_t)copy * dim);
@@ -603,5 +601,157 @@ extern "C" __global__ void __launch_bounds__(256) opt_bulk_engram_post(
             o.y = __bfloat162float(__float2bfloat16_rn(__fadd_rn(sv.y, __fmul_rn(gate, opt_m_bf16hi(vw)))));
             s2[p] = o;
         }
+    }
+}
+
+// opt_bulk_engram_post: opt_engram_post_row over a chunk's rows at once, row r's stream at
+//   stream_all + r * hc * dim and its kv row at kv_all + r * kv_stride; a row with live[r] == 0 is
+//   left alone. Grid (rows), 256 threads.
+extern "C" __global__ void __launch_bounds__(256) opt_bulk_engram_post(
+    float *__restrict__ stream_all, const __nv_bfloat16 *__restrict__ kv_all,
+    const float *__restrict__ product, const uint8_t *__restrict__ live, const uint32_t dim,
+    const uint32_t hc, const float eps, const uint32_t kv_stride) {
+    OPT_PDL_ENTRY();
+    const uint32_t row = blockIdx.x;
+    if (live[row] == 0u || hc > 4u) return;
+    opt_engram_post_row(stream_all + (uint64_t)row * hc * dim, kv_all + (uint64_t)row * kv_stride,
+                        product, dim, hc, eps);
+}
+
+// opt_rows_engram_post: opt_bulk_engram_post over a rows step's rows (at most 64), row r live when
+//   bit r of `live` is set: the flags travel with the launch, so the host can write the next step's
+//   while this one is queued. Grid (rows), 256 threads.
+extern "C" __global__ void __launch_bounds__(256) opt_rows_engram_post(
+    float *__restrict__ stream_all, const __nv_bfloat16 *__restrict__ kv_all,
+    const float *__restrict__ product, const uint64_t live, const uint32_t dim, const uint32_t hc,
+    const float eps, const uint32_t kv_stride) {
+    OPT_PDL_ENTRY();
+    const uint32_t row = blockIdx.x;
+    if (row >= 64u || ((live >> row) & 1u) == 0u || hc > 4u) return;
+    opt_engram_post_row(stream_all + (uint64_t)row * hc * dim, kv_all + (uint64_t)row * kv_stride,
+                        product, dim, hc, eps);
+}
+
+// ---------------------------------------------------------------------------------------------
+// A rows step's completed compressor groups, every lane's at once
+// ---------------------------------------------------------------------------------------------
+// The group table has a row per completed group: {lane offset, first position}, where the group
+// pools positions first .. first + ratio - 1 and is compressed row first / ratio of its lane, and the
+// lane offset (the row table's) moves every lane region the bases point at to the group's lane.
+// Without a table group g is the one at first position (g0 + g) * ratio of the bases' own lane.
+// Each kernel is the single-group launch's arithmetic, so every group is bit-identical to the
+// per-row chain's.
+#include "compressed_append_sm121.cu"
+
+__device__ __forceinline__ void opt_group_at(const uint64_t *__restrict__ tab, const uint32_t g0,
+                                             const uint32_t ratio, const uint32_t g,
+                                             uint64_t &offset, uint64_t &first) {
+    if (tab != nullptr) {
+        offset = __ldg(tab + 2u * g);
+        first = __ldg(tab + 2u * g + 1u);
+    } else {
+        offset = 0u;
+        first = (uint64_t)(g0 + g) * ratio;
+    }
+}
+
+// opt_rows_group_pool: opt_pool_rows over the groups of a table, group g's rows read from its
+//   lane's compressor rings (kv / score, `ring_rows` positions of [head_dim] f32; a group never
+//   wraps a ring) into dest[g]. Grid (ceil(head_dim / 128), groups), 128 threads.
+extern "C" __global__ void __launch_bounds__(128) opt_rows_group_pool(
+    const uint8_t *__restrict__ kv_base, const uint8_t *__restrict__ score_base,
+    float *__restrict__ dest, const uint64_t *__restrict__ tab, const uint32_t g0,
+    const uint32_t ratio, const uint32_t head_dim, const uint32_t ring_rows) {
+    OPT_PDL_ENTRY();
+    const uint32_t element = blockIdx.x * blockDim.x + threadIdx.x;
+    if (element >= head_dim) return;
+    uint64_t offset, first;
+    opt_group_at(tab, g0, ratio, blockIdx.y, offset, first);
+    const uint64_t at = offset + (first % ring_rows) * head_dim * 4u;
+    opt_pool_element(reinterpret_cast<const float *>(kv_base + at),
+                     reinterpret_cast<const float *>(score_base + at),
+                     dest + (uint64_t)blockIdx.y * head_dim, ratio, head_dim, element);
+}
+
+// fp4_round_trip_bf16_to_f32's E8M0 ceiling scale code.
+__device__ __forceinline__ uint8_t opt_e8m0_encode_ceil(float value) {
+    if (!(value > 0.0f)) return 0u;
+    const uint32_t bits = spark_float_bits(value);
+    const uint32_t field = (bits >> 23) & 0xFFu;
+    if (field == 0xFFu) return 255u;
+    const uint32_t mantissa = bits & 0x007FFFFFu;
+    int32_t exponent = static_cast<int32_t>(field) - 127 + (mantissa != 0u ? 1 : 0);
+    int32_t code = exponent + 127;
+    if (code < 0) code = 0;
+    if (code > 254) code = 254;
+    return static_cast<uint8_t>(code);
+}
+
+// opt_rows_group_keys: fp4_round_trip_bf16_to_f32 of each group's roped index key (src[g], [dim]
+//   bf16) into the key row of its compressed row, keys_base + offset + (first / ratio) * dim f32.
+//   Grid (groups), a thread per 32-value block.
+extern "C" __global__ void opt_rows_group_keys(
+    const __nv_bfloat16 *__restrict__ src, uint8_t *__restrict__ keys_base,
+    const uint64_t *__restrict__ tab, const uint32_t g0, const uint32_t ratio,
+    const uint32_t dim) {
+    OPT_PDL_ENTRY();
+    if (threadIdx.x >= dim / 32u) return;
+    uint64_t offset, first;
+    opt_group_at(tab, g0, ratio, blockIdx.x, offset, first);
+    const __nv_bfloat16 *s = src + (uint64_t)blockIdx.x * dim + threadIdx.x * 32u;
+    float *d = reinterpret_cast<float *>(keys_base + offset + (first / ratio) * dim * 4u) +
+               threadIdx.x * 32u;
+    float amax = 0.0f;
+    for (uint32_t i = 0u; i < 32u; ++i) {
+        const float v = fabsf(__bfloat162float(s[i]));
+        amax = v > amax ? v : amax;
+    }
+    const float floor_val = 6.0f * spark_bits_float(0x00800000u);
+    const float floored = amax > floor_val ? amax : floor_val;
+    const float max_inv = 1.0f / 6.0f;
+    const uint8_t code = opt_e8m0_encode_ceil(__fmul_rn(floored, max_inv));
+    const float scale = spark_ue8m0_decode(code);
+    for (uint32_t i = 0u; i < 32u; ++i) {
+        const float v = __bfloat162float(s[i]);
+        const float scaled = fminf(fmaxf(__fdiv_rn(v, scale), -6.0f), 6.0f);
+        const uint8_t nibble = spark_fp4_e2m1_encode_fallback(scaled);
+        d[i] = __fmul_rn(spark_fp4_e2m1_decode(nibble), scale);
+    }
+}
+
+// opt_rows_group_append: compressed_append_sm121's body for each group's roped latent (latent[g],
+//   [REF_DIM] f32) at store row `first` of its lane's codes / scales. Grid (groups), 256 threads.
+extern "C" __global__ void __launch_bounds__(256) opt_rows_group_append(
+    const float *__restrict__ latent, uint8_t *__restrict__ codes_base,
+    uint8_t *__restrict__ scales_base, const uint64_t *__restrict__ tab, const uint32_t g0,
+    const uint32_t ratio) {
+    OPT_PDL_ENTRY();
+    uint64_t offset, first;
+    opt_group_at(tab, g0, ratio, blockIdx.x, offset, first);
+    unsigned char *codes = codes_base + offset;
+    unsigned char *scales = scales_base + offset;
+    const unsigned tid = threadIdx.x;
+    const unsigned store_row = static_cast<unsigned>(first);
+    const float *__restrict__ values = latent + (size_t)blockIdx.x * REF_DIM;
+    __shared__ float s_scale[REF_SCALE_BYTES];
+    if (tid < REF_SCALE_BYTES) {
+        const float *group = values + tid * REF_SCALE_GROUP;
+        float amax = 0.0f;
+        for (unsigned at = 0; at < REF_SCALE_GROUP; ++at) amax = fmaxf(amax, fabsf(group[at]));
+        const float floored = fmaxf(amax, REF_AMAX_FLOOR);
+        s_scale[tid] = ref_e4m3_decode(ref_e4m3_encode(floored / REF_E2M1_MAX));
+        scales[store_row * REF_SCALE_BYTES + tid] =
+            (unsigned char)ref_e4m3_encode(floored / REF_E2M1_MAX);
+    }
+    __syncthreads();
+    if (tid < REF_CODE_BYTES) {
+        const unsigned at = tid * 2u;
+        const float scale = s_scale[at / REF_SCALE_GROUP];
+        const float a = values[at] / scale;
+        const float b = values[at + 1u] / scale;
+        const unsigned code_a = ref_e2m1_encode(fminf(fmaxf(a, -REF_E2M1_MAX), REF_E2M1_MAX));
+        const unsigned code_b = ref_e2m1_encode(fminf(fmaxf(b, -REF_E2M1_MAX), REF_E2M1_MAX));
+        codes[store_row * REF_CODE_BYTES + tid] =
+            (unsigned char)((code_a & 0xFu) | ((code_b & 0xFu) << 4));
     }
 }

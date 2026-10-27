@@ -41,21 +41,7 @@ use serde::{Deserialize, Serialize};
 pub const V41_FLASH_RUNTIME_CONFIG: &str =
     include_str!("../config/deepseek_v41_flash.runtime.json");
 
-/// What is wrong with a configuration.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ConfigError {
-    /// The JSON could not be parsed, or a required key was absent.
-    #[error("could not parse the configuration: {0}")]
-    Json(String),
-    /// A parsed value contradicts another.
-    #[error("{field}: {detail}")]
-    Invalid {
-        /// The field the complaint is about.
-        field: &'static str,
-        /// What is wrong with it.
-        detail: String,
-    },
-}
+pub use sparkflash_weights::ConfigError;
 
 /// The hyperparameters of one DeepSeek-V4.1-Flash-shaped model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

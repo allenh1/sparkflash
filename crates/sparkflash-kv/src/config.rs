@@ -23,10 +23,10 @@ pub const CANDIDATE_BLOCK_SIZE: usize = 8;
 pub const CANDIDATE_POSITIONS: usize = CANDIDATE_TOPK_BLOCKS * CANDIDATE_BLOCK_SIZE;
 
 /// Sliding window size in tokens, active in every layer.
-pub const SWA_WINDOW_SIZE: usize = 128;
+pub const SWA_WINDOW_SIZE: usize = sparkflash_model::telemetry::DEFAULT_SWA_WINDOW_TOKENS;
 
 /// Tokens per global KV page (matches the 64-token FlashMLA page split).
-pub const KV_PAGE_TOKENS: usize = 64;
+pub const KV_PAGE_TOKENS: usize = sparkflash_model::telemetry::DEFAULT_KV_PAGE_TOKENS;
 
 /// Logical global KV bytes per token across the whole model, as reported in the paper.
 pub const GLOBAL_KV_BYTES_PER_TOKEN: usize = 890;

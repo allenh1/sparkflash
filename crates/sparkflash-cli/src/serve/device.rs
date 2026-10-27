@@ -34,7 +34,6 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
-use sparkflash_api::encoding::{HfTokenizerEncoder, TokenizerSeam};
 use sparkflash_api::engine::InferenceEngine as ApiInferenceEngine;
 use sparkflash_api::engine::{
     Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason, MAX_SEQ_LEN_ENV,
@@ -43,6 +42,7 @@ use sparkflash_api::engine::{
 use sparkflash_api::telemetry_types::DSparkStepStats;
 use sparkflash_api::{AppState, Metrics};
 use sparkflash_engine::config::ModelConfig;
+use sparkflash_model_deepseek_v41::encoding::{HfTokenizerEncoder, TokenizerSeam};
 
 use super::{
     ENGINE_ERROR_CODE, ENGINE_GONE_CODE, EXIT_REFUSED, REFUSED_CODE, RequestTiming, RunSummary,
@@ -53,7 +53,8 @@ use super::{
 };
 use crate::device_link::{DeviceFinish, DeviceJob, DeviceLink, DeviceOutcome, DeviceTick};
 use sparkflash_api::VisionImage;
-use sparkflash_vision::{Geometry, Grid, IMAGE_TOKEN_ID, ImageSpan};
+use sparkflash_model::vision::{ImageGrid as Grid, ImageSpan};
+use sparkflash_vision::{Geometry, IMAGE_TOKEN_ID};
 
 /// Positions kept past `--max-model-len` for the last verify block (k drafts, the draft block and
 /// the bonus row), so a request that fills the context still has its rows.
@@ -287,7 +288,20 @@ fn bad_spans(prompt: &[u32], images: &[VisionImage]) -> Option<String> {
             || grid.best_width == 0
             || grid.best_height % patch != 0
             || grid.best_width % patch != 0
-            || Geometry::V41.grid(grid.best_height, grid.best_width) != grid
+            || {
+                let made = Geometry::V41.grid(grid.best_height, grid.best_width);
+                (
+                    made.n_llm_h,
+                    made.n_llm_w,
+                    made.best_height,
+                    made.best_width,
+                ) != (
+                    grid.n_llm_h,
+                    grid.n_llm_w,
+                    grid.best_height,
+                    grid.best_width,
+                )
+            }
         {
             return Some(format!("image {index}: {grid:?} is not a canvas's grid"));
         }
@@ -1522,11 +1536,16 @@ mod tests {
 
     /// A 42 x 84 canvas: one token row of two tokens, a span of 1 + 3 + 1 positions.
     fn image(start: usize) -> VisionImage {
-        let grid = Geometry::V41.grid(42, 84);
+        let made = Geometry::V41.grid(42, 84);
         VisionImage {
             span: ImageSpan {
                 start,
-                grid,
+                grid: Grid {
+                    n_llm_h: made.n_llm_h,
+                    n_llm_w: made.n_llm_w,
+                    best_height: made.best_height,
+                    best_width: made.best_width,
+                },
                 key: [0xa5; 32],
             },
             pixels: vec![7u8; 42 * 84 * 3].into(),

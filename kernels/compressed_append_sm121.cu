@@ -22,6 +22,8 @@
 // the device; a declared estimate, not a measurement - this box has no GPU). At 512 rows it is
 // exactness for free against a parallel compaction that would have to reproduce the host order.
 
+#pragma once  // kernels/opt_misc_sm121.cu includes this file for its group-batched append
+
 #include "m4_common_sm121.cuh"
 
 #define REF_DIM 512u

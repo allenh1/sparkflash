@@ -12,10 +12,10 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::{Value, json};
 use sparkflash_api::MODEL_ID;
-use sparkflash_api::encoding::{TokenizerSeam, reference_tokenizer_path};
 use sparkflash_api::engine::{Capabilities, ClusterStatsSnapshot, InferenceEngine, MockEngine};
 use sparkflash_api::server::router;
 use sparkflash_api::state::AppState;
+use sparkflash_model_deepseek_v41::encoding::{TokenizerSeam, reference_tokenizer_path};
 use sparkflash_vision::{IMAGE_TOKEN_ID, PrepOptions};
 use tower::ServiceExt as _;
 
@@ -236,7 +236,10 @@ async fn routes_without_the_vision_path_say_so() {
             {"type": "input_image", "image_url": data_url("image/png", DOT)},
         ]}],
     });
-    let (status, response) = send(app(true), "POST", "/v1/responses", Some(body)).await;
+    // Without the checkpoint tokenizer: with it, the route is refused as not implemented before
+    // its images are looked at.
+    let app = router(AppState::new(engine(true)));
+    let (status, response) = send(app, "POST", "/v1/responses", Some(body)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
     let message = response["error"]["message"].as_str().unwrap();
     assert!(message.contains("/v1/chat/completions"), "{message}");

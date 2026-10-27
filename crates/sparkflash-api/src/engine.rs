@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
-use sparkflash_engram::EngramTelemetrySnapshot;
-use sparkflash_kv::{KvCacheStatsSnapshot, KvCacheTelemetry, PrefixMatchPlan};
+use sparkflash_model::telemetry::{
+    EngramTelemetrySnapshot, KvCacheStatsSnapshot, KvCacheTelemetry, PrefixMatchPlan,
+};
 
 use crate::loop_abort::{LoopAbort, LoopAbortConfig, LoopAbortDetector};
 use crate::multimodal::ImagePart;
@@ -24,9 +25,15 @@ use crate::telemetry_types::{
 use crate::vision::VisionImage;
 
 /// Canonical Hugging Face model id served by this cluster.
-pub const MODEL_ID: &str = "deepseek-ai/DeepSeek-V4.1-Flash";
-/// Maximum context window of the model, in tokens.
-pub const MODEL_CONTEXT_TOKENS: usize = 1_048_576;
+///
+/// Kept as a compatibility constant for the V4.1 default. A selected model's descriptor is the
+/// source of truth on the HTTP path; see [`crate::state::AppState::descriptor`].
+pub const MODEL_ID: &str = sparkflash_model::DEFAULT_MODEL_ID;
+/// Maximum context window of the V4.1 model, in tokens.
+///
+/// A selected model's [`sparkflash_model::ModelDescriptor::context_tokens`] is the source of
+/// truth; this constant is the default used by weight-free tests and the legacy helpers below.
+pub const MODEL_CONTEXT_TOKENS: usize = sparkflash_model::V41_CONTEXT_TOKENS;
 
 /// Environment variable that overrides the sequence length the server actually serves.
 pub const MAX_SEQ_LEN_ENV: &str = "SPARK_MAX_SEQ_LEN";
@@ -39,15 +46,23 @@ pub const MAX_SEQ_LEN_ENV: &str = "SPARK_MAX_SEQ_LEN";
 /// wants a deliberately tiny window.
 pub const MIN_SEQ_LEN: usize = 1;
 
-/// Parses a SPARK_MAX_SEQ_LEN value, returning None when it must be ignored.
+/// Parses a SPARK_MAX_SEQ_LEN value against the V4.1 window.
 ///
-/// Accepts a pure decimal integer within MIN_SEQ_LEN..=MODEL_CONTEXT_TOKENS. Surrounding
-/// whitespace is tolerated because it survives shell quoting. Everything else is
-/// rejected: a sign (usize::from_str would happily take "+131072"), underscore
-/// separators, zero, and anything wider than the model's window - advertising
-/// 18446744073709551615 tokens would be a number the engine cannot serve.
+/// This is the compatibility wrapper; a model-aware caller uses [`parse_max_seq_len_within`]
+/// with its descriptor's `context_tokens`.
 #[must_use]
 pub fn parse_max_seq_len(raw: &str) -> Option<usize> {
+    parse_max_seq_len_within(raw, MODEL_CONTEXT_TOKENS)
+}
+
+/// Parses a SPARK_MAX_SEQ_LEN value, returning None when it must be ignored.
+///
+/// Accepts a pure decimal integer within `MIN_SEQ_LEN..=max_context`. Surrounding whitespace is
+/// tolerated because it survives shell quoting. Everything else is rejected: a sign
+/// (`usize::from_str` would happily take `"+131072"`), underscore separators, zero, and anything
+/// wider than the model's window.
+#[must_use]
+pub fn parse_max_seq_len_within(raw: &str, max_context: usize) -> Option<usize> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
@@ -55,28 +70,33 @@ pub fn parse_max_seq_len(raw: &str) -> Option<usize> {
     trimmed
         .parse::<usize>()
         .ok()
-        .filter(|value| (MIN_SEQ_LEN..=MODEL_CONTEXT_TOKENS).contains(value))
+        .filter(|value| (MIN_SEQ_LEN..=max_context).contains(value))
 }
 
-/// The maximum sequence length in use, per DECISIONS.md D5.
-///
-/// SPARK_MAX_SEQ_LEN wins when it is usable (see [`parse_max_seq_len`]). Anything else -
-/// unset, unparsable, zero, or wider than the model's window - falls back to
-/// [`MODEL_CONTEXT_TOKENS`] with a warning, so a typo can never make the server advertise
-/// a window it cannot honour. /v1/models and /v1/cluster/stats report this value.
+/// The maximum sequence length in use for the V4.1 default, per DECISIONS.md D5.
 #[must_use]
 pub fn max_seq_len() -> usize {
+    max_seq_len_for(MODEL_CONTEXT_TOKENS)
+}
+
+/// The maximum sequence length in use for a model with `max_context` tokens.
+///
+/// SPARK_MAX_SEQ_LEN wins when it is usable (see [`parse_max_seq_len_within`]). Anything else -
+/// unset, unparsable, zero, or wider than the model's window - falls back to `max_context` with a
+/// warning, so a typo can never make the server advertise a window it cannot honour.
+#[must_use]
+pub fn max_seq_len_for(max_context: usize) -> usize {
     let Ok(raw) = std::env::var(MAX_SEQ_LEN_ENV) else {
-        return MODEL_CONTEXT_TOKENS;
+        return max_context;
     };
-    match parse_max_seq_len(&raw) {
+    match parse_max_seq_len_within(&raw, max_context) {
         Some(value) => value,
         None => {
             tracing::warn!(
                 value = %raw,
-                "ignoring {MAX_SEQ_LEN_ENV}: not a usable sequence length, serving {MODEL_CONTEXT_TOKENS}"
+                "ignoring {MAX_SEQ_LEN_ENV}: not a usable sequence length, serving {max_context}"
             );
-            MODEL_CONTEXT_TOKENS
+            max_context
         }
     }
 }
@@ -86,7 +106,9 @@ pub fn max_seq_len() -> usize {
 /// still lowered to the context left after the prompt by the router. The CLI's
 /// `--max-tokens` default uses the same ceiling so the serve cap cannot silently
 /// truncate a request the API advertises as legal.
-pub const MODEL_MAX_OUTPUT_TOKENS: usize = 393_216;
+///
+/// A selected model's descriptor may narrow this; the HTTP path asks the descriptor.
+pub const MODEL_MAX_OUTPUT_TOKENS: usize = sparkflash_model::V41_MAX_OUTPUT_TOKENS;
 /// Value reported in the OpenAI `owned_by` field.
 pub const MODEL_OWNED_BY: &str = "sparkflash";
 
@@ -254,7 +276,7 @@ pub struct EngineRequest {
     /// Resolved model id.
     pub model: String,
     /// Prompt token ids (placeholder ids in Milestone 1). Each image's span is already expanded in
-    /// place: every position of it is [`sparkflash_vision::IMAGE_TOKEN_ID`], and [`Self::vision`]
+    /// place: every position of it is the model's image token id, and [`Self::vision`]
     /// says where each span starts and what fills it.
     pub prompt_tokens: Vec<u32>,
     /// The logprobs this request asks for. The default asks for none: no log-softmax, no top-k and
@@ -542,38 +564,14 @@ impl ClusterStatsSnapshot {
 
 /// What an engine can actually serve.
 ///
-/// Every field defaults to `false`, which is the most conservative answer there is: an engine that
-/// has not declared a channel is treated as not having it, so `GET /v1/models` can never advertise
-/// a capability by omission. A driver opts in by saying what it really does.
+/// The type lives in `sparkflash-model` because a model descriptor and an engine report the same
+/// fact. It is re-exported here so every existing caller and test keeps its path.
 ///
-/// [`Self::vision`] is `true` only for an engine that has loaded the vision tower, the aligner and
-/// the three image delimiters (DECISIONS.md D59, amending D18). `GET /v1/models` derives
-/// `multimodal` and `image_url` from it, and the chat route prepares images only for such an
-/// engine; any other engine has a request with an image refused with [`MissingCapability`] rather
-/// than answered from its text tokens alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Capabilities {
-    /// Whether the engine can emit tool calls.
-    pub tools: bool,
-    /// Whether the engine produces a reasoning channel.
-    pub thinking: bool,
-    /// Whether the engine honours a caller's `reasoning_effort`.
-    pub reasoning_effort: bool,
-    /// Whether the engine turns prepared images ([`EngineRequest::vision`]) into visual tokens.
-    pub vision: bool,
-}
-
-impl Capabilities {
-    /// Every text channel, declared: what a text engine that does all of it answers. Vision is
-    /// left out, because it depends on the vision tower being loaded rather than on the driver; an
-    /// engine with it says `Capabilities { vision: true, ..Capabilities::ALL }`.
-    pub const ALL: Self = Self {
-        tools: true,
-        thinking: true,
-        reasoning_effort: true,
-        vision: false,
-    };
-}
+/// Every field defaults to `false`: an engine that has not declared a channel is treated as not
+/// having it, so `GET /v1/models` can never advertise a capability by omission. `vision` is
+/// `true` only for an engine with the tower, aligner and image delimiters loaded (DECISIONS.md
+/// D59, amending D18).
+pub use sparkflash_model::Capabilities;
 
 /// A capability a request can require and an engine can lack.
 ///
@@ -1223,9 +1221,14 @@ mod tests {
     }
 
     fn prepared_image() -> VisionImage {
-        let grid = sparkflash_vision::Geometry::V41.grid(42, 42);
+        let grid = sparkflash_model::vision::ImageGrid {
+            n_llm_h: 1,
+            n_llm_w: 1,
+            best_height: 42,
+            best_width: 42,
+        };
         VisionImage {
-            span: sparkflash_vision::ImageSpan {
+            span: sparkflash_model::vision::ImageSpan {
                 start: 1,
                 grid,
                 key: [0; 32],

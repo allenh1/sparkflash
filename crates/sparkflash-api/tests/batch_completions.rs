@@ -14,7 +14,6 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::{Value, json};
-use sparkflash_api::encoding::{TokenizerSeam, reference_tokenizer_path};
 use sparkflash_api::engine::{
     Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason, InferenceEngine,
     MockEngine,
@@ -25,7 +24,8 @@ use sparkflash_api::{
     CompletionTokensDetails, DSparkStepStats, DeepSeekSparkRequestStats, MODEL_ID,
     OpenAiUsageWithCache, PromptTokensDetails, RequestTimingStats, RoceTransportStats,
 };
-use sparkflash_engram::EngramTelemetrySnapshot;
+use sparkflash_model::telemetry::EngramTelemetrySnapshot;
+use sparkflash_model_deepseek_v41::encoding::{TokenizerSeam, reference_tokenizer_path};
 use tower::ServiceExt as _;
 
 const FIXED_TIME: u64 = 1_700_000_000;

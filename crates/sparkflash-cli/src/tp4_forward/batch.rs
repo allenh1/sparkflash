@@ -16,9 +16,10 @@
 //!    together with one system prompt prefill it once. A long prompt's chunks leave the decoders
 //!    some ticks of their own in between ([`DecodeShare`]);
 //! 3. runs one decode step over every decoding sequence. A lone sequence takes the speculative
-//!    step (draft, verify, accept); up to eight (MAX_SEQS) take one speculative step together (each
-//!    drafts, and the step's R_MAX rows go to the anchors and then to the drafts most likely
-//!    accepted); more take one plain rows step together, one row each (R_MAX rows per step). Every
+//!    step (draft, verify, accept); up to thirty-two (R_MAX / 2) take one speculative step together
+//!    (each drafts, in passes of up to sixteen, and the step's R_MAX rows go to the anchors and then
+//!    to the drafts most likely accepted); more take one plain rows step together, one row each
+//!    (R_MAX rows per step). Every
 //!    row is under its own sampler at its own position. Every rows-step row is computed as if
 //!    alone (bit-identical to M = 1 on the exact path) and the sampler's noise is a function of
 //!    (seed, position, id), so a sequence emits the same tokens whatever it shares the device
@@ -33,7 +34,7 @@
 //! and a lane's prefix is shared only up to the first image span the two prompts do not hold alike
 //! (the same place, grid and canvas key).
 
-use super::draft::{AnchorRow, BLOCK, DraftBlock, DraftState, MAX_SEQS};
+use super::draft::{AnchorRow, BLOCK, DraftBlock, DraftState};
 use super::lanes::{SLIDE_STEP, Seg, slide_floor};
 use super::rows::{R_MAX, RowsState};
 use super::sample::Sampler;
@@ -46,7 +47,8 @@ use crate::device_link::{DeviceFinish, DeviceJob};
 use sparkflash_api::VisionImage;
 use sparkflash_engine::forward::engram::HASH_SENTINEL;
 use sparkflash_kernels::cuda_driver::HostMapped;
-use sparkflash_vision::{IMAGE_TOKEN_ID, ImageSpan};
+use sparkflash_model::vision::ImageSpan;
+use sparkflash_vision::IMAGE_TOKEN_ID;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -71,12 +73,12 @@ fn busy_chunk() -> usize {
 }
 
 /// Exact prefill steps (R_MAX rows each) per tick while another sequence decodes
-/// (SPARKFLASH_PREFILL_EXACT_BUSY): two, 32 rows.
+/// (SPARKFLASH_PREFILL_EXACT_BUSY): one, R_MAX rows.
 fn busy_exact_steps() -> usize {
     std::env::var("SPARKFLASH_PREFILL_EXACT_BUSY")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(2usize)
+        .unwrap_or(1usize)
         .max(1)
 }
 
@@ -143,12 +145,29 @@ impl DecodeShare {
     }
 }
 
-/// Shares `budget` verify rows among the sequences' drafts, the likeliest accepted first: each
-/// row goes to the sequence whose next draft has the highest chain probability (the lowest
+/// What a shared speculative step costs on GB10 for each sequence past the first, besides its
+/// anchor row (ms): its draft block, its segment's seam and select, its head row. With
+/// [`super::spec::step_ms`] the steps of two to eight sequences at up to 16 rows fit 20 ms + 2.3 ms
+/// a sequence + 3.9 ms a row, and eight code streams at 32 rows step in 162 ms (167 modelled).
+const SEQ_MS: f64 = 2.3;
+
+/// The modelled wall of a shared speculative step over `seqs` sequences that verifies `drafts`
+/// drafts (ms). Only the ratios matter to [share_rows].
+fn multi_step_ms(seqs: usize, drafts: usize) -> f64 {
+    super::spec::step_ms(seqs - 1 + drafts) + SEQ_MS * (seqs - 1) as f64
+}
+
+/// Shares up to `budget` verify rows among the sequences' drafts, the likeliest accepted first:
+/// each row goes to the sequence whose next draft has the highest chain probability (the lowest
 /// sequence on a tie), while that is at least `floor`. A sequence's chain falls with depth, so
-/// this maximises the expected accepted drafts.
+/// each count of rows holds the most expected accepted drafts it can; of those counts the step
+/// takes the one with the most expected tokens a modelled millisecond ([multi_step_ms]). A row
+/// reads its own six experts a layer (rows rarely share one), so a draft is worth its row only
+/// while its chance beats the step's token rate times a row's cost.
 fn share_rows(chains: &[Vec<f64>], budget: usize, floor: f64) -> Vec<usize> {
-    let mut depths = vec![0usize; chains.len()];
+    let seqs = chains.len();
+    let mut depths = vec![0usize; seqs];
+    let mut order = Vec::with_capacity(budget);
     for _ in 0..budget {
         let mut best: Option<(usize, f64)> = None;
         for (index, (chain, &depth)) in chains.iter().zip(&depths).enumerate() {
@@ -160,9 +179,28 @@ fn share_rows(chains: &[Vec<f64>], budget: usize, floor: f64) -> Vec<usize> {
             }
         }
         match best {
-            Some((index, _)) => depths[index] += 1,
+            Some((index, p)) => {
+                depths[index] += 1;
+                order.push((index, p));
+            }
             None => break,
         }
+    }
+    if seqs == 0 {
+        return depths;
+    }
+    let mut tokens = seqs as f64;
+    let (mut keep, mut best_rate) = (0, tokens / multi_step_ms(seqs, 0));
+    for (count, &(_, p)) in (1..).zip(&order) {
+        tokens += p;
+        let rate = tokens / multi_step_ms(seqs, count);
+        if rate > best_rate {
+            (keep, best_rate) = (count, rate);
+        }
+    }
+    depths.fill(0);
+    for &(index, _) in &order[..keep] {
+        depths[index] += 1;
     }
     depths
 }
@@ -1625,8 +1663,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             [index] => self.spec_step(*index, out, ahead),
             many if self.spec_floor.is_some()
                 && self.exchange.is_some()
-                && 2 * many.len() <= R_MAX
-                && many.len() <= MAX_SEQS =>
+                && 2 * many.len() <= R_MAX =>
             {
                 self.spec_multi_step(many, out, ahead)
             }
@@ -1959,10 +1996,10 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         }
         Ok(n)
     }
-    /// One speculative step over the sequences `group` (each its own lane, at most R_MAX / 2 and
-    /// MAX_SEQS): one draft pass drafts every sequence's block from its anchor
-    /// ([DeviceLayer::draft_blocks]), the step's R_MAX rows go to the anchors and then to the drafts
-    /// most likely accepted ([`share_rows`]), and one rows step verifies every sequence's
+    /// One speculative step over the sequences `group` (each its own lane, at most R_MAX / 2):
+    /// draft passes of up to [DraftState::pass_seqs] blocks draft every sequence's block from its
+    /// anchor ([DeviceLayer::draft_blocks]), the step's R_MAX rows go to the anchors and then to the
+    /// drafts most likely accepted ([`share_rows`]), and one rows step verifies every sequence's
     /// [anchor, drafts] as its own segment. Each sequence then accepts as [Self::spec_step] does.
     fn spec_multi_step(
         &mut self,
@@ -1992,9 +2029,17 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             .collect::<Result<Vec<_>, String>>()?;
         // No sequence can take more draft rows than the anchors leave, so none drafts deeper.
         let depth = k.min(R_MAX - group.len());
-        let drafted =
-            self.device
-                .draft_blocks(rows, draft, inputs.tail, inputs.embed.0, &blocks, depth)?;
+        let mut drafted = Vec::with_capacity(blocks.len());
+        for pass in blocks.chunks(draft.pass_seqs()) {
+            drafted.extend(self.device.draft_blocks(
+                rows,
+                draft,
+                inputs.tail,
+                inputs.embed.0,
+                pass,
+                depth,
+            )?);
+        }
         let t1 = Instant::now();
         let chains: Vec<Vec<f64>> = group
             .iter()
@@ -2250,13 +2295,19 @@ mod tests {
     }
 
     #[test]
-    fn rows_go_to_the_likeliest_drafts_down_to_the_floor() {
+    fn rows_go_to_the_likeliest_drafts_while_they_pay() {
         let chains = [vec![0.9, 0.8, 0.3], vec![0.95, 0.5, 0.1], vec![0.15]];
-        // 0.95 (b), 0.9 (a), 0.8 (a), 0.5 (b), 0.3 (a); 0.15 and 0.1 are under the floor.
-        assert_eq!(share_rows(&chains, 8, 0.2), [3, 2, 0]);
+        // 0.95 (b), 0.9 (a), 0.8 (a), 0.5 (b) raise the modelled rate (3.95 / 43.6 up to 6.15 /
+        // 55.6 tokens a ms); 0.3 (a) lowers it; 0.15 and 0.1 are under the floor.
+        assert_eq!(share_rows(&chains, 8, 0.2), [2, 2, 0]);
         assert_eq!(share_rows(&chains, 3, 0.2), [2, 1, 0]);
         assert_eq!(share_rows(&chains, 0, 0.2), [0, 0, 0]);
         // A tie goes to the lower sequence.
-        assert_eq!(share_rows(&[vec![0.5], vec![0.5]], 1, 0.0), [1, 0]);
+        assert_eq!(share_rows(&[vec![0.9], vec![0.9]], 1, 0.0), [1, 0]);
+        // Drafts that are nearly sure take the whole budget.
+        let sure = vec![vec![0.99; 5]; 8];
+        assert_eq!(share_rows(&sure, 24, 0.2).iter().sum::<usize>(), 24);
+        // A lone unlikely draft is not worth a row.
+        assert_eq!(share_rows(&[vec![0.1], vec![0.1]], 4, 0.0), [0, 0]);
     }
 }

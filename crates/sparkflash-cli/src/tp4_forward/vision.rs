@@ -20,7 +20,8 @@ use crate::device_link::tower_rank;
 use sparkflash_api::VisionImage;
 use sparkflash_kernels::cuda_driver::{Kernel, Module};
 use sparkflash_kernels::vision_tower::{Delimiter, ROW, VisionTower};
-use sparkflash_vision::{Geometry, SpanRow};
+use sparkflash_model::vision::SpanRow;
+use sparkflash_vision::Geometry;
 use std::collections::HashMap;
 
 /// The rows one encoded image holds at most: a span is at most `vision_max_n_token` positions.

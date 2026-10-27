@@ -27,7 +27,10 @@ use sparkflash_kernels::mxfp8_gemv_launch::{OptArgs, OptKind, launch_opt};
 /// The draft block: the anchor and four noise rows (`dspark_block_size`).
 pub(super) const BLOCK: usize = 5;
 /// The most sequences one draft pass serves (opt_draft's OD_MAX_SEQS).
-pub(super) const MAX_SEQS: usize = 8;
+pub(super) const MAX_SEQS: usize = 16;
+/// The most a pass serves through opt_draft_markov_seqs (OD_SIMT_SEQS), whose per-sequence state
+/// in registers spills past eight.
+const SIMT_SEQS: usize = 8;
 /// The rows of a pass over [MAX_SEQS] blocks.
 pub(super) const DRAFT_ROWS: usize = MAX_SEQS * BLOCK;
 /// u32 words between two sequences' ids: `[BLOCK + 1]` ids, then `[BLOCK + 1]` f32 probabilities.
@@ -39,12 +42,14 @@ const STAGES: usize = 3;
 /// `dspark_n_routed_experts` / `dspark_n_activated_experts`.
 const EXPERTS: usize = 128;
 const TOP_K: usize = 3;
-/// opt_moe_sm121.cu's OptMoePlan (a count, then 128 experts, 129 starts and 128 rows, u32), which
-/// groups at most OPT_MOE_PLAN_MAX routed rows.
-const MOE_PLAN_BYTES: usize = (1 + 128 + 129 + 128) * 4;
+/// opt_moe_sm121.cu's OPT_MOE_PLAN_MAX: the routed rows one dedup plan groups.
+const MOE_PLAN_MAX: usize = 384;
+/// opt_moe_sm121.cu's OptMoePlan (a count, then MOE_PLAN_MAX experts, one more start and
+/// MOE_PLAN_MAX rows, u32).
+const MOE_PLAN_BYTES: usize = (1 + MOE_PLAN_MAX + (MOE_PLAN_MAX + 1) + MOE_PLAN_MAX) * 4;
 const _: () = assert!(
-    DRAFT_ROWS * TOP_K <= 128,
-    "the dedup plan holds 128 routed rows"
+    DRAFT_ROWS * TOP_K <= MOE_PLAN_MAX,
+    "the dedup plan holds the drafter's routed rows"
 );
 /// The tap width: three target layers of `dim`.
 const TAPS: usize = 3;
@@ -71,11 +76,19 @@ struct DraftKernels {
     /// The head logits on the tensor cores over the E4M3 copy, and whether its rows go in as
     /// E4M3 codes (opt_mma_fp8_rowscale_f32o) rather than bf16 (opt_mma_bf16a_fp8row_f32o).
     logits_mma: Option<(Kernel, bool)>,
+    /// opt_draft_head_fp8t and opt_mma_head_fp8t_f32o: the E4M3 copy in 128-entry tiles and the
+    /// head logits over it at every row count, opt_mma_bf16a_fp8row_f32o's bits at twice its rate
+    /// (None in an older cubin, with SPARKFLASH_DRAFT_LOGITS_MMA set, or with
+    /// SPARKFLASH_DRAFT_HEAD_TILED=0).
+    head_tiled: Option<(Kernel, Kernel)>,
     markov: Kernel,
     fold_prob: Kernel,
     pick_prob: Kernel,
     embed_blocks: Kernel,
     markov_seqs: Kernel,
+    /// The sequences a pass takes: MAX_SEQS on the tensor-core Markov kernel, SIMT_SEQS on the
+    /// warp-sum one, at most SPARKFLASH_DRAFT_SEQS.
+    pass_seqs: usize,
     fold_seqs: Kernel,
     pick_seqs: Kernel,
     router: Kernel,
@@ -164,6 +177,10 @@ pub(super) struct DraftState {
     /// A several-sequence pass's parameters (`PARAM_WORDS`), written before its launches: the last
     /// pass that read them is done (its drafts were read back).
     params: HostMapped,
+    /// A several-sequence pass's row table (`[DRAFT_ROWS]` {lane offset, position} u64 pairs, as
+    /// opt_rows_kv reads it), written like `params`: the per-block launches then run once over
+    /// every block.
+    row_tab: HostMapped,
     block_max: u64,
     block_arg: u64,
     block_sum: u64,
@@ -225,16 +242,42 @@ impl DraftState {
                 false,
             )),
         };
+        let head_tiled = match (
+            std::env::var("SPARKFLASH_DRAFT_LOGITS_MMA").is_ok(),
+            std::env::var("SPARKFLASH_DRAFT_HEAD_TILED").as_deref(),
+        ) {
+            (true, _) | (_, Ok("0")) => None,
+            _ => load("opt_draft_sm121.cubin", "opt_draft_head_fp8t")
+                .and_then(|quant| {
+                    Ok((
+                        quant,
+                        load("opt_mma_sm121.cubin", "opt_mma_head_fp8t_f32o")?,
+                    ))
+                })
+                .ok(),
+        };
         let markov = load("opt_draft_sm121.cubin", "opt_draft_markov")?;
         let fold_prob = load("opt_draft_sm121.cubin", "opt_draft_fold_prob")?;
         let pick_prob = load("opt_draft_sm121.cubin", "opt_draft_pick_prob")?;
         let embed_blocks = load("opt_draft_sm121.cubin", "opt_draft_embed_blocks")?;
         // The Markov biases on the tensor cores (SPARKFLASH_DRAFT_MARKOV_MMA=0: a warp sum per
         // sequence and entry, the one-sequence kernel's bits).
-        let markov_seqs = match std::env::var("SPARKFLASH_DRAFT_MARKOV_MMA").as_deref() {
-            Ok("0") => load("opt_draft_sm121.cubin", "opt_draft_markov_seqs")?,
-            _ => load("opt_draft_sm121.cubin", "opt_draft_markov_seqs_mma")?,
+        let simt = std::env::var("SPARKFLASH_DRAFT_MARKOV_MMA").as_deref() == Ok("0");
+        let (markov_seqs, pass_seqs) = if simt {
+            (
+                load("opt_draft_sm121.cubin", "opt_draft_markov_seqs")?,
+                SIMT_SEQS,
+            )
+        } else {
+            (
+                load("opt_draft_sm121.cubin", "opt_draft_markov_seqs_mma")?,
+                MAX_SEQS,
+            )
         };
+        let pass_seqs = std::env::var("SPARKFLASH_DRAFT_SEQS")
+            .ok()
+            .and_then(|seqs| seqs.parse::<usize>().ok())
+            .map_or(pass_seqs, |seqs| seqs.clamp(1, pass_seqs));
         let fold_seqs = load("opt_draft_sm121.cubin", "opt_draft_fold_seqs")?;
         let pick_seqs = load("opt_draft_sm121.cubin", "opt_draft_pick_seqs")?;
         let router = load("opt_router_sm121.cubin", "opt_router_e128k3_sm121")?;
@@ -258,11 +301,13 @@ impl DraftState {
             head_quant,
             logits_fp8,
             logits_mma,
+            head_tiled,
             markov,
             fold_prob,
             pick_prob,
             embed_blocks,
             markov_seqs,
+            pass_seqs,
             fold_seqs,
             pick_seqs,
             router,
@@ -362,7 +407,9 @@ impl DraftState {
         let head_fp8 = if std::env::var("SPARKFLASH_DSPARK_HEAD_FP8").as_deref() == Ok("0") {
             None
         } else {
-            Some((alloc(vocab * dim)?, alloc(vocab * dim / 32)?))
+            // Whole 128-entry tiles, for the tiled copy.
+            let entries = vocab.next_multiple_of(128);
+            Some((alloc(entries * dim)?, alloc(entries * dim / 32)?))
         };
         let r = R_MAX;
         Ok(Self {
@@ -385,6 +432,7 @@ impl DraftState {
             logits: alloc(DRAFT_ROWS * vocab * 4)?,
             ids: alloc(MAX_SEQS * IDS_STRIDE * 4)?,
             params: cuda.alloc_host_mapped(PARAM_WORDS * 4, &mut 0)?,
+            row_tab: cuda.alloc_host_mapped(DRAFT_ROWS * 16, &mut 0)?,
             block_max: alloc(MAX_SEQS * chunks * 4)?,
             block_arg: alloc(MAX_SEQS * chunks * 4)?,
             block_sum: alloc(MAX_SEQS * chunks * 4)?,
@@ -404,6 +452,11 @@ impl DraftState {
             head_fp8_ready: Cell::new(false),
             gathers: Cell::new(0),
         })
+    }
+
+    /// The most sequences one [DeviceLayer::draft_blocks] pass takes.
+    pub(super) fn pass_seqs(&self) -> usize {
+        self.kernels.pass_seqs
     }
 
     /// The stage rings' rows (slot = position): the lanes lay theirs out with as many.
@@ -426,6 +479,7 @@ impl DraftState {
         let borrowed: Vec<&Deviceptr> = self.allocations.iter().collect();
         cuda.free_buffers(&borrowed);
         cuda.free_host_mapped(&self.params);
+        cuda.free_host_mapped(&self.row_tab);
     }
 }
 
@@ -614,6 +668,10 @@ impl DeviceLayer<'_> {
         )?;
         let (cos, sin) = self.draft_rope();
         let latent = self.head_width as usize;
+        let segs = self.step_segs(p0, n);
+        // With the row table one kv launch writes every lane's rows (their stage rings sit at the
+        // lanes' offsets, as the window rings do).
+        let table = self.row_table(rows, &segs).filter(|_| sp.is_none());
         for (index, stage) in draft.stages.iter().enumerate() {
             self.draft_gemv(
                 OptKind::Fp8aBf16o,
@@ -626,9 +684,23 @@ impl DeviceLayer<'_> {
                 n,
             )
             .map_err(|error| format!("draft seed wkv: {error}"))?;
-            for seg in self.step_segs(p0, n) {
-                let ring = self.seg_draft_ring(stage, index, &seg);
-                self.draft_kv(rows, draft, stage, ring, cos, sin, seg.row0, seg.p0, seg.n)?;
+            if let (Some(table), Some(first)) = (table, segs.first()) {
+                let ring = self.seg_draft_ring(stage, index, first);
+                self.draft_kv(rows, draft, stage, ring, cos, sin, (0, first.p0, n), table)?;
+                continue;
+            }
+            for seg in &segs {
+                let ring = self.seg_draft_ring(stage, index, seg);
+                self.draft_kv(
+                    rows,
+                    draft,
+                    stage,
+                    ring,
+                    cos,
+                    sin,
+                    (seg.row0, seg.p0, seg.n),
+                    0,
+                )?;
                 if let Some(sp) = sp {
                     // The chunk's slots from its first position, rank r's rows at block r
                     // (NCCL's in-place form); the last block's padding lands on slots past the
@@ -665,7 +737,8 @@ impl DeviceLayer<'_> {
     }
 
     /// kv_norm, rope at p0.., the window round trip into `ring` (slot = position), over the step
-    /// rows row0..row0+n.
+    /// rows row0..row0+n; with a row table (else 0) each row's position and lane offset are its
+    /// entry's.
     #[allow(clippy::too_many_arguments)]
     fn draft_kv(
         &self,
@@ -675,9 +748,8 @@ impl DeviceLayer<'_> {
         (ring_codes, ring_scales): (u64, u64),
         cos: u64,
         sin: u64,
-        row0: usize,
-        p0: usize,
-        n: usize,
+        (row0, p0, n): (usize, usize, usize),
+        table: u64,
     ) -> Result<(), String> {
         let b = rows.b;
         let row = (row0 * self.head_width as usize * 2) as u64;
@@ -700,7 +772,7 @@ impl DeviceLayer<'_> {
                 u64::from(self.head_width),
                 u64::from(self.rope_head_dim),
                 p0 as u64,
-                0,
+                table,
             ],
         )
     }
@@ -826,7 +898,7 @@ impl DeviceLayer<'_> {
             .device_exchange()
             .ok_or("draft: several blocks need the device exchange")?;
         if seqs == 0
-            || seqs > MAX_SEQS
+            || seqs > draft.pass_seqs()
             || k == 0
             || k > BLOCK
             || blocks
@@ -982,9 +1054,54 @@ impl DeviceLayer<'_> {
             .collect())
     }
 
+    /// The pass's row table when `blocks` are several lanes' blocks of one size, back to back from
+    /// row 0, whose stage rings all sit at the lane's offset from the first block's: each row's
+    /// {lane offset, position} goes to `draft.row_tab`, which no launch still reads (the last pass
+    /// that did was read back). None under SPARKFLASH_DRAFT_TABLE=0.
+    fn draft_row_table(&self, draft: &DraftState, blocks: &[Seg]) -> Result<Option<u64>, String> {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off =
+            *OFF.get_or_init(|| std::env::var("SPARKFLASH_DRAFT_TABLE").as_deref() == Ok("0"));
+        let (Some(lanes), Some(first)) = (self.lanes.as_ref(), blocks.first()) else {
+            return Ok(None);
+        };
+        if off
+            || blocks.len() < 2
+            || blocks.iter().map(|seg| seg.n).sum::<usize>() > DRAFT_ROWS
+            || blocks
+                .iter()
+                .enumerate()
+                .any(|(g, seg)| seg.lane == NO_LANE || seg.n != first.n || seg.row0 != g * first.n)
+        {
+            return Ok(None);
+        }
+        let base = lanes.pointers(first.lane).draft;
+        let mut bytes = Vec::with_capacity(DRAFT_ROWS * 16);
+        for seg in blocks {
+            let rings = lanes.pointers(seg.lane).draft;
+            let offset = rings[0].0.wrapping_sub(base[0].0);
+            if rings
+                .iter()
+                .zip(&base)
+                .any(|(&(codes, scales), &(c0, s0))| {
+                    codes.wrapping_sub(c0) != offset || scales.wrapping_sub(s0) != offset
+                })
+            {
+                return Ok(None);
+            }
+            for row in 0..seg.n {
+                bytes.extend_from_slice(&offset.to_le_bytes());
+                bytes.extend_from_slice(&((seg.p0 + row) as u64).to_le_bytes());
+            }
+        }
+        draft.row_tab.write_at(0, &bytes)?;
+        Ok(Some(draft.row_tab.device().0))
+    }
+
     /// The three stages over the pass's rows: `blocks` are its blocks' segments, back to back from
     /// row 0, each at its own position and attending to its lane's rings (the selected rings for
-    /// [NO_LANE]). Only rope, the KV round trip, the attention and inverse rope run per block.
+    /// [NO_LANE]). Only rope, the KV round trip, the attention and inverse rope run per block, and
+    /// with the pass's row table ([Self::draft_row_table]) once over every block.
     fn draft_stages(
         &self,
         rows: &RowsState,
@@ -1001,6 +1118,7 @@ impl DeviceLayer<'_> {
         let latent = self.head_width as usize;
         let q_cols = self.heads_per_rank as usize * latent;
         let (_, rope) = self.opt_rope.ok_or("draft: the opt rope is not loaded")?;
+        let table = self.draft_row_table(draft, blocks)?;
         for (index, stage) in draft.stages.iter().enumerate() {
             self.rows_seam(
                 rows,
@@ -1061,53 +1179,113 @@ impl DeviceLayer<'_> {
                 n,
             )
             .map_err(|error| format!("draft wq_b: {error}"))?;
-            for seg in blocks {
-                let rows_at = (seg.row0 * q_cols * 2) as u64;
-                let pair_bytes = (self.rope_pairs as usize * 4 * seg.p0) as u64;
+            if let (Some(table), Some(first)) = (table, blocks.first()) {
+                let ring = self.seg_draft_ring(stage, index, first);
                 self.cuda.launch(
                     rope,
-                    (self.heads_per_rank, seg.n as u32, 1),
+                    (self.heads_per_rank, n as u32, 1),
                     (32, 1, 1),
                     &[
-                        b.q + rows_at,
-                        cos + pair_bytes,
-                        sin + pair_bytes,
-                        u64::from(self.head_width),
-                        u64::from(self.rope_head_dim),
-                        u64::from(self.heads_per_rank),
-                        u64::from(self.rope_pairs),
-                        0,
-                    ],
-                )?;
-                let ring = self.seg_draft_ring(stage, index, seg);
-                self.draft_kv(rows, draft, stage, ring, cos, sin, seg.row0, seg.p0, seg.n)?;
-                self.cuda.launch(
-                    draft.kernels.attn,
-                    (self.heads_per_rank, seg.n as u32, 1),
-                    (256, 1, 1),
-                    &[
-                        b.q + rows_at,
-                        ring.0,
-                        ring.1,
-                        stage.sink,
-                        b.attn_body + rows_at,
-                        seg.p0 as u64,
-                    ],
-                )?;
-                self.cuda.launch(
-                    rows.kernels.inv_rope,
-                    (self.heads_per_rank, seg.n as u32, 1),
-                    (32, 1, 1),
-                    &[
-                        b.attn_body + rows_at,
+                        b.q,
                         cos,
                         sin,
                         u64::from(self.head_width),
                         u64::from(self.rope_head_dim),
-                        seg.p0 as u64,
-                        0,
+                        u64::from(self.heads_per_rank),
+                        u64::from(self.rope_pairs),
+                        table,
                     ],
                 )?;
+                self.draft_kv(rows, draft, stage, ring, cos, sin, (0, first.p0, n), table)?;
+                self.cuda.launch(
+                    draft.kernels.attn,
+                    (self.heads_per_rank, n as u32, 1),
+                    (256, 1, 1),
+                    &[
+                        b.q,
+                        ring.0,
+                        ring.1,
+                        stage.sink,
+                        b.attn_body,
+                        first.p0 as u64,
+                        table,
+                        first.n as u64,
+                    ],
+                )?;
+                self.cuda.launch(
+                    rows.kernels.inv_rope,
+                    (self.heads_per_rank, n as u32, 1),
+                    (32, 1, 1),
+                    &[
+                        b.attn_body,
+                        cos,
+                        sin,
+                        u64::from(self.head_width),
+                        u64::from(self.rope_head_dim),
+                        0,
+                        table,
+                    ],
+                )?;
+            } else {
+                for seg in blocks {
+                    let rows_at = (seg.row0 * q_cols * 2) as u64;
+                    let pair_bytes = (self.rope_pairs as usize * 4 * seg.p0) as u64;
+                    self.cuda.launch(
+                        rope,
+                        (self.heads_per_rank, seg.n as u32, 1),
+                        (32, 1, 1),
+                        &[
+                            b.q + rows_at,
+                            cos + pair_bytes,
+                            sin + pair_bytes,
+                            u64::from(self.head_width),
+                            u64::from(self.rope_head_dim),
+                            u64::from(self.heads_per_rank),
+                            u64::from(self.rope_pairs),
+                            0,
+                        ],
+                    )?;
+                    let ring = self.seg_draft_ring(stage, index, seg);
+                    self.draft_kv(
+                        rows,
+                        draft,
+                        stage,
+                        ring,
+                        cos,
+                        sin,
+                        (seg.row0, seg.p0, seg.n),
+                        0,
+                    )?;
+                    self.cuda.launch(
+                        draft.kernels.attn,
+                        (self.heads_per_rank, seg.n as u32, 1),
+                        (256, 1, 1),
+                        &[
+                            b.q + rows_at,
+                            ring.0,
+                            ring.1,
+                            stage.sink,
+                            b.attn_body + rows_at,
+                            seg.p0 as u64,
+                            0,
+                            0,
+                        ],
+                    )?;
+                    self.cuda.launch(
+                        rows.kernels.inv_rope,
+                        (self.heads_per_rank, seg.n as u32, 1),
+                        (32, 1, 1),
+                        &[
+                            b.attn_body + rows_at,
+                            cos,
+                            sin,
+                            u64::from(self.head_width),
+                            u64::from(self.rope_head_dim),
+                            seg.p0 as u64,
+                            0,
+                        ],
+                    )?;
+                }
             }
             self.draft_output(rows, stage, n)?;
             self.draft_reduce("all_reduce", b.attn_out, b.reduced, n)?;
@@ -1212,10 +1390,16 @@ impl DeviceLayer<'_> {
     ) -> Result<(), String> {
         let b = rows.b;
         let dim = self.dim;
-        // Each row's picks are its own (the router scores the rows eight at a time).
+        // Each row's picks are its own. The 128-expert gate is small enough that past four rows they
+        // go two (four past sixteen rows) to a block row (gridDim.y), each re-reading it from L2.
+        let groups = match n {
+            0..=4 => 1,
+            5..=16 => n.div_ceil(2),
+            _ => n.div_ceil(4),
+        };
         self.cuda.launch(
             draft.kernels.router,
-            ((EXPERTS / 8) as u32, 1, 1),
+            ((EXPERTS / 8) as u32, groups as u32, 1),
             (256, 1, 1),
             &[
                 b.ffn_x,
@@ -1307,11 +1491,12 @@ impl DeviceLayer<'_> {
                     draft.moe_plan,
                 ],
             )?;
-            // Two 32-column tiles a block (OPT_MOE_DD_TILES); blocks past the distinct count exit.
+            // Two 32-column tiles a block (OPT_MOE_DD_TILES), two of a tile's 576 chunks a thread;
+            // blocks past the distinct count exit.
             self.cuda.launch(
                 down,
                 ((dim / 64) as u32, routed, 1),
-                (256, 1, 1),
+                (288, 1, 1),
                 &[
                     stage.table + 2 * matrix,
                     draft.moe_plan,
@@ -1405,6 +1590,38 @@ impl DeviceLayer<'_> {
         };
         sparkflash_kernels::rmsnorm_launch::launch(self.cuda, self.row_norm.1, &norm)?;
         let vocab = crate::tp4_tail::VOCAB_PER_RANK;
+        if let (Some((codes, scales)), Some((quant, mma))) =
+            (draft.head_fp8, draft.kernels.head_tiled)
+        {
+            if !draft.head_fp8_ready.get() {
+                self.cuda.launch(
+                    quant,
+                    (vocab.next_multiple_of(128) as u32, 1, 1),
+                    (256, 1, 1),
+                    &[tail.head_weight.0, codes, scales, vocab as u64],
+                )?;
+                draft.head_fp8_ready.set(true);
+            }
+            // A pipelined pass over the tiles: the head's bytes once at any row count, faster than
+            // the CUDA-core form even for one sequence's block.
+            self.cuda.launch(
+                mma,
+                (n.div_ceil(64) as u32, vocab.div_ceil(128) as u32, 1),
+                (256, 1, 1),
+                &[
+                    b.lm_normed,
+                    codes,
+                    scales,
+                    draft.logits,
+                    vocab as u64,
+                    dim as u64,
+                    n as u64,
+                    dim as u64,
+                    vocab as u64,
+                ],
+            )?;
+            return Ok(());
+        }
         if let Some((codes, scales)) = draft.head_fp8 {
             if !draft.head_fp8_ready.get() {
                 self.cuda.launch(

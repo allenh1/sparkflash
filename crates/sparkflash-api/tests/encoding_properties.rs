@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use deepseek_recipe_core::conversation::ReasoningEffort;
 use serde_json::json;
-use sparkflash_api::encoding::{
+use sparkflash_model_deepseek_v41::encoding::{
     ReasoningEffortError, SparkV41Encoding, load_first_case, parse_cases, resolve_reasoning_effort,
     resolve_thinking_from_request, retarget_reasoning_effort,
 };

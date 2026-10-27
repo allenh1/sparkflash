@@ -7,8 +7,7 @@
 //! JSON key set is asserted by the unit tests below.
 
 use serde::{Deserialize, Serialize};
-use sparkflash_engram::EngramTelemetrySnapshot;
-use sparkflash_kv::PrefixMatchPlan;
+use sparkflash_model::telemetry::{EngramTelemetrySnapshot, PrefixMatchPlan};
 
 /// Standard OpenAI prompt-token breakdown plus the SparkFlash per-tier cache split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

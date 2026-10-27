@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::device_token::DeviceTokenSource;
-use crate::encoding::TokenizerSeam;
 use crate::engine::InferenceEngine;
 use crate::metrics::Metrics;
+use sparkflash_model::{ModelDescriptor, PromptCodec};
 
 /// The default interval between SSE keep-alive comment frames while an engine stream is idle.
 ///
@@ -138,6 +138,11 @@ impl ChoiceSeedSource for SequentialChoiceSeeds {
 pub struct AppState {
     /// Model runtime.
     pub engine: Arc<dyn InferenceEngine>,
+    /// What this process is serving: id, context, output ceiling, vocabulary and capabilities.
+    ///
+    /// Defaults to the V4.1 descriptor under the engine's own id, so weight-free tests remain
+    /// valid; a real serve installs the selected registry entry.
+    model: Arc<ModelDescriptor>,
     /// Prometheus exporter.
     pub metrics: Arc<Metrics>,
     /// Process start time.
@@ -146,7 +151,7 @@ pub struct AppState {
     fixed_time_unix: Option<u64>,
     max_logprobs: usize,
     sse_keep_alive: Option<Duration>,
-    tokenizer: Option<Arc<TokenizerSeam>>,
+    tokenizer: Option<Arc<dyn PromptCodec>>,
     api_key: Option<Arc<str>>,
     cors: Option<CorsConfig>,
     device_token_source: Option<Arc<dyn DeviceTokenSource>>,
@@ -158,8 +163,10 @@ impl AppState {
     /// Builds state around an engine with a fresh metric registry.
     #[must_use]
     pub fn new(engine: Arc<dyn InferenceEngine>) -> Self {
+        let model = Arc::new(ModelDescriptor::for_id(engine.model_id()));
         Self {
             engine,
+            model,
             metrics: Arc::new(Metrics::new()),
             started: Instant::now(),
             id_seq: Arc::new(AtomicU64::new(0)),
@@ -173,6 +180,23 @@ impl AppState {
             choice_seeds: Arc::new(RandomChoiceSeeds),
             draining: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Installs the selected model descriptor.
+    ///
+    /// The descriptor is what the HTTP surface reports for context, output ceiling, vocabulary
+    /// and the model card. The engine still owns what it can actually execute, so capabilities
+    /// remain an engine answer.
+    #[must_use]
+    pub fn with_model_descriptor(mut self, descriptor: Arc<ModelDescriptor>) -> Self {
+        self.model = descriptor;
+        self
+    }
+
+    /// The selected model descriptor.
+    #[must_use]
+    pub fn descriptor(&self) -> &ModelDescriptor {
+        &self.model
     }
 
     /// Replaces the exporter so the engine driver and the HTTP surface share one registry.
@@ -194,14 +218,14 @@ impl AppState {
     /// server's template. Leaving it off keeps the Milestone 1 placeholder path that the
     /// weight-free router tests pin (`prompt.rs`).
     #[must_use]
-    pub fn with_tokenizer(mut self, tokenizer: Arc<TokenizerSeam>) -> Self {
+    pub fn with_tokenizer(mut self, tokenizer: Arc<dyn PromptCodec>) -> Self {
         self.tokenizer = Some(tokenizer);
         self
     }
 
     /// The attached tokenizer seam, if any.
     #[must_use]
-    pub fn tokenizer(&self) -> Option<&Arc<TokenizerSeam>> {
+    pub fn tokenizer(&self) -> Option<&Arc<dyn PromptCodec>> {
         self.tokenizer.as_ref()
     }
 
@@ -330,10 +354,28 @@ impl AppState {
         self.draining.load(Ordering::SeqCst)
     }
 
-    /// The engine's model id.
+    /// The selected model id.
+    ///
+    /// This is the descriptor's id, which [`Self::new`] synchronises with the engine. A caller
+    /// that installs a descriptor explicitly makes that descriptor authoritative.
     #[must_use]
     pub fn model_id(&self) -> &str {
-        self.engine.model_id()
+        &self.model.id
+    }
+
+    /// The maximum sequence length this process serves.
+    ///
+    /// SPARK_MAX_SEQ_LEN still overrides the descriptor's context, but only within that model's
+    /// own window.
+    #[must_use]
+    pub fn max_seq_len(&self) -> usize {
+        crate::engine::max_seq_len_for(self.model.context_tokens)
+    }
+
+    /// The output-token ceiling this process advertises.
+    #[must_use]
+    pub fn max_output_tokens(&self) -> usize {
+        self.model.max_output_tokens
     }
 
     /// Next deterministic response id for the given prefix.
@@ -382,5 +424,39 @@ mod tests {
     fn fixed_time_overrides_the_wall_clock() {
         let state = AppState::new(Arc::new(MockEngine::new("m"))).with_fixed_time(1_700_000_000);
         assert_eq!(state.now_unix(), 1_700_000_000);
+    }
+
+    #[test]
+    fn the_default_descriptor_takes_its_id_from_the_engine() {
+        let state = AppState::new(Arc::new(MockEngine::new("m")));
+        assert_eq!(state.model_id(), "m");
+        assert_eq!(state.descriptor().id, "m");
+        assert_eq!(
+            state.descriptor().context_tokens,
+            sparkflash_model::V41_CONTEXT_TOKENS
+        );
+        assert_eq!(
+            state.max_output_tokens(),
+            sparkflash_model::V41_MAX_OUTPUT_TOKENS
+        );
+    }
+
+    #[test]
+    fn an_installed_descriptor_drives_context_output_and_id() {
+        let descriptor = ModelDescriptor {
+            id: "tiny-dense".to_owned(),
+            family: "dense".to_owned(),
+            weights_id: "tiny-dense".to_owned(),
+            context_tokens: 4096,
+            max_output_tokens: 1024,
+            vocab_size: 32_000,
+            capabilities: Default::default(),
+        };
+        let state = AppState::new(Arc::new(MockEngine::new("m")))
+            .with_model_descriptor(Arc::new(descriptor));
+        assert_eq!(state.model_id(), "tiny-dense");
+        assert_eq!(state.max_seq_len(), 4096);
+        assert_eq!(state.max_output_tokens(), 1024);
+        assert_eq!(state.descriptor().vocab_size, 32_000);
     }
 }

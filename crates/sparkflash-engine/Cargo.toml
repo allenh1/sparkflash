@@ -12,6 +12,7 @@ serde_json = { workspace = true }
 # Logits digests in the Phase 2 sequence fixture. The reference forward itself still hashes nothing.
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+sparkflash-model-deepseek-v41 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

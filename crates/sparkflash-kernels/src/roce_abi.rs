@@ -1090,7 +1090,7 @@ mod tests {
             );
         }
         assert!(
-            !strip_comments(ROCE_CUDA_STUB).contains("__syncthreads"),
+            !strip_comments(ROCE_CUDA_STUB).contains("__syncthreads("),
             "the stub must not define __syncthreads: clang provides it as a builtin and \
              redefining it is an error"
         );

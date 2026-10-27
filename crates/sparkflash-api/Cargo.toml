@@ -13,13 +13,7 @@ device-token-fixtures = []
 
 [dependencies]
 sparkflash-trace = { workspace = true }
-sparkflash-engram = { workspace = true }
-sparkflash-kv = { workspace = true }
-deepseek-recipe = { workspace = true }
-deepseek-recipe-core = { workspace = true }
-deepseek-recipe-encoding = { workspace = true }
-tokenizers = "0.23"
-sparkflash-vision = { workspace = true }
+sparkflash-model = { workspace = true }
 # Fetches http(s) image URLs (the recipe client: rustls, five redirects); already in the lock via
 # tokenizers -> hf-hub.
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
@@ -41,6 +35,12 @@ parking_lot = { workspace = true }
 flate2 = { workspace = true }
 
 [dev-dependencies]
+sparkflash-model-deepseek-v41 = { workspace = true }
+sparkflash-vision = { workspace = true }
+deepseek-recipe = { workspace = true }
+deepseek-recipe-core = { workspace = true }
+deepseek-recipe-encoding = { workspace = true }
+tokenizers = "0.23"
 tower = { workspace = true }
 http-body-util = { workspace = true }
 tempfile = { workspace = true }

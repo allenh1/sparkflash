@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde::Deserialize;
 
 use crate::dtype::DType;
-use crate::tensor::TensorSpec;
+use crate::spec::TensorSpec;
 use crate::weights::{WeightError, WeightSource};
 
 /// The largest header this reader will believe, and therefore the largest it will allocate for one.

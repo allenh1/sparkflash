@@ -1,0 +1,22 @@
+[package]
+name = "sparkflash-serve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Model-agnostic request lifecycle and host serving adapter for SparkFlash"
+
+[dependencies]
+sparkflash-trace = { workspace = true }
+sparkflash-model = { workspace = true }
+sparkflash-api = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+http-body-util = { workspace = true }
+serde_json = { workspace = true }
+tower = { workspace = true }

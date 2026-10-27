@@ -1,35 +1,36 @@
 # Performance
 
 Measured on four DGX Sparks (GB10, 128 GB each) at tensor parallelism 4, one network cable per
-node with NCCL on one of its two RoCE devices (about 100 Gb/s; [serving.md](serving.md#network)
+node with NCCL on both of its RoCE devices (about 200 Gb/s; [serving.md](serving.md#network)
 explains the two), default GPU clocks, serving `deepseek-ai/DeepSeek-V4.1-Flash` from the
 `sparkflash convert` per-rank files. All numbers are client-side, over HTTP streaming, on
-2026-10-26 unless marked otherwise.
+2026-10-27 unless marked otherwise.
 
 ## Decode
 
-Greedy, 256-token completions, prompts of about 2K tokens (a block of filler records plus a
-question), each run with a fresh system prompt so nothing is reused from the KV cache. *Per
-request* is each stream's own rate from its first to its last token, which is what a user
-watching one stream sees; *aggregate* is all tokens over the wall time of the run.
+Greedy, 256-token completions, prompts of about 800 tokens (60 filler records plus a question),
+all streams starting together, each wave run on an otherwise idle server. *Per request* is each
+stream's own rate from its first to its last token, which is what a user watching one stream
+sees; *aggregate* is all tokens over the wall time of the run, prefill included.
 
-| Workload | 1 stream | 4 streams | 8 streams |
-| :-- | --: | --: | --: |
-| Code (per request) | **117.9 tok/s** | **44.5 tok/s** | **25.4 tok/s** |
-| Code (aggregate) | | 146 tok/s | 157 tok/s |
-| Prose (per request) | **69.8 tok/s** | 31.9 tok/s | |
-| Prose (aggregate) | | 103 tok/s | |
+| Workload | 1 stream | 4 streams | 8 streams | 16 streams |
+| :-- | --: | --: | --: | --: |
+| Code (per request) | **125.5 tok/s** | **51.0 tok/s** | **30.5 tok/s** | **18.8 tok/s** |
+| Code (aggregate) | | 155 tok/s | 180 tok/s | 200 tok/s |
+| Prose (per request) | **73.9 tok/s** | 39.5 tok/s | | |
+| Prose (aggregate) | | 114 tok/s | | |
 
-- DSpark speculation verifies about **5.3 tokens per step** on code and **2.6** on prose at one
-  stream (`k = 5` drafts, depth chosen per step). The step itself is ~46 ms for code at full
-  depth and ~36 ms for prose.
-- Four code streams vary from run to run (41.5 and 47.5 tok/s per request in two runs); eight
-  are steady (24.8-25.9 tok/s over three runs).
-- Time to first token for these prompts is ~0.1 s at one stream, ~0.4 s median at four and
-  ~0.65 s at eight. Right after a restart the first prompts are slower (up to 0.5 s alone and
-  2.3 s at eight) while their Engram table rows are first read from NVMe.
-- Up to eight decoding sequences share one speculative step. Past eight, every sequence gets one
-  plain (unspeculated) token per step, which is why sixteen streams fall off a cliff (below).
+- DSpark speculation verifies about **5.3 tokens per step** on code and **2.7** on prose at one
+  stream (`k = 5` drafts, depth chosen per step). The step itself is ~44 ms for code at full
+  depth and ~37 ms for prose.
+- Up to 32 decoding sequences share one speculative step of up to 64 verify rows, drafted in
+  passes of sixteen; the rows go to the likeliest drafts, by expected tokens per modelled
+  millisecond. Sixteen code streams still verify 4.1 tokens per step, at a ~191 ms step.
+- Time to first token is ~0.2-0.5 s at one stream, ~1.4 s median at four code streams, ~2.4 s at
+  eight and ~3.8 s at sixteen, since every prompt arrives at once and prefills alongside the
+  others' decode.
+- At 32 code streams: 10.9 tok/s per request and 185 tok/s aggregate, with a 12 s median time to
+  first token while the 32 prompts prefill.
 
 ## Against the MiaAI-Lab SGLang build
 
@@ -44,73 +45,74 @@ Per-stream tok/s, **SparkFlash** / SGLang:
 
 | Workload | 1 stream | 2 | 4 | 8 | 16 |
 | :-- | --: | --: | --: | --: | --: |
-| Prose | **81.7** / 87.7 | **51.9** / 61.9 | **32.4** / 41.4 | **20.1** / 30.8 | **11.8** / 22.2 |
-| Code | **126.6** / 124.8 | **82.7** / 88.4 | **47.5** / 63.2 | **23.6** / 41.4 | **11.4** / 29.3 |
-| Structured | **144.3** / 152.4 | **99.5** / 103.3 | **62.3** / 70.4 | **34.3** / 44.2 | **17.2** / 44.4 |
-| JSON | **120.3** / 118.9 | **80.2** / 89.8 | **48.0** / 76.2 | **25.5** / 60.2 | **12.9** / 42.7 |
+| Prose | **86.2** / 87.7 | **58.1** / 61.9 | **41.7** / 41.4 | **28.5** / 30.8 | **18.3** / 22.2 |
+| Code | **131.8** / 124.8 | **92.2** / 88.4 | **60.8** / 63.2 | **38.6** / 41.4 | **23.1** / 29.3 |
+| Structured | **151.7** / 152.4 | **114.6** / 103.3 | **88.3** / 70.4 | **63.7** / 44.2 | **39.3** / 44.4 |
+| JSON | **126.9** / 118.9 | **94.2** / 89.8 | **65.7** / 76.2 | **43.8** / 60.2 | **28.1** / 42.7 |
 
 Aggregate tok/s, **SparkFlash** / SGLang:
 
 | Workload | 2 streams | 4 | 8 | 16 |
 | :-- | --: | --: | --: | --: |
-| Prose | **101** / 120 | **119** / 164 | **147** / 238 | **177** / 343 |
-| Code | **159** / 175 | **156** / 247 | **158** / 310 | **171** / 438 |
-| Structured | **191** / 178 | **179** / 240 | **185** / 296 | **180** / 572 |
-| JSON | **156** / 174 | **181** / 302 | **177** / 472 | **193** / 660 |
+| Prose | **114** / 120 | **157** / 164 | **205** / 238 | **258** / 343 |
+| Code | **175** / 175 | **224** / 247 | **270** / 310 | **304** / 438 |
+| Structured | **219** / 178 | **224** / 240 | **271** / 296 | **343** / 572 |
+| JSON | **182** / 174 | **246** / 302 | **316** / 472 | **365** / 660 |
 
-Tokens per verify step here, by stream count (1 / 2 / 4 / 8 / 16): prose 3.2 / 2.8 / 2.9 / 2.0 /
-1.0, code 5.7 / 5.5 / 4.3 / 2.3 / 1.0.
+Tokens per verify step here, by stream count (1 / 2 / 4 / 8 / 16): prose 3.2 / 2.6 / 2.6 / 2.4 /
+2.3, code 5.7 / 5.5 / 5.2 / 4.9 / 4.2.
 
 - SparkFlash does not implement `ignore_eos` or `min_tokens`, which sparkDash sends, so most
   structured-output streams stop at their natural end before 256 tokens (2 of 2 at two streams,
   14 of 16 at sixteen). Their per-stream rates stand; their aggregates count fewer tokens.
-- **One stream:** level. SparkFlash is ahead on code and JSON and behind on prose and structured
-  output. It verifies the same tokens per step SGLang reports (~3 on prose, ~6 on code), so the
-  difference is step time: ~39 ms (prose) and ~45 ms (code) here against ~33 and ~39 ms there.
-  Its collectives use a one-shot RDMA kernel on both RoCE devices of its one cable (~2.6 ms of
-  all-reduce per step); SparkFlash used NCCL on one of the two. Moving SparkFlash to both left its
-  step time unchanged (36.4 ms against 36.3 ms median in an A/B check with the same weights), so
-  the link's bandwidth is not what separates them.
-- **Two to eight streams:** SGLang pulls ahead, 1.3x per stream at four code streams and 1.8x at
-  eight. SparkFlash verifies at most 16 rows per step across all sequences, and its decode GEMVs
-  run on CUDA cores so that greedy output does not depend on the batch. Each extra row costs
-  compute, so the step grows (45 ms at one code stream, 90 at four, 98 at eight) while each
-  sequence's share of the 16 rows shrinks to about one draft at eight. The SGLang build runs its
-  routed experts on tensor cores and keeps full drafts for up to 16 sequences. Tensor-core decode
-  kernels whose per-row reduction order does not depend on the batch would keep batch invariance
-  while making extra rows cheap.
-- **Sixteen streams:** SparkFlash's batched speculative step serves at most eight sequences;
-  with more decoding, every sequence gets one plain token per step. Aggregate throughput holds
-  (~170-190 tok/s) but each stream drops to ~12 tok/s, against ~22-44 for SGLang. Speculating
-  in groups of eight would remove the cliff.
+- **One stream:** level. SparkFlash is ahead on code (131.8 against 124.8 tok/s) and JSON, level
+  on structured output, and 2% behind on prose. It verifies the same tokens per step SGLang
+  reports (~3 on prose, ~6 on code), at a step of ~37 ms (prose) and ~43 ms (code). Both now
+  run their collectives over both RoCE devices of one cable (SGLang through a one-shot RDMA
+  kernel, SparkFlash through NCCL).
+- **Two to eight streams:** close. At two streams SparkFlash is ahead on code, structured output
+  and JSON. At four and eight, code and prose are level to 8% behind and structured output is
+  ahead, but JSON trails by 14% at four and 27% at eight. SparkFlash verifies up to 64 rows a step
+  and keeps code at ~5 tokens a step through eight streams. Its decode GEMVs run on CUDA cores so
+  that greedy output does not depend on the batch, so each extra row still costs compute, and the
+  step grows from ~43 ms at one code stream to ~125 ms at eight. SGLang runs its routed experts
+  on tensor cores.
+- **Sixteen streams:** the cliff is gone. SparkFlash speculates for up to 32 sequences, so
+  sixteen streams keep 2.3 (prose) to 4.2 (code) tokens a step and 18-39 tok/s each, up from
+  ~12. SGLang is still ahead here: 1.3x per stream on code, 1.5x on JSON, and 1.3-1.8x in
+  aggregate. Tensor-core decode kernels whose per-row reduction order does not depend on the batch
+  would keep batch invariance while making extra rows cheap.
 
 ## Long context
 
-Cold (nothing cached), 48 greedy tokens, needle-in-a-haystack prompts, measured at `19c8054`
-(before the Engram fix, which changes which Engram rows a prompt reads but not how many):
+Cold (nothing cached, the server's first prompts after a restart), greedy. The 209K prompt is
+a needle in a haystack (a fact at half depth in filler records); the others are shipping-log
+filler with a question:
 
 | Prompt | Time to first token | Prefill rate |
 | --: | --: | --: |
-| 203,324 tokens | **63.9 s** (65.1 s replicate) | ~3,200 tok/s |
-| 31,945 tokens | **9.4 s** | ~3,400 tok/s |
+| 209,631 tokens | **57.3 s** (56.3 s for a second, 207,967-token prompt) | ~3,700 tok/s |
+| 32,613 tokens | **8.3 s** (8.2 s for a second, 32,543-token prompt) | ~3,950 tok/s |
 
-- The 200K needle is found. Output is identical with and without the merged expert pass (one of
-  the bulk prefill's optimisations, on by default), which takes 200K from 67.7 s to 63.9 s.
-- Decode stays usable at depth: **38.4 tok/s** at a 208K-token context (measured 2026-10-25 at
-  `65e957c`, before the later decode improvements).
+- The 200K needle is found.
+- Decode stays usable at depth: **56.0 tok/s** at a 208K-token context (2.1 tokens a step, at a
+  37 ms step).
 - A prompt that extends a previous turn reuses that turn's KV: only the new tokens are prefilled.
 - Running streams keep decoding while a long prompt prefills (slower, but never stalled).
 
 ## Boot
 
-**25 s** from launching the four processes to `/v1/models` answering (24.5-25.4 s on twelve of
-the last fifteen restarts, 29-31 s on the other three), reading 77.7 GB per node from NVMe (`O_DIRECT`, ~3.1 GB/s) and loading
-pre-built cubins. There is no compilation, graph capture or Python import at boot.
+**25 s** from the server starting to `/v1/models` answering (25.3 and 25.4 s on the two
+restarts for this page, by the server's own boot timer), reading 77.7 GB per node from NVMe
+(`O_DIRECT`, ~3.1 GB/s) and loading pre-built cubins. Timed from running the launch script, which
+starts the four ranks over ssh, the same restarts took 29.5 s. There is no compilation, graph
+capture or Python import at boot.
 
 ## Correctness
 
-- With `SPARKFLASH_PREFILL_EXACT=1`, eight concurrent greedy requests produce output
-  **byte-identical** to the stored single-stream reference (checked before every deployment).
+- With `SPARKFLASH_PREFILL_EXACT=1`, eight and sixteen concurrent greedy requests produce output
+  **byte-identical** to the same prompts run one at a time, and the one-at-a-time output matches
+  the previous build's (checked before every deployment).
 - Greedy decode is the same at any concurrency: decode kernels keep each row's arithmetic order.
 - Seeded sampling emits the same tokens whether or not speculation is on.
 - Engram n-grams are hashed over the tokenizer's compressed ids, as the reference does, and
@@ -129,12 +131,15 @@ Single-stream decode on the same four Sparks, from the first end-to-end device r
 | 2026-10-25 | `9b0c858` | `sparkflash serve` on the device path, 1M context | 87 tok/s |
 | 2026-10-26 | `19c8054` | batched verify, adaptive depth, tick-ahead, bulk prefill | 112.8 tok/s code |
 | 2026-10-26 | `771ed84` | Engram hashed over compressed ids (as the reference) | 117.9 tok/s code |
+| 2026-10-27 | !188 | 64-row verify steps for up to 32 sequences, tensor-core drafter head, faster bulk prefill | 125.5 tok/s code |
 
 The Engram fix raised code acceptance from 5.0 to 5.3 tokens per step on the same prompt; prose
 went from 2.7 to 2.6.
 
-200K cold time to first token went 119 s -> 100 -> 87 -> 70 -> 63.9 s over the last four
-prefill changes (FP4 index scorer, paired chunks, sequence-parallel seams, merged expert pass).
+200K cold time to first token went 119 s -> 100 -> 87 -> 70 -> 63.9 s over four prefill changes
+(FP4 index scorer, paired chunks, sequence-parallel seams, merged expert pass). The bulk attention
+at two blocks an SM then took 32K prompts from 9.2-9.3 s to 8.2-8.3 s, and a 209K-token prompt
+now takes 57.3 s.
 
 ## Reproducing
 

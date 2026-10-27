@@ -50,7 +50,7 @@ impl SyntheticServer {
 
     /// Starts the server with extra `serve` flags, for tests that need a non-default mode.
     fn start_with(extra: &[&str]) -> Self {
-        let tokenizer = sparkflash_api::encoding::reference_tokenizer_path();
+        let tokenizer = sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path();
         let mut args = vec!["--synthetic", "--bind", "127.0.0.1:0"];
         args.extend(extra);
         args.push("--tokenizer");
@@ -115,7 +115,7 @@ impl SyntheticServer {
         });
         std::fs::write(&script, serde_json::to_vec(&spec).expect("script JSON"))
             .expect("script file");
-        let tokenizer = sparkflash_api::encoding::reference_tokenizer_path();
+        let tokenizer = sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path();
         let mut args = vec!["--synthetic", "--bind", "127.0.0.1:0"];
         args.extend(extra.iter().copied());
         args.push("--tokenizer");
@@ -2081,8 +2081,8 @@ fn a_device_token_window_serves_its_claimed_completion_and_labels_it_unmeasured(
     sparkflash_api::device_chain::fixtures::write_envelope(window.path(), true);
     let window_arg = window.path().to_str().expect("temporary paths are UTF-8");
     let server = SyntheticServer::start_with(&["--device-token-dir", window_arg]);
-    let seam = sparkflash_api::encoding::TokenizerSeam::from_path(
-        &sparkflash_api::encoding::reference_tokenizer_path(),
+    let seam = sparkflash_model_deepseek_v41::encoding::TokenizerSeam::from_path(
+        &sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path(),
     )
     .expect("reference tokenizer");
     let ids = sparkflash_api::device_chain::fixtures::DECODE_IDS;
@@ -2163,8 +2163,8 @@ fn a_device_window_recorded_for_the_rendered_chat_prompt_serves_the_chat_endpoin
     // W4 over the real binary: chat renders + tokenizes the prompt before asking the device
     // source, so a window recorded for exactly that prompt is claimable from
     // /v1/chat/completions instead of always falling back to the host twin.
-    let seam = sparkflash_api::encoding::TokenizerSeam::from_path(
-        &sparkflash_api::encoding::reference_tokenizer_path(),
+    let seam = sparkflash_model_deepseek_v41::encoding::TokenizerSeam::from_path(
+        &sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path(),
     )
     .expect("reference tokenizer");
     let body = serde_json::json!({
@@ -2247,8 +2247,8 @@ fn a_live_window_follower_serves_the_newest_completed_window_and_falls_back_for_
     let parent_arg = parent.path().to_str().expect("temporary paths are UTF-8");
     let server =
         SyntheticServer::start_with(&["--device-token-dir", parent_arg, "--device-token-live"]);
-    let seam = sparkflash_api::encoding::TokenizerSeam::from_path(
-        &sparkflash_api::encoding::reference_tokenizer_path(),
+    let seam = sparkflash_model_deepseek_v41::encoding::TokenizerSeam::from_path(
+        &sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path(),
     )
     .expect("reference tokenizer");
     let ids = fixtures::DECODE_IDS;
@@ -2345,8 +2345,8 @@ fn a_device_token_window_streams_its_claimed_completion_and_labels_it_unmeasured
     fixtures::write_envelope(window.path(), true);
     let window_arg = window.path().to_str().expect("temporary paths are UTF-8");
     let server = SyntheticServer::start_with(&["--device-token-dir", window_arg]);
-    let seam = sparkflash_api::encoding::TokenizerSeam::from_path(
-        &sparkflash_api::encoding::reference_tokenizer_path(),
+    let seam = sparkflash_model_deepseek_v41::encoding::TokenizerSeam::from_path(
+        &sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path(),
     )
     .expect("reference tokenizer");
     let ids = fixtures::DECODE_IDS;
@@ -2596,8 +2596,8 @@ fn a_refused_device_window_is_fail_closed_and_names_the_reason() {
     while !derived_server.log().contains("claim ok") && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
-    let seam = sparkflash_api::encoding::TokenizerSeam::from_path(
-        &sparkflash_api::encoding::reference_tokenizer_path(),
+    let seam = sparkflash_model_deepseek_v41::encoding::TokenizerSeam::from_path(
+        &sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path(),
     )
     .expect("reference tokenizer");
     let expected = seam.decode(&fixtures::DECODE_IDS).expect("ids decode");

@@ -8,7 +8,6 @@
 pub mod constrained;
 pub mod device_chain;
 pub mod device_token;
-pub mod encoding;
 pub mod engine;
 pub mod error;
 pub mod loop_abort;
@@ -23,7 +22,6 @@ pub mod telemetry_types;
 pub mod tool_parser;
 pub mod vision;
 
-pub use encoding::{SparkV41Encoding, TokenizerSeam, TokenizerSeamError};
 pub use engine::{
     Capabilities, Capability, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason,
     InferenceEngine, LogprobAlternative, LogprobSelection, LogprobsRequest, MODEL_ID,

@@ -67,7 +67,7 @@
 // The routed-row ceiling one stage call may gather, and the size of the host-side staging plan. It is
 // a capacity bound, not a model constant: the released decode is one token (six rows) and a batch of
 // `MAX_ROUTED_ROWS / 6` tokens still fits.
-#define SPARK_MOE_ROUTED_MAX_ROWS 256u
+#define SPARK_MOE_ROUTED_MAX_ROWS 384u
 
 static_assert(SPARK_M4_MOE_TOP_K == 6u,
               "moe_routed_combine_sm121 orders the router's six routed slots by expert id");

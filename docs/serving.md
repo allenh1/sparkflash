@@ -79,8 +79,8 @@ turns 200 when it accepts requests. If any rank dies, the others exit rather tha
 | :-- | :-- |
 | `POST /v1/chat/completions` | Streaming and buffered; tools and tool calls (DeepSeek V4.1 format, parsed into OpenAI `tool_calls`); `reasoning_effort` / thinking with the reasoning returned separately; images; `n`, `seed`, `stop`, `max_tokens`, `temperature`, `top_p`, `top_k`; `stream_options.include_usage` |
 | `POST /v1/completions` | Text or token-id prompts, streaming and buffered |
-| `POST /v1/responses` | OpenAI Responses API, buffered |
-| `POST /v1/messages` | Anthropic Messages API, buffered |
+| `POST /v1/responses` | OpenAI Responses API. **Not implemented yet:** refused with 501 (see below) |
+| `POST /v1/messages` | Anthropic Messages API. **Not implemented yet:** refused with 501 (see below) |
 | `GET /v1/models`, `/v1/models/{id}` | The served model is `deepseek-ai/DeepSeek-V4.1-Flash` |
 | `POST /tokenize`, `/detokenize` | vLLM-compatible |
 | `GET /health`, `/readyz` | Liveness (503, with the reason, once the device loop has failed or stalled), and readiness (also 503 while draining) |
@@ -92,11 +92,17 @@ bearer token on every route except health, readiness and metrics.
 
 ### Not supported yet
 
+- **`/v1/responses` and `/v1/messages` still need implementing.** They do not tokenize their
+  requests yet: their prompt is a row of placeholder token ids sized from the text, so the model
+  would answer something unrelated to the request. Until they are implemented, both answer 501
+  with an error that points to `/v1/chat/completions`. Implementing them means converting
+  their requests (system prompt, messages, tool calls and tool results, reasoning) to the chat
+  template and tokenizing them like `/v1/chat/completions`, returning tool calls as
+  `tool_use` / `function_call` items, and adding streaming.
 - `logprobs` / `top_logprobs`, and repetition, presence and frequency penalties: refused with an
   error rather than ignored.
 - `response_format` `json_object` / `json_schema` (structured output needs constrained decoding,
   which the server does not have): refused.
-- Streaming on `/v1/responses` and `/v1/messages`.
 - `ignore_eos` and `min_tokens`: ignored, like other unknown request fields; generation stops at
   the end-of-sequence token.
 

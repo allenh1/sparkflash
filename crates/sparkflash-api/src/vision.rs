@@ -1,18 +1,18 @@
-//! The router's half of the vision path: turning a chat request's image parts into the canvases
-//! and token spans an engine with the vision tower consumes.
+//! The image parts of a chat request: discovery, fetching, preparation and prompt placement.
 //!
 //! The chat template renders every `image_url` / `input_image` part as one image placeholder
-//! (`encoding/seam.rs`), so the rendered prompt has one [`sparkflash_vision::IMAGE_TOKEN_ID`] per
-//! part, in message and part order, and the placeholder's spelling in text stays text.
-//! [`take_chat_images`] collects the parts in that order, and the handler pairs them with the
-//! placeholders, refusing a request where the two counts differ (an `image_pil` part that carries
-//! no data).
+//! (`encoding/seam.rs`), so the rendered prompt has one image token per part, in message and part
+//! order, and the placeholder's spelling in text stays text. [`take_chat_images`] collects the
+//! parts in that order, and the handler pairs them with the placeholders, refusing a request
+//! where the two counts differ (an `image_pil` part that carries no data).
 //!
-//! Each part is then fetched (an http(s) URL) or taken inline (a base64 data URL) and prepared by
-//! [`sparkflash_vision::prepare`]: decoded, planned and padded exactly as the reference
-//! `load_image` does. The limits are the serving recipe's (`deepseek-recipe-image` 0.2.0
-//! `ImageLimits`): 600 images and 64 MiB a request, 32 MiB and 8192 pixels a side an image (4096
-//! from the fifteenth image on), and a long side of 512 at `detail: "low"`.
+//! The protocol layer owns the wire shapes and the size limits; the model's vision front end,
+//! reached through `PromptCodec::vision_codec`, owns decoding, canvas planning and token span
+//! expansion. Each part is fetched (an http(s) URL) or taken inline (a base64 data URL) and
+//! prepared by that front end: decoded, planned and padded exactly as the reference `load_image`
+//! does. The limits are the serving recipe's (`deepseek-recipe-image` 0.2.0 `ImageLimits`): 600
+//! images and 64 MiB a request, 32 MiB and 8192 pixels a side an image (4096 from the fifteenth
+//! image on), and a long side of 512 at `detail: "low"`.
 
 use std::fmt;
 use std::io::Read;
@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use sparkflash_vision::{DecodeLimits, ImageSpan, PrepOptions, PreparedImage};
+use sparkflash_model::vision::{ImageSpan, PreparedImage, VisionCodec, VisionOptions};
 
 use crate::error::ApiError;
 use crate::multimodal::{ImagePart, parse_image_url};
@@ -31,14 +31,14 @@ pub const MAX_IMAGES: usize = 600;
 pub const MAX_TOTAL_BYTES: usize = 64 << 20;
 /// Most encoded bytes one image may have.
 pub const MAX_IMAGE_BYTES: usize = 32 << 20;
-/// Longest http(s) image URL accepted (`MAX_IMAGE_URL_LEN` in deepseek-recipe-core); a data URL
-/// is bounded by [`MAX_IMAGE_BYTES`] instead.
+/// Longest http(s) image URL accepted (MAX_IMAGE_URL_LEN in deepseek-recipe-core); a data URL
+/// is bounded by MAX_IMAGE_BYTES instead.
 pub const MAX_URL_LEN: usize = 8192;
-/// From this many images on, a side may be at most [`MAX_SIDE_MANY`] pixels.
+/// From this many images on, a side may be at most MAX_SIDE_MANY pixels.
 const MANY_IMAGES: usize = 15;
 const MAX_SIDE: u32 = 8192;
 const MAX_SIDE_MANY: u32 = 4096;
-/// Long side at `detail: "low"`.
+/// Long side at detail: "low".
 const LOW_DETAIL_SIDE: u32 = 512;
 /// The recipe's fetch client: 10 s to connect, 60 s in all, five redirects.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -50,7 +50,7 @@ const MAX_REDIRECTS: u32 = 5;
 pub struct VisionImage {
     /// The span's position, grid and content key.
     pub span: ImageSpan,
-    /// The canvas: `best_height * best_width * 3` bytes of RGB.
+    /// The canvas: best_height * best_width * 3 bytes of RGB.
     pub pixels: Arc<[u8]>,
 }
 
@@ -63,7 +63,7 @@ impl fmt::Debug for VisionImage {
     }
 }
 
-/// Sum of the span lengths: the usage block's `image_tokens`.
+/// Sum of the span lengths: the usage block's image_tokens.
 #[must_use]
 pub fn image_tokens(images: &[VisionImage]) -> usize {
     images.iter().map(|image| image.span.len()).sum()
@@ -74,21 +74,21 @@ pub fn image_tokens(images: &[VisionImage]) -> usize {
 pub struct ChatImage {
     /// The parsed URL or inline payload.
     pub part: ImagePart,
-    /// `detail: "low"` was asked for.
+    /// detail: "low" was asked for.
     pub low_detail: bool,
 }
 
-/// Collects the image parts of a chat body's `messages`, and returns a copy of the body with each
+/// Collects the image parts of a chat body's messages, and returns a copy of the body with each
 /// collected part replaced by an empty text part.
 ///
-/// The copy is what the image-carrier scan runs on afterwards (see [`refuse_unread_image`]): an
+/// The copy is what the image-carrier scan runs on afterwards (see refuse_unread_image): an
 /// image carrier it still finds is a shape this function did not take, so its image would reach no
 /// placeholder, and the request is refused rather than answered without it (D27).
 ///
 /// # Errors
 ///
-/// A 400 for an image part with no string URL, an http(s) URL over [`MAX_URL_LEN`], or a URL that
-/// is not a base64 data URL or http(s) ([`MultimodalError`](crate::multimodal::MultimodalError)).
+/// A 400 for an image part with no string URL, an http(s) URL over MAX_URL_LEN, or a URL that
+/// is not a base64 data URL or http(s) (MultimodalError).
 pub fn take_chat_images(body: &Value) -> Result<(Vec<ChatImage>, Value), ApiError> {
     let mut stripped = body.clone();
     let mut images = Vec::new();
@@ -137,12 +137,12 @@ pub fn take_chat_images(body: &Value) -> Result<(Vec<ChatImage>, Value), ApiErro
     Ok((images, stripped))
 }
 
-/// Refuses a request whose body, after [`take_chat_images`], still carries an image: one this
+/// Refuses a request whose body, after take_chat_images, still carries an image: one this
 /// server would not show the model.
 ///
 /// # Errors
 ///
-/// An `unsupported_capability` 400 naming the shape and its JSON path.
+/// An unsupported_capability 400 naming the shape and its JSON path.
 pub fn refuse_unread_image(stripped: &Value) -> Result<(), ApiError> {
     let Some(shape) = crate::prompt::find_image_carrier(stripped) else {
         return Ok(());
@@ -166,13 +166,13 @@ fn invalid_image(message: impl Into<String>) -> ApiError {
     )
 }
 
-/// Whether http(s) image URLs are fetched: on unless `SPARKFLASH_IMAGE_FETCH=0`.
+/// Whether http(s) image URLs are fetched: on unless SPARKFLASH_IMAGE_FETCH=0.
 #[must_use]
 pub fn fetch_enabled() -> bool {
     std::env::var("SPARKFLASH_IMAGE_FETCH").map_or(true, |value| value != "0")
 }
 
-/// Downloads one image, at most [`MAX_IMAGE_BYTES`] of it.
+/// Downloads one image, at most MAX_IMAGE_BYTES of it.
 fn fetch(url: &str) -> Result<Vec<u8>, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(CONNECT_TIMEOUT)
@@ -198,12 +198,13 @@ fn fetch(url: &str) -> Result<Vec<u8>, String> {
 ///
 /// # Errors
 ///
-/// An `invalid_image` 400 naming the image (1-based) and the reason: too many images or bytes, a
+/// An invalid_image 400 naming the image (1-based) and the reason: too many images or bytes, a
 /// URL that could not be fetched (or fetching is off), a placeholder with no image, or a file
-/// [`sparkflash_vision::prepare`] refused.
+/// the model's VisionCodec refused.
 pub async fn prepare_images(
     images: Vec<ChatImage>,
     fetch_urls: bool,
+    vision: Arc<dyn VisionCodec>,
 ) -> Result<Vec<PreparedImage>, ApiError> {
     if images.len() > MAX_IMAGES {
         return Err(invalid_image(format!(
@@ -211,13 +212,10 @@ pub async fn prepare_images(
             images.len()
         )));
     }
-    let limits = DecodeLimits {
-        max_bytes: MAX_IMAGE_BYTES,
-        max_dimension: if images.len() < MANY_IMAGES {
-            MAX_SIDE
-        } else {
-            MAX_SIDE_MANY
-        },
+    let max_dimension = if images.len() < MANY_IMAGES {
+        MAX_SIDE
+    } else {
+        MAX_SIDE_MANY
     };
     let mut payloads: Vec<(Arc<[u8]>, bool)> = Vec::with_capacity(images.len());
     let mut fetches = Vec::new();
@@ -265,12 +263,13 @@ pub async fn prepare_images(
     let tasks: Vec<_> = payloads
         .into_iter()
         .map(|(bytes, low_detail)| {
-            let options = PrepOptions {
-                limits,
+            let options = VisionOptions {
+                max_bytes: MAX_IMAGE_BYTES,
+                max_dimension,
                 max_long_side: low_detail.then_some(LOW_DETAIL_SIDE),
-                ..PrepOptions::default()
             };
-            tokio::task::spawn_blocking(move || sparkflash_vision::prepare(&bytes, &options))
+            let vision = Arc::clone(&vision);
+            tokio::task::spawn_blocking(move || vision.prepare(&bytes, &options))
         })
         .collect();
     let mut prepared = Vec::with_capacity(tasks.len());
@@ -284,16 +283,18 @@ pub async fn prepare_images(
     Ok(prepared)
 }
 
-/// Replaces each placeholder in `prompt` with its image's span.
+/// Replaces each placeholder in prompt with its image's span.
 ///
 /// # Errors
 ///
-/// An `invalid_image` 400 when the placeholders and the images differ in number.
+/// An invalid_image 400 when the placeholders and the images differ in number.
 pub fn place_images(
     prompt: &[u32],
     prepared: Vec<PreparedImage>,
+    vision: &dyn VisionCodec,
 ) -> Result<(Vec<u32>, Vec<VisionImage>), ApiError> {
-    let (ids, spans) = sparkflash_vision::span::expand(prompt, &prepared)
+    let (ids, spans) = vision
+        .expand(prompt, &prepared)
         .map_err(|error| invalid_image(error.to_string()))?;
     let images = spans
         .into_iter()
@@ -309,9 +310,15 @@ pub fn place_images(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sparkflash_model::vision::ImageGrid;
+    use sparkflash_model_deepseek_v41::vision::V41Vision;
 
     /// A 1x1 PNG, base64.
     const DOT: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+    fn vision() -> V41Vision {
+        V41Vision
+    }
 
     #[test]
     fn image_parts_are_taken_in_render_order_and_stripped() {
@@ -365,15 +372,27 @@ mod tests {
             {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{DOT}")}},
         ]}]});
         let (images, _) = take_chat_images(&body).unwrap();
-        let prepared = prepare_images(images, false).await.unwrap();
+        let prepared = prepare_images(images, false, Arc::new(vision()))
+            .await
+            .unwrap();
         assert_eq!(prepared[0].grid.tokens(), 184);
-        let id = sparkflash_vision::IMAGE_TOKEN_ID;
-        let (ids, placed) = place_images(&[1, id, 2], prepared).unwrap();
+        let id = vision().image_token_id();
+        let (ids, placed) = place_images(&[1, id, 2], prepared, &vision()).unwrap();
         assert_eq!(ids.len(), 186);
         assert_eq!(placed[0].span.start, 1);
         assert_eq!(image_tokens(&placed), 184);
         assert_eq!(placed[0].pixels.len(), 546 * 546 * 3);
-        assert!(place_images(&[1, 2], Vec::new()).is_ok());
+        assert!(place_images(&[1, 2], Vec::new(), &vision()).is_ok());
+        assert_eq!(
+            ImageGrid {
+                n_llm_h: 1,
+                n_llm_w: 1,
+                best_height: 546,
+                best_width: 546,
+            }
+            .tokens(),
+            4
+        );
     }
 
     #[tokio::test]
@@ -384,7 +403,9 @@ mod tests {
             },
             low_detail: false,
         }];
-        let error = prepare_images(url, false).await.unwrap_err();
+        let error = prepare_images(url, false, Arc::new(vision()))
+            .await
+            .unwrap_err();
         assert!(
             error.to_string().contains("SPARKFLASH_IMAGE_FETCH"),
             "{error}"
@@ -393,8 +414,12 @@ mod tests {
             part: ImagePart::Placeholder,
             low_detail: false,
         }];
-        assert!(prepare_images(placeholder, true).await.is_err());
-        let id = sparkflash_vision::IMAGE_TOKEN_ID;
-        assert!(place_images(&[id, id], Vec::new()).is_err());
+        assert!(
+            prepare_images(placeholder, true, Arc::new(vision()))
+                .await
+                .is_err()
+        );
+        let id = vision().image_token_id();
+        assert!(place_images(&[id, id], Vec::new(), &vision()).is_err());
     }
 }

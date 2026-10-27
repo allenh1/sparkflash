@@ -18,6 +18,7 @@ pub mod engram_device_state;
 pub mod layer_attention_stages;
 pub mod layer_device;
 pub mod logits_dump;
+pub mod models;
 #[cfg(feature = "cuda")]
 pub mod moe_device;
 pub mod resident_weights;

@@ -1163,7 +1163,7 @@ const CALIBRATION_EDGES: [f32; 7] = [0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99];
 /// The pseudo-count of the calibration prior (each bin starts at the draft's own probability).
 const CALIBRATION_PRIOR: f64 = 4.0;
 
-fn step_ms(depth: usize) -> f64 {
+pub(super) fn step_ms(depth: usize) -> f64 {
     STEP_MS + ROW_MS * depth as f64
 }
 

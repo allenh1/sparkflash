@@ -2323,8 +2323,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "sparkflash-engram",
- "sparkflash-kv",
+ "sparkflash-model",
+ "sparkflash-model-deepseek-v41",
  "sparkflash-trace",
  "sparkflash-vision",
  "tempfile",
@@ -2357,6 +2357,8 @@ dependencies = [
  "sparkflash-engram",
  "sparkflash-kernels",
  "sparkflash-kv",
+ "sparkflash-model",
+ "sparkflash-model-deepseek-v41",
  "sparkflash-scheduler",
  "sparkflash-trace",
  "sparkflash-vision",
@@ -2406,6 +2408,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sparkflash-kv",
+ "sparkflash-model-deepseek-v41",
  "tempfile",
  "thiserror 2.0.21",
 ]
@@ -2425,6 +2428,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sparkflash-model",
  "sparkflash-trace",
  "tempfile",
  "thiserror 2.0.21",
@@ -2460,9 +2464,38 @@ dependencies = [
  "parking_lot",
  "serde",
  "sha2",
+ "sparkflash-model",
  "sparkflash-trace",
  "tempfile",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "sparkflash-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sparkflash-trace",
+ "sparkflash-weights",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "sparkflash-model-deepseek-v41"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "deepseek-recipe-core",
+ "deepseek-recipe-encoding",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sparkflash-model",
+ "sparkflash-vision",
+ "sparkflash-weights",
+ "thiserror 2.0.21",
+ "tokenizers",
 ]
 
 [[package]]
@@ -2476,6 +2509,22 @@ dependencies = [
  "sparkflash-kv",
  "sparkflash-trace",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "sparkflash-serve"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures",
+ "http-body-util",
+ "serde_json",
+ "sparkflash-api",
+ "sparkflash-model",
+ "sparkflash-trace",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]
@@ -2520,6 +2569,15 @@ dependencies = [
  "tower",
  "tracing-subscriber",
  "ureq",
+]
+
+[[package]]
+name = "sparkflash-weights"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

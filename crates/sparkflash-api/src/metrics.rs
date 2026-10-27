@@ -20,7 +20,7 @@ use prometheus::{
     Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec, Opts,
     Registry, TextEncoder,
 };
-use sparkflash_kv::PrefixMatchPlan;
+use sparkflash_model::telemetry::PrefixMatchPlan;
 
 use crate::engine::ClusterStatsSnapshot;
 use crate::telemetry_types::{DeepSeekSparkRequestStats, OpenAiUsageWithCache, finite_or_zero};

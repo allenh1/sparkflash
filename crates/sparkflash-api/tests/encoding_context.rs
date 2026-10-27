@@ -7,7 +7,7 @@
 //! this file was produced by running reference/encoding/encoding.py directly.
 
 use serde_json::{Value, json};
-use sparkflash_api::encoding::{SparkV41Encoding, parse_cases};
+use sparkflash_model_deepseek_v41::encoding::{SparkV41Encoding, parse_cases};
 
 const BOS: &str = "<｜begin▁of▁sentence｜>";
 const SYSTEM: &str = "<｜System｜>";

@@ -423,3 +423,313 @@ OPT_GEMV_ENTRY(opt_gemv_fp8a_bf16o_t8, OPT_A_FP8, false, 8)
 OPT_GEMV_ENTRY(opt_gemv_fp8a_f32o_t8, OPT_A_FP8, true, 8)
 OPT_GEMV_ENTRY(opt_gemv_f32a_f32o_t8, OPT_A_F32, true, 8)
 OPT_GEMV_ENTRY(opt_gemv_f32a_bf16o_t8, OPT_A_F32, false, 8)
+
+// ---------------------------------------------------------------------------------------------
+// Rows GEMV (a few to a few dozen tokens): the same per-token chains, cheaper per token.
+// ---------------------------------------------------------------------------------------------
+//
+// opt_gemv_rows_*: grid (ceil(cols / (32 * CPL)), groups, ceil(tokens / TB)), 256 threads. A block
+// serves CPL 32-column tiles (lane l: column l of each) and up to TB tokens, numbered token split
+// fastest as above. K goes eight blocks at a time, one a warp (warp w: K blocks w, w + 8, ... as in
+// opt_gemv_body), and the chunk's activations for the block's tokens are staged in shared memory
+// (two buffers: the next chunk is loaded while this one computes): E4M3 widened to f16 pairs with
+// its scales as f32, bf16 pairs and f32 as they are. A warp converts its K block's weights once for
+// all the block's tokens, and each staged activation it reads serves all CPL columns, where the
+// t1..t8 forms convert a tile's weights once per eight tokens at most, read a token's activations
+// once per column and stage whole rows before the first product.
+//
+// Every token's chain is opt_gemv_body's: the K block's 32 products in ascending order, each one
+// rounding (E4M3 and bf16 pairs on the mixed-precision FMA, whose products are exact in f32 like
+// those of the f32 FMA on the widened values; f32 rows on the f32 FMA), the chain over the warp's
+// K blocks, the eight warp partials summed in warp order. So the bits are the same.
+#define OPT_GR_CHUNK OPT_G_WARPS
+
+// c + a.lo * b.lo, then + a.hi * b.hi, on bf16x2 pairs: two single-rounding f32 FMAs.
+__device__ __forceinline__ float opt_g_fma2_bf16(uint32_t a, uint32_t b, float c) {
+    asm("fma.rn.f32.bf16 %0, %1, %2, %0;" : "+f"(c) : "h"((uint16_t)(a & 0xffffu)), "h"((uint16_t)(b & 0xffffu)));
+    asm("fma.rn.f32.bf16 %0, %1, %2, %0;" : "+f"(c) : "h"((uint16_t)(a >> 16)), "h"((uint16_t)(b >> 16)));
+    return c;
+}
+
+// Two E4M3 bytes (the low 16 bits) -> bf16x2, the low byte in the low half (E4M3 is exact in bf16).
+__device__ __forceinline__ uint32_t opt_g_e4m3x2_bf16(uint32_t two) {
+    const uint32_t h = opt_g_e4m3x2(two);
+    const float2 f = __half22float2(*reinterpret_cast<const __half2 *>(&h));
+    uint32_t b;
+    asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(b) : "f"(f.y), "f"(f.x));
+    return b;
+}
+
+template <int AMODE, bool OUT_F32, uint32_t TB, uint32_t CPL>
+__device__ __forceinline__ void opt_gemv_rows_body(
+    const uint8_t *__restrict__ a, const uint8_t *__restrict__ a_scales,
+    const uint8_t *__restrict__ w, const uint8_t *__restrict__ ws, void *__restrict__ out,
+    const uint32_t cols, const uint32_t inner, const uint32_t tokens,
+    const uint64_t a_tok_stride, const uint64_t out_tok_stride,
+    const uint64_t a_grp_stride, const uint64_t w_grp_stride, const uint64_t s_grp_stride,
+    const uint64_t out_grp_stride, const uint32_t k_stride_blocks) {
+    constexpr bool FP8 = AMODE == OPT_A_FP8;
+    constexpr bool F32 = AMODE == OPT_A_F32;
+    constexpr uint32_t EB = AMODE == OPT_A_BF16 ? 2u : FP8 ? 1u : 4u;
+    // Staged words of a token's K block: 16 f16 or bf16 pairs, or 32 f32.
+    constexpr uint32_t KW = F32 ? 32u : 16u;
+    // 16-byte source loads per token per chunk, and per thread.
+    constexpr uint32_t UPT = OPT_GR_CHUNK * 2u * EB;
+    constexpr uint32_t NU = (TB * UPT + OPT_G_THREADS - 1u) / OPT_G_THREADS;
+    // One staged chunk: [token][K block][KW words], then (E4M3) [token][K block] f32 scales.
+    constexpr uint32_t ACT_WORDS = TB * OPT_GR_CHUNK * KW;
+    constexpr uint32_t BUF_WORDS = ACT_WORDS + (FP8 ? TB * OPT_GR_CHUNK : 0u);
+    constexpr uint32_t RED_WORDS = OPT_G_WARPS * TB * 32u * CPL;
+    constexpr uint32_t SMEM_WORDS = RED_WORDS > 2u * BUF_WORDS ? RED_WORDS : 2u * BUF_WORDS;
+    static_assert(!FP8 || TB * OPT_GR_CHUNK <= OPT_G_THREADS, "one scale a thread a chunk");
+    __shared__ __align__(16) uint32_t s_mem[SMEM_WORDS];
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5;
+    // Token split fastest: consecutive blocks are the splits of one tile group.
+    const uint32_t lin = blockIdx.z * gridDim.x + blockIdx.x;
+    const uint32_t pair = lin / gridDim.z;
+    const uint32_t group = blockIdx.y;
+    const uint32_t tiles = cols >> 5;
+    const uint32_t k_blocks = inner >> 5;
+    const uint32_t z0 = (lin - pair * gridDim.z) * TB;
+    const uint32_t live = tokens - z0 < TB ? tokens - z0 : TB;
+    const uint32_t k_row = k_stride_blocks != 0u ? k_stride_blocks : k_blocks;
+    const uint64_t a_base = group * a_grp_stride + (uint64_t)z0 * a_tok_stride;
+
+    const uint8_t *wt[CPL];
+    const uint8_t *st[CPL];
+    bool have[CPL];
+#pragma unroll
+    for (uint32_t c = 0; c < CPL; ++c) {
+        const uint32_t tile = pair * CPL + c;
+        have[c] = tile < tiles;
+        const uint32_t t_ = have[c] ? tile : 0u;
+        wt[c] = w + group * w_grp_stride + (uint64_t)t_ * k_row * 1024u + lane * 32u;
+        st[c] = ws + group * s_grp_stride + (uint64_t)t_ * k_row;
+    }
+
+    // Staging: load u (u = tid + 256 i) is 16 bytes of token u / UPT's chunk, at byte 16 * (u % UPT)
+    // of it (K block 16 * (u % UPT) / (32 * EB)); thread i < TB * 8 also loads the E4M3 scale of
+    // token i / 8, K block i % 8.
+    auto stage_load = [&](uint32_t chunk, uint4 (&u)[NU], uint8_t &sc) {
+#pragma unroll
+        for (uint32_t i = 0; i < NU; ++i) {
+            const uint32_t idx = tid + i * OPT_G_THREADS;
+            const uint32_t t = idx / UPT;
+            const uint32_t r = idx - t * UPT;
+            const uint32_t kb = chunk * OPT_GR_CHUNK + r * 16u / (32u * EB);
+            u[i] = make_uint4(0u, 0u, 0u, 0u);
+            if (idx < TB * UPT && t < live && kb < k_blocks) {
+                const uint8_t *src = a + (a_base + (uint64_t)t * a_tok_stride) * EB +
+                                     (uint64_t)chunk * OPT_GR_CHUNK * 32u * EB + r * 16u;
+                u[i] = __ldg(reinterpret_cast<const uint4 *>(src));
+            }
+        }
+        sc = 0u;
+        if constexpr (FP8) {
+            const uint32_t kb = chunk * OPT_GR_CHUNK + (tid & 7u);
+            if (tid < TB * OPT_GR_CHUNK && (tid >> 3) < live && kb < k_blocks) {
+                sc = __ldg(a_scales + (a_base + (uint64_t)(tid >> 3) * a_tok_stride) / 32u + kb);
+            }
+        }
+    };
+    auto stage_store = [&](uint32_t buf, const uint4 (&u)[NU], uint8_t sc) {
+        uint32_t *base = s_mem + buf * BUF_WORDS;
+#pragma unroll
+        for (uint32_t i = 0; i < NU; ++i) {
+            const uint32_t idx = tid + i * OPT_G_THREADS;
+            if (idx < TB * UPT) {
+                const uint32_t t = idx / UPT;
+                const uint32_t r = idx - t * UPT;
+                if constexpr (FP8) {
+                    uint4 *dst = reinterpret_cast<uint4 *>(base + t * OPT_GR_CHUNK * KW + r * 8u);
+                    dst[0] = make_uint4(opt_g_e4m3x2(u[i].x), opt_g_e4m3x2(u[i].x >> 16), opt_g_e4m3x2(u[i].y),
+                                        opt_g_e4m3x2(u[i].y >> 16));
+                    dst[1] = make_uint4(opt_g_e4m3x2(u[i].z), opt_g_e4m3x2(u[i].z >> 16), opt_g_e4m3x2(u[i].w),
+                                        opt_g_e4m3x2(u[i].w >> 16));
+                } else {
+                    *reinterpret_cast<uint4 *>(base + t * OPT_GR_CHUNK * KW + r * 4u) = u[i];
+                }
+            }
+        }
+        if constexpr (FP8) {
+            if (tid < TB * OPT_GR_CHUNK) {
+                reinterpret_cast<float *>(base + ACT_WORDS)[tid] = opt_g_ue8m0(sc);
+            }
+        }
+    };
+
+    float acc[TB][CPL];
+#pragma unroll
+    for (uint32_t t = 0; t < TB; ++t) {
+#pragma unroll
+        for (uint32_t c = 0; c < CPL; ++c) acc[t][c] = 0.0f;
+    }
+
+    const uint32_t chunks = (k_blocks + OPT_GR_CHUNK - 1u) / OPT_GR_CHUNK;
+    // A missing second tile (odd tile count) converts zeros and stores nothing.
+    uint4 lo[CPL], hi[CPL];
+    uint8_t sc[CPL];
+#pragma unroll
+    for (uint32_t c = 0; c < CPL; ++c) {
+        lo[c] = make_uint4(0u, 0u, 0u, 0u);
+        hi[c] = lo[c];
+        sc[c] = 0u;
+    }
+    auto load_w = [&](uint32_t chunk) {
+        const uint32_t kb = chunk * OPT_GR_CHUNK + warp;
+#pragma unroll
+        for (uint32_t c = 0; c < CPL; ++c) {
+            if (have[c] && kb < k_blocks) {
+                lo[c] = opt_g_ldw(wt[c] + (uint64_t)kb * 1024u);
+                hi[c] = opt_g_ldw(wt[c] + (uint64_t)kb * 1024u + 16u);
+                sc[c] = __ldg(st[c] + kb);
+            }
+        }
+    };
+    load_w(0u);
+    {
+        uint4 u[NU];
+        uint8_t s8;
+        stage_load(0u, u, s8);
+        stage_store(0u, u, s8);
+    }
+    __syncthreads();
+
+    for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
+        const uint32_t kb = chunk * OPT_GR_CHUNK + warp;
+        const bool more = chunk + 1u < chunks;
+        uint4 nu[NU];
+        uint8_t ns;
+        if (more) stage_load(chunk + 1u, nu, ns);
+        if (kb < k_blocks) {
+            // The weights as f16 or bf16 pairs, or as 32 f32.
+            uint32_t wp[CPL][F32 ? 1 : 16];
+            float wf[CPL][F32 ? 32 : 1];
+            float wscale[CPL];
+#pragma unroll
+            for (uint32_t c = 0; c < CPL; ++c) {
+                const uint32_t ww[8] = {lo[c].x, lo[c].y, lo[c].z, lo[c].w, hi[c].x, hi[c].y, hi[c].z, hi[c].w};
+#pragma unroll
+                for (int q = 0; q < 8; ++q) {
+                    if constexpr (F32) {
+                        opt_g_e4m3x4(ww[q], wf[c][4 * q], wf[c][4 * q + 1], wf[c][4 * q + 2], wf[c][4 * q + 3]);
+                    } else if constexpr (FP8) {
+                        wp[c][2 * q] = opt_g_e4m3x2(ww[q]);
+                        wp[c][2 * q + 1] = opt_g_e4m3x2(ww[q] >> 16);
+                    } else {
+                        wp[c][2 * q] = opt_g_e4m3x2_bf16(ww[q]);
+                        wp[c][2 * q + 1] = opt_g_e4m3x2_bf16(ww[q] >> 16);
+                    }
+                }
+                wscale[c] = opt_g_ue8m0(sc[c]);
+            }
+            if (more) load_w(chunk + 1u);
+            const uint32_t *buf = s_mem + (chunk & 1u) * BUF_WORDS;
+#pragma unroll
+            for (uint32_t t = 0; t < TB; ++t) {
+                if (t < live) {
+                    const uint4 *src = reinterpret_cast<const uint4 *>(buf + (t * OPT_GR_CHUNK + warp) * KW);
+                    float blk[CPL];
+#pragma unroll
+                    for (uint32_t c = 0; c < CPL; ++c) blk[c] = 0.0f;
+                    if constexpr (F32) {
+#pragma unroll
+                        for (int q = 0; q < 8; ++q) {
+                            const uint4 v = src[q];
+                            const float av[4] = {__uint_as_float(v.x), __uint_as_float(v.y), __uint_as_float(v.z),
+                                                 __uint_as_float(v.w)};
+#pragma unroll
+                            for (int e = 0; e < 4; ++e) {
+#pragma unroll
+                                for (uint32_t c = 0; c < CPL; ++c) blk[c] = __fmaf_rn(av[e], wf[c][4 * q + e], blk[c]);
+                            }
+                        }
+                    } else {
+                        uint32_t ap[16];
+#pragma unroll
+                        for (int q = 0; q < 4; ++q) {
+                            const uint4 v = src[q];
+                            ap[4 * q] = v.x; ap[4 * q + 1] = v.y; ap[4 * q + 2] = v.z; ap[4 * q + 3] = v.w;
+                        }
+#pragma unroll
+                        for (uint32_t c = 0; c < CPL; ++c) {
+#pragma unroll
+                            for (int j = 0; j < 16; ++j) {
+                                if constexpr (FP8) {
+                                    blk[c] = opt_g_fma2_f16(ap[j], wp[c][j], blk[c]);
+                                } else {
+                                    blk[c] = opt_g_fma2_bf16(ap[j], wp[c][j], blk[c]);
+                                }
+                            }
+                        }
+                    }
+                    float ascale = 1.0f;
+                    if constexpr (FP8) {
+                        ascale = reinterpret_cast<const float *>(buf + ACT_WORDS)[t * OPT_GR_CHUNK + warp];
+                    }
+#pragma unroll
+                    for (uint32_t c = 0; c < CPL; ++c) acc[t][c] = __fmaf_rn(blk[c], wscale[c] * ascale, acc[t][c]);
+                }
+            }
+        }
+        if (more) stage_store((chunk + 1u) & 1u, nu, ns);
+        __syncthreads();
+    }
+
+    // The warp partials reuse the staging words; the loop's last barrier freed them.
+    float *red = reinterpret_cast<float *>(s_mem);
+#pragma unroll
+    for (uint32_t t = 0; t < TB; ++t) {
+#pragma unroll
+        for (uint32_t c = 0; c < CPL; ++c) {
+            red[(warp * TB + t) * (32u * CPL) + c * 32u + lane] = acc[t][c];
+        }
+    }
+    __syncthreads();
+    for (uint32_t idx = tid; idx < live * 32u * CPL; idx += OPT_G_THREADS) {
+        const uint32_t t = idx / (32u * CPL);
+        const uint32_t cc = idx % (32u * CPL);
+        const uint32_t tile = pair * CPL + cc / 32u;
+        if (tile >= tiles) continue;
+        float s = 0.0f;
+#pragma unroll
+        for (uint32_t q = 0; q < OPT_G_WARPS; ++q) s += red[(q * TB + t) * (32u * CPL) + cc];
+        const uint64_t o = group * out_grp_stride + ((uint64_t)t + z0) * out_tok_stride + (uint64_t)tile * 32u + cc % 32u;
+        if constexpr (OUT_F32) {
+            reinterpret_cast<float *>(out)[o] = s;
+        } else {
+            reinterpret_cast<__nv_bfloat16 *>(out)[o] = __float2bfloat16_rn(s);
+        }
+    }
+}
+
+#define OPT_GEMV_ROWS_ENTRY(name, AMODE, OUTF32, TB, CPL, MINB)                                     \
+    extern "C" __global__ void __launch_bounds__(OPT_G_THREADS, MINB) name(                        \
+        const void *__restrict__ a, const uint8_t *__restrict__ a_scales,                            \
+        const uint8_t *__restrict__ w, const uint8_t *__restrict__ ws, void *__restrict__ out,     \
+        const uint32_t cols, const uint32_t inner, const uint32_t tokens,                          \
+        const uint64_t a_tok_stride, const uint64_t out_tok_stride, const uint64_t a_grp_stride,   \
+        const uint64_t w_grp_stride, const uint64_t s_grp_stride, const uint64_t out_grp_stride,  \
+        const uint32_t k_stride_blocks) {                                                          \
+        OPT_PDL_ENTRY();                                                                           \
+        opt_gemv_rows_body<AMODE, OUTF32, TB, CPL>(reinterpret_cast<const uint8_t *>(a), a_scales,  \
+                                                   w, ws, out, cols, inner, tokens, a_tok_stride,  \
+                                                   out_tok_stride, a_grp_stride, w_grp_stride,     \
+                                                   s_grp_stride, out_grp_stride, k_stride_blocks); \
+    }
+
+// Three shapes of block for E4M3 rows, by sweep over the decode projections at 2 to 32 tokens: eight
+// tokens and two tiles (wide matrices), eight tokens and one tile, four tokens and one tile (narrow
+// matrices, three blocks an SM).
+OPT_GEMV_ROWS_ENTRY(opt_gemv_rows_fp8a_bf16o_r8c2, OPT_A_FP8, false, 8u, 2u, 2)
+OPT_GEMV_ROWS_ENTRY(opt_gemv_rows_fp8a_bf16o_r8c1, OPT_A_FP8, false, 8u, 1u, 3)
+OPT_GEMV_ROWS_ENTRY(opt_gemv_rows_fp8a_bf16o_r4c1, OPT_A_FP8, false, 4u, 1u, 3)
+// bf16 rows (wo_a): eight tokens and two tiles or one. f32 rows (the shared expert): four tokens and
+// two tiles (the wide down projection) or one (gate/up).
+OPT_GEMV_ROWS_ENTRY(opt_gemv_rows_bf16a_bf16o_r8c2, OPT_A_BF16, false, 8u, 2u, 2)
+OPT_GEMV_ROWS_ENTRY(opt_gemv_rows_bf16a_bf16o_r8c1, OPT_A_BF16, false, 8u, 1u, 3)
+OPT_GEMV_ROWS_ENTRY(opt_gemv_rows_f32a_f32o_r4c2, OPT_A_F32, true, 4u, 2u, 2)
+OPT_GEMV_ROWS_ENTRY(opt_gemv_rows_f32a_f32o_r4c1, OPT_A_F32, true, 4u, 1u, 3)

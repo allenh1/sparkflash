@@ -1,0 +1,16 @@
+[package]
+name = "sparkflash-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sparkflash-trace = { workspace = true }
+
+[dev-dependencies]
+sparkflash-weights = { workspace = true }

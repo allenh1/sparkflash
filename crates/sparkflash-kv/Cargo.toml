@@ -17,6 +17,7 @@ libloading = { version = "0.8", optional = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
+sparkflash-model = { workspace = true }
 sparkflash-trace = { workspace = true }
 thiserror = { workspace = true }
 

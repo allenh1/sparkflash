@@ -3,8 +3,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::{Deserialize, Serialize};
-
 /// Fixed-point scale used for the mean gate alpha accumulator (micro-units).
 pub const GATE_ALPHA_SCALE: u64 = 1_000_000;
 
@@ -29,26 +27,7 @@ pub struct EngramLayerTelemetry {
     pub gate_samples_total: AtomicU64,
 }
 
-/// Serializable snapshot of one Engram layer's telemetry.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EngramTelemetrySnapshot {
-    /// Backbone layer index that owns the Engram table (1 or 14).
-    pub layer_id: usize,
-    /// 24-column hash lookups issued by this layer.
-    pub lookups_total: u64,
-    /// Lookups served from the tier-1 tier of the cache.
-    pub tier1_drm_hits: u64,
-    /// Lookups served from the tier-2 UMA cache.
-    pub tier2_uma_hits: u64,
-    /// Lookups that had to reach the NVMe store.
-    pub tier3_nvme_misses: u64,
-    /// Fraction of lookups that did not reach NVMe, in [0, 1]; 0.0 when nothing was looked up.
-    pub hit_rate: f64,
-    /// Mean per-token stall on Engram I/O, in microseconds.
-    pub mean_prefetch_stall_us: f64,
-    /// Mean learned gate alpha over all sampled batches, in [0, 1].
-    pub mean_gate_alpha: f64,
-}
+pub use sparkflash_model::telemetry::EngramTelemetrySnapshot;
 
 impl EngramLayerTelemetry {
     /// Records one batch of lookups with the tier they resolved in.

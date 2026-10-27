@@ -3,15 +3,15 @@
 //! A source answers three questions about a tensor - does it exist, what is its dtype and shape,
 //! and what are its bytes - and nothing else. Two implementations are planned:
 //!
-//! - [`crate::synthetic`], which generates bytes from a seed and needs no checkpoint, and
-//! - the checkpoint source, which will memory-map the 48 safetensors shards named by the index.
+//! - a synthetic source, which generates bytes from a seed and needs no checkpoint, and
+//! - the checkpoint source, which memory-maps the safetensors shards named by the index.
 //!
 //! Keeping the trait this narrow is what makes the engine testable without the weights: every test
 //! that is about arithmetic rather than about the file format runs against the synthetic source, and
 //! the conformance check below is what proves the two sources describe the same model.
 
 use crate::dtype::DType;
-use crate::tensor::{TensorPlan, TensorSpec};
+use crate::spec::TensorSpec;
 
 /// What can go wrong while asking a source for a tensor.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -190,23 +190,23 @@ impl Conformance {
     }
 }
 
-/// Check every tensor in `plan` against `source`.
+/// Check every tensor in `specs` against `source`.
 ///
 /// This is the check that lets a synthetic source stand in for the checkpoint in a test: it reports
 /// whether the two describe the same names with the same dtypes and shapes, without reading tensor
 /// data - only specs - so it is cheap even against a 510 GB checkpoint.
 ///
 /// What it can and cannot prove depends entirely on the source. Against a real checkpoint it is a
-/// conformance gate. Against [`crate::synthetic::SyntheticWeights`] built from the same plan it can
-/// only ever agree, because that source clones the plan: a test that wants to show this check FIRING
-/// must hand it a source that deviates, which is what
-/// `the_conformance_check_rejects_a_source_that_deviates` does.
-pub fn check_source_against_plan<S: WeightSource + ?Sized>(
+/// conformance gate. Against a source built from the same specs it can only ever agree, because
+/// that source clones the plan: a test that wants to show this check firing must hand it a source
+/// that deviates, which is what the V4.1 `the_conformance_check_rejects_a_source_that_deviates`
+/// does.
+pub fn check_source_against_specs<S: WeightSource + ?Sized>(
     source: &S,
-    plan: &TensorPlan,
+    specs: &[TensorSpec],
 ) -> Conformance {
     let mut report = Conformance::default();
-    for wanted in plan.specs() {
+    for wanted in specs {
         match source.spec(&wanted.name) {
             Err(error) => report.mismatches.push(format!("{}: {error}", wanted.name)),
             Ok(found) => {

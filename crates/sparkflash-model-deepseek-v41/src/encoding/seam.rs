@@ -97,6 +97,7 @@
 //! recorded here.
 
 use serde_json::{Map, Value};
+use sparkflash_model::{PromptCodec, PromptError};
 
 use super::render::encode_messages_text;
 use super::{
@@ -622,4 +623,69 @@ fn resolve_effort(
         _ => return Err(TokenizerSeamError::InvalidReasoningEffort),
     };
     Ok(ResolvedEffort { thinking, score })
+}
+
+impl From<TokenizerSeamError> for PromptError {
+    fn from(error: TokenizerSeamError) -> Self {
+        let message = error.to_string();
+        let (param, code) = match &error {
+            TokenizerSeamError::MissingMessages
+            | TokenizerSeamError::EmptyMessages
+            | TokenizerSeamError::MessageNotObject { .. }
+            | TokenizerSeamError::InvalidRole { .. }
+            | TokenizerSeamError::UnsupportedContentPart { .. }
+            | TokenizerSeamError::InvalidContent
+            | TokenizerSeamError::InvalidToolCalls => (Some("messages"), Some("invalid_messages")),
+            TokenizerSeamError::InvalidChatTemplateKwargs => (
+                Some("chat_template_kwargs"),
+                Some("invalid_chat_template_kwargs"),
+            ),
+            TokenizerSeamError::InvalidTools => (Some("tools"), Some("invalid_tools")),
+            TokenizerSeamError::InvalidReasoningEffort => {
+                (Some("reasoning_effort"), Some("invalid_reasoning_effort"))
+            }
+            TokenizerSeamError::Render(case) => match case {
+                CaseError::InvalidReasoningEffort(_) => {
+                    (Some("reasoning_effort"), Some("invalid_reasoning_effort"))
+                }
+                CaseError::InvalidThinkingMode(_) => {
+                    (Some("chat_template_kwargs"), Some("invalid_thinking"))
+                }
+                CaseError::ImagePlaceholderInContent
+                | CaseError::ImagePlaceholderInReasoning
+                | CaseError::InvalidImageBlock
+                | CaseError::UnknownRole(_)
+                | CaseError::InvalidTask(_)
+                | CaseError::UnmergedToolMessage
+                | CaseError::ToolsWithoutMessages
+                | CaseError::InvalidCaseShape
+                | CaseError::InvalidJson(_) => (Some("messages"), Some("invalid_messages")),
+            },
+            TokenizerSeamError::Tokenize(_) => return PromptError::internal(message),
+        };
+        PromptError::invalid(message, param, code)
+    }
+}
+
+impl PromptCodec for TokenizerSeam {
+    fn encode_chat(&self, request: &Value) -> Result<Vec<u32>, PromptError> {
+        TokenizerSeam::encode_chat(self, request).map_err(PromptError::from)
+    }
+
+    fn encode_text(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, PromptError> {
+        self.encode_text_with(text, add_special_tokens)
+            .map_err(PromptError::from)
+    }
+
+    fn decode(&self, ids: &[u32]) -> Option<String> {
+        TokenizerSeam::decode(self, ids)
+    }
+
+    fn token_str(&self, id: u32) -> Option<String> {
+        TokenizerSeam::token_str(self, id)
+    }
+
+    fn vision_codec(&self) -> Option<std::sync::Arc<dyn sparkflash_model::vision::VisionCodec>> {
+        Some(std::sync::Arc::new(*crate::vision::codec()))
+    }
 }

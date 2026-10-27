@@ -21,7 +21,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures::StreamExt;
 use serde_json::{Map, Value, json};
-use sparkflash_kv::PrefixMatchPlan;
+use sparkflash_model::telemetry::PrefixMatchPlan;
 use sparkflash_trace::{
     GpuTraceRing, TraceAdminRequest, TraceAdminResponse, TraceExportOptions, TraceScope,
     active_mask, arm_with_gpu, bind_current_request, disarm_with_gpu, drain_cpu_events,
@@ -32,10 +32,9 @@ use crate::device_token::{
     DeviceEndpoint, DeviceResponseContext, DeviceTokenClaim, DeviceTokenRequest, DeviceTokenStream,
     device_chat_body, device_chat_frames, device_completions_body, device_completions_frames,
 };
-use crate::encoding::{CaseError, TokenizerSeamError};
 use crate::engine::{
     EngineEvent, EngineRequest, FinishReason, InferenceEngine, LogprobSelection, LogprobsRequest,
-    MODEL_MAX_OUTPUT_TOKENS, MODEL_OWNED_BY, PromptLogprobs, TokenLogprob, max_seq_len,
+    MODEL_MAX_OUTPUT_TOKENS, MODEL_OWNED_BY, PromptLogprobs, TokenLogprob,
 };
 use crate::error::ApiError;
 use crate::prompt::{
@@ -56,6 +55,7 @@ use crate::vision::{
     VisionImage, fetch_enabled as image_fetch_enabled, place_images, prepare_images,
     refuse_unread_image, take_chat_images,
 };
+use sparkflash_model::{PromptCodec, PromptError};
 
 /// Decode-side trace request header.
 pub const TRACE_HEADER: &str = "x-sparkflash-trace";
@@ -431,6 +431,31 @@ fn refuse_image_carrier(carrier: Option<String>, vision: bool) -> Result<(), Api
         ),
         None,
         Some("unsupported_capability".to_owned()),
+    ))
+}
+
+/// Refuses `/v1/responses` and `/v1/messages` when the checkpoint tokenizer is attached.
+///
+/// Both routes still size their prompt with the Milestone 1 heuristic (`prompt.rs`), whose token
+/// ids are zero placeholders. A real engine would generate from those placeholders instead of the
+/// request, so with the tokenizer attached the routes answer 501 until they are implemented:
+/// their requests converted to the chat template (messages, tool calls and tool results) and
+/// tokenized like `/v1/chat/completions`. The weight-free router keeps serving them, since its mock
+/// engine never reads the ids.
+fn refuse_untokenized_route(state: &AppState, route: &str) -> Result<(), ApiError> {
+    if state.tokenizer().is_none() {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::NOT_IMPLEMENTED,
+        "invalid_request_error",
+        format!(
+            "{route} is not implemented yet: this server does not tokenize its requests, so it \
+             would answer from placeholder tokens instead of the prompt; use \
+             /v1/chat/completions, which carries the same conversations, tools and reasoning"
+        ),
+        None,
+        Some("route_not_implemented".to_owned()),
     ))
 }
 
@@ -849,13 +874,11 @@ fn model_matches(requested: &str, engine_id: &str) -> bool {
     requested_leaf.eq_ignore_ascii_case(engine_leaf)
 }
 
-/// Resolves the requested output-token budget.
+/// Resolves the requested output-token budget against the V4.1 ceiling.
 ///
-/// This follows the deepseek-recipe 0.2 contract: an absent budget means
-/// [`DEFAULT_NON_THINKING_MAX_TOKENS`], [`DEFAULT_THINKING_MAX_TOKENS`] or
-/// [`DEFAULT_MAX_EFFORT_MAX_TOKENS`] by mode; `0` and a value above the advertised
-/// [`MODEL_MAX_OUTPUT_TOKENS`] ceiling are client errors; an otherwise legal value is
-/// lowered to the context left after the prompt, and raised to at least 1.
+/// This is the compatibility wrapper for tests and callers that have not selected a model. A
+/// serving path uses [`resolve_max_tokens_with_ceiling`] with the descriptor's ceiling.
+#[allow(dead_code)]
 fn resolve_max_tokens(
     primary: Option<usize>,
     primary_name: &'static str,
@@ -865,7 +888,7 @@ fn resolve_max_tokens(
     prompt_tokens: usize,
     context_limit: usize,
 ) -> Result<usize, ApiError> {
-    resolve_max_tokens_impl(
+    resolve_max_tokens_with_ceiling(
         primary,
         primary_name,
         secondary,
@@ -873,13 +896,18 @@ fn resolve_max_tokens(
         spec,
         prompt_tokens,
         context_limit,
-        true,
+        MODEL_MAX_OUTPUT_TOKENS,
     )
 }
 
-/// Anthropic Messages lowers an over-cap `max_tokens` to the protocol upper bound instead of
-/// rejecting it, while Chat Completions and Responses reject it (recipe 0.2 semantics).
-fn resolve_max_tokens_for_messages(
+/// Resolves the requested output-token budget.
+///
+/// An absent budget means [`DEFAULT_NON_THINKING_MAX_TOKENS`],
+/// [`DEFAULT_THINKING_MAX_TOKENS`] or [`DEFAULT_MAX_EFFORT_MAX_TOKENS`] by mode; `0` and a
+/// value above `max_output_tokens` are client errors; an otherwise legal value is lowered to the
+/// context left after the prompt, and raised to at least 1.
+#[allow(clippy::too_many_arguments)]
+fn resolve_max_tokens_with_ceiling(
     primary: Option<usize>,
     primary_name: &'static str,
     secondary: Option<usize>,
@@ -887,6 +915,7 @@ fn resolve_max_tokens_for_messages(
     spec: ReasoningSpec,
     prompt_tokens: usize,
     context_limit: usize,
+    max_output_tokens: usize,
 ) -> Result<usize, ApiError> {
     resolve_max_tokens_impl(
         primary,
@@ -896,7 +925,57 @@ fn resolve_max_tokens_for_messages(
         spec,
         prompt_tokens,
         context_limit,
+        max_output_tokens,
+        true,
+    )
+}
+
+/// Anthropic Messages lowers an over-cap `max_tokens` to the protocol upper bound instead of
+/// rejecting it, while Chat Completions and Responses reject it (recipe 0.2 semantics).
+#[allow(clippy::too_many_arguments)]
+fn resolve_max_tokens_for_messages_with_ceiling(
+    primary: Option<usize>,
+    primary_name: &'static str,
+    secondary: Option<usize>,
+    secondary_name: &'static str,
+    spec: ReasoningSpec,
+    prompt_tokens: usize,
+    context_limit: usize,
+    max_output_tokens: usize,
+) -> Result<usize, ApiError> {
+    resolve_max_tokens_impl(
+        primary,
+        primary_name,
+        secondary,
+        secondary_name,
+        spec,
+        prompt_tokens,
+        context_limit,
+        max_output_tokens,
         false,
+    )
+}
+
+/// Anthropic Messages with the V4.1 ceiling: the compatibility wrapper.
+#[allow(dead_code)]
+fn resolve_max_tokens_for_messages(
+    primary: Option<usize>,
+    primary_name: &'static str,
+    secondary: Option<usize>,
+    secondary_name: &'static str,
+    spec: ReasoningSpec,
+    prompt_tokens: usize,
+    context_limit: usize,
+) -> Result<usize, ApiError> {
+    resolve_max_tokens_for_messages_with_ceiling(
+        primary,
+        primary_name,
+        secondary,
+        secondary_name,
+        spec,
+        prompt_tokens,
+        context_limit,
+        MODEL_MAX_OUTPUT_TOKENS,
     )
 }
 
@@ -909,6 +988,7 @@ fn resolve_max_tokens_impl(
     spec: ReasoningSpec,
     prompt_tokens: usize,
     context_limit: usize,
+    max_output_tokens: usize,
     reject_above_upper_bound: bool,
 ) -> Result<usize, ApiError> {
     let (field, mut requested) = match (primary, secondary) {
@@ -924,16 +1004,16 @@ fn resolve_max_tokens_impl(
         ));
     }
     if let Some(value) = requested
-        && value > MODEL_MAX_OUTPUT_TOKENS
+        && value > max_output_tokens
     {
         if reject_above_upper_bound {
             return Err(ApiError::invalid_request(
-                format!("{field} must not exceed {MODEL_MAX_OUTPUT_TOKENS}"),
+                format!("{field} must not exceed {max_output_tokens}"),
                 Some(field.to_owned()),
                 Some("invalid_max_tokens".to_owned()),
             ));
         }
-        requested = Some(MODEL_MAX_OUTPUT_TOKENS);
+        requested = Some(max_output_tokens);
     }
     if prompt_tokens > context_limit {
         return Err(ApiError::invalid_request(
@@ -1632,66 +1712,18 @@ fn chat_logprobs_value(output: &EngineOutput, info: LogprobInfo) -> Value {
 // POST /v1/chat/completions
 // ---------------------------------------------------------------------------------------
 
-/// Maps a tokenizer-seam refusal to the OpenAI-shaped 400 (or 500 for a tokenizer failure).
+/// Maps a prompt-codec refusal to the OpenAI-shaped 400, or 500 for a tokenizer failure.
 ///
-/// The message text is the seam's own: the role, content-part and effort strings are byte-identical
-/// with the released vLLM image's raises, so a client (or a parity harness) sees the same word
-/// either way.
-fn tokenizer_seam_error(error: TokenizerSeamError) -> ApiError {
-    match error {
-        TokenizerSeamError::MissingMessages
-        | TokenizerSeamError::EmptyMessages
-        | TokenizerSeamError::MessageNotObject { .. }
-        | TokenizerSeamError::InvalidRole { .. }
-        | TokenizerSeamError::UnsupportedContentPart { .. }
-        | TokenizerSeamError::InvalidContent => ApiError::invalid_request(
-            error.to_string(),
-            Some("messages".to_owned()),
-            Some("invalid_messages".to_owned()),
-        ),
-        TokenizerSeamError::InvalidChatTemplateKwargs => ApiError::invalid_request(
-            error.to_string(),
-            Some("chat_template_kwargs".to_owned()),
-            Some("invalid_chat_template_kwargs".to_owned()),
-        ),
-        TokenizerSeamError::InvalidTools => ApiError::invalid_request(
-            error.to_string(),
-            Some("tools".to_owned()),
-            Some("invalid_tools".to_owned()),
-        ),
-        TokenizerSeamError::InvalidToolCalls => ApiError::invalid_request(
-            error.to_string(),
-            Some("messages".to_owned()),
-            Some("invalid_messages".to_owned()),
-        ),
-        TokenizerSeamError::InvalidReasoningEffort => ApiError::invalid_request(
-            error.to_string(),
-            Some("reasoning_effort".to_owned()),
-            Some("invalid_reasoning_effort".to_owned()),
-        ),
-        TokenizerSeamError::Render(error) => render_case_error(&error),
-        TokenizerSeamError::Tokenize(_) => ApiError::internal(error.to_string()),
+/// The message and the optional parameter/code come from the codec, so the V4.1 pack keeps the
+/// exactly matching refusal strings while the router stays model-agnostic.
+fn prompt_codec_error(error: PromptError) -> ApiError {
+    if error.is_internal() {
+        return ApiError::internal(error.to_string());
     }
-}
-
-/// Maps an official-encoder refusal to the matching parameter/code pair.
-fn render_case_error(error: &CaseError) -> ApiError {
-    let (param, code) = match error {
-        CaseError::InvalidReasoningEffort(_) => ("reasoning_effort", "invalid_reasoning_effort"),
-        CaseError::ImagePlaceholderInContent
-        | CaseError::ImagePlaceholderInReasoning
-        | CaseError::InvalidImageBlock
-        | CaseError::UnknownRole(_)
-        | CaseError::InvalidTask(_)
-        | CaseError::UnmergedToolMessage
-        | CaseError::ToolsWithoutMessages => ("messages", "invalid_messages"),
-        CaseError::InvalidThinkingMode(_) => ("chat_template_kwargs", "invalid_thinking"),
-        CaseError::InvalidCaseShape | CaseError::InvalidJson(_) => ("messages", "invalid_messages"),
-    };
     ApiError::invalid_request(
         error.to_string(),
-        Some(param.to_owned()),
-        Some(code.to_owned()),
+        error.param().map(str::to_owned),
+        error.code().map(str::to_owned),
     )
 }
 
@@ -1716,6 +1748,7 @@ async fn chat_completions(
     // reasoning_effort decide thinking and the rendered budget), so keep a copy only when a
     // tokenizer seam is attached; the placeholder path does not need it.
     let seam = state.tokenizer().cloned();
+    let vision_codec = seam.as_ref().and_then(|seam| seam.vision_codec());
     let mut raw_for_seam = seam.as_ref().map(|_| value.clone());
     let request: ChatCompletionRequest = serde_json::from_value(value).map_err(invalid_body)?;
     // vLLM's auto tool choice is enabled by `--enable-auto-tool-choice --tool-call-parser
@@ -1835,7 +1868,7 @@ async fn chat_completions(
     // weight-free router tests), the Milestone 1 heuristic keeps the placeholder path.
     let (mut summary, prompt_token_ids) = match (seam.as_ref(), raw_for_seam.as_ref()) {
         (Some(seam), Some(raw)) => {
-            let ids = seam.encode_chat(raw).map_err(tokenizer_seam_error)?;
+            let ids = seam.encode_chat(raw).map_err(prompt_codec_error)?;
             (tokenizer_prompt_summary(ids.clone(), 0), Some(ids))
         }
         _ => (summarize_chat_messages(&request.messages)?, None),
@@ -1873,8 +1906,14 @@ async fn chat_completions(
     {
         let (images, stripped) = take_chat_images(raw)?;
         refuse_unread_image(&stripped)?;
-        let prepared = prepare_images(images, image_fetch_enabled()).await?;
-        let (ids, placed) = place_images(&summary.token_ids, prepared)?;
+        let codec = vision_codec.ok_or_else(|| {
+            ApiError::internal(
+                "the engine advertises vision but the prompt codec has no vision front end",
+            )
+        })?;
+        let prepared =
+            prepare_images(images, image_fetch_enabled(), std::sync::Arc::clone(&codec)).await?;
+        let (ids, placed) = place_images(&summary.token_ids, prepared, codec.as_ref())?;
         summary.token_ids = ids;
         vision = placed;
     } else {
@@ -1884,14 +1923,15 @@ async fn chat_completions(
     let created = state.now_unix();
     let trace_id = trace_request_id(&headers, &id);
     let prompt_tokens = summary.token_ids.len();
-    let max_tokens = resolve_max_tokens(
+    let max_tokens = resolve_max_tokens_with_ceiling(
         request.max_completion_tokens,
         "max_completion_tokens",
         request.max_tokens,
         "max_tokens",
         spec,
         prompt_tokens,
-        max_seq_len(),
+        state.max_seq_len(),
+        state.max_output_tokens(),
     )?;
     let engine_request = RequestBuilder {
         id: id.clone(),
@@ -2901,8 +2941,8 @@ async fn completions(
             None => match state.tokenizer() {
                 Some(seam) => {
                     let ids = seam
-                        .encode_text(&prompt.text)
-                        .map_err(tokenizer_seam_error)?;
+                        .encode_text(&prompt.text, false)
+                        .map_err(prompt_codec_error)?;
                     tokenizer_prompt_summary(ids, prompt.text.len())
                 }
                 None => summarize_prompt_text(&prompt.text),
@@ -2911,14 +2951,15 @@ async fn completions(
         let max_tokens = if echo && request.max_tokens == Some(0) {
             0
         } else {
-            resolve_max_tokens(
+            resolve_max_tokens_with_ceiling(
                 None,
                 "max_tokens",
                 request.max_tokens,
                 "max_tokens",
                 spec,
                 summary.token_ids.len(),
-                max_seq_len(),
+                state.max_seq_len(),
+                state.max_output_tokens(),
             )?
         };
         for choice in 0..n {
@@ -3593,6 +3634,7 @@ async fn responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    refuse_untokenized_route(&state, "/v1/responses")?;
     let value = parse_json(&body)?;
     let spec = resolve_reasoning(&value)?;
     let image_carrier = find_image_carrier(&value);
@@ -3622,14 +3664,15 @@ async fn responses(
     let created = state.now_unix();
     let trace_id = trace_request_id(&headers, &response_id);
     let prompt_tokens = summary.token_ids.len();
-    let max_tokens = resolve_max_tokens(
+    let max_tokens = resolve_max_tokens_with_ceiling(
         None,
         "max_output_tokens",
         request.max_output_tokens,
         "max_output_tokens",
         spec,
         prompt_tokens,
-        max_seq_len(),
+        state.max_seq_len(),
+        state.max_output_tokens(),
     )?;
     let engine_request = RequestBuilder {
         id: response_id.clone(),
@@ -3707,6 +3750,7 @@ async fn messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    refuse_untokenized_route(&state, "/v1/messages")?;
     let value = parse_json(&body)?;
     let spec = resolve_reasoning(&value)?;
     let image_carrier = find_image_carrier(&value);
@@ -3733,14 +3777,15 @@ async fn messages(
     let id = state.next_id("msg_dsv41_");
     let trace_id = trace_request_id(&headers, &id);
     let prompt_tokens = summary.token_ids.len();
-    let max_tokens = resolve_max_tokens_for_messages(
+    let max_tokens = resolve_max_tokens_for_messages_with_ceiling(
         None,
         "max_tokens",
         request.max_tokens,
         "max_tokens",
         spec,
         prompt_tokens,
-        max_seq_len(),
+        state.max_seq_len(),
+        state.max_output_tokens(),
     )?;
     let engine_request = RequestBuilder {
         id: id.clone(),
@@ -3892,6 +3937,22 @@ fn model_card(state: &AppState, created: u64) -> Value {
     // vision tower loaded, the same fact that decides whether the chat route prepares an image or
     // refuses it (DECISIONS.md D59).
     let capabilities = state.engine.capabilities();
+    // /v1/responses and /v1/messages answer 501 while the tokenizer is attached
+    // (`refuse_untokenized_route`), so they are listed only where they serve.
+    let mut endpoints = vec!["/v1/chat/completions", "/v1/completions"];
+    if state.tokenizer().is_none() {
+        endpoints.extend(["/v1/responses", "/v1/messages"]);
+    }
+    endpoints.extend([
+        "/v1/models/{model}",
+        "/tokenize",
+        "/detokenize",
+        "/v1/cluster/stats",
+        "/v1/admin/trace",
+        "/health",
+        "/readyz",
+        "/metrics",
+    ]);
     let mut advertised = json!({
         "streaming": true,
         "tools": capabilities.tools,
@@ -3900,20 +3961,7 @@ fn model_card(state: &AppState, created: u64) -> Value {
         "image_url": capabilities.vision,
         "thinking": capabilities.thinking,
         "chat_template_kwargs": if capabilities.thinking { json!(["thinking"]) } else { json!([]) },
-        "endpoints": [
-            "/v1/chat/completions",
-            "/v1/completions",
-            "/v1/responses",
-            "/v1/messages",
-            "/v1/models/{model}",
-            "/tokenize",
-            "/detokenize",
-            "/v1/cluster/stats",
-            "/v1/admin/trace",
-            "/health",
-            "/readyz",
-            "/metrics",
-        ],
+        "endpoints": endpoints,
     });
     if capabilities.reasoning_effort {
         advertised["reasoning_effort"] = json!({
@@ -3934,10 +3982,10 @@ fn model_card(state: &AppState, created: u64) -> Value {
         // card carries them beside this server's own context_length/max_output_tokens names.
         "root": state.model_id(),
         "parent": Value::Null,
-        "max_model_len": max_seq_len(),
+        "max_model_len": state.max_seq_len(),
         "permission": json!([]),
-        "context_length": max_seq_len(),
-        "max_output_tokens": MODEL_MAX_OUTPUT_TOKENS,
+        "context_length": state.max_seq_len(),
+        "max_output_tokens": state.max_output_tokens(),
         "fabric_mode": state.engine.cluster_stats().fabric_mode,
         "capabilities": advertised,
     })
@@ -3952,7 +4000,7 @@ async fn cluster_stats(State(state): State<AppState>) -> Response {
 /// `sparkflash serve` always attaches one; the weight-free router tests (and the synthetic tiny
 /// plan's decode path) do not, so the route has to say that instead of answering from the
 /// Milestone 1 placeholder estimate, which would report ids that are not the checkpoint's.
-fn require_tokenizer(state: &AppState) -> Result<Arc<crate::encoding::TokenizerSeam>, ApiError> {
+fn require_tokenizer(state: &AppState) -> Result<Arc<dyn PromptCodec>, ApiError> {
     state.tokenizer().cloned().ok_or_else(|| {
         ApiError::service_unavailable(
             "this server was started without a tokenizer, so it cannot report checkpoint token ids;              start `sparkflash serve` with a tokenizer attached (the default is              reference/tokenizer.json)",
@@ -3985,7 +4033,7 @@ async fn tokenize(State(state): State<AppState>, body: Bytes) -> Result<Response
     {
         // The chat form tokenizes the rendered V4.1 template, so the ids are what
         // /v1/chat/completions would prefill.
-        seam.encode_chat(&value).map_err(tokenizer_seam_error)?
+        seam.encode_chat(&value).map_err(prompt_codec_error)?
     } else if let Some(prompt) = value.get("prompt").filter(|prompt| !prompt.is_null()) {
         let text = prompt.as_str().ok_or_else(|| {
             ApiError::invalid_request(
@@ -3994,8 +4042,8 @@ async fn tokenize(State(state): State<AppState>, body: Bytes) -> Result<Response
                 Some("invalid_prompt".to_owned()),
             )
         })?;
-        seam.encode_text_with(text, add_special_tokens)
-            .map_err(tokenizer_seam_error)?
+        seam.encode_text(text, add_special_tokens)
+            .map_err(prompt_codec_error)?
     } else {
         return Err(ApiError::invalid_request(
             "the request must carry `prompt` (a string) or `messages` (an array)",
@@ -4012,7 +4060,7 @@ async fn tokenize(State(state): State<AppState>, body: Bytes) -> Result<Response
     });
     Ok(Json(json!({
         "count": count,
-        "max_model_len": max_seq_len(),
+        "max_model_len": state.max_seq_len(),
         "tokens": tokens,
         "token_strs": token_strs,
     }))

@@ -385,7 +385,7 @@ fn run_checked(args: &[&str]) -> Result<ExitCode, String> {
                 .tokenizer
                 .as_deref()
                 .ok_or("--prompt needs --tokenizer PATH")?;
-            let encoder = sparkflash_api::encoding::load_hf_tokenizer(path)
+            let encoder = sparkflash_model_deepseek_v41::encoding::load_hf_tokenizer(path)
                 .map_err(|error| format!("tokenizer: {error}"))?;
             encoder
                 .tokenizer()
@@ -3451,7 +3451,7 @@ fn run_rank_with_transport(
     }
     let completion_text = match &input.tokenizer {
         Some(path) => {
-            let encoder = sparkflash_api::encoding::load_hf_tokenizer(path)
+            let encoder = sparkflash_model_deepseek_v41::encoding::load_hf_tokenizer(path)
                 .map_err(|error| format!("tokenizer: {error}"))?;
             encoder.tokenizer().decode(&generated, false).ok()
         }

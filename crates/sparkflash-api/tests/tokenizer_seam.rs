@@ -13,12 +13,12 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt as _;
 use serde_json::{Value, json};
-use sparkflash_api::encoding::{
-    CaseError, TokenizerSeam, TokenizerSeamError, reference_tokenizer_path,
-};
 use sparkflash_api::engine::{Capabilities, ClusterStatsSnapshot, MockEngine};
 use sparkflash_api::server::router;
 use sparkflash_api::state::AppState;
+use sparkflash_model_deepseek_v41::encoding::{
+    CaseError, TokenizerSeam, TokenizerSeamError, reference_tokenizer_path,
+};
 use tower::ServiceExt as _;
 
 const MODEL: &str = "deepseek-ai/DeepSeek-V4.1-Flash";

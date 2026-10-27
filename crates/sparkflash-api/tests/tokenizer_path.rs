@@ -5,7 +5,9 @@
 use std::fs;
 use std::path::Path;
 
-use sparkflash_api::encoding::{reference_tokenizer_path, resolve_reference_tokenizer};
+use sparkflash_model_deepseek_v41::encoding::{
+    reference_tokenizer_path, resolve_reference_tokenizer,
+};
 
 /// Puts the vendored relative path under `root` so the resolver sees a staged file.
 fn stage(root: &Path) -> std::path::PathBuf {

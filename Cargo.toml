@@ -1,7 +1,11 @@
 [workspace]
 members = [
     "crates/sparkflash-trace",
+    "crates/sparkflash-model",
+    "crates/sparkflash-model-deepseek-v41",
+    "crates/sparkflash-weights",
     "crates/sparkflash-api",
+    "crates/sparkflash-serve",
     "crates/sparkflash-scheduler",
     "crates/sparkflash-kv",
     "crates/sparkflash-engram",
@@ -24,7 +28,11 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 sparkflash-trace = { path = "crates/sparkflash-trace" }
+sparkflash-model = { path = "crates/sparkflash-model" }
+sparkflash-model-deepseek-v41 = { path = "crates/sparkflash-model-deepseek-v41" }
+sparkflash-weights = { path = "crates/sparkflash-weights" }
 sparkflash-api = { path = "crates/sparkflash-api" }
+sparkflash-serve = { path = "crates/sparkflash-serve" }
 sparkflash-scheduler = { path = "crates/sparkflash-scheduler" }
 sparkflash-kv = { path = "crates/sparkflash-kv" }
 sparkflash-engram = { path = "crates/sparkflash-engram" }

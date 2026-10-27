@@ -114,9 +114,6 @@ use sparkflash_api::device_chain::{ClaimMode, DeviceChainEnvelope};
 use sparkflash_api::device_token::{
     DeviceChainTokenSource, DeviceTokenSource, LiveWindowTokenSource, TokenPieceDecoder,
 };
-use sparkflash_api::encoding::{
-    HfTokenizerEncoder, TokenizerSeam, load_hf_tokenizer, resolve_reference_tokenizer,
-};
 use sparkflash_api::engine::InferenceEngine as ApiInferenceEngine;
 use sparkflash_api::engine::{
     Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason, LogprobSelection,
@@ -148,6 +145,9 @@ use sparkflash_engram::packer::{MANIFEST_NAME, PackManifest};
 use sparkflash_engram::paged::{EngramTensor, PagedTable};
 use sparkflash_engram::store::{BackendPreference, DirectTable, RowTable, specs_from_manifest};
 use sparkflash_kv::PrefixMatchPlan;
+use sparkflash_model_deepseek_v41::encoding::{
+    HfTokenizerEncoder, TokenizerSeam, load_hf_tokenizer, resolve_reference_tokenizer,
+};
 use sparkflash_scheduler::config::SchedulerConfig;
 use sparkflash_scheduler::prefill::ChunkedPrefillPlan;
 
@@ -5121,6 +5121,7 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
     let metrics = driver.metrics();
     let state = AppState::new(Arc::new(driver))
         .with_metrics(metrics)
+        .with_model_descriptor(Arc::new(sparkflash_model::default_model().clone()))
         .with_max_logprobs(options.max_logprobs)
         .with_tokenizer(seam)
         .with_api_key(options.api_key.clone())
@@ -5311,6 +5312,7 @@ fn serve_with_engine(
     };
     let state = AppState::new(engine)
         .with_metrics(metrics)
+        .with_model_descriptor(Arc::new(sparkflash_model::default_model().clone()))
         .with_max_logprobs(options.max_logprobs)
         .with_tokenizer(seam)
         .with_api_key(options.api_key.clone())
@@ -7137,7 +7139,7 @@ mod tests {
     use sparkflash_engine::loader::Treatment;
 
     use super::*;
-    use sparkflash_api::encoding::reference_tokenizer_path;
+    use sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path;
 
     /// A driver over the synthetic tiny plan: the path every behavioural test takes.
     ///
@@ -9244,11 +9246,11 @@ mod engram_packed_store {
 
     use std::sync::atomic::AtomicU64;
 
-    use sparkflash_api::encoding::reference_tokenizer_path;
     use sparkflash_engine::forward::SequenceState;
     use sparkflash_engram::layout::{ENGRAM_HEAD_DIM, ENGRAM_ROW_BYTES};
     use sparkflash_engram::packer::align_up;
     use sparkflash_engram::store::{TableSpec, TailFill};
+    use sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path;
 
     use super::*;
 
@@ -9767,8 +9769,9 @@ mod tp4_serve_tests {
     fn the_prompt_logprob_request_frame_carries_the_selection_and_the_events_lead_with_the_payload()
     {
         let prompt = vec![100u32, 200, 300, 400];
-        let tokenizer = load_hf_tokenizer(&sparkflash_api::encoding::reference_tokenizer_path())
-            .expect("tokenizer");
+        let tokenizer =
+            load_hf_tokenizer(&sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path())
+                .expect("tokenizer");
         // Bind a free loopback port, release it, and let the hub take it: the hub does not expose
         // its bound address, and the race window is a test-only detail.
         let probe = TcpListener::bind("127.0.0.1:0").expect("probe listener");
@@ -10105,7 +10108,7 @@ mod tp4_serve_tests {
 #[cfg(test)]
 mod device_token_serve_tests {
     use super::*;
-    use sparkflash_api::encoding::reference_tokenizer_path;
+    use sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path;
 
     #[test]
     fn device_token_flags_parse_and_require_each_other() {

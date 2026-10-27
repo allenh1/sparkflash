@@ -21,13 +21,18 @@ use crate::layer_device::DeviceSpan;
 use sparkflash_kernels::cuda_driver::{Kernel, Module};
 use sparkflash_kernels::mxfp8_gemv_launch::{OptArgs, OptKind, launch_opt, launch_opt_split};
 
-/// The widest verify step. The t8 GEMV takes the rows eight to a block, the router and the Engram
-/// wkv eight to a weight pass, and the head all sixteen in one launch ([HEAD_ROWS]); every row's
-/// arithmetic is the single-row kernel's.
-pub(super) const R_MAX: usize = 16;
+/// The widest verify step. The t8 GEMV takes the rows eight to a block, the router eight to a block
+/// row, the Engram wkv eight to a weight pass, the head four to a block ([HEAD_ROWS]) and the MoE
+/// dedup plan all their 384 routed rows; every row's arithmetic is the single-row kernel's. Several
+/// sequences' steps fill it: the more rows a step holds, the more of them share the experts they
+/// read, and the step's fixed part (the dense weights, the head, the collectives) is spread over
+/// more of them.
+pub(super) const R_MAX: usize = 64;
+// The Engram post takes a step's live rows as one 64-bit launch word.
+const _: () = assert!(R_MAX <= 64);
 
-/// The rows one opt_rows_lm_head launch serves (its OR_LM_MAXR).
-const HEAD_ROWS: usize = 16;
+/// The rows one opt_rows_lm_head block serves (its OR_LM_ROWS, staged in shared memory).
+const HEAD_ROWS: usize = 4;
 
 /// [launch_opt] with up to `gemv_rows` tokens kept on the t8 GEMV (each token's bits the
 /// single-row kernel's); more are a bulk chunk, for the tensor-core GEMMs.
@@ -46,6 +51,9 @@ pub(super) fn launch_opt_rows(
 
 /// The mix table's coefficient rows (pre 4, post 4, comb 16).
 const MIX_ROWS: usize = 24;
+/// Steps of more rows than this take the staged Engram wkv kernel (at 8 rows or fewer the plain
+/// kernel is already at the weight stream's DRAM rate and the staging only costs).
+const ENGRAM_STAGED_FROM: usize = 8;
 /// opt_rows_mhc_seam's per-row scratch: 80 blocks x 32 partial words.
 const SEAM_PARTIAL_FLOATS: usize = 80 * 32;
 /// The transport sequence range the rows head's argmax gather uses.
@@ -90,10 +98,25 @@ pub(super) struct RowsKernels {
     pub(super) embed_own: Kernel,
     embed_stream: Kernel,
     embed_table: Kernel,
+    /// opt_rows_engram_wkv (8 outputs a block), and opt_rows_engram_wkv_s (16 a block, activations
+    /// staged in shared memory) for steps of more than ENGRAM_STAGED_FROM rows; None in an older
+    /// cubin or with SPARKFLASH_ENGRAM_STAGED=0. Both give the same bits.
     engram_wkv: Kernel,
+    engram_wkv_staged: Option<Kernel>,
+    /// opt_bulk_engram_embed and opt_rows_engram_post (opt_misc): the rows' Engram entries
+    /// re-quantised, and the narrow, gate, widen and write of every live row, each in one launch
+    /// and bit-identical to the single-row launches.
+    engram_embed: Kernel,
+    engram_post: Kernel,
     pub(super) rank_permute: Kernel,
     /// opt_rows_hostw_{bf16w, bf16w_f32o, f32w_f32o}, by hostw_gemv_launch::Mode.
     hostw: [Kernel; 3],
+    /// opt_rows_hostw_{bf16w, f32w}_f32o_ring: the compressor's projections of every lane's rows
+    /// into their rings in one launch each (none in an older cubin, or SPARKFLASH_ROWS_RING=0).
+    hostw_ring: Option<[Kernel; 2]>,
+    /// A step's completed compressor groups, every lane's at once (none in an older cubin, or
+    /// SPARKFLASH_ROWS_GROUPS=0).
+    groups: Option<GroupKernels>,
     prefetch_l2: Kernel,
     /// opt_rows_prologue_bf16 and opt_rows_shared_swiglu: layer_seams' activation quantiser and
     /// shared-expert SwiGLU with the PDL entry ([RowsState::quantise_bf16], [RowsState::swiglu]).
@@ -102,6 +125,25 @@ pub(super) struct RowsKernels {
     /// opt_rows_hc_pre_collapse: hc_pre_collapse_bf16 over a grid of rows in one launch.
     pub(super) hc_collapse: Kernel,
 }
+
+/// opt_misc's kernels for a rows step's completed compressor groups ([DeviceLayer::rows_groups]).
+#[derive(Clone, Copy)]
+pub(super) struct GroupKernels {
+    /// opt_rows_group_pool: the groups' softmax pools from their lanes' rings.
+    pool: Kernel,
+    /// opt_k_norm_rows: the index keys' norm, a thread a group.
+    k_norm: Kernel,
+    /// opt_rows_group_keys: the keys' FP4 round trip into their lanes' key rows.
+    keys: Kernel,
+    /// opt_rows_group_append: the roped latents into their lanes' compressed stores.
+    append: Kernel,
+}
+
+/// The compressor ratios a step's group tables cover (the model's distinct ratios above one).
+const GROUP_SLOTS: usize = 2;
+
+/// The byte offset of the group tables in the row table buffer: after the rows and the pieces.
+const GROUP_TAB_AT: usize = R_MAX * 16 + R_MAX * 8;
 
 /// The per-row device buffers, each `[R_MAX][natural width]`.
 #[derive(Clone, Copy)]
@@ -174,8 +216,17 @@ pub(super) struct RowsBuffers {
     /// `[R_MAX]` u32: a prompt chunk's token ids, for the device embedding gather.
     pub(super) row_ids: u64,
     /// `[R_MAX][2]` u64: a step over several lanes' rows, row r's lane offset and position
-    /// ([DeviceLayer::upload_row_table]).
+    /// ([DeviceLayer::upload_row_table]), then `[R_MAX][2]` u32: the select's pieces
+    /// ([select_pieces]), then GROUP_SLOTS `[R_MAX][2]` u64 group tables: a completed compressor
+    /// group's lane offset and first position, per ratio.
     row_tab: u64,
+    /// A step's completed compressor groups, `[R_MAX]` of each: the pooled (later the roped and
+    /// widened) latent f32, the narrowed and the normed latent bf16, the index key f32 and bf16.
+    group_f32: u64,
+    group_bf16: u64,
+    group_normed: u64,
+    group_key_f32: u64,
+    group_key_bf16: u64,
     /// The head's raw logits `[R_MAX][vocab slice]` f32, for the truncated sampler.
     logits: u64,
     /// `[GATHER_WORLD][R_MAX][TOPC_WORDS]` u32: each rank's opt_rows_topc slots, exchanged in place.
@@ -204,6 +255,8 @@ pub(super) struct RowsState {
     post_pending: Cell<Option<usize>>,
     /// The segments whose row table `b.row_tab` holds (empty: none).
     row_tab_for: std::cell::RefCell<Vec<super::lanes::Seg>>,
+    /// The ratio of each group table the row table holds (0: none).
+    group_ratios: Cell<[usize; GROUP_SLOTS]>,
     /// The DSpark tap capture (spec mode): opt_draft_taps, the `[R_MAX][3][dim]` f32 tap buffer,
     /// and the target layers in tap order. Before each target layer the rows' streams are
     /// hc-averaged into their tap slot.
@@ -337,16 +390,47 @@ impl RowsState {
         let embed_stream = load("opt_rows_embed_stream")?;
         let embed_table = load("opt_rows_embed_table")?;
         let engram_wkv = load("opt_rows_engram_wkv")?;
+        let engram_wkv_staged = match std::env::var("SPARKFLASH_ENGRAM_STAGED").as_deref() {
+            Ok("0") => None,
+            _ => load("opt_rows_engram_wkv_s").ok(),
+        };
         let rank_permute = load("opt_rows_rank_permute")?;
         let hostw = [
             load("opt_rows_hostw_bf16w")?,
             load("opt_rows_hostw_bf16w_f32o")?,
             load("opt_rows_hostw_f32w_f32o")?,
         ];
+        let hostw_ring = match std::env::var("SPARKFLASH_ROWS_RING").as_deref() {
+            Ok("0") => None,
+            _ => load("opt_rows_hostw_bf16w_f32o_ring")
+                .and_then(|bf16| Ok([bf16, load("opt_rows_hostw_f32w_f32o_ring")?]))
+                .ok(),
+        };
         let prefetch_l2 = load("opt_rows_prefetch_l2")?;
         let prologue = load("opt_rows_prologue_bf16")?;
         let swiglu = load("opt_rows_shared_swiglu")?;
         let hc_collapse = load("opt_rows_hc_pre_collapse")?;
+        let (misc, _sha) = cached_cubin(&kernel_dir.join("opt_misc_sm121.cubin"))
+            .map_err(|error| format!("rows: {error}"))?;
+        let mut load_misc = |name: &'static str| -> Result<Kernel, String> {
+            let (module, kernel) = cuda.load_named(&misc, name)?;
+            modules.push(module);
+            Ok(kernel)
+        };
+        let engram_embed = load_misc("opt_bulk_engram_embed")?;
+        let engram_post = load_misc("opt_rows_engram_post")?;
+        let groups = match std::env::var("SPARKFLASH_ROWS_GROUPS").as_deref() {
+            Ok("0") => None,
+            _ => (|| {
+                Ok::<_, String>(GroupKernels {
+                    pool: load_misc("opt_rows_group_pool")?,
+                    k_norm: load_misc("opt_k_norm_rows")?,
+                    keys: load_misc("opt_rows_group_keys")?,
+                    append: load_misc("opt_rows_group_append")?,
+                })
+            })()
+            .ok(),
+        };
         let kernels = RowsKernels {
             _modules: modules,
             seam,
@@ -365,8 +449,13 @@ impl RowsState {
             embed_stream,
             embed_table,
             engram_wkv,
+            engram_wkv_staged,
+            engram_embed,
+            engram_post,
             rank_permute,
             hostw,
+            hostw_ring,
+            groups,
             prefetch_l2,
             prologue,
             swiglu,
@@ -394,6 +483,7 @@ impl RowsState {
         let chunks = crate::tp4_tail::CHUNKS_PER_RANK;
         let index_heads = device.index_n_heads;
         let index_cols = index_heads * device.index_head_dim;
+        let head_width = device.head_width as usize;
         let r = cap.max(R_MAX);
         // The drafter runs several sequences' blocks through the row buffers at once: they hold
         // that many rows even where a step holds R_MAX.
@@ -486,7 +576,12 @@ impl RowsState {
             argmax_gather: alloc(GATHER_WORLD * R_MAX * 8)?,
             lm_picks: alloc(R_MAX * 8)?,
             row_ids: alloc(r * 4)?,
-            row_tab: alloc(R_MAX * 16)?,
+            row_tab: alloc(GROUP_TAB_AT + GROUP_SLOTS * R_MAX * 16)?,
+            group_f32: alloc(R_MAX * head_width * 4)?,
+            group_bf16: alloc(R_MAX * head_width * 2)?,
+            group_normed: alloc(R_MAX * head_width * 2)?,
+            group_key_f32: alloc(R_MAX * device.index_head_dim * 4)?,
+            group_key_bf16: alloc(R_MAX * device.index_head_dim * 2)?,
             logits: alloc(R_MAX * crate::tp4_tail::VOCAB_PER_RANK * 4)?,
             topc_gather: alloc(GATHER_WORLD * R_MAX * super::sample::TOPC_WORDS * 4)?,
             embed_gather: alloc(GATHER_WORLD * r * dim * 2)?,
@@ -508,6 +603,7 @@ impl RowsState {
             gathers: Cell::new(0),
             post_pending: Cell::new(None),
             row_tab_for: std::cell::RefCell::new(Vec::new()),
+            group_ratios: Cell::new([0; GROUP_SLOTS]),
             taps: None,
             // A bulk chunk's stages read far more than the L2 holds, so it prefetches nothing.
             side: match std::env::var("SPARKFLASH_L2_PREFETCH").as_deref() {
@@ -599,6 +695,16 @@ impl RowsState {
 
 /// The selected list's row stride in u32 ids (`workspace.selected` is 2,048 B).
 const SELECTED_STRIDE: usize = 512;
+
+/// The pieces opt_select_scores_segs scores a step's segments in: each segment's rows in runs of
+/// at most SELECT_SEG_ROWS, as (first step row, rows). At most R_MAX of them.
+fn select_pieces(segs: &[super::lanes::Seg]) -> impl Iterator<Item = (usize, usize)> + '_ {
+    segs.iter().flat_map(|seg| {
+        (0..seg.n)
+            .step_by(SELECT_SEG_ROWS)
+            .map(move |at| (seg.row0 + at, SELECT_SEG_ROWS.min(seg.n - at)))
+    })
+}
 
 /// The split attention's heads a rank and slots a row (OR_A3_HEADS, OR_A_MAX_ATTENDED), and the
 /// slots a scores block takes (OR_A3_CHUNK).
@@ -1207,13 +1313,14 @@ impl DeviceLayer<'_> {
             let b = state.b;
             let way = state.moe_way.map_or(0, |way| way.way);
             device.set_addend(b.shared_out);
+            // Only the bf16 sums go on (to the reduce): no f32 copy.
             device.combine_bulk(
                 self.cuda,
                 &bulk.moe,
                 way * share.stride,
                 n,
                 b.moe_ids,
-                b.delta_f32,
+                0,
                 b.delta_bf16,
             )?;
         }
@@ -1809,8 +1916,9 @@ impl DeviceLayer<'_> {
         )
     }
 
-    /// The Engram write per row: the gather per row, one batched wkv over the rows, then the gate
-    /// and the stream write per row (the M = 1 launches over the row's buffers).
+    /// The Engram write of the rows: their entries re-quantised, one batched wkv, then the gate
+    /// and the stream write of every live row, each a launch over all the rows whose rows are
+    /// bit-identical to the M = 1 launches.
     fn rows_engram(
         &mut self,
         rows: &RowsState,
@@ -1819,12 +1927,6 @@ impl DeviceLayer<'_> {
         n: usize,
         (first, count): (usize, usize),
     ) -> Result<(), String> {
-        use sparkflash_kernels::{
-            engram_convert_launch::{self, EngramConvertParams, EngramConvertSpans},
-            engram_embed_launch::{self, EngramEmbedLaunchParams},
-            engram_gate_write_launch::{self, EngramGateWriteLaunchParams},
-            engram_write_launch::{self, EngramWriteParams, EngramWriteSpans},
-        };
         if !self.engram_rows.contains(&layer) {
             return Ok(());
         }
@@ -1844,41 +1946,30 @@ impl DeviceLayer<'_> {
         if !live.iter().any(|&on| on) {
             return Ok(());
         }
+        if engram.hc_mult > 4 || !engram.dim.is_multiple_of(2) {
+            return Err("rows engram: the post takes hc <= 4 copies of an even width".into());
+        }
         if let Some(bulk) = rows.bulk.as_ref().filter(|_| n > R_MAX) {
-            if engram.hc_mult > 4 || !engram.dim.is_multiple_of(2) {
-                return Err(
-                    "rows engram: the bulk post takes hc <= 4 copies of an even width".into(),
-                );
-            }
             return self.bulk_engram(rows, bulk, slot, &live[first..first + count], p0, first);
         }
         let b = rows.b;
         let layout = engram.layout;
         let align = crate::engram_device_state::ARENA_ALIGN;
-        let (hc, dim) = (engram.hc_mult, engram.dim);
-        let layer_id = layer as u32;
-        for row in 0..n {
-            let entry = slot * engram.positions + base + row;
-            let base = engram.arena.0 + (entry * layout.stride()) as u64;
-            engram_embed_launch::launch(
-                self.cuda,
-                engram.kernels.embed,
-                &EngramEmbedLaunchParams {
-                    row_codes: Deviceptr(base),
-                    row_scales: Deviceptr(
-                        base + (layout.codes_len().div_ceil(align) * align) as u64,
-                    ),
-                    fetched: engram.fetched,
-                    act_codes: Deviceptr(b.engram_codes + (row * engram.inner) as u64),
-                    act_scales: Deviceptr(b.engram_scales + (row * engram.inner / 32) as u64),
-                    rows_cols: layout.columns() as u32,
-                    head_dim: layout.head_dim() as u32,
-                    trace_ring: 0,
-                    layer_id,
-                    step_seq: (p0 + row) as u64,
-                },
-            )?;
-        }
+        let stride = layout.stride();
+        // The rows' entries are consecutive in the arena.
+        self.cuda.launch(
+            rows.kernels.engram_embed,
+            (n as u32, 1, 1),
+            (256, 1, 1),
+            &[
+                engram.arena.0 + ((slot * engram.positions + base) * stride) as u64,
+                stride as u64,
+                (layout.codes_len().div_ceil(align) * align) as u64,
+                b.engram_codes,
+                b.engram_scales,
+                engram.inner as u64,
+            ],
+        )?;
         self.rows_engram_wkv(
             rows,
             engram.wkv_weight[slot].0,
@@ -1887,80 +1978,27 @@ impl DeviceLayer<'_> {
             engram.inner,
             n,
         )?;
-        let stream_bytes = hc * dim * 4;
-        for (row, &on) in live.iter().enumerate() {
-            if !on {
-                continue;
-            }
-            let stream = b.stream + (row * stream_bytes) as u64;
-            let kv = b.engram_kv + (row * engram.out_width * 2) as u64;
-            let step_seq = (p0 + row) as u64;
-            engram_convert_launch::launch_narrow(
-                self.cuda,
-                engram.kernels.narrow,
-                &EngramConvertParams {
-                    src: Deviceptr(stream),
-                    dst: engram.hs_bf16,
-                    count: (hc * dim) as u32,
-                },
-                &EngramConvertSpans {
-                    src_bytes: stream_bytes,
-                    dst_bytes: hc * dim * 2,
-                },
-            )?;
-            engram_gate_write_launch::launch(
-                self.cuda,
-                engram.kernels.gate,
-                &EngramGateWriteLaunchParams {
-                    kv: Deviceptr(kv),
-                    stream: engram.hs_bf16,
-                    product: engram.product[slot],
-                    out: engram.hs_bf16,
-                    gates: engram.gates,
-                    dim: dim as u32,
-                    hc: hc as u32,
-                    eps: engram.eps,
-                    trace_ring: 0,
-                    layer_id,
-                    step_seq,
-                },
-            )?;
-            engram_convert_launch::launch_widen(
-                self.cuda,
-                engram.kernels.widen,
-                &EngramConvertParams {
-                    src: Deviceptr(kv + (hc * dim * 2) as u64),
-                    dst: engram.value_f32,
-                    count: dim as u32,
-                },
-                &EngramConvertSpans {
-                    src_bytes: dim * 2,
-                    dst_bytes: dim * 4,
-                },
-            )?;
-            engram_write_launch::launch(
-                self.cuda,
-                engram.kernels.write,
-                &EngramWriteParams {
-                    stream: Deviceptr(stream),
-                    gate: engram.gates,
-                    value: engram.value_f32,
-                    stream_out: Deviceptr(stream),
-                    dim: dim as u32,
-                    copies: hc as u32,
-                    trace_ring: 0,
-                    layer_id,
-                    step_seq,
-                },
-                &EngramWriteSpans {
-                    stream_bytes,
-                    gate_bytes: hc * 4,
-                    value_bytes: dim * 4,
-                    stream_out_bytes: stream_bytes,
-                },
-            )?;
-        }
-        Ok(())
+        // The live flags go as launch words (R_MAX <= 64), so the next step's cannot overwrite
+        // them while this launch is queued.
+        let live_bits = live
+            .iter()
+            .enumerate()
+            .fold(0u64, |bits, (row, &on)| bits | (u64::from(on) << row));
+        self.cuda.launch(
+            rows.kernels.engram_post,
+            (n as u32, 1, 1),
+            (256, 1, 1),
+            &[
+                b.stream,
+                b.engram_kv,
+                engram.product[slot].0,
+                live_bits,
+                engram.dim as u64,
+                engram.hc_mult as u64,
+                u64::from(engram.eps.to_bits()),
+                engram.out_width as u64,
+            ],
+        )
     }
 
     /// The Engram wkv of the rows into `engram_kv` (`[rows][out_width]` bf16). With the one-shot
@@ -1977,9 +2015,13 @@ impl DeviceLayer<'_> {
     ) -> Result<(), String> {
         let b = rows.b;
         let wkv = |row_base: usize, row_end: usize, out: u64, stride: usize| {
+            let (kernel, per_block) = match rows.kernels.engram_wkv_staged {
+                Some(staged) if n > ENGRAM_STAGED_FROM => (staged, 16),
+                _ => (rows.kernels.engram_wkv, 8),
+            };
             self.cuda.launch(
-                rows.kernels.engram_wkv,
-                (((row_end - row_base) as u32).div_ceil(8), 1, 1),
+                kernel,
+                (((row_end - row_base) as u32).div_ceil(per_block), 1, 1),
                 (256, 1, 1),
                 &[
                     b.engram_codes,
@@ -2054,6 +2096,7 @@ impl DeviceLayer<'_> {
     ) -> Result<(), String> {
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         rows.row_tab_for.borrow_mut().clear();
+        rows.group_ratios.set([0; GROUP_SLOTS]);
         let off = *OFF.get_or_init(|| std::env::var("SPARKFLASH_ROW_TABLE").as_deref() == Ok("0"));
         let Some(lanes) = self.lanes.as_ref() else {
             return Ok(());
@@ -2063,14 +2106,23 @@ impl DeviceLayer<'_> {
         }
         let first = lanes.pointers(segs[0].lane);
         let mut words = Vec::with_capacity(2 * R_MAX);
+        let mut offsets = Vec::with_capacity(segs.len());
         for seg in segs {
             let lane = lanes.pointers(seg.lane);
             let offset = lane.kv_ring.wrapping_sub(first.kv_ring);
-            if lane.store_codes.wrapping_sub(first.store_codes) != offset
-                || lane.store_scales.wrapping_sub(first.store_scales) != offset
+            if [
+                (lane.wkv, first.wkv),
+                (lane.wgate, first.wgate),
+                (lane.store_codes, first.store_codes),
+                (lane.store_scales, first.store_scales),
+                (lane.index_keys, first.index_keys),
+            ]
+            .iter()
+            .any(|&(at, base)| at.wrapping_sub(base) != offset)
             {
                 return Ok(());
             }
+            offsets.push(offset);
             for row in 0..seg.n {
                 words.push(offset);
                 words.push((seg.p0 + row) as u64);
@@ -2079,15 +2131,63 @@ impl DeviceLayer<'_> {
         if words.len() > 2 * R_MAX {
             return Ok(());
         }
-        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        words.resize(2 * R_MAX, 0);
+        let mut bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        // The select's pieces after the rows (one copy for all).
+        for (row0, count) in select_pieces(segs) {
+            bytes.extend_from_slice(&(row0 as u32).to_le_bytes());
+            bytes.extend_from_slice(&(count as u32).to_le_bytes());
+        }
+        // Then each compressor ratio's completed groups, segment by segment.
+        bytes.resize(GROUP_TAB_AT, 0);
+        let mut ratios = [0; GROUP_SLOTS];
+        for (slot, ratio) in self.group_ratios().into_iter().enumerate() {
+            ratios[slot] = ratio;
+            let mut groups = 0;
+            for (seg, &offset) in segs.iter().zip(&offsets) {
+                for group in seg.p0 / ratio..(seg.p0 + seg.n) / ratio {
+                    bytes.extend_from_slice(&offset.to_le_bytes());
+                    bytes.extend_from_slice(&((group * ratio) as u64).to_le_bytes());
+                    groups += 1;
+                }
+            }
+            bytes.resize(bytes.len() + (R_MAX - groups) * 16, 0);
+        }
         self.cuda.copy_htod(&Deviceptr(rows.b.row_tab), &bytes)?;
         rows.row_tab_for.borrow_mut().extend_from_slice(segs);
+        rows.group_ratios.set(ratios);
         Ok(())
+    }
+
+    /// The model's distinct compressor ratios above one, the first GROUP_SLOTS ascending.
+    fn group_ratios(&self) -> Vec<usize> {
+        let mut ratios: Vec<usize> = self
+            .compress_ratio
+            .iter()
+            .copied()
+            .filter(|&ratio| ratio > 1)
+            .collect();
+        ratios.sort_unstable();
+        ratios.dedup();
+        ratios.truncate(GROUP_SLOTS);
+        ratios
+    }
+
+    /// The group table of `ratio` when the row table is the step's ([Self::upload_row_table]).
+    fn group_table(
+        &self,
+        rows: &RowsState,
+        segs: &[super::lanes::Seg],
+        ratio: usize,
+    ) -> Option<u64> {
+        let table = self.row_table(rows, segs)?;
+        let slot = rows.group_ratios.get().iter().position(|&at| at == ratio)?;
+        Some(table + (GROUP_TAB_AT + slot * R_MAX * 16) as u64)
     }
 
     /// The row table when the step's rows are several lanes' and [Self::upload_row_table] wrote
     /// it for them.
-    fn row_table(&self, rows: &RowsState, segs: &[super::lanes::Seg]) -> Option<u64> {
+    pub(super) fn row_table(&self, rows: &RowsState, segs: &[super::lanes::Seg]) -> Option<u64> {
         (segs.len() > 1 && rows.row_tab_for.borrow().as_slice() == segs).then_some(rows.b.row_tab)
     }
 
@@ -2302,7 +2402,11 @@ impl DeviceLayer<'_> {
         let heads = self.index_n_heads;
         let index_cols = heads * self.index_head_dim;
         let segs = self.step_segs(p0, n);
+        // Every lane's completed compressor groups at once; reference_seam then skips its chain.
+        self.seam_groups_done = prepared && self.rows_groups(rows, layer, &segs)?;
         let batched = prepared && self.rows_select_batched(layer, &segs);
+        // With the row table the segments' selects run together after every row's seam.
+        let together = batched && self.rows_select_together(rows, layer, &segs);
         let mut outcome = Ok(());
         'segs: for seg in &segs {
             if let Err(error) = self.enter_seg(seg) {
@@ -2334,14 +2438,18 @@ impl DeviceLayer<'_> {
                     break 'segs;
                 }
             }
-            if batched {
+            if batched && !together {
                 outcome = self.rows_index_select(rows, layer, seg);
                 if outcome.is_err() {
                     break;
                 }
             }
         }
+        if together && outcome.is_ok() {
+            outcome = self.rows_index_select_together(rows, layer, &segs);
+        }
         self.seam_rows_prepared = false;
+        self.seam_groups_done = false;
         self.buffers = saved;
         if let (Some(ring), Some((mask, weights, query))) = (self.seam_ring.as_mut(), saved_scratch)
         {
@@ -2376,6 +2484,139 @@ impl DeviceLayer<'_> {
                 && seg.n * stride <= select.scores_floats
                 && seg.n * (reach + reach.div_ceil(4)) <= select.scratch_words
         })
+    }
+
+    /// Whether a batched select over several lanes' rows runs as one launch pair through the row
+    /// table ([Self::rows_index_select_together]): the table holds the step's rows, the cubin has
+    /// the table kernels, the indexer is the 32-head one and every row's scores and scratch fit at
+    /// the step's widest stride.
+    fn rows_select_together(
+        &self,
+        rows: &RowsState,
+        layer: usize,
+        segs: &[super::lanes::Seg],
+    ) -> bool {
+        let ratio = self.compress_ratio.get(layer).copied().unwrap_or(0);
+        let Some(select) = self.opt_select.as_ref() else {
+            return false;
+        };
+        if ratio == 0
+            || select.rows_tab.is_none()
+            || self.row_table(rows, segs).is_none()
+            || self.index_n_heads != SELECT_SEG_HEADS
+            || std::env::var("SPARKFLASH_SELECT_TOGETHER").as_deref() == Ok("0")
+        {
+            return false;
+        }
+        let n: usize = segs.iter().map(|seg| seg.n).sum();
+        let reach = segs
+            .iter()
+            .map(|seg| (seg.p0 + seg.n) / ratio)
+            .max()
+            .unwrap_or(0);
+        n * reach.next_multiple_of(4) <= select.scores_floats
+            && n * (reach + reach.div_ceil(4)) <= select.scratch_words
+    }
+
+    /// Every segment's index-source select in two launches: opt_select_scores_segs scores the
+    /// segments' rows in [select_pieces] (each piece opt_select_scores_seg's launch over its rows,
+    /// its keys its own lane's through the row table), then opt_select_rows_tab takes every row's
+    /// top-k at its position. The scores rows sit at the step's widest stride; each row's chain
+    /// is [Self::rows_index_select]'s.
+    fn rows_index_select_together(
+        &mut self,
+        rows: &RowsState,
+        layer: usize,
+        segs: &[super::lanes::Seg],
+    ) -> Result<(), String> {
+        let ratio = self.compress_ratio.get(layer).copied().unwrap_or(0);
+        let reach = segs
+            .iter()
+            .map(|seg| (seg.p0 + seg.n) / ratio.max(1))
+            .max()
+            .unwrap_or(0);
+        if reach == 0 {
+            return Ok(());
+        }
+        let first = segs.first().ok_or("rows select: no segments")?;
+        // The table's lane offsets are from the first segment's lane.
+        self.enter_seg(first)?;
+        let owner = self
+            .owner_index_for(layer)
+            .ok_or_else(|| format!("rows select: layer {layer} has no kv-source owner"))?;
+        let (Some(ring), Some(select)) = (self.seam_ring, self.opt_select.as_ref()) else {
+            return Err(Self::refusal("rows select"));
+        };
+        let (Some((scores_segs, select_rows)), Some(table)) =
+            (select.rows_tab, self.row_table(rows, segs))
+        else {
+            return Err(Self::refusal("rows select"));
+        };
+        let b = rows.b;
+        let n: usize = segs.iter().map(|seg| seg.n).sum();
+        let keys =
+            ring.index_keys.0 + (owner * self.max_positions * self.index_head_dim * 4) as u64;
+        let stride = reach.next_multiple_of(4);
+        let mask_mode = match layer.cmp(&self.candidate_source_layer) {
+            std::cmp::Ordering::Less => 0u64,
+            std::cmp::Ordering::Equal => 2,
+            std::cmp::Ordering::Greater => 1,
+        };
+        let cap = std::env::var("SPARKFLASH_SEG_BLOCKS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(SELECT_SEG_BLOCKS)
+            .max(1);
+        let pieces = select_pieces(segs).count();
+        self.cuda.launch(
+            scores_segs,
+            (
+                reach.div_ceil(SELECT_SEG_TILE).min(cap) as u32,
+                pieces as u32,
+                1,
+            ),
+            ((64 * SELECT_SEG_ROWS) as u32, 1, 1),
+            &[
+                b.idx_q_f32,
+                keys,
+                b.idx_weights_f32,
+                select.scores_out.0,
+                if mask_mode == 1 { b.masks } else { 0 },
+                table,
+                table + (R_MAX * 16) as u64,
+                ratio as u64,
+                stride as u64,
+                (rows.mask_bytes / 4) as u64,
+            ],
+        )?;
+        self.cuda.launch(
+            select_rows,
+            (n as u32, 1, 1),
+            (1024, 1, 1),
+            &[
+                select.scores_out.0,
+                table,
+                b.selected,
+                if mask_mode == 1 { b.masks } else { 0 },
+                if mask_mode == 2 { b.masks } else { 0 },
+                select.scratch.0,
+                n as u64,
+                0,
+                ratio as u64,
+                self.index_topk as u64,
+                mask_mode,
+                self.candidate_topk_blocks as u64,
+                self.candidate_block_size as u64,
+                stride as u64,
+                SELECTED_STRIDE as u64,
+                (rows.mask_bytes / 4) as u64,
+                (reach + reach.div_ceil(4)) as u64,
+            ],
+        )?;
+        if let Some(last) = segs.last() {
+            self.attn_window.selected_count = self.index_topk.min((last.p0 + last.n) / ratio);
+        }
+        Ok(())
     }
 
     /// One segment's index-source select, batched: opt_select_scores_rows scores every row's
@@ -2547,21 +2788,59 @@ impl DeviceLayer<'_> {
             let (wkv, wkv_mode) = staged.wkv.ok_or("rows seam: no staged compressor wkv")?;
             let row_bytes = ring.head_dim * 4;
             let owner_base = owner * ring.rows * row_bytes;
-            // Each sequence's rows land in its own lane's compressor ring.
-            for seg in &segs {
-                self.enter_seg(seg)?;
+            let mut projections = vec![(wkv, wkv_mode)];
+            projections.extend(staged.wgate);
+            let ring_kernel = |mode: Mode| match (rows.kernels.hostw_ring, mode) {
+                (Some(kernels), Mode::Bf16WeightF32Stores) => Some(kernels[0]),
+                (Some(kernels), Mode::F32WeightF32Stores) => Some(kernels[1]),
+                _ => None,
+            };
+            let table = self.row_table(rows, &segs);
+            let together = (table.is_some() || segs.len() == 1)
+                && projections
+                    .iter()
+                    .all(|&(_, mode)| ring_kernel(mode).is_some());
+            if let (Some(first), true) = (segs.first(), together) {
+                // Every lane's rows in one launch a projection: row y writes the ring row of its
+                // position in its own lane's ring (the row table's offset from the first lane's).
+                self.enter_seg(first)?;
                 let ring = self.seam_ring.ok_or("rows seam: no compressor ring")?;
-                let mut row = 0;
-                while row < seg.n {
-                    let slot = (seg.p0 + row) % ring.rows;
-                    let run = (ring.rows - slot).min(seg.n - row);
-                    let a = b.normed + ((seg.row0 + row) * dim * 4) as u64;
-                    let at = (owner_base + slot * row_bytes) as u64;
-                    hostw(wkv_mode, a, wkv, ring.wkv.0 + at, ring.head_dim, run)?;
-                    if let Some((wgate, wgate_mode)) = staged.wgate {
-                        hostw(wgate_mode, a, wgate, ring.wgate.0 + at, ring.head_dim, run)?;
+                for (&(weight, mode), base) in projections.iter().zip([ring.wkv.0, ring.wgate.0]) {
+                    let kernel = ring_kernel(mode).ok_or("rows seam: no ring projection")?;
+                    cuda.launch(
+                        kernel,
+                        ((ring.head_dim / 32) as u32, n as u32, 1),
+                        (32, 1, 1),
+                        &[
+                            b.normed,
+                            weight.0,
+                            base + owner_base as u64,
+                            ring.head_dim as u64,
+                            dim as u64,
+                            dim as u64,
+                            table.unwrap_or(0),
+                            first.p0 as u64,
+                            ring.rows as u64,
+                        ],
+                    )?;
+                }
+            } else {
+                // Otherwise each sequence's rows land in its own lane's compressor ring.
+                for seg in &segs {
+                    self.enter_seg(seg)?;
+                    let ring = self.seam_ring.ok_or("rows seam: no compressor ring")?;
+                    let mut row = 0;
+                    while row < seg.n {
+                        let slot = (seg.p0 + row) % ring.rows;
+                        let run = (ring.rows - slot).min(seg.n - row);
+                        let a = b.normed + ((seg.row0 + row) * dim * 4) as u64;
+                        let at = (owner_base + slot * row_bytes) as u64;
+                        hostw(wkv_mode, a, wkv, ring.wkv.0 + at, ring.head_dim, run)?;
+                        if let Some((wgate, wgate_mode)) = staged.wgate {
+                            hostw(wgate_mode, a, wgate, ring.wgate.0 + at, ring.head_dim, run)?;
+                        }
+                        row += run;
                     }
-                    row += run;
                 }
             }
         }
@@ -2616,24 +2895,34 @@ impl DeviceLayer<'_> {
                 R_MAX,
             )
             .map_err(|error| format!("rows indexer wq_b: {error}"))?;
+            // The query rope of every row at once (per segment without the row table): the opt
+            // rope's arithmetic is rope_rotate_rows_bf16's forward rotation.
             let pairs = self.rope_pairs as usize;
             let table_bytes = self.max_positions * pairs * 4;
             let tables = self.buffers.workspace.rope_tables_compressed.device;
-            for row in 0..n {
-                let (_, position) = Self::row_seg(&segs, row)?;
-                let rope_offset = (position * pairs * 4) as u64;
-                crate::layer_attention_stages::launch_forward_rope(
-                    cuda,
-                    self.kernels.rope_rows,
-                    Deviceptr(b.idx_query + (row * index_cols * 2) as u64),
-                    Deviceptr(tables + rope_offset),
-                    Deviceptr(tables + table_bytes as u64 + rope_offset),
-                    heads as u32,
-                    head_dim as u32,
-                    self.rope_head_dim,
-                    self.seam_trace_ring(),
-                    layer as u32,
-                    position as u64,
+            let (_, rope) = self
+                .opt_rope
+                .ok_or("rows seam: the opt rope is not loaded")?;
+            let table = self.row_table(rows, &segs);
+            for seg in Self::row_units(&segs, table) {
+                let pair_bytes = match table {
+                    Some(_) => 0,
+                    None => (pairs * 4 * seg.p0) as u64,
+                };
+                cuda.launch(
+                    rope,
+                    (heads as u32, seg.n as u32, 1),
+                    (32, 1, 1),
+                    &[
+                        b.idx_query + (seg.row0 * index_cols * 2) as u64,
+                        tables + pair_bytes,
+                        tables + table_bytes as u64 + pair_bytes,
+                        head_dim as u64,
+                        u64::from(self.rope_head_dim),
+                        heads as u64,
+                        pairs as u64,
+                        table.unwrap_or(0),
+                    ],
                 )?;
             }
             sparkflash_kernels::pool_group_launch::launch_fp4_round_trip(
@@ -2644,6 +2933,224 @@ impl DeviceLayer<'_> {
                 (n * index_cols / 32) as u32,
             )?;
         }
+        Ok(true)
+    }
+
+    /// The compressor groups the step's rows complete, every lane's at once: reference_seam's
+    /// per-group chain (the pool of the group's ring rows, the latent's narrow and norm, the index
+    /// key's projection, norm, rope and FP4 round trip into the lane's keys, then the latent's rope,
+    /// widen and append to the lane's compressed store) with each stage in one launch over the
+    /// groups, each group's arithmetic the single-group launch's. Runs after rows_seam_prepare wrote
+    /// every row's wkv / wgate; false when it cannot (the rows then take the per-row chain).
+    fn rows_groups(
+        &mut self,
+        rows: &RowsState,
+        layer: usize,
+        segs: &[super::lanes::Seg],
+    ) -> Result<bool, String> {
+        use sparkflash_kernels::engram_convert_launch::{
+            self as convert, EngramConvertParams, EngramConvertSpans,
+        };
+        let ratio = self.compress_ratio.get(layer).copied().unwrap_or(0);
+        let (Some(k), Some(first)) = (rows.kernels.groups, segs.first()) else {
+            return Ok(false);
+        };
+        if ratio < 2 || !self.is_kv_source(layer) {
+            return Ok(false);
+        }
+        let (tab, g0) = match segs {
+            [seg] => (0, seg.p0 / ratio),
+            _ => match self.group_table(rows, segs, ratio) {
+                Some(tab) => (tab, 0),
+                None => return Ok(false),
+            },
+        };
+        let (Some(staged), Some(narrow), Some(norm), Some(widen), Some((_, rope))) = (
+            self.seam_staged,
+            self.seam_narrow,
+            self.seam_norm,
+            self.seam_widen,
+            self.opt_rope,
+        ) else {
+            return Ok(false);
+        };
+        let (Some((norm_weight, norm_bytes)), Some(wk), Some((k_norm, _))) =
+            (staged.compressor_norm, staged.index_wk, staged.index_k_norm)
+        else {
+            return Ok(false);
+        };
+        let groups: usize = segs
+            .iter()
+            .map(|seg| (seg.p0 + seg.n) / ratio - seg.p0 / ratio)
+            .sum();
+        if groups == 0 {
+            return Ok(true);
+        }
+        let owner = self
+            .owner_index_for(layer)
+            .ok_or("rows groups: the layer has no kv-source owner")?;
+        self.enter_seg(first)?;
+        let ring = self.seam_ring.ok_or("rows groups: no compressor ring")?;
+        let hd = ring.head_dim;
+        let index_dim = self.index_head_dim;
+        // The append's row is 512 wide, and a group never wraps the ring.
+        if hd != self.head_width as usize
+            || hd != 512
+            || norm_bytes != hd * 2
+            || !ring.rows.is_multiple_of(ratio)
+            || groups > R_MAX
+        {
+            return Ok(false);
+        }
+        let cuda = self.cuda;
+        let b = rows.b;
+        let owner_ring = (owner * ring.rows * hd * 4) as u64;
+        cuda.launch(
+            k.pool,
+            (hd.div_ceil(128) as u32, groups as u32, 1),
+            (128, 1, 1),
+            &[
+                ring.wkv.0 + owner_ring,
+                ring.wgate.0 + owner_ring,
+                b.group_f32,
+                tab,
+                g0 as u64,
+                ratio as u64,
+                hd as u64,
+                ring.rows as u64,
+            ],
+        )?;
+        let count = groups * hd;
+        convert::launch_narrow(
+            cuda,
+            narrow,
+            &EngramConvertParams {
+                src: Deviceptr(b.group_f32),
+                dst: Deviceptr(b.group_bf16),
+                count: count as u32,
+            },
+            &EngramConvertSpans {
+                src_bytes: count * 4,
+                dst_bytes: count * 2,
+            },
+        )?;
+        sparkflash_kernels::rmsnorm_launch::launch(
+            cuda,
+            norm,
+            &sparkflash_kernels::rmsnorm_launch::RmsNormLaunchParams {
+                x: Deviceptr(b.group_bf16),
+                weight: norm_weight,
+                out: Deviceptr(b.group_normed),
+                rows: groups as u32,
+                cols: hd as u32,
+                eps: self.eps,
+                trace_ring: 0,
+                layer_id: layer as u32,
+                step_seq: 0,
+            },
+        )?;
+        // The index keys, from the pre-rope normed latent.
+        let widen_latent = || {
+            convert::launch_widen(
+                cuda,
+                widen,
+                &EngramConvertParams {
+                    src: Deviceptr(b.group_normed),
+                    dst: Deviceptr(b.group_f32),
+                    count: count as u32,
+                },
+                &EngramConvertSpans {
+                    src_bytes: count * 2,
+                    dst_bytes: count * 4,
+                },
+            )
+        };
+        widen_latent()?;
+        cuda.launch(
+            rows.kernels.hostw[1],
+            ((index_dim / 32) as u32, groups as u32, 1),
+            (32, 1, 1),
+            &[
+                b.group_f32,
+                wk.0,
+                b.group_key_f32,
+                index_dim as u64,
+                hd as u64,
+                hd as u64,
+                index_dim as u64,
+            ],
+        )?;
+        cuda.launch(
+            k.k_norm,
+            ((groups as u32).div_ceil(128), 1, 1),
+            (128, 1, 1),
+            &[
+                b.group_key_f32,
+                k_norm.0,
+                b.group_key_bf16,
+                index_dim as u64,
+                u64::from(self.eps.to_bits()),
+                groups as u64,
+            ],
+        )?;
+        // The rope of a group at its first position: the group table's position, or (g0 + g)
+        // ratio through a stride of `ratio` table rows.
+        let pairs = self.rope_pairs as usize;
+        let table_bytes = (self.max_positions * pairs * 4) as u64;
+        let (at, stride) = match tab {
+            0 => ((g0 * ratio * pairs * 4) as u64, pairs * ratio),
+            _ => (0, pairs),
+        };
+        let tables = self.buffers.workspace.rope_tables_compressed.device + at;
+        let rope_rows = |rows_at: u64, width: usize| {
+            cuda.launch(
+                rope,
+                (1, groups as u32, 1),
+                (32, 1, 1),
+                &[
+                    rows_at,
+                    tables,
+                    tables + table_bytes,
+                    width as u64,
+                    u64::from(self.rope_head_dim),
+                    1,
+                    stride as u64,
+                    tab,
+                ],
+            )
+        };
+        rope_rows(b.group_key_bf16, index_dim)?;
+        let keys = ring.index_keys.0 + (owner * self.max_positions * index_dim * 4) as u64;
+        cuda.launch(
+            k.keys,
+            (groups as u32, 1, 1),
+            (32, 1, 1),
+            &[
+                b.group_key_bf16,
+                keys,
+                tab,
+                g0 as u64,
+                ratio as u64,
+                index_dim as u64,
+            ],
+        )?;
+        // The compressed store rows, from the roped latent.
+        rope_rows(b.group_normed, hd)?;
+        widen_latent()?;
+        let (code_bytes, scale_bytes) = super::seam_store_owner_bytes(self.max_positions)?;
+        cuda.launch(
+            k.append,
+            (groups as u32, 1, 1),
+            sparkflash_kernels::compressed_append_launch::BLOCK,
+            &[
+                b.group_f32,
+                ring.store_codes.0 + (owner * code_bytes) as u64,
+                ring.store_scales.0 + (owner * scale_bytes) as u64,
+                tab,
+                g0 as u64,
+                ratio as u64,
+            ],
+        )?;
         Ok(true)
     }
 
@@ -2694,7 +3201,7 @@ impl DeviceLayer<'_> {
                     format!("rows attention: layer {layer} has no kv-source owner")
                 })?;
                 let ring = self.seam_ring.ok_or("rows attention: no seam ring")?;
-                let (code_bytes, scale_bytes) = seam_store_owner_bytes(self.max_positions)?;
+                let (code_bytes, scale_bytes) = super::seam_store_owner_bytes(self.max_positions)?;
                 (
                     ring.store_codes.0 + (owner * code_bytes) as u64,
                     ring.store_scales.0 + (owner * scale_bytes) as u64,
@@ -2880,9 +3387,10 @@ impl DeviceLayer<'_> {
             self.bulk_router(rows, bulk, gate.0, bias.0, n)?;
             self.vision_route(layer, bulk.dots, true, b.moe_ids, b.moe_weights)?;
         } else {
+            // Groups of eight rows (gridDim.y): each group's blocks re-read the gate from L2.
             self.cuda.launch(
                 router_kernel,
-                (48, 1, 1),
+                (48, n.div_ceil(8) as u32, 1),
                 (256, 1, 1),
                 &[
                     b.ffn_x,
@@ -3100,10 +3608,11 @@ impl DeviceLayer<'_> {
             ],
         )?;
         self.exchange_slots(gather, n * 4, rank, "argmax gather")?;
+        // A thread a row: a warp per 32 rows, so a 64-row step picks every row.
         self.cuda.launch(
             rows.kernels.pick,
             (1, 1, 1),
-            (32, 1, 1),
+            ((32 * n.div_ceil(32)) as u32, 1, 1),
             &[
                 gather,
                 n as u64,
@@ -3116,8 +3625,8 @@ impl DeviceLayer<'_> {
         Ok(ids_out)
     }
 
-    /// The head over the rows: hc collapse per row, the final norm, one pass of the vocabulary
-    /// shard for every [HEAD_ROWS] rows, the per-row fold, then the cross-rank argmax. Returns
+    /// The head over the rows: hc collapse per row, the final norm, the vocabulary shard against
+    /// [HEAD_ROWS] rows a block, the per-row fold, then the cross-rank argmax. Returns
     /// (token, value) per row.
     pub(super) fn head_rows(
         &self,
@@ -3223,37 +3732,27 @@ impl DeviceLayer<'_> {
             rows.head_params.device().0
         };
         let id_base = self.device_exchange().map_or(0, |(_, rank)| rank * vocab);
-        // HEAD_ROWS rows a pass over the vocabulary shard: each piece's chunk maxima, logits and
-        // noise are its rows of the step's.
-        for row0 in (0..n).step_by(HEAD_ROWS) {
-            self.cuda.launch(
-                rows.kernels.lm_head,
-                (chunks as u32, 1, 1),
-                (512, 1, 1),
-                &[
-                    b.lm_normed + (row0 * dim * 2) as u64,
-                    tail.head_weight.0,
-                    b.lm_block_max + (row0 * chunks * 4) as u64,
-                    b.lm_block_arg + (row0 * chunks * 4) as u64,
-                    vocab as u64,
-                    HEAD_ROWS.min(n - row0) as u64,
-                    if any_truncated {
-                        b.logits + (row0 * vocab * 4) as u64
-                    } else {
-                        0
-                    },
-                    inv_t,
-                    seed,
-                    (index0 + row0) as u64,
-                    id_base as u64,
-                    if params == 0 {
-                        0
-                    } else {
-                        params + (row0 * 16) as u64
-                    },
-                ],
-            )?;
-        }
+        // One launch: HEAD_ROWS rows a block, the row groups' blocks of a chunk reading its weight
+        // rows from L2 after the first.
+        self.cuda.launch(
+            rows.kernels.lm_head,
+            (n.div_ceil(HEAD_ROWS) as u32, chunks as u32, 1),
+            (512, 1, 1),
+            &[
+                b.lm_normed,
+                tail.head_weight.0,
+                b.lm_block_max,
+                b.lm_block_arg,
+                vocab as u64,
+                n as u64,
+                if any_truncated { b.logits } else { 0 },
+                inv_t,
+                seed,
+                index0 as u64,
+                id_base as u64,
+                params,
+            ],
+        )?;
         let mut picked: Vec<Option<u32>> = vec![None; n];
         if any_truncated {
             let Some((world, rank)) = self.device_exchange() else {

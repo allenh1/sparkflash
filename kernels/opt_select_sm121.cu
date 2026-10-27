@@ -643,16 +643,20 @@ extern "C" __global__ void __launch_bounds__(FAST_BLOCK) opt_ref_select_fast(OPT
 // blocks stride over the rows, each with its own `scratch_words` of scratch (n + n / 4 words for
 // the most compressed positions n a row reaches). opt_select_rows reads f32 scores,
 // opt_select_rows_bf16 the bulk scorer's bf16 ones (the same values, so the same choice).
+// With `row_tab` (a step over several sequences' rows, DeviceLayer::upload_row_table's
+// {lane offset, position} per row) row y's position is row_tab[2 y + 1] instead of p0 + y.
 template <typename T>
 __device__ __forceinline__ void select_rows_body(
-    const T* __restrict__ scores, uint32_t* __restrict__ selected,
-    const uint32_t* __restrict__ mask_in, uint32_t* __restrict__ mask_out,
-    uint32_t* __restrict__ scratch, uint32_t tokens, uint32_t p0, uint32_t ratio, uint32_t topk,
-    uint32_t mask_mode, uint32_t topk_blocks, uint32_t block_size, uint32_t score_stride,
-    uint32_t selected_stride, uint32_t mask_stride, uint32_t scratch_words) {
+    const T* __restrict__ scores, const uint64_t* __restrict__ row_tab,
+    uint32_t* __restrict__ selected, const uint32_t* __restrict__ mask_in,
+    uint32_t* __restrict__ mask_out, uint32_t* __restrict__ scratch, uint32_t tokens, uint32_t p0,
+    uint32_t ratio, uint32_t topk, uint32_t mask_mode, uint32_t topk_blocks, uint32_t block_size,
+    uint32_t score_stride, uint32_t selected_stride, uint32_t mask_stride, uint32_t scratch_words) {
     uint32_t* mine = scratch + static_cast<size_t>(blockIdx.x) * scratch_words;
     for (uint32_t y = blockIdx.x; y < tokens; y += gridDim.x) {
-        const uint32_t n = (p0 + y + 1u) / ratio;
+        const uint32_t position =
+            row_tab != nullptr ? static_cast<uint32_t>(row_tab[2u * y + 1u]) : p0 + y;
+        const uint32_t n = (position + 1u) / ratio;
         if (n == 0u) continue;
         const size_t mask_row = static_cast<size_t>(y) * mask_stride;
         fast_select(scores + static_cast<size_t>(y) * score_stride, mine,
@@ -677,13 +681,22 @@ __device__ __forceinline__ void select_rows_body(
 extern "C" __global__ void __launch_bounds__(FAST_BLOCK) opt_select_rows(
     const float* __restrict__ scores, OPT_SELECT_ROWS_PARAMS) {
     OPT_PDL_ENTRY();
-    select_rows_body(scores, OPT_SELECT_ROWS_ARGS);
+    select_rows_body(scores, static_cast<const uint64_t*>(nullptr), OPT_SELECT_ROWS_ARGS);
 }
 
 extern "C" __global__ void __launch_bounds__(FAST_BLOCK) opt_select_rows_bf16(
     const uint16_t* __restrict__ scores, OPT_SELECT_ROWS_PARAMS) {
     OPT_PDL_ENTRY();
-    select_rows_body(scores, OPT_SELECT_ROWS_ARGS);
+    select_rows_body(scores, static_cast<const uint64_t*>(nullptr), OPT_SELECT_ROWS_ARGS);
+}
+
+// opt_select_rows over a step's rows from several sequences, each row's position from `row_tab`
+// (p0 unused).
+extern "C" __global__ void __launch_bounds__(FAST_BLOCK) opt_select_rows_tab(
+    const float* __restrict__ scores, const uint64_t* __restrict__ row_tab,
+    OPT_SELECT_ROWS_PARAMS) {
+    OPT_PDL_ENTRY();
+    select_rows_body(scores, row_tab, OPT_SELECT_ROWS_ARGS);
 }
 
 // One block per compressed position: warp w scores heads w, w+8, ... (a warp tree per dot, the
@@ -865,18 +878,18 @@ __device__ __forceinline__ uint32_t sg_next(const uint32_t* __restrict__ mask_in
     return n_top;
 }
 
-extern "C" __global__ void __launch_bounds__(SG_SLICE * SG_ROWS) opt_select_scores_seg(
+// The scores of one segment's rows from block bx of `blocks`, with `slices` row slices (threads
+// past rows * slices slices fetch and fold but score nothing).
+__device__ __forceinline__ void scores_seg_body(
     const float* __restrict__ q_index, const float* __restrict__ keys,
     const float* __restrict__ weights, float* __restrict__ scores,
     const uint32_t* __restrict__ mask_in, uint32_t p0, uint32_t ratio, uint32_t score_stride,
-    uint32_t mask_stride, uint32_t rows) {
-    OPT_PDL_ENTRY();
+    uint32_t mask_stride, uint32_t rows, uint32_t slices, uint32_t bx, uint32_t blocks) {
     // Two key tiles, dim 32 i + L at [i * 32 + (L & 7) * 4 + (L >> 3)]: a thread's chains in order.
     __shared__ __align__(16) float s_k[2][SG_TILE][SR_DIM];
     // The head terms, [row][position][head].
     __shared__ __align__(16) __nv_bfloat16 s_c[SG_ROWS][SG_TILE][SG_HEADS];
     const uint32_t tid = threadIdx.x;
-    const uint32_t slices = blockDim.x / (SG_SLICE * rows);
     const uint32_t z = tid / SG_SLICE;
     const uint32_t row = z % rows, slice = z / rows;
     const uint32_t group = (tid >> 3) & 7u, eighth = tid & 7u;
@@ -884,7 +897,7 @@ extern "C" __global__ void __launch_bounds__(SG_SLICE * SG_ROWS) opt_select_scor
     const uint32_t n_top = reach_top < FAST_MAX_POS ? reach_top : FAST_MAX_POS;
     const uint32_t reach = (p0 + row + 1u) / ratio;
     const uint32_t n_row = reach < FAST_MAX_POS ? reach : FAST_MAX_POS;
-    const uint32_t step = gridDim.x * SG_TILE;
+    const uint32_t step = blocks * SG_TILE;
     // q[g][i][m]: dim 32 i + 8 m + eighth of head group + 8 g of this row.
     float q[SG_GROUP][SR_DPL][SG_CHAINS];
 #pragma unroll
@@ -915,7 +928,7 @@ extern "C" __global__ void __launch_bounds__(SG_SLICE * SG_ROWS) opt_select_scor
         asm volatile("cp.async.commit_group;\n" ::: "memory");
     };
     uint32_t need, mine;
-    uint32_t base = sg_next(mask_in, blockIdx.x * SG_TILE, step, n_top, rows, mask_stride, row, need, mine);
+    uint32_t base = sg_next(mask_in, bx * SG_TILE, step, n_top, rows, mask_stride, row, need, mine);
     uint32_t buf = 0u;
     if (base < n_top) fetch(base, need, buf);
     while (base < n_top) {
@@ -930,7 +943,7 @@ extern "C" __global__ void __launch_bounds__(SG_SLICE * SG_ROWS) opt_select_scor
         }
         __syncthreads();
         const uint32_t tile = n_top - base < SG_TILE ? n_top - base : SG_TILE;
-        for (uint32_t p = slice; p < tile; p += slices) {
+        for (uint32_t p = slice; slice < slices && p < tile; p += slices) {
             if (base + p >= n_row || ((mine >> p) & 1u) == 0u) continue;
             const float* k = &s_k[buf][p][eighth * 4u];
             float c[SG_GROUP][SG_CHAINS];
@@ -993,6 +1006,41 @@ extern "C" __global__ void __launch_bounds__(SG_SLICE * SG_ROWS) opt_select_scor
         mine = mine_next;
         buf ^= 1u;
     }
+}
+
+extern "C" __global__ void __launch_bounds__(SG_SLICE * SG_ROWS) opt_select_scores_seg(
+    const float* __restrict__ q_index, const float* __restrict__ keys,
+    const float* __restrict__ weights, float* __restrict__ scores,
+    const uint32_t* __restrict__ mask_in, uint32_t p0, uint32_t ratio, uint32_t score_stride,
+    uint32_t mask_stride, uint32_t rows) {
+    OPT_PDL_ENTRY();
+    scores_seg_body(q_index, keys, weights, scores, mask_in, p0, ratio, score_stride, mask_stride,
+                    rows, blockDim.x / (SG_SLICE * rows), blockIdx.x, gridDim.x);
+}
+
+// opt_select_scores_seg over a step's rows from several sequences, in one launch: block row y
+// takes piece y of `pieces` ({row0, rows} words, rows <= SG_ROWS, one sequence's consecutive
+// positions), whose first position and lane offset are row_tab's at row0
+// (DeviceLayer::upload_row_table) and whose keys are at keys + that offset. A piece's scores are
+// opt_select_scores_seg's over its rows (its rows' at their step rows), with SG_ROWS / rows slices.
+extern "C" __global__ void __launch_bounds__(SG_SLICE * SG_ROWS) opt_select_scores_segs(
+    const float* __restrict__ q_index, const float* __restrict__ keys,
+    const float* __restrict__ weights, float* __restrict__ scores,
+    const uint32_t* __restrict__ mask_in, const uint64_t* __restrict__ row_tab,
+    const uint32_t* __restrict__ pieces, uint32_t ratio, uint32_t score_stride,
+    uint32_t mask_stride) {
+    OPT_PDL_ENTRY();
+    const uint32_t row0 = pieces[2u * blockIdx.y], rows = pieces[2u * blockIdx.y + 1u];
+    if (rows == 0u || rows > SG_ROWS) return;
+    const uint64_t offset = row_tab[2u * row0];
+    const uint32_t p0 = static_cast<uint32_t>(row_tab[2u * row0 + 1u]);
+    scores_seg_body(q_index + static_cast<size_t>(row0) * SG_HEADS * SR_DIM,
+                    reinterpret_cast<const float*>(reinterpret_cast<const char*>(keys) + offset),
+                    weights + static_cast<size_t>(row0) * SG_HEADS,
+                    scores + static_cast<size_t>(row0) * score_stride,
+                    mask_in != nullptr ? mask_in + static_cast<size_t>(row0) * mask_stride : nullptr,
+                    p0, ratio, score_stride, mask_stride, rows, SG_ROWS / rows, blockIdx.x,
+                    gridDim.x);
 }
 
 }  // namespace opt_select

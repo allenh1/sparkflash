@@ -15,7 +15,8 @@
 //   scales applied by the MMA. The opt GEMV's argument list (OptArgs), any token count.
 //   Grid (ceil(tokens / 128), ceil(cols / 128), groups), 256 threads. A block owns a 128-token x
 //   128-column tile and walks K two MX blocks per stage through a double-buffered cp.async
-//   pipeline; warp (wm, wn) computes 64 tokens x one 32-column weight tile (4 x 4 MMA tiles).
+//   pipeline (the scale bytes through registers a stage ahead); warp (wm, wn) computes 64 tokens x
+//   one 32-column weight tile (4 x 4 MMA tiles).
 //   Blocks with the same column tile are adjacent in launch order, so a weight tile is read from
 //   DRAM about once while the activation rows stay in L2.
 // opt_mma_fp8_rowscale_f32o: the same over row-major E4M3 weights with one ue8m0 per row per 32
@@ -139,14 +140,17 @@ __device__ __forceinline__ void opt_mma_fp8_body(
                                           : w_grp + ((uint64_t)ct * k_row + kb0 + kt) * 1024u + within * 16u;
             om_cp16(om_smem(&s_w[buf][om_w_off(tile, within >> 1, within & 1u)]), src, valid);
         }
-        // Scales by plain loads (a row's two bytes need not be 4-byte aligned).
+    };
+    // Scales by plain loads (a row's two bytes need not be 4-byte aligned), into registers a stage
+    // ahead of their store, so the loads run under a stage of MMAs instead of before the barrier.
+    auto load_scales = [&](uint32_t stage, uint8_t (&r)[OM_KB]) {
+        const uint32_t kb0 = stage * OM_KB;
         if (tid < OM_BM) {
             const uint32_t token = m0 + tid;
 #pragma unroll
             for (uint32_t j = 0; j < OM_KB; ++j) {
                 const uint32_t kb = kb0 + j;
-                s_as[buf][tid * OM_KB + j] =
-                    token < tokens && kb < k_blocks ? __ldg(as_grp + (uint64_t)token * a_tok_stride / 32u + kb) : (uint8_t)0;
+                r[j] = token < tokens && kb < k_blocks ? __ldg(as_grp + (uint64_t)token * a_tok_stride / 32u + kb) : (uint8_t)0;
             }
         } else if (W_RSCALE) {
             // Thread 128 + c loads column c's scales (OM_BN = 128 columns).
@@ -154,15 +158,25 @@ __device__ __forceinline__ void opt_mma_fp8_body(
 #pragma unroll
             for (uint32_t j = 0; j < OM_KB; ++j) {
                 const uint32_t kb = kb0 + j;
-                s_ws[buf][col * OM_KB + j] =
-                    n0 + col < cols && kb < k_blocks ? __ldg(ws + (uint64_t)(n0 + col) * k_blocks + kb) : (uint8_t)0;
+                r[j] = n0 + col < cols && kb < k_blocks ? __ldg(ws + (uint64_t)(n0 + col) * k_blocks + kb) : (uint8_t)0;
             }
         } else if (tid < OM_BM + OM_W_TILES) {
             const uint32_t tile = tid - OM_BM;
             const uint32_t ct = tile / OM_KB;
             const uint32_t kt = tile % OM_KB;
             const uint32_t kb = kb0 + kt;
-            s_ws[buf][tile] = ct < col_tiles && kb < k_blocks ? __ldg(ws_grp + (uint64_t)ct * k_row + kb) : (uint8_t)0;
+            r[0] = ct < col_tiles && kb < k_blocks ? __ldg(ws_grp + (uint64_t)ct * k_row + kb) : (uint8_t)0;
+        }
+    };
+    auto store_scales = [&](const uint8_t (&r)[OM_KB], uint32_t buf) {
+        if (tid < OM_BM) {
+#pragma unroll
+            for (uint32_t j = 0; j < OM_KB; ++j) s_as[buf][tid * OM_KB + j] = r[j];
+        } else if (W_RSCALE) {
+#pragma unroll
+            for (uint32_t j = 0; j < OM_KB; ++j) s_ws[buf][(tid - OM_BM) * OM_KB + j] = r[j];
+        } else if (tid < OM_BM + OM_W_TILES) {
+            s_ws[buf][tid - OM_BM] = r[0];
         }
     };
 
@@ -178,13 +192,19 @@ __device__ __forceinline__ void opt_mma_fp8_body(
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
 
+    uint8_t sc[OM_KB] = {};
+    load_scales(0, sc);
+    store_scales(sc, 0);
     issue(0, 0);
     om_commit();
+    if (stages > 1u) load_scales(1, sc);
     for (uint32_t stage = 0; stage < stages; ++stage) {
         const uint32_t buf = stage & 1u;
         if (stage + 1u < stages) {
+            store_scales(sc, buf ^ 1u);
             issue(stage + 1u, buf ^ 1u);
             om_commit();
+            if (stage + 2u < stages) load_scales(stage + 2u, sc);
             om_wait<1>();
         } else {
             om_wait<0>();
@@ -578,6 +598,131 @@ extern "C" __global__ void __launch_bounds__(OM_THREADS) opt_mma_bf16a_fp8row_f3
                                                    0u, 0u, 0u, 0u, 0u);
 }
 
+// opt_mma_head_fp8t_f32o: opt_mma_bf16a_fp8row_f32o over the head copy in 128-column tiles
+//   (opt_draft_head_fp8t: tile t, K block kb is 4 KB of codes, [128 columns][32], then its 128 scale
+//   bytes in the scale copy), so a stage's weights are one contiguous read. A cp.async pipeline keeps
+//   OH_STAGES - 1 stages of codes, scales and activation rows in flight; each stage's codes times
+//   their scales are decoded to bf16 in shared memory and go through opt_mma_bf16_body's MMAs in its
+//   order, so every logit is that kernel's bits. A block owns 64 rows x 128 columns: warp w the 16
+//   columns 16 w .. 16 w + 15 of every row tile of 16 the block's rows reach.
+//   Grid (ceil(tokens / 64), ceil(cols / 128)), 256 threads: a column tile's row blocks are adjacent
+//   in launch order, so its codes come from DRAM about once.
+#define OH_BM 64u
+#define OH_STAGES 4u
+#define OH_W_BYTES (OM_BN * 32u)        // a stage's codes
+#define OH_A_BYTES (OH_BM * 32u * 2u)   // a stage's activation rows (bf16)
+
+extern "C" __global__ void __launch_bounds__(OM_THREADS) opt_mma_head_fp8t_f32o(
+    const __nv_bfloat16 *__restrict__ a, const uint8_t *__restrict__ w, const uint8_t *__restrict__ ws,
+    float *__restrict__ out, const uint32_t cols, const uint32_t inner, const uint32_t tokens,
+    const uint64_t a_tok_stride, const uint64_t out_tok_stride) {
+    OPT_PDL_ENTRY();
+    __shared__ __align__(16) uint8_t s_w8[OH_STAGES][OH_W_BYTES];
+    __shared__ __align__(16) uint8_t s_a[OH_STAGES][OH_A_BYTES];
+    __shared__ __align__(16) uint8_t s_s[OH_STAGES][OM_BN];
+    __shared__ __align__(16) __nv_bfloat16 s_w[OM_BN * OB_LD];
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5;
+    const uint32_t m0 = blockIdx.x * OH_BM;
+    const uint32_t tile = blockIdx.y;
+    const uint32_t n0 = tile * OM_BN;
+    const uint32_t k_blocks = inner >> 5;
+    const uint32_t row_tiles = min(OH_BM, tokens - m0 + 15u) >> 4;  // 16-row MMA tiles with a live row
+    const uint8_t *w_tile = w + (uint64_t)tile * k_blocks * OH_W_BYTES;
+    const uint8_t *s_tile = ws + (uint64_t)tile * k_blocks * OM_BN;
+
+    // Thread t copies 16 bytes of codes (t of 256), 16 bytes of activation row t / 4 (chunk t % 4,
+    // zero past the last row) and, for t < 8, 16 scale bytes.
+    const uint32_t a_row = tid >> 2;
+    const uint32_t a_chunk = tid & 3u;
+    const bool a_live = m0 + a_row < tokens;
+    const __nv_bfloat16 *a_src = a + (uint64_t)(a_live ? m0 + a_row : 0u) * a_tok_stride + a_chunk * 8u;
+    auto load = [&](uint32_t kb) {
+        const uint32_t slot = kb % OH_STAGES;
+        om_cp16(om_smem(&s_w8[slot][tid * 16u]), w_tile + (uint64_t)kb * OH_W_BYTES + tid * 16u, true);
+        om_cp16(om_smem(&s_a[slot][om_a_off(a_row, a_chunk)]), a_src + kb * 32u, a_live);
+        if (tid < OM_BN / 16u) om_cp16(om_smem(&s_s[slot][tid * 16u]), s_tile + (uint64_t)kb * OM_BN + tid * 16u, true);
+    };
+
+    float acc[4][2][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
+
+#pragma unroll
+    for (uint32_t kb = 0; kb + 1u < OH_STAGES; ++kb) {
+        if (kb < k_blocks) load(kb);
+        om_commit();
+    }
+    // The decode of a stage: thread t the 16 codes of column t / 2, half t % 2 (opt_mma_bf16_body's
+    // store of an FP8ROW stage).
+    const uint32_t d_col = tid >> 1;
+    const uint32_t d_half = tid & 1u;
+    for (uint32_t kb = 0; kb < k_blocks; ++kb) {
+        om_wait<OH_STAGES - 2u>();
+        __syncthreads();
+        if (kb + OH_STAGES - 1u < k_blocks) load(kb + OH_STAGES - 1u);
+        om_commit();
+        const uint32_t slot = kb % OH_STAGES;
+        {
+            const float scale = opt_ue8m0_f32(s_s[slot][d_col]);
+            const uint4 r = *reinterpret_cast<const uint4 *>(&s_w8[slot][d_col * 32u + d_half * 16u]);
+            __nv_bfloat16 *dst = &s_w[d_col * OB_LD + d_half * 16u];
+            *reinterpret_cast<uint4 *>(dst) =
+                make_uint4(ob_e4m3x2(r.x, scale), ob_e4m3x2(r.x >> 16, scale), ob_e4m3x2(r.y, scale), ob_e4m3x2(r.y >> 16, scale));
+            *reinterpret_cast<uint4 *>(dst + 8) =
+                make_uint4(ob_e4m3x2(r.z, scale), ob_e4m3x2(r.z >> 16, scale), ob_e4m3x2(r.w, scale), ob_e4m3x2(r.w >> 16, scale));
+        }
+        __syncthreads();
+#pragma unroll
+        for (uint32_t ks = 0; ks < 2u; ++ks) {
+            const uint32_t k0 = ks * 16u;
+            uint32_t b[2][2];
+            {
+                const uint32_t n = warp * 16u + (lane & 7u) + 8u * (lane >> 4);
+                const uint32_t k = k0 + 8u * ((lane >> 3) & 1u);
+                om_ldsm4(om_smem(&s_w[n * OB_LD + k]), b[0][0], b[0][1], b[1][0], b[1][1]);
+            }
+#pragma unroll
+            for (uint32_t mt = 0; mt < 4u; ++mt) {
+                if (mt < row_tiles) {
+                    const uint32_t row = mt * 16u + (lane & 15u);
+                    const uint32_t chunk = (k0 >> 3) + (lane >> 4);
+                    uint32_t af[4];
+                    om_ldsm4(om_smem(&s_a[slot][om_a_off(row, chunk)]), af[0], af[1], af[2], af[3]);
+#pragma unroll
+                    for (uint32_t nt = 0; nt < 2u; ++nt) ob_mma(acc[mt][nt], af, b[nt][0], b[nt][1]);
+                }
+            }
+        }
+    }
+    om_wait<0>();
+
+    const uint32_t g = lane >> 2;
+    const uint32_t q = lane & 3u;
+#pragma unroll
+    for (uint32_t mt = 0; mt < 4u; ++mt) {
+#pragma unroll
+        for (uint32_t half = 0; half < 2u; ++half) {
+            const uint32_t token = m0 + mt * 16u + g + 8u * half;
+            if (mt >= row_tiles || token >= tokens) continue;
+#pragma unroll
+            for (uint32_t nt = 0; nt < 2u; ++nt) {
+                const uint32_t col = n0 + warp * 16u + nt * 8u + 2u * q;
+                if (col < cols) {
+                    *reinterpret_cast<float2 *>(out + (uint64_t)token * out_tok_stride + col) =
+                        make_float2(acc[mt][nt][2u * half], acc[mt][nt][2u * half + 1u]);
+                }
+            }
+        }
+    }
+}
+
 // opt_mma_hostw_{bf16w, bf16w_f32o, f32w_f32o}: the host-weight GEMVs (b12x_hostw_gemv_m1's three
 //   modes: an f32 activation row against bf16 or f32 weights in the B12x tiling) over many rows.
 //   Grid (ceil(cols / 128), ceil(tokens / 128)), 256 threads. f32 weights are split like the
@@ -693,7 +838,7 @@ extern "C" __global__ void __launch_bounds__(256) opt_mma_router_topk(
 // opt_mma_moe_down: grid (5120 / 128, max items), 256 threads; block (x, y) = item y, output
 //   columns 128 x .. 128 x + 127; writes each row's slot value rounded to bf16 into slot [rows][5120].
 // opt_mma_moe_combine: grid (5120 / 256, tokens), 256 threads; the routed combine of opt_moe (slots
-//   in ascending expert id, f32 adds, then the addend) into delta_f32 and delta_bf16.
+//   in ascending expert id, f32 adds, then the addend) into delta_bf16 and, when not null, delta_f32.
 
 #include "m4_common_sm121.cuh"
 #include "m4_activation_quant_sm121.cuh"
@@ -1097,7 +1242,7 @@ extern "C" __global__ void __launch_bounds__(256) opt_mma_moe_combine(
     }
     const uint64_t out = (uint64_t)token * OMM_HIDDEN + column;
     if (addend != nullptr) total = __fadd_rn(total, addend[out]);
-    delta_f32[out] = total;
+    if (delta_f32 != nullptr) delta_f32[out] = total;
     delta_bf16[out] = __float2bfloat16_rn(total);
 }
 
@@ -1349,8 +1494,9 @@ extern "C" __global__ void __launch_bounds__(OM_THREADS, 2) opt_mma_index_scores
 //   (E4M3 x ue8m0, the layer's linear ring) then the selected compressed keys (E2M1 x E4M3), 32 at
 //   a time decoded to bf16 in shared memory (both decodes are exact in bf16), an online softmax
 //   over the tiles with the probabilities rounded to bf16 for P x V, and the sink in the
-//   denominator. The next tile's raw bytes load into registers under the current tile's MMAs.
-//   Grid (rows), 256 threads. Not bit-identical to opt_rows_attn (the sums run in MMA order).
+//   denominator. Grid (rows), 256 threads, two blocks an SM: at 128 registers a block's loads,
+//   decode and barriers run under the other block's MMAs. Not bit-identical to opt_rows_attn (the
+//   sums run in MMA order).
 // ---------------------------------------------------------------------------------------------
 #define OBA_HEADS 16u
 #define OBA_LATENT 512u
@@ -1383,14 +1529,23 @@ __device__ __forceinline__ float oba_e4m3(uint32_t code) {
     return __half2float(__ushort_as_half((uint16_t)(h & 0xffffu)));
 }
 
-__device__ __forceinline__ float oba_e2m1(uint32_t nibble) {
-    const uint32_t e = (nibble >> 1) & 3u;
-    const float half_m = (nibble & 1u) != 0u ? 0.5f : 0.0f;
-    const float m = e == 0u ? half_m : __uint_as_float((e + 126u) << 23) * (1.0f + half_m);
-    return (nibble & 8u) != 0u ? -m : m;
+// Eight E2M1 codes (one 32-bit word, low nibble first) times an E4M3 scale -> four bf16x2, exact:
+// the codes widen to f16 in hardware and a product has at most 6 significant bits.
+__device__ __forceinline__ void oba_e2m1x8(uint32_t word, float scale, uint32_t v[4]) {
+    uint32_t h[4];
+    asm("{\n.reg .b8 b0, b1, b2, b3;\nmov.b32 {b0, b1, b2, b3}, %4;\n"
+        "cvt.rn.f16x2.e2m1x2 %0, b0;\ncvt.rn.f16x2.e2m1x2 %1, b1;\n"
+        "cvt.rn.f16x2.e2m1x2 %2, b2;\ncvt.rn.f16x2.e2m1x2 %3, b3;\n}"
+        : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3])
+        : "r"(word));
+#pragma unroll
+    for (uint32_t b = 0; b < 4u; ++b) {
+        const float2 f = __half22float2(*reinterpret_cast<const __half2 *>(&h[b]));
+        v[b] = ob_pack(__float2bfloat16_rn(f.x * scale), __float2bfloat16_rn(f.y * scale));
+    }
 }
 
-extern "C" __global__ void __launch_bounds__(256) opt_bulk_attn(
+extern "C" __global__ void __launch_bounds__(256, 2) opt_bulk_attn(
     const __nv_bfloat16 *__restrict__ q_all,   // [rows][16][512]
     const uint8_t *__restrict__ kv_fp4, const uint8_t *__restrict__ kv_scales,
     const uint8_t *__restrict__ ring_codes, const uint8_t *__restrict__ ring_scales,
@@ -1400,7 +1555,7 @@ extern "C" __global__ void __launch_bounds__(256) opt_bulk_attn(
     const uint32_t ring_rows) {
     OPT_PDL_ENTRY();
     __shared__ __align__(128) uint8_t s_k[OBA_TILE * OBA_LATENT * 2u];
-    __shared__ float s_s[2][OBA_HEADS][OBA_TILE];
+    __shared__ __align__(8) float s_s[4][OBA_HEADS][OBA_TILE];
     __shared__ __align__(16) __nv_bfloat16 s_p[OBA_HEADS * OBA_P_LD];
     __shared__ uint32_t s_cand[OBA_MAX_SELECTED];
     __shared__ uint32_t s_valid[OBA_TILE];
@@ -1434,13 +1589,13 @@ extern "C" __global__ void __launch_bounds__(256) opt_bulk_attn(
     const uint32_t total = window_rows + selected_count;
     const uint32_t tiles = (total + OBA_TILE - 1u) / OBA_TILE;
 
-    // S = Q K^T: warp w scores keys 8 (w % 4) .. + 7 over dims 256 (w / 4) .. + 255.
-    const uint32_t nt_s = warp & 3u, kh = warp >> 2;
+    // S = Q K^T: warp w scores keys 16 (w % 2) .. + 15 over dims 128 (w / 2) .. + 127.
+    const uint32_t kq = warp & 1u, kd = warp >> 1;
     const __nv_bfloat16 *qrow = q_all + (uint64_t)y * OBA_HEADS * OBA_LATENT;
-    uint32_t qa[16][4];
+    uint32_t qa[8][4];
 #pragma unroll
-    for (uint32_t j = 0; j < 16u; ++j) {
-        const uint32_t k0 = kh * 256u + j * 16u + 2u * q;
+    for (uint32_t j = 0; j < 8u; ++j) {
+        const uint32_t k0 = kd * 128u + j * 16u + 2u * q;
         qa[j][0] = __ldg(reinterpret_cast<const uint32_t *>(qrow + g * OBA_LATENT + k0));
         qa[j][1] = __ldg(reinterpret_cast<const uint32_t *>(qrow + (g + 8u) * OBA_LATENT + k0));
         qa[j][2] = __ldg(reinterpret_cast<const uint32_t *>(qrow + g * OBA_LATENT + k0 + 8u));
@@ -1453,11 +1608,11 @@ extern "C" __global__ void __launch_bounds__(256) opt_bulk_attn(
 #pragma unroll
         for (uint32_t e = 0; e < 4u; ++e) acc[nt][e] = 0.0f;
 
-    // The lane's raw bytes of its four keys (warp + 8 i) of a tile: dims 16 lane .. + 15.
-    uint4 raw[4];
-    uint32_t raw_scale[4], raw_kind[4];
     __syncthreads();   // s_cand
-    auto fetch = [&](uint32_t tile) {
+    for (uint32_t tile = 0; tile < tiles; ++tile) {
+        // The lane's dims 16 lane .. + 15 of keys warp + 8 i: all four loads, then the decodes.
+        uint4 raw[4];
+        uint32_t raw_scale[4], raw_kind[4];
 #pragma unroll
         for (uint32_t i = 0; i < 4u; ++i) {
             const uint32_t slot = tile * OBA_TILE + warp + 8u * i;
@@ -1476,8 +1631,6 @@ extern "C" __global__ void __launch_bounds__(256) opt_bulk_attn(
                 }
             }
         }
-    };
-    auto store = [&]() {
 #pragma unroll
         for (uint32_t i = 0; i < 4u; ++i) {
             const uint32_t key = warp + 8u * i;
@@ -1492,16 +1645,8 @@ extern "C" __global__ void __launch_bounds__(256) opt_bulk_attn(
                 }
             } else if (raw_kind[i] == 2u) {
                 const float scale = oba_e4m3(raw_scale[i]);
-                const uint32_t w2[2] = {raw[i].x, raw[i].y};
-#pragma unroll
-                for (uint32_t j = 0; j < 2u; ++j) {
-#pragma unroll
-                    for (uint32_t b = 0; b < 4u; ++b) {
-                        const uint32_t byte = (w2[j] >> (8u * b)) & 0xffu;
-                        v[4u * j + b] = ob_pack(__float2bfloat16_rn(oba_e2m1(byte & 0xfu) * scale),
-                                               __float2bfloat16_rn(oba_e2m1(byte >> 4) * scale));
-                    }
-                }
+                oba_e2m1x8(raw[i].x, scale, v);
+                oba_e2m1x8(raw[i].y, scale, v + 4);
             } else {
 #pragma unroll
                 for (uint32_t j = 0; j < 8u; ++j) v[j] = 0u;
@@ -1510,48 +1655,53 @@ extern "C" __global__ void __launch_bounds__(256) opt_bulk_attn(
             *reinterpret_cast<uint4 *>(&s_k[oba_k_off(key, 2u * lane + 1u)]) = make_uint4(v[4], v[5], v[6], v[7]);
             if (lane == 0u) s_valid[key] = raw_kind[i] != 0u;
         }
-    };
-
-    if (tiles > 0u) fetch(0);
-    for (uint32_t tile = 0; tile < tiles; ++tile) {
-        store();
         __syncthreads();
-        if (tile + 1u < tiles) fetch(tile + 1u);
+        // One accumulator per 8-key column tile: two independent chains of eight MMAs.
         {
-            float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            const uint32_t key = nt_s * 8u + (lane & 7u);
+            float c[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
 #pragma unroll
-            for (uint32_t j2 = 0; j2 < 8u; ++j2) {
-                const uint32_t chunk = kh * 32u + j2 * 4u + (lane >> 3);
-                uint32_t b0, b1, b2, b3;
-                om_ldsm4(om_smem(&s_k[oba_k_off(key, chunk)]), b0, b1, b2, b3);
-                ob_mma(c, qa[2u * j2], b0, b1);
-                ob_mma(c, qa[2u * j2 + 1u], b2, b3);
+            for (uint32_t j2 = 0; j2 < 4u; ++j2) {
+                const uint32_t chunk = kd * 16u + j2 * 4u + (lane >> 3);
+#pragma unroll
+                for (uint32_t t = 0; t < 2u; ++t) {
+                    const uint32_t key = kq * 16u + t * 8u + (lane & 7u);
+                    uint32_t b0, b1, b2, b3;
+                    om_ldsm4(om_smem(&s_k[oba_k_off(key, chunk)]), b0, b1, b2, b3);
+                    ob_mma(c[t], qa[2u * j2], b0, b1);
+                    ob_mma(c[t], qa[2u * j2 + 1u], b2, b3);
+                }
             }
-            s_s[kh][g][nt_s * 8u + 2u * q] = c[0];
-            s_s[kh][g][nt_s * 8u + 2u * q + 1u] = c[1];
-            s_s[kh][g + 8u][nt_s * 8u + 2u * q] = c[2];
-            s_s[kh][g + 8u][nt_s * 8u + 2u * q + 1u] = c[3];
+#pragma unroll
+            for (uint32_t t = 0; t < 2u; ++t) {
+                const uint32_t col = kq * 16u + t * 8u + 2u * q;
+                *reinterpret_cast<float2 *>(&s_s[kd][g][col]) = make_float2(c[t][0], c[t][1]);
+                *reinterpret_cast<float2 *>(&s_s[kd][g + 8u][col]) = make_float2(c[t][2], c[t][3]);
+            }
         }
         __syncthreads();
-        // Online softmax: warp w takes heads 2 w and 2 w + 1, lane = key.
+        // Online softmax: warp w takes heads 2 w (lanes 0-15) and 2 w + 1 (lanes 16-31), two keys a
+        // lane, so one 16-lane butterfly reduces both heads.
+        {
+            const uint32_t h = 2u * warp + (lane >> 4), k2 = 2u * (lane & 15u);
+            const bool v0 = s_valid[k2] != 0u, v1 = s_valid[k2 + 1u] != 0u;
+            const float2 a0 = *reinterpret_cast<const float2 *>(&s_s[0][h][k2]);
+            const float2 a1 = *reinterpret_cast<const float2 *>(&s_s[1][h][k2]);
+            const float2 a2 = *reinterpret_cast<const float2 *>(&s_s[2][h][k2]);
+            const float2 a3 = *reinterpret_cast<const float2 *>(&s_s[3][h][k2]);
+            const float score0 = v0 ? ((a0.x + a1.x) + (a2.x + a3.x)) * OBA_SCORE_SCALE : -3.402823466e38f;
+            const float score1 = v1 ? ((a0.y + a1.y) + (a2.y + a3.y)) * OBA_SCORE_SCALE : -3.402823466e38f;
+            float tile_max = fmaxf(score0, score1);
 #pragma unroll
-        for (uint32_t hh = 0; hh < 2u; ++hh) {
-            const uint32_t h = 2u * warp + hh;
-            const bool valid = s_valid[lane] != 0u;
-            const float score = valid ? (s_s[0][h][lane] + s_s[1][h][lane]) * OBA_SCORE_SCALE : -3.402823466e38f;
-            float tile_max = score;
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, o));
+            for (int o = 8; o > 0; o >>= 1) tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, o));
             const float m_old = s_m[h];
             const float m_new = fmaxf(m_old, tile_max);
-            const float p = valid ? expf(score - m_new) : 0.0f;
-            s_p[h * OBA_P_LD + lane] = __float2bfloat16_rn(p);
-            float sum = p;
+            const float p0 = v0 ? expf(score0 - m_new) : 0.0f;
+            const float p1 = v1 ? expf(score1 - m_new) : 0.0f;
+            *reinterpret_cast<__nv_bfloat162 *>(&s_p[h * OBA_P_LD + k2]) = __floats2bfloat162_rn(p0, p1);
+            float sum = p0 + p1;
 #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-            __syncwarp();
-            if (lane == 0u) {
+            for (int o = 8; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            if ((lane & 15u) == 0u) {
                 const float alpha = expf(m_old - m_new);
                 s_alpha[h] = alpha;
                 s_l[h] = s_l[h] * alpha + sum;

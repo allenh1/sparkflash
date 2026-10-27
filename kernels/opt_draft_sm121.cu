@@ -9,10 +9,12 @@
 //   opt_draft_norm_quant  RMSNorm of f32 rows by a bf16 weight, then the MX FP8 activation codes
 //                         (grid rows).
 //   opt_draft_attn        the block attention: every row of the block attends the stage ring's last
-//                         min(d, 128) positions and all of the block's own rows (grid heads x rows).
+//                         min(d, 128) positions and all of the block's own rows (grid heads x rows;
+//                         with a row table, several sequences' blocks).
 //   opt_draft_logits      the head logits of a pass's rows over the rank's vocabulary slice.
 //   opt_draft_head_fp8    the head slice as E4M3 codes + ue8m0 per 32 (once, at the first draft).
 //   opt_draft_logits_fp8  opt_draft_logits over that copy: half the bytes of the bf16 head.
+//   opt_draft_head_fp8t   the same copy in opt_mma_head_fp8t_f32o's 128-entry tiles.
 //   opt_draft_markov      one sequential draft step: base logits of row i plus the Markov bias of
 //                         ids[i], chunk maxima for opt_rows_argmax_fold and each chunk's softmax mass.
 //   opt_draft_fold_prob   the chunk maxima and masses of one step folded into this rank's slot.
@@ -122,7 +124,9 @@ extern "C" __global__ void __launch_bounds__(256) opt_draft_norm_quant(
 // Block attention. The stage ring is linear (slot = position): the main rows' KV at their own
 // positions, and the block's rows written at d .. d + rows - 1 just before this launch, so the keys
 // of every row are the one contiguous range [max(d, 128) - 128, d + rows). The block is not causal
-// inside itself (model.py:1021-1029).
+// inside itself (model.py:1021-1029). With a row table (several sequences' blocks in one launch, as
+// opt_rows_kv reads it: row y's {lane offset in bytes, position}) row y's block is rows
+// y - y % block_rows .. + block_rows, at its first row's position in the ring at row y's offset.
 // ---------------------------------------------------------------------------------------------
 #define OD_A_LATENT 512u
 #define OD_A_THREADS 256u
@@ -159,7 +163,9 @@ extern "C" __global__ void __launch_bounds__(OD_A_THREADS) opt_draft_attn(
     const uint8_t *__restrict__ ring_scales,
     const float *__restrict__ sink,           // [heads] of this rank
     __nv_bfloat16 *__restrict__ out_all,      // [rows][heads][512]
-    const uint32_t d) {
+    const uint32_t block_d,
+    const uint64_t *__restrict__ row_tab,     // null, or the batched rows' {lane offset, position}
+    const uint32_t block_rows) {
     OPT_PDL_ENTRY();
     const uint32_t head = blockIdx.x;
     const uint32_t heads = gridDim.x;
@@ -167,11 +173,18 @@ extern "C" __global__ void __launch_bounds__(OD_A_THREADS) opt_draft_attn(
     const uint32_t t = threadIdx.x;
     const uint32_t lane = t & 31u;
     const uint32_t warp = t >> 5;
+    uint32_t d = block_d, rows = gridDim.y;
+    uint64_t lane_offset = 0u;
+    if (row_tab != nullptr) {
+        lane_offset = __ldg(row_tab + 2u * y);
+        d = (uint32_t)__ldg(row_tab + 2u * (y - y % block_rows) + 1u);
+        rows = block_rows;
+    }
     const uint32_t start = d > OD_A_WINDOW ? d - OD_A_WINDOW : 0u;
-    uint32_t keys = d + gridDim.y - start;
+    uint32_t keys = d + rows - start;
     keys = keys < OD_A_MAX_KEYS ? keys : OD_A_MAX_KEYS;
-    const uint8_t *codes = ring_codes + (uint64_t)start * OD_A_LATENT;
-    const uint8_t *scales = ring_scales + (uint64_t)start * OD_A_WSCALES;
+    const uint8_t *codes = ring_codes + lane_offset + (uint64_t)start * OD_A_LATENT;
+    const uint8_t *scales = ring_scales + lane_offset + (uint64_t)start * OD_A_WSCALES;
     const __nv_bfloat16 *q = q_all + ((uint64_t)y * heads + head) * OD_A_LATENT;
     __nv_bfloat16 *out = out_all + ((uint64_t)y * heads + head) * OD_A_LATENT;
 
@@ -310,6 +323,36 @@ extern "C" __global__ void __launch_bounds__(256) opt_draft_head_fp8(
         const uint8_t scale = spark_act_quant_scale_code(amax);
         codes[i] = spark_fp8_e4m3_encode(v * (1.0f / spark_ue8m0_decode(scale)));
         if (lane == 0u) scales[row * (OD_HIDDEN / 32u) + b] = scale;
+    }
+}
+
+// opt_draft_head_fp8 into opt_mma_head_fp8t_f32o's tiles: entry v's codes of K block b at
+// ((v / 128 * 160 + b) * 128 + v % 128) * 32 and its scale at (v / 128 * 160 + b) * 128 + v % 128.
+// Grid vocab rounded up to 128 (the entries past the slice write zero codes and scale 0), 256
+// threads.
+extern "C" __global__ void __launch_bounds__(256) opt_draft_head_fp8t(
+    const __nv_bfloat16 *__restrict__ w, uint8_t *__restrict__ codes, uint8_t *__restrict__ scales,
+    const uint32_t vocab) {
+    OPT_PDL_ENTRY();
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint64_t row = blockIdx.x;
+    const uint64_t tile = row >> 7;
+    const uint32_t col = (uint32_t)row & 127u;
+    for (uint32_t b = warp; b < OD_HIDDEN / 32u; b += 8u) {
+        const uint64_t at = (tile * (OD_HIDDEN / 32u) + b) * 128u + col;
+        if (row >= vocab) {
+            codes[at * 32u + lane] = 0u;
+            if (lane == 0u) scales[at] = 0u;
+            continue;
+        }
+        const float v = __bfloat162float(w[row * OD_HIDDEN + b * 32u + lane]);
+        float amax = fabsf(v);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        const uint8_t scale = spark_act_quant_scale_code(amax);
+        codes[at * 32u + lane] = spark_fp8_e4m3_encode(v * (1.0f / spark_ue8m0_decode(scale)));
+        if (lane == 0u) scales[at] = scale;
     }
 }
 
@@ -495,7 +538,10 @@ extern "C" __global__ void opt_draft_pick_prob(
 // g's block, each sequence's ids (anchor, then the drafts) and probabilities at ids + g * ids_stride
 // and ids + g * ids_stride + block + 1. Each sequence's values are the one-sequence kernels' bits.
 // ---------------------------------------------------------------------------------------------
-#define OD_MAX_SEQS 8u
+#define OD_MAX_SEQS 16u
+// opt_draft_markov_seqs keeps a sequence's state in registers: past eight it spills, so a pass that
+// takes it holds at most eight sequences (draft.rs DraftState::pass_seqs).
+#define OD_SIMT_SEQS 8u
 
 // Row r of seqs * block rows: a block's first row is its anchor's embedding row from the owner's
 // slot of the exchanged gather ([world][seqs][hidden] bf16, opt_rows_embed_own over the anchors),
@@ -560,14 +606,14 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov_seq
     const uint32_t rows_per_seq,
     const uint32_t id_base) {
     OPT_PDL_ENTRY();
-    __shared__ float s_best[OD_MAX_SEQS][OD_LM_WARPS];
-    __shared__ float s_sum[OD_MAX_SEQS][OD_LM_WARPS];
-    __shared__ uint32_t s_best_i[OD_MAX_SEQS][OD_LM_WARPS];
+    __shared__ float s_best[OD_SIMT_SEQS][OD_LM_WARPS];
+    __shared__ float s_sum[OD_SIMT_SEQS][OD_LM_WARPS];
+    __shared__ uint32_t s_best_i[OD_SIMT_SEQS][OD_LM_WARPS];
     // The noise parameters live in shared memory and each logits row is addressed in place: eight
     // sequences' worth in registers spills.
-    __shared__ float s_inv_t[OD_MAX_SEQS];
-    __shared__ uint64_t s_seed[OD_MAX_SEQS];
-    __shared__ uint32_t s_pos[OD_MAX_SEQS];
+    __shared__ float s_inv_t[OD_SIMT_SEQS];
+    __shared__ uint64_t s_seed[OD_SIMT_SEQS];
+    __shared__ uint32_t s_pos[OD_SIMT_SEQS];
     const uint32_t t = threadIdx.x;
     const uint32_t lane = t & 31u;
     const uint32_t warp = t >> 5;
@@ -576,11 +622,11 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov_seq
         s_seed[t] = (uint64_t)params[4u * t + 1u] | ((uint64_t)params[4u * t + 2u] << 32);
         s_pos[t] = params[4u * t + 3u] + step;
     }
-    uint4 e[OD_MAX_SEQS];
-    float best[OD_MAX_SEQS], sum[OD_MAX_SEQS];
-    uint32_t best_i[OD_MAX_SEQS];
+    uint4 e[OD_SIMT_SEQS];
+    float best[OD_SIMT_SEQS], sum[OD_SIMT_SEQS];
+    uint32_t best_i[OD_SIMT_SEQS];
 #pragma unroll
-    for (uint32_t g = 0; g < OD_MAX_SEQS; ++g) {
+    for (uint32_t g = 0; g < OD_SIMT_SEQS; ++g) {
         best[g] = -3.402823466e38f;
         sum[g] = 0.0f;
         best_i[g] = 0xffffffffu;
@@ -596,7 +642,7 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov_seq
         if (entry >= vocab) break;
         const uint4 h = od_ldw(reinterpret_cast<const uint4 *>(markov_head + (uint64_t)entry * OD_MARKOV_RANK) + lane);
 #pragma unroll
-        for (uint32_t g = 0; g < OD_MAX_SEQS; ++g) {
+        for (uint32_t g = 0; g < OD_SIMT_SEQS; ++g) {
             if (g < seqs) {
                 const float bias = od_warp_sum(od_dot8(h, e[g], 0.0f));
                 const float logit = logits_all[(uint64_t)(g * rows_per_seq + step) * vocab + entry] + bias;
@@ -615,7 +661,7 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov_seq
     }
     if (lane == 0u) {
 #pragma unroll
-        for (uint32_t g = 0; g < OD_MAX_SEQS; ++g) {
+        for (uint32_t g = 0; g < OD_SIMT_SEQS; ++g) {
             s_best[g][warp] = best[g]; s_sum[g][warp] = sum[g]; s_best_i[g][warp] = best_i[g];
         }
     }
@@ -640,18 +686,20 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov_seq
     }
 }
 
-// opt_draft_markov_seqs with the biases on the tensor cores: the eight sequences' Markov embeddings
-// are the rows of A (m16n8k16 bf16, rows 8..15 zero) and each n8 tile of the head the columns of B,
-// so a warp reads a head row once for all the sequences instead of a warp sum per sequence and
-// entry. Lane l holds sequence l / 4's biases of two entries per tile; the K order inside a 32-wide
-// span is permuted alike in A and B (lane q's 16 bytes of a row are k 8q .. 8q + 7), which the sum
-// does not see. The argmax keeps the lowest index of equal values and the mass is folded as the
-// one-row kernel's (not its bits: the drafter only has to draft well). Same arguments and grid.
-__device__ __forceinline__ void od_mma_bf16(float c[4], uint32_t a0, uint32_t a2, uint32_t b0, uint32_t b1) {
+// opt_draft_markov_seqs with the biases on the tensor cores: the sixteen sequences' Markov
+// embeddings are the rows of A (m16n8k16 bf16, rows past `seqs` zero) and each n8 tile of the head
+// the columns of B, so a warp reads a head row once for all the sequences instead of a warp sum per
+// sequence and entry. Lane l holds sequences l / 4 and l / 4 + 8's biases of two entries per tile;
+// the K order inside a 32-wide span is permuted alike in A and B (lane q's 16 bytes of a row are
+// k 8q .. 8q + 7), which the sum does not see. The argmax keeps the lowest index of equal values
+// and the mass is folded as the one-row kernel's (not its bits: the drafter only has to draft
+// well). Same arguments and grid.
+__device__ __forceinline__ void od_mma_bf16(float c[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                            uint32_t b0, uint32_t b1) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a0), "r"(0u), "r"(a2), "r"(0u), "r"(b0), "r"(b1));
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
 // (best, index, mass) of `other` folded into the running triple: the greater value wins, equal
@@ -691,34 +739,44 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov_seq
     const uint32_t t = threadIdx.x;
     const uint32_t lane = t & 31u;
     const uint32_t warp = t >> 5;
-    const uint32_t g = lane >> 2;
     const uint32_t q = lane & 3u;
-    const bool live = g < seqs;
-    float inv_t = 0.0f;
-    uint64_t seed = 0;
-    uint32_t pos = 0;
-    uint4 e[SPANS];
-    if (live) {
-        inv_t = __uint_as_float(params[4u * g]);
-        seed = (uint64_t)params[4u * g + 1u] | ((uint64_t)params[4u * g + 2u] << 32);
-        pos = params[4u * g + 3u] + step;
-        const uint32_t token = ids[g * ids_stride + step];
-        const uint4 *src = reinterpret_cast<const uint4 *>(markov_embed + (uint64_t)token * OD_MARKOV_RANK);
+    // This lane's sequences: A rows lane / 4 (c[0], c[1]) and lane / 4 + 8 (c[2], c[3]).
+    bool live[2];
+    float inv_t[2], best[2], sum[2];
+    uint64_t seed[2];
+    uint32_t pos[2], best_i[2];
+    const float *logits[2];
+    uint4 e[2][SPANS];
 #pragma unroll
-        for (uint32_t s = 0; s < SPANS; ++s) e[s] = __ldg(src + 4u * s + q);
-    } else {
+    for (uint32_t h = 0; h < 2u; ++h) {
+        const uint32_t g = (lane >> 2) + 8u * h;
+        live[h] = g < seqs;
+        inv_t[h] = 0.0f;
+        seed[h] = 0;
+        pos[h] = 0;
+        best[h] = -3.402823466e38f;
+        sum[h] = 0.0f;
+        best_i[h] = 0xffffffffu;
+        logits[h] = logits_all + (uint64_t)(g * rows_per_seq + step) * vocab;
+        if (live[h]) {
+            inv_t[h] = __uint_as_float(params[4u * g]);
+            seed[h] = (uint64_t)params[4u * g + 1u] | ((uint64_t)params[4u * g + 2u] << 32);
+            pos[h] = params[4u * g + 3u] + step;
+            const uint32_t token = ids[g * ids_stride + step];
+            const uint4 *src = reinterpret_cast<const uint4 *>(markov_embed + (uint64_t)token * OD_MARKOV_RANK);
 #pragma unroll
-        for (uint32_t s = 0; s < SPANS; ++s) e[s] = make_uint4(0u, 0u, 0u, 0u);
+            for (uint32_t s = 0; s < SPANS; ++s) e[h][s] = __ldg(src + 4u * s + q);
+        } else {
+#pragma unroll
+            for (uint32_t s = 0; s < SPANS; ++s) e[h][s] = make_uint4(0u, 0u, 0u, 0u);
+        }
     }
-    const float *logits = logits_all + (uint64_t)(g * rows_per_seq + step) * vocab;
-    float best = -3.402823466e38f, sum = 0.0f;
-    uint32_t best_i = 0xffffffffu;
     const uint32_t base = blockIdx.x * OD_LM_CHUNK + warp * TILES * 8u;
 #pragma unroll 2
     for (uint32_t tile = 0; tile < TILES; ++tile) {
         const uint32_t n0 = base + tile * 8u;
         if (n0 >= vocab) break;
-        const uint32_t row = min(n0 + g, vocab - 1u);
+        const uint32_t row = min(n0 + (lane >> 2), vocab - 1u);
         const uint4 *w = reinterpret_cast<const uint4 *>(markov_head + (uint64_t)row * OD_MARKOV_RANK);
         uint4 b[SPANS];
 #pragma unroll
@@ -726,32 +784,40 @@ extern "C" __global__ void __launch_bounds__(OD_LM_THREADS) opt_draft_markov_seq
         float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
         for (uint32_t s = 0; s < SPANS; ++s) {
-            od_mma_bf16(c, e[s].x, e[s].y, b[s].x, b[s].y);
-            od_mma_bf16(c, e[s].z, e[s].w, b[s].z, b[s].w);
+            od_mma_bf16(c, e[0][s].x, e[1][s].x, e[0][s].y, e[1][s].y, b[s].x, b[s].y);
+            od_mma_bf16(c, e[0][s].z, e[1][s].z, e[0][s].w, e[1][s].w, b[s].z, b[s].w);
         }
-        if (live) {
 #pragma unroll
-            for (uint32_t i = 0; i < 2u; ++i) {
-                const uint32_t entry = n0 + 2u * q + i;
-                if (entry < vocab) {
-                    const float logit = logits[entry] + c[i];
-                    const float value =
-                        inv_t == 0.0f ? logit : fmaf(logit, inv_t, opt_sample_gumbel(seed, pos, id_base + entry));
-                    od_fold(best, best_i, sum, value, entry, 1.0f);
+        for (uint32_t h = 0; h < 2u; ++h) {
+            if (live[h]) {
+#pragma unroll
+                for (uint32_t i = 0; i < 2u; ++i) {
+                    const uint32_t entry = n0 + 2u * q + i;
+                    if (entry < vocab) {
+                        const float logit = logits[h][entry] + c[2u * h + i];
+                        const float value = inv_t[h] == 0.0f
+                            ? logit
+                            : fmaf(logit, inv_t[h], opt_sample_gumbel(seed[h], pos[h], id_base + entry));
+                        od_fold(best[h], best_i[h], sum[h], value, entry, 1.0f);
+                    }
                 }
             }
         }
     }
     // The quad's four lanes hold one sequence's entries.
 #pragma unroll
-    for (int o = 1; o <= 2; o <<= 1) {
-        const float o_best = __shfl_xor_sync(0xffffffffu, best, o);
-        const uint32_t o_i = __shfl_xor_sync(0xffffffffu, best_i, o);
-        const float o_sum = __shfl_xor_sync(0xffffffffu, sum, o);
-        od_fold(best, best_i, sum, o_best, o_i, o_sum);
-    }
-    if (q == 0u) {
-        s_best[g][warp] = best; s_sum[g][warp] = sum; s_best_i[g][warp] = best_i;
+    for (uint32_t h = 0; h < 2u; ++h) {
+#pragma unroll
+        for (int o = 1; o <= 2; o <<= 1) {
+            const float o_best = __shfl_xor_sync(0xffffffffu, best[h], o);
+            const uint32_t o_i = __shfl_xor_sync(0xffffffffu, best_i[h], o);
+            const float o_sum = __shfl_xor_sync(0xffffffffu, sum[h], o);
+            od_fold(best[h], best_i[h], sum[h], o_best, o_i, o_sum);
+        }
+        if (q == 0u) {
+            const uint32_t g = (lane >> 2) + 8u * h;
+            s_best[g][warp] = best[h]; s_sum[g][warp] = sum[h]; s_best_i[g][warp] = best_i[h];
+        }
     }
     __syncthreads();
     if (t < seqs) {

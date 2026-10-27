@@ -13,9 +13,11 @@
 //   opt_rows_attn         opt_flash_mla_csa2_seq without the HSI prologue (grid heads x rows); the
 //                         window and the selected count are derived from the row's position.
 //   opt_rows_inv_rope     rope_rotate_rows_bf16 with sin_sign = -1 (grid heads x rows).
-//   opt_rows_lm_head      opt_lm_head per row (grid chunks x rows).
-//   opt_rows_engram_wkv   opt_engram_wkv over the rows, eight to a weight read.
-//   opt_rows_hostw_*      b12x_hostw_gemv_m1 per row (grid cols/32 x rows).
+//   opt_rows_lm_head      opt_lm_head per row (grid row groups of four x chunks).
+//   opt_rows_engram_wkv   opt_engram_wkv over the rows, eight to a weight read; the _s form stages
+//                         sixteen rows' activations in shared memory per pass.
+//   opt_rows_hostw_*      b12x_hostw_gemv_m1 per row (grid cols/32 x rows); the _ring forms write
+//                         each row's compressor ring row, every lane's in one launch.
 //   opt_rows_argmax_pick  the cross-rank argmax over exchanged folds (the host gather's rule).
 //   opt_rows_topc         a row's slice statistics for the truncated (top-k / top-p) sampler.
 //   opt_rows_embed_*      the rows' embedding streams from device ids, over the exchange.
@@ -1706,27 +1708,34 @@ __device__ __forceinline__ uint4 or_ldw(const void *p) {
     return v;
 }
 
+// The mixed-precision FMA takes the bf16 operands as they are: their product is exact in f32, so
+// each step rounds exactly as fmaf on the widened values does (opt_lm_head's), without the widening.
+__device__ __forceinline__ float or_fma2_bf16(uint32_t a, uint32_t b, float c) {
+    asm("fma.rn.f32.bf16 %0, %1, %2, %0;" : "+f"(c) : "h"((uint16_t)(a & 0xffffu)), "h"((uint16_t)(b & 0xffffu)));
+    asm("fma.rn.f32.bf16 %0, %1, %2, %0;" : "+f"(c) : "h"((uint16_t)(a >> 16)), "h"((uint16_t)(b >> 16)));
+    return c;
+}
+
 __device__ __forceinline__ float or_dot8(uint4 w, uint4 h, float acc) {
-    const uint32_t a[4] = {w.x, w.y, w.z, w.w};
-    const uint32_t b[4] = {h.x, h.y, h.z, h.w};
-#pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        acc = fmaf(or_bf16lo(a[k]), or_bf16lo(b[k]), acc);
-        acc = fmaf(or_bf16hi(a[k]), or_bf16hi(b[k]), acc);
-    }
+    acc = or_fma2_bf16(w.x, h.x, acc);
+    acc = or_fma2_bf16(w.y, h.y, acc);
+    acc = or_fma2_bf16(w.z, h.z, acc);
+    acc = or_fma2_bf16(w.w, h.w, acc);
     return acc;
 }
 
-// Up to OR_LM_MAXR rows share one pass over the weight: every warp row is loaded once and dotted
-// against each row's hidden (read through L1: 16 rows of 10 KB exceed the static shared limit), so
+// Block (g, c) scores chunk c's 1024 entries for the OR_LM_ROWS rows g * OR_LM_ROWS ..: every warp
+// row is loaded once and dotted against each row's hidden (staged in shared memory, 10 KB a row), so
 // the per-row value is opt_lm_head's (same FMA order per row). Lane y keeps row y's running best
 // (every lane holds the warp's sum after the shuffle), so the rows cost two registers, not two each.
+// Four rows a block keeps the weight reads of the row groups close together in L2 and the staged rows
+// within the static shared limit; the groups' blocks read each weight row from L2 after the first.
 //
 // Sampling: with inv_t == 0 the block maxima are the raw logits' (greedy, unchanged). Otherwise the
 // score of entry v on row y is logit * inv_t + G(seed, pos0 + y, id_base + v) (opt_sample_sm121.cuh),
 // so the maxima's argmax is a sample of softmax(logits / T) at the position row y produces. With
 // logits_out non-null every raw logit is also written ([rows][vocab]) for opt_rows_topc.
-#define OR_LM_MAXR 16u
+#define OR_LM_ROWS 4u
 extern "C" __global__ void __launch_bounds__(OR_LM_THREADS) opt_rows_lm_head(
     const __nv_bfloat16 *__restrict__ hidden_all,    // [rows][5120]
     const __nv_bfloat16 *__restrict__ w,
@@ -1741,33 +1750,40 @@ extern "C" __global__ void __launch_bounds__(OR_LM_THREADS) opt_rows_lm_head(
     const uint32_t id_base,
     const uint32_t *__restrict__ row_params) {     // [rows][4] or null (see below)
     OPT_PDL_ENTRY();
-    __shared__ float s_best[OR_LM_MAXR][OR_LM_WARPS];
-    __shared__ uint32_t s_best_i[OR_LM_MAXR][OR_LM_WARPS];
+    __shared__ float s_best[OR_LM_ROWS][OR_LM_WARPS];
+    __shared__ uint32_t s_best_i[OR_LM_ROWS][OR_LM_WARPS];
     // Each row's noise: (inv_t, seed, position). Without row_params every row takes the scalar
     // arguments at position pos0 + y; with them (rows of different requests) row y reads
     // {inv_t bits, position, seed low, seed high} from row_params[4y..].
-    __shared__ float s_inv_t[OR_LM_MAXR];
-    __shared__ uint64_t s_seed[OR_LM_MAXR];
-    __shared__ uint32_t s_pos[OR_LM_MAXR];
-    if (threadIdx.x < OR_LM_MAXR) {
+    __shared__ float s_inv_t[OR_LM_ROWS];
+    __shared__ uint64_t s_seed[OR_LM_ROWS];
+    __shared__ uint32_t s_pos[OR_LM_ROWS];
+    __shared__ __align__(16) uint4 s_h[OR_LM_ROWS * (OR_LM_HIDDEN / 8u)];
+    const uint32_t row0 = blockIdx.x * OR_LM_ROWS;
+    const uint32_t chunk = blockIdx.y;
+    const uint32_t chunks = gridDim.y;
+    const uint32_t live = rows - row0 < OR_LM_ROWS ? rows - row0 : OR_LM_ROWS;
+    if (threadIdx.x < OR_LM_ROWS) {
         const uint32_t y = threadIdx.x;
-        if (row_params != nullptr && y < rows) {
-            s_inv_t[y] = __uint_as_float(row_params[4u * y]);
-            s_pos[y] = row_params[4u * y + 1u];
-            s_seed[y] = (uint64_t)row_params[4u * y + 2u] | ((uint64_t)row_params[4u * y + 3u] << 32);
+        if (row_params != nullptr && y < live) {
+            const uint32_t *p = row_params + 4u * (row0 + y);
+            s_inv_t[y] = __uint_as_float(p[0]);
+            s_pos[y] = p[1];
+            s_seed[y] = (uint64_t)p[2] | ((uint64_t)p[3] << 32);
         } else {
             s_inv_t[y] = inv_t;
-            s_pos[y] = pos0 + y;
+            s_pos[y] = pos0 + row0 + y;
             s_seed[y] = seed;
         }
     }
+    const uint32_t per = OR_LM_HIDDEN / 8u;
+    const uint4 *hidden4 = reinterpret_cast<const uint4 *>(hidden_all) + (uint64_t)row0 * per;
+    for (uint32_t i = threadIdx.x; i < live * per; i += OR_LM_THREADS) s_h[i] = __ldg(hidden4 + i);
     __syncthreads();
     const uint32_t t = threadIdx.x;
     const uint32_t lane = t & 31u;
     const uint32_t warp = t >> 5;
-    const uint32_t per = OR_LM_HIDDEN / 8u;
-    const uint4 *hidden4 = reinterpret_cast<const uint4 *>(hidden_all);
-    const uint32_t base = blockIdx.x * OR_LM_CHUNK;
+    const uint32_t base = chunk * OR_LM_CHUNK;
     float best = -3.402823466e38f;
     uint32_t best_i = 0xffffffffu;
     for (uint32_t r = warp; r < OR_LM_CHUNK; r += OR_LM_WARPS) {
@@ -1778,15 +1794,15 @@ extern "C" __global__ void __launch_bounds__(OR_LM_THREADS) opt_rows_lm_head(
 #pragma unroll
         for (uint32_t i = 0; i < 20u; ++i) wv[i] = or_ldw(row + lane + 32u * i);
 #pragma unroll
-        for (uint32_t y = 0; y < OR_LM_MAXR; ++y) {
-            if (y < rows) {
-                const uint4 *h = hidden4 + y * per;
+        for (uint32_t y = 0; y < OR_LM_ROWS; ++y) {
+            if (y < live) {
+                const uint4 *h = s_h + y * per;
                 float acc = 0.0f;
 #pragma unroll
-                for (uint32_t i = 0; i < 20u; ++i) acc = or_dot8(wv[i], __ldg(h + lane + 32u * i), acc);
+                for (uint32_t i = 0; i < 20u; ++i) acc = or_dot8(wv[i], h[lane + 32u * i], acc);
 #pragma unroll
                 for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
-                if (logits_out != nullptr && lane == 0u) logits_out[(uint64_t)y * vocab + entry] = acc;
+                if (logits_out != nullptr && lane == 0u) logits_out[(uint64_t)(row0 + y) * vocab + entry] = acc;
                 if (lane == y) {
                     const float row_inv_t = s_inv_t[y];
                     const float score = row_inv_t == 0.0f
@@ -1797,9 +1813,9 @@ extern "C" __global__ void __launch_bounds__(OR_LM_THREADS) opt_rows_lm_head(
             }
         }
     }
-    if (lane < OR_LM_MAXR) { s_best[lane][warp] = best; s_best_i[lane][warp] = best_i; }
+    if (lane < OR_LM_ROWS) { s_best[lane][warp] = best; s_best_i[lane][warp] = best_i; }
     __syncthreads();
-    if (t < rows) {
+    if (t < live) {
         const uint32_t y = t;
         float v = s_best[y][0];
         uint32_t idx = s_best_i[y][0];
@@ -1808,8 +1824,8 @@ extern "C" __global__ void __launch_bounds__(OR_LM_THREADS) opt_rows_lm_head(
             if (oi == 0xffffffffu) continue;
             if (idx == 0xffffffffu || s_best[y][k] > v || (s_best[y][k] == v && oi < idx)) { v = s_best[y][k]; idx = oi; }
         }
-        block_max_all[(uint64_t)y * gridDim.x + blockIdx.x] = v;
-        block_argmax_all[(uint64_t)y * gridDim.x + blockIdx.x] = idx == 0xffffffffu ? 0u : idx;
+        block_max_all[(uint64_t)(row0 + y) * chunks + chunk] = v;
+        block_argmax_all[(uint64_t)(row0 + y) * chunks + chunk] = idx == 0xffffffffu ? 0u : idx;
     }
 }
 
@@ -2206,6 +2222,153 @@ extern "C" __global__ void __launch_bounds__(256) opt_rows_engram_wkv(
     }
 }
 
+// opt_rows_engram_wkv_s: opt_rows_engram_wkv with the rows' activations staged once per block and
+//   two outputs a warp. Per 512-wide K chunk the block widens up to 16 rows' E4M3 codes to f16 in
+//   shared memory (and their scales to f32); lane l of a warp then reads its 16 values of each row
+//   there and runs opt_engram_wkv's chain on them for both of its outputs: the 16 products in
+//   order from zero on the mixed-precision FMA (E4M3 is exact in f16, the products exact in f32,
+//   so each is the f32 FMA's rounding), the pair sum with lane l ^ 1, the scaled add into the even
+//   lane's accumulator, and the warp's tree at the end. So every output is the single-row kernel's
+//   bits. Grid ceil((row_end - row_base) / 16), 256 threads; rows past 16 take further passes.
+#define OR_ES_K 512u
+
+// Lane l's 32 staged bytes (16 f16) hold its values 8 h .. 8 h + 7 at 16 (h ^ (l / 4 % 2)), so the
+// eight lanes of a 16-byte phase fall in distinct banks.
+__device__ __forceinline__ uint32_t or_es_half(uint32_t l, uint32_t h) {
+    return l * 32u + ((h ^ ((l >> 2) & 1u)) << 4);
+}
+
+__device__ __forceinline__ uint32_t or_es_e4m3x2(uint32_t two) {
+    uint32_t h;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h) : "h"((uint16_t)(two & 0xffffu)));
+    return h;
+}
+
+// c + a.lo * b.lo, then + a.hi * b.hi, on f16x2 pairs: two single-rounding f32 FMAs.
+__device__ __forceinline__ float or_es_fma2(uint32_t a, uint32_t b, float c) {
+    asm("fma.rn.f32.f16 %0, %1, %2, %0;" : "+f"(c) : "h"((uint16_t)(a & 0xffffu)), "h"((uint16_t)(b & 0xffffu)));
+    asm("fma.rn.f32.f16 %0, %1, %2, %0;" : "+f"(c) : "h"((uint16_t)(a >> 16)), "h"((uint16_t)(b >> 16)));
+    return c;
+}
+
+template <uint32_t OR_ES_ROWS>
+__device__ __forceinline__ void or_engram_wkv_staged(
+    const uint8_t *__restrict__ act_codes_all, const uint8_t *__restrict__ act_scales_all,
+    const uint8_t *__restrict__ weight, const uint8_t *__restrict__ weight_scales,
+    __nv_bfloat16 *__restrict__ out_all, const uint32_t out_width, const uint32_t inner,
+    const uint32_t rows, const uint32_t row_base, const uint32_t row_end, const uint32_t out_stride) {
+    __shared__ __align__(16) uint8_t s_act[OR_ES_ROWS * OR_ES_K * 2u];
+    __shared__ float s_scale[OR_ES_ROWS * (OR_ES_K / 32u)];
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t k_blocks = inner / 32u;
+    const uint32_t out0 = row_base + blockIdx.x * 16u + warp * 2u;
+    const bool live_out[2] = {out0 < row_end && out0 < out_width, out0 + 1u < row_end && out0 + 1u < out_width};
+    for (uint32_t y0 = 0u; y0 < rows; y0 += OR_ES_ROWS) {
+        const uint32_t live_rows = rows - y0 < OR_ES_ROWS ? rows - y0 : OR_ES_ROWS;
+        float acc[2][OR_ES_ROWS];
+#pragma unroll
+        for (int o = 0; o < 2; ++o)
+#pragma unroll
+            for (int y = 0; y < (int)OR_ES_ROWS; ++y) acc[o][y] = 0.0f;
+        for (uint32_t base = 0u; base < inner; base += OR_ES_K) {
+            __syncthreads();
+            // Thread t widens row t / 32's lane-t % 32 group of 16 codes, eight rows apart.
+            for (uint32_t i = threadIdx.x; i < OR_ES_ROWS * 32u; i += 256u) {
+                const uint32_t y = i >> 5;
+                const uint32_t l = i & 31u;
+                const uint32_t col = base + 16u * l;
+                uint4 u = make_uint4(0u, 0u, 0u, 0u);
+                if (y < live_rows && col < inner)
+                    u = __ldg(reinterpret_cast<const uint4 *>(act_codes_all + (uint64_t)(y0 + y) * inner + col));
+                uint8_t *row = s_act + y * (OR_ES_K * 2u);
+                *reinterpret_cast<uint4 *>(row + or_es_half(l, 0u)) =
+                    make_uint4(or_es_e4m3x2(u.x), or_es_e4m3x2(u.x >> 16), or_es_e4m3x2(u.y), or_es_e4m3x2(u.y >> 16));
+                *reinterpret_cast<uint4 *>(row + or_es_half(l, 1u)) =
+                    make_uint4(or_es_e4m3x2(u.z), or_es_e4m3x2(u.z >> 16), or_es_e4m3x2(u.w), or_es_e4m3x2(u.w >> 16));
+            }
+            for (uint32_t i = threadIdx.x; i < OR_ES_ROWS * (OR_ES_K / 32u); i += 256u) {
+                const uint32_t y = i / (OR_ES_K / 32u);
+                const uint32_t kb = base / 32u + i % (OR_ES_K / 32u);
+                s_scale[i] = y < live_rows && kb < k_blocks
+                                 ? spark_ue8m0_decode(act_scales_all[(uint64_t)(y0 + y) * k_blocks + kb])
+                                 : 0.0f;
+            }
+            __syncthreads();
+            const uint32_t col = base + 16u * lane;
+            const bool live = col < inner;
+            const uint32_t kb = col / 32u;
+            uint32_t w[2][8];
+            float wscale[2];
+#pragma unroll
+            for (int o = 0; o < 2; ++o) {
+                uint4 wv = make_uint4(0u, 0u, 0u, 0u);
+                wscale[o] = 0.0f;
+                if (live && live_out[o]) {
+                    wv = or_ldw_nc(weight + (uint64_t)(out0 + o) * inner + col);
+                    wscale[o] = spark_ue8m0_decode(weight_scales[(uint64_t)((out0 + o) / 32u) * k_blocks + kb]);
+                }
+                const uint32_t ww[4] = {wv.x, wv.y, wv.z, wv.w};
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    w[o][2 * k] = or_es_e4m3x2(ww[k]);
+                    w[o][2 * k + 1] = or_es_e4m3x2(ww[k] >> 16);
+                }
+            }
+#pragma unroll
+            for (uint32_t y = 0; y < OR_ES_ROWS; ++y) {
+                if (y >= live_rows) break;
+                const uint8_t *row = s_act + y * (OR_ES_K * 2u);
+                const uint4 lo = *reinterpret_cast<const uint4 *>(row + or_es_half(lane, 0u));
+                const uint4 hi = *reinterpret_cast<const uint4 *>(row + or_es_half(lane, 1u));
+                const uint32_t a[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+                float d[2] = {0.0f, 0.0f};
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    d[0] = or_es_fma2(a[j], w[0][j], d[0]);
+                    d[1] = or_es_fma2(a[j], w[1][j], d[1]);
+                }
+                const float ascale = s_scale[y * (OR_ES_K / 32u) + lane / 2u];
+#pragma unroll
+                for (int o = 0; o < 2; ++o) {
+                    d[o] += __shfl_xor_sync(0xffffffffu, d[o], 1);
+                    if ((lane & 1u) == 0u && live && live_out[o])
+                        acc[o][y] = __fadd_rn(acc[o][y], __fmul_rn(__fmul_rn(d[o], ascale), wscale[o]));
+                }
+            }
+        }
+#pragma unroll
+        for (int o = 0; o < 2; ++o) {
+            if (!live_out[o]) continue;
+#pragma unroll
+            for (uint32_t y = 0; y < OR_ES_ROWS; ++y) {
+                if (y >= live_rows) break;
+                float a = acc[o][y];
+#pragma unroll
+                for (int s = 16; s > 0; s >>= 1) a += __shfl_xor_sync(0xffffffffu, a, s);
+                if (lane == 0u) out_all[(uint64_t)(y0 + y) * out_stride + (out0 + o - row_base)] = __float2bfloat16_rn(a);
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2) opt_rows_engram_wkv_s(
+    const uint8_t *__restrict__ act_codes_all,     // [rows][inner]
+    const uint8_t *__restrict__ act_scales_all,    // [rows][inner/32]
+    const uint8_t *__restrict__ weight,
+    const uint8_t *__restrict__ weight_scales,
+    __nv_bfloat16 *__restrict__ out_all,           // [rows][out_stride]
+    const uint32_t out_width,
+    const uint32_t inner,
+    const uint32_t rows,
+    const uint32_t row_base,
+    const uint32_t row_end,
+    const uint32_t out_stride) {
+    OPT_PDL_ENTRY();
+    or_engram_wkv_staged<16u>(act_codes_all, act_scales_all, weight, weight_scales, out_all, out_width, inner, rows,
+                              row_base, row_end, out_stride);
+}
+
 // [world][rows][chunk] (the split wkv's gathered slices) -> [rows][world * chunk]; 16-byte moves.
 extern "C" __global__ void __launch_bounds__(256) opt_rows_rank_permute(
     const uint4 *__restrict__ src, uint4 *__restrict__ dst, const uint32_t rows,
@@ -2306,4 +2469,36 @@ extern "C" __global__ void __launch_bounds__(32) opt_rows_hostw_f32w_f32o(
     const uint32_t inner, const uint32_t a_stride, const uint32_t out_stride) {
     OPT_PDL_ENTRY();
     or_hostw_rows<float, true>(a_all, w, out_all, cols, inner, a_stride, out_stride);
+}
+
+// The f32-output forms into a ring of `ring_rows` positions of [cols] f32: row y writes the ring row
+// of its position at the lane offset, out_base + offset + (position % ring_rows) * cols, with
+// {offset, position} the row table's row y (null: offset 0, position p0 + y). Every lane's
+// compressor rows in one launch.
+template <typename W>
+__device__ __forceinline__ void or_hostw_ring(const float *a_all, const W *w, uint8_t *out_base,
+                                              uint32_t cols, uint32_t inner, uint32_t a_stride,
+                                              const uint64_t *row_tab, uint32_t p0,
+                                              uint32_t ring_rows) {
+    const uint64_t y = blockIdx.y;
+    const uint64_t offset = row_tab != nullptr ? __ldg(row_tab + 2u * y) : 0u;
+    const uint64_t position = row_tab != nullptr ? __ldg(row_tab + 2u * y + 1u) : p0 + y;
+    uint8_t *out = out_base + offset + (position % ring_rows) * cols * 4u;
+    spark_hw_gemv_m1_body<W, true>(a_all + y * a_stride, w, out, 1u, cols, inner, nullptr, 0u, 0u);
+}
+
+extern "C" __global__ void __launch_bounds__(32) opt_rows_hostw_bf16w_f32o_ring(
+    const float *a_all, const __nv_bfloat16 *__restrict__ w, uint8_t *out_base,
+    const uint32_t cols, const uint32_t inner, const uint32_t a_stride, const uint64_t *row_tab,
+    const uint32_t p0, const uint32_t ring_rows) {
+    OPT_PDL_ENTRY();
+    or_hostw_ring<__nv_bfloat16>(a_all, w, out_base, cols, inner, a_stride, row_tab, p0, ring_rows);
+}
+
+extern "C" __global__ void __launch_bounds__(32) opt_rows_hostw_f32w_f32o_ring(
+    const float *a_all, const float *__restrict__ w, uint8_t *out_base, const uint32_t cols,
+    const uint32_t inner, const uint32_t a_stride, const uint64_t *row_tab, const uint32_t p0,
+    const uint32_t ring_rows) {
+    OPT_PDL_ENTRY();
+    or_hostw_ring<float>(a_all, w, out_base, cols, inner, a_stride, row_tab, p0, ring_rows);
 }

@@ -13,7 +13,8 @@ use serde_json::Value;
 use sparkflash_engine::config::{ModelConfig, V41_FLASH_RUNTIME_CONFIG};
 
 /// The released checkpoint's `config.json`, byte-for-byte (sha256 in `config/README.md`).
-const RELEASED: &str = include_str!("../config/deepseek_v41_flash.released.json");
+const RELEASED: &str =
+    include_str!("../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json");
 
 /// The released document's top-level keys, pinned. A key added by a later release fails the test
 /// until the loader is taught it.

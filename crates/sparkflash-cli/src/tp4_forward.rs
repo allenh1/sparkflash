@@ -10802,6 +10802,10 @@ struct OptSeams {
 }
 #[cfg(feature = "cuda")]
 const OPT_SEAMS_SCRATCH: usize = 80 * 32 * 4 + 5120 * 4 + 64;
+/// The fewest rows a step sends through the two-shot all-reduce by default: below it the second
+/// hop's latency costs more than the halved bytes save.
+#[cfg(feature = "cuda")]
+const TWO_SHOT_ROWS: usize = 16;
 #[cfg(feature = "cuda")]
 const OPT_SEAMS_ROW_OFFSET: u64 = 80 * 32 * 4;
 #[cfg(feature = "cuda")]
@@ -11144,6 +11148,10 @@ struct DeviceLayer<'a> {
         sparkflash_kernels::cuda_driver::Kernel,
         sparkflash_kernels::cuda_driver::Deviceptr,
     )>,
+    /// The fewest rows a step sends through the two-shot all-reduce (each rank sums one chunk of
+    /// every row in rank order, then the chunks are shared), which moves half the one-shot
+    /// exchange's bytes for the same bits. SPARKFLASH_TWO_SHOT_ROWS, 0 for never.
+    two_shot_rows: usize,
     /// The indexer select (opt_select_sm121.cubin): a grid-wide score pass then the one-block
     /// select over the scores, unless SPARKFLASH_OPT_SELECT=0.
     opt_select: Option<OptSelect>,
@@ -11172,6 +11180,9 @@ struct DeviceLayer<'a> {
     /// row (rows.rs rows_seam_prepare): reference_seam then skips the compressor's wkv/wgate and
     /// ref_select the indexer's weights and query projections, reading the rows' own results.
     seam_rows_prepared: bool,
+    /// True while the multi-row step has already run this layer's completed compressor groups for
+    /// every row (rows.rs rows_groups): reference_seam then skips its per-group chain.
+    seam_groups_done: bool,
     /// The `pool_group_f32` symbol the completing-group chain pools the ring with, loaded at open.
     seam_pool: Option<sparkflash_kernels::cuda_driver::Kernel>,
     /// The narrow (f32 -> bf16) symbol the compressor latent is rounded with, loaded at open.
@@ -11416,6 +11427,12 @@ struct OptSelect {
     /// none with the rank form.
     rows: Option<(
         sparkflash_kernels::cuda_driver::Kernel,
+        sparkflash_kernels::cuda_driver::Kernel,
+        sparkflash_kernels::cuda_driver::Kernel,
+    )>,
+    /// opt_select_scores_segs and opt_select_rows_tab: the batched rows select of several lanes'
+    /// rows at once, through the row table (none in an older cubin).
+    rows_tab: Option<(
         sparkflash_kernels::cuda_driver::Kernel,
         sparkflash_kernels::cuda_driver::Kernel,
     )>,
@@ -11746,6 +11763,10 @@ impl<'a> DeviceLayer<'a> {
             }
             _ => None,
         };
+        let two_shot_rows = std::env::var("SPARKFLASH_TWO_SHOT_ROWS")
+            .ok()
+            .and_then(|rows| rows.parse().ok())
+            .unwrap_or(TWO_SHOT_ROWS);
         let opt_attn = match kernel_cubin_dir {
             Some(dir) if std::env::var("SPARKFLASH_OPT_ATTN").as_deref() != Ok("0") => {
                 let (cubin, _sha) = cached_cubin(&dir.join("opt_attn_sm121.cubin"))
@@ -11779,6 +11800,16 @@ impl<'a> DeviceLayer<'a> {
                     let (_m5, scores_seg) = cuda.load_named(&cubin, "opt_select_scores_seg")?;
                     Some((scores_rows, select_rows, scores_seg))
                 };
+                let rows_tab = match rows {
+                    Some(_) => cuda
+                        .load_named(&cubin, "opt_select_scores_segs")
+                        .and_then(|(_m6, scores)| {
+                            let (_m7, select) = cuda.load_named(&cubin, "opt_select_rows_tab")?;
+                            Ok((scores, select))
+                        })
+                        .ok(),
+                    None => None,
+                };
                 let mut total = 0usize;
                 let table = max_positions.max(sparkflash_kernels::ref_select_launch::MAX_POSITIONS);
                 // A rows step's R_MAX rows of scores and select scratch (n + n / 4 words a row),
@@ -11797,6 +11828,7 @@ impl<'a> DeviceLayer<'a> {
                     scores_out,
                     scratch,
                     rows,
+                    rows_tab,
                     scores_floats,
                     scratch_words,
                 })
@@ -12273,6 +12305,7 @@ impl<'a> DeviceLayer<'a> {
             opt_seams,
             opt_attn,
             opt_oneshot,
+            two_shot_rows,
             opt_select,
             moe_routed_device: None,
             moe_router_seen: 0,
@@ -12282,6 +12315,7 @@ impl<'a> DeviceLayer<'a> {
             seam_kernels: None,
             seam_window_only: false,
             seam_rows_prepared: false,
+            seam_groups_done: false,
             seam_pool: None,
             seam_narrow: None,
             seam_widen: None,
@@ -12873,6 +12907,43 @@ impl<'a> DeviceLayer<'a> {
                 // The rows travel as one block: the sum is per element in rank order, so each
                 // row's arithmetic is the single-row exchange's.
                 let count = count * rows;
+                if self.two_shot_rows > 0
+                    && rows >= self.two_shot_rows
+                    && world > 1
+                    && count.is_multiple_of(2 * world)
+                {
+                    // Two shots: this rank sums chunk `rank` of the block (every peer's piece of
+                    // it lands in the gather slots), then the summed chunks are shared in place.
+                    // Each element is summed by the same fold, so the bits are the one-shot's.
+                    let chunk = count / world;
+                    let mine = (rank * chunk * 2) as u64;
+                    // SAFETY: as below; the input holds world * chunk values and the gather
+                    // buffer world chunks of at most R_MAX * 5120 / world values each.
+                    unsafe { handle.scatter_bf16(input.device, gather.0, chunk, 0) }
+                        .map_err(|error| format!("layer device stage {stage}: {error}"))?;
+                    let pairs = (chunk / 2) as u32;
+                    self.cuda.launch(
+                        sum_kernel,
+                        (pairs.div_ceil(256), 1, 1),
+                        (256, 1, 1),
+                        &[
+                            gather.0,
+                            input.device + mine,
+                            output.device + mine,
+                            chunk as u64,
+                            rank as u64,
+                            world as u64,
+                        ],
+                    )?;
+                    // SAFETY: the output holds world chunks; this rank's summed chunk is the send
+                    // buffer and every peer's lands in its own place.
+                    unsafe { handle.exchange_bf16(output.device + mine, output.device, chunk, 0) }
+                        .map_err(|error| format!("layer device stage {stage}: {error}"))?;
+                    self.collectives_in_flight
+                        .set(self.collectives_in_flight.get().saturating_add(2));
+                    probe::count(stage);
+                    return Ok(());
+                }
                 // SAFETY: as below; the gather buffer holds 8 ranks x R_MAX rows of 5120 bf16 values.
                 unsafe { handle.exchange_bf16(input.device, gather.0, count, 0) }
                     .map_err(|error| format!("layer device stage {stage}: {error}"))?;
@@ -14898,7 +14969,7 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
                     u32::try_from(layer).unwrap_or(u32::MAX),
                 )?;
             }
-            if (position + 1).is_multiple_of(ratio) {
+            if (position + 1).is_multiple_of(ratio) && !self.seam_groups_done {
                 let unnormed_f32 = if ratio == 1 {
                     Deviceptr(owner_wkv_base + offset)
                 } else {

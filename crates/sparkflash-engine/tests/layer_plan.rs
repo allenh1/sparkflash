@@ -14,7 +14,8 @@ use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::layer_plan::{CompressionKind, LayerMode, LayerPlan, LayerSpec, PlanError};
 
 /// The released checkpoint's `config.json`, byte-for-byte (sha256 in `config/README.md`).
-const RELEASED: &str = include_str!("../config/deepseek_v41_flash.released.json");
+const RELEASED: &str =
+    include_str!("../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json");
 
 fn document() -> Value {
     serde_json::from_str(RELEASED).expect("the released fixture is valid JSON")

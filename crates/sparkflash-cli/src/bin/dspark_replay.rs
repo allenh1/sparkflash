@@ -95,7 +95,7 @@ fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("encode-chat") if args.len() == 4 => {
-            let seam = sparkflash_api::encoding::TokenizerSeam::from_path(Path::new(&args[2]))
+            let seam = sparkflash_model_deepseek_v41::encoding::TokenizerSeam::from_path(Path::new(&args[2]))
                 .map_err(|e| e.to_string())?;
             let text = std::fs::read_to_string(&args[3]).map_err(|e| e.to_string())?;
             let request = serde_json::json!({"messages": [{"role": "user", "content": text.trim()}]});
@@ -105,7 +105,7 @@ fn main() -> Result<(), String> {
             Ok(())
         }
         Some("decode") if args.len() == 4 => {
-            let seam = sparkflash_api::encoding::TokenizerSeam::from_path(Path::new(&args[2]))
+            let seam = sparkflash_model_deepseek_v41::encoding::TokenizerSeam::from_path(Path::new(&args[2]))
                 .map_err(|e| e.to_string())?;
             let dump = read_dump(Path::new(&args[3]))?;
             let ids = sequence(&dump);

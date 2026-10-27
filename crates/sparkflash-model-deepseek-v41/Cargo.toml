@@ -1,0 +1,21 @@
+[package]
+name = "sparkflash-model-deepseek-v41"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "DeepSeek-V4.1-Flash model pack for SparkFlash"
+
+[dependencies]
+sparkflash-model = { workspace = true }
+sparkflash-weights = { workspace = true }
+sparkflash-vision = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+anyhow = { workspace = true }
+tokenizers = "0.23"
+deepseek-recipe-core = { workspace = true }
+deepseek-recipe-encoding = { workspace = true }

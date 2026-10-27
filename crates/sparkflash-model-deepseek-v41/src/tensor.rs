@@ -34,6 +34,8 @@ use std::collections::BTreeMap;
 use crate::config::ModelConfig;
 use crate::dtype::{DType, dense_scale_shape, expert_scale_shape};
 
+pub use sparkflash_weights::TensorSpec;
+
 /// The checkpoint's storage dtype for a tensor whose format cannot be recovered from f32.
 ///
 /// The Engram `wkv` projection is fp8 codes plus a 32x32 E8M0 grid (`model.py:345`), and the
@@ -50,30 +52,6 @@ pub fn checkpoint_storage_dtype(name: &str) -> Option<DType> {
         Some(DType::F8E8M0)
     } else {
         None
-    }
-}
-
-/// One tensor's entry in the plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TensorSpec {
-    /// The name exactly as the checkpoint spells it.
-    pub name: String,
-    /// The element format.
-    pub dtype: DType,
-    /// The logical shape. For an FP4 weight this is the shape the arithmetic sees, twice the last
-    /// dimension of the bytes on disk.
-    pub shape: Vec<usize>,
-}
-
-impl TensorSpec {
-    /// The number of logical elements.
-    pub fn elements(&self) -> u128 {
-        self.shape.iter().map(|&d| d as u128).product()
-    }
-
-    /// The number of bytes this tensor occupies, packing included.
-    pub fn storage_bytes(&self) -> u128 {
-        self.dtype.storage_bytes(self.elements() as usize) as u128
     }
 }
 

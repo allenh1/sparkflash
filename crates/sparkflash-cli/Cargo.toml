@@ -33,6 +33,8 @@ path = "src/main.rs"
 
 [dependencies]
 sparkflash-trace = { workspace = true }
+sparkflash-model = { workspace = true }
+sparkflash-model-deepseek-v41 = { workspace = true }
 sparkflash-api = { workspace = true }
 sparkflash-vision = { workspace = true }
 sparkflash-engram = { workspace = true }
