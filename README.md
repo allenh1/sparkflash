@@ -1,3 +1,19 @@
+<!--
+Copyright (c) 2026 Hunter L. Allen
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 # SparkFlash
 
 **DeepSeek-V4.1-Flash on four NVIDIA DGX Sparks: 125 tok/s single-stream, 25 s boot, 1M context.**
@@ -223,6 +239,14 @@ scripts/                 launch, build and verification tooling
 docs/                    design, performance, serving and model architecture
 reference/               upstream model card, tokenizer and encoding reference
 ```
+
+## Contributing
+
+Contributions are welcome under the Apache-2.0 license. Start with
+[CONTRIBUTING.md](CONTRIBUTING.md): it states the commit sign-off rule, the CI gates, and the
+evidence a new model must bring (tested configuration, clean and measured kernels, benchmark
+protocol, weights revision, paper or reference implementation, licensing, and supported
+platforms).
 
 ## Status
 

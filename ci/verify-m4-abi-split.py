@@ -1,8 +1,22 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Hunter L. Allen
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Verify that the m4_abi quarantine split is a verbatim move of the frozen module.
 
 D26 froze the Milestone-4 ABI source-text lint at one file, crates/sparkflash-kernels/src/m4_abi.rs
-(13,906 lines at main 0639413). The split keeps the frozen scanners verbatim but files them by what
+(13,906 lines at main d7ed586a). The split keeps the frozen scanners verbatim but files them by what
 they are: the root file keeps the module documentation, the const API the launch and driver modules
 import, every root test with its cfg(test) helpers and the pin_helpers module; src/m4_abi/scanner.rs
 holds the C/C++ token and control-flow scanners the acquire guard uses; src/m4_abi/acquire_guard.rs
@@ -40,7 +54,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-BASE_COMMIT = "0639413"
+BASE_COMMIT = "d7ed586a"
 BASE_PATH = "crates/sparkflash-kernels/src/m4_abi.rs"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC = REPO_ROOT / "crates/sparkflash-kernels/src"
@@ -276,8 +290,21 @@ def format_rust(expected, name):
     return path.read_text()
 
 
+LICENSE_HEADER_END = "// limitations under the License.\n\n"
+
+
+def strip_license_header(text):
+    """Drop the Apache-2.0 notice the relicense added above every source file."""
+    if not text.startswith("// Copyright (c) 2026 Hunter L. Allen"):
+        return text
+    end = text.find(LICENSE_HEADER_END)
+    if end < 0:
+        sys.exit("error: a source file starts with the license header but does not end it")
+    return text[end + len(LICENSE_HEADER_END):]
+
+
 def compare(expected, actual_path, label):
-    actual = actual_path.read_text()
+    actual = strip_license_header(actual_path.read_text())
     if expected == actual:
         print("  " + label + ": byte-identical to the regeneration")
         return True

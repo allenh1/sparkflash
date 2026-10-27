@@ -1,3 +1,17 @@
+// Copyright (c) 2026 Hunter L. Allen
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Generates the exhaustive bf16 -> FP8 E4M3 / FP4 E2M1 conversion table used by
 // crates/sparkflash-kernels/tests/m4_codec_golden.rs. Compiled and run by nvcc 12.9.1; the host
 // has no GPU, and none is needed: these converters are host-callable.
