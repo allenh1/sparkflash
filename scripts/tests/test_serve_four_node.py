@@ -91,6 +91,21 @@ class PrintPlanTests(unittest.TestCase):
         self.assertEqual(result.stdout.count("SPARK_MAX_SEQ_LEN=262144"), 4)
         self.assertEqual(result.stdout.count("SPARKFLASH_LANES=8"), 4)
 
+    def test_scheduler_knobs_reach_every_rank(self) -> None:
+        """Every rank runs the same ticks: a knob only a local rank 0 inherited would split them."""
+        result = run_script(
+            "print",
+            env=base_env(
+                SPARKFLASH_PREFILL_CHUNK="2048",
+                SPARKFLASH_BATCH_SPEC_FLOOR="0.3",
+                SPARKFLASH_DECODE_SHARE="0.4",
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("SPARKFLASH_PREFILL_CHUNK=2048"), 4, result.stdout)
+        self.assertEqual(result.stdout.count("SPARKFLASH_BATCH_SPEC_FLOOR=0.3"), 4)
+        self.assertEqual(result.stdout.count("SPARKFLASH_DECODE_SHARE=0.4"), 4)
+
     def test_port_overrides_reach_the_commands(self) -> None:
         result = run_script(
             "print",

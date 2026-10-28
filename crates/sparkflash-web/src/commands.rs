@@ -19,9 +19,11 @@
 //! a shell string, where every interpolated value goes through [`shell_quote`].
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::{SparkConfig, shell_quote};
+use crate::hf;
+use crate::inspect;
 
 /// One process to run, with a display line for the job log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,15 +70,15 @@ impl CommandSpec {
 #[must_use]
 pub fn convert_command(config: &SparkConfig, rank: usize) -> CommandSpec {
     let node = &config.cluster.nodes[rank];
-    let checkpoint = &config.model.checkpoint;
-    let output_dir = &config.model.converted_dir;
+    let checkpoint = config.node_path(&config.model.checkpoint);
+    let output_dir = config.converted_path();
     let rank_text = rank.to_string();
     let convert_args = vec![
         "convert".to_owned(),
         "--checkpoint".to_owned(),
-        checkpoint.clone(),
+        checkpoint.display().to_string(),
         "--output-dir".to_owned(),
-        output_dir.clone(),
+        output_dir.display().to_string(),
         "--tp-world-size".to_owned(),
         "4".to_owned(),
         "--tp-rank".to_owned(),
@@ -102,7 +104,7 @@ pub fn convert_command(config: &SparkConfig, rank: usize) -> CommandSpec {
     }
 
     let binary = config.binary_path().display().to_string();
-    let repo = config.paths.repo_root.clone();
+    let repo = config.repo_root().display().to_string();
     let mut remote_parts = vec![
         "cd".to_owned(),
         shell_quote(&repo),
@@ -178,10 +180,7 @@ pub fn serve_action_command(config: &SparkConfig, action: ServeAction) -> Comman
 /// which is exactly the condition the UI is reporting.
 #[must_use]
 pub fn ssh_probe_command(config: &SparkConfig, destination: &str) -> CommandSpec {
-    let mut args = vec!["-n".to_owned(), "-o".to_owned(), "BatchMode=yes".to_owned()];
-    args.extend(config.cluster.ssh_options.iter().cloned());
-    args.push("-o".to_owned());
-    args.push(format!("ConnectTimeout={}", config.web.ssh_timeout_secs));
+    let mut args = batch_ssh_args(config);
     args.push(destination.to_owned());
     args.push("true".to_owned());
     CommandSpec {
@@ -192,6 +191,194 @@ pub fn ssh_probe_command(config: &SparkConfig, destination: &str) -> CommandSpec
         label: format!("SSH probe {destination}"),
         kind: "ssh-probe".to_owned(),
     }
+}
+
+/// `ssh` options for a command that must never wait for a password or a host-key prompt.
+fn batch_ssh_args(config: &SparkConfig) -> Vec<String> {
+    let mut args = vec!["-n".to_owned(), "-o".to_owned(), "BatchMode=yes".to_owned()];
+    args.extend(config.cluster.ssh_options.iter().cloned());
+    args.push("-o".to_owned());
+    args.push(format!("ConnectTimeout={}", config.web.ssh_timeout_secs));
+    args
+}
+
+/// The read-only node check of [`inspect`] for `rank`: `bash` on the lead for a local rank, `ssh`
+/// otherwise. `checkpoint` is the lead's checkpoint directory, when the model is there.
+#[must_use]
+pub fn inspect_command(
+    config: &SparkConfig,
+    rank: usize,
+    checkpoint: Option<&Path>,
+) -> CommandSpec {
+    let node = &config.cluster.nodes[rank];
+    let script_args = inspect::script_args(config, rank, checkpoint);
+    let label = format!("Check {}", node.ssh);
+    if node.local {
+        let mut args = vec![
+            "-c".to_owned(),
+            inspect::INSPECT_SCRIPT.to_owned(),
+            "sparkflash-inspect".to_owned(),
+        ];
+        args.extend(script_args);
+        return CommandSpec {
+            program: "bash".to_owned(),
+            args,
+            env: BTreeMap::new(),
+            cwd: None,
+            label,
+            kind: "inspect".to_owned(),
+        };
+    }
+    let mut args = batch_ssh_args(config);
+    args.push(config.ssh_destination(rank));
+    args.push(inspect::remote_command(&script_args));
+    CommandSpec {
+        program: "ssh".to_owned(),
+        args,
+        env: BTreeMap::new(),
+        cwd: None,
+        label,
+        kind: "inspect".to_owned(),
+    }
+}
+
+/// Downloads `model.id` into the Hugging Face cache on the lead with `scripts/hf-download.py`,
+/// resuming whatever an earlier download left.
+///
+/// # Errors
+///
+/// When `model.checkpoint` names a directory (nothing is downloaded then), or there is no cache.
+pub fn download_command(config: &SparkConfig) -> Result<CommandSpec, String> {
+    if !config.model.checkpoint.trim().is_empty() {
+        return Err(
+            "model.checkpoint names a directory, so the model is read from there; clear it to \
+             download into the Hugging Face cache"
+                .to_owned(),
+        );
+    }
+    if !hf::is_model_id(&config.model.id) {
+        return Err(format!(
+            "{:?} is not a Hugging Face model id",
+            config.model.id
+        ));
+    }
+    let cache = config
+        .hub_cache_dir()
+        .ok_or("no Hugging Face cache directory: set HF_HUB_CACHE or model.hub_cache")?;
+    let root = config.repo_root();
+    Ok(CommandSpec {
+        program: "python3".to_owned(),
+        args: vec![
+            "-I".to_owned(),
+            root.join("scripts/hf-download.py").display().to_string(),
+            "--repo".to_owned(),
+            config.model.id.clone(),
+            "--cache".to_owned(),
+            cache.display().to_string(),
+        ],
+        env: BTreeMap::new(),
+        cwd: Some(root),
+        label: format!("Download {}", config.model.id),
+        kind: "download".to_owned(),
+    })
+}
+
+/// What a sync copies from the lead to the other nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncWhat {
+    /// The server binary, the kernels and the NCCL library.
+    Software,
+    /// The checkpoint (the model's whole Hugging Face cache folder, or `model.checkpoint`).
+    Model,
+}
+
+impl SyncWhat {
+    /// The job kind.
+    #[must_use]
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::Software => "sync-software",
+            Self::Model => "sync-model",
+        }
+    }
+}
+
+/// One node a sync copies to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncTarget {
+    /// The address to connect to, the fast-network one when it is known to work.
+    pub address: String,
+    /// The configured SSH name, whose known host key the connection checks.
+    pub ssh: String,
+}
+
+/// Copies software or the model from the lead to `targets` at the same absolute paths, with
+/// `scripts/sync-nodes.py` (parallel `rsync` streams over SSH).
+///
+/// # Errors
+///
+/// When there is nothing to copy to, or the model's location is not known.
+pub fn sync_command(
+    config: &SparkConfig,
+    what: SyncWhat,
+    targets: &[SyncTarget],
+) -> Result<CommandSpec, String> {
+    if targets.is_empty() {
+        return Err("every node is the lead; there is nothing to copy".to_owned());
+    }
+    let root = config.repo_root();
+    let mut args = vec![
+        "-I".to_owned(),
+        root.join("scripts/sync-nodes.py").display().to_string(),
+    ];
+    // The connection may use the fast-network address; HostKeyAlias checks it against the key
+    // already trusted for the node's name, so nothing new lands in known_hosts.
+    for option in config.cluster.ssh_options.iter().chain(&[
+        "-o".to_owned(),
+        "BatchMode=yes".to_owned(),
+        "-o".to_owned(),
+        format!("ConnectTimeout={}", config.web.ssh_timeout_secs),
+    ]) {
+        args.push(format!("--ssh-arg={option}"));
+    }
+    for target in targets {
+        let user = config.ssh_target(&target.address);
+        args.push(format!("--host={user},{}", target.ssh));
+    }
+    let paths: Vec<PathBuf> = match what {
+        SyncWhat::Software => {
+            args.push(format!("--ensure-dir={}", root.display()));
+            let mut paths = vec![config.binary_path(), config.cubins_path()];
+            paths.extend(config.nccl_lib_path());
+            paths
+        }
+        SyncWhat::Model => {
+            args.push("--exclude=*.incomplete".to_owned());
+            if config.model.checkpoint.trim().is_empty() {
+                let cache = config.hub_cache_dir().ok_or(
+                    "no Hugging Face cache directory: set HF_HUB_CACHE or model.hub_cache",
+                )?;
+                vec![cache.join(hf::repo_folder(&config.model.id))]
+            } else {
+                vec![config.node_path(&config.model.checkpoint)]
+            }
+        }
+    };
+    for path in paths {
+        args.push(format!("--path={}", path.display()));
+    }
+    Ok(CommandSpec {
+        program: "python3".to_owned(),
+        args,
+        env: BTreeMap::new(),
+        cwd: Some(root),
+        label: match what {
+            SyncWhat::Software => "Install on the other Sparks".to_owned(),
+            SyncWhat::Model => "Copy the model to the other Sparks".to_owned(),
+        },
+        kind: what.kind().to_owned(),
+    })
 }
 
 /// A copy-paste command that installs the lead node's public key on every listed host.
@@ -251,14 +438,14 @@ mod tests {
     fn local_convert_runs_the_documented_rank_command() {
         let mut config = SparkConfig::default();
         config.model.checkpoint = "/data/DeepSeek-V4.1-Flash".to_owned();
+        config.model.converted_dir = "/data/sparkflash-conv".to_owned();
         let command = convert_command(&config, 0);
+        let cwd = std::env::current_dir().expect("cwd");
         assert_eq!(
             command.program,
-            PathBuf::from("./target/release/sparkflash")
-                .display()
-                .to_string()
+            cwd.join("target/release/sparkflash").display().to_string()
         );
-        assert_eq!(command.cwd, Some(PathBuf::from(".")));
+        assert_eq!(command.cwd, Some(cwd));
         for expected in [
             "convert",
             "--checkpoint",
@@ -286,6 +473,7 @@ mod tests {
         config.model.checkpoint = "/data/DeepSeek-V4.1-Flash".to_owned();
         config.cluster.nodes[1].ssh = "spark one".to_owned();
         config.paths.repo_root = "/opt/spark flash".to_owned();
+        config.model.converted_dir = "/data/sparkflash-conv".to_owned();
         let command = convert_command(&config, 1);
         assert_eq!(command.program, "ssh");
         assert_eq!(command.args.last().expect("remote command"), &{
@@ -364,5 +552,86 @@ mod tests {
             kind: "test".to_owned(),
         };
         assert_eq!(spec.display(), "A='b c' bash -c 'echo hi'");
+    }
+
+    #[test]
+    fn the_node_check_runs_locally_for_the_lead_and_over_batch_ssh_elsewhere() {
+        let config = SparkConfig::default();
+        let local = inspect_command(&config, 0, Some(Path::new("/models/snap")));
+        assert_eq!(local.program, "bash");
+        assert_eq!(local.args[0], "-c");
+        assert_eq!(local.args[2], "sparkflash-inspect");
+        assert_eq!(local.args[6], "/models/snap");
+        let remote = inspect_command(&config, 2, None);
+        assert_eq!(remote.program, "ssh");
+        assert!(remote.args.iter().any(|arg| arg == "BatchMode=yes"));
+        let destination = config.ssh_destination(2);
+        let at = remote
+            .args
+            .iter()
+            .position(|arg| *arg == destination)
+            .expect("destination");
+        assert!(remote.args[at + 1].starts_with("bash -c '"));
+        assert_eq!(remote.args.len(), at + 2);
+    }
+
+    #[test]
+    fn the_download_fills_the_hub_cache_and_only_when_no_directory_is_set() {
+        let mut config = SparkConfig::default();
+        config.model.hub_cache = "/cache/hub".to_owned();
+        let command = download_command(&config).expect("command");
+        assert_eq!(command.program, "python3");
+        assert_eq!(command.kind, "download");
+        assert!(command.args[1].ends_with("scripts/hf-download.py"));
+        assert_eq!(
+            command.args[2..],
+            [
+                "--repo",
+                "deepseek-ai/DeepSeek-V4.1-Flash",
+                "--cache",
+                "/cache/hub"
+            ]
+        );
+        config.model.checkpoint = "/data/model".to_owned();
+        assert!(download_command(&config).is_err());
+    }
+
+    #[test]
+    fn a_sync_copies_the_same_absolute_paths_to_every_other_node() {
+        let mut config = SparkConfig::default();
+        config.paths.repo_root = "/srv/sparkflash".to_owned();
+        config.model.hub_cache = "/cache/hub".to_owned();
+        config.cluster.ssh_user = "spark".to_owned();
+        let targets = [SyncTarget {
+            address: "198.51.100.12".to_owned(),
+            ssh: "spark1".to_owned(),
+        }];
+        let software = sync_command(&config, SyncWhat::Software, &targets).expect("software");
+        assert_eq!(software.kind, "sync-software");
+        for expected in [
+            "/srv/sparkflash/scripts/sync-nodes.py",
+            "--host=spark@198.51.100.12,spark1",
+            "--ensure-dir=/srv/sparkflash",
+            "--path=/srv/sparkflash/target/release/sparkflash",
+            "--path=/srv/sparkflash/target/cubins",
+            "--path=/srv/sparkflash/target/deps/nccl",
+            "--ssh-arg=BatchMode=yes",
+        ] {
+            assert!(
+                software.args.iter().any(|arg| arg == expected),
+                "{expected}: {:?}",
+                software.args
+            );
+        }
+        let model = sync_command(&config, SyncWhat::Model, &targets).expect("model");
+        assert_eq!(model.kind, "sync-model");
+        assert!(
+            model
+                .args
+                .iter()
+                .any(|arg| arg == "--path=/cache/hub/models--deepseek-ai--DeepSeek-V4.1-Flash")
+        );
+        assert!(model.args.iter().any(|arg| arg == "--exclude=*.incomplete"));
+        assert!(sync_command(&config, SyncWhat::Model, &[]).is_err());
     }
 }

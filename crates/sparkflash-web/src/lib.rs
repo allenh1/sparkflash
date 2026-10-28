@@ -26,6 +26,8 @@
 //! - [`hf`] resolves a Hugging Face model id to its checkpoint in the hub cache and lists the
 //!   cached models.
 //! - [`discovery`] is DNS-SD plus a `BatchMode=yes` SSH probe behind traits.
+//! - [`inspect`] reads each node's fast network, software, model and converted weights, and
+//!   derives the NCCL settings and fix commands the guided setup shows.
 //! - [`jobs`] runs long actions asynchronously with a bounded log tail.
 //! - [`stats`] samples Prometheus and cluster JSON into a downsampleable history and writes it
 //!   only while the cluster is idle.
@@ -36,6 +38,7 @@ pub mod commands;
 pub mod config;
 pub mod discovery;
 pub mod hf;
+pub mod inspect;
 pub mod jobs;
 mod run;
 pub mod stats;

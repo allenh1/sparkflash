@@ -14,12 +14,14 @@
 
 # SparkFlash lead-node configuration.
 #
-# Copy to sparkflash.toml beside the checkout (or pass --config PATH) and edit the four nodes.
-# `sparkflash --web` loads this file, the web form saves it atomically, and every launcher and
-# converter command is derived from it.
+# The console's Setup page (scripts/setup.sh, then http://<lead>.local:8790) writes sparkflash.toml
+# for you, with these values. This copy documents every field: copy it to sparkflash.toml beside
+# the checkout (or pass --config PATH) to write one by hand. `sparkflash --web` loads the file, the
+# web form saves it atomically, and every launcher and converter command is derived from it.
 #
 # Relative paths resolve against [paths].repo_root, which itself resolves against the process
-# working directory. Production installs normally use absolute paths.
+# working directory. A leading ~/ is the home directory, the same on every node when the account
+# name is.
 
 [model]
 # Model means the weights. Only the released V4.1-Flash checkpoint ships in this build.
@@ -35,9 +37,9 @@ hub_cache = ""
 # Empty derives <checkpoint>/tokenizer.json.
 tokenizer = ""
 # The directory `sparkflash convert` writes one file per rank into.
-converted_dir = "/data/sparkflash-conv"
+converted_dir = "~/sparkflash/converted"
 # The cubin directory built by scripts/build-cubins.sh.
-cubins = "/opt/sparkflash/cubins"
+cubins = "target/cubins"
 
 [engine]
 # Engine means how the weights run. The TP=4 device engine is the only one today.
@@ -57,30 +59,34 @@ http_bind = "0.0.0.0:8000"
 # Rank R uses base_port + R for the engine collectives.
 base_port = 29601
 # Empty means the user running the control plane.
-ssh_user = "spark"
+ssh_user = ""
 ssh_options = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
 # Exactly four nodes, in rank order. `local = true` runs that rank's convert, launch, stop and
 # status commands on the lead node rather than over SSH, so the lead needs no SSH key for itself.
-# The peer is the RoCE address the collectives use.
+# The peer is the fast-network (RoCE) address the collectives use; step 2 of the Setup page fills
+# it in from what each node reports.
 nodes = [
-  { ssh = "spark0", peer = "10.0.0.1", local = true },
-  { ssh = "spark1", peer = "10.0.0.2", local = false },
-  { ssh = "spark2", peer = "10.0.0.3", local = false },
-  { ssh = "spark3", peer = "10.0.0.4", local = false },
+  { ssh = "node0.local", peer = "192.0.2.11", local = true },
+  { ssh = "node1.local", peer = "192.0.2.12", local = false },
+  { ssh = "node2.local", peer = "192.0.2.13", local = false },
+  { ssh = "node3.local", peer = "192.0.2.14", local = false },
 ]
 
 [paths]
-# The checkout on every node.
-repo_root = "/opt/sparkflash"
+# The checkout, at the same path on every node. "." is the directory the console started in; the
+# Setup page's Install step copies the binary, kernels and NCCL library to the same paths.
+repo_root = "."
 # The binary from `cargo build --release -p sparkflash-cli --features cuda,tp4-serve`.
 binary = "target/release/sparkflash"
 serve_script = "scripts/serve-four-node.sh"
-# Empty means NCCL is installed system-wide.
-nccl_lib = "/opt/nccl/lib"
+# The directory holding libnccl.so.2, filled by scripts/fetch-nccl.sh. Empty means NCCL is
+# installed system-wide.
+nccl_lib = "target/deps/nccl"
 # The remote logs from scripts/serve-four-node.sh.
 log_root = "target/serve-tp4"
 
 [network]
+# Step 2 of the Setup page ("Use these settings") fills these three from the cabling it finds.
 # The RoCE devices NCCL uses, comma-separated; empty lets NCCL use every active one. A Spark's
 # ConnectX-7 reaches the GB10 over two PCIe Gen5 x4 links of about 100 Gb/s each, so each cabled
 # port shows up as two devices, one per link, and only both together carry the port's 200 Gb/s.
@@ -91,8 +97,7 @@ nccl_socket_ifname = ""
 nccl_ib_gid_index = 3
 # Extra environment exported to every rank.
 [network.env]
-# NCCL_NET_GDR_LEVEL = "5"
-# NCCL_DMABUF_ENABLE = "1"
+# NCCL_DEBUG = "WARN"
 
 [web]
 # The control plane's own listener. All interfaces, because Sparks run headless. It has no login:

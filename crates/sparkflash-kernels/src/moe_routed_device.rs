@@ -1767,7 +1767,7 @@ impl MoeRoutedDevice {
         }
         cuda.launch(
             bulk.combine,
-            ((HIDDEN / 256) as u32, tokens as u32, 1),
+            ((HIDDEN / 1024) as u32, tokens as u32, 1),
             (256, 1, 1),
             &[
                 ids,

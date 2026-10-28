@@ -851,8 +851,8 @@ extern "C" __global__ void __launch_bounds__(256) opt_mma_router_topk(
 //   clamp, SwiGLU, routing weight, bf16, MX quantiser) into codes [rows][576], scales [rows][18].
 // opt_mma_moe_down: grid (5120 / 128, max items), 256 threads; block (x, y) = item y, output
 //   columns 128 x .. 128 x + 127; writes each row's slot value rounded to bf16 into slot [rows][5120].
-// opt_mma_moe_combine: grid (5120 / 256, tokens), 256 threads; the routed combine of opt_moe (slots
-//   in ascending expert id, f32 adds, then the addend) into delta_bf16 and, when not null, delta_f32.
+// opt_mma_moe_combine: grid (5120 / 1024, tokens), 256 threads of four columns; opt_moe's routed combine
+//   (slots in ascending expert id, f32 adds, then the addend) into delta_bf16 and, when set, delta_f32.
 
 #include "m4_common_sm121.cuh"
 #include "m4_activation_quant_sm121.cuh"
@@ -1236,13 +1236,16 @@ extern "C" __global__ void __launch_bounds__(256) opt_mma_moe_combine(
     const float *addend) {
     OPT_PDL_ENTRY();
     const uint32_t token = blockIdx.y;
-    const uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
+    // Four adjacent columns a thread: a warp's six slot reads are 256 B (two full lines) and the
+    // bf16 store is one 8 B vector, where one column a thread read 64 B and stored 2 B.
+    const uint32_t column = (blockIdx.x * blockDim.x + threadIdx.x) * 4u;
     if (token >= tokens || column >= OMM_HIDDEN) return;
     uint32_t ids[OMM_TOPK];
 #pragma unroll
     for (uint32_t s = 0u; s < OMM_TOPK; ++s) ids[s] = expert_ids[token * OMM_TOPK + s];
     uint32_t used = 0u;
-    float total = 0.0f;
+    float2 lo = make_float2(0.0f, 0.0f), hi = lo;
+    const uint64_t base = (uint64_t)token * OMM_TOPK * OMM_HIDDEN;
 #pragma unroll
     for (uint32_t position = 0u; position < OMM_TOPK; ++position) {
         uint32_t best = OMM_TOPK;
@@ -1252,12 +1255,28 @@ extern "C" __global__ void __launch_bounds__(256) opt_mma_moe_combine(
             if (best == OMM_TOPK || ids[s] < ids[best]) best = s;
         }
         used |= 1u << best;
-        total = __fadd_rn(total, __bfloat162float(slot[(uint64_t)(token * OMM_TOPK + best) * OMM_HIDDEN + column]));
+        const __nv_bfloat162 *src = reinterpret_cast<const __nv_bfloat162 *>(slot + base + (uint64_t)best * OMM_HIDDEN + column);
+        const float2 a = __bfloat1622float2(src[0]);
+        const float2 b = __bfloat1622float2(src[1]);
+        lo.x = __fadd_rn(lo.x, a.x);
+        lo.y = __fadd_rn(lo.y, a.y);
+        hi.x = __fadd_rn(hi.x, b.x);
+        hi.y = __fadd_rn(hi.y, b.y);
     }
     const uint64_t out = (uint64_t)token * OMM_HIDDEN + column;
-    if (addend != nullptr) total = __fadd_rn(total, addend[out]);
-    if (delta_f32 != nullptr) delta_f32[out] = total;
-    delta_bf16[out] = __float2bfloat16_rn(total);
+    if (addend != nullptr) {
+        const float4 a = *reinterpret_cast<const float4 *>(addend + out);
+        lo.x = __fadd_rn(lo.x, a.x);
+        lo.y = __fadd_rn(lo.y, a.y);
+        hi.x = __fadd_rn(hi.x, a.z);
+        hi.y = __fadd_rn(hi.y, a.w);
+    }
+    if (delta_f32 != nullptr) *reinterpret_cast<float4 *>(delta_f32 + out) = make_float4(lo.x, lo.y, hi.x, hi.y);
+    const __nv_bfloat162 p0 = __floats2bfloat162_rn(lo.x, lo.y);
+    const __nv_bfloat162 p1 = __floats2bfloat162_rn(hi.x, hi.y);
+    const uint2 packed = make_uint2(*reinterpret_cast<const uint32_t *>(&p0),
+                                    *reinterpret_cast<const uint32_t *>(&p1));
+    *reinterpret_cast<uint2 *>(delta_bf16 + out) = packed;
 }
 
 // ---- The indexer over a chunk: the scores on the FP4 tensor cores.

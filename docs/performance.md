@@ -107,8 +107,9 @@ filler with a question:
 
 | Prompt | Time to first token | Prefill rate |
 | --: | --: | --: |
-| 209,631 tokens | **57.3 s** (56.3 s for a second, 207,967-token prompt) | ~3,700 tok/s |
-| 32,613 tokens | **8.3 s** (8.2 s for a second, 32,543-token prompt) | ~3,950 tok/s |
+| 209,631 tokens | **44.4 s** (one run) | ~4,700 tok/s |
+| 67,570 tokens | **11.8 s** (10.8-14.2 s over three servers) | ~5,700 tok/s |
+| 32,613 tokens | **5.1 s** (median of six 32K prompts over three servers: 4.9-5.2 s, two outliers at 7.1 and 8.4 s) | ~6,400 tok/s |
 
 - The 200K needle is found.
 - Decode stays usable at depth: **56.0 tok/s** at a 208K-token context (2.1 tokens a step, at a
@@ -155,7 +156,9 @@ went from 2.7 to 2.6.
 200K cold time to first token went 119 s -> 100 -> 87 -> 70 -> 63.9 s over four prefill changes
 (FP4 index scorer, paired chunks, sequence-parallel seams, merged expert pass). The bulk attention
 at two blocks an SM then took 32K prompts from 9.2-9.3 s to 8.2-8.3 s, and a 209K-token prompt
-now takes 57.3 s.
+to 57.3 s. Running only layers 0-20 on a prompt's rows before its last 2,541 then took cold 32K
+prompts from 8.2 s to 5.1 s, 64K from 18.1 s to 11.8 s, and the 209K needle to 44.4 s (72-87 s
+with the skip off on the same day, slower than the 57.3 s measured before).
 
 ## Reproducing
 

@@ -20,9 +20,10 @@ limitations under the License.
 model. [scripts/serve-four-node.sh](../scripts/serve-four-node.sh) builds and launches the four
 command lines over ssh; this page describes what it sets up and what the server offers.
 
-The lead node can drive the same launcher and converter from a browser:
-[`sparkflash --web`](web.md) reads a TOML file, discovers the four nodes, and turns conversion and
-launch into buttons. The manual path below remains the reference for what those buttons run.
+The lead node can do all of this from a browser: `scripts/setup.sh` builds the server and starts
+[the console](web.md), which installs it on the other nodes, downloads the model once and copies
+it over, works out the network settings, converts the weights and launches. The manual path below
+remains the reference for what those buttons run.
 
 ## Prerequisites
 
@@ -148,6 +149,7 @@ Defaults are what the numbers in [performance.md](performance.md) were measured 
 | Variable | Effect |
 | :-- | :-- |
 | `SPARKFLASH_PREFILL_EXACT=1` | Prefill every prompt on the exact one-row path: slower long prompts, output bit-identical to a single-stream reference |
+| `SPARKFLASH_PREFILL_DECODER_SKIP=0` | Run every layer over every prompt row (slower long prompts; for comparison). By default a prompt's rows before its last 2,541 run only layers 0-20, which hold every cache the later layers read |
 | `SPARKFLASH_PREFILL_MOE_MERGE=0` | Run each in-flight prefill chunk's experts separately (slower; for comparison) |
 | `SPARKFLASH_WARMUP=0` | Skip the warm-up pass before HTTP binds (the first request then pays the one-time setup) |
 | `NCCL_*` | Passed to every rank by the launcher |

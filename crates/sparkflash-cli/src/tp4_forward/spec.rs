@@ -25,7 +25,7 @@
 //! counters back and the next step overwrites it. The Engram entries of the verify rows are written
 //! from the step's own token history before it runs.
 
-use super::batch::{Batch, Emission, Pools};
+use super::batch::{Batch, ENCODER_LAYERS, Emission, Pools};
 use super::draft::DraftState;
 use super::rows::{R_MAX, RowsState};
 use super::sample::Sampler;
@@ -1047,9 +1047,10 @@ impl DeviceLayer<'_> {
     /// that layer's caches, so the results are the chunks' run one after the other. Each chunk's
     /// Engram reads (`task`, staged in its pinned buffer) are waited for and uploaded just before
     /// its slot's layer (the chunks share the arena rows: the run's stream orders each upload after
-    /// the previous chunk's reads of them). `then` runs once every layer is
-    /// queued. Returns the ms spent waiting for reads.
-    #[allow(clippy::type_complexity)]
+    /// the previous chunk's reads of them). The first `encoder_only` chunks stop after the
+    /// encoder layers ([`ENCODER_LAYERS`]). `then` runs once every layer is queued. Returns the ms
+    /// spent waiting for reads.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub(super) fn prefill_layers_paired<'r>(
         &mut self,
         chunks: &[(
@@ -1059,12 +1060,20 @@ impl DeviceLayer<'_> {
             Option<(&GatherTask<'r>, &HostMapped)>,
         )],
         staged: &[Option<SeamStagedWeights>],
+        encoder_only: usize,
         engram_layers: &[usize],
         reads: Option<&Reads<'r>>,
         then: impl FnOnce(&mut Self) -> Result<(), String>,
     ) -> Result<f64, String> {
         if !self.bulk_comm_open() || chunks.is_empty() {
             return Err("paired prefill: no collective stream or no chunk".to_owned());
+        }
+        if encoder_only > chunks.len() || staged.len() < ENCODER_LAYERS {
+            return Err(format!(
+                "paired prefill: {encoder_only} encoder-only chunks of {} over {} layers",
+                chunks.len(),
+                staged.len()
+            ));
         }
         for &(rows, _, n, _) in chunks {
             if rows.bulk.is_none() || n <= R_MAX {
@@ -1090,6 +1099,18 @@ impl DeviceLayer<'_> {
         let result: Result<f64, String> = (|| {
             let mut waited = 0.0;
             for (layer, weights) in staged.iter().enumerate() {
+                // The decoder layers run the chunks after the encoder-only ones (a suffix, so the
+                // merged pass's rows are the suffix of its list too).
+                let chunks = if layer < ENCODER_LAYERS {
+                    chunks
+                } else {
+                    &chunks[encoder_only..]
+                };
+                if chunks.is_empty() {
+                    break;
+                }
+                let merged = &merged[merged.len() - chunks.len()..];
+                let merge = merge && chunks.len() > 1;
                 self.set_seam_weights(*weights);
                 let slot = engram_layers.iter().position(|&target| target == layer);
                 for &(rows, p0, n, task) in chunks {
@@ -1121,7 +1142,7 @@ impl DeviceLayer<'_> {
                     for &(rows, _, n, _) in chunks {
                         self.ffn_rest_inputs(rows, layer, n)?;
                     }
-                    self.rows_moe_merged(&merged, layer)?;
+                    self.rows_moe_merged(merged, layer)?;
                     for &(rows, _, n, _) in chunks {
                         self.ffn_rest_tail(rows, layer, n)?;
                     }

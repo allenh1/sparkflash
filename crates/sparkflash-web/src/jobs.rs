@@ -17,13 +17,17 @@
 //! Convert, launch, stop and status are processes that outlive one HTTP request. Each is a job
 //! with an id, a status, an exit code and a bounded in-memory log tail. Nothing here writes the
 //! log to disk: the launcher's own remote log files remain the durable record.
+//!
+//! A long job (a download, a copy to the other nodes) reports how far it is by printing
+//! `@progress {"done":N,"total":N,"detail":"..."}` on stdout. Those lines update the job's
+//! [`JobProgress`] instead of filling the bounded log.
 
 use std::collections::VecDeque;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 
@@ -37,6 +41,21 @@ pub const MAX_JOBS: usize = 20;
 
 /// The maximum characters kept from one output line.
 const MAX_LINE_CHARS: usize = 2_000;
+
+/// The stdout prefix of a progress report.
+pub const PROGRESS_PREFIX: &str = "@progress ";
+
+/// How far a long job is, from its latest `@progress` line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobProgress {
+    /// Units finished (bytes for a download or a copy).
+    pub done: u64,
+    /// Units in all; zero while the job is still sizing the work.
+    pub total: u64,
+    /// One short human line, e.g. "12 of 55 files, 230 MB/s".
+    #[serde(default)]
+    pub detail: String,
+}
 
 /// A job that could not be accepted (too many running jobs).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +113,8 @@ pub struct JobSummary {
     pub exit_code: Option<i32>,
     /// The last output line, useful in the compact list.
     pub last_line: Option<String>,
+    /// The latest progress report, for a job that prints them.
+    pub progress: Option<JobProgress>,
 }
 
 /// The full record for the log viewer.
@@ -116,6 +137,7 @@ struct JobEntry {
     finished_ms: Option<u64>,
     exit_code: Option<i32>,
     log: VecDeque<String>,
+    progress: Option<JobProgress>,
 }
 
 impl JobEntry {
@@ -130,6 +152,7 @@ impl JobEntry {
             finished_ms: self.finished_ms,
             exit_code: self.exit_code,
             last_line: self.log.back().cloned(),
+            progress: self.progress.clone(),
         }
     }
 }
@@ -337,6 +360,7 @@ impl JobManager {
             finished_ms: None,
             exit_code: None,
             log: VecDeque::new(),
+            progress: None,
         });
         Ok(id)
     }
@@ -350,6 +374,13 @@ impl JobManager {
         job.log.push_back(line);
         while job.log.len() > MAX_LOG_LINES {
             job.log.pop_front();
+        }
+    }
+
+    fn report(&self, id: u64, progress: JobProgress) {
+        let mut inner = self.inner.lock().expect("job lock");
+        if let Some(job) = inner.jobs.iter_mut().find(|job| job.id == id) {
+            job.progress = Some(progress);
         }
     }
 
@@ -376,7 +407,16 @@ async fn pump<R: AsyncRead + Unpin>(
     let mut lines = BufReader::new(reader).lines();
     loop {
         match lines.next_line().await {
-            Ok(Some(line)) => manager.append(id, format!("{stream} {line}")),
+            Ok(Some(line)) => {
+                let progress = line
+                    .strip_prefix(PROGRESS_PREFIX)
+                    .filter(|_| stream == "out")
+                    .and_then(|json| serde_json::from_str::<JobProgress>(json).ok());
+                match progress {
+                    Some(progress) => manager.report(id, progress),
+                    None => manager.append(id, format!("{stream} {line}")),
+                }
+            }
             Ok(None) => break,
             Err(error) => {
                 manager.append(id, format!("{stream} read error: {error}"));
@@ -446,6 +486,38 @@ mod tests {
         assert!(log.contains("out hello"), "{log}");
         assert!(log.contains("err oops"), "{log}");
         assert!(log.contains("[exit 3]"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn progress_lines_update_the_job_instead_of_the_log() {
+        let manager = Arc::new(JobManager::new());
+        let id = manager
+            .start(spec(
+                "sh",
+                &[
+                    "-c",
+                    "printf 'sizing\\n'; \
+                     printf '@progress {\"done\":5,\"total\":10,\"detail\":\"half\"}\\n'; \
+                     printf '@progress not json\\n'; \
+                     printf '@progress {\"done\":10,\"total\":10}\\n'",
+                ],
+            ))
+            .await
+            .expect("accepted");
+        let detail = wait_done(&manager, id).await;
+        assert_eq!(detail.summary.status, JobStatus::Succeeded);
+        assert_eq!(
+            detail.summary.progress,
+            Some(JobProgress {
+                done: 10,
+                total: 10,
+                detail: String::new(),
+            })
+        );
+        let log = detail.log.join("\n");
+        assert!(log.contains("out sizing"), "{log}");
+        assert!(log.contains("out @progress not json"), "{log}");
+        assert!(!log.contains("\"done\""), "{log}");
     }
 
     #[tokio::test]

@@ -104,6 +104,13 @@ Short and cached prompts take the exact rows path. Long uncached prompts take th
 - **One expert pass for several chunks.** The in-flight chunks share their routed-expert inputs,
   so the routed experts run as one grouped pass over all of them: each expert's FP4 weights are
   read once per three chunks instead of once per chunk. Per-row results are unchanged.
+- **The decoder layers only on a prompt's tail.** Layers 21-39 keep nothing of their own but a
+  128-row window; they read the compressed and index caches layer 20 owns. A prompt's rows before
+  its last 2,541 (the decoder's 19 windows of reach, plus one window) therefore run only layers
+  0-20, on both paths. The decoder layers start cold on the tail, and by its last window their
+  outputs, the drafter's seeds and the windows decode reads are the ones running every layer
+  gives, so the exact path stays bit-identical. A later prompt that forks inside the skipped rows
+  re-runs up to 2,541 rows.
 - The bulk path's results differ from the one-row path in the last bits (different accumulation
   order); `SPARKFLASH_PREFILL_EXACT=1` forces the exact path for every prompt.
 
