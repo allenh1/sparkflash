@@ -1211,7 +1211,12 @@ free converted 2000000000000
         assert_eq!(plan.nccl_ib_gid_index, Some(3));
         assert_eq!(
             plan.peers,
-            ["198.51.100.21", "198.51.100.22", "198.51.100.23", "198.51.100.24"]
+            [
+                "198.51.100.21",
+                "198.51.100.22",
+                "198.51.100.23",
+                "198.51.100.24"
+            ]
         );
         assert!(report.network_ok());
         for node in &report.nodes {
