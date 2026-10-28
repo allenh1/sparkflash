@@ -52,13 +52,12 @@ use crate::engine::{
 };
 use crate::error::ApiError;
 use crate::prompt::{
-    PromptSummary, find_image_carrier, summarize_anthropic_messages, summarize_chat_messages,
-    summarize_prompt_text, summarize_responses_input,
+    PromptSummary, find_image_carrier, summarize_chat_messages, summarize_prompt_text,
 };
 use crate::reasoning::{self, ReasoningSpec};
 use crate::schema::{
-    ChatCompletionRequest, CompletionRequest, MessagesRequest, PromptSpec, ResponseFormat,
-    ResponsesRequest, StopSpec,
+    ChatCompletionRequest, ChatMessage, CompletionRequest, MessagesRequest, PromptSpec,
+    ResponseFormat, ResponsesRequest, StopSpec,
 };
 use crate::state::{AppState, CorsConfig};
 use crate::telemetry_types::{
@@ -412,14 +411,14 @@ fn invalid_body(error: serde_json::Error) -> ApiError {
 
 /// Refuses an image carrier found in the raw request body before generation.
 ///
-/// This is D27's structural backstop: [`find_image_carrier`] walks every object and array, so
-/// an image spelling no typed parser knows (the documented `computer_screenshot` output, a
-/// `file_id`-only screenshot, a `code_interpreter_call` output, a case-variant
-/// `type`) is refused with the same HTTP 400 `unsupported_capability` as the capability
-/// seam, and the message names the shape and JSON path found. It runs before
-/// `validate_request` because the typed seam only sees the parts a parser understood.
+/// This is D27's structural backstop: [find_image_carrier] walks every object and array, so
+/// an image spelling no typed parser knows (the documented computer_screenshot output, a
+/// file_id-only screenshot, a code_interpreter_call output, a case-variant type) is refused with
+/// the same HTTP 400 unsupported_capability as the capability seam, and the message names the
+/// shape and JSON path found. It runs before validate_request because the typed seam only sees
+/// the parts a parser understood.
 ///
-/// With `vision` (the engine has the tower loaded) only the routes that do not read images yet
+/// With vision (the engine has the tower loaded) only the routes that do not read images yet
 /// call it, and the message says so instead of blaming the engine.
 fn refuse_image_carrier(carrier: Option<String>, vision: bool) -> Result<(), ApiError> {
     let Some(shape) = carrier else {
@@ -445,31 +444,6 @@ fn refuse_image_carrier(carrier: Option<String>, vision: bool) -> Result<(), Api
         ),
         None,
         Some("unsupported_capability".to_owned()),
-    ))
-}
-
-/// Refuses `/v1/responses` and `/v1/messages` when the checkpoint tokenizer is attached.
-///
-/// Both routes still size their prompt with the Milestone 1 heuristic (`prompt.rs`), whose token
-/// ids are zero placeholders. A real engine would generate from those placeholders instead of the
-/// request, so with the tokenizer attached the routes answer 501 until they are implemented:
-/// their requests converted to the chat template (messages, tool calls and tool results) and
-/// tokenized like `/v1/chat/completions`. The weight-free router keeps serving them, since its mock
-/// engine never reads the ids.
-fn refuse_untokenized_route(state: &AppState, route: &str) -> Result<(), ApiError> {
-    if state.tokenizer().is_none() {
-        return Ok(());
-    }
-    Err(ApiError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "invalid_request_error",
-        format!(
-            "{route} is not implemented yet: this server does not tokenize its requests, so it \
-             would answer from placeholder tokens instead of the prompt; use \
-             /v1/chat/completions, which carries the same conversations, tools and reasoning"
-        ),
-        None,
-        Some("route_not_implemented".to_owned()),
     ))
 }
 
@@ -3640,6 +3614,1818 @@ fn completions_stream_response(
 }
 
 // ---------------------------------------------------------------------------------------
+// Protocol adapters: Responses and Anthropic requests onto the chat template
+// ---------------------------------------------------------------------------------------
+
+/// A protocol request normalized onto the chat-completion shape the prompt seam renders.
+struct ChatBridge {
+    /// The raw chat body handed to PromptCodec::encode_chat.
+    chat: Value,
+    /// The same messages as typed chat messages, for the tokenizer-free router path.
+    messages: Vec<ChatMessage>,
+    /// Whether a non-empty tool list is rendered and a DSML answer may be lifted into calls.
+    tools_offered: bool,
+    /// Whether one answer may carry more than one tool call.
+    parallel_tool_calls: bool,
+}
+
+fn chat_bridge(
+    chat: Value,
+    tools_offered: bool,
+    parallel_tool_calls: bool,
+) -> Result<ChatBridge, ApiError> {
+    let messages = chat
+        .get("messages")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
+    let messages: Vec<ChatMessage> = serde_json::from_value(messages).map_err(invalid_body)?;
+    Ok(ChatBridge {
+        chat,
+        messages,
+        tools_offered,
+        parallel_tool_calls,
+    })
+}
+
+fn unsupported_input_item(what: &str) -> ApiError {
+    ApiError::invalid_request(
+        format!(
+            "{what} is not supported on this endpoint; this server renders chat messages, tool \
+             calls and tool outputs, and refuses an item it cannot turn into a prompt rather than \
+             silently dropping it"
+        ),
+        Some("input".to_owned()),
+        Some("unsupported_capability".to_owned()),
+    )
+}
+
+fn object_member<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
+    object.get(key).filter(|value| !value.is_null())
+}
+
+fn required_string(object: &Map<String, Value>, key: &str, item: &str) -> Result<String, ApiError> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            ApiError::invalid_request(
+                format!("{item} requires a non-empty string \"{key}\""),
+                Some(key.to_owned()),
+                Some("invalid_input".to_owned()),
+            )
+        })
+}
+
+/// Text of a Responses content-part array, for items that carry prose (instructions and reasoning).
+fn responses_text_parts(value: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(items) = value.as_array() {
+        for item in items {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                parts.push(text.to_owned());
+            } else if let Some(text) = item.as_str() {
+                parts.push(text.to_owned());
+            }
+        }
+    } else if let Some(text) = value.as_str() {
+        parts.push(text.to_owned());
+    }
+    parts.join("\n")
+}
+
+/// Converts one Responses content value (string or part array) to a chat content value.
+fn responses_content_to_chat(value: &Value) -> Result<Value, ApiError> {
+    match value {
+        Value::String(text) => Ok(Value::String(text.clone())),
+        Value::Null => Ok(Value::Null),
+        Value::Array(items) => {
+            let mut parts = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(object) = item.as_object() else {
+                    return Err(unsupported_input_item(
+                        "a non-object Responses content part",
+                    ));
+                };
+                let part_type = object.get("type").and_then(Value::as_str);
+                match part_type {
+                    Some("input_text" | "output_text" | "text") => {
+                        let text = object
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        parts.push(json!({"type": "text", "text": text}));
+                    }
+                    Some("input_image" | "image_url") => {
+                        let image = object
+                            .get("image_url")
+                            .cloned()
+                            .or_else(|| object.get("url").cloned())
+                            .ok_or_else(|| {
+                                ApiError::invalid_request(
+                                    "an image content part requires \"image_url\"",
+                                    Some("input".to_owned()),
+                                    Some("invalid_input".to_owned()),
+                                )
+                            })?;
+                        parts.push(json!({"type": "image_url", "image_url": image}));
+                    }
+                    Some("refusal") => {
+                        let text = object
+                            .get("refusal")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        parts.push(json!({"type": "text", "text": text}));
+                    }
+                    Some(other) => {
+                        return Err(unsupported_input_item(&format!(
+                            "the Responses content part type {other:?}"
+                        )));
+                    }
+                    None => {
+                        return Err(ApiError::invalid_request(
+                            "a Responses content part requires a string \"type\"",
+                            Some("input".to_owned()),
+                            Some("invalid_input".to_owned()),
+                        ));
+                    }
+                }
+            }
+            Ok(Value::Array(parts))
+        }
+        _ => Err(ApiError::invalid_request(
+            "Responses content must be a string or an array of content parts",
+            Some("input".to_owned()),
+            Some("invalid_input".to_owned()),
+        )),
+    }
+}
+
+/// Appends one assistant function call, merging contiguous calls into one assistant message.
+fn push_responses_function_call(
+    messages: &mut Vec<Value>,
+    object: &Map<String, Value>,
+) -> Result<(), ApiError> {
+    let call_id = required_string(object, "call_id", "a function_call item")?;
+    let name = required_string(object, "name", "a function_call item")?;
+    let arguments = match object.get("arguments") {
+        Some(Value::String(text)) => text.clone(),
+        Some(value @ (Value::Object(_) | Value::Array(_))) => value.to_string(),
+        None | Some(Value::Null) => String::new(),
+        Some(_) => {
+            return Err(ApiError::invalid_request(
+                "function_call arguments must be a JSON string or object",
+                Some("arguments".to_owned()),
+                Some("invalid_input".to_owned()),
+            ));
+        }
+    };
+    let call = json!({
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    });
+    if let Some(last) = messages.last_mut().and_then(Value::as_object_mut)
+        && last.get("role").and_then(Value::as_str) == Some("assistant")
+        && last.get("tool_calls").is_some()
+        && last.get("tool_call_id").is_none()
+        && let Some(Value::Array(calls)) = last.get_mut("tool_calls")
+    {
+        calls.push(call);
+        return Ok(());
+    }
+    messages.push(json!({
+        "role": "assistant",
+        "content": Value::Null,
+        "tool_calls": [call],
+    }));
+    Ok(())
+}
+
+fn push_responses_reasoning(
+    messages: &mut Vec<Value>,
+    object: &Map<String, Value>,
+) -> Result<(), ApiError> {
+    let text = object
+        .get("summary")
+        .map(responses_text_parts)
+        .filter(|text| !text.is_empty())
+        .or_else(|| object.get("content").map(responses_text_parts))
+        .unwrap_or_default();
+    if text.is_empty() {
+        return Ok(());
+    }
+    if let Some(last) = messages.last_mut().and_then(Value::as_object_mut)
+        && last.get("role").and_then(Value::as_str) == Some("assistant")
+        && last.get("tool_call_id").is_none()
+        && last.get("tool_calls").is_none()
+    {
+        let existing = last
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let joined = if existing.is_empty() {
+            text
+        } else {
+            format!("{existing}\n{text}")
+        };
+        last.insert("reasoning_content".to_owned(), Value::String(joined));
+        return Ok(());
+    }
+    messages.push(json!({
+        "role": "assistant",
+        "content": Value::Null,
+        "reasoning_content": text,
+    }));
+    Ok(())
+}
+
+fn responses_message_item(object: &Map<String, Value>) -> Result<Value, ApiError> {
+    let role = required_string(object, "role", "a Responses message item")?;
+    if !matches!(
+        role.as_str(),
+        "system" | "developer" | "user" | "assistant" | "tool"
+    ) {
+        return Err(ApiError::invalid_request(
+            format!("invalid Responses message role {role:?}"),
+            Some("role".to_owned()),
+            Some("invalid_input".to_owned()),
+        ));
+    }
+    // The released V4.1 encoder drops a developer message in thinking mode (the default) and
+    // refuses it in chat mode. Fold it onto the system role, which the renderer supports at any
+    // position, so the instruction reaches the model instead of disappearing.
+    let role = if role == "developer" {
+        "system".to_owned()
+    } else {
+        role
+    };
+    let content = match object.get("content") {
+        None => Value::Null,
+        Some(content) => responses_content_to_chat(content)?,
+    };
+    let mut message = Map::new();
+    message.insert("role".to_owned(), Value::String(role));
+    message.insert("content".to_owned(), content);
+    for key in ["name", "tool_call_id", "tool_calls"] {
+        if let Some(value) = object_member(object, key) {
+            message.insert(key.to_owned(), value.clone());
+        }
+    }
+    Ok(Value::Object(message))
+}
+
+fn responses_function_output(object: &Map<String, Value>) -> Result<Value, ApiError> {
+    let call_id = required_string(object, "call_id", "a function_call_output item")?;
+    let output = object.get("output").ok_or_else(|| {
+        ApiError::invalid_request(
+            "a function_call_output item requires \"output\"",
+            Some("output".to_owned()),
+            Some("invalid_input".to_owned()),
+        )
+    })?;
+    let content = responses_content_to_chat(output)?;
+    Ok(json!({"role": "tool", "tool_call_id": call_id, "content": content}))
+}
+
+/// Converts the Responses input member into chat messages.
+fn responses_input_messages(input: Option<&Value>) -> Result<Vec<Value>, ApiError> {
+    let mut messages = Vec::new();
+    let Some(input) = input else {
+        return Ok(messages);
+    };
+    match input {
+        Value::Null => {}
+        Value::String(text) => messages.push(json!({"role": "user", "content": text})),
+        Value::Array(items) => {
+            let mut pending_parts = Vec::new();
+            let flush = |messages: &mut Vec<Value>, pending_parts: &mut Vec<Value>| {
+                if !pending_parts.is_empty() {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": Value::Array(std::mem::take(pending_parts)),
+                    }));
+                }
+            };
+            for item in items {
+                match item {
+                    Value::String(text) => {
+                        flush(&mut messages, &mut pending_parts);
+                        messages.push(json!({"role": "user", "content": text}));
+                    }
+                    Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+                        Some("message") | None if object.contains_key("role") => {
+                            flush(&mut messages, &mut pending_parts);
+                            messages.push(responses_message_item(object)?);
+                        }
+                        Some("input_text" | "input_image" | "text" | "image_url") => {
+                            let part =
+                                responses_content_to_chat(&Value::Array(vec![item.clone()]))?;
+                            if let Value::Array(mut parts) = part {
+                                pending_parts.append(&mut parts);
+                            }
+                        }
+                        Some("function_call") => {
+                            flush(&mut messages, &mut pending_parts);
+                            push_responses_function_call(&mut messages, object)?;
+                        }
+                        Some("function_call_output") => {
+                            flush(&mut messages, &mut pending_parts);
+                            messages.push(responses_function_output(object)?);
+                        }
+                        Some("reasoning") => {
+                            flush(&mut messages, &mut pending_parts);
+                            push_responses_reasoning(&mut messages, object)?;
+                        }
+                        Some("item_reference") => {
+                            return Err(ApiError::invalid_request(
+                                "item_reference input needs a response store, and this server keeps none; send the referenced content inline instead",
+                                Some("input".to_owned()),
+                                Some("unsupported_parameter".to_owned()),
+                            ));
+                        }
+                        Some(other) => {
+                            return Err(unsupported_input_item(&format!(
+                                "the Responses input item type {other:?}"
+                            )));
+                        }
+                        None => {
+                            return Err(ApiError::invalid_request(
+                                "a Responses input object requires \"type\" or \"role\"",
+                                Some("input".to_owned()),
+                                Some("invalid_input".to_owned()),
+                            ));
+                        }
+                    },
+                    _ => {
+                        return Err(unsupported_input_item(
+                            "a non-string, non-object input item",
+                        ));
+                    }
+                }
+            }
+            flush(&mut messages, &mut pending_parts);
+        }
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("input_text" | "input_image" | "text" | "image_url") => {
+                let content = responses_content_to_chat(&Value::Array(vec![input.clone()]))?;
+                messages.push(json!({"role": "user", "content": content}));
+            }
+            Some("message") | None if object.contains_key("role") => {
+                messages.push(responses_message_item(object)?);
+            }
+            Some("function_call") => push_responses_function_call(&mut messages, object)?,
+            Some("function_call_output") => {
+                messages.push(responses_function_output(object)?);
+            }
+            Some("reasoning") => push_responses_reasoning(&mut messages, object)?,
+            Some("item_reference") => {
+                return Err(ApiError::invalid_request(
+                    "item_reference input needs a response store, and this server keeps none; send the referenced content inline instead",
+                    Some("input".to_owned()),
+                    Some("unsupported_parameter".to_owned()),
+                ));
+            }
+            Some(other) => {
+                return Err(unsupported_input_item(&format!(
+                    "the Responses input item type {other:?}"
+                )));
+            }
+            None => {
+                return Err(ApiError::invalid_request(
+                    "a Responses input object requires \"type\" or \"role\"",
+                    Some("input".to_owned()),
+                    Some("invalid_input".to_owned()),
+                ));
+            }
+        },
+        _ => {
+            return Err(unsupported_input_item(
+                "a Responses input of this JSON type",
+            ));
+        }
+    }
+    Ok(messages)
+}
+
+fn responses_tools_to_chat(tools: Option<&Value>) -> Result<Option<Value>, ApiError> {
+    let Some(tools) = tools.filter(|tools| !tools.is_null()) else {
+        return Ok(None);
+    };
+    let Some(items) = tools.as_array() else {
+        return Err(ApiError::invalid_request(
+            "\"tools\" must be an array",
+            Some("tools".to_owned()),
+            Some("invalid_tools".to_owned()),
+        ));
+    };
+    let mut converted = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(object) = item.as_object() else {
+            return Err(ApiError::invalid_request(
+                "each tool must be an object",
+                Some("tools".to_owned()),
+                Some("invalid_tools".to_owned()),
+            ));
+        };
+        if object.get("function").is_some() {
+            converted.push(item.clone());
+            continue;
+        }
+        let tool_type = object.get("type").and_then(Value::as_str);
+        if !matches!(tool_type, Some("function") | None) {
+            return Err(ApiError::invalid_request(
+                format!(
+                    "the Responses tool type {:?} is not supported: this server renders function \
+                     tools only, so custom, hosted and built-in tools are refused rather than \
+                     advertised without an implementation",
+                    tool_type
+                ),
+                Some("tools".to_owned()),
+                Some("unsupported_capability".to_owned()),
+            ));
+        }
+        let name = required_string(object, "name", "a function tool")?;
+        let mut function = Map::new();
+        function.insert("name".to_owned(), Value::String(name));
+        for key in ["description", "parameters", "strict"] {
+            if let Some(value) = object_member(object, key) {
+                function.insert(key.to_owned(), value.clone());
+            }
+        }
+        converted.push(json!({"type": "function", "function": function}));
+    }
+    Ok(Some(Value::Array(converted)))
+}
+
+fn validate_responses_text_format(text: Option<&Value>) -> Result<(), ApiError> {
+    let Some(text) = text.filter(|text| !text.is_null()) else {
+        return Ok(());
+    };
+    let Some(object) = text.as_object() else {
+        return Err(ApiError::invalid_request(
+            "\"text\" must be an object",
+            Some("text".to_owned()),
+            Some("invalid_request".to_owned()),
+        ));
+    };
+    let Some(format) = object.get("format").filter(|format| !format.is_null()) else {
+        return Ok(());
+    };
+    let Some(format) = format.as_object() else {
+        return Err(ApiError::invalid_request(
+            "\"text.format\" must be an object",
+            Some("text.format".to_owned()),
+            Some("invalid_request".to_owned()),
+        ));
+    };
+    match format.get("type").and_then(Value::as_str) {
+        Some("text") | None => Ok(()),
+        Some("json_object" | "json_schema") => Err(ApiError::invalid_request(
+            "text.format json_object/json_schema needs constrained decoding, and this server has \
+             no decoder logits processor; the request is refused rather than returning JSON that \
+             may violate the caller's guarantee",
+            Some("text.format".to_owned()),
+            Some("unsupported_parameter".to_owned()),
+        )),
+        Some(other) => Err(ApiError::invalid_request(
+            format!("unknown text.format type {other:?}"),
+            Some("text.format".to_owned()),
+            Some("invalid_request".to_owned()),
+        )),
+    }
+}
+
+fn responses_bridge(value: &Value, request: &ResponsesRequest) -> Result<ChatBridge, ApiError> {
+    if request.previous_response_id.is_some() {
+        return Err(ApiError::invalid_request(
+            "previous_response_id needs a response store, and this server keeps none; send the \
+             full conversation in \"input\" instead",
+            Some("previous_response_id".to_owned()),
+            Some("unsupported_parameter".to_owned()),
+        ));
+    }
+    if let Some(reasoning) = request.reasoning.as_ref().filter(|value| !value.is_null())
+        && !reasoning.is_object()
+    {
+        return Err(ApiError::invalid_request(
+            "\"reasoning\" must be an object with an optional effort member",
+            Some("reasoning".to_owned()),
+            Some("invalid_request".to_owned()),
+        ));
+    }
+    validate_responses_text_format(request.text.as_ref())?;
+    let policy = resolve_tool_policy(
+        request.tools.as_ref(),
+        request.tool_choice.as_ref(),
+        request.parallel_tool_calls,
+    )?;
+    let tools = responses_tools_to_chat(request.tools.as_ref())?;
+    let mut messages = Vec::new();
+    if let Some(instructions) = request.instructions.as_deref() {
+        messages.push(json!({"role": "system", "content": instructions}));
+    }
+    messages.extend(responses_input_messages(request.input.as_ref())?);
+    let mut chat = Map::new();
+    chat.insert("messages".to_owned(), Value::Array(messages));
+    if policy.tools_offered
+        && let Some(tools) = tools
+    {
+        chat.insert("tools".to_owned(), tools);
+    }
+    if policy.tools_offered
+        && let Some(tool_choice) = request.tool_choice.clone()
+    {
+        chat.insert("tool_choice".to_owned(), tool_choice);
+    }
+    if let Some(parallel) = request.parallel_tool_calls {
+        chat.insert("parallel_tool_calls".to_owned(), json!(parallel));
+    }
+    if let Some(effort) = request
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.get("effort"))
+    {
+        // The released template understands low/high/xhigh/max/none. OpenAI also spells
+        // minimal and medium; map them onto the template's nearest documented aliases.
+        let effort = match effort.as_str() {
+            Some("minimal") => json!("low"),
+            Some("medium") => json!("high"),
+            _ => effort.clone(),
+        };
+        chat.insert("reasoning_effort".to_owned(), effort);
+    }
+    for key in ["enable_thinking", "chat_template_kwargs"] {
+        if let Some(value) = value.get(key).filter(|value| !value.is_null()) {
+            chat.insert(key.to_owned(), value.clone());
+        }
+    }
+    chat_bridge(Value::Object(chat), policy.tools_offered, policy.parallel)
+}
+
+/// Converts an Anthropic image source to a chat image URL.
+fn anthropic_image_url(source: &Value) -> Result<String, ApiError> {
+    let Some(source) = source.as_object() else {
+        return Err(ApiError::invalid_request(
+            "an Anthropic image source must be an object",
+            Some("source".to_owned()),
+            Some("invalid_input".to_owned()),
+        ));
+    };
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let media_type = required_string(source, "media_type", "an Anthropic image source")?;
+            let data = required_string(source, "data", "an Anthropic image source")?;
+            Ok(crate::multimodal::anthropic_source_to_data_url(
+                &media_type,
+                &data,
+            ))
+        }
+        Some("url") => required_string(source, "url", "an Anthropic image source"),
+        Some(other) => Err(unsupported_input_item(&format!(
+            "the Anthropic image source type {other:?}"
+        ))),
+        None => Err(ApiError::invalid_request(
+            "an Anthropic image source requires a string \"type\"",
+            Some("source".to_owned()),
+            Some("invalid_input".to_owned()),
+        )),
+    }
+}
+
+/// Converts an Anthropic content block array to chat parts, returning tool calls separately.
+fn anthropic_content_to_chat(
+    role: &str,
+    content: Option<&Value>,
+    messages: &mut Vec<Value>,
+) -> Result<(), ApiError> {
+    let Some(content) = content else {
+        messages.push(json!({"role": role, "content": Value::Null}));
+        return Ok(());
+    };
+    match content {
+        Value::String(text) => messages.push(json!({"role": role, "content": text})),
+        Value::Null => messages.push(json!({"role": role, "content": Value::Null})),
+        Value::Array(blocks) => {
+            let mut parts = Vec::new();
+            let mut tool_calls = Vec::new();
+            let mut reasoning = String::new();
+            let flush_user = |messages: &mut Vec<Value>, parts: &mut Vec<Value>| {
+                if !parts.is_empty() {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": Value::Array(std::mem::take(parts)),
+                    }));
+                }
+            };
+            for block in blocks {
+                let Some(object) = block.as_object() else {
+                    return Err(unsupported_input_item(
+                        "a non-object Anthropic content block",
+                    ));
+                };
+                let block_type = object.get("type").and_then(Value::as_str);
+                match block_type {
+                    Some("text") => {
+                        let text = object
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        parts.push(json!({"type": "text", "text": text}));
+                    }
+                    Some("image") => {
+                        let source = object.get("source").ok_or_else(|| {
+                            ApiError::invalid_request(
+                                "an Anthropic image block requires \"source\"",
+                                Some("source".to_owned()),
+                                Some("invalid_input".to_owned()),
+                            )
+                        })?;
+                        let url = anthropic_image_url(source)?;
+                        parts.push(json!({"type": "image_url", "image_url": {"url": url}}));
+                    }
+                    Some("thinking") => {
+                        if let Some(text) = object.get("thinking").and_then(Value::as_str) {
+                            reasoning.push_str(text);
+                        }
+                    }
+                    Some("redacted_thinking") => {}
+                    Some("tool_use") => {
+                        let id = required_string(object, "id", "an Anthropic tool_use block")?;
+                        let name = required_string(object, "name", "an Anthropic tool_use block")?;
+                        let input = object.get("input").cloned().unwrap_or_else(|| json!({}));
+                        let arguments = input.to_string();
+                        tool_calls.push(json!({
+                            "id": id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments},
+                        }));
+                    }
+                    Some("tool_result") => {
+                        if role != "user" {
+                            return Err(ApiError::invalid_request(
+                                "tool_result blocks are only valid in user messages",
+                                Some("messages".to_owned()),
+                                Some("invalid_input".to_owned()),
+                            ));
+                        }
+                        flush_user(messages, &mut parts);
+                        let tool_use_id = required_string(
+                            object,
+                            "tool_use_id",
+                            "an Anthropic tool_result block",
+                        )?;
+                        let result = object.get("content").cloned().unwrap_or(Value::Null);
+                        let result = match result {
+                            Value::Array(blocks) => {
+                                let mut text: Vec<String> = Vec::new();
+                                for block in blocks {
+                                    let Some(block) = block.as_object() else {
+                                        return Err(unsupported_input_item(
+                                            "a non-object Anthropic tool_result content block",
+                                        ));
+                                    };
+                                    match block.get("type").and_then(Value::as_str) {
+                                        Some("text") => {
+                                            let Some(text_value) =
+                                                block.get("text").and_then(Value::as_str)
+                                            else {
+                                                return Err(ApiError::invalid_request(
+                                                    "an Anthropic tool_result text block requires a string \"text\"",
+                                                    Some("messages".to_owned()),
+                                                    Some("invalid_input".to_owned()),
+                                                ));
+                                            };
+                                            text.push(text_value.to_owned());
+                                        }
+                                        Some("image") => {
+                                            let source = block.get("source").ok_or_else(|| {
+                                                ApiError::invalid_request(
+                                                    "an Anthropic tool_result image block requires \"source\"",
+                                                    Some("source".to_owned()),
+                                                    Some("invalid_input".to_owned()),
+                                                )
+                                            })?;
+                                            text.push(anthropic_image_url(source)?);
+                                        }
+                                        Some(other) => {
+                                            return Err(unsupported_input_item(&format!(
+                                                "the Anthropic tool_result block type {other:?}"
+                                            )));
+                                        }
+                                        None => {
+                                            return Err(ApiError::invalid_request(
+                                                "an Anthropic tool_result content block requires a string \"type\"",
+                                                Some("messages".to_owned()),
+                                                Some("invalid_input".to_owned()),
+                                            ));
+                                        }
+                                    }
+                                }
+                                Value::String(text.join("\n"))
+                            }
+                            other => other,
+                        };
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tool_use_id,
+                            "content": result,
+                        }));
+                    }
+                    Some(other) => {
+                        return Err(unsupported_input_item(&format!(
+                            "the Anthropic content block type {other:?}"
+                        )));
+                    }
+                    None => {
+                        return Err(ApiError::invalid_request(
+                            "an Anthropic content block requires a string \"type\"",
+                            Some("messages".to_owned()),
+                            Some("invalid_input".to_owned()),
+                        ));
+                    }
+                }
+            }
+            if role == "assistant" {
+                if !parts.is_empty() || !tool_calls.is_empty() || !reasoning.is_empty() {
+                    let content = if parts.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::Array(parts)
+                    };
+                    let mut message = Map::new();
+                    message.insert("role".to_owned(), Value::String("assistant".to_owned()));
+                    message.insert("content".to_owned(), content);
+                    if !tool_calls.is_empty() {
+                        message.insert("tool_calls".to_owned(), Value::Array(tool_calls));
+                    }
+                    if !reasoning.is_empty() {
+                        message.insert("reasoning_content".to_owned(), Value::String(reasoning));
+                    }
+                    messages.push(Value::Object(message));
+                }
+            } else {
+                flush_user(messages, &mut parts);
+            }
+        }
+        _ => {
+            return Err(ApiError::invalid_request(
+                "Anthropic message content must be a string or an array of blocks",
+                Some("messages".to_owned()),
+                Some("invalid_input".to_owned()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn anthropic_system_text(system: Option<&Value>) -> Result<Option<String>, ApiError> {
+    let Some(system) = system.filter(|system| !system.is_null()) else {
+        return Ok(None);
+    };
+    match system {
+        Value::String(text) => Ok(Some(text.clone())),
+        Value::Array(blocks) => {
+            let mut parts = Vec::new();
+            for block in blocks {
+                let Some(object) = block.as_object() else {
+                    return Err(ApiError::invalid_request(
+                        "each Anthropic system block must be an object",
+                        Some("system".to_owned()),
+                        Some("invalid_input".to_owned()),
+                    ));
+                };
+                match object.get("type").and_then(Value::as_str) {
+                    Some("text") | None => {
+                        if let Some(text) = object.get("text").and_then(Value::as_str) {
+                            parts.push(text.to_owned());
+                        }
+                    }
+                    Some(other) => {
+                        return Err(unsupported_input_item(&format!(
+                            "the Anthropic system block type {other:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(Some(parts.join("\n\n")))
+        }
+        _ => Err(ApiError::invalid_request(
+            "Anthropic system must be a string or an array of text blocks",
+            Some("system".to_owned()),
+            Some("invalid_input".to_owned()),
+        )),
+    }
+}
+
+fn anthropic_tools_to_chat(tools: Option<&Value>) -> Result<Option<Value>, ApiError> {
+    let Some(tools) = tools.filter(|tools| !tools.is_null()) else {
+        return Ok(None);
+    };
+    let Some(items) = tools.as_array() else {
+        return Err(ApiError::invalid_request(
+            "\"tools\" must be an array",
+            Some("tools".to_owned()),
+            Some("invalid_tools".to_owned()),
+        ));
+    };
+    let mut converted = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(object) = item.as_object() else {
+            return Err(ApiError::invalid_request(
+                "each tool must be an object",
+                Some("tools".to_owned()),
+                Some("invalid_tools".to_owned()),
+            ));
+        };
+        if object.get("function").is_some() {
+            converted.push(item.clone());
+            continue;
+        }
+        let name = required_string(object, "name", "an Anthropic tool")?;
+        let mut function = Map::new();
+        function.insert("name".to_owned(), Value::String(name));
+        if let Some(description) = object_member(object, "description") {
+            function.insert("description".to_owned(), description.clone());
+        }
+        if let Some(schema) = object_member(object, "input_schema") {
+            function.insert("parameters".to_owned(), schema.clone());
+        }
+        converted.push(json!({"type": "function", "function": function}));
+    }
+    Ok(Some(Value::Array(converted)))
+}
+
+fn anthropic_tool_choice_to_chat(
+    choice: Option<&Value>,
+) -> Result<(Option<Value>, bool), ApiError> {
+    let Some(choice) = choice.filter(|choice| !choice.is_null()) else {
+        return Ok((None, true));
+    };
+    let Some(object) = choice.as_object() else {
+        return Err(ApiError::invalid_request(
+            "tool_choice must be an object",
+            Some("tool_choice".to_owned()),
+            Some("invalid_tool_choice".to_owned()),
+        ));
+    };
+    let choice_type = object.get("type").and_then(Value::as_str);
+    let parallel = !object
+        .get("disable_parallel_tool_use")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let converted = match choice_type {
+        Some("auto") => Value::String("auto".to_owned()),
+        Some("none") => Value::String("none".to_owned()),
+        Some("any") => Value::String("required".to_owned()),
+        Some("tool") => {
+            let name = required_string(object, "name", "an Anthropic tool_choice")?;
+            json!({"type": "function", "function": {"name": name}})
+        }
+        _ => {
+            return Err(ApiError::invalid_request(
+                "tool_choice must be {\"type\":\"auto\"}, {\"type\":\"any\"}, {\"type\":\"tool\",\"name\":...} or {\"type\":\"none\"}",
+                Some("tool_choice".to_owned()),
+                Some("invalid_tool_choice".to_owned()),
+            ));
+        }
+    };
+    Ok((Some(converted), parallel))
+}
+
+fn anthropic_bridge(request: &MessagesRequest) -> Result<ChatBridge, ApiError> {
+    let (tool_choice, parallel) = anthropic_tool_choice_to_chat(request.tool_choice.as_ref())?;
+    let policy = resolve_tool_policy(request.tools.as_ref(), tool_choice.as_ref(), Some(parallel))?;
+    let tools = anthropic_tools_to_chat(request.tools.as_ref())?;
+    let mut messages = Vec::new();
+    if let Some(system) = anthropic_system_text(request.system.as_ref())? {
+        messages.push(json!({"role": "system", "content": system}));
+    }
+    for message in &request.messages {
+        match message.role.as_str() {
+            "user" | "assistant" => {
+                anthropic_content_to_chat(&message.role, message.content.as_ref(), &mut messages)?;
+            }
+            other => {
+                return Err(ApiError::invalid_request(
+                    format!("invalid Anthropic message role {other:?}"),
+                    Some("messages".to_owned()),
+                    Some("invalid_input".to_owned()),
+                ));
+            }
+        }
+    }
+    let mut chat = Map::new();
+    chat.insert("messages".to_owned(), Value::Array(messages));
+    if policy.tools_offered
+        && let Some(tools) = tools
+    {
+        chat.insert("tools".to_owned(), tools);
+    }
+    if policy.tools_offered
+        && let Some(tool_choice) = tool_choice
+    {
+        chat.insert("tool_choice".to_owned(), tool_choice);
+    }
+    chat.insert("parallel_tool_calls".to_owned(), json!(policy.parallel));
+    if let Some(thinking) = request
+        .thinking
+        .as_ref()
+        .filter(|thinking| !thinking.is_null())
+    {
+        let Some(thinking) = thinking.as_object() else {
+            return Err(ApiError::invalid_request(
+                "thinking must be an object",
+                Some("thinking".to_owned()),
+                Some("invalid_thinking".to_owned()),
+            ));
+        };
+        match thinking.get("type").and_then(Value::as_str) {
+            Some("enabled") => {
+                chat.insert("enable_thinking".to_owned(), Value::Bool(true));
+            }
+            Some("disabled") => {
+                chat.insert("enable_thinking".to_owned(), Value::Bool(false));
+            }
+            _ => {
+                return Err(ApiError::invalid_request(
+                    "thinking.type must be \"enabled\" or \"disabled\"",
+                    Some("thinking".to_owned()),
+                    Some("invalid_thinking".to_owned()),
+                ));
+            }
+        }
+    }
+    chat_bridge(Value::Object(chat), policy.tools_offered, policy.parallel)
+}
+
+/// Sizes a bridged request with the checkpoint tokenizer, or the Milestone 1 estimator for the
+/// weight-free router. Mirrors the chat handler's seam choice exactly.
+fn bridge_prompt_summary(
+    state: &AppState,
+    bridge: &ChatBridge,
+) -> Result<(PromptSummary, Option<Vec<u32>>), ApiError> {
+    match state.tokenizer() {
+        Some(seam) => {
+            let ids = seam.encode_chat(&bridge.chat).map_err(prompt_codec_error)?;
+            Ok((tokenizer_prompt_summary(ids.clone(), 0), Some(ids)))
+        }
+        None => Ok((summarize_chat_messages(&bridge.messages)?, None)),
+    }
+}
+
+/// Response-appropriate ids for the tool calls of a buffered output.
+fn response_call_ids(state: &AppState, calls: usize) -> Vec<(String, String)> {
+    (0..calls)
+        .map(|_| (state.next_id("fc_dsv41_"), state.next_id("call_dsv41_")))
+        .collect()
+}
+
+fn responses_usage_value(usage: &OpenAiUsageWithCache) -> Value {
+    json!({
+        "input_tokens": usage.prompt_tokens,
+        "input_tokens_details": {"cached_tokens": usage.prompt_tokens_details.cached_tokens},
+        "output_tokens": usage.completion_tokens,
+        "output_tokens_details": {"reasoning_tokens": usage.completion_tokens_details.reasoning_tokens},
+        "total_tokens": usage.total_tokens,
+    })
+}
+
+fn responses_message_item_value(message_id: &str, content: &str, status: &str) -> Value {
+    json!({
+        "type": "message",
+        "id": message_id,
+        "status": status,
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": content, "annotations": []}],
+    })
+}
+
+fn responses_reasoning_item_value(reasoning_id: &str, text: &str, status: &str) -> Value {
+    json!({
+        "type": "reasoning",
+        "id": reasoning_id,
+        "status": status,
+        "summary": [{"type": "summary_text", "text": text}],
+    })
+}
+
+fn responses_function_call_item_value(
+    item_id: &str,
+    call_id: &str,
+    name: &str,
+    arguments: &str,
+    status: &str,
+) -> Value {
+    json!({
+        "type": "function_call",
+        "id": item_id,
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+        "status": status,
+    })
+}
+
+fn responses_output_items(
+    output: &EngineOutput,
+    reasoning_id: &str,
+    message_id: &str,
+    call_ids: &[(String, String)],
+) -> Vec<Value> {
+    let mut items = Vec::new();
+    if !output.reasoning.is_empty() {
+        items.push(responses_reasoning_item_value(
+            reasoning_id,
+            &output.reasoning,
+            "completed",
+        ));
+    }
+    if !output.content.is_empty() || output.tool_calls.is_empty() {
+        items.push(responses_message_item_value(
+            message_id,
+            &output.content,
+            "completed",
+        ));
+    }
+    for (index, call) in output.tool_calls.iter().enumerate() {
+        let (item_id, call_id) = call_ids.get(index).cloned().unwrap_or_else(|| {
+            (
+                format!("fc_dsv41_{index:08x}"),
+                format!("call_dsv41_{index:08x}"),
+            )
+        });
+        items.push(responses_function_call_item_value(
+            &item_id,
+            &call_id,
+            &call.name,
+            &call.arguments,
+            "completed",
+        ));
+    }
+    items
+}
+
+/// The Responses status/incomplete-details pair for a terminal finish reason.
+fn responses_terminal_status(reason: FinishReason) -> (&'static str, Option<Value>) {
+    match reason {
+        FinishReason::Length => ("incomplete", Some(json!({"reason": "max_output_tokens"}))),
+        FinishReason::Stop | FinishReason::ToolCalls | FinishReason::LoopAbort => {
+            ("completed", None)
+        }
+    }
+}
+
+fn responses_response_body(
+    output: &EngineOutput,
+    id: &str,
+    created: u64,
+    model: &str,
+    reasoning_id: &str,
+    message_id: &str,
+    call_ids: &[(String, String)],
+) -> Value {
+    let items = responses_output_items(output, reasoning_id, message_id, call_ids);
+    let (status, incomplete_details) = responses_terminal_status(output.finish_reason);
+    json!({
+        "id": id,
+        "object": "response",
+        "created_at": created,
+        "status": status,
+        "error": Value::Null,
+        "incomplete_details": incomplete_details,
+        "model": model,
+        "output": items,
+        "output_text": output.content,
+        "usage": responses_usage_value(&output.usage),
+        "x_deepseek_spark_stats": output.stats,
+    })
+}
+
+fn responses_snapshot(id: &str, created: u64, model: &str, status: &str, items: &[Value]) -> Value {
+    let output_text = items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+        .flat_map(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<String>();
+    json!({
+        "id": id,
+        "object": "response",
+        "created_at": created,
+        "status": status,
+        "error": Value::Null,
+        "incomplete_details": Value::Null,
+        "model": model,
+        "output": items,
+        "output_text": output_text,
+        "usage": Value::Null,
+    })
+}
+
+fn responses_sse_event(kind: &str, mut data: Value, sequence: &mut u64) -> Bytes {
+    if let Some(map) = data.as_object_mut() {
+        map.insert("type".to_owned(), Value::String(kind.to_owned()));
+        map.insert("sequence_number".to_owned(), json!(*sequence));
+    }
+    *sequence += 1;
+    let mut text = format!("event: {kind}\ndata: ");
+    text.push_str(&serde_json::to_string(&data).unwrap_or_else(|_| "{}".to_owned()));
+    text.push_str("\n\n");
+    Bytes::from(text)
+}
+
+/// One open tool-call item in a Responses stream.
+struct ResponsesCall {
+    output_index: usize,
+    item_id: String,
+    call_id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Streaming state shared by the content, reasoning and tool-call paths.
+struct ResponsesStreamItems {
+    next_output_index: usize,
+    reasoning_index: Option<usize>,
+    reasoning_text: String,
+    message_index: Option<usize>,
+    message_text: String,
+    calls: Vec<ResponsesCall>,
+    native_calls: BTreeMap<usize, usize>,
+    parsed_calls: BTreeMap<usize, usize>,
+}
+
+impl ResponsesStreamItems {
+    fn new() -> Self {
+        Self {
+            next_output_index: 0,
+            reasoning_index: None,
+            reasoning_text: String::new(),
+            message_index: None,
+            message_text: String::new(),
+            calls: Vec::new(),
+            native_calls: BTreeMap::new(),
+            parsed_calls: BTreeMap::new(),
+        }
+    }
+
+    fn output_index(&mut self) -> usize {
+        let index = self.next_output_index;
+        self.next_output_index += 1;
+        index
+    }
+
+    fn output(&self, reasoning_id: &str, message_id: &str) -> Vec<Value> {
+        let mut items: Vec<(usize, Value)> = Vec::new();
+        if let Some(index) = self.reasoning_index {
+            items.push((
+                index,
+                responses_reasoning_item_value(reasoning_id, &self.reasoning_text, "completed"),
+            ));
+        }
+        if let Some(index) = self.message_index {
+            items.push((
+                index,
+                responses_message_item_value(message_id, &self.message_text, "completed"),
+            ));
+        }
+        for call in &self.calls {
+            items.push((
+                call.output_index,
+                responses_function_call_item_value(
+                    &call.item_id,
+                    &call.call_id,
+                    &call.name,
+                    &call.arguments,
+                    "completed",
+                ),
+            ));
+        }
+        items.sort_by_key(|(index, _)| *index);
+        items.into_iter().map(|(_, item)| item).collect()
+    }
+}
+
+fn responses_open_message(
+    state: &mut ResponsesStreamItems,
+    message_id: &str,
+    sequence: &mut u64,
+) -> Vec<Bytes> {
+    if state.message_index.is_some() {
+        return Vec::new();
+    }
+    let index = state.output_index();
+    state.message_index = Some(index);
+    vec![
+        responses_sse_event(
+            "response.output_item.added",
+            json!({
+                "output_index": index,
+                "item": {"type": "message", "id": message_id, "status": "in_progress",
+                         "role": "assistant", "content": []},
+            }),
+            sequence,
+        ),
+        responses_sse_event(
+            "response.content_part.added",
+            json!({
+                "item_id": message_id,
+                "output_index": index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            }),
+            sequence,
+        ),
+    ]
+}
+
+fn responses_content_frames(
+    state: &mut ResponsesStreamItems,
+    message_id: &str,
+    text: &str,
+    sequence: &mut u64,
+) -> Vec<Bytes> {
+    let mut frames = responses_open_message(state, message_id, sequence);
+    state.message_text.push_str(text);
+    let index = state.message_index.expect("the message item is open");
+    frames.push(responses_sse_event(
+        "response.output_text.delta",
+        json!({
+            "item_id": message_id,
+            "output_index": index,
+            "content_index": 0,
+            "delta": text,
+        }),
+        sequence,
+    ));
+    frames
+}
+
+fn responses_reasoning_frames(
+    state: &mut ResponsesStreamItems,
+    reasoning_id: &str,
+    text: &str,
+    sequence: &mut u64,
+) -> Vec<Bytes> {
+    let mut frames = Vec::new();
+    if state.reasoning_index.is_none() {
+        let index = state.output_index();
+        state.reasoning_index = Some(index);
+        frames.push(responses_sse_event(
+            "response.output_item.added",
+            json!({
+                "output_index": index,
+                "item": {"type": "reasoning", "id": reasoning_id, "status": "in_progress",
+                         "summary": []},
+            }),
+            sequence,
+        ));
+        frames.push(responses_sse_event(
+            "response.reasoning_summary_part.added",
+            json!({
+                "item_id": reasoning_id,
+                "output_index": index,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""},
+            }),
+            sequence,
+        ));
+    }
+    state.reasoning_text.push_str(text);
+    let index = state.reasoning_index.expect("the reasoning item is open");
+    frames.push(responses_sse_event(
+        "response.reasoning_summary_text.delta",
+        json!({
+            "item_id": reasoning_id,
+            "output_index": index,
+            "summary_index": 0,
+            "delta": text,
+        }),
+        sequence,
+    ));
+    frames
+}
+
+fn responses_open_parsed_call(
+    state: &mut ResponsesStreamItems,
+    next_id: &mut impl FnMut(&str) -> String,
+    parser_index: usize,
+    name: &str,
+    parallel: bool,
+    sequence: &mut u64,
+) -> Vec<Bytes> {
+    if !parallel && parser_index > 0 {
+        return Vec::new();
+    }
+    if let Some(existing) = state.parsed_calls.get(&parser_index) {
+        let call = &state.calls[*existing];
+        return vec![responses_sse_event(
+            "response.output_item.added",
+            json!({
+                "output_index": call.output_index,
+                "item": {"type": "function_call", "id": call.item_id, "call_id": call.call_id,
+                         "name": call.name, "arguments": "", "status": "in_progress"},
+            }),
+            sequence,
+        )];
+    }
+    let output_index = state.output_index();
+    let item_id = next_id("fc_dsv41_");
+    let call_id = next_id("call_dsv41_");
+    state.calls.push(ResponsesCall {
+        output_index,
+        item_id: item_id.clone(),
+        call_id: call_id.clone(),
+        name: name.to_owned(),
+        arguments: String::new(),
+    });
+    state
+        .parsed_calls
+        .insert(parser_index, state.calls.len() - 1);
+    vec![responses_sse_event(
+        "response.output_item.added",
+        json!({
+            "output_index": output_index,
+            "item": {"type": "function_call", "id": item_id, "call_id": call_id,
+                     "name": name, "arguments": "", "status": "in_progress"},
+        }),
+        sequence,
+    )]
+}
+
+fn responses_arguments_frame(
+    state: &mut ResponsesStreamItems,
+    call_index: usize,
+    arguments_delta: &str,
+    sequence: &mut u64,
+) -> Option<Bytes> {
+    let call = state.calls.get_mut(call_index)?;
+    call.arguments.push_str(arguments_delta);
+    Some(responses_sse_event(
+        "response.function_call_arguments.delta",
+        json!({
+            "item_id": call.item_id,
+            "output_index": call.output_index,
+            "delta": arguments_delta,
+        }),
+        sequence,
+    ))
+}
+
+fn responses_native_call_frames(
+    state: &mut ResponsesStreamItems,
+    next_id: &mut impl FnMut(&str) -> String,
+    index: usize,
+    name: Option<&str>,
+    arguments_delta: &str,
+    parallel: bool,
+    sequence: &mut u64,
+) -> Vec<Bytes> {
+    if !parallel && index > 0 {
+        return Vec::new();
+    }
+    let mut frames = Vec::new();
+    let call_index = if let Some(existing) = state.native_calls.get(&index) {
+        *existing
+    } else {
+        let output_index = state.output_index();
+        let item_id = next_id("fc_dsv41_");
+        let call_id = next_id("call_dsv41_");
+        let name = name.unwrap_or_default().to_owned();
+        state.calls.push(ResponsesCall {
+            output_index,
+            item_id: item_id.clone(),
+            call_id: call_id.clone(),
+            name: name.clone(),
+            arguments: String::new(),
+        });
+        let call_index = state.calls.len() - 1;
+        state.native_calls.insert(index, call_index);
+        frames.push(responses_sse_event(
+            "response.output_item.added",
+            json!({
+                "output_index": output_index,
+                "item": {"type": "function_call", "id": item_id, "call_id": call_id,
+                         "name": name, "arguments": "", "status": "in_progress"},
+            }),
+            sequence,
+        ));
+        call_index
+    };
+    if let Some(name) = name
+        && let Some(call) = state.calls.get_mut(call_index)
+        && call.name.is_empty()
+    {
+        call.name = name.to_owned();
+    }
+    if !arguments_delta.is_empty()
+        && let Some(frame) = responses_arguments_frame(state, call_index, arguments_delta, sequence)
+    {
+        frames.push(frame);
+    }
+    frames
+}
+
+fn responses_finish_items(
+    state: &ResponsesStreamItems,
+    reasoning_id: &str,
+    message_id: &str,
+    sequence: &mut u64,
+) -> Vec<Bytes> {
+    let mut frames = Vec::new();
+    if let Some(index) = state.reasoning_index {
+        frames.push(responses_sse_event(
+            "response.reasoning_summary_text.done",
+            json!({
+                "item_id": reasoning_id,
+                "output_index": index,
+                "summary_index": 0,
+                "text": state.reasoning_text,
+            }),
+            sequence,
+        ));
+        frames.push(responses_sse_event(
+            "response.reasoning_summary_part.done",
+            json!({
+                "item_id": reasoning_id,
+                "output_index": index,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": state.reasoning_text},
+            }),
+            sequence,
+        ));
+        frames.push(responses_sse_event(
+            "response.output_item.done",
+            json!({
+                "output_index": index,
+                "item": responses_reasoning_item_value(reasoning_id, &state.reasoning_text, "completed"),
+            }),
+            sequence,
+        ));
+    }
+    if let Some(index) = state.message_index {
+        frames.push(responses_sse_event(
+            "response.output_text.done",
+            json!({
+                "item_id": message_id,
+                "output_index": index,
+                "content_index": 0,
+                "text": state.message_text,
+            }),
+            sequence,
+        ));
+        frames.push(responses_sse_event(
+            "response.content_part.done",
+            json!({
+                "item_id": message_id,
+                "output_index": index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": state.message_text, "annotations": []},
+            }),
+            sequence,
+        ));
+        frames.push(responses_sse_event(
+            "response.output_item.done",
+            json!({
+                "output_index": index,
+                "item": responses_message_item_value(message_id, &state.message_text, "completed"),
+            }),
+            sequence,
+        ));
+    }
+    for call in &state.calls {
+        frames.push(responses_sse_event(
+            "response.function_call_arguments.done",
+            json!({
+                "item_id": call.item_id,
+                "output_index": call.output_index,
+                "arguments": call.arguments,
+            }),
+            sequence,
+        ));
+        frames.push(responses_sse_event(
+            "response.output_item.done",
+            json!({
+                "output_index": call.output_index,
+                "item": responses_function_call_item_value(
+                    &call.item_id, &call.call_id, &call.name, &call.arguments, "completed"),
+            }),
+            sequence,
+        ));
+    }
+    frames
+}
+
+fn responses_failed_event(
+    id: &str,
+    created: u64,
+    model: &str,
+    items: &[Value],
+    code: &str,
+    message: &str,
+    sequence: &mut u64,
+) -> Bytes {
+    let mut response = responses_snapshot(id, created, model, "failed", items);
+    if let Some(map) = response.as_object_mut() {
+        map.insert(
+            "error".to_owned(),
+            json!({"code": code, "message": message}),
+        );
+        map.insert("usage".to_owned(), Value::Null);
+    }
+    responses_sse_event("response.failed", json!({"response": response}), sequence)
+}
+
+/// The context a Responses streaming answer needs.
+struct ResponsesStreamContext {
+    id: String,
+    created: u64,
+    model: String,
+    reasoning_id: String,
+    message_id: String,
+    tools_offered: bool,
+    parallel_tool_calls: bool,
+    trace_id: Option<String>,
+}
+
+fn responses_stream_response(
+    state: &AppState,
+    request: EngineRequest,
+    context: ResponsesStreamContext,
+    trace: Option<TraceDirective>,
+) -> Response {
+    let engine = Arc::clone(&state.engine);
+    let metrics = Arc::clone(&state.metrics);
+    let counter = state.id_counter();
+    let ResponsesStreamContext {
+        id,
+        created,
+        model,
+        reasoning_id,
+        message_id,
+        tools_offered,
+        parallel_tool_calls,
+        trace_id,
+    } = context;
+    let stream = async_stream::stream! {
+        let _binding = RequestTraceBinding::new(trace_id);
+        let mut sequence = 0u64;
+        let mut next_id = {
+            let counter = Arc::clone(&counter);
+            move |prefix: &str| {
+                format!(
+                    "{prefix}{:08x}",
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                )
+            }
+        };
+        let mut items = ResponsesStreamItems::new();
+        let mut parser = tools_offered.then(tool_parser::ToolCallStreamParser::new);
+        let mut parser_refusal: Option<String> = None;
+        yield Ok::<Bytes, Infallible>(responses_sse_event(
+            "response.created",
+            json!({"response": responses_snapshot(&id, created, &model, "in_progress", &[])}),
+            &mut sequence,
+        ));
+        yield Ok(responses_sse_event(
+            "response.in_progress",
+            json!({"response": responses_snapshot(&id, created, &model, "in_progress", &[])}),
+            &mut sequence,
+        ));
+        let mut events = engine.generate(request);
+        let mut finished = None;
+        while let Some(event) = events.next().await {
+            match event {
+                EngineEvent::Started { .. }
+                | EngineEvent::PromptLogprobs(_)
+                | EngineEvent::TokenLogprobs(_) => {}
+                EngineEvent::ReasoningDelta(text) => {
+                    for frame in responses_reasoning_frames(
+                        &mut items,
+                        &reasoning_id,
+                        &text,
+                        &mut sequence,
+                    ) {
+                        yield Ok(frame);
+                    }
+                }
+                EngineEvent::ContentDelta(text) => {
+                    if let Some(parser) = parser.as_mut() {
+                        if parser_refusal.is_none() {
+                            match parser.feed(&text) {
+                                Ok(events) => {
+                                    for event in events {
+                                        match event {
+                                            tool_parser::StreamToolEvent::Content(text) => {
+                                                for frame in responses_content_frames(
+                                                    &mut items,
+                                                    &message_id,
+                                                    &text,
+                                                    &mut sequence,
+                                                ) {
+                                                    yield Ok(frame);
+                                                }
+                                            }
+                                            tool_parser::StreamToolEvent::CallStart { index, name } => {
+                                                for frame in responses_open_parsed_call(
+                                                    &mut items,
+                                                    &mut next_id,
+                                                    index,
+                                                    &name,
+                                                    parallel_tool_calls,
+                                                    &mut sequence,
+                                                ) {
+                                                    yield Ok(frame);
+                                                }
+                                            }
+                                            tool_parser::StreamToolEvent::ArgumentsDelta { index, arguments_delta } => {
+                                                if let Some(call_index) = items.parsed_calls.get(&index).copied()
+                                                    && let Some(frame) = responses_arguments_frame(
+                                                        &mut items,
+                                                        call_index,
+                                                        &arguments_delta,
+                                                        &mut sequence,
+                                                    )
+                                                {
+                                                    yield Ok(frame);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(refusal) => parser_refusal = Some(refusal.message),
+                            }
+                        }
+                    } else {
+                        for frame in responses_content_frames(
+                            &mut items,
+                            &message_id,
+                            &text,
+                            &mut sequence,
+                        ) {
+                            yield Ok(frame);
+                        }
+                    }
+                }
+                EngineEvent::ToolCallDelta {
+                    index,
+                    id: _,
+                    name,
+                    arguments_delta,
+                } => {
+                    for frame in responses_native_call_frames(
+                        &mut items,
+                        &mut next_id,
+                        index,
+                        name.as_deref(),
+                        &arguments_delta,
+                        parallel_tool_calls,
+                        &mut sequence,
+                    ) {
+                        yield Ok(frame);
+                    }
+                }
+                EngineEvent::Finished {
+                    finish_reason,
+                    usage,
+                    stats,
+                } => {
+                    metrics.record_request(&usage, &stats.kv_cache);
+                    metrics.record_request_stats(&stats);
+                    finished = Some((finish_reason, usage, stats));
+                }
+                EngineEvent::Error { message, code } => {
+                    let items = items.output(&reasoning_id, &message_id);
+                    yield Ok(responses_failed_event(
+                        &id,
+                        created,
+                        &model,
+                        &items,
+                        &code,
+                        &message,
+                        &mut sequence,
+                    ));
+                    return;
+                }
+            }
+        }
+        if let Some(parser) = parser.as_mut()
+            && parser_refusal.is_none()
+        {
+            match parser.finish() {
+                Ok(events) => {
+                    for event in events {
+                        match event {
+                            tool_parser::StreamToolEvent::Content(text) => {
+                                for frame in responses_content_frames(
+                                    &mut items,
+                                    &message_id,
+                                    &text,
+                                    &mut sequence,
+                                ) {
+                                    yield Ok(frame);
+                                }
+                            }
+                            tool_parser::StreamToolEvent::CallStart { index, name } => {
+                                for frame in responses_open_parsed_call(
+                                    &mut items,
+                                    &mut next_id,
+                                    index,
+                                    &name,
+                                    parallel_tool_calls,
+                                    &mut sequence,
+                                ) {
+                                    yield Ok(frame);
+                                }
+                            }
+                            tool_parser::StreamToolEvent::ArgumentsDelta { index, arguments_delta } => {
+                                if let Some(call_index) = items.parsed_calls.get(&index).copied()
+                                    && let Some(frame) = responses_arguments_frame(
+                                        &mut items,
+                                        call_index,
+                                        &arguments_delta,
+                                        &mut sequence,
+                                    )
+                                {
+                                    yield Ok(frame);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(refusal) => parser_refusal = Some(refusal.message),
+            }
+        }
+        if let Some(message) = parser_refusal {
+            let output = items.output(&reasoning_id, &message_id);
+            yield Ok(responses_failed_event(
+                &id,
+                created,
+                &model,
+                &output,
+                tool_parser::TOOL_STREAM_REFUSAL_CODE,
+                &message,
+                &mut sequence,
+            ));
+            return;
+        }
+        let Some((finish_reason, usage, stats)) = finished else {
+            let output = items.output(&reasoning_id, &message_id);
+            yield Ok(responses_failed_event(
+                &id,
+                created,
+                &model,
+                &output,
+                "engine_stream_incomplete",
+                "engine stream ended without a finish event",
+                &mut sequence,
+            ));
+            return;
+        };
+        if items.message_index.is_none() && items.calls.is_empty() {
+            for frame in responses_open_message(&mut items, &message_id, &mut sequence) {
+                yield Ok(frame);
+            }
+        }
+        for frame in responses_finish_items(&items, &reasoning_id, &message_id, &mut sequence) {
+            yield Ok(frame);
+        }
+        let output = items.output(&reasoning_id, &message_id);
+        let (status, incomplete_details) = responses_terminal_status(finish_reason);
+        let mut response = responses_snapshot(&id, created, &model, status, &output);
+        if let Some(map) = response.as_object_mut() {
+            map.insert("usage".to_owned(), responses_usage_value(&usage));
+            map.insert(
+                "incomplete_details".to_owned(),
+                incomplete_details.unwrap_or(Value::Null),
+            );
+            map.insert(
+                "x_deepseek_spark_stats".to_owned(),
+                serde_json::to_value(stats.as_ref()).unwrap_or(Value::Null),
+            );
+        }
+        let event = if status == "incomplete" {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
+        yield Ok(responses_sse_event(
+            event,
+            json!({"response": response}),
+            &mut sequence,
+        ));
+    };
+    sse_response(stream, trace, state.sse_keep_alive())
+}
+
+// ---------------------------------------------------------------------------------------
 // POST /v1/responses
 // ---------------------------------------------------------------------------------------
 
@@ -3648,30 +5434,22 @@ async fn responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    refuse_untokenized_route(&state, "/v1/responses")?;
     let value = parse_json(&body)?;
     let spec = resolve_reasoning(&value)?;
     let image_carrier = find_image_carrier(&value);
-    let request: ResponsesRequest = serde_json::from_value(value).map_err(invalid_body)?;
-    if request.stream.unwrap_or(false) {
+    let request: ResponsesRequest = serde_json::from_value(value.clone()).map_err(invalid_body)?;
+    refuse_image_carrier(image_carrier, state.engine.capabilities().vision)?;
+    let bridge = responses_bridge(&value, &request)?;
+    if bridge.messages.is_empty() {
         return Err(ApiError::invalid_request(
-            "/v1/responses does not implement SSE yet; send \"stream\": false",
-            Some("stream".to_owned()),
-            Some("unsupported_parameter".to_owned()),
+            "\"input\" must contain at least one message or item",
+            Some("input".to_owned()),
+            Some("invalid_messages".to_owned()),
         ));
     }
     let model = resolve_model(&state, request.model.as_deref())?;
     let trace = trace_context(&headers)?;
-
-    let mut summary = PromptSummary::default();
-    if let Some(instructions) = request.instructions.as_deref() {
-        summary.absorb(summarize_prompt_text(instructions));
-    }
-    if let Some(input) = request.input.as_ref() {
-        summary.absorb(summarize_responses_input(input)?);
-    }
-    refuse_image_carrier(image_carrier, state.engine.capabilities().vision)?;
-
+    let (summary, _prompt_ids) = bridge_prompt_summary(&state, &bridge)?;
     let response_id = state.next_id("resp_dsv41_");
     let message_id = state.next_id("msg_dsv41_");
     let reasoning_id = state.next_id("rs_dsv41_");
@@ -3712,47 +5490,621 @@ async fn responses(
         .engine
         .validate_request(&engine_request)
         .map_err(ApiError::from)?;
+    if request.stream.unwrap_or(false) {
+        return Ok(responses_stream_response(
+            &state,
+            engine_request,
+            ResponsesStreamContext {
+                id: response_id,
+                created,
+                model,
+                reasoning_id,
+                message_id,
+                tools_offered: bridge.tools_offered,
+                parallel_tool_calls: bridge.parallel_tool_calls,
+                trace_id,
+            },
+            trace,
+        ));
+    }
     let _binding = RequestTraceBinding::new(trace_id);
-    let output = drive_engine(state.engine.as_ref(), engine_request).await?;
+    let mut output = drive_engine(state.engine.as_ref(), engine_request).await?;
+    if bridge.tools_offered {
+        apply_deepseek_v41_tool_parser(&mut output, &state);
+    }
+    if !bridge.parallel_tool_calls && output.tool_calls.len() > 1 {
+        output.tool_calls.truncate(1);
+        output.finish_reason = FinishReason::ToolCalls;
+    }
     state
         .metrics
         .record_request(&output.usage, &output.stats.kv_cache);
     state.metrics.record_request_stats(&output.stats);
+    let call_ids = response_call_ids(&state, output.tool_calls.len());
+    Ok(json_response(
+        responses_response_body(
+            &output,
+            &response_id,
+            created,
+            &model,
+            &reasoning_id,
+            &message_id,
+            &call_ids,
+        ),
+        trace,
+    ))
+}
 
-    let mut items = Vec::new();
+// ---------------------------------------------------------------------------------------
+// Anthropic output assembly and streaming
+// ---------------------------------------------------------------------------------------
+
+fn anthropic_tool_input(arguments: &str) -> Value {
+    // Anthropic's tool_use.input is always an object. A native engine can hand back an empty or
+    // partial JSON fragment (for example a no-argument call before its closing brace), which must
+    // not be serialized as a JSON string: clients decode this member as a map.
+    match serde_json::from_str(arguments) {
+        Ok(Value::Object(map)) => Value::Object(map),
+        _ => Value::Object(Map::new()),
+    }
+}
+
+fn anthropic_content_blocks(output: &EngineOutput, call_ids: &[String]) -> Vec<Value> {
+    let mut content = Vec::new();
     if !output.reasoning.is_empty() {
-        items.push(json!({
-            "type": "reasoning",
-            "id": reasoning_id,
-            "summary": [{"type": "summary_text", "text": output.reasoning}],
+        content.push(json!({
+            "type": "thinking",
+            "thinking": output.reasoning,
+            "signature": "",
         }));
     }
-    items.push(json!({
-        "type": "message",
-        "id": message_id,
-        "status": "completed",
-        "role": "assistant",
-        "content": [{"type": "output_text", "text": output.content, "annotations": []}],
-    }));
+    if !output.content.is_empty() || output.tool_calls.is_empty() {
+        content.push(json!({"type": "text", "text": output.content}));
+    }
+    for (index, call) in output.tool_calls.iter().enumerate() {
+        let id = call_ids
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| format!("toolu_dsv41_{index:08x}"));
+        content.push(json!({
+            "type": "tool_use",
+            "id": id,
+            "name": call.name,
+            "input": anthropic_tool_input(&call.arguments),
+        }));
+    }
+    content
+}
 
-    let body = json!({
-        "id": response_id,
-        "object": "response",
-        "created_at": created,
-        "status": "completed",
+fn anthropic_response_body(
+    output: &EngineOutput,
+    id: &str,
+    model: &str,
+    call_ids: &[String],
+) -> Value {
+    let cache_read_input_tokens = output.usage.prompt_tokens_details.cached_tokens;
+    let input_tokens = output
+        .usage
+        .prompt_tokens
+        .saturating_sub(cache_read_input_tokens);
+    json!({
+        "id": id,
+        "type": "message",
+        "role": "assistant",
         "model": model,
-        "output": items,
-        "output_text": output.content,
+        "content": anthropic_content_blocks(output, call_ids),
+        "stop_reason": if output.tool_calls.is_empty() {
+            anthropic_stop_reason(output.finish_reason)
+        } else {
+            "tool_use"
+        },
+        "stop_sequence": null,
         "usage": {
-            "input_tokens": output.usage.prompt_tokens,
-            "input_tokens_details": {"cached_tokens": output.usage.prompt_tokens_details.cached_tokens},
+            "input_tokens": input_tokens,
             "output_tokens": output.usage.completion_tokens,
-            "output_tokens_details": {"reasoning_tokens": output.usage.completion_tokens_details.reasoning_tokens},
-            "total_tokens": output.usage.total_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
+            "cache_creation_input_tokens": 0,
         },
         "x_deepseek_spark_stats": output.stats,
+    })
+}
+
+fn anthropic_sse_event(kind: &str, mut data: Value) -> Bytes {
+    if let Some(map) = data.as_object_mut() {
+        map.insert("type".to_owned(), Value::String(kind.to_owned()));
+    }
+    let mut text = format!("event: {kind}\ndata: ");
+    text.push_str(&serde_json::to_string(&data).unwrap_or_else(|_| "{}".to_owned()));
+    text.push_str("\n\n");
+    Bytes::from(text)
+}
+
+struct AnthropicCall {
+    index: usize,
+    id: String,
+    name: String,
+    input: String,
+}
+
+struct AnthropicStreamItems {
+    next_index: usize,
+    reasoning_index: Option<usize>,
+    reasoning_text: String,
+    message_index: Option<usize>,
+    message_text: String,
+    calls: Vec<AnthropicCall>,
+    native_calls: BTreeMap<usize, usize>,
+    parsed_calls: BTreeMap<usize, usize>,
+}
+
+impl AnthropicStreamItems {
+    fn new() -> Self {
+        Self {
+            next_index: 0,
+            reasoning_index: None,
+            reasoning_text: String::new(),
+            message_index: None,
+            message_text: String::new(),
+            calls: Vec::new(),
+            native_calls: BTreeMap::new(),
+            parsed_calls: BTreeMap::new(),
+        }
+    }
+
+    fn index(&mut self) -> usize {
+        let index = self.next_index;
+        self.next_index += 1;
+        index
+    }
+
+    fn stop_reason(&self, finish_reason: FinishReason) -> &'static str {
+        if self.calls.is_empty() {
+            anthropic_stop_reason(finish_reason)
+        } else {
+            "tool_use"
+        }
+    }
+}
+
+fn anthropic_reasoning_frames(state: &mut AnthropicStreamItems, text: &str) -> Vec<Bytes> {
+    let mut frames = Vec::new();
+    if state.reasoning_index.is_none() {
+        let index = state.index();
+        state.reasoning_index = Some(index);
+        frames.push(anthropic_sse_event(
+            "content_block_start",
+            json!({
+                "index": index,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+            }),
+        ));
+    }
+    state.reasoning_text.push_str(text);
+    let index = state.reasoning_index.expect("the thinking block is open");
+    frames.push(anthropic_sse_event(
+        "content_block_delta",
+        json!({"index": index, "delta": {"type": "thinking_delta", "thinking": text}}),
+    ));
+    frames
+}
+
+fn anthropic_text_frames(state: &mut AnthropicStreamItems, text: &str) -> Vec<Bytes> {
+    let mut frames = Vec::new();
+    if state.message_index.is_none() {
+        let index = state.index();
+        state.message_index = Some(index);
+        frames.push(anthropic_sse_event(
+            "content_block_start",
+            json!({"index": index, "content_block": {"type": "text", "text": ""}}),
+        ));
+    }
+    state.message_text.push_str(text);
+    let index = state.message_index.expect("the text block is open");
+    frames.push(anthropic_sse_event(
+        "content_block_delta",
+        json!({"index": index, "delta": {"type": "text_delta", "text": text}}),
+    ));
+    frames
+}
+
+fn anthropic_open_parsed_call(
+    state: &mut AnthropicStreamItems,
+    next_id: &mut impl FnMut(&str) -> String,
+    parser_index: usize,
+    name: &str,
+    parallel: bool,
+) -> Vec<Bytes> {
+    if !parallel && parser_index > 0 {
+        return Vec::new();
+    }
+    if let Some(existing) = state.parsed_calls.get(&parser_index) {
+        let call = &state.calls[*existing];
+        return vec![anthropic_sse_event(
+            "content_block_start",
+            json!({
+                "index": call.index,
+                "content_block": {"type": "tool_use", "id": call.id, "name": call.name, "input": {}},
+            }),
+        )];
+    }
+    let index = state.index();
+    let id = next_id("toolu_dsv41_");
+    state.calls.push(AnthropicCall {
+        index,
+        id: id.clone(),
+        name: name.to_owned(),
+        input: String::new(),
     });
-    Ok(json_response(body, trace))
+    state
+        .parsed_calls
+        .insert(parser_index, state.calls.len() - 1);
+    vec![anthropic_sse_event(
+        "content_block_start",
+        json!({
+            "index": index,
+            "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}},
+        }),
+    )]
+}
+
+fn anthropic_native_call_frames(
+    state: &mut AnthropicStreamItems,
+    next_id: &mut impl FnMut(&str) -> String,
+    index: usize,
+    name: Option<&str>,
+    arguments_delta: &str,
+    parallel: bool,
+) -> Vec<Bytes> {
+    if !parallel && index > 0 {
+        return Vec::new();
+    }
+    let mut frames = Vec::new();
+    let call_index = if let Some(existing) = state.native_calls.get(&index) {
+        *existing
+    } else {
+        let block_index = state.index();
+        let id = next_id("toolu_dsv41_");
+        let name = name.unwrap_or_default().to_owned();
+        state.calls.push(AnthropicCall {
+            index: block_index,
+            id: id.clone(),
+            name: name.clone(),
+            input: String::new(),
+        });
+        let call_index = state.calls.len() - 1;
+        state.native_calls.insert(index, call_index);
+        frames.push(anthropic_sse_event(
+            "content_block_start",
+            json!({
+                "index": block_index,
+                "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}},
+            }),
+        ));
+        call_index
+    };
+    if let Some(name) = name
+        && let Some(call) = state.calls.get_mut(call_index)
+        && call.name.is_empty()
+    {
+        call.name = name.to_owned();
+    }
+    if !arguments_delta.is_empty() {
+        let call = &mut state.calls[call_index];
+        call.input.push_str(arguments_delta);
+        frames.push(anthropic_sse_event(
+            "content_block_delta",
+            json!({
+                "index": call.index,
+                "delta": {"type": "input_json_delta", "partial_json": arguments_delta},
+            }),
+        ));
+    }
+    frames
+}
+
+fn anthropic_arguments_frame(
+    state: &mut AnthropicStreamItems,
+    call_index: usize,
+    arguments_delta: &str,
+) -> Option<Bytes> {
+    let call = state.calls.get_mut(call_index)?;
+    call.input.push_str(arguments_delta);
+    Some(anthropic_sse_event(
+        "content_block_delta",
+        json!({
+            "index": call.index,
+            "delta": {"type": "input_json_delta", "partial_json": arguments_delta},
+        }),
+    ))
+}
+
+fn anthropic_finish_frames(
+    state: &AnthropicStreamItems,
+    finish_reason: FinishReason,
+    usage: &OpenAiUsageWithCache,
+    prompt_tokens: usize,
+) -> Vec<Bytes> {
+    let mut frames = Vec::new();
+    if let Some(index) = state.reasoning_index {
+        frames.push(anthropic_sse_event(
+            "content_block_stop",
+            json!({"index": index}),
+        ));
+    }
+    if let Some(index) = state.message_index {
+        frames.push(anthropic_sse_event(
+            "content_block_stop",
+            json!({"index": index}),
+        ));
+    }
+    for call in &state.calls {
+        frames.push(anthropic_sse_event(
+            "content_block_stop",
+            json!({"index": call.index}),
+        ));
+    }
+    let cache_read = usage.prompt_tokens_details.cached_tokens;
+    let input_tokens = prompt_tokens.saturating_sub(cache_read);
+    frames.push(anthropic_sse_event(
+        "message_delta",
+        json!({
+            "delta": {
+                "stop_reason": state.stop_reason(finish_reason),
+                "stop_sequence": null,
+            },
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": usage.completion_tokens,
+                "cache_read_input_tokens": cache_read,
+                "cache_creation_input_tokens": 0,
+            },
+        }),
+    ));
+    frames.push(anthropic_sse_event("message_stop", json!({})));
+    frames
+}
+
+struct AnthropicStreamContext {
+    id: String,
+    model: String,
+    tools_offered: bool,
+    parallel_tool_calls: bool,
+    prompt_tokens: usize,
+    trace_id: Option<String>,
+}
+
+fn messages_stream_response(
+    state: &AppState,
+    request: EngineRequest,
+    context: AnthropicStreamContext,
+    trace: Option<TraceDirective>,
+) -> Response {
+    let engine = Arc::clone(&state.engine);
+    let metrics = Arc::clone(&state.metrics);
+    let counter = state.id_counter();
+    let AnthropicStreamContext {
+        id,
+        model,
+        tools_offered,
+        parallel_tool_calls,
+        prompt_tokens,
+        trace_id,
+    } = context;
+    let stream = async_stream::stream! {
+        let _binding = RequestTraceBinding::new(trace_id);
+        let mut next_id = {
+            let counter = Arc::clone(&counter);
+            move |prefix: &str| {
+                format!(
+                    "{prefix}{:08x}",
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                )
+            }
+        };
+        let mut items = AnthropicStreamItems::new();
+        let mut parser = tools_offered.then(tool_parser::ToolCallStreamParser::new);
+        let mut parser_refusal: Option<String> = None;
+        // The engine's first event carries the cache hit, which Anthropic's message_start usage
+        // must partition the same way message_delta does. Read that event before starting the
+        // message so the first usage block is not gross while the last one is net.
+        let mut events = engine.generate(request);
+        let mut cached_tokens = 0usize;
+        let mut pending = None;
+        if let Some(event) = events.next().await {
+            match event {
+                EngineEvent::Started {
+                    cached_tokens: cached,
+                    ..
+                } => cached_tokens = cached,
+                other => pending = Some(other),
+            }
+        }
+        let input_tokens = prompt_tokens.saturating_sub(cached_tokens);
+        yield Ok::<Bytes, Infallible>(anthropic_sse_event(
+            "message_start",
+            json!({
+                "message": {
+                    "id": id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": cached_tokens,
+                        "cache_creation_input_tokens": 0,
+                    },
+                }
+            }),
+        ));
+        let mut finished = None;
+        loop {
+            let event = if let Some(event) = pending.take() {
+                event
+            } else {
+                let Some(event) = events.next().await else {
+                    break;
+                };
+                event
+            };
+            match event {
+                EngineEvent::Started { .. }
+                | EngineEvent::PromptLogprobs(_)
+                | EngineEvent::TokenLogprobs(_) => {}
+                EngineEvent::ReasoningDelta(text) => {
+                    for frame in anthropic_reasoning_frames(&mut items, &text) {
+                        yield Ok(frame);
+                    }
+                }
+                EngineEvent::ContentDelta(text) => {
+                    if let Some(parser) = parser.as_mut() {
+                        if parser_refusal.is_none() {
+                            match parser.feed(&text) {
+                                Ok(events) => {
+                                    for event in events {
+                                        match event {
+                                            tool_parser::StreamToolEvent::Content(text) => {
+                                                for frame in anthropic_text_frames(&mut items, &text) {
+                                                    yield Ok(frame);
+                                                }
+                                            }
+                                            tool_parser::StreamToolEvent::CallStart { index, name } => {
+                                                for frame in anthropic_open_parsed_call(
+                                                    &mut items,
+                                                    &mut next_id,
+                                                    index,
+                                                    &name,
+                                                    parallel_tool_calls,
+                                                ) {
+                                                    yield Ok(frame);
+                                                }
+                                            }
+                                            tool_parser::StreamToolEvent::ArgumentsDelta { index, arguments_delta } => {
+                                                if let Some(call_index) = items.parsed_calls.get(&index).copied()
+                                                    && let Some(frame) = anthropic_arguments_frame(
+                                                        &mut items,
+                                                        call_index,
+                                                        &arguments_delta,
+                                                    )
+                                                {
+                                                    yield Ok(frame);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(refusal) => parser_refusal = Some(refusal.message),
+                            }
+                        }
+                    } else {
+                        for frame in anthropic_text_frames(&mut items, &text) {
+                            yield Ok(frame);
+                        }
+                    }
+                }
+                EngineEvent::ToolCallDelta {
+                    index,
+                    id: _,
+                    name,
+                    arguments_delta,
+                } => {
+                    for frame in anthropic_native_call_frames(
+                        &mut items,
+                        &mut next_id,
+                        index,
+                        name.as_deref(),
+                        &arguments_delta,
+                        parallel_tool_calls,
+                    ) {
+                        yield Ok(frame);
+                    }
+                }
+                EngineEvent::Finished {
+                    finish_reason,
+                    usage,
+                    stats,
+                } => {
+                    metrics.record_request(&usage, &stats.kv_cache);
+                    metrics.record_request_stats(&stats);
+                    finished = Some((finish_reason, usage));
+                }
+                EngineEvent::Error { message, .. } => {
+                    yield Ok(anthropic_sse_event(
+                        "error",
+                        json!({"error": {"type": "api_error", "message": message}}),
+                    ));
+                    return;
+                }
+            }
+        }
+        if let Some(parser) = parser.as_mut()
+            && parser_refusal.is_none()
+        {
+            match parser.finish() {
+                Ok(events) => {
+                    for event in events {
+                        match event {
+                            tool_parser::StreamToolEvent::Content(text) => {
+                                for frame in anthropic_text_frames(&mut items, &text) {
+                                    yield Ok(frame);
+                                }
+                            }
+                            tool_parser::StreamToolEvent::CallStart { index, name } => {
+                                for frame in anthropic_open_parsed_call(
+                                    &mut items,
+                                    &mut next_id,
+                                    index,
+                                    &name,
+                                    parallel_tool_calls,
+                                ) {
+                                    yield Ok(frame);
+                                }
+                            }
+                            tool_parser::StreamToolEvent::ArgumentsDelta { index, arguments_delta } => {
+                                if let Some(call_index) = items.parsed_calls.get(&index).copied()
+                                    && let Some(frame) = anthropic_arguments_frame(
+                                        &mut items,
+                                        call_index,
+                                        &arguments_delta,
+                                    )
+                                {
+                                    yield Ok(frame);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(refusal) => parser_refusal = Some(refusal.message),
+            }
+        }
+        if let Some(message) = parser_refusal {
+            yield Ok(anthropic_sse_event(
+                "error",
+                json!({"error": {"type": "api_error", "message": message}}),
+            ));
+            return;
+        }
+        let Some((finish_reason, usage)) = finished else {
+            yield Ok(anthropic_sse_event(
+                "error",
+                json!({"error": {"type": "api_error", "message": "engine stream ended without a finish event"}}),
+            ));
+            return;
+        };
+        if items.message_index.is_none()
+            && items.calls.is_empty()
+            && let Some(frame) = anthropic_text_frames(&mut items, "").into_iter().next()
+        {
+            yield Ok(frame);
+        }
+        for frame in anthropic_finish_frames(&items, finish_reason, &usage, prompt_tokens) {
+            yield Ok(frame);
+        }
+    };
+    sse_response(stream, trace, state.sse_keep_alive())
 }
 
 // ---------------------------------------------------------------------------------------
@@ -3764,18 +6116,10 @@ async fn messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    refuse_untokenized_route(&state, "/v1/messages")?;
     let value = parse_json(&body)?;
-    let spec = resolve_reasoning(&value)?;
     let image_carrier = find_image_carrier(&value);
     let request: MessagesRequest = serde_json::from_value(value).map_err(invalid_body)?;
-    if request.stream.unwrap_or(false) {
-        return Err(ApiError::invalid_request(
-            "/v1/messages does not implement SSE yet; send \"stream\": false",
-            Some("stream".to_owned()),
-            Some("unsupported_parameter".to_owned()),
-        ));
-    }
+    refuse_image_carrier(image_carrier, state.engine.capabilities().vision)?;
     if request.messages.is_empty() {
         return Err(ApiError::invalid_request(
             "\"messages\" must be a non-empty array",
@@ -3783,10 +6127,25 @@ async fn messages(
             Some("invalid_messages".to_owned()),
         ));
     }
+    if request.max_tokens.is_none() {
+        return Err(ApiError::invalid_request(
+            "\"max_tokens\" is required by the Anthropic Messages API",
+            Some("max_tokens".to_owned()),
+            Some("invalid_max_tokens".to_owned()),
+        ));
+    }
+    let bridge = anthropic_bridge(&request)?;
+    if bridge.messages.is_empty() {
+        return Err(ApiError::invalid_request(
+            "\"messages\" must carry at least one non-empty user or assistant turn",
+            Some("messages".to_owned()),
+            Some("invalid_messages".to_owned()),
+        ));
+    }
+    let spec = resolve_reasoning(&bridge.chat)?;
     let model = resolve_model(&state, request.model.as_deref())?;
     let trace = trace_context(&headers)?;
-    let summary = summarize_anthropic_messages(request.system.as_ref(), &request.messages)?;
-    refuse_image_carrier(image_carrier, state.engine.capabilities().vision)?;
+    let (summary, _prompt_ids) = bridge_prompt_summary(&state, &bridge)?;
     let stop = request.stop_sequences.clone().unwrap_or_default();
     let id = state.next_id("msg_dsv41_");
     let trace_id = trace_request_id(&headers, &id);
@@ -3808,7 +6167,7 @@ async fn messages(
         max_tokens,
         temperature: request.temperature,
         top_p: request.top_p,
-        top_k: None,
+        top_k: request.top_k,
         repetition_penalty: None,
         presence_penalty: None,
         frequency_penalty: None,
@@ -3825,42 +6184,41 @@ async fn messages(
         .engine
         .validate_request(&engine_request)
         .map_err(ApiError::from)?;
+    if request.stream.unwrap_or(false) {
+        return Ok(messages_stream_response(
+            &state,
+            engine_request,
+            AnthropicStreamContext {
+                id,
+                model,
+                tools_offered: bridge.tools_offered,
+                parallel_tool_calls: bridge.parallel_tool_calls,
+                prompt_tokens,
+                trace_id,
+            },
+            trace,
+        ));
+    }
     let _binding = RequestTraceBinding::new(trace_id);
-    let output = drive_engine(state.engine.as_ref(), engine_request).await?;
+    let mut output = drive_engine(state.engine.as_ref(), engine_request).await?;
+    if bridge.tools_offered {
+        apply_deepseek_v41_tool_parser(&mut output, &state);
+    }
+    if !bridge.parallel_tool_calls && output.tool_calls.len() > 1 {
+        output.tool_calls.truncate(1);
+        output.finish_reason = FinishReason::ToolCalls;
+    }
     state
         .metrics
         .record_request(&output.usage, &output.stats.kv_cache);
     state.metrics.record_request_stats(&output.stats);
-
-    let mut content = Vec::new();
-    if !output.reasoning.is_empty() {
-        content.push(json!({"type": "thinking", "thinking": output.reasoning, "signature": ""}));
-    }
-    content.push(json!({"type": "text", "text": output.content}));
-    // Anthropic excludes cache reads from `input_tokens` and reports them separately; the
-    // two fields must partition prompt_tokens, not both include the cached amount.
-    let cache_read_input_tokens = output.usage.prompt_tokens_details.cached_tokens;
-    let input_tokens = output
-        .usage
-        .prompt_tokens
-        .saturating_sub(cache_read_input_tokens);
-    let body = json!({
-        "id": id,
-        "type": "message",
-        "role": "assistant",
-        "model": model,
-        "content": content,
-        "stop_reason": anthropic_stop_reason(output.finish_reason),
-        "stop_sequence": null,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output.usage.completion_tokens,
-            "cache_read_input_tokens": cache_read_input_tokens,
-            "cache_creation_input_tokens": 0,
-        },
-        "x_deepseek_spark_stats": output.stats,
-    });
-    Ok(json_response(body, trace))
+    let call_ids: Vec<String> = (0..output.tool_calls.len())
+        .map(|_| state.next_id("toolu_dsv41_"))
+        .collect();
+    Ok(json_response(
+        anthropic_response_body(&output, &id, &model, &call_ids),
+        trace,
+    ))
 }
 
 fn anthropic_stop_reason(reason: FinishReason) -> &'static str {
@@ -3951,13 +6309,11 @@ fn model_card(state: &AppState, created: u64) -> Value {
     // vision tower loaded, the same fact that decides whether the chat route prepares an image or
     // refuses it (DECISIONS.md D59).
     let capabilities = state.engine.capabilities();
-    // /v1/responses and /v1/messages answer 501 while the tokenizer is attached
-    // (`refuse_untokenized_route`), so they are listed only where they serve.
-    let mut endpoints = vec!["/v1/chat/completions", "/v1/completions"];
-    if state.tokenizer().is_none() {
-        endpoints.extend(["/v1/responses", "/v1/messages"]);
-    }
-    endpoints.extend([
+    let endpoints = vec![
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/responses",
+        "/v1/messages",
         "/v1/models/{model}",
         "/tokenize",
         "/detokenize",
@@ -3966,7 +6322,7 @@ fn model_card(state: &AppState, created: u64) -> Value {
         "/health",
         "/readyz",
         "/metrics",
-    ]);
+    ];
     let mut advertised = json!({
         "streaming": true,
         "tools": capabilities.tools,

@@ -244,19 +244,35 @@ async fn a_text_engine_still_refuses_images() {
 
 #[tokio::test]
 async fn routes_without_the_vision_path_say_so() {
-    let body = json!({
-        "model": MODEL_ID,
-        "input": [{"role": "user", "content": [
-            {"type": "input_image", "image_url": data_url("image/png", DOT)},
-        ]}],
-    });
-    // Without the checkpoint tokenizer: with it, the route is refused as not implemented before
-    // its images are looked at.
-    let app = router(AppState::new(engine(true)));
-    let (status, response) = send(app, "POST", "/v1/responses", Some(body)).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
-    let message = response["error"]["message"].as_str().unwrap();
-    assert!(message.contains("/v1/chat/completions"), "{message}");
+    let bodies = [
+        (
+            "/v1/responses",
+            json!({
+                "model": MODEL_ID,
+                "input": [{"type": "input_image", "image_url": data_url("image/png", DOT)}],
+            }),
+        ),
+        (
+            "/v1/messages",
+            json!({
+                "model": MODEL_ID,
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": [
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": DOT,
+                    }},
+                ]}],
+            }),
+        ),
+    ];
+    // A vision engine plus the checkpoint tokenizer is still refused: these adapters have no
+    // image-preparation/placement path, so the only honest answer is to refuse before generation.
+    for (uri, body) in bodies {
+        let (status, response) = send(app(true), "POST", uri, Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {response}");
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains("/v1/chat/completions"), "{uri}: {message}");
+    }
 }
 
 #[tokio::test]

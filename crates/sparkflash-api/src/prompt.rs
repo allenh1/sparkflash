@@ -22,10 +22,10 @@
 //!
 //! This heuristic is the fallback for a router with no checkpoint tokenizer attached (the
 //! weight-free tests). A production `sparkflash serve` attaches a model pack's `PromptCodec`,
-//! and then `/v1/completions` and `/v1/chat/completions` carry the checkpoint's real token ids
-//! instead of these placeholders. `/v1/responses` and `/v1/messages` have no tokenizer path yet,
-//! so with the seam attached they are refused as not implemented rather than served these
-//! placeholders.
+//! and then `/v1/completions`, `/v1/chat/completions`, `/v1/responses` and `/v1/messages` carry
+//! the checkpoint's real token ids instead of these placeholders. The Responses and Anthropic
+//! adapters convert their request shapes to the chat template and tokenize through the same
+//! `PromptCodec::encode_chat` seam, so the fallback only serves a router with no tokenizer.
 //!
 //! Image content parts are **recorded**, not charged. The vision path is 263
 //! `vision.*`/`aligner.*` tensors plus the three image delimiters, none of which the tensor plan
