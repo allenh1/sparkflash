@@ -400,15 +400,26 @@ pub struct ResponsesRequest {
     pub temperature: Option<f32>,
     /// Nucleus sampling threshold.
     pub top_p: Option<f32>,
-    /// Whether the client asked for streaming. Milestone 1 answers a true value with a
-    /// 400 unsupported_parameter error rather than silently returning a buffered body.
+    /// Whether the client asked for streaming. The handler emits the Responses SSE event family
+    /// when true and the buffered response object when false.
     pub stream: Option<bool>,
-    /// Tool definitions, including `apply_patch` custom tools.
+    /// Tool definitions in the Responses shape (`{type:"function", name, parameters}`).
     pub tools: Option<Value>,
+    /// Tool-choice selector. `"auto"` and `"none"` are honoured; `"required"` and a named
+    /// function selector are refused typed because this server cannot force the call.
+    pub tool_choice: Option<Value>,
+    /// Whether one answer may carry more than one tool call.
+    pub parallel_tool_calls: Option<bool>,
     /// Reasoning configuration object.
     pub reasoning: Option<Value>,
-    /// Whether to persist the response.
+    /// Output-format configuration. Only the text default is supported; JSON modes are refused.
+    pub text: Option<Value>,
+    /// Whether to persist the response (accepted as a no-op: this server keeps no store).
     pub store: Option<bool>,
+    /// Truncation policy (`auto` or `disabled`); accepted as a no-op.
+    pub truncation: Option<Value>,
+    /// Previous response id. This server keeps no response store, so references are refused.
+    pub previous_response_id: Option<String>,
 }
 
 /// Anthropic `POST /v1/messages` request body.
@@ -423,8 +434,8 @@ pub struct MessagesRequest {
     pub messages: Vec<AnthropicMessage>,
     /// System prompt: string or block array.
     pub system: Option<Value>,
-    /// Whether the client asked for streaming. Milestone 1 answers a true value with a
-    /// 400 unsupported_parameter error rather than silently returning a buffered body.
+    /// Whether the client asked for streaming. The handler emits the Anthropic Messages SSE event
+    /// family when true and the buffered message object when false.
     pub stream: Option<bool>,
     /// Sampling temperature.
     pub temperature: Option<f32>,
@@ -432,8 +443,15 @@ pub struct MessagesRequest {
     pub top_p: Option<f32>,
     /// Stop sequences.
     pub stop_sequences: Option<Vec<String>>,
-    /// Tool definitions.
+    /// Tool definitions in the Anthropic shape (`{name, description, input_schema}`).
     pub tools: Option<Value>,
+    /// Tool-choice selector. Anthropic `auto` and `none` are honoured; `any` and `tool` are
+    /// refused typed because this server cannot force the call.
+    pub tool_choice: Option<Value>,
+    /// Extended-thinking configuration.
+    pub thinking: Option<Value>,
+    /// Top-k sampling (Anthropic's extension over the OpenAI surface).
+    pub top_k: Option<i32>,
     /// Request metadata.
     pub metadata: Option<Value>,
 }

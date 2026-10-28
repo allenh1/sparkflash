@@ -1292,19 +1292,37 @@ async fn token_budget_is_validated_against_the_advertised_ceiling() {
 }
 
 #[tokio::test]
-async fn anthropic_streaming_is_rejected_loudly() {
+async fn anthropic_streaming_emits_message_events() {
     let body = json!({"model": MODEL, "max_tokens": 16, "stream": true,
         "messages": [{"role": "user", "content": "hello"}]});
-    let (status, _, bytes) = send(app(), json_request("/v1/messages", &body)).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    let error = body_json(&bytes);
-    assert_eq!(error["error"]["code"], 400);
-    assert_eq!(error["error"]["param"], "stream");
-    assert!(
-        error["error"]["message"]
-            .as_str()
-            .expect("message")
-            .contains("stream")
+    let (status, headers, bytes) = send(app(), json_request("/v1/messages", &body)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("content-type").expect("content type"),
+        "text/event-stream"
+    );
+    let text = String::from_utf8_lossy(&bytes);
+    for event in [
+        "event: message_start",
+        "event: content_block_start",
+        "event: content_block_delta",
+        "event: content_block_stop",
+        "event: message_delta",
+        "event: message_stop",
+    ] {
+        assert!(text.contains(event), "missing {event}: {text}");
+    }
+    let frames = sse_frames(&bytes);
+    assert_eq!(frames[0]["type"], "message_start");
+    let delta = frames
+        .iter()
+        .find(|frame| frame["type"] == "message_delta")
+        .expect("a message_delta frame");
+    assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+    assert_eq!(delta["usage"]["output_tokens"], 2);
+    assert_eq!(
+        frames.last().expect("a final frame")["type"],
+        "message_stop"
     );
 }
 
@@ -1405,19 +1423,33 @@ async fn requests_bind_and_restore_their_trace_id() {
 }
 
 #[tokio::test]
-async fn responses_streaming_is_rejected_loudly() {
+async fn responses_streaming_emits_response_events() {
     let body = json!({"model": MODEL, "input": "hello", "stream": true});
-    let (status, _, bytes) = send(app(), json_request("/v1/responses", &body)).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    let error = body_json(&bytes);
-    assert_eq!(error["error"]["code"], 400);
-    assert_eq!(error["error"]["param"], "stream");
-    assert!(
-        error["error"]["message"]
-            .as_str()
-            .expect("message")
-            .contains("stream")
+    let (status, headers, bytes) = send(app(), json_request("/v1/responses", &body)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("content-type").expect("content type"),
+        "text/event-stream"
     );
+    let text = String::from_utf8_lossy(&bytes);
+    for event in [
+        "event: response.created",
+        "event: response.in_progress",
+        "event: response.output_item.added",
+        "event: response.output_text.delta",
+        "event: response.output_item.done",
+        "event: response.completed",
+    ] {
+        assert!(text.contains(event), "missing {event}: {text}");
+    }
+    let frames = sse_frames(&bytes);
+    let completed = frames
+        .iter()
+        .find(|frame| frame["type"] == "response.completed")
+        .expect("a response.completed frame");
+    assert_eq!(completed["response"]["status"], "completed");
+    assert_eq!(completed["response"]["output_text"], "Hello world");
+    assert_eq!(completed["response"]["usage"]["output_tokens"], 2);
 }
 
 #[tokio::test]
@@ -3992,12 +4024,12 @@ async fn device_claimed_chat_with_tokenizer_seam_captures_prompt_token_ids() {
 }
 
 #[tokio::test]
-async fn responses_and_messages_are_not_implemented_with_the_checkpoint_tokenizer() {
-    // Both routes size their prompt with placeholder ids. A real engine (the tokenizer attached)
-    // would generate from those instead of the request, so they are refused until implemented.
-    let engine = RecordingEngine::default();
-    let calls = Arc::clone(&engine.calls);
-    let seam = Arc::new(
+async fn responses_and_messages_tokenize_with_the_checkpoint_tokenizer() {
+    // Both routes now render the same V4.1 chat template the chat route uses, so the prompt ids
+    // are the checkpoint's rather than zero placeholders.
+    let engine = RecordingRequestEngine::new();
+    let requests = Arc::clone(&engine.requests);
+    let seam: Arc<dyn sparkflash_model::PromptCodec> = Arc::new(
         sparkflash_model_deepseek_v41::encoding::TokenizerSeam::from_path(
             &sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path(),
         )
@@ -4006,53 +4038,71 @@ async fn responses_and_messages_are_not_implemented_with_the_checkpoint_tokenize
     let app = router(
         AppState::new(Arc::new(engine))
             .with_fixed_time(FIXED_TIME)
-            .with_tokenizer(seam),
+            .with_tokenizer(Arc::clone(&seam)),
     );
     let bodies = [
         (
             "/v1/responses",
-            json!({"model": MODEL, "input": "What is 2 + 2?"}),
+            json!({"model": MODEL, "instructions": "be brief", "input": [
+                {"type": "message", "role": "developer", "content": "developer marker"},
+                {"role": "user", "content": "What is 2 + 2?"},
+            ]}),
         ),
         (
             "/v1/messages",
-            json!({"model": MODEL, "max_tokens": 8,
+            json!({"model": MODEL, "max_tokens": 8, "system": "be brief",
                    "messages": [{"role": "user", "content": "What is 2 + 2?"}]}),
         ),
     ];
     for (uri, body) in bodies {
         let (status, _, bytes) = send(app.clone(), json_request(uri, &body)).await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{uri}");
-        let message = body_json(&bytes)["error"]["message"]
-            .as_str()
-            .expect("an error message")
-            .to_owned();
-        assert!(
-            message.starts_with(&format!("{uri} is not implemented yet")),
-            "{message}"
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{uri}: {}",
+            String::from_utf8_lossy(&bytes)
         );
-        assert!(message.contains("/v1/chat/completions"), "{message}");
     }
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "no refused request reached generation"
-    );
+    {
+        let captured = requests.lock().expect("request log");
+        assert_eq!(captured.len(), 2, "both routes reached generation");
+        for request in captured.iter() {
+            assert!(
+                request.prompt_tokens.len() > 3,
+                "the real template prompt is tokenized: {request:?}"
+            );
+            assert!(
+                request.prompt_tokens.iter().any(|id| *id != 0),
+                "the prompt is not a row of placeholders"
+            );
+        }
+        let responses_prompt = seam
+            .decode(&captured[0].prompt_tokens)
+            .expect("the Responses prompt decodes");
+        assert!(
+            responses_prompt.contains("developer marker"),
+            "a developer message must reach the real renderer: {responses_prompt}"
+        );
+        let messages_prompt = seam
+            .decode(&captured[1].prompt_tokens)
+            .expect("the Anthropic prompt decodes");
+        assert!(
+            messages_prompt.contains("be brief"),
+            "the Anthropic system block must reach the real renderer: {messages_prompt}"
+        );
+    }
     let (status, _, bytes) = send(app, get_request("/v1/models")).await;
     assert_eq!(status, StatusCode::OK);
     let card = body_json(&bytes);
     let endpoints = card["data"][0]["capabilities"]["endpoints"]
         .as_array()
         .expect("endpoints is an array");
-    assert!(
-        endpoints.iter().any(|e| e == "/v1/chat/completions"),
-        "{endpoints:?}"
-    );
-    assert!(
-        !endpoints
-            .iter()
-            .any(|e| e == "/v1/responses" || e == "/v1/messages"),
-        "the refused routes are not advertised: {endpoints:?}"
-    );
+    for route in ["/v1/responses", "/v1/messages"] {
+        assert!(
+            endpoints.iter().any(|e| e == route),
+            "{route} is advertised: {endpoints:?}"
+        );
+    }
 }
 
 #[tokio::test]
