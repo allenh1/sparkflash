@@ -960,6 +960,15 @@ impl DeviceLayer<'_> {
         }
     }
 
+    /// Counts positions ..`end` as appended to the caches of layers `from..` without running those
+    /// layers on them: a prefill's rows that stop after the encoder. Those layers' windows over them
+    /// hold stale rows, which only the decoder's warm-up rows read ([super::batch::DECODER_WARM]).
+    pub(super) fn skip_rows(&mut self, from: usize, end: usize) {
+        for count in self.appended_rows.iter_mut().skip(from) {
+            *count = end;
+        }
+    }
+
     /// The latest position at or before `next` the rows can resume from over the state a longer
     /// sequence left: the compressor ring holds only the last SEAM_RING_ROWS positions' rows, so a
     /// later position may have overwritten a row of the group still open at `next`. A multiple of

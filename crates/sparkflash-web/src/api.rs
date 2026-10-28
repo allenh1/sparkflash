@@ -25,13 +25,17 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use crate::commands::{ServeAction, convert_command, local_hostname, serve_action_command};
+use crate::commands::{
+    ServeAction, SyncTarget, SyncWhat, convert_command, download_command, inspect_command,
+    local_hostname, serve_action_command, sync_command,
+};
 use crate::config::{
     MAX_CONCURRENCY, MODEL_CONTEXT_TOKENS, SUPPORTED_ENGINES, SUPPORTED_WEIGHTS, SparkConfig,
     WORLD_SIZE,
 };
 use crate::discovery::{DiscoveryReport, NodeDiscovery, SshProbe, report_nodes};
 use crate::hf::{self, CachedModel};
+use crate::inspect::{self, ProbeResult, SetupReport};
 use crate::jobs::{JobManager, JobSummary};
 use crate::stats::{MAX_SERIES_POINTS, StatsStore, TelemetrySource, now_ms};
 
@@ -42,6 +46,35 @@ pub const ACTION_HEADER: &str = "x-sparkflash-web";
 
 /// The cluster actions that change whether the group runs; one at a time.
 const CLUSTER_STATE_KINDS: &[&str] = &["launch", "stop"];
+
+/// What a conversion must not overlap: a launch or stop, or the checkpoint changing under it.
+const CONVERT_EXCLUSIVE: &[&str] = &["launch", "stop", "download", "sync-model"];
+
+/// What a launch must not overlap: anything that changes the files the ranks start from.
+const LAUNCH_EXCLUSIVE: &[&str] = &[
+    "launch",
+    "stop",
+    "download",
+    "sync-model",
+    "sync-software",
+    "convert-r0",
+    "convert-r1",
+    "convert-r2",
+    "convert-r3",
+];
+
+/// What a model download or copy must not overlap: the other one, or a conversion reading it.
+const MODEL_EXCLUSIVE: &[&str] = &[
+    "download",
+    "sync-model",
+    "convert-r0",
+    "convert-r1",
+    "convert-r2",
+    "convert-r3",
+];
+
+/// How long one node check may take, on top of the SSH connect timeout.
+const INSPECT_SECS: u64 = 60;
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_CSS: &str = include_str!("../assets/app.css");
@@ -83,6 +116,8 @@ pub struct WebState {
     telemetry: Arc<RwLock<Arc<TelemetrySource>>>,
     last_discovery: Arc<RwLock<Option<DiscoveryReport>>>,
     discovery_lock: Arc<tokio::sync::Mutex<()>>,
+    last_inspect: Arc<RwLock<Option<SetupReport>>>,
+    inspect_lock: Arc<tokio::sync::Mutex<()>>,
     advertised: Option<String>,
     hostname: String,
 }
@@ -111,6 +146,8 @@ impl WebState {
             telemetry: Arc::new(RwLock::new(init.telemetry)),
             last_discovery: Arc::new(RwLock::new(None)),
             discovery_lock: Arc::new(tokio::sync::Mutex::new(())),
+            last_inspect: Arc::new(RwLock::new(None)),
+            inspect_lock: Arc::new(tokio::sync::Mutex::new(())),
             advertised: init.advertised,
             hostname: local_hostname(),
         }
@@ -186,11 +223,15 @@ pub fn router(state: WebState) -> Router {
         .route("/api/config", get(get_config).put(put_config))
         .route("/api/config/reload", post(reload_config))
         .route("/api/discover", post(discover))
+        .route("/api/inspect", post(inspect_nodes))
+        .route("/api/network/apply", post(apply_network))
         .route("/api/models", get(models))
         .route("/api/series", get(series))
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/{id}", get(get_job))
         .route("/api/actions/convert", post(convert))
+        .route("/api/actions/download", post(download))
+        .route("/api/actions/sync", post(sync))
         .route("/api/actions/launch", post(launch))
         .route("/api/actions/stop", post(stop))
         .route("/api/actions/status", post(status))
@@ -279,6 +320,8 @@ struct ConfigView {
 #[derive(Serialize)]
 struct StateView {
     now_ms: u64,
+    /// This node's hostname, which the setup page names rank 0 after.
+    hostname: String,
     config_path: String,
     config: SparkConfig,
     config_error: Option<String>,
@@ -289,6 +332,7 @@ struct StateView {
     last_error: Option<String>,
     jobs: Vec<JobSummary>,
     discovery: Option<DiscoveryReport>,
+    setup: Option<SetupReport>,
     advertised: Option<String>,
     checkpoint: CheckpointView,
     limits: Limits,
@@ -342,9 +386,11 @@ async fn state_snapshot(State(web): State<WebState>) -> Json<StateView> {
         (state.config.clone(), state.load_error.clone(), state.exists)
     };
     let discovery = web.last_discovery.read().expect("discovery lock").clone();
+    let setup = web.last_inspect.read().expect("inspect lock").clone();
     let checkpoint = CheckpointView::of(&config);
     Json(StateView {
         now_ms: now_ms(),
+        hostname: web.hostname.clone(),
         config_path: web.config_path.display().to_string(),
         config,
         config_error,
@@ -355,6 +401,7 @@ async fn state_snapshot(State(web): State<WebState>) -> Json<StateView> {
         last_error: web.stats.last_error(),
         jobs: web.jobs.list(),
         discovery,
+        setup,
         advertised: web.advertised.clone(),
         checkpoint,
         limits: Limits {
@@ -390,6 +437,11 @@ async fn put_config(State(web): State<WebState>, Json(body): Json<serde_json::Va
             );
         }
     };
+    store_config(&web, config)
+}
+
+/// Validates, saves and adopts `config`, answering with the saved view.
+fn store_config(web: &WebState, config: SparkConfig) -> Response {
     if let Err(error) = config.validate() {
         return api_error(StatusCode::BAD_REQUEST, error.message);
     }
@@ -466,6 +518,173 @@ async fn discover(State(web): State<WebState>) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("discovery task failed: {error}"),
         ),
+    }
+}
+
+/// Checks every node (in parallel, read-only) and keeps the report for the state view.
+async fn inspect_nodes(State(web): State<WebState>) -> Response {
+    let _guard = web.inspect_lock.lock().await;
+    let config = match web.usable_config() {
+        Ok(config) => config,
+        Err(message) => return api_error(StatusCode::CONFLICT, message),
+    };
+    let probe = Arc::clone(&web.ssh);
+    let result = tokio::task::spawn_blocking(move || run_inspect(&config, probe.as_ref())).await;
+    match result {
+        Ok(report) => {
+            *web.last_inspect.write().expect("inspect lock") = Some(report.clone());
+            Json(report).into_response()
+        }
+        Err(error) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("the node check failed: {error}"),
+        ),
+    }
+}
+
+fn run_inspect(config: &SparkConfig, probe: &dyn SshProbe) -> SetupReport {
+    let checkpoint = config.resolve_checkpoint().ok();
+    let timeout = std::time::Duration::from_secs(config.web.ssh_timeout_secs + INSPECT_SECS);
+    let probes: Vec<ProbeResult> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..config.cluster.nodes.len())
+            .map(|rank| {
+                let command = inspect_command(config, rank, checkpoint.as_deref());
+                scope.spawn(move || {
+                    probe
+                        .capture(&command, timeout)
+                        .map(|text| inspect::parse_facts(&text))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err("the check stopped unexpectedly".to_owned()))
+            })
+            .collect()
+    });
+    inspect::analyze(config, &probes, lead_model_complete(config), now_ms())
+}
+
+/// Whether the lead holds the whole checkpoint: a download left no `.incomplete` blob behind, or
+/// `model.checkpoint` names a directory that exists.
+fn lead_model_complete(config: &SparkConfig) -> bool {
+    if !config.model.checkpoint.trim().is_empty() {
+        return config.node_path(&config.model.checkpoint).is_dir();
+    }
+    config
+        .hub_cache_dir()
+        .and_then(|cache| hf::list(&cache).ok())
+        .and_then(|models| models.into_iter().find(|model| model.id == config.model.id))
+        .is_some_and(|model| model.complete)
+}
+
+/// Writes the NCCL settings and peer addresses the last check derived into the configuration.
+async fn apply_network(State(web): State<WebState>) -> Response {
+    let plan = web
+        .last_inspect
+        .read()
+        .expect("inspect lock")
+        .as_ref()
+        .and_then(|report| report.plan.clone());
+    let Some(plan) = plan else {
+        return api_error(
+            StatusCode::CONFLICT,
+            "there are no detected network settings yet; check the Sparks first",
+        );
+    };
+    let mut config = match web.usable_config() {
+        Ok(config) => config,
+        Err(message) => return api_error(StatusCode::CONFLICT, message),
+    };
+    plan.apply(&mut config);
+    store_config(&web, config)
+}
+
+/// Downloads the configured model into the lead's Hugging Face cache.
+async fn download(State(web): State<WebState>) -> Response {
+    let command = match web
+        .usable_config()
+        .and_then(|config| download_command(&config))
+    {
+        Ok(command) => command,
+        Err(message) => return api_error(StatusCode::CONFLICT, message),
+    };
+    match web.jobs.start_exclusive(command, MODEL_EXCLUSIVE).await {
+        Ok(id) => accepted_jobs(&web, &[id]),
+        Err(error) => api_error(StatusCode::CONFLICT, error.message),
+    }
+}
+
+#[derive(Deserialize)]
+struct SyncRequest {
+    what: SyncWhat,
+}
+
+/// Copies the software or the model from the lead to the other nodes.
+async fn sync(State(web): State<WebState>, Json(request): Json<SyncRequest>) -> Response {
+    let config = match web.usable_config() {
+        Ok(config) => config,
+        Err(message) => return api_error(StatusCode::CONFLICT, message),
+    };
+    match request.what {
+        SyncWhat::Software if !config.binary_path().is_file() => {
+            return api_error(
+                StatusCode::CONFLICT,
+                format!(
+                    "{} is not built yet; run scripts/setup.sh on this Spark first",
+                    config.binary_path().display()
+                ),
+            );
+        }
+        SyncWhat::Model if !lead_model_complete(&config) => {
+            return api_error(
+                StatusCode::CONFLICT,
+                "the model is not completely on this Spark yet; download it first",
+            );
+        }
+        _ => {}
+    }
+    // The fast network carries the copy once a check has confirmed the configured addresses.
+    let fast = web
+        .last_inspect
+        .read()
+        .expect("inspect lock")
+        .as_ref()
+        .is_some_and(|report| {
+            report.network_ok()
+                && report
+                    .plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.matches(&config))
+        });
+    let targets: Vec<SyncTarget> = config
+        .cluster
+        .nodes
+        .iter()
+        .filter(|node| !node.local)
+        .map(|node| SyncTarget {
+            address: if fast {
+                node.peer.clone()
+            } else {
+                node.ssh.clone()
+            },
+            ssh: node.ssh.clone(),
+        })
+        .collect();
+    let command = match sync_command(&config, request.what, &targets) {
+        Ok(command) => command,
+        Err(message) => return api_error(StatusCode::CONFLICT, message),
+    };
+    let exclusive: &[&str] = match request.what {
+        SyncWhat::Software => &["launch"],
+        SyncWhat::Model => MODEL_EXCLUSIVE,
+    };
+    match web.jobs.start_exclusive(command, exclusive).await {
+        Ok(id) => accepted_jobs(&web, &[id]),
+        Err(error) => api_error(StatusCode::CONFLICT, error.message),
     }
 }
 
@@ -565,8 +784,9 @@ async fn convert(State(web): State<WebState>, Json(request): Json<ConvertRequest
     let mut started = Vec::new();
     for rank in ranks {
         let command = convert_command(&config, rank);
-        // Refused while this rank converts or the group is being launched or stopped.
-        match web.jobs.start_exclusive(command, CLUSTER_STATE_KINDS).await {
+        // Refused while this rank converts, the group is being launched or stopped, or the
+        // checkpoint is being downloaded or copied.
+        match web.jobs.start_exclusive(command, CONVERT_EXCLUSIVE).await {
             Ok(id) => started.push(id),
             Err(error) => {
                 return api_error(StatusCode::CONFLICT, error.message);
@@ -608,9 +828,11 @@ async fn start_action(web: &WebState, action: ServeAction) -> Response {
         Err(message) => return api_error(StatusCode::CONFLICT, message),
     };
     let command = serve_action_command(&config, action);
-    // Launch and stop exclude each other (and a second of themselves); status runs alongside.
+    // Launch and stop exclude each other (and a second of themselves), and a launch waits for
+    // every copy and conversion; status runs alongside.
     let exclusive: &[&str] = match action {
-        ServeAction::Launch | ServeAction::Stop => CLUSTER_STATE_KINDS,
+        ServeAction::Launch => LAUNCH_EXCLUSIVE,
+        ServeAction::Stop => CLUSTER_STATE_KINDS,
         ServeAction::Status => &[],
     };
     match web.jobs.start_exclusive(command, exclusive).await {
@@ -678,6 +900,36 @@ mod tests {
                 ok: true,
                 message: String::new(),
             }
+        }
+
+        /// A healthy dual-rail node per rank: the lead runs locally, the rest over SSH to
+        /// `spark1`..`spark3`, and `spark3` refuses.
+        fn capture(
+            &self,
+            command: &CommandSpec,
+            _timeout: std::time::Duration,
+        ) -> Result<String, String> {
+            let rank = if command.program == "bash" {
+                0
+            } else {
+                (1..4)
+                    .find(|rank| {
+                        command
+                            .args
+                            .iter()
+                            .any(|arg| arg.ends_with(&format!("spark{rank}")))
+                    })
+                    .expect("an ssh destination")
+            };
+            if rank == 3 {
+                return Err("Permission denied (publickey).".to_owned());
+            }
+            let rank = u8::try_from(rank).expect("rank");
+            Ok(crate::inspect::tests::node_text(
+                &format!("spark-{rank}"),
+                11 + rank,
+                21 + rank,
+            ))
         }
     }
 
@@ -858,7 +1110,7 @@ mod tests {
         let nodes = body["nodes"].as_array().expect("nodes");
         assert_eq!(nodes.len(), 5);
         assert_eq!(body["discovered"], 1);
-        assert!(nodes.iter().any(|node| node["ssh"] == "10.0.0.7"));
+        assert!(nodes.iter().any(|node| node["ssh"] == "spark7.local"));
     }
 
     #[tokio::test]
@@ -987,6 +1239,151 @@ mod tests {
                 "{uri}: {body}"
             );
         }
+    }
+
+    fn post_json(uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .header(ACTION_HEADER, "1")
+            .header(header::CONTENT_TYPE, "application/json")
+            .uri(uri)
+            .body(Body::from(body.to_owned()))
+            .expect("request")
+    }
+
+    #[tokio::test]
+    async fn the_node_check_reports_each_spark_and_its_network_plan_can_be_applied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = test_router(test_state(dir.path()));
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/network/apply", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "nothing checked yet"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let report = body_json(response).await;
+        assert_eq!(report["nodes"].as_array().map(Vec::len), Some(4));
+        assert_eq!(report["nodes"][0]["hostname"], "spark-0");
+        assert_eq!(
+            report["nodes"][0]["rails"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(report["nodes"][3]["reachable"], false);
+        assert!(
+            report["plan"].is_null(),
+            "an unreachable node blocks the plan"
+        );
+        assert!(
+            report["findings"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Can't reach spark3"),
+            "{report}"
+        );
+
+        let state = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/state")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let state = body_json(state).await;
+        assert_eq!(state["setup"]["nodes"][1]["hostname"], "spark-1");
+    }
+
+    #[tokio::test]
+    async fn the_detected_network_settings_are_saved_into_the_configuration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web = test_state(dir.path());
+        let config = web.config();
+        let probes: Vec<ProbeResult> = (0..4u8)
+            .map(|rank| {
+                Ok(inspect::parse_facts(&crate::inspect::tests::node_text(
+                    &format!("spark-{rank}"),
+                    11 + rank,
+                    21 + rank,
+                )))
+            })
+            .collect();
+        *web.last_inspect.write().expect("inspect lock") =
+            Some(inspect::analyze(&config, &probes, true, 1));
+        let app = test_router(web.clone());
+        let response = app
+            .oneshot(post_json("/api/network/apply", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = SparkConfig::load(&dir.path().join("sparkflash.toml")).expect("saved");
+        assert_eq!(saved.network.nccl_ib_hca, "rocep1s0f1,roceP2p1s0f1");
+        assert_eq!(saved.network.nccl_socket_ifname, "enP2p1s0f1np1");
+        assert_eq!(saved.network.nccl_ib_gid_index, Some(3));
+        assert_eq!(saved.cluster.nodes[3].peer, "198.51.100.24");
+        assert_eq!(saved.cluster.nodes[3].ssh, "spark3", "the SSH names stay");
+    }
+
+    #[tokio::test]
+    async fn downloads_and_copies_are_refused_until_their_inputs_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web = test_state(dir.path());
+        let app = test_router(web.clone());
+
+        // The binary is not built in the test checkout, and nothing is downloaded.
+        for (body, expected) in [
+            (r#"{"what":"software"}"#, "is not built yet"),
+            (r#"{"what":"model"}"#, "download it first"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(post_json("/api/actions/sync", body))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{body}");
+            let error = body_json(response).await["error"].to_string();
+            assert!(error.contains(expected), "{body}: {error}");
+        }
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/actions/sync", r#"{"what":"everything"}"#))
+            .await
+            .expect("response");
+        assert!(response.status().is_client_error());
+
+        let mut config = web.config();
+        config.model.checkpoint = dir.path().display().to_string();
+        config
+            .save(&dir.path().join("sparkflash.toml"))
+            .expect("save");
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/config/reload", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .oneshot(post_json("/api/actions/download", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"].to_string();
+        assert!(
+            error.contains("model.checkpoint names a directory"),
+            "{error}"
+        );
     }
 
     async fn status_of(app: Router, request: Request<Body>) -> StatusCode {

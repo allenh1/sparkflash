@@ -51,6 +51,8 @@
 #   SPARKFLASH_DRAIN_TIMEOUT_MS  rank-0 drain deadline (default 30000)
 #   SPARK_MAX_SEQ_LEN      served sequence window (forwarded to every rank; the web UI sets it)
 #   SPARKFLASH_LANES       concurrent sequence slots (forwarded to every rank; the web UI sets it)
+#   SPARKFLASH_PREFILL_*, SPARKFLASH_BATCH_*, SPARKFLASH_DECODE_*  scheduler knobs (forwarded to
+#                          every rank: the ranks must agree on every tick)
 #   SPARKFLASH_DEVICE_TOKEN_DIR  token window (or live window parent) served by rank 0
 #   SPARKFLASH_DEVICE_TOKEN_LIVE=1        follow that directory as a live window directory (W5)
 #   SPARKFLASH_DEVICE_TOKEN_DERIVED_CLAIM=1  accept a window without the device's claim assertion
@@ -123,6 +125,12 @@ rank_env() {
         done
     fi
     [ -n "$CONVERTED_DIR" ] && printf ' SPARKFLASH_CONVERTED_DIR=%s' "$CONVERTED_DIR"
+    # The scheduler's knobs: every rank runs the same ticks, so a prefill or batching setting
+    # that only a local rank 0 inherited would split the group's collectives.
+    local knob
+    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE)_' || true); do
+        printf ' %s=%q' "$knob" "${!knob}"
+    done
     return 0
 }
 

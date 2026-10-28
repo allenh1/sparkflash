@@ -30,8 +30,18 @@ const S = {
   selectedJob: null,
   jobDetail: null,
   discoveryBusy: false,
+  inspectBusy: false,
+  inspectError: null,
+  inspectedFor: null,
+  autoInspected: false,
+  jobSeen: new Map(),
+  pick: null,
+  manualHosts: [],
+  guideOpen: {},
+  guideHtml: {},
   models: null,
   autoDiscovered: false,
+  firstState: true,
   tab: "overview",
   hover: null,
   detailBusy: false,
@@ -204,6 +214,7 @@ function showTab(name) {
     renderJobs();
     if (S.selectedJob !== null) refreshJobDetail(S.selectedJob, true);
   }
+  renderGuide();
 }
 
 /* Configuration form state */
@@ -233,11 +244,17 @@ async function refreshState() {
     S.state = await api("/api/state");
     S.stateError = null;
     S.jobs = S.state.jobs || [];
+    if (S.firstState) {
+      S.firstState = false;
+      // A console that has never been set up opens on the setup steps.
+      if (!location.hash && !S.state.config_exists) location.hash = "setup";
+    }
     renderState();
     if (!S.autoDiscovered && !S.state.discovery) {
       S.autoDiscovered = true;
       discover(true);
     }
+    maybeInspect();
   } catch (error) {
     S.stateError = error.message;
     renderStatus();
@@ -320,7 +337,6 @@ function renderState() {
   $("action-launch").disabled = online || clusterBusy || converting;
   $("action-stop").disabled = !online || clusterBusy;
   $("action-status").disabled = clusterBusy;
-  $("action-convert").disabled = online || converting || clusterBusy;
   for (const button of document.querySelectorAll("[data-convert-rank]")) {
     button.disabled = online || clusterBusy;
   }
@@ -332,39 +348,9 @@ function renderState() {
   $("max-concurrency").max = state.limits?.max_concurrency || 32;
 
   renderCluster(state);
-  renderDiscovery(state.discovery);
-  renderSteps(state);
+  renderGuide();
   renderJobs();
   if (!S.configDirty) paintConfig(state.config, state.discovery);
-}
-
-function renderSteps(state) {
-  const jobs = S.jobs;
-  const convertDone = [0, 1, 2, 3].every((rank) =>
-    jobs.some((job) => job.kind === "convert-r" + rank && job.status === "succeeded")
-  );
-  const convertActive = jobs.some((job) => job.kind.startsWith("convert-") && job.status === "running");
-  const launchActive = jobs.some((job) => job.kind === "launch" && job.status === "running");
-  const configured = (state.discovery?.nodes || []).filter((node) => node.configured);
-  const sshDone = configured.length === 4 && configured.every((node) => node.ssh_ok === true);
-  const online = !!(state.latest && state.latest.online);
-  const configDone = !!state.config_exists && !state.config_error;
-  const steps = [
-    ["step-config", configDone, false],
-    ["step-ssh", sshDone, S.discoveryBusy],
-    ["step-convert", convertDone, convertActive],
-    ["step-launch", online, launchActive],
-  ];
-  let done = 0;
-  for (const [id, complete, active] of steps) {
-    const element = $(id);
-    element.classList.toggle("done", complete);
-    element.classList.toggle("active", !complete && active);
-    if (complete) done += 1;
-  }
-  const progress = $("setup-progress");
-  progress.textContent = done + " / 4";
-  progress.className = "tag" + (done === 4 ? " good" : "");
 }
 
 /* Configuration form */
@@ -719,86 +705,737 @@ async function reloadConfig() {
 async function discover(quiet = false) {
   if (S.discoveryBusy) return;
   S.discoveryBusy = true;
-  const button = $("discover");
-  button.disabled = true;
-  button.classList.add("busy");
-  button.querySelector("span").textContent = "Scanning…";
-  if (S.state) renderSteps(S.state);
+  renderGuide();
   try {
     const report = await api("/api/discover", { method: "POST" });
     if (S.state) {
       S.state.discovery = report;
-      renderDiscovery(report);
       if (!S.configDirty && S.state.config) paintConfig(S.state.config, report, true);
     }
-    if (report.mdns_error && !quiet) toast("mDNS: " + report.mdns_error, true);
-    else if (!quiet) toast("Found " + report.discovered + " mDNS host(s) and probed the configured ranks.");
+    if (report.mdns_error && !quiet) toast("Could not search the network: " + report.mdns_error, true);
   } catch (error) {
-    if (!quiet) toast("Discovery failed: " + error.message, true);
+    if (!quiet) toast("Could not search the network: " + error.message, true);
   } finally {
     S.discoveryBusy = false;
-    button.disabled = false;
-    button.classList.remove("busy");
-    button.querySelector("span").textContent = "Rescan";
-    if (S.state) renderSteps(S.state);
+    renderGuide();
   }
 }
 
-function renderDiscovery(report) {
-  const body = $("discovery-rows");
-  const signature = JSON.stringify(report || null);
-  if (body.dataset.signature === signature) return;
-  body.dataset.signature = signature;
-  if (!report || !report.nodes || report.nodes.length === 0) {
-    body.innerHTML = '<tr><td colspan="4" class="empty">' + (report ? "Nothing answered." : "No scan yet.") + "</td></tr>";
-    $("fix-wrap").classList.add("hidden");
-    return;
+/* Guided setup */
+
+// The steps, in order. Each one decides from the latest node check whether it is done, so the page
+// can be closed and reopened at any point.
+const GUIDE = ["find", "network", "software", "download", "copy", "convert", "launch"];
+const GUIDE_TITLES = {
+  find: "Find your Sparks",
+  network: "Connect the fast network",
+  software: "Install on the other Sparks",
+  download: "Download the model",
+  copy: "Copy the model to the other Sparks",
+  convert: "Prepare the weights",
+  launch: "Start the server",
+};
+
+// What each step needs finished first.
+const GUIDE_NEEDS = {
+  find: [],
+  network: ["find"],
+  software: ["find"],
+  download: ["find"],
+  copy: ["download"],
+  convert: ["software", "copy"],
+  launch: ["network", "convert"],
+};
+
+// Jobs whose result changes what the node check finds.
+const isSetupJob = (kind) =>
+  ["download", "sync-software", "sync-model", "launch"].includes(kind) || kind.startsWith("convert-");
+
+function latestJob(match) {
+  let found = null;
+  for (const job of S.jobs) {
+    if (match(job) && (!found || job.id > found.id)) found = job;
   }
-  body.innerHTML = report.nodes.map((node) => {
-    const host = node.hostname || node.ssh || "unknown";
-    const address = (node.addresses && node.addresses[0]) || node.peer || "—";
-    const tags = (node.rank !== null && node.rank !== undefined ? ' <span class="tag">R' + node.rank + "</span>" : "") +
-      (node.local ? ' <span class="tag">this node</span>' : "");
-    let action;
-    if (node.rank !== null && node.rank !== undefined) {
-      const target = (node.addresses && node.addresses[0]) || node.hostname || node.ssh;
-      action = '<button class="btn btn-ghost btn-xs" type="button" data-use-rank="' + node.rank + '" data-host="' + esc(target) +
-        '" title="Put this address in rank ' + node.rank + "'s SSH host\">Use for R" + node.rank + "</button>";
-    } else {
-      action = '<button class="btn btn-ghost btn-xs" type="button" data-copy-host="' + esc(node.ssh) + '">Copy</button>';
-    }
-    return '<tr><td><span class="host-name">' + esc(host) + "</span>" + tags + "</td>" +
-      "<td>" + esc(address) + "</td><td>" + sshState(node) + '</td><td class="num">' + action + "</td></tr>";
-  }).join("");
-
-  body.querySelectorAll("[data-use-rank]").forEach((button) => {
-    button.addEventListener("click", () => useDiscovered(Number(button.dataset.useRank), button.dataset.host));
-  });
-  body.querySelectorAll("[data-copy-host]").forEach((button) => {
-    button.addEventListener("click", () => copyText(button.dataset.copyHost));
-  });
-
-  const fix = report.fix_command || "";
-  $("fix-wrap").classList.toggle("hidden", !fix);
-  $("fix-command").textContent = fix;
+  return found;
 }
 
-function useDiscovered(rank, host) {
-  const row = document.querySelector('#node-rows tr[data-rank="' + rank + '"]');
-  if (!row) return;
-  const ssh = row.querySelector('[data-field="ssh"]');
-  if (host && ssh.value !== host) {
-    ssh.value = host;
-    markDirty();
-    toast("Rank " + rank + " now uses " + host + ". Save the configuration to keep it.");
+const runningJob = (match) => S.jobs.find((job) => job.status === "running" && match(job));
+const ofKind = (kind) => (job) => job.kind === kind;
+const isConvert = (job) => job.kind.startsWith("convert-");
+
+// "spark-1.local." and "Spark-1" are the same host.
+function bareHost(name) {
+  return String(name || "").trim().replace(/\.$/, "").replace(/\.local$/i, "").toLowerCase();
+}
+
+function sshTarget(host) {
+  const user = S.state?.config?.cluster?.ssh_user;
+  const target = user ? user + "@" + host : host;
+  return /^[A-Za-z0-9@._:-]+$/.test(target) ? target : "'" + target.replaceAll("'", "'\\''") + "'";
+}
+
+// The node check, when it was taken of the Sparks the configuration names now.
+function freshSetup(state) {
+  const setup = state?.setup;
+  const nodes = state?.config?.cluster?.nodes || [];
+  if (!setup || !Array.isArray(setup.nodes) || setup.nodes.length !== nodes.length) return null;
+  return setup.nodes.every((node, rank) => node.ssh === nodes[rank].ssh) ? setup : null;
+}
+
+function planApplied(config, plan) {
+  if (!plan) return false;
+  const network = config.network;
+  return network.nccl_ib_hca === plan.nccl_ib_hca &&
+    network.nccl_socket_ifname === plan.nccl_socket_ifname &&
+    (network.nccl_ib_gid_index ?? null) === (plan.nccl_ib_gid_index ?? null) &&
+    plan.peers.every((peer, rank) => config.cluster.nodes[rank]?.peer === peer);
+}
+
+function guideModel(state) {
+  const config = state.config;
+  const setup = freshSetup(state);
+  const nodes = setup?.nodes || [];
+  const online = !!(state.latest && state.latest.online);
+  const saved = !!state.config_exists && !state.config_error;
+  const configured = (state.discovery?.nodes || []).filter((node) => node.configured);
+  const sshOk = configured.length === 4 && configured.every((node) => node.ssh_ok === true);
+  const all = (field) => !!setup && nodes.every((node) => node[field] === "ready");
+  const errors = (setup?.findings || []).filter((finding) => finding.severity === "error");
+  const found = saved && ((!!setup && nodes.every((node) => node.reachable)) || sshOk);
+  const steps = {
+    find: { done: found },
+    network: { done: found && !!setup?.plan && errors.length === 0 && planApplied(config, setup.plan) },
+    software: { done: found && all("software"), running: runningJob(ofKind("sync-software")) },
+    download: { done: found && nodes[0]?.model === "ready", running: runningJob(ofKind("download")) },
+    copy: { done: found && all("model"), running: runningJob(ofKind("sync-model")) },
+    convert: { done: found && all("converted"), running: runningJob(isConvert) },
+    launch: { done: online && !!state.latest.ready, running: runningJob(ofKind("launch")) },
+  };
+  for (const key of GUIDE) {
+    steps[key].waitsFor = GUIDE_NEEDS[key].find((need) => !steps[need].done) || null;
+    steps[key].available = !steps[key].waitsFor;
+  }
+  const current = GUIDE.find((key) => !steps[key].done) || null;
+  return { setup, nodes, online, steps, current };
+}
+
+/* Step 1: the four Sparks */
+
+// The other Sparks this one could work with: what mDNS found, what the configuration names, and
+// anything typed in by hand. This Spark itself is rank 0 and never a choice.
+function sparkCandidates(state) {
+  const me = bareHost(state.hostname);
+  const seen = new Map();
+  const add = (candidate) => {
+    const key = bareHost(candidate.ssh);
+    if (key && !seen.has(key)) seen.set(key, candidate);
+  };
+  for (const node of state.discovery?.nodes || []) {
+    if (node.local || bareHost(node.hostname) === me || bareHost(node.ssh) === me) continue;
+    // Before the first save the configured names are placeholders; only show one mDNS also found.
+    if (node.configured && !state.config_exists && !node.hostname) continue;
+    add({
+      ssh: node.ssh,
+      name: node.hostname || node.ssh,
+      address: (node.addresses && node.addresses[0]) || "",
+      ok: node.ssh_ok,
+      message: node.ssh_message || "",
+    });
+  }
+  for (const host of S.manualHosts) add({ ssh: host, name: host, address: "", ok: null, message: "" });
+  return Array.from(seen.values());
+}
+
+function ensurePick(state, candidates) {
+  if (S.pick) return;
+  if (state.config_exists) {
+    S.pick = state.config.cluster.nodes.filter((node) => !node.local).map((node) => node.ssh);
+  } else if (state.discovery) {
+    S.pick = candidates.filter((candidate) => candidate.ok === true).slice(0, 3).map((candidate) => candidate.ssh);
+  }
+}
+
+function sshProblem(message) {
+  if (/resolve/i.test(message)) return "Can't find this name on the network";
+  if (/host key/i.test(message)) return "Doesn't know this Spark yet";
+  if (/timed out|no route|refused|no answer/i.test(message)) return "Not answering";
+  return "Needs this Spark's key";
+}
+
+function sshBadge(candidate) {
+  if (candidate.ok === true) return '<span class="ssh-state ok">Connected</span>';
+  if (candidate.ok === false) return '<span class="ssh-state fail" title="' + esc(candidate.message) + '">' + esc(sshProblem(candidate.message)) + "</span>";
+  return '<span class="ssh-state unknown">' + (S.discoveryBusy ? "Checking…" : "Not checked yet") + "</span>";
+}
+
+function codeBlock(heading, text) {
+  return '<div class="codeblock"><div class="codeblock-head"><span>' + heading + "</span>" +
+    '<button class="btn btn-ghost btn-xs" type="button" data-copy="' + esc(text) + '"><svg><use href="#i-copy"/></svg>Copy</button></div>' +
+    "<pre>" + esc(text) + "</pre></div>";
+}
+
+function findBody(state) {
+  const candidates = sparkCandidates(state);
+  ensurePick(state, candidates);
+  const picked = candidates.filter((candidate) => (S.pick || []).includes(candidate.ssh));
+  const parts = [];
+  parts.push('<p class="guide-lead">This Spark, <strong>' + esc(state.hostname) + "</strong>, runs this page and is the first of the four. " +
+    "Tick the three others. They need to be switched on and on the same network as this one.</p>");
+  if (candidates.length === 0) {
+    parts.push('<p class="guide-empty">' + (S.discoveryBusy || !state.discovery
+      ? "Looking for Sparks on your network…"
+      : "No other Sparks answered. Check that they are on and connected, then press Search again, or type a name below.") + "</p>");
   } else {
-    toast("Rank " + rank + " already uses " + host + ".");
+    parts.push('<div class="picks">' + candidates.map((candidate) => {
+      const checked = picked.includes(candidate);
+      const sub = candidate.address && candidate.address !== candidate.name ? candidate.address : (candidate.name !== candidate.ssh ? candidate.ssh : "");
+      return '<label class="pick' + (checked ? " on" : "") + '"><input type="checkbox" data-pick="' + esc(candidate.ssh) + '"' + (checked ? " checked" : "") + ">" +
+        '<span class="pick-name">' + esc(candidate.name) + (sub ? '<small class="mono">' + esc(sub) + "</small>" : "") + "</span>" +
+        sshBadge(candidate) + "</label>";
+    }).join("") + "</div>");
   }
+  parts.push('<div class="manual"><input id="g-manual" type="text" placeholder="Not listed? Type its name, e.g. spark-3.local" aria-label="Add a Spark by name">' +
+    '<button class="btn btn-sm" type="button" data-act="add-host">Add</button></div>');
+
+  const failing = picked.filter((candidate) => candidate.ok === false);
+  if (failing.length > 0) {
+    const command = ["[ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519"]
+      .concat(failing.map((candidate) => "ssh-copy-id " + sshTarget(candidate.ssh)))
+      .join("\n");
+    parts.push('<p class="guide-note">This Spark has to be allowed to sign in to ' + esc(failing.map((candidate) => candidate.name).join(", ")) +
+      ". Open a terminal on this Spark, paste the lines below, and answer each question (type <code>yes</code>, then that Spark's password). Then press Search again.</p>");
+    parts.push(codeBlock("Run once in a terminal on this Spark", command));
+  }
+
+  const count = picked.length;
+  const ready = count === 3 && failing.length === 0;
+  const hint = count === 3
+    ? (failing.length ? "Fix the sign-in above first." : "")
+    : "Tick " + (count < 3 ? 3 - count + " more" : count - 3 + " fewer") + ".";
+  parts.push('<div class="guide-actions">' +
+    '<button class="btn" type="button" data-act="scan"' + (S.discoveryBusy ? " disabled" : "") + '><svg><use href="#i-search"/></svg>' + (S.discoveryBusy ? "Searching…" : "Search again") + "</button>" +
+    (hint ? '<span class="guide-hint">' + esc(hint) + "</span>" : "") +
+    '<button class="btn btn-primary" type="button" data-act="use-sparks"' + (ready ? "" : " disabled") + ">Use these Sparks</button></div>");
+  return parts.join("");
+}
+
+async function useSparks() {
+  if (!requireSaved()) return;
+  const state = S.state;
+  const candidates = sparkCandidates(state);
+  const picked = (S.pick || []).filter((ssh) => candidates.some((candidate) => candidate.ssh === ssh));
+  if (picked.length !== 3) return;
+  const config = JSON.parse(JSON.stringify(state.config));
+  const lead = state.config_exists ? config.cluster.nodes.find((node) => node.local) : null;
+  // The fast-network addresses stay what they were until step 2 fills in the real ones.
+  const peers = config.cluster.nodes.map((node) => node.peer);
+  config.cluster.nodes = [{ ssh: lead?.ssh || state.hostname + ".local", peer: peers[0], local: true }]
+    .concat(picked.map((ssh, index) => ({ ssh, peer: peers[index + 1], local: false })));
+  try {
+    await api("/api/config", { method: "PUT", body: JSON.stringify({ config }) });
+    toast("Saved. Checking the four Sparks…");
+    S.manualHosts = [];
+    await refreshState();
+    paintConfig(S.state.config, S.state.discovery, true);
+    await Promise.all([discover(true), inspect(true)]);
+  } catch (error) {
+    toast("Not saved: " + error.message, true);
+  }
+}
+
+/* Step 2: the fast network */
+
+function railText(rail) {
+  const bits = [rail.netdev, rail.ip + (rail.prefix ? "/" + rail.prefix : "")];
+  if (rail.rate_gbps) bits.push(rail.rate_gbps + " Gb/s");
+  return bits.join(" · ");
+}
+
+function findingsList(findings, config) {
+  if (!findings.length) return "";
+  return '<ul class="findings">' + findings.map((finding) => {
+    const who = finding.rank === null || finding.rank === undefined ? "" : (config.cluster.nodes[finding.rank]?.ssh || "rank " + finding.rank) + ": ";
+    return '<li class="' + esc(finding.severity) + '">' + esc(who + finding.message) + "</li>";
+  }).join("") + "</ul>";
+}
+
+function waitingForCheck() {
+  return '<p class="guide-empty">' + (S.inspectBusy ? "Checking the four Sparks…" : (S.inspectError ? esc(S.inspectError) : "Not checked yet.")) + "</p>" +
+    (S.inspectBusy ? "" : '<div class="guide-actions"><button class="btn" type="button" data-act="check">Check the Sparks</button></div>');
+}
+
+function networkBody(state, model) {
+  const setup = model.setup;
+  if (!setup) return waitingForCheck();
+  const config = state.config;
+  const parts = [];
+  parts.push('<table class="table compact"><thead><tr><th>Spark</th><th>Fast ports</th><th></th></tr></thead><tbody>' +
+    setup.nodes.map((node) => {
+      const problems = setup.findings.filter((finding) => finding.rank === node.rank);
+      const worst = problems.some((finding) => finding.severity === "error") ? "fail" : (problems.length ? "warn" : "ok");
+      const label = !node.reachable ? "Not answering" : worst === "fail" ? "Needs setup" : worst === "warn" ? "Works, see below" : "Ready";
+      const rails = node.rails.length ? node.rails.map((rail) => '<span class="mono">' + esc(railText(rail)) + "</span>").join("<br>") : '<span class="dim">none connected</span>';
+      return '<tr><td><span class="host-name">' + esc(node.hostname || node.ssh) + '</span><span class="host-meta">rank ' + node.rank + "</span></td>" +
+        "<td>" + rails + '</td><td class="num"><span class="ssh-state ' + (worst === "warn" ? "warnish" : worst) + '">' + esc(label) + "</span></td></tr>";
+    }).join("") + "</tbody></table>");
+  parts.push(findingsList(setup.findings, config));
+  for (const node of setup.nodes) {
+    if (!node.network_fix) continue;
+    parts.push(codeBlock("Run on " + esc(node.hostname || node.ssh) + ": sign in there, or first type <code>ssh " + esc(node.ssh) + "</code> in a terminal on this Spark", node.network_fix));
+  }
+  if (setup.nodes.some((node) => node.network_fix)) {
+    parts.push('<p class="guide-note">The commands set each port\'s address and the jumbo frames the fast network needs, and keep them after a restart. Press Check again when they have run.</p>');
+  }
+  const plan = setup.plan;
+  if (plan) {
+    const applied = planApplied(config, plan);
+    parts.push('<p class="guide-note">NCCL will use <code>' + esc(plan.nccl_ib_hca) + "</code> over <code>" + esc(plan.nccl_socket_ifname) + "</code>" +
+      (plan.nccl_ib_gid_index === null || plan.nccl_ib_gid_index === undefined ? "" : ", GID index " + plan.nccl_ib_gid_index) +
+      ", reaching the Sparks at " + esc(plan.peers.join(", ")) + "." + (applied ? " These settings are saved." : "") + "</p>");
+    if (!applied) {
+      parts.push('<div class="guide-actions"><span class="guide-hint"></span><button class="btn btn-primary" type="button" data-act="apply-network">Use these settings</button></div>');
+    }
+  }
+  return parts.join("");
+}
+
+async function applyNetwork() {
+  if (!requireSaved()) return;
+  try {
+    await api("/api/network/apply", { method: "POST" });
+    toast("Network settings saved");
+    await refreshState();
+    paintConfig(S.state.config, S.state.discovery, true);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+/* Steps 3 to 7: jobs */
+
+function progressBar(job, fallback) {
+  const progress = job?.progress;
+  const total = progress?.total || 0;
+  const fraction = total > 0 ? Math.min(1, progress.done / total) : null;
+  const text = progress?.detail || job?.last_line || fallback;
+  const percent = fraction === null ? null : Math.floor(fraction * 100);
+  return '<div class="progress' + (fraction === null ? " indeterminate" : "") + '" role="progressbar" aria-valuemin="0" aria-valuemax="100"' +
+    (percent === null ? "" : ' aria-valuenow="' + percent + '"') + ">" +
+    '<div class="progress-track"><div class="progress-fill" style="width:' + (fraction === null ? 100 : (fraction * 100).toFixed(1)) + '%"></div></div>' +
+    '<div class="progress-text"><span>' + esc(text) + "</span>" + (percent === null ? "" : "<strong>" + percent + "%</strong>") + "</div></div>";
+}
+
+// The last run of a step, when it failed and nothing has run since.
+function failureNote(job, what) {
+  if (!job || job.status !== "failed") return "";
+  return '<p class="note warn">' + esc(what) + " stopped with an error" + (job.last_line ? ": " + esc(job.last_line) : ".") +
+    ' <a href="#activity" data-job-log="' + job.id + '">See the log</a></p>';
+}
+
+const CHECK_TEXT = {
+  software: { ready: "Installed", missing: "Not installed", outdated: "Older version", partial: "Unfinished", unknown: "Unknown" },
+  model: { ready: "Copied", missing: "Not copied", outdated: "Different", partial: "Partly copied", unknown: "Unknown" },
+  converted: { ready: "Prepared", missing: "Not prepared", outdated: "Out of date", partial: "Unfinished", unknown: "Unknown" },
+};
+
+function nodeChips(nodes, field, extra) {
+  return '<div class="chips-row">' + nodes.map((node) => {
+    const value = node[field];
+    // Not there yet is the normal state before a step runs, so only a mismatch is coloured.
+    const cls = value === "ready" ? "ok" : value === "outdated" ? "warnish" : "unknown";
+    const note = extra ? extra(node) : "";
+    return '<div class="node-chip"><span class="host-name">' + esc(node.hostname || node.ssh) + "</span>" +
+      '<span class="ssh-state ' + cls + '">' + esc(note || CHECK_TEXT[field][value] || value) + "</span></div>";
+  }).join("") + "</div>";
+}
+
+function actionRow(button, hint) {
+  return '<div class="guide-actions">' + (hint ? '<span class="guide-hint">' + hint + "</span>" : '<span class="guide-hint"></span>') + button + "</div>";
+}
+
+function softwareBody(state, model) {
+  const setup = model.setup;
+  if (!setup) return waitingForCheck();
+  const lead = setup.nodes[0];
+  if (lead.software !== "ready") {
+    return '<p class="guide-note">This Spark does not have the server built yet. Open a terminal on this Spark and run the setup script; it builds everything and restarts this page.</p>' +
+      codeBlock("Run in a terminal on this Spark", "cd " + state.config.paths.repo_root + "\n./scripts/setup.sh");
+  }
+  const others = setup.nodes.slice(1);
+  const running = model.steps.software.running;
+  const parts = [nodeChips(others, "software")];
+  if (running) {
+    parts.push(progressBar(running, "Connecting…"));
+  } else {
+    parts.push(failureNote(latestJob(ofKind("sync-software")), "The install"));
+    const update = others.some((node) => node.software === "outdated");
+    const label = model.steps.software.done ? "Install again" : update ? "Update" : "Install";
+    parts.push(actionRow('<button class="btn btn-primary" type="button" data-act="install">' + label + "</button>",
+      "Copies the server, its GPU kernels and the NCCL library. Takes about a minute."));
+  }
+  return parts.join("");
+}
+
+function downloadBody(state, model) {
+  const setup = model.setup;
+  if (!setup) return waitingForCheck();
+  const config = state.config;
+  const lead = setup.nodes[0];
+  const parts = [];
+  const explicit = (config.model.checkpoint || "").trim();
+  parts.push('<p class="guide-lead">Model <strong>' + esc(config.model.id) + "</strong>" +
+    ' <a href="#setup" data-act="advanced">change</a></p>');
+  if (explicit) {
+    parts.push('<p class="guide-note">The model is read from <code>' + esc(explicit) + "</code> (set under Advanced settings), so there is nothing to download." +
+      (lead.model === "ready" ? "" : " That folder is missing or incomplete on this Spark.") + "</p>");
+    return parts.join("");
+  }
+  const facts = [];
+  if (lead.model === "ready") facts.push("On this Spark: " + fmtInt(lead.model_files) + " files, " + formatSize(lead.model_bytes));
+  else if (lead.model_bytes > 0) facts.push("Downloaded so far: " + formatSize(lead.model_bytes));
+  if (lead.free_bytes !== null && lead.free_bytes !== undefined) facts.push(formatSize(lead.free_bytes) + " free");
+  if (facts.length) parts.push('<p class="guide-facts">' + esc(facts.join(" · ")) + "</p>");
+  const running = model.steps.download.running;
+  if (running) {
+    parts.push(progressBar(running, "Asking Hugging Face for the file list…"));
+  } else if (lead.model !== "ready") {
+    parts.push(failureNote(latestJob(ofKind("download")), "The download"));
+    const resume = lead.model_bytes > 0;
+    parts.push(actionRow('<button class="btn btn-primary" type="button" data-act="download">' + (resume ? "Resume download" : "Download") + "</button>",
+      "Hundreds of gigabytes take hours. If it stops, press " + (resume ? "Resume" : "Download") + " again and it carries on where it left off."));
+  }
+  return parts.join("");
+}
+
+function copyBody(state, model) {
+  const setup = model.setup;
+  if (!setup) return waitingForCheck();
+  const lead = setup.nodes[0];
+  const others = setup.nodes.slice(1);
+  const running = model.steps.copy.running;
+  const parts = [nodeChips(others, "model", (node) =>
+    node.model === "partial" && lead.model_bytes ? formatSize(node.model_bytes) + " of " + formatSize(lead.model_bytes) : "")];
+  if (running) {
+    parts.push(progressBar(running, "Connecting…"));
+  } else if (!model.steps.copy.done) {
+    parts.push(failureNote(latestJob(ofKind("sync-model")), "The copy"));
+    const fast = model.steps.network.done;
+    parts.push(actionRow('<button class="btn btn-primary" type="button" data-act="copy-model">' + (others.some((node) => node.model_bytes > 0) ? "Finish copying" : "Copy") + "</button>",
+      fast ? "Uses the fast network; files already there are skipped." : "Finish step 2 first to use the fast network; the regular one is much slower."));
+  }
+  return parts.join("");
+}
+
+function convertBody(state, model) {
+  const setup = model.setup;
+  if (!setup) return waitingForCheck();
+  const running = S.jobs.filter((job) => job.status === "running" && isConvert(job));
+  const parts = [nodeChips(setup.nodes, "converted", (node) => {
+    const job = running.find((entry) => entry.kind === "convert-r" + node.rank);
+    return job ? "Preparing, " + fmtDuration(Date.now() - job.started_ms) : "";
+  })];
+  if (running.length > 0) {
+    parts.push(progressBar(null, "All four Sparks are converting their part of the model at the same time."));
+    return parts.join("");
+  }
+  for (const rank of [0, 1, 2, 3]) {
+    parts.push(failureNote(latestJob(ofKind("convert-r" + rank)), "Preparing " + (setup.nodes[rank]?.hostname || "rank " + rank)));
+  }
+  if (model.online) {
+    parts.push('<p class="guide-note">Stop the server (on the Overview page) before preparing the weights again.</p>');
+  } else {
+    const label = model.steps.convert.done ? "Prepare again" : "Prepare the weights";
+    parts.push(actionRow('<button class="btn btn-primary" type="button" data-act="convert">' + label + "</button>",
+      "Each Spark converts its quarter of the model at the same time. This takes a while."));
+  }
+  return parts.join("");
+}
+
+function apiUrl(state) {
+  const bind = state.config.cluster.http_bind || "0.0.0.0:8000";
+  const port = bind.slice(bind.lastIndexOf(":") + 1) || "8000";
+  const host = location.hostname.includes(":") ? "[" + location.hostname + "]" : location.hostname;
+  return "http://" + host + ":" + port + "/v1";
+}
+
+function launchBody(state, model) {
+  const parts = [];
+  const running = model.steps.launch.running;
+  if (model.steps.launch.done) {
+    const url = apiUrl(state);
+    const name = state.cluster?.model || state.config.model.id;
+    parts.push('<p class="guide-lead">The server is running. Point any OpenAI-compatible app at this address:</p>');
+    parts.push(codeBlock("API address", url));
+    parts.push(codeBlock("Try it from a terminal",
+      "curl " + url + "/chat/completions -H 'Content-Type: application/json' \\\n  -d '{\"model\": \"" + name + "\", \"messages\": [{\"role\": \"user\", \"content\": \"Hello!\"}]}'"));
+    parts.push('<p class="guide-note">Speed, requests and memory are on the <a href="#overview">Overview</a> page.</p>');
+    return parts.join("");
+  }
+  if (running || model.online) {
+    parts.push(progressBar(running, "Starting the four Sparks and loading the model. This takes a few minutes."));
+    return parts.join("");
+  }
+  parts.push(failureNote(latestJob(ofKind("launch")), "Starting the server"));
+  parts.push(actionRow('<button class="btn btn-primary" type="button" data-act="launch"><svg><use href="#i-play"/></svg>Start the server</button>',
+    "Loads the model on all four Sparks. It stays running until you stop it on the Overview page."));
+  return parts.join("");
+}
+
+const GUIDE_BODIES = {
+  find: findBody,
+  network: networkBody,
+  software: softwareBody,
+  download: downloadBody,
+  copy: copyBody,
+  convert: convertBody,
+  launch: launchBody,
+};
+
+function guideSummary(key, state, model) {
+  const step = model.steps[key];
+  const setup = model.setup;
+  if (!step.done) {
+    if (!step.available) return "Waits for step " + (GUIDE.indexOf(step.waitsFor) + 1) + ".";
+    return null;
+  }
+  switch (key) {
+    case "find":
+      return state.config.cluster.nodes.map((node) => node.ssh).join(", ");
+    case "network": {
+      const warnings = (setup?.findings || []).length;
+      const lanes = setup ? Math.min(...setup.nodes.map((node) => node.rails.length)) : 0;
+      return lanes + (lanes === 1 ? " lane" : " lanes") + " per Spark" + (warnings ? ", " + warnings + (warnings === 1 ? " warning" : " warnings") : "");
+    }
+    case "software":
+      return "Installed on all four Sparks.";
+    case "download":
+      return setup ? formatSize(setup.nodes[0].model_bytes) + " on this Spark." : "Done.";
+    case "copy":
+      return "On all four Sparks.";
+    case "convert":
+      return "Prepared on all four Sparks.";
+    case "launch":
+      return "Serving at " + apiUrl(state);
+    default:
+      return null;
+  }
+}
+
+function guideTag(key, model) {
+  const step = model.steps[key];
+  if (step.done) return ["Done", "good"];
+  if (step.running || (key === "find" && S.discoveryBusy) || (key === "launch" && model.online)) return ["Working", "run"];
+  if (!step.available) return ["Waiting", ""];
+  return key === model.current ? ["Next", "next"] : ["To do", ""];
+}
+
+function renderGuide() {
+  const state = S.state;
+  if (!state || !state.config) return;
+  const model = guideModel(state);
+  GUIDE.forEach((key) => {
+    const step = model.steps[key];
+    const element = $("g-" + key);
+    // Open: what is left to do, and the last step once the server runs (it has the address).
+    const open = S.guideOpen[key] ?? ((step.available && !step.done) || (key === "launch" && step.done));
+    element.classList.toggle("done", step.done);
+    element.classList.toggle("current", key === model.current);
+    element.classList.toggle("blocked", !step.available);
+    element.classList.toggle("open", open);
+    const [tag, cls] = guideTag(key, model);
+    const tagElement = $("g-" + key + "-tag");
+    tagElement.textContent = tag;
+    tagElement.className = "tag" + (cls ? " " + cls : "");
+    const summary = guideSummary(key, state, model);
+    const summaryElement = $("g-" + key + "-summary");
+    if (!summaryElement.dataset.base) summaryElement.dataset.base = summaryElement.textContent;
+    summaryElement.textContent = summary || summaryElement.dataset.base;
+    // A finished step folds away; its heading opens it again.
+    const head = element.querySelector(".guide-head");
+    if (step.done) {
+      head.tabIndex = 0;
+      head.setAttribute("role", "button");
+      head.setAttribute("aria-expanded", String(open));
+    } else {
+      head.removeAttribute("tabindex");
+      head.removeAttribute("role");
+      head.removeAttribute("aria-expanded");
+    }
+    const body = $("g-" + key + "-body");
+    const html = open ? GUIDE_BODIES[key](state, model) : "";
+    // Never rebuild a step under the cursor of someone typing in it.
+    const active = document.activeElement;
+    const typing = active && active.type === "text" && body.contains(active);
+    if (S.guideHtml[key] !== html && !typing) {
+      S.guideHtml[key] = html;
+      body.innerHTML = html;
+    }
+  });
+  $("setup-banner").classList.toggle("hidden", !model.current || model.online || S.tab === "setup");
+  if (model.current) {
+    $("setup-banner-step").textContent = "Next is step " + (GUIDE.indexOf(model.current) + 1) + ", " + GUIDE_TITLES[model.current].toLowerCase() + ".";
+  }
+}
+
+async function inspect(quiet = false) {
+  if (S.inspectBusy) return;
+  S.inspectBusy = true;
+  S.inspectedFor = JSON.stringify(S.state?.config?.cluster?.nodes || null);
+  const button = $("setup-check");
+  button.classList.add("busy");
+  renderGuide();
+  try {
+    const report = await api("/api/inspect", { method: "POST" });
+    if (S.state) S.state.setup = report;
+    S.inspectError = null;
+  } catch (error) {
+    S.inspectError = error.message;
+    if (!quiet) toast("Could not check the Sparks: " + error.message, true);
+  } finally {
+    S.inspectBusy = false;
+    button.classList.remove("busy");
+    renderGuide();
+  }
+}
+
+// Checks the Sparks again when something changed what they hold: a setup job finished, the
+// configuration names other Sparks than the last check, or the page just opened on an old check.
+function maybeInspect() {
+  const state = S.state;
+  let finished = false;
+  for (const job of S.jobs) {
+    if (S.jobSeen.get(job.id) === "running" && job.status !== "running" && isSetupJob(job.kind)) finished = true;
+    S.jobSeen.set(job.id, job.status);
+  }
+  if (!state || !state.config_exists || state.config_error || S.inspectBusy) return;
+  const nodes = JSON.stringify(state.config.cluster.nodes);
+  const stale = !freshSetup(state) && S.inspectedFor !== nodes;
+  const old = !S.autoInspected && (!state.setup || state.now_ms - state.setup.checked_ms > 120000);
+  S.autoInspected = true;
+  if (finished || stale || old) inspect(true);
+}
+
+function checkAgain() {
+  discover(false);
+  if (S.state?.config_exists) inspect(false);
+}
+
+async function convertAll() {
+  const model = guideModel(S.state);
+  const nodes = model.setup?.nodes || [];
+  const pending = nodes.filter((node) => node.converted !== "ready").map((node) => node.rank);
+  const ranks = pending.length ? pending : [0, 1, 2, 3];
+  if (!pending.length) {
+    const ok = await confirmAction({
+      title: "Prepare the weights again?",
+      body: "Every Spark rewrites its converted weights from the downloaded model. Only needed after changing the model.",
+      ok: "Prepare again",
+    });
+    if (!ok) return;
+  }
+  postAction("/api/actions/convert", { ranks }, false);
+}
+
+function bindGuide() {
+  const guide = $("guide");
+  guide.addEventListener("click", (event) => {
+    const head = event.target.closest(".guide-head");
+    if (head) {
+      const key = head.parentElement.dataset.step;
+      const step = S.state && guideModel(S.state).steps[key];
+      if (step && step.done) {
+        S.guideOpen[key] = !head.parentElement.classList.contains("open");
+        renderGuide();
+      }
+      return;
+    }
+    const copy = event.target.closest("[data-copy]");
+    if (copy) {
+      copyText(copy.dataset.copy);
+      return;
+    }
+    const log = event.target.closest("[data-job-log]");
+    if (log) {
+      S.selectedJob = Number(log.dataset.jobLog);
+      S.jobDetail = null;
+      return;
+    }
+    const action = event.target.closest("[data-act]");
+    if (!action || action.disabled) return;
+    switch (action.dataset.act) {
+      case "scan":
+        discover(false);
+        break;
+      case "add-host": {
+        const input = $("g-manual");
+        const host = input.value.trim();
+        if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(host)) {
+          toast("Type a host name or address, e.g. spark-3.local", true);
+          return;
+        }
+        if (!S.manualHosts.includes(host)) S.manualHosts.push(host);
+        S.pick = (S.pick || []).filter((ssh) => ssh !== host).concat(host);
+        input.value = "";
+        input.blur();
+        renderGuide();
+        break;
+      }
+      case "use-sparks":
+        useSparks();
+        break;
+      case "check":
+        inspect(false);
+        break;
+      case "apply-network":
+        applyNetwork();
+        break;
+      case "install":
+        if (requireSaved()) postAction("/api/actions/sync", { what: "software" }, false);
+        break;
+      case "download":
+        if (requireSaved()) postAction("/api/actions/download", undefined, false);
+        break;
+      case "copy-model":
+        if (requireSaved()) postAction("/api/actions/sync", { what: "model" }, false);
+        break;
+      case "convert":
+        if (requireSaved()) convertAll();
+        break;
+      case "launch":
+        if (requireSaved()) postAction("/api/actions/launch", undefined, false);
+        break;
+      case "advanced":
+        event.preventDefault();
+        $("advanced").open = true;
+        $("advanced").scrollIntoView({ behavior: "smooth", block: "start" });
+        break;
+      default:
+        break;
+    }
+  });
+  guide.addEventListener("change", (event) => {
+    const box = event.target.closest("[data-pick]");
+    if (!box) return;
+    const ssh = box.dataset.pick;
+    const pick = (S.pick || []).filter((entry) => entry !== ssh);
+    S.pick = box.checked ? pick.concat(ssh) : pick;
+    renderGuide();
+  });
+  guide.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && event.target.id === "g-manual") {
+      event.preventDefault();
+      guide.querySelector('[data-act="add-host"]').click();
+    } else if ((event.key === "Enter" || event.key === " ") && event.target.classList.contains("guide-head")) {
+      event.preventDefault();
+      event.target.click();
+    }
+  });
 }
 
 /* Actions */
 
-async function postAction(path, body) {
+// Starts a job. `follow` opens its log; the setup steps pass false and show progress in place.
+async function postAction(path, body, follow = true) {
   try {
     const result = await api(path, {
       method: "POST",
@@ -807,9 +1444,11 @@ async function postAction(path, body) {
     const jobs = (result && Array.isArray(result.jobs)) ? result.jobs : [];
     if (jobs.length > 0) {
       toast(jobs.length === 1 ? jobs[0].label + " started" : jobs.length + " jobs started");
-      S.selectedJob = jobs[0].id;
-      S.jobDetail = null;
-      location.hash = "activity";
+      if (follow) {
+        S.selectedJob = jobs[0].id;
+        S.jobDetail = null;
+        location.hash = "activity";
+      }
     } else {
       toast("Request accepted");
     }
@@ -1220,7 +1859,7 @@ function renderJobs() {
   const container = $("jobs");
   $("job-count").textContent = S.jobs.length;
   if (S.jobs.length === 0) {
-    container.innerHTML = '<p class="empty">No jobs yet. Launch, stop or convert and the output streams here.</p>';
+    container.innerHTML = '<p class="empty">Nothing has run yet. Downloads, copies, conversions and launches show their output here.</p>';
     return;
   }
   if (S.selectedJob === null || !S.jobs.some((job) => job.id === S.selectedJob)) {
@@ -1232,12 +1871,16 @@ function renderJobs() {
     container.dataset.signature = signature;
     container.innerHTML = S.jobs.map((job) => {
       const selected = job.id === S.selectedJob;
-      const sub = job.status + " · " + (job.last_line || job.command);
+      const progress = job.status === "running" ? job.progress : null;
+      const sub = job.status + " · " + (progress?.detail || job.last_line || job.command);
+      const bar = progress && progress.total > 0
+        ? '<span class="job-bar" aria-hidden="true"><span style="width:' + Math.min(100, (progress.done / progress.total) * 100).toFixed(1) + '%"></span></span>'
+        : "";
       return '<div class="job ' + esc(job.status) + (selected ? " selected" : "") + '" data-job="' + job.id + '" tabindex="0" role="option" aria-selected="' + selected + '">' +
         '<span class="job-dot" aria-hidden="true"></span>' +
         '<span class="job-title">' + esc(job.label) + "</span>" +
         '<span class="job-time">' + esc(fmtClock(job.started_ms, true)) + "</span>" +
-        '<span class="job-sub" title="' + esc(job.command) + '">' + esc(sub) + "</span></div>";
+        '<span class="job-sub" title="' + esc(job.command) + '">' + esc(sub) + "</span>" + bar + "</div>";
     }).join("");
     for (const element of container.querySelectorAll("[data-job]")) {
       const id = Number(element.dataset.job);
@@ -1305,8 +1948,8 @@ function bindEvents() {
   $("save-config").addEventListener("click", saveConfig);
   $("discard-config").addEventListener("click", discardConfig);
   $("reload-config").addEventListener("click", reloadConfig);
-  $("discover").addEventListener("click", () => discover(false));
-  $("copy-fix").addEventListener("click", () => copyText($("fix-command").textContent));
+  $("setup-check").addEventListener("click", checkAgain);
+  bindGuide();
   $("copy-command").addEventListener("click", (event) => copyText(event.currentTarget.dataset.command || ""));
 
   $("action-launch").addEventListener("click", async () => {
@@ -1332,15 +1975,6 @@ function bindEvents() {
   });
   $("action-status").addEventListener("click", () => {
     if (requireSaved()) postAction("/api/actions/status");
-  });
-  $("action-convert").addEventListener("click", async () => {
-    if (!requireSaved()) return;
-    const ok = await confirmAction({
-      title: "Convert all four ranks?",
-      body: "Rewrites every node's converted weights from the checkpoint. It takes several minutes per rank and the cluster must stay stopped until all four finish.",
-      ok: "Convert all ranks",
-    });
-    if (ok) postAction("/api/actions/convert", { ranks: [0, 1, 2, 3] });
   });
 
   $("rescan-models").addEventListener("click", () => loadModels());

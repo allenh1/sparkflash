@@ -63,6 +63,10 @@ limitations under the License.
         <svg class="banner-icon"><use href="#i-alert"/></svg>
         <div><strong>Rank 0 reports the device loop is not making progress.</strong> <span id="health-reason"></span></div>
       </div>
+      <div id="setup-banner" class="banner info hidden">
+        <svg class="banner-icon"><use href="#i-bolt"/></svg>
+        <div><strong>Setup isn't finished.</strong> <span id="setup-banner-step"></span> <a href="#setup">Continue setup</a></div>
+      </div>
       <div id="config-error" class="banner bad hidden" role="alert">
         <svg class="banner-icon"><use href="#i-alert"/></svg>
         <div id="config-error-text"></div>
@@ -194,164 +198,216 @@ limitations under the License.
       <div class="page-head">
         <div>
           <h1 id="setup-title">Setup</h1>
-          <p class="page-sub"><span id="config-path">loading configuration…</span> <span class="tag" id="config-exists">not saved yet</span></p>
+          <p class="page-sub" id="setup-sub">Seven steps from four Sparks to a running server. Every step checks itself, so you can close this page and come back.</p>
         </div>
         <div class="actions">
-          <button id="reload-config" class="btn" type="button"><svg><use href="#i-refresh"/></svg>Reload file</button>
-          <button id="action-convert" class="btn" type="button"><svg><use href="#i-convert"/></svg>Convert all ranks</button>
+          <button id="setup-check" class="btn" type="button"><svg><use href="#i-refresh"/></svg><span>Check again</span></button>
         </div>
       </div>
 
-      <div class="setup-grid">
-        <form id="config-form" class="panel form" autocomplete="off" spellcheck="false">
-          <fieldset>
-            <legend>Model and runtime</legend>
-            <div class="fields">
-              <div class="field span-2">
-                <span id="model-id-label">Model <em>Hugging Face ID, from the cache on the lead node</em></span>
-                <div class="input-row">
-                  <select id="model-id" aria-labelledby="model-id-label" aria-describedby="model-source"></select>
-                  <button id="rescan-models" class="btn btn-icon" type="button" title="Rescan the Hugging Face cache" aria-label="Rescan the Hugging Face cache"><svg><use href="#i-refresh"/></svg></button>
-                </div>
-                <small id="model-source" class="model-source">Reading the Hugging Face cache…</small>
-              </div>
-              <label class="field">
-                <span>Architecture</span>
-                <select id="model-weights"></select>
-                <small>The weight format the engine loads.</small>
-              </label>
-              <label class="field">
-                <span>Engine</span>
-                <select id="engine-kind"></select>
-                <small>Only the TP=4 device engine ships today.</small>
-              </label>
-              <label class="field">
-                <span>Max context <em>tokens</em></span>
-                <input id="max-context" type="number" min="1" max="1048576" step="1" required>
-                <div class="chips" aria-label="Context presets">
-                  <button class="chip" type="button" data-context="131072">128K</button>
-                  <button class="chip" type="button" data-context="262144">256K</button>
-                  <button class="chip" type="button" data-context="524288">512K</button>
-                  <button class="chip" type="button" data-context="1048576">1M</button>
-                </div>
-              </label>
-              <label class="field">
-                <span>Max concurrency <em>sequences</em></span>
-                <input id="max-concurrency" type="number" min="1" max="32" step="1" required>
-                <small>Sets <code>SPARKFLASH_LANES</code>; 32 is the engine's design point.</small>
-              </label>
+      <ol class="guide" id="guide" aria-label="Setup steps">
+        <li class="guide-step" id="g-find" data-step="find">
+          <div class="guide-head">
+            <span class="guide-num" aria-hidden="true">1</span>
+            <div class="guide-title">
+              <h2>Find your Sparks</h2>
+              <p class="guide-summary" id="g-find-summary">Pick the three Sparks that work with this one.</p>
             </div>
-          </fieldset>
-
-          <fieldset>
-            <legend>Nodes <small>Rank order is launch order.</small></legend>
-            <div class="table-wrap">
-              <table class="table nodes">
-                <thead><tr><th>Rank</th><th>SSH host</th><th>RoCE peer</th><th>Lead</th><th>SSH</th><th></th></tr></thead>
-                <tbody id="node-rows"></tbody>
-              </table>
-            </div>
-            <div class="fields three">
-              <label class="field">
-                <span>SSH user</span>
-                <input id="ssh-user" type="text" placeholder="current user">
-              </label>
-              <label class="field">
-                <span>Rank 0 HTTP bind</span>
-                <input id="http-bind" type="text" placeholder="0.0.0.0:8000">
-              </label>
-              <label class="field">
-                <span>Collective base port</span>
-                <input id="base-port" type="number" min="1" max="65535">
-              </label>
-            </div>
-          </fieldset>
-
-          <details class="section">
-            <summary>Paths on every node</summary>
-            <div class="fields">
-              <label class="field span-2"><span>Checkout root</span><input id="repo-root" type="text"></label>
-              <label class="field"><span>Server binary</span><input id="binary" type="text"></label>
-              <label class="field"><span>Launcher script</span><input id="serve-script" type="text"></label>
-              <label class="field span-2"><span>Checkpoint <em>empty uses the model's snapshot in the Hugging Face cache</em></span><input id="checkpoint" type="text"></label>
-              <label class="field span-2"><span>Hugging Face cache <em>empty uses HF_HUB_CACHE or ~/.cache/huggingface/hub</em></span><input id="hub-cache" type="text"></label>
-              <label class="field span-2"><span>Tokenizer <em>empty derives it from the checkpoint</em></span><input id="tokenizer" type="text"></label>
-              <label class="field"><span>Converted weights</span><input id="converted-dir" type="text"></label>
-              <label class="field"><span>Kernel cubins</span><input id="cubins" type="text"></label>
-              <label class="field"><span>NCCL library directory</span><input id="nccl-lib" type="text" placeholder="system NCCL when empty"></label>
-              <label class="field"><span>Remote log root</span><input id="log-root" type="text"></label>
-            </div>
-          </details>
-
-          <details class="section">
-            <summary>Fabric and SSH</summary>
-            <div class="fields">
-              <label class="field"><span>NCCL_IB_HCA</span><input id="nccl-ib-hca" type="text" placeholder="e.g. rocep1s0f1,roceP2p1s0f1"></label>
-              <label class="field"><span>NCCL_SOCKET_IFNAME</span><input id="nccl-socket-ifname" type="text" placeholder="e.g. enp1s0f1np1"></label>
-              <label class="field"><span>NCCL_IB_GID_INDEX</span><input id="nccl-gid" type="number" min="0" max="65535"></label>
-              <label class="field"><span>SSH probe timeout <em>seconds</em></span><input id="ssh-timeout" type="number" min="1" max="60"></label>
-              <label class="field span-2"><span>Extra SSH options <em>one argument per line</em></span><textarea id="ssh-options" rows="4"></textarea></label>
-              <label class="field span-2"><span>Extra rank environment <em>KEY=VALUE per line</em></span><textarea id="extra-env" rows="3" placeholder="NCCL_NET_GDR_LEVEL=5"></textarea></label>
-            </div>
-          </details>
-
-          <details class="section">
-            <summary>Control plane and telemetry</summary>
-            <div class="fields">
-              <label class="field"><span>Web bind <em>restart to apply</em></span><input id="web-bind" type="text"></label>
-              <label class="field"><span>Rank 0 serve URL</span><input id="serve-url" type="text"></label>
-              <label class="field span-2"><span>Extra allowed host names <em>one per line, e.g. a reverse proxy's</em></span><textarea id="allowed-hosts" rows="2"></textarea></label>
-              <label class="field"><span>Discovery timeout <em>seconds</em></span><input id="discovery-timeout" type="number" min="1" max="60"></label>
-              <label class="field"><span>Sample interval <em>seconds</em></span><input id="stats-interval" type="number" min="1" max="300"></label>
-              <label class="field"><span>History retention <em>seconds</em></span><input id="stats-retention" type="number" min="60"></label>
-              <label class="field"><span>Idle flush interval <em>seconds</em></span><input id="stats-flush" type="number" min="1"></label>
-              <label class="field span-2"><span>Telemetry snapshot path</span><input id="stats-path" type="text"></label>
-              <label class="check span-2"><input id="advertise" type="checkbox"><span>Advertise this lead node over mDNS</span></label>
-            </div>
-          </details>
-
-          <div class="savebar" id="savebar" aria-live="polite">
-            <span class="savebar-text">Unsaved changes</span>
-            <button id="discard-config" class="btn btn-ghost" type="button">Discard</button>
-            <button id="save-config" class="btn btn-primary" type="button">Save configuration</button>
+            <span class="tag" id="g-find-tag"></span>
           </div>
-        </form>
+          <div class="guide-body" id="g-find-body"></div>
+        </li>
+        <li class="guide-step" id="g-network" data-step="network">
+          <div class="guide-head">
+            <span class="guide-num" aria-hidden="true">2</span>
+            <div class="guide-title">
+              <h2>Connect the fast network</h2>
+              <p class="guide-summary" id="g-network-summary">Check the cables between the Sparks and set up their fast ports.</p>
+            </div>
+            <span class="tag" id="g-network-tag"></span>
+          </div>
+          <div class="guide-body" id="g-network-body"></div>
+        </li>
+        <li class="guide-step" id="g-software" data-step="software">
+          <div class="guide-head">
+            <span class="guide-num" aria-hidden="true">3</span>
+            <div class="guide-title">
+              <h2>Install on the other Sparks</h2>
+              <p class="guide-summary" id="g-software-summary">Copy the server program from this Spark to the others.</p>
+            </div>
+            <span class="tag" id="g-software-tag"></span>
+          </div>
+          <div class="guide-body" id="g-software-body"></div>
+        </li>
+        <li class="guide-step" id="g-download" data-step="download">
+          <div class="guide-head">
+            <span class="guide-num" aria-hidden="true">4</span>
+            <div class="guide-title">
+              <h2>Download the model</h2>
+              <p class="guide-summary" id="g-download-summary">Fetch the model from Hugging Face onto this Spark.</p>
+            </div>
+            <span class="tag" id="g-download-tag"></span>
+          </div>
+          <div class="guide-body" id="g-download-body"></div>
+        </li>
+        <li class="guide-step" id="g-copy" data-step="copy">
+          <div class="guide-head">
+            <span class="guide-num" aria-hidden="true">5</span>
+            <div class="guide-title">
+              <h2>Copy the model to the other Sparks</h2>
+              <p class="guide-summary" id="g-copy-summary">Send the model over the fast network, so it is downloaded only once.</p>
+            </div>
+            <span class="tag" id="g-copy-tag"></span>
+          </div>
+          <div class="guide-body" id="g-copy-body"></div>
+        </li>
+        <li class="guide-step" id="g-convert" data-step="convert">
+          <div class="guide-head">
+            <span class="guide-num" aria-hidden="true">6</span>
+            <div class="guide-title">
+              <h2>Prepare the weights</h2>
+              <p class="guide-summary" id="g-convert-summary">Each Spark converts its quarter of the model for the GPU.</p>
+            </div>
+            <span class="tag" id="g-convert-tag"></span>
+          </div>
+          <div class="guide-body" id="g-convert-body"></div>
+        </li>
+        <li class="guide-step" id="g-launch" data-step="launch">
+          <div class="guide-head">
+            <span class="guide-num" aria-hidden="true">7</span>
+            <div class="guide-title">
+              <h2>Start the server</h2>
+              <p class="guide-summary" id="g-launch-summary">Load the model on all four Sparks and answer requests.</p>
+            </div>
+            <span class="tag" id="g-launch-tag"></span>
+          </div>
+          <div class="guide-body" id="g-launch-body"></div>
+        </li>
+      </ol>
 
-        <aside class="setup-side">
-          <section class="panel">
-            <div class="panel-head">
-              <div><h2>Bring-up</h2><p class="panel-sub">One-time steps before the first launch.</p></div>
-              <span class="tag" id="setup-progress">0 / 4</span>
-            </div>
-            <ol class="steps">
-              <li id="step-config"><span class="step-mark"></span><div><strong>Save the configuration</strong><small>Writes the TOML on this node.</small></div></li>
-              <li id="step-ssh"><span class="step-mark"></span><div><strong>Prove passwordless SSH</strong><small>Every rank answers a batch-mode login.</small></div></li>
-              <li id="step-convert"><span class="step-mark"></span><div><strong>Convert each rank</strong><small>Once per checkpoint, with the cluster stopped.</small></div></li>
-              <li id="step-launch"><span class="step-mark"></span><div><strong>Launch and wait for ready</strong><small>Rank 0 answers on its serve URL.</small></div></li>
-            </ol>
-          </section>
-
-          <section class="panel">
-            <div class="panel-head">
-              <div><h2>Discovery</h2><p class="panel-sub">mDNS finds candidates; an SSH probe proves the login.</p></div>
-              <button id="discover" class="btn btn-sm" type="button"><svg><use href="#i-search"/></svg><span>Scan</span></button>
-            </div>
-            <div class="table-wrap">
-              <table class="table discovery">
-                <thead><tr><th>Host</th><th>Address</th><th>SSH</th><th></th></tr></thead>
-                <tbody id="discovery-rows"><tr><td colspan="4" class="empty">No scan yet.</td></tr></tbody>
-              </table>
-            </div>
-            <div id="fix-wrap" class="codeblock hidden">
-              <div class="codeblock-head">
-                <span>Run on this node to enable passwordless SSH</span>
-                <button id="copy-fix" class="btn btn-ghost btn-xs" type="button"><svg><use href="#i-copy"/></svg>Copy</button>
+      <details class="advanced" id="advanced">
+        <summary>
+          <span>Advanced settings</span>
+          <small><span id="config-path">loading configuration…</span> <span class="tag" id="config-exists">not saved yet</span></small>
+        </summary>
+        <div class="advanced-actions">
+          <p>Everything the steps above set, and the rest of the configuration file. Most setups never need to change these.</p>
+          <button id="reload-config" class="btn btn-sm" type="button"><svg><use href="#i-refresh"/></svg>Reload file</button>
+        </div>
+          <form id="config-form" class="panel form" autocomplete="off" spellcheck="false">
+            <fieldset>
+              <legend>Model and runtime</legend>
+              <div class="fields">
+                <div class="field span-2">
+                  <span id="model-id-label">Model <em>Hugging Face ID, from the cache on the lead node</em></span>
+                  <div class="input-row">
+                    <select id="model-id" aria-labelledby="model-id-label" aria-describedby="model-source"></select>
+                    <button id="rescan-models" class="btn btn-icon" type="button" title="Rescan the Hugging Face cache" aria-label="Rescan the Hugging Face cache"><svg><use href="#i-refresh"/></svg></button>
+                  </div>
+                  <small id="model-source" class="model-source">Reading the Hugging Face cache…</small>
+                </div>
+                <label class="field">
+                  <span>Architecture</span>
+                  <select id="model-weights"></select>
+                  <small>The weight format the engine loads.</small>
+                </label>
+                <label class="field">
+                  <span>Engine</span>
+                  <select id="engine-kind"></select>
+                  <small>Only the TP=4 device engine ships today.</small>
+                </label>
+                <label class="field">
+                  <span>Max context <em>tokens</em></span>
+                  <input id="max-context" type="number" min="1" max="1048576" step="1" required>
+                  <div class="chips" aria-label="Context presets">
+                    <button class="chip" type="button" data-context="131072">128K</button>
+                    <button class="chip" type="button" data-context="262144">256K</button>
+                    <button class="chip" type="button" data-context="524288">512K</button>
+                    <button class="chip" type="button" data-context="1048576">1M</button>
+                  </div>
+                </label>
+                <label class="field">
+                  <span>Max concurrency <em>sequences</em></span>
+                  <input id="max-concurrency" type="number" min="1" max="32" step="1" required>
+                  <small>Sets <code>SPARKFLASH_LANES</code>; 32 is the engine's design point.</small>
+                </label>
               </div>
-              <pre id="fix-command"></pre>
+            </fieldset>
+
+            <fieldset>
+              <legend>Nodes <small>Rank order is launch order.</small></legend>
+              <div class="table-wrap">
+                <table class="table nodes">
+                  <thead><tr><th>Rank</th><th>SSH host</th><th>Fast-network IP</th><th>This Spark</th><th>SSH</th><th></th></tr></thead>
+                  <tbody id="node-rows"></tbody>
+                </table>
+              </div>
+              <div class="fields three">
+                <label class="field">
+                  <span>SSH user</span>
+                  <input id="ssh-user" type="text" placeholder="current user">
+                </label>
+                <label class="field">
+                  <span>Rank 0 HTTP bind</span>
+                  <input id="http-bind" type="text" placeholder="0.0.0.0:8000">
+                </label>
+                <label class="field">
+                  <span>Collective base port</span>
+                  <input id="base-port" type="number" min="1" max="65535">
+                </label>
+              </div>
+            </fieldset>
+
+            <details class="section">
+              <summary>Paths on every node</summary>
+              <div class="fields">
+                <label class="field span-2"><span>Checkout root</span><input id="repo-root" type="text"></label>
+                <label class="field"><span>Server binary</span><input id="binary" type="text"></label>
+                <label class="field"><span>Launcher script</span><input id="serve-script" type="text"></label>
+                <label class="field span-2"><span>Checkpoint <em>empty uses the model's snapshot in the Hugging Face cache</em></span><input id="checkpoint" type="text"></label>
+                <label class="field span-2"><span>Hugging Face cache <em>empty uses HF_HUB_CACHE or ~/.cache/huggingface/hub</em></span><input id="hub-cache" type="text"></label>
+                <label class="field span-2"><span>Tokenizer <em>empty derives it from the checkpoint</em></span><input id="tokenizer" type="text"></label>
+                <label class="field"><span>Converted weights</span><input id="converted-dir" type="text"></label>
+                <label class="field"><span>Kernel cubins</span><input id="cubins" type="text"></label>
+                <label class="field"><span>NCCL library directory</span><input id="nccl-lib" type="text" placeholder="system NCCL when empty"></label>
+                <label class="field"><span>Remote log root</span><input id="log-root" type="text"></label>
+              </div>
+            </details>
+
+            <details class="section">
+              <summary>Fabric and SSH</summary>
+              <div class="fields">
+                <label class="field"><span>NCCL_IB_HCA</span><input id="nccl-ib-hca" type="text" placeholder="e.g. rocep1s0f1,roceP2p1s0f1"></label>
+                <label class="field"><span>NCCL_SOCKET_IFNAME</span><input id="nccl-socket-ifname" type="text" placeholder="e.g. enp1s0f1np1"></label>
+                <label class="field"><span>NCCL_IB_GID_INDEX</span><input id="nccl-gid" type="number" min="0" max="65535"></label>
+                <label class="field"><span>SSH probe timeout <em>seconds</em></span><input id="ssh-timeout" type="number" min="1" max="60"></label>
+                <label class="field span-2"><span>Extra SSH options <em>one argument per line</em></span><textarea id="ssh-options" rows="4"></textarea></label>
+                <label class="field span-2"><span>Extra rank environment <em>KEY=VALUE per line</em></span><textarea id="extra-env" rows="3" placeholder="NCCL_NET_GDR_LEVEL=5"></textarea></label>
+              </div>
+            </details>
+
+            <details class="section">
+              <summary>Control plane and telemetry</summary>
+              <div class="fields">
+                <label class="field"><span>Web bind <em>restart to apply</em></span><input id="web-bind" type="text"></label>
+                <label class="field"><span>Rank 0 serve URL</span><input id="serve-url" type="text"></label>
+                <label class="field span-2"><span>Extra allowed host names <em>one per line, e.g. a reverse proxy's</em></span><textarea id="allowed-hosts" rows="2"></textarea></label>
+                <label class="field"><span>Discovery timeout <em>seconds</em></span><input id="discovery-timeout" type="number" min="1" max="60"></label>
+                <label class="field"><span>Sample interval <em>seconds</em></span><input id="stats-interval" type="number" min="1" max="300"></label>
+                <label class="field"><span>History retention <em>seconds</em></span><input id="stats-retention" type="number" min="60"></label>
+                <label class="field"><span>Idle flush interval <em>seconds</em></span><input id="stats-flush" type="number" min="1"></label>
+                <label class="field span-2"><span>Telemetry snapshot path</span><input id="stats-path" type="text"></label>
+                <label class="check span-2"><input id="advertise" type="checkbox"><span>Advertise this lead node over mDNS</span></label>
+              </div>
+            </details>
+
+            <div class="savebar" id="savebar" aria-live="polite">
+              <span class="savebar-text">Unsaved changes</span>
+              <button id="discard-config" class="btn btn-ghost" type="button">Discard</button>
+              <button id="save-config" class="btn btn-primary" type="button">Save configuration</button>
             </div>
-          </section>
-        </aside>
-      </div>
+          </form>
+      </details>
     </section>
 
     <!-- Activity -->
@@ -359,7 +415,7 @@ limitations under the License.
       <div class="page-head">
         <div>
           <h1 id="activity-title">Activity</h1>
-          <p class="page-sub">Launches, stops, status checks and conversions started from this console. Logs keep the last 400 lines.</p>
+          <p class="page-sub">Everything started from this console: downloads, copies, conversions, launches and stops. Logs keep the last 400 lines.</p>
         </div>
       </div>
       <div class="activity-grid">

@@ -20,8 +20,9 @@
 //! cannot drift apart.
 //!
 //! Relative paths are resolved against [`PathsConfig::repo_root`], which is itself resolved
-//! against the process working directory. This keeps a checkout-relative sample useful while
-//! still accepting the absolute paths a production install uses.
+//! against the process working directory, and a leading `~/` is the home directory of the account
+//! the control plane runs as. Every command is built with the resulting absolute paths, which must
+//! name the same place on all four nodes: use the same account name on every Spark.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -134,8 +135,8 @@ impl Default for ModelConfig {
             checkpoint: String::new(),
             hub_cache: String::new(),
             tokenizer: String::new(),
-            converted_dir: "/data/sparkflash-conv".to_owned(),
-            cubins: "/opt/sparkflash/cubins".to_owned(),
+            converted_dir: "~/sparkflash/converted".to_owned(),
+            cubins: "target/cubins".to_owned(),
         }
     }
 }
@@ -251,7 +252,8 @@ pub struct PathsConfig {
     pub binary: String,
     /// The four-node launcher, relative to `repo_root` or absolute.
     pub serve_script: String,
-    /// The directory holding `libnccl.so.2`, empty when NCCL is installed system-wide.
+    /// The directory holding `libnccl.so.2` (`scripts/fetch-nccl.sh` fills `target/deps/nccl`),
+    /// empty when NCCL is installed system-wide.
     pub nccl_lib: String,
     /// The remote log directory (`SPARKFLASH_LOG_ROOT`).
     pub log_root: String,
@@ -263,7 +265,7 @@ impl Default for PathsConfig {
             repo_root: ".".to_owned(),
             binary: "target/release/sparkflash".to_owned(),
             serve_script: "scripts/serve-four-node.sh".to_owned(),
-            nccl_lib: String::new(),
+            nccl_lib: "target/deps/nccl".to_owned(),
             log_root: "target/serve-tp4".to_owned(),
         }
     }
@@ -576,7 +578,7 @@ impl SparkConfig {
         if self.model.hub_cache.trim().is_empty() {
             crate::hf::default_cache_dir()
         } else {
-            Some(PathBuf::from(&self.model.hub_cache))
+            Some(self.node_path(&self.model.hub_cache))
         }
     }
 
@@ -588,7 +590,7 @@ impl SparkConfig {
     /// When the checkpoint is left to the cache and the model is not in it.
     pub fn resolve_checkpoint(&self) -> Result<PathBuf, ConfigError> {
         if !self.model.checkpoint.trim().is_empty() {
-            return Ok(PathBuf::from(&self.model.checkpoint));
+            return Ok(self.node_path(&self.model.checkpoint));
         }
         let cache = self.hub_cache_dir().ok_or_else(|| {
             ConfigError::new(
@@ -617,34 +619,66 @@ impl SparkConfig {
     #[must_use]
     pub fn effective_tokenizer(&self) -> PathBuf {
         if self.model.tokenizer.trim().is_empty() {
-            Path::new(&self.model.checkpoint).join("tokenizer.json")
+            self.node_path(&self.model.checkpoint)
+                .join("tokenizer.json")
         } else {
-            PathBuf::from(&self.model.tokenizer)
+            self.node_path(&self.model.tokenizer)
         }
     }
 
-    /// The checkout root on the lead node.
+    /// The checkout root, absolute: `.` is the directory the control plane was started in.
     #[must_use]
     pub fn repo_root(&self) -> PathBuf {
-        PathBuf::from(&self.paths.repo_root)
+        let root = expand_home(&self.paths.repo_root);
+        std::path::absolute(&root).unwrap_or(root)
+    }
+
+    /// A configured path as every node sees it: `~/` expanded, a relative path under the checkout.
+    #[must_use]
+    pub fn node_path(&self, value: &str) -> PathBuf {
+        let path = expand_home(value);
+        if path.is_absolute() {
+            path
+        } else {
+            self.repo_root().join(path)
+        }
     }
 
     /// The binary path, resolved against `repo_root` when it is relative.
     #[must_use]
     pub fn binary_path(&self) -> PathBuf {
-        resolve_against(&self.repo_root(), &self.paths.binary)
+        self.node_path(&self.paths.binary)
     }
 
     /// The launcher script path, resolved against `repo_root` when it is relative.
     #[must_use]
     pub fn serve_script_path(&self) -> PathBuf {
-        resolve_against(&self.repo_root(), &self.paths.serve_script)
+        self.node_path(&self.paths.serve_script)
     }
 
     /// The telemetry file path, resolved against `repo_root` when it is relative.
     #[must_use]
     pub fn stats_path(&self) -> PathBuf {
-        resolve_against(&self.repo_root(), &self.stats.persist_path)
+        self.node_path(&self.stats.persist_path)
+    }
+
+    /// The converted weights directory.
+    #[must_use]
+    pub fn converted_path(&self) -> PathBuf {
+        self.node_path(&self.model.converted_dir)
+    }
+
+    /// The kernel cubin directory.
+    #[must_use]
+    pub fn cubins_path(&self) -> PathBuf {
+        self.node_path(&self.model.cubins)
+    }
+
+    /// The directory holding `libnccl.so.2`, when one is configured.
+    #[must_use]
+    pub fn nccl_lib_path(&self) -> Option<PathBuf> {
+        let value = self.paths.nccl_lib.trim();
+        (!value.is_empty()).then(|| self.node_path(value))
     }
 
     /// The environment the four-node launcher receives.
@@ -675,7 +709,7 @@ impl SparkConfig {
         );
         env.insert(
             "SPARKFLASH_CHECKPOINT".to_owned(),
-            self.model.checkpoint.clone(),
+            self.node_path(&self.model.checkpoint).display().to_string(),
         );
         env.insert(
             "SPARKFLASH_TOKENIZER".to_owned(),
@@ -683,7 +717,7 @@ impl SparkConfig {
         );
         env.insert(
             "SPARKFLASH_CONVERTED_DIR".to_owned(),
-            self.model.converted_dir.clone(),
+            self.converted_path().display().to_string(),
         );
         env.insert(
             "SPARKFLASH_HTTP_BIND".to_owned(),
@@ -695,9 +729,7 @@ impl SparkConfig {
         );
         env.insert(
             "SPARKFLASH_LOG_ROOT".to_owned(),
-            resolve_against(&self.repo_root(), &self.paths.log_root)
-                .display()
-                .to_string(),
+            self.node_path(&self.paths.log_root).display().to_string(),
         );
         env.insert(
             "SPARKFLASH_TP4_BASE_PORT".to_owned(),
@@ -729,12 +761,15 @@ impl SparkConfig {
             env.insert("SPARK_LOCAL_RANKS".to_owned(), local_ranks.join(" "));
         }
         if self.engine.device && !self.model.cubins.trim().is_empty() {
-            env.insert("SPARKFLASH_CUBINS".to_owned(), self.model.cubins.clone());
+            env.insert(
+                "SPARKFLASH_CUBINS".to_owned(),
+                self.cubins_path().display().to_string(),
+            );
         }
-        if !self.paths.nccl_lib.trim().is_empty() {
+        if let Some(nccl_lib) = self.nccl_lib_path() {
             env.insert(
                 "SPARKFLASH_NCCL_LIB".to_owned(),
-                self.paths.nccl_lib.clone(),
+                nccl_lib.display().to_string(),
             );
         }
         if !self.network.nccl_ib_hca.trim().is_empty() {
@@ -770,6 +805,19 @@ impl SparkConfig {
         } else {
             format!("{}@{host}", self.cluster.ssh_user)
         }
+    }
+}
+
+/// `path` with a leading `~/` (or a bare `~`) replaced by `$HOME`.
+#[must_use]
+pub fn expand_home(path: &str) -> PathBuf {
+    let home = || std::env::var_os("HOME").map(PathBuf::from);
+    if path == "~" {
+        return home().unwrap_or_else(|| PathBuf::from(path));
+    }
+    match (path.strip_prefix("~/"), home()) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => PathBuf::from(path),
     }
 }
 
@@ -1018,6 +1066,45 @@ mod tests {
             config.binary_path(),
             PathBuf::from("/usr/local/bin/sparkflash")
         );
+    }
+
+    #[test]
+    fn node_paths_are_absolute_with_home_expanded() {
+        let home = std::env::var("HOME").expect("HOME is set for tests");
+        let mut config = SparkConfig::default();
+        config.paths.repo_root = "/srv/sparkflash".to_owned();
+        assert_eq!(
+            config.converted_path(),
+            Path::new(&home).join("sparkflash/converted")
+        );
+        assert_eq!(
+            config.cubins_path(),
+            PathBuf::from("/srv/sparkflash/target/cubins")
+        );
+        assert_eq!(
+            config.nccl_lib_path(),
+            Some(PathBuf::from("/srv/sparkflash/target/deps/nccl"))
+        );
+        let env = config.launch_env();
+        assert_eq!(
+            env["SPARKFLASH_CONVERTED_DIR"],
+            Path::new(&home)
+                .join("sparkflash/converted")
+                .display()
+                .to_string()
+        );
+        assert_eq!(env["SPARKFLASH_CUBINS"], "/srv/sparkflash/target/cubins");
+        assert_eq!(
+            env["SPARKFLASH_NCCL_LIB"],
+            "/srv/sparkflash/target/deps/nccl"
+        );
+
+        config.paths.repo_root = ".".to_owned();
+        let cwd = std::env::current_dir().expect("cwd");
+        assert_eq!(config.repo_root(), cwd);
+        assert_eq!(config.binary_path(), cwd.join("target/release/sparkflash"));
+        assert_eq!(expand_home("~"), PathBuf::from(&home));
+        assert_eq!(expand_home("~other/x"), PathBuf::from("~other/x"));
     }
 
     #[test]

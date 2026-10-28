@@ -138,6 +138,16 @@ pub struct ProbeOutcome {
 pub trait SshProbe: Send + Sync {
     /// Runs one probe command and reports its outcome.
     fn probe(&self, command: &CommandSpec) -> ProbeOutcome;
+
+    /// Runs one read-only command and returns its standard output, killing it after `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Why the command did not run or exited non-zero, from its standard error when it said.
+    fn capture(&self, command: &CommandSpec, timeout: Duration) -> Result<String, String> {
+        let _ = (command, timeout);
+        Err("this probe cannot run commands".to_owned())
+    }
 }
 
 /// The production probe: spawn `ssh` with a batch-mode command.
@@ -170,6 +180,58 @@ impl SshProbe for CommandSshProbe {
                 ok: false,
                 message: format!("cannot run {}: {error}", command.program),
             },
+        }
+    }
+
+    fn capture(&self, command: &CommandSpec, timeout: Duration) -> Result<String, String> {
+        let mut child = std::process::Command::new(&command.program)
+            .args(&command.args)
+            .envs(&command.env)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("cannot run {}: {error}", command.program))?;
+        // Drain both pipes on their own threads so a chatty command cannot block on a full pipe
+        // while this thread waits for it to exit.
+        let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut text = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut text);
+                }
+                String::from_utf8_lossy(&text).into_owned()
+            })
+        };
+        let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as _));
+        let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as _));
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+            }
+        };
+        let out = stdout.join().unwrap_or_default();
+        let err = stderr.join().unwrap_or_default();
+        match status {
+            Some(status) if status.success() => Ok(out),
+            Some(status) => {
+                let detail = err.trim();
+                Err(if detail.is_empty() {
+                    format!("{} exited with {status}", command.program)
+                } else {
+                    truncate(detail, 300)
+                })
+            }
+            None => Err(format!("no answer within {} seconds", timeout.as_secs())),
         }
     }
 }
@@ -353,13 +415,15 @@ pub fn report_nodes(
         if let Some(candidate) = existing {
             candidate.discovered = Some(node.clone());
         } else {
-            // A discovered host's SSH target must be resolvable without relying on the same
-            // mDNS query that found it: prefer the A record, then the `.local` name.
-            let ssh = node
-                .addresses
-                .first()
-                .cloned()
-                .unwrap_or_else(|| format!("{normalized}.local"));
+            // A discovered host is named `<host>.local`: the name survives a DHCP address
+            // change, DGX OS resolves it through nss-mdns, and it is the name scripts/setup.sh
+            // copies the SSH key to, so the host key it accepted matches. Without a host name,
+            // the A record.
+            let ssh = if normalized.is_empty() {
+                node.addresses.first().cloned().unwrap_or_default()
+            } else {
+                format!("{normalized}.local")
+            };
             candidates.push(Candidate {
                 rank: None,
                 ssh,
@@ -638,7 +702,7 @@ mod tests {
             .iter()
             .find(|node| !node.configured)
             .expect("extra");
-        assert_eq!(extra.ssh, "10.0.0.9");
+        assert_eq!(extra.ssh, "spark9.local");
         assert_eq!(extra.addresses, vec!["10.0.0.9".to_owned()]);
     }
 
@@ -701,7 +765,7 @@ mod tests {
         // Rank 0 is `local = true` in the defaults, so it is not probed.
         assert_eq!(
             seen,
-            ["ops@10.0.0.9", "ops@spark1", "ops@spark2", "ops@spark3"]
+            ["ops@spark1", "ops@spark2", "ops@spark3", "ops@spark9.local"]
         );
         // The report still names the host as configured; only the login carries the user.
         assert!(report.nodes.iter().any(|node| node.ssh == "spark1"));
