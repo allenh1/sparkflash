@@ -171,6 +171,9 @@ pub struct AppState {
     device_token_source: Option<Arc<dyn DeviceTokenSource>>,
     choice_seeds: Arc<dyn ChoiceSeedSource>,
     draining: Arc<AtomicBool>,
+    /// Other model ids this server answers to (a client configured for another provider sends its
+    /// own name; Claude Code sends its `ANTHROPIC_DEFAULT_*_MODEL` value).
+    model_aliases: Vec<String>,
 }
 
 impl AppState {
@@ -193,7 +196,29 @@ impl AppState {
             device_token_source: None,
             choice_seeds: Arc::new(RandomChoiceSeeds),
             draining: Arc::new(AtomicBool::new(false)),
+            model_aliases: Vec::new(),
         }
+    }
+
+    /// Adds model ids this server answers to besides its own descriptor id.
+    ///
+    /// A client configured for another provider sends its own model name (Claude Code sends the
+    /// `ANTHROPIC_DEFAULT_*_MODEL` value), so an alias is what lets one server answer it without
+    /// an edit on the client. Matching is case-insensitive.
+    #[must_use]
+    pub fn with_model_aliases<I, S>(mut self, aliases: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.model_aliases = aliases.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The configured model aliases.
+    #[must_use]
+    pub fn model_aliases(&self) -> &[String] {
+        &self.model_aliases
     }
 
     /// Installs the selected model descriptor.

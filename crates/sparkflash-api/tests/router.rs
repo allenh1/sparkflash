@@ -1123,6 +1123,51 @@ async fn models_reports_the_engines_own_capabilities() {
 }
 
 #[tokio::test]
+async fn a_model_id_carries_a_context_suffix_and_a_configured_alias() {
+    // Anthropic spells a 1M-context request as `model[1m]`, and Claude Code forwards that
+    // spelling unchanged; the suffix decorates the id rather than replacing it. A client
+    // configured for another provider also sends its own model name, which an alias covers.
+    let aliased = router(
+        AppState::new(Arc::new(engine_with(&["Hello", " world"])))
+            .with_fixed_time(FIXED_TIME)
+            .with_model_aliases(["deepseek-flash"]),
+    );
+    for model in ["deepseek-flash", "deepseek-flash[1m]", "DEEPSEEK-FLASH[1m]"] {
+        let body = json!({"model": model, "messages": [{"role": "user", "content": "hi"}]});
+        let (status, _, bytes) =
+            send(aliased.clone(), json_request("/v1/chat/completions", &body)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{model}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+    // The retrieve route resolves the same spellings.
+    let (status, _, _) = send(
+        aliased.clone(),
+        get_request("/v1/models/deepseek-flash[1m]"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // The served id keeps its own suffix handling without an alias.
+    let body =
+        json!({"model": format!("{MODEL}[1m]"), "messages": [{"role": "user", "content": "hi"}]});
+    let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    // An unconfigured name is still the typed 404.
+    let body = json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]});
+    let (status, _, bytes) = send(app(), json_request("/v1/chat/completions", &body)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body_json(&bytes)["error"]["param"], "model");
+}
+
+#[tokio::test]
 async fn completions_responses_and_messages_round_trip() {
     let (status, _, bytes) = send(
         app(),

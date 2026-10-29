@@ -1397,7 +1397,8 @@ fn start_leader(
         .with_max_logprobs(options.max_logprobs)
         .with_tokenizer(seam)
         .with_api_key(options.api_key.clone())
-        .with_cors(options.cors.clone());
+        .with_cors(options.cors.clone())
+        .with_model_aliases(crate::serve::model_aliases());
     let bind = options.bind;
     let boot = Instant::now();
     std::thread::Builder::new()
