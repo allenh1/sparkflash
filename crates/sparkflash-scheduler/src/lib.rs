@@ -20,6 +20,11 @@
 //! Everything here is a decision engine. A plan computes what the runtime would do and
 //! returns the numbers the tests assert, so the whole milestone is exercisable with no
 //! weights, no GPU and no cluster.
+//!
+//! **Attribution:** Online calibrated acceptance profiles paired with a step cost model for
+//! adaptive speculative verification depth draw on prior art in
+//! [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference)
+//! (`helios/src/scheduler/speculation.rs`, `cost.rs`, `learning.rs`). See the root `NOTICE` file.
 
 #![deny(missing_docs)]
 

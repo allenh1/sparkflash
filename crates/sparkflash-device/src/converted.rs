@@ -15,6 +15,12 @@
 //! Pre-converted per-rank checkpoint format (`sparkflash convert`) and fast parallel direct-I/O
 //! arena loader.
 //!
+//! **Attribution:** Pre-converting per-rank weight layouts and loading them via parallel
+//! `O_DIRECT` reads for fast (~20-25 s) cold boot on DGX Spark draws on prior art in
+//! [`b12x`](https://github.com/local-inference-lab/b12x) (`b12x/loader/_direct.c`) and
+//! [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference) (Apache-2.0; Luke Alonso
+//! `@lukealonso`, `@original-el8`, and contributors). See the root `NOTICE` file.
+//!
 //! Instead of seeking and reading one tensor at a time on one thread, allocating a fresh
 //! `Vec<u8>` per tensor, and re-tiling B12x weights and re-digesting on the CPU on every boot,
 //! `sparkflash convert` writes one contiguous file per rank (`rank-{rank}-of-{world}.bin`) already

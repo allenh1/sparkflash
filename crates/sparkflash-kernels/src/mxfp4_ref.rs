@@ -15,6 +15,13 @@
 //! CPU reference for the W4A8 routed-expert MoE combine
 //! (kernels/b12x_mxfp4_moe_sm121.cu).
 //!
+//! **Attribution:** The `b12x` naming and SM120/SM121 block-scaled MXFP8/MXFP4 micro-tile
+//! indexing concepts originate from [`b12x`](https://github.com/local-inference-lab/b12x) (now in
+//! FlashInfer under `flashinfer/experimental/b12x`, Apache-2.0; Luke Alonso `@lukealonso`,
+//! `@original-el8`, and contributors) and
+//! [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference) (Apache-2.0). See the root
+//! `NOTICE` file for full provenance details.
+//!
 //! This module is the definition of that kernel's arithmetic, and it also counts what the kernel
 //! spends. Three claims are pinned here:
 //!

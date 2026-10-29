@@ -14,6 +14,16 @@
 
 //! Size-based collective dispatch: one-shot RDMA for decode-sized payloads, NCCL for large ones.
 //!
+//! **Attribution:** The `RoCEnante` name and one-shot dual-rail RoCEv2 collective architecture
+//! (pinned unified-memory slot staging with a system fence, CPU proxy doorbell striping across
+//! dual ConnectX-7 rails, per-rail sequence arrival flags, canonical rank-order `0 + 1 + 2 + 3`
+//! reduction, and the `<= 2 MiB` one-shot RDMA vs `> 2 MiB` dual-rail NCCL dispatch policy)
+//! originate from [`b12x`](https://github.com/local-inference-lab/b12x) (Apache-2.0; Luke Alonso
+//! `@lukealonso`, `@original-el8`, and contributors),
+//! [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference) (Apache-2.0), and
+//! [`dgx-spark-networking`](https://github.com/christopherowen/dgx-spark-networking) (Apache-2.0;
+//! Christopher Owen). See the root `NOTICE` file for full provenance details.
+//!
 //! The fabric decision is a payload-size decision, and it is the only one the forward loop should
 //! have to make:
 //!

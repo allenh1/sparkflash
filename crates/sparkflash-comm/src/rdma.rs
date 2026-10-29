@@ -14,6 +14,16 @@
 
 //! The real dual-rail libibverbs backend.
 //!
+//! **Attribution:** The `RoCEnante` name and one-shot dual-rail RoCEv2 collective architecture
+//! (pinned unified-memory slot staging with a system fence, CPU proxy doorbell striping across
+//! dual ConnectX-7 rails, per-rail sequence arrival flags, canonical rank-order `0 + 1 + 2 + 3`
+//! reduction, and the `<= 2 MiB` one-shot RDMA vs `> 2 MiB` dual-rail NCCL dispatch policy)
+//! originate from [`b12x`](https://github.com/local-inference-lab/b12x) (Apache-2.0; Luke Alonso
+//! `@lukealonso`, `@original-el8`, and contributors),
+//! [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference) (Apache-2.0), and
+//! [`dgx-spark-networking`](https://github.com/christopherowen/dgx-spark-networking) (Apache-2.0;
+//! Christopher Owen). See the root `NOTICE` file for full provenance details.
+//!
 //! This module is compiled only with --features rdma and links nothing: libibverbs is opened at run
 //! time by [`verbs::Verbs::load`], and every ABI struct is a hand-written mirror asserted against
 //! rdma-core's layout in [`abi`]. The bring-up is the sequence a RoCEv2 RC all-to-all needs and

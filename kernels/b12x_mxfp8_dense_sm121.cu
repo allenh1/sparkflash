@@ -14,6 +14,12 @@
 
 // kernels/b12x_mxfp8_dense_sm121.cu
 //
+// Attribution: The "b12x" naming prefix and SM120/SM121 block-scaled MXFP8/MXFP4 micro-tile
+// layout concepts originate from b12x (https://github.com/local-inference-lab/b12x, now in
+// FlashInfer under flashinfer/experimental/b12x, Apache-2.0; Luke Alonso @lukealonso,
+// @original-el8, and contributors) and NVIDIA Flare
+// (https://github.com/NVIDIA/flare-local-inference, Apache-2.0). See the root NOTICE file.
+//
 // The dense MXFP8 GEMM of specification 4.1 (B12x weight layout, per-32 ue8m0 shared scales,
 // f32 accumulation, bf16 output). This is the kernel that every dense projection in the model
 // uses: the attention projections, the MLP up/gate halves, and (through the wo_a variant in

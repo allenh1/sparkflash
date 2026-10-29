@@ -14,6 +14,12 @@
 
 // kernels/b12x_mxfp8_wo_a_sm121.cu
 //
+// Attribution: The "b12x" naming prefix and SM120/SM121 block-scaled MXFP8/MXFP4 micro-tile
+// layout concepts originate from b12x (https://github.com/local-inference-lab/b12x, now in
+// FlashInfer under flashinfer/experimental/b12x, Apache-2.0; Luke Alonso @lukealonso,
+// @original-el8, and contributors) and NVIDIA Flare
+// (https://github.com/NVIDIA/flare-local-inference, Apache-2.0). See the root NOTICE file.
+//
 // The grouped output projection wo_a of specification 2.1/6.2, MXFP8 like the dense twin:
 // 8 output groups (2 per rank) with o_lora_rank 1024, each group consuming the concatenated
 // 512-dim outputs of its 8 attention heads (8 * 512 = 4096 reduction width), weights in the

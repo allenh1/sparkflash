@@ -14,6 +14,15 @@
 
 // kernels/rocenante_oneshot_sm121.cuh
 //
+// Attribution: The "RoCEnante" name and one-shot dual-rail RoCE collective architecture
+// (pinned unified-memory slot staging with a system fence, CPU proxy doorbell across dual
+// ConnectX-7 rails, per-rail sequence arrival flags, and canonical rank-order 0+1+2+3
+// reduction) originate from b12x (https://github.com/local-inference-lab/b12x, Apache-2.0;
+// Luke Alonso @lukealonso, @original-el8, and contributors), NVIDIA Flare
+// (https://github.com/NVIDIA/flare-local-inference, Apache-2.0), and dgx-spark-networking
+// (https://github.com/christopherowen/dgx-spark-networking, Apache-2.0; Christopher Owen).
+// See the root NOTICE file for full provenance details.
+//
 // Slot ABI and shared constants of the RoCEnante one-shot All-Reduce
 // (kernels/rocenante_oneshot_sm121.cu, specification section 5.4, lines 646-649).
 //

@@ -15,6 +15,16 @@
 //! Conformance between the Rust mirror of the RoCEnante one-shot slot ABI and the CUDA
 //! header and kernel that implement it.
 //!
+//! **Attribution:** The `RoCEnante` name and one-shot dual-rail RoCEv2 collective architecture
+//! (pinned unified-memory slot staging with a system fence, CPU proxy doorbell striping across
+//! dual ConnectX-7 rails, per-rail sequence arrival flags, canonical rank-order `0 + 1 + 2 + 3`
+//! reduction, and the `<= 2 MiB` one-shot RDMA vs `> 2 MiB` dual-rail NCCL dispatch policy)
+//! originate from [`b12x`](https://github.com/local-inference-lab/b12x) (Apache-2.0; Luke Alonso
+//! `@lukealonso`, `@original-el8`, and contributors),
+//! [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference) (Apache-2.0), and
+//! [`dgx-spark-networking`](https://github.com/christopherowen/dgx-spark-networking) (Apache-2.0;
+//! Christopher Owen). See the root `NOTICE` file for full provenance details.
+//!
 //! The CUDA side is `kernels/rocenante_oneshot_sm121.cuh` (the slot) and
 //! `kernels/rocenante_oneshot_sm121.cu` (the kernel). A GPU writes the slot fields
 //! and a ConnectX-7 NIC DMAs into them, so the byte offsets are a wire protocol, not an

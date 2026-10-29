@@ -14,6 +14,16 @@
 
 //! SparkFlash-RS RoCEnante one-shot RDMA + patched-NCCL dual-path collective transport.
 //!
+//! **Attribution:** The `RoCEnante` name and one-shot dual-rail RoCEv2 collective architecture
+//! (pinned unified-memory slot staging with a system fence, CPU proxy doorbell striping across
+//! dual ConnectX-7 rails, per-rail sequence arrival flags, canonical rank-order `0 + 1 + 2 + 3`
+//! reduction, and the `<= 2 MiB` one-shot RDMA vs `> 2 MiB` dual-rail NCCL dispatch policy)
+//! originate from [`b12x`](https://github.com/local-inference-lab/b12x) (Apache-2.0; Luke Alonso
+//! `@lukealonso`, `@original-el8`, and contributors),
+//! [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference) (Apache-2.0), and
+//! [`dgx-spark-networking`](https://github.com/christopherowen/dgx-spark-networking) (Apache-2.0;
+//! Christopher Owen). See the root `NOTICE` file for full provenance details.
+//!
 //! Two collective shapes exist for four DGX Spark ranks:
 //!
 //! * payloads of at most ROCENANTE_MAX_BYTES (2 MiB) go through the RoCEnante one-shot path,

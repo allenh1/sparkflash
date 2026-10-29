@@ -14,6 +14,14 @@
 
 //! Deterministic Engram conditional-memory engine.
 //!
+//! **Attribution:** Bounded `O_DIRECT` / `io_uring` NVMe row gathering and unified-memory
+//! caching for out-of-core Engram/PLE tables on DGX Spark (`GB10`) draw on prior art from
+//! [`b12x`](https://github.com/local-inference-lab/b12x),
+//! [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference) (`helios/src/engram/reader.rs`),
+//! [`MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks),
+//! and [`knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4`](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4).
+//! See the root `NOTICE` file for full provenance details.
+//!
 //! DeepSeek-V4.1-Flash augments two backbone layers (1 and 14) with a 189 GiB n-gram
 //! conditional-memory table. Per token the layer performs 24 lookups (3 n-gram orders x 8
 //! hash heads), gathers 8 x 256-dimensional embeddings per lookup, and mixes the resulting

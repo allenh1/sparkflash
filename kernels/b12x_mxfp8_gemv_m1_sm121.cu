@@ -14,6 +14,12 @@
 
 // kernels/b12x_mxfp8_gemv_m1_sm121.cu
 //
+// Attribution: The "b12x" naming prefix and SM120/SM121 block-scaled MXFP8/MXFP4 micro-tile
+// layout concepts originate from b12x (https://github.com/local-inference-lab/b12x, now in
+// FlashInfer under flashinfer/experimental/b12x, Apache-2.0; Luke Alonso @lukealonso,
+// @original-el8, and contributors) and NVIDIA Flare
+// (https://github.com/NVIDIA/flare-local-inference, Apache-2.0). See the root NOTICE file.
+//
 // The dedicated decode-step (M=1) MXFP8 GEMV of WS-D: a bandwidth-first kernel, not a retile of the
 // prefill GEMM. It is added, not substituted: the pinned b12x_mxfp8_dense_sm121 kernel and its
 // cubin stay the reference and the frozen ABI id, and this file compiles into its own cubin with

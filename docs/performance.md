@@ -34,8 +34,13 @@ sees; *aggregate* is all tokens over the wall time of the run, prefill included.
 
 ## Against the MiaAI-Lab SGLang build
 
-The fastest published V4.1-Flash setup on four Sparks we know of is the
-[MiaAI-Lab SGLang build](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/blob/main/docs/tp4.md).
+The fastest published SGLang V4.1-Flash setup on four Sparks we know of is the
+[MiaAI-Lab SGLang build](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/blob/main/docs/tp4.md)
+(building on [`b12x`](https://github.com/local-inference-lab/b12x)'s `RoCEnante` one-shot RoCE
+collectives, [`dgx-spark-networking`](https://github.com/christopherowen/dgx-spark-networking), and
+[`knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4`](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4);
+see also [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference) and
+[`blaesus/dsgx10`](https://github.com/blaesus/dsgx10)).
 Its numbers come from sparkDash 1.8.8's DecodeBench, which we replicated request for request:
 the same prompts, 256 tokens at temperature 0 with thinking off, a discarded first sweep, and
 the single-stream prose and code figures as the median of five runs. Every wave ran on an

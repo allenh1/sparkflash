@@ -14,6 +14,11 @@
 
 // kernels/opt_sample_sm121.cuh
 //
+// Attribution: Stateless counter-seeded Gumbel-max sampling so speculative draft and target
+// verification share identical random draws without RNG state synchronization follows the
+// sampling design in NVIDIA Flare (https://github.com/NVIDIA/flare-local-inference,
+// Apache-2.0; Luke Alonso @lukealonso, @original-el8, and contributors). See NOTICE.
+//
 // The serving sampler's noise: a Gumbel variate per (seed, position, vocabulary id), counter based,
 // so every rank draws the same value for the same token without any state or exchange. A token is
 // sampled from softmax(logits / T) as the argmax of logit / T + G (the Gumbel-max rule); the

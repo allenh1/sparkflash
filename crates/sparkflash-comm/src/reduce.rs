@@ -14,6 +14,16 @@
 
 //! The canonical-order bf16 reduction every transport must reproduce bit for bit.
 //!
+//! **Attribution:** The `RoCEnante` name and one-shot dual-rail RoCEv2 collective architecture
+//! (pinned unified-memory slot staging with a system fence, CPU proxy doorbell striping across
+//! dual ConnectX-7 rails, per-rail sequence arrival flags, canonical rank-order `0 + 1 + 2 + 3`
+//! reduction, and the `<= 2 MiB` one-shot RDMA vs `> 2 MiB` dual-rail NCCL dispatch policy)
+//! originate from [`b12x`](https://github.com/local-inference-lab/b12x) (Apache-2.0; Luke Alonso
+//! `@lukealonso`, `@original-el8`, and contributors),
+//! [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference) (Apache-2.0), and
+//! [`dgx-spark-networking`](https://github.com/christopherowen/dgx-spark-networking) (Apache-2.0;
+//! Christopher Owen). See the root `NOTICE` file for full provenance details.
+//!
 //! The RoCEnante kernel accumulates rank `0 + 1 + 2 + 3` in ascending rank order in f32,
 //! starting from `0.0f`, and rounds exactly once with round-to-nearest-even when it stores the
 //! bf16 result. Every element is independent, so the result does not depend on the block/grid
