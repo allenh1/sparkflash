@@ -77,9 +77,12 @@ fn eighty_posted_reduces_with_deferred_waits_match_the_canonical_reference() {
                 &format!("rank {rank} async seq {seq}"),
             );
         }
-        true
+        // The transport is returned rather than dropped here: a rank that finishes first would
+        // otherwise close its sockets while a slower rank is still mid-collective, and the slower
+        // rank would see EOF (PeerClosed) on a reduce that is still in flight.
+        transport
     });
-    assert!(results.iter().all(|value| *value));
+    assert_eq!(results.len(), WORLD);
 }
 
 #[test]
@@ -124,9 +127,10 @@ fn interleaved_post_and_wait_orders_still_reach_the_canonical_result() {
                 &format!("rank {rank} interleaved seq {seq}"),
             );
         }
-        true
+        // Kept alive until every rank thread has joined (see the note in the deferred-wait test).
+        transport
     });
-    assert!(results.iter().all(|value| *value));
+    assert_eq!(results.len(), WORLD);
 }
 
 #[test]
@@ -159,9 +163,10 @@ fn a_reused_slot_and_a_dead_wait_are_hard_errors() {
             &expected,
             &format!("rank {rank} slot-reuse survivor"),
         );
-        true
+        // Kept alive until every rank thread has joined (see the note in the deferred-wait test).
+        transport
     });
-    assert!(results.iter().all(|value| *value));
+    assert_eq!(results.len(), WORLD);
 }
 
 #[test]
@@ -182,10 +187,11 @@ fn posting_80_reduces_costs_no_extra_round_trip_versus_sync() {
                 .all_reduce_bf16(&mut buffer, seq as u64, &layout)
                 .unwrap_or_else(|error| panic!("rank {rank} sync {seq}: {error}"));
         }
-        start.elapsed().as_secs_f64() * 1e3
+        // Kept alive until every rank thread has joined (see the deferred-wait test's note).
+        (start.elapsed().as_secs_f64() * 1e3, transport)
     })
     .into_iter()
-    .fold(0.0f64, f64::max);
+    .fold(0.0f64, |slowest, (wall, _transport)| slowest.max(wall));
 
     let async_base = port_block();
     let async_wall = run_ranks(WORLD, |rank| {
@@ -209,10 +215,11 @@ fn posting_80_reduces_costs_no_extra_round_trip_versus_sync() {
                 .wait_reduce(handle)
                 .unwrap_or_else(|error| panic!("rank {rank} wait: {error}"));
         }
-        start.elapsed().as_secs_f64() * 1e3
+        // Kept alive until every rank thread has joined.
+        (start.elapsed().as_secs_f64() * 1e3, transport)
     })
     .into_iter()
-    .fold(0.0f64, f64::max);
+    .fold(0.0f64, |slowest, (wall, _transport)| slowest.max(wall));
 
     eprintln!(
         "transport sanity: 80 sync one-shot reduces {sync_wall:.3} ms; 80 posted + deferred waits {async_wall:.3} ms (257 bf16 elements, loopback; not a latency claim)"
@@ -246,9 +253,10 @@ fn a_sequence_reused_across_slots_is_refused() {
         let _ = transport
             .wait_reduce(handle)
             .unwrap_or_else(|error| panic!("rank {rank}: {error}"));
-        true
+        // Kept alive until every rank thread has joined (see the note in the deferred-wait test).
+        transport
     });
-    assert!(results.iter().all(|value| *value));
+    assert_eq!(results.len(), WORLD);
 }
 
 /// The loop's posting schedule: 40 layers x 2 seams = 80 reduces, all posted ahead of the first
@@ -326,7 +334,8 @@ fn two_phase_slots_post_eighty_reduces_ahead_and_wait_at_consumption_points() {
         // Double wait is a compile error: ReduceHandle is neither Copy nor Clone and wait consumes
         // it. The runtime guards exercised above are the slot and sequence checks.
         assert!(handles.is_empty());
-        true
+        // Kept alive until every rank thread has joined (see the note in the deferred-wait test).
+        transport
     });
-    assert!(results.iter().all(|value| *value));
+    assert_eq!(results.len(), WORLD);
 }

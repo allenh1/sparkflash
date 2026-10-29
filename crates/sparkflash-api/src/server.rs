@@ -65,7 +65,7 @@ use crate::telemetry_types::{
 };
 use crate::tool_parser;
 use crate::vision::{
-    VisionImage, fetch_enabled as image_fetch_enabled, place_images, prepare_images,
+    ChatImage, VisionImage, fetch_enabled as image_fetch_enabled, place_images, prepare_images,
     refuse_unread_image, take_chat_images,
 };
 use sparkflash_model::{PromptCodec, PromptError};
@@ -418,8 +418,9 @@ fn invalid_body(error: serde_json::Error) -> ApiError {
 /// shape and JSON path found. It runs before validate_request because the typed seam only sees
 /// the parts a parser understood.
 ///
-/// With vision (the engine has the tower loaded) only the routes that do not read images yet
-/// call it, and the message says so instead of blaming the engine.
+/// With vision (the engine has the tower loaded) this only fires for a carrier in a shape the
+/// route does not read, and the message names the shapes it does read instead of blaming the
+/// engine.
 fn refuse_image_carrier(carrier: Option<String>, vision: bool) -> Result<(), ApiError> {
     let Some(shape) = carrier else {
         return Ok(());
@@ -427,9 +428,10 @@ fn refuse_image_carrier(carrier: Option<String>, vision: bool) -> Result<(), Api
     if vision {
         return Err(ApiError::invalid_request(
             format!(
-                "this route does not read images (only /v1/chat/completions does, DECISIONS.md \
-                 D59): the request body carries an image at {shape}; the request is refused rather \
-                 than answered from its text tokens alone"
+                "this route does not read an image in this shape: it reads chat message \
+                 image_url/input_image parts, Responses input_image parts and Anthropic image \
+                 blocks (DECISIONS.md D59), and the request body carries an image at {shape}; the \
+                 request is refused rather than answered from its text tokens alone"
             ),
             None,
             Some("unsupported_capability".to_owned()),
@@ -445,6 +447,129 @@ fn refuse_image_carrier(carrier: Option<String>, vision: bool) -> Result<(), Api
         None,
         Some("unsupported_capability".to_owned()),
     ))
+}
+
+/// Prepares a request's images and expands their placeholders in `summary` (DECISIONS.md D59).
+async fn prepare_and_place_images(
+    state: &AppState,
+    images: Vec<ChatImage>,
+    summary: &mut PromptSummary,
+) -> Result<Vec<VisionImage>, ApiError> {
+    let codec = state
+        .tokenizer()
+        .and_then(|seam| seam.vision_codec())
+        .ok_or_else(|| {
+            ApiError::internal(
+                "the engine advertises vision but the prompt codec has no vision front end",
+            )
+        })?;
+    let prepared = prepare_images(images, image_fetch_enabled(), Arc::clone(&codec)).await?;
+    let (ids, placed) = place_images(&summary.token_ids, prepared, codec.as_ref())?;
+    summary.token_ids = ids;
+    Ok(placed)
+}
+
+/// Refuses an image the protocol bridge does not render.
+///
+/// The bridge turns only the fields it knows (`input` for Responses, `messages`/`system` for
+/// Anthropic) into chat parts, but [find_image_carrier] scans the whole raw body. An image
+/// anywhere else would be dropped from the prompt, so it is refused by name instead of answered
+/// from the text alone (D27's backstop, at the route's own boundary).
+///
+/// # Errors
+///
+/// The same unsupported_capability 400 [refuse_image_carrier] builds.
+fn refuse_unbridged_image(body: &Value, rendered: &[&str]) -> Result<(), ApiError> {
+    let Some(object) = body.as_object() else {
+        return Ok(());
+    };
+    let mut remainder = object.clone();
+    for key in rendered {
+        remainder.remove(*key);
+    }
+    let shape = find_image_carrier(&Value::Object(remainder));
+    refuse_image_carrier(shape, true)
+}
+
+/// Refuses an image on `/v1/completions`, which takes a prompt rather than messages.
+///
+/// The route has no image part to read, so two spellings are refused by name: a marker inside
+/// the prompt (an `<image>...</image>` tag, a placeholder in any spelling, or the image token in
+/// pre-tokenized ids) and an image carrier in the body. Either would reach the model with no
+/// canvas behind it, and the request would be answered from its text alone (DECISIONS.md D59);
+/// the conversation routes read images.
+///
+/// The check runs before the device-token fast path: a claimed envelope replays a recorded token
+/// window on the ranks, so an image it carried would never be read on the host either.
+///
+/// # Errors
+///
+/// The unsupported_capability 400 the other carrier refusals build.
+fn refuse_completion_image(
+    state: &AppState,
+    prompt: Option<&PromptSpec>,
+    carrier: Option<String>,
+) -> Result<(), ApiError> {
+    let image_token = state
+        .tokenizer()
+        .and_then(|seam| seam.vision_codec())
+        .map(|codec| codec.image_token_id());
+    let marked = match prompt {
+        None => None,
+        Some(PromptSpec::Text(text)) => {
+            completion_prompt_marker(text, None, image_token).map(|marker| (1, marker))
+        }
+        Some(PromptSpec::Many(items)) => items.iter().enumerate().find_map(|(index, text)| {
+            completion_prompt_marker(text, None, image_token).map(|marker| (index + 1, marker))
+        }),
+        Some(PromptSpec::Tokens(ids)) => {
+            completion_prompt_marker("", Some(ids), image_token).map(|marker| (1, marker))
+        }
+    };
+    let Some(shape) = marked
+        .map(|(index, marker)| format!("the {marker} in prompt {index}"))
+        .or_else(|| carrier.map(|shape| format!("an image at {shape}")))
+    else {
+        return Ok(());
+    };
+    Err(ApiError::invalid_request(
+        format!(
+            "/v1/completions takes a prompt, not messages, so it reads no image, and {shape} would \
+             reach the model with no canvas behind it. Send the image on /v1/chat/completions, \
+             /v1/responses or /v1/messages (DECISIONS.md D59), or remove it; this route refuses \
+             it rather than answering from the text alone"
+        ),
+        None,
+        Some("unsupported_capability".to_owned()),
+    ))
+}
+
+/// The image marker in one completion prompt, named for a refusal message.
+///
+/// A pre-tokenized prompt is checked by id - the placeholder's spelling need not survive a decode
+/// - and a text prompt by its spelling.
+fn completion_prompt_marker(
+    text: &str,
+    tokens: Option<&[u32]>,
+    image_token: Option<u32>,
+) -> Option<&'static str> {
+    if tokens.is_some_and(|ids| image_token.is_some_and(|id| ids.contains(&id))) {
+        return Some("image token id");
+    }
+    crate::multimodal::image_marker_in(text)
+}
+
+/// The chat-shape image path: take the body's image parts, refuse a carrier left behind, then
+/// prepare and place them. The protocol bridges render their images as chat parts, so the
+/// Responses and Anthropic routes take this same path.
+async fn apply_chat_images(
+    state: &AppState,
+    chat: &Value,
+    summary: &mut PromptSummary,
+) -> Result<Vec<VisionImage>, ApiError> {
+    let (images, stripped) = take_chat_images(chat)?;
+    refuse_unread_image(&stripped)?;
+    prepare_and_place_images(state, images, summary).await
 }
 
 /// The number of independent choices a request asks for, validated before generation.
@@ -1736,7 +1861,6 @@ async fn chat_completions(
     // reasoning_effort decide thinking and the rendered budget), so keep a copy only when a
     // tokenizer seam is attached; the placeholder path does not need it.
     let seam = state.tokenizer().cloned();
-    let vision_codec = seam.as_ref().and_then(|seam| seam.vision_codec());
     let mut raw_for_seam = seam.as_ref().map(|_| value.clone());
     let request: ChatCompletionRequest = serde_json::from_value(value).map_err(invalid_body)?;
     // vLLM's auto tool choice is enabled by `--enable-auto-tool-choice --tool-call-parser
@@ -1888,24 +2012,12 @@ async fn chat_completions(
     // shape this route does not read, refused rather than answered without its image.
     let mut vision = Vec::new();
     let capabilities = state.engine.capabilities();
-    if image_carrier.is_some()
-        && capabilities.vision
-        && let Some(raw) = raw_for_seam.as_ref()
+    match raw_for_seam
+        .as_ref()
+        .filter(|_| image_carrier.is_some() && capabilities.vision)
     {
-        let (images, stripped) = take_chat_images(raw)?;
-        refuse_unread_image(&stripped)?;
-        let codec = vision_codec.ok_or_else(|| {
-            ApiError::internal(
-                "the engine advertises vision but the prompt codec has no vision front end",
-            )
-        })?;
-        let prepared =
-            prepare_images(images, image_fetch_enabled(), std::sync::Arc::clone(&codec)).await?;
-        let (ids, placed) = place_images(&summary.token_ids, prepared, codec.as_ref())?;
-        summary.token_ids = ids;
-        vision = placed;
-    } else {
-        refuse_image_carrier(image_carrier, capabilities.vision)?;
+        Some(raw) => vision = apply_chat_images(&state, raw, &mut summary).await?,
+        None => refuse_image_carrier(image_carrier, capabilities.vision)?,
     }
     let id = state.next_id("chatcmpl-dsv41-");
     let created = state.now_unix();
@@ -2790,6 +2902,10 @@ async fn completions(
     // vLLM's list-prompt contract plus OpenAI's n: each prompt expands into n independent
     // choices, and the response choice index is prompt_index * n + choice_index.
     let n = resolve_choice_count(request.n, state.engine.as_ref())?;
+    // Before the device-token fast path: an envelope claim replays a recorded window on the ranks
+    // without the host reading the prompt, so the image refusal must not depend on which path
+    // serves the request.
+    refuse_completion_image(&state, request.prompt.as_ref(), image_carrier)?;
     // Device-chain scaffold: only a plain, single-choice, pre-tokenized request is served from a
     // claimed four-rank token envelope; everything else continues to the host twin below.
     if let Some(claim) = device_completion_eligibility(&request)
@@ -2851,7 +2967,6 @@ async fn completions(
             ));
         }
     };
-    refuse_image_carrier(image_carrier, state.engine.capabilities().vision)?;
     let id = state.next_id("cmpl-dsv41-");
     let created = state.now_unix();
     let trace_id = trace_request_id(&headers, &id);
@@ -3729,6 +3844,20 @@ fn responses_content_to_chat(value: &Value) -> Result<Value, ApiError> {
                                     Some("invalid_input".to_owned()),
                                 )
                             })?;
+                        // The Responses schema puts `detail` beside `image_url`, while the chat
+                        // part carries it inside the image URL object; dropping it here would
+                        // prepare a `low` image at full size.
+                        let detail = object.get("detail").cloned();
+                        let image = match (image, detail) {
+                            (Value::String(url), Some(detail)) => {
+                                json!({"url": url, "detail": detail})
+                            }
+                            (Value::Object(mut map), Some(detail)) => {
+                                map.insert("detail".to_owned(), detail);
+                                Value::Object(map)
+                            }
+                            (image, _) => image,
+                        };
                         parts.push(json!({"type": "image_url", "image_url": image}));
                     }
                     Some("refusal") => {
@@ -4498,15 +4627,34 @@ fn anthropic_bridge(request: &MessagesRequest) -> Result<ChatBridge, ApiError> {
     let (tool_choice, parallel) = anthropic_tool_choice_to_chat(request.tool_choice.as_ref())?;
     let policy = resolve_tool_policy(request.tools.as_ref(), tool_choice.as_ref(), Some(parallel))?;
     let tools = anthropic_tools_to_chat(request.tools.as_ref())?;
-    let mut messages = Vec::new();
+    // The Messages API has no "system" role inside `messages`, but clients send one (Claude Code
+    // among them). Its text joins the system prompt rather than failing the request, so a
+    // conversation that carries instruction turns still renders.
+    let mut system_parts = Vec::new();
     if let Some(system) = anthropic_system_text(request.system.as_ref())? {
-        messages.push(json!({"role": "system", "content": system}));
+        system_parts.push(system);
+    }
+    for message in request
+        .messages
+        .iter()
+        .filter(|message| message.role == "system")
+    {
+        if let Some(text) = anthropic_system_text(message.content.as_ref())?
+            && !text.is_empty()
+        {
+            system_parts.push(text);
+        }
+    }
+    let mut messages = Vec::new();
+    if !system_parts.is_empty() {
+        messages.push(json!({"role": "system", "content": system_parts.join("\n\n")}));
     }
     for message in &request.messages {
         match message.role.as_str() {
             "user" | "assistant" => {
                 anthropic_content_to_chat(&message.role, message.content.as_ref(), &mut messages)?;
             }
+            "system" => {}
             other => {
                 return Err(ApiError::invalid_request(
                     format!("invalid Anthropic message role {other:?}"),
@@ -5438,7 +5586,13 @@ async fn responses(
     let spec = resolve_reasoning(&value)?;
     let image_carrier = find_image_carrier(&value);
     let request: ResponsesRequest = serde_json::from_value(value.clone()).map_err(invalid_body)?;
-    refuse_image_carrier(image_carrier, state.engine.capabilities().vision)?;
+    // A text-only engine cannot serve an image on any route, and the refusal must not depend on
+    // whether the bridge understands the item that carries it, so it runs before the bridge.
+    let capabilities = state.engine.capabilities();
+    if image_carrier.is_some() && !capabilities.vision {
+        refuse_image_carrier(image_carrier.clone(), false)?;
+    }
+    refuse_unbridged_image(&value, &["input"])?;
     let bridge = responses_bridge(&value, &request)?;
     if bridge.messages.is_empty() {
         return Err(ApiError::invalid_request(
@@ -5449,7 +5603,21 @@ async fn responses(
     }
     let model = resolve_model(&state, request.model.as_deref())?;
     let trace = trace_context(&headers)?;
-    let (summary, _prompt_ids) = bridge_prompt_summary(&state, &bridge)?;
+    let (mut summary, _prompt_ids) = bridge_prompt_summary(&state, &bridge)?;
+    // The bridge renders every input_image as a chat image_url part, so a request with an image
+    // takes the chat vision path (DECISIONS.md D59). A carrier the bridge left behind is a shape
+    // this route does not read, refused by name.
+    let mut vision = Vec::new();
+    if image_carrier.is_some() && capabilities.vision {
+        let (images, stripped) = take_chat_images(&bridge.chat)?;
+        refuse_unread_image(&stripped)?;
+        if images.is_empty() {
+            refuse_image_carrier(image_carrier, capabilities.vision)?;
+        }
+        vision = prepare_and_place_images(&state, images, &mut summary).await?;
+    } else {
+        refuse_image_carrier(image_carrier, capabilities.vision)?;
+    }
     let response_id = state.next_id("resp_dsv41_");
     let message_id = state.next_id("msg_dsv41_");
     let reasoning_id = state.next_id("rs_dsv41_");
@@ -5483,7 +5651,7 @@ async fn responses(
         seed: None,
         logprobs: LogprobsRequest::default(),
         trace,
-        vision: Vec::new(),
+        vision,
     }
     .build()?;
     state
@@ -6118,8 +6286,13 @@ async fn messages(
 ) -> Result<Response, ApiError> {
     let value = parse_json(&body)?;
     let image_carrier = find_image_carrier(&value);
-    let request: MessagesRequest = serde_json::from_value(value).map_err(invalid_body)?;
-    refuse_image_carrier(image_carrier, state.engine.capabilities().vision)?;
+    let request: MessagesRequest = serde_json::from_value(value.clone()).map_err(invalid_body)?;
+    // A text-only engine cannot serve an image on any route, and the refusal must not depend on
+    // whether the bridge understands the block that carries it, so it runs before the bridge.
+    let capabilities = state.engine.capabilities();
+    if image_carrier.is_some() && !capabilities.vision {
+        refuse_image_carrier(image_carrier.clone(), false)?;
+    }
     if request.messages.is_empty() {
         return Err(ApiError::invalid_request(
             "\"messages\" must be a non-empty array",
@@ -6134,6 +6307,7 @@ async fn messages(
             Some("invalid_max_tokens".to_owned()),
         ));
     }
+    refuse_unbridged_image(&value, &["messages", "system"])?;
     let bridge = anthropic_bridge(&request)?;
     if bridge.messages.is_empty() {
         return Err(ApiError::invalid_request(
@@ -6145,7 +6319,21 @@ async fn messages(
     let spec = resolve_reasoning(&bridge.chat)?;
     let model = resolve_model(&state, request.model.as_deref())?;
     let trace = trace_context(&headers)?;
-    let (summary, _prompt_ids) = bridge_prompt_summary(&state, &bridge)?;
+    let (mut summary, _prompt_ids) = bridge_prompt_summary(&state, &bridge)?;
+    // The bridge renders every Anthropic image block as a chat image_url part, so a request with
+    // an image takes the chat vision path (DECISIONS.md D59). A carrier the bridge left behind is
+    // a shape this route does not read, refused by name.
+    let mut vision = Vec::new();
+    if image_carrier.is_some() && capabilities.vision {
+        let (images, stripped) = take_chat_images(&bridge.chat)?;
+        refuse_unread_image(&stripped)?;
+        if images.is_empty() {
+            refuse_image_carrier(image_carrier, capabilities.vision)?;
+        }
+        vision = prepare_and_place_images(&state, images, &mut summary).await?;
+    } else {
+        refuse_image_carrier(image_carrier, capabilities.vision)?;
+    }
     let stop = request.stop_sequences.clone().unwrap_or_default();
     let id = state.next_id("msg_dsv41_");
     let trace_id = trace_request_id(&headers, &id);
@@ -6177,7 +6365,7 @@ async fn messages(
         seed: None,
         logprobs: LogprobsRequest::default(),
         trace,
-        vision: Vec::new(),
+        vision,
     }
     .build()?;
     state

@@ -13,15 +13,8 @@ are about evidence, not ceremony. Read them before you open a merge request.
   `Signed-off-by: Your Name <you@example.com>`. Use `git commit -s`; the sign-off certifies that
   you wrote the change or have the right to submit it. Do not add co-authorship trailers for tools
   or assistants.
-- **No deployment details.** Never commit hostnames, LAN or RoCE addresses, SSH keys, passwords,
-  credentials, internal Git URLs, personal home directories, or notes about a particular cluster.
-  Documentation examples use `node0`-`node3` and the TEST-NET ranges (`192.0.2.0/24`,
-  `198.51.100.0/24`, `203.0.113.0/24`). A change that leaks any of these is rejected even if the code
-  is correct.
 - **One idea per commit.** Keep mechanical changes (formatting, renaming, license headers) separate
   from behavioural changes so a reviewer can see the behaviour.
-- **Third-party material.** Preserve upstream notices. `reference/` is DeepSeek's MIT-licensed
-  reference material and must not be relicensed or stamped with this project's copyright.
 
 ## Before you send a change
 

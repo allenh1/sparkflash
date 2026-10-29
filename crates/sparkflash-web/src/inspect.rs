@@ -1125,10 +1125,10 @@ gid rocep1s0f0 0 IB/RoCE_v1 fe80:0000:0000:0000:4ebb:47ff:fe00:0001 enp1s0f0np0
 port rocep1s0f1 ACTIVE 200
 gid rocep1s0f1 0 IB/RoCE_v1 fe80:0000:0000:0000:4ebb:47ff:fe00:0002 enp1s0f1np1
 gid rocep1s0f1 1 RoCE_v2 fe80:0000:0000:0000:4ebb:47ff:fe00:0002 enp1s0f1np1
-gid rocep1s0f1 2 IB/RoCE_v1 0000:0000:0000:0000:0000:ffff:0a00:01{a:02x} enp1s0f1np1
-gid rocep1s0f1 3 RoCE_v2 0000:0000:0000:0000:0000:ffff:0a00:01{a:02x} enp1s0f1np1
+gid rocep1s0f1 2 IB/RoCE_v1 0000:0000:0000:0000:0000:ffff:c633:64{a:02x} enp1s0f1np1
+gid rocep1s0f1 3 RoCE_v2 0000:0000:0000:0000:0000:ffff:c633:64{a:02x} enp1s0f1np1
 port roceP2p1s0f1 ACTIVE 200
-gid roceP2p1s0f1 3 RoCE_v2 0000:0000:0000:0000:0000:ffff:0a00:01{b:02x} enP2p1s0f1np1
+gid roceP2p1s0f1 3 RoCE_v2 0000:0000:0000:0000:0000:ffff:c633:64{b:02x} enP2p1s0f1np1
 arp all 1 2
 link enp1s0f1np1 9000 up 0 0
 link enP2p1s0f1np1 9000 up 0 0
@@ -1177,7 +1177,7 @@ free converted 2000000000000
                 .collect::<Vec<_>>(),
             ["rocep1s0f1", "roceP2p1s0f1"]
         );
-        assert_eq!(rails[0].ip, Ipv4Addr::new(10, 0, 1, 11));
+        assert_eq!(rails[0].ip, Ipv4Addr::new(198, 51, 100, 11));
         assert_eq!(rails[0].gid_index, 3);
         assert_eq!(rails[0].prefix, Some(24));
         assert_eq!(rails[1].mtu, Some(9000));
@@ -1405,7 +1405,7 @@ link enp1s0f1np1 1500 up 0 0
         let mut probes = cluster();
         let text = node_text("spark-2", 13, 23)
             .replace("198.51.100.", "10.9.1.")
-            .replace("ffff:0a00:01", "ffff:0a09:01");
+            .replace("ffff:c633:64", "ffff:0a09:01");
         probes[2] = Ok(parse_facts(&text));
         let report = analyze(&SparkConfig::default(), &probes, true, 1);
         assert!(report.plan.is_none());
