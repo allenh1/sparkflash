@@ -15,6 +15,13 @@
 //! Value-for-value check of the B12x index helpers in kernels/m4_common_sm121.cuh against their
 //! Rust twins in src/mxfp8_ref.rs.
 //!
+//! **Attribution:** The `b12x` naming and SM120/SM121 block-scaled MXFP8/MXFP4 micro-tile
+//! indexing concepts originate from [`b12x`](https://github.com/local-inference-lab/b12x) (now in
+//! FlashInfer under `flashinfer/experimental/b12x`, Apache-2.0; Luke Alonso `@lukealonso`,
+//! `@original-el8`, and contributors) and
+//! [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference) (Apache-2.0). See the root
+//! `NOTICE` file for full provenance details.
+//!
 //! This exists because a comment in the wo_a kernel claimed this test did, and it did not: the two
 //! implementations were only compared with themselves, which is how a group stride taken from the
 //! weight byte size could pass every test while reading 2 MiB past the end of the scale buffer.

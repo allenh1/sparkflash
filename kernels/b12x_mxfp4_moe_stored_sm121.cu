@@ -14,6 +14,12 @@
 
 // kernels/b12x_mxfp4_moe_stored_sm121.cu
 //
+// Attribution: The "b12x" naming prefix and SM120/SM121 block-scaled MXFP8/MXFP4 micro-tile
+// layout concepts originate from b12x (https://github.com/local-inference-lab/b12x, now in
+// FlashInfer under flashinfer/experimental/b12x, Apache-2.0; Luke Alonso @lukealonso,
+// @original-el8, and contributors) and NVIDIA Flare
+// (https://github.com/NVIDIA/flare-local-inference, Apache-2.0). See the root NOTICE file.
+//
 // The stored-layout variant of the routed-expert down projection: the same tensor-parallel rank
 // partial GEMM as b12x_mxfp4_moe_sm121 (specification 2.1/6.2, decision D39), reading the released
 // plan's real 576-wide rows instead of the A8 chain's 640-padded rows. This file is a NEW symbol

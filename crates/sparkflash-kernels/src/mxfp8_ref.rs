@@ -16,6 +16,13 @@
 //! (kernels/b12x_mxfp8_dense_sm121.cu) and the grouped wo_a projection
 //! (kernels/b12x_mxfp8_wo_a_sm121.cu).
 //!
+//! **Attribution:** The `b12x` naming and SM120/SM121 block-scaled MXFP8/MXFP4 micro-tile
+//! indexing concepts originate from [`b12x`](https://github.com/local-inference-lab/b12x) (now in
+//! FlashInfer under `flashinfer/experimental/b12x`, Apache-2.0; Luke Alonso `@lukealonso`,
+//! `@original-el8`, and contributors) and
+//! [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference) (Apache-2.0). See the root
+//! `NOTICE` file for full provenance details.
+//!
 //! This module is the definition of those kernels' arithmetic. It is weight-free: it takes encoded
 //! FP8 bytes and ue8m0 scales exactly as the kernels do and dequantizes with the same codecs, so
 //! the reference cannot quietly use a different rounding rule. What it pins:

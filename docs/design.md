@@ -50,9 +50,14 @@ Every running sequence's next tokens are verified together in one **rows step** 
   use tensor-core MMA and keep a fixed reduction order. Greedy output is identical whether a
   request runs alone or with seven others, and identical to the one-row reference path.
 - **Collectives sized for the fabric.** Each layer's all-reduces run on one NCCL communicator over
-  RoCE; small exchanges (argmax, embeddings, draft tokens) use a one-shot device exchange instead
-  of host round trips. Multi-microsecond launch gaps are removed with programmatic dependent
-  launch and an L2 prefetch of the next weights on a side stream.
+  RoCE; small exchanges (argmax, embeddings, draft tokens) and the `RoCEnante` one-shot RDMA
+  transport (`crates/sparkflash-comm`, `kernels/rocenante_oneshot_sm121.cu`) follow the
+  `RoCEnante` one-shot dual-rail RoCE collective architecture originated by
+  [`b12x`](https://github.com/local-inference-lab/b12x) (Luke Alonso `@lukealonso`, `@original-el8`,
+  and contributors), [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference), and
+  [`dgx-spark-networking`](https://github.com/christopherowen/dgx-spark-networking) (Christopher Owen).
+  Multi-microsecond launch gaps are removed with programmatic dependent launch and an L2 prefetch
+  of the next weights on a side stream.
 - **Tick-ahead.** Rank 0 plans tick N+1 while tick N's device work is still running and sends the
   plan to the workers, which find it waiting when they finish.
 
@@ -116,5 +121,20 @@ Short and cached prompts take the exact rows path. Long uncached prompts take th
   concurrency 1 and 8 before a build is deployed.
 - Kernel optimisations keep each row's arithmetic order; where a change cannot (bulk prefill, the
   drafter), it is opt-out and the reference path stays available.
-- Collective reductions use a canonical rank order, so all four ranks hold bit-identical results
-  (see [DECISIONS.md](DECISIONS.md) D21).
+- Collective reductions use a canonical rank order (`0 + 1 + 2 + 3`), so all four ranks hold
+  bit-identical results (see [DECISIONS.md](DECISIONS.md) D21 and `b12x`'s `RoCEnante` design).
+
+## Prior art and attributions
+
+SparkFlash's `RoCEnante` one-shot RDMA collective transport, `b12x_*` block-scaled `sm_121a`
+kernel naming and micro-tile conventions, bounded `O_DIRECT` / `io_uring` Engram table reader,
+pre-converted weight boot path, stateless seeded Gumbel-max sampling, and online cost-model-driven
+adaptive speculation draw on prior art from [`b12x`](https://github.com/local-inference-lab/b12x)
+(Local Inference Lab / [FlashInfer](https://github.com/flashinfer-ai/flashinfer/tree/main/flashinfer/experimental/b12x)),
+[NVIDIA Flare (`flare-local-inference`)](https://github.com/NVIDIA/flare-local-inference),
+[`dgx-spark-networking`](https://github.com/christopherowen/dgx-spark-networking),
+[`MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks),
+[`knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4`](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4),
+[`blaesus/dsgx10`](https://github.com/blaesus/dsgx10), and
+[`deepseek-ai/deepseek-recipe`](https://github.com/deepseek-ai/deepseek-recipe). See the root
+[NOTICE](../NOTICE) file for complete attribution details.

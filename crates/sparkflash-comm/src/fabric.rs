@@ -14,6 +14,13 @@
 
 //! Dual-rail device discovery, validation and selection.
 //!
+//! **Attribution:** Dual-rail ConnectX-7 RoCEv2 discovery and link validation across GB10's
+//! two PCIe Gen5 x4 roots (`rocep1s0f0`/`rocep1s0f1` and `roceP2p1s0f0`/`roceP2p1s0f1`) build on
+//! [`b12x`](https://github.com/local-inference-lab/b12x) (`RoCEnante`, `b12x.comm.roce`),
+//! [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference), and
+//! [`dgx-spark-networking`](https://github.com/christopherowen/dgx-spark-networking)
+//! (Christopher Owen). See the root `NOTICE` file.
+//!
 //! Spec section 3 and checkpoint 6.1 name the rails by their f0 functions
 //! (SPEC_RAIL0_INTERFACE and SPEC_RAIL1_INTERFACE). Measured read-only on the live four-node
 //! cluster those functions are DOWN at 40 Gb/s; the ACTIVE 200 Gb/s rails are the f1 functions of

@@ -4,12 +4,17 @@
 
 > **Setting up with an AI agent?** Send your agent to [docs/agent-setup.md](docs/agent-setup.md) to set up and run this repo.
 
-SparkFlash is an inference server written from scratch in Rust and CUDA for exactly one job:
-serving [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) on a
-four-node DGX Spark (GB10) cluster. Every kernel is written for `sm_121a`, the weights are stored
-in the layout those kernels read, and the whole serving path, from HTTP to the last collective, is
-one native binary per node. It speaks the OpenAI Chat Completions API, so existing clients and
-coding agents that use it work unchanged.
+SparkFlash is a native Rust and CUDA inference server purpose-built for serving
+[DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) on a four-node DGX
+Spark (GB10) cluster, building on architectural concepts from
+[`b12x`](https://github.com/local-inference-lab/b12x),
+[NVIDIA Flare (`flare-local-inference`)](https://github.com/NVIDIA/flare-local-inference),
+[`dgx-spark-networking`](https://github.com/christopherowen/dgx-spark-networking), and the DGX
+Spark community (see [Acknowledgments & Prior Art](#acknowledgments--prior-art) and
+[NOTICE](NOTICE)). Every kernel is targeted to `sm_121a`, the weights are stored in the layout
+those kernels read, and the whole serving path, from HTTP to the last collective, is one native
+binary per node. It speaks the OpenAI Chat Completions API, so existing clients and coding agents
+that use it work unchanged.
 
 ## Benchmarks
 
@@ -205,18 +210,22 @@ Spark's constraints instead:
   once for all running sequences. The MoE kernels deduplicate experts across rows, and the next
   layer's weights are prefetched into L2 while the current layer finishes.
 - **Speculation on the device, sized per step.** V4.1-Flash's DSpark head drafts five tokens;
-  SparkFlash decides how many to verify each step from the drafts' confidence and a cost model of
-  the hardware. Code runs at five to six tokens per step.
+  following the online confidence + step-cost approach pioneered in
+  [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference), SparkFlash decides how many
+  drafts to verify each step from the drafts' calibrated confidence and a cost model of the
+  hardware. Code runs at five to six tokens per step.
 - **Tensor parallelism laid out for four nodes.** Every expert is split four ways, so no node
-  waits on another's experts. Small exchanges use a one-shot device exchange instead of NCCL's
-  ring.
+  waits on another's experts. Small exchanges and the one-shot RDMA collective path build on the
+  `RoCEnante` dual-rail architecture from [`b12x`](https://github.com/local-inference-lab/b12x) and
+  [`dgx-spark-networking`](https://github.com/christopherowen/dgx-spark-networking).
 - **Long prompts on tensor cores.** Prefill runs 4096-token chunks as FP8/FP4 tensor-core GEMMs,
   three chunks in flight so their collectives overlap compute, with one pass over the expert
   weights for all three. Layers 21-39 read only caches that layer 20 owns, so they run on a
   prompt's last 2,541 rows alone.
-- **Restarts are cheap.** Weights are converted once into each rank's final memory layout, so a
-  boot is a parallel 78 GB read plus loading pre-built kernels: 25 s, with no JIT, no graph
-  capture and no Python start-up.
+- **Restarts are cheap.** Inspired by [`b12x`](https://github.com/local-inference-lab/b12x) and
+  [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference), weights are converted once into
+  each rank's final memory layout, so a boot is a parallel 78 GB `O_DIRECT` read plus loading
+  pre-built kernels: 25 s, with no JIT, no graph capture and no Python start-up.
 
 The design is described in [docs/design.md](docs/design.md); the model itself in
 [docs/architecture/](docs/architecture/).
@@ -270,11 +279,31 @@ kernels/                 CUDA sources (compiled to cubins by scripts/build-cubin
 scripts/                 launch, build and verification tooling
 docs/                    design, performance, serving and model architecture
 reference/               upstream model card, tokenizer and encoding reference
+LICENSE                  Apache License, Version 2.0
+NOTICE                   prior-art, architectural provenance and third-party attributions
 ```
+
+## Acknowledgments & Prior Art
+
+SparkFlash's Rust runtime and CUDA C++ (`.cu` / `.cuh`) kernels draw heavily from the architectural concepts introduced by existing open source works. See [NOTICE](NOTICE) for full provenance details:
+
+- **[b12x](https://github.com/local-inference-lab/b12x)** (Local Inference Lab — **Luke Alonso ([@lukealonso](https://github.com/lukealonso) / `@lukea`)**, **[@original-el8](https://github.com/original-el8) (`@el8`)**, and contributors; Apache-2.0, now integrated into [FlashInfer `flashinfer/experimental/b12x`](https://github.com/flashinfer-ai/flashinfer/tree/main/flashinfer/experimental/b12x)):
+  - **`RoCEnante`** (`b12x.comm.roce`, documented in [`docs/rocenante.md`](https://github.com/local-inference-lab/b12x/blob/2cc7f66aaef76a9c7cbb660a1efb865cf3f26c88/docs/rocenante.md)) is the name and one-shot RoCEv2 collective architecture created by the `b12x` authors for multi-node DGX Spark tensor parallelism. SparkFlash's one-shot RDMA collective transport (`crates/sparkflash-comm`, `kernels/rocenante_oneshot_sm121.{cu,cuh}`, and `crates/sparkflash-kernels/src/roce_*.rs`) adopts the `RoCEnante` name and design: ping-pong pinned unified-memory slots registered across dual ConnectX-7 RoCEv2 rails, GPU-side staging with a system-scope fence, a dedicated CPU proxy polling a sequence doorbell and striping RDMA writes across rails with per-rail arrival flags, and deterministic canonical rank-order (`0 + 1 + 2 + 3`) f32 reduction with a single round-to-nearest-even bf16 store.
+  - The **`b12x_*`** kernel naming prefix (`kernels/b12x_*.cu`) and the **`spark_b12x_*`** `32x32` weight micro-tile / `UE8M0` block-scale indexing helpers (`kernels/m4_common_sm121.cuh` and `crates/sparkflash-kernels`) are named after and inspired by `b12x`'s `SM120`/`SM121` block-scaled MXFP8/MXFP4/NVFP4 kernel and direct-I/O loader architecture.
+- **[NVIDIA Flare (`flare-local-inference`)](https://github.com/NVIDIA/flare-local-inference)** (NVIDIA Corporation, **Luke Alonso ([@lukealonso](https://github.com/lukealonso))**, **[@original-el8](https://github.com/original-el8)**, **[@voipmonitor](https://github.com/voipmonitor)**, **[@eugr](https://github.com/eugr)**, and contributors; Apache-2.0):
+  - Pioneered native Rust local inference serving (`Helios` runtime and `Ignition` compiler, built on `b12x` and FlashInfer) on `SM120`/`SM121` and multi-node DGX Spark hardware. SparkFlash draws architectural inspiration from Flare across its Rust integration of `RoCEnante` dual-rail one-shot RDMA collectives (`helios/src/execution/roce.rs`), bounded `O_DIRECT` / `io_uring` asynchronous NVMe row gathering for out-of-core Engram/PLE tables (`helios/src/engram/reader.rs`), pre-converted weight artifacts for fast cold boot, stateless seeded Gumbel-max sampling for draft/target agreement, and online calibrated acceptance profiles paired with a step cost model for adaptive speculative verification depth (`helios/src/scheduler/speculation.rs`, `cost.rs`, `learning.rs`).
+- **[dgx-spark-networking](https://github.com/christopherowen/dgx-spark-networking)** (**Christopher Owen ([@christopherowen](https://github.com/christopherowen))**, [NVIDIA Forum #385049](https://forums.developer.nvidia.com/t/dgx-spark-networking-open-source-switchless-roce-collectives-nccl-profiles-and-fabric-tooling-for-multi-spark-inference/385049); Apache-2.0):
+  - Packaged `b12x`'s `RoCEnante` one-shot collectives (`sparknet.oneshot`) with dual-backend payload-size dispatch (routing decode-sized payloads `<= 2 MiB` to `RoCEnante` one-shot RDMA and larger prefill payloads `> 2 MiB` to dual-rail NCCL), dual-rail ConnectX-7 discovery on GB10, fabric verification / collective doctor tooling, and documentation of the AArch64 NCCL send-path memory-ordering fix ([`NVIDIA/nccl#2393`](https://github.com/NVIDIA/nccl/pull/2393) by Stanislav Bardyuk).
+- **[MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks)** (MIT) and **[knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4)** ([NVIDIA Forum #382897](https://forums.developer.nvidia.com/t/deepseek-v4-1-flash-552b-moe-on-4x-dgx-spark-tp4-77-2-tok-s-c1-on-peak-52-code-72-tok-s-on-a-warm-code-run-47-math-39-reasoning-23-prose/382897)):
+  - Established the 4x DGX Spark TP=4 unified-memory budget analysis (showing why host-RAM CPU offload of the ~189 GiB Engram tables exhausts GB10's 128 GB unified memory pool), dual-rail RoCE fabric configurations, and the SGLang baseline measurements cited in [docs/performance.md](docs/performance.md).
+- **[blaesus/dsgx10 (`spark-ds41f`)](https://github.com/blaesus/dsgx10)** ([NVIDIA Forum #385803](https://forums.developer.nvidia.com/t/squeezing-5-70-tok-s-over-sota-by-building-from-scratch-ds4-1flash-native-precision-on-4xgb10-switchless/385803)):
+  - Concurrent community exploration of native C++/CUDA + Rust serving for DeepSeek-V4.1-Flash on 4x GB10 (`sm_121a`), DSpark multi-token drafting, and switchless ConnectX-7 ring topologies.
+- **[DeepSeek AI](https://github.com/deepseek-ai)** ([`deepseek-ai/DeepSeek-V4.1-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash), [`deepseek-ai/deepseek-recipe`](https://github.com/deepseek-ai/deepseek-recipe); MIT):
+  - DeepSeek-V4.1-Flash model architecture, technical report (`arXiv:2609.19969`), Engram conditional memory paper (`arXiv:2601.07372`), upstream reference files under [`reference/`](reference/), and the `deepseek-recipe` Rust encoding, tokenization, and image preprocessing crates.
 
 ## Contributing
 
-Contributions are welcome under the Apache-2.0 license. Start with
+Contributions are welcome under the [Apache-2.0 license](LICENSE). Start with
 [CONTRIBUTING.md](CONTRIBUTING.md): it states the commit sign-off rule, the CI gates, and the
 evidence a new model must bring (tested configuration, clean and measured kernels, benchmark
 protocol, weights revision, paper or reference implementation, licensing, and supported

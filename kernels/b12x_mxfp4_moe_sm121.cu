@@ -14,6 +14,12 @@
 
 // kernels/b12x_mxfp4_moe_sm121.cu
 //
+// Attribution: The "b12x" naming prefix and SM120/SM121 block-scaled MXFP8/MXFP4 micro-tile
+// layout concepts originate from b12x (https://github.com/local-inference-lab/b12x, now in
+// FlashInfer under flashinfer/experimental/b12x, Apache-2.0; Luke Alonso @lukealonso,
+// @original-el8, and contributors) and NVIDIA Flare
+// (https://github.com/NVIDIA/flare-local-inference, Apache-2.0). See the root NOTICE file.
+//
 // The W4A8 mixture-of-experts down-projection partial of specification 2.1/6.2: 384 routed experts
 // with top-6 routing and one shared expert, whose width is 576 per rank padded to 640, FP4 E2M1
 // weights with one ue8m0 scale per 32 values along the reduction dimension, against FP8 E4M3

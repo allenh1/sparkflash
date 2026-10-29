@@ -14,6 +14,12 @@
 
 // kernels/b12x_hostw_gemv_m1_sm121.cu
 //
+// Attribution: The "b12x" naming prefix and SM120/SM121 block-scaled MXFP8/MXFP4 micro-tile
+// layout concepts originate from b12x (https://github.com/local-inference-lab/b12x, now in
+// FlashInfer under flashinfer/experimental/b12x, Apache-2.0; Luke Alonso @lukealonso,
+// @original-el8, and contributors) and NVIDIA Flare
+// (https://github.com/NVIDIA/flare-local-inference, Apache-2.0). See the root NOTICE file.
+//
 // The decode-step (M=1) GEMV whose weight is the checkpoint's OWN values - widened bf16 or plain
 // f32 - rather than MXFP8 codes with a ue8m0 grid. It is an addition, not a substitution: the pinned
 // b12x_mxfp8_gemv_m1_sm121 cubin, its four symbols and its digest are untouched, and this file

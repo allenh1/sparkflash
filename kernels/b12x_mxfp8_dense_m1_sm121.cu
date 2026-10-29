@@ -14,6 +14,12 @@
 
 // kernels/b12x_mxfp8_dense_m1_sm121.cu
 //
+// Attribution: The "b12x" naming prefix and SM120/SM121 block-scaled MXFP8/MXFP4 micro-tile
+// layout concepts originate from b12x (https://github.com/local-inference-lab/b12x, now in
+// FlashInfer under flashinfer/experimental/b12x, Apache-2.0; Luke Alonso @lukealonso,
+// @original-el8, and contributors) and NVIDIA Flare
+// (https://github.com/NVIDIA/flare-local-inference, Apache-2.0). See the root NOTICE file.
+//
 // The columns-only M=1 dense MXFP8 GEMM: the decode-step projection kernel of WS-D.
 //
 // Why this symbol exists. The pinned b12x_mxfp8_dense_sm121 kernel owns a 64x64 output tile with

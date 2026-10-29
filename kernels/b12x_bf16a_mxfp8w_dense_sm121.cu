@@ -14,6 +14,12 @@
 
 // kernels/b12x_bf16a_mxfp8w_dense_sm121.cu
 //
+// Attribution: The "b12x" naming prefix and SM120/SM121 block-scaled MXFP8/MXFP4 micro-tile
+// layout concepts originate from b12x (https://github.com/local-inference-lab/b12x, now in
+// FlashInfer under flashinfer/experimental/b12x, Apache-2.0; Luke Alonso @lukealonso,
+// @original-el8, and contributors) and NVIDIA Flare
+// (https://github.com/NVIDIA/flare-local-inference, Apache-2.0). See the root NOTICE file.
+//
 // The BF16-activation variant of the dense MXFP8 GEMM: same weights, same layout, same tile and
 // grid geometry, same trace ABI as b12x_mxfp8_dense_sm121.cu, with the ACTIVATION operand in
 // __nv_bfloat16 instead of E4M3 + ue8m0 block scales. This is the D37 precision-first path for

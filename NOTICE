@@ -1,0 +1,141 @@
+SparkFlash
+
+================================================================================
+Prior Art, Architectural Provenance, and Third-Party Attributions
+================================================================================
+
+SparkFlash's Rust runtime and CUDA C++ (.cu / .cuh) kernels draw heavily from
+the architectural concepts, hardware discoveries, and terminology introduced by
+existing open-source projects in the NVIDIA DGX Spark (GB10 / sm_121a) and
+DeepSeek inference community. While the Rust crates and CUDA C++ kernels in
+this repository are custom implementations written for SparkFlash, the system
+architecture and naming ("RoCEnante" and the "b12x_*" kernel prefix) build
+directly upon the pioneering work of the projects and authors below, who are
+gratefully acknowledged.
+
+SparkFlash is an independent open-source project and is not affiliated with,
+sponsored by, or endorsed by Local Inference Lab, NVIDIA Corporation, or
+DeepSeek AI. All project names, product names, and trademarks mentioned in this
+repository are the property of their respective owners and are used solely for
+identification and attribution under Apache License 2.0 Section 6.
+
+--------------------------------------------------------------------------------
+1. b12x and RoCEnante (Local Inference Lab / FlashInfer)
+--------------------------------------------------------------------------------
+Repository: https://github.com/local-inference-lab/b12x
+Upstream integration: https://github.com/flashinfer-ai/flashinfer/tree/main/flashinfer/experimental/b12x
+Authors: Luke Alonso (@lukealonso / @lukea), @original-el8 (@el8), and contributors
+License: Apache License, Version 2.0
+
+Attribution:
+- "RoCEnante" (b12x.comm.roce, documented in b12x's docs/rocenante.md) is the
+  name and one-shot RoCEv2 collective architecture created by the b12x authors
+  for multi-node DGX Spark tensor parallelism. SparkFlash's one-shot RDMA
+  collective transport (crates/sparkflash-comm, kernels/rocenante_oneshot_sm121.cuh,
+  kernels/rocenante_oneshot_sm121.cu, and crates/sparkflash-kernels/src/roce_*.rs)
+  adopts the RoCEnante name and design: ping-pong pinned unified-memory staging
+  and receive slots registered across dual ConnectX-7 RoCEv2 rails, GPU-side
+  staging with a system-scope fence, a dedicated CPU proxy polling a sequence
+  doorbell and striping RDMA writes across rails with per-rail sequence arrival
+  flags, and deterministic canonical rank-order (0 + 1 + 2 + 3) f32 reduction
+  with a single round-to-nearest-even bf16 store.
+- The "b12x_*" kernel naming prefix (kernels/b12x_*.cu) and the "spark_b12x_*"
+  32x32 weight micro-tile / UE8M0 block-scale indexing helpers
+  (kernels/m4_common_sm121.cuh, crates/sparkflash-kernels/src/mxfp8_ref.rs,
+  crates/sparkflash-kernels/src/mxfp4_ref.rs, and
+  crates/sparkflash-kernels/tests/b12x_index_parity.rs) are named after and
+  inspired by b12x's SM120/SM121 block-scaled MXFP8/MXFP4/NVFP4 kernel and
+  direct-I/O loader architecture.
+
+--------------------------------------------------------------------------------
+2. NVIDIA Flare (flare-local-inference / spark-local-inference)
+--------------------------------------------------------------------------------
+Repository: https://github.com/NVIDIA/flare-local-inference
+Authors: NVIDIA Corporation & Affiliates, Luke Alonso (@lukealonso / @lukea),
+         @original-el8 (@el8), @voipmonitor, @eugr, and contributors
+License: Apache License, Version 2.0
+
+Attribution:
+- Flare (Helios Rust runtime and Ignition compiler, built on b12x and FlashInfer)
+  pioneered native Rust local inference serving on SM120/SM121 and multi-node
+  DGX Spark hardware.
+- SparkFlash draws architectural inspiration from Flare across several subsystems:
+  * Rust integration of the RoCEnante dual-rail one-shot RDMA collective model
+    (helios/native/roce_proxy.c, helios/src/execution/roce.rs);
+  * Bounded O_DIRECT and io_uring asynchronous NVMe row gathering and caching
+    for out-of-core Engram / PLE embedding tables
+    (helios/src/engram/reader.rs -> crates/sparkflash-engram);
+  * Pre-converted per-rank weight artifacts for fast cold boot without Python or
+    JIT warmup overhead;
+  * Stateless seeded Gumbel-max sampling so draft and target steps share
+    identical random draws without host RNG state synchronization;
+  * Online calibrated acceptance profiles paired with a step cost model for
+    adaptive speculative verification depth
+    (helios/src/scheduler/speculation.rs, cost.rs, learning.rs ->
+    crates/sparkflash-scheduler).
+
+--------------------------------------------------------------------------------
+3. dgx-spark-networking
+--------------------------------------------------------------------------------
+Repository: https://github.com/christopherowen/dgx-spark-networking
+Forum reference: https://forums.developer.nvidia.com/t/dgx-spark-networking-open-source-switchless-roce-collectives-nccl-profiles-and-fabric-tooling-for-multi-spark-inference/385049
+Author: Christopher Owen (@christopher_owen)
+License: Apache License, Version 2.0
+
+Attribution:
+- Packaged b12x's RoCEnante one-shot collective engine (sparknet.oneshot) with
+  dual-backend payload-size dispatch (routing decode-sized payloads <= 2 MiB to
+  RoCEnante one-shot RDMA and larger prefill payloads > 2 MiB to dual-rail NCCL),
+  dual-rail ConnectX-7 HCA discovery on GB10 (rocep1s0f0/rocep1s0f1 and
+  roceP2p1s0f0/roceP2p1s0f1), fabric doctor / collective verification tooling,
+  and documentation of the AArch64 NCCL send-path memory-ordering fix
+  (NVIDIA/nccl#2393 by Stanislav Bardyuk). These directly informed
+  crates/sparkflash-comm/src/dispatch.rs, crates/sparkflash-comm/src/fabric.rs,
+  and crates/sparkflash-cli/src/doctor.rs.
+
+--------------------------------------------------------------------------------
+4. MiaAI-Lab & knapcio 4x DGX Spark TP=4 References
+--------------------------------------------------------------------------------
+Repositories:
+- https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks (MIT License)
+- https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4
+Forum reference: https://forums.developer.nvidia.com/t/deepseek-v4-1-flash-552b-moe-on-4x-dgx-spark-tp4-77-2-tok-s-c1-on-peak-52-code-72-tok-s-on-a-warm-code-run-47-math-39-reasoning-23-prose/382897
+
+Attribution:
+- Established the 4x DGX Spark TP=4 unified-memory budget analysis showing why
+  host-RAM CPU offload of the ~189 GiB Engram tables exhausts GB10's 128 GB
+  coherent unified memory pool, and provided the dual-rail RoCE SGLang baseline
+  measurements cited in docs/performance.md.
+
+--------------------------------------------------------------------------------
+5. blaesus/dsgx10 (spark-ds41f)
+--------------------------------------------------------------------------------
+Repository: https://github.com/blaesus/dsgx10
+Forum reference: https://forums.developer.nvidia.com/t/squeezing-5-70-tok-s-over-sota-by-building-from-scratch-ds4-1flash-native-precision-on-4xgb10-switchless/385803
+Author: @blaesus
+
+Attribution:
+- Concurrent community exploration of native C++/CUDA + Rust serving for
+  DeepSeek-V4.1-Flash on 4x GB10 (sm_121a), DSpark multi-token drafting, and
+  switchless ConnectX-7 ring topologies.
+
+--------------------------------------------------------------------------------
+6. DeepSeek AI (DeepSeek-V4.1-Flash & deepseek-recipe)
+--------------------------------------------------------------------------------
+Repositories:
+- https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash
+- https://github.com/deepseek-ai/deepseek-recipe
+Papers:
+- DeepSeek-V4.1-Flash Technical Report (arXiv:2609.19969)
+- Conditional Memory via Scalable Lookup: A New Axis of Sparsity for Large
+  Language Models / Engram (arXiv:2601.07372)
+Copyright (c) 2023-2026 DeepSeek
+License: MIT License
+
+Attribution:
+- Upstream model configuration, tokenizer, and Python encoding reference files
+  under reference/ are Copyright (c) DeepSeek and licensed under the MIT License.
+- Prompt formatting, DSML tool-call parsing, thinking-mode sampling defaults,
+  and dynamic-resolution vision preprocessing in crates/sparkflash-api,
+  crates/sparkflash-model-deepseek-v41, and crates/sparkflash-vision follow the
+  official deepseek-recipe Rust crates.

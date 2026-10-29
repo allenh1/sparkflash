@@ -14,6 +14,12 @@
 
 // kernels/m4_common_sm121.cuh
 //
+// Attribution: The "b12x" naming prefix and SM120/SM121 block-scaled MXFP8/MXFP4 micro-tile
+// layout concepts originate from b12x (https://github.com/local-inference-lab/b12x, now in
+// FlashInfer under flashinfer/experimental/b12x, Apache-2.0; Luke Alonso @lukealonso,
+// @original-el8, and contributors) and NVIDIA Flare
+// (https://github.com/NVIDIA/flare-local-inference, Apache-2.0). See the root NOTICE file.
+//
 // Shared constants, dtype codecs and geometry asserts of the Milestone 4 sm_121a kernels
 // (specification section 6.2, line 1337, with the architecture in 2.1-2.4).
 //

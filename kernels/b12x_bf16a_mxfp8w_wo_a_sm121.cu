@@ -14,6 +14,12 @@
 
 // kernels/b12x_bf16a_mxfp8w_wo_a_sm121.cu
 //
+// Attribution: The "b12x" naming prefix and SM120/SM121 block-scaled MXFP8/MXFP4 micro-tile
+// layout concepts originate from b12x (https://github.com/local-inference-lab/b12x, now in
+// FlashInfer under flashinfer/experimental/b12x, Apache-2.0; Luke Alonso @lukealonso,
+// @original-el8, and contributors) and NVIDIA Flare
+// (https://github.com/NVIDIA/flare-local-inference, Apache-2.0). See the root NOTICE file.
+//
 // The BF16-activation variant of the grouped output projection wo_a: the grouped twin of
 // b12x_bf16a_mxfp8w_dense_sm121.cu and the D37 precision-first path for K6 (docs/DECISIONS.md
 // D37, docs/archive/build/phase3-attn-precision.md). Weights are exactly the B12x FP8 codes and ue8m0
