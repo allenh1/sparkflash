@@ -226,8 +226,8 @@ The design is described in [docs/design.md](docs/design.md); the model itself in
 
 One server answers OpenAI Chat Completions (`/v1/chat/completions`), Completions (`/v1/completions`),
 Responses (`/v1/responses`) and Anthropic Messages (`/v1/messages`), with V4.1's tool calls parsed
-into standard tool-call items, its reasoning returned separately, images (on Chat Completions), `n`,
-`seed` and `stop`, plus `/tokenize`, `/detokenize`, `/metrics`, `/health` and `/readyz`.
+into standard tool-call items, its reasoning returned separately, images on every conversation
+route, `n`, `seed` and `stop`, plus `/tokenize`, `/detokenize`, `/metrics`, `/health` and `/readyz`.
 
 Not supported yet: `logprobs`, repetition, presence and frequency penalties, `response_format` JSON
 modes, and Responses/Anthropic shapes the V4.1 chat template cannot represent (these return an error
