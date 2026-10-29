@@ -1,19 +1,3 @@
-<!--
-Copyright (c) 2026 Hunter L. Allen
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
-
 # Serving
 
 `sparkflash serve` runs one process per DGX Spark. Rank 0 serves HTTP; ranks 1-3 only run the
@@ -95,9 +79,9 @@ turns 200 when it accepts requests. If any rank dies, the others exit rather tha
 | Route | Notes |
 | :-- | :-- |
 | `POST /v1/chat/completions` | Streaming and buffered; tools and tool calls (DeepSeek V4.1 format, parsed into OpenAI `tool_calls`); `reasoning_effort` / thinking with the reasoning returned separately; images; `n`, `seed`, `stop`, `max_tokens`, `temperature`, `top_p`, `top_k`; `stream_options.include_usage` |
-| `POST /v1/completions` | Text or token-id prompts, streaming and buffered |
-| `POST /v1/responses` | OpenAI Responses API: string, message, content-part, function-call and function-output input; instructions; reasoning items; Responses tools and tool calls as `function_call` items; buffered and SSE (`response.created` through `response.completed`) |
-| `POST /v1/messages` | Anthropic Messages API: system blocks, text/thinking/tool-use/tool-result blocks, Anthropic tools and tool calls as `tool_use` blocks; buffered and SSE (`message_start` through `message_stop`) |
+| `POST /v1/completions` | Text or token-id prompts, streaming and buffered; a prompt carrying an image marker is refused (this route has no image part to fill it) |
+| `POST /v1/responses` | OpenAI Responses API: string, message, content-part (`input_text`, `input_image`), function-call and function-output input; instructions; reasoning items; Responses tools and tool calls as `function_call` items; buffered and SSE (`response.created` through `response.completed`) |
+| `POST /v1/messages` | Anthropic Messages API: system blocks, text/thinking/tool-use/tool-result/image blocks, a `system` role inside `messages` (folded into the system prompt), Anthropic tools and tool calls as `tool_use` blocks; buffered and SSE (`message_start` through `message_stop`) |
 | `GET /v1/models`, `/v1/models/{id}` | The served model is `deepseek-ai/DeepSeek-V4.1-Flash` |
 | `POST /tokenize`, `/detokenize` | vLLM-compatible |
 | `GET /health`, `/readyz` | Liveness (503, with the reason, once the device loop has failed or stalled), and readiness (also 503 while draining) |
@@ -112,10 +96,13 @@ bearer token on every route except health, readiness and metrics.
 - **Responses and Anthropic shapes the chat template cannot represent are refused typed**, not
   silently dropped: hosted/built-in/custom Responses tools, `item_reference`, `previous_response_id`
   (this server keeps no response store), JSON output formats, Anthropic document/search blocks,
-  image blocks (only `/v1/chat/completions` reads images) and a tool choice that forces a call
-  (OpenAI `required`, Anthropic `any`, or a named function/tool). Both adapters render the same
-  V4.1 chat template and tokenize it through the checkpoint tokenizer, so with that tokenizer
-  attached the prompt ids are the checkpoint's real ids.
+  and a tool choice that forces a call (OpenAI `required`, Anthropic `any`, or a named
+  function/tool). Images are read on all three conversation routes (chat message `image_url`/
+  `input_image` parts, Responses `input_image` parts, Anthropic `image` blocks); Completions takes
+  text only and refuses an image by name, whether it arrives as an `<image>...</image>` tag, a
+  placeholder spelling or the image token in pre-tokenized ids, or as a carrier key in the body. Both adapters render the same V4.1 chat template and tokenize it through the
+  checkpoint tokenizer, so with that tokenizer attached the prompt ids are the checkpoint's real
+  ids.
 - `logprobs` / `top_logprobs`, and repetition, presence and frequency penalties: refused with an
   error rather than ignored.
 - `response_format` `json_object` / `json_schema` (structured output needs constrained decoding,
@@ -132,9 +119,8 @@ bearer token on every route except health, readiness and metrics.
 ## Behaviour
 
 - **Concurrency.** Up to 32 sequences run at once (`SPARKFLASH_LANES`); up to 64 more wait in a
-  queue, after which requests are refused (503). Up to eight decoding sequences take one
-  speculative step together; with more than eight decoding, every sequence gets one token per
-  step and no speculation, so per-stream speed drops sharply past eight.
+  queue, after which requests are refused (503). Up to 32 decoding sequences share one speculative
+  step of up to 64 verify rows, drafted in passes of sixteen.
 - **Prefix reuse.** A request that extends an earlier request's prompt (a multi-turn chat or an
   agent loop) reuses its KV. Concurrent requests with a common prefix prefill it once.
 - **Long prompts.** Prompts are prefilled in chunks between decode steps, so running streams
@@ -158,4 +144,4 @@ Defaults are what the numbers in [performance.md](performance.md) were measured 
 | `SPARKFLASH_PREFILL_DECODER_SKIP=0` | Run every layer over every prompt row (slower long prompts; for comparison). By default a prompt's rows before its last 2,541 run only layers 0-20, which hold every cache the later layers read |
 | `SPARKFLASH_PREFILL_MOE_MERGE=0` | Run each in-flight prefill chunk's experts separately (slower; for comparison) |
 | `SPARKFLASH_WARMUP=0` | Skip the warm-up pass before HTTP binds (the first request then pays the one-time setup) |
-| `NCCL_*` | Passed to every rank by the launcher |
+| `NCCL_*`, `SPARKFLASH_SERVE_API_KEY`, `SPARKFLASH_PREFILL_*`, `SPARKFLASH_BATCH_*`, `SPARKFLASH_DECODE_*` | Passed to every rank by the launcher |

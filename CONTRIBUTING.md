@@ -1,19 +1,3 @@
-<!--
-Copyright (c) 2026 Hunter L. Allen
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
-
 # Contributing to SparkFlash
 
 SparkFlash is an inference engine for large sparse models on small, memory-coherent GPUs. The
@@ -29,15 +13,8 @@ are about evidence, not ceremony. Read them before you open a merge request.
   `Signed-off-by: Your Name <you@example.com>`. Use `git commit -s`; the sign-off certifies that
   you wrote the change or have the right to submit it. Do not add co-authorship trailers for tools
   or assistants.
-- **No deployment details.** Never commit hostnames, LAN or RoCE addresses, SSH keys, passwords,
-  credentials, internal Git URLs, personal home directories, or notes about a particular cluster.
-  Documentation examples use `node0`-`node3` and the TEST-NET ranges (`192.0.2.0/24`,
-  `198.51.100.0/24`, `203.0.113.0/24`). A change that leaks any of these is rejected even if the code
-  is correct.
 - **One idea per commit.** Keep mechanical changes (formatting, renaming, license headers) separate
   from behavioural changes so a reviewer can see the behaviour.
-- **Third-party material.** Preserve upstream notices. `reference/` is DeepSeek's MIT-licensed
-  reference material and must not be relicensed or stamped with this project's copyright.
 
 ## Before you send a change
 

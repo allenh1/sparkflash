@@ -194,6 +194,21 @@ pub fn count_image_placeholders(text: &str) -> usize {
     text.matches(IMAGE_PLACEHOLDER).count()
 }
 
+/// The first image marker in raw prompt text, named for a refusal message.
+///
+/// A marker is a complete `<image>...</image>` tag or a placeholder in any known spelling. A
+/// route that takes a prompt rather than messages has no image part to pair a marker with, so it
+/// refuses the marker instead of letting it reach the model with no canvas behind it
+/// (DECISIONS.md D59).
+#[must_use]
+pub fn image_marker_in(text: &str) -> Option<&'static str> {
+    if replace_image_tags(text) != text {
+        return Some("<image>...</image> tag");
+    }
+    (count_image_placeholders(&normalize_image_placeholders(text)) > 0)
+        .then_some("image placeholder")
+}
+
 /// Visual tokens a `grid_h x grid_w` ViT patch grid produces after 3x3 pixel-unshuffle.
 ///
 /// This is the published tiling arithmetic - ceil(grid / 3) tiles per axis, multiplied together -
@@ -364,6 +379,30 @@ mod tests {
         assert!(!prepared.contains('|'));
         assert!(!prepared.contains("<image>"));
         assert_eq!(count_image_placeholders(&prepared), 2);
+    }
+
+    #[test]
+    fn markers_are_found_in_every_spelling_and_named() {
+        assert_eq!(
+            image_marker_in("a<image>xyz</image>b"),
+            Some("<image>...</image> tag")
+        );
+        assert_eq!(
+            image_marker_in("a <|deepseek_image|> b"),
+            Some("image placeholder")
+        );
+        assert_eq!(image_marker_in("<|image|>"), Some("image placeholder"));
+        assert_eq!(
+            image_marker_in("<image>1</image> <|deepseek_image|>"),
+            Some("<image>...</image> tag"),
+            "a tag is named as a tag even beside a placeholder"
+        );
+        // An unterminated tag is text (the reference encoder leaves it alone), and prose that
+        // mentions an image, or carries a data: URL, is text too (D27's fail-open rule).
+        assert_eq!(image_marker_in("a<image>b"), None);
+        assert_eq!(image_marker_in("an image of a cat"), None);
+        assert_eq!(image_marker_in("data:image/png;base64,aGVsbG8="), None);
+        assert_eq!(image_marker_in("<|rl_image_start|>"), None);
     }
 
     #[test]
