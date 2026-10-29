@@ -780,47 +780,79 @@ async fn anthropic_refuses_malformed_shapes_typed() {
     }
 }
 
-#[tokio::test]
-async fn anthropic_thinking_disabled_reaches_the_prompt_and_top_k_reaches_the_engine() {
-    let requests: Arc<Mutex<Vec<EngineRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    struct Recorder {
-        requests: Arc<Mutex<Vec<EngineRequest>>>,
-        inner: MockEngine,
+/// A scripted engine that also keeps the normalized request it served.
+struct Recorder {
+    requests: Arc<Mutex<Vec<EngineRequest>>>,
+    inner: MockEngine,
+}
+
+impl Recorder {
+    fn new(inner: MockEngine) -> (Self, Arc<Mutex<Vec<EngineRequest>>>) {
+        let requests: Arc<Mutex<Vec<EngineRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                requests: Arc::clone(&requests),
+                inner,
+            },
+            requests,
+        )
     }
-    impl InferenceEngine for Recorder {
-        fn model_id(&self) -> &str {
-            self.inner.model_id()
-        }
-        fn generate(
-            &self,
-            request: EngineRequest,
-        ) -> futures::stream::BoxStream<'static, sparkflash_api::engine::EngineEvent> {
-            self.requests
-                .lock()
-                .expect("request log")
-                .push(request.clone());
-            self.inner.generate(request)
-        }
-        fn capabilities(&self) -> Capabilities {
-            self.inner.capabilities()
-        }
-        fn cluster_stats(&self) -> ClusterStatsSnapshot {
-            self.inner.cluster_stats()
-        }
+}
+
+impl InferenceEngine for Recorder {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
     }
-    let recorder = Recorder {
-        requests: Arc::clone(&requests),
-        inner: MockEngine::new(MODEL)
-            .with_capabilities(Capabilities::ALL)
-            .content(&["ok"]),
-    };
+    fn generate(
+        &self,
+        request: EngineRequest,
+    ) -> futures::stream::BoxStream<'static, sparkflash_api::engine::EngineEvent> {
+        self.requests
+            .lock()
+            .expect("request log")
+            .push(request.clone());
+        self.inner.generate(request)
+    }
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+    fn cluster_stats(&self) -> ClusterStatsSnapshot {
+        self.inner.cluster_stats()
+    }
+}
+
+/// A recording engine behind a recording codec: the app and the two logs it fills.
+struct Recorded {
+    app: Router,
+    engine_requests: Arc<Mutex<Vec<EngineRequest>>>,
+    prompts: Arc<Mutex<Vec<Value>>>,
+}
+
+fn recorded_app(engine: MockEngine) -> Recorded {
+    let (recorder, engine_requests) = Recorder::new(engine);
     let codec = RecordingCodec::default();
-    let codec_requests = Arc::clone(&codec.requests);
+    let prompts = Arc::clone(&codec.requests);
     let app = router(
         AppState::new(Arc::new(recorder))
             .with_fixed_time(FIXED_TIME)
             .with_tokenizer(Arc::new(codec)),
     );
+    Recorded {
+        app,
+        engine_requests,
+        prompts,
+    }
+}
+
+#[tokio::test]
+async fn anthropic_thinking_disabled_reaches_the_prompt_and_top_k_reaches_the_engine() {
+    let recorded = recorded_app(
+        MockEngine::new(MODEL)
+            .with_capabilities(Capabilities::ALL)
+            .content(&["ok"]),
+    );
+    let (app, requests, codec_requests) =
+        (recorded.app, recorded.engine_requests, recorded.prompts);
     let body = json!({
         "model": MODEL,
         "max_tokens": 16,
@@ -840,6 +872,72 @@ async fn anthropic_thinking_disabled_reaches_the_prompt_and_top_k_reaches_the_en
     let engine_request = requests.lock().expect("engine log")[0].clone();
     assert_eq!(engine_request.top_k, 7);
     assert!(!engine_request.thinking);
+}
+
+#[tokio::test]
+async fn anthropic_adaptive_thinking_turns_thinking_on_and_carries_the_effort() {
+    // Claude Code sends {"thinking": {"type": "adaptive", "display": "omitted"}} with
+    // {"output_config": {"effort": "high"}}. The template has one switch, so adaptive is on, and
+    // the effort becomes the template's reasoning_effort (high is the 50-level of its table).
+    let recorded = recorded_app(
+        MockEngine::new(MODEL)
+            .with_capabilities(Capabilities::ALL)
+            .content(&["ok"]),
+    );
+    let (app, requests, codec_requests) =
+        (recorded.app, recorded.engine_requests, recorded.prompts);
+    let body = json!({
+        "model": MODEL,
+        "max_tokens": 32000,
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "adaptive", "display": "omitted"},
+        "output_config": {"effort": "high"},
+    });
+    let (status, bytes) = send(app, "/v1/messages", &body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let captured = codec_requests.lock().expect("codec log");
+    assert_eq!(captured[0]["enable_thinking"], true);
+    assert_eq!(captured[0]["reasoning_effort"], "high");
+    let engine_request = requests.lock().expect("engine log")[0].clone();
+    assert!(engine_request.thinking);
+    assert_eq!(engine_request.reasoning_effort, Some(50));
+}
+
+#[tokio::test]
+async fn an_unknown_thinking_type_is_refused_by_name() {
+    for (thinking, named) in [
+        (json!({"type": "sometimes"}), Some("sometimes")),
+        (json!({"type": 7}), None),
+    ] {
+        let body = json!({
+            "model": MODEL,
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": thinking,
+        });
+        let (status, bytes) = send(app_with(MockEngine::new(MODEL)), "/v1/messages", &body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let error = body_json(&bytes);
+        let message = error["error"]["message"].as_str().expect("a message");
+        assert!(
+            message.contains("\"enabled\", \"disabled\" or \"adaptive\""),
+            "{message}"
+        );
+        match named {
+            Some(named) => assert!(message.contains(named), "{message}"),
+            None => assert!(message.contains("non-string"), "{message}"),
+        }
+    }
 }
 
 fn dsml_answer() -> String {

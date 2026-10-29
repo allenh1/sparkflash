@@ -973,18 +973,38 @@ fn resolve_model(state: &AppState, requested: Option<&str>) -> Result<String, Ap
     let engine_id = state.model_id();
     match requested.map(str::trim).filter(|model| !model.is_empty()) {
         None => Ok(engine_id.to_owned()),
-        Some(requested) if model_matches(requested, engine_id) => Ok(engine_id.to_owned()),
+        Some(requested) if model_matches(requested, engine_id, state.model_aliases()) => {
+            Ok(engine_id.to_owned())
+        }
         Some(requested) => Err(ApiError::model_not_found(requested)),
     }
 }
 
-fn model_matches(requested: &str, engine_id: &str) -> bool {
+/// The bare model id a client named, without a protocol suffix.
+///
+/// Anthropic spells a 1M-context request as `model[1m]`, and Claude Code sends that spelling
+/// through to the server; the suffix decorates the id rather than replacing it.
+fn without_model_suffix(requested: &str) -> &str {
+    match requested.strip_suffix(']') {
+        Some(stem) => match stem.rfind('[') {
+            Some(open) => stem[..open].trim_end(),
+            None => requested,
+        },
+        None => requested,
+    }
+}
+
+fn model_matches(requested: &str, engine_id: &str, aliases: &[String]) -> bool {
+    let requested = without_model_suffix(requested.trim());
     if requested.eq_ignore_ascii_case(engine_id) {
         return true;
     }
     let requested_leaf = requested.rsplit('/').next().unwrap_or(requested);
     let engine_leaf = engine_id.rsplit('/').next().unwrap_or(engine_id);
     requested_leaf.eq_ignore_ascii_case(engine_leaf)
+        || aliases
+            .iter()
+            .any(|alias| alias.eq_ignore_ascii_case(requested))
 }
 
 /// Resolves the requested output-token budget against the V4.1 ceiling.
@@ -4226,6 +4246,18 @@ fn validate_responses_text_format(text: Option<&Value>) -> Result<(), ApiError> 
     }
 }
 
+/// The template spelling of a client's reasoning effort.
+///
+/// The released template understands low/high/xhigh/max/none. OpenAI also spells minimal and
+/// medium; map them onto the template's nearest documented aliases.
+fn reasoning_effort_alias(effort: &Value) -> Value {
+    match effort.as_str() {
+        Some("minimal") => json!("low"),
+        Some("medium") => json!("high"),
+        _ => effort.clone(),
+    }
+}
+
 fn responses_bridge(value: &Value, request: &ResponsesRequest) -> Result<ChatBridge, ApiError> {
     if request.previous_response_id.is_some() {
         return Err(ApiError::invalid_request(
@@ -4276,14 +4308,10 @@ fn responses_bridge(value: &Value, request: &ResponsesRequest) -> Result<ChatBri
         .as_ref()
         .and_then(|reasoning| reasoning.get("effort"))
     {
-        // The released template understands low/high/xhigh/max/none. OpenAI also spells
-        // minimal and medium; map them onto the template's nearest documented aliases.
-        let effort = match effort.as_str() {
-            Some("minimal") => json!("low"),
-            Some("medium") => json!("high"),
-            _ => effort.clone(),
-        };
-        chat.insert("reasoning_effort".to_owned(), effort);
+        chat.insert(
+            "reasoning_effort".to_owned(),
+            reasoning_effort_alias(effort),
+        );
     }
     for key in ["enable_thinking", "chat_template_kwargs"] {
         if let Some(value) = value.get(key).filter(|value| !value.is_null()) {
@@ -4690,20 +4718,40 @@ fn anthropic_bridge(request: &MessagesRequest) -> Result<ChatBridge, ApiError> {
             ));
         };
         match thinking.get("type").and_then(Value::as_str) {
-            Some("enabled") => {
+            // "adaptive" is the current Anthropic mode: the model decides when and how much to
+            // think, and the client asks for an amount through output_config.effort (carried
+            // below). The V4.1 template has one switch, so adaptive means thinking on.
+            Some("enabled" | "adaptive") => {
                 chat.insert("enable_thinking".to_owned(), Value::Bool(true));
             }
             Some("disabled") => {
                 chat.insert("enable_thinking".to_owned(), Value::Bool(false));
             }
-            _ => {
+            other => {
                 return Err(ApiError::invalid_request(
-                    "thinking.type must be \"enabled\" or \"disabled\"",
+                    format!(
+                        "thinking.type must be \"enabled\", \"disabled\" or \"adaptive\", got {}",
+                        other.map_or_else(
+                            || "a non-string value".to_owned(),
+                            |value| format!("{value:?}")
+                        )
+                    ),
                     Some("thinking".to_owned()),
                     Some("invalid_thinking".to_owned()),
                 ));
             }
         }
+    }
+    if let Some(effort) = request
+        .output_config
+        .as_ref()
+        .and_then(|config| config.get("effort"))
+        .filter(|effort| !effort.is_null())
+    {
+        chat.insert(
+            "reasoning_effort".to_owned(),
+            reasoning_effort_alias(effort),
+        );
     }
     chat_bridge(Value::Object(chat), policy.tools_offered, policy.parallel)
 }
@@ -6480,7 +6528,7 @@ async fn retrieve_model(
 ) -> Result<Response, ApiError> {
     // Axum's rest-of-path capture keeps the separating slash.
     let model = model.trim_start_matches('/');
-    if !model_matches(model, state.model_id()) {
+    if !model_matches(model, state.model_id(), state.model_aliases()) {
         return Err(ApiError::model_not_found(model));
     }
     Ok(Json(model_card(&state, state.now_unix())).into_response())

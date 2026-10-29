@@ -5140,6 +5140,7 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
         .with_tokenizer(seam)
         .with_api_key(options.api_key.clone())
         .with_cors(options.cors.clone())
+        .with_model_aliases(model_aliases())
         .with_device_token_source(device_token_source);
     let drain_state = state.clone();
     let router = sparkflash_api::server::router(state);
@@ -5331,6 +5332,7 @@ fn serve_with_engine(
         .with_tokenizer(seam)
         .with_api_key(options.api_key.clone())
         .with_cors(options.cors.clone())
+        .with_model_aliases(model_aliases())
         .with_device_token_source(device_token_source);
     // A debug-build test seam: a wire test can shorten the keep-alive interval so an idle engine
     // gap produces observable comment frames without waiting the production 15 s. Debug-only, so
@@ -5615,6 +5617,22 @@ fn drain_delay() -> Duration {
 }
 
 /// Reads a positive millisecond duration from \`name\`, or returns \`default\` for unset/invalid.
+/// The other model ids this server answers to.
+///
+/// `SPARKFLASH_MODEL_ALIASES` holds a comma- or whitespace-separated list. A client configured
+/// for another provider sends its own model name (Claude Code sends its
+/// `ANTHROPIC_DEFAULT_*_MODEL` value), so an alias is what lets one server answer it without an
+/// edit on the client.
+pub(crate) fn model_aliases() -> Vec<String> {
+    std::env::var("SPARKFLASH_MODEL_ALIASES")
+        .unwrap_or_default()
+        .split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn drain_millis_env(name: &str, default: Duration) -> Duration {
     std::env::var(name)
         .ok()

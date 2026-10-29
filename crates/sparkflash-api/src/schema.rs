@@ -450,6 +450,8 @@ pub struct MessagesRequest {
     pub tool_choice: Option<Value>,
     /// Extended-thinking configuration.
     pub thinking: Option<Value>,
+    /// Anthropic's `output_config` (adaptive thinking's `effort` lives here).
+    pub output_config: Option<Value>,
     /// Top-k sampling (Anthropic's extension over the OpenAI surface).
     pub top_k: Option<i32>,
     /// Request metadata.
