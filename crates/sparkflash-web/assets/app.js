@@ -802,9 +802,10 @@ function guideModel(state) {
   const all = (field) => !!setup && nodes.every((node) => node[field] === "ready");
   const errors = (setup?.findings || []).filter((finding) => finding.severity === "error");
   const found = saved && ((!!setup && nodes.every((node) => node.reachable)) || sshOk);
+  const networkErrors = errors.filter((finding) => finding.rank === null || finding.rank === undefined || nodes[finding.rank]?.reachable !== false);
   const steps = {
     find: { done: found },
-    network: { done: found && !!setup?.plan && errors.length === 0 && planApplied(config, setup.plan) },
+    network: { done: found && !!setup?.plan && networkErrors.length === 0 && planApplied(config, setup.plan) },
     software: { done: found && all("software"), running: runningJob(ofKind("sync-software")) },
     download: { done: found && nodes[0]?.model === "ready", running: runningJob(ofKind("download")) },
     copy: { done: found && all("model"), running: runningJob(ofKind("sync-model")) },
@@ -1135,7 +1136,10 @@ function convertBody(state, model) {
     return job ? "Preparing, " + fmtDuration(Date.now() - job.started_ms) : "";
   })];
   if (running.length > 0) {
-    parts.push(progressBar(null, "All four Sparks are converting their part of the model at the same time."));
+    const label = running.length === 4
+      ? "All four Sparks are converting their part of the model at the same time."
+      : running.length + (running.length === 1 ? " Spark is" : " Sparks are") + " converting weights…";
+    parts.push(progressBar(null, label));
     return parts.join("");
   }
   for (const rank of [0, 1, 2, 3]) {
@@ -1172,7 +1176,7 @@ function launchBody(state, model) {
     return parts.join("");
   }
   if (running || model.online) {
-    parts.push(progressBar(running, "Starting the four Sparks and loading the model. This takes a few minutes."));
+    parts.push(progressBar(running, "Starting the four Sparks and loading the model (~25 seconds)."));
     return parts.join("");
   }
   parts.push(failureNote(latestJob(ofKind("launch")), "Starting the server"));
@@ -1202,8 +1206,8 @@ function guideSummary(key, state, model) {
     case "find":
       return state.config.cluster.nodes.map((node) => node.ssh).join(", ");
     case "network": {
-      const warnings = (setup?.findings || []).length;
-      const lanes = setup ? Math.min(...setup.nodes.map((node) => node.rails.length)) : 0;
+      const warnings = (setup?.findings || []).filter((finding) => finding.severity === "warning").length;
+      const lanes = setup && setup.nodes.length ? Math.min(...setup.nodes.map((node) => node.rails.length)) : 0;
       return lanes + (lanes === 1 ? " lane" : " lanes") + " per Spark" + (warnings ? ", " + warnings + (warnings === 1 ? " warning" : " warnings") : "");
     }
     case "software":
@@ -1356,8 +1360,11 @@ function bindGuide() {
     }
     const log = event.target.closest("[data-job-log]");
     if (log) {
+      event.preventDefault();
       S.selectedJob = Number(log.dataset.jobLog);
       S.jobDetail = null;
+      if (location.hash === "#activity") showTab("activity");
+      else location.hash = "activity";
       return;
     }
     const action = event.target.closest("[data-act]");

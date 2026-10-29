@@ -1,19 +1,3 @@
-<!--
-Copyright (c) 2026 Hunter L. Allen
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
-
 # Serving
 
 `sparkflash serve` runs one process per DGX Spark. Rank 0 serves HTTP; ranks 1-3 only run the
@@ -132,9 +116,8 @@ bearer token on every route except health, readiness and metrics.
 ## Behaviour
 
 - **Concurrency.** Up to 32 sequences run at once (`SPARKFLASH_LANES`); up to 64 more wait in a
-  queue, after which requests are refused (503). Up to eight decoding sequences take one
-  speculative step together; with more than eight decoding, every sequence gets one token per
-  step and no speculation, so per-stream speed drops sharply past eight.
+  queue, after which requests are refused (503). Up to 32 decoding sequences share one speculative
+  step of up to 64 verify rows, drafted in passes of sixteen.
 - **Prefix reuse.** A request that extends an earlier request's prompt (a multi-turn chat or an
   agent loop) reuses its KV. Concurrent requests with a common prefix prefill it once.
 - **Long prompts.** Prompts are prefilled in chunks between decode steps, so running streams
@@ -158,4 +141,4 @@ Defaults are what the numbers in [performance.md](performance.md) were measured 
 | `SPARKFLASH_PREFILL_DECODER_SKIP=0` | Run every layer over every prompt row (slower long prompts; for comparison). By default a prompt's rows before its last 2,541 run only layers 0-20, which hold every cache the later layers read |
 | `SPARKFLASH_PREFILL_MOE_MERGE=0` | Run each in-flight prefill chunk's experts separately (slower; for comparison) |
 | `SPARKFLASH_WARMUP=0` | Skip the warm-up pass before HTTP binds (the first request then pays the one-time setup) |
-| `NCCL_*` | Passed to every rank by the launcher |
+| `NCCL_*`, `SPARKFLASH_SERVE_API_KEY`, `SPARKFLASH_PREFILL_*`, `SPARKFLASH_BATCH_*`, `SPARKFLASH_DECODE_*` | Passed to every rank by the launcher |

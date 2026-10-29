@@ -116,6 +116,7 @@ rank_env() {
     # rather than hard-coded so a web-driven launch and a hand-written one run the same flags.
     [ -n "${SPARK_MAX_SEQ_LEN:-}" ] && printf ' SPARK_MAX_SEQ_LEN=%s' "$SPARK_MAX_SEQ_LEN"
     [ -n "${SPARKFLASH_LANES:-}" ] && printf ' SPARKFLASH_LANES=%s' "$SPARKFLASH_LANES"
+    [ -n "${SPARKFLASH_SERVE_API_KEY:-}" ] && printf ' SPARKFLASH_SERVE_API_KEY=%q' "$SPARKFLASH_SERVE_API_KEY"
     if [ -n "$CUBINS" ]; then
         printf ' SPARK_COMM_REDUCE=nccl SPARKFLASH_LEAN_HEAD=1'
         [ -n "$NCCL_LIB" ] && printf ' LD_LIBRARY_PATH=%s${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}' "$NCCL_LIB"

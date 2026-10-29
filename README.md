@@ -1,22 +1,8 @@
-<!--
-Copyright (c) 2026 Hunter L. Allen
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
-
 # SparkFlash
 
-**DeepSeek-V4.1-Flash on four NVIDIA DGX Sparks: 125 tok/s single-stream, 25 s boot, 1M context.**
+**DeepSeek-V4.1-Flash on four NVIDIA DGX Sparks: 132 tok/s single-stream, 25 s boot, 1M context.**
+
+> **Setting up with an AI agent?** Send your agent to [docs/agent-setup.md](docs/agent-setup.md) to set up and run this repo.
 
 SparkFlash is an inference server written from scratch in Rust and CUDA for exactly one job:
 serving [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) on a
@@ -25,18 +11,27 @@ in the layout those kernels read, and the whole serving path, from HTTP to the l
 one native binary per node. It speaks the OpenAI Chat Completions API, so existing clients and
 coding agents that use it work unchanged.
 
-| Measured on 4x DGX Spark | |
-| :-- | --: |
-| Single stream, code | **125.5 tok/s** |
-| Single stream, prose | **73.9 tok/s** |
-| 4 concurrent streams, code | **51 tok/s each** |
-| 8 concurrent agents, code | **30.5 tok/s each** (180 tok/s total) |
-| 16 concurrent agents, code | **18.8 tok/s each** (200 tok/s total) |
-| 200K-token prompt, cold | **57 s** to first token |
-| Context per sequence | **1,048,576 tokens** |
-| Server start to serving | **25 s** |
+## Benchmarks
 
-Details and methodology: [docs/performance.md](docs/performance.md).
+Four DGX Sparks at tensor parallelism 4, one network cable per node, default clocks, greedy,
+client-side over HTTP.
+
+| Benchmark | Result |
+| :-- | --: |
+| Single stream, code | **131.8 tok/s** |
+| Single stream, prose | **86.2 tok/s** |
+| 4 streams, code, each | **60.8 tok/s** |
+| 8 streams, code, total | **270 tok/s** |
+| 16 streams, code, total | **304 tok/s** |
+| Prefill, ~32K-token prompt | **6,400 tok/s** |
+| Start-up to serving | **25 s** |
+| Greedy output at any concurrency | decode identical; prefill with `SPARKFLASH_PREFILL_EXACT=1` |
+| Network, per node | one cable, both RoCE devices |
+| In the serving path | one Rust binary per node |
+
+Decode: sparkDash 1.8.8 DecodeBench prompts, 256 tokens, temperature 0, idle server. Full results:
+[docs/performance.md](docs/performance.md).
+
 
 ## Quick start
 
@@ -44,8 +39,7 @@ Details and methodology: [docs/performance.md](docs/performance.md).
 
 - **Four DGX Sparks** running DGX OS, on the same network as the computer you set them up from,
   with the same user account name on each (the account made at first boot is fine).
-- **One QSFP cable per Spark** from its ConnectX-7 to a 200 GbE switch. Either port works; a
-  second cable adds nothing (see [the fast network](#the-fast-network)).
+- **One QSFP cable per Spark** from its ConnectX-7 to a 200 GbE switch. Either port works (see [the fast network](#the-fast-network)).
 - **About 600 GB free on each Spark**: the model is 510 GB, and each Spark's prepared quarter of
   it is another 78 GB.
 - **Internet on the first Spark**, which downloads the model once and copies it to the others.
@@ -60,7 +54,7 @@ first one installs everything on them.
 Pick any Spark to be the lead, open a terminal on it, and run:
 
 ```bash
-git clone <repository URL> ~/sparkflash
+git clone https://github.com/allenh1/sparkflash ~/sparkflash
 ```
 
 ```bash
@@ -86,19 +80,15 @@ Running the script again is safe: it skips whatever is already done.
 Open that address in a browser. The **Setup** page walks through seven steps, one button each,
 and checks every Spark after each one, so it always shows what is done and what is next.
 
-| Step | What happens |
-| :-- | :-- |
-| 1. Find your Sparks | Pick your other three Sparks from the ones on the network. If this Spark can't sign in to one yet, the page shows the one command that fixes it. |
-| 2. Connect the fast network | Checks the cables and works out the dual-rail NCCL settings from what each Spark reports. If a port still needs an address or a larger MTU, it shows the commands to paste on that Spark. |
-| 3. Install on the other Sparks | Copies the server, its GPU kernels and NCCL from this Spark. |
-| 4. Download the model | Fetches [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) (510 GB) onto this Spark, with progress. An interrupted download resumes where it stopped. |
-| 5. Copy the model to the other Sparks | Copies it over the fast network to all three at once. |
-| 6. Prepare the weights | Each Spark converts its quarter of the model once, in parallel (about five minutes). This is what makes every later start take 25 s. |
-| 7. Start the server | Starts all four Sparks and shows the API address. |
-
-Steps that don't depend on each other are open at the same time, so the software installs while
-the model downloads. Everything runs on the Sparks: you can close the browser and come back to
-the same address to check progress.
+| Step                                  | What happens                                                                                                                                                                              |
+|:--------------------------------------|:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 1. Find your Sparks                   | Pick your other three Sparks from the ones on the network. If this Spark can't sign in to one yet, the page shows the one command that fixes it.                                          |
+| 2. Connect the fast network           | Checks the cables and works out the dual-rail NCCL settings from what each Spark reports. If a port still needs an address or a larger MTU, it shows the commands to paste on that Spark. |
+| 3. Install on the other Sparks        | Copies the server, its GPU kernels and NCCL from this Spark.                                                                                                                              |
+| 4. Download the model                 | Fetches [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) (510 GB) onto this Spark, with progress. An interrupted download resumes where it stopped.          |
+| 5. Copy the model to the other Sparks | Copies it over the fast network to all three at once.                                                                                                                                     |
+| 6. Prepare the weights                | Each Spark converts its quarter of the model once, in parallel (about five minutes). This is what makes every later start take 25 s.                                                      |
+| 7. Start the server                   | Starts all four Sparks and shows the API address.                                                                                                                                         |
 
 The DeepSeek checkpoint needs no Hugging Face account. For a model that does, save your token in
 `~/.cache/huggingface/token` on the lead Spark before step 4.
@@ -177,7 +167,7 @@ The console runs the same commands you can run by hand, which is useful for scri
 cluster managed some other way. On every node, at the same paths:
 
 ```bash
-git clone <repository URL> ~/sparkflash && cd ~/sparkflash
+git clone https://github.com/allenh1/sparkflash ~/sparkflash && cd ~/sparkflash
 hf download deepseek-ai/DeepSeek-V4.1-Flash --local-dir /data/DeepSeek-V4.1-Flash
 cargo build --release -p sparkflash-cli --features cuda,tp4-serve   # Rust from https://rustup.rs
 scripts/build-cubins.sh target/cubins                               # nvcc is in /usr/local/cuda/bin
@@ -231,65 +221,18 @@ Spark's constraints instead:
 The design is described in [docs/design.md](docs/design.md); the model itself in
 [docs/architecture/](docs/architecture/).
 
-## Compared with vLLM and SGLang
-
-vLLM and SGLang are excellent general-purpose servers, and both run V4.1-Flash on Sparks through
-community recipes. SparkFlash makes the opposite trade: one model and one cluster shape, in
-exchange for start-up time, determinism and a small, self-contained serving stack.
-
-| | SparkFlash | vLLM, community recipe | SGLang, MiaAI-Lab build |
-| :-- | :-- | :-- | :-- |
-| Single stream, code | **131.8 tok/s** | 76.0 tok/s | 124.8 tok/s |
-| Single stream, prose | 86.2 tok/s | 62.4 tok/s | **87.7 tok/s** |
-| 4 streams, code, each | 60.8 tok/s | not stated | **63.2 tok/s** |
-| 8 streams, code, total | 270 tok/s | 264 tok/s | **310 tok/s** |
-| 16 streams, code, total | 304 tok/s | not stated | **438 tok/s** |
-| Prefill, ~32K-token prompt | 6,400 tok/s | **6,800 tok/s** | 4,800 tok/s |
-| Start-up to serving | **25 s** | 2-7 minutes | 160-170 s |
-| Greedy output at any concurrency | **identical** (decode always; prefill in exact mode) | can vary with the batch | identical run to run |
-| Network, per node | one cable, both RoCE devices | not stated | one cable, both RoCE devices |
-| In the serving path | one Rust binary per node | Python, PyTorch, JIT kernels | Python, PyTorch, JIT kernels |
-
-The vLLM figures are self-reported by community members for four Sparks (TileLang-based recipe,
-October 2026; the prefill figure is the recipe's October 25 build on source text) in the NVIDIA
-forum's
-[DeepSeek 4.1 Flash recipe thread](https://forums.developer.nvidia.com/t/new-deepseek-4-1-flash-recipe/384438).
-The SGLang figures are from the
-[MiaAI-Lab TP4 notes](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/blob/main/docs/tp4.md)
-(September 2026; prefill on real text). SparkFlash's decode figures here were measured with the
-same benchmark, sparkDash 1.8.8's DecodeBench prompts and protocol, so those two columns compare
-like for like; the full grid is in [docs/performance.md](docs/performance.md). The vLLM column
-used other prompts, and single-stream speculative decoding is very prompt-dependent, so treat it
-as indicative.
-
-What this means in practice:
-
-- **Start-up and recovery:** a 25 s restart, no Python environment and no kernel compile cache
-  make upgrades, crashes and experiments cheap.
-- **Reproducibility:** greedy decode does not depend on what else is running, and with
-  `SPARKFLASH_PREFILL_EXACT=1` neither does prefill, so an agent's behaviour can be replayed
-  exactly and regressions bisected.
-- **Network:** both use one cable per node and both of its RoCE devices, so the differences
-  below are not the network.
-- **Raw speed:** one stream is level with the MiaAI-Lab SGLang build (ahead on code and JSON,
-  2% behind on prose). Up to eight streams it is close: 4% behind per stream at four code
-  streams and 7% at eight. SparkFlash now speculates for up to 32 sequences, so sixteen code
-  streams get 23 tok/s each against SGLang's 29, where they used to get ~12. SGLang still has
-  more aggregate throughput at sixteen streams (1.3-1.8x). Long-prompt prefill is now ahead of
-  SGLang and about 6% behind the latest vLLM recipe. Closing these gaps is the next work; see
-  [docs/performance.md](docs/performance.md).
 
 ### API
 
-One server answers OpenAI Chat Completions and Completions, with V4.1's tool calls parsed into
-standard `tool_calls`, its reasoning returned separately, images, `n`, `seed` and `stop`, plus
-vLLM-compatible `/tokenize`, `/detokenize`, `/metrics`, `/health` and `/readyz`.
+One server answers OpenAI Chat Completions (`/v1/chat/completions`), Completions (`/v1/completions`),
+Responses (`/v1/responses`) and Anthropic Messages (`/v1/messages`), with V4.1's tool calls parsed
+into standard tool-call items, its reasoning returned separately, images (on Chat Completions), `n`,
+`seed` and `stop`, plus `/tokenize`, `/detokenize`, `/metrics`, `/health` and `/readyz`.
 
-Not supported yet: the OpenAI Responses and Anthropic Messages routes, which answer 501 until they
-are implemented ([docs/serving.md](docs/serving.md#not-supported-yet) lists what that takes);
-`logprobs`, repetition, presence and frequency penalties, and `response_format` JSON modes (these
-return an error rather than being ignored); and `ignore_eos` / `min_tokens`, which are ignored
-(generation stops at the end-of-sequence token).
+Not supported yet: `logprobs`, repetition, presence and frequency penalties, `response_format` JSON
+modes, and Responses/Anthropic shapes the V4.1 chat template cannot represent (these return an error
+rather than being ignored); and `ignore_eos` / `min_tokens`, which are ignored (generation stops at
+the end-of-sequence token). Full route and limitation details: [docs/serving.md](docs/serving.md).
 
 ## Building and testing without a cluster
 
