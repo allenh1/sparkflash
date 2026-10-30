@@ -521,6 +521,11 @@ struct Live {
     ttft: Option<Duration>,
     /// Still in the reasoning channel (until `</think>`).
     reasoning: bool,
+    /// A `</think>` token has been read, but whether it closes the reasoning channel is not yet
+    /// known: the next token decides (see [`Live::emit`]).
+    pending_end: bool,
+    /// The last character emitted on the reasoning channel, for the inline-code quote test.
+    reasoning_tail: Option<char>,
     reasoning_tokens: usize,
     completion_tokens: usize,
     decode: DecodeState,
@@ -539,6 +544,8 @@ impl Live {
             pending,
             started: Instant::now(),
             ttft: None,
+            pending_end: false,
+            reasoning_tail: None,
             reasoning_tokens: 0,
             completion_tokens: 0,
             decode: DecodeState::default(),
@@ -554,8 +561,32 @@ impl Live {
         }
     }
 
+    /// Decodes one token through the streaming detokeniser, or names the token that failed.
+    fn decode_token(
+        &mut self,
+        token: u32,
+        tokenizer: &HfTokenizerEncoder,
+    ) -> Result<Option<String>, String> {
+        tokenizers::step_decode_stream(
+            tokenizer.tokenizer(),
+            vec![token],
+            self.pending.skip_special_tokens,
+            &mut self.decode.ids,
+            &mut self.decode.prefix,
+            &mut self.decode.prefix_index,
+        )
+        .map(|piece| piece.filter(|piece| !piece.is_empty()))
+        .map_err(|error| format!("the tokenizer could not decode token {token}: {error}"))
+    }
+
     /// Streams one step's tokens; false when the request must end here (a stop string matched,
     /// the client left, or the text could not be decoded).
+    ///
+    /// A `</think>` token does not by itself close the reasoning channel: the model also writes
+    /// the tag inside its reasoning, quoted in inline code. The tag is held until the next token;
+    /// a backtick on both sides means it was quoted, and any other neighbour makes it the
+    /// channel boundary. The tag itself is recognized by token id, so a plain-text spelling never
+    /// matches; only the inline-code test reads the decoded neighbour.
     fn emit(
         &mut self,
         tokens: &[u32],
@@ -576,31 +607,49 @@ impl Live {
                 self.ttft = Some(self.started.elapsed());
             }
             if self.reasoning && Some(token) == think_end {
-                // The content channel starts after the delimiter, with its own decoder.
-                self.reasoning = false;
                 self.reasoning_tokens += 1;
-                self.decode = DecodeState::default();
+                if self.pending_end {
+                    // Two delimiters with no token between them: the first was quoted, so it is
+                    // reasoning text, not the channel boundary.
+                    self.send(EngineEvent::ReasoningDelta(THINK_END.to_owned()));
+                    self.reasoning_tail = Some('>');
+                }
+                self.pending_end = true;
                 continue;
             }
-            let piece = match tokenizers::step_decode_stream(
-                tokenizer.tokenizer(),
-                vec![token],
-                self.pending.skip_special_tokens,
-                &mut self.decode.ids,
-                &mut self.decode.prefix,
-                &mut self.decode.prefix_index,
-            ) {
-                Ok(piece) => piece.filter(|piece| !piece.is_empty()),
-                Err(error) => {
-                    self.failed = Some(format!(
-                        "the tokenizer could not decode token {token}: {error}"
-                    ));
+            let mut piece = match self.decode_token(token, tokenizer) {
+                Ok(piece) => piece,
+                Err(message) => {
+                    self.failed = Some(message);
                     return false;
                 }
             };
+            if self.pending_end {
+                // A delimiter closes the channel only when it is not a quoted tag in inline code:
+                // the model writes `</think>` there, with a backtick on either side.
+                self.pending_end = false;
+                let quoted = self.reasoning_tail == Some('`')
+                    && piece.as_deref().is_some_and(|text| text.starts_with('`'));
+                if quoted {
+                    self.send(EngineEvent::ReasoningDelta(THINK_END.to_owned()));
+                    self.reasoning_tail = Some('>');
+                } else {
+                    // The content channel starts after the delimiter, with its own decoder.
+                    self.reasoning = false;
+                    self.decode = DecodeState::default();
+                    piece = match self.decode_token(token, tokenizer) {
+                        Ok(piece) => piece,
+                        Err(message) => {
+                            self.failed = Some(message);
+                            return false;
+                        }
+                    };
+                }
+            }
             if self.reasoning {
                 self.reasoning_tokens += 1;
                 if let Some(piece) = piece {
+                    self.reasoning_tail = piece.chars().last();
                     self.send(EngineEvent::ReasoningDelta(piece));
                 }
             } else {
@@ -1436,6 +1485,7 @@ fn start_leader(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sparkflash_model_deepseek_v41::encoding::{load_hf_tokenizer, reference_tokenizer_path};
 
     #[test]
     fn a_control_frame_the_sockets_cannot_hold_does_not_wait_for_the_worker() {
@@ -1617,5 +1667,177 @@ mod tests {
             bad_spans(&two, &[image(8), image(2)]).is_some(),
             "out of order"
         );
+    }
+    /// The reference tokenizer the device path uses in production.
+    fn tokenizer() -> HfTokenizerEncoder {
+        load_hf_tokenizer(&reference_tokenizer_path()).expect("the vendored tokenizer parses")
+    }
+
+    /// One admitted request with an open reasoning channel and no stop strings.
+    fn live() -> (Live, tokio::sync::mpsc::UnboundedReceiver<EngineEvent>) {
+        let (events, answers) = tokio::sync::mpsc::unbounded_channel();
+        let job = DeviceJob {
+            prompt: vec![0],
+            max_tokens: 64,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            seed: 0,
+            stop_ids: vec![1],
+            images: Vec::new(),
+        };
+        let pending = Pending {
+            job,
+            reasoning: true,
+            skip_special_tokens: true,
+            stop: Vec::new(),
+            enqueued_at: Instant::now(),
+            events,
+        };
+        (Live::new(pending), answers)
+    }
+
+    /// Prompt text as the tokenizer's ids.
+    fn ids(tokenizer: &HfTokenizerEncoder, text: &str) -> Vec<u32> {
+        tokenizer
+            .tokenizer()
+            .encode(text, false)
+            .expect("the reference tokenizer encodes")
+            .get_ids()
+            .to_vec()
+    }
+
+    /// The reasoning and content channels a request has sent so far.
+    fn drain(answers: &mut tokio::sync::mpsc::UnboundedReceiver<EngineEvent>) -> (String, String) {
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        while let Ok(event) = answers.try_recv() {
+            match event {
+                EngineEvent::ReasoningDelta(text) => reasoning.push_str(&text),
+                EngineEvent::ContentDelta(text) => content.push_str(&text),
+                other => panic!("unexpected stream event: {other:?}"),
+            }
+        }
+        (reasoning, content)
+    }
+
+    #[test]
+    fn a_real_delimiter_splits_the_reasoning_from_the_content() {
+        let tokenizer = tokenizer();
+        let think_end = tokenizer
+            .tokenizer()
+            .token_to_id("</think>")
+            .expect("the reference tokenizer spells the delimiter");
+        let (mut live, mut answers) = live();
+        let metrics = Metrics::new();
+        assert!(live.emit(
+            &ids(&tokenizer, "Weigh the options."),
+            &tokenizer,
+            Some(think_end),
+            &metrics
+        ));
+        assert!(live.emit(&[think_end], &tokenizer, Some(think_end), &metrics));
+        assert!(live.emit(
+            &ids(&tokenizer, "Use the second one."),
+            &tokenizer,
+            Some(think_end),
+            &metrics
+        ));
+        let (reasoning, content) = drain(&mut answers);
+        assert_eq!(reasoning, "Weigh the options.");
+        assert_eq!(content, "Use the second one.");
+    }
+
+    #[test]
+    fn a_delimiter_quoted_in_inline_code_does_not_close_the_reasoning() {
+        let tokenizer = tokenizer();
+        let think_end = tokenizer
+            .tokenizer()
+            .token_to_id("</think>")
+            .expect("the reference tokenizer spells the delimiter");
+        let (mut live, mut answers) = live();
+        let metrics = Metrics::new();
+        assert!(live.emit(
+            &ids(&tokenizer, "The model can write `"),
+            &tokenizer,
+            Some(think_end),
+            &metrics
+        ));
+        assert!(live.emit(&[think_end], &tokenizer, Some(think_end), &metrics));
+        assert!(live.emit(
+            &ids(&tokenizer, "` inside its reasoning. "),
+            &tokenizer,
+            Some(think_end),
+            &metrics
+        ));
+        // The real delimiter: the reasoning tail is a space, not a backtick.
+        assert!(live.emit(&[think_end], &tokenizer, Some(think_end), &metrics));
+        assert!(live.emit(
+            &ids(&tokenizer, "Done."),
+            &tokenizer,
+            Some(think_end),
+            &metrics
+        ));
+        let (reasoning, content) = drain(&mut answers);
+        assert_eq!(
+            reasoning,
+            "The model can write `</think>` inside its reasoning. "
+        );
+        assert_eq!(content, "Done.");
+    }
+
+    #[test]
+    fn content_that_starts_with_a_backtick_is_still_content() {
+        let tokenizer = tokenizer();
+        let think_end = tokenizer
+            .tokenizer()
+            .token_to_id("</think>")
+            .expect("the reference tokenizer spells the delimiter");
+        let (mut live, mut answers) = live();
+        let metrics = Metrics::new();
+        assert!(live.emit(
+            &ids(&tokenizer, "Use "),
+            &tokenizer,
+            Some(think_end),
+            &metrics
+        ));
+        assert!(live.emit(&[think_end], &tokenizer, Some(think_end), &metrics));
+        assert!(live.emit(
+            &ids(&tokenizer, "`cargo test`"),
+            &tokenizer,
+            Some(think_end),
+            &metrics
+        ));
+        let (reasoning, content) = drain(&mut answers);
+        assert_eq!(reasoning, "Use ");
+        assert_eq!(content, "`cargo test`");
+    }
+
+    #[test]
+    fn two_delimiters_side_by_side_keep_the_first_as_reasoning() {
+        let tokenizer = tokenizer();
+        let think_end = tokenizer
+            .tokenizer()
+            .token_to_id("</think>")
+            .expect("the reference tokenizer spells the delimiter");
+        let (mut live, mut answers) = live();
+        let metrics = Metrics::new();
+        assert!(live.emit(
+            &ids(&tokenizer, "Tail "),
+            &tokenizer,
+            Some(think_end),
+            &metrics
+        ));
+        assert!(live.emit(&[think_end], &tokenizer, Some(think_end), &metrics));
+        assert!(live.emit(&[think_end], &tokenizer, Some(think_end), &metrics));
+        assert!(live.emit(
+            &ids(&tokenizer, "Body"),
+            &tokenizer,
+            Some(think_end),
+            &metrics
+        ));
+        let (reasoning, content) = drain(&mut answers);
+        assert_eq!(reasoning, "Tail </think>");
+        assert_eq!(content, "Body");
     }
 }
