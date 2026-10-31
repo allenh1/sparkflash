@@ -3678,6 +3678,22 @@ impl DeviceLayer<'_> {
         self.head_rows_multi(rows, tail, transport, &samplers)
     }
 
+    /// [`Self::head_rows_sampled`] with a per-row structured-output constraint.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn head_rows_sampled_c(
+        &self,
+        rows: &RowsState,
+        tail: &crate::tp4_tail::TailStage,
+        transport: &dyn sparkflash_comm::transport::Transport,
+        n: usize,
+        sampler: &super::sample::Sampler,
+        index0: usize,
+        constraints: &[Option<&sparkflash_api::constrained::TokenConstraint>],
+    ) -> Result<Vec<(u32, f32)>, String> {
+        let samplers: Vec<_> = (0..n).map(|row| (*sampler, index0 + row)).collect();
+        self.head_rows_multi_c(rows, tail, transport, &samplers, constraints)
+    }
+
     /// The head over rows of several requests: row y samples under `samplers[y].0` with its token
     /// at sequence index `samplers[y].1`. Rows that share one sampler at consecutive indices take
     /// the head kernel's scalar noise (the single request's path); otherwise each row's noise comes
@@ -3689,6 +3705,26 @@ impl DeviceLayer<'_> {
         tail: &crate::tp4_tail::TailStage,
         transport: &dyn sparkflash_comm::transport::Transport,
         samplers: &[(super::sample::Sampler, usize)],
+    ) -> Result<Vec<(u32, f32)>, String> {
+        self.head_rows_multi_c(rows, tail, transport, samplers, &[])
+    }
+
+    /// [`Self::head_rows_multi`] with a structured-output constraint per row.
+    ///
+    /// A constrained row is sampled greedily over the ids its automaton admits: the rank reads its
+    /// slice's raw logits, keeps the best admitted id, and writes that into the block maxima that
+    /// the fold and the cross-rank pick already reduce. The global answer is therefore the masked
+    /// argmax over the whole vocabulary, not over one rank's slice. A constrained row for which no
+    /// rank admitted an id comes back with a -infinity value and an id the automaton never
+    /// admitted; that is the caller's to end as its sequence's own error, which every rank reaches
+    /// from the same picks.
+    pub(super) fn head_rows_multi_c(
+        &self,
+        rows: &RowsState,
+        tail: &crate::tp4_tail::TailStage,
+        transport: &dyn sparkflash_comm::transport::Transport,
+        samplers: &[(super::sample::Sampler, usize)],
+        constraints: &[Option<&sparkflash_api::constrained::TokenConstraint>],
     ) -> Result<Vec<(u32, f32)>, String> {
         let n = samplers.len();
         let Some(&(sampler, index0)) = samplers.first() else {
@@ -3729,6 +3765,11 @@ impl DeviceLayer<'_> {
         let vocab = crate::tp4_tail::VOCAB_PER_RANK;
         let truncated: Vec<bool> = samplers.iter().map(|(s, _)| s.truncated()).collect();
         let any_truncated = truncated.iter().any(|&cut| cut);
+        // A constrained row needs raw logits on the host; every other row keeps its own path.
+        let constrained: Vec<bool> = (0..n)
+            .map(|row| constraints.get(row).is_some_and(|c| c.is_some()))
+            .collect();
+        let any_constrained = constrained.iter().any(|&masked| masked);
         let sampled = samplers.iter().any(|(s, _)| !s.is_greedy());
         let (inv_t, seed) = if uniform {
             sampler.head_noise()
@@ -3768,7 +3809,11 @@ impl DeviceLayer<'_> {
                 b.lm_block_arg,
                 vocab as u64,
                 n as u64,
-                if any_truncated { b.logits } else { 0 },
+                if any_truncated || any_constrained {
+                    b.logits
+                } else {
+                    0
+                },
                 inv_t,
                 seed,
                 index0 as u64,
@@ -3776,6 +3821,92 @@ impl DeviceLayer<'_> {
                 params,
             ],
         )?;
+        if any_constrained {
+            // The head was queued on the run's stream, so the copy below is ordered behind it.
+            // Masked greedy: this rank keeps the best admitted logit inside its own vocabulary
+            // slice and writes it into the row's block maxima, which the fold and the cross-rank
+            // pick already reduce - so the answer is the masked argmax over the whole vocabulary
+            // and not over one rank's slice. Only the constrained rows are touched: every other
+            // row keeps the maxima its own sampler's path computed.
+            let base = i64::try_from(id_base).unwrap_or(0);
+            let span = i64::try_from(vocab).unwrap_or(0);
+            let lo = u32::try_from(base.max(0)).unwrap_or(0);
+            let hi = u32::try_from((base + span).min(i64::from(u32::MAX))).unwrap_or(u32::MAX);
+            let all_constrained = constrained.iter().all(|&c| c);
+            let mut all_raw = vec![0u8; n * vocab * 4];
+            self.cuda.copy_dtoh(&mut all_raw, &Deviceptr(b.logits))?;
+            let mut all_values = if all_constrained {
+                vec![0u8; n * chunks * 4]
+            } else {
+                Vec::new()
+            };
+            let mut all_indices = if all_constrained {
+                vec![0u8; n * chunks * 4]
+            } else {
+                Vec::new()
+            };
+            for row in 0..n {
+                if !constrained[row] {
+                    continue;
+                }
+                let Some(Some(constraint)) = constraints.get(row) else {
+                    continue;
+                };
+                let raw = &all_raw[row * vocab * 4..(row + 1) * vocab * 4];
+                let mut best = f32::NEG_INFINITY;
+                let mut best_index = 0u32;
+                constraint.for_each_allowed_in(lo, hi, |id| {
+                    let local = i64::from(id) - base;
+                    if local < 0 || local >= span {
+                        return;
+                    }
+                    let at = local as usize * 4;
+                    let Some(bytes) = raw.get(at..at + 4) else {
+                        return;
+                    };
+                    let value = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    if value > best {
+                        best = value;
+                        best_index = local as u32;
+                    }
+                });
+                // A slice holding no admitted id is ordinary, not an error: this rank owns none of
+                // the tokens the automaton admits here, so it contributes -infinity and the
+                // cross-rank pick takes the rank that does own one. (A byte-level vocabulary keeps
+                // all 256 single-byte tokens in the lowest slice, so some rank can always continue.)
+                // Chunk 0 carries the masked maximum; the fold reads strictly-greater replacements,
+                // so -infinity everywhere else leaves chunk 0 the winner.
+                if all_constrained {
+                    let row_off = row * chunks * 4;
+                    all_values[row_off..row_off + 4].copy_from_slice(&best.to_le_bytes());
+                    all_indices[row_off..row_off + 4].copy_from_slice(&best_index.to_le_bytes());
+                    for chunk in 1..chunks {
+                        let at = row_off + chunk * 4;
+                        all_values[at..at + 4].copy_from_slice(&f32::NEG_INFINITY.to_le_bytes());
+                    }
+                } else {
+                    let mut values = vec![0u8; chunks * 4];
+                    let mut indices = vec![0u8; chunks * 4];
+                    values[..4].copy_from_slice(&best.to_le_bytes());
+                    indices[..4].copy_from_slice(&best_index.to_le_bytes());
+                    for chunk in 1..chunks {
+                        let at = chunk * 4;
+                        values[at..at + 4].copy_from_slice(&f32::NEG_INFINITY.to_le_bytes());
+                    }
+                    let row_at = (row * chunks * 4) as u64;
+                    self.cuda
+                        .copy_htod(&Deviceptr(b.lm_block_max + row_at), &values)?;
+                    self.cuda
+                        .copy_htod(&Deviceptr(b.lm_block_arg + row_at), &indices)?;
+                }
+            }
+            if all_constrained {
+                self.cuda
+                    .copy_htod(&Deviceptr(b.lm_block_max), &all_values)?;
+                self.cuda
+                    .copy_htod(&Deviceptr(b.lm_block_arg), &all_indices)?;
+            }
+        }
         let mut picked: Vec<Option<u32>> = vec![None; n];
         if any_truncated {
             let Some((world, rank)) = self.device_exchange() else {

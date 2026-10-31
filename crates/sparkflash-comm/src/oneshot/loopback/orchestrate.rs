@@ -203,7 +203,10 @@ impl Default for OrchestrationConfig {
             failure: FailurePolicy::default(),
             rails: ONESHOT_RAILS,
             ring: HOST_TWIN_RING,
-            timeout: Duration::from_secs(5),
+            // Same reasoning as [LoopbackDeviceConfig::default]: this deadline bounds a handoff
+            // between threads in one process, not a node, so it must be generous enough that only a
+            // real hang reaches it. At five seconds, a loaded CI runner reached it first.
+            timeout: Duration::from_secs(600),
         }
     }
 }

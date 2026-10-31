@@ -96,13 +96,34 @@ Anthropic spelling Claude Code forwards), or any id listed in `SPARKFLASH_MODEL_
 or space separated). The alias list is what lets a client configured for another provider
 (Claude Code sends its `ANTHROPIC_DEFAULT_*_MODEL` value) talk to this server unchanged.
 
+### The model card names the weights that answered
+
+`GET /v1/models` reports the checkpoint `sparkflash serve` loaded, not merely the id a client
+asked for. `root` is the `--checkpoint` path when one was declared (and the model id otherwise),
+`checkpoint` carries the same value as its own member, and `build` carries the package version
+plus `SPARKFLASH_BUILD_ID` when an operator set one. A finetune served under the released model's
+id is therefore distinguishable from the released weights (DECISIONS.md D38, D61).
+
+The `capabilities` block names the modes the server actually enforces, so an unsupported mode is
+visible before a request rather than as a typed 400 mid-run. On the device path, where the head can
+mask its logits against a schema, `response_format_modes` is `["text", "json_object", "json_schema"]`
+and `tool_choice_modes` is `["auto", "none", "required", "named"]` with `tool_choice_forced: true`;
+a process without the tokenizer's vocabulary table advertises `["text"]`, `["auto", "none"]` and
+`false` instead, because that is all it can guarantee (DECISIONS.md D64).
+
+Speculative-decode counters are exported twice from one increment: the `sparkflash_draft_tokens_*`
+spelling, and vLLM's (`vllm:spec_decode_num_accepted_tokens_total`,
+`vllm:spec_decode_num_draft_tokens_total`, `vllm:spec_decode_num_drafts_total`), which is what
+`tool-eval-bench --spec-bench` and vLLM dashboards read. `sparkflash_verify_steps_total` is the
+step denominator behind tokens-per-verify-step (D61).
+
 ### Not supported yet
 
 - **Responses and Anthropic shapes the chat template cannot represent are refused typed**, not
   silently dropped: hosted/built-in/custom Responses tools, `item_reference`, `previous_response_id`
   (this server keeps no response store), JSON output formats, Anthropic document/search blocks,
   and a tool choice that forces a call (OpenAI `required`, Anthropic `any`, or a named
-  function/tool). Images are read on all three conversation routes (chat message `image_url`/
+  function/tool) on an engine that cannot force one. Images are read on all three conversation routes (chat message `image_url`/
   `input_image` parts, Responses `input_image` parts, Anthropic `image` blocks); Completions takes
   text only and refuses an image by name, whether it arrives as an `<image>...</image>` tag, a
   placeholder spelling or the image token in pre-tokenized ids, or as a carrier key in the body. Both adapters render the same V4.1 chat template and tokenize it through the
@@ -110,8 +131,17 @@ or space separated). The alias list is what lets a client configured for another
   ids.
 - `logprobs` / `top_logprobs`, and repetition, presence and frequency penalties: refused with an
   error rather than ignored.
-- `response_format` `json_object` / `json_schema` (structured output needs constrained decoding,
-  which the server does not have): refused.
+- `response_format` `json_object` / `json_schema` on an engine without constrained decoding:
+  refused with a typed 400. The device path enforces them (see above) and compiles the caller's
+  schema before it serves, so a keyword the byte automaton cannot enforce is still a 400 rather
+  than a stream that fails midway. The keyword subset is listed in
+  `crates/sparkflash-api/src/constrained.rs`. A sequence that reaches a point where no vocabulary
+  token continues the schema ends with an error of its own; the requests decoding beside it carry
+  on (D65).
+- `response_format` together with a `tool_choice` that forces a call: refused with a typed 400,
+  because the call's arguments are not the response_format document. A named `tool_choice` whose
+  function name holds a quote, an angle bracket or a line break is refused too: the forced call
+  spells the name into the prompt, where those characters would end it early.
 - `ignore_eos` and `min_tokens`: ignored, like other unknown request fields; generation stops at
   the end-of-sequence token.
 - Anthropic thinking blocks carry an empty `signature`, and `stop_sequence` is always `null`:

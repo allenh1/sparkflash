@@ -74,6 +74,20 @@ pub struct Metrics {
     draft_tokens_accepted_total: IntCounter,
     /// DSpark draft tokens proposed by the drafter, cumulative.
     draft_tokens_proposed_total: IntCounter,
+    /// DSpark verification steps, cumulative: the denominator of tokens-per-verify-step.
+    verify_steps_total: IntCounter,
+    /// vLLM-compatible alias of [`Self::draft_tokens_accepted_total`].
+    ///
+    /// `tool-eval-bench --spec-bench` (and every vLLM dashboard) reads the spec-decode counters
+    /// under vLLM's names, so a server that exports only the `sparkflash_*` spelling reports
+    /// "Acceptance rate metrics were not available from the server" and the whole spec section
+    /// degenerates into a second plain-throughput table. Both spellings are exported from one
+    /// increment so they cannot drift.
+    spec_decode_accepted_total: IntCounter,
+    /// vLLM-compatible alias of [`Self::draft_tokens_proposed_total`].
+    spec_decode_draft_tokens_total: IntCounter,
+    /// vLLM-compatible alias of [`Self::verify_steps_total`] (`num_drafts` in vLLM's naming).
+    spec_decode_drafts_total: IntCounter,
     /// The last completed request's decode speed.
     last_decode_tokens_per_second: Gauge,
     /// The last completed request's prefill speed.
@@ -126,6 +140,27 @@ impl Metrics {
         let draft_tokens_proposed_total = IntCounter::new(
             "sparkflash_draft_tokens_proposed_total",
             "Total DSpark draft tokens proposed by the drafter",
+        )
+        .expect("static metric descriptor");
+        let verify_steps_total = IntCounter::new(
+            "sparkflash_verify_steps_total",
+            "Total DSpark target-model verification steps",
+        )
+        .expect("static metric descriptor");
+        // vLLM's spelling, so spec-decode tooling finds the counters without an adapter.
+        let spec_decode_accepted_total = IntCounter::new(
+            "vllm:spec_decode_num_accepted_tokens_total",
+            "Total DSpark draft tokens accepted by the target model (vLLM-compatible alias)",
+        )
+        .expect("static metric descriptor");
+        let spec_decode_draft_tokens_total = IntCounter::new(
+            "vllm:spec_decode_num_draft_tokens_total",
+            "Total DSpark draft tokens proposed by the drafter (vLLM-compatible alias)",
+        )
+        .expect("static metric descriptor");
+        let spec_decode_drafts_total = IntCounter::new(
+            "vllm:spec_decode_num_drafts_total",
+            "Total DSpark verification steps (vLLM-compatible alias)",
         )
         .expect("static metric descriptor");
         let last_decode_tokens_per_second = Gauge::new(
@@ -228,6 +263,10 @@ impl Metrics {
             Box::new(time_to_first_token_seconds.clone()),
             Box::new(draft_tokens_accepted_total.clone()),
             Box::new(draft_tokens_proposed_total.clone()),
+            Box::new(verify_steps_total.clone()),
+            Box::new(spec_decode_accepted_total.clone()),
+            Box::new(spec_decode_draft_tokens_total.clone()),
+            Box::new(spec_decode_drafts_total.clone()),
             Box::new(last_decode_tokens_per_second.clone()),
             Box::new(last_prefill_tokens_per_second.clone()),
             Box::new(last_acceptance_rate.clone()),
@@ -257,6 +296,10 @@ impl Metrics {
             requests_rejected_total,
             draft_tokens_accepted_total,
             draft_tokens_proposed_total,
+            verify_steps_total,
+            spec_decode_accepted_total,
+            spec_decode_draft_tokens_total,
+            spec_decode_drafts_total,
             last_decode_tokens_per_second,
             last_prefill_tokens_per_second,
             last_acceptance_rate,
@@ -270,10 +313,16 @@ impl Metrics {
     /// are the last completed request's values, which is what the control plane's per-request
     /// graph shows. Both are cheap increments/sets in the existing request-completion path.
     pub fn record_request_stats(&self, stats: &DeepSeekSparkRequestStats) {
-        self.draft_tokens_accepted_total
-            .inc_by(stats.dspark_speculative.draft_tokens_accepted as u64);
-        self.draft_tokens_proposed_total
-            .inc_by(stats.dspark_speculative.draft_tokens_proposed as u64);
+        let accepted = stats.dspark_speculative.draft_tokens_accepted as u64;
+        let proposed = stats.dspark_speculative.draft_tokens_proposed as u64;
+        let steps = stats.dspark_speculative.target_verify_steps as u64;
+        self.draft_tokens_accepted_total.inc_by(accepted);
+        self.draft_tokens_proposed_total.inc_by(proposed);
+        self.verify_steps_total.inc_by(steps);
+        // The vLLM-compatible aliases move with the native counters, never separately.
+        self.spec_decode_accepted_total.inc_by(accepted);
+        self.spec_decode_draft_tokens_total.inc_by(proposed);
+        self.spec_decode_drafts_total.inc_by(steps);
         self.last_decode_tokens_per_second
             .set(finite_or_zero(stats.timing.decode_tok_per_s));
         self.last_prefill_tokens_per_second
@@ -464,6 +513,13 @@ mod tests {
             "sparkflash_uma_free_gib",
             "sparkflash_draft_tokens_accepted_total",
             "sparkflash_draft_tokens_proposed_total",
+            "sparkflash_verify_steps_total",
+            // vLLM's spelling: `tool-eval-bench --spec-bench` matches these names (optionally
+            // prefixed `vllm:`/`vllm_`/`tensorfold:`) and reports the spec section only when
+            // it finds them.
+            "vllm:spec_decode_num_accepted_tokens_total",
+            "vllm:spec_decode_num_draft_tokens_total",
+            "vllm:spec_decode_num_drafts_total",
             "sparkflash_last_decode_tokens_per_second",
             "sparkflash_last_prefill_tokens_per_second",
             "sparkflash_last_acceptance_rate",
@@ -474,6 +530,10 @@ mod tests {
         assert!(text.contains("layer=\"1\""));
         assert!(text.contains("rank=\"0\""));
         assert!(text.contains("sparkflash_draft_tokens_accepted_total 40"));
+        // The aliases carry the same counts, so a vLLM-shaped reader derives the same rate.
+        assert!(text.contains("vllm:spec_decode_num_accepted_tokens_total 40"));
+        assert!(text.contains("vllm:spec_decode_num_draft_tokens_total 50"));
+        assert!(text.contains("vllm:spec_decode_num_drafts_total 10"));
         assert!(text.contains("sparkflash_last_decode_tokens_per_second 120"));
     }
 

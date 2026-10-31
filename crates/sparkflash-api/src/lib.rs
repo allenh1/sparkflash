@@ -35,6 +35,7 @@ pub mod state;
 pub mod telemetry_types;
 pub mod tool_parser;
 pub mod vision;
+pub mod vocab;
 
 pub use engine::{
     Capabilities, Capability, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason,

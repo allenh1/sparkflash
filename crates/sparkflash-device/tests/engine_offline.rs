@@ -99,6 +99,7 @@ fn request(temperature: f32) -> EngineRequest {
         seed: Some(0),
         trace_scopes: 0,
         trace_steps: 0,
+        constraint: None,
     }
 }
 

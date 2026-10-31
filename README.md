@@ -1,6 +1,6 @@
 # SparkFlash
 
-**DeepSeek-V4.1-Flash on four NVIDIA DGX Sparks: 132 tok/s single-stream, 25 s boot, 1M context.**
+**DeepSeek-V4.1-Flash on four NVIDIA DGX Sparks: 80 tok/s single-stream while sampling, 25 s boot, 1M context.**
 
 > **Setting up with an AI agent?** Send your agent to [docs/agent-setup.md](docs/agent-setup.md) to set up and run this repo.
 
@@ -18,13 +18,16 @@ that use it work unchanged.
 
 ## Benchmarks
 
-Four DGX Sparks at tensor parallelism 4, one network cable per node, default clocks, greedy,
-client-side over HTTP.
+Four DGX Sparks at tensor parallelism 4, one network cable per node, default clocks, client-side
+over HTTP, 256-token completions. Greedy unless the row says otherwise — greedy code is
+speculation's best case, so it is the fastest number here, not the typical one.
 
 | Benchmark | Result |
 | :-- | --: |
-| Single stream, code | **131.8 tok/s** |
-| Single stream, prose | **86.2 tok/s** |
+| Single stream, code, greedy (speculation's best case) | **131.8 tok/s** |
+| Single stream, code, temperature 1.0, thinking on | **80 tok/s** |
+| Single stream, chat, temperature 1.0, thinking on | **59 tok/s** |
+| Single stream, prose, greedy | **86.2 tok/s** |
 | 4 streams, code, each | **60.8 tok/s** |
 | 8 streams, code, total | **270 tok/s** |
 | 16 streams, code, total | **304 tok/s** |
@@ -34,8 +37,19 @@ client-side over HTTP.
 | Network, per node | one cable, both RoCE devices |
 | In the serving path | one Rust binary per node |
 
-Decode: sparkDash 1.8.8 DecodeBench prompts, 256 tokens, temperature 0, idle server. Full results:
-[docs/performance.md](docs/performance.md).
+Decode: [sparkDash 1.8.8](https://github.com/MiaAI-Lab/sparkDash) DecodeBench prompts, 256
+tokens, temperature 0, idle server. Full results: [docs/performance.md](docs/performance.md).
+
+![tool-eval-bench results card: 94/100 tool calling, 74.9 tok/s single-stream decode, 2,369 tok/s prefill on four DGX Sparks](docs/images/sparkflash-decode-card.png)
+
+Results card from `tool-eval-bench` 3.0.0, seed 42, on the shipped defaults: 94/100 tool calling
+plus that harness's own decode and prefill probes — its decode prompt is not the code workload in
+the table above, which is why the two decode numbers differ.
+
+The same suite with thinking disabled (`chat_template_kwargs: {"enable_thinking": false}`) scores
+92/100 — that is the configuration the published vLLM and TensorFold numbers were measured in, and
+it is **not** our default: thinking off trades planning for safety (Autonomous Planning 100 → 67,
+Safety & Boundaries 85 → 92).
 
 
 ## Quick start
@@ -236,12 +250,15 @@ The design is described in [docs/design.md](docs/design.md); the model itself in
 One server answers OpenAI Chat Completions (`/v1/chat/completions`), Completions (`/v1/completions`),
 Responses (`/v1/responses`) and Anthropic Messages (`/v1/messages`), with V4.1's tool calls parsed
 into standard tool-call items, its reasoning returned separately, images on every conversation
-route, `n`, `seed` and `stop`, plus `/tokenize`, `/detokenize`, `/metrics`, `/health` and `/readyz`.
+route, `n`, `seed` and `stop`, structured output (`response_format` `json_object`/`json_schema` and
+forced `tool_choice`, enforced by masking the head's logits), plus `/tokenize`, `/detokenize`,
+`/metrics`, `/health` and `/readyz`.
 
-Not supported yet: `logprobs`, repetition, presence and frequency penalties, `response_format` JSON
-modes, and Responses/Anthropic shapes the V4.1 chat template cannot represent (these return an error
-rather than being ignored); and `ignore_eos` / `min_tokens`, which are ignored (generation stops at
-the end-of-sequence token). Full route and limitation details: [docs/serving.md](docs/serving.md).
+Not supported yet: `logprobs`, repetition, presence and frequency penalties, JSON-Schema keywords
+outside the enforced subset, and Responses/Anthropic shapes the V4.1 chat template cannot represent
+(these return an error rather than being ignored); and `ignore_eos` / `min_tokens`, which are
+ignored (generation stops at the end-of-sequence token). Full route and limitation details:
+[docs/serving.md](docs/serving.md).
 
 ## Building and testing without a cluster
 

@@ -174,6 +174,14 @@ pub struct AppState {
     /// Other model ids this server answers to (a client configured for another provider sends its
     /// own name; Claude Code sends its `ANTHROPIC_DEFAULT_*_MODEL` value).
     model_aliases: Vec<String>,
+    /// The checkpoint this process actually loaded, when the caller knows it.
+    ///
+    /// `/v1/models` reports it as `checkpoint`, so a client can tell which weights answered.
+    /// Without it the card echoes only the requested model id, which says nothing about the
+    /// weights on disk: a finetune served under the base model's id would look identical.
+    served_checkpoint: Option<Arc<str>>,
+    /// An operator-supplied identifier for the build serving these weights.
+    build_id: Option<Arc<str>>,
 }
 
 impl AppState {
@@ -197,7 +205,43 @@ impl AppState {
             choice_seeds: Arc::new(RandomChoiceSeeds),
             draining: Arc::new(AtomicBool::new(false)),
             model_aliases: Vec::new(),
+            served_checkpoint: None,
+            build_id: None,
         }
+    }
+
+    /// Records the checkpoint path this process loaded, for the model card.
+    ///
+    /// `sparkflash serve` passes its `--checkpoint` argument, so a client sees the snapshot that
+    /// actually answered beside the model id it requested.
+    ///
+    /// Every `AppState` a serve command builds must call this and [Self::with_build_id]: the
+    /// reference engine, the host TP=4 path (`run_tp4`) and the device TP=4 path
+    /// (`serve/device.rs`) each construct their own state, and a site that forgets reports the
+    /// released model id for a served finetune (DECISIONS.md D38, D61).
+    #[must_use]
+    pub fn with_served_checkpoint(mut self, checkpoint: Option<String>) -> Self {
+        self.served_checkpoint = checkpoint.map(Into::into);
+        self
+    }
+
+    /// The checkpoint path this process loaded, if the caller declared one.
+    #[must_use]
+    pub fn served_checkpoint(&self) -> Option<&str> {
+        self.served_checkpoint.as_deref()
+    }
+
+    /// Records an operator-supplied build identifier (a commit sha or image tag), for the card.
+    #[must_use]
+    pub fn with_build_id(mut self, build_id: Option<String>) -> Self {
+        self.build_id = build_id.map(Into::into);
+        self
+    }
+
+    /// The operator-supplied build identifier, if one was declared.
+    #[must_use]
+    pub fn build_id(&self) -> Option<&str> {
+        self.build_id.as_deref()
     }
 
     /// Adds model ids this server answers to besides its own descriptor id.

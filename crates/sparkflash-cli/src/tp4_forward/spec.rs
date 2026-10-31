@@ -57,13 +57,16 @@ pub(super) struct SpecInputs<'s> {
     pub(super) bulk_more: &'s [RowsState],
 }
 
-/// The shortest uncached prompt the bulk prefill takes (SPARKFLASH_PREFILL_BULK_MIN, default 256):
-/// shorter ones run the exact rows step, whose output is bit-identical to M = 1.
+/// The shortest uncached prompt the bulk prefill takes (SPARKFLASH_PREFILL_BULK_MIN, default
+/// 96). The exact rows step costs about 3.6 ms a row (a synchronous Engram read per 64-row
+/// step) while a bulk chunk costs about 0.3 s almost flat (it reads every expert's weights
+/// once), so the two cross near 85 rows; below that the exact step is both faster and
+/// bit-identical to M = 1.
 pub(super) fn bulk_min() -> usize {
     std::env::var("SPARKFLASH_PREFILL_BULK_MIN")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(256)
+        .unwrap_or(96)
 }
 
 /// Gathers the embedding rows of `tokens` (f32, `[n][dim]`) with one all-gather: each owner rank

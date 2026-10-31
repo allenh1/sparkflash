@@ -35,7 +35,7 @@
 //! embedding exchange, like any token's.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// The vision tower's cubin in the `--tp4-device` cubin directory: serving takes images when it is
 /// there and SPARKFLASH_VISION is not 0.
@@ -52,6 +52,56 @@ pub fn vision_enabled(cubins: &Path) -> bool {
 #[must_use]
 pub const fn tower_rank() -> usize {
     sparkflash_vision::IMAGE_TOKEN_ID as usize / crate::tp4_tail::VOCAB_PER_RANK
+}
+
+/// A structured-output constraint a request carries: the schema, and the table that turns it into
+/// admissible vocabulary ids.
+///
+/// The table is process-wide (it is the checkpoint tokenizer's, built once), so two specs with the
+/// same schema compare equal whatever Arc they hold: that is what keeps DeviceJob's derived
+/// PartialEq meaningful across ranks.
+#[derive(Debug, Clone)]
+pub struct ConstraintSpec {
+    /// The JSON Schema the document must satisfy.
+    pub schema: serde_json::Value,
+    /// The vocabulary's bytes.
+    pub vocabulary: Arc<sparkflash_api::vocab::TokenBytes>,
+    /// The end-of-sequence id, admissible only where the document may end.
+    pub end: u32,
+}
+
+impl PartialEq for ConstraintSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema == other.schema && self.end == other.end
+    }
+}
+
+impl ConstraintSpec {
+    /// A spec for schema, or None when no vocabulary table was installed (a process that never
+    /// loaded a tokenizer cannot enforce a constraint, and must not silently ignore one).
+    #[must_use]
+    pub fn new(schema: serde_json::Value, end: u32) -> Option<Self> {
+        Some(Self {
+            schema,
+            vocabulary: vocabulary()?,
+            end,
+        })
+    }
+}
+
+/// The process's vocabulary table, installed once the tokenizer is loaded.
+static VOCABULARY: std::sync::OnceLock<Arc<sparkflash_api::vocab::TokenBytes>> =
+    std::sync::OnceLock::new();
+
+/// Installs the vocabulary table (the first call wins; every later one is a no-op).
+pub fn install_vocabulary(table: Arc<sparkflash_api::vocab::TokenBytes>) {
+    let _ = VOCABULARY.set(table);
+}
+
+/// The vocabulary table, when this process loaded a tokenizer.
+#[must_use]
+pub fn vocabulary() -> Option<Arc<sparkflash_api::vocab::TokenBytes>> {
+    VOCABULARY.get().cloned()
 }
 
 /// One request as the device loop runs it: identical on every rank.
@@ -76,6 +126,10 @@ pub struct DeviceJob {
     /// holds the placeholder id), grid and content key. The canvas is there on the
     /// [`tower_rank`] only and empty on the others.
     pub images: Vec<sparkflash_api::VisionImage>,
+    /// The structured-output constraint, when the request asked for one. A constrained request is
+    /// sampled greedily over the ids the schema admits; a drafted row is masked by the automaton
+    /// state at its own position.
+    pub constraint: Option<Arc<ConstraintSpec>>,
 }
 
 /// Why a device request ended.

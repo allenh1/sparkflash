@@ -8954,6 +8954,19 @@ pub fn write_forward_progress(
 ///
 /// The probe's own boundary drain is excluded from a block's counters and priced once in
 /// `run.probe_overhead`, so a block's numbers describe the code path and not the instrument.
+/// Serialises the tests that touch the probe, across every test module in this crate.
+///
+/// [probe::installed] is one process-wide flag while the probe's samples are thread-local, so two
+/// test threads that arm or clear it at once observe each other's installs: a test that asserts the
+/// flag is clear can land between another test's arm and its own read, and read `true`. Every test
+/// that writes the flag takes this lock. Production installs once, from the thread that runs the
+/// forward, so it never contends.
+#[cfg(test)]
+pub(crate) fn probe_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|error| error.into_inner())
+}
+
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) mod probe {
     use std::cell::RefCell;
@@ -9934,13 +9947,10 @@ pub(crate) mod probe {
     mod tests {
         use super::*;
 
-        /// The probe's installed flag is process-wide while its state is thread-local, so two test
-        /// threads writing at once would race on the flag and see each other's installs. These
-        /// tests serialise on one lock; production only ever installs from one thread.
-        static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+        /// One lock for every test in this crate that writes the probe's process-wide flag, so
+        /// these tests cannot see each other's installs. See [super::super::probe_test_lock].
         fn serial() -> std::sync::MutexGuard<'static, ()> {
-            TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+            super::super::probe_test_lock()
         }
 
         fn unique_path(name: &str) -> std::path::PathBuf {
@@ -19189,6 +19199,7 @@ mod tests {
 
     #[test]
     fn probe_off_takes_the_non_probe_branches() {
+        let _serial = probe_test_lock();
         probe::reset();
         // The default run installs no probe state, so the counter clock is None (no Instant read)
         // and every block timer is unarmed: the loop takes the existing path.

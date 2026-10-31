@@ -32,6 +32,9 @@ pub struct Capabilities {
     pub reasoning_effort: bool,
     /// Whether the engine turns prepared images into visual tokens.
     pub vision: bool,
+    /// Whether the engine enforces a JSON Schema on the decoder, so `response_format` is a
+    /// guarantee rather than an instruction.
+    pub constrained: bool,
 }
 
 impl Capabilities {
@@ -42,6 +45,7 @@ impl Capabilities {
         thinking: true,
         reasoning_effort: true,
         vision: false,
+        constrained: false,
     };
 
     /// The same text channels plus vision.

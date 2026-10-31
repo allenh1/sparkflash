@@ -406,6 +406,22 @@ impl ApiInferenceEngine for DeviceDriver {
                 REFUSED_CODE,
             );
         }
+        // A structured-output request runs greedy: the mask decides every token, so there is no
+        // distribution left to sample from. A process without the vocabulary table cannot mask,
+        // and serving the request unconstrained would hand back a document the schema never held.
+        let constraint = request.constraint.as_ref().map(|schema| {
+            crate::device_link::ConstraintSpec::new(schema.clone(), self.end_of_sequence)
+        });
+        let constraint = match constraint {
+            Some(None) => {
+                return refused(
+                    "structured output needs the tokenizer's vocabulary table, and this process \
+                     has none",
+                    REFUSED_CODE,
+                );
+            }
+            spec => spec.flatten().map(std::sync::Arc::new),
+        };
         let greedy = request.temperature < SAMPLING_EPS;
         let seed = request.seed.unwrap_or_else(|| self.random_seed());
         let reasoning = request.thinking
@@ -428,6 +444,7 @@ impl ApiInferenceEngine for DeviceDriver {
             stop_ids: vec![self.end_of_sequence],
             prompt: request.prompt_tokens,
             images: request.vision,
+            constraint,
         };
         let (events, answers) = tokio::sync::mpsc::unbounded_channel();
         let pending = Pending {
@@ -493,6 +510,13 @@ impl ApiInferenceEngine for DeviceDriver {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             vision: self.vision,
+            // The head masks its logits for a constrained row, so `response_format` is a
+            // guarantee on this path rather than an instruction (DECISIONS.md D62/D64). It needs
+            // the vocabulary table the tokenizer builds, which every rank installs before it
+            // joins the group; a process without one keeps refusing the request.
+            // SPARKFLASH_CONSTRAINED=0 turns it back off for a run without a rebuild.
+            constrained: crate::device_link::vocabulary().is_some()
+                && std::env::var("SPARKFLASH_CONSTRAINED").as_deref() != Ok("0"),
             ..Capabilities::ALL
         }
     }
@@ -766,6 +790,7 @@ fn admit_frame(seq: u64, job: &DeviceJob) -> Tp4DeviceAdmit {
                 }
             })
             .collect(),
+        constraint: job.constraint.as_ref().map(|spec| spec.schema.to_string()),
     }
 }
 
@@ -811,9 +836,32 @@ fn admitted_job(
                 .unwrap_or_else(|| Arc::from(&[][..])),
         });
     }
+    // The constraint's end id is the request's end-of-sequence id, the one id that appends no
+    // bytes and ends the document.
+    let end = admit.stop_ids.first().copied().unwrap_or(0);
+    // A rank that cannot enforce a schema the group was admitted with must fail the sequence
+    // rather than run it unconstrained: every rank has to build the same automaton, so a silent
+    // drop here would mask one rank's head while another's stays free, and the collectives after
+    // it would disagree (DECISIONS.md D64).
+    let constraint = match admit.constraint.as_deref() {
+        None => None,
+        Some(schema) => {
+            let schema: serde_json::Value = serde_json::from_str(schema).map_err(|error| {
+                format!("sequence {seq}: the admitted constraint schema is not JSON: {error}")
+            })?;
+            let spec = crate::device_link::ConstraintSpec::new(schema, end).ok_or_else(|| {
+                format!(
+                    "sequence {seq}: a constraint schema arrived but this rank has no vocabulary \
+                     table, so it cannot enforce it"
+                )
+            })?;
+            Some(std::sync::Arc::new(spec))
+        }
+    };
     Ok((
         seq,
         DeviceJob {
+            constraint,
             prompt: admit.prompt_ids,
             max_tokens: admit.max_tokens as usize,
             temperature: f32::from_bits(admit.temperature_bits),
@@ -1338,6 +1386,9 @@ pub(super) fn run(
     let control = SocketAddr::new(tp4.peers[0], tp4.control_port);
     if tp4.rank != 0 {
         let started = (|| -> Result<(), String> {
+            // Before the control channel: an admit frame may carry a constraint schema on the
+            // first tick, and a rank without the table would have to refuse it (D64).
+            install_constraint_vocabulary(options)?;
             let rank = u32::try_from(tp4.rank).map_err(|_| "rank does not fit in u32")?;
             let mut worker =
                 Tp4ControlWorker::connect(control, rank, tp4.world_size, TP4_CONTROL_TIMEOUT)
@@ -1375,6 +1426,24 @@ pub(super) fn run(
     code
 }
 
+/// Builds the vocabulary table every rank's structured-output mask reads.
+///
+/// The table is the checkpoint tokenizer's bytes, so two ranks that load the same tokenizer admit
+/// exactly the same ids without exchanging anything. A worker installs it before it connects, since
+/// an admit frame can carry a schema on the first tick; rank 0 installs it beside its seam in
+/// [`start_leader`].
+fn install_constraint_vocabulary(options: &ServeOptions) -> Result<(), String> {
+    let tokenizer_path = match options.tokenizer.clone() {
+        Some(path) => path,
+        None => default_tokenizer()?,
+    };
+    let seam = TokenizerSeam::new(load_tokenizer(&tokenizer_path)?);
+    crate::device_link::install_vocabulary(Arc::new(
+        sparkflash_api::vocab::TokenBytes::from_codec(&seam, seam.tokenizer().get_vocab_size(true)),
+    ));
+    Ok(())
+}
+
 /// Rank 0 before its epoch: the tokenizer, the workers' handshake, the link, and the HTTP thread
 /// that binds once the epoch reaches its serving loop.
 fn start_leader(
@@ -1389,6 +1458,14 @@ fn start_leader(
     };
     let tokenizer = load_tokenizer(&tokenizer_path)?;
     let seam = Arc::new(TokenizerSeam::new(load_tokenizer(&tokenizer_path)?));
+    // The vocabulary table a structured-output constraint masks with: built once here from the
+    // same tokenizer every rank loads, so every rank admits the same ids.
+    crate::device_link::install_vocabulary(Arc::new(
+        sparkflash_api::vocab::TokenBytes::from_codec(
+            seam.as_ref(),
+            seam.tokenizer().get_vocab_size(true),
+        ),
+    ));
     let id = |name: &str| tokenizer.tokenizer().token_to_id(name);
     let think_start = id(THINK_START);
     let think_end = id(THINK_END);
@@ -1447,7 +1524,17 @@ fn start_leader(
         .with_tokenizer(seam)
         .with_api_key(options.api_key.clone())
         .with_cors(options.cors.clone())
-        .with_model_aliases(crate::serve::model_aliases());
+        .with_model_aliases(crate::serve::model_aliases())
+        // This is the path a `--tp4-device` launch takes, so it is the one the model card is
+        // actually served from: without these two the card reports the released id for a served
+        // finetune and no build identifier (DECISIONS.md D38, D61).
+        .with_served_checkpoint(
+            options
+                .checkpoint
+                .as_ref()
+                .map(|path| path.display().to_string()),
+        )
+        .with_build_id(std::env::var("SPARKFLASH_BUILD_ID").ok());
     let bind = options.bind;
     let boot = Instant::now();
     std::thread::Builder::new()
@@ -1577,6 +1664,7 @@ mod tests {
             seed: u64::MAX - 3,
             stop_ids: vec![1],
             images: Vec::new(),
+            constraint: None,
         };
         let frame = Tp4ControlFrame::DeviceTick {
             admit: vec![admit_frame(9, &job)],
@@ -1631,6 +1719,7 @@ mod tests {
             seed: 1,
             stop_ids: vec![1],
             images: vec![image(2)],
+            constraint: None,
         };
         assert_eq!(bad_spans(&job.prompt, &job.images), None);
         let wire = serde_json::to_vec(&admit_frame(3, &job)).unwrap();
@@ -1685,6 +1774,7 @@ mod tests {
             seed: 0,
             stop_ids: vec![1],
             images: Vec::new(),
+            constraint: None,
         };
         let pending = Pending {
             job,

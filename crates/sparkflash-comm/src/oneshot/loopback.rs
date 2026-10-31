@@ -146,7 +146,13 @@ impl Default for LoopbackDeviceConfig {
             world_size: ONESHOT_RANKS,
             slot_ring: HOST_TWIN_RING,
             rails: ONESHOT_RAILS,
-            timeout: Duration::from_secs(5),
+            // The twin is four threads in this process, so every wait it makes is one thread
+            // handing work to another; nothing here measures latency. A deadline tight enough to
+            // be reached by scheduling alone turns a correct run into a timeout on a loaded
+            // runner (CI: 452 tests in parallel, the preflight alone taking over a minute), which
+            // is how this assertion used to fail as a "protocol" error. A real hang still ends the
+            // run, just an hour later than a five-second budget would.
+            timeout: Duration::from_secs(600),
             reverse_arrivals: false,
             read_epoch_policy: ReadEpochPolicy::Honor,
             kernel_delay: None,

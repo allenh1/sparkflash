@@ -341,6 +341,9 @@ pub struct EngineRequest {
     pub trace_scopes: u64,
     /// Engine steps for which `trace_scopes` stays armed.
     pub trace_steps: u32,
+    /// The JSON Schema a structured-output request must satisfy, when the engine can enforce one.
+    /// None for every request that did not ask for structured output.
+    pub constraint: Option<serde_json::Value>,
 }
 
 /// One element of the normalized decode stream.
@@ -1182,6 +1185,7 @@ mod tests {
             seed: None,
             trace_scopes: 0,
             trace_steps: 0,
+            constraint: None,
         }
     }
 
@@ -1226,6 +1230,7 @@ mod tests {
         // A struct literal, so a new channel fails to compile until this test says whether `ALL`
         // covers it. Vision is declared by an engine with the tower loaded, never by `ALL` (D59).
         let every_text_channel = Capabilities {
+            constrained: false,
             tools: true,
             thinking: true,
             reasoning_effort: true,

@@ -1120,6 +1120,40 @@ async fn models_reports_the_engines_own_capabilities() {
     assert_eq!(caps["thinking"], true);
     assert_eq!(caps["chat_template_kwargs"], json!(["thinking"]));
     assert_eq!(caps["reasoning_effort"]["max"], 100);
+    // The modes this seam cannot enforce are named, so a client does not discover them as a 400.
+    assert_eq!(caps["tool_choice_modes"], json!(["auto", "none"]));
+    assert_eq!(caps["tool_choice_forced"], false);
+    assert_eq!(caps["response_format_modes"], json!(["text"]));
+}
+
+#[tokio::test]
+async fn models_card_reports_the_served_checkpoint_rather_than_the_requested_id() {
+    // A finetune served under the released model's id would otherwise be indistinguishable from
+    // the released weights (DECISIONS.md D38): `root` names the checkpoint that answered.
+    let checkpoint = "/models/models--example--DeepSeek-V4.1-Flash-finetune/snapshots/0000";
+    let state = AppState::new(Arc::new(
+        MockEngine::new(MODEL).with_capabilities(Capabilities::ALL),
+    ))
+    .with_fixed_time(FIXED_TIME)
+    .with_served_checkpoint(Some(checkpoint.to_owned()))
+    .with_build_id(Some("03317f96".to_owned()));
+    let (status, _, bytes) = send(router(state), get_request("/v1/models")).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_json(&bytes);
+    let card = &body["data"][0];
+    assert_eq!(card["id"], MODEL, "the requested id is unchanged");
+    assert_eq!(card["root"], checkpoint);
+    assert_eq!(card["checkpoint"], checkpoint);
+    assert_eq!(card["build"]["id"], "03317f96");
+    assert!(card["build"]["version"].is_string());
+
+    // With no checkpoint declared, the card falls back to the model id and says so with null.
+    let (status, _, bytes) = send(app(), get_request("/v1/models")).await;
+    assert_eq!(status, StatusCode::OK);
+    let body = body_json(&bytes);
+    assert_eq!(body["data"][0]["root"], MODEL);
+    assert_eq!(body["data"][0]["checkpoint"], Value::Null);
+    assert_eq!(body["data"][0]["build"]["id"], Value::Null);
 }
 
 #[tokio::test]

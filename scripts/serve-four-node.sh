@@ -117,6 +117,9 @@ rank_env() {
     [ -n "${SPARK_MAX_SEQ_LEN:-}" ] && printf ' SPARK_MAX_SEQ_LEN=%s' "$SPARK_MAX_SEQ_LEN"
     [ -n "${SPARKFLASH_LANES:-}" ] && printf ' SPARKFLASH_LANES=%s' "$SPARKFLASH_LANES"
     [ -n "${SPARKFLASH_SERVE_API_KEY:-}" ] && printf ' SPARKFLASH_SERVE_API_KEY=%q' "$SPARKFLASH_SERVE_API_KEY"
+    # The build identifier the model card reports, so a served card names the binary that
+    # answered and not just the package version (DECISIONS.md D61).
+    [ -n "${SPARKFLASH_BUILD_ID:-}" ] && printf ' SPARKFLASH_BUILD_ID=%s' "$SPARKFLASH_BUILD_ID"
     if [ -n "$CUBINS" ]; then
         printf ' SPARK_COMM_REDUCE=nccl SPARKFLASH_LEAN_HEAD=1'
         [ -n "$NCCL_LIB" ] && printf ' LD_LIBRARY_PATH=%s${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}' "$NCCL_LIB"

@@ -2024,6 +2024,10 @@ pub struct Tp4DeviceAdmit {
     /// [`Tp4ControlFrame::DevicePixels`] frames.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<Tp4DeviceImage>,
+    /// The JSON Schema the document must satisfy, when the request asked for structured output.
+    /// Every rank rebuilds the constraint from this, so it is the schema and not a pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint: Option<String>,
 }
 
 /// One image span of an admission: where it sits in the prompt and the canvas it is made from.
@@ -5141,6 +5145,15 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
         .with_api_key(options.api_key.clone())
         .with_cors(options.cors.clone())
         .with_model_aliases(model_aliases())
+        // The TP=4 path builds its own state; the card must name the served weights here too,
+        // or a device launch reports the released id for a finetune (DECISIONS.md D38, D61).
+        .with_served_checkpoint(
+            options
+                .checkpoint
+                .as_ref()
+                .map(|path| path.display().to_string()),
+        )
+        .with_build_id(std::env::var("SPARKFLASH_BUILD_ID").ok())
         .with_device_token_source(device_token_source);
     let drain_state = state.clone();
     let router = sparkflash_api::server::router(state);
@@ -5325,6 +5338,12 @@ fn serve_with_engine(
             return ExitCode::from(EXIT_REFUSED);
         }
     };
+    // The card reports the weights that actually answered: a finetune served under the released
+    // model's id is otherwise indistinguishable from the released weights (DECISIONS.md D38).
+    let served_checkpoint = options
+        .checkpoint
+        .as_ref()
+        .map(|path| path.display().to_string());
     let state = AppState::new(engine)
         .with_metrics(metrics)
         .with_model_descriptor(Arc::new(sparkflash_model::default_model().clone()))
@@ -5333,6 +5352,8 @@ fn serve_with_engine(
         .with_api_key(options.api_key.clone())
         .with_cors(options.cors.clone())
         .with_model_aliases(model_aliases())
+        .with_served_checkpoint(served_checkpoint)
+        .with_build_id(std::env::var("SPARKFLASH_BUILD_ID").ok())
         .with_device_token_source(device_token_source);
     // A debug-build test seam: a wire test can shorten the keep-alive interval so an idle engine
     // gap produces observable comment frames without waiting the production 15 s. Debug-only, so
@@ -7415,6 +7436,7 @@ mod tests {
             seed: Some(seed),
             trace_scopes: 0,
             trace_steps: 0,
+            constraint: None,
         }
     }
 
@@ -9583,6 +9605,7 @@ mod tp4_serve_tests {
             seed: Some(0),
             trace_scopes: 0,
             trace_steps: 0,
+            constraint: None,
         }
     }
 

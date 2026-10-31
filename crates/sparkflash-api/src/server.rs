@@ -186,6 +186,8 @@ struct StreamContext {
     parallel_tool_calls: bool,
     /// Whether every chunk carries the running usage block (`stream_options.continuous_usage_stats`).
     continuous_usage_stats: bool,
+    /// Forced DSML tool-call prefix seeded into the prompt and parser when `tool_choice` forces a call.
+    forced_prefix: Option<String>,
 }
 
 /// A parsed `X-SparkFlash-Trace` directive.
@@ -603,19 +605,59 @@ struct ToolPolicy {
     /// Whether one response may carry more than one parsed call (`parallel_tool_calls`, default
     /// true).
     parallel: bool,
+    /// Forced DSML tool-call prefix when `tool_choice` forces a call on a constrained engine.
+    forced_prefix: Option<String>,
+}
+
+/// Whether `name` can be written as a DSML attribute value: the prefix is spelled into the prompt
+/// unescaped, so a quote, an angle bracket or a line break would end the attribute or the tag early
+/// and leave the model continuing a malformed block.
+fn dsml_attribute_safe(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['"', '<', '>', '\n', '\r'])
+}
+
+fn forced_dsml_prefix_for_tool(function: &Value) -> Option<String> {
+    let name = function
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| dsml_attribute_safe(name))?;
+    let params = function.get("parameters");
+    let required = params
+        .and_then(|p| p.get("required"))
+        .and_then(Value::as_array);
+    if let Some(req) = required {
+        if req.len() == 1
+            && let Some(req_param) = req[0].as_str()
+            && dsml_attribute_safe(req_param)
+        {
+            let is_string = params
+                .and_then(|p| p.get("properties"))
+                .and_then(|props| props.get(req_param))
+                .and_then(|schema| schema.get("type"))
+                .and_then(Value::as_str)
+                == Some("string");
+            let flag = if is_string { "true" } else { "false" };
+            return Some(format!(
+                "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"{name}\">\n<｜DSML｜ parameter name=\"{req_param}\" string=\"{flag}\">"
+            ));
+        }
+        if !req.is_empty() {
+            return Some(format!(
+                "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"{name}\">\n<｜DSML｜ parameter name=\""
+            ));
+        }
+    }
+    Some(format!(
+        "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"{name}\">\n"
+    ))
 }
 
 /// Validates OpenAI's `tool_choice`/`parallel_tool_calls` pair.
-///
-/// `"none"` and `"auto"` are honoured. `"required"` and a named function selector need a template
-/// policy that forces the call, which the V4.1 seam does not render, so they are refused with a
-/// typed 400 (the same treatment `response_format` gets) rather than accepted as a no-op. The
-/// selector is validated even when no tools are offered, because a malformed value is a client
-/// error either way.
 fn resolve_tool_policy(
     tools: Option<&Value>,
     tool_choice: Option<&Value>,
     parallel_tool_calls: Option<bool>,
+    constrained: bool,
 ) -> Result<ToolPolicy, ApiError> {
     let offered = tools.is_some_and(|tools| !tools.is_null());
     let parallel = parallel_tool_calls.unwrap_or(true);
@@ -637,12 +679,36 @@ fn resolve_tool_policy(
             Some("invalid_tool_choice".to_owned()),
         )
     };
+    let mut forced_prefix = None;
     let mode = match tool_choice {
         None | Some(Value::Null) => "auto",
         Some(Value::String(choice)) => match choice.as_str() {
             "auto" => "auto",
             "none" => "none",
-            "required" => return Err(forced("\"required\"")),
+            "required" => {
+                if !constrained {
+                    return Err(forced("\"required\""));
+                }
+                let list = tools
+                    .and_then(Value::as_array)
+                    .filter(|arr| !arr.is_empty())
+                    .ok_or_else(|| {
+                        ApiError::invalid_request(
+                            "tool_choice \"required\" requires a non-empty tools list",
+                            Some("tool_choice".to_owned()),
+                            Some("invalid_tool_choice".to_owned()),
+                        )
+                    })?;
+                forced_prefix = if list.len() == 1 {
+                    list[0]
+                        .get("function")
+                        .and_then(forced_dsml_prefix_for_tool)
+                        .or_else(|| Some("<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"".to_owned()))
+                } else {
+                    Some("<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"".to_owned())
+                };
+                "required"
+            }
             _ => return Err(malformed()),
         },
         Some(Value::Object(selector)) => {
@@ -650,13 +716,54 @@ fn resolve_tool_policy(
             if !is_function {
                 return Err(malformed());
             }
-            return Err(forced("with a named function"));
+            if !constrained {
+                return Err(forced("with a named function"));
+            }
+            let target = selector
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(malformed)?;
+            let list = tools
+                .and_then(Value::as_array)
+                .filter(|arr| !arr.is_empty())
+                .ok_or_else(|| {
+                    ApiError::invalid_request(
+                        "a function tool_choice selector requires a non-empty tools list",
+                        Some("tool_choice".to_owned()),
+                        Some("invalid_tool_choice".to_owned()),
+                    )
+                })?;
+            let matched = list
+                .iter()
+                .filter_map(|item| item.get("function"))
+                .find(|f| f.get("name").and_then(Value::as_str) == Some(target))
+                .ok_or_else(|| {
+                    ApiError::invalid_request(
+                        format!("tool_choice function \"{target}\" is not in tools"),
+                        Some("tool_choice".to_owned()),
+                        Some("invalid_tool_choice".to_owned()),
+                    )
+                })?;
+            forced_prefix = Some(forced_dsml_prefix_for_tool(matched).ok_or_else(|| {
+                ApiError::invalid_request(
+                    format!(
+                        "tool_choice function \"{target}\" cannot be written into a forced tool \
+                         call: its name contains a quote, an angle bracket or a line break"
+                    ),
+                    Some("tool_choice".to_owned()),
+                    Some("invalid_tool_choice".to_owned()),
+                )
+            })?);
+            "function"
         }
         Some(_) => return Err(malformed()),
     };
     Ok(ToolPolicy {
         tools_offered: offered && mode != "none",
         parallel,
+        forced_prefix,
     })
 }
 
@@ -749,7 +856,24 @@ fn check_sampling_extensions(
 /// instruction, but an instruction is not a guarantee, so `json_object` and `json_schema` are
 /// refused before generation instead of returning text that may not be valid JSON or match the
 /// schema. `{"type":"text"}` is the OpenAI default and is accepted as a no-op.
-fn refuse_unenforceable_response_format(format: Option<&ResponseFormat>) -> Result<(), ApiError> {
+fn refuse_unenforceable_response_format(
+    format: Option<&ResponseFormat>,
+    constrained: bool,
+) -> Result<(), ApiError> {
+    // An engine that masks its decoder enforces the schema, so the request is served once its
+    // schema compiles into the byte automaton.
+    if constrained {
+        if let Some(schema) = constraint_schema(format) {
+            crate::constrained::compile(&schema).map_err(|error| {
+                ApiError::invalid_request(
+                    format!("response_format schema cannot be enforced: {error}"),
+                    Some("response_format".to_owned()),
+                    Some("invalid_response_format".to_owned()),
+                )
+            })?;
+        }
+        return Ok(());
+    }
     match format {
         None | Some(ResponseFormat::Text) => Ok(()),
         Some(ResponseFormat::JsonObject) | Some(ResponseFormat::JsonSchema { .. }) => {
@@ -759,6 +883,18 @@ fn refuse_unenforceable_response_format(format: Option<&ResponseFormat>) -> Resu
                 Some("unsupported_parameter".to_owned()),
             ))
         }
+    }
+}
+
+/// The JSON Schema a `response_format` asks the decoder to enforce.
+///
+/// `json_object` is the permissive object schema (vLLM compiles it the same way); `json_schema`
+/// is the caller's own. `text` and an absent field ask for nothing.
+fn constraint_schema(format: Option<&ResponseFormat>) -> Option<serde_json::Value> {
+    match format {
+        Some(ResponseFormat::JsonObject) => Some(serde_json::json!({ "type": "object" })),
+        Some(ResponseFormat::JsonSchema { json_schema }) => Some(json_schema.schema.clone()),
+        None | Some(ResponseFormat::Text) => None,
     }
 }
 
@@ -1209,6 +1345,27 @@ struct RequestBuilder {
     trace: Option<TraceDirective>,
     /// The prepared images, whose spans are already expanded in `summary.token_ids`.
     vision: Vec<VisionImage>,
+    /// The schema a structured-output request must satisfy, when the engine enforces one.
+    constraint: Option<serde_json::Value>,
+}
+
+/// Turns the prompt's trailing opening think tag into the closing one, so a turn that must not
+/// reason still starts from the conversation's own rendered prefix: a template re-rendered with
+/// thinking off drops the prior turns' reasoning and shifts every token from position 2, which
+/// costs the whole prefix cache. Returns whether the swap happened.
+fn close_thinking_turn(seam: &dyn PromptCodec, ids: &mut [u32]) -> bool {
+    let single = |text: &str| match seam.encode_text(text, false) {
+        Ok(tokens) if tokens.len() == 1 => tokens.first().copied(),
+        _ => None,
+    };
+    let (Some(start), Some(end)) = (single("<think>"), single("</think>")) else {
+        return false;
+    };
+    let Some(last) = ids.last_mut().filter(|last| **last == start) else {
+        return false;
+    };
+    *last = end;
+    true
 }
 
 /// V4.1 thinking-mode sampling policy, adopted from deepseek-recipe 0.2.
@@ -1218,7 +1375,16 @@ struct RequestBuilder {
 /// least 0.95; outside thinking mode the caller's values are passed through.
 fn resolve_sampling(temperature: Option<f32>, top_p: Option<f32>, thinking: bool) -> (f32, f32) {
     if thinking {
-        (1.0, top_p.unwrap_or(1.0).max(0.95))
+        // An explicit greedy request is a client decision (the reference servers honour it),
+        // and greedy is also the only sample the decoder can verify at full speculative depth.
+        // SPARKFLASH_THINKING_SAMPLING=recipe restores the unconditional recipe policy.
+        let honour_greedy =
+            std::env::var("SPARKFLASH_THINKING_SAMPLING").as_deref() != Ok("recipe");
+        if honour_greedy && temperature.is_some_and(|t| t <= 0.0) {
+            (0.0, 1.0)
+        } else {
+            (1.0, top_p.unwrap_or(1.0).max(0.95))
+        }
     } else {
         (temperature.unwrap_or(1.0), top_p.unwrap_or(1.0))
     }
@@ -1259,6 +1425,7 @@ impl RequestBuilder {
             logprobs: self.logprobs,
             trace_scopes: self.trace.map_or(0, |directive| directive.scopes),
             trace_steps: self.trace.map_or(0, |directive| directive.steps),
+            constraint: self.constraint,
         })
     }
 }
@@ -1882,14 +2049,17 @@ async fn chat_completions(
     // tokenizer seam is attached; the placeholder path does not need it.
     let seam = state.tokenizer().cloned();
     let mut raw_for_seam = seam.as_ref().map(|_| value.clone());
+    let mut spec = spec;
     let request: ChatCompletionRequest = serde_json::from_value(value).map_err(invalid_body)?;
     // vLLM's auto tool choice is enabled by `--enable-auto-tool-choice --tool-call-parser
     // deepseek_v41`; the request side of that contract is a non-null `tools` list, and the
     // answer side is parsed below before the OpenAI tool_calls array is filled.
+    let constrained = state.engine.capabilities().constrained;
     let tool_policy = resolve_tool_policy(
         request.tools.as_ref(),
         request.tool_choice.as_ref(),
         request.parallel_tool_calls,
+        constrained && seam.is_some(),
     )?;
     let tools_offered = tool_policy.tools_offered;
     if !tools_offered
@@ -1911,7 +2081,31 @@ async fn chat_completions(
         ));
     }
     let n = resolve_choice_count(request.n, state.engine.as_ref())?;
-    refuse_unenforceable_response_format(request.response_format.as_ref())?;
+    // A guided-decoding engine enforces the schema; one without a logits processor must refuse
+    // rather than render the schema into the prompt and hope.
+    refuse_unenforceable_response_format(request.response_format.as_ref(), constrained)?;
+    let schema_enforced =
+        constrained && constraint_schema(request.response_format.as_ref()).is_some();
+    if schema_enforced && tool_policy.forced_prefix.is_some() {
+        // The forced call's arguments are written as DSML after the seeded prefix, while the
+        // schema requires the continuation to be the response_format document: the document would
+        // close the sequence inside an unterminated tool-call block, which parses as neither.
+        return Err(ApiError::invalid_request(
+            "response_format json_object/json_schema cannot be combined with a tool_choice that \
+             forces a call: the call's arguments are not the response_format document",
+            Some("response_format".to_owned()),
+            Some("unsupported_parameter".to_owned()),
+        ));
+    }
+    // Guided decoding and forced tool calls emit directly into the visible content/tool channel
+    // without a reasoning block on this turn. Keep the conversation's rendered prefix unchanged so
+    // the KV cache still matches prior turns, and close the trailing thinking tag on the encoded
+    // prompt below.
+    let suppress_thinking =
+        spec.thinking && (schema_enforced || tool_policy.forced_prefix.is_some());
+    if suppress_thinking {
+        spec.thinking = false;
+    }
     // Logprobs are resolved and validated before generation, exactly where vLLM validates them:
     // an impossible request (too many alternatives, out-of-vocabulary ids, streaming prompt
     // logprobs) is a 400, never a truncated answer.
@@ -2000,7 +2194,37 @@ async fn chat_completions(
     // weight-free router tests), the Milestone 1 heuristic keeps the placeholder path.
     let (mut summary, prompt_token_ids) = match (seam.as_ref(), raw_for_seam.as_ref()) {
         (Some(seam), Some(raw)) => {
-            let ids = seam.encode_chat(raw).map_err(prompt_codec_error)?;
+            let mut ids = seam.encode_chat(raw).map_err(prompt_codec_error)?;
+            let closed = !spec.thinking && close_thinking_turn(seam.as_ref(), &mut ids);
+            if suppress_thinking && !closed {
+                // The rendered prompt did not end on the opening think tag, so closing it in
+                // place is not possible: re-render with the template's own thinking switch,
+                // which costs the turn's prefix cache but keeps the prompt well formed. (A turn
+                // the client asked not to reason was rendered without it already.) Both switches
+                // are set over the client's other kwargs: the template reasons when either is
+                // true, and a top-level reasoning_effort fills in enable_thinking when it is
+                // absent.
+                if let Some(object) = raw_for_seam.as_ref().and_then(Value::as_object) {
+                    let mut restated = object.clone();
+                    let mut kwargs = restated
+                        .get("chat_template_kwargs")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    kwargs.insert("thinking".to_owned(), Value::Bool(false));
+                    kwargs.insert("enable_thinking".to_owned(), Value::Bool(false));
+                    restated.insert("chat_template_kwargs".to_owned(), Value::Object(kwargs));
+                    ids = seam
+                        .encode_chat(&Value::Object(restated))
+                        .map_err(prompt_codec_error)?;
+                }
+            }
+            if let Some(prefix) = tool_policy.forced_prefix.as_deref() {
+                let prefix_ids = seam
+                    .encode_text(prefix, false)
+                    .map_err(prompt_codec_error)?;
+                ids.extend(prefix_ids);
+            }
             (tokenizer_prompt_summary(ids.clone(), 0), Some(ids))
         }
         _ => (summarize_chat_messages(&request.messages)?, None),
@@ -2071,6 +2295,7 @@ async fn chat_completions(
         logprobs,
         trace,
         vision,
+        constraint: constraint_schema(request.response_format.as_ref()),
     }
     .build()?;
     // One engine request per choice. The reference engine serves one sequence per request, so n
@@ -2119,6 +2344,7 @@ async fn chat_completions(
                 tools_offered,
                 parallel_tool_calls: tool_policy.parallel,
                 continuous_usage_stats,
+                forced_prefix: tool_policy.forced_prefix,
             },
             logprob_info,
             trace,
@@ -2130,6 +2356,9 @@ async fn chat_completions(
             outputs.push(drive_engine(state.engine.as_ref(), engine_request).await?);
         }
         for output in &mut outputs {
+            if let Some(prefix) = tool_policy.forced_prefix.as_deref() {
+                output.content = format!("{prefix}{}", output.content);
+            }
             if tools_offered {
                 apply_deepseek_v41_tool_parser(output, &state);
             }
@@ -2457,6 +2686,7 @@ fn chat_stream_response(
         tools_offered,
         parallel_tool_calls,
         continuous_usage_stats,
+        forced_prefix,
     } = context;
     // The parser runs whenever the client offered tools. It used to be switched off for
     // streaming-logprob requests, which left the raw DSML block in the content; vLLM parses that
@@ -2523,6 +2753,12 @@ fn chat_stream_response(
             // sent cannot be taken back, so the error frame ends the response and later events are
             // dropped instead of interleaving content with a broken call.
             let mut parser_refusal: Option<String> = None;
+            if let (Some(parser), Some(prefix)) = (tool_parser.as_mut(), forced_prefix.as_deref()) {
+                match parser.feed(prefix) {
+                    Ok(chunks) => assembler.push(chunks),
+                    Err(refusal) => parser_refusal = Some(refusal.message),
+                }
+            }
             let mut events = engine.generate(request);
             while let Some(event) = events.next().await {
                 match event {
@@ -2997,7 +3233,7 @@ async fn completions(
     let vocab_size = state.engine.vocab_size();
     // S2: the completions schema now carries response_format with the chat refusal rule, and S5's
     // best_of is accepted as vLLM's documented no-op. logit_bias/min_p follow the chat validation.
-    refuse_unenforceable_response_format(request.response_format.as_ref())?;
+    refuse_unenforceable_response_format(request.response_format.as_ref(), false)?;
     check_sampling_extensions(request.logit_bias.as_ref(), request.min_p, vocab_size)?;
     let explicit_token_ids = request
         .logprob_token_ids
@@ -3115,6 +3351,7 @@ async fn completions(
                     logprobs: logprobs.clone(),
                     trace,
                     vision: Vec::new(),
+                    constraint: None,
                 }
                 .build()?,
             );
@@ -3148,6 +3385,7 @@ async fn completions(
                 tools_offered: false,
                 parallel_tool_calls: true,
                 continuous_usage_stats: false,
+                forced_prefix: None,
             },
             logprob_info,
             echo,
@@ -4281,6 +4519,7 @@ fn responses_bridge(value: &Value, request: &ResponsesRequest) -> Result<ChatBri
         request.tools.as_ref(),
         request.tool_choice.as_ref(),
         request.parallel_tool_calls,
+        false,
     )?;
     let tools = responses_tools_to_chat(request.tools.as_ref())?;
     let mut messages = Vec::new();
@@ -4653,7 +4892,12 @@ fn anthropic_tool_choice_to_chat(
 
 fn anthropic_bridge(request: &MessagesRequest) -> Result<ChatBridge, ApiError> {
     let (tool_choice, parallel) = anthropic_tool_choice_to_chat(request.tool_choice.as_ref())?;
-    let policy = resolve_tool_policy(request.tools.as_ref(), tool_choice.as_ref(), Some(parallel))?;
+    let policy = resolve_tool_policy(
+        request.tools.as_ref(),
+        tool_choice.as_ref(),
+        Some(parallel),
+        false,
+    )?;
     let tools = anthropic_tools_to_chat(request.tools.as_ref())?;
     // The Messages API has no "system" role inside `messages`, but clients send one (Claude Code
     // among them). Its text joins the system prompt rather than failing the request, so a
@@ -5700,6 +5944,7 @@ async fn responses(
         logprobs: LogprobsRequest::default(),
         trace,
         vision,
+        constraint: None,
     }
     .build()?;
     state
@@ -6414,6 +6659,7 @@ async fn messages(
         logprobs: LogprobsRequest::default(),
         trace,
         vision,
+        constraint: None,
     }
     .build()?;
     state
@@ -6544,6 +6790,12 @@ fn model_card(state: &AppState, created: u64) -> Value {
     // `multimodal` and `image_url` are `Capabilities::vision`: true only for an engine with the
     // vision tower loaded, the same fact that decides whether the chat route prepares an image or
     // refuses it (DECISIONS.md D59).
+    //
+    // The capability block is a promise, so the modes that this seam cannot enforce are named
+    // here rather than discovered by a 400: `tool_choice` accepts "auto" and "none" only
+    // ("required" and a named selector need a template policy that forces the call), and
+    // `response_format` accepts "text" only (json_object/json_schema need a decoder logits
+    // processor this engine seam does not have, see `refuse_unenforceable_response_format`).
     let capabilities = state.engine.capabilities();
     let endpoints = vec![
         "/v1/chat/completions",
@@ -6578,6 +6830,25 @@ fn model_card(state: &AppState, created: u64) -> Value {
             "names": ["low", "minimal", "medium", "high", "xhigh", "max"],
         });
     }
+    if capabilities.tools {
+        if capabilities.constrained {
+            advertised["tool_choice_modes"] = json!(["auto", "none", "required", "named"]);
+            advertised["tool_choice_forced"] = json!(true);
+        } else {
+            advertised["tool_choice_modes"] = json!(["auto", "none"]);
+            advertised["tool_choice_forced"] = json!(false);
+        }
+    }
+    // Structured output needs an engine that masks its logits against the schema; one that cannot
+    // refuses it, so the card says so instead of letting a client discover it as a 400 mid-run.
+    advertised["response_format_modes"] = if capabilities.constrained {
+        json!(["text", "json_object", "json_schema"])
+    } else {
+        json!(["text"])
+    };
+    // The weights that actually answered, which is not the model id when a finetune is served
+    // under the base model's name: without this, `/v1/models` cannot distinguish the two.
+    let checkpoint = state.served_checkpoint();
     json!({
         "id": state.model_id(),
         "object": "model",
@@ -6586,7 +6857,16 @@ fn model_card(state: &AppState, created: u64) -> Value {
         // vLLM's ModelCard also publishes these four members (root, parent, max_model_len and
         // an empty permission list); OpenAI clients read `max_model_len` for context, so the
         // card carries them beside this server's own context_length/max_output_tokens names.
-        "root": state.model_id(),
+        //
+        // `root` is the checkpoint when the caller declared one, because that is the member a
+        // client reads to learn which weights answered (D38: a finetune must not be reported
+        // as the released model).
+        "root": checkpoint.unwrap_or(state.model_id()),
+        "checkpoint": checkpoint,
+        "build": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "id": state.build_id(),
+        },
         "parent": Value::Null,
         "max_model_len": state.max_seq_len(),
         "permission": json!([]),
@@ -6852,6 +7132,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_forced_tool_prefix_only_spells_names_dsml_can_hold() {
+        let tool = |name: &str, param: &str| {
+            json!({
+                "name": name,
+                "parameters": {
+                    "type": "object",
+                    "properties": {param: {"type": "string"}},
+                    "required": [param],
+                },
+            })
+        };
+        assert_eq!(
+            forced_dsml_prefix_for_tool(&tool("get", "city")).as_deref(),
+            Some(
+                "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get\">\n\
+                 <｜DSML｜ parameter name=\"city\" string=\"true\">"
+            )
+        );
+        // A parameter name the attribute cannot hold is left for the model to write.
+        let prefix = forced_dsml_prefix_for_tool(&tool("get", "a\"b")).expect("the name is fine");
+        assert!(prefix.ends_with("parameter name=\""), "{prefix}");
+        assert_eq!(forced_dsml_prefix_for_tool(&tool("g\"et", "city")), None);
+        assert_eq!(forced_dsml_prefix_for_tool(&tool("get>", "city")), None);
+        assert_eq!(forced_dsml_prefix_for_tool(&tool("get\n", "city")), None);
+
+        // A named tool_choice whose name cannot be spelled is refused rather than left unforced.
+        let tools = json!([{"type": "function", "function": tool("g\"et", "city")}]);
+        let choice = json!({"type": "function", "function": {"name": "g\"et"}});
+        let error = resolve_tool_policy(Some(&tools), Some(&choice), None, true)
+            .err()
+            .expect("the name cannot be forced");
+        assert!(error.to_string().contains("cannot be written"), "{error}");
+        // "required" with that one tool still forces a call, the name left to the model.
+        let required = json!("required");
+        let policy = resolve_tool_policy(Some(&tools), Some(&required), None, true)
+            .expect("a call is still forced");
+        assert!(
+            policy
+                .forced_prefix
+                .as_deref()
+                .is_some_and(|prefix| prefix.ends_with("invoke name=\"")),
+            "{:?}",
+            policy.forced_prefix
+        );
+    }
+
     fn spec(thinking: bool, effort: Option<u8>) -> ReasoningSpec {
         ReasoningSpec { thinking, effort }
     }
@@ -7033,6 +7360,8 @@ mod tests {
     fn thinking_sampling_follows_the_labelled_v41_policy() {
         assert_eq!(resolve_sampling(Some(0.6), Some(0.7), true), (1.0, 0.95));
         assert_eq!(resolve_sampling(None, None, true), (1.0, 1.0));
+        assert_eq!(resolve_sampling(Some(0.0), Some(0.7), true), (0.0, 1.0));
+        assert_eq!(resolve_sampling(Some(1.0), Some(0.7), true), (1.0, 0.95));
         assert_eq!(resolve_sampling(Some(0.6), Some(0.7), false), (0.6, 0.7));
     }
 }

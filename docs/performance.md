@@ -32,6 +32,25 @@ sees; *aggregate* is all tokens over the wall time of the run, prefill included.
 - At 32 code streams: 10.9 tok/s per request and 185 tok/s aggregate, with a 12 s median time to
   first token while the 32 prompts prefill.
 
+### Sampling changes the rate
+
+The tables above and below are greedy, which is speculation's best case: predictable text makes
+for long acceptance runs. The same server, one stream, 256-token completions, five runs each,
+measured 2026-10-30:
+
+| Prompt | Sampling | Tokens per step | Median |
+| :-- | :-- | --: | --: |
+| Code | greedy, thinking off | 5.8 | **133 tok/s** |
+| Prose | greedy, thinking off | 3.1 | **86 tok/s** |
+| Code | temperature 1.0, top_p 0.95, thinking on | 2.5-3.4 | **80 tok/s** |
+| Chat, "how a CPU cache hierarchy works" | temperature 1.0, top_p 0.95, thinking on | 1.9-2.3 | **59 tok/s** |
+
+The step stays at ~40 ms in every row; what moves is how many tokens a step verifies. Sampling
+shortens acceptance runs and removes the tail of near-certain drafts, so 133 tok/s is a ceiling on
+the most predictable workload, and about 80 tok/s is what interactive sampled code sees. Two
+identical greedy prose runs measured 87 and 52 tok/s on the same accept length (3.11) because the
+step itself stretched, so single-stream figures are a band of roughly ±20%, not a constant.
+
 ## Against the MiaAI-Lab SGLang build
 
 The fastest published SGLang V4.1-Flash setup on four Sparks we know of is the
@@ -41,10 +60,16 @@ collectives, [`dgx-spark-networking`](https://github.com/christopherowen/dgx-spa
 [`knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4`](https://github.com/knapcio/DeepSeek-V4.1-Flash-4x-DGX-Spark-TP4);
 see also [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference) and
 [`blaesus/dsgx10`](https://github.com/blaesus/dsgx10)).
-Its numbers come from sparkDash 1.8.8's DecodeBench, which we replicated request for request:
-the same prompts, 256 tokens at temperature 0 with thinking off, a discarded first sweep, and
-the single-stream prose and code figures as the median of five runs. Every wave ran on an
-otherwise idle server.
+Its numbers come from [sparkDash 1.8.8's
+DecodeBench](https://github.com/MiaAI-Lab/sparkDash), which we replicated request for request:
+the prompts and their per-stream prefixes
+([`src/shared/llmPrompts.js`](https://github.com/MiaAI-Lab/sparkDash/blob/main/src/shared/llmPrompts.js)),
+the decode-rate definition `(completion_tokens - 1) / (last - first token)`
+([`server/collectors/DecodeBench.js`](https://github.com/MiaAI-Lab/sparkDash/blob/main/server/collectors/DecodeBench.js)),
+256 tokens at temperature 0 with thinking off, a discarded first sweep, and the single-stream
+prose and code figures as the median of five runs. Every wave ran on an otherwise idle server.
+Both tables below are a 2026-10-27 capture; the sweep client lives outside this tree, so a
+re-run has to reproduce the protocol from those two files.
 
 Per-stream tok/s, **SparkFlash** / SGLang:
 

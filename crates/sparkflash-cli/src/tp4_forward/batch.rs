@@ -288,6 +288,14 @@ struct Seq {
     prompt_len: usize,
     max_new: usize,
     sampler: Sampler,
+    /// The structured-output constraint, when the request asked for one: the document's automaton
+    /// and the ids it admits at each step. Decoding alone, a constrained sequence runs the
+    /// speculative step with each verify row masked by a clone advanced over the drafts before it;
+    /// decoding with others, the group shares the plain step.
+    constraint: Option<sparkflash_api::constrained::TokenConstraint>,
+    /// Why the constraint could not go on (see [`Seq::constrain`]): the step ends the sequence
+    /// with this error instead of emitting the token.
+    refused: Option<String>,
     stop_ids: Vec<u32>,
     exact: bool,
     lane: Option<usize>,
@@ -322,6 +330,36 @@ impl Seq {
             self.tokens.len() - 1
         }
     }
+
+    /// Advances the document's automaton by the head's pick for this sequence, recording why it
+    /// cannot go on when [`constraint_refusal`] says so, for the step to end it with
+    /// ([`Batch::refuse`]).
+    fn constrain(&mut self, pick: (u32, f32)) {
+        if self.refused.is_none()
+            && let Some(constraint) = self.constraint.as_mut()
+        {
+            self.refused = constraint_refusal(constraint, pick);
+        }
+    }
+}
+
+/// Advances `constraint` by a pick of the masked head, or says why the sequence cannot go on. A
+/// -infinity value means no rank admitted an id, and a pick the automaton refuses would put the
+/// text the client reads outside the schema. Either is that sequence's error alone: every rank
+/// reaches it from the same picks, so the group stays in step and the other sequences go on.
+fn constraint_refusal(
+    constraint: &mut sparkflash_api::constrained::TokenConstraint,
+    (id, value): (u32, f32),
+) -> Option<String> {
+    if !value.is_finite() {
+        return Some(
+            "structured output: the schema admits no vocabulary token at this point".to_owned(),
+        );
+    }
+    constraint
+        .advance(id)
+        .err()
+        .map(|error| format!("structured output: token {id} leaves the schema: {error}"))
 }
 
 /// A lane as the scheduler sees it.
@@ -558,6 +596,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             sampler,
             &job.stop_ids,
             true,
+            job.constraint.as_deref(),
         )
     }
 
@@ -571,6 +610,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         sampler: Sampler,
         stop_ids: &[u32],
         exact: bool,
+        constraint: Option<&crate::device_link::ConstraintSpec>,
     ) -> Result<(), String> {
         if prompt.is_empty() || prompt.len() > self.room {
             return Err(format!(
@@ -612,6 +652,26 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             return Err(format!("sequence {id} is already on the device"));
         }
         let policy = DepthPolicy::from_env(self.k)?;
+        // A constrained sequence is sampled greedily over the admitted ids: the mask decides every
+        // token, so there is no distribution left to sample from.
+        let sampler = if constraint.is_some() {
+            Sampler::GREEDY
+        } else {
+            sampler
+        };
+        // Every rank builds its own automaton from the same schema, so the emitted bytes and the
+        // admitted sets are identical without exchanging them.
+        let constraint = match constraint {
+            Some(spec) => Some(
+                sparkflash_api::constrained::TokenConstraint::new(
+                    &spec.schema,
+                    std::sync::Arc::clone(&spec.vocabulary),
+                    Some(spec.end),
+                )
+                .map_err(|error| format!("structured output: {error}"))?,
+            ),
+            None => None,
+        };
         self.seqs.push(Seq {
             id,
             tokens,
@@ -619,6 +679,8 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             prompt_len: prompt.len(),
             max_new,
             sampler,
+            constraint,
+            refused: None,
             stop_ids: stop_ids.to_vec(),
             exact,
             lane: None,
@@ -841,6 +903,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             request.sampler,
             request.stop_ids,
             request.exact,
+            None,
         )?;
         loop {
             for emission in self.tick(false, &mut |_, _| Ok(()))? {
@@ -871,7 +934,16 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             let ids: Vec<u32> = (0..len as u32)
                 .map(|i| 1000 + i.wrapping_mul(7919) % 90_000)
                 .collect();
-            self.admit_seq(u64::MAX - index as u64, &ids, &[], 8, greedy, &[], true)?;
+            self.admit_seq(
+                u64::MAX - index as u64,
+                &ids,
+                &[],
+                8,
+                greedy,
+                &[],
+                true,
+                None,
+            )?;
         }
         while !self.idle() {
             for emission in self.tick(false, &mut |_, _| Ok(()))? {
@@ -1031,6 +1103,24 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         Ok(())
     }
 
+    /// Ends sequence `index` with the error its constraint recorded ([`Seq::constrain`]), keeping
+    /// its first `valid` positions for reuse like any other end.
+    fn refuse(
+        &mut self,
+        index: usize,
+        valid: usize,
+        out: &mut Vec<Emission>,
+    ) -> Result<(), String> {
+        let error = self.seqs[index].refused.take().unwrap_or_default();
+        self.end(index, DeviceFinish::Aborted, valid)?;
+        out.push(Emission {
+            seq: self.seqs[index].id,
+            tokens: Vec::new(),
+            done: Some(Err(error)),
+        });
+        Ok(())
+    }
+
     /// Gives free lanes to the waiting sequences, oldest first.
     fn place(&mut self, out: &mut Vec<Emission>) -> Result<(), String> {
         loop {
@@ -1048,14 +1138,21 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             let Some((lane, shared)) = free
                 .map(|lane| {
                     let held = &self.lanes[lane];
-                    (
-                        lane,
-                        if self.reuse {
-                            common_prefix(&held.resident, &held.spans, wanted, images)
-                        } else {
-                            0
-                        },
-                    )
+                    let raw_shared = if self.reuse {
+                        common_prefix(&held.resident, &held.spans, wanted, images)
+                    } else {
+                        0
+                    };
+                    // A short match against a lane holding a long prefix keeps the prefix: that
+                    // lane is passed over (the least recently used empty lane takes the sequence)
+                    // so the next turn that does share the prefix still finds it. A match of 256
+                    // rows or more is always used, and so is any match on a lane holding fewer.
+                    let effective_shared = if raw_shared < 256 && held.resident.len() >= 256 {
+                        0
+                    } else {
+                        raw_shared
+                    };
+                    (lane, effective_shared)
                 })
                 .max_by(|a, b| {
                     // The longest shared prefix, else the least recently used lane.
@@ -1372,9 +1469,19 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         };
         seq.prefill_ms = seq.admitted.elapsed().as_secs_f64() * 1e3;
         seq.decode_started = Some(Instant::now());
+        if seq.refused.is_some() {
+            return self.refuse(index, target, out);
+        }
         let mut step = vec![first];
         let finish = cut_step(&mut step, 0, seq.max_new, &seq.stop_ids, seq.exact);
         seq.tokens.extend_from_slice(&step);
+        // The automaton advanced on this token inside the prefill step; a document that closed
+        // with it ends the request here, because anything after it would be outside the schema.
+        let finish = if seq.constraint.as_ref().is_some_and(|c| c.is_complete()) {
+            Some(DeviceFinish::Stop)
+        } else {
+            finish
+        };
         match finish {
             Some(finish) => self.finish(index, finish, target, step, out),
             None => {
@@ -1447,16 +1554,27 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             }
             let seq = &self.seqs[index];
             if p + n == target && seq.emitted() == 0 {
-                // Row y (position p + y) samples the token at sequence index p + y + 1.
-                let picks = self.device.head_rows_sampled(
+                // Row y (position p + y) samples the token at sequence index p + y + 1, so the row
+                // that produces the first completion token is the chunk's last one; the rows before
+                // it are prompt positions whose picks are discarded. Only that row is masked, so a
+                // constrained prompt's first token already satisfies the schema (D64).
+                let last = n - 1;
+                let mut constraints: Vec<Option<&sparkflash_api::constrained::TokenConstraint>> =
+                    vec![None; n];
+                if let Some(constraint) = seq.constraint.as_ref() {
+                    constraints[last] = Some(constraint);
+                }
+                let picks = self.device.head_rows_sampled_c(
                     rows,
                     inputs.tail,
                     inputs.transport,
                     n,
                     &seq.sampler,
                     p + 1,
+                    &constraints,
                 )?;
-                first = Some(picks[n - 1].0);
+                self.seqs[index].constrain(picks[last]);
+                first = Some(picks[last].0);
             }
             self.seqs[index].pos = p + n;
         }
@@ -1742,14 +1860,17 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             hc * 4,
         )?;
         let sampler = self.seqs[index].sampler;
-        let picks = self.device.head_rows_sampled(
+        let constraints = [self.seqs[index].constraint.as_ref()];
+        let picks = self.device.head_rows_sampled_c(
             rows,
             inputs.tail,
             inputs.transport,
             1,
             &sampler,
             target,
+            &constraints,
         )?;
+        self.seqs[index].constrain(picks[0]);
         Ok(picks[0].0)
     }
 
@@ -1773,9 +1894,22 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             }
         }
         let decoding = decoding(&self.seqs);
+        // A lone constrained sequence advances cloned automaton states across its drafted tokens
+        // in spec_step; when several sequences decode together and any is constrained, they share
+        // the plain step so the group stays on one collective sequence.
+        let constrained = decoding
+            .iter()
+            .any(|&index| self.seqs[index].constraint.is_some());
         match decoding.as_slice() {
             [] => Ok(0),
             [index] => self.spec_step(*index, out, ahead),
+            many if constrained => {
+                let mut rows = 0;
+                for group in many.chunks(R_MAX) {
+                    rows += self.plain_step(group, out, &mut *ahead)?;
+                }
+                Ok(rows)
+            }
             many if self.spec_floor.is_some()
                 && self.exchange.is_some()
                 && 2 * many.len() <= R_MAX =>
@@ -1850,9 +1984,13 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             Some(_) => Vec::new(),
             None => gather_rows(self.device.cuda, inputs, &self.counter, &[anchor])?,
         };
-        // A fixed depth knows the verify's rows before the draft: their embedding is queued
-        // behind the chain.
-        let queued = match (self.exchange, self.seqs[index].policy.adaptive) {
+        // A fixed depth without a constraint knows the verify's rows before the draft: their
+        // embedding is queued behind the chain.
+        let has_constraint = self.seqs[index].constraint.is_some();
+        let queued = match (
+            self.exchange,
+            self.seqs[index].policy.adaptive || has_constraint,
+        ) {
             (Some(_), false) => k + 1,
             _ => 0,
         };
@@ -1880,7 +2018,23 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         )?;
         let t1 = Instant::now();
         let seq = &mut self.seqs[index];
-        let depth = seq.policy.depth(&probs);
+        let mut depth = seq.policy.depth(&probs);
+        let mut row_constraints: Vec<sparkflash_api::constrained::TokenConstraint> = Vec::new();
+        if let Some(base_constraint) = seq.constraint.as_ref() {
+            row_constraints.reserve(depth + 1);
+            row_constraints.push(base_constraint.clone());
+            for (d, &token) in drafted.iter().enumerate().take(depth) {
+                let mut next = row_constraints
+                    .last()
+                    .expect("anchor constraint is present")
+                    .clone();
+                if next.advance(token).is_err() || next.is_complete() {
+                    depth = d;
+                    break;
+                }
+                row_constraints.push(next);
+            }
+        }
         if queued > 0 && depth + 1 != queued {
             return Err(format!(
                 "decode: {queued} verify rows queued for depth {depth}"
@@ -1946,13 +2100,20 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             n,
         )?;
         self.send_ahead(ahead)?;
-        let picks = self.device.head_rows_sampled(
+        let constraint_refs: Vec<Option<&sparkflash_api::constrained::TokenConstraint>> =
+            if row_constraints.is_empty() {
+                vec![None; n]
+            } else {
+                row_constraints.iter().map(Some).collect()
+            };
+        let picks = self.device.head_rows_sampled_c(
             rows,
             inputs.tail,
             inputs.transport,
             n,
             &sampler,
             pos + 1,
+            &constraint_refs,
         )?;
         let th = Instant::now();
         let seq = &mut self.seqs[index];
@@ -1971,7 +2132,22 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let mut step = drafts[..m].to_vec();
         step.push(bonus);
         let emitted = seq.emitted() - drafts.len();
-        let finish = cut_step(&mut step, emitted, seq.max_new, &seq.stop_ids, seq.exact);
+        let mut finish = cut_step(&mut step, emitted, seq.max_new, &seq.stop_ids, seq.exact);
+        if seq.constraint.is_some() {
+            // Every emitted token is its verify row's pick: the accepted drafts equal theirs, and
+            // the bonus is the next row's.
+            for (row, &pick) in picks.iter().enumerate().take(step.len()) {
+                seq.constrain(pick);
+                if seq.refused.is_some() {
+                    return self.refuse(index, pos, out).map(|()| n);
+                }
+                if seq.constraint.as_ref().is_some_and(|c| c.is_complete()) {
+                    step.truncate(row + 1);
+                    finish = Some(DeviceFinish::Stop);
+                    break;
+                }
+            }
+        }
         if self.print {
             println!(
                 "spec step {}: pos {pos} drafts {drafted:?} probs {probs:.3?} depth {depth} verify {:?} accepted {m}",
@@ -2076,9 +2252,17 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 .iter()
                 .map(|&index| (self.seqs[index].sampler, self.seqs[index].pos + 1))
                 .collect();
-            let picks =
-                self.device
-                    .head_rows_multi(rows, inputs.tail, inputs.transport, &samplers)?;
+            let constraints: Vec<Option<&sparkflash_api::constrained::TokenConstraint>> = group
+                .iter()
+                .map(|&index| self.seqs[index].constraint.as_ref())
+                .collect();
+            let picks = self.device.head_rows_multi_c(
+                rows,
+                inputs.tail,
+                inputs.transport,
+                &samplers,
+                &constraints,
+            )?;
             self.device.draft_seed(rows, draft, 0, n)?;
             Ok::<_, String>(picks)
         })();
@@ -2096,7 +2280,20 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 &seq.stop_ids,
                 seq.exact,
             );
+            // The document's automaton advances on the emitted token; a complete document ends
+            // the request here, because anything after it would be outside the schema.
+            seq.constrain(picks[row]);
+            if seq.refused.is_some() {
+                self.refuse(index, pos + 1, out)?;
+                continue;
+            }
             seq.tokens.extend_from_slice(&step);
+            let complete = seq.constraint.as_ref().is_some_and(|c| c.is_complete());
+            let finish = if complete {
+                Some(DeviceFinish::Stop)
+            } else {
+                finish
+            };
             match finish {
                 Some(finish) => self.finish(index, finish, pos + 1, step, out)?,
                 None => {
@@ -2367,9 +2564,32 @@ impl Drop for Batch<'_, '_, '_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DECODER_WARM, DecodeShare, ENCODER_LAYERS, bulk_rows, common_prefix, decoder_resume,
-        runs_decoder, share_rows, skip_end_after,
+        DECODER_WARM, DecodeShare, ENCODER_LAYERS, bulk_rows, common_prefix, constraint_refusal,
+        decoder_resume, runs_decoder, share_rows, skip_end_after,
     };
+    use sparkflash_api::constrained::TokenConstraint;
+    use sparkflash_api::vocab::TokenBytes;
+
+    #[test]
+    fn a_constrained_pick_the_schema_cannot_take_ends_only_its_sequence() {
+        let vocab = TokenBytes::shared(
+            ["{", "}", "x"]
+                .iter()
+                .enumerate()
+                .map(|(id, text)| (id as u32, (*text).to_owned())),
+        );
+        let schema = serde_json::json!({"type": "object", "additionalProperties": false});
+        let mut constraint = TokenConstraint::new(&schema, vocab, None).expect("schema compiles");
+        assert_eq!(constraint_refusal(&mut constraint, (0, 1.5)), None);
+        // No rank admitted an id: the head's value is -infinity whatever id it carries.
+        let error = constraint_refusal(&mut constraint, (1, f32::NEG_INFINITY));
+        assert!(error.is_some_and(|error| error.contains("admits no vocabulary token")));
+        // An id the automaton refuses is the sequence's error, not the step's.
+        let error = constraint_refusal(&mut constraint, (2, 0.0));
+        assert!(error.is_some_and(|error| error.contains("token 2 leaves the schema")));
+        assert_eq!(constraint_refusal(&mut constraint, (1, 0.0)), None);
+        assert!(constraint.is_complete());
+    }
 
     #[test]
     fn the_decoders_get_what_the_prefill_deadlines_leave() {
