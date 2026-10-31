@@ -191,7 +191,7 @@ __global__ void sparkflash_roce_abi_probe(RoceOneShotSlot *slot, uint64_t *sink)
 /// device sources this crate ships, the clang/nvcc probes compile them like the others, and
 /// baseline/kernel_baseline.txt records their cubins. Every one of the forty-two is probed on every
 /// build: a kernel that is only ever compiled by hand on a GPU host is a kernel nobody has
-/// type-checked, and the CI cuda-abi job runs exactly this probe.
+/// type-checked, and the CI cuda-tests job runs exactly this probe.
 const PROBED_KERNELS: [(&str, &str); 42] = [
     ("mega_mhc_sm121.cu", "mega_mhc_sm121"),
     ("b12x_mxfp8_dense_sm121.cu", "b12x_mxfp8_dense_sm121"),

@@ -43,10 +43,28 @@ fn nvcc() -> Option<PathBuf> {
 /// On a host WITHOUT nvcc the check returns early, and the line it prints is on the test's captured
 /// stdout, so a green `cargo test` run does not show it - libtest only shows it under `--nocapture`.
 /// The channel that states the same thing on every run is the build script's `cargo:warning`, which
-/// names the arch and the sources it could not compile, and CI's `cuda-abi` job has nvcc, so this
-/// check is not skipped where it matters. Nothing here claims a skip is loud.
+/// names the arch and the sources it could not compile, and CI's nightly `cuda-baseline` job has
+/// nvcc and no opt-out, so this check is not skipped where it matters. Nothing here claims a skip is
+/// loud.
+///
+/// `SPARKFLASH_KERNEL_BASELINE=skip` turns the check off for a caller that has already decided to
+/// run it elsewhere. The per-commit `cuda-tests` job does exactly that: it has a toolkit, so the
+/// nvcc branch cannot be used to skip, and running the baseline there cost 238 s per invocation -
+/// twice per job - for a check whose answer a commit that leaves the kernels and the baseline alone
+/// cannot change. The scheduled job is where it runs.
 #[test]
 fn the_kernels_still_compile_to_the_recorded_baseline() {
+    if matches!(
+        std::env::var("SPARKFLASH_KERNEL_BASELINE").as_deref(),
+        Ok("skip") | Ok("off") | Ok("0")
+    ) {
+        println!(
+            "skipping the kernel baseline check: SPARKFLASH_KERNEL_BASELINE asks for it. The \
+             nightly cuda-baseline job runs it with no opt-out: /bin/sh \
+             crates/sparkflash-kernels/scripts/check-kernel-baseline.sh"
+        );
+        return;
+    }
     let Some(nvcc) = nvcc() else {
         println!(
             "skipping the kernel baseline check: no nvcc on PATH and SPARKFLASH_NVCC is unset or \

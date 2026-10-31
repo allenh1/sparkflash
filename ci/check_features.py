@@ -47,7 +47,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Features whose TESTS need hardware this pipeline does not have. The cuda-abi job compiles CUDA in
+# Features whose TESTS need hardware this pipeline does not have. The cuda-tests job compiles CUDA in
 # an image that does have a toolkit, so this one is covered elsewhere in the pipeline - but only the
 # tests are what needs the GPU, and the lint is what needs the TOOLKIT, because cudarc's build script
 # runs `nvcc --version` and refuses to configure a version without one.
@@ -59,7 +59,7 @@ from pathlib import Path
 # When no toolkit is on PATH the command cannot run here and the sweep SAYS SO and names the job that
 # owns the feature, rather than dropping it quietly.
 HARDWARE_ONLY = {
-    ("sparkflash-kernels", "cuda"): "needs a toolkit and a target; the cuda-abi job compiles it",
+    ("sparkflash-kernels", "cuda"): "needs a toolkit and a target; the cuda-tests job compiles it",
 }
 
 SECTION = re.compile(r"^\s*\[([^\]]+)\]\s*$")
@@ -259,7 +259,7 @@ def main():
     if toolkit_present is None and any((package, feature) in HARDWARE_ONLY for package, feature in found):
         print(
             "no CUDA toolkit on PATH, so the feature-scoped lint of a hardware-only feature cannot run "
-            "here (cudarc's build script runs nvcc --version). The cuda-abi job owns that feature and "
+            "here (cudarc's build script runs nvcc --version). The cuda-tests job owns that feature and "
             "should lint it there; this is the one gate that cannot run in this image.",
             file=sys.stderr,
         )

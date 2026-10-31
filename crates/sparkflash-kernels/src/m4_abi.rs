@@ -24,7 +24,7 @@
 //!     invariant goes to compiled-artifact inspection
 //!     (crates/sparkflash-kernels/scripts/check-kernel-baseline.sh recompiles every Milestone 4
 //!     kernel and compares cubin bytes, sha256 and PTX membar lines against
-//!     crates/sparkflash-kernels/baseline/kernel_baseline.txt in the cuda-abi CI job) or to a
+//!     crates/sparkflash-kernels/baseline/kernel_baseline.txt in the nightly cuda-baseline job) or to a
 //!     runtime device assertion in a harness (the m7_layer0 device stages), where the shipped
 //!     binary is what is measured;
 //!   * defects in the scanners already here are still fixed, with the mutation proof the file requires,
@@ -48,7 +48,7 @@
 //! The three verification gates this milestone can actually close on a GPU-less host are:
 //!   1. nvcc compiles each kernel for sm_121a (build.rs: the trace-header probe, the RoCEnante ABI
 //!      probe, each of the six kernels and the combined Milestone 4 probe, all to PTX in OUT_DIR; the
-//!      cuda-abi CI job asserts the probe PTX exists, and scripts/check-kernel-baseline.sh recompiles
+//!      cuda-tests CI job asserts the probe PTX exists, and scripts/check-kernel-baseline.sh recompiles
 //!      all six against the committed baseline);
 //!   2. the static asserts here and in the headers hold under both toolchains;
 //!   3. the Rust side re-derives the same shapes, and the CPU references define the numerics.
@@ -88,7 +88,7 @@
 //!     pin it does not have (the round-12 structural finding: two rounds of findings were exactly that
 //!     mistake);
 //!   * what enforces the compiled acquire is the committed cubin baseline, not this file: any change
-//!     to the six kernels' cubin byte count, sha256 or PTX `membar` count fails the `cuda-abi` CI
+//!     to the six kernels' cubin byte count, sha256 or PTX `membar` count fails the nightly `cuda-baseline` CI
 //!     job, and the on-device tests that would check the acquire at run time do not exist yet. The
 //!     lint's job is to catch the mistake early and explain it; it is explicitly NOT the proof;
 //!   * the lists below are complete by policy: every spelling the checks accept is listed, every
@@ -560,7 +560,7 @@
 //! `cuda_13.0.r13.0/compiler.36424714_0`). A different toolkit fails with "the toolkit changed,
 //! regenerate the baseline" instead of reporting a kernel change, so a false failure cannot make the
 //! check useless; a moved cubin or membar count is reported per kernel. `tests/kernel_baseline.rs`
-//! runs the same script when nvcc is available and says it skipped when it is not, and the cuda-abi
+//! runs the same script when nvcc is available and says it skipped when it is not, and the nightly cuda-baseline
 //! CI job runs it as a hard gate. A green guard means "the shapes this file names did not occur".
 //!
 //! The baseline compile is also what makes the frontier of this lint acceptable. The committed
@@ -592,7 +592,7 @@
 //! compile a cubin. The one compiled claim that IS a CI gate is the baseline itself: that script
 //! recompiles the six kernels and compares each cubin's byte count and sha256 and its PTX `membar`
 //! line count with `baseline/kernel_baseline.txt`, `tests/kernel_baseline.rs` runs it whenever nvcc is
-//! available and reports a skip when it is not, and the `cuda-abi` CI job runs it as a hard gate.
+//! available and reports a skip when it is not, and the nightly `cuda-baseline` CI job runs it as a hard gate.
 //!
 //! The accepted spellings are:
 //!
@@ -1242,7 +1242,7 @@ fn the_geometry_parser_re_derives_rather_than_restates() {
 }
 
 /// The number of static asserts each source must carry. Pinning the count is what stops a future
-/// edit from quietly deleting an assertion that the CI cuda-abi job exists to enforce.
+/// edit from quietly deleting an assertion that the nightly cuda-baseline job exists to enforce.
 #[cfg(test)]
 const ASSERT_COUNTS: [(&str, usize); 7] = [
     ("m4_common_sm121.cuh", 20),

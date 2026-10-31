@@ -14,21 +14,78 @@
 
 # SparkFlash-RS CI: weight-free correctness gate.
 #
-# Everything in this pipeline runs on any x86_64 or aarch64 host: no checkpoint, no RDMA
+# Everything in the per-commit pipeline runs on any x86_64 or aarch64 host: no checkpoint, no RDMA
 # fabric, and no GPU. Hardware-specific crates are exercised through their CPU reference
 # implementations and mock transports. CUDA is the one exception, and it still needs no GPU:
-# the cuda-abi job compiles device-only code with nvcc, which is enough to type-check every
-# static assert in the shared trace ABI header.
+# the cuda job compiles device-only code with nvcc, which is enough to type-check every static
+# assert in the shared trace ABI header.
+#
+# Three stages, split by what a reader is entitled to assume when they turn green:
+#
+#   check     style and static analysis, under two minutes each;
+#   test      the per-commit correctness gate;
+#   accuracy  checks that compare committed artifacts against what this machine's toolchain
+#             produces - the kernel baseline and the codec golden table - plus the feature sweep
+#             and the recorded host-gate artifact. These run on the nightly schedule (and on
+#             demand), not on every push.
+#
+# Two measured facts decided this shape, both from pipeline 4374 (a green run, 2109 s wall):
+#
+# 1. The kernel baseline was running three times per pipeline - tests/kernel_baseline.rs once per
+#    feature set, 238 s each, and again as a script - inside a job that was 1893 s of the 2109.
+#    It compares committed cubin bytes with what this machine's nvcc emits; a commit that leaves
+#    the kernels and the baseline alone cannot change that answer. It is an accuracy check, so it
+#    moved to the schedule, and the per-commit gate keeps what a commit can break: the crate
+#    builds, its tests pass under both feature sets, the sm_121a probe PTX exists, clippy accepts
+#    the CUDA paths.
+#
+# 2. The runner's available concurrency varies. During 4374 it ran about seven jobs at once; on
+#    2026-10-31 it ran one (job start times stepped 469, 488, 575, 642, 649, 656, 814, 1012,
+#    1262 s). Under one slot, wall time is the SUM of the jobs, so every extra job is a cost and
+#    splitting is a pessimisation. The layout below is chosen to be good in both regimes: few
+#    jobs, each doing as much as it can in one place, so the serial case keeps the total work
+#    down, and sharding only where the shards are real compile islands (the three `test` shards).
+#
+# Total runner time, measured: 4374 spent 4299 s across its jobs. This layout spends about
+# 2000 s. With one slot that is the wall clock; with seven it is about 1100 s.
+
 stages:
   - check
   - test
+  - accuracy
 
 variables:
   CARGO_TERM_COLOR: always
   CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
+  # Keep target/ small and the linker out of the picture: test binaries never need debug info, and
+  # every job restores this directory, so its size is paid on every job's clock. Debug info here
+  # was most of the 40k-file archive that cost m4-abi-freeze 203 s to restore.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+# One pipeline per commit. A branch with an open merge request runs its gate as the
+# merge-request pipeline, which is the one the MR page reports and the one "pipelines must
+# succeed" reads; a push pipeline for the same commit would run the identical jobs a second
+# time. Without this rule the two pipelines both exist, and the duplicate that GitLab marks
+# `skipped` is what the MR shows.
+#
+# auto_cancel is the other half: a superseded push should stop paying for the pipeline it
+# replaced. Every job here is interruptible, because none of them deploys or publishes.
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
 
 default:
   image: rust:1.98
+  interruptible: true
   # The shared docker runner intermittently refuses jobs at pickup with
   # runner_system_failure and an empty trace (the job never runs a command).
   # Retrying those on the same commit is the honest fix; it does not mask a
@@ -40,19 +97,52 @@ default:
       - stuck_or_timeout_failure
       - scheduler_failure
 
-cache:
-  key: "$CI_COMMIT_REF_SLUG"
-  paths:
-    - target/
-    - .cargo-home/
+# Compiles Rust: needs the dependency cache and the build directory.
+.cached-build:
+  cache:
+    key: "$CI_COMMIT_REF_SLUG"
+    paths:
+      - target/
+      - .cargo-home/
 
-fmt:
+# Compiles nothing (a shell or Python check): restoring a 40k-file archive to run it is pure wait.
+.uncached:
+  cache: []
+
+# The nightly half. `schedule` is the scheduled pipeline; the manual rule keeps the job startable
+# from the UI on an ordinary pipeline without making the pipeline wait for it.
+.accuracy:
+  stage: accuracy
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - when: manual
+      allow_failure: true
+
+# Style, in one job because both halves are seconds and a job costs more than that: rustfmt is a
+# 85 s download in this image and the D26 freeze check is 38 ms.
+#
+# D26 freezes the Milestone-4 ABI lint (crates/sparkflash-kernels/src/m4_abi.rs and the pinned
+# submodules under src/m4_abi/: the quarantine split moved the scanners there verbatim, and the pin
+# is the aggregate over the family): it parses kernel source text, and its own contract says that
+# scan is explicitly not the proof - the committed cubin baseline is - while the recorded review
+# history reaches round 36 with a real false accept or false rejection in every round. New kernel
+# invariants go to compiled-artifact inspection (the nightly cuda-baseline job) or runtime device
+# assertions instead. This cheap, always-on check fails if the family's total line count differs
+# from its pin, so a new scanner cannot arrive as a side effect of another edit and an existing one
+# cannot disappear without the pin diff.
+# A commit that changes the family's length (or its pinned file set) changes PINNED_LINES in
+# ci/check-m4-abi-size.sh in the same diff; that diff is the deliberate act a reviewer reads, and
+# ci/verify-m4-abi-split.py proves the split itself is a verbatim move of d7ed586a's m4_abi.rs.
+style:
+  extends: .uncached
   stage: check
   script:
-    - rustup component add rustfmt clippy
+    - sh ci/check-m4-abi-size.sh
+    - rustup component add rustfmt
     - cargo fmt --all -- --check
 
 clippy:
+  extends: .cached-build
   stage: check
   script:
     - rustup component add clippy
@@ -62,73 +152,65 @@ clippy:
 # nothing had ever run this, which is how sparkflash-trace, sparkflash-kv, sparkflash-comm
 # and sparkflash-cli all drifted out of compliance.
 rustdoc:
+  extends: .cached-build
   stage: check
   script:
     - RUSTDOCFLAGS="-D missing_docs" cargo doc --workspace --no-deps
 
-# D26 freezes the Milestone-4 ABI lint (crates/sparkflash-kernels/src/m4_abi.rs and the pinned
-# submodules under src/m4_abi/: the quarantine split moved the scanners there verbatim, and the pin
-# is the aggregate over the family): it parses kernel source text, and its own contract says that
-# scan is explicitly not the proof - the committed cubin baseline is - while the recorded review
-# history reaches round 36 with a real false accept or false rejection in every round. New kernel
-# invariants go to compiled-artifact inspection (the cuda-abi job's baseline) or runtime device
-# assertions instead. This cheap, always-on check fails if the family's total line count differs
-# from its pin, so a new scanner cannot arrive as a side effect of another edit and an existing one
-# cannot disappear without the pin diff.
-# A commit that changes the family's length (or its pinned file set) changes PINNED_LINES in
-# ci/check-m4-abi-size.sh in the same diff; that diff is the deliberate act a reviewer reads, and
-# ci/verify-m4-abi-split.py proves the split itself is a verbatim move of d7ed586a's m4_abi.rs.
-m4-abi-freeze:
-  stage: check
-  script:
-    - sh ci/check-m4-abi-size.sh
-
-test:
+# The per-commit test gate, in three shards. One `cargo test --workspace` was 1372 s in a single
+# job; the shards below are compile islands - the kernels crate with its CUDA-aware build script,
+# the CLI and its siblings, and the rest of the workspace - so with more than one runner slot they
+# overlap, and with one slot they cost only their own cache restores over the monolith.
+#
+# No --all-features here on purpose: the only optional feature in the workspace is
+# sparkflash-kernels/cuda, and enabling it pulls in cudarc, whose build script refuses to
+# configure a CUDA version without a toolkit and a target. CUDA is exercised by the cuda job
+# below, which runs in an image that really has a toolkit.
+test-kernels:
+  extends: .cached-build
   stage: test
   script:
-    # No --all-features here on purpose: the only optional feature in the workspace is
-    # sparkflash-kernels/cuda, and enabling it pulls in cudarc, whose build script refuses to
-    # configure a CUDA version without a toolkit and a target. CUDA is exercised by cuda-abi
-    # below, which runs in an image that really has a toolkit.
-    - cargo test --workspace
-    - cargo test -p sparkflash-trace --no-default-features
-
-# `cargo test --workspace` does not run the tests inside example harnesses: it builds the examples
-# to check they compile, but their #[cfg(test)] blocks are invisible to every gate. The m8_sequence
-# harness keeps its rotation accounting, dispatch plan, fixture pin and comparison-plumbing invariants
-# there, so those checks had never run in CI. This job runs them explicitly; it needs no GPU, no
-# checkpoint and no cubin.
-test-examples:
-  stage: test
-  script:
+    - cargo test -p sparkflash-kernels
+    # `cargo test --workspace` does not run the tests inside example harnesses: it builds the
+    # examples to check they compile, but their #[cfg(test)] blocks are invisible to every gate.
+    # The m8_sequence harness keeps its rotation accounting, dispatch plan, fixture pin and
+    # comparison-plumbing invariants there, so those checks had never run in CI. No GPU, no
+    # checkpoint and no cubin needed, and the crate is already built here.
     - cargo test -p sparkflash-kernels --examples
 
-# `cargo test --workspace` builds only the default feature sets, so code behind a non-default
-# feature is compiled by no job unless a job names it. sparkflash-engram's io_uring ring sits
-# behind `io-uring`, which no crate in the workspace enables: the ring and its tests were
-# invisible to six rounds of green gates, which is how an orphaned-submission-queue defect
-# survived all of them, and sparkflash-comm/rdma was in the same position. This job discovers
-# the features rather than listing them, tests and lints each one, fails on an empty feature that
-# nothing names, and fails when a feature appears that is not classified as hardware-only in
-# ci/check_features.py - so a feature cannot go uncompiled again without somebody writing down why.
-# The script's own tests run first, because the first version of it silently skipped the very
-# feature it was written for.
-#
-# One gap this job cannot close, written down rather than implied: the runner's seccomp policy
-# refuses io_uring_setup with EPERM, so the ring-dependent tests in sparkflash-engram report that
-# they did NOT verify the ring (one line each, on stderr, naming the test and the errno) and pass.
-# Compiling the feature, linting it and running its non-ring logic is real coverage and is what this
-# job adds; the ring's own syscall behaviour is verified on a host that permits io_uring_setup, by
-# the same tests with SPARKFLASH_REQUIRE_IO_URING=1 set, which turns a skip into a failure. Read a
-# green io-uring job as "the feature builds and its logic passes", never as "the ring ran here".
-test-features:
+test-cli:
+  extends: .cached-build
   stage: test
   script:
-    - rustup component add clippy
-    - apt-get update
-    - apt-get install -y --no-install-recommends python3
+    - cargo test -p sparkflash-cli -p sparkflash-serve -p sparkflash-model -p sparkflash-vision
+
+test-workspace:
+  extends: .cached-build
+  stage: test
+  script:
+    - cargo test -p sparkflash-api -p sparkflash-comm -p sparkflash-engine -p sparkflash-model-deepseek-v41
+    - cargo test -p sparkflash-kv -p sparkflash-engram -p sparkflash-scheduler -p sparkflash-device -p sparkflash-web
+    - cargo test -p sparkflash-weights -p sparkflash-trace
+    # The trace crate's no-default-features build is a different configuration of the same tests,
+    # and it is cheap once the crate is compiled.
+    - cargo test -p sparkflash-trace --no-default-features
+
+# The Python and shell gates, in one job. Each used to be its own job with its own container start,
+# its own checkout and its own apt-get for a python3 that rust:1.98 already ships (3.13.5); four
+# of those cost more in setup than the checks themselves. Total runtime here is about two minutes.
+#
+# test_check_features.py runs before the sweep below (nightly) because the first version of the
+# sweep silently skipped the very feature it was written for; its own tests catch that class.
+scripts-tests:
+  extends: .uncached
+  stage: test
+  script:
+    - python3 -m unittest discover -s scripts/tests -v
+    - bash scripts/identity-gate.sh --anchor
+    - bash scripts/identity-gate.sh --self-test
+    - python3 -m unittest scripts/tests/test_identity_gate.py -v
+    - bash scripts/numerical-gate.sh --self-test
     - python3 ci/test_check_features.py
-    - python3 ci/check_features.py
 
 # Actually compiles CUDA. This replaces a job that ran `command -v nvcc || exit 0` in a
 # rust:1.98 image and therefore never compiled a single line of CUDA in its life.
@@ -136,8 +218,11 @@ test-features:
 # It is a hard gate on purpose: no allow_failure, no `|| exit 0`, and no SPARKFLASH_CUDA_ARCH
 # override. build.rs defaults to the DGX Spark target sm_121a, so a toolkit that does not know
 # that architecture fails here instead of quietly compiling something else.
-cuda-abi:
-  stage: test
+#
+# One job, not two: the clippy build shares this job's target-cuda and its setup, and splitting
+# them would buy nothing when only one job can run, and nothing when seven can - the test build
+# is the longer half either way.
+.cuda:
   tags: [cuda]
   image: nvidia/cuda:13.0.3-devel-ubuntu22.04
   variables:
@@ -146,6 +231,9 @@ cuda-abi:
     # Named explicitly so a missing toolkit is a loud failure rather than the silent skip that
     # made the previous job useless.
     SPARKFLASH_NVCC: /usr/local/cuda/bin/nvcc
+    # The kernel baseline compares committed cubin bytes against this machine's nvcc output. That is
+    # cuda-baseline's job on the nightly schedule; here it cost 238 s per test invocation, twice.
+    SPARKFLASH_KERNEL_BASELINE: skip
   cache:
     - key: "cargo-$CI_COMMIT_REF_SLUG"
       paths:
@@ -154,19 +242,30 @@ cuda-abi:
       paths:
         - target-cuda/
         - .rustup/
-  script:
+  before_script:
     - test -x "$SPARKFLASH_NVCC"
     - $SPARKFLASH_NVCC --version
-    - apt-get update
-    - apt-get install -y --no-install-recommends ca-certificates curl diffutils gcc g++ make
-    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --component rustfmt --component clippy
+    # The image is a devel image: it already carries gcc, g++, make and ca-certificates. Only the
+    # two packages it does not are installed, and the whole apt step is skipped when curl is there.
+    - if ! command -v curl > /dev/null; then apt-get update && apt-get install -y --no-install-recommends curl diffutils; fi
+    # The toolchain is cached (.rustup/ and .cargo-home/), so the installer is only needed on a
+    # cold cache. Running it anyway was ~60 s of network in every job.
+    - if [ ! -x "$CARGO_HOME/bin/rustc" ]; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --component rustfmt --component clippy; fi
     - . "$CARGO_HOME/env"
     - rustc --version
+
+cuda:
+  extends: .cuda
+  stage: test
+  script:
     # build.rs writes its PTX into OUT_DIR, which is not part of cargo's fingerprint, so a
     # target dir restored from cache could satisfy the assertion below without compiling
     # anything. Clearing just this crate forces the build script to run again.
     - cargo clean -p sparkflash-kernels
-    - cargo test -p sparkflash-kernels
+    # Default features, compiled rather than tested: the tests that matter run under --features
+    # cuda below (the feature is additive, so they are the same tests), and this is what proves
+    # the crate still builds without a toolkit.
+    - cargo check -p sparkflash-kernels --all-targets
     # Proof that nvcc really compiled the probe for sm_121a: build.rs only writes this file
     # when the toolkit accepted the header, and it is silent (a cargo warning) when nvcc is
     # missing or refuses the architecture.
@@ -185,16 +284,26 @@ cuda-abi:
     # job when it skips the command, so the two together close the gap rather than each assuming the
     # other.
     - cargo clippy -p sparkflash-kernels --all-targets --features cuda -- -D warnings
-    # The committed kernel baseline is the check that would catch a kernel silently changing. It
-    # recompiles all nine baseline kernels (the six Milestone 4 kernels, the M7 SwiGLU
-    # quantiser epilogue, the task-37 device router and the task-8 routed gate/up GEMM) with this
-    # job's nvcc, compares the cubin bytes, the
-    # cubin sha256 and the PTX membar line count against
-    # crates/sparkflash-kernels/baseline/kernel_baseline.txt, and reports a different toolkit as a
-    # toolkit change (with the regenerate command) rather than as a kernel change - a compiler
-    # upgrade that looked like a regression would make the check useless. tests/kernel_baseline.rs
-    # runs the same script and skips when nvcc is absent - a skip libtest reports only under
-    # --nocapture and build.rs reports as its own cargo:warning - so this step is what enforces it.
+
+# The committed kernel baseline is the check that would catch a kernel silently changing. It
+# recompiles all nine baseline kernels (the six Milestone 4 kernels, the M7 SwiGLU
+# quantiser epilogue, the task-37 device router and the task-8 routed gate/up GEMM) with this
+# job's nvcc, compares the cubin bytes, the
+# cubin sha256 and the PTX membar line count against
+# crates/sparkflash-kernels/baseline/kernel_baseline.txt, and reports a different toolkit as a
+# toolkit change (with the regenerate command) rather than as a kernel change - a compiler
+# upgrade that looked like a regression would make the check useless. tests/kernel_baseline.rs
+# runs the same script and skips when nvcc is absent, or when SPARKFLASH_KERNEL_BASELINE says to;
+# this job sets neither and runs it as a hard gate.
+cuda-baseline:
+  extends:
+    - .cuda
+    - .accuracy
+  variables:
+    # No opt-out here, unlike the per-commit job: unset the skip so the script is the only say.
+    SPARKFLASH_KERNEL_BASELINE: ""
+  script:
+    - cargo clean -p sparkflash-kernels
     - /bin/sh crates/sparkflash-kernels/scripts/check-kernel-baseline.sh
     # The codec golden table is the ground truth the MXFP8/MXFP4 tests compare against, and it is
     # committed from outside the tree. Until this step existed, nothing could tell a table nvcc
@@ -203,22 +312,50 @@ cuda-abi:
     # the claimed toolkit version honest.
     - sh crates/sparkflash-kernels/scripts/regen-codec-fixture.sh
 
+# `cargo test --workspace` builds only the default feature sets, so code behind a non-default
+# feature is compiled by no job unless a job names it. sparkflash-engram's io_uring ring sits
+# behind `io-uring`, which no crate in the workspace enables: the ring and its tests were
+# invisible to six rounds of green gates, which is how an orphaned-submission-queue defect
+# survived all of them, and sparkflash-comm/rdma was in the same position. This job discovers
+# the features rather than listing them, tests and lints each one, fails on an empty feature that
+# nothing names, and fails when a feature appears that is not classified as hardware-only in
+# ci/check_features.py - so a feature cannot go uncompiled again without somebody writing down why.
+# The script's own tests run first on every push (scripts-tests above), because the first version
+# of it silently skipped the very feature it was written for.
+#
+# One gap this job cannot close, written down rather than implied: the runner's seccomp policy
+# refuses io_uring_setup with EPERM, so the ring-dependent tests in sparkflash-engram report that
+# they did NOT verify the ring (one line each, on stderr, naming the test and the errno) and pass.
+# Compiling the feature, linting it and running its non-ring logic is real coverage and is what this
+# job adds; the ring's own syscall behaviour is verified on a host that permits io_uring_setup, by
+# the same tests with SPARKFLASH_REQUIRE_IO_URING=1 set, which turns a skip into a failure. Read a
+# green io-uring job as "the feature builds and its logic passes", never as "the ring ran here".
+#
+# Nightly: the sweep is 390 s of one-feature-at-a-time builds.
+feature-sweep:
+  extends:
+    - .cached-build
+    - .accuracy
+  script:
+    - rustup component add clippy
+    - python3 ci/test_check_features.py
+    - python3 ci/check_features.py
+
 # The per-commit gate above is deliberately not duplicated here. gate-artifact is the record
 # producer: it runs the same host gate set through ci/host-gates.py and keeps one machine-readable
 # JSON plus one log per gate. The JSON records the exact argv, cwd, exit codes, suite counts,
 # toolchain strings and git sha, so a batch record is a diffable artifact instead of prose and a
 # future release gate can compare two runs directly (python3 ci/host-gates.py --diff OLD NEW).
-# Manual on purpose: the check/test jobs already gate every commit; this job records a run when a
-# batch needs the evidence. No network, no GPU, no checkpoint.
+# Manual or scheduled on purpose: the check/test jobs already gate every commit; this job records a
+# run when a batch needs the evidence. No network, no GPU, no checkpoint.
 gate-artifact:
-  stage: test
-  when: manual
-  # Optional by intent: a manual job that is not required for the gate. Setting this explicitly
-  # keeps the pipeline verdict 'success' when nobody starts it, instead of relying on the default.
-  allow_failure: true
+  extends: .cached-build
+  stage: accuracy
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - when: manual
+      allow_failure: true
   script:
-    - apt-get update
-    - apt-get install -y --no-install-recommends python3
     - rustup component add rustfmt clippy
     - python3 ci/host-gates.py --out gate-artifacts
   artifacts:
@@ -226,43 +363,3 @@ gate-artifact:
     paths:
       - gate-artifacts/
     expire_in: 90 days
-
-# The Python tooling under scripts/ (serve probes, distribution comparators, capture runners and the
-# CI perf gate) is part of the evidence chain, but until now no CI job ran scripts/tests at all.
-# pytest is not available in this image, and the suite is unittest-native, so the documented runner
-# is used verbatim. No network, no GPU, no checkpoint: every test builds its own fake server or
-# temporary evidence files.
-scripts-tests:
-  stage: test
-  script:
-    - apt-get update
-    - apt-get install -y --no-install-recommends python3
-    - python3 -m unittest discover -s scripts/tests -v
-
-# Byte-identity gate. CI has no GPU and no four-node rig, so this job cannot run a decode step: it
-# proves the ONE command the speed-track rules require, and that the command rejects the failure
-# modes we actually hit (wrong tokens, a rank that exited non-zero, a chain-free run claiming to
-# have recorded digests). The same command runs automatically at the end of every device row
-# (scripts/identity-gate.sh --run <window run dir>), so a row's identity result needs no document
-# and no hand re-run.
-identity-gate:
-  stage: test
-  script:
-    - apt-get update
-    - apt-get install -y --no-install-recommends python3
-    - bash scripts/identity-gate.sh --anchor
-    - bash scripts/identity-gate.sh --self-test
-    - python3 -m unittest scripts/tests/test_identity_gate.py -v
-
-# Numerical correctness gate (D54). CI has no GPU and no four-node rig, so this job proves the two
-# things that can be proved without one: the declared bars are what the documents say they are, and
-# the checker accepts an identical row and rejects a perturbed one (self-test builds a synthetic dump,
-# freezes it, then perturbs a logit outside the bars). The same command runs on every device row
-# (scripts/numerical-gate.sh --run <window run dir>), so a row's correctness result needs no document
-# and no hand re-run.
-numerical-gate:
-  stage: test
-  script:
-    - apt-get update
-    - apt-get install -y --no-install-recommends python3
-    - bash scripts/numerical-gate.sh --self-test

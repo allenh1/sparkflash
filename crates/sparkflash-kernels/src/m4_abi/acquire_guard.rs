@@ -6477,7 +6477,7 @@ const THIS_SOURCE: &str = concat!(
 /// store is, which is the developer tree, and in CI the test says so and moves on (round-20 test
 /// quality: the store cannot be in CI, so the documentation says which half CI checks). What CI
 /// covers instead is every check that does not need the store: the crate and workspace suites, the
-/// feature sweep with its own tests, and the six-cubin baseline gate of the `cuda-abi` job, each of
+/// feature sweep with its own tests, and the six-cubin baseline gate of the `cuda-baseline` job, each of
 /// which rebuilds these texts from this module's builders or from the committed baseline. Only the
 /// comparison against the STORED bytes is host-only.
 const EVIDENCE_TEXTS: &str = "/home/user/wt/targets/kd17_texts";
