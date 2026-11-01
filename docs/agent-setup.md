@@ -3,6 +3,12 @@
 Instructions for an AI agent running on the lead DGX Spark (rank 0) to build, configure, stage, and
 launch a four-node SparkFlash cluster without a browser.
 
+> **Running Qwen3.8-Flash-Next on one Spark?** Skip the four-Spark steps. Choose **Run on this
+> Spark only** on the Setup page, or save a one-node plan with `model.weights =
+> "qwen3.8-flash-next-nvfp4"`, `engine.kind = "qwen4-exp"`, `checkpoint = ""`, and
+> `nodes = [{ ssh = "<this host>", peer = "", local = true }]`. The console then offers only
+> download and start; see [web.md](web.md#guided-setup).
+
 ## Prerequisites
 
 - Four NVIDIA DGX Sparks (GB10, `aarch64`, DGX OS with CUDA 13 in `/usr/local/cuda/bin`), each with

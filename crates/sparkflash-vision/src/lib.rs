@@ -27,8 +27,10 @@
 //! from the same decoded pixels (the goldens in `tests/fixtures/prep` come from Pillow). Decoding
 //! (step 1) follows the official serving recipe (`deepseek-recipe-image`) rather than Pillow where
 //! the two differ: transparency is blended onto `#FDFDFD` and 16-bit samples are rounded to 8 bits,
-//! where `convert("RGB")` drops alpha and truncates. JPEG and lossy WebP decoders are not
-//! bit-identical across libraries; the decode tests bound the difference.
+//! where `convert("RGB")` drops alpha and truncates. A model whose processor uses Pillow's
+//! `convert("RGB")` can ask for [`decode_with_alpha`] with [`AlphaPolicy::Drop`] instead. JPEG and
+//! lossy WebP decoders are not bit-identical across libraries; the decode tests bound the
+//! difference.
 //!
 //! The recipe also resizes with OpenCV and re-encodes the result as WebP before the reference sees
 //! it. That step is not taken: the canvas comes straight from the decoded file.
@@ -43,7 +45,7 @@ pub mod span;
 
 use thiserror::Error;
 
-pub use decode::{DecodeLimits, ImageFormat, decode};
+pub use decode::{AlphaPolicy, DecodeLimits, ImageFormat, decode, decode_with_alpha};
 pub use plan::{Geometry, Grid, plan_grid};
 pub use prep::{PrepOptions, PreparedImage, prepare};
 pub use resample::{RgbImage, resize_bicubic};

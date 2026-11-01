@@ -1118,7 +1118,10 @@ async fn models_reports_the_engines_own_capabilities() {
     assert_eq!(caps["tools"], true);
     assert_eq!(caps["tool_choice"], true);
     assert_eq!(caps["thinking"], true);
-    assert_eq!(caps["chat_template_kwargs"], json!(["thinking"]));
+    assert_eq!(
+        caps["chat_template_kwargs"],
+        json!(["thinking", "enable_thinking"])
+    );
     assert_eq!(caps["reasoning_effort"]["max"], 100);
     // The modes this seam cannot enforce are named, so a client does not discover them as a 400.
     assert_eq!(caps["tool_choice_modes"], json!(["auto", "none"]));

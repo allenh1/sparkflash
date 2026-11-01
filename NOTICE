@@ -46,6 +46,24 @@ Attribution:
   crates/sparkflash-kernels/tests/b12x_index_parity.rs) are named after and
   inspired by b12x's SM120/SM121 block-scaled MXFP8/MXFP4/NVFP4 kernel and
   direct-I/O loader architecture.
+- The SM120/SM121 mma.sync / ldmatrix / cp.async GEMM tiling shared by
+  kernels/opt_mma_sm121.cu, kernels/opt_mma_common_sm121.cuh and
+  kernels/opt_mma_bf16_sm121.cuh draws on prior art from b12x's SM120/SM121
+  block-scaled GEMM kernels.
+- In crates/sparkflash-model-qwen4-exp (kernels/qwen4_exp_sm121.cu,
+  kernels/qwen4_prefill_sm121.cu, src/ple.rs, src/checkpoint.rs, src/device.rs,
+  src/device/prefill.rs, src/device/blocks.rs) and kernels/quant_decode_sm121.cuh,
+  the SM120/SM121 NVFP4/FP8 decode kernels, asynchronous CUDA driver dispatch,
+  and out-of-core safetensors Per-Layer Embedding (PLE) shard paging with
+  POSIX_FADV_RANDOM and parallel pread draw on prior art from b12x
+  (b12x/loader/_ple_reader.c and SM120/SM121 MoE/attention kernels).
+- The pre-converted per-rank weight files (the shared container,
+  crates/sparkflash-weights/src/rank_file.rs; DeepSeek-V4.1-Flash's index and
+  arena loader, crates/sparkflash-device/src/converted.rs; GLM-5.3-Flash's,
+  crates/sparkflash-model-glm5-next/src/convert.rs) and their bounded parallel
+  O_DIRECT reads into host and device memory (read_file_parallel_into_slice and
+  Cuda::upload_file_parallel in crates/sparkflash-kernels/src/cuda_driver.rs)
+  draw on prior art from b12x's direct-I/O loader (b12x/loader/_direct.c).
 
 --------------------------------------------------------------------------------
 2. NVIDIA Flare (flare-local-inference / spark-local-inference)
@@ -66,13 +84,17 @@ Attribution:
     for out-of-core Engram / PLE embedding tables
     (helios/src/engram/reader.rs -> crates/sparkflash-engram);
   * Pre-converted per-rank weight artifacts for fast cold boot without Python or
-    JIT warmup overhead;
+    JIT warmup overhead (crates/sparkflash-weights/src/rank_file.rs and the
+    per-model converters in section 1);
   * Stateless seeded Gumbel-max sampling so draft and target steps share
     identical random draws without host RNG state synchronization;
   * Online calibrated acceptance profiles paired with a step cost model for
     adaptive speculative verification depth
     (helios/src/scheduler/speculation.rs, cost.rs, learning.rs ->
-    crates/sparkflash-scheduler).
+    crates/sparkflash-scheduler, crates/sparkflash-model/src/speculation.rs);
+  * SM120/SM121 mma.sync tensor-core GEMM tiling in the shared MMA headers
+    (kernels/opt_mma_common_sm121.cuh, kernels/opt_mma_bf16_sm121.cuh) that the
+    DeepSeek kernels and the Qwen4-Exp prefill image both include.
 
 --------------------------------------------------------------------------------
 3. dgx-spark-networking
@@ -139,3 +161,167 @@ Attribution:
   and dynamic-resolution vision preprocessing in crates/sparkflash-api,
   crates/sparkflash-model-deepseek-v41, and crates/sparkflash-vision follow the
   official deepseek-recipe Rust crates.
+- The host mHC reference in crates/sparkflash-weights/src/mhc.rs (the
+  coefficient mixes, the split Sinkhorn, hc_pre and hc_post) follows the
+  released inference reference (model.py, kernel.py), which was read for the
+  arithmetic; no source is copied. The GLM-5.3-Flash pack runs the same module.
+- The noaux_tc expert selection (the selection bias picks the experts, the
+  unbiased scores weight them) shared through
+  crates/sparkflash-weights/src/topk.rs follows the same reference's gate; the
+  GLM-5.3-Flash pack routes through it.
+
+--------------------------------------------------------------------------------
+7. Qwen / Alibaba Cloud, vLLM, and NVIDIA ModelOpt (Qwen3.8-Flash-Next-NVFP4)
+--------------------------------------------------------------------------------
+Repositories & Models:
+- https://huggingface.co/Qwen/Qwen3.8-Flash-Next (Alibaba Cloud Qwen Team, Apache-2.0)
+- https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4 (NVIDIA Corporation, Apache-2.0)
+- https://github.com/vllm-project/vllm (vLLM Contributors, Apache-2.0)
+Papers:
+- Songlin Yang, Jan Kautz, Ali Hatamizadeh. "Gated Delta Networks: Improving
+  Mamba2 with Delta Rule." International Conference on Learning
+  Representations (ICLR), 2025.
+
+Attribution:
+- The Qwen4ExpForConditionalGeneration architecture implemented in
+  crates/sparkflash-model-qwen4-exp (48-layer 3:1 hybrid Gated DeltaNet linear
+  attention + Qwen Sparse Attention with 4-token block-compressed indexer,
+  4-stream gated hyper-connections, 512-expert top-10 MoE + sigmoid-gated
+  shared expert, and Layer-2 16-head bigram/trigram Per-Layer Embedding with
+  dilated depthwise causal convolution and EOS segment reset) follows the
+  Qwen3.8-Flash-Next model release by the Qwen team and its reference
+  implementation in vLLM.
+- The Gated DeltaNet linear-attention recurrence (the host oracle in
+  src/forward.rs with its convolution and state step in
+  crates/sparkflash-weights/src/linear_attention.rs, the q4e_gdn_* decode
+  kernels in kernels/qwen4_exp_sm121.cu and the q4p_gdn_* prefill kernels in
+  kernels/qwen4_prefill_sm121.cu) is the gated delta rule of Yang, Kautz and
+  Hatamizadeh as the Qwen release uses it. The shared state step, the
+  q4e_gdn_recur decode kernel (with q4e_kda_decay's factors) and the
+  q4p_kda_prep / q4p_kda_scan prefill kernels also take Kimi Delta Attention's
+  per-channel decay (section 9).
+- The NVFP4 W4A4 routed-expert quantization layout (packed E2M1 nibbles,
+  per-16-column FP8 E4M3 block scales, FP32 weight_scale_2, and 128-shard FP8
+  E4M3 PLE n-gram table) follows NVIDIA's TensorRT ModelOpt 0.46 checkpoint
+  format in nvidia/Qwen3.8-Flash-Next-NVFP4.
+
+--------------------------------------------------------------------------------
+8. DFlash / DFlash 2 (Z Lab, Inco AI) and SGLang (Qwen3.8 and GLM-5.3 DFlash2)
+--------------------------------------------------------------------------------
+Repositories & Models:
+- https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2 (Inco AI, Apache-2.0)
+- https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2 (Inco AI, CC BY-NC-ND 4.0,
+  for research and evaluation; commercial licensing from Inco AI)
+- https://github.com/z-lab/dflash (Copyright (c) 2026 Z Lab, MIT License)
+- https://github.com/sgl-project/sglang (Copyright 2023-2024 SGLang Team,
+  Apache License, Version 2.0)
+Papers & posts:
+- Jian Chen, Yesheng Liang, Zhijian Liu. "DFlash: Block Diffusion for Flash
+  Speculative Decoding." International Conference on Machine Learning (ICML),
+  2026.
+- Inco AI. "DFlash 2: Keep Drafting Parallel." August 2026.
+  https://inco.ai/blog/dflash2/
+
+Attribution:
+- Block-diffusion speculative drafting (one parallel draft block of a bonus
+  token plus mask positions, conditioned on hidden states captured from the
+  target model and verified by the target in one pass) is the DFlash method of
+  Chen, Liang and Liu, with its reference implementation in z-lab/dflash.
+- The DFlash 2 drafter served by crates/sparkflash-model-qwen4-exp (its
+  configuration in crates/sparkflash-model/src/dflash2.rs, src/device/dflash.rs
+  and the q4d_* kernels in kernels/dflash2_sm121.cu) follows
+  Inco AI's DFlash 2 release for Qwen3.8-Flash-Next: the five-layer non-causal
+  sliding-window drafter, the per-block grouped causal convolutions around
+  attention and MLP, the low-rank candidate path selector over the target head's
+  top candidates, and the target-layer feature capture (layers 5/15/25/35/45,
+  the mean of the four hyper-connection streams) described by the model card
+  and its capture patch. The drafter weights are Inco AI's and are loaded, not
+  redistributed.
+- Inco AI's GLM-5.3-Flash drafter is the same architecture at GLM-5.3-Flash's
+  geometry (4,096 wide, target layers 5/14/24/33/42), served by the same drafter
+  code on crates/sparkflash-model-glm5-next's tensor-parallel ranks
+  (src/device.rs): every rank runs it whole, scores its blocks with its own
+  slice of the target head, and the ranks merge their candidates. Its target
+  rows are the mean of the four hyper-connection streams of each target
+  layer's finished rows, as SGLang's GLM-5.3-Flash DFlash capture
+  (python/sglang/srt/models/glm5_next.py) takes them.
+  crates/sparkflash-model/src/dflash2.rs parses its configuration and checks it
+  against the GLM-5.3-Flash pack's. Its weights are licensed CC BY-NC-ND 4.0 for
+  research and evaluation; they are loaded from the user's own copy and are
+  neither redistributed nor modified here, and commercial use needs a license
+  from Inco AI.
+- The drafter forward, the selector walk and the verify/accept protocol were
+  implemented by reading SGLang's DFlash support (python/sglang/srt/models/
+  dflash.py, python/sglang/srt/speculative/dflash_*.py and python/sglang/kernels/
+  ops/speculative/dflash.py, which SGLang notes it adapted from the DFlash
+  reference implementation). No SGLang or DFlash source is copied; the Rust and
+  CUDA code is an independent implementation of the same arithmetic.
+
+--------------------------------------------------------------------------------
+9. Z.ai and Hugging Face Transformers (GLM-5.3-Flash)
+--------------------------------------------------------------------------------
+Repositories & Models:
+- https://huggingface.co/zai-org/GLM-5.3-Flash (Z.ai, MIT License)
+- https://huggingface.co/zai-org/GLM-5.3-Flash-BF16 (Z.ai, MIT License)
+- https://github.com/huggingface/transformers (Copyright 2026 the HuggingFace
+  Team, Apache License, Version 2.0)
+- https://github.com/fla-org/flash-linear-attention (FLA contributors, MIT
+  License)
+- https://github.com/vllm-project/vllm (vLLM Contributors, Apache-2.0)
+Papers:
+- GLM-5 Team et al. "GLM-5: from Vibe Coding to Agentic Engineering."
+  arXiv:2602.15763, 2026.
+- Kimi Team et al. "Kimi Linear: An Expressive, Efficient Attention
+  Architecture." arXiv:2510.26692, 2025.
+- DeepSeek-AI et al. "DeepSeek-V3 Technical Report." arXiv:2412.19437, 2024.
+- DeepSeek-AI et al. "DeepSeek-V3.2: Pushing the Frontier of Open Large
+  Language Models." arXiv:2512.02556, 2025.
+- Zhenda Xie, Yixuan Wei, Huanqi Cao, et al. "mHC: Manifold-Constrained
+  Hyper-Connections." arXiv:2512.24880, 2025.
+- Yushi Bai, Qian Dong, Ting Jiang, et al. "IndexCache: Accelerating Sparse
+  Attention via Cross-Layer Index Reuse." arXiv:2603.12201, 2026.
+
+Attribution:
+- The Glm5NextForConditionalGeneration architecture planned in
+  crates/sparkflash-model-glm5-next (45-layer 3:1 hybrid of Kimi Delta
+  Attention linear attention and DeepSeek Sparse Attention with a 4-token
+  k-pool indexer, 4-stream manifold-constrained hyper-connections, 288-expert
+  top-8 sigmoid MoE with one shared expert, and one MTP layer) follows Z.ai's
+  GLM-5.3-Flash release and its reference implementation in Transformers
+  (src/transformers/models/glm5_next), which was read for the arithmetic; no
+  Transformers source is copied.
+- Kimi Delta Attention (the per-channel forget gate and the delta-rule state
+  update) is the method of the Kimi Linear paper, whose kernels the Transformers
+  implementation takes from FLA. DeepSeek Sparse Attention and its lightning
+  indexer are DeepSeek-V3.2's; the cross-layer index sharing the configuration
+  can name is IndexCache's. The hyper-connections are mHC, run through the host
+  reference shared with DeepSeek-V4.1-Flash (crates/sparkflash-weights/src/mhc.rs,
+  section 6).
+- The MTP layer (an eh_proj over the normed embedding of a token and the normed
+  hidden the model left at the position before it, then one DSA + MoE layer
+  without hyper-connections, the head norm and the shared LM head) is
+  DeepSeek-V3's multi-token prediction module as Z.ai's release ships it. The
+  speculative decoding that drafts with it and verifies the drafts in one step
+  (crates/sparkflash-model-glm5-next/src/device.rs) is an independent
+  implementation.
+- The block-scaled FP8 layout of the official release (FP8 E4M3 codes with one
+  FP32 weight_scale_inv per 128x128 tile, quant_method fp8 with dynamic
+  activations) is the format the Transformers fine-grained FP8 integration
+  reads; its planner (TensorPlan::push_fp8_block) and scale grid
+  (linalg::ScaleGrid::Tile) in crates/sparkflash-weights are an independent
+  implementation, shared with the Qwen3.8 pack's MTP experts, as is the decode
+  GEMV that multiplies it (q4e_gemv_tiled_e4m3_block, in the Qwen3.8 pack's
+  tiled GEMV, with the activations quantised per 128 columns as the host's
+  quant::quantize_activation_fp8_tiles does, which takes vLLM's
+  per-token-group quantiser's answer for an all-zero tile: zero codes and a
+  zero scale). The tensor plan's byte totals are pinned to both Z.ai releases' model.safetensors.index.json
+  files.
+- The device arm (crates/sparkflash-model-glm5-next/src/device.rs) decodes
+  through the Qwen3.8 pack's token cubin, whose GLM-5.3-Flash section (the mHC
+  mixers, the clamped SwiGLU, the noaux router, the k-pool indexer's key norm,
+  pooling, scores and pick, and the routed experts' FP8 GEMV) is an independent
+  implementation of the arithmetic of the host reference above; no Transformers
+  or FLA source is copied.
+- The released configuration carried under
+  crates/sparkflash-model-glm5-next/config/ is Z.ai's config.json from
+  zai-org/GLM-5.3-Flash, MIT License.

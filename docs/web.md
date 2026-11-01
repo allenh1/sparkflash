@@ -1,10 +1,14 @@
 # Web control plane
 
-`sparkflash --web` is the lead Spark's console for the four-node cluster. It sets the cluster up
-from a browser: it finds the other Sparks, works out the fast-network settings, installs the
-server on them, downloads the model once and copies it over, and converts the weights. Then it
-starts, stops and graphs the cluster. Everything it does is a command run on the lead, or over SSH
-on the others, and `sparkflash.toml` holds the result.
+`sparkflash --web` is the lead Spark's console. It sets the cluster up from a browser: it finds
+the other Sparks, works out the fast-network settings, installs the server on them, downloads the
+model once and copies it over, and converts the weights. Then it starts, stops and graphs the
+cluster. Everything it does is a command run on the lead, or over SSH on the others, and
+`sparkflash.toml` holds the result.
+
+It also runs a **single Spark** for the TP=1 Qwen3.8-Flash-Next pack. That path needs no other
+Spark, no SSH and no fast network: step 1 offers **Run on this Spark only**, and the console
+downloads the checkpoint and starts one local server.
 
 The usual way to start it is the setup script, which builds the server, lets this Spark sign in to
 the others, and starts the console in the background so that closing the terminal does not stop a
@@ -54,19 +58,38 @@ on Setup.
 
 ## Guided setup
 
-The Setup page is seven steps. Each shows what it found on every Spark, and the one button that
-moves it forward. A step opens once the steps it needs are done, so independent ones run side by
-side (installing the software while the model downloads, for example).
+The Setup page is seven steps for a V4.1 cluster and three for a local Qwen server. Each shows what
+it found on the configured node or nodes, and the one button that moves it forward. A step opens
+once the steps it needs are done, so independent ones run side by side (installing the software
+while the model downloads, for example).
 
 | Step | Button | What it runs |
 | :-- | :-- | :-- |
 | 1. Find your Sparks | **Use these Sparks** | Saves this Spark as rank 0 (`local = true`) and the three picked ones as ranks 1-3 |
+| 1. Run this Spark only | **Run on this Spark only** | Saves a one-node TP=1 Qwen plan, with no SSH and no peers |
 | 2. Connect the fast network | **Use these settings** | `POST /api/network/apply`: saves the NCCL values and peers the node check worked out |
 | 3. Install on the other Sparks | **Install** | `scripts/sync-nodes.py` copies the binary, cubins and NCCL library to the same paths |
 | 4. Download the model | **Download** | `scripts/hf-download.py` fetches `model.id` into the lead's Hugging Face cache |
 | 5. Copy the model to the other Sparks | **Copy** | `scripts/sync-nodes.py` copies the model's cache folder |
 | 6. Prepare the weights | **Prepare the weights** | One `sparkflash convert` job per rank that is not converted yet |
-| 7. Start the server | **Start the server** | `scripts/serve-four-node.sh launch` |
+| 7. Start the server | **Start the server** | `scripts/serve-four-node.sh launch`, or `scripts/serve-single-node.sh launch` locally |
+
+A local Qwen plan shows only **Run this Spark only**, **Download the model** and **Start the
+server**. It hides the network, install, copy and conversion steps because a TP=1 pack loads its
+released checkpoint directly and has no collectives. The target model and the optional DFlash 2
+drafter are both resolved from their canonical Hugging Face cache snapshots; downloading the
+drafter repository makes it available without another path setting.
+
+With an existing four-Spark configuration, the same button is offered on step 1 and asks before it
+replaces the cluster plan. To return to four Sparks, set `model.weights` and `engine.kind` back
+to the V4.1 values and restore four `[cluster].nodes` under **Advanced settings**.
+
+Before offering **Download**, the console checks the snapshot for `model.id` in the Hugging
+Face cache. A complete snapshot marks the step done and shows **Already in the Hugging Face
+cache** with its size and revision, so the next step is ready without a network transfer. An
+explicit `model.checkpoint` directory is treated the same way when it exists. The check is in
+`/api/state` as `checkpoint.cached` (targeted at one repo, not a full cache scan), and
+`POST /api/actions/download` refuses a redundant transfer for a complete cache snapshot.
 
 After every job that changes a node, and on **Check again**, the console runs the node check
 (`POST /api/inspect`). One read-only shell script runs on every node at once, locally on the lead
@@ -147,20 +170,23 @@ atomically (a sibling temp file, then rename). See
 | `[model]` | Architecture (`weights`), Hugging Face model `id`, checkpoint (empty: looked up in the hub cache), hub cache, tokenizer, converted weights, cubins |
 | `[engine]` | How the weights run (`kind`, `device`) |
 | `[runtime]` | `SPARK_MAX_SEQ_LEN` and `SPARKFLASH_LANES` |
-| `[cluster]` | Rank 0 HTTP bind, collective base port, SSH user/options, exactly four nodes (`ssh`, RoCE `peer`, optional `local`) |
+| `[cluster]` | Rank 0 HTTP bind, collective base port, SSH user/options, and the rank list: exactly four nodes for V4.1, exactly one local node for Qwen |
 | `[paths]` | Checkout, binary, launcher, NCCL library, log root on every node |
 | `[network]` | `NCCL_IB_HCA`, `NCCL_SOCKET_IFNAME`, `NCCL_IB_GID_INDEX`, extra rank environment |
 | `[web]` | Control-plane bind, rank 0 URL, extra allowed `Host` names, discovery/SSH timeouts, advertising |
 | `[stats]` | Sampling interval, in-memory retention, idle snapshot path and flush interval |
 
-Validation refuses an unknown weight/engine selection, a context outside 1..=1,048,576, a
-concurrency outside 1..=32, duplicate SSH names or peers, a non-IP peer, a malformed socket
-address/URL, and anything other than exactly four nodes. It also refuses SSH names and users that
-SSH would read as options (a leading `-`, whitespace, `@` in the user), extra environment keys
-that are not shell identifiers, `web.allowed_hosts` entries with a scheme or port, and an empty
-`model.checkpoint` with a `model.id` that is not a Hugging Face model ID. The model and engine selectors are
-separate values: "model" is the weights, "engine" is the runtime. Only `deepseek-v4.1-flash` is
-implemented for either today; adding a second choice is a deliberate change to
+Validation refuses an unknown weight/engine selection, a mismatched weight/engine pair, a context
+outside the selected model's window (1..=1,048,576 for V4.1, 1..=262,144 for Qwen), a concurrency
+outside 1..=32, duplicate SSH names or peers, a non-IP peer, a malformed socket address/URL, and
+the wrong rank count: four nodes for V4.1, one local node for Qwen. It also refuses SSH names and
+users that SSH would read as options (a leading `-`, whitespace, `@` in the user), extra
+environment keys that are not shell identifiers, `web.allowed_hosts` entries with a scheme or
+port, and an empty `model.checkpoint` with a `model.id` that is not a Hugging Face model ID.
+The model and engine selectors are separate values: "model" is the weights, "engine" is the
+runtime. The supported pairs are `deepseek-v4.1-flash` + `deepseek-v4.1-flash` (TP=4; the
+checkpoint is converted per rank) and `qwen3.8-flash-next-nvfp4` + `qwen4-exp` (TP=1; the
+released checkpoint is loaded directly). Adding another pair is a deliberate change to
 `SUPPORTED_WEIGHTS`/`SUPPORTED_ENGINES` plus the code that can serve it.
 
 Relative paths resolve against `paths.repo_root`. Relative `paths.repo_root` resolves against the
@@ -236,8 +262,9 @@ cannot remove. `scripts/setup.sh` runs it for the Sparks picked in the terminal.
 | **Install** / **Copy** | `python3 -I scripts/sync-nodes.py --host <address>,<ssh name> … --path …` on the lead (software: binary, cubins, NCCL; model: the model's cache folder without `*.incomplete` files) |
 | **Prepare the weights** / per-rank **Convert** | One job per rank: rank 0 locally when `local = true`, ranks 1–3 over SSH. Each runs `sparkflash convert --checkpoint … --output-dir … --tp-world-size 4 --tp-rank R --no-pad-moe-640 --no-verify` |
 | **Launch cluster** | `scripts/serve-four-node.sh launch` with `SPARK_NODES`, `SPARK_PEERS`, `SPARK_LOCAL_RANKS` (the `local = true` ranks, started on the lead without SSH), `SPARK_MAX_SEQ_LEN`, `SPARKFLASH_LANES`, paths, and every `NCCL_*` value from the TOML. Each rank is started detached, so the job ends once all four are running |
-| **Stop** | `scripts/serve-four-node.sh stop` (SIGTERM; rank 0 drains first) |
-| **Rank status** | `scripts/serve-four-node.sh status` |
+| **Start server** (local) | `scripts/serve-single-node.sh launch` with the binary, checkpoint, tokenizer, context and HTTP bind. The one TP=1 process is started detached; its log and pid file are under `paths.log_root` |
+| **Stop** | `scripts/serve-four-node.sh stop`, or `scripts/serve-single-node.sh stop` (SIGTERM; rank 0 drains first) |
+| **Rank status** | `scripts/serve-four-node.sh status`, or `scripts/serve-single-node.sh status` |
 
 Conversion is refused while rank 0 is reachable; stop the cluster first. Launch is refused while
 rank 0 is already reachable. A launch waits for every job that changes the files the ranks start
@@ -314,7 +341,7 @@ fresh control plane does not draw everything served so far as a one-sample spike
 | `POST /api/config/reload` | Re-read the file (an invalid file leaves the running config in place) |
 | `GET /api/health` | `200 ok` once the console is up (the setup script waits for it) |
 | `POST /api/discover` | mDNS browse + concurrent SSH probes |
-| `POST /api/inspect` | Node check on all four nodes; the report is also kept in `/api/state` as `setup` |
+| `POST /api/inspect` | Node check on every configured node; the report is also kept in `/api/state` as `setup` |
 | `POST /api/network/apply` | Save the last check's fabric plan (NCCL values and peers) into the config; 409 without one |
 | `GET /api/models` | Models in the lead's hub cache |
 | `GET /api/series?window_secs=N` | Downsampled graph window |

@@ -20,9 +20,10 @@
 //! score, and resolving whether thinking is enabled at all.
 //!
 //! Precedence for thinking (highest first):
-//! 1. `chat_template_kwargs.thinking` (bool, or "thinking" / "non-thinking")
-//! 2. `enable_thinking` (bool)
-//! 3. the default: thinking on.
+//! 1. `chat_template_kwargs.enable_thinking` (Qwen's spelling)
+//! 2. `chat_template_kwargs.thinking` (bool, or "thinking" / "non-thinking")
+//! 3. `enable_thinking` (bool)
+//! 4. the default: thinking on.
 //!
 //! The numeric table is the protocol-level default (low/minimal 25, medium/high 50,
 //! xhigh 75, max 100, absent 50). A model pack may expose the same aliases through its
@@ -173,10 +174,20 @@ fn parse_effort(value: Option<&Value>) -> Result<Option<u8>, ReasoningError> {
 }
 
 fn resolve_thinking(body: &Value) -> Result<bool, ReasoningError> {
-    if let Some(kwargs) = body.get("chat_template_kwargs").filter(|v| !v.is_null())
-        && let Some(thinking) = kwargs.get("thinking").filter(|v| !v.is_null())
-    {
-        return parse_thinking(thinking);
+    if let Some(kwargs) = body.get("chat_template_kwargs").filter(|v| !v.is_null()) {
+        // Qwen spells the switch `enable_thinking` inside the template kwargs; the API's own
+        // spelling is the bare top-level field handled below.
+        if let Some(enable) = kwargs.get("enable_thinking").filter(|v| !v.is_null()) {
+            return match enable {
+                Value::Bool(flag) => Ok(*flag),
+                other => Err(ReasoningError::InvalidThinking {
+                    value: render(other),
+                }),
+            };
+        }
+        if let Some(thinking) = kwargs.get("thinking").filter(|v| !v.is_null()) {
+            return parse_thinking(thinking);
+        }
     }
     if let Some(enable) = body.get("enable_thinking").filter(|v| !v.is_null()) {
         return match enable {
@@ -423,6 +434,33 @@ mod tests {
         .expect("thinking string");
         assert_eq!(
             on_string,
+            ReasoningSpec {
+                thinking: true,
+                effort: Some(50)
+            }
+        );
+    }
+
+    #[test]
+    fn qwen_enable_thinking_inside_chat_template_kwargs_is_honoured() {
+        let off = resolve(&json!({
+            "chat_template_kwargs": {"enable_thinking": false},
+        }))
+        .expect("Qwen kwargs off");
+        assert_eq!(
+            off,
+            ReasoningSpec {
+                thinking: false,
+                effort: None
+            }
+        );
+        let on = resolve(&json!({
+            "chat_template_kwargs": {"enable_thinking": true},
+            "enable_thinking": false,
+        }))
+        .expect("Qwen kwargs on wins");
+        assert_eq!(
+            on,
             ReasoningSpec {
                 thinking: true,
                 effort: Some(50)

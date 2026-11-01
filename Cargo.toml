@@ -17,6 +17,8 @@ members = [
     "crates/sparkflash-trace",
     "crates/sparkflash-model",
     "crates/sparkflash-model-deepseek-v41",
+    "crates/sparkflash-model-qwen4-exp",
+    "crates/sparkflash-model-glm5-next",
     "crates/sparkflash-weights",
     "crates/sparkflash-api",
     "crates/sparkflash-serve",
@@ -44,6 +46,8 @@ rust-version = "1.88"
 sparkflash-trace = { path = "crates/sparkflash-trace" }
 sparkflash-model = { path = "crates/sparkflash-model" }
 sparkflash-model-deepseek-v41 = { path = "crates/sparkflash-model-deepseek-v41" }
+sparkflash-model-qwen4-exp = { path = "crates/sparkflash-model-qwen4-exp" }
+sparkflash-model-glm5-next = { path = "crates/sparkflash-model-glm5-next" }
 sparkflash-weights = { path = "crates/sparkflash-weights" }
 sparkflash-api = { path = "crates/sparkflash-api" }
 sparkflash-serve = { path = "crates/sparkflash-serve" }

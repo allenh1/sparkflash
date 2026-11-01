@@ -2359,7 +2359,10 @@ dependencies = [
  "sparkflash-kv",
  "sparkflash-model",
  "sparkflash-model-deepseek-v41",
+ "sparkflash-model-glm5-next",
+ "sparkflash-model-qwen4-exp",
  "sparkflash-scheduler",
+ "sparkflash-serve",
  "sparkflash-trace",
  "sparkflash-vision",
  "sparkflash-web",
@@ -2396,6 +2399,7 @@ dependencies = [
  "sparkflash-engine",
  "sparkflash-kernels",
  "sparkflash-kv",
+ "sparkflash-weights",
  "tempfile",
  "thiserror 2.0.21",
 ]
@@ -2499,6 +2503,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparkflash-model-glm5-next"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "serde",
+ "serde_json",
+ "sparkflash-kernels",
+ "sparkflash-model",
+ "sparkflash-model-qwen4-exp",
+ "sparkflash-weights",
+ "tempfile",
+]
+
+[[package]]
+name = "sparkflash-model-qwen4-exp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bytemuck",
+ "half",
+ "http-body-util",
+ "libm",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sparkflash-api",
+ "sparkflash-engram",
+ "sparkflash-kernels",
+ "sparkflash-model",
+ "sparkflash-serve",
+ "sparkflash-vision",
+ "sparkflash-weights",
+ "tempfile",
+ "tokenizers",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "sparkflash-scheduler"
 version = "0.1.0"
 dependencies = [
@@ -2516,6 +2561,7 @@ name = "sparkflash-serve"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "crossbeam-channel",
  "futures",
  "http-body-util",
  "serde_json",

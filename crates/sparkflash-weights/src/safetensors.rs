@@ -1162,6 +1162,8 @@ fn logical_spec(name: &str, descriptor: &TensorHeader) -> Result<TensorSpec, Wei
         "BF16" => DType::BF16,
         "F8_E4M3" => DType::F8E4M3,
         "F8_E8M0" => DType::F8E8M0,
+        "U8" => DType::U8,
+        "I64" => DType::I64,
         "I8" => {
             let last = shape.last_mut().ok_or_else(|| WeightError::Malformed {
                 name: name.to_string(),
@@ -1190,7 +1192,8 @@ fn logical_spec(name: &str, descriptor: &TensorHeader) -> Result<TensorSpec, Wei
     let width = match dtype {
         DType::F32 => 4u128,
         DType::F16 | DType::BF16 => 2,
-        DType::F8E4M3 | DType::F8E8M0 | DType::F4E2M1 => 1,
+        DType::F8E4M3 | DType::F8E8M0 | DType::F4E2M1 | DType::U8 => 1,
+        DType::I64 => 8,
     };
     let needed = descriptor.elements().saturating_mul(width);
     if stored != needed {
@@ -1215,4 +1218,111 @@ fn file_label(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// The file that describes a sharded checkpoint: its total size and which shard holds each tensor.
+pub const INDEX_NAME: &str = "model.safetensors.index.json";
+
+/// Writes tensors as a sharded safetensors checkpoint: the shard files and [INDEX_NAME].
+///
+/// The tensors are dealt round-robin over `shards` files in the order given, so a fixture with
+/// several shards also exercises the index's weight map and the per-shard headers. One shard is
+/// named `model.safetensors`; several are `model-00000.safetensors` onwards. Every tensor starts on
+/// an eight-byte boundary and every header is padded with spaces to one, as in a released shard: the
+/// reader does not need either, but a fixture not shaped like a real shard would hide an alignment
+/// bug. A packed FP4 tensor is stored as I8 with its last dimension halved, the packing
+/// [SafeTensorsSource] reads back.
+///
+/// This holds every tensor in memory, so it writes fixtures; it is not a converter.
+///
+/// # Errors
+///
+/// [WeightError::Plan] for zero shards, [WeightError::Malformed] when a tensor's bytes are not the
+/// storage its spec describes, and [WeightError::Io] when the directory or a file cannot be written.
+pub fn write_checkpoint(
+    directory: &Path,
+    tensors: &[(TensorSpec, Vec<u8>)],
+    shards: usize,
+) -> Result<(), WeightError> {
+    if shards == 0 {
+        return Err(WeightError::Plan {
+            detail: "a checkpoint needs at least one shard".to_owned(),
+        });
+    }
+    let io = |what: String, error: std::io::Error| WeightError::Io {
+        name: file_label(directory),
+        detail: format!("{what}: {error}"),
+    };
+    std::fs::create_dir_all(directory)
+        .map_err(|error| io(format!("create {}", directory.display()), error))?;
+    let mut weight_map = serde_json::Map::new();
+    let mut total_size = 0u128;
+    for shard in 0..shards {
+        let file_name = if shards == 1 {
+            "model.safetensors".to_owned()
+        } else {
+            format!("model-{shard:05}.safetensors")
+        };
+        let mut header = serde_json::Map::new();
+        let mut data: Vec<u8> = Vec::new();
+        for (spec, bytes) in tensors.iter().skip(shard).step_by(shards) {
+            if bytes.len() as u128 != spec.storage_bytes() {
+                return Err(WeightError::Malformed {
+                    name: spec.name.clone(),
+                    detail: format!(
+                        "{} bytes for a tensor whose spec stores {}",
+                        bytes.len(),
+                        spec.storage_bytes()
+                    ),
+                });
+            }
+            while !data.len().is_multiple_of(8) {
+                data.push(0);
+            }
+            let mut shape = spec.shape.clone();
+            let dtype = match spec.dtype {
+                DType::F4E2M1 => {
+                    if let Some(last) = shape.last_mut() {
+                        *last = last.div_ceil(2);
+                    }
+                    "I8"
+                }
+                other => other.name(),
+            };
+            let begin = data.len();
+            data.extend_from_slice(bytes);
+            total_size += bytes.len() as u128;
+            header.insert(
+                spec.name.clone(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [begin, data.len()],
+                }),
+            );
+            weight_map.insert(
+                spec.name.clone(),
+                serde_json::Value::String(file_name.clone()),
+            );
+        }
+        let mut block = serde_json::to_vec(&serde_json::Value::Object(header))
+            .map_err(|error| io("render a header".to_owned(), std::io::Error::other(error)))?;
+        while !block.len().is_multiple_of(8) {
+            block.push(b' ');
+        }
+        let mut file = Vec::with_capacity(8 + block.len() + data.len());
+        file.extend_from_slice(&(block.len() as u64).to_le_bytes());
+        file.extend_from_slice(&block);
+        file.extend_from_slice(&data);
+        std::fs::write(directory.join(&file_name), &file)
+            .map_err(|error| io(format!("write {file_name}"), error))?;
+    }
+    let index = serde_json::json!({
+        "metadata": { TOTAL_SIZE_KEY: total_size },
+        "weight_map": weight_map,
+    });
+    let rendered = serde_json::to_vec_pretty(&index)
+        .map_err(|error| io("render the index".to_owned(), std::io::Error::other(error)))?;
+    std::fs::write(directory.join(INDEX_NAME), rendered)
+        .map_err(|error| io(format!("write {INDEX_NAME}"), error))
 }

@@ -403,6 +403,7 @@ mod tests {
                 n_llm_w: 1,
                 best_height: 546,
                 best_width: 546,
+                line_stride: 2,
             }
             .tokens(),
             4

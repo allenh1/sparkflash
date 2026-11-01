@@ -32,6 +32,7 @@ use super::sample::Sampler;
 use super::*;
 use crate::device_link::{DeviceFinish, DeviceLink, DeviceOutcome};
 use sparkflash_kernels::cuda_driver::HostMapped;
+use sparkflash_model::speculation::{DepthPolicy, StepCost};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -1193,127 +1194,28 @@ impl DeviceLayer<'_> {
 
 /// The modelled wall of a c=1 step on GB10 that verifies `depth` drafts (ms): the draft, the
 /// backbone rows step and the head, measured at 27 ms plus 4 ms a verified row (each row reads its
-/// own six experts a layer). Only the differences matter to the depth choice.
-const STEP_MS: f64 = 27.0;
-const ROW_MS: f64 = 4.0;
-/// The draft-probability bins the acceptance calibration counts in.
-const CALIBRATION_EDGES: [f32; 7] = [0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99];
-/// The pseudo-count of the calibration prior (each bin starts at the draft's own probability).
-const CALIBRATION_PRIOR: f64 = 4.0;
+/// own six experts a layer). Only the differences matter to the depth choice; the first step
+/// assumes 60 tok/s.
+pub(super) const STEP_COST: StepCost = StepCost {
+    step_ms: 27.0,
+    row_ms: 4.0,
+    prior_tokens_per_ms: 0.06,
+};
 
 pub(super) fn step_ms(depth: usize) -> f64 {
-    STEP_MS + ROW_MS * depth as f64
+    STEP_COST.ms(depth)
 }
 
-/// How many of the k drafts a step verifies (SPARKFLASH_DSPARK_DEPTH=adaptive, the default, or
-/// fixed: all k). Adaptive picks the depth d that maximises
-///   sum_{j <= d} prod_{i <= j} q_i  -  rate * step_ms(d),
-/// the expected accepted drafts less what the extra rows cost at the run's modelled token rate,
-/// where q_i is the acceptance probability of draft i given the ones before it were accepted:
-/// the draft's softmax probability, calibrated by the acceptances seen so far in its bin. Under a
-/// sampler the probabilities are of the noised scores; the calibration learns what they are worth.
+/// How many of the k drafts a step verifies: the shared [DepthPolicy] over [STEP_COST], from
+/// SPARKFLASH_DSPARK_DEPTH (adaptive, the default, or fixed) and SPARKFLASH_DSPARK_MIN_DEPTH.
 /// Every input (the exchanged probabilities, the acceptances, the static cost model) is the same
 /// on every rank, so every rank picks the same depth and launches the same collectives. At c=1 on
 /// GB10 (k = 5) it took prose at 2K context from 52.0 / 56.8 to 59.9 / 65.3 tok/s and the
 /// explanation prompts from 57.1 / 67.4 to 64.8 / 73.0, and left code at 107-112 (its drafts are
 /// accepted to the full depth); pinned to depth 5 (SPARKFLASH_DSPARK_MIN_DEPTH=5) it ran as fixed,
 /// so the host read of the probabilities costs nothing.
-pub(super) struct DepthPolicy {
-    pub(super) adaptive: bool,
-    k: usize,
-    min_depth: usize,
-    accepted: [f64; CALIBRATION_EDGES.len() + 1],
-    seen: [f64; CALIBRATION_EDGES.len() + 1],
-    tokens: f64,
-    ms: f64,
-}
-
-impl DepthPolicy {
-    pub(super) fn from_env(k: usize) -> Result<Self, String> {
-        let adaptive = match std::env::var("SPARKFLASH_DSPARK_DEPTH").as_deref() {
-            Err(_) | Ok("adaptive") => true,
-            Ok("fixed") => false,
-            Ok(other) => {
-                return Err(format!(
-                    "SPARKFLASH_DSPARK_DEPTH={other}: adaptive or fixed"
-                ));
-            }
-        };
-        let min_depth = std::env::var("SPARKFLASH_DSPARK_MIN_DEPTH")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0)
-            .min(k);
-        Ok(Self {
-            adaptive,
-            k,
-            min_depth,
-            accepted: [0.0; CALIBRATION_EDGES.len() + 1],
-            seen: [0.0; CALIBRATION_EDGES.len() + 1],
-            tokens: 0.0,
-            ms: 0.0,
-        })
-    }
-
-    fn bin(p: f32) -> usize {
-        CALIBRATION_EDGES
-            .iter()
-            .take_while(|edge| p >= **edge)
-            .count()
-    }
-
-    pub(super) fn depth(&self, probs: &[f32]) -> usize {
-        if !self.adaptive {
-            return self.k;
-        }
-        let rate = if self.ms > 0.0 {
-            self.tokens / self.ms
-        } else {
-            0.06
-        };
-        let (mut best, mut best_score) = (0usize, -rate * step_ms(0));
-        let mut gain = 0.0f64;
-        let chain = self.chain(probs);
-        for (d, chained) in (1..).zip(&chain) {
-            gain += chained;
-            let score = gain - rate * step_ms(d);
-            if score > best_score {
-                (best, best_score) = (d, score);
-            }
-        }
-        best.max(self.min_depth)
-    }
-
-    /// The calibrated probability that drafts 0..=j are all accepted, for each of the k drafts.
-    pub(super) fn chain(&self, probs: &[f32]) -> Vec<f64> {
-        let mut chain = 1.0f64;
-        probs
-            .iter()
-            .take(self.k)
-            .map(|&p| {
-                let b = Self::bin(p);
-                chain *= (self.accepted[b] + CALIBRATION_PRIOR * f64::from(p))
-                    / (self.seen[b] + CALIBRATION_PRIOR);
-                chain
-            })
-            .collect()
-    }
-
-    /// A step verified `depth` drafts and accepted the first `m`: drafts 0..m were accepted and
-    /// draft m (when verified) was not.
-    pub(super) fn observe(&mut self, probs: &[f32], depth: usize, m: usize) {
-        for (i, p) in probs.iter().enumerate().take(depth) {
-            let b = Self::bin(*p);
-            self.seen[b] += 1.0;
-            if i < m {
-                self.accepted[b] += 1.0;
-            } else {
-                break;
-            }
-        }
-        self.tokens += (m + 1) as f64;
-        self.ms += step_ms(depth);
-    }
+pub(super) fn depth_policy(k: usize) -> Result<DepthPolicy, String> {
+    DepthPolicy::from_env("SPARKFLASH_DSPARK", k, STEP_COST)
 }
 
 /// A generation's per-step callback: the step's tokens and whether the request ends with it

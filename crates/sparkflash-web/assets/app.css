@@ -858,6 +858,26 @@ footer {
 @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(290%); } }
 @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } }
 
+.solo-offer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  background: var(--surface-2);
+}
+
+.solo-offer strong { display: block; margin-bottom: 3px; font-size: 13.5px; }
+.solo-offer span { display: block; color: var(--text-2); font-size: 12.5px; }
+.solo-offer .mono { display: inline; }
+
+@media (max-width: 680px) {
+  .solo-offer { flex-direction: column; align-items: stretch; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition: none !important; }
 }

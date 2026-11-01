@@ -1101,6 +1101,11 @@ impl Transport for TcpTransport {
 }
 
 /// Accepts one connection, polling so a peer that never appears becomes a Timeout.
+///
+/// The listener is non-blocking for that poll. On the BSDs and macOS an accepted socket inherits
+/// the flag, and every read on it would return WouldBlock at once, which the frame reader reports
+/// as a timeout; Linux never sets it. The stream is made blocking explicitly, so its reads wait
+/// for the frame deadline [tune] sets on every platform.
 fn accept_retry(
     listener: &TcpListener,
     deadline: Instant,
@@ -1108,7 +1113,10 @@ fn accept_retry(
 ) -> Result<TcpStream, CommError> {
     loop {
         match listener.accept() {
-            Ok((stream, _address)) => return Ok(stream),
+            Ok((stream, _address)) => {
+                stream.set_nonblocking(false)?;
+                return Ok(stream);
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
                     return Err(CommError::timeout(

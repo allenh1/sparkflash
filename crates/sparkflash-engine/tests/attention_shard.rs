@@ -31,11 +31,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use common::CodedSource;
-use common::host_path::{Bus, BusGather, LIMIT, SEED, Step, bits, reference_steps, run_steps};
+use common::host_path::{LIMIT, SEED, Step, bits, reference_steps, run_steps};
 
 use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::forward::InferenceEngine;
 use sparkflash_engine::forward::attention::attention_shard_geometry;
+use sparkflash_engine::parallel_tp::{LocalBus, LocalRank};
 use sparkflash_engine::tensor::{TensorPlan, TensorSpec};
 use sparkflash_engine::weights::{WeightError, WeightSource};
 
@@ -150,7 +151,7 @@ fn shard_ready_config() -> ModelConfig {
 /// Four engines, one per attention output-row slice, gathering each layer's o_lora through the
 /// bus.
 fn sharded_steps(config: &ModelConfig, tokens: &[u32], world: usize) -> Vec<Vec<Step>> {
-    let bus = Arc::new(Bus::new(world));
+    let bus = Arc::new(LocalBus::new(world));
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..world)
             .map(|rank| {
@@ -165,7 +166,7 @@ fn sharded_steps(config: &ModelConfig, tokens: &[u32], world: usize) -> Vec<Vec<
                         LIMIT,
                     )
                     .expect("sharded engine")
-                    .with_bit_gather(Box::new(BusGather { rank, world, bus }));
+                    .with_bit_gather(Box::new(LocalRank { rank, bus }));
                     let provider = AttentionShardSource::new(&plan, world, rank);
                     run_steps(&config, &engine, &provider, &tokens).expect("sharded steps")
                 })
@@ -230,10 +231,9 @@ fn the_replicated_attention_with_a_seam_still_takes_the_replicated_path() {
         LIMIT,
     )
     .expect("engine")
-    .with_bit_gather(Box::new(BusGather {
+    .with_bit_gather(Box::new(LocalRank {
         rank: 0,
-        world: 1,
-        bus: Arc::new(Bus::new(1)),
+        bus: Arc::new(LocalBus::new(1)),
     }));
     let provider = CodedSource::from_plan(&plan, SEED);
     let steps = run_steps(&config, &engine, &provider, &tokens).expect("hatch steps");

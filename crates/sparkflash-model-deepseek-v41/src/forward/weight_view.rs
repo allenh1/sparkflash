@@ -659,11 +659,7 @@ mod tests {
     }
 
     fn scale_bytes(grid: ScaleGrid, rows: usize, cols: usize) -> usize {
-        let scale_cols = cols.div_ceil(32);
-        match grid {
-            ScaleGrid::Block32 => rows.div_ceil(32) * scale_cols,
-            ScaleGrid::PerRow32 => rows * scale_cols,
-        }
+        grid.len(rows, cols)
     }
 
     /// One deterministic finite value pattern shared by the coded patterns.

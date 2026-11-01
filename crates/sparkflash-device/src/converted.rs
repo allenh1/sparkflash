@@ -42,9 +42,7 @@
 //! `--verify-weights` flag.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -52,38 +50,21 @@ use serde::{Deserialize, Serialize};
 use sparkflash_engine::safetensors::{CheckpointIndex, SafeTensorsSource};
 use sparkflash_kernels::cuda_driver::DirectReadReport;
 use sparkflash_kernels::mxfp8_ref::b12x_buffer_bytes;
+pub use sparkflash_weights::rank_file::{
+    CONVERTED_MAGIC, CONVERTED_MANIFEST_NAME, CONVERTED_VERSION, ConvertedPreamble,
+    DATA_ALIGN_BYTES, PREAMBLE_BYTES, align_up_page, find_converted_rank_file, rank_file_name,
+    read_index,
+};
+use sparkflash_weights::rank_file::{
+    FNV_OFFSET, PayloadDigest, RankFileWriter, data_offset_for, fold_digest, verify_payloads,
+};
 
 use crate::arena::{
     AllocationMode, ArenaAllocator, ArenaEvidence, ArenaSlice, DIRECT_CHUNK_BYTES,
-    DIRECT_CONCURRENCY, FNV_OFFSET, FNV_PRIME, GroupArena, ResidentArena, TensorLayout, align_up,
-    b12x_layout, elapsed_ms, fnv1a, moe_padded_640_layout, order_scales_next_to_weights,
-    pad_moe_rows_640, tile_b12x,
+    DIRECT_CONCURRENCY, GroupArena, ResidentArena, TensorLayout, align_up, b12x_layout, elapsed_ms,
+    moe_padded_640_layout, order_scales_next_to_weights, pad_moe_rows_640, tile_b12x,
 };
 use crate::resident::{HeaderEntry, Placement, ResidentGroup, ResidentPlan};
-
-/// Magic bytes at offset 0 of every converted per-rank file.
-pub const CONVERTED_MAGIC: &[u8; 8] = b"SPKFRANK";
-/// Format schema version.
-pub const CONVERTED_VERSION: u32 = 1;
-/// Fixed binary preamble length in bytes before the JSON index.
-pub const PREAMBLE_BYTES: usize = 64;
-/// Alignment of the data section start and padded length, matching 4 KiB page / `O_DIRECT` blocks.
-pub const DATA_ALIGN_BYTES: usize = 4096;
-/// Manifest filename written in the converted output directory.
-pub const CONVERTED_MANIFEST_NAME: &str = "sparkflash-converted-manifest.json";
-
-/// Canonical filename for one rank's converted file.
-#[must_use]
-pub fn rank_file_name(rank: usize, world: usize) -> String {
-    format!("rank-{rank}-of-{world}.bin")
-}
-
-/// Returns the path to a rank's converted file inside `dir` if it exists on disk.
-#[must_use]
-pub fn find_converted_rank_file(dir: &Path, rank: usize, world: usize) -> Option<PathBuf> {
-    let candidate = dir.join(rank_file_name(rank, world));
-    candidate.is_file().then_some(candidate)
-}
 
 /// Metadata for one tensor stored inside a converted rank file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,82 +141,6 @@ pub struct ConvertedRankHeader {
     pub groups: Vec<ConvertedGroupEntry>,
     /// All resident tensors in slab order (with scales immediately adjacent to their weights).
     pub tensors: Vec<ConvertedTensorEntry>,
-}
-
-/// Decoded 64-byte binary preamble at offset 0 of a converted rank file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConvertedPreamble {
-    /// Schema version.
-    pub version: u32,
-    /// Rank id.
-    pub rank: usize,
-    /// World size.
-    pub world: usize,
-    /// Byte length of the serialized JSON header starting at byte 64.
-    pub index_len: u64,
-    /// 4096-aligned byte offset where the arena data starts.
-    pub data_offset: u64,
-    /// Logical arena size (`allocated_bytes`).
-    pub data_bytes: u64,
-    /// 4096-aligned arena data size on disk.
-    pub padded_data_bytes: u64,
-    /// FNV-1a 64 hash of the JSON header bytes `64..64 + index_len`.
-    pub header_hash: u64,
-    /// FNV-1a 64 digest of the arena payload.
-    pub file_digest: u64,
-}
-
-impl ConvertedPreamble {
-    fn encode(&self) -> [u8; PREAMBLE_BYTES] {
-        let mut out = [0u8; PREAMBLE_BYTES];
-        out[0..8].copy_from_slice(CONVERTED_MAGIC);
-        out[8..12].copy_from_slice(&self.version.to_le_bytes());
-        out[12..16].copy_from_slice(&(self.rank as u32).to_le_bytes());
-        out[16..20].copy_from_slice(&(self.world as u32).to_le_bytes());
-        out[20..24].copy_from_slice(&0u32.to_le_bytes());
-        out[24..32].copy_from_slice(&self.index_len.to_le_bytes());
-        out[32..40].copy_from_slice(&self.data_offset.to_le_bytes());
-        out[40..48].copy_from_slice(&self.data_bytes.to_le_bytes());
-        out[48..56].copy_from_slice(&self.padded_data_bytes.to_le_bytes());
-        out[56..64].copy_from_slice(&self.header_hash.to_le_bytes());
-        out
-    }
-
-    fn decode(bytes: &[u8; PREAMBLE_BYTES], path: &Path) -> Result<Self, String> {
-        if &bytes[0..8] != CONVERTED_MAGIC {
-            return Err(format!(
-                "{}: invalid magic {:?}, expected {:?}",
-                path.display(),
-                &bytes[0..8],
-                CONVERTED_MAGIC
-            ));
-        }
-        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        if version != CONVERTED_VERSION {
-            return Err(format!(
-                "{}: unsupported converted version {version}, expected {CONVERTED_VERSION}",
-                path.display()
-            ));
-        }
-        let rank = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-        let world = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
-        let index_len = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
-        let data_offset = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
-        let data_bytes = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
-        let padded_data_bytes = u64::from_le_bytes(bytes[48..56].try_into().unwrap());
-        let header_hash = u64::from_le_bytes(bytes[56..64].try_into().unwrap());
-        Ok(Self {
-            version,
-            rank,
-            world,
-            index_len,
-            data_offset,
-            data_bytes,
-            padded_data_bytes,
-            header_hash,
-            file_digest: 0,
-        })
-    }
 }
 
 /// Summary of one converted rank file in `sparkflash-converted-manifest.json`.
@@ -383,13 +288,6 @@ pub struct ConvertedLoadReport {
     pub read_report: Option<DirectReadReport>,
     /// Whether full payload digest verification (`--verify-weights`) was performed.
     pub weights_verified: bool,
-}
-
-fn align_up_page(bytes: usize) -> usize {
-    match bytes % DATA_ALIGN_BYTES {
-        0 => bytes,
-        rem => bytes + (DATA_ALIGN_BYTES - rem),
-    }
 }
 
 /// Loads all safetensors headers once from `checkpoint_dir` and returns `(SafeTensorsSource, Vec<HeaderEntry>)`.
@@ -614,22 +512,14 @@ pub fn convert_rank_with_source(
     };
     let placeholder_json = serde_json::to_vec(&placeholder_header)
         .map_err(|error| format!("serialise header placeholder: {error}"))?;
-    // Reserve generous slack (one extra 4096 page) so final JSON with real digests always fits
-    // inside `data_offset`.
-    let data_offset = align_up_page(PREAMBLE_BYTES + placeholder_json.len() + 1024) as u64;
+    let data_offset = data_offset_for(placeholder_json.len());
 
     fs::create_dir_all(output_dir)
         .map_err(|error| format!("create {}: {error}", output_dir.display()))?;
     let file_name = rank_file_name(rank, world);
     let out_path = output_dir.join(&file_name);
-    let file = File::create(&out_path)
-        .map_err(|error| format!("create {}: {error}", out_path.display()))?;
-    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, file);
-
-    // Seek to `data_offset` and stream each tensor's converted payload sequentially.
-    writer
-        .seek(SeekFrom::Start(data_offset))
-        .map_err(|error| format!("seek {}: {error}", out_path.display()))?;
+    // Stream each tensor's converted payload sequentially from `data_offset`.
+    let mut writer = RankFileWriter::create(&out_path, data_offset)?;
 
     let max_stored = raw_slots
         .iter()
@@ -637,11 +527,7 @@ pub fn convert_rank_with_source(
         .max()
         .unwrap_or(0);
     let mut scratch = vec![0u8; max_stored];
-    let zeros = [0u8; DATA_ALIGN_BYTES];
-
-    let mut file_digest = FNV_OFFSET;
     let mut tensor_cursor = 0usize;
-    let mut written_in_data = 0usize;
 
     for (group_idx, (_group, indices)) in by_group.iter().enumerate() {
         let mut group_digest = FNV_OFFSET;
@@ -650,11 +536,6 @@ pub fn convert_rank_with_source(
             let entry = &mut tensor_entries[tensor_cursor];
             tensor_cursor += 1;
 
-            if written_in_data < entry.slab_offset {
-                let pad = entry.slab_offset - written_in_data;
-                write_zeros(&mut writer, &zeros, pad, &out_path)?;
-                written_in_data += pad;
-            }
             let _ = &planned_shards[slot.planned_index];
             let stored_len = usize::try_from(slot.stored_bytes)
                 .map_err(|_| format!("{}: stored bytes do not fit usize", slot.name))?;
@@ -684,27 +565,14 @@ pub fn convert_rank_with_source(
                     entry.bytes
                 ));
             }
-            writer
-                .write_all(payload)
-                .map_err(|error| format!("write {}: {error}", out_path.display()))?;
-            written_in_data += payload.len();
-
-            let slice_digest = fnv1a(payload);
+            let slice_digest = writer.put(entry.slab_offset, payload)?;
             entry.digest = slice_digest;
-            group_digest ^= slice_digest;
-            group_digest = group_digest.wrapping_mul(FNV_PRIME);
-            file_digest ^= slice_digest;
-            file_digest = file_digest.wrapping_mul(FNV_PRIME);
+            group_digest = fold_digest(group_digest, slice_digest);
         }
         group_entries[group_idx].digest = group_digest;
     }
 
-    let target_data_len = padded_data_bytes as usize;
-    if written_in_data < target_data_len {
-        let pad = target_data_len - written_in_data;
-        write_zeros(&mut writer, &zeros, pad, &out_path)?;
-    }
-
+    let file_digest = writer.file_digest();
     let final_header = ConvertedRankHeader {
         version: CONVERTED_VERSION,
         rank,
@@ -723,41 +591,13 @@ pub fn convert_rank_with_source(
     };
     let index_bytes = serde_json::to_vec(&final_header)
         .map_err(|error| format!("serialise converted header: {error}"))?;
-    if PREAMBLE_BYTES + index_bytes.len() > data_offset as usize {
-        return Err(format!(
-            "{}: header grew to {} bytes, exceeding reserved data_offset {data_offset}",
-            out_path.display(),
-            PREAMBLE_BYTES + index_bytes.len()
-        ));
-    }
-    let header_hash = fnv1a(&index_bytes);
-    let preamble = ConvertedPreamble {
-        version: CONVERTED_VERSION,
+    let header_hash = writer.finish(
         rank,
         world,
-        index_len: index_bytes.len() as u64,
-        data_offset,
-        data_bytes: allocated_bytes,
+        &index_bytes,
+        allocated_bytes,
         padded_data_bytes,
-        header_hash,
-        file_digest,
-    };
-
-    writer
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| format!("seek start {}: {error}", out_path.display()))?;
-    writer
-        .write_all(&preamble.encode())
-        .map_err(|error| format!("write preamble {}: {error}", out_path.display()))?;
-    writer
-        .write_all(&index_bytes)
-        .map_err(|error| format!("write header {}: {error}", out_path.display()))?;
-    let header_pad = (data_offset as usize) - (PREAMBLE_BYTES + index_bytes.len());
-    write_zeros(&mut writer, &zeros, header_pad, &out_path)?;
-    writer
-        .flush()
-        .map_err(|error| format!("flush {}: {error}", out_path.display()))?;
-    drop(writer);
+    )?;
 
     if verify {
         verify_converted_file(&out_path)?;
@@ -782,22 +622,6 @@ pub fn convert_rank_with_source(
     })
 }
 
-fn write_zeros(
-    writer: &mut BufWriter<File>,
-    zeros: &[u8; DATA_ALIGN_BYTES],
-    mut remaining: usize,
-    path: &Path,
-) -> Result<(), String> {
-    while remaining > 0 {
-        let step = remaining.min(zeros.len());
-        writer
-            .write_all(&zeros[..step])
-            .map_err(|error| format!("pad {}: {error}", path.display()))?;
-        remaining -= step;
-    }
-    Ok(())
-}
-
 /// Performs the cheap boot check on a converted rank file: verifies the file size against
 /// `data_offset + padded_data_bytes` and verifies `fnv1a(index_bytes) == header_hash`.
 ///
@@ -805,69 +629,7 @@ fn write_zeros(
 pub fn inspect_converted_rank(
     path: &Path,
 ) -> Result<(ConvertedPreamble, ConvertedRankHeader), String> {
-    let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
-    let file_len = file
-        .metadata()
-        .map_err(|error| format!("stat {}: {error}", path.display()))?
-        .len();
-    if file_len < PREAMBLE_BYTES as u64 {
-        return Err(format!(
-            "{}: file is {} bytes, shorter than the {PREAMBLE_BYTES}-byte preamble",
-            path.display(),
-            file_len
-        ));
-    }
-    let mut preamble_buf = [0u8; PREAMBLE_BYTES];
-    file.read_exact(&mut preamble_buf)
-        .map_err(|error| format!("read preamble {}: {error}", path.display()))?;
-    let mut preamble = ConvertedPreamble::decode(&preamble_buf, path)?;
-    let expected_file_len = preamble
-        .data_offset
-        .checked_add(preamble.padded_data_bytes)
-        .ok_or_else(|| format!("{}: file size arithmetic overflow", path.display()))?;
-    if file_len != expected_file_len {
-        return Err(format!(
-            "{}: file size is {file_len} bytes, but header declares {expected_file_len} ({} header + {} data)",
-            path.display(),
-            preamble.data_offset,
-            preamble.padded_data_bytes
-        ));
-    }
-    if !(preamble.data_offset as usize).is_multiple_of(DATA_ALIGN_BYTES)
-        || !(preamble.padded_data_bytes as usize).is_multiple_of(DATA_ALIGN_BYTES)
-    {
-        return Err(format!(
-            "{}: data_offset ({}) or padded_data_bytes ({}) is not {DATA_ALIGN_BYTES}-byte aligned",
-            path.display(),
-            preamble.data_offset,
-            preamble.padded_data_bytes
-        ));
-    }
-    let index_end = (PREAMBLE_BYTES as u64)
-        .checked_add(preamble.index_len)
-        .ok_or_else(|| format!("{}: index_len overflow", path.display()))?;
-    if index_end > preamble.data_offset {
-        return Err(format!(
-            "{}: index end {index_end} exceeds data_offset {}",
-            path.display(),
-            preamble.data_offset
-        ));
-    }
-    let index_len = usize::try_from(preamble.index_len)
-        .map_err(|_| format!("{}: index_len does not fit usize", path.display()))?;
-    let mut index_bytes = vec![0u8; index_len];
-    file.read_exact(&mut index_bytes)
-        .map_err(|error| format!("read index {}: {error}", path.display()))?;
-    let measured_header_hash = fnv1a(&index_bytes);
-    if measured_header_hash != preamble.header_hash {
-        return Err(format!(
-            "{}: header hash mismatch (measured {measured_header_hash:#018x}, expected {:#018x})",
-            path.display(),
-            preamble.header_hash
-        ));
-    }
-    let header: ConvertedRankHeader = serde_json::from_slice(&index_bytes)
-        .map_err(|error| format!("parse index in {}: {error}", path.display()))?;
+    let (mut preamble, header): (_, ConvertedRankHeader) = read_index(path)?;
     preamble.file_digest = header.file_digest;
     Ok((preamble, header))
 }
@@ -876,39 +638,17 @@ pub fn inspect_converted_rank(
 /// converted rank file on disk. Called at conversion time and when `--verify-weights` is passed.
 pub fn verify_converted_file(path: &Path) -> Result<ConvertedRankHeader, String> {
     let (preamble, header) = inspect_converted_rank(path)?;
-    let file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
-    let max_tensor = header.tensors.iter().map(|t| t.bytes).max().unwrap_or(0);
-    let mut buf = vec![0u8; max_tensor];
-    let mut rolling_digest = FNV_OFFSET;
-    for entry in &header.tensors {
-        let at = preamble.data_offset + entry.slab_offset as u64;
-        file.read_exact_at(&mut buf[..entry.bytes], at)
-            .map_err(|error| {
-                format!(
-                    "verify read {} ({}) at {at}: {error}",
-                    entry.name,
-                    path.display()
-                )
-            })?;
-        let digest = fnv1a(&buf[..entry.bytes]);
-        if digest != entry.digest {
-            return Err(format!(
-                "{}: tensor {} digest mismatch (measured {digest:#018x}, header {:#018x})",
-                path.display(),
-                entry.name,
-                entry.digest
-            ));
-        }
-        rolling_digest ^= digest;
-        rolling_digest = rolling_digest.wrapping_mul(FNV_PRIME);
-    }
-    if rolling_digest != header.file_digest {
-        return Err(format!(
-            "{}: file digest mismatch (measured {rolling_digest:#018x}, header {:#018x})",
-            path.display(),
-            header.file_digest
-        ));
-    }
+    verify_payloads(
+        path,
+        preamble.data_offset,
+        header.tensors.iter().map(|entry| PayloadDigest {
+            name: &entry.name,
+            offset: entry.slab_offset,
+            bytes: entry.bytes,
+            digest: entry.digest,
+        }),
+        header.file_digest,
+    )?;
     Ok(header)
 }
 
@@ -1137,6 +877,20 @@ mod tests {
         assert_eq!(manifest.ranks.len(), 2);
         assert_eq!(manifest.ranks[0].tiled_tensors, 1);
         assert_eq!(manifest.ranks[0].padded_moe_tensors, 2);
+
+        // The fixture's files are pinned byte for byte: the writer is shared with other packs, and
+        // a change to what it writes would leave the rank files already on the nodes unreadable.
+        for (name, digest) in [
+            ("rank-0-of-4.bin", 0x6b9e_df21_bb59_5859),
+            ("rank-1-of-4.bin", 0xe9fd_f80e_895d_e563),
+        ] {
+            let bytes = fs::read(out_dir.path().join(name)).expect("read the rank file");
+            assert_eq!(
+                (bytes.len(), crate::arena::fnv1a(&bytes)),
+                (8192, digest),
+                "{name} is not the bytes this converter has always written"
+            );
+        }
 
         let rank0_path = out_dir.path().join("rank-0-of-4.bin");
         let (_preamble, header) = inspect_converted_rank(&rank0_path).expect("inspect rank 0");

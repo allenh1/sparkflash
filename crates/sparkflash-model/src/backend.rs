@@ -76,6 +76,20 @@ pub struct StepOutput {
     pub draft: Vec<u32>,
 }
 
+/// What a sequence's speculative decoder has done so far.
+///
+/// The serving layer reports these per request; a backend that drafts nothing keeps the zero
+/// default, which reads as "no speculation" in the stats block.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Speculation {
+    /// Forward passes that verified at least one draft token.
+    pub verify_steps: usize,
+    /// Draft tokens those passes offered.
+    pub drafts_proposed: usize,
+    /// Draft tokens the model's own choice agreed with.
+    pub drafts_accepted: usize,
+}
+
 /// The sampling configuration for one request.
 ///
 /// This mirrors the protocol's sampling fields so a model backend can apply them with the
@@ -118,8 +132,10 @@ impl Default for Sampling {
 
 /// One sequence's backend state.
 ///
-/// A session is created per request so two requests never share KV state. It is Send because
-/// the serving adapter owns it on its engine thread.
+/// A session is created per request so two requests never share KV state. It is `Send`, so a
+/// serving adapter may move it between worker threads, but it is not `Sync`: exactly one thread
+/// calls [`ModelSession::prefill`] or [`ModelSession::decode`] at a time. A backend whose sessions
+/// share mutable engine state must serialize that state itself; see [`ModelBackend`].
 pub trait ModelSession: Send {
     /// Applies this request's sampler before any step.
     ///
@@ -140,14 +156,24 @@ pub trait ModelSession: Send {
     /// # Errors
     /// A backend failure, such as a shape mismatch or an exhausted context.
     fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError>;
+
+    /// The speculative decoder's counts for this sequence so far.
+    ///
+    /// The default is zero, for a backend that drafts nothing.
+    fn speculation(&self) -> Speculation {
+        Speculation::default()
+    }
 }
 
 /// How a model runs on one host.
 ///
 /// A backend is a factory for sessions, not a session itself: it can be shared, while each
-/// request gets its own state. The descriptor is the identity the serving layer reports; the
-/// capabilities are what this backend can actually execute, which may be narrower than what the
-/// model family supports when loaded fully.
+/// request gets its own state. [`ModelBackend::open_session`] may be called from several worker
+/// threads at once, and those sessions may run concurrently, so a backend whose sessions share
+/// mutable engine state must serialize that state itself. Read-only weights and handles may be
+/// shared; per-session streams and scratch allocations are the backend's choice. The descriptor
+/// is the identity the serving layer reports; the capabilities are what this backend can actually
+/// execute, which may be narrower than what the model family supports when loaded fully.
 pub trait ModelBackend: Send + Sync {
     /// The model this backend executes.
     fn descriptor(&self) -> &ModelDescriptor;

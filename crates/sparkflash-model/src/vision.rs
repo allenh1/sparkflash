@@ -33,13 +33,33 @@ pub struct ImageGrid {
     pub best_height: usize,
     /// Canvas width in pixels.
     pub best_width: usize,
+    /// Positions per image row, including the row separator when the model has one.
+    ///
+    /// DeepSeek-V4.1 writes each visual row followed by a newline, so its stride is
+    /// n_llm_w + 1. Qwen packs the rows without separators, so its stride is n_llm_w.
+    /// The span is always n_llm_h * line_stride + 2: a start delimiter, the rows, and an
+    /// end delimiter.
+    pub line_stride: usize,
 }
 
 impl ImageGrid {
-    /// Positions in the span: a start, each row's tokens and its newline, and an end.
+    /// The row stride actually used by [`Self::tokens`] and [`ImageSpan::row`].
+    ///
+    /// A stride narrower than the token width would make the span shorter than its own image
+    /// rows and let [`ImageSpan::row`] divide by zero. Treating it as the packed width keeps an
+    /// old or hand-built grid usable; new code should set `line_stride` explicitly.
+    const fn stride(&self) -> usize {
+        if self.line_stride < self.n_llm_w {
+            self.n_llm_w
+        } else {
+            self.line_stride
+        }
+    }
+
+    /// Positions in the span: a start, each image row, and an end.
     #[must_use]
     pub const fn tokens(&self) -> usize {
-        self.n_llm_h * (self.n_llm_w + 1) + 2
+        self.n_llm_h * self.stride() + 2
     }
 
     /// Aligner rows: the positions that carry image features.
@@ -110,8 +130,9 @@ impl ImageSpan {
             return SpanRow::End;
         }
         let width = self.grid.n_llm_w;
-        let (row, column) = ((offset - 1) / (width + 1), (offset - 1) % (width + 1));
-        if column == width {
+        let stride = self.grid.stride();
+        let (row, column) = ((offset - 1) / stride, (offset - 1) % stride);
+        if column >= width {
             SpanRow::NewLine
         } else {
             SpanRow::Image(row * width + column)

@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 /// The `config.json` `model_type` values the supported weights load.
-pub const SUPPORTED_MODEL_TYPES: &[&str] = &["deepseek_v41"];
+pub const SUPPORTED_MODEL_TYPES: &[&str] = &["deepseek_v41", "qwen4_exp"];
 
 /// The hub cache directory from this process's environment, as `huggingface_hub` resolves it.
 #[must_use]
@@ -181,30 +181,45 @@ pub fn list(cache: &Path) -> Result<Vec<CachedModel>, String> {
         let Some(id) = folder_id(&folder) else {
             continue;
         };
-        let repo = entry.path();
-        let Some(snapshot) = snapshot_of(&repo) else {
-            continue;
-        };
-        let model_type = std::fs::read(snapshot.path.join("config.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .and_then(|config| config["model_type"].as_str().map(str::to_owned));
-        let (bytes, complete) = blob_totals(&repo.join("blobs"));
-        models.push(CachedModel {
-            supported: model_type
-                .as_deref()
-                .is_some_and(|kind| SUPPORTED_MODEL_TYPES.contains(&kind)),
-            has_tokenizer: snapshot.path.join("tokenizer.json").is_file(),
-            snapshot: snapshot.path.display().to_string(),
-            revision: snapshot.revision,
-            id,
-            model_type,
-            bytes,
-            complete,
-        });
+        if let Some(model) = read_model(&entry.path(), &id) {
+            models.push(model);
+        }
     }
     models.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(models)
+}
+
+/// The cached entry for one model id, if its snapshot exists.
+///
+/// This is the cheap targeted lookup the control plane uses before offering a download: it reads
+/// one repo folder, not every model in the cache.
+#[must_use]
+pub fn lookup(cache: &Path, id: &str) -> Option<CachedModel> {
+    if !is_model_id(id) {
+        return None;
+    }
+    read_model(&cache.join(repo_folder(id)), id)
+}
+
+fn read_model(repo: &Path, id: &str) -> Option<CachedModel> {
+    let snapshot = snapshot_of(repo)?;
+    let model_type = std::fs::read(snapshot.path.join("config.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|config| config["model_type"].as_str().map(str::to_owned));
+    let (bytes, complete) = blob_totals(&repo.join("blobs"));
+    Some(CachedModel {
+        supported: model_type
+            .as_deref()
+            .is_some_and(|kind| SUPPORTED_MODEL_TYPES.contains(&kind)),
+        has_tokenizer: snapshot.path.join("tokenizer.json").is_file(),
+        snapshot: snapshot.path.display().to_string(),
+        revision: snapshot.revision,
+        id: id.to_owned(),
+        model_type,
+        bytes,
+        complete,
+    })
 }
 
 fn blob_totals(blobs: &Path) -> (u64, bool) {
@@ -358,5 +373,12 @@ pub(crate) mod tests {
         assert!(models[0].bytes > 0);
         assert!(!models[1].supported);
         assert!(!models[1].complete);
+
+        let flash = lookup(dir.path(), "org/flash").expect("targeted lookup");
+        assert_eq!(flash.id, "org/flash");
+        assert!(flash.complete);
+        assert_eq!(flash.revision, "abc123");
+        assert!(lookup(dir.path(), "org/absent").is_none());
+        assert!(lookup(dir.path(), "not an id").is_none());
     }
 }

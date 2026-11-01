@@ -49,6 +49,8 @@
 
 use std::fmt::Write as _;
 
+use sparkflash_weights::topk::noaux_top_k;
+
 use crate::config::{ConfigError, ModelConfig};
 use crate::dtype::DType;
 use crate::forward::weight_view::WeightView;
@@ -181,9 +183,6 @@ pub trait MoeDeviceBackend {
         None
     }
 }
-
-/// The reduction epsilon of model.py:825: the literal `1e-20`, **not** `norm_eps` and not `hc_eps`.
-const ROUTE_NORM_EPSILON: f32 = 1e-20;
 
 /// `F.softplus`'s threshold at the reference's default `beta = 1`: PyTorch returns the input above
 /// it instead of `log1p(exp(x))` (model.py:816-817). The two agree far below f32 resolution past the
@@ -706,42 +705,16 @@ impl Routing<'_> {
         }
 
         // The bias only decides *which* experts: the weights come from the unbiased scores
-        // (model.py:818-823). Ties go to the lower index, so the selection is a function of the
-        // scores rather than of the order the candidates happened to be visited in.
-        let selection_bias = bias_vl.unwrap_or(bias);
-        self.selected.clear();
-        for _ in 0..topk {
-            let mut best: Option<usize> = None;
-            let mut best_signal = f32::NEG_INFINITY;
-            for expert in 0..n_routed {
-                if self.selected.iter().any(|(taken, _)| *taken == expert) {
-                    continue;
-                }
-                let signal = scores[expert] + selection_bias[expert];
-                if best.is_none() || signal > best_signal {
-                    best = Some(expert);
-                    best_signal = signal;
-                }
-            }
-            match best {
-                Some(expert) => self.selected.push((expert, scores[expert])),
-                None => break,
-            }
-        }
-
-        // weights /= (sum + 1e-20) when norm_topk_prob and topk > 1, then weights *= route_scale
-        // (model.py:824-826).
-        if cfg.norm_topk_prob && topk > 1 {
-            let sum: f32 = self.selected.iter().map(|(_, weight)| *weight).sum();
-            let denominator = sum + ROUTE_NORM_EPSILON;
-            for (_, weight) in self.selected.iter_mut() {
-                *weight /= denominator;
-            }
-        }
-        let route_scale = cfg.route_scale as f32;
-        for (_, weight) in self.selected.iter_mut() {
-            *weight *= route_scale;
-        }
+        // (model.py:818-823). Then weights /= (sum + 1e-20) when norm_topk_prob and topk > 1,
+        // and weights *= route_scale (model.py:824-826).
+        noaux_top_k(
+            scores,
+            bias_vl.unwrap_or(bias),
+            topk,
+            cfg.norm_topk_prob,
+            cfg.route_scale as f32,
+            self.selected,
+        );
         Ok(())
     }
 }

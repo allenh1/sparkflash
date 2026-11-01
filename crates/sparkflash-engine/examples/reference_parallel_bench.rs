@@ -120,6 +120,19 @@ impl RandSource {
                     *byte = rng.byte();
                 }
             }
+            // NVFP4 checkpoints carry a packed weight as raw bytes, and a few derived hash
+            // constants as i64, so both reach this generator. The values are synthetic either
+            // way: what the bench measures is the loader's shape, not the arithmetic.
+            DType::U8 => {
+                for byte in &mut out {
+                    *byte = rng.byte();
+                }
+            }
+            DType::I64 => {
+                for word in out.as_chunks_mut::<8>().0 {
+                    word.copy_from_slice(&rng.next().to_le_bytes());
+                }
+            }
             DType::F16 => panic!("the released checkpoint has no f16 tensors"),
         }
         out

@@ -18,13 +18,9 @@
 //! crates/sparkflash-cli/src/tp4_host.rs): the layer input goes through mHC and the attention norm,
 //! and the post hook runs mHC, the FFN norm and the deferred handoff. The tests feed these to
 //! InferenceEngine::run_hybrid_sequence_step so a sharded engine and a whole-checkpoint engine see
-//! exactly the same host arithmetic and only the shard layout differs.
-//!
-//! The rank-order bus is a test-only BitGather: each rank contributes one segment per round and
-//! every rank leaves with the concatenation in ascending rank order, which is the transport
-//! contract the real TP=4 gather implements.
-
-use std::sync::{Arc, Condvar, Mutex};
+//! exactly the same host arithmetic and only the shard layout differs. A sharded engine gathers
+//! over the seam's in-process bus (`parallel_tp::LocalBus`), which keeps the real TP=4 gather's
+//! contract: every rank leaves with each rank's segment in ascending rank order.
 
 use super::CodedSource;
 
@@ -36,7 +32,6 @@ use sparkflash_engine::forward::{
     DeferredHandoff, HybridEntry, HybridPost, InferenceEngine, SequenceState,
 };
 use sparkflash_engine::linalg::{self, EngineError};
-use sparkflash_engine::parallel_tp::BitGather;
 use sparkflash_engine::tensor::TensorPlan;
 use sparkflash_engine::weights::WeightSource;
 
@@ -156,101 +151,6 @@ pub fn host_post(
         ffn_mixes,
         source: LayerZeroEntrySource::Host,
     })
-}
-
-/// A rank-order gather bus. Each rank contributes one segment per round; every rank leaves with
-/// the concatenation in ascending rank order.
-pub struct Bus {
-    state: Mutex<BusState>,
-    ready: Condvar,
-}
-
-#[derive(Default)]
-struct BusState {
-    round: u64,
-    slots: Vec<Option<Vec<f32>>>,
-    arrived: usize,
-    result: Option<Vec<f32>>,
-    copied: usize,
-}
-
-impl Bus {
-    /// One bus for a world of ranks.
-    pub fn new(world: usize) -> Self {
-        Self {
-            state: Mutex::new(BusState {
-                slots: vec![None; world],
-                ..BusState::default()
-            }),
-            ready: Condvar::new(),
-        }
-    }
-
-    /// Contributes one rank segment and returns the rank-order concatenation.
-    pub fn gather(&self, rank: usize, local: &[f32]) -> Vec<f32> {
-        let mut state = self.state.lock().expect("bus lock");
-        let round = state.round;
-        state.slots[rank] = Some(local.to_vec());
-        state.arrived += 1;
-        if state.arrived == state.slots.len() {
-            let mut result = Vec::new();
-            for slot in &state.slots {
-                result.extend_from_slice(slot.as_ref().expect("every rank arrived"));
-            }
-            state.result = Some(result);
-            self.ready.notify_all();
-        }
-        while state.round == round && state.result.is_none() {
-            state = self.ready.wait(state).expect("bus wait");
-        }
-        let result = state.result.as_ref().expect("gather result").clone();
-        state.copied += 1;
-        if state.copied == state.slots.len() {
-            state.slots.fill(None);
-            state.result = None;
-            state.arrived = 0;
-            state.copied = 0;
-            state.round = round + 1;
-            self.ready.notify_all();
-        }
-        result
-    }
-}
-
-/// One rank BitGather over a [Bus].
-pub struct BusGather {
-    /// This rank.
-    pub rank: usize,
-    /// The world size.
-    pub world: usize,
-    /// The shared bus.
-    pub bus: Arc<Bus>,
-}
-
-impl BitGather for BusGather {
-    fn world(&self) -> usize {
-        self.world
-    }
-
-    fn rank(&self) -> usize {
-        self.rank
-    }
-
-    fn label(&self) -> &'static str {
-        "test bus"
-    }
-
-    fn gather_bits(&mut self, local: &[f32], out: &mut [f32]) -> Result<(), EngineError> {
-        let gathered = self.bus.gather(self.rank, local);
-        if out.len() != gathered.len() {
-            return Err(EngineError::Shape {
-                what: "test bus gather".to_owned(),
-                detail: format!("{} gathered into {}", gathered.len(), out.len()),
-            });
-        }
-        out.copy_from_slice(&gathered);
-        Ok(())
-    }
 }
 
 /// One step's observable: the chosen token and the full logits.

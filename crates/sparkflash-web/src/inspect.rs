@@ -590,7 +590,9 @@ pub fn analyze(
     };
     let lead = probes.first().and_then(|probe| probe.as_ref().ok());
 
-    // Fabric: every node needs a lane, and the lanes must agree on what NCCL is told.
+    // Fabric: every node needs a lane, and the lanes must agree on what NCCL is told. A TP=1
+    // pack has no collectives, so its single node needs no fast-network port at all.
+    let distributed = config.world_size() > 1;
     let mut rails_by_rank: Vec<Vec<Rail>> = Vec::new();
     for (rank, probe) in probes.iter().enumerate() {
         let rails = match probe {
@@ -604,18 +606,18 @@ pub fn analyze(
                 Vec::new()
             }
         };
-        if let Ok(facts) = probe {
+        if distributed && let Ok(facts) = probe {
             if rails.is_empty() {
                 let message = if facts.unaddressed().is_empty() {
                     format!(
-                        "{} has no fast-network link. Check that its QSFP cable is plugged in at \
-                         both ends.",
+                        "{} has no fast-network link. Check that its QSFP cable is plugged in \
+                             at both ends.",
                         name(rank)
                     )
                 } else {
                     format!(
-                        "{}'s fast-network port ({}) is cabled but has no IP address yet. Run the \
-                         network command shown for it.",
+                        "{}'s fast-network port ({}) is cabled but has no IP address yet. Run \
+                             the network command shown for it.",
                         name(rank),
                         facts.unaddressed().join(", ")
                     )
@@ -633,7 +635,7 @@ pub fn analyze(
                         severity: Severity::Warning,
                         message: format!(
                             "{}'s port {} uses MTU {}; {FABRIC_MTU} is faster. Run the network \
-                             command shown for it.",
+                                 command shown for it.",
                             name(rank),
                             rail.netdev,
                             rail.mtu.unwrap_or_default()
@@ -646,7 +648,7 @@ pub fn analyze(
                         severity: Severity::Warning,
                         message: format!(
                             "{}'s port {} links at {} Gb/s, not 200. Check the cable and switch \
-                             port.",
+                                 port.",
                             name(rank),
                             rail.device,
                             rail.rate_gbps.unwrap_or_default()
@@ -661,8 +663,8 @@ pub fn analyze(
                     severity: Severity::Warning,
                     message: format!(
                         "{} has two fast lanes on one subnet without arp_ignore=1 and \
-                         arp_announce=2, so replies can leave by the wrong lane. Run the network \
-                         command shown for it.",
+                             arp_announce=2, so replies can leave by the wrong lane. Run the \
+                             network command shown for it.",
                         name(rank)
                     ),
                 });
@@ -675,7 +677,7 @@ pub fn analyze(
         .filter(|rails| !rails.is_empty())
         .map(Vec::len)
         .collect();
-    if lane_counts.len() > 1 {
+    if distributed && lane_counts.len() > 1 {
         for (rank, rails) in rails_by_rank.iter().enumerate() {
             if rails.len() == 1 && lane_counts.iter().any(|count| *count > 1) {
                 findings.push(Finding {
@@ -692,13 +694,18 @@ pub fn analyze(
         }
     }
 
-    let plan = plan_fabric(probes, &rails_by_rank, &mut findings, &name);
+    let plan = if distributed {
+        plan_fabric(probes, &rails_by_rank, &mut findings, &name)
+    } else {
+        None
+    };
 
     // Software, model and converted weights, each node against the lead.
     let lead_file = |label: &str| lead.and_then(|facts| facts.files.get(label).cloned().flatten());
     let lead_tree = |label: &str| lead.and_then(|facts| facts.trees.get(label).cloned().flatten());
     let lead_model = lead_tree("checkpoint");
     let wants_nccl = config.nccl_lib_path().is_some();
+    let wants_cubins = config.requires_cubins();
     let mut nodes = Vec::with_capacity(probes.len());
     for (rank, probe) in probes.iter().enumerate() {
         let ssh = name(rank);
@@ -725,7 +732,7 @@ pub fn analyze(
         let tree = |label: &str| facts.trees.get(label).cloned().flatten();
         let software = if rank == 0 {
             let present = file("binary").is_some()
-                && tree("cubins").is_some_and(|tree| tree.files > 0)
+                && (!wants_cubins || tree("cubins").is_some_and(|tree| tree.files > 0))
                 && (!wants_nccl || file("nccl").is_some());
             if present {
                 Check::Ready
@@ -738,7 +745,7 @@ pub fn analyze(
             if file("binary").is_none() {
                 Check::Missing
             } else if same_file("binary")
-                && same_tree("cubins")
+                && (!wants_cubins || same_tree("cubins"))
                 && (!wants_nccl || same_file("nccl"))
             {
                 Check::Ready
@@ -769,10 +776,17 @@ pub fn analyze(
             }
             (Some(_), Some(_)) => Check::Partial,
         };
-        let converted = match (file("converted"), file("manifest")) {
-            (None, _) => Check::Missing,
-            (Some(rank_file), Some(manifest)) if manifest.mtime >= rank_file.mtime => Check::Ready,
-            (Some(_), _) => Check::Partial,
+        let converted = if !config.requires_conversion() {
+            // A TP=1 pack loads the released checkpoint directly; there is no converted layout.
+            Check::Ready
+        } else {
+            match (file("converted"), file("manifest")) {
+                (None, _) => Check::Missing,
+                (Some(rank_file), Some(manifest)) if manifest.mtime >= rank_file.mtime => {
+                    Check::Ready
+                }
+                (Some(_), _) => Check::Partial,
+            }
         };
         nodes.push(NodeCheck {
             rank,
@@ -1086,7 +1100,7 @@ pub fn script_args(config: &SparkConfig, rank: usize, checkpoint: Option<&Path>)
         // `sparkflash convert` names its output rank-{rank}-of-{world}.bin and writes the
         // manifest after the rank file is complete.
         converted
-            .join(format!("rank-{rank}-of-{WORLD_SIZE}.bin"))
+            .join(format!("rank-{rank}-of-{}.bin", config.world_size()))
             .display()
             .to_string(),
         converted

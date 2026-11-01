@@ -19,52 +19,45 @@
 //!
 //! * `identity`: with a one-rank adapter the sharded engine's logits are bit-identical to the
 //!   unsharded reference, so inserting the seam changed no value;
-//! * `two-and-four-rank`: with 2 and 4 in-process ranks the logits stay inside the bars declared
-//!   on task-54 (per-seam routed-FFN relative L2 <= 5.0e-3, end-to-end logits <= 2.0e-2);
+//! * `exact wire`: over an exact f32 reduce, 2 and 4 in-process ranks match the reference within
+//!   `EXACT_WIRE_REL_L2_BAR` (1e-5) per routed-FFN seam and end to end, so a slicing error cannot
+//!   hide inside the bf16 wire's rounding (about 2e-3 per seam). On this fixture the routed FFN's
+//!   reduced output has an L2 norm near 1e-7, so the logits do not move on either wire: the
+//!   per-seam comparisons are the ones that see the shards;
+//! * `bf16 wire`: over the transport's canonical arithmetic every rank's logits and seams are
+//!   bit-equal to rank 0's. The distance from the reference is the wire's rounding, so it is
+//!   printed, not barred (the relative-L2 bars task-54 declared were replaced by the exact-wire
+//!   bar);
 //! * `resident`: after `new_tp` returns, a per-token forward issues no whole-tensor read against
 //!   the caller's source (a counting wrapper proves the count stops changing), while the Engram
 //!   tables stay in the source and are paged per token.
 //!
-//! The collective is an in-process bus (two barriers, one shared payload slot per rank) that
-//! implements the trait's canonical arithmetic exactly: bf16-round each payload, f32-accumulate in
-//! ascending rank order from 0.0, one bf16 round, widen. It is test scaffolding only; the node path
+//! The collective is the seam's in-process bus ([sparkflash_engine::parallel_tp::LocalBus]) on its
+//! default bf16 wire, which implements the trait's canonical arithmetic exactly: bf16-round each
+//! payload, f32-accumulate in ascending rank order from 0.0, one bf16 round, widen. The node path
 //! implements the same trait over TCP in the CLI.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
 
 use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::dtype::{DType, expert_scale_shape};
 use sparkflash_engine::forward::{InferenceEngine, Sampling, SequenceState};
 use sparkflash_engine::linalg::EngineError;
 use sparkflash_engine::parallel_tp::{
-    ResidentPlan, ResidentSource, TpCollective, TpLayout, is_engram_table,
+    EXACT_WIRE_REL_L2_BAR, LocalBus, LocalRank, ResidentPlan, ResidentSource, TpLayout, Wire,
+    is_engram_table,
 };
-use sparkflash_engine::quant::bf16_round;
 use sparkflash_engine::tensor::{TensorPlan, TensorSpec};
 use sparkflash_engine::weights::{WeightError, WeightSource};
 
 mod common;
 
 use common::FiniteSource;
-
-/// The declared per-seam relative-L2 bar (task-54, written before the run).
-const SEAM_REL_L2_BAR: f64 = 5.0e-3;
-/// The declared end-to-end logits relative-L2 bar (task-54, written before the run).
-const LOGITS_REL_L2_BAR: f64 = 2.0e-2;
+use common::host_path::bits;
 
 fn rel_l2(a: &[f32], b: &[f32]) -> f64 {
-    assert_eq!(a.len(), b.len(), "two vectors of different lengths");
-    let mut diff = 0.0f64;
-    let mut lhs = 0.0f64;
-    let mut rhs = 0.0f64;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        let d = f64::from(x) - f64::from(y);
-        diff += d * d;
-        lhs += f64::from(x) * f64::from(x);
-        rhs += f64::from(y) * f64::from(y);
-    }
-    diff.sqrt() / lhs.sqrt().max(rhs.sqrt()).max(f64::MIN_POSITIVE)
+    sparkflash_engine::linalg::relative_l2(a, b).expect("two vectors of the same length")
 }
 
 fn engine(config: &ModelConfig, seed: u64, limit: usize) -> InferenceEngine {
@@ -462,94 +455,15 @@ impl WeightSource for CountingSource {
     }
 }
 
-/// The in-process TP bus: one payload slot per rank and two barriers per seam.
-struct Bus {
-    slots: Mutex<Vec<Vec<f32>>>,
-    recorded: Vec<Mutex<Vec<Vec<f32>>>>,
-    published: Barrier,
-    consumed: Barrier,
-}
-
-impl Bus {
-    fn new(world: usize) -> Self {
-        Self {
-            slots: Mutex::new(vec![Vec::new(); world]),
-            recorded: (0..world).map(|_| Mutex::new(Vec::new())).collect(),
-            published: Barrier::new(world),
-            consumed: Barrier::new(world),
-        }
-    }
-
-    fn record(&self, rank: usize, values: &[f32]) {
-        self.recorded[rank]
-            .lock()
-            .expect("the bus is not poisoned")
-            .push(values.to_vec());
-    }
-
-    fn reduce_and_record(&self, rank: usize, values: &mut [f32]) {
-        {
-            let mut slots = self.slots.lock().expect("the bus is not poisoned");
-            slots[rank] = values.to_vec();
-        }
-        self.published.wait();
-        {
-            let slots = self.slots.lock().expect("the bus is not poisoned");
-            let mut accumulator = vec![0.0f32; values.len()];
-            for payload in slots.iter() {
-                for (sum, value) in accumulator.iter_mut().zip(payload.iter()) {
-                    *sum += bf16_round(*value);
-                }
-            }
-            for (out, sum) in values.iter_mut().zip(accumulator.iter()) {
-                *out = bf16_round(*sum);
-            }
-        }
-        self.record(rank, values);
-        self.consumed.wait();
-    }
-}
-
-struct BusCollective {
-    rank: usize,
-    world: usize,
-    bus: Arc<Bus>,
-}
-
-impl TpCollective for BusCollective {
-    fn world(&self) -> usize {
-        self.world
-    }
-    fn rank(&self) -> usize {
-        self.rank
-    }
-    fn label(&self) -> &'static str {
-        "in-process bus"
-    }
-    fn all_reduce_assign(&mut self, values: &mut [f32]) -> Result<(), EngineError> {
-        if self.world == 1 {
-            self.bus.record(self.rank, values);
-            return Ok(());
-        }
-        self.bus.reduce_and_record(self.rank, values);
-        Ok(())
-    }
-    fn all_gather_assign(&mut self, _local: &[f32], _out: &mut [f32]) -> Result<(), EngineError> {
-        Err(EngineError::Shape {
-            what: "the in-process bus".to_owned(),
-            detail: "the Phase-1 seam has no gather".to_owned(),
-        })
-    }
-}
-
 fn tp_engines(
     config: &ModelConfig,
     seed: u64,
     limit: usize,
     world: usize,
-) -> (Vec<InferenceEngine>, Arc<Bus>) {
+    wire: Wire,
+) -> (Vec<InferenceEngine>, Arc<LocalBus>) {
     let plan = TensorPlan::language_model(config);
-    let bus = Arc::new(Bus::new(world));
+    let bus = Arc::new(LocalBus::recording(world).with_wire(wire));
     let engines = (0..world)
         .map(|rank| {
             let source = LocalSource::from_plan(&plan, seed, world, rank, config.moe_inter_dim);
@@ -561,9 +475,8 @@ fn tp_engines(
                     rank,
                     world_size: world,
                 },
-                Box::new(BusCollective {
+                Box::new(LocalRank {
                     rank,
-                    world,
                     bus: Arc::clone(&bus),
                 }),
             )
@@ -601,7 +514,7 @@ fn the_one_rank_shard_path_is_bit_identical_to_the_reference() {
         .expect("the reference forward runs")
         .logits;
 
-    let (engines, bus) = tp_engines(&config, 7, limit, 1);
+    let (engines, bus) = tp_engines(&config, 7, limit, 1, Wire::Bf16);
     let mut state = SequenceState::new(&config);
     let got = engines[0]
         .prefill(&mut state, &[3, 7, 11])
@@ -616,105 +529,108 @@ fn the_one_rank_shard_path_is_bit_identical_to_the_reference() {
         );
     }
     // One chunk of three tokens is one block per layer, so one seam per layer.
-    let recorded = bus.recorded[0].lock().expect("the bus is not poisoned");
+    let recorded = bus.seams(0).expect("the bus records its seams");
     assert_eq!(recorded.len(), config.n_layers);
     assert!(recorded.iter().all(|row| row.len() == 3 * config.dim));
 }
 
+/// Every rank's first-step logits for `tokens` over one recording bus on `wire`, and the bus.
+fn run_world(
+    config: &ModelConfig,
+    limit: usize,
+    world: usize,
+    wire: Wire,
+    tokens: &[u32],
+) -> (Vec<Vec<f32>>, Arc<LocalBus>) {
+    let (engines, bus) = tp_engines(config, 7, limit, world, wire);
+    let handles: Vec<_> = engines
+        .into_iter()
+        .map(|engine| run_logits(engine, config, tokens))
+        .collect();
+    let logits = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("a rank thread does not panic"))
+        .collect();
+    (logits, bus)
+}
+
+/// The reference's first-step logits for `tokens`.
+fn reference_logits(config: &ModelConfig, limit: usize, tokens: &[u32]) -> Vec<f32> {
+    engine(config, 7, limit)
+        .prefill(&mut SequenceState::new(config), tokens)
+        .expect("the reference forward runs")
+        .logits
+}
+
 #[test]
-fn two_and_four_rank_logits_stay_inside_the_declared_bars() {
+fn two_and_four_ranks_shard_the_reference_over_an_exact_wire() {
     let config = ModelConfig::tiny();
     let limit = 1 << 22;
-    let reference = engine(&config, 7, limit);
-    let mut reference_state = SequenceState::new(&config);
-    let expected = reference
-        .prefill(&mut reference_state, &[3, 7, 11])
-        .expect("the reference forward runs")
-        .logits;
-
-    let (two, two_bus) = tp_engines(&config, 7, limit, 2);
-    let handles: Vec<_> = two
-        .into_iter()
-        .map(|engine| run_logits(engine, &config, &[3, 7, 11]))
-        .collect();
-    let two_logits: Vec<Vec<f32>> = handles
-        .into_iter()
-        .map(|handle| handle.join().expect("a rank thread does not panic"))
-        .collect();
-    for (rank, logits) in two_logits.iter().enumerate() {
-        let rel = rel_l2(logits, &expected);
-        let differing = logits
-            .iter()
-            .zip(expected.iter())
-            .filter(|(a, b)| a.to_bits() != b.to_bits())
-            .count();
-        println!(
-            "measured: world 2 rank {rank} logits rel L2 = {rel:e}, {} of {} values differ",
-            differing,
-            expected.len()
-        );
-        assert!(
-            rel <= LOGITS_REL_L2_BAR,
-            "rank {rank} of 2: logits rel L2 {rel:e} above the declared {LOGITS_REL_L2_BAR:e}"
-        );
-    }
-
-    let (four, four_bus) = tp_engines(&config, 7, limit, 4);
-    let handles: Vec<_> = four
-        .into_iter()
-        .map(|engine| run_logits(engine, &config, &[3, 7, 11]))
-        .collect();
-    let four_logits: Vec<Vec<f32>> = handles
-        .into_iter()
-        .map(|handle| handle.join().expect("a rank thread does not panic"))
-        .collect();
-    for (rank, logits) in four_logits.iter().enumerate() {
-        let rel = rel_l2(logits, &expected);
-        let differing = logits
-            .iter()
-            .zip(expected.iter())
-            .filter(|(a, b)| a.to_bits() != b.to_bits())
-            .count();
-        println!(
-            "measured: world 4 rank {rank} logits rel L2 = {rel:e}, {} of {} values differ",
-            differing,
-            expected.len()
-        );
-        assert!(
-            rel <= LOGITS_REL_L2_BAR,
-            "rank {rank} of 4: logits rel L2 {rel:e} above the declared {LOGITS_REL_L2_BAR:e}"
-        );
-    }
-
-    // The per-seam bar: compare each rank's reduced routed FFN output against the one-rank run's
-    // f32 routed FFN output at the same (layer, token).
-    let (one, one_bus) = tp_engines(&config, 7, limit, 1);
-    let handle = run_logits(
-        one.into_iter().next().expect("one engine"),
-        &config,
-        &[3, 7, 11],
-    );
-    handle.join().expect("the one-rank thread does not panic");
-    let one_seams = one_bus.recorded[0].lock().expect("the bus is not poisoned");
-    assert_eq!(one_seams.len(), config.n_layers);
+    let tokens = [3, 7, 11];
+    let expected = reference_logits(&config, limit, &tokens);
+    let (_, one_bus) = run_world(&config, limit, 1, Wire::F32, &tokens);
+    let one_seams = one_bus.seams(0).expect("the bus records its seams");
     for world in [2usize, 4] {
-        let bus = if world == 2 { &two_bus } else { &four_bus };
-        for rank in 0..world {
-            let seams = bus.recorded[rank].lock().expect("the bus is not poisoned");
-            assert_eq!(
-                seams.len(),
-                config.n_layers,
-                "rank {rank} of {world} recorded the wrong number of seams"
+        let (logits, bus) = run_world(&config, limit, world, Wire::F32, &tokens);
+        for (rank, logits) in logits.iter().enumerate() {
+            let rel = rel_l2(logits, &expected);
+            println!("measured: exact wire, world {world} rank {rank} logits rel L2 = {rel:e}");
+            assert!(
+                rel <= EXACT_WIRE_REL_L2_BAR,
+                "rank {rank} of {world}: logits rel L2 {rel:e} above {EXACT_WIRE_REL_L2_BAR:e}"
             );
-            for (index, reference_seam) in one_seams.iter().enumerate() {
-                let rel = rel_l2(&seams[index], reference_seam);
-                println!("measured: world {world} rank {rank} seam {index} rel L2 = {rel:e}");
+            let seams = bus.seams(rank).expect("the bus records its seams");
+            assert_eq!(seams.len(), one_seams.len(), "rank {rank} of {world}");
+            for (index, (ours, theirs)) in seams.iter().zip(&one_seams).enumerate() {
+                let rel = rel_l2(ours, theirs);
                 assert!(
-                    rel <= SEAM_REL_L2_BAR,
-                    "rank {rank} of {world} seam {index} rel L2 {rel:e} above the declared {SEAM_REL_L2_BAR:e}"
+                    rel <= EXACT_WIRE_REL_L2_BAR,
+                    "rank {rank} of {world} seam {index}: rel L2 {rel:e} above \
+                     {EXACT_WIRE_REL_L2_BAR:e}"
                 );
             }
         }
+    }
+}
+
+#[test]
+fn two_and_four_ranks_agree_bit_for_bit_over_the_bf16_wire() {
+    let config = ModelConfig::tiny();
+    let limit = 1 << 22;
+    let tokens = [3, 7, 11];
+    let expected = reference_logits(&config, limit, &tokens);
+    let (_, one_bus) = run_world(&config, limit, 1, Wire::Bf16, &tokens);
+    let one_seams = one_bus.seams(0).expect("the bus records its seams");
+    for world in [2usize, 4] {
+        let (logits, bus) = run_world(&config, limit, world, Wire::Bf16, &tokens);
+        let seams = bus.seams(0).expect("the bus records its seams");
+        assert_eq!(seams.len(), config.n_layers, "one seam per layer");
+        for rank in 1..world {
+            assert_eq!(
+                bits(&logits[rank]),
+                bits(&logits[0]),
+                "rank {rank} of {world}"
+            );
+            let theirs = bus.seams(rank).expect("the bus records its seams");
+            assert_eq!(theirs.len(), seams.len(), "rank {rank} of {world}");
+            for (index, (ours, theirs)) in seams.iter().zip(&theirs).enumerate() {
+                assert_eq!(
+                    bits(theirs),
+                    bits(ours),
+                    "rank {rank} of {world} seam {index}"
+                );
+            }
+        }
+        let worst_seam = seams
+            .iter()
+            .zip(&one_seams)
+            .map(|(ours, theirs)| rel_l2(ours, theirs))
+            .fold(0.0f64, f64::max);
+        println!(
+            "measured: bf16 wire, world {world}: worst seam rel L2 = {worst_seam:e}, logits rel L2 \
+             = {:e}",
+            rel_l2(&logits[0], &expected)
+        );
     }
 }
 
@@ -736,10 +652,9 @@ fn the_resident_source_is_not_read_again_per_token() {
             rank: 0,
             world_size: 1,
         },
-        Box::new(BusCollective {
+        Box::new(LocalRank {
             rank: 0,
-            world: 1,
-            bus: Arc::new(Bus::new(1)),
+            bus: Arc::new(LocalBus::new(1)),
         }),
     )
     .expect("the fixture supports the layout");
@@ -808,10 +723,9 @@ fn the_resident_source_holds_shard_and_replicated_weights_and_pages_engram_table
             rank: 0,
             world_size: 1,
         },
-        Box::new(BusCollective {
+        Box::new(LocalRank {
             rank: 0,
-            world: 1,
-            bus: Arc::new(Bus::new(1)),
+            bus: Arc::new(LocalBus::new(1)),
         }),
     )
     .expect("the fixture supports the layout");
@@ -911,10 +825,9 @@ fn set_sampling_applies_a_request_sampler_without_consuming_the_engine() {
             rank: 0,
             world_size: 1,
         },
-        Box::new(BusCollective {
+        Box::new(LocalRank {
             rank: 0,
-            world: 1,
-            bus: Arc::new(Bus::new(1)),
+            bus: Arc::new(LocalBus::new(1)),
         }),
     )
     .expect("the fixture supports the layout");
@@ -1010,10 +923,9 @@ fn a_layout_that_does_not_split_the_routed_intermediate_is_refused() {
             rank: 0,
             world_size: 3,
         },
-        Box::new(BusCollective {
+        Box::new(LocalRank {
             rank: 0,
-            world: 3,
-            bus: Arc::new(Bus::new(3)),
+            bus: Arc::new(LocalBus::new(3)),
         }),
     )
     .err()

@@ -16,6 +16,36 @@ those kernels read, and the whole serving path, from HTTP to the last collective
 binary per node. It speaks the OpenAI Chat Completions API, so existing clients and coding agents
 that use it work unchanged.
 
+## Run Qwen on one Spark
+
+The Qwen3.8-Flash-Next (NVFP4) pack runs at TP=1 on a single DGX Spark. It loads the released
+checkpoint directly, so there is no weight conversion, no second Spark, no SSH and no fast
+network. Build as usual, then start the console and choose **Run on this Spark only** in Setup:
+
+```bash
+cargo build --release -p sparkflash-cli --features cuda,tp4-serve
+./scripts/setup.sh --no-ssh          # or: target/release/sparkflash --web
+# open http://<this spark>.local:8790, then Setup -> Run on this Spark only
+```
+
+The local plan is three steps: confirm this Spark, download
+`nvidia/Qwen3.8-Flash-Next-NVFP4`, start the server. The console starts
+`scripts/serve-single-node.sh`, which serves the OpenAI API on
+`0.0.0.0:8000` and keeps its log and pid file under `target/serve-single`. To run it without the
+console:
+
+```bash
+hf download nvidia/Qwen3.8-Flash-Next-NVFP4
+target/release/sparkflash serve --model qwen3.8-flash-next-nvfp4 \
+  --context 262144 --bind 0.0.0.0:8000
+```
+
+With no `--checkpoint`, the server resolves the canonical snapshot in the Hugging Face cache
+(`models--nvidia--Qwen3.8-Flash-Next-NVFP4/snapshots/<refs/main>`) and its `tokenizer.json`.
+`--checkpoint` and `--tokenizer` still override that. The DFlash 2 drafter follows the same rule:
+`hf download incoai/Qwen3.8-Flash-Next-DFlash2` is enough; unset `SPARKFLASH_QWEN4_DFLASH2` picks
+up the canonical cache snapshot, and setting it to a path or repo id overrides the choice.
+
 ## Benchmarks
 
 Four DGX Sparks at tensor parallelism 4, one network cable per node, default clocks, client-side
@@ -254,10 +284,11 @@ route, `n`, `seed` and `stop`, structured output (`response_format` `json_object
 forced `tool_choice`, enforced by masking the head's logits), plus `/tokenize`, `/detokenize`,
 `/metrics`, `/health` and `/readyz`.
 
-Not supported yet: `logprobs`, repetition, presence and frequency penalties, JSON-Schema keywords
-outside the enforced subset, and Responses/Anthropic shapes the V4.1 chat template cannot represent
-(these return an error rather than being ignored); and `ignore_eos` / `min_tokens`, which are
-ignored (generation stops at the end-of-sequence token). Full route and limitation details:
+Not supported yet: JSON-Schema keywords outside the enforced subset, Responses/Anthropic shapes the
+V4.1 chat template cannot represent, and, on the TP=4 device path, `logprobs` and repetition,
+presence and frequency penalties (these return an error rather than being ignored; the single-node
+reference engine serves logprobs and penalties); and `ignore_eos` / `min_tokens`, which are ignored
+(generation stops at the end-of-sequence token). Full route and limitation details:
 [docs/serving.md](docs/serving.md).
 
 ## Building and testing without a cluster
@@ -340,5 +371,5 @@ contracts too, so `sparkflash-api`'s normal dependency tree no longer contains t
 Engram, KV or the vision crate. `sparkflash-model::backend` names the host execution seam, and
 `sparkflash-serve` now provides a generic `HostDriver` over it; its toy test serves a chat
 completion through the real router without any V4.1 type. The V4.1 reference driver still lives
-in the CLI until the remaining Phase 3 move. The path to a second model is
-[docs/multi-model-plan.md](docs/multi-model-plan.md).
+in the CLI until the remaining Phase 3 move. D60 in [docs/DECISIONS.md](docs/DECISIONS.md) is the
+record of how a model pack is built and registered.

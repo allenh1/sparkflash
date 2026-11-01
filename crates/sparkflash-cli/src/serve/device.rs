@@ -309,11 +309,13 @@ fn bad_spans(prompt: &[u32], images: &[VisionImage]) -> Option<String> {
                     made.n_llm_w,
                     made.best_height,
                     made.best_width,
+                    made.n_llm_w + 1,
                 ) != (
                     grid.n_llm_h,
                     grid.n_llm_w,
                     grid.best_height,
                     grid.best_width,
+                    grid.line_stride,
                 )
             }
         {
@@ -828,6 +830,9 @@ fn admitted_job(
                     n_llm_w: image.n_llm_w as usize,
                     best_height: image.best_height as usize,
                     best_width: image.best_width as usize,
+                    // This admission path is the V4.1 TP=4 group; V4.1 writes a newline after
+                    // each image row, so its stride is one longer than the token width.
+                    line_stride: image.n_llm_w as usize + 1,
                 },
                 key,
             },
@@ -1698,6 +1703,7 @@ mod tests {
                     n_llm_w: made.n_llm_w,
                     best_height: made.best_height,
                     best_width: made.best_width,
+                    line_stride: made.n_llm_w + 1,
                 },
                 key: [0xa5; 32],
             },

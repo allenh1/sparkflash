@@ -543,6 +543,7 @@ fn dtype_words_map_to_the_plan_dtypes() {
     let e4m3_bytes = [0u8; 4];
     let e8m0_bytes = [0u8; 4];
     let packed_bytes = [0u8; 8];
+    let i64_bytes = [0u8; 16];
     let entries = [
         Entry {
             name: "f32",
@@ -605,6 +606,12 @@ fn dtype_words_map_to_the_plan_dtypes() {
             shape: &[1],
             data: &i32_bytes,
         },
+        Entry {
+            name: "i64",
+            dtype: "I64",
+            shape: &[2],
+            data: &i64_bytes,
+        },
     ];
     write_container(dir.path(), "s.safetensors", &entries);
     write_container(dir.path(), "unknown.safetensors", &unknown);
@@ -629,8 +636,16 @@ fn dtype_words_map_to_the_plan_dtypes() {
     assert_eq!(packed.shape, vec![2, 8], "the last dimension doubles");
     assert_eq!(packed.elements(), 16);
     assert_eq!(packed.storage_bytes(), 8);
-    // A dtype this checkpoint does not use is malformed, not a panic.
-    for (name, word) in [("f64", "F64"), ("u8", "U8"), ("i32", "I32")] {
+    // U8 carries NVFP4's packed bytes and I64 the derived hash constants, so both are plan
+    // dtypes now: a raw byte is one byte wide and an i64 eight, and the header's byte length
+    // is checked against that.
+    assert_eq!(source.spec("u8").unwrap().dtype, DType::U8);
+    assert_eq!(source.spec("u8").unwrap().storage_bytes(), 4);
+    let wide = source.spec("i64").expect("I64 is a plan dtype");
+    assert_eq!(wide.dtype, DType::I64);
+    assert_eq!(wide.storage_bytes(), 16);
+    // A dtype the plan does not carry is malformed, not a panic.
+    for (name, word) in [("f64", "F64"), ("i32", "I32")] {
         expect_malformed(source.spec(name), word);
     }
 }

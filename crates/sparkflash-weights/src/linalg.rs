@@ -81,6 +81,40 @@ pub enum ScaleGrid {
     /// One scale per 32 elements along K, per output row: `scale[r][c / 32]`. This is the released
     /// FP4 expert grid (`[out, ceil(in/32)]`, kernel.py:582).
     PerRow32,
+    /// One scale per `n x n` tile: `scale[r / n][c / n]`, `n` nonzero. This is the block-scaled
+    /// FP8 layout (`quant_method: fp8`, `weight_block_size: [n, n]`) of the GLM-5.3-Flash release
+    /// and the Qwen3.8 MTP experts, both at n = 128, whose grid is stored as `weight_scale_inv` in
+    /// F32 or BF16 and multiplies despite its name.
+    Tile(usize),
+}
+
+impl ScaleGrid {
+    /// The `[rows, columns]` of the grid a `[rows, cols]` weight carries.
+    #[must_use]
+    pub const fn shape(self, rows: usize, cols: usize) -> [usize; 2] {
+        match self {
+            Self::Block32 => [rows.div_ceil(32), cols.div_ceil(32)],
+            Self::PerRow32 => [rows, cols.div_ceil(32)],
+            Self::Tile(side) => [rows.div_ceil(side), cols.div_ceil(side)],
+        }
+    }
+
+    /// The number of scales a `[rows, cols]` weight carries.
+    #[must_use]
+    pub const fn len(self, rows: usize, cols: usize) -> usize {
+        let [grid_rows, grid_cols] = self.shape(rows, cols);
+        grid_rows * grid_cols
+    }
+
+    /// The index of the scale of element `(row, col)` of a weight `cols` wide.
+    #[must_use]
+    pub const fn offset(self, row: usize, col: usize, cols: usize) -> usize {
+        match self {
+            Self::Block32 => (row / 32) * cols.div_ceil(32) + col / 32,
+            Self::PerRow32 => row * cols.div_ceil(32) + col / 32,
+            Self::Tile(side) => (row / side) * cols.div_ceil(side) + col / side,
+        }
+    }
 }
 
 /// The element limit a forward pass applies to a single tensor unless the caller says otherwise.
@@ -193,10 +227,7 @@ pub fn apply_scales(
             ),
         });
     }
-    let expected = match grid {
-        ScaleGrid::Block32 => rows.div_ceil(32) * cols.div_ceil(32),
-        ScaleGrid::PerRow32 => rows * cols.div_ceil(32),
-    };
+    let expected = grid.len(rows, cols);
     if scales.len() != expected {
         return Err(EngineError::Shape {
             what: "scale grid".to_owned(),
@@ -211,11 +242,7 @@ pub fn apply_scales(
         for (local_row, row_values) in block.chunks_mut(cols).enumerate() {
             let row = first_row + local_row;
             for (col, value) in row_values.iter_mut().enumerate() {
-                let scale = match grid {
-                    ScaleGrid::Block32 => scales[(row / 32) * cols.div_ceil(32) + col / 32],
-                    ScaleGrid::PerRow32 => scales[row * cols.div_ceil(32) + col / 32],
-                };
-                *value *= scale;
+                *value *= scales[grid.offset(row, col, cols)];
             }
         }
     });
@@ -467,24 +494,6 @@ where
     Ok(())
 }
 
-/// The E8M0 scale byte for (row, col), using the same grid arithmetic as [apply_scales].
-fn scale_offset(grid: ScaleGrid, row: usize, col: usize, cols: usize) -> usize {
-    let scale_cols = cols.div_ceil(32);
-    match grid {
-        ScaleGrid::Block32 => (row / 32) * scale_cols + col / 32,
-        ScaleGrid::PerRow32 => row * scale_cols + col / 32,
-    }
-}
-
-/// The number of scale bytes a coded weight needs for this geometry.
-fn scale_bytes(grid: ScaleGrid, rows: usize, cols: usize) -> usize {
-    let scale_cols = cols.div_ceil(32);
-    match grid {
-        ScaleGrid::Block32 => rows.div_ceil(32) * scale_cols,
-        ScaleGrid::PerRow32 => rows * scale_cols,
-    }
-}
-
 /// Checks shared coded-matmul geometry and returns the number of codes needed.
 fn coded_geometry(
     out: &[f32],
@@ -517,7 +526,7 @@ fn coded_geometry(
         what: "coded matmul".to_owned(),
         detail: "rows times cols overflows".to_owned(),
     })?;
-    let needed_scales = scale_bytes(grid, rows, cols);
+    let needed_scales = grid.len(rows, cols);
     if scales.len() < needed_scales {
         return Err(EngineError::Shape {
             what: "coded matmul".to_owned(),
@@ -567,7 +576,7 @@ pub fn matmul_f8_scaled(
     let scale_table: [f32; 256] = std::array::from_fn(|index| quant::f8e8m0_to_f32(index as u8));
     coded_matmul(out, x, rows, cols, batch, |row, col| {
         code_table[codes[row * cols + col] as usize]
-            * scale_table[scales[scale_offset(grid, row, col, cols)] as usize]
+            * scale_table[scales[grid.offset(row, col, cols)] as usize]
     })
 }
 
@@ -626,11 +635,7 @@ pub fn matmul_f8_grouped(
             ),
         });
     }
-    let scale_cols = cols_per_group.div_ceil(32);
-    let needed_scales = match grid {
-        ScaleGrid::Block32 => rows.div_ceil(32) * scale_cols,
-        ScaleGrid::PerRow32 => rows * scale_cols,
-    };
+    let needed_scales = grid.len(rows, cols_per_group);
     if scales.len() < needed_scales {
         return Err(EngineError::Shape {
             what: "grouped coded matmul".to_owned(),
@@ -644,7 +649,7 @@ pub fn matmul_f8_grouped(
     let scale_table: [f32; 256] = std::array::from_fn(|index| quant::f8e8m0_to_f32(index as u8));
     let element = |global_row: usize, col: usize| {
         let code = codes[global_row * cols_per_group + col];
-        let scale = scales[scale_offset(grid, global_row, col, cols_per_group)];
+        let scale = scales[grid.offset(global_row, col, cols_per_group)];
         code_table[code as usize] * scale_table[scale as usize]
     };
     let min_chunk = (65_536 / cols_per_group).max(1);
@@ -835,7 +840,7 @@ pub fn matmul_f4_scaled(
             byte >> 4
         };
         code_table[(nibble & 0x0f) as usize]
-            * scale_table[scales[scale_offset(grid, row, col, cols)] as usize]
+            * scale_table[scales[grid.offset(row, col, cols)] as usize]
     })
 }
 
@@ -899,7 +904,7 @@ pub fn matmul_f4_experts(
             what: "routed expert matmul".to_owned(),
             detail: "rows times columns overflows".to_owned(),
         })?;
-    let needed_scales = scale_bytes(grid, rows_per_expert, cols_per_expert);
+    let needed_scales = grid.len(rows_per_expert, cols_per_expert);
     for expert in 0..experts {
         if xs[expert].len() != cols_per_expert {
             return Err(EngineError::Shape {
@@ -933,7 +938,7 @@ pub fn matmul_f4_experts(
             byte >> 4
         };
         code_table[(nibble & 0x0f) as usize]
-            * scale_table[scales[expert][scale_offset(grid, row, col, cols_per_expert)] as usize]
+            * scale_table[scales[expert][grid.offset(row, col, cols_per_expert)] as usize]
     };
     let multiplies = rows as u128 * cols_per_expert as u128;
     const PARALLEL_MIN_MULTIPLIES: u128 = 1_000_000;
@@ -968,10 +973,10 @@ pub fn matmul_f4_experts(
             let mut acc3 = 0.0f32;
             for base in (0..cols_per_expert).step_by(32) {
                 let width = (cols_per_expert - base).min(32);
-                let scale0 = scales[scale_offset(grid, row, base, cols_per_expert)] as usize;
-                let scale1 = scales[scale_offset(grid, row + 1, base, cols_per_expert)] as usize;
-                let scale2 = scales[scale_offset(grid, row + 2, base, cols_per_expert)] as usize;
-                let scale3 = scales[scale_offset(grid, row + 3, base, cols_per_expert)] as usize;
+                let scale0 = scales[grid.offset(row, base, cols_per_expert)] as usize;
+                let scale1 = scales[grid.offset(row + 1, base, cols_per_expert)] as usize;
+                let scale2 = scales[grid.offset(row + 2, base, cols_per_expert)] as usize;
+                let scale3 = scales[grid.offset(row + 3, base, cols_per_expert)] as usize;
                 let s0 = scale_table[scale0];
                 let s1 = scale_table[scale1];
                 let s2 = scale_table[scale2];
@@ -1088,7 +1093,7 @@ pub fn matmul_bf16_scaled(
             detail: format!("{rows}x{cols} needs {bytes} bytes, got {}", w.len()),
         });
     }
-    let needed_scales = scale_bytes(grid, rows, cols);
+    let needed_scales = grid.len(rows, cols);
     if scales.len() < needed_scales {
         return Err(EngineError::Shape {
             what: "bf16 matmul".to_owned(),
@@ -1101,7 +1106,7 @@ pub fn matmul_bf16_scaled(
     coded_matmul(out, x, rows, cols, batch, |row, col| {
         let index = row * cols + col;
         quant::bf16_to_f32(u16::from_le_bytes([w[index * 2], w[index * 2 + 1]]))
-            * quant::f8e8m0_to_f32(scales[scale_offset(grid, row, col, cols)])
+            * quant::f8e8m0_to_f32(scales[grid.offset(row, col, cols)])
     })
 }
 
@@ -1137,6 +1142,60 @@ pub fn rms_norm(x: &mut [f32], weight: &[f32], cols: usize, eps: f32) -> Result<
             let inv = 1.0 / (mean + eps).sqrt();
             for (value, w) in row.iter_mut().zip(weight.iter()) {
                 *value = *value * inv * w;
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Layer-normalises each `cols`-long row of `x` in place: `(x - mean) * rsqrt(var + eps) * weight +
+/// bias`, with the biased variance `mean((x - mean)^2)` of `torch.nn.LayerNorm`.
+///
+/// Rows are independent and each is computed in the serial order whatever the thread count, as in
+/// [rms_norm].
+///
+/// # Errors
+///
+/// [EngineError::Shape] when `x` is not a whole number of `cols`-long rows or the weight or bias is
+/// the wrong length.
+pub fn layer_norm(
+    x: &mut [f32],
+    weight: &[f32],
+    bias: &[f32],
+    cols: usize,
+    eps: f32,
+) -> Result<(), EngineError> {
+    if cols == 0 || !x.len().is_multiple_of(cols) {
+        return Err(EngineError::Shape {
+            what: "layer norm".to_owned(),
+            detail: format!("{} values are not whole rows of {cols}", x.len()),
+        });
+    }
+    if weight.len() != cols || bias.len() != cols {
+        return Err(EngineError::Shape {
+            what: "layer norm affine".to_owned(),
+            detail: format!(
+                "{cols} columns need a {cols}-long weight and bias, got {} and {}",
+                weight.len(),
+                bias.len()
+            ),
+        });
+    }
+    let min_rows = (65_536 / cols).max(1);
+    par_aligned_mut(x, cols, min_rows, |_first_row, block| {
+        for row in block.chunks_mut(cols) {
+            let mean = row.iter().sum::<f32>() / cols as f32;
+            let variance = row
+                .iter()
+                .map(|value| {
+                    let delta = value - mean;
+                    delta * delta
+                })
+                .sum::<f32>()
+                / cols as f32;
+            let scale = 1.0 / (variance + eps).sqrt();
+            for ((value, w), b) in row.iter_mut().zip(weight).zip(bias) {
+                *value = (*value - mean) * scale * w + b;
             }
         }
     });
@@ -1234,6 +1293,10 @@ fn rope_rotate_with(x: &mut [f32], cos: &[f32], sin: &[f32], sign: f32) -> Resul
 /// The index of the largest value, or `None` for an empty slice. Ties take the lower index.
 #[must_use]
 pub fn argmax(x: &[f32]) -> Option<usize> {
+    if let Some(index) = finite_argmax(x) {
+        return Some(index);
+    }
+    // A row with a NaN or an infinity keeps the scalar scan's own answer for it.
     let mut best: Option<(usize, f32)> = None;
     for (index, value) in x.iter().copied().enumerate() {
         if best.is_none_or(|(_, held)| value > held) {
@@ -1241,6 +1304,53 @@ pub fn argmax(x: &[f32]) -> Option<usize> {
         }
     }
     best.map(|(index, _)| index)
+}
+
+/// Lanes the [finite_argmax] pass keeps: independent maxima the compiler can hold in vector
+/// registers, where one running maximum and its index is a serial compare-and-branch per value.
+const ARGMAX_LANES: usize = 16;
+
+/// Values [finite_argmax] compares at once while it looks for the maximum's first index.
+const ARGMAX_SCAN: usize = 64;
+
+/// The index of the largest value when every value is finite, ties to the lower index; `None`
+/// for an empty slice or one holding a NaN or an infinity.
+///
+/// A logits row is a quarter of a million values and a serving loop takes its argmax at every
+/// token, so this is one vectorised pass for the maximum and the finiteness together, then a scan
+/// that stops at the first value equal to it. Over finite values that first index is exactly the
+/// one a strict-greater scan keeps.
+#[must_use]
+pub fn finite_argmax(x: &[f32]) -> Option<usize> {
+    let mut lanes = [f32::NEG_INFINITY; ARGMAX_LANES];
+    let mut nonfinite = [false; ARGMAX_LANES];
+    let (chunks, rest) = x.as_chunks::<ARGMAX_LANES>();
+    for chunk in chunks {
+        for lane in 0..ARGMAX_LANES {
+            nonfinite[lane] |= !chunk[lane].is_finite();
+            lanes[lane] = lanes[lane].max(chunk[lane]);
+        }
+    }
+    if x.is_empty() || nonfinite.contains(&true) || rest.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let max = lanes
+        .iter()
+        .chain(rest)
+        .fold(f32::NEG_INFINITY, |held, value| held.max(*value));
+    // A whole block is compared before any branch, which vectorises where an early-exit scan of
+    // single values does not.
+    let mut start = 0;
+    for block in x.chunks(ARGMAX_SCAN) {
+        if block.iter().fold(false, |hit, value| hit | (*value == max)) {
+            return block
+                .iter()
+                .position(|value| *value == max)
+                .map(|index| start + index);
+        }
+        start += block.len();
+    }
+    None
 }
 
 /// The arithmetic mean of a slice, or 0 for an empty one.
@@ -1256,6 +1366,28 @@ pub fn mean(x: &[f32]) -> f32 {
 #[must_use]
 pub fn is_dense_weight(dtype: DType) -> bool {
     matches!(dtype, DType::F8E4M3 | DType::BF16 | DType::F32)
+}
+
+/// The relative L2 distance of two vectors, `||a - b|| / max(||a||, ||b||)`, accumulated in f64:
+/// the bar a sharded or device run is held to against the f32 reference.
+///
+/// # Errors
+/// [EngineError::Shape] when the lengths differ.
+pub fn relative_l2(a: &[f32], b: &[f32]) -> Result<f64, EngineError> {
+    if a.len() != b.len() {
+        return Err(EngineError::Shape {
+            what: "relative L2".to_owned(),
+            detail: format!("{} values against {}", a.len(), b.len()),
+        });
+    }
+    let (mut diff, mut lhs, mut rhs) = (0.0f64, 0.0f64, 0.0f64);
+    for (&x, &y) in a.iter().zip(b) {
+        let (x, y) = (f64::from(x), f64::from(y));
+        diff += (x - y) * (x - y);
+        lhs += x * x;
+        rhs += y * y;
+    }
+    Ok(diff.sqrt() / lhs.sqrt().max(rhs.sqrt()).max(f64::MIN_POSITIVE))
 }
 
 #[cfg(test)]
@@ -1648,6 +1780,29 @@ mod tests {
     }
 
     #[test]
+    fn layer_norm_centres_with_the_biased_variance_then_applies_the_affine() {
+        let mut rows = [1.0f32, 3.0, 5.0, 7.0, 2.0, 2.0, 2.0, 2.0];
+        layer_norm(
+            &mut rows[..4],
+            &[1.0, 2.0, 1.0, 1.0],
+            &[0.0, 0.0, 0.5, 0.0],
+            4,
+            0.0,
+        )
+        .unwrap();
+        // mean 4 and biased variance 5, so (x - 4) / sqrt(5); a constant row is all bias.
+        let unit = 1.0 / 5.0f32.sqrt();
+        let want = [-3.0 * unit, -2.0 * unit, unit + 0.5, 3.0 * unit];
+        for (got, want) in rows[..4].iter().zip(want) {
+            assert!((got - want).abs() < 1e-6, "{rows:?}");
+        }
+        layer_norm(&mut rows[4..], &[1.0; 4], &[0.0; 4], 4, 1e-6).unwrap();
+        assert_eq!(rows[4..], [0.0; 4]);
+        let error = layer_norm(&mut rows, &[1.0; 4], &[0.0; 3], 4, 0.0).unwrap_err();
+        assert!(matches!(error, EngineError::Shape { .. }), "{error}");
+    }
+
+    #[test]
     fn softmax_is_a_distribution_and_all_inf_is_zero() {
         let mut x = [1.0f32, 2.0, 3.0];
         softmax(&mut x);
@@ -1715,6 +1870,19 @@ mod tests {
     }
 
     #[test]
+    fn a_tile_grid_gives_each_tile_its_own_scale_and_edge_tiles_keep_theirs() {
+        // A 3x3 weight in 2x2 tiles: a 2x2 grid whose right and bottom tiles are cut short.
+        let mut weight = vec![1.0f32; 9];
+        apply_scales(&mut weight, 3, 3, &[1.0, 2.0, 4.0, 8.0], ScaleGrid::Tile(2)).unwrap();
+        assert_eq!(weight, vec![1.0, 1.0, 2.0, 1.0, 1.0, 2.0, 4.0, 4.0, 8.0]);
+        assert_eq!(ScaleGrid::Tile(128).shape(2048, 4096), [16, 32]);
+        assert_eq!(
+            ScaleGrid::Tile(32).shape(70, 70),
+            ScaleGrid::Block32.shape(70, 70)
+        );
+    }
+
+    #[test]
     fn silu_and_sigmoid_agree_at_the_origin_and_saturate() {
         assert!((sigmoid(0.0) - 0.5).abs() < 1e-6);
         assert_eq!(silu(0.0), 0.0);
@@ -1726,8 +1894,40 @@ mod tests {
     fn argmax_takes_the_lower_index_on_a_tie() {
         assert_eq!(argmax(&[1.0, 3.0, 3.0]), Some(1));
         assert_eq!(argmax(&[]), None);
+        // A tie at zero takes the first zero, whatever its sign.
+        assert_eq!(argmax(&[-1.0, -0.0, 0.0]), Some(1));
         assert_eq!(mean(&[]), 0.0);
         assert!((mean(&[1.0, 2.0, 3.0]) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_vectorised_argmax_is_the_strict_scan() {
+        let scan = |x: &[f32]| {
+            let mut best: Option<(usize, f32)> = None;
+            for (index, value) in x.iter().copied().enumerate() {
+                if best.is_none_or(|(_, held)| value > held) {
+                    best = Some((index, value));
+                }
+            }
+            best.map(|(index, _)| index)
+        };
+        // Lengths on both sides of a lane chunk, values with many ties, and the maximum placed
+        // in a chunk, in the remainder and on the first element.
+        for len in [1, 15, 16, 17, 100, 1_003] {
+            let mut row: Vec<f32> = (0..len).map(|i| ((i * 37) % 11) as f32 - 5.0).collect();
+            assert_eq!(finite_argmax(&row), scan(&row), "len {len}");
+            for at in [0, len / 2, len - 1] {
+                row[at] = 9.0;
+                assert_eq!(finite_argmax(&row), scan(&row), "len {len} max at {at}");
+            }
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut odd = row.clone();
+                odd[len - 1] = bad;
+                assert_eq!(finite_argmax(&odd), None);
+                assert_eq!(argmax(&odd), scan(&odd), "len {len} with {bad}");
+            }
+        }
+        assert_eq!(finite_argmax(&[]), None);
     }
 
     /// The exact bits of a slice, for comparing two runs that must agree bit for bit.

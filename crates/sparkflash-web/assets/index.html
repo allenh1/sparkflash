@@ -314,7 +314,7 @@ limitations under the License.
                 <label class="field">
                   <span>Engine</span>
                   <select id="engine-kind"></select>
-                  <small>Only the TP=4 device engine ships today.</small>
+                  <small>V4.1 runs TP=4 across four Sparks; Qwen3.8 runs TP=1 on one.</small>
                 </label>
                 <label class="field">
                   <span>Max context <em>tokens</em></span>
@@ -363,7 +363,7 @@ limitations under the License.
               <div class="fields">
                 <label class="field span-2"><span>Checkout root</span><input id="repo-root" type="text"></label>
                 <label class="field"><span>Server binary</span><input id="binary" type="text"></label>
-                <label class="field"><span>Launcher script</span><input id="serve-script" type="text"></label>
+                <label class="field"><span>Four-node launcher script</span><input id="serve-script" type="text"></label>
                 <label class="field span-2"><span>Checkpoint <em>empty uses the model's snapshot in the Hugging Face cache</em></span><input id="checkpoint" type="text"></label>
                 <label class="field span-2"><span>Hugging Face cache <em>empty uses HF_HUB_CACHE or ~/.cache/huggingface/hub</em></span><input id="hub-cache" type="text"></label>
                 <label class="field span-2"><span>Tokenizer <em>empty derives it from the checkpoint</em></span><input id="tokenizer" type="text"></label>

@@ -6818,7 +6818,11 @@ fn model_card(state: &AppState, created: u64) -> Value {
         "multimodal": capabilities.vision,
         "image_url": capabilities.vision,
         "thinking": capabilities.thinking,
-        "chat_template_kwargs": if capabilities.thinking { json!(["thinking"]) } else { json!([]) },
+        "chat_template_kwargs": if capabilities.thinking {
+            json!(["thinking", "enable_thinking"])
+        } else {
+            json!([])
+        },
         "endpoints": endpoints,
     });
     if capabilities.reasoning_effort {

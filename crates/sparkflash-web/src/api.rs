@@ -30,8 +30,8 @@ use crate::commands::{
     local_hostname, serve_action_command, sync_command,
 };
 use crate::config::{
-    MAX_CONCURRENCY, MODEL_CONTEXT_TOKENS, SUPPORTED_ENGINES, SUPPORTED_WEIGHTS, SparkConfig,
-    WORLD_SIZE,
+    MAX_CONCURRENCY, QWEN_CONTEXT_TOKENS, QWEN_ENGINE_ID, QWEN_MODEL_ID, QWEN_WEIGHTS_ID,
+    SUPPORTED_ENGINES, SUPPORTED_WEIGHTS, SparkConfig,
 };
 use crate::discovery::{DiscoveryReport, NodeDiscovery, SshProbe, report_nodes};
 use crate::hf::{self, CachedModel};
@@ -344,24 +344,41 @@ struct StateView {
 struct CheckpointView {
     /// The checkpoint directory, when it resolves.
     path: Option<String>,
+    /// Whether that directory exists right now.
+    exists: bool,
     /// Whether it is looked up in the Hugging Face cache rather than set in `model.checkpoint`.
     from_cache: bool,
     /// The hub cache `model.id` is looked up in.
     cache: Option<String>,
+    /// The cached entry for `model.id`, when it has one. `complete` says whether the snapshot
+    /// is ready to serve; `bytes` says how much is already downloaded.
+    cached: Option<CachedModel>,
     /// Why it does not resolve.
     error: Option<String>,
 }
 
 impl CheckpointView {
     fn of(config: &SparkConfig) -> Self {
+        let from_cache = config.model.checkpoint.trim().is_empty();
+        let cache = config.hub_cache_dir();
+        let cached = if from_cache {
+            cache
+                .as_deref()
+                .and_then(|dir| hf::lookup(dir, &config.model.id))
+        } else {
+            None
+        };
         let resolved = config.resolve_checkpoint();
+        let exists = resolved.as_ref().map(|path| path.is_dir()).unwrap_or(false);
         Self {
             path: resolved
                 .as_ref()
                 .ok()
                 .map(|path| path.display().to_string()),
-            from_cache: config.model.checkpoint.trim().is_empty(),
-            cache: config.hub_cache_dir().map(|dir| dir.display().to_string()),
+            exists,
+            from_cache,
+            cache: cache.map(|dir| dir.display().to_string()),
+            cached,
             error: resolved.err().map(|error| error.to_string()),
         }
     }
@@ -378,6 +395,16 @@ struct Limits {
 struct Supported {
     weights: &'static [&'static str],
     engines: &'static [&'static str],
+    /// The one-node TP=1 profile the Setup page offers as "run on this Spark only".
+    solo: SoloDefaults,
+}
+
+#[derive(Serialize)]
+struct SoloDefaults {
+    weights: &'static str,
+    engine: &'static str,
+    id: &'static str,
+    context_tokens: usize,
 }
 
 async fn state_snapshot(State(web): State<WebState>) -> Json<StateView> {
@@ -388,6 +415,11 @@ async fn state_snapshot(State(web): State<WebState>) -> Json<StateView> {
     let discovery = web.last_discovery.read().expect("discovery lock").clone();
     let setup = web.last_inspect.read().expect("inspect lock").clone();
     let checkpoint = CheckpointView::of(&config);
+    let limits = Limits {
+        max_context_tokens: config.max_context_tokens(),
+        max_concurrency: MAX_CONCURRENCY,
+        world_size: config.world_size(),
+    };
     Json(StateView {
         now_ms: now_ms(),
         hostname: web.hostname.clone(),
@@ -404,14 +436,16 @@ async fn state_snapshot(State(web): State<WebState>) -> Json<StateView> {
         setup,
         advertised: web.advertised.clone(),
         checkpoint,
-        limits: Limits {
-            max_context_tokens: MODEL_CONTEXT_TOKENS,
-            max_concurrency: MAX_CONCURRENCY,
-            world_size: WORLD_SIZE,
-        },
+        limits,
         supported: Supported {
             weights: SUPPORTED_WEIGHTS,
             engines: SUPPORTED_ENGINES,
+            solo: SoloDefaults {
+                weights: QWEN_WEIGHTS_ID,
+                engine: QWEN_ENGINE_ID,
+                id: QWEN_MODEL_ID,
+                context_tokens: QWEN_CONTEXT_TOKENS,
+            },
         },
     })
 }
@@ -576,8 +610,7 @@ fn lead_model_complete(config: &SparkConfig) -> bool {
     }
     config
         .hub_cache_dir()
-        .and_then(|cache| hf::list(&cache).ok())
-        .and_then(|models| models.into_iter().find(|model| model.id == config.model.id))
+        .and_then(|cache| hf::lookup(&cache, &config.model.id))
         .is_some_and(|model| model.complete)
 }
 
@@ -605,10 +638,22 @@ async fn apply_network(State(web): State<WebState>) -> Response {
 
 /// Downloads the configured model into the lead's Hugging Face cache.
 async fn download(State(web): State<WebState>) -> Response {
-    let command = match web
-        .usable_config()
-        .and_then(|config| download_command(&config))
-    {
+    let config = match web.usable_config() {
+        Ok(config) => config,
+        Err(message) => return api_error(StatusCode::CONFLICT, message),
+    };
+    // The cache is the source of truth before the download starts. A complete snapshot needs no
+    // network transfer, and saying so is more useful than starting a job that immediately no-ops.
+    if config.model.checkpoint.trim().is_empty() && lead_model_complete(&config) {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "{} is already in the Hugging Face cache; nothing to download",
+                config.model.id
+            ),
+        );
+    }
+    let command = match download_command(&config) {
         Ok(command) => command,
         Err(message) => return api_error(StatusCode::CONFLICT, message),
     };
@@ -757,21 +802,31 @@ async fn convert(State(web): State<WebState>, Json(request): Json<ConvertRequest
         Ok(config) => config,
         Err(message) => return api_error(StatusCode::CONFLICT, message),
     };
+    if !config.requires_conversion() {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "{} loads its released checkpoint directly; there is no conversion step",
+                config.model.weights
+            ),
+        );
+    }
     if web.stats.latest().is_some_and(|sample| sample.online) {
         return api_error(
             StatusCode::CONFLICT,
             "rank 0 is online; stop the cluster before converting its weights",
         );
     }
-    let ranks = request.ranks.unwrap_or_else(|| (0..WORLD_SIZE).collect());
+    let world_size = config.world_size();
+    let ranks = request.ranks.unwrap_or_else(|| (0..world_size).collect());
     if ranks.is_empty() {
         return api_error(StatusCode::BAD_REQUEST, "ranks must not be empty");
     }
     for rank in &ranks {
-        if *rank >= WORLD_SIZE {
+        if *rank >= world_size {
             return api_error(
                 StatusCode::BAD_REQUEST,
-                format!("rank {rank} is outside 0..{WORLD_SIZE}"),
+                format!("rank {rank} is outside 0..{world_size}"),
             );
         }
         if web.jobs.convert_running(*rank) {
@@ -1036,6 +1091,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_solo_qwen_config_is_saved_and_reported_as_one_world() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = test_router(test_state(dir.path()));
+        let mut config = SparkConfig::default();
+        config.model.weights = crate::config::QWEN_WEIGHTS_ID.to_owned();
+        config.model.id = crate::config::QWEN_MODEL_ID.to_owned();
+        config.model.checkpoint = "/data/Qwen3.8-Flash-Next-NVFP4".to_owned();
+        config.model.cubins.clear();
+        config.engine.kind = crate::config::QWEN_ENGINE_ID.to_owned();
+        config.runtime.max_context_tokens = crate::config::QWEN_CONTEXT_TOKENS;
+        config.cluster.nodes = vec![crate::config::NodeConfig::new("this-spark.local", "", true)];
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .header(ACTION_HEADER, "1")
+                    .uri("/api/config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"config": config}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved = SparkConfig::load(&dir.path().join("sparkflash.toml")).expect("saved");
+        assert!(saved.is_solo());
+        assert_eq!(saved.cluster.nodes[0].peer, "");
+
+        let state = body_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/state")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response"),
+        )
+        .await;
+        assert_eq!(state["limits"]["world_size"], 1);
+        assert_eq!(
+            state["limits"]["max_context_tokens"],
+            crate::config::QWEN_CONTEXT_TOKENS
+        );
+        assert_eq!(
+            state["supported"]["solo"]["weights"],
+            crate::config::QWEN_WEIGHTS_ID
+        );
+
+        let convert = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .header(ACTION_HEADER, "1")
+                    .uri("/api/actions/convert")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(convert.status(), StatusCode::CONFLICT);
+        let body = body_json(convert).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no conversion step")
+        );
+    }
+
+    #[tokio::test]
     async fn saving_config_validates_and_writes_the_toml() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = test_state(dir.path());
@@ -1203,11 +1334,26 @@ mod tests {
         assert_eq!(models["models"][0]["supported"], true);
         assert_eq!(models["models"][1]["id"], "org/other");
         assert_eq!(models["models"][1]["supported"], false);
-        let state = body_json(app.oneshot(get("/api/state")).await.expect("state")).await;
+        let state = body_json(app.clone().oneshot(get("/api/state")).await.expect("state")).await;
         assert_eq!(state["checkpoint"]["from_cache"], true);
         assert_eq!(
             state["checkpoint"]["path"],
             snapshot.display().to_string().as_str()
+        );
+        assert_eq!(state["checkpoint"]["exists"], true);
+        assert_eq!(state["checkpoint"]["cached"]["complete"], true);
+        assert_eq!(state["checkpoint"]["cached"]["has_tokenizer"], true);
+
+        // A complete cache snapshot needs no download job.
+        let response = app
+            .oneshot(post_json("/api/actions/download", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"].to_string();
+        assert!(
+            error.contains("already in the Hugging Face cache"),
+            "{error}"
         );
     }
 

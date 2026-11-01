@@ -99,12 +99,19 @@ struct CuLaunchConfig {
     num_attrs: u32,
 }
 
-/// Whether opt_* kernels launch with programmatic stream serialization (every opt kernel opens
-/// with griddepcontrol.launch_dependents + griddepcontrol.wait, so stream order holds). On unless
+/// Whether [programmatic] kernels launch with programmatic stream serialization. On unless
 /// SPARKFLASH_PDL=0.
 fn pdl_enabled() -> bool {
     static PDL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *PDL.get_or_init(|| std::env::var("SPARKFLASH_PDL").as_deref() != Ok("0"))
+}
+
+/// Whether a kernel launches with programmatic stream serialization: the opt kernels and the
+/// Qwen4-Exp pack's q4e kernels. Every one opens with griddepcontrol.launch_dependents +
+/// griddepcontrol.wait (OPT_PDL_ENTRY), so it reads and writes nothing before the previous grid
+/// has completed and stream order holds.
+fn programmatic(kernel: &Kernel) -> bool {
+    (kernel.name.starts_with("opt_") || kernel.name.starts_with("q4e_")) && pdl_enabled()
 }
 
 /// The driver's CUresult names, so a report says OUT_OF_MEMORY rather than 2.
@@ -201,9 +208,19 @@ pub struct Kernel {
     function: CuFunction,
     /// The canonical cubin pin name, so a timing bracket can key its sample by kernel.
     name: &'static str,
+    /// Dynamic shared memory the launch reserves, set at load time. A kernel whose tile is fixed
+    /// by its arguments rather than by a compile-time bound - the GDN recurrence's state, for
+    /// one - needs the block's shared memory sized by the caller, and above 48 KiB the function
+    /// needs the driver's opt-in as well.
+    shared_bytes: u32,
 }
 
 impl Kernel {
+    /// Dynamic shared memory this handle reserves for every launch.
+    pub fn shared_bytes(&self) -> u32 {
+        self.shared_bytes
+    }
+
     /// The raw function word and pin name, for a crate-internal dispatch table that must be
     /// `Sync` (a raw CUfunction is not).
     pub(crate) fn to_raw(self) -> (u64, &'static str) {
@@ -215,6 +232,7 @@ impl Kernel {
         Self {
             function: function as CuFunction,
             name,
+            shared_bytes: 0,
         }
     }
 }
@@ -1649,6 +1667,7 @@ pub struct CudaLaunchRecord {
     function: usize,
     grid: (u32, u32, u32),
     block: (u32, u32, u32),
+    shared_bytes: u32,
     args: Vec<u64>,
 }
 
@@ -1780,8 +1799,43 @@ impl SideStream {
     }
 }
 
+/// A non-blocking stream a serving session owns.
+///
+/// Unlike [SideStream], this stream carries a session's whole forward: copies and kernel launches
+/// are ordered on it, and no other session's work is. The raw handle is why the type is not
+/// automatically `Send`; a session moves it between threads only as a whole.
+pub struct RunStream {
+    stream: CuStream,
+}
+
+// SAFETY: a stream handle is an opaque driver object. It is used by one session at a time, and
+// every call that touches it is made on the session's own thread.
+unsafe impl Send for RunStream {}
+
+impl RunStream {
+    /// The raw stream handle, for a library that enqueues its own work on it.
+    #[must_use]
+    pub fn raw(&self) -> u64 {
+        self.stream as u64
+    }
+
+    /// A second handle to the same stream, for a caller that orders several sessions' launches on
+    /// one of them.
+    ///
+    /// The handle is an alias, not a second stream: work enqueued through either is on one stream
+    /// and runs in submission order. Only the handle [Cuda::run_stream] returned may be given to
+    /// [Cuda::destroy_run_stream].
+    #[must_use]
+    pub fn alias(&self) -> Self {
+        Self {
+            stream: self.stream,
+        }
+    }
+}
+
 /// An event a [SideStream] marks and the run's stream waits on ([Cuda::side_mark],
-/// [Cuda::run_wait]); it lives for the run, like the side stream.
+/// [Cuda::run_wait]), or the run's stream marks and the host waits on ([Cuda::run_mark],
+/// [Cuda::host_wait]); it lives for the run, like the side stream.
 pub struct StreamEvent(CuEvent);
 
 /// The CUDA context and the dlopen'd driver functions this process uses.
@@ -1813,6 +1867,28 @@ pub struct Cuda {
 }
 
 impl Cuda {
+    /// Makes this handle's context current on the calling thread.
+    ///
+    /// A CUDA context is per-thread: [Cuda::load] makes the primary context current for the thread
+    /// that opened it, and every other thread that allocates, copies or launches through this handle
+    /// has to make it current first or the driver answers CUDA_ERROR_INVALID_CONTEXT (201). A backend
+    /// that is opened on a startup thread and then executed by a serving worker - which is exactly
+    /// what the generic host driver in sparkflash-serve does - calls this once on the worker.
+    ///
+    /// # Errors
+    /// The driver's cuCtxSetCurrent failure code.
+    pub fn make_current(&self) -> Result<(), String> {
+        let set: libloading::Symbol<unsafe extern "C" fn(*mut c_void) -> CuResult> =
+            self.sym(b"cuCtxSetCurrent")?;
+        // SAFETY: the symbol comes from this context's library and the pointer is the context this
+        // handle retained; the call only binds it to the calling thread.
+        let r = unsafe { set(self.ctx) };
+        if r != 0 {
+            return Err(format!("cuCtxSetCurrent failed: {r}"));
+        }
+        Ok(())
+    }
+
     /// Blocks until every queued operation on this context has completed (the M2 probe sync point).
     ///
     /// The forward perf probe calls this once at each timed block boundary so the host `Instant`
@@ -2192,7 +2268,7 @@ impl Cuda {
                     record.block.0,
                     record.block.1,
                     record.block.2,
-                    0,
+                    record.shared_bytes,
                     std::ptr::null_mut(),
                     ptrs.as_mut_ptr(),
                     std::ptr::null_mut(),
@@ -2245,6 +2321,7 @@ impl Cuda {
             function: kernel.function as usize,
             grid,
             block,
+            shared_bytes: kernel.shared_bytes,
             args: args.to_vec(),
         };
         match mode {
@@ -2273,7 +2350,7 @@ impl Cuda {
                         block.0,
                         block.1,
                         block.2,
-                        0,
+                        kernel.shared_bytes,
                         stream,
                         ptrs.as_mut_ptr(),
                         std::ptr::null_mut(),
@@ -2975,6 +3052,56 @@ impl Cuda {
         }
     }
 
+    /// Reads `len` bytes of `path` from `file_offset` into device memory at `destination` with
+    /// [read_file_parallel_into_slice], through one 1 GiB page-aligned host window (read, then
+    /// copy), so the host never holds a second copy of what it uploads.
+    ///
+    /// # Errors
+    /// When a read fails or hits the end of the file, or a copy fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_file_parallel(
+        &self,
+        destination: &Deviceptr,
+        path: &Path,
+        file_offset: u64,
+        len: usize,
+        chunk_bytes: usize,
+        concurrency: usize,
+        use_odirect: bool,
+    ) -> Result<DirectReadReport, String> {
+        const WINDOW: usize = 1 << 30;
+        let mut storage = vec![0u8; WINDOW.min(len) + DIRECT_IO_ALIGN];
+        let shift = storage.as_ptr().align_offset(DIRECT_IO_ALIGN);
+        let mut done = 0usize;
+        let mut report = DirectReadReport {
+            bytes_read: 0,
+            chunks: 0,
+            concurrency,
+            chunk_bytes,
+            direct_io: use_odirect,
+        };
+        while done < len {
+            let n = (len - done).min(WINDOW);
+            let buf = &mut storage[shift..shift + n];
+            let part = read_file_parallel_into_slice(
+                path,
+                file_offset + done as u64,
+                buf,
+                chunk_bytes,
+                concurrency,
+                use_odirect,
+            )?;
+            self.copy_htod(&destination.offset(done), buf)?;
+            report.chunks += part.chunks;
+            report.concurrency = part.concurrency;
+            report.chunk_bytes = part.chunk_bytes;
+            report.direct_io &= part.direct_io;
+            done += n;
+        }
+        report.bytes_read = len;
+        Ok(report)
+    }
+
     /// Copies a device allocation back to host bytes.
     pub fn copy_dtoh(&self, dst: &mut [u8], src: &Deviceptr) -> Result<(), String> {
         if let Some(refusal) = self.graph_refusal(SegmentOp::Copy) {
@@ -3141,15 +3268,47 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: id.cubin_names()[0],
             },
         ))
     }
 
+    /// Loads a kernel by name, reserving `shared_bytes` of dynamic shared memory for each launch.
+    ///
+    /// `cuFuncSetAttribute` is set once here rather than at each launch: the size belongs to the
+    /// kernel's argument shape, and above 48 KiB the driver refuses the launch without it.
+    pub fn load_named_shared(
+        &self,
+        cubin: &[u8],
+        name: &'static str,
+        shared_bytes: u32,
+    ) -> Result<(Module, Kernel), String> {
+        let (module, mut kernel) = self.load_named(cubin, name)?;
+        let set: libloading::Symbol<unsafe extern "C" fn(CuFunction, u32, i32) -> CuResult> =
+            self.sym(b"cuFuncSetAttribute")?;
+        // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES.
+        let r = unsafe { set(kernel.function, 8, shared_bytes as i32) };
+        if r != 0 {
+            return Err(format!(
+                "cuFuncSetAttribute(shared {shared_bytes}) for {name} failed: {r}"
+            ));
+        }
+        kernel.shared_bytes = shared_bytes;
+        Ok((module, kernel))
+    }
+
     /// Loads any symbol by name from a cubin image, with no pin: the opt kernels' loader.
     pub fn load_named(&self, cubin: &[u8], name: &'static str) -> Result<(Module, Kernel), String> {
         let (module, function) = self.load_function(cubin, name)?;
-        Ok((Module(module), Kernel { function, name }))
+        Ok((
+            Module(module),
+            Kernel {
+                function,
+                shared_bytes: 0,
+                name,
+            },
+        ))
     }
 
     /// Loads the router's stage-two top-6 merge kernel from the router cubin.
@@ -3164,6 +3323,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "moe_router_topk_sm121",
             },
         ))
@@ -3175,6 +3335,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "cert_lm_head_batched_sm121",
             },
         ))
@@ -3191,6 +3352,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "moe_expert_stage_sm121",
             },
         ))
@@ -3206,6 +3368,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "moe_routed_combine_sm121",
             },
         ))
@@ -3254,6 +3417,7 @@ impl Cuda {
                 Module(module),
                 Kernel {
                     function,
+                    shared_bytes: 0,
                     name: symbol,
                 },
             ))
@@ -3297,6 +3461,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "b12x_mxfp8_dense_warp_sm121",
             },
         ))
@@ -3313,6 +3478,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "rope_rotate_bf16",
             },
         ))
@@ -3325,6 +3491,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "kv_norm_rope_bf16",
             },
         ))
@@ -3341,6 +3508,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "ref_select_sm121",
             },
         ))
@@ -3353,6 +3521,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "kv_append_bf16",
             },
         ))
@@ -3365,6 +3534,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "window_quant_fp8_bf16",
             },
         ))
@@ -3381,6 +3551,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "engram_write_bf16",
             },
         ))
@@ -3397,6 +3568,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "pool_group_f32",
             },
         ))
@@ -3409,6 +3581,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "k_norm_f32_to_bf16",
             },
         ))
@@ -3421,6 +3594,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "fp4_round_trip_bf16_to_f32",
             },
         ))
@@ -3433,6 +3607,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "scale_index_weights_bf16_to_f32",
             },
         ))
@@ -3445,6 +3620,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "hc_pre_collapse_bf16",
             },
         ))
@@ -3461,6 +3637,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "compressed_append_sm121",
             },
         ))
@@ -3473,6 +3650,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "compressed_selected_fill_sm121",
             },
         ))
@@ -3489,6 +3667,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "engram_narrow_bf16",
             },
         ))
@@ -3505,6 +3684,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "engram_widen_f32",
             },
         ))
@@ -3521,6 +3701,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "b12x_mxfp8_dense_m1_sm121",
             },
         ))
@@ -3561,6 +3742,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: symbol,
             },
         ))
@@ -3573,6 +3755,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "b12x_mxfp8_dense_tile_sm121",
             },
         ))
@@ -3585,6 +3768,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "b12x_mxfp8_dense_par_k_sm121",
             },
         ))
@@ -3601,11 +3785,13 @@ impl Cuda {
             Module(mm),
             Kernel {
                 function: mf,
+                shared_bytes: 0,
                 name: "mega_mhc_fused_bf16_batched_sm121",
             },
             Module(im),
             Kernel {
                 function: init,
+                shared_bytes: 0,
                 name: "mega_mhc_init_sm121",
             },
         ))
@@ -3618,6 +3804,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "lm_head_reduce_batched_sm121",
             },
         ))
@@ -3634,11 +3821,13 @@ impl Cuda {
             Module(pm),
             Kernel {
                 function: pf,
+                shared_bytes: 0,
                 name: "b12x_mxfp8_dense_split_k_sm121",
             },
             Module(cm),
             Kernel {
                 function: cf,
+                shared_bytes: 0,
                 name: "b12x_mxfp8_dense_split_k_combine_sm121",
             },
         ))
@@ -3651,6 +3840,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "flash_mla_csa2_ring_sm121",
             },
         ))
@@ -3666,6 +3856,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "flash_mla_csa2_seq_batched_sm121",
             },
         ))
@@ -3678,6 +3869,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "b12x_mxfp8_wo_a_warp_sm121",
             },
         ))
@@ -3690,6 +3882,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "b12x_mxfp8_wo_a_tile_sm121",
             },
         ))
@@ -3702,6 +3895,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: "b12x_mxfp8_wo_a_batched_sm121",
             },
         ))
@@ -3714,6 +3908,7 @@ impl Cuda {
             Module(module),
             Kernel {
                 function,
+                shared_bytes: 0,
                 name: FLASH_MLA_CUBIN,
             },
         ))
@@ -3791,10 +3986,24 @@ impl Cuda {
         if mode != GRAPH_DIRECT {
             return self.graph_segment_launch(mode, kernel, grid, block, args);
         }
+        self.launch_kernel(std::ptr::null_mut(), kernel, grid, block, args)
+            .map_err(|r| format!("cuLaunchKernel failed: {r}"))
+    }
+
+    /// Queues one launch on `stream`, with programmatic stream serialization when the kernel
+    /// opens with the dependency wait ([programmatic]). The driver's code on failure.
+    fn launch_kernel(
+        &self,
+        stream: CuStream,
+        kernel: Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        args: &[u64],
+    ) -> Result<(), String> {
         let mut storage: Vec<[u64; 1]> = args.iter().map(|a| [*a]).collect();
         let mut ptrs: Vec<*mut c_void> =
             storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
-        if kernel.name.starts_with("opt_") && pdl_enabled() {
+        let r = if programmatic(&kernel) {
             let launch_ex: libloading::Symbol<LaunchExFn> = self.sym(b"cuLaunchKernelEx")?;
             let mut attribute = CuLaunchAttribute {
                 id: CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION,
@@ -3809,48 +4018,262 @@ impl Cuda {
                 block_x: block.0,
                 block_y: block.1,
                 block_z: block.2,
-                shared_bytes: 0,
-                stream: std::ptr::null_mut(),
+                shared_bytes: kernel.shared_bytes,
+                stream,
                 attrs: &mut attribute,
                 num_attrs: 1,
             };
             // SAFETY: as below; the config and its one attribute outlive the call.
-            let r = unsafe {
+            unsafe {
                 launch_ex(
                     &config,
                     kernel.function,
                     ptrs.as_mut_ptr(),
                     std::ptr::null_mut(),
                 )
-            };
-            if r != 0 {
-                return Err(format!("cuLaunchKernelEx failed: {r}"));
             }
-            self.issued.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+        } else {
+            let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
+            // SAFETY: the symbol comes from this context's library, every argument is a u64 or a
+            // pointer to one that outlives the call, the kernel handle is crate-owned and the
+            // stream belongs to this context.
+            unsafe {
+                launch(
+                    kernel.function,
+                    grid.0,
+                    grid.1,
+                    grid.2,
+                    block.0,
+                    block.1,
+                    block.2,
+                    kernel.shared_bytes,
+                    stream,
+                    ptrs.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            }
+        };
+        if r != 0 {
+            return Err(r.to_string());
         }
-        let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
-        // SAFETY: the symbol comes from this context's library, every argument is a u64 or a
-        // pointer to one that outlives the call, and the kernel handle is crate-owned.
+        self.issued.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Creates a [RunStream]: one non-blocking stream for one serving session.
+    ///
+    /// # Errors
+    /// The driver's cuStreamCreate failure code.
+    pub fn run_stream(&self) -> Result<RunStream, String> {
+        let create: libloading::Symbol<unsafe extern "C" fn(*mut CuStream, u32) -> CuResult> =
+            self.sym(b"cuStreamCreate")?;
+        let mut stream: CuStream = std::ptr::null_mut();
+        // SAFETY: the symbol belongs to this context's library and the out-pointer is valid for the
+        // call; the flag is the documented non-blocking stream flag.
+        let r = unsafe { create(&mut stream, CU_STREAM_NON_BLOCKING) };
+        if r != 0 {
+            return Err(format!("cuStreamCreate for the run stream failed: {r}"));
+        }
+        Ok(RunStream { stream })
+    }
+
+    /// Destroys a stream created by [Self::run_stream].
+    ///
+    /// The caller must have synchronized it first. The destruction is best-effort because the
+    /// context teardown releases any stream that remains.
+    pub fn destroy_run_stream(&self, stream: &RunStream) {
+        let destroy: libloading::Symbol<unsafe extern "C" fn(CuStream) -> CuResult> =
+            match self.sym(b"cuStreamDestroy_v2") {
+                Ok(symbol) => symbol,
+                Err(_) => return,
+            };
+        // SAFETY: the handle came from this context's cuStreamCreate and is consumed here.
+        unsafe {
+            let _ = destroy(stream.stream);
+        }
+    }
+
+    /// Launches a kernel on a session's stream.
+    ///
+    /// # Errors
+    /// The driver's cuLaunchKernel failure code.
+    pub fn launch_on(
+        &self,
+        stream: &RunStream,
+        kernel: Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        args: &[u64],
+    ) -> Result<(), String> {
+        self.launch_kernel(stream.stream, kernel, grid, block, args)
+            .map_err(|r| format!("cuLaunchKernel on the run stream failed: {r}"))
+    }
+
+    /// Copies host bytes to a device allocation on a session's stream and waits for the copy.
+    ///
+    /// # Errors
+    /// The driver's cuMemcpyHtoDAsync or cuStreamSynchronize failure code.
+    pub fn copy_htod_on(
+        &self,
+        stream: &RunStream,
+        dst: &Deviceptr,
+        src: &[u8],
+    ) -> Result<(), String> {
+        let copy: libloading::Symbol<
+            unsafe extern "C" fn(CuDeviceptr, *const c_void, usize, CuStream) -> CuResult,
+        > = self.sym(b"cuMemcpyHtoDAsync_v2")?;
+        // SAFETY: both pointers are live for the call and the stream belongs to this context.
+        let r = unsafe { copy(dst.0, src.as_ptr().cast(), src.len(), stream.stream) };
+        if r != 0 {
+            return Err(format!("cuMemcpyHtoDAsync failed: {r}"));
+        }
+        self.synchronize_stream(stream)
+    }
+
+    /// Queues a copy out of a pinned host slab on a session's stream without waiting.
+    ///
+    /// # Errors
+    /// A range outside the slab, or the driver's cuMemcpyHtoDAsync failure code.
+    pub fn copy_htod_async_on(
+        &self,
+        stream: &RunStream,
+        dst: &Deviceptr,
+        src: &HostMapped,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(), String> {
+        if offset.checked_add(bytes).is_none_or(|end| end > src.len) {
+            return Err(format!(
+                "copy_htod_async_on: {offset}+{bytes} is outside the {}-byte slab",
+                src.len
+            ));
+        }
+        let copy: libloading::Symbol<
+            unsafe extern "C" fn(CuDeviceptr, *const c_void, usize, CuStream) -> CuResult,
+        > = self.sym(b"cuMemcpyHtoDAsync_v2")?;
+        // SAFETY: the source range is inside the page-locked slab (checked), the destination is a
+        // device address this process owns, and the stream belongs to this context.
         let r = unsafe {
-            launch(
-                kernel.function,
-                grid.0,
-                grid.1,
-                grid.2,
-                block.0,
-                block.1,
-                block.2,
-                0,
-                std::ptr::null_mut(),
-                ptrs.as_mut_ptr(),
-                std::ptr::null_mut(),
+            copy(
+                dst.0,
+                src.host.cast::<u8>().add(offset).cast(),
+                bytes,
+                stream.stream,
             )
         };
         if r != 0 {
-            return Err(format!("cuLaunchKernel failed: {r}"));
+            return Err(format!("cuMemcpyHtoDAsync failed: {r}"));
         }
         self.issued.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Copies device bytes to host memory on a session's stream and waits for the copy.
+    ///
+    /// # Errors
+    /// The driver's cuMemcpyDtoHAsync or cuStreamSynchronize failure code.
+    pub fn copy_dtoh_on(
+        &self,
+        stream: &RunStream,
+        dst: &mut [u8],
+        src: &Deviceptr,
+    ) -> Result<(), String> {
+        // SAFETY: the destination is live and writable for the call.
+        unsafe { self.dtoh_on(stream, dst.as_mut_ptr(), dst.len(), src) }
+    }
+
+    /// Copies `bytes` device bytes into a host-mapped slab at `offset` on a session's stream and
+    /// waits for the copy. The slab is page-locked, so the copy is one DMA with no staging and no
+    /// host allocation.
+    ///
+    /// # Errors
+    /// When the range is outside the slab, or the driver's cuMemcpyDtoHAsync or
+    /// cuStreamSynchronize failure code.
+    pub fn copy_dtoh_mapped_on(
+        &self,
+        stream: &RunStream,
+        dst: &HostMapped,
+        offset: usize,
+        src: &Deviceptr,
+        bytes: usize,
+    ) -> Result<(), String> {
+        if offset.checked_add(bytes).is_none_or(|end| end > dst.len) {
+            return Err(format!(
+                "copy_dtoh_mapped_on: {offset}+{bytes} is outside the {}-byte slab",
+                dst.len
+            ));
+        }
+        // SAFETY: the destination range is inside the page-locked slab (checked).
+        unsafe { self.dtoh_on(stream, dst.host.cast::<u8>().add(offset), bytes, src) }
+    }
+
+    /// [Self::copy_dtoh_on] into `len` bytes at `dst`.
+    ///
+    /// # Safety
+    /// `dst..dst + len` is host memory writable for the call.
+    unsafe fn dtoh_on(
+        &self,
+        stream: &RunStream,
+        dst: *mut u8,
+        len: usize,
+        src: &Deviceptr,
+    ) -> Result<(), String> {
+        let copy: libloading::Symbol<
+            unsafe extern "C" fn(*mut c_void, CuDeviceptr, usize, CuStream) -> CuResult,
+        > = self.sym(b"cuMemcpyDtoHAsync_v2")?;
+        // SAFETY: the caller keeps the destination live and the stream belongs to this context.
+        let r = unsafe { copy(dst.cast(), src.0, len, stream.stream) };
+        if r != 0 {
+            return Err(format!("cuMemcpyDtoHAsync failed: {r}"));
+        }
+        self.synchronize_stream(stream)?;
+        self.completed
+            .store(self.issued.load(Ordering::Relaxed), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Blocks until everything queued on a session's stream has run.
+    ///
+    /// # Errors
+    /// The driver's cuStreamSynchronize failure code.
+    pub fn synchronize_stream(&self, stream: &RunStream) -> Result<(), String> {
+        let sync: libloading::Symbol<unsafe extern "C" fn(CuStream) -> CuResult> =
+            self.sym(b"cuStreamSynchronize")?;
+        // SAFETY: the stream belongs to this context.
+        let r = unsafe { sync(stream.stream) };
+        if r != 0 {
+            return Err(format!("cuStreamSynchronize failed: {r}"));
+        }
+        Ok(())
+    }
+
+    /// Destroys an event created by [Self::stream_event].
+    ///
+    /// The caller must have waited on it first. Best-effort, like [Self::destroy_run_stream].
+    pub fn destroy_event(&self, event: &StreamEvent) {
+        let destroy: libloading::Symbol<unsafe extern "C" fn(CuEvent) -> CuResult> =
+            match self.sym(b"cuEventDestroy_v2") {
+                Ok(symbol) => symbol,
+                Err(_) => return,
+            };
+        // SAFETY: the handle came from this context's cuEventCreate and is consumed here.
+        unsafe {
+            let _ = destroy(event.0);
+        }
+    }
+
+    /// Records `event` after everything queued on a session's stream so far.
+    ///
+    /// # Errors
+    /// The driver's cuEventRecord failure code.
+    pub fn record_event_on(&self, stream: &RunStream, event: &StreamEvent) -> Result<(), String> {
+        let record: libloading::Symbol<unsafe extern "C" fn(CuEvent, CuStream) -> CuResult> =
+            self.sym(b"cuEventRecord")?;
+        // SAFETY: the event and stream belong to this context.
+        let r = unsafe { record(event.0, stream.stream) };
+        if r != 0 {
+            return Err(format!("cuEventRecord on the run stream failed: {r}"));
+        }
         Ok(())
     }
 
@@ -3877,6 +4300,20 @@ impl Cuda {
             return Err(format!("cuEventCreate for the side stream failed: {r}"));
         }
         Ok(SideStream { stream, event })
+    }
+
+    /// Waits for the work queued on a stream created by [Self::side_stream], then destroys it and
+    /// its event, so nothing it reads is freed under it.
+    ///
+    /// The destruction is best-effort because the context teardown releases any stream that
+    /// remains.
+    pub fn destroy_side_stream(&self, side: &SideStream) {
+        let stream = RunStream {
+            stream: side.stream,
+        };
+        let _ = self.synchronize_stream(&stream);
+        self.destroy_event(&StreamEvent(side.event));
+        self.destroy_run_stream(&stream);
     }
 
     /// [Self::side_stream] at the context's greatest stream priority: when SMs free up, its
@@ -3975,6 +4412,47 @@ impl Cuda {
         Ok(())
     }
 
+    /// Records `event` on the run's stream after everything queued there so far, for
+    /// [Self::host_wait]: the reuse fence of a host staging buffer, which waits for the copy that
+    /// read the buffer rather than for the whole queue as [Self::synchronize] does.
+    ///
+    /// # Errors
+    /// Inside a graph segment, or the driver's cuEventRecord failure code.
+    pub fn run_mark(&self, event: &StreamEvent) -> Result<(), String> {
+        if self.graph_mode.load(Ordering::Relaxed) != GRAPH_DIRECT {
+            return Err("run_mark: a graph segment is active".to_owned());
+        }
+        let record: libloading::Symbol<unsafe extern "C" fn(CuEvent, CuStream) -> CuResult> =
+            self.sym(b"cuEventRecord")?;
+        // SAFETY: the symbol comes from this context's library; the event is live and the null
+        // stream is the run's stream.
+        let r = unsafe { record(event.0, std::ptr::null_mut()) };
+        if r != 0 {
+            return Err(format!("cuEventRecord on the run's stream failed: {r}"));
+        }
+        Ok(())
+    }
+
+    /// Blocks the host until the work queued before `event`'s last record has completed; an
+    /// event never recorded is complete.
+    ///
+    /// # Errors
+    /// Inside a graph segment, or the driver's cuEventSynchronize failure code.
+    pub fn host_wait(&self, event: &StreamEvent) -> Result<(), String> {
+        if let Some(refusal) = self.graph_refusal(SegmentOp::Synchronize) {
+            return Err(refusal.to_string());
+        }
+        let wait: libloading::Symbol<unsafe extern "C" fn(CuEvent) -> CuResult> =
+            self.sym(b"cuEventSynchronize")?;
+        // SAFETY: the symbol comes from this context's library and the event is live; the call
+        // only blocks the calling thread.
+        let r = unsafe { wait(event.0) };
+        if r != 0 {
+            return Err(format!("cuEventSynchronize failed: {r}"));
+        }
+        Ok(())
+    }
+
     /// Makes the run's stream wait for `event`'s last record before anything queued after this.
     ///
     /// # Errors
@@ -3994,6 +4472,24 @@ impl Cuda {
         Ok(())
     }
 
+    /// Makes `stream` wait for `event`'s last record before anything queued after this.
+    ///
+    /// A batch of sessions runs on one stream that is not the members' own, so it orders itself
+    /// behind a member's earlier work with an event rather than a host synchronise.
+    ///
+    /// # Errors
+    /// The driver's cuStreamWaitEvent failure code.
+    pub fn stream_wait_event(&self, stream: &RunStream, event: &StreamEvent) -> Result<(), String> {
+        let wait: libloading::Symbol<unsafe extern "C" fn(CuStream, CuEvent, u32) -> CuResult> =
+            self.sym(b"cuStreamWaitEvent")?;
+        // SAFETY: the symbol comes from this context's library, the event is live and the stream
+        // belongs to this context.
+        let r = unsafe { wait(stream.stream, event.0, 0) };
+        if r != 0 {
+            return Err(format!("cuStreamWaitEvent on a session stream failed: {r}"));
+        }
+        Ok(())
+    }
     /// Launches `kernel` on `side` after everything already queued on the run's stream, without
     /// the run's stream waiting for it, so the kernel must only read what no later launch writes.
     /// Outside direct launches (a graph capture or record) it launches nothing: side work is a
@@ -4012,6 +4508,36 @@ impl Cuda {
         if self.graph_mode.load(Ordering::Relaxed) != GRAPH_DIRECT {
             return Ok(());
         }
+        self.side_launch_after(std::ptr::null_mut(), side, kernel, grid, block, args)
+    }
+
+    /// [Self::side_launch] after everything already queued on a session's stream rather than on
+    /// the run's.
+    ///
+    /// # Errors
+    /// The driver's cuEventRecord, cuStreamWaitEvent or cuLaunchKernel failure code.
+    pub fn side_launch_on(
+        &self,
+        stream: &RunStream,
+        side: &SideStream,
+        kernel: Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        args: &[u64],
+    ) -> Result<(), String> {
+        self.side_launch_after(stream.stream, side, kernel, grid, block, args)
+    }
+
+    /// Orders `side` after the work queued on `after` so far and launches `kernel` on it.
+    fn side_launch_after(
+        &self,
+        after: CuStream,
+        side: &SideStream,
+        kernel: Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        args: &[u64],
+    ) -> Result<(), String> {
         let record: libloading::Symbol<unsafe extern "C" fn(CuEvent, CuStream) -> CuResult> =
             self.sym(b"cuEventRecord")?;
         let wait: libloading::Symbol<unsafe extern "C" fn(CuStream, CuEvent, u32) -> CuResult> =
@@ -4021,9 +4547,10 @@ impl Cuda {
         let mut ptrs: Vec<*mut c_void> =
             storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
         // SAFETY: the symbols come from this context's library, the event and stream belong to
-        // `side`, and every kernel argument is a u64 or a pointer to one that outlives the call.
+        // `side`, `after` is a stream of this context, and every kernel argument is a u64 or a
+        // pointer to one that outlives the call.
         unsafe {
-            let r = record(side.event, std::ptr::null_mut());
+            let r = record(side.event, after);
             if r != 0 {
                 return Err(format!("cuEventRecord for the side stream failed: {r}"));
             }
@@ -4039,7 +4566,7 @@ impl Cuda {
                 block.0,
                 block.1,
                 block.2,
-                0,
+                kernel.shared_bytes,
                 side.stream,
                 ptrs.as_mut_ptr(),
                 std::ptr::null_mut(),
@@ -4126,7 +4653,7 @@ impl Cuda {
                 block.0,
                 block.1,
                 block.2,
-                0,
+                kernel.shared_bytes,
                 std::ptr::null_mut(),
                 ptrs.as_mut_ptr(),
                 std::ptr::null_mut(),
@@ -4237,7 +4764,7 @@ impl Cuda {
                 block.0,
                 block.1,
                 block.2,
-                0,
+                kernel.shared_bytes,
                 std::ptr::null_mut(),
                 ptrs.as_mut_ptr(),
                 std::ptr::null_mut(),
@@ -4966,6 +5493,7 @@ mod graph_tests {
         // argument word is a changed record: a moved pooled buffer or a different weight slice
         // must never be replayed against a graph captured for the old address.
         let base = CudaLaunchRecord {
+            shared_bytes: 0,
             function: 0x1000,
             grid: (1, 1, 1),
             block: (2, 1, 1),

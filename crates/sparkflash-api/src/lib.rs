@@ -28,6 +28,7 @@ pub mod loop_abort;
 pub mod metrics;
 pub mod multimodal;
 pub mod prompt;
+pub mod qwen;
 pub mod reasoning;
 pub mod schema;
 pub mod server;

@@ -188,7 +188,8 @@ Unsupported configurations:
 - Design and performance records: `docs/design.md`, `docs/performance.md`,
   `docs/DECISIONS.md`
 - Serving and the HTTP surface: `docs/serving.md`
-- Adding a second model: `docs/multi-model-plan.md`
+- Adding a second model: D60 in `docs/DECISIONS.md`, and the pack in
+  `crates/sparkflash-model-glm5-next`
 - Kernel conventions and the compiled baseline: `crates/sparkflash-kernels/`
 
 If something in this guide is wrong or a gate cannot be run on the hardware you have, say so in the

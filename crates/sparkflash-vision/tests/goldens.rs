@@ -15,11 +15,14 @@
 //! The fixtures from `tests/fixtures/generate.py`: canvases the reference `load_image` built with
 //! Pillow, and small files of each format with what they must decode to.
 
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use sparkflash_vision::prep::pad;
-use sparkflash_vision::{DecodeLimits, Geometry, Grid, RgbImage, decode, plan_grid};
+use sparkflash_vision::{
+    AlphaPolicy, DecodeLimits, Geometry, Grid, RgbImage, decode, decode_with_alpha, plan_grid,
+};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -125,6 +128,33 @@ fn files_decode_to_the_recipe_pixels() {
             kind => panic!("{name}: unknown kind {kind}"),
         }
     }
+}
+
+#[test]
+fn dropping_alpha_keeps_the_colour_samples() {
+    let bytes = std::fs::read(fixtures().join("decode/rgba8.png")).unwrap();
+    let dropped = decode_with_alpha(&bytes, &DecodeLimits::RECIPE, AlphaPolicy::Drop).unwrap();
+    let blended = decode(&bytes, &DecodeLimits::RECIPE).unwrap();
+    assert_eq!((dropped.width, dropped.height), (29, 31));
+    assert_ne!(
+        dropped.data, blended.data,
+        "the two policies must differ here"
+    );
+
+    // Read the source RGBA so the assertion is against the file, not against another decode.
+    let decoder = png::Decoder::new(Cursor::new(&bytes));
+    let mut reader = decoder.read_info().unwrap();
+    let mut rgba = vec![0; reader.output_buffer_size().expect("the frame fits")];
+    let info = reader.next_frame(&mut rgba).unwrap();
+    assert_eq!(info.color_type, png::ColorType::Rgba);
+    let pixel = (0..dropped.width * dropped.height)
+        .find(|index| rgba[index * 4 + 3] < 255)
+        .expect("the fixture has a transparent pixel");
+    assert_eq!(
+        &dropped.data[pixel * 3..pixel * 3 + 3],
+        &rgba[pixel * 4..pixel * 4 + 3],
+        "Pillow's convert(\"RGB\") keeps the colour under alpha"
+    );
 }
 
 #[test]

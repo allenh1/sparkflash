@@ -98,7 +98,8 @@ print_address() {
     printf '    http://%s.local:%s\n' "$(hostname)" "$WEB_PORT"
     [ -z "$lan" ] || printf '    http://%s:%s   (if the name does not open)\n' "$lan" "$WEB_PORT"
     echo
-    echo "  The Setup page walks through the rest: the fast network, the model download, and the start."
+    echo "  The Setup page walks through the rest. For Qwen on this Spark alone, choose"
+    echo "  'Run on this Spark only' in step 1 and skip the network and other Sparks."
 }
 
 # 1. This machine.
@@ -159,6 +160,7 @@ step "4/5  Letting this Spark sign in to the other three"
 if [ "$DO_SSH" = 0 ] || ! interactive; then
     note "Skipped. The console's first step shows the command for any Spark it cannot sign in to."
 else
+    note "Running Qwen on this Spark only? Press Enter at the next prompt; no other Sparks are needed."
     if [ ! -f "$HOME/.ssh/id_ed25519" ]; then
         mkdir -p -m 700 "$HOME/.ssh"
         ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"

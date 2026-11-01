@@ -14,9 +14,17 @@
 
 //! The generic host driver.
 //!
-//! The driver owns one backend and one sequence at a time on a dedicated thread. Requests arrive
-//! through a bounded channel and their events leave through a bounded reply channel, so a client
-//! that stops reading applies backpressure to the engine rather than growing an unbounded buffer.
+//! The driver owns one backend and opens one sequence per request. Requests arrive through a
+//! bounded channel and their events leave through a bounded reply channel, so a client that stops
+//! reading applies backpressure to the engine rather than growing an unbounded buffer.
+//!
+//! `HostOptions::concurrency` chooses how many requests execute at once. Each worker owns one
+//! session at a time, so concurrency N means N independent sequences progressing in parallel; it
+//! is not a fused batch and does not change the arithmetic of any one sequence. The default is 1,
+//! which preserves the serial one-job-at-a-time behavior. A value above 1 is for backends whose
+//! sessions are independent; a backend whose sessions share mutable engine state must serialize
+//! that state itself (the Qwen device arm gives each session its own stream, so their kernels can
+//! overlap). A backend that only supports one live session must stay at 1.
 //!
 //! This adapter is intentionally smaller than the V4.1 reference driver. It supports text
 //! requests, stop strings, sample logprobs and the standard usage/timing envelope. Prompt
@@ -25,8 +33,10 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::{Receiver, Sender, bounded};
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use sparkflash_api::Metrics;
@@ -40,7 +50,7 @@ use sparkflash_api::telemetry_types::{
     PromptTokensDetails, RequestTimingStats, RoceTransportStats, finite_or_zero,
 };
 use sparkflash_model::telemetry::PrefixMatchPlan;
-use sparkflash_model::{ModelBackend, ModelDescriptor, PromptCodec, Sampling};
+use sparkflash_model::{ModelBackend, ModelDescriptor, PromptCodec, Sampling, Speculation};
 use tokio::sync::mpsc;
 
 /// The default engine queue depth.
@@ -70,6 +80,12 @@ pub struct HostOptions {
     pub queue_capacity: usize,
     /// How many reply events may be buffered for one client.
     pub reply_buffer: usize,
+    /// How many requests execute at once. Each worker owns one session at a time.
+    ///
+    /// Defaults to 1, the serial path. A value above 1 is a concurrency choice, not a fused
+    /// batch: it opens that many independent sessions and lets the operating system interleave
+    /// their steps. A backend whose sessions share mutable state must keep this at 1.
+    pub concurrency: usize,
 }
 
 impl Default for HostOptions {
@@ -78,19 +94,23 @@ impl Default for HostOptions {
             max_tokens: DEFAULT_MAX_TOKENS,
             queue_capacity: DEFAULT_QUEUE,
             reply_buffer: DEFAULT_REPLY_BUFFER,
+            concurrency: 1,
         }
     }
 }
 
 /// The API engine implemented over a ModelBackend.
 ///
-/// The backend itself lives on the worker thread; this value only holds the descriptor, the
-/// queue and the shared metrics registry.
+/// The backend is shared by every worker thread behind an `Arc`; this value holds that Arc's
+/// sibling state (descriptor, queue and metrics), never a session. The backend's own contract
+/// decides whether its sessions may execute concurrently.
 pub struct HostDriver {
     model: String,
     descriptor: Arc<ModelDescriptor>,
     capabilities: Capabilities,
-    jobs: mpsc::Sender<Job>,
+    jobs: Sender<Job>,
+    /// Set once every worker has exited; a later request is refused instead of queued forever.
+    closed: Arc<AtomicBool>,
     max_tokens: usize,
     reply_buffer: usize,
     metrics: Arc<Metrics>,
@@ -110,35 +130,79 @@ impl HostDriver {
         if options.max_tokens == 0 {
             return Err("the host engine needs a non-zero generation cap".to_owned());
         }
+        if options.concurrency == 0 {
+            return Err("the host engine needs at least one worker".to_owned());
+        }
         let descriptor = Arc::new(backend.descriptor().clone());
         let capabilities = backend.capabilities();
-        let (jobs, queued) = mpsc::channel(options.queue_capacity.max(1));
+        let (jobs, queued) = bounded(options.queue_capacity.max(1));
         let (ready, reported) = std::sync::mpsc::channel();
         let metrics = Arc::new(Metrics::new());
-        let thread_metrics = Arc::clone(&metrics);
-        std::thread::Builder::new()
-            .name("sparkflash-host-engine".to_owned())
-            .spawn(move || {
-                host_thread(backend, codec, queued, ready, thread_metrics);
-            })
-            .map_err(|error| format!("cannot start the host engine thread: {error}"))?;
-        match reported.recv() {
-            Ok(Ok(())) => {
-                let cluster = cluster_snapshot(&descriptor);
-                Ok(Self {
-                    model: descriptor.id.clone(),
-                    descriptor,
-                    capabilities,
-                    jobs,
-                    max_tokens: options.max_tokens,
-                    reply_buffer: options.reply_buffer.max(1),
-                    metrics,
-                    cluster,
+        let backend: Arc<dyn ModelBackend> = Arc::from(backend);
+        let mut handles = Vec::with_capacity(options.concurrency);
+        for worker in 0..options.concurrency {
+            let backend = Arc::clone(&backend);
+            let codec = Arc::clone(&codec);
+            let queued = queued.clone();
+            let ready = ready.clone();
+            let thread_metrics = Arc::clone(&metrics);
+            let handle = std::thread::Builder::new()
+                .name(format!("sparkflash-host-engine-{worker}"))
+                .spawn(move || {
+                    host_thread(backend, codec, queued, ready, thread_metrics);
                 })
-            }
-            Ok(Err(message)) => Err(message),
-            Err(_) => Err("the host engine thread stopped before it reported ready".to_owned()),
+                .map_err(|error| format!("cannot start host engine worker {worker}: {error}"))?;
+            handles.push(handle);
         }
+        drop(ready);
+        let mut failures = Vec::new();
+        for _ in 0..options.concurrency {
+            match reported.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => failures.push(message),
+                Err(_) => failures
+                    .push("a host engine worker stopped before it reported ready".to_owned()),
+            }
+        }
+        if let Some(message) = failures.into_iter().next() {
+            drop(jobs);
+            for handle in handles {
+                let _ = handle.join();
+            }
+            return Err(message);
+        }
+        let closed = Arc::new(AtomicBool::new(false));
+        let monitor_closed = Arc::clone(&closed);
+        let monitor_queue = queued.clone();
+        std::thread::Builder::new()
+            .name("sparkflash-host-monitor".to_owned())
+            .spawn(move || {
+                for handle in handles {
+                    let _ = handle.join();
+                }
+                monitor_closed.store(true, Ordering::SeqCst);
+                // Every worker is gone. Refuse the jobs that never ran rather than leaving their
+                // clients waiting for a reply the engine can no longer produce.
+                while let Ok(job) = monitor_queue.try_recv() {
+                    let _ = job.replies.blocking_send(Reply::Failed(
+                        "the host engine worker stopped before this request finished".to_owned(),
+                    ));
+                }
+            })
+            .map_err(|error| format!("cannot start the host engine monitor: {error}"))?;
+        drop(queued);
+        let cluster = cluster_snapshot(&descriptor);
+        Ok(Self {
+            model: descriptor.id.clone(),
+            descriptor,
+            capabilities,
+            jobs,
+            closed,
+            max_tokens: options.max_tokens,
+            reply_buffer: options.reply_buffer.max(1),
+            metrics,
+            cluster,
+        })
     }
 
     /// The exporter this driver feeds.
@@ -160,9 +224,25 @@ impl InferenceEngine for HostDriver {
     }
 
     fn generate(&self, request: EngineRequest) -> BoxStream<'static, EngineEvent> {
+        if self.closed.load(Ordering::SeqCst) {
+            return refused(
+                "the host engine stopped; no worker is left to run this request",
+                ENGINE_GONE_CODE,
+            );
+        }
         if !request.images.is_empty() {
             let missing = MissingCapability::vision();
             return refused(&missing.to_string(), missing.code());
+        }
+        // The API prepares images into `vision` only for an engine that advertises vision. The
+        // generic host driver has no way to write those rows over the placeholder embeddings yet,
+        // and prefill would otherwise read the placeholders as ordinary text. Refuse rather than
+        // answer from a prompt whose images were silently dropped.
+        if !request.vision.is_empty() {
+            return refused(
+                "the generic host driver cannot prefill prepared images yet; use the V4.1 device arm or a text-only request",
+                REFUSED_CODE,
+            );
         }
         if request.prompt_tokens.is_empty() {
             return refused(
@@ -198,6 +278,15 @@ impl InferenceEngine for HostDriver {
             return refused(
                 "the host engine queue is full; retry when the requests in flight have finished",
                 REFUSED_CODE,
+            );
+        }
+        // A worker may have died between the check above and the send. The monitor fails the job
+        // if it saw it; the client still gets a definite error instead of waiting forever.
+        if self.closed.load(Ordering::SeqCst) {
+            self.metrics.request_enqueue_refused();
+            return refused(
+                "the host engine stopped while this request was being queued",
+                ENGINE_GONE_CODE,
             );
         }
         let head = stream::once(async move {
@@ -294,6 +383,7 @@ struct HostSummary {
     completion_tokens: usize,
     finish_reason: FinishReason,
     timing: RequestTiming,
+    speculation: Speculation,
 }
 
 /// The wall-clock numbers one request measured.
@@ -329,16 +419,20 @@ fn rate(count: usize, seconds: f64) -> f64 {
 }
 
 fn host_thread(
-    backend: Box<dyn ModelBackend>,
+    backend: Arc<dyn ModelBackend>,
     codec: Arc<dyn PromptCodec>,
-    mut jobs: mpsc::Receiver<Job>,
+    jobs: Receiver<Job>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
     metrics: Arc<Metrics>,
 ) {
     if ready.send(Ok(())).is_err() {
         return;
     }
-    while let Some(job) = jobs.blocking_recv() {
+    // Do not keep the readiness sender alive for the worker's lifetime: `start` waits for one
+    // report per worker, and a clone held by a worker that later hangs would keep the channel
+    // open after the reports it needs have already arrived.
+    drop(ready);
+    while let Ok(job) = jobs.recv() {
         metrics.request_admitted();
         let replies = job.replies.clone();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -462,6 +556,7 @@ fn run_request(
             completion_tokens,
             finish_reason,
             timing,
+            speculation: session.speculation(),
         })))
         .map_err(|_| "the client stopped reading this response".to_owned())?;
     Ok(())
@@ -662,6 +757,7 @@ fn top_k(logprobs: &[f32], count: usize) -> Vec<usize> {
 
 fn finished_event(prompt_tokens: usize, summary: HostSummary) -> EngineEvent {
     let completion_tokens = summary.completion_tokens;
+    let speculation = summary.speculation;
     let stats = DeepSeekSparkRequestStats {
         kv_cache: PrefixMatchPlan {
             total_prompt_tokens: prompt_tokens,
@@ -670,12 +766,21 @@ fn finished_event(prompt_tokens: usize, summary: HostSummary) -> EngineEvent {
             nvme_restored_tokens: 0,
             swa_tail_hit: false,
             encoder_swa_replay_tokens: 0,
-            uncached_suffix_tokens: 0,
+            // The host path has no prefix cache: every prompt token is part of the uncached
+            // suffix. Reporting zero here made the extended stats look like a 100% hit while the
+            // OpenAI usage block correctly said zero cached tokens.
+            uncached_suffix_tokens: prompt_tokens,
             decoder_swa_replay_tokens: 0,
         },
         kv_cache_hit_rate: 0.0,
         engram_layers: default_engram_layers(),
-        dspark_speculative: DSparkStepStats::default(),
+        // The confidence gate is the V4.1 driver's; the generic host offers every draft it gets.
+        dspark_speculative: DSparkStepStats::from_counts(
+            speculation.verify_steps,
+            speculation.drafts_proposed,
+            0,
+            speculation.drafts_accepted,
+        ),
         transport: RoceTransportStats {
             fabric_mode: "none (host backend)".to_owned(),
             ..RoceTransportStats::default()

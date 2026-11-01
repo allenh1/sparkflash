@@ -189,6 +189,8 @@ test-workspace:
   stage: test
   script:
     - cargo test -p sparkflash-api -p sparkflash-comm -p sparkflash-engine -p sparkflash-model-deepseek-v41
+    - cargo test -p sparkflash-model-qwen4-exp
+    - cargo test -p sparkflash-model-glm5-next
     - cargo test -p sparkflash-kv -p sparkflash-engram -p sparkflash-scheduler -p sparkflash-device -p sparkflash-web
     - cargo test -p sparkflash-weights -p sparkflash-trace
     # The trace crate's no-default-features build is a different configuration of the same tests,

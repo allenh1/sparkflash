@@ -378,7 +378,8 @@ impl InferenceEngine {
     ) -> Result<Self, EngineError> {
         config.validate()?;
         let plan = TensorPlan::language_model(&config);
-        let runtime = crate::parallel_tp::TpRuntime::new(tp, config.moe_inter_dim, collective)?;
+        tp.local_width("moe_inter_dim", config.moe_inter_dim)?;
+        let runtime = crate::parallel_tp::TpRuntime::new(tp, collective)?;
         let resident = crate::parallel_tp::ResidentSource::load(source, &plan)?;
         Ok(Self {
             config,
@@ -1933,7 +1934,7 @@ impl InferenceEngine {
                 self.limit,
                 &mut scratch.moe,
                 &mut scratch.ffn_out,
-                tp.local_moe_inter(),
+                tp.local_width("moe_inter_dim", config.moe_inter_dim)?,
             )?;
             tp.all_reduce(&mut scratch.ffn_out)?;
             moe::add_shared_expert(

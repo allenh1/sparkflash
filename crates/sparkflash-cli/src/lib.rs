@@ -29,6 +29,7 @@ pub mod device_counters;
 pub mod device_link;
 pub mod doctor;
 pub mod engram_device_state;
+pub mod glm_tp4;
 pub mod layer_attention_stages;
 pub mod layer_device;
 pub mod logits_dump;

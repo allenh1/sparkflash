@@ -80,7 +80,7 @@ pub fn convert_command(config: &SparkConfig, rank: usize) -> CommandSpec {
         "--output-dir".to_owned(),
         output_dir.display().to_string(),
         "--tp-world-size".to_owned(),
-        "4".to_owned(),
+        config.world_size().to_string(),
         "--tp-rank".to_owned(),
         rank_text,
         "--no-pad-moe-640".to_owned(),
@@ -156,11 +156,37 @@ impl ServeAction {
             Self::Status => "Check rank status",
         }
     }
+
+    /// The label a single-node launch uses instead of the cluster wording.
+    #[must_use]
+    pub const fn solo_label(self) -> &'static str {
+        match self {
+            Self::Launch => "Start server",
+            Self::Stop => "Stop server",
+            Self::Status => "Check server status",
+        }
+    }
 }
 
-/// The existing four-node launcher, driven with the TOML-derived environment.
+/// The launcher for this topology, driven with the TOML-derived environment.
+///
+/// A four-node V4.1 plan uses `scripts/serve-four-node.sh`; a single TP=1 pack uses the local
+/// launcher, which starts one detached `sparkflash serve --model …` process.
 #[must_use]
 pub fn serve_action_command(config: &SparkConfig, action: ServeAction) -> CommandSpec {
+    if config.is_solo() {
+        return CommandSpec {
+            program: "bash".to_owned(),
+            args: vec![
+                config.local_serve_script_path().display().to_string(),
+                action.as_str().to_owned(),
+            ],
+            env: config.local_launch_env(),
+            cwd: Some(config.repo_root()),
+            label: action.solo_label().to_owned(),
+            kind: action.as_str().to_owned(),
+        };
+    }
     CommandSpec {
         program: "bash".to_owned(),
         args: vec![
@@ -518,6 +544,32 @@ mod tests {
         assert_eq!(command.env["SPARKFLASH_LANES"], "4");
         assert_eq!(command.env["NCCL_IB_HCA"], "rocep1s0f1");
         assert_eq!(command.env["SSH_USER"], config.cluster.ssh_user);
+    }
+
+    #[test]
+    fn a_solo_qwen_launch_uses_the_local_script_and_no_ssh() {
+        let mut config = SparkConfig::default();
+        config.model.weights = crate::config::QWEN_WEIGHTS_ID.to_owned();
+        config.model.id = crate::config::QWEN_MODEL_ID.to_owned();
+        config.model.checkpoint = "/data/Qwen3.8-Flash-Next-NVFP4".to_owned();
+        config.model.cubins.clear();
+        config.engine.kind = crate::config::QWEN_ENGINE_ID.to_owned();
+        config.runtime.max_context_tokens = crate::config::QWEN_CONTEXT_TOKENS;
+        config.cluster.nodes = vec![crate::config::NodeConfig::new("this-spark.local", "", true)];
+        let command = serve_action_command(&config, ServeAction::Launch);
+        assert_eq!(command.program, "bash");
+        assert!(command.args[0].ends_with("scripts/serve-single-node.sh"));
+        assert_eq!(command.args[1], "launch");
+        assert_eq!(
+            command.env["SPARKFLASH_MODEL"],
+            crate::config::QWEN_WEIGHTS_ID
+        );
+        assert_eq!(
+            command.env["SPARKFLASH_CONTEXT"],
+            crate::config::QWEN_CONTEXT_TOKENS.to_string()
+        );
+        assert!(!command.args.iter().any(|arg| arg == "ssh"));
+        assert_eq!(command.label, "Start server");
     }
 
     #[test]

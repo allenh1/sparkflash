@@ -19,20 +19,28 @@
 //! it serves, what it can do) and the **registry** (which descriptors this build knows about).
 //! It owns no weights, no arithmetic, no HTTP types, and no CUDA.
 //!
+//! It also holds what several packs share at that boundary: the error their configuration parsers
+//! return ([config]) and the DFlash 2 drafter's configuration ([dflash2]), which more than one
+//! target drafts with.
+//!
 //! The first pack is DeepSeek-V4.1-Flash. The registry is compile-time and static for now; a
 //! second pack adds a descriptor here (or in a pack crate that registers at startup) without
 //! changing the server, the web control plane, or the CLI dispatcher.
 
 pub mod backend;
 pub mod capabilities;
+pub mod config;
 pub mod descriptor;
+pub mod dflash2;
 pub mod engine;
 pub mod prompt;
+pub mod speculation;
 pub mod telemetry;
 pub mod vision;
 
-pub use backend::{BackendError, ModelBackend, ModelSession, Sampling, StepOutput};
+pub use backend::{BackendError, ModelBackend, ModelSession, Sampling, Speculation, StepOutput};
 pub use capabilities::Capabilities;
+pub use config::ConfigError;
 pub use descriptor::{
     DEFAULT_MODEL_ID, DEFAULT_WEIGHTS_ID, MODELS, ModelDescriptor, V41_CONTEXT_TOKENS,
     V41_MAX_OUTPUT_TOKENS, V41_VOCAB_SIZE, WEIGHT_IDS, default_model, find_model,
@@ -40,6 +48,7 @@ pub use descriptor::{
 };
 pub use engine::{DEFAULT_ENGINE_KIND, ENGINE_NAMES, EngineKind, parse_engine_kind};
 pub use prompt::{PromptCodec, PromptError};
+pub use speculation::{DepthPolicy, StepCost};
 pub use vision::{
     ImageGrid, ImageSpan, PreparedImage, SpanRow, VisionCodec, VisionError, VisionOptions,
 };

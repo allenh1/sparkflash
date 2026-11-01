@@ -212,4 +212,17 @@ async fn the_toy_model_serves_a_chat_completion_through_the_router() {
     assert_eq!(body["choices"][0]["message"]["content"], RESPONSE);
     assert_eq!(body["choices"][0]["finish_reason"], "stop");
     assert_eq!(body["usage"]["completion_tokens"], RESPONSE.len());
+    // The toy host backend has no prefix cache, so the OpenAI block and the extended KV stats
+    // must agree: zero hits, and the whole prompt is the uncached suffix.
+    let prompt_tokens = body["usage"]["prompt_tokens"]
+        .as_u64()
+        .expect("prompt tokens");
+    assert_eq!(body["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+    assert_eq!(body["usage"]["prompt_cache_hit_tokens"], 0);
+    assert_eq!(body["usage"]["prompt_cache_miss_tokens"], prompt_tokens);
+    let kv = &body["x_deepseek_spark_stats"]["kv_cache"];
+    assert_eq!(kv["total_prompt_tokens"], prompt_tokens);
+    assert_eq!(kv["global_kv_cached_tokens"], 0);
+    assert_eq!(kv["uncached_suffix_tokens"], prompt_tokens);
+    assert_eq!(body["x_deepseek_spark_stats"]["kv_cache_hit_rate"], 0.0);
 }

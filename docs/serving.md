@@ -78,7 +78,7 @@ turns 200 when it accepts requests. If any rank dies, the others exit rather tha
 
 | Route | Notes |
 | :-- | :-- |
-| `POST /v1/chat/completions` | Streaming and buffered; tools and tool calls (DeepSeek V4.1 format, parsed into OpenAI `tool_calls`); `reasoning_effort` / thinking with the reasoning returned separately; images; `n`, `seed`, `stop`, `max_tokens`, `temperature`, `top_p`, `top_k`; `stream_options.include_usage` |
+| `POST /v1/chat/completions` | Streaming and buffered; tools and tool calls (DeepSeek V4.1 DSML, or Qwen3.8 `<tool_call>` XML, parsed into OpenAI `tool_calls`); `reasoning_effort` / thinking with the reasoning returned separately (`reasoning_content` for Qwen); images; `n`, `seed`, `stop`, `max_tokens`, `temperature`, `top_p`, `top_k`; `stream_options.include_usage` |
 | `POST /v1/completions` | Text or token-id prompts, streaming and buffered; a prompt carrying an image marker is refused (this route has no image part to fill it) |
 | `POST /v1/responses` | OpenAI Responses API: string, message, content-part (`input_text`, `input_image`), function-call and function-output input; instructions; reasoning items; Responses tools and tool calls as `function_call` items; buffered and SSE (`response.created` through `response.completed`) |
 | `POST /v1/messages` | Anthropic Messages API: system blocks, text/thinking/tool-use/tool-result/image blocks, a `system` role inside `messages` (folded into the system prompt), `thinking` `enabled`/`disabled`/`adaptive` with `output_config.effort`, Anthropic tools and tool calls as `tool_use` blocks; buffered and SSE (`message_start` through `message_stop`) |
@@ -129,8 +129,11 @@ step denominator behind tokens-per-verify-step (D61).
   placeholder spelling or the image token in pre-tokenized ids, or as a carrier key in the body. Both adapters render the same V4.1 chat template and tokenize it through the
   checkpoint tokenizer, so with that tokenizer attached the prompt ids are the checkpoint's real
   ids.
-- `logprobs` / `top_logprobs`, and repetition, presence and frequency penalties: refused with an
-  error rather than ignored.
+- `logprobs` / `top_logprobs`, and repetition, presence and frequency penalties, on the device path
+  (`--tp4-device`): refused with an error rather than ignored. The single-node reference engine
+  serves both, with vLLM's definitions: the repetition penalty covers the prompt and the generated
+  tokens, the presence and frequency penalties only the generated tokens. The TP=4 host loop
+  (without `--tp4-device`) decodes greedily only; it serves logprobs but ignores the penalties.
 - `response_format` `json_object` / `json_schema` on an engine without constrained decoding:
   refused with a typed 400. The device path enforces them (see above) and compiles the caller's
   schema before it serves, so a keyword the byte automaton cannot enforce is still a 400 rather

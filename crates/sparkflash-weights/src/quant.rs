@@ -261,6 +261,22 @@ pub enum QuantError {
         /// How many elements were handed over.
         elements: usize,
     },
+    /// The element count is not a whole number of the caller's tiles.
+    #[error("{elements} elements is not a whole number of {tile}-element tiles")]
+    TileWidth {
+        /// How many elements were handed over.
+        elements: usize,
+        /// The tile width asked for.
+        tile: usize,
+    },
+    /// A dense operand does not match the width of the weight it multiplies.
+    #[error("the input has {actual} values for a {expected}-wide weight")]
+    Width {
+        /// The weight's column count.
+        expected: usize,
+        /// How many values the operand holds.
+        actual: usize,
+    },
 }
 
 /// Checks an element count against a byte count using [DType::storage_bytes].
@@ -424,7 +440,9 @@ pub fn decode(dtype: DType, bytes: &[u8], elements: usize) -> Result<Vec<f32>, Q
             Ok(decode_f8e8m0(bytes))
         }
         DType::F4E2M1 => decode_f4e2m1(bytes, elements),
-        DType::F16 => Err(QuantError::Unsupported { dtype }),
+        // U8 is a raw container format (ModelOpt's packed NVFP4 weight); the model pack owns its
+        // block decoding. I64 is a derived constant table, never arithmetic.
+        DType::F16 | DType::U8 | DType::I64 => Err(QuantError::Unsupported { dtype }),
     }
 }
 
@@ -837,6 +855,75 @@ pub fn quantize_activation_fp8_narrowed(values: &[f32]) -> Result<QuantisedFp8, 
     Ok(QuantisedFp8 { codes, scales })
 }
 
+/// Quantises an f32 row as FP8 E4M3 with one f32 scale per `tile` elements: the codes, then the
+/// scales.
+///
+/// This is the dynamic activation rule of square-tile FP8 checkpoints whose activation scales are
+/// not rounded, GLM-5.3-Flash's `activation_scheme: dynamic` over 128x128 weight tiles: the
+/// `act_quant` of transformers' fine-grained FP8 integration and vLLM's per-token-group quantiser.
+/// It differs from [quantize_activation_fp8] in the scale, not the encoder. Per tile:
+///
+/// 1. the scale is `amax / 448` in f32, with no floor and no rounding to a power of two;
+/// 2. each element is divided by it, clamped to +/-448 (the division can land a rounding step
+///    past it), and rounded to the nearest E4M3 code, ties to the even mantissa.
+///
+/// An all-zero tile has amax 0. transformers divides by the zero scale and gets NaN codes; vLLM
+/// floors amax at 1e-10 and gets zero codes. This takes vLLM's answer, zero codes with a zero
+/// scale: the tile is exactly zero either way, and a NaN would only poison the product.
+///
+/// `code * scale` is the operand a W8A8 GEMM multiplies the weight tiles by, in exact arithmetic.
+///
+/// # Errors
+///
+/// [QuantError::TileWidth] when `tile` is zero or the row is not a whole number of tiles: the
+/// reference asserts that rather than scaling a short tile.
+pub fn quantize_activation_fp8_tiles(
+    values: &[f32],
+    tile: usize,
+) -> Result<(Vec<u8>, Vec<f32>), QuantError> {
+    if tile == 0 || !values.len().is_multiple_of(tile) {
+        return Err(QuantError::TileWidth {
+            elements: values.len(),
+            tile,
+        });
+    }
+    let mut codes = Vec::with_capacity(values.len());
+    let mut scales = Vec::with_capacity(values.len() / tile);
+    for block in values.chunks(tile) {
+        let amax = block
+            .iter()
+            .fold(0.0f32, |amax, value| amax.max(value.abs()));
+        let scale = amax / FP8_E4M3_MAX;
+        scales.push(scale);
+        for &value in block {
+            codes.push(if scale == 0.0 {
+                0
+            } else {
+                e4m3_encode_bits((value / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX))
+            });
+        }
+    }
+    Ok((codes, scales))
+}
+
+/// The values [quantize_activation_fp8_tiles] stands for: each code times its tile's scale, in
+/// f32, which is the operand a W8A8 GEMM multiplies the weight tiles by.
+///
+/// # Errors
+///
+/// As [quantize_activation_fp8_tiles].
+pub fn dequantized_activation_fp8_tiles(
+    values: &[f32],
+    tile: usize,
+) -> Result<Vec<f32>, QuantError> {
+    let (codes, scales) = quantize_activation_fp8_tiles(values, tile)?;
+    Ok(codes
+        .iter()
+        .enumerate()
+        .map(|(index, code)| f8e4m3_to_f32(*code) * scales[index / tile])
+        .collect())
+}
+
 /// Quantises an f32 slice as FP4 E2M1, packed two per byte, with one E8M0 scale per 32 elements.
 ///
 /// This is the reference's FP4 activation quantiser (kernel.py:128-181), the one the routed-expert
@@ -1070,6 +1157,42 @@ mod tests {
                 "scales differ on row {index}"
             );
         }
+    }
+
+    /// The tile quantiser scales each tile by its own amax over 448, so the tile's largest element
+    /// lands on the top code, and zero tiles stay zero.
+    #[test]
+    fn tile_scales_are_amax_over_448_and_zero_tiles_stay_zero() {
+        let values = [
+            1.0f32, -3.5, 0.25, 2.0, 0.0, 0.0, 0.0, 0.0, 7.0, -0.001, 0.5, 6.0,
+        ];
+        let (codes, scales) = quantize_activation_fp8_tiles(&values, 4).expect("quantise");
+        assert_eq!(scales, vec![3.5 / 448.0, 0.0, 7.0 / 448.0]);
+        assert_eq!(f8e4m3_to_f32(codes[1]), -448.0);
+        assert_eq!(f8e4m3_to_f32(codes[8]), 448.0);
+        assert_eq!(&codes[4..8], &[0, 0, 0, 0]);
+        for (index, &value) in values.iter().enumerate() {
+            let scale = scales[index / 4];
+            let expected = if scale == 0.0 {
+                0
+            } else {
+                e4m3_encode((value / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX))
+            };
+            assert_eq!(codes[index], expected, "element {index}");
+        }
+        let dequantized = dequantized_activation_fp8_tiles(&values, 4).expect("dequantise");
+        for (index, value) in dequantized.iter().enumerate() {
+            assert_eq!(*value, f8e4m3_to_f32(codes[index]) * scales[index / 4]);
+        }
+        assert_eq!(dequantized[1], -3.5);
+        assert!(matches!(
+            quantize_activation_fp8_tiles(&values, 5),
+            Err(QuantError::TileWidth {
+                elements: 12,
+                tile: 5
+            })
+        ));
+        assert!(quantize_activation_fp8_tiles(&values, 0).is_err());
     }
 
     /// Every f32 bit pattern, against the bisection. The encoder is a pure function of the bits, so

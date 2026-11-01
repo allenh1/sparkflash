@@ -24,11 +24,26 @@ pub const DEFAULT_MODEL_ID: &str = "deepseek-ai/DeepSeek-V4.1-Flash";
 /// The control-plane weight selector for the released V4.1-Flash checkpoint.
 pub const DEFAULT_WEIGHTS_ID: &str = "deepseek-v4.1-flash";
 
+/// The served id of the NVIDIA NVFP4 Qwen3.8-Flash-Next checkpoint.
+pub const QWEN38_FLASH_NEXT_ID: &str = "nvidia/Qwen3.8-Flash-Next-NVFP4";
+
+/// The control-plane weight selector for the Qwen3.8-Flash-Next checkpoint.
+pub const QWEN38_FLASH_NEXT_WEIGHTS_ID: &str = "qwen3.8-flash-next-nvfp4";
+
+/// The context window of the released Qwen3.8-Flash-Next checkpoint.
+pub const QWEN38_CONTEXT_TOKENS: usize = 262_144;
+
+/// The output ceiling this build serves for Qwen3.8-Flash-Next.
+pub const QWEN38_MAX_OUTPUT_TOKENS: usize = 32_768;
+
+/// The vocabulary of the released Qwen3.8-Flash-Next checkpoint (padded).
+pub const QWEN38_VOCAB_SIZE: usize = 248_320;
+
 /// The model ids this build knows how to serve, in selector order.
 ///
 /// Kept as a separate slice so the web control plane can expose it without constructing the
 /// registry. A new pack adds its selector here and its descriptor below.
-pub const WEIGHT_IDS: &[&str] = &[DEFAULT_WEIGHTS_ID];
+pub const WEIGHT_IDS: &[&str] = &[DEFAULT_WEIGHTS_ID, QWEN38_FLASH_NEXT_WEIGHTS_ID];
 
 /// The maximum context window of the released model.
 pub const V41_CONTEXT_TOKENS: usize = 1_048_576;
@@ -78,6 +93,23 @@ impl ModelDescriptor {
         }
     }
 
+    /// The released nvidia/Qwen3.8-Flash-Next-NVFP4 descriptor.
+    ///
+    /// The device arm serves the text language model at TP=1; the vision tower and MTP are in the
+    /// checkpoint but are not loaded, so vision is not declared.
+    #[must_use]
+    pub fn qwen38_flash_next_nvfp4() -> Self {
+        Self {
+            id: QWEN38_FLASH_NEXT_ID.to_owned(),
+            family: "qwen4-exp".to_owned(),
+            weights_id: QWEN38_FLASH_NEXT_WEIGHTS_ID.to_owned(),
+            context_tokens: QWEN38_CONTEXT_TOKENS,
+            max_output_tokens: QWEN38_MAX_OUTPUT_TOKENS,
+            vocab_size: QWEN38_VOCAB_SIZE,
+            capabilities: Capabilities::ALL,
+        }
+    }
+
     /// The V4.1-Flash shape under a caller-supplied id.
     ///
     /// This is what a weight-free test or a synthetic server uses when it names a model that is
@@ -103,8 +135,12 @@ impl ModelDescriptor {
 /// The registry is a `LazyLock` rather than a `const` slice because descriptors carry owned
 /// strings and may later be built from a pack's registration function. Lookup is cheap and only
 /// happens at startup or on a control-plane request.
-pub static MODELS: LazyLock<Vec<ModelDescriptor>> =
-    LazyLock::new(|| vec![ModelDescriptor::v41_flash()]);
+pub static MODELS: LazyLock<Vec<ModelDescriptor>> = LazyLock::new(|| {
+    vec![
+        ModelDescriptor::v41_flash(),
+        ModelDescriptor::qwen38_flash_next_nvfp4(),
+    ]
+});
 
 /// The default descriptor: the released V4.1-Flash.
 ///

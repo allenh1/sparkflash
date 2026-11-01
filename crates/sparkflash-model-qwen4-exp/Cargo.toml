@@ -1,0 +1,46 @@
+# Copyright (c) 2026 Hunter L. Allen
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "sparkflash-model-qwen4-exp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Qwen3.8-Flash-Next (Qwen4-Exp) pack: NVFP4 checkpoint, n-gram PLE and the TP=1 device arm"
+
+[dependencies]
+sparkflash-model = { workspace = true }
+sparkflash-weights = { workspace = true }
+sparkflash-engram = { workspace = true }
+sparkflash-kernels = { workspace = true }
+sparkflash-vision = { workspace = true }
+anyhow = { workspace = true }
+libm = "0.2"
+sha2 = { workspace = true }
+bytemuck = { workspace = true }
+half = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+memmap2 = { workspace = true }
+tokenizers = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+sparkflash-serve = { workspace = true }
+sparkflash-api = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+http-body-util = { workspace = true }
+tokio = { workspace = true }

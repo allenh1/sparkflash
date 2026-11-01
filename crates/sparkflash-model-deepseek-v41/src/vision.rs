@@ -44,6 +44,7 @@ fn grid(grid: sparkflash_vision::Grid) -> ImageGrid {
         n_llm_w: grid.n_llm_w,
         best_height: grid.best_height,
         best_width: grid.best_width,
+        line_stride: grid.n_llm_w + 1,
     }
 }
 

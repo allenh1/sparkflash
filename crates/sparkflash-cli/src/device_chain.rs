@@ -389,6 +389,13 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     {
         return crate::tp4_host::run(&arg_refs[2..]);
     }
+    // The glm-tp4 stage is a GLM-5.3-Flash device rank over the tp4-host collective. Its driver is
+    // dlopened at run time and its kernels are the pack's embedded cubin, so it needs no feature.
+    if arg_refs.first().copied() == Some("--run-stage")
+        && arg_refs.get(1).copied() == Some("glm-tp4")
+    {
+        return crate::glm_tp4::run(&arg_refs[2..]);
+    }
     #[cfg(feature = "cuda")]
     if arg_refs.first().copied() == Some("--run-stage") {
         return run_stage(&arg_refs[1..]);

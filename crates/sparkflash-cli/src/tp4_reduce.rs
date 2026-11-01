@@ -104,6 +104,8 @@ use sparkflash_comm::device_reduce::{
 };
 use sparkflash_comm::nccl::{NcclApi, NcclError};
 use sparkflash_comm::tcp::TcpTransport;
+use sparkflash_engine::linalg::EngineError;
+use sparkflash_engine::parallel_tp::{TpCollective, Wire};
 
 /// Opens the run's NCCL communicator: library check, rendezvous, open, warm up, one sync, one barrier.
 ///
@@ -206,6 +208,99 @@ fn synchronize_setup() -> Result<(), NcclError> {
             "the setup sync after warm-up failed: {error}; the setup barrier makes this an all-rank abort"
         ))
     })
+}
+
+/// A host collective with the run's communicator as its device leg: the host seam's collectives
+/// go to the seam, and [TpCollective::exchange_on_device] is one [RunReduce::exchange_bf16] of the
+/// payload's bytes, which moves bits and sums nothing, so the caller's [Wire::F32] sum sees the
+/// peers' values exactly.
+pub struct DeviceExchange {
+    host: Box<dyn TpCollective>,
+    reduce: RunReduce,
+}
+
+// SAFETY: RunReduce holds the communicator's raw handles, which NCCL lets any one thread use at a
+// time. TpRuntime keeps its collective behind a Mutex, so no two calls overlap, and the run makes
+// every call on the thread that opened the communicator, against the same current context.
+unsafe impl Send for DeviceExchange {}
+
+impl DeviceExchange {
+    /// `host` with `reduce` as its device leg; both are this rank of the same world.
+    ///
+    /// # Errors
+    /// When the two are not the same rank of the same world, or the library has no
+    /// point-to-point calls to exchange with.
+    pub fn new(host: Box<dyn TpCollective>, reduce: RunReduce) -> Result<Self, String> {
+        if !reduce.has_exchange() {
+            return Err("the NCCL library has no point-to-point calls to exchange with".to_owned());
+        }
+        let (world, rank) = reduce.world_rank();
+        if (host.world(), host.rank()) != (world, rank) {
+            return Err(format!(
+                "the host collective is rank {} of {}, the communicator rank {rank} of {world}",
+                host.rank(),
+                host.world()
+            ));
+        }
+        Ok(Self { host, reduce })
+    }
+}
+
+impl TpCollective for DeviceExchange {
+    fn world(&self) -> usize {
+        self.host.world()
+    }
+
+    fn rank(&self) -> usize {
+        self.host.rank()
+    }
+
+    fn label(&self) -> &'static str {
+        "nccl-exchange/exact-f32"
+    }
+
+    fn all_reduce_assign(&mut self, values: &mut [f32]) -> Result<(), EngineError> {
+        self.host.all_reduce_assign(values)
+    }
+
+    fn all_gather_assign(&mut self, local: &[f32], out: &mut [f32]) -> Result<(), EngineError> {
+        self.host.all_gather_assign(local, out)
+    }
+
+    fn send(&mut self, to: usize, values: &[f32]) -> Result<(), EngineError> {
+        self.host.send(to, values)
+    }
+
+    fn recv(&mut self, from: usize, out: &mut [f32]) -> Result<(), EngineError> {
+        self.host.recv(from, out)
+    }
+
+    fn device_wire(&self) -> Option<Wire> {
+        Some(Wire::F32)
+    }
+
+    fn exchange_on_device(
+        &mut self,
+        stream: u64,
+        send: u64,
+        slots: u64,
+        bytes: usize,
+    ) -> Result<(), EngineError> {
+        let refuse = |detail: String| EngineError::Shape {
+            what: "NCCL device exchange".to_owned(),
+            detail,
+        };
+        if !bytes.is_multiple_of(2) {
+            return Err(refuse(format!(
+                "{bytes} bytes are not whole bf16 words, the unit the exchange moves"
+            )));
+        }
+        // SAFETY: TpCollective::exchange_on_device's contract is exchange_bf16's: `send` holds
+        // `bytes` and `slots` a world of them on the communicator's device, `stream` is a stream
+        // there, and every rank enqueues the same exchanges in the same order.
+        unsafe { self.reduce.exchange_bf16(send, slots, bytes / 2, stream) }
+            .map_err(|error| refuse(error.to_string()))
+    }
 }
 
 #[cfg(test)]

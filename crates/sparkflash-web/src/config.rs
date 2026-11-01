@@ -35,22 +35,43 @@ use serde::{Deserialize, Serialize};
 ///
 /// "Model" means the weights, not the runtime. Adding a second checkpoint is a deliberate
 /// change here, plus the conversion and engine code that knows how to read it.
-pub const SUPPORTED_WEIGHTS: &[&str] = &["deepseek-v4.1-flash"];
+pub const SUPPORTED_WEIGHTS: &[&str] = &[DEFAULT_WEIGHTS_ID, QWEN_WEIGHTS_ID];
 
 /// The engines this build can run the weights with.
 ///
-/// Only the tensor-parallel-4 device engine exists today. The web selector keeps the concept
-/// distinct from the weights so a future engine can be added without inventing a new surface.
-pub const SUPPORTED_ENGINES: &[&str] = &["deepseek-v4.1-flash"];
+/// V4.1-Flash is the tensor-parallel-4 device engine. Qwen3.8-Flash-Next is the TP=1 pack
+/// engine, which serves directly from the Hugging Face checkpoint and needs no conversion.
+pub const SUPPORTED_ENGINES: &[&str] = &[DEFAULT_ENGINE_ID, QWEN_ENGINE_ID];
 
-/// The canonical Hugging Face id of the checkpoint this engine reads.
+/// The control-plane weight selector for V4.1-Flash.
+pub const DEFAULT_WEIGHTS_ID: &str = "deepseek-v4.1-flash";
+
+/// The control-plane engine selector for the TP=4 V4.1 engine.
+pub const DEFAULT_ENGINE_ID: &str = "deepseek-v4.1-flash";
+
+/// The canonical Hugging Face id of the checkpoint the default engine reads.
 pub const DEFAULT_MODEL_ID: &str = "deepseek-ai/DeepSeek-V4.1-Flash";
+
+/// The control-plane weight selector for Qwen3.8-Flash-Next (NVFP4).
+pub const QWEN_WEIGHTS_ID: &str = "qwen3.8-flash-next-nvfp4";
+
+/// The control-plane engine selector for the TP=1 Qwen pack.
+pub const QWEN_ENGINE_ID: &str = "qwen4-exp";
+
+/// The canonical Hugging Face id of the Qwen3.8-Flash-Next checkpoint.
+pub const QWEN_MODEL_ID: &str = "nvidia/Qwen3.8-Flash-Next-NVFP4";
 
 /// The maximum context window of V4.1-Flash.
 pub const MODEL_CONTEXT_TOKENS: usize = 1_048_576;
 
-/// The engine's current serving width; four DGX Sparks at tensor parallelism four.
+/// The maximum context window of Qwen3.8-Flash-Next.
+pub const QWEN_CONTEXT_TOKENS: usize = 262_144;
+
+/// The tensor-parallel width of the V4.1 cluster.
 pub const WORLD_SIZE: usize = 4;
+
+/// The tensor-parallel width of a TP=1 pack such as Qwen3.8-Flash-Next.
+pub const SOLO_WORLD_SIZE: usize = 1;
 
 /// The largest concurrency the current engine is designed for.
 pub const MAX_CONCURRENCY: usize = 32;
@@ -216,7 +237,7 @@ pub struct ClusterConfig {
     pub ssh_user: String,
     /// Extra SSH options, e.g. `-o StrictHostKeyChecking=accept-new`.
     pub ssh_options: Vec<String>,
-    /// Exactly [`WORLD_SIZE`] nodes, in rank order.
+    /// Either the four V4.1 ranks or one TP=1 node, in rank order.
     pub nodes: Vec<NodeConfig>,
 }
 
@@ -408,6 +429,17 @@ impl SparkConfig {
                 SUPPORTED_ENGINES.join(", ")
             )));
         }
+        let expected_engine = if self.is_qwen() {
+            QWEN_ENGINE_ID
+        } else {
+            DEFAULT_ENGINE_ID
+        };
+        if self.engine.kind != expected_engine {
+            return Err(ConfigError::new(format!(
+                "model.weights {:?} runs with engine.kind {expected_engine:?}, not {:?}",
+                self.model.weights, self.engine.kind
+            )));
+        }
         if self.model.id.trim().is_empty() {
             return Err(ConfigError::new("model.id must not be empty"));
         }
@@ -421,15 +453,16 @@ impl SparkConfig {
         if self.model.converted_dir.trim().is_empty() {
             return Err(ConfigError::new("model.converted_dir must not be empty"));
         }
-        if self.engine.device && self.model.cubins.trim().is_empty() {
+        if self.requires_cubins() && self.model.cubins.trim().is_empty() {
             return Err(ConfigError::new(
                 "model.cubins must not be empty when engine.device is true",
             ));
         }
-        if !(1..=MODEL_CONTEXT_TOKENS).contains(&self.runtime.max_context_tokens) {
+        let max_context = self.max_context_tokens();
+        if !(1..=max_context).contains(&self.runtime.max_context_tokens) {
             return Err(ConfigError::new(format!(
-                "runtime.max_context_tokens must be in 1..={MODEL_CONTEXT_TOKENS}, got {}",
-                self.runtime.max_context_tokens
+                "runtime.max_context_tokens must be in 1..={max_context} for {:?}, got {}",
+                self.model.weights, self.runtime.max_context_tokens
             )));
         }
         if !(1..=MAX_CONCURRENCY).contains(&self.runtime.max_concurrency) {
@@ -438,9 +471,21 @@ impl SparkConfig {
                 self.runtime.max_concurrency
             )));
         }
-        if self.cluster.nodes.len() != WORLD_SIZE {
+        let expected_nodes = if self.is_qwen() {
+            SOLO_WORLD_SIZE
+        } else {
+            WORLD_SIZE
+        };
+        if self.cluster.nodes.len() != expected_nodes {
+            let topology = if self.is_qwen() {
+                "one node at TP=1".to_owned()
+            } else {
+                format!("{WORLD_SIZE} nodes at TP={WORLD_SIZE}")
+            };
             return Err(ConfigError::new(format!(
-                "cluster.nodes must list exactly {WORLD_SIZE} nodes in rank order, got {}",
+                "cluster.nodes must list exactly {expected_nodes} node{} for {:?} ({topology}), got {}",
+                if expected_nodes == 1 { "" } else { "s" },
+                self.model.weights,
                 self.cluster.nodes.len()
             )));
         }
@@ -472,18 +517,31 @@ impl SparkConfig {
                     node.ssh
                 )));
             }
-            node.peer.parse::<std::net::IpAddr>().map_err(|_| {
-                ConfigError::new(format!(
-                    "cluster.nodes[{rank}].peer {:?} is not an IP address",
-                    node.peer
-                ))
-            })?;
-            if !peers.insert(node.peer.clone()) {
-                return Err(ConfigError::new(format!(
-                    "cluster.nodes[{rank}].peer {:?} is repeated",
-                    node.peer
-                )));
+            if node.peer.trim().is_empty() {
+                if !self.is_qwen() {
+                    return Err(ConfigError::new(format!(
+                        "cluster.nodes[{rank}].peer must name the fast-network address"
+                    )));
+                }
+            } else {
+                node.peer.parse::<std::net::IpAddr>().map_err(|_| {
+                    ConfigError::new(format!(
+                        "cluster.nodes[{rank}].peer {:?} is not an IP address",
+                        node.peer
+                    ))
+                })?;
+                if !peers.insert(node.peer.clone()) {
+                    return Err(ConfigError::new(format!(
+                        "cluster.nodes[{rank}].peer {:?} is repeated",
+                        node.peer
+                    )));
+                }
             }
+        }
+        if self.is_qwen() && !self.cluster.nodes[0].local {
+            return Err(ConfigError::new(
+                "cluster.nodes[0].local must be true: the TP=1 node runs on this Spark",
+            ));
         }
         parse_socket_addr("cluster.http_bind", &self.cluster.http_bind)?;
         parse_socket_addr("web.bind", &self.web.bind)?;
@@ -570,6 +628,55 @@ impl SparkConfig {
             let _ = std::fs::remove_file(&temp);
             ConfigError::new(format!("cannot replace {}: {error}", path.display()))
         })
+    }
+
+    /// Whether the selected weights are the TP=1 Qwen pack.
+    #[must_use]
+    pub fn is_qwen(&self) -> bool {
+        self.model.weights == QWEN_WEIGHTS_ID
+    }
+
+    /// Whether this configuration runs on one node instead of the four-node cluster.
+    #[must_use]
+    pub fn is_solo(&self) -> bool {
+        self.cluster.nodes.len() == SOLO_WORLD_SIZE
+    }
+
+    /// The number of ranks this configuration names.
+    #[must_use]
+    pub fn world_size(&self) -> usize {
+        self.cluster.nodes.len()
+    }
+
+    /// The context ceiling of the selected weights.
+    #[must_use]
+    pub fn max_context_tokens(&self) -> usize {
+        if self.is_qwen() {
+            QWEN_CONTEXT_TOKENS
+        } else {
+            MODEL_CONTEXT_TOKENS
+        }
+    }
+
+    /// Whether launch must run the one-time per-rank conversion first.
+    ///
+    /// The Qwen pack loads the released checkpoint directly; only the V4.1 engine has a separate
+    /// converted layout.
+    #[must_use]
+    pub fn requires_conversion(&self) -> bool {
+        !self.is_qwen()
+    }
+
+    /// Whether the engine needs the external cubin directory.
+    #[must_use]
+    pub fn requires_cubins(&self) -> bool {
+        self.engine.device && self.requires_conversion()
+    }
+
+    /// The single-node launcher script, next to the four-node one.
+    #[must_use]
+    pub fn local_serve_script_path(&self) -> PathBuf {
+        self.repo_root().join("scripts/serve-single-node.sh")
     }
 
     /// The Hugging Face hub cache `model.id` is looked up in.
@@ -760,7 +867,7 @@ impl SparkConfig {
         if !local_ranks.is_empty() {
             env.insert("SPARK_LOCAL_RANKS".to_owned(), local_ranks.join(" "));
         }
-        if self.engine.device && !self.model.cubins.trim().is_empty() {
+        if self.requires_cubins() && !self.model.cubins.trim().is_empty() {
             env.insert(
                 "SPARKFLASH_CUBINS".to_owned(),
                 self.cubins_path().display().to_string(),
@@ -784,6 +891,46 @@ impl SparkConfig {
         if let Some(index) = self.network.nccl_ib_gid_index {
             env.insert("NCCL_IB_GID_INDEX".to_owned(), index.to_string());
         }
+        for (key, value) in &self.network.env {
+            env.insert(key.clone(), value.clone());
+        }
+        env
+    }
+
+    /// The environment the single-node launcher receives.
+    ///
+    /// A TP=1 pack runs in this process's place: no SSH, no collective, and no converted weights.
+    /// The script only needs the binary, the checkpoint, the tokenizer, the HTTP bind and the
+    /// context window. Extra rank environment is passed through unchanged.
+    #[must_use]
+    pub fn local_launch_env(&self) -> BTreeMap<String, String> {
+        let mut env = BTreeMap::new();
+        let checkpoint = self
+            .resolve_checkpoint()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        env.insert("SPARKFLASH_MODEL".to_owned(), self.model.weights.clone());
+        env.insert("SPARKFLASH_CHECKPOINT".to_owned(), checkpoint);
+        env.insert(
+            "SPARKFLASH_TOKENIZER".to_owned(),
+            self.effective_tokenizer().display().to_string(),
+        );
+        env.insert(
+            "SPARKFLASH_CONTEXT".to_owned(),
+            self.runtime.max_context_tokens.to_string(),
+        );
+        env.insert(
+            "SPARKFLASH_HTTP_BIND".to_owned(),
+            self.cluster.http_bind.clone(),
+        );
+        env.insert(
+            "SPARKFLASH_BIN".to_owned(),
+            self.binary_path().display().to_string(),
+        );
+        env.insert(
+            "SPARKFLASH_LOG_ROOT".to_owned(),
+            self.node_path(&self.paths.log_root).display().to_string(),
+        );
         for (key, value) in &self.network.env {
             env.insert(key.clone(), value.clone());
         }
@@ -923,6 +1070,43 @@ mod tests {
         assert_eq!(env["SPARKFLASH_LANES"], MAX_CONCURRENCY.to_string());
         assert_eq!(env["NCCL_IB_GID_INDEX"], "3");
         assert_eq!(env["SPARK_LOCAL_RANKS"], "0");
+    }
+
+    #[test]
+    fn a_solo_qwen_plan_validates_and_uses_the_local_launcher() {
+        let mut config = SparkConfig::default();
+        config.model.weights = QWEN_WEIGHTS_ID.to_owned();
+        config.model.id = QWEN_MODEL_ID.to_owned();
+        config.model.checkpoint = "/data/Qwen3.8-Flash-Next-NVFP4".to_owned();
+        config.model.cubins.clear();
+        config.engine.kind = QWEN_ENGINE_ID.to_owned();
+        config.runtime.max_context_tokens = QWEN_CONTEXT_TOKENS;
+        config.cluster.nodes = vec![NodeConfig::new("this-spark.local", "", true)];
+        config.validate().expect("solo Qwen validates");
+        assert!(config.is_qwen());
+        assert!(config.is_solo());
+        assert_eq!(config.world_size(), 1);
+        assert!(!config.requires_conversion());
+        assert!(!config.requires_cubins());
+        assert_eq!(config.max_context_tokens(), QWEN_CONTEXT_TOKENS);
+        let env = config.local_launch_env();
+        assert_eq!(env["SPARKFLASH_MODEL"], QWEN_WEIGHTS_ID);
+        assert_eq!(
+            env["SPARKFLASH_CHECKPOINT"],
+            "/data/Qwen3.8-Flash-Next-NVFP4"
+        );
+        assert_eq!(env["SPARKFLASH_CONTEXT"], QWEN_CONTEXT_TOKENS.to_string());
+        assert!(!env.contains_key("SPARK_NODES"));
+
+        // The tensor-parallel sizes are not interchangeable.
+        config.cluster.nodes = SparkConfig::default().cluster.nodes;
+        let error = config.validate().expect_err("Qwen on four nodes");
+        assert!(error.message.contains("exactly 1"), "{error}");
+
+        let mut four = SparkConfig::default();
+        four.cluster.nodes = vec![NodeConfig::new("this-spark.local", "", true)];
+        let error = four.validate().expect_err("V4.1 on one node");
+        assert!(error.message.contains("exactly 4"), "{error}");
     }
 
     #[test]

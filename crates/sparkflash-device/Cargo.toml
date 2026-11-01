@@ -39,6 +39,7 @@ sparkflash-api = { workspace = true }
 sparkflash-engine = { workspace = true }
 sparkflash-kernels = { workspace = true }
 sparkflash-kv = { workspace = true }
+sparkflash-weights = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

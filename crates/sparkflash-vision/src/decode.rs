@@ -37,6 +37,15 @@ use crate::resample::RgbImage;
 /// What the transparent parts of an image are blended onto.
 pub const BACKGROUND: u8 = 0xfd;
 
+/// How an alpha channel is treated when an image is reduced to RGB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlphaPolicy {
+    /// Alpha-composite onto [`BACKGROUND`]. This is the serving recipe's rule.
+    Blend,
+    /// Ignore alpha and keep the colour samples, as Pillow's `convert("RGB")` does.
+    Drop,
+}
+
 /// Size limits checked before decoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeLimits {
@@ -113,13 +122,27 @@ impl fmt::Display for ImageFormat {
     }
 }
 
-/// Decodes an image file to RGB.
+/// Decodes an image file to RGB, blending any transparency onto [`BACKGROUND`].
 ///
 /// # Errors
 ///
 /// [`VisionError::Empty`], [`VisionError::TooManyBytes`], [`VisionError::UnsupportedFormat`],
 /// [`VisionError::TooLarge`], [`VisionError::ZeroSize`] or [`VisionError::Decode`].
 pub fn decode(bytes: &[u8], limits: &DecodeLimits) -> Result<RgbImage, VisionError> {
+    decode_with_alpha(bytes, limits, AlphaPolicy::Blend)
+}
+
+/// Decodes an image file to RGB under an explicit alpha policy.
+///
+/// # Errors
+///
+/// [`VisionError::Empty`], [`VisionError::TooManyBytes`], [`VisionError::UnsupportedFormat`],
+/// [`VisionError::TooLarge`], [`VisionError::ZeroSize`] or [`VisionError::Decode`].
+pub fn decode_with_alpha(
+    bytes: &[u8],
+    limits: &DecodeLimits,
+    alpha: AlphaPolicy,
+) -> Result<RgbImage, VisionError> {
     if bytes.is_empty() {
         return Err(VisionError::Empty);
     }
@@ -132,10 +155,10 @@ pub fn decode(bytes: &[u8], limits: &DecodeLimits) -> Result<RgbImage, VisionErr
     let format = ImageFormat::sniff(bytes).ok_or(VisionError::UnsupportedFormat)?;
     let fail = |detail: String| VisionError::Decode { format, detail };
     let image = match format {
-        ImageFormat::Png => png_rgb(bytes, limits, &fail)?,
-        ImageFormat::Jpeg => jpeg_rgb(bytes, limits, &fail)?,
-        ImageFormat::Gif => gif_rgb(bytes, limits, &fail)?,
-        ImageFormat::WebP => webp_rgb(bytes, limits, &fail)?,
+        ImageFormat::Png => png_rgb(bytes, limits, alpha, &fail)?,
+        ImageFormat::Jpeg => jpeg_rgb(bytes, limits, alpha, &fail)?,
+        ImageFormat::Gif => gif_rgb(bytes, limits, alpha, &fail)?,
+        ImageFormat::WebP => webp_rgb(bytes, limits, alpha, &fail)?,
     };
     debug_assert_eq!(image.data.len(), image.width * image.height * 3);
     Ok(image)
@@ -166,14 +189,26 @@ fn blend(c: u8, a: u8) -> u8 {
 }
 
 /// Grey, grey + alpha, RGB or RGBA 8-bit samples to RGB.
-fn to_rgb(width: usize, height: usize, channels: usize, samples: &[u8]) -> RgbImage {
+fn to_rgb(
+    width: usize,
+    height: usize,
+    channels: usize,
+    samples: &[u8],
+    alpha: AlphaPolicy,
+) -> RgbImage {
     let mut data = Vec::with_capacity(width * height * 3);
     for px in samples.chunks_exact(channels).take(width * height) {
         match channels {
             1 => data.extend_from_slice(&[px[0]; 3]),
-            2 => data.extend_from_slice(&[blend(px[0], px[1]); 3]),
+            2 => match alpha {
+                AlphaPolicy::Blend => data.extend_from_slice(&[blend(px[0], px[1]); 3]),
+                AlphaPolicy::Drop => data.extend_from_slice(&[px[0]; 3]),
+            },
             3 => data.extend_from_slice(px),
-            _ => data.extend(px[..3].iter().map(|&c| blend(c, px[3]))),
+            _ => match alpha {
+                AlphaPolicy::Blend => data.extend(px[..3].iter().map(|&c| blend(c, px[3]))),
+                AlphaPolicy::Drop => data.extend_from_slice(&px[..3]),
+            },
         }
     }
     RgbImage {
@@ -186,6 +221,7 @@ fn to_rgb(width: usize, height: usize, channels: usize, samples: &[u8]) -> RgbIm
 fn png_rgb(
     bytes: &[u8],
     limits: &DecodeLimits,
+    alpha: AlphaPolicy,
     fail: &dyn Fn(String) -> VisionError,
 ) -> Result<RgbImage, VisionError> {
     let mut decoder = png::Decoder::new(Cursor::new(bytes));
@@ -222,12 +258,13 @@ fn png_rgb(
     if !matches!(channels, 1..=4) {
         return Err(fail(format!("{channels} channels")));
     }
-    Ok(to_rgb(w, h, channels, &samples))
+    Ok(to_rgb(w, h, channels, &samples, alpha))
 }
 
 fn jpeg_rgb(
     bytes: &[u8],
     limits: &DecodeLimits,
+    alpha: AlphaPolicy,
     fail: &dyn Fn(String) -> VisionError,
 ) -> Result<RgbImage, VisionError> {
     use zune_core::bytestream::ZCursor;
@@ -256,12 +293,13 @@ fn jpeg_rgb(
             pixels.len()
         )));
     }
-    Ok(to_rgb(w, h, channels, &pixels))
+    Ok(to_rgb(w, h, channels, &pixels, alpha))
 }
 
 fn gif_rgb(
     bytes: &[u8],
     limits: &DecodeLimits,
+    alpha: AlphaPolicy,
     fail: &dyn Fn(String) -> VisionError,
 ) -> Result<RgbImage, VisionError> {
     let mut options = gif::DecodeOptions::new();
@@ -288,12 +326,13 @@ fn gif_rgb(
         let src = &frame.buffer[y * fw * 4..][..n];
         canvas[((top + y) * w + left) * 4..][..n].copy_from_slice(src);
     }
-    Ok(to_rgb(w, h, 4, &canvas))
+    Ok(to_rgb(w, h, 4, &canvas, alpha))
 }
 
 fn webp_rgb(
     bytes: &[u8],
     limits: &DecodeLimits,
+    alpha: AlphaPolicy,
     fail: &dyn Fn(String) -> VisionError,
 ) -> Result<RgbImage, VisionError> {
     let mut decoder =
@@ -308,7 +347,7 @@ fn webp_rgb(
         .read_image(&mut buf)
         .map_err(|e| fail(e.to_string()))?;
     let channels = if decoder.has_alpha() { 4 } else { 3 };
-    Ok(to_rgb(w as usize, h as usize, channels, &buf))
+    Ok(to_rgb(w as usize, h as usize, channels, &buf, alpha))
 }
 
 #[cfg(test)]

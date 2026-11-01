@@ -25,6 +25,7 @@ description = "Model-agnostic request lifecycle and host serving adapter for Spa
 sparkflash-trace = { workspace = true }
 sparkflash-model = { workspace = true }
 sparkflash-api = { workspace = true }
+crossbeam-channel = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

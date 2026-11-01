@@ -74,7 +74,7 @@ use sparkflash_engine::forward::{
     DeferredHandoff, HybridEntry, HybridPost, InferenceEngine, SequenceState,
 };
 use sparkflash_engine::linalg::{self, EngineError};
-use sparkflash_engine::parallel_tp::BitGather;
+use sparkflash_engine::parallel_tp::{BitGather, Wire};
 use sparkflash_engine::prompt_ranks;
 use sparkflash_engine::quant;
 use sparkflash_engine::safetensors::{SafeTensorsSource, TensorHeader};
@@ -287,15 +287,7 @@ impl HostArgs {
                         .map_err(|error| format!("--tp-world-size: {error}"))?;
                 }
                 "--comm-peers" => {
-                    let text = take("--comm-peers")?;
-                    parsed.peers = text
-                        .split(',')
-                        .map(|peer| {
-                            peer.trim()
-                                .parse::<IpAddr>()
-                                .map_err(|error| format!("--comm-peers {peer}: {error}"))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
+                    parsed.peers = parse_list("--comm-peers", &take("--comm-peers")?)?;
                 }
                 "--comm-base-port" => {
                     parsed.base_port = take("--comm-base-port")?
@@ -309,17 +301,8 @@ impl HostArgs {
                 }
                 "--prompt" => parsed.prompt_text = Some(take("--prompt")?),
                 "--prompt-tokens" => {
-                    let text = take("--prompt-tokens")?;
-                    parsed.prompt_tokens = Some(
-                        text.split(',')
-                            .map(|token| {
-                                token
-                                    .trim()
-                                    .parse::<u32>()
-                                    .map_err(|error| format!("--prompt-tokens {token}: {error}"))
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                    );
+                    parsed.prompt_tokens =
+                        Some(parse_list("--prompt-tokens", &take("--prompt-tokens")?)?);
                 }
                 "--max-tokens" => {
                     parsed.max_tokens = take("--max-tokens")?
@@ -366,6 +349,21 @@ impl HostArgs {
         }
         Ok(parsed)
     }
+}
+
+/// A comma-separated `flag` value, each item parsed and trimmed: `--comm-peers` addresses or
+/// `--prompt-tokens` ids.
+pub(crate) fn parse_list<T: std::str::FromStr>(flag: &str, text: &str) -> Result<Vec<T>, String>
+where
+    T::Err: std::fmt::Display,
+{
+    text.split(',')
+        .map(|item| {
+            item.trim()
+                .parse()
+                .map_err(|error| format!("{flag} {item}: {error}"))
+        })
+        .collect()
 }
 
 /// Entry point for `--run-stage tp4-host`.
@@ -437,24 +435,16 @@ fn run_checked(args: &[&str]) -> Result<ExitCode, String> {
     let tcp_config = if parsed.world == 1 {
         None
     } else {
-        let addresses: Vec<SocketAddr> = parsed
-            .peers
-            .iter()
-            .enumerate()
-            .map(|(peer, ip)| SocketAddr::new(*ip, parsed.base_port + peer as u16))
-            .collect();
-        let mut config = TcpConfig::with_addresses(parsed.rank, addresses)
-            .map_err(|error| format!("tcp config: {error}"))?;
         // A node run's ranks reach the collective at different times: rank 0 starts with a warm
         // page cache and ranks 1-3 cold, and the first token's cold reads can exceed the 5 s
         // default. The fixture runs keep the default; the released-checkpoint run gets a timeout
         // that no cold first token can hit.
-        if parsed.fixture.is_none() {
-            config = config
-                .with_timeout(Duration::from_secs(180))
-                .with_connect_timeout(Duration::from_secs(60));
-        }
-        Some(config)
+        Some(tcp_config(
+            parsed.rank,
+            &parsed.peers,
+            parsed.base_port,
+            parsed.fixture.is_none(),
+        )?)
     };
     let started = Instant::now();
     // Connect the collective only AFTER this rank finishes its ResidentCache fill, so all four
@@ -1054,10 +1044,11 @@ impl Tp4Rank {
         let mut engine = InferenceEngine::new(config.clone(), engine_source, element_limit)
             .map_err(|error| Tp4Error::new(format!("engine: {error}")))?;
         if attention_shard {
-            engine = engine.with_bit_gather(Box::new(Tp4BitGather {
+            engine = engine.with_bit_gather(Box::new(Tp4Seam {
                 rank: input.rank,
                 world: input.world,
                 collective: Arc::clone(&collective),
+                wire: Wire::Bf16,
             }));
         }
         let backend = TpMoeBackend {
@@ -2706,14 +2697,129 @@ impl TpCollective {
     }
 }
 
-/// The engine's exact all-gather seam over one rank's transport.
-struct Tp4BitGather {
+/// One rank's shared TP seams over its transport: the reduce in the arithmetic of `wire`, and the
+/// exact gather.
+///
+/// Every copy over one [TpCollective] shares its sequence counter, so a model's `TpRuntime` and
+/// `BitGatherHandle` can each own one and stay in step with the other ranks.
+struct Tp4Seam {
     rank: usize,
     world: usize,
     collective: Arc<TpCollective>,
+    wire: Wire,
 }
 
-impl BitGather for Tp4BitGather {
+/// One rank's reduce and gather seams, as a model's `TpRuntime` and `BitGatherHandle` take them.
+pub(crate) type Seams = (
+    Box<dyn sparkflash_engine::parallel_tp::TpCollective>,
+    Box<dyn BitGather>,
+);
+
+/// Both of one rank's seams over one collective, so they share its sequence counter, reducing in
+/// the arithmetic of `wire`.
+pub(crate) fn tp4_seams(
+    rank: usize,
+    world: usize,
+    transport: Option<Box<dyn Transport>>,
+    wire: Wire,
+) -> Seams {
+    let collective = Arc::new(TpCollective::new(world, transport));
+    let reduce = Tp4Seam {
+        rank,
+        world,
+        collective: Arc::clone(&collective),
+        wire,
+    };
+    (
+        Box::new(reduce),
+        Box::new(Tp4Seam {
+            rank,
+            world,
+            collective,
+            wire,
+        }),
+    )
+}
+
+/// The TCP collective of rank `rank` of `peers`, where rank `r` listens on `base_port + r`. A
+/// released-checkpoint run waits long enough for any rank's cold load to reach the collective;
+/// the fixture runs keep the defaults.
+pub(crate) fn tcp_config(
+    rank: usize,
+    peers: &[IpAddr],
+    base_port: u16,
+    long_waits: bool,
+) -> Result<TcpConfig, String> {
+    let addresses: Vec<SocketAddr> = peers
+        .iter()
+        .enumerate()
+        .map(|(peer, ip)| SocketAddr::new(*ip, base_port + peer as u16))
+        .collect();
+    let config = TcpConfig::with_addresses(rank, addresses)
+        .map_err(|error| format!("tcp config: {error}"))?;
+    Ok(if long_waits {
+        config
+            .with_timeout(Duration::from_secs(180))
+            .with_connect_timeout(Duration::from_secs(60))
+    } else {
+        config
+    })
+}
+
+impl sparkflash_engine::parallel_tp::TpCollective for Tp4Seam {
+    fn world(&self) -> usize {
+        self.world
+    }
+
+    fn rank(&self) -> usize {
+        self.rank
+    }
+
+    fn label(&self) -> &'static str {
+        match self.wire {
+            Wire::Bf16 => "tcp-hostonly/canonical-bf16",
+            Wire::F32 => "tcp-hostonly/exact-f32",
+        }
+    }
+
+    /// On the bf16 wire, the transport's canonical reduce. On the exact wire, every rank's partial
+    /// gathered bit for bit and summed in ascending rank order, as the in-process bus sums them.
+    fn all_reduce_assign(&mut self, values: &mut [f32]) -> Result<(), EngineError> {
+        match self.wire {
+            Wire::Bf16 => self
+                .collective
+                .all_reduce_f32(values)
+                .map_err(collective_error),
+            Wire::F32 => {
+                if self.world == 1 || values.is_empty() {
+                    return Ok(());
+                }
+                let mut partials = vec![0.0; values.len() * self.world];
+                self.collective
+                    .all_gather_f32(values, &mut partials)
+                    .map_err(collective_error)?;
+                let payloads: Vec<&[f32]> = partials.chunks(values.len()).collect();
+                Wire::F32.reduce_into(values, &payloads)
+            }
+        }
+    }
+
+    /// The exact gather, then on the bf16 wire each element bf16-rounded: the same values as
+    /// rounding before the wire, and the same order as the in-process bus.
+    fn all_gather_assign(&mut self, local: &[f32], out: &mut [f32]) -> Result<(), EngineError> {
+        self.collective
+            .all_gather_f32(local, out)
+            .map_err(collective_error)?;
+        if self.world > 1 && self.wire == Wire::Bf16 {
+            for value in out.iter_mut() {
+                *value = bf16_to_f32(f32_to_bf16_rn(*value));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl BitGather for Tp4Seam {
     fn world(&self) -> usize {
         self.world
     }
@@ -3550,7 +3656,7 @@ fn reference_whole_bytes(source: &SafeTensorsSource, plan: &ShardPlan) -> Result
 
 /// The SHA-256 of one position logits block, little-endian f32 bytes as the arithmetic produced
 /// them. Two ranks or two layouts that claim bit-identical logits must publish the same digest.
-fn logits_sha256(logits: &[f32]) -> String {
+pub(crate) fn logits_sha256(logits: &[f32]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for value in logits {
@@ -3938,6 +4044,15 @@ fn write_summary(directory: &Path, outcome: &RankOutcome, wall_ms: u64) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use sparkflash_comm::{LoopbackCluster, LoopbackConfig};
+    use sparkflash_engine::linalg::REFERENCE_TENSOR_LIMIT;
+    use sparkflash_engine::parallel_tp::{
+        BitGatherHandle, LocalBus, LocalRank, TpLayout, TpRuntime,
+    };
+    use sparkflash_engine::safetensors::INDEX_NAME;
+    use sparkflash_model_glm5_next::checkpoint::write_synthetic_checkpoint;
+    use sparkflash_model_glm5_next::{Glm5NextConfig, Glm5NextWeights};
+
     use super::*;
 
     /// The adjacent-range probe releases its listeners before the ranks bind, so two tests running
@@ -3970,7 +4085,40 @@ mod tests {
         panic!("no free adjacent port range");
     }
 
+    /// How the test ranks reach each other.
+    #[derive(Clone, Copy, Debug)]
+    enum Wiring {
+        /// One TCP connection per peer over 127.0.0.1, as the nodes connect.
+        Tcp,
+        /// sparkflash-comm's in-process loopback cluster.
+        Loopback,
+    }
+
+    /// One rank's TCP transport to its peers on 127.0.0.1, from `base_port` up.
+    fn tcp_transport(rank: usize, world: usize, base_port: u16) -> TcpTransport {
+        let addresses: Vec<SocketAddr> = (0..world)
+            .map(|peer| SocketAddr::new(IpAddr::from([127, 0, 0, 1]), base_port + peer as u16))
+            .collect();
+        TcpTransport::connect(TcpConfig::with_addresses(rank, addresses).expect("config"))
+            .expect("transport connect")
+    }
+
+    /// One rank's transport over `wiring`; `cluster` serves the loopback leg.
+    fn wired(
+        wiring: Wiring,
+        rank: usize,
+        world: usize,
+        base_port: u16,
+        cluster: &LoopbackCluster,
+    ) -> Box<dyn Transport> {
+        match wiring {
+            Wiring::Tcp => Box::new(tcp_transport(rank, world, base_port)),
+            Wiring::Loopback => Box::new(cluster.handle(rank).expect("loopback handle")),
+        }
+    }
+
     fn run_two_to_four_ranks(
+        wiring: Wiring,
         world: usize,
         prompt: Vec<u32>,
         max_tokens: usize,
@@ -3982,22 +4130,19 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         write_twin_fixture(directory.path()).expect("fixture");
         let base_port = free_base_port(world as u16);
+        let cluster = LoopbackCluster::new(LoopbackConfig {
+            world_size: world,
+            ..LoopbackConfig::default()
+        })
+        .expect("loopback cluster");
         let outcomes: Vec<RankOutcome> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..world)
                 .map(|rank| {
                     let directory = directory.path().to_path_buf();
                     let prompt = prompt.clone();
+                    let cluster = &cluster;
                     scope.spawn(move || {
-                        let addresses: Vec<SocketAddr> = (0..world)
-                            .map(|peer| {
-                                SocketAddr::new(
-                                    IpAddr::from([127, 0, 0, 1]),
-                                    base_port + peer as u16,
-                                )
-                            })
-                            .collect();
-                        let config = TcpConfig::with_addresses(rank, addresses).expect("config");
-                        let transport = TcpTransport::connect(config).expect("transport connect");
+                        let transport = wired(wiring, rank, world, base_port, cluster);
                         let input = RankInput {
                             rank,
                             world,
@@ -4012,7 +4157,7 @@ mod tests {
                             bench_steps: 0,
                             tokenizer: None,
                         };
-                        run_rank(&input, Some(Box::new(transport))).expect("rank")
+                        run_rank(&input, Some(transport)).expect("rank")
                     })
                 })
                 .collect();
@@ -4022,6 +4167,38 @@ mod tests {
                 .collect()
         });
         outcomes
+    }
+
+    /// The same ranks over TCP and over the in-process loopback cluster: every rank's per-step
+    /// logits and tokens agree bit for bit. Both wirings apply the canonical reduce and the exact
+    /// gather, so a transport that moves every byte correctly changes nothing.
+    fn tcp_matching_loopback(
+        world: usize,
+        prompt: Vec<u32>,
+        max_tokens: usize,
+        resident_cache: bool,
+    ) -> Vec<RankOutcome> {
+        let tcp = run_two_to_four_ranks(
+            Wiring::Tcp,
+            world,
+            prompt.clone(),
+            max_tokens,
+            resident_cache,
+        );
+        let loopback =
+            run_two_to_four_ranks(Wiring::Loopback, world, prompt, max_tokens, resident_cache);
+        assert_eq!(tcp.len(), loopback.len());
+        for (tcp, loopback) in tcp.iter().zip(&loopback) {
+            assert_eq!(tcp.rank, loopback.rank);
+            assert!(!tcp.step_logits_sha256.is_empty(), "rank {}", tcp.rank);
+            assert_eq!(
+                tcp.step_logits_sha256, loopback.step_logits_sha256,
+                "rank {}: per-step logits over TCP and loopback",
+                tcp.rank
+            );
+            assert_eq!(tcp.step_tokens, loopback.step_tokens, "rank {}", tcp.rank);
+        }
+        tcp
     }
 
     /// One four-rank session over the tiny fixture with the test's own per-rank closure.
@@ -4042,18 +4219,7 @@ mod tests {
                     let fixture = fixture.to_path_buf();
                     let prompt = prompt.to_vec();
                     scope.spawn(move || {
-                        let addresses: Vec<SocketAddr> = (0..world)
-                            .map(|peer| {
-                                SocketAddr::new(
-                                    IpAddr::from([127, 0, 0, 1]),
-                                    base_port + peer as u16,
-                                )
-                            })
-                            .collect();
-                        let transport = TcpTransport::connect(
-                            TcpConfig::with_addresses(rank, addresses).expect("config"),
-                        )
-                        .expect("transport connect");
+                        let transport = tcp_transport(rank, world, base_port);
                         let input = RankInput {
                             rank,
                             world,
@@ -4542,7 +4708,7 @@ mod tests {
 
     #[test]
     fn two_ranks_produce_the_reference_token_sequence() {
-        let outcomes = run_two_to_four_ranks(2, vec![3, 7, 11], 2, false);
+        let outcomes = tcp_matching_loopback(2, vec![3, 7, 11], 2, false);
         assert_eq!(outcomes.len(), 2);
         assert_eq!(outcomes[0].generated, outcomes[1].generated);
         assert_eq!(outcomes[0].step_tokens, outcomes[1].step_tokens);
@@ -4560,11 +4726,6 @@ mod tests {
             "tokens: {:?}",
             reference.reference_tokens
         );
-        assert!(
-            reference.max_logits_rel_l2 <= 2.0e-2,
-            "max logits rel L2 {} over 2e-2",
-            reference.max_logits_rel_l2
-        );
         for outcome in &outcomes {
             assert_eq!(outcome.reduce_calls, 40 * outcome.step_ms.len() as u64);
             assert_eq!(
@@ -4580,7 +4741,7 @@ mod tests {
         // reference engine computes the replicated layout, so the reference source must read
         // the whole tensors from the checkpoint. This is the real --resident-cache path that
         // the twin tests used to skip (they ran with the cache off).
-        let outcomes = run_two_to_four_ranks(2, vec![3, 7, 11], 2, true);
+        let outcomes = tcp_matching_loopback(2, vec![3, 7, 11], 2, true);
         assert_eq!(outcomes.len(), 2);
         assert_eq!(
             outcomes[0].attention_shard, "head-row+wq_b-head+wo_a-group/world2",
@@ -4591,11 +4752,6 @@ mod tests {
             reference.tokens_equal,
             "tokens: {:?}",
             reference.reference_tokens
-        );
-        assert!(
-            reference.max_logits_rel_l2 <= 2.0e-2,
-            "max logits rel L2 {} over 2e-2",
-            reference.max_logits_rel_l2
         );
         assert_eq!(
             outcomes[0].step_logits_sha256.len(),
@@ -4613,7 +4769,7 @@ mod tests {
 
     #[test]
     fn four_ranks_produce_the_reference_token_sequence() {
-        let outcomes = run_two_to_four_ranks(4, vec![3, 7], 2, false);
+        let outcomes = tcp_matching_loopback(4, vec![3, 7], 2, false);
         assert_eq!(outcomes.len(), 4);
         for outcome in &outcomes[1..] {
             assert_eq!(outcome.step_tokens, outcomes[0].step_tokens);
@@ -4624,12 +4780,130 @@ mod tests {
             "tokens: {:?}",
             reference.reference_tokens
         );
-        assert!(
-            reference.max_logits_rel_l2 <= 2.0e-2,
-            "max logits rel L2 {} over 2e-2",
-            reference.max_logits_rel_l2
-        );
         assert!(reference.seam_comparisons >= 40);
+    }
+
+    /// GLM's sharded host forward on the tiny fixture, one thread per rank, with `seams(rank)` built
+    /// on the rank's own thread so a TCP rank can wait there for its peers. Returns every rank's
+    /// logits and what a probe through the rounded gather gave it.
+    fn glm_ranks(
+        source: &SafeTensorsSource,
+        world: usize,
+        tokens: &[u32],
+        seams: impl Fn(usize) -> Seams + Sync,
+    ) -> Vec<(Vec<Vec<f32>>, Vec<f32>)> {
+        let config = Glm5NextConfig::tiny();
+        let ranks: Vec<(TpLayout, Glm5NextWeights)> = (0..world)
+            .map(|rank| {
+                let layout = TpLayout {
+                    rank,
+                    world_size: world,
+                };
+                let weights =
+                    Glm5NextWeights::load_tp(&config, source, REFERENCE_TENSOR_LIMIT, layout)
+                        .expect("the fixture splits");
+                (layout, weights)
+            })
+            .collect();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = ranks
+                .iter()
+                .map(|(layout, weights)| {
+                    let seams = &seams;
+                    scope.spawn(move || {
+                        let (collective, gather) = seams(layout.rank);
+                        let tp =
+                            TpRuntime::new(*layout, collective).expect("the seams are this rank");
+                        let gather = BitGatherHandle::new(gather);
+                        let mut state = weights.new_state();
+                        let logits = weights
+                            .forward_tp(&tp, &gather, &mut state, tokens)
+                            .expect("the rank runs");
+                        // Thirds are not bf16 values, so the probe shows whether the gather rounds.
+                        let probe = [layout.rank as f32 + 1.0 / 3.0, -2.0 / 3.0];
+                        let mut gathered = vec![0.0; probe.len() * world];
+                        tp.all_gather(&probe, &mut gathered)
+                            .expect("the probe gathers");
+                        (logits, gathered)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("rank thread"))
+                .collect()
+        })
+    }
+
+    /// GLM's sharded host forward through this adapter: two and four ranks over sparkflash-comm's
+    /// loopback cluster and over TCP give every rank the same bits as the in-process bus, on the
+    /// canonical bf16 wire and on the exact one, and one rank with no transport gives the plain
+    /// one-rank forward.
+    #[test]
+    fn glm_over_loopback_and_tcp_matches_the_in_process_bus_bit_for_bit() {
+        let bits = |values: &[f32]| -> Vec<u32> { values.iter().map(|v| v.to_bits()).collect() };
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let config = Glm5NextConfig::tiny();
+        write_synthetic_checkpoint(fixture.path(), &config, 7, 2).expect("fixture");
+        let source = SafeTensorsSource::open(fixture.path(), &fixture.path().join(INDEX_NAME))
+            .expect("source");
+        let tokens = [3, 17, 42, 5, 63, 0, 28];
+
+        let whole =
+            Glm5NextWeights::load(&config, &source, REFERENCE_TENSOR_LIMIT).expect("weights");
+        let plain = whole
+            .forward(&mut whole.new_state(), &tokens)
+            .expect("forward");
+        let one = glm_ranks(&source, 1, &tokens, |rank| {
+            tp4_seams(rank, 1, None, Wire::Bf16)
+        });
+        assert_eq!(bits(&one[0].0.concat()), bits(&plain.concat()), "one rank");
+        assert_eq!(
+            bits(&one[0].1),
+            bits(&[1.0 / 3.0, -2.0 / 3.0]),
+            "one rank's gather"
+        );
+
+        for (world, wire) in [2, 4]
+            .into_iter()
+            .flat_map(|w| [(w, Wire::Bf16), (w, Wire::F32)])
+        {
+            let bus = Arc::new(LocalBus::new(world).with_wire(wire));
+            let in_process = glm_ranks(&source, world, &tokens, |rank| {
+                let adapter = LocalRank {
+                    rank,
+                    bus: Arc::clone(&bus),
+                };
+                (Box::new(adapter.clone()), Box::new(adapter))
+            });
+            let _range = PORT_RANGE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let base_port = free_base_port(world as u16);
+            for wiring in [Wiring::Loopback, Wiring::Tcp] {
+                let cluster = LoopbackCluster::new(LoopbackConfig {
+                    world_size: world,
+                    ..LoopbackConfig::default()
+                })
+                .expect("loopback cluster");
+                let ranks = glm_ranks(&source, world, &tokens, |rank| {
+                    let transport = wired(wiring, rank, world, base_port, &cluster);
+                    tp4_seams(rank, world, Some(transport), wire)
+                });
+                for (rank, (ours, theirs)) in ranks.iter().zip(&in_process).enumerate() {
+                    assert_eq!(
+                        bits(&ours.0.concat()),
+                        bits(&theirs.0.concat()),
+                        "world {world} rank {rank}: {wiring:?} {wire:?} logits"
+                    );
+                    assert_eq!(
+                        bits(&ours.1),
+                        bits(&theirs.1),
+                        "world {world} rank {rank}: {wiring:?} {wire:?} gather"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

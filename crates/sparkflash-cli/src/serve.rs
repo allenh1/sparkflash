@@ -147,7 +147,7 @@ use sparkflash_engine::config::ModelConfig;
 use sparkflash_engine::forward::{
     InferenceEngine, SamplerOptions, Sampling, SequenceState, StepOutput,
 };
-use sparkflash_engine::linalg::{CHECKPOINT_TENSOR_LIMIT, REFERENCE_TENSOR_LIMIT, argmax};
+use sparkflash_engine::linalg::{CHECKPOINT_TENSOR_LIMIT, REFERENCE_TENSOR_LIMIT, finite_argmax};
 use sparkflash_engine::loader::ReferenceWeights;
 #[cfg(feature = "tp4-serve")]
 use sparkflash_engine::prompt_ranks::MergedPosition;
@@ -568,6 +568,14 @@ pub struct ServeOptions {
     /// Serve a real sharded checkpoint: a directory holding `config.json` and the safetensors
     /// index, or the index file itself.
     pub checkpoint: Option<PathBuf>,
+    /// The model pack this run serves, when `--model` named one.
+    ///
+    /// `None` is the V4.1 engine every other flag in this file describes. `Some` selects a pack
+    /// from sparkflash-model's catalogue and hands the run to that pack's own serving arm, which
+    /// is why the V4.1-only flags are refused alongside it.
+    pub model: Option<String>,
+    /// The context window a packed model allocates.
+    pub context: Option<usize>,
     /// The `tokenizer.json` to detokenise with, when the operator passed `--tokenizer`.
     ///
     /// `None` means the default is resolved at startup from the executable's directory, then the
@@ -588,6 +596,23 @@ pub struct ServeOptions {
     /// How many requests the scheduler admits at once; only meaningful with
     /// [Self::continuous_batching], and 1 is a legal (degenerate) batch of one.
     pub max_batch: usize,
+    /// How many packed-model requests the generic host driver runs at once.
+    ///
+    /// Each worker owns one session at a time, so this is concurrency, not a fused batch. The
+    /// default of 1 is the serial path; a value above 1 is refused for the V4.1 reference engine,
+    /// which has its own [Self::continuous_batching] scheduler.
+    pub concurrency: usize,
+    /// Step the packed model's concurrent sessions as one batch over the weights.
+    ///
+    /// Only the Qwen3.8-Flash-Next device arm implements it; a packed backend without a fused
+    /// engine ignores the flag and keeps one session a worker. A fused session does not speculate
+    /// and a prefill runs alone, so this trades draft verification for shared weight reads.
+    pub fuse_batch: bool,
+    /// The KV memory the packed model's session caches may claim, in GiB.
+    ///
+    /// Unset takes the arm's laptop slice; a node with more room under the weights raises it
+    /// rather than shortening the context.
+    pub kv_budget_gib: Option<usize>,
     /// The element cap the reference pass applies to one tensor. Above it, a tensor is refused
     /// rather than materialised.
     ///
@@ -731,6 +756,40 @@ impl ServeOptions {
             Some(value) => value,
             None => DEFAULT_MAX_BATCH,
         };
+        // The generic host driver's concurrency is a packed-model knob: each worker opens its own
+        // session, which the V4.1 reference engine does not do (it has the continuous batching
+        // scheduler above). Refusing the combination is better than silently running serial.
+        if cli.concurrency == 0 {
+            return Err("--concurrency must be at least 1".to_owned());
+        }
+        if cli.concurrency > sparkflash_serve::host::DEFAULT_QUEUE {
+            return Err(format!(
+                "--concurrency {} exceeds the {}-request host queue",
+                cli.concurrency,
+                sparkflash_serve::host::DEFAULT_QUEUE
+            ));
+        }
+        if cli.fuse_batch && cli.model.is_none() {
+            return Err("--fuse-batch is the packed model\u{27}s knob; the V4.1 engine batches with --continuous-batching".to_owned());
+        }
+        if cli.fuse_batch && cli.concurrency < 2 {
+            return Err("--fuse-batch needs --concurrency of at least 2".to_owned());
+        }
+        if cli.kv_budget_gib.is_some() && cli.model.is_none() {
+            return Err(
+                "--kv-budget-gib is the packed model's knob; the V4.1 engine sizes its own caches"
+                    .to_owned(),
+            );
+        }
+        if cli.kv_budget_gib == Some(0) {
+            return Err("--kv-budget-gib must be at least 1".to_owned());
+        }
+        if cli.model.is_none() && cli.concurrency != 1 {
+            return Err(
+                "--concurrency is the packed-model host driver's knob; the V4.1 engine uses --continuous-batching/--max-batch"
+                    .to_owned(),
+            );
+        }
         // The packed Engram store is rows of a checkpoint's tensors; the synthetic plan carries
         // its own tiny table in memory, so there is no checkpoint to page and the combination is
         // refused rather than silently ignored.
@@ -768,6 +827,49 @@ impl ServeOptions {
                     .to_owned(),
             );
         }
+        // A packed model is served by its own arm. Every flag below describes the V4.1 engine's
+        // weights, its device session, its Engram paging or its four-rank group; silently ignoring
+        // one would serve something other than what the operator asked for.
+        if let Some(model) = cli.model.as_deref() {
+            let mut unsupported: Vec<&str> = Vec::new();
+            if cli.engram_dir.is_some() {
+                unsupported.push("--engram-dir");
+            }
+            if cli.continuous_batching {
+                unsupported.push("--continuous-batching");
+            }
+            if cli.max_batch.is_some() {
+                unsupported.push("--max-batch");
+            }
+            if cli.engine != EngineChoice::Reference {
+                unsupported.push("--engine");
+            }
+            if cli.device_cubin.is_some() {
+                unsupported.push("--device-cubin");
+            }
+            if cli.element_limit.is_some() {
+                unsupported.push("--element-limit");
+            }
+            if cli.device_token_dir.is_some() {
+                unsupported.push("--device-token-dir");
+            }
+            if cli.device_token_derived_claim {
+                unsupported.push("--device-token-derived-claim");
+            }
+            if cli.device_token_live {
+                unsupported.push("--device-token-live");
+            }
+            #[cfg(feature = "tp4-serve")]
+            if cli.tp4_rank.is_some() {
+                unsupported.push("--tp4-rank");
+            }
+            if !unsupported.is_empty() {
+                return Err(format!(
+                    "--model {model} serves its own pack: {} cannot be combined with it",
+                    unsupported.join(", ")
+                ));
+            }
+        }
         match (cli.synthetic, checkpoint) {
             (true, Some(_)) => Err(
                 "--synthetic and --checkpoint cannot both be given: --synthetic serves the tiny synthetic plan and --checkpoint serves a real sharded checkpoint, so choose one"
@@ -778,11 +880,16 @@ impl ServeOptions {
                 bind: cli.bind,
                 synthetic,
                 checkpoint,
+                model: cli.model,
+                context: cli.context,
                 tokenizer,
                 max_tokens: cli.max_tokens,
                 max_logprobs,
                 continuous_batching: cli.continuous_batching,
                 max_batch,
+                concurrency: cli.concurrency,
+                fuse_batch: cli.fuse_batch,
+                kv_budget_gib: cli.kv_budget_gib,
                 element_limit,
                 engine: cli.engine,
                 device_cubin: cli.device_cubin,
@@ -834,7 +941,7 @@ impl ServeOptions {
 /// A server with no weights would answer with text that is not model output, so this is a refusal
 /// rather than a default: the operator says which weights to serve.
 fn no_weights_message() -> String {
-    "no weights to serve: pass --synthetic for the tiny synthetic plan, or --checkpoint DIR for a real checkpoint".to_owned()
+    "no weights to serve: pass --synthetic for the tiny synthetic plan, or --checkpoint DIR for a real checkpoint (with --model ID, --synthetic serves that pack's own tiny fixture)".to_owned()
 }
 
 /// The element cap a run gets when the operator does not name one.
@@ -868,15 +975,34 @@ struct ServeArgs {
     #[arg(long)]
     synthetic: bool,
     /// Serve a real sharded checkpoint: its directory, or its safetensors index file.
+    ///
+    /// A packed model with no checkpoint resolves its canonical snapshot in the Hugging Face
+    /// cache, so `--model nvidia/Qwen3.8-Flash-Next-NVFP4` works after `hf download`.
     #[arg(long, value_name = "DIR")]
     checkpoint: Option<PathBuf>,
+    /// Serve a model pack by id instead of the V4.1 engine.
+    ///
+    /// The only pack wired today is nvidia/Qwen3.8-Flash-Next-NVFP4 (alias
+    /// qwen3.8-flash-next-nvfp4), which is device-only and TP=1: it needs a GPU whose driver can
+    /// load the embedded cubin plus its canonical Hugging Face cache snapshot. With
+    /// --synthetic it serves the pack's own tiny fixture instead, which is a runnable demo of the
+    /// same code path rather than the V4.1 tiny plan.
+    #[arg(long, value_name = "ID")]
+    model: Option<String>,
+    /// The context window a packed model allocates, in tokens.
+    ///
+    /// Only meaningful with --model. Absent means the pack's own default (65,536 for Qwen4-Exp);
+    /// the pack refuses a window it cannot serve.
+    #[arg(long, value_name = "N")]
+    context: Option<usize>,
     /// The tokenizer.json to detokenise with; without it the default is resolved at startup.
     ///
-    /// The default is `reference/tokenizer.json` next to the executable, then under the current
-    /// directory. That makes a copied binary work when the stage carries the `reference/`
-    /// directory, and never depends on the checkout that built it. A real deployment passes the
-    /// model's own tokenizer file, because detokenising with the wrong vocabulary produces text
-    /// that is not the model's output.
+    /// A packed model defaults to the tokenizer.json beside its checkpoint. The V4.1 engine uses
+    /// `reference/tokenizer.json` next to the executable, then under the current directory. That
+    /// makes a copied binary work when the stage carries the `reference/` directory, and never
+    /// depends on the checkout that built it. A real deployment passes the model's own tokenizer
+    /// file, because detokenising with the wrong vocabulary produces text that is not the model's
+    /// output.
     #[arg(long, value_name = "FILE")]
     tokenizer: Option<PathBuf>,
     /// The ceiling on tokens generated for one request.
@@ -953,6 +1079,28 @@ struct ServeArgs {
     /// --continuous-batching).
     #[arg(long, value_name = "N")]
     max_batch: Option<usize>,
+    /// How many packed-model requests the generic host driver runs at once.
+    ///
+    /// Each worker owns one session, so this is concurrent execution, not a fused batch. The
+    /// default is 1 (one request at a time); the flag is refused without --model because the
+    /// V4.1 engine's concurrency knob is --continuous-batching/--max-batch.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    concurrency: usize,
+    /// Step the packed model's concurrent sessions as one batch over the weights (--model only).
+    ///
+    /// Each decode step reads the model's weights once for every session; a fused batch reads
+    /// them once for all of them, which is the only way concurrent requests add throughput on a
+    /// step bound by weight traffic. Requires --concurrency above 1. A member keeps its drafter -
+    /// its verify's rows join the same pass - and a prefill still runs alone.
+    #[arg(long)]
+    fuse_batch: bool,
+    /// How much KV memory the packed model's session caches may claim, in GiB.
+    ///
+    /// The arm's default is a laptop slice - one full 262,144-token window - so a second session
+    /// needs a shorter --context. Raise this on a node where the weights leave more room, and the
+    /// worker count or window may then grow without the caches alone exhausting memory.
+    #[arg(long, value_name = "GIB")]
+    kv_budget_gib: Option<usize>,
     /// The element cap the reference pass applies to one tensor; the default follows the source.
     ///
     /// `--synthetic` keeps the reference guard, [REFERENCE_TENSOR_LIMIT], which the tiny plan fits
@@ -2645,10 +2793,7 @@ impl SpeculativeAccounting {
 /// keeps every acceptance comparison away from NaN semantics (where `NaN != NaN` and a malformed
 /// row could otherwise look like a mismatch or, worse, a match).
 fn finite_target_argmax(logits: &[f32]) -> Option<u32> {
-    if !logits.iter().all(|value| value.is_finite()) {
-        return None;
-    }
-    argmax(logits).map(|index| index as u32)
+    finite_argmax(logits).map(|index| index as u32)
 }
 
 /// The wall-clock numbers one request measured.
@@ -5179,6 +5324,11 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             return ExitCode::from(EXIT_REFUSED);
         }
     };
+    // A packed model is served by its own arm: none of the V4.1 recipe, engine selection or
+    // device-chain wiring below describes it, and running through them would serve the wrong model.
+    if let Some(model) = options.model.clone() {
+        return serve_pack(&model, &options);
+    }
     #[cfg(feature = "tp4-serve")]
     if let ServeEngine::Tp4(tp4) = serve_engine(&options) {
         return run_tp4(&options, tp4);
@@ -5310,6 +5460,188 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
     serve_with_engine(engine, metrics, &tokenizer, &options)
 }
 
+/// Serves a model pack that brings its own arm.
+///
+/// sparkflash-model's catalogue is what `sparkflash models` prints, so an id that names a
+/// catalogue entry but has no arm here is a build that cannot serve what it advertises - the
+/// refusal says which ids this binary does know rather than failing at the first request.
+fn serve_pack(model: &str, options: &ServeOptions) -> ExitCode {
+    match model {
+        sparkflash_model_qwen4_exp::MODEL_ID | sparkflash_model_qwen4_exp::WEIGHTS_ID => {
+            serve_qwen4_exp(options)
+        }
+        other => {
+            let known: Vec<&str> = sparkflash_model::MODELS
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect();
+            eprintln!(
+                "sparkflash serve: --model {other:?} has no serving arm in this build; known model ids: {}",
+                known.join(", ")
+            );
+            ExitCode::from(EXIT_REFUSED)
+        }
+    }
+}
+
+/// The Qwen3.8-Flash-Next arm: the TP=1 device backend behind the generic host driver.
+///
+/// The pack owns the arithmetic, the chat template and the token ids; this function owns the
+/// process - open the checkpoint, choose the prompt seam, start the driver, serve the router.
+fn serve_qwen4_exp(options: &ServeOptions) -> ExitCode {
+    use sparkflash_model::ModelBackend as _;
+
+    let directory = match (options.synthetic, options.checkpoint.as_deref()) {
+        (true, _) => {
+            let directory = std::env::temp_dir()
+                .join(format!("sparkflash-qwen4-fixture-{}", std::process::id()));
+            let config = sparkflash_model_qwen4_exp::Qwen4ExpConfig::tiny();
+            if let Err(error) =
+                sparkflash_model_qwen4_exp::write_synthetic_checkpoint(&directory, &config, 7)
+            {
+                eprintln!(
+                    "sparkflash serve: cannot write the tiny Qwen4-Exp fixture to {}: {error}",
+                    directory.display()
+                );
+                return ExitCode::from(EXIT_REFUSED);
+            }
+            eprintln!(
+                "sparkflash serve: serving the tiny Qwen4-Exp fixture at {} with a byte codec: this exercises the serving path, it is not the released model",
+                directory.display()
+            );
+            directory
+        }
+        (false, Some(path)) => path.to_path_buf(),
+        (false, None) => {
+            let Some(directory) =
+                sparkflash_model_qwen4_exp::cached_model_dir(sparkflash_model_qwen4_exp::MODEL_ID)
+            else {
+                eprintln!(
+                    "sparkflash serve: {} is not in the Hugging Face cache; run hf download {} or pass --checkpoint DIR",
+                    sparkflash_model_qwen4_exp::MODEL_ID,
+                    sparkflash_model_qwen4_exp::MODEL_ID,
+                );
+                return ExitCode::from(EXIT_REFUSED);
+            };
+            directory
+        }
+    };
+    // The prompt seam is built before the checkpoint is opened. Opening a real checkpoint uploads
+    // 77.8 GiB; discovering afterwards that the tokenizer is missing (or names a vocabulary whose
+    // special ids disagree with the configuration) would waste the upload and leave the GPU full.
+    // The pack's tokenizer.json lives beside the snapshot, so a cache-resolved checkpoint needs no
+    // second path on the command line.
+    let released_seam: Option<Arc<dyn sparkflash_model::PromptCodec>> = if options.synthetic {
+        None
+    } else {
+        let tokenizer = options
+            .tokenizer
+            .clone()
+            .unwrap_or_else(|| directory.join("tokenizer.json"));
+        if !tokenizer.is_file() {
+            eprintln!(
+                "sparkflash serve: --model {} needs --tokenizer FILE, or a tokenizer.json beside the checkpoint at {}",
+                sparkflash_model_qwen4_exp::MODEL_ID,
+                tokenizer.display()
+            );
+            return ExitCode::from(EXIT_REFUSED);
+        }
+        match sparkflash_model_qwen4_exp::QwenCodec::from_path(&tokenizer) {
+            Ok(codec) => Some(Arc::new(codec)),
+            Err(message) => {
+                eprintln!("sparkflash serve: {message}");
+                return ExitCode::from(EXIT_REFUSED);
+            }
+        }
+    };
+    let context = options
+        .context
+        .unwrap_or(sparkflash_model_qwen4_exp::DEFAULT_DEVICE_CONTEXT);
+    // Each worker opens its own full-window KV set. Refuse a worker count whose caches alone would
+    // exceed the documented budget before uploading 77.8 GiB of weights, rather than failing one
+    // request at a time when the node runs out of memory.
+    let budget = options.kv_budget_gib.map_or(
+        sparkflash_model_qwen4_exp::CONCURRENCY_KV_BUDGET_BYTES,
+        sparkflash_model_qwen4_exp::kv_budget_bytes,
+    );
+    let kv_bytes = sparkflash_model_qwen4_exp::concurrency_kv_bytes(context, options.concurrency);
+    eprintln!(
+        "sparkflash serve: KV cache {:.1} GiB ({concurrency} x {context} tokens), budget {:.0} GiB",
+        kv_bytes as f64 / (1u64 << 30) as f64,
+        budget as f64 / (1u64 << 30) as f64,
+        concurrency = options.concurrency,
+    );
+    if kv_bytes > budget {
+        eprintln!(
+            "sparkflash serve: --concurrency {} at --context {context} needs {:.1} GiB of KV caches, over the {:.0} GiB budget; lower --concurrency or --context, or raise --kv-budget-gib on a node with more room",
+            options.concurrency,
+            kv_bytes as f64 / (1u64 << 30) as f64,
+            budget as f64 / (1u64 << 30) as f64,
+        );
+        return ExitCode::from(EXIT_REFUSED);
+    }
+    let mut backend = match sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::open(
+        &directory, context,
+    ) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!(
+                "sparkflash serve: cannot open {}: {error}",
+                directory.display()
+            );
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    // One pooled session a concurrent request: the driver opens exactly `concurrency` sessions, so
+    // a smaller pool would make a request wait for a slot it asked for at start-up.
+    if options.fuse_batch
+        && let Err(error) = backend.enable_fusion(options.concurrency)
+    {
+        eprintln!("sparkflash serve: cannot fuse the batch: {error}");
+        return ExitCode::from(EXIT_REFUSED);
+    }
+    let descriptor = backend.descriptor().clone();
+    let seam: Arc<dyn sparkflash_model::PromptCodec> = match released_seam {
+        Some(seam) => seam,
+        None => Arc::new(sparkflash_model_qwen4_exp::ByteCodec::new(
+            descriptor.vocab_size,
+        )),
+    };
+    let driver = match sparkflash_serve::HostDriver::start(
+        Box::new(backend),
+        Arc::clone(&seam),
+        sparkflash_serve::HostOptions {
+            // The pack's descriptor is the authority on the model's output ceiling; the CLI
+            // default belongs to the V4.1 surface and may be larger.
+            max_tokens: options
+                .max_tokens
+                .min(sparkflash_model_qwen4_exp::MAX_OUTPUT_TOKENS),
+            concurrency: options.concurrency,
+            ..sparkflash_serve::HostOptions::default()
+        },
+    ) {
+        Ok(driver) => driver,
+        Err(message) => {
+            eprintln!("sparkflash serve: {message}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    let metrics = driver.metrics();
+    println!(
+        "sparkflash serve: {} ({}) at TP=1 on {}, context {context}",
+        descriptor.id,
+        descriptor.weights_id,
+        directory.display()
+    );
+    let engine: Arc<dyn ApiInferenceEngine> = if options.synthetic {
+        // The byte codec's output is arbitrary text, not the released template's channels.
+        Arc::new(driver)
+    } else {
+        sparkflash_api::qwen::QwenResponseEngine::layer(Arc::new(driver))
+    };
+    serve_with_seam(engine, metrics, seam, None, options, descriptor)
+}
+
 /// Loads the tokenizer seam, builds the app state and serves the router until stopped.
 ///
 /// The checkpoint path and the debug-build scripted path both end here, so the wire contract
@@ -5338,6 +5670,30 @@ fn serve_with_engine(
             return ExitCode::from(EXIT_REFUSED);
         }
     };
+    serve_with_seam(
+        engine,
+        metrics,
+        seam,
+        device_token_source,
+        options,
+        sparkflash_model::default_model().clone(),
+    )
+}
+
+/// Builds the app state from an already chosen prompt seam and serves the router.
+///
+/// A model pack brings its own seam (its own chat template and special ids) and its own
+/// descriptor; the V4.1 path arrives here with the seam built from `tokenizer.json` and the
+/// catalogue's default descriptor. Everything below this point is model-agnostic, which is what
+/// keeps the wire contract from drifting between the engines.
+fn serve_with_seam(
+    engine: Arc<dyn ApiInferenceEngine>,
+    metrics: Arc<Metrics>,
+    seam: Arc<dyn sparkflash_model::PromptCodec>,
+    device_token_source: Option<Arc<dyn DeviceTokenSource>>,
+    options: &ServeOptions,
+    descriptor: sparkflash_model::ModelDescriptor,
+) -> ExitCode {
     // The card reports the weights that actually answered: a finetune served under the released
     // model's id is otherwise indistinguishable from the released weights (DECISIONS.md D38).
     let served_checkpoint = options
@@ -5346,7 +5702,7 @@ fn serve_with_engine(
         .map(|path| path.display().to_string());
     let state = AppState::new(engine)
         .with_metrics(metrics)
-        .with_model_descriptor(Arc::new(sparkflash_model::default_model().clone()))
+        .with_model_descriptor(Arc::new(descriptor))
         .with_max_logprobs(options.max_logprobs)
         .with_tokenizer(seam)
         .with_api_key(options.api_key.clone())
@@ -8069,6 +8425,112 @@ mod tests {
     fn the_driver_reports_the_canonical_model_id() {
         let driver = synthetic_driver(1);
         assert_eq!(driver.model_id(), MODEL_ID);
+    }
+
+    #[test]
+    fn a_pack_model_parses_and_carries_its_window() {
+        let options = ServeOptions::parse(vec![
+            "--model".to_owned(),
+            "qwen3.8-flash-next-nvfp4".to_owned(),
+            "--synthetic".to_owned(),
+            "--context".to_owned(),
+            "4096".to_owned(),
+        ])
+        .expect("a pack model parses");
+        assert_eq!(options.model.as_deref(), Some("qwen3.8-flash-next-nvfp4"));
+        assert_eq!(options.context, Some(4096));
+        assert!(options.synthetic, "the fixture is the synthetic source");
+    }
+
+    #[test]
+    fn the_v41_only_flags_are_refused_alongside_a_pack_model() {
+        for flag in [
+            vec!["--engine", "device"],
+            vec!["--engram-dir", "/tmp/engram"],
+            vec!["--continuous-batching"],
+            vec!["--device-cubin", "/tmp/router.cubin"],
+            vec!["--element-limit", "1024"],
+        ] {
+            let mut args = vec![
+                "--model".to_owned(),
+                "qwen3.8-flash-next-nvfp4".to_owned(),
+                "--synthetic".to_owned(),
+            ];
+            args.extend(flag.iter().map(|value| (*value).to_owned()));
+            let error = ServeOptions::parse(args)
+                .expect_err("a V4.1 flag cannot be combined with a pack model");
+            assert!(
+                error.contains(flag[0]),
+                "the refusal must name {}: {error}",
+                flag[0]
+            );
+        }
+    }
+
+    #[test]
+    fn the_kv_budget_is_a_packed_model_flag_and_counts_gib() {
+        let parsed = ServeOptions::parse(vec![
+            "--model".to_owned(),
+            "qwen3.8-flash-next-nvfp4".to_owned(),
+            "--synthetic".to_owned(),
+            "--kv-budget-gib".to_owned(),
+            "24".to_owned(),
+        ])
+        .expect("a packed model takes a kv budget");
+        assert_eq!(parsed.kv_budget_gib, Some(24));
+        assert_eq!(
+            sparkflash_model_qwen4_exp::kv_budget_bytes(24),
+            24 * (1u64 << 30)
+        );
+
+        let without_model = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--kv-budget-gib".to_owned(),
+            "8".to_owned(),
+        ])
+        .expect_err("the V4.1 engine sizes its own caches");
+        assert!(without_model.contains("--kv-budget-gib"), "{without_model}");
+
+        let zero = ServeOptions::parse(vec![
+            "--model".to_owned(),
+            "qwen3.8-flash-next-nvfp4".to_owned(),
+            "--synthetic".to_owned(),
+            "--kv-budget-gib".to_owned(),
+            "0".to_owned(),
+        ])
+        .expect_err("a zero budget admits no session");
+        assert!(zero.contains("at least 1"), "{zero}");
+    }
+
+    #[test]
+    fn concurrency_is_a_packed_model_flag() {
+        let parsed = ServeOptions::parse(vec![
+            "--model".to_owned(),
+            "qwen3.8-flash-next-nvfp4".to_owned(),
+            "--synthetic".to_owned(),
+            "--concurrency".to_owned(),
+            "4".to_owned(),
+        ])
+        .expect("a packed model takes a concurrency");
+        assert_eq!(parsed.concurrency, 4);
+
+        let without_model = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--concurrency".to_owned(),
+            "2".to_owned(),
+        ])
+        .expect_err("the V4.1 engine has its own batching flags");
+        assert!(without_model.contains("--concurrency"), "{without_model}");
+
+        let zero = ServeOptions::parse(vec![
+            "--model".to_owned(),
+            "qwen3.8-flash-next-nvfp4".to_owned(),
+            "--synthetic".to_owned(),
+            "--concurrency".to_owned(),
+            "0".to_owned(),
+        ])
+        .expect_err("zero workers admit nothing");
+        assert!(zero.contains("at least 1"), "{zero}");
     }
 
     // ---- option parsing ------------------------------------------------------------------

@@ -52,6 +52,12 @@ pub enum DType {
     F8E8M0,
     /// FP4 E2M1, packed two values per byte. Routed and MTP experts.
     F4E2M1,
+    /// Raw unsigned bytes. NVFP4 checkpoints (NVIDIA ModelOpt) store a packed FP4 weight as
+    /// `U8` with the last dimension already halved, alongside its block scales.
+    U8,
+    /// 64-bit signed integer. The Qwen4-Exp PLE checkpoints a few derived hash constants
+    /// (`layer_multipliers`, `ngram_heads_offsets`, `ngram_heads_vocab_sizes`).
+    I64,
 }
 
 impl DType {
@@ -63,7 +69,8 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::BF16 | DType::F16 => 2,
-            DType::F8E4M3 | DType::F8E8M0 | DType::F4E2M1 => 1,
+            DType::F8E4M3 | DType::F8E8M0 | DType::F4E2M1 | DType::U8 => 1,
+            DType::I64 => 8,
         }
     }
 
@@ -106,9 +113,29 @@ impl DType {
             DType::F8E4M3 => "F8_E4M3",
             DType::F8E8M0 => "F8_E8M0",
             DType::F4E2M1 => "F4_E2M1",
+            DType::U8 => "U8",
+            DType::I64 => "I64",
         }
     }
+
+    /// The format whose [DType::name] is `name`, the way an index that records names reads back.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        FORMATS.into_iter().find(|dtype| dtype.name() == name)
+    }
 }
+
+/// Every format, for [DType::from_name].
+const FORMATS: [DType; 8] = [
+    DType::F32,
+    DType::BF16,
+    DType::F16,
+    DType::F8E4M3,
+    DType::F8E8M0,
+    DType::F4E2M1,
+    DType::U8,
+    DType::I64,
+];
 
 /// The K-block width of every scale grid in this checkpoint: one scale per 32 elements.
 pub const SCALE_BLOCK: usize = 32;
@@ -127,4 +154,29 @@ pub fn dense_scale_shape(out: usize, r#in: usize) -> [usize; 2] {
 /// blocking along `out` (model.py:219-224, kernel.py:486-499).
 pub fn expert_scale_shape(out: usize, r#in: usize) -> [usize; 2] {
     [out, r#in.div_ceil(SCALE_BLOCK)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_format_reads_back_from_its_name() {
+        // Exhaustive on purpose: a new format stops this compiling until it is listed in FORMATS.
+        let listed = |dtype: DType| match dtype {
+            DType::F32
+            | DType::BF16
+            | DType::F16
+            | DType::F8E4M3
+            | DType::F8E8M0
+            | DType::F4E2M1
+            | DType::U8
+            | DType::I64 => FORMATS.contains(&dtype),
+        };
+        for dtype in FORMATS {
+            assert!(listed(dtype));
+            assert_eq!(DType::from_name(dtype.name()), Some(dtype));
+        }
+        assert_eq!(DType::from_name("I8"), None);
+    }
 }

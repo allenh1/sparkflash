@@ -63,21 +63,8 @@ use crate::shard::StoredShard;
 /// a scale grid that starts mid-row from being under-aligned.
 pub const ARENA_ALIGNMENT: usize = 256;
 
-/// The FNV-1a 64 offset basis, matching the plan and read digests.
-pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-/// The FNV-1a 64 prime.
-pub const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-/// FNV-1a 64 over a byte slice.
-#[must_use]
-pub fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash = FNV_OFFSET;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
+/// The FNV-1a 64 digest the plan and read digests use, the one every converted rank file carries.
+pub use sparkflash_weights::rank_file::{FNV_OFFSET, FNV_PRIME, fnv1a};
 
 /// How the arena's device slabs are allocated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1147,40 +1134,16 @@ impl ArenaAllocator for CudaArenaAllocator<'_> {
                 use_odirect,
             );
         }
-        // Device memory: stream the file through one 1 GiB page-aligned window (read, then copy), so
-        // the host never holds a second copy of the whole rank.
-        const WINDOW: usize = 1 << 30;
-        const ALIGN: usize = 4096;
-        let mut storage = vec![0u8; WINDOW.min(len) + ALIGN];
-        let shift = storage.as_ptr().align_offset(ALIGN);
-        let mut done = 0usize;
-        let mut report = DirectReadReport {
-            bytes_read: 0,
-            chunks: 0,
-            concurrency,
+        // Device memory: through the driver's 1 GiB host window.
+        self.cuda.upload_file_parallel(
+            destination,
+            path,
+            file_offset,
+            len,
             chunk_bytes,
-            direct_io: use_odirect,
-        };
-        while done < len {
-            let n = (len - done).min(WINDOW);
-            let buf = &mut storage[shift..shift + n];
-            let part = read_file_parallel_into_slice(
-                path,
-                file_offset + done as u64,
-                buf,
-                chunk_bytes,
-                concurrency,
-                use_odirect,
-            )?;
-            self.upload(&destination.offset(done), buf)?;
-            report.chunks += part.chunks;
-            report.concurrency = part.concurrency;
-            report.chunk_bytes = part.chunk_bytes;
-            report.direct_io &= part.direct_io;
-            done += n;
-        }
-        report.bytes_read = len;
-        Ok(report)
+            concurrency,
+            use_odirect,
+        )
     }
 
     fn mmap_from_file(

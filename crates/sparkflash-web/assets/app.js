@@ -237,6 +237,46 @@ function requireSaved() {
   return false;
 }
 
+/* Topology: the four-Spark V4.1 plan, or one TP=1 pack on this machine. */
+
+function soloDefaults() {
+  return S.state?.supported?.solo || null;
+}
+
+function isSolo(state = S.state) {
+  return (state?.config?.cluster?.nodes?.length || 0) === 1;
+}
+
+function wantsConversion(state = S.state) {
+  const solo = state?.supported?.solo || soloDefaults();
+  return !!solo && state?.config?.model?.weights !== solo.weights;
+}
+
+function setButtonLabel(id, label) {
+  const button = $(id);
+  const icon = button.querySelector("svg");
+  button.innerHTML = (icon ? icon.outerHTML : "") + esc(label);
+}
+
+function servePort(config) {
+  const bind = config?.cluster?.http_bind || "0.0.0.0:8000";
+  return bind.slice(bind.lastIndexOf(":") + 1) || "8000";
+}
+
+// The cached snapshot the state endpoint found for the selected model, if any.
+function cachedCheckpoint(state = S.state) {
+  const checkpoint = state?.checkpoint;
+  return checkpoint?.from_cache ? checkpoint.cached || null : null;
+}
+
+// Whether the weights are already on this Spark: a complete cache snapshot, or a checkpoint
+// directory the operator set explicitly.
+function checkpointPresent(state = S.state) {
+  const checkpoint = state?.checkpoint;
+  if (!checkpoint) return false;
+  return checkpoint.from_cache ? !!checkpoint.cached?.complete : !!checkpoint.exists;
+}
+
 /* State */
 
 async function refreshState() {
@@ -311,6 +351,12 @@ function renderState() {
 
   const config = state.config;
   const cluster = state.cluster;
+  const solo = isSolo(state);
+  const brandSub = document.querySelector(".brand-sub");
+  if (brandSub) brandSub.textContent = solo ? "Local console" : "Cluster console";
+  setButtonLabel("action-status", solo ? "Server status" : "Rank status");
+  setButtonLabel("action-stop", solo ? "Stop server" : "Stop cluster");
+  setButtonLabel("action-launch", solo ? "Start server" : "Launch cluster");
   $("overview-sub").textContent = online
     ? [
         cluster?.model || config.model.id,
@@ -498,7 +544,9 @@ function paintModelSource() {
     warn = true;
   }
   const saved = S.state?.config?.model?.id;
-  const note = saved && id && id !== saved ? "Changing the model needs a fresh conversion on every rank." : "";
+  const note = saved && id && id !== saved
+    ? (isSolo() ? "Changing the model restarts the local server." : "Changing the model needs a fresh conversion on every rank.")
+    : "";
   const element = $("model-source");
   element.innerHTML = esc(text) + (note ? '<span class="model-note">' + esc(note) + "</span>" : "");
   element.classList.toggle("warn", warn);
@@ -744,7 +792,7 @@ const GUIDE_NEEDS = {
   download: ["find"],
   copy: ["download"],
   convert: ["software", "copy"],
-  launch: ["network", "convert"],
+  launch: ["network", "download", "convert"],
 };
 
 // Jobs whose result changes what the node check finds.
@@ -797,27 +845,37 @@ function guideModel(state) {
   const nodes = setup?.nodes || [];
   const online = !!(state.latest && state.latest.online);
   const saved = !!state.config_exists && !state.config_error;
+  const solo = isSolo(state);
+  const active = solo ? ["find", "download", "launch"] : GUIDE.slice();
   const configured = (state.discovery?.nodes || []).filter((node) => node.configured);
-  const sshOk = configured.length === 4 && configured.every((node) => node.ssh_ok === true);
+  const sshOk = configured.length === config.cluster.nodes.length && configured.every((node) => node.ssh_ok === true);
   const all = (field) => !!setup && nodes.every((node) => node[field] === "ready");
   const errors = (setup?.findings || []).filter((finding) => finding.severity === "error");
-  const found = saved && ((!!setup && nodes.every((node) => node.reachable)) || sshOk);
+  // A local TP=1 server needs no SSH password, no second Spark, and no fast network. Once the
+  // configuration names it, step 1 is done.
+  const found = saved && (solo || (!!setup && nodes.every((node) => node.reachable)) || sshOk);
   const networkErrors = errors.filter((finding) => finding.rank === null || finding.rank === undefined || nodes[finding.rank]?.reachable !== false);
+  const conversion = wantsConversion(state);
   const steps = {
     find: { done: found },
-    network: { done: found && !!setup?.plan && networkErrors.length === 0 && planApplied(config, setup.plan) },
-    software: { done: found && all("software"), running: runningJob(ofKind("sync-software")) },
-    download: { done: found && nodes[0]?.model === "ready", running: runningJob(ofKind("download")) },
-    copy: { done: found && all("model"), running: runningJob(ofKind("sync-model")) },
-    convert: { done: found && all("converted"), running: runningJob(isConvert) },
+    network: { done: solo || (found && !!setup?.plan && networkErrors.length === 0 && planApplied(config, setup.plan)) },
+    software: { done: solo || (found && all("software")), running: runningJob(ofKind("sync-software")) },
+    download: {
+      // The cache lookup in /api/state is authoritative; the node check only confirms it once
+      // the read-only probe has run.
+      done: found && (checkpointPresent(state) || nodes[0]?.model === "ready"),
+      running: runningJob(ofKind("download")),
+    },
+    copy: { done: solo || (found && all("model")), running: runningJob(ofKind("sync-model")) },
+    convert: { done: !conversion || (found && all("converted")), running: runningJob(isConvert) },
     launch: { done: online && !!state.latest.ready, running: runningJob(ofKind("launch")) },
   };
   for (const key of GUIDE) {
     steps[key].waitsFor = GUIDE_NEEDS[key].find((need) => !steps[need].done) || null;
     steps[key].available = !steps[key].waitsFor;
   }
-  const current = GUIDE.find((key) => !steps[key].done) || null;
-  return { setup, nodes, online, steps, current };
+  const current = active.find((key) => !steps[key].done) || null;
+  return { setup, nodes, online, steps, current, solo, active, conversion };
 }
 
 /* Step 1: the four Sparks */
@@ -876,10 +934,28 @@ function codeBlock(heading, text) {
 }
 
 function findBody(state) {
+  if (isSolo(state)) {
+    const model = state.config.model.id || state.config.model.weights;
+    const source = state.checkpoint?.path && !state.checkpoint.from_cache
+      ? "Checkpoint " + state.checkpoint.path
+      : "Hugging Face cache" + (state.checkpoint?.cache ? ": " + state.checkpoint.cache : "");
+    return '<p class="guide-lead">This Spark, <strong>' + esc(state.hostname) + "</strong>, runs the model by itself. " +
+      "No other Sparks are needed, and no SSH is used.</p>" +
+      '<div class="guide-facts"><strong>' + esc(model) + "</strong> · TP=1 · " + esc(fmtInt(state.config.runtime.max_context_tokens)) +
+      "-token context<br>" + esc(source) + "</div>" +
+      '<p class="guide-note">The server listens on <code>' + esc(state.config.cluster.http_bind) + "</code>. " +
+      'To change the model or the paths, open <a href="#setup" data-act="advanced">Advanced settings</a>.</p>';
+  }
   const candidates = sparkCandidates(state);
   ensurePick(state, candidates);
   const picked = candidates.filter((candidate) => (S.pick || []).includes(candidate.ssh));
   const parts = [];
+  const solo = soloDefaults();
+  if (solo) {
+    parts.push('<div class="solo-offer"><div><strong>Only have this machine?</strong>' +
+      '<span>Load <span class="mono">' + esc(solo.id) + '</span> here at TP=1. No second Spark, no SSH, no fast network.</span></div>' +
+      '<button class="btn btn-sm" type="button" data-act="use-solo">Run on this Spark only</button></div>');
+  }
   parts.push('<p class="guide-lead">This Spark, <strong>' + esc(state.hostname) + "</strong>, runs this page and is the first of the four. " +
     "Tick the three others. They need to be switched on and on the same network as this one.</p>");
   if (candidates.length === 0) {
@@ -939,6 +1015,59 @@ async function useSparks() {
     await refreshState();
     paintConfig(S.state.config, S.state.discovery, true);
     await Promise.all([discover(true), inspect(true)]);
+  } catch (error) {
+    toast("Not saved: " + error.message, true);
+  }
+}
+
+async function useSolo() {
+  if (!requireSaved()) return;
+  const state = S.state;
+  const solo = soloDefaults();
+  if (!solo) {
+    toast("This build has no single-node model profile.", true);
+    return;
+  }
+  if (state.config_exists && !isSolo(state)) {
+    const ok = await confirmAction({
+      title: "Run on this Spark only?",
+      body: "This replaces the four-Spark cluster in the saved configuration with one local " +
+        solo.id + " server. Converted weights are left in place but unused.",
+      ok: "Use this Spark only",
+    });
+    if (!ok) return;
+  }
+  const config = JSON.parse(JSON.stringify(state.config));
+  const wasQwen = config.model.weights === solo.weights;
+  config.model.weights = solo.weights;
+  config.model.id = solo.id;
+  if (!wasQwen) {
+    // Do not carry a V4.1 checkpoint path over to a different model.
+    config.model.checkpoint = "";
+    config.model.tokenizer = "";
+  }
+  config.engine = { ...config.engine, kind: solo.engine, device: true };
+  config.runtime.max_context_tokens = Math.min(
+    config.runtime.max_context_tokens || solo.context_tokens,
+    solo.context_tokens,
+  );
+  config.cluster.nodes = [{
+    ssh: state.hostname || "localhost",
+    peer: "",
+    local: true,
+  }];
+  config.network = { ...config.network, nccl_ib_hca: "", nccl_socket_ifname: "", nccl_ib_gid_index: null };
+  config.paths.log_root = "target/serve-single";
+  config.web.serve_url = "http://127.0.0.1:" + servePort(config);
+  try {
+    await api("/api/config", { method: "PUT", body: JSON.stringify({ config }) });
+    toast("Saved. This Spark will serve " + solo.id + " locally.");
+    S.pick = [];
+    S.manualHosts = [];
+    await refreshState();
+    paintConfig(S.state.config, S.state.discovery, true);
+    await inspect(true);
+    loadModels(true);
   } catch (error) {
     toast("Not saved: " + error.message, true);
   }
@@ -1079,29 +1208,53 @@ function softwareBody(state, model) {
 
 function downloadBody(state, model) {
   const setup = model.setup;
-  if (!setup) return waitingForCheck();
   const config = state.config;
-  const lead = setup.nodes[0];
-  const parts = [];
+  const lead = setup?.nodes?.[0] || null;
+  const cached = cachedCheckpoint(state);
   const explicit = (config.model.checkpoint || "").trim();
+  const parts = [];
   parts.push('<p class="guide-lead">Model <strong>' + esc(config.model.id) + "</strong>" +
     ' <a href="#setup" data-act="advanced">change</a></p>');
+
   if (explicit) {
-    parts.push('<p class="guide-note">The model is read from <code>' + esc(explicit) + "</code> (set under Advanced settings), so there is nothing to download." +
-      (lead.model === "ready" ? "" : " That folder is missing or incomplete on this Spark.") + "</p>");
+    const present = !!state.checkpoint?.exists;
+    parts.push('<p class="guide-note">The model is read from <code>' + esc(explicit) + "</code> (set under Advanced settings).</p>");
+    if (present) {
+      parts.push('<p class="guide-facts">Checkpoint already present; nothing to download.</p>');
+      parts.push('<p class="guide-note">Continue to <strong>Start the server</strong>.</p>');
+    } else {
+      parts.push('<p class="guide-note">That folder is missing on this Spark. Put the checkpoint there, or clear <strong>Checkpoint</strong> to use the Hugging Face cache.</p>');
+    }
     return parts.join("");
   }
+
+  if (cached?.complete) {
+    parts.push('<p class="guide-facts">Already in the Hugging Face cache: ' + esc(formatSize(cached.bytes)) +
+      " · snapshot " + esc(String(cached.revision || "").slice(0, 12)) + "</p>");
+    parts.push('<p class="guide-note">Nothing to download. Continue to <strong>Start the server</strong>.</p>');
+    return parts.join("");
+  }
+
+  if (!setup && !cached) return parts.join("") + waitingForCheck();
+
   const facts = [];
-  if (lead.model === "ready") facts.push("On this Spark: " + fmtInt(lead.model_files) + " files, " + formatSize(lead.model_bytes));
-  else if (lead.model_bytes > 0) facts.push("Downloaded so far: " + formatSize(lead.model_bytes));
-  if (lead.free_bytes !== null && lead.free_bytes !== undefined) facts.push(formatSize(lead.free_bytes) + " free");
+  if (cached && !cached.complete) facts.push("Downloaded so far: " + formatSize(cached.bytes));
+  else if (lead?.model === "ready") facts.push("On this Spark: " + fmtInt(lead.model_files) + " files, " + formatSize(lead.model_bytes));
+  else if (lead?.model_bytes > 0) facts.push("Downloaded so far: " + formatSize(lead.model_bytes));
+  if (lead && lead.free_bytes !== null && lead.free_bytes !== undefined) facts.push(formatSize(lead.free_bytes) + " free");
   if (facts.length) parts.push('<p class="guide-facts">' + esc(facts.join(" · ")) + "</p>");
+
+  if (lead?.model === "ready") {
+    parts.push('<p class="guide-note">Nothing to download. Continue to <strong>Start the server</strong>.</p>');
+    return parts.join("");
+  }
+
   const running = model.steps.download.running;
   if (running) {
     parts.push(progressBar(running, "Asking Hugging Face for the file list…"));
-  } else if (lead.model !== "ready") {
+  } else {
     parts.push(failureNote(latestJob(ofKind("download")), "The download"));
-    const resume = lead.model_bytes > 0;
+    const resume = (cached?.bytes || lead?.model_bytes || 0) > 0;
     parts.push(actionRow('<button class="btn btn-primary" type="button" data-act="download">' + (resume ? "Resume download" : "Download") + "</button>",
       "Hundreds of gigabytes take hours. If it stops, press " + (resume ? "Resume" : "Download") + " again and it carries on where it left off."));
   }
@@ -1176,12 +1329,16 @@ function launchBody(state, model) {
     return parts.join("");
   }
   if (running || model.online) {
-    parts.push(progressBar(running, "Starting the four Sparks and loading the model (~25 seconds)."));
+    parts.push(progressBar(running, model.solo
+      ? "Starting this Spark's server and loading the model."
+      : "Starting the four Sparks and loading the model (~25 seconds)."));
     return parts.join("");
   }
   parts.push(failureNote(latestJob(ofKind("launch")), "Starting the server"));
   parts.push(actionRow('<button class="btn btn-primary" type="button" data-act="launch"><svg><use href="#i-play"/></svg>Start the server</button>',
-    "Loads the model on all four Sparks. It stays running until you stop it on the Overview page."));
+    model.solo
+      ? "Loads the model on this Spark. It stays running until you stop it on the Overview page."
+      : "Loads the model on all four Sparks. It stays running until you stop it on the Overview page."));
   return parts.join("");
 }
 
@@ -1199,7 +1356,8 @@ function guideSummary(key, state, model) {
   const step = model.steps[key];
   const setup = model.setup;
   if (!step.done) {
-    if (!step.available) return "Waits for step " + (GUIDE.indexOf(step.waitsFor) + 1) + ".";
+    if (!step.available) return "Waits for step " + (model.active.indexOf(step.waitsFor) + 1) + ".";
+    if (key === "find" && model.solo) return "This Spark only.";
     return null;
   }
   switch (key) {
@@ -1212,8 +1370,12 @@ function guideSummary(key, state, model) {
     }
     case "software":
       return "Installed on all four Sparks.";
-    case "download":
+    case "download": {
+      const cached = cachedCheckpoint(state);
+      if (cached?.complete) return "Already in the Hugging Face cache.";
+      if (!state.checkpoint?.from_cache && state.checkpoint?.exists) return "Checkpoint already present.";
       return setup ? formatSize(setup.nodes[0].model_bytes) + " on this Spark." : "Done.";
+    }
     case "copy":
       return "On all four Sparks.";
     case "convert":
@@ -1237,9 +1399,19 @@ function renderGuide() {
   const state = S.state;
   if (!state || !state.config) return;
   const model = guideModel(state);
+  $("g-find").querySelector("h2").textContent = model.solo ? "Run this Spark only" : "Find your Sparks";
+  $("setup-sub").textContent = model.solo
+    ? "Three steps from a local checkpoint to a running server. Each step checks itself, so you can close this page and come back."
+    : "Seven steps from four Sparks to a running server. Every step checks itself, so you can close this page and come back.";
+  let position = 0;
   GUIDE.forEach((key) => {
     const step = model.steps[key];
     const element = $("g-" + key);
+    const applies = model.active.includes(key);
+    element.classList.toggle("hidden", !applies);
+    if (!applies) return;
+    position += 1;
+    element.querySelector(".guide-num").textContent = position;
     // Open: what is left to do, and the last step once the server runs (it has the address).
     const open = S.guideOpen[key] ?? ((step.available && !step.done) || (key === "launch" && step.done));
     element.classList.toggle("done", step.done);
@@ -1268,8 +1440,8 @@ function renderGuide() {
     const body = $("g-" + key + "-body");
     const html = open ? GUIDE_BODIES[key](state, model) : "";
     // Never rebuild a step under the cursor of someone typing in it.
-    const active = document.activeElement;
-    const typing = active && active.type === "text" && body.contains(active);
+    const focused = document.activeElement;
+    const typing = focused && focused.type === "text" && body.contains(focused);
     if (S.guideHtml[key] !== html && !typing) {
       S.guideHtml[key] = html;
       body.innerHTML = html;
@@ -1277,7 +1449,10 @@ function renderGuide() {
   });
   $("setup-banner").classList.toggle("hidden", !model.current || model.online || S.tab === "setup");
   if (model.current) {
-    $("setup-banner-step").textContent = "Next is step " + (GUIDE.indexOf(model.current) + 1) + ", " + GUIDE_TITLES[model.current].toLowerCase() + ".";
+    const title = model.current === "find" && model.solo
+      ? "Run this Spark only"
+      : GUIDE_TITLES[model.current];
+    $("setup-banner-step").textContent = "Next is step " + (model.active.indexOf(model.current) + 1) + ", " + title.toLowerCase() + ".";
   }
 }
 
@@ -1320,7 +1495,7 @@ function maybeInspect() {
 }
 
 function checkAgain() {
-  discover(false);
+  if (!isSolo()) discover(false);
   if (S.state?.config_exists) inspect(false);
 }
 
@@ -1390,6 +1565,9 @@ function bindGuide() {
       case "use-sparks":
         useSparks();
         break;
+      case "use-solo":
+        useSolo();
+        break;
       case "check":
         inspect(false);
         break;
@@ -1400,7 +1578,13 @@ function bindGuide() {
         if (requireSaved()) postAction("/api/actions/sync", { what: "software" }, false);
         break;
       case "download":
-        if (requireSaved()) postAction("/api/actions/download", undefined, false);
+        if (!requireSaved()) break;
+        if (checkpointPresent(S.state)) {
+          toast("The model is already present; there is nothing to download.");
+          renderGuide();
+          break;
+        }
+        postAction("/api/actions/download", undefined, false);
         break;
       case "copy-model":
         if (requireSaved()) postAction("/api/actions/sync", { what: "model" }, false);
@@ -1961,21 +2145,27 @@ function bindEvents() {
 
   $("action-launch").addEventListener("click", async () => {
     if (!requireSaved()) return;
+    const solo = isSolo();
     const ok = await confirmAction({
-      title: "Launch the cluster?",
-      body: "Starts all four ranks with the saved configuration. Rank 0 answers on its serve URL once the weights are loaded.",
-      ok: "Launch cluster",
+      title: solo ? "Start the server?" : "Launch the cluster?",
+      body: solo
+        ? "Starts this Spark's local server with the saved configuration. The API answers on the serve URL once the weights are loaded."
+        : "Starts all four ranks with the saved configuration. Rank 0 answers on its serve URL once the weights are loaded.",
+      ok: solo ? "Start server" : "Launch cluster",
     });
     if (ok) postAction("/api/actions/launch");
   });
   $("action-stop").addEventListener("click", async () => {
     if (!requireSaved()) return;
+    const solo = isSolo();
     const running = S.state?.latest?.running || 0;
     const ok = await confirmAction({
-      title: "Stop the cluster?",
+      title: solo ? "Stop the server?" : "Stop the cluster?",
       body: (running > 0 ? running + " request(s) are in flight. " : "") +
-        "Rank 0 drains in-flight requests, then all four ranks exit. Clients get errors until the next launch.",
-      ok: "Stop cluster",
+        (solo
+          ? "The server drains in-flight requests, then exits. Clients get errors until you start it again."
+          : "Rank 0 drains in-flight requests, then all four ranks exit. Clients get errors until the next launch."),
+      ok: solo ? "Stop server" : "Stop cluster",
       danger: true,
     });
     if (ok) postAction("/api/actions/stop");

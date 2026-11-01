@@ -58,14 +58,15 @@ use super::lanes::{SLIDE_STEP, Seg, slide_floor};
 use super::rows::{R_MAX, RowsState};
 use super::sample::Sampler;
 use super::spec::{
-    DepthPolicy, ENGRAM_AHEAD_THREADS, EngramGather, GatherTask, Keepalive, Reads, SpecInputs,
-    SpecOutcome, Staging, bulk_min, cut_step, gather_rows,
+    ENGRAM_AHEAD_THREADS, EngramGather, GatherTask, Keepalive, Reads, SpecInputs, SpecOutcome,
+    Staging, bulk_min, cut_step, depth_policy, gather_rows,
 };
 use super::*;
 use crate::device_link::{DeviceFinish, DeviceJob};
 use sparkflash_api::VisionImage;
 use sparkflash_engine::forward::engram::HASH_SENTINEL;
 use sparkflash_kernels::cuda_driver::HostMapped;
+use sparkflash_model::speculation::DepthPolicy;
 use sparkflash_model::vision::ImageSpan;
 use sparkflash_vision::IMAGE_TOKEN_ID;
 use std::sync::Arc;
@@ -651,7 +652,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         if self.seqs.iter().any(|seq| seq.id == id) {
             return Err(format!("sequence {id} is already on the device"));
         }
-        let policy = DepthPolicy::from_env(self.k)?;
+        let policy = depth_policy(self.k)?;
         // A constrained sequence is sampled greedily over the admitted ids: the mask decides every
         // token, so there is no distribution left to sample from.
         let sampler = if constraint.is_some() {
@@ -1019,7 +1020,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             draft_ms: seq.draft_ms,
             verify_ms: seq.verify_ms,
             phase: seq.phase_ms,
-            adaptive: seq.policy.adaptive,
+            adaptive: seq.policy.is_adaptive(),
             reused: seq.reused.unwrap_or(0),
         })
     }
@@ -1989,7 +1990,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let has_constraint = self.seqs[index].constraint.is_some();
         let queued = match (
             self.exchange,
-            self.seqs[index].policy.adaptive || has_constraint,
+            self.seqs[index].policy.is_adaptive() || has_constraint,
         ) {
             (Some(_), false) => k + 1,
             _ => 0,

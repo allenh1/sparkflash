@@ -22,13 +22,25 @@
 //! - Scales are stored immediately next to their weights.
 //! - A 4096-byte-aligned header block at the start of the file holds the tensor index
 //!   (`name -> offset, length`), `header_hash`, and `file_digest`.
+//!
+//! A checkpoint whose `config.json` names GLM-5.3's model type is converted by the GLM pack
+//! instead, into the same container ([sparkflash_model_glm5_next::convert]); `--inspect` tells the
+//! two apart by the model a file's index names.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 
+use serde_json::Value;
 use sparkflash_device::converted::{
-    ConvertOptions, convert_checkpoint, inspect_converted_rank, verify_converted_file,
+    ConvertOptions, ConvertedPreamble, convert_checkpoint, inspect_converted_rank, read_index,
+    verify_converted_file,
 };
+use sparkflash_engine::parallel_tp::TpLayout;
+use sparkflash_engine::safetensors::{INDEX_NAME, SafeTensorsSource};
+use sparkflash_model_glm5_next::Glm5NextConfig;
+use sparkflash_model_glm5_next::config::MODEL_TYPE;
+use sparkflash_model_glm5_next::convert::{CONVERTED_MODEL, convert_rank, verify_converted};
 
 /// Usage string for `sparkflash convert`.
 pub const USAGE: &str = "sparkflash convert --checkpoint DIR [--output-dir DIR] [--tp-world-size 4] [--tp-rank R | --ranks 0,1,2,3] [--no-pad-moe-640] [--no-verify] | sparkflash convert --inspect FILE [--verify-weights]";
@@ -120,6 +132,22 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
     let checkpoint_dir =
         checkpoint.ok_or_else(|| format!("--checkpoint DIR is required (usage: {USAGE})"))?;
     let out_dir = output_dir.unwrap_or_else(|| checkpoint_dir.clone());
+    if let Some(config) = glm_config(&checkpoint_dir)? {
+        if !pad_moe_640 {
+            return Err(
+                "--no-pad-moe-640 is DeepSeek's routed-expert layout, and this checkpoint is GLM-5.3"
+                    .to_string(),
+            );
+        }
+        return convert_glm(
+            &checkpoint_dir,
+            &out_dir,
+            &config,
+            world_size,
+            &ranks,
+            verify,
+        );
+    }
     let options = ConvertOptions {
         checkpoint_dir,
         output_dir: out_dir.clone(),
@@ -154,7 +182,105 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
+/// The GLM-5.3 configuration of the checkpoint in `dir`, when its `config.json` names GLM's model
+/// type. A checkpoint with no `config.json`, or another model's, is DeepSeek's to convert.
+fn glm_config(dir: &Path) -> Result<Option<Glm5NextConfig>, String> {
+    let path = dir.join("config.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let root: Value =
+        serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    if root.get("model_type").and_then(Value::as_str) != Some(MODEL_TYPE) {
+        return Ok(None);
+    }
+    Glm5NextConfig::from_json(&text)
+        .map(Some)
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Converts `ranks` (every rank when empty) of a GLM-5.3 checkpoint one at a time, so one rank's
+/// slices are all the converter holds, and re-reads each file's digests when `verify` asks.
+fn convert_glm(
+    dir: &Path,
+    out_dir: &Path,
+    config: &Glm5NextConfig,
+    world_size: usize,
+    ranks: &[usize],
+    verify: bool,
+) -> Result<Vec<String>, String> {
+    let source = SafeTensorsSource::open(dir, &dir.join(INDEX_NAME))
+        .map_err(|error| format!("{}: {error}", dir.display()))?;
+    let label = dir.file_name().map_or_else(
+        || dir.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let ranks: Vec<usize> = if ranks.is_empty() {
+        (0..world_size).collect()
+    } else {
+        ranks.to_vec()
+    };
+    let mut lines = Vec::new();
+    for rank in ranks {
+        let layout = TpLayout { rank, world_size };
+        let started = Instant::now();
+        let converted = convert_rank(&source, config, layout, out_dir, &label)
+            .map_err(|error| format!("rank {rank}/{world_size}: {error}"))?;
+        if verify {
+            verify_converted(&converted.path, layout)
+                .map_err(|error| format!("rank {rank}/{world_size}: {error}"))?;
+        }
+        lines.push(format!(
+            "sparkflash convert: {CONVERTED_MODEL} rank {rank}/{world_size}: wrote {} ({} bytes, {} weights, header_hash={:#018x}, file_digest={:#018x}, verified={verify}, {} ms)",
+            converted.path.display(),
+            converted.file_bytes,
+            converted.slots,
+            converted.header_hash,
+            converted.file_digest,
+            started.elapsed().as_millis(),
+        ));
+    }
+    Ok(lines)
+}
+
+/// One GLM rank file's index, checked as the rank and world its preamble names, and with
+/// `verify_weights` every slot's digest.
+fn inspect_glm(
+    path: &Path,
+    preamble: ConvertedPreamble,
+    verify_weights: bool,
+) -> Result<Vec<String>, String> {
+    let layout = TpLayout {
+        rank: preamble.rank,
+        world_size: preamble.world,
+    };
+    let (preamble, index) = if verify_weights {
+        verify_converted(path, layout).map(|index| (preamble, index))?
+    } else {
+        sparkflash_model_glm5_next::convert::read_index(path, layout)?
+    };
+    Ok(vec![format!(
+        "sparkflash convert inspect {}: {} rank {}/{}, {} weights from {}, data_offset={}, padded_data_bytes={}, header_hash={:#018x}, file_digest={:#018x}, weights_verified={verify_weights}",
+        path.display(),
+        index.model,
+        index.rank,
+        index.world,
+        index.slots.len(),
+        index.source,
+        preamble.data_offset,
+        preamble.padded_data_bytes,
+        preamble.header_hash,
+        index.file_digest,
+    )])
+}
+
 fn inspect_file(path: &Path, verify_weights: bool) -> Result<Vec<String>, String> {
+    let (preamble, index): (_, Value) = read_index(path)?;
+    if index.get("model").and_then(Value::as_str) == Some(CONVERTED_MODEL) {
+        return inspect_glm(path, preamble, verify_weights);
+    }
     let (preamble, header) = inspect_converted_rank(path)?;
     if verify_weights {
         verify_converted_file(path)?;
@@ -260,5 +386,51 @@ mod tests {
         let inspect_lines = run_lines(&["--inspect", rank0.to_str().unwrap(), "--verify-weights"])
             .expect("inspect rank 0");
         assert!(inspect_lines[0].contains("weights_verified=true"));
+    }
+
+    /// A checkpoint whose `config.json` names GLM-5.3 is the GLM pack's to convert, so DeepSeek's
+    /// padding flag is refused for it, and `--inspect` reads a GLM rank file by its index's model.
+    #[test]
+    fn a_glm_checkpoint_and_rank_file_go_to_the_glm_pack() {
+        let ckpt = tempfile::tempdir().expect("ckpt");
+        fs::write(
+            ckpt.path().join("config.json"),
+            include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json"),
+        )
+        .expect("write config");
+        let error = run_lines(&[
+            "--checkpoint",
+            ckpt.path().to_str().unwrap(),
+            "--no-pad-moe-640",
+        ])
+        .expect_err("GLM has no 640-wide padding");
+        assert!(error.contains("GLM-5.3"), "{error}");
+
+        let config = Glm5NextConfig::small();
+        let fixture = tempfile::tempdir().expect("fixture");
+        sparkflash_model_glm5_next::checkpoint::write_synthetic_checkpoint(
+            fixture.path(),
+            &config,
+            7,
+            2,
+        )
+        .expect("the fixture writes");
+        let source = SafeTensorsSource::open(fixture.path(), &fixture.path().join(INDEX_NAME))
+            .expect("the fixture opens");
+        let out = tempfile::tempdir().expect("out");
+        let layout = TpLayout {
+            rank: 1,
+            world_size: 2,
+        };
+        let converted =
+            convert_rank(&source, &config, layout, out.path(), "fixture").expect("rank 1 converts");
+        let lines = run_lines(&[
+            "--inspect",
+            converted.path.to_str().unwrap(),
+            "--verify-weights",
+        ])
+        .expect("inspect rank 1");
+        assert!(lines[0].contains("glm5-next rank 1/2"), "{}", lines[0]);
+        assert!(lines[0].contains("weights_verified=true"), "{}", lines[0]);
     }
 }

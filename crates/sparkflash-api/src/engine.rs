@@ -1245,6 +1245,7 @@ mod tests {
             n_llm_w: 1,
             best_height: 42,
             best_width: 42,
+            line_stride: 2,
         };
         VisionImage {
             span: sparkflash_model::vision::ImageSpan {

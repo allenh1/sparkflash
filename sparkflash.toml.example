@@ -24,7 +24,9 @@
 # name is.
 
 [model]
-# Model means the weights. Only the released V4.1-Flash checkpoint ships in this build.
+# Model means the weights. Two checkpoints ship in this build:
+#   deepseek-v4.1-flash            four Sparks, TP=4, converted per rank
+#   qwen3.8-flash-next-nvfp4       one Spark,  TP=1, loaded directly from the checkpoint
 weights = "deepseek-v4.1-flash"
 # The checkpoint's Hugging Face model ID.
 id = "deepseek-ai/DeepSeek-V4.1-Flash"
@@ -42,7 +44,9 @@ converted_dir = "~/sparkflash/converted"
 cubins = "target/cubins"
 
 [engine]
-# Engine means how the weights run. The TP=4 device engine is the only one today.
+# Engine means how the weights run. Match it to the weights:
+#   deepseek-v4.1-flash            TP=4 device engine
+#   qwen4-exp                      TP=1 pack engine
 kind = "deepseek-v4.1-flash"
 # false runs the CPU host twin and is only useful for a smoke test.
 device = true
@@ -61,10 +65,12 @@ base_port = 29601
 # Empty means the user running the control plane.
 ssh_user = ""
 ssh_options = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
-# Exactly four nodes, in rank order. `local = true` runs that rank's convert, launch, stop and
-# status commands on the lead node rather than over SSH, so the lead needs no SSH key for itself.
-# The peer is the fast-network (RoCE) address the collectives use; step 2 of the Setup page fills
-# it in from what each node reports.
+# Four nodes for deepseek-v4.1-flash, or exactly one for qwen3.8-flash-next-nvfp4. In rank order.
+# `local = true` runs that rank's convert, launch, stop and status commands on the lead node rather
+# than over SSH, so the lead needs no SSH key for itself. The peer is the fast-network (RoCE)
+# address the collectives use; step 2 of the Setup page fills it in from what each node reports.
+# A TP=1 Qwen node may leave peer empty:
+#   nodes = [{ ssh = "this-spark.local", peer = "", local = true }]
 nodes = [
   { ssh = "node0.local", peer = "192.0.2.11", local = true },
   { ssh = "node1.local", peer = "192.0.2.12", local = false },
@@ -78,6 +84,7 @@ nodes = [
 repo_root = "."
 # The binary from `cargo build --release -p sparkflash-cli --features cuda,tp4-serve`.
 binary = "target/release/sparkflash"
+# The four-node launcher. A one-node plan uses scripts/serve-single-node.sh automatically.
 serve_script = "scripts/serve-four-node.sh"
 # The directory holding libnccl.so.2, filled by scripts/fetch-nccl.sh. Empty means NCCL is
 # installed system-wide.
@@ -98,6 +105,9 @@ nccl_ib_gid_index = 3
 # Extra environment exported to every rank.
 [network.env]
 # NCCL_DEBUG = "WARN"
+# The Qwen DFlash 2 drafter resolves from the canonical cache without this. Set it only to
+# override the choice; a repo id also works.
+# SPARKFLASH_QWEN4_DFLASH2 = "incoai/Qwen3.8-Flash-Next-DFlash2"
 
 [web]
 # The control plane's own listener. All interfaces, because Sparks run headless. It has no login:
