@@ -34,6 +34,7 @@
 
 use crate::c_decl::{self, KernelDecl};
 use crate::cuda_driver::{Cuda, Deviceptr, Kernel, KernelId, Module};
+use crate::mxfp8_gemv_launch::{self, OptArgs, OptKind};
 
 /// The kernel symbol in the cubin.
 pub const KERNEL: &str = "b12x_bf16a_mxfp8w_wo_a_sm121";
@@ -171,28 +172,36 @@ pub fn launch(cuda: &Cuda, kernel: Kernel, params: &Bf16aMxfp8wWoAParams) -> Res
     if word != 0 {
         // [attn, w, w_scales, out, groups, trace, layer, step]; one group is [1024][4096].
         let p = params.as_slice();
-        let (cols, inner) = (1024u64, 4096u64);
+        let (cols, inner) = (1024u32, 4096u32);
+        let (c, i) = (u64::from(cols), u64::from(inner));
+        let args = OptArgs {
+            a: p[0],
+            a_scales: 0,
+            w: p[1],
+            ws: p[2],
+            out: p[3],
+            cols,
+            inner,
+            tokens: 1,
+            a_tok_stride: i * p[4],
+            out_tok_stride: c * p[4],
+            groups: params.groups(),
+            a_grp_stride: i,
+            w_grp_stride: c * i,
+            s_grp_stride: (c / 32) * (i / 32),
+            out_grp_stride: c,
+            k_stride_blocks: 0,
+        };
+        if let Some(launched) =
+            mxfp8_gemv_launch::launch_decode_mma(cuda, OptKind::Bf16aBf16o, &args)
+        {
+            return launched;
+        }
         return cuda.launch(
             Kernel::from_raw(word, OPT_SYMBOL),
-            (1024 / 32, grid.0, 1),
+            (cols / 32, grid.0, 1),
             (256, 1, 1),
-            &[
-                p[0],
-                0,
-                p[1],
-                p[2],
-                p[3],
-                cols,
-                inner,
-                1,
-                inner * p[4],
-                cols * p[4],
-                inner,
-                cols * inner,
-                (cols / 32) * (inner / 32),
-                cols,
-                0,
-            ],
+            &mxfp8_gemv_launch::opt_words(&args),
         );
     }
     cuda.launch(kernel, grid, BLOCK, params.as_slice())

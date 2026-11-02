@@ -103,15 +103,75 @@ Tokens per verify step here, by stream count (1 / 2 / 4 / 8 / 16): prose 3.2 / 2
 - **Two to eight streams:** close. At two streams SparkFlash is ahead on code, structured output
   and JSON. At four and eight, code and prose are level to 8% behind and structured output is
   ahead, but JSON trails by 14% at four and 27% at eight. SparkFlash verifies up to 64 rows a step
-  and keeps code at ~5 tokens a step through eight streams. Its decode GEMVs run on CUDA cores so
-  that greedy output does not depend on the batch, so each extra row still costs compute, and the
-  step grows from ~43 ms at one code stream to ~125 ms at eight. SGLang runs its routed experts
-  on tensor cores.
+  and keeps code at ~5 tokens a step through eight streams. The step grows from ~43 ms at one
+  code stream to ~125 ms at eight, mostly because more rows pick more distinct routed experts,
+  each a separate read (see below). SGLang runs its routed experts on tensor cores.
 - **Sixteen streams:** the cliff is gone. SparkFlash speculates for up to 32 sequences, so
   sixteen streams keep 2.3 (prose) to 4.2 (code) tokens a step and 18-39 tok/s each, up from
   ~12. SGLang is still ahead here: 1.3x per stream on code, 1.5x on JSON, and 1.3-1.8x in
-  aggregate. Tensor-core decode kernels whose per-row reduction order does not depend on the batch
-  would keep batch invariance while making extra rows cheap.
+  aggregate.
+
+### What an extra verify row costs
+
+Rank 0's kernel time per step, from an Nsight Systems capture of code streams (PDL off, so the
+steps run longer than above; 2026-11-01):
+
+| Streams (rows a step) | Step | Routed experts | Dense projections | Collectives | Attention |
+| :-- | --: | --: | --: | --: | --: |
+| 1 (5.6) | 45 ms | 19.9 ms | 11.1 ms | 4.3 ms | 2.7 ms |
+| 4 (20.9) | 97 ms | 56.2 ms | 15.8 ms | 8.2 ms | 5.5 ms |
+| 8 (38.7) | 164 ms | 80.7 ms | 23.1 ms | 37.4 ms | 8.4 ms |
+
+- **Routed experts** are half (eight streams) to two thirds (four) of what the extra rows add,
+  and they are memory-bound. Each distinct expert a layer's rows pick is a 4.7 MB read per rank.
+  Windows of recorded routes pick 22 distinct experts a layer at one stream's six rows, 56 at
+  four streams and 82 at eight. Routes from different conversations pick more.
+  - Reading each of those experts once, the routed kernels run at 218 GB/s.
+  - With the real routes, where several rows share an expert, the kernels come within 2% (one
+    stream), 4% (four) and 11% (eight) of that floor.
+  - So the per-row FMA work is mostly hidden under the reads.
+- **Dense projections** (the attention projections and the shared expert) add ~5 µs a row a layer
+  on the CUDA cores: 213 µs a layer at one row, 445 µs at 48.
+- **Collectives** at eight streams are mostly transfer once decode is steady. In a capture of all
+  four ranks at once (2026-11-01), each rank waits 2-7 ms of a ~135 ms step for its peers. The
+  rank that arrives last changes from call to call, mostly on the routed-expert kernels, whose
+  time differs by rank, and no one node is slow. Rank 0's 28 ms in calls longer than 200 µs in the
+  capture above came mostly from its first steps.
+- **The Engram gather** is the largest host stall at eight streams. On text the server has not
+  seen, every rank's GPU idles 3.7-4.6 ms a step before layer 1's Engram write while its table rows
+  are read from NVMe. Once those rows are in the reader's cache the wait is ~0.1 ms, so a benchmark
+  that repeats its prompts hides it.
+
+Tensor cores need not make greedy output depend on the batch: an output keeps its bits if the
+tile shape, the split of K and the order of each output's reduction do not depend on the row
+count. The bulk prefill's GEMMs already have that property: a row gets the same bits alone as
+among 48.
+
+Decode runs the projections with FP8 or bf16 activations that way, as block-scaled MMA in
+`kernels/opt_gemv_sm121.cu` (`SPARKFLASH_DECODE_MMA=off` keeps them on the CUDA cores). A block
+keeps the GEMV's split of K over its eight warps, chains each warp's MMAs in ascending K from zero
+and adds the warps' sums in warp order, so a row's bits do not depend on how many rows share the
+launch or where the row sits in it. Projections with f32 activations, such as the shared expert's,
+stay on the GEMV and the routed experts on their read-bound kernels. The five attention
+projections of a layer, weights streamed from memory on one Spark:
+
+| Rows | 1 | 6 | 24 | 32 | 48 | 64 |
+| :-- | --: | --: | --: | --: | --: | --: |
+| CUDA cores | 167 µs | 177 µs | 214 µs | 243 µs | 335 µs | 442 µs |
+| Tensor cores | 176 µs | 179 µs | 188 µs | 181 µs | 199 µs | 211 µs |
+
+Every row of every launch from 1 to 64 rows matches the row launched alone, and the error against
+a double-precision reference is the GEMV's; `crates/sparkflash-kernels/tests/decode_mma_device.rs`
+checks both on a device. On the four Sparks (code streams, CUDA and tensor cores alternated twice;
+2026-11-01) the step goes from 43.2 to 43.1 ms at one stream and from 131.1 to 124.6 ms at eight
+(5% less). Each request decoded the same alone as among eight on both, but five of eight
+completions differ between them a few tokens in, because a tensor core sums a block's 32 products
+in its own order. Tokens accepted a step move with the text, so per-stream throughput rose 1.5% at one
+stream and 2% at eight. GPUs with several times this memory bandwidth read the routed experts in a
+fraction of the time, so there the per-row FMA work dominates and tensor cores matter more.
+There the small projections also leave most SMs idle: wkv runs on 16 blocks and wq_a on 40.
+On one Spark, 32 blocks already keep memory busy, so splitting wkv's K over more blocks would save
+2.6 µs a layer.
 
 ## Long context
 

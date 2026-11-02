@@ -182,4 +182,5 @@ Defaults are what the numbers in [performance.md](performance.md) were measured 
 | `SPARKFLASH_PREFILL_DECODER_SKIP=0` | Run every layer over every prompt row (slower long prompts; for comparison). By default a prompt's rows before its last 2,541 run only layers 0-20, which hold every cache the later layers read |
 | `SPARKFLASH_PREFILL_MOE_MERGE=0` | Run each in-flight prefill chunk's experts separately (slower; for comparison) |
 | `SPARKFLASH_WARMUP=0` | Skip the warm-up pass before HTTP binds (the first request then pays the one-time setup) |
+| `SPARKFLASH_DECODE_MMA=off` | Run the dense decode projections on the CUDA cores instead of the tensor cores (`on` by default): 5% slower at eight streams, with the greedy output from before the tensor-core decode. A request decodes the same alone as in a batch either way ([performance](performance.md#what-an-extra-verify-row-costs)) |
 | `NCCL_*`, `SPARKFLASH_SERVE_API_KEY`, `SPARKFLASH_PREFILL_*`, `SPARKFLASH_BATCH_*`, `SPARKFLASH_DECODE_*` | Passed to every rank by the launcher |

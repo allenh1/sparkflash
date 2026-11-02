@@ -747,3 +747,232 @@ OPT_GEMV_ROWS_ENTRY(opt_gemv_rows_bf16a_bf16o_r8c2, OPT_A_BF16, false, 8u, 2u, 2
 OPT_GEMV_ROWS_ENTRY(opt_gemv_rows_bf16a_bf16o_r8c1, OPT_A_BF16, false, 8u, 1u, 3)
 OPT_GEMV_ROWS_ENTRY(opt_gemv_rows_f32a_f32o_r4c2, OPT_A_F32, true, 4u, 2u, 2)
 OPT_GEMV_ROWS_ENTRY(opt_gemv_rows_f32a_f32o_r4c1, OPT_A_F32, true, 4u, 1u, 3)
+
+// ---------------------------------------------------------------------------------------------
+// Tensor-core forms (the default; SPARKFLASH_DECODE_MMA=off keeps FMA): same split, MMA products.
+// ---------------------------------------------------------------------------------------------
+//
+// opt_gemv_mma_*_m{1,2}: the opt GEMV's operands and argument list, and its split of the
+// reduction (8 warps over one 32-column tile, warp w owning K blocks w, w + 8, ...), with a K
+// block's products on mma.sync instead of the FMA chain. Grid (cols / 32, groups, ceil(tokens /
+// (16 MT))), 256 threads, numbered token split fastest as above; a block serves MT m16 tiles of
+// rows. A warp keeps OPT_G_DEPTH K blocks of weights, scales and its rows' activations in flight in
+// registers (the rows are read straight from L2: a warp reads only its own K blocks of them).
+//
+// A row's bits do not depend on how many rows share the launch. An output is one warp's chain of
+// MMAs over its K blocks in ascending order, from zero, then the eight warp partials summed in warp
+// order; an MMA's output element depends only on its A row, its B column, their scales and its own
+// accumulator. So neither the row count, MT, the split nor the row's slot in its m16 tile enters
+// it, and rows past `tokens` (zero operands) change nothing. The bits are not the FMA forms' (the
+// MMA sums a K block's 32 products in its own order and rounding) nor the bulk GEMMs' in
+// opt_mma_sm121.cu (those fold every K block into one accumulator per output).
+//
+// K order inside a block: lane (g = lane / 4, t = lane % 4) reads bytes 8t..8t+7 of each of its
+// rows with one 8-byte load and feeds the first half to the MMA's k slots for 4t..4t+3 (E4M3) or
+// 2t..2t+1 of the first k16 MMA (bf16), the second half to the next ones; A and B use the same map,
+// so the products are the K block's 32 and the permutation is fixed.
+//
+// fp8a: E4M3 rows (one ue8m0 per 32 along K) x B12x E4M3 tiles, m16n8k32 kind::mxf8f6f4 with both
+//   scales applied by the MMA. bf16a: bf16 rows x the same tiles widened to bf16 times the tile scale
+//   (exact), two m16n8k16 bf16 MMAs per K block, as in opt_mma_bf16_body.
+#include "opt_mma_bf16_sm121.cuh"
+
+__device__ __forceinline__ uint2 opt_gm_ldw(const uint8_t *p) {
+    uint2 v;
+    asm volatile("ld.global.cs.v2.u32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p));
+    return v;
+}
+
+template <bool BF16A, int MT>
+__device__ __forceinline__ void opt_gemv_mma_body(
+    const uint8_t *__restrict__ a, const uint8_t *__restrict__ a_scales,
+    const uint8_t *__restrict__ w, const uint8_t *__restrict__ ws, __nv_bfloat16 *__restrict__ out,
+    const uint32_t cols, const uint32_t inner, const uint32_t tokens,
+    const uint64_t a_tok_stride, const uint64_t out_tok_stride,
+    const uint64_t a_grp_stride, const uint64_t w_grp_stride, const uint64_t s_grp_stride,
+    const uint64_t out_grp_stride, const uint32_t k_stride_blocks) {
+    constexpr uint32_t ROWS = 16u * (uint32_t)MT;
+    constexpr uint32_t EB = BF16A ? 2u : 1u;
+    // Activation words per row per K block per lane: 8 bf16 or 8 E4M3.
+    constexpr int AW = BF16A ? 4 : 2;
+    // One m16 tile's warp partials, [warp][accumulator register][lane].
+    __shared__ float red[OPT_G_WARPS][16][32];
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t g = lane >> 2;
+    const uint32_t t = lane & 3u;
+    const uint32_t lin = blockIdx.z * gridDim.x + blockIdx.x;
+    const uint32_t tile = lin / gridDim.z;
+    const uint32_t group = blockIdx.y;
+    const uint32_t k_blocks = inner >> 5;
+    const uint32_t z0 = (lin - tile * gridDim.z) * ROWS;
+    const uint32_t live = tokens - z0 < ROWS ? tokens - z0 : ROWS;
+
+    const uint32_t k_row = k_stride_blocks != 0u ? k_stride_blocks : k_blocks;
+    // This lane's 8 bytes of weight row 8j + g (j = 0..3) of each tile: bytes 8t..8t+7.
+    const uint8_t *wt = w + group * w_grp_stride + (uint64_t)tile * k_row * 1024u + g * 32u + t * 8u;
+    const uint8_t *st = ws + group * s_grp_stride + (uint64_t)tile * k_row;
+    const uint64_t a_base = group * a_grp_stride + (uint64_t)z0 * a_tok_stride;
+
+    // The lane's rows g and g + 8 of each m16 tile, and (E4M3) the row whose scale it supplies.
+    const uint8_t *arow[MT][2];
+    bool aok[MT][2];
+    const uint8_t *srow[MT];
+    bool sok[MT];
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint32_t r = (uint32_t)mt * 16u + g + 8u * (uint32_t)h;
+            aok[mt][h] = r < live;
+            arow[mt][h] = a + (a_base + (uint64_t)r * a_tok_stride) * EB + t * 8u * EB;
+        }
+        const uint32_t rs = (uint32_t)mt * 16u + g + 8u * (lane & 1u);
+        sok[mt] = rs < live;
+        srow[mt] = a_scales + (a_base + (uint64_t)rs * a_tok_stride) / 32u;
+    }
+
+    float acc[MT][4][4];
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[mt][j][c] = 0.0f;
+
+    const uint32_t mine = warp < k_blocks ? (k_blocks - warp + OPT_G_WARPS - 1u) / OPT_G_WARPS : 0u;
+    uint32_t wq[OPT_G_DEPTH][8];
+    uint32_t wsc[OPT_G_DEPTH];
+    uint32_t aq[OPT_G_DEPTH][MT][2][AW];
+    uint32_t asc[OPT_G_DEPTH][MT];
+    auto fetch = [&](const uint32_t d, const uint32_t kb) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint2 v = opt_gm_ldw(wt + (uint64_t)kb * 1024u + (uint32_t)j * 256u);
+            wq[d][2 * j] = v.x;
+            wq[d][2 * j + 1] = v.y;
+        }
+        wsc[d] = __ldg(st + kb);
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                if constexpr (BF16A) {
+                    const uint4 v = aok[mt][h] ? __ldg(reinterpret_cast<const uint4 *>(arow[mt][h] + kb * 64u))
+                                               : make_uint4(0u, 0u, 0u, 0u);
+                    aq[d][mt][h][0] = v.x;
+                    aq[d][mt][h][1] = v.y;
+                    aq[d][mt][h][2] = v.z;
+                    aq[d][mt][h][3] = v.w;
+                } else {
+                    const uint2 v = aok[mt][h] ? __ldg(reinterpret_cast<const uint2 *>(arow[mt][h] + kb * 32u))
+                                               : make_uint2(0u, 0u);
+                    aq[d][mt][h][0] = v.x;
+                    aq[d][mt][h][1] = v.y;
+                }
+            }
+            if constexpr (!BF16A) asc[d][mt] = sok[mt] ? (uint32_t)__ldg(srow[mt] + kb) : 127u;
+        }
+    };
+#pragma unroll
+    for (uint32_t d = 0; d < OPT_G_DEPTH; ++d) {
+        if (d < mine) fetch(d, warp + d * OPT_G_WARPS);
+    }
+
+    for (uint32_t i0 = 0; i0 < mine; i0 += OPT_G_DEPTH) {
+#pragma unroll
+        for (uint32_t d = 0; d < OPT_G_DEPTH; ++d) {
+            const uint32_t i = i0 + d;
+            if (i < mine) {
+                uint32_t b[8];
+#pragma unroll
+                for (int q = 0; q < 8; ++q) b[q] = wq[d][q];
+                const uint32_t sfb = wsc[d];
+                uint32_t av[MT][2][AW];
+                uint32_t sfa[MT];
+#pragma unroll
+                for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+                    for (int h = 0; h < 2; ++h)
+#pragma unroll
+                        for (int q = 0; q < AW; ++q) av[mt][h][q] = aq[d][mt][h][q];
+                    sfa[mt] = asc[d][mt];
+                }
+                // Refill this slot DEPTH blocks ahead before the arithmetic.
+                const uint32_t nx = i + OPT_G_DEPTH;
+                if (nx < mine) fetch(d, warp + nx * OPT_G_WARPS);
+                if constexpr (BF16A) {
+                    const float wscale = opt_ue8m0_f32((uint8_t)sfb);
+                    uint32_t bb[4][4];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        bb[j][0] = ob_e4m3x2(b[2 * j], wscale);
+                        bb[j][1] = ob_e4m3x2(b[2 * j] >> 16, wscale);
+                        bb[j][2] = ob_e4m3x2(b[2 * j + 1], wscale);
+                        bb[j][3] = ob_e4m3x2(b[2 * j + 1] >> 16, wscale);
+                    }
+#pragma unroll
+                    for (int mt = 0; mt < MT; ++mt) {
+                        const uint32_t a0[4] = {av[mt][0][0], av[mt][1][0], av[mt][0][1], av[mt][1][1]};
+                        const uint32_t a1[4] = {av[mt][0][2], av[mt][1][2], av[mt][0][3], av[mt][1][3]};
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            ob_mma(acc[mt][j], a0, bb[j][0], bb[j][1]);
+                            ob_mma(acc[mt][j], a1, bb[j][2], bb[j][3]);
+                        }
+                    }
+                } else {
+#pragma unroll
+                    for (int mt = 0; mt < MT; ++mt) {
+                        const uint32_t af[4] = {av[mt][0][0], av[mt][1][0], av[mt][0][1], av[mt][1][1]};
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) om_mma_e4m3(acc[mt][j], af, b[2 * j], b[2 * j + 1], sfa[mt], sfb);
+                    }
+                }
+            }
+        }
+    }
+
+    // Accumulator c of n8 tile j holds row g + 8 (c / 2), column 8j + 2t + c % 2.
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+        if ((uint32_t)mt * 16u >= live) break;
+        if (mt > 0) __syncthreads();
+#pragma unroll
+        for (int r = 0; r < 16; ++r) red[warp][r][lane] = acc[mt][r >> 2][r & 3];
+        __syncthreads();
+        for (uint32_t idx = threadIdx.x; idx < 16u * 32u; idx += OPT_G_THREADS) {
+            const uint32_t r = idx >> 5;
+            const uint32_t l = idx & 31u;
+            const uint32_t row = (uint32_t)mt * 16u + (l >> 2) + 8u * ((r & 3u) >> 1);
+            const uint32_t col = tile * 32u + 8u * (r >> 2) + 2u * (l & 3u) + (r & 1u);
+            if (row >= live || col >= cols) continue;
+            float s = 0.0f;
+#pragma unroll
+            for (uint32_t q = 0; q < OPT_G_WARPS; ++q) s += red[q][r][l];
+            out[group * out_grp_stride + ((uint64_t)row + z0) * out_tok_stride + col] = __float2bfloat16_rn(s);
+        }
+    }
+}
+
+#define OPT_GEMV_MMA_ENTRY(name, BF16A, MT)                                                        \
+    extern "C" __global__ void __launch_bounds__(OPT_G_THREADS) name(                              \
+        const void *__restrict__ a, const uint8_t *__restrict__ a_scales,                            \
+        const uint8_t *__restrict__ w, const uint8_t *__restrict__ ws, void *__restrict__ out,     \
+        const uint32_t cols, const uint32_t inner, const uint32_t tokens,                          \
+        const uint64_t a_tok_stride, const uint64_t out_tok_stride, const uint64_t a_grp_stride,   \
+        const uint64_t w_grp_stride, const uint64_t s_grp_stride, const uint64_t out_grp_stride,  \
+        const uint32_t k_stride_blocks) {                                                          \
+        OPT_PDL_ENTRY();                                                                           \
+        opt_gemv_mma_body<BF16A, MT>(reinterpret_cast<const uint8_t *>(a), a_scales, w, ws,         \
+                                     reinterpret_cast<__nv_bfloat16 *>(out), cols, inner, tokens,  \
+                                     a_tok_stride, out_tok_stride, a_grp_stride, w_grp_stride,     \
+                                     s_grp_stride, out_grp_stride, k_stride_blocks);               \
+    }
+
+// By sweep over the decode projections at 1 to 64 rows: E4M3 rows one m16 tile a block (more
+// re-reads the activations less but holds too many registers); bf16 rows (wo_a) two above 24 rows.
+OPT_GEMV_MMA_ENTRY(opt_gemv_mma_fp8a_bf16o_m1, false, 1)
+OPT_GEMV_MMA_ENTRY(opt_gemv_mma_bf16a_bf16o_m1, true, 1)
+OPT_GEMV_MMA_ENTRY(opt_gemv_mma_bf16a_bf16o_m2, true, 2)

@@ -11479,6 +11479,23 @@ fn planned_lanes(serving: bool) -> Result<usize, String> {
     }
 }
 
+/// SPARKFLASH_DECODE_MMA: the E4M3- and bf16-row decode GEMVs on the tensor cores (kernels/
+/// opt_gemv_sm121.cu's opt_gemv_mma_*). `None` when unset: the tensor cores wherever the opt GEMV is
+/// installed. `Some(true)` (on|1) requires the opt GEMV; `Some(false)` (off|0) keeps the FMA chain,
+/// whose greedy output is the one from before the tensor-core forms. Either way a row's bits are one
+/// fixed chain whatever the batch. Any other value is refused.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn decode_mma_from_env_value(raw: Option<&str>) -> Result<Option<bool>, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some("0" | "off") => Ok(Some(false)),
+        Some("1" | "on") => Ok(Some(true)),
+        Some(other) => Err(format!(
+            "SPARKFLASH_DECODE_MMA={other:?} is not one of off|on"
+        )),
+    }
+}
+
 /// The candidate mask's words for a run of `max_positions`: the rank form's fixed table, or one bit
 /// a position past it.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -11721,7 +11738,10 @@ impl<'a> DeviceLayer<'a> {
             _ => None,
         };
         // The split-K opt GEMV serves every decode GEMV and the grouped wo_a once installed; the
-        // modules stay loaded for the process (nothing frees them).
+        // modules stay loaded for the process (nothing frees them). Its E4M3- and bf16-row launches
+        // run on the tensor-core forms in the same cubin unless SPARKFLASH_DECODE_MMA=off.
+        let decode_mma =
+            decode_mma_from_env_value(std::env::var("SPARKFLASH_DECODE_MMA").ok().as_deref())?;
         if let Some(dir) = kernel_cubin_dir
             && std::env::var("SPARKFLASH_OPT_GEMV").as_deref() != Ok("0")
         {
@@ -11729,6 +11749,15 @@ impl<'a> DeviceLayer<'a> {
                 .map_err(|error| format!("layer device opt gemv: {error}"))?;
             let _ = sparkflash_kernels::mxfp8_gemv_launch::install_opt(cuda, &cubin)?;
             let _ = sparkflash_kernels::bf16a_mxfp8w_wo_a_launch::install_opt(cuda, &cubin)?;
+            if decode_mma != Some(false) {
+                let _ = sparkflash_kernels::mxfp8_gemv_launch::install_decode_mma(cuda, &cubin)?;
+            }
+        } else if decode_mma == Some(true) {
+            return Err(
+                "SPARKFLASH_DECODE_MMA=on runs on the opt GEMV, which is off here \
+                        (SPARKFLASH_OPT_GEMV=0 or no kernel directory)"
+                    .to_owned(),
+            );
         }
         let opt_rope = match kernel_cubin_dir {
             Some(dir) if std::env::var("SPARKFLASH_OPT_MISC").as_deref() != Ok("0") => {
@@ -21281,6 +21310,27 @@ mod tests {
             head_seam_input_file(true, seam, alias),
             alias.display().to_string()
         );
+    }
+}
+
+#[cfg(test)]
+mod decode_mma_switch_tests {
+    use super::*;
+
+    #[test]
+    fn the_tensor_core_decode_is_the_default_off_opts_out_and_other_values_are_refused() {
+        for unset in [None, Some(""), Some("  ")] {
+            assert_eq!(decode_mma_from_env_value(unset), Ok(None), "{unset:?}");
+        }
+        for off in [Some("0"), Some("off"), Some(" off ")] {
+            assert_eq!(decode_mma_from_env_value(off), Ok(Some(false)), "{off:?}");
+        }
+        for on in [Some("1"), Some("on")] {
+            assert_eq!(decode_mma_from_env_value(on), Ok(Some(true)), "{on:?}");
+        }
+        for bad in ["true", "yes", "ON", "2"] {
+            assert!(decode_mma_from_env_value(Some(bad)).is_err(), "{bad:?}");
+        }
     }
 }
 

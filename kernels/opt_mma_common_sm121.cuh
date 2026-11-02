@@ -16,7 +16,8 @@
 //
 // The tensor-core prefill's shared primitives, lifted unchanged out of kernels/opt_mma_sm121.cu so a
 // second model pack runs the same instructions instead of growing its own copy: the bulk tile
-// geometry, the ue8m0 decode, the cp.async stage copy and the ldmatrix load.
+// geometry, the ue8m0 decode, the cp.async stage copy, the ldmatrix load and the block-scaled E4M3
+// MMA (which the decode GEMV's tensor-core forms in kernels/opt_gemv_sm121.cu share).
 //
 // Attribution:
 //   - The SM120/SM121 (GB10) mma.sync / ldmatrix / cp.async tiling patterns draw on prior art from
@@ -65,6 +66,17 @@ __device__ __forceinline__ void om_ldsm4(uint32_t addr, uint32_t &r0, uint32_t &
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                  : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
                  : "r"(addr));
+}
+
+// D += A x B with the ue8m0 scales: lane l supplies A row (l / 4) + 8 (l % 2) and B column l / 4.
+__device__ __forceinline__ void om_mma_e4m3(float d[4], const uint32_t a[4], uint32_t b0, uint32_t b1,
+                                            uint32_t sfa, uint32_t sfb) {
+    asm volatile(
+        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3},{%10},{%11,%12},{%13},{%14,%15};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "h"((uint16_t)0),
+          "h"((uint16_t)0), "r"(sfb), "h"((uint16_t)0), "h"((uint16_t)0));
 }
 
 #endif  // SPARKFLASH_OPT_MMA_COMMON_SM121_CUH

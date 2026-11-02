@@ -44,17 +44,6 @@
 
 #include "opt_mma_common_sm121.cuh"
 
-// D += A x B with the ue8m0 scales: lane l supplies A row (l / 4) + 8 (l % 2) and B column l / 4.
-__device__ __forceinline__ void om_mma_e4m3(float d[4], const uint32_t a[4], uint32_t b0, uint32_t b1,
-                                            uint32_t sfa, uint32_t sfb) {
-    asm volatile(
-        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
-        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3},{%10},{%11,%12},{%13},{%14,%15};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "h"((uint16_t)0),
-          "h"((uint16_t)0), "r"(sfb), "h"((uint16_t)0), "h"((uint16_t)0));
-}
-
 // The activation stage is [128 rows][4 chunks of 16 B]; chunk c of row r lives at c ^ ((r / 2) % 4)
 // so the eight rows an ldmatrix phase reads fall in eight bank groups.
 __device__ __forceinline__ uint32_t om_a_off(uint32_t row, uint32_t chunk) {

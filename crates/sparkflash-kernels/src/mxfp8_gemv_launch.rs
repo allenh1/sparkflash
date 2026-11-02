@@ -452,6 +452,70 @@ pub fn mma_installed() -> bool {
     OPT_MMA_FUNCTIONS[0].load(std::sync::atomic::Ordering::Acquire) != 0
 }
 
+/// The tensor-core decode forms (kernels/opt_gemv_sm121.cu's opt_gemv_mma_*), used only once
+/// [`install_decode_mma`] has run (SPARKFLASH_DECODE_MMA): then every E4M3- and bf16-row GEMV
+/// launch - one row ([`launch`], the grouped wo_a), rows ([`launch_opt`] up to 8 tokens,
+/// [`launch_opt_split`]) - runs on them, so a row's bits are one MMA chain whatever the batch. They
+/// are not the FMA forms' bits. Slots: E4M3 rows one m16 tile a block, bf16 one, bf16 two.
+static OPT_DECODE_MMA_FUNCTIONS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+const OPT_DECODE_MMA_SYMBOLS: [&str; 3] = [
+    "opt_gemv_mma_fp8a_bf16o_m1",
+    "opt_gemv_mma_bf16a_bf16o_m1",
+    "opt_gemv_mma_bf16a_bf16o_m2",
+];
+/// Above this many rows a bf16 launch takes two m16 tiles a block (by sweep: wo_a at 1 to 64 rows).
+const DECODE_MMA_BF16_PAIR_ROWS: u32 = 24;
+
+/// Loads the tensor-core decode forms from the opt GEMV's cubin and routes the E4M3- and bf16-row
+/// decode launches through them. The module is returned so the caller keeps it loaded for the run.
+///
+/// # Errors
+/// Returns the driver's error when the cubin lacks a symbol.
+pub fn install_decode_mma(cuda: &Cuda, cubin: &[u8]) -> Result<Module, String> {
+    let mut module = None;
+    for (slot, symbol) in OPT_DECODE_MMA_FUNCTIONS.iter().zip(OPT_DECODE_MMA_SYMBOLS) {
+        let (m, k) = cuda.load_named(cubin, symbol)?;
+        slot.store(k.to_raw().0, std::sync::atomic::Ordering::Release);
+        module = Some(m);
+    }
+    module.ok_or_else(|| "opt decode mma: no symbols".to_owned())
+}
+
+/// True once [`install_decode_mma`] has run.
+#[must_use]
+pub fn decode_mma_installed() -> bool {
+    OPT_DECODE_MMA_FUNCTIONS[0].load(std::sync::atomic::Ordering::Acquire) != 0
+}
+
+/// The tensor-core decode form of a GEMV launch: `None` while they are not installed or for a kind
+/// they do not serve (f32 rows stay on the FMA chain), otherwise the launch's result. Grid (cols /
+/// 32, groups, ceil(tokens / rows a block)).
+///
+/// # Errors
+/// The driver's error, inside the `Some`.
+pub fn launch_decode_mma(cuda: &Cuda, kind: OptKind, args: &OptArgs) -> Option<Result<(), String>> {
+    if !decode_mma_installed() {
+        return None;
+    }
+    let (slot, rows) = match kind {
+        OptKind::Fp8aBf16o => (0, 16),
+        OptKind::Bf16aBf16o if args.tokens > DECODE_MMA_BF16_PAIR_ROWS => (2, 32),
+        OptKind::Bf16aBf16o => (1, 16),
+        OptKind::F32aBf16o | OptKind::F32aF32o => return None,
+    };
+    let word = OPT_DECODE_MMA_FUNCTIONS[slot].load(std::sync::atomic::Ordering::Acquire);
+    Some(cuda.launch(
+        Kernel::from_raw(word, OPT_DECODE_MMA_SYMBOLS[slot]),
+        (args.cols / 32, args.groups, args.tokens.div_ceil(rows)),
+        (256, 1, 1),
+        &opt_words(args),
+    ))
+}
+
 /// The tensor-core form of [`launch_opt`]: 128 x 128 output tiles. The FP8 kernel walks the token
 /// tiles fastest (its weights are the wider operand), the f32/bf16 kernels the column tiles (their
 /// activation rows are).
@@ -477,15 +541,15 @@ fn launch_mma(cuda: &Cuda, index: usize, args: &OptArgs) -> Result<(), String> {
     )
 }
 
-fn opt_for(kernel: Kernel) -> Option<Kernel> {
-    let index = match kernel.to_raw().1 {
-        KERNEL | KERNEL_NONFUSED => 0,
-        KERNEL_NONFUSED_F32_ACTIVATION => 1,
-        KERNEL_NONFUSED_F32_ACTIVATION_F32_OUT => 2,
+fn opt_for(kernel: Kernel) -> Option<(OptKind, Kernel)> {
+    let (index, kind) = match kernel.to_raw().1 {
+        KERNEL | KERNEL_NONFUSED => (0, OptKind::Fp8aBf16o),
+        KERNEL_NONFUSED_F32_ACTIVATION => (1, OptKind::F32aBf16o),
+        KERNEL_NONFUSED_F32_ACTIVATION_F32_OUT => (2, OptKind::F32aF32o),
         _ => return None,
     };
     let word = OPT_FUNCTIONS[index].load(std::sync::atomic::Ordering::Acquire);
-    (word != 0).then(|| Kernel::from_raw(word, OPT_SYMBOLS[index]))
+    (word != 0).then(|| (kind, Kernel::from_raw(word, OPT_SYMBOLS[index])))
 }
 
 /// Which opt GEMV instantiation [`launch_opt`] runs.
@@ -589,6 +653,9 @@ fn opt_index(kind: OptKind, args: &OptArgs) -> Result<usize, String> {
 
 fn launch_gemv(cuda: &Cuda, kind: OptKind, index: usize, args: &OptArgs) -> Result<(), String> {
     use std::sync::atomic::Ordering::Acquire;
+    if let Some(launched) = launch_decode_mma(cuda, kind, args) {
+        return launched;
+    }
     // Tokens per block (every form gives a token the same bits): about four, so a block's
     // accumulators stay short while few splits re-read the weights (from L2: the kernel runs a
     // tile's splits side by side). A wide matrix with a long reduction has the blocks already and
@@ -679,7 +746,7 @@ fn launch_gemv(cuda: &Cuda, kind: OptKind, index: usize, args: &OptArgs) -> Resu
 }
 
 /// The fifteen argument words every opt GEMV and tensor-core GEMM entry takes.
-fn opt_words(args: &OptArgs) -> [u64; 15] {
+pub(crate) fn opt_words(args: &OptArgs) -> [u64; 15] {
     [
         args.a,
         args.a_scales,
@@ -726,17 +793,30 @@ const OPT_STAGE_T1: u32 = 20480;
 pub fn launch(cuda: &Cuda, kernel: Kernel, params: &Mxfp8DenseParams) -> Result<(), String> {
     check(params)?;
     let grid = grid(params.rows(), params.cols())?;
-    if let Some(opt) = opt_for(kernel) {
+    if let Some((kind, opt)) = opt_for(kernel) {
         let p = params.as_slice();
-        let (cols, inner) = (u64::from(params.cols()), u64::from(params.inner()));
-        return cuda.launch(
-            opt,
-            grid,
-            (256, 1, 1),
-            &[
-                p[0], p[1], p[2], p[3], p[4], cols, inner, 1, inner, cols, 0, 0, 0, 0, 0,
-            ],
-        );
+        let args = OptArgs {
+            a: p[0],
+            a_scales: p[1],
+            w: p[2],
+            ws: p[3],
+            out: p[4],
+            cols: params.cols(),
+            inner: params.inner(),
+            tokens: 1,
+            a_tok_stride: u64::from(params.inner()),
+            out_tok_stride: u64::from(params.cols()),
+            groups: 1,
+            a_grp_stride: 0,
+            w_grp_stride: 0,
+            s_grp_stride: 0,
+            out_grp_stride: 0,
+            k_stride_blocks: 0,
+        };
+        if let Some(launched) = launch_decode_mma(cuda, kind, &args) {
+            return launched;
+        }
+        return cuda.launch(opt, grid, (256, 1, 1), &opt_words(&args));
     }
     cuda.launch(kernel, grid, BLOCK, params.as_slice())
 }

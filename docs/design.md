@@ -40,15 +40,19 @@ Two facts shape everything:
 
 ## Decode: the rows step
 
-Every running sequence's next tokens are verified together in one **rows step** of up to 16 rows
+Every running sequence's next tokens are verified together in one **rows step** of up to 64 rows
 (the anchor token plus the drafts of each sequence).
 
 - **One weight read per step.** The dense GEMVs read each weight tile once for all rows. The
   routed MoE kernels deduplicate across rows: an expert routed by several rows is read once, so
   extra rows mostly cost only their new experts.
-- **Bit-exact batching.** Per-row arithmetic is the same at any batch size: decode GEMVs do not
-  use tensor-core MMA and keep a fixed reduction order. Greedy output is identical whether a
-  request runs alone or with seven others, and identical to the one-row reference path.
+- **Bit-exact batching.** Per-row arithmetic is the same at any batch size: every output is
+  reduced in a fixed order that does not depend on the row count. Decode runs the dense
+  projections as tensor-core MMA with a fixed tile shape and K order, which keeps the property;
+  `SPARKFLASH_DECODE_MMA=off` runs them on the CUDA cores instead, 5% slower at eight streams and
+  with the greedy output from before the tensor-core decode
+  ([performance](performance.md#what-an-extra-verify-row-costs)). Greedy output is identical
+  whether a request runs alone or with seven others, and identical to the one-row reference path.
 - **Collectives sized for the fabric.** Each layer's all-reduces run on one NCCL communicator over
   RoCE; small exchanges (argmax, embeddings, draft tokens) and the `RoCEnante` one-shot RDMA
   transport (`crates/sparkflash-comm`, `kernels/rocenante_oneshot_sm121.cu`) follow the
