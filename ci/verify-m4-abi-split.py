@@ -112,6 +112,30 @@ POST_SPLIT_ROOT_EDITS = [
         '        "acc += (partial * act_scale) * w_scale;",\n        "acc += routing * (partial * act_scale) * w_scale;",\n',
         '        "__fmul_rn(__fmul_rn(partial, act_scale), w_scale);",\n        "__fmul_rn(__fmul_rn(routing * partial, act_scale), w_scale);",\n',
     ),
+    (
+        "//!     crates/sparkflash-kernels/baseline/kernel_baseline.txt in the cuda-abi CI job) or to a\n",
+        "//!     crates/sparkflash-kernels/baseline/kernel_baseline.txt in the nightly cuda-baseline job) or to a\n",
+    ),
+    (
+        "//!      cuda-abi CI job asserts the probe PTX exists, and scripts/check-kernel-baseline.sh recompiles\n",
+        "//!      cuda-tests CI job asserts the probe PTX exists, and scripts/check-kernel-baseline.sh recompiles\n",
+    ),
+    (
+        "//!     to the six kernels' cubin byte count, sha256 or PTX `membar` count fails the `cuda-abi` CI\n",
+        "//!     to the six kernels' cubin byte count, sha256 or PTX `membar` count fails the nightly `cuda-baseline` CI\n",
+    ),
+    (
+        "//! runs the same script when nvcc is available and says it skipped when it is not, and the cuda-abi\n",
+        "//! runs the same script when nvcc is available and says it skipped when it is not, and the nightly cuda-baseline\n",
+    ),
+    (
+        "//! available and reports a skip when it is not, and the `cuda-abi` CI job runs it as a hard gate.\n",
+        "//! available and reports a skip when it is not, and the nightly `cuda-baseline` CI job runs it as a hard gate.\n",
+    ),
+    (
+        "/// edit from quietly deleting an assertion that the CI cuda-abi job exists to enforce.\n",
+        "/// edit from quietly deleting an assertion that the nightly cuda-baseline job exists to enforce.\n",
+    ),
 ]
 
 POST_SPLIT_GUARD_EDITS = [
@@ -146,6 +170,10 @@ POST_SPLIT_GUARD_EDITS = [
         );
     }
 ''',
+    ),
+    (
+        "/// feature sweep with its own tests, and the six-cubin baseline gate of the `cuda-abi` job, each of\n",
+        "/// feature sweep with its own tests, and the six-cubin baseline gate of the `cuda-baseline` job, each of\n",
     ),
 ]
 
