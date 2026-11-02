@@ -36,7 +36,13 @@ Two facts shape everything:
 - The embedding table is replicated on every rank, so token embedding needs no exchange.
 - Engram's n-gram tables live on each node's NVMe and are read with `io_uring` while the layers
   ahead of the Engram layers run; a keep-alive reader holds the drive out of its idle state while
-  sequences are running.
+  sequences are running. The reads use `O_DIRECT`, so the ~200 GB of tables never pass through the
+  page cache, which would otherwise fill the memory the GPU shares and keep the kernel reclaiming.
+  A prompt chunk's reads are split over the ranks by column: each rank reads 6 of every row's 24
+  columns and the ranks exchange them on the device, so a node issues 24 reads a row instead of 96.
+  Prompt chunks' reads go to a pool of 256 threads that take the earliest Engram layer's reads of
+  every chunk in flight first, so each chunk reaches its first Engram layer before a read for a
+  later layer lands.
 
 ## Decode: the rows step
 
@@ -115,6 +121,10 @@ Short and cached prompts take the exact rows path. Long uncached prompts take th
   concurrent requests sharing a prefix prefill it once. Cached turns are scheduled first.
 - **Decoders keep running through long prefills.** A long prompt is prefilled in chunks between
   decode ticks, so running streams slow down but never stall behind a 200K-token prompt.
+- **Short prompts prefill together.** Up to three prompts whose uncached rest is one bulk chunk
+  share a tick (2,048 rows in all while others decode), each a chunk on its own lane, interleaved
+  layer by layer as a long prompt's chunks are. Eight uncached 800-token prompts arriving at once
+  prefill in five ticks instead of eight, and each prompt's results are the ones it gets alone.
 - Context up to 1,048,576 tokens per sequence.
 - The HTTP surface (OpenAI chat/completions/responses, Anthropic messages, tokenize/detokenize,
   metrics) is described in [serving.md](serving.md).

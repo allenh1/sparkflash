@@ -672,10 +672,15 @@ impl<'a> DeviceLayer<'a> {
 
     /// Selects `seg`'s lane (a single-sequence step's implicit segment selects nothing).
     pub(super) fn enter_seg(&mut self, seg: &Seg) -> Result<(), String> {
-        if seg.lane == NO_LANE {
+        self.enter_lane(seg.lane)
+    }
+
+    /// Selects lane `lane`, or nothing for [`NO_LANE`] (the state already selected).
+    pub(super) fn enter_lane(&mut self, lane: usize) -> Result<(), String> {
+        if lane == NO_LANE {
             Ok(())
         } else {
-            self.select_lane(seg.lane)
+            self.select_lane(lane)
         }
     }
 

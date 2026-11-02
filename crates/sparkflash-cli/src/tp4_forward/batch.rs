@@ -54,7 +54,7 @@
 //! (the same place, grid and canvas key).
 
 use super::draft::{AnchorRow, BLOCK, DraftBlock, DraftState};
-use super::lanes::{SLIDE_STEP, Seg, slide_floor};
+use super::lanes::{NO_LANE, SLIDE_STEP, Seg, slide_floor};
 use super::rows::{R_MAX, RowsState};
 use super::sample::Sampler;
 use super::spec::{
@@ -477,6 +477,8 @@ pub(super) struct Batch<'b, 'a, 'r> {
     tick_chunk: bool,
     print: bool,
     trace: bool,
+    /// The ms the running tick's prefill waited for Engram reads, for the trace.
+    read_wait_ms: f64,
     preemptions: usize,
 }
 
@@ -540,6 +542,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             print: inputs.rank == 0 && std::env::var("SPARKFLASH_SPEC_TRACE").as_deref() == Ok("1"),
             trace: inputs.rank == 0
                 && std::env::var("SPARKFLASH_BATCH_TRACE").as_deref() == Ok("1"),
+            read_wait_ms: 0.0,
             preemptions: 0,
         })
     }
@@ -810,6 +813,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let started = Instant::now();
         self.tick_started = started;
         self.tick_chunk = false;
+        self.read_wait_ms = 0.0;
         let mut out = Vec::new();
         self.place(&mut out)?;
         let decoding = self.decoding();
@@ -828,13 +832,20 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             // state, and `hold` is rank 0's.
             if !(hold && decoding && left > SHARE_MIN_ROWS) {
                 let from = self.seqs[index].pos;
-                self.prefill(index, decoding, &mut out)?;
-                // A preempted sequence went back to position 0.
-                let ran = self.seqs[index].pos.saturating_sub(from);
-                prefilled = Some((self.seqs[index].id, from, ran));
-                if left > SHARE_MIN_ROWS && ran > 0 {
-                    long_chunk = Some(ran);
-                    self.tick_chunk = true;
+                let together = self.together(index, decoding)?;
+                if together.len() > 1 {
+                    // Short rests only: no long chunk for the decoders' share.
+                    let ran = self.prefill_together(&together, &mut out)?;
+                    prefilled = Some((self.seqs[index].id, from, ran));
+                } else {
+                    self.prefill(index, decoding, &mut out)?;
+                    // A preempted sequence went back to position 0.
+                    let ran = self.seqs[index].pos.saturating_sub(from);
+                    prefilled = Some((self.seqs[index].id, from, ran));
+                    if left > SHARE_MIN_ROWS && ran > 0 {
+                        long_chunk = Some(ran);
+                        self.tick_chunk = true;
+                    }
                 }
             }
         }
@@ -853,9 +864,10 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         if self.trace {
             let (held, budget) = self.device.lane_memory();
             println!(
-                "batch: tick {} seqs {} prefill {prefilled:?} {prefill_ms:.1} ms decode {batch} rows {:.1} ms lanes {} of {} MiB",
+                "batch: tick {} seqs {} prefill {prefilled:?} {prefill_ms:.1} ms (reads {:.1} ms) decode {batch} rows {:.1} ms lanes {} of {} MiB",
                 self.ticks,
                 self.seqs.len(),
+                self.read_wait_ms,
                 started.elapsed().as_secs_f64() * 1e3 - prefill_ms,
                 held >> 20,
                 budget >> 20,
@@ -1458,6 +1470,18 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         } else {
             self.prefill_exact(index, target, decoding)?
         };
+        self.prefilled(index, target, first, out)
+    }
+
+    /// Sequence `index` after its prefill ran to its position: once that is `target` it decodes,
+    /// with `first` (None for a recomputed sequence, whose anchor is already known) emitted.
+    fn prefilled(
+        &mut self,
+        index: usize,
+        target: usize,
+        first: Option<u32>,
+        out: &mut Vec<Emission>,
+    ) -> Result<(), String> {
         if self.seqs[index].pos < target {
             return Ok(());
         }
@@ -1606,7 +1630,17 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let id = self.seqs[index].id;
         let p = self.seqs[index].pos;
         let (budget, most) = self.bulk_budget(decoding);
-        let chunk = |p: usize| bulk_rows(target - p, budget, most);
+        // The tick's `slot`th chunk from row p: one that another chunk of the tick follows splits
+        // the decoder's rows off ([`bulk_rows`]).
+        let ways = if self.pairs(index, decoding) {
+            1 + inputs.bulk_more.len()
+        } else {
+            1
+        };
+        let split = self.decoder_skip.then_some(DECODER_WARM);
+        let chunk = move |p: usize, slot: usize| {
+            bulk_rows(target - p, budget, most, split.filter(|_| slot + 1 < ways))
+        };
         let pending = match self.prefill_next.take() {
             Some(next) if next.seq == id && next.p == p => Some(next),
             Some(next) => {
@@ -1621,28 +1655,10 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                       p: usize,
                       n: usize,
                       staging: Option<&[HostMapped; 2]>,
-                      buffer: usize|
-         -> Result<Option<PrefillReads<'r>>, String> {
-            let (Some(reader), Some(reads), Some(staging)) = (inputs.engram, reads, staging) else {
-                return Ok(None);
-            };
-            let Some(mut gather) = device.engram_plan(inputs.config, reader, tokens, p, n, 0, n)?
-            else {
-                return Ok(None);
-            };
-            gather.cached = false;
-            let task = reads.submit(
-                gather,
-                Staging::of(&staging[buffer]),
-                super::spec::prefill_read_threads(),
-            )?;
-            Ok(Some(PrefillReads {
-                seq: id,
-                p,
-                n,
-                task,
-                buffer,
-            }))
+                      buffer: usize| {
+            submit_chunk_reads(
+                device, inputs, reads, exchange, id, tokens, p, n, staging, buffer,
+            )
         };
         let current = match pending {
             Some(next) => Some(next),
@@ -1650,15 +1666,14 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 self.device,
                 &self.seqs[index].tokens,
                 p,
-                chunk(p),
+                chunk(p, 0),
                 staging,
                 0,
             )?,
         };
-        let n = current.as_ref().map_or_else(|| chunk(p), |next| next.n);
+        let n = current.as_ref().map_or_else(|| chunk(p, 0), |next| next.n);
         let buffer = current.as_ref().map_or(0, |current| current.buffer);
-        let several =
-            self.pairs(index, decoding) && n > R_MAX && p + n < target && chunk(p + n) > R_MAX;
+        let several = ways > 1 && n > R_MAX && p + n < target && chunk(p + n, 1) > R_MAX;
         let lane = self.seqs[index].lane.ok_or("prefill: no lane")?;
         if !several {
             let staged = &inputs.staged[..self.prefill_layers(lane, p, n, target)];
@@ -1683,7 +1698,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             let mut next = None;
             match reads {
                 Some(reads) => {
-                    self.device.prefill_layers_gathered(
+                    let waited = self.device.prefill_layers_gathered(
                         state,
                         staged,
                         &inputs.config.engram_layer_ids,
@@ -1697,7 +1712,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                                     device,
                                     tokens,
                                     after,
-                                    chunk(after),
+                                    chunk(after, 0),
                                     staging,
                                     buffer ^ 1,
                                 )?;
@@ -1705,6 +1720,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                             Ok(())
                         },
                     )?;
+                    self.read_wait_ms += waited;
                 }
                 None => self.device.spec_layers(state, staged, p, n)?,
             }
@@ -1729,7 +1745,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let mut slots = vec![(state, p, n, current, staging, buffer)];
         let mut end = p + n;
         for (slot, state_i) in more.iter().enumerate() {
-            if end >= target || chunk(end) <= R_MAX {
+            if end >= target || chunk(end, slot + 1) <= R_MAX {
                 break;
             }
             let staging_i = bulk_staging(state_i, inputs);
@@ -1748,12 +1764,14 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                     self.device,
                     &self.seqs[index].tokens,
                     end,
-                    chunk(end),
+                    chunk(end, slot + 1),
                     staging_i,
                     buffer,
                 )?,
             };
-            let n_i = current_i.as_ref().map_or_else(|| chunk(end), |next| next.n);
+            let n_i = current_i
+                .as_ref()
+                .map_or_else(|| chunk(end, slot + 1), |next| next.n);
             let buffer_i = current_i.as_ref().map_or(buffer, |current| current.buffer);
             slots.push((state_i, end, n_i, current_i, staging_i, buffer_i));
             end += n_i;
@@ -1788,11 +1806,17 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let chunks: Vec<_> = slots
             .iter()
             .map(|(state, p, n, current, staging, _)| {
-                (*state, *p, *n, chunk_reads(current.as_ref(), *staging))
+                (
+                    *state,
+                    NO_LANE,
+                    *p,
+                    *n,
+                    chunk_reads(current.as_ref(), *staging),
+                )
             })
             .collect();
         let mut next: Vec<Option<PrefillReads<'r>>> = slots.iter().map(|_| None).collect();
-        self.device.prefill_layers_paired(
+        let waited = self.device.prefill_layers_paired(
             &chunks,
             inputs.staged,
             encoder_only,
@@ -1805,7 +1829,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                     if at >= target {
                         break;
                     }
-                    let n_next = chunk(at);
+                    let n_next = chunk(at, slot);
                     if slot > 0 && n_next <= R_MAX {
                         break;
                     }
@@ -1818,6 +1842,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 Ok(())
             },
         )?;
+        self.read_wait_ms += waited;
         drop(chunks);
         let mut next = next.into_iter();
         self.prefill_next = next.next().flatten();
@@ -1834,6 +1859,173 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         }
         let &(last, _, n_last, ..) = slots.last().ok_or("prefill: no bulk chunk")?;
         self.bulk_first(index, last, n_last, target).map(Some)
+    }
+
+    /// The sequences whose prompts end together in this tick, sequence `index` (the next in
+    /// [`Self::prefill_order`]) first: while a bulk rows state is left, the next sequences in
+    /// prefill order whose rest is one chunk ([`Self::whole_chunk`]), as many rows in all as one
+    /// tick runs (a busy chunk's beside decoders, a chunk a state otherwise), each one's lane backed
+    /// for it and the decode after without preempting anything. One that would copy half its rest
+    /// or more from a picked one once that has run ([`Self::adopt`]) waits for it instead. Just
+    /// `index` when nothing joins it, or while reads for a bulk tick are staged. Every rank answers
+    /// alike.
+    fn together(&mut self, index: usize, decoding: bool) -> Result<Vec<usize>, String> {
+        let mut picked = vec![index];
+        let ways = 1 + self.inputs.bulk_more.len();
+        if ways == 1
+            || !self.attached
+            || !self.device.bulk_comm_open()
+            || self.prefill_next.is_some()
+            || self.prefill_more.iter().any(Option::is_some)
+        {
+            return Ok(picked);
+        }
+        let (budget, _) = self.bulk_budget(decoding);
+        let most = if decoding { budget } else { budget * ways };
+        let mut rows = match self.whole_chunk(index, budget) {
+            Some((left, lane, target)) if self.grow(lane, target + BLOCK + self.k + 2)? => left,
+            _ => return Ok(picked),
+        };
+        for (_, other) in self.prefill_order() {
+            if picked.len() == ways {
+                break;
+            }
+            if other == index {
+                continue;
+            }
+            self.adopt(other)?;
+            let Some((left, lane, target)) = self.whole_chunk(other, budget) else {
+                continue;
+            };
+            if rows + left > most {
+                break;
+            }
+            let seq = &self.seqs[other];
+            let waits = picked.iter().any(|&lead| {
+                let lead = &self.seqs[lead];
+                let shared = common_prefix(&lead.tokens, &[], &seq.tokens, &seq.images);
+                shared >= seq.pos + ADOPT_MIN.max(left / 2)
+            });
+            if !waits && self.grow(lane, target + BLOCK + self.k + 2)? {
+                rows += left;
+                picked.push(other);
+            }
+        }
+        Ok(picked)
+    }
+
+    /// Sequence `index`'s (rows left, lane, target) when its prompt's rest is one bulk chunk
+    /// however its tick runs it: more than R_MAX rows, at most `budget`, and too few to split off
+    /// the decoder's ([`bulk_rows`]); with a lane and no images.
+    fn whole_chunk(&self, index: usize, budget: usize) -> Option<(usize, usize, usize)> {
+        let seq = &self.seqs[index];
+        let (Phase::Prefill { target, bulk: true }, Some(lane)) = (seq.phase, seq.lane) else {
+            return None;
+        };
+        let left = target - seq.pos;
+        let most = if self.decoder_skip {
+            budget.min(DECODER_WARM + R_MAX)
+        } else {
+            budget
+        };
+        (!seq.done && seq.images.is_empty() && left > R_MAX && left <= most)
+            .then_some((left, lane, target))
+    }
+
+    /// The rests of sequences `picked` ([`Self::together`]) as one bulk tick: each one's rest a
+    /// chunk on a bulk rows state of its own, run on its lane, their layers interleaved
+    /// ([`DeviceLayer::prefill_layers_paired`]) so each chunk's results are its tick alone's; each
+    /// samples its first token from its chunk's last row. Returns the rows run.
+    fn prefill_together(
+        &mut self,
+        picked: &[usize],
+        out: &mut Vec<Emission>,
+    ) -> Result<usize, String> {
+        let (inputs, draft) = (self.inputs, self.draft);
+        let exchange = self
+            .exchange
+            .ok_or("prefill: the bulk chunks need the exchange")?;
+        let states = inputs.bulk.into_iter().chain(inputs.bulk_more);
+        let pools = self.pools;
+        let mut slots = Vec::with_capacity(picked.len());
+        for (&index, state) in picked.iter().zip(states) {
+            let seq = &self.seqs[index];
+            let (Phase::Prefill { target, .. }, Some(lane)) = (seq.phase, seq.lane) else {
+                return Err(format!("prefill: sequence {} is not prefilling", seq.id));
+            };
+            let (p, n) = (seq.pos, target - seq.pos);
+            let staging = bulk_staging(state, inputs);
+            let reads = pools.prefill.as_ref().filter(|_| staging.is_some());
+            let current = submit_chunk_reads(
+                self.device,
+                inputs,
+                reads,
+                exchange,
+                seq.id,
+                &seq.tokens,
+                p,
+                n,
+                staging,
+                0,
+            )?;
+            self.enter(lane)?;
+            if self.prefill_layers(lane, p, n, target) < inputs.staged.len() {
+                return Err(format!("prefill: {n} rows to {target} skip the decoder"));
+            }
+            let ids = upload_ids(&self.seqs[index].tokens[p..p + n]);
+            self.device
+                .cuda
+                .copy_htod(&Deviceptr(state.b.row_ids), &ids)?;
+            self.device.begin_rows_device(
+                state,
+                p,
+                inputs.embed.0,
+                state.b.row_ids,
+                n,
+                exchange,
+            )?;
+            slots.push((index, state, lane, p, n, target, current, staging));
+        }
+        let chunks: Vec<_> = slots
+            .iter()
+            .map(|(_, state, lane, p, n, _, current, staging)| {
+                (
+                    *state,
+                    *lane,
+                    *p,
+                    *n,
+                    chunk_reads(current.as_ref(), *staging),
+                )
+            })
+            .collect();
+        let waited = self.device.prefill_layers_paired(
+            &chunks,
+            inputs.staged,
+            0,
+            &inputs.config.engram_layer_ids,
+            pools.prefill.as_ref(),
+            |_| Ok(()),
+        )?;
+        self.read_wait_ms += waited;
+        drop(chunks);
+        let mut ran = 0;
+        for &(index, state, lane, p, n, target, ..) in &slots {
+            self.enter(lane)?;
+            // The drafter's taps are layers 37-39's.
+            self.device.draft_seed(state, draft, p, n)?;
+            self.seqs[index].pos = target;
+            ran += n;
+        }
+        for &(index, state, lane, _, n, target, ..) in &slots {
+            self.enter(lane)?;
+            let first = if self.seqs[index].emitted() > 0 {
+                None
+            } else {
+                Some(self.bulk_first(index, state, n, target)?)
+            };
+            self.prefilled(index, target, first, out)?;
+        }
+        Ok(ran)
     }
 
     /// The first token of sequence `index`, from the last row of the bulk chunk of `n` rows that
@@ -1946,6 +2138,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             1,
             0,
             BLOCK + 1,
+            None,
         )?
         else {
             return Ok(());
@@ -2055,11 +2248,18 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 depth,
                 1,
                 BLOCK + 1,
+                None,
             )?,
-            Some(reader) => {
-                self.device
-                    .engram_plan(inputs.config, reader, &seq.tokens, pos, n, 0, BLOCK + 1)?
-            }
+            Some(reader) => self.device.engram_plan(
+                inputs.config,
+                reader,
+                &seq.tokens,
+                pos,
+                n,
+                0,
+                BLOCK + 1,
+                None,
+            )?,
             None => None,
         };
         let te = Instant::now();
@@ -2212,6 +2412,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                     1,
                     row,
                     R_MAX,
+                    None,
                 )?
             {
                 parts.push(part);
@@ -2390,6 +2591,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                     n,
                     row0,
                     R_MAX,
+                    None,
                 )?
             {
                 parts.push(part);
@@ -2486,13 +2688,21 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
     }
 }
 
-/// A chunk's token ids as the embedding upload takes them: an image span's positions are the
-/// placeholder's row (the tower rank overwrites them before the exchange).
 /// The rows of the next bulk chunk with `left` rows of the prompt to go: `budget`, or all of them
 /// when they fit `most`, so no short tail takes a chunk (and a read of every expert's weights) of
-/// its own.
-fn bulk_rows(left: usize, budget: usize, most: usize) -> usize {
-    if left <= most { left } else { budget }
+/// its own. With `split` (the decoder's [`DECODER_WARM`] rows, when the tick runs another chunk
+/// after this one), the rows before the prompt's last `split` take this chunk once they fit it, so
+/// they stop after the encoder layers and only the last `split` rows, in the chunk beside them,
+/// run the decoder's.
+fn bulk_rows(left: usize, budget: usize, most: usize, split: Option<usize>) -> usize {
+    let early = split.map_or(0, |warm| left.saturating_sub(warm));
+    if early > R_MAX && early <= budget {
+        early
+    } else if left <= most {
+        left
+    } else {
+        budget
+    }
 }
 
 /// How many leading positions of `wanted` a lane holding `held` (its image spans `spans`) holds
@@ -2526,6 +2736,44 @@ fn chunk_reads<'c, 'r, 's>(
         .map(|(current, staging)| (&*current.task, &staging[current.buffer]))
 }
 
+/// Plans sequence `id`'s Engram reads for its rows p..p+n (history `tokens`) and submits them to
+/// `reads`, landing in `staging[buffer]`: None when the run reads no Engram or the rows read none.
+#[allow(clippy::too_many_arguments)]
+fn submit_chunk_reads<'r>(
+    device: &mut DeviceLayer<'_>,
+    inputs: &SpecInputs<'r>,
+    reads: Option<&Reads<'r>>,
+    exchange: (usize, usize),
+    id: u64,
+    tokens: &[u32],
+    p: usize,
+    n: usize,
+    staging: Option<&[HostMapped; 2]>,
+    buffer: usize,
+) -> Result<Option<PrefillReads<'r>>, String> {
+    let (Some(reader), Some(reads), Some(staging)) = (inputs.engram, reads, staging) else {
+        return Ok(None);
+    };
+    let shard = reader.shard.then_some(exchange);
+    let Some(mut gather) = device.engram_plan(inputs.config, reader, tokens, p, n, 0, n, shard)?
+    else {
+        return Ok(None);
+    };
+    gather.cached = false;
+    let task = reads.submit(
+        gather,
+        Staging::of(&staging[buffer]),
+        super::spec::prefill_read_threads(),
+    )?;
+    Ok(Some(PrefillReads {
+        seq: id,
+        p,
+        n,
+        task,
+        buffer,
+    }))
+}
+
 /// A bulk rows state's pinned Engram staging pair, when the run reads Engram.
 fn bulk_staging<'s>(state: &'s RowsState, inputs: &SpecInputs<'_>) -> Option<&'s [HostMapped; 2]> {
     state
@@ -2535,6 +2783,8 @@ fn bulk_staging<'s>(state: &'s RowsState, inputs: &SpecInputs<'_>) -> Option<&'s
         .filter(|_| inputs.engram.is_some())
 }
 
+/// A chunk's token ids as the embedding upload takes them: an image span's positions are the
+/// placeholder's row (the tower rank overwrites them before the exchange).
 fn upload_ids(tokens: &[u32]) -> Vec<u8> {
     tokens
         .iter()
@@ -2565,8 +2815,8 @@ impl Drop for Batch<'_, '_, '_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DECODER_WARM, DecodeShare, ENCODER_LAYERS, bulk_rows, common_prefix, constraint_refusal,
-        decoder_resume, runs_decoder, share_rows, skip_end_after,
+        DECODER_WARM, DecodeShare, ENCODER_LAYERS, R_MAX, bulk_rows, common_prefix,
+        constraint_refusal, decoder_resume, runs_decoder, share_rows, skip_end_after,
     };
     use sparkflash_api::constrained::TokenConstraint;
     use sparkflash_api::vocab::TokenBytes;
@@ -2620,10 +2870,39 @@ mod tests {
 
     #[test]
     fn a_short_tail_rides_with_the_chunk_before_it() {
-        assert_eq!(bulk_rows(540, 512, 768), 540);
-        assert_eq!(bulk_rows(769, 512, 768), 512);
-        assert_eq!(bulk_rows(5000, 4096, 4096), 4096);
-        assert_eq!(bulk_rows(100, 4096, 4096), 100);
+        assert_eq!(bulk_rows(540, 512, 768, None), 540);
+        assert_eq!(bulk_rows(769, 512, 768, None), 512);
+        assert_eq!(bulk_rows(5000, 4096, 4096, None), 4096);
+        assert_eq!(bulk_rows(100, 4096, 4096, None), 100);
+    }
+
+    #[test]
+    fn the_rows_before_the_decoder_s_take_a_chunk_beside_them() {
+        let split = Some(DECODER_WARM);
+        // A tick of three chunks, as the scheduler asks for them: the last of the tick gets no
+        // split, so the split never adds a tick.
+        let tick = |left: usize| {
+            let mut chunks = Vec::new();
+            let mut left = left;
+            for slot in 0..3 {
+                if left == 0 {
+                    break;
+                }
+                let n = bulk_rows(left, 4096, 4096, split.filter(|_| slot < 2));
+                chunks.push(n);
+                left -= n;
+            }
+            chunks
+        };
+        // 4126 rows: the 30-row tail no longer takes a tick (and an expert pass) of its own, and
+        // only the decoder's rows run its layers.
+        assert_eq!(tick(4126), [4126 - DECODER_WARM, DECODER_WARM]);
+        assert_eq!(tick(9000), [4096, 9000 - 4096 - DECODER_WARM, DECODER_WARM]);
+        // Three full chunks still fill the tick.
+        assert_eq!(tick(12000), [4096, 4096, 3808]);
+        // A prompt within a window or so of the decoder's rows stays one chunk.
+        assert_eq!(tick(DECODER_WARM + R_MAX), [DECODER_WARM + R_MAX]);
+        assert_eq!(tick(2000), [2000]);
     }
 
     #[test]

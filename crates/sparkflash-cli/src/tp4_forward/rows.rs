@@ -2103,6 +2103,8 @@ impl DeviceLayer<'_> {
                 n as u64,
                 u64::from(vecs),
                 world as u64,
+                u64::from(vecs),
+                world as u64 * u64::from(vecs),
             ],
         )
     }
@@ -3578,7 +3580,7 @@ impl DeviceLayer<'_> {
 
     /// [Self::exchange_slots] as one ring AllGather (the same bits in the same slots), for a bulk
     /// chunk's slots: the point-to-point sends of a 2K-row embedding slot take ~110 ms.
-    fn gather_slots(
+    pub(super) fn gather_slots(
         &self,
         gather: u64,
         count: usize,

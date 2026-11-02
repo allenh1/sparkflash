@@ -105,7 +105,7 @@ use sparkflash_comm::device_reduce::{
 use sparkflash_comm::nccl::{NcclApi, NcclError};
 use sparkflash_comm::tcp::TcpTransport;
 use sparkflash_engine::linalg::EngineError;
-use sparkflash_engine::parallel_tp::{TpCollective, Wire};
+use sparkflash_engine::parallel_tp::{TpCollective, TpLayout, Wire};
 
 /// Opens the run's NCCL communicator: library check, rendezvous, open, warm up, one sync, one barrier.
 ///
@@ -163,6 +163,42 @@ pub fn open_run_reduce(
     // that failed one of them cannot leave its peers to enter the timed region alone.
     setup_barrier(transport, world, rank)?;
     Ok(reduce)
+}
+
+/// [`open_run_reduce`] for a [`DeviceExchange`] of `hidden`-wide f32 rows, on `cuda`'s context.
+/// Every rank must pass the same `run`: its digest is the agreement word, so ranks that disagree on
+/// what they are about to run refuse before any enters NCCL. The warm-up moves one row's partial,
+/// and its scratch is freed once the open has synchronised it.
+///
+/// # Errors
+/// The scratch allocation, or any refusal of [`open_run_reduce`].
+pub fn open_exchange_reduce(
+    cuda: &sparkflash_kernels::cuda_driver::Cuda,
+    transport: &TcpTransport,
+    layout: TpLayout,
+    hidden: usize,
+    run: &str,
+) -> Result<RunReduce, String> {
+    let agreement = BootstrapConfig {
+        native_rounding: 0,
+        env_toggles: 0,
+        plan_digest: sparkflash_engine::synthetic::fnv1a(run.as_bytes()),
+    };
+    // One f32 row is two bf16 words an element, the unit the exchange moves.
+    let payload = hidden * 2;
+    let mut allocated = 0usize;
+    let scratch = cuda.alloc(payload * 2, &mut allocated)?;
+    let opened = open_run_reduce(
+        transport,
+        layout.world_size,
+        layout.rank,
+        0,
+        scratch.0,
+        payload,
+        agreement,
+    );
+    cuda.free_buffers(&[&scratch]);
+    opened.map_err(|error| format!("nccl open: {error}"))
 }
 
 /// Refuses an open request whose arguments cannot be honoured, before any transport or NCCL call.

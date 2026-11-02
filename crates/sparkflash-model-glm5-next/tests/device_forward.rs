@@ -631,6 +631,55 @@ fn batched_rows_are_the_bits_of_one_token_steps() {
     }
 }
 
+/// A sequence put back at position 0 runs the bits of a fresh one: [DeviceRank::reset] leaves
+/// nothing of the run before it, whose cache entries reach past the second run's positions.
+#[test]
+fn a_reset_sequence_is_the_bits_of_a_fresh_one() {
+    let Some(_cuda) = open() else {
+        return;
+    };
+    let config = Glm5NextConfig::small();
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    write_synthetic_checkpoint(directory.path(), &config, 7, 2).expect("the fixture writes");
+    let (before, after) = (stride_tokens(&config, 2 * TOKENS, 53, 5), tokens(&config));
+    for world in [1, 2] {
+        let bus = Arc::new(LocalBus::new(world).with_wire(Wire::F32));
+        let runs = ranks(
+            &config,
+            Load::Checkpoint(directory.path()),
+            world,
+            &bus,
+            None,
+            &[before.len(), after.len()],
+            Drafting::No,
+            |weights, sequences, tp, gather| {
+                let [reused, fresh] = sequences else {
+                    unreachable!("two sequences");
+                };
+                weights.forward_batch(tp, gather, &mut [(&mut *reused, before.as_slice())])?;
+                weights.reset(reused)?;
+                assert_eq!(reused.position(), 0);
+                let again =
+                    weights.forward_batch(tp, gather, &mut [(&mut *reused, after.as_slice())])?;
+                let first = weights.forward_batch(tp, gather, &mut [(fresh, after.as_slice())])?;
+                Ok((again, first))
+            },
+        );
+        for (rank, (again, first)) in runs.iter().enumerate() {
+            assert_eq!(
+                bits(&again[0]),
+                bits(&first[0]),
+                "world {world} rank {rank}: the reset sequence's rows are not a fresh one's"
+            );
+        }
+        println!(
+            "measured: world {world}: {} rows after a reset of {}, bit-equal to a fresh sequence",
+            after.len(),
+            before.len()
+        );
+    }
+}
+
 /// Three sequences verify drafts together, up to [MAX_ROWS] rows a step, and each commit keeps
 /// a prefix of its rows: one row, all of them, or some between. A verify's rows past the kept
 /// ones are drafts the model would not have made (a token other than the stream's), so a commit

@@ -9,7 +9,8 @@
 //! the same bits at every count. The rank prints its tokens and the digest of its last logits,
 //! which every rank of a world must print the same.
 //!
-//! `--collective nccl` gives the TCP collective the run's NCCL communicator as its device leg
+//! `--collective nccl`, the default on the f32 wire with 2 or more ranks (the device arm's path for
+//! every model), gives the TCP collective the run's NCCL communicator as its device leg
 //! ([crate::tp4_reduce::DeviceExchange]): the partials and the logits are exchanged between the
 //! devices and summed there in Wire::F32's order, the bits of the TCP run.
 //!
@@ -34,7 +35,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sparkflash_comm::device_reduce::BootstrapConfig;
 use sparkflash_comm::{TcpTransport, Transport};
 use sparkflash_device::converted::find_converted_rank_file;
 use sparkflash_engine::parallel_tp::{BitGatherHandle, TpCollective, TpLayout, TpRuntime, Wire};
@@ -47,10 +47,10 @@ use sparkflash_model_glm5_next::{
 };
 
 use crate::tp4_host::{logits_sha256, parse_list, tcp_config, tp4_seams};
-use crate::tp4_reduce::{DeviceExchange, open_run_reduce};
+use crate::tp4_reduce::{DeviceExchange, open_exchange_reduce};
 
 /// The stage's arguments.
-pub const USAGE: &str = "sparkflash device-chain --run-stage glm-tp4 --tp-rank N --tp-world-size N --comm-peers IP,IP,... --comm-base-port 29701 (--converted DIR | --checkpoint DIR) [--config FILE] (--prompt TEXT --tokenizer PATH | --prompt-tokens 3,7,11) [--tokenizer PATH] [--max-tokens 16] [--streams 1,2,4,8] [--wire f32|bf16] [--collective tcp|nccl] [--draft 0,3] [--dflash2 DIR [--depth fixed|adaptive] | --draft-oracle]; the weights come from DIR's rank-R-of-W.bin or the checkpoint, the configuration from FILE, the checkpoint's config.json, or the released one; each stream count runs in turn on the one load, and a tokenizer also decodes what the rank generates; nccl exchanges the partials on the devices and needs the f32 wire and a world of 2 or more; each draft count past 0 decodes speculatively with the MTP layer, or with DIR's DFlash 2 drafter, or as the first run (of 0 drafts) decoded, which every verify must keep, a stream's drafts and its next token one verify of at most 8 rows a step; adaptive verifies only the block drafts its confidence judges worth their rows";
+pub const USAGE: &str = "sparkflash device-chain --run-stage glm-tp4 --tp-rank N --tp-world-size N --comm-peers IP,IP,... --comm-base-port 29701 (--converted DIR | --checkpoint DIR) [--config FILE] (--prompt TEXT --tokenizer PATH | --prompt-tokens 3,7,11) [--tokenizer PATH] [--max-tokens 16] [--streams 1,2,4,8] [--wire f32|bf16] [--collective tcp|nccl] [--draft 0,3] [--dflash2 DIR [--depth fixed|adaptive] | --draft-oracle]; the weights come from DIR's rank-R-of-W.bin or the checkpoint, the configuration from FILE, the checkpoint's config.json, or the released one; each stream count runs in turn on the one load, and a tokenizer also decodes what the rank generates; nccl, the default where it applies, exchanges the partials on the devices and needs the f32 wire and a world of 2 or more; each draft count past 0 decodes speculatively with the MTP layer, or with DIR's DFlash 2 drafter, or as the first run (of 0 drafts) decoded, which every verify must keep, a stream's drafts and its next token one verify of at most 8 rows a step; adaptive verifies only the block drafts its confidence judges worth their rows";
 
 /// One `flag`'s numeric value.
 fn number<T: std::str::FromStr>(flag: &str, text: &str) -> Result<T, String>
@@ -82,13 +82,14 @@ struct GlmArgs {
     /// Verify as many of the block drafter's drafts as [DepthPolicy] judges worth it, not all.
     adaptive: bool,
     wire: Wire,
-    /// The NCCL communicator as the collective's device leg.
+    /// The NCCL communicator as the collective's device leg; the default where it applies.
     nccl: bool,
 }
 
 impl GlmArgs {
     fn parse(args: &[&str]) -> Result<Self, String> {
         let (mut rank, mut world) = (0, 1);
+        let mut collective = None;
         let mut parsed = Self {
             layout: TpLayout {
                 rank: 0,
@@ -155,11 +156,11 @@ impl GlmArgs {
                     }
                 }
                 "--collective" => {
-                    parsed.nccl = match take()? {
+                    collective = Some(match take()? {
                         "tcp" => false,
                         "nccl" => true,
                         other => return Err(format!("--collective {other}: tcp or nccl")),
-                    }
+                    });
                 }
                 other => return Err(format!("unknown argument {other}")),
             }
@@ -224,8 +225,11 @@ impl GlmArgs {
                 );
             }
         }
-        // The device leg sums as Wire::F32 does and has nothing to exchange alone.
-        if parsed.nccl && (parsed.wire != Wire::F32 || world < 2) {
+        // The device leg sums as Wire::F32 does and has nothing to exchange alone; where it can
+        // run, it is the default, as it is for every model's serve.
+        let nccl_fits = parsed.wire == Wire::F32 && world >= 2;
+        parsed.nccl = collective.unwrap_or(nccl_fits);
+        if parsed.nccl && !nccl_fits {
             return Err(
                 "--collective nccl needs --wire f32 and a --tp-world-size of 2 or more".to_owned(),
             );
@@ -277,7 +281,6 @@ fn open_nccl(
     config: &Glm5NextConfig,
     prompt: &[u32],
 ) -> Result<sparkflash_comm::device_reduce::RunReduce, String> {
-    let layout = args.layout;
     let run = format!(
         "glm-tp4;{config:?};{prompt:?};{:?};{};{:?};{}",
         args.streams,
@@ -285,27 +288,7 @@ fn open_nccl(
         args.drafts,
         args.dflash2.is_some()
     );
-    let agreement = BootstrapConfig {
-        native_rounding: 0,
-        env_toggles: 0,
-        plan_digest: sparkflash_engine::synthetic::fnv1a(run.as_bytes()),
-    };
-    // The warm-up runs one row's partial through the communicator; its scratch is freed once the
-    // open has synchronised it.
-    let payload = config.hidden_size * 2;
-    let mut allocated = 0usize;
-    let scratch = cuda.alloc(payload * 2, &mut allocated)?;
-    let opened = open_run_reduce(
-        transport,
-        layout.world_size,
-        layout.rank,
-        0,
-        scratch.0,
-        payload,
-        agreement,
-    );
-    cuda.free_buffers(&[&scratch]);
-    opened.map_err(|error| format!("nccl open: {error}"))
+    open_exchange_reduce(cuda, transport, args.layout, config.hidden_size, &run)
 }
 
 fn ms(duration: Duration) -> f64 {
@@ -719,6 +702,19 @@ mod tests {
             (&[3, 8][..], 16)
         );
         assert_eq!(parsed.wire, Wire::Bf16);
+        assert!(!parsed.nccl, "the bf16 wire has no device leg");
+        let f32_wire: Vec<&str> = args
+            .iter()
+            .copied()
+            .filter(|&arg| arg != "--wire" && arg != "bf16")
+            .collect();
+        assert!(
+            GlmArgs::parse(&f32_wire).expect("the f32 wire").nccl,
+            "nccl by default"
+        );
+        let mut tcp = f32_wire.clone();
+        tcp.extend(["--collective", "tcp"]);
+        assert!(!GlmArgs::parse(&tcp).expect("tcp named").nccl);
 
         for (change, refusal) in [
             ("--checkpoint /c", "exactly one"),

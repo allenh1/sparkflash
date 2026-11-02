@@ -665,6 +665,8 @@ impl DeviceLayer<'_> {
                     n as u64,
                     u64::from(vecs),
                     world as u64,
+                    u64::from(vecs),
+                    world as u64 * u64::from(vecs),
                 ],
             )?;
         }

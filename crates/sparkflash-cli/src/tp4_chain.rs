@@ -857,9 +857,10 @@ fn resident_argv(args: &ChainArgs) -> Vec<String> {
 /// No forward pass, no token - the evidence says setup_only: true and must not be read as a step.
 fn run_loop(args: &ChainArgs) -> Result<Vec<String>, String> {
     // ---- S2-a run header: the arm and the collective path, decided before anything else ----
-    // A forward run that does not name its collective path (SPARK_COMM_REDUCE), names one that does
-    // not match its arm, or spells the arm switch wrong refuses here, with an envelope that records
-    // what the operator set, before the plan setup, the arena boot and any transport.
+    // A forward run whose collective path (SPARK_COMM_REDUCE) is a typo or does not match its arm,
+    // or that spells the arm switch wrong, refuses here, with an envelope that records what the
+    // operator set, before the plan setup, the arena boot and any transport. An unset path is the
+    // arm's own, and the header line names it.
     let header = if args.forward {
         match crate::run_header::RunHeader::from_env() {
             Ok(header) => {

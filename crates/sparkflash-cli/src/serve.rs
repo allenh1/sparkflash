@@ -175,6 +175,9 @@ use sparkflash_model_glm5_next::{DeviceRank, DeviceSequence, Glm5NextConfig};
 use sparkflash_model_qwen4_exp::sampling::Sampler;
 
 #[cfg(feature = "tp4-serve")]
+use crate::run_header::{COMM_REDUCE_ENV, ReducePath};
+
+#[cfg(feature = "tp4-serve")]
 mod device;
 #[cfg(feature = "tp4-serve")]
 pub use device::DeviceServeOptions;
@@ -2108,6 +2111,10 @@ pub enum Tp4ControlFrame {
         /// bounded candidate exchange cannot carry it.
         #[serde(default)]
         prompt_logprobs: Option<u32>,
+        /// Whether the request decodes speculatively ([Tp4Sampling::speculative]): every rank
+        /// takes it from here, so every rank drafts and verifies the same steps.
+        #[serde(default)]
+        speculative: bool,
     },
     /// Rank 0 -> every worker: the sampled token for the next lockstep decode.
     Token {
@@ -4170,10 +4177,14 @@ fn run_request(
 #[cfg(feature = "tp4-serve")]
 #[derive(Debug, Clone, Default)]
 pub struct Tp4Step {
-    /// The raw logits for the position just fed.
+    /// The raw logits for the position just fed; empty from a rank that was not asked for them
+    /// ([Tp4Sampling::logits]) and took its greedy pick on the device.
     pub logits: Vec<f32>,
     /// The greedy next token, when the rank produced one.
     pub next_token: Option<u32>,
+    /// The tokens the step decoded before `next_token`: a speculative step's kept drafts, which
+    /// its verify already ran, so they are emitted and not fed back. Empty for a one-token step.
+    pub accepted: Vec<u32>,
 }
 
 /// The request sampler a rank applies before its first step.
@@ -4189,6 +4200,15 @@ pub struct Tp4Sampling {
     pub temperature: f32,
     /// The request seed.
     pub seed: u64,
+    /// Whether each step's logits row is read (a request for logprobs). Without it a rank whose
+    /// pick is the row's argmax may take it on the device and leave the row there; the token is
+    /// the same.
+    pub logits: bool,
+    /// Whether the rank may decode the request speculatively: rank 0 sets it for a request whose
+    /// tokens are each its row's argmax and whose rows are never read (no temperature, no
+    /// logprobs), and the Request frame carries it to the workers. A rank that drafts nothing
+    /// decodes a token a step.
+    pub speculative: bool,
 }
 
 #[cfg(feature = "tp4-serve")]
@@ -4197,6 +4217,8 @@ impl Default for Tp4Sampling {
         Self {
             temperature: 0.0,
             seed: 0,
+            logits: false,
+            speculative: false,
         }
     }
 }
@@ -4357,6 +4379,7 @@ impl Tp4RankApi for HostTp4Rank {
         Ok(Tp4Step {
             logits: output.logits,
             next_token: output.token,
+            accepted: Vec::new(),
         })
     }
 
@@ -4373,6 +4396,7 @@ impl Tp4RankApi for HostTp4Rank {
             Tp4Step {
                 logits: output.logits,
                 next_token: output.token,
+                accepted: Vec::new(),
             },
             merged,
         ))
@@ -4383,6 +4407,7 @@ impl Tp4RankApi for HostTp4Rank {
         Ok(Tp4Step {
             logits: output.logits,
             next_token: output.token,
+            accepted: Vec::new(),
         })
     }
 
@@ -4424,21 +4449,29 @@ fn open_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> 
 /// One GLM-5.3-Flash rank behind the serve-owned TP=4 control channel.
 ///
 /// The rank mirrors [HostTp4Rank] over the device arm: every rank runs the same prompt and the
-/// same sampled token, rank 0 samples on the host and the workers ignore their own choice. The
-/// sequence is rebuilt at the start of every request, so a request's KV state never leaks into the
-/// next one.
+/// same sampled token, and the workers ignore their own choice. Rank 0 samples on the host, or
+/// takes the device's greedy pick when the host sampler would take the argmax and no logprobs are
+/// asked for, which leaves the logits row on the device. Such a request decodes speculatively when
+/// rank 0 says so ([Tp4Sampling::speculative]): the MTP layer drafts, one verify step runs the
+/// token and its drafts, and the drafts greedy would have picked are kept, so the tokens are the
+/// one-token steps'. The sequence is put back at position 0 at the start of every request, so a
+/// request's state never leaks into the next one; its window is allocated once, at load, and kept.
 #[cfg(feature = "tp4-serve")]
 struct GlmTp4Rank {
     rank: DeviceRank,
-    /// The live request's sequence. It is dropped before the next request allocates its own, so a
-    /// long context never holds two full KV sets at once.
-    sequence: Option<DeviceSequence>,
+    /// The request window, allocated at load and put back at position 0 by every request.
+    sequence: DeviceSequence,
     tp: TpRuntime,
     gather: BitGatherHandle,
     sampler: Sampler,
     sampling: sparkflash_model::Sampling,
+    /// Whether the request reads each step's logits row ([Tp4Sampling::logits]).
+    logits: bool,
+    /// The MTP drafts a speculative step verifies after its token; 0 decodes a token a step.
+    drafts: usize,
+    /// Whether the request decodes speculatively ([Tp4Sampling::speculative]) with them.
+    speculative: bool,
     eos: Vec<u32>,
-    context: usize,
     load_ms: u64,
     steps: u64,
     last_step_ms: u64,
@@ -4449,19 +4482,28 @@ impl GlmTp4Rank {
     /// One greedy step of `rows` and the sampled token after the last of them.
     fn step(&mut self, rows: &[u32]) -> Result<Tp4Step, String> {
         let started = Instant::now();
-        let sequence = self
-            .sequence
-            .as_mut()
-            .ok_or_else(|| "a GLM step arrived before begin_request".to_owned())?;
-        let mut batch = [(sequence, rows)];
-        self.rank
+        let mut batch = [(&mut self.sequence, rows)];
+        let picks = self
+            .rank
             .forward_batch_greedy(&self.tp, &self.gather, &mut batch)
             .map_err(|error| format!("the GLM rank forward failed: {error}"))?;
-        let logits = self
-            .rank
-            .last_logits(batch[0].0)
-            .map_err(|error| format!("the GLM rank's last logits: {error}"))?;
-        let token = self.sampler.choose(&logits, &self.sampling);
+        let (logits, token) = if !self.logits && self.sampler.takes_argmax(&self.sampling) {
+            // The device picked the last row's argmax as the host sampler takes it, so the
+            // full-vocabulary row stays on the device.
+            let token = picks
+                .first()
+                .and_then(|rows| rows.last())
+                .copied()
+                .ok_or_else(|| "the GLM rank's step returned no pick".to_owned())?;
+            (Vec::new(), token)
+        } else {
+            let logits = self
+                .rank
+                .last_logits(batch[0].0)
+                .map_err(|error| format!("the GLM rank's last logits: {error}"))?;
+            let token = self.sampler.choose(&logits, &self.sampling);
+            (logits, token)
+        };
         let next_token = if self.eos.contains(&token) {
             None
         } else {
@@ -4469,27 +4511,101 @@ impl GlmTp4Rank {
         };
         self.steps += 1;
         self.last_step_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        Ok(Tp4Step { logits, next_token })
+        Ok(Tp4Step {
+            logits,
+            next_token,
+            accepted: Vec::new(),
+        })
+    }
+
+    /// One speculative step after `token`: the MTP layer drafts up to [Self::drafts] tokens, one
+    /// verify runs `token` and them, and the drafts each verify row picks are kept with the token
+    /// the last kept row picks: the tokens of one-token greedy steps
+    /// ([DeviceRank::verify_batch_greedy]).
+    fn speculate(&mut self, token: u32) -> Result<Tp4Step, String> {
+        let started = Instant::now();
+        // The verify runs the token and its drafts at the next positions, all inside the window.
+        let room = self
+            .sequence
+            .capacity()
+            .saturating_sub(self.sequence.position() + 1);
+        let count = self.drafts.min(room);
+        let drafted = if count == 0 {
+            Vec::new()
+        } else {
+            let mut batch = [(&mut self.sequence, token)];
+            self.rank
+                .draft(&self.tp, &self.gather, &mut batch, count)
+                .map_err(|error| format!("the GLM rank's draft failed: {error}"))?
+                .pop()
+                .unwrap_or_default()
+        };
+        let chunk: Vec<u32> = std::iter::once(token).chain(drafted).collect();
+        let mut batch = [(&mut self.sequence, chunk.as_slice())];
+        let picks = self
+            .rank
+            .verify_batch_greedy(&self.tp, &self.gather, &mut batch)
+            .map_err(|error| format!("the GLM rank's verify failed: {error}"))?
+            .pop()
+            .unwrap_or_default();
+        // Row r picks the token after chunk[r], so draft r + 1 is kept while row r picked it.
+        let kept = 1 + chunk[1..]
+            .iter()
+            .zip(&picks)
+            .take_while(|(draft, pick)| draft == pick)
+            .count();
+        if chunk.len() > 1 {
+            self.rank
+                .commit(&mut self.sequence, kept)
+                .map_err(|error| format!("the GLM rank's commit failed: {error}"))?;
+        }
+        let picked = *picks
+            .get(kept - 1)
+            .ok_or_else(|| "the GLM rank's verify returned a pick a row short".to_owned())?;
+        let mut decoded = chunk[1..kept].to_vec();
+        decoded.push(picked);
+        // The request ends at the first end-of-sequence token, a kept draft or the pick.
+        let (accepted, next_token) = match decoded.iter().position(|id| self.eos.contains(id)) {
+            Some(end) => (decoded[..end].to_vec(), None),
+            None => {
+                let next = decoded.pop();
+                (decoded, next)
+            }
+        };
+        for &id in &accepted {
+            self.sampler.record(id);
+        }
+        self.steps += 1;
+        self.last_step_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Ok(Tp4Step {
+            logits: Vec::new(),
+            next_token,
+            accepted,
+        })
     }
 }
 
 #[cfg(feature = "tp4-serve")]
 impl Tp4RankApi for GlmTp4Rank {
     fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String> {
-        // Free the last request's KV before allocating this one's: at a long context the two
-        // allocations together do not fit beside the weights.
-        self.sequence = None;
-        let sequence = self
-            .rank
-            .new_sequence(self.context)
-            .map_err(|error| format!("a fresh GLM sequence: {error}"))?;
-        self.sequence = Some(sequence);
+        self.rank
+            .reset(&mut self.sequence)
+            .map_err(|error| format!("resetting the GLM sequence: {error}"))?;
         self.sampler.reset();
         self.sampling = sparkflash_model::Sampling {
             temperature: sampling.temperature,
             seed: sampling.seed,
             ..sparkflash_model::Sampling::default()
         };
+        self.logits = sampling.logits;
+        self.speculative = sampling.speculative && self.drafts > 0;
+        if self.speculative && (self.logits || !self.sampler.takes_argmax(&self.sampling)) {
+            return Err(
+                "a speculative request must take each row's argmax and read no row; this one \
+                 samples or asks for logprobs"
+                    .to_owned(),
+            );
+        }
         Ok(())
     }
 
@@ -4516,6 +4632,9 @@ impl Tp4RankApi for GlmTp4Rank {
 
     fn decode(&mut self, token: u32) -> Result<Tp4Step, String> {
         self.sampler.record(token);
+        if self.speculative {
+            return self.speculate(token);
+        }
         self.step(&[token])
     }
 
@@ -4534,12 +4653,17 @@ impl Tp4RankApi for GlmTp4Rank {
     }
 }
 
+/// The MTP drafts a GLM rank verifies after each token of a greedy request.
+#[cfg(feature = "tp4-serve")]
+const GLM_DRAFTS_ENV: &str = "SPARKFLASH_GLM_DRAFTS";
+
 /// Opens one GLM-5.3-Flash rank of the serve-owned TP=4 group.
 ///
 /// The weights come from the checkpoint directory (or its index's parent), the configuration from
 /// its `config.json` or the carried release, and the collective from the same TCP seams the
-/// `glm-tp4` harness uses. The partials travel on the f32 wire; the device leg is not selected
-/// here, so a four-node GLM run needs no NCCL to be correct, only to be fast.
+/// `glm-tp4` harness uses. The partials travel on the f32 wire, exchanged on the devices over NCCL
+/// by default and on the host seam with `SPARK_COMM_REDUCE=tcp`; both sum them in rank order, so
+/// the two give the same tokens.
 #[cfg(feature = "tp4-serve")]
 fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> {
     let started = Instant::now();
@@ -4567,19 +4691,57 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
         rank: config.rank,
         world_size: config.world_size,
     };
+    // The seam gets the run's NCCL communicator as its device leg, as `glm-tp4 --collective nccl`
+    // does: the partials are exchanged on the devices. That is the default, the device arm's path
+    // for every model (ReducePath::default_for); tcp keeps them on the host seam, and roce has no
+    // GLM path. A world of 1 has nothing to exchange, so it defaults to the seam alone.
+    let value = std::env::var(COMM_REDUCE_ENV).ok();
+    let default = if config.world_size > 1 {
+        ReducePath::Nccl
+    } else {
+        ReducePath::Tcp
+    };
+    let nccl = match ReducePath::parse(value.as_deref(), default)? {
+        ReducePath::Nccl if config.world_size > 1 => true,
+        ReducePath::Nccl => {
+            return Err(format!(
+                "{COMM_REDUCE_ENV}=nccl needs a world of 2 or more; a world of 1 has nothing to exchange"
+            ));
+        }
+        ReducePath::Tcp => false,
+        ReducePath::Roce => {
+            return Err(format!(
+                "{COMM_REDUCE_ENV}={:?} has no GLM path: nccl or tcp",
+                value.unwrap_or_default()
+            ));
+        }
+    };
     // The engine collective is a separate socket set from the serve control channel: one
     // transport per rank, on base_port + rank, exactly as the harness opens it.
+    let mut reduce = None;
     let transport: Option<Box<dyn sparkflash_comm::Transport>> = if config.world_size > 1 {
         let tcp = crate::tp4_host::tcp_config(config.rank, &config.peers, config.base_port, true)?;
-        Some(Box::new(
-            sparkflash_comm::TcpTransport::connect(tcp)
-                .map_err(|error| format!("tcp connect: {error}"))?,
-        ))
+        let transport = sparkflash_comm::TcpTransport::connect(tcp)
+            .map_err(|error| format!("tcp connect: {error}"))?;
+        if nccl {
+            let run = format!("glm-serve;{glm_config:?};{}", config.context);
+            reduce = Some(crate::tp4_reduce::open_exchange_reduce(
+                &cuda,
+                &transport,
+                layout,
+                glm_config.hidden_size,
+                &run,
+            )?);
+        }
+        Some(Box::new(transport))
     } else {
         None
     };
-    let (collective, gather) =
+    let (mut collective, gather) =
         crate::tp4_host::tp4_seams(config.rank, config.world_size, transport, Wire::F32);
+    if let Some(reduce) = reduce {
+        collective = Box::new(crate::tp4_reduce::DeviceExchange::new(collective, reduce)?);
+    }
     let tp = TpRuntime::new(layout, collective).map_err(|error| error.to_string())?;
     let gather = BitGatherHandle::new(gather);
     // The latent cache the 1M window needs: E4M3 by default (vLLM's `fp8_ds_mla` trade), or
@@ -4647,28 +4809,52 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
             config.context, glm_config.max_position_embeddings
         ));
     }
-    let context = config.context;
-    // A placeholder that a request replaces; allocating the full window here would hold it idle
-    // for the server's whole life and leave no room for a request's own sequence.
-    let sequence = rank
-        .new_sequence(1)
-        .map_err(|error| format!("a fresh GLM sequence: {error}"))?;
+    // The MTP drafts a greedy request verifies after each token: 2 by default, the harness's best
+    // at one stream; 0 decodes a token a step.
+    let drafts = match std::env::var(GLM_DRAFTS_ENV) {
+        Err(_) => 2,
+        Ok(value) => match value.parse::<usize>() {
+            Ok(drafts) if drafts < sparkflash_model_glm5_next::MAX_ROWS => drafts,
+            _ => {
+                return Err(format!(
+                    "{GLM_DRAFTS_ENV}={value:?} is not a draft count from 0 to {}",
+                    sparkflash_model_glm5_next::MAX_ROWS - 1
+                ));
+            }
+        },
+    };
+    // The window every request resets and reuses. Allocating it per request cost every rank about a
+    // second of a short prompt's first token at the 1M default; here a window that does not fit
+    // beside the weights is refused at startup, not at the first request. A drafting window also
+    // keeps the MTP layer's caches.
+    let sequence = if drafts > 0 {
+        rank.new_drafting_sequence(config.context)
+            .map_err(|error| {
+                format!("the GLM request window: {error} ({GLM_DRAFTS_ENV}=0 drafts nothing)")
+            })?
+    } else {
+        rank.new_sequence(config.context)
+            .map_err(|error| format!("the GLM request window: {error}"))?
+    };
     let load_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     eprintln!(
-        "sparkflash serve: GLM rank {}/{} loaded in {:.1} s from {origin}",
+        "sparkflash serve: GLM rank {}/{} loaded in {:.1} s from {origin}; {} collective",
         config.rank,
         config.world_size,
-        load_ms as f64 / 1000.0
+        load_ms as f64 / 1000.0,
+        tp.label()
     );
     Ok(Box::new(GlmTp4Rank {
         eos: glm_config.eos_token_ids.clone(),
         rank,
-        sequence: Some(sequence),
+        sequence,
         tp,
         gather,
         sampler: Sampler::new(),
         sampling: sparkflash_model::Sampling::default(),
-        context,
+        logits: false,
+        drafts,
+        speculative: false,
         load_ms,
         steps: 0,
         last_step_ms: 0,
@@ -5072,15 +5258,21 @@ fn run_tp4_request(
             )));
         }
     };
-    rank.begin_request(Tp4Sampling {
+    let logits = job.logprobs.wants_sample();
+    let sampling = Tp4Sampling {
         temperature: job.temperature,
         seed: job.seed,
-    })?;
+        logits,
+        // The sampler's greedy rule: zero, below it or NaN draws nothing.
+        speculative: (job.temperature.is_nan() || job.temperature <= 0.0) && !logits,
+    };
+    rank.begin_request(sampling)?;
     let max_tokens = u32::try_from(job.max_tokens).unwrap_or(u32::MAX);
     hub.broadcast(&Tp4ControlFrame::Request {
         prompt_ids: job.prompt_tokens.clone(),
         max_tokens,
         prompt_logprobs: prompt_logprobs_frame,
+        speculative: sampling.speculative,
     })
     .map_err(|error| format!("control Request: {error}"))?;
     let request_started = Instant::now();
@@ -5146,10 +5338,18 @@ fn run_tp4_request(
     let mut decoder = tokenizer.tokenizer().decode_stream(job.skip_special_tokens);
     let mut logits = prefill.logits;
     let mut next = prefill.next_token;
+    // The last step's kept drafts: its verify ran them, so they are emitted but not fed back.
+    let mut accepted = Vec::new().into_iter();
     let mut completion_tokens = 0usize;
     let mut ttft: Option<Duration> = None;
     while completion_tokens < job.max_tokens {
-        let Some(token) = next else { break };
+        let (token, ran) = match accepted.next() {
+            Some(token) => (token, true),
+            None => match next {
+                Some(token) => (token, false),
+                None => break,
+            },
+        };
         if ttft.is_none() {
             // Same histogram rule as the reference paths: driver entry to first token, so the
             // rank-0 job queue wait and the host prefill are both included.
@@ -5199,10 +5399,14 @@ fn run_tp4_request(
         if completion_tokens >= job.max_tokens {
             break;
         }
+        if ran {
+            continue;
+        }
         hub.broadcast(&Tp4ControlFrame::Token { token_id: token })
             .map_err(|error| format!("control Token: {error}"))?;
         let step = rank.decode(token)?;
         logits = step.logits;
+        accepted = step.accepted.into_iter();
         next = step.next_token;
     }
     let elapsed = request_started.elapsed();
@@ -5374,10 +5578,16 @@ fn tp4_worker_loop(
                 prompt_ids,
                 max_tokens,
                 prompt_logprobs,
+                speculative,
             }) => {
                 // Workers do not sample; reset their state with the greedy default. The engine's
                 // forward arithmetic is unchanged by the sampler, and their next_token is ignored.
-                rank.begin_request(Tp4Sampling::default())?;
+                // Whether the request speculates is rank 0's decision, so every rank runs the
+                // same drafts and verifies.
+                rank.begin_request(Tp4Sampling {
+                    speculative,
+                    ..Tp4Sampling::default()
+                })?;
                 let selection = prompt_logprobs.map(|count| {
                     if count == 0 {
                         None
@@ -10982,11 +11192,13 @@ mod tp4_serve_tests {
                 prompt_ids: vec![1, 2, 3],
                 max_tokens: 4,
                 prompt_logprobs: None,
+                speculative: true,
             },
             Tp4ControlFrame::Request {
                 prompt_ids: vec![9, 8],
                 max_tokens: 2,
                 prompt_logprobs: Some(3),
+                speculative: false,
             },
             Tp4ControlFrame::Token { token_id: 7 },
             Tp4ControlFrame::End,
@@ -11030,6 +11242,7 @@ mod tp4_serve_tests {
             Ok(Tp4Step {
                 logits: vec![0.0; 8],
                 next_token: Some(500),
+                accepted: Vec::new(),
             })
         }
 
@@ -11059,6 +11272,7 @@ mod tp4_serve_tests {
                 Tp4Step {
                     logits: vec![0.0; 8],
                     next_token: Some(500),
+                    accepted: Vec::new(),
                 },
                 merged,
             ))
@@ -11068,6 +11282,7 @@ mod tp4_serve_tests {
             Ok(Tp4Step {
                 logits: vec![0.0; 8],
                 next_token: Some(501),
+                accepted: Vec::new(),
             })
         }
 
@@ -11111,6 +11326,7 @@ mod tp4_serve_tests {
                         prompt_ids,
                         max_tokens,
                         prompt_logprobs,
+                        ..
                     } => {
                         requests.push((prompt_ids, max_tokens, prompt_logprobs));
                         loop {
@@ -11198,6 +11414,117 @@ mod tp4_serve_tests {
         }
         assert!(deltas >= 1);
         assert!(done, "the request must end with the Done summary");
+    }
+
+    /// A rank-0 stub whose every step keeps two drafts: decode(t) decodes t + 1 and t + 2 in its
+    /// verify and picks t + 3.
+    #[derive(Default)]
+    struct SpeculativeFakeRank {
+        speculative: Option<bool>,
+        fed: Vec<u32>,
+    }
+
+    impl Tp4RankApi for SpeculativeFakeRank {
+        fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String> {
+            self.speculative = Some(sampling.speculative);
+            Ok(())
+        }
+
+        fn prefill(&mut self, _prompt: &[u32]) -> Result<Tp4Step, String> {
+            Ok(Tp4Step {
+                next_token: Some(500),
+                ..Tp4Step::default()
+            })
+        }
+
+        fn prefill_prompt_logprobs(
+            &mut self,
+            _prompt: &[u32],
+            _selection: Option<usize>,
+        ) -> Result<(Tp4Step, Vec<MergedPosition>), String> {
+            Err("not asked".to_owned())
+        }
+
+        fn decode(&mut self, token: u32) -> Result<Tp4Step, String> {
+            self.fed.push(token);
+            Ok(Tp4Step {
+                logits: Vec::new(),
+                next_token: Some(token + 3),
+                accepted: vec![token + 1, token + 2],
+            })
+        }
+
+        fn metrics(&self) -> Tp4RankMetrics {
+            Tp4RankMetrics::default()
+        }
+    }
+
+    #[test]
+    fn a_speculative_steps_kept_drafts_are_emitted_and_only_its_pick_is_fed() {
+        let tokenizer =
+            load_hf_tokenizer(&sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path())
+                .expect("tokenizer");
+        let probe = TcpListener::bind("127.0.0.1:0").expect("probe listener");
+        let address = probe.local_addr().expect("probe address");
+        drop(probe);
+        let worker = thread::spawn(move || {
+            let mut control = Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(10))
+                .expect("worker connect");
+            control.handshake().expect("handshake");
+            let (mut speculative, mut tokens) = (None, Vec::new());
+            while let Ok(frame) = control.next_frame() {
+                match frame {
+                    Tp4ControlFrame::Request {
+                        speculative: flag, ..
+                    } => speculative = Some(flag),
+                    Tp4ControlFrame::Token { token_id } => tokens.push(token_id),
+                    Tp4ControlFrame::End => {}
+                    other => panic!("unexpected frame {other:?}"),
+                }
+            }
+            (speculative, tokens)
+        });
+        let mut hub = Tp4ControlHub::start(address, 2, Duration::from_secs(10)).expect("hub");
+        let (replies, mut answers) = tokio::sync::mpsc::channel(REPLY_BUFFER);
+        let job = Job {
+            prompt_tokens: vec![100, 200],
+            max_tokens: 6,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            skip_special_tokens: true,
+            seed: 0,
+            logprobs: LogprobsRequest {
+                sample: None,
+                prompt: None,
+                token_ids: Vec::new(),
+            },
+            stop: Vec::new(),
+            enqueued_at: Instant::now(),
+            replies,
+        };
+        let mut rank = SpeculativeFakeRank::default();
+        run_tp4_request(&mut rank, &mut hub, &tokenizer, job, &Metrics::new())
+            .expect("request runs");
+        drop(hub);
+        // 500, then 501 502 503 from the step fed 500, then 504 505 from the step fed 503: six
+        // tokens, two steps, and the workers run the same two.
+        assert_eq!(rank.speculative, Some(true));
+        assert_eq!(rank.fed, [500, 503]);
+        assert_eq!(
+            worker.join().expect("worker joins"),
+            (Some(true), vec![500, 503])
+        );
+        let mut completion_tokens = None;
+        while let Ok(reply) = answers.try_recv() {
+            if let Reply::Done(summary) = reply {
+                completion_tokens = Some(summary.completion_tokens);
+            }
+        }
+        assert_eq!(completion_tokens, Some(6));
     }
 
     #[test]

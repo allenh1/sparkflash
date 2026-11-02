@@ -130,9 +130,10 @@ rank_env() {
     fi
     [ -n "$CONVERTED_DIR" ] && printf ' SPARKFLASH_CONVERTED_DIR=%s' "$CONVERTED_DIR"
     # The scheduler's knobs: every rank runs the same ticks, so a prefill or batching setting
-    # that only a local rank 0 inherited would split the group's collectives.
+    # that only a local rank 0 inherited would split the group's collectives. Every rank reads
+    # its own Engram tables, so their knobs go to every rank too.
     local knob
-    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE)_' || true); do
+    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM)_' || true); do
         printf ' %s=%q' "$knob" "${!knob}"
     done
     return 0

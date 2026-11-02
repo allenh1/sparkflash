@@ -533,14 +533,16 @@ impl RowTable for MemoryTable {
 }
 
 /// A heap buffer whose first byte is 4096-byte aligned, as `O_DIRECT` requires.
-pub(crate) struct AlignedBuffer {
+pub struct AlignedBuffer {
     storage: Vec<u8>,
     offset: usize,
     len: usize,
 }
 
 impl AlignedBuffer {
-    pub(crate) fn new(len: usize) -> Self {
+    /// `len` zeroed bytes from a 4096-byte boundary.
+    #[must_use]
+    pub fn new(len: usize) -> Self {
         let storage = vec![0u8; len + SCRATCH_ALIGN];
         let base = storage.as_ptr() as usize;
         let offset = (SCRATCH_ALIGN - base % SCRATCH_ALIGN) % SCRATCH_ALIGN;
@@ -551,11 +553,14 @@ impl AlignedBuffer {
         }
     }
 
-    pub(crate) fn as_slice(&self) -> &[u8] {
+    /// The aligned window as a shared byte slice, `len` bytes long.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
         &self.storage[self.offset..self.offset + self.len]
     }
 
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+    /// The aligned window as a mutable byte slice, `len` bytes long.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
         let (offset, len) = (self.offset, self.len);
         &mut self.storage[offset..offset + len]
     }
@@ -1110,8 +1115,11 @@ impl DirectTable {
 /// and ignores it, and a device with a larger logical block size accepts the open and then
 /// rejects every misaligned request with `EINVAL`. This therefore only returns the handle
 /// after one real aligned read at offset 0 has succeeded.
-#[cfg(feature = "io-uring")]
-pub(crate) fn open_direct(path: &Path) -> Result<File> {
+///
+/// # Errors
+/// The file cannot be stat'ed or opened with `O_DIRECT`, its device needs an alignment outside
+/// `[MIN_ALIGN_BYTES]..=[MAX_ALIGN_BYTES]`, or the probe read fails.
+pub fn open_direct(path: &Path) -> Result<File> {
     let file_bytes = std::fs::metadata(path)
         .with_context(|| format!("stat {}", path.display()))?
         .len();

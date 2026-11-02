@@ -90,12 +90,12 @@ impl Sampler {
     #[must_use]
     pub fn choose(&mut self, logits: &[f32], sampling: &Sampling) -> u32 {
         assert!(!logits.is_empty(), "cannot sample from an empty logit row");
-        let greedy = sampling.temperature.is_nan() || sampling.temperature <= 0.0;
-        let generated = &self.history[self.prompt_len..];
-        if greedy && penalties_are_neutral(sampling, &self.history, generated) {
+        if self.takes_argmax(sampling) {
             // The released default needs no rewritten copy of the row to pick its token.
             return argmax(logits);
         }
+        let greedy = is_greedy(sampling);
+        let generated = &self.history[self.prompt_len..];
         let mut scores: Vec<f32> = logits.to_vec();
         // Penalties apply to a greedy request too: vLLM's penalties rewrite the row before the
         // temperature is even considered, so a repetition penalty at temperature 0 changes which
@@ -117,6 +117,14 @@ impl Sampler {
         let chosen = self.draw(&scores);
         self.draws = self.draws.wrapping_add(1);
         chosen
+    }
+
+    /// Whether [Self::choose] takes the row's [argmax] as it stands: a greedy request whose
+    /// penalties change nothing yet. A caller that has that argmax already needs no row.
+    #[must_use]
+    pub fn takes_argmax(&self, sampling: &Sampling) -> bool {
+        is_greedy(sampling)
+            && penalties_are_neutral(sampling, &self.history, &self.history[self.prompt_len..])
     }
 
     /// Draw one id from a row that has already been filtered, in f64.
@@ -181,6 +189,11 @@ pub fn argmax(values: &[f32]) -> u32 {
         }
     }
     best as u32
+}
+
+/// A temperature that draws nothing: zero, below it, or NaN.
+fn is_greedy(sampling: &Sampling) -> bool {
+    sampling.temperature.is_nan() || sampling.temperature <= 0.0
 }
 
 /// Whether the penalties leave every score as it is: the repetition penalty is neutral or there

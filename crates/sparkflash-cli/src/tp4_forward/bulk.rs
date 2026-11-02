@@ -217,6 +217,9 @@ pub(super) struct BulkState {
     /// through the mapping (host-written as each slot's layer is queued; by position, so a chunk
     /// never rewrites a flag a queued launch reads).
     pub(super) engram_staging: Option<[HostMapped; 2]>,
+    /// With Engram: a sharded chunk's exchanged shares, `[world][cap]` rows of a share each, every
+    /// column once (spec::EngramShard): (address, bytes).
+    pub(super) engram_shares: Option<(u64, usize)>,
     engram_live: Option<HostMapped>,
     allocations: Vec<Deviceptr>,
 }
@@ -339,6 +342,14 @@ impl BulkState {
             },
             None => None,
         };
+        let engram_shares = match device.engram.as_ref() {
+            Some(engram) => {
+                let layout = engram.layout;
+                let bytes = cap * layout.columns() * (layout.head_dim() + layout.scale_width());
+                Some((alloc(bytes)?, bytes))
+            }
+            None => None,
+        };
         let engram_live = match device.engram.as_ref() {
             Some(engram) => {
                 Some(cuda.alloc_host_mapped(engram.layer_ids.len() * engram.positions, &mut 0)?)
@@ -367,6 +378,7 @@ impl BulkState {
             taps: alloc(cap * 3 * device.dim * 4)?,
             sp_last: alloc(super::rows::GATHER_WORLD * (device.hc_mult + 1) * device.dim * 4)?,
             engram_staging,
+            engram_shares,
             engram_live,
             allocations,
         };

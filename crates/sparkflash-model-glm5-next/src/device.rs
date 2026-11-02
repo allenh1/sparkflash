@@ -379,8 +379,10 @@ fn recur_parts(head: usize) -> usize {
         .unwrap_or(1)
 }
 
-/// This rank's kv_b rows as the absorbed MLA reads them: [heads * (nope + value)][kv_lora] f32,
-/// the checkpoint's E4M3 codes times their 128x128 block scales, or its BF16 values widened.
+/// This rank's kv_b rows as the absorbed MLA reads them, f32: the checkpoint's E4M3 codes times
+/// their 128x128 block scales, or its BF16 values widened. A head keeps its `nope` key rows as
+/// they are, `[nope][kv_lora]`, then its `value` rows transposed, `[kv_lora][value]`: each kernel
+/// walks the latent in order for one output, and either way a warp's loads are consecutive words.
 ///
 /// A rank's copy is 16.8 MB at the release's geometry, against the 82 GB rank. Dequantising once
 /// at load keeps every attention step a plain f32 dot product, and the cached latent carries the
@@ -390,23 +392,49 @@ fn absorb_kv_b(
     stream: &RunStream,
     memory: &mut Allocations,
     linear: &DeviceLinear,
+    nope: usize,
+    value: usize,
 ) -> Result<Deviceptr, BackendError> {
     let (rows, columns) = (linear.rows, linear.columns);
+    let per_head = nope + value;
+    if per_head == 0 || !rows.is_multiple_of(per_head) {
+        return Err(refusal(format!(
+            "kv_b keeps {rows} rows here, not whole heads of {nope} key and {value} value rows"
+        )));
+    }
+    let widened = dequantise_kv_b(cuda, linear)?;
+    let mut laid = Vec::with_capacity(widened.len() * 4);
+    for head in widened.chunks_exact(per_head * columns) {
+        let (keys, values) = head.split_at(nope * columns);
+        for weight in keys {
+            laid.extend_from_slice(&weight.to_le_bytes());
+        }
+        for column in 0..columns {
+            for row in values.chunks_exact(columns) {
+                laid.extend_from_slice(&row[column].to_le_bytes());
+            }
+        }
+    }
+    memory.upload(stream, &laid)
+}
+
+/// kv_b's rows, `[rows][columns]` row-major, as the f32 the absorbed MLA multiplies.
+fn dequantise_kv_b(cuda: &Cuda, linear: &DeviceLinear) -> Result<Vec<f32>, BackendError> {
+    let (rows, columns) = (linear.rows, linear.columns);
     let Some(scales) = linear.scales else {
-        // BF16: [rows][columns], widened to the f32 the attention reads.
+        // BF16, widened exactly: its bits are an f32's top half.
         let elements = rows
             .checked_mul(columns)
             .ok_or_else(|| refusal("kv_b's shape overflows a usize"))?;
         let mut bytes = vec![0u8; elements * 2];
         cuda.copy_dtoh(&mut bytes, &linear.weight)
             .map_err(cuda_error)?;
-        let mut widened = Vec::with_capacity(elements * 4);
-        for pair in bytes.as_chunks::<2>().0 {
-            // BF16 widened exactly: its bits are an f32's top half.
-            let value = f32::from_bits(u32::from(u16::from_le_bytes(*pair)) << 16);
-            widened.extend_from_slice(&value.to_le_bytes());
-        }
-        return memory.upload(stream, &widened);
+        return Ok(bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| f32::from_bits(u32::from(u16::from_le_bytes(*pair)) << 16))
+            .collect());
     };
     if !rows.is_multiple_of(FP8_BLOCK) || !columns.is_multiple_of(FP8_BLOCK) {
         return Err(refusal(format!(
@@ -431,17 +459,17 @@ fn absorb_kv_b(
         .map(|bytes| f32::from_le_bytes(*bytes))
         .collect();
     let bands = columns / FP8_BLOCK;
-    let mut widened = Vec::with_capacity(codes * 4);
+    let mut widened = Vec::with_capacity(codes);
     for row in 0..rows {
         let band = (row / FP8_BLOCK) * bands;
         for column in 0..columns {
             let scale = scales_host[band + column / FP8_BLOCK];
-            let value =
-                sparkflash_weights::quant::f8e4m3_to_f32(weight[row * columns + column]) * scale;
-            widened.extend_from_slice(&value.to_le_bytes());
+            widened.push(
+                sparkflash_weights::quant::f8e4m3_to_f32(weight[row * columns + column]) * scale,
+            );
         }
     }
-    memory.upload(stream, &widened)
+    Ok(widened)
 }
 
 /// Device allocations, and page-locked host slabs the device maps, freed together when they drop.
@@ -707,8 +735,8 @@ struct DeviceDsa {
     kv_b: DeviceLinear,
     o: DeviceLinear,
     indexer: Option<DeviceIndexer>,
-    /// This rank's `kv_b` rows, `[heads * (nope + value)][kv_lora]`, dequantised to f32: the two
-    /// absorbed operands. See [DeviceRank::dsa_attend].
+    /// This rank's `kv_b` rows dequantised to f32, a head's key rows then its value rows
+    /// transposed ([absorb_kv_b]): the two absorbed operands. See [DeviceRank::dsa_attend].
     kv_dequant: Deviceptr,
     /// Whether the latent cache holds the release's quantised activation.
     quantise: bool,
@@ -1501,6 +1529,12 @@ impl DeviceSequence {
         self.position
     }
 
+    /// The positions this sequence was made for.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// The block drafter's confidence in each of the sequence's last drafts, in `(0, 1]`: the
     /// selector's probability for its pick among the row's candidates. Empty after an MTP draft,
     /// which keeps none.
@@ -1707,6 +1741,7 @@ impl DeviceRank {
         } = upload(&stream, &mut memory)?;
         // The absorbed MLA operands: each sparse layer's kv_b, dequantised once. The latent
         // cache's representation is the caller's ([LatentCache]).
+        let (nope, value) = (config.qk_nope_head_dim, config.v_head_dim);
         let quantise = |dsa: &DeviceDsa| {
             (match cache {
                 LatentCache::Auto => config.dynamic_activations && dsa.kv_b.scales.is_some(),
@@ -1717,12 +1752,13 @@ impl DeviceRank {
         for layer in &mut layers {
             if let DeviceBranch::Sparse(dsa) = &mut layer.branch {
                 dsa.quantise = quantise(dsa);
-                dsa.kv_dequant = absorb_kv_b(&cuda, &stream, &mut memory, &dsa.kv_b)?;
+                dsa.kv_dequant = absorb_kv_b(&cuda, &stream, &mut memory, &dsa.kv_b, nope, value)?;
             }
         }
         if let Some(mtp) = &mut mtp {
             mtp.dsa.quantise = quantise(&mtp.dsa);
-            mtp.dsa.kv_dequant = absorb_kv_b(&cuda, &stream, &mut memory, &mtp.dsa.kv_b)?;
+            mtp.dsa.kv_dequant =
+                absorb_kv_b(&cuda, &stream, &mut memory, &mtp.dsa.kv_b, nope, value)?;
         }
         let scratch = Self::scratch(config, layout, &stream, &mut memory)?;
         let prefetch = Prefetch::new(&cuda)?;
@@ -1976,6 +2012,59 @@ impl DeviceRank {
         self.sequence(capacity, false)
     }
 
+    /// Puts `sequence` back at position 0 with no history, the state [Self::new_sequence] opens
+    /// one in, keeping its window: a server that holds one window between requests skips the
+    /// allocation, 18.2 GiB a rank at the 1M default. As in a fresh window, only the convolution
+    /// history and the recurrent memory are cleared; the caches are read below the position only.
+    ///
+    /// # Errors
+    /// A block-drafting sequence, whose drafter context this does not clear, or the device refuses
+    /// a copy.
+    pub fn reset(&self, sequence: &mut DeviceSequence) -> Result<(), BackendError> {
+        if sequence.block.is_some() {
+            return Err(refusal(
+                "a block-drafting sequence is not reset in place; open a new one",
+            ));
+        }
+        self.clear(sequence)
+    }
+
+    /// Zeroes `sequence`'s convolution history and recurrent memory and rewinds it to position 0.
+    fn clear(&self, sequence: &mut DeviceSequence) -> Result<(), BackendError> {
+        let head = self.config.linear_head_dim;
+        let history = self.config.linear_conv_kernel_dim.saturating_sub(1);
+        let mut zeros = Vec::new();
+        for (layer, state) in self.layers.iter().zip(&sequence.layers) {
+            let (
+                DeviceBranch::Linear(kda),
+                SequenceLayer::Linear {
+                    conv, recurrent, ..
+                },
+            ) = (&layer.branch, state)
+            else {
+                continue;
+            };
+            let cleared = [
+                (conv, history * 3 * kda.width * 4),
+                (recurrent, kda.heads * head * head * 4),
+            ];
+            for (pointer, bytes) in cleared.into_iter().filter(|&(_, bytes)| bytes > 0) {
+                zeros.resize(zeros.len().max(bytes), 0u8);
+                self.cuda
+                    .copy_htod_on(&self.stream, pointer, &zeros[..bytes])
+                    .map_err(cuda_error)?;
+            }
+        }
+        sequence.position = 0;
+        sequence.pending = None;
+        sequence.logits_at = None;
+        sequence.confidence.clear();
+        if let Some(drafter) = sequence.drafter.as_mut() {
+            drafter.last = None;
+        }
+        Ok(())
+    }
+
     /// A fresh sequence of up to `capacity` positions that keeps the MTP layer's state, for
     /// [Self::draft]: each of its steps also fills the MTP layer's caches.
     ///
@@ -2086,8 +2175,8 @@ impl DeviceRank {
             .map(|layer| {
                 Ok(match &layer.branch {
                     DeviceBranch::Linear(kda) => SequenceLayer::Linear {
-                        conv: memory.zeroed(&self.stream, history * 3 * kda.width * 4)?,
-                        recurrent: memory.zeroed(&self.stream, kda.heads * head * head * 4)?,
+                        conv: memory.bytes(history * 3 * kda.width * 4)?,
+                        recurrent: memory.bytes(kda.heads * head * head * 4)?,
                         spare: memory.floats(kda.heads * head * head)?,
                     },
                     DeviceBranch::Sparse(dsa) => self.sparse_state(&mut memory, dsa, capacity)?,
@@ -2102,7 +2191,7 @@ impl DeviceRank {
             }),
             _ => None,
         };
-        Ok(DeviceSequence {
+        let mut sequence = DeviceSequence {
             position: 0,
             capacity,
             pending: None,
@@ -2112,7 +2201,9 @@ impl DeviceRank {
             block: None,
             confidence: Vec::new(),
             memory,
-        })
+        };
+        self.clear(&mut sequence)?;
+        Ok(sequence)
     }
 
     /// A DSA layer's caches for `capacity` positions, the indexer's only for a layer with one.
@@ -2688,7 +2779,11 @@ impl DeviceRank {
             };
             self.launch(
                 self.kernels.mla_absorb,
-                (heads as u32, run.len as u32, 1),
+                (
+                    heads as u32,
+                    run.len as u32,
+                    latent.div_ceil(BLOCK as usize) as u32,
+                ),
                 BLOCK,
                 &[
                     s.query.0,

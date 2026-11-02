@@ -149,8 +149,8 @@ pub enum ReduceSwitch {
 
 #[cfg(feature = "cuda")]
 impl ReduceSwitch {
-    /// The slot for the header's path. There is no parse here and no default: the header refused an
-    /// unset or unknown `SPARK_COMM_REDUCE` at startup.
+    /// The slot for the header's path. There is no parse here and no default of its own: the header
+    /// decided `SPARK_COMM_REDUCE` at startup, the arm's own path when unset, and refused a typo.
     #[must_use]
     pub fn for_path(path: crate::run_header::ReducePath) -> Self {
         match path {
@@ -11479,20 +11479,15 @@ fn planned_lanes(serving: bool) -> Result<usize, String> {
     }
 }
 
-/// SPARKFLASH_DECODE_MMA: the E4M3- and bf16-row decode GEMVs on the tensor cores (kernels/
-/// opt_gemv_sm121.cu's opt_gemv_mma_*). `None` when unset: the tensor cores wherever the opt GEMV is
-/// installed. `Some(true)` (on|1) requires the opt GEMV; `Some(false)` (off|0) keeps the FMA chain,
-/// whose greedy output is the one from before the tensor-core forms. Either way a row's bits are one
-/// fixed chain whatever the batch. Any other value is refused.
+/// The on|off switch `name` set to `raw`: `None` when unset (the caller's default), `Some(true)` for
+/// on|1, `Some(false)` for off|0. Any other value is refused.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn decode_mma_from_env_value(raw: Option<&str>) -> Result<Option<bool>, String> {
+fn on_off_from_env_value(name: &str, raw: Option<&str>) -> Result<Option<bool>, String> {
     match raw.map(str::trim) {
         None | Some("") => Ok(None),
         Some("0" | "off") => Ok(Some(false)),
         Some("1" | "on") => Ok(Some(true)),
-        Some(other) => Err(format!(
-            "SPARKFLASH_DECODE_MMA={other:?} is not one of off|on"
-        )),
+        Some(other) => Err(format!("{name}={other:?} is not one of off|on")),
     }
 }
 
@@ -11739,9 +11734,14 @@ impl<'a> DeviceLayer<'a> {
         };
         // The split-K opt GEMV serves every decode GEMV and the grouped wo_a once installed; the
         // modules stay loaded for the process (nothing frees them). Its E4M3- and bf16-row launches
-        // run on the tensor-core forms in the same cubin unless SPARKFLASH_DECODE_MMA=off.
-        let decode_mma =
-            decode_mma_from_env_value(std::env::var("SPARKFLASH_DECODE_MMA").ok().as_deref())?;
+        // run on the tensor-core forms in the same cubin (kernels/opt_gemv_sm121.cu's
+        // opt_gemv_mma_*) under SPARKFLASH_DECODE_MMA: unset, wherever the opt GEMV is installed;
+        // on requires it; off keeps the FMA chain, whose greedy output is the one from before the
+        // tensor-core forms. Either way a row's bits are one fixed chain whatever the batch.
+        let decode_mma = on_off_from_env_value(
+            "SPARKFLASH_DECODE_MMA",
+            std::env::var("SPARKFLASH_DECODE_MMA").ok().as_deref(),
+        )?;
         if let Some(dir) = kernel_cubin_dir
             && std::env::var("SPARKFLASH_OPT_GEMV").as_deref() != Ok("0")
         {
@@ -21314,23 +21314,28 @@ mod tests {
 }
 
 #[cfg(test)]
-mod decode_mma_switch_tests {
+mod on_off_switch_tests {
     use super::*;
 
     #[test]
-    fn the_tensor_core_decode_is_the_default_off_opts_out_and_other_values_are_refused() {
+    fn unset_is_the_default_off_and_on_are_explicit_and_other_values_are_refused() {
+        let switch = |raw| on_off_from_env_value("SPARKFLASH_DECODE_MMA", raw);
         for unset in [None, Some(""), Some("  ")] {
-            assert_eq!(decode_mma_from_env_value(unset), Ok(None), "{unset:?}");
+            assert_eq!(switch(unset), Ok(None), "{unset:?}");
         }
         for off in [Some("0"), Some("off"), Some(" off ")] {
-            assert_eq!(decode_mma_from_env_value(off), Ok(Some(false)), "{off:?}");
+            assert_eq!(switch(off), Ok(Some(false)), "{off:?}");
         }
         for on in [Some("1"), Some("on")] {
-            assert_eq!(decode_mma_from_env_value(on), Ok(Some(true)), "{on:?}");
+            assert_eq!(switch(on), Ok(Some(true)), "{on:?}");
         }
         for bad in ["true", "yes", "ON", "2"] {
-            assert!(decode_mma_from_env_value(Some(bad)).is_err(), "{bad:?}");
+            assert!(switch(Some(bad)).is_err(), "{bad:?}");
         }
+        assert_eq!(
+            on_off_from_env_value("SPARKFLASH_ENGRAM_DIRECT", Some("no")),
+            Err("SPARKFLASH_ENGRAM_DIRECT=\"no\" is not one of off|on".to_owned())
+        );
     }
 }
 
@@ -21704,10 +21709,14 @@ mod evidence_switch_tests {
         assert_eq!(ReduceSwitch::for_path(ReducePath::Roce), ReduceSwitch::Roce);
         assert_eq!(ReduceSwitch::for_path(ReducePath::Tcp), ReduceSwitch::Tcp);
         assert_eq!(ReduceSwitch::for_path(ReducePath::Nccl), ReduceSwitch::Nccl);
-        // An unset value or a typo never reaches the slot: the header refuses it at startup, so the
-        // row's line always names the path the run asked for (crate::run_header tests).
-        assert!(ReducePath::parse(Some("roc")).is_err());
-        assert!(ReducePath::parse(None).is_err());
+        // A typo never reaches the slot: the header refuses it at startup, and an unset value is
+        // the arm's own path, so the row's line always names the path the run took
+        // (crate::run_header tests).
+        assert!(ReducePath::parse(Some("roc"), ReducePath::Nccl).is_err());
+        assert_eq!(
+            ReducePath::parse(None, ReducePath::Tcp),
+            Ok(ReducePath::Tcp)
+        );
     }
 
     #[test]

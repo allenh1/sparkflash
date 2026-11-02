@@ -31,6 +31,7 @@ use super::rows::{R_MAX, RowsState};
 use super::sample::Sampler;
 use super::*;
 use crate::device_link::{DeviceFinish, DeviceLink, DeviceOutcome};
+use sparkflash_engram::store::AlignedBuffer;
 use sparkflash_kernels::cuda_driver::HostMapped;
 use sparkflash_model::speculation::{DepthPolicy, StepCost};
 use std::cell::RefCell;
@@ -123,8 +124,18 @@ pub(super) fn gather_rows(
 
 /// The paged Engram tables, opened for concurrent reads: per Engram slot, the codes and scales
 /// files and the byte each tensor starts at.
+///
+/// The files are opened again with `O_DIRECT` unless SPARKFLASH_ENGRAM_DIRECT=off: the tables are
+/// ~200 GB read at random (a 256-byte code and an 8-byte scale per lookup), and through the page
+/// cache every miss adds a 4 KB page. On a node whose GPU holds most of the same memory, that churn
+/// kept the kernel reclaiming while it decoded: a minute of single-stream decode scanned ~1M pages
+/// a node, with hundreds of direct-reclaim stalls and some swapping. Read directly, the same minute
+/// reclaims nothing, and a lookup moves only the aligned window that covers it.
 pub(super) struct EngramReader {
     slots: Vec<(Arc<fs::File>, u64, Arc<fs::File>, u64)>,
+    /// The `O_DIRECT` alignment the files are read at, or None when they are read through the page
+    /// cache.
+    direct: Option<u64>,
     /// The tokenizer's compressed token map: the n-grams are hashed over compressed ids
     /// (engram.py's token map), never over raw ones.
     compressor: sparkflash_engram::compress::TokenizerCompressor,
@@ -132,6 +143,9 @@ pub(super) struct EngramReader {
     /// redrafted row) costs a copy instead of a device read.
     cache: Mutex<EntryCache>,
     cached: bool,
+    /// Whether a bulk prefill chunk's reads are split over the ranks by column
+    /// ([`EngramShard`]; SPARKFLASH_ENGRAM_SHARD=off reads every column on every rank).
+    pub(super) shard: bool,
 }
 
 /// Reader threads per gather: the lookups are small random reads, latency-bound one at a time, and
@@ -146,9 +160,11 @@ pub(super) fn prefill_read_threads() -> usize {
     std::env::var("SPARKFLASH_PREFILL_READ_THREADS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(128usize)
-        .clamp(1, 256)
+        .unwrap_or(256usize)
+        .clamp(1, 512)
 }
+/// Reads a pool thread takes from one gather before it looks for an earlier slot's elsewhere.
+const READS_PER_TURN: usize = 16;
 /// The most entries the reader keeps (about 130 B each).
 const ENGRAM_CACHE_ENTRIES: usize = 1 << 20;
 /// Submission queue entries of the io_uring reader: a verify step's gather is under 300 reads.
@@ -175,11 +191,30 @@ impl EngramReader {
         let compressor =
             sparkflash_engram::compress::TokenizerCompressor::from_tokenizer_json(tokenizer)
                 .map_err(|error| format!("engram reader: {}: {error}", tokenizer.display()))?;
-        let region = |name: String| -> Result<(Arc<fs::File>, u64), String> {
+        let direct = super::on_off_from_env_value(
+            "SPARKFLASH_ENGRAM_DIRECT",
+            std::env::var("SPARKFLASH_ENGRAM_DIRECT").ok().as_deref(),
+        )? != Some(false);
+        let shard = super::on_off_from_env_value(
+            "SPARKFLASH_ENGRAM_SHARD",
+            std::env::var("SPARKFLASH_ENGRAM_SHARD").ok().as_deref(),
+        )? != Some(false);
+        let mut align = sparkflash_engram::store::MIN_ALIGN_BYTES;
+        let mut region = |name: String| -> Result<(Arc<fs::File>, u64), String> {
             let (file, start, _len) = source
                 .file_region(&name)
                 .ok_or_else(|| format!("engram reader: {name} is not file-backed"))?
                 .map_err(|error| format!("engram reader: {name}: {error}"))?;
+            if direct {
+                let (file, file_align) = reopen_direct(&file).map_err(|error| {
+                    format!(
+                        "engram reader: {name}: {error} (SPARKFLASH_ENGRAM_DIRECT=off reads the \
+                         tables through the page cache)"
+                    )
+                })?;
+                align = align.max(file_align);
+                return Ok((Arc::new(file), start));
+            }
             // Readahead only multiplies the bytes a random 256-byte lookup moves.
             // SAFETY: a valid open descriptor; the advice changes no memory.
             unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
@@ -193,11 +228,58 @@ impl EngramReader {
         }
         Ok(Self {
             slots,
+            direct: direct.then_some(align),
             compressor,
             cache: Mutex::new(std::collections::HashMap::new()),
             cached: std::env::var("SPARKFLASH_ENGRAM_CACHE").as_deref() != Ok("0"),
+            shard,
         })
     }
+
+    /// Where the bytes `[at, at + len)` are read from: (first byte, bytes before them, bytes read).
+    /// Through the page cache that is the bytes themselves; direct, the aligned windows that cover
+    /// them.
+    fn window(&self, at: u64, len: usize) -> (u64, usize, usize) {
+        match self.direct {
+            None => (at, 0, len),
+            Some(align) => {
+                let (start, end) = sparkflash_engram::store::window_span(at, len as u64, align);
+                (start, (at - start) as usize, (end - start) as usize)
+            }
+        }
+    }
+}
+
+/// `file` opened again with `O_DIRECT` through its /proc/self/fd link, once one aligned read has
+/// succeeded on it ([`sparkflash_engram::store::open_direct`]), and the alignment its device needs.
+fn reopen_direct(file: &fs::File) -> Result<(fs::File, u64), String> {
+    use std::os::fd::AsRawFd as _;
+    let link = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    let direct =
+        sparkflash_engram::store::open_direct(&link).map_err(|error| format!("{error:#}"))?;
+    Ok((direct, sparkflash_engram::store::device_alignment(&link)))
+}
+
+/// Reads `window` (bytes of `file` from `start`) until its first `need` bytes have landed, `got`
+/// of them already: a short read is finished in place, and a direct window may run past the end of
+/// the file, where its read stops short.
+fn finish_window(
+    file: &fs::File,
+    window: &mut [u8],
+    start: u64,
+    mut got: usize,
+    need: usize,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt as _;
+    while got < need {
+        match file.read_at(&mut window[got..], start + got as u64) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => got += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Keeps the Engram drive out of its idle power states while sequences run. A decode step's reads
@@ -223,17 +305,15 @@ impl Keepalive {
         scope: &'scope std::thread::Scope<'scope, '_>,
         reader: &EngramReader,
     ) -> Option<Self> {
-        use std::os::fd::AsRawFd as _;
-        use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _};
+        use std::os::unix::fs::FileExt as _;
         if std::env::var("SPARKFLASH_ENGRAM_KEEPALIVE").as_deref() == Ok("0") {
             return None;
         }
         let (codes, ..) = reader.slots.first()?;
-        let opened = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(format!("/proc/self/fd/{}", codes.as_raw_fd()))
-            .and_then(|file| Ok((file.metadata()?.len(), file)));
+        let opened = reopen_direct(codes).and_then(|(file, _)| {
+            let len = file.metadata().map_err(|error| error.to_string())?.len();
+            Ok((len, file))
+        });
         let (len, file) = match opened {
             Ok((len, file)) if len >= 8192 => (len, file),
             Ok(_) => return None,
@@ -292,6 +372,98 @@ impl Drop for Keepalive {
     }
 }
 
+/// One rank's share of a sharded gather: the ranks read disjoint column ranges of every row (rank
+/// r columns r * columns.., a quarter of the reads each at four ranks), staged compact, and the
+/// exchange gives every rank every share ([`DeviceLayer::engram_upload`]). The arena rows end up
+/// with the bytes an unsharded gather uploads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EngramShard {
+    world: usize,
+    rank: usize,
+    /// Columns a rank reads.
+    columns: usize,
+    /// Bytes a staged row: the share's codes, then its scales.
+    pitch: usize,
+    /// The share's code bytes (where its scales start in a staged row).
+    codes: usize,
+    /// Where an arena row's scales start.
+    scales_offset: usize,
+}
+
+impl EngramShard {
+    /// Rank `rank`'s share of `layout`'s columns over `world` ranks.
+    ///
+    /// # Errors
+    /// Columns that do not split evenly, or shares the permute cannot move 16 bytes at a time.
+    fn of(
+        layout: &crate::engram_device_state::EngramArenaLayout,
+        world: usize,
+        rank: usize,
+    ) -> Result<Self, String> {
+        let align = crate::engram_device_state::ARENA_ALIGN;
+        let scales_offset = layout.codes_len().div_ceil(align) * align;
+        let columns = layout.columns() / world.max(1);
+        let (codes, scales) = (columns * layout.head_dim(), columns * layout.scale_width());
+        if world == 0
+            || rank >= world
+            || columns * world != layout.columns()
+            || ![codes, scales, layout.stride(), scales_offset]
+                .iter()
+                .all(|bytes| bytes.is_multiple_of(16))
+        {
+            return Err(format!(
+                "engram shard: {} columns of {} + {} bytes do not split into 16-byte shares over \
+                 {world} ranks (SPARKFLASH_ENGRAM_SHARD=off reads every column on every rank)",
+                layout.columns(),
+                layout.head_dim(),
+                layout.scale_width()
+            ));
+        }
+        Ok(Self {
+            world,
+            rank,
+            columns,
+            pitch: codes + scales,
+            codes,
+            scales_offset,
+        })
+    }
+
+    /// The permutes of the exchanged shares into the arena rows: (bytes into a share, bytes into
+    /// an arena row, length) for the codes, then the scales; rank r's land at r * length past it.
+    fn moves(&self) -> [(usize, usize, usize); 2] {
+        [
+            (0, 0, self.codes),
+            (self.codes, self.scales_offset, self.pitch - self.codes),
+        ]
+    }
+}
+
+/// How a gather stages a row's entries: (first column read, columns read, bytes a staged row,
+/// where its scales start), every column in the arena row's own layout without a shard.
+fn staged_row(
+    layout: &crate::engram_device_state::EngramArenaLayout,
+    shard: Option<EngramShard>,
+) -> (usize, usize, usize, usize) {
+    match shard {
+        Some(shard) => (
+            shard.rank * shard.columns,
+            shard.columns,
+            shard.pitch,
+            shard.codes,
+        ),
+        None => {
+            let align = crate::engram_device_state::ARENA_ALIGN;
+            (
+                0,
+                layout.columns(),
+                layout.stride(),
+                layout.codes_len().div_ceil(align) * align,
+            )
+        }
+    }
+}
+
 /// The reads that fill the Engram entries of rows p0..p0+n: each slot's entries are contiguous in
 /// the arena, so a slot is one span of the staging buffer (slot s at s * n * stride) and one upload.
 pub(super) struct EngramGather<'r> {
@@ -314,6 +486,9 @@ pub(super) struct EngramGather<'r> {
     /// Whether the reads go through the reader's entry cache: a bulk prefill chunk's do not (its
     /// thousands of reads would serialise on the cache lock and fill the cache with prompt rows).
     pub(super) cached: bool,
+    /// This rank's share when the ranks split the columns (staged `shard.pitch` bytes a row
+    /// instead of `stride`).
+    shard: Option<EngramShard>,
 }
 
 /// One Engram read: (slot, file, byte offset, staging offset, length).
@@ -371,6 +546,7 @@ impl EngramGather<'_> {
                 || part.cap != merged.cap
                 || part.stride != merged.stride
                 || part.slots() != merged.slots()
+                || part.shard != merged.shard
                 || !std::ptr::eq(part.reader, merged.reader)
             {
                 return Err("engram gather: the parts do not tile one staging buffer".to_owned());
@@ -388,11 +564,16 @@ impl EngramGather<'_> {
         Ok(Some(merged))
     }
 
+    /// Bytes a staged row.
+    fn pitch(&self) -> usize {
+        self.shard.map_or(self.stride, |shard| shard.pitch)
+    }
+
     /// Slot `slot`'s staged rows 0..row0 + n: (byte offset in the staging buffer, bytes).
     fn slot_span(&self, slot: usize) -> (usize, usize) {
         (
-            slot * self.cap * self.stride,
-            (self.row0 + self.n) * self.stride,
+            slot * self.cap * self.pitch(),
+            (self.row0 + self.n) * self.pitch(),
         )
     }
 
@@ -449,35 +630,68 @@ impl EngramGather<'_> {
         }
     }
 
+    /// Reads job `i`'s entry into `slice`: straight in through the page cache, else through
+    /// `bounce`, grown to the job's aligned window.
+    fn read_job(
+        &self,
+        i: usize,
+        slice: &mut [u8],
+        bounce: &mut AlignedBuffer,
+    ) -> std::io::Result<()> {
+        let (_, file, at, _, len) = self.jobs[i];
+        if self.reader.direct.is_none() {
+            return finish_window(file, slice, at, 0, len);
+        }
+        let (start, skip, bytes) = self.reader.window(at, len);
+        if bounce.as_slice().len() < bytes {
+            *bounce = AlignedBuffer::new(bytes);
+        }
+        let window = &mut bounce.as_mut_slice()[..bytes];
+        finish_window(file, window, start, 0, skip + len)?;
+        slice.copy_from_slice(&window[skip..skip + len]);
+        Ok(())
+    }
+
     /// Takes reads until none is left.
     fn work(&self, progress: &ReadProgress, staging: &Staging) {
-        use std::os::unix::fs::FileExt as _;
-        loop {
-            let i = progress.next.fetch_add(1, Ordering::Relaxed);
-            let Some(&(slot, file, at, _, _)) = self.jobs.get(i) else {
-                break;
-            };
-            // SAFETY: `next` gave index i to this thread alone.
-            let result = unsafe { self.job_slice(i, staging) }.and_then(|slice| {
-                if self.cached_copy(i, slice) {
-                    return Ok(());
-                }
-                file.read_exact_at(slice, at)
-                    .map(|()| self.remember(i, slice))
-                    .map_err(|error| format!("engram reader: read at {at}: {error}"))
-            });
-            if let Err(error) = result {
-                progress
-                    .failed
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .get_or_insert(error);
+        let mut bounce = AlignedBuffer::new(0);
+        while self.take(progress, staging, &mut bounce) {}
+    }
+
+    /// The slot of the next read not yet taken, if any is left.
+    fn next_slot(&self, progress: &ReadProgress) -> Option<usize> {
+        self.jobs
+            .get(progress.next.load(Ordering::Relaxed))
+            .map(|job| job.0)
+    }
+
+    /// Takes the next read and lands it; false when none was left.
+    fn take(&self, progress: &ReadProgress, staging: &Staging, bounce: &mut AlignedBuffer) -> bool {
+        let i = progress.next.fetch_add(1, Ordering::Relaxed);
+        let Some(&(slot, _, at, _, _)) = self.jobs.get(i) else {
+            return false;
+        };
+        // SAFETY: `next` gave index i to this thread alone.
+        let result = unsafe { self.job_slice(i, staging) }.and_then(|slice| {
+            if self.cached_copy(i, slice) {
+                return Ok(());
             }
-            if progress.remaining[slot].fetch_sub(1, Ordering::AcqRel) == 1 {
-                let _guard = progress.failed.lock().unwrap_or_else(|p| p.into_inner());
-                progress.landed.notify_all();
-            }
+            self.read_job(i, slice, bounce)
+                .map(|()| self.remember(i, slice))
+                .map_err(|error| format!("engram reader: read at {at}: {error}"))
+        });
+        if let Err(error) = result {
+            progress
+                .failed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_or_insert(error);
         }
+        if progress.remaining[slot].fetch_sub(1, Ordering::AcqRel) == 1 {
+            let _guard = progress.failed.lock().unwrap_or_else(|p| p.into_inner());
+            progress.landed.notify_all();
+        }
+        true
     }
 
     /// Runs every read on `threads` threads and returns once all have landed.
@@ -509,6 +723,51 @@ pub(super) struct GatherTask<'r> {
     gather: EngramGather<'r>,
     progress: ReadProgress,
     staging: Staging,
+    /// The ring's direct reads' windows (the pool's threads read through their own).
+    windows: Option<Windows>,
+}
+
+/// The aligned windows a gather's direct reads land in on the ring, one per job in one arena, each
+/// copied to the staging buffer as its read completes.
+struct Windows {
+    /// Per job: (first byte, bytes before the entry, window bytes, offset in the arena).
+    spans: Vec<(u64, usize, usize, usize)>,
+    base: Staging,
+    /// Owns the memory `base` points into (a Vec's heap block does not move with it).
+    _arena: AlignedBuffer,
+}
+
+impl Windows {
+    fn of(gather: &EngramGather<'_>) -> Self {
+        let mut bytes = 0;
+        let spans = gather
+            .jobs
+            .iter()
+            .map(|&(_, _, at, _, len)| {
+                let (start, skip, window) = gather.reader.window(at, len);
+                bytes += window;
+                (start, skip, window, bytes - window)
+            })
+            .collect();
+        let mut arena = AlignedBuffer::new(bytes);
+        let base = Staging(arena.as_mut_slice().as_mut_ptr(), bytes);
+        Self {
+            spans,
+            base,
+            _arena: arena,
+        }
+    }
+
+    /// Job `i`'s window.
+    ///
+    /// # Safety
+    /// As [`EngramGather::job_slice`]: each index is held by one reader at a time.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn window(&self, i: usize) -> &mut [u8] {
+        let (_, _, bytes, offset) = self.spans[i];
+        // SAFETY: inside the arena (sized from these spans), and disjoint from every other job's.
+        unsafe { std::slice::from_raw_parts_mut(self.base.0.add(offset), bytes) }
+    }
 }
 
 /// Reader threads kept for a whole generation, so a step's reads start no threads.
@@ -525,8 +784,30 @@ impl<'r> ReadPool<'r> {
             .map(|_| {
                 let (sender, tasks) = std::sync::mpsc::channel::<Arc<GatherTask<'r>>>();
                 scope.spawn(move || {
-                    for task in tasks {
-                        task.gather.work(&task.progress, &task.staging);
+                    let mut bounce = AlignedBuffer::new(0);
+                    let mut held: Vec<Arc<GatherTask<'r>>> = Vec::new();
+                    loop {
+                        held.extend(tasks.try_iter());
+                        held.retain(|task| task.gather.next_slot(&task.progress).is_some());
+                        // The earliest slot's reads first, the oldest task's of those: a tick's
+                        // chunks then all reach their first Engram layer before any read for the
+                        // next one lands. A few reads at a time, so a later task's first slot goes
+                        // ahead of the rest of this one.
+                        let Some(task) = held
+                            .iter()
+                            .min_by_key(|task| task.gather.next_slot(&task.progress))
+                        else {
+                            match tasks.recv() {
+                                Ok(task) => held.push(task),
+                                Err(_) => break,
+                            }
+                            continue;
+                        };
+                        for _ in 0..READS_PER_TURN {
+                            if !task.gather.take(&task.progress, &task.staging, &mut bounce) {
+                                break;
+                            }
+                        }
                     }
                 });
                 sender
@@ -549,6 +830,7 @@ impl<'r> ReadPool<'r> {
             progress: gather.progress(),
             gather,
             staging,
+            windows: None,
         });
         for worker in self
             .workers
@@ -593,6 +875,7 @@ impl<'r> UringReads<'r> {
         }
         let task = Arc::new(GatherTask {
             progress: gather.progress(),
+            windows: gather.reader.direct.map(|_| Windows::of(&gather)),
             gather,
             staging,
         });
@@ -603,23 +886,28 @@ impl<'r> UringReads<'r> {
         });
         let mut ring = self.ring.borrow_mut();
         let mut in_flight = 0usize;
-        for (i, &(slot, file, at, _, len)) in task.gather.jobs.iter().enumerate() {
+        for (i, &(slot, file, at, _, _)) in task.gather.jobs.iter().enumerate() {
             // SAFETY: the task is new, so nothing else holds index i yet.
             let slice = unsafe { task.gather.job_slice(i, &task.staging) }?;
             if task.gather.cached_copy(i, slice) {
                 task.progress.remaining[slot].fetch_sub(1, Ordering::Relaxed);
                 continue;
             }
+            let (target, start) = match &task.windows {
+                // SAFETY: as the staging slice: index i is this submit's alone.
+                Some(windows) => (unsafe { windows.window(i) }, windows.spans[i].0),
+                None => (slice, at),
+            };
             let entry = io_uring::opcode::Read::new(
                 io_uring::types::Fd(file.as_raw_fd()),
-                slice.as_mut_ptr(),
-                len as u32,
+                target.as_mut_ptr(),
+                target.len() as u32,
             )
-            .offset(at)
+            .offset(start)
             .build()
             .user_data(((t as u64) << 32) | i as u64);
-            // SAFETY: the buffer is the job's own staging range, which outlives the read (the task
-            // stays in `live` until every read of it has completed).
+            // SAFETY: the buffer is the job's own staging range or window, which outlives the read
+            // (the task stays in `live` until every read of it has completed).
             while unsafe { ring.submission().push(&entry) }.is_err() {
                 ring.submit()
                     .map_err(|error| format!("engram reader: submit: {error}"))?;
@@ -636,7 +924,6 @@ impl<'r> UringReads<'r> {
 
     /// Blocks for at least one completion and retires every completion queued.
     fn reap(&self) -> Result<(), String> {
-        use std::os::unix::fs::FileExt as _;
         let done: Vec<(u64, i32)> = {
             let mut ring = self.ring.borrow_mut();
             ring.submit_and_wait(1)
@@ -661,10 +948,19 @@ impl<'r> UringReads<'r> {
                         std::io::Error::from_raw_os_error(-result)
                     )
                 })?;
-                if got < len {
-                    // A short read: finish it in place.
-                    file.read_exact_at(&mut slice[got..], at + got as u64)
-                        .map_err(|error| format!("engram reader: read at {at}: {error}"))?;
+                let read = |window: &mut [u8], start, need| {
+                    finish_window(file, window, start, got, need)
+                        .map_err(|error| format!("engram reader: read at {at}: {error}"))
+                };
+                match &task.windows {
+                    Some(windows) => {
+                        let (start, skip, ..) = windows.spans[i];
+                        // SAFETY: index i's read has completed, and its submit-time window is gone.
+                        let window = unsafe { windows.window(i) };
+                        read(window, start, skip + len)?;
+                        slice.copy_from_slice(&window[skip..skip + len]);
+                    }
+                    None => read(slice, at, len)?,
                 }
                 gather.remember(i, slice);
                 Ok(())
@@ -760,6 +1056,7 @@ impl<'r> Reads<'r> {
 impl DeviceLayer<'_> {
     /// Hashes rows p0..p0+n of `history` through the compressed token map, sets their skip flags
     /// and returns the table reads that fill their entries, staged at rows row0.. of `cap` per slot.
+    /// With `shard` (world, rank), only this rank's share of the columns ([`EngramShard`]).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn engram_plan<'r>(
         &mut self,
@@ -770,6 +1067,7 @@ impl DeviceLayer<'_> {
         n: usize,
         row0: usize,
         cap: usize,
+        shard: Option<(usize, usize)>,
     ) -> Result<Option<EngramGather<'r>>, String> {
         let Some(engram) = self.engram.as_mut() else {
             return Ok(None);
@@ -791,8 +1089,10 @@ impl DeviceLayer<'_> {
             layout.scale_width(),
             layout.stride(),
         );
-        let align = crate::engram_device_state::ARENA_ALIGN;
-        let scales_offset = layout.codes_len().div_ceil(align) * align;
+        let shard = shard
+            .map(|(world, rank)| EngramShard::of(&layout, world, rank))
+            .transpose()?;
+        let (first, share, pitch, scales_offset) = staged_row(&layout, shard);
         let slots = engram.layer_ids.len();
         let mut per_slot: Vec<Vec<ReadJob<'_>>> = vec![Vec::new(); slots];
         let mut hashes = Vec::new();
@@ -825,8 +1125,8 @@ impl DeviceLayer<'_> {
                     continue;
                 }
                 let (codes, codes_at, scales, scales_at) = &reader.slots[slot];
-                let base = (slot * cap + row0 + row) * stride;
-                for (column, &id) in ids.iter().enumerate() {
+                let base = (slot * cap + row0 + row) * pitch;
+                for (column, &id) in ids[first..first + share].iter().enumerate() {
                     let id = u64::from(id);
                     slot_jobs.push((
                         slot,
@@ -858,6 +1158,7 @@ impl DeviceLayer<'_> {
             jobs,
             counts,
             cached: true,
+            shard,
         }))
     }
 
@@ -910,6 +1211,67 @@ impl DeviceLayer<'_> {
         ))
     }
 
+    /// Queues slot `slot`'s staged entries of `gather` (landed in `pinned`) for its arena rows on
+    /// the run's stream: one copy, or for a sharded gather a copy of this rank's share into its
+    /// block of the rows state's share buffer, the exchange of every rank's (the ring AllGather
+    /// past R_MAX rows, as the embedding gather), then the shares' codes and scales permuted into
+    /// the rows.
+    fn engram_upload(
+        &self,
+        rows: &RowsState,
+        gather: &EngramGather<'_>,
+        slot: usize,
+        pinned: &HostMapped,
+    ) -> Result<(), String> {
+        let at = self.engram_entry(slot, gather.at, gather.stride)?;
+        let (offset, bytes) = gather.slot_span(slot);
+        let Some(shard) = gather.shard else {
+            return self.cuda.copy_htod_async(&at, pinned, offset, bytes);
+        };
+        let staged = gather.row0 + gather.n;
+        let shares = rows
+            .bulk
+            .as_ref()
+            .and_then(|bulk| bulk.engram_shares)
+            .filter(|&(_, len)| len >= shard.world * bytes)
+            .ok_or_else(|| format!("engram upload: no share buffer for {staged} sharded rows"))?
+            .0;
+        self.cuda.copy_htod_async(
+            &Deviceptr(shares + (shard.rank * bytes) as u64),
+            pinned,
+            offset,
+            bytes,
+        )?;
+        if staged > R_MAX {
+            self.gather_slots(shares, bytes / 2, shard.rank, "engram shares")?;
+        } else {
+            self.exchange_slots(shares, bytes / 2, shard.rank, "engram shares")?;
+        }
+        let pitches = [(shard.pitch / 16) as u64, (gather.stride / 16) as u64];
+        for (from, to, len) in shard.moves() {
+            let vecs = (len / 16) as u32;
+            self.cuda.launch(
+                rows.kernels.rank_permute,
+                (
+                    (shard.world as u32 * staged as u32 * vecs).div_ceil(256),
+                    1,
+                    1,
+                ),
+                (256, 1, 1),
+                &[
+                    shares + from as u64,
+                    at.0 + to as u64,
+                    staged as u64,
+                    u64::from(vecs),
+                    shard.world as u64,
+                    pitches[0],
+                    pitches[1],
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     /// The Engram entries of rows p0..p0+n, read and uploaded before returning.
     pub(super) fn engram_set_rows(
         &mut self,
@@ -919,7 +1281,7 @@ impl DeviceLayer<'_> {
         p0: usize,
         n: usize,
     ) -> Result<(), String> {
-        let Some(gather) = self.engram_plan(config, reader, history, p0, n, 0, n)? else {
+        let Some(gather) = self.engram_plan(config, reader, history, p0, n, 0, n, None)? else {
             return Ok(());
         };
         self.engram_apply(&gather)?;
@@ -984,12 +1346,9 @@ impl DeviceLayer<'_> {
                 if let Some(early) = ahead.take() {
                     reads.wait_all(&early)?;
                 }
-                let gather = &task.gather;
                 reads.wait(task, slot)?;
                 waited += started.elapsed().as_secs_f64() * 1e3;
-                let at = self.engram_entry(slot, gather.at, gather.stride)?;
-                let (offset, bytes) = gather.slot_span(slot);
-                self.cuda.copy_htod_async(&at, pinned, offset, bytes)?;
+                self.engram_upload(rows, &task.gather, slot, pinned)?;
             }
             self.set_seam_weights(*weights);
             self.run_layer_rows(rows, layer, p0, n)?;
@@ -1028,10 +1387,7 @@ impl DeviceLayer<'_> {
                 let started = std::time::Instant::now();
                 reads.wait(task, slot)?;
                 waited += started.elapsed().as_secs_f64() * 1e3;
-                let gather = &task.gather;
-                let at = self.engram_entry(slot, gather.at, gather.stride)?;
-                let (offset, bytes) = gather.slot_span(slot);
-                self.cuda.copy_htod_async(&at, pinned, offset, bytes)?;
+                self.engram_upload(rows, &task.gather, slot, pinned)?;
             }
             self.set_seam_weights(*weights);
             self.run_layer_rows(rows, layer, p0, n)?;
@@ -1043,7 +1399,7 @@ impl DeviceLayer<'_> {
         Ok(waited)
     }
 
-    /// Consecutive bulk chunks of one sequence (each chunk's rows right after the one before),
+    /// Bulk chunks of a tick (consecutive ones of one sequence, or several sequences' own),
     /// their layers interleaved so that each chunk's collectives run on the collective stream under
     /// the other chunks' launches: per layer, the chunks' attention halves in order, then their FFN
     /// halves in the same order. Each chunk's launches are its single-chunk launches in their
@@ -1052,13 +1408,15 @@ impl DeviceLayer<'_> {
     /// Engram reads (`task`, staged in its pinned buffer) are waited for and uploaded just before
     /// its slot's layer (the chunks share the arena rows: the run's stream orders each upload after
     /// the previous chunk's reads of them). The first `encoder_only` chunks stop after the
-    /// encoder layers ([`ENCODER_LAYERS`]). `then` runs once every layer is queued. Returns the ms
-    /// spent waiting for reads.
+    /// encoder layers ([`ENCODER_LAYERS`]). Each chunk's launches run on its lane
+    /// ([`DeviceLayer::enter_lane`]; [`super::lanes::NO_LANE`] keeps the selected one). `then`
+    /// runs once every layer is queued. Returns the ms spent waiting for reads.
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub(super) fn prefill_layers_paired<'r>(
         &mut self,
         chunks: &[(
             &RowsState,
+            usize,
             usize,
             usize,
             Option<(&GatherTask<'r>, &HostMapped)>,
@@ -1079,7 +1437,7 @@ impl DeviceLayer<'_> {
                 staged.len()
             ));
         }
-        for &(rows, _, n, _) in chunks {
+        for &(rows, _, _, n, _) in chunks {
             if rows.bulk.is_none() || n <= R_MAX {
                 return Err(format!("paired prefill: {n} rows are not a bulk chunk"));
             }
@@ -1090,12 +1448,12 @@ impl DeviceLayer<'_> {
         // chunks' seams (and the earlier chunks' rests).
         let split = chunks
             .iter()
-            .any(|&(rows, _, n, _)| self.sp_rows(rows, n).is_some());
+            .any(|&(rows, _, _, n, _)| self.sp_rows(rows, n).is_some());
         // Split, the chunks' routed experts run as one pass over the expert weights when their
         // states share the routed rows ([Self::rows_moe_merged]; SPARKFLASH_PREFILL_MOE_MERGE=0:
         // a pass a chunk). Each row's values are its chunk's own pass's.
         let merged: Vec<(&RowsState, usize)> =
-            chunks.iter().map(|&(rows, _, n, _)| (rows, n)).collect();
+            chunks.iter().map(|&(rows, _, _, n, _)| (rows, n)).collect();
         let merge = split
             && chunks.len() > 1
             && std::env::var("SPARKFLASH_PREFILL_MOE_MERGE").as_deref() != Ok("0")
@@ -1117,16 +1475,14 @@ impl DeviceLayer<'_> {
                 let merge = merge && chunks.len() > 1;
                 self.set_seam_weights(*weights);
                 let slot = engram_layers.iter().position(|&target| target == layer);
-                for &(rows, p0, n, task) in chunks {
+                for &(rows, lane, p0, n, task) in chunks {
+                    self.enter_lane(lane)?;
                     if let (Some(reads), Some((task, pinned)), Some(slot)) = (reads, task, slot) {
                         let started = std::time::Instant::now();
                         reads.wait(task, slot)?;
                         waited += started.elapsed().as_secs_f64() * 1e3;
-                        let gather = &task.gather;
-                        self.engram_apply(gather)?;
-                        let at = self.engram_entry(slot, gather.at, gather.stride)?;
-                        let (offset, bytes) = gather.slot_span(slot);
-                        self.cuda.copy_htod_async(&at, pinned, offset, bytes)?;
+                        self.engram_apply(&task.gather)?;
+                        self.engram_upload(rows, &task.gather, slot, pinned)?;
                     }
                     if split {
                         self.run_layer_attn_seam(rows, layer, p0, n)?;
@@ -1135,24 +1491,29 @@ impl DeviceLayer<'_> {
                     }
                 }
                 if split {
-                    for &(rows, p0, n, _) in chunks {
+                    for &(rows, lane, p0, n, _) in chunks {
+                        self.enter_lane(lane)?;
                         self.run_layer_attn_rest(rows, layer, p0, n)?;
                     }
-                    for &(rows, _, n, _) in chunks {
+                    for &(rows, lane, _, n, _) in chunks {
+                        self.enter_lane(lane)?;
                         self.run_layer_ffn_seam(rows, layer, n)?;
                     }
                 }
                 if merge {
-                    for &(rows, _, n, _) in chunks {
+                    for &(rows, lane, _, n, _) in chunks {
+                        self.enter_lane(lane)?;
                         self.ffn_rest_inputs(rows, layer, n)?;
                     }
                     self.rows_moe_merged(merged, layer)?;
-                    for &(rows, _, n, _) in chunks {
+                    for &(rows, lane, _, n, _) in chunks {
+                        self.enter_lane(lane)?;
                         self.ffn_rest_tail(rows, layer, n)?;
                     }
                     continue;
                 }
-                for &(rows, p0, n, _) in chunks {
+                for &(rows, lane, p0, n, _) in chunks {
+                    self.enter_lane(lane)?;
                     if split {
                         self.run_layer_ffn_rest(rows, layer, p0, n)?;
                     } else {
@@ -1160,7 +1521,7 @@ impl DeviceLayer<'_> {
                     }
                 }
             }
-            for &(rows, _, n, _) in chunks {
+            for &(rows, _, _, n, _) in chunks {
                 self.rows_ar_wait(rows, n)?;
             }
             Ok(waited)
@@ -1527,10 +1888,11 @@ mod tests {
         assert_eq!(cut_step(&mut step, 0, 10, &[9], true), None);
     }
 
-    #[test]
-    fn merged_gathers_keep_each_slot_together_in_row_order() {
-        let reader = EngramReader {
+    /// A reader over no tables, reading direct at `direct`'s alignment (None: through the cache).
+    fn reader(direct: Option<u64>) -> EngramReader {
+        EngramReader {
             slots: Vec::new(),
+            direct,
             compressor: sparkflash_engram::compress::TokenizerCompressor::from_lookup(
                 vec![0; 3],
                 sparkflash_engram::layout::COMPRESSED_VOCAB_SIZE,
@@ -1538,7 +1900,217 @@ mod tests {
             .expect("lookup"),
             cache: Mutex::new(std::collections::HashMap::new()),
             cached: true,
+            shard: true,
+        }
+    }
+
+    #[test]
+    fn direct_windows_land_the_same_bytes_as_reads_through_the_cache() {
+        use std::io::Write as _;
+        // 5000 bytes, not a whole number of 512-byte blocks, so the last window runs past the end.
+        let bytes: Vec<u8> = (0..5000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+        let mut file = tempfile::tempfile().expect("a temporary file");
+        file.write_all(&bytes).expect("write");
+        // A row's two reads at the start, straddling a block, inside one, and at the end.
+        let reads = [
+            (0u64, 256usize),
+            (300, 256),
+            (510, 8),
+            (4096, 8),
+            (4990, 10),
+            (4744, 256),
+        ];
+        let total: usize = reads.iter().map(|&(_, len)| len).sum();
+        let want: Vec<u8> = reads
+            .iter()
+            .flat_map(|&(at, len)| bytes[at as usize..at as usize + len].to_vec())
+            .collect();
+        for direct in [None, Some(512), Some(4096)] {
+            let reader = reader(direct);
+            let gather = || {
+                let mut dst = 0;
+                let jobs = reads
+                    .iter()
+                    .map(|&(at, len)| {
+                        dst += len;
+                        (0, &file, at, dst - len, len)
+                    })
+                    .collect();
+                EngramGather {
+                    reader: &reader,
+                    n: 1,
+                    stride: total,
+                    cap: 1,
+                    row0: 0,
+                    at: 0,
+                    skips: vec![false],
+                    jobs,
+                    counts: vec![reads.len()],
+                    cached: false,
+                    shard: None,
+                }
+            };
+            let mut got = vec![0u8; total];
+            gather()
+                .read_all(&Staging(got.as_mut_ptr(), total), 2)
+                .expect("the pool's reads");
+            assert_eq!(got, want, "pool, direct {direct:?}");
+            match UringReads::open() {
+                Ok(ring) => {
+                    let mut got = vec![0u8; total];
+                    let task = ring
+                        .submit(gather(), Staging(got.as_mut_ptr(), total))
+                        .expect("submit");
+                    ring.wait(&task, 0).expect("the ring's reads");
+                    drop(task);
+                    assert_eq!(got, want, "ring, direct {direct:?}");
+                }
+                // The CI runner's seccomp profile forbids io_uring_setup (engram's ring_or_skip).
+                Err(error) if std::env::var_os("SPARKFLASH_REQUIRE_IO_URING").is_none() => {
+                    eprintln!("skipped the ring's reads ({error}): no io_uring here");
+                }
+                Err(error) => panic!("SPARKFLASH_REQUIRE_IO_URING is set: {error}"),
+            }
+        }
+        // A direct window is its aligned span; through the cache, the bytes themselves.
+        assert_eq!(reader(Some(512)).window(300, 256), (0, 300, 1024));
+        assert_eq!(reader(Some(512)).window(4990, 10), (4608, 382, 512));
+        assert_eq!(reader(None).window(300, 256), (300, 0, 256));
+        // A short read is finished from where it stopped.
+        let mut window = vec![0u8; 512];
+        window[..100].copy_from_slice(&bytes[4608..4708]);
+        finish_window(&file, &mut window, 4608, 100, 392).expect("the rest of the window");
+        assert_eq!(window[..392], bytes[4608..]);
+        assert!(finish_window(&file, &mut window, 4608, 0, 393).is_err());
+    }
+
+    #[test]
+    fn pooled_engram_reads_land_every_task_s_bytes() {
+        use std::io::Write as _;
+        let bytes: Vec<u8> = (0..4096u32).map(|i| (i * 13 + i / 97) as u8).collect();
+        let mut file = tempfile::tempfile().expect("a temporary file");
+        file.write_all(&bytes).expect("write");
+        // (slot, byte, length): slot 0 repeats one entry, slot 1 reads one entry three times.
+        let entries = [
+            (0, 300u64, 16usize),
+            (0, 0, 16),
+            (0, 300, 16),
+            (1, 1000, 8),
+            (1, 1000, 8),
+            (1, 1000, 8),
+        ];
+        let total: usize = entries.iter().map(|entry| entry.2).sum();
+        let want: Vec<u8> = entries
+            .iter()
+            .flat_map(|&(_, at, len)| bytes[at as usize..at as usize + len].to_vec())
+            .collect();
+        let reader = reader(Some(512));
+        let gather = || {
+            let mut dst = 0;
+            let jobs = entries
+                .iter()
+                .map(|&(slot, at, len)| {
+                    dst += len;
+                    (slot, &file, at, dst - len, len)
+                })
+                .collect();
+            EngramGather {
+                reader: &reader,
+                n: 1,
+                stride: total,
+                cap: 1,
+                row0: 0,
+                at: 0,
+                skips: vec![false, false],
+                jobs,
+                counts: vec![3, 3],
+                cached: false,
+                shard: None,
+            }
         };
+        // Two tasks on one pool, whose workers take the earliest slot of either; the later one
+        // waited for first.
+        let (mut first, mut second) = (vec![0u8; 2 * total], vec![0u8; 2 * total]);
+        std::thread::scope(|scope| {
+            let reads = Reads::Pool(ReadPool::start(scope, 2));
+            let one = reads
+                .submit(gather(), Staging(first.as_mut_ptr(), first.len()), 2)
+                .expect("submit");
+            let two = reads
+                .submit(gather(), Staging(second.as_mut_ptr(), second.len()), 2)
+                .expect("submit");
+            reads.wait_all(&two).expect("the second task's reads");
+            reads.wait_all(&one).expect("the first task's reads");
+        });
+        assert_eq!(first[..total], want, "the first task");
+        assert_eq!(second[..total], want, "the second task");
+    }
+
+    #[test]
+    fn sharded_rows_permute_into_the_unsharded_rows() {
+        let layout =
+            crate::engram_device_state::EngramArenaLayout::new(24, 256).expect("the layout");
+        let (head, scale) = (layout.head_dim(), layout.scale_width());
+        let rows = 3;
+        // Row y's column j: its code bytes and its scale bytes.
+        let code = |y: usize, j: usize, k: usize| (y * 31 + j * 7 + k) as u8;
+        let scale_byte = |y: usize, j: usize, k: usize| (200 + y * 3 + j * 5 + k) as u8;
+        // Stages every row as `shard` does, at row y of [rows][pitch].
+        let stage = |shard: Option<EngramShard>| {
+            let (first, count, pitch, scales_at) = staged_row(&layout, shard);
+            let mut staged = vec![0u8; rows * pitch];
+            for y in 0..rows {
+                for c in 0..count {
+                    let (row, j) = (y * pitch, first + c);
+                    for k in 0..head {
+                        staged[row + c * head + k] = code(y, j, k);
+                    }
+                    for k in 0..scale {
+                        staged[row + scales_at + c * scale + k] = scale_byte(y, j, k);
+                    }
+                }
+            }
+            staged
+        };
+        let want = stage(None);
+        let world = 4;
+        let shards: Vec<EngramShard> = (0..world)
+            .map(|rank| EngramShard::of(&layout, world, rank).expect("a share"))
+            .collect();
+        // The exchanged shares, [world][rows][pitch], permuted as the device does.
+        let shares: Vec<u8> = shards
+            .iter()
+            .flat_map(|&shard| stage(Some(shard)))
+            .collect();
+        let (pitch, stride) = (shards[0].pitch, layout.stride());
+        let mut got = vec![0u8; rows * stride];
+        for (from, to, len) in shards[0].moves() {
+            assert_eq!((from % 16, to % 16, len % 16), (0, 0, 0));
+            for rank in 0..world {
+                for y in 0..rows {
+                    let src = (rank * rows + y) * pitch + from;
+                    let dst = y * stride + to + rank * len;
+                    got[dst..dst + len].copy_from_slice(&shares[src..src + len]);
+                }
+            }
+        }
+        // Every byte an unsharded gather stages (the alignment padding is never read).
+        let (_, _, _, scales_at) = staged_row(&layout, None);
+        for y in 0..rows {
+            let row = y * stride;
+            let codes = row..row + layout.codes_len();
+            let scales = row + scales_at..row + scales_at + layout.scales_len();
+            assert_eq!(got[codes.clone()], want[codes], "row {y}'s codes");
+            assert_eq!(got[scales.clone()], want[scales], "row {y}'s scales");
+        }
+        assert!(EngramShard::of(&layout, 5, 0).is_err());
+        assert!(EngramShard::of(&layout, 4, 4).is_err());
+        assert!(EngramShard::of(&layout, 0, 0).is_err());
+    }
+
+    #[test]
+    fn merged_gathers_keep_each_slot_together_in_row_order() {
+        let reader = reader(None);
         let file = fs::File::open("/dev/null").expect("/dev/null");
         let part = |row0: usize, at: u64| EngramGather {
             reader: &reader,
@@ -1554,6 +2126,7 @@ mod tests {
             ],
             counts: vec![1, 1],
             cached: true,
+            shard: None,
         };
         let merged = EngramGather::merge(vec![part(0, 100), part(1, 200), part(2, 300)])
             .expect("tiles")

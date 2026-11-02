@@ -3771,10 +3771,14 @@ __device__ __forceinline__ float q4e_glm_mla_at(const float* __restrict__ latent
     return latent[(unsigned long long)row * width + column];
 }
 
+// The operands the absorbed MLA's serial sums load at once before they fold them in, in order:
+// the sums are the same, and a thread has that many loads in flight instead of one.
+#define Q4E_GLM_MLA_AHEAD 8
+
 // The query half of the absorption: q_abs[row][head][c] = sum_j q[row][head][j] * kv_b[h][j][c],
-// kv_b's key rows, [nope][latent] a head. grid (heads, rows), Q4E_BLOCK threads: thread
-// threadIdx.x owns latent columns threadIdx.x, threadIdx.x + block, ..., so a warp's reads of the
-// weight are consecutive words and its reads of the query one broadcast.
+// kv_b's key rows, [nope][latent] a head. grid (heads, rows, latent / blockDim.x rounded up):
+// thread threadIdx.x of z-block z owns latent column z * blockDim.x + threadIdx.x, so a warp's
+// reads of the weight are consecutive words and its reads of the query one broadcast.
 extern "C" __global__ void q4e_glm_mla_absorb(const float* __restrict__ q,
                                               const float* __restrict__ kv_b,
                                               float* __restrict__ q_abs, int base, int nope,
@@ -3782,24 +3786,36 @@ extern "C" __global__ void q4e_glm_mla_absorb(const float* __restrict__ q,
     OPT_PDL_ENTRY();
     const int head = blockIdx.x;
     const int row = base + blockIdx.y;
-    if (latent > Q4E_GLM_MAX_LATENT) {
+    const int c = blockIdx.z * blockDim.x + threadIdx.x;
+    if (latent > Q4E_GLM_MAX_LATENT || c >= latent) {
         return;
     }
     const float* qh = q + ((unsigned long long)row * gridDim.x + head) * nope;
-    const float* wh = kv_b + (unsigned long long)head * (nope + value) * latent;
-    float* oh = q_abs + ((unsigned long long)row * gridDim.x + head) * latent;
-    for (int c = threadIdx.x; c < latent; c += blockDim.x) {
-        float acc = 0.0f;
-        for (int j = 0; j < nope; ++j) {
-            acc = fmaf(wh[(unsigned long long)j * latent + c], qh[j], acc);
+    const float* wc = kv_b + (unsigned long long)head * (nope + value) * latent + c;
+    float acc = 0.0f;
+    int j = 0;
+    for (; j + Q4E_GLM_MLA_AHEAD <= nope; j += Q4E_GLM_MLA_AHEAD) {
+        float w[Q4E_GLM_MLA_AHEAD];
+#pragma unroll
+        for (int k = 0; k < Q4E_GLM_MLA_AHEAD; ++k) {
+            w[k] = wc[(unsigned long long)(j + k) * latent];
         }
-        oh[c] = acc;
+#pragma unroll
+        for (int k = 0; k < Q4E_GLM_MLA_AHEAD; ++k) {
+            acc = fmaf(w[k], qh[j + k], acc);
+        }
     }
+    for (; j < nope; ++j) {
+        acc = fmaf(wc[(unsigned long long)j * latent], qh[j], acc);
+    }
+    q_abs[((unsigned long long)row * gridDim.x + head) * latent + c] = acc;
 }
 
 // The attention and the value half together: a f32 softmax over the selected latents, then the
-// weighted latent sum projected by kv_b's value rows. grid (heads, rows), Q4E_BLOCK threads. The
-// score and softmax phases are q4e_attn's, over the latent instead of an expanded key.
+// weighted latent sum projected by kv_b's value rows, which a head keeps transposed after its key
+// rows ([latent][value]) so a warp's reads of them are consecutive words. grid (heads, rows),
+// Q4E_BLOCK threads. The score and softmax phases are q4e_attn's, over the latent instead of an
+// expanded key.
 extern "C" __global__ void q4e_glm_mla_attend(const float* __restrict__ q_abs,
                                               const float* __restrict__ latent_cache,
                                               const unsigned char* __restrict__ codes,
@@ -3822,7 +3838,8 @@ extern "C" __global__ void q4e_glm_mla_attend(const float* __restrict__ q_abs,
         return;
     }
     const float* qh = q_abs + ((unsigned long long)row * gridDim.x + head) * latent;
-    const float* wh = kv_b + (unsigned long long)head * (nope + value) * latent;
+    const float* wv = kv_b + (unsigned long long)head * (nope + value) * latent +
+                      (unsigned long long)nope * latent;
     float* oh = out + ((unsigned long long)row * gridDim.x + head) * value;
     if (nsel <= 0) {
         // Before the indexer has a full block there is nothing to attend over, and the reference
@@ -3868,7 +3885,20 @@ extern "C" __global__ void q4e_glm_mla_attend(const float* __restrict__ q_abs,
 
     for (int c = threadIdx.x; c < latent; c += blockDim.x) {
         float accumulator = 0.0f;
-        for (int slot = 0; slot < nsel; ++slot) {
+        int slot = 0;
+        for (; slot + Q4E_GLM_MLA_AHEAD <= nsel; slot += Q4E_GLM_MLA_AHEAD) {
+            float x[Q4E_GLM_MLA_AHEAD];
+#pragma unroll
+            for (int k = 0; k < Q4E_GLM_MLA_AHEAD; ++k) {
+                x[k] = q4e_glm_mla_at(latent_cache, codes, scales, latent, sel[slot + k], c,
+                                      quantise);
+            }
+#pragma unroll
+            for (int k = 0; k < Q4E_GLM_MLA_AHEAD; ++k) {
+                accumulator = fmaf(logits[slot + k], x[k], accumulator);
+            }
+        }
+        for (; slot < nsel; ++slot) {
             accumulator =
                 fmaf(logits[slot],
                      q4e_glm_mla_at(latent_cache, codes, scales, latent, sel[slot], c, quantise),
@@ -3879,10 +3909,22 @@ extern "C" __global__ void q4e_glm_mla_attend(const float* __restrict__ q_abs,
     __syncthreads();
 
     for (int j = threadIdx.x; j < value; j += blockDim.x) {
-        const float* wrow = wh + (unsigned long long)(nope + j) * latent;
+        const float* wj = wv + j;
         float accumulator = 0.0f;
-        for (int c = 0; c < latent; ++c) {
-            accumulator = fmaf(wrow[c], mixed[c], accumulator);
+        int c = 0;
+        for (; c + Q4E_GLM_MLA_AHEAD <= latent; c += Q4E_GLM_MLA_AHEAD) {
+            float w[Q4E_GLM_MLA_AHEAD];
+#pragma unroll
+            for (int k = 0; k < Q4E_GLM_MLA_AHEAD; ++k) {
+                w[k] = wj[(unsigned long long)(c + k) * value];
+            }
+#pragma unroll
+            for (int k = 0; k < Q4E_GLM_MLA_AHEAD; ++k) {
+                accumulator = fmaf(w[k], mixed[c + k], accumulator);
+            }
+        }
+        for (; c < latent; ++c) {
+            accumulator = fmaf(wj[(unsigned long long)c * value], mixed[c], accumulator);
         }
         oh[j] = accumulator;
     }

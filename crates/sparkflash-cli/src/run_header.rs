@@ -15,22 +15,22 @@
 //! The forward run's header: the arm, the collective path and the NCCL transport environment,
 //! decided once at startup and recorded verbatim in the token envelope and the forward record (S2-a).
 //!
-//! Three rules, all enforced by [`RunHeader::decide`] before any device work:
+//! [`RunHeader::decide`] settles all three before any device work:
 //!
-//! 1. `SPARK_COMM_REDUCE` has NO default. Since the device arm became the default (S2), an unset
-//!    value would silently mean "the NCCL communicator" on one binary and "the TCP exchange" on the
-//!    previous one, so a run that does not name its collective path refuses to start.
-//! 2. The path must match the arm: the device arm's per-layer collectives are NCCL enqueues
-//!    (`nccl`), and the host arm's are the reference exchange (`tcp`) or the RoCE one-shot (`roce`).
-//!    A mismatch is a refusal, never a quiet reinterpretation, so the header always names the path
-//!    the run's collectives actually took.
+//! 1. An unset `SPARK_COMM_REDUCE` takes the arm's own path ([`ReducePath::default_for`]): `nccl`
+//!    on the device arm, the default arm, and `tcp` on the host arm. Every model's serve takes the
+//!    same default. The header records the switch as unset beside the path it decided.
+//! 2. A path that is set must match the arm: the device arm's per-layer collectives are NCCL
+//!    enqueues (`nccl`), and the host arm's are the reference exchange (`tcp`) or the RoCE one-shot
+//!    (`roce`). A mismatch is a refusal, never a quiet reinterpretation, so the header always names
+//!    the path the run's collectives actually took.
 //! 3. Every switch is read here, exactly once, and the raw values are recorded next to the decision
 //!    with the NCCL transport variables ([`sparkflash_comm::nccl::TRANSPORT_ENV`]). The NCCL build
 //!    itself is known only after the communicator opens, so the forward record adds it there.
 
 use crate::layer_device::{LAYER_DEVICE_ENV, LayerArm, decide_layer_arm};
 
-/// The collective-path switch. Required: [`ReducePath::parse`] refuses an unset value.
+/// The collective-path switch; unset takes the arm's own path ([`ReducePath::default_for`]).
 pub const COMM_REDUCE_ENV: &str = "SPARK_COMM_REDUCE";
 
 /// The per-layer evidence chain switch; recording forces the host arm.
@@ -54,17 +54,26 @@ pub enum ReducePath {
 }
 
 impl ReducePath {
+    /// The path an unset switch takes on `arm`: the device arm's collectives are NCCL enqueues,
+    /// and the host arm's reference exchange is TCP.
+    #[must_use]
+    pub fn default_for(arm: LayerArm) -> Self {
+        if arm.is_device() {
+            Self::Nccl
+        } else {
+            Self::Tcp
+        }
+    }
+
     /// Parses a `SPARK_COMM_REDUCE` value: `nccl`, `tcp`, or `roce` (also `rdma`), ASCII
-    /// case-insensitive.
+    /// case-insensitive. Unset or empty takes `default`.
     ///
     /// # Errors
-    /// Unset, empty, or any other spelling (surrounding whitespace included): the run refuses rather
-    /// than guessing which collective path was meant.
-    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+    /// Any other spelling (surrounding whitespace included): the run refuses rather than guessing
+    /// which collective path was meant.
+    pub fn parse(value: Option<&str>, default: Self) -> Result<Self, String> {
         let Some(raw) = value.filter(|raw| !raw.is_empty()) else {
-            return Err(format!(
-                "{COMM_REDUCE_ENV} is unset: a forward run names its collective path explicitly - nccl for the device arm (the default), tcp or roce for the host arm ({LAYER_DEVICE_ENV}=0)"
-            ));
+            return Ok(default);
         };
         match raw.to_ascii_lowercase().as_str() {
             "nccl" => Ok(Self::Nccl),
@@ -124,8 +133,8 @@ impl RunHeader {
     /// Decides the arm and the collective path from one environment lookup.
     ///
     /// # Errors
-    /// An arm switch that names neither arm, an unset or unknown `SPARK_COMM_REDUCE`, or a path that
-    /// does not match the arm. [`Self::observed_json`] records the same lookup for the refusal.
+    /// An arm switch that names neither arm, an unknown `SPARK_COMM_REDUCE`, or a path that does
+    /// not match the arm. [`Self::observed_json`] records the same lookup for the refusal.
     pub fn decide(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
         let switches = read(&DECISION_ENV, &lookup);
         let value = |name: &str| {
@@ -136,7 +145,7 @@ impl RunHeader {
         };
         let (arm, evidence) =
             decide_layer_arm(value(LAYER_DEVICE_ENV), value(FORWARD_EVIDENCE_ENV))?;
-        let reduce = ReducePath::parse(value(COMM_REDUCE_ENV))?;
+        let reduce = ReducePath::parse(value(COMM_REDUCE_ENV), ReducePath::default_for(arm))?;
         reduce.require_for_arm(arm)?;
         Ok(Self {
             arm,
@@ -241,22 +250,27 @@ mod tests {
     }
 
     #[test]
-    fn an_unset_or_unknown_reduce_path_refuses_and_names_the_switch() {
+    fn an_unset_reduce_path_takes_the_default_and_an_unknown_one_refuses() {
         for value in [None, Some("")] {
-            let error = ReducePath::parse(value).expect_err("unset refuses");
-            assert!(error.contains("SPARK_COMM_REDUCE is unset"), "{error}");
+            for default in [ReducePath::Nccl, ReducePath::Tcp] {
+                assert_eq!(ReducePath::parse(value, default), Ok(default));
+            }
         }
         for value in ["roc", " tcp", "nccl ", "ib", "0"] {
-            let error = ReducePath::parse(Some(value)).expect_err("a typo refuses");
+            let error =
+                ReducePath::parse(Some(value), ReducePath::Nccl).expect_err("a typo refuses");
             assert!(
                 error.contains("names no collective path"),
                 "{value:?}: {error}"
             );
         }
-        assert_eq!(ReducePath::parse(Some("NCCL")), Ok(ReducePath::Nccl));
-        assert_eq!(ReducePath::parse(Some("tcp")), Ok(ReducePath::Tcp));
-        assert_eq!(ReducePath::parse(Some("roce")), Ok(ReducePath::Roce));
-        assert_eq!(ReducePath::parse(Some("RDMA")), Ok(ReducePath::Roce));
+        let tcp = ReducePath::Tcp;
+        assert_eq!(ReducePath::parse(Some("NCCL"), tcp), Ok(ReducePath::Nccl));
+        assert_eq!(ReducePath::parse(Some("tcp"), ReducePath::Nccl), Ok(tcp));
+        assert_eq!(ReducePath::parse(Some("roce"), tcp), Ok(ReducePath::Roce));
+        assert_eq!(ReducePath::parse(Some("RDMA"), tcp), Ok(ReducePath::Roce));
+        assert_eq!(ReducePath::default_for(LayerArm::Device), ReducePath::Nccl);
+        assert_eq!(ReducePath::default_for(LayerArm::Host("test")), tcp);
     }
 
     #[test]
@@ -279,20 +293,26 @@ mod tests {
     }
 
     #[test]
-    fn the_default_run_is_the_device_arm_on_nccl_and_an_unset_path_refuses_it() {
-        let header = RunHeader::decide(env(&[("SPARK_COMM_REDUCE", "nccl")])).expect("decides");
-        assert_eq!(header.arm, LayerArm::Device);
-        assert_eq!(header.reduce, ReducePath::Nccl);
-        assert!(!header.evidence);
-        let error = RunHeader::decide(env(&[])).expect_err("unset refuses");
-        assert!(error.contains("SPARK_COMM_REDUCE is unset"), "{error}");
-        let host = RunHeader::decide(env(&[
-            ("SPARKFLASH_LAYER_DEVICE", "0"),
-            ("SPARK_COMM_REDUCE", "tcp"),
-        ]))
-        .expect("the host arm stays selectable");
-        assert!(!host.arm.is_device());
-        assert_eq!(host.reduce, ReducePath::Tcp);
+    fn the_default_run_is_the_device_arm_on_nccl_named_or_not() {
+        for pairs in [&[][..], &[("SPARK_COMM_REDUCE", "nccl")][..]] {
+            let header = RunHeader::decide(env(pairs)).expect("decides");
+            assert_eq!(header.arm, LayerArm::Device);
+            assert_eq!(header.reduce, ReducePath::Nccl);
+            assert!(!header.evidence);
+        }
+        let json = RunHeader::decide(env(&[])).expect("decides").to_json();
+        assert_eq!(json["reduce_path"], "nccl");
+        assert!(
+            json["switches"]["SPARK_COMM_REDUCE"].is_null(),
+            "the header says the path was the default"
+        );
+        for (value, path) in [(None, ReducePath::Tcp), (Some("roce"), ReducePath::Roce)] {
+            let mut pairs = vec![("SPARKFLASH_LAYER_DEVICE", "0")];
+            pairs.extend(value.map(|value| ("SPARK_COMM_REDUCE", value)));
+            let host = RunHeader::decide(env(&pairs)).expect("the host arm stays selectable");
+            assert!(!host.arm.is_device());
+            assert_eq!(host.reduce, path);
+        }
     }
 
     #[test]
@@ -309,6 +329,9 @@ mod tests {
         ]))
         .expect("evidence on tcp");
         assert!(header.evidence && !header.arm.is_device());
+        let header = RunHeader::decide(env(&[("SPARKFLASH_FORWARD_EVIDENCE", "1")]))
+            .expect("evidence alone takes the host arm's default");
+        assert_eq!(header.reduce, ReducePath::Tcp);
     }
 
     #[test]

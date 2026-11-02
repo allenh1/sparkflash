@@ -2383,17 +2383,22 @@ extern "C" __global__ void __launch_bounds__(256, 2) opt_rows_engram_wkv_s(
                               row_base, row_end, out_stride);
 }
 
-// [world][rows][chunk] (the split wkv's gathered slices) -> [rows][world * chunk]; 16-byte moves.
+// [world][rows] chunks of chunk_vecs at a src_pitch_vecs pitch (the split wkv's gathered slices,
+// or the first chunk_vecs of each rank's Engram rows) -> rows at a dst_pitch_vecs pitch, rank r's
+// chunk at r * chunk_vecs; 16-byte moves. The split wkv's pitches are chunk_vecs and
+// world * chunk_vecs.
 extern "C" __global__ void __launch_bounds__(256) opt_rows_rank_permute(
     const uint4 *__restrict__ src, uint4 *__restrict__ dst, const uint32_t rows,
-    const uint32_t chunk_vecs, const uint32_t world) {
+    const uint32_t chunk_vecs, const uint32_t world, const uint32_t src_pitch_vecs,
+    const uint32_t dst_pitch_vecs) {
     OPT_PDL_ENTRY();
     const uint32_t total = world * rows * chunk_vecs;
     for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
         const uint32_t v = i % chunk_vecs;
         const uint32_t y = (i / chunk_vecs) % rows;
         const uint32_t r = i / (chunk_vecs * rows);
-        dst[((uint64_t)y * world + r) * chunk_vecs + v] = src[i];
+        dst[(uint64_t)y * dst_pitch_vecs + r * chunk_vecs + v] =
+            src[((uint64_t)r * rows + y) * src_pitch_vecs + v];
     }
 }
 

@@ -26,9 +26,9 @@ sees; *aggregate* is all tokens over the wall time of the run, prefill included.
 - Up to 32 decoding sequences share one speculative step of up to 64 verify rows, drafted in
   passes of sixteen; the rows go to the likeliest drafts, by expected tokens per modelled
   millisecond. Sixteen code streams still verify 4.1 tokens per step, at a ~191 ms step.
-- Time to first token is ~0.2-0.5 s at one stream, ~1.4 s median at four code streams, ~2.4 s at
-  eight and ~3.8 s at sixteen, since every prompt arrives at once and prefills alongside the
-  others' decode.
+- Time to first token is ~0.2-0.5 s at one stream, ~1.2 s median at four code streams, ~2.0 s at
+  eight and ~3.5 s at sixteen, since every prompt arrives at once and prefills alongside the
+  others' decode, two or three short prompts a tick (~1.4, ~2.4 and ~4.5 s one a tick).
 - At 32 code streams: 10.9 tok/s per request and 185 tok/s aggregate, with a 12 s median time to
   first token while the 32 prompts prefill.
 
