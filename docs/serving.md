@@ -4,10 +4,10 @@
 model. [scripts/serve-four-node.sh](../scripts/serve-four-node.sh) builds and launches the four
 command lines over ssh; this page describes what it sets up and what the server offers.
 
-The lead node can do all of this from a browser: `scripts/setup.sh` builds the server and starts
-[the console](web.md), which installs it on the other nodes, downloads the model once and copies
-it over, works out the network settings, converts the weights and launches. The manual path below
-remains the reference for what those buttons run.
+The lead node can do all of this from a browser: `cargo run --bin sparkflash -- --web` starts
+[the console](web.md), which adopts and deploys the same binary, downloads the model once and
+copies it over, works out the network settings, converts the weights and launches. The manual path
+below remains the reference for what those buttons run.
 
 ## Prerequisites
 

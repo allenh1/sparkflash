@@ -25,6 +25,11 @@ cubin.
 `sparkflash serve --model zai-org/GLM-5.3-Flash` dispatches to the pack's arm. The arm is the
 TP=1 device backend behind the generic `sparkflash-serve` host driver:
 
+The web console configures the four-rank release by selecting **Model** `zai-org/GLM-5.3-Flash`
+under Advanced settings. It then downloads the checkpoint, converts one rank per Spark, and starts
+`scripts/serve-four-node.sh` with `--model glm5.3-flash-fp8`; GLM needs no external cubin
+directory because its kernels are compiled into the binary.
+
 * `Glm5NextDeviceBackend` (`src/serve.rs`) owns the device rank behind a mutex and opens one
   `DeviceSequence` a request. A rank's forward takes `&mut self` because a step writes the rank's
   scratch, so sessions serialize their steps; that is also the tensor-parallel requirement, where

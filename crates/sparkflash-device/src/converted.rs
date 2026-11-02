@@ -207,6 +207,9 @@ pub struct ConvertOptions {
     pub pad_moe_640: bool,
     /// Verify the written file digest after writing (default `true`).
     pub verify: bool,
+    /// Optional `(done, total, detail)` sink for a longer conversion. The CLI prints these as
+    /// `@progress` lines for the web job; library callers leave it unset.
+    pub progress: Option<fn(u64, u64, &str)>,
 }
 
 impl ConvertOptions {
@@ -220,6 +223,7 @@ impl ConvertOptions {
             ranks: Vec::new(),
             pad_moe_640: true,
             verify: true,
+            progress: None,
         }
     }
 
@@ -336,6 +340,7 @@ pub fn convert_checkpoint(options: &ConvertOptions) -> Result<ConvertedManifest,
             &options.output_dir,
             options.pad_moe_640,
             options.verify,
+            options.progress,
         )?;
         summaries.push(summary);
     }
@@ -355,7 +360,7 @@ pub fn convert_checkpoint(options: &ConvertOptions) -> Result<ConvertedManifest,
 }
 
 /// Converts a single rank into `output_dir/rank-{rank}-of-{world}.bin`.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn convert_rank_with_source(
     source: &SafeTensorsSource,
     entries: Vec<HeaderEntry>,
@@ -364,6 +369,7 @@ pub fn convert_rank_with_source(
     output_dir: &Path,
     pad_moe_640: bool,
     verify: bool,
+    progress: Option<fn(u64, u64, &str)>,
 ) -> Result<ConvertedRankSummary, String> {
     let started = Instant::now();
     let plan = ResidentPlan::plan(rank, world, entries)
@@ -521,6 +527,13 @@ pub fn convert_rank_with_source(
     // Stream each tensor's converted payload sequentially from `data_offset`.
     let mut writer = RankFileWriter::create(&out_path, data_offset)?;
 
+    if let Some(emit) = progress {
+        emit(
+            0,
+            total_payload_bytes,
+            &format!("rank {rank}/{world}: reading checkpoint"),
+        );
+    }
     let max_stored = raw_slots
         .iter()
         .filter_map(|slot| usize::try_from(slot.stored_bytes).ok())
@@ -528,6 +541,7 @@ pub fn convert_rank_with_source(
         .unwrap_or(0);
     let mut scratch = vec![0u8; max_stored];
     let mut tensor_cursor = 0usize;
+    let mut converted_bytes = 0u64;
 
     for (group_idx, (_group, indices)) in by_group.iter().enumerate() {
         let mut group_digest = FNV_OFFSET;
@@ -568,6 +582,20 @@ pub fn convert_rank_with_source(
             let slice_digest = writer.put(entry.slab_offset, payload)?;
             entry.digest = slice_digest;
             group_digest = fold_digest(group_digest, slice_digest);
+            converted_bytes = converted_bytes.saturating_add(payload.len() as u64);
+            // One update per tensor is cheap; the job manager consumes these lines instead of
+            // appending them to the bounded log.
+            if let Some(emit) = progress {
+                emit(
+                    converted_bytes.min(total_payload_bytes),
+                    total_payload_bytes,
+                    &format!(
+                        "rank {rank}/{world}: {}/{} tensors",
+                        tensor_cursor,
+                        raw_slots.len()
+                    ),
+                );
+            }
         }
         group_entries[group_idx].digest = group_digest;
     }
@@ -599,6 +627,13 @@ pub fn convert_rank_with_source(
         padded_data_bytes,
     )?;
 
+    if let Some(emit) = progress {
+        emit(
+            total_payload_bytes,
+            total_payload_bytes,
+            &format!("rank {rank}/{world}: verifying"),
+        );
+    }
     if verify {
         verify_converted_file(&out_path)?;
     }
@@ -863,6 +898,36 @@ mod tests {
         }
         let index_text = format!("{{\"metadata\":{{}},\"weight_map\":{{{weight_map}}}}}");
         fs::write(dir.join("model.safetensors.index.json"), index_text).expect("write index");
+    }
+
+    static PROGRESS_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static PROGRESS_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn record_progress(done: u64, _total: u64, _detail: &str) {
+        PROGRESS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        PROGRESS_DONE.store(done, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn conversion_reports_progress_and_finishes_at_the_total() {
+        PROGRESS_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        PROGRESS_DONE.store(0, std::sync::atomic::Ordering::Relaxed);
+        let ckpt_dir = tempfile::tempdir().expect("ckpt_dir");
+        let out_dir = tempfile::tempdir().expect("out_dir");
+        write_synthetic_checkpoint(ckpt_dir.path());
+        let mut options = ConvertOptions::new(ckpt_dir.path(), out_dir.path());
+        options.ranks = vec![0];
+        options.progress = Some(record_progress);
+        let manifest = convert_checkpoint(&options).expect("convert_checkpoint");
+        assert_eq!(manifest.ranks.len(), 1);
+        assert!(
+            PROGRESS_CALLS.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+            "expected at least the start and end reports"
+        );
+        assert_eq!(
+            PROGRESS_DONE.load(std::sync::atomic::Ordering::Relaxed),
+            manifest.ranks[0].payload_bytes
+        );
     }
 
     #[test]

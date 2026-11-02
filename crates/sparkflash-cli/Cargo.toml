@@ -21,11 +21,14 @@ authors.workspace = true
 description = "sparkflash command line interface"
 
 [features]
-default = []
+# `cargo run --bin sparkflash -- --web` is the documented one-command setup, and the binary it
+# builds is also the one the console deploys. Building the serving path by default means that
+# command produces a server that can actually launch, instead of a web-only binary that rejects
+# `--tp4-rank`. CPU-only CI builds still work; the device session is only opened on a CUDA host.
+default = ["cuda", "tp4-serve"]
 # The Phase-1 TP=4 serving path: one process per rank, rank 0 owns the HTTP surface and the
-# control channel. Off by default so main and the existing reference server are unchanged until
-# the rank adapter lands; build with --features tp4-serve to compile the serve-side types and
-# their loopback tests.
+# control channel. Build with --features tp4-serve to compile the serve-side types and their
+# loopback tests.
 tp4-serve = []
 # "cuda" forwards to sparkflash-device's cfg gate for the M2 real session (the dlopen driver and
 # the pinned router cubin). The default binary has no device session path; a cuda build still links

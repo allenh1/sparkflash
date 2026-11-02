@@ -705,6 +705,11 @@ input:user-invalid { border-color: rgba(208, 59, 59, 0.6); }
   background: var(--input);
 }
 
+.convert-hosts { display: grid; gap: 10px; margin-top: 14px; }
+.convert-host { padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); }
+.convert-host-head { display: flex; justify-content: space-between; gap: 12px; color: var(--text-2); font-size: 13px; }
+.convert-host-head .mono { color: var(--text-2); font-size: 12px; }
+.convert-host .progress { margin-top: 8px; }
 .progress { margin-top: 14px; }
 .progress-track { height: 8px; border-radius: 4px; background: var(--surface-3); overflow: hidden; }
 .progress-fill { height: 100%; border-radius: 4px; background: var(--accent); transition: width 600ms ease-out; }

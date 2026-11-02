@@ -232,7 +232,7 @@ limitations under the License.
           <div class="guide-head">
             <span class="guide-num" aria-hidden="true">3</span>
             <div class="guide-title">
-              <h2>Install on the other Sparks</h2>
+              <h2>Deploy the server</h2>
               <p class="guide-summary" id="g-software-summary">Copy the server program from this Spark to the others.</p>
             </div>
             <span class="tag" id="g-software-tag"></span>
@@ -308,13 +308,13 @@ limitations under the License.
                 </div>
                 <label class="field">
                   <span>Architecture</span>
-                  <select id="model-weights"></select>
-                  <small>The weight format the engine loads.</small>
+                  <select id="model-weights" disabled></select>
+                  <small>Set from the selected model; not a separate choice.</small>
                 </label>
                 <label class="field">
                   <span>Engine</span>
-                  <select id="engine-kind"></select>
-                  <small>V4.1 runs TP=4 across four Sparks; Qwen3.8 runs TP=1 on one.</small>
+                  <select id="engine-kind" disabled></select>
+                  <small>Set from the selected model: V4.1 and GLM-5.3 are TP=4, Qwen3.8 is TP=1.</small>
                 </label>
                 <label class="field">
                   <span>Max context <em>tokens</em></span>
@@ -367,7 +367,7 @@ limitations under the License.
                 <label class="field span-2"><span>Checkpoint <em>empty uses the model's snapshot in the Hugging Face cache</em></span><input id="checkpoint" type="text"></label>
                 <label class="field span-2"><span>Hugging Face cache <em>empty uses HF_HUB_CACHE or ~/.cache/huggingface/hub</em></span><input id="hub-cache" type="text"></label>
                 <label class="field span-2"><span>Tokenizer <em>empty derives it from the checkpoint</em></span><input id="tokenizer" type="text"></label>
-                <label class="field"><span>Converted weights</span><input id="converted-dir" type="text"></label>
+                <label class="field"><span>Converted weights <em>root; a model-specific child is added</em></span><input id="converted-dir" type="text"></label>
                 <label class="field"><span>Kernel cubins</span><input id="cubins" type="text"></label>
                 <label class="field"><span>NCCL library directory</span><input id="nccl-lib" type="text" placeholder="system NCCL when empty"></label>
                 <label class="field"><span>Remote log root</span><input id="log-root" type="text"></label>

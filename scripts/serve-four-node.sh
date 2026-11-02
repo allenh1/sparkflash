@@ -34,11 +34,14 @@
 #   SPARKFLASH_CHECKPOINT  sharded checkpoint directory, same path on every node
 #   SPARKFLASH_TOKENIZER   tokenizer.json path, same path on every node
 # Device path (what makes it fast; leave SPARKFLASH_CUBINS unset for the CPU reference engine):
-#   SPARKFLASH_CUBINS      cubin directory on every node (scripts/build-cubins.sh): --tp4-device
+#   SPARKFLASH_CUBINS      V4.1 cubin directory on every node (scripts/build-cubins.sh): --tp4-device
 #   SPARK_PEERS            the four RoCE addresses the collectives use, in rank order
 #                          (default: SPARK_NODES)
-#   SPARKFLASH_NCCL_LIB    directory holding libnccl.so.2 on every node (prepended to LD_LIBRARY_PATH)
+#   SPARKFLASH_NCCL_LIB    directory holding libnccl.so.2 on every node (prepended to LD_LIBRARY_PATH);
+#                          used for V4.1 and for a packed model such as GLM that always runs on device
 #   SPARKFLASH_CONVERTED_DIR  directory of `sparkflash convert` rank files on every node (fast boot)
+#   SPARKFLASH_MODEL       packed model selector, e.g. glm5.3-flash-fp8: adds --model
+#   SPARKFLASH_CONTEXT     packed model context window: adds --context
 #   NCCL_*                 every NCCL_ variable set here is passed to every rank (NCCL_IB_HCA,
 #                          NCCL_SOCKET_IFNAME, NCCL_IB_GID_INDEX, ...)
 # Options:
@@ -71,6 +74,8 @@ SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=8}"
 NODES_RAW="${SPARK_NODES:-}"
 CHECKPOINT="${SPARKFLASH_CHECKPOINT:-}"
 TOKENIZER="${SPARKFLASH_TOKENIZER:-}"
+MODEL="${SPARKFLASH_MODEL:-}"
+CONTEXT="${SPARKFLASH_CONTEXT:-}"
 BIN="${SPARKFLASH_BIN:-$REPO_ROOT/target/release/sparkflash}"
 HTTP_BIND="${SPARKFLASH_HTTP_BIND:-0.0.0.0:8000}"
 BASE_PORT="${SPARKFLASH_TP4_BASE_PORT:-29601}"
@@ -120,15 +125,19 @@ rank_env() {
     # The build identifier the model card reports, so a served card names the binary that
     # answered and not just the package version (DECISIONS.md D61).
     [ -n "${SPARKFLASH_BUILD_ID:-}" ] && printf ' SPARKFLASH_BUILD_ID=%s' "$SPARKFLASH_BUILD_ID"
-    if [ -n "$CUBINS" ]; then
-        printf ' SPARK_COMM_REDUCE=nccl SPARKFLASH_LEAN_HEAD=1'
+    # V4.1's external kernels are the only path that turns on the lean head; a packed model
+    # (GLM) carries its kernels in the binary but still needs the NCCL library and fabric values.
+    [ -n "$CUBINS" ] && printf ' SPARK_COMM_REDUCE=nccl SPARKFLASH_LEAN_HEAD=1'
+    if [ -n "$CUBINS" ] || [ -n "$MODEL" ]; then
         [ -n "$NCCL_LIB" ] && printf ' LD_LIBRARY_PATH=%s${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}' "$NCCL_LIB"
         local var
         for var in $(compgen -e | grep '^NCCL_' || true); do
             printf ' %s=%s' "$var" "${!var}"
         done
     fi
-    [ -n "$CONVERTED_DIR" ] && printf ' SPARKFLASH_CONVERTED_DIR=%s' "$CONVERTED_DIR"
+    # V4.1 reads the generic name; GLM reads its own. Setting both lets the same plan start
+    # either model without the launcher having to guess which arm will read it.
+    [ -n "$CONVERTED_DIR" ] && printf ' SPARKFLASH_CONVERTED_DIR=%s SPARKFLASH_GLM_CONVERTED_DIR=%s' "$CONVERTED_DIR" "$CONVERTED_DIR"
     # The scheduler's knobs: every rank runs the same ticks, so a prefill or batching setting
     # that only a local rank 0 inherited would split the group's collectives. Every rank reads
     # its own Engram tables, so their knobs go to every rank too.
@@ -145,6 +154,9 @@ rank_env() {
 rank_command() {
     local rank="$1"
     printf '%s serve --checkpoint %s --tokenizer %s' "$BIN" "$CHECKPOINT" "$TOKENIZER"
+    # The V4.1 engine is the default; a packed four-rank arm (GLM) is selected by --model.
+    [ -n "$MODEL" ] && printf ' --model %s' "$MODEL"
+    [ -n "$CONTEXT" ] && printf ' --context %s' "$CONTEXT"
     printf ' --tp4-rank %s --tp4-world-size 4 --tp4-peers %s' "$rank" "$PEERS"
     printf ' --tp4-base-port %s --tp4-control-port %s' "$BASE_PORT" "$CONTROL_PORT"
     [ -n "$CUBINS" ] && printf ' --tp4-device %s' "$CUBINS"
@@ -211,6 +223,13 @@ case "$MODE" in
         ;;
     launch)
         [ -x "$BIN" ] || printf 'serve-four-node: local binary %s is not executable; the remote nodes must have it staged\n' "$BIN" >&2
+        # A binary built without the serving feature accepts no --tp4-rank and exits in the
+        # background, which used to look like a successful launch. Refuse before starting.
+        help_text=$("$BIN" serve --help 2>&1 || true)
+        case "$help_text" in
+            *--tp4-rank*) ;;
+            *) die "$BIN was built without the tp4-serve feature" ;;
+        esac
         local_plan="$LOG_ROOT/$RUN_ID/local-commands.txt"
         mkdir -p "$LOG_ROOT/$RUN_ID"
         print_plan > "$local_plan"
@@ -218,6 +237,23 @@ case "$MODE" in
             remote "$rank" "$(start_line "$rank") echo \$!" \
                 | sed "s/^/rank $rank pid /"
         done
+        # The ranks are detached, so the launcher must check that the processes survived their
+        # first second. Otherwise an argument or startup error is reported as a successful launch.
+        sleep 2
+        failed=0
+        for rank in 0 1 2 3; do
+            if ! remote "$rank" "pgrep -f '[t]p4-rank $rank ' >/dev/null" >/dev/null 2>&1; then
+                printf 'serve-four-node: rank %s exited immediately\n' "$rank" >&2
+                remote "$rank" "tail -n 25 '$LOG_ROOT/$RUN_ID/rank$rank.log'" >&2 || true
+                failed=1
+            fi
+        done
+        if [ "$failed" != 0 ]; then
+            for rank in 0 1 2 3; do
+                remote "$rank" "pkill -TERM -f '[s]parkflash serve --checkpoint .* --tp4-rank $rank ' >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+            done
+            die "one or more ranks failed to start"
+        fi
         printf 'serve-four-node: launched; commands in %s\n' "$local_plan"
         printf 'serve-four-node: rank 0 health endpoint http://%s/health\n' "$HTTP_BIND"
         ;;

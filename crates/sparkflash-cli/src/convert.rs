@@ -29,6 +29,7 @@
 //! ([sparkflash_model_qwen4_exp::convert]). `--inspect` tells the three apart by the model a
 //! file's index names.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -48,6 +49,15 @@ use sparkflash_model_qwen4_exp::convert::{
     CONVERTED_MODEL as QWEN_CONVERTED_MODEL, convert_rank as qwen_convert_rank,
     read_index as qwen_read_index, verify_converted as qwen_verify_converted,
 };
+
+/// Prints one job-progress line for the web control plane and flushes it so the reader sees it
+/// while the conversion is still running.
+fn emit_progress(done: u64, total: u64, detail: &str) {
+    let line = serde_json::json!({"done": done, "total": total, "detail": detail});
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "@progress {line}");
+    let _ = stdout.flush();
+}
 
 /// Usage string for `sparkflash convert`.
 pub const USAGE: &str = "sparkflash convert --checkpoint DIR [--output-dir DIR] [--tp-world-size 4] [--tp-rank R | --ranks 0,1,2,3] [--no-pad-moe-640] [--no-verify] | sparkflash convert --inspect FILE [--verify-weights]";
@@ -165,6 +175,7 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
         ranks,
         pad_moe_640,
         verify,
+        progress: Some(emit_progress),
     };
     let manifest = convert_checkpoint(&options)?;
     let mut lines = Vec::new();

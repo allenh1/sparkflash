@@ -33,15 +33,15 @@ use serde::{Deserialize, Serialize};
 
 /// The model ids this build can serve.
 ///
-/// "Model" means the weights, not the runtime. Adding a second checkpoint is a deliberate
+/// "Model" means the weights, not the runtime. Adding another checkpoint is a deliberate
 /// change here, plus the conversion and engine code that knows how to read it.
-pub const SUPPORTED_WEIGHTS: &[&str] = &[DEFAULT_WEIGHTS_ID, QWEN_WEIGHTS_ID];
+pub const SUPPORTED_WEIGHTS: &[&str] = &[DEFAULT_WEIGHTS_ID, QWEN_WEIGHTS_ID, GLM_WEIGHTS_ID];
 
 /// The engines this build can run the weights with.
 ///
-/// V4.1-Flash is the tensor-parallel-4 device engine. Qwen3.8-Flash-Next is the TP=1 pack
-/// engine, which serves directly from the Hugging Face checkpoint and needs no conversion.
-pub const SUPPORTED_ENGINES: &[&str] = &[DEFAULT_ENGINE_ID, QWEN_ENGINE_ID];
+/// V4.1-Flash and GLM-5.3-Flash are tensor-parallel-4 packs. Qwen3.8-Flash-Next is the TP=1
+/// pack engine, which serves directly from the Hugging Face checkpoint and needs no conversion.
+pub const SUPPORTED_ENGINES: &[&str] = &[DEFAULT_ENGINE_ID, QWEN_ENGINE_ID, GLM_ENGINE_ID];
 
 /// The control-plane weight selector for V4.1-Flash.
 pub const DEFAULT_WEIGHTS_ID: &str = "deepseek-v4.1-flash";
@@ -61,13 +61,25 @@ pub const QWEN_ENGINE_ID: &str = "qwen4-exp";
 /// The canonical Hugging Face id of the Qwen3.8-Flash-Next checkpoint.
 pub const QWEN_MODEL_ID: &str = "nvidia/Qwen3.8-Flash-Next-NVFP4";
 
+/// The control-plane weight selector for the GLM-5.3-Flash FP8 checkpoint.
+pub const GLM_WEIGHTS_ID: &str = "glm5.3-flash-fp8";
+
+/// The control-plane engine selector for the TP=4 GLM-5.3-Flash pack.
+pub const GLM_ENGINE_ID: &str = "glm5-next";
+
+/// The canonical Hugging Face id of the GLM-5.3-Flash checkpoint.
+pub const GLM_MODEL_ID: &str = "zai-org/GLM-5.3-Flash";
+
 /// The maximum context window of V4.1-Flash.
 pub const MODEL_CONTEXT_TOKENS: usize = 1_048_576;
 
 /// The maximum context window of Qwen3.8-Flash-Next.
 pub const QWEN_CONTEXT_TOKENS: usize = 262_144;
 
-/// The tensor-parallel width of the V4.1 cluster.
+/// The maximum context window of GLM-5.3-Flash.
+pub const GLM_CONTEXT_TOKENS: usize = 1_048_576;
+
+/// The tensor-parallel width of the V4.1 and GLM clusters.
 pub const WORLD_SIZE: usize = 4;
 
 /// The tensor-parallel width of a TP=1 pack such as Qwen3.8-Flash-Next.
@@ -78,6 +90,90 @@ pub const MAX_CONCURRENCY: usize = 32;
 
 /// The default config path, relative to the lead node's working directory.
 pub const DEFAULT_CONFIG_PATH: &str = "sparkflash.toml";
+
+/// One checkpoint family this build knows how to run, and the selector pair that runs it.
+///
+/// The Hugging Face cache is the source of model *instances*; this table is the source of model
+/// *families*. A cached checkpoint is selectable only when its `config.json` names one of these
+/// `model_type`s, and choosing it fixes `model.weights` and `engine.kind` instead of leaving the
+/// operator to pair them by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelProfile {
+    /// The `model_type` the checkpoint's `config.json` carries.
+    pub model_type: &'static str,
+    /// The control-plane weight selector.
+    pub weights: &'static str,
+    /// The engine selector that runs those weights.
+    pub engine: &'static str,
+    /// The canonical Hugging Face id, used for the option shown before the model is downloaded.
+    pub id: &'static str,
+    /// The model's context ceiling.
+    pub context_tokens: usize,
+    /// Whether launch needs a per-rank converted file.
+    pub requires_conversion: bool,
+    /// Whether launch loads the external cubin directory built by scripts/build-cubins.sh.
+    pub requires_cubins: bool,
+}
+
+/// Every model family the web control plane can configure.
+pub const MODEL_PROFILES: &[ModelProfile] = &[
+    ModelProfile {
+        model_type: "deepseek_v41",
+        weights: DEFAULT_WEIGHTS_ID,
+        engine: DEFAULT_ENGINE_ID,
+        id: DEFAULT_MODEL_ID,
+        context_tokens: MODEL_CONTEXT_TOKENS,
+        requires_conversion: true,
+        requires_cubins: true,
+    },
+    ModelProfile {
+        model_type: "qwen4_exp",
+        weights: QWEN_WEIGHTS_ID,
+        engine: QWEN_ENGINE_ID,
+        id: QWEN_MODEL_ID,
+        context_tokens: QWEN_CONTEXT_TOKENS,
+        requires_conversion: false,
+        requires_cubins: false,
+    },
+    ModelProfile {
+        model_type: "glm5_next",
+        weights: GLM_WEIGHTS_ID,
+        engine: GLM_ENGINE_ID,
+        id: GLM_MODEL_ID,
+        context_tokens: GLM_CONTEXT_TOKENS,
+        requires_conversion: true,
+        requires_cubins: false,
+    },
+];
+
+/// The profile for a checkpoint's `config.json` `model_type`, including the text-only Qwen
+/// alias the pack also releases.
+#[must_use]
+pub fn profile_for_model_type(model_type: &str) -> Option<&'static ModelProfile> {
+    let wanted = match model_type {
+        "qwen4_exp" | "qwen4_exp_text" => "qwen4_exp",
+        other => other,
+    };
+    MODEL_PROFILES
+        .iter()
+        .find(|profile| profile.model_type == wanted)
+}
+
+/// The profile for a control-plane weight selector.
+#[must_use]
+pub fn profile_for_weights(weights: &str) -> Option<&'static ModelProfile> {
+    MODEL_PROFILES
+        .iter()
+        .find(|profile| profile.weights.eq_ignore_ascii_case(weights.trim()))
+}
+
+/// The profile for a canonical released Hugging Face id.
+#[must_use]
+pub fn profile_for_id(id: &str) -> Option<&'static ModelProfile> {
+    MODEL_PROFILES
+        .iter()
+        .find(|profile| profile.id.eq_ignore_ascii_case(id.trim()))
+}
 
 /// A configuration that failed to parse or validate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +238,8 @@ pub struct ModelConfig {
     pub hub_cache: String,
     /// The `tokenizer.json` path. Empty means `<checkpoint>/tokenizer.json`.
     pub tokenizer: String,
-    /// The directory of per-rank converted files, the same path on every node.
+    /// The root for per-rank converted files, the same path on every node. The console adds a
+    /// checkpoint-specific child (repository and resolved-path hash) under it.
     pub converted_dir: String,
     /// The cubin directory built by `scripts/build-cubins.sh`.
     pub cubins: String,
@@ -429,11 +526,8 @@ impl SparkConfig {
                 SUPPORTED_ENGINES.join(", ")
             )));
         }
-        let expected_engine = if self.is_qwen() {
-            QWEN_ENGINE_ID
-        } else {
-            DEFAULT_ENGINE_ID
-        };
+        let expected_engine = profile_for_weights(&self.model.weights)
+            .map_or(DEFAULT_ENGINE_ID, |profile| profile.engine);
         if self.engine.kind != expected_engine {
             return Err(ConfigError::new(format!(
                 "model.weights {:?} runs with engine.kind {expected_engine:?}, not {:?}",
@@ -450,6 +544,7 @@ impl SparkConfig {
                 self.model.id
             )));
         }
+        self.validate_model_family()?;
         if self.model.converted_dir.trim().is_empty() {
             return Err(ConfigError::new("model.converted_dir must not be empty"));
         }
@@ -607,6 +702,108 @@ impl SparkConfig {
         Ok(())
     }
 
+    /// Refuses a model this build cannot run before anything is downloaded or converted.
+    ///
+    /// The cache is authoritative for a cached checkpoint: its `config.json` `model_type` must
+    /// be one of [`MODEL_PROFILES`], and the saved weight and engine selectors must be the pair
+    /// that runs it. An explicit checkpoint is checked the same way when it carries a
+    /// `config.json`. A model that is neither cached nor an explicit directory must be one of
+    /// the canonical releases, so the download step cannot be pointed at an arbitrary repository.
+    fn validate_model_family(&self) -> Result<(), ConfigError> {
+        let model_type = if !self.model.checkpoint.trim().is_empty() {
+            let path = self.node_path(&self.model.checkpoint).join("config.json");
+            match std::fs::read_to_string(&path) {
+                Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|config| config["model_type"].as_str().map(str::to_owned)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(ConfigError::new(format!(
+                        "cannot read the checkpoint configuration {}: {error}",
+                        path.display()
+                    )));
+                }
+            }
+        } else if let Some(cached) = self
+            .hub_cache_dir()
+            .as_deref()
+            .and_then(|cache| crate::hf::lookup(cache, &self.model.id))
+        {
+            if cached.model_type.is_none() {
+                // A download writes the large shards before config.json. A canonical id still
+                // identifies the family, so selecting it while it downloads is valid.
+                if let Some(profile) = profile_for_id(&self.model.id) {
+                    if self.model.weights != profile.weights || self.engine.kind != profile.engine {
+                        return Err(ConfigError::new(format!(
+                            "{} runs with model.weights {:?} and engine.kind {:?}, not {:?}/{:?}",
+                            self.model.id,
+                            profile.weights,
+                            profile.engine,
+                            self.model.weights,
+                            self.engine.kind
+                        )));
+                    }
+                    return Ok(());
+                }
+                if !cached.complete {
+                    // The repository is still downloading and is not a canonical id. There is no
+                    // model_type to check yet; the download step remains the next action.
+                    return Ok(());
+                }
+                return Err(ConfigError::new(format!(
+                    "the cached checkpoint {} has no config.json model_type, so this build cannot \
+                     tell whether it can run it",
+                    self.model.id
+                )));
+            }
+            cached.model_type
+        } else {
+            let profile = profile_for_id(&self.model.id).ok_or_else(|| {
+                ConfigError::new(format!(
+                    "model.id {:?} is not in the Hugging Face cache and is not a release this build \
+                     knows; download a supported model or select one already in the cache",
+                    self.model.id
+                ))
+            })?;
+            if self.model.weights != profile.weights || self.engine.kind != profile.engine {
+                return Err(ConfigError::new(format!(
+                    "{} runs with model.weights {:?} and engine.kind {:?}, not {:?}/{:?}",
+                    self.model.id,
+                    profile.weights,
+                    profile.engine,
+                    self.model.weights,
+                    self.engine.kind
+                )));
+            }
+            return Ok(());
+        };
+
+        let Some(model_type) = model_type else {
+            // An explicit checkpoint without a config.json is a fixture-style directory. Its
+            // weights selector is the only evidence available, so keep the existing validation.
+            return Ok(());
+        };
+        let profile = profile_for_model_type(&model_type).ok_or_else(|| {
+            ConfigError::new(format!(
+                "the checkpoint's model_type {model_type:?} is not one this build can run \
+                 (supported: {})",
+                MODEL_PROFILES
+                    .iter()
+                    .map(|profile| profile.model_type)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+        if self.model.weights != profile.weights || self.engine.kind != profile.engine {
+            return Err(ConfigError::new(format!(
+                "the checkpoint's model_type {model_type:?} runs with model.weights {:?} and \
+                 engine.kind {:?}, not {:?}/{:?}",
+                profile.weights, profile.engine, self.model.weights, self.engine.kind
+            )));
+        }
+        Ok(())
+    }
+
     /// Saves the configuration atomically: write a sibling temp file, then rename.
     ///
     /// # Errors
@@ -630,10 +827,81 @@ impl SparkConfig {
         })
     }
 
+    /// Point `paths.binary` at the executable that is running this control plane when the
+    /// configured path does not exist.
+    ///
+    /// This is what makes `cargo run --bin sparkflash -- --web` self-contained: the debug (or
+    /// release) binary cargo just built is the one the Install step copies, instead of a
+    /// `target/release/sparkflash` that was never built. An explicitly built path that exists is
+    /// left alone.
+    pub fn adopt_running_binary(&mut self, executable: &Path) -> bool {
+        if self.binary_path().is_file() || !executable.is_file() {
+            return false;
+        }
+        self.paths.binary = executable.display().to_string();
+        if let Some(root) = executable
+            .ancestors()
+            .skip(1)
+            .find(|directory| directory.join("Cargo.toml").is_file())
+        {
+            self.paths.repo_root = root.display().to_string();
+        }
+        true
+    }
+
+    /// If the selected model is not a complete cache snapshot, switch to the best complete cached
+    /// model in the same weight family.
+    ///
+    /// A fresh checkout keeps the canonical id in its defaults; on a Spark whose cache already
+    /// holds `...-1017`, that would make the Setup page offer a 510 GB download that is already
+    /// on disk. Returns the selected entry when it changed the configuration.
+    pub fn prefer_cached_model(&mut self) -> Option<crate::hf::CachedModel> {
+        let cache = self.hub_cache_dir()?;
+        if crate::hf::lookup(&cache, &self.model.id).is_some_and(|model| model.complete) {
+            return None;
+        }
+        let profile = profile_for_weights(&self.model.weights)?;
+        let models = crate::hf::list(&cache).ok()?;
+        let preferred =
+            crate::hf::preferred_cached(&models, &self.model.weights, profile.id)?.clone();
+        if preferred.id == self.model.id {
+            return None;
+        }
+        self.model.id = preferred.id.clone();
+        if let Some(weights) = preferred.weights.as_deref() {
+            self.model.weights = weights.to_owned();
+        }
+        if let Some(engine) = preferred.engine.as_deref() {
+            self.engine.kind = engine.to_owned();
+        }
+        if let Some(context) = preferred.context_tokens {
+            self.runtime.max_context_tokens = self.runtime.max_context_tokens.min(context);
+        }
+        self.model.checkpoint.clear();
+        self.model.tokenizer.clear();
+        Some(preferred)
+    }
+
     /// Whether the selected weights are the TP=1 Qwen pack.
     #[must_use]
     pub fn is_qwen(&self) -> bool {
         self.model.weights == QWEN_WEIGHTS_ID
+    }
+
+    /// Whether the selected weights are the TP=4 GLM-5.3-Flash pack.
+    #[must_use]
+    pub fn is_glm(&self) -> bool {
+        self.model.weights == GLM_WEIGHTS_ID
+    }
+
+    /// The model selector a packed four-rank launcher passes as its --model argument.
+    ///
+    /// The V4.1 engine is the launcher's default and takes no --model; a packed model names its
+    /// stable weight selector so a fine-tune of the same family still dispatches to its arm.
+    #[must_use]
+    pub fn packed_model(&self) -> Option<&'static str> {
+        let profile = profile_for_weights(&self.model.weights)?;
+        (profile.weights != DEFAULT_WEIGHTS_ID).then_some(profile.weights)
     }
 
     /// Whether this configuration runs on one node instead of the four-node cluster.
@@ -651,26 +919,34 @@ impl SparkConfig {
     /// The context ceiling of the selected weights.
     #[must_use]
     pub fn max_context_tokens(&self) -> usize {
-        if self.is_qwen() {
-            QWEN_CONTEXT_TOKENS
-        } else {
-            MODEL_CONTEXT_TOKENS
-        }
+        profile_for_weights(&self.model.weights)
+            .map_or(MODEL_CONTEXT_TOKENS, |profile| profile.context_tokens)
     }
 
     /// Whether launch must run the one-time per-rank conversion first.
     ///
-    /// The Qwen pack loads the released checkpoint directly; only the V4.1 engine has a separate
+    /// The Qwen pack loads the released checkpoint directly; V4.1 and GLM have a separate
     /// converted layout.
     #[must_use]
     pub fn requires_conversion(&self) -> bool {
-        !self.is_qwen()
+        profile_for_weights(&self.model.weights).is_none_or(|profile| profile.requires_conversion)
     }
 
     /// Whether the engine needs the external cubin directory.
     #[must_use]
     pub fn requires_cubins(&self) -> bool {
-        self.engine.device && self.requires_conversion()
+        self.engine.device
+            && profile_for_weights(&self.model.weights)
+                .is_none_or(|profile| profile.requires_cubins)
+    }
+
+    /// Whether the node check should require a conversion manifest beside this rank's file.
+    ///
+    /// The GLM converter writes one rank file and no manifest; its rank file is the completion
+    /// marker. V4.1 writes a manifest after each rank file.
+    #[must_use]
+    pub fn requires_conversion_manifest(&self) -> bool {
+        !self.is_glm()
     }
 
     /// The single-node launcher script, next to the four-node one.
@@ -769,10 +1045,45 @@ impl SparkConfig {
         self.node_path(&self.stats.persist_path)
     }
 
-    /// The converted weights directory.
+    /// The converted weights directory for the selected checkpoint.
+    ///
+    /// `model.converted_dir` is a root, not the directory itself: each checkpoint gets its own
+    /// child named after the repository and a hash of the resolved checkpoint path. Swapping
+    /// models therefore cannot silently reuse another checkpoint's rank files; the new path is
+    /// empty, and the node check reports the conversion as missing until it runs again.
     #[must_use]
     pub fn converted_path(&self) -> PathBuf {
         self.node_path(&self.model.converted_dir)
+            .join(self.conversion_scope())
+    }
+
+    /// The per-checkpoint child under `model.converted_dir`.
+    #[must_use]
+    pub fn conversion_scope(&self) -> String {
+        let mut scope = if crate::hf::is_model_id(&self.model.id) {
+            crate::hf::repo_folder(&self.model.id)
+        } else {
+            sanitize_scope(&self.model.id)
+        };
+        if scope.is_empty() {
+            scope.push_str("model");
+        }
+        // Always identify the resolved checkpoint path, not the spelling in the file. A command
+        // built from `resolved()` has `model.checkpoint` filled in, while the node check uses
+        // the unresolved config; both must name the same directory. Hashing the resolved path
+        // also gives a re-download or a same-basename explicit checkpoint its own directory.
+        if let Ok(checkpoint) = self.resolve_checkpoint() {
+            let marker = short_hash(&checkpoint.to_string_lossy());
+            let suffix = format!("--{marker}");
+            if !marker.is_empty()
+                && !scope
+                    .to_ascii_lowercase()
+                    .ends_with(&suffix.to_ascii_lowercase())
+            {
+                scope.push_str(&suffix);
+            }
+        }
+        scope
     }
 
     /// The kernel cubin directory.
@@ -850,6 +1161,15 @@ impl SparkConfig {
             "SPARKFLASH_LANES".to_owned(),
             self.runtime.max_concurrency.to_string(),
         );
+        // A packed four-rank model is selected by --model and sizes its window with --context;
+        // the V4.1 engine is the launcher's default and reads SPARK_MAX_SEQ_LEN instead.
+        if let Some(model) = self.packed_model() {
+            env.insert("SPARKFLASH_MODEL".to_owned(), model.to_owned());
+            env.insert(
+                "SPARKFLASH_CONTEXT".to_owned(),
+                self.runtime.max_context_tokens.to_string(),
+            );
+        }
         if !self.cluster.ssh_user.trim().is_empty() {
             env.insert("SSH_USER".to_owned(), self.cluster.ssh_user.clone());
         }
@@ -953,6 +1273,30 @@ impl SparkConfig {
             format!("{}@{host}", self.cluster.ssh_user)
         }
     }
+}
+
+/// Make a model id or directory name safe as one path component.
+/// A stable short digest for a path used as one converted-weights directory component.
+fn short_hash(value: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn sanitize_scope(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut last_was_dash = false;
+    for character in value.trim().chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+            result.push(character);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            result.push('-');
+            last_was_dash = true;
+        }
+    }
+    result.trim_matches(['-', '.']).to_owned()
 }
 
 /// `path` with a leading `~/` (or a bare `~`) replaced by `$HOME`.
@@ -1110,6 +1454,37 @@ mod tests {
     }
 
     #[test]
+    fn a_glm_plan_validates_and_uses_the_packed_ranks() {
+        assert_eq!(
+            profile_for_model_type("glm5_next").map(|profile| profile.weights),
+            Some(GLM_WEIGHTS_ID)
+        );
+        let mut config = SparkConfig::default();
+        config.model.weights = GLM_WEIGHTS_ID.to_owned();
+        config.model.id = GLM_MODEL_ID.to_owned();
+        config.model.checkpoint = "/data/GLM-5.3-Flash".to_owned();
+        config.model.cubins.clear();
+        config.engine.kind = GLM_ENGINE_ID.to_owned();
+        config.runtime.max_context_tokens = GLM_CONTEXT_TOKENS;
+        config
+            .validate()
+            .expect("the GLM four-Spark plan validates");
+        assert!(config.is_glm());
+        assert!(!config.is_qwen());
+        assert!(!config.is_solo());
+        assert_eq!(config.world_size(), WORLD_SIZE);
+        assert!(config.requires_conversion());
+        assert!(!config.requires_cubins());
+        assert!(!config.requires_conversion_manifest());
+        assert_eq!(config.max_context_tokens(), GLM_CONTEXT_TOKENS);
+        let env = config.launch_env();
+        assert_eq!(env["SPARKFLASH_MODEL"], GLM_WEIGHTS_ID);
+        assert_eq!(env["SPARKFLASH_CONTEXT"], GLM_CONTEXT_TOKENS.to_string());
+        assert_eq!(env["SPARK_MAX_SEQ_LEN"], GLM_CONTEXT_TOKENS.to_string());
+        assert!(!env.contains_key("SPARKFLASH_CUBINS"));
+    }
+
+    #[test]
     fn local_ranks_are_omitted_when_every_rank_is_remote() {
         let mut config = SparkConfig::default();
         for node in &mut config.cluster.nodes {
@@ -1257,10 +1632,9 @@ mod tests {
         let home = std::env::var("HOME").expect("HOME is set for tests");
         let mut config = SparkConfig::default();
         config.paths.repo_root = "/srv/sparkflash".to_owned();
-        assert_eq!(
-            config.converted_path(),
-            Path::new(&home).join("sparkflash/converted")
-        );
+        let converted =
+            Path::new(&home).join("sparkflash/converted/models--deepseek-ai--DeepSeek-V4.1-Flash");
+        assert_eq!(config.converted_path(), converted);
         assert_eq!(
             config.cubins_path(),
             PathBuf::from("/srv/sparkflash/target/cubins")
@@ -1272,10 +1646,7 @@ mod tests {
         let env = config.launch_env();
         assert_eq!(
             env["SPARKFLASH_CONVERTED_DIR"],
-            Path::new(&home)
-                .join("sparkflash/converted")
-                .display()
-                .to_string()
+            converted.display().to_string()
         );
         assert_eq!(env["SPARKFLASH_CUBINS"], "/srv/sparkflash/target/cubins");
         assert_eq!(
@@ -1314,6 +1685,140 @@ mod tests {
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn a_cached_checkpoint_must_match_the_selected_model_family() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = dir.path();
+        crate::hf::tests::cache_model(cache, DEFAULT_MODEL_ID, "abc123", "deepseek_v41");
+        let mut config = SparkConfig::default();
+        config.model.hub_cache = cache.display().to_string();
+        config.validate().expect("the supported pair validates");
+
+        config.model.weights = QWEN_WEIGHTS_ID.to_owned();
+        config.engine.kind = QWEN_ENGINE_ID.to_owned();
+        let error = config
+            .validate()
+            .expect_err("a V4.1 checkpoint cannot run Qwen");
+        assert!(
+            error.message.contains("model.weights") && error.message.contains("engine.kind"),
+            "{error}"
+        );
+
+        let mut unknown = SparkConfig::default();
+        unknown.model.hub_cache = cache.display().to_string();
+        unknown.model.id = "org/llama".to_owned();
+        crate::hf::tests::cache_model(cache, "org/llama", "def456", "llama");
+        let error = unknown.validate().expect_err("an unsupported checkpoint");
+        assert!(error.message.contains("model_type"), "{error}");
+
+        let mut absent = SparkConfig::default();
+        absent.model.hub_cache = cache.display().to_string();
+        absent.model.id = "org/not-downloaded".to_owned();
+        let error = absent.validate().expect_err("an unknown uncached model");
+        assert!(
+            error.message.contains("not in the Hugging Face cache"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_canonical_model_is_valid_while_its_download_is_incomplete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snapshot =
+            crate::hf::tests::cache_model(dir.path(), DEFAULT_MODEL_ID, "abc123", "deepseek_v41");
+        std::fs::remove_file(snapshot.join("config.json")).expect("drop config");
+        let mut config = SparkConfig::default();
+        config.model.hub_cache = dir.path().display().to_string();
+        config
+            .validate()
+            .expect("the selected canonical model is still identifiable");
+    }
+
+    #[test]
+    fn a_fresh_default_prefers_a_complete_cached_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::hf::tests::cache_model(
+            dir.path(),
+            "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            "aaa",
+            "deepseek_v41",
+        );
+        crate::hf::tests::cache_model(
+            dir.path(),
+            "pqhaz/DeepSeek-V4.1-Flash-1017-heretic",
+            "bbb",
+            "deepseek_v41",
+        );
+        let mut config = SparkConfig::default();
+        config.model.hub_cache = dir.path().display().to_string();
+        let selected = config.prefer_cached_model().expect("a cached model");
+        assert_eq!(selected.id, "deepseek-ai/DeepSeek-V4.1-Flash-1017");
+        assert_eq!(config.model.id, selected.id);
+        assert_eq!(config.model.weights, DEFAULT_WEIGHTS_ID);
+        assert_eq!(config.engine.kind, DEFAULT_ENGINE_ID);
+        assert_eq!(config.model.checkpoint, "");
+        config
+            .validate()
+            .expect("the selected cache model validates");
+    }
+
+    #[test]
+    fn converted_weights_are_scoped_to_the_selected_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = dir.path();
+        crate::hf::tests::cache_model(cache, DEFAULT_MODEL_ID, "aaaaaaaa", "deepseek_v41");
+        crate::hf::tests::cache_model(cache, "org/finetune", "bbbbbbbb", "deepseek_v41");
+        let mut config = SparkConfig::default();
+        config.model.hub_cache = cache.display().to_string();
+        let first = config.converted_path();
+        assert!(
+            first
+                .display()
+                .to_string()
+                .contains("models--deepseek-ai--DeepSeek-V4.1-Flash--")
+        );
+        // The conversion command is built from `resolved()`; the node check is not. They must
+        // agree on the directory or every finished conversion is reported missing.
+        assert_eq!(first, config.resolved().expect("cached").converted_path());
+        config.model.id = "org/finetune".to_owned();
+        let second = config.converted_path();
+        assert!(
+            second
+                .display()
+                .to_string()
+                .contains("models--org--finetune--")
+        );
+        assert_ne!(first, second);
+
+        // Two explicit checkpoints with the same basename must not share converted weights.
+        let mut explicit = SparkConfig::default();
+        explicit.model.checkpoint = "/data/one/model".to_owned();
+        let one = explicit.converted_path();
+        explicit.model.checkpoint = "/data/two/model".to_owned();
+        let two = explicit.converted_path();
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn a_missing_configured_binary_adopts_the_running_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]").expect("manifest");
+        let executable = dir.path().join("target/debug/sparkflash");
+        std::fs::create_dir_all(executable.parent().expect("parent")).expect("target");
+        std::fs::write(&executable, "binary").expect("binary");
+        let mut config = SparkConfig::default();
+        config.paths.binary = dir
+            .path()
+            .join("target/release/sparkflash")
+            .display()
+            .to_string();
+        config.paths.repo_root = "/not/the/checkout".to_owned();
+        assert!(config.adopt_running_binary(&executable));
+        assert_eq!(config.binary_path(), executable);
+        assert_eq!(config.repo_root(), dir.path());
+        assert!(!config.adopt_running_binary(&executable));
     }
 
     #[test]

@@ -205,9 +205,12 @@ def main(argv: list[str] | None = None) -> int:
         rsh = shlex.join([*shlex.split(args.ssh), *args.ssh_arg, "-o", f"HostKeyAlias={alias}"])
         for path, size in lists:
             transfers.append(Transfer(alias, size, [
-                "rsync", "-a", "--whole-file", "--from0", f"--files-from={path}",
-                "--info=progress2", "--no-human-readable", "-e", rsh,
-                "/", f"{destination}:{dest_root}/",
+                # Copying from "/" makes the implied parent directories (/home, /home/user)
+                # part of the transfer. Their mtimes belong to root and cannot be set by the
+                # login user, which rsync reports as exit 23 even though every file arrived.
+                "rsync", "-a", "--whole-file", "--omit-dir-times", "--from0",
+                f"--files-from={path}", "--info=progress2", "--no-human-readable",
+                "-e", rsh, "/", f"{destination}:{dest_root}/",
             ]))
     for transfer in transfers:
         transfer.start()

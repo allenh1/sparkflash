@@ -14,19 +14,21 @@
 
 # SparkFlash lead-node configuration.
 #
-# The console's Setup page (scripts/setup.sh, then http://<lead>.local:8790) writes sparkflash.toml
-# for you, with these values. This copy documents every field: copy it to sparkflash.toml beside
-# the checkout (or pass --config PATH) to write one by hand. `sparkflash --web` loads the file, the
-# web form saves it atomically, and every launcher and converter command is derived from it.
+# `sparkflash --web` (or `cargo run --bin sparkflash -- --web`) starts the console and its Setup
+# page writes sparkflash.toml for you, with these values. This copy documents every field: copy it
+# to sparkflash.toml beside the checkout (or pass --config PATH) to write one by hand.
+# `sparkflash --web` loads the file, the web form saves it atomically, and every launcher and
+# converter command is derived from it.
 #
 # Relative paths resolve against [paths].repo_root, which itself resolves against the process
 # working directory. A leading ~/ is the home directory, the same on every node when the account
 # name is.
 
 [model]
-# Model means the weights. Two checkpoints ship in this build:
+# Model means the weights. Three checkpoints ship in this build:
 #   deepseek-v4.1-flash            four Sparks, TP=4, converted per rank
 #   qwen3.8-flash-next-nvfp4       one Spark,  TP=1, loaded directly from the checkpoint
+#   glm5.3-flash-fp8                four Sparks, TP=4, converted per rank
 weights = "deepseek-v4.1-flash"
 # The checkpoint's Hugging Face model ID.
 id = "deepseek-ai/DeepSeek-V4.1-Flash"
@@ -38,7 +40,9 @@ checkpoint = ""
 hub_cache = ""
 # Empty derives <checkpoint>/tokenizer.json.
 tokenizer = ""
-# The directory `sparkflash convert` writes one file per rank into.
+# Root for converted weights. The console adds a child named after the model repository and a
+# hash of the resolved checkpoint path, so switching models cannot reuse another checkpoint's rank
+# files.
 converted_dir = "~/sparkflash/converted"
 # The cubin directory built by scripts/build-cubins.sh.
 cubins = "target/cubins"
@@ -47,6 +51,7 @@ cubins = "target/cubins"
 # Engine means how the weights run. Match it to the weights:
 #   deepseek-v4.1-flash            TP=4 device engine
 #   qwen4-exp                      TP=1 pack engine
+#   glm5-next                       TP=4 GLM pack engine
 kind = "deepseek-v4.1-flash"
 # false runs the CPU host twin and is only useful for a smoke test.
 device = true
@@ -65,7 +70,8 @@ base_port = 29601
 # Empty means the user running the control plane.
 ssh_user = ""
 ssh_options = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
-# Four nodes for deepseek-v4.1-flash, or exactly one for qwen3.8-flash-next-nvfp4. In rank order.
+# Four nodes for deepseek-v4.1-flash and glm5.3-flash-fp8, or exactly one for
+# qwen3.8-flash-next-nvfp4. In rank order.
 # `local = true` runs that rank's convert, launch, stop and status commands on the lead node rather
 # than over SSH, so the lead needs no SSH key for itself. The peer is the fast-network (RoCE)
 # address the collectives use; step 2 of the Setup page fills it in from what each node reports.

@@ -73,7 +73,7 @@ pub fn convert_command(config: &SparkConfig, rank: usize) -> CommandSpec {
     let checkpoint = config.node_path(&config.model.checkpoint);
     let output_dir = config.converted_path();
     let rank_text = rank.to_string();
-    let convert_args = vec![
+    let mut convert_args = vec![
         "convert".to_owned(),
         "--checkpoint".to_owned(),
         checkpoint.display().to_string(),
@@ -83,9 +83,12 @@ pub fn convert_command(config: &SparkConfig, rank: usize) -> CommandSpec {
         config.world_size().to_string(),
         "--tp-rank".to_owned(),
         rank_text,
-        "--no-pad-moe-640".to_owned(),
-        "--no-verify".to_owned(),
     ];
+    // 640-wide routed-expert padding is DeepSeek's layout; the GLM converter refuses the flag.
+    if !config.is_glm() {
+        convert_args.push("--no-pad-moe-640".to_owned());
+    }
+    convert_args.push("--no-verify".to_owned());
     let label = format!("Convert rank {rank} ({})", node.ssh);
     if node.local {
         let mut env = BTreeMap::new();
@@ -375,7 +378,11 @@ pub fn sync_command(
     let paths: Vec<PathBuf> = match what {
         SyncWhat::Software => {
             args.push(format!("--ensure-dir={}", root.display()));
-            let mut paths = vec![config.binary_path(), config.cubins_path()];
+            let mut paths = vec![config.binary_path()];
+            // GLM carries its kernels in the binary and builds no external cubin directory.
+            if config.requires_cubins() {
+                paths.push(config.cubins_path());
+            }
             paths.extend(config.nccl_lib_path());
             paths
         }
@@ -400,7 +407,7 @@ pub fn sync_command(
         env: BTreeMap::new(),
         cwd: Some(root),
         label: match what {
-            SyncWhat::Software => "Install on the other Sparks".to_owned(),
+            SyncWhat::Software => "Deploy the server".to_owned(),
             SyncWhat::Model => "Copy the model to the other Sparks".to_owned(),
         },
         kind: what.kind().to_owned(),
@@ -472,12 +479,21 @@ mod tests {
             cwd.join("target/release/sparkflash").display().to_string()
         );
         assert_eq!(command.cwd, Some(cwd));
+        let converted = config.converted_path();
+        assert!(
+            converted
+                .display()
+                .to_string()
+                .starts_with("/data/sparkflash-conv/models--deepseek-ai--DeepSeek-V4.1-Flash"),
+            "{}",
+            converted.display()
+        );
         for expected in [
             "convert",
             "--checkpoint",
             "/data/DeepSeek-V4.1-Flash",
             "--output-dir",
-            "/data/sparkflash-conv",
+            converted.to_str().expect("utf8"),
             "--tp-world-size",
             "4",
             "--tp-rank",
@@ -494,6 +510,42 @@ mod tests {
     }
 
     #[test]
+    fn a_glm_convert_omits_the_deepseek_padding_flag_and_launch_names_the_pack() {
+        let mut config = SparkConfig::default();
+        config.model.weights = crate::config::GLM_WEIGHTS_ID.to_owned();
+        config.model.id = crate::config::GLM_MODEL_ID.to_owned();
+        config.model.checkpoint = "/data/GLM-5.3-Flash".to_owned();
+        config.engine.kind = crate::config::GLM_ENGINE_ID.to_owned();
+        let convert = convert_command(&config, 0);
+        assert_eq!(convert.program, config.binary_path().display().to_string());
+        assert!(!convert.args.iter().any(|arg| arg == "--no-pad-moe-640"));
+        assert!(convert.args.iter().any(|arg| arg == "--tp-world-size"));
+        assert!(convert.args.iter().any(|arg| arg == "4"));
+
+        let launch = serve_action_command(&config, ServeAction::Launch);
+        assert_eq!(
+            launch.env["SPARKFLASH_MODEL"],
+            crate::config::GLM_WEIGHTS_ID
+        );
+        assert_eq!(
+            launch.env["SPARKFLASH_CONTEXT"],
+            config.runtime.max_context_tokens.to_string()
+        );
+        assert!(!launch.env.contains_key("SPARKFLASH_CUBINS"));
+
+        let targets = [SyncTarget {
+            address: "198.51.100.12".to_owned(),
+            ssh: "spark1".to_owned(),
+        }];
+        let sync = sync_command(&config, SyncWhat::Software, &targets).expect("software sync");
+        assert!(
+            !sync.args.iter().any(|arg| arg.ends_with("/target/cubins")),
+            "{:?}",
+            sync.args
+        );
+    }
+
+    #[test]
     fn remote_convert_goes_over_ssh_and_quotes_paths() {
         let mut config = SparkConfig::default();
         config.model.checkpoint = "/data/DeepSeek-V4.1-Flash".to_owned();
@@ -506,12 +558,13 @@ mod tests {
             let mut expected = String::from(
                 "cd '/opt/spark flash' && '/opt/spark flash/target/release/sparkflash'",
             );
+            let converted = config.converted_path();
             for arg in [
                 "convert",
                 "--checkpoint",
                 "/data/DeepSeek-V4.1-Flash",
                 "--output-dir",
-                "/data/sparkflash-conv",
+                converted.to_str().expect("utf8"),
                 "--tp-world-size",
                 "4",
                 "--tp-rank",

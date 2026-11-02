@@ -23,21 +23,32 @@ Run on the lead Spark (rank 0):
 ```bash
 git clone https://github.com/allenh1/sparkflash ~/sparkflash
 cd ~/sparkflash
-./scripts/setup.sh --no-ssh
+cargo run --bin sparkflash -- --web
 ```
 
-`./scripts/setup.sh --no-ssh` is idempotent. If `rustup` is not yet installed and stdin is not a
-TTY, install Rust first:
+That one command starts the control plane on `http://127.0.0.1:8790`. Its automatic provisioner
+adopts the running binary, builds `target/cubins/*.cubin` and fetches
+`target/deps/nccl/libnccl.so.2` when they are missing, then copies the same binary to every Spark
+whose copy differs. If `rustup` is not installed, or `cargo --version` is older than 1.88, install the pinned
+toolchain and put the rustup shims first:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
-export PATH="/usr/local/cuda/bin:$HOME/.cargo/bin:$PATH"
-./scripts/setup.sh --no-ssh
+export PATH="$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH"
+rustup show    # installs the 1.98.1 toolchain from rust-toolchain.toml
+cargo --version
+cargo run --bin sparkflash -- --web
 ```
 
-This builds `target/release/sparkflash`, compiles `target/cubins/*.cubin`, fetches
-`target/deps/nccl/libnccl.so.2`, and starts the control plane in the background on
-`http://127.0.0.1:8790`.
+A distribution Cargo (for example 1.75.0) rejects this workspace with `feature edition2024 is
+required`; that message means the rustup shim is not first on `PATH`.
+
+For the release serving build, add the serving features before starting the console:
+
+```bash
+cargo build --release -p sparkflash-cli --features cuda,tp4-serve
+target/release/sparkflash --web
+```
 
 Every `PUT` and `POST` to `127.0.0.1:8790` requires the header `-H 'x-sparkflash-web: 1'`.
 

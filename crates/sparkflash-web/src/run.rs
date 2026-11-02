@@ -24,7 +24,7 @@ use clap::Parser;
 
 use crate::api::{WebState, WebStateInit, router};
 use crate::commands::local_hostname;
-use crate::config::{DEFAULT_CONFIG_PATH, SparkConfig};
+use crate::config::{DEFAULT_CONFIG_PATH, DEFAULT_MODEL_ID, SparkConfig};
 use crate::discovery::{CommandSshProbe, DiscoveredNode, MdnsDiscovery, NodeDiscovery};
 use crate::jobs::JobManager;
 use crate::stats::{StatsStore, TelemetrySource, now_ms};
@@ -72,7 +72,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
         .try_init();
 
     let exists = cli.config.exists();
-    let (config, load_error) = match SparkConfig::load(&cli.config) {
+    let (mut config, load_error) = match SparkConfig::load(&cli.config) {
         Ok(config) => (config, None),
         Err(error) => {
             let note = if exists {
@@ -90,6 +90,38 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             (SparkConfig::default(), Some(note))
         }
     };
+    // A fresh checkout should use a complete checkpoint that is already on this Spark instead of
+    // offering to download the canonical id again (for example an existing `...-1017` snapshot).
+    // A saved file that still names only the built-in canonical default is migrated the same way;
+    // an operator who deliberately chose another uncached id is left alone.
+    let default_model = config.model.id == DEFAULT_MODEL_ID;
+    if (!exists || default_model)
+        && let Some(model) = config.prefer_cached_model()
+    {
+        println!(
+            "sparkflash web: using the cached model {} ({})",
+            model.id, model.revision
+        );
+        if exists && let Err(error) = config.save(&cli.config) {
+            eprintln!(
+                "sparkflash web: using {} in memory, but cannot save it to {}: {}",
+                model.id,
+                cli.config.display(),
+                error.message
+            );
+        }
+    }
+    // The binary cargo just built is the one this process is running. Adopt it when the
+    // configured path is not there, so the first Install copies a real server instead of asking
+    // for scripts/setup.sh.
+    if let Ok(executable) = std::env::current_exe()
+        && config.adopt_running_binary(&executable)
+    {
+        println!(
+            "sparkflash web: using the running binary {}",
+            executable.display()
+        );
+    }
     let bind_text = cli.bind.clone().unwrap_or_else(|| config.web.bind.clone());
     let bind: SocketAddr = match bind_text.parse() {
         Ok(bind) => bind,
@@ -177,6 +209,19 @@ async fn serve(
             let interval =
                 Duration::from_secs(sampler_state.config().stats.sample_interval_secs.max(1));
             tokio::time::sleep(interval).await;
+        }
+    });
+
+    // Automatic provisioning: build the local artifacts a fresh checkout lacks, verify every
+    // Spark's copy of this same binary, and copy it where it differs. The UI shows these as
+    // ordinary jobs, so nothing here is hidden from the operator.
+    let provision_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            // A missing config, an unreachable peer or a failed artifact stays visible on the
+            // Setup and Activity pages; the automatic pass simply tries again on its next tick.
+            let _ = provision_state.provision_once().await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
         }
     });
 

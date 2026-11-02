@@ -32,8 +32,11 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::config::{profile_for_id, profile_for_model_type};
+
 /// The `config.json` `model_type` values the supported weights load.
-pub const SUPPORTED_MODEL_TYPES: &[&str] = &["deepseek_v41", "qwen4_exp"];
+pub const SUPPORTED_MODEL_TYPES: &[&str] =
+    &["deepseek_v41", "qwen4_exp", "qwen4_exp_text", "glm5_next"];
 
 /// The hub cache directory from this process's environment, as `huggingface_hub` resolves it.
 #[must_use]
@@ -155,6 +158,14 @@ pub struct CachedModel {
     pub model_type: Option<String>,
     /// Whether this build's engine loads the model type.
     pub supported: bool,
+    /// The control-plane weight selector that runs this checkpoint, when supported.
+    pub weights: Option<String>,
+    /// The engine selector that runs this checkpoint, when supported.
+    pub engine: Option<String>,
+    /// The checkpoint's context ceiling, when supported.
+    pub context_tokens: Option<usize>,
+    /// Whether a launch needs per-rank converted weights.
+    pub requires_conversion: Option<bool>,
     /// Whether the snapshot carries `tokenizer.json`.
     pub has_tokenizer: bool,
     /// The bytes downloaded so far.
@@ -189,6 +200,41 @@ pub fn list(cache: &Path) -> Result<Vec<CachedModel>, String> {
     Ok(models)
 }
 
+/// The best complete cached model for a weight family, preferring the canonical repository and
+/// then the closest name to it.
+///
+/// This is what the console selects on a fresh checkout: a machine that already has
+/// `org/model-1017` should not offer to download `org/model` again.
+#[must_use]
+pub fn preferred_cached<'a>(
+    models: &'a [CachedModel],
+    weights: &str,
+    canonical_id: &str,
+) -> Option<&'a CachedModel> {
+    let rank = |model: &CachedModel| {
+        if model.id == canonical_id {
+            0
+        } else if model.id.starts_with(canonical_id) {
+            1
+        } else if model.id.starts_with("deepseek-ai/") {
+            2
+        } else {
+            3
+        }
+    };
+    models
+        .iter()
+        .filter(|model| model.complete && model.supported)
+        .filter(|model| model.weights.as_deref() == Some(weights))
+        .min_by(|left, right| {
+            (rank(left), left.id.len(), left.id.as_str()).cmp(&(
+                rank(right),
+                right.id.len(),
+                right.id.as_str(),
+            ))
+        })
+}
+
 /// The cached entry for one model id, if its snapshot exists.
 ///
 /// This is the cheap targeted lookup the control plane uses before offering a download: it reads
@@ -208,10 +254,18 @@ fn read_model(repo: &Path, id: &str) -> Option<CachedModel> {
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
         .and_then(|config| config["model_type"].as_str().map(str::to_owned));
     let (bytes, complete) = blob_totals(&repo.join("blobs"));
+    // An in-progress download may not have config.json yet. A canonical repository id still
+    // identifies the family, so the selected model does not appear unsupported mid-download.
+    let profile = match model_type.as_deref() {
+        Some(kind) => profile_for_model_type(kind),
+        None => profile_for_id(id),
+    };
     Some(CachedModel {
-        supported: model_type
-            .as_deref()
-            .is_some_and(|kind| SUPPORTED_MODEL_TYPES.contains(&kind)),
+        supported: profile.is_some(),
+        weights: profile.map(|profile| profile.weights.to_owned()),
+        engine: profile.map(|profile| profile.engine.to_owned()),
+        context_tokens: profile.map(|profile| profile.context_tokens),
+        requires_conversion: profile.map(|profile| profile.requires_conversion),
         has_tokenizer: snapshot.path.join("tokenizer.json").is_file(),
         snapshot: snapshot.path.display().to_string(),
         revision: snapshot.revision,
@@ -349,6 +403,52 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_cached_snapshot_wins_over_an_absent_canonical_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        cache_model(
+            dir.path(),
+            "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            "aaa",
+            "deepseek_v41",
+        );
+        cache_model(
+            dir.path(),
+            "pqhaz/DeepSeek-V4.1-Flash-1017-heretic",
+            "bbb",
+            "deepseek_v41",
+        );
+        cache_model(dir.path(), "other/unrelated", "ccc", "llama");
+        let models = list(dir.path()).expect("list");
+        let preferred = preferred_cached(
+            &models,
+            crate::config::DEFAULT_WEIGHTS_ID,
+            crate::config::DEFAULT_MODEL_ID,
+        )
+        .expect("a cached model");
+        assert_eq!(preferred.id, "deepseek-ai/DeepSeek-V4.1-Flash-1017");
+    }
+
+    #[test]
+    fn a_canonical_model_is_supported_while_its_config_is_still_downloading() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snapshot = cache_model(
+            dir.path(),
+            crate::config::DEFAULT_MODEL_ID,
+            "abc123",
+            "deepseek_v41",
+        );
+        std::fs::remove_file(snapshot.join("config.json")).expect("drop config");
+        let model = lookup(dir.path(), crate::config::DEFAULT_MODEL_ID).expect("cache entry");
+        assert!(model.supported);
+        assert_eq!(model.model_type, None);
+        assert_eq!(
+            model.weights.as_deref(),
+            Some(crate::config::DEFAULT_WEIGHTS_ID)
+        );
+        assert_eq!(model.requires_conversion, Some(true));
+    }
+
+    #[test]
     fn list_reports_every_cached_model_and_whether_it_is_supported() {
         let dir = tempfile::tempdir().expect("tempdir");
         cache_model(dir.path(), "org/flash", "abc123", "deepseek_v41");
@@ -370,8 +470,22 @@ pub(crate) mod tests {
         assert!(models[0].has_tokenizer);
         assert_eq!(models[0].revision, "abc123");
         assert_eq!(models[0].model_type.as_deref(), Some("deepseek_v41"));
+        assert_eq!(
+            models[0].weights.as_deref(),
+            Some(crate::config::DEFAULT_WEIGHTS_ID)
+        );
+        assert_eq!(
+            models[0].engine.as_deref(),
+            Some(crate::config::DEFAULT_ENGINE_ID)
+        );
+        assert_eq!(
+            models[0].context_tokens,
+            Some(crate::config::MODEL_CONTEXT_TOKENS)
+        );
+        assert_eq!(models[0].requires_conversion, Some(true));
         assert!(models[0].bytes > 0);
         assert!(!models[1].supported);
+        assert!(models[1].weights.is_none());
         assert!(!models[1].complete);
 
         let flash = lookup(dir.path(), "org/flash").expect("targeted lookup");
@@ -380,5 +494,29 @@ pub(crate) mod tests {
         assert_eq!(flash.revision, "abc123");
         assert!(lookup(dir.path(), "org/absent").is_none());
         assert!(lookup(dir.path(), "not an id").is_none());
+    }
+
+    #[test]
+    fn a_cached_glm_checkpoint_is_selectable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        cache_model(
+            dir.path(),
+            crate::config::GLM_MODEL_ID,
+            "abc123",
+            "glm5_next",
+        );
+        let model = lookup(dir.path(), crate::config::GLM_MODEL_ID).expect("cache entry");
+        assert!(model.supported);
+        assert_eq!(model.model_type.as_deref(), Some("glm5_next"));
+        assert_eq!(
+            model.weights.as_deref(),
+            Some(crate::config::GLM_WEIGHTS_ID)
+        );
+        assert_eq!(model.engine.as_deref(), Some(crate::config::GLM_ENGINE_ID));
+        assert_eq!(
+            model.context_tokens,
+            Some(crate::config::GLM_CONTEXT_TOKENS)
+        );
+        assert_eq!(model.requires_conversion, Some(true));
     }
 }

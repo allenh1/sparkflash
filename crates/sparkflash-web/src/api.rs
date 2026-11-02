@@ -26,17 +26,17 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::{
-    ServeAction, SyncTarget, SyncWhat, convert_command, download_command, inspect_command,
-    local_hostname, serve_action_command, sync_command,
+    CommandSpec, ServeAction, SyncTarget, SyncWhat, convert_command, download_command,
+    inspect_command, local_hostname, serve_action_command, sync_command,
 };
 use crate::config::{
-    MAX_CONCURRENCY, QWEN_CONTEXT_TOKENS, QWEN_ENGINE_ID, QWEN_MODEL_ID, QWEN_WEIGHTS_ID,
-    SUPPORTED_ENGINES, SUPPORTED_WEIGHTS, SparkConfig,
+    MAX_CONCURRENCY, MODEL_PROFILES, QWEN_CONTEXT_TOKENS, QWEN_ENGINE_ID, QWEN_MODEL_ID,
+    QWEN_WEIGHTS_ID, SUPPORTED_ENGINES, SUPPORTED_WEIGHTS, SparkConfig,
 };
 use crate::discovery::{DiscoveryReport, NodeDiscovery, SshProbe, report_nodes};
 use crate::hf::{self, CachedModel};
-use crate::inspect::{self, ProbeResult, SetupReport};
-use crate::jobs::{JobManager, JobSummary};
+use crate::inspect::{self, Check, ProbeResult, SetupReport};
+use crate::jobs::{JobManager, JobStatus, JobSummary};
 use crate::stats::{MAX_SERIES_POINTS, StatsStore, TelemetrySource, now_ms};
 
 /// The header every state-changing request must carry (the UI sends it). A browser adds a custom
@@ -202,6 +202,206 @@ impl WebState {
         Arc::clone(&self.stats)
     }
 
+    /// The process manager, for the automatic provisioner.
+    #[must_use]
+    pub fn jobs(&self) -> Arc<JobManager> {
+        Arc::clone(&self.jobs)
+    }
+
+    /// Whether a configuration file exists and validated.
+    #[must_use]
+    pub fn config_exists(&self) -> bool {
+        let state = self.config.read().expect("config lock");
+        state.exists && state.load_error.is_none()
+    }
+
+    /// Runs the read-only node check and keeps the report for the state view.
+    ///
+    /// # Errors
+    /// Returns why the configuration cannot be used or the check task failed.
+    pub async fn inspect_now(&self) -> Result<SetupReport, String> {
+        let _guard = self.inspect_lock.lock().await;
+        let config = self.usable_config()?;
+        let probe = Arc::clone(&self.ssh);
+        let result = tokio::task::spawn_blocking(move || run_inspect(&config, probe.as_ref()))
+            .await
+            .map_err(|error| format!("the node check failed: {error}"))?;
+        *self.last_inspect.write().expect("inspect lock") = Some(result.clone());
+        Ok(result)
+    }
+
+    /// One automatic provisioning pass:
+    ///
+    /// 1. build the local GPU kernels and fetch NCCL when they are missing, so a fresh checkout
+    ///    does not need `scripts/setup.sh`;
+    /// 2. inspect every Spark;
+    /// 3. copy this process's binary, kernels and NCCL to any reachable Spark whose copy differs.
+    ///
+    /// The pass is deliberately idempotent and never loops on a failed attempt: a bootstrap job
+    /// that already exists (running or failed) is left for the operator to retry from the UI.
+    ///
+    /// # Errors
+    /// Only when the configuration cannot be used or the node check itself fails.
+    pub async fn provision_once(&self) -> Result<(), String> {
+        if !self.config_exists() {
+            return Ok(());
+        }
+        let config = self.usable_config()?;
+        if config.is_solo() || !config.binary_path().is_file() {
+            return Ok(());
+        }
+        let jobs = self.jobs.list();
+        let seen = |kind: &str| jobs.iter().any(|job| job.kind == kind);
+        // A failed automatic deploy is not retried in a loop; the Setup page's Deploy button is
+        // the deliberate retry.
+        if jobs
+            .iter()
+            .find(|job| job.kind == "sync-software")
+            .is_some_and(|job| job.status == JobStatus::Failed)
+        {
+            return Ok(());
+        }
+        if config.requires_cubins()
+            && !has_cubins(&config.cubins_path())
+            && !seen("bootstrap-cubins")
+        {
+            let script = config.repo_root().join("scripts/build-cubins.sh");
+            if script.is_file() {
+                let command = CommandSpec {
+                    program: "bash".to_owned(),
+                    args: vec![
+                        script.display().to_string(),
+                        config.cubins_path().display().to_string(),
+                    ],
+                    env: std::collections::BTreeMap::new(),
+                    cwd: Some(config.repo_root()),
+                    label: "Build the GPU kernels".to_owned(),
+                    kind: "bootstrap-cubins".to_owned(),
+                };
+                let _ = self.jobs.start_exclusive(command, &["launch"]).await;
+                return Ok(());
+            }
+        }
+        if let Some(nccl) = config.nccl_lib_path()
+            && !nccl.join("libnccl.so.2").is_file()
+            && !seen("bootstrap-nccl")
+        {
+            let script = config.repo_root().join("scripts/fetch-nccl.sh");
+            if script.is_file() {
+                let command = CommandSpec {
+                    program: "bash".to_owned(),
+                    args: vec![script.display().to_string(), nccl.display().to_string()],
+                    env: std::collections::BTreeMap::new(),
+                    cwd: Some(config.repo_root()),
+                    label: "Fetch the NCCL library".to_owned(),
+                    kind: "bootstrap-nccl".to_owned(),
+                };
+                let _ = self.jobs.start_exclusive(command, &["launch"]).await;
+                return Ok(());
+            }
+        }
+
+        // A check taken moments ago is enough; the UI refreshes the same report.
+        let recent = self
+            .last_inspect
+            .read()
+            .expect("inspect lock")
+            .as_ref()
+            .is_some_and(|report| now_ms().saturating_sub(report.checked_ms) < 15_000);
+        let report = if recent {
+            self.last_inspect
+                .read()
+                .expect("inspect lock")
+                .clone()
+                .expect("recent report")
+        } else {
+            self.inspect_now().await?
+        };
+        let lead_ready = report
+            .nodes
+            .first()
+            .is_some_and(|node| node.software == Check::Ready);
+        let needs_copy = report.nodes.iter().skip(1).any(|node| {
+            node.reachable
+                && matches!(
+                    node.software,
+                    Check::Missing | Check::Outdated | Check::Partial
+                )
+        });
+        if !lead_ready || !needs_copy {
+            return Ok(());
+        }
+        let command = sync_command(&config, SyncWhat::Software, &sync_targets(self, &config))?;
+        let _ = self
+            .jobs
+            .start_exclusive(command, &["launch", "sync-software"])
+            .await;
+        Ok(())
+    }
+
+    /// Retry the local preparation the automatic provisioner does: build missing cubins and fetch
+    /// a missing NCCL library. Unlike the automatic pass, this deliberately retries a previous
+    /// failed attempt because an operator asked for it.
+    ///
+    /// # Errors
+    /// When the configuration cannot be used or there is nothing left to prepare.
+    pub async fn prepare_local(&self) -> Result<Vec<u64>, String> {
+        let config = self.usable_config()?;
+        let mut started = Vec::new();
+        let mut failures = Vec::new();
+        if config.requires_cubins() && !has_cubins(&config.cubins_path()) {
+            let script = config.repo_root().join("scripts/build-cubins.sh");
+            if script.is_file() {
+                let command = CommandSpec {
+                    program: "bash".to_owned(),
+                    args: vec![
+                        script.display().to_string(),
+                        config.cubins_path().display().to_string(),
+                    ],
+                    env: std::collections::BTreeMap::new(),
+                    cwd: Some(config.repo_root()),
+                    label: "Build the GPU kernels".to_owned(),
+                    kind: "bootstrap-cubins".to_owned(),
+                };
+                match self.jobs.start_exclusive(command, &["launch"]).await {
+                    Ok(id) => started.push(id),
+                    Err(error) => failures.push(error.message),
+                }
+            } else {
+                failures.push(format!("{} is missing", script.display()));
+            }
+        }
+        if let Some(nccl) = config.nccl_lib_path()
+            && !nccl.join("libnccl.so.2").is_file()
+        {
+            let script = config.repo_root().join("scripts/fetch-nccl.sh");
+            if script.is_file() {
+                let command = CommandSpec {
+                    program: "bash".to_owned(),
+                    args: vec![script.display().to_string(), nccl.display().to_string()],
+                    env: std::collections::BTreeMap::new(),
+                    cwd: Some(config.repo_root()),
+                    label: "Fetch the NCCL library".to_owned(),
+                    kind: "bootstrap-nccl".to_owned(),
+                };
+                match self.jobs.start_exclusive(command, &["launch"]).await {
+                    Ok(id) => started.push(id),
+                    Err(error) => failures.push(error.message),
+                }
+            } else {
+                failures.push(format!("{} is missing", script.display()));
+            }
+        }
+        if started.is_empty() {
+            return Err(if failures.is_empty() {
+                "the local server is already prepared; use Deploy for the other Sparks".to_owned()
+            } else {
+                failures.join("; ")
+            });
+        }
+        Ok(started)
+    }
+
     /// The telemetry source, for the sampler.
     ///
     /// The source is replaced when a saved config changes `web.serve_url`, so the next scrape
@@ -210,6 +410,48 @@ impl WebState {
     pub fn telemetry(&self) -> Arc<TelemetrySource> {
         Arc::clone(&self.telemetry.read().expect("telemetry lock"))
     }
+}
+
+/// Whether `directory` holds at least one `.cubin` file.
+fn has_cubins(directory: &std::path::Path) -> bool {
+    std::fs::read_dir(directory).is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("cubin"))
+        })
+    })
+}
+
+/// The other Sparks a copy goes to, addressed over the fast network once the last check proved it.
+fn sync_targets(web: &WebState, config: &SparkConfig) -> Vec<SyncTarget> {
+    let fast = web
+        .last_inspect
+        .read()
+        .expect("inspect lock")
+        .as_ref()
+        .is_some_and(|report| {
+            report.network_ok()
+                && report
+                    .plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.matches(config))
+        });
+    config
+        .cluster
+        .nodes
+        .iter()
+        .filter(|node| !node.local)
+        .map(|node| SyncTarget {
+            address: if fast {
+                node.peer.clone()
+            } else {
+                node.ssh.clone()
+            },
+            ssh: node.ssh.clone(),
+        })
+        .collect()
 }
 
 /// Builds the web router.
@@ -231,6 +473,7 @@ pub fn router(state: WebState) -> Router {
         .route("/api/jobs/{id}", get(get_job))
         .route("/api/actions/convert", post(convert))
         .route("/api/actions/download", post(download))
+        .route("/api/actions/prepare", post(prepare))
         .route("/api/actions/sync", post(sync))
         .route("/api/actions/launch", post(launch))
         .route("/api/actions/stop", post(stop))
@@ -395,8 +638,19 @@ struct Limits {
 struct Supported {
     weights: &'static [&'static str],
     engines: &'static [&'static str],
+    /// Every model family this build can configure, including one not downloaded yet.
+    models: Vec<SupportedModel>,
     /// The one-node TP=1 profile the Setup page offers as "run on this Spark only".
     solo: SoloDefaults,
+}
+
+#[derive(Serialize)]
+struct SupportedModel {
+    id: &'static str,
+    weights: &'static str,
+    engine: &'static str,
+    context_tokens: usize,
+    requires_conversion: bool,
 }
 
 #[derive(Serialize)]
@@ -440,6 +694,16 @@ async fn state_snapshot(State(web): State<WebState>) -> Json<StateView> {
         supported: Supported {
             weights: SUPPORTED_WEIGHTS,
             engines: SUPPORTED_ENGINES,
+            models: MODEL_PROFILES
+                .iter()
+                .map(|profile| SupportedModel {
+                    id: profile.id,
+                    weights: profile.weights,
+                    engine: profile.engine,
+                    context_tokens: profile.context_tokens,
+                    requires_conversion: profile.requires_conversion,
+                })
+                .collect(),
             solo: SoloDefaults {
                 weights: QWEN_WEIGHTS_ID,
                 engine: QWEN_ENGINE_ID,
@@ -557,22 +821,9 @@ async fn discover(State(web): State<WebState>) -> Response {
 
 /// Checks every node (in parallel, read-only) and keeps the report for the state view.
 async fn inspect_nodes(State(web): State<WebState>) -> Response {
-    let _guard = web.inspect_lock.lock().await;
-    let config = match web.usable_config() {
-        Ok(config) => config,
-        Err(message) => return api_error(StatusCode::CONFLICT, message),
-    };
-    let probe = Arc::clone(&web.ssh);
-    let result = tokio::task::spawn_blocking(move || run_inspect(&config, probe.as_ref())).await;
-    match result {
-        Ok(report) => {
-            *web.last_inspect.write().expect("inspect lock") = Some(report.clone());
-            Json(report).into_response()
-        }
-        Err(error) => api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("the node check failed: {error}"),
-        ),
+    match web.inspect_now().await {
+        Ok(report) => Json(report).into_response(),
+        Err(message) => api_error(StatusCode::CONFLICT, message),
     }
 }
 
@@ -663,6 +914,14 @@ async fn download(State(web): State<WebState>) -> Response {
     }
 }
 
+/// Retries the local build/fetch the automatic provisioner performs.
+async fn prepare(State(web): State<WebState>) -> Response {
+    match web.prepare_local().await {
+        Ok(ids) => accepted_jobs(&web, &ids),
+        Err(message) => api_error(StatusCode::CONFLICT, message),
+    }
+}
+
 #[derive(Deserialize)]
 struct SyncRequest {
     what: SyncWhat,
@@ -679,7 +938,7 @@ async fn sync(State(web): State<WebState>, Json(request): Json<SyncRequest>) -> 
             return api_error(
                 StatusCode::CONFLICT,
                 format!(
-                    "{} is not built yet; run scripts/setup.sh on this Spark first",
+                    "{} is not built yet; restart the console from the checkout so it can adopt the running binary",
                     config.binary_path().display()
                 ),
             );
@@ -693,32 +952,7 @@ async fn sync(State(web): State<WebState>, Json(request): Json<SyncRequest>) -> 
         _ => {}
     }
     // The fast network carries the copy once a check has confirmed the configured addresses.
-    let fast = web
-        .last_inspect
-        .read()
-        .expect("inspect lock")
-        .as_ref()
-        .is_some_and(|report| {
-            report.network_ok()
-                && report
-                    .plan
-                    .as_ref()
-                    .is_some_and(|plan| plan.matches(&config))
-        });
-    let targets: Vec<SyncTarget> = config
-        .cluster
-        .nodes
-        .iter()
-        .filter(|node| !node.local)
-        .map(|node| SyncTarget {
-            address: if fast {
-                node.peer.clone()
-            } else {
-                node.ssh.clone()
-            },
-            ssh: node.ssh.clone(),
-        })
-        .collect();
+    let targets = sync_targets(&web, &config);
     let command = match sync_command(&config, request.what, &targets) {
         Ok(command) => command,
         Err(message) => return api_error(StatusCode::CONFLICT, message),
@@ -856,6 +1090,18 @@ async fn launch(State(web): State<WebState>) -> Response {
         return api_error(
             StatusCode::CONFLICT,
             "rank 0 is already reachable; stop the cluster before launching it",
+        );
+    }
+    if web
+        .jobs
+        .list()
+        .iter()
+        .find(|job| job.kind == "sync-software")
+        .is_some_and(|job| job.status == JobStatus::Failed)
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            "the last Deploy failed; retry it before launching the cluster",
         );
     }
     start_action(&web, ServeAction::Launch).await
@@ -1087,6 +1333,22 @@ mod tests {
         assert_eq!(body["limits"]["max_concurrency"], 32);
         assert_eq!(body["config"]["runtime"]["max_context_tokens"], 1_048_576);
         assert_eq!(body["supported"]["engines"][0], "deepseek-v4.1-flash");
+        assert_eq!(
+            body["supported"]["models"][0]["id"],
+            crate::config::DEFAULT_MODEL_ID
+        );
+        assert_eq!(
+            body["supported"]["models"][0]["weights"],
+            crate::config::DEFAULT_WEIGHTS_ID
+        );
+        assert_eq!(
+            body["supported"]["models"][2]["id"],
+            crate::config::GLM_MODEL_ID
+        );
+        assert_eq!(
+            body["supported"]["models"][2]["engine"],
+            crate::config::GLM_ENGINE_ID
+        );
         assert_eq!(body["config_exists"], false);
     }
 
@@ -1164,6 +1426,15 @@ mod tests {
                 .unwrap_or_default()
                 .contains("no conversion step")
         );
+    }
+
+    #[tokio::test]
+    async fn automatic_provisioning_waits_for_a_saved_configuration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state(dir.path());
+        assert!(!state.config_exists());
+        state.provision_once().await.expect("a no-op");
+        assert!(state.jobs().list().is_empty());
     }
 
     #[tokio::test]
@@ -1280,6 +1551,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn launch_refuses_after_a_failed_deploy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state(dir.path());
+        let command = CommandSpec {
+            program: "sh".to_owned(),
+            args: vec!["-c".to_owned(), "exit 1".to_owned()],
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+            label: "Deploy the server".to_owned(),
+            kind: "sync-software".to_owned(),
+        };
+        let id = state.jobs.start(command).await.expect("job accepted");
+        for _ in 0..100 {
+            if state
+                .jobs
+                .get(id)
+                .is_some_and(|job| job.summary.status.is_done())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let app = test_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .header(ACTION_HEADER, "1")
+                    .uri("/api/actions/launch")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("last Deploy failed"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
     async fn an_invalid_existing_file_blocks_actions_instead_of_using_defaults() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = test_state_with(dir.path(), true, Some("missing field `runtime`".to_owned()));
@@ -1355,6 +1672,41 @@ mod tests {
             error.contains("already in the Hugging Face cache"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cached_model_this_build_cannot_run_is_refused_even_if_posted_directly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::hf::tests::cache_model(&dir.path().join("hub"), "org/llama", "abc", "llama");
+        let state = test_state(dir.path());
+        let mut config: serde_json::Value =
+            serde_json::to_value(state.config()).expect("config JSON");
+        let app = test_router(state);
+        config["model"]["id"] = serde_json::json!("org/llama");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .header(ACTION_HEADER, "1")
+                    .uri("/api/config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"config": config}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("model_type"),
+            "{body}"
+        );
+        assert!(!dir.path().join("sparkflash.toml").exists());
     }
 
     #[tokio::test]

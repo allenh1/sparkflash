@@ -782,6 +782,9 @@ pub fn analyze(
         } else {
             match (file("converted"), file("manifest")) {
                 (None, _) => Check::Missing,
+                // The GLM converter writes the rank file and no manifest; that file is the
+                // completion marker. V4.1 writes its manifest after the rank file.
+                (Some(_), _) if !config.requires_conversion_manifest() => Check::Ready,
                 (Some(rank_file), Some(manifest)) if manifest.mtime >= rank_file.mtime => {
                     Check::Ready
                 }
@@ -1097,8 +1100,8 @@ pub fn script_args(config: &SparkConfig, rank: usize, checkpoint: Option<&Path>)
         checkpoint
             .map(|path| path.display().to_string())
             .unwrap_or_default(),
-        // `sparkflash convert` names its output rank-{rank}-of-{world}.bin and writes the
-        // manifest after the rank file is complete.
+        // `sparkflash convert` names its output rank-{rank}-of-{world}.bin; V4.1 writes the
+        // manifest after the rank file is complete, while GLM writes only the rank file.
         converted
             .join(format!("rank-{rank}-of-{}.bin", config.world_size()))
             .display()
@@ -1245,6 +1248,33 @@ free converted 2000000000000
         plan.apply(&mut config);
         assert!(plan.matches(&config));
         config.validate().expect("the applied plan validates");
+    }
+
+    #[test]
+    fn a_glm_rank_file_is_complete_without_a_manifest() {
+        let probes: Vec<ProbeResult> = cluster()
+            .into_iter()
+            .map(|probe| {
+                probe.map(|mut facts| {
+                    facts.files.remove("manifest");
+                    facts
+                })
+            })
+            .collect();
+        let mut config = SparkConfig::default();
+        config.model.weights = crate::config::GLM_WEIGHTS_ID.to_owned();
+        config.model.id = crate::config::GLM_MODEL_ID.to_owned();
+        config.model.checkpoint = "/data/GLM-5.3-Flash".to_owned();
+        config.engine.kind = crate::config::GLM_ENGINE_ID.to_owned();
+        let report = analyze(&config, &probes, true, 1);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+        for node in &report.nodes {
+            assert_eq!(node.converted, Check::Ready, "rank {}", node.rank);
+        }
+
+        // V4.1 uses the manifest as its completion marker, so the same file set is partial.
+        let report = analyze(&SparkConfig::default(), &probes, true, 1);
+        assert_eq!(report.nodes[0].converted, Check::Partial);
     }
 
     #[test]
@@ -1449,11 +1479,12 @@ link enp1s0f1np1 1500 up 0 0
         let args = script_args(&config, 2, Some(Path::new("/models/snap")));
         assert_eq!(args[3], "/models/snap");
         assert_eq!(args[0], "/srv/spark flash/target/release/sparkflash");
-        assert!(
-            args[4].ends_with("/sparkflash/converted/rank-2-of-4.bin"),
-            "{}",
-            args[4]
-        );
+        let rank_file = config
+            .converted_path()
+            .join("rank-2-of-4.bin")
+            .display()
+            .to_string();
+        assert_eq!(args[4], rank_file);
         let line = remote_command(&args);
         assert!(line.starts_with("bash -c '"), "{line}");
         assert!(

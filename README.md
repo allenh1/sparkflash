@@ -23,10 +23,12 @@ checkpoint directly, so there is no weight conversion, no second Spark, no SSH a
 network. Build as usual, then start the console and choose **Run on this Spark only** in Setup:
 
 ```bash
-cargo build --release -p sparkflash-cli --features cuda,tp4-serve
-./scripts/setup.sh --no-ssh          # or: target/release/sparkflash --web
+cargo run --bin sparkflash -- --web
 # open http://<this spark>.local:8790, then Setup -> Run on this Spark only
 ```
+
+For a release build, use `cargo build --release -p sparkflash-cli --features cuda,tp4-serve` and
+run `target/release/sparkflash --web`.
 
 The local plan is three steps: confirm this Spark, download
 `nvidia/Qwen3.8-Flash-Next-NVFP4`, start the server. The console starts
@@ -93,36 +95,49 @@ Safety & Boundaries 85 → 92).
   it is another 78 GB.
 - **Internet on the first Spark**, which downloads the model once and copies it to the others.
 
-Nothing needs installing by hand. DGX OS already ships the CUDA toolkit, the compilers, `curl`,
-`rsync`, `python3` and `ssh`. The one missing piece, Rust, is installed by the setup script into
-your home directory, without an admin password. The other three Sparks need nothing at all: the
-first one installs everything on them.
+Nothing needs installing by hand beyond Rust (`https://rustup.rs`). DGX OS already ships the CUDA
+toolkit, the compilers, `curl`, `rsync`, `python3` and `ssh`. The other three Sparks need nothing
+installed: the first one deploys the same binary, kernels and NCCL library to them.
 
-### 1. Run the setup script on one Spark
+### 1. Start the console on one Spark
 
 Pick any Spark to be the lead, open a terminal on it, and run:
 
 ```bash
 git clone https://github.com/allenh1/sparkflash ~/sparkflash
+cd ~/sparkflash
+cargo run --bin sparkflash -- --web
 ```
 
-```bash
-~/sparkflash/scripts/setup.sh
-```
-
-The script checks the Spark, installs Rust, and builds SparkFlash (several minutes the first time).
-It then lists the computers it finds on your network and asks which three are your other Sparks.
-For each one it asks you to type `yes` to trust it and your password there, once, so this Spark
-can reach them from then on. Last, it starts the SparkFlash console in the background and prints
-its address, for example:
+That one command starts the console. It adopts the binary cargo just built, prepares the local GPU
+kernels and NCCL library when they are missing, and copies the same binary to any Spark whose copy
+is missing or older. It prints the console address, for example:
 
 ```text
-Open the SparkFlash console in a browser on any computer on this network:
-
-    http://node0.local:8790
+sparkflash web: control plane on http://0.0.0.0:8790
 ```
 
-Running the script again is safe: it skips whatever is already done.
+> **If cargo says `feature edition2024 is required`**, the shell is running a distribution Cargo
+> older than the toolchain pinned in `rust-toolchain.toml` (1.98.1), not the rustup shim. Install
+> Rust and put its shims first:
+>
+> ```bash
+> curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
+> export PATH="$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH"
+> rustup show    # installs the pinned 1.98.1 toolchain
+> cargo --version
+> ```
+>
+> Then rerun `cargo run --bin sparkflash -- --web` from the checkout.
+
+Open `http://node0.local:8790` from any computer on the network. If this Spark cannot sign in to
+one of the others, step 1 of Setup shows the single `ssh-copy-id` command that fixes it. Build a
+release binary with the serving features when you want the fastest startup:
+
+```bash
+cargo build --release -p sparkflash-cli --features cuda,tp4-serve
+target/release/sparkflash --web
+```
 
 ### 2. Follow the Setup page
 
@@ -133,14 +148,15 @@ and checks every Spark after each one, so it always shows what is done and what 
 |:--------------------------------------|:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | 1. Find your Sparks                   | Pick your other three Sparks from the ones on the network. If this Spark can't sign in to one yet, the page shows the one command that fixes it.                                          |
 | 2. Connect the fast network           | Checks the cables and works out the dual-rail NCCL settings from what each Spark reports. If a port still needs an address or a larger MTU, it shows the commands to paste on that Spark. |
-| 3. Install on the other Sparks        | Copies the server, its GPU kernels and NCCL from this Spark.                                                                                                                              |
+| 3. Deploy the server                  | Copies the same binary, its GPU kernels and NCCL from this Spark automatically when a copy is missing or older.                                                                            |
 | 4. Download the model                 | Fetches [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) (510 GB) onto this Spark, with progress. An interrupted download resumes where it stopped.          |
 | 5. Copy the model to the other Sparks | Copies it over the fast network to all three at once.                                                                                                                                     |
 | 6. Prepare the weights                | Each Spark converts its quarter of the model once, in parallel (about five minutes). This is what makes every later start take 25 s.                                                      |
 | 7. Start the server                   | Starts all four Sparks and shows the API address.                                                                                                                                         |
 
 The DeepSeek checkpoint needs no Hugging Face account. For a model that does, save your token in
-`~/.cache/huggingface/token` on the lead Spark before step 4.
+`~/.cache/huggingface/token` on the lead Spark before step 4. The **Model** list under Advanced
+settings also offers GLM-5.3-Flash (FP8), which uses the same four-Spark, converted-rank path.
 
 ### 3. Use it
 
@@ -156,10 +172,9 @@ curl -s http://node0.local:8000/v1/chat/completions -H 'content-type: applicatio
 ```
 
 Start and stop the server from the console's **Overview** page, which also graphs decode speed,
-prefill, draft acceptance, cache hits and tokens served. The console keeps running in the
-background; `~/sparkflash/scripts/setup.sh --stop` stops it, and running the script again starts
-it. More on the console: [docs/web.md](docs/web.md). More on the API and tuning:
-[docs/serving.md](docs/serving.md).
+prefill, draft acceptance, cache hits and tokens served. The console runs until you stop the
+`cargo run` process (Ctrl-C). More on the console: [docs/web.md](docs/web.md). More on the API and
+tuning: [docs/serving.md](docs/serving.md).
 
 ### The fast network
 

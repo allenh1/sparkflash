@@ -6,26 +6,29 @@ model once and copies it over, and converts the weights. Then it starts, stops a
 cluster. Everything it does is a command run on the lead, or over SSH on the others, and
 `sparkflash.toml` holds the result.
 
-It also runs a **single Spark** for the TP=1 Qwen3.8-Flash-Next pack. That path needs no other
-Spark, no SSH and no fast network: step 1 offers **Run on this Spark only**, and the console
-downloads the checkpoint and starts one local server.
+It runs either of the TP=4 packs, V4.1-Flash and GLM-5.3-Flash, on the four Sparks. It also runs
+a **single Spark** for the TP=1 Qwen3.8-Flash-Next pack. That path needs no other Spark, no SSH
+and no fast network: step 1 offers **Run on this Spark only**, and the console downloads the
+checkpoint and starts one local server.
 
-The usual way to start it is the setup script, which builds the server, lets this Spark sign in to
-the others, and starts the console in the background so that closing the terminal does not stop a
-download:
+It starts from the checkout with one command. There is no separate setup script to run first:
+the process adopts the binary cargo just built, prepares the local GPU kernels and NCCL library
+when they are missing, and copies that same binary to any Spark whose copy differs.
 
 ```bash
-scripts/setup.sh                # then open http://<this spark>.local:8790
-scripts/setup.sh --stop         # stop the console
-scripts/setup.sh --foreground   # run the console in this terminal instead
+cargo run --bin sparkflash -- --web
+# console on http://node0.local:8790 (any address of the lead node)
 ```
 
-It can also run directly:
+A built binary is the same entry point:
 
 ```bash
 target/release/sparkflash --web --config sparkflash.toml
-# console on http://node0.local:8790 (any address of the lead node)
 ```
+
+`scripts/setup.sh` remains as a convenience for pre-authorising SSH keys and starting the console in
+the background, but no setup step requires it. The console shows the one `ssh-copy-id` command for
+any Spark it cannot sign in to.
 
 `sparkflash web` is the same entry point. `--bind ADDR` overrides `web.bind`; `--no-mdns` keeps the
 configured-node SSH checks but disables discovery and advertising. `SPARKFLASH_CONFIG` and
@@ -58,7 +61,8 @@ on Setup.
 
 ## Guided setup
 
-The Setup page is seven steps for a V4.1 cluster and three for a local Qwen server. Each shows what
+The Setup page is seven steps for a V4.1 or GLM-5.3 cluster and three for a local Qwen server. Each
+shows what
 it found on the configured node or nodes, and the one button that moves it forward. A step opens
 once the steps it needs are done, so independent ones run side by side (installing the software
 while the model downloads, for example).
@@ -68,17 +72,21 @@ while the model downloads, for example).
 | 1. Find your Sparks | **Use these Sparks** | Saves this Spark as rank 0 (`local = true`) and the three picked ones as ranks 1-3 |
 | 1. Run this Spark only | **Run on this Spark only** | Saves a one-node TP=1 Qwen plan, with no SSH and no peers |
 | 2. Connect the fast network | **Use these settings** | `POST /api/network/apply`: saves the NCCL values and peers the node check worked out |
-| 3. Install on the other Sparks | **Install** | `scripts/sync-nodes.py` copies the binary, cubins and NCCL library to the same paths |
+| 3. Deploy the server | Automatic (**Deploy now** retries) | `scripts/sync-nodes.py` copies the same binary, cubins and NCCL library to the same paths |
 | 4. Download the model | **Download** | `scripts/hf-download.py` fetches `model.id` into the lead's Hugging Face cache |
 | 5. Copy the model to the other Sparks | **Copy** | `scripts/sync-nodes.py` copies the model's cache folder |
 | 6. Prepare the weights | **Prepare the weights** | One `sparkflash convert` job per rank that is not converted yet |
 | 7. Start the server | **Start the server** | `scripts/serve-four-node.sh launch`, or `scripts/serve-single-node.sh launch` locally |
 
 A local Qwen plan shows only **Run this Spark only**, **Download the model** and **Start the
-server**. It hides the network, install, copy and conversion steps because a TP=1 pack loads its
+server**. It hides the network, deploy, copy and conversion steps because a TP=1 pack loads its
 released checkpoint directly and has no collectives. The target model and the optional DFlash 2
 drafter are both resolved from their canonical Hugging Face cache snapshots; downloading the
 drafter repository makes it available without another path setting.
+
+After a job that changes a node, and on every **Check again**, the console verifies the binary by
+SHA-256 on every Spark and starts the software copy itself when a copy is missing or older. The
+**Deploy now** button is only a retry after a failure.
 
 With an existing four-Spark configuration, the same button is offered on step 1 and asks before it
 replaces the cluster plan. To return to four Sparks, set `model.weights` and `engine.kind` back
@@ -99,12 +107,13 @@ and over SSH on the others, and reports:
 - every RoCE device: port state and rate, GID table, netdev, IPv4 address, prefix and MTU;
 - `arp_ignore` / `arp_announce`, addresses and routes;
 - size, time and SHA-256 of the binary, cubins and NCCL library;
-- file count and size of the checkpoint, and this rank's converted file and manifest;
+- file count and size of the checkpoint, and this rank's converted file and manifest (GLM writes
+  the rank file only, so that file is its completion marker);
 - free space where the model goes.
 
 The report compares each node with the lead (`ready`, `missing`, `outdated`, `partial`) and lists
 problems as errors or warnings. Software whose hashes differ from the lead's is `outdated`. A model
-copy whose file count or size differs from the lead's is `partial`, and so is a converted file
+copy whose file count or size differs from the lead's is `partial`, and so is a V4.1 converted file
 without a newer manifest (an interrupted conversion).
 
 ### The fast network
@@ -156,8 +165,9 @@ connects to each node's peer address, with `HostKeyAlias` set to the node's SSH 
 known host key is checked and nothing new lands in `known_hosts`. A rerun skips files that already
 match.
 
-Both print `@progress {"done": N, "total": N, "detail": "..."}` lines. The job keeps the latest one
-as its `progress`, and the UI draws it as a bar.
+Downloads, copies and weight conversions print `@progress {"done": N, "total": N, "detail":
+"..."}` lines. The job keeps the latest one as its `progress`, and the UI draws each rank's
+conversion and the combined bar from those values.
 
 ## Configuration
 
@@ -177,16 +187,18 @@ atomically (a sibling temp file, then rename). See
 | `[stats]` | Sampling interval, in-memory retention, idle snapshot path and flush interval |
 
 Validation refuses an unknown weight/engine selection, a mismatched weight/engine pair, a context
-outside the selected model's window (1..=1,048,576 for V4.1, 1..=262,144 for Qwen), a concurrency
-outside 1..=32, duplicate SSH names or peers, a non-IP peer, a malformed socket address/URL, and
-the wrong rank count: four nodes for V4.1, one local node for Qwen. It also refuses SSH names and
+outside the selected model's window (1..=1,048,576 for V4.1 and GLM-5.3, 1..=262,144 for Qwen), a
+concurrency outside 1..=32, duplicate SSH names or peers, a non-IP peer, a malformed socket
+address/URL, and the wrong rank count: four nodes for V4.1 and GLM-5.3, one local node for Qwen. It
+also refuses SSH names and
 users that SSH would read as options (a leading `-`, whitespace, `@` in the user), extra
 environment keys that are not shell identifiers, `web.allowed_hosts` entries with a scheme or
 port, and an empty `model.checkpoint` with a `model.id` that is not a Hugging Face model ID.
 The model and engine selectors are separate values: "model" is the weights, "engine" is the
 runtime. The supported pairs are `deepseek-v4.1-flash` + `deepseek-v4.1-flash` (TP=4; the
-checkpoint is converted per rank) and `qwen3.8-flash-next-nvfp4` + `qwen4-exp` (TP=1; the
-released checkpoint is loaded directly). Adding another pair is a deliberate change to
+checkpoint is converted per rank), `glm5.3-flash-fp8` + `glm5-next` (TP=4; the checkpoint is
+converted per rank) and `qwen3.8-flash-next-nvfp4` + `qwen4-exp` (TP=1; the released checkpoint
+is loaded directly). Adding another pair is a deliberate change to
 `SUPPORTED_WEIGHTS`/`SUPPORTED_ENGINES` plus the code that can serve it.
 
 Relative paths resolve against `paths.repo_root`. Relative `paths.repo_root` resolves against the
@@ -210,15 +222,21 @@ on the lead node and the resulting path is passed to every rank, so every node n
 at the same cache path. Steps 4 and 5 do that: the lead downloads it once and copies the folder to
 the others. `hf download <id>` as the same user on every node works too.
 
-The **Model** list under **Advanced settings** is the lead node's cache. Each model shows its size, and a
-download that is still in progress is marked incomplete. A model whose `config.json` `model_type`
-this build cannot load is listed but disabled. The line under the list shows the snapshot the next
-launch or conversion will use. A launch or conversion for a model that is not in the cache is refused with
-the cache path in the message; stop and status still work. A non-empty `model.checkpoint` skips the
-lookup. Use it for a checkpoint outside the cache, and then `model.id` may be any name.
+The **Model** list under **Advanced settings** is the lead node's cache. Each supported model
+shows its size, and a download that is still in progress is marked incomplete. Choosing a model also
+selects its architecture and engine, so a V4.1 checkpoint cannot be paired with the Qwen engine by
+accident. A cached model whose `config.json` `model_type` this build cannot load is not selectable,
+and saving one is refused by the server as well; the catalog adds the canonical supported releases
+that are not downloaded yet, so **Download** always has a valid target. The line under the list
+shows the snapshot the next launch or conversion will use. A launch or conversion for a model that
+is not in the cache is refused with the cache path in the message; stop and status still work. A
+non-empty `model.checkpoint` skips the lookup. Use it for a checkpoint outside the cache, and its
+`config.json` `model_type` is checked the same way.
 
 Switching models means converting every rank again: the converted weights belong to one
-checkpoint.
+checkpoint. The console writes each conversion under a child of `model.converted_dir` named after
+the repository and a hash of the resolved checkpoint path, so a different model cannot be
+mistaken for an already converted one.
 
 ## Applying changes
 
@@ -259,7 +277,7 @@ cannot remove. `scripts/setup.sh` runs it for the Sparks picked in the terminal.
 | Action | What it runs |
 | :-- | :-- |
 | **Download** | `python3 -I scripts/hf-download.py --repo <model.id> --cache <hub cache>` on the lead |
-| **Install** / **Copy** | `python3 -I scripts/sync-nodes.py --host <address>,<ssh name> … --path …` on the lead (software: binary, cubins, NCCL; model: the model's cache folder without `*.incomplete` files) |
+| **Deploy** / **Copy** | `python3 -I scripts/sync-nodes.py --host <address>,<ssh name> … --path …` on the lead (software: binary, cubins, NCCL; model: the model's cache folder without `*.incomplete` files). Deploy runs automatically when the node check finds a missing or older copy |
 | **Prepare the weights** / per-rank **Convert** | One job per rank: rank 0 locally when `local = true`, ranks 1–3 over SSH. Each runs `sparkflash convert --checkpoint … --output-dir … --tp-world-size 4 --tp-rank R --no-pad-moe-640 --no-verify` |
 | **Launch cluster** | `scripts/serve-four-node.sh launch` with `SPARK_NODES`, `SPARK_PEERS`, `SPARK_LOCAL_RANKS` (the `local = true` ranks, started on the lead without SSH), `SPARK_MAX_SEQ_LEN`, `SPARKFLASH_LANES`, paths, and every `NCCL_*` value from the TOML. Each rank is started detached, so the job ends once all four are running |
 | **Start server** (local) | `scripts/serve-single-node.sh launch` with the binary, checkpoint, tokenizer, context and HTTP bind. The one TP=1 process is started detached; its log and pid file are under `paths.log_root` |

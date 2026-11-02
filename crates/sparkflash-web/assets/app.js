@@ -421,6 +421,7 @@ function paintConfig(config, report, force = false) {
   $("checkpoint").placeholder = checkpoint?.from_cache && checkpoint.path ? checkpoint.path : "from the Hugging Face cache";
   $("hub-cache").placeholder = checkpoint?.cache || "~/.cache/huggingface/hub";
   paintModels(config.model.id);
+  applyModelProfile(config.model.id, false);
   setValue("tokenizer", config.model.tokenizer);
   setValue("converted-dir", config.model.converted_dir);
   setValue("cubins", config.model.cubins);
@@ -487,22 +488,41 @@ function formatSize(bytes) {
 function modelLabel(model) {
   const notes = [formatSize(model.bytes)];
   if (!model.complete) notes.push("download incomplete");
-  if (!model.supported) notes.push("unsupported " + (model.model_type || "model type"));
   return model.id + " — " + notes.join(", ");
 }
 
-// The cached models as options; the selected id stays listed even when it is not cached.
+// The catalog entry for an id, from the cache when it is there and otherwise from this build's
+// supported releases. Only a profile the engine can actually run is returned.
+function modelProfile(id) {
+  if (!id) return null;
+  const cached = (S.models?.models || []).find((model) => model.id === id && model.supported);
+  if (cached) return cached;
+  return (S.state?.supported?.models || []).find((model) => model.id === id) || null;
+}
+
+// The cache is the source of model instances: supported entries are options. A canonical release
+// that has not been downloaded yet is also an option, so Download has a target. An unsupported
+// cached model is never selectable.
 function paintModels(selected) {
   const select = $("model-id");
   const current = selected ?? (select.value || S.state?.config?.model?.id || "");
-  const models = S.models?.models || [];
-  const options = models.map((model) => ({
+  const cache = S.models?.models || [];
+  const options = cache.filter((model) => model.supported).map((model) => ({
     value: model.id,
     text: modelLabel(model),
-    disabled: !model.supported && model.id !== current,
+    disabled: false,
   }));
-  if (current && !models.some((model) => model.id === current)) {
-    options.unshift({ value: current, text: current + (S.models ? " — not in the cache" : ""), disabled: false });
+  for (const model of S.state?.supported?.models || []) {
+    if (!cache.some((entry) => entry.id === model.id)) {
+      options.push({ value: model.id, text: model.id + " — not downloaded", disabled: false });
+    }
+  }
+  if (current && !options.some((option) => option.value === current)) {
+    const cached = cache.find((model) => model.id === current);
+    const why = cached
+      ? (!cached.complete ? "download incomplete" : "unsupported " + (cached.model_type || "model type"))
+      : "not a release this build can run";
+    options.unshift({ value: current, text: current + " — " + why, disabled: true });
   }
   const signature = JSON.stringify(options);
   if (select.dataset.signature !== signature) {
@@ -513,6 +533,30 @@ function paintModels(selected) {
   }
   select.value = current;
   paintModelSource();
+}
+
+// Choosing a model fixes the architecture and engine; they are one choice, not two.
+function applyModelProfile(id = $("model-id").value, dirty = true) {
+  const profile = modelProfile(id);
+  if (!profile) return false;
+  let changed = false;
+  if (profile.weights && $("model-weights").value !== profile.weights) {
+    $("model-weights").value = profile.weights;
+    changed = true;
+  }
+  if (profile.engine && $("engine-kind").value !== profile.engine) {
+    $("engine-kind").value = profile.engine;
+    changed = true;
+  }
+  if (profile.context_tokens) {
+    $("max-context").max = profile.context_tokens;
+    if (Number($("max-context").value) > profile.context_tokens) {
+      $("max-context").value = profile.context_tokens;
+      changed = true;
+    }
+  }
+  if (dirty && changed) markDirty();
+  return true;
 }
 
 // Where the selected model's weights come from, under the selector.
@@ -777,7 +821,7 @@ const GUIDE = ["find", "network", "software", "download", "copy", "convert", "la
 const GUIDE_TITLES = {
   find: "Find your Sparks",
   network: "Connect the fast network",
-  software: "Install on the other Sparks",
+  software: "Deploy the server",
   download: "Download the model",
   copy: "Copy the model to the other Sparks",
   convert: "Prepare the weights",
@@ -856,10 +900,11 @@ function guideModel(state) {
   const found = saved && (solo || (!!setup && nodes.every((node) => node.reachable)) || sshOk);
   const networkErrors = errors.filter((finding) => finding.rank === null || finding.rank === undefined || nodes[finding.rank]?.reachable !== false);
   const conversion = wantsConversion(state);
+  const deployFailed = latestJob(ofKind("sync-software"))?.status === "failed";
   const steps = {
     find: { done: found },
     network: { done: solo || (found && !!setup?.plan && networkErrors.length === 0 && planApplied(config, setup.plan)) },
-    software: { done: solo || (found && all("software")), running: runningJob(ofKind("sync-software")) },
+    software: { done: solo || (!deployFailed && found && all("software")), failed: deployFailed, running: runningJob(ofKind("sync-software")) },
     download: {
       // The cache lookup in /api/state is authoritative; the node check only confirms it once
       // the read-only probe has run.
@@ -964,7 +1009,7 @@ function findBody(state) {
       : "No other Sparks answered. Check that they are on and connected, then press Search again, or type a name below.") + "</p>");
   } else {
     parts.push('<div class="picks">' + candidates.map((candidate) => {
-      const checked = picked.includes(candidate);
+      const checked = picked.includes(candidate.ssh);
       const sub = candidate.address && candidate.address !== candidate.name ? candidate.address : (candidate.name !== candidate.ssh ? candidate.ssh : "");
       return '<label class="pick' + (checked ? " on" : "") + '"><input type="checkbox" data-pick="' + esc(candidate.ssh) + '"' + (checked ? " checked" : "") + ">" +
         '<span class="pick-name">' + esc(candidate.name) + (sub ? '<small class="mono">' + esc(sub) + "</small>" : "") + "</span>" +
@@ -1188,8 +1233,18 @@ function softwareBody(state, model) {
   if (!setup) return waitingForCheck();
   const lead = setup.nodes[0];
   if (lead.software !== "ready") {
-    return '<p class="guide-note">This Spark does not have the server built yet. Open a terminal on this Spark and run the setup script; it builds everything and restarts this page.</p>' +
-      codeBlock("Run in a terminal on this Spark", "cd " + state.config.paths.repo_root + "\n./scripts/setup.sh");
+    const preparing = runningJob((job) => job.kind === "bootstrap-cubins" || job.kind === "bootstrap-nccl");
+    const parts = [
+      '<p class="guide-note">This Spark does not have a complete server yet. The control plane is building the GPU kernels or fetching NCCL automatically.</p>',
+    ];
+    if (preparing) {
+      parts.push(progressBar(preparing, "Preparing the local server…"));
+    } else {
+      parts.push(failureNote(latestJob((job) => job.kind === "bootstrap-cubins" || job.kind === "bootstrap-nccl"), "Preparing the local server"));
+      parts.push(actionRow('<button class="btn btn-primary" type="button" data-act="prepare">Retry preparation</button>',
+        "Builds the GPU kernels or fetches NCCL on this Spark. No terminal command is needed."));
+    }
+    return parts.join("");
   }
   const others = setup.nodes.slice(1);
   const running = model.steps.software.running;
@@ -1199,9 +1254,9 @@ function softwareBody(state, model) {
   } else {
     parts.push(failureNote(latestJob(ofKind("sync-software")), "The install"));
     const update = others.some((node) => node.software === "outdated");
-    const label = model.steps.software.done ? "Install again" : update ? "Update" : "Install";
+    const label = model.steps.software.done ? "Deploy again" : update ? "Update now" : "Deploy now";
     parts.push(actionRow('<button class="btn btn-primary" type="button" data-act="install">' + label + "</button>",
-      "Copies the server, its GPU kernels and the NCCL library. Takes about a minute."));
+      "This copy happens automatically. Use this button to retry after a failure."));
   }
   return parts.join("");
 }
@@ -1235,6 +1290,20 @@ function downloadBody(state, model) {
     return parts.join("");
   }
 
+  // A different complete repository in the same family may already be on this Spark. Offer it
+  // before starting a second hundreds-of-gigabytes download.
+  const alternatives = (S.models?.models || [])
+    .filter((entry) => entry.supported && entry.complete && entry.id !== config.model.id)
+    .sort((left, right) => left.id.localeCompare(right.id));
+  if (!cached && alternatives.length > 0) {
+    const alternative = alternatives[0];
+    parts.push('<p class="guide-facts">Already complete in the cache: <strong>' + esc(alternative.id) + "</strong> · " +
+      esc(formatSize(alternative.bytes)) + "</p>");
+    parts.push(actionRow(
+      '<button class="btn btn-primary" type="button" data-act="use-cached" data-model-id="' + esc(alternative.id) + '">Use this model</button>',
+      "No download needed. Other cached models are under Advanced settings."));
+  }
+
   if (!setup && !cached) return parts.join("") + waitingForCheck();
 
   const facts = [];
@@ -1261,6 +1330,38 @@ function downloadBody(state, model) {
   return parts.join("");
 }
 
+async function useCachedModel(id) {
+  if (!requireSaved()) return;
+  const model = (S.models?.models || []).find((entry) => entry.id === id);
+  if (!model || !model.supported || !model.complete) {
+    toast("That model is not a complete cached checkpoint this build can run.", true);
+    return;
+  }
+  const config = JSON.parse(JSON.stringify(S.state.config));
+  config.model.id = model.id;
+  config.model.checkpoint = "";
+  config.model.tokenizer = "";
+  if (model.weights) config.model.weights = model.weights;
+  if (model.engine) config.engine = { ...config.engine, kind: model.engine };
+  if (model.context_tokens) {
+    config.runtime.max_context_tokens = Math.min(
+      config.runtime.max_context_tokens || model.context_tokens,
+      model.context_tokens,
+    );
+  }
+  try {
+    await api("/api/config", { method: "PUT", body: JSON.stringify({ config }) });
+    clearDirty();
+    toast("Using " + model.id + " from the cache.");
+    await refreshState();
+    paintConfig(S.state.config, S.state.discovery, true);
+    await loadModels(true);
+    await inspect(true);
+  } catch (error) {
+    toast("Not saved: " + error.message, true);
+  }
+}
+
 function copyBody(state, model) {
   const setup = model.setup;
   if (!setup) return waitingForCheck();
@@ -1284,19 +1385,55 @@ function convertBody(state, model) {
   const setup = model.setup;
   if (!setup) return waitingForCheck();
   const running = S.jobs.filter((job) => job.status === "running" && isConvert(job));
+  const percentOf = (job) => {
+    const total = job?.progress?.total || 0;
+    return total > 0 ? Math.min(100, Math.floor((job.progress.done / total) * 100)) : null;
+  };
   const parts = [nodeChips(setup.nodes, "converted", (node) => {
     const job = running.find((entry) => entry.kind === "convert-r" + node.rank);
-    return job ? "Preparing, " + fmtDuration(Date.now() - job.started_ms) : "";
+    if (!job) return "";
+    const percent = percentOf(job);
+    return percent === null ? "Preparing, " + fmtDuration(Date.now() - job.started_ms) : percent + "%";
   })];
   if (running.length > 0) {
+    const ordered = [...running].sort((left, right) =>
+      Number(left.kind.slice("convert-r".length)) - Number(right.kind.slice("convert-r".length)));
+    const hostBars = ordered.map((job) => {
+      const rank = Number(job.kind.slice("convert-r".length));
+      const node = setup.nodes[rank] || {};
+      const host = node.hostname || node.ssh || "rank " + rank;
+      return '<div class="convert-host"><div class="convert-host-head"><span>' + esc(host) +
+        '</span><span class="mono">rank ' + rank + "</span></div>" +
+        progressBar(job, "Waiting for the first progress report…") + "</div>";
+    }).join("");
+    if (hostBars) parts.push('<div class="convert-hosts">' + hostBars + "</div>");
     const label = running.length === 4
       ? "All four Sparks are converting their part of the model at the same time."
       : running.length + (running.length === 1 ? " Spark is" : " Sparks are") + " converting weights…";
-    parts.push(progressBar(null, label));
+    const reporting = running.filter((job) => percentOf(job) !== null);
+    let barJob = null;
+    if (reporting.length > 0) {
+      const done = reporting.reduce((sum, job) => sum + job.progress.done, 0);
+      const total = reporting.reduce((sum, job) => sum + job.progress.total, 0);
+      const detail = running
+        .map((job) => "rank " + job.kind.slice("convert-r".length) + ": " + (percentOf(job) ?? 0) + "%")
+        .join(" · ");
+      barJob = { progress: { done, total, detail } };
+    }
+    parts.push(progressBar(barJob, label));
     return parts.join("");
   }
   for (const rank of [0, 1, 2, 3]) {
     parts.push(failureNote(latestJob(ofKind("convert-r" + rank)), "Preparing " + (setup.nodes[rank]?.hostname || "rank " + rank)));
+  }
+  if (model.steps.convert.done) {
+    const completed = setup.nodes.map((node) => {
+      const host = node.hostname || node.ssh || "rank " + node.rank;
+      return '<div class="convert-host"><div class="convert-host-head"><span>' + esc(host) +
+        '</span><span class="mono">rank ' + node.rank + "</span></div>" +
+        progressBar({ progress: { done: 1, total: 1, detail: "Prepared" } }, "Prepared") + "</div>";
+    }).join("");
+    parts.push('<div class="convert-hosts">' + completed + "</div>");
   }
   if (model.online) {
     parts.push('<p class="guide-note">Stop the server (on the Overview page) before preparing the weights again.</p>');
@@ -1328,10 +1465,22 @@ function launchBody(state, model) {
     parts.push('<p class="guide-note">Speed, requests and memory are on the <a href="#overview">Overview</a> page.</p>');
     return parts.join("");
   }
-  if (running || model.online) {
-    parts.push(progressBar(running, model.solo
-      ? "Starting this Spark's server and loading the model."
-      : "Starting the four Sparks and loading the model (~25 seconds)."));
+  const launchJob = latestJob(ofKind("launch"));
+  // The launcher job ends as soon as the four detached ranks are alive. The server then loads its
+  // weights for 25 s on a release build, and considerably longer on a debug build; without this
+  // state the step would show Start again while the loading process was healthy.
+  const loading = !running && !model.online && launchJob?.status === "succeeded" &&
+    launchJob.finished_ms && Date.now() - launchJob.finished_ms < 10 * 60 * 1000;
+  if (running || model.online || loading) {
+    parts.push(progressBar(running, loading
+      ? "The server is loading its weights. A debug build can take a few minutes."
+      : model.solo
+        ? "Starting this Spark's server and loading the model."
+        : "Starting the four Sparks and loading the model (~25 seconds)."));
+    if (loading) {
+      parts.push('<p class="guide-note">The ranks are running; this step completes when rank 0 answers <code>/readyz</code>. ' +
+        "A release build boots much faster than this debug binary.</p>");
+    }
     return parts.join("");
   }
   parts.push(failureNote(latestJob(ofKind("launch")), "Starting the server"));
@@ -1491,6 +1640,7 @@ function maybeInspect() {
   const stale = !freshSetup(state) && S.inspectedFor !== nodes;
   const old = !S.autoInspected && (!state.setup || state.now_ms - state.setup.checked_ms > 120000);
   S.autoInspected = true;
+  if (finished) loadModels(true);
   if (finished || stale || old) inspect(true);
 }
 
@@ -1576,6 +1726,12 @@ function bindGuide() {
         break;
       case "install":
         if (requireSaved()) postAction("/api/actions/sync", { what: "software" }, false);
+        break;
+      case "prepare":
+        if (requireSaved()) postAction("/api/actions/prepare", undefined, false);
+        break;
+      case "use-cached":
+        useCachedModel(action.dataset.modelId);
         break;
       case "download":
         if (!requireSaved()) break;
@@ -2175,7 +2331,10 @@ function bindEvents() {
   });
 
   $("rescan-models").addEventListener("click", () => loadModels());
-  $("model-id").addEventListener("change", paintModelSource);
+  $("model-id").addEventListener("change", () => {
+    applyModelProfile();
+    paintModelSource();
+  });
   $("checkpoint").addEventListener("input", paintModelSource);
 
   const form = $("config-form");
