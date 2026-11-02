@@ -207,27 +207,27 @@ impl DeviceSequence {
                 batch as u64,
             ],
         )?;
-        // The chunk's keys and values land in the cache as one contiguous run, so
-        // the append is a flat copy of batch * kv_width floats rather than one copy
-        // per token.
+        // The chunk's keys and values land in the cache as one contiguous run, so the append
+        // narrows batch * kv_width f32 projections to BF16 in one pass rather than one copy per
+        // token. The cache holds the model dtype, not the kernels' working f32.
         let kv_elems = batch * kv_width;
         let kv_blocks = kv_elems.div_ceil(256).max(1) as u32;
         self.launch(
-            kernels.copy_flat,
+            kernels.cache_bf16,
             (kv_blocks, 1, 1),
             (256, 1, 1),
             &[
-                keys.offset(position * kv_width * 4).0,
+                keys.offset(position * kv_width * 2).0,
                 self.kv_row.0,
                 kv_elems as u64,
             ],
         )?;
         self.launch(
-            kernels.copy_flat,
+            kernels.cache_bf16,
             (kv_blocks, 1, 1),
             (256, 1, 1),
             &[
-                values.offset(position * kv_width * 4).0,
+                values.offset(position * kv_width * 2).0,
                 self.value_row.0,
                 kv_elems as u64,
             ],
@@ -270,7 +270,7 @@ impl DeviceSequence {
             ],
         )?;
         self.launch(
-            kernels.copy_rows,
+            kernels.cache_rows_bf16,
             (
                 config.indexer_head_dim.div_ceil(256).max(1) as u32,
                 batch as u32,
@@ -278,7 +278,7 @@ impl DeviceSequence {
             ),
             (256, 1, 1),
             &[
-                index_keys.offset(position * config.indexer_head_dim * 4).0,
+                index_keys.offset(position * config.indexer_head_dim * 2).0,
                 self.index_row.offset(idx_q_width * 4).0,
                 config.indexer_head_dim as u64,
                 config.indexer_head_dim as u64,

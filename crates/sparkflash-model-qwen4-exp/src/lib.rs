@@ -105,17 +105,20 @@ pub const MAX_OUTPUT_TOKENS: usize = 32_768;
 ///
 /// This is the released checkpoint's full 262,144-position window. The QSA indexer selects
 /// 2,048 tokens per query out of complete 4-token blocks, so the KV cache grows with the
-/// sequence rather than staying in a sliding window. The QSA K/V cache at 12 sparse layers is
-/// 12 x 262,144 x 2 x 256 x 4 bytes = 6.4 GiB at f32, plus 1.6 GiB of indexer keys and 113 MiB
-/// of Gated DeltaNet state, beside 77.8 GiB of device weights. That fits a 128 GiB node; a
-/// caller that wants a smaller window can still pass `--context`.
+/// sequence rather than staying in a sliding window. At BF16 the 12 sparse layers' K/V, the
+/// indexer keys and the MTP layer's caches are 6.0 + 0.75 + 0.56 GiB, and the f32 Gated DeltaNet
+/// live state plus its verify spare is 0.21 GiB, beside 77.8 GiB of device weights. That fits a
+/// 128 GiB node; a caller that wants a smaller window can still pass `--context`.
 pub const DEFAULT_DEVICE_CONTEXT: usize = CONTEXT_TOKENS;
 
-/// QSA K/V bytes one context token adds at the 12 sparse layers.
-pub const QSA_KV_BYTES_PER_TOKEN: u64 = 12 * 2 * 256 * 4;
-/// Indexer-key bytes one context token adds at the 12 sparse layers.
-pub const INDEXER_KV_BYTES_PER_TOKEN: u64 = 12 * 128 * 4;
-/// The Gated DeltaNet recurrent state, which is independent of context length.
+/// QSA K/V bytes one context token adds at the 12 sparse layers: both caches, BF16.
+pub const QSA_KV_BYTES_PER_TOKEN: u64 = 12 * 2 * 512 * 2;
+/// Indexer-key bytes one context token adds at the 12 sparse layers, BF16.
+pub const INDEXER_KV_BYTES_PER_TOKEN: u64 = 12 * 128 * 2;
+/// The MTP layer's key, value and indexer-key caches, BF16, per context token.
+pub const MTP_KV_BYTES_PER_TOKEN: u64 = (2 * 512 + 128) * 2;
+/// One Gated DeltaNet recurrent state, which is independent of context length; the session holds
+/// the live state and, when a verify checks more than one row, a spare beside it.
 pub const GDN_RECURRENT_BYTES: u64 = 36 * 48 * 128 * 128 * 4;
 /// The KV memory a packed serve may spend before it must refuse more workers.
 ///
@@ -123,7 +126,7 @@ pub const GDN_RECURRENT_BYTES: u64 = 36 * 48 * 128 * 128 * 4;
 /// table keeps paging in as n-grams are touched. It is the slice the session caches are allowed to
 /// claim, and it is sized for the machine this arm is developed and served on - a 116 GiB unified
 /// memory node, where the weights leave about 35 GiB and the table grows into most of it. One
-/// released 262,144-token window is 8.17 GiB, so this admits exactly one full window, and a second
+/// released 262,144-token window is 7.52 GiB, so this admits exactly one full window, and a second
 /// session has to come from a shorter `--context`. A node with more room raises it with
 /// `--kv-budget-gib`; the earlier 20 GiB slice admitted two full windows and is what this laptop
 /// could not hold.
@@ -136,9 +139,18 @@ pub const fn kv_budget_bytes(gib: usize) -> u64 {
 }
 
 /// KV bytes one session allocates at `context` tokens.
+///
+/// This is the whole set of KV/state caches `DeviceSequence::allocate` claims: the sparse
+/// layers' K/V and indexer keys, the MTP layer's caches, the live Gated DeltaNet recurrent state
+/// and the spare a verify keeps beside it. The spare is allocated whenever a verify checks more
+/// than one row, which is the default; counting it here makes the admission guard an upper bound
+/// either way. Per-session scratch, prefill buffers and a loaded DFlash drafter's own scratch are
+/// outside this figure.
 #[must_use]
 pub const fn sequence_kv_bytes(context: usize) -> u64 {
-    (context as u64) * (QSA_KV_BYTES_PER_TOKEN + INDEXER_KV_BYTES_PER_TOKEN) + GDN_RECURRENT_BYTES
+    (context as u64)
+        * (QSA_KV_BYTES_PER_TOKEN + INDEXER_KV_BYTES_PER_TOKEN + MTP_KV_BYTES_PER_TOKEN)
+        + 2 * GDN_RECURRENT_BYTES
 }
 
 /// KV bytes `concurrency` sessions allocate at `context` tokens.
@@ -161,7 +173,7 @@ mod tests {
     #[test]
     fn the_kv_budget_admits_one_default_session_on_this_laptop_and_refuses_two() {
         let one = sequence_kv_bytes(DEFAULT_DEVICE_CONTEXT);
-        assert_eq!(one, 8_166_309_888);
+        assert_eq!(one, 8_078_229_504);
         assert!(one <= CONCURRENCY_KV_BUDGET_BYTES);
         assert!(concurrency_kv_bytes(DEFAULT_DEVICE_CONTEXT, 2) > CONCURRENCY_KV_BUDGET_BYTES);
         // Two sessions fit the same slice at half the window, which is the split a laptop serves.

@@ -19,6 +19,7 @@
 //! tests hold it to that at the released shape and a narrower one, over selections from empty
 //! to the most it stages. They skip - loudly - without an embedded cubin or a CUDA driver.
 
+use half::bf16;
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_model_qwen4_exp::device::{
     ATTN_GROUP_HEADS, ATTN_GROUP_SELECTED, ATTN_GROUP_SHARED_BYTES, MAX_SELECTED_TOKENS,
@@ -64,6 +65,16 @@ fn upload(cuda: &Cuda, bytes: &[u8]) -> Deviceptr {
 }
 
 fn upload_f32(cuda: &Cuda, values: &[f32]) -> Deviceptr {
+    upload(
+        cuda,
+        &values
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn upload_bf16(cuda: &Cuda, values: &[bf16]) -> Deviceptr {
     upload(
         cuda,
         &values
@@ -122,11 +133,11 @@ fn grouped_matches_per_head(shape: &Shape, counts: &[usize]) {
     // A query four times the keys' scale gives a peaked softmax, so the weights span the range.
     let q: Vec<f32> = (0..tokens * width).map(|_| 4.0 * rng.next()).collect();
     let gate: Vec<f32> = (0..tokens * width).map(|_| 3.0 * rng.next()).collect();
-    let keys: Vec<f32> = (0..context * kv_heads * head_dim)
-        .map(|_| rng.next())
+    let keys: Vec<bf16> = (0..context * kv_heads * head_dim)
+        .map(|_| bf16::from_f32(rng.next()))
         .collect();
-    let values: Vec<f32> = (0..context * kv_heads * head_dim)
-        .map(|_| rng.next())
+    let values: Vec<bf16> = (0..context * kv_heads * head_dim)
+        .map(|_| bf16::from_f32(rng.next()))
         .collect();
     let mut selected = vec![0i32; tokens * MAX_SELECTED_TOKENS];
     for (token, &count) in counts.iter().enumerate() {
@@ -137,8 +148,8 @@ fn grouped_matches_per_head(shape: &Shape, counts: &[usize]) {
     let count: Vec<i32> = counts.iter().map(|&count| count as i32).collect();
     let q = upload_f32(&cuda, &q);
     let gate = upload_f32(&cuda, &gate);
-    let keys = upload_f32(&cuda, &keys);
-    let values = upload_f32(&cuda, &values);
+    let keys = upload_bf16(&cuda, &keys);
+    let values = upload_bf16(&cuda, &values);
     let selected = upload_i32(&cuda, &selected);
     let count = upload_i32(&cuda, &count);
     let run = |kernel: Kernel, group: usize| {
@@ -246,16 +257,16 @@ fn bench_the_attention_kernels() {
     let (heads, kv_heads, head_dim, context) = (24usize, 2usize, 256usize, 8192usize);
     let groups = heads / kv_heads;
     let mut rng = Lcg(0xbe_7c4);
-    let keys = upload_f32(
+    let keys = upload_bf16(
         &cuda,
         &(0..context * kv_heads * head_dim)
-            .map(|_| rng.next())
+            .map(|_| bf16::from_f32(rng.next()))
             .collect::<Vec<_>>(),
     );
-    let values = upload_f32(
+    let values = upload_bf16(
         &cuda,
         &(0..context * kv_heads * head_dim)
-            .map(|_| rng.next())
+            .map(|_| bf16::from_f32(rng.next()))
             .collect::<Vec<_>>(),
     );
     for (rows, count) in [

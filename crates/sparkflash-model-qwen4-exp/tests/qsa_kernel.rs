@@ -68,6 +68,16 @@ fn upload_f32(cuda: &Cuda, values: &[f32]) -> Deviceptr {
     )
 }
 
+fn upload_bf16(cuda: &Cuda, values: &[bf16]) -> Deviceptr {
+    upload(
+        cuda,
+        &values
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn download_f32(cuda: &Cuda, pointer: &Deviceptr, elements: usize) -> Vec<f32> {
     cuda.synchronize().expect("synchronize");
     let mut bytes = vec![0u8; elements * 4];
@@ -101,18 +111,25 @@ fn the_block_scores_sum_in_the_block_trees_order() {
     const DIM: usize = 128;
     const HEADS: usize = 4;
     const RATIO: usize = 4;
-    // Rows that straddle block ends and a score tile's 64 blocks.
-    let position = 1_013;
-    let rows = 300;
+    const ROTARY: usize = 64;
+    const ROPE_HALF: usize = ROTARY / 2;
+    // Rows that straddle block ends and a score tile's 64 blocks. The final block stays inside
+    // +/-100*pi, where the PTX cos/sin approximations have a documented error bound: at a larger
+    // angle a host powf/cos can differ from the device by more than the pooling tolerance even
+    // when the pool itself is right.
+    let position = 113;
+    let rows = 200;
     let stride = (position + rows) / RATIO + 1;
     let pooled_blocks = (position + rows) / RATIO;
     let mut rng = Lcg(0x1d_e8e5);
-    let keys: Vec<f32> = (0..(position + rows) * DIM).map(|_| rng.next()).collect();
+    let keys: Vec<bf16> = (0..(position + rows) * DIM)
+        .map(|_| bf16::from_f32(rng.next()))
+        .collect();
     let weight: Vec<bf16> = (0..DIM)
         .map(|_| bf16::from_f32(0.25 * rng.next()))
         .collect();
     let queries: Vec<f32> = (0..rows * HEADS * DIM).map(|_| rng.next()).collect();
-    let keys_on = upload_f32(&cuda, &keys);
+    let keys_on = upload_bf16(&cuda, &keys);
     let weight_on = upload(
         &cuda,
         &weight
@@ -139,7 +156,7 @@ fn the_block_scores_sum_in_the_block_trees_order() {
             pooled_on.0,
             DIM as u64,
             RATIO as u64,
-            64,
+            ROTARY as u64,
             10_000_000f32.to_bits() as u64,
             1e-6f32.to_bits() as u64,
         ],
@@ -167,6 +184,48 @@ fn the_block_scores_sum_in_the_block_trees_order() {
         pooled.iter().all(|value| value.is_finite()),
         "q4e_qsa_pool left a block unwritten"
     );
+    // The pool itself, against the same input the kernel read: widen each BF16 key, mean it over
+    // the block, RMS-normalise with the BF16 weight and rotate at the block's first position.
+    // This is what catches a wrong widening or stride that the score comparison alone cannot,
+    // because the score test reads the pooled key the kernel wrote either way.
+    for block in 0..pooled_blocks {
+        let mut mean = [0.0f32; DIM];
+        for (dim, value) in mean.iter_mut().enumerate() {
+            let mut sum = 0.0f32;
+            for token in 0..RATIO {
+                sum += keys[(block * RATIO + token) * DIM + dim].to_f32();
+            }
+            *value = sum / RATIO as f32;
+        }
+        let mut squares = [0.0f32; 128];
+        for (lane, value) in squares.iter_mut().zip(mean) {
+            *lane = value * value;
+        }
+        let scale = (block_tree(squares) / DIM as f32 + 1e-6).sqrt().recip();
+        let mut want = [0.0f32; DIM];
+        for (dim, value) in want.iter_mut().enumerate() {
+            *value = mean[dim] * scale * (1.0 + weight[dim].to_f32());
+        }
+        for dim in 0..ROPE_HALF {
+            let frequency = 10_000_000f32.powf(-2.0 * dim as f32 / ROTARY as f32);
+            let angle = (block * RATIO) as f32 * frequency;
+            let (sine, cosine) = angle.sin_cos();
+            let a = want[dim];
+            let b = want[dim + ROPE_HALF];
+            want[dim] = a * cosine - b * sine;
+            want[dim + ROPE_HALF] = a * sine + b * cosine;
+        }
+        for (dim, &expected) in want.iter().enumerate() {
+            let got = pooled[block * DIM + dim];
+            // The kernel rotates with __cosf/__sinf, whose documented absolute error near this
+            // range already exceeds 1e-5; the bound here leaves room for that and its powf.
+            let tolerance = 2e-4 * expected.abs().max(1.0);
+            assert!(
+                (got - expected).abs() <= tolerance,
+                "block {block} dim {dim}: pooled {got} against the host's {expected}"
+            );
+        }
+    }
     for row in 0..rows {
         let blocks = (position + row + 1) / RATIO;
         for block in 0..blocks {

@@ -1917,17 +1917,29 @@ extern "C" __global__ void q4e_rmsnorm_rows(const float* x, const __nv_bfloat16*
     }
 }
 
-// dst[row][0..width] = src[row][0..width] for rows rows of width floats each, with independent
-// strides: the indexer's per-token KV row into the cache.
-extern "C" __global__ void q4e_copy_rows(float* __restrict__ dst, const float* __restrict__ src,
-                                         int width, int dst_stride, int src_stride) {
+// dst[i] = BF16(src[i]), the KV cache's narrowing append: the projections and their rotary
+// stay f32, and the cache keeps what the reference keeps, the model dtype.
+extern "C" __global__ void q4e_cache_bf16(__nv_bfloat16* __restrict__ dst,
+                                          const float* __restrict__ src, int count) {
+    OPT_PDL_ENTRY();
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < count;
+         index += blockDim.x * gridDim.x) {
+        dst[index] = __float2bfloat16_rn(src[index]);
+    }
+}
+
+// dst[row][0..width] = BF16(src[row][0..width]) for rows rows, with independent strides: the
+// indexer's per-token row into its BF16 key cache.
+extern "C" __global__ void q4e_cache_rows_bf16(__nv_bfloat16* __restrict__ dst,
+                                               const float* __restrict__ src, int width,
+                                               int dst_stride, int src_stride) {
     OPT_PDL_ENTRY();
     const int row = blockIdx.y;
-    float* d = dst + (unsigned long long)row * dst_stride;
+    __nv_bfloat16* d = dst + (unsigned long long)row * dst_stride;
     const float* s = src + (unsigned long long)row * src_stride;
     for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < width;
          index += blockDim.x * gridDim.x) {
-        d[index] = s[index];
+        d[index] = __float2bfloat16_rn(s[index]);
     }
 }
 
@@ -3272,9 +3284,10 @@ extern "C" __global__ void q4e_rope(float* rows, int head_dim, int rotary, int p
 // rotated at the block's first position. It depends on the block's keys alone, so a forward pools
 // each block once for every row that scores it, where the score kernel used to pool a block again
 // for each row. blockIdx.x is the block; launch 128 threads.
-extern "C" __global__ void q4e_qsa_pool(const float* index_keys, const __nv_bfloat16* k_weight,
-                                        float* pooled_keys, int index_dim, int ratio, int rotary,
-                                        float theta, float eps) {
+extern "C" __global__ void q4e_qsa_pool(const __nv_bfloat16* index_keys,
+                                        const __nv_bfloat16* k_weight, float* pooled_keys,
+                                        int index_dim, int ratio, int rotary, float theta,
+                                        float eps) {
     OPT_PDL_ENTRY();
     const int block = blockIdx.x;
     if (index_dim > 128 || blockDim.x < 128) {
@@ -3288,7 +3301,8 @@ extern "C" __global__ void q4e_qsa_pool(const float* index_keys, const __nv_bflo
     if (live) {
         float sum = 0.0f;
         for (int token = 0; token < ratio; ++token) {
-            sum += index_keys[(unsigned long long)(block * ratio + token) * index_dim + dim];
+            sum += __bfloat162float(
+                index_keys[(unsigned long long)(block * ratio + token) * index_dim + dim]);
         }
         value = sum / (float)ratio;
     }
@@ -3588,8 +3602,8 @@ extern "C" __global__ void q4e_glm_pick(const float* scores, int* selected, int*
 // The softmax is three block-wide reductions over the whole slot array (max, sum) with the
 // normalising divide folded into the value loop, so the only barriers left are one per reduction.
 extern "C" __global__ void q4e_attn(const float* __restrict__ q, const float* __restrict__ gate,
-                                    const float* __restrict__ keys,
-                                    const float* __restrict__ values,
+                                    const __nv_bfloat16* __restrict__ keys,
+                                    const __nv_bfloat16* __restrict__ values,
                                     const int* __restrict__ selected,
                                     const int* __restrict__ selected_count,
                                     float* __restrict__ out, int heads, int kv_heads, int head_dim,
@@ -3626,11 +3640,11 @@ extern "C" __global__ void q4e_attn(const float* __restrict__ q, const float* __
     const float scale = sqrtf((float)head_dim);
 
     for (int slot = warp; slot < nsel; slot += warps) {
-        const float* krow =
+        const __nv_bfloat16* krow =
             keys + (unsigned long long)sel[slot] * kv_heads * head_dim + kv_head * head_dim;
         float dot = 0.0f;
         for (int dim = lane; dim < head_dim; dim += 32) {
-            dot += qh[dim] * krow[dim];
+            dot += qh[dim] * __bfloat162float(krow[dim]);
         }
         dot = q4e_warp_sum(dot);
         if (lane == 0) {
@@ -3656,8 +3670,9 @@ extern "C" __global__ void q4e_attn(const float* __restrict__ q, const float* __
         float accumulator = 0.0f;
         for (int slot = 0; slot < nsel; ++slot) {
             accumulator += logits[slot] *
-                           values[(unsigned long long)sel[slot] * kv_heads * head_dim +
-                                  kv_head * head_dim + dim];
+                           __bfloat162float(
+                               values[(unsigned long long)sel[slot] * kv_heads * head_dim +
+                                      kv_head * head_dim + dim]);
         }
         outh[dim] = gh != nullptr ? accumulator / total / (1.0f + __expf(-gh[dim]))
                                   : accumulator / total;
@@ -4001,7 +4016,7 @@ __device__ void q4e_block_sum_heads(float* value, float* scratch) {
 // Every head is computed exactly as q4e_attn computes it alone: the same lane takes the same
 // channels of a key in the same order, the same warp and block trees reduce them, and the value
 // sum runs over the slots in order, so the outputs are bit-identical. What changes is the
-// reading: a token's selected keys and values, 2 MiB each at the full budget, are read once for
+// reading: a token's selected keys and values, about 1 MiB each at the full budget, are read once for
 // the group instead of once a head, and twelve query heads share a KV head. The loads are batched
 // ahead of the arithmetic that consumes them, which reorders reads and nothing else.
 //
@@ -4010,8 +4025,8 @@ __device__ void q4e_block_sum_heads(float* value, float* scratch) {
 // of reduction floats a head, then the token's selection.
 extern "C" __global__ void q4e_attn_group(const float* __restrict__ q,
                                           const float* __restrict__ gate,
-                                          const float* __restrict__ keys,
-                                          const float* __restrict__ values,
+                                          const __nv_bfloat16* __restrict__ keys,
+                                          const __nv_bfloat16* __restrict__ values,
                                           const int* __restrict__ selected,
                                           const int* __restrict__ selected_count,
                                           float* __restrict__ out, int heads, int kv_heads,
@@ -4072,11 +4087,13 @@ extern "C" __global__ void q4e_attn_group(const float* __restrict__ q,
 #pragma unroll
         for (int k = 0; k < IN; ++k) {
             const int slot = base + k * warps < nsel ? base + k * warps : base;
-            const float* krow = keys + (unsigned long long)sel[slot] * kv_stride + kv_offset;
+            const __nv_bfloat16* krow =
+                keys + (unsigned long long)sel[slot] * kv_stride + kv_offset;
 #pragma unroll
             for (int step = 0; step < Q4E_BLOCK / 32; ++step) {
                 const int dim = lane + 32 * step;
-                key[k][step] = dim < head_dim ? krow[dim] : 0.0f;
+                key[k][step] =
+                    dim < head_dim ? __bfloat162float(krow[dim]) : 0.0f;
             }
         }
 #pragma unroll
@@ -4138,13 +4155,14 @@ extern "C" __global__ void q4e_attn_group(const float* __restrict__ q,
         for (int head = 0; head < HEADS; ++head) {
             accumulator[head] = 0.0f;
         }
-        const float* column = values + kv_offset + dim;
+        const __nv_bfloat16* column = values + kv_offset + dim;
         int slot = 0;
         for (; slot + UNROLL <= nsel; slot += UNROLL) {
             float value[UNROLL];
 #pragma unroll
             for (int u = 0; u < UNROLL; ++u) {
-                value[u] = column[(unsigned long long)sel[slot + u] * kv_stride];
+                value[u] = __bfloat162float(
+                    column[(unsigned long long)sel[slot + u] * kv_stride]);
             }
 #pragma unroll
             for (int u = 0; u < UNROLL; ++u) {
@@ -4156,7 +4174,8 @@ extern "C" __global__ void q4e_attn_group(const float* __restrict__ q,
             }
         }
         for (; slot < nsel; ++slot) {
-            const float value = column[(unsigned long long)sel[slot] * kv_stride];
+            const float value =
+                __bfloat162float(column[(unsigned long long)sel[slot] * kv_stride]);
 #pragma unroll
             for (int head = 0; head < HEADS; ++head) {
                 accumulator[head] += logits[head * Q4E_ATTN_GROUP_SELECTED + slot] * value;

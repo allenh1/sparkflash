@@ -599,7 +599,9 @@ struct Kernels {
     deinterleave: Kernel,
     rmsnorm_rows: Kernel,
     copy_flat: Kernel,
-    copy_rows: Kernel,
+    /// Narrow a f32 projection row into the BF16 KV cache, flat or one row at a time.
+    cache_bf16: Kernel,
+    cache_rows_bf16: Kernel,
     /// The tensor-core forms a prefill chunk takes (kernels/qwen4_prefill_sm121.cu).
     prefill: PrefillKernels,
 }
@@ -683,7 +685,8 @@ impl Kernels {
             deinterleave: named(cuda, "q4e_deinterleave")?,
             rmsnorm_rows: named(cuda, "q4e_rmsnorm_rows")?,
             copy_flat: named(cuda, "q4e_copy_flat")?,
-            copy_rows: named(cuda, "q4e_copy_rows")?,
+            cache_bf16: named(cuda, "q4e_cache_bf16")?,
+            cache_rows_bf16: named(cuda, "q4e_cache_rows_bf16")?,
             prefill: PrefillKernels::load(cuda)?,
         })
     }
@@ -1998,8 +2001,13 @@ struct DeviceSequence {
     position: usize,
     /// Floats per token in the indexer's block-score row; the chunk's score grid strides by it.
     score_stride: usize,
+    /// Each sparse layer's BF16 key cache, `context_limit * kv_proj_width` elements; the MTP
+    /// layer, when present, is one extra slot after the stack.
     keys: Vec<Option<Deviceptr>>,
+    /// Each sparse layer's BF16 value cache, the same shape as [Self::keys].
     values: Vec<Option<Deviceptr>>,
+    /// Each sparse layer's BF16 indexer-key cache, `context_limit * indexer_head_dim` elements;
+    /// the MTP layer, when present, is one extra slot after the stack.
     index_keys: Vec<Option<Deviceptr>>,
     gdn_conv: Vec<Option<Deviceptr>>,
     gdn_recurrent: Vec<Option<Deviceptr>>,
@@ -3768,10 +3776,18 @@ impl DeviceSequence {
         } else {
             let mut total = 0usize;
             let f32_bytes = |elements: usize| elements * 4;
-            let mut alloc = |elements: usize| -> Result<Deviceptr, BackendError> {
-                cuda.alloc(f32_bytes(elements), &mut total)
-                    .map_err(|error| BackendError::new("qwen4_device", error))
-            };
+            macro_rules! alloc {
+                ($elements:expr) => {
+                    cuda.alloc(f32_bytes($elements), &mut total)
+                        .map_err(|error| BackendError::new("qwen4_device", error))
+                };
+            }
+            macro_rules! alloc_bf16 {
+                ($elements:expr) => {
+                    cuda.alloc(($elements) * 2, &mut total)
+                        .map_err(|error| BackendError::new("qwen4_device", error))
+                };
+            }
             let mut keys = Vec::with_capacity(config.num_hidden_layers);
             let mut values = Vec::with_capacity(config.num_hidden_layers);
             let mut index_keys = Vec::with_capacity(config.num_hidden_layers);
@@ -3782,27 +3798,28 @@ impl DeviceSequence {
             for (index, kind) in config.layer_types.iter().enumerate() {
                 match kind {
                     LayerKind::Sparse => {
-                        keys.push(Some(alloc(context_limit * config.kv_proj_width())?));
-                        values.push(Some(alloc(context_limit * config.kv_proj_width())?));
-                        index_keys.push(Some(alloc(context_limit * config.indexer_head_dim)?));
+                        keys.push(Some(alloc_bf16!(context_limit * config.kv_proj_width())?));
+                        values.push(Some(alloc_bf16!(context_limit * config.kv_proj_width())?));
+                        index_keys
+                            .push(Some(alloc_bf16!(context_limit * config.indexer_head_dim)?));
                         gdn_conv.push(None);
                         gdn_recurrent.push(None);
                         gdn_spare.push(None);
                     }
                     LayerKind::Linear => {
                         let history = config.linear_conv_kernel_dim.saturating_sub(1);
-                        let conv = alloc(history.max(1) * config.linear_conv_width())?;
+                        let conv = alloc!(history.max(1) * config.linear_conv_width())?;
                         let rec_elems = config.linear_num_value_heads
                             * config.linear_key_head_dim
                             * config.linear_value_head_dim;
-                        let recurrent = alloc(rec_elems)?;
+                        let recurrent = alloc!(rec_elems)?;
                         keys.push(None);
                         values.push(None);
                         index_keys.push(None);
                         gdn_conv.push(Some(conv));
                         gdn_recurrent.push(Some(recurrent));
                         gdn_spare.push(if shared.verify_rows > 1 {
-                            Some(alloc(rec_elems)?)
+                            Some(alloc!(rec_elems)?)
                         } else {
                             None
                         });
@@ -3811,7 +3828,7 @@ impl DeviceSequence {
                 if config.ple_layer_ids.contains(&(index + 1)) {
                     let frames =
                         (config.ple_conv_kernel_size.saturating_sub(1)) * config.ngram_size;
-                    ple_conv.push(Some(alloc(frames.max(1) * width)?));
+                    ple_conv.push(Some(alloc!(frames.max(1) * width)?));
                 } else {
                     ple_conv.push(None);
                 }
@@ -3819,9 +3836,9 @@ impl DeviceSequence {
             if config.mtp_num_hidden_layers > 0 {
                 // The drafted layer has its own attention, so its keys, values and indexer keys
                 // are one more entry in the same lists the per-layer caches live in.
-                keys.push(Some(alloc(context_limit * config.kv_proj_width())?));
-                values.push(Some(alloc(context_limit * config.kv_proj_width())?));
-                index_keys.push(Some(alloc(context_limit * config.indexer_head_dim)?));
+                keys.push(Some(alloc_bf16!(context_limit * config.kv_proj_width())?));
+                values.push(Some(alloc_bf16!(context_limit * config.kv_proj_width())?));
+                index_keys.push(Some(alloc_bf16!(context_limit * config.indexer_head_dim)?));
                 gdn_conv.push(None);
                 gdn_recurrent.push(None);
                 gdn_spare.push(None);
@@ -3829,66 +3846,66 @@ impl DeviceSequence {
             }
             let snapshot_regions = shared.verify_rows.saturating_sub(1).max(1);
             let scratch = [
-                alloc(rows * width)?,
-                alloc(rows * width)?,
-                alloc(rows * hidden)?,
-                alloc(rows * config.hc_count)?,
-                alloc(rows * config.attn_out_width())?,
-                alloc(rows * hidden)?,
-                alloc(rows * config.q_proj_width())?,
-                alloc(rows * config.attn_out_width())?,
-                alloc(rows * config.attn_out_width())?,
-                alloc(rows * config.kv_proj_width())?,
-                alloc(rows * config.kv_proj_width())?,
-                alloc(
+                alloc!(rows * width)?,
+                alloc!(rows * width)?,
+                alloc!(rows * hidden)?,
+                alloc!(rows * config.hc_count)?,
+                alloc!(rows * config.attn_out_width())?,
+                alloc!(rows * hidden)?,
+                alloc!(rows * config.q_proj_width())?,
+                alloc!(rows * config.attn_out_width())?,
+                alloc!(rows * config.attn_out_width())?,
+                alloc!(rows * config.kv_proj_width())?,
+                alloc!(rows * config.kv_proj_width())?,
+                alloc!(
                     rows * (config.indexer_n_heads + config.indexer_kv_heads)
-                        * config.indexer_head_dim,
+                        * config.indexer_head_dim
                 )?,
-                alloc(rows * config.indexer_n_heads * config.indexer_head_dim)?,
-                alloc(attention_rows * MAX_SELECTED_TOKENS)?,
-                alloc(attention_rows)?,
-                alloc(
+                alloc!(rows * config.indexer_n_heads * config.indexer_head_dim)?,
+                alloc!(attention_rows * MAX_SELECTED_TOKENS)?,
+                alloc!(attention_rows)?,
+                alloc!(
                     attention_rows
-                        * (context_limit.div_ceil(config.indexer_compress_ratio.max(1)) + 1),
+                        * (context_limit.div_ceil(config.indexer_compress_ratio.max(1)) + 1)
                 )?,
-                alloc(rows * config.linear_conv_width())?,
-                alloc(rows * config.linear_conv_width())?,
-                alloc(rows * config.linear_value_width())?,
-                alloc(rows * config.linear_num_value_heads)?,
-                alloc(rows * config.linear_num_value_heads)?,
-                alloc(rows * config.linear_value_width())?,
-                alloc(shared.verify_rows * config.vocab_size)?,
-                alloc(rows * config.num_experts)?,
-                alloc(rows * config.num_experts_per_tok)?,
-                alloc(rows * config.num_experts_per_tok * hidden)?,
-                alloc(rows * config.num_experts_per_tok * config.moe_intermediate_size)?,
-                alloc(rows * config.hc_lowrank)?,
-                alloc(rows)?,
-                alloc(rows * config.shared_expert_intermediate_size)?,
-                alloc(rows * config.shared_expert_intermediate_size)?,
-                alloc(rows * hidden)?,
-                alloc(rows * config.ple_embed_dim)?,
-                alloc(rows * width)?,
-                alloc(rows * width)?,
-                alloc(rows * hidden)?,
-                alloc(rows * width)?,
-                alloc(rows * width)?,
-                alloc(rows * width)?,
-                alloc(rows * config.num_experts_per_tok)?,
-                alloc(2 * rows * config.num_experts_per_tok)?,
-                alloc(rows * config.hc_count * hidden)?,
-                alloc(GEMM_PARTIAL_FLOATS)?,
-                alloc(rows * width)?,
-                alloc(rows * hidden)?,
-                alloc(rows * hidden)?,
-                alloc(rows * width)?,
-                alloc(width)?,
-                alloc(snapshot_regions * snapshot_stride)?,
-                alloc(TILED_GEMV_BLOCKS)?,
-                alloc(linear_layers.max(1) * replay_stride)?,
-                alloc(
+                alloc!(rows * config.linear_conv_width())?,
+                alloc!(rows * config.linear_conv_width())?,
+                alloc!(rows * config.linear_value_width())?,
+                alloc!(rows * config.linear_num_value_heads)?,
+                alloc!(rows * config.linear_num_value_heads)?,
+                alloc!(rows * config.linear_value_width())?,
+                alloc!(shared.verify_rows * config.vocab_size)?,
+                alloc!(rows * config.num_experts)?,
+                alloc!(rows * config.num_experts_per_tok)?,
+                alloc!(rows * config.num_experts_per_tok * hidden)?,
+                alloc!(rows * config.num_experts_per_tok * config.moe_intermediate_size)?,
+                alloc!(rows * config.hc_lowrank)?,
+                alloc!(rows)?,
+                alloc!(rows * config.shared_expert_intermediate_size)?,
+                alloc!(rows * config.shared_expert_intermediate_size)?,
+                alloc!(rows * hidden)?,
+                alloc!(rows * config.ple_embed_dim)?,
+                alloc!(rows * width)?,
+                alloc!(rows * width)?,
+                alloc!(rows * hidden)?,
+                alloc!(rows * width)?,
+                alloc!(rows * width)?,
+                alloc!(rows * width)?,
+                alloc!(rows * config.num_experts_per_tok)?,
+                alloc!(2 * rows * config.num_experts_per_tok)?,
+                alloc!(rows * config.hc_count * hidden)?,
+                alloc!(GEMM_PARTIAL_FLOATS)?,
+                alloc!(rows * width)?,
+                alloc!(rows * hidden)?,
+                alloc!(rows * hidden)?,
+                alloc!(rows * width)?,
+                alloc!(width)?,
+                alloc!(snapshot_regions * snapshot_stride)?,
+                alloc!(TILED_GEMV_BLOCKS)?,
+                alloc!(linear_layers.max(1) * replay_stride)?,
+                alloc!(
                     (context_limit.div_ceil(config.indexer_compress_ratio.max(1)) + 1)
-                        * config.indexer_head_dim,
+                        * config.indexer_head_dim
                 )?,
             ];
             let ple_host_staging = cuda

@@ -307,9 +307,10 @@ replaces the 77.8 GiB per-tensor upload; it does not remove the checkpoint.
 
 `tests/device_parity.rs::the_converted_rank_file_matches_the_checkpoint_path` runs the whole TP=1
 loop over a file the converter wrote and requires the checkpoint path's logits; it agrees to
-~2e-7 relative on the tiny fixture. `DeviceSequence` allocates per-session KV/indexer caches (f32), GDN convolution and
-recurrent state, PLE convolution state and one workspace, then runs the layer order above one
-token at a time through `kernels/qwen4_exp_sm121.cu`.
+~2e-7 relative on the tiny fixture. `DeviceSequence` allocates per-session KV/indexer caches in
+BF16, the model dtype, plus f32 GDN convolution and recurrent state, PLE convolution state and one
+workspace, then runs the layer order above one token at a time through
+`kernels/qwen4_exp_sm121.cu`.
 
 Kernels: embed, BF16 GEMV, grouped zero-centred RMSNorm, hyper mix/inject, gated residual
 injection, SwiGLU, router softmax+top-k, NVFP4 expert body, MoE combine, GDN convolution and
@@ -741,12 +742,16 @@ the device arm cannot keep.
 
 ## Memory
 
-At TP=1 and the default 262,144-token window the QSA K/V caches are
-`12 x 262,144 x 2 x 256 x 4 = 6.4 GiB`, the indexer keys `12 x 262,144 x 128 x 4 = 1.6 GiB`, and
-the GDN recurrent state `36 x 48 x 128 x 128 x 4 = 113 MiB`. The steady state is about 80 GiB beside a
-128 GiB node. Each extra `--concurrency` worker allocates another cache set, which is why the
-serve path refuses a worker count whose caches exceed the 10 GiB slice; at the full window that is
-one session, and two fit the same slice at half the window. Upload peaks at one tensor at a time
+At TP=1 and the default 262,144-token window the BF16 QSA K/V caches are
+`12 x 262,144 x 2 x 512 x 2 = 6.0 GiB`, the BF16 indexer keys
+`12 x 262,144 x 128 x 2 = 0.75 GiB`, the MTP layer's BF16 key, value and indexer caches
+`262,144 x (2 x 512 + 128) x 2 = 0.56 GiB`, and the f32 GDN live state plus its verify spare
+`2 x 36 x 48 x 128 x 128 x 4 = 0.21 GiB`. One full target cache set is 7.52 GiB (per-session
+scratch, prefill buffers and a loaded drafter's scratch are outside it), and the steady state is
+about 85 GiB beside a 128 GiB node. Each extra `--concurrency` worker allocates another cache set,
+which is why the serve path refuses a worker count whose caches exceed the 10 GiB slice; at the
+full window that is one session, and two fit the same slice at half the window. Upload peaks at one
+tensor at a time
 because the loader reads it, copies it and drops the host copy; a bulk streaming loader is
 throughput work, not a correctness question.
 

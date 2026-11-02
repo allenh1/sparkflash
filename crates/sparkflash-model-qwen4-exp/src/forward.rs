@@ -262,11 +262,12 @@ pub struct ReferenceState {
 /// The key/value and indexer-key history of one sparse layer.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SparseState {
-    /// Rotated keys, one row of kv_heads * head_dim per position.
+    /// Rotated keys, one row of kv_heads * head_dim per position, rounded to the BF16 cache dtype.
     pub keys: Vec<Vec<f32>>,
-    /// Values, one row of kv_heads * head_dim per position.
+    /// Values, one row of kv_heads * head_dim per position, rounded to the BF16 cache dtype.
     pub values: Vec<Vec<f32>>,
-    /// Raw indexer keys before the block pooling norm, one idx_head_dim row per position.
+    /// Raw indexer keys before the block pooling norm, one idx_head_dim row per position, rounded
+    /// to the BF16 cache dtype.
     pub index_keys: Vec<Vec<f32>>,
 }
 
@@ -286,6 +287,14 @@ pub struct PleState {
     pub conv: Vec<Vec<f32>>,
     /// The rolling n-gram hasher (it owns the token window and the segment rule).
     pub hasher: PleHasher,
+}
+
+/// The cache keeps the model dtype, as the device store does: round one f32 row to BF16 and
+/// widen it back, so the host oracle reads the same keys and values the device cache holds.
+fn narrow_to_bf16(row: &mut [f32]) {
+    for value in row {
+        *value = half::bf16::from_f32(*value).to_f32();
+    }
 }
 
 fn silu(value: f32) -> f32 {
@@ -610,7 +619,9 @@ fn sparse_attention(
             keys[head * head_dim..(head + 1) * head_dim].copy_from_slice(&normalized);
         }
         apply_rope(&mut keys, head_dim, rotary, position, theta);
-        let values = v_proj.matvec(row);
+        let mut values = v_proj.matvec(row);
+        narrow_to_bf16(&mut keys);
+        narrow_to_bf16(&mut values);
         state.keys.push(keys.clone());
         state.values.push(values.clone());
 
@@ -619,7 +630,8 @@ fn sparse_attention(
         // block start.
         let index = index_qk.matvec(row);
         let mut index_queries = index[..index_heads * index_dim].to_vec();
-        let raw_key = index[index_heads * index_dim..].to_vec();
+        let mut raw_key = index[index_heads * index_dim..].to_vec();
+        narrow_to_bf16(&mut raw_key);
         for head in 0..index_heads {
             let normalized = rms_norm(
                 &index_queries[head * index_dim..(head + 1) * index_dim],
