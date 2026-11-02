@@ -51,6 +51,7 @@
 //! it would require the matching activation quantiser; this is the documented numeric difference
 //! from vLLM's W4A4 path, and the reason the parity gate is a tolerance, not bit identity.
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -545,7 +546,7 @@ struct GpuMtp {
 }
 
 #[derive(Debug)]
-struct GpuWeights {
+pub(crate) struct GpuWeights {
     embed: GpuMat,
     lm_head: GpuMat,
     mixer: GpuHyper,
@@ -700,14 +701,81 @@ fn bytes_bf16_scalar(bytes: &[u8], name: &str) -> Result<f32, String> {
     Ok(half::bf16::from_le_bytes(array).to_f32())
 }
 
-struct Uploader<'a> {
-    cuda: &'a Cuda,
+/// Where the weight walk puts each upload: a device allocation per weight ([Direct], the
+/// checkpoint path), or a converted rank file's slots ([crate::convert]).
+pub(crate) trait Sink {
+    /// Whether [Sink::weight] needs the bytes; a sink that only plans where they go, or already
+    /// holds them in a slab, takes the shapes alone and is handed no bytes.
+    fn wants_bytes(&self) -> bool;
+
+    /// Whether the walk should read the two per-tensor NVFP4 scales; a slab sink gets them from
+    /// the rank file's index instead.
+    fn wants_scalars(&self) -> bool {
+        self.wants_bytes()
+    }
+
+    /// The device address of the next weight, `key`, `len` bytes, which are `bytes` when the
+    /// sink wants them and empty when it does not.
+    fn weight(&mut self, key: &str, len: usize, bytes: Vec<u8>) -> Result<Deviceptr, String>;
+
+    /// Bytes built from addresses (the routed experts' pointer tables), which no rank file holds.
+    fn derived(&mut self, key: &str, len: usize, bytes: &[u8]) -> Result<Deviceptr, String>;
+
+    /// The two per-tensor NVFP4 scales; a sink that records them returns what the walk read, and
+    /// a slab sink returns the pair the rank file's index recorded.
+    fn nvfp4_scalars(&mut self, scale_2: f32, input_scale: f32) -> Result<(f32, f32), String>;
+}
+
+/// A weight's bytes against the length its shapes give, which every sink handed bytes checks.
+pub(crate) fn check_length(key: &str, len: usize, bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() == len {
+        Ok(())
+    } else {
+        Err(format!(
+            "{key} came to {} bytes where its shapes give {len}",
+            bytes.len()
+        ))
+    }
+}
+
+/// Each weight in its own device allocation, uploaded as it is read.
+pub(crate) struct Direct<'a> {
+    pub(crate) cuda: &'a Cuda,
+}
+
+impl Sink for Direct<'_> {
+    fn wants_bytes(&self) -> bool {
+        true
+    }
+
+    fn weight(&mut self, key: &str, len: usize, bytes: Vec<u8>) -> Result<Deviceptr, String> {
+        check_length(key, len, &bytes)?;
+        self.derived(key, len, &bytes)
+    }
+
+    fn derived(&mut self, _: &str, _: usize, bytes: &[u8]) -> Result<Deviceptr, String> {
+        let mut total = 0usize;
+        let pointer = self.cuda.alloc(bytes.len().max(4), &mut total)?;
+        self.cuda.copy_htod(&pointer, bytes)?;
+        Ok(pointer)
+    }
+
+    fn nvfp4_scalars(&mut self, scale_2: f32, input_scale: f32) -> Result<(f32, f32), String> {
+        Ok((scale_2, input_scale))
+    }
+}
+
+/// The checkpoint walk: each upload goes to the sink in the order the model is built.
+pub(crate) struct Uploader<'a> {
+    /// The context [Uploader::mat_e4m3] quantizes on; unset for the host-only convert walks.
+    cuda: Option<&'a Cuda>,
+    sink: RefCell<&'a mut dyn Sink>,
 }
 
 /// The rows or the columns `first..first + count` of a matrix: what one rank of a
 /// tensor-parallel world holds of it. `Rows(0, rows)` is the whole matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Part {
+pub(crate) enum Part {
     Rows(usize, usize),
     Columns(usize, usize),
 }
@@ -748,11 +816,23 @@ impl Part {
 }
 
 impl<'a> Uploader<'a> {
-    fn bytes(&self, bytes: &[u8]) -> Result<Deviceptr, String> {
-        let mut total = 0usize;
-        let pointer = self.cuda.alloc(bytes.len().max(4), &mut total)?;
-        self.cuda.copy_htod(&pointer, bytes)?;
-        Ok(pointer)
+    pub(crate) fn new(cuda: &'a Cuda, sink: &'a mut dyn Sink) -> Self {
+        Self {
+            cuda: Some(cuda),
+            sink: RefCell::new(sink),
+        }
+    }
+
+    /// A walk that places every weight but reads none, for the host-only convert passes.
+    pub(crate) fn planning(sink: &'a mut dyn Sink) -> Self {
+        Self {
+            cuda: None,
+            sink: RefCell::new(sink),
+        }
+    }
+
+    fn wants_bytes(&self) -> bool {
+        self.sink.borrow().wants_bytes()
     }
 
     fn mat(
@@ -773,17 +853,23 @@ impl<'a> Uploader<'a> {
         (rows, columns): (usize, usize),
         part: Part,
     ) -> Result<GpuMat, String> {
-        let bytes = source.read(name).map_err(|error| error.to_string())?;
-        let expected = rows * columns * 2;
-        if bytes.len() != expected {
-            return Err(format!(
-                "{name} is {} bytes, expected {expected} for a BF16 [{rows}, {columns}]",
-                bytes.len()
-            ));
-        }
         let (part_rows, part_columns) = part.shape((rows, columns))?;
+        let len = part_rows * part_columns * 2;
+        let bytes = if self.wants_bytes() {
+            let bytes = source.read(name).map_err(|error| error.to_string())?;
+            let expected = rows * columns * 2;
+            if bytes.len() != expected {
+                return Err(format!(
+                    "{name} is {} bytes, expected {expected} for a BF16 [{rows}, {columns}]",
+                    bytes.len()
+                ));
+            }
+            part.of(&bytes, (rows, columns)).into_owned()
+        } else {
+            Vec::new()
+        };
         Ok(GpuMat {
-            pointer: self.bytes(&part.of(&bytes, (rows, columns)))?,
+            pointer: self.sink.borrow_mut().weight(name, len, bytes)?,
             rows: part_rows,
             columns: part_columns,
         })
@@ -799,9 +885,12 @@ impl<'a> Uploader<'a> {
         rows: usize,
         columns: usize,
     ) -> Result<GpuMatE4m3, String> {
+        let cuda = self
+            .cuda
+            .ok_or_else(|| "the E4M3 quantization needs a device".to_owned())?;
         let matrix = self.mat(source, name, rows, columns)?;
-        let quantized = GpuMatE4m3::quantize(self.cuda, quantize, &matrix, &mut 0);
-        self.cuda.free_buffers(&[&matrix.pointer]);
+        let quantized = GpuMatE4m3::quantize(cuda, quantize, &matrix, &mut 0);
+        cuda.free_buffers(&[&matrix.pointer]);
         quantized
     }
 
@@ -819,12 +908,14 @@ impl<'a> Uploader<'a> {
         if part == Part::Rows(0, rows) {
             return Ok(whole);
         }
-        let (mut codes, mut scales) = (vec![0u8; rows * columns], vec![0u8; rows * 4]);
-        let copied = self
+        let cuda = self
             .cuda
+            .ok_or_else(|| "the E4M3 quantization needs a device".to_owned())?;
+        let (mut codes, mut scales) = (vec![0u8; rows * columns], vec![0u8; rows * 4]);
+        let copied = cuda
             .copy_dtoh(&mut codes, &whole.weight)
-            .and_then(|()| self.cuda.copy_dtoh(&mut scales, &whole.scales));
-        self.cuda.free_buffers(&[&whole.weight, &whole.scales]);
+            .and_then(|()| cuda.copy_dtoh(&mut scales, &whole.scales));
+        cuda.free_buffers(&[&whole.weight, &whole.scales]);
         copied?;
         let (part_rows, part_columns) = part.shape((rows, columns))?;
         if !part_columns.is_multiple_of(16) {
@@ -835,9 +926,10 @@ impl<'a> Uploader<'a> {
             Part::Rows(..) => part.of(&scales, (rows, 1)),
             Part::Columns(..) => scales.as_slice().into(),
         };
+        let codes = part.of(&codes, (rows, columns));
         Ok(GpuMatE4m3 {
-            weight: self.bytes(&part.of(&codes, (rows, columns)))?,
-            scales: self.bytes(&scales)?,
+            weight: self.bytes(codes.as_ref())?,
+            scales: self.bytes(scales.as_ref())?,
             rows: part_rows,
             columns: part_columns,
         })
@@ -849,15 +941,20 @@ impl<'a> Uploader<'a> {
         name: &str,
         elements: usize,
     ) -> Result<Deviceptr, String> {
-        let bytes = source.read(name).map_err(|error| error.to_string())?;
-        if bytes.len() != elements * 2 {
-            return Err(format!(
-                "{name} is {} bytes, expected {} for {elements} BF16 values",
-                bytes.len(),
-                elements * 2
-            ));
-        }
-        self.bytes(&bytes)
+        let len = elements * 2;
+        let bytes = if self.wants_bytes() {
+            let bytes = source.read(name).map_err(|error| error.to_string())?;
+            if bytes.len() != len {
+                return Err(format!(
+                    "{name} is {} bytes, expected {len} for {elements} BF16 values",
+                    bytes.len()
+                ));
+            }
+            bytes
+        } else {
+            Vec::new()
+        };
+        self.sink.borrow_mut().weight(name, len, bytes)
     }
 
     /// One block-scaled FP8 expert matrix: the codes and the BF16 inverse-scale grid.
@@ -868,26 +965,41 @@ impl<'a> Uploader<'a> {
         rows: usize,
         columns: usize,
     ) -> Result<(Deviceptr, Deviceptr), String> {
-        let weight = source
-            .read(&format!("{prefix}.weight"))
-            .map_err(|error| error.to_string())?;
-        let scales = source
-            .read(&format!("{prefix}.weight_scale_inv"))
-            .map_err(|error| error.to_string())?;
-        if weight.len() != rows * columns {
-            return Err(format!(
-                "{prefix}.weight is {} bytes, expected {rows} x {columns} for an FP8 matrix",
-                weight.len()
-            ));
-        }
-        let scale_bytes = ScaleGrid::Tile(128).len(rows, columns) * 2;
-        if scales.len() != scale_bytes {
-            return Err(format!(
-                "{prefix}.weight_scale_inv is {} bytes, expected {scale_bytes}",
-                scales.len()
-            ));
-        }
-        Ok((self.bytes(&weight)?, self.bytes(&scales)?))
+        let weight_len = rows * columns;
+        let scale_len = ScaleGrid::Tile(128).len(rows, columns) * 2;
+        let (weight, scales) = if self.wants_bytes() {
+            let weight = source
+                .read(&format!("{prefix}.weight"))
+                .map_err(|error| error.to_string())?;
+            let scales = source
+                .read(&format!("{prefix}.weight_scale_inv"))
+                .map_err(|error| error.to_string())?;
+            if weight.len() != weight_len {
+                return Err(format!(
+                    "{prefix}.weight is {} bytes, expected {weight_len} for an FP8 matrix",
+                    weight.len()
+                ));
+            }
+            if scales.len() != scale_len {
+                return Err(format!(
+                    "{prefix}.weight_scale_inv is {} bytes, expected {scale_len}",
+                    scales.len()
+                ));
+            }
+            (weight, scales)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let weight_pointer =
+            self.sink
+                .borrow_mut()
+                .weight(&format!("{prefix}.weight"), weight_len, weight)?;
+        let scale_pointer = self.sink.borrow_mut().weight(
+            &format!("{prefix}.weight_scale_inv"),
+            scale_len,
+            scales,
+        )?;
+        Ok((weight_pointer, scale_pointer))
     }
 
     fn nvfp4(
@@ -897,238 +1009,502 @@ impl<'a> Uploader<'a> {
         rows: usize,
         columns: usize,
     ) -> Result<GpuNvfp4, String> {
-        let weight = source
-            .read(&format!("{prefix}.weight"))
-            .map_err(|error| error.to_string())?;
-        let scales = source
-            .read(&format!("{prefix}.weight_scale"))
-            .map_err(|error| error.to_string())?;
-        let scale_2 = bytes_f32(
-            &source
-                .read(&format!("{prefix}.weight_scale_2"))
-                .map_err(|error| error.to_string())?,
-            prefix,
-        )?;
-        let input_scale = bytes_f32(
-            &source
-                .read(&format!("{prefix}.input_scale"))
-                .map_err(|error| error.to_string())?,
-            prefix,
-        )?;
-        if weight.len() != rows * columns.div_ceil(2) {
-            return Err(format!(
-                "{prefix}.weight is {} bytes, expected {} for an NVFP4 [{rows}, {columns}]",
-                weight.len(),
-                rows * columns.div_ceil(2)
-            ));
-        }
-        if scales.len() != rows * columns.div_ceil(16) {
-            return Err(format!(
-                "{prefix}.weight_scale is {} bytes, expected {}",
-                scales.len(),
-                rows * columns.div_ceil(16)
-            ));
-        }
+        let weight_len = rows * columns.div_ceil(2);
+        let scale_len = rows * columns.div_ceil(16);
+        let (weight, scales) = if self.wants_bytes() {
+            let weight = source
+                .read(&format!("{prefix}.weight"))
+                .map_err(|error| error.to_string())?;
+            let scales = source
+                .read(&format!("{prefix}.weight_scale"))
+                .map_err(|error| error.to_string())?;
+            if weight.len() != weight_len {
+                return Err(format!(
+                    "{prefix}.weight is {} bytes, expected {weight_len} for an NVFP4 [{rows}, {columns}]",
+                    weight.len()
+                ));
+            }
+            if scales.len() != scale_len {
+                return Err(format!(
+                    "{prefix}.weight_scale is {} bytes, expected {scale_len}",
+                    scales.len()
+                ));
+            }
+            (weight, scales)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let weight_pointer =
+            self.sink
+                .borrow_mut()
+                .weight(&format!("{prefix}.weight"), weight_len, weight)?;
+        let scale_pointer =
+            self.sink
+                .borrow_mut()
+                .weight(&format!("{prefix}.weight_scale"), scale_len, scales)?;
+        let (scale_2, input_scale) = if self.sink.borrow().wants_scalars() {
+            (
+                bytes_f32(
+                    &source
+                        .read(&format!("{prefix}.weight_scale_2"))
+                        .map_err(|error| error.to_string())?,
+                    prefix,
+                )?,
+                bytes_f32(
+                    &source
+                        .read(&format!("{prefix}.input_scale"))
+                        .map_err(|error| error.to_string())?,
+                    prefix,
+                )?,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        let (scale_2, input_scale) = self.sink.borrow_mut().nvfp4_scalars(scale_2, input_scale)?;
         Ok(GpuNvfp4 {
-            weight: self.bytes(&weight)?,
-            scales: self.bytes(&scales)?,
+            weight: weight_pointer,
+            scales: scale_pointer,
             scale_2,
             input_scale,
         })
     }
+
+    fn derived(&self, key: &str, bytes: &[u8]) -> Result<Deviceptr, String> {
+        self.sink.borrow_mut().derived(key, bytes.len(), bytes)
+    }
+
+    /// `bytes` of host memory as its own device allocation.
+    fn bytes(&self, bytes: &[u8]) -> Result<Deviceptr, String> {
+        let cuda = self
+            .cuda
+            .ok_or_else(|| "a device upload needs a device".to_owned())?;
+        let mut total = 0usize;
+        let pointer = cuda.alloc(bytes.len().max(4), &mut total)?;
+        cuda.copy_htod(&pointer, bytes)?;
+        Ok(pointer)
+    }
 }
 
 impl GpuWeights {
-    fn upload(
+    /// Upload every resident weight from the checkpoint into its own allocation.
+    pub(crate) fn upload(
         cuda: &Cuda,
         directory: &Path,
         source: &dyn WeightSource,
         config: &Qwen4ExpConfig,
     ) -> Result<Self, String> {
-        let uploader = Uploader { cuda };
-        let hidden = config.hidden_size;
-        let width = config.hyper_width();
-        let hyper = |prefix: String, inject: bool| -> Result<GpuHyper, String> {
-            Ok(GpuHyper {
-                norm: uploader.vector(source, &format!("{prefix}.hc_norm.weight"), width)?,
-                down: uploader.mat(
+        let mut sink = Direct { cuda };
+        build_weights(&Uploader::new(cuda, &mut sink), directory, source, config)
+    }
+}
+
+/// The weight walk: each upload goes to the uploader's sink in the model's order.
+pub(crate) fn build_weights(
+    uploader: &Uploader<'_>,
+    directory: &Path,
+    source: &dyn WeightSource,
+    config: &Qwen4ExpConfig,
+) -> Result<GpuWeights, String> {
+    let hidden = config.hidden_size;
+    let width = config.hyper_width();
+    let hyper = |prefix: String, inject: bool| -> Result<GpuHyper, String> {
+        Ok(GpuHyper {
+            norm: uploader.vector(source, &format!("{prefix}.hc_norm.weight"), width)?,
+            down: uploader.mat(
+                source,
+                &format!("{prefix}.input_mix_weight_down.weight"),
+                config.hc_lowrank,
+                width,
+            )?,
+            up: uploader.mat(
+                source,
+                &format!("{prefix}.input_mix_weight_up.weight"),
+                width,
+                config.hc_lowrank,
+            )?,
+            inject: if inject {
+                Some(uploader.mat(
                     source,
-                    &format!("{prefix}.input_mix_weight_down.weight"),
-                    config.hc_lowrank,
+                    &format!("{prefix}.block_inject_weight.weight"),
+                    config.hc_count,
                     width,
-                )?,
-                up: uploader.mat(
-                    source,
-                    &format!("{prefix}.input_mix_weight_up.weight"),
-                    width,
-                    config.hc_lowrank,
-                )?,
-                inject: if inject {
-                    Some(uploader.mat(
+                )?)
+            } else {
+                None
+            },
+        })
+    };
+    let embed = uploader.mat(
+        source,
+        "model.language_model.embed_tokens.weight",
+        config.vocab_size,
+        hidden,
+    )?;
+    let lm_head = uploader.mat(source, "lm_head.weight", config.vocab_size, hidden)?;
+    let mixer = hyper(
+        "model.language_model.hyper_connection_mixer".to_owned(),
+        false,
+    )?;
+    let mut layers = Vec::with_capacity(config.num_hidden_layers);
+    for (index, kind) in config.layer_types.iter().enumerate() {
+        let prefix = format!("model.language_model.layers.{index}");
+        let branch = match kind {
+            LayerKind::Linear => {
+                let prefix = format!("{prefix}.linear_attn");
+                GpuBranch::Linear {
+                    in_qkv: uploader.mat(
                         source,
-                        &format!("{prefix}.block_inject_weight.weight"),
-                        config.hc_count,
-                        width,
-                    )?)
-                } else {
-                    None
-                },
-            })
+                        &format!("{prefix}.in_proj_qkv.weight"),
+                        config.linear_conv_width(),
+                        hidden,
+                    )?,
+                    in_z: uploader.mat(
+                        source,
+                        &format!("{prefix}.in_proj_z.weight"),
+                        config.linear_value_width(),
+                        hidden,
+                    )?,
+                    in_b: uploader.mat(
+                        source,
+                        &format!("{prefix}.in_proj_b.weight"),
+                        config.linear_num_value_heads,
+                        hidden,
+                    )?,
+                    in_a: uploader.mat(
+                        source,
+                        &format!("{prefix}.in_proj_a.weight"),
+                        config.linear_num_value_heads,
+                        hidden,
+                    )?,
+                    out_proj: uploader.mat(
+                        source,
+                        &format!("{prefix}.out_proj.weight"),
+                        hidden,
+                        config.linear_value_width(),
+                    )?,
+                    conv: uploader.vector(
+                        source,
+                        &format!("{prefix}.conv1d.weight"),
+                        config.linear_conv_width() * config.linear_conv_kernel_dim,
+                    )?,
+                    a_log: uploader.vector(
+                        source,
+                        &format!("{prefix}.A_log"),
+                        config.linear_num_value_heads,
+                    )?,
+                    dt_bias: uploader.vector(
+                        source,
+                        &format!("{prefix}.dt_bias"),
+                        config.linear_num_value_heads,
+                    )?,
+                    norm: uploader.vector(
+                        source,
+                        &format!("{prefix}.norm.weight"),
+                        config.linear_value_head_dim,
+                    )?,
+                }
+            }
+            LayerKind::Sparse => {
+                let prefix = format!("{prefix}.self_attn");
+                GpuBranch::Sparse {
+                    q_proj: uploader.mat(
+                        source,
+                        &format!("{prefix}.q_proj.weight"),
+                        config.q_proj_width(),
+                        hidden,
+                    )?,
+                    k_proj: uploader.mat(
+                        source,
+                        &format!("{prefix}.k_proj.weight"),
+                        config.kv_proj_width(),
+                        hidden,
+                    )?,
+                    v_proj: uploader.mat(
+                        source,
+                        &format!("{prefix}.v_proj.weight"),
+                        config.kv_proj_width(),
+                        hidden,
+                    )?,
+                    o_proj: uploader.mat(
+                        source,
+                        &format!("{prefix}.o_proj.weight"),
+                        hidden,
+                        config.attn_out_width(),
+                    )?,
+                    q_norm: uploader.vector(
+                        source,
+                        &format!("{prefix}.q_norm.weight"),
+                        config.head_dim,
+                    )?,
+                    k_norm: uploader.vector(
+                        source,
+                        &format!("{prefix}.k_norm.weight"),
+                        config.head_dim,
+                    )?,
+                    index_qk: uploader.mat(
+                        source,
+                        &format!("{prefix}.indexer.index_qk_proj.weight"),
+                        (config.indexer_n_heads + config.indexer_kv_heads)
+                            * config.indexer_head_dim,
+                        hidden,
+                    )?,
+                    index_q_norm: uploader.vector(
+                        source,
+                        &format!("{prefix}.indexer.q_layernorm.weight"),
+                        config.indexer_head_dim,
+                    )?,
+                    index_k_norm: uploader.vector(
+                        source,
+                        &format!("{prefix}.indexer.k_layernorm.weight"),
+                        config.indexer_head_dim,
+                    )?,
+                }
+            }
         };
-        let embed = uploader.mat(
-            source,
-            "model.language_model.embed_tokens.weight",
-            config.vocab_size,
-            hidden,
-        )?;
-        let lm_head = uploader.mat(source, "lm_head.weight", config.vocab_size, hidden)?;
-        let mixer = hyper(
-            "model.language_model.hyper_connection_mixer".to_owned(),
-            false,
-        )?;
-        let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for (index, kind) in config.layer_types.iter().enumerate() {
-            let prefix = format!("model.language_model.layers.{index}");
-            let branch = match kind {
-                LayerKind::Linear => {
-                    let prefix = format!("{prefix}.linear_attn");
-                    GpuBranch::Linear {
-                        in_qkv: uploader.mat(
-                            source,
-                            &format!("{prefix}.in_proj_qkv.weight"),
-                            config.linear_conv_width(),
-                            hidden,
-                        )?,
-                        in_z: uploader.mat(
-                            source,
-                            &format!("{prefix}.in_proj_z.weight"),
-                            config.linear_value_width(),
-                            hidden,
-                        )?,
-                        in_b: uploader.mat(
-                            source,
-                            &format!("{prefix}.in_proj_b.weight"),
-                            config.linear_num_value_heads,
-                            hidden,
-                        )?,
-                        in_a: uploader.mat(
-                            source,
-                            &format!("{prefix}.in_proj_a.weight"),
-                            config.linear_num_value_heads,
-                            hidden,
-                        )?,
-                        out_proj: uploader.mat(
-                            source,
-                            &format!("{prefix}.out_proj.weight"),
-                            hidden,
-                            config.linear_value_width(),
-                        )?,
-                        conv: uploader.vector(
-                            source,
-                            &format!("{prefix}.conv1d.weight"),
-                            config.linear_conv_width() * config.linear_conv_kernel_dim,
-                        )?,
-                        a_log: uploader.vector(
-                            source,
-                            &format!("{prefix}.A_log"),
-                            config.linear_num_value_heads,
-                        )?,
-                        dt_bias: uploader.vector(
-                            source,
-                            &format!("{prefix}.dt_bias"),
-                            config.linear_num_value_heads,
-                        )?,
-                        norm: uploader.vector(
-                            source,
-                            &format!("{prefix}.norm.weight"),
-                            config.linear_value_head_dim,
-                        )?,
-                    }
-                }
-                LayerKind::Sparse => {
-                    let prefix = format!("{prefix}.self_attn");
-                    GpuBranch::Sparse {
-                        q_proj: uploader.mat(
-                            source,
-                            &format!("{prefix}.q_proj.weight"),
-                            config.q_proj_width(),
-                            hidden,
-                        )?,
-                        k_proj: uploader.mat(
-                            source,
-                            &format!("{prefix}.k_proj.weight"),
-                            config.kv_proj_width(),
-                            hidden,
-                        )?,
-                        v_proj: uploader.mat(
-                            source,
-                            &format!("{prefix}.v_proj.weight"),
-                            config.kv_proj_width(),
-                            hidden,
-                        )?,
-                        o_proj: uploader.mat(
-                            source,
-                            &format!("{prefix}.o_proj.weight"),
-                            hidden,
-                            config.attn_out_width(),
-                        )?,
-                        q_norm: uploader.vector(
-                            source,
-                            &format!("{prefix}.q_norm.weight"),
-                            config.head_dim,
-                        )?,
-                        k_norm: uploader.vector(
-                            source,
-                            &format!("{prefix}.k_norm.weight"),
-                            config.head_dim,
-                        )?,
-                        index_qk: uploader.mat(
-                            source,
-                            &format!("{prefix}.indexer.index_qk_proj.weight"),
-                            (config.indexer_n_heads + config.indexer_kv_heads)
-                                * config.indexer_head_dim,
-                            hidden,
-                        )?,
-                        index_q_norm: uploader.vector(
-                            source,
-                            &format!("{prefix}.indexer.q_layernorm.weight"),
-                            config.indexer_head_dim,
-                        )?,
-                        index_k_norm: uploader.vector(
-                            source,
-                            &format!("{prefix}.indexer.k_layernorm.weight"),
-                            config.indexer_head_dim,
-                        )?,
-                    }
-                }
-            };
-            let mlp = format!("{prefix}.mlp");
-            let experts = (0..config.num_experts)
-                .map(|expert| {
-                    let prefix = format!("{mlp}.experts.{expert}");
-                    Ok(GpuExpert {
-                        gate: uploader.nvfp4(
-                            source,
-                            &format!("{prefix}.gate_proj"),
-                            config.moe_intermediate_size,
-                            hidden,
-                        )?,
-                        up: uploader.nvfp4(
-                            source,
-                            &format!("{prefix}.up_proj"),
-                            config.moe_intermediate_size,
-                            hidden,
-                        )?,
-                        down: uploader.nvfp4(
-                            source,
-                            &format!("{prefix}.down_proj"),
-                            hidden,
-                            config.moe_intermediate_size,
-                        )?,
-                    })
+        let mlp = format!("{prefix}.mlp");
+        let experts = (0..config.num_experts)
+            .map(|expert| {
+                let prefix = format!("{mlp}.experts.{expert}");
+                Ok(GpuExpert {
+                    gate: uploader.nvfp4(
+                        source,
+                        &format!("{prefix}.gate_proj"),
+                        config.moe_intermediate_size,
+                        hidden,
+                    )?,
+                    up: uploader.nvfp4(
+                        source,
+                        &format!("{prefix}.up_proj"),
+                        config.moe_intermediate_size,
+                        hidden,
+                    )?,
+                    down: uploader.nvfp4(
+                        source,
+                        &format!("{prefix}.down_proj"),
+                        hidden,
+                        config.moe_intermediate_size,
+                    )?,
                 })
-                .collect::<Result<Vec<_>, String>>()?;
-            let moe = GpuMoe {
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let moe = GpuMoe {
+            router: uploader.mat(
+                source,
+                &format!("{mlp}.gate.weight"),
+                config.num_experts,
+                hidden,
+            )?,
+            shared: uploader.mat(
+                source,
+                &format!("{mlp}.shared_expert.gate_proj.weight"),
+                config.shared_expert_intermediate_size,
+                hidden,
+            )?,
+            shared_up: uploader.mat(
+                source,
+                &format!("{mlp}.shared_expert.up_proj.weight"),
+                config.shared_expert_intermediate_size,
+                hidden,
+            )?,
+            shared_down: uploader.mat(
+                source,
+                &format!("{mlp}.shared_expert.down_proj.weight"),
+                hidden,
+                config.shared_expert_intermediate_size,
+            )?,
+            shared_gate: uploader.mat(
+                source,
+                &format!("{mlp}.shared_expert_gate.weight"),
+                1,
+                hidden,
+            )?,
+            experts: GpuExperts::Nvfp4 {
+                table: {
+                    let mut pointers = Vec::with_capacity(experts.len() * 6 * 8);
+                    for expert in &experts {
+                        for pointer in [
+                            expert.gate.weight.0,
+                            expert.gate.scales.0,
+                            expert.up.weight.0,
+                            expert.up.scales.0,
+                            expert.down.weight.0,
+                            expert.down.scales.0,
+                        ] {
+                            pointers.extend_from_slice(&pointer.to_le_bytes());
+                        }
+                    }
+                    uploader.derived(&format!("{mlp}.experts.table"), &pointers)?
+                },
+                scales: {
+                    let mut scalars = Vec::with_capacity(experts.len() * 3 * 4);
+                    for expert in &experts {
+                        for scale in [expert.gate.scale_2, expert.up.scale_2, expert.down.scale_2] {
+                            scalars.extend_from_slice(&scale.to_le_bytes());
+                        }
+                    }
+                    uploader.derived(&format!("{mlp}.experts.scales"), &scalars)?
+                },
+            },
+        };
+        let ple = if config.ple_layer_ids.contains(&(index + 1)) {
+            let prefix = format!("{prefix}.ple");
+            let scale = bytes_bf16_scalar(
+                &source
+                    .read(&format!(
+                        "{prefix}.ple_embedding.ngram_embedding.weight_scale"
+                    ))
+                    .map_err(|error| error.to_string())?,
+                "the PLE scale",
+            )?;
+            let reader = crate::checkpoint::CheckpointRows::open(directory, config, index)?;
+            Some(GpuPle {
+                key_proj: uploader.mat(
+                    source,
+                    &format!("{prefix}.key_proj.weight"),
+                    width,
+                    config.ple_embed_dim,
+                )?,
+                value_proj: uploader.mat(
+                    source,
+                    &format!("{prefix}.value_proj.weight"),
+                    hidden,
+                    config.ple_embed_dim,
+                )?,
+                norm_key: uploader.vector(source, &format!("{prefix}.norm_key.weight"), width)?,
+                norm_query: uploader.vector(
+                    source,
+                    &format!("{prefix}.norm_query.weight"),
+                    width,
+                )?,
+                norm_conv: uploader.vector(source, &format!("{prefix}.norm_conv.weight"), width)?,
+                conv: uploader.vector(
+                    source,
+                    &format!("{prefix}.conv1d.weight"),
+                    width * config.ple_conv_kernel_size,
+                )?,
+                table: std::sync::Mutex::new(PleTable::new(config, reader, scale)?),
+            })
+        } else {
+            None
+        };
+        layers.push(GpuLayer {
+            branch,
+            attn_hyper: hyper(format!("{prefix}.attn_hyper_connection"), true)?,
+            mlp_hyper: hyper(format!("{prefix}.mlp_hyper_connection"), true)?,
+            moe,
+            ple,
+        });
+    }
+    let mtp = if config.mtp_num_hidden_layers > 0 {
+        let prefix = "mtp";
+        let layer = format!("{prefix}.layers.0");
+        let attn_prefix = format!("{layer}.self_attn");
+        let attn = GpuBranch::Sparse {
+            q_proj: uploader.mat(
+                source,
+                &format!("{attn_prefix}.q_proj.weight"),
+                config.q_proj_width(),
+                hidden,
+            )?,
+            k_proj: uploader.mat(
+                source,
+                &format!("{attn_prefix}.k_proj.weight"),
+                config.kv_proj_width(),
+                hidden,
+            )?,
+            v_proj: uploader.mat(
+                source,
+                &format!("{attn_prefix}.v_proj.weight"),
+                config.kv_proj_width(),
+                hidden,
+            )?,
+            o_proj: uploader.mat(
+                source,
+                &format!("{attn_prefix}.o_proj.weight"),
+                hidden,
+                config.attn_out_width(),
+            )?,
+            q_norm: uploader.vector(
+                source,
+                &format!("{attn_prefix}.q_norm.weight"),
+                config.head_dim,
+            )?,
+            k_norm: uploader.vector(
+                source,
+                &format!("{attn_prefix}.k_norm.weight"),
+                config.head_dim,
+            )?,
+            index_qk: uploader.mat(
+                source,
+                &format!("{attn_prefix}.indexer.index_qk_proj.weight"),
+                (config.indexer_n_heads + config.indexer_kv_heads) * config.indexer_head_dim,
+                hidden,
+            )?,
+            index_q_norm: uploader.vector(
+                source,
+                &format!("{attn_prefix}.indexer.q_layernorm.weight"),
+                config.indexer_head_dim,
+            )?,
+            index_k_norm: uploader.vector(
+                source,
+                &format!("{attn_prefix}.indexer.k_layernorm.weight"),
+                config.indexer_head_dim,
+            )?,
+        };
+        let mlp = format!("{layer}.mlp");
+        let mut pointers = Vec::with_capacity(config.num_experts * 6 * 8);
+        for expert in 0..config.num_experts {
+            let expert_prefix = format!("{mlp}.experts.{expert}");
+            let gate = uploader.fp8(
+                source,
+                &format!("{expert_prefix}.gate_proj"),
+                config.moe_intermediate_size,
+                hidden,
+            )?;
+            let up = uploader.fp8(
+                source,
+                &format!("{expert_prefix}.up_proj"),
+                config.moe_intermediate_size,
+                hidden,
+            )?;
+            let down = uploader.fp8(
+                source,
+                &format!("{expert_prefix}.down_proj"),
+                hidden,
+                config.moe_intermediate_size,
+            )?;
+            for pointer in [gate.0, gate.1, up.0, up.1, down.0, down.1] {
+                pointers.extend_from_slice(&pointer.0.to_le_bytes());
+            }
+        }
+        Some(GpuMtp {
+            fc_embedding: uploader.mat(
+                source,
+                &format!("{prefix}.fc_embedding.weight"),
+                hidden,
+                hidden,
+            )?,
+            fc_hidden: uploader.mat(
+                source,
+                &format!("{prefix}.fc_hidden.weight"),
+                hidden,
+                hidden,
+            )?,
+            pre_norm_embedding: uploader.vector(
+                source,
+                &format!("{prefix}.pre_fc_norm_embedding.weight"),
+                hidden,
+            )?,
+            pre_norm_hidden: uploader.vector(
+                source,
+                &format!("{prefix}.pre_fc_norm_hidden.weight"),
+                width,
+            )?,
+            mixer: hyper(format!("{prefix}.hyper_connection_mixer"), false)?,
+            attn_hyper: hyper(format!("{layer}.attn_hyper_connection"), true)?,
+            mlp_hyper: hyper(format!("{layer}.mlp_hyper_connection"), true)?,
+            attn,
+            moe: GpuMoe {
                 router: uploader.mat(
                     source,
                     &format!("{mlp}.gate.weight"),
@@ -1159,249 +1535,21 @@ impl GpuWeights {
                     1,
                     hidden,
                 )?,
-                experts: GpuExperts::Nvfp4 {
-                    table: {
-                        let mut pointers = Vec::with_capacity(experts.len() * 6 * 8);
-                        for expert in &experts {
-                            for pointer in [
-                                expert.gate.weight.0,
-                                expert.gate.scales.0,
-                                expert.up.weight.0,
-                                expert.up.scales.0,
-                                expert.down.weight.0,
-                                expert.down.scales.0,
-                            ] {
-                                pointers.extend_from_slice(&pointer.to_le_bytes());
-                            }
-                        }
-                        uploader.bytes(&pointers)?
-                    },
-                    scales: {
-                        let mut scalars = Vec::with_capacity(experts.len() * 3 * 4);
-                        for expert in &experts {
-                            for scale in
-                                [expert.gate.scale_2, expert.up.scale_2, expert.down.scale_2]
-                            {
-                                scalars.extend_from_slice(&scale.to_le_bytes());
-                            }
-                        }
-                        uploader.bytes(&scalars)?
-                    },
+                experts: GpuExperts::Fp8 {
+                    table: uploader.derived(&format!("{mlp}.experts.table"), &pointers)?,
                 },
-            };
-            let ple = if config.ple_layer_ids.contains(&(index + 1)) {
-                let prefix = format!("{prefix}.ple");
-                let scale = bytes_bf16_scalar(
-                    &source
-                        .read(&format!(
-                            "{prefix}.ple_embedding.ngram_embedding.weight_scale"
-                        ))
-                        .map_err(|error| error.to_string())?,
-                    "the PLE scale",
-                )?;
-                let reader = crate::checkpoint::CheckpointRows::open(directory, config, index)?;
-                Some(GpuPle {
-                    key_proj: uploader.mat(
-                        source,
-                        &format!("{prefix}.key_proj.weight"),
-                        width,
-                        config.ple_embed_dim,
-                    )?,
-                    value_proj: uploader.mat(
-                        source,
-                        &format!("{prefix}.value_proj.weight"),
-                        hidden,
-                        config.ple_embed_dim,
-                    )?,
-                    norm_key: uploader.vector(
-                        source,
-                        &format!("{prefix}.norm_key.weight"),
-                        width,
-                    )?,
-                    norm_query: uploader.vector(
-                        source,
-                        &format!("{prefix}.norm_query.weight"),
-                        width,
-                    )?,
-                    norm_conv: uploader.vector(
-                        source,
-                        &format!("{prefix}.norm_conv.weight"),
-                        width,
-                    )?,
-                    conv: uploader.vector(
-                        source,
-                        &format!("{prefix}.conv1d.weight"),
-                        width * config.ple_conv_kernel_size,
-                    )?,
-                    table: std::sync::Mutex::new(PleTable::new(config, reader, scale)?),
-                })
-            } else {
-                None
-            };
-            layers.push(GpuLayer {
-                branch,
-                attn_hyper: hyper(format!("{prefix}.attn_hyper_connection"), true)?,
-                mlp_hyper: hyper(format!("{prefix}.mlp_hyper_connection"), true)?,
-                moe,
-                ple,
-            });
-        }
-        let mtp = if config.mtp_num_hidden_layers > 0 {
-            let prefix = "mtp";
-            let layer = format!("{prefix}.layers.0");
-            let attn_prefix = format!("{layer}.self_attn");
-            let attn = GpuBranch::Sparse {
-                q_proj: uploader.mat(
-                    source,
-                    &format!("{attn_prefix}.q_proj.weight"),
-                    config.q_proj_width(),
-                    hidden,
-                )?,
-                k_proj: uploader.mat(
-                    source,
-                    &format!("{attn_prefix}.k_proj.weight"),
-                    config.kv_proj_width(),
-                    hidden,
-                )?,
-                v_proj: uploader.mat(
-                    source,
-                    &format!("{attn_prefix}.v_proj.weight"),
-                    config.kv_proj_width(),
-                    hidden,
-                )?,
-                o_proj: uploader.mat(
-                    source,
-                    &format!("{attn_prefix}.o_proj.weight"),
-                    hidden,
-                    config.attn_out_width(),
-                )?,
-                q_norm: uploader.vector(
-                    source,
-                    &format!("{attn_prefix}.q_norm.weight"),
-                    config.head_dim,
-                )?,
-                k_norm: uploader.vector(
-                    source,
-                    &format!("{attn_prefix}.k_norm.weight"),
-                    config.head_dim,
-                )?,
-                index_qk: uploader.mat(
-                    source,
-                    &format!("{attn_prefix}.indexer.index_qk_proj.weight"),
-                    (config.indexer_n_heads + config.indexer_kv_heads) * config.indexer_head_dim,
-                    hidden,
-                )?,
-                index_q_norm: uploader.vector(
-                    source,
-                    &format!("{attn_prefix}.indexer.q_layernorm.weight"),
-                    config.indexer_head_dim,
-                )?,
-                index_k_norm: uploader.vector(
-                    source,
-                    &format!("{attn_prefix}.indexer.k_layernorm.weight"),
-                    config.indexer_head_dim,
-                )?,
-            };
-            let mlp = format!("{layer}.mlp");
-            let mut pointers = Vec::with_capacity(config.num_experts * 6 * 8);
-            for expert in 0..config.num_experts {
-                let expert_prefix = format!("{mlp}.experts.{expert}");
-                let gate = uploader.fp8(
-                    source,
-                    &format!("{expert_prefix}.gate_proj"),
-                    config.moe_intermediate_size,
-                    hidden,
-                )?;
-                let up = uploader.fp8(
-                    source,
-                    &format!("{expert_prefix}.up_proj"),
-                    config.moe_intermediate_size,
-                    hidden,
-                )?;
-                let down = uploader.fp8(
-                    source,
-                    &format!("{expert_prefix}.down_proj"),
-                    hidden,
-                    config.moe_intermediate_size,
-                )?;
-                for pointer in [gate.0, gate.1, up.0, up.1, down.0, down.1] {
-                    pointers.extend_from_slice(&pointer.0.to_le_bytes());
-                }
-            }
-            Some(GpuMtp {
-                fc_embedding: uploader.mat(
-                    source,
-                    &format!("{prefix}.fc_embedding.weight"),
-                    hidden,
-                    hidden,
-                )?,
-                fc_hidden: uploader.mat(
-                    source,
-                    &format!("{prefix}.fc_hidden.weight"),
-                    hidden,
-                    hidden,
-                )?,
-                pre_norm_embedding: uploader.vector(
-                    source,
-                    &format!("{prefix}.pre_fc_norm_embedding.weight"),
-                    hidden,
-                )?,
-                pre_norm_hidden: uploader.vector(
-                    source,
-                    &format!("{prefix}.pre_fc_norm_hidden.weight"),
-                    width,
-                )?,
-                mixer: hyper(format!("{prefix}.hyper_connection_mixer"), false)?,
-                attn_hyper: hyper(format!("{layer}.attn_hyper_connection"), true)?,
-                mlp_hyper: hyper(format!("{layer}.mlp_hyper_connection"), true)?,
-                attn,
-                moe: GpuMoe {
-                    router: uploader.mat(
-                        source,
-                        &format!("{mlp}.gate.weight"),
-                        config.num_experts,
-                        hidden,
-                    )?,
-                    shared: uploader.mat(
-                        source,
-                        &format!("{mlp}.shared_expert.gate_proj.weight"),
-                        config.shared_expert_intermediate_size,
-                        hidden,
-                    )?,
-                    shared_up: uploader.mat(
-                        source,
-                        &format!("{mlp}.shared_expert.up_proj.weight"),
-                        config.shared_expert_intermediate_size,
-                        hidden,
-                    )?,
-                    shared_down: uploader.mat(
-                        source,
-                        &format!("{mlp}.shared_expert.down_proj.weight"),
-                        hidden,
-                        config.shared_expert_intermediate_size,
-                    )?,
-                    shared_gate: uploader.mat(
-                        source,
-                        &format!("{mlp}.shared_expert_gate.weight"),
-                        1,
-                        hidden,
-                    )?,
-                    experts: GpuExperts::Fp8 {
-                        table: uploader.bytes(&pointers)?,
-                    },
-                },
-            })
-        } else {
-            None
-        };
-        Ok(Self {
-            embed,
-            lm_head,
-            mixer,
-            layers,
-            mtp,
+            },
         })
-    }
+    } else {
+        None
+    };
+    Ok(GpuWeights {
+        embed,
+        lm_head,
+        mixer,
+        layers,
+        mtp,
+    })
 }
 
 /// The TP=1 device backend.
@@ -1445,7 +1593,39 @@ impl Qwen4ExpDeviceBackend {
         context_limit: usize,
         prefill: PrefillPlan,
     ) -> Result<Self, BackendError> {
-        Self::open_inner(checkpoint, context_limit, prefill)
+        Self::open_inner(checkpoint, context_limit, prefill, None)
+    }
+
+    /// [Self::open] over a converted rank file instead of the checkpoint's tensors, so the
+    /// weights are one parallel read into one allocation. The checkpoint directory is still the
+    /// configuration, tokenizer and host-paged PLE source.
+    ///
+    /// # Errors
+    /// Everything [Self::open] refuses, and a rank file this configuration did not write.
+    pub fn open_converted(
+        checkpoint: &Path,
+        context_limit: usize,
+        rank_file: &Path,
+    ) -> Result<Self, BackendError> {
+        Self::open_inner(
+            checkpoint,
+            context_limit,
+            PrefillPlan::from_env(),
+            Some(rank_file),
+        )
+    }
+
+    /// [Self::open_converted] with an explicit prefill plan.
+    ///
+    /// # Errors
+    /// Everything [Self::open_converted] refuses.
+    pub fn open_with_prefill_converted(
+        checkpoint: &Path,
+        context_limit: usize,
+        prefill: PrefillPlan,
+        rank_file: &Path,
+    ) -> Result<Self, BackendError> {
+        Self::open_inner(checkpoint, context_limit, prefill, Some(rank_file))
     }
 
     /// Open the checkpoint for a tensor-parallel group of this size.
@@ -1471,13 +1651,14 @@ impl Qwen4ExpDeviceBackend {
                 ),
             ));
         }
-        Self::open_inner(checkpoint, context_limit, PrefillPlan::from_env())
+        Self::open_inner(checkpoint, context_limit, PrefillPlan::from_env(), None)
     }
 
     fn open_inner(
         checkpoint: &Path,
         context_limit: usize,
         prefill: PrefillPlan,
+        converted: Option<&Path>,
     ) -> Result<Self, BackendError> {
         let directory = if checkpoint.is_dir() {
             checkpoint.to_path_buf()
@@ -1601,9 +1782,18 @@ impl Qwen4ExpDeviceBackend {
                 ),
             ));
         }
-        let weights = GpuWeights::upload(&cuda, &directory, &source, &config).map_err(|error| {
-            BackendError::new("qwen4_device", format!("weight upload: {error}"))
-        })?;
+        let weights = match converted {
+            Some(path) => crate::convert::load_converted(&cuda, &config, &directory, path, &source)
+                .map_err(|error| {
+                    BackendError::new(
+                        "qwen4_weights",
+                        format!("converted rank {}: {error}", path.display()),
+                    )
+                })?,
+            None => GpuWeights::upload(&cuda, &directory, &source, &config).map_err(|error| {
+                BackendError::new("qwen4_device", format!("weight upload: {error}"))
+            })?,
+        };
         // The GDN recurrence's state is one head's `key_dim x value_dim` floats; staging it in
         // shared memory turns three global trips per token into three per chunk.
         let stage =

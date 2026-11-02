@@ -286,7 +286,28 @@ with a Python transcription of the reference, including the row after an EOS.
 
 `Qwen4ExpDeviceBackend::open` uploads every non-PLE tensor (77.8 GiB), keeps the PLE table on the
 host, and refuses without a cubin, with a TP world other than 1, or with a context limit outside
-`1..=262,144`. `DeviceSequence` allocates per-session KV/indexer caches (f32), GDN convolution and
+`1..=262,144`.
+
+### Converted rank file
+
+`sparkflash convert --checkpoint "$CKPT" --output-dir "$CONV"` writes one `rank-0-of-1.bin`
+(80,565,841,920 bytes, 151,721 slots, 73,728 NVFP4 scale pairs); `--inspect FILE --verify-weights`
+re-reads every slot. The file holds the exact bytes the walk uploads, plus the two per-tensor
+NVFP4 scales in walk order; the routed experts' pointer tables are rebuilt at load because they
+hold device addresses.
+
+`SPARKFLASH_QWEN_CONVERTED_DIR=$CONV sparkflash serve ...` reads the file into one allocation with
+the parallel direct-I/O path the V4.1 and GLM arms use. Measured on an RTX Spark: **15.7 s from
+launch to `/health`**, against 132 s from the released checkpoint; both include the DFlash 2
+drafter. Conversion is one pass and took 341 s on the node.
+
+The checkpoint directory is still required: its `config.json`, `tokenizer.json` and 51.2 GiB of
+host-paged PLE shards are the source for everything but the resident weights. The converted file
+replaces the 77.8 GiB per-tensor upload; it does not remove the checkpoint.
+
+`tests/device_parity.rs::the_converted_rank_file_matches_the_checkpoint_path` runs the whole TP=1
+loop over a file the converter wrote and requires the checkpoint path's logits; it agrees to
+~2e-7 relative on the tiny fixture. `DeviceSequence` allocates per-session KV/indexer caches (f32), GDN convolution and
 recurrent state, PLE convolution state and one workspace, then runs the layer order above one
 token at a time through `kernels/qwen4_exp_sm121.cu`.
 

@@ -85,6 +85,7 @@
 //! head, so the copy changes how many drafts a verify keeps, never what it keeps.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sparkflash_kernels::cuda_driver::{
@@ -106,6 +107,21 @@ use crate::config::{Glm5NextConfig, IndexerKind, LayerKind, MlpKind};
 use crate::convert::{ConvertedSlot, ConvertedSpecs, expect_slot};
 use crate::forward::{INDEX_KEY_NORM_EPS, inverse_sqrt};
 use crate::tensor::{Glm5NextTensorPlan, LM_PREFIX, Split};
+
+/// The representation a sequence caches the MLA latent in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LatentCache {
+    /// The representation the expansion itself used: E4M3 when the projections quantise their
+    /// activations (an FP8 release), f32 otherwise. The parity tests run this.
+    #[default]
+    Auto,
+    /// The normed latent as f32: the expansion's own operand, exact, 2 KiB a position a layer.
+    F32,
+    /// The release's E4M3 activation: 528 B a position a layer, which is what fits the model's
+    /// full window. It quantises the latent, so it is not the expansion's arithmetic; vLLM's
+    /// \`fp8_ds_mla\` makes the same trade.
+    Fp8,
+}
 
 /// The most rows one step carries: the tiled GEMVs' batch.
 pub const MAX_ROWS: usize = GEMV_MAX_BATCH;
@@ -156,6 +172,41 @@ const MAX_ATTENTION_HEAD_DIM: usize = 256;
 fn cuda_error(error: String) -> BackendError {
     BackendError::new("glm5_device", format!("CUDA: {error}"))
 }
+
+/// The CUDA context a rank and its sequences share, owned so a rank outlives the call that opened
+/// it and a sequence can hold the handle for as long as its allocations live.
+///
+/// The driver's context is process-wide and retained by the driver; this wrapper is what makes that
+/// handle `Send`/`Sync` for the serving worker threads, exactly as the Qwen4-Exp arm's
+/// `CudaHandle` does. Every device call goes through it, and its `Deref` keeps the call sites on
+/// the driver API.
+pub struct CudaHandle(Cuda);
+
+impl CudaHandle {
+    /// Takes ownership of an opened context.
+    #[must_use]
+    pub fn new(cuda: Cuda) -> Self {
+        Self(cuda)
+    }
+}
+
+impl std::ops::Deref for CudaHandle {
+    type Target = Cuda;
+
+    fn deref(&self) -> &Cuda {
+        &self.0
+    }
+}
+
+// SAFETY: the handle owns one retained driver context, and the driver's context is process-wide:
+// every method this crate calls on it is a query or a launch on a stream the caller names, and the
+// CUDA driver serialises context access. A session owns its own stream and buffers, and a rank's
+// forward takes `&mut self`, so a `Send` handle cannot be used concurrently for the same rank's
+// state.
+unsafe impl Send for CudaHandle {}
+// SAFETY: as above: the handle itself carries no mutable per-thread state, and the run-scope
+// caches behind it lock internally.
+unsafe impl Sync for CudaHandle {}
 
 pub(crate) fn refusal(detail: impl Into<String>) -> BackendError {
     BackendError::new("glm5_config", detail)
@@ -251,19 +302,28 @@ struct Kernels {
     conv: Kernel,
     kda_decay: Kernel,
     recur: Kernel,
-    deinterleave: Kernel,
     copy_flat: Kernel,
     layer_norm: Kernel,
     pool: Kernel,
     index_scores: Kernel,
     pick: Kernel,
-    attn: Kernel,
+    /// The absorbed MLA ([DeviceRank::dsa_attend]): the latent cache writer, the query's
+    /// projection into the latent space, and attention with the value projection.
+    mla_cache: Kernel,
+    mla_cache_fp8: Kernel,
+    mla_absorb: Kernel,
+    mla_attend: Kernel,
     swiglu: Kernel,
     router: Kernel,
     combine: Kernel,
     fold: Kernel,
     prefetch_l2: Kernel,
 }
+
+// SAFETY: a kernel is an immutable function handle loaded from the cubin. Every launch goes
+// through a rank's `&mut self` on that rank's own stream, so a handle that moves to another
+// thread is never used concurrently.
+unsafe impl Send for Kernels {}
 
 impl Kernels {
     fn load(cuda: &Cuda, head_dim: usize) -> Result<Self, String> {
@@ -292,13 +352,15 @@ impl Kernels {
             conv: named("q4e_gdn_conv")?,
             kda_decay: named("q4e_kda_decay")?,
             recur,
-            deinterleave: named("q4e_deinterleave")?,
             copy_flat: named("q4e_copy_flat")?,
             layer_norm: named("q4e_layer_norm")?,
             pool: named("q4e_glm_pool")?,
             index_scores: named("q4e_glm_index_scores")?,
             pick: named("q4e_glm_pick")?,
-            attn: named("q4e_attn")?,
+            mla_cache: named("q4e_glm_mla_cache")?,
+            mla_cache_fp8: named("q4e_glm_mla_cache_fp8")?,
+            mla_absorb: named("q4e_glm_mla_absorb")?,
+            mla_attend: named("q4e_glm_mla_attend")?,
             swiglu: named("q4e_swiglu_limited")?,
             router: named("q4e_noaux_router")?,
             combine: named("q4e_moe_combine")?,
@@ -317,16 +379,81 @@ fn recur_parts(head: usize) -> usize {
         .unwrap_or(1)
 }
 
+/// This rank's kv_b rows as the absorbed MLA reads them: [heads * (nope + value)][kv_lora] f32,
+/// the checkpoint's E4M3 codes times their 128x128 block scales, or its BF16 values widened.
+///
+/// A rank's copy is 16.8 MB at the release's geometry, against the 82 GB rank. Dequantising once
+/// at load keeps every attention step a plain f32 dot product, and the cached latent carries the
+/// release's activation quantisation, so the products are the expansion's own.
+fn absorb_kv_b(
+    cuda: &Cuda,
+    stream: &RunStream,
+    memory: &mut Allocations,
+    linear: &DeviceLinear,
+) -> Result<Deviceptr, BackendError> {
+    let (rows, columns) = (linear.rows, linear.columns);
+    let Some(scales) = linear.scales else {
+        // BF16: [rows][columns], widened to the f32 the attention reads.
+        let elements = rows
+            .checked_mul(columns)
+            .ok_or_else(|| refusal("kv_b's shape overflows a usize"))?;
+        let mut bytes = vec![0u8; elements * 2];
+        cuda.copy_dtoh(&mut bytes, &linear.weight)
+            .map_err(cuda_error)?;
+        let mut widened = Vec::with_capacity(elements * 4);
+        for pair in bytes.as_chunks::<2>().0 {
+            // BF16 widened exactly: its bits are an f32's top half.
+            let value = f32::from_bits(u32::from(u16::from_le_bytes(*pair)) << 16);
+            widened.extend_from_slice(&value.to_le_bytes());
+        }
+        return memory.upload(stream, &widened);
+    };
+    if !rows.is_multiple_of(FP8_BLOCK) || !columns.is_multiple_of(FP8_BLOCK) {
+        return Err(refusal(format!(
+            "kv_b keeps {rows} x {columns} here, not whole {FP8_BLOCK}-wide FP8 tiles"
+        )));
+    }
+    let codes = rows
+        .checked_mul(columns)
+        .ok_or_else(|| refusal("kv_b's shape overflows a usize"))?;
+    let mut weight = vec![0u8; codes];
+    cuda.copy_dtoh(&mut weight, &linear.weight)
+        .map_err(cuda_error)?;
+    let grid = ScaleGrid::Tile(FP8_BLOCK);
+    let scale_count = grid.len(rows, columns);
+    let mut scale_bytes = vec![0u8; scale_count * 4];
+    cuda.copy_dtoh(&mut scale_bytes, &scales)
+        .map_err(cuda_error)?;
+    let scales_host: Vec<f32> = scale_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
+        .collect();
+    let bands = columns / FP8_BLOCK;
+    let mut widened = Vec::with_capacity(codes * 4);
+    for row in 0..rows {
+        let band = (row / FP8_BLOCK) * bands;
+        for column in 0..columns {
+            let scale = scales_host[band + column / FP8_BLOCK];
+            let value =
+                sparkflash_weights::quant::f8e4m3_to_f32(weight[row * columns + column]) * scale;
+            widened.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    memory.upload(stream, &widened)
+}
+
 /// Device allocations, and page-locked host slabs the device maps, freed together when they drop.
-struct Allocations<'c> {
-    cuda: &'c Cuda,
+struct Allocations {
+    cuda: Arc<CudaHandle>,
     buffers: Vec<Deviceptr>,
     mapped: Vec<HostMapped>,
     bytes: usize,
 }
 
-impl<'c> Allocations<'c> {
-    fn new(cuda: &'c Cuda) -> Self {
+impl Allocations {
+    fn new(cuda: Arc<CudaHandle>) -> Self {
         Self {
             cuda,
             buffers: Vec::new(),
@@ -363,6 +490,16 @@ impl<'c> Allocations<'c> {
 
     fn zeroed(&mut self, stream: &RunStream, bytes: usize) -> Result<Deviceptr, BackendError> {
         self.upload(stream, &vec![0; bytes])
+    }
+
+    /// `bytes` of device memory, left as the allocator returns it.
+    fn bytes(&mut self, bytes: usize) -> Result<Deviceptr, BackendError> {
+        let pointer = self
+            .cuda
+            .alloc(bytes.max(4), &mut self.bytes)
+            .map_err(cuda_error)?;
+        self.buffers.push(pointer);
+        Ok(pointer)
     }
 
     /// `floats` f32 of scratch, left as the allocator returns it.
@@ -432,12 +569,12 @@ pub(crate) fn check_length(key: &str, len: usize, bytes: &[u8]) -> Result<(), Ba
 }
 
 /// Each weight in its own device allocation, uploaded as it is read.
-struct Direct<'a, 'c> {
+struct Direct<'a> {
     stream: &'a RunStream,
-    memory: &'a mut Allocations<'c>,
+    memory: &'a mut Allocations,
 }
 
-impl Sink for Direct<'_, '_> {
+impl Sink for Direct<'_> {
     fn wants_bytes(&self) -> bool {
         true
     }
@@ -454,15 +591,15 @@ impl Sink for Direct<'_, '_> {
 
 /// The weights of a converted rank file, already on the device in one allocation at `base`: each
 /// upload is the next slot of the file's index, which must be the same weight at the same length.
-struct Slab<'a, 'c> {
+struct Slab<'a> {
     base: Deviceptr,
     slots: &'a [ConvertedSlot],
     next: usize,
     stream: &'a RunStream,
-    memory: &'a mut Allocations<'c>,
+    memory: &'a mut Allocations,
 }
 
-impl Sink for Slab<'_, '_> {
+impl Sink for Slab<'_> {
     fn wants_bytes(&self) -> bool {
         false
     }
@@ -478,7 +615,7 @@ impl Sink for Slab<'_, '_> {
     }
 }
 
-impl Drop for Allocations<'_> {
+impl Drop for Allocations {
     fn drop(&mut self) {
         // No queued launch may outlive the buffers it reads.
         let _ = self.cuda.synchronize();
@@ -570,6 +707,11 @@ struct DeviceDsa {
     kv_b: DeviceLinear,
     o: DeviceLinear,
     indexer: Option<DeviceIndexer>,
+    /// This rank's `kv_b` rows, `[heads * (nope + value)][kv_lora]`, dequantised to f32: the two
+    /// absorbed operands. See [DeviceRank::dsa_attend].
+    kv_dequant: Deviceptr,
+    /// Whether the latent cache holds the release's quantised activation.
+    quantise: bool,
     heads: usize,
 }
 
@@ -1054,6 +1196,9 @@ impl<'a, S: WeightSource + ?Sized> Uploader<'a, S> {
             } else {
                 None
             },
+            // Derived from `kv_b` once the rank is built ([DeviceRank::absorb_mla]).
+            kv_dequant: Deviceptr(0),
+            quantise: false,
             heads: heads / self.layout.world_size,
         })
     }
@@ -1160,7 +1305,8 @@ struct Scratch {
     kda_out: Deviceptr,
     dsa_fused: Deviceptr,
     query: Deviceptr,
-    kv: Deviceptr,
+    /// `[rows][heads][kv_lora]`: the query projected into the latent space ([DeviceRank::dsa_attend]).
+    q_abs: Deviceptr,
     attn_out: Deviceptr,
     index_fused: Deviceptr,
     index_query: Deviceptr,
@@ -1218,8 +1364,8 @@ struct LinearScratch {
 }
 
 /// One sequence's state on one rank: each KDA layer's convolution history and recurrent memory,
-/// each DSA layer's key, value and indexer caches, `capacity` positions long.
-pub struct DeviceSequence<'c> {
+/// each DSA layer's latent and indexer caches, `capacity` positions long.
+pub struct DeviceSequence {
     position: usize,
     capacity: usize,
     /// The last verify's rows, until [DeviceRank::commit] keeps some of them.
@@ -1234,7 +1380,7 @@ pub struct DeviceSequence<'c> {
     block: Option<DraftScratch>,
     /// The block drafter's confidence in each of the sequence's last drafts.
     confidence: Vec<f32>,
-    memory: Allocations<'c>,
+    memory: Allocations,
 }
 
 /// What a drafting sequence keeps for the MTP layer: its caches, whose position `q` pairs the
@@ -1265,7 +1411,7 @@ trait StepRow: Sized {
     const ON_DEVICE: bool;
     /// The rows of `input` through the LM head.
     fn head(
-        rank: &DeviceRank<'_>,
+        rank: &DeviceRank,
         collectives: (&TpRuntime, &BitGatherHandle),
         input: Deviceptr,
         rows: usize,
@@ -1277,7 +1423,7 @@ trait StepRow: Sized {
 impl StepRow for Vec<f32> {
     const ON_DEVICE: bool = false;
     fn head(
-        rank: &DeviceRank<'_>,
+        rank: &DeviceRank,
         (tp, gather): (&TpRuntime, &BitGatherHandle),
         input: Deviceptr,
         rows: usize,
@@ -1291,7 +1437,7 @@ impl StepRow for Vec<f32> {
 impl StepRow for u32 {
     const ON_DEVICE: bool = true;
     fn head(
-        rank: &DeviceRank<'_>,
+        rank: &DeviceRank,
         collectives: (&TpRuntime, &BitGatherHandle),
         input: Deviceptr,
         rows: usize,
@@ -1320,8 +1466,12 @@ enum SequenceLayer {
         spare: Deviceptr,
     },
     Sparse {
-        keys: Deviceptr,
-        values: Deviceptr,
+        /// The normed latent: `[capacity][kv_lora]` E4M3 codes when `latent_scales` is set, f32
+        /// otherwise. Attention reads it in latent space ([DeviceRank::dsa_attend]), so the cache
+        /// is one row a position rather than `heads` expanded key and value slices.
+        latent: Deviceptr,
+        /// `[capacity][kv_lora / 128]` f32 scales of the E4M3 cache; zero for the f32 one.
+        latent_scales: Deviceptr,
         /// The indexer's per-position keys and gates and its pooled keys; unused by a layer
         /// that shares the previous layer's selection.
         index_keys: Deviceptr,
@@ -1343,7 +1493,7 @@ struct Run<'s> {
     block: Option<&'s DraftScratch>,
 }
 
-impl DeviceSequence<'_> {
+impl DeviceSequence {
     /// Positions this sequence has consumed, a verify's rows too until its commit gives back the
     /// ones it does not keep.
     #[must_use]
@@ -1373,8 +1523,8 @@ struct BlockDrafter {
 }
 
 /// One tensor-parallel rank of GLM-5.3-Flash on one GPU, for decode up to [MAX_ROWS] rows a step.
-pub struct DeviceRank<'c> {
-    cuda: &'c Cuda,
+pub struct DeviceRank {
+    cuda: Arc<CudaHandle>,
     stream: RunStream,
     kernels: Kernels,
     config: Glm5NextConfig,
@@ -1399,7 +1549,7 @@ pub struct DeviceRank<'c> {
     heads: AtomicU64,
     /// The side stream [Self::prefetch] warms the L2 from, unless SPARKFLASH_L2_PREFETCH=0.
     prefetch: Option<Prefetch>,
-    memory: Allocations<'c>,
+    memory: Allocations,
 }
 
 /// A side stream that pulls the weights the next kernels read into the L2 while the rank's stream
@@ -1408,6 +1558,10 @@ struct Prefetch {
     side: SideStream,
     budget: usize,
 }
+
+// SAFETY: a side stream is a queue on the rank's own context, and only the rank's launches
+// record waits on it. A `Send` rank moves the stream with it; nothing shares it.
+unsafe impl Send for Prefetch {}
 
 impl Prefetch {
     /// The bytes a wait asks for unless SPARKFLASH_L2_PREFETCH_MB says otherwise: about what DRAM
@@ -1441,7 +1595,7 @@ impl Prefetch {
     }
 }
 
-impl<'c> DeviceRank<'c> {
+impl DeviceRank {
     /// Upload rank `layout.rank`'s slice of the text model.
     ///
     /// # Errors
@@ -1449,12 +1603,26 @@ impl<'c> DeviceRank<'c> {
     /// outgrows a kernel's bounds, a tensor is missing, shaped or stored other than the plan
     /// says, or the device refuses an allocation or a copy.
     pub fn load<S: WeightSource + ?Sized>(
-        cuda: &'c Cuda,
+        cuda: Arc<CudaHandle>,
         config: &Glm5NextConfig,
         source: &S,
         layout: TpLayout,
     ) -> Result<Self, BackendError> {
-        Self::build(cuda, config, layout, |stream, memory| {
+        Self::load_with_cache(cuda, config, source, layout, LatentCache::Auto)
+    }
+
+    /// [Self::load] with an explicit latent-cache representation.
+    ///
+    /// # Errors
+    /// As [Self::load].
+    pub fn load_with_cache<S: WeightSource + ?Sized>(
+        cuda: Arc<CudaHandle>,
+        config: &Glm5NextConfig,
+        source: &S,
+        layout: TpLayout,
+        cache: LatentCache,
+    ) -> Result<Self, BackendError> {
+        Self::build(cuda, config, layout, cache, |stream, memory| {
             let mut sink = Direct { stream, memory };
             Uploader::new(source, config, layout, &mut sink).weights()
         })
@@ -1468,16 +1636,30 @@ impl<'c> DeviceRank<'c> {
     /// What [DeviceRank::load] refuses, and a file that is not a GLM rank file of this rank and
     /// world, fails its index check, or holds other weights than this configuration loads.
     pub fn load_converted(
-        cuda: &'c Cuda,
+        cuda: Arc<CudaHandle>,
         config: &Glm5NextConfig,
         path: &Path,
         layout: TpLayout,
+    ) -> Result<Self, BackendError> {
+        Self::load_converted_with_cache(cuda, config, path, layout, LatentCache::Auto)
+    }
+
+    /// [Self::load_converted] with an explicit latent-cache representation.
+    ///
+    /// # Errors
+    /// As [Self::load_converted].
+    pub fn load_converted_with_cache(
+        cuda: Arc<CudaHandle>,
+        config: &Glm5NextConfig,
+        path: &Path,
+        layout: TpLayout,
+        cache: LatentCache,
     ) -> Result<Self, BackendError> {
         let (preamble, index) = crate::convert::read_index(path, layout).map_err(refusal)?;
         let specs = ConvertedSpecs::new(&index).map_err(refusal)?;
         let data = usize::try_from(preamble.padded_data_bytes)
             .map_err(|_| refusal("the rank file's data does not fit this machine's range"))?;
-        Self::build(cuda, config, layout, |stream, memory| {
+        Self::build(cuda, config, layout, cache, |stream, memory| {
             let base = memory.file(path, preamble.data_offset, data)?;
             let mut sink = Slab {
                 base,
@@ -1501,10 +1683,11 @@ impl<'c> DeviceRank<'c> {
     /// The rank around the weights `upload` places, once the configuration is one the kernels
     /// take.
     fn build(
-        cuda: &'c Cuda,
+        cuda: Arc<CudaHandle>,
         config: &Glm5NextConfig,
         layout: TpLayout,
-        upload: impl FnOnce(&RunStream, &mut Allocations<'c>) -> Result<RankWeights, BackendError>,
+        cache: LatentCache,
+        upload: impl FnOnce(&RunStream, &mut Allocations) -> Result<RankWeights, BackendError>,
     ) -> Result<Self, BackendError> {
         if !cubin_available() {
             return Err(refusal(
@@ -1513,17 +1696,36 @@ impl<'c> DeviceRank<'c> {
         }
         Self::check_rank(config, layout)?;
         let stream = cuda.run_stream().map_err(cuda_error)?;
-        let kernels = Kernels::load(cuda, config.linear_head_dim).map_err(cuda_error)?;
-        let mut memory = Allocations::new(cuda);
+        let kernels = Kernels::load(&cuda, config.linear_head_dim).map_err(cuda_error)?;
+        let mut memory = Allocations::new(Arc::clone(&cuda));
         let RankWeights {
             embed,
             norm,
             lm_head,
-            layers,
-            mtp,
+            mut layers,
+            mut mtp,
         } = upload(&stream, &mut memory)?;
+        // The absorbed MLA operands: each sparse layer's kv_b, dequantised once. The latent
+        // cache's representation is the caller's ([LatentCache]).
+        let quantise = |dsa: &DeviceDsa| {
+            (match cache {
+                LatentCache::Auto => config.dynamic_activations && dsa.kv_b.scales.is_some(),
+                LatentCache::F32 => false,
+                LatentCache::Fp8 => true,
+            }) && config.kv_lora_rank.is_multiple_of(FP8_BLOCK)
+        };
+        for layer in &mut layers {
+            if let DeviceBranch::Sparse(dsa) = &mut layer.branch {
+                dsa.quantise = quantise(dsa);
+                dsa.kv_dequant = absorb_kv_b(&cuda, &stream, &mut memory, &dsa.kv_b)?;
+            }
+        }
+        if let Some(mtp) = &mut mtp {
+            mtp.dsa.quantise = quantise(&mtp.dsa);
+            mtp.dsa.kv_dequant = absorb_kv_b(&cuda, &stream, &mut memory, &mtp.dsa.kv_b)?;
+        }
         let scratch = Self::scratch(config, layout, &stream, &mut memory)?;
-        let prefetch = Prefetch::new(cuda)?;
+        let prefetch = Prefetch::new(&cuda)?;
         let mut rank = Self {
             cuda,
             stream,
@@ -1574,7 +1776,7 @@ impl<'c> DeviceRank<'c> {
         };
         let memory = &mut self.memory;
         let head = GpuMatE4m3::quantize(
-            self.cuda,
+            &self.cuda,
             self.kernels.quantize_e4m3,
             &matrix,
             &mut memory.bytes,
@@ -1601,6 +1803,18 @@ impl<'c> DeviceRank<'c> {
     #[must_use]
     pub fn device_bytes(&self) -> usize {
         self.memory.bytes
+    }
+
+    /// This rank's place in the tensor-parallel world.
+    #[must_use]
+    pub fn layout(&self) -> TpLayout {
+        self.layout
+    }
+
+    /// The configuration this rank was built for.
+    #[must_use]
+    pub fn config(&self) -> &Glm5NextConfig {
+        &self.config
     }
 
     /// Refuses a configuration a kernel's fixed bounds would truncate.
@@ -1679,7 +1893,7 @@ impl<'c> DeviceRank<'c> {
         config: &Glm5NextConfig,
         layout: TpLayout,
         stream: &RunStream,
-        memory: &mut Allocations<'_>,
+        memory: &mut Allocations,
     ) -> Result<Scratch, BackendError> {
         let world = layout.world_size;
         let hidden = config.hidden_size;
@@ -1719,7 +1933,7 @@ impl<'c> DeviceRank<'c> {
             kda_out: memory.floats(MAX_ROWS * width)?,
             dsa_fused: memory.floats(MAX_ROWS * (config.q_lora_rank + config.kv_lora_rank))?,
             query: memory.floats(MAX_ROWS * heads * nope)?,
-            kv: memory.floats(MAX_ROWS * heads * (nope + value))?,
+            q_abs: memory.floats(MAX_ROWS * heads * config.kv_lora_rank)?,
             attn_out: memory.floats(MAX_ROWS * heads * value)?,
             index_fused: memory.floats(MAX_ROWS * (2 * index_dim + index_heads))?,
             index_query: memory.floats(MAX_ROWS * index_heads * index_dim)?,
@@ -1758,7 +1972,7 @@ impl<'c> DeviceRank<'c> {
     ///
     /// # Errors
     /// When `capacity` is past the context window or the device refuses an allocation.
-    pub fn new_sequence(&self, capacity: usize) -> Result<DeviceSequence<'c>, BackendError> {
+    pub fn new_sequence(&self, capacity: usize) -> Result<DeviceSequence, BackendError> {
         self.sequence(capacity, false)
     }
 
@@ -1767,10 +1981,7 @@ impl<'c> DeviceRank<'c> {
     ///
     /// # Errors
     /// As [Self::new_sequence], and when this rank has no MTP layer.
-    pub fn new_drafting_sequence(
-        &self,
-        capacity: usize,
-    ) -> Result<DeviceSequence<'c>, BackendError> {
+    pub fn new_drafting_sequence(&self, capacity: usize) -> Result<DeviceSequence, BackendError> {
         if self.mtp.is_none() {
             return Err(refusal("this rank has no MTP layer to draft with"));
         }
@@ -1792,7 +2003,7 @@ impl<'c> DeviceRank<'c> {
         }
         let head = self.draft_head()?;
         let shard = (self.layout.rank, self.layout.world_size);
-        let draft = GpuDflash2::load(self.cuda, directory, &self.config, &head, shard).map_err(
+        let draft = GpuDflash2::load(&self.cuda, directory, &self.config, &head, shard).map_err(
             |error| {
                 BackendError::new(
                     "glm5_dflash2",
@@ -1821,7 +2032,7 @@ impl<'c> DeviceRank<'c> {
                 Ok(())
             }
             Err(error) => {
-                draft.free(self.cuda);
+                draft.free(&self.cuda);
                 Err(error)
             }
         }
@@ -1842,7 +2053,7 @@ impl<'c> DeviceRank<'c> {
     pub fn new_block_drafting_sequence(
         &self,
         capacity: usize,
-    ) -> Result<DeviceSequence<'c>, BackendError> {
+    ) -> Result<DeviceSequence, BackendError> {
         let Some(block) = &self.block else {
             return Err(refusal(
                 "this rank has no block drafter; load_block_drafter loads one",
@@ -1858,11 +2069,7 @@ impl<'c> DeviceRank<'c> {
         Ok(sequence)
     }
 
-    fn sequence(
-        &self,
-        capacity: usize,
-        drafting: bool,
-    ) -> Result<DeviceSequence<'c>, BackendError> {
+    fn sequence(&self, capacity: usize, drafting: bool) -> Result<DeviceSequence, BackendError> {
         let config = &self.config;
         if capacity > config.max_position_embeddings {
             return Err(refusal(format!(
@@ -1870,7 +2077,7 @@ impl<'c> DeviceRank<'c> {
                 config.max_position_embeddings
             )));
         }
-        let mut memory = Allocations::new(self.cuda);
+        let mut memory = Allocations::new(Arc::clone(&self.cuda));
         let head = config.linear_head_dim;
         let history = config.linear_conv_kernel_dim.saturating_sub(1);
         let layers = self
@@ -1911,11 +2118,23 @@ impl<'c> DeviceRank<'c> {
     /// A DSA layer's caches for `capacity` positions, the indexer's only for a layer with one.
     fn sparse_state(
         &self,
-        memory: &mut Allocations<'_>,
+        memory: &mut Allocations,
         dsa: &DeviceDsa,
         capacity: usize,
     ) -> Result<SequenceLayer, BackendError> {
         let config = &self.config;
+        let index_dim = config.index_head_dim;
+        // The latent is the release's E4M3 activation when the projections quantise theirs, and
+        // f32 for a BF16 release.
+        let width = config.kv_lora_rank;
+        let (latent, latent_scales) = if dsa.quantise {
+            (
+                memory.bytes(capacity * width)?,
+                memory.floats(capacity * width.div_ceil(FP8_BLOCK))?,
+            )
+        } else {
+            (memory.floats(capacity * width)?, Deviceptr(0))
+        };
         let mut index = |floats: usize| {
             if dsa.indexer.is_some() {
                 memory.floats(floats)
@@ -1923,13 +2142,12 @@ impl<'c> DeviceRank<'c> {
                 Ok(Deviceptr(0))
             }
         };
-        let index_dim = config.index_head_dim;
         Ok(SequenceLayer::Sparse {
             index_keys: index(capacity * index_dim)?,
             index_gates: index(capacity * index_dim)?,
             pooled: index(capacity / config.index_kpool * index_dim)?,
-            keys: memory.floats(capacity * dsa.heads * config.qk_nope_head_dim)?,
-            values: memory.floats(capacity * dsa.heads * config.v_head_dim)?,
+            latent,
+            latent_scales,
         })
     }
 
@@ -2352,8 +2570,8 @@ impl<'c> DeviceRank<'c> {
         self.dsa_attend(dsa, layer, runs, rows)
     }
 
-    /// The half of a DSA sublayer that writes each row's position of the caches: its key and
-    /// value, and with an indexer its index key and gate and any pool the row completes. It
+    /// The half of a DSA sublayer that writes each row's position of the caches: the normed
+    /// latent, and with an indexer its index key and gate and any pool the row completes. It
     /// leaves the normed query latent in `dsa_fused` for [Self::dsa_attend].
     fn dsa_cache(
         &self,
@@ -2366,7 +2584,6 @@ impl<'c> DeviceRank<'c> {
         let config = &self.config;
         let eps = float(config.rms_norm_eps as f32);
         let (q_lora, kv_lora) = (config.q_lora_rank, config.kv_lora_rank);
-        let (heads, nope, value) = (dsa.heads, config.qk_nope_head_dim, config.v_head_dim);
         let floats = |count: usize| count * 4;
         self.gemv(&dsa.fused, s.collapsed, s.dsa_fused, rows)?;
         let latent = dsa.fused.part(s.dsa_fused, 1, rows);
@@ -2390,24 +2607,46 @@ impl<'c> DeviceRank<'c> {
                 ],
             )?;
         }
-        self.gemv(&dsa.kv_b, latent, s.kv, rows)?;
+        // The latent, not its expansion: attention reads it in latent space, and kv_b's rows are
+        // the absorbed operands it reads instead ([Self::dsa_attend]).
         for run in runs {
-            let SequenceLayer::Sparse { keys, values, .. } = &run.layers[layer] else {
+            let SequenceLayer::Sparse {
+                latent: cache,
+                latent_scales: scales,
+                ..
+            } = &run.layers[layer]
+            else {
                 return Err(other_kind());
             };
-            let cached = floats(run.position * heads * nope);
-            self.launch(
-                self.kernels.deinterleave,
-                (blocks(heads * nope), run.len as u32, 1),
-                BLOCK,
-                &[
-                    s.kv.offset(floats(run.first * heads * (nope + value))).0,
-                    keys.offset(cached).0,
-                    values.offset(cached).0,
-                    heads as u64,
-                    nope as u64,
-                ],
-            )?;
+            let source = latent.offset(floats(run.first * kv_lora)).0;
+            if dsa.quantise {
+                self.launch(
+                    self.kernels.mla_cache_fp8,
+                    (run.len as u32, 1, 1),
+                    BLOCK,
+                    &[
+                        source,
+                        cache.0,
+                        scales.0,
+                        run.position as u64,
+                        run.len as u64,
+                        kv_lora as u64,
+                    ],
+                )?;
+            } else {
+                self.launch(
+                    self.kernels.mla_cache,
+                    (run.len as u32, 1, 1),
+                    BLOCK,
+                    &[
+                        source,
+                        cache.0,
+                        run.position as u64,
+                        run.len as u64,
+                        kv_lora as u64,
+                    ],
+                )?;
+            }
         }
         match &dsa.indexer {
             Some(indexer) => self.index_cache(indexer, layer, runs, rows),
@@ -2428,7 +2667,7 @@ impl<'c> DeviceRank<'c> {
         let s = &self.scratch;
         let config = &self.config;
         let (heads, nope, value) = (dsa.heads, config.qk_nope_head_dim, config.v_head_dim);
-        let floats = |count: usize| count * 4;
+        let latent = config.kv_lora_rank;
         self.gemv(&dsa.q_b, s.dsa_fused, s.query, rows)?;
         // The indexer's pick and the attention leave DRAM idle; the output projection comes in
         // meanwhile.
@@ -2436,27 +2675,50 @@ impl<'c> DeviceRank<'c> {
         if let Some(indexer) = &dsa.indexer {
             self.index_pick(indexer, layer, runs, rows)?;
         }
+        // The absorbed form: the query projected into the latent space, then one kernel an
+        // attention over the latent cache and kv_b's value rows.
         for run in runs {
-            let SequenceLayer::Sparse { keys, values, .. } = &run.layers[layer] else {
+            let SequenceLayer::Sparse {
+                latent: cache,
+                latent_scales: scales,
+                ..
+            } = &run.layers[layer]
+            else {
                 return Err(other_kind());
             };
             self.launch(
-                self.kernels.attn,
+                self.kernels.mla_absorb,
                 (heads as u32, run.len as u32, 1),
                 BLOCK,
                 &[
-                    s.query.offset(floats(run.first * heads * nope)).0,
-                    0,
-                    keys.0,
-                    values.0,
-                    s.selected.offset(floats(run.first * MAX_SELECTED_TOKENS)).0,
-                    s.count.offset(floats(run.first)).0,
-                    s.attn_out.offset(floats(run.first * heads * value)).0,
-                    heads as u64,
-                    heads as u64,
+                    s.query.0,
+                    dsa.kv_dequant.0,
+                    s.q_abs.0,
+                    run.first as u64,
                     nope as u64,
-                    1,
+                    value as u64,
+                    latent as u64,
+                ],
+            )?;
+            self.launch(
+                self.kernels.mla_attend,
+                (heads as u32, run.len as u32, 1),
+                BLOCK,
+                &[
+                    s.q_abs.0,
+                    cache.0,
+                    cache.0,
+                    scales.0,
+                    dsa.kv_dequant.0,
+                    s.selected.0,
+                    s.count.0,
+                    s.attn_out.0,
+                    run.first as u64,
+                    nope as u64,
+                    value as u64,
+                    latent as u64,
                     MAX_SELECTED_TOKENS as u64,
+                    u64::from(dsa.quantise),
                 ],
             )?;
         }
@@ -2698,7 +2960,7 @@ impl<'c> DeviceRank<'c> {
     /// Refuses a sequence this rank cannot run `tokens` through.
     fn check_sequence(
         &self,
-        sequence: &DeviceSequence<'_>,
+        sequence: &DeviceSequence,
         tokens: &[u32],
     ) -> Result<(), BackendError> {
         let config = &self.config;
@@ -2751,7 +3013,7 @@ impl<'c> DeviceRank<'c> {
         &mut self,
         tp: &TpRuntime,
         gather: &BitGatherHandle,
-        sequence: &mut DeviceSequence<'_>,
+        sequence: &mut DeviceSequence,
         tokens: &[u32],
     ) -> Result<Vec<Vec<f32>>, BackendError> {
         let mut logits = self.forward_batch(tp, gather, &mut [(sequence, tokens)])?;
@@ -2770,7 +3032,7 @@ impl<'c> DeviceRank<'c> {
         &mut self,
         tp: &TpRuntime,
         gather: &BitGatherHandle,
-        batch: &mut [(&mut DeviceSequence<'_>, &[u32])],
+        batch: &mut [(&mut DeviceSequence, &[u32])],
     ) -> Result<Vec<Vec<Vec<f32>>>, BackendError> {
         self.run_batch(tp, gather, batch, false)
     }
@@ -2786,7 +3048,7 @@ impl<'c> DeviceRank<'c> {
         &mut self,
         tp: &TpRuntime,
         gather: &BitGatherHandle,
-        batch: &mut [(&mut DeviceSequence<'_>, &[u32])],
+        batch: &mut [(&mut DeviceSequence, &[u32])],
     ) -> Result<Vec<Vec<Vec<f32>>>, BackendError> {
         Self::one_step(batch)?;
         self.run_batch(tp, gather, batch, true)
@@ -2803,7 +3065,7 @@ impl<'c> DeviceRank<'c> {
         &mut self,
         tp: &TpRuntime,
         gather: &BitGatherHandle,
-        batch: &mut [(&mut DeviceSequence<'_>, &[u32])],
+        batch: &mut [(&mut DeviceSequence, &[u32])],
     ) -> Result<Vec<Vec<u32>>, BackendError> {
         self.run_batch(tp, gather, batch, false)
     }
@@ -2817,7 +3079,7 @@ impl<'c> DeviceRank<'c> {
         &mut self,
         tp: &TpRuntime,
         gather: &BitGatherHandle,
-        batch: &mut [(&mut DeviceSequence<'_>, &[u32])],
+        batch: &mut [(&mut DeviceSequence, &[u32])],
     ) -> Result<Vec<Vec<u32>>, BackendError> {
         Self::one_step(batch)?;
         self.run_batch(tp, gather, batch, true)
@@ -2829,7 +3091,7 @@ impl<'c> DeviceRank<'c> {
     /// # Errors
     /// When the sequence's last step was not a greedy one of this rank, its verify is not
     /// committed, an LM head (a step's or a draft's) has run since, or the device refuses a copy.
-    pub fn last_logits(&self, sequence: &DeviceSequence<'_>) -> Result<Vec<f32>, BackendError> {
+    pub fn last_logits(&self, sequence: &DeviceSequence) -> Result<Vec<f32>, BackendError> {
         let Some(at) = sequence.logits_at else {
             return Err(refusal(
                 "the sequence's last step was not a greedy step; its logits went to the host then",
@@ -2863,7 +3125,7 @@ impl<'c> DeviceRank<'c> {
     }
 
     /// Refuses a verify of more rows than one step carries.
-    fn one_step(batch: &[(&mut DeviceSequence<'_>, &[u32])]) -> Result<(), BackendError> {
+    fn one_step(batch: &[(&mut DeviceSequence, &[u32])]) -> Result<(), BackendError> {
         let rows: usize = batch.iter().map(|(_, tokens)| tokens.len()).sum();
         if rows > MAX_ROWS {
             return Err(refusal(format!(
@@ -2884,11 +3146,7 @@ impl<'c> DeviceRank<'c> {
     /// # Errors
     /// When the sequence has no verify to commit, this rank did not run it or has run a step
     /// since, `kept` is 0 or past the verify's rows, or the device refuses a launch.
-    pub fn commit(
-        &self,
-        sequence: &mut DeviceSequence<'_>,
-        kept: usize,
-    ) -> Result<(), BackendError> {
+    pub fn commit(&self, sequence: &mut DeviceSequence, kept: usize) -> Result<(), BackendError> {
         let Some(pending) = sequence.pending else {
             return Err(refusal("the sequence has no verify to commit"));
         };
@@ -3003,7 +3261,7 @@ impl<'c> DeviceRank<'c> {
         &mut self,
         tp: &TpRuntime,
         gather: &BitGatherHandle,
-        batch: &mut [(&mut DeviceSequence<'_>, &[u32])],
+        batch: &mut [(&mut DeviceSequence, &[u32])],
         verify: bool,
     ) -> Result<Vec<Vec<R>>, BackendError> {
         let device_leg = self.collective(tp, gather)?;
@@ -3520,7 +3778,7 @@ impl<'c> DeviceRank<'c> {
         &self,
         tp: &TpRuntime,
         gather: &BitGatherHandle,
-        batch: &mut [(&mut DeviceSequence<'_>, u32)],
+        batch: &mut [(&mut DeviceSequence, u32)],
         count: usize,
     ) -> Result<Vec<Vec<u32>>, BackendError> {
         let device_leg = self.collective(tp, gather)?;
@@ -3660,7 +3918,7 @@ impl<'c> DeviceRank<'c> {
     fn draft_blocks(
         &self,
         (tp, gather, device_leg): (&TpRuntime, &BitGatherHandle, bool),
-        batch: &mut [(&mut DeviceSequence<'_>, u32)],
+        batch: &mut [(&mut DeviceSequence, u32)],
         count: usize,
     ) -> Result<Vec<Vec<u32>>, BackendError> {
         let Some(block) = &self.block else {
@@ -3784,7 +4042,7 @@ impl<'c> DeviceRank<'c> {
 }
 
 /// The block drafter's launches go on the rank's stream, and its BF16 GEMVs through the rank's.
-impl DraftDevice for DeviceRank<'_> {
+impl DraftDevice for DeviceRank {
     fn launch(
         &self,
         kernel: Kernel,
@@ -3822,13 +4080,13 @@ impl DraftDevice for DeviceRank<'_> {
 /// The rank as the block drafter's device while it scores a block: the rank's launches, GEMVs and
 /// tiled scratch, and the TP collective that sums the sharded drafter's partials as
 /// [DeviceRank::mix_out] sums the model's, into one stream by `mtp_coeffs` (`x + reduced`).
-struct Scoring<'r, 'c> {
-    rank: &'r DeviceRank<'c>,
+struct Scoring<'r> {
+    rank: &'r DeviceRank,
     tp: &'r TpRuntime,
     device_leg: bool,
 }
 
-impl DraftDevice for Scoring<'_, '_> {
+impl DraftDevice for Scoring<'_> {
     fn launch(
         &self,
         kernel: Kernel,
@@ -3872,14 +4130,14 @@ impl DraftDevice for Scoring<'_, '_> {
     }
 }
 
-impl Drop for DeviceRank<'_> {
+impl Drop for DeviceRank {
     fn drop(&mut self) {
         let _ = self.cuda.synchronize_stream(&self.stream);
         if let Some(prefetch) = &self.prefetch {
             self.cuda.destroy_side_stream(&prefetch.side);
         }
         if let Some(block) = &self.block {
-            block.draft.free(self.cuda);
+            block.draft.free(&self.cuda);
         }
         self.cuda.destroy_run_stream(&self.stream);
     }

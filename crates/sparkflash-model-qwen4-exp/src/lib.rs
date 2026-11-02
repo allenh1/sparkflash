@@ -33,6 +33,8 @@
 //! * [checkpoint] is the shared checkpoint plumbing: the host loader the device arm is compared
 //!   against, the paged PLE reader both sides use, and a synthetic-checkpoint writer so the whole
 //!   device loop can run on a tiny fixture instead of the 132.6 GB release.
+//! * [convert] writes and reads the converted TP=1 rank file, the exact bytes the weight walk
+//!   uploads, so a boot is one direct-I/O read instead of 77.8 GiB of per-tensor uploads.
 //! * [device] is the TP=1 device arm: one rank, one cubin, no host fallback.
 //! * [dflash] is the DFlash 2 block drafter's configuration, which the device arm serves as its
 //!   speculative drafter when a drafter checkpoint is configured.
@@ -61,6 +63,7 @@ pub mod cache;
 pub mod checkpoint;
 pub mod codec;
 pub mod config;
+pub mod convert;
 pub mod device;
 pub mod dflash;
 pub mod forward;

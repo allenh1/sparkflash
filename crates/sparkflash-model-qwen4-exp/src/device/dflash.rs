@@ -360,7 +360,8 @@ impl GpuDflash2 {
         let kernels = Dflash2Kernels::load(cuda)?;
         let quantize = kernels.quantize;
         let source = single_file_source(directory)?;
-        let uploader = Uploader { cuda };
+        let mut sink = super::Direct { cuda };
+        let uploader = Uploader::new(cuda, &mut sink);
         let hidden = config.hidden_size;
         let conv = |prefix: String| -> Result<GpuConv, String> {
             Ok(GpuConv {

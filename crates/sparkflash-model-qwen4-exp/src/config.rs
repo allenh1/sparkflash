@@ -476,6 +476,7 @@ impl Qwen4ExpConfig {
             text["pad_token_id"] = serde_json::json!(pad);
         }
         let mut root = serde_json::json!({
+            "model_type": "qwen4_exp",
             "text_config": text,
             "tie_word_embeddings": self.tie_word_embeddings,
             "image_token_id": self.image_token_id,

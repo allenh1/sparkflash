@@ -31,6 +31,7 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sparkflash_comm::device_reduce::BootstrapConfig;
@@ -40,6 +41,7 @@ use sparkflash_engine::parallel_tp::{BitGatherHandle, TpCollective, TpLayout, Tp
 use sparkflash_engine::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_kernels::cuda_driver::Cuda;
 use sparkflash_model::DepthPolicy;
+use sparkflash_model_glm5_next::device::CudaHandle;
 use sparkflash_model_glm5_next::{
     DFLASH2_STEP_COST, DeviceRank, DeviceSequence, Glm5NextConfig, MAX_ROWS,
 };
@@ -345,19 +347,19 @@ fn run_rank(args: &GlmArgs) -> Result<(), String> {
     if prompt.is_empty() {
         return Err("the prompt is no tokens".to_owned());
     }
-    let cuda = Cuda::load()?;
+    let cuda = Arc::new(CudaHandle::new(Cuda::load()?));
 
     let started = Instant::now();
     let mut rank = match (&args.converted, &args.checkpoint) {
         (Some(dir), _) => {
             let path = find_converted_rank_file(dir, layout.rank, layout.world_size)
                 .ok_or_else(|| format!("{} holds no file for {who}", dir.display()))?;
-            DeviceRank::load_converted(&cuda, &config, &path, layout)
+            DeviceRank::load_converted(Arc::clone(&cuda), &config, &path, layout)
         }
         (None, Some(dir)) => {
             let source = SafeTensorsSource::open(dir, &dir.join(INDEX_NAME))
                 .map_err(|error| format!("{}: {error}", dir.display()))?;
-            DeviceRank::load(&cuda, &config, &source, layout)
+            DeviceRank::load(Arc::clone(&cuda), &config, &source, layout)
         }
         (None, None) => unreachable!("the parser requires one source"),
     }
@@ -473,7 +475,7 @@ enum Drafter<'a> {
 /// Returns stream 0's tokens and the digest of its last logits, once every stream has decoded
 /// the same tokens and the same last logits.
 fn decode_streams(
-    rank: &mut DeviceRank<'_>,
+    rank: &mut DeviceRank,
     (tp, gather): (&TpRuntime, &BitGatherHandle),
     prompt: &[u32],
     (streams, drafts, drafter): (usize, usize, Drafter<'_>),
@@ -487,7 +489,7 @@ fn decode_streams(
             (_, Drafter::Mtp) => rank.new_drafting_sequence(capacity),
             (_, Drafter::Block { .. }) => rank.new_block_drafting_sequence(capacity),
         })
-        .collect::<Result<Vec<DeviceSequence<'_>>, _>>()
+        .collect::<Result<Vec<DeviceSequence>, _>>()
         .map_err(|error| error.to_string())?;
     let started = Instant::now();
     let mut batch: Vec<_> = sequences
@@ -583,9 +585,9 @@ type Streams<'a> = (&'a mut [u32], &'a mut [Vec<u32>]);
 /// When a step fails, or an oracle's draft is not kept: the verify row before it picked another
 /// token than the one-token steps did.
 fn speculate(
-    rank: &mut DeviceRank<'_>,
+    rank: &mut DeviceRank,
     (tp, gather): (&TpRuntime, &BitGatherHandle),
-    sequences: &mut [DeviceSequence<'_>],
+    sequences: &mut [DeviceSequence],
     (next, generated): Streams<'_>,
     (drafts, drafter): (usize, Drafter<'_>),
     max_tokens: usize,

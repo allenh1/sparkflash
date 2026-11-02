@@ -2506,14 +2506,21 @@ dependencies = [
 name = "sparkflash-model-glm5-next"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bytemuck",
+ "http-body-util",
  "serde",
  "serde_json",
+ "sparkflash-api",
  "sparkflash-kernels",
  "sparkflash-model",
  "sparkflash-model-qwen4-exp",
+ "sparkflash-serve",
  "sparkflash-weights",
  "tempfile",
+ "tokenizers",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

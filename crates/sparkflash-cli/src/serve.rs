@@ -166,6 +166,15 @@ use sparkflash_scheduler::config::SchedulerConfig;
 use sparkflash_scheduler::prefill::ChunkedPrefillPlan;
 
 #[cfg(feature = "tp4-serve")]
+use sparkflash_engine::parallel_tp::{BitGatherHandle, TpLayout, TpRuntime, Wire};
+#[cfg(feature = "tp4-serve")]
+use sparkflash_model_glm5_next::device::CudaHandle;
+#[cfg(feature = "tp4-serve")]
+use sparkflash_model_glm5_next::{DeviceRank, DeviceSequence, Glm5NextConfig};
+#[cfg(feature = "tp4-serve")]
+use sparkflash_model_qwen4_exp::sampling::Sampler;
+
+#[cfg(feature = "tp4-serve")]
 mod device;
 #[cfg(feature = "tp4-serve")]
 pub use device::DeviceServeOptions;
@@ -859,8 +868,15 @@ impl ServeOptions {
             if cli.device_token_live {
                 unsupported.push("--device-token-live");
             }
+            // The GLM pack is the one that brings a four-rank arm; every other packed model is
+            // TP=1, so the flag stays a V4.1/GLM-only surface rather than a silent no-op.
             #[cfg(feature = "tp4-serve")]
-            if cli.tp4_rank.is_some() {
+            if cli.tp4_rank.is_some()
+                && !cli.model.as_deref().is_some_and(|model| {
+                    model.eq_ignore_ascii_case(sparkflash_model_glm5_next::MODEL_ID)
+                        || model.eq_ignore_ascii_case(sparkflash_model_glm5_next::WEIGHTS_ID)
+                })
+            {
                 unsupported.push("--tp4-rank");
             }
             if !unsupported.is_empty() {
@@ -2357,6 +2373,24 @@ fn read_control_pixels(stream: &mut TcpStream, bytes: u64) -> Result<Vec<u8>, Tp
     let mut pixels = vec![0u8; length];
     stream.read_exact(&mut pixels)?;
     Ok(pixels)
+}
+
+/// Whether a control read timed out with no request open, which is an idle wait rather than a
+/// dead peer.
+///
+/// The socket's read timeout is a liveness guard for a stalled step; between requests it fires on
+/// a healthy server that has simply received nothing. Only the timeout kinds mean "try again":
+/// a reset or a broken pipe is still a failure.
+#[cfg(feature = "tp4-serve")]
+fn control_read_is_idle(error: &Tp4ControlError) -> bool {
+    matches!(
+        error,
+        Tp4ControlError::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )
+    )
 }
 
 /// Reads one length-prefixed JSON control frame.
@@ -4253,6 +4287,9 @@ pub struct Tp4RankConfig {
     pub checkpoint: PathBuf,
     /// The element cap for one tensor.
     pub element_limit: usize,
+    /// The context one packed-model sequence allocates. The host reference rank sizes its own
+    /// sequence state from the checkpoint, so only a packed arm reads this.
+    pub context: usize,
     /// The startup and control deadline.
     pub timeout: Duration,
 }
@@ -4284,6 +4321,9 @@ fn tp4_rank_config(
         control_port: tp4.control_port,
         checkpoint,
         element_limit: options.element_limit,
+        context: options
+            .context
+            .unwrap_or(sparkflash_model_glm5_next::DEFAULT_DEVICE_CONTEXT),
         timeout,
     })
 }
@@ -4381,6 +4421,277 @@ fn open_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> 
     Ok(Box::new(HostTp4Rank { rank }))
 }
 
+/// One GLM-5.3-Flash rank behind the serve-owned TP=4 control channel.
+///
+/// The rank mirrors [HostTp4Rank] over the device arm: every rank runs the same prompt and the
+/// same sampled token, rank 0 samples on the host and the workers ignore their own choice. The
+/// sequence is rebuilt at the start of every request, so a request's KV state never leaks into the
+/// next one.
+#[cfg(feature = "tp4-serve")]
+struct GlmTp4Rank {
+    rank: DeviceRank,
+    /// The live request's sequence. It is dropped before the next request allocates its own, so a
+    /// long context never holds two full KV sets at once.
+    sequence: Option<DeviceSequence>,
+    tp: TpRuntime,
+    gather: BitGatherHandle,
+    sampler: Sampler,
+    sampling: sparkflash_model::Sampling,
+    eos: Vec<u32>,
+    context: usize,
+    load_ms: u64,
+    steps: u64,
+    last_step_ms: u64,
+}
+
+#[cfg(feature = "tp4-serve")]
+impl GlmTp4Rank {
+    /// One greedy step of `rows` and the sampled token after the last of them.
+    fn step(&mut self, rows: &[u32]) -> Result<Tp4Step, String> {
+        let started = Instant::now();
+        let sequence = self
+            .sequence
+            .as_mut()
+            .ok_or_else(|| "a GLM step arrived before begin_request".to_owned())?;
+        let mut batch = [(sequence, rows)];
+        self.rank
+            .forward_batch_greedy(&self.tp, &self.gather, &mut batch)
+            .map_err(|error| format!("the GLM rank forward failed: {error}"))?;
+        let logits = self
+            .rank
+            .last_logits(batch[0].0)
+            .map_err(|error| format!("the GLM rank's last logits: {error}"))?;
+        let token = self.sampler.choose(&logits, &self.sampling);
+        let next_token = if self.eos.contains(&token) {
+            None
+        } else {
+            Some(token)
+        };
+        self.steps += 1;
+        self.last_step_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Ok(Tp4Step { logits, next_token })
+    }
+}
+
+#[cfg(feature = "tp4-serve")]
+impl Tp4RankApi for GlmTp4Rank {
+    fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String> {
+        // Free the last request's KV before allocating this one's: at a long context the two
+        // allocations together do not fit beside the weights.
+        self.sequence = None;
+        let sequence = self
+            .rank
+            .new_sequence(self.context)
+            .map_err(|error| format!("a fresh GLM sequence: {error}"))?;
+        self.sequence = Some(sequence);
+        self.sampler.reset();
+        self.sampling = sparkflash_model::Sampling {
+            temperature: sampling.temperature,
+            seed: sampling.seed,
+            ..sparkflash_model::Sampling::default()
+        };
+        Ok(())
+    }
+
+    fn prefill(&mut self, prompt: &[u32]) -> Result<Tp4Step, String> {
+        if prompt.is_empty() {
+            return Err("an empty prompt has no logits".to_owned());
+        }
+        self.sampler.record_prompt(prompt);
+        self.step(prompt)
+    }
+
+    fn prefill_prompt_logprobs(
+        &mut self,
+        _prompt: &[u32],
+        _selection: Option<usize>,
+    ) -> Result<(Tp4Step, Vec<MergedPosition>), String> {
+        // The rank's logits are one row a step; the prompt-logprob contract needs every scored
+        // position's row and a merged candidate order this arm does not produce yet.
+        Err(format!(
+            "{} the GLM-5.3-Flash four-rank arm does not score prompt logprobs yet",
+            crate::tp4_host::PROMPT_LOGPROBS_REFUSED_PREFIX
+        ))
+    }
+
+    fn decode(&mut self, token: u32) -> Result<Tp4Step, String> {
+        self.sampler.record(token);
+        self.step(&[token])
+    }
+
+    fn metrics(&self) -> Tp4RankMetrics {
+        Tp4RankMetrics {
+            load_ms: self.load_ms,
+            resident_cache_bytes: u64::try_from(self.rank.device_bytes()).unwrap_or(u64::MAX),
+            // This arm does not instrument the collective or the tensor count; the fields report
+            // zero rather than a number nobody measured.
+            resident_cache_tensors: 0,
+            reduce_calls: 0,
+            reduce_elements: 0,
+            steps: self.steps,
+            last_step_ms: self.last_step_ms,
+        }
+    }
+}
+
+/// Opens one GLM-5.3-Flash rank of the serve-owned TP=4 group.
+///
+/// The weights come from the checkpoint directory (or its index's parent), the configuration from
+/// its `config.json` or the carried release, and the collective from the same TCP seams the
+/// `glm-tp4` harness uses. The partials travel on the f32 wire; the device leg is not selected
+/// here, so a four-node GLM run needs no NCCL to be correct, only to be fast.
+#[cfg(feature = "tp4-serve")]
+fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> {
+    let started = Instant::now();
+    let directory = if config.checkpoint.is_dir() {
+        config.checkpoint.clone()
+    } else {
+        config
+            .checkpoint
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf()
+    };
+    let config_path = directory.join(CHECKPOINT_CONFIG_NAME);
+    let glm_config = if config_path.is_file() {
+        let text = std::fs::read_to_string(&config_path)
+            .map_err(|error| format!("{}: {error}", config_path.display()))?;
+        Glm5NextConfig::from_json(&text).map_err(|error| error.to_string())?
+    } else {
+        Glm5NextConfig::glm53_flash().map_err(|error| error.to_string())?
+    };
+    let cuda = Arc::new(CudaHandle::new(
+        sparkflash_kernels::cuda_driver::Cuda::load().map_err(|error| format!("CUDA: {error}"))?,
+    ));
+    let layout = TpLayout {
+        rank: config.rank,
+        world_size: config.world_size,
+    };
+    // The engine collective is a separate socket set from the serve control channel: one
+    // transport per rank, on base_port + rank, exactly as the harness opens it.
+    let transport: Option<Box<dyn sparkflash_comm::Transport>> = if config.world_size > 1 {
+        let tcp = crate::tp4_host::tcp_config(config.rank, &config.peers, config.base_port, true)?;
+        Some(Box::new(
+            sparkflash_comm::TcpTransport::connect(tcp)
+                .map_err(|error| format!("tcp connect: {error}"))?,
+        ))
+    } else {
+        None
+    };
+    let (collective, gather) =
+        crate::tp4_host::tp4_seams(config.rank, config.world_size, transport, Wire::F32);
+    let tp = TpRuntime::new(layout, collective).map_err(|error| error.to_string())?;
+    let gather = BitGatherHandle::new(gather);
+    // The latent cache the 1M window needs: E4M3 by default (vLLM's `fp8_ds_mla` trade), or
+    // f32 for the expansion's exact arithmetic at a smaller window.
+    let latent_cache = match std::env::var("SPARKFLASH_GLM_KV_CACHE").as_deref() {
+        Ok("f32") => sparkflash_model_glm5_next::device::LatentCache::F32,
+        Ok("fp8") | Err(_) => sparkflash_model_glm5_next::device::LatentCache::Fp8,
+        Ok(other) => {
+            return Err(format!(
+                "SPARKFLASH_GLM_KV_CACHE={other} is neither fp8 nor f32"
+            ));
+        }
+    };
+    // The converted rank file is one allocation the arm uploads in place, read with the same
+    // parallel direct-I/O path the V4.1 ranks use: the checkpoint path re-reads and re-lays-out
+    // every tensor, which is the six-minute startup this replaces. A configured directory that
+    // does not hold this rank's file is a refusal, not a silent fallback to the slow path.
+    let (rank, origin) =
+        match std::env::var_os("SPARKFLASH_GLM_CONVERTED_DIR").filter(|value| !value.is_empty()) {
+            Some(configured) => {
+                let configured = PathBuf::from(configured);
+                let file = sparkflash_device::converted::find_converted_rank_file(
+                    &configured,
+                    config.rank,
+                    config.world_size,
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "{} holds no converted rank file for rank {} of {}",
+                        configured.display(),
+                        config.rank,
+                        config.world_size
+                    )
+                })?;
+                let rank = DeviceRank::load_converted_with_cache(
+                    Arc::clone(&cuda),
+                    &glm_config,
+                    &file,
+                    layout,
+                    latent_cache,
+                )
+                .map_err(|error| format!("{}: {error}", file.display()))?;
+                (rank, format!("converted {}", file.display()))
+            }
+            None => {
+                let source = sparkflash_engine::safetensors::SafeTensorsSource::open(
+                    &directory,
+                    &directory.join(sparkflash_engine::safetensors::INDEX_NAME),
+                )
+                .map_err(|error| format!("{}: {error}", directory.display()))?;
+                let rank = DeviceRank::load_with_cache(
+                    Arc::clone(&cuda),
+                    &glm_config,
+                    &source,
+                    layout,
+                    latent_cache,
+                )
+                .map_err(|error| error.to_string())?;
+                (rank, format!("checkpoint {}", directory.display()))
+            }
+        };
+    if config.context == 0 || config.context > glm_config.max_position_embeddings {
+        return Err(format!(
+            "context limit {} is outside 1..={}",
+            config.context, glm_config.max_position_embeddings
+        ));
+    }
+    let context = config.context;
+    // A placeholder that a request replaces; allocating the full window here would hold it idle
+    // for the server's whole life and leave no room for a request's own sequence.
+    let sequence = rank
+        .new_sequence(1)
+        .map_err(|error| format!("a fresh GLM sequence: {error}"))?;
+    let load_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    eprintln!(
+        "sparkflash serve: GLM rank {}/{} loaded in {:.1} s from {origin}",
+        config.rank,
+        config.world_size,
+        load_ms as f64 / 1000.0
+    );
+    Ok(Box::new(GlmTp4Rank {
+        eos: glm_config.eos_token_ids.clone(),
+        rank,
+        sequence: Some(sequence),
+        tp,
+        gather,
+        sampler: Sampler::new(),
+        sampling: sparkflash_model::Sampling::default(),
+        context,
+        load_ms,
+        steps: 0,
+        last_step_ms: 0,
+    }))
+}
+
+/// What the TP=4 driver serves and how it opens its rank.
+///
+/// The control channel, the request loop and the HTTP side are the same for every pack; this is the
+/// part that differs: the model id and vocabulary the driver reports, the capabilities the router
+/// exposes, the telemetry it states, the tokenizer it detokenizes with, and the factory that opens
+/// this process's rank.
+#[cfg(feature = "tp4-serve")]
+#[derive(Clone)]
+struct Tp4EngineSpec {
+    model: String,
+    vocab_size: usize,
+    capabilities: Capabilities,
+    cluster: ClusterStatsSnapshot,
+    tokenizer: PathBuf,
+    open: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String>,
+}
+
 /// The TP=4 HTTP driver: the same ApiInferenceEngine/EngineEvent contract as ReferenceDriver,
 /// backed by one rank-0 engine thread that owns the rank and the control hub.
 #[cfg(feature = "tp4-serve")]
@@ -4389,6 +4700,7 @@ pub struct Tp4Driver {
     jobs: tokio::sync::mpsc::Sender<Job>,
     max_tokens: usize,
     vocab_size: usize,
+    capabilities: Capabilities,
     cluster: ClusterStatsSnapshot,
     /// The exporter the rank-0 engine thread feeds; the router serves this same registry.
     metrics: Arc<Metrics>,
@@ -4401,28 +4713,31 @@ impl Tp4Driver {
     /// The handshake is after open() and after every worker's Hello, so a missing rank or an
     /// unreadable checkpoint refuses startup before the HTTP socket exists.
     fn start(
-        recipe: &Recipe,
+        spec: Tp4EngineSpec,
         rank_config: Tp4RankConfig,
         max_tokens: usize,
     ) -> Result<Self, String> {
         let (jobs, queued) = tokio::sync::mpsc::channel(TP4_JOB_QUEUE);
         let (ready, reported) = std::sync::mpsc::channel();
-        let owned = recipe.clone();
         // Same sharing rule as the reference driver: one exporter, fed by the thread, served by
         // the router.
         let metrics = Arc::new(Metrics::new());
         let thread_metrics = Arc::clone(&metrics);
+        let thread_spec = spec.clone();
         std::thread::Builder::new()
             .name(ENGINE_THREAD_NAME.to_owned())
-            .spawn(move || tp4_engine_thread(&owned, rank_config, queued, ready, thread_metrics))
+            .spawn(move || {
+                tp4_engine_thread(&thread_spec, rank_config, queued, ready, thread_metrics)
+            })
             .map_err(|error| format!("cannot start the TP=4 engine thread: {error}"))?;
         match reported.recv() {
             Ok(Ok(())) => Ok(Self {
-                model: MODEL_ID.to_owned(),
+                model: spec.model,
                 jobs,
                 max_tokens,
-                vocab_size: recipe.config.vocab_size,
-                cluster: tp4_cluster_snapshot(),
+                vocab_size: spec.vocab_size,
+                capabilities: spec.capabilities,
+                cluster: spec.cluster,
                 metrics,
             }),
             Ok(Err(message)) => Err(message),
@@ -4438,6 +4753,7 @@ impl Tp4Driver {
             jobs,
             max_tokens,
             vocab_size: 8,
+            capabilities: Capabilities::default(),
             cluster: tp4_cluster_snapshot(),
             metrics: Arc::new(Metrics::new()),
         }
@@ -4591,7 +4907,7 @@ impl ApiInferenceEngine for Tp4Driver {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities::default()
+        self.capabilities
     }
 
     fn vocab_size(&self) -> Option<usize> {
@@ -4624,13 +4940,13 @@ fn log_tp4_metrics(rank: usize, phase: &str, metrics: &Tp4RankMetrics) {
 /// Rank 0's engine thread: open the resident rank, accept the workers, then run one job at a time.
 #[cfg(feature = "tp4-serve")]
 fn tp4_engine_thread(
-    recipe: &Recipe,
+    spec: &Tp4EngineSpec,
     rank_config: Tp4RankConfig,
     mut jobs: tokio::sync::mpsc::Receiver<Job>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
     metrics: Arc<Metrics>,
 ) {
-    let built = open_tp4_rank(&rank_config)
+    let built = (spec.open)(&rank_config)
         .map_err(|error| format!("rank {}: {error}", rank_config.rank))
         .and_then(|rank| {
             log_tp4_metrics(rank_config.rank, "open", &rank.metrics());
@@ -4640,7 +4956,7 @@ fn tp4_engine_thread(
                 rank_config.timeout,
             )
             .map_err(|error| format!("rank 0 control channel: {error}"))?;
-            let tokenizer = load_tokenizer(&recipe.tokenizer)?;
+            let tokenizer = load_tokenizer(&spec.tokenizer)?;
             Ok((rank, hub, tokenizer))
         });
     let (mut rank, mut hub, tokenizer) = match built {
@@ -4674,17 +4990,25 @@ fn tp4_engine_thread(
         };
         log_tp4_metrics(rank_config.rank, "request", &rank.metrics());
         if let Some(error) = failure {
-            let (code, message) = match error {
+            match error {
                 Tp4RequestError::Refused(message) => {
-                    (TP4_LOGPROBS_REFUSED_CODE.to_owned(), message)
+                    let _ = hub.broadcast(&Tp4ControlFrame::Error {
+                        code: TP4_LOGPROBS_REFUSED_CODE.to_owned(),
+                        message: message.clone(),
+                    });
+                    let _ = replies.blocking_send(Reply::Failed(message));
                 }
-                Tp4RequestError::Failed(message) => (ENGINE_ERROR_CODE.to_owned(), message),
-            };
-            let _ = hub.broadcast(&Tp4ControlFrame::Error {
-                code: code.clone(),
-                message: message.clone(),
-            });
-            let _ = replies.blocking_send(Reply::Failed(message));
+                Tp4RequestError::Failed(message) => {
+                    let _ = hub.broadcast(&Tp4ControlFrame::Error {
+                        code: ENGINE_ERROR_CODE.to_owned(),
+                        message: message.clone(),
+                    });
+                    let _ = replies.blocking_send(Reply::Failed(message));
+                }
+                // The request ended for the workers with an End frame in run_tp4_request; the
+                // client is gone, so there is no reply and no group-level failure.
+                Tp4RequestError::Cancelled => {}
+            }
         }
         metrics.request_finished();
     }
@@ -4701,6 +5025,10 @@ fn tp4_engine_thread(
 enum Tp4RequestError {
     /// A prompt-logprob contract refusal: request-scoped and recoverable for the group.
     Refused(String),
+    /// The client stopped reading this response. The request is closed for the workers with an
+    /// End frame and the group stays up for the next request; a disconnected client must not end
+    /// the four ranks.
+    Cancelled,
     /// Anything else: the forward, the tokenizer or the control channel failed.
     Failed(String),
 }
@@ -4803,10 +5131,16 @@ fn run_tp4_request(
     );
     // Prompt logprobs are one payload for the prompt, delivered once at the end of prefill,
     // which is where the serial host path and vLLM deliver them.
-    if let Some(payload) = prompt_logprobs {
-        job.replies
+    if let Some(payload) = prompt_logprobs
+        && job
+            .replies
             .blocking_send(Reply::PromptLogprobs(Box::new(payload)))
-            .map_err(|_| "the client stopped reading this response".to_owned())?;
+            .is_err()
+    {
+        // The workers are between the Request and the first Token. End the request for them and
+        // leave the group alive; a client that closes its connection is not a group failure.
+        let _ = hub.broadcast(&Tp4ControlFrame::End);
+        return Err(Tp4RequestError::Cancelled);
     }
     let want_sample = job.logprobs.wants_sample();
     let mut decoder = tokenizer.tokenizer().decode_stream(job.skip_special_tokens);
@@ -4837,19 +5171,26 @@ fn run_tp4_request(
                 &job.logprobs.token_ids,
                 &mut logprob_decoder,
             )?;
-            if let Some(piece) = piece {
-                job.replies
-                    .blocking_send(Reply::Delta(piece))
-                    .map_err(|_| "the client stopped reading this response".to_owned())?;
+            if let Some(piece) = piece
+                && job.replies.blocking_send(Reply::Delta(piece)).is_err()
+            {
+                let _ = hub.broadcast(&Tp4ControlFrame::End);
+                return Err(Tp4RequestError::Cancelled);
             }
-            job.replies
+            if job
+                .replies
                 .blocking_send(Reply::TokenLogprobs(Box::new(entry)))
-                .map_err(|_| "the client stopped reading this response".to_owned())?;
+                .is_err()
+            {
+                let _ = hub.broadcast(&Tp4ControlFrame::End);
+                return Err(Tp4RequestError::Cancelled);
+            }
             logprob_decoder.push(token);
-        } else if let Some(piece) = piece {
-            job.replies
-                .blocking_send(Reply::Delta(piece))
-                .map_err(|_| "the client stopped reading this response".to_owned())?;
+        } else if let Some(piece) = piece
+            && job.replies.blocking_send(Reply::Delta(piece)).is_err()
+        {
+            let _ = hub.broadcast(&Tp4ControlFrame::End);
+            return Err(Tp4RequestError::Cancelled);
         }
         completion_tokens += 1;
         metrics.record_generation_tokens(1);
@@ -4879,16 +5220,16 @@ fn run_tp4_request(
     };
     hub.broadcast(&Tp4ControlFrame::End)
         .map_err(|error| format!("control End: {error}"))?;
-    job.replies
-        .blocking_send(Reply::Done(Box::new(RunSummary {
-            completion_tokens,
-            finish_reason,
-            timing,
-            // The TP=4 driver has no draft source in this slice, so it reports the honest zero:
-            // no MTP draft was proposed, accepted or gated on the four-rank arm.
-            dspark: DSparkStepStats::default(),
-        })))
-        .map_err(|_| "the client stopped reading this response".to_owned())?;
+    // The End frame is already out, so the group's request is complete; a client that stopped
+    // reading the final summary is only a dropped connection.
+    let _ = job.replies.blocking_send(Reply::Done(Box::new(RunSummary {
+        completion_tokens,
+        finish_reason,
+        timing,
+        // The TP=4 driver has no draft source in this slice, so it reports the honest zero:
+        // no MTP draft was proposed, accepted or gated on the four-rank arm.
+        dspark: DSparkStepStats::default(),
+    })));
     Ok(())
 }
 
@@ -4984,12 +5325,9 @@ fn tp4_prompt_logprobs_payload(
     Ok(PromptLogprobs { tokens, positions })
 }
 
-/// Runs one worker rank until its control channel ends.
+/// Connects a worker to rank 0's control hub and completes the handshake.
 #[cfg(feature = "tp4-serve")]
-fn tp4_worker(options: &ServeOptions, tp4: &Tp4ServeOptions) -> Result<(), String> {
-    let rank_config = tp4_rank_config(options, tp4, TP4_CONTROL_TIMEOUT)?;
-    let mut rank = open_tp4_rank(&rank_config)?;
-    log_tp4_metrics(rank_config.rank, "open", &rank.metrics());
+fn tp4_control_worker(rank_config: &Tp4RankConfig) -> Result<Tp4ControlWorker, String> {
     let mut control = Tp4ControlWorker::connect(
         rank_config.control_address(),
         u32::try_from(rank_config.rank).map_err(|_| "rank does not fit in u32".to_owned())?,
@@ -5000,6 +5338,36 @@ fn tp4_worker(options: &ServeOptions, tp4: &Tp4ServeOptions) -> Result<(), Strin
     control
         .handshake()
         .map_err(|error| format!("rank {} control handshake: {error}", rank_config.rank))?;
+    Ok(control)
+}
+
+/// Runs one worker rank until its control channel ends.
+#[cfg(feature = "tp4-serve")]
+fn tp4_worker(options: &ServeOptions, tp4: &Tp4ServeOptions) -> Result<(), String> {
+    let rank_config = tp4_rank_config(options, tp4, TP4_CONTROL_TIMEOUT)?;
+    let mut rank = open_tp4_rank(&rank_config)?;
+    log_tp4_metrics(rank_config.rank, "open", &rank.metrics());
+    let mut control = tp4_control_worker(&rank_config)?;
+    tp4_worker_loop(rank.as_mut(), &mut control, rank_config.rank)
+}
+
+/// Runs one GLM-5.3-Flash worker rank until its control channel ends.
+#[cfg(feature = "tp4-serve")]
+fn glm_tp4_worker(options: &ServeOptions, tp4: &Tp4ServeOptions) -> Result<(), String> {
+    let rank_config = tp4_rank_config(options, tp4, TP4_CONTROL_TIMEOUT)?;
+    let mut rank = open_glm_tp4_rank(&rank_config)?;
+    log_tp4_metrics(rank_config.rank, "open", &rank.metrics());
+    let mut control = tp4_control_worker(&rank_config)?;
+    tp4_worker_loop(rank.as_mut(), &mut control, rank_config.rank)
+}
+
+/// The worker's frame loop: prefill a request, run the tokens rank 0 sampled, repeat.
+#[cfg(feature = "tp4-serve")]
+fn tp4_worker_loop(
+    rank: &mut dyn Tp4RankApi,
+    control: &mut Tp4ControlWorker,
+    rank_index: usize,
+) -> Result<(), String> {
     loop {
         match control.next_frame() {
             Ok(Tp4ControlFrame::Request {
@@ -5035,25 +5403,22 @@ fn tp4_worker(options: &ServeOptions, tp4: &Tp4ServeOptions) -> Result<(), Strin
                             if code == TP4_LOGPROBS_REFUSED_CODE =>
                         {
                             println!(
-                                "sparkflash serve: tp4_prompt_logprobs_refused rank={} message={message}",
-                                rank_config.rank
+                                "sparkflash serve: tp4_prompt_logprobs_refused rank={rank_index} message={message}"
                             );
                         }
                         Ok(other) => {
                             return Err(format!(
-                                "rank {} expected the prompt-logprob refusal frame, got {}",
-                                rank_config.rank,
+                                "rank {rank_index} expected the prompt-logprob refusal frame, got {}",
                                 other.kind()
                             ));
                         }
                         Err(error) => {
                             return Err(format!(
-                                "rank {} control after a prompt-logprob refusal: {error}",
-                                rank_config.rank
+                                "rank {rank_index} control after a prompt-logprob refusal: {error}"
                             ));
                         }
                     }
-                    log_tp4_metrics(rank_config.rank, "refused", &rank.metrics());
+                    log_tp4_metrics(rank_index, "refused", &rank.metrics());
                     continue;
                 }
                 let mut decoded = 0usize;
@@ -5074,42 +5439,42 @@ fn tp4_worker(options: &ServeOptions, tp4: &Tp4ServeOptions) -> Result<(), Strin
                         }
                         Ok(other) => {
                             return Err(format!(
-                                "rank {} expected Token or End, got {}",
-                                rank_config.rank,
+                                "rank {rank_index} expected Token or End, got {}",
                                 other.kind()
                             ));
                         }
                         Err(error) => {
                             return Err(format!(
-                                "rank {} control after prefill: {error}",
-                                rank_config.rank
+                                "rank {rank_index} control after prefill: {error}"
                             ));
                         }
                     }
                 }
-                log_tp4_metrics(rank_config.rank, "request", &rank.metrics());
+                log_tp4_metrics(rank_index, "request", &rank.metrics());
             }
             Ok(Tp4ControlFrame::End) => break,
             Ok(Tp4ControlFrame::Error { code, message }) => {
                 if code == TP4_LOGPROBS_REFUSED_CODE {
                     println!(
-                        "sparkflash serve: tp4_prompt_logprobs_refused rank={} message={message}",
-                        rank_config.rank
+                        "sparkflash serve: tp4_prompt_logprobs_refused rank={rank_index} message={message}"
                     );
-                    log_tp4_metrics(rank_config.rank, "refused", &rank.metrics());
+                    log_tp4_metrics(rank_index, "refused", &rank.metrics());
                     continue;
                 }
                 return Err(format!("rank 0 reported {code}: {message}"));
             }
             Ok(other) => {
                 return Err(format!(
-                    "rank {} expected Request, End or Error, got {}",
-                    rank_config.rank,
+                    "rank {rank_index} expected Request, End or Error, got {}",
                     other.kind()
                 ));
             }
+            // A healthy rank 0 sends nothing between requests. The read timeout is a liveness
+            // guard for a step inside a request, so an idle gap means wait again, not exit: the
+            // old code tore the group down after ten quiet minutes.
+            Err(error) if control_read_is_idle(&error) => continue,
             Err(error) => {
-                return Err(format!("rank {} control: {error}", rank_config.rank));
+                return Err(format!("rank {rank_index} control: {error}"));
             }
         }
     }
@@ -5241,7 +5606,15 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
         ),
     );
     let load_started = std::time::Instant::now();
-    let driver = match Tp4Driver::start(&recipe, rank_config, options.max_tokens) {
+    let spec = Tp4EngineSpec {
+        model: MODEL_ID.to_owned(),
+        vocab_size: recipe.config.vocab_size,
+        capabilities: Capabilities::default(),
+        cluster: tp4_cluster_snapshot(),
+        tokenizer: recipe.tokenizer.clone(),
+        open: open_tp4_rank,
+    };
+    let driver = match Tp4Driver::start(spec, rank_config, options.max_tokens) {
         Ok(driver) => driver,
         Err(message) => {
             eprintln!("sparkflash serve: {message}");
@@ -5313,6 +5686,162 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
         }
     };
     runtime.block_on(bind_and_serve(router, drain_state, options.bind))
+}
+
+/// The cluster telemetry the GLM TP=4 arm can state: its fabric mode, not a node list or a rail.
+#[cfg(feature = "tp4-serve")]
+fn glm_tp4_cluster_snapshot(context: usize) -> ClusterStatsSnapshot {
+    ClusterStatsSnapshot {
+        model: sparkflash_model_glm5_next::MODEL_ID.to_owned(),
+        fabric_mode: "tp4-tcp".to_owned(),
+        nodes: Vec::new(),
+        kv: empty_kv_snapshot(),
+        engram: default_engram_layers().to_vec(),
+        transport: RoceTransportStats {
+            fabric_mode: "tp4-tcp".to_owned(),
+            ..RoceTransportStats::default()
+        },
+        dspark: DSparkStepStats::default(),
+        timing: RequestTimingStats::default(),
+        max_seq_len: context,
+    }
+}
+
+/// Runs one process of the GLM-5.3-Flash TP=4 group.
+///
+/// Rank 0 owns HTTP, the tokenizer, the chat template and streaming; every other rank runs the
+/// resident GLM rank and the control worker and never loads a tokenizer. The engine collective is
+/// the same TCP seam the `glm-tp4` harness opens, and the serve control channel is the one the
+/// V4.1 group uses.
+#[cfg(feature = "tp4-serve")]
+fn serve_glm_tp4(options: &ServeOptions, tp4: &Tp4ServeOptions) -> ExitCode {
+    if tp4.rank != 0 {
+        return match glm_tp4_worker(options, tp4) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("sparkflash serve: rank {}: {message}", tp4.rank);
+                ExitCode::from(EXIT_REFUSED)
+            }
+        };
+    }
+    let Some(checkpoint) = options.checkpoint.clone() else {
+        eprintln!(
+            "sparkflash serve: --model {} --tp4-rank needs --checkpoint DIR",
+            sparkflash_model_glm5_next::MODEL_ID
+        );
+        return ExitCode::from(EXIT_REFUSED);
+    };
+    let directory = if checkpoint.is_dir() {
+        checkpoint
+    } else {
+        checkpoint.parent().unwrap_or(Path::new(".")).to_path_buf()
+    };
+    let config_path = directory.join(CHECKPOINT_CONFIG_NAME);
+    let config = if config_path.is_file() {
+        std::fs::read_to_string(&config_path)
+            .map_err(|error| format!("{}: {error}", config_path.display()))
+            .and_then(|text| Glm5NextConfig::from_json(&text).map_err(|error| error.to_string()))
+    } else {
+        Glm5NextConfig::glm53_flash().map_err(|error| error.to_string())
+    };
+    let config = match config {
+        Ok(config) => config,
+        Err(message) => {
+            eprintln!("sparkflash serve: cannot read the GLM-5.3-Flash configuration: {message}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    // The prompt seam and the detokenizer are the same file; load it before the 82 GB rank upload
+    // so a missing tokenizer costs a startup message, not a load.
+    let tokenizer = options
+        .tokenizer
+        .clone()
+        .unwrap_or_else(|| directory.join("tokenizer.json"));
+    if !tokenizer.is_file() {
+        eprintln!(
+            "sparkflash serve: --model {} needs --tokenizer FILE, or a tokenizer.json beside the checkpoint at {}",
+            sparkflash_model_glm5_next::MODEL_ID,
+            tokenizer.display()
+        );
+        return ExitCode::from(EXIT_REFUSED);
+    }
+    let seam: Arc<dyn sparkflash_model::PromptCodec> =
+        match sparkflash_model_glm5_next::GlmCodec::from_path(&tokenizer) {
+            Ok(codec) => Arc::new(codec),
+            Err(message) => {
+                eprintln!("sparkflash serve: {message}");
+                return ExitCode::from(EXIT_REFUSED);
+            }
+        };
+    let context = options.context.unwrap_or_else(|| {
+        config
+            .max_position_embeddings
+            .min(sparkflash_model_glm5_next::DEFAULT_DEVICE_CONTEXT)
+    });
+    if context == 0 || context > config.max_position_embeddings {
+        eprintln!(
+            "sparkflash serve: context limit {context} is outside 1..={}",
+            config.max_position_embeddings
+        );
+        return ExitCode::from(EXIT_REFUSED);
+    }
+    let capabilities = Capabilities {
+        tools: true,
+        thinking: true,
+        reasoning_effort: true,
+        vision: false,
+        constrained: false,
+    };
+    let descriptor = sparkflash_model::ModelDescriptor {
+        id: sparkflash_model_glm5_next::MODEL_ID.to_owned(),
+        family: sparkflash_model_glm5_next::FAMILY.to_owned(),
+        weights_id: sparkflash_model_glm5_next::WEIGHTS_ID.to_owned(),
+        context_tokens: context,
+        max_output_tokens: sparkflash_model_glm5_next::MAX_OUTPUT_TOKENS,
+        vocab_size: config.vocab_size,
+        capabilities,
+    };
+    let mut rank_config = match tp4_rank_config(options, tp4, TP4_CONTROL_TIMEOUT) {
+        Ok(config) => config,
+        Err(message) => {
+            eprintln!("sparkflash serve: {message}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    // The engine-thread spec carries the seam and the model; the rank config carries the context
+    // every rank allocates, so every rank agrees on the sequence width.
+    rank_config.context = context;
+    let max_tokens = options
+        .max_tokens
+        .min(sparkflash_model_glm5_next::MAX_OUTPUT_TOKENS);
+    let spec = Tp4EngineSpec {
+        model: sparkflash_model_glm5_next::MODEL_ID.to_owned(),
+        vocab_size: config.vocab_size,
+        capabilities,
+        cluster: glm_tp4_cluster_snapshot(context),
+        tokenizer,
+        open: open_glm_tp4_rank,
+    };
+    let driver = match Tp4Driver::start(spec, rank_config, max_tokens) {
+        Ok(driver) => driver,
+        Err(message) => {
+            eprintln!("sparkflash serve: {message}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    println!(
+        "sparkflash serve: {} TP=4 rank 0/{} on {}; control {}; workers never detokenize",
+        sparkflash_model_glm5_next::MODEL_ID,
+        tp4.world_size,
+        tp4.peers[0],
+        tp4.control_port
+    );
+    let metrics = driver.metrics();
+    // The dialect wrapper splits the model's <think> block into reasoning_content; the tool-call
+    // XML is still streamed as content until a GLM tool parser lands.
+    let engine: Arc<dyn ApiInferenceEngine> =
+        sparkflash_api::glm::GlmResponseEngine::layer(Arc::new(driver));
+    serve_with_seam(engine, metrics, seam, None, options, descriptor)
 }
 
 /// Entry point main.rs calls: parses arguments, starts the engine, binds the router.
@@ -5470,6 +5999,13 @@ fn serve_pack(model: &str, options: &ServeOptions) -> ExitCode {
         sparkflash_model_qwen4_exp::MODEL_ID | sparkflash_model_qwen4_exp::WEIGHTS_ID => {
             serve_qwen4_exp(options)
         }
+        sparkflash_model_glm5_next::MODEL_ID | sparkflash_model_glm5_next::WEIGHTS_ID => {
+            #[cfg(feature = "tp4-serve")]
+            if let Some(tp4) = options.tp4.as_ref() {
+                return serve_glm_tp4(options, tp4);
+            }
+            serve_glm53_flash(options)
+        }
         other => {
             let known: Vec<&str> = sparkflash_model::MODELS
                 .iter()
@@ -5580,9 +6116,31 @@ fn serve_qwen4_exp(options: &ServeOptions) -> ExitCode {
         );
         return ExitCode::from(EXIT_REFUSED);
     }
-    let mut backend = match sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::open(
-        &directory, context,
-    ) {
+    // A converted rank file is one slab read instead of 77.8 GiB of per-tensor uploads. The
+    // checkpoint directory stays the configuration, tokenizer and host-paged PLE source.
+    let converted = match std::env::var("SPARKFLASH_QWEN_CONVERTED_DIR") {
+        Ok(dir) => match sparkflash_model_qwen4_exp::convert::find_rank_file(Path::new(&dir)) {
+            Some(path) => Some(path),
+            None => {
+                eprintln!(
+                    "sparkflash serve: {} holds no {} for Qwen4-Exp TP=1",
+                    dir,
+                    sparkflash_model_qwen4_exp::convert::RANK_FILE_NAME
+                );
+                return ExitCode::from(EXIT_REFUSED);
+            }
+        },
+        Err(_) => None,
+    };
+    let opened = match &converted {
+        Some(path) => sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::open_converted(
+            &directory, context, path,
+        ),
+        None => {
+            sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::open(&directory, context)
+        }
+    };
+    let mut backend = match opened {
         Ok(backend) => backend,
         Err(error) => {
             eprintln!(
@@ -5592,6 +6150,12 @@ fn serve_qwen4_exp(options: &ServeOptions) -> ExitCode {
             return ExitCode::from(EXIT_REFUSED);
         }
     };
+    if let Some(path) = &converted {
+        eprintln!(
+            "sparkflash serve: Qwen4-Exp weights from converted {}",
+            path.display()
+        );
+    }
     // One pooled session a concurrent request: the driver opens exactly `concurrency` sessions, so
     // a smaller pool would make a request wait for a slot it asked for at start-up.
     if options.fuse_batch
@@ -5638,6 +6202,205 @@ fn serve_qwen4_exp(options: &ServeOptions) -> ExitCode {
         Arc::new(driver)
     } else {
         sparkflash_api::qwen::QwenResponseEngine::layer(Arc::new(driver))
+    };
+    serve_with_seam(engine, metrics, seam, None, options, descriptor)
+}
+
+/// The GLM-5.3-Flash arm: the TP=1 device backend behind the generic host driver.
+///
+/// The pack owns the arithmetic, the chat template and the token ids; this function owns the
+/// process - resolve the checkpoint and its configuration, choose the prompt seam, start the
+/// driver, serve the router. The released FP8 checkpoint is 328.3 GB, so a single rank can only
+/// hold the tiny fixture; the four-rank group is the shape the released model is served in, and
+/// this arm refuses rather than pretends when the checkpoint is the release and the process is not
+/// one rank of that group.
+fn serve_glm53_flash(options: &ServeOptions) -> ExitCode {
+    use sparkflash_model::ModelBackend as _;
+
+    let (directory, config, synthetic) = match (options.synthetic, options.checkpoint.as_deref()) {
+        (true, _) => {
+            let directory = std::env::temp_dir()
+                .join(format!("sparkflash-glm53-fixture-{}", std::process::id()));
+            let config = sparkflash_model_glm5_next::Glm5NextConfig::tiny();
+            if let Err(error) = sparkflash_model_glm5_next::checkpoint::write_synthetic_checkpoint(
+                &directory, &config, 7, 2,
+            ) {
+                eprintln!(
+                    "sparkflash serve: cannot write the tiny GLM-5.3-Flash fixture to {}: {error}",
+                    directory.display()
+                );
+                return ExitCode::from(EXIT_REFUSED);
+            }
+            eprintln!(
+                "sparkflash serve: serving the tiny GLM-5.3-Flash fixture at {} with a byte codec: this exercises the serving path, it is not the released model",
+                directory.display()
+            );
+            (directory, config, true)
+        }
+        (false, Some(path)) => {
+            let directory = if path.is_dir() {
+                path.to_path_buf()
+            } else {
+                path.parent().unwrap_or(Path::new(".")).to_path_buf()
+            };
+            let config_path = directory.join("config.json");
+            let config = if config_path.is_file() {
+                match std::fs::read_to_string(&config_path)
+                    .map_err(|error| format!("{}: {error}", config_path.display()))
+                    .and_then(|text| {
+                        sparkflash_model_glm5_next::Glm5NextConfig::from_json(&text)
+                            .map_err(|error| error.to_string())
+                    }) {
+                    Ok(config) => config,
+                    Err(message) => {
+                        eprintln!(
+                            "sparkflash serve: cannot read the GLM-5.3-Flash configuration: {message}"
+                        );
+                        return ExitCode::from(EXIT_REFUSED);
+                    }
+                }
+            } else {
+                match sparkflash_model_glm5_next::Glm5NextConfig::glm53_flash() {
+                    Ok(config) => config,
+                    Err(error) => {
+                        eprintln!(
+                            "sparkflash serve: cannot read the carried GLM-5.3-Flash configuration: {error}"
+                        );
+                        return ExitCode::from(EXIT_REFUSED);
+                    }
+                }
+            };
+            (directory, config, false)
+        }
+        (false, None) => {
+            let Some(directory) =
+                sparkflash_model_qwen4_exp::cached_model_dir(sparkflash_model_glm5_next::MODEL_ID)
+            else {
+                eprintln!(
+                    "sparkflash serve: {} is not in the Hugging Face cache; run hf download {} or pass --checkpoint DIR",
+                    sparkflash_model_glm5_next::MODEL_ID,
+                    sparkflash_model_glm5_next::MODEL_ID,
+                );
+                return ExitCode::from(EXIT_REFUSED);
+            };
+            let config_path = directory.join("config.json");
+            let config = std::fs::read_to_string(&config_path)
+                .map_err(|error| format!("{}: {error}", config_path.display()))
+                .and_then(|text| {
+                    sparkflash_model_glm5_next::Glm5NextConfig::from_json(&text)
+                        .map_err(|error| error.to_string())
+                });
+            match config {
+                Ok(config) => (directory, config, false),
+                Err(message) => {
+                    eprintln!(
+                        "sparkflash serve: cannot read the GLM-5.3-Flash configuration: {message}"
+                    );
+                    return ExitCode::from(EXIT_REFUSED);
+                }
+            }
+        }
+    };
+    // The released FP8 release is 82 GB a rank over four nodes. One rank holding all four shards
+    // is not the served shape, and the server says so before it tries a 328.3 GB upload.
+    if !synthetic && config.num_hidden_layers >= 45 {
+        eprintln!(
+            "sparkflash serve: {} is the released 321B-parameter FP8 checkpoint (328.3 GB): one TP=1 rank cannot hold it. Serve the tiny fixture at TP=1 (--synthetic), or serve the release with the four-rank group: build with --features tp4-serve and pass --tp4-rank/--tp4-world-size/--tp4-peers with --checkpoint.",
+            sparkflash_model_glm5_next::MODEL_ID
+        );
+        return ExitCode::from(EXIT_REFUSED);
+    }
+    // The prompt seam is built before the checkpoint is opened, so a missing or wrong tokenizer is
+    // a startup refusal rather than a discovery after the weights are resident.
+    let released_seam: Option<Arc<dyn sparkflash_model::PromptCodec>> = if synthetic {
+        None
+    } else {
+        let tokenizer = options
+            .tokenizer
+            .clone()
+            .unwrap_or_else(|| directory.join("tokenizer.json"));
+        if !tokenizer.is_file() {
+            eprintln!(
+                "sparkflash serve: --model {} needs --tokenizer FILE, or a tokenizer.json beside the checkpoint at {}",
+                sparkflash_model_glm5_next::MODEL_ID,
+                tokenizer.display()
+            );
+            return ExitCode::from(EXIT_REFUSED);
+        }
+        match sparkflash_model_glm5_next::GlmCodec::from_path(&tokenizer) {
+            Ok(codec) => Some(Arc::new(codec)),
+            Err(message) => {
+                eprintln!("sparkflash serve: {message}");
+                return ExitCode::from(EXIT_REFUSED);
+            }
+        }
+    };
+    let context = options.context.unwrap_or_else(|| {
+        config
+            .max_position_embeddings
+            .min(sparkflash_model_glm5_next::DEFAULT_DEVICE_CONTEXT)
+    });
+    let cuda = match sparkflash_kernels::cuda_driver::Cuda::load() {
+        Ok(cuda) => Arc::new(sparkflash_model_glm5_next::device::CudaHandle::new(cuda)),
+        Err(error) => {
+            eprintln!("sparkflash serve: CUDA: {error}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    let backend = match sparkflash_model_glm5_next::Glm5NextDeviceBackend::open_single_rank(
+        cuda, config, &directory, context,
+    ) {
+        Ok(backend) => backend,
+        Err(error) => {
+            eprintln!(
+                "sparkflash serve: cannot open the GLM-5.3-Flash rank at {}: {error}",
+                directory.display()
+            );
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    if options.fuse_batch {
+        eprintln!(
+            "sparkflash serve: the GLM-5.3-Flash arm has no fused batch; each worker keeps one session"
+        );
+    }
+    let descriptor = backend.descriptor().clone();
+    let seam: Arc<dyn sparkflash_model::PromptCodec> = match released_seam {
+        Some(seam) => seam,
+        None => Arc::new(sparkflash_model_qwen4_exp::ByteCodec::new(
+            descriptor.vocab_size,
+        )),
+    };
+    let driver = match sparkflash_serve::HostDriver::start(
+        Box::new(backend),
+        Arc::clone(&seam),
+        sparkflash_serve::HostOptions {
+            max_tokens: options
+                .max_tokens
+                .min(sparkflash_model_glm5_next::MAX_OUTPUT_TOKENS),
+            concurrency: options.concurrency,
+            ..sparkflash_serve::HostOptions::default()
+        },
+    ) {
+        Ok(driver) => driver,
+        Err(message) => {
+            eprintln!("sparkflash serve: {message}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    };
+    let metrics = driver.metrics();
+    println!(
+        "sparkflash serve: {} ({}) at TP=1 on {}, context {context}",
+        descriptor.id,
+        descriptor.weights_id,
+        directory.display()
+    );
+    // The byte-codec fixture's output is arbitrary text, not the released template's channels, so
+    // it stays on the raw driver; the released tokenizer gets the <think> split.
+    let engine: Arc<dyn ApiInferenceEngine> = if synthetic {
+        Arc::new(driver)
+    } else {
+        sparkflash_api::glm::GlmResponseEngine::layer(Arc::new(driver))
     };
     serve_with_seam(engine, metrics, seam, None, options, descriptor)
 }
@@ -10045,6 +10808,45 @@ mod tp4_serve_tests {
 
     use super::*;
 
+    #[test]
+    fn the_glm_pack_may_take_the_four_rank_flags() {
+        let options =
+            ServeOptions::parse(tp4_args(&["--model", sparkflash_model_glm5_next::MODEL_ID]))
+                .expect("the GLM pack takes the group flags");
+        assert_eq!(
+            options.model.as_deref(),
+            Some(sparkflash_model_glm5_next::MODEL_ID)
+        );
+        assert!(options.tp4.is_some());
+    }
+
+    #[test]
+    fn a_packed_model_without_a_four_rank_arm_still_refuses_the_group_flags() {
+        let error =
+            ServeOptions::parse(tp4_args(&["--model", sparkflash_model_qwen4_exp::MODEL_ID]))
+                .expect_err("the Qwen arm serves TP=1 only");
+        assert!(error.contains("--tp4-rank"), "{error}");
+    }
+
+    #[test]
+    fn only_a_read_timeout_counts_as_an_idle_control_wait() {
+        let idle = Tp4ControlError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        assert!(control_read_is_idle(&idle));
+        let timed_out = Tp4ControlError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert!(control_read_is_idle(&timed_out));
+        let reset = Tp4ControlError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(!control_read_is_idle(&reset));
+    }
+
+    #[test]
+    fn the_glm_cluster_snapshot_names_the_model_the_fabric_and_the_served_context() {
+        let snapshot = glm_tp4_cluster_snapshot(4_096);
+        assert_eq!(snapshot.model, sparkflash_model_glm5_next::MODEL_ID);
+        assert_eq!(snapshot.fabric_mode, "tp4-tcp");
+        assert_eq!(snapshot.max_seq_len, 4_096);
+        assert!(snapshot.nodes.is_empty());
+    }
+
     fn engine_request(prompt: &[u32], max_tokens: usize) -> EngineRequest {
         EngineRequest {
             request_id: "tp4-test".to_owned(),
@@ -10559,6 +11361,42 @@ mod tp4_serve_tests {
             display.contains("150ms"),
             "the refusal must name the elapsed budget: {display}"
         );
+    }
+
+    #[test]
+    fn an_idle_control_gap_does_not_take_the_worker_down() {
+        // The real timeout is ten minutes; shrink it so the test does not build a minute of wait
+        // into CI. The worker is the client, and rank 0 stays silent for several timeouts before
+        // it ends the group.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let address = listener.local_addr().expect("the listener address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("the test hub connects");
+            thread::sleep(Duration::from_millis(350));
+            write_control_frame(&mut stream, &Tp4ControlFrame::End).expect("write End");
+        });
+        let stream = TcpStream::connect(address).expect("connect to the test hub");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("a short read timeout");
+        let mut worker = Tp4ControlWorker {
+            stream,
+            rank: 1,
+            world: 2,
+            ready: true,
+        };
+        let mut rank = FakeTp4Rank {
+            prompt: Vec::new(),
+            seen_selection: None,
+        };
+        let started = Instant::now();
+        tp4_worker_loop(&mut rank, &mut worker, 1)
+            .expect("a silent rank 0 is an idle wait, not a dead peer");
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "the loop must survive more than one read timeout"
+        );
+        server.join().expect("the test hub joins");
     }
 
     #[test]

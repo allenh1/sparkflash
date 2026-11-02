@@ -3664,6 +3664,230 @@ extern "C" __global__ void q4e_attn(const float* __restrict__ q, const float* __
     }
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// GLM-5.3-Flash's MLA over the compressed latent, instead of over the expanded per-head keys and
+// values q4e_attn read.
+//
+// The expanded form ran kv_b on the normed latent and cached heads * (nope + value) floats a
+// position: 8,192 at the release's geometry on one rank of four, against the 512 the latent it
+// expands already holds. Caching the latent instead, and folding kv_b into the two matmuls
+// attention already makes, is MLA absorption (DeepSeek-V2's MLA, arXiv:2405.04434, of which
+// GLM-5.3-Flash releases the NoPE form):
+//
+//   k[h][j] = sum_c kv_b[h * (nope + value) + j][c] * c_kv[c]           j < nope
+//   v[h][j] = sum_c kv_b[h * (nope + value) + nope + j][c] * c_kv[c]    j < value
+//
+// so a score is
+//
+//   sum_j q[h][j] k[h][j] = (sum_j q[h][j] kv_b[h * (nope + value) + j][c]) . c_kv
+//
+// the query projected into the latent space once a row, and a value is
+//
+//   sum_slot p[slot] v[h][slot] = kv_b[h * (nope + value) + nope + j] . (sum_slot p[slot] c_kv[slot])
+//
+// the weighted latent sum projected once a row. Both absorbed operands are this rank's own kv_b
+// rows, dequantised once at load, so no kernel here reads the checkpoint's FP8 codes.
+//
+// The cache is the release's own E4M3 activation: 512 codes and one f32 scale a 128-column block a
+// position a layer, 528 bytes, against the expanded form's 2,048. The quantisation is the one the
+// FP8 GEMV applied to the latent, so the products are exactly the expansion's - the codes and
+// scales are the values it would have multiplied. A configuration without dynamic activation
+// quantisation (a BF16 release) caches the latent as f32 instead, and the attention reads either.
+#define Q4E_GLM_MAX_LATENT 512
+
+// One row's normed latent into an f32 cache, for a configuration whose FP8 projections do not
+// quantise their activations (a BF16 release). grid (rows).
+extern "C" __global__ void q4e_glm_mla_cache(const float* __restrict__ latent,
+                                             float* __restrict__ cache, int base, int rows,
+                                             int width) {
+    OPT_PDL_ENTRY();
+    const int row = blockIdx.x;
+    if (row >= rows || width > Q4E_GLM_MAX_LATENT) {
+        return;
+    }
+    const float* src = latent + (unsigned long long)row * width;
+    float* dst = cache + (unsigned long long)(base + row) * width;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+// One row's normed latent into the E4M3 cache: per 128-column block the release's quantisation,
+// the largest magnitude over 448 as the scale, each value over it rounded to the nearest code, and
+// the scale kept beside the codes. grid (rows), Q4E_FP8_BLOCK threads: a warp a block, four values
+// a lane.
+extern "C" __global__ void q4e_glm_mla_cache_fp8(const float* __restrict__ latent,
+                                                 unsigned char* __restrict__ codes,
+                                                 float* __restrict__ scales, int base, int rows,
+                                                 int width) {
+    OPT_PDL_ENTRY();
+    const int row = blockIdx.x;
+    if (row >= rows || width > Q4E_GLM_MAX_LATENT || width % Q4E_FP8_BLOCK != 0) {
+        return;
+    }
+    const float* src = latent + (unsigned long long)row * width;
+    unsigned char* dst = codes + (unsigned long long)(base + row) * width;
+    float* scl = scales + (unsigned long long)(base + row) * (width / Q4E_FP8_BLOCK);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    for (int start = warp * Q4E_FP8_BLOCK; start < width; start += warps * Q4E_FP8_BLOCK) {
+        const float4 value = *reinterpret_cast<const float4*>(src + start + lane * 4);
+        float largest = fmaxf(fmaxf(fabsf(value.x), fabsf(value.y)),
+                              fmaxf(fabsf(value.z), fabsf(value.w)));
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            largest = fmaxf(largest, __shfl_xor_sync(0xFFFFFFFFu, largest, offset));
+        }
+        const float scale = largest / 448.0f;
+        if (lane == 0) {
+            scl[start / Q4E_FP8_BLOCK] = scale;
+        }
+        unsigned int c0 = 0u, c1 = 0u, c2 = 0u, c3 = 0u;
+        if (scale != 0.0f) {
+            c0 = __nv_cvt_float_to_fp8(value.x / scale, __NV_SATFINITE, __NV_E4M3);
+            c1 = __nv_cvt_float_to_fp8(value.y / scale, __NV_SATFINITE, __NV_E4M3);
+            c2 = __nv_cvt_float_to_fp8(value.z / scale, __NV_SATFINITE, __NV_E4M3);
+            c3 = __nv_cvt_float_to_fp8(value.w / scale, __NV_SATFINITE, __NV_E4M3);
+        }
+        *reinterpret_cast<uchar4*>(dst + start + lane * 4) =
+            make_uchar4((unsigned char)c0, (unsigned char)c1, (unsigned char)c2,
+                        (unsigned char)c3);
+    }
+}
+
+// One cached latent, decoded as the release's activation: the E4M3 code times its 128-column
+// block's scale, or the f32 cache when the configuration does not quantise.
+__device__ __forceinline__ float q4e_glm_mla_at(const float* __restrict__ latent,
+                                                const unsigned char* __restrict__ codes,
+                                                const float* __restrict__ scales, int width,
+                                                int row, int column, int quantise) {
+    if (quantise) {
+        return q4e_e4m3(codes[(unsigned long long)row * width + column]) *
+               scales[(unsigned long long)row * (width / Q4E_FP8_BLOCK) +
+                      column / Q4E_FP8_BLOCK];
+    }
+    return latent[(unsigned long long)row * width + column];
+}
+
+// The query half of the absorption: q_abs[row][head][c] = sum_j q[row][head][j] * kv_b[h][j][c],
+// kv_b's key rows, [nope][latent] a head. grid (heads, rows), Q4E_BLOCK threads: thread
+// threadIdx.x owns latent columns threadIdx.x, threadIdx.x + block, ..., so a warp's reads of the
+// weight are consecutive words and its reads of the query one broadcast.
+extern "C" __global__ void q4e_glm_mla_absorb(const float* __restrict__ q,
+                                              const float* __restrict__ kv_b,
+                                              float* __restrict__ q_abs, int base, int nope,
+                                              int value, int latent) {
+    OPT_PDL_ENTRY();
+    const int head = blockIdx.x;
+    const int row = base + blockIdx.y;
+    if (latent > Q4E_GLM_MAX_LATENT) {
+        return;
+    }
+    const float* qh = q + ((unsigned long long)row * gridDim.x + head) * nope;
+    const float* wh = kv_b + (unsigned long long)head * (nope + value) * latent;
+    float* oh = q_abs + ((unsigned long long)row * gridDim.x + head) * latent;
+    for (int c = threadIdx.x; c < latent; c += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j < nope; ++j) {
+            acc = fmaf(wh[(unsigned long long)j * latent + c], qh[j], acc);
+        }
+        oh[c] = acc;
+    }
+}
+
+// The attention and the value half together: a f32 softmax over the selected latents, then the
+// weighted latent sum projected by kv_b's value rows. grid (heads, rows), Q4E_BLOCK threads. The
+// score and softmax phases are q4e_attn's, over the latent instead of an expanded key.
+extern "C" __global__ void q4e_glm_mla_attend(const float* __restrict__ q_abs,
+                                              const float* __restrict__ latent_cache,
+                                              const unsigned char* __restrict__ codes,
+                                              const float* __restrict__ scales,
+                                              const float* __restrict__ kv_b,
+                                              const int* __restrict__ selected,
+                                              const int* __restrict__ selected_count,
+                                              float* __restrict__ out, int base, int nope,
+                                              int value, int latent, int select_stride,
+                                              int quantise) {
+    OPT_PDL_ENTRY();
+    __shared__ float logits[Q4E_MAX_SELECTED];
+    __shared__ float reduce[Q4E_BLOCK];
+    __shared__ float mixed[Q4E_GLM_MAX_LATENT];
+    const int head = blockIdx.x;
+    const int row = base + blockIdx.y;
+    const int* sel = selected + (unsigned long long)row * select_stride;
+    const int nsel = selected_count[row];
+    if (latent > Q4E_GLM_MAX_LATENT) {
+        return;
+    }
+    const float* qh = q_abs + ((unsigned long long)row * gridDim.x + head) * latent;
+    const float* wh = kv_b + (unsigned long long)head * (nope + value) * latent;
+    float* oh = out + ((unsigned long long)row * gridDim.x + head) * value;
+    if (nsel <= 0) {
+        // Before the indexer has a full block there is nothing to attend over, and the reference
+        // keeps the row at zero rather than leaving the buffer untouched.
+        for (int j = threadIdx.x; j < value; j += blockDim.x) {
+            oh[j] = 0.0f;
+        }
+        return;
+    }
+    if (nsel > Q4E_MAX_SELECTED) {
+        return;
+    }
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const float scale = sqrtf((float)nope);
+
+    for (int slot = warp; slot < nsel; slot += warps) {
+        const int at = sel[slot];
+        float dot = 0.0f;
+        for (int c = lane; c < latent; c += 32) {
+            dot += qh[c] * q4e_glm_mla_at(latent_cache, codes, scales, latent, at, c, quantise);
+        }
+        dot = q4e_warp_sum(dot);
+        if (lane == 0) {
+            logits[slot] = dot / scale;
+        }
+    }
+    __syncthreads();
+
+    float local_max = -INFINITY;
+    for (int slot = threadIdx.x; slot < nsel; slot += blockDim.x) {
+        local_max = fmaxf(local_max, logits[slot]);
+    }
+    const float maximum = q4e_block_max(local_max, reduce);
+    float local_sum = 0.0f;
+    for (int slot = threadIdx.x; slot < nsel; slot += blockDim.x) {
+        const float weight = __expf(logits[slot] - maximum);
+        logits[slot] = weight;
+        local_sum += weight;
+    }
+    const float total = q4e_block_sum(local_sum, reduce);
+
+    for (int c = threadIdx.x; c < latent; c += blockDim.x) {
+        float accumulator = 0.0f;
+        for (int slot = 0; slot < nsel; ++slot) {
+            accumulator =
+                fmaf(logits[slot],
+                     q4e_glm_mla_at(latent_cache, codes, scales, latent, sel[slot], c, quantise),
+                     accumulator);
+        }
+        mixed[c] = accumulator / total;
+    }
+    __syncthreads();
+
+    for (int j = threadIdx.x; j < value; j += blockDim.x) {
+        const float* wrow = wh + (unsigned long long)(nope + j) * latent;
+        float accumulator = 0.0f;
+        for (int c = 0; c < latent; ++c) {
+            accumulator = fmaf(wrow[c], mixed[c], accumulator);
+        }
+        oh[j] = accumulator;
+    }
+}
+
 // Block reductions of HEADS values at once, each over the same tree as q4e_block_max and
 // q4e_block_sum, so each head's result is bit-identical to reducing it alone; scratch holds
 // HEADS * blockDim.x floats. Reusable back to back, as those are.

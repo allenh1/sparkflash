@@ -39,6 +39,7 @@ use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
 use sparkflash_model::BackendError;
 use sparkflash_model_glm5_next::checkpoint::write_synthetic_checkpoint;
 use sparkflash_model_glm5_next::convert::convert_rank;
+use sparkflash_model_glm5_next::device::CudaHandle;
 use sparkflash_model_glm5_next::{
     DeviceRank, DeviceSequence, Glm5NextConfig, Glm5NextWeights, MAX_ROWS,
 };
@@ -65,13 +66,13 @@ fn stride_tokens(config: &Glm5NextConfig, count: usize, stride: usize, first: us
 }
 
 /// A CUDA context, or why this run cannot have one.
-fn open() -> Option<Cuda> {
+fn open() -> Option<Arc<CudaHandle>> {
     if !cubin_available() {
         eprintln!("skipped: this build embeds no Qwen4-Exp cubin");
         return None;
     }
     match Cuda::load() {
-        Ok(cuda) => Some(cuda),
+        Ok(cuda) => Some(Arc::new(CudaHandle::new(cuda))),
         Err(error) => {
             eprintln!("skipped: no CUDA driver ({error})");
             None
@@ -91,19 +92,19 @@ enum Load<'a> {
 }
 
 impl Load<'_> {
-    fn rank<'c>(
+    fn rank(
         self,
-        cuda: &'c Cuda,
+        cuda: &Arc<CudaHandle>,
         config: &Glm5NextConfig,
         layout: TpLayout,
-    ) -> Result<DeviceRank<'c>, BackendError> {
+    ) -> Result<DeviceRank, BackendError> {
         match self {
             Self::Checkpoint(directory) => {
-                DeviceRank::load(cuda, config, &source(directory), layout)
+                DeviceRank::load(Arc::clone(cuda), config, &source(directory), layout)
             }
             Self::Converted(directory) => {
                 let file = directory.join(rank_file_name(layout.rank, layout.world_size));
-                DeviceRank::load_converted(cuda, config, &file, layout)
+                DeviceRank::load_converted(Arc::clone(cuda), config, &file, layout)
             }
         }
     }
@@ -300,8 +301,8 @@ fn ranks<T: Send>(
     capacities: &[usize],
     drafting: Drafting<'_>,
     run: impl Fn(
-        &mut DeviceRank<'_>,
-        &mut [DeviceSequence<'_>],
+        &mut DeviceRank,
+        &mut [DeviceSequence],
         &TpRuntime,
         &BitGatherHandle,
     ) -> Result<T, BackendError>
@@ -322,7 +323,7 @@ fn ranks<T: Send>(
                         rank,
                         world_size: world,
                     };
-                    let cuda = Cuda::load();
+                    let cuda = Cuda::load().map(|cuda| Arc::new(CudaHandle::new(cuda)));
                     let weights = cuda.as_ref().map_err(Clone::clone).and_then(|cuda| {
                         let mut weights = load
                             .rank(cuda, config, layout)
@@ -705,7 +706,7 @@ fn a_verify_keeps_the_bits_of_its_kept_rows() {
                     if chunks.iter().all(|(chunk, _)| chunk.is_empty()) {
                         break;
                     }
-                    let mut batch: Vec<(&mut DeviceSequence<'_>, &[u32])> = verified
+                    let mut batch: Vec<(&mut DeviceSequence, &[u32])> = verified
                         .iter_mut()
                         .zip(&chunks)
                         .map(|(sequence, (chunk, _))| (sequence, chunk.as_slice()))
@@ -780,8 +781,8 @@ fn greatest(row: &[f32]) -> u32 {
 /// Each prompt prefilled alone and decoded greedily one token a step, `generate` steps, drafting
 /// `count` tokens after each token it runs when given a count.
 fn greedy(
-    weights: &mut DeviceRank<'_>,
-    sequences: &mut [DeviceSequence<'_>],
+    weights: &mut DeviceRank,
+    sequences: &mut [DeviceSequence],
     (tp, gather): (&TpRuntime, &BitGatherHandle),
     prompts: &[Vec<u32>],
     generate: usize,
@@ -902,7 +903,7 @@ fn speculative_greedy(
                 let mut drafted = Vec::new();
                 let mut counts = Vec::new();
                 for step in 0.. {
-                    let mut active: Vec<(usize, &mut DeviceSequence<'_>)> =
+                    let mut active: Vec<(usize, &mut DeviceSequence)> =
                         [&mut *first, &mut *second, &mut *third]
                             .into_iter()
                             .enumerate()
@@ -913,7 +914,7 @@ fn speculative_greedy(
                     if active.is_empty() {
                         break;
                     }
-                    let mut batch: Vec<(&mut DeviceSequence<'_>, u32)> = active
+                    let mut batch: Vec<(&mut DeviceSequence, u32)> = active
                         .iter_mut()
                         .map(|(index, sequence)| {
                             (&mut **sequence, *tokens[*index].last().expect("a token"))
@@ -942,7 +943,7 @@ fn speculative_greedy(
                             .collect();
                         chunks.push(chunk);
                     }
-                    let mut batch: Vec<(&mut DeviceSequence<'_>, &[u32])> = active
+                    let mut batch: Vec<(&mut DeviceSequence, &[u32])> = active
                         .iter_mut()
                         .zip(&chunks)
                         .map(|((_, sequence), chunk)| (&mut **sequence, chunk.as_slice()))
@@ -1208,10 +1209,10 @@ fn the_device_leg_is_the_bits_of_the_host_round_trip() {
 }
 
 /// Each sequence with its tokens, as a batch.
-fn pairs<'s, 'a, T: AsRef<[u32]>>(
-    sequences: &'s mut [DeviceSequence<'a>],
+fn pairs<'s, T: AsRef<[u32]>>(
+    sequences: &'s mut [DeviceSequence],
     tokens: &'s [T],
-) -> Vec<(&'s mut DeviceSequence<'a>, &'s [u32])> {
+) -> Vec<(&'s mut DeviceSequence, &'s [u32])> {
     sequences
         .iter_mut()
         .zip(tokens)
@@ -1249,7 +1250,7 @@ fn a_greedy_step_picks_its_logits_argmax_and_keeps_its_last_row() {
         .chain(&prompts)
         .map(|prompt| prompt.len() + 4)
         .collect();
-    let last = |weights: &DeviceRank<'_>, sequences: &[DeviceSequence<'_>]| {
+    let last = |weights: &DeviceRank, sequences: &[DeviceSequence]| {
         sequences
             .iter()
             .map(|sequence| weights.last_logits(sequence))
@@ -1390,7 +1391,7 @@ fn a_converted_rank_is_the_bits_of_the_checkpoint_rank() {
         world_size: 1,
     };
     let file = converted.path().join(rank_file_name(0, 1));
-    let error = DeviceRank::load_converted(&cuda, &narrower, &file, whole)
+    let error = DeviceRank::load_converted(Arc::clone(&cuda), &narrower, &file, whole)
         .err()
         .expect("narrower experts are another walk");
     assert!(error.to_string().contains("expected"), "{error}");
@@ -1413,11 +1414,12 @@ fn a_device_rank_refuses_what_it_cannot_run() {
         rank: 0,
         world_size: 3,
     };
-    let error = DeviceRank::load(&cuda, &config, &source, three)
+    let error = DeviceRank::load(Arc::clone(&cuda), &config, &source, three)
         .err()
         .expect("three ranks do not split the fixture");
     assert!(error.to_string().contains("split"), "{error}");
-    let mut weights = DeviceRank::load(&cuda, &config, &source, whole).expect("one rank loads");
+    let mut weights =
+        DeviceRank::load(Arc::clone(&cuda), &config, &source, whole).expect("one rank loads");
     let error = weights
         .new_sequence(config.max_position_embeddings + 1)
         .err()
@@ -1516,14 +1518,14 @@ fn a_device_rank_refuses_what_it_cannot_run() {
             .len(),
         3
     );
-    let mut many: Vec<DeviceSequence<'_>> = (0..=MAX_ROWS)
+    let mut many: Vec<DeviceSequence> = (0..=MAX_ROWS)
         .map(|_| {
             weights
                 .new_drafting_sequence(2)
                 .expect("a drafting sequence")
         })
         .collect();
-    let mut batch: Vec<(&mut DeviceSequence<'_>, u32)> =
+    let mut batch: Vec<(&mut DeviceSequence, u32)> =
         many.iter_mut().map(|sequence| (sequence, 1)).collect();
     let error = weights.draft(&tp, &gather, &mut batch, 1).unwrap_err();
     assert!(error.to_string().contains("at most"), "{error}");
@@ -1532,7 +1534,8 @@ fn a_device_rank_refuses_what_it_cannot_run() {
         num_nextn_predict_layers: 0,
         ..config.clone()
     };
-    let mut plain = DeviceRank::load(&cuda, &without, &source, whole).expect("a rank without MTP");
+    let mut plain =
+        DeviceRank::load(Arc::clone(&cuda), &without, &source, whole).expect("a rank without MTP");
     let error = plain.new_drafting_sequence(4).err().expect("no MTP layer");
     assert!(error.to_string().contains("no MTP layer"), "{error}");
     let error = plain

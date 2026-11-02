@@ -24,6 +24,7 @@ pub mod device_chain;
 pub mod device_token;
 pub mod engine;
 pub mod error;
+pub mod glm;
 pub mod loop_abort;
 pub mod metrics;
 pub mod multimodal;

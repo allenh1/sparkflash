@@ -24,8 +24,10 @@
 //!   (`name -> offset, length`), `header_hash`, and `file_digest`.
 //!
 //! A checkpoint whose `config.json` names GLM-5.3's model type is converted by the GLM pack
-//! instead, into the same container ([sparkflash_model_glm5_next::convert]); `--inspect` tells the
-//! two apart by the model a file's index names.
+//! instead, into the same container ([sparkflash_model_glm5_next::convert]); a Qwen4-Exp
+//! checkpoint is converted by its pack's TP=1 converter
+//! ([sparkflash_model_qwen4_exp::convert]). `--inspect` tells the three apart by the model a
+//! file's index names.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -41,6 +43,11 @@ use sparkflash_engine::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_model_glm5_next::Glm5NextConfig;
 use sparkflash_model_glm5_next::config::MODEL_TYPE;
 use sparkflash_model_glm5_next::convert::{CONVERTED_MODEL, convert_rank, verify_converted};
+use sparkflash_model_qwen4_exp::Qwen4ExpConfig;
+use sparkflash_model_qwen4_exp::convert::{
+    CONVERTED_MODEL as QWEN_CONVERTED_MODEL, convert_rank as qwen_convert_rank,
+    read_index as qwen_read_index, verify_converted as qwen_verify_converted,
+};
 
 /// Usage string for `sparkflash convert`.
 pub const USAGE: &str = "sparkflash convert --checkpoint DIR [--output-dir DIR] [--tp-world-size 4] [--tp-rank R | --ranks 0,1,2,3] [--no-pad-moe-640] [--no-verify] | sparkflash convert --inspect FILE [--verify-weights]";
@@ -132,6 +139,9 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
     let checkpoint_dir =
         checkpoint.ok_or_else(|| format!("--checkpoint DIR is required (usage: {USAGE})"))?;
     let out_dir = output_dir.unwrap_or_else(|| checkpoint_dir.clone());
+    if let Some(config) = qwen_config(&checkpoint_dir)? {
+        return convert_qwen(&checkpoint_dir, &out_dir, &config, &ranks, verify);
+    }
     if let Some(config) = glm_config(&checkpoint_dir)? {
         if !pad_moe_640 {
             return Err(
@@ -199,6 +209,65 @@ fn glm_config(dir: &Path) -> Result<Option<Glm5NextConfig>, String> {
     Glm5NextConfig::from_json(&text)
         .map(Some)
         .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// The Qwen4-Exp configuration of the checkpoint in `dir`, when its `config.json` names the
+/// pack's model type.
+fn qwen_config(dir: &Path) -> Result<Option<Qwen4ExpConfig>, String> {
+    let path = dir.join("config.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let root: Value =
+        serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    let model_type = root.get("model_type").and_then(Value::as_str);
+    if model_type != Some("qwen4_exp") && model_type != Some("qwen4_exp_text") {
+        return Ok(None);
+    }
+    Qwen4ExpConfig::from_json(&text)
+        .map(Some)
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Converts the TP=1 rank file of a Qwen4-Exp checkpoint and re-reads its digests when `verify`
+/// asks. The pack is TP=1; a rank other than 0 is refused rather than named a second file.
+fn convert_qwen(
+    dir: &Path,
+    out_dir: &Path,
+    config: &Qwen4ExpConfig,
+    ranks: &[usize],
+    verify: bool,
+) -> Result<Vec<String>, String> {
+    if let Some(rank) = ranks.iter().find(|rank| **rank != 0) {
+        return Err(format!(
+            "Qwen4-Exp is TP=1 and has no rank {rank}; convert rank 0 only"
+        ));
+    }
+    let source = SafeTensorsSource::open(dir, &dir.join(INDEX_NAME))
+        .map_err(|error| format!("{}: {error}", dir.display()))?;
+    let label = dir.file_name().map_or_else(
+        || dir.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let started = Instant::now();
+    let converted = qwen_convert_rank(&source, config, dir, out_dir, &label)
+        .map_err(|error| format!("Qwen4-Exp rank 0/1: {error}"))?;
+    if verify {
+        qwen_verify_converted(&converted.path)
+            .map_err(|error| format!("Qwen4-Exp rank 0/1: {error}"))?;
+    }
+    Ok(vec![format!(
+        "sparkflash convert: {QWEN_CONVERTED_MODEL} rank 0/1: wrote {} ({} bytes, {} weights, {} NVFP4 scale pairs, header_hash={:#018x}, file_digest={:#018x}, verified={verify}, {} ms)",
+        converted.path.display(),
+        converted.file_bytes,
+        converted.slots,
+        qwen_read_index(&converted.path).map_or(0, |(_, index)| index.nvfp4_scalars.len()),
+        converted.header_hash,
+        converted.file_digest,
+        started.elapsed().as_millis(),
+    )])
 }
 
 /// Converts `ranks` (every rank when empty) of a GLM-5.3 checkpoint one at a time, so one rank's
@@ -276,10 +345,40 @@ fn inspect_glm(
     )])
 }
 
+/// One Qwen4-Exp rank file's index, with `verify_weights` every slot's digest.
+fn inspect_qwen(
+    path: &Path,
+    preamble: ConvertedPreamble,
+    verify_weights: bool,
+) -> Result<Vec<String>, String> {
+    let index = if verify_weights {
+        qwen_verify_converted(path)?
+    } else {
+        qwen_read_index(path)?.1
+    };
+    Ok(vec![format!(
+        "sparkflash convert inspect {}: {} rank {}/{}, {} weights, {} NVFP4 scale pairs from {}, data_offset={}, padded_data_bytes={}, header_hash={:#018x}, file_digest={:#018x}, weights_verified={verify_weights}",
+        path.display(),
+        index.model,
+        index.rank,
+        index.world,
+        index.slots.len(),
+        index.nvfp4_scalars.len(),
+        index.source,
+        preamble.data_offset,
+        preamble.padded_data_bytes,
+        preamble.header_hash,
+        index.file_digest,
+    )])
+}
+
 fn inspect_file(path: &Path, verify_weights: bool) -> Result<Vec<String>, String> {
     let (preamble, index): (_, Value) = read_index(path)?;
     if index.get("model").and_then(Value::as_str) == Some(CONVERTED_MODEL) {
         return inspect_glm(path, preamble, verify_weights);
+    }
+    if index.get("model").and_then(Value::as_str) == Some(QWEN_CONVERTED_MODEL) {
+        return inspect_qwen(path, preamble, verify_weights);
     }
     let (preamble, header) = inspect_converted_rank(path)?;
     if verify_weights {
@@ -390,6 +489,33 @@ mod tests {
 
     /// A checkpoint whose `config.json` names GLM-5.3 is the GLM pack's to convert, so DeepSeek's
     /// padding flag is refused for it, and `--inspect` reads a GLM rank file by its index's model.
+    #[test]
+    fn a_qwen_checkpoint_and_rank_file_go_to_the_qwen_pack() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let config = sparkflash_model_qwen4_exp::Qwen4ExpConfig::tiny();
+        sparkflash_model_qwen4_exp::write_synthetic_checkpoint(directory.path(), &config, 7)
+            .expect("the fixture writes");
+        let output = tempfile::tempdir().expect("an output directory");
+        let lines = run_lines(&[
+            "--checkpoint",
+            directory.path().to_str().unwrap(),
+            "--output-dir",
+            output.path().to_str().unwrap(),
+        ])
+        .expect("the Qwen fixture converts");
+        assert!(lines[0].contains("qwen4-exp rank 0/1"), "{}", lines[0]);
+        let file = output.path().join("rank-0-of-1.bin");
+        assert!(file.is_file());
+        let inspected = run_lines(&["--inspect", file.to_str().unwrap(), "--verify-weights"])
+            .expect("the rank file inspects");
+        assert!(inspected[0].contains("qwen4-exp"), "{}", inspected[0]);
+        assert!(
+            inspected[0].contains("weights_verified=true"),
+            "{}",
+            inspected[0]
+        );
+    }
+
     #[test]
     fn a_glm_checkpoint_and_rank_file_go_to_the_glm_pack() {
         let ckpt = tempfile::tempdir().expect("ckpt");

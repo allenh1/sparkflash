@@ -39,11 +39,33 @@ pub const QWEN38_MAX_OUTPUT_TOKENS: usize = 32_768;
 /// The vocabulary of the released Qwen3.8-Flash-Next checkpoint (padded).
 pub const QWEN38_VOCAB_SIZE: usize = 248_320;
 
+/// The served id of the Z.ai GLM-5.3-Flash checkpoint.
+pub const GLM53_FLASH_ID: &str = "zai-org/GLM-5.3-Flash";
+
+/// The control-plane weight selector for the GLM-5.3-Flash FP8 checkpoint.
+pub const GLM53_FLASH_WEIGHTS_ID: &str = "glm5.3-flash-fp8";
+
+/// The context window of the released GLM-5.3-Flash checkpoint.
+pub const GLM53_CONTEXT_TOKENS: usize = 1_048_576;
+
+/// The per-request output ceiling this build serves for GLM-5.3-Flash.
+///
+/// The same 32,768 the other packed arm caps a request at; the context window and the dense KV
+/// allocation, not this number, are what refuse a longer request.
+pub const GLM53_MAX_OUTPUT_TOKENS: usize = 32_768;
+
+/// The vocabulary of the released GLM-5.3-Flash checkpoint.
+pub const GLM53_VOCAB_SIZE: usize = 154_880;
+
 /// The model ids this build knows how to serve, in selector order.
 ///
 /// Kept as a separate slice so the web control plane can expose it without constructing the
 /// registry. A new pack adds its selector here and its descriptor below.
-pub const WEIGHT_IDS: &[&str] = &[DEFAULT_WEIGHTS_ID, QWEN38_FLASH_NEXT_WEIGHTS_ID];
+pub const WEIGHT_IDS: &[&str] = &[
+    DEFAULT_WEIGHTS_ID,
+    QWEN38_FLASH_NEXT_WEIGHTS_ID,
+    GLM53_FLASH_WEIGHTS_ID,
+];
 
 /// The maximum context window of the released model.
 pub const V41_CONTEXT_TOKENS: usize = 1_048_576;
@@ -110,6 +132,24 @@ impl ModelDescriptor {
         }
     }
 
+    /// The released zai-org/GLM-5.3-Flash descriptor.
+    ///
+    /// The vision tower is in the checkpoint but is not loaded, so vision is not declared. The
+    /// context is the model's window; an endpoint reports the context it actually allocated in its
+    /// own descriptor.
+    #[must_use]
+    pub fn glm53_flash() -> Self {
+        Self {
+            id: GLM53_FLASH_ID.to_owned(),
+            family: "glm5-next".to_owned(),
+            weights_id: GLM53_FLASH_WEIGHTS_ID.to_owned(),
+            context_tokens: GLM53_CONTEXT_TOKENS,
+            max_output_tokens: GLM53_MAX_OUTPUT_TOKENS,
+            vocab_size: GLM53_VOCAB_SIZE,
+            capabilities: Capabilities::ALL,
+        }
+    }
+
     /// The V4.1-Flash shape under a caller-supplied id.
     ///
     /// This is what a weight-free test or a synthetic server uses when it names a model that is
@@ -139,6 +179,7 @@ pub static MODELS: LazyLock<Vec<ModelDescriptor>> = LazyLock::new(|| {
     vec![
         ModelDescriptor::v41_flash(),
         ModelDescriptor::qwen38_flash_next_nvfp4(),
+        ModelDescriptor::glm53_flash(),
     ]
 });
 

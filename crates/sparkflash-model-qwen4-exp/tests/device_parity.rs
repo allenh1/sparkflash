@@ -116,6 +116,7 @@ fn parity_with(config: Qwen4ExpConfig, label: &str, prompt_len: usize) -> bool {
         prompt_len,
         PrefillPlan::new(CHUNK, false),
         RELATIVE_TOLERANCE,
+        false,
     )
 }
 
@@ -128,6 +129,7 @@ fn parity_on(
     prompt_len: usize,
     plan: PrefillPlan,
     tolerance: f32,
+    converted: bool,
 ) -> bool {
     if !cubin_available() {
         eprintln!(
@@ -142,7 +144,32 @@ fn parity_on(
     // The context has to hold the prompt plus the decode steps, and a test that prefills more
     // than one chunk needs a window past CHUNK.
     let session_limit = 32.max(prompt_len + 8).min(config.max_position_embeddings);
-    let backend = match Qwen4ExpDeviceBackend::open_with_prefill(temp.path(), session_limit, plan) {
+    let converted_dir = tempfile::tempdir().expect("a converted directory");
+    let converted_path = if converted {
+        let source = SafeTensorsSource::open(temp.path(), &temp.path().join(INDEX))
+            .expect("the fixture index opens");
+        let file = sparkflash_model_qwen4_exp::convert::convert_rank(
+            &source,
+            &config,
+            temp.path(),
+            converted_dir.path(),
+            "fixture",
+        )
+        .expect("the rank converts");
+        Some(file.path)
+    } else {
+        None
+    };
+    let opened = match &converted_path {
+        Some(path) => Qwen4ExpDeviceBackend::open_with_prefill_converted(
+            temp.path(),
+            session_limit,
+            plan,
+            path,
+        ),
+        None => Qwen4ExpDeviceBackend::open_with_prefill(temp.path(), session_limit, plan),
+    };
+    let backend = match opened {
         Ok(backend) => backend,
         Err(error)
             if error.code() == "qwen4_device"
@@ -233,6 +260,20 @@ fn parity_on(
 #[test]
 fn the_tp1_device_loop_matches_the_host_oracle() {
     let _ = parity(Qwen4ExpConfig::tiny(), "tiny");
+}
+
+/// The converted rank file is the same bits: the device loop over a file the converter wrote must
+/// produce the checkpoint path's logits, including the NVFP4 scales and the rebuilt expert tables.
+#[test]
+fn the_converted_rank_file_matches_the_checkpoint_path() {
+    let _ = parity_on(
+        Qwen4ExpConfig::tiny(),
+        "tiny converted",
+        11,
+        PrefillPlan::new(CHUNK, false),
+        RELATIVE_TOLERANCE,
+        true,
+    );
 }
 
 /// A second, deliberately asymmetric geometry.
@@ -424,6 +465,7 @@ fn tensor_core_parity(config: Qwen4ExpConfig, label: &str, prompt_len: usize) {
         prompt_len,
         PrefillPlan::new(CHUNK, true),
         TENSOR_CORE_TOLERANCE,
+        false,
     );
 }
 
